@@ -7914,6 +7914,120 @@ jit_frameless_callee(const Chunk &ck, size_t old_pc, const Instr &in,
     return why ? nullptr : bake;
 }
 
+/*
+ * #97 INCREMENT 3 (W1): THE SITE BUILDS THE CALLEE'S WINDOW. Called by
+ * the frameless tail of emit_sync_call_inline with the run staged,
+ * rdx = fo and r9 = ctx live, rsp call-ready. It reserves the callee's
+ * N*48 bytes on the caller's native stack and fills them exactly as
+ * the frameless ENTRY used to (increment 2), with the CALLEE answering
+ * every question at emit time - it is a baked, placed descriptor here:
+ *   binds_scalar()     an int/float-declared or proven param can only
+ *                      receive a scalar (the baked push's coercing
+ *                      checks ran first) - the payload copied, the type
+ *                      word an immediate for a DECLARED int/float
+ *                      (the 1c checks guarantee the exact tag) or
+ *                      copied for a PROVEN one (a bool travels as `i`);
+ *   not ref-listed     a slot outside the callee's ref_slots never
+ *                      holds a reference (the chunk invariant its
+ *                      release scan trusts) - the same arm;
+ *   otherwise          the run slot's type is tested and a REFERENCE
+ *                      goes to jit_bind_ref_arg - the retaining copy,
+ *                      or #94's borrow when bit i of noescape_params
+ *                      says the reference cannot outlive the call.
+ * The container/flag tail is zeroed FIRST for every parameter (raw
+ * stack; the bind helper's ML_CHECK(!borrowed) reads the OLD flag),
+ * and every non-parameter slot gets a zero tail and a t_none type word
+ * (a helper writing a slot goes through LValue::put, which reads
+ * `container` and `borrowed` before it stores). r10 = the window base
+ * (rsp cannot be a base without a SIB byte the encoders refuse), r11
+ * scratch; the bind helper call saves rdx/r9 around itself (two
+ * pushes keep the call parity) and re-derives r10 from rsp after.
+ * ⛔ A raw copy of a reference is a use-after-free: the callee's
+ * release scan would drop a count it never took (watched, inc 2:
+ * jit_ret_inline_c4c's `h(arr, n)`).
+ */
+static void emit_frameless_window(Emitter &e, const Instr &in,
+                                  const FuncDescriptor *callee,
+                                  const Chunk &cck)
+{
+    const JitLayout &L = jit_layout();
+    const uint8_t R9R = 9, R10 = 10, R11 = 11;
+    const int total = cck.slot_count + cck.n_temps;
+    const int nargs = static_cast<int>(callee->params.size());
+    const int32_t abase = static_cast<int32_t>(in.a_lit());
+    ML_CHECK(nargs == in.b_lit() && abase >= 0);
+    e.op_reg_imm(Op::minus, RSP, total * 48);
+    e.mov_rr(R10, RSP);                                  /* reg:proto */
+    for (int i = 0; i < nargs; i++) {
+        const int32_t d = i * 48;                        /* window slot */
+        const int32_t r = (abase + i) * 48;              /* run slot */
+        const bool listed = !callee->params[i].binds_scalar()
+                            && jit_slot_ref_listed(cck, i);
+        e.store_qword_base_imm32(R10, d + 32, 0);        /* reg:proto */
+        e.store_qword_base_imm32(R10, d + 40, 0);        /* reg:proto */
+        size_t j_ref = 0;
+        if (listed) {
+            e.load_base(R11, RBX, r + 24);               /* reg:proto */
+            e.load32_base(R11, R11, L.type_t_off);       /* reg:proto */
+            e.cmp_reg32_imm32(R11,                       /* reg:proto */
+                              static_cast<uint32_t>(L.t_str_val));
+            j_ref = e.j32(0x7D);                 /* jge: a reference */
+            for (int32_t o = 0; o <= 24; o += 8) {
+                e.load_base(R11, RBX, r + o);            /* reg:proto */
+                e.store_base(R11, R10, d + o);           /* reg:proto */
+            }
+        } else {
+            const FuncDescriptor::ParamDesc &pd = callee->params[i];
+            e.load_base(R11, RBX, r);                    /* reg:proto */
+            e.store_base(R11, R10, d);                   /* reg:proto */
+            if (pd.decl_type == DeclType::i) {
+                e.store_type_tag_base(R10, d + 24,       /* reg:proto */
+                                      L.t_int, R11);     /* reg:proto */
+            } else if (pd.decl_type == DeclType::f) {
+                e.store_type_tag_base(R10, d + 24,       /* reg:proto */
+                                      L.t_float, R11);   /* reg:proto */
+            } else {
+                e.load_base(R11, RBX, r + 24);           /* reg:proto */
+                e.store_base(R11, R10, d + 24);          /* reg:proto */
+            }
+        }
+        if (!listed)
+            continue;
+        const size_t j_join = e.j32(0xEB);
+        e.patch32_here(j_ref);
+        /* the helper's retaining copy RELEASES the slot's old value
+         * first (LValue::rebind) - on raw stack that is a garbage
+         * Type*, so the slot reads as `none` first */
+        e.store_type_tag_base(R10, d + 24, L.t_none, R11);  /* reg:proto */
+        e.push_reg(RDX);                                 /* reg:proto: fo */
+        e.push_reg(R9R);                                 /* reg:proto: ctx */
+        e.lea_base(RSI, RBX, r);                         /* reg:abi: &src */
+        e.lea_base(RDI, R10, d);                         /* reg:abi: &dst */
+        /* a uint64 mask bit into a u32 immediate: the cast is what
+         * keeps MSVC's C4244 (/WX) off the Windows lane */
+        e.mov_reg_imm32(RDX,                             /* reg:abi */
+            static_cast<uint32_t>((callee->noescape_params >> i) & 1u));
+        e.call_relocs.push_back(
+            { e.pos(), reinterpret_cast<const void *>(jit_bind_ref_arg) });
+        e.u8(0xE8); e.u32(0);
+        e.pop_reg(R9R);                                  /* reg:proto */
+        e.pop_reg(RDX);                                  /* reg:proto */
+        e.mov_rr(R10, RSP);                              /* reg:proto */
+        e.patch32_here(j_join);
+    }
+    /* every non-parameter slot reads as a fresh `none` until written:
+     * r11 = 0 for the tails, then the tag stores (which use it as
+     * scratch only off the arena) */
+    e.zero_reg32(R11);                                   /* reg:proto */
+    for (int sl = nargs; sl < total; sl++) {
+        e.store_base(R11, R10, sl * 48 + 32);            /* reg:proto */
+        e.store_base(R11, R10, sl * 48 + 40);            /* reg:proto */
+    }
+    for (int sl = nargs; sl < total; sl++)
+        e.store_type_tag_base(R10, sl * 48 + 24,         /* reg:proto */
+                              L.t_none, R11);            /* reg:proto */
+}
+
 void jit_mark_frameless_wanted(const Chunk &main, const JitCtx *jc)
 {
     if (!jit_norec_on() || jit_lever_off(JL_FRAMELESS))
@@ -9450,28 +9564,34 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     size_t j_done1 = 0, j_done2 = 0, j_notsent = 0;
     if (frameless_taken) {
         /*
-         * #97 INCREMENT 2 (F4/F6): THE FRAMELESS CALL. The push ended at
-         * the identity compare and the per-argument checks with rdx = fo
-         * and r9 = ctx live. The residue is pushed exactly as for a
-         * record-less call - [dst_addr|1][captures] - so the callee's
-         * frameless return arm finds the dst word at [rbp+24] and the
-         * caller's captures at [rbp+16] (F6: told apart by rbx == rsp,
-         * so bit 0 is now for the C++ decline tier and the raise arm):
-         *   - the captures are pushed STRAIGHT FROM ctx (one push, no
+         * #97 INCREMENT 2 (F4/F6) / 3 (W1): THE FRAMELESS CALL. The push
+         * ended at the identity compare and the per-argument checks
+         * with rdx = fo and r9 = ctx live. Then, in stack order:
+         *   - THE CALLEE'S WINDOW, reserved and filled HERE
+         *     (emit_frameless_window: the parameter binds from the
+         *     staged run, t_none over every other slot) - W1 moved it
+         *     from the callee's entry so the site, which knows the
+         *     callee at emit time, can bind the argument sources in
+         *     place (W2);
+         *   - the residue, exactly as for a record-less call -
+         *     [dst_addr|1][captures] - so the callee finds the dst word
+         *     at [rbp+24], the caller's captures at [rbp+16] and the
+         *     window at [rbp+32] (F6/W1: told apart by rbx == rbp+32,
+         *     so bit 0 is for the C++ decline tier and the raise arm);
+         *     the captures are pushed STRAIGHT FROM ctx (one push, no
          *     relay store on the hot path - the relay is written on the
          *     exception path only, where the C++ postexit reads it),
          *     then ctx.captures is repointed at the callee's;
-         *   - rdi = the ARGUMENT RUN (the callee copies it into its
-         *     stack window);
          *   - a DIRECT `call rel32` into the placed callee's frameless
          *     entry (the reloc finalizer trampolines an out-of-range
-         *     one) - no movabs, no indirect call.
+         *     one) - no movabs, no indirect call, no rdi.
          * No stack switch (a leaf cannot recurse), no depth counter. On
-         * return rax = the sentinel (the arm wrote dst, released its
-         * window, restored ctx.captures) or an exit pc (an exception,
-         * conveyed; the callee's exit epilogue released its window's
-         * references before the frame died). The vframe is repointed at
-         * the caller here on both paths - the callee never touches it
+         * return rax = the sentinel (the arm wrote dst, released the
+         * window's references, restored ctx.captures) or an exit pc (an
+         * exception, conveyed; the callee's exit epilogue released the
+         * window's references before its frame died). The residue and
+         * the window are dropped together on both paths, and the vframe
+         * is repointed at the caller here - the callee never touches it
          * on the way out.
          */
         const JitPushLayout &JP = jit_push_layout();
@@ -9479,6 +9599,12 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             jit_frameless_callee(ck, old_pc, in, nullptr);
         ML_CHECK(fl_callee && fl_callee->vm_chunk);
         const Chunk *fl_ck = static_cast<const Chunk *>(fl_callee->vm_chunk);
+        /* W1: the callee's window, on THIS stack, filled here (the
+         * contract: Chunk::frameless_entry_off); dropped with the
+         * residue on both return paths */
+        const int32_t fl_win =
+            (fl_ck->slot_count + fl_ck->n_temps) * 48;
+        emit_frameless_window(e, in, fl_callee, *fl_ck);
         /* the dst word: the slot address with bit 0 set, or bare 1 for a
          * discarded result (the arm masks the bit, so it reads 0 = no
          * write, exactly the record-less spelling). A ref-listed dst
@@ -9499,8 +9625,6 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                    static_cast<int32_t>(JP.fo_capture_slots));
         e.store_base(RAX, R9,                     /* reg:proto */
                      static_cast<int32_t>(jit_layout().ctx_captures));
-        e.lea_base(RDI, RBX,                      /* reg:abi: the run */
-                   static_cast<int32_t>(in.a_lit()) * 48);
 #ifdef TESTS
         g_jit_frameless_sites++;                  /* emit-time */
         e.bump_counter(&g_jit_frameless_pushes);
@@ -9520,7 +9644,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         }
         e.cmp_reg_imm(RAX, -1);
         const size_t j_fexc = e.j32(0x75);        /* jne: an exception */
-        e.op_reg_imm(Op::plus, RSP, 16);          /* drop the residue */
+        e.op_reg_imm(Op::plus, RSP, 16 + fl_win); /* the residue + window */
         /* the caller's view: vframe.slots = rbx, size = the caller's
          * total (main's = its own baked total) */
         const auto vframe_restore = [&]() {
@@ -9547,7 +9671,10 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             e.movabs(RDX, reinterpret_cast<uint64_t>(&g_jit_residue_caps));
             e.store_base0(RCX, RDX);
         }
-        e.op_reg_imm(Op::plus, RSP, 8);           /* the dst word */
+        e.op_reg_imm(Op::plus, RSP, 8 + fl_win);  /* the dst word + window
+                                                   * (its references: the
+                                                   * callee's exit released
+                                                   * them) */
         vframe_restore();
         e.mov_rr(RDI, RAX);                       /* reg:abi */
         emit_bake_call_site(e, ck, old_pc);
@@ -9980,22 +10107,28 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         e.u8(0xE8); e.u32(0);
 #endif
         /*
-         * #97 INCREMENT 2 (F6): THE FRAMELESS FRAME IS TOLD APART FIRST,
-         * AND WITHOUT A LOAD. Its window is the native stack the entry
-         * carved right below the spill area, so `rbx == rsp` at any
-         * terminator (rsp is call-ready there, every push paired) - and
-         * a segment window is a heap address that can never equal rsp.
-         * That is one compare where the record-less arm's discrimination
-         * costs three loads and lands on an arm that re-derives what the
-         * entry already knew. The arm itself is below the record-less
-         * one; only a chunk with a frameless entry emits either half.
+         * #97 INCREMENT 2 (F6) / 3 (W1): THE FRAMELESS FRAME IS TOLD
+         * APART FIRST, AND WITHOUT A LOAD. Its window is the one the
+         * CALLER built on its native stack, at a fixed offset from this
+         * frame's anchor (rbp+32, above the residue and the return
+         * address - Chunk::frameless_entry_off), so `rbx == rbp+32` at
+         * any terminator - and a segment window is a heap address that
+         * can never sit there. Two instructions (an lea and a compare)
+         * where the record-less arm's discrimination costs three loads
+         * and lands on an arm that re-derives what the entry already
+         * knew. (Increment 2's window was the callee's own stack and
+         * the test was `rbx == rsp`, one instruction; W1 moved the
+         * window to the caller so the site could fill it in place.)
+         * The arm itself is below the record-less one; only a chunk
+         * with a frameless entry emits either half.
          */
         size_t j_frameless = 0;
         const bool arm_frameless =
             jit_norec_on() && ck.frameless_ok && ck.frameless_wanted
             && !jit_lever_off(JL_FRAMELESS);
         if (arm_frameless) {
-            e.cmp_rr(RBX, RSP);                    /* cmp rbx, rsp */
+            e.lea_base(RAX, RBP, JIT_FRAMELESS_WIN_OFF);  /* reg:proto */
+            e.cmp_rr(RAX, RBX);                    /* cmp rax, rbx */
             j_frameless = e.j32(0x74);             /* je frameless arm */
         }
         /* r8 = act, r10 = top_rec (OUR record) */
@@ -27135,37 +27268,32 @@ retry_emission:
         }
 
         /*
-         * #97 INCREMENT 2 (F2): THE FRAMELESS ENTRY - the callee half
-         * of the frameless protocol (Chunk::frameless_entry_off has the
-         * contract). Emitted for a frameless_ok body whose whole code is
-         * this one run; it takes rdi = the CALLER's argument run
-         * (params.size() contiguous slots, exact types - the baked
-         * push's own per-argument checks precede the call) and builds
-         * the frame itself:
+         * #97 INCREMENT 2 (F2) / INCREMENT 3 (W1): THE FRAMELESS ENTRY
+         * - the callee half of the frameless protocol
+         * (Chunk::frameless_entry_off has the contract). Emitted for a
+         * frameless_ok body whose whole code is this one run. THE
+         * CALLER BUILT THE WINDOW: the site reserved it on its own
+         * native stack, bound every parameter into it and initialised
+         * every other slot, then pushed the residue and called - so the
+         * window sits at a fixed offset from this frame's anchor
+         * ([rbp+32], above the residue's two words and the return
+         * address) and the entry is:
          *   frag_entry                the recorded entry's prologue,
          *                             verbatim - so [rbp-8] is still the
          *                             caller's window and every
          *                             rbp-relative spill home keeps its
          *                             offset;
-         *   sub rsp, N*48 ; rbx=rsp   the window, on the native stack -
-         *                             16-aligned since 48 is, rsp was;
-         *   the argument copy         four qwords per parameter from
-         *                             [rdi], the container/flag tail
-         *                             zeroed (the push's scalar arm);
-         *   t_none over every other   the release scan and the
-         *   slot's type word          VM_HARDENING pop audit read every
-         *                             listed / every slot;
+         *   lea rbx, [rbp+32]         the window;
          *   act.vframe = the window   helpers reach the frame there;
          *   establish(begin) ; jmp    the head's own register contract.
          * NOT emitted: the segment fit test and bump, the record or its
          * record-less fork, the residue and relay pushes, the depth
-         * counter - the activation bookkeeping the contract counted at
-         * 71 of a 142-Ir call. The return is the record-less arm's, told
-         * apart by bit 0 of [rbp+24] (F3); the exits are the shared
-         * epilogues, whose teardown is absolute (frag_ret).
-         *
-         * UNREACHABLE at this increment: no site calls it yet (F4). The
-         * lever keeps the whole tier off in the differential matrix.
+         * counter, and (W1) the argument copy and the slot init - all
+         * of which are the SITE's, where the callee is an emit-time
+         * fact and the argument sources are in hand (the fusion W2
+         * spends). The return is the record-less arm's, told apart by
+         * rbx == rbp+32 (F6/W1); the exits are the shared epilogues,
+         * whose teardown is absolute (frag_ret).
          */
         if (chunk.frameless_ok && chunk.frameless_wanted
                 && g_cur_caller_desc && runs.size() == 1
@@ -27174,135 +27302,15 @@ retry_emission:
             const JitLayout &L = jit_layout();
             const JitPushLayout &P = jit_push_layout();
             const int total = chunk.slot_count + chunk.n_temps;
-            const int nargs =
-                static_cast<int>(g_cur_caller_desc->params.size());
             const uint8_t R8R = 8, R11 = 11;
             fe_off = static_cast<int64_t>(e.pos());
             {
-            /* the whole frame build is pin MACHINERY to the tracker: no
-             * pin is live before establish() below loads it, and the
-             * bind helper's argument registers (rsi/rdi/rdx) may be a
-             * tag grant or a pin in the body's final state */
+            /* the frame build is pin MACHINERY to the tracker: no pin
+             * is live before establish() below loads it */
             Emitter::PinMach pm(e);
-            e.frag_entry(/*load_window=*/false);  /* rdi stays the run */
-            /* the window: below the spill area, rbx repointed */
-            e.op_reg_imm(Op::minus, RSP, total * 48);
-            e.mov_rr(RBX, RSP);
-            /*
-             * The arguments: [rdi + i*48] -> [rbx + i*48]. This is the
-             * push's copy loop with the CALLEE answering every question
-             * at emit time, because the callee is what is being compiled:
-             *   binds_scalar()     an int/float-declared or proven param
-             *                      can only receive a scalar (the baked
-             *                      push's coercing checks ran first) -
-             *                      four qwords copied, the container/flag
-             *                      tail zeroed, no test;
-             *   not ref-listed     a slot outside ref_slots never holds
-             *                      a reference (the chunk invariant the
-             *                      release scan trusts) - the same arm;
-             *   otherwise          the source's type is tested and a
-             *                      REFERENCE goes to jit_bind_ref_arg -
-             *                      the retaining copy, or #94's borrow
-             *                      when bit i of noescape_params says the
-             *                      reference cannot outlive the call - a
-             *                      bit that is a CONSTANT here where the
-             *                      push had to load it.
-             * ⛔ A raw copy of a reference is a use-after-free: the
-             * callee's release scan would drop a count it never took
-             * (watched: jit_ret_inline_c4c's `h(arr, n)`). rdi is the
-             * fragment's argument register (the caller's run pointer);
-             * r11 is entry scratch - every pin load comes AFTER this,
-             * from the window these stores fill. The helper call saves
-             * rdi across itself (two pushes keep the call parity that
-             * frag_entry and the 48-byte window preserve).
-             */
-            for (int i = 0; i < nargs; i++) {
-                const int32_t d = i * 48;
-                const bool listed =
-                    !g_cur_caller_desc->params[i].binds_scalar()
-                    && jit_slot_ref_listed(chunk, i);
-                /* the container/flag tail FIRST, for both arms: the
-                 * window is raw stack, and the bind helper's
-                 * ML_CHECK(!borrowed) reads the slot's OLD flag - which a
-                 * segment window always has clear and this one does not */
-                e.store_qword_base_imm32(RBX, d + 32, 0);
-                e.store_qword_base_imm32(RBX, d + 40, 0);
-                size_t j_ref = 0;
-                if (listed) {
-                    e.load_base(R11, RDI, d + 24);   /* reg:abi reg:proto */
-                    e.load32_base(R11, R11, L.type_t_off);   /* reg:proto */
-                    e.cmp_reg32_imm32(R11,                   /* reg:proto */
-                                      static_cast<uint32_t>(L.t_str_val));
-                    j_ref = e.j32(0x7D);             /* jge: a reference */
-                    for (int32_t o = 0; o <= 24; o += 8) {
-                        e.load_base(R11, RDI, d + o); /* reg:abi reg:proto */
-                        e.store_base(R11, RBX, d + o);  /* reg:proto */
-                    }
-                } else {
-                    /* a SCALAR: the 8-byte payload, and the type word -
-                     * copied for a PROVEN param (inference stamps `i` for
-                     * a bool too, so the tag must travel), an immediate
-                     * for a DECLARED int/float one, whose bind coercion
-                     * (the baked push's 1c checks) guarantees the exact
-                     * tag is in the run slot */
-                    const FuncDescriptor::ParamDesc &pd =
-                        g_cur_caller_desc->params[i];
-                    e.load_base(R11, RDI, d);       /* reg:abi reg:proto */
-                    e.store_base(R11, RBX, d);      /* reg:proto */
-                    if (pd.decl_type == DeclType::i) {
-                        e.store_type_tag_base(RBX, d + 24, L.t_int,
-                                              R11);  /* reg:proto */
-                    } else if (pd.decl_type == DeclType::f) {
-                        e.store_type_tag_base(RBX, d + 24, L.t_float,
-                                              R11);  /* reg:proto */
-                    } else {
-                        e.load_base(R11, RDI, d + 24);  /* reg:abi reg:proto */
-                        e.store_base(R11, RBX, d + 24); /* reg:proto */
-                    }
-                }
-                if (!listed)
-                    continue;
-                const size_t j_join = e.j32(0xEB);
-                e.patch32_here(j_ref);
-                /* the helper's retaining copy RELEASES the slot's old
-                 * value first (LValue::rebind) - on raw stack that is a
-                 * garbage Type*, so the slot reads as `none` first */
-                e.store_type_tag_base(RBX, d + 24, L.t_none,
-                                      R11);          /* reg:proto */
-                e.push_reg(RDI);                    /* reg:abi */
-                e.op_reg_imm(Op::minus, RSP, 8);    /* pad: call parity */
-                e.lea_base(RSI, RDI, d);            /* reg:abi: &src */
-                e.lea_base(RDI, RBX, d);            /* reg:abi: &dst */
-                /* a uint64 mask bit into a u32 immediate: the cast is
-                 * what keeps MSVC's C4244 (/WX) off the Windows lane */
-                e.mov_reg_imm32(RDX,                /* reg:abi: can_borrow */
-                    static_cast<uint32_t>(
-                        (g_cur_caller_desc->noescape_params >> i) & 1u));
-                e.call_relocs.push_back(
-                    { e.pos(),
-                      reinterpret_cast<const void *>(jit_bind_ref_arg) });
-                e.u8(0xE8); e.u32(0);
-                e.op_reg_imm(Op::plus, RSP, 8);
-                e.pop_reg(RDI);                     /* reg:abi */
-                e.patch32_here(j_join);
-            }
-            /* every non-parameter slot reads as a fresh `none` until
-             * written: the type word, AND the container/flag tail - a
-             * helper writing a slot goes through LValue::put, which
-             * reads `container` and `borrowed` before it stores (watched:
-             * jit_container's `f([1, 2])` result temp, put by a helper
-             * into raw stack). The segment never had to pay this: its
-             * slots are constructed once and the pop's clear keeps them
-             * so. r11 = 0 for the tails, then the tag stores (which use
-             * it as scratch only off the arena). */
-            e.zero_reg32(R11);                              /* reg:proto */
-            for (int sl = nargs; sl < total; sl++) {
-                e.store_base(R11, RBX, sl * 48 + 32);       /* reg:proto */
-                e.store_base(R11, RBX, sl * 48 + 40);       /* reg:proto */
-            }
-            for (int sl = nargs; sl < total; sl++)
-                e.store_type_tag_base(RBX, sl * 48 + 24, L.t_none,
-                                      R11);                 /* reg:proto */
+            e.frag_entry(/*load_window=*/false);  /* rdi: unused here */
+            /* the window the caller built: [rbp+32] (the contract) */
+            e.lea_base(RBX, RBP, JIT_FRAMELESS_WIN_OFF);
             /* act.vframe = this window (helpers read the frame there);
              * r8 = act is the push protocol's own register for it */
             e.load_global(R8R, L.addr_act, R11);            /* reg:proto */

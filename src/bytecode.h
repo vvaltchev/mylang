@@ -1837,16 +1837,22 @@ struct Chunk {
     /*
      * #97 increment 2: the FRAMELESS ENTRY (derived post-JIT, never
      * serialized, -1 = none). A second prologue for a `frameless_ok`
-     * body: it takes rdi = the CALLER's argument run and allocates the
-     * window on the NATIVE STACK (`sub rsp, N*48`; rbx = rsp), copies
-     * the arguments in, writes t_none over every other slot's type
-     * word, points act.vframe at the window, then replays the run
-     * head's establishment (tags, pins, literals) and jumps to the
-     * first op. No segment, no record, no record-less fork. The body,
-     * the return arm and the exit epilogues are SHARED with the
-     * recorded entry - a frameless frame is told apart at its return
-     * by bit 0 of the dst word the caller pushed ([rbp+24]), and its
-     * teardown is frag_ret's absolute `lea rsp, [rbp-K]`.
+     * body. THE CALLER BUILDS THE WINDOW (increment 3, W1): the site
+     * reserves N*48 bytes on ITS native stack, fills the parameter
+     * slots (the bind - scalar copy, or the reference bind helper),
+     * writes t_none over every other slot's type word, pushes the
+     * residue ([dst|1][captures]) below it and calls. So in the
+     * callee the window is at a FIXED offset from its frame anchor:
+     * [rbp+8] the return address, [rbp+16] the caller's captures,
+     * [rbp+24] the dst word, [rbp+32..] the window - and the entry is
+     * `frag_entry; lea rbx, [rbp+32]; act.vframe = rbx; establish;
+     * jmp`. No segment, no record, no record-less fork, no argument
+     * copy of its own. The body, the return arm and the exit epilogues
+     * are SHARED with the recorded entry - a frameless frame is told
+     * apart at its return by `rbx == rbp+32` (a segment window can
+     * never sit there), its teardown is frag_ret's absolute
+     * `lea rsp, [rbp-K]`, and the site drops the residue and the
+     * window together on both return paths.
      */
     int64_t frameless_entry_off = -1;
 

@@ -27768,6 +27768,363 @@ static bool vm_disasm_driver_jit_parity()
 }
 
 /*
+ * THE EXPECTED-SEQUENCE HARNESS (#97 increment 3). Increment 3's
+ * micro-steps are verified on the DISASSEMBLY: the expected `-vdj`
+ * text of a protocol piece is written first, the emitter is changed,
+ * and the two are compared instruction for instruction - before any
+ * number is measured. These helpers read a `-vdj` dump (the same text
+ * a human reads, reproducible by construction: <addr>/<int-tag>/
+ * <helper> in place of every baked pointer) and match a sequence of
+ * instruction PATTERNS against it, `*` matching any run of characters
+ * (a layout-probed displacement, a jump target, a slot name).
+ *
+ * The TESTS build interleaves its instrumentation - the counter bump
+ * quadruple `push rax / movabs rax, <addr> / inc [rax+0x0] / pop rax`
+ * is `e.bump_counter`, `#ifdef TESTS` by construction - so a sequence
+ * is read with those quadruples REMOVED and the expectation describes
+ * the shipping build's code. An expectation that starts AFTER an
+ * instrumentation prologue (the entry RA check, the return-arm oracle)
+ * simply starts at the first shipping instruction.
+ */
+struct NativeIns { uint32_t off; std::string text; };
+
+/* the instructions of one chunk section's native dump, in offset order,
+ * comments stripped; `section` is the `; ===== <title>` header text */
+static std::vector<NativeIns>
+native_ins_of(const std::string &dump, const std::string &section)
+{
+    std::vector<NativeIns> out;
+    const size_t s = dump.find("; ===== " + section);
+    if (s == std::string::npos)
+        return out;
+    size_t e = dump.find("---- end native ----", s);
+    if (e == std::string::npos)
+        e = dump.size();
+    size_t p = s;
+    while (p < e) {
+        size_t nl = dump.find('\n', p);
+        if (nl == std::string::npos || nl > e)
+            nl = e;
+        std::string line = dump.substr(p, nl - p);
+        p = nl + 1;
+        /* `       .   +NNN: mnemonic operands   ; comment` */
+        const size_t plus = line.find("   +");
+        const size_t colon = plus == std::string::npos
+                                 ? std::string::npos : line.find(": ", plus);
+        if (plus == std::string::npos || colon == std::string::npos
+                || line.compare(0, 9, "       . ") != 0)
+            continue;
+        const uint32_t off = static_cast<uint32_t>(
+            std::atoi(line.c_str() + plus + 4));
+        std::string text = line.substr(colon + 2);
+        const size_t cm = text.find(" ;");       /* the trailing comment */
+        if (cm != std::string::npos)
+            text.erase(cm);
+        while (!text.empty() && text.back() == ' ')
+            text.pop_back();
+        out.push_back({ off, text });
+    }
+    /* strip the TESTS counter bumps (see above) */
+    std::vector<NativeIns> kept;
+    for (size_t i = 0; i < out.size(); i++) {
+        if (i + 3 < out.size() && out[i].text == "push rax"
+                && out[i + 1].text == "movabs rax, <addr>"
+                && out[i + 2].text == "inc [rax+0x0]"
+                && out[i + 3].text == "pop rax") {
+            i += 3;
+            continue;
+        }
+        kept.push_back(out[i]);
+    }
+    return kept;
+}
+
+/* `*` matches any run of characters (including none) */
+static bool native_pat_match(const char *pat, const char *s)
+{
+    while (*pat) {
+        if (*pat == '*') {
+            pat++;
+            for (const char *t = s; ; t++) {
+                if (native_pat_match(pat, t))
+                    return true;
+                if (!*t)
+                    return false;
+            }
+        }
+        if (*pat != *s)
+            return false;
+        pat++; s++;
+    }
+    return *s == 0;
+}
+
+/* the index of the first instruction at or after `off` whose text
+ * matches `pat`, or npos */
+static size_t native_find(const std::vector<NativeIns> &ins, uint32_t off,
+                          const char *pat)
+{
+    for (size_t i = 0; i < ins.size(); i++)
+        if (ins[i].off >= off && native_pat_match(pat, ins[i].text.c_str()))
+            return i;
+    return std::string::npos;
+}
+
+/*
+ * A PIN THAT HOLDS IN BOTH TAG CONFIGURATIONS (found by the nolowmem
+ * lane, 2026-09-21: three shape tests pinned the arena spelling and
+ * failed off it). On the low arena a type tag or a global's address is
+ * an imm32 - `mov [d], <int-tag>`, `cmp x, <addr>`, `mov r8, [<addr>]`;
+ * off it (MYLANG_NO_LOWMEM=1, the nolowmem lane, and every platform
+ * without MAP_32BIT) the emitter materialises it through a scratch
+ * register first. A want line names that register after `@`, and is
+ * EXPANDED here into the two-instruction form when the arena is
+ * unavailable:
+ *     `OP X, <tok>@sc`      -> `movabs sc, <tok>` + `OP X, sc`
+ *     `mov R, [<addr>]@sc`  -> `movabs sc, <addr>` + `mov R, [sc+0x0]`
+ * and a line ending in `@-` exists ONLY off-arena (the entry's
+ * register-form singletons). The scratch is each SITE's own contract
+ * (r11 at the frameless fill, rax at a global load or a func-tag
+ * compare), so it is named per line, never guessed.
+ */
+static bool native_tags_imm()
+{
+    return ml_lowmem_fits_imm32(AllTypes[Type::t_int]);
+}
+
+static std::vector<std::string>
+native_want_expand(const std::vector<const char *> &want)
+{
+    const bool imm = native_tags_imm();
+    std::vector<std::string> out;
+    for (const char *w : want) {
+        const std::string line = w;
+        const size_t at = line.rfind('@');
+        if (at == std::string::npos) {
+            out.push_back(line);
+            continue;
+        }
+        const std::string body = line.substr(0, at);
+        const std::string sc = line.substr(at + 1);
+        if (sc == "-") {                    /* off-arena only */
+            if (!imm)
+                out.push_back(body);
+            continue;
+        }
+        if (imm) {
+            out.push_back(body);
+            continue;
+        }
+        const size_t comma = body.rfind(", ");
+        ML_CHECK(comma != std::string::npos);
+        const std::string lhs = body.substr(0, comma);
+        const std::string rhs = body.substr(comma + 2);
+        if (rhs == "[<addr>]") {
+            out.push_back("movabs " + sc + ", <addr>");
+            out.push_back(lhs + ", [" + sc + "+0x0]");
+        } else {
+            out.push_back("movabs " + sc + ", " + rhs);
+            out.push_back(lhs + ", " + sc);
+        }
+    }
+    return out;
+}
+
+/* match `want` against the instructions from index `at`; on a mismatch
+ * name the first differing instruction (and the whole window read) */
+static bool native_expect(const std::vector<NativeIns> &ins, size_t at,
+                          const std::vector<const char *> &want_in,
+                          const char *what)
+{
+    const std::vector<std::string> want = native_want_expand(want_in);
+    for (size_t k = 0; k < want.size(); k++) {
+        const bool have = at + k < ins.size();
+        if (have && native_pat_match(want[k].c_str(),
+                                     ins[at + k].text.c_str()))
+            continue;
+        fprintf(stderr, "%s: instruction %zu: want `%s`, have `%s`\n",
+                what, k, want[k].c_str(),
+                have ? ins[at + k].text.c_str() : "<end of fragment>");
+        fprintf(stderr, "%s: the sequence read:\n", what);
+        for (size_t j = at; j < ins.size() && j < at + want.size() + 2; j++)
+            fprintf(stderr, "    +%u: %s\n", ins[j].off, ins[j].text.c_str());
+        return false;
+    }
+    return true;
+}
+
+/* the `-vdj` dump of a source, through the real dump driver */
+static std::string native_dump_of(const std::vector<const char *> &lines)
+{
+    const bool ann_was = g_jit_annotate;
+    g_jit_annotate = true;
+    struct AnnRestore {
+        bool v; ~AnnRestore() { g_jit_annotate = v; }
+    } ann_restore{ ann_was };
+    std::string src;
+    for (const char *l : lines) { src += l; src += '\n'; }
+    std::vector<Tok> toks;
+    lexer(src, 1, toks);
+    ParseContext pc(TokenStream(toks), true);
+    unique_ptr<Construct> root = pBlock(pc);
+    mark_implicit_globals(root.get(), {});
+    infer_types(root.get(), true);
+    run_optimizers(root.get());
+    const Block *b = dynamic_cast<const Block *>(root.get());
+    return b ? disassemble_program(b) : std::string();
+}
+
+/* the offset a chunk section's `; frameless entry @+N` names, or -1 */
+static long native_frameless_entry_off(const std::string &dump,
+                                       const std::string &section)
+{
+    const size_t s = dump.find("; ===== " + section);
+    if (s == std::string::npos)
+        return -1;
+    const size_t f = dump.find("; frameless entry @+", s);
+    const size_t next = dump.find("; ===== ", s + 8);
+    if (f == std::string::npos || (next != std::string::npos && f > next))
+        return -1;
+    return std::atol(dump.c_str() + f + 20);
+}
+
+/*
+ * #97 increment 3, W1 - THE CALLER BUILDS THE WINDOW. The expected
+ * disassembly of 78's `add(i)`, read from the dump:
+ *  - the callee's frameless ENTRY is the recorded prologue plus
+ *    `lea rbx, [rbp+32]` and the vframe repoint - no window carve, no
+ *    argument copy, no slot init (all three moved to the site);
+ *  - the return arm tells the frame apart by `rbx == rbp+32`, an lea
+ *    and a compare, no load;
+ *  - the SITE reserves the callee's 3 slots (144 bytes), fills the
+ *    parameter from the staged run slot (payload, the declared int tag
+ *    as an immediate, a zeroed tail), gives the two temps a zero tail
+ *    and a t_none type word, pushes the residue, calls, and drops the
+ *    residue and the window together (160) on the sentinel path.
+ * W2 rewrites the site's fill (the staging move disappears); this
+ * expectation is W1's and is replaced with it.
+ */
+static bool jit_frameless_w1_shape()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    std::string d;
+    try {
+        d = native_dump_of({
+            "func make_adder(int base) {",
+            "  return func [base] (int k) { return base + k; }; }",
+            "var add = make_adder(7);",
+            "var s = 0;",
+            "for (var i = 0; i < runtime(40); i++) s = s + add(i);",
+            "print(s);" });
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_frameless_w1_shape: threw %s: %s\n", e.name,
+                e.msg);
+        return false;
+    }
+    bool ok = true;
+    /* the callee: closure#0 */
+    const std::vector<NativeIns> cl = native_ins_of(d, "closure#0");
+    const long fe = native_frameless_entry_off(d, "closure#0");
+    if (fe < 0 || cl.empty()) {
+        fprintf(stderr, "jit_frameless_w1_shape: closure#0 has no "
+                        "frameless entry in the dump\n");
+        return false;
+    }
+    {
+        const size_t at = native_find(cl, static_cast<uint32_t>(fe),
+                                      "push rbp");
+        ok = at != std::string::npos
+             && native_expect(cl, at, {
+                    "push rbp",
+                    "mov rbp, rsp",
+                    "push rbx",
+                    "sub rsp, 8",
+                    "lea rbx, [rbp+0x20]",       /* the caller's window */
+                    "mov r8, [<addr>]@r11",      /* act */
+                    "mov [r8+0x*], rbx",         /* vframe.slots */
+                    "mov [r8+0x*], 3",           /* vframe.size = 3 */
+                    "movabs rsi, <int-tag>@-",   /* the register-form
+                                                  * singletons, off-arena */
+                    "movabs r8, <float-tag>@-",
+                    "jmp +*" }, "W1 entry") && ok;
+    }
+    {
+        /* the return arm: the discriminator, then the frameless arm at
+         * its `je` target - the dst word, the old dst's type test, the
+         * two-qword result copy, ctx.captures back from [rbp+16] */
+        const size_t at = native_find(cl, 0, "lea rax, [rbp+0x20]");
+        ok = at != std::string::npos
+             && native_expect(cl, at, {
+                    "lea rax, [rbp+0x20]",
+                    "cmp rax, rbx",
+                    "je +*" }, "W1 arm discriminator") && ok;
+        if (ok) {
+            const uint32_t tgt = static_cast<uint32_t>(
+                std::atoi(cl[at + 2].text.c_str() + 4));
+            const size_t arm = native_find(cl, tgt, "mov rdx, [rbp+0x18]");
+            ok = arm != std::string::npos
+                 && native_expect(cl, arm, {
+                        "mov rdx, [rbp+0x18]",
+                        "and rdx, -2",
+                        "test rdx, rdx",
+                        "je +*",
+                        "mov rax, [rdx+0x18]",
+                        "cmp [rax+0x8], 8",
+                        "jge +*",
+                        "mov r11, r2",
+                        "mov [rdx+0x0], r11",
+                        "mov r11, r2.type",
+                        "mov [rdx+0x18], r11",
+                        "mov r9, [<addr>]@rax",
+                        "mov rax, [rbp+0x10]",
+                        "mov [r9+0x*], rax",
+                        "mov rax, -1",
+                        "lea rsp, [rbp-0x8]",
+                        "pop rbx",
+                        "pop rbp",
+                        "ret" }, "W1 frameless arm") && ok;
+        }
+    }
+    /* the site, in main */
+    const std::vector<NativeIns> mn = native_ins_of(d, "main");
+    {
+        const size_t at = native_find(mn, 0, "sub rsp, 144");
+        ok = at != std::string::npos
+             && native_expect(mn, at, {
+                    "sub rsp, 144",              /* the callee's 3 slots */
+                    "mov r10, rsp",
+                    "mov [r10+0x20], 0",         /* param 0: the tail */
+                    "mov [r10+0x28], 0",
+                    "mov r11, r*",               /* from the run slot */
+                    "mov [r10+0x0], r11",
+                    "mov [r10+0x18], <int-tag>@r11",  /* declared int */
+                    "xor r11, r11",              /* the two temps' tails */
+                    "mov [r10+0x50], r11",
+                    "mov [r10+0x58], r11",
+                    "mov [r10+0x80], r11",
+                    "mov [r10+0x88], r11",
+                    "mov [r10+0x48], <addr>@r11", /* t_none */
+                    "mov [r10+0x78], <addr>@r11",
+                    "lea rcx, [rbx+0x*]",        /* dst|1 */
+                    "push rcx",
+                    "push [r9+0x*]",             /* the caller's captures */
+                    "lea rax, [rdx+0x*]",        /* ctx.captures = callee's */
+                    "mov [r9+0x*], rax",
+                    "call <helper>",             /* the frameless entry */
+                    "cmp rax, -1",
+                    "jne +*",
+                    "add rsp, 160" },            /* residue + window */
+                    "W1 site") && ok;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * #97 increment 2 (F4): THE FRAMELESS CALL - main's site calls a
  * frameless_ok leaf through its frameless entry (no segment window, no
  * record, no fork). Reach is g_jit_frameless_pushes, bumped by the
@@ -40340,6 +40697,10 @@ static const std::vector<extra_check> extra_checks =
       "frameless pre-pass, main's map), and a deleted-originals "
       "fragment's marks name the original ops",
       vm_disasm_driver_jit_parity },
+    { "jit: #97 inc 3 (W1) - the CALLER builds the frameless window: the "
+      "expected entry, discriminator, arm and site sequences, read from "
+      "the dump",
+      jit_frameless_w1_shape },
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },
