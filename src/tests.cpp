@@ -27670,6 +27670,104 @@ static bool jit_frameless_entry_emitted()
 }
 
 /*
+ * THE DUMP DRIVER RUNS THE JIT SEQUENCE A RUN DOES. `-vd`/`-vdj` is a
+ * SECOND codegen driver (disassemble_program), and a hand copy of the
+ * pass sequence there went stale twice without a net: main was jitted
+ * with no JitCtx after #97 step 4 gave main the map, and the #97 inc 2
+ * pre-pass never ran - so the dump showed the generic `call rdx` push
+ * on a program whose run took every call framelessly. The three drivers
+ * share vm_jit_program now; this pins the property itself, from the
+ * dump: the two emit-time counters the frameless tier bumps ONLY when
+ * the pre-pass and main's map are both present advance by the four
+ * leaves of 78's shape (two factories, two closures), and the dump's
+ * text carries the entry line for each. Plus the mark fix from the same
+ * session: a delete-originals fragment's marks name the ORIGINAL ops
+ * (`; vm op N: call.val ...`), where every mark used to read
+ * `enter.nat`.
+ */
+static bool vm_disasm_driver_jit_parity()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const bool ann_was = g_jit_annotate;
+    g_jit_annotate = true;
+    struct AnnRestore {
+        bool v; ~AnnRestore() { g_jit_annotate = v; }
+    } ann_restore{ ann_was };
+    std::string src;
+    for (const char *l : {
+            "func make_adder(int base) {",
+            "  return func [base] (int k) { return base + k; }; }",
+            "func make_scaler(float f) {",
+            "  return func [f] (float x) { return f * x; }; }",
+            "var add = make_adder(7);",
+            "var scale_it = make_scaler(0.5);",
+            "var s = 0; var t = 0.0;",
+            "for (var i = 0; i < runtime(40); i++) {",
+            "  s = s + add(i); t = t + scale_it(i); }",
+            "print(s, t);" }) {
+        src += l;
+        src += '\n';
+    }
+    std::vector<Tok> toks;
+    lexer(src, 1, toks);
+    std::string d;
+    const unsigned long e0 = g_jit_frameless_entries;
+    const unsigned long s0 = g_jit_frameless_sites;
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        const Block *b = dynamic_cast<const Block *>(root.get());
+        if (!b)
+            return false;
+        d = disassemble_program(b);
+    } catch (Exception &e) {
+        fprintf(stderr, "vm_disasm_driver_jit_parity: threw %s: %s\n",
+                e.name, e.msg);
+        return false;
+    }
+    const unsigned long entries = g_jit_frameless_entries - e0;
+    const unsigned long sites = g_jit_frameless_sites - s0;
+    bool ok = true;
+    /* FOUR, not two: the two factories are leaves main calls once
+     * each (`make.closure; ret`), so they qualify exactly like the two
+     * closures - the count JITSTATS reports for bench/my/78 */
+    if (entries != 4 || sites != 4) {
+        fprintf(stderr, "vm_disasm_driver_jit_parity: the dump driver "
+                        "emitted %lu frameless entries and %lu frameless "
+                        "sites (want 4 and 4) - it is not running the "
+                        "sequence a run does\n", entries, sites);
+        ok = false;
+    }
+    size_t n_entry_lines = 0;
+    for (size_t p = d.find("; frameless entry @+"); p != std::string::npos;
+         p = d.find("; frameless entry @+", p + 1))
+        n_entry_lines++;
+    if (n_entry_lines != 4) {
+        fprintf(stderr, "vm_disasm_driver_jit_parity: %zu `frameless "
+                        "entry` header lines in the dump (want 4)\n",
+                n_entry_lines);
+        ok = false;
+    }
+    /* the readable marks: main's ops were deleted (#56), and the
+     * fragment's marks must still name them */
+    if (d.find("; vm op ") == std::string::npos
+            || d.find(": call.val") == std::string::npos) {
+        fprintf(stderr, "vm_disasm_driver_jit_parity: main's fragment "
+                        "marks do not name the deleted originals\n");
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * #97 increment 2 (F4): THE FRAMELESS CALL - main's site calls a
  * frameless_ok leaf through its frameless entry (no segment window, no
  * record, no fork). Reach is g_jit_frameless_pushes, bumped by the
@@ -40238,6 +40336,10 @@ static const std::vector<extra_check> extra_checks =
       "leaf's frameless entry (closures, temps, a reference result, "
       "borrowed/retained params, a discarded dst, exceptions both ways)",
       jit_frameless_call_reach },
+    { "vm: -vd/-vdj's driver runs the JIT sequence a run does (the "
+      "frameless pre-pass, main's map), and a deleted-originals "
+      "fragment's marks name the original ops",
+      vm_disasm_driver_jit_parity },
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },

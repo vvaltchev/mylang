@@ -106,8 +106,8 @@ std::string opsym(Op op)
 }
 
 /* The bare enum NAME of an opcode (for the M1 container-plan blocker list -
- * the full mnemonic lives in render_row's per-op switch; here the enum spelling
- * is the clearest "what op is blocking nativization"). */
+ * the full mnemonic lives in render_instr's per-op switch; here the enum
+ * spelling is the clearest "what op is blocking nativization"). */
 const char *opcode_name(OpCode op)
 {
 #define ML_OPCODE_NAME(N) case OpCode::N: return #N;
@@ -1122,7 +1122,9 @@ static bool vdj_hex_on()
 
 void disasm_native_frag(std::ostream &s, const uint8_t *code,
                         const NativeCode::Frag &frag, const SlotNamer &nm,
-                        const std::function<std::string(size_t)> &render_row)
+                        const std::function<std::string(const Instr &)>
+                            &render_instr,
+                        bool deleted_originals)
 {
     const void *ti = nullptr, *tf = nullptr, *ta = nullptr;
     jit_type_singletons(ti, tf, ta);
@@ -1155,12 +1157,21 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
             mi++;
         }
         while (mi < frag.marks.size() && frag.marks[mi].off == p) {
-            const uint32_t vpc = frag.marks[mi].vm_pc;
+            const NativeCode::OpMark &mk = frag.marks[mi];
             if (!first)
                 s << "       .\n";
             first = false;
-            s << "       . ; vm pc " << vpc << ": " << render_row(vpc)
-              << "\n";
+            /* the mark's own copy of the op: on a delete-originals
+             * fragment (#56) the rebuilt code holds only the EnterNative
+             * head, so the op is named by its PRE-remap pc - the only
+             * numbering it still has (`vm op`, not `vm pc`, so a reader
+             * does not look for it in the listing above) */
+            if (deleted_originals)
+                s << "       . ; vm op " << mk.orig_pc << ": "
+                  << render_instr(mk.orig) << "\n";
+            else
+                s << "       . ; vm pc " << mk.vm_pc << ": "
+                  << render_instr(mk.orig) << "\n";
             mi++;
         }
         const uint32_t st = p;
@@ -1293,6 +1304,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
     if (chunk.native_leaf)
         s << "; native_leaf: whole body -> one fragment @+"
           << chunk.native_entry_off << "  (call-able; #55)\n";
+    /* #97 inc 2: the second prologue, emitted only when MAIN's pre-pass
+     * (jit_mark_frameless_wanted) found a site that will call it */
+    if (chunk.frameless_entry_off >= 0)
+        s << "; frameless entry @+" << chunk.frameless_entry_off
+          << "  (a leaf main calls with no record; #97)\n";
     /* plans/archived/model-flip.md M1: the container plan - how this body partitions
      * into NATIVE / ISLAND segments, and whether it could be ONE native
      * container. For a mixed body, list each island's pc span + the distinct
@@ -1376,8 +1392,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
 
     /* Render ONE VM op's mnemonic (shared by the main listing and the
      * -vdj native fragment's `; vm pc N: <op>` markers). */
-    auto render_row = [&](size_t pc) -> std::string {
-        const Instr &in = chunk.code[pc];
+    auto render_instr = [&](const Instr &in) -> std::string {
         std::ostringstream row;
 
         switch (in.op) {
@@ -2043,7 +2058,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
 
     for (size_t pc = 0; pc < chunk.code.size(); pc++) {
         const Instr &in = chunk.code[pc];
-        s << std::setw(4) << pc << "  " << render_row(pc) << "\n";
+        s << std::setw(4) << pc << "  " << render_instr(in) << "\n";
 
         /* -vdj: after an EnterNative line, disassemble its fragment. */
         if (in.op == OpCode::EnterNative && chunk.native.base
@@ -2051,11 +2066,21 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             const uint32_t off = static_cast<uint32_t>(in.a_lit());
             for (const NativeCode::Frag &fr : chunk.native.frags)
                 if (fr.start == off) {
+                    /* a fragment whose ops were DELETED (#56) has more
+                     * marks than the surviving code has ops after its
+                     * head - its marks name the originals */
+                    bool deleted = false;
+                    for (const NativeCode::OpMark &mk : fr.marks)
+                        if (mk.vm_pc >= chunk.code.size()
+                                || chunk.code[mk.vm_pc].op != mk.orig.op) {
+                            deleted = true;
+                            break;
+                        }
                     disasm_native_frag(
                         s, static_cast<const uint8_t *>(chunk.native.base)
                                + fr.start, fr,
                         [&chunk](int sl) { return reg(chunk, sl); },
-                        render_row);
+                        render_instr, deleted);
                     break;
                 }
         }
@@ -2215,19 +2240,20 @@ std::string disassemble_program(const Block *root)
             bc_inline_chunk(it->second, slot_desc, bc_snaps);
     }
 
-    /* Pass B: jit each body with its JitCtx (caller_desc = its own descriptor).
-     * Main gets no JitCtx - a call from main is never native (as at runtime). */
+    /* Pass B: the native tier through the ONE driver (vm_jit_program,
+     * vm.h) - the frameless pre-pass over main, every body with its own
+     * JitCtx, main last with the same map. A hand copy of that sequence
+     * sat here and went stale twice (main jitted with no map; no
+     * pre-pass), so `-vdj` dumped the generic push on a program whose
+     * run took every call framelessly. Source order for the bodies, so
+     * the arena fills reproducibly (see the note above). */
+    std::vector<std::pair<Chunk *, const FuncDescriptor *>> bodies;
     for (const FuncDeclStmt *fn : funcs) {
         auto it = chunks.find(fn->desc);
-        if (it == chunks.end())
-            continue;
-        JitCtx jc;
-        jc.slot_desc = &slot_desc;
-        jc.slot_reassigned = &root->global_slot_reassigned;
-        jc.caller_desc = it->first;
-        jit_compile_chunk(it->second, &jc);
+        if (it != chunks.end())
+            bodies.push_back({ &it->second, it->first });
     }
-    jit_compile_chunk(main_ck);
+    vm_jit_program(&main_ck, bodies, slot_desc, root->global_slot_reassigned);
 
     s << disassemble(main_ck, "main");
 

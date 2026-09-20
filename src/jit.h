@@ -618,6 +618,9 @@ extern unsigned long g_jit_cap_scalar;
 extern unsigned long g_jit_frameless_chunks;
 extern unsigned long g_jit_frameless_calls;
 extern unsigned long g_jit_frameless_entries;   /* inc 2 (emit-time) */
+extern unsigned long g_jit_frameless_sites;     /* inc 2 (emit-time): the
+                                                 * SITE took the frameless
+                                                 * tail */
 extern unsigned long g_jit_frameless_pushes;    /* inc 2 (emitted code) */
 extern unsigned long g_jit_frameless_rets;      /* inc 2 (emitted code) */
 
