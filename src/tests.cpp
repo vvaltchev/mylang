@@ -26646,11 +26646,11 @@ static bool opcode_table_census()
         { OpCode::EmplaceStruct,         1,1,1,0,0,0, nullptr },
         { OpCode::CallBuiltinLVElem,     1,1,1,0,0,0, nullptr },
         { OpCode::CallBuiltinLVMember,   1,1,1,0,0,0, nullptr },
-        { OpCode::CallV,                 0,1,0,0,1,1, 
-          "e0/p0: run admission is op_run_eligible's call-shape layer; a run with a call caches NOTHING - decided #98, a call-as-barrier is #97's call-protocol decision" },
-        { OpCode::CachedCallV,           0,1,0,0,1,0, 
+        { OpCode::CallV,                 0,1,1,0,1,1, 
+          "e0: run admission is op_run_eligible's call-shape layer; p1 since #97 1b: a call is classified PRECISELY (arg run + callee temp read, dst written - see jit_call_precise_class), where it used to be unclassified and a run holding one cached NOTHING" },
+        { OpCode::CachedCallV,           0,1,1,0,1,0, 
           "see the CallV row - the same two decisions" },
-        { OpCode::CallValueV,            0,1,0,0,0,0, 
+        { OpCode::CallValueV,            0,1,1,0,0,0, 
           "see the CallV row - the same two decisions" },
         { OpCode::CheckFuncV,            1,1,1,1,0,0, nullptr },
         { OpCode::MapFilterV,            1,1,1,1,0,0, nullptr },
@@ -26685,8 +26685,8 @@ static bool opcode_table_census()
         { OpCode::StructCtorBoxedV,      1,1,1,1,0,0, 
           "d1 since #98: convey-only helper + the emit exc-stamp + the eptr net added together - reverting any of the three must fail this row" },
         { OpCode::ThrowRuntimeV,         1,1,1,0,0,0, nullptr },
-        { OpCode::CallValueGenericV,     1,0,0,1,0,0, 
-          "d0: it can BAIL (depth cap / chunkless callee / undefined-global arg0), so its interpreted original must stay; p0: the CallV rule" },
+        { OpCode::CallValueGenericV,     1,0,1,1,0,0, 
+          "d0: it can BAIL (depth cap / chunkless callee / undefined-global arg0), so its interpreted original must stay; p1: the CallV rule (#97 1b - a barrier; its bail is an exit_pc from an EMPTY cache)" },
         { OpCode::CheckCallableV,        1,1,1,1,0,0, nullptr },
         { OpCode::MakeStructArrayV,      1,1,1,0,0,0, nullptr },
         { OpCode::JumpUnlessTrueV,       1,1,1,0,0,0, nullptr },
@@ -26943,6 +26943,509 @@ static bool jit_intervals_check()
  *      interval - visit_use_def (liveness) and pick_visit_op
  *      (classification) agree about which slots an op touches.
  */
+/*
+ * #97 1b: THE CALL FAMILY'S CLASSIFICATION, ASSERTED EXACTLY. A run
+ * holding a MyLang call may now pin; what makes that sound is that the
+ * visitor names PRECISELY what the call touches in the caller's frame -
+ * the argument run and the callee temp (READ from memory), the dst
+ * (WRITTEN) - and nothing else, so a pin in a callee-saved register
+ * survives the `call` untouched. Too little in that set is a stale
+ * argument or a clobbered result; too much (the BARRIER that was
+ * measured first) is a flush and a reload per call for nothing. So the
+ * test asks for the SET, not for "something was marked":
+ *  - jit_qualify_intervals' MemEvent stream at the call pc is EXACTLY
+ *    {arg run} U {callee temp, for a value call} U {dst};
+ *  - the READ-ONLY int parameter every case reads in int ops has NO
+ *    event at the call and IS in the pick (it is the pin the whole
+ *    increment exists for);
+ *  - the pick's barrier mark is OFF at a CallV / CachedCallV /
+ *    CallValueV and ON at a CallValueGenericV (whose arg0 lvalue
+ *    descriptor names a slot only the call_sites pool knows).
+ * Watched failing against both wrong answers: the CALL family sent
+ * back to the `default` arm (unclassified: qualify declines, the pick
+ * is empty) and the barrier arm (barrier ON, no events).
+ * Shape-eaters defeated up front: the callee is IMPURE (writes a
+ * global) and over the inline weight gate so the call survives to
+ * codegen; the bound is runtime() so the loop keeps its counted form.
+ */
+/*
+ * #97 1b: A PIN LIVE ACROSS A SWITCHED CALL. With the CALL family
+ * classified precisely, a callee-saved pin stays in its register across
+ * the `call` - no flush, no reload - which is right on every path that
+ * RETURNS into the fragment. The two JIT_RET_SWITCH exits do not: the
+ * fragment `ret`s, the interpreter drives the switched callee, and the
+ * record's baked resume re-enters at the post-call stub, which loads
+ * the pins FROM MEMORY. So those exits must flush first
+ * (emit_divergent_flush), and this is the test that reaches them: the
+ * depth cap forced to 4 so a 60-deep mutual recursion switches at every
+ * level past it, with a local `k` computed BEFORE the call and read
+ * three times AFTER it - the shape the scan keeps resident across the
+ * call (k has int evidence and no memory demand anywhere).
+ * Proven to run, not assumed: g_jit_sync_switch must grow (the switch
+ * happened) and g_jit_call_pinned_sites must grow (the call sites were
+ * emitted with the cache live - the pre-1b count is 0 for every
+ * program). Watched failing: with emit_divergent_flush deleted the
+ * resumed continuation reads k's stale memory and the sum is wrong.
+ * Expected values are the closed form computed outside MyLang:
+ *   aa(n) = bb(n-1) + 3n + 9n^2,  bb(n) = aa(n-1) + 15n,  aa(0)=bb(0)=0
+ */
+static bool jit_call_pins_survive_switch()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const auto run = [&](const std::vector<std::string> &lines,
+                         const char *expect) -> bool {
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::string src;
+        for (const std::string &l : lines)
+            src += l + "\n";
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        bool ok = true;
+        std::ostringstream out;
+        std::streambuf *old = std::cout.rdbuf(out.rdbuf());
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        std::cout.rdbuf(old);
+        g_exec_engine = saved;
+        if (ok && out.str() != expect) {
+            fprintf(stderr, "jit_call_pins_survive_switch: stdout %s != "
+                            "expected %s (a pin resumed stale?)\n",
+                    out.str().c_str(), expect);
+            ok = false;
+        }
+        return ok;
+    };
+    const int saved_cap = jit_sync_depth_cap();
+    jit_set_sync_depth_cap(4);
+    const unsigned long s0 = g_jit_sync_switch;
+    const unsigned long p0 = g_jit_call_pinned_sites;
+    bool ok = run({
+        "func aa(int n) { if (n < 1) { return 0; }",
+        "  var k = n * 3; var r = bb(n - 1); return r + k + k * k; }",
+        "func bb(int n) { if (n < 1) { return 0; }",
+        "  var k = n * 5; var r = aa(n - 1); return r + k * 2 + k; }",
+        "print(aa(runtime(60)));",
+        "print(aa(runtime(30)) + 1);" }, "356670 \n48736 \n");
+    if (ok && g_jit_sync_switch <= s0) {
+        fprintf(stderr, "jit_call_pins_survive_switch: the SWITCH push "
+                        "DID NOT RUN\n");
+        ok = false;
+    }
+    if (ok && g_jit_call_pinned_sites <= p0) {
+        fprintf(stderr, "jit_call_pins_survive_switch: no sync call was "
+                        "emitted inside a PINNED run - the shape did not "
+                        "pin (vacuous)\n");
+        ok = false;
+    }
+    jit_set_sync_depth_cap(saved_cap);
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 1b: THE OTHER PATHS OUT OF A PINNED CALL SITE, each proven to
+ * have run in a pinned run (g_jit_call_pinned_sites grows across the
+ * compile - it is 0 for every program before 1b):
+ *  (a) an EXCEPTION out of the callee - the sync call's exception exit
+ *      is exit_pc, whose shared epilogue flushes the live pins, and the
+ *      same-frame handler then reads the accumulator - it must see the
+ *      value the fragment held in its register;
+ *  (b) CachedCallV with the pure-call CACHE ON and OFF - the probe's
+ *      hit arm writes the dst from C++ (the dst is a memory-demanded
+ *      slot, never a pin) while `n` stays resident; both settings must
+ *      agree with the closed form;
+ *  (c) CallValueV - a closure callee read from a temp the call demands
+ *      in memory, inside a loop whose accumulator and bound are pinned.
+ * Expected values computed outside MyLang.
+ */
+static bool jit_call_pins_paths()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const auto run = [&](const std::vector<std::string> &lines,
+                         const char *expect, const char *what) -> bool {
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::string src;
+        for (const std::string &l : lines)
+            src += l + "\n";
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        bool ok = true;
+        const unsigned long p0 = g_jit_call_pinned_sites;
+        std::ostringstream out;
+        std::streambuf *old = std::cout.rdbuf(out.rdbuf());
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        std::cout.rdbuf(old);
+        g_exec_engine = saved;
+        if (ok && out.str() != expect) {
+            fprintf(stderr, "jit_call_pins_paths [%s]: stdout %s != "
+                            "expected %s\n", what, out.str().c_str(),
+                    expect);
+            ok = false;
+        }
+        if (ok && g_jit_call_pinned_sites <= p0) {
+            fprintf(stderr, "jit_call_pins_paths [%s]: no sync call was "
+                            "emitted inside a PINNED run (vacuous)\n",
+                    what);
+            ok = false;
+        }
+        return ok;
+    };
+    /* (a) the callee throws on one iteration; the handler reads the
+     * pinned accumulator (and adds it to `caught`, so a stale read is a
+     * wrong printed value, not a missed branch) */
+    bool ok = run({
+        "var g = 0;",
+        "func thrower(int x) { g = g + x;",
+        "  if (x == 7) { var z = 0; z = z + runtime(0); return 10 / z; }",
+        "  return x * 2; }",
+        "func hot(int n) {",
+        "  var acc = 0; var caught = 0;",
+        "  for (var i = 0; i < n; i++) {",
+        "    acc = acc + n * 2;",
+        "    try { acc = acc + thrower(i); }",
+        "    catch (DivisionByZeroEx) { caught = caught + acc; }",
+        "    acc = acc + n;",
+        "  }",
+        "  return acc + caught + n;",
+        "}",
+        "print(hot(runtime(12)), g);" }, "880 66 \n", "exception");
+    /* (b) the cached recursion, cache OFF then ON (the -rt default is
+     * restored either way) */
+    const bool saved_pc = g_pure_cache_enabled;
+    for (int on = 0; ok && on < 2; on++) {
+        g_pure_cache_enabled = on == 1;
+        ok = run({
+            "func fib(n) { if (n < 2) return n;",
+            "  return fib(n - 1) + fib(n - 2); }",
+            "var m = 25; m = m + runtime(0);",
+            "print(fib(m));" }, "75025 \n",
+            on ? "cached, cache on" : "cached, cache off");
+    }
+    g_pure_cache_enabled = saved_pc;
+    /* (c) the value call */
+    if (ok)
+        ok = run({
+            "var g = 0;",
+            "func mk(int base) { return func [base] (int x, int y) {",
+            "  g = g + x; var q = x * base; var r = q - y;",
+            "  var t = r ^ 5; g = g + t; return t; }; }",
+            "func hot(int n) {",
+            "  var f = mk(n);",
+            "  var acc = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    acc = acc + n * 2;",
+            "    var d = f(i, n);",
+            "    acc = acc + d + n;",
+            "  }",
+            "  return acc + n;",
+            "}",
+            "print(hot(runtime(30)), g);" }, "14918 12623 \n", "value");
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 1b: ARGFUSE (#162) MEETS A PINNED CALL RUN. A fused argument is
+ * read by the push STRAIGHT FROM ITS SLOT, so the fusion gate refuses a
+ * source whose memory is stale - a pin, a type-elided slot, a spill
+ * home. It enumerated the pick's plans and not the scan's TRANSITIONS,
+ * and nothing could reach the hole while a call run pinned nothing.
+ * The first pinned call run fused a loop counter that lived in r13 from
+ * pc 1 on, and the callee read <none> (this program printed 590 for
+ * 780, watched). The test requires BOTH mechanisms in the same run -
+ * an in-place bind (g_jit_arg_inplace) AND a sync call emitted with the
+ * cache live (g_jit_call_pinned_sites) - so it cannot pass by either
+ * one having quietly switched off.
+ */
+static bool jit_argfuse_vs_pins()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;             /* a lever-off run fails by design:
+                                  * the coverage below asserts its
+                                  * own lever ran (CLAUDE.md) */
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    const std::string src =
+        "func first(a, k) {\n"
+        "  var t = a[0] + k;\n"
+        "  var u = t * 3 - k;\n"
+        "  var v = u - t - t;\n"
+        "  return t + v - v;\n"
+        "}\n"
+        "var base = [10, 20, 30, 40, 50];\n"
+        "var s = 0;\n"
+        "for (var i = 0; i < 20; i++) {\n"
+        "  var sl = base[1:4];\n"
+        "  s += first(sl, i);\n"
+        "  base[1] = base[1] + 1;\n"
+        "}\n"
+        "print(s, base[1]);\n";
+    std::vector<Tok> toks;
+    lexer(src, 1, toks);
+    bool ok = true;
+    const unsigned long p0 = g_jit_call_pinned_sites;
+    const unsigned long a0 = g_jit_arg_inplace;
+    std::ostringstream out;
+    std::streambuf *old = std::cout.rdbuf(out.rdbuf());
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        vm_execute(root.get());
+    } catch (...) {
+        ok = false;
+    }
+    std::cout.rdbuf(old);
+    g_exec_engine = saved;
+    if (ok && out.str() != "780 40 \n") {
+        fprintf(stderr, "jit_argfuse_vs_pins: stdout %s != 780 40 (a "
+                        "fused argument read a pinned slot's memory?)\n",
+                out.str().c_str());
+        ok = false;
+    }
+    if (ok && g_jit_arg_inplace <= a0) {
+        fprintf(stderr, "jit_argfuse_vs_pins: no in-place bind ran "
+                        "(vacuous - the fusion did not fire)\n");
+        ok = false;
+    }
+    if (ok && g_jit_call_pinned_sites <= p0) {
+        fprintf(stderr, "jit_argfuse_vs_pins: the call was not emitted "
+                        "inside a PINNED run (vacuous)\n");
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+static bool jit_call_precise_class()
+{
+#if ML_JIT_SUPPORTED
+    struct Case { const char *name; OpCode op; std::string src; };
+    const std::string sink =
+        "var g = 0;\n"
+        "func sink(int x, int y) { g = g + x; var q = x * 3;\n"
+        "  var r = q - y; var t = r ^ 5; g = g + t; return t; }\n";
+    const Case cases[] = {
+        { "CallV", OpCode::CallV, sink +
+          "func hot(int n) {\n"
+          "  var acc = 0;\n"
+          "  for (var i = 0; i < n; i++) {\n"
+          "    acc = acc + n * 2;\n"
+          "    var d = sink(i, n);\n"
+          "    acc = acc + d + n;\n"
+          "  }\n"
+          "  return acc + n;\n"
+          "}\n"
+          "print(hot(runtime(30)));\n" },
+        { "CallValueV", OpCode::CallValueV, sink +
+          "func mk(int base) { return func [base] (int x, int y) {\n"
+          "  g = g + x; var q = x * base; var r = q - y;\n"
+          "  var t = r ^ 5; g = g + t; return t; }; }\n"
+          "func hot(int n) {\n"
+          "  var f = mk(n);\n"
+          "  var acc = 0;\n"
+          "  for (var i = 0; i < n; i++) {\n"
+          "    acc = acc + n * 2;\n"
+          "    var d = f(i, n);\n"
+          "    acc = acc + d + n;\n"
+          "  }\n"
+          "  return acc + n;\n"
+          "}\n"
+          "print(hot(runtime(30)));\n" },
+        /* the instance must be the INT one: `fib(runtime(12))` makes a
+         * dyn instance whose body is BinOpV/CmpV - boxed, memory-read,
+         * so `n` is disqualified by those and not by the call. An int
+         * variable coerced from the dyn keeps the argument int. */
+        { "CachedCallV", OpCode::CachedCallV,
+          "func fib(n) { if (n < 2) return n;\n"
+          "  return fib(n - 1) + fib(n - 2); }\n"
+          "var m = 12; m = m + runtime(0);\n"
+          "print(fib(m));\n" },
+        { "CallValueGenericV", OpCode::CallValueGenericV, sink +
+          "func hot(int n) {\n"
+          "  var dyn h = sink;\n"
+          "  var acc = 0;\n"
+          "  for (var i = 0; i < n; i++) {\n"
+          "    acc = acc + n * 2;\n"
+          "    var dyn d = h(i, n);\n"
+          "    acc = acc + n;\n"
+          "  }\n"
+          "  return acc + n;\n"
+          "}\n"
+          "print(hot(runtime(30)));\n" },
+    };
+    bool ok = true;
+    int seen_calls = 0;
+    for (const Case &c : cases) {
+        std::vector<Tok> toks;
+        lexer(c.src, 1, toks);
+        ParseContext pctx(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pctx);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        /* the chunk under test is the one holding the call op (hot, or
+         * fib's instance) - never main, whose own calls are the
+         * top-level ones */
+        const Chunk *ckp = nullptr;
+        for (const auto &fd : prog.funcs) {
+            const Chunk *k = static_cast<const Chunk *>(fd->vm_chunk);
+            if (!k)
+                continue;
+            for (const Instr &in : k->code)
+                if (in.op == c.op) { ckp = k; break; }
+            if (ckp)
+                break;
+        }
+        if (!ckp) {
+            printf("  [%s]: no function chunk holds the op (shape "
+                   "eaten?)\n", c.name);
+            ok = false;
+            continue;
+        }
+        const Chunk &ck = *ckp;
+        const size_t n = ck.code.size();
+        /* the classification, through the same public entry the scan
+         * uses */
+        SlotLiveness sl;
+        std::vector<LiveInterval> iv;
+        if (!jit_slot_liveness(ck, sl) || !jit_build_intervals(ck, 0, n,
+                                                                sl, iv)) {
+            printf("  [%s]: liveness/intervals declined\n", c.name);
+            ok = false;
+            continue;
+        }
+        std::vector<IntervalQual> q;
+        std::vector<MemEvent> ev;
+        int orphans = -1;
+        const bool classified =
+            jit_qualify_intervals(ck, 0, n, iv, q, &orphans, &ev);
+        if (!classified) {
+            printf("  [%s]: jit_qualify_intervals DECLINED - an op in "
+                   "the chunk is unclassified (the pre-1b answer)\n",
+                   c.name);
+            ok = false;
+            continue;
+        }
+        std::vector<char> barrier;
+        std::vector<int> fhot;
+        const std::vector<int> picked =
+            jit_test_pick_cached_slots(ck, 0, n, ck.slot_count, 4,
+                                       &fhot, &barrier);
+        for (size_t pc = 0; pc < n; pc++) {
+            const Instr &in = ck.code[pc];
+            if (in.op != c.op)
+                continue;
+            seen_calls++;
+            /* the EXPECTED set */
+            std::set<int> want;
+            const int nargs = static_cast<int>(
+                c.op == OpCode::CallValueGenericV ? (in.b_lit() & 0xfff)
+                                                  : in.b_lit());
+            for (int k = 0; k < nargs; k++)
+                want.insert(static_cast<int>(in.a_lit()) + k);
+            if (c.op == OpCode::CallValueV)
+                want.insert(in.target2);
+            want.insert(in.target);
+            /* the OBSERVED set at this pc */
+            std::set<int> got;
+            for (const MemEvent &e : ev)
+                if (e.pc == pc)
+                    got.insert(e.slot);
+            const bool generic = c.op == OpCode::CallValueGenericV;
+            if (generic) {
+                /* a barrier constrains no interval: NO events, mark ON */
+                if (!got.empty() || !barrier[pc]) {
+                    printf("  [%s] pc %zu: expected a BARRIER (no "
+                           "events, mark on), got %zu event(s), "
+                           "mark=%d\n", c.name, pc, got.size(),
+                           (int)barrier[pc]);
+                    ok = false;
+                }
+                continue;
+            }
+            if (got != want) {
+                printf("  [%s] pc %zu: mem-event set differs - want {",
+                       c.name, pc);
+                for (int s2 : want) printf(" %d", s2);
+                printf(" } got {");
+                for (int s2 : got) printf(" %d", s2);
+                printf(" }\n");
+                ok = false;
+            }
+            if (barrier[pc]) {
+                printf("  [%s] pc %zu: the call is marked as a BARRIER "
+                       "(the measured-and-rejected answer)\n", c.name,
+                       pc);
+                ok = false;
+            }
+            /* the parameter: slot 0 in every case (`n`), read by int
+             * ops, never an argument of its own call - it must be free
+             * of memory demand here and picked */
+            if (got.count(0)) {
+                printf("  [%s] pc %zu: the read-only parameter has a "
+                       "memory demand at the call\n", c.name, pc);
+                ok = false;
+            }
+            if (std::find(picked.begin(), picked.end(), 0)
+                    == picked.end()) {
+                printf("  [%s]: the read-only parameter is NOT in the "
+                       "pick (%zu picked)\n", c.name, picked.size());
+                ok = false;
+            }
+            /* and the dst is disqualified run-wide by the pick (its
+             * write comes from memory) */
+            if (!generic && std::find(picked.begin(), picked.end(),
+                                      in.target) != picked.end()) {
+                printf("  [%s] pc %zu: the call's dst slot %d is in the "
+                       "pick\n", c.name, pc, in.target);
+                ok = false;
+            }
+        }
+    }
+    if (seen_calls < 4 + 4) {          /* 4 cases; fib alone has 8 */
+        printf("  vacuous: only %d call op(s) examined\n", seen_calls);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_interval_qual_check()
 {
 #if ML_JIT_SUPPORTED
@@ -39077,6 +39580,19 @@ static const std::vector<extra_check> extra_checks =
     { "jit: D3.b - per-interval qualification implies the pick's "
       "run-wide answer; the payoff interval observed (step 2a)",
       jit_interval_qual_check },
+    { "jit: #97 1b - the CALL family's classification is PRECISE: the "
+      "memory-demand set at a call is exactly {args, callee, dst}, the "
+      "read-only parameter stays pinned, no barrier",
+      jit_call_precise_class },
+    { "jit: #97 1b - a pin stays live across a call and survives the "
+      "SWITCH exits (flushed on the path, reloaded by the resume stub)",
+      jit_call_pins_survive_switch },
+    { "jit: #97 1b - the exception exit, the cached call (cache on/off) "
+      "and the value call, each inside a PINNED run",
+      jit_call_pins_paths },
+    { "jit: #97 1b - an in-place argument (#162) beside a pin installed "
+      "by a scan TRANSITION: the fusion gate sees the transition",
+      jit_argfuse_vs_pins },
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },

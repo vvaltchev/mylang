@@ -249,7 +249,24 @@ ASan+UBSan, unless noted):
     image vs source run             byte-identical output, and both
                                     report bake_push 1,000,001
 
-### 1.4 ⛔ INCREMENT 1b — RE-SCOPED TODAY. READ THIS BEFORE TOUCHING IT.
+### 1.4 ⛔ INCREMENT 1b — ✅ DONE 2026-09-19 (see the note at the end)
+
+**STATUS AS OF 2026-09-19: LANDED.** The barrier form was built first
+and measured (it costs 3 instructions per executed call for nothing;
+09_fib +2.6% Ir, 11_closure_counter 1.10x on the clock), then replaced
+by the PRECISE classification: `pick_visit_op` marks the argument run,
+the callee temp and the dst as memory-touched and nothing else, so a
+callee-saved pin stays live across the `call`; the two SWITCH exits
+flush before their `ret`. Q1 (barrier vs precise) is therefore
+ANSWERED BY MEASUREMENT - precise - and Q3's ordering question is moot
+for 1b. Four `-rt` entries pin it, each watched failing; the full record
+is `docs/jit-optimizations.md`, *#97 increment 1b*, and the plan's §3b
+carries what it found and what it leaves open (caller-saved pins in a
+call run; `lea` for `n - k` off a pinned source; the scan's unused
+register at K=4; `visit_use_def`'s missing store family). The text
+below is the pre-landing analysis, kept because its measurements are
+the argument.
+
 
 The plan's §3b USED TO SAY: *"a fragment that emits a MyLang call gets
 4 pinnable registers of 13"*, because `jit_run_blocks_xcache` denies the
@@ -545,6 +562,7 @@ These are the decisions a successor session must NOT guess at. Each is
 stated with the concrete alternatives.
 
 **Q1 — 1b: BARRIER or PRECISE classification of the CALL family?**
+✅ ANSWERED 2026-09-19 by measurement: PRECISE (§1.4).
 A barrier (`v.mark_barrier(pc)`, IncDecChainV's precedent) is safe and
 simple: pins may live in the run, and the call kills them across itself.
 PRECISE additionally declares that the call reads the argument RUN and
@@ -555,6 +573,11 @@ does not make `lsra_pins` non-zero on `fib$0`, precision will not
 either, and the increment stops there having cost one afternoon.
 
 **Q2 — 1b: what is the ACCEPTANCE bar, given E1's result?**
+✅ ANSWERED 2026-09-19 by the numbers: the call-containing LOOPS win
+4-6% on the clock (11/63/76/78), the recursive bodies pay the pin's
+push/pop per invocation (fib flat, 10_recursion_deep 1.03x), geomean
+0.999x. Landed on the geomean gate; the loop-free profitability rule
+is the open follow-up (plan §3b (iii)).
 Admitting pins into call-containing runs means spilling and reloading
 them around EVERY call in the run. On a call-dense body such as `fib$0`
 that could easily cost more than it saves. §3b's stated gate is "the
@@ -565,6 +588,7 @@ its own)? Or should it be judged on its own wall clock, and dropped if
 flat?
 
 **Q3 — ORDERING: 1b before 1c, or 1c first?**
+✅ MOOT 2026-09-19: 1b landed first (the maintainer's call).
 1b is the plan's order and is a confounder removal for increment 2's
 wall-clock gate. 1c is what actually unblocks 78_typed_param_call, the
 arc's flagship bench, and is independent of 1b.
@@ -583,7 +607,8 @@ than the full frameless protocol with its second frame kind, second
 entry point and new exception path? That is a much smaller change with
 most of the predicted benefit.
 
-**Q5 — the local commits.** Four commits (`1767291`, `0ad4384`,
+**Q5 — the local commits.** ✅ pushed by the maintainer before 2026-09-19.
+ Four commits (`1767291`, `0ad4384`,
 `96656ad`, `e626b84`) are ahead of `origin/exp-work`. Push, or leave for
 the maintainer?
 

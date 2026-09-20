@@ -11812,3 +11812,210 @@ out of an array of two different lambda DECLS instead (two candidates, no
 stamp, so the cache tier) while staying monomorphic at run time. **An
 optimization that names more callees eats every test whose subject is the
 tier for UNNAMED ones.**
+
+## #97 increment 1b - A MYLANG CALL BECOMES A CLASSIFIED OP, AND THE
+## BARRIER THAT WAS BUILT FIRST IS THE MEASURED REASON IT IS PRECISE
+## (2026-09-19)
+
+**THE SUBJECT.** A native run holding a MyLang call - `CallV`,
+`CachedCallV`, `CallValueV` - cached NOTHING. The CALL family sat in
+`pick_visit_op`'s `default` arm, whose contract is *"an unclassified op:
+assume every slot is touched"*, and the pick answers that by pinning
+nothing for the whole run. `MYLANG_JITSTATS` on 09_fib/10/11/63/76/78
+printed `pick_decided 2` and no pin row at all. The plan's older symptom
+- *"such a run keeps 4 pinnable registers of 13"*, from
+`jit_run_blocks_xcache` denying the caller-saved half - described a
+second gate the run never reached; deleting that denial alone would have
+changed nothing (recorded in the plan's section 3b on 2026-09-04).
+
+**THE BARRIER, BUILT AND MEASURED FIRST (the maintainer's call: barrier,
+then measure).** The precedent for an op that touches slots the emitter
+cannot enumerate is `mark_barrier` - `CallBuiltinV`, `MakeClosureV`,
+`EmplaceStruct`: flush every pin before, reload after. Applied to the
+call family it makes the run pin (`lsra_pins` 0 -> 555,833 on 09_fib)
+and then, callgrind Ir and interleaved wall clock, `OPT=1 ASSERTS=0`,
+`-npc`:
+
+    bench                 Ir        wall      the pin's own saving
+    09_fib_recursive    +2.58%     1.00x     zero - `n` is a read-only
+    10_recursion_deep   +5.09%     1.03x     parameter; `sub rax, k`
+    11_closure_counter  +2.38%     1.10x     off a register costs what
+    63_closures         +1.75%     1.04x     it costs off memory
+    76_funcval_dispatch -1.21%     0.97x
+    program B (call loop) +2.48%             12.8 Ir / iteration
+    suite geomean cur/base           1.002x
+
+`scripts/jitprofile.py` put the +5.0 Ir per `fib$0` invocation exactly:
+`mov s0.type, <int-tag>; mov s0, r12` before each of the eight call
+sites and `mov r12, s0` after - three instructions per executed call for
+a register a SysV `call` PRESERVES. On 11_closure_counter a +2.4% Ir
+became a 10% wall regression, which is the store-burst family this file
+has recorded twice: the extra instructions are STORES on the call path.
+**The full flush/reload discipline is the wrong tool for a call whose
+callee cannot reach the caller's frame.** That is the measured argument
+for precision, and it is why the barrier arm is gone rather than kept as
+a fallback.
+
+**THE PRECISE CLASSIFICATION.** What a MyLang call touches in the
+CALLER's frame, and the argument that it is all of it:
+ - it READS the argument run `[a_lit, a_lit + b_lit)` from memory (the
+   inline push copies it raw; the C++ tiers read it through the frame),
+   and a VALUE call reads the callee temp (`target2`) - `bad()` each, so
+   a run slot is neither pinned nor type-elided at the call, which for
+   the scan is a cut at that pc (the piece is forced memory, the
+   transition machinery stores it before the call);
+ - it WRITES the dst (`target`): the callee's native ReturnV / `jit_ret`
+   through the window, the cached probe's hit arm from C++ - `bad()`.
+ Nothing else: a global lives in the global table, a capture is a
+ BY-VALUE snapshot in the FuncObject, and no MyLang function can name
+ its caller's locals. A pin in a CALLEE-SAVED register - all a call run
+ may hold, since `jit_run_blocks_xcache` still denies the caller-saved
+ half and `jit_assert_no_volatile_pin` checks it - therefore stays LIVE
+ across the `call` with no store and no reload.
+`CallValueGenericV` stays a BARRIER: its arg0 LVALUE DESCRIPTOR, re-
+derived at dispatch for an lvalue-ABI builtin callee, names a frame slot
+only the `call_sites` pool knows, and the visitor does not chase pools
+(the `EmplaceStruct` rule). A dyn call is the generic tier anyway.
+
+**THE PRICE IS PAID ON THE EXITS, NOT ON THE CALL.** Three paths leave
+the fragment mid-op with the pins still in registers:
+ - the EXCEPTION exit is `exit_pc`, whose shared epilogue flushes the
+   state captured at the exit - unchanged;
+ - the native-direct `CallV`'s StackOverflow arm is `exit_pc` - unchanged;
+ - the two `JIT_RET_SWITCH` exits `ret` with the record's baked resume
+   re-entering THIS fragment at the post-call stub, which loads the pins
+   FROM MEMORY, and the interpreter runs the switched callee (and any
+   handler of ours) in between. They used `frag_ret(RetFlush::empty)` -
+   correct exactly as long as no call run could pin - and now flush
+   first (`emit_divergent_flush`), with the register tracker's flush
+   state put back for the fall-through continuation, whose pins are
+   still live. CLAUDE.md's `frag_ret` note said *"do not fix that abort
+   by switching to `flushed` - emit the flush"*; this is that flush.
+
+**THREE THINGS THAT WERE LATENT AND WENT LIVE, each found by an existing
+net the moment a call run could pin:**
+ 1. **The sync call's bracket count was NEGATIVE.** `emit_sync_call_inline`
+    emits ONE `emit_call_prologue` and FIVE `emit_call_epilogue` copies -
+    one per exit path - and the tracker's model is emission-linear, so
+    each divergent-path epilogue closed the bracket for the code after
+    it: -4 per sync call, `bracket=-7` two ops after two calls, where a
+    MoveV's cold-arm helper epilogue reloading a float pin read as a
+    stray write. Not only a diagnostic: `trk_push`'s borrow
+    discrimination reads the same count and DRIVES EMISSION. A
+    divergent-path epilogue now REOPENS the bracket
+    (`emit_call_epilogue_divergent`, also the native CallV's SO arm),
+    and `op_boundary` asserts the count is zero after every op.
+ 2. **argfuse's `pinned()` gate could not see a scan TRANSITION.** #162
+    reads a fused argument straight from its slot, so its gate refuses
+    a source whose memory is stale - and enumerated `hot`, `fhot`,
+    `textra`, `spill_hot` and the share seams, not `lsra_tr`: under
+    trans mode `hot` holds only the ENTRY occupants. The #162 slice test
+    printed 590 for 780: the loop counter lived in r13 from pc 1 by a
+    transition, was fused, and the callee read its never-written memory
+    as `<none>`. The gate consults both files' transitions now
+    (`jit_argfuse_vs_pins` requires the fusion AND the pinned call in
+    ONE run, watched failing at 590).
+ 3. **And why a loop counter was a fusion candidate at all:** the
+    element STORE family (`StoreElemInt`/`Float`/`Value`, `DictStore`,
+    `StoreMemberV`, ...) is absent from `visit_use_def`, so
+    `compute_ref_slots` takes its `bail` arm and lists EVERY slot of any
+    function containing `a[i] = v` as reference-carrying. A pre-existing
+    audit-table gap with its own costs (release scans, ref checks on
+    every scalar store, and here a scalar fused as if it were a
+    reference); NOT fixed in this increment - recorded as the next
+    table gap to close, with `t162.my` as the repro.
+
+**AND ONE THE INCREMENT MAKES REACHABLE, NOT FIXED:** at K=4 with six
+hot locals the linear scan leaves a register UNUSED - program B pins
+`a`/`b`/`i` in r12/r13/r14, homes `c`/`d`/`e`, and never touches r15.
+Reproduced on the call-free twin with `MYLANG_JIT_MAXPINS=4`: an
+eviction victim's early piece is demoted (no use inside it) and the
+freed register is never re-offered. 1b is the first shipping
+configuration that runs the scan at K=4 under pressure, so this is the
+allocator's next increment, not a call-protocol one.
+
+**REACH, proven not assumed.** `g_jit_call_pinned_sites` counts sync
+call SITES emitted with the cache live - 0 for every program before 1b.
+09_fib: `lsra_pins` 555,833, `call_pinned_sites` 8; program B:
+`lsra_pins 1`, `call_pinned_sites 1`, `lsra_trans 5`. The `-vdj` of
+`fib$0`: one `mov r12, s0` at entry, `push`/`pop r12` in the frame, every
+read of `n` a `mov rax, r12`, and the ONLY stores of r12 to `s0` are the
+six that precede a `pop r12` (return and exit paths). Program B: the two
+flushes of a/b/i/c/d/e sit on the two SWITCH exits; the `call rdx` sites
+have nothing around them.
+
+**THE NETS** (`build-claude/dbg`, TESTS=1 OPT=0, ASan+UBSan):
+ - `-rt` 1982/1982 + the four differential modes 1696/1696 each, with
+   four new entries: `jit_call_precise_class` (the memory-demand set at
+   each call op is EXACTLY {args, callee, dst}, the read-only parameter
+   has no demand and is picked, no barrier except the generic op -
+   watched failing against the barrier arm AND the unclassified arm),
+   `jit_call_pins_survive_switch` (cap 4, 60-deep mutual recursion, a
+   local computed before and read after the switched call; requires
+   `g_jit_sync_switch` and `g_jit_call_pinned_sites` to grow; watched
+   failing at `15` for 356,670 with the divergent flush removed),
+   `jit_call_pins_paths` (the exception exit into a same-frame handler
+   reading the pinned accumulator, `CachedCallV` with the pure cache off
+   and on, `CallValueV`; each proving the pinned emission),
+   `jit_argfuse_vs_pins` (above);
+ - the census rows: `CallV`/`CachedCallV`/`CallValueV`/
+   `CallValueGenericV` p=1;
+ - `corpus_diff` plain 34/34, `--levers` 34/34 x 23 configs, `--cold`,
+   `--xrot` 34/34 x 16, `--nolowmem` 34/34; `driver_checks` all passed;
+   `disasmcheck` every instruction agrees with objdump;
+   `norec_enum --depth 3` 480 programs, all engines agree;
+   `norec_sweep` 37 programs OK; `nested_fuzz --count 300` 0 diverged;
+ - `vdjcmp` self-test: 127/127 on the RELEASE lane for BOTH binaries,
+   and base-vs-cur 94 identical / **33 differing** - the call-containing
+   runs, i.e. the measured blast radius. ⛔ On the ASan lane the
+   self-test REFUSED (126/127): `18_store_src_gate.my`'s
+   `load r1, P` bakes a trivial `StructTypeDef*` constant's whole
+   24-byte union as three immediates, and the union's unused 16 bytes
+   are indeterminate in a debug build (`ValueU(StructTypeDef *)`
+   initialises one member). Not this change - the base binary has no
+   debug lane on this box to compare, but the release lanes are clean
+   and the varying qword is a constant's tail, not emitted logic. An
+   instrument finding to fix at the source (zero the union in the
+   trivial constructors, or bake only the live bytes), recorded here
+   because a refusal is a result.
+
+**MEASURED** (callgrind Ir and interleaved wall clock, `OPT=1
+ASSERTS=0`, `-npc`, 90 benches; the barrier's numbers beside them,
+which is the increment's own A/B):
+
+    bench                    Ir       wall    barrier: Ir     wall
+    09_fib_recursive       +1.19%    1.00x       +2.58%    1.00x
+    10_recursion_deep      +3.21%    1.03x       +5.09%    1.03x
+    11_closure_counter     -3.06%    0.96x       +2.38%    1.10x
+    63_closures            -2.30%    0.95x       +1.75%    1.04x
+    76_funcval_dispatch    -3.37%    0.95x       -1.21%    0.97x
+    78_typed_param_call    -5.54%    0.94x       +0.59%    1.00x
+    program B (call loop)  -2.94%                +2.48%
+    64/46/03/01 (no call)   0.00%    1.00x        0.00%    1.00x
+    suite geomean cur/base           0.999x                1.002x
+
+**TWO SHAPES, TWO ANSWERS, and the second is the open item.** A LOOP
+with a call in it (11, 63, 76, 78, program B) keeps its accumulators
+resident across the call and wins 4-6% on the clock - the pin's entry
+cost is amortised over the iterations. A RECURSIVE BODY (09, 10) pays
+the pin's `push`/`pop` on EVERY invocation - fib$0 +2.0 Ir per call
+(`scripts/jitprofile.py`: 90.83M -> 91.94M in the fragment, nothing at
+any call site), `sumto$0` +2.5 - for a read-only parameter whose three
+uses save nothing: `cmp`/`sub`/`add` take a memory operand as cheaply
+as a register. The scan admits any proven-used slot (the pick required
+>= 3 static uses; both admit `n` here), and neither weighs a fragment's
+ENTRY cost against its dynamic use count. So 1b lands as a net win on
+the geomean gate with one bench 3% slower, and the profitability rule
+for a loop-free run - or `lea rax, [r12 - k]` for the `n - k` shape,
+which turns fib's +2 into a saving - is the next increment's decision,
+stated in the plan's section 3b.
+
+**AGAINST g++ -O2 ON THE SAME LOOP (program B):** gcc keeps all six
+values in registers across the call - in CALLER-saved ones (rcx, r8-r10,
+rsi), legal only because IPA-RA sees `sink`'s clobber set - and its
+loop is 16 instructions including the `call`. The caller side of ours
+now has the same shape (no traffic at the site; c/d/e in stack homes for
+the scan-hole reason above); the gap that remains, ~100 Ir per call, is
+the call protocol - increment 2's subject. Worth carrying: a BAKED
+callee's clobber set is known at JIT-compile time exactly as it is to
+gcc, so caller-saved pins across a named call need no spill either.

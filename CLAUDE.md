@@ -973,6 +973,17 @@ emitted on this path), `empty` (**ML_CHECKed**), or `epilogue`
 return site must pick one**, and `empty` is the one that will fail
 loudly the day the allocator keeps a value in a register across a call.
 Do not "fix" that abort by switching to `flushed` - emit the flush.
+**That day was #97 increment 1b (2026-09-19):** the CALL family is a
+CLASSIFIED op now, a call run pins, and the sync call's two SWITCH
+exits emit the flush (`emit_divergent_flush`) before saying `flushed`.
+Two rules it added: a multi-exit call emitter closes its bracket ONCE,
+on the fall-through path - a divergent exit uses
+`emit_call_epilogue_divergent`, and `op_boundary` asserts the count is
+back to zero (it had been -4 per sync call, latent while no call run
+could pin); and a gate that enumerates "is this slot register-resident"
+must include the scan's TRANSITIONS, not only the entry occupants
+(argfuse's `pinned()` did not, and fused a loop counter that lived in
+r13). Record: `docs/jit-optimizations.md`, *#97 increment 1b*.
 
 **⛔ AND IT BROKE AGAIN, ONE DAY AFTER THE ABS32 MEMORY OPERAND LANDED,
 WITH THREE NETS PRESENT AND ALL THREE BLIND (2026-08-26 -> found

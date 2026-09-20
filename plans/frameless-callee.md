@@ -398,10 +398,14 @@ Each ends with a MEASUREMENT that can kill the next one.
    own, not smuggled into E1.**
 
 **1b. THE CALL SITE BRACKETS ITS PINS (§3b, inherited from #123).**
-   The caller runs on 4 pinnable registers of 13 today, and increment
-   2's gate is a wall-clock number — so this is a CONFOUNDER REMOVAL,
-   not a side quest. See §3b for why the obvious fix does not work and
-   what the real one is.
+   ✅ DONE 2026-09-19 — as a PRECISE classification of the CALL family
+   in `pick_visit_op` (args + callee temp read, dst written), after the
+   BARRIER form was built first and measured to cost 3 instructions per
+   executed call for nothing (09_fib +2.6% Ir, 11_closure_counter 1.10x
+   on the clock). A callee-saved pin now stays live across the `call`;
+   the flush moved to the two SWITCH exits. Record:
+   `docs/jit-optimizations.md`, *#97 increment 1b*. See §3b for what it
+   found on the way and what it leaves open.
 
 **1c. THE COERCING-CALLEE BAKE — added 2026-09-04, from E1's own
    measurement.** E1 named 78_typed_param_call's callees and the bench
@@ -523,13 +527,61 @@ a pool the run never reaches in the first place. Deleting the denial
 alone — which is what this section used to prescribe — would change
 nothing at all.
 
-**WHAT 1b ACTUALLY IS, THEREFORE: classify the CALL family as a
-BARRIER** rather than as an unclassified op. `IncDecChainV` is the
-precedent already in the switch (`v.mark_barrier(pc)`, commented
-"BRACKET (not a branch)"). The call must additionally declare what it
-really touches — the argument RUN and the callee slot are read from
-memory, the dst is written — so the analysis stops guessing. Only THEN
-does the caller-saved question below become live.
+**WHAT 1b ACTUALLY IS, THEREFORE: classify the CALL family** rather
+than leave it unclassified. ✅ DONE 2026-09-19, in two measured steps:
+
+  - the BARRIER first (`IncDecChainV`'s precedent, `v.mark_barrier(pc)`
+    - flush every pin before the call, reload after). It makes the run
+    pin, and then charges 3 instructions per EXECUTED call for
+    registers a SysV `call` preserves: 09_fib +2.6% Ir (+5.0 per
+    invocation, `mov s0.type; mov s0, r12` before each of 8 sites and
+    `mov r12, s0` after), 10_recursion_deep +5.1%, 11_closure_counter
+    +2.4% Ir and **1.10x on the clock** - the extra instructions are
+    STORES on the call path, the family the wall clock does see. A
+    read-only parameter in a register saves nothing (`sub rax, k` off
+    r12 costs what it costs off memory), so the barrier is pure cost.
+    Measured, rejected, and the reason the answer is precise;
+  - then the PRECISE form: the argument run and (for a value call) the
+    callee temp are `bad()` (memory-read), the dst is `bad()`
+    (memory-written), nothing else - a callee cannot reach the caller's
+    frame (globals live in the global table, captures are by-value
+    snapshots). `CallValueGenericV` stays a barrier: its arg0 lvalue
+    descriptor names a slot only the call_sites pool knows. The pins
+    stay live across the `call`; the price moved to the exits (the two
+    SWITCH `ret`s flush first, since the post-call resume stub loads
+    pins from memory).
+
+  Measured on `fib$0`: +2.0 Ir per invocation, exactly the `push`/`pop
+  r12` the pin costs and nothing at any call site; program B's loop
+  (five accumulators + a call per iteration) hot fragment **-8.1%**.
+
+**WHAT IT FOUND ON THE WAY (all recorded in the JIT record entry):**
+  the sync emitter's tracker bracket count went to -4 per call (one
+  prologue, five per-path epilogues; an emission-affecting imbalance
+  only a pinned call run could expose); argfuse's `pinned()` gate did
+  not consult the scan's transitions (the #162 slice test printed 590
+  for 780 - a loop counter in r13 fused and read from never-written
+  memory); the element STORE family is absent from `visit_use_def`, so
+  `compute_ref_slots` lists EVERY slot of any function with `a[i] = v`
+  (why a loop counter was a fusion candidate at all - NOT fixed here);
+  and at K=4 the scan leaves a register unused under pressure
+  (program B homes `c` while r15 sits idle; reproducible on the
+  call-free twin with `MYLANG_JIT_MAXPINS=4`).
+
+**WHAT 1b LEAVES OPEN.** Two things, both measurable now that a call run
+pins: (i) whether to admit CALLER-saved pins into a call run - the
+denial below stands, and the trade is the prologue/epilogue spill per
+call, which the barrier measurement says to expect no wall-clock gain
+from on a call-dense body; (ii) `lea rax, [r12 - k]` for an IntSubRI/
+IntAddRI off a pinned source (today `mov rax, r12; sub rax, k`) - that
+is what turns fib$0's +2 per invocation into a saving, since each
+`fib(n - k)` argument is exactly that shape; (iii) PROFITABILITY on a
+loop-free body: a recursive function pays the pin's `push`/`pop` on
+every invocation, and for a read-only parameter with three uses that
+is a pure cost - 10_recursion_deep +3.2% Ir / 1.03x, fib flat - while
+every call-containing LOOP wins 4-6%. Neither allocator weighs a
+fragment's entry cost against its dynamic uses. None of the three is
+1b.
 
 **THE OLD SYMPTOM TEXT, kept because its analysis of the DENIAL is
 still correct:** `jit_run_blocks_xcache` denies the whole CALLER-SAVED
