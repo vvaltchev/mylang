@@ -745,17 +745,31 @@ messages, not carets, which is why no test fails. A `tests` entry with
 Small, but a caret that differs between engines is a RULE 2 violation
 and is on record. Not a detour from #97 - the maintainer's call.
 
-## 3d. FOUND 2026-09-20, NOT FIXED — TWO LOADER FINDINGS (`myv_fuzz`,
-## #137/#142 class) AND ONE TABLE GAP (the tenth shape, again)
+## 3d. FOUND 2026-09-20/21, NOT FIXED — THREE LOADER FINDINGS
+## (`myv_fuzz`, #137/#142 class) AND ONE TABLE GAP (the tenth shape, again)
 
-**The loader (task #26).** Both reached by the mutation space the v16
-`arg_locs` records shifted, both pre-existing, reproducers kept in
-`myv-fuzz-bad/`: `fat-676.myv` - an `InternalErrorEx` thrown through
-the `noexcept` `jit_load_struct_elem` -> `vm_struct_elem` ->
-`flat_structs()`' untrusted check = `std::terminate` (the same on the
-debug and the assert-free build); `small-938.myv` - a HANG in the
-load-time JIT's `jit_liveness_core`, whose fixpoint never converges on
-a mutated chunk. Both violate "no input may crash the interpreter".
+**The loader (task #26).** All reached by the mutation space a format
+change shifted (v16 `arg_locs`, then v17 `noescape_params`), all
+pre-existing, reproducers kept in `myv-fuzz-bad/`: `fat-676.myv` - an
+`InternalErrorEx` thrown through the `noexcept` `jit_load_struct_elem`
+-> `vm_struct_elem` -> `flat_structs()`' untrusted check =
+`std::terminate` (the same on the debug and the assert-free build);
+`small-938.myv` - a HANG in the load-time JIT's `jit_liveness_core`,
+whose fixpoint never converges on a mutated chunk; `fat-486.myv`
+(2026-09-21) - ONE byte turns a `LoadLiteralObjV` into a `PopHandler`
+with no `PushHandler` before it, and the interpreter's
+`act.handlers.pop_back()` runs on an EMPTY vector: a SEGV in the
+ASSERTS=0 build, a libstdc++ hardening abort in the debug one. No
+static bound in `verify_chunk` covers it (the handler stack's depth is
+a path property, not an operand); the fix is the TIER 2 provenance
+gate (`ML_UNTRUSTED_CHECK` on the pop, a defined `MyvError`/exception
+under `g_untrusted_bytecode`) - the same shape as the flat-array kind
+tag. All three violate "no input may crash the interpreter".
+**And the fuzzer could not SEE the third in the debug lane** (fixed
+2026-09-21): UBSan under `-fno-sanitize-recover` reports and exits 1,
+the SAME code a clean `MyvError` refusal uses, so `myv_fuzz.py` counted
+it clean while the release build segfaulted on the identical bytes. A
+sanitizer report in stderr is a CRASH now, whatever the exit code.
 
 **The table (task #25).** `visit_use_def` does not know the
 element-STORE family (StoreElemInt/Float/Value, StoreElem2V, the chain
