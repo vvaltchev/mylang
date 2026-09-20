@@ -6501,7 +6501,21 @@ first two cannot see what the third checks:
     push/pop, joins must agree, a region's exceptional entries seeded at
     its push depth). It runs on stored images and, ASSERTS-only, on
     every chunk codegen emits, so the rule and the compiler cannot
-    drift apart.
+    drift apart. **⛔ AND A BOUND THAT ONLY LOOKS COMPLETE (same day):
+    `a_reg`/`b_reg` skip the frame-slot bound when the operand's lit
+    flag is set - right for an op that READS the flag (StoreElemInt,
+    `read_int_operand`), a hole for one that reads `a_slot()` /
+    `b_slot()` unconditionally (DictStore, StoreElemValue, StoreMemberV,
+    StoreElem2V: codegen materialises their literals into temps, so a
+    set flag never comes from a compile). One mutated `opflags` bit
+    and the handler indexed the frame with the payload. Those rows use
+    `a_slot_only`/`b_slot_only`, which REFUSE the flag; and a
+    `chain_locs` entry a two-level op dereferences as a PAIR
+    (`chain_pair`: StoreElem2V, whose index was not bounded at all, and
+    the LoadElem2 reads) must hold two. **When you bound an operand,
+    read the HANDLER, not the encoding: what the VM does with the field
+    is the contract, and the encoding can say "literal" about a field
+    the VM never asks.**
 **⛔ AND A FOURTH SHAPE ALL THREE LAYERS MISS BY CONSTRUCTION: A
 CONSTRUCTOR THE LOADER ITSELF CALLS (2026-08-25).** The three layers
 bound what an image CONTAINS. They cannot bound an argument the READER

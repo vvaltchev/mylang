@@ -23916,6 +23916,149 @@ static bool myv_verify_handler_balance()
     return ok;
 }
 
+/*
+ * #137 (2026-09-21, found while auditing the store family's operand
+ * layouts for #25): two holes in verify_chunk's STORE rows, both a
+ * crash on a hostile image that the byte layers cannot see.
+ *  (1) StoreElem2V's `a` is a DUAL (k1 slot, chain_locs index) and the
+ *      index went UNBOUNDED: the VM indexes `chain_locs[a_dual_hi()]`
+ *      and the load-time JIT bakes that entry's `.data()` into the
+ *      fragment. And the two nested-store consumers
+ *      (vm_nested_subscript_store, jit_store_elem2) read locs[0] AND
+ *      locs[1], so an entry of ONE pair is a read past its end - the
+ *      LoadElem2Int/Float reads (`&locs[1]`) had the same length hole
+ *      behind a bounded index.
+ *  (2) DictStore / StoreElemValue / StoreMemberV / StoreElem2V read their
+ *      key and value operands as SLOTS unconditionally (codegen
+ *      materialises every literal into a temp first), but the verifier
+ *      SKIPPED the bound when the operand's lit flag was set - one
+ *      mutated opflags bit and `frame->at(<any 64-bit payload>)` ran
+ *      with no ML_VM_CHECK in a release build.
+ * Each patch is applied to the compiled chunk in process and must be
+ * refused with its own message; the intact program passes before and
+ * after.
+ */
+static bool myv_verify_store_operands()
+{
+    const char *lines_arr[] = {
+        "struct P { int x; }",
+        "func f(int n) {",
+        "  var g = [\"\", \"\"]; var d = {}; var m = [[0, 0], [0, 0]];",
+        "  var p = P(1); var s = 0;",
+        "  for (var i = 0; i < n; i++) {",
+        "    g[i] = str(i); d[str(i)] = i; m[i][1] = i; p.x = i;",
+        "    s = s + m[i][1] + p.x;",
+        "  }",
+        "  return s;",
+        "}",
+        "print(f(runtime(2)));" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        vm_verify_program(prog);                    /* intact: passes */
+        Chunk *fck = nullptr;
+        for (const auto &d : prog.funcs)
+            if (d->vm_chunk && d->name && d->name->val == "f")
+                fck = static_cast<Chunk *>(const_cast<void *>(d->vm_chunk));
+        const auto find = [&](OpCode op) -> Instr * {
+            if (!fck)
+                return nullptr;
+            for (Instr &in : fck->code)
+                if (in.op == op)
+                    return &in;
+            return nullptr;
+        };
+        Instr *st2 = find(OpCode::StoreElem2V);
+        Instr *ds = find(OpCode::DictStore);
+        Instr *sv = find(OpCode::StoreElemValue);
+        Instr *sm = find(OpCode::StoreMemberV);
+        Instr *l2 = find(OpCode::LoadElem2Int);
+        if (!st2 || !ds || !sv || !sm || !l2) {
+            fprintf(stderr, "myv_verify_store_operands: the shapes did not "
+                            "lower as expected (%d%d%d%d%d)\n",
+                    !!st2, !!ds, !!sv, !!sm, !!l2);
+            g_exec_engine = saved;
+            return false;
+        }
+        const auto refused = [&](const char *what, const char *needle)
+            -> bool {
+            try {
+                vm_verify_program(prog);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError"
+                        && e.msg && strstr(e.msg, needle))
+                    return true;
+                fprintf(stderr, "myv_verify_store_operands [%s]: threw "
+                                "%s: %s\n", what, e.name,
+                        e.msg ? e.msg : "");
+                return false;
+            }
+            fprintf(stderr, "myv_verify_store_operands [%s]: ACCEPTED\n",
+                    what);
+            return false;
+        };
+        /* (1a) the nested store's chain_locs index past the pool */
+        {
+            const Instr keep = *st2;
+            st2->set_a_dual(st2->a_dual_lo(), 9999);
+            ok = refused("StoreElem2V chain_locs index", "chain locs")
+                 && ok;
+            *st2 = keep;
+        }
+        /* (1b) the index names an entry of ONE pair: nested store, and
+         * the fused nested read */
+        {
+            fck->chain_locs.push_back({ { Loc(), Loc() } });
+            const int one = static_cast<int>(fck->chain_locs.size()) - 1;
+            const Instr keep = *st2;
+            st2->set_a_dual(st2->a_dual_lo(), one);
+            ok = refused("StoreElem2V one-pair entry", "chain locs pair")
+                 && ok;
+            *st2 = keep;
+            const Instr keep2 = *l2;
+            l2->set_a_dual(l2->a_dual_lo(), one);
+            ok = refused("LoadElem2Int one-pair entry", "chain locs pair")
+                 && ok;
+            *l2 = keep2;
+            fck->chain_locs.pop_back();
+        }
+        /* (2) a lit flag on an operand the VM reads as a slot */
+        struct LitCase { const char *what; Instr *in; uint8_t bit; };
+        const LitCase lits[] = {
+            { "DictStore key lit",       ds,  1 },
+            { "DictStore value lit",     ds,  8 },
+            { "StoreElemValue index lit", sv, 1 },
+            { "StoreElemValue value lit", sv, 8 },
+            { "StoreMemberV value lit",  sm,  8 },
+            { "StoreElem2V k2 lit",      st2, 8 },
+        };
+        for (const LitCase &lc : lits) {
+            const Instr keep = *lc.in;
+            lc.in->opflags = static_cast<uint8_t>(lc.in->opflags | lc.bit);
+            ok = refused(lc.what, "a literal where a slot") && ok;
+            *lc.in = keep;
+        }
+        vm_verify_program(prog);                    /* restored: passes */
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_verify_store_operands: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
 static bool myv_corrupt_refused()
 {
     const char *lines_arr[] = {
@@ -42085,6 +42228,10 @@ static const std::vector<extra_check> extra_checks =
       "pushed, a join at two depths and a region pushed twice are refused "
       "at load (myv_fuzz fat-486, 2026-09-21)",
       myv_verify_handler_balance },
+    { "myv: #137 - a STORE's chain_locs index and entry LENGTH are "
+      "bounded, and a lit flag on an operand the VM reads as a slot is "
+      "refused (StoreElem2V/DictStore/StoreElemValue/StoreMemberV, "
+      "LoadElem2Int)", myv_verify_store_operands },
     { "jit: #97 inc 3 (W1/W2) - the CALLER builds the frameless window "
       "and binds from the argument SOURCES: the expected entry, "
       "discriminator, arm and site sequences (a pinned int into an int "

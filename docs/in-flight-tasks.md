@@ -770,6 +770,17 @@ inlines the same pop as a bare `finish -= 4`) and, ASSERTS-only, on
 every chunk codegen emits - the whole corpus and `-rt` prove it accepts
 our own output. Pinned by `myv_verify_handler_balance` (three arms:
 a pop at depth 0, a join at two depths, a region pushed twice).
+✅ FIXED 2026-09-21, found by READING (auditing the store family's
+operand layouts for #25), not by the fuzzer: `StoreElem2V`'s
+`chain_locs` index was unbounded (the VM indexes the pool with it, the
+load-time JIT bakes the entry's address) and the two-level consumers
+read a PAIR out of the entry that a bounded index alone did not
+guarantee (LoadElem2Int/Float had that half); and the verifier SKIPPED
+the frame-slot bound on a lit-flagged operand of DictStore /
+StoreElemValue / StoreMemberV / StoreElem2V, which the VM reads as a
+slot unconditionally. `chain_pair`, `a_slot_only`/`b_slot_only` in
+verify_chunk; pinned by `myv_verify_store_operands` (nine patched
+chunks, all nine ACCEPTED before the fix).
 **A fourth, reported by the fixed fuzzer the same day, NOT fixed:**
 `small-1305.myv` runs to completion (prints `4`) and LeakSanitizer
 reports two 136-byte `FuncObject`s allocated by `jit_make_closure_ptr`
