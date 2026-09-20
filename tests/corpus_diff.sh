@@ -95,7 +95,7 @@ MODE=${2:-}
 # Re-measure that ratio if it ever looks like this row is free.
 LEVERS="cache fcache telide fread flit fwd ffwd resreg hoist hoist2 \
 mfact cest relent norec argfuse xcache scache rshare peep bakecallee \
-lsra"
+lsra capbase frameless"
 
 # ⛔ AN ASan LANE MUST BOUND ITSELF, OR A RUNAWAY TAKES THE MACHINE DOWN
 # INSTEAD OF FAILING (2026-09-03).  This script spawns a process per

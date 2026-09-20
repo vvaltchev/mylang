@@ -607,6 +607,7 @@ enum { FRAMELESS_MAX_SLOTS = 64 };
 extern unsigned long g_jit_cap_scalar;
 extern unsigned long g_jit_frameless_chunks;
 extern unsigned long g_jit_frameless_calls;
+extern unsigned long g_jit_frameless_entries;   /* inc 2 (emit-time) */
 
 /*
  * Call a compiled fragment (frameless: slots base in, resume pc out).

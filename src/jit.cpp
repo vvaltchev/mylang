@@ -366,13 +366,14 @@ enum JitLever {
     JL_CACHE, JL_FCACHE, JL_TELIDE, JL_FREAD, JL_FLIT,
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
-    JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA, JL_COUNT
+    JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA,
+    JL_FRAMELESS, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
-    "peep", "bakecallee", "capbase", "lsra"
+    "peep", "bakecallee", "capbase", "lsra", "frameless"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -3393,10 +3394,30 @@ struct Emitter {
                          "slots - flush_cache() first and say flushed");
         assert_no_borrow("frag_ret with a BORROW open - the teardown "
                          "pops would desynchronise against it");
-        if (const int sb = spill_bytes())            /* add rsp, imm32 */
-            { u8(0x48); u8(0x81); u8(0xC4); u32(static_cast<uint32_t>(sb)); }
-        if (entry_pad())
-            { u8(0x48); u8(0x83); u8(0xC4); u8(0x08); }       /* add rsp,8 */
+        /*
+         * #97 increment 2 (F2): THE TEARDOWN IS ABSOLUTE. It used to
+         * `add rsp` past the spill area and the alignment pad - correct
+         * only while every frame put NOTHING below them. A frameless
+         * frame allocates its whole window below the spill area
+         * (`sub rsp, N*48` at the frameless entry), so its rsp at any
+         * return or exit is that much lower; one `lea rsp, [rbp - K]`,
+         * with K the prologue's own push count + pad + spill, lands on
+         * the saved registers for BOTH frame kinds, and a frameless
+         * frame's window is discarded by the same instruction that
+         * skips a recorded frame's pad. rbp is the frame anchor in
+         * every fragment (G1 step 3), so the address is exact. One
+         * instruction where there were zero to two.
+         *
+         * K counts ONLY the pushes above the pad: rbx and the saved
+         * pins. The pad and the spill area lie BELOW them and are what
+         * this lea skips - adding them to K (the first version did)
+         * lands one slot low, so `pop rbx` takes the pad and `ret` takes
+         * the old rbp (watched: rip == rbx in gdb on the first closure
+         * call).
+         */
+        const int32_t K = static_cast<int32_t>(8 * (1 + saved.size()));
+        u8(0x48); u8(0x8D); u8(0xA5);                   /* lea rsp,[rbp+d] */
+        u32(static_cast<uint32_t>(-K));
         /* the teardown pops restore the C CALLER's callee-saved
          * registers; the pins those registers held are dead here (the
          * caller flushed, or asserted empty above) - machinery */
@@ -11071,6 +11092,7 @@ void jit_stats_report()
         { "cap_scalar",       &g_jit_cap_scalar },
         { "frameless_chunks", &g_jit_frameless_chunks },
         { "frameless_calls",  &g_jit_frameless_calls },
+        { "frameless_entries", &g_jit_frameless_entries },
         { "arg_stage",        &g_jit_arg_stage },
         { "sync_switch",      &g_jit_sync_switch },
         { "cached_probe_calls", &g_jit_cached_probe_calls },
@@ -23409,8 +23431,23 @@ bool jit_chunk_frameless_ok(const Chunk &chunk)
                  */
                 why = "not a leaf"; ok = false; break;
             default:
-                if (!jit_op_eligible(in))
-                    { why = "an op is not nativizable"; ok = false; break; }
+                /*
+                 * #97 increment 2 (F1): NOT `jit_op_eligible` - that is
+                 * the run builder's bar and it admits an op that can
+                 * BAIL (exit to a pc so the interpreter re-runs it),
+                 * which a frameless frame cannot survive: there is no
+                 * vframe and no record for the interpreter to resume
+                 * on. The only exit a frameless callee may take is an
+                 * EXCEPTION, conveyed to the caller as a status - and
+                 * "conveys, never bails" is exactly `op_fully_native`,
+                 * the #56 deletability predicate. Today every eligible
+                 * op but CallValueGenericV (refused above as a call) is
+                 * fully native, so this changes no reach; it changes
+                 * what the gate ASKS, so the next eligible-but-bailing
+                 * op is refused instead of silently admitted.
+                 */
+                if (!op_fully_native(in))
+                    { why = "an op can bail";   ok = false; break; }
                 continue;
             }
             break;
@@ -24250,6 +24287,7 @@ retry_emission:
      * emit_ok=false give-up path has always had. */
     Emitter e;
     std::vector<size_t> frag_off(runs.size());
+    int64_t fe_off = -1;             /* #97 inc 2: the frameless entry */
     /* #162: the in-place-argument decision, refilled per fragment but
      * OWNED here so the file-statics the emit reads can never outlive
      * their storage (they are cleared with the others at the end). */
@@ -26458,23 +26496,27 @@ retry_emission:
          * ops write memory). Emitted after the run body (labels final, so
          * the jump is a direct backward rel32); unmarked in -vdj (the
          * decoder resyncs at the next fragment's marks). */
-        for (auto &pe : entries) {
-            if (pe.first <= begin || pe.first >= end)
-                continue;                /* interior entries only (a head
-                                          * uses its run's own entry) */
-            pe.second = e.pos();
+        /*
+         * THE ENTRY ESTABLISHMENT, shared. What the run head emits after
+         * frag_entry - the tag singletons, the spill-home seeds, the pin
+         * loads AS OF a pc (base + every seam and transition at or
+         * before it), the float pins, the literal pool, the capture
+         * base - replayed by every post-call resume stub, and (F2) by
+         * the frameless entry for pc == begin. ONE copy: the stub loop
+         * used to hold it inline, and a second entry kind is exactly
+         * the moment two copies would start to drift.
+         */
+        const auto establish = [&](size_t at_pc) {
             {
-                /* the tracker: a stub is ENTRY ESTABLISHMENT - its
-                 * frag_entry pushes are the C caller's callee-saved
-                 * saves and its loads are the pin loads, all machinery.
-                 * The flit loads below stay OUTSIDE the scope on
-                 * purpose: flit_load stages through a real scratch
-                 * register, and whether that register is free here is
-                 * exactly what the tracker must keep judging. */
+                /* the tracker: entry establishment is machinery - the
+                 * loads are the pin loads. The flit loads below stay
+                 * OUTSIDE the scope on purpose: flit_load stages through
+                 * a real scratch register, and whether that register is
+                 * free here is exactly what the tracker must keep
+                 * judging. */
                 Emitter::PinMach pm(e);
                 e.trk_flushed = false;
                 e.trk_flushdirty = 0;
-                e.frag_entry();                  /* a stub IS an entry too */
                 /* BEFORE the pin loads: r8 may be both the singleton
                  * and a pin register, and the pin must win. */
                 emit_type_tags(e);
@@ -26492,7 +26534,7 @@ retry_emission:
                  * for entries past the last seam. */
                 std::vector<Emitter::CacheEnt> st_cache = base_cache;
                 for (const ShareSeam &sm : seams) {
-                    if (sm.pc > pe.first)
+                    if (sm.pc > at_pc)
                         break;
                     for (Emitter::CacheEnt &c : st_cache)
                         if (c.reg == sm.reg) {
@@ -26508,7 +26550,7 @@ retry_emission:
                  * entry pc is included - the stub jumps to label[pc],
                  * which is emitted after the transitions there) */
                 for (const LsraTrans &tr : lsra_tr) {
-                    if (tr.pc > pe.first)
+                    if (tr.pc > at_pc)
                         break;
                     if (tr.evict_slot >= 0)
                         for (size_t ci = 0; ci < st_cache.size(); ci++)
@@ -26538,7 +26580,7 @@ retry_emission:
                  * this degenerates to the old run-constant loop) */
                 std::vector<Emitter::CacheEnt> st_f = base_fcache;
                 for (const LsraTrans &tr : lsra_ftr) {
-                    if (tr.pc > pe.first)
+                    if (tr.pc > at_pc)
                         break;
                     if (tr.evict_slot >= 0)
                         for (size_t ci = 0; ci < st_f.size(); ci++)
@@ -26569,6 +26611,30 @@ retry_emission:
              * the day one does, when its absence would be a read
              * through a garbage pointer rather than a wrong number. */
             e.capbase_load();                     /* #112 capture base */
+        };
+
+        /* PER-PC ENTRY STUBS (post-call resume): an interior offset cannot
+         * be entered raw - fragment code assumes the HEAD's register
+         * contract (rsi = t_int, r8 = t_float on a float run, the N5 cache
+         * regs loaded). Each post-call entry gets a stub replaying exactly
+         * the head's establishment sequence, then jumping to the op AFTER
+         * the call. Sound: cache slots are resolved locals and memory is
+         * CURRENT at any resume (every native exit flushes; interpreted
+         * ops write memory). Emitted after the run body (labels final, so
+         * the jump is a direct backward rel32); unmarked in -vdj (the
+         * decoder resyncs at the next fragment's marks). */
+        for (auto &pe : entries) {
+            if (pe.first <= begin || pe.first >= end)
+                continue;                /* interior entries only (a head
+                                          * uses its run's own entry) */
+            pe.second = e.pos();
+            {
+                /* a stub's frag_entry pushes are the C caller's
+                 * callee-saved saves - machinery */
+                Emitter::PinMach pm(e);
+                e.frag_entry();                  /* a stub IS an entry too */
+            }
+            establish(pe.first);
 #ifdef TESTS
             e.bump_counter(&g_jit_entry_resume);
 #endif
@@ -26576,6 +26642,92 @@ retry_emission:
             e.u8(0xE9);
             e.u32(static_cast<uint32_t>(
                 tgt - (e.pos() + 4)));            /* jmp (backward) */
+        }
+
+        /*
+         * #97 INCREMENT 2 (F2): THE FRAMELESS ENTRY - the callee half
+         * of the frameless protocol (Chunk::frameless_entry_off has the
+         * contract). Emitted for a frameless_ok body whose whole code is
+         * this one run; it takes rdi = the CALLER's argument run
+         * (params.size() contiguous slots, exact types - the baked
+         * push's own per-argument checks precede the call) and builds
+         * the frame itself:
+         *   frag_entry                the recorded entry's prologue,
+         *                             verbatim - so [rbp-8] is still the
+         *                             caller's window and every
+         *                             rbp-relative spill home keeps its
+         *                             offset;
+         *   sub rsp, N*48 ; rbx=rsp   the window, on the native stack -
+         *                             16-aligned since 48 is, rsp was;
+         *   the argument copy         four qwords per parameter from
+         *                             [rdi], the container/flag tail
+         *                             zeroed (the push's scalar arm);
+         *   t_none over every other   the release scan and the
+         *   slot's type word          VM_HARDENING pop audit read every
+         *                             listed / every slot;
+         *   act.vframe = the window   helpers reach the frame there;
+         *   establish(begin) ; jmp    the head's own register contract.
+         * NOT emitted: the segment fit test and bump, the record or its
+         * record-less fork, the residue and relay pushes, the depth
+         * counter - the activation bookkeeping the contract counted at
+         * 71 of a 142-Ir call. The return is the record-less arm's, told
+         * apart by bit 0 of [rbp+24] (F3); the exits are the shared
+         * epilogues, whose teardown is absolute (frag_ret).
+         *
+         * UNREACHABLE at this increment: no site calls it yet (F4). The
+         * lever keeps the whole tier off in the differential matrix.
+         */
+        if (chunk.frameless_ok && g_cur_caller_desc && runs.size() == 1
+                && begin == 0 && end == n
+                && !jit_lever_off(JL_FRAMELESS)) {
+            const JitLayout &L = jit_layout();
+            const JitPushLayout &P = jit_push_layout();
+            const int total = chunk.slot_count + chunk.n_temps;
+            const int nargs =
+                static_cast<int>(g_cur_caller_desc->params.size());
+            const uint8_t R8R = 8, R11 = 11;
+            fe_off = static_cast<int64_t>(e.pos());
+            {
+                Emitter::PinMach pm(e);
+                e.frag_entry();                  /* rbx = rdi for a moment */
+            }
+            /* the window: below the spill area, rbx repointed */
+            e.op_reg_imm(Op::minus, RSP, total * 48);
+            e.mov_rr(RBX, RSP);
+            /* the arguments: [rdi + i*48] -> [rbx + i*48], four qwords,
+             * then the container/flag tail zeroed. rdi is the fragment's
+             * argument register (the caller's run pointer here); r11 is
+             * entry scratch - every pin load comes AFTER this, from the
+             * window these stores fill, so a body pin in r11 is not yet
+             * live. */
+            for (int i = 0; i < nargs; i++) {
+                const int32_t d = i * 48;
+                for (int32_t o = 0; o <= 24; o += 8) {
+                    e.load_base(R11, RDI, d + o);   /* reg:abi reg:proto */
+                    e.store_base(R11, RBX, d + o);  /* reg:proto */
+                }
+                e.store_qword_base_imm32(RBX, d + 32, 0);
+                e.store_qword_base_imm32(RBX, d + 40, 0);
+            }
+            /* every non-parameter slot reads as `none` until written */
+            for (int sl = nargs; sl < total; sl++)
+                e.store_type_tag_base(RBX, sl * 48 + 24, L.t_none,
+                                      R11);                 /* reg:proto */
+            /* act.vframe = this window (helpers read the frame there);
+             * r8 = act is the push protocol's own register for it */
+            e.load_global(R8R, L.addr_act, R11);            /* reg:proto */
+            e.store_base(RBX, R8R,                          /* reg:proto */
+                         static_cast<int32_t>(P.act_vframe + P.frame_slots));
+            e.store_dword_base_imm32(R8R,                   /* reg:proto */
+                static_cast<int32_t>(P.act_vframe + P.frame_size),
+                static_cast<uint32_t>(total));
+            establish(begin);
+#ifdef TESTS
+            g_jit_frameless_entries++;
+#endif
+            const size_t tgt = label[0];
+            e.u8(0xE9);
+            e.u32(static_cast<uint32_t>(tgt - (e.pos() + 4)));
         }
         e.emit_epilogues(g_cur_caller_desc, &g_norec_exit_desc);
                                  /* the shared exit tail(s) for THIS run */
@@ -26803,6 +26955,10 @@ retry_emission:
      * sync caller fragment (jit_sync_push_* returns base + this). */
     if (!chunk.code.empty() && chunk.code[0].op == OpCode::EnterNative)
         chunk.sync_entry_off = static_cast<int64_t>(chunk.code[0].a_lit());
+    /* #97 increment 2: the frameless entry, an offset into the same
+     * buffer (a frameless_ok body is one run, so its fragment is the
+     * whole chunk) */
+    chunk.frameless_entry_off = fe_off;
     if (jit_map_wanted())
         jit_write_map(chunk, map_name);
 }
