@@ -72,6 +72,74 @@ struct test {
 static const std::vector<test> tests =
 {
     /*
+     * #97 B2: abs/min/max on PROVEN INTS lower to a compare-and-branch over
+     * int ops (codegen), not the builtin call. The builtins' exact
+     * semantics, in the three positions whose peepholes treat a lowering's
+     * LAST op specially (an assignment, a return, a sub-expression) - the
+     * return form is the one that caught a lowering ending on an IntBin.
+     * Arguments come through runtime(): a constant argument folds before
+     * codegen and would test nothing. INT_MIN: abs wraps, like the
+     * builtin's `-val`. A tie returns the FIRST argument (indistinguishable
+     * for ints; the bool/float line checks the generic path still types).
+     */
+    { "builtin: abs/min/max on proven ints (#97 B2) - values, ties, "
+      "INT_MIN, three positions, and the generic path for bool/float", {
+        /* NOT INLINABLE (the loop is over the inliner's weight gate) and
+         * a TEMP argument (x + k): a one-line `return abs(x)` is spliced
+         * into the caller as a plain sub-expression, so this is what keeps
+         * the RETURN position a return */
+        "func ret_abs(int x) {",
+        "  var k = 0; for (var i = 0; i < 1; i++) k = k + i;",
+        "  return abs(x + k);",
+        "}",
+        "func ret_min(int a, int b) {",
+        "  var k = 0; for (var i = 0; i < 1; i++) k = k + i;",
+        "  return min(a + k, b);",
+        "}",
+        "func ret_max(int a, int b) {",
+        "  var k = 0; for (var i = 0; i < 1; i++) k = k + i;",
+        "  return max(a + k, b);",
+        "}",
+        "func asg(int a, int b) {",
+        "  var r = 0;",
+        "  r = abs(a - b);",
+        "  var q = 0;",
+        "  q = max(a, 3) - min(-a, b);",
+        "  return r * 1000 + q;",
+        "}",
+        /* ARGUMENT positions - the one the staging retarget rewrites:
+         * a builtin's argument, a non-inlinable user call's, and an
+         * INLINED helper's result as an argument (watched: an abs ending
+         * on an IntBin printed a stale slot through exactly this) */
+        "func inl(int a) { return abs(a - 1); }",
+        "func keep(int v) {",
+        "  var k = 0; for (var i = 0; i < 1; i++) k = k + i;",
+        "  return v + k;",
+        "}",
+        "var lo = int(runtime(-9223372036854775807)) - 1;",
+        "assert(ret_abs(lo) == lo);",
+        "for (var i = -4; i <= 4; i++) {",
+        "  var a = int(runtime(i * 7));",
+        "  var b = int(runtime(5 - i));",
+        "  assert(ret_abs(a) == (a >= 0 ? a : 0 - a));",
+        "  assert(ret_abs(a - b) == (a - b >= 0 ? a - b : b - a));",
+        "  assert(ret_min(a, b) == (b < a ? b : a));",
+        "  assert(ret_max(a, b) == (b > a ? b : a));",
+        "  assert(ret_min(a, a) == a && ret_max(b, b) == b);",
+        "  var d = abs(a - b);",
+        "  var mm = min(a, 3) + max(-2, b) * 10;",
+        "  assert(d == (a > b ? a - b : b - a));",
+        "  assert(mm == (a < 3 ? a : 3) + (b > -2 ? b : -2) * 10);",
+        "  assert(asg(a, b) == d * 1000 + ((a > 3 ? a : 3) - (0 - a < b ? 0 - a : b)));",
+        "  assert(str(abs(a - 1)) == str(a - 1 >= 0 ? a - 1 : 1 - a));",
+        "  assert(keep(min(a + 1, b)) == (b < a + 1 ? b : a + 1));",
+        "  assert(keep(max(a - 1, b)) == (b > a - 1 ? b : a - 1));",
+        "  assert(str(inl(a)) == str(a - 1 >= 0 ? a - 1 : 1 - a));",
+        "  assert(keep(inl(b)) == (b - 1 >= 0 ? b - 1 : 1 - b));",
+        "}",
+        "assert(typestr(min(true, 5)) == \"bool\");",
+        "assert(min(2, 2.5) == 2 && max(1.5, 1) == 1.5 && abs(-2.5) == 2.5);" } },
+    /*
      * FALL OFF THE END: a body whose last statement is a conditional
      * return, so the false arm is the implicit `return none`.
      *
@@ -20161,6 +20229,58 @@ static bool jit_frameless_builtins()
 #else
     return true;
 #endif
+}
+
+/*
+ * #97 B2's REACH: the lowering fires for abs/min/max on proven ints and
+ * NOT for a bool or float argument (the generic call keeps its typing and
+ * its throws). Counted at codegen (g_cg_minmax_lowered), so it holds in
+ * every build, JIT or not.
+ */
+static bool cg_minmax_reach()
+{
+    const auto count = [](const std::vector<const char *> &lines) -> long {
+        std::string src;
+        for (const char *l : lines) { src += l; src += "\n"; }
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        const unsigned long c0 = g_cg_minmax_lowered;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) { }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        return static_cast<long>(g_cg_minmax_lowered - c0);
+    };
+    bool ok = true;
+    const long ints = count({
+        "func f(int a, int b) { return abs(a) + min(a, b) + max(a, b); }",
+        "print(f(int(runtime(-3)), int(runtime(4))));" });
+    if (ints != 3) {
+        fprintf(stderr, "cg_minmax_reach: %ld of 3 int calls lowered\n",
+                ints);
+        ok = false;
+    }
+    const long others = count({
+        "func g(bool p, float x) {",
+        "  return str(min(p, 5)) + str(max(x, 1.5)) + str(abs(x));",
+        "}",
+        "print(g(runtime(true), runtime(-2.5)));" });
+    if (others != 0) {
+        fprintf(stderr, "cg_minmax_reach: %ld bool/float calls lowered - "
+                "they must keep the generic call\n", others);
+        ok = false;
+    }
+    return ok;
 }
 
 /*
@@ -44779,6 +44899,8 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 H1 - a frameless body calls builtins: plain, raising, a "
       "callback (and a throwing one), an lvalue write, a recursion "
       "through the bound", jit_frameless_builtins },
+    { "builtin: abs/min/max on proven ints lower, bool/float do not "
+      "(#97 B2 reach)", cg_minmax_reach },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",
       jit_bind_widen_inline },
     { "jit: a reference argument binds IN PLACE, and the declines (#162)",

@@ -603,8 +603,10 @@ work — but profile it before building, the way increment 0 was.
         *#97 G2*). ✅ **H1 DONE 2026-09-24** (benches 94/95 first): a
         frameless body may call builtins (95 0.87x wall; 94 0.99x - its
         cost is the BUILTIN CALL itself, 51% in jit_call_builtin; record:
-        *#97 H1*). NEXT candidates: the generic builtin helper's
-        per-call cost, and abs/min/max lowered on proven ints; then #124.
+        *#97 H1*). ✅ **B1 + B2 DONE 2026-09-24** (the maintainer: do
+        both): SmallArgs for the builtin argument buffer (94 -14.6%, 41
+        -11.0%, 32 -7.5%) and abs/min/max on proven ints lowered to int ops
+        (94 -82.8%, 95 -76.1%; records: *#97 B1*, *#97 B2*). Then #124.
         NEXT was: a non-SELF callee
         (needs the callee's placement facts at a non-main site - the
         seventh audit-table shape), builtin calls in a calling body.
