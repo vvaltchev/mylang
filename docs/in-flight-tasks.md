@@ -51,21 +51,21 @@ kept in `myv-fuzz-bad/` (git-ignored) - see the loader item in §3.
 <= 5x. Plan: `plans/frameless-callee.md`. Per-change record:
 `docs/jit-optimizations.md`.
 
-**WHERE THE WORST BENCHES STAND after W3 + the per-argument caret
-(the maintainer's own run, 2026-09-20, `my/cpp`; the previous table,
-before E3/W3, read 34 5.28x ... 78 10.35x, 76 11.45x):**
+**WHERE THE WORST BENCHES STAND after W4 (the maintainer's own run,
+2026-09-21, `my/cpp`; after W3 the same table read 34 5.22x, 11 7.59x,
+63 7.95x, 78 8.47x, 76 9.80x; before E3/W3: 78 10.35x, 76 11.45x):**
 
-    34_sort_custom_cmp            0.106      0.020    5.22x
-    64_struct_create              0.106      0.016    6.58x
-    09_fib_recursive              0.154      0.022    7.04x
-    73_multi_unpack               0.232      0.032    7.16x
-    58_structs                    0.078      0.011    7.28x
-    11_closure_counter            0.093      0.012    7.59x
-    63_closures                   0.201      0.025    7.95x
-    35_map_filter                 0.200      0.025    8.10x
-    78_typed_param_call           0.061      0.007    8.47x
-    75_indexed_unpack             0.210      0.024    8.88x
-    76_funcval_dispatch           0.172      0.018    9.80x
+    34_sort_custom_cmp            0.106      0.020    5.23x
+    64_struct_create              0.105      0.016    6.49x
+    11_closure_counter            0.082      0.012    6.68x
+    73_multi_unpack               0.228      0.032    7.02x
+    58_structs                    0.077      0.011    7.12x
+    09_fib_recursive              0.156      0.022    7.12x
+    63_closures                   0.194      0.025    7.65x
+    35_map_filter                 0.193      0.025    7.80x
+    78_typed_param_call           0.057      0.007    7.85x
+    75_indexed_unpack             0.208      0.024    8.79x
+    76_funcval_dispatch           0.170      0.018    9.72x
 
 RESUMED 2026-09-21 with W4 (done). Next per §1.6: the parameter
 tails' zeroing, `visit_use_def` learning the element-store family (it
