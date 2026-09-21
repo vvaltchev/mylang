@@ -3096,7 +3096,10 @@ flag, so an error that arrives with a loc already set (a builtin like
 `append(tbl, 9)`, a not-an-lvalue assignment `d.k = v`) still keeps its frames.
 `do_func_call` sets the same flag after its own call-site flush so the enclosing
 `CallExpr` doesn't re-emit, while each physical call's flush stays unconditional
-(multi-level inlined call sites all show). Backtraces for **body** errors are
+(multi-level inlined call sites all show). `tag_inline` must walk a COMPLETE
+child visitor (`fmi_children`, #38 repro B): the resolver's `for_each_child`
+skips Block/for/foreach/try/Expr14, which left every STATEMENT of a spliced
+block body chain-less. Backtraces for **body** errors are
 byte-identical with/without inlining;
 **known limitation** — an error *evaluating an argument* (e.g. an undefined var)
 is attributed to the inlined callee rather than the call site (the arg node is
