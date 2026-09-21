@@ -580,5 +580,31 @@ else
     pass "-dcs: names the callee of a copy chain, and does not run"
 fi
 
+# ---------------------------------------------------------------------
+# -nti (#51): with type inference off, the VM codegen refused every user
+# call that reached it (NotLoweredEx: it lowered a call only on a TYPE
+# proof), while the tree-walker ran the program. A flag is the driver's,
+# and no `-rt` entry runs untyped, so the case lives here too (the corpus
+# lane is tests/corpus_diff.sh's `-nti` pass).
+cat > "$TMP/nti.my" <<'NTIEOF'
+struct P { int x; }
+func f(a) { var r = a[0] + 1; return r; }
+func g(n) { var p = P(n); return p.x; }
+var t = 0;
+for (var i = 0; i < 3; i++) {
+    var a = [i, 2];
+    t += f(a) + g(runtime(i));
+}
+print(t);
+NTIEOF
+a=$("$BIN" -tw -nti "$TMP/nti.my" 2>&1)
+b=$("$BIN" -nti "$TMP/nti.my" 2>&1)
+got_rc=$?
+if [ "$got_rc" = 0 ] && [ "$a" = "9 " ] && [ "$a" = "$b" ]; then
+    pass "-nti: a user call in a loop runs, both engines agree"
+else
+    fail "-nti: rc=$got_rc tw=[$a] vm=[$b]"
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc

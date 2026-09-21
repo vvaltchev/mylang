@@ -3052,8 +3052,15 @@ struct Codegen {
     bool try_native_value_call(const CallExpr *call, int &out_slot,
                                std::vector<CgInstr> &ops)
     {
+        /* A DirectCallExpr is CallV's (try_native_call) - unless nothing
+         * proved its callee a function (#51: -nti stamps every call a DYN
+         * callee), in which case the generic dispatch below is the only
+         * sound lowering: its callee is a global slot, which the boxed
+         * compile reads like any value. */
+        if (dynamic_cast<const DirectBuiltinCallExpr *>(call))
+            return false;
         if (dynamic_cast<const DirectCallExpr *>(call)
-            || dynamic_cast<const DirectBuiltinCallExpr *>(call))
+            && (call->vm_direct_func || !call->vm_dyn_callee))
             return false;
         if ((!call->vm_direct_func && !call->vm_dyn_callee) || !call->args)
             return false;
