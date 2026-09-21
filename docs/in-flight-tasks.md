@@ -670,6 +670,15 @@ does not rediscover (a) as a mystery.
 ## BIND-COERCION ERROR'S CARET DIFFERED PER ENGINE (found during #97
 ## inc 3 W2; RULE 2)
 
+**REFINED the same day, on the maintainer's "as accurate as possible":**
+a bind coercion now carets the FAILING ARGUMENT alone (`f2(i, z)` with a
+string in `z` underlines `z`), in every engine and from a `.myv` image -
+the bind records the parameter index (`Exception::bind_arg`), the call
+ops carry one span per argument (`Chunk::arg_locs`, myv v16), and the
+JIT's conveyance stamp selects on the index at run time. An arity error
+keeps the list. Record: docs/jit-optimizations.md, *RULE 2, refined*.
+The list-span fix it refines follows.
+
 The fix, in one line: the user call ops carry the ARGUMENT LIST's span as
 their second caret (`base_locs`), the interpreter and the JIT stamp a
 loc-less setup throw with it, and the tree-walker's devirtualized

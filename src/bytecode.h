@@ -2004,10 +2004,12 @@ struct Chunk {
      * global records one, and (2026-09-20, RULE 2) so does every USER CALL
      * op (CallV/CachedCallV/CallValueV), whose second caret is the ARGUMENT
      * LIST's span: a loc-less exception out of the call's setup - an arity
-     * throw, a bind coercion - is what the tree-walker's CallExpr::do_eval
-     * carets there, while `locs` holds the whole call. Read by the
-     * interpreter's enter paths (vm_stamp_setup_caret) and baked by the
-     * JIT's conveyance (emit_exc_stamp's args form).
+     * throw, the window push - is what the tree-walker's CallExpr::do_eval
+     * carets there, while `locs` holds the whole call. A BIND COERCION
+     * carets the one argument it rejected instead - the op's THIRD caret,
+     * `arg_locs` below. Read by the interpreter's enter paths
+     * (vm_stamp_setup_caret) and baked by the JIT's conveyance
+     * (emit_exc_stamp's args form).
      */
     std::vector<LocEntry> base_locs;
 
@@ -2045,6 +2047,51 @@ struct Chunk {
     bool base_loc_at(size_t pc, Loc &start, Loc &end) const
     {
         return loc_lookup(base_locs, pc, start, end);
+    }
+
+    /*
+     * THE PER-ARGUMENT CARETS of a user call op (RULE 2, 2026-09-20) - the
+     * op's THIRD caret. A BIND COERCION (`func f(int k)` handed a `dyn`
+     * float) carets the FAILING ARGUMENT alone in the tree-walker
+     * (stamp_args_loc reads `args->elems[i]` off the bind's recorded
+     * index, Exception::bind_arg); `locs` holds the whole call and
+     * `base_locs` the argument list, and neither can name ONE argument.
+     * So CallV/CachedCallV/CallValueV record every argument's span here:
+     * `arg_locs` is pc-keyed and ascending like the other two (exact-match
+     * binary search, read ONLY on a throw path), each entry naming a run
+     * `[first, first + n)` of `arg_loc_pool`. SPARSE - only the three
+     * user-call ops record one (the generic dyn-callee op's CallSite
+     * carries its own). The interpreter's enter paths read it
+     * (vm_stamp_setup_caret); the JIT bakes `&arg_loc_pool[first]` into
+     * the call site's conveyance stamp (emit_exc_stamp's args form, a
+     * run-time select on the exception's bind_arg), so the pool's buffer
+     * must be STABLE after codegen - the same rule as boxed_ops. Every pc
+     * mover (the JIT's remaps, the bytecode splice) carries it; the loader
+     * bounds it (verify_chunk); docs/myv-format.txt 9.21.
+     */
+    struct ArgLocEntry { uint32_t pc; uint32_t first; uint32_t n; };
+    std::vector<ArgLocEntry> arg_locs;
+    std::vector<ArgLoc> arg_loc_pool;
+
+    /* The `idx`-th argument's Loc of the call op at `pc`; false if the op
+     * recorded no per-argument carets or `idx` is past its count. */
+    bool arg_loc_at(size_t pc, size_t idx, Loc &start, Loc &end) const
+    {
+        size_t lo = 0, hi = arg_locs.size();
+        while (lo < hi) {
+            const size_t mid = (lo + hi) / 2;
+            if (arg_locs[mid].pc < pc)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo >= arg_locs.size() || arg_locs[lo].pc != pc
+                || idx >= arg_locs[lo].n)
+            return false;
+        const ArgLoc &al = arg_loc_pool[arg_locs[lo].first + idx];
+        start = al.start;
+        end = al.end;
+        return true;
     }
 
     /*

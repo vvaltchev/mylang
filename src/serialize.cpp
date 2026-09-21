@@ -999,6 +999,52 @@ void read_loc_table(Reader &r, std::vector<Chunk::LocEntry> &tbl,
     }
 }
 
+/*
+ * THE PER-ARGUMENT CARET TABLE (v16; RULE 2, 2026-09-20) - a user call op's
+ * THIRD caret, one span per argument, so a bind coercion can name the
+ * argument it rejected (docs/myv-format.txt 9.21). On disk each entry is
+ * SELF-CONTAINED - `u32 pc, u32 n, n x {loc start, loc end}` through the
+ * narrow pool codec - rather than the in-memory `{pc, first, n}` run over a
+ * flat pool: the reader rebuilds `first` itself as it appends, so there is
+ * no pool INDEX in the file for a hostile image to point past. The pc is
+ * bounded here like a loc table's; verify_chunk re-checks the run against
+ * the rebuilt pool before the JIT bakes its address.
+ */
+static void write_arg_locs(Writer &w, const Chunk &c)
+{
+    w.u32v(static_cast<uint32_t>(c.arg_locs.size()));
+    for (const auto &ae : c.arg_locs) {
+        w.u32v(ae.pc);
+        w.u32v(ae.n);
+        for (uint32_t k = 0; k < ae.n; k++) {
+            const ArgLoc &al = c.arg_loc_pool[ae.first + k];
+            w.locv(al.start);
+            w.locv(al.end);
+        }
+    }
+}
+
+static void read_arg_locs(Reader &r, Chunk &c, size_t code_size)
+{
+    const uint32_t n = r.countv();
+    c.arg_locs.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        Chunk::ArgLocEntry ae;
+        ae.pc = r.u32v();
+        if (ae.pc > code_size)
+            bad_image("corrupt .myv (arg_locs pc)");
+        ae.n = r.countv();
+        ae.first = static_cast<uint32_t>(c.arg_loc_pool.size());
+        for (uint32_t k = 0; k < ae.n; k++) {
+            ArgLoc al;
+            al.start = r.locv();
+            al.end = r.locv();
+            c.arg_loc_pool.push_back(al);
+        }
+        c.arg_locs.push_back(ae);
+    }
+}
+
 void write_arglocs(Writer &w, const std::vector<ArgLoc> &v)
 {
     w.u32v(static_cast<uint32_t>(v.size()));
@@ -1147,6 +1193,8 @@ void write_chunk(Writer &w, const Chunk &c)
      * whose base can be an unbound global records one). */
     write_loc_table(w, c.base_locs);
     ct("  base_locs");
+    write_arg_locs(w, c);              /* v16: the per-argument carets */
+    ct("  arg_locs");
     /*
      * #97 E1: the NAMED CALLEE of each value-call site (sparse - only a
      * CallValueV whose callee #116's analysis could name). Two u32s per
@@ -1434,6 +1482,7 @@ void read_chunk(Reader &r, Chunk &c)
 
     read_loc_table(r, c.locs, c.code.size());
     read_loc_table(r, c.base_locs, c.code.size());     /* #127 */
+    read_arg_locs(r, c, c.code.size());                /* v16 */
 
     n = r.countv();                                   /* #97 E1 */
     c.value_callees.reserve(n);

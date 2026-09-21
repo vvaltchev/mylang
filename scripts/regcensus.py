@@ -312,11 +312,15 @@ def census(path):
                            r'\btake\s*\(|\btake_fixed\s*\(|'
                            r'\bfree_scratch\s*\(|'
                            # RefScratch asks the allocator first (8c);
-                           # its ctor argument is the PREFERENCE
+                           # its ctor argument is the PREFERENCE - as
+                           # a declaration `RefScratch rs(e, R)` or a
+                           # constructor expression `RefScratch(e, R)`
+                           # (a conditional second scratch held in a
+                           # unique_ptr: the exc-stamp's arg select)
                            # Phase A: the conflict-evict seam is
                            # allocator API too - calling it IS model
                            # participation, not a hardcode
-                           r'\bRefScratch\s+\w+\s*\(|'
+                           r'\bRefScratch(?:\s+\w+)?\s*\(|'
                            # the conflict-evict seam (any register) and
                            # hold() - the ask-first borrow - are model
                            # API: their register operands are requests

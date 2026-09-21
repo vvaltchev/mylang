@@ -236,6 +236,38 @@ else
     fail "myv: -c refused a program with a function value in a pool"
 fi
 
+# RULE 2 (2026-09-20): a bind coercion carets the FAILING ARGUMENT, and an
+# image must render it exactly as the source run does - the per-argument
+# spans travel in the image's arg_locs table (v16), and this is the only
+# net that renders an error THROUGH the file driver from a loaded image
+# (-rt's round trip compares the tables, not the caret a user sees). The
+# throw is on a WARMED re-descent so the emitted site's stamp - a run-time
+# select on the exception's bind_arg - is what renders under the JIT.
+cat > "$TMP/argcaret.my" <<'PROG'
+func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }
+var f2 = mk2(1);
+var dyn z = 0; z = runtime("str"); var s = 0;
+for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); s = s + f2(z, i); }
+print(s);
+PROG
+# (the header names the file as each run was given it - the absolute
+# path here, the image's stored relative reference - so the name is
+# masked; everything else, the caret line included, must be identical)
+mask_at='s/ at [^,]*, line/ at F, line/'
+src_out=$("$BIN" "$TMP/argcaret.my" 2>&1 | sed "$mask_at")
+if "$BIN" -c "$TMP/argcaret.my" -o "$TMP/argcaret.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/argcaret.myv" 2>&1 | sed "$mask_at")
+    if [ "$img_out" = "$src_out" ] && \
+       printf '%s' "$src_out" | grep -q 'line 4, col 69:70'; then
+        pass "myv: a bind coercion's per-argument caret renders from an image"
+    else
+        det="src [$src_out] img [$img_out]"
+        fail "myv: per-argument caret from an image ($det)"
+    fi
+else
+    fail "myv: -c refused the per-argument caret program"
+fi
+
 # ... and a function in a STRUCT's const member is REFUSED at -c time,
 # loudly, instead of producing an image nobody can read. The struct table
 # (section 7) is parsed BEFORE the descriptor table, so a descriptor index

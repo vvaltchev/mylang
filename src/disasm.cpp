@@ -454,6 +454,24 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             s << ";   pc" << l.pc << " -> " << l.start.line << ":"
               << l.start.col << "\n";
     }
+    if (!ch.arg_locs.empty()) {
+        /* RULE 2: a user call op's THIRD caret - one span per argument,
+         * for a bind coercion to name the argument it rejected (`locs`
+         * holds the whole call, `base_locs` the argument list). Both
+         * ends printed: the round-trip oracle compares these tables
+         * entry-for-entry beside the dump, and `end` is half the caret. */
+        s << "; -- arg_locs: call pc -> per-argument line:col-col ("
+          << ch.arg_locs.size() << ") --\n";
+        for (const auto &ae : ch.arg_locs) {
+            s << ";   pc" << ae.pc << " ->";
+            for (uint32_t k = 0; k < ae.n; k++) {
+                const ArgLoc &al = ch.arg_loc_pool[ae.first + k];
+                s << " " << al.start.line << ":" << al.start.col << "-"
+                  << al.end.col;
+            }
+            s << "\n";
+        }
+    }
     if (!ch.value_callees.empty()) {
         /* #97 E1: the callee #116's analysis NAMED for a value-call site,
          * as a closure_defs index - what the JIT bakes, and what its

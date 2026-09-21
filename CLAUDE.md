@@ -5584,6 +5584,16 @@ and two macros:
   stays sparse. **When you add a store-like op, give it a base caret**: the
   emit site has the base expression in hand from `as_container_base`, and it
   is one line. Full note: *docs/vm-ops.md*, `Chunk::base_locs`.
+  **A user CALL op needs THREE (RULE 2, 2026-09-20):** the whole call
+  (`locs`), its argument list (`base_locs` - an arity error), and the ONE
+  ARGUMENT a bind coercion rejected (`Chunk::arg_locs`, one span per
+  argument; the bind records the parameter index in `Exception::bind_arg`
+  and every engine's call-site stamp selects on it - the JIT's at run
+  time, in emitted code). Only a CALL-SITE bind records the index: a
+  builtin callback's parameter index names no argument of the builtin
+  call, so its coercion keeps the builtin's list. `docs/vm-ops.md`,
+  `Chunk::arg_locs`; the record is *RULE 2, refined* in
+  docs/jit-optimizations.md.
 - **Context keywords**: `break`/`continue`/`return`/`rethrow` outside their
   valid context (gated by `pFlags` in `pStmt`) raise a clear `SyntaxErrorEx`
   ("... only allowed in a loop", etc.), not a generic "unexpected token".

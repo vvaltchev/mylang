@@ -2,8 +2,12 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 14.  This document describes the on-disk image exhaustively:
+Format version 16.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v16 adds one per-chunk record, `arg_locs` - section 9.21 - written right
+after `base_locs`; v15 added `value_callees`, section 9.20.  Neither
+changed an existing encoding.)
 
 (v14 changed no encoding: it widened the VALUE DOMAIN of an instruction's
 `aop` byte - the compound shift/bitwise assignment operators `<<=` `>>=`
@@ -456,6 +460,8 @@ Each chunk is:
     N x value consts
     N x LocEntry locs               9.2
     N x LocEntry base_locs          9.2 - the store-BASE carets (v13)
+    u32      n_arg_locs             the per-ARGUMENT carets (v16)
+    n x ArgLocs                     9.21
     u32      n_value_callees        the named value-call callees (v15)
     n x { u32 pc; u32 def }         9.20
     N x InlineFrame inline_frames   9.3
@@ -994,6 +1000,45 @@ entry is harmless by construction: the emitted code compares the live
 callee's descriptor against the baked one and takes a generic path on a
 mismatch, so a bad prediction costs a slow path and never a wrong answer.
 An OUT-OF-RANGE one is not harmless, which is what the bound is for.
+
+9.21  arg_locs - a user call op's PER-ARGUMENT carets (v16)
+
+A user call op (`CallV`, `CachedCallV`, `CallValueV`) has THREE error
+spans: the whole call (`locs`), its argument list (`base_locs`, for an
+arity error) and, for a BIND COERCION - a declared `int`/`float`
+parameter refusing a `dyn` value - the ONE ARGUMENT that was rejected
+(section 9.20's sibling in shape: pc-keyed, sparse, read only on a throw
+path).  The tree-walker carets that argument's own expression, so the VM
+and the JIT must be able to name it too; the bind records the parameter
+index on the exception, and the call site reads the span from here.
+
+    u32   count
+    count x:
+        u32  pc     the call op's pc, non-decreasing, exact-match searched
+        u32  n      the argument count of that call
+        n x:
+            loc  start      2.1 (the narrow pool loc)
+            loc  end
+
+One entry per user call op with at least one argument; a chunk with none
+pays the 4-byte count and nothing else.  An argument that has no span of
+its own in the source (a const-folded literal) is stored with the LIST's
+span, so an image renders exactly what the source run renders.
+
+The in-memory form is a flat pool of spans plus `{pc, first, n}` runs
+into it; the on-disk form is deliberately SELF-CONTAINED per entry - the
+reader rebuilds `first` as it appends - so there is no pool INDEX in the
+file for a hostile image to point past.  A reader must bound `pc` against
+the chunk's instruction count (it is remapped by INDEXING a per-pc vector,
+like `locs`); `n` is bounded like any element count.  The JIT bakes the
+run's ADDRESS into the call site's exception stamp and the emitted code
+indexes it at run time by the recorded parameter index, which is why the
+run is re-verified against the rebuilt pool before the load-time JIT.
+
+Version 16 adds `arg_locs` (section 9.21), the per-argument carets of a
+user call op, so a bind coercion's error names the argument it rejected
+from an image exactly as from source.  No existing encoding changes; the
+record is appended to the chunk right after `base_locs`.
 
 Version 15 adds `value_callees` (section 9.20), a per-chunk table naming the
 single function a value-call site can reach.  The emitter could previously

@@ -444,7 +444,8 @@ do_func_return(EvalValue &&tmp, Construct *retExpr)
     return RValue(tmp);
 }
 
-static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt);
+static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt,
+                                     int site_arg = -1);
 
 /*
  * Bind one parameter. When `frame` is set (the function was resolved), the
@@ -456,6 +457,14 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt);
  *
  * The param is a FuncDescriptor::ParamDesc - the descriptor's parse-time
  * snapshot of the param Identifier - so binding reads no AST node.
+ *
+ * `site_arg` (RULE 2, 2026-09-20): the index of the CALL-SITE ARGUMENT this
+ * bind consumes, for the coercion's throw to carry (Exception::bind_arg) -
+ * only the two call-site overloads (argument expressions, the VM's arg run)
+ * pass it; a builtin CALLBACK's bind passes -1, because its parameter index
+ * names no argument of the builtin call the caret will land on (watched:
+ * `sort(a, func(int x, int y) ...)` over a dyn string carets sort's whole
+ * argument list in every engine, and must keep doing so).
  */
 static inline void
 bind_param(EvalContext *args_ctx,
@@ -463,10 +472,11 @@ bind_param(EvalContext *args_ctx,
            int idx,
            const FuncDescriptor::ParamDesc &param,
            EvalValue val,
-           bool is_const)
+           bool is_const,
+           int site_arg)
 {
     if (param.decl_type == DeclType::f || param.decl_type == DeclType::i)
-        val = coerce_to_decl_type(val, param.decl_type);
+        val = coerce_to_decl_type(val, param.decl_type, site_arg);
 
     if (frame) {
         frame->at(idx) = LValue(std::move(val), is_const);
@@ -508,7 +518,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
             args_ctx, frame, static_cast<int>(i),
             funcParams[i],
             i < args.size() ? RValue(args[i]->eval(ctx)) : EvalValue(),
-            funcParams[i].cnst
+            funcParams[i].cnst,
+            static_cast<int>(i)              /* a call-site bind */
         );
     }
 }
@@ -529,7 +540,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
         bind_param(
             args_ctx, frame, static_cast<int>(i),
             funcParams[i],
-            i < args.size() ? args[i] : EvalValue(), ctx->const_ctx
+            i < args.size() ? args[i] : EvalValue(), ctx->const_ctx,
+            /*site_arg=*/-1                  /* a callback's bind */
         );
     }
 }
@@ -563,11 +575,12 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
         if (i < args.size())
             bind_param(args_ctx, frame, static_cast<int>(i),
                        funcParams[i],
-                       args[i], ctx->const_ctx);
+                       args[i], ctx->const_ctx,
+                       static_cast<int>(i)); /* a call-site bind */
         else
             bind_param(args_ctx, frame, static_cast<int>(i),
                        funcParams[i],
-                       EvalValue(), ctx->const_ctx);
+                       EvalValue(), ctx->const_ctx, /*site_arg=*/-1);
     }
 }
 
@@ -585,8 +598,9 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
 
     for (size_t i = 0; i < nparams; i++)
         bind_param(args_ctx, frame, static_cast<int>(i),
-                       funcParams[i],
-                   i == 0 ? arg : EvalValue(), ctx->const_ctx);
+                   funcParams[i],
+                   i == 0 ? arg : EvalValue(), ctx->const_ctx,
+                   /*site_arg=*/-1);            /* a callback's bind */
 }
 
 
@@ -604,9 +618,9 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
 
     for (size_t i = 0; i < nparams; i++)
         bind_param(args_ctx, frame, static_cast<int>(i),
-                       funcParams[i],
+                   funcParams[i],
                    i == 0 ? args.first : i == 1 ? args.second : EvalValue(),
-                   ctx->const_ctx);
+                   ctx->const_ctx, /*site_arg=*/-1); /* a callback's bind */
 }
 
 /*
@@ -1587,6 +1601,43 @@ EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
 }
 
 /*
+ * THE CALL'S SETUP CARET (RULE 2, 2026-09-20). A loc-less exception out of
+ * a call's SETUP - an arity throw, a bind coercion, the window push - is
+ * stamped here, by the call site, since the throw itself knows no source
+ * position. Two spans, chosen by what failed:
+ *  - a BIND COERCION (`func f(int k)` handed a `dyn` float) carets the
+ *    FAILING ARGUMENT's own expression - the bind recorded its index in
+ *    Exception::bind_arg (bind_param's `site_arg`);
+ *  - anything else (an arity error is about the LIST; the window push is
+ *    about no argument) carets the whole argument list.
+ * Shared by CallExpr::do_eval's dispatch (dispatch_call_value's catch) and
+ * the DEVIRTUALIZED nodes (DirectCallExpr/CachedCallExpr), which must
+ * reproduce it exactly: before they did, `fi(x)` marked the whole call
+ * from a named function and the argument list from a closure. The VM's
+ * twin is vm_stamp_setup_caret (base_locs + arg_locs), the generic
+ * dyn-callee op's is vm_stamp_args_caret (its CallSite), and the JIT's
+ * conveyance stamps it in emitted code (emit_exc_stamp's args form). An
+ * out-of-range index (a stale value from an unrelated bind) takes the
+ * list span - a caret is never invented from it.
+ */
+static inline void stamp_args_loc(Exception &e, const ExprList *args)
+{
+    if (e.loc_start)
+        return;
+    const int i = e.bind_arg;
+    if (i >= 0 && static_cast<size_t>(i) < args->elems.size()
+            && args->elems[static_cast<size_t>(i)]->start) {
+        /* (an argument with no span of its own - a const-folded literal -
+         * takes the list's, exactly as codegen records it for the VM) */
+        e.loc_start = args->elems[static_cast<size_t>(i)]->start;
+        e.loc_end = args->elems[static_cast<size_t>(i)]->end;
+        return;
+    }
+    e.loc_start = args->start;
+    e.loc_end = args->end;
+}
+
+/*
  * Shared call DISPATCH: `callable` is the ALREADY-evaluated callee value, `node`
  * the CallExpr (for its args + carets). A Builtin runs its ExprList ABI -
  * EXCEPT an INDIRECT (vm_dyn_callee) call of a non-lazy builtin, which is
@@ -1673,11 +1724,7 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                                     node->args.get());
 
     } catch (Exception &e) {
-
-        if (!e.loc_start) {
-            e.loc_start = node->args->start;
-            e.loc_end = node->args->end;
-        }
+        stamp_args_loc(e, node->args.get());     /* RULE 2: see above */
         throw;
     }
 
@@ -1720,24 +1767,6 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
  * construction, a slot reassigned to a non-function, an undefined slot, or the
  * REPL (no global table) falls back to the full CallExpr path.
  */
-/*
- * RULE 2 (2026-09-20): the argument-list caret a loc-less error out of
- * do_func_call gets in CallExpr::do_eval's catch - a bind coercion, an
- * arity throw - is reproduced here, exactly as DirectBuiltinCallExpr
- * reproduces it for a builtin. Without it the DEVIRTUALIZATION changed
- * the caret: `fi(x)` with a `dyn` float into an `int` parameter marked
- * the whole call from a named function and the argument list from a
- * closure (a plain CallExpr), and the VM carets the argument list for
- * both (the call ops' second caret, base_locs).
- */
-static inline void stamp_args_loc(Exception &e, const ExprList *args)
-{
-    if (!e.loc_start) {
-        e.loc_start = args->start;
-        e.loc_end = args->end;
-    }
-}
-
 EvalValue DirectCallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     if (ctx->gfuncs && ctx->gfuncs->defined[direct_func_slot]) {
@@ -3455,9 +3484,15 @@ try_pod_struct_store(EvalContext *ctx, Construct *lvalue, Op op,
  * non-widening values pass through unchanged; the inferencer has already
  * rejected anything not assignable to the declared type.
  */
-static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt)
+static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt,
+                                     int site_arg)
 {
     /*
+     * `site_arg` (RULE 2, 2026-09-20): the CALL-SITE argument index when
+     * this coercion binds a parameter for a call site, else -1 - the throw
+     * carries it (Exception::bind_arg) so the call's setup catch can caret
+     * that argument alone. An assignment's coercion passes nothing.
+     *
      * Coerce a value to a typed variable's/param's declared type. WIDENING is
      * implicit (int/bool -> float, bool -> int); NARROWING is NOT (a `float`
      * into an `int` THROWS, it never truncates) - use an explicit int(x) to
@@ -3474,18 +3509,22 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt)
             return EvalValue(static_cast<float_type>(v.get<int_type>()));
         if (v.is<bool>())
             return EvalValue(static_cast<float_type>(v.get<bool>() ? 1 : 0));
-        throw TypeErrorEx(
+        TypeErrorEx ex(
             "cannot store a non-numeric value in a 'float' variable "
             "(use float(...) to convert)");
+        ex.bind_arg = site_arg;
+        throw ex;
     }
     if (dt == DeclType::i) {
         if (v.is<int_type>() || v.is<NoneVal>())
             return v;
         if (v.is<bool>())
             return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
-        throw TypeErrorEx(
+        TypeErrorEx ex(
             "cannot store a non-int value in an 'int' variable "
             "(a float doesn't narrow implicitly - use int(...) to convert)");
+        ex.bind_arg = site_arg;
+        throw ex;
     }
     return v;
 }
@@ -3493,9 +3532,11 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt)
 /* VM (CoerceNumV): the typed-store numeric coerce - the SAME
  * coerce_to_decl_type the tree-walker's op==assign path runs, so the widen /
  * pass-none / narrowing-throw behavior is byte-identical by construction. */
-EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float)
+EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float,
+                             int site_arg)
 {
-    return coerce_to_decl_type(v, is_float ? DeclType::f : DeclType::i);
+    return coerce_to_decl_type(v, is_float ? DeclType::f : DeclType::i,
+                               site_arg);
 }
 
 /*

@@ -144,6 +144,25 @@ struct Exception {
      */
     int32_t jit_inline_frame = -1;
 
+    /*
+     * THE FAILING ARGUMENT of a call's bind (RULE 2, 2026-09-20): the
+     * parameter index a BIND COERCION rejected - `func f(int k)` handed a
+     * `dyn` float - so the call site can caret THAT argument's own span
+     * instead of the whole argument list. Set ONLY by a bind performed for
+     * a CALL SITE (the tree-walker's do_func_bind_params over argument
+     * expressions / the VM's arg run, vm_frame_setup's coercing loop) -
+     * never by a builtin CALLBACK's bind, whose parameter index names no
+     * argument of the enclosing builtin call, and never by an assignment's
+     * coercion (CoerceNumV, a typed decl), which has no argument at all.
+     * -1 = "not a bind failure": the stamp uses the list span.
+     *
+     * A stale value is harmless by construction: every stamp that reads it
+     * is guarded by `!loc_start`, and the innermost setup catch of the call
+     * whose bind failed stamps first. `int32_t` because the fragment reads
+     * it with one `mov r32, dword [rax+off]` (emit_exc_stamp's args form).
+     */
+    int32_t bind_arg = -1;
+
     Exception(const char *name,
               const char *msg,
               Loc start = Loc(),

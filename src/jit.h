@@ -168,6 +168,7 @@ void **jit_addr_exc();
 ptrdiff_t jit_off_exc_loc_start();
 ptrdiff_t jit_off_exc_loc_end();
 ptrdiff_t jit_off_exc_inline_frame();
+ptrdiff_t jit_off_exc_bind_arg();       /* Exception::bind_arg */
 ptrdiff_t jit_off_ctx_captures();       /* EvalContext::captures */
 ptrdiff_t jit_off_ctx_gfuncs();         /* EvalContext::gfuncs */
 ptrdiff_t jit_off_ctx_flow();           /* EvalContext::flow (C4c) */

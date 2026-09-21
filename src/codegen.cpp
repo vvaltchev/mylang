@@ -7745,9 +7745,38 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
          * chain store records a base node with NO node_idx at all. The loop is
          * pc-ascending, so base_locs comes out sorted.
          */
-        if (const Construct *bn = node_at(in.base_node_idx))
+        if (const Construct *bn = node_at(in.base_node_idx)) {
             chunk.base_locs.push_back(
                 {static_cast<uint32_t>(pc), bn->start, bn->end});
+            /*
+             * RULE 2 (2026-09-20): a USER CALL op's base node IS its
+             * argument list (the ExprList the emit sites record), so the
+             * op's THIRD caret - one span per argument, for a bind
+             * coercion to name the argument it rejected - is read off the
+             * same node here: `arg_locs` + `arg_loc_pool` (bytecode.h).
+             * Gated on the OPCODE, not the node kind alone: a peephole
+             * fusion copies a source struct, and only these three ops
+             * mean "argument list" by their base node.
+             */
+            if ((in.op == OpCode::CallV || in.op == OpCode::CachedCallV
+                 || in.op == OpCode::CallValueV)
+                    && ctag(bn) == ConstructType::expr_list) {
+                const auto *el = static_cast<const ExprList *>(bn);
+                Chunk::ArgLocEntry ae;
+                ae.pc = static_cast<uint32_t>(pc);
+                ae.first = static_cast<uint32_t>(chunk.arg_loc_pool.size());
+                ae.n = static_cast<uint32_t>(el->elems.size());
+                /* an argument with NO span of its own (a const-folded
+                 * literal carries none) takes the list's, so every
+                 * engine renders the same thing for it - the tree-walker
+                 * (stamp_args_loc) makes the same substitution */
+                for (const auto &a : el->elems)
+                    chunk.arg_loc_pool.push_back(
+                        a->start ? ArgLoc{a->start, a->end}
+                                 : ArgLoc{bn->start, bn->end});
+                chunk.arg_locs.push_back(ae);
+            }
+        }
         in.base_node_idx = -1;
         /*
          * #97 E1: the named callee -> value_callees, on exactly the same
@@ -10577,6 +10606,20 @@ void verify_chunk(const Chunk &chunk, const ChunkLimits &lim)
         v.target_pc(static_cast<int_type>(e.pc));
     for (const Chunk::LocEntry &e : chunk.base_locs)
         v.target_pc(static_cast<int_type>(e.pc));
+    /*
+     * The per-argument carets (RULE 2): the pc is remapped by indexing
+     * like the two above, and `first`/`n` name a run of arg_loc_pool the
+     * JIT bakes a POINTER to (`&arg_loc_pool[first]`) and the emitted
+     * stamp indexes at run time by the exception's bind_arg (< n) - so an
+     * out-of-range run would be a wild read from generated code.
+     */
+    for (const Chunk::ArgLocEntry &e : chunk.arg_locs) {
+        v.target_pc(static_cast<int_type>(e.pc));
+        if (static_cast<size_t>(e.first) > chunk.arg_loc_pool.size()
+                || static_cast<size_t>(e.n)
+                       > chunk.arg_loc_pool.size() - e.first)
+            v.reject("an arg_locs entry past its pool");
+    }
     for (const Chunk::InlineEntry &e : chunk.inline_ctxs) {
         v.target_pc(static_cast<int_type>(e.pc));
         v.pool(e.frame, chunk.inline_frames.size(), "inline frame");
@@ -11372,6 +11415,8 @@ void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out)
     s.code = ck.code;
     s.locs = ck.locs;
     s.base_locs = ck.base_locs;                        /* #127 */
+    s.arg_locs = ck.arg_locs;                          /* RULE 2 */
+    s.arg_loc_pool = ck.arg_loc_pool;
     s.ref_slots = ck.ref_slots;
     s.slot_count = ck.slot_count;
     s.n_temps = ck.n_temps;
@@ -11402,6 +11447,8 @@ bool bc_inline_chunk(Chunk &ck,
         std::vector<Instr> body;        /* SNAPSHOT (self-recursion) */
         std::vector<Chunk::LocEntry> locs;
         std::vector<Chunk::LocEntry> base_locs;   /* #127 */
+        std::vector<Chunk::ArgLocEntry> arg_locs; /* RULE 2 */
+        std::vector<ArgLoc> arg_loc_pool;
         std::vector<int32_t> ref_slots;
         Chunk::InlineFrame frame;
     };
@@ -11460,6 +11507,12 @@ bool bc_inline_chunk(Chunk &ck,
          * belt-and-braces reasoning as the branch-past-end check.
          */
         s.base_locs = snap.base_locs;
+        /* RULE 2: same standing as base_locs - no call op is whitelisted
+         * for a spliced body today, so this carries nothing, and the day
+         * one is admitted its per-argument carets ride along instead of
+         * silently vanishing. */
+        s.arg_locs = snap.arg_locs;
+        s.arg_loc_pool = snap.arg_loc_pool;
         s.ref_slots = snap.ref_slots;
         /* the virtual frame, built to render EXACTLY as the physical one
          * would (backtrace.cpp's frame_display over the descriptor) */
@@ -11501,6 +11554,17 @@ bool bc_inline_chunk(Chunk &ck,
     const auto caller_base_loc = [&](size_t pc, Loc &s, Loc &e) -> bool {
         for (const auto &le : ck.base_locs)
             if (le.pc == pc) { s = le.start; e = le.end; return true; }
+        return false;
+    };
+    /* RULE 2: the per-argument carets ride the splice like the loc - the
+     * caller's own pool is kept as is (a re-based entry keeps its run),
+     * a spliced body's run is APPENDED to the caller's pool. */
+    std::vector<Chunk::ArgLocEntry> nargl;
+    std::vector<ArgLoc> nargpool = ck.arg_loc_pool;
+    const auto caller_arg_locs = [&](size_t pc, uint32_t &first,
+                                     uint32_t &n) -> bool {
+        for (const auto &ae : ck.arg_locs)
+            if (ae.pc == pc) { first = ae.first; n = ae.n; return true; }
         return false;
     };
     /*
@@ -11577,6 +11641,9 @@ bool bc_inline_chunk(Chunk &ck,
                     if (le.pc == j) {
                         bbs = le.start; bbe = le.end; has_base = true; break;
                     }
+                const Chunk::ArgLocEntry *bargs = nullptr;   /* RULE 2 */
+                for (const auto &ae : S.arg_locs)
+                    if (ae.pc == j) { bargs = &ae; break; }
                 if (S.body[j].op == OpCode::ReturnV) {
                     if (keep_result) {
                         Instr mv;
@@ -11620,6 +11687,16 @@ bool bc_inline_chunk(Chunk &ck,
                 if (has_base)
                     nbase.push_back({ static_cast<uint32_t>(nc.size()),
                                       bbs, bbe });
+                if (bargs) {
+                    Chunk::ArgLocEntry ae;
+                    ae.pc = static_cast<uint32_t>(nc.size());
+                    ae.first = static_cast<uint32_t>(nargpool.size());
+                    ae.n = bargs->n;
+                    for (uint32_t k = 0; k < bargs->n; k++)
+                        nargpool.push_back(
+                            S.arg_loc_pool[bargs->first + k]);
+                    nargl.push_back(ae);
+                }
                 nctx.push_back({ static_cast<uint32_t>(nc.size()), fidx });
                 nc.push_back(bi);
                 from_caller.push_back(0);
@@ -11632,6 +11709,12 @@ bool bc_inline_chunk(Chunk &ck,
             nlocs.push_back({ static_cast<uint32_t>(nc.size()), s, e });
         if (caller_base_loc(pc, s, e))
             nbase.push_back({ static_cast<uint32_t>(nc.size()), s, e });
+        {
+            uint32_t afirst, an;
+            if (caller_arg_locs(pc, afirst, an))
+                nargl.push_back({ static_cast<uint32_t>(nc.size()),
+                                  afirst, an });
+        }
         {
             std::vector<int32_t> vcds;
             caller_value_callees(pc, vcds);
@@ -11666,6 +11749,8 @@ bool bc_inline_chunk(Chunk &ck,
     ck.code = std::move(nc);
     ck.locs = std::move(nlocs);
     ck.base_locs = std::move(nbase);                   /* #127 */
+    ck.arg_locs = std::move(nargl);                    /* RULE 2 */
+    ck.arg_loc_pool = std::move(nargpool);
     ck.value_callees = std::move(nvc);                 /* #97 E1 */
     ck.inline_ctxs = std::move(nctx);
     ck.n_temps = next_base - ck.slot_count;
