@@ -5420,7 +5420,7 @@ private:
          * chains under it, so arbitrarily deep nesting renders correctly.
          */
         const InlineCtx *ic = alloc_inline_ctx(
-            { std::string(f->id->get_str()), param_names(f),
+            { inline_frame_name(f), param_names(f),
               ce->start, ce->inline_ctx });
 
         unique_ptr<Construct> body = fexpr->clone();
@@ -5794,7 +5794,7 @@ private:
             *fsize += grow;   /* the caller's frame absorbed locals + arg temps */
 
         const InlineCtx *ic = alloc_inline_ctx(
-            { std::string(f->id->get_str()), param_names(f),
+            { inline_frame_name(f), param_names(f),
               ce->start, ce->inline_ctx });
 
         /* If the spliced body is a temp-free guard chain, emit an EXPRESSIBLE
@@ -5943,7 +5943,7 @@ private:
         *fsize += nlocals;   /* the caller's frame absorbed f's locals */
 
         const InlineCtx *ic = alloc_inline_ctx(
-            { std::string(f->id->get_str()), param_names(f),
+            { inline_frame_name(f), param_names(f),
               ce->start, ce->inline_ctx });
         tag_inline(spliced.get(), ic);
 
@@ -6003,6 +6003,18 @@ private:
 
         return dynamic_cast<const Literal *>(arg)   /* scalar: drop or dup ok */
             || (uses >= 2 && local);                /* identifier: same slot */
+    }
+
+    /* The name an inlined (virtual) frame renders: the SAME one a
+     * physical frame of `f` renders (format_backtrace prefers the
+     * descriptor's display_name), so a template instance `f$0` or a
+     * specialization clone `f$s0` reads `f` whether or not the call
+     * was inlined - RULE 2 (#38). */
+    static std::string inline_frame_name(const FuncDeclStmt *f)
+    {
+        if (!f->desc->display_name.empty())
+            return f->desc->display_name;
+        return std::string(f->id->get_str());
     }
 
     static std::vector<std::string> param_names(const FuncDeclStmt *f)

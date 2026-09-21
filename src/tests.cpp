@@ -6999,7 +6999,7 @@ static const std::vector<test> tests =
         "assert(f() == \"R\"); assert(lg == \"a1212xy\");" } },
     /* A NESTED inlined error: a tree-recursive `f` unrolls (its self-calls
      * inline), so an error deep in an inlined self-call reconstructs a chain of
-     * virtual `f$0` frames. Exercises the VM's flattened inline_frames pool
+     * virtual `f` frames. Exercises the VM's flattened inline_frames pool
      * (walked by parent index in vm_flush_inline) - the backtrace is byte-
      * identical to the tree-walker's (verified out of band; the differential
      * here checks the exception propagates through the nested pool correctly). */
@@ -16013,7 +16013,7 @@ vm_warmed_throw_backtrace_parity()
  * make_int_mul copy_base_fields), and the typed eval path - which
  * bypasses Construct::eval - must flush the innermost node's chain
  * (TypedScalarExpr::eval_int/eval_float wrappers). Both engines must
- * render the identical [inner$0, outer$0, main] backtrace.
+ * render the identical [inner, outer, main] backtrace.
  */
 static bool
 typed_inlined_backtrace_parity()
@@ -16322,6 +16322,7 @@ inlined_recursion_backtrace_parity()
      * (defect 2). A first version of this test used only depth 4 and PASSED
      * with defect 1 put back.
      */
+    size_t last_virt = 0;
     auto run = [&](ExecEngine eng, int depth, bool jit) -> std::string {
         const std::string src =
             std::string("func f(n) {\n")
@@ -16353,6 +16354,10 @@ inlined_recursion_backtrace_parity()
              * it alongside the frames rather than the frames alone */
             out = "loc " + std::to_string(e.loc_start.line) + ":"
                 + std::to_string(e.loc_start.col) + "\n" + format_backtrace(e);
+            last_virt = 0;
+            for (const auto &bf : e.backtrace)
+                if (!bf.desc)
+                    last_virt++;
         }
         g_jit_enabled = saved_jit;
         g_exec_engine = saved;
@@ -16364,6 +16369,7 @@ inlined_recursion_backtrace_parity()
 
     for (const int depth : { 2, 3, 4 }) {
         const std::string tw = run(ExecEngine::TreeWalk, depth, false);
+        const size_t virt = last_virt;
         const std::string vm = run(ExecEngine::Vm, depth, false);
         /* #88: and with the JIT ON, which reaches these frames by a wholly
          * different route - the baked call site + the baked raise-site
@@ -16378,14 +16384,13 @@ inlined_recursion_backtrace_parity()
             ok = false;
         }
 
-        /* Count the VIRTUAL (inlined) frames: a physical frame renders the
-         * template's display_name `f`, an inlined one the instance name
-         * `f$0`. Requiring some keeps the test from passing vacuously if
-         * the unroll ever stops firing here - equality alone would then be
-         * satisfied by two engines that both inline nothing. */
-        size_t virt = 0;
-        for (size_t i = tw.find("f$0"); i != npos; i = tw.find("f$0", i + 1))
-            virt++;
+        /* Count the VIRTUAL (inlined) frames - the ones with no
+         * descriptor. Requiring some keeps the test from passing
+         * vacuously if the unroll ever stops firing here - equality alone
+         * would then be satisfied by two engines that both inline
+         * nothing. (This counted the name `f$0` until #38 repro B made an
+         * inlined frame render the template's display name `f`, exactly
+         * as a physical one does.) */
 
         const bool good = !tw.empty() && tw == vm
                           && virt >= 2
