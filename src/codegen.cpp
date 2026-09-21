@@ -8049,6 +8049,9 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::LoadElem2Int:
         case OpCode::LoadElem2Float:
         case OpCode::LoadElemValue:
+        /* node = the container: the element may be GONE (the body shrank
+         * the array), an OutOfBoundsEx with this caret */
+        case OpCode::LoadElemBool:
         case OpCode::MultiUnpackV:   /* node = the Expr14 (unpack-length caret) */
         case OpCode::StoreElemInt:   /* node = the SUBSCRIPT (plain: OOB/type) or
                                       * the Expr14 (compound: its div0 caret) */
