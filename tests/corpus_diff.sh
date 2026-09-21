@@ -198,9 +198,22 @@ run_one() {     # $1 = env assignment ("" = plain), $2 = extra engine flags
     # which is what the diff below does instead: compare everything,
     # print the first few DIFFERING lines (more useful than the tail).
     a=$(timeout 60 "$BIN" -tw $flags "$f" 2>&1)
+    local ra=$?
     b=$(env $1 timeout 60 "$BIN" $flags "$f" 2>&1)
+    local rb=$?
     n=$((n + 1))
-    if [ "$a" != "$b" ]; then
+    # ⛔ A PROGRAM THAT CRASHES THE SAME WAY IN BOTH ENGINES "AGREES".
+    # The compile gate's lesson one step later: an assertion abort (or a
+    # sanitizer report, or a timeout) that both engines reach prints the
+    # same text, so the diff below is silent. Found 2026-09-25 while
+    # watching #53's dict-cursor sabotage fail: both engines tripped the
+    # cursor's ML_CHECK identically and this script said 41/41. A signal
+    # death (128+) or a timeout (124) is a failure on EITHER side.
+    if [ "$ra" -ge 124 ] || [ "$rb" -ge 124 ]; then
+      echo "CRASH [${1:-plain}${flags:+ $flags}] $f (tw rc=$ra, vm rc=$rb)"
+      printf '%s\n' "$b" | tail -4 | sed 's/^/  /'
+      bad=$((bad + 1))
+    elif [ "$a" != "$b" ]; then
       echo "DIFF [${1:-plain}${flags:+ $flags}] $f"
       diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") \
         | head -8 | sed 's/^/  /'
