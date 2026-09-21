@@ -6556,6 +6556,14 @@ vm_jit_stamp_call_site(Exception &e, const FuncDescriptor *d,
 #endif
         vm_flush_inline_call_pool(
             static_cast<const Chunk::InlineFrame *>(pool), chain, e);
+    } else {
+        /* the site is NOT inlined code - an answer, like the fragment
+         * stamp's -2. Recorded, because the conversion's exit is a
+         * plain exit_pc: the caller's EnterNative re-raises at a
+         * COLLAPSED pc, where the raise-site flush's pc lookup named
+         * the first inlined op's chain - a phantom `step(n)` above every
+         * `od(n, k)` of a mutual recursion (#38 repro B). */
+        e.inline_origin_emitted = true;
     }
 }
 

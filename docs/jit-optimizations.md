@@ -14773,3 +14773,14 @@ rendered `d1` alone. The raise arm now calls `emit_exc_chain_stamp`
 bytes). A chunk with no inlined code emits nothing and keeps its short
 jump, so `-vdj` is unchanged there. Watched failing: nested_chain and
 the even-depth recursion unrolls.
+
+**(2) A CONVERSION AT A NON-INLINED SITE SAID NOTHING.** When the
+callee's exception is converted at a sync site whose call is NOT inlined
+code, `vm_jit_stamp_call_site` flushed nothing and set nothing; the
+fragment then exits with a plain `exit_pc`, and the caller's EnterNative
+re-raise ran the raise-site flush against the collapsed pc - a phantom
+`step(n)` above every `od(n, k)` of a mutual recursion whose calls sit
+next to an inlined `step`, and a phantom `probe(xs, k)` below a builtin
+callback's frames. "No chain" is an answer here exactly as the fragment
+stamp's -2 is, so the stamp now records it (`inline_origin_emitted =
+true`). Watched failing: mutual, cb_find_sum.
