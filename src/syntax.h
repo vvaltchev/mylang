@@ -886,6 +886,18 @@ public:
      * conservative answer.
      */
     const FuncDescriptor *callee_desc = nullptr;
+    /*
+     * #97 E3 (2026-09-20): the SECOND candidate of a TWO-WAY value call
+     * site - `ops[i % 2]` reaching add_op or sub_op. Set together with
+     * `callee_desc` when the callee set has exactly two members, neither
+     * escaped; null otherwise. `callee_fn` stays null for such a site (the
+     * resolver's consumers need ONE function). The JIT's frameless site
+     * dispatches on the live descriptor between the two; every other
+     * consumer of `callee_desc` treats a site with this set as UNNAMED
+     * (jit_baked_callee returns null for a two-entry pool pc). Same
+     * lifetime and copy rules as `callee_desc`.
+     */
+    const FuncDescriptor *callee_desc2 = nullptr;
 
     /* Set by the inferencer when the callee's static type is `dyn` (callable at
      * runtime, resolved dynamically). The VM lowers it to CallValueGenericV — a

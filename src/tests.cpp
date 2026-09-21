@@ -23149,8 +23149,16 @@ static bool myv_round_trip()
         "    for (var i = 0; i < k; i++) acc = acc + i % 4 + i / 8;",
         "    return acc;",
         "}",
+        /* #97 E3: a TWO-WAY value site - the value_callees pool carries
+         * two entries at one pc, which the image must reproduce */
+        "func add_op(st, x) { st[0] = st[0] + x; }",
+        "func sub_op(st, x) { st[0] = st[0] - x; }",
+        "var ops = [add_op, sub_op];",
+        "var st2 = [0];",
+        "for (var i = 0; i < runtime(6); i++) {",
+        "  var fn = ops[i % 2]; fn(st2, i); }",
         "print(s, t, d[\"a\"], d[\"b\"], tbl[1], len(pts),",
-        "      edge(runtime(3), runtime(1.5)), nn(runtime(12)));" };
+        "      edge(runtime(3), runtime(1.5)), nn(runtime(12)), st2[0]);" };
 
     std::string src;
     std::vector<Tok> toks;
@@ -23603,6 +23611,93 @@ static bool myv_round_trip()
  * fail at run time, since proving a slot's type at every pc would be a
  * bytecode type-checker, not a structural check.
  */
+/*
+ * #137, two CROSS-RECORD refusals myv_fuzz found on 2026-09-20 (both
+ * pre-existing since #97 inc 2, found the day the images changed shape):
+ * a stored ExitBlock - a CONTAINER-only op the JIT inserts and never
+ * stores, which the frameless gate then admitted, so the container
+ * path took the chunk with no frameless ENTRY and its return arm ran on
+ * a frame that was never frameless; and a function chunk whose
+ * `slot_count` disagrees with its descriptor's `frame_size` - the push
+ * sizes the window from the descriptor, the JIT's return arms from the
+ * chunk. Both in memory, on the compiled program itself (the verifier
+ * runs on what the reader produced, so tampering with the program IS
+ * tampering with an image), and the intact program must pass first.
+ */
+static bool myv_verify_cross_records()
+{
+    const char *lines_arr[] = {
+        "struct P { int x; }",
+        "func f(a) { var p = P(a); return p.x + 1; }",
+        "var t = f(3);",
+        "print(t);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        vm_verify_program(prog);                    /* intact: passes */
+        Chunk *fck = nullptr;
+        for (const auto &d : prog.funcs)
+            if (d->vm_chunk && d->name && d->name->val == "f$0")
+                fck = static_cast<Chunk *>(const_cast<void *>(d->vm_chunk));
+        if (!fck || fck->code.size() < 2) {
+            fprintf(stderr, "myv_verify_cross_records: no f$0 chunk\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        const auto refused = [&](const char *what) -> bool {
+            try {
+                vm_verify_program(prog);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError")
+                    return true;
+                fprintf(stderr, "myv_verify_cross_records [%s]: threw "
+                                "%s, not MyvError\n", what, e.name);
+                return false;
+            }
+            fprintf(stderr, "myv_verify_cross_records [%s]: ACCEPTED\n",
+                    what);
+            return false;
+        };
+        /* (1) a container op in stored code */
+        const Instr keep = fck->code[1];
+        Instr ex = keep;
+        ex.op = OpCode::ExitBlock;
+        {
+            Operand o;                              /* a_lit = 0, the pc */
+            o.is_lit = true;
+            o.lit_kind = Operand::LitKind::i;
+            o.lit = 0;
+            ex.set_a(o);
+        }
+        fck->code[1] = ex;
+        ok = refused("stored ExitBlock") && ok;
+        fck->code[1] = keep;
+        /* (2) slot_count vs frame_size */
+        const int keep_sc = fck->slot_count;
+        fck->slot_count = keep_sc + 1;
+        ok = refused("slot_count != frame_size") && ok;
+        fck->slot_count = keep_sc;
+        vm_verify_program(prog);                    /* restored: passes */
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_verify_cross_records: threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
 static bool myv_corrupt_refused()
 {
     const char *lines_arr[] = {
@@ -28001,6 +28096,26 @@ static bool native_expect(const std::vector<NativeIns> &ins, size_t at,
     return true;
 }
 
+/* the index at or after `off` where the whole (expanded) sequence
+ * `want` matches, or npos - the find for an anchor whose first line is
+ * configuration-dependent */
+static size_t native_find_seq(const std::vector<NativeIns> &ins,
+                              uint32_t off,
+                              const std::vector<const char *> &want_in)
+{
+    const std::vector<std::string> want = native_want_expand(want_in);
+    for (size_t i = 0; i + want.size() <= ins.size(); i++) {
+        if (ins[i].off < off)
+            continue;
+        bool all = true;
+        for (size_t k = 0; k < want.size() && all; k++)
+            all = native_pat_match(want[k].c_str(), ins[i + k].text.c_str());
+        if (all)
+            return i;
+    }
+    return std::string::npos;
+}
+
 /* the `-vdj` dump of a source, through the real dump driver */
 static std::string native_dump_of(const std::vector<const char *> &lines)
 {
@@ -28277,6 +28392,88 @@ static bool jit_frameless_w2_shape()
 }
 
 /*
+ * #97 E3 - THE TWO-WAY SITE, from the dump. 76's shape: `ops[i % 2]`
+ * reaches add_op or sub_op, and the site is ONE resolve (the slot's
+ * type test, fo, the live descriptor) followed by two candidates, each
+ * `movabs r11, desc; cmp rax, r11; jne next` and its own whole tail
+ * (here both reserve 192: two params, two temps), the second's `jne`
+ * going to the slow tier. And the pool it is emitted from: the
+ * value_callees table carries the pair at ONE pc.
+ */
+static bool jit_frameless_e3_shape()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    std::string d;
+    try {
+        d = native_dump_of({
+            "func add_op(st, x) { st[0] = st[0] + x; }",
+            "func sub_op(st, x) { st[0] = st[0] - x; }",
+            "var ops = [add_op, sub_op];",
+            "var st = [0];",
+            "var N = int(runtime(40));",
+            "for (var i = 0; i < N; i++) { var fn = ops[i % 2]; fn(st, i); }",
+            "print(st[0]);" });
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_frameless_e3_shape: threw %s: %s\n", e.name,
+                e.msg);
+        return false;
+    }
+    bool ok = true;
+    /* the pool: two entries at one pc */
+    size_t n_vc = 0;
+    for (size_t p = d.find(";   pc0 -> ["); p != std::string::npos;
+         p = d.find(";   pc0 -> [", p + 1))
+        n_vc++;
+    if (n_vc != 2) {
+        fprintf(stderr, "jit_frameless_e3_shape: %zu value_callees entries "
+                        "at pc 0 (want 2: the pair)\n", n_vc);
+        ok = false;
+    }
+    const std::vector<NativeIns> mn = native_ins_of(d, "main");
+    const size_t at = native_find_seq(mn, 0, { "cmp fn.type, <addr>@rax",
+                                              "jne +*", "mov rdx, fn" });
+    if (at == std::string::npos)
+        fprintf(stderr, "jit_frameless_e3_shape: no value-site dispatch "
+                        "(`cmp fn.type, <func-tag>; jne; mov rdx, fn`) "
+                        "in main\n");
+    ok = at != std::string::npos
+         && native_expect(mn, at, {
+                "cmp fn.type, <addr>@rax",   /* a function? */
+                "jne +*",
+                "mov rdx, fn",               /* fo */
+                "mov rax, [rdx+0x8]",        /* the live descriptor */
+                "movabs r11, <addr>",        /* candidate 0 */
+                "cmp rax, r11",
+                "jne +*",                    /* -> candidate 1 */
+                "sub rsp, 192" }, "E3 dispatch, candidate 0") && ok;
+    if (ok) {
+        /* candidate 1's dispatch follows candidate 0's whole tail (which
+         * off-arena holds `movabs r11` tag stores of its own, so the
+         * anchor is the four-line sequence, not the first movabs) */
+        const size_t sub0 = native_find(mn, mn[at].off, "sub rsp, 192");
+        const std::vector<const char *> cand1 = {
+            "movabs r11, <addr>",        /* candidate 1 */
+            "cmp rax, r11",
+            "jne +*",                    /* -> the slow tier */
+            "sub rsp, 192" };
+        const size_t at2 = sub0 == std::string::npos ? sub0
+            : native_find_seq(mn, mn[sub0].off + 1, cand1);
+        if (at2 == std::string::npos)
+            fprintf(stderr, "jit_frameless_e3_shape: no second candidate "
+                            "dispatch after the first tail\n");
+        ok = at2 != std::string::npos
+             && native_expect(mn, at2, cand1, "E3 dispatch, candidate 1")
+             && ok;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * #97 increment 2 (F4): THE FRAMELESS CALL - main's site calls a
  * frameless_ok leaf through its frameless entry (no segment window, no
  * record, no fork). Reach is g_jit_frameless_pushes, bumped by the
@@ -28347,6 +28544,7 @@ static bool jit_frameless_call_reach()
         const char *expect;           /* stdout */
         unsigned long min_pushes;     /* the reach floor */
         bool throws;                  /* uncaught: compare the backtrace */
+        bool no_pushes = false;       /* E3: the site must NOT be frameless */
     };
     const std::vector<Case> cases = {
         { "closure loop: exact int + widening float (78)", {
@@ -28514,6 +28712,43 @@ static bool jit_frameless_call_reach()
             "var n = 0; var N = int(runtime(30));",
             "for (var i = 0; i < N; i++) n = n + bx(i);",
             "print(n, len(box), box[32]);" }, "555 33 29 \n", 30, false },
+        /* #97 E3: the TWO-WAY value site */
+        { "E3: 76's shape - `ops[i % 2]` reaching add_op or sub_op, both "
+          "frameless, the site dispatching on the live descriptor (the "
+          "array param BORROWED: refcount back where it was)", {
+            "func add_op(st, x) { st[0] = st[0] + x; }",
+            "func sub_op(st, x) { st[0] = st[0] - x; }",
+            "var ops = [add_op, sub_op];",
+            "var st = [0];",
+            "var N = int(runtime(40));",
+            "for (var i = 0; i < N; i++) { var fn = ops[i % 2]; fn(st, i); }",
+            "var c1 = refcount(st);",
+            "for (var i = 0; i < N; i++) { var fn = ops[i % 2]; fn(st, i); }",
+            "print(st[0], refcount(st) - c1);" }, "-40 0 \n", 80, false },
+        /* (two candidates of a typed func variable always share the
+         * SIGNATURE - a mixed pair makes the array `array<dyn>` and the
+         * call the generic dyn op - but not their DECLARATIONS or their
+         * frame sizes: a declared `int k` beside a proven one, a 4-slot
+         * window beside a 5-slot one) */
+        { "E3: two candidates with DIFFERENT tails - a declared and a "
+          "proven int param, a 192- and a 240-byte window", {
+            "func fi(st, int k) { st[0] = st[0] + k; }",
+            "func fg(st, k) { var t = k * 2; st[0] = st[0] + t; }",
+            "var ops = [fi, fg];",
+            "var st = [0];",
+            "var N = int(runtime(40));",
+            "for (var i = 0; i < N; i++) { var fn = ops[i % 2]; fn(st, i); }",
+            "print(st[0]);" }, "1180 \n", 40, false },
+        { "E3: THREE candidates stay on the generic tier (values right, "
+          "no frameless push)", {
+            "func a1(st, x) { st[0] = st[0] + x; }",
+            "func a2(st, x) { st[0] = st[0] - x; }",
+            "func a3(st, x) { st[0] = st[0] * 2 + x; }",
+            "var ops = [a1, a2, a3];",
+            "var st = [0];",
+            "var N = int(runtime(30));",
+            "for (var i = 0; i < N; i++) { var fn = ops[i % 3]; fn(st, i); }",
+            "print(st[0]);" }, "3039 \n", 0, false, true },
         { "W2: a pinned int sibling next to a dyn STRING into an int "
           "param - the decline trampoline materialises BOTH into the run "
           "(the pin from its register) before the C++ tier raises", {
@@ -28550,6 +28785,12 @@ static bool jit_frameless_call_reach()
                             "pushes, expected >= %lu - the site did not "
                             "take the frameless call\n", c.name,
                     vm.pushes, c.min_pushes);
+            ok = false;
+        }
+        if (c.no_pushes && vm.pushes) {
+            fprintf(stderr, "jit_frameless_call_reach [%s]: %lu frameless "
+                            "pushes on a site that must stay generic\n",
+                    c.name, vm.pushes);
             ok = false;
         }
         all = all && ok;
@@ -40922,11 +41163,17 @@ static const std::vector<extra_check> extra_checks =
       "frameless pre-pass, main's map), and a deleted-originals "
       "fragment's marks name the original ops",
       vm_disasm_driver_jit_parity },
+    { "myv: #137 - a stored ExitBlock and a slot_count/frame_size "
+      "disagreement are refused at load (myv_fuzz, 2026-09-20)",
+      myv_verify_cross_records },
     { "jit: #97 inc 3 (W1/W2) - the CALLER builds the frameless window "
       "and binds from the argument SOURCES: the expected entry, "
       "discriminator, arm and site sequences (a pinned int into an int "
       "and a float param, a dyn memory source), read from the dump",
       jit_frameless_w2_shape },
+    { "jit: #97 E3 - the TWO-WAY frameless site: the dispatch chain and "
+      "the paired pool entry, read from the dump",
+      jit_frameless_e3_shape },
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },

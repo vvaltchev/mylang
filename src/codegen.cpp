@@ -676,12 +676,10 @@ struct Codegen {
      * in a loop is one site, but two sites may name one function), which is
      * already the per-chunk, SERIALIZABLE pool of FuncDescriptor*.
      */
-    int add_value_callee(const CallExpr *call)
+    int add_value_callee(const FuncDescriptor *d)
     {
-        if (!call || !call->callee_desc || !g_live_descs
-                || !g_live_descs->count(call->callee_desc))
+        if (!d || !g_live_descs || !g_live_descs->count(d))
             return -1;            /* unstamped, or a stamp that may dangle */
-        const FuncDescriptor *d = call->callee_desc;
         for (size_t i = 0; i < chunk.closure_defs.size(); i++)
             if (chunk.closure_defs[i] == d)
                 return static_cast<int>(i);
@@ -3119,7 +3117,14 @@ struct Codegen {
         cv.node_idx = add_ast_node(call);
         cv.base_node_idx = add_ast_node(call->args.get());  /* the args
                                              * caret - see try_native_call */
-        cv.callee_def_idx = add_value_callee(call);   /* #97 E1 */
+        cv.callee_def_idx = add_value_callee(call->callee_desc);  /* #97 E1 */
+        /* #97 E3: a two-way site's second candidate - BOTH or neither,
+         * so the pool never names one half of a pair as a single callee */
+        if (cv.callee_def_idx >= 0 && call->callee_desc2) {
+            cv.callee_def_idx2 = add_value_callee(call->callee_desc2);
+            if (cv.callee_def_idx2 < 0)
+                cv.callee_def_idx = -1;
+        }
         cv.target = dst;
         cv.target2 = callee_slot;
         cv.set_a(int_lit(argbase));
@@ -7753,8 +7758,12 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         if (in.callee_def_idx >= 0) {
             chunk.value_callees.push_back(
                 {static_cast<uint32_t>(pc), in.callee_def_idx});
+            if (in.callee_def_idx2 >= 0)          /* #97 E3: the pair */
+                chunk.value_callees.push_back(
+                    {static_cast<uint32_t>(pc), in.callee_def_idx2});
             in.callee_def_idx = -1;
         }
+        in.callee_def_idx2 = -1;
         if (!node)
             continue;
         /*
@@ -7957,7 +7966,7 @@ static void verify_ast_free(const std::vector<CgInstr> &code)
         /* #97 E1: not an AST handle, but the same "consumed exactly once"
          * invariant - a stamp still set here never reached value_callees,
          * so the site would silently lose its baked callee. */
-        ML_CHECK(in.callee_def_idx == -1);
+        ML_CHECK(in.callee_def_idx == -1 && in.callee_def_idx2 == -1);
         (void)in;
     }
 }
@@ -9939,6 +9948,19 @@ void ChunkVerifier::verify_one(const Instr &in)
     case OpCode::PopHandler:
         break;
     case OpCode::ExitBlock:
+        /*
+         * A CONTAINER-only op, inserted by the JIT (jit_try_container) and
+         * never stored - exactly like EnterNative below, and refused for
+         * the same reason. myv_fuzz found the hole (2026-09-20): a
+         * mutated opcode became an ExitBlock in a body the frameless gate
+         * then admitted (every op "fully native", a terminal ReturnV),
+         * the container path took the chunk without the frameless
+         * ENTRY, and its return arm ran on a frame that was never
+         * frameless - an oracle abort in the debug build, a SEGV in the
+         * assert-free one.
+         */
+        if (!ck.native.base)
+            reject("a container op in stored code");
         target_pc(in.a_lit());          /* the container's resume pc */
         break;
     case OpCode::EnterNative:
@@ -11486,10 +11508,10 @@ bool bc_inline_chunk(Chunk &ck,
      * callee's closure_defs would name an entry in the WRONG pool. Losing
      * it costs a bake, never an answer.
      */
-    const auto caller_value_callee = [&](size_t pc) -> int32_t {
+    const auto caller_value_callees = [&](size_t pc,
+                                          std::vector<int32_t> &out) {
         for (const auto &e : ck.value_callees)
-            if (e.pc == pc) return e.def;
-        return -1;
+            if (e.pc == pc) out.push_back(e.def);   /* #97 E3: both */
     };
 
     size_t si = 0;
@@ -11608,8 +11630,12 @@ bool bc_inline_chunk(Chunk &ck,
             nlocs.push_back({ static_cast<uint32_t>(nc.size()), s, e });
         if (caller_base_loc(pc, s, e))
             nbase.push_back({ static_cast<uint32_t>(nc.size()), s, e });
-        if (const int32_t vcd = caller_value_callee(pc); vcd >= 0)
-            nvc.push_back({ static_cast<uint32_t>(nc.size()), vcd });
+        {
+            std::vector<int32_t> vcds;
+            caller_value_callees(pc, vcds);
+            for (const int32_t vcd : vcds)
+                nvc.push_back({ static_cast<uint32_t>(nc.size()), vcd });
+        }
         const int32_t f = ck.inline_frame_at(pc);
         if (f >= 0) {
 #ifdef TESTS

@@ -2337,6 +2337,21 @@ vm_verify_program(const VmProgram &prog)
         if (!d->vm_chunk)
             continue;
         const Chunk &ck = *static_cast<const Chunk *>(d->vm_chunk);
+        /*
+         * A CROSS-RECORD fact the per-chunk verifier cannot see: the
+         * chunk's `slot_count` IS its descriptor's `frame_size`
+         * (codegen_func_body passes it as such). The push sizes the
+         * window from the DESCRIPTOR and the JIT's return arms from the
+         * CHUNK, so a mutated slot_count (myv_fuzz, 2026-09-20: 0 -> 1024
+         * and 0 -> 66 on the fat image) makes the two disagree on how
+         * many slots a frame has - an oracle abort in the debug build,
+         * and a release scan past the window in the assert-free one.
+         */
+        if (ck.slot_count != d->frame_size)
+            throw Exception("MyvError",
+                            intern_msg("corrupt .myv (a function chunk's "
+                                       "slot_count disagrees with its "
+                                       "descriptor's frame_size)"));
         lim.nslots = d->frame_size + ck.n_temps;
         lim.ncaptures = d->captures.size();
         verify_chunk(ck, lim);

@@ -1238,10 +1238,30 @@ void Inferencer::stamp_callee_fn(Block *rootBlock)
         CallExpr *call = cp.first;
         call->callee_fn = nullptr;
         call->callee_desc = nullptr;
+        call->callee_desc2 = nullptr;
         if (cs_struct_callee(call->what.get()))
             continue;                     /* a construction, not a call */
         const CsSet cs = callee_set(call->what.get());
-        if (cs.top || cs.funcs.size() != 1)
+        if (cs.top)
+            continue;
+        /*
+         * #97 E3: a TWO-WAY site (`ops[i % 2]` reaching add_op or sub_op)
+         * is stamped with BOTH descriptors, for the JIT's frameless
+         * dispatch alone - `callee_fn` stays null, since the resolver's
+         * consumers need one function, and the generic push reads a
+         * two-entry pool pc as unnamed. Both must be nameable, unescaped
+         * functions with a body; a set of three or more stays unnamed.
+         */
+        if (cs.funcs.size() == 2) {
+            FuncInfo *a = cs.funcs[0], *b = cs.funcs[1];
+            if (!a || !a->decl || !b || !b->decl || a == b
+                    || callee_escaped(a) || callee_escaped(b))
+                continue;
+            call->callee_desc = a->decl->desc;
+            call->callee_desc2 = b->decl->desc;
+            continue;
+        }
+        if (cs.funcs.size() != 1)
             continue;
         FuncInfo *fi = cs.funcs[0];
         if (!fi || !fi->decl)

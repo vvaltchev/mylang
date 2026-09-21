@@ -528,9 +528,13 @@ Each ends with a MEASUREMENT that can kill the next one.
    `norec_enum --depth 4` (2272 programs x 4 engines) because a throw
    crossing a frameless frame is exactly its shape space.
 
-**4. E3 — the two-entry inline cache.** Serves 76. Last because it is
-   the only one that adds a RUNTIME decision, and because it is worth
-   nothing until 2 exists.
+**4. E3 — the two-entry inline cache.** ✅ **DONE 2026-09-20** as the
+   TWO-WAY FRAMELESS SITE: the inferencer stamps both candidates, the
+   pool carries the pair at one pc, the site dispatches on the live
+   descriptor into one of two site-local tails. 76 -20.2% Ir; record:
+   `docs/jit-optimizations.md`, *#97 E3*. Original text: Serves 76.
+   Last because it is the only one that adds a RUNTIME decision, and
+   because it is worth nothing until 2 exists.
 
 ---
 

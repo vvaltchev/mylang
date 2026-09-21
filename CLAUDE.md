@@ -1159,7 +1159,9 @@ collision). Three nets now:
   named local, pinned or not: the site builds the callee's window
   itself and binds each argument from where it lives at that pc, a
   pin from its register; its decline trampoline materialises the
-  run the same way), xcache (#96: the CALLER-saved half of the
+  run the same way; a TWO-WAY value site - E3 - dispatches on the
+  live descriptor into one of two such tails), xcache (#96: the
+  CALLER-saved half of the
   pin pool - it holds hot locals too, spilled/reloaded around every
   helper call by emit_call_prologue/epilogue. **Which members a run
   may spend is a per-register CLOBBER MASK, `jit_xcache_clobber` -
