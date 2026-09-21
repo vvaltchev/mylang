@@ -8526,11 +8526,12 @@ static const Chunk::ArgLocEntry *arg_locs_entry_in(const Chunk &ck,
  * n > 0 - a 0-argument call has no argument to name.
  */
 static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
-                           bool args_caret = false, bool arg_select = true)
+                           bool args_caret = false, bool arg_select = true,
+                           bool chain_only = false)
 {
     const Chunk::LocEntry *le = static_cast<const Chunk::LocEntry *>(
         args_caret ? loc_entry_in(ck.base_locs, old_pc) : nullptr);
-    if (!le)
+    if (!le && !chain_only)
         le = static_cast<const Chunk::LocEntry *>(loc_entry_addr(ck, old_pc));
     /* `arg_select`: the site's word on whether a bind coercion can be
      * thrown here at all (jit_site_may_coerce) - where it cannot, the
@@ -8689,6 +8690,26 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
         e.patch32(j_null, static_cast<uint32_t>(join - (j_null + 4))); }
     else
         e.patch8(j_null, join);
+}
+
+/*
+ * #38 repro B: stamp ONLY the op's inlined-at chain (Exception::
+ * jit_inline_frame) - for a conveying op whose helper already stamped
+ * its own caret from a pool entry (the boxed family, LogV), so a
+ * caret block here would be dead bytes. Emits nothing in a chunk with
+ * no inlined code, where the flush's pc lookup cannot name a chain
+ * anyway; `exc_chain_stamp_emits` says so up front, for a caller that
+ * sizes a jump over it.
+ */
+static bool exc_chain_stamp_emits(const Chunk &ck)
+{
+    return !ck.inline_ctxs.empty();
+}
+
+static void emit_exc_chain_stamp(Emitter &e, const Chunk &ck, size_t old_pc)
+{
+    if (exc_chain_stamp_emits(ck))
+        emit_exc_stamp(e, ck, old_pc, false, true, /*chain_only=*/true);
 }
 
 
@@ -23789,10 +23810,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
         /* jz -> continue (0 = no raise) */
-        const size_t j_ok = e.j8(0x74);
-        /* raised: EnterNative re-raises */
+        /* raised: EnterNative re-raises. The helper stamped the caret
+         * from its pool entry; the op's INLINED-AT chain is the half
+         * only the fragment knows once the run's originals are deleted
+         * (every pc collapses onto the head EnterNative, so the flush's
+         * pc lookup named the FIRST op's chain - `d1` for a raise four
+         * inlines deep, #38 repro B). A chunk with no inlined code
+         * stamps nothing and keeps its short jump. */
+        const bool chain = exc_chain_stamp_emits(ck);
+        const size_t j_ok = chain ? e.j32(0x74) : e.j8(0x74);
+        emit_exc_chain_stamp(e, ck, old_pc);
         e.exit_pc(pc);
-        e.patch8(j_ok, e.pos());
+        if (chain)
+            e.patch32_here(j_ok);
+        else
+            e.patch8(j_ok, e.pos());
         if (j_done) e.patch32_here(j_done);
         if (j_donef) e.patch32_here(j_donef);
         return true;
@@ -23812,9 +23844,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
         {
-            const size_t j_ok = e.j8(0x74);
+            /* the chain, as for the boxed family above (#38) */
+            const bool chain = exc_chain_stamp_emits(ck);
+            const size_t j_ok = chain ? e.j32(0x74) : e.j8(0x74);
+            emit_exc_chain_stamp(e, ck, old_pc);
             e.exit_pc(pc);
-            e.patch8(j_ok, e.pos());
+            if (chain)
+                e.patch32_here(j_ok);
+            else
+                e.patch8(j_ok, e.pos());
         }
         return true;
 

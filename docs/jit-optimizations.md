@@ -14751,3 +14751,25 @@ LoadElemValue, `pick_visit_op` treats it as a helper op, and
 `jit_load_elem_bool` is deleted. The hot path - 56_sieve_bool's reason
 for the inline tier - is unchanged: the same navigation, the same
 byte load, a `jae` to the decline pad where the `jb`+bail was.
+
+## #38 REPRO B - THE JIT NAMED THE WRONG INLINED-AT CHAIN, THREE WAYS
+## (2026-09-25)
+
+Found by the backtrace oracle (`inlined_backtrace_oracle`,
+`tests/bt_oracle.py`): with inlining ON, every configuration must render
+the backtrace the `-ni -tw` run renders. Once the tree-walker and `-nj`
+were fixed (tag_inline completeness, the per-frame guard, the display
+name - CLAUDE.md *Inlined (virtual) frames*), every remaining failure was
+JIT-only, and all three had #88's shape: a flush fell back to the pc
+lookup on a DELETED run, where every pc has collapsed onto the head
+EnterNative and `inline_frame_at` names the FIRST inlined op's chain.
+
+**(1) THE BOXED FAMILY'S SLOW TIER STAMPED NO CHAIN.** `BinOpV` / `CmpV` /
+`UnaryV` / `CompoundV` and `LogV` are deletable because their helpers
+stamp the op's CARET from its pool entry - but nothing baked the op's
+chain, so a raise four inlines deep (`d1 -> d2 -> d3 -> d4`, boxed ops)
+rendered `d1` alone. The raise arm now calls `emit_exc_chain_stamp`
+(`emit_exc_stamp`'s `chain_only` form: the caret block would be dead
+bytes). A chunk with no inlined code emits nothing and keeps its short
+jump, so `-vdj` is unchanged there. Watched failing: nested_chain and
+the even-depth recursion unrolls.
