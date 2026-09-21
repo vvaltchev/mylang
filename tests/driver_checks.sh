@@ -337,27 +337,39 @@ else
     fail "myv: -c refused the per-argument caret program"
 fi
 
-# ... and a function in a STRUCT's const member is REFUSED at -c time,
-# loudly, instead of producing an image nobody can read. The struct table
-# (section 7) is parsed BEFORE the descriptor table, so a descriptor index
-# written there resolves against an empty one: `-c` used to exit 0 and the
-# image then died as "corrupt .myv (descriptor)" - a file that is nothing
-# of the kind. The real fix is to move those consts after section 8; until
-# then the format doc and the writer agree that it is not storable, which
-# is the rule an image is never silently lossy.
+# ... and a function in a STRUCT's const member (#52, v20). The struct
+# table used to be read BEFORE the descriptor table, so a descriptor index
+# in a const member resolved against an empty one: `-c` first wrote an
+# image that died as "corrupt .myv (descriptor)", then refused the
+# program outright. v20's table of contents builds every struct and
+# descriptor SHELL first, so the image must now compile, load and print
+# exactly what the source run prints - including an array and a dict of
+# functions, and a function literal as the member itself.
 cat > "$TMP/sconst.my" <<'PROG'
 pure func sq(x) => x * x;
-struct Ops { const F = sq; }
+struct Ops {
+    const F = sq;
+    const LT = pure func(a, b) => a < b;
+    const ALL = [sq, pure func(x) => 0 - x];
+    const BY = {"sq": sq};
+}
 var dyn f = runtime(Ops.F);
-print(f(7));
+var xs = [3, 1, 2];
+print(f(7), sort(xs, Ops.LT), Ops.ALL[runtime(1)](4), Ops.BY["sq"](5));
 PROG
-out=$("$BIN" -c "$TMP/sconst.my" -o "$TMP/sconst.myv" 2>&1)
-got_rc=$?
-if [ "$got_rc" != 0 ] && \
-   printf '%s' "$out" | grep -q "struct's const member"; then
-    pass "myv: a function in a struct const is refused at compile time"
+src_out=$("$BIN" "$TMP/sconst.my" 2>&1)
+if "$BIN" -c "$TMP/sconst.my" -o "$TMP/sconst.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/sconst.myv" 2>&1)
+    got_rc=$?
+    if [ "$got_rc" = 0 ] && [ "$img_out" = "$src_out" ] && \
+       printf '%s' "$src_out" | grep -q '^49 \[1, 2, 3\] -4 25'; then
+        pass "myv: functions in a struct's const members round-trip"
+    else
+        fail "myv: struct-const functions: rc=$got_rc src=[$src_out] \
+img=[$img_out]"
+    fi
 else
-    fail "myv: struct-const function (rc=$got_rc) [$out]"
+    fail "myv: -c refused a function in a struct's const member"
 fi
 
 # A LOADED image whose main takes a SWITCHED call (recursion past the

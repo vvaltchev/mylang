@@ -2645,8 +2645,8 @@ and it lives *inside the parser*. Mechanics:
   have in place, and every later pass sees an ordinary lambda. `pure`
   forbids captures, so evaluating it earlier is unobservable. A literal
   the value does NOT name (`sort([3, 1], pure func..)` bakes ints) still
-  dies. (A struct const member holding a function is still refused by
-  `-c`, a pre-existing, explicit MyvError.)
+  dies. (A struct const member holding a function is storable in a
+  `.myv` since v20's table of contents, #52.)
   **THE SAME UAF HAD A SECOND, UNRELATED PATH - the one #47 was reported
   as.** `for_each_child_of` (inferencer.h), the "COMPLETE" walker that
   `vm_compile`'s `collect_funcs` uses to decide which bodies to compile
@@ -6526,7 +6526,15 @@ makes a loaded image's `-vd` byte-identical to a fresh compile's.
 **The format** (all little-endian, fixed records, NO compression - the
 no-deps rule): magic + `MYV_FORMAT_VERSION` (exact match) + an endian mark
 + a **BUILTIN-SET FINGERPRINT** + the **SOURCE REFERENCE** + the string
-table, then structs, descriptors, chunks (root first), globals.
+table, then a TABLE OF CONTENTS (v20: the struct and descriptor counts),
+structs, descriptors, chunks (root first), globals. **The loader reads in
+three phases - IDENTITY (a shell per struct and descriptor, from the
+counts), CONTENT (the records, in file order), WIRING (layouts, deferred
+checks) - so a cross-table index resolves wherever it appears (#52: a
+struct's const member naming a function). Nothing may read a SHELL's
+fields during CONTENT**: the `func` value case defers its capture-free
+check to WIRING, since a shell's empty capture list would pass it
+vacuously (plans/myv-table-ordering.md).
 Cross-references
 are INDICES or NAMES, never pointers: a `UniqueId*` is a string index (the
 loader re-interns), a `Builtin` is its NAME (`vm_lookup_builtin` re-resolves;

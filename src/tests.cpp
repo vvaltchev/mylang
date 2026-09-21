@@ -24754,8 +24754,15 @@ static bool myv_round_trip()
         "var st2 = [0];",
         "for (var i = 0; i < runtime(6); i++) {",
         "  var fn = ops[i % 2]; fn(st2, i); }",
+        /* #52 (v20): a STRUCT CONST holding functions - read while the
+         * descriptors are still shells (the table of contents) */
+        "pure func sqk(x) => x * x;",
+        "struct K { const LT = pure func(a, b) => a < b;",
+        "           const T = [sqk]; }",
+        "var ks = [3, 1, 2];",
         "print(s, t, d[\"a\"], d[\"b\"], tbl[1], len(pts),",
-        "      edge(runtime(3), runtime(1.5)), nn(runtime(12)), st2[0]);" };
+        "      edge(runtime(3), runtime(1.5)), nn(runtime(12)), st2[0],",
+        "      sort(ks, K.LT)[0], K.T[0](runtime(4)));" };
 
     std::string src;
     std::vector<Tok> toks;
@@ -25981,6 +25988,122 @@ static bool myv_corrupt_refused()
         ok = true;
     } catch (Exception &e) {
         fprintf(stderr, "myv-corrupt: threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+    }
+    remove(path.c_str());
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
+ * #52 (v20): A FUNCTION IN A STRUCT'S CONST MEMBER, and the check the
+ * table of contents made DEFERRABLE.
+ *
+ * The struct table is read while every descriptor is still an empty SHELL
+ * (identity first, content second - section 7.0 of docs/myv-format.txt).
+ * read_value's `func` case refuses a pool closure whose descriptor has
+ * captures, and on a shell that test reads an EMPTY capture list and
+ * passes vacuously - so the loader DEFERS it to the wiring phase. This
+ * test gives the lambda's descriptor a capture AROUND the write (the
+ * FuncObject in the const is still capture-free, so the writer emits it)
+ * and requires the load to be refused; with the check run against the
+ * shell the image loads. And the intact image must load and print the
+ * source's answer, or the refusal proves nothing.
+ */
+static bool myv_struct_const_func()
+{
+    const char *lines_arr[] = {
+        "struct K { const LT = pure func(a, b) => a < b; }",
+        "var xs = [3, 1, 2];",
+        "print(sort(xs, K.LT)[runtime(0)]);" };
+
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-sconst.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = false;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+
+        FuncDescriptor *fd = nullptr;
+        for (auto &sd : prog.structs)
+            for (auto &kv : sd->consts)
+                if (kv.second.is<intrusive_ptr<FuncObject>>())
+                    fd = const_cast<FuncDescriptor *>(
+                        kv.second.get<intrusive_ptr<FuncObject>>()->func);
+        if (!fd) {
+            fprintf(stderr, "myv-sconst: no function in a struct const - "
+                            "the shape changed\n");
+            g_exec_engine = saved;
+            return false;
+        }
+
+        /* the intact image: compiles, loads, prints the source's `1` */
+        myv_write(prog, path, MyvSourceRef());
+        {
+            MyvSource s;
+            VmProgram good = myv_read(path, s);
+            std::ostringstream cap;
+            std::streambuf *ob = std::cout.rdbuf(cap.rdbuf());
+            vm_run(good);
+            std::cout.rdbuf(ob);
+            if (cap.str() != "1 \n") {
+                fprintf(stderr, "myv-sconst: the image printed [%s]\n",
+                        cap.str().c_str());
+                g_exec_engine = saved;
+                remove(path.c_str());
+                return false;
+            }
+        }
+
+        /* a capture on the descriptor, around the write only */
+        FuncDescriptor::CaptureDesc cd;
+        cd.name = UniqueId::get("zz");
+        cd.kind = SymKind::local;
+        cd.slot = 0;
+        fd->captures.push_back(cd);
+        myv_write(prog, path, MyvSourceRef());
+        fd->captures.pop_back();
+
+        std::string why;
+        try {
+            MyvSource s;
+            VmProgram bad = myv_read(path, s);
+            (void)bad;
+        } catch (Exception &e) {
+            why = e.msg ? e.msg : "";
+        }
+        if (why.find("capturing closure") == std::string::npos) {
+            fprintf(stderr, "myv-sconst: a CAPTURING closure in a struct "
+                            "const was %s - the deferred check did not "
+                            "run [%s]\n",
+                    why.empty() ? "ACCEPTED" : "refused for another reason",
+                    why.c_str());
+        } else {
+            ok = true;
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "myv-sconst: threw %s: %s\n", e.name,
                 e.msg ? e.msg : "");
     }
     remove(path.c_str());
@@ -45314,6 +45437,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: a callable descriptor with no chunk is refused, then guarded "
       "(#122)",
       myv_chunkless_callee },
+    { "myv: a function in a struct's const member round-trips, and its "
+      "capture check survives the shells (#52, v20)",
+      myv_struct_const_func },
     { "myv: an UNTRUSTED image's out-of-range field index is caught (#137)",
       myv_untrusted_field_index },
     { "myv: a WRONG-TYPED base does not take the process down (#142)",

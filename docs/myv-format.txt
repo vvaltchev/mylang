@@ -2,10 +2,17 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 19.  This document describes the on-disk image exhaustively:
+Format version 20.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
 
-(v19 changes no encoding: the loader now REFUSES an image whose
+(v20 adds the TABLE OF CONTENTS (section 7.0): the struct and descriptor
+COUNTS, both written before the struct table, which therefore no longer
+carries a leading count - nor does the descriptor table.  The reader builds
+an empty shell for every struct and every descriptor before it reads a
+record, so a struct's const member may hold a FUNCTION (value tag 9), which
+v19 and earlier had to refuse at write time.
+
+v19 changes no encoding: the loader now REFUSES an image whose
 `root_slot_count` (section 10) disagrees with the root chunk's own
 `slot_count` (section 9) - a cross-record check, see section 3 layer 3.
 v18 REMOVED one per-chunk record: `ref_slots`, which used to follow
@@ -257,6 +264,7 @@ Every pool in section 9 writes its Locs through this one encoding.
     |  SOURCE REFERENCE  (section 5)                           |
     |  STRING TABLE      (section 6)                           |
     +----------------------------------------------------------+
+    |  TABLE OF CONTENTS (section 7.0)                         |
     |  STRUCT TABLE      (section 7)                           |
     |  DESCRIPTOR TABLE  (section 8)                           |
     |  CHUNKS            (section 9)  root first, then one per |
@@ -367,7 +375,29 @@ through this table: a string CONSTANT is data, not an identifier.
 7.  STRUCT TABLE
 --------------------------------------------------------------------------------
 
-    N x StructDef
+7.0  TABLE OF CONTENTS (v20)
+
+    u32   n_structs         the number of StructDef records in section 7
+    u32   n_descriptors     the number of Descriptor records in section 8
+
+Both counts come BEFORE either table's content: the loader constructs an
+empty SHELL for every struct and every descriptor first (IDENTITY), then fills
+the records in file order (CONTENT), then derives what depends on filled
+records (WIRING - section 14).  Any cross-table index is therefore resolvable
+wherever it appears; in particular a struct's const member may name a
+descriptor (value tag 9) although the descriptor table follows it.  The design
+record is plans/myv-table-ordering.md.
+
+VALIDATION: the counts no longer precede their own records, so the
+"no more entries than bytes remaining" bound of a plain count does not apply.
+Instead a struct record is at least 12 bytes and a descriptor record at least
+40, and the loader REFUSES an image where
+12 * n_structs + 40 * n_descriptors exceeds the bytes remaining after the two
+counts ("corrupt .myv (table of contents exceeds the file)").
+
+7.1  THE RECORDS
+
+    n_structs x StructDef           (no leading count - it is in 7.0)
 
     StructDef:
         uid   name
@@ -386,18 +416,12 @@ through this table: a string CONSTANT is data, not an identifier.
         uid   name
         value value         the folded `const NAME = expr;` member
 
-                            A `func` value (tag 9) is REFUSED here: this
-                            section is read before the DESCRIPTOR TABLE
-                            (section 8), so a descriptor index written
-                            here resolves against an empty table.  The
-                            writer aborts with "unserializable value (a
-                            function in a struct's const member ...)"
-                            rather than emit an image that cannot be
-                            read.  Lifting the restriction is NOT a
-                            section swap - classes make the table
-                            references CYCLIC - it is the identity-
-                            before-content read designed in
-                            plans/myv-table-ordering.md.
+                            A `func` value (tag 9) is legal here since
+                            v20: the descriptor it names is a SHELL when
+                            this record is read (section 7.0), so the
+                            loader stores only the pointer and DEFERS
+                            the capture-free check of section 11 to the
+                            wiring phase, when the descriptor is filled.
 
 Structs are written in definition order.  A field's `struct_def` can only
 reference an EARLIER struct (inline fields only go backwards - a parser
@@ -418,7 +442,7 @@ reference any of them during the fill.
 A FuncDescriptor is the serializable runtime identity of a function - the
 whole call model reads it, never an AST node.
 
-    N x Descriptor
+    n_descriptors x Descriptor      (no leading count - it is in 7.0)
 
     Descriptor:
         uid   name
@@ -884,12 +908,10 @@ keys and values, and recursively by itself.
     6  dict         see 11.2
     7  strct        see 11.3
     8  structtype   sref
-    9  func         dref     (a FuncObject; NOT legal inside a struct's
-                              const members - section 7 is read BEFORE the
-                              descriptor table exists, so the reference
-                              cannot be resolved; the writer REFUSES one
-                              there rather than emit an unreadable image
-                              (plans/myv-table-ordering.md).
+    9  func         dref     (a FuncObject.  Legal in a struct's const
+                              members since v20 - the descriptor is a
+                              shell there (section 7.0), so the check
+                              below runs in the wiring phase.
                               The descriptor MUST have
                               NO captures - the writer refuses a
                               capturing closure and the READER
@@ -1206,14 +1228,20 @@ member is a format change even when it renumbers nothing.
      2. magic, format version, endianness, builtin fingerprint
      3. the source reference; resolve and verify it (section 5)
      4. the string table -> re-interned UniqueIds
-     5. struct definitions: construct all, fill all, compute_layout each
-     6. descriptors: construct all, fill all
-     7. the root chunk, then each descriptor's chunk, installing it
+     5. the table of contents (section 7.0); construct an empty shell for
+        every struct AND every descriptor (IDENTITY)
+     6. fill every struct record, then every descriptor record, in file
+        order (CONTENT) - a function value read while the descriptors are
+        still shells is materialized as a pointer, its checks deferred
+     7. WIRING: compute_layout of each struct in table order; the deferred
+        capture-free check of every function value read in step 6; each
+        descriptor's bind flags recomputed and cross-checked
+     8. the root chunk, then each descriptor's chunk, installing it
         (each chunk's derived pools rebuilt at the end of read_chunk)
-     8. the globals
-     9. vm_jit_loaded_image(prog) - the native tier, both passes, exactly as a
+     9. the globals
+    10. vm_jit_loaded_image(prog) - the native tier, both passes, exactly as a
         fresh compile runs them
-    10. return the VmProgram
+    11. return the VmProgram
 
 The caller OWNS the returned program and must keep it alive for the whole run:
 exception payloads and lazily-rendered backtrace frames reference its struct
