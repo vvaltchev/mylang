@@ -14784,3 +14784,27 @@ next to an inlined `step`, and a phantom `probe(xs, k)` below a builtin
 callback's frames. "No chain" is an answer here exactly as the fragment
 stamp's -2 is, so the stamp now records it (`inline_origin_emitted =
 true`). Watched failing: mutual, cb_find_sum.
+
+**(3) A SWITCHED RECORD HAD A BAKED CARET AND NO BAKED CHAIN.**
+`VmCallRec::call_site_chain` now rides beside `call_site_packed`, set at
+the same four sites (the switch push, the core's retarget of its own
+record, the materializer's retarget and insert - the last two from
+`NorecSite::inline_chain`) and read by `vm_unwind_walk`'s pop under the
+same `!sync_stop` gate - its ret_pc is a resume stub in a deleted run,
+so the pop's pc lookup named the first inlined op's chain: a phantom
+`pre(n)` above every level of a mutual recursion past the sync depth
+cap. Reached only where the cap is 32 - a sanitized build, or
+`MYLANG_NATIVE_STACK=0` (bt_oracle.py has that config; the -rt oracle
+reaches it in the sanitized lanes); with the native stack armed the
+recursion goes frameless and never switches. To fill the record,
+`jit_call_sync_switch` now performs #88's CLAIM at entry, the one
+helper the slow tail reaches that did not; the RESET half of that claim
+is contract hygiene (it keeps a later no-chain claimer from reading a
+stale chain) that no corpus shape was found to observe - every path
+back from a switch passes a chain site's own re-store. The chunk-less
+`jit_sync_boundary_call` stamps the claimed chain too
+(`vm_jit_stamp_call_site`). Watched failing: deep_mutual.
+
+Every JIT configuration (`OFF=norec`, `OFF=frameless`, `OFF=all`, a
+`.myv` image) failed identically, which is the tell that all three are in
+the shared record/conversion machinery rather than in one tier.
