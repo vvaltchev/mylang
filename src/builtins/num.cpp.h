@@ -419,8 +419,12 @@ EvalValue builtin_rand(EvalContext *ctx, const ArgLocs *exprList,
     if (!v1.is<int_type>())
         throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
+    /* An empty range has no value to draw. rand() is typed `int`, so the
+     * `none` this used to return landed in a slot inference had proven
+     * int (RULE 1, the #50 family). */
     if (v1.get<int_type>() < v0.get<int_type>())
-        return none;
+        throw InvalidArgumentEx("rand(lo, hi) needs lo <= hi",
+                                exprList->start, exprList->end);
 
     if (v0.get<int_type>() == v1.get<int_type>())
         return v0;
@@ -449,11 +453,24 @@ EvalValue builtin_randf(EvalContext *ctx, const ArgLocs *exprList,
     if (!v1.is<float_type>())
         throw TypeErrorEx("Expected float", arg1->start, arg1->end);
 
-    if (v1.get<float_type>() < v0.get<float_type>())
-        return none;
+    const float_type lo = v0.get<float_type>();
+    const float_type hi = v1.get<float_type>();
 
-    if (v0.get<float_type>() == v1.get<float_type>())
+    /* An empty range (lo > hi) returned `none` into a slot typed `float`
+     * (RULE 1). And uniform_real_distribution's own precondition is
+     * lo <= hi with a FINITE width: a NaN bound, or [-inf, inf], was
+     * undefined behaviour in the C++ library. `!(lo <= hi)` also
+     * catches a NaN. */
+    if (!(lo <= hi))
+        throw InvalidArgumentEx("randf(lo, hi) needs lo <= hi",
+                                exprList->start, exprList->end);
+
+    if (lo == hi)
         return v0;
+
+    if (!std::isfinite(hi - lo))
+        throw InvalidArgumentEx("randf(lo, hi) needs a finite range",
+                                exprList->start, exprList->end);
 
     std::uniform_real_distribution<float_type> distrib(
         v0.get<float_type>(), v1.get<float_type>()

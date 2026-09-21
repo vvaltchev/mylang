@@ -7532,13 +7532,31 @@ static const std::vector<test> tests =
         "rand() / randf() basics",
         {
             "assert(rand(5, 5) == 5);",       /* lo == hi */
-            "assert(rand(9, 1) == none);",    /* lo > hi  */
             "var r = rand(1, 3);",
             "assert(r >= 1 && r <= 3);",
             "assert(randf(2.0, 2.0) == 2.0);",
-            "assert(randf(5.0, 1.0) == none);",
             "var f = randf(0.0, 1.0);",
             "assert(f >= 0.0 && f <= 1.0);",
+        },
+    },
+    {
+        /* An empty range has no value to draw: rand() is typed int and
+         * randf() float, so the `none` this used to return put a none in
+         * a slot proven numeric (RULE 1). A NaN bound or an infinite
+         * width was UB in uniform_real_distribution. Each must raise. */
+        "rand()/randf() of an empty or non-finite range raise",
+        {
+            "var n = 0;",
+            "try { int r = rand(9, int(runtime(1))); print(r + 1); }",
+            "catch (InvalidArgumentEx) { n += 1; }",
+            "try { float f = randf(5.0, float(runtime(1.0))); print(f); }",
+            "catch (InvalidArgumentEx) { n += 1; }",
+            "try { print(randf(0.0, float(runtime(nan)))); }",
+            "catch (InvalidArgumentEx) { n += 1; }",
+            "try { print(randf(-inf, float(runtime(inf)))); }",
+            "catch (InvalidArgumentEx) { n += 1; }",
+            "assert(n == 4);",
+            "assert(randf(inf, float(runtime(inf))) == inf);",
         },
     },
     { "rand() with a non-integer is a type error",

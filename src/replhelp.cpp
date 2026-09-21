@@ -318,9 +318,10 @@ const BuiltinDoc builtin_docs[] = {
 
 /* --- random --- */
 { "rand", "random", "rand(lo, hi)",
-  "A random int in [lo, hi] inclusive (none if lo > hi).", nullptr },
+  "A random int in [lo, hi] inclusive (raises if lo > hi).", nullptr },
 { "randf", "random", "randf(lo, hi)",
-  "A random float in [lo, hi] inclusive (none if lo > hi).", nullptr },
+  "A random float in [lo, hi] (raises if lo > hi or not finite).",
+  nullptr },
 
 /* --- io --- */
 { "print", "io", "print(...)",
