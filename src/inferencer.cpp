@@ -4532,6 +4532,21 @@ void Inferencer::accumulate_call(CallExpr *call)
             /* make_dict(keys, gen): the callback's param is a KEY, so feed it
              * the keys array's element type via the general path below. */
             func_i = 1; cont_i = 0;
+        } else if (nm == "find") {
+            /* #49: find(array, what, key): the key's param is an ELEMENT,
+             * exactly as for sum's. It used to be missing here, so the
+             * param finalized `dyn` - boxed, and visibly so
+             * (`find(a, "int", func(x) => typestr(x))` never matched,
+             * while the same lambda under map() said "int"). Only an
+             * ARRAY container ever calls the key (find on a dict or a
+             * string ignores it), so a dict does not feed its key type. */
+            func_i = 2; cont_i = 0;
+            if (args->elems.size() > 0) {
+                StaticTypeRef c0 =
+                    static_type_resolve(type_of(args->elems[0].get()));
+                if (!is_unknown(c0) && c0->kind != StaticTypeKind::Array)
+                    return;
+            }
         } else {
             return;
         }

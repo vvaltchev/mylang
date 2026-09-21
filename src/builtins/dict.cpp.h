@@ -346,7 +346,10 @@ EvalValue builtin_make_dict(EvalContext *ctx, const ArgLocs *exprList,
     /* prepared per-loop invoker (vm.h); the call site names the frame */
     VmInvoker inv(ctx, funcObj, exprList->start);
 
-    for (size_type i = 0; i < n; i++) {
+    /* #49: `i < keys.size()`, re-read per step - the callback is arbitrary
+     * script code and may shrink the keys array under us; a count read
+     * once indexed past its end. */
+    for (size_type i = 0; i < keys.size(); i++) {
 
         const EvalValue k = arr_elem_at(keys, i);
         const EvalValue v = inv.call(k);

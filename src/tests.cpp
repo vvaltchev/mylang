@@ -10318,6 +10318,82 @@ static const std::vector<test> tests =
     },
 
     {
+        /* #49 (a): find()'s key param is fed the ELEMENT type, as map's
+         * and sum's are. It finalized `dyn` before, so a key asking its
+         * param's type never matched - typestr folds statically. */
+        "find() key func: its param is typed by the element (#49)",
+        {
+            "var a = [3, 4, 5];",
+            "assert(map(func(x) => typestr(x), a)[0] == \"int\");",
+            "assert(find(a, \"int\", func(x) => typestr(x)) == 0);",
+            "assert(find(a, 8, func(x) => x * 2) == 1);",
+        },
+    },
+
+    {
+        /* #49 (c): a callback that SHRINKS or GROWS the container it is
+         * called over. find / map / filter / make_dict read the array's
+         * length once and indexed past its end; map / filter over a dict
+         * walked an unordered_map the callback had just erased from (a
+         * heap-use-after-free). Arrays are now re-bounded per step, a dict
+         * is walked as a snapshot of its pairs. */
+        "higher-order builtins: a callback mutating the container (#49)",
+        {
+            "var g = [1, 2, 3, 4, 5, 6, 7, 8];",
+            "func shrink(int x) { pop(g); return x; }",
+            "assert(find(g, 100, shrink) == none);",
+            "assert(g == [1, 2, 3, 4]);",
+            "var g2 = [1, 2, 3, 4, 5, 6, 7, 8];",
+            "func shrink2(int x) { pop(g2); return x; }",
+            "assert(map(shrink2, g2) == [1, 2, 3, 4]);",
+            "var g3 = [1, 2, 3, 4, 5, 6, 7, 8];",
+            "func shrink3(int x) { pop(g3); return true; }",
+            "assert(filter(shrink3, g3) == [1, 2, 3, 4]);",
+            "var ks = [1, 2, 3, 4, 5, 6];",
+            "func gen(int k) { pop(ks); return k * 2; }",
+            "assert(make_dict(ks, gen) == {1: 2, 2: 4, 3: 6});",
+            "var d = {1: 1, 2: 2, 3: 3};",
+            "func grow(int k, int v) {",
+            "  for (var i = 0; i < 50; i++) d[k * 1000 + i] = i;",
+            "  return v;",
+            "}",
+            "assert(sum(map(grow, d)) == 6 && len(d) == 153);",
+            "var e = {1: 1, 2: 2, 3: 3};",
+            "func cut(int k, int v) { erase(e, k); return true; }",
+            "assert(filter(cut, e) == {1: 1, 2: 2, 3: 3} && len(e) == 0);",
+        },
+    },
+
+    {
+        /* #49 (c): sort()'s comparator may not change the array's length
+         * (or storage): the heapsort indexes a vector sized once. Like
+         * Python's "list modified during sort", it raises. */
+        "sort(): a comparator that shrinks the array raises (#49)",
+        {
+            "var g = [8, 7, 6, 5, 4, 3, 2, 1];",
+            "func cmp(int a, int b) {",
+            "  if (len(g) > 2) pop(g);",
+            "  return a < b;",
+            "}",
+            "print(sort(g, cmp));",
+        },
+        &typeid(InvalidArgumentEx),
+    },
+
+    {
+        /* #49 (b): a BUILTIN is not a callback - find() refuses it with
+         * TypeErrorEx exactly as map/filter/sort do. */
+        "find(): a builtin key is a TypeErrorEx, like map's (#49)",
+        {
+            "var s = [\"ab\", \"cde\"];",
+            "append(s, str(runtime(1)));",
+            "var dyn k = len;",
+            "print(find(s, 3, k));",
+        },
+        &typeid(TypeErrorEx),
+    },
+
+    {
         /* A key_func that throws: the callback's own exception comes out
          * (not InternalErrorEx), with the callback's caret. */
         "Builtin sum() with a throwing key func propagates it (#43)",
