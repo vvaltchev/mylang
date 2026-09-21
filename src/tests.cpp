@@ -10311,7 +10311,7 @@ static const std::vector<test> tests =
             "var dyn g = [1, \"a\", 2.5];",
             "assert(sum(g, func(dyn v) => str(v)) == \"1a2.500000\");",
             "array<int> e = [];",
-            "assert(sum(e, weight) == none);",
+            "assert(sum(e, weight) == 0);",   /* #48: the int identity */
             "var n = sum(xs, weight) + 1;",
             "assert(n == 25 && typestr(n) == \"int\");",
         },
@@ -12446,14 +12446,50 @@ static const std::vector<test> tests =
     },
 
     {
-        "sum() of an empty array returns none",
+        /* #48: sum() of an empty array used to return NONE while its static
+         * type is the (non-opt) element type - `int s = sum(e)` put a none
+         * in a slot proven int (the tree-walker threw TypeErrorEx, the VM
+         * tripped ML_VM_CHECK, the JIT read 0). A numeric sum now starts
+         * from its identity, decided from the static type the inferencer
+         * stamps (stamp_sum_identity) - `keys(d)` of an empty dict is a
+         * GENERAL array, so only the stamp can answer there - and a
+         * one-term bool sum is an int like any other bool sum. */
+        "sum() of an empty array is its numeric identity (#48)",
         {
-            "assert(sum([]) == none);",
+            "array<int> ei = [];",
+            "int s = sum(ei);",
+            "assert(s + 1 == 1);",
+            "array<float> ef = [];",
+            "float f = sum(ef);",
+            "assert(f + 0.5 == 0.5);",
+            "array<bool> eb = [];",
+            "assert(sum(eb) + 2 == 2);",
             "var a = [1, 2, 3];",
             "var e = a[1:1];",
-            "assert(sum(e) == none);",
-            "assert(sum([], pure func(x) => x) == none);",
+            "assert(sum(e) == 0);",
+            "dict<int, int> d = {};",
+            "assert(array_storage(keys(d)) == \"general\");",
+            "assert(sum(keys(d)) + 3 == 3);",
+            "assert(sum(ei, func(int x) => x * 2.5) + 1.0 == 1.0);",
+            "var k = sum(ei, func(int x) => x > 1);",
+            "assert(k + 3 == 3);",
+            "var xs = [int(runtime(5))];",
+            "var one = sum(xs, func(int x) => x > 1);",
+            "assert(one + 0 == 1 && str(one) == \"1\");",
         },
+    },
+
+    {
+        /* #48: a NON-numeric sum has no identity, so an empty one raises
+         * (like `max` of an empty array) instead of returning none. */
+        "sum() of an empty non-numeric array raises (#48)",
+        {
+            "array<str> e = [];",
+            "append(e, str(runtime(1)));",
+            "var p = pop(e);",
+            "print(sum(e) + p);",
+        },
+        &typeid(InvalidArgumentEx),
     },
 
     {

@@ -191,10 +191,11 @@ const BuiltinDoc builtin_docs[] = {
   "Sort a in place descending (or by cmp).", nullptr },
 { "reverse", "array", "reverse(a)",
   "Reverse a in place.", nullptr },
-{ "sum", "array", "sum(a, [reduce])",
-  "Sum the elements of a, or fold them with reduce(acc, x).",
+{ "sum", "array", "sum(a, [key])",
+  "Sum the elements of a (or key(x) for each element x).",
   "An all-int array sums in a tight unboxed loop; sum of an array<bool> counts "
-  "the trues." },
+  "the trues. An empty numeric sum is 0 / 0.0; an empty non-numeric one "
+  "raises InvalidArgumentEx." },
 { "map", "array", "map(f, c)",
   "A new array applying f to each element of an array/dict.", nullptr },
 { "filter", "array", "filter(f, c)",

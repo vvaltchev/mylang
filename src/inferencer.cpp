@@ -426,6 +426,7 @@ private:
     TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
     void set_array_repr_hint(Expr14 *e);    /* type-driven ArrHint on rvalue */
+    void stamp_sum_identity(CallExpr *call);  /* #48: sum() of nothing */
     void check_call(CallExpr *call);
     void check_struct_construction(CallExpr *call, const StructTypeDef *def);
     void check_binops(MultiOpConstruct *mo, bool comparison, bool logical,
@@ -2548,6 +2549,7 @@ void Inferencer::annotate_hints(Construct *n)
             }
         }
         call->callable_arg_mask = cmask;
+        stamp_sum_identity(call);
         /* lever 4b: len(x)'s arg proven a non-opt array/string - the
          * BUILTIN-ness proof is codegen's (DirectBuiltinCallExpr + the
          * `len` uid), so this stamp alone triggers nothing. */
@@ -2705,6 +2707,42 @@ void Inferencer::annotate_hints(Construct *n)
  * inferencer's one AST-mutation point. This replaces the old array(N) autofill:
  * a flat_i/flat_f hint makes array(N) born flat (0 / 0.0 fill), no rewrite.
  */
+/*
+ * #48: WHAT `sum()` OF AN EMPTY ARRAY RETURNS. The static type of a sum is
+ * the element type (the callback's return with a key_func; a bool counts
+ * as int), non-opt - and the runtime used to return `none`, so
+ * `int s = sum(empty)` put a none in a slot the unboxed tiers had been
+ * PROVEN to hold an int (RULE 1: the tree-walker threw TypeErrorEx, the VM
+ * tripped ML_VM_CHECK, the JIT read it as 0). The answer is decided HERE,
+ * from the result type the call was given: a numeric sum starts from its
+ * additive identity (int 0 / float 0.0), and every other kind - str,
+ * array, dyn, a struct - has none to offer, so the builtin throws
+ * InvalidArgumentEx instead (like `max` of an empty array, README).
+ *
+ * The answer rides the args list's `arr_hint` (flat_i -> 0, flat_f -> 0.0),
+ * the channel every engine and the .myv image already carry into a
+ * builtin's ArgLocs; nothing else reads it for `sum`. An unstamped call (no
+ * inference, a sum reached through a function VALUE) falls back to the
+ * array's own flat storage, and failing that throws.
+ */
+void Inferencer::stamp_sum_identity(CallExpr *call)
+{
+    auto *cid = dynamic_cast<Identifier *>(call->what.get());
+    if (!cid || !call->args || cid->uid->val != "sum")
+        return;
+    /* the builtin, not a user function of the same name */
+    auto sit = id_sym.find(cid);
+    if ((sit != id_sym.end() && sit->second) || !is_builtin(cid->uid))
+        return;
+    StaticTypeRef rt = static_type_resolve(type_of(call));
+    if (rt->opt)
+        return;
+    if (rt->kind == StaticTypeKind::Int || rt->kind == StaticTypeKind::Bool)
+        call->args->arr_hint = ArrHint::flat_i;
+    else if (rt->kind == StaticTypeKind::Float)
+        call->args->arr_hint = ArrHint::flat_f;
+}
+
 void Inferencer::set_array_repr_hint(Expr14 *e)
 {
     if (e->op != Op::assign)

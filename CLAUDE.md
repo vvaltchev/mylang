@@ -5440,7 +5440,17 @@ are unchanged.
   `builtin_sum` also has an all-int fast path that accumulates a raw `int_type`
   in a tight loop — skipping `num_bin_op`'s promotion check and the per-element
   virtual `TypeInt::add` — and falls back to the general loop at the first
-  non-int element, so a mixed int/float array still promotes correctly.)
+  non-int element, so a mixed int/float array still promotes correctly.
+  **An EMPTY sum is decided by the STATIC type (#48)**: it used to return
+  `none` into a slot inference had proven numeric (RULE 1). The inferencer
+  stamps the result kind on the call's args `arr_hint`
+  (`stamp_sum_identity`: `flat_i` -> 0, `flat_f` -> 0.0 - the channel
+  every engine and the `.myv` already carry into `ArgLocs`, and `sum`
+  reads it for nothing else); unstamped, flat numeric STORAGE decides the
+  same way, and anything else raises `InvalidArgumentEx`. Storage alone
+  cannot answer - `keys(d)` of an empty `dict<int,int>` is a GENERAL
+  array. The seed is `sum_seed`, which also turns a one-term bool sum
+  into the `int` its static type says.)
 - **Getting a mutable copy of a const: `clone()` vs `deepclone()`.** Two helpers
   in `eval.cpp` make mutable copies (scalars/strings returned as-is):
   `make_mutable_clone` builds a fresh mutable *top* but **shares** any read-only
