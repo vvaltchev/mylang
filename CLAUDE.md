@@ -5307,9 +5307,17 @@ are unchanged.
   join (direct SharedStr reads), foreach (a tree-walker do_iter branch
   + the VM LoadElemValue strs arm), clone/const-clone stay flat
   (strings are immutable - a handle copy IS the deep copy); sum/min/max
-  promote a LOCAL handle copy (the caller keeps flat; min/max's old
+  walk a `general_copy()` (the caller keeps flat; min/max's old
   `!= general` guard mis-read the union for strs AND structs - a
   latent pre-existing struct-array InternalError, fixed the same way).
+  **⛔ A PROMOTION IS IN PLACE, ON THE SHARED STORAGE (#53b,
+  2026-09-25).** It used to RESEAT the handle it ran on, so a cold op
+  through one variable left every alias on the old storage: `var f =
+  e; pop(f)` shrank f and not e, breaking "assignment aliases" for
+  exactly the two flat kinds that promote. A SLICE handle still
+  reseats (a view detaches on write anyway). A READ-only general walk
+  must use `general_copy()`, never `get_vec()` on a handle copy - the
+  copy shares the storage, so it would promote the caller's array.
 
 - **Flat (unboxed) int/float/bool storage.** `SharedObject` carries a `Storage
   kind` (`general`/`ints`/`floats`/`bools`) and an **anonymous union** of `vec`
@@ -5538,7 +5546,8 @@ but the per-element `StructObject` allocation is gone (build overhead
   iterations
   (overwrite-in-place with a `use_count` COW guard, so a captured element keeps
   its value). Cold ops (insert/sort/map/...) **auto-promote** to a general array
-  via `get_vec()`'s `promote_structs_to_general()`, so every existing array op
+  via `get_vec()`'s `promote_structs_to_general()` - IN PLACE, so every alias
+  sees it (#53b, see the strs bullet) - so every existing array op
   works with no dedicated case and nothing throws. `array_storage` reports
   `"struct"`.
 

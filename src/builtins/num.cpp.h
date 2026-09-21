@@ -193,11 +193,12 @@ EvalValue b_min_max_arr(const SharedArrayObj &arr, const ArgLoc *arg)
         return EvalValue(best);
     }
 
-    /* strs/structs: promote a LOCAL handle copy (the caller's array keeps
-     * its flat storage) and run the general compare loop. */
-    SharedArrayObj marr = arr;
-    if (marr.skind() != SharedArrayObj::Storage::general)
-        (void)marr.get_vec();          /* promotes strs/structs in place */
+    /* strs/structs: a general COPY (the caller's array keeps its flat
+     * storage - a promotion would be in place on the shared storage, #53b)
+     * and the general compare loop. */
+    const SharedArrayObj marr =
+        arr.skind() != SharedArrayObj::Storage::general ? arr.general_copy()
+                                                         : arr;
     const ArrayConstView &arr_view = marr.get_view();
 
     if (arr_view.size() == 0)

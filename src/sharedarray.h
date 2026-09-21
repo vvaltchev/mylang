@@ -377,6 +377,9 @@ public:
      */
     void promote_structs_to_general();
     void promote_strs_to_general();     /* flat strings (top-10 #7) */
+    /* A fresh general copy of this handle's elements; the shared storage is
+     * untouched (for a read-only general walk - see types/arr.cpp.h). */
+    SharedArrayObjTempl general_copy() const;
 
     /*
      * General (vector<LValue>) access. mylang does NOT promote flat int/float
