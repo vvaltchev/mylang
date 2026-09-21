@@ -163,6 +163,36 @@ struct Exception {
      */
     int32_t bind_arg = -1;
 
+    /*
+     * Record a PHYSICAL frame - the one place every engine appends one
+     * (#38 repro B). `inline_origin_emitted` and `jit_inline_frame` are
+     * facts about the frame the exception is CURRENTLY unwinding
+     * through, not about the exception: "this frame's inlined-at chain
+     * was flushed" / "this frame's conveyor baked this chain". Crossing
+     * a physical frame boundary moves the exception into the CALLER,
+     * whose inlined regions have not been flushed yet - so both reset
+     * here. They used to persist, and a callee's virtual frame then
+     * suppressed its caller's: `top` vanished from
+     * `top -> sort -> cmpw -> weight` (every engine, with inlining on),
+     * and a callee's baked chain index was looked up in the CALLER's
+     * pool. A call-site flush that follows (do_func_call's
+     * call_site_inl, vm_flush_inline_call) sets the flag again, which
+     * is what keeps the enclosing call node from re-emitting.
+     */
+    void push_frame(const FuncDescriptor *d, Loc cs)
+    {
+        backtrace.emplace_back(d, cs);
+        inline_origin_emitted = false;
+        jit_inline_frame = -1;
+    }
+
+    void push_frame(std::string n, std::vector<std::string> p, Loc cs)
+    {
+        backtrace.emplace_back(std::move(n), std::move(p), cs);
+        inline_origin_emitted = false;
+        jit_inline_frame = -1;
+    }
+
     Exception(const char *name,
               const char *msg,
               Loc start = Loc(),

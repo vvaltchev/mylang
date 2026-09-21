@@ -3121,7 +3121,7 @@ static void vm_capture_rec_frame(RuntimeException &e, const VmCallRec &rec)
                     != ns->site_loc)
                 norec_fail("a retargeted frame captured off-site", ns,
                            nullptr);
-            e.backtrace.emplace_back(rec.desc, cs);
+            e.push_frame(rec.desc, cs);
             return;
         }
         if (cs.line != 0 || cs.col != 0)
@@ -3142,7 +3142,7 @@ static void vm_capture_rec_frame(RuntimeException &e, const VmCallRec &rec)
         g_jit_norec_frame_verify++;
     }
 #endif
-    e.backtrace.emplace_back(rec.desc, cs);
+    e.push_frame(rec.desc, cs);
 }
 
 /* Inc v2: the in-flight cross-frame exception signal (see vm.h). */
@@ -6652,7 +6652,7 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
     vm_flush_inline(*chunk, pc, *ex);      /* frames if raised in inlined */
     if (norec_raiser) {
         const auto *d = static_cast<const FuncDescriptor *>(raise_desc);
-        ex->backtrace.emplace_back(d, Loc());
+        ex->push_frame(d, Loc());
         LValue *win = ctx.frame->slots;
         const int_type total = static_cast<int_type>(chunk->slot_count)
                                + chunk->n_temps;
@@ -7129,7 +7129,7 @@ vm_capture_desc_frame(Exception &e, const FuncDescriptor *d,
             undefEx->in_pure_func = true;
 
     /* profile #3: the LAZY frame - no strings at capture time */
-    e.backtrace.emplace_back(d, site);
+    e.push_frame(d, site);
 }
 
 /* #60 (b): the bare dispatch loop, split out of vm_run_chunk so a builtin
@@ -8283,7 +8283,7 @@ jit_norec_postexit(size_t r, int_type site_packed, LValue *caller_win,
         ex->loc_end = en;
     }
     vm_flush_inline(*ck, r, *ex);
-    ex->backtrace.emplace_back(d, Loc());
+    ex->push_frame(d, Loc());
     LValue *win = ctx.frame->slots;
     const int_type total = static_cast<int_type>(ctx.frame->size);
     for (const int32_t s : ck->ref_slots) {
@@ -8362,7 +8362,7 @@ extern "C" int jit_frameless_postexit(size_t r, int_type site_packed,
         ex->loc_end = en;
     }
     vm_flush_inline(*ck, r, *ex);
-    ex->backtrace.emplace_back(d, Loc());
+    ex->push_frame(d, Loc());
     ctx.captures = static_cast<CaptureSlots *>(
         const_cast<void *>(g_jit_residue_caps));
     act.view_frame.point_at(

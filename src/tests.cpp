@@ -16229,8 +16229,11 @@ callback_frame_call_site()
  * through the value op (sum/find), the lvalue op (sort) and map, in all
  * five engine configurations. `top` is expression-bodied so the AST
  * inliner splices it into drive's loop; the callbacks are NAMED
- * functions (a lambda literal inside an inlined body is a separate,
- * unfixed defect).
+ * functions, one of which (`cmpw_w`) calls an INLINED helper of its
+ * own - #38 repro B: the callee's virtual frame used to set the
+ * once-only inline_origin_emitted guard, which never reset when the
+ * exception left the PHYSICAL callee frame, so `top` vanished again in
+ * every engine (Exception::push_frame resets it now).
  */
 static bool
 inlined_builtin_backtrace_parity()
@@ -16240,6 +16243,8 @@ inlined_builtin_backtrace_parity()
         "find(xs, 99, weight) ?? 0",
         "len(map(weight, xs))",
         "len(sort(xs, cmpw))",
+        "len(sort(xs, cmpw_w))",      /* #38 B: the comparator inlines */
+        "sum(xs, func(int v) => weight(v))",    /* ...and a lambda does */
         "sum(xs, fz)",                /* the builtin's own TypeErrorEx */
         "len(sort(xs, fz))",
     };
@@ -16247,12 +16252,10 @@ inlined_builtin_backtrace_parity()
     for (const char *sh : shapes) {
         const std::string src =
             std::string("func weight(int x) { return 10 / (x - 1); }\n")
-            /* the comparator divides ITSELF: a call to `weight` would be
-             * inlined into it, and a virtual frame flushed inside a
-             * callee drops the caller's inlined frames in EVERY engine
-             * (the once-only inline_origin_emitted guard crosses the
-             * physical frame - a separate, tree-walker-level defect) */
+            /* one comparator divides itself, the other calls `weight`,
+             * which the inliner splices into it (#38 repro B) */
             + "func cmpw(int a, int b) { return 10 / (a - 1) < b; }\n"
+            + "func cmpw_w(int a, int b) { return weight(a) < b; }\n"
             + "var dyn fz = 5;\n"
             + "func top(array<int> xs, int k) { return " + sh + " + k; }\n"
             + "func drive(array<int> xs, int n) {\n"
@@ -16266,10 +16269,10 @@ inlined_builtin_backtrace_parity()
         if (!engines_agree_bt(sh, src, &tw))
             ok = false;
         /* not vacuous: the reference must END in the exception and
-         * RENDER the inlined frame (at its call site, line 7) */
+         * RENDER the inlined frame (at its call site, line 8) */
         if (tw.find("EXC ") == std::string::npos
                 || tw.find("top(xs, k)") == std::string::npos
-                || tw.find("drive(xs, n) at line 7") == std::string::npos) {
+                || tw.find("drive(xs, n) at line 8") == std::string::npos) {
             cout << "  " << sh << ": the tree-walker does not render "
                  << "the inlined frame:\n" << tw;
             ok = false;

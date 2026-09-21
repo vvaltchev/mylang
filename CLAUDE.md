@@ -3096,8 +3096,15 @@ flag, so an error that arrives with a loc already set (a builtin like
 `append(tbl, 9)`, a not-an-lvalue assignment `d.k = v`) still keeps its frames.
 `do_func_call` sets the same flag after its own call-site flush so the enclosing
 `CallExpr` doesn't re-emit, while each physical call's flush stays unconditional
-(multi-level inlined call sites all show). `tag_inline` must walk a COMPLETE
-child visitor (`fmi_children`, #38 repro B): the resolver's `for_each_child`
+(multi-level inlined call sites all show). **⛔ The flag is PER PHYSICAL
+FRAME, not per exception (#38 repro B, 2026-09-25):** `Exception::push_frame`
+is the ONE place every engine records a physical frame, and it resets the
+flag (and the JIT's baked `jit_inline_frame`) - the exception has moved into
+the CALLER, whose inlined regions are not flushed yet. It used to persist, so
+a callee's virtual frame suppressed its caller's (`top -> sort -> cmpw ->
+weight` lost `top`, every engine). A new frame-recording site must use
+`push_frame`, never `backtrace.emplace_back`. `tag_inline` must walk a
+COMPLETE child visitor (`fmi_children`): the resolver's `for_each_child`
 skips Block/for/foreach/try/Expr14, which left every STATEMENT of a spliced
 block body chain-less. Backtraces for **body** errors are
 byte-identical with/without inlining;
@@ -5905,7 +5912,11 @@ and two macros:
   inlined code) emits the chain once and sets the flag, and `do_func_call`'s
   catch (a real call made *from* inlined code) flushes the call-site chain
   unconditionally and sets the flag so the enclosing `CallExpr` doesn't re-emit.
-  `format_backtrace` is untouched. See `plans/archived/function-inlining.md`.
+  The flag describes the frame the exception is CURRENTLY in, so recording a
+  physical frame (`Exception::push_frame`, every engine's one entry point)
+  resets it - otherwise a callee's virtual frame suppresses its caller's
+  (#38 repro B). `format_backtrace` is untouched. See
+  `plans/archived/function-inlining.md`.
 - **Tests** pin caret spans via the `test` struct's
   `ex_col`/`ex_line`/`ex_col_end`/`ex_line_end` (each checked only when nonzero;
   see the "err loc:" tests in `tests.cpp`); the "backtrace:" `extra_checks`
