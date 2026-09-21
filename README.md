@@ -2579,13 +2579,16 @@ Return the absolute value of the given number.
 Return the smallest value among the ones passed to it.
 
 #### `min(array)`
-Return the smallest value among the ones in the given array.
+Return the smallest value among the ones in the given array. The result has
+the array's element type; an **empty** array has no smallest value, so it
+raises `InvalidArgumentEx` (a compile-time error when the array is a `const`).
 
 #### `max(a, b, [c, [...]])`
 Return the largest value among the ones passed to it.
 
 #### `max(array)`
-Return the largest value among the ones in the given array.
+Return the largest value among the ones in the given array. Like `min()`, an
+**empty** array raises `InvalidArgumentEx`.
 
 #### `exp(x)`
 Return e^x.

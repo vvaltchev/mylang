@@ -7595,12 +7595,56 @@ static const std::vector<test> tests =
             "const ar = [34];",
             "assert(min(ar) == 34);",
             "assert(max(ar) == 34);",
-            "assert(min([]) == none);",
-            "assert(max([]) == none);",
             "const ar2 = [34, 52, 3];",
             "assert(min(ar2) == 3);",
             "assert(max(ar2) == 52);",
         },
+    },
+
+    {
+        /* #50: min/max of an EMPTY array returned none while its static
+         * type is the non-opt element type (RULE 1, #48's sibling). Every
+         * storage kind - flat int/float/bool, str, struct, a general dyn
+         * array, an empty slice - must raise the documented exception. */
+        "min()/max() of an empty array raises InvalidArgumentEx (#50)",
+        {
+            "struct P { int x; }",
+            "var n = 0;",
+            "array<int> ei = [];",
+            "try { var m = max(ei); print(m + 1); }",
+            "catch (InvalidArgumentEx) { n += 1; }",
+            "try { int m = min(ei); print(m); }",
+            "catch (InvalidArgumentEx) { n += 1; }",
+            "array<float> ef = [];",
+            "try { print(min(ef) + 0.5); }",
+            "catch (InvalidArgumentEx) { n += 1; }",
+            "array<bool> eb = [];",
+            "try { print(max(eb)); } catch (InvalidArgumentEx) { n += 1; }",
+            "array<str> es = [];",
+            "try { print(min(es) + \"!\"); }",
+            "catch (InvalidArgumentEx) { n += 1; }",
+            "array<P> ep = [];",
+            "try { print(max(ep).x); } catch (InvalidArgumentEx) { n += 1; }",
+            "var dyn g = dynarray(ei);",
+            "try { print(min(g)); } catch (InvalidArgumentEx) { n += 1; }",
+            "var a = [int(runtime(1)), 2, 3];",
+            "var sl = a[1:1];",
+            "try { print(max(sl)); } catch (InvalidArgumentEx) { n += 1; }",
+            "assert(n == 8);",
+            "append(ei, int(runtime(4)));",
+            "assert(max(ei) == 4 && min(ei) == 4);",
+        },
+    },
+
+    {
+        /* #50: a CONST empty array folds at parse time, so the error is a
+         * compile-time one (the early-failure rule), still InvalidArg. */
+        "max() of a const empty array fails the build (#50)",
+        {
+            "const E = [];",
+            "print(max(E));",
+        },
+        &typeid(InvalidArgumentEx),
     },
 
     {

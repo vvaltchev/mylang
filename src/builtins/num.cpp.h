@@ -129,8 +129,23 @@ EvalValue builtin_abs(EvalContext *ctx, const ArgLocs *exprList,
     }
 }
 
+/*
+ * #50: min/max of an EMPTY array has no answer. Its static type is the
+ * array's (non-opt) element type, so the `none` this used to return put a
+ * none in a slot inference had proven int/float/... (RULE 1) - the same
+ * hole #48 closed for sum(). Unlike a sum there is no identity element to
+ * give, so it is the InvalidArgumentEx README documents.
+ */
 template <bool is_max>
-EvalValue b_min_max_arr(const SharedArrayObj &arr)
+[[noreturn]] static void b_min_max_empty(const ArgLoc *arg)
+{
+    throw InvalidArgumentEx(is_max ? "max() of an empty array"
+                                   : "min() of an empty array",
+                            arg->start, arg->end);
+}
+
+template <bool is_max>
+EvalValue b_min_max_arr(const SharedArrayObj &arr, const ArgLoc *arg)
 {
     /* Flat fast path: scan the unboxed int/float vector directly, no promotion
      * and no per-element virtual compare (see plans/archived/typed-arrays.md).
@@ -144,7 +159,7 @@ EvalValue b_min_max_arr(const SharedArrayObj &arr)
         const size_type n = arr.size(), off = arr.offset();
 
         if (n == 0)
-            return EvalValue();
+            b_min_max_empty<is_max>(arg);
 
         if (arr.skind() == SharedArrayObj::Storage::ints) {
             const auto &iv = arr.flat_ints();
@@ -184,26 +199,25 @@ EvalValue b_min_max_arr(const SharedArrayObj &arr)
     if (marr.skind() != SharedArrayObj::Storage::general)
         (void)marr.get_vec();          /* promotes strs/structs in place */
     const ArrayConstView &arr_view = marr.get_view();
-    EvalValue val;
 
-    if (arr_view.size() > 0) {
+    if (arr_view.size() == 0)
+        b_min_max_empty<is_max>(arg);
 
-        val = arr_view[0].get();
+    EvalValue val = arr_view[0].get();
 
-        for (size_type i = 1; i < arr_view.size(); i++) {
+    for (size_type i = 1; i < arr_view.size(); i++) {
 
-            const EvalValue &other = arr_view[i].get();
+        const EvalValue &other = arr_view[i].get();
 
-            if constexpr(is_max) {
+        if constexpr(is_max) {
 
-                if (other > val)
-                    val = other;
+            if (other > val)
+                val = other;
 
-            } else {
+        } else {
 
-                if (other < val)
-                    val = other;
-            }
+            if (other < val)
+                val = other;
         }
     }
 
@@ -230,7 +244,7 @@ EvalValue b_min_max(EvalContext *ctx, const ArgLocs *exprList,
             );
         }
 
-        return b_min_max_arr<is_max>(val.get<SharedArrayObj>());
+        return b_min_max_arr<is_max>(val.get<SharedArrayObj>(), first_arg);
     }
 
     for (size_type i = 1; i < n; i++) {

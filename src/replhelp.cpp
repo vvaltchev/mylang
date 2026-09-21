@@ -268,9 +268,9 @@ const BuiltinDoc builtin_docs[] = {
 /* --- math --- */
 { "abs", "math", "abs(x)", "Absolute value (int or float).", nullptr },
 { "min", "math", "min(a) | min(x, y, ...)",
-  "Minimum of an array or of the arguments.", nullptr },
+  "Minimum of an array (non-empty) or of the arguments.", nullptr },
 { "max", "math", "max(a) | max(x, y, ...)",
-  "Maximum of an array or of the arguments.", nullptr },
+  "Maximum of an array (non-empty) or of the arguments.", nullptr },
 { "pow", "math", "pow(x, y)", "x raised to the power y.", nullptr },
 { "sqrt", "math", "sqrt(x)", "Square root.", nullptr },
 { "cbrt", "math", "cbrt(x)", "Cube root.", nullptr },
