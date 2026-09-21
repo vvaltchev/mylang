@@ -600,6 +600,13 @@ bool jit_chunk_is_native_leaf(const Chunk &chunk);
  * A REACH PROBE: nothing consumes the answer to decide emission yet.
  */
 bool jit_chunk_frameless_ok(const Chunk &chunk);
+/* #97 inc 3 (W3): Chunk::frameless_init_free - derived beside
+ * frameless_ok, at the same three sites, for the same reason (the
+ * CALLER's site reads it, after this chunk's originals are gone). */
+uint64_t jit_chunk_frameless_init_free(const Chunk &chunk);
+#ifdef TESTS
+bool jit_test_instr_stores_dst_raw(const Instr &in);   /* W3's whitelist */
+#endif
 /* #97 inc 2 (F6): the pre-pass that sets Chunk::frameless_wanted on
  * every callee MAIN will call framelessly (see bytecode.h). Run with the
  * SAME JitCtx main will be jitted with, before any body is jitted. */
@@ -627,6 +634,19 @@ extern unsigned long g_jit_frameless_sites;     /* inc 2 (emit-time): the
                                                  * tail */
 extern unsigned long g_jit_frameless_pushes;    /* inc 2 (emitted code) */
 extern unsigned long g_jit_frameless_rets;      /* inc 2 (emitted code) */
+extern unsigned long g_jit_frameless_init_free; /* inc 3 W3 (emit-time):
+                                                 * window slots a site
+                                                 * left UNINITIALISED */
+/*
+ * #97 inc 3 W3 (TESTS): the POISON type. A frameless site writes it as
+ * the type word of every window slot it deliberately leaves
+ * uninitialised, so a helper that reads the old state of such a slot
+ * (LValue::put / rebind / a release scan) aborts BY NAME in every test
+ * lane instead of dereferencing stack garbage. Its `t` is non-trivial,
+ * so every reader that tests `t >= t_str` takes the releasing path and
+ * lands in one of its lifecycle ops, all of which abort.
+ */
+const void *jit_poison_type();
 
 /*
  * Call a compiled fragment (frameless: slots base in, resume pc out).

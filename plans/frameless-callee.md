@@ -506,10 +506,16 @@ Each ends with a MEASUREMENT that can kill the next one.
      a register by the site would make the read 1 Ir and delete the
      repoint - sound only when EVERY capture access in the body is
      emitted (a helper reading `ctx->captures` would see the caller's);
-   - the WINDOW INIT: 3 stores per non-argument slot (type + tail),
-     needed only for a slot some HELPER may `put()`/rebind into; an
-     opcode-level "helper writes its dst" fact would skip the rest -
-     an audit table, so build it with the enum-derived ratchet;
+   - the WINDOW INIT: ✅ W3 (2026-09-20) - a slot that is not a
+     parameter, not ref-listed and written ONLY by ops that store
+     their dst raw (`jit_instr_stores_dst_raw`, a per-instruction
+     whitelist; `Chunk::frameless_init_free`) is left uninitialised;
+     a TESTS build poisons it with `jit_poison_type` so a wrongly
+     admitted op aborts by name. 78's add(i): 73 -> 66 per call
+     (record: *#97 increment 3, W3*). What the "3 stores" note above
+     did not know: the derivation must run at CODEGEN, beside
+     `frameless_ok` - by the time main's site emits, the callee's
+     originals are deleted;
    - the CALLER-BUILT WINDOW: ✅ W1 (2026-09-20) - the site fills the
      callee's window on its own stack, at [rbp+32] from the callee's
      anchor; ✅ W2 (2026-09-20) - the fusion it exists for: the staging

@@ -12752,3 +12752,131 @@ EnterNative; `vm_verify_program` checks the second across the two
 records. `myv_verify_cross_records` (-rt) tampers with the compiled
 program in memory and requires the refusal, watched failing both ways;
 docs/myv-format.txt lists both rules under layer 3.
+
+## #97 increment 3, W3 - THE SITE WRITES ONLY WHAT THE BINDS DO NOT:
+## a raw-written, unlisted window slot is left uninitialised (2026-09-20)
+
+**What it is.** The frameless site (W1) initialised every
+non-parameter slot of the callee's window - two zero stores for the
+tail (`container`, `container_idx`/`is_const`/`borrowed`) and a
+`t_none` type word - so that whatever first touches the slot finds a
+valid LValue. Per `add(i)` in 78 that was `xor r11, r11`, four tail
+stores and two tag stores for two temps: seven instructions the body
+then overwrote without ever reading. The site now asks, per slot, WHO
+reads the old state, and the answer for a temp written by an
+arithmetic op is nobody:
+ - the writer stores the payload and the type word RAW (`store_dst`,
+   `emit_float_store`, `store_dst_bool` for an UNLISTED dst - the put
+   helper is their ref-listed arm only);
+ - the frameless return arm releases by `ref_slots`, the frameless
+   window is never popped through `pop_window` (whose hardened re-scan
+   is the one every-slot walk), and every raise path releases by
+   `ref_slots` too (vm.cpp: five scans, all over the list);
+ - the register cache's entry load reads a pinned temp's payload into
+   its register (garbage, overwritten before any use - a temp is dead
+   at entry) and its flush writes raw.
+So a slot that is not a parameter, not ref-listed, and written ONLY by
+ops that store their dst raw is left as the raw stack it is:
+`Chunk::frameless_init_free`, a bit per slot, derived beside
+`frameless_ok` at the same three sites (codegen, the splice's
+re-derivation, the image loader) - BEFORE the originals are deleted,
+because by the time main's site emits, the callee's `code` is one
+`EnterNative` (the first version asked the callee at the site and
+found opcode 124 "unaudited").
+
+**⛔ THE CLASSIFICATION IS THE WHOLE SOUNDNESS ARGUMENT** -
+`jit_instr_stores_dst_raw`, a table whose stale row costs a read of
+stack garbage, and it is guarded three ways:
+ - a WHITELIST with a false default, per INSTRUCTION not per opcode:
+   the IntBin/FloatBin families (and the B1/B2 twins
+   `specialize_arith_ops` makes of them - the derivation runs at
+   codegen on the unspecialized code, the twins are listed so the
+   answer cannot change if it ever moves), LoadImmInt/Float,
+   CmpIntV/CmpFloatV, and `LoadCaptureV` ONLY with `cap_scalar` (the
+   proven-scalar read emits no helper at all - #111; the boxed shape
+   has a `jit_load_capture` arm). NOT `LoadElemInt` (its slow tier
+   `put()`s), not `MoveV` (the boxed copy), not any of the 106 helpers
+   that take a dst INDEX - which is also why the seam cannot be a
+   `lea` hook: a helper's dst is an immediate;
+ - an op `jit_op_slot_refs` does not know refuses the whole chunk (it
+   may define anything); an op defining more than its `target`
+   refuses those defs;
+ - a ref-listed slot is excluded, and for a NON-PARAMETER slot the
+   exclusion is REDUNDANT: such a slot is listed because a writer of it
+   is not `op_writes_scalar`, and no op in the raw whitelist is one, so
+   the writer rule already clears it. The first draft claimed "watched
+   failing with the exclusion removed"; the harness showed every net
+   GREEN with it removed - what redundancy looks like. A chunk-side
+   ML_CHECK of the redundancy was tried next and fired on a legitimate
+   shape: a reference PARAMETER reassigned raw in its body (`opt y ...
+   y = -1`) - a `ref_slots` SEED with a raw writer, which the chunk
+   cannot tell from a violation because it does not know its
+   parameter count (the site excludes parameters by index). So the
+   property is pinned where it is decidable, at the OPCODE level:
+   `jit_raw_whitelist_is_scalar` (-rt) walks the whole opcode enum and
+   requires every raw-whitelisted opcode to be `op_writes_scalar`
+   (LoadCaptureV excepted - its admission is `cap_scalar`, which
+   compute_ref_slots honours the same way). Watched failing with
+   `MoveV` admitted: "opcode 56 ... may write a reference";
+ - **in a TESTS build the site POISONS every slot it skips**: the
+   tails zeroed, the type word `jit_poison_type` - a static `Type`
+   whose every lifecycle op aborts BY NAME (`t_dict`, so every
+   `t >= t_str` scan takes the releasing path and lands in one). A
+   wrongly admitted op's helper tier then fails deterministically in
+   every net lane instead of dereferencing whatever the stack held.
+   `jit_ret_audit` (the C3 net, which walks every slot) recognises the
+   poison and ML_VM_CHECKs it sits on a slot the chunk claims - a
+   stronger net than before, not a weaker one. **Watched:** admitting
+   `LoadElemInt` and running the negative-index shape below prints
+   `W3 POISON HIT (dtor)` and aborts; with the poison off the same
+   sabotage reads garbage.
+A TESTS build therefore emits MORE at the site than W2 did (a
+`movabs r11` plus one register store per skipped slot); the elision
+exists in the release build only, which is what `-rt` cannot see and
+`tests/driver_checks.sh` pins on a non-TESTS binary (the poison form
+on a TESTS one, so neither configuration can rot).
+
+**The expected dump, and the dump** (78, the perf build):
+
+    op 22  the site                  W2: 34                       W3: 27
+           ... mov [r10+0x18], <int-tag> / lea rcx, [rbx+0x181] ...
+           (was: xor r11,r11 / 4 tails / 2 t_none between them)
+
+Per `add(i)` call: the caller 35 -> 28, the callee unchanged at 38 -
+73 -> 66 (W2: 73, inc 2: 83, C++ ~10). What is left at the site: the
+captures push/repoint/restore (5 + 3, W4), the vframe repoint and
+restore (3 + 3), the parameter's tail zeroing (2 - the bind helper's
+`ML_CHECK(!borrowed)` reads it, and a scalar bind could skip it: the
+next step after W4), the float pin spill/reload (2, #124).
+
+**Reach on the target benches** (`frameless_init_free`, emit-time):
+78: 4 of 4 temps (two sites); 11: closure#0's two temps, closure#1's
+`incdec.chk` temp kept (the IncDec family is not listed); 63: the two
+int closures' temps, the boxed one (`bin.v`, a helper) kept; 76:
+`add_op$0`/`sub_op$0`'s add temp skipped, the `load.elem.i` temp kept.
+A LOCAL is skipped by the same rule (the `var t = k * z` case).
+
+**Nets.** `jit_raw_whitelist_is_scalar` (above);
+`jit_frameless_w3_shape` pins the mixed site from the dump:
+a `st[x]` read (kept: a `t_none` IMMEDIATE) beside a proven-scalar
+capture read and an add (skipped: the sentinel through `movabs r11`,
+one register store each) - and the W2 shape test's `add(i)` pin moved
+to the poison form. Three reach cases (values on both engines): the
+mixed shape with a NEGATIVE index, which sends `LoadElemInt` to its
+slow tier every call (a slice does not - it has its own inline arm);
+locals written raw (all five non-parameter slots skipped); a skipped
+temp written and then a zero divisor thrown on a warmed call
+(backtrace parity - the raise path touches no skipped slot).
+`driver_checks.sh`: the release form and the poison form, by
+`mylang -v`'s `tests` line.
+
+**Wall clock, one 1-vs-1 run at the end of the task (W3 + the
+per-argument caret vs 9017e80; `bench/run.py --mylang
+build-claude/perf/mylang --baseline build-claude/base-9017e80/mylang`,
+-npc, both OPT=1 ASSERTS=0):** 78 **0.85x**, 11 **0.90x**, 63
+**0.92x**, 76 0.98x, 09/10/12/35/75 0.99-1.01x, geomean cur/base
+0.998x over 90. The one other row past 6% is 52_cse_dedup at 1-2 ms,
+below the timer's resolution. 78's clock moved 15% on a 7.6% Ir cut -
+the seven deleted stores sat on the call's critical path (a store to
+the window the callee's entry then reads), which is the direction the
+clock and the count usually disagree in on this protocol.

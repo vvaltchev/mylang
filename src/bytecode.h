@@ -1934,6 +1934,17 @@ struct Chunk {
      */
     bool frameless_ok = false;
     /*
+     * #97 increment 3 (W3): bit `s` set = window slot `s` is written ONLY
+     * by ops that store it raw (payload + type word, never through
+     * LValue::put) and is not ref-listed, so a frameless SITE building
+     * this chunk's window may leave it uninitialised (nothing reads its
+     * old state: jit_chunk_frameless_init_free). A parameter slot's bit
+     * is meaningless - the fill writes every parameter. Derived from
+     * the ops beside `frameless_ok`, BEFORE the originals are deleted
+     * (#56 leaves `code` as one EnterNative), and never stored.
+     */
+    uint64_t frameless_init_free = 0;
+    /*
      * #97 increment 2 (F6): main NAMES this chunk at a site the shared
      * predicate (jit_frameless_callee) says will be frameless - so the
      * frameless ENTRY and the frameless RETURN ARM are worth emitting.
