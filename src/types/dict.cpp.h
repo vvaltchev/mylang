@@ -146,12 +146,14 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
      */
     if (obj.get_has_default()) {
         EvalValue fk = make_const_clone(key);
+        obj.will_restructure();        /* #53: a new key - see Cursor */
         return &(*data.emplace(std::move(fk),
                      LValue(obj.get_default(), false)).first).second;
     }
 
     if (for_write) {
         EvalValue fk = make_const_clone(key);
+        obj.will_restructure();        /* #53: a new key - see Cursor */
         return &(*data.emplace(std::move(fk),
                      LValue(none, false)).first).second;
     }

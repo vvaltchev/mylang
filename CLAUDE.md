@@ -7460,7 +7460,28 @@ first call; `sort` checks after every comparison that the array's length
 and storage kind are unchanged and raises `InvalidArgumentEx` otherwise
 (a strs array promoted by a non-string write DESTROYS the vector the sort
 holds a reference to). A new callback-driven builtin must pick one of
-these three, never a cached bound or a live iterator. **Callback handle lifetime:** when a builtin keeps a raw
+these three, never a cached bound or a live iterator.
+**⛔ AND A FOREACH BODY IS THE SAME HAZARD, WITH THE SEMANTICS NOW
+IN THE LANGUAGE (#53, 2026-09-25; README *Modifying the container
+during the loop*).** An ARRAY loop runs over the length at its start,
+reads each element when its turn comes, and raises OutOfBoundsEx at
+the container when the body removed the next one - so EVERY foreach
+element load re-checks the CURRENT length (the TW loop, LoadElemInt/
+Float/Value as always, LoadElemBool and LoadStructElemV since #53,
+ForeachDynNext's array bodies through an `oob` flag so the specialized
+bodies stay throw-free, the unpack core), and the struct DIRECT read
+(`p.x` off the array bytes at every use) is allowed only for a body
+`struct_fe_body_inert` (codegen.cpp) proves cannot change any array or
+run program code - otherwise `p` is bound whole, a COPY. A DICT loop
+walks a **`DictObject::Cursor`** (shareddict.h): live until the body
+RESTRUCTURES the dict, then a snapshot of the remaining keys, each
+looked up when its turn comes. **Every structural change - a new key,
+an erase - must call `will_restructure()` first** (TypeDict::subscript's
+two emplaces, the member lvalue paths, erase/insert); a site that
+forgets it leaves a live cursor over a rehashed map, and the cursor's
+`ML_CHECK` on the map size is the tripwire. Calling it when nothing
+restructures is harmless (a snapshot of the same keys is
+unobservable). **Callback handle lifetime:** when a builtin keeps a raw
 `FuncObject *` to the callback, the `shared_ptr` that owns it must outlive every
 call — an inline lambda (`find(a, x, func(e)=>…)`) has *no other owner*, so a
 raw pointer extracted from a `RValue()` temporary that goes out of scope before

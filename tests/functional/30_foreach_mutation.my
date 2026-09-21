@@ -1,0 +1,209 @@
+# #53: a foreach whose BODY mutates the container it walks. Before, every
+# engine did something different - the tree-walker read past a vector's
+# end or walked a freed dict node (ASan), the VM raised OutOfBoundsEx for
+# some element kinds and bound `false`/garbage for others, a bool SLICE
+# tripped a JIT assertion - and the language said nothing. The DEFINED
+# semantics (README, "Modifying a container during foreach"):
+#
+#  - an ARRAY loop runs over the length the array had when it started
+#    (appended elements are not visited); each element is read when its
+#    turn comes (a store to a later element is seen); if the body removed
+#    elements so that the next one is gone, OutOfBoundsEx at the container;
+#  - the loop variable is a COPY (a struct element stored over after its
+#    turn does not change `p`);
+#  - a DICT loop visits each key the dict held when the loop started,
+#    once, if the key is still present when its turn comes, with its
+#    value at that moment; keys the body inserts are not visited.
+#
+# Every loop sits in a function called three times, so the JIT's warmed
+# and frameless tiers run it, not only the first descent.
+# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff.sh), and the
+# asserted totals pin the semantics themselves.
+
+struct P { int x; int y; }
+
+func shrink(dyn a) {
+    var s = 0;
+    try {
+        foreach (x in a) { pop(a); s++; }
+    } catch (OutOfBoundsEx) {
+        s = -s;
+    }
+    return s;
+}
+
+func arrays() {
+    var out = [];
+    append(out, shrink([1, 2, 3, 4, 5, 6]));
+    append(out, shrink([1.5, 2.5, 3.5, 4.5]));
+    append(out, shrink([true, false, true, true]));
+    append(out, shrink(split("a b c d", str(runtime(" ")))));
+    append(out, shrink([[1], [2], [3], [4]]));
+
+    var ints = [1, 2, 3, 4, 5, 6];
+    var s = 0;
+    try { foreach (x in ints) { pop(ints); s += x; } }
+    catch (OutOfBoundsEx) { s = -s; }
+    append(out, s);
+
+    var bools = [true, false, true, true, false, true];
+    var nb = 0;
+    try { foreach (b in bools) { pop(bools); if (b) nb++; } }
+    catch (OutOfBoundsEx) { nb += 100; }
+    append(out, nb);
+
+    var ps = [P(1, 2), P(3, 4), P(5, 6), P(7, 8)];
+    var sp = 0;
+    try { foreach (p in ps) { pop(ps); sp += p.x; } }
+    catch (OutOfBoundsEx) { sp = -sp; }
+    append(out, sp);
+
+    var qs = [P(1, 2), P(3, 4), P(5, 6)];
+    var sq = 0;
+    foreach (p in qs) {
+        qs[0] = P(100, 100);         /* after p's turn: p is a copy */
+        sq += p.x;
+    }
+    append(out, sq);
+
+    var rs = [P(1, 2), P(3, 4), P(5, 6)];
+    var sr = 0;
+    foreach (p in rs) {
+        if (p.x == 1) rs[2] = P(50, 0);  /* a LATER element: seen */
+        sr += p.x;
+    }
+    append(out, sr);
+
+    var grow = [1, 2, 3];
+    var ng = 0;
+    foreach (x in grow) { append(grow, x); ng++; }
+    append(out, ng * 100 + len(grow));
+
+    var later = [1, 2, 3, 4];
+    var sl = 0;
+    foreach (x in later) { later[3] = 40; sl += x; }
+    append(out, sl);
+
+    var pairs = [[1, 2], [3, 4], [5, 6]];
+    var su = 0;
+    try { foreach (a, b in pairs) { pop(pairs); su += a * b; } }
+    catch (OutOfBoundsEx) { su = -su; }
+    append(out, su);
+
+    var idx = [5, 6, 7, 8];
+    var si = 0;
+    try { foreach (i, x in indexed idx) { pop(idx); si += i * x; } }
+    catch (OutOfBoundsEx) { si = -si; }
+    append(out, si);
+
+    var sl2 = [true, false, true, true, false, true];
+    var ns = 0;
+    foreach (b in sl2[1:5]) { if (b) ns++; }   /* a bool SLICE */
+    append(out, ns);
+
+    var rb = [1, 2, 3];
+    var srb = 0;
+    foreach (x in rb) { rb = [9]; srb += x; }
+    append(out, srb);
+    return out;
+}
+
+func mk(int v) {
+    var d = {};
+    for (var i = 0; i < 8; i++)
+        d[i] = v;
+    return d;
+}
+
+func dicts() {
+    var out = [];
+
+    var d = mk(runtime(5));
+    var n = 0;
+    foreach (k, v in d) { d[k + 100] = v; n++; }
+    append(out, n * 100 + len(d));
+
+    d = mk(runtime(5));
+    var s = 0;
+    foreach (k, v in d) { erase(d, k); s += v; }
+    append(out, s * 100 + len(d));
+
+    d = mk(runtime(5));
+    n = 0;
+    foreach (k in d) {
+        if (n == 0)
+            for (var j = 0; j < 8; j++)
+                if (j != k) erase(d, j);
+        n++;
+    }
+    append(out, n * 100 + len(d));
+
+    d = mk(runtime(5));
+    s = 0;
+    foreach (k, v in d) {
+        if (s == 0)
+            for (var j = 0; j < 8; j++)
+                if (j != k) d[j] = 1000;
+        s += v;
+    }
+    append(out, s);
+
+    d = mk(runtime(5));
+    s = 0;
+    n = 0;
+    foreach (k, v in d) {
+        if (n == 0)
+            for (var j = 0; j < 8; j++)
+                if (j != k) { erase(d, j); d[j] = 7; d[j + 50] = 1; }
+        s += v;
+        n++;
+    }
+    append(out, s * 100 + n);
+
+    var dyn e = mk(runtime(5));
+    n = 0;
+    foreach (k, v in e) { e[k + 100] = v; erase(e, k); n++; }
+    append(out, n * 100 + len(e));
+
+    var m = {"a": 1, "b": 2, "c": 3};
+    n = 0;
+    foreach (k in m) {
+        m.z = 5; erase(m, "a"); erase(m, "b"); erase(m, "c");
+        n++;
+    }
+    append(out, n * 100 + len(m));
+
+    d = mk(runtime(5));
+    n = 0;
+    foreach (k in d) {
+        foreach (k2 in d)
+            n++;
+        d[k + 100] = 1;       /* the inner walk sees it, the outer not */
+    }
+    append(out, n * 100 + len(d));
+
+    d = mk(runtime(5));
+    foreach (k in d) break;
+    for (var i = 0; i < 50; i++) d[i + 200] = i;
+    n = 0;
+    foreach (k in d) n++;
+    append(out, n);
+
+    var dd = dict(0);                 /* a DEFAULT dict: a read inserts */
+    dd[1] = 1;
+    dd[2] = 2;
+    n = 0;
+    foreach (k in dd) { var t = dd[k + 100]; n += 1 + t; }
+    append(out, n * 100 + len(dd));
+
+    d = mk(runtime(5));
+    var reb = 0;
+    foreach (k, v in d) { d = {}; reb += v; }
+    append(out, reb * 100 + len(d));
+    return out;
+}
+
+for (var r = 0; r < 3; r++) {
+    print(arrays());
+    print(dicts());
+}

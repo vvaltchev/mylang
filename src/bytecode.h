@@ -285,15 +285,16 @@ enum class OpCode : unsigned char {
      * `Chunk::n_dict_iters`, indexed by a codegen-assigned `iter_id`.
      *
      * DictIterInit  target=iter_id, target2=dict_slot: pin the dict
-     *               (intrusive_ptr copy -> alive for loop) + set it=begin().
+     *               (intrusive_ptr copy -> alive for loop) + start the
+     *               state's DictObject::Cursor.
      * DictIterNext  target=end_pc, target2=iter_id, a.slot=k, b.slot=v
-     *               (-1 == `_`/unused): if it==end -> pc=end_pc; else bind
-     *               k=it->first, v=it->second.get() (box-free, like
-     *               LoadElemValue), ++it, fall through to the body. Advance is
-     *               BEFORE the body - the visited sequence is identical to the
-     *               tree-walker's range-for; the only difference (++it timing)
-     *               is observable only under mutation-during-iteration, UB in
-     *               both engines. Neither op throws (node stays null).
+     *               (-1 == `_`/unused): the cursor's next entry, or
+     *               pc=end_pc; bind k, v (box-free COPIES, like
+     *               LoadElemValue), fall through to the body. The cursor is
+     *               what makes a body that inserts or erases keys of this
+     *               dict DEFINED (#53 - it used to be a live iterator, a
+     *               use-after-free) and identical to the tree-walker, which
+     *               walks the same cursor. Neither op throws.
      */
     DictIterInit,
     DictIterNext,

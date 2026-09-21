@@ -1264,7 +1264,9 @@ struct ExecGuard {
  * / exception mid-loop releases it when the frame unwinds - no cleanup op. */
 struct DictIterState {
     intrusive_ptr<DictObject> dict;
-    DictObject::inner_type::iterator it;
+    /* #53: a walk the body may restructure (DictObject::Cursor) - movable,
+     * so the activation's state vector may grow under it */
+    DictObject::Cursor cur;
 };
 /* Per-loop LIVE state for a native `foreach (<ids> in [indexed] <dyn>)`: the
  * array-vs-dict choice is made ONCE at ForeachDynInit and recorded here (the
@@ -1280,7 +1282,8 @@ struct DynIterState {
     const std::vector<int32_t> *targets = nullptr;   /* per-var slots */
     size_type idx = 0, size = 0;               /* array cursor + snapshot */
     int_type counter = 0;                      /* dict `indexed` counter */
-    DictObject::inner_type::iterator it;       /* dict cursor (iff is_dict) */
+    DictObject::Cursor cur;                    /* dict cursor (iff is_dict,
+                                                * #53 - see DictObject) */
     /* Lever 4 (shape specialization): the per-element Next body, RESOLVED
      * ONCE at Init - a flat int/float/bool single-var array binds the raw
      * scalar, a 1/2-var dict binds through the baked slot0/slot1, anything
@@ -1291,6 +1294,11 @@ struct DynIterState {
      * loop behaves exactly as the generic body did. */
     bool (*next)(DynIterState &, Frame &, const Chunk *, size_t) = nullptr;
     int32_t slot0 = -1, slot1 = -1;            /* baked target slots */
+    /* #53: an ARRAY body found the element gone (the loop body shrank the
+     * array): it returns false with this set, and the op raises the
+     * foreach's OutOfBoundsEx - so the specialized bodies stay throw-free
+     * (the JIT helper keeps no EH state on their hot path). */
+    bool oob = false;
     /* #56: only the GENERIC body can throw (the strict N-var unpack /
      * the InternalErrorEx net); the five specialized bodies never do -
      * the JIT helper skips its try/catch for them (the extra catch
@@ -1363,7 +1371,7 @@ vm_dict_iter_init_body(DictIterState &st, const EvalValue &base)
         st.dict = base.get<intrusive_ptr<DictObject>>();
     else
         st.dict = intrusive_ptr<DictObject>(new DictObject());
-    st.it = st.dict->get_ref().begin();
+    st.cur.start(*st.dict);
 }
 
 /* DictIterNext: false on exhaustion; else bind the key (and value) box-free -
@@ -1374,13 +1382,15 @@ static ML_ALWAYS_INLINE bool
 vm_dict_iter_next_body(DictIterState &st, Frame &frame,
                        int_type k_slot, int_type v_slot)
 {
-    if (st.it == st.dict->get_ref().end())
+    /* #53: the next key present at the loop's start and still present
+     * (DictObject::Cursor); the binds COPY before the body can erase it */
+    const auto *p = st.cur.next_entry(*st.dict);
+    if (!p)
         return false;
     if (k_slot >= 0)
-        frame.at(k_slot).put(st.it->first);
+        frame.at(k_slot).put(p->first);
     if (v_slot >= 0)
-        frame.at(v_slot).put(st.it->second.get());
-    ++st.it;
+        frame.at(v_slot).put(p->second.get());
     return true;
 }
 
@@ -1401,6 +1411,7 @@ vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
     st.next = &vm_foreach_dyn_next_body;     /* the generic default */
     st.next_throws = true;
     st.slot0 = st.slot1 = -1;
+    st.oob = false;
     const std::vector<int32_t> &tg = *targets;
     const size_t tb = st.indexed ? 1 : 0;
     const size_t nv = static_cast<size_t>(st.nvars) - tb;
@@ -1428,8 +1439,7 @@ vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
         }
     } else if (st.container.is<intrusive_ptr<DictObject>>()) {
         st.is_dict = true;
-        st.it = st.container.get<intrusive_ptr<DictObject>>()
-                    ->get_ref().begin();
+        st.cur.start(*st.container.get_ref<intrusive_ptr<DictObject>>());
         /* lever 4: the non-indexed 1/2-var dict loop binds key/value
          * through the baked slots (>2 vars = none-padding -> generic). */
         if (!st.indexed && nv >= 1 && nv <= 2) {
@@ -1468,6 +1478,10 @@ vm_foreach_dyn_next_body(DynIterState &st, Frame &frame,
     if (!st.is_dict) {
         if (st.idx >= st.size)
             return false;
+        if (st.idx >= st.container.get_ref<SharedArrayObj>().size()) {
+            st.oob = true;                              /* #53 */
+            return false;
+        }
         if (st.indexed)
             bind(0, EvalValue(static_cast<int_type>(st.idx)));
         if (nv == 1) {
@@ -1487,20 +1501,20 @@ vm_foreach_dyn_next_body(DynIterState &st, Frame &frame,
         }
         st.idx++;
     } else {
-        DictObject &d = *st.container.get<intrusive_ptr<DictObject>>();
-        if (st.it == d.get_ref().end())
+        DictObject &d = *st.container.get_ref<intrusive_ptr<DictObject>>();
+        const auto *p = st.cur.next_entry(d);       /* #53 */
+        if (!p)
             return false;
         if (st.indexed)
             bind(0, EvalValue(st.counter++));
         /* do_iter's count==2 else-branch: key, value, then `none` for any
          * further vars. */
         if (nv >= 1)
-            bind(tb, st.it->first);
+            bind(tb, p->first);
         if (nv >= 2)
-            bind(tb + 1, st.it->second.get());
+            bind(tb + 1, p->second.get());
         for (size_t i = 2; i < nv; i++)
             bind(tb + i, none);
-        ++st.it;
     }
     return true;
 }
@@ -1518,6 +1532,10 @@ vm_dyn_next_arr_int(DynIterState &st, Frame &frame, const Chunk *, size_t)
         return false;
     ML_DYN_FAST_RAN(0);
     const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
+    if (st.idx >= a.size()) {                           /* #53 */
+        st.oob = true;
+        return false;
+    }
     frame.at(st.slot0).put(EvalValue(a.flat_ints()[a.offset() + st.idx]));
     st.idx++;
     return true;
@@ -1530,6 +1548,10 @@ vm_dyn_next_arr_float(DynIterState &st, Frame &frame, const Chunk *, size_t)
         return false;
     ML_DYN_FAST_RAN(1);
     const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
+    if (st.idx >= a.size()) {                           /* #53 */
+        st.oob = true;
+        return false;
+    }
     frame.at(st.slot0).put(EvalValue(a.flat_floats()[a.offset() + st.idx]));
     st.idx++;
     return true;
@@ -1542,6 +1564,10 @@ vm_dyn_next_arr_bool(DynIterState &st, Frame &frame, const Chunk *, size_t)
         return false;
     ML_DYN_FAST_RAN(2);
     const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
+    if (st.idx >= a.size()) {                           /* #53 */
+        st.oob = true;
+        return false;
+    }
     frame.at(st.slot0).put(EvalValue(
         static_cast<bool>(a.flat_bools()[a.offset() + st.idx])));
     st.idx++;
@@ -1554,6 +1580,10 @@ vm_dyn_next_arr_gen(DynIterState &st, Frame &frame, const Chunk *, size_t)
     if (st.idx >= st.size)
         return false;
     ML_DYN_FAST_RAN(3);
+    if (st.idx >= st.container.get_ref<SharedArrayObj>().size()) {  /* #53 */
+        st.oob = true;
+        return false;
+    }
     frame.at(st.slot0).put(vm_arr_elem(st.container, st.idx));
     st.idx++;
     return true;
@@ -1562,15 +1592,15 @@ vm_dyn_next_arr_gen(DynIterState &st, Frame &frame, const Chunk *, size_t)
 static bool
 vm_dyn_next_dict(DynIterState &st, Frame &frame, const Chunk *, size_t)
 {
-    DictObject &d = *st.container.get<intrusive_ptr<DictObject>>();
-    if (st.it == d.get_ref().end())
+    DictObject &d = *st.container.get_ref<intrusive_ptr<DictObject>>();
+    const auto *p = st.cur.next_entry(d);           /* #53 */
+    if (!p)
         return false;
     ML_DYN_FAST_RAN(4);
     if (st.slot0 >= 0)
-        frame.at(st.slot0).put(st.it->first);
+        frame.at(st.slot0).put(p->first);
     if (st.slot1 >= 0)
-        frame.at(st.slot1).put(st.it->second.get());
-    ++st.it;
+        frame.at(st.slot1).put(p->second.get());
     return true;
 }
 
@@ -4555,7 +4585,11 @@ static ML_NOINLINE int
 jit_foreach_dyn_next_slow(DynIterState &st) noexcept
 {
     try {
-        return st.next(st, *g_current_ctx->frame, nullptr, 0) ? 1 : 0;
+        if (st.next(st, *g_current_ctx->frame, nullptr, 0))
+            return 1;
+        if (st.oob)                             /* #53: the element is gone */
+            throw OutOfBoundsEx();
+        return 0;
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return -1;
@@ -4576,7 +4610,12 @@ extern "C" int jit_foreach_dyn_next(int_type iter_id) noexcept
          * of THIS function matters: the catch-all's exception_ptr temp
          * made -fstack-protector-strong add a canary, +7 Ir per element
          * on the hot path (#56, callgrind-diagnosed). */
-        return st.next(st, *g_current_ctx->frame, nullptr, 0) ? 1 : 0;
+        if (st.next(st, *g_current_ctx->frame, nullptr, 0))
+            return 1;
+    /* exhausted - or (#53) the element is gone, which only the EH-carrying
+     * slow tier conveys; checked here, OFF the per-element path */
+    if (!st.next_throws && !st.oob)
+        return 0;
     return jit_foreach_dyn_next_slow(st);
 }
 
@@ -5105,7 +5144,16 @@ vm_unpack_elem_body(EvalContext &ctx, const EvalValue &base_v, int_type idx,
      * defined outcome (defs.h, the ml_untrusted_bytecode() idiom). */
     ML_VM_CHECK(ml_untrusted_bytecode() || base_v.is<SharedArrayObj>());
     const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
-    const EvalValue &elem = outer.get_vec()[outer.offset() + idx].get();
+    /* #53: the index is bounded by the length at the loop's START; the
+     * body may have shrunk the array since - the foreach's defined
+     * OutOfBoundsEx (loc-less for the JIT: the re-raise stamps it). */
+    if (idx < 0 || static_cast<size_type>(idx) >= outer.size()) {
+        Loc ls, le;
+        if (chunk)
+            chunk->loc_at(pc, ls, le);
+        throw OutOfBoundsEx(ls, le);
+    }
+    const EvalValue elem = vm_arr_elem(outer, static_cast<size_type>(idx));
     if (!elem.is<SharedArrayObj>())
         vm_throw_unpack_nonarray(chunk, pc, N);
     const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
@@ -11317,11 +11365,11 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             bool b = false;
             if (bv.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = bv.get_ref<SharedArrayObj>();
-                /* The index is loop-bounded by the length at the loop's
-                 * START, and the body may have shrunk the array since - the
-                 * element is gone: OutOfBoundsEx at the container, as for
-                 * every other element kind (and the JIT's tier, which
-                 * declines to jit_load_elem_value on the same test). */
+                /* #53: the index is loop-bounded by the length at the
+                 * loop's START, and the body may have shrunk the array
+                 * since - the element is gone, which is the foreach's
+                 * defined OutOfBoundsEx (every engine; the JIT's inline
+                 * tier bails here on the same test). */
                 if (idx >= 0 && static_cast<size_type>(idx) >= arr.size()) {
                     Loc ls, le;
                     chunk->loc_at(pc, ls, le);
@@ -11434,6 +11482,11 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 && in->target2 < static_cast<int_type>(chunk->n_dyn_iters));
             DynIterState &dst_ = dyiter(in->target2);
             if (!dst_.next(dst_, *ctx.frame, chunk, pc)) {
+                if (dst_.oob) {                 /* #53: the element is gone */
+                    Loc ls, le;
+                    chunk->loc_at(pc, ls, le);
+                    throw OutOfBoundsEx(ls, le);
+                }
                 pc = static_cast<size_t>(in->target);
                 VM_NEXT;
             }
@@ -11881,10 +11934,17 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         VM_CASE(LoadStructElemV):
             /* Whole-`p` foreach bind: materialize a fresh StructObject from the
              * flat struct-array element into the loop var. target = loop var,
-             * target2 = the array slot, a = the counter. */
-            ctx.frame->at(in->target).put(
-                vm_struct_elem(ctx.frame->at(in->target2).get(),
-                               read_int_operand(in->a(), &ctx)));
+             * target2 = the array slot, a = the counter. #53: the element
+             * may be GONE (the body shrank the array) - the loc-less
+             * OutOfBoundsEx takes the container's caret here. */
+            try {
+                ctx.frame->at(in->target).put(
+                    vm_struct_elem(ctx.frame->at(in->target2).get(),
+                                   read_int_operand(in->a(), &ctx)));
+            } catch (Exception &e) {
+                vm_stamp_loc(*chunk, pc, e);
+                throw;
+            }
             pc++;
             VM_NEXT;
 
