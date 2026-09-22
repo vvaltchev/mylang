@@ -1178,9 +1178,8 @@ void write_chunk(Writer &w, const Chunk &c)
         w.boolv(hs.has_rethrow);
     }
 
-    w.u32v(static_cast<uint32_t>(c.ref_slots.size()));
-    for (int32_t s : c.ref_slots)
-        w.u32v(static_cast<uint32_t>(s));
+    /* `ref_slots` is NOT written (v18): the loader derives it from the
+     * verified code - see the rebuild in myv_read. */
 
     w.u32v(static_cast<uint32_t>(c.consts.size()));
     for (const EvalValue &v : c.consts)
@@ -1470,12 +1469,11 @@ void read_chunk(Reader &r, Chunk &c)
         }
     }
 
-    uint32_t n = r.countv();
-    c.ref_slots.reserve(n);
-    for (uint32_t i = 0; i < n; i++)
-        c.ref_slots.push_back(static_cast<int32_t>(r.u32v()));
+    /* `ref_slots` is DERIVED (v18) - rebuilt in myv_read after
+     * vm_verify_program, from the code, never read from the file. It
+     * stays EMPTY here, which the verifier's own bound accepts. */
 
-    n = r.countv();
+    uint32_t n = r.countv();
     c.consts.reserve(n);
     for (uint32_t i = 0; i < n; i++)
         c.consts.push_back(read_value(r));
@@ -2203,6 +2201,26 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         if (d->vm_chunk)
             compute_nonneg_slots(*static_cast<Chunk *>(
                                      const_cast<void *>(d->vm_chunk)));
+    /*
+     * v18: `ref_slots` is derived here too, for the strongest reason a
+     * pool has had - it decides what a frame pop RELEASES. Read from the
+     * file, one mutated entry (myv_fuzz small-1305: one bit, `[1, 2]` ->
+     * `[0, 2]`) made the release scan skip the temp two closures were
+     * built in, and the image ran to the right answer while leaking them.
+     * Derived from the verified code with the seeds the compile used
+     * (`ref_seeds_of`, the descriptor's non-scalar params), the list
+     * cannot disagree with the code beside it. Same placement rule as
+     * nonneg_slots: after the verifier bounded every operand the walk
+     * reads, before the JIT bakes the list into its release arms.
+     */
+    compute_ref_slots(prog.root, nullptr);
+    for (const auto &d : prog.funcs)
+        if (d->vm_chunk) {
+            std::vector<int32_t> seeds;
+            ref_seeds_of(*d, seeds);
+            compute_ref_slots(*static_cast<Chunk *>(
+                                  const_cast<void *>(d->vm_chunk)), &seeds);
+        }
 
     /*
      * #137 tier 2: from here on this process is running UNTRUSTED bytecode.

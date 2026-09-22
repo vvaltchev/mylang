@@ -6688,8 +6688,10 @@ extern "C" void jit_ret_audit() noexcept
      * slot, that a plain frame moved no watermark. On bytecode read off a
      * DISK none of that is our output and the premise simply does not
      * hold, so the audit is not a bug report, it is a false alarm that
-     * aborts the process. `ref_slots` is bounded by verify_chunk, so a
-     * wrong one can only leak a reference, never index out of range.
+     * aborts the process. (`ref_slots` itself is DERIVED at load since
+     * myv v18 - rebuilt from the verified code, never read from the
+     * file - so it cannot disagree with the code beside it; the other
+     * premises here still can.)
      */
 #if ML_UNTRUSTED_CHECKS
     if (g_untrusted_bytecode)

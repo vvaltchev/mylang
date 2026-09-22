@@ -23417,6 +23417,39 @@ static bool myv_round_trip()
             g_exec_engine = saved;
             return false;
         }
+        /*
+         * v18: `ref_slots` is DERIVED at load too - and it is the pool the
+         * dump oracle covers only INDIRECTLY (through the emitted release
+         * arms), so compare it entry-for-entry on every chunk, the
+         * function chunks with the descriptor SEEDS the loader rebuilds
+         * from `ref_seeds_of`. Counted, so the check cannot pass on two
+         * empty lists.
+         */
+        size_t nref = 0;
+        auto same_refs = [&](const Chunk &x, const Chunk &y) {
+            nref += x.ref_slots.size();
+            return x.ref_slots == y.ref_slots;
+        };
+        bool refs_ok = same_refs(prog.root, loaded.root);
+        for (size_t i = 0; refs_ok && i < prog.funcs.size(); i++) {
+            const Chunk *a =
+                static_cast<const Chunk *>(prog.funcs[i]->vm_chunk);
+            const Chunk *b =
+                static_cast<const Chunk *>(loaded.funcs[i]->vm_chunk);
+            if (a && b && !same_refs(*a, *b))
+                refs_ok = false;
+        }
+        if (!refs_ok) {
+            fprintf(stderr, "myv: the DERIVED ref_slots list differs\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        if (!nref) {
+            fprintf(stderr, "myv: no ref_slots to compare - the program "
+                            "above no longer exercises the rebuild\n");
+            g_exec_engine = saved;
+            return false;
+        }
 
         /*
          * #106 phase 2: `nonneg_slots` is the SECOND derived pool the -vd
@@ -24052,6 +24085,102 @@ static bool myv_verify_store_operands()
         vm_verify_program(prog);                    /* restored: passes */
     } catch (Exception &e) {
         fprintf(stderr, "myv_verify_store_operands: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
+ * v18 (2026-09-22): `ref_slots` is DERIVED at load. The myv_fuzz finding
+ * small-1305 was one bit in the STORED list (`[1, 2]` -> `[0, 2]`): the
+ * release scan skipped the temp two closures were built in and the image
+ * ran to the right answer while leaking both (LeakSanitizer at exit).
+ * With the record gone from the format, the loader rebuilds the list
+ * from the verified code with the descriptor's seeds - so a TAMPERED
+ * in-memory list on the writer's side must not reach the loaded chunk:
+ * the loaded lists must equal the pristine derivation, on the root and
+ * on a function chunk whose seeds matter (a reference parameter).
+ * Watched failing: with the record stored (v17) the tampered lists came
+ * back verbatim.
+ */
+static bool myv_ref_slots_derived()
+{
+    const char *lines_arr[] = {
+        "func sq(a, int k) { var t = a[0] * k; a[1] = t; return t; }",
+        "var arr = [3, 0];",
+        "var f = func(int x) { var s = str(x); return s + \"!\"; };",
+        "var acc = 0; var last = \"\";",
+        "for (var i = 0; i < runtime(3); i++) {",
+        "  acc = acc + sq(arr, i); last = f(i);",
+        "}",
+        "print(acc, arr[1], last);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        /* the INSTANCE `sq$0` (its `a` is the seed; the template base
+         * `sq` keeps a chunk of its own, with different slots) */
+        Chunk *sqck = nullptr;
+        for (const auto &d : prog.funcs)
+            if (d->vm_chunk && d->name && d->name->val == "sq$0")
+                sqck = static_cast<Chunk *>(const_cast<void *>(d->vm_chunk));
+        if (!sqck || prog.root.ref_slots.empty() || sqck->ref_slots.empty()
+                || sqck->ref_slots[0] != 0) {
+            fprintf(stderr, "myv_ref_slots_derived: the shapes did not "
+                            "compile as expected\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        const std::vector<int32_t> root_refs = prog.root.ref_slots;
+        const std::vector<int32_t> sq_refs = sqck->ref_slots;
+        /* tamper: the old finding's exact shape on both chunks */
+        prog.root.ref_slots.erase(prog.root.ref_slots.begin());
+        sqck->ref_slots.clear();
+        std::string tdir = "/tmp";      /* portable, as myv_round_trip */
+        for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+            const std::optional<std::string> e = env_get(var);
+            if (e && !e->empty()) { tdir = *e; break; }
+        }
+        while (tdir.size() > 1
+               && (tdir.back() == '/' || tdir.back() == '\\'))
+            tdir.pop_back();
+        const std::string path = tdir + "/mylang-myv-refslots.myv";
+        const std::string spath = tdir + "/mylang-myv-refslots.my";
+        std::ofstream(spath) << src;
+        myv_write(prog, path, myv_source_ref(spath));
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        const Chunk *lsq = nullptr;
+        for (const auto &d : loaded.funcs)
+            if (d->vm_chunk && d->name && d->name->val == "sq$0")
+                lsq = static_cast<const Chunk *>(d->vm_chunk);
+        if (loaded.root.ref_slots != root_refs) {
+            fprintf(stderr, "myv_ref_slots_derived: the root's loaded list "
+                            "is not the derivation (%zu vs %zu)\n",
+                    loaded.root.ref_slots.size(), root_refs.size());
+            ok = false;
+        }
+        if (!lsq || lsq->ref_slots != sq_refs) {
+            fprintf(stderr, "myv_ref_slots_derived: sq's loaded list is not "
+                            "the derivation (seeds lost?)\n");
+            ok = false;
+        }
+        std::remove(path.c_str());
+        std::remove(spath.c_str());
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_ref_slots_derived: threw %s: %s\n",
                 e.name, e.msg ? e.msg : "");
         ok = false;
     }
@@ -42232,6 +42361,9 @@ static const std::vector<extra_check> extra_checks =
       "bounded, and a lit flag on an operand the VM reads as a slot is "
       "refused (StoreElem2V/DictStore/StoreElemValue/StoreMemberV, "
       "LoadElem2Int)", myv_verify_store_operands },
+    { "myv: v18 - ref_slots is DERIVED at load: a tampered stored list "
+      "cannot reach the loaded chunk (root and a seeded function chunk)",
+      myv_ref_slots_derived },
     { "jit: #97 inc 3 (W1/W2) - the CALLER builds the frameless window "
       "and binds from the argument SOURCES: the expected entry, "
       "discriminator, arm and site sequences (a pinned int into an int "
