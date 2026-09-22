@@ -13469,3 +13469,113 @@ explicit rebind loop is gone. Pinned by `vm_program_move_rebinds`
 kills the suite in the harness) and a `driver_checks.sh` deep-image case.
 Not visible to -rt (its loads are elided initialisations, no move), nor
 to myv_fuzz (its corpus has no switched call from main).
+
+## #97 increment 3, W6 - THE CAPTURE BASE GOES CALLER-SAVED IN A
+## CALL-FREE FRAMELESS BODY, and the ABI parity filler eats half the
+## prize (2026-09-22)
+
+**What W4 left.** W4 put the capture base in a register the FRAMELESS
+ENTRY loads from the FuncObject, and its record named the residue: "the
+two of the eight that W4 does not recover are the capbase push/pop in
+the frameless prologue and epilogue; a caller-saved base would drop them
+for a body with no helper call". A frameless entry runs PER CALL, so
+those two are per call too.
+
+**The claim is conditional now, and the condition is the cost model's
+own.** `gp_weight` prices a callee-saved register as the CHEAPER kind
+because it survives a call for free - true, and paid for with a push at
+`frag_entry` and a pop at every exit. A run that makes no call has
+nothing to survive, so there the relation inverts. The claim asks
+`take(CAP_ALLOCATABLE | CAP_MEM_BASE)` with
+`prefer = gp_caller_saved_mask()` (a PREFER mask, not a capability:
+"caller-saved" is the absence of one, and asking for it would invert the
+superset relation the model rests on), and only a callee-saved register
+joins `e.saved` - the list's own stated rule decides, so the entry and
+the exit cannot disagree about what was pushed.
+
+**"Makes no call" is decided in two halves, because the two kinds of
+call clobber differently:**
+ - a MyLang CALL op's emitter uses r8/r10/r11 as RAW scratch OUTSIDE any
+   bracket, so no spill could save the base from it. Those runs are
+   refused STATICALLY by `jit_run_blocks_xcache` - the same gate the
+   caller-saved PIN pool already asks, reused rather than restated;
+ - a HELPER call is BRACKETED, and the bracket is also exactly where
+   #112's refresh would have to restore the base from ctx - which a W4
+   run may not read (those are the CALLER's captures). That half cannot
+   be known before the run is emitted, so it is bet optimistically and
+   settled from `n_prologues` after the run, with a ONE-SHOT re-emission
+   (the rax-conflict shape, a bool that only goes false -> true).
+   An UNBRACKETED call is on an exit path, which returns without reading
+   a capture again.
+
+**⛔ AND THE PRIZE IS ONE INSTRUCTION, NOT TWO - THE ENTRY PARITY PAYS
+FOR THE PUSH IT LOSES.** `entry_pad()` adds `sub rsp, 8` when the number
+of entry pushes is EVEN, so that the cold raise exits - which CALL before
+restoring rsp - stay 16-aligned. Dropping the capbase push flips the
+parity and buys the filler back:
+
+    W4  push rbp | mov rbp,rsp | push rbx | push r13  (2 bytes)
+    W6  push rbp | mov rbp,rsp | push rbx | sub rsp,8 (4 bytes)
+
+so the ENTRY is instruction-for-instruction identical and two bytes
+bigger, and the win is the EXIT's `pop` alone. The W1/W2 shape test is
+what said so - it pins the entry sequence instruction by instruction,
+and it failed with `want push r1*, have sub rsp, 8` before any
+measurement ran. **A push removed from a prologue is not an instruction
+saved until the frame's 16-alignment has been re-derived.** Recovering
+the second one means moving the parity to the cold exits (each exit
+call fixing rsp itself, or `lea rsp,[rbp-N]` BEFORE the call rather
+than after) - not done, and worth its own decision.
+
+**Measured** (callgrind Ir, scale 1, `-npc`, OPT=1 ASSERTS=0 both sides,
+base = 4f1d1d1): 78_typed_param_call 153,431,230 -> 151,433,961
+**-1.30%** (exactly 1 instruction x 1,000,000 calls x the two closures),
+11_closure_counter 71,556,772 -> 70,558,337 **-1.40%**, 63_closures
+184,043,023 -> 183,447,337 -0.32%. Reach (`capbase_cs`, emit-time):
+78 2 of 2, 11 1 of 1, 63 2 of 3 - the third keeps the callee-saved base,
+which is the gate discriminating rather than a miss. Blast radius
+(vdjcmp): 5 of 128 corpus programs change, all five capture-carrying.
+
+**⛔ `--xrot` EARNED ITS KEEP AGAIN, ON THE FIRST RUN.** At the default
+rotation the base lands in r10 and everything passed. At
+**MYLANG_JIT_XROT=11** it lands in r11 - which the RETURN ARM uses as
+raw scratch - and two corpus programs aborted on the D3 tracker
+(`write to a PINNED register with no borrow and no declaration: r11`).
+The write is harmless in LIVENESS terms (every path out of the arm
+leaves the fragment, and the next call re-establishes the base at the
+entry), but the tracker judges a write by whether the register is live,
+so the range has to be stated: `Emitter::capbase_live` ends at the run's
+LAST op, which for a frameless run IS that terminal ReturnV (the F1
+gate), and nothing follows it for a back edge to re-enter a capture
+access from. **The default rotation would never have met this** - the
+pool-tail blindness CLAUDE.md names, caught by the axis built for it.
+
+**And three MACHINERY declarations the model needed.** Teaching
+`reg_holds_pin` that the base is live made the base's OWN establishment
+an undeclared write to a live register: the run head's `capbase_load`,
+`emit_call_epilogue`'s refresh and the entry STUB's copy all abort the
+tracker without a `PinMach`. Each is machinery - the loads that
+ESTABLISH the value - and now says so. `jit_assert_no_volatile_pin`
+(the standing check at the two raw-scratch MyLang-call emitters) checks
+the base too, since it is not in `cache` and is the one register there
+that can now be caller-saved.
+
+**⛔ AND THE `nolowmem` LANE FOUND THE SECOND ONE - THE BASE LANDED IN
+RAX.** With the tag singletons occupying two more registers, the pick
+under pressure reached its LAST preference, and rax is not a register a
+run-scoped value may live in: `acc_take` hands it out BY NAME and every
+call site tests it as the helper's status. CAP_CALLEE_SAVED had been
+excluding it for free; asking the caller-saved half put it back in the
+running. The claim states the exclusion now. Both findings are the same
+shape as #123's lesson - **deleting a partition converts every latent
+bookkeeping assumption in that resource into a live one** - and both
+were found by a lane built for exactly that: `--xrot` for the pool's
+tail, `nolowmem` for the configuration that ships where MAP_32BIT does
+not.
+
+**Nets.** The W1/W2 shape test pins both new sequences (the filler where
+the push was, the one-slot-shallower `lea rsp,[rbp-0x8]` and the missing
+`pop`); `capbase_cs` joins the counter-coverage assertion, so a gate
+that stops admitting anything fails instead of going quiet. Watched
+failing: forcing CAP_CALLEE_SAVED back fails 2 of 2014 (the shape test
+and the coverage).

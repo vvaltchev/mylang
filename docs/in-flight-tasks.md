@@ -72,8 +72,9 @@ the site, the arm's borrowed skip, the scalar parameter tails - 76
 -13.5% Ir, 78 -2.5%) and #25 (done: `visit_use_def` learned six store
 ops - 76 -9.0% Ir with `refs=[0 1]` and a 76-instruction callee, and
 far more elsewhere: 60_bit_sieve -23%, 14 -20%, 86 -20%, 68 -18%,
-zero per-iteration regressions). Next per §1.6: a caller-saved capture
-base for a body with no helper call (the 2 W4 does not recover), then
+zero per-iteration regressions), and W6 (done 2026-09-22: the capture
+base is CALLER-saved in a call-free frameless body - 78 -1.30% Ir, 11
+-1.40%, 63 -0.32%; HALF the predicted step, see §1.6). Next per §1.6:
 E2 for 09.
 
 ### 1.1 What is DONE
@@ -508,7 +509,14 @@ work — but profile it before building, the way increment 0 was.
         parameter tails (done 2026-09-21: the noescape bit is baked, a
         non-slice reference is a raw copy with the flag set, the
         helper kept for a slice; myv v17 stores the bit - 76 -13.5%
-        Ir, 78 -2.5%).
+        Ir, 78 -2.5%), then W6 the CALLER-SAVED capture base (done
+        2026-09-22: a call-free frameless body's base joins no save
+        list - 78 -1.30% Ir, 11 -1.40%, 63 -0.32%. ⛔ HALF the step the
+        W4 record predicted: the entry's 16-alignment filler buys the
+        dropped push straight back, so the win is the exit's `pop`
+        alone; and `--xrot` caught the return arm's raw use of r11 on
+        the first run, which is why the base now carries a LIVE RANGE
+        ending at the terminal ReturnV).
     3.  E2 - drop the leaf rule. Serves 09_fib. GATE includes
         norec_enum --depth 4 (2272 programs x 4 engines), because a
         throw crossing a frameless frame is exactly its shape space.
