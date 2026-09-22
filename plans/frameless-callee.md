@@ -510,7 +510,11 @@ Each ends with a MEASUREMENT that can kill the next one.
      Ir: the two helper bodies; the emitted site grew by 4), 78's
      add(i) 17 -> 15 at the site (-2.5% Ir). The stored format learned
      the bit (myv v17). Record: *#97 increment 3, W5*. 76's remaining
-     tails and its four-slot arm scan wait on #25;
+     tails and its four-slot arm scan waited on #25 - ✅ DONE
+     2026-09-21 (record: the *#25* entry): `refs=[0 1]`, the callee
+     92 -> 76 per call, the site 112.5 -> 109.5, 76 -9.0% Ir - and the
+     same table fix read -23% on 60_bit_sieve, -20% on 14 and 86,
+     -18% on 68, none of them call benches;
    - the CAPTURE PROTOCOL: ✅ W4 (2026-09-21) - the frameless entry
      loads the capture data pointer from the FuncObject in rdx into
      the run's capbase register (one load), every access goes through
@@ -642,7 +646,8 @@ than leave it unclassified. ✅ DONE 2026-09-19, in two measured steps:
   for 780 - a loop counter in r13 fused and read from never-written
   memory); the element STORE family is absent from `visit_use_def`, so
   `compute_ref_slots` lists EVERY slot of any function with `a[i] = v`
-  (why a loop counter was a fusion candidate at all - NOT fixed here);
+  (why a loop counter was a fusion candidate at all - NOT fixed here;
+  fixed as #25 on 2026-09-21);
   and at K=4 the scan leaves a register unused under pressure
   (program B homes `c` while r15 sits idle; reproducible on the
   call-free twin with `MYLANG_JIT_MAXPINS=4`).

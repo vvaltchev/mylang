@@ -8378,6 +8378,71 @@ static bool visit_use_def(const Instr &in, U u, D d)
             u(in.target2);
         u(static_cast<int>(in.b_lit())); /* the value's SLOT (lit-encoded) */
         d(in.target); return true;
+    /*
+     * ⛔ THE ELEMENT-STORE FAMILY WAS A BARRIER UNTIL 2026-09-21 (#25) -
+     * eight ops, every one hitting `default:` for no reason but omission,
+     * exactly as `Throw` had (above). The cost was the largest this
+     * table has paid: `compute_ref_slots` BAILS on a barrier, so every
+     * chunk with an element store listed EVERY slot as reference-carrying
+     * - 76_funcval_dispatch's `st[0] = st[0] + x` body got `refs=[0 1 2
+     * 3]` for two ints and a none - and the E1 liveness, jit_fwd_info,
+     * the struct-fact KILL and compute_nonneg_slots all gave up at the
+     * store. Found by W3 (the newest consumer), the tenth shape again.
+     *
+     * THE CONTRACT, verified against vm.cpp's VM_CASEs and verify_chunk:
+     * a store READS its base, its keys and its value and WRITES NO FRAME
+     * SLOT. The base slot is read only when its KIND is local (the kind
+     * rides `target`: 1 global, 2 capture, anything else local -
+     * `vm_store_base`'s switch); a global or capture base names no frame
+     * slot at all, and reporting target2 as a use there would name an
+     * unrelated one. The keys and value are plain slots in the boxed
+     * forms (the VM reads `a_slot()`/`b_slot()` unconditionally),
+     * operands (slot or literal) in the flat int/float forms.
+     * StoreElem2V's `a` is a DUAL (k1 slot, chain_locs idx), its base is
+     * always a frame slot and its VALUE rides `target`.
+     *
+     * The two CHAIN forms stay barriers for a structural reason, not an
+     * omission: StoreElemChainV's keys are the run [b_lit, +nkeys) with
+     * nkeys the chain_locs entry's LENGTH, and a StoreLValueChainV
+     * subscript step's key is the frame temp its chain_steps entry names
+     * - both live in a POOL this Instr-only signature cannot reach.
+     * Zero corpus programs emit either (2026-09-21 census); the day one
+     * pays for it, the fix is a `const Chunk *` through every consumer.
+     *
+     * WHY "no def" IS RIGHT although the store can REWRITE the base slot:
+     * the COW paths (`clone_internal_vec` on a slice base,
+     * `clone_aliased_slices` on an aliased one, the dict/struct clones in
+     * vm_subscript_store / vm_member_store) replace the HANDLE inside the
+     * base slot's value, in place, type unchanged - an array stays an
+     * array of the same elements, a struct keeps its def. No consumer of
+     * a def can see that: liveness already has the base as a USE at the
+     * same pc; compute_ref_slots needs the base listed and it already is
+     * (whatever put the container there listed it, or it is a parameter
+     * seed); the C4d struct fact is (slot, def) and a same-def clone
+     * preserves it; a sign fact is about an int slot, never a container.
+     * Reporting a def would only KILL the struct fact at every member
+     * store for nothing. `jit_hoist_op_defs` (jit.cpp) already says the
+     * same of these ops: "no frame-slot writes".
+     *
+     * STILL BARRIERS, on purpose: the IncDec family, the Unpack family,
+     * MultiUnpackV, EmplaceStruct - those DO write frame slots through
+     * their pools, a different contract that needs its own audit.
+     */
+    case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
+        if (in.target != 1 && in.target != 2)
+            u(in.target2);
+        opnd(in.a()); opnd(in.b()); return true;
+    case OpCode::StoreElemValue: case OpCode::DictStore:
+        if (in.target != 1 && in.target != 2)
+            u(in.target2);
+        u(in.a_slot()); u(in.b_slot()); return true;
+    case OpCode::StoreMemberV:         /* a = the member_keys pool idx */
+        if (in.target != 1 && in.target != 2)
+            u(in.target2);
+        u(in.b_slot()); return true;
+    case OpCode::StoreElem2V:          /* base always a frame slot */
+        u(in.target2); u(in.a_dual_lo()); u(in.b_slot()); u(in.target);
+        return true;
     default:
         return false;                  /* BARRIER - reads everything */
     }

@@ -67,12 +67,14 @@ kept in `myv-fuzz-bad/` (git-ignored) - see the loader item in §3.
     75_indexed_unpack             0.208      0.024    8.79x
     76_funcval_dispatch           0.170      0.018    9.72x
 
-RESUMED 2026-09-21 with W4 (done) and W5 (done: the inline borrow at
+RESUMED 2026-09-21 with W4 (done), W5 (done: the inline borrow at
 the site, the arm's borrowed skip, the scalar parameter tails - 76
--13.5% Ir, 78 -2.5%). Next per §1.6: `visit_use_def` learning the
-element-store family (#25 - it is what keeps W3, the tails and the
-one-slot arm scan off 76), a caller-saved capture base for a body with
-no helper call (the 2 W4 does not recover), then E2 for 09.
+-13.5% Ir, 78 -2.5%) and #25 (done: `visit_use_def` learned six store
+ops - 76 -9.0% Ir with `refs=[0 1]` and a 76-instruction callee, and
+far more elsewhere: 60_bit_sieve -23%, 14 -20%, 86 -20%, 68 -18%,
+zero per-iteration regressions). Next per §1.6: a caller-saved capture
+base for a body with no helper call (the 2 W4 does not recover), then
+E2 for 09.
 
 ### 1.1 What is DONE
 
@@ -783,14 +785,19 @@ the SAME code a clean `MyvError` refusal uses, so `myv_fuzz.py` counted
 it clean while the release build segfaulted on the identical bytes. A
 sanitizer report in stderr is a CRASH now, whatever the exit code.
 
-**The table (task #25).** `visit_use_def` does not know the
-element-STORE family (StoreElemInt/Float/Value, StoreElem2V, the chain
-stores, DictStore): each hits its `default:` BARRIER. Found by W3, the
-newest consumer, exactly as CLAUDE.md's tenth shape predicts - it fails
-closed, so 76_funcval_dispatch's `st[0] = st[0] + x` body gets no init
-elision (3 Ir per call), and lever A, the E1 liveness and C5 give up
-inside every element-store loop in the corpus. Six consumers, so its
-own increment with its own measurement.
+**The table (task #25) - ✅ DONE 2026-09-21.** `visit_use_def` did not
+know the element-STORE family: each op hit its `default:` BARRIER.
+Found by W3, the newest consumer, exactly as CLAUDE.md's tenth shape
+predicts. Six ops audited (uses only, no defs - the COW rewrite of a
+base is in place, type unchanged); the two CHAIN forms stay barriers
+(their keys live in a pool the Instr-only signature cannot reach; zero
+corpus reach). Measured: 76 -9.0% Ir (the site's tails and the
+callee's C5-class store guards + two arm scans, 92 -> 76 per call),
+60_bit_sieve -23%, 14_array_subscript -20%, 86 -20%, 68_nested -18%,
+87 -14%, 38 -10%, 46 -7%, 90 -7%, 88 -6%; every other bench a
+compile-time constant. Record: docs/jit-optimizations.md, the *#25*
+entry. The residue this time: the chain forms, which need a
+`const Chunk *` through every consumer of the table.
 
 **Two caret residues, reported not fixed:** a LITERAL argument through
 a `dyn` callee still carets the argument list (a const-folded literal

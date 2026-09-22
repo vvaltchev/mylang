@@ -26688,6 +26688,158 @@ static const char *fwd_opcode_name(OpCode op)
  * That is the cliff this widening removes, so the case asserts it is
  * actually reached rather than hoping some corpus chunk is big enough.
  */
+/*
+ * #25 (2026-09-21): the ELEMENT-STORE family's rows in visit_use_def,
+ * pinned against the VM's OWN operand reads. Each store op is produced by
+ * a real shape, found by opcode in the compiled chunks, and its use/def
+ * answer (jit_op_slot_refs, the exported shim over the table) must be
+ * exactly the frame slots vm.cpp's VM_CASE reads - the base only when its
+ * KIND is local (a global's or capture's `target2` is not a frame slot),
+ * the keys, the value - and NO def at all (the COW paths rewrite the
+ * container handle in place, type unchanged; a def here would only kill
+ * a struct fact for nothing). VACUITY GUARDED: every op in the family and
+ * every base kind (local / global / capture) must appear, or the case
+ * that would have caught a wrong row was never compiled.
+ *
+ * Watched failing, three sabotage builds - and the finding is that THIS
+ * test is the only net: the value use dropped from StoreElemValue /
+ * DictStore, a def invented for a StoreElemInt base, and a global base's
+ * index reported as a frame slot each fail here (and the first also
+ * trips D3.b's interval qualification with an orphan event), while the
+ * 5-mode differential, corpus_diff and every value the corpus prints
+ * stayed GREEN on all three. A wrong row in this table costs
+ * optimizations silently or a miscompile only in a shape the corpus does
+ * not contain; the answers it produces are not an oracle for it.
+ */
+static bool use_def_store_family()
+{
+#if ML_JIT_SUPPORTED
+    const char *src =
+        "struct P { int x; int y; }\n"
+        "var garr = [0, 0, 0];\n"
+        "func gstore(int i) { garr[i] = i * 3; return garr[i]; }\n"
+        "var carr = [0, 0, 0];\n"
+        "var cst = func [carr] (int i) { carr[i] = i + 1; return carr[i]; };\n"
+        "var n = 0; n = n + runtime(3);\n"
+        "var a = array(n); var f = [0.0, 0.0, 0.0];\n"
+        "var g = [\"\", \"\", \"\"]; var d = {};\n"
+        "var m = [[0, 0], [0, 0]]; var p = P(1, 2);\n"
+        "var s = 0;\n"
+        "for (var i = 0; i < n; i++) {\n"
+        "  a[i] = i * 2;\n"                     /* StoreElemInt, slot value */
+        "  a[0] = 7;\n"                         /* StoreElemInt, both literal */
+        "  f[i] = i * 1.5;\n"                   /* StoreElemFloat */
+        "  g[i] = str(i);\n"                    /* StoreElemValue */
+        "  d[str(i)] = i;\n"                    /* DictStore */
+        "  m[i % 2][1] = i;\n"                  /* StoreElem2V */
+        "  p.x = p.x + i;\n"                    /* StoreMemberV */
+        "  s = s + gstore(i) + cst(i);\n"
+        "}\n"
+        "print(s, sum(a), sum(f), g[1], d[\"1\"], m[1][1], p.x);\n";
+    std::vector<Tok> toks;
+    lexer(src, 1, toks);
+    ParseContext pctx(TokenStream(toks), true);
+    unique_ptr<Construct> root = pBlock(pctx);
+    mark_implicit_globals(root.get(), {});
+    infer_types(root.get(), true);
+    run_optimizers(root.get());
+    VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+
+    std::vector<const Chunk *> chunks;
+    chunks.push_back(&prog.root);
+    for (const auto &fd : prog.funcs)
+        if (fd->vm_chunk)
+            chunks.push_back(static_cast<const Chunk *>(fd->vm_chunk));
+
+    /* what the VM reads, per op - written from vm.cpp's VM_CASEs */
+    const auto expected = [](const Instr &in, std::vector<int> &want)
+        -> bool {
+        want.clear();
+        const auto local_base = [&](int_type kind) {
+            if (kind != 1 && kind != 2)
+                want.push_back(static_cast<int>(in.target2));
+        };
+        switch (in.op) {
+        case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
+            local_base(in.target);
+            if (!in.a_is_lit()) want.push_back(in.a_slot());
+            if (!in.b_is_lit()) want.push_back(in.b_slot());
+            return true;
+        case OpCode::StoreElemValue: case OpCode::DictStore:
+            local_base(in.target);
+            want.push_back(in.a_slot());
+            want.push_back(in.b_slot());
+            return true;
+        case OpCode::StoreMemberV:
+            local_base(in.target);
+            want.push_back(in.b_slot());
+            return true;
+        case OpCode::StoreElem2V:
+            want.push_back(static_cast<int>(in.target2));
+            want.push_back(in.a_dual_lo());
+            want.push_back(in.b_slot());
+            want.push_back(static_cast<int>(in.target));
+            return true;
+        default:
+            return false;
+        }
+    };
+
+    int seen_op[6] = { 0, 0, 0, 0, 0, 0 };
+    int seen_kind[3] = { 0, 0, 0 };
+    bool seen_lit = false;
+    for (const Chunk *ck : chunks)
+        for (size_t p = 0; p < ck->code.size(); p++) {
+            const Instr &in = ck->code[p];
+            std::vector<int> want;
+            if (!expected(in, want))
+                continue;
+            switch (in.op) {
+            case OpCode::StoreElemInt:   seen_op[0]++; break;
+            case OpCode::StoreElemFloat: seen_op[1]++; break;
+            case OpCode::StoreElemValue: seen_op[2]++; break;
+            case OpCode::DictStore:      seen_op[3]++; break;
+            case OpCode::StoreMemberV:   seen_op[4]++; break;
+            default:                     seen_op[5]++; break;
+            }
+            if (in.op != OpCode::StoreElem2V)
+                seen_kind[in.target == 1 ? 1 : in.target == 2 ? 2 : 0]++;
+            if (in.op == OpCode::StoreElemInt && in.a_is_lit()
+                    && in.b_is_lit())
+                seen_lit = true;
+            std::vector<int> uses, defs;
+            if (!jit_op_slot_refs(in, uses, defs)) {
+                printf("  pc %zu (op %d): still a BARRIER\n", p, (int)in.op);
+                return false;
+            }
+            std::sort(uses.begin(), uses.end());
+            std::sort(want.begin(), want.end());
+            if (uses != want || !defs.empty()) {
+                printf("  pc %zu (op %d): uses/defs differ from the VM's "
+                       "reads (uses %zu vs %zu wanted, defs %zu)\n",
+                       p, (int)in.op, uses.size(), want.size(),
+                       defs.size());
+                return false;
+            }
+        }
+    for (int k = 0; k < 6; k++)
+        if (!seen_op[k]) {
+            printf("  VACUOUS: store op #%d never compiled\n", k);
+            return false;
+        }
+    for (int k = 0; k < 3; k++)
+        if (!seen_kind[k]) {
+            printf("  VACUOUS: base kind %d never compiled\n", k);
+            return false;
+        }
+    if (!seen_lit) {
+        printf("  VACUOUS: no all-literal StoreElemInt\n");
+        return false;
+    }
+#endif
+    return true;
+}
+
 static bool jit_slot_liveness_check()
 {
 #if ML_JIT_SUPPORTED
@@ -26718,10 +26870,18 @@ static bool jit_slot_liveness_check()
           "func h(int n) { var r = n * 3; return r + 1; }\n"
           "var acc = 0;\nfor (var i = 0; i < runtime(5); i++)"
           " { var v = h(i); acc = acc + v; }\nprint(acc);\n" },
-        /* an ARRAY ELEMENT STORE: StoreElemInt is one of the 35
-         * opcodes visit_use_def does not name, so it is a BARRIER and
-         * this case is what makes check (2) non-vacuous. */
-        { "array element store (an UNAUDITED op)",
+        /* a MULTI-ASSIGN: MultiUnpackV writes its targets through a
+         * POOL, so visit_use_def does not name it - a BARRIER, and this
+         * case is what makes check (2) non-vacuous. (It was an array
+         * element store until #25 audited that family, 2026-09-21; the
+         * store case stays below as an AUDITED op, exercising (1).) */
+        { "multi-assign (an UNAUDITED op)",
+          "var lim = 0; lim = lim + runtime(4);\n"
+          "var p = [lim, lim + 1];\n"
+          "var x = 0; var y = 0;\n"
+          "for (var i = 0; i < lim; i++) { x, y = p; x = x + i; }\n"
+          "print(x + y);\n" },
+        { "array element store (audited since #25)",
           "var lim = 0; lim = lim + runtime(4);\n"
           "var a = array(lim);\n"
           "for (var i = 0; i < lim; i++) { a[i] = i * 2; }\n"
@@ -38535,8 +38695,17 @@ static bool arg_inplace_shapes()
     };
 
     /* FUSES: an array in a named local, passed to a several-statement
-     * callee (a small body would be inlined and leave no call at all). */
+     * callee (a small body would be inlined and leave no call at all).
+     * ⛔ Since #25 (2026-09-21) this LEAF callee is FRAMELESS: its
+     * `a[0] = v` used to be a use-def BARRIER that made compute_ref_slots
+     * list every slot (`refs=[0..6]`, "ref_slots too many"), which is
+     * what kept it on the generic push and its argfuse. The W2 frameless
+     * site binds a reference straight from the caller slot by
+     * construction (W5 borrows it inline), so the property this case
+     * asserts - no staging move - holds through the other counter now.
+     * The generic push's OWN fusion is the next case. */
     unsigned long b0 = g_jit_arg_inplace;
+    unsigned long f0 = g_jit_frameless_pushes;
     if (!run({ "func addto(a, x) {",
                "  var t = a[0] + x;",
                "  var u = t * 2;",
@@ -38548,9 +38717,30 @@ static bool arg_inplace_shapes()
                "for (var i = 0; i < 40; i++) addto(st, i);",
                "assert(st[0] == 780);" }))
         return false;
-    if (g_jit_arg_inplace <= b0)
+    if (g_jit_frameless_pushes <= f0 && g_jit_arg_inplace <= b0)
         return fail("the array argument was NOT bound in place",
                     g_jit_arg_inplace - b0);
+
+    /* FUSES on the GENERIC push: the same body made a NON-leaf by a
+     * (never taken) self-call, which the frameless gate refuses and the
+     * bytecode splice cannot remove - so the call keeps the inline push,
+     * whose #162 arm binds the array straight from `st`'s slot. */
+    b0 = g_jit_arg_inplace;
+    if (!run({ "func addto(a, x) {",
+               "  if (x > 1000) { return addto(a, x - 1000); }",
+               "  var t = a[0] + x;",
+               "  var u = t * 2;",
+               "  var v = u - t;",
+               "  a[0] = v;",
+               "  return v;",
+               "}",
+               "var st = [0];",
+               "for (var i = 0; i < 40; i++) addto(st, i);",
+               "assert(st[0] == 780);" }))
+        return false;
+    if (g_jit_arg_inplace <= b0)
+        return fail("the array argument was NOT bound in place by the "
+                    "generic push", g_jit_arg_inplace - b0);
 
     /* DECLINES - NEITHER argument is a staging move: the fresh CALL
      * RESULT and the LITERAL are written into the run slots by their own
@@ -41846,6 +42036,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the OPCODE-TABLE CENSUS - every opcode decided against the "
       "six opcode-keyed optimization tables, vs the live predicates (#98)",
       opcode_table_census },
+    { "jit: the ELEMENT-STORE family's use/def rows match the VM's own "
+      "operand reads, no defs, every op and base kind seen (#25)",
+      use_def_store_family },
     { "jit: the all-slot LIVE RANGES agree with the temps-only analysis "
       "they generalise, and clear its 64-temp cliff (#96)",
       jit_slot_liveness_check },
