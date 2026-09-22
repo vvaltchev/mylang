@@ -178,6 +178,7 @@ def main(path):
             r.uid(); r.u8(); r.u32(); r.loc(); r.loc()
         r.boolv(); r.u32(); r.u32()
         for _ in range(6): r.boolv()   # pure/effective/cache/pure_ctx/tmpl/fast
+        r.i64()                                   # noescape_params (v17)
         has_chunk.append(r.boolv())
     chunk(r)                                      # section 9: root
     nfunc = 0

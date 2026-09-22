@@ -13113,3 +13113,159 @@ clock), 09/10/12/35/75 0.97-1.00x, geomean cur/base 0.997x over 90;
 moved twice its Ir cut again: the capture read went from three
 dependent loads through ctx to one register-relative load, and that is
 the latency the counter closure's loop sits on.
+
+## #97 increment 3, W5 - THE INLINE BORROW AT THE FRAMELESS SITE, the
+## arm's borrowed skip, and the proven-scalar parameter tails dropped
+## (2026-09-21)
+
+**What it is.** Three things a frameless call still paid for a
+parameter it had already proven something about:
+
+ - **a REFERENCE argument bound through `jit_bind_ref_arg`** - ten
+   emitted instructions around a helper (`push rdx; push r9; lea rsi;
+   lea rdi; mov rdx, noesc; call; pop; pop; mov r10, rsp`) whose body
+   decided at RUN time, from the descriptor's `noescape_params` bit and
+   the value's kind, whether to retain or to borrow (#94's
+   `vm_bind_arg`). At a frameless site the callee is BAKED, so the bit
+   is an EMIT-time fact - the third of the conditions the archived
+   inline-borrow-arm plan named for re-introducing the arm ("the bit
+   becomes bakeable"), and unlike the 2026-08-15 attempt the arm is
+   emitted only at the sites that TAKE it, not at every reference slot
+   of every push. Under W5 a non-escaping parameter's reference arm is
+   `cmp r11, t_arr; jne copy; cmp byte [src+slice_off], 0; jne helper;
+   copy: <4 qwords>; mov byte [dst+borrowed], 1` - a raw bit-copy with
+   the flag set (`LValue::borrow_from`'s exact shape), NO retain, and
+   the helper kept for exactly ONE decline: an ARRAY whose slice flag is
+   set (#94's rule - a slice registers itself in its parent's live-slice
+   set when COPIED, and an element write to the parent detaches every
+   registered view; a borrowed view is in no such set). Every other
+   reference type's copy is a plain retain with no registration, so the
+   bit-copy is its twin. The slice byte is read off the SOURCE SLOT
+   (`s + L.slice_off`, the SharedArrayObj sits inline in the payload -
+   the element tiers' own test), not through the object pointer: the
+   first version dereferenced `[slot]` and read a byte of the
+   SharedObject, and reached the inline arm for nothing on 76 until the
+   reach counter said 0;
+ - **the ARM's release of a borrowed slot** - the release scan tested
+   the type (`jl skip`) and called `jit_release_slot` on every
+   reference, whose `frame_release` then found `borrowed` and only
+   reset the slot: a helper call to do nothing, on a slot about to be
+   given back with the window. The arm now tests the flag byte inline
+   after the type test (`cmp byte [rbx+d+borrowed], 0; jne skip`) and
+   the helper is called only for a RETAINED reference;
+ - **the TAILS of a proven-scalar parameter** - `mov [r10+d+32], 0;
+   mov [r10+d+40], 0` per parameter, zeroing `container`,
+   `container_idx`, `is_const` and `borrowed` for a slot the fill then
+   writes payload and type into and nothing reads further: W3's
+   derivation (`Chunk::frameless_init_free`) already knows which
+   parameter slots are raw-written and unlisted, and the site masks its
+   parameter bits out of the mask it applies to the locals - so the
+   answer was computed and thrown away. The site reads it now
+   (`tail_free`). A LISTED parameter keeps its tails, and must: the
+   bind helper's `ML_CHECK(!borrowed)` and the inline arm's flag store
+   both rely on a zeroed tail, and a reference parameter is always
+   listed (`ref_seeds`).
+
+**The stored format had to learn the bit (myv v17).** `noescape_params`
+was computed by the resolver and never written to an image: a LOADED
+program's descriptors all read 0, so its frameless sites bound every
+reference through the helper with `noesc = 0` - a retain where the
+fresh compile borrowed - and `myv_round_trip` (a loaded image's `-vdj`
+vs a fresh compile's) failed the moment the site started baking the
+bit. Section 8 of `docs/myv-format.txt` gained the `i64` after the six
+bools, `tests/myv_doc_check.py` consumes it, the version is 17. That
+the pre-W5 loader ran correctly with the field missing is the #94
+design working as intended - a false "escapes" costs a retain, never a
+count - and it is also why nothing had noticed for six weeks.
+
+**The expected dump, and the dump** (the perf build, W4's tree
+`fdcac9e` as the base; `scripts/jitprofile.py --listing` on the
+EXECUTED path, so these are the instructions that ran, not the ones
+emitted):
+
+    76 (st, a non-slice array, non-escaping; two tails per site):
+      site, the reference arm    10 -> 14   the helper's ten become the
+                                            inline fourteen
+      C++ per call              ~37 ->  0   vm_bind_arg + frame_release
+      arm                        --         same count: cmp/jne replaces
+                                            lea/call, the helper gone
+      -------------
+      per call                        -33   (32,996,248 Ir / 1,000,000)
+
+    78 (i, a proven-int parameter, two frameless calls per iteration):
+      site                       17 -> 15   the two tail stores
+      -------------
+      per call                         -2   (4,000,191 Ir / 2,000,000)
+
+Callgrind (OPT=1 ASSERTS=0, -npc, scale 1, vs `build-claude/base-w4`):
+76 **-13.45%**, 78 **-2.54%**, 63 -0.43%, and 11/09/12/34/35/58/64/73/75
+flat to the instruction (|delta| < 500 Ir, compile-side). 76's split
+is the instructive one: its emitted code grew by 4 per call
+(200.5M -> 204.5M in fragments) while the C++ side lost 37
+(53.4M -> 16.6M), so the win is entirely the two helper bodies, and an
+emitted-code count alone would have called this a regression - the
+same lesson as the -vdj-only costing #97 opened with.
+
+**What 76 still pays, and why W5 cannot take it.** Its window keeps
+all four tails and its arm scans four slots because `compute_ref_slots`
+bails to every slot on the `StoreElemInt` barrier (`refs=[0 1 2 3]`,
+task #25 - `visit_use_def` does not know the element-store family).
+The borrowed test is behind the type test, so the three scalar slots
+cost the arm nothing extra; the tails are 8 stores per call that #25
+removes without touching this code.
+
+**Nets.** `jit_frameless_w5_shape` reads 76's dump for the inline
+sequence (the array compare, the slice byte test on the SOURCE slot,
+the four-qword copy, the flag store), the helper decline behind it, and
+the arm's flag test in `add_op$0`; the W2 shape test's tail pins moved
+to the W5 form (no `[r10+0x20]/[0x28]` stores for a scalar parameter).
+Four reach cases on both engines: a SLICE at a frameless site declining
+to the helper with the base mutated between calls (`arg_borrow_slice`
+counts, `borrow_inline` does not); an array plus a string borrowed
+inline with `refcount` read before and after (the borrow takes no
+count); and the TWO shapes that make a raw-copied slice OBSERVABLE,
+which the first case is not - a slice parameter beside its parent with
+the parent written INSIDE the call (a registered view is detached by
+the write and reads the old value, an unregistered one the new), and an
+element write THROUGH the slice parameter (its COW clone releases a
+count the borrow never took, and the caller's handle dangles). Both
+keep the callee under `RET_REF_GUARD_MAX` only because they are this
+small: an element store makes `compute_ref_slots` bail to every slot
+(#25), and the first attempt at each was refused as "ref_slots too
+many" and quietly ran through the C++ tier - `frameless_pushes 1`, for
+`mk`, was the tell. `jit_ref_arg_bind` and `jit_borrow_arg_shapes`
+count `arg_borrow + borrow_inline` as one number, since which arm
+serves a borrow is now an emit-time choice the tests must not depend
+on. `myv_round_trip` covers v17. Watched failing, one sabotage build
+each (`scratchpad/w5-sabotage.sh`, cp-aside restore with the rebuild
+inside): the slice test made always-false, so a slice goes inline (the
+parent-written case prints the new value, the write-through case is an
+ASan heap-use-after-free in `jit_load_elem_int`, and the two #94 borrow
+tests fail; ⛔ the FIRST spelling of this sabotage compared the byte
+against 99 and so sent EVERY array to the helper - the opposite
+direction, which only the shape test noticed - a sabotage must be read
+for which way it turns the branch); the flag byte not stored (ASan
+heap-use-after-free: the arm releases a borrowed count); the arm's flag
+test dropped (the refcount case and `jit_frameless_call_reach`'s
+"refcount back to 1" assertion - a double release).
+
+**Wall clock, one 1-vs-1 run at the end of the task (W5 vs W4's tree
+`fdcac9e`, kept as `build-claude/base-w4`; `bench/run.py --mylang
+build-claude/perf/mylang --baseline build-claude/base-w4/mylang`,
+-npc, both OPT=1 ASSERTS=0):** 76 **0.80x**, 78 **0.94x**, 11/12/34/
+35/58/63/64/73/75 0.99-1.01x, geomean cur/base 0.998x over 90. Unlike
+the guard-elision family this one's clock follows its Ir: what W5
+deletes is two helper BODIES per call (a call, a prologue, `vm_bind_arg`'s
+kind dispatch, `frame_release`'s flag test) rather than predicted
+branches over L1 hits, and 76's 20% is the largest single wall-clock
+move of increment 3.
+
+**A finding beside the point, recorded not fixed.** `myv_fuzz` on the
+ASSERTS=0 build crashed once in 3200 mutations (`fat-486.myv`): a
+single byte turns a `LoadLiteralObjV` into a `PopHandler` with no
+`PushHandler` before it, and `act.handlers.pop_back()` runs on an empty
+vector - pre-existing, reached because v17 shifted the seeded mutation
+space, task #26's third finding (docs/in-flight-tasks.md §3d). The
+debug lane had counted the same mutation CLEAN: UBSan exits 1, exactly
+as a `MyvError` refusal does. `myv_fuzz.py` treats a sanitizer report
+as a crash now.

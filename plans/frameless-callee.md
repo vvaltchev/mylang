@@ -500,6 +500,17 @@ Each ends with a MEASUREMENT that can kill the next one.
    record: docs/jit-optimizations.md *#97 increment 3, W1*; it puts
    every per-callee decision at the site), then the fusion it enables
    (W2), then the init elision and the capture base at the site:**
+   - the BIND of a REFERENCE argument and the parameter tails: ✅ W5
+     (2026-09-21) - the callee is baked, so `noescape_params` is an
+     emit-time bit and the site borrows inline (a raw four-qword copy
+     with the flag byte set; an ARRAY whose slice byte is set is the
+     one decline, to the helper), the arm tests the flag byte before
+     calling the release helper, and a proven-scalar parameter's two
+     tail stores go (W3's mask already knew). 76 -33 per call (-13.5%
+     Ir: the two helper bodies; the emitted site grew by 4), 78's
+     add(i) 17 -> 15 at the site (-2.5% Ir). The stored format learned
+     the bit (myv v17). Record: *#97 increment 3, W5*. 76's remaining
+     tails and its four-slot arm scan wait on #25;
    - the CAPTURE PROTOCOL: ✅ W4 (2026-09-21) - the frameless entry
      loads the capture data pointer from the FuncObject in rdx into
      the run's capbase register (one load), every access goes through

@@ -8,6 +8,15 @@ step by step if the core changes enough to make it pay.
 
 **The tests it came with were KEPT.** Only the optimization was undone.
 
+**UPDATE 2026-09-21: condition 3 below ("the bit becomes bakeable") came
+true and the arm is BUILT at that one place** - the FRAMELESS site of
+#97 increment 3 (W5), where the callee is a baked descriptor and
+`noescape_params` is read at emit time; the arm is emitted only at the
+sites that take it, so a bench that never borrows pays no bytes. 76
+-13.5% Ir, the whole cut being the two helper bodies. The generic push
+still binds through `jit_bind_ref_arg`, exactly as this file leaves it.
+Record: docs/jit-optimizations.md, *#97 increment 3, W5*.
+
 ## The commits
 
 | SHA | what |
