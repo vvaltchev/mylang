@@ -125,6 +125,20 @@ def run(binary, path, timeout, args=()):
         return None, ''
 
 
+# A sanitizer finding is a CRASH whatever the exit code. ASan and UBSan
+# (the latter under -fno-sanitize-recover) both report and then exit 1 -
+# the SAME code a clean MyvError refusal uses - so the debug lane counted
+# a real out-of-range read as a clean refusal while the ASSERTS=0 build
+# segfaulted on the identical mutation (2026-09-21, a PopHandler with no
+# handler pushed). The exit code cannot tell the two apart; the report can.
+SANITIZER_MARKS = ('runtime error:', 'AddressSanitizer', 'LeakSanitizer',
+                   'UndefinedBehaviorSanitizer')
+
+
+def sanitizer_hit(err):
+    return any(m in err for m in SANITIZER_MARKS)
+
+
 def save(savedir, name, i, blob):
     os.makedirs(savedir, exist_ok=True)
     path = os.path.join(savedir, '%s-%d.myv' % (name, i))
@@ -161,7 +175,7 @@ def sweep(binary, name, src, n, seed, timeout, triage, tmp, savedir):
                         if lrc == 0 else ' [hung during LOAD - a real bug]')
             print('  HANG   #%d mode=%d%s  -> %s'
                   % (i, mode, note, save(savedir, name, i, blob)))
-        elif rc < 0 or rc not in (0, 1):
+        elif rc < 0 or rc not in (0, 1) or sanitizer_hit(err):
             crashes += 1
             print('  CRASH  #%d mode=%d rc=%d  %s  -> %s'
                   % (i, mode, rc, err[:200], save(savedir, name, i, blob)))
