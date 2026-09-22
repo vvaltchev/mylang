@@ -1188,7 +1188,17 @@ collision). Three nets now:
   ref-listed and written ONLY by ops in `jit_instr_stores_dst_raw` -
   a per-INSTRUCTION whitelist an op joins only when EVERY tier of its
   emission stores the dst raw; a TESTS build poisons such a slot with
-  `jit_poison_type`, so a wrong row aborts by name; W5: a frameless
+  `jit_poison_type`, so a wrong row aborts by name. ⛔ AND "written
+  only by raw ops" is VACUOUSLY true of a slot NO op writes
+  (2026-09-22, myv_fuzz small-60 on a v18 image): a mutated ctor dst
+  left `p` unwritten, the site left it uninitialised, `p.x` read stale
+  stack whose type word said "dict" - a SEGV in both builds. The site
+  now also subtracts `Chunk::frameless_read_first` (a definitely-
+  written dataflow over the CFG, `chunk_read_before_write`) from the
+  LOCAL half; a parameter's bit is ignored - the fill writes it.
+  `jit_chunk_frameless_derive` is the ONE derivation point for the
+  three frameless facts (codegen, the splice, the loader). Emitted code
+  byte-identical corpus-wide; W5: a frameless
   site BORROWS a non-escaping reference INLINE - the callee is baked,
   so `noescape_params` is an emit-time bit - as a raw copy with the
   `borrowed` byte set, declining ONLY an array whose slice byte is set

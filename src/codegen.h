@@ -348,6 +348,16 @@ void verify_handler_sites(const Chunk &chunk);
 const char *handler_balance_fault(const Chunk &chunk, size_t *at_pc);
 
 /*
+ * The frame slots some path can READ before any instruction WROTE them
+ * (a bit per slot; a barrier op makes it every slot). W3's init-free
+ * derivation subtracts it: a slot the frameless site leaves
+ * uninitialised must be written before it is read on EVERY path, and
+ * "every write is raw" is vacuously true of a slot with no write at all
+ * (myv_fuzz small-60, 2026-09-22 - a SEGV on a mutated image).
+ */
+uint64_t chunk_read_before_write(const Chunk &chunk);
+
+/*
  * #137: the bounds every operand of a chunk's instructions is measured
  * against. Everything here is EXTERNAL to the Chunk - the frame the VM will
  * actually build, and three program-wide tables - so a corrupt image cannot

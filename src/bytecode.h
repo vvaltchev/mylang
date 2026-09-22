@@ -1945,6 +1945,20 @@ struct Chunk {
      */
     uint64_t frameless_init_free = 0;
     /*
+     * 2026-09-22 (myv_fuzz small-60): bit `s` set = some path READS
+     * window slot `s` before any instruction has WRITTEN it
+     * (`chunk_read_before_write`, codegen.h). The frameless SITE
+     * subtracts it from the LOCAL half of `frameless_init_free`:
+     * "written only by raw ops" is vacuously true of a slot no op
+     * writes, and such a slot left uninitialised is a read of stale
+     * stack - which codegen never emits and a mutated image did. A
+     * parameter's bit is set by construction (the bind is no
+     * instruction) and is IGNORED - the fill writes every parameter.
+     * Derived with the two above (`jit_chunk_frameless_derive`), never
+     * stored.
+     */
+    uint64_t frameless_read_first = 0;
+    /*
      * #97 increment 3 (W4): this chunk's frameless callee runs without
      * ctx.captures being repointed to its FuncObject's capture slots - the
      * site skips the repoint, the return arm the restore, and the

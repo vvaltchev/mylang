@@ -29077,6 +29077,131 @@ static bool jit_frameless_w2_shape()
  * The RELEASE form (no poison, the slots simply absent from the site)
  * is pinned by tests/driver_checks.sh against a non-TESTS binary.
  */
+/*
+ * W3's derivation and a slot that is READ BUT NEVER WRITTEN (2026-09-22,
+ * myv_fuzz small-60 on the v18 images): `jit_chunk_frameless_init_free`
+ * asked only that every WRITE of a slot be raw, so a slot with no write
+ * at all kept its init-free bit - vacuously - and the frameless site
+ * left it uninitialised. Codegen never emits that shape (a local is
+ * declared before use, a temp written before read), but one mutated
+ * `StructCtorV` dst does: `p` is never written, `p.x` reads raw stack
+ * whose stale type word said "dict", and `member_read_core` retained
+ * a garbage pointer - a SEGV in BOTH builds where `-nj` raised a clean
+ * TypeErrorEx. The derivation now also requires every READ of the slot
+ * to be preceded by a write on every path (a definitely-written
+ * dataflow over the CFG, `chunk_read_before_write`, codegen.h). This
+ * test builds the mutated shape in process - the ctor retargeted to a
+ * temp - and requires the read-first slot OUT of the mask on the
+ * mutated chunk, and the derivation on the INTACT chunk unchanged (the
+ * rule costs our own output nothing: emitted code byte-identical
+ * corpus-wide, vdjcmp).
+ */
+static bool jit_frameless_init_free_read_first()
+{
+#if ML_JIT_SUPPORTED
+    const char *lines_arr[] = {
+        "struct P { int x; }",
+        "func f(int a) { var p = P(a); return p.x + 1; }",
+        "var t = 0;",
+        "for (var i = 0; i < runtime(3); i++) t = t + f(i);",
+        "print(t);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        Chunk *fck = nullptr;
+        for (const auto &d : prog.funcs)
+            if (d->vm_chunk && d->name && d->name->val == "f")
+                fck = static_cast<Chunk *>(const_cast<void *>(d->vm_chunk));
+        Instr *ctor = nullptr;
+        Instr *rd = nullptr;
+        if (fck)
+            for (Instr &in : fck->code) {
+                if (in.op == OpCode::StructCtorV && !ctor) ctor = &in;
+                if (in.op == OpCode::LoadMemberInt && !rd) rd = &in;
+            }
+        if (!fck || !ctor || !rd || rd->target2 != ctor->target
+                || ctor->target >= fck->slot_count) {
+            fprintf(stderr, "init_free_read_first: the shape did not "
+                            "lower as expected\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        const int p_slot = static_cast<int>(ctor->target);
+        /* what the SITE reads for the local half: init_free minus the
+         * read-first set (a parameter's read-first bit is ignored there) */
+        const auto local_free = [&]() {
+            jit_chunk_frameless_derive(*fck);
+            return fck->frameless_init_free & ~fck->frameless_read_first;
+        };
+        const uint64_t intact = local_free();
+        /* `p` is written by a ctor (not a raw-storing op), so it is not
+         * init-free on the intact chunk either - the point is what the
+         * MUTATED chunk says once no write of it exists at all */
+        if ((intact >> p_slot) & 1) {
+            fprintf(stderr, "init_free_read_first: p is init-free on the "
+                            "intact chunk (a ctor is not a raw store)\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        const Instr keep = *ctor;
+        const std::vector<int32_t> refs_keep = fck->ref_slots;
+        const FuncDescriptor *fdesc = nullptr;
+        for (const auto &d : prog.funcs)
+            if (d->vm_chunk == fck)
+                fdesc = d.get();
+        ctor->target = fck->slot_count;          /* the first temp */
+        /* as the LOADER sees it: ref_slots derived from the mutated code
+         * (v18), so `p` - now written by nothing - is unlisted too */
+        std::vector<int32_t> seeds;
+        ref_seeds_of(*fdesc, seeds);
+        compute_ref_slots(*fck, &seeds);
+        const bool p_listed =
+            std::find(fck->ref_slots.begin(), fck->ref_slots.end(), p_slot)
+            != fck->ref_slots.end();
+        const uint64_t mutated = local_free();
+        *ctor = keep;
+        fck->ref_slots = refs_keep;
+        if (p_listed) {
+            fprintf(stderr, "init_free_read_first: p still ref-listed "
+                            "after the derivation - the shape is not the "
+                            "loader's\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        if ((mutated >> p_slot) & 1) {
+            fprintf(stderr, "init_free_read_first: a slot READ but never "
+                            "WRITTEN is init-free (mask %#llx, slot %d)\n",
+                    (unsigned long long)mutated, p_slot);
+            ok = false;
+        }
+        if (local_free() != intact) {
+            fprintf(stderr, "init_free_read_first: the restore changed the "
+                            "answer\n");
+            ok = false;
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "init_free_read_first: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_frameless_w3_shape()
 {
 #if ML_JIT_SUPPORTED
@@ -42373,6 +42498,10 @@ static const std::vector<extra_check> extra_checks =
       "window slot UNINITIALISED (poisoned in this build): a kept "
       "t_none immediate beside two poisoned slots, read from the dump",
       jit_frameless_w3_shape },
+    { "jit: #97 inc 3 (W3) - a slot READ but never WRITTEN is not "
+      "init-free: the definitely-written dataflow (myv_fuzz small-60, "
+      "a mutated ctor dst left `p` uninitialised in the window)",
+      jit_frameless_init_free_read_first },
     { "jit: #97 inc 3 (W4) - the capture base from the site: a "
       "capture-free callee's site goes from the residue push to the "
       "call, a reference capture's helper arms take the base register, "

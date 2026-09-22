@@ -8383,6 +8383,34 @@ uint64_t jit_chunk_frameless_init_free(const Chunk &ck)
     return mask;
 }
 
+/*
+ * ⛔ THE ONE DERIVATION POINT for a chunk's frameless facts (2026-09-22):
+ * `frameless_ok`, `frameless_init_free` and `frameless_read_first`. It
+ * used to be three call-site pairs (codegen_chunk, the bytecode splice's
+ * re-derivation, the image loader), and the third fact is what made a
+ * fourth copy one too many.
+ *
+ * `frameless_read_first` is the slot set some path can READ before any
+ * instruction WROTE it (`chunk_read_before_write`, codegen.h - a MUST
+ * dataflow over the CFG). W3's rule "every write is raw" is vacuously
+ * true of a slot with NO write at all, which codegen never emits but one
+ * mutated `StructCtorV` dst did (myv_fuzz small-60 on the v18 images):
+ * `p` was never written, the site left it uninitialised, and `p.x` read
+ * stale stack whose type word said "dict" - a SEGV in both builds where
+ * `-nj` raised a clean TypeErrorEx. The SITE subtracts this set from
+ * the LOCAL half of init_free only: a parameter is read-first by
+ * construction (the BIND writes it, which is no instruction) and the
+ * fill writes every parameter, so its tail elision (W5) stays. The
+ * chunk does not know its parameter count; the site does. Codegen's own
+ * output loses nothing: emitted code byte-identical corpus-wide.
+ */
+void jit_chunk_frameless_derive(Chunk &ck)
+{
+    ck.frameless_ok = jit_chunk_frameless_ok(ck);
+    ck.frameless_init_free = jit_chunk_frameless_init_free(ck);
+    ck.frameless_read_first = chunk_read_before_write(ck);
+}
+
 #ifdef TESTS
 /* the raw whitelist, for the -rt subset check (see above) */
 bool jit_test_instr_stores_dst_raw(const Instr &in)
@@ -8679,7 +8707,8 @@ static void emit_frameless_window(Emitter &e, const Instr &in,
      * the tails, then the tag stores (which use it as scratch only off
      * the arena) */
     const uint64_t free = nargs >= 64 ? 0
-        : cck.frameless_init_free & ~((uint64_t(1) << nargs) - 1);
+        : (cck.frameless_init_free & ~cck.frameless_read_first)
+              & ~((uint64_t(1) << nargs) - 1);
     const auto skipped = [&](int sl) { return (free >> sl) & 1; };
     bool any_tail = false;
     for (int sl = nargs; sl < total; sl++)
@@ -28719,6 +28748,13 @@ bool jit_chunk_frameless_ok(const Chunk &)
 uint64_t jit_chunk_frameless_init_free(const Chunk &)
 {
     return 0;       /* no frameless site to read it */
+}
+
+void jit_chunk_frameless_derive(Chunk &ck)
+{
+    ck.frameless_ok = false;
+    ck.frameless_init_free = 0;
+    ck.frameless_read_first = 0;
 }
 
 void jit_mark_frameless_wanted(const Chunk &, const JitCtx *)

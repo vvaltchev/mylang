@@ -2243,8 +2243,7 @@ void vm_jit_loaded_image(VmProgram &prog)
          * so it must exist before main is jitted. Left at its loaded
          * default (false) it made a loaded image's main 649 bytes bigger
          * than the fresh compile's, which myv_round_trip caught. */
-        ck.frameless_ok = jit_chunk_frameless_ok(ck);
-        ck.frameless_init_free = jit_chunk_frameless_init_free(ck);  /* W3 */
+        jit_chunk_frameless_derive(ck);          /* W3, small-60 */
     });
 
     std::vector<const FuncDescriptor *> slot_desc(

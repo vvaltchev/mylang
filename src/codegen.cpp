@@ -9970,6 +9970,94 @@ const char *handler_balance_fault(const Chunk &chunk, size_t *at_pc)
     return fault;
 }
 
+/*
+ * THE READ-BEFORE-WRITE SLOTS (2026-09-22, myv_fuzz small-60): the frame
+ * slots some path can READ before any instruction has WRITTEN them. A
+ * forward MUST dataflow of "definitely written" over the chunk's CFG:
+ * entry pcs (pc 0, every handler body pc and finally pc - a dispatch
+ * arrives with no history this walk modelled) start with NOTHING
+ * written; each op first reads its uses - one not in the state is
+ * read-first - then adds its defs; a join is the INTERSECTION of its
+ * predecessors' states (the fixpoint starts at TOP and only shrinks,
+ * which is what lets a loop-carried write survive the back edge).
+ * Successors are `visit_pc_fields`' targets plus the fall-through of
+ * every op that has one. An op the audited table does not know is a
+ * barrier that may read anything: every slot is read-first.
+ *
+ * Its consumer is W3's `jit_chunk_frameless_init_free`, which used to ask
+ * only that every WRITE of a slot be raw - true VACUOUSLY of a slot with
+ * no write at all, which codegen never emits (a local is declared before
+ * use, a temp written before read) but one mutated `StructCtorV` dst
+ * does: `p` was never written, the frameless site left it uninitialised,
+ * `p.x` read raw stack whose stale type word said "dict", and
+ * `member_read_core` retained a garbage pointer - a SEGV in both builds
+ * where `-nj` raised a clean TypeErrorEx. Codegen's own output pays
+ * nothing for the rule (emitted code byte-identical corpus-wide).
+ */
+uint64_t chunk_read_before_write(const Chunk &chunk)
+{
+    const size_t n = chunk.code.size();
+    /* one bit per slot: past 64 the chunk is not frameless anyway
+     * (FRAMELESS_MAX_SLOTS), and the set is capped at what a mask holds */
+    const int total = std::min(chunk.slot_count + chunk.n_temps, 64);
+    const uint64_t all = total >= 64 ? ~uint64_t(0)
+                                     : (uint64_t(1) << total) - 1;
+    if (!n)
+        return 0;
+    std::vector<uint64_t> in(n, all);          /* TOP: everything written */
+    std::vector<char> seen(n, 0);
+    std::vector<size_t> work;
+    const auto enter = [&](size_t pc) {
+        if (pc < n && in[pc] != 0) {
+            in[pc] = 0;
+            seen[pc] = 1;
+            work.push_back(pc);
+        } else if (pc < n && !seen[pc]) {
+            seen[pc] = 1;
+            work.push_back(pc);
+        }
+    };
+    enter(0);
+    for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+        for (const Chunk::HandlerClause &cl : hs.clauses)
+            if (cl.body_pc >= 0)
+                enter(static_cast<size_t>(cl.body_pc));
+        if (hs.fin_pc >= 0)
+            enter(static_cast<size_t>(hs.fin_pc));
+    }
+    uint64_t read_first = 0;
+    std::vector<int> uses, defs;
+    const auto flow = [&](size_t from, int_type t, uint64_t st) {
+        if (t < 0 || static_cast<size_t>(t) >= n)
+            return;
+        const size_t s = static_cast<size_t>(t);
+        const uint64_t nst = in[s] & st;       /* MEET: intersection */
+        if (!seen[s] || nst != in[s]) {
+            in[s] = nst;
+            seen[s] = 1;
+            work.push_back(s);
+        }
+    };
+    while (!work.empty()) {
+        const size_t pc = work.back();
+        work.pop_back();
+        Instr &ins = const_cast<Instr &>(chunk.code[pc]);
+        uint64_t st = in[pc];
+        if (!jit_op_slot_refs(ins, uses, defs))
+            return all;                        /* a barrier reads anything */
+        for (const int u : uses)
+            if (u >= 0 && u < total && !((st >> u) & 1))
+                read_first |= uint64_t(1) << u;
+        for (const int d : defs)
+            if (d >= 0 && d < total)
+                st |= uint64_t(1) << d;
+        visit_pc_fields(ins, [&](int &t) { flow(pc, t, st); });
+        if (op_falls_through(ins.op) && pc + 1 < n)
+            flow(pc, static_cast<int_type>(pc + 1), st);
+    }
+    return read_first;
+}
+
 /* ------------------------------------------------------------------ */
 /* #137: STRUCTURAL VERIFICATION of a chunk's instruction operands      */
 /* ------------------------------------------------------------------ */
@@ -11194,9 +11282,7 @@ codegen_chunk(const Block *block, int slot_count, bool jit,
     /* #97 REACH PROBE - derived here, beside native_leaf, for the same
      * reason: both ends of a call protocol must read it BEFORE any jit.
      * Nothing consumes it to decide emission yet. */
-    cg.chunk.frameless_ok = jit_chunk_frameless_ok(cg.chunk);
-    cg.chunk.frameless_init_free =                     /* #97 inc 3 W3 */
-        jit_chunk_frameless_init_free(cg.chunk);
+    jit_chunk_frameless_derive(cg.chunk);           /* W3 / small-60 */
 #ifdef TESTS
     if (cg.chunk.frameless_ok)
         g_jit_frameless_chunks++;
@@ -12021,7 +12107,6 @@ bool bc_inline_chunk(Chunk &ck,
     ck.boxed_ops.clear();
     build_boxed_ops(ck);
     ck.native_leaf = jit_chunk_is_native_leaf(ck);
-    ck.frameless_ok = jit_chunk_frameless_ok(ck);   /* #97 reach probe */
-    ck.frameless_init_free = jit_chunk_frameless_init_free(ck);   /* W3 */
+    jit_chunk_frameless_derive(ck);   /* #97 reach probe, W3, small-60 */
     return true;
 }
