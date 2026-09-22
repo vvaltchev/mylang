@@ -185,7 +185,7 @@ def main(path):
     for hc in has_chunk:
         if hc: chunk(r); nfunc += 1
     r.nx(r.u8)                                    # section 10
-    r.u32(); r.nx(r.uid)
+    r.u32(); r.nx(r.uid)       # root_slot_count (checked at load, v19)
 
     left = len(r.b) - r.p
     print("%-22s v%d  %6d bytes  strings %3d  structs %d  descs %d "

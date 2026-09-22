@@ -291,6 +291,43 @@ else
     fail "myv: struct-const function (rc=$got_rc) [$out]"
 fi
 
+# A LOADED image whose main takes a SWITCHED call (recursion past the
+# JIT's sync depth cap, an exception across a call) must run exactly like
+# its source. The script driver moves the VmProgram it loads out of
+# myv_read's return slot into its own variable, and main's root chunk is
+# ADDRESS-BAKED by the native tier (every NorecSite's caller, the
+# fragment -> chunk map): the compile path rebound after its move, the load
+# path did not, and `mylang prog.myv` resumed main at a stack address that
+# had gone out of scope - ASan on 12_deep_switch, a wild read in a
+# release build (found 2026-09-22 by running every corpus image against
+# its source). The rebind lives in VmProgram's move operations now; this is
+# the only net that reaches the driver's move, since -rt runs in-process.
+# Deep enough to cross the cap in every lane (32 under the sanitizers).
+cat > "$TMP/deep.my" <<'PROG'
+func ev(int n) { if (n == 0) { return 0; } var r = od(n - 1); return r + 1; }
+func od(int n) { if (n == 0) { return 0; } var r = ev(n - 1); return r + 1; }
+var t = 0;
+for (var k = 0; k < 3; k++)
+    t += ev(runtime(220));
+print("deep:", t);
+PROG
+src_out=$("$BIN" "$TMP/deep.my" 2>&1)
+src_rc=$?
+if "$BIN" -c "$TMP/deep.my" -o "$TMP/deep.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/deep.myv" 2>&1)
+    img_rc=$?
+    if [ "$src_rc" = 0 ] && [ "$img_rc" = 0 ] && \
+       [ "$img_out" = "$src_out" ]; then
+        pass "myv: an image whose main takes a SWITCHED call runs like src"
+    else
+        img_head=$(printf '%s' "$img_out" | head -3)
+        det="src $src_rc [$src_out] img $img_rc [$img_head]"
+        fail "myv: a switched call from a loaded image's main ($det)"
+    fi
+else
+    fail "myv: -c refused the deep-recursion program"
+fi
+
 # #96: the hardcoded-register RATCHET (scripts/regcensus.py header has
 # the rule). A source-analysis check, not a binary one - it lives here
 # because every CI lane and the local battery already run this script.

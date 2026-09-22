@@ -282,6 +282,28 @@ struct VmProgram {
     std::vector<char> global_slot_reassigned;
     std::vector<std::unique_ptr<FuncDescriptor>> funcs;
     std::vector<std::unique_ptr<StructTypeDef>> structs;
+
+    /*
+     * ⛔ A JIT'd ROOT CHUNK IS ADDRESS-BAKED, SO A MOVE MUST REBIND IT
+     * (2026-09-22). `root` is a by-value member, and the native tier
+     * records ITS ADDRESS in two places that outlive the move: every
+     * NorecSite's `caller` (the record-less tier's retarget writes it into
+     * a record's `ret_chunk`) and the fragment -> chunk map. The function
+     * chunks are heap objects a descriptor points at and never move; main's
+     * is the one that does - out of vm_compile's / myv_read's return slot
+     * into the caller's variable. The script driver's compile path called
+     * `jit_norec_rebind` after its move and the LOAD path did not: `mylang
+     * prog.myv` resumed main at a stack address that had gone out of scope
+     * (ASan on 12_deep_switch, 07_exceptions, 23_baked_callee - any image
+     * whose main takes a switched call; a wild read in a release build).
+     * So the move itself rebinds now, in the two operations and nowhere
+     * else - a caller cannot forget what the type does for it.
+     */
+    VmProgram() = default;
+    VmProgram(VmProgram &&o) noexcept;
+    VmProgram &operator=(VmProgram &&o) noexcept;
+    VmProgram(const VmProgram &) = delete;
+    VmProgram &operator=(const VmProgram &) = delete;
 };
 
 /*

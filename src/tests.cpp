@@ -13781,6 +13781,26 @@ static const std::vector<test> tests =
         "var t = 0;",
         "foreach (var p in a) { t = t + p.a.v + p.y; }",
         "assert(t == 10);" } },
+    /* NESTED fields-only struct foreachs: the direct-read mapping is a
+     * STACK (2026-09-22). It was four scalars, so the inner loop overwrote
+     * and then cleared the outer's, and `a.x` inside the inner body
+     * compiled as a member read of a slot nothing had written - the VM
+     * threw where the tree-walker printed the sum. Three shapes: the outer
+     * var read inside the inner body, read again AFTER the inner loop, and
+     * an inner loop over a DIFFERENT struct type. */
+    { "struct array: nested fields-only foreachs read the OUTER var inside "
+      "the inner body and after it",
+      { "struct P { int x; int y; } struct Q { int w; }",
+        "var a = [P(1, 10), P(2, 20), P(3, 30)]; var qs = [Q(5), Q(7)];",
+        "var cross = 0; var tail = 0; var mix = 0;",
+        "foreach (var p in a) {",
+        "  foreach (var r in a) { if (p.x < r.x) cross += p.y * r.x; }",
+        "  tail += p.x;",
+        "  foreach (var q in qs) { mix += q.w * p.y; }",
+        "}",
+        /* cross: p=1: 10*2+10*3 = 50; p=2: 20*3 = 60 -> 110 */
+        "assert(cross == 110); assert(tail == 6);",
+        "assert(mix == 12 * 60);" } },
     { "struct array: a mixed literal falls back to general",
       { "struct P { int x; }",
         "var dyn a = [P(1), 5];",
@@ -24093,6 +24113,88 @@ static bool myv_verify_store_operands()
 }
 
 /*
+ * myv_fuzz small-938 (2026-09-22): a HANG in the loader, not a crash. A
+ * planned StructCtorV carries its computed-argument MINI-RUN in the `a`
+ * dual (lo = base or -1, hi = count) - an operand NO handler reads, so no
+ * runtime check could ever trip on it - and `visit_use_def`'s
+ * `run(base, cnt)` ITERATES the count: a burst mutation made it
+ * 0x73A07676 and the load-time liveness walked two billion uses per op.
+ * The verifier bounds the run exactly as it bounds every other one, and a
+ * `-1` base must carry a ZERO count (the only shape codegen emits).
+ * Watched failing: both patches were ACCEPTED before the row went in (the
+ * hang is the count's; the second is the row's other half).
+ */
+static bool myv_verify_ctor_minirun()
+{
+    const char *lines_arr[] = {
+        "struct P { int x; int y; }",
+        "func f(int n) { var p = P(n, n + 1); return p.x + p.y; }",
+        "print(f(runtime(2)));" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        vm_verify_program(prog);                    /* intact: passes */
+        Instr *ctor = nullptr;
+        for (const auto &d : prog.funcs)
+            if (d->vm_chunk && d->name && d->name->val == "f")
+                for (Instr &in
+                     : static_cast<Chunk *>(const_cast<void *>(d->vm_chunk))
+                           ->code)
+                    if (in.op == OpCode::StructCtorV && in.b_dual_hi() >= 0)
+                        ctor = &in;
+        /* the PLANNED form with a real mini-run (`n + 1` is computed) */
+        if (!ctor || ctor->a_dual_lo() < 0 || ctor->a_dual_hi() < 1) {
+            fprintf(stderr, "myv_verify_ctor_minirun: no planned ctor with "
+                            "a computed run - the shape changed\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        const auto refused = [&](const char *what, const char *needle)
+            -> bool {
+            try {
+                vm_verify_program(prog);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError"
+                        && e.msg && strstr(e.msg, needle))
+                    return true;
+                fprintf(stderr, "myv_verify_ctor_minirun [%s]: threw "
+                                "%s: %s\n", what, e.name,
+                        e.msg ? e.msg : "");
+                return false;
+            }
+            fprintf(stderr, "myv_verify_ctor_minirun [%s]: ACCEPTED\n",
+                    what);
+            return false;
+        };
+        const Instr keep = *ctor;
+        ctor->set_a_dual(keep.a_dual_lo(), 0x73A07676);   /* the finding */
+        ok = refused("two-billion mini-run", "run window") && ok;
+        ctor->set_a_dual(-1, keep.a_dual_hi());           /* no base, a
+                                                           * count */
+        ok = refused("count without a base", "ctor mini-run") && ok;
+        *ctor = keep;
+        vm_verify_program(prog);                    /* restored: passes */
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_verify_ctor_minirun: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
  * v18 (2026-09-22): `ref_slots` is DERIVED at load. The myv_fuzz finding
  * small-1305 was one bit in the STORED list (`[1, 2]` -> `[0, 2]`): the
  * release scan skipped the temp two closures were built in and the image
@@ -24181,6 +24283,107 @@ static bool myv_ref_slots_derived()
         std::remove(spath.c_str());
     } catch (Exception &e) {
         fprintf(stderr, "myv_ref_slots_derived: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
+ * v19 (2026-09-22): `root_slot_count` is the root chunk's `slot_count`
+ * stored a SECOND time, and the loader REFUSES an image whose two copies
+ * disagree - the cross-record rule the function chunks already had
+ * (slot_count == frame_size). It is a primary fact with no derivation:
+ * myv_fuzz fat-316 mutated the chunk's copy (26 -> 145) while the frame
+ * was pushed from the other and the JIT baked main's frame size from the
+ * chunk's - a leaked reference on the exception path; a first v19 made the
+ * two ONE record, and fat-311 then mutated it undetected (22 -> 101): the
+ * register cache took the temps for locals, pinned one that also held a
+ * reference, and leaked it. So both copies are written and checked. Both
+ * directions are tampered here, on the in-memory program, and each must
+ * be a MyvError by name. Watched failing: with the check removed both
+ * loads were accepted.
+ */
+static bool myv_root_slot_count_checked()
+{
+    const char *lines_arr[] = {
+        "var a = [1, 2, 3]; var s = 0;",
+        "for (var i = 0; i < runtime(3); i++) { s = s + a[i]; }",
+        "print(s);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        const int pristine = prog.root.slot_count;
+        if (prog.root_slot_count != pristine || pristine <= 0) {
+            fprintf(stderr, "myv_root_slot_count_checked: the compile's "
+                            "two copies differ (%d vs %d)\n",
+                    prog.root_slot_count, pristine);
+            g_exec_engine = saved;
+            return false;
+        }
+        std::string tdir = "/tmp";
+        for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+            const std::optional<std::string> e = env_get(var);
+            if (e && !e->empty()) { tdir = *e; break; }
+        }
+        while (tdir.size() > 1
+               && (tdir.back() == '/' || tdir.back() == '\\'))
+            tdir.pop_back();
+        const std::string path = tdir + "/mylang-myv-rootslots.myv";
+        const auto refused = [&](const char *what) -> bool {
+            myv_write(prog, path, MyvSourceRef());
+            try {
+                MyvSource img_src;
+                VmProgram loaded = myv_read(path, img_src);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError" && e.msg
+                        && strstr(e.msg, "root slot count"))
+                    return true;
+                fprintf(stderr, "myv_root_slot_count_checked [%s]: threw "
+                                "%s: %s\n", what, e.name,
+                        e.msg ? e.msg : "");
+                return false;
+            }
+            fprintf(stderr, "myv_root_slot_count_checked [%s]: ACCEPTED\n",
+                    what);
+            return false;
+        };
+        prog.root_slot_count = 145;              /* the fat-316 value */
+        ok = refused("second record mutated") && ok;
+        prog.root_slot_count = pristine;
+        prog.root.slot_count = 101;              /* the fat-311 value */
+        ok = refused("chunk copy mutated") && ok;
+        prog.root.slot_count = pristine;
+        myv_write(prog, path, MyvSourceRef());   /* intact: loads + runs */
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(loaded);
+        } catch (Exception &) {
+        }
+        std::cout.rdbuf(old_buf);
+        if (cap.str().find("6") == std::string::npos) {
+            fprintf(stderr, "myv_root_slot_count_checked: ran to \"%s\"\n",
+                    cap.str().c_str());
+            ok = false;
+        }
+        std::remove(path.c_str());
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_root_slot_count_checked: threw %s: %s\n",
                 e.name, e.msg ? e.msg : "");
         ok = false;
     }
@@ -24732,6 +24935,369 @@ static bool myv_wrong_typed_base()
     g_exec_engine = saved;
     g_jit_enabled = saved_jit;
     return ok;
+}
+
+/*
+ * #142 again, one helper the first sweep missed (myv_fuzz fat-676,
+ * 2026-09-22): LoadStructElemV's `jit_load_struct_elem` was a `void
+ * noexcept` helper with no status test, on the argument that its base is
+ * an inference-proven flat struct array - so `flat_structs()` can never
+ * fail. On an IMAGE the proof is input: one mutated byte pointed the base
+ * at another array, `flat_structs()`'s ML_UNTRUSTED_CHECK threw the
+ * InternalErrorEx the tier exists to throw, and the throw hit the
+ * `noexcept` boundary - std::terminate, exit 134, no message, no caret.
+ * The interpreted twin rendered the same image's error cleanly.
+ *
+ * Two retargets, because they take DIFFERENT throws through the same
+ * helper: at a flat INT array (an array, wrong storage kind -> the
+ * untrusted tier's InternalErrorEx, the finding's exact shape) and at an
+ * int (not an array -> get_ref's TypeErrorEx). Both must come out of
+ * vm_run as the exception they are. The emitted-code counter is required
+ * so the test cannot pass on the interpreted twin: the loop is JIT'd from
+ * the retargeted ops and the helper must have RUN.
+ */
+static bool myv_struct_elem_base()
+{
+#if !ML_UNTRUSTED_CHECKS
+    return true;                    /* the tier is compiled out (the A/B) */
+#else
+    const char *lines_arr[] = {
+        "struct P { int x; int y; }",
+        "var ia = [10, 20, 30];",
+        "var k = int(runtime(7));",     /* runtime(): a literal is
+                                         * auto-const, folded, no slot */
+        "var pts = [];",
+        "for (var i = 0; i < 4; i++) { append(pts, P(i, i * 2)); }",
+        "var s = 0; var last = P(0, 0);",
+        /* `last = p` is the VALUE use: with p read only through its
+         * fields the loop would lower to LoadStructFieldInt off the
+         * array bytes and never bind p at all */
+        "foreach (var p in pts) { s += p.x + p.y; last = p; }",
+        "print(s, last.x);" };
+
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-structelem.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    const bool saved_jit = g_jit_enabled;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    /* the two bases: which slot, what the helper must throw */
+    struct Case { const char *slot; const char *ex; };
+    const Case cases[] = {
+        { "ia", "InternalErrorEx" },   /* an array of the WRONG kind */
+        { "k",  "TypeErrorEx" },       /* not an array at all */
+    };
+    for (const Case &c : cases) {
+        /* JIT OFF for the load, so the retargeted op - not the original -
+         * is what the tier compiles (myv_wrong_typed_base's reason). */
+        g_jit_enabled = false;
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+
+            VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+            myv_write(prog, path, MyvSourceRef());
+            MyvSource ms;
+            VmProgram loaded = myv_read(path, ms);
+
+            int32_t slot = -1;
+            for (size_t i = 0; i < loaded.root.slot_names.size(); i++)
+                if (loaded.root.slot_names[i] == c.slot)
+                    slot = static_cast<int32_t>(i);
+            int patched = 0;
+            for (Instr &in : loaded.root.code)
+                if (in.op == OpCode::LoadStructElemV) {
+                    in.target2 = slot;        /* base <- `ia` / `k` */
+                    patched++;
+                }
+            if (slot < 0 || patched != 1) {
+                fprintf(stderr, "myv-structelem [%s]: expected 1 whole-p "
+                                "bind and a named slot (%d, %d) - the "
+                                "shape changed\n", c.slot, patched, slot);
+                ok = false;
+                remove(path.c_str());
+                continue;
+            }
+
+            g_jit_enabled = saved_jit;
+            if (g_jit_enabled)
+                vm_jit_loaded_image(loaded);   /* from the RETARGETED op */
+#if ML_JIT_SUPPORTED
+            const unsigned long before =
+                g_jit_op_run[static_cast<size_t>(OpCode::LoadStructElemV)];
+#endif
+            std::string got = "(no throw)";
+            try {
+                vm_run(loaded);
+            } catch (Exception &e) {
+                got = e.name;
+            }
+            if (got != c.ex) {
+                fprintf(stderr, "myv-structelem [%s]: expected %s, got "
+                                "%s\n", c.slot, c.ex, got.c_str());
+                ok = false;
+            }
+#if ML_JIT_SUPPORTED
+            if (g_jit_enabled
+                && g_jit_op_run[static_cast<size_t>(OpCode::LoadStructElemV)]
+                       == before) {
+                fprintf(stderr, "myv-structelem [%s]: the emitted helper "
+                                "never ran - the interpreted twin answered "
+                                "(vacuous)\n", c.slot);
+                ok = false;
+            }
+#endif
+        } catch (Exception &e) {
+            fprintf(stderr, "myv-structelem [%s]: setup threw %s: %s\n",
+                    c.slot, e.name, e.msg ? e.msg : "");
+            ok = false;
+        }
+        remove(path.c_str());
+    }
+    g_exec_engine = saved;
+    g_jit_enabled = saved_jit;
+    return ok;
+#endif
+}
+
+/*
+ * myv_fuzz fat-845 / fat-260 (2026-09-22): TWO ML_VM_CHECK tripwires on
+ * codegen-PROVEN arms - a `th==f` operand holds a float (read_float_slot),
+ * a foreach-unpack's base is an array (vm_unpack_elem_body) - aborted the
+ * debug lane on a mutated image while the assert-free build gave the
+ * defined answer (0.0; TypeErrorEx). The tripwires are right for bytecode
+ * WE compiled, where the condition really is an interpreter bug; on an
+ * image the proof is input, so they now read
+ * `ML_VM_CHECK(ml_untrusted_bytecode() || <invariant>)` (defs.h) and the
+ * outcome is the SAME in every build. Loaded with the JIT off, like
+ * myv_untrusted_field_index: these are the interpreter's readers.
+ */
+static bool myv_untrusted_proven_arms()
+{
+#if !ML_UNTRUSTED_CHECKS
+    return true;                    /* the tier is compiled out (the A/B) */
+#else
+    const char *lines_arr[] = {
+        "var name = str(runtime(\"abc\"));",   /* runtime(): a literal
+                                                  * is auto-const, no slot */
+        "var fs = [1.5, 2.5, 3.5];",
+        "var acc = 0.0;",
+        "foreach (var f in fs) { acc = acc + f; }",
+        "var pairs = [[1, 2], [3, 4]];",
+        "var t = 0;",
+        "foreach (var a, b in pairs) { t += a + b; }",
+        "print(acc, t);" };
+
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-provenarms.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    const bool saved_jit = g_jit_enabled;
+    g_exec_engine = ExecEngine::Vm;
+    g_jit_enabled = false;
+    bool ok = true;
+    /* which op to retarget at the STRING slot, and the defined outcome */
+    struct Case { OpCode op; const char *what; const char *expect_out;
+                  const char *expect_ex; };
+    const Case cases[] = {
+        /* both float operands read a string: 0.0 + 0.0 every iteration */
+        { OpCode::FloatAddRR,    "float operand", "0.000000 10", nullptr },
+        /* the unpack's base is a string: get_ref's TypeErrorEx */
+        { OpCode::UnpackElemInt, "unpack base",   nullptr, "TypeErrorEx" },
+    };
+    for (const Case &c : cases) {
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+
+            VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+            myv_write(prog, path, MyvSourceRef());
+            MyvSource ms;
+            VmProgram loaded = myv_read(path, ms);
+
+            int32_t sslot = -1;
+            for (size_t i = 0; i < loaded.root.slot_names.size(); i++)
+                if (loaded.root.slot_names[i] == "name")
+                    sslot = static_cast<int32_t>(i);
+            int patched = 0;
+            for (Instr &in : loaded.root.code) {
+                if (in.op != c.op)
+                    continue;
+                if (c.op == OpCode::FloatAddRR) {
+                    Operand o;
+                    o.slot = sslot;
+                    in.set_a(o);
+                    in.set_b(o);
+                } else {
+                    in.target2 = sslot;
+                }
+                patched++;
+            }
+            if (sslot < 0 || patched != 1) {
+                fprintf(stderr, "myv-provenarms [%s]: expected exactly one "
+                                "op and a named slot (%d, %d) - the shape "
+                                "changed\n", c.what, patched, sslot);
+                ok = false;
+                remove(path.c_str());
+                continue;
+            }
+            std::ostringstream cap;
+            std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+            std::string ex;
+            try {
+                vm_run(loaded);
+            } catch (Exception &e) {
+                ex = e.name;
+            }
+            std::cout.rdbuf(old_buf);
+            const std::string out = cap.str();
+            if (c.expect_out
+                && out.find(c.expect_out) == std::string::npos) {
+                fprintf(stderr, "myv-provenarms [%s]: expected \"%s\", got "
+                                "\"%s\" (ex: %s)\n", c.what, c.expect_out,
+                        out.c_str(), ex.c_str());
+                ok = false;
+            }
+            if (c.expect_ex && ex != c.expect_ex) {
+                fprintf(stderr, "myv-provenarms [%s]: expected %s, got "
+                                "\"%s\" (out: %s)\n", c.what, c.expect_ex,
+                        ex.c_str(), out.c_str());
+                ok = false;
+            }
+        } catch (Exception &e) {
+            fprintf(stderr, "myv-provenarms [%s]: setup threw %s: %s\n",
+                    c.what, e.name, e.msg ? e.msg : "");
+            ok = false;
+        }
+        remove(path.c_str());
+    }
+    g_exec_engine = saved;
+    g_jit_enabled = saved_jit;
+    return ok;
+#endif
+}
+
+/*
+ * A JIT'd root chunk is ADDRESS-BAKED (every NorecSite's `caller`, the
+ * fragment -> chunk map), and main's VmProgram MOVES out of its producer's
+ * return slot into the caller's variable. The script driver's compile
+ * path rebound after its move; its LOAD path did not, so `mylang prog.myv`
+ * resumed main at a stack address that had gone out of scope on any image
+ * whose main takes a switched call (ASan on 12_deep_switch, 07_exceptions,
+ * 23_baked_callee; found 2026-09-22 by running every corpus image against
+ * its source). The rebind lives in VmProgram's move operations now (vm.h),
+ * so this asserts the TYPE's contract: after a move construction and a
+ * move assignment, every site names the object the program lives in, and
+ * the fragment map resolves to it. Watched failing: with the rebind out of
+ * the move ctor, the first check names the moved-from stack object.
+ */
+static bool vm_program_move_rebinds()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const char *lines_arr[] = {
+        "func f(int n) {",
+        "  if (n == 0) { return 0; }",
+        "  var r = f(n - 1); return r + 1;",
+        "}",
+        "var t = 0;",
+        "for (var k = 0; k < runtime(3); k++) { t += f(runtime(5)); }",
+        "print(t);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram a = vm_compile(root.get());
+        if (!a.root.native.base || a.root.norec_sites.empty()) {
+            fprintf(stderr, "vm_program_move_rebinds: main has no fragment "
+                            "or no call site - the shape changed\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        const auto bound_to = [](const VmProgram &p, const char *what)
+            -> bool {
+            bool good = jit_norec_frag_for(p.root.native.base) == &p.root;
+            for (const auto &ns : p.root.norec_sites)
+                good = good && ns->caller == &p.root;
+            if (!good)
+                fprintf(stderr, "vm_program_move_rebinds [%s]: a baked "
+                                "address names the moved-from object\n",
+                        what);
+            return good;
+        };
+        ok = bound_to(a, "fresh") && ok;
+        VmProgram b(std::move(a));                  /* move construction */
+        ok = bound_to(b, "move-constructed") && ok;
+        VmProgram c;
+        c = std::move(b);                           /* move assignment */
+        ok = bound_to(c, "move-assigned") && ok;
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(c);                              /* and it RUNS there */
+        } catch (Exception &) {
+        }
+        std::cout.rdbuf(old_buf);
+        if (cap.str().find("15") == std::string::npos) {
+            fprintf(stderr, "vm_program_move_rebinds: ran to \"%s\"\n",
+                    cap.str().c_str());
+            ok = false;
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "vm_program_move_rebinds: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+#else
+    return true;
+#endif
 }
 
 /*
@@ -42489,6 +43055,11 @@ static const std::vector<extra_check> extra_checks =
     { "myv: v18 - ref_slots is DERIVED at load: a tampered stored list "
       "cannot reach the loaded chunk (root and a seeded function chunk)",
       myv_ref_slots_derived },
+    { "myv: v19 - the root chunk's slot_count and the stored root slot "
+      "count must agree, either copy mutated is refused",
+      myv_root_slot_count_checked },
+    { "myv: the verifier bounds a planned ctor's mini-run (small-938, a "
+      "load-time HANG)", myv_verify_ctor_minirun },
     { "jit: #97 inc 3 (W1/W2) - the CALLER builds the frameless window "
       "and binds from the argument SOURCES: the expected entry, "
       "discriminator, arm and site sequences (a pinned int into an int "
@@ -42601,6 +43172,15 @@ static const std::vector<extra_check> extra_checks =
       myv_untrusted_field_index },
     { "myv: a WRONG-TYPED base does not take the process down (#142)",
       myv_wrong_typed_base },
+    { "myv: a whole-p struct bind on a corrupt BASE renders, never "
+      "terminates (#142, fat-676)",
+      myv_struct_elem_base },
+    { "myv: a codegen-PROVEN arm on an image takes its defined fallback in "
+      "every build (fat-845 float operand, fat-260 unpack base)",
+      myv_untrusted_proven_arms },
+    { "vm: a moved VmProgram's root chunk keeps its baked addresses bound "
+      "(the load path's stack-stale main)",
+      vm_program_move_rebinds },
     { "myv: an image from a different BUILTIN SET is refused (#144)",
       myv_builtin_set_guard },
     { "myv: Loc escapes - delta table + narrow pool Locs",

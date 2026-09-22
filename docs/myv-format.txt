@@ -2,15 +2,18 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 18.  This document describes the on-disk image exhaustively:
+Format version 19.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
 
-(v18 REMOVES one per-chunk record: `ref_slots`, which used to follow
-`handler_sites` - it is DERIVED at load now, see "DERIVED POOLS" in
-section 9.  v17 added one descriptor field, `noescape_params` - section
-8 - written right after `fast_bind`; v16 added one per-chunk record,
-`arg_locs` - section 9.21 - written right after `base_locs`; v15 added
-`value_callees`, section 9.20.  None changed an existing encoding.)
+(v19 changes no encoding: the loader now REFUSES an image whose
+`root_slot_count` (section 10) disagrees with the root chunk's own
+`slot_count` (section 9) - a cross-record check, see section 3 layer 3.
+v18 REMOVED one per-chunk record: `ref_slots`, which used to follow
+`handler_sites` - it is DERIVED at load now, see section 12.  v17 added
+one descriptor field, `noescape_params` - section 8 - written right
+after `fast_bind`; v16 added one per-chunk record, `arg_locs` - section
+9.21 - written right after `base_locs`; v15 added `value_callees`,
+section 9.20.  None changed an existing encoding.)
 
 (v14 changed no encoding: it widened the VALUE DOMAIN of an instruction's
 `aop` byte - the compound shift/bitwise assignment operators `<<=` `>>=`
@@ -147,6 +150,25 @@ sees a kind of field the others structurally cannot (#137):
      is refused when its lit flag is set, instead of the bound being
      skipped: one mutated `opflags` bit had let the handler index the frame
      with the raw payload.
+
+     MAIN'S SLOT COUNT, ACROSS TWO RECORDS (2026-09-22, myv_fuzz fat-316
+     and fat-311): the root chunk's `slot_count` (section 9) must equal
+     `root_slot_count` (section 10), exactly as a function chunk's must
+     equal its descriptor's `frame_size`.  Every load-time analysis and
+     the JIT's pin gate classify a frame slot as a local or a temp by it,
+     so a mutated copy is not a wrong size but a wrong CLASSIFICATION -
+     the register cache pinned a temp it took for a local and the
+     reference that temp also held leaked - and the fact has no
+     derivation, so the redundancy is what makes the mutation visible.
+
+     AN OPERAND NO HANDLER READS (2026-09-22, myv_fuzz small-938): a
+     planned `StructCtorV`'s `a` dual is its computed-argument MINI-RUN
+     (lo = base or -1, hi = count), consumed by no handler and by exactly
+     one load-time analysis, whose `run(base, cnt)` ITERATES the count -
+     so a mutated count of 0x73A07676 was a HANG at load, not a crash.
+     The run is bounded like every other (`base + count` inside the frame),
+     and a `-1` base must carry a zero count, the only shape the compiler
+     emits.
 
   4. THE VALUE-DEPENDENT RESIDUE (ML_UNTRUSTED_CHECK, defs.h).  A few facts
      no load-time pass can decide, because they are properties of the VALUE a
@@ -824,8 +846,19 @@ section that could be dropped without losing behaviour.
 --------------------------------------------------------------------------------
 
     N x u8   global_slot_reassigned    per global slot: written more than once?
-    u32      root_slot_count           (signed)
+    u32      root_slot_count           (signed) the root chunk's `slot_count`
+                                       (section 9) written a SECOND time;
+                                       the loader refuses the image when
+                                       the two disagree (v19)
     N x uid  global_func_names         the global table's slot -> name list
+
+`root_slot_count` is deliberately redundant, as a function chunk's
+`slot_count` is with its descriptor's `frame_size`: `slot_count` partitions
+main's frame into locals and temps, every load-time analysis and the JIT's
+pin gate classify a slot by it, and it has NO derivation - so a second copy
+is the only way to DETECT a mutated one (myv_fuzz fat-316 and fat-311, both
+the chunk's copy: a leaked reference either way, and undetectable while the
+format kept one record).
 
 `global_slot_reassigned` is what lets the load-time JIT rebuild its compile
 context: a write-once global slot may be baked, a reassigned one may not.

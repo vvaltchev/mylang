@@ -1073,8 +1073,11 @@ extern "C" void jit_load_struct_field(int_type dst, int_type base, int_type idx,
 extern "C" int jit_load_struct_elem_field(int_type dst, int_type base,
                                           int_type idx, int_type fidx,
                                           int is_float) noexcept;
-extern "C" void jit_load_struct_elem(int_type dst, int_type base,
-                                     int_type idx) noexcept;
+/* The whole-`p` foreach bind. Returns non-zero when it raised (only an
+ * IMAGE can make it: a corrupt base - fat-676), conveying via
+ * g_vm_jit_exc. */
+extern "C" int jit_load_struct_elem(int_type dst, int_type base,
+                                    int_type idx) noexcept;
 extern "C" int jit_load_elem_value(int_type dst, int_type base,
                                    int_type idx) noexcept;
 

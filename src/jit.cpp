@@ -22282,12 +22282,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.call_relocs.push_back({ e.pos(), fn });
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
-        if (in.op == OpCode::LoadElemValue || sfield_checked) {
+        if (in.op == OpCode::LoadElemValue || sfield_checked
+            || in.op == OpCode::LoadStructElemV) {
             e.test32_rr(RAX, RAX);           /* test eax, eax; reg:abi */
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* cold: the OOB caret (the
                                                * InternalErrorEx net rides
-                                               * eptr, loc-less both ways) */
+                                               * eptr, loc-less both ways;
+                                               * LoadStructElemV's is an
+                                               * IMAGE's corrupt base -
+                                               * fat-676 - conveyed via
+                                               * g_vm_jit_exc, so it takes
+                                               * this caret) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
@@ -24437,14 +24443,15 @@ static bool op_never_exits(const Instr &in)
     case OpCode::CmpIntV:           /* int compare -> bool; cannot fault */
     /* the foreach loads: the index is loop-bounded by the ArrLen/StrLen that
      * produced it and the base kind is proven, so none of these can throw or
-     * bail (LoadElemValue bounds-checks, so it lives in op_fully_native's
-     * convey family instead - it exits, but only by conveying). */
+     * bail (LoadElemValue bounds-checks, and LoadStructElemV's helper
+     * conveys an IMAGE's corrupt base - fat-676 - so both live in
+     * op_fully_native's convey family instead: they exit, but only by
+     * conveying). */
     case OpCode::LoadElemBool:
     case OpCode::StrLen:
     case OpCode::LoadStrChar:
     case OpCode::LoadStructFieldInt:
     case OpCode::LoadStructFieldFloat:
-    case OpCode::LoadStructElemV:
     /* #56: dst = other + a[i].f - the helper is never-throwing (the field
      * read is inference-proven no-fault) and the add/store run in the
      * fragment; no exit of any kind. */
@@ -24675,6 +24682,12 @@ static bool op_fully_native(const Instr &in)
      * unreachable-by-inference non-array/wrong-kind tail conveys the
      * interpreted InternalErrorEx via eptr - no bail left. */
     case OpCode::LoadElemValue:
+        return true;
+    /* LoadStructElemV (the whole-`p` foreach bind): never throws on
+     * bytecode we compiled; on an IMAGE its helper conveys the corrupt-base
+     * InternalErrorEx / TypeErrorEx through the status return (fat-676) -
+     * an exc exit, no bail, so still deletable. */
+    case OpCode::LoadStructElemV:
         return true;
     /* #56 delete-originals: LoadElemInt/Float - the inline fast path's
      * every decline (slice/kind/wrap/OOB) goes to the jit_load_elem_*

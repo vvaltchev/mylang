@@ -1877,6 +1877,10 @@ void myv_write(const VmProgram &prog, const std::string &path,
     w.u32v(static_cast<uint32_t>(prog.global_slot_reassigned.size()));
     for (char c : prog.global_slot_reassigned)
         w.u8v(static_cast<uint8_t>(c));
+    /* `root_slot_count` IS the root chunk's `slot_count` - written a
+     * SECOND time on purpose, as the function chunks' `frame_size` is: a
+     * primary fact with no derivation, so the redundancy is what lets the
+     * loader DETECT a mutated copy (vm_verify_program, v19). */
     w.u32v(static_cast<uint32_t>(prog.root_slot_count));
     w.u32v(static_cast<uint32_t>(prog.global_func_names.size()));
     for (const UniqueId *u : prog.global_func_names)
@@ -2167,7 +2171,21 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
     for (uint32_t i = 0; i < nre; i++)
         prog.global_slot_reassigned.push_back(static_cast<char>(r.u8v()));
 
-    prog.root_slot_count =            /* main's half of the frame */
+    /*
+     * v19: main's half of the frame, stored TWICE - here and as the root
+     * chunk's `slot_count` - and CHECKED against each other in
+     * vm_verify_program, the rule the function chunks already had
+     * (slot_count == frame_size). It is a PRIMARY fact with no
+     * derivation, so a second copy is the only way to detect a mutated
+     * one: myv_fuzz fat-316 mutated the chunk's copy (26 -> 145) while
+     * the frame was pushed from this one and the JIT baked main's frame
+     * size from the chunk's - a leaked reference on the exception path -
+     * and, with the two made one record instead (the first v19 attempt),
+     * fat-311 mutated the chunk's copy (22 -> 101) undetected and the
+     * register cache pinned a TEMP it now took for a local: a leak again.
+     * Either copy mutated is a refusal now.
+     */
+    prog.root_slot_count =
         static_cast<int>(r.sizev("corrupt .myv (root slot count)"));
     n = r.countv();
     prog.global_func_names.reserve(n);

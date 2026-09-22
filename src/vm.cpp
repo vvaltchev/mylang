@@ -42,8 +42,10 @@ read_int_slot(EvalContext *ctx, int_type slot)
      * is the same one `getval` does internally, so this costs nothing; only
      * the miss branch changes, from a throw to a value. A VALID program never
      * reaches it (the ML_VM_CHECK above is the net, and CI runs the release
-     * lanes with VM_HARDENING on). */
-    ML_VM_CHECK(lv.is<int_type>());
+     * lanes with VM_HARDENING on). On an IMAGE the proof is input, not a
+     * fact, so the tripwire stays silent there (the float twin below is
+     * where myv_fuzz found it, fat-845). */
+    ML_VM_CHECK(ml_untrusted_bytecode() || lv.is<int_type>());
     return lv.is<int_type>() ? lv.getval<int_type>() : 0;
 }
 
@@ -80,8 +82,10 @@ read_float_slot(EvalContext *ctx, int_type slot)
     /* Likewise a th==f operand must hold a float here (int/bool promoted
      * above); a wrong-typed / garbage slot fails before the raw union read.
      * The miss returns a DEFINED value rather than throwing - see the
-     * int twin above (#142). */
-    ML_VM_CHECK(lv.is<float_type>());
+     * int twin above (#142). The tripwire is for bytecode WE compiled:
+     * on an image the proof is input (myv_fuzz fat-845), and the defined
+     * 0.0 is the outcome there in every build. */
+    ML_VM_CHECK(ml_untrusted_bytecode() || lv.is<float_type>());
     return lv.is<float_type>() ? lv.getval<float_type>() : 0.0;
 }
 
@@ -2328,7 +2332,22 @@ vm_verify_program(const VmProgram &prog)
     for (const auto &sd : prog.structs)
         lim.max_fields = std::max(lim.max_fields, sd->fields.size());
 
-    /* main: no captures, and its frame is the ROOT slot count + temps. */
+    /*
+     * main: no captures, and its frame is the ROOT slot count + temps.
+     * `root_slot_count` is the root chunk's `slot_count` stored a second
+     * time (section 10 of the format), and the two must AGREE - the same
+     * cross-record rule the function chunks get below, for the same
+     * reason: `slot_count` partitions the frame into locals and temps, and
+     * every load-time analysis and the JIT's pin gate classify a slot by
+     * it. A mutated copy (myv_fuzz fat-316: 26 -> 145; fat-311: 22 -> 101,
+     * which made the register cache pin a TEMP as a local and leak the
+     * reference it also held) is a refusal, not a run.
+     */
+    if (prog.root_slot_count != prog.root.slot_count)
+        throw Exception("MyvError",
+                        intern_msg("corrupt .myv (the root chunk's "
+                                   "slot_count disagrees with the stored "
+                                   "root slot count)"));
     lim.nslots = prog.root_slot_count + prog.root.n_temps;
     lim.ncaptures = 0;
     verify_chunk(prog.root, lim);
@@ -2525,12 +2544,38 @@ vm_execute(const Construct *root_c)
     retained.push_back(vm_compile(root_c));
     /* G1: the program (and its root Chunk) just MOVED - twice, in fact:
      * out of vm_compile's frame and into the retained vector, which may
-     * also REALLOCATE and move every EARLIER program's root. Rebind all
-     * of them, not just the new one - the audit's chain check caught a
-     * stack-stale site caller here on its first run. */
-    for (VmProgram &pr : retained)
-        jit_norec_rebind(pr.root);
+     * also REALLOCATE and move every EARLIER program's root. Every one of
+     * those moves goes through VmProgram's move operations, which REBIND
+     * the root's baked addresses (vm.h) - this used to be an explicit
+     * rebind loop here, which the script driver's load path then lacked. */
     vm_run(retained.back());
+}
+
+/* The move operations rebind the root chunk's baked addresses - see the
+ * contract on the struct (vm.h). Out of line: vm.h does not see jit.h. */
+VmProgram::VmProgram(VmProgram &&o) noexcept
+    : root(std::move(o.root)),
+      root_slot_count(o.root_slot_count),
+      global_func_names(std::move(o.global_func_names)),
+      global_slot_reassigned(std::move(o.global_slot_reassigned)),
+      funcs(std::move(o.funcs)),
+      structs(std::move(o.structs))
+{
+    jit_norec_rebind(root);
+}
+
+VmProgram &VmProgram::operator=(VmProgram &&o) noexcept
+{
+    if (this != &o) {
+        root = std::move(o.root);
+        root_slot_count = o.root_slot_count;
+        global_func_names = std::move(o.global_func_names);
+        global_slot_reassigned = std::move(o.global_slot_reassigned);
+        funcs = std::move(o.funcs);
+        structs = std::move(o.structs);
+        jit_norec_rebind(root);
+    }
+    return *this;
 }
 
 void
@@ -4768,13 +4813,27 @@ extern "C" void jit_load_struct_field(int_type dst, int_type base, int_type idx,
 }
 
 /* LoadStructElemV: the whole-`p` foreach bind - materialize a fresh
- * StructObject from the flat struct-array element into the loop var. */
-extern "C" void jit_load_struct_elem(int_type dst, int_type base,
-                                     int_type idx) noexcept
+ * StructObject from the flat struct-array element into the loop var.
+ * A STATUS helper (#142, myv_fuzz fat-676): for bytecode WE compiled the
+ * base is a proven flat struct array and nothing here can throw, but on an
+ * IMAGE the proof is input - `flat_structs()`'s ML_UNTRUSTED_CHECK throws
+ * InternalErrorEx (and a non-array base a TypeErrorEx) - and a throw
+ * through a `void noexcept` helper is std::terminate: no message, no
+ * caret. Both are RuntimeExceptions, so the return conveys them exactly
+ * as jit_load_struct_elem_field does and EnterNative re-raises with this
+ * op's caret. */
+extern "C" int jit_load_struct_elem(int_type dst, int_type base,
+                                    int_type idx) noexcept
 {
     ML_JIT_OP_RAN(LoadStructElemV);
     Frame *f = g_current_ctx->frame;
-    f->at(dst).put(vm_struct_elem(f->at(base).get(), idx));
+    try {
+        f->at(dst).put(vm_struct_elem(f->at(base).get(), idx));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(static_cast<RuntimeException *>(e.clone()));
+        return 1;
+    }
+    return 0;
 }
 
 /* LoadElemValue: a GENERAL (or flat-str) array element into a slot, box-free.
@@ -5025,7 +5084,11 @@ vm_unpack_elem_body(EvalContext &ctx, const EvalValue &base_v, int_type idx,
                     const std::vector<int32_t> *targets,
                     const Chunk *chunk, size_t pc)
 {
-    ML_VM_CHECK(base_v.is<SharedArrayObj>());
+    /* a codegen-PROVEN array base - for bytecode WE compiled. On an
+     * image the proof is input, not a fact (myv_fuzz fat-260): the
+     * tripwire stays silent there and get_ref's TypeErrorEx is the
+     * defined outcome (defs.h, the ml_untrusted_bytecode() idiom). */
+    ML_VM_CHECK(ml_untrusted_bytecode() || base_v.is<SharedArrayObj>());
     const SharedArrayObj &outer = base_v.get_ref<SharedArrayObj>();
     const EvalValue &elem = outer.get_vec()[outer.offset() + idx].get();
     if (!elem.is<SharedArrayObj>())

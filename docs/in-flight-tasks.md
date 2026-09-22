@@ -747,8 +747,9 @@ messages, not carets, which is why no test fails. A `tests` entry with
 Small, but a caret that differs between engines is a RULE 2 violation
 and is on record. Not a detour from #97 - the maintainer's call.
 
-## 3d. FOUND 2026-09-20/21 — THREE LOADER FINDINGS (`myv_fuzz`,
-## #137/#142 class; ONE FIXED) AND ONE TABLE GAP (the tenth shape, again)
+## 3d. FOUND 2026-09-20/21 — THE LOADER FINDINGS (`myv_fuzz`,
+## #137/#142 class; ✅ ALL FIXED 2026-09-22) AND ONE TABLE GAP (the
+## tenth shape, again)
 
 **The loader (task #26).** All reached by the mutation space a format
 change shifted (v16 `arg_locs`, then v17 `noescape_params`), all
@@ -790,7 +791,27 @@ record is GONE from the format (myv v18): `myv_read` rebuilds
 (`compute_ref_slots` / `ref_seeds_of`, codegen.h, shared with the
 compile), after `vm_verify_program` and before the JIT. Pinned by
 `myv_ref_slots_derived` and the round trip's entry-for-entry compare.
-Two findings still open: fat-676 (terminate) and small-938 (a hang).
+✅ FIXED 2026-09-22 (the maintainer's call: "fix all five loader
+findings first, then back to #97"): `fat-676.myv` - `jit_load_struct_elem`
+is a STATUS helper now (`catch (RuntimeException &)` -> g_vm_jit_exc,
+the emitter's `test eax` after the call), and LoadStructElemV moved from
+`op_never_exits` to `op_fully_native`'s convey family - a conveying op
+cannot sit in a NATIVE_LEAF, whose direct caller ignores the status.
+Reach: NO corpus program emitted `load.selem` at all (a whole-`p` bind
+needs a value use of `p`; every corpus foreach read fields only), so
+the leaf-bar move costs nothing; `tests/functional/27_struct_whole_p.my`
+gives the corpus_diff matrices the shape. Pinned by
+`myv_struct_elem_base` (two retargets: a flat int array -> the
+untrusted tier's InternalErrorEx, the finding; an int -> TypeErrorEx;
+the emitted helper must have RUN). Watched: the void shape terminates
+the whole suite. `small-938.myv` - the planned StructCtorV's `a` dual
+(the computed-arg mini-run: read by NO handler, only by visit_use_def's
+`run(base, cnt)`) was unbounded, and a count of 0x73A07676 was the
+"never-converging liveness". `verify_chunk` bounds it like every run,
+and a `-1` base must carry a zero count; pinned by
+`myv_verify_ctor_minirun` (both ACCEPTED before). Note the finding was
+misfiled as a JIT fixpoint bug for a day: a HANG in the loader is a
+COUNT until proven otherwise.
 **And the v18 images shifted the seeded mutation space onto FOUR more
 (2026-09-22, all pre-existing classes):** ✅ `small-60.myv` - a
 mutated `StructCtorV` dst leaves `p` never written, and W3's
@@ -803,23 +824,56 @@ a definitely-written MUST dataflow over the CFG) feeds
 half of init_free (a parameter's bit is ignored - the fill writes it);
 `jit_chunk_frameless_derive` is the one derivation point now. Emitted
 code byte-identical corpus-wide (vdjcmp 127/127); pinned by
-`jit_frameless_init_free_read_first`. `fat-260.myv` / `fat-845.myv` -
-debug-only C `assert`s on codegen-proven arms (`vm_unpack_elem_body`'s
+`jit_frameless_init_free_read_first`. ✅ `fat-260.myv` / `fat-845.myv` -
+debug-only `ML_VM_CHECK`s on codegen-proven arms (`vm_unpack_elem_body`'s
 array base, `read_float_slot`'s float) that a corrupt image violates, a
-clean
-TypeErrorEx / OutOfBoundsEx on the ASSERTS=0 build - the "named abort"
-outcome the spec accepts, which the fuzzer nonetheless counts as a
-crash on an ASSERTS build; `fat-316.myv` - an LSan report (256 bytes)
-after an uncaught OutOfBoundsEx from a mutated image.
-**A fourth, reported by the fixed fuzzer the same day, NOT fixed:**
-`small-1305.myv` runs to completion (prints `4`) and LeakSanitizer
-reports two 136-byte `FuncObject`s allocated by `jit_make_closure_ptr`
-from emitted code and never released - a mutated image whose values
-leak a reference, which CLAUDE.md's loader text names as the ACCEPTED
-failure mode of a wrong `ref_slots` on a disk image ("can then only
-LEAK a reference, never index out of range"). Whether an LSan report on
-a hostile image should count as a crash is a question for the
-maintainer; the fuzzer's new classifier says yes.
+clean TypeErrorEx / 0.0 on the ASSERTS=0 build. FIXED 2026-09-22 with the
+`ml_untrusted_bytecode()` idiom (defs.h): the tripwire stays for our own
+bytecode and is silent on an image, so the outcome is the same in every
+build; pinned by `myv_untrusted_proven_arms` (both watched aborting).
+✅ `fat-316.myv` - an LSan report (256 bytes) after an uncaught
+OutOfBoundsEx from a mutated image. ROOT CAUSE: `root_slot_count` is
+stored TWICE - the root chunk's `slot_count` and a second record in the
+globals section - with different consumers: the loader pushed main's
+window from the second while the JIT baked main's frame size into its
+return arm from the chunk's; one mutated byte (26 -> 145) made the
+exception path release a frame of a different size than the one pushed.
+JIT-only, ANY mismatch reproduced it (27, 40). FIXED 2026-09-22 as myv
+v19 - in two steps: a first fix DROPPED the second record ("derive it"),
+and the next fuzz run's `fat-311.myv` mutated the now-single copy
+(22 -> 101) undetected: the register cache took the temps for locals,
+pinned one that also held a reference, and leaked it (`-nj` clean,
+`MYLANG_JIT_OFF=cache` clean). `slot_count` is primary data with no
+derivation, so the copy is kept and CHECKED (`vm_verify_program`, the
+function chunks' slot_count == frame_size rule); pinned by
+`myv_root_slot_count_checked` (both copies tampered, each refused;
+watched: both accepted with the check out).
+**And the new functional test found a CODEGEN bug on the way (the same
+day, fixed):** the struct-foreach direct-read mapping (`sfe_*`) was four
+scalars, so an INNER fields-only struct foreach overwrote the outer's and
+cleared it - `foreach (var a in pts) foreach (var b in pts) if (a.x <
+b.x)` compiled `a.x` as a member read of a slot the direct-read design
+never writes, and the VM threw where the tree-walker printed 255. A RULE
+2 divergence no corpus program had reached. `sfe_maps` is a stack now;
+pinned by a 5-mode `struct array:` entry (fails 1704/1705 in every VM
+mode with the scalars back) and case 4 of the functional test.
+**And a SIXTH loader finding, from running every corpus image against
+its source (a check this batch added to the net battery): `mylang
+prog.myv` resumed main at a STACK ADDRESS OUT OF SCOPE on any image
+whose main takes a switched call (12_deep_switch, 07_exceptions,
+23_baked_callee - ASan stack-use-after-scope; the release build printed
+the right answer by luck). Main's VmProgram moves out of myv_read's
+return slot into the driver's variable, and the JIT'd root chunk is
+address-baked (NorecSite::caller, the fragment map); the compile path
+called `jit_norec_rebind` after its move, the load path never did.
+FIXED 2026-09-22 in the TYPE: VmProgram's move operations rebind (vm.h);
+pinned by `vm_program_move_rebinds` and a driver_checks deep-image case,
+both watched failing. -rt could not see it (its loads are elided
+initialisations), the fuzz corpus has no switched call from main.
+(`small-1305.myv`, the LSan report the fixed fuzzer reported the same
+day - two `FuncObject`s from `jit_make_closure_ptr` never released - is
+the v18 fix above: the maintainer answered the "does an LSan report on
+a hostile image count" question with "derive ref_slots at load".)
 **And the fuzzer could not SEE the third in the debug lane** (fixed
 2026-09-21): UBSan under `-fno-sanitize-recover` reports and exits 1,
 the SAME code a clean `MyvError` refusal uses, so `myv_fuzz.py` counted
