@@ -131,6 +131,21 @@ sees a kind of field the others structurally cannot (#137):
      in an ASSERTS build, so the rule cannot drift from what the compiler
      emits.
 
+     TWO STORE-OPERAND RULES (2026-09-21, found auditing the store family's
+     operand layouts): a `chain_locs` entry a TWO-LEVEL op dereferences is
+     required to hold at least TWO pairs - `StoreElem2V` (whose entry index,
+     `a_dual_hi`, was not bounded at all) and the fused `LoadElem2Int` /
+     `LoadElem2Float` read `locs[0]` and `locs[1]`, and the load-time JIT
+     bakes the entry's address, so a one-pair entry (which a
+     `StoreElemChainV` may legitimately own) is a read past its end.  And an
+     operand the VM reads as a SLOT unconditionally - the key and value of
+     `DictStore` and `StoreElemValue`, the value of `StoreMemberV` and the
+     k2 of `StoreElem2V` (the compiler materialises every literal into a
+     temp for these; only `StoreElemInt`/`StoreElemFloat` take a literal) -
+     is refused when its lit flag is set, instead of the bound being
+     skipped: one mutated `opflags` bit had let the handler index the frame
+     with the raw payload.
+
   4. THE VALUE-DEPENDENT RESIDUE (ML_UNTRUSTED_CHECK, defs.h).  A few facts
      no load-time pass can decide, because they are properties of the VALUE a
      slot holds rather than of the image: a flat array's storage-kind union

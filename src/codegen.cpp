@@ -10099,6 +10099,43 @@ struct ChunkVerifier {
             reg(in.b_slot());
     }
     void ab_regs(const Instr &in) const { a_reg(in); b_reg(in); }
+    /*
+     * An operand the VM reads as a SLOT whatever the lit flag says
+     * (`frame->at(in->a_slot())` in DictStore / StoreElemValue /
+     * StoreMemberV / StoreElem2V - codegen materialises every literal
+     * into a temp first, so a set flag never comes from a compile).
+     * `a_reg`/`b_reg` SKIP the bound on a lit flag, and on these ops
+     * that skip was a hole: one mutated opflags bit and the handler
+     * indexed the frame with the payload, unchecked in a release build
+     * (2026-09-21, found auditing the store family for #25).
+     */
+    void a_slot_only(const Instr &in) const
+    {
+        if (in.a_is_lit())
+            reject("a literal where a slot is read");
+        reg(in.a_slot());
+    }
+    void b_slot_only(const Instr &in) const
+    {
+        if (in.b_is_lit())
+            reject("a literal where a slot is read");
+        reg(in.b_slot());
+    }
+    /*
+     * A chain_locs entry a TWO-LEVEL op dereferences as a PAIR:
+     * vm_nested_subscript_store / jit_store_elem2 read locs[0] and
+     * locs[1], the fused reads `&locs[1]` - so bounding the INDEX alone
+     * (as LoadElem2Int/Float did) still lets a one-pair entry, which a
+     * StoreElemChainV legitimately owns, be read past its end. The
+     * StoreElem2V index was not bounded at all: the VM indexes the pool
+     * with it and the load-time JIT bakes the entry's `.data()`.
+     */
+    void chain_pair(int_type i) const
+    {
+        pool(i, ck.chain_locs.size(), "chain locs");
+        if (ck.chain_locs[static_cast<size_t>(i)].size() < 2)
+            reject("chain locs pair");
+    }
 
     void verify_one(const Instr &in);
 };
@@ -10274,7 +10311,7 @@ void ChunkVerifier::verify_one(const Instr &in)
         reg(in.target);
         reg(in.target2);
         reg(in.a_dual_lo());
-        pool(in.a_dual_hi(), ck.chain_locs.size(), "chain locs");
+        chain_pair(in.a_dual_hi());
         b_reg(in);
         break;
     case OpCode::LoadStructFieldInt:
@@ -10335,20 +10372,28 @@ void ChunkVerifier::verify_one(const Instr &in)
     /* --- element / member STORES (target = the base's slot KIND) ------ */
     case OpCode::StoreElemInt:
     case OpCode::StoreElemFloat:
+        base(in.target, in.target2);
+        ab_regs(in);                    /* index, value: slot or literal */
+        break;
     case OpCode::StoreElemValue:
     case OpCode::DictStore:
         base(in.target, in.target2);
-        ab_regs(in);                    /* index, value */
+        a_slot_only(in);                /* key / index: always a slot */
+        b_slot_only(in);                /* value: always a slot */
         break;
     case OpCode::StoreMemberV:
         base(in.target, in.target2);
         pool(in.a_lit(), ck.member_keys.size(), "member key");
-        b_reg(in);
+        b_slot_only(in);                /* value: always a slot */
         break;
     case OpCode::StoreElem2V:
-        reg(in.target);                 /* the VALUE (a plain slot here) */
+        /* value in `target`, base in `target2`, a_dual = (k1 slot,
+         * chain_locs idx - a PAIR the store dereferences), k2 in `b`. */
+        reg(in.target);
         reg(in.target2);
-        ab_regs(in);                    /* the two indexes */
+        reg(in.a_dual_lo());
+        chain_pair(in.a_dual_hi());
+        b_slot_only(in);
         break;
     case OpCode::StoreElemChainV:
         /* a_dual = (chain_locs idx, base kind); the keys are the run
