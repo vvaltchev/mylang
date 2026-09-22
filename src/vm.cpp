@@ -3467,6 +3467,9 @@ unsigned long g_jit_frameless_rets = 0;    /* #97 inc 2: frameless RETURN
 unsigned long g_jit_frameless_init_free = 0; /* #97 inc 3 W3: window slots
                                               * a site left uninitialised
                                               * (emit-time) */
+unsigned long g_jit_frameless_capbase = 0;   /* #97 inc 3 W4: sites that
+                                              * skip the captures repoint
+                                              * (emit-time) */
 unsigned long g_jit_arg_scalar = 0;
 
 #ifdef TESTS
@@ -3487,10 +3490,13 @@ struct JitPoisonType final : Type {
     [[noreturn]] static void hit(const char *op)
     {
         fprintf(stderr,
-                "\n*** W3 POISON HIT (%s): a helper read the old state of a "
-                "frameless window slot the site left uninitialised - "
-                "jit_instr_stores_dst_raw admits an op whose helper tier "
-                "writes its dst through LValue::put ***\n", op);
+                "\n*** POISON HIT (%s): a helper read a value the frameless "
+                "site poisoned - W3: the old state of a window slot the site "
+                "left uninitialised (jit_instr_stores_dst_raw admits an op "
+                "whose helper tier writes its dst through LValue::put); or "
+                "W4: ctx->captures inside a W4 callee (jit_op_w4_safe admits "
+                "an op whose helper reads it, and jit_w4_unsafe_helpers "
+                "does not list that helper) ***\n", op);
         fflush(stderr);
         abort();
     }
@@ -4136,6 +4142,68 @@ extern "C" void jit_store_capture(int_type cap_slot,
     ML_JIT_OP_RAN(StoreCaptureV);
     (*g_current_ctx->captures)[cap_slot].put(RValue(*src));
 }
+
+/*
+ * #97 INCREMENT 3 (W4): THE BASE-RELATIVE TWINS. A run that holds the
+ * capture base in a register (#112's capbase) hands it to its helper
+ * arms as an ARGUMENT, so the helper reads the same array the inline
+ * path does - and never `ctx->captures`. That is what lets a frameless
+ * site skip repointing ctx.captures for the callee (W4): under it the
+ * running closure's captures are reachable ONLY through the register
+ * the entry loaded from the FuncObject, and ctx->captures still names
+ * the CALLER's (a TESTS build points it at the poison below, so a read
+ * of it aborts by name instead of returning the caller's values).
+ */
+extern "C" void jit_load_capture_at(int_type dst, const LValue *base,
+                                    int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadCaptureV);
+    g_current_ctx->frame->at(dst).put(base[idx].get());
+}
+
+extern "C" void jit_store_capture_at(LValue *base, int_type cap_slot,
+                                     const EvalValue *src) noexcept
+{
+    ML_JIT_OP_RAN(StoreCaptureV);
+    base[cap_slot].put(RValue(*src));
+}
+
+#ifdef TESTS
+/*
+ * W4's net (see jit_poison_type for the W3 twin): the CaptureSlots a
+ * W4 site installs as ctx.captures for the callee's duration in a TESTS
+ * build. Every slot's type word names the poison type, so a helper that
+ * reads `ctx->captures` inside a W4 callee - one the emitter's
+ * classification wrongly admitted, or one missing from its unsafe
+ * list - aborts by name on its first lifecycle op. Built once, never
+ * destroyed (its destructor would run the poison's), reachable through
+ * the global so it is no leak; 64 slots, more than any closure captures.
+ */
+static CaptureSlots *g_jit_poison_caps = nullptr;
+
+const void *jit_poison_captures()
+{
+    if (!g_jit_poison_caps) {
+        CaptureSlots *cs = new CaptureSlots;
+        cs->reserve(64);
+        for (int i = 0; i < 64; i++)
+            cs->emplace_back(EvalValue(), false);
+        /* the type word's offset, probed the way jit_layout() probes
+         * it (LValue::val is private; its payload is at +0 of val) */
+        const ptrdiff_t ty_off =
+            reinterpret_cast<const char *>(&(*cs)[0].get())
+            - reinterpret_cast<const char *>(&(*cs)[0])
+            + static_cast<ptrdiff_t>(EvalValue::jit_type_off());
+        const void *poison = jit_poison_type();
+        for (int i = 0; i < 64; i++) {
+            char *slot = reinterpret_cast<char *>(&(*cs)[i]);
+            std::memcpy(slot + ty_off, &poison, sizeof poison);
+        }
+        g_jit_poison_caps = cs;
+    }
+    return g_jit_poison_caps;
+}
+#endif
 
 /*
  * model-flip (nativize-ops): the native LoadGlobalV body - `frame[dst] =
@@ -6688,6 +6756,10 @@ extern "C" void jit_ret_audit() noexcept
              * claims - anywhere else it is the site writing a slot the
              * derivation did not clear, and stays an abort. */
             if (win[i].get().get_type() == jit_poison_type()) {
+                /* (W4's poison CAPTURES carry the same type: a slot
+                 * holding it that the chunk does not claim means a
+                 * capture was copied in through ctx->captures - which
+                 * is how the epilogue's capbase refresh was caught) */
                 ML_VM_CHECK(i < 64
                             && (my_ck->frameless_init_free >> i & 1));
                 continue;

@@ -1945,6 +1945,21 @@ struct Chunk {
      */
     uint64_t frameless_init_free = 0;
     /*
+     * #97 increment 3 (W4): this chunk's frameless callee runs without
+     * ctx.captures being repointed to its FuncObject's capture slots - the
+     * site skips the repoint, the return arm the restore, and the
+     * frameless ENTRY loads the capture data pointer straight from the
+     * FuncObject (rdx at the call) into the run's capbase register. True
+     * iff no op in the body can reach `ctx->captures` at run time (the
+     * plain capture ops go through capbase and its base-relative helper
+     * twins; every other reader - a compound capture store, a closure
+     * creation, an inc/dec, an append, a builtin-LV call, the kind-based
+     * stores - refuses). WRITTEN BY THE JIT at this chunk's compile (the
+     * claim of capbase is the allocator's), before main - the reader -
+     * is compiled; never stored.
+     */
+    bool frameless_capbase = false;
+    /*
      * #97 increment 2 (F6): main NAMES this chunk at a site the shared
      * predicate (jit_frameless_callee) says will be frameless - so the
      * frameless ENTRY and the frameless RETURN ARM are worth emitting.

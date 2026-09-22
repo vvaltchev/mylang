@@ -368,13 +368,13 @@ enum JitLever {
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
     JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA,
-    JL_FRAMELESS, JL_COUNT
+    JL_FRAMELESS, JL_CAPPROT, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
-    "peep", "bakecallee", "capbase", "lsra", "frameless"
+    "peep", "bakecallee", "capbase", "lsra", "frameless", "capprot"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -2268,6 +2268,15 @@ struct Emitter {
      */
     int capbase = -1;
     /*
+     * #97 inc 3 (W4): this run's capture base came from the FuncObject
+     * at a frameless entry and MUST NOT be refreshed from ctx: under W4
+     * ctx.captures still names the CALLER's captures for the whole call
+     * (a TESTS build's site points it at the poison). The register is
+     * callee-saved, so it survives every helper call with its value
+     * intact - the walk below is skipped, not replaced.
+     */
+    bool capbase_fixed = false;
+    /*
      * The walk, through the DESTINATION register - no scratch at all,
      * which is what lets it run at the epilogue where rax carries the
      * helper's status (the flit_load lesson below, avoided by
@@ -3307,26 +3316,42 @@ struct Emitter {
      * emitted sync `call rdx`, or a native_leaf direct call). rbx and the
      * cache registers are callee-saved, so save the caller's and take them
      * over. Called AFTER `saved` is filled (the cache pick decides it). */
-    void frag_entry(bool load_window = true)
+    void frag_entry(bool load_window = true, bool keep_rdx = false)
     {
         /* the entry pushes are teardown-balanced (frag_ret), not
          * op-balanced - machinery, like frag_ret's pops already are.
          * `load_window` = false for the FRAMELESS entry (#97 inc 2),
          * which carves its own window on the stack right after and
-         * would only overwrite the `mov rbx, rdi`. */
+         * would only overwrite the `mov rbx, rdi`. `keep_rdx` (W4): the
+         * frameless entry reads the FuncObject the site left in rdx
+         * AFTER the prologue, so the TESTS probe below - a C++ call,
+         * which clobbers rdx - must save it. */
         PinMach pm(*this);
 #ifdef TESTS
         /* G1 step 2: hand the HARDWARE return address to the table check
          * before anything else runs. One push keeps the entry parity
          * (rsp%16: 8 -> 0 == call-ready); rdi (the window argument) is
-         * the only live register at entry and is saved around the call. */
+         * the only live register at entry and is saved around the call.
+         * With keep_rdx THREE pushes (rdx twice - the second is the
+         * parity filler - then rdi) keep the same parity. */
+        if (keep_rdx) {
+            /* fo - the push protocol's register - and a parity filler */
+            push_reg(RDX);                                /* reg:proto */
+            push_reg(RDX);                                /* reg:proto */
+        }
         push_reg(REG_ARG0);              /* save rdi (reg:abi) */
-        u8(0x48); u8(0x8B); u8(0x7C); u8(0x24); u8(0x08);
-                                                  /* mov rdi, [rsp+8] */
+        u8(0x48); u8(0x8B); u8(0x7C); u8(0x24);
+        u8(keep_rdx ? 0x18 : 0x08);      /* mov rdi, [rsp+8 | rsp+24] */
         movabs(0 /* RAX */, reinterpret_cast<uint64_t>(
                                 &jit_norec_ret_verify));
         call_rax();   /* reg:abi */
         pop_reg(REG_ARG0);                            /* reg:abi */
+        if (keep_rdx) {
+            pop_reg(RDX);                                 /* reg:proto */
+            pop_reg(RDX);                                 /* reg:proto */
+        }
+#else
+        (void)keep_rdx;
 #endif
       /* G1 STEP 3 - THE FRAME-POINTER CHAIN (plans/archived/g1-no-record-tier.md,
       
@@ -6968,6 +6993,141 @@ static size_t jit_capbase_uses(const Chunk &ck, size_t begin, size_t end)
     return n;
 }
 
+/*
+ * #97 INCREMENT 3 (W4): CAN THIS BODY RUN WITH ctx.captures LEFT ALONE?
+ *
+ * A frameless site repoints ctx.captures to the callee's FuncObject
+ * capture slots before the call and the return arm restores the
+ * caller's after it - five instructions per call that exist so that
+ * whatever reads `ctx->captures` inside the callee finds the callee's
+ * array. Under W4 the callee's frameless ENTRY loads that array's data
+ * pointer straight from the FuncObject (rdx at the call) into the run's
+ * capbase register, every plain capture access reads through it (the
+ * inline path, or the base-relative helper twins), and ctx.captures is
+ * never touched: it still names the CALLER's captures for the whole
+ * call. So the gate is exactly "no op in the body can reach
+ * ctx->captures at run time", which is a property of the HELPERS an
+ * op's emission may call - and the helpers that read it are a closed
+ * list (grep `ctx->captures` / `ctx.captures` in vm.cpp, plus
+ * jit_make_closure through the FuncObject ctor's read_sym_lv):
+ *   jit_load_capture / jit_store_capture (the non-capbase arms),
+ *   jit_store_capture_compound, jit_make_closure, the four jit_incdec_*,
+ *   jit_append, the three jit_call_builtin_lv*, jit_emplace_struct,
+ *   jit_store_elem_value / _chain, jit_store_member,
+ *   jit_store_lvalue_chain.
+ *
+ * TWO LAYERS DECIDE IT, and the second checks the first:
+ *  - jit_op_w4_safe, a per-instruction WHITELIST with a false default,
+ *    decides BEFORE emission (the return arm is emitted mid-body and
+ *    the site in main, so the answer must not depend on what the body
+ *    turned out to emit). The plain capture ops are admitted on the
+ *    condition that the run holds capbase (jit_chunk_w4 checks it);
+ *  - jit_w4_helpers_ok, AFTER the run is emitted, walks every call the
+ *    emission recorded and refuses any target in the list above -
+ *    stated as an ML_CHECK, because a whitelisted op that reaches one
+ *    of those helpers on some arm is a wrong ROW, and a wrong row here
+ *    is a callee reading its caller's captures.
+ * A TESTS build adds the third layer at run time: the site installs
+ * jit_poison_captures() as ctx.captures for the callee's duration, so a
+ * reader the list is missing aborts by name (W3's poison, one level up).
+ */
+static bool jit_op_w4_safe(const Instr &in)
+{
+    switch (in.op) {
+    /* the plain capture ops: through capbase (jit_chunk_w4 requires it) */
+    case OpCode::LoadCaptureV:
+        return true;
+    case OpCode::StoreCaptureV:
+        return in.aop == Op::invalid;
+    /* raw-storing arithmetic and compares (W3's list) */
+    case OpCode::IntBin:
+    case OpCode::IntAddRR: case OpCode::IntSubRR: case OpCode::IntMulRR:
+    case OpCode::IntAndRR: case OpCode::IntOrRR:  case OpCode::IntXorRR:
+    case OpCode::IntAddRI: case OpCode::IntSubRI: case OpCode::IntMulRI:
+    case OpCode::IntAndRI: case OpCode::IntOrRI:  case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShrRR:
+    case OpCode::IntShlRI: case OpCode::IntShrRI:
+    case OpCode::IntModRI: case OpCode::IntAddModRI:
+    case OpCode::LoadImmInt:
+    case OpCode::FloatBin:
+    case OpCode::FloatAddRR: case OpCode::FloatSubRR:
+    case OpCode::FloatMulRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRI: case OpCode::FloatMulRI:
+    case OpCode::LoadImmFloat:
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
+    /* slot-only moves, loads, branches, the terminators */
+    case OpCode::MoveV: case OpCode::LoadConstV:
+    case OpCode::Jump: case OpCode::JumpUnlessTrueV:
+    case OpCode::JumpUnlessIntCmp: case OpCode::JumpUnlessFloatCmp:
+    case OpCode::JumpIfNotNoneV: case OpCode::JumpUnlessElemInt:
+    case OpCode::ForLoopStep: case OpCode::IntAddStep:
+    case OpCode::ForStepElemInt:
+    case OpCode::ReturnV: case OpCode::Halt:
+    /* slot-based element / member / dict reads and the flat stores */
+    case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+    case OpCode::LoadElemBool: case OpCode::LoadElemValue:
+    case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
+    case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
+    case OpCode::LoadMemberInt: case OpCode::LoadMemberFloat:
+    case OpCode::LoadStructFieldInt: case OpCode::LoadStructFieldFloat:
+    case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
+    case OpCode::ArrLen: case OpCode::StrLen: case OpCode::LoadStrChar:
+    case OpCode::StructFieldAddInt:
+    /* the boxed family: slot operands through the pool entry */
+    case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
+    case OpCode::UnaryV: case OpCode::CoerceNumV: case OpCode::MathFnV:
+    case OpCode::SubscriptV: case OpCode::MemberV:
+    /* the global table, not the capture array */
+    case OpCode::LoadGlobalV: case OpCode::DefinedGlobalV:
+        return true;
+    case OpCode::StoreGlobalV:
+        return in.aop == Op::invalid;
+    default:
+        return false;
+    }
+}
+
+/* every helper whose body reads ctx->captures (the list above) */
+static const void *const jit_w4_unsafe_helpers[] = {
+    reinterpret_cast<const void *>(jit_load_capture),
+    reinterpret_cast<const void *>(jit_store_capture),
+    reinterpret_cast<const void *>(jit_store_capture_compound),
+    reinterpret_cast<const void *>(jit_make_closure),
+    reinterpret_cast<const void *>(jit_incdec_checked),
+    reinterpret_cast<const void *>(jit_incdec_elem),
+    reinterpret_cast<const void *>(jit_incdec_member),
+    reinterpret_cast<const void *>(jit_incdec_chain),
+    reinterpret_cast<const void *>(jit_append),
+    reinterpret_cast<const void *>(jit_call_builtin_lv),
+    reinterpret_cast<const void *>(jit_call_builtin_lv_elem),
+    reinterpret_cast<const void *>(jit_call_builtin_lv_member),
+    reinterpret_cast<const void *>(jit_emplace_struct),
+    reinterpret_cast<const void *>(jit_store_elem_value),
+    reinterpret_cast<const void *>(jit_store_elem_chain),
+    reinterpret_cast<const void *>(jit_store_member),
+    reinterpret_cast<const void *>(jit_store_lvalue_chain),
+};
+
+static bool jit_w4_helpers_ok(const Emitter &e)
+{
+    for (const auto &r : e.call_relocs)
+        for (const void *h : jit_w4_unsafe_helpers)
+            if (r.fn == h)
+                return false;
+    return true;
+}
+
+/* the STATIC half of the W4 decision for a whole-body run: every op
+ * whitelisted; the plain capture ops need capbase, which the caller
+ * checks against the allocator's answer */
+static bool jit_chunk_w4_static(const Chunk &ck)
+{
+    for (const Instr &in : ck.code)
+        if (!jit_op_w4_safe(in))
+            return false;
+    return true;
+}
+
 /* The INVERTED form for the de-helperize inline paths: jump NEAR to the
  * HELPER fallback when the value at `type_off` is a REFERENCE (type->t >=
  * t_str); fall through for a trivial value. Returns the jae rel32 site to
@@ -7332,8 +7492,16 @@ static void emit_call_epilogue(Emitter &e)
      * closure bodies in 11_closure_counter and 63_closures make no
      * helper call at all, which is why removing it would be measured in
      * noise. Delete it only with a test that FAILS without it.
+     *
+     * #97 inc 3 (W4) FOUND THE OPPOSITE: a run whose base came from the
+     * FuncObject at its frameless entry (capbase_fixed) must NOT refresh
+     * it - under W4 ctx.captures is the CALLER's, and this walk read the
+     * poison a TESTS site installs (watched: the 1c opt-int closure's
+     * early return carried the poison type into the C3 audit). So it is
+     * gated, and the gate IS the test that fails with the refresh on.
      */
-    e.capbase_load();
+    if (!e.capbase_fixed)
+        e.capbase_load();
     if (g_hoist.active) {
         /*
          * Re-derive via RCX - RAX carries the helper's status, which
@@ -10259,11 +10427,29 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                         static_cast<int32_t>(jit_layout().ctx_captures));
                                                   /* push [r9+caps]: the
                                                    * caller's captures */
-            /* ctx.captures = &fo.capture_slots */
-            e.lea_base(RAX, RDX,                  /* reg:proto */
-                       static_cast<int32_t>(JP.fo_capture_slots));
-            e.store_base(RAX, R9,                 /* reg:proto */
-                         static_cast<int32_t>(jit_layout().ctx_captures));
+            if (!fl_ck->frameless_capbase) {
+                /* ctx.captures = &fo.capture_slots */
+                e.lea_base(RAX, RDX,              /* reg:proto */
+                           static_cast<int32_t>(JP.fo_capture_slots));
+                e.store_base(RAX, R9,             /* reg:proto */
+                             static_cast<int32_t>(
+                                 jit_layout().ctx_captures));
+            } else {
+                /* W4: the callee's entry takes its capture base from
+                 * rdx (fo) itself and nothing in its body reads
+                 * ctx->captures - so the repoint is not emitted. In a
+                 * TESTS build the POISON captures go there instead
+                 * (jit_poison_captures: a reader the classification
+                 * missed aborts by name; the arm restores the caller's) */
+#ifdef TESTS
+                e.movabs(RAX, reinterpret_cast<uint64_t>(   /* reg:proto */
+                                  jit_poison_captures()));
+                e.store_base(RAX, R9,             /* reg:proto */
+                             static_cast<int32_t>(
+                                 jit_layout().ctx_captures));
+                g_jit_frameless_capbase++;        /* emit-time */
+#endif
+            }
 #ifdef TESTS
             g_jit_frameless_sites++;              /* emit-time */
             e.bump_counter(&g_jit_frameless_pushes);
@@ -11151,11 +11337,20 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                     e.u8(0xE8); e.u32(0);
                     e.patch32_here(j_tr);
                 }
-                /* ctx.captures = the caller's, from the residue */
+                /* ctx.captures = the caller's, from the residue - unless
+                 * the site never repointed it (W4: the callee reached
+                 * its captures through capbase alone). A TESTS build
+                 * restores regardless: its W4 site installed the poison
+                 * captures, which must not outlive the call. */
+#ifndef TESTS
+                if (!ck.frameless_capbase)
+#endif
+                {
                 e.load_global(R9R, L.addr_ctx, RAX);   /* reg:proto */
                 ld(RAX, 5, 16);
                 st(R9R, static_cast<int32_t>(L.ctx_captures), RAX);
                                                        /* reg:proto */
+                }
 #ifdef TESTS
                 e.bump_counter(&g_jit_native_returns);
                 e.bump_counter(&g_jit_norec_ret_arm);  /* a record-less
@@ -12385,6 +12580,7 @@ void jit_stats_report()
         { "frameless_pushes",  &g_jit_frameless_pushes },
         { "frameless_rets",    &g_jit_frameless_rets },
         { "frameless_init_free", &g_jit_frameless_init_free },
+        { "frameless_capbase", &g_jit_frameless_capbase },
         { "arg_stage",        &g_jit_arg_stage },
         { "sync_switch",      &g_jit_sync_switch },
         { "cached_probe_calls", &g_jit_cached_probe_calls },
@@ -20446,9 +20642,22 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.patch32_here(sj);
         emit_call_prologue(e);
         e.mov_imm(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
-        e.mov_imm(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
-        e.call_relocs.push_back(
-            { e.pos(), reinterpret_cast<const void *>(jit_load_capture) });
+        if (cpin) {
+            /* W4: the helper reads the array the base register names,
+             * never ctx->captures (cb is callee-saved: it survives the
+             * prologue's spills) */
+            e.mov_rr(RSI, cb);                              /* reg:abi */
+            e.mov_imm(RDX, static_cast<uint64_t>(
+                               static_cast<int_type>(in.target2)));
+            e.call_relocs.push_back(
+                { e.pos(),
+                  reinterpret_cast<const void *>(jit_load_capture_at) });
+        } else {
+            e.mov_imm(RSI, static_cast<uint64_t>(
+                               static_cast<int_type>(in.target2)));
+            e.call_relocs.push_back(
+                { e.pos(), reinterpret_cast<const void *>(jit_load_capture) });
+        }
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         /* #113: the helper's status clobbered the bus - reload it on
@@ -22726,11 +22935,24 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                                         * static_cast<long>(sizeof(LValue)));
         };
         emit_call_prologue(e);
-        e.lea(RSI, off(in.a_slot()));       /* rsi = &slot[src] (uses rdi) */
-        e.mov_imm(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
-        e.call_relocs.push_back(
-            { e.pos(), reinterpret_cast<const void *>(
-                is_cap ? jit_store_capture : jit_store_global) });
+        if (cpin) {
+            /* W4: base-relative (see LoadCaptureV's arm) - rdi = the
+             * base, rsi = the slot index, rdx = &slot[src] */
+            e.lea(RDX, off(in.a_slot()));   /* rdx = &slot[src] (uses rdi) */
+            e.mov_imm(RSI, static_cast<uint64_t>(
+                               static_cast<int_type>(in.target)));
+            e.mov_rr(RDI, cb);                              /* reg:abi */
+            e.call_relocs.push_back(
+                { e.pos(),
+                  reinterpret_cast<const void *>(jit_store_capture_at) });
+        } else {
+            e.lea(RSI, off(in.a_slot()));   /* rsi = &slot[src] (uses rdi) */
+            e.mov_imm(RDI, static_cast<uint64_t>(
+                               static_cast<int_type>(in.target)));
+            e.call_relocs.push_back(
+                { e.pos(), reinterpret_cast<const void *>(
+                    is_cap ? jit_store_capture : jit_store_global) });
+        }
         e.u8(0xE8); e.u32(0);
         emit_call_epilogue(e);
         e.patch32_here(j_done);
@@ -25659,6 +25881,7 @@ retry_emission:
                                  * capture base would let the next
                                  * fragment read a register it never
                                  * walked the ctx chain into */
+        e.capbase_fixed = false; /* W4: per-RUN too */
         e.released.clear();     /* C5: per-RUN AND per-pc below (a stale
                                  * entry would let a store skip a guard
                                  * nothing released - the C2a fcache bug) */
@@ -26482,8 +26705,26 @@ retry_emission:
          * pool. The register is never rax, so the accumulator
          * machinery's "no rax pin present" abort is out of reach.
          */
+        /*
+         * #97 inc 3 (W4): a whole-body run that main will call
+         * FRAMELESSLY and whose every op is W4-safe (jit_op_w4_safe)
+         * claims the base from ONE access up - under W4 the frameless
+         * entry loads it in one instruction from the FuncObject instead
+         * of the three-load walk, and holding it is what lets the site
+         * drop the ctx.captures repoint and the arm its restore. The
+         * decision itself is taken right after the claim, because the
+         * arm (emitted mid-body), the entry (after the body) and main's
+         * site (compiled last) must all read the same answer.
+         */
+        const bool w4_run = chunk.frameless_ok && chunk.frameless_wanted
+                            && g_cur_caller_desc && runs.size() == 1
+                            && begin == 0 && end == n
+                            && !jit_lever_off(JL_FRAMELESS)
+                            && !jit_lever_off(JL_CAPPROT)
+                            && jit_chunk_w4_static(chunk);
+        const size_t cap_uses = jit_capbase_uses(chunk, begin, end);
         if (!jit_lever_off(JL_CAPBASE)
-                && jit_capbase_uses(chunk, begin, end) >= 2) {
+                && (cap_uses >= 2 || (w4_run && cap_uses >= 1))) {
             /* ⛔ IT IS A BASE REGISTER, NOT A VALUE REGISTER, AND THAT
              * EXCLUDES r12 - which is `CAP_MEM_BASE` and is why the
              * capability exists. Every access addresses off it
@@ -26517,6 +26758,11 @@ retry_emission:
             if (cb >= 0)
                 e.capbase = cb;
         }
+        /* W4: decided here, once (Chunk::frameless_capbase's contract) */
+        chunk.frameless_capbase =
+            w4_run && !jit_lever_off(JL_CAPBASE)
+            && (cap_uses == 0 || e.capbase >= 0);
+        e.capbase_fixed = chunk.frameless_capbase;
         if (pair_lo >= 0) {
             e.saved.push_back(static_cast<uint8_t>(pair_lo));
             e.saved.push_back(static_cast<uint8_t>(pair_hi));
@@ -27857,7 +28103,7 @@ retry_emission:
          * used to hold it inline, and a second entry kind is exactly
          * the moment two copies would start to drift.
          */
-        const auto establish = [&](size_t at_pc) {
+        const auto establish = [&](size_t at_pc, bool frameless = false) {
             {
                 /* the tracker: entry establishment is machinery - the
                  * loads are the pin loads. The flit loads below stay
@@ -27868,6 +28114,23 @@ retry_emission:
                 Emitter::PinMach pm(e);
                 e.trk_flushed = false;
                 e.trk_flushdirty = 0;
+                /*
+                 * #97 inc 3 (W4): at the FRAMELESS entry of a W4 chunk
+                 * the capture base comes from the FuncObject the site
+                 * still holds in rdx - ONE load, in place of the
+                 * three-load walk through ctx (capbase_load below, which
+                 * would read the CALLER's captures: the W4 site did not
+                 * repoint them). FIRST, before the pin loads: rdx can
+                 * itself be a pin register (the optimistic rdx), and
+                 * capbase is callee-saved, so this order clobbers
+                 * nothing. The ordinary entry keeps the walk - its push
+                 * repointed ctx.captures as always.
+                 */
+                if (frameless && chunk.frameless_capbase && e.capbase >= 0)
+                    e.load_base(static_cast<uint8_t>(e.capbase),
+                                RDX,                         /* reg:proto */
+                                static_cast<int32_t>(
+                                    jit_push_layout().fo_capture_slots));
                 /* BEFORE the pin loads: r8 may be both the singleton
                  * and a pin register, and the pin must win. */
                 emit_type_tags(e);
@@ -27961,7 +28224,8 @@ retry_emission:
              * capture base currently has an entry stub; it is here for
              * the day one does, when its absence would be a read
              * through a garbage pointer rather than a wrong number. */
-            e.capbase_load();                     /* #112 capture base */
+            if (!(frameless && chunk.frameless_capbase))
+                e.capbase_load();                 /* #112 capture base */
         };
 
         /* PER-PC ENTRY STUBS (post-call resume): an interior offset cannot
@@ -28036,7 +28300,8 @@ retry_emission:
             /* the frame build is pin MACHINERY to the tracker: no pin
              * is live before establish() below loads it */
             Emitter::PinMach pm(e);
-            e.frag_entry(/*load_window=*/false);  /* rdi: unused here */
+            e.frag_entry(/*load_window=*/false,   /* rdi: unused here */
+                         /*keep_rdx=*/chunk.frameless_capbase);
             /* the window the caller built: [rbp+32] (the contract) */
             e.lea_base(RBX, RBP, JIT_FRAMELESS_WIN_OFF);
             /* act.vframe = this window (helpers read the frame there);
@@ -28048,8 +28313,15 @@ retry_emission:
                 static_cast<int32_t>(P.act_vframe + P.frame_size),
                 static_cast<uint32_t>(total));
             }                                    /* end of the machinery */
-            establish(begin);
+            establish(begin, /*frameless=*/true);
             entry_proofs();
+            /* W4's second layer: no call this body emitted reaches a
+             * helper that reads ctx->captures (jit_w4_unsafe_helpers) -
+             * a wrong row in jit_op_w4_safe fails here, at compile time,
+             * on the first program that has the op in a W4 body */
+            if (chunk.frameless_capbase && !jit_w4_helpers_ok(e))
+                ML_CHECK_MSG(false, "W4: a whitelisted op emitted a call "
+                                    "to a helper that reads ctx->captures");
 #ifdef TESTS
             g_jit_frameless_entries++;
 #endif

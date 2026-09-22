@@ -67,10 +67,10 @@ before E3/W3, read 34 5.28x ... 78 10.35x, 76 11.45x):**
     75_indexed_unpack             0.210      0.024    8.88x
     76_funcval_dispatch           0.172      0.018    9.80x
 
-STOPPED HERE (2026-09-20, the maintainer's call); the work resumes
-with §1.6's list: W4 the capture base, the parameter tails' zeroing,
-`visit_use_def` learning the element-store family (it is what keeps
-W3 off 76), then E2 for 09.
+RESUMED 2026-09-21 with W4 (done). Next per §1.6: the parameter
+tails' zeroing, `visit_use_def` learning the element-store family (it
+is what keeps W3 off 76), a caller-saved capture base for a body with
+no helper call (the 2 W4 does not recover), then E2 for 09.
 
 ### 1.1 What is DONE
 
@@ -497,7 +497,9 @@ work — but profile it before building, the way increment 0 was.
         then E3 (done the same day: the two-way site serves 76), then
         W3 the init elision (done: a raw-written unlisted slot is left
         uninitialised, poisoned in TESTS builds - 78's add(i) 73 -> 66
-        per call), then the capture base (W4, site-local now).
+        per call), W4 the capture base (done 2026-09-21: the entry
+        loads it from fo, ctx.captures untouched, poisoned in TESTS
+        builds - 78 -7.1% Ir, 11 -8.9%, 76 -2.0%).
     3.  E2 - drop the leaf rule. Serves 09_fib. GATE includes
         norec_enum --depth 4 (2272 programs x 4 engines), because a
         throw crossing a frameless frame is exactly its shape space.

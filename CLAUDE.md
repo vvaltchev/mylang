@@ -1165,7 +1165,15 @@ collision). Three nets now:
   ref-listed and written ONLY by ops in `jit_instr_stores_dst_raw` -
   a per-INSTRUCTION whitelist an op joins only when EVERY tier of its
   emission stores the dst raw; a TESTS build poisons such a slot with
-  `jit_poison_type`, so a wrong row aborts by name), xcache (#96: the
+  `jit_poison_type`, so a wrong row aborts by name), capprot (W4: a
+  W4 callee's frameless site leaves `ctx.captures` ALONE - the entry
+  takes the capture base from the FuncObject in rdx - which is sound
+  only while NO op in the body can reach `ctx->captures`: the
+  `jit_op_w4_safe` whitelist, the post-emission check over the
+  emitted call targets against `jit_w4_unsafe_helpers`, and a TESTS
+  build's `jit_poison_captures()` installed as ctx.captures. A helper
+  that starts reading `ctx->captures` joins that list - the poison is
+  what tells you it did not), xcache (#96: the
   CALLER-saved half of the
   pin pool - it holds hot locals too, spilled/reloaded around every
   helper call by emit_call_prologue/epilogue. **Which members a run

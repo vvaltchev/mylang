@@ -500,12 +500,16 @@ Each ends with a MEASUREMENT that can kill the next one.
    record: docs/jit-optimizations.md *#97 increment 3, W1*; it puts
    every per-callee decision at the site), then the fusion it enables
    (W2), then the init elision and the capture base at the site:**
-   - the CAPTURE PROTOCOL: the body reads captures through
-     `ctx -> captures -> data()` (4 Ir per read) and the site/arm
-     repoint + restore `ctx.captures` (5 Ir); a capture base handed in
-     a register by the site would make the read 1 Ir and delete the
-     repoint - sound only when EVERY capture access in the body is
-     emitted (a helper reading `ctx->captures` would see the caller's);
+   - the CAPTURE PROTOCOL: ✅ W4 (2026-09-21) - the frameless entry
+     loads the capture data pointer from the FuncObject in rdx into
+     the run's capbase register (one load), every access goes through
+     it (the helper arms take it as an argument), and ctx.captures is
+     left alone: no site repoint, no arm restore. Sound exactly when no
+     op in the body can reach `ctx->captures` (a per-instruction
+     whitelist, a post-emission check over the emitted call targets,
+     and a TESTS-build poison installed as ctx.captures). 78's add(i):
+     58 -> 52 per call; 76 -5 per call for free (no captures). Record:
+     *#97 increment 3, W4*. Not recovered: the capbase push/pop (2);
    - the WINDOW INIT: ✅ W3 (2026-09-20) - a slot that is not a
      parameter, not ref-listed and written ONLY by ops that store
      their dst raw (`jit_instr_stores_dst_raw`, a per-instruction

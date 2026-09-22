@@ -12991,3 +12991,125 @@ below the timer's resolution. 78's clock moved 15% on a 7.6% Ir cut -
 the seven deleted stores sat on the call's critical path (a store to
 the window the callee's entry then reads), which is the direction the
 clock and the count usually disagree in on this protocol.
+
+## #97 increment 3, W4 - THE CAPTURE BASE FROM THE SITE: the frameless
+## entry takes the callee's capture array from the FuncObject, and
+## ctx.captures is left alone for the whole call (2026-09-21)
+
+**What it is.** A frameless site repointed `ctx.captures` to the
+callee's FuncObject capture slots before the call (`lea rax,
+[rdx+0x10]; mov [r9+caps], rax`) and the return arm restored the
+caller's after it (`mov r9, [ctx]; mov rax, [rbp+0x10]; mov [r9+caps],
+rax`) - five instructions per call whose only purpose was that whatever
+read `ctx->captures` inside the callee found the callee's array. The
+callee body then either walked `ctx -> captures -> data()` per access
+(three loads) or, with two or more accesses, once at the run head into
+#112's `capbase` register.
+
+Under W4 the body reaches its captures through `capbase` ALONE: the
+frameless ENTRY loads the array's data pointer straight from the
+FuncObject the site still holds in rdx (`mov r13, [rdx+0x10]` - one
+load, no walk), every plain capture access reads or writes through the
+register (the inline paths as before; the helper arms now take the base
+as an ARGUMENT - `jit_load_capture_at` / `jit_store_capture_at`, the
+base-relative twins), and `ctx.captures` is never touched: the site
+neither repoints nor the arm restores. The ordinary entry (a recorded
+push, the C++ tier) still repoints and still walks, so the body is
+shared unchanged.
+
+**The gate is "no op in the body can reach `ctx->captures` at run
+time"**, a property of the HELPERS an op's emission may call, and the
+helpers that read it are a closed list (grep `ctx->captures` /
+`ctx.captures` in vm.cpp, plus `jit_make_closure` through the
+FuncObject constructor's `read_sym_lv`): the non-capbase capture
+helpers, the compound capture store, `jit_make_closure`, the four
+`jit_incdec_*`, `jit_append`, the three `jit_call_builtin_lv*`,
+`jit_emplace_struct`, the kind-based stores (`jit_store_elem_value`,
+`_chain`, `jit_store_member`, `jit_store_lvalue_chain`). THREE LAYERS
+decide and check it:
+ - `jit_op_w4_safe`, a per-instruction WHITELIST with a false default,
+   decides BEFORE emission (the return arm is emitted mid-body, the
+   entry after it, the site in main - all three must read one answer,
+   `Chunk::frameless_capbase`, taken at the run head right after the
+   capbase claim). The plain capture ops are admitted on the condition
+   that the run holds capbase, which W4 claims from ONE access up (the
+   entry's single load makes the register pay at one access where
+   #112 needed two);
+ - `jit_w4_helpers_ok`, AFTER the run is emitted, walks every call the
+   emission recorded (`call_relocs`) and refuses a target in the list -
+   an ML_CHECK, live in every build, because a whitelisted op reaching
+   one of those helpers on some arm is a wrong ROW;
+ - a TESTS build's W4 site installs **`jit_poison_captures()`** as
+   `ctx.captures` for the callee's duration - 64 slots whose type word
+   is W3's poison type - so a reader neither layer knew aborts by name
+   (the arm restores the caller's in a TESTS build, so the poison
+   never outlives the call).
+
+**⛔ THE POISON FOUND ITS FIRST READER INSIDE THE EMITTER.**
+`emit_call_epilogue` re-walked `capbase` from ctx after every helper
+call - the refresh #112's own record calls "unfalsifiable" and keeps
+"until a test fails without it". Under W4 it reads the CALLER's
+captures (the poison, in a TESTS build): the 1c opt-int closure's
+early return carried the poison type into the C3 audit
+(`jit_ret_audit`, which now recognises the poison on a slot the chunk
+does not claim as exactly this). A W4 run sets `Emitter::capbase_fixed`
+and the refresh is skipped - the register is callee-saved and its value
+cannot change under it, which was the redundancy argument all along.
+So that record's condition is met from the other side: the test that
+fails is with the refresh ON, in a W4 body.
+
+**And a second one in the TESTS entry probe:** `frag_entry` opens every
+fragment with a C++ call (`jit_norec_ret_verify`, the hardware return
+address check), which clobbers rdx before the prologue - the W4 load
+read `[0+0x10]` and faulted. The frameless entry of a W4 chunk pushes
+rdx around the probe (`keep_rdx`; three pushes keep the call parity).
+The release build has no probe and no pushes.
+
+**Reach on the target benches** (`frameless_capbase`, emit-time; the
+declines named): 78: 2 of 2 closure sites (the two factories decline -
+MakeClosureV); 11: closure#0 (the `incdec.chk` closure declines -
+jit_incdec_checked); 63: 3 of 5 (the two factories decline); 76: 2 of 2
+(no captures at all: the site's five go, nothing else changes). A
+factory whose closure captures only LOCALS could be admitted by
+checking the def's capture kinds - not done; `jit_make_closure` is in
+the unsafe list whole.
+
+**The expected dump, and the dump** (78's `add(i)`, the perf build,
+W3's tree 67c9b5e as the base):
+
+    site   19 -> 17   the repoint's lea + store gone
+    entry   9 -> 10   `push r13` for `sub rsp, 8`, + `mov r13, [rdx+0x10]`
+    body    8 ->  5   the three-load ctx walk gone
+    arm    19 -> 17   the three-instruction restore gone, `pop r13` in
+    -------------
+           58 -> 52   per call (with the discriminator's 3), -6
+
+Callgrind (OPT=1 ASSERTS=0, -npc, scale 1): 78 **-7.08%**, 11
+**-8.91%**, 63 -2.12%, 76 **-2.00%** (exactly -5 per call, 1,000,000
+calls), 09/12 flat to the instruction. The two of the eight that W4
+does not recover are the capbase push/pop in the frameless prologue
+and epilogue; a caller-saved base would drop them for a body with no
+helper call (78's, 11's) and is the next step on this path if it pays.
+
+**Nets.** `jit_frameless_w4_shape` (a capture-free callee's site goes
+from the residue push to the call - poison form in TESTS; a reference
+capture's read and store arms pass the base register; a factory's site
+keeps the repoint), the W2 shape test's entry/site/arm pins moved to
+the W4 form, four reach cases (values on both engines: a reference
+capture through both `_at` arms, a factory in a loop declining with
+each closure reading its own base, a nested closure capturing a
+capture, an inc/dec closure declining beside a W4 sibling on the same
+capture), `driver_checks.sh` pins the release form (the residue push
+followed straight by the call) and the TESTS form. The lever:
+`MYLANG_JIT_OFF=capprot` (in `corpus_diff --levers`).
+
+**Wall clock, one 1-vs-1 run at the end of the task (W4 vs W3's tree
+67c9b5e; `bench/run.py --mylang build-claude/perf/mylang --baseline
+build-claude/base-67c9b5e/mylang`, -npc, both OPT=1 ASSERTS=0, the
+machine quiet):** 11 **0.83x**, 78 **0.94x**, 63 0.98x, 76 1.01x (its
+-5 Ir per call is 2% of its instructions and does not reach the
+clock), 09/10/12/35/75 0.97-1.00x, geomean cur/base 0.997x over 90;
+52_cse_dedup 1.13x at 2 ms, below the timer's resolution. 11's clock
+moved twice its Ir cut again: the capture read went from three
+dependent loads through ctx to one register-relative load, and that is
+the latency the counter closure's loop sits on.

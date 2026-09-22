@@ -404,6 +404,44 @@ else
     echo "  skip  -vdj W3 site form (this build reports jit 0)"
 fi
 
+# #97 inc 3 W4: the frameless SITE of a W4 callee neither repoints
+# ctx.captures nor restores it - the callee's entry takes its capture
+# base from the FuncObject in rdx. A release build shows the residue
+# push followed STRAIGHT by the call; a TESTS build stores the poison
+# captures between them (movabs + store), so both forms are asserted,
+# over 78's `add(i)` site again (the closure is a W4 body: one proven
+# capture read, one add).
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    site=$("$BIN" -npc -vdj "$here/../bench/my/78_typed_param_call.my" \
+            2>/dev/null | sed -n '/; ===== main/,$p' \
+          | sed -n '/sub rsp, 144/,/call <helper>/p' \
+          | sed -n '1,/call <helper>/p' \
+          | grep -v 'push rax\|inc \[rax+0x0\]\|pop rax')
+    after_push=$(printf '%s\n' "$site" \
+          | sed -n '/push \[r9+0x/{n;p;}' | head -1)
+    if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then
+        case "$after_push" in
+        *"movabs rax, <addr>"*)
+            pass "-vdj: W4 - a TESTS build stores the poison captures" ;;
+        *)
+            fail "-vdj: W4 - a TESTS build should store the poison captures
+      after the residue push of 78's add(i) site; the line after it was:
+      $after_push" ;;
+        esac
+    else
+        case "$after_push" in
+        *"call <helper>"*)
+            pass "-vdj: W4 - a release build: residue push, then the call" ;;
+        *)
+            fail "-vdj: W4 - a release build should follow the residue push of
+      78's add(i) site straight with the call (no ctx.captures repoint);
+      the line after it was: $after_push" ;;
+        esac
+    fi
+else
+    echo "  skip  -vdj W4 site form (this build reports jit 0)"
+fi
+
 # ---------------------------------------------------------------------
 # -dcs: the CALLEE-SET dump (#116).
 #
