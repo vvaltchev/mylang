@@ -311,6 +311,29 @@ bool op_writes_scalar(OpCode op);
 void verify_handler_sites(const Chunk &chunk);
 
 /*
+ * #137: THE HANDLER-STACK BALANCE. `VmActivation::handlers` is ONE stack
+ * shared by every frame of an activation, sliced by the records'
+ * `handler_base` watermarks; `PopHandler` is a bare `pop_back()` and the
+ * JIT's inline form a bare `finish -= 4`. So a chunk whose control flow
+ * can reach a PopHandler with nothing of its own pushed pops the CALLER's
+ * handler - or, at the bottom, an EMPTY vector (a SEGV in the assert-free
+ * build; myv_fuzz 2026-09-21, one opcode byte). No per-operand bound can
+ * see it: the depth is a property of the PATH, not of a field.
+ *
+ * This is the forward dataflow that proves it: the depth relative to the
+ * frame's entry at every reachable pc, +1 through a PushHandler, -1
+ * through a PopHandler (which must find one), every join agreeing, and
+ * the EXCEPTIONAL entries of a region (its clause body pcs and fin_pc)
+ * seeded at the depth its PushHandler was met at - the dispatch has
+ * popped that handler, and every inner one, before it resumes there. It
+ * runs on BYTECODE ONLY (a chunk with a native fragment keeps its pushes
+ * and pops inside the fragment), which is exactly what the loader
+ * verifies and what codegen emits. Returns nullptr when balanced, else
+ * the fault and the pc it was found at.
+ */
+const char *handler_balance_fault(const Chunk &chunk, size_t *at_pc);
+
+/*
  * #137: the bounds every operand of a chunk's instructions is measured
  * against. Everything here is EXTERNAL to the Chunk - the frame the VM will
  * actually build, and three program-wide tables - so a corrupt image cannot

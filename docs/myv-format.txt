@@ -112,6 +112,25 @@ sees a kind of field the others structurally cannot (#137):
      disagree on how many slots a frame has.  Checked in
      vm_verify_program, across the two records.
 
+     THE HANDLER-STACK BALANCE (2026-09-21, myv_fuzz; handler_balance_fault,
+     codegen.h) - the one PopHandler property no per-operand bound can
+     express, because it is a property of the PATH.  The activation's
+     handler stack is shared by every frame and a PopHandler is a bare
+     pop, so a chunk whose control flow reaches one with nothing of its
+     own pushed pops the CALLER's handler, or an EMPTY vector (one mutated
+     opcode byte: a SEGV in the assert-free build).  The verifier walks the
+     chunk's control flow from pc 0 carrying the handler depth: +1 through a
+     PushHandler, -1 through a PopHandler, which must find one; every join
+     must agree; and a region's clause body pcs and fin_pc are entered at
+     the depth its PushHandler was met at (the dispatch has popped that
+     handler, and every inner one, before resuming there), so a region
+     pushed at two depths is refused too.  Successors are the pc-field
+     table's targets plus the fall-through of every op but Jump / Halt /
+     ReturnV.  Applied to a chunk with no native fragment - which is every
+     chunk of a stored image.  The same walk asserts codegen's own output
+     in an ASSERTS build, so the rule cannot drift from what the compiler
+     emits.
+
   4. THE VALUE-DEPENDENT RESIDUE (ML_UNTRUSTED_CHECK, defs.h).  A few facts
      no load-time pass can decide, because they are properties of the VALUE a
      slot holds rather than of the image: a flat array's storage-kind union

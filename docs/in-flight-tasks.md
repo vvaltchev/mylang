@@ -745,8 +745,8 @@ messages, not carets, which is why no test fails. A `tests` entry with
 Small, but a caret that differs between engines is a RULE 2 violation
 and is on record. Not a detour from #97 - the maintainer's call.
 
-## 3d. FOUND 2026-09-20/21, NOT FIXED — THREE LOADER FINDINGS
-## (`myv_fuzz`, #137/#142 class) AND ONE TABLE GAP (the tenth shape, again)
+## 3d. FOUND 2026-09-20/21 — THREE LOADER FINDINGS (`myv_fuzz`,
+## #137/#142 class; ONE FIXED) AND ONE TABLE GAP (the tenth shape, again)
 
 **The loader (task #26).** All reached by the mutation space a format
 change shifted (v16 `arg_locs`, then v17 `noescape_params`), all
@@ -755,16 +755,28 @@ pre-existing, reproducers kept in `myv-fuzz-bad/`: `fat-676.myv` - an
 -> `vm_struct_elem` -> `flat_structs()`' untrusted check =
 `std::terminate` (the same on the debug and the assert-free build);
 `small-938.myv` - a HANG in the load-time JIT's `jit_liveness_core`,
-whose fixpoint never converges on a mutated chunk; `fat-486.myv`
-(2026-09-21) - ONE byte turns a `LoadLiteralObjV` into a `PopHandler`
-with no `PushHandler` before it, and the interpreter's
-`act.handlers.pop_back()` runs on an EMPTY vector: a SEGV in the
-ASSERTS=0 build, a libstdc++ hardening abort in the debug one. No
-static bound in `verify_chunk` covers it (the handler stack's depth is
-a path property, not an operand); the fix is the TIER 2 provenance
-gate (`ML_UNTRUSTED_CHECK` on the pop, a defined `MyvError`/exception
-under `g_untrusted_bytecode`) - the same shape as the flat-array kind
-tag. All three violate "no input may crash the interpreter".
+whose fixpoint never converges on a mutated chunk. Both still open,
+both violate "no input may crash the interpreter".
+✅ FIXED 2026-09-21: `fat-486.myv` - ONE byte turns a `LoadLiteralObjV`
+into a `PopHandler` with no `PushHandler` before it, and the
+interpreter's `act.handlers.pop_back()` ran on an EMPTY vector (a SEGV
+in the ASSERTS=0 build, a hardening abort in the debug one). Fixed
+STATICALLY, not by a run-time gate: `handler_balance_fault` (codegen.h)
+is a forward dataflow of the handler depth over the chunk's CFG, run
+by `verify_chunk` on every stored chunk BEFORE the load-time JIT (which
+inlines the same pop as a bare `finish -= 4`) and, ASSERTS-only, on
+every chunk codegen emits - the whole corpus and `-rt` prove it accepts
+our own output. Pinned by `myv_verify_handler_balance` (three arms:
+a pop at depth 0, a join at two depths, a region pushed twice).
+**A fourth, reported by the fixed fuzzer the same day, NOT fixed:**
+`small-1305.myv` runs to completion (prints `4`) and LeakSanitizer
+reports two 136-byte `FuncObject`s allocated by `jit_make_closure_ptr`
+from emitted code and never released - a mutated image whose values
+leak a reference, which CLAUDE.md's loader text names as the ACCEPTED
+failure mode of a wrong `ref_slots` on a disk image ("can then only
+LEAK a reference, never index out of range"). Whether an LSan report on
+a hostile image should count as a crash is a question for the
+maintainer; the fuzzer's new classifier says yes.
 **And the fuzzer could not SEE the third in the debug lane** (fixed
 2026-09-21): UBSan under `-fno-sanitize-recover` reports and exits 1,
 the SAME code a clean `MyvError` refusal uses, so `myv_fuzz.py` counted

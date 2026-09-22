@@ -6468,7 +6468,17 @@ first two cannot see what the third checks:
     the suite caught the moment `==` was tried); and a baked ctor plan's
     per-field byte offset plus ITS OWN store width must land inside the
     instance (the width matters: a blanket 8 falsely refuses a trailing
-    bool).
+    bool). **And ONE PATH property (2026-09-21): the HANDLER-STACK
+    BALANCE** (`handler_balance_fault`, codegen.h) - `PopHandler` is a
+    bare `pop_back()` on a stack every frame of the activation shares,
+    so a chunk that can reach one with nothing of its own pushed pops
+    the caller's handler, or an empty vector (myv_fuzz: ONE opcode byte,
+    a SEGV in the assert-free build). No operand bound sees it; a
+    forward dataflow of the depth over the CFG does (+1/-1 through
+    push/pop, joins must agree, a region's exceptional entries seeded at
+    its push depth). It runs on stored images and, ASSERTS-only, on
+    every chunk codegen emits, so the rule and the compiler cannot
+    drift apart.
 **⛔ AND A FOURTH SHAPE ALL THREE LAYERS MISS BY CONSTRUCTION: A
 CONSTRUCTOR THE LOADER ITSELF CALLS (2026-08-25).** The three layers
 bound what an image CONTAINS. They cannot bound an argument the READER
