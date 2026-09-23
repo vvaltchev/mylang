@@ -14033,3 +14033,82 @@ all 35/35, `norec_enum --depth 3`, `norec_sweep`, `nested_fuzz`,
 34 corpus images identical to their source runs, `driver_checks` 24/24,
 `disasmcheck` zero objdump disagreements with and without the alignment
 lever, `vdjcmp` self-test 128/128, `regcensus --gate` at its floor.
+
+## THE SWITCH MATERIALIZER - TWO ORDER-OF-OPERATIONS BUGS, found by a
+## new parity net before E2 could be built on them (2026-09-23)
+
+**THE NET CAME FIRST.** E2 (a frameless callee that makes calls) turned
+on one question: *does every call tier charge the slot SEGMENT exactly
+as `push_window` does?* `StackOverflowEx` is raised when a push cannot
+get a window from the budget, so the depth a runaway recursion reaches
+is OBSERVABLE - a program can catch the overflow and print it - and a
+tier that carved its window anywhere else would move that depth. No
+test pinned it: `-rt` cannot set `MYLANG_VM_STACK` (read once into a
+static) and the tree-walker overflows the C stack. `driver_checks.sh`
+now runs one program - plain self recursion, a leaf call per level,
+mutual recursion, a closure call per level, and a leaf called from
+MAIN (the frameless site's home) - at four caps straddling a
+`SEG_SLOTS` boundary, under `-nj` and five JIT configurations
+(default, `OFF=norec`, `OFF=frameless`, `OFF=bakecallee`,
+`MYLANG_NATIVE_STACK=0`), and requires byte-identical output. Its
+vacuity guard: `-nj` must overflow every shape at every cap.
+
+Today's tiers pass it (a frameless window lives only in main's calls,
+never at depth). It failed on its FIRST run anyway, on the debug build,
+at the two caps above one segment - with two unrelated aborts, both in
+the depth-cap SWITCH protocol (a sanitized build caps native nesting at
+32, so it takes that protocol constantly; `MYLANG_NATIVE_STACK=0` puts
+a release build at 200 and reproduces both, which is why that config
+is in the matrix).
+
+**Bug 1 - `jit_call_sync_core`'s retarget took `cur_seg` for the
+caller's segment.** When the core's callee returns `JIT_RET_SWITCH`,
+the core retargets its CALLER's native frames and inserts records for
+the record-less ones. `norec_switch_retarget` stamped each inserted
+record's `seg` and parent view from `act.cur_seg` / `act.cur_sg` - the
+callee's segment by then, since the core's own push may have ADVANCED
+to a new one. The walked frames sit in the caller's segment (a native
+push that does not fit declines to C++, whose frame is the walk's
+floor, so a walk never spans two), so the records claimed the wrong
+segment and the next pop aborted on `cur_sg == segs[rec.seg]`. Only a
+second pass reached it: the first run of a recursion allocates the
+segment, the second REUSES it at a slightly different depth, and the
+crossing call became a core call. The walk now takes the segment as a
+parameter - the switch passes `cur_seg` (nothing pushed yet), the core
+passes its own record's PARENT view - and ML_CHECKs each record-less
+window lies inside it.
+
+**Bug 2 - `jit_call_sync_switch` materialized BEFORE the push that can
+throw.** The switch inserted records for the native chain, cleared
+`sync_stop` on the record-ful frames, and THEN pushed the callee. The
+push can throw - `StackOverflowEx`, an arity or bind-coercion error -
+and a throw there conveys as status 2, i.e. back through the NATIVE
+frames, each unwinding as the record-less or record-ful frame it was
+pushed as. A record-less exit gives its window back and returns; it has
+no record to pop, so the inserted records outlived their frames and the
+catch's unwind popped them a second time (`jit_ret_audit`, and a
+double segment give-back in an assert-free build). The first descent
+of a recursion never reaches it (every record is at a new high-water,
+so every call goes through the core); the second run, on emitted
+pushes, overflowed inside the switch. The push comes first now - only
+a push that SUCCEEDED commits the switch - with everything the walk
+reads captured before it (the caller's window, segment and chunk; the
+push repoints the view and may advance the segment). The inserts land
+below the callee's record and repoint `top_rec` at it.
+
+**Watched failing:** bug 1 alone, `pop_window`'s check at cap 20000;
+bug 2 alone (after fixing 1), `jit_ret_audit` at cap 40000 and under
+`OFF=norec` at 40000; both on the dbg lane and on `rel-hard` with
+`MYLANG_NATIVE_STACK=0`. `-nj` answered correctly throughout, and so
+did a plain release build with the native stack on (cap 500000 - the
+switch never ran).
+
+**What it means for E2:** the overflow-depth property is now pinned,
+and it is the reason a CALLING frameless callee cannot keep its window
+on the native stack. Charging the segment anyway (reserve there, run
+on the native stack) costs the same fit/bump/give-back as simply
+putting the window on the segment, and then a SWITCH below the frame
+must relocate a window whose uninitialised W3 slots and self-registered
+slices cannot be moved byte-wise. So a non-leaf callee's window stays
+on the segment, and E2's saving has to come from the rest of the
+record-less site (see docs/in-flight-tasks.md §1.6).
