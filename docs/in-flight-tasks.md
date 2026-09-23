@@ -516,7 +516,19 @@ work — but profile it before building, the way increment 0 was.
         dropped push straight back, so the win is the exit's `pop`
         alone; and `--xrot` caught the return arm's raw use of r11 on
         the first run, which is why the base now carries a LIVE RANGE
-        ending at the terminal ReturnV).
+        ending at the terminal ReturnV), and then SP1/SP2/SP3 - the
+        16-alignment invariant itself (done 2026-09-22, the
+        maintainer's call after the W6 finding): ONE call seam, an
+        emit-time rsp MODEL that checks it, and the rule relaxed from
+        "aligned everywhere" to "aligned AT the call". W6's second
+        instruction is recovered (11 -1.56% Ir, 78 -1.39%, 34 -0.42%,
+        35 -0.37%, 63 -0.34%; wall geomean 1.005x - flat, as the
+        guard-elision family always is). ⛔ It is the prerequisite
+        #124(b) needed: the number of caller-saved pins spilled around
+        a call varies per run, and half those shapes would otherwise
+        have paid a wasted push/pop PER CALL on the hot path. Record:
+        SP1/SP2/SP3 in the JIT record; the four rules a new emitter
+        must obey are in CLAUDE.md under THE 16-ALIGNMENT RULE.
     3.  E2 - drop the leaf rule. Serves 09_fib. GATE includes
         norec_enum --depth 4 (2272 programs x 4 engines), because a
         throw crossing a frameless frame is exactly its shape space.
@@ -524,6 +536,13 @@ work — but profile it before building, the way increment 0 was.
         (increment 0 made it 20.7% faster), not from the old -4.75% row.
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
+
+**⛔ THE OPEN CODE-SIZE FINDING (SP3, 2026-09-22, not fixed):** `MoveV`
+emits its helper arm even when NEITHER slot is ref-listed, so `jhelp`
+is empty, nothing is patched to it, and the arm is UNREACHABLE -
+roughly 35 emitted bytes per move. The rsp model noticed because a call
+emitted there has no branch state to align against;
+`g_jit_call_dead_model` counts them. No correctness component.
 
 **⛔ THE STANDING KILL CRITERION (plan section 4):** if increment 2's
 gate comes back byte-flat on the WALL CLOCK while Ir drops, STOP AND SAY

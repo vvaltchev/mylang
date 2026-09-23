@@ -170,6 +170,14 @@ unsigned long g_jit_hoist2 = 0;        /* C2b: second-base preheader entries */
  * correspondence read the DUMP, not these. */
 unsigned long g_jit_call_sites = 0;
 unsigned long g_jit_spcheck_sites = 0;
+/* SP3 reach: runs whose entry 16-alignment filler was proved
+ * unnecessary (the body emits no call), and calls that had to align
+ * themselves because the stack was not already call-ready. */
+unsigned long g_jit_entry_pad_off = 0;
+unsigned long g_jit_call_align = 0;
+/* calls emitted into code no branch has reached yet (MoveV's dead
+ * helper arm is the corpus's whole population) - see call_site */
+unsigned long g_jit_call_dead_model = 0;
 unsigned long g_jit_capbase_cs = 0;    /* W6: runs holding the capture
                                         * base in a CALLER-saved
                                         * register (no entry push) */
@@ -3458,7 +3466,20 @@ struct Emitter {
      * (op_boundary), so there is exactly one right answer here. */
     void sp_resume_body()
     { sp_adopt({ sp_body, ((8 - sp_body) % 16 + 16) % 16, true }); }
-#ifndef NDEBUG
+    /*
+     * ⛔ NOT `#ifndef NDEBUG`, AND THAT COST A SEGFAULT (SP3). This
+     * table looks like pure diagnostics - it only ever feeds an
+     * ML_CHECK - but it is ALSO how a label REVIVES the model after a
+     * terminator, and the model DRIVES EMISSION now (call_site aligns
+     * from it). Compiled out, `sp_live` went false at a fragment's
+     * first `ret` and never came back, so every later call skipped
+     * BOTH the alignment and the check: bench/my/78 GP-faulted inside
+     * jit_ret_norec in an OPT=1 ASSERTS=0 build while every checked
+     * build stayed green, and MYLANG_JIT_SPCHECK - the one layer that
+     * reads the real rsp and needs no model - is what named it. Same
+     * family as trk_push's own ⛔: a count that drives EMISSION is not
+     * diagnostics, whatever it looks like.
+     */
     /* The state recorded where a forward branch was emitted, checked
      * against the state where it is patched. This is what proves the
      * relaxed rule over BRANCHING code: two paths that reach one label
@@ -3480,14 +3501,9 @@ struct Emitter {
                      "native stack, and the label's alignment is only "
                      "true on one of them");
     }
-#else
-    void sp_note_jump(size_t) {}
-    void sp_check_join(size_t) {}
-#endif
     /* Record the depth at a position that later serves as a branch
      * TARGET (`patch8(at, join)` rather than `patch8(at, pos())`). */
     size_t sp_mark() { sp_note_jump(pos()); return pos(); }
-#ifndef NDEBUG
     /* the same join check when the TARGET is a recorded mark rather
      * than the current position */
     void sp_check_target(size_t at, size_t target)
@@ -3501,9 +3517,6 @@ struct Emitter {
                      "a branch reaches a marked label at a DIFFERENT "
                      "stack depth than the label was marked at");
     }
-#else
-    void sp_check_target(size_t, size_t) {}
-#endif
 
     /*
      * The call seam's check, both halves.
@@ -3520,12 +3533,95 @@ struct Emitter {
      * sp_move. `test` writes only flags, which a call clobbers anyway,
      * so it is transparent to the site.
      */
+    int sp_adj = 0;      /* the alignment this call site is paying for */
+    /*
+     * ⛔ A CALL WHOSE CALLEE READS THIS FRAME AT A FIXED OFFSET FROM
+     * THE RETURN ADDRESS, and the one thing the self-aligning seam
+     * must NOT touch. The push protocol's callee takes the caller's
+     * captures from [rbp+16], the pushed dst word from [rbp+24] and
+     * (frameless) its whole WINDOW from [rbp+32] - every one of them
+     * counted through the residue the SITE pushed, so an `sub rsp, 8`
+     * slipped in between the last push and the call MOVES the window.
+     *
+     * It never happens today, structurally rather than by luck: such a
+     * site is in a run containing a MyLang CALL op, which is one of
+     * the conditions the entry-filler settle requires to be FALSE, so
+     * the body keeps its filler; and the site's own movement - a
+     * window that is a multiple of 48 plus a 16-byte residue -
+     * preserves the parity. This bit is that argument STATED at the
+     * three sites that rely on it, and it was not hypothetical: a
+     * sabotage that dropped the filler for calling bodies too broke
+     * the frameless window and surfaced as a jit_ret_audit abort, four
+     * layers away from the cause.
+     *
+     * If the check below is compiled out and the stack really is
+     * misaligned, the site emits a MISALIGNED CALL rather than a moved
+     * window - the lesser wrong, and the one MYLANG_JIT_SPCHECK names.
+     */
+    bool sp_fixed_frame = false;
+    void call_fixed_frame(const void *fn)
+    { sp_fixed_frame = true; call_direct(fn); }
+    void call_fixed_frame_reg(uint8_t r)
+    { sp_fixed_frame = true; call_reg(r); }
     void call_site()
     {
 #ifdef TESTS
         g_jit_call_sites++;
 #endif
-        ML_CHECK_MSG(!sp_live || sp_call_ready(),
+        n_calls++;
+        /*
+         * ⛔ ALIGN AT THE CALL (SP3). This is the whole relaxation: the
+         * obligation is LOCAL to the one instruction that has it, so a
+         * site that spills an odd number of registers no longer has to
+         * push a filler, and a future emitter author does not have to
+         * know about parity at all. It is FREE in the common case - the
+         * prologue still aligns the body whenever the body calls, so
+         * `sp_call_ready()` already holds and nothing is emitted.
+         *
+         * `sub` before and `add` after are both safe against the flags:
+         * a call clobbers them, so no emitted code can carry a
+         * condition ACROSS one, and the restore can therefore only
+         * destroy what the call already did.
+         */
+        /*
+         * ⛔ A CALL ON A DEAD MODEL IS A CALL IN CODE NOTHING HAS
+         * JUMPED TO YET, and it is not hypothetical: MoveV emits its
+         * helper arm even when neither slot is ref-listed, so `jhelp`
+         * is empty, nothing is patched to it, and the arm is
+         * UNREACHABLE (~35 emitted bytes per move - a separate finding
+         * the model turned up).
+         *
+         * Such code still has to be emitted with SOME depth in mind,
+         * and the only defensible one is the body contract every op
+         * begins and ends at. Assuming it is also self-correcting: a
+         * branch patched into this region LATER goes through
+         * sp_check_join with the model now LIVE, so it CHECKS its
+         * recorded state against this assumption instead of adopting
+         * it, and a region that was really at another depth fails
+         * there by name.
+         */
+        if (!sp_live) {
+            sp_resume_body();
+#ifdef TESTS
+            g_jit_call_dead_model++;
+#endif
+        }
+        sp_adj = 0;
+        if (sp_fixed_frame) {
+            sp_fixed_frame = false;
+            ML_CHECK_MSG(sp_call_ready(),
+                         "a FIXED-FRAME call site is not call-ready - "
+                         "padding it here would move the window its "
+                         "callee reads at [rbp+32]");
+        } else if (!sp_call_ready()) {
+            sp_adj = sp_mod;         /* rsp is sp_mod past a boundary */
+            op_reg_imm(Op::minus, RSP, sp_adj);
+            n_align++;
+#ifdef TESTS
+            g_jit_call_align++;
+#endif
+        }
+        ML_CHECK_MSG(sp_call_ready(),
                      "an emitted CALL at a stack that is not 16-byte "
                      "aligned - System V requires it AT the call, and a "
                      "callee's aligned SSE store is what finds it");
@@ -3545,13 +3641,41 @@ struct Emitter {
         }
 #endif
     }
+    void call_done()
+    {
+        last_call_ra = pos();        /* the HARDWARE return address */
+        if (sp_adj) {
+            op_reg_imm(Op::plus, RSP, sp_adj);
+            sp_adj = 0;
+        }
+    }
+    /* how many calls this emission has made, and how many of them had
+     * to align themselves. The first is what decides whether a
+     * fragment's PROLOGUE needs its 16-alignment filler at all; the
+     * second is the reach counter for the relaxation. */
+    unsigned long n_calls = 0;
+    unsigned long n_align = 0;
 
     /* Total pushes at entry, including rbp, the base and any 8-byte pad.
      * A fragment is entered at rsp % 16 == 8, so an ODD count lands the
      * body at 0 - which IS the call-ready state every emitted call site
      * assumes. G1 step 3 added the rbp push (frame-pointer chains), so
      * the count is now 2 + saved.size() and the pad parity FLIPPED. */
-    bool entry_pad() const { return (2 + saved.size()) % 2 == 0; }
+    /*
+     * ⛔ SP3: AND IT IS FOR THE CALLS, SO A BODY THAT MAKES NONE DOES
+     * NOT NEED IT. The filler exists to leave the body CALL-READY; a
+     * run whose emission contains no call has nothing to be ready for,
+     * and for a FRAMELESS callee - whose prologue runs PER CALL - that
+     * filler is an instruction on the hot path. "Makes no call" is
+     * settled by ARITHMETIC after the run is emitted (Emitter::n_calls,
+     * which the one call seam makes exact) with a single re-emission,
+     * the same bet-and-settle shape W6 uses for the capture base; a
+     * call the SETTLE cannot see - an epilogue's release scan, an entry
+     * stub - aligns itself at the seam.
+     */
+    bool pad_forced_off = false;
+    bool entry_pad() const
+    { return !pad_forced_off && (2 + saved.size()) % 2 == 0; }
 
     /*
      * THE SPILL AREA (the real register allocator, maintainer-set
@@ -3681,24 +3805,24 @@ struct Emitter {
          * before anything else runs. One push keeps the entry parity
          * (rsp%16: 8 -> 0 == call-ready); rdi (the window argument) is
          * the only live register at entry and is saved around the call.
-         * With keep_rdx THREE pushes (rdx twice - the second is the
-         * parity filler - then rdi) keep the same parity. */
-        if (keep_rdx) {
-            /* fo - the push protocol's register - and a parity filler */
-            push_reg(RDX);                                /* reg:proto */
-            push_reg(RDX);                                /* reg:proto */
-        }
+         * With keep_rdx there are TWO pushes and the probe's own call
+         * pays the odd parity at the seam - it used to push rdx twice,
+         * the second purely as a filler (SP3). */
+        if (keep_rdx)
+            push_reg(RDX);       /* fo (reg:proto: the push protocol's
+                                  * own register, saved across the C
+                                  * call the probe makes) */
         push_reg(REG_ARG0);              /* save rdi (reg:abi) */
-        u8(0x48); u8(0x8B); u8(0x7C); u8(0x24);
-        u8(keep_rdx ? 0x18 : 0x08);      /* mov rdi, [rsp+8 | rsp+24] */
+        /* rdi = the HARDWARE return address, which sits at the entry
+         * datum: depth 0, so `sp_depth` bytes above rsp right now
+         * (rdi is the checker's first argument) */
+        load_rsp_disp(REG_ARG0, sp_depth);            /* reg:abi */
         movabs(0 /* RAX */, reinterpret_cast<uint64_t>(
                                 &jit_norec_ret_verify));
         call_rax();   /* reg:abi */
         pop_reg(REG_ARG0);                            /* reg:abi */
-        if (keep_rdx) {
+        if (keep_rdx)
             pop_reg(RDX);                                 /* reg:proto */
-            pop_reg(RDX);                                 /* reg:proto */
-        }
 #else
         (void)keep_rdx;
 #endif
@@ -4298,6 +4422,36 @@ struct Emitter {
      * the pin tracker and the rsp model. Named, so they are not. */
     void push_rbp() { sp_move(8); u8(0x55); }
     void pop_rbp()  { sp_move(-8); u8(0x5D); }
+    /*
+     * `mov reg64, [rsp + disp]` - THE ONE SPELLING for an rsp-relative
+     * read, and the reason the rsp model earns its keep beyond
+     * alignment. Three sites used to hand-count the displacement in a
+     * comment ("behind this arm's three pushes and its pad"), which is
+     * a parity fact written down in prose: delete a filler and the
+     * prose is silently wrong. `sp_depth - <the depth the datum was
+     * pushed at>` is the same number DERIVED, so it cannot rot.
+     * rsp as a base needs a SIB byte, which is why this is here rather
+     * than in the generic modrm helpers.
+     */
+    void load_rsp_disp(uint8_t reg, int disp)
+    {
+        ML_CHECK_MSG(sp_exact, "load_rsp_disp with an inexact stack "
+                               "model - the displacement is a guess");
+        ML_CHECK_MSG(disp >= 0 && disp < 128,
+                     "load_rsp_disp: the datum is not within a disp8 "
+                     "of rsp (or is BELOW it)");
+        wrote(reg);
+        u8(static_cast<uint8_t>(0x48 | (reg >= 8 ? 0x04 : 0)));
+        u8(0x8B);
+        if (disp == 0) {
+            u8(static_cast<uint8_t>(0x04 | ((reg & 7) << 3)));  /* mod=00 */
+            u8(0x24);                                    /* SIB: rsp */
+            return;
+        }
+        u8(static_cast<uint8_t>(0x44 | ((reg & 7) << 3)));      /* mod=01 */
+        u8(0x24);
+        u8(static_cast<uint8_t>(disp));
+    }
     void call_rax() { call_reg(0 /* rax: the Reg enum is
                                 * declared below the class */); }
     /* lea reg, [rbx + disp32]  (an EvalValue-ptr / LValue-ptr helper arg;
@@ -4819,6 +4973,7 @@ struct Emitter {
         call_site();
         call_relocs.push_back({ pos(), fn });
         u8(0xE8); u32(0);
+        call_done();
     }
     void call_reg(uint8_t r)                              /* call r64 */
     {
@@ -4827,7 +4982,18 @@ struct Emitter {
             u8(0x41);
         u8(0xFF);
         u8(static_cast<uint8_t>(0xD0 | (r & 7)));
+        call_done();
     }
+    /*
+     * ⛔ THE RETURN ADDRESS IS `last_call_ra`, NOT `pos()` (SP3).
+     * `pos()` right after a call stopped being the hardware return
+     * address the moment the seam could emit an alignment restore
+     * behind the call. Four sites record a fragment-to-fragment call's
+     * RA into the no-record registry, and a wrong one there is not a
+     * crash - it is a MISS in the return table, i.e. the entry check
+     * aborting on a call it should have recognised.
+     */
+    size_t last_call_ra = 0;
     void jmp_reg(uint8_t r)                                /* jmp r64 */
     {
         if (r >= 8)
@@ -9629,16 +9795,16 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
          * (any decline in between jumps to the slow tier, which consumes
          * it). fo is spilled around the call (the probe clobbers the
          * resolve registers); desc re-derives from it. */
-        e.push_reg(RDX);                  /* fo */
-        /* pad: an even push count keeps the stack call-ready */
-        e.op_reg_imm(Op::minus, RSP, 8);
+        e.push_reg(RDX);                  /* fo - ONE push: the odd
+                                           * parity it leaves is the
+                                           * call seam's business now
+                                           * (SP3), not a filler's */
         e.mov_rr(RDI, RAX);           /* rdi = desc (reg:abi) */
         e.mov_imm(RSI, static_cast<uint64_t>(in.a_lit()));  /* reg:abi */
         e.mov_imm(RDX, static_cast<uint64_t>(in.b_lit()));
         e.mov_imm(RCX,
                  static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.call_direct(reinterpret_cast<const void *>(jit_cached_probe));
-        e.op_reg_imm(Op::plus, RSP, 8);
         e.pop_reg(RDX);                   /* fo back */
         e.test32_rr(RAX, RAX);           /* test eax, eax */
         j_done.push_back(e.j32(0x75));    /* jnz done (hit) */
@@ -10118,8 +10284,11 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
                                                        * these are addresses) */
 
     /* -------------- MUTATIONS (control reaches the call) --------------- */
-    e.push_reg(RDX);                                  /* fo   [rsp+8] */
-    e.push_reg(RAX);                                  /* desc [rsp]   */
+    e.push_reg(RDX);                                  /* fo   */
+    e.push_reg(RAX);                                  /* desc */
+    /* the two spills' depths, so every later [rsp+N] read of them is
+     * DERIVED from the model rather than counted in a comment (SP3) */
+    const int sp_desc = e.sp_depth;
     /* the window IS the old watermark - one load, no multiply - and the
      * new one is already computed in r11 */
     ld(RDX, R10, static_cast<int32_t>(P.seg_cur));    /* rdx = the window */
@@ -10241,9 +10410,7 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
         st(R10, static_cast<int32_t>(P.rec_norec_site), RAX);
     }
 #endif
-    e.wrote(0);                     /* raw bytes (rsp base needs SIB) */
-    e.u8(0x48); e.u8(0x8B); e.u8(0x04); e.u8(0x24);  /* mov rax, [rsp]
-                                                      * = the desc spill */
+    e.load_rsp_disp(RAX, e.sp_depth - sp_desc);   /* = the desc spill */
     st(R10, static_cast<int32_t>(P.rec_desc), RAX);
     ld(RAX, R9R, static_cast<int32_t>(L.ctx_captures));  /* reg:proto */
     st(R10, static_cast<int32_t>(P.rec_caller_caps), RAX);
@@ -10405,30 +10572,29 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
          * cannot be inlined as a refcount bump - a SLICE registers itself in
          * its parent's `slices` set on copy - so the helper runs fast_bind's
          * exact per-argument step. FOUR pushes: rcx/rdx/r9 are read after the
-         * bind and the 4th is a PAD, because an even count preserves the
-         * 16-byte alignment this site already has (emit_call_prologue made it
-         * call-ready and the two live pushes here - fo, desc - keep it so).
-         * r8 is not read after; rsi/rax are dead (emit_call_epilogue reloads
-         * the type singletons anyway); the base is in rbx, which the callee
-         * preserves - it used to be rdi, which is why this pushed four LIVE
-         * registers rather than three and a pad.
+         * bind. r8 is not read after; rsi/rax are dead
+         * (emit_call_epilogue reloads the type singletons anyway); the
+         * base is in rbx, which the callee preserves - it used to be
+         * rdi, which is why this pushed four LIVE registers rather
+         * than three. THREE pushes, no filler: the odd parity they
+         * leave belongs to the call seam now (SP3), and the
+         * descriptor's displacement below is derived from the model
+         * rather than counted against the filler.
          */
         e.push_reg(RCX); e.push_reg(R9R);  /* reg:proto */
         e.push_reg(RDX);
-        e.op_reg_imm(Op::minus, RSP, 8);   /* pad */
         modrm(0x8D, RSI, RBX, s, true); /* &src arg2 (reg:abi) */
         modrm(0x8D, RDI, RDX, d, true);  /* &dst, arg1 (reg:abi) */
         /*
          * arg 3 = #94's `can_borrow`: bit i of the CALLEE's
          * noescape_params. The callee here is an inline CACHE, so the bit
-         * cannot be baked - it is loaded from the descriptor spill, which
-         * sits at [rsp+32] behind this arm's three pushes and its pad.
-         * Four instructions on a path that is already a call.
+         * cannot be baked - it is loaded from the descriptor spill,
+         * whose displacement the rsp model computes (it used to be the
+         * hand-counted `[rsp+32]`, i.e. this arm's three pushes plus a
+         * filler - a number that would have gone silently wrong the
+         * moment the filler left).
          */
-        /* mov rax, [rsp+32] - the modrm helper above deliberately cannot
-         * encode an rsp base (it needs a SIB byte), so spell it out. */
-        e.wrote(0);                 /* raw bytes (rsp base needs SIB) */
-        e.u8(0x48); e.u8(0x8B); e.u8(0x44); e.u8(0x24); e.u8(0x20);
+        e.load_rsp_disp(RAX, e.sp_depth - sp_desc);
         ld(RDX, RAX, static_cast<int32_t>(P.desc_noescape));
         if (i) {                                      /* shr rdx, i */
             e.shr_rr_imm8(RDX, static_cast<uint8_t>(i));
@@ -10436,7 +10602,6 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
         e.op_reg_imm(Op::band, RDX, 1);
         e.movabs(RAX, reinterpret_cast<uint64_t>(&jit_bind_ref_arg));
         e.call_rax();
-        e.op_reg_imm(Op::plus, RSP, 8);
         e.pop_reg(RDX);
         e.pop_reg(R9R); e.pop_reg(RCX);  /* reg:proto */
         e.patch32_here(j_done);
@@ -11003,7 +11168,9 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             e.bump_counter(&g_jit_sync_inline);
             e.bump_counter(&g_jit_op_run[static_cast<size_t>(in.op)]);
 #endif
-            e.call_direct(
+            /* the callee reads its WINDOW at [rbp+32], through the
+             * residue just pushed - nothing may come between */
+            e.call_fixed_frame(
                 static_cast<const void *>( static_cast<const char *>(fl_ck->native.base) + fl_ck->frameless_entry_off));
             if (ns) {
                 NorecSite *kns = ns;
@@ -11013,8 +11180,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                         std::unique_ptr<NorecSite>(new NorecSite(*ns)));
                     kns = g_cur_norec_sites->back().get();
                 }
-                kns->off_plain = e.pos();         /* G1: the hardware RA */
-                kns->off_switched = e.pos();      /* one call: both keys */
+                kns->off_plain = e.last_call_ra;  /* G1: the hardware RA */
+                kns->off_switched = e.last_call_ra;   /* one call: both */
                 kns->frameless = true;
             }
             e.cmp_reg_imm(RAX, -1);
@@ -11172,17 +11339,19 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         };
         const size_t j_plain = emit_nstack_switch_pre(e);
         residue_push();
-        e.call_reg(RDX);                    /* call rdx (switched) */
+        e.call_fixed_frame_reg(RDX);        /* call rdx (switched) - the
+                                             * callee reads the residue
+                                             * at [rbp+16]/[rbp+24] */
         if (ns)
-            ns->off_switched = e.pos();  /* G1: the hardware ret address */
+            ns->off_switched = e.last_call_ra;   /* the hardware RA */
         residue_pop();
         emit_nstack_switch_post(e);
         const size_t j_over = e.j32(0xEB);
         e.patch32_here(j_plain);
         residue_push();
-        e.call_reg(RDX);                    /* call rdx (plain) */
+        e.call_fixed_frame_reg(RDX);        /* call rdx (plain) - ditto */
         if (ns)
-            ns->off_plain = e.pos();
+            ns->off_plain = e.last_call_ra;
         residue_pop();
         e.patch32_here(j_over);
     }
@@ -13196,6 +13365,9 @@ void jit_stats_report()
         { "capbase_cs",       &g_jit_capbase_cs },
         { "call_sites",       &g_jit_call_sites },
         { "spcheck_sites",    &g_jit_spcheck_sites },
+        { "entry_pad_off",    &g_jit_entry_pad_off },
+        { "call_align",       &g_jit_call_align },
+        { "call_dead_model",  &g_jit_call_dead_model },
         { "hoist_rmw",        &g_jit_hoist_rmw },
         /* #96: the two halves of the element tier's REGISTER supply -
          * how often the plan ran out (elem_noreg, an emit-time decline
@@ -23751,8 +23923,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             lns->op = static_cast<uint8_t>(in.op);
             lns->caller_desc = g_cur_caller_desc;   /* step 3b */
             lns->leaf = true;
-            lns->off_plain = e.pos();
-            lns->off_switched = e.pos();    /* one call: both keys equal */
+            lns->off_plain = e.last_call_ra;
+            lns->off_switched = e.last_call_ra;  /* one call: both equal */
         }
         emit_call_epilogue(e);              /* re-mat rsi/r8 */
         return true;
@@ -26212,6 +26384,15 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * the claim on the one re-emission that follows. A bool that only
      * ever goes false -> true, so it bounds the loop by itself. */
     bool capbase_cs_forced = false;
+    /*
+     * SP3: per RUN, has its entry's 16-alignment filler been proved
+     * unnecessary? Declared outside the retry label, like
+     * capbase_cs_forced, because the Emitter below is destroyed and
+     * rebuilt by the backward goto. Each entry only ever goes 0 -> 1
+     * and a run whose filler is already off cannot ask again, so the
+     * loop is bounded by the number of runs.
+     */
+    std::vector<char> pad_off(runs.size(), 0);
     g_jit_pins_denied = 0;
 retry_emission:
     /* Phase A: the one-shot re-emission after a rax-pin conflict. The
@@ -27267,7 +27448,14 @@ retry_emission:
                         "slot %d\n", begin, end, j, spill_hot[j]);
         }
         e.spill_slots = static_cast<int>(spill_hot.size());
+        /* SP3: set BEFORE the prologue - it decides what frag_entry
+         * emits, and (through entry_pad) where every rbp-relative
+         * spill home sits. One decision serves this run's prologue,
+         * its interior entry stubs and its frameless entry, which is
+         * required: they all jump into the same body. */
+        e.pad_forced_off = pad_off[r] != 0;
         e.frag_entry();               /* push rbx + the cache regs; rbx=rdi */
+
         /* B1: the grant (taken above, before the pick) is the ONE
          * decision emit_type_tags and emit_call_epilogue's
          * re-materialisation both read, so they cannot disagree (they
@@ -28340,6 +28528,42 @@ retry_emission:
          * shape; an unbracketed call is on an exit path, which returns
          * without reading a capture again.
          */
+        /*
+         * SP3: THE FILLER'S OWN BET, SETTLED THE SAME WAY. frag_entry
+         * padded the body to CALL-READY; if this run emitted no call
+         * there was nothing to be ready for. `n_calls` is exact
+         * because there is exactly one call seam - which is the first
+         * thing SP1 bought that reasoning could not. Costs one
+         * re-emission for the runs that win, and nothing for the rest.
+         *
+         * ⛔ THE CONDITION IS PROFITABILITY, NOT SOUNDNESS, and that
+         * is the whole difference the seam makes: a call at an odd
+         * depth ALIGNS ITSELF, so a wrong answer here costs two
+         * instructions, never a misaligned call. What it asks is
+         * therefore what it means: does this run's MAINLINE emission
+         * call? - `n_prologues` for the bracketed helper calls, and
+         * the same static MyLang-CALL test W6's bet uses. The
+         * unbracketed calls that remain are the COLD arms (a
+         * ref-listed return slot's release, the return's slow tier,
+         * an exit epilogue), which pay their two instructions off the
+         * hot path in exchange for one instruction at an entry that,
+         * for every function body and every frameless callee, runs
+         * PER CALL.
+         */
+        if (!pad_off[r] && e.entry_pad()
+                && e.n_prologues == cb_prologues0
+                && !jit_run_blocks_xcache(chunk, begin, end)) {
+            pad_off[r] = 1;
+#ifdef TESTS
+            g_jit_entry_pad_off++;
+#endif
+            g_hoist = JitHoist{};
+            g_hoist2 = JitHoist{};
+            chunk.call_caches.clear();
+            chunk.norec_sites.clear();
+            chunk.arg_stage_pools.clear();
+            goto retry_emission;
+        }
         if (e.capbase >= 0
                 && !jit_reg_is_callee_saved(
                        static_cast<uint8_t>(e.capbase))
@@ -28865,12 +29089,12 @@ retry_emission:
                     e.cmp_reg32_imm32(R11,                      /* reg:proto */
                                       static_cast<uint32_t>(L.t_str_val));
                     const size_t j_tr = e.j32(0x7C);  /* jl: trivial */
-                    e.push_reg(RAX);                  /* reg:proto: exit pc */
-                    e.op_reg_imm(Op::minus, RSP, 8);  /* call parity */
+                    e.push_reg(RAX);                  /* reg:proto: exit pc.
+                                                       * ONE push - the seam
+                                                       * pays the parity */
                     e.lea_rdi(d);                     /* reg:abi */
                     e.call_direct(
                         reinterpret_cast<const void *>( jit_release_slot));
-                    e.op_reg_imm(Op::plus, RSP, 8);
                     e.pop_reg(RAX);                   /* reg:proto */
                     e.patch32_here(j_tr);
                 }

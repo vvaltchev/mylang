@@ -183,6 +183,63 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: $GITHUB_WORKSPACE/tests/driver_checks.sh ./mylang
 
+  # ---------------------------------------------------------------- #
+  # THE STACK-ALIGNMENT GROUND TRUTH (SP2/SP3). System V requires
+  # rsp % 16 == 0 AT the call; the emitter has a MODEL of rsp that says
+  # so at emit time, and a model is complete only while every
+  # rsp-moving emission goes through one of its seams. This lane emits
+  # `test rsp, 15` before every call and reads the REAL rsp, so it
+  # needs no model - it is what catches a MISSING seam.
+  #
+  # TWO BUILDS, and they are not redundant: the FIRST bug it found was
+  # invisible to every checked build (-rt 2016/2016, every corpus
+  # matrix 35/35, --spcheck itself 35/35 on Debug) and showed only at
+  # ASSERTS=0, where the branch-state table it also revives from had
+  # been compiled out. Same split as the myv-fuzz lane above.
+  # ---------------------------------------------------------------- #
+  spcheck:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debug-sanitized
+            cmake: -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
+          - name: release-no-asserts
+            cmake: -DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release
+    name: spcheck (${{matrix.name}})
+    steps:
+    - uses: actions/checkout@v4
+    - name: Configure
+      run: cmake -E make_directory ${{github.workspace}}/build
+    - name: CMake
+      working-directory: ${{github.workspace}}/build
+      run: cmake ${{matrix.cmake}} $GITHUB_WORKSPACE
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      run: cmake --build . -j
+
+    # THE VACUITY GUARD: the check is emitted code, so prove it is
+    # THERE. Its instructions only appear under the lever, so the
+    # dump must grow and must carry `test rsp, 15`.
+    - name: "assert the alignment check is emitted"
+      working-directory: ${{github.workspace}}/build
+      run: |
+        if ! MYLANG_JIT_SPCHECK=1 ./mylang -vdj \
+               $GITHUB_WORKSPACE/samples/gcd | grep -q 'test rsp, 15'
+        then echo "the lever emitted no check"; exit 1; fi
+        if ./mylang -vdj $GITHUB_WORKSPACE/samples/gcd \
+             | grep -q 'test rsp, 15'
+        then echo "the check is emitted WITHOUT the lever"; exit 1; fi
+
+    - name: "-rt with the alignment check"
+      working-directory: ${{github.workspace}}/build
+      run: MYLANG_JIT_SPCHECK=1 ./mylang -rt
+
+    - name: corpus_diff --spcheck
+      working-directory: ${{github.workspace}}/build
+      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --spcheck
+
   myv-fuzz:
     runs-on: ubuntu-latest
     strategy:

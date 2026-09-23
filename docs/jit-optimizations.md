@@ -13579,3 +13579,261 @@ the push was, the one-slot-shallower `lea rsp,[rbp-0x8]` and the missing
 that stops admitting anything fails instead of going quiet. Watched
 failing: forcing CAP_CALLEE_SAVED back fails 2 of 2014 (the shape test
 and the coverage).
+
+
+## SP1/SP2/SP3 - ONE CALL SEAM, AN EMIT-TIME rsp MODEL, AND THE
+## 16-ALIGNMENT INVARIANT RELAXED FROM "EVERYWHERE" TO "AT THE CALL"
+## (2026-09-22)
+
+System V requires `rsp % 16 == 0` **at the call instruction**, and
+nowhere else. This file's emitter satisfied that with a far stronger
+property - *the body of every fragment runs 16-aligned at ALL times* -
+held up by three unrelated mechanisms and checked by NOTHING:
+
+ - `frag_entry`'s parity filler (`entry_pad`, an 8-byte `sub rsp`
+   whenever the entry's push count is even);
+ - a hand rule, written in a comment, that "the sites that spill by
+   hand all push in PAIRS";
+ - a third clause about `emit_call_prologue` padding on an odd cache
+   size, which had been STALE since the GP spill became a store to the
+   slot rather than a push.
+
+Its failure mode is the one the file already names about this exact
+subject: *not a crash on x86-64 until some callee uses an aligned SSE
+store, i.e. exactly the kind of bug that hides.*
+
+W6 (the entry above) is what forced the issue. It removed a push/pop
+pair from a frameless callee's PER-CALL prologue and got back half the
+prize, because dropping the push flipped the entry's parity and
+`entry_pad` bought the 8 bytes back as an instruction. The allocator's
+cost model cannot express that: `gp_weight` prices a callee-saved
+register at one push, and the prologue's SHAPE turns that into "one
+push, plus or minus a filler depending on parity".
+
+### SP1 - THE SEAM
+
+97 sites open-coded
+
+    e.call_relocs.push_back({ e.pos(), fn });
+    e.u8(0xE8); e.u32(0);
+
+so each carried the alignment obligation privately, and the question
+"does this run emit a call?" could only be reconstructed from
+`call_relocs.size()`. They are `e.call_direct(fn)` now; `call_reg` is
+the only other spelling; `u8(0xE8)` as a call opcode appears in exactly
+two places in the file (`call_direct`, and the alignment check's own
+report call). Four sites that chose their helper in a branch hoist it
+into a local first. **Verified a pure restructuring: `vdjcmp` 128/128
+byte-identical.**
+
+Two things fell out of the seam immediately, and both are used below:
+an exact per-emission call COUNT, and one place to put a check.
+
+### SP2 - THE MODEL
+
+`Emitter` MODELS rsp instead of legislating about it. Two numbers,
+one mutator (`sp_move`):
+
+ - **`sp_mod`** - `rsp % 16`, always known. A fragment is entered by a
+   `call`, so it starts at 8 and CALL-READY is `sp_mod == 0`.
+ - **`sp_depth`** - bytes below the fragment's entry rsp, exact while
+   `sp_exact`. This is what makes an `[rsp+N]` displacement derivable.
+
+Every emission that moves rsp goes through a seam that calls `sp_move`:
+push/pop, `push_base0`/`push_base`/`push_abs32`, `op_reg_imm` on RSP
+(which ML_CHECKs the op is one the model can follow), the two raw rbp
+pushes (named `push_rbp`/`pop_rbp` now - rbp is outside the Reg enum, so
+they were raw bytes and invisible to both trackers), the residue
+relay's raw rcx pair, `frag_entry`'s pad and spill reserve, `frag_ret`'s
+`lea rsp,[rbp-K]`, and the native-stack SWITCH - which loses only the
+DEPTH, because the switched top is a page boundary and therefore
+16-aligned (ML_CHECKed where the mapping is made, not asserted at the
+emitter).
+
+**Four checks, in every ASSERTS build** - debug AND the default release,
+so every `-rt` mode, every corpus program, every fuzzer program and
+every CI lane exercises them, at zero emitted cost:
+
+ 1. `call_direct`/`call_reg`: the model must say call-ready;
+ 2. `frag_ret`: rsp is back at the entry depth before the `ret`, and
+    the teardown `lea` lands on the pushes the pops are about to take;
+ 3. `op_boundary`: an op leaves the stack where it found it - which is
+    what makes every run-internal pc branch join at one depth for free,
+    with no per-branch bookkeeping;
+ 4. every forward branch records its state and every patch checks it.
+    Two paths reaching one label must agree, or the label's alignment
+    claim is only true on the path its author thought about. A `ret`, an
+    `exit_pc` or an unconditional `jmp` ENDS a path, so the model goes
+    dead there and the first jump patched to a position REVIVES it.
+
+**It found one on its first run.** `pop_bytes` (a divergent-path
+restore) is deliberately exempt from `trk_pushes`, because that counter
+counts EMISSIONS and the shared push is popped once on each path.
+`sp_depth` follows ONE PATH, where the pop really does move rsp;
+leaving it out put `PushHandler`'s cold grow call at an odd depth.
+
+**`MYLANG_JIT_SPCHECK=1` (TESTS) is the GROUND TRUTH the model is
+checked against**: `test rsp, 15` before every emitted call, reporting
+through `jit_sp_misaligned` with the real rsp. It needs no model, which
+is exactly why it is worth its bytes - it is the layer that catches a
+MISSING `sp_move`. A lever rather than always-on because it changes the
+emitted bytes that `-vdj`, the shape tests and `vdjcmp` read;
+`corpus_diff.sh --spcheck` is its lane, and it belongs on an
+**`ASSERTS=0`** build as much as a debug one (see the bug below).
+
+The completeness net for SP1 is the `-rt` entry *the CALL SEAM is
+total*, which asks the DISASSEMBLY rather than the emitter: with the
+lever on, every `call` in the dump is either preceded by the
+five-instruction check - whose `je` must name that call's own offset -
+or is the check's own report call. An open-coded 98th site fails it by
+offset (watched).
+
+### SP3 - ALIGN AT THE CALL
+
+ - **`call_site` ALIGNS.** If the model says the stack is not
+   call-ready it emits `sub rsp, N` before and `add rsp, N` after. Safe
+   against the flags for a reason worth stating: a call clobbers them,
+   so no emitted code can carry a condition ACROSS one, and the restore
+   can only destroy what the call already did. FREE in the common case,
+   because the prologue still aligns the body whenever the body calls.
+
+ - **`entry_pad()` is CONDITIONAL.** The filler exists to leave the body
+   call-ready; a run whose MAINLINE emission makes no call has nothing
+   to be ready for, and for a function body - above all for a FRAMELESS
+   callee - that prologue runs PER CALL. Settled after the run by the
+   same bet-and-settle shape W6 uses (`n_prologues` for the bracketed
+   helper calls plus `jit_run_blocks_xcache`'s static MyLang-CALL test),
+   with one re-emission. **The condition is PROFITABILITY, not
+   soundness**: a call at an odd depth aligns itself, so a wrong answer
+   costs two instructions on a cold arm, never a misaligned call. The
+   unbracketed calls that remain are exactly the cold arms - a
+   ref-listed return slot's release, the return's slow tier, an exit
+   epilogue - which pay two instructions off the hot path in exchange
+   for one at an entry that runs per call. **W6's second instruction is
+   recovered here.**
+
+ - **The hand-spill sites stop pushing in pairs.** Four parity fillers
+   are gone (the entry probe's second rdx push, the cached probe's, the
+   reference-bind arm's, the exit release scan's). Instruction-neutral
+   by construction - a filler and a self-aligning call are both two
+   instructions - which is the point: the obligation lives in ONE place
+   now instead of at every site that spills. This is the half #124(b)
+   needs, since the number of caller-saved pins it spills around a call
+   varies per run and half those shapes would otherwise pay a wasted
+   push/pop per call, on the hot path, forever. (For #124(b) the better
+   answer is the rbp-relative SPILL AREA `spill_off` already provides -
+   reserved once, a multiple of 16, no per-call stack movement at all.)
+
+ - **And the displacements are DERIVED.** `Emitter::load_rsp_disp` is
+   the one spelling for an rsp-relative read; the descriptor spill's
+   `[rsp+32]`, documented as *"behind this arm's three pushes and its
+   pad"*, is `sp_depth - sp_desc` now. A parity fact written in prose
+   goes silently wrong the moment the filler leaves; a derived one
+   cannot. RAWENC 14 -> 12.
+
+### ⛔ THE BUG THIS CHANGE SHIPPED FOR AN HOUR, AND WHAT CAUGHT IT
+
+`sp_at_jump` - the table recording each forward branch's stack state -
+looks like pure diagnostics: it only ever feeds an `ML_CHECK`. It is
+ALSO how a label REVIVES the model after a terminator, and the model
+DRIVES EMISSION now. It was `#ifndef NDEBUG`, so under NDEBUG `sp_live`
+went false at a fragment's first `ret` and never came back, and every
+later call skipped BOTH the alignment and the check.
+
+`mylang -npc bench/my/78_typed_param_call.my` GP-faulted inside
+`jit_ret_norec` in an `OPT=1 ASSERTS=0` build - a misaligned SSE access,
+the textbook symptom - while **every checked build was green**: `-rt`
+2016/2016 in five modes, every corpus matrix 35/35, `--spcheck` 35/35
+on the debug build. `MYLANG_JIT_SPCHECK` on an **ASSERTS=0** build is
+what named it, in one line, at the call.
+
+That is the same "two builds catch different things" discipline the
+myv-fuzz lane is built on, and it earns the same rule:
+
+**⛔ A VALUE THAT DRIVES EMISSION IS NOT DIAGNOSTICS, WHATEVER IT LOOKS
+LIKE.** Same family as `trk_push`'s own ⛔ (a count that drives
+emission). If a table feeds a check AND a decision, it cannot be
+compiled out with the check.
+
+### ⛔ AND A SECOND ONE, FOUND BY SABOTAGE: THE FIXED-FRAME CALL
+
+Three call sites have a callee that reads the CALLER's frame at a fixed
+offset from the return address - the push protocol's captures at
+`[rbp+16]`, the pushed dst word at `[rbp+24]`, and the frameless
+window at `[rbp+32]` - every one of them counted through the residue
+the SITE pushed. **A `sub rsp, 8` slipped between the last push and the
+call MOVES the window.**
+
+It cannot happen in the shipping configuration, structurally rather
+than by luck: such a site is in a run containing a MyLang CALL op,
+which is one of the conditions the filler settle requires to be FALSE,
+so the body keeps its filler; and the site's own movement (a window
+that is a multiple of 48, plus a 16-byte residue) preserves the parity.
+But nothing SAID so. A sabotage that dropped the filler for calling
+bodies too broke the frameless window, and surfaced as a `jit_ret_audit`
+abort four layers from the cause. `call_fixed_frame` /
+`call_fixed_frame_reg` state the requirement at the three sites that
+rely on it; the same sabotage now aborts by name, at the call.
+
+### MEASURED
+
+Callgrind Ir, scale-3 minus scale-1 (so compile time is excluded),
+`OPT=1 ASSERTS=0` on both sides, `-npc`:
+
+    11_closure_counter      -1.56%
+    78_typed_param_call     -1.39%
+    34_sort_custom_cmp      -0.42%
+    35_map_filter           -0.37%
+    63_closures             -0.34%
+    67_make_dict            -0.26%
+    57_bool_reduce          -0.14%
+    12_higher_order          0.00%
+    09_fib_recursive, 01_while_loop, 46_matrix_mult,
+    83_regs_int_40, 89_regs_float_08, 08_func_call - flat to the
+    instruction
+
+Corpus-wide, release build: 21 programs' emitted code changes, 23
+entry fillers removed. Wall clock, one interleaved A/B over 90
+benchmarks: **geomean cur/base 1.005x - FLAT**, which is the
+guard-elision family's documented ceiling and was the expected result
+for one instruction per call. **The value here is the seam, the model
+and the nets**; the numbers are the evidence that they cost nothing.
+
+### NETS
+
+`-rt` 2016/2016 in all five modes (gcc, clang, CMake, `rel-hard`,
+non-JIT), `corpus_diff` plain / `--levers` / `--cold` / `--xrot` /
+`--nolowmem` / `--spcheck` all 35/35, `--spcheck` ALSO on an
+`OPT=1 ASSERTS=0` build, `norec_enum --depth 3` (480 programs),
+`norec_sweep`, `nested_fuzz` 1000 programs, `myv_fuzz` on both builds
+(0 crashes, the 3 known non-terminating programs), 34 corpus images
+identical to their source runs, `driver_checks`, `disasmcheck` 280,563
+instructions under the lever with zero objdump disagreements (234,588
+without - so the four new instruction forms are covered), `vdjcmp`
+self-test 128/128, `regcensus --gate` at its floor.
+
+**Watched failing**, one sabotage build each:
+
+ 1. an extra push before a libm call -> the emit-time model aborts at
+    `call_site`;
+ 2. the same push emitted as RAW BYTES, invisible to the model -> the
+    model is silent and `MYLANG_JIT_SPCHECK` reports `rsp % 16 == 8`;
+ 3. a 98th open-coded call site -> *the CALL SEAM is total* names the
+    offending call's offset (2015/2016);
+ 4. the frameless site's normal arm releasing 8 bytes too few -> the
+    branch-join check;
+ 5. the filler restored unconditionally -> *the entry FILLER is for the
+    calls* names both of `closure#0`'s prologues;
+ 6. the filler dropped for calling bodies too -> the FIXED-FRAME check;
+ 7. `sp_at_jump` back under `NDEBUG` -> the checked build stays green
+    (2016/2016, `--spcheck` 35/35) and the `ASSERTS=0` `--spcheck` lane
+    reports 31/35.
+
+### THE ONE THING IT FOUND AND DID NOT FIX
+
+`MoveV` emits its helper arm even when neither slot is ref-listed, so
+`jhelp` is empty, nothing is patched to it, and the arm is
+**UNREACHABLE** - roughly 35 emitted bytes per move. The model noticed
+because a call emitted there has no branch state to align against. It
+is a code-SIZE finding with no correctness component; `g_jit_call_dead_
+model` counts them.
