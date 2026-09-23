@@ -1454,6 +1454,14 @@ extern "C" unsigned long g_jit_hoist2;        /* C2b: second-base preheader
 extern "C" unsigned long g_jit_capbase;       /* #112: fragment entries with
                                                * ctx->captures->data() pinned
                                                * for the run */
+/* SP: every emitted call goes through Emitter::call_direct or
+ * call_reg; this counts them, and `spcheck_sites` the MYLANG_JIT_SPCHECK
+ * runtime alignment checks emitted beside them. */
+extern "C" unsigned long g_jit_call_sites;
+extern "C" unsigned long g_jit_spcheck_sites;
+#if defined(TESTS) && ML_JIT_SUPPORTED
+extern "C" bool g_jit_spcheck;      /* MYLANG_JIT_SPCHECK=1 */
+#endif
 extern "C" unsigned long g_jit_capbase_cs;    /* W6: runs whose capture base
                                                * is CALLER-saved (a call-free
                                                * run: no entry push/pop) */

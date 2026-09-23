@@ -29332,14 +29332,25 @@ static size_t native_find_seq(const std::vector<NativeIns> &ins,
     return std::string::npos;
 }
 
-/* the `-vdj` dump of a source, through the real dump driver */
-static std::string native_dump_of(const std::vector<const char *> &lines)
+/* the `-vdj` dump of a source, through the real dump driver.
+ *
+ * A shape test pins the SHIPPING emission, so the dump is taken with
+ * MYLANG_JIT_SPCHECK OFF unless the test asks for it: the lever puts a
+ * `test rsp, 15` guard in front of every call, and the `spcheck` CI
+ * lane runs the whole suite with it on - where every sequence pinned
+ * across a call read the guard instead of the call (four tests, both
+ * builds, the day the lane landed). */
+static std::string native_dump_of(const std::vector<const char *> &lines,
+                                  bool spcheck = false)
 {
     const bool ann_was = g_jit_annotate;
     g_jit_annotate = true;
+    const bool sp_was = g_jit_spcheck;
+    g_jit_spcheck = spcheck;
     struct AnnRestore {
-        bool v; ~AnnRestore() { g_jit_annotate = v; }
-    } ann_restore{ ann_was };
+        bool v, sp;
+        ~AnnRestore() { g_jit_annotate = v; g_jit_spcheck = sp; }
+    } ann_restore{ ann_was, sp_was };
     std::string src;
     for (const char *l : lines) { src += l; src += '\n'; }
     std::vector<Tok> toks;
@@ -30165,6 +30176,128 @@ static bool jit_frameless_e3_shape()
         ok = at2 != std::string::npos
              && native_expect(mn, at2, cand1, "E3 dispatch, candidate 1")
              && ok;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * ==========  THE CALL SEAM IS TOTAL, AND THE STACK IS ALIGNED  ==========
+ *
+ * System V requires rsp % 16 == 0 AT the call. The emitter used to
+ * satisfy that with a far stronger, unchecked property - "the body of a
+ * fragment is aligned at ALL times" - held up by a parity filler at
+ * frag_entry and a hand rule that the spill sites push IN PAIRS. Its
+ * failure mode is the one this file names elsewhere: not a crash until
+ * some callee uses an aligned SSE store, i.e. exactly the kind of bug
+ * that hides.
+ *
+ * Two things must be true for the emit-time rsp model to mean anything,
+ * and NEITHER is provable by reading the emitter:
+ *
+ *   1. EVERY emitted call goes through the seam (Emitter::call_direct
+ *      or call_reg). 97 sites used to open-code `push_back(reloc);
+ *      u8(0xE8); u32(0)`, and a 98th could be written tomorrow.
+ *   2. The check the seam emits is really THERE, in the bytes.
+ *
+ * So this test asks the DISASSEMBLY - an independent reading of what
+ * was emitted, not of what the emitter meant - with the runtime check
+ * forced on: every `call` instruction in the dump is either preceded by
+ * the four-instruction alignment check, or IS the check's own reporter
+ * call (recognised by the `and rsp, -16` that precedes it, and reached
+ * only when the check has already failed).
+ *
+ * WATCHED FAILING: open-coding one call site again (the E8 pair without
+ * call_site()) leaves that call unguarded and this names its offset.
+ */
+static bool jit_call_seam_is_total()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    /* a program that reaches many different call EMITTERS: a helper
+     * call in a pinned int run, a libm call, an element store, a
+     * closure call (call_reg, the switched tier), a dict, a string */
+    const std::vector<const char *> lines = {
+        "func mk(int n) { var b = n * 10;",
+        "              return func [b] (int x) { return b + x; }; }",
+        "var add = mk(7);",
+        "var a = []; var d = {}; var s = \"\";",
+        "var t = 0.0; var acc = 0;",
+        "for (var i = 0; i < runtime(6); i++) {",
+        "  append(a, i * 3); d[i] = i + 1; s = s + str(i);",
+        "  t = t + sqrt(float(i) + 1.0); acc = acc + add(i);",
+        "}",
+        "print(len(a), len(d), len(s), t > 0.0, acc);"
+    };
+    const unsigned long c0 = g_jit_call_sites;
+    const unsigned long s0 = g_jit_spcheck_sites;
+    std::string d;
+    try {
+        d = native_dump_of(lines, /*spcheck=*/true);
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_call_seam_is_total: threw %s: %s\n",
+                e.name, e.msg);
+        return false;
+    }
+    if (g_jit_call_sites == c0 || g_jit_spcheck_sites == s0) {
+        fprintf(stderr, "jit_call_seam_is_total: VACUOUS - the compile "
+                        "emitted %lu call seams and %lu runtime checks\n",
+                g_jit_call_sites - c0, g_jit_spcheck_sites - s0);
+        return false;
+    }
+    /* walk EVERY native instruction of EVERY chunk in the dump */
+    std::vector<NativeIns> all;
+    for (size_t p = d.find("; ===== "); p != std::string::npos;
+         p = d.find("; ===== ", p + 1)) {
+        const size_t nl = d.find('\n', p);
+        if (nl == std::string::npos)
+            break;
+        std::string title = d.substr(p + 8, nl - (p + 8));
+        while (!title.empty() && (title.back() == ' ' || title.back() == '='))
+            title.pop_back();
+        const std::vector<NativeIns> in = native_ins_of(d, title);
+        all.insert(all.end(), in.begin(), in.end());
+    }
+    size_t calls = 0, guarded = 0, reporters = 0;
+    bool ok = true;
+    for (size_t i = 0; i < all.size(); i++) {
+        if (all[i].text.compare(0, 5, "call ") != 0)
+            continue;
+        calls++;
+        if (i >= 1 && all[i - 1].text == "and rsp, -16") {
+            reporters++;                 /* the check's own report call */
+            continue;
+        }
+        /* test rsp,15 / je <this call> / mov rdi,rsp / and rsp,-16 /
+         * call <report> / <THE CALL> - and the `je` must name this
+         * instruction's offset, which is what proves the fall-through
+         * really is the report and not something else */
+        if (i >= 5 && all[i - 5].text == "test rsp, 15"
+                && all[i - 4].text.compare(0, 4, "je +") == 0
+                && all[i - 3].text == "mov rdi, rsp"
+                && all[i - 2].text == "and rsp, -16"
+                && all[i - 1].text.compare(0, 5, "call ") == 0
+                && static_cast<uint32_t>(
+                       std::atoi(all[i - 4].text.c_str() + 4))
+                       == all[i].off) {
+            guarded++;
+            continue;
+        }
+        fprintf(stderr, "jit_call_seam_is_total: `%s` at +%u is NOT "
+                        "preceded by the alignment check - it was "
+                        "emitted outside Emitter::call_direct/call_reg\n",
+                all[i].text.c_str(), all[i].off);
+        ok = false;
+    }
+    if (calls < 8 || guarded < 4 || reporters != guarded) {
+        fprintf(stderr, "jit_call_seam_is_total: %zu calls, %zu guarded, "
+                        "%zu reporters - too few to prove anything, or "
+                        "the guard/report pairing is broken\n",
+                calls, guarded, reporters);
+        ok = false;
     }
     return ok;
 #else
@@ -40021,6 +40154,14 @@ static bool jit_counter_coverage()
          * CALLER-saved file. Zero would mean the call-free gate never
          * admits anything, i.e. the step is inert. */
         { "capbase_cs",       &g_jit_capbase_cs,       nullptr },
+        /* SP: the call seam's own reach - zero would mean the emitter
+         * stopped calling helpers, or the seam stopped being the one
+         * spelling. The runtime alignment check is a LEVER, so it is
+         * exempt unless the lever is on (the --spcheck lane). */
+        { "call_sites",       &g_jit_call_sites,       nullptr },
+        { "spcheck_sites",    &g_jit_spcheck_sites,
+          g_jit_spcheck ? nullptr
+                        : "MYLANG_JIT_SPCHECK is off in this run" },
         { "hoist_rmw",        &g_jit_hoist_rmw,        nullptr },
         { "fwd",              &g_jit_fwd,              nullptr },
         { "ffwd",             &g_jit_ffwd,             nullptr },
@@ -43105,6 +43246,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 E3 - the TWO-WAY frameless site: the dispatch chain and "
       "the paired pool entry, read from the dump",
       jit_frameless_e3_shape },
+    { "jit: SP - the CALL SEAM is total: every emitted call carries the "
+      "MYLANG_JIT_SPCHECK alignment check, read from the dump",
+      jit_call_seam_is_total },
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },

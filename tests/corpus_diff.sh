@@ -21,6 +21,9 @@
 #   tests/corpus_diff.sh [binary] --cold     - once per forced cold tier
 #   tests/corpus_diff.sh [binary] --xrot     - once per pin-pool rotation
 #   tests/corpus_diff.sh [binary] --nolowmem - with the low-address arena
+#   tests/corpus_diff.sh [binary] --spcheck  - with the emitted rsp
+#                                              alignment check at every
+#                                              call site (TESTS builds)
 #                                              REFUSED (the imm32 tags fall
 #                                              back to registers)
 #
@@ -219,5 +222,17 @@ case "$MODE" in
     for K in $XROTS; do run_one "MYLANG_JIT_XROT=$K" || rc=1; done ;;
   --nolowmem)
     run_one "MYLANG_NO_LOWMEM=1" || rc=1 ;;
+  # SP: the emitted-call alignment check reads the REAL rsp, so it needs
+  # no emit-time model to be right - it is the ground truth the model is
+  # checked against, and this is the lane that executes it over every
+  # corpus program. A TESTS build only (the emission is #ifdef TESTS);
+  # elsewhere the lane runs the plain corpus and says so.
+  --spcheck)
+    if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then
+      run_one "MYLANG_JIT_SPCHECK=1" || rc=1
+    else
+      echo "  spcheck: SKIPPED - '$BIN' is not a TESTS build" >&2
+      rc=1
+    fi ;;
 esac
 exit $rc
