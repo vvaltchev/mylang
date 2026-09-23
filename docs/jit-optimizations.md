@@ -13883,3 +13883,137 @@ parameters and the source becomes PINNED, the move takes an early
 return and the case goes VACUOUS, watched) and a runtime-count shift.
 Watched failing: restoring `MoveV`'s arm, and hand-encoding the shift's
 branches again - one sabotage build each, both named by count.
+
+
+## #97 1b(ii) - `lea dst, [src + k]`: THE MOVE FOLDS INTO THE
+## ARITHMETIC, and the shape tests get an INSTRUCTION MODEL
+## (2026-09-22)
+
+The plan's own open item (`plans/frameless-callee.md` §3b, *WHAT 1b
+LEAVES OPEN* (ii)). The emitter's shape is three-address-through-the-
+accumulator, so an int add/sub-IMMEDIATE off a register-resident
+operand costs TWO instructions:
+
+    mov rax, r12 ; sub rax, 1        ->    lea rax, [r12-0x1]
+
+and that is exactly the shape of every `fib(n - k)` argument - which is
+why the plan named it as what turns 1b's *"+2 per invocation"* into a
+saving. The two-REGISTER `+` is the same trick with an index instead of
+a displacement and is admitted with it; `-` has no two-register `lea`
+form, and a `*` is already strength-reduced by #100's `mul_plan`.
+
+**SOUNDNESS: `lea` sets NO FLAGS where `add`/`sub` do.** Nothing
+downstream reads them - the arm ends in `write_slot`, whose ref-listed
+path emits its own compare, and a flag consumer never crosses an op
+boundary in this emitter (every branch op makes its own `cmp`). That is
+the ONE property to re-check if a future fusion ever reads an
+arithmetic op's flags. **COST, not soundness:** it is declined when the
+destination IS the source register, because `mov_rr` already elides
+that self-move and `lea` is then the longer encoding of the same one
+instruction.
+
+⛔ **AND IT NEEDED AN ENCODER FIX FIRST, at the register the allocator
+hands out most.** `rm == 100` in ModRM does not mean "rsp", it means *a
+SIB byte follows* - which is what `base_needs_sib` is for, and every
+encoder here ASSERTS against such a base. Those assertions are right
+for the load/store forms, whose capability model (`CAP_MEM_BASE`) keeps
+r12 out of the base role deliberately. They are NOT right for a `lea`
+off an arbitrary PIN, and **r12 is a pin**: fib's own `n` lives there.
+`emit_modrm_disp` writes the SIB now, which is a pure WIDENING (every
+existing caller asserts before arriving, so none can reach the new
+branch) - `vdjcmp` 128/128 with it in and the peephole out.
+
+### MEASURED
+
+Callgrind Ir, scale-3 minus scale-1, `OPT=1 ASSERTS=0` both sides,
+`-npc`:
+
+    51_purefunc_fold        -5.26%
+    09_fib_recursive        -2.69%     <- the plan's named target
+    03_int_arith            -2.17%
+    22_multi_assign         -2.15%
+    87_elem_shift_compound  -1.45%
+    10_recursion_deep       -0.63%
+    73_multi_unpack         -0.41%
+    77_struct_array_lit     -0.27%
+    68_nested, 45_gcd, 83_regs_int_40, 82_regs_int_25, 44_primes_sqrt,
+    07_nested_loops - flat to the instruction
+
+16 corpus programs change, 185,964 -> 185,902 emitted instructions.
+Wall clock, one interleaved A/B over 90 benchmarks: **geomean 1.007x**,
+with the affected benches scattered both ways (03_int_arith 0.86x,
+09_fib 1.03x) on runtimes of 0.07-0.19s. **The clock does not move**,
+which is this repo's third recording of the same thing: an
+instruction-count win on predicted, L1-hitting work retires alongside
+the real work. Take the Ir as the size-and-decode win it is.
+
+### ⛔ AND THE SHAPE TESTS GET AN INSTRUCTION MODEL (maintainer,
+### 2026-09-22) - THE HALF WORTH MORE THAN THE PEEPHOLE
+
+The first version of this increment's test scanned the `-vdj` text:
+*does this line start with `lea `, contain `-0x1]`, and not contain
+`rbp` or `rsp`*. The maintainer's verdict - **"that's not a test"** -
+is right twice over. It is a HEURISTIC LINE CLASSIFIER, satisfied by
+any instruction that happens to render the same way; and its
+exclusions are the enumerate-where-the-hazard-can-occur shape CLAUDE.md
+already records as a staleness trap (the `-rt` address-free check that
+walked operand separators, #96).
+
+So `tests.cpp` now PARSES the dump into `MIns2`/`MOp` - mnemonic plus
+typed operands (`Name`, `Mem{base,index,scale,disp}`, `Imm`, `Sym`,
+`Rel`) - and the assertions are field comparisons:
+`op.kind == MOp::Mem && op.base == pin && op.index < 0 && op.disp == -1`.
+The instruction under test is ANCHORED by its destination store (the
+`<slot>.type` / `<slot>` pair every int result ends in), so it is *this
+op's arithmetic*, not some other `lea` that renders alike.
+
+**WHY THE DUMP AND NOT AN EMITTER-SIDE TRACE:** an oracle that shares
+its subject is not an oracle (#96). `-vdj` decodes the BYTES that were
+emitted and `disasmcheck` proves that decode against objdump corpus-
+wide, so parsing it keeps the independent reading.
+
+**WHAT disasmcheck DOES NOT PROVE, watched here:** dropping the SIB
+byte from the `[r12+d]` encoding leaves a DIFFERENT, well-formed
+instruction - and our decoder and objdump agreed on it perfectly (zero
+disagreements over 235,639 instructions) while `-rt` aborted and
+`corpus_diff` went 33/35 with a garbage value printed. A decoder
+oracle proves the dump is honest about the bytes; only the differential
+proves the bytes mean what the emitter intended.
+
+⛔ **ONE THING THE MODEL CANNOT RESOLVE, stated rather than papered
+over:** a bare operand is either a MACHINE REGISTER or a FRAME SLOT,
+and the dump spells a scratch TEMP `rN` - the same spelling as r8..r15.
+A bare token therefore stays a `Name`, and `mgpr()` answers only "is
+this one of the 16 GPR spellings". A memory operand's base/index are
+never ambiguous (a slot is rendered bare, never bracketed), which is
+what these assertions rest on. **The real fix is in the DISASSEMBLER -
+spell a temp `tN`** - and it is a separate change, because it moves
+every dump's text and every existing shape test's want lines.
+
+The model FAILS CLOSED (`mparse` refuses a form it does not know and
+`mins_of` drops the section), and `jit: the shape tests'
+MACHINE-INSTRUCTION MODEL parses every form the emitter produces` is its
+self-test: >2000 instructions over >=4 sections of a program reaching
+closures, a frameless call, a dict, a string, a flat array, a struct,
+libm, a runtime-count shift, an idiv and a try/catch. A new operand
+form fails there, by instruction.
+
+### WATCHED FAILING, one sabotage build each
+
+ 1. the peephole never fires -> *the arithmetic before `r10`'s store is
+    `sub rax, 1` (want one `lea <dst>, [<pin>-0x1]`), reach 0*;
+ 2. **the `lea` fires but the redundant `mov` is KEPT** - the case that
+    justifies the model: a counting or substring test passes it (the
+    `lea` is there, the `sub` is not) and the anchored model reports
+    *the arithmetic before `r10`'s store is `mov rax, r12`*;
+ 3. the SIB byte dropped from `emit_modrm_disp` -> `-rt` aborts and
+    `corpus_diff` 33/35, while disasmcheck stays green (above).
+
+### NETS
+
+`-rt` 2018/2018 in all five modes (gcc, clang, rel-hard), `corpus_diff`
+plain / `--levers` / `--cold` / `--xrot` / `--nolowmem` / `--spcheck`
+all 35/35, `norec_enum --depth 3`, `norec_sweep`, `nested_fuzz`,
+34 corpus images identical to their source runs, `driver_checks` 24/24,
+`disasmcheck` zero objdump disagreements with and without the alignment
+lever, `vdjcmp` self-test 128/128, `regcensus --gate` at its floor.

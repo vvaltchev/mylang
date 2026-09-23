@@ -173,6 +173,9 @@ unsigned long g_jit_spcheck_sites = 0;
 /* SP3 reach: runs whose entry 16-alignment filler was proved
  * unnecessary (the body emits no call), and calls that had to align
  * themselves because the stack was not already call-ready. */
+/* #97 1b(ii): int add/sub-immediate (and register `+`) folded into a
+ * single `lea` off a register-resident operand - the `fib(n-k)` shape */
+unsigned long g_jit_lea_addsub = 0;
 unsigned long g_jit_entry_pad_off = 0;
 unsigned long g_jit_call_align = 0;
 /* calls emitted into code no branch has reached yet (MoveV's dead
@@ -4675,12 +4678,36 @@ struct Emitter {
     void lea_base(uint8_t dst, uint8_t base, int32_t d)
     {
         wrote(dst);
-        ML_CHECK_MSG(!base_needs_sib(base),
-                     "lea_base: rsp/r12 need a SIB byte");
+        /* no rsp/r12 refusal here: emit_modrm_disp writes the SIB
+         * (#97 1b-ii - a lea off an arbitrary PIN must accept r12) */
         u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
                                 | (base >= 8 ? 0x01 : 0)));
         u8(0x8D);
         emit_modrm_disp(dst, base, d);
+    }
+    /*
+     * `lea dst, [base + index]` - the two-REGISTER add in one
+     * instruction (#97 1b-ii). Scale 1, no displacement, so mod=00
+     * and the SIB's scale field is 00.
+     *
+     * The base may not be rbp/r13 (mod=00 with rm=101 means "no base,
+     * disp32"); the caller SWAPS the two registers when it can, which
+     * a `+` always can. The INDEX may not be rsp (index=100 means "no
+     * index"), which costs nothing - rsp is not allocatable - while
+     * r12 as an index is fine, REX.X distinguishing them.
+     */
+    void lea_base_idx(uint8_t dst, uint8_t base, uint8_t index)
+    {
+        wrote(dst);
+        ML_CHECK_MSG(!base_no_base_form(base),
+                     "lea_base_idx: an rbp/r13 base needs mod=01");
+        ML_CHECK_MSG(index != 4, "lea_base_idx: rsp is not an index");
+        u8(static_cast<uint8_t>(0x48 | (dst >= 8 ? 0x04 : 0)
+                                | (index >= 8 ? 0x02 : 0)
+                                | (base >= 8 ? 0x01 : 0)));
+        u8(0x8D);
+        u8(static_cast<uint8_t>(((dst & 7) << 3) | 4));    /* SIB */
+        u8(static_cast<uint8_t>(((index & 7) << 3) | (base & 7)));
     }
     /* lea dst, [base + index*8]  (the element address) */
     void lea_elem_q(uint8_t dst, uint8_t base, uint8_t index)
@@ -4786,17 +4813,34 @@ struct Emitter {
     }
     /* the shared mod/rm + displacement tail: mod=00 when the
      * displacement is zero and the base allows it, else disp8, else
-     * disp32 */
+     * disp32.
+     *
+     * ⛔ AND IT WRITES THE SIB BYTE FOR AN rsp/r12 BASE (#97 1b-ii).
+     * `rm == 100` does not mean "rsp" in ModRM, it means "a SIB byte
+     * follows" - which is why `base_needs_sib` exists and why every
+     * encoder here ASSERTS against such a base. The assertions are
+     * right for the load/store forms, whose capability model
+     * (CAP_MEM_BASE) keeps r12 out of the base role deliberately; they
+     * are NOT right for `lea` off an arbitrary PIN, and r12 is a pin
+     * the allocator hands out constantly. One `SIB = (none)*1 + base`
+     * byte encodes it, and this is a pure WIDENING: every existing
+     * caller asserts before arriving here, so none of them can reach
+     * the new branch and not one emitted byte moves (vdjcmp 128/128).
+     */
     void emit_modrm_disp(uint8_t reg, uint8_t base, int32_t d)
     {
         const uint8_t rm = static_cast<uint8_t>(base & 7);
+        const bool sib = rm == 4;          /* rsp/r12: a SIB follows */
         if (d == 0 && rm != 5) {
             u8(static_cast<uint8_t>(((reg & 7) << 3) | rm));
+            if (sib) u8(0x24);             /* base=rm, index=none */
         } else if (d >= -128 && d <= 127) {
             u8(static_cast<uint8_t>(0x40 | ((reg & 7) << 3) | rm));
+            if (sib) u8(0x24);
             u8(static_cast<uint8_t>(d));
         } else {
             u8(static_cast<uint8_t>(0x80 | ((reg & 7) << 3) | rm));
+            if (sib) u8(0x24);
             u32(static_cast<uint32_t>(d));
         }
     }
@@ -13365,6 +13409,7 @@ void jit_stats_report()
         { "capbase_cs",       &g_jit_capbase_cs },
         { "call_sites",       &g_jit_call_sites },
         { "spcheck_sites",    &g_jit_spcheck_sites },
+        { "lea_addsub",       &g_jit_lea_addsub },
         { "entry_pad_off",    &g_jit_entry_pad_off },
         { "call_align",       &g_jit_call_align },
         { "call_dead_model",  &g_jit_call_dead_model },
@@ -19807,13 +19852,77 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             ? e.spill_at(in.b_slot()) : -1;
         const bool bimm = !fb && in.b_is_lit()
             && in.b_lit() >= INT32_MIN && in.b_lit() <= INT32_MAX;
+        /*
+         * ⛔ #97 1b(ii): `lea A, [src + k]` - THE MOVE FOLDS INTO THE
+         * ARITHMETIC. The three-address-through-the-accumulator shape
+         * emits `mov rax, src ; sub rax, k` for an add/sub-IMMEDIATE
+         * off a register-resident operand; `lea` is the same work in
+         * ONE instruction, and it is exactly the shape of every
+         * `fib(n - k)` argument - the plan named it as what turns
+         * 1b's `+2 per invocation` into a saving (§3b, "WHAT 1b LEAVES
+         * OPEN" (ii)).
+         *
+         * The two-REGISTER `+` is the same trick with an index instead
+         * of a displacement, and is admitted here for the same reason.
+         * `-` has no two-register lea form, and a `*` is already
+         * strength-reduced by #100's mul_plan.
+         *
+         * SOUNDNESS: `lea` sets NO FLAGS where `add`/`sub` do. Nothing
+         * downstream reads them - this arm ends in `write_slot`, whose
+         * ref-listed path emits its own compare, and a flag consumer
+         * never crosses an op boundary in this emitter (every branch op
+         * makes its own `cmp`). That is the ONE property to re-check if
+         * a future fusion ever reads an arithmetic op's flags.
+         *
+         * COST, not soundness: it is declined when the destination IS
+         * the source register, because the move is then skipped
+         * already (`mov_rr` elides a self-move) and `lea` is the longer
+         * encoding of the same one instruction.
+         */
+        bool lea_done = false;
         if (!fa && !fb) {
             acc.take();
-            read_slot(e, acc.r, in.a_slot());
+            const int apin = in.a_is_lit() ? -1 : e.reg_at(in.a_slot());
+            const long long ad =
+                (!bimm || aop == Op::plus)
+                    ? static_cast<long long>(in.b_lit())
+                    : -static_cast<long long>(in.b_lit());
+            if (apin >= 0 && acc.r != static_cast<uint8_t>(apin)
+                    && !jit_lever_off(JL_PEEP)) {
+                if (bimm && (aop == Op::plus || aop == Op::minus)
+                        && ad >= INT32_MIN && ad <= INT32_MAX) {
+                    e.trk_read_pin(static_cast<uint8_t>(apin));
+                    e.lea_base(acc.r, static_cast<uint8_t>(apin),
+                               static_cast<int32_t>(ad));
+                    lea_done = true;
+                } else if (aop == Op::plus && bpin >= 0
+                           && bpin != apin) {
+                    /* `+` is commutative, so an rbp/r13 BASE swaps to
+                     * the index role rather than declining */
+                    uint8_t b0 = static_cast<uint8_t>(apin);
+                    uint8_t i0 = static_cast<uint8_t>(bpin);
+                    if (Emitter::base_no_base_form(b0))
+                        std::swap(b0, i0);
+                    if (!Emitter::base_no_base_form(b0)) {
+                        e.trk_read_pin(static_cast<uint8_t>(apin));
+                        e.trk_read_pin(static_cast<uint8_t>(bpin));
+                        e.lea_base_idx(acc.r, b0, i0);
+                        lea_done = true;
+                    }
+                }
+            }
+#ifdef TESTS
+            if (lea_done)
+                g_jit_lea_addsub++;
+#endif
+            if (!lea_done)
+                read_slot(e, acc.r, in.a_slot());
             A = acc.r;
         }
         MulPlan mp;
-        if (!fb && bpin >= 0) {
+        if (lea_done) {
+            /* the arithmetic WAS the lea */
+        } else if (!fb && bpin >= 0) {
             op_rr(e, aop, A, static_cast<uint8_t>(bpin));
         } else if (!fb && bskg >= 0) {
             e.op_reg_spill(aop, A, bskg);          /* #96 inc-1 */

@@ -1053,6 +1053,21 @@ and a new emitter must obey all four:
    inside `jit_ret_norec` in an `OPT=1 ASSERTS=0` build while `-rt`
    2016/2016, every corpus matrix and even `--spcheck` on the DEBUG
    build were green. Same family as `trk_push`'s own ⛔.
+ - **⛔ A SHAPE TEST ASSERTS ON AN INSTRUCTION, NOT ON THE TEXT THAT
+   RENDERS IT (maintainer, 2026-09-22).** `tests.cpp` parses a `-vdj`
+   line into `MIns2`/`MOp` - mnemonic plus typed operands (`Name`,
+   `Mem{base,index,scale,disp}`, `Imm`, `Sym`, `Rel`) - and a new shape
+   test compares FIELDS. The `native_*` string patterns remain for
+   pinning a long SEQUENCE verbatim, which is what they are good at;
+   they degenerate the moment a test wants to say something about ONE
+   OPERAND, because "does this line contain `-0x1]` and not `rbp`" is a
+   heuristic classifier that passes for any instruction rendering the
+   same way, with exclusions that go stale exactly like an enumerated
+   hazard list. ANCHOR the instruction under test (its destination
+   store, its op mark) rather than counting matches. The model FAILS
+   CLOSED and has its own `-rt` self-test over every form the emitter
+   produces. Its one unresolvable case is named there: the dump spells
+   a scratch TEMP `rN`, colliding with r8..r15.
  - **WHEN EVERY GUARD IS ELIDED, EMIT NEITHER THE JOIN JUMP NOR THE
    ARM.** A tier that falls to a helper behind one or more `ref_slots`
    guards has an UNREACHABLE helper when all of them are elided -

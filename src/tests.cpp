@@ -30185,6 +30185,457 @@ static bool jit_frameless_e3_shape()
 }
 
 /*
+ * ====================  THE MACHINE-INSTRUCTION MODEL  ==================
+ *
+ * ⛔ A SHAPE TEST ASSERTS ON AN INSTRUCTION, NOT ON THE TEXT THAT
+ * RENDERS IT (maintainer, 2026-09-22). The pattern helpers above match
+ * a `-vdj` line against a string with `*` wildcards, which is fine for
+ * pinning a long SEQUENCE verbatim and is how every #97 shape test up
+ * to here is written - but it degenerates the moment a test wants to
+ * say something about ONE OPERAND. A test that asks "does this line
+ * contain `-0x1]` and not `rbp`" is a heuristic line classifier: it
+ * passes for an unrelated instruction that happens to render the same
+ * way, and its exclusions are the enumerate-where-the-hazard-can-occur
+ * shape CLAUDE.md already names as a staleness trap.
+ *
+ * So the dump is PARSED into a structure and the assertions are field
+ * comparisons: `op.kind == MOp::Mem && op.base == pin && op.disp == -1`
+ * says what it means and cannot be satisfied by a coincidence of
+ * spelling.
+ *
+ * WHY THE DUMP AND NOT THE EMITTER'S OWN RECORD: an oracle that shares
+ * its subject is not an oracle (CLAUDE.md, #96). `-vdj` decodes the
+ * BYTES that were emitted, and `scripts/disasmcheck.py` proves that
+ * decode against objdump over the whole corpus - so parsing the dump
+ * keeps the independent reading while giving the test a model to
+ * assert against. (What disasmcheck does NOT prove is that the
+ * instruction MEANS what the emitter intended: dropping the SIB byte
+ * from an `[r12+d]` encoding left a different, well-formed instruction
+ * that our decoder and objdump agreed on perfectly - watched. That is
+ * the differential's job, and it caught it.)
+ *
+ * ⛔ THE ONE THING THIS MODEL CANNOT RESOLVE, stated rather than
+ * papered over: a bare operand is either a MACHINE REGISTER or a FRAME
+ * SLOT, and the dump spells a scratch TEMP `rN` - the same spelling as
+ * r8..r15. So a bare token stays a `Name` and `mgpr()` answers "is this
+ * one of the 16 GPR spellings", which is ambiguous for exactly the
+ * temps r8..r15. A memory operand's base/index are never ambiguous (a
+ * slot is rendered as a bare name, never bracketed), which is what the
+ * assertions below rest on. The real fix is in the DISASSEMBLER -
+ * spell a temp `tN` - and it is a separate change, because it moves
+ * every dump's text and every existing shape test's want lines.
+ */
+struct MOp {
+    enum Kind { None, Name, Mem, Imm, Sym, Rel };
+    Kind kind = None;
+    std::string text;       /* Name/Sym: the token as printed        */
+    std::string size;       /* Mem: "byte"/"dword"/... when printed  */
+    int base = -1;          /* Mem: base GPR, -1 = none (abs32)      */
+    int index = -1;         /* Mem: index GPR, -1 = none             */
+    int scale = 1;
+    long long disp = 0;     /* Mem                                   */
+    long long imm = 0;      /* Imm / Rel                             */
+};
+struct MIns2 { uint32_t off = 0; std::string mn; std::vector<MOp> ops; };
+
+/* the 16 GPR spellings the dump uses, in encoding order */
+static int mgpr(const std::string &t)
+{
+    static const char *n[16] = { "rax", "rcx", "rdx", "rbx", "rsp",
+                                 "rbp", "rsi", "rdi", "r8", "r9",
+                                 "r10", "r11", "r12", "r13", "r14",
+                                 "r15" };
+    for (int i = 0; i < 16; i++)
+        if (t == n[i])
+            return i;
+    return -1;
+}
+
+/* `0x1f`, `-0x1f`, `31`, `-31` -> the value; false when not a number */
+static bool mnum(const std::string &t, long long &out)
+{
+    if (t.empty())
+        return false;
+    size_t i = 0;
+    bool neg = false;
+    if (t[i] == '-' || t[i] == '+') { neg = t[i] == '-'; i++; }
+    if (i >= t.size())
+        return false;
+    int b = 10;
+    if (t.compare(i, 2, "0x") == 0) { b = 16; i += 2; }
+    if (i >= t.size())
+        return false;
+    long long v = 0;
+    for (; i < t.size(); i++) {
+        const char c = t[i];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (b == 16 && c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (b == 16 && c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        v = v * b + d;
+    }
+    out = neg ? -v : v;
+    return true;
+}
+
+/* `[rax+0x8]`, `[r12-0x1]`, `[rcx+r9*8]`, `[rsp]`, `[<addr>]` */
+static bool mparse_mem(const std::string &in, MOp &op)
+{
+    op.kind = MOp::Mem;
+    std::string b = in.substr(1, in.size() - 2);   /* strip [ ] */
+    if (!b.empty() && b[0] == '<') {               /* the abs32 form */
+        op.text = b;
+        return true;
+    }
+    /* the base runs to the first + or - (after position 0) */
+    size_t i = 1;
+    while (i < b.size() && b[i] != '+' && b[i] != '-')
+        i++;
+    const std::string base = b.substr(0, i);
+    op.base = mgpr(base);
+    if (op.base < 0)
+        return false;
+    if (i >= b.size())
+        return true;                               /* `[rsp]` */
+    const char sign = b[i];
+    const std::string rest = b.substr(i + 1);
+    const size_t star = rest.find('*');
+    if (sign == '+' && star != std::string::npos) { /* index*scale */
+        op.index = mgpr(rest.substr(0, star));
+        long long sc = 0;
+        if (op.index < 0 || !mnum(rest.substr(star + 1), sc))
+            return false;
+        op.scale = static_cast<int>(sc);
+        return true;
+    }
+    long long d = 0;
+    if (!mnum(rest, d))
+        return false;
+    op.disp = sign == '-' ? -d : d;
+    return true;
+}
+
+/* one `-vdj` instruction's text -> the model; false when a piece of it
+ * is a form this parser does not know (a test must FAIL on that, not
+ * silently match nothing) */
+static bool mparse(const NativeIns &ni, MIns2 &out)
+{
+    out = MIns2();
+    out.off = ni.off;
+    const std::string &t = ni.text;
+    size_t sp = t.find(' ');
+    out.mn = sp == std::string::npos ? t : t.substr(0, sp);
+    if (sp == std::string::npos)
+        return true;                               /* `cqo`, `ret` */
+    /* split the operand list on ", " outside brackets */
+    std::vector<std::string> toks;
+    int depth = 0;
+    std::string cur;
+    for (size_t i = sp + 1; i < t.size(); i++) {
+        const char c = t[i];
+        if (c == '[') depth++;
+        if (c == ']') depth--;
+        if (c == ',' && depth == 0) {
+            toks.push_back(cur);
+            cur.clear();
+            if (i + 1 < t.size() && t[i + 1] == ' ')
+                i++;
+            continue;
+        }
+        cur += c;
+    }
+    if (!cur.empty())
+        toks.push_back(cur);
+    for (std::string tok : toks) {
+        while (!tok.empty() && tok[0] == ' ')
+            tok.erase(0, 1);
+        MOp op;
+        /* an operand-size word belongs to the memory operand after it */
+        std::string sz;
+        for (const char *w : { "byte ", "word ", "dword ", "qword " })
+            if (tok.compare(0, strlen(w), w) == 0) {
+                sz = std::string(w).substr(0, strlen(w) - 1);
+                tok.erase(0, strlen(w));
+            }
+        if (!tok.empty() && tok[0] == '[') {
+            if (!mparse_mem(tok, op))
+                return false;
+            op.size = sz;
+        } else if (!tok.empty() && tok[0] == '<') {
+            op.kind = MOp::Sym;
+            op.text = tok;
+        } else if (!tok.empty() && (tok[0] == '+' || tok[0] == '-')
+                   && mnum(tok, op.imm)) {
+            op.kind = MOp::Rel;          /* a branch's fragment offset */
+        } else if (mnum(tok, op.imm)) {
+            op.kind = MOp::Imm;
+        } else {
+            op.kind = MOp::Name;         /* a GPR *or* a frame slot */
+            op.text = tok;
+        }
+        out.ops.push_back(op);
+    }
+    return true;
+}
+
+/* a whole section, parsed; empty when the section is absent */
+static std::vector<MIns2> mins_of(const std::string &dump,
+                                  const std::string &section)
+{
+    std::vector<MIns2> out;
+    for (const NativeIns &ni : native_ins_of(dump, section)) {
+        MIns2 m;
+        if (!mparse(ni, m)) {
+            fprintf(stderr, "mins_of: cannot model `%s` at +%u - the "
+                            "parser does not know this operand form\n",
+                    ni.text.c_str(), ni.off);
+            out.clear();
+            return out;
+        }
+        out.push_back(m);
+    }
+    return out;
+}
+
+/*
+ * THE MODEL'S OWN SELF-TEST. A parser that silently matches nothing is
+ * worse than no parser: every assertion built on it would pass. So it
+ * FAILS CLOSED - `mparse` returns false for a form it does not know and
+ * `mins_of` drops the whole section - and this check requires it to
+ * model EVERY instruction of a program that reaches most of the
+ * emitter: closures and a frameless call, a dict, a string, a flat
+ * array, libm, a runtime-count shift, an idiv, a struct, a try/catch.
+ * A new operand FORM in the emitter fails here, by instruction, which
+ * is the same obligation `-vdj` itself carries.
+ */
+static bool jit_ins_model_covers_the_emitter()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const std::vector<const char *> lines = {
+        "struct P { int x; float y; }",
+        "func mk(int n) { var b = n * 10;",
+        "              return func [b] (int x) { return b + x; }; }",
+        "func eu(p, q) { var r = 0;",
+        "  while (q != 0) { var tt = q; q = p % q; p = tt; r = r + 1; }",
+        "  return r + p; }",
+        "var add = mk(7);",
+        "var a = []; var d = {}; var s = \"\"; var ps = [];",
+        "var t = 0.0; var acc = 0; var k = int(runtime(3)); var w = 0;",
+        "for (var i = 0; i < runtime(6); i++) {",
+        "  append(a, i * 3); d[i] = i + 1; s = s + str(i);",
+        "  append(ps, P(i, float(i) * 0.5));",
+        "  t = t + sin(float(i)) + sqrt(float(i) + 1.0); acc = acc + add(i);",
+        "  w = w + ((i + 1) << k) + ((i + 9) >>> k) + ((i + 7) % (k + 2));",
+        "  w = w + eu(i + 84, i + 36) + ps[i].x;",
+        "  try { if (i > 90) { throw P(i, 0.0); } } catch { w = w + 1; }",
+        "}",
+        "print(len(a), len(d), len(s), t > 0.0, acc, w);"
+    };
+    std::string d;
+    try {
+        d = native_dump_of(lines);
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_ins_model_covers_the_emitter: threw %s: %s\n",
+                e.name, e.msg);
+        return false;
+    }
+    size_t total = 0, sections = 0;
+    bool ok = true;
+    for (size_t p = d.find("; ===== "); p != std::string::npos;
+         p = d.find("; ===== ", p + 1)) {
+        const size_t nl = d.find('\n', p);
+        if (nl == std::string::npos)
+            break;
+        std::string title = d.substr(p + 8, nl - (p + 8));
+        while (!title.empty() && (title.back() == ' ' || title.back() == '='))
+            title.pop_back();
+        const std::vector<NativeIns> raw = native_ins_of(d, title);
+        if (raw.empty())
+            continue;
+        sections++;
+        for (const NativeIns &ni : raw) {
+            MIns2 m;
+            if (!mparse(ni, m)) {
+                fprintf(stderr, "jit_ins_model_covers_the_emitter: "
+                                "`%s` (%s +%u) is a form the model does "
+                                "not know\n", ni.text.c_str(),
+                        title.c_str(), ni.off);
+                ok = false;
+            }
+            total++;
+        }
+    }
+    if (total < 2000 || sections < 4) {
+        fprintf(stderr, "jit_ins_model_covers_the_emitter: VACUOUS - "
+                        "%zu instruction(s) over %zu section(s)\n",
+                total, sections);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * ==========  `lea` FOLDS THE MOVE INTO THE ARITHMETIC  ==========
+ *
+ * #97 §3b, "WHAT 1b LEAVES OPEN" (ii). The emitter's shape is
+ * three-address-through-the-accumulator, so an int add/sub-IMMEDIATE
+ * off a register-resident operand costs TWO instructions where `lea`
+ * does the same work in one - and that is exactly the shape of every
+ * `fib(n - k)` argument.
+ *
+ * ASSERTED ON THE INSTRUCTION MODEL, not on the rendered text: the
+ * claim is *this op's arithmetic is one `lea` whose memory operand is
+ * [<the pin> - k], with no index* - which is a statement about
+ * operands, and a string match cannot make it.
+ *
+ * ANCHORED, not counted. The arithmetic for `rT = r0 - k` is found by
+ * its DESTINATION STORE - the `<slot>.type` / `<slot>` pair that every
+ * int result ends in - so the instruction under test is the one
+ * belonging to that op and not some other `lea` that renders alike.
+ *
+ * BOTH DIRECTIONS, through the `peep` lever, which is also the A/B a
+ * suspected peephole bug needs: with it on the arithmetic is the lea;
+ * with it off it is `mov`+`sub` OFF THE SAME PIN (checked: the base
+ * register of the one is the source of the other). An equivalence test
+ * alone would be satisfied by a peephole that never fires.
+ */
+static bool jit_lea_addsub_shape()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const std::vector<const char *> lines = {
+        "func fib(n) { if (n < 2) { return n; }",
+        "  var a = fib(n-1); var b = fib(n-2); return a + b; }",
+        "print(fib(int(runtime(12))));"
+    };
+    /*
+     * The two-store that ends an int result: `mov <slot>.type, <tag>`
+     * then `mov <slot>, <reg>`. Returns the index of the FIRST one, and
+     * the register the value came from, or npos. Arena-independent: the
+     * tag store is one instruction on the low arena and two off it, so
+     * only the payload store is matched and the search walks back from
+     * it.
+     */
+    const auto find_store = [](const std::vector<MIns2> &v, size_t from,
+                               const char *slot, int &src) -> size_t {
+        for (size_t i = from; i < v.size(); i++) {
+            if (v[i].mn != "mov" || v[i].ops.size() != 2)
+                continue;
+            if (v[i].ops[0].kind != MOp::Name || v[i].ops[0].text != slot)
+                continue;
+            if (v[i].ops[1].kind != MOp::Name)
+                continue;
+            const int r = mgpr(v[i].ops[1].text);
+            if (r < 0)
+                continue;
+            src = r;
+            return i;
+        }
+        return std::string::npos;
+    };
+    bool ok = true;
+    std::string on, off;
+    const unsigned long r0 = g_jit_lea_addsub;
+    unsigned long r_on = 0, r_off = 0;
+    try {
+        on = native_dump_of(lines);
+        r_on = g_jit_lea_addsub - r0;
+        const unsigned save = g_jit_off_extra;
+        g_jit_off_extra |= jit_lever_bit("peep");
+        const unsigned long r1 = g_jit_lea_addsub;
+        off = native_dump_of(lines);
+        r_off = g_jit_lea_addsub - r1;
+        g_jit_off_extra = save;
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_lea_addsub_shape: threw %s: %s\n",
+                e.name, e.msg);
+        return false;
+    }
+    const std::vector<MIns2> von = mins_of(on, "func fib$0");
+    const std::vector<MIns2> voff = mins_of(off, "func fib$0");
+    if (von.empty() || voff.empty()) {
+        fprintf(stderr, "jit_lea_addsub_shape: no modelled `func fib$0` "
+                        "- the instance was not created, or an operand "
+                        "form is unknown; this proves nothing\n");
+        return false;
+    }
+    /* `n - 1` and `n - 2` both land in the temp the call then reads */
+    const char *SLOT = "r10";
+    int src_on = -1, src_off = -1;
+    const size_t s_on = find_store(von, 0, SLOT, src_on);
+    const size_t s_off = find_store(voff, 0, SLOT, src_off);
+    if (s_on == std::string::npos || s_off == std::string::npos
+            || s_on < 2 || s_off < 3) {
+        fprintf(stderr, "jit_lea_addsub_shape: no `%s` destination "
+                        "store found in one of the two dumps - the "
+                        "anchor this test hangs on is gone\n", SLOT);
+        return false;
+    }
+    /* ON: the instruction feeding the store is ONE lea off a pin */
+    {
+        const MIns2 &a = von[s_on - 2];
+        const bool shape =
+            a.mn == "lea" && a.ops.size() == 2
+            && a.ops[0].kind == MOp::Name && mgpr(a.ops[0].text) == src_on
+            && a.ops[1].kind == MOp::Mem && a.ops[1].base >= 0
+            && a.ops[1].index < 0 && a.ops[1].disp == -1;
+        if (!shape || r_on == 0) {
+            fprintf(stderr, "jit_lea_addsub_shape: lever ON - the "
+                            "arithmetic before `%s`'s store is `%s` "
+                            "(want one `lea <dst>, [<pin>-0x1]`), reach "
+                            "%lu (want > 0)\n",
+                    SLOT, native_ins_of(on, "func fib$0")[s_on - 2]
+                              .text.c_str(), r_on);
+            ok = false;
+        } else {
+            src_on = a.ops[1].base;        /* the pin, for the cross-check */
+        }
+    }
+    /* OFF: it is the `mov` + `sub` pair, off the SAME pin */
+    {
+        const MIns2 &mv = voff[s_off - 3];
+        const MIns2 &sb = voff[s_off - 2];
+        const bool shape =
+            mv.mn == "mov" && mv.ops.size() == 2
+            && mv.ops[0].kind == MOp::Name && mgpr(mv.ops[0].text) == src_off
+            && mv.ops[1].kind == MOp::Name && mgpr(mv.ops[1].text) >= 0
+            && sb.mn == "sub" && sb.ops.size() == 2
+            && sb.ops[0].kind == MOp::Name && mgpr(sb.ops[0].text) == src_off
+            && sb.ops[1].kind == MOp::Imm && sb.ops[1].imm == 1;
+        if (!shape || r_off != 0) {
+            fprintf(stderr, "jit_lea_addsub_shape: lever OFF - the "
+                            "arithmetic before `%s`'s store is `%s` / "
+                            "`%s` (want `mov <dst>, <pin>` + `sub <dst>, "
+                            "1`), reach %lu (want 0)\n", SLOT,
+                    native_ins_of(off, "func fib$0")[s_off - 3].text.c_str(),
+                    native_ins_of(off, "func fib$0")[s_off - 2].text.c_str(),
+                    r_off);
+            ok = false;
+        } else if (ok && mgpr(mv.ops[1].text) != src_on) {
+            /* the two directions must be reading the SAME operand -
+             * otherwise the shapes above are about different code */
+            fprintf(stderr, "jit_lea_addsub_shape: the lea's base and "
+                            "the mov's source are different registers "
+                            "(%d vs %d) - the two directions are not "
+                            "about the same operand\n",
+                    src_on, mgpr(mv.ops[1].text));
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * ==========  THE ENTRY FILLER IS FOR THE CALLS  ==========
  *
  * SP3. `entry_pad` pads a fragment's prologue to CALL-READY when its
@@ -43414,6 +43865,14 @@ static const std::vector<extra_check> extra_checks =
       "call-free leaf's prologue drops it, a calling leaf's keeps it "
       "(one program, both directions, every prologue)",
       jit_entry_pad_is_for_calls },
+    { "jit: the shape tests' MACHINE-INSTRUCTION MODEL parses every "
+      "form the emitter produces (it fails closed, so a form it does "
+      "not know must fail HERE and not silently match nothing)",
+      jit_ins_model_covers_the_emitter },
+    { "jit: #97 1b(ii) - `lea dst, [src+k]` folds the move into an int "
+      "add/sub-immediate off a pin (fib(n-k)); both directions through "
+      "the peep lever",
+      jit_lea_addsub_shape },
     { "jit: D3.b - the linear scan (analysis): tiling, no register "
       "conflicts, forced memory, pressure split (step 2b-i)",
       jit_lsra_check },

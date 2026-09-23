@@ -656,10 +656,16 @@ than leave it unclassified. ✅ DONE 2026-09-19, in two measured steps:
 pins: (i) whether to admit CALLER-saved pins into a call run - the
 denial below stands, and the trade is the prologue/epilogue spill per
 call, which the barrier measurement says to expect no wall-clock gain
-from on a call-dense body; (ii) `lea rax, [r12 - k]` for an IntSubRI/
-IntAddRI off a pinned source (today `mov rax, r12; sub rax, k`) - that
-is what turns fib$0's +2 per invocation into a saving, since each
-`fib(n - k)` argument is exactly that shape; (iii) PROFITABILITY on a
+from on a call-dense body; (ii) ✅ DONE 2026-09-22 - `lea rax,
+[r12 - k]` for an IntSubRI/IntAddRI off a pinned source, plus the
+two-register `+`. 09_fib -2.69% Ir, 51_purefunc_fold -5.26%,
+03_int_arith -2.17%, 22_multi_assign -2.15%; wall geomean 1.007x, i.e.
+flat, the instruction-count family's usual answer. It needed an
+ENCODER fix first: `emit_modrm_disp` refused an rsp/r12 base, and r12
+is a pin the allocator hands out constantly - it writes the SIB byte
+now. Record: *#97 1b(ii)* in the JIT record, which also carries the
+maintainer's call that a shape test asserts on an INSTRUCTION MODEL,
+not on disassembly strings; (iii) PROFITABILITY on a
 loop-free body: a recursive function pays the pin's `push`/`pop` on
 every invocation, and for a read-only parameter with three uses that
 is a pure cost - 10_recursion_deep +3.2% Ir / 1.03x, fib flat - while
