@@ -517,6 +517,15 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
  * (stride 48, payload +0, type +24) is stable and mirrored here for the
  * `slot N` / `slot N.type` labels (cosmetic - the JIT itself bakes the
  * runtime-probed offsets). */
+/*
+ * The STRUCTURED-DECODE collector (disasm.h). Null by default - a
+ * shape test sets it around a `disassemble_program` call and gets the
+ * instructions the dump was RENDERED FROM, rather than parsing the
+ * rendering back and losing the slot-vs-register distinction the text
+ * collapses.
+ */
+std::vector<DecodedFrag> *g_jit_decode_sink = nullptr;
+
 namespace {
 
 /*
@@ -655,34 +664,148 @@ std::string imm_str(int64_t v, const void *ti, const void *tf,
     return o.str();
 }
 
-/* [rbx+disp] -> the slot's NAME (via `nm`, the chunk's slot-namer),
- * else [base+0xNN]. The frame window base is rbx (callee-saved; it was
- * rdi before the JIT moved the pins off the caller-saved registers). */
+/*
+ * ⛔ THE DECODE FILLS A STRUCTURE AND THE TEXT IS RENDERED FROM IT
+ * (2026-09-22, the maintainer's call). It used to format straight into
+ * a stream, so every field it had computed - base, index, scale,
+ * displacement, and above all whether `[rbx+d]` resolves to a FRAME
+ * SLOT - existed only as characters. A shape test that wanted one
+ * operand had to parse those characters back, which is a second
+ * decoder in all but name, and one that cannot recover what the
+ * rendering COLLAPSED: a temp slot and a machine register are both
+ * spelled `rN`.
+ *
+ * `render_op` below is now the ONLY place a machine operand becomes
+ * text, so the dump and the structure cannot disagree, and `-vdj`'s
+ * output is byte-for-byte what it was (vdjcmp 128/128 across the
+ * refactor - that is what makes a rewrite of this size safe).
+ */
 using SlotNamer = std::function<std::string(int)>;
-std::string mem_disp(int base_reg, int32_t disp, const SlotNamer &nm)
+
+/* [rbx+disp] IS a frame slot when the displacement lands on a slot's
+ * payload or its type word - a structural fact about the encoding, so
+ * it is decided here and the NAME is the renderer's business. The frame
+ * window base is rbx (callee-saved; it was rdi before the JIT moved the
+ * pins off the caller-saved registers). */
+DecOp mem_op(int base_reg, int32_t disp)
 {
+    DecOp x;
     if (base_reg == 3 /*rbx*/) {
         const int stride = 48, poff = 0, toff = 24;
-        if (disp >= 0 && disp % stride == poff)
-            return nm(disp / stride);
-        if (disp >= 0 && disp % stride == toff)
-            return nm(disp / stride) + ".type";
+        if (disp >= 0 && disp % stride == poff) {
+            x.kind = DecOp::Slot;
+            x.slot = disp / stride;
+            return x;
+        }
+        if (disp >= 0 && disp % stride == toff) {
+            x.kind = DecOp::Slot;
+            x.slot = disp / stride;
+            x.slot_type = true;
+            return x;
+        }
     }
-    std::ostringstream o;
-    o << "[" << gp64(base_reg) << (disp < 0 ? "-0x" : "+0x") << std::hex
-      << (disp < 0 ? -disp : disp) << "]";
-    return o.str();
+    x.kind = DecOp::Mem;
+    x.reg = base_reg;
+    x.disp = disp;
+    return x;
 }
 
-/* Decode ONE instruction at code[p]; append its mnemonic to `out` and
- * advance p. Covers jit.cpp's emitted forms. */
+DecOp dop_gpr(int r)   { DecOp x; x.kind = DecOp::Gpr;   x.reg = r; return x; }
+DecOp dop_gpr32(int r) { DecOp x; x.kind = DecOp::Gpr32; x.reg = r; return x; }
+DecOp dop_xmm(int r)   { DecOp x; x.kind = DecOp::Xmm;   x.reg = r; return x; }
+DecOp dop_cl()         { DecOp x; x.kind = DecOp::Cl;    return x; }
+DecOp dop_gpr8(int r, bool rex)
+{ DecOp x; x.kind = DecOp::Gpr8; x.reg = r; x.rex8 = rex; return x; }
+DecOp dop_imm(long long v)
+{ DecOp x; x.kind = DecOp::Imm; x.imm = v; return x; }
+DecOp dop_immdec(long long v)
+{ DecOp x; x.kind = DecOp::ImmDec; x.imm = v; return x; }
+DecOp dop_rel(long long t)
+{ DecOp x; x.kind = DecOp::Rel; x.imm = t; return x; }
+DecOp dop_callrel(long long d)
+{ DecOp x; x.kind = DecOp::CallRel; x.imm = d; return x; }
+DecOp dop_byte(DecOp x) { x.byte_ptr = true; return x; }
+
+/* THE ONE PLACE A MACHINE OPERAND BECOMES TEXT. */
+std::string render_op(const DecOp &x, const SlotNamer &nm,
+                      const void *ti, const void *tf, const void *ta)
+{
+    std::ostringstream o;
+    const char *bp = x.byte_ptr ? "byte " : "";
+    switch (x.kind) {
+    case DecOp::Gpr:    return gp64(x.reg);
+    case DecOp::Gpr32:  return std::string("e") + (gp64(x.reg) + 1);
+    case DecOp::Gpr8:   return gp8(x.reg, x.rex8);
+    case DecOp::Xmm:    o << "xmm" << x.reg; return o.str();
+    case DecOp::Cl:     return "cl";
+    case DecOp::Slot:
+        o << bp << nm(x.slot) << (x.slot_type ? ".type" : "");
+        return o.str();
+    case DecOp::Mem:
+        o << bp << "[";
+        if (x.rip) {
+            o << "rip" << (x.disp < 0 ? "-0x" : "+0x") << std::hex
+              << (x.disp < 0 ? -int64_t(x.disp) : int64_t(x.disp))
+              << std::dec;
+        } else if (!x.via_sib) {
+            o << gp64(x.reg) << (x.disp < 0 ? "-0x" : "+0x") << std::hex
+              << (x.disp < 0 ? -int64_t(x.disp) : int64_t(x.disp))
+              << std::dec;
+        } else {
+            if (x.reg >= 0) o << gp64(x.reg);
+            if (x.index >= 0) {
+                if (x.reg >= 0) o << "+";
+                o << gp64(x.index) << "*" << x.scale;
+            }
+            if (x.reg < 0 && x.index < 0)
+                o << imm_str(static_cast<int64_t>(
+                                 static_cast<uint32_t>(x.disp)),
+                             ti, tf, ta);
+            else if (x.disp)
+                o << (x.disp < 0 ? "-0x" : "+0x") << std::hex
+                  << (x.disp < 0 ? -int64_t(x.disp) : int64_t(x.disp))
+                  << std::dec;
+        }
+        o << "]";
+        return o.str();
+    case DecOp::Imm:    return imm_str(x.imm, ti, tf, ta);
+    case DecOp::ImmDec: o << x.imm; return o.str();
+    case DecOp::Rel:    o << "+" << std::dec << x.imm; return o.str();
+    case DecOp::CallRel:
+        if (!vdj_show_addrs())
+            return "<helper>";
+        o << (x.imm < 0 ? "-0x" : "+0x") << std::hex
+          << (x.imm < 0 ? -x.imm : x.imm) << std::dec;
+        return o.str();
+    default: break;
+    }
+    return "?";
+}
+
+std::string render_ins(const DecodedIns &d, const SlotNamer &nm,
+                       const void *ti, const void *tf, const void *ta)
+{
+    std::string s = d.mn;
+    for (int i = 0; i < d.n; i++) {
+        s += i ? ", " : " ";
+        s += render_op(d.ops[i], nm, ti, tf, ta);
+    }
+    return s;
+}
+
+/* Decode ONE instruction at code[p]; fill `di`, render it into `out`,
+ * and advance p. Covers jit.cpp's emitted forms. */
 void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
                 std::string &cmt, const SlotNamer &nm,
-                const void *ti, const void *tf, const void *ta)
+                const void *ti, const void *tf, const void *ta,
+                DecodedIns *di = nullptr)
 {
     const uint32_t start = p;
-    std::ostringstream o;
+    DecodedIns D;
+    D.off = start;
     cmt.clear();
+    const auto MN = [&](const char *m) { D.mn = m; };
+    const auto A  = [&](const DecOp &x) { if (D.n < 3) D.ops[D.n++] = x; };
     bool pf_f2 = false, pf_66 = false;
     while (p < n && (c[p] == 0xF2 || c[p] == 0xF3 || c[p] == 0x66)) {
         if (c[p] == 0xF2) pf_f2 = true;
@@ -692,7 +815,8 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
     uint8_t rex = 0;
     if (p < n && (c[p] & 0xF0) == 0x40) rex = c[p++];
     const bool W = rex & 8, R = rex & 4, X = rex & 2, B = rex & 1;
-    if (p >= n) { p = start + 1; out = ".byte 0x" + hex2(c[start]); return; }
+    if (p >= n) goto undecoded;
+    {
     const uint8_t op = c[p++];
     auto rd32 = [&]() -> int32_t {
         int32_t v = 0;
@@ -705,7 +829,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         return v;
     };
     /*
-     * modrm: returns the reg field (+REX.R) and formats the r/m operand,
+     * modrm: returns the reg field (+REX.R) and the r/m OPERAND,
      * consuming the SIB byte and the displacement.
      *
      * ⛔ THE SIB ARM USED TO BE WRONG IN THREE WAYS, AND THE FIRST ONE
@@ -731,12 +855,12 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
      * but a decoder that silently mis-consumes it is exactly how this
      * class of bug survives.
      */
-    auto modrm = [&](int &regf, std::string &rm) {
+    auto modrm = [&](int &regf, DecOp &rm) {
         const uint8_t m = c[p++];
         const int mod = m >> 6, reg = ((m >> 3) & 7) + (R ? 8 : 0),
                   rmf = (m & 7) + (B ? 8 : 0);
         regf = reg;
-        if (mod == 3) { rm = gp64(rmf); return; }
+        if (mod == 3) { rm = dop_gpr(rmf); return; }
         if ((m & 7) == 4) {                       /* SIB byte follows */
             const uint8_t sib = c[p++];
             const int scale = 1 << (sib >> 6);
@@ -748,60 +872,49 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             const int32_t d = no_base ? rd32()
                             : (mod == 2) ? rd32()
                             : (mod == 1) ? int8_t(c[p++]) : 0;
-            std::ostringstream so;
-            so << "[";
-            if (!no_base) so << gp64(base);
-            if (idx3 != 4) {                      /* 4 == no index */
-                if (!no_base) so << "+";
-                so << gp64(idx) << "*" << scale;
-            }
-            if (no_base && idx3 == 4) {
-                /*
-                 * ⛔ THE NO-BASE disp32 IS AN ABSOLUTE ADDRESS, AND IT
-                 * MUST BE MASKED LIKE EVERY OTHER BAKED POINTER.
-                 *
-                 * This is the low arena's operand (#97 step 1): a
-                 * process-lifetime global reached in ONE instruction,
-                 * with the pointer sitting in the displacement. Every
-                 * other baked address in this dump prints as
-                 * `<addr>` / `<int-tag>` / `<helper>` precisely so two
-                 * runs and two separately-linked binaries produce
-                 * IDENTICAL text - that is what `scripts/vdjcmp.sh`
-                 * IS - and this form was added later without learning
-                 * the rule.
-                 *
-                 * ⛔ IT BROKE THE ORACLE AND NOTHING SAID SO. From the
-                 * day the arena landed, `vdjcmp.sh` failed its own
-                 * SELF-TEST ("the same binary gave two different dumps")
-                 * on every invocation, so every "verified byte-identical
-                 * emitted code" claim since was unverifiable. The
-                 * self-test did its job; nobody ran it. Same shape as
-                 * the 2026-08-17 mask-rot, one arena later.
-                 */
-                so << imm_str(static_cast<int64_t>(
-                                  static_cast<uint32_t>(d)),
-                              ti, tf, ta);
-            } else if (d) {
-                so << (d < 0 ? "-0x" : "+0x") << std::hex
-                   << (d < 0 ? -int64_t(d) : int64_t(d)) << std::dec;
-            }
-            so << "]";
-            rm = so.str();
+            rm = DecOp();
+            rm.kind = DecOp::Mem;
+            rm.via_sib = true;
+            rm.reg = no_base ? -1 : base;
+            /*
+             * ⛔ THE NO-BASE disp32 IS AN ABSOLUTE ADDRESS, AND IT
+             * MUST BE MASKED LIKE EVERY OTHER BAKED POINTER (render_op
+             * sends it through imm_str for exactly that reason).
+             *
+             * This is the low arena's operand (#97 step 1): a
+             * process-lifetime global reached in ONE instruction, with
+             * the pointer sitting in the displacement. Every other
+             * baked address in this dump prints as `<addr>` /
+             * `<int-tag>` / `<helper>` precisely so two runs and two
+             * separately-linked binaries produce IDENTICAL text - that
+             * is what `scripts/vdjcmp.sh` IS - and this form was added
+             * later without learning the rule.
+             *
+             * ⛔ IT BROKE THE ORACLE AND NOTHING SAID SO. From the day
+             * the arena landed, `vdjcmp.sh` failed its own SELF-TEST
+             * ("the same binary gave two different dumps") on every
+             * invocation, so every "verified byte-identical emitted
+             * code" claim since was unverifiable. The self-test did its
+             * job; nobody ran it. Same shape as the 2026-08-17
+             * mask-rot, one arena later.
+             */
+            rm.index = idx3 != 4 ? idx : -1;      /* 4 == no index */
+            rm.scale = scale;
+            rm.disp = d;
             return;
         }
         if (mod == 0 && (m & 7) == 5) {           /* RIP-relative disp32 */
-            const int32_t d = rd32();
-            std::ostringstream so;
-            so << "[rip" << (d < 0 ? "-0x" : "+0x") << std::hex
-               << (d < 0 ? -int64_t(d) : int64_t(d)) << std::dec << "]";
-            rm = so.str();
+            rm = DecOp();
+            rm.kind = DecOp::Mem;
+            rm.rip = true;
+            rm.disp = rd32();
             return;
         }
         const int32_t d = (mod == 2) ? rd32()
                         : (mod == 1) ? int8_t(c[p++]) : 0;
-        rm = mem_disp(rmf, d, nm);   /* REX.B-extended base (r9 chains) */
+        rm = mem_op(rmf, d);   /* REX.B-extended base (r9 chains) */
     };
-    int regf; std::string rm;
+    int regf; DecOp rm;
 
     switch (op) {
     case 0xB8: case 0xB9: case 0xBA: case 0xBB:
@@ -811,8 +924,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             const uint64_t imm = rd64();
             if (tag_name(imm, ti, tf, ta))
                 cmt = "the Type-tag constant";
-            o << "movabs " << gp64(rr) << ", "
-              << imm_str(static_cast<int64_t>(imm), ti, tf, ta);
+            MN("movabs"); A(dop_gpr(rr)); A(dop_imm(int64_t(imm)));
         } else {
             /* mov eNN, imm32 (zero-extending). Until #101 the only
              * emitter of this form was the exit's resume-pc load, and
@@ -823,64 +935,50 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
             const uint32_t imm = rd32();
             if (tag_name(static_cast<uint64_t>(imm), ti, tf, ta))
                 cmt = "the Type-tag constant";
-            o << "mov e" << (gp64(rr) + 1) << ", "
-              << imm_str(static_cast<int64_t>(imm), ti, tf, ta);
+            MN("mov"); A(dop_gpr32(rr)); A(dop_imm(int64_t(imm)));
         }
         break; }
-    case 0xC3: o << "ret"; break;
+    case 0xC3: MN("ret"); break;
     case 0x50: case 0x51: case 0x52: case 0x53:      /* push r64 */
     case 0x54: case 0x55: case 0x56: case 0x57:
-        o << "push " << gp64((op - 0x50) + (B ? 8 : 0)); break;
+        MN("push"); A(dop_gpr((op - 0x50) + (B ? 8 : 0))); break;
     case 0x58: case 0x59: case 0x5A: case 0x5B:      /* pop r64 */
     case 0x5C: case 0x5D: case 0x5E: case 0x5F:
-        o << "pop " << gp64((op - 0x58) + (B ? 8 : 0)); break;
-    case 0x8B: modrm(regf, rm); o << "mov " << gp64(regf) << ", " << rm;
-        break;
-    case 0x89: modrm(regf, rm); o << "mov " << rm << ", " << gp64(regf);
-        break;
-    case 0x8D: modrm(regf, rm); o << "lea " << gp64(regf) << ", " << rm;
+        MN("pop"); A(dop_gpr((op - 0x58) + (B ? 8 : 0))); break;
+    case 0x8B: modrm(regf, rm); MN("mov"); A(dop_gpr(regf)); A(rm); break;
+    case 0x89: modrm(regf, rm); MN("mov"); A(rm); A(dop_gpr(regf)); break;
+    case 0x8D: modrm(regf, rm); MN("lea"); A(dop_gpr(regf)); A(rm);
         break;                                /* lea (a helper's &slot arg) */
-    case 0x85: modrm(regf, rm); o << "test " << rm << ", " << gp64(regf);
+    case 0x85: modrm(regf, rm); MN("test"); A(rm); A(dop_gpr(regf));
         break;                                /* test (a helper's status) */
-    case 0x01: modrm(regf, rm); o << "add " << rm << ", " << gp64(regf);
-        break;
-    case 0x29: modrm(regf, rm); o << "sub " << rm << ", " << gp64(regf);
-        break;
+    case 0x01: modrm(regf, rm); MN("add"); A(rm); A(dop_gpr(regf)); break;
+    case 0x29: modrm(regf, rm); MN("sub"); A(rm); A(dop_gpr(regf)); break;
     /* The r64 <- r/m64 DIRECTION of the group-1 arithmetic (opcode
      * bit 1 set). The `rm <- reg` forms above were here from the
      * start; these were not, so `add rdx, [rcx+0xd8]` and
      * `sub rcx, [rax+0x28]` - the M5b record-push address arithmetic -
      * decoded as nothing at all. */
-    case 0x03: modrm(regf, rm); o << "add " << gp64(regf) << ", " << rm;
-        break;
-    case 0x2B: modrm(regf, rm); o << "sub " << gp64(regf) << ", " << rm;
-        break;
-    case 0x0B: modrm(regf, rm); o << "or "  << gp64(regf) << ", " << rm;
-        break;
-    case 0x23: modrm(regf, rm); o << "and " << gp64(regf) << ", " << rm;
-        break;
-    case 0x33: modrm(regf, rm); o << "xor " << gp64(regf) << ", " << rm;
-        break;
+    case 0x03: modrm(regf, rm); MN("add"); A(dop_gpr(regf)); A(rm); break;
+    case 0x2B: modrm(regf, rm); MN("sub"); A(dop_gpr(regf)); A(rm); break;
+    case 0x0B: modrm(regf, rm); MN("or");  A(dop_gpr(regf)); A(rm); break;
+    case 0x23: modrm(regf, rm); MN("and"); A(dop_gpr(regf)); A(rm); break;
+    case 0x33: modrm(regf, rm); MN("xor"); A(dop_gpr(regf)); A(rm); break;
     /* movsxd r64, r/m32 - how a 32-bit frame_size / count field is
      * widened before it is compared or added. */
-    case 0x63: modrm(regf, rm); o << "movsxd " << gp64(regf) << ", " << rm;
+    case 0x63: modrm(regf, rm); MN("movsxd"); A(dop_gpr(regf)); A(rm);
         break;
     /* mov r/m8, r8 - the BYTE element store (`mov [rcx+r9], dil`, a
      * flat array<bool> write). With REX present the source is the
      * uniform low-byte set (dil/sil/spl/bpl), which is why this prints
      * the low-byte name rather than gp64. */
     case 0x88: { modrm(regf, rm);
-        o << "mov byte " << rm << ", " << gp8(regf, rex != 0); break; }
+        MN("mov"); A(dop_byte(rm)); A(dop_gpr8(regf, rex != 0)); break; }
     case 0x8A: { modrm(regf, rm);
-        o << "mov " << gp8(regf, rex != 0) << ", byte " << rm; break; }
-    case 0x21: modrm(regf, rm); o << "and " << rm << ", " << gp64(regf);
-        break;
-    case 0x09: modrm(regf, rm); o << "or "  << rm << ", " << gp64(regf);
-        break;
-    case 0x31: modrm(regf, rm); o << "xor " << rm << ", " << gp64(regf);
-        break;
-    case 0x39: modrm(regf, rm); o << "cmp " << rm << ", " << gp64(regf);
-        break;
+        MN("mov"); A(dop_gpr8(regf, rex != 0)); A(dop_byte(rm)); break; }
+    case 0x21: modrm(regf, rm); MN("and"); A(rm); A(dop_gpr(regf)); break;
+    case 0x09: modrm(regf, rm); MN("or");  A(rm); A(dop_gpr(regf)); break;
+    case 0x31: modrm(regf, rm); MN("xor"); A(rm); A(dop_gpr(regf)); break;
+    case 0x39: modrm(regf, rm); MN("cmp"); A(rm); A(dop_gpr(regf)); break;
     /* ⛔ cmp rax, imm32 - the ACCUMULATOR short form (REX.W 3D id), with
      * no modrm byte. This is what `cmp_reg_tag` emits for rax, so #96
      * step 3 made it common, and it was undecoded: 168 corpus sites,
@@ -889,9 +987,9 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
     case 0x3D: { const int32_t imm = rd32();
         if (tag_name(uint64_t(uint32_t(imm)), ti, tf, ta))
             cmt = "the Type-tag constant";
-        o << "cmp rax, " << imm_str(imm, ti, tf, ta);
+        MN("cmp"); A(dop_gpr(0)); A(dop_imm(imm));
         break; }
-    case 0x99: o << (W ? "cqo" : "cdq"); break;
+    case 0x99: MN(W ? "cqo" : "cdq"); break;
     /*
      * ⛔ THE F7 GROUP - /3 neg AND /5 imul WERE MISSING, AND THEIR
      * ABSENCE WAS SILENT (2026-08-19). Only /7 (idiv) was decoded;
@@ -905,39 +1003,38 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
     case 0xF7: { modrm(regf, rm); const uint8_t sub = regf & 7;
         if (sub == 0) {                        /* test r/m64, imm32 */
             const int32_t imm = rd32();
-            o << "test " << rm << ", " << imm_str(imm, ti, tf, ta);
+            MN("test"); A(rm); A(dop_imm(imm));
         } else {
             static const char *const f7[8] = {
-                "", "", "not ", "neg ", "mul ", "imul ", "div ", "idiv "
+                "", "", "not", "neg", "mul", "imul", "div", "idiv"
             };
             if (!*f7[sub])
                 goto undecoded;
-            o << f7[sub] << rm;
+            MN(f7[sub]); A(rm);
         }
         break; }
     case 0xC1: { modrm(regf, rm); const uint8_t imm = c[p++];
-        o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
-          << rm << ", " << int(imm);
+        MN((regf & 7) == 4 ? "shl" : (regf & 7) == 5 ? "shr" : "sar");
+        A(rm); A(dop_immdec(int(imm)));
         break; }
     case 0x3B: { modrm(regf, rm);   /* cmp r64, r/m64 (the PushHandler
                                      * capacity check) */
-        o << "cmp " << gp64(regf) << ", " << rm; break; }
+        MN("cmp"); A(dop_gpr(regf)); A(rm); break; }
     case 0x6B: { modrm(regf, rm);   /* imul r64, r/m64, imm8 - the SAME
                                      * record-stride multiply when the
                                      * stride fits a byte (0x30), which
                                      * is the case the assembler
                                      * actually picks */
         const int8_t imm = int8_t(c[p++]);
-        o << "imul " << gp64(regf) << ", " << rm << ", " << int(imm);
+        MN("imul"); A(dop_gpr(regf)); A(rm); A(dop_immdec(int(imm)));
         break; }
     case 0x69: { modrm(regf, rm);   /* imul r64, r/m64, imm32 (the
                                      * SetPend record-stride multiply) */
         const int32_t imm = rd32();
-        o << "imul " << gp64(regf) << ", " << rm << ", "
-          << imm_str(imm, ti, tf, ta); break; }
+        MN("imul"); A(dop_gpr(regf)); A(rm); A(dop_imm(imm)); break; }
     case 0xC6: { modrm(regf, rm);   /* /0: mov BYTE [rm], imm8 (the
                                      * defined[gslot]=1 store) */
-        o << "mov byte " << rm << ", " << int(c[p++]); break; }
+        MN("mov"); A(dop_byte(rm)); A(dop_immdec(int(c[p++]))); break; }
     case 0xC7: { modrm(regf, rm);   /* /0: mov r/m, imm32 (emit_raise's
                                      * kind store `mov dword [rax], kind`,
                                      * and since #96 step 3 the TYPE-TAG
@@ -948,27 +1045,27 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         for (int i = 0; i < 4; i++) imm |= uint32_t(c[p++]) << (8 * i);
         if (tag_name(uint64_t(imm), ti, tf, ta))
             cmt = "the Type-tag constant";
-        o << "mov " << rm << ", "
-          << imm_str(static_cast<int64_t>(static_cast<int32_t>(imm)),
-                     ti, tf, ta);
+        MN("mov"); A(rm);
+        A(dop_imm(static_cast<int64_t>(static_cast<int32_t>(imm))));
         break; }
     case 0xD1: { modrm(regf, rm);   /* group-2 shift by 1 */
-        o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
-          << rm << ", 1"; break; }
+        MN((regf & 7) == 4 ? "shl" : (regf & 7) == 5 ? "shr" : "sar");
+        A(rm); A(dop_immdec(1)); break; }
     case 0xD3: { modrm(regf, rm);
-        o << ((regf & 7) == 4 ? "shl " : (regf & 7) == 5 ? "shr " : "sar ")
-          << rm << ", cl"; break; }
+        MN((regf & 7) == 4 ? "shl" : (regf & 7) == 5 ? "shr" : "sar");
+        A(rm); A(dop_cl()); break; }
     case 0xFF: { modrm(regf, rm);   /* group 5: /0 inc /1 dec /2 call
                                      * /4 jmp /6 push (the reg field is the
                                      * opcode extension, NOT a register) */
         const int sub = regf & 7;
-        o << (sub == 0 ? "inc " : sub == 1 ? "dec " : sub == 2 ? "call "
-            : sub == 4 ? "jmp " : sub == 6 ? "push " : "") << rm;
         if (sub != 0 && sub != 1 && sub != 2 && sub != 4 && sub != 6)
             goto undecoded;
+        MN(sub == 0 ? "inc" : sub == 1 ? "dec" : sub == 2 ? "call"
+           : sub == 4 ? "jmp" : "push");
+        A(rm);
         break; }
     case 0x80: { modrm(regf, rm); const uint8_t imm = c[p++];
-        o << "cmp byte " << rm << ", " << int(imm); break; }
+        MN("cmp"); A(dop_byte(rm)); A(dop_immdec(int(imm))); break; }
     /* F6 /0: test r/m8, imm8 - the record-less return arm's frameless
      * discriminator (bit 0 of the pushed dst word, #97 increment 2). Only
      * /0 is emitted; the other subs of this group are not, so they stay
@@ -977,7 +1074,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         if ((regf & 7) != 0)
             goto undecoded;
         const uint8_t imm = c[p++];
-        o << "test byte " << rm << ", " << int(imm); break; }
+        MN("test"); A(dop_byte(rm)); A(dop_immdec(int(imm))); break; }
     /* group 1 (add/or/adc/sbb/and/sub/xor/cmp by the reg field) with an
      * imm32 (0x81) or a sign-ext imm8 (0x83): the ref-check `cmp ecx, t_str`
      * and the call prologue's `sub/add rsp, 8` alignment pad. */
@@ -987,9 +1084,8 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         const int32_t imm = op == 0x81 ? rd32() : int8_t(c[p++]);
         if (tag_name(uint64_t(uint32_t(imm)), ti, tf, ta))
             cmt = "the Type-tag constant";
-        o << g1[regf & 7] << " " << rm << ", "
-          << imm_str(imm, ti, tf, ta); break; }
-    case 0x90: o << "nop"; break;
+        MN(g1[regf & 7]); A(rm); A(dop_imm(imm)); break; }
+    case 0x90: MN("nop"); break;
     case 0xE8: { const int32_t d = rd32();
         /* call rel32 to a C++ helper / libm. The DISPLACEMENT is the
          * distance from this code page to the callee, so BOTH ends move
@@ -997,101 +1093,84 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
          * varies (5 or 6 hex digits for the same libm target), which is
          * what made a width-based mask in vdjcmp.sh race with a
          * call-based one and report a file as differing from itself.
-         * Print the shape, not the digits. */
-        if (vdj_show_addrs())
-            o << "call " << (d < 0 ? "-0x" : "+0x") << std::hex
-              << (d < 0 ? -int64_t(d) : int64_t(d)) << std::dec;
-        else
-            o << "call <helper>";
+         * render_op prints the shape, not the digits. */
+        MN("call"); A(dop_callrel(d));
         cmt = "rel32 call (C++ helper / libm)"; break; }
     case 0xE9: { const int32_t d = rd32();
-        o << "jmp +" << std::dec << (int32_t(p) + d); break; }
+        MN("jmp"); A(dop_rel(int32_t(p) + d)); break; }
     case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75:
     case 0x76: case 0x77: case 0x78: case 0x79: case 0x7A: case 0x7B:
     case 0x7C: case 0x7D: case 0x7E: case 0x7F: case 0xEB: {
         const int8_t d = int8_t(c[p++]);
         static const char *js[16] = {"jo","jno","jb","jae","je","jne",
             "jbe","ja","js","jns","jp","jnp","jl","jge","jle","jg"};
-        const char *m = op == 0xEB ? "jmp" : js[op - 0x70];
-        o << m << " +" << std::dec << (int32_t(p) + d); break; }
+        MN(op == 0xEB ? "jmp" : js[op - 0x70]);
+        A(dop_rel(int32_t(p) + d)); break; }
     case 0x0F: {
         const uint8_t o2 = c[p++];
+        /* the rm REGISTER of an SSE form is an XMM, not a GP (the
+         * generic modrm would print `rsi` for xmm6 - found live on
+         * 89_regs_float_08's xmm-pinned fj) */
+        const auto xmm_rm = [&](DecOp &x) {
+            const bool reg_form = (c[p] & 0xC0) == 0xC0;
+            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
+            modrm(regf, x);
+            if (reg_form) x = dop_xmm(rm_xmm);
+        };
         if (o2 == 0xAF) { modrm(regf, rm);
-            o << "imul " << gp64(regf) << ", " << rm; }
+            MN("imul"); A(dop_gpr(regf)); A(rm); }
         else if (o2 >= 0x80 && o2 <= 0x8F) { const int32_t d = rd32();
             static const char *j[16] = {"jo","jno","jb","jae","je","jne",
                 "jbe","ja","js","jns","jp","jnp","jl","jge","jle","jg"};
-            o << j[o2 - 0x80] << " +" << std::dec << (int32_t(p) + d); }
+            MN(j[o2 - 0x80]); A(dop_rel(int32_t(p) + d)); }
         else if (o2 == 0x28) {         /* movaps (reg-reg fmov) */
-            const bool reg_form = (c[p] & 0xC0) == 0xC0;
-            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
-            modrm(regf, rm);
-            o << "movaps xmm" << regf << ", ";
-            if (reg_form) o << "xmm" << rm_xmm; else o << rm; }
+            xmm_rm(rm); MN("movaps"); A(dop_xmm(regf)); A(rm); }
         else if (o2 == 0x57) {         /* xorps (#101: the cvtsi2sd
                                         * merge-dependency break; always
                                         * reg-reg, dst == src) */
-            const bool reg_form = (c[p] & 0xC0) == 0xC0;
-            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
-            modrm(regf, rm);
-            o << "xorps xmm" << regf << ", ";
-            if (reg_form) o << "xmm" << rm_xmm; else o << rm; }
+            xmm_rm(rm); MN("xorps"); A(dop_xmm(regf)); A(rm); }
         else if (o2 == 0x10 || o2 == 0x11 || o2 == 0x51) {
-            /* reg-reg form: the rm REGISTER is an XMM, not a GP (the
-             * generic modrm would print `rsi` for xmm6 - found live on
-             * 89_regs_float_08's xmm-pinned fj; the 0x58 family below
-             * had the fix, these three arms did not) */
-            const bool reg_form = (c[p] & 0xC0) == 0xC0;
-            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
-            modrm(regf, rm);
-            const char *m = o2 == 0x51 ? "sqrtsd" : "movsd";
+            xmm_rm(rm);
+            MN(o2 == 0x51 ? "sqrtsd" : "movsd");
             if (o2 == 0x11) {           /* store direction: rm first */
-                o << m << " ";
-                if (reg_form) o << "xmm" << rm_xmm; else o << rm;
-                o << ", xmm" << regf;
+                A(rm); A(dop_xmm(regf));
             } else {
-                o << m << " xmm" << regf << ", ";
-                if (reg_form) o << "xmm" << rm_xmm; else o << rm;
+                A(dop_xmm(regf)); A(rm);
             } }
         else if (o2 == 0x58 || o2 == 0x59 || o2 == 0x5C || o2 == 0x5E) {
-            /* reg-reg form: the rm REGISTER is an XMM, not a GP (the generic
-             * modrm would print `rcx` for xmm1) */
-            const bool reg_form = (c[p] & 0xC0) == 0xC0;
-            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
-            modrm(regf, rm);
-            const char *m = o2==0x58?"addsd":o2==0x59?"mulsd":
-                            o2==0x5C?"subsd":"divsd";
-            o << m << " xmm" << regf << ", ";
-            if (reg_form) o << "xmm" << rm_xmm; else o << rm; }
+            xmm_rm(rm);
+            MN(o2==0x58?"addsd":o2==0x59?"mulsd":
+               o2==0x5C?"subsd":"divsd");
+            A(dop_xmm(regf)); A(rm); }
         else if (o2 == 0x2A) { modrm(regf, rm);
-            o << "cvtsi2sd xmm" << regf << ", " << rm; }
+            MN("cvtsi2sd"); A(dop_xmm(regf)); A(rm); }
         else if (o2 == 0x6E) { modrm(regf, rm);
-            o << "movq xmm" << regf << ", " << rm; }
+            MN("movq"); A(dop_xmm(regf)); A(rm); }
         else if (o2 == 0x7E) { modrm(regf, rm);   /* 66 REX.W 0F 7E:
                                                    * movq r/m64, xmm */
-            o << "movq " << rm << ", xmm" << regf; }
+            MN("movq"); A(rm); A(dop_xmm(regf)); }
         else if (o2 == 0x2E) {
-            const bool reg_form = (c[p] & 0xC0) == 0xC0;
-            const int rm_xmm = (c[p] & 7) + (B ? 8 : 0);
-            modrm(regf, rm);
-            o << "ucomisd xmm" << regf << ", ";
-            if (reg_form) o << "xmm" << rm_xmm; else o << rm; }
+            xmm_rm(rm); MN("ucomisd"); A(dop_xmm(regf)); A(rm); }
         else if (o2 >= 0x90 && o2 <= 0x9F) {   /* setcc r/m8 (CmpIntV) */
             modrm(regf, rm);
             static const char *sc[16] = {"seto","setno","setb","setae",
                 "sete","setne","setbe","seta","sets","setns","setp","setnp",
                 "setl","setge","setle","setg"};
-            o << sc[o2 - 0x90] << " " << rm; }
+            MN(sc[o2 - 0x90]); A(rm); }
         else if (o2 == 0xB6) { modrm(regf, rm);   /* movzx r32, r/m8 */
-            o << "movzx " << gp64(regf) << ", " << rm; }
+            MN("movzx"); A(dop_gpr(regf)); A(rm); }
         else { goto undecoded; }
         break; }
     default:
         goto undecoded;
     }
     (void)pf_f2; (void)pf_66;
-    out = o.str();
+    D.ok = true;
+    D.len = p - start;
+    out = render_ins(D, nm, ti, tf, ta);
+    if (di) *di = D;
     return;
+    }
     /*
      * ⛔ ONE EXIT FOR "I DO NOT KNOW", AND IT MUST BE `.byte`.
      *
@@ -1111,6 +1190,10 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
 undecoded:
     p = start + 1;
     out = ".byte 0x" + hex2(c[start]);
+    D = DecodedIns();
+    D.off = start;
+    D.len = 1;
+    if (di) *di = D;
 }
 
 /*
@@ -1142,8 +1225,19 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
                         const NativeCode::Frag &frag, const SlotNamer &nm,
                         const std::function<std::string(const Instr &)>
                             &render_instr,
-                        bool deleted_originals)
+                        bool deleted_originals,
+                        const std::string &section)
 {
+    /* the STRUCTURED decode, collected beside the rendering rather than
+     * from a second walk: this loop already finds every fragment and
+     * the caller already named the section, and two walks are how two
+     * answers start to differ */
+    DecodedFrag *sink = nullptr;
+    if (g_jit_decode_sink) {
+        g_jit_decode_sink->push_back(DecodedFrag());
+        g_jit_decode_sink->back().section = section;
+        sink = &g_jit_decode_sink->back();
+    }
     const void *ti = nullptr, *tf = nullptr, *ta = nullptr;
     jit_type_singletons(ti, tf, ta);
     s << "       . ---- native x86-64 (rbx=frame slots, rsi=int-tag,"
@@ -1194,7 +1288,10 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
         }
         const uint32_t st = p;
         std::string mn, cmt;
-        decode_one(code, frag.len, p, mn, cmt, nm, ti, tf, ta);
+        DecodedIns di;
+        decode_one(code, frag.len, p, mn, cmt, nm, ti, tf, ta, &di);
+        if (sink)
+            sink->ins.push_back(di);
         if (mn.compare(0, 6, ".byte ") == 0)
             undecoded++;
         std::ostringstream line;
@@ -2098,7 +2195,7 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                         s, static_cast<const uint8_t *>(chunk.native.base)
                                + fr.start, fr,
                         [&chunk](int sl) { return reg(chunk, sl); },
-                        render_instr, deleted);
+                        render_instr, deleted, title);
                     break;
                 }
         }

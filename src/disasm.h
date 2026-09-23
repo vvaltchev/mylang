@@ -5,6 +5,7 @@
 #include "bytecode.h"
 
 #include <string>
+#include <vector>
 
 class Block;
 
@@ -50,6 +51,95 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
  * chunk; only a fall-through body - `main`, a void function - keeps `halt`).
  */
 std::string disassemble_program(const Block *root);
+
+/*
+ * ====================  THE STRUCTURED DECODE  ====================
+ *
+ * ⛔ A TEST ASSERTS ON AN INSTRUCTION, NOT ON THE TEXT THAT RENDERS IT
+ * (maintainer, 2026-09-22). `-vdj`'s decoder knows every field - the
+ * base register, the index, the scale, the displacement, whether the
+ * memory operand resolves to a FRAME SLOT - and then threw all of it
+ * away into a string. A shape test that wanted one operand had to
+ * parse the rendering back, which is a second decoder in all but name:
+ * it re-derives what was already known, it is not the thing objdump
+ * cross-checks, and it cannot recover what the rendering COLLAPSED.
+ *
+ * The collapse is real and it is the reason this exists: the dump
+ * spells a scratch TEMP `rN`, which is also how it spells machine
+ * registers r8..r15, so `mov r10, rax` is ambiguous IN THE TEXT and
+ * not ambiguous at all in the decode. `DecOp::Slot` and `DecOp::Gpr`
+ * are different kinds here.
+ *
+ * So `decode_one` FILLS one of these and the dump is `render(it)` -
+ * one decoder still, the one `scripts/disasmcheck.py` verifies against
+ * objdump, and the text cannot disagree with the structure because it
+ * is derived from it.
+ *
+ * ⛔ WHAT THIS DOES NOT PROVE, and the sabotage that showed it:
+ * dropping the SIB byte from an `[r12+d]` encoding leaves a DIFFERENT,
+ * well-formed instruction - our decoder and objdump agreed on it
+ * perfectly over 235,639 instructions while `-rt` aborted and
+ * corpus_diff went 33/35. A decoder oracle proves the dump is honest
+ * about the BYTES; only the engine differential proves the bytes mean
+ * what the emitter intended.
+ */
+struct DecOp {
+    enum Kind : unsigned char {
+        None,
+        Gpr,        /* a 64-bit general register (`reg`)             */
+        Gpr32,      /* its 32-bit spelling, eNN                      */
+        Gpr8,       /* its low-byte spelling (`rex8`: dil/sil/...)   */
+        Xmm,        /* an SSE register (`reg`)                       */
+        Cl,         /* the ISA-fixed shift count                     */
+        Mem,        /* [base + index*scale + disp]; base < 0 = none  */
+        Slot,       /* a FRAME SLOT - [rbx+disp] the namer resolved  */
+        Imm,        /* `imm`, rendered through the tag symbolisation */
+        ImmDec,     /* `imm`, rendered as a plain decimal            */
+        Rel,        /* a branch target: `imm` = the FRAGMENT offset  */
+        CallRel     /* a rel32 call: `imm` = the raw displacement,
+                     * masked to <helper> unless MYLANG_VDJ_ADDRS     */
+    };
+    Kind kind = None;
+    int reg = -1;          /* Gpr/Gpr32/Gpr8/Xmm; Mem: the base      */
+    int index = -1;        /* Mem, -1 = none                         */
+    int scale = 1;         /* Mem                                    */
+    int disp = 0;          /* Mem                                    */
+    long long imm = 0;     /* Imm/ImmDec/Rel/CallRel                 */
+    int slot = -1;         /* Slot: the frame slot index             */
+    bool slot_type = false;/* Slot: the `.type` half of the slot     */
+    bool byte_ptr = false; /* Mem/Slot printed with a `byte` size    */
+    bool rex8 = false;     /* Gpr8: the uniform low-byte set         */
+    /* HOW the address was ENCODED, which the rendering differs on: a
+     * SIB form omits a zero displacement and carries the no-base
+     * absolute, a plain one always prints its disp. Recorded rather
+     * than re-derived, so render() stays a pure function of this. */
+    bool via_sib = false;  /* Mem                                    */
+    bool rip = false;      /* Mem: RIP-relative                      */
+};
+
+struct DecodedIns {
+    unsigned off = 0;      /* fragment-relative offset               */
+    unsigned len = 0;
+    std::string mn;        /* the mnemonic; empty when !ok           */
+    DecOp ops[3];
+    int n = 0;
+    bool ok = false;       /* false: the decoder does not know it    */
+};
+
+/* one collected fragment: which chunk section it belongs to, and its
+ * instructions in offset order */
+struct DecodedFrag {
+    std::string section;
+    std::vector<DecodedIns> ins;
+};
+
+/*
+ * When non-null, every native fragment `disassemble_program` renders is
+ * ALSO appended here. A collector rather than a second entry point
+ * because the dump walk already finds every fragment and names every
+ * section; duplicating that walk is how two answers start to differ.
+ */
+extern std::vector<DecodedFrag> *g_jit_decode_sink;
 
 /* The LOADED-IMAGE twin (plans/archived/myv-serializer.md): dump a VmProgram exactly
  * as disassemble_program dumps a fresh compile - the ROUND-TRIP ORACLE

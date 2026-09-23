@@ -13959,55 +13959,71 @@ exclusions are the enumerate-where-the-hazard-can-occur shape CLAUDE.md
 already records as a staleness trap (the `-rt` address-free check that
 walked operand separators, #96).
 
-So `tests.cpp` now PARSES the dump into `MIns2`/`MOp` - mnemonic plus
-typed operands (`Name`, `Mem{base,index,scale,disp}`, `Imm`, `Sym`,
-`Rel`) - and the assertions are field comparisons:
-`op.kind == MOp::Mem && op.base == pin && op.index < 0 && op.disp == -1`.
-The instruction under test is ANCHORED by its destination store (the
-`<slot>.type` / `<slot>` pair every int result ends in), so it is *this
-op's arithmetic*, not some other `lea` that renders alike.
+**AND THE SECOND VERSION WAS ALSO WRONG**, which is the part worth
+carrying. Parsing the rendering back into a struct in `tests.cpp` is a
+SECOND DECODER in all but name: it re-derives what `decode_one` already
+computed, it is not the thing `disasmcheck` cross-checks against
+objdump, and it cannot recover what the rendering COLLAPSED. The
+collapse is concrete: the dump spells a scratch TEMP `rN`, which is
+also how it spells r8..r15, so `mov r10, rax` is ambiguous IN THE TEXT.
+The first write-up of this entry called that ambiguity unresolvable and
+named a disassembler rename (`tN`) as the eventual fix. Both were
+treating a symptom.
 
-**WHY THE DUMP AND NOT AN EMITTER-SIDE TRACE:** an oracle that shares
-its subject is not an oracle (#96). `-vdj` decodes the BYTES that were
-emitted and `disasmcheck` proves that decode against objdump corpus-
-wide, so parsing it keeps the independent reading.
+**THE DECODER FILLS A STRUCTURE AND THE TEXT IS RENDERED FROM IT.**
+`decode_one` produces a `DecodedIns` - mnemonic plus typed `DecOp`s
+(`Gpr`, `Gpr32`, `Gpr8`, `Xmm`, `Cl`, `Mem{base,index,scale,disp}`,
+**`Slot{slot, slot_type}`**, `Imm`, `ImmDec`, `Rel`, `CallRel`) - and
+`render_op` is the ONLY place a machine operand becomes text. So:
+
+ - there is still exactly ONE decoder, the one objdump verifies;
+ - the dump cannot disagree with the structure, because it IS the
+   structure rendered;
+ - `DecOp::Slot` and `DecOp::Gpr` are different KINDS. The ambiguity
+   was never in the decode, only in the rendering, and a test never
+   sees the rendering.
+
+A test collects through `g_jit_decode_sink`, which `disasm_native_frag`
+appends to beside the text - the dump walk already finds every fragment
+and names every section, and a second walk is how two answers start to
+differ.
+
+**VERIFIED INERT THE ONLY WAY A REWRITE OF 457 LINES CAN BE:** `-vdj`
+is byte-for-byte unchanged (`vdjcmp` 128/128 against the pre-refactor
+binary) and `disasmcheck` re-proves the decode against objdump (234,305
+instructions, zero disagreements). The refactor was landed and checked
+BEFORE the test moved onto it.
 
 **WHAT disasmcheck DOES NOT PROVE, watched here:** dropping the SIB
 byte from the `[r12+d]` encoding leaves a DIFFERENT, well-formed
 instruction - and our decoder and objdump agreed on it perfectly (zero
 disagreements over 235,639 instructions) while `-rt` aborted and
-`corpus_diff` went 33/35 with a garbage value printed. A decoder
-oracle proves the dump is honest about the bytes; only the differential
+`corpus_diff` went 33/35 with a garbage value printed. A decoder oracle
+proves the dump is honest about the BYTES; only the engine differential
 proves the bytes mean what the emitter intended.
 
-⛔ **ONE THING THE MODEL CANNOT RESOLVE, stated rather than papered
-over:** a bare operand is either a MACHINE REGISTER or a FRAME SLOT,
-and the dump spells a scratch TEMP `rN` - the same spelling as r8..r15.
-A bare token therefore stays a `Name`, and `mgpr()` answers only "is
-this one of the 16 GPR spellings". A memory operand's base/index are
-never ambiguous (a slot is rendered bare, never bracketed), which is
-what these assertions rest on. **The real fix is in the DISASSEMBLER -
-spell a temp `tN`** - and it is a separate change, because it moves
-every dump's text and every existing shape test's want lines.
-
-The model FAILS CLOSED (`mparse` refuses a form it does not know and
-`mins_of` drops the section), and `jit: the shape tests'
-MACHINE-INSTRUCTION MODEL parses every form the emitter produces` is its
-self-test: >2000 instructions over >=4 sections of a program reaching
-closures, a frameless call, a dict, a string, a flat array, a struct,
-libm, a runtime-count shift, an idiv and a try/catch. A new operand
-form fails there, by instruction.
+The decode FAILS CLOSED (an unknown form is `.byte` with `ok == false`)
+and `jit: the shape tests' MACHINE-INSTRUCTION MODEL parses every form
+the emitter produces` is its self-test: >2000 instructions over >=4
+fragments of a program reaching closures, a frameless call, a dict, a
+string, a flat array, a struct, libm, a runtime-count shift, an idiv
+and a try/catch. A new operand form fails there, by fragment and
+offset.
 
 ### WATCHED FAILING, one sabotage build each
 
- 1. the peephole never fires -> *the arithmetic before `r10`'s store is
-    `sub rax, 1` (want one `lea <dst>, [<pin>-0x1]`), reach 0*;
+ 1. the peephole never fires -> *the arithmetic before slot 10's store
+    is `sub` with 2 operand(s) (want one `lea <dst>, [<pin>-1]`),
+    reach 0*;
  2. **the `lea` fires but the redundant `mov` is KEPT** - the case that
-    justifies the model: a counting or substring test passes it (the
-    `lea` is there, the `sub` is not) and the anchored model reports
-    *the arithmetic before `r10`'s store is `mov rax, r12`*;
+    justifies asserting on the structure: a counting or substring test
+    passes it (the `lea` is there, the `sub` is not) and the anchored
+    check reports *the arithmetic before slot 10's store is `mov`*;
  3. the SIB byte dropped from `emit_modrm_disp` -> `-rt` aborts and
-    `corpus_diff` 33/35, while disasmcheck stays green (above).
+    `corpus_diff` 33/35, while disasmcheck stays green (above);
+ 4. **`decode_one` stops resolving `[rbx+d]` to a SLOT** -> *no slot-10
+    destination store found*, i.e. the anchor really is `DecOp::Slot`
+    and not a spelling.
 
 ### NETS
 
