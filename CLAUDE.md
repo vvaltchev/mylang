@@ -1053,6 +1053,17 @@ and a new emitter must obey all four:
    inside `jit_ret_norec` in an `OPT=1 ASSERTS=0` build while `-rt`
    2016/2016, every corpus matrix and even `--spcheck` on the DEBUG
    build were green. Same family as `trk_push`'s own ⛔.
+ - **WHEN EVERY GUARD IS ELIDED, EMIT NEITHER THE JOIN JUMP NOR THE
+   ARM.** A tier that falls to a helper behind one or more `ref_slots`
+   guards has an UNREACHABLE helper when all of them are elided -
+   nothing is patched to it - and the `jmp` that hops over it is ONE
+   EXECUTED INSTRUCTION on the fast path. #113 gave the capture read
+   this rule; `MoveV` did not get it for two more years, at about 40
+   dead bytes plus that `jmp` per staging move (45_gcd **-2.93% Ir**
+   when it landed). The rsp model is what found it - a call nothing
+   branches to has no stack state to align against - and
+   `g_jit_call_dead_model` is the ratchet, held at ZERO by *the CALL
+   SEAM is total*.
  - **A CALL WHOSE CALLEE READS THE CALLER'S FRAME AT A FIXED OFFSET
    FROM THE RETURN ADDRESS uses `call_fixed_frame`.** The push
    protocol's captures (`[rbp+16]`), the pushed dst word (`[rbp+24]`)

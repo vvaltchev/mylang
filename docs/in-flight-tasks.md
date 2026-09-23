@@ -537,12 +537,20 @@ work — but profile it before building, the way increment 0 was.
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
 
-**⛔ THE OPEN CODE-SIZE FINDING (SP3, 2026-09-22, not fixed):** `MoveV`
-emits its helper arm even when NEITHER slot is ref-listed, so `jhelp`
-is empty, nothing is patched to it, and the arm is UNREACHABLE -
-roughly 35 emitted bytes per move. The rsp model noticed because a call
-emitted there has no branch state to align against;
-`g_jit_call_dead_model` counts them. No correctness component.
+**✅ FIXED 2026-09-22 (the maintainer asked the same day) - THE
+DEAD-MODEL POPULATION, 18 -> 0.** Two causes, different in kind.
+`MoveV` emitted an UNREACHABLE helper arm whenever neither slot was
+ref-listed (15 of the 18) - #113's rule for the capture read, which
+this op never got; eliding it also drops the `jmp` that hopped over
+it, one EXECUTED instruction per move, and un-bumps `n_prologues` so
+such a run reads as call-free and drops its entry filler too. 45_gcd
+**-2.93% Ir** from five fewer emitted instructions, 10_recursion_deep
+-1.25%. The other 3 were NOT dead code: `emit_reg_shift` hand-encoded
+its three branches (`0F 88`, `0F 8C`, `E9` + a bare `patch32`), so the
+seams never saw them and the model went blind over perfectly reachable
+code - routed through `j32`/`jmp32`/`patch32_here`, byte-identical,
+RAWENC 12 -> 10. `jit: SP - the CALL SEAM is total` is the ratchet at
+zero; both causes watched failing.
 
 **⛔ THE STANDING KILL CRITERION (plan section 4):** if increment 2's
 gate comes back byte-flat on the WALL CLOCK while Ir drops, STOP AND SAY

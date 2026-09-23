@@ -30347,15 +30347,32 @@ static bool jit_call_seam_is_total()
     const std::vector<const char *> lines = {
         "func mk(int n) { var b = n * 10;",
         "              return func [b] (int x) { return b + x; }; }",
+        /* ⛔ THE EUCLID SWAP, UNTYPED ON PURPOSE (bench/my/45's own
+         * shape). `var tt = q; ... p = tt;` in a TEMPLATE instance is
+         * the commonest BOXED MoveV whose two slots are both
+         * un-ref-listed - the one whose helper arm was unreachable.
+         * ANNOTATING the parameters makes the source PINNED and the
+         * move takes an early return instead, so the case goes
+         * vacuous: watched, with the arm restored and the typed
+         * spelling in place the ratchet stayed green. */
+        "func eu(p, q) { var r = 0;",
+        "  while (q != 0) { var tt = q; q = p % q; p = tt; r = r + 1; }",
+        "  return r + p; }",
         "var add = mk(7);",
         "var a = []; var d = {}; var s = \"\";",
-        "var t = 0.0; var acc = 0;",
+        "var t = 0.0; var acc = 0; var k = int(runtime(3)); var w = 0;",
         "for (var i = 0; i < runtime(6); i++) {",
         "  append(a, i * 3); d[i] = i + 1; s = s + str(i);",
         "  t = t + sin(float(i)) + sqrt(float(i) + 1.0); acc = acc + add(i);",
+        /* a RUNTIME-count shift: its negative-count arm is a CONVEY,
+         * and its three branches are the ones that used to be hand-
+         * encoded and therefore invisible to the stack model */
+        "  w = w + ((i + 1) << k) + ((i + 9) >>> k) + ((i + 7) % (k + 2));",
+        "  w = w + eu(i + 84, i + 36);",
         "}",
-        "print(len(a), len(d), len(s), t > 0.0, acc);"
+        "print(len(a), len(d), len(s), t > 0.0, acc, w);"
     };
+    const unsigned long dm0 = g_jit_call_dead_model;
     const unsigned long c0 = g_jit_call_sites;
     const unsigned long s0 = g_jit_spcheck_sites;
     std::string d;
@@ -30414,6 +30431,26 @@ static bool jit_call_seam_is_total()
                         "preceded by the alignment check - it was "
                         "emitted outside Emitter::call_direct/call_reg\n",
                 all[i].text.c_str(), all[i].off);
+        ok = false;
+    }
+    /*
+     * ⛔ AND NO CALL IS EMITTED WHERE THE MODEL IS BLIND. `call_site`
+     * has to pick a stack depth for code no branch has reached yet, so
+     * it assumes the body contract - correct, but it means a real
+     * blind spot would be ABSORBED rather than reported. Two of them
+     * existed when the counter was added and both are closed: MoveV
+     * emitted an UNREACHABLE helper arm when neither slot was
+     * ref-listed, and emit_reg_shift hand-encoded its three branches
+     * so the seams never saw them. The population is ZERO now, and
+     * this is the ratchet that keeps it there - a new unreachable
+     * call, or a new raw-encoded jump, fails here by count.
+     */
+    if (g_jit_call_dead_model != dm0) {
+        fprintf(stderr, "jit_call_seam_is_total: %lu call(s) emitted "
+                        "where the stack model is BLIND - either the "
+                        "code is unreachable (elide it) or a branch to "
+                        "it bypassed j8/j32/jmp32\n",
+                g_jit_call_dead_model - dm0);
         ok = false;
     }
     if (calls < 8 || guarded < 4 || reporters != guarded) {
