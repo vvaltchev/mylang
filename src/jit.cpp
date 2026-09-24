@@ -9039,12 +9039,23 @@ static const char *jit_frameless_callee_why(const FuncDescriptor *bake,
     const bool self =
         g_cur_caller_desc != nullptr && bake == g_cur_caller_desc;
     return
-        (bake_ck->frameless_calls && !self)
-              ? "a CALLING callee is frameless only at its own self "
-                "sites (E2 v1)"
-        : (!self && with_placement && bake_ck->native.base == nullptr)
+        /* #97 G1: a CALLING callee at another function's site - named
+         * (a value callee's closure could differ in its captures),
+         * capture-free, and never from MAIN, which runs on the C stack:
+         * its callee's own sites would all decline off the native stack
+         * into boundary calls, and a boundary forms no frameless frame */
+        (bake_ck->frameless_calls && !self
+         && (!g_cur_caller_desc || in.op == OpCode::CallValueV
+             || !bake->captures.empty()))
+              ? "a CALLING callee is frameless only from a function, "
+                "by name, capture-free"
+        /* a calling callee is placed at RUN time (frameless_entry_abs),
+         * so none of the three placement tests applies to it */
+        : (!self && !bake_ck->frameless_calls && with_placement
+           && bake_ck->native.base == nullptr)
               ? "not bake_final (the callee is unplaced)"
-        : (!self && with_placement && bake_ck->sync_entry_off < 0)
+        : (!self && !bake_ck->frameless_calls && with_placement
+           && bake_ck->sync_entry_off < 0)
               ? "the callee does not start native"
         : static_cast<int>(bake->params.size()) != in.b_lit()
               ? "arity (omitted trailing opt args - the push does not bake)"
@@ -9054,7 +9065,8 @@ static const char *jit_frameless_callee_why(const FuncDescriptor *bake,
         : !bake_ck->frameless_ok ? "the callee is not frameless_ok"
         : (self && !g_cur_self_fl)
               ? "the E2 pre-pass refused this body"
-        : (!self && with_placement && bake_ck->frameless_entry_off < 0)
+        : (!self && !bake_ck->frameless_calls && with_placement
+           && bake_ck->frameless_entry_off < 0)
               ? "no frameless entry emitted"
         : jit_lever_off(JL_FRAMELESS) ? "lever off"
         /* with the pure cache OFF a CachedCallV's probe is not
@@ -11446,7 +11458,12 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
              * exception is not).
              */
             const bool fl_self = fl_callee == g_cur_caller_desc;
-            if (fl_self) {
+            /* #97 G1: a CALLING callee recurses whoever calls it, so its
+             * site keeps a self site's bounds too - the stack cursor and
+             * the floor, or the cap (everything below says "self" for
+             * history's sake and applies to both) */
+            const bool fl_rec = fl_self || fl_ck->frameless_calls;
+            if (fl_rec) {
                 /*
                  * E2d: WHICH BOUND, decided at EMIT time - the native
                  * stack is armed (or not) before any chunk compiles.
@@ -11479,7 +11496,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                     e.cmp_rr(RSP, R11);           /* reg:proto */
                     j_pre.push_back(e.j32(0x72)); /* jb: below the floor */
 #ifdef TESTS
-                    g_jit_frameless_self_floor++; /* emit-time */
+                    if (fl_self)
+                        g_jit_frameless_self_floor++; /* emit-time */
 #endif
                 } else {
                     if (!e.cmp_abs32_imm32(
@@ -11492,8 +11510,20 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                     }
                     j_pre.push_back(e.j32(0x7D)); /* jge: at the cap */
                 }
+                if (!fl_self) {
+                    /* G1: the callee is placed at RUN time - no entry yet
+                     * (its own pre-pass refused it) declines, before the
+                     * window is reserved, like any other bound */
+                    e.movabs(R11, reinterpret_cast<uint64_t>(
+                                      &fl_ck->frameless_entry_abs));
+                    e.cmp_qword_base_imm8(R11, 0);
+                    j_pre.push_back(e.j32(0x74)); /* je: no entry */
+                }
 #ifdef TESTS
-                g_jit_frameless_self_sites++;     /* emit-time */
+                if (fl_self)
+                    g_jit_frameless_self_sites++; /* emit-time */
+                else
+                    g_jit_frameless_mutual++;     /* G1: emit-time */
 #endif
             }
             /* W1: the callee's window, on THIS stack, filled here (the
@@ -11515,8 +11545,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
              * the site that built THIS frame left uninitialised (W3: a
              * call's dst is a raw write in a calling frameless body) */
             const int32_t dst_bits =
-                1 + ((fl_self && !jit_slot_ref_listed(ck, in.target)) ? 2
-                                                                      : 0);
+                1 + ((fl_rec && !jit_slot_ref_listed(ck, in.target)) ? 2
+                                                                     : 0);
             /* #97 F2: a LEAF site in a calling frameless body. E2b made a
              * call's dst a raw write here, so the site that built THIS
              * frame may have left it uninitialised (W3) - and the leaf's
@@ -11525,7 +11555,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
              * there would be paid on every leaf call). One store makes
              * the old value `none`. Watched: without it, the TESTS
              * poison type aborts the E2 test's leaf case by name. */
-            if (!fl_self && g_cur_self_fl && in.target >= 0
+            if (!fl_rec && g_cur_self_fl && in.target >= 0
                     && !jit_slot_ref_listed(ck, in.target))
                 e.store_type_tag_via(
                     in.target * static_cast<int32_t>(sizeof(LValue)) + 24,
@@ -11578,13 +11608,21 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             /* the callee reads its WINDOW at [rbp+32], through the
              * residue just pushed - nothing may come between (the depth
              * bump is register- and stack-neutral) */
-            const bool fl_count = fl_self && !jit_nstack_armed();
+            const bool fl_count = fl_rec && !jit_nstack_armed();
+            if (fl_count)                         /* E2d: see the bounds -
+                                                   * before r11 is loaded */
+                e.bump_counter32_live(
+                    reinterpret_cast<const void *>(depth_addr));
             if (fl_self) {
-                if (fl_count)                     /* E2d: see the bounds */
-                    e.bump_counter32_live(
-                        reinterpret_cast<const void *>(depth_addr));
                 ML_CHECK(g_cur_self_fl_calls != nullptr);
                 g_cur_self_fl_calls->push_back(e.call_local_fixed_frame());
+            } else if (fl_rec) {
+                /* G1: through the entry cell (tested above); a register
+                 * load is stack-neutral, so the window stays at [rbp+32] */
+                e.movabs(R11, reinterpret_cast<uint64_t>(
+                                  &fl_ck->frameless_entry_abs));
+                e.load_base(R11, R11, 0);
+                e.call_fixed_frame_reg(R11);
             } else {
                 e.call_fixed_frame(
                     static_cast<const void *>( static_cast<const char *>(fl_ck->native.base) + fl_ck->frameless_entry_off));
@@ -13772,6 +13810,7 @@ void jit_stats_report()
         { "frameless_self_floor", &g_jit_frameless_self_floor },
         { "vframe_publish",    &g_jit_vframe_publish },
         { "frameless_nonmain", &g_jit_frameless_nonmain },
+        { "frameless_mutual",  &g_jit_frameless_mutual },
         { "frameless_boundary", &g_jit_frameless_boundary },
         { "borrow_inline",     &g_jit_borrow_inline },
         { "arg_stage",        &g_jit_arg_stage },
@@ -27011,11 +27050,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             /* #97 F2: or a frameless site to a LEAF - it makes no call,
              * so no switch can start below it, and F1's ordering has it
              * placed (asked with placement, like any other site) */
+            /* #97 G1: or a frameless site to another CALLING function -
+             * which is entered framelessly only if ITS pre-pass admits it
+             * (it has an entry), and otherwise declines at run time */
             const FuncDescriptor *c[2] = { nullptr, nullptr };
-            if (jit_frameless_candidates(chunk, pc, in, c, nullptr) != 1
-                    || (c[0] != g_cur_caller_desc
-                        && static_cast<const Chunk *>(c[0]->vm_chunk)
-                               ->frameless_calls))
+            if (jit_frameless_candidates(chunk, pc, in, c, nullptr) != 1)
                 g_cur_self_fl = false;
             else if (c[0] == g_cur_caller_desc)
                 any_self = true;
@@ -27027,6 +27066,12 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         if (g_cur_self_fl && any_self)
             chunk.frameless_wanted = true;
     }
+    /* #97 G1: another body may have marked a CALLING body wanted
+     * (jit_mark_frameless_wanted); its entry is sound only if its OWN
+     * verdict admits it - every site in it frameless - so a refused
+     * calling body drops the mark, and its entry cell stays null */
+    if (chunk.frameless_calls && !g_cur_self_fl)
+        chunk.frameless_wanted = false;
     /* Emit the fragments. Per run: RSI = t_int once at entry (preserved
      * across the loop - no op clobbers it - so the native back edge, a
      * jump to label[begin] AFTER this movabs, keeps it live); record each
@@ -30016,6 +30061,8 @@ retry_emission:
      * buffer (a frameless_ok body is one run, so its fragment is the
      * whole chunk) */
     chunk.frameless_entry_off = fe_off;
+    chunk.frameless_entry_abs =
+        fe_off >= 0 ? static_cast<char *>(mem) + fe_off : nullptr;
     if (jit_map_wanted())
         jit_write_map(chunk, map_name);
 }

@@ -1858,6 +1858,11 @@ struct Chunk {
      * window together on both return paths.
      */
     int64_t frameless_entry_off = -1;
+    /* #97 G1: the frameless entry's ABSOLUTE address once placed (null =
+     * none). A site calling a CALLING callee reads it at RUN time - an
+     * immediate would need the callee placed first, and mutual recursion
+     * has no such order - and declines when it is null. */
+    void *frameless_entry_abs = nullptr;
 
     /* Live dyn-foreach iterator state slots (max iter_id + 1); one per native
      * ForeachDyn in the chunk. See the ForeachDyn ops. */

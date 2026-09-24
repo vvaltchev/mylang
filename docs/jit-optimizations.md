@@ -14462,3 +14462,73 @@ wall = ONE interleaved `--baseline` run each):
 
 Against C++ (the cached `-cl cpp` twins), 91 went from 2.69x to 1.13x and
 92 from 3.38x to 1.51x; against CPython 0.17x -> 0.07x and 0.22x -> 0.10x.
+
+## #97 G1 - MUTUAL RECURSION: A CALLING FUNCTION CALLED FRAMELESSLY FROM ANOTHER (2026-09-24)
+
+**THE BENCH FIRST (c08c165): 93_mutual_recursion** - `ev`/`od` calling
+each other to depth ~600. Neither call could be frameless: a CALLING
+callee was entered framelessly only at its own self sites, so both bodies
+were refused and every level took the generic protocol - ~159 Ir per
+level against ~50 for self-recursion; 0.098s, 2.00x C++.
+
+**PLACEMENT AT RUN TIME.** F1's answer - jit the callee first - has no
+order to use here: `ev` and `od` each need the other placed. So a site to
+a CALLING callee does not read the callee's placement at emit time at
+all. `Chunk::frameless_entry_abs` holds the placed frameless entry (null
+= none); the site tests it before reserving the window (`je` to the
+decline, with the other bounds) and calls through it
+(`call_fixed_frame_reg(r11)`). The emitted code depends on no compile
+order, and a callee that never got an entry simply leaves its cell null.
+
+**ADMISSION STAYS PER BODY, AND IS STILL SOUND.** A site to a calling
+callee is a candidate when the callee is NAMED (a value callee's closure
+may differ in its captures), capture-free and `frameless_ok`, and the
+caller is not MAIN (which runs on the C stack: its callee's own sites
+would all decline off the native stack into boundary calls, and a
+boundary forms no frameless frame). The E2 pre-pass admits such a site
+like a self or leaf one. Whether the CALLEE is entered framelessly is
+its own pre-pass's verdict: every site in it frameless. So a switch still
+never passes through a frameless frame. ⛔ **THE ONE NEW RULE THAT MAKES
+THAT TRUE:** another body may now mark a calling body `frameless_wanted`
+(`jit_mark_frameless_wanted` scans every body since F1), so a calling
+body whose own pre-pass REFUSES it clears the mark before anything reads
+it - its return arm, its W4 run and its entry all agree, and its cell
+stays null. Watched: without the clear, the refused body gets an entry,
+a depth-cap switch below it meets it, and `norec_switch_retarget`'s
+tripwire aborts by name.
+
+**THE SELF SITE'S MACHINERY, GENERALISED** from "the callee is me" to
+"the callee calls": the cursor/floor (or cap) bounds, the depth count
+when the stack is not armed, and the dst's bit 1 (a calling callee's arm
+tests it). E2c's identity elision stays SELF-only (the callee is not the
+running function). Five older tests whose shape was a chain of calling
+functions (the SWITCH protocol, pins across a switch, forced
+reconstruction, the segment boundary, the post-call entry stub) pin
+their tier with the `frameless` lever off.
+
+PINNED by `jit_frameless_mutual` (the E2 test's harness: pure cache off,
+cap 16, the test floor 24KB): values deep and warmed; the boundary
+decline; a throw at the bottom caught three times and then uncaught (the
+backtrace against the JIT-off VM); a threaded reference; and a partner
+that is not frameless-eligible - which refuses the OTHER body's pre-pass
+too, so the one G1 site emitted (into it) meets a NULL cell and declines
+on every call: the run-time placement's decline path, taken. JITSTATS
+row `frameless_mutual`. Watched: without the cell test, SIGSEGV at
+address 0; with the bounds on self sites only, every case reports 0
+boundary calls; without the wanted-clear, the tripwire above.
+
+Measured (callgrind Ir per scale unit, `OPT=1 ASSERTS=0`, `-npc`; wall =
+ONE interleaved `--baseline` run):
+
+    bench                 Ir per scale unit             wall
+    93_mutual_recursion   191,205,200 -> 121,379,200  -36.52%  0.79x (2.00x -> 1.59x C++)
+    10_recursion_deep                                  -0.10%
+    09 / 91 / 92 / 08 / 45 / 78 / 76 / 11           flat to the instruction
+
+What is left on 93, ~101 Ir per level against self-recursion's ~50: the
+identity chain (E2c elided it for a self call only - but a named,
+write-once, capture-free callee's slot can hold nothing but that
+function once its scope is entered, so the same argument covers ANY such
+callee, F1's leaves and main's sites included) and the vframe restore
+(E2e's lazy publish is per BODY, and both bodies here are lazy already -
+to be profiled).

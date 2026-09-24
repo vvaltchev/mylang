@@ -802,8 +802,11 @@ it can name is already placed (`bake_final`; a null
 argument, and it is the same kind:** Pass B jits every frameless
 LEAF body FIRST (a stable partition in `vm_jit_program` - a leaf
 names no callee, so it needs no placement of its own), so ANY caller
-may read a leaf callee's placement; a CALLING callee is still read
-only at its own self sites. **When you read a field at emit time,
+may read a leaf callee's placement. A CALLING callee has no such
+order (mutual recursion is a cycle), so #97 G1 does not read its
+placement at emit time at all: the site loads the callee's
+`Chunk::frameless_entry_abs` at RUN time and declines when it is
+null. **When you read a field at emit time,
 ask which PASS writes it and whether that pass has run for THIS
 object** - and if the answer varies, do not let it vary per run.
 
