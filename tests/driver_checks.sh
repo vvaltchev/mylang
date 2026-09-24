@@ -185,20 +185,20 @@ else
     fail "depth cap: uncaught overflow rc=$got_rc [$out]"
 fi
 
-# THE OVERFLOW DEPTH IS THE SAME IN EVERY ENGINE CONFIGURATION (RULE 2).
-# StackOverflowEx is decided by SEGMENT usage - a push that cannot get a
-# window from the budget throws - so the depth a runaway recursion
-# reaches is observable, and every call tier must charge the segment
-# exactly as the interpreter's push_window does. A tier that carved its
-# window anywhere else (the native stack - the frameless tier's shape)
-# would move that depth, and nothing else in the tree would notice: the
-# program still throws, still catches, still prints a number. The caps
-# straddle a SEG_SLOTS (16384) boundary, where the budget arithmetic
-# changes, and the shapes are the ones the call tiers treat differently:
-# plain self recursion, a leaf call per level, mutual recursion, a
-# closure call per level, and a leaf called from MAIN (the frameless
-# site's home). Untested until 2026-09-23, when the question "may a
-# frameless callee make calls?" turned on exactly this property.
+# EVERY ENGINE CONFIGURATION ENDS A RUNAWAY RECURSION IN A CATCHABLE
+# StackOverflowEx (RULE 2, as revised 2026-09-23). The DEPTH is
+# unspecified - how much memory an engine has is a property of the
+# environment, and a native tier that carves frames from the machine
+# stack may go deeper than the slot segment - so it is MASKED: the
+# program prints only whether it got well past a trivial depth. What
+# must match is everything else: that the overflow happened, that it was
+# caught, and all the output around it. The caps straddle a SEG_SLOTS
+# (16384) boundary, where the budget arithmetic changes, and the shapes
+# are the ones the call tiers treat differently: plain self recursion, a
+# leaf call per level, mutual recursion, a closure call per level, and a
+# leaf called from MAIN (the frameless site's home). Its first run, in
+# its earlier depth-exact form, found two real bugs in the depth-cap
+# SWITCH materializer (docs/jit-optimizations.md).
 cat > "$TMP/sodepth.my" <<'SODEOF'
 var depth = 0;
 func leaf(int x) { var a = x + 1; var b = a * 2; return b - a; }
@@ -218,15 +218,15 @@ func run(int which) {
         if (which == 1) print(withleaf(runtime(1)));
         if (which == 2) print(ev(runtime(1)));
         if (which == 3) print(viacl(runtime(1)));
-    } catch (StackOverflowEx) { print("overflow", which, "at", depth); }
+    } catch (StackOverflowEx) { print("overflow", which, depth > 500); }
 }
 for (var w = 0; w < 4; w++) { print(leaf(w)); run(w); }
 SODEOF
 sod_ok=1
 for cap in 3001 16384 16390 40000; do
     want=$(MYLANG_VM_STACK=$cap "$BIN" -nj "$TMP/sodepth.my" 2>&1)
-    if ! printf '%s\n' "$want" | grep -q '^overflow 3 at'; then
-        fail "overflow depth: -nj did not overflow every shape at cap $cap
+    if ! printf '%s\n' "$want" | grep -q '^overflow 3 true'; then
+        fail "overflow: -nj did not overflow every shape at cap $cap
       (the check would be vacuous) [$want]"
         sod_ok=0
         continue
@@ -239,7 +239,7 @@ for cap in 3001 16384 16390 40000; do
                "MYLANG_JIT_OFF=bakecallee" "MYLANG_NATIVE_STACK=0"; do
         got=$(env $cfg MYLANG_VM_STACK=$cap "$BIN" "$TMP/sodepth.my" 2>&1)
         if [ "$got" != "$want" ]; then
-            fail "overflow depth: cap $cap, [${cfg:-default}] differs from -nj:
+            fail "overflow: cap $cap, [${cfg:-default}] differs from -nj:
       want: $(printf '%s' "$want" | tr '\n' '|')
       got:  $(printf '%s' "$got" | tr '\n' '|')"
             sod_ok=0
@@ -247,7 +247,7 @@ for cap in 3001 16384 16390 40000; do
     done
 done
 [ $sod_ok = 1 ] &&
-    pass "overflow depth: identical in every engine configuration (4 caps)"
+    pass "overflow: a catchable StackOverflowEx in every engine configuration (4 caps)"
 
 # -v REPORTS THE ARENA, and MYLANG_NO_LOWMEM=1 refuses it. This is the
 # VACUITY GUARD for the no-arena CI lane: a lane that tests a

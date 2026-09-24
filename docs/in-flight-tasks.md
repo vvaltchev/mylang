@@ -573,41 +573,51 @@ work — but profile it before building, the way increment 0 was.
         throw crossing a frameless frame is exactly its shape space.
         ⛔ Its gate must be re-derived from 09_fib's NEW baseline
         (increment 0 made it 20.7% faster), not from the old -4.75% row.
-        ⛔ **ITS PREMISE DOES NOT HOLD AS WRITTEN (2026-09-23) - AWAITING
-        THE MAINTAINER'S CALL ON THE REVISED SHAPE BELOW.** A CALLING
-        frameless callee cannot keep its window on the NATIVE stack:
-        `StackOverflowEx` is raised by the SEGMENT budget, so an
-        uncharged window moves the depth a runaway recursion reaches -
-        observable, a RULE 2 divergence (pinned now: driver_checks'
-        overflow-depth case, which also found two real switch bugs on
-        its first run - record: *THE SWITCH MATERIALIZER* in the JIT
-        record). Reserving segment space while running on the native
-        stack costs the same fit/bump/give-back as a segment window and
-        then needs a window RELOCATION at every switch below the frame
-        (W3's uninitialised slots and self-registered slices cannot be
-        moved byte-wise). So a non-leaf callee's window stays on the
-        segment - i.e. it is a RECORD-LESS frame, which every walker,
-        the materializer and the raise path already handle.
-        **THE REVISED E2: a lean record-less site for a callee the
-        emitter can NAME at a non-main caller**, starting with the
-        SELF call. Profile (09_fib, scale 1, `jitprofile --listing`):
-        fib$0 costs 144 Ir per call - the site 74, the entry 8, the
-        return arm ~30 - and the site reads at RUN time facts that are
-        emit-time constants for a self call: the callee's entry offset
-        (the `sync_entry_off` test, the chunk load and the entry
-        computation - the SEVENTH audit-table shape keeps them runtime
-        today), the `norec_ok` fork and the record high-water gate it
-        needs, the captures relay and repoint (a capture-free callee
-        under W4's whitelist), the boxed four-qword argument copy (a
-        proven-int argument is a payload + an immediate tag, W2's
-        rule), and the push/pop shuffles around them. Estimated ~30 of
-        144 per call (~20% of fib's JIT Ir), no new frame kind, no
-        walker change. Micro-steps: (a) self-call entry as `call rel32`
-        to the fragment's own sync entry; (b) the fork and gate
-        resolved at emit time for a self call; (c) typed argument
-        store; (d) captures for a capture-free callee. Gate: 09_fib Ir
-        per scale unit vs today's, the nets above, norec_enum --depth
-        4.
+        **2026-09-23 - THE DESIGN, after the maintainer revised RULE 2**
+        (recursion depth is an unspecified property of the
+        environment, like speed; what must hold is that a runaway
+        recursion ends in a catchable StackOverflowEx). A calling
+        frameless callee's window stays on the NATIVE stack. What is
+        left hard is the depth-cap SWITCH (a deep sync call hands its
+        callee to the interpreter and returns -3 up the native chain,
+        which the materializer turns into records - impossible for a
+        window about to be unwound with the native stack). The rule
+        that makes it tractable: **A SWITCH NEVER PASSES THROUGH A
+        FRAMELESS FRAME.**
+         - D1 THE GATE: frameless_ok admits a body whose only MyLang
+           calls are SELF calls (v1: 09_fib's shape; other callees
+           later, they need placement facts the compile order hides).
+           A CachedCallV counts as a call only while the pure cache is
+           ON (with it off the probe is elided at emit time, #97
+           probe-E1). Builtin calls stay refused in v1.
+         - D2 THE SELF SITE: in a non-main caller, a self call is a
+           frameless site (window on the native stack, `call rel32`
+           to the fragment's own frameless entry). It keeps the sync
+           DEPTH GUARD.
+         - D3 AT THE CAP: the decline asks whether the CALLER is itself
+           frameless (the arm's discriminator, `lea rax,[rbp+32]; cmp
+           rax,rbx`). No -> today's slow tier, which may switch. Yes ->
+           a BOUNDARY call: the callee runs under a nested dispatch
+           loop that consumes every switch below it and returns the
+           value synchronously. Depth stays >= cap inside, so no
+           frameless frame exists there and no second boundary nests:
+           one extra C frame per chain. The frameless site ML_CHECKs it
+           never sees -3.
+         - D4 EXCEPTIONS convey natively level by level, as a leaf's do
+           today (the callee's pre_ret release, the site's postexit
+           stamping the callee frame) - generalised, not new.
+         - D5 THE WALKERS: the materializer never meets a frameless
+           frame (asserted); the release-mode reconstruction
+           (MYLANG_RECON_AT) learns bit 0 of [rbp+24].
+        Then the lean-site items below apply to the frameless self
+        site too (the entry offset, the captures, the typed argument).
+        GATE: 09_fib Ir per scale unit vs today; driver_checks'
+        overflow case; norec_enum --depth 4; every matrix.
+        The earlier revision, kept for its profile: the site reads at
+        RUN time facts that are emit-time constants for a self call -
+        the callee's entry offset, the `norec_ok` fork and its
+        high-water gate, the captures relay, the boxed four-qword
+        argument copy (fib$0: 144 Ir per call, the site 74).
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
 

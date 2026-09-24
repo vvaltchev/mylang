@@ -14103,12 +14103,13 @@ bug 2 alone (after fixing 1), `jit_ret_audit` at cap 40000 and under
 did a plain release build with the native stack on (cap 500000 - the
 switch never ran).
 
-**What it means for E2:** the overflow-depth property is now pinned,
-and it is the reason a CALLING frameless callee cannot keep its window
-on the native stack. Charging the segment anyway (reserve there, run
-on the native stack) costs the same fit/bump/give-back as simply
-putting the window on the segment, and then a SWITCH below the frame
-must relocate a window whose uninitialised W3 slots and self-registered
-slices cannot be moved byte-wise. So a non-leaf callee's window stays
-on the segment, and E2's saving has to come from the rest of the
-record-less site (see docs/in-flight-tasks.md §1.6).
+**What it means for E2 - and the rule it prompted.** The first form of
+this net required the overflow DEPTH to be identical in every engine,
+which would have forbidden a calling frameless callee (a native-stack
+window is not charged to the segment). The maintainer revised RULE 2
+the same day: recursion depth, like speed and memory, is an
+unspecified property of the environment, and what must hold is only
+that a runaway recursion ends in a catchable `StackOverflowEx`. The net
+now masks the depth and compares everything else - and still fails on
+both bugs above, since they were crashes. E2's design under the revised
+rule: docs/in-flight-tasks.md §1.6.
