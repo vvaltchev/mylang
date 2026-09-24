@@ -14245,6 +14245,26 @@ interleaved `--baseline` run each):
     10_recursion_deep   212,370,000 -> 162,540,000  -23.46%   1.00x
     08 / 45 / 11 / 78 / 76 / 03                     flat to the instruction
 
+**⛔ AND A BOUNDARY RETURN IS A C++ ENTRY TOO (2026-09-25, a shipped
+SEGV).** The list above was "every C++ CALL and every exception
+epilogue" - and missed the third way control reaches C++: the ReturnV's
+BOUNDARY arm, taken when a builtin runs the body as a callback
+(VmInvoker, the sync boundary, vm_dispatch). Its owner reads
+`act.view_frame` straight after it - VmInvoker binds the NEXT element's
+arguments into it, `pop_window` releases it - and a callback lambda
+that made a frameless call (F1: `filter(func(int x) => key(x) > 1, xs)`)
+left it naming the callee's window, already popped off the stack. An
+`OPT=1 ASSERTS=0` build SEGFAULTED on element 2; a TESTS build hit the
+poison window, which is how CI's lto0/spcheck/nolowmem lanes found it
+through #44's backtrace test. Invisible to every local lane: the
+asserting ones run `VM_HARDENING`, and the release corpus had no
+callback that calls a function. The arm publishes now (two stores per
+callback element, only in a lazy body). Pinned by
+`jit_frameless_nonmain`'s callback case and
+`tests/functional/28_callback_frameless_call.my`; watched failing
+without the publish (the poison aborts `-rt`; the release build
+segfaults on the functional program).
+
 What is left on 10 at the self site, by cycles: the callee identity
 chain (ctx -> globals -> slot -> FuncObject -> descriptor, ~18% - the
 old site paid it too, but at depth 900 it is no longer hidden), the
@@ -14361,3 +14381,84 @@ interleaved `--baseline` run):
     09_fib_recursive     47,484,066 -> 44,149,098    -7.02%   0.91x
     10_recursion_deep   142,335,000 -> 134,253,000   -5.68%   0.96x
     08 / 45 / 11 / 78 / 76 / 03                     flat to the instruction
+
+## #97 F1/F2 - A FUNCTION CALLS ANOTHER FUNCTION FRAMELESSLY (2026-09-24)
+
+**THE BENCHES CAME FIRST (maintainer's rule: zero bench reach means
+write the bench, not skip the work).** No bench exercised a call the
+frameless tier refused - 12_higher_order's `apply -> sq`, the one
+candidate, is inlined away - so two were written, with Python and C++
+twins (commit 55d8c52):
+ - **91_call_from_function**: a leaf helper called in a tight loop that
+   lives in a FUNCTION. 533 Ir per iteration against 106 for the same
+   loop at top level - the site took the #55 native-direct tier, a C++
+   setup call plus an indirect call, because only MAIN's calls could be
+   frameless.
+ - **92_recursion_with_helper**: a recursion that also calls a leaf at
+   every level. The E2 pre-pass admitted only self calls, so the whole
+   body was refused and both calls took the generic protocol - ~1,100
+   Ir per level.
+
+**F1 - ANY CALLER, A LEAF CALLEE.** What confined the frameless site to
+main was PLACEMENT: its entry is an immediate, a callee is placed only
+by its own JIT pass, and that pass's position among the bodies was a
+pointer-keyed map's (the seventh audit-table shape). `vm_jit_program`
+now jits every frameless LEAF body first - a stable partition, so the
+relative order within each half is unchanged - and a leaf names no
+callee, so it needs no placement of its own. Every leaf a site can name
+is therefore placed before any site is emitted, in every run (`-vdj`
+stays reproducible: vdjcmp 130/130). Three more pieces:
+ - the per-callee conditions of `jit_frameless_candidates` are ONE
+   function, `jit_frameless_callee_why`, and the #55 tier
+   (`callv_native_ok`) declines exactly where it answers yes - the two
+   tiers stay disjoint without a second copy of the rules;
+ - `jit_mark_frameless_wanted` scans every body, not just main;
+ - three older tier tests (`jit_callee_cache_hit`,
+   `jit_bind_widen_inline`, `jit_native_call`) used a function calling
+   a leaf as their shape, which is frameless now - each turns the
+   `frameless` lever off for its duration, since those tiers still serve
+   every callee that is not frameless-eligible.
+PINNED by `jit_frameless_nonmain`: values, a throw from the leaf on
+iteration 37 (caught, then uncaught - the backtrace compared against
+the JIT-off VM), and a reference argument's use count; every case
+requires `frameless_nonmain` (a JITSTATS row, emit-time) and frameless
+calls. Watched: with the leaves jitted LAST, every case reports 0
+non-main sites.
+
+**F2 - A CALLING FRAMELESS BODY MAY CALL A LEAF.** The E2 pre-pass
+admits a site whose callee is a LEAF as well as a self site: the
+invariant it protects - a switch never passes through a frameless frame
+- holds, because a leaf makes no call, so no switch can start below it;
+its window is bounded, so the floor's margin (native stack) or the cap
+(C stack) still ends a runaway recursion in StackOverflowEx. A body that
+calls ONLY leaves (91's `drive`) passes too but gets no frameless entry
+- only a self site can enter a calling body framelessly - and keeps the
+rest (the leaf sites' boundary declines, E2e's lazy vframe).
+**⛔ ONE REAL BUG, CAUGHT BY W3's POISON:** E2b made a call's dst a raw
+write in a calling frameless body, and covered it at SELF sites with
+bit 1 of the dst word, which the self arm tests. A LEAF's return arm has
+no bit-1 test (it serves main's sites too, where a test would be paid on
+every leaf call), so it read the old type word of a slot the site that
+built the frame had left uninitialised - an abort by name in a TESTS
+build, stack garbage read as a Type* in a release one. The leaf site in
+such a body now stores `none`'s type word into its dst first (one
+store). The `jit_frameless_calling` case that asserted a two-callee body
+is REFUSED used a const-specialized clone - itself a leaf, so F2 admits
+it; the case now calls a CALLING function, and a new case admits a
+recursion that also calls a leaf. Watched: with the pre-pass's leaf
+admission removed, the new case reports 0 self sites.
+
+Measured (callgrind Ir per scale unit, `OPT=1 ASSERTS=0`, `-npc`;
+wall = ONE interleaved `--baseline` run each):
+
+    bench                        before F1     after F1      after F2
+    91_call_from_function       533,000,000  106,000,000  104,000,000
+                                             -80.1%         -1.9%
+    92_recursion_with_helper    557,656,554  222,658,221  158,280,157
+                                             -60.1%        -28.9%
+    wall 91                                  0.43x         0.99x
+    wall 92                                  0.54x         0.86x
+    09 / 10 / 08 / 12 / 45 / 78 / 76 / 11      flat to the instruction
+
+Against C++ (the cached `-cl cpp` twins), 91 went from 2.69x to 1.13x and
+92 from 3.38x to 1.51x; against CPython 0.17x -> 0.07x and 0.22x -> 0.10x.

@@ -590,7 +590,13 @@ work — but profile it before building, the way increment 0 was.
         hot reach in bench/ (the one candidate, 12's apply -> sq, is
         inlined away; the rest are chain entries or cold outer calls) -
         it serves programs with helper functions called from functions,
-        which no bench measures. NEXT: a non-SELF callee
+        which no bench measures. ✅ **F1/F2 DONE 2026-09-24** (the
+        maintainer: write the bench first): benches 91/92 written, then a
+        function calls a LEAF framelessly (F1, 91 -80% Ir) and a calling
+        frameless body may call a leaf (F2, 92 -60% then -29%; record:
+        *#97 F1/F2*). STILL OPEN: a CALLING callee at a non-self site
+        (mutual recursion - its placement needs a cycle-aware order).
+        NEXT was: a non-SELF callee
         (needs the callee's placement facts at a non-main site - the
         seventh audit-table shape), builtin calls in a calling body.
         **2026-09-23 - THE DESIGN, after the maintainer revised RULE 2**

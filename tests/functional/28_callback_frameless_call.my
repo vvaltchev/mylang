@@ -1,0 +1,23 @@
+# A builtin CALLBACK whose lambda calls a named function: the lambda is a
+# calling frameless body (#97 F1/E2e), so its frame is published lazily,
+# and the builtin enters it as a BOUNDARY frame (VmInvoker) that reuses
+# the frame for every element. The boundary return must publish it, or
+# element 2 is bound into the callee's dead window - a SEGV in a release
+# build. Several elements per builtin; self-asserting.
+
+func key(int x) { if (x == 999) return 7; return x % 5; }
+func wt(int x, int y) { return x * 3 + y; }
+
+var xs = make_array(200, func(int i) => (i * 37) % 101);
+var f = filter(func(int x) => key(x) > 1, xs);
+var m = map(func(int x) => wt(x, 2) - key(x), xs);
+var s = sort(xs, func(int a, int b) =>
+             key(a) * 1000 + a < key(b) * 1000 + b);
+var g = make_array(50, func(int i) => wt(i, key(i)));
+
+assert(len(f) == 118);
+assert(sum(f) == 5969);
+assert(sum(m) == 30033);
+assert(s[0] == 0 && s[199] == 99);
+assert(sum(g) == 3775);
+print(len(f), sum(f), sum(m), s[0], s[199], sum(g));

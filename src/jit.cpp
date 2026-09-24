@@ -9004,6 +9004,66 @@ static bool callv_native_ok(const Instr &in, const JitCtx *jc);
  * false skips the tests that only hold once the callee is placed (the
  * pre-pass asks before any body is jitted).
  */
+/*
+ * #97 F1: THE CALLEE'S HALF of the frameless-site chain - every condition
+ * that is a property of the (callee, call op) pair, independent of which
+ * candidate list named it. jit_frameless_candidates asks it per candidate,
+ * and callv_native_ok asks it so the #55 native-direct tier yields to a
+ * frameless site instead of carrying a second copy of these rules.
+ */
+static const char *jit_frameless_callee_why(const FuncDescriptor *bake,
+                                            const Instr &in,
+                                            bool with_placement)
+{
+    const bool cached = in.op == OpCode::CachedCallV;
+    const Chunk *bake_ck = static_cast<const Chunk *>(bake->vm_chunk);
+    /*
+     * #97 E2: a SELF call - the callee IS the chunk being compiled.
+     * Its placement facts do not exist yet (the fragment is being
+     * emitted), but none is needed: the entry is a label in this
+     * very buffer (Emitter::call_local_fixed_frame), and the E2
+     * pre-pass has already decided the body is entered framelessly
+     * only if every call site in it is such a site
+     * (g_cur_self_fl). A CALLING callee is frameless at its own
+     * self sites and nowhere else.
+     *
+     * #97 F1: ANY caller may call a LEAF callee framelessly, not only
+     * main. What confined it to main was PLACEMENT - the entry is an
+     * immediate, and a callee is placed only by its own JIT pass, whose
+     * order among the bodies was a pointer-keyed map's. vm_jit_program
+     * now jits every frameless LEAF body first (a leaf names no callee,
+     * so it needs no placement of its own), so a leaf callee is placed
+     * before ANY body that can call it is emitted - in every run, which
+     * is what keeps -vdj reproducible.
+     */
+    const bool self =
+        g_cur_caller_desc != nullptr && bake == g_cur_caller_desc;
+    return
+        (bake_ck->frameless_calls && !self)
+              ? "a CALLING callee is frameless only at its own self "
+                "sites (E2 v1)"
+        : (!self && with_placement && bake_ck->native.base == nullptr)
+              ? "not bake_final (the callee is unplaced)"
+        : (!self && with_placement && bake_ck->sync_entry_off < 0)
+              ? "the callee does not start native"
+        : static_cast<int>(bake->params.size()) != in.b_lit()
+              ? "arity (omitted trailing opt args - the push does not bake)"
+        : !bake->fast_bind && bake->bind_req.size() != bake->params.size()
+              ? "bind_req not derived (the push does not bake)"
+        : !jit_norec_on() ? "the record-less arm is off"
+        : !bake_ck->frameless_ok ? "the callee is not frameless_ok"
+        : (self && !g_cur_self_fl)
+              ? "the E2 pre-pass refused this body"
+        : (!self && with_placement && bake_ck->frameless_entry_off < 0)
+              ? "no frameless entry emitted"
+        : jit_lever_off(JL_FRAMELESS) ? "lever off"
+        /* with the pure cache OFF a CachedCallV's probe is not
+         * emitted at all (#97 probe-E1) - it is a plain call */
+        : (cached && g_pure_cache_enabled)
+              ? "a cached call (the pure cache is on)"
+        : nullptr;
+}
+
 static int jit_frameless_candidates(const Chunk &ck, size_t old_pc,
                                     const Instr &in,
                                     const FuncDescriptor *out[2],
@@ -9011,7 +9071,6 @@ static int jit_frameless_candidates(const Chunk &ck, size_t old_pc,
                                     bool with_placement = true)
 {
     const bool is_value = in.op == OpCode::CallValueV;
-    const bool cached = in.op == OpCode::CachedCallV;
     const int callee_arg = static_cast<int>(in.target2);
     const char *why = nullptr;
     int n = 0;
@@ -9029,59 +9088,17 @@ static int jit_frameless_candidates(const Chunk &ck, size_t old_pc,
         if (n != k)
             n = 0;                       /* a pair with a chunk-less half */
     } else if (!is_value) {
+        /* F1: no longer deferred to the #55 native-direct tier - that
+         * tier now declines wherever this answers yes (callv_native_ok) */
         const FuncDescriptor *bake =
-            (in.op == OpCode::CallV && callv_native_ok(in, g_cur_jc))
-                ? nullptr    /* the native-direct tier, not a sync site */
-                : jit_baked_callee(ck, old_pc, callee_arg, is_value);
+            jit_baked_callee(ck, old_pc, callee_arg, is_value);
         if (bake)
             out[n++] = bake;
     }
     if (n == 0)
         why = "not baked";
-    for (int i = 0; i < n && !why; i++) {
-        const FuncDescriptor *bake = out[i];
-        const Chunk *bake_ck = static_cast<const Chunk *>(bake->vm_chunk);
-        /*
-         * #97 E2: a SELF call - the callee IS the chunk being compiled.
-         * Its placement facts do not exist yet (the fragment is being
-         * emitted), but none is needed: the entry is a label in this
-         * very buffer (Emitter::call_local_fixed_frame), and the E2
-         * pre-pass has already decided the body is entered framelessly
-         * only if every call site in it is such a site
-         * (g_cur_self_fl). A CALLING callee is frameless at its own
-         * self sites and nowhere else in v1 - main's leaf-style site
-         * does not switch to the native stack, and it is the only other
-         * caller that could name one.
-         */
-        const bool self =
-            g_cur_caller_desc != nullptr && bake == g_cur_caller_desc;
-        why =
-            (bake_ck->frameless_calls && !self)
-                  ? "a CALLING callee is frameless only at its own self "
-                    "sites (E2 v1)"
-            : (!self && g_cur_caller_desc)
-                  ? "not bake_final (the caller is not main)"
-            : (!self && with_placement && bake_ck->native.base == nullptr)
-                  ? "not bake_final (the callee is unplaced)"
-            : (!self && with_placement && bake_ck->sync_entry_off < 0)
-                  ? "the callee does not start native"
-            : static_cast<int>(bake->params.size()) != in.b_lit()
-                  ? "arity (omitted trailing opt args - the push does not bake)"
-            : !bake->fast_bind && bake->bind_req.size() != bake->params.size()
-                  ? "bind_req not derived (the push does not bake)"
-            : !jit_norec_on() ? "the record-less arm is off"
-            : !bake_ck->frameless_ok ? "the callee is not frameless_ok"
-            : (self && !g_cur_self_fl)
-                  ? "the E2 pre-pass refused this body"
-            : (!self && with_placement && bake_ck->frameless_entry_off < 0)
-                  ? "no frameless entry emitted"
-            : jit_lever_off(JL_FRAMELESS) ? "lever off"
-            /* with the pure cache OFF a CachedCallV's probe is not
-             * emitted at all (#97 probe-E1) - it is a plain call */
-            : (cached && g_pure_cache_enabled)
-                  ? "a cached call (the pure cache is on)"
-            : nullptr;
-    }
+    for (int i = 0; i < n && !why; i++)
+        why = jit_frameless_callee_why(out[i], in, with_placement);
     if (fl_why)
         *fl_why = why;
     return why ? 0 : n;
@@ -9721,13 +9738,14 @@ void jit_mark_frameless_wanted(const Chunk &main, const JitCtx *jc)
 {
     if (!jit_norec_on() || jit_lever_off(JL_FRAMELESS))
         return;
-    /* the predicate reads the baked-callee map through g_cur_jc and
-     * insists on main as the caller (g_cur_caller_desc null) - both as
-     * they will be when main's sites are emitted */
+    /* the predicate reads the baked-callee map through g_cur_jc and the
+     * caller through g_cur_caller_desc - set as they will be when this
+     * chunk's sites are emitted (F1: any body, not only main; a null
+     * jc->caller_desc IS main) */
     const JitCtx *saved_jc = g_cur_jc;
     const FuncDescriptor *saved_desc = g_cur_caller_desc;
     g_cur_jc = jc;
-    g_cur_caller_desc = nullptr;
+    g_cur_caller_desc = jc ? jc->caller_desc : nullptr;
     for (size_t pc = 0; pc < main.code.size(); pc++) {
         const Instr &in = main.code[pc];
         if (in.op != OpCode::CallV && in.op != OpCode::CallValueV)
@@ -11499,6 +11517,19 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             const int32_t dst_bits =
                 1 + ((fl_self && !jit_slot_ref_listed(ck, in.target)) ? 2
                                                                       : 0);
+            /* #97 F2: a LEAF site in a calling frameless body. E2b made a
+             * call's dst a raw write here, so the site that built THIS
+             * frame may have left it uninitialised (W3) - and the leaf's
+             * return arm, unlike a self arm, reads the OLD type word (it
+             * has no bit-1 test: it serves main's sites too, and a test
+             * there would be paid on every leaf call). One store makes
+             * the old value `none`. Watched: without it, the TESTS
+             * poison type aborts the E2 test's leaf case by name. */
+            if (!fl_self && g_cur_self_fl && in.target >= 0
+                    && !jit_slot_ref_listed(ck, in.target))
+                e.store_type_tag_via(
+                    in.target * static_cast<int32_t>(sizeof(LValue)) + 24,
+                    jit_layout().t_none, RCX);
             if (in.target >= 0)
                 e.lea_base(RCX, RBX,              /* reg:proto: dst|bits */
                            in.target * static_cast<int32_t>(sizeof(LValue))
@@ -11537,6 +11568,8 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
 #endif
             }
 #ifdef TESTS
+            if (!fl_self && g_cur_caller_desc)
+                g_jit_frameless_nonmain++;        /* F1: emit-time */
             g_jit_frameless_sites++;              /* emit-time */
             e.bump_counter(&g_jit_frameless_pushes);
             e.bump_counter(&g_jit_sync_inline);
@@ -12362,6 +12395,14 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         e.bump_counter(&g_jit_ret_inline);
         e.bump_counter(&g_jit_native_returns);
 #endif
+        /* E2e: a boundary return IS an entry into C++ - the owner reads
+         * act.view_frame straight after it (VmInvoker binds the next
+         * element into it, pop_window releases it) - so a lazy-vframe
+         * body publishes here like at any C++ call. Without it a
+         * callback that made a frameless call left the owner a DEAD
+         * window: the callee's, already popped off the stack (a SEGV in
+         * a release build; the poison window in a TESTS one). */
+        e.vframe_publish();
         e.mov_reg_imm32(RAX, 0xFFFFFFFEu);   /* mov rax, -2 */
         e.frag_ret(Emitter::RetFlush::flushed);
 
@@ -13730,6 +13771,7 @@ void jit_stats_report()
         { "frameless_self_id", &g_jit_frameless_self_id },
         { "frameless_self_floor", &g_jit_frameless_self_floor },
         { "vframe_publish",    &g_jit_vframe_publish },
+        { "frameless_nonmain", &g_jit_frameless_nonmain },
         { "frameless_boundary", &g_jit_frameless_boundary },
         { "borrow_inline",     &g_jit_borrow_inline },
         { "arg_stage",        &g_jit_arg_stage },
@@ -25847,7 +25889,17 @@ static bool callv_native_ok(const Instr &in, const JitCtx *jc)
     const FuncDescriptor *callee = (*jc->slot_desc)[slot];
     if (!callee || !callee->vm_chunk)
         return false;
-    return static_cast<const Chunk *>(callee->vm_chunk)->native_leaf;
+    if (!static_cast<const Chunk *>(callee->vm_chunk)->native_leaf)
+        return false;
+    /* #97 F1: a FRAMELESS site beats the #55 direct call (the frame is
+     * built on the native stack at the site, with no C++ setup call) -
+     * so this tier declines exactly where jit_frameless_candidates will
+     * take the call, and the two stay disjoint (the candidates bake the
+     * same write-once slot, which is why the bake lever is asked too) */
+    if (!jit_lever_off(JL_BAKECALLEE)
+            && jit_frameless_callee_why(callee, in, true) == nullptr)
+        return false;
+    return true;
 }
 
 /* An op that can be part of a native RUN: a plain eligible op, OR a CallV the
@@ -26056,7 +26108,7 @@ bool jit_chunk_frameless_ok(const Chunk &chunk)
              * #97 E2 (2026-09-23): a DIRECT MyLang call no longer
              * refuses the chunk here. Whether a calling body may be
              * entered framelessly depends on facts only the JIT has
-             * (every call site must be a frameless SELF site - the
+             * (every call site must be a frameless SELF or LEAF site - the
              * callee baked, the lever on, the pure cache off for a
              * CachedCallV), so the gate admits the op and the E2
              * pre-pass in jit_compile_chunk decides; a body it refuses
@@ -26934,7 +26986,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     g_cur_jc = jc;                       /* #97 step 4: the bake gate */
     /*
      * #97 E2: THE PRE-PASS - may this CALLING body be entered framelessly?
-     * Only if EVERY call site in it will itself be a frameless SELF site:
+     * Only if EVERY call site in it will itself be a frameless SELF site
+     * or (#97 F2) a frameless site to a LEAF, which calls nothing, so no
+     * switch can start below it:
      * a frame that can call is an ancestor, and an ancestor on the native
      * stack is sound only while a depth-cap SWITCH never passes through
      * it. A frameless site guarantees that (it never returns -3: at the
@@ -26949,17 +27003,29 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             && runs.size() == 1 && runs[0].begin == 0 && runs[0].end == n
             && jit_norec_on() && !jit_lever_off(JL_FRAMELESS)) {
         g_cur_self_fl = true;             /* assumed, then every site asked */
+        bool any_self = false;
         for (size_t pc = 0; pc < n && g_cur_self_fl; pc++) {
             const Instr &in = chunk.code[pc];
             if (in.op != OpCode::CallV && in.op != OpCode::CachedCallV)
                 continue;
+            /* #97 F2: or a frameless site to a LEAF - it makes no call,
+             * so no switch can start below it, and F1's ordering has it
+             * placed (asked with placement, like any other site) */
             const FuncDescriptor *c[2] = { nullptr, nullptr };
             if (jit_frameless_candidates(chunk, pc, in, c, nullptr) != 1
-                    || c[0] != g_cur_caller_desc)
+                    || (c[0] != g_cur_caller_desc
+                        && static_cast<const Chunk *>(c[0]->vm_chunk)
+                               ->frameless_calls))
                 g_cur_self_fl = false;
+            else if (c[0] == g_cur_caller_desc)
+                any_self = true;
         }
-        if (g_cur_self_fl)
-            chunk.frameless_wanted = true;    /* the entry + the arm */
+        /* the entry + the arm - only a SELF site can enter a calling body
+         * framelessly, so a body that calls only leaves (91's drive)
+         * gets none; it keeps the rest of the verdict (its leaf sites'
+         * declines, the lazy vframe) */
+        if (g_cur_self_fl && any_self)
+            chunk.frameless_wanted = true;
     }
     /* Emit the fragments. Per run: RSI = t_int once at entry (preserved
      * across the loop - no op clobbers it - so the native back edge, a
