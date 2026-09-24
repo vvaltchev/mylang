@@ -119,17 +119,22 @@ fi
 # throws a CATCHABLE StackOverflowEx where the old per-call C-stack model
 # SEGFAULTED. It can only be tested from here: the cap is read ONCE per
 # process into a static, so an in-process `-rt` entry cannot set it.
+# The recursion RUNS AWAY (it counts up from 1): how deep an engine gets
+# before the budget ends it is unspecified (RULE 2, revised 2026-09-23 -
+# a native tier may carve frames from the machine stack and go far
+# deeper than the slot budget), so a bounded one would be a statement
+# about memory, not about the exception.
 : > "$TMP/so.my"
 cat > "$TMP/so.my" <<'EOF'
 func down(int n) {
     if (n <= 0)
         return 0;
-    var r = down(n - 1);
+    var r = down(n + 1);
     return r + 1;
 }
 var caught = 0;
 try {
-    var d = down(runtime(100000));
+    var d = down(runtime(1));
     print("NO THROW", d);
 } catch (StackOverflowEx) {
     caught = 1;
@@ -172,10 +177,10 @@ cat > "$TMP/sou.my" <<'EOF'
 func down(int n) {
     if (n <= 0)
         return 0;
-    var r = down(n - 1);
+    var r = down(n + 1);
     return r + 1;
 }
-print("d:", down(runtime(100000)));
+print("d:", down(runtime(1)));
 EOF
 out=$(MYLANG_VM_STACK=4000 "$BIN" "$TMP/sou.my" 2>&1)
 got_rc=$?

@@ -1934,6 +1934,17 @@ struct Chunk {
      */
     bool frameless_ok = false;
     /*
+     * #97 E2: this frameless_ok body makes MyLang CALLS (CallV /
+     * CachedCallV - the only call ops the gate admits). Such a body is
+     * entered framelessly only when EVERY one of its call sites is itself
+     * a frameless SELF site (decided at its own compile, jit_compile_chunk's
+     * E2 pre-pass): a frame that can call is an ancestor, and the rule
+     * that keeps an ancestor on the native stack sound is that a
+     * depth-cap SWITCH never passes through it (docs/in-flight-tasks.md
+     * 1.6). Derived beside frameless_ok, never stored.
+     */
+    bool frameless_calls = false;
+    /*
      * #97 increment 3 (W3): bit `s` set = window slot `s` is written ONLY
      * by ops that store it raw (payload + type word, never through
      * LValue::put) and is not ref-listed, so a frameless SITE building

@@ -515,6 +515,13 @@ static bool jit_cold_forced(JitColdTier t)
 static char *&g_nstack_cur = *ml_lowmem_new<char *>(nullptr);
 static char *&g_nstack_top = *ml_lowmem_new<char *>(nullptr); /* the top (read from its CELL now, not baked as an imm - it is a 1GB mapping's high address
                                          * emitted site switches) */
+/* #97 E2: the lowest rsp a frameless SELF site may call from - the
+ * mapping's guard page plus a margin for everything a frame at the floor
+ * may still run (its window, a boundary call's dispatch frame and
+ * helpers). Null when there is no native stack: then every frame is on
+ * the C stack, bounded by the sync depth cap instead, and the unsigned
+ * compare against 0 never declines. */
+static char *&g_nstack_floor = *ml_lowmem_new<char *>(nullptr);
 static void *&g_nstack_saved_rsp = *ml_lowmem_new<void *>(nullptr);  /* the OUTERMOST emitted site's
                                              * C rsp (single-threaded; nested
                                              * sites are plain by cur==null) */
@@ -553,6 +560,7 @@ void jit_native_stack_init()
                  "the native stack's top is not 16-byte aligned - the "
                  "emitted switch would leave every call on it misaligned");
     g_nstack_cur = g_nstack_top;
+    g_nstack_floor = static_cast<char *>(m) + 4096 + (1u << 20);
     jit_set_sync_depth_cap(500000);
 #else
     /* SANITIZED build (the stack is pass-through): every sync level below
@@ -5019,6 +5027,24 @@ struct Emitter {
         u8(0xE8); u32(0);
         call_done();
     }
+    /*
+     * #97 E2: the THIRD spelling - a call to an offset IN THIS BUFFER
+     * that is not emitted yet (a self site's call to the fragment's own
+     * frameless entry, which is emitted after the body). Through the same
+     * seam; returns the rel32's position, which the caller patch32s once
+     * the target exists. Fixed-frame: the callee reads the window the
+     * site built at [rbp+32].
+     */
+    size_t call_local_fixed_frame()
+    {
+        sp_fixed_frame = true;
+        call_site();
+        u8(0xE8);
+        const size_t at = pos();
+        u32(0);
+        call_done();
+        return at;
+    }
     void call_reg(uint8_t r)                              /* call r64 */
     {
         call_site();
@@ -8595,6 +8621,13 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
 /* The descriptor keying the chunk being compiled - null for MAIN
  * (step 3b; #97 step 4's bake_final also reads it). */
 static const FuncDescriptor *g_cur_caller_desc = nullptr;
+/* #97 E2: the chunk being compiled is a CALLING frameless body whose
+ * every call site is a frameless SELF site - the E2 pre-pass's verdict
+ * (jit_compile_chunk), read by the site predicate for a self call. */
+static bool g_cur_self_fl = false;
+/* ...and the rel32 positions of its self sites' calls, patched to the
+ * frameless entry once it is emitted (after the body) */
+static std::vector<size_t> *g_cur_self_fl_calls = nullptr;
 
 /*
  * The program context this chunk is being compiled in - the global
@@ -8710,13 +8743,26 @@ static bool jit_slot_ref_listed(const Chunk &ck, int slot)
                               static_cast<int32_t>(slot));
 }
 
+/*
+ * ⛔ IT WRITES THE PAIR EVEN WHEN THIS SITE HAS NO INLINE CHAIN (-1 and a
+ * null pool) - 2026-09-23. It used to return early, leaving whatever the
+ * LAST writer stored, on the reasoning that every consumer claims (reads
+ * and resets) the pair. Not every one does: a slow tail whose helper
+ * takes the depth-cap SWITCH never reaches the core that claims it, so a
+ * site INSIDE inlined code left its pair behind, and the next core call
+ * from a chain-less site claimed it - the wrong inlined frames on a
+ * backtrace within one program, and a use-after-free across two (the
+ * pool is the earlier program's freed Chunk::inline_frames; ASan, in the
+ * #97 E2 test, whose boundary path makes switches routine). Every use is
+ * a COLD path (the slow tail, the exception exits), so writing
+ * unconditionally costs nothing measurable and makes the channel's value
+ * always THIS site's.
+ */
 static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
 {
     const int32_t chain = ck.inline_frame_at(old_pc);
-    if (chain < 0)
-        return;
     const uint64_t pool =
-        ck.inline_frames.empty()
+        (chain < 0 || ck.inline_frames.empty())
             ? 0
             : reinterpret_cast<uint64_t>(ck.inline_frames.data());
     AccScratch acc(e, AccScratch::reuse_t{});
@@ -8902,11 +8948,29 @@ static int jit_frameless_candidates(const Chunk &ck, size_t old_pc,
     for (int i = 0; i < n && !why; i++) {
         const FuncDescriptor *bake = out[i];
         const Chunk *bake_ck = static_cast<const Chunk *>(bake->vm_chunk);
+        /*
+         * #97 E2: a SELF call - the callee IS the chunk being compiled.
+         * Its placement facts do not exist yet (the fragment is being
+         * emitted), but none is needed: the entry is a label in this
+         * very buffer (Emitter::call_local_fixed_frame), and the E2
+         * pre-pass has already decided the body is entered framelessly
+         * only if every call site in it is such a site
+         * (g_cur_self_fl). A CALLING callee is frameless at its own
+         * self sites and nowhere else in v1 - main's leaf-style site
+         * does not switch to the native stack, and it is the only other
+         * caller that could name one.
+         */
+        const bool self =
+            g_cur_caller_desc != nullptr && bake == g_cur_caller_desc;
         why =
-            g_cur_caller_desc ? "not bake_final (the caller is not main)"
-            : (with_placement && bake_ck->native.base == nullptr)
+            (bake_ck->frameless_calls && !self)
+                  ? "a CALLING callee is frameless only at its own self "
+                    "sites (E2 v1)"
+            : (!self && g_cur_caller_desc)
+                  ? "not bake_final (the caller is not main)"
+            : (!self && with_placement && bake_ck->native.base == nullptr)
                   ? "not bake_final (the callee is unplaced)"
-            : (with_placement && bake_ck->sync_entry_off < 0)
+            : (!self && with_placement && bake_ck->sync_entry_off < 0)
                   ? "the callee does not start native"
             : static_cast<int>(bake->params.size()) != in.b_lit()
                   ? "arity (omitted trailing opt args - the push does not bake)"
@@ -8914,10 +8978,15 @@ static int jit_frameless_candidates(const Chunk &ck, size_t old_pc,
                   ? "bind_req not derived (the push does not bake)"
             : !jit_norec_on() ? "the record-less arm is off"
             : !bake_ck->frameless_ok ? "the callee is not frameless_ok"
-            : (with_placement && bake_ck->frameless_entry_off < 0)
+            : (self && !g_cur_self_fl)
+                  ? "the E2 pre-pass refused this body"
+            : (!self && with_placement && bake_ck->frameless_entry_off < 0)
                   ? "no frameless entry emitted"
             : jit_lever_off(JL_FRAMELESS) ? "lever off"
-            : cached ? "a cached call"
+            /* with the pure cache OFF a CachedCallV's probe is not
+             * emitted at all (#97 probe-E1) - it is a plain call */
+            : (cached && g_pure_cache_enabled)
+                  ? "a cached call (the pure cache is on)"
             : nullptr;
     }
     if (fl_why)
@@ -9004,6 +9073,22 @@ static bool jit_instr_stores_dst_raw(const Instr &in)
      * (#111); the boxed shape has a jit_load_capture arm */
     case OpCode::LoadCaptureV:
         return in.cap_scalar();
+    /*
+     * #97 E2b: a MyLang call's dst. This answer is consumed only where a
+     * frameless SITE builds a window for a body that CALLS - i.e. a
+     * frameless self site (no other site can enter such a body) - and
+     * every writer of the dst there is raw or initialises first: the
+     * frameless arm stores payload + type (told by bit 1 of the dst
+     * word that the old value is trivial - no load of it), the
+     * exception exit writes nothing, jit_ret_norec constructs in place
+     * under that bit, and a DECLINE (the slow tail, whose helper
+     * put()s the result) initialises the slot when its frame is the
+     * frameless one. A TESTS build poisons the skipped slot, so a
+     * writer this list forgot aborts by name.
+     */
+    case OpCode::CallV:
+    case OpCode::CachedCallV:
+        return true;
     default:
         return false;
     }
@@ -9070,6 +9155,11 @@ uint64_t jit_chunk_frameless_init_free(const Chunk &ck)
 void jit_chunk_frameless_derive(Chunk &ck)
 {
     ck.frameless_ok = jit_chunk_frameless_ok(ck);
+    ck.frameless_calls = false;
+    if (ck.frameless_ok)
+        for (const Instr &in : ck.code)
+            if (in.op == OpCode::CallV || in.op == OpCode::CachedCallV)
+                ck.frameless_calls = true;
     ck.frameless_init_free = jit_chunk_frameless_init_free(ck);
     ck.frameless_read_first = chunk_read_before_write(ck);
 }
@@ -11145,6 +11235,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         struct WinTramp { std::vector<size_t> j; int32_t win; };
         std::vector<WinTramp> tramps;             /* declines after a reserve */
         std::vector<size_t> j_next;               /* the failed compares */
+        std::vector<size_t> j_pre;                /* E2: a self site's bounds */
         for (int k = 0; k < ncand; k++) {
             const FuncDescriptor *fl_callee = cands[k];
             ML_CHECK(fl_callee && fl_callee->vm_chunk);
@@ -11159,6 +11250,48 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
 #ifdef TESTS
             e.bump_counter(&g_jit_bake_push);     /* the baked arm ran */
 #endif
+            /*
+             * #97 E2: a SELF site - the callee is this very body, which
+             * CALLS, so the frame being built is an ANCESTOR and three
+             * bounds a leaf never needed apply. Each declines BEFORE the
+             * window is reserved, to the slow tier - which, from a
+             * frameless caller, is a BOUNDARY call (below):
+             *  - off the native stack (it is ARMED: this chain started
+             *    from a C-stack fragment) - the slow tier's core enters
+             *    through jit_enter_deep, which switches, so the chain
+             *    continues framelessly THERE;
+             *  - at the sync DEPTH CAP, which is what bounds a chain on
+             *    the C stack when there is no native stack at all;
+             *  - below the native stack's FLOOR: a window may be 3KB and
+             *    the depth cap alone would let the chain walk off the
+             *    1GB mapping.
+             * Past any of them a runaway recursion reaches the flat
+             * interpreter, whose segment budget ends it in the catchable
+             * StackOverflowEx (RULE 2: the DEPTH is unspecified, the
+             * exception is not).
+             */
+            const bool fl_self = fl_callee == g_cur_caller_desc;
+            if (fl_self) {
+                if (!e.cmp_qword_abs32_imm8(&g_nstack_cur, 0)) {
+                    e.movabs(R11, reinterpret_cast<uint64_t>(&g_nstack_cur));
+                    e.cmp_qword_base_imm8(R11, 0);
+                }
+                j_pre.push_back(e.j32(0x75));     /* jne: armed */
+                if (!e.cmp_abs32_imm32(
+                        reinterpret_cast<const void *>(depth_addr),
+                        static_cast<uint32_t>(jit_sync_depth_cap()))) {
+                    e.movabs(R11, depth_addr);
+                    e.cmp_dword_base_imm32(
+                        R11, 0, static_cast<uint32_t>(jit_sync_depth_cap()));
+                }
+                j_pre.push_back(e.j32(0x7D));     /* jge: at the cap */
+                e.load_global(R11, &g_nstack_floor, R11);
+                e.cmp_rr(RSP, R11);               /* reg:proto */
+                j_pre.push_back(e.j32(0x72));     /* jb: below the floor */
+#ifdef TESTS
+                g_jit_frameless_self_sites++;     /* emit-time */
+#endif
+            }
             /* W1: the callee's window, on THIS stack, filled here (the
              * contract: Chunk::frameless_entry_off); dropped with the
              * residue on both return paths */
@@ -11172,10 +11305,18 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
              * ref-listed dst needs no gate: the arm tests the OLD value's
              * type at run time and declines a reference to
              * jit_ret_norec, which knows the bit. */
+            /* E2b: bit 1 = "the old dst value is TRIVIAL" - a self site
+             * whose dst is not ref-listed. The callee's arm then skips
+             * the old-type load chain, and the dst may be a window slot
+             * the site that built THIS frame left uninitialised (W3: a
+             * call's dst is a raw write in a calling frameless body) */
+            const int32_t dst_bits =
+                1 + ((fl_self && !jit_slot_ref_listed(ck, in.target)) ? 2
+                                                                      : 0);
             if (in.target >= 0)
-                e.lea_base(RCX, RBX,              /* reg:proto: dst|1 */
+                e.lea_base(RCX, RBX,              /* reg:proto: dst|bits */
                            in.target * static_cast<int32_t>(sizeof(LValue))
-                           + 1);
+                           + dst_bits);
             else
                 e.mov_reg_imm32(RCX, 1);          /* reg:proto: discarded */
             e.push_reg(RCX);                      /* push rcx (dst|1) */
@@ -11213,9 +11354,17 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             e.bump_counter(&g_jit_op_run[static_cast<size_t>(in.op)]);
 #endif
             /* the callee reads its WINDOW at [rbp+32], through the
-             * residue just pushed - nothing may come between */
-            e.call_fixed_frame(
-                static_cast<const void *>( static_cast<const char *>(fl_ck->native.base) + fl_ck->frameless_entry_off));
+             * residue just pushed - nothing may come between (the depth
+             * bump is register- and stack-neutral) */
+            if (fl_self) {
+                e.bump_counter32_live(
+                    reinterpret_cast<const void *>(depth_addr));
+                ML_CHECK(g_cur_self_fl_calls != nullptr);
+                g_cur_self_fl_calls->push_back(e.call_local_fixed_frame());
+            } else {
+                e.call_fixed_frame(
+                    static_cast<const void *>( static_cast<const char *>(fl_ck->native.base) + fl_ck->frameless_entry_off));
+            }
             if (ns) {
                 NorecSite *kns = ns;
                 if (k > 0) {
@@ -11227,6 +11376,13 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 kns->off_plain = e.last_call_ra;  /* G1: the hardware RA */
                 kns->off_switched = e.last_call_ra;   /* one call: both */
                 kns->frameless = true;
+            }
+            if (fl_self) {                        /* the level ended */
+                if (!e.dec_abs32(reinterpret_cast<const void *>(depth_addr),
+                                 true)) {
+                    e.movabs(RCX, depth_addr);
+                    e.dec_dword_base(RCX);
+                }
             }
             e.cmp_reg_imm(RAX, -1);
             const size_t j_fexc = e.j32(0x75);    /* jne: an exception */
@@ -11269,6 +11425,9 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             tramps.push_back(std::move(wt));
             /* next_k: the next candidate's compare, or the slow tier */
             e.patch32_here(j_next.back());
+            for (const size_t j : j_pre)          /* E2: the self bounds */
+                e.patch32_here(j);
+            j_pre.clear();
         }
         for (size_t j : j_done_fl)
             j_dones.push_back(j);                 /* patched at done: */
@@ -11552,6 +11711,41 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
         e.store_base0(RCX, RAX);
         e.movabs(RAX, reinterpret_cast<uint64_t>(&g_norec_switch_rbp));
         e.store_base0(RBP, RAX);
+    }
+    /*
+     * #97 E2: A SWITCH NEVER PASSES THROUGH A FRAMELESS FRAME. In a body
+     * that can be entered framelessly, a decline asks whether THIS frame
+     * is the frameless one - the return arm's own test, rbx == rbp+32 (a
+     * segment window is a heap address) - and if so tells the helper to
+     * run the callee as a BOUNDARY call: under a nested dispatch loop that
+     * consumes every switch below it, so this frame never receives -3
+     * and never needs the record the materializer could not give a
+     * native-stack window. rax is dead here (the relay above is done;
+     * the helper's arguments are set below).
+     */
+    if (g_cur_self_fl) {
+        e.lea_base(RAX, RBP, JIT_FRAMELESS_WIN_OFF);   /* reg:proto */
+        e.cmp_rr(RAX, RBX);                            /* reg:proto */
+        const size_t j_nf = e.j32(0x75);               /* jne: not ours */
+        const void *nosw = jit_addr_nosw();
+        if (!e.store_qword_abs32_imm32(nosw, 1)) {
+            e.movabs(RAX, reinterpret_cast<uint64_t>(nosw));  /* reg:proto */
+            e.store_qword_base_imm32(RAX, 0, 1);
+        }
+        /* E2b: the helper put()s the result into the dst, which reads
+         * the old value's type and tail - and in a frameless frame the
+         * site that built this window may have left the dst raw (W3). A
+         * valid `none` first, on this cold path only. */
+        if (in.target >= 0) {
+            const JitLayout &LL = jit_layout();
+            const int32_t d = in.target * static_cast<int32_t>(sizeof(LValue));
+            e.zero_reg32(RAX);                          /* reg:proto */
+            e.store_base(RAX, RBX, d + 32);             /* reg:proto */
+            e.store_base(RAX, RBX, d + 40);             /* reg:proto */
+            e.movabs(RAX, reinterpret_cast<uint64_t>(LL.t_none));
+            e.store_base(RAX, RBX, d + static_cast<int32_t>(LL.off_type));
+        }
+        e.patch32_here(j_nf);
     }
     /* #88: the slow tier reads the same side channel. Reached only from a
      * GUARD decline, i.e. before the callee runs, so nothing can have
@@ -12033,13 +12227,22 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                     j_nslow.push_back(e.j32(0x7D));    /* a reference */
                 }
                 ld(RDX, 5, 24);
-                e.op_reg_imm(Op::band, RDX, -2);           /* clear bit 0 */
+                e.op_reg_imm(Op::band, RDX, -4);       /* clear bits 0, 1 */
                 e.test_rr(RDX, RDX);
                 const size_t j_fnw = e.j32(0x74);      /* jz no_write */
+                /* E2b: a self site says the old dst is trivial (bit 1) -
+                 * no load chain; only a CALLING body has self sites */
+                size_t j_triv_old = 0;
+                if (ck.frameless_calls) {
+                    e.test_byte_base_imm8(RBP, 24, 2);
+                    j_triv_old = e.j32(0x75);          /* jnz: trivial */
+                }
                 ld(RAX, RDX, static_cast<int32_t>(L.off_type));
                 cmp_d_imm8(RAX, L.type_t_off,
                            static_cast<int8_t>(L.t_str_val));
                 j_nslow.push_back(e.j32(0x7D));        /* old dst: reference */
+                if (j_triv_old)
+                    e.patch32_here(j_triv_old);
                 if (res_slot >= 0) {
                     const int32_t s = static_cast<int32_t>(
                         static_cast<long>(res_slot)
@@ -13325,6 +13528,10 @@ void jit_stats_report()
         { "frameless_rets",    &g_jit_frameless_rets },
         { "frameless_init_free", &g_jit_frameless_init_free },
         { "frameless_capbase", &g_jit_frameless_capbase },
+        /* #97 E2: self sites EMITTED frameless, and the BOUNDARY calls a
+         * frameless frame's declines took (the cap / the floor) */
+        { "frameless_self_sites", &g_jit_frameless_self_sites },
+        { "frameless_boundary", &g_jit_frameless_boundary },
         { "borrow_inline",     &g_jit_borrow_inline },
         { "arg_stage",        &g_jit_arg_stage },
         { "sync_switch",      &g_jit_sync_switch },
@@ -25646,7 +25853,20 @@ bool jit_chunk_frameless_ok(const Chunk &chunk)
     else
         for (const Instr &in : chunk.code) {
             switch (in.op) {
+            /*
+             * #97 E2 (2026-09-23): a DIRECT MyLang call no longer
+             * refuses the chunk here. Whether a calling body may be
+             * entered framelessly depends on facts only the JIT has
+             * (every call site must be a frameless SELF site - the
+             * callee baked, the lever on, the pure cache off for a
+             * CachedCallV), so the gate admits the op and the E2
+             * pre-pass in jit_compile_chunk decides; a body it refuses
+             * gets no frameless entry, and no site can reach one
+             * without an entry. `frameless_calls` names the case.
+             * The value calls and the builtins stay refused.
+             */
             case OpCode::CallV: case OpCode::CachedCallV:
+                continue;
             case OpCode::CallValueV: case OpCode::CallValueGenericV:
             case OpCode::CallBuiltinV: case OpCode::CallBuiltinLV:
                 /*
@@ -26513,6 +26733,35 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     g_cur_norec_sites = &chunk.norec_sites;
     g_cur_caller_desc = jc ? jc->caller_desc : nullptr;   /* step 3b */
     g_cur_jc = jc;                       /* #97 step 4: the bake gate */
+    /*
+     * #97 E2: THE PRE-PASS - may this CALLING body be entered framelessly?
+     * Only if EVERY call site in it will itself be a frameless SELF site:
+     * a frame that can call is an ancestor, and an ancestor on the native
+     * stack is sound only while a depth-cap SWITCH never passes through
+     * it. A frameless site guarantees that (it never returns -3: at the
+     * cap its decline takes a BOUNDARY call when its caller is frameless,
+     * see jit_call_sync), a normal push does not - so one ordinary site
+     * in the body would put a switch-capable frame directly above a
+     * frameless one. Decided before any site is emitted, because the
+     * self sites' `call rel32` targets the entry this verdict creates.
+     */
+    g_cur_self_fl = false;
+    if (chunk.frameless_ok && chunk.frameless_calls && g_cur_caller_desc
+            && runs.size() == 1 && runs[0].begin == 0 && runs[0].end == n
+            && jit_norec_on() && !jit_lever_off(JL_FRAMELESS)) {
+        g_cur_self_fl = true;             /* assumed, then every site asked */
+        for (size_t pc = 0; pc < n && g_cur_self_fl; pc++) {
+            const Instr &in = chunk.code[pc];
+            if (in.op != OpCode::CallV && in.op != OpCode::CachedCallV)
+                continue;
+            const FuncDescriptor *c[2] = { nullptr, nullptr };
+            if (jit_frameless_candidates(chunk, pc, in, c, nullptr) != 1
+                    || c[0] != g_cur_caller_desc)
+                g_cur_self_fl = false;
+        }
+        if (g_cur_self_fl)
+            chunk.frameless_wanted = true;    /* the entry + the arm */
+    }
     /* Emit the fragments. Per run: RSI = t_int once at entry (preserved
      * across the loop - no op clobbers it - so the native back edge, a
      * jump to label[begin] AFTER this movabs, keeps it live); record each
@@ -26543,6 +26792,8 @@ retry_emission:
     Emitter e;
     std::vector<size_t> frag_off(runs.size());
     int64_t fe_off = -1;             /* #97 inc 2: the frameless entry */
+    std::vector<size_t> self_fl_calls;   /* #97 E2: -> fe_off, patched */
+    g_cur_self_fl_calls = &self_fl_calls;
     /* #162: the in-place-argument decision, refilled per fragment but
      * OWNED here so the file-statics the emit reads can never outlive
      * their storage (they are cleared with the others at the end). */
@@ -29153,6 +29404,10 @@ retry_emission:
             const int total = chunk.slot_count + chunk.n_temps;
             const uint8_t R8R = 8, R11 = 11;
             fe_off = static_cast<int64_t>(e.pos());
+            /* #97 E2: the body's self sites call HERE */
+            for (const size_t at : self_fl_calls)
+                e.patch32(at, static_cast<uint32_t>(
+                                  fe_off - static_cast<int64_t>(at + 4)));
             {
             /* the frame build is pin MACHINERY to the tracker: no pin
              * is live before establish() below loads it */
@@ -29420,7 +29675,12 @@ retry_emission:
     g_cur_arg_stage_pools = nullptr;
     g_cur_call_caches = nullptr;
     g_cur_norec_sites = nullptr;
+    /* every self site's call was patched - an entry-less body with a
+     * frameless self site would call offset 0 of nothing */
+    ML_CHECK(self_fl_calls.empty() || fe_off >= 0);
+    g_cur_self_fl_calls = nullptr;
     g_cur_caller_desc = nullptr;
+    g_cur_self_fl = false;
     g_cur_jc = nullptr;
 
     /* Trampoline pool (out-of-line, one per DISTINCT libm fn): the rare
@@ -29504,6 +29764,7 @@ uint64_t jit_chunk_frameless_init_free(const Chunk &)
 void jit_chunk_frameless_derive(Chunk &ck)
 {
     ck.frameless_ok = false;
+    ck.frameless_calls = false;
     ck.frameless_init_free = 0;
     ck.frameless_read_first = 0;
 }

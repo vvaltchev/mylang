@@ -14113,3 +14113,142 @@ that a runaway recursion ends in a catchable `StackOverflowEx`. The net
 now masks the depth and compares everything else - and still fails on
 both bugs above, since they were crashes. E2's design under the revised
 rule: docs/in-flight-tasks.md §1.6.
+
+## #97 E2 - A CALLING FRAMELESS CALLEE: a self-recursive body enters
+## itself framelessly, and a switch never passes through it (2026-09-23)
+
+**THE PRECONDITION WAS A RULE CHANGE.** A frameless window lives on the
+native stack and is not charged to the slot segment, so a recursion made
+of them overflows at a different depth than `-nj`. RULE 2 said that was
+observable and forbidden; the maintainer revised it (CLAUDE.md, RULE 2):
+recursion depth, like speed and memory, is an unspecified property of
+the environment - what must hold is that a runaway recursion ends in a
+catchable `StackOverflowEx`. `driver_checks.sh`'s *overflow* case now
+compares everything but the depth.
+
+**WHAT WAS STILL HARD: THE DEPTH-CAP SWITCH.** Past the sync depth cap a
+call is handed to the interpreter and `-3` unwinds every native frame
+down to the nearest C++ one, the materializer turning each into a
+record. A frameless window cannot become a record - it is the stack
+being unwound. So the tier rests on one invariant, asserted where it
+would break (`norec_switch_retarget`: *a SWITCH is materializing a
+FRAMELESS frame*): **a switch never passes through a frameless frame.**
+Four pieces make it true:
+
+ - **D1 THE GATE** admits `CallV` / `CachedCallV` (`frameless_calls`);
+   builtins and value calls stay refused.
+ - **THE E2 PRE-PASS** (`jit_compile_chunk`, before any site is
+   emitted): a calling body gets a frameless entry only if EVERY call
+   site in it is a frameless SELF site. One ordinary push in the body
+   would put a switch-capable frame directly above a frameless one. The
+   verdict creates the entry the self sites `call rel32` into (a third
+   spelling in the call seam, `Emitter::call_local_fixed_frame`, patched
+   when the entry is emitted after the body). A calling callee is
+   frameless ONLY at its own self sites - main's leaf-style site does not
+   switch to the native stack.
+ - **D2 THE SELF SITE** keeps three bounds a leaf never needed, each
+   declining before the window is reserved: off the native stack (it is
+   ARMED - the chain started on the C stack; the core's jit_enter_deep
+   switches, so the chain continues there), at the sync DEPTH CAP (what
+   bounds a chain with no native stack at all - a sanitized build), and
+   below the native stack's FLOOR (`g_nstack_floor`, 1MB above the
+   guard page: a window can be 3KB, and the cap alone would walk off the
+   1GB mapping). It counts its depth like a sync site.
+ - **D3 THE BOUNDARY DECLINE.** In a body that can be entered
+   framelessly, the slow tail asks whether THIS frame is the frameless one
+   (`rbx == rbp+32`, the arm's own test) and if so sets a relay
+   (`jit_addr_nosw`) that turns the helper's call into
+   `jit_call_sync_boundary`: the callee runs under a nested dispatch loop
+   (the core's `via_dispatch` path), which consumes every switch below
+   it. The depth is held at the cap inside, so no frameless frame forms
+   there and no second boundary nests: one extra C frame per chain.
+
+Exceptions need nothing new: each level conveys as a leaf's always did
+(the callee's pre_ret release, the site's postexit stamping the callee
+frame), and the backtraces render byte-identically to the JIT-off VM.
+
+**A PRE-EXISTING BUG THE BOUNDARY EXPOSED: the call-site side channel
+went stale.** `emit_bake_call_site` stored the site's inlined-at pair
+only when the site HAD one, relying on every consumer to claim (read and
+reset) it. A slow tail whose helper takes the SWITCH never reaches the
+claiming core, so a site inside inlined code left its pair behind and the
+next core call from a chain-less site claimed it: the wrong inlined
+frames on a backtrace within one program, a use-after-free across two
+(ASan, in the E2 test - the pool was the previous program's freed
+`inline_frames`). The writer now always writes (`-1`/null for a
+chain-less site); every use is a cold path.
+
+**REACH, AND WHAT THE DEBUG LANE SEES.** 09_fib: all 8 of `fib$0`'s
+sites, 555,828 of 555,832 calls. In a build with the native stack off
+(sanitized; cap 32) a plain `CallV` self recursion is not run-eligible
+(`op_run_eligible`'s cap rule), so there the tier reaches `CachedCallV`
+bodies only, with the pure cache off. `jit_frameless_calling` (-rt)
+therefore sets both in-process - the cache off, the cap lowered to 16 -
+so every build runs the tier AND its boundary decline.
+
+**TESTS.** `jit_frameless_calling`: values cold and warmed; a throw deep
+in the chain caught three times then uncaught (backtrace compared); a
+reference argument threaded through every level (its use count must not
+GROW between three and nine recursions - an argument temp legitimately
+holds it after the last call); and a body that also calls ANOTHER
+function (a const-specialized clone), which the pre-pass must refuse.
+Each case requires reach (self sites, frameless calls, boundary calls)
+or, for the refusal, their absence. `jit_frameless_gate` gained the
+admitting case. **Watched failing:** the decline relay removed -> the
+materializer's tripwire aborts by name; the pre-pass's self-only rule
+removed -> *the E2 pre-pass admitted it (2 self sites, 45 frameless
+calls)*.
+
+**FOUND ON THE WAY, NOT E2 (task #38):** for an unrolled throwing
+recursion (`u(n-1) + u(n % 2 - 5)` with `throw` at `n == 0`) the VM
+renders one frame fewer than the tree-walker - with the JIT off too. The
+E2 test compares against the JIT-off VM for that reason.
+
+**THE WALL CLOCK DISAGREED WITH THE INSTRUCTION COUNT, AND A NEW
+INSTRUMENT SAID WHY.** As first built, E2 read -18.7% Ir on 09_fib and
+-20.9% on 10_recursion_deep - and 10 ran **1.09-1.13x SLOWER** (09
+0.94x). A same-binary A/B (`MYLANG_JIT_OFF=frameless`) matched the
+baseline to the cycle, so it was the tier: +14% cycles on -21%
+instructions, IPC 2.9 -> 2.0, `exe_activity.bound_on_loads` doubled.
+`jitprofile` counts INSTRUCTIONS and could not see it; `perf record`
+with a `/tmp/perf-<pid>.map` built from `MYLANG_JIT_MAP` (one symbol per
+emitted instruction) attributes CYCLES to JIT code, and named two
+costs: the self site's per-call WINDOW INIT (a segment window is
+initialised once and reused; a frameless window is rebuilt every call -
+`mov [r10+0xe8], r11` alone 6% of cycles) and the return arm's load
+chain testing the OLD dst's type (`[rbp+0x18]` -> `[rdx+0x18]` ->
+`[rax+8]`, ~12%).
+
+**E2b - A CALL'S DST IS RAW IN A CALLING FRAMELESS BODY.** The init that
+dominated was the call-result temps', which W3 could not skip because a
+call's dst was not a raw write. It is one now, in the only place that
+asks (a frameless SELF site's fill): `jit_instr_stores_dst_raw` admits
+CallV/CachedCallV, and every writer of such a dst is raw or initialises
+first - the self site sets BIT 1 of its dst word ("the old value is
+trivial": the dst is not ref-listed), so the frameless arm skips the old
+type chain and stores payload + type; `jit_ret_norec` constructs in
+place under the bit; a DECLINE from a frameless frame (the slow tail,
+whose helper `put()`s the result) stores a valid `none` first, on that
+cold path only; the exception exit writes nothing. The ref-listed
+exclusion in `jit_chunk_frameless_init_free` is now LOAD-BEARING for the
+two call ops (a call whose result may be a reference has its dst
+listed), which `jit_raw_whitelist_is_scalar` states instead of hiding.
+**Watched failing:** the slow tail's init removed -> *POISON HIT
+(dtor)* in `jit_frameless_calling`, by name.
+
+**MEASURED** (callgrind Ir per scale unit, scale-3 minus scale-1,
+`OPT=1 ASSERTS=0`, `-npc`, baseline = the commit before E2; wall = ONE
+interleaved `--baseline` run each):
+
+    bench                Ir per scale unit            wall
+    09_fib_recursive     80,277,906 -> 55,821,486   -30.46%   0.68x
+    10_recursion_deep   212,370,000 -> 162,540,000  -23.46%   1.00x
+    08 / 45 / 11 / 78 / 76 / 03                     flat to the instruction
+
+What is left on 10 at the self site, by cycles: the callee identity
+chain (ctx -> globals -> slot -> FuncObject -> descriptor, ~18% - the
+old site paid it too, but at depth 900 it is no longer hidden), the
+vframe stores, the depth counter's store-forwarding chain (~4%, measured
+by removing it). For a SELF call the callee is the running function, so
+the identity compare's soundness argument is different from a named
+call's - a candidate increment, not done.

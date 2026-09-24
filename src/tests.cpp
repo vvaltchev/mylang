@@ -19742,6 +19742,8 @@ static bool jit_frameless_gate()
         "func drive(int reps) {",
         "  var s = 0;",
         "  for (var i = 0; i < reps; i++) s = s + usesblt(i);",
+        "  print(s);",               /* E2: a builtin keeps the DRIVER
+                                      * out of the count */
         "  return s;",
         "}",
         "print(drive(runtime(20)));" }), false);
@@ -19760,9 +19762,195 @@ static bool jit_frameless_gate()
         "func drive(int n) {",
         "  var s = 0;",
         "  for (var i = 0; i < n; i++) s = s + guarded(i);",
+        "  print(s);",               /* E2: see above */
         "  return s;",
         "}",
         "print(drive(runtime(20)));" }), false);
+    /*
+     * #97 E2: ADMITS a body whose only calls are MyLang calls - the
+     * self-recursion `rec` is the one qualifying chunk (main calls a
+     * builtin). Whether it is ENTERED framelessly is the JIT's E2
+     * pre-pass (every call site must be a frameless self site); the
+     * gate only stops refusing it. Watched failing with CallV back in
+     * the "not a leaf" group.
+     */
+    want("a body whose only calls are MyLang calls (E2)", probe({
+        "func rec(int n) { if (n <= 0) return 0; return rec(n - 1) + 1; }",
+        "print(rec(runtime(20)));" }), true);
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 E2: A CALLING FRAMELESS CALLEE - a self-recursive body entered
+ * framelessly at its own self sites, its window on the native stack, a
+ * frame that is now an ANCESTOR. What must hold, each checked against
+ * the VM with the JIT off (stdout AND the rendered backtrace):
+ *  - the values, cold and WARMED (a frameless site has no high-water
+ *    gate, so every call is the emitted one);
+ *  - the DECLINE at the depth cap: from a frameless caller it is a
+ *    BOUNDARY call (a nested dispatch that consumes the switches below
+ *    it), and a switch never materializes a frameless frame (an
+ *    ML_CHECK in norec_switch_retarget - the cap is lowered here so
+ *    every build takes the path, not only a sanitized one);
+ *  - an exception thrown deep in the chain, caught (warmed, three times)
+ *    and uncaught (the backtrace is built level by level as it conveys
+ *    through the frameless ancestors);
+ *  - a REFERENCE argument threaded through every level: its use count
+ *    is unchanged after the recursion (a leaked retain in a frameless
+ *    exit is invisible to every value check).
+ * The pure cache is OFF for the duration: a CachedCallV is a plain call
+ * then (its probe is not emitted), which is the one way the debug build,
+ * whose native stack is off, reaches the tier at all - a plain CallV
+ * self-recursion is not run-eligible there (op_run_eligible's cap rule).
+ */
+static bool jit_frameless_calling()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled || !jit_norec_on())
+        return true;
+    struct Restore {
+        bool pc; int cap;
+        ~Restore() {
+            g_pure_cache_enabled = pc;
+            jit_set_sync_depth_cap(cap);
+        }
+    } restore{ g_pure_cache_enabled, jit_sync_depth_cap() };
+    g_pure_cache_enabled = false;
+    jit_set_sync_depth_cap(16);       /* baked at emission: set it first */
+
+    /* `jit` false = the VM with the JIT OFF: the reference. Not the
+     * tree-walker - for this unrolled throwing recursion the VM already
+     * renders one frame fewer than it, with no JIT at all (task #38), and
+     * this test is about what E2 changes, not about that */
+    const auto run = [&](const std::vector<const char *> &lines,
+                         bool jit) -> std::string {
+        const ExecEngine eng = ExecEngine::Vm;
+        const bool jit_was = g_jit_enabled;
+        g_jit_enabled = jit;
+        std::string src;
+        for (const char *l : lines) { src += l; src += "\n"; }
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = eng;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        std::string tail;
+        /* OUTSIDE the try: the unwind would free the tree-walker's
+         * descriptors before the catch renders the backtrace from them */
+        unique_ptr<Construct> root;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (const Exception &e) {
+            tail = std::string("EXC ") + e.name + "\n" + format_backtrace(e);
+        }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        g_jit_enabled = jit_was;
+        return cap.str() + tail;
+    };
+    bool ok = true;
+    const auto same = [&](const char *what,
+                          const std::vector<const char *> &lines,
+                          const char *must, bool expect_tier = true) {
+        const unsigned long s0 = g_jit_frameless_self_sites;
+        const unsigned long p0 = g_jit_frameless_pushes;
+        const unsigned long b0 = g_jit_frameless_boundary;
+        const std::string tw = run(lines, false);   /* the reference */
+        const std::string vm = run(lines, true);
+        const unsigned long ds = g_jit_frameless_self_sites - s0;
+        const unsigned long dp = g_jit_frameless_pushes - p0;
+        const unsigned long db = g_jit_frameless_boundary - b0;
+        if (tw != vm || tw.find(must) == std::string::npos) {
+            fprintf(stderr, "jit_frameless_calling: %s differs\n  nj: "
+                    "%s\n  vm: %s\n", what, tw.c_str(), vm.c_str());
+            ok = false;
+        }
+        /* reach: the tier must have RUN, and so must its decline - or
+         * the case proves nothing about either */
+        if (!expect_tier) {
+            /* a REFUSED body: no self site may be emitted frameless */
+            if (ds || dp) {
+                fprintf(stderr, "jit_frameless_calling: %s - the E2 "
+                        "pre-pass admitted it (%lu self sites, %lu "
+                        "frameless calls)\n", what, ds, dp);
+                ok = false;
+            }
+            return;
+        }
+        if (!ds || dp < 30 || !db) {
+            fprintf(stderr, "jit_frameless_calling: %s VACUOUS - %lu self "
+                    "sites emitted, %lu frameless calls, %lu boundary "
+                    "calls\n", what, ds, dp, db);
+            ok = false;
+        }
+    };
+    /* two self calls per level (a CachedCallV), linear depth: t(n) = n+1.
+     * ⛔ `int(runtime(..))`, not `runtime(..)`: a `dyn` argument makes
+     * the recursion a SECOND template instance t(dyn), and the int one
+     * then only ever serves the base case - watched: 4 self sites
+     * emitted, 0 frameless calls. */
+    same("values, deep and warmed", {
+        "func t(n) { if (n <= 0) return 1; return t(n - 1) + t(-1); }",
+        "var s = 0;",
+        "for (var k = 0; k < 3; k++) s = s + t(int(runtime(200 + k)));",
+        "print(s);" }, "606");
+    same("a throw deep in the chain: caught (warmed), then uncaught", {
+        "struct Boom { int at; }",
+        /* ⛔ `u(n % 2 - 5)`, not `u(-1)`: a CONST argument is
+         * specialized into a separate clone, the body then calls ANOTHER
+         * function, and v1 admits self calls only; and no builtin in the
+         * body (`runtime` there is a call the gate refuses) */
+        "func u(int n) {",
+        "  if (n == 0) throw Boom(n + 7);",
+        "  if (n < 0) return 1;",
+        "  return u(n - 1) + u(n % 2 - 5);",
+        "}",
+        "for (var k = 0; k < 3; k++) {",
+        "  try { print(u(int(runtime(60)))); }",
+        "  catch (Boom as b) { print(\"boom\", b.at); }",
+        "}",
+        "print(u(int(runtime(40))));" }, "EXC");
+    same("a reference argument threaded through every level", {
+        /* typed parameters: the untyped template's unrolled body lists
+         * more reference slots than the frameless bound */
+        "func r(int n, array<int> a) {",
+        "  if (n <= 0) return a[0];",
+        "  return r(n - 1, a) + r(n % 2 - 5, a);",
+        "}",
+        /* the COUNT is not the check - an argument temp may still hold
+         * the array after the last call; what must not grow is the count
+         * between two points three and nine recursions in */
+        "var arr = [5, 6];",
+        "var s = 0;",
+        "for (var k = 0; k < 3; k++) s = s + r(int(runtime(80)), arr);",
+        "var rc1 = refcount(arr);",
+        "for (var k = 0; k < 6; k++) s = s + r(int(runtime(80)), arr);",
+        "print(s, refcount(arr) == rc1);" }, "true");
+    /* REFUSED: the body also calls ANOTHER function - `v(-1)` is const-
+     * specialized into its own clone. A normal push from a frameless
+     * frame could switch THROUGH it; the pre-pass must refuse the whole
+     * body. Watched: with the refusal removed, norec_switch_retarget's
+     * tripwire aborts on this case (the cap is 16, the recursion 60). */
+    same("a body that also calls another function is refused", {
+        "struct Boom { int at; }",
+        "func v(int n) {",
+        "  if (n == 0) throw Boom(n + 7);",
+        "  if (n < 0) return 1;",
+        "  return v(n - 1) + v(-1);",
+        "}",
+        "for (var k = 0; k < 3; k++) {",
+        "  try { print(v(int(runtime(60)))); }",
+        "  catch (Boom as b) { print(\"boom\", b.at); }",
+        "}" }, "boom 7", /*expect_tier=*/false);
     return ok;
 #else
     return true;
@@ -29520,7 +29708,7 @@ static bool jit_frameless_w2_shape()
             ok = arm != std::string::npos
                  && native_expect(cl, arm, {
                         "mov rdx, [rbp+0x18]",
-                        "and rdx, -2",
+                        "and rdx, -4",   /* bits 0 and 1 (E2b) */
                         "test rdx, rdx",
                         "je +*",
                         "mov rax, [rdx+0x18]",
@@ -30081,6 +30269,15 @@ static bool jit_raw_whitelist_is_scalar()
         in.op = o;
         if (o == OpCode::LoadCaptureV)
             continue;                    /* per-instruction: cap_scalar */
+        /* #97 E2b: a MyLang call's dst is RAW in a calling frameless body
+         * and CAN hold a reference - so for these two the ref-listed
+         * exclusion in jit_chunk_frameless_init_free is LOAD-BEARING,
+         * not redundant: a call whose result may be a reference has its
+         * dst listed (compute_ref_slots) and keeps its init. Stated here
+         * rather than hidden, so the subset claim stays true of every
+         * other row. */
+        if (o == OpCode::CallV || o == OpCode::CachedCallV)
+            continue;
         if (!jit_test_instr_stores_dst_raw(in))
             continue;
         admitted++;
@@ -43817,6 +44014,9 @@ static const std::vector<extra_check> extra_checks =
       "fail-closed", jit_capture_fwd },
     { "jit: the FRAMELESS gate admits a scalar leaf and rejects a caller "
       "/ a try region (#97, inert)", jit_frameless_gate },
+    { "jit: #97 E2 - a CALLING frameless callee (self sites): values, the "
+      "boundary decline at the cap, a throw through frameless ancestors, "
+      "a threaded reference", jit_frameless_calling },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",
       jit_bind_widen_inline },
     { "jit: a reference argument binds IN PLACE, and the declines (#162)",
