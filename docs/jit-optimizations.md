@@ -14532,3 +14532,59 @@ function once its scope is entered, so the same argument covers ANY such
 callee, F1's leaves and main's sites included) and the vframe restore
 (E2e's lazy publish is per BODY, and both bodies here are lazy already -
 to be profiled).
+
+## #97 G2 - NO IDENTITY CHAIN FOR ANY NAMED, WRITE-ONCE, CAPTURE-FREE CALLEE (2026-09-24)
+
+E2c skipped the five-load identity chain (ctx -> gfuncs -> slots ->
+FuncObject -> descriptor) and its compare at a SELF site. Its argument
+never needed the callee to be the running function:
+ - the baked constants (window, binds, entry) are true of the slot's ONE
+   declaration, because a write-once slot holds nothing else;
+ - the slot cannot be `none` when the site runs: a `slot_desc` entry is
+   always a NAMED declaration (a lambda's descriptor has no name, so
+   neither the compile map nor the loader's by-name map lists one), a
+   named declaration binds at SCOPE ENTRY (#134), and a site names it
+   only from inside that scope - entered before any of its code ran.
+So `jit_self_site_is_running` now holds for any such callee, main's
+sites, F1's leaves and G1's partners included. What a non-self site
+still owes the callee is `ctx.captures`: the caller's are installed, so
+it points it at a static EMPTY set (`jit_empty_captures`, one constant
+store) - which is what the callee's own capture-free FuncObject holds.
+**It does NOT read the callee's `frameless_capbase`** (E2c did): the
+entry loads from rdx only when it CLAIMED a capture base, which needs a
+capture op, which a capture-free body has none of - and that flag is
+written by the callee's own JIT pass, which a G1 callee may not have
+run yet, so reading it would make the emission order-dependent (the
+seventh audit-table shape; it was also why most leaves failed the
+predicate - W4 sets the flag on any body with no capture reader).
+**AND THE SLOW TAIL CAN NOW BE DEAD.** A baked leaf with no compare, no
+bounds and no fill decline leaves nothing jumping to the decline path;
+the site now emits neither the materialisation nor the shared slow tail
+(`slow_dead`) - found by *the CALL SEAM is total*, which reported a call
+on a blind stack model the moment the compare went.
+PINNED: `jit_frameless_nonmain` requires every leaf site to skip the
+chain (JITSTATS `frameless_fixed`) and adds a FORCE=bakecallee case that
+reassigns the leaf's slot between two calls of its caller; W4's shape
+test now reads the factory's repoint as the empty-set store, told from
+W4's own poison store by the G2 counter. Watched: with the write-once
+test removed, both FORCE cases (E2c's self, G2's leaf) print the old
+function's answer.
+
+Measured (callgrind Ir per scale unit, `OPT=1 ASSERTS=0`, `-npc`, baseline
+G1; wall = ONE interleaved `--baseline` run):
+
+    bench                        Ir          wall
+    93_mutual_recursion        -8.93%       0.97x
+    91_call_from_function      -6.73%       0.99x
+    92_recursion_with_helper   -4.45%       1.04x
+    63_closures                -2.04%
+    45_gcd                     -1.81%
+    08 / 78 / 09 / 10 / 76 / 11 / 12 / 03   flat
+
+⛔ **THE GUARD-ELISION SIGNATURE, AGAIN: -4% to -9% Ir, WALL FLAT.** The
+chain is five well-predicted L1-hitting loads and a compare OFF the
+critical path - they retired nearly free beside the call's real work,
+exactly as C4d/C4e/C5 did. G2 stays (it is sound, it shrinks every such
+site, and it found the dead slow tail), but this line is NOT to be
+pushed further on Ir evidence: E2c's 0.95x on 09 came from the SELF
+case's depth at 900 levels, not from the chain in general.
