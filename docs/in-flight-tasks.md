@@ -583,7 +583,14 @@ work — but profile it before building, the way increment 0 was.
         record: *E2c* in the JIT record). ✅ **E2d DONE 2026-09-24**:
         on the native stack a self site keeps no depth count - the floor
         bounds it, and a boundary blocks the floor (09 -4.5% Ir, 10
-        -3.6%). NEXT: a non-SELF callee
+        -3.6%). ✅ **E2e DONE 2026-09-24**: the vframe is published
+        lazily in a calling frameless body - before its C++ calls only
+        (09 -7.0% Ir, 10 -5.7%). ⛔ MEASURED BEFORE BUILDING: the next
+        listed item, a non-SELF callee from a non-main caller, has ZERO
+        hot reach in bench/ (the one candidate, 12's apply -> sq, is
+        inlined away; the rest are chain entries or cold outer calls) -
+        it serves programs with helper functions called from functions,
+        which no bench measures. NEXT: a non-SELF callee
         (needs the callee's placement facts at a non-main site - the
         seventh audit-table shape), builtin calls in a calling body.
         **2026-09-23 - THE DESIGN, after the maintainer revised RULE 2**

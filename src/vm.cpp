@@ -3507,6 +3507,7 @@ unsigned long g_jit_frameless_sites = 0;   /* #97 inc 2: sites EMITTED
 unsigned long g_jit_frameless_self_sites = 0; /* #97 E2: emit-time */
 unsigned long g_jit_frameless_self_id = 0;    /* #97 E2c: emit-time */
 unsigned long g_jit_frameless_self_floor = 0; /* #97 E2d: emit-time */
+unsigned long g_jit_vframe_publish = 0;      /* #97 E2e: emit-time */
 unsigned long g_jit_frameless_boundary = 0;   /* #97 E2: run-time */
 unsigned long g_jit_frameless_pushes = 0;  /* #97 inc 2: frameless CALLS
                                             * (emitted code) */
@@ -4253,6 +4254,17 @@ const void *jit_poison_captures()
         g_jit_poison_caps = cs;
     }
     return g_jit_poison_caps;
+}
+
+/* #97 E2e's net: the WINDOW a TESTS build leaves in act.view_frame where
+ * the lazy scheme leaves a stale one (after a self call returns, at a
+ * frameless entry) - the poison captures' slots, so a C++ reader that
+ * ran without a publish aborts by name on its first lifecycle op */
+const void *jit_poison_window()
+{
+    const CaptureSlots &cs =
+        *static_cast<const CaptureSlots *>(jit_poison_captures());
+    return &cs[0];
 }
 #endif
 

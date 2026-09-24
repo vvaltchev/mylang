@@ -19872,6 +19872,7 @@ static bool jit_frameless_calling()
         const unsigned long b0 = g_jit_frameless_boundary;
         const unsigned long i0 = g_jit_frameless_self_id;
         const unsigned long f0 = g_jit_frameless_self_floor;
+        const unsigned long v0 = g_jit_vframe_publish;
         const std::string tw = run(lines, false);   /* the reference */
         const std::string vm = run(lines, true);
         const unsigned long ds = g_jit_frameless_self_sites - s0;
@@ -19879,6 +19880,14 @@ static bool jit_frameless_calling()
         const unsigned long db = g_jit_frameless_boundary - b0;
         const unsigned long di = g_jit_frameless_self_id - i0;
         const unsigned long df = g_jit_frameless_self_floor - f0;
+        /* E2e: a calling body publishes its vframe at its C++ calls (its
+         * slow tails at least) - none means the lazy mode never engaged,
+         * and the poison below the self calls tested nothing */
+        if (ds && g_jit_vframe_publish == v0) {
+            fprintf(stderr, "jit_frameless_calling: %s - %lu self sites but "
+                    "no vframe publish emitted\n", what, ds);
+            ok = false;
+        }
         /* E2d: every self site takes its build's bound */
         if (df != (armed ? ds : 0)) {
             fprintf(stderr, "jit_frameless_calling: %s - %lu of %lu self "

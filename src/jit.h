@@ -650,6 +650,8 @@ extern unsigned long g_jit_frameless_sites;     /* inc 2 (emit-time): the
                                                  * tail */
 extern unsigned long g_jit_frameless_pushes;    /* inc 2 (emitted code) */
 extern unsigned long g_jit_frameless_self_sites; /* E2: self sites EMITTED */
+extern unsigned long g_jit_vframe_publish;     /* E2e: vframe
+                                                * publishes EMITTED */
 extern unsigned long g_jit_frameless_self_floor; /* E2d: self sites
                                                 * bounded by the floor alone
                                                 * (emit-time) */
@@ -675,6 +677,8 @@ const void *jit_poison_type();
 /* W4 (TESTS): the CaptureSlots a W4 site installs as ctx.captures - 64
  * slots whose type word is jit_poison_type; see vm.cpp */
 const void *jit_poison_captures();
+/* #97 E2e: a window of poison slots (the lazy vframe's stale state) */
+const void *jit_poison_window();
 #endif
 extern unsigned long g_jit_frameless_capbase;   /* W4 (emit-time): sites
                                                  * that skip the repoint */

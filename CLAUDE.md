@@ -1038,6 +1038,12 @@ and a new emitter must obey all four:
    reconstructed from `call_relocs.size()`. The seam ALIGNS the call
    if the model says it must, so a site that spills an ODD number of
    registers no longer pads.
+   **#97 E2e adds a second duty to the seam:** in a calling
+   frameless body the vframe is published LAZILY, by `call_direct`
+   (unless fixed-frame) and `call_rax` - so a C++ helper there must
+   be reached through one of those two, never a bare `call_reg`,
+   or it runs with a stale `ctx->frame` (a TESTS build's poison
+   window then aborts it by name).
  - **EVERY emission that moves rsp goes through a seam that calls
    `Emitter::sp_move`** - push/pop, `push_base0`/`push_base`/
    `push_abs32`, `op_reg_imm` on RSP, `push_rbp`/`pop_rbp`,

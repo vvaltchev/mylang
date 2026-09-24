@@ -3602,6 +3602,54 @@ struct Emitter {
      * misaligned, the site emits a MISALIGNED CALL rather than a moved
      * window - the lesser wrong, and the one MYLANG_JIT_SPCHECK names.
      */
+    /*
+     * #97 E2e: THE LAZY VFRAME. `act.view_frame` is where C++ finds the
+     * running frame (ctx->frame points at it), and every frame kept it
+     * current EAGERLY: a frameless entry wrote {window, size}, and the
+     * site wrote the caller's back after every call - four stores and two
+     * loads per call, the hottest stores left on a self-recursive chain
+     * (~7% wall on 09/10, measured by deleting them). No EMITTED code in
+     * a calling frameless body reads it (the return arms only write it),
+     * so in such a body it is PUBLISHED instead: immediately before every
+     * C++ call (call_direct unless fixed-frame, call_rax) and at every
+     * exception epilogue - so each C++ entry sees exactly what the eager
+     * scheme showed it, and between them the cell may name a window that
+     * is already gone. rbx is the frame's window throughout a body; the
+     * one C++ call that runs before rbx is set, frag_entry's TESTS probe,
+     * is emitted with the mode suspended. r11 is the scratch: caller-
+     * saved, so no pin lives in it at a call, and no call ABI passes in
+     * it. `lazy_vframe_total` < 0 = the mode is off (every other body).
+     */
+    int32_t lazy_vframe_total = -1;
+    int32_t lazy_vframe_slots_off = 0, lazy_vframe_size_off = 0;
+    void vframe_publish()
+    {
+        if (lazy_vframe_total < 0)
+            return;
+        PinMach pm(*this);              /* machinery: no pin is written */
+        load_global(11, jit_layout().addr_act, 11);
+        store_base(3 /* rbx */, 11, lazy_vframe_slots_off);
+        store_dword_base_imm32(11, lazy_vframe_size_off,
+                               static_cast<uint32_t>(lazy_vframe_total));
+#ifdef TESTS
+        g_jit_vframe_publish++;          /* emit-time */
+#endif
+    }
+    /* TESTS: where the eager scheme stored, store a POISON window (size 0,
+     * slots whose type word is jit_poison_type) - a C++ reader reached
+     * without a publish then fails by name. rcx and r11 scratch. */
+    void vframe_poison()
+    {
+#ifdef TESTS
+        if (lazy_vframe_total < 0)
+            return;
+        PinMach pm(*this);
+        movabs(11, reinterpret_cast<uint64_t>(jit_poison_window()));
+        load_global(1 /* rcx */, jit_layout().addr_act, 1);
+        store_base(11, 1, lazy_vframe_slots_off);
+        store_dword_base_imm32(1, lazy_vframe_size_off, 0);
+#endif
+    }
     bool sp_fixed_frame = false;
     void call_fixed_frame(const void *fn)
     { sp_fixed_frame = true; call_direct(fn); }
@@ -3841,6 +3889,12 @@ struct Emitter {
          * AFTER the prologue, so the TESTS probe below - a C++ call,
          * which clobbers rdx - must save it. */
         PinMach pm(*this);
+        /* E2e: rbx is not the window yet - no publish from here */
+        struct LazyOff {
+            int32_t &t, saved;
+            ~LazyOff() { t = saved; }
+        } lazy_off{ lazy_vframe_total, lazy_vframe_total };
+        lazy_vframe_total = -1;
         /* a fragment is reached by its own `call`, whatever precedes it
          * in the buffer: the model restarts here (see sp_enter) */
         sp_enter();
@@ -4304,6 +4358,8 @@ struct Emitter {
                 cache.swap(sc); fcache.swap(sf); tflush.swap(st_);
                 scache.swap(ss);
             }
+            vframe_publish();          /* E2e: an exit to C++ (after the
+                                        * flush - a pin may be in r11) */
             if (pre_ret)
                 pre_ret();
             relay_store();
@@ -4496,7 +4552,8 @@ struct Emitter {
         u8(0x24);
         u8(static_cast<uint8_t>(disp));
     }
-    void call_rax() { call_reg(0 /* rax: the Reg enum is
+    void call_rax() { vframe_publish();  /* always a C++ helper */
+                      call_reg(0 /* rax: the Reg enum is
                                 * declared below the class */); }
     /* lea reg, [rbx + disp32]  (an EvalValue-ptr / LValue-ptr helper arg;
      * rm = rbx = slots base). reg is a raw GP number (the Reg enum is
@@ -5055,6 +5112,9 @@ struct Emitter {
      */
     void call_direct(const void *fn)
     {
+        if (!sp_fixed_frame)            /* a fixed-frame callee is a
+                                         * fragment, never C++ */
+            vframe_publish();
         call_site();
         call_relocs.push_back({ pos(), fn });
         u8(0xE8); u32(0);
@@ -11518,7 +11578,11 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             e.cmp_reg_imm(RAX, -1);
             const size_t j_fexc = e.j32(0x75);    /* jne: an exception */
             e.op_reg_imm(Op::plus, RSP, 16 + fl_win);  /* residue + window */
-            vframe_restore();
+            if (e.lazy_vframe_total < 0)          /* E2e: lazy - no */
+                vframe_restore();                 /* restore; the next C++
+                                                   * call publishes */
+            else
+                e.vframe_poison();                /* TESTS only */
             j_done_fl.push_back(e.j32(0xEB));     /* jmp done */
             /* an exception conveyed out of the frameless callee: park
              * the pushed captures in the relay (the postexit restores
@@ -13665,6 +13729,7 @@ void jit_stats_report()
         { "frameless_self_sites", &g_jit_frameless_self_sites },
         { "frameless_self_id", &g_jit_frameless_self_id },
         { "frameless_self_floor", &g_jit_frameless_self_floor },
+        { "vframe_publish",    &g_jit_vframe_publish },
         { "frameless_boundary", &g_jit_frameless_boundary },
         { "borrow_inline",     &g_jit_borrow_inline },
         { "arg_stage",        &g_jit_arg_stage },
@@ -26924,6 +26989,14 @@ retry_emission:
      * and reconstructs fresh - the same total-discard semantics the
      * emit_ok=false give-up path has always had. */
     Emitter e;
+    if (g_cur_self_fl) {            /* E2e: the lazy vframe (Emitter) */
+        e.lazy_vframe_total =
+            static_cast<int32_t>(chunk.slot_count + chunk.n_temps);
+        e.lazy_vframe_slots_off = static_cast<int32_t>(
+            jit_push_layout().act_vframe + jit_push_layout().frame_slots);
+        e.lazy_vframe_size_off = static_cast<int32_t>(
+            jit_push_layout().act_vframe + jit_push_layout().frame_size);
+    }
     std::vector<size_t> frag_off(runs.size());
     int64_t fe_off = -1;             /* #97 inc 2: the frameless entry */
     std::vector<size_t> self_fl_calls;   /* #97 E2: -> fe_off, patched */
@@ -29552,12 +29625,19 @@ retry_emission:
             e.lea_base(RBX, RBP, JIT_FRAMELESS_WIN_OFF);
             /* act.vframe = this window (helpers read the frame there);
              * r8 = act is the push protocol's own register for it */
-            e.load_global(R8R, L.addr_act, R11);            /* reg:proto */
-            e.store_base(RBX, R8R,                          /* reg:proto */
-                         static_cast<int32_t>(P.act_vframe + P.frame_slots));
-            e.store_dword_base_imm32(R8R,                   /* reg:proto */
-                static_cast<int32_t>(P.act_vframe + P.frame_size),
-                static_cast<uint32_t>(total));
+            /* E2e: a calling body's vframe is published at its C++
+             * calls instead (Emitter::vframe_publish) */
+            if (e.lazy_vframe_total < 0) {
+                e.load_global(R8R, L.addr_act, R11);        /* reg:proto */
+                e.store_base(RBX, R8R,                      /* reg:proto */
+                             static_cast<int32_t>(P.act_vframe
+                                                  + P.frame_slots));
+                e.store_dword_base_imm32(R8R,               /* reg:proto */
+                    static_cast<int32_t>(P.act_vframe + P.frame_size),
+                    static_cast<uint32_t>(total));
+            } else {
+                e.vframe_poison();                /* TESTS only */
+            }
             }                                    /* end of the machinery */
             establish(begin, /*frameless=*/true);
             entry_proofs();
