@@ -1,0 +1,23 @@
+# mutual recursion: two functions that call each other (depth ~600), each
+# doing a little work per level
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+func ev(int n, int acc) {
+    if (n <= 0)
+        return acc;
+    return od(n - 1, (acc * 3 + n) % 1000003);
+}
+
+func od(int n, int acc) {
+    if (n <= 0)
+        return acc + 1;
+    return ev(n - 1, (acc + n * 7) % 1000003);
+}
+
+var K = 2000 * scale;
+var s = 0;
+for (var k = 0; k < K; k++)
+    s = (s + ev(600 + k % 5, k)) % 1000000007;
+print("result:", s);
