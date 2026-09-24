@@ -1,0 +1,23 @@
+# call overhead from a FUNCTION: a small helper called in a tight loop that
+# lives in a function (drive), not at the top level (08 is the top-level twin)
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+func mix(int a, int b) {
+    var x = a * 31 + b;
+    x = x ^ (x >> 7);
+    x = x * 5 + 3;
+    if (x < 0)
+        x = 0 - x;
+    return x % 1000003;
+}
+
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++)
+        s = (s + mix(i, s)) % 1000000007;
+    return s;
+}
+
+print("result:", drive(1000000 * scale));
