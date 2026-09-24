@@ -3506,6 +3506,7 @@ unsigned long g_jit_frameless_sites = 0;   /* #97 inc 2: sites EMITTED
                                             * net reads it) */
 unsigned long g_jit_frameless_self_sites = 0; /* #97 E2: emit-time */
 unsigned long g_jit_frameless_self_id = 0;    /* #97 E2c: emit-time */
+unsigned long g_jit_frameless_self_floor = 0; /* #97 E2d: emit-time */
 unsigned long g_jit_frameless_boundary = 0;   /* #97 E2: run-time */
 unsigned long g_jit_frameless_pushes = 0;  /* #97 inc 2: frameless CALLS
                                             * (emitted code) */
@@ -9049,14 +9050,31 @@ static int jit_call_sync_boundary(FuncObject &fo, int_type argbase,
 #ifdef TESTS
     g_jit_frameless_boundary++;
 #endif
+    /* D3's invariant, stated where it would break: nothing below a
+     * boundary is frameless, so nothing below it can ask for another */
+#ifndef NDEBUG
+    static bool active = false;
+    ML_CHECK_MSG(!active, "a BOUNDARY call nested - a frameless frame "
+                          "formed inside one");
+    active = true;
+#endif
     const int saved = g_jit_sync_depth;
     if (g_jit_sync_depth < g_jit_sync_cap)
         g_jit_sync_depth = g_jit_sync_cap;
+    /* E2d: on the native stack a self site does not count depth - its
+     * bound is the floor, so the floor is what must say "decline" here
+     * (the highest address: rsp is always below it) */
+    char *const floor =
+        jit_nstack_floor_swap(reinterpret_cast<char *>(UINTPTR_MAX));
     const int r = jit_call_sync_core(fo, argbase, nargs, dst, site_packed,
                                      cached, resume_pc,
                                      /*entry_rbp=*/nullptr,
                                      /*via_dispatch=*/true);
+    jit_nstack_floor_swap(floor);
     g_jit_sync_depth = saved;
+#ifndef NDEBUG
+    active = false;
+#endif
     ML_CHECK_MSG(r != 3, "a boundary call propagated a SWITCH");
     return r;
 }

@@ -232,6 +232,13 @@ int jit_sync_depth_cap();
 void jit_set_sync_depth_cap(int cap);   /* M5a: raised when the native
                                          * stack arms; tests pin it low */
 void jit_native_stack_init();
+/* #97 E2d: set the native stack's self-site floor, returning the old one
+ * (a boundary call blocks it; null/unarmed builds ignore it) */
+char *jit_nstack_floor_swap(char *floor);
+#ifdef TESTS
+bool jit_test_nstack_armed();
+void jit_test_nstack_floor(size_t bytes_below_top);
+#endif
 
 /* M5b - the FULLY-INLINE record push: every offset/size the emitted push
  * needs, probed from REAL objects in vm.cpp (the TU that owns
@@ -643,6 +650,9 @@ extern unsigned long g_jit_frameless_sites;     /* inc 2 (emit-time): the
                                                  * tail */
 extern unsigned long g_jit_frameless_pushes;    /* inc 2 (emitted code) */
 extern unsigned long g_jit_frameless_self_sites; /* E2: self sites EMITTED */
+extern unsigned long g_jit_frameless_self_floor; /* E2d: self sites
+                                                * bounded by the floor alone
+                                                * (emit-time) */
 extern unsigned long g_jit_frameless_self_id;  /* E2c: self sites whose
                                                 * callee identity chain
                                                 * was elided (emit-time) */

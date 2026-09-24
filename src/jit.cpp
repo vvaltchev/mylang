@@ -522,18 +522,45 @@ static char *&g_nstack_top = *ml_lowmem_new<char *>(nullptr); /* the top (read f
  * the C stack, bounded by the sync depth cap instead, and the unsigned
  * compare against 0 never declines. */
 static char *&g_nstack_floor = *ml_lowmem_new<char *>(nullptr);
+/* E2d: the floor the mapping gives (g_nstack_floor is moved by a
+ * boundary call and, in a TESTS build, by jit_test_nstack_floor) */
+static char *g_nstack_floor_default = nullptr;
+/* E2d: armed == a self site bounds its chain by the floor alone */
+static bool jit_nstack_armed()
+{
+    return g_nstack_top != nullptr;
+}
+/* E2d: a BOUNDARY call holds the floor at "every self site declines" for
+ * its duration, which is what keeps a frameless frame from forming
+ * inside it on the native stack (the depth cap does it off it) */
+char *jit_nstack_floor_swap(char *floor)
+{
+    char *const old = g_nstack_floor;
+    g_nstack_floor = floor;
+    return old;
+}
+#ifdef TESTS
+/* E2d: a test's floor `bytes` below the top (0 = the mapping's), so a
+ * self chain meets it at a depth a test can run; no-op when unarmed */
+bool jit_test_nstack_armed() { return jit_nstack_armed(); }
+void jit_test_nstack_floor(size_t bytes)
+{
+    if (jit_nstack_armed())
+        g_nstack_floor =
+            bytes ? g_nstack_top - bytes : g_nstack_floor_default;
+}
+#endif
 static void *&g_nstack_saved_rsp = *ml_lowmem_new<void *>(nullptr);  /* the OUTERMOST emitted site's
                                              * C rsp (single-threaded; nested
                                              * sites are plain by cur==null) */
 
-/* M5a: PAUSE the native stack for a builtin->callback ELEMENT LOOP
- * (VmInvoker): the per-fragment-entry stack switch measured ~1% on the
- * map/filter/sort benches, and a per-element callee never needs the deep
- * stack. Paused entries run plainly on the C stack; correctness of the
- * baked 500k guard is restored by the AUTHORITATIVE runtime cap check in
- * jit_sync_push_common + jit_call_sync* (the cap is lowered to the
- * C-stack-safe 200 for the pause's duration - VmInvoker's ctor/dtor
- * bracket the whole loop, ONE flip per loop). */
+/* M5a: arm the dedicated native stack. A fragment entered from C++ (a
+ * builtin's callback, the top level) runs on the C stack with the stack
+ * armed but INACTIVE (g_nstack_cur = its top); the first sync call that
+ * nests switches onto it (the emitted site, or jit_enter_deep for the
+ * helper path), and everything below runs there with g_nstack_cur null.
+ * (A per-callback-loop PAUSE this comment used to describe no longer
+ * exists.) */
 void jit_native_stack_init()
 {
     static bool done = false;
@@ -561,6 +588,7 @@ void jit_native_stack_init()
                  "emitted switch would leave every call on it misaligned");
     g_nstack_cur = g_nstack_top;
     g_nstack_floor = static_cast<char *>(m) + 4096 + (1u << 20);
+    g_nstack_floor_default = g_nstack_floor;
     jit_set_sync_depth_cap(500000);
 #else
     /* SANITIZED build (the stack is pass-through): every sync level below
@@ -576,6 +604,11 @@ void jit_native_stack_init()
 }
 #else
 void jit_native_stack_init() { }
+char *jit_nstack_floor_swap(char *) { return nullptr; }
+#ifdef TESTS
+bool jit_test_nstack_armed() { return false; }
+void jit_test_nstack_floor(size_t) { }
+#endif
 #endif
 
 #if defined(__clang__)
@@ -11336,22 +11369,51 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
              */
             const bool fl_self = fl_callee == g_cur_caller_desc;
             if (fl_self) {
-                if (!e.cmp_qword_abs32_imm8(&g_nstack_cur, 0)) {
-                    e.movabs(R11, reinterpret_cast<uint64_t>(&g_nstack_cur));
-                    e.cmp_qword_base_imm8(R11, 0);
+                /*
+                 * E2d: WHICH BOUND, decided at EMIT time - the native
+                 * stack is armed (or not) before any chunk compiles.
+                 *  - ARMED: the frame is on the native stack exactly when
+                 *    g_nstack_cur is null (a C-stack entry sees the armed,
+                 *    inactive top and declines to the core, which
+                 *    switches), and there the FLOOR bounds the chain. The
+                 *    depth counter is NOT kept: it was one load-modify-
+                 *    store per level on each side of the call, a store-
+                 *    forwarding chain through every level of the
+                 *    recursion, bounding nothing the floor does not. Its
+                 *    other job - no frameless frame inside a BOUNDARY
+                 *    call - moved to the floor too: the boundary sets it
+                 *    to "everything declines" for its duration
+                 *    (jit_nstack_floor_swap).
+                 *  - NOT ARMED (a sanitized build, MYLANG_NATIVE_STACK=0,
+                 *    a failed mmap): every frame is on the C stack, the
+                 *    floor is null and g_nstack_cur always null, so the
+                 *    DEPTH CAP is the only bound - counted here, and held
+                 *    at the cap by the boundary.
+                 */
+                if (jit_nstack_armed()) {
+                    if (!e.cmp_qword_abs32_imm8(&g_nstack_cur, 0)) {
+                        e.movabs(R11,
+                                 reinterpret_cast<uint64_t>(&g_nstack_cur));
+                        e.cmp_qword_base_imm8(R11, 0);
+                    }
+                    j_pre.push_back(e.j32(0x75)); /* jne: off the stack */
+                    e.load_global(R11, &g_nstack_floor, R11);
+                    e.cmp_rr(RSP, R11);           /* reg:proto */
+                    j_pre.push_back(e.j32(0x72)); /* jb: below the floor */
+#ifdef TESTS
+                    g_jit_frameless_self_floor++; /* emit-time */
+#endif
+                } else {
+                    if (!e.cmp_abs32_imm32(
+                            reinterpret_cast<const void *>(depth_addr),
+                            static_cast<uint32_t>(jit_sync_depth_cap()))) {
+                        e.movabs(R11, depth_addr);
+                        e.cmp_dword_base_imm32(
+                            R11, 0,
+                            static_cast<uint32_t>(jit_sync_depth_cap()));
+                    }
+                    j_pre.push_back(e.j32(0x7D)); /* jge: at the cap */
                 }
-                j_pre.push_back(e.j32(0x75));     /* jne: armed */
-                if (!e.cmp_abs32_imm32(
-                        reinterpret_cast<const void *>(depth_addr),
-                        static_cast<uint32_t>(jit_sync_depth_cap()))) {
-                    e.movabs(R11, depth_addr);
-                    e.cmp_dword_base_imm32(
-                        R11, 0, static_cast<uint32_t>(jit_sync_depth_cap()));
-                }
-                j_pre.push_back(e.j32(0x7D));     /* jge: at the cap */
-                e.load_global(R11, &g_nstack_floor, R11);
-                e.cmp_rr(RSP, R11);               /* reg:proto */
-                j_pre.push_back(e.j32(0x72));     /* jb: below the floor */
 #ifdef TESTS
                 g_jit_frameless_self_sites++;     /* emit-time */
 #endif
@@ -11423,9 +11485,11 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             /* the callee reads its WINDOW at [rbp+32], through the
              * residue just pushed - nothing may come between (the depth
              * bump is register- and stack-neutral) */
+            const bool fl_count = fl_self && !jit_nstack_armed();
             if (fl_self) {
-                e.bump_counter32_live(
-                    reinterpret_cast<const void *>(depth_addr));
+                if (fl_count)                     /* E2d: see the bounds */
+                    e.bump_counter32_live(
+                        reinterpret_cast<const void *>(depth_addr));
                 ML_CHECK(g_cur_self_fl_calls != nullptr);
                 g_cur_self_fl_calls->push_back(e.call_local_fixed_frame());
             } else {
@@ -11444,7 +11508,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 kns->off_switched = e.last_call_ra;   /* one call: both */
                 kns->frameless = true;
             }
-            if (fl_self) {                        /* the level ended */
+            if (fl_count) {                       /* the level ended */
                 if (!e.dec_abs32(reinterpret_cast<const void *>(depth_addr),
                                  true)) {
                     e.movabs(RCX, depth_addr);
@@ -13600,6 +13664,7 @@ void jit_stats_report()
          * frameless frame's declines took (the cap / the floor) */
         { "frameless_self_sites", &g_jit_frameless_self_sites },
         { "frameless_self_id", &g_jit_frameless_self_id },
+        { "frameless_self_floor", &g_jit_frameless_self_floor },
         { "frameless_boundary", &g_jit_frameless_boundary },
         { "borrow_inline",     &g_jit_borrow_inline },
         { "arg_stage",        &g_jit_arg_stage },

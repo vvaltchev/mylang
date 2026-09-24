@@ -19816,10 +19816,16 @@ static bool jit_frameless_calling()
         ~Restore() {
             g_pure_cache_enabled = pc;
             jit_set_sync_depth_cap(cap);
+            jit_test_nstack_floor(0);
         }
     } restore{ g_pure_cache_enabled, jit_sync_depth_cap() };
     g_pure_cache_enabled = false;
+    /* E2d: a self site's bound is the depth cap off the native stack and
+     * the FLOOR on it - lower whichever this build uses, so the decline
+     * (a boundary call) is reached at a depth these programs run */
+    const bool armed = jit_test_nstack_armed();
     jit_set_sync_depth_cap(16);       /* baked at emission: set it first */
+    jit_test_nstack_floor(24 * 1024);
 
     /* `jit` false = the VM with the JIT OFF: the reference. Not the
      * tree-walker - for this unrolled throwing recursion the VM already
@@ -19865,12 +19871,21 @@ static bool jit_frameless_calling()
         const unsigned long p0 = g_jit_frameless_pushes;
         const unsigned long b0 = g_jit_frameless_boundary;
         const unsigned long i0 = g_jit_frameless_self_id;
+        const unsigned long f0 = g_jit_frameless_self_floor;
         const std::string tw = run(lines, false);   /* the reference */
         const std::string vm = run(lines, true);
         const unsigned long ds = g_jit_frameless_self_sites - s0;
         const unsigned long dp = g_jit_frameless_pushes - p0;
         const unsigned long db = g_jit_frameless_boundary - b0;
         const unsigned long di = g_jit_frameless_self_id - i0;
+        const unsigned long df = g_jit_frameless_self_floor - f0;
+        /* E2d: every self site takes its build's bound */
+        if (df != (armed ? ds : 0)) {
+            fprintf(stderr, "jit_frameless_calling: %s - %lu of %lu self "
+                    "sites bounded by the floor alone (armed %d)\n", what,
+                    df, ds, armed ? 1 : 0);
+            ok = false;
+        }
         if (tw != vm || tw.find(must) == std::string::npos) {
             fprintf(stderr, "jit_frameless_calling: %s differs\n  nj: "
                     "%s\n  vm: %s\n", what, tw.c_str(), vm.c_str());
@@ -19920,10 +19935,10 @@ static bool jit_frameless_calling()
         "  return u(n - 1) + u(n % 2 - 5);",
         "}",
         "for (var k = 0; k < 3; k++) {",
-        "  try { print(u(int(runtime(60)))); }",
+        "  try { print(u(int(runtime(150)))); }",
         "  catch (Boom as b) { print(\"boom\", b.at); }",
         "}",
-        "print(u(int(runtime(40))));" }, "EXC");
+        "print(u(int(runtime(120))));" }, "EXC");
     same("a reference argument threaded through every level", {
         /* typed parameters: the untyped template's unrolled body lists
          * more reference slots than the frameless bound */

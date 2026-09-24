@@ -580,8 +580,10 @@ work — but profile it before building, the way increment 0 was.
         CYCLES to JIT code with perf + a map from MYLANG_JIT_MAP), every
         other call bench flat. ✅ **E2c DONE 2026-09-23**: the self
         site's callee identity chain is elided (09 -11.0% Ir, 10 -9.1%;
-        record: *E2c* in the JIT record). NEXT, by the cycle profile of
-        10: the depth counter's store-forwarding chain, a non-SELF callee
+        record: *E2c* in the JIT record). ✅ **E2d DONE 2026-09-24**:
+        on the native stack a self site keeps no depth count - the floor
+        bounds it, and a boundary blocks the floor (09 -4.5% Ir, 10
+        -3.6%). NEXT: a non-SELF callee
         (needs the callee's placement facts at a non-main site - the
         seventh audit-table shape), builtin calls in a calling body.
         **2026-09-23 - THE DESIGN, after the maintainer revised RULE 2**

@@ -14289,3 +14289,42 @@ baseline E2; wall = ONE interleaved `--baseline` run):
     09_fib_recursive     55,821,486 -> 49,707,378   -10.95%   0.95x
     10_recursion_deep   162,540,000 -> 147,723,000   -9.12%   0.97x
     08 / 45 / 11 / 78 / 76 / 03                     flat to the instruction
+
+**E2d - ON THE NATIVE STACK A SELF SITE KEEPS NO DEPTH COUNT
+(2026-09-24).** The site compared the sync depth against the cap, then
+`inc`ed it before the call and `dec`ed it after - a load-modify-store on
+one cell on each side of every level, a store-forwarding chain through
+the whole recursion, bounding nothing the FLOOR check beside it did not
+already bound there. Which bound a self site emits is now decided at
+EMIT time (the stack arms before any chunk compiles):
+ - **armed**: a frame is on the native stack exactly when `g_nstack_cur`
+   is null (a C-stack entry - a builtin's callback, the top level - sees
+   the armed, inactive top and declines to the core, which switches), so
+   the site tests that and the floor, and nothing else;
+ - **not armed** (a sanitized build, `MYLANG_NATIVE_STACK=0`, a failed
+   mmap): every frame is on the C stack and the depth cap is the only
+   bound - counted as before, and the always-null floor and cursor
+   compares are dropped.
+The counter had a SECOND job, and it moved with it: a BOUNDARY call held
+the depth at the cap so that no frameless frame could form below it (D3).
+The boundary now also sets the floor to the highest address for its
+duration (`jit_nstack_floor_swap`), and D3's invariant is an `ML_CHECK`
+at the boundary's entry - it never nests. ⛔ On the armed stack that
+floor block is UNREACHABLE today: every decline from a frameless frame
+there is the floor itself (so the stack below it is already below the
+floor) or an argument-type decline whose C++ bind raises at once. It is
+a guard, and no test could watch it; a borrowed slice argument looked
+like a way in and is not (the borrow's helper takes it inside the fill).
+The `-rt` case lowers whichever bound the build uses - a TESTS knob puts
+the floor 24KB below the top (`jit_test_nstack_floor`) - and requires
+every self site to have taken its build's form (`frameless_self_floor`,
+a JITSTATS row). Watched: with the floor compare removed, `-rt` reports
+all three cases VACUOUS (zero boundary calls) and `driver_checks.sh`
+crashes with SIGSEGV (rc 139) where StackOverflowEx is required.
+Measured (callgrind per scale unit and ONE interleaved `--baseline` run,
+baseline E2c):
+
+    bench                Ir per scale unit            wall
+    09_fib_recursive     49,707,378 -> 47,484,066    -4.47%   0.92x
+    10_recursion_deep   147,723,000 -> 142,335,000   -3.65%   0.97x
+    08 / 45 / 11 / 78 / 76 / 03                     flat to the instruction
