@@ -14252,3 +14252,40 @@ vframe stores, the depth counter's store-forwarding chain (~4%, measured
 by removing it). For a SELF call the callee is the running function, so
 the identity compare's soundness argument is different from a named
 call's - a candidate increment, not done.
+
+**E2c - A SELF SITE WHOSE CALLEE IS THE RUNNING FUNCTION SKIPS THE
+IDENTITY CHAIN (2026-09-23).** `jit_self_site_is_running` decides it at
+emit time; the push then loads `ctx` alone and returns, and the tail
+emits no compare and no `ctx.captures` repoint. The soundness argument
+has three legs, and each is a condition of the predicate:
+ - **the slot is REALLY written once** - the resolver's flag, read
+   directly, never the FORCE lever's relaxation of it. A write-once
+   global slot holds its own declaration's FuncObject or `none`, and it
+   is bound at scope ENTRY (#134), before any value of the function can
+   exist to be called - so while the body runs, the slot holds it;
+ - **the callee is the body being compiled**, so every constant the
+   site bakes (window, binds, entry) is true of what will run;
+ - **it captures nothing.** The FuncObject matters only for its capture
+   slots, and a clone of a closure carries different ones, so for a
+   capturing callee "the running function" and "the slot's function"
+   can differ in exactly the field the site would read. This leg is
+   UNREACHABLE today (a closure in a variable is not a baked callee -
+   `slot_desc` names only declarations, and a named function cannot
+   capture), so no test can watch it; it is a guard for the day a
+   variable-held closure bakes.
+A `.myv` image whose write-once flag lies stays memory-safe: the site
+calls the running body with the arity and window it was compiled
+against, and only the ANSWER can change - which any mutation may do.
+PINNED by `jit_frameless_calling`: every case requires its self sites to
+have taken the elision (`frameless_self_id`, a JITSTATS row), and a
+FORCE=bakecallee case reassigns the self slot while the body runs
+(entered through a saved value) - the site must keep its compare and
+reach the new function. Watched: with the predicate reading the forced
+bake instead of the write-once flag, it printed `41` where `202` is
+right. Measured (callgrind, `OPT=1 ASSERTS=0`, `-npc`, per scale unit,
+baseline E2; wall = ONE interleaved `--baseline` run):
+
+    bench                Ir per scale unit            wall
+    09_fib_recursive     55,821,486 -> 49,707,378   -10.95%   0.95x
+    10_recursion_deep   162,540,000 -> 147,723,000   -9.12%   0.97x
+    08 / 45 / 11 / 78 / 76 / 03                     flat to the instruction
