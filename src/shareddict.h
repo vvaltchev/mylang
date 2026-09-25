@@ -64,8 +64,10 @@ public:
      * will_restructure(), which snapshots each linked cursor's REMAINING
      * keys and unlinks it; from then on the cursor looks each key up when
      * its turn comes. Snapshotting early is unobservable (the same keys, the
-     * same order, the same current values), so a site that might restructure
-     * may call the hook unconditionally.
+     * same order, the same current values). The hook is PRIVATE and the map
+     * is reachable for mutation only through the methods that call it
+     * (insert_new / insert_if_absent / erase_key), so no call site can
+     * forget it.
      *
      * The cursor is MOVABLE (the VM keeps its iterator states in a vector
      * that grows with the activation) and relinks itself on a move.
@@ -219,15 +221,83 @@ public:
         : data(std::move(d))
     { }
 
-    /* #53: call BEFORE inserting or erasing a key (see Cursor). */
+private:
+    /* #53: runs BEFORE a key is inserted or erased (see Cursor). PRIVATE:
+     * only the structural methods below (and the move constructor) call
+     * it, which is what makes forgetting it impossible. */
     void will_restructure()
     {
         if (cursors)
             snapshot_cursors();
     }
 
-    inner_type &get_ref() { return data; }
+public:
+
+    /*
+     * ⛔ THE MAP IS READ-ONLY FROM OUTSIDE (#53, part B). `get_ref()`
+     * hands out a CONST reference only - there is no mutable overload -
+     * so every change to the map goes through one of the methods below,
+     * and each STRUCTURAL one (a key added or removed) calls
+     * will_restructure() itself. The hook used to be enforced by
+     * convention at six call sites, backed by an ML_CHECK compiled out of
+     * a release; forgetting it is now a compile error (the static_assert
+     * in types/dict.cpp.h pins that no mutable map reference can be
+     * obtained).
+     *
+     * A VALUE-only store into an existing entry is not structural and
+     * snapshots nothing: find_mut() hands out a MUTABLE iterator, whose
+     * `->second` is the entry's LValue - an iterator cannot add or remove
+     * a key without the map, which stays private.
+     */
     const inner_type &get_ref() const { return data; }
+
+    typedef typename inner_type::iterator mut_iterator;
+
+    /* Look `k` up for a VALUE store; compare with mut_end(). Never
+     * restructures. */
+    mut_iterator find_mut(const EvalValueT &k) { return data.find(k); }
+    mut_iterator mut_end() { return data.end(); }
+
+    /* Add `k` (absent - the caller looked it up, and froze it) with `v`;
+     * the new entry's slot. STRUCTURAL: live cursors snapshot first. */
+    LValueT *insert_new(EvalValueT &&k, LValueT &&v)
+    {
+        will_restructure();
+        const auto r = data.emplace(std::move(k), std::move(v));
+        ML_CHECK(r.second);
+        return &r.first->second;
+    }
+
+    /* insert(): add `k` -> `v` unless present; true iff added. Only an
+     * actual insertion restructures. */
+    bool insert_if_absent(EvalValueT &&k, LValueT &&v)
+    {
+        if (data.find(k) != data.end())
+            return false;
+        will_restructure();
+        data.emplace(std::move(k), std::move(v));
+        return true;
+    }
+
+    /* erase(): remove `k`; true iff it was there. Only an actual removal
+     * restructures. */
+    bool erase_key(const EvalValueT &k)
+    {
+        const auto it = data.find(k);
+        if (it == data.end())
+            return false;
+        will_restructure();
+        data.erase(it);
+        return true;
+    }
+
+    /* A FRESH dict under construction (the .myv loader): no walk can be
+     * linked yet, which the check states instead of paying the hook. */
+    void build_emplace(EvalValueT &&k, LValueT &&v)
+    {
+        ML_CHECK(!cursors);
+        data.emplace(std::move(k), std::move(v));
+    }
 
     bool is_readonly() const { return readonly; }
     void set_readonly() { readonly = true; }

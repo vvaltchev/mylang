@@ -13,6 +13,15 @@
 #include "eval.h"
 #include "evaltypes.cpp.h"
 
+/* #53 part B: the dict's map is reachable for MUTATION only through
+ * DictObject's methods, each structural one calling will_restructure()
+ * itself - so a new site cannot forget the cursor hook. The whole
+ * guarantee is that no mutable map reference can be obtained. */
+static_assert(std::is_same<
+                  decltype(std::declval<DictObject &>().get_ref()),
+                  const DictObject::inner_type &>::value,
+              "DictObject::get_ref() must never hand out a mutable map");
+
 class TypeDict : public TypeImpl<intrusive_ptr<DictObject>> {
 
 public:
@@ -106,9 +115,8 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
     const intrusive_ptr<DictObject> &flatObj =
         what.get_ref<intrusive_ptr<DictObject>>();
     DictObject &obj = *flatObj.get();
-    DictObject::inner_type &data = obj.get_ref();
-
-    const auto &it = data.find(key);
+    const DictObject::mut_iterator it = obj.find_mut(key);
+    const bool present = it != obj.mut_end();
 
     /*
      * A read-only (const) dict never hands out an assignable lvalue: present ->
@@ -116,7 +124,7 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
      * write target a const dict returns an rvalue so the write fails NotLValue.
      */
     if (flatObj->is_readonly()) {
-        if (it != data.end())
+        if (present)
             return it->second.get();
         if (obj.get_has_default())
             return obj.get_default();
@@ -127,7 +135,7 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
 
     /* Present key: hand out the lvalue (a read RValue()s it; a compound assign
      * reads-and-writes it). */
-    if (it != data.end())
+    if (present)
         return &it->second;
 
     /*
@@ -144,19 +152,12 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
      * (the entry would sit in the wrong bucket). A scalar/string key is
      * immutable already, so make_const_clone returns it as-is (cheap).
      */
-    if (obj.get_has_default()) {
-        EvalValue fk = make_const_clone(key);
-        obj.will_restructure();        /* #53: a new key - see Cursor */
-        return &(*data.emplace(std::move(fk),
-                     LValue(obj.get_default(), false)).first).second;
-    }
+    if (obj.get_has_default())            /* a new key: see Cursor */
+        return obj.insert_new(make_const_clone(key),
+                              LValue(obj.get_default(), false));
 
-    if (for_write) {
-        EvalValue fk = make_const_clone(key);
-        obj.will_restructure();        /* #53: a new key - see Cursor */
-        return &(*data.emplace(std::move(fk),
-                     LValue(none, false)).first).second;
-    }
+    if (for_write)
+        return obj.insert_new(make_const_clone(key), LValue(none, false));
 
     throw KeyNotFoundEx();
 }

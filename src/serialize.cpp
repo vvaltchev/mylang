@@ -801,7 +801,7 @@ EvalValue read_value(Reader &r)
         for (uint32_t i = 0; i < n; i++) {
             EvalValue k = read_value(r);
             EvalValue val = read_value(r);
-            d->get_ref().emplace(std::move(k), LValue(std::move(val), false));
+            d->build_emplace(std::move(k), LValue(std::move(val), false));
         }
         if (ro)
             d->set_readonly();

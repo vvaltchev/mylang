@@ -3697,18 +3697,15 @@ LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
     if (dval.is<intrusive_ptr<DictObject>>()) {
         const auto &obj = dval.get<intrusive_ptr<DictObject>>();
         if (!obj->is_readonly()) {
-            DictObject::inner_type &data = obj->get_ref();
-            const auto &it = data.find(memId);
-            if (it != data.end())
+            const DictObject::mut_iterator it = obj->find_mut(memId);
+            if (it != obj->mut_end())
                 return &it->second;
-            if (obj->get_has_default() || for_write)
-                obj->will_restructure();   /* #53: a new key (Cursor) */
-            if (obj->get_has_default())
-                return &(*data.emplace(memId,
-                    LValue(obj->get_default(), false)).first).second;
+            if (obj->get_has_default())      /* a new key (Cursor) */
+                return obj->insert_new(EvalValue(memId),
+                                       LValue(obj->get_default(), false));
             if (for_write)
-                return &(*data.emplace(memId,
-                    LValue(none, false)).first).second;
+                return obj->insert_new(EvalValue(memId),
+                                       LValue(none, false));
             throw KeyNotFoundEx(mstart, mend);
         }
     }
@@ -5791,7 +5788,7 @@ EvalValue member_read_core(const EvalValue &dval, const EvalValue &memId,
         throw TypeErrorEx("Expected dict object", bstart, bend);
 
     const auto &obj = dval.get<intrusive_ptr<DictObject>>();
-    DictObject::inner_type &data = obj->get_ref();
+    const DictObject::inner_type &data = obj->get_ref();
     const auto &it = data.find(memId);
 
     if (it != data.end())            /* present key -> the value */
@@ -5840,8 +5837,8 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
     } else if (dval.is<intrusive_ptr<DictObject>>()) {
 
         const auto &obj = dval.get<intrusive_ptr<DictObject>>();
-        DictObject::inner_type &data = obj->get_ref();
-        const auto &it = data.find(memId);
+        const DictObject::mut_iterator it = obj->find_mut(memId);
+        const bool present = it != obj->mut_end();
 
         /*
          * `d.key` mirrors `d[key]` (TypeDict::subscript): present -> the value
@@ -5851,21 +5848,19 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
          * missing) is member_read's job.
          */
         if (!obj->is_readonly()) {
-            if (it != data.end())
+            if (present)
                 return &it->second;
-            if (obj->get_has_default() || for_write)
-                obj->will_restructure();   /* #53: a new key (Cursor) */
-            if (obj->get_has_default())
-                return &(*data.emplace(memId, LValue(obj->get_default(), false))
-                              .first).second;
+            if (obj->get_has_default())      /* a new key (Cursor) */
+                return obj->insert_new(EvalValue(memId),
+                                       LValue(obj->get_default(), false));
             if (for_write)
-                return &(*data.emplace(memId,
-                    LValue(none, false)).first).second;
+                return obj->insert_new(EvalValue(memId),
+                                       LValue(none, false));
             throw KeyNotFoundEx(start, end);
         }
         /* A readonly dict + a for_write missing-key (no default) -> `none`, so
          * the ensuing write fails NotLValueEx (not a KeyNotFound read). */
-        if (for_write && it == data.end() && !obj->get_has_default())
+        if (for_write && !present && !obj->get_has_default())
             return none;
     }
 
