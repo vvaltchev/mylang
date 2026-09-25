@@ -1097,8 +1097,8 @@ extern "C" void jit_struct_ctor_planned(const void *def, const void *plan,
  * boxed condition no longer splits the run at the branch. */
 extern "C" int jit_is_true(int_type cond_slot) noexcept;
 
-extern "C" void jit_load_elem_bool(int_type dst, int_type base,
-                                   int_type idx) noexcept;
+/* (LoadElemBool's own helper is gone - #53: its declines take
+ * jit_load_elem_value, which conveys the foreach's OutOfBoundsEx.) */
 extern "C" void jit_load_str_char(int_type dst, int_type base,
                                   int_type idx) noexcept;
 extern "C" void jit_load_struct_field(int_type dst, int_type base, int_type idx,
@@ -1335,7 +1335,9 @@ extern unsigned long g_jit_op_run[];
     X(storev_val_ex) X(storev_val_slice) \
     X(memberv_base_not_struct) X(memberv_def) X(memberv_base_const) \
     X(memberv_readonly) X(memberv_val_kind) X(memberv_val_ex) \
-    X(memberv_val_slice)
+    X(memberv_val_slice) \
+    X(elemb_base_not_arr) X(elemb_base_slice) X(elemb_base_kind) \
+    X(elemb_bounds)
 
 enum JitDecline {
 #define ML_JD_ENUM(n) JD_##n,

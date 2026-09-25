@@ -1,0 +1,28 @@
+# A foreach over a bool SLICE in a JIT-compiled function. LoadElemBool's
+# inline tier BAILED on a slice container - a decline its op table called
+# unreachable - and the bail exited a frameless frame with no signal:
+# "a frameless frame exited with no signal", an assertion in a checked
+# build. Every decline goes to the status helper now. The function is
+# called repeatedly so the warmed / frameless tiers run it.
+# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff.sh).
+
+func count(int k) {
+    var a = [true, false, true, true, false, true];
+    var n = 0;
+    for (var r = 0; r < k; r++)
+        foreach (x in a[1:5])
+            if (x) n++;
+    return n;
+}
+
+func index_sum(int k) {
+    var a = [true, true, false, true];
+    var s = 0;
+    for (var r = 0; r < k; r++)
+        foreach (i, x in indexed a[1:4])
+            if (x) s += i;
+    return s;
+}
+
+for (var t = 0; t < 3; t++)
+    print(count(runtime(3)), index_sum(runtime(2)));

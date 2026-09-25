@@ -14723,3 +14723,31 @@ B1; wall = ONE interleaved `--baseline` run):
     95_recursion_with_builtin  -76.08%      0.56x     3.92x -> 2.11x
     38_min_max (array min/max - generic, as it must be)   flat
     40 / 09 / 03 / 45 / 91                                 flat
+
+## LoadElemBool: EVERY DECLINE TAKES THE STATUS HELPER, NONE BAILS (2026-09-25)
+
+The bool foreach bind (`LoadElemBool`) was emitted INLINE with four
+guards - base is an array, not a slice, flat bools, index in range -
+each a `bail_unless` back to the interpreter, while the op sat in
+`op_never_exits` on the claim that the index is loop-bounded and the
+base kind proven, so none could fire. Two could:
+
+ - a SLICE container, `foreach (b in a[1:5])` in a JIT'd function: the
+   bail exited a FRAMELESS frame with no signal -
+   `jit_frameless_postexit`'s "a frameless frame exited with no
+   signal" assertion in a checked build (found while fixing #53);
+ - an index past the end after the BODY shrank the array (#53): the
+   ref-listed helper `jit_load_elem_bool` and the interpreted twin
+   both answered `false`/`none` where every other element kind raised
+   OutOfBoundsEx.
+
+The inline tier now lives in the shared foreach-load block and its four
+guards are DECLINES (`JD_elemb_*` in the ledger) to
+`jit_load_elem_value` - which boxes a real bool, bounds-checks, and
+CONVEYS the OutOfBoundsEx through its status return with the op's own
+caret (the container's; `extract_locs` records it). So LoadElemBool
+moved from `op_never_exits` to `op_fully_native`'s convey family beside
+LoadElemValue, `pick_visit_op` treats it as a helper op, and
+`jit_load_elem_bool` is deleted. The hot path - 56_sieve_bool's reason
+for the inline tier - is unchanged: the same navigation, the same
+byte load, a `jae` to the decline pad where the `jb`+bail was.

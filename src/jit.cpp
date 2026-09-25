@@ -15578,13 +15578,7 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
         }
         v.bad(in.target);
         break;
-    case OpCode::LoadElemBool:
-        /* INLINED (no helper); the index is read cache-aware
-         * (load_index_idx), so it stays a countable int use like
-         * LoadElemInt's. */
-        v.bad(in.target); v.bad(in.target2);
-        if (!in.a_is_lit()) v.usei(in.a_slot());
-        break;
+    case OpCode::LoadElemBool:   /* #53: inline + the status helper */
     case OpCode::StrLen:
     case OpCode::LoadStrChar:
     case OpCode::LoadStructFieldInt:
@@ -23163,58 +23157,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
 
     case OpCode::LoadElemBool:
-        /* INLINE (no helper call): the N4 flat-array navigation with a BYTE
-         * element - slot -> shobj -> kind + data, unsigned bounds check, movzx
-         * the byte, then the two-store with the t_bool singleton. A helper CALL
-         * here cost more than the interpreter dispatch it replaced (measured:
-         * +55% instructions on 56_sieve_bool, whose hot loop is exactly
-         * `if (sieve[i])`), which is the whole reason this op is emitted inline.
-         * Any failing precondition BAILS and the interpreter re-runs the op.
-         * Falls back to the helper only when the dst is REF-LISTED (it may hold
-         * a reference whose release needs C++) - rare for a bool loop var. */
-        if (!std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
-                                static_cast<int32_t>(in.target))) {
-            const uint8_t ir = elem_read_idx(e, in.op);
-            if (ir == ELEM_NO_REG)
-                return false;  /* no free index reg - decline */
-            AccScratch acc(e);
-            const JitLayout &L = jit_layout();
-            const SlotAddr base = slot_addr(in.target2);
-            const SlotAddr dst = slot_addr(in.target);
-            e.bump_op(OpCode::LoadElemBool);         /* execution proof */
-            e.load(acc.r, base.type);                  /* base an array? */
-            e.cmp_reg_tag_via(acc.r, L.t_arr, ir);
-            e.bail_unless(0x74, pc);
-            e.cmp_byte_slot(base.payload + L.slice_off, 0);   /* not a slice? */
-            e.bail_unless(0x74, pc);
-            e.load(acc.r, base.payload);               /* rax = shobj */
-            e.cmp_byte_base(acc.r, L.kind_off, L.kind_bools);/* flat bools? */
-            e.bail_unless(0x74, pc);
-            const ElemRead r = elem_read_plan(e, ir);
-            e.load_base(r.data, acc.r, L.data_off);      /* _M_start   */
-            e.load_base(r.count, acc.r, L.data_off + 8); /* _M_finish  */
-            e.sub_rr(r.count, r.data);            /* count (1B elems, so NO
-                                                   * sar - unlike the 8-byte
-                                                   * int/float path) */
-            load_index_idx(e, r.idx, in);            /* cache-aware index */
-            e.cmp_rr(r.idx, r.count);
-            e.bail_unless(0x72, pc);                 /* jb: unsigned in-range */
-            e.load_elem_zx8(acc.r, r.data, r.idx);
-            /* ⛔ #96: the tag through the SEAM, not by hand. This was
-             * `movabs RCX, t_bool; store_rcx_slot(...)` - the exact
-             * store_dst_bool shape that shipped a wrong answer once a
-             * register stopped being loaded. store_type_tag_via emits an
-             * imm32 when the arena placed t_bool low (so it names NO
-             * register at all, 17 bytes -> 11) and builds it in the
-             * scratch only on the fallback path. */
-            {
-                RefScratch rb(e, RCX);
-                e.store_type_tag_via(dst.type, L.t_bool, rb.sc);
-                rb.release();
-            }
-            e.store(acc.r, dst.payload);           /* a REAL bool, not 0/1 */
-            return true;
-        }
+        /* The inline tier lives in the shared block below (#53) - see the
+         * comment there. */
         goto foreach_load_helper;
 
     case OpCode::StrLen: {
@@ -23419,6 +23363,64 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.free_scratch(s2);
             e.free_scratch(s1);
         }
+        /*
+         * LoadElemBool's INLINE tier (the bool foreach loop var): the N4
+         * flat-array navigation with a BYTE element - slot -> shobj ->
+         * kind + data, unsigned bounds check, movzx the byte, then the
+         * two-store with the t_bool singleton. A helper CALL on the hot
+         * path cost more than the interpreter dispatch it replaced
+         * (measured: +55% instructions on 56_sieve_bool), which is why it
+         * is inline. Skipped for a REF-LISTED dst (its old value may need
+         * a C++ release).
+         *
+         * ⛔ #53: EVERY DECLINE GOES TO THE STATUS HELPER BELOW - it used
+         * to BAIL. Two declines were believed unreachable and were not:
+         * a SLICE container (`foreach (x in a[1:5])` - the bail exited a
+         * frameless frame with no signal, an assertion in a checked build)
+         * and an index past the end after the BODY shrank the array (the
+         * interpreted twin then answered `false`). The helper is
+         * jit_load_elem_value, which boxes a real bool and CONVEYS the
+         * foreach's defined OutOfBoundsEx.
+         */
+        if (in.op == OpCode::LoadElemBool
+            && !std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
+                                   static_cast<int32_t>(in.target))) {
+            const uint8_t ir = elem_read_idx(e, in.op);
+            if (ir != ELEM_NO_REG) {
+                DeclineJumps elemb_slows;
+                const JitLayout &L = jit_layout();
+                const SlotAddr base = slot_addr(in.target2);
+                const SlotAddr dst = slot_addr(in.target);
+                e.bump_op(OpCode::LoadElemBool);      /* execution proof */
+                e.load(acc.r, base.type);             /* base an array? */
+                e.cmp_reg_tag_via(acc.r, L.t_arr, ir);
+                decline_jump(e, elemb_slows, 0x75, JD_elemb_base_not_arr);
+                e.cmp_byte_slot(base.payload + L.slice_off, 0); /* slice? */
+                decline_jump(e, elemb_slows, 0x75, JD_elemb_base_slice);
+                e.load(acc.r, base.payload);          /* rax = shobj */
+                e.cmp_byte_base(acc.r, L.kind_off, L.kind_bools);
+                decline_jump(e, elemb_slows, 0x75, JD_elemb_base_kind);
+                const ElemRead r = elem_read_plan(e, ir);
+                e.load_base(r.data, acc.r, L.data_off);      /* _M_start */
+                e.load_base(r.count, acc.r, L.data_off + 8); /* _M_finish */
+                e.sub_rr(r.count, r.data);    /* count (1B elems, no sar) */
+                load_index_idx(e, r.idx, in);         /* cache-aware */
+                e.cmp_rr(r.idx, r.count);
+                decline_jump(e, elemb_slows, 0x73,  /* jae: OOB/negative */
+                             JD_elemb_bounds);
+                e.load_elem_zx8(acc.r, r.data, r.idx);
+                /* ⛔ #96: the tag through the SEAM, not by hand (the
+                 * store_dst_bool lesson - see store_type_tag_via). */
+                {
+                    RefScratch rb(e, RCX);
+                    e.store_type_tag_via(dst.type, L.t_bool, rb.sc);
+                    rb.release();
+                }
+                e.store(acc.r, dst.payload);   /* a REAL bool, not 0/1 */
+                lev_done = e.j32(0xEB);                   /* -> done */
+                decline_land(e, elemb_slows);
+            }
+        }
         if (has_idx)
             load_operand(e, acc.r, in.a_is_lit(), in.a_lit(),
                          in.a_slot());
@@ -23436,9 +23438,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * LoadElemValue's. */
         const bool sfield_checked = is_field && in.struct_checked();
         const void *fn =
-            in.op == OpCode::LoadElemBool
-                ? reinterpret_cast<const void *>(jit_load_elem_bool)
-          : in.op == OpCode::LoadStrChar
+            in.op == OpCode::LoadStrChar
                 ? reinterpret_cast<const void *>(jit_load_str_char)
           : sfield_checked
                 ? reinterpret_cast<const void *>(jit_load_struct_elem_field)
@@ -23450,7 +23450,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.call_direct(fn);
         emit_call_epilogue(e);
         if (in.op == OpCode::LoadElemValue || sfield_checked
-            || in.op == OpCode::LoadStructElemV) {
+            || in.op == OpCode::LoadStructElemV
+            || in.op == OpCode::LoadElemBool) {
             e.test32_rr(RAX, RAX);           /* test eax, eax; reg:abi */
             const size_t j_ok = e.j8(0x74);
             emit_exc_stamp(e, ck, old_pc);    /* cold: the OOB caret (the
@@ -25563,8 +25564,8 @@ static bool op_never_exits(const Instr &in)
      * bail (LoadElemValue bounds-checks, and LoadStructElemV's helper
      * conveys an IMAGE's corrupt base - fat-676 - so both live in
      * op_fully_native's convey family instead: they exit, but only by
-     * conveying). */
-    case OpCode::LoadElemBool:
+     * conveying; so does LoadElemBool since #53 - a body that shrinks the
+     * array leaves the index out of range). */
     case OpCode::StrLen:
     case OpCode::LoadStrChar:
     case OpCode::LoadStructFieldInt:
@@ -25797,8 +25798,12 @@ static bool op_fully_native(const Instr &in)
     /* LoadElemValue (the general/str-array element read incl. 2-D
      * `a[i][k]`): the OOB conveys (exc-stamped caret) and the
      * unreachable-by-inference non-array/wrong-kind tail conveys the
-     * interpreted InternalErrorEx via eptr - no bail left. */
+     * interpreted InternalErrorEx via eptr - no bail left. LoadElemBool
+     * (#53) declines its inline tier to the SAME helper, so it conveys
+     * the same way: the foreach's OutOfBoundsEx when the body shrank the
+     * array, the caret from the op's own loc. */
     case OpCode::LoadElemValue:
+    case OpCode::LoadElemBool:
         return true;
     /* LoadStructElemV (the whole-`p` foreach bind): never throws on
      * bytecode we compiled; on an IMAGE its helper conveys the corrupt-base

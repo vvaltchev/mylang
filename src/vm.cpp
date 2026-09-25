@@ -4756,36 +4756,6 @@ extern "C" int jit_is_true(int_type cond_slot) noexcept
     }
 }
 
-/* LoadElemBool: bind a[i] of a flat array<bool> as a REAL bool (not 0/1). */
-extern "C" void jit_load_elem_bool(int_type dst, int_type base,
-                                   int_type idx) noexcept
-{
-    ML_JIT_OP_RAN(LoadElemBool);
-    Frame *f = g_current_ctx->frame;
-    /* #142: `noexcept`, no status test - see jit_arr_len. Both the BASE's
-     * type and the INDEX are compile-proven for valid bytecode; a corrupt
-     * image can break either, and an unchecked flat read at a mangled index
-     * is a wild load, not merely a wrong answer. */
-    const EvalValue &bv = f->at(base).get();
-    if (!bv.is<SharedArrayObj>()) {
-        f->at(dst).put(EvalValue());
-        return;
-    }
-    const SharedArrayObj &arr = bv.get_ref<SharedArrayObj>();
-    if (idx < 0 || static_cast<size_type>(idx) >= arr.size()) {
-        f->at(dst).put(EvalValue());
-        return;
-    }
-    bool b;
-    if (arr.skind() == SharedArrayObj::Storage::bools) {
-        b = arr.flat_bools()[arr.offset() + idx] != 0;
-    } else {
-        const EvalValue &e = arr.get_view()[idx].get();
-        b = e.is<bool>() && e.get<bool>();
-    }
-    f->at(dst).put(EvalValue(b));
-}
-
 /* LoadStrChar: bind a FRESH 1-char string for the container's i-th char -
  * matches the tree-walker's SharedStr(string(&view[i], 1)). */
 extern "C" void jit_load_str_char(int_type dst, int_type base,
@@ -11339,7 +11309,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             /* bool-foreach loop var: bind a[i] as a real BOOL (not 0/1), so
              * `print(x)` shows true/false. `i` is loop-bounded (< ArrLen); the
              * base is a proven flat array<bool> (elem_is_bool). */
-            /* #142: the interpreted TWIN of jit_load_elem_bool - both the
+            /* #142: the interpreted twin of the JIT's inline tier - both the
              * base's type and the index are compile-proven, and a corrupt
              * image breaks either into a wild flat read. */
             const EvalValue &bv = ctx.frame->at(in->target2).get();
@@ -11347,6 +11317,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             bool b = false;
             if (bv.is<SharedArrayObj>()) {
                 const SharedArrayObj &arr = bv.get_ref<SharedArrayObj>();
+                /* The index is loop-bounded by the length at the loop's
+                 * START, and the body may have shrunk the array since - the
+                 * element is gone: OutOfBoundsEx at the container, as for
+                 * every other element kind (and the JIT's tier, which
+                 * declines to jit_load_elem_value on the same test). */
+                if (idx >= 0 && static_cast<size_type>(idx) >= arr.size()) {
+                    Loc ls, le;
+                    chunk->loc_at(pc, ls, le);
+                    throw OutOfBoundsEx(ls, le);
+                }
                 if (idx >= 0 && static_cast<size_type>(idx) < arr.size()) {
                     if (arr.skind() == SharedArrayObj::Storage::bools) {
                         b = arr.flat_bools()[arr.offset() + idx] != 0;
