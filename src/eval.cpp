@@ -4089,10 +4089,47 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
     }
 }
 
-/* Read scalar field #fidx of element `idx` of a flat array<PodStruct> straight
- * from the bytes (the VM's LoadStructFieldInt/Float, the struct-foreach direct
- * read). `arrv` is the array value; the codegen proved it flat-struct + `idx`
- * in range (the counted loop), so no checks. A bool field reads as 0/1. */
+/* Field #fidx of element `idx` of a GENERAL array whose elements are POD
+ * structs (a promoted array<PodStruct>): the boxed StructObject's field, in
+ * its own kind (int / float / bool -> 0/1). An element that is not a struct,
+ * or a field index it does not have, can only come from a corrupt image and
+ * reads 0 - the defined value of the untrusted tier (#142). */
+template <class T>
+static T general_struct_field(const SharedArrayObj &arr, size_type idx,
+                              int_type fidx)
+{
+    const EvalValue &ev = arr.get_vec()[arr.offset() + idx].get();
+    if (!ev.is<intrusive_ptr<StructObject>>())
+        return static_cast<T>(0);
+    const StructObject &so = *ev.get_ref<intrusive_ptr<StructObject>>();
+    if (!so.def || fidx < 0
+        || static_cast<size_t>(fidx) >= so.def->fields.size()
+        || !so.def->is_pod())
+        return static_cast<T>(0);
+    const FieldKind k = so.def->fields[fidx].kind;
+    if (k != FieldKind::f_int && k != FieldKind::f_float
+        && k != FieldKind::f_bool)
+        return static_cast<T>(0);
+    const EvalValue fv = so.pod_get(static_cast<int>(fidx));
+    if (fv.is<float_type>())
+        return static_cast<T>(fv.get<float_type>());
+    if (fv.is<int_type>())
+        return static_cast<T>(fv.get<int_type>());
+    return static_cast<T>(fv.get_type()->is_true(fv) ? 1 : 0);   /* bool */
+}
+
+/* Read scalar field #fidx of element `idx` of an array<PodStruct> (the VM's
+ * LoadStructFieldInt/Float, the struct-foreach direct read). `arrv` is the
+ * array value; the codegen proved `idx` in range (the counted loop over an
+ * inert body). A bool field reads as 0/1.
+ *
+ * ⛔ The codegen did NOT prove the STORAGE flat - only the static type
+ * array<P>, and a flat struct array AUTO-PROMOTES to general storage on a
+ * cold op (insert/sort/map, via get_vec()) anywhere BEFORE the loop. This
+ * read used to return 0 for every element of such an array (a silent wrong
+ * answer, found by the #54 -nc audit: an un-folded `var pts = []` was built
+ * general). A general array is read the boxed way, as G4's subscript form
+ * below always did. */
 int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
                     int_type fidx)
 {
@@ -4111,8 +4148,12 @@ int_type vm_struct_field_int(const EvalValue &arrv, int_type idx,
     if (!arrv.is<SharedArrayObj>())
         return 0;
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
-    if (arr.skind() != SharedArrayObj::Storage::structs
-        || idx < 0 || static_cast<size_type>(idx) >= arr.size())
+    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+        return 0;
+    if (arr.skind() == SharedArrayObj::Storage::general)
+        return general_struct_field<int_type>(
+            arr, static_cast<size_type>(idx), fidx);
+    if (arr.skind() != SharedArrayObj::Storage::structs)
         return 0;
     const auto &sv = arr.flat_structs();
     if (fidx < 0 || static_cast<size_t>(fidx) >= sv.def->fields.size())
@@ -4145,8 +4186,12 @@ float_type vm_struct_field_float(const EvalValue &arrv, int_type idx,
     if (!arrv.is<SharedArrayObj>())
         return 0.0;
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
-    if (arr.skind() != SharedArrayObj::Storage::structs
-        || idx < 0 || static_cast<size_type>(idx) >= arr.size())
+    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+        return 0.0;
+    if (arr.skind() == SharedArrayObj::Storage::general)   /* see above */
+        return general_struct_field<float_type>(
+            arr, static_cast<size_type>(idx), fidx);
+    if (arr.skind() != SharedArrayObj::Storage::structs)
         return 0.0;
     const auto &sv = arr.flat_structs();
     if (fidx < 0 || static_cast<size_t>(fidx) >= sv.def->fields.size())
