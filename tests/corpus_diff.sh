@@ -225,9 +225,42 @@ run_one() {     # $1 = env assignment ("" = plain), $2 = extra engine flags
   return $bad
 }
 
+# #54: `-nc` turns off FOLDING - an optimization - so RULE 2 says the
+# program may not notice: default and `-nc` must print the same stdout
+# and stderr and exit the same way, on the SAME engine. This is stronger
+# than the engine differential below (both of whose sides would share a
+# -nc mistake): for months `-nc` refused struct programs, stored a nested
+# POD field boxed and let a const array element be assigned, and nothing
+# ran it. The default engine is compared; the -nc pass of run_one then
+# checks the engines agree within the mode, as the -nti pass does.
+fold_same() {
+  local bad=0 n=0 a b ra rb
+  for f in $(progs); do
+    a=$(timeout 60 "$BIN" "$f" 2>&1)
+    ra=$?
+    b=$(timeout 60 "$BIN" -nc "$f" 2>&1)
+    rb=$?
+    n=$((n + 1))
+    if [ "$ra" -ge 124 ] || [ "$rb" -ge 124 ]; then
+      echo "CRASH [-nc vs default] $f (default rc=$ra, -nc rc=$rb)"
+      printf '%s\n' "$b" | tail -4 | sed 's/^/  /'
+      bad=$((bad + 1))
+    elif [ "$a" != "$b" ] || [ "$ra" != "$rb" ]; then
+      echo "DIFF [-nc vs default] $f (rc $ra vs $rb)"
+      diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") \
+        | head -8 | sed 's/^/  /'
+      bad=$((bad + 1))
+    fi
+  done
+  printf "  %-28s %d/%d agree\n" "-nc vs default" "$((n - bad))" "$n"
+  return $bad
+}
+
 rc=0
 compiles_all || rc=1
 run_one "" || rc=1
+fold_same || rc=1
+run_one "" "-nc" || rc=1
 # #51: -nti (no type inference) had NO net - and the codegen, which
 # lowers a call only on a TYPE proof, refused every non-inlined user
 # call there (NotLoweredEx) while the tree-walker ran it. Both SIDES run
