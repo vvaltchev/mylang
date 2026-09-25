@@ -89,8 +89,13 @@ EvalValue
 builtin_insert_dict(LValue *lval, const EvalValue &key, const EvalValue &val)
 {
     DictObject &dictObj = *lval->getval<intrusive_ptr<DictObject>>().get();
-    /* #53: restructures (see Cursor) only when the key is new */
-    return dictObj.insert_if_absent(EvalValue(key), LValue(val, false));
+    /* #53: restructures (see Cursor) only when the key is new. The key is
+     * FROZEN like every other insert site's (make_const_clone): a stored
+     * container key that the caller mutates afterwards would change its
+     * hash and strand the entry in the wrong bucket, findable by NO key. */
+    if (dictObj.get_ref().count(key))
+        return false;
+    return dictObj.insert_if_absent(make_const_clone(key), LValue(val, false));
 }
 
 /*

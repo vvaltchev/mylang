@@ -7642,6 +7642,23 @@ static const std::vector<test> tests =
     },
 
     {
+        /* insert(d, k, v) stored a container key UNFROZEN - every other
+         * insert site freezes it (make_const_clone) - so mutating the key
+         * afterwards changed its hash under the map: the entry printed
+         * as {[1, 2]: 7} yet no key could find it. */
+        "insert() into a dict freezes a container key",
+        {
+            "var k = [1];",
+            "var d = {};",
+            "assert(insert(d, k, 7));",
+            "append(k, 2);",
+            "assert(len(d) == 1 && d[[1]] == 7);",
+            "assert(get(d, [1, 2]) == none);",
+            "assert(!insert(d, [1], 8) && d[[1]] == 7);",
+        },
+    },
+
+    {
         /* insert() into a flat STRING array (split()'s storage) threw the
          * flat-array TypeErrorEx for EVERY value, a string included: the
          * insert path promoted structs on its cold path and forgot strs.
