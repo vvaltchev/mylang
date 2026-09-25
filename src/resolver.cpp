@@ -6504,7 +6504,15 @@ private:
         if (!c)
             return;
         c->inline_ctx = rebase(c->inline_ctx, ic);
-        for_each_child(c, [&](Construct *ch) { tag_inline(ch, ic); });
+        /* fmi_children, NOT for_each_child: the latter omits the nodes
+         * the resolver's walk() handles itself (Block, for, foreach,
+         * try, Expr14), so every STATEMENT of a spliced block body -
+         * `var t = ...`, a loop, a try - kept no inlined-at chain and
+         * an error there lost the inlined callee's frame (#38 repro B).
+         * A nested FuncDeclStmt is still not entered: a lambda's body
+         * runs in its own PHYSICAL frame, whose virtual frames are its
+         * call site's, never the enclosing splice's. */
+        fmi_children(c, [&](Construct *ch) { tag_inline(ch, ic); });
     }
 };
 
