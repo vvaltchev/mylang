@@ -4038,8 +4038,16 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 
     if (n == "sum") {
         /* sum returns the element type, except a bool array sums to an int
-         * (it counts the `true`s; bool promotes to int in arithmetic). */
+         * (it counts the `true`s; bool promotes to int in arithmetic).
+         * sum(array, key_func) sums the CALLBACK's results, so it returns
+         * the callback's return type instead (the same bool rule). */
         StaticTypeRef el = elem_of(arg(0));
+        if (args && args->elems.size() == 2) {
+            StaticTypeRef f = static_type_resolve(arg(1));
+            if (is_unknown(f))
+                return bottom;      /* defer: callback not yet known */
+            el = is_func(f) ? f->ret : A.dyn_ty();
+        }
         if (is_unknown(el))
             return bottom;
         return static_type_resolve(el)->kind == StaticTypeKind::Bool ?
@@ -4469,6 +4477,9 @@ void Inferencer::accumulate_call(CallExpr *call)
             func_i = 0; cont_i = 1;
         } else if (nm == "sort" || nm == "rev_sort") {
             func_i = 1; cont_i = 0; comparator = true;
+        } else if (nm == "sum") {
+            /* sum(array, key): the key's param is an ELEMENT. */
+            func_i = 1; cont_i = 0;
         } else if (nm == "make_array") {
             /* make_array(N, gen): the callback's param is the int index, not a
              * container element - type it int directly and return. */
