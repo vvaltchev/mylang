@@ -287,7 +287,11 @@ is a same-POD-struct ctor with all-scalar field args: the N structs' field args
 compile INTERLEAVED into one run (struct i's field j at `base + i*M + j`,
 `M = nfields`), and `vm_make_struct_array` coerces them STRAIGHT into a
 contiguous flat byte buffer — **no intermediate `StructObject` per element** —
-then builds the mode-5 flat array. This **BEATS** the tree-walker's
+then builds the mode-5 flat array. An EMPTY `[]` whose destination is
+`array<PodStruct>` takes the same op with N = 0 and the def from the
+inferencer's `arr_hint_struct` (#54): `MakeArrayV` carries no def, so it built
+such an array GENERAL, unlike the tree-walker - reachable only when the `[]` is
+not folded to a baked value, i.e. under `-nc`. This **BEATS** the tree-walker's
 `LiteralArray::do_eval` (which allocates N `StructObject`s then packs them):
 `77_struct_array_lit` VM **0.85x** vs the tree-walker (was ~1.2x SLOWER under the
 earlier per-element `StructCtorV`+`MakeArrayV` lowering — the `EmplaceStruct`
