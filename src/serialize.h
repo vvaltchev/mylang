@@ -23,10 +23,12 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 19;   /* v19: root_slot_count is
-                                                 CHECKED against the root
-                                                 chunk's slot_count at load
-                                                 (v18: ref_slots derived) */
+constexpr unsigned MYV_FORMAT_VERSION = 20;   /* v20: a TABLE OF
+                                                 CONTENTS before the struct
+                                                 and descriptor tables, so a
+                                                 struct const may hold a
+                                                 function (v19: slot_count
+                                                 checked at load) */
 
 /*
  * The stored SOURCE REFERENCE (v2). An image does NOT embed the source text -

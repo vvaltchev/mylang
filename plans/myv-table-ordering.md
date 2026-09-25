@@ -1,6 +1,17 @@
 # `.myv` cross-table references: identity BEFORE content
 
-Status: **DESIGNED, NOT STARTED.** The one shape that can hit it today
+Status: **BUILT (#52, myv v20, 2026-09-25)** for the two tables that
+exist - a table of contents (the struct and descriptor COUNTS) after the
+string table, SHELLS for both tables before any record, the records in
+file order, then WIRING (layouts, the deferred capture-free check of a
+function value read while descriptors were shells, the bind-flag cross
+check). The count bound is the per-record minimum size this plan asks
+for (12 bytes a struct, 40 a descriptor). A future table (classes) joins
+the table of contents the same way. Pinned by the `myv_struct_const_func`
+`-rt` entry, the round-trip program and a driver_checks.sh case.
+
+Original status: **DESIGNED, NOT STARTED.** The one shape that can hit it
+today
 is REFUSED at write time (commit 2d8793b), so nothing is broken and this
 is a design decision, not a fire. Maintainer's call, 2026-08-25: the
 obvious fix (swap two sections) is a lateral move and is NOT what we

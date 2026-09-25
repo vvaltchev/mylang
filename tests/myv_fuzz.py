@@ -50,6 +50,9 @@ import tempfile
 # the one record no corpus program used to produce. That gap was not
 # academic: read_value built its FuncObject with a NULL context and the
 # ctor dereferenced it, so the UNMUTATED image segfaulted on load.
+# `struct K`'s const members hold functions too (#52, v20): they are read
+# while the descriptors are still SHELLS, so they reach the loader's
+# DEFERRED capture check and the table of contents' count bound.
 SMALL = """\
 struct P { int x; }
 func f(a) { var p = P(a); return p.x + 1; }
@@ -87,6 +90,9 @@ pure func sq(x) => x * x;
 const OPS = [sq];
 var dyn ops = runtime(OPS);
 bits += len(ops);
+struct K { const F = pure func(a, b) => a < b; const T = [sq]; }
+var dyn kf = runtime(K.F);
+if (kf(1, 2)) { bits += len(K.T); }
 print(s, joined, t, bits, fs > 0.0);
 """
 

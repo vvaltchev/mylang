@@ -266,7 +266,6 @@ struct Writer {
      * plans/myv-table-ordering.md; until then this is a clean
      * compile-time refusal, not a broken file.
      */
-    bool in_struct_consts = false;
 
     void u8v(uint8_t v) { buf.push_back(static_cast<char>(v)); }
     void u32v(uint32_t v)
@@ -379,6 +378,11 @@ struct Reader {
     std::vector<std::string> strs;
     std::vector<StructTypeDef *> structs;
     std::vector<FuncDescriptor *> descs;
+    /* #52: false while the descriptors are empty shells (the struct table
+     * is read first), and the pool closures materialized meanwhile, whose
+     * capture-free check the wiring phase runs once they are filled. */
+    bool descs_filled = false;
+    std::vector<const FuncDescriptor *> deferred_funcs;
 
     explicit Reader(const std::string &b) : buf(b) { }
 
@@ -768,10 +772,6 @@ void write_value(Writer &w, const EvalValue &v)
         const FuncObject &fo = *v.get<intrusive_ptr<FuncObject>>();
         if (!fo.capture_slots.empty())
             bad_image("unserializable value (capturing closure in a pool)");
-        if (w.in_struct_consts)
-            bad_image("unserializable value (a function in a struct's "
-                      "const member - the descriptor table is written "
-                      "after the struct table, so it cannot be read back)");
         auto it = w.desc_ids.find(fo.func);
         if (it == w.desc_ids.end())
             bad_image("unserializable value (func descriptor)");
@@ -836,6 +836,17 @@ EvalValue read_value(Reader &r)
     case VTag::func: {
         const uint32_t fi = r.idx(r.descs.size(), "corrupt .myv (descriptor)");
         const FuncDescriptor *fd = r.descs[fi];
+        /* While the descriptors are still SHELLS (a struct const member
+         * is read before the descriptor table's content, #52), the check
+         * below would read an empty capture list and pass vacuously: it
+         * is DEFERRED to the wiring phase, which runs it on the filled
+         * record. The FuncObject stores only the pointer - its ctor reads
+         * `captures`, empty on a shell, so it never touches the null
+         * context either way. */
+        if (!r.descs_filled) {
+            r.deferred_funcs.push_back(fd);
+            return EvalValue(make_intrusive<FuncObject>(fd, nullptr));
+        }
         /*
          * A pool FuncObject is capture-free - the WRITER refuses any other
          * kind - and the loader must not TRUST that: a capture snapshot
@@ -1799,8 +1810,20 @@ void myv_write(const VmProgram &prog, const std::string &path,
     for (size_t i = 0; i < prog.funcs.size(); i++)
         w.desc_ids.emplace(prog.funcs[i].get(), static_cast<uint32_t>(i));
 
-    /* structs */
+    /*
+     * THE TABLE OF CONTENTS (#52, v20): every table's COUNT, before any
+     * table's content, so the reader can construct an empty shell for
+     * every struct AND every descriptor before it reads a single record -
+     * identity, then content, then wiring (plans/myv-table-ordering.md).
+     * Any cross-table index is then resolvable wherever it appears: a
+     * struct's const member may name a function (`const F = pure func(a,
+     * b) => a < b;`), which a single forward pass could not read back
+     * because the descriptor table came second.
+     */
     w.u32v(static_cast<uint32_t>(prog.structs.size()));
+    w.u32v(static_cast<uint32_t>(prog.funcs.size()));
+
+    /* structs (the count is in the table of contents) */
     for (const auto &sd : prog.structs) {
         w.uidv(sd->name);
         w.u32v(static_cast<uint32_t>(sd->fields.size()));
@@ -1815,18 +1838,16 @@ void myv_write(const VmProgram &prog, const std::string &path,
             w.u32v(static_cast<uint32_t>(f.slot));
         }
         w.u32v(static_cast<uint32_t>(sd->consts.size()));
-        w.in_struct_consts = true;
         for (const auto &kv : sd->consts) {
             w.uidv(kv.first);
             write_value(w, kv.second);
         }
-        w.in_struct_consts = false;
     }
 
     tick("structs");
 
-    /* descriptors (their chunks follow, same order) */
-    w.u32v(static_cast<uint32_t>(prog.funcs.size()));
+    /* descriptors (their chunks follow, same order; the count is in the
+     * table of contents) */
     for (const auto &d : prog.funcs) {
         w.uidv(d->name);
         w.strv(d->display_name);
@@ -2025,16 +2046,42 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
 
     VmProgram prog;
 
-    /* structs: construct all first (so a field can reference any earlier
-     * def), then wire + compute the layout - which is RECOMPUTED, never
-     * stored (deterministic from the field kinds; storing it would only
-     * add drift surface). */
-    n = r.countv();
-    for (uint32_t i = 0; i < n; i++)
+    /*
+     * PHASE 1 - IDENTITY (#52, v20): the table of contents gives every
+     * table's count up front, and an empty SHELL is constructed for every
+     * struct and every descriptor before any record is read, so every
+     * cross-table index in the file resolves wherever it appears
+     * (plans/myv-table-ordering.md). Nothing may READ a shell's fields
+     * until PHASE 2 has filled it - see read_value's `func` case.
+     *
+     * The counts no longer sit right before their records, so countv's
+     * "no more entries than bytes remaining" is replaced by a per-record
+     * MINIMUM SIZE bound (#137: a count is an allocation an attacker
+     * controls): a struct record is at least 12 bytes (name, field count,
+     * const count), a descriptor record at least 40.
+     */
+    const uint32_t n_structs = r.u32v();
+    const uint32_t n_descs = r.u32v();
+    {
+        const uint64_t need = uint64_t(n_structs) * 12
+                              + uint64_t(n_descs) * 40;
+        if (need > r.buf.size() - r.p)
+            bad_image("corrupt .myv (table of contents exceeds the file)");
+    }
+    for (uint32_t i = 0; i < n_structs; i++)
         prog.structs.push_back(std::unique_ptr<StructTypeDef>(
             new StructTypeDef()));
-    for (uint32_t i = 0; i < n; i++)
+    for (uint32_t i = 0; i < n_structs; i++)
         r.structs.push_back(prog.structs[i].get());
+    for (uint32_t i = 0; i < n_descs; i++)
+        prog.funcs.push_back(std::unique_ptr<FuncDescriptor>(
+            new FuncDescriptor()));
+    for (uint32_t i = 0; i < n_descs; i++)
+        r.descs.push_back(prog.funcs[i].get());
+
+    /* PHASE 2 - CONTENT: the struct records (a const member may name a
+     * descriptor, which is a shell until the loop below it) */
+    n = n_structs;
     for (uint32_t i = 0; i < n; i++) {
         StructTypeDef &sd = *prog.structs[i];
         sd.name = r.uidv();
@@ -2058,18 +2105,11 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             const UniqueId *cn = r.uidv();
             sd.consts.emplace_back(cn, read_value(r));
         }
-        sd.compute_layout();
     }
 
-    /* descriptors: construct all, then fill (a chunk's closure_defs may
-     * reference any of them) */
-    n = r.countv();
+    /* ... then the descriptor records */
+    n = n_descs;
     std::vector<bool> has_chunk(n, false);
-    for (uint32_t i = 0; i < n; i++)
-        prog.funcs.push_back(std::unique_ptr<FuncDescriptor>(
-            new FuncDescriptor()));
-    for (uint32_t i = 0; i < n; i++)
-        r.descs.push_back(prog.funcs[i].get());
     for (uint32_t i = 0; i < n; i++) {
         FuncDescriptor &d = *prog.funcs[i];
         d.name = r.uidv();
@@ -2110,6 +2150,29 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         d.noescape_params = static_cast<uint64_t>(r.i64v());    /* v17 */
         has_chunk[i] = r.boolv();
         d.decl = nullptr;                      /* compile-only back-pointer */
+    }
+    r.descs_filled = true;
+
+    /*
+     * PHASE 3 - WIRING: what DERIVES from filled records.
+     *
+     * The struct LAYOUT is RECOMPUTED, never stored (deterministic from
+     * the field kinds; storing it would only add drift surface) - in
+     * table order, since an inline struct field only ever names an
+     * EARLIER struct, whose layout is then already computed.
+     */
+    for (auto &sdp : prog.structs)
+        sdp->compute_layout();
+
+    /* The pool closures read while the descriptors were shells: the
+     * capture-free rule (read_value's `func` case) on the real record. */
+    for (const FuncDescriptor *fd : r.deferred_funcs)
+        if (!fd->captures.empty())
+            bad_image("corrupt .myv (capturing closure in a pool)");
+    r.deferred_funcs.clear();
+
+    for (uint32_t i = 0; i < n; i++) {
+        FuncDescriptor &d = *prog.funcs[i];
         /*
          * Rebuild the bind plan from the params just read: bind_req is
          * DERIVED and not stored, and recomputing fast_bind beside it makes

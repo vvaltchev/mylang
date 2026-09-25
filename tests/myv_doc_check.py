@@ -161,14 +161,14 @@ def main(path):
     r.i64()                                       # builtin fingerprint
     root, rel, abs_, crc, size = (r.raw(), r.raw(), r.raw(), r.u32(), r.i64())
     strs = r.nx(r.raw)                            # section 6
-    nstructs = r.u32()                            # section 7
-    for _ in range(nstructs):
+    nstructs = r.u32()                            # 7.0 table of contents
+    ndesc = r.u32()                               #     (v20)
+    for _ in range(nstructs):                     # section 7
         r.uid()
         for _ in range(r.u32()):                  # fields
             r.uid(); r.u8(); r.uid(); r.sref(); r.boolv(); r.u32()
         for _ in range(r.u32()): r.uid(); value(r)     # consts
-    ndesc = r.u32()                               # section 8
-    has_chunk = []
+    has_chunk = []                                # section 8
     for _ in range(ndesc):
         r.uid(); r.sid()
         for _ in range(r.u32()):                  # params
