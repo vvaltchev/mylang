@@ -14645,3 +14645,29 @@ count, copies the arguments out of the frame, builds the ArgLocs, and
 generic). Two candidate follow-ups, neither built: a cheaper generic
 helper (construct only `n` slots), and lowering abs/min/max on PROVEN
 ints to native ops, as `len()` already is (`ArrLen`).
+
+## #97 B1 - A BUILTIN'S ARGUMENT BUFFER CONSTRUCTS ONLY WHAT IT HOLDS (2026-09-24)
+
+`jit_call_builtin` - and its interpreted twin, the lvalue-builtin family,
+the aggregate builders and the chain-store key buffer - copied a call's
+arguments out of the frame into `EvalValue stackbuf[8]` (16, 32): every
+element default-constructed and later destroyed, whatever the argument
+count. On 94 that was most of the ~200 Ir a builtin call cost before the
+builtin ran. `SmallArgs<N>` (evalvalue.h) is aligned raw storage:
+`push()` copy-constructs one argument in place and the destructor
+destroys exactly the pushed ones (also on a throw - it is an ordinary
+local); the heap fallback past N is unchanged. The two generic VALUE-call
+paths, which switch one pointer between a stack and a heap buffer, are
+left as they are (cold). No emitted code changes - verified by `-rt` on
+three lanes and `corpus_diff`.
+
+Measured (callgrind Ir per scale unit, `OPT=1 ASSERTS=0`, `-npc`, baseline
+H1; wall = ONE interleaved `--baseline` run):
+
+    bench                         Ir         wall
+    94_builtin_in_helper        -14.61%     0.95x
+    95_recursion_with_builtin   -11.58%     0.92x
+    41_str_int_conv             -10.98%     0.94x
+    32_str_build_join            -7.46%     0.99x
+    28_str_concat                -4.97%     0.96x
+    38 / 31 / 47 / 36 / 39 / 75 / 67 / 35 / 79 / 23 / 40 / 34 / 13   flat
