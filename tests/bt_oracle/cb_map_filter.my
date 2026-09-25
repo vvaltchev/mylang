@@ -1,0 +1,17 @@
+# map/filter callbacks whose bodies are inlined chains
+func sq(x) { return x * x; }
+func inv(x) { return 100 / sq(x - 2); }
+func pick(x) { return inv(x) > 3; }
+func stage(xs) => len(filter(pick, xs));
+func stage2(xs) => sum(map(inv, xs));
+func drive(n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var xs = [5, 7, 9];
+        s = s + stage(xs);
+        if (i == n - 1) append(xs, runtime(2));
+        s = s + stage2(xs);
+    }
+    return s;
+}
+print(drive(runtime(4)));

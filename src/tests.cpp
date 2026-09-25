@@ -16075,9 +16075,16 @@ typed_inlined_backtrace_parity()
  * the thing a backtrace test must compare (a matching exception TYPE says
  * nothing about the frames). `jit` and `splice` are the VM's two levers;
  * the tree-walker ignores both. Shared by the #44 and #38 checks.
+ *
+ * `inl` is the AST inliner (`-ni` when false); `virt`, when non-null,
+ * receives the number of VIRTUAL (inlined-at) frames the backtrace
+ * holds - how a test proves inlining reached the error path at all; and
+ * the exception's caret span is part of the result, since a caret that
+ * differs is a RULE 2 violation just like a frame.
  */
 static std::string
-engine_run_bt(const std::string &src, ExecEngine eng, bool jit, bool splice)
+engine_run_bt(const std::string &src, ExecEngine eng, bool jit, bool splice,
+              bool inl = true, int *virt = nullptr)
 {
     std::vector<Tok> toks;
     lexer(src, 1, toks);
@@ -16097,13 +16104,23 @@ engine_run_bt(const std::string &src, ExecEngine eng, bool jit, bool splice)
         root = pBlock(pc);
         mark_implicit_globals(root.get(), {});
         infer_types(root.get(), true);
-        run_optimizers(root.get());
+        run_optimizers(root.get(), inl);
         if (eng == ExecEngine::Vm)
             vm_execute(root.get());
         else
             root->eval(nullptr);
     } catch (const Exception &e) {
         tail = std::string("EXC ") + e.name + "\n" + format_backtrace(e);
+        if (virt) {
+            *virt = 0;
+            for (const auto &bf : e.backtrace)
+                if (!bf.desc)
+                    ++*virt;
+            tail += "caret " + std::to_string(e.loc_start.line) + ":"
+                  + std::to_string(e.loc_start.col) + "-"
+                  + std::to_string(e.loc_end.line) + ":"
+                  + std::to_string(e.loc_end.col) + "\n";
+        }
     }
     cout.rdbuf(old);
     g_exec_engine = se;
@@ -16277,6 +16294,284 @@ inlined_builtin_backtrace_parity()
                  << "the inlined frame:\n" << tw;
             ok = false;
         }
+    }
+    return ok;
+}
+
+/*
+ * #38 repro B - THE BACKTRACE ORACLE. The reference for an uncaught
+ * error is the program run with inlining OFF in the tree-walker: no
+ * inlined-at chain exists there, so every frame is a physical one and
+ * none can be lost or invented. With inlining ON, every engine
+ * configuration - the tree-walker, the VM with the JIT off and on, the
+ * bytecode splice off and on - must render the SAME backtrace AND caret
+ * (RULE 2). A differential between engines alone is blind here: a
+ * frame the inliner's chains lose is lost in every engine alike.
+ *
+ * Four defects were found by this oracle, one per shape family:
+ *  - tag_inline walked the resolver's for_each_child, which skips
+ *    Block/for/foreach/try/Expr14, so a spliced BLOCK body's statements
+ *    carried no chain (block_body, tail_inline, rec_unroll);
+ *  - the once-only inline_origin_emitted guard never reset when the
+ *    exception left a PHYSICAL frame, so a callee's virtual frame
+ *    suppressed its caller's (cb_sort_weight: `top` lost);
+ *  - an inlined frame rendered the template instance's `weight$0`
+ *    where the physical one renders `weight`;
+ *  - three JIT conveyances named the WRONG chain once a run's
+ *    originals were deleted: the boxed family's slow tier stamped no
+ *    chain (nested_chain lost d2..d4); a conversion at a NON-inlined
+ *    call site left the caller's re-raise to the collapsed pc lookup
+ *    (a phantom `step` above every `od` in mutual); and a SWITCHED
+ *    record's pop did the same (a phantom `pre` above every level of
+ *    deep_mutual under `jit cap 32`).
+ * Every program throws on a WARMED iteration (a first descent never
+ * takes the emitted push). tests/bt_oracle.py runs the same property
+ * over the CLI configurations -rt cannot reach (the JIT levers, a .myv
+ * image, --no-opt all).
+ *
+ * NOT VACUOUS: the reference must end in an exception with no virtual
+ * frame, and the inlined runs must render virtual frames - counted over
+ * the corpus, since a phantom-frame shape (mutual) legitimately has none.
+ */
+static bool
+inlined_backtrace_oracle()
+{
+    static const char *const progs[] = {
+        /* a comparator calling an inlined helper, sorted from an inlined
+         * body */
+        R"(func weight(x) { return 10 / (x - 1); }
+func cmpw(a, b) { return weight(a) < weight(b); }
+func top(xs, k) => len(sort(xs, cmpw)) + k;
+func drive(n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var xs = [3, 4, 2];
+        if (i == n - 1) append(xs, runtime(1));
+        s = s + top(xs, i);
+    }
+    return s;
+}
+print(drive(runtime(5)));)",
+        /* map/filter callbacks whose bodies are inlined chains */
+        R"(func sq(x) { return x * x; }
+func inv(x) { return 100 / sq(x - 2); }
+func pick(x) { return inv(x) > 3; }
+func stage(xs) => len(filter(pick, xs));
+func stage2(xs) => sum(map(inv, xs));
+func drive(n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var xs = [5, 7, 9];
+        s = s + stage(xs);
+        if (i == n - 1) append(xs, runtime(2));
+        s = s + stage2(xs);
+    }
+    return s;
+}
+print(drive(runtime(4)));)",
+        /* a 4-deep chain of expression-bodied inlinees (boxed ops) */
+        R"(func d4(x) => 1000 / (x - 7);
+func d3(x) => d4(x + 1) + 1;
+func d2(x) => d3(x * 2) - 2;
+func d1(x) => d2(x - 1) * 3;
+func outer(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++)
+        s = s + d1(runtime(i));
+    return s;
+}
+print(outer(runtime(6)));)",
+        /* typed-scalar chains spliced from inlined bodies */
+        R"(func ratio(int a, int b) => a * 3 / (b - a);
+func mix(float f, int a, int b) => f + float(ratio(a, b));
+func run(int n) {
+    var acc = 0.0;
+    for (var i = 1; i <= n; i++)
+        acc = acc + mix(0.5, i, runtime(n));
+    return acc;
+}
+print(run(runtime(5)));)",
+        /* block-bodied inlinees: locals, and an if-chain */
+        R"(func h(x) { var t = x + 1; var q = t * 2; return 50 / (q - 8); }
+func g(x) { if (x > 100) return 0; if (x < -100) return 1; return h(x); }
+func drive(n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) s = s + g(int(runtime(i)));
+    return s;
+}
+print(drive(runtime(5)));)",
+        /* a tail call to a block body with a loop in it */
+        R"(func acc(n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) s = s + 12 / (i - 3);
+    return s;
+}
+func w(n) { return acc(n); }
+func go(n) {
+    var t = 0;
+    for (var j = 0; j < n; j++) t = t + w(runtime(j));
+    return t;
+}
+print(go(runtime(6)));)",
+        /* a user struct rethrown across an inlined frame */
+        R"(struct E { int v; }
+func risky(int x) { if (x > 5) throw E(x); return x; }
+func guard(int x) {
+    try { return risky(x) + 1; }
+    catch (E as e) { rethrow; }
+    return 0;
+}
+func mid(int x) => guard(x) * 2;
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++)
+        s = s + mid(runtime(i));
+    return s;
+}
+print(drive(runtime(8)));)",
+        /* a subscript's own OutOfBounds inside an inlined body */
+        R"(func at(array<int> xs, int i) => xs[i] + 1;
+func pairsum(array<int> xs, int i) => at(xs, i) + at(xs, i + 1);
+func drive(int n) {
+    var xs = [1, 2, 3, 4];
+    var s = 0;
+    for (var i = 0; i < n; i++) s = s + pairsum(xs, runtime(i));
+    return s;
+}
+print(drive(runtime(6)));)",
+        /* mutual recursion whose calls sit NEXT TO an inlined helper */
+        R"(func ev(int n, int k) {
+    if (n == 0) return 10 / (k - 1);
+    return od(n - 1, k) + 1;
+}
+func od(int n, int k) { return ev(n - 1, k) + step(n); }
+func step(int n) => n * 2;
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < 4; i++) {
+        var k = 0;
+        if (i == 3) k = runtime(1);
+        s = s + ev(n * 2, k);
+    }
+    return s;
+}
+print(drive(runtime(4)));)",
+        /* deep enough to cross the `jit cap 32` config's sync depth
+         * cap (the SWITCH path), every call site inside an inlined
+         * region. NOT deeper: the -ni tree-walker reference recurses on
+         * the C STACK, and at 300 levels MSVC's frames overflowed the
+         * Windows lane's 8MB (exit 127). tests/bt_oracle.py keeps the
+         * full depth for the CLI's default cap. */
+        R"(func walk(int n, int k) {
+    if (n == 0) return 10 / (k - 1);
+    return wrap(n, k);
+}
+func wrap(int n, int k) => walk(n - 1, k) + 1;
+func drive(int d) {
+    var s = 0;
+    for (var i = 0; i < 4; i++) {
+        var k = 0;
+        if (i == 3) k = runtime(1);
+        s = s + walk(d, k);
+    }
+    return s;
+}
+print(drive(runtime(64)));)",
+        /* a MUTUAL recursion past the cap (the `jit cap 32` config
+         * below drives it through the SWITCH), its calls in inlined
+         * regions of a chunk that also holds another inlinee (`pre`) */
+        R"(func ev(int n, int k) {
+    if (n == 0) return 10 / (k - 1);
+    var a = pre(n);
+    return a + wod(n, k);
+}
+func od(int n, int k) {
+    if (n == 0) return 20 / (k - 1);
+    var a = pre(n);
+    return a + wev(n, k);
+}
+func pre(int n) => n * 3;
+func wod(int n, int k) => od(n - 1, k) + 1;
+func wev(int n, int k) => ev(n - 1, k) + 1;
+func drive(int d) {
+    var s = 0;
+    for (var i = 0; i < 4; i++) {
+        var k = 0;
+        if (i == 3) k = runtime(1);
+        s = s + ev(d, k);
+    }
+    return s;
+}
+print(drive(runtime(60)));)",
+    };
+    std::vector<std::string> corpus(std::begin(progs), std::end(progs));
+    /* the fib-unroll shape at every depth the unroll distinguishes */
+    for (int depth = 1; depth <= 8; depth++)
+        corpus.push_back(
+            "func u(n, k) {\n"
+            "    if (n < 2) return 10 / (n - k);\n"
+            "    return u(n - 1, k) + u(n - 2, k);\n"
+            "}\n"
+            "func drive(int d) {\n"
+            "    var s = 0;\n"
+            "    for (var i = 0; i < 4; i++) {\n"
+            "        var k = -1;\n"
+            "        if (i == 3) k = runtime(1);\n"
+            "        s = s + u(runtime(d), k);\n"
+            "    }\n"
+            "    return s;\n"
+            "}\n"
+            "print(drive(" + std::to_string(depth) + "));\n");
+
+    /* `cap` > 0 lowers the JIT's sync depth cap for the run (it is baked
+     * at emission, so it is set before the compile): 32 is what a build
+     * without the native stack - a sanitized one - runs, and it is what
+     * sends a deep recursion through the SWITCH records */
+    const struct {
+        const char *name; ExecEngine eng; bool jit, splice; int cap;
+    } cfgs[] = {
+        { "tw", ExecEngine::TreeWalk, false, false, 0 },
+        { "vm -nbi", ExecEngine::Vm, false, false, 0 },
+        { "jit -nbi", ExecEngine::Vm, true, false, 0 },
+        { "vm", ExecEngine::Vm, false, true, 0 },
+        { "jit", ExecEngine::Vm, true, true, 0 },
+        { "jit cap 32", ExecEngine::Vm, true, true, 32 },
+    };
+    bool ok = true;
+    int virt_total = 0;
+    for (size_t p = 0; p < corpus.size(); p++) {
+        int rv = -1;
+        const std::string ref = engine_run_bt(
+            corpus[p], ExecEngine::TreeWalk, false, false, false, &rv);
+        if (ref.find("EXC ") == std::string::npos || rv != 0) {
+            cout << "  program " << p << ": the -ni reference must end "
+                 << "in an exception with no virtual frame:\n" << ref;
+            ok = false;
+            continue;
+        }
+        for (const auto &c : cfgs) {
+            int v = 0;
+            const int saved_cap = jit_sync_depth_cap();
+            if (c.cap)
+                jit_set_sync_depth_cap(c.cap);
+            const std::string r = engine_run_bt(corpus[p], c.eng, c.jit,
+                                                c.splice, true, &v);
+            jit_set_sync_depth_cap(saved_cap);
+            if (c.eng == ExecEngine::TreeWalk)
+                virt_total += v;
+            if (r != ref) {
+                cout << "  program " << p << " (" << c.name
+                     << ", inlining on) differs from -ni -tw\n  ref:\n"
+                     << ref << "  got:\n" << r;
+                ok = false;
+            }
+        }
+    }
+    if (virt_total < 20) {
+        cout << "  VACUOUS: only " << virt_total << " virtual frames "
+             << "rendered over the corpus - the inliner no longer reaches "
+             << "the error paths\n";
+        ok = false;
     }
     return ok;
 }
@@ -45780,6 +46075,8 @@ static const std::vector<extra_check> extra_checks =
       callback_frame_call_site },
     { "backtrace: a builtin call in an inlined body keeps its frame (#38)",
       inlined_builtin_backtrace_parity },
+    { "backtrace: inlining renders the -ni backtrace, every engine (#38)",
+      inlined_backtrace_oracle },
     { "static_type: ground caching & with_opt", static_type_ground_caching },
     { "static_type: assignable rules", static_type_assignable_rules },
     { "static_type: join (LUB) rules", static_type_join_rules },

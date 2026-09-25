@@ -1,0 +1,10 @@
+# a subscript's own error (out of bounds) inside an inlined body
+func at(array<int> xs, int i) => xs[i] + 1;
+func pairsum(array<int> xs, int i) => at(xs, i) + at(xs, i + 1);
+func drive(int n) {
+    var xs = [1, 2, 3, 4];
+    var s = 0;
+    for (var i = 0; i < n; i++) s = s + pairsum(xs, runtime(i));
+    return s;
+}
+print(drive(runtime(6)));

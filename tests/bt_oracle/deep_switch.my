@@ -1,0 +1,17 @@
+# a recursion deep enough to cross the JIT's sync depth cap (the SWITCH
+# path), whose every call site sits inside an inlined region
+func walk(int n, int k) {
+    if (n == 0) return 10 / (k - 1);
+    return wrap(n, k);
+}
+func wrap(int n, int k) => walk(n - 1, k) + 1;
+func drive(int d) {
+    var s = 0;
+    for (var i = 0; i < 4; i++) {
+        var k = 0;
+        if (i == 3) k = runtime(1);
+        s = s + walk(d, k);
+    }
+    return s;
+}
+print(drive(runtime(300)));

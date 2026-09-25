@@ -1,0 +1,17 @@
+# find/sum key callbacks, and a lambda inside an inlined body
+func key(int x) { return 60 / (x - 6); }
+func probe(array<int> xs, int k) => find(xs, k, key) ?? 0;
+func tot(array<int> xs) {
+    return sum(xs, func(int v) => key(v) + 1);
+}
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var xs = [1, 2, 3];
+        s = s + probe(xs, 20);
+        if (i == n - 1) append(xs, runtime(6));
+        s = s + tot(xs);
+    }
+    return s;
+}
+print(drive(runtime(4)));

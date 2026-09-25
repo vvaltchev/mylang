@@ -1,0 +1,17 @@
+# mutual recursion through an inlined helper, thrown on a warmed call
+func ev(int n, int k) {
+    if (n == 0) return 10 / (k - 1);
+    return od(n - 1, k) + 1;
+}
+func od(int n, int k) { return ev(n - 1, k) + step(n); }
+func step(int n) => n * 2;
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < 4; i++) {
+        var k = 0;
+        if (i == 3) k = runtime(1);
+        s = s + ev(n * 2, k);
+    }
+    return s;
+}
+print(drive(runtime(4)));

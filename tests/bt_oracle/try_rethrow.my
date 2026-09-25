@@ -1,0 +1,16 @@
+# a user exception crossing inlined code and a rethrow
+struct E { int v; }
+func risky(int x) { if (x > 5) throw E(x); return x; }
+func guard(int x) {
+    try { return risky(x) + 1; }
+    catch (E as e) { rethrow; }
+    return 0;
+}
+func mid(int x) => guard(x) * 2;
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++)
+        s = s + mid(runtime(i));
+    return s;
+}
+print(drive(runtime(8)));

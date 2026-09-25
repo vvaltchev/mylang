@@ -1,0 +1,14 @@
+# a comparator that calls an inlined helper, sorted from an inlined body
+func weight(x) { return 10 / (x - 1); }
+func cmpw(a, b) { return weight(a) < weight(b); }
+func top(xs, k) => len(sort(xs, cmpw)) + k;
+func drive(n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var xs = [3, 4, 2];
+        if (i == n - 1) append(xs, runtime(1));
+        s = s + top(xs, i);
+    }
+    return s;
+}
+print(drive(runtime(5)));

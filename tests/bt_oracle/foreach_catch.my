@@ -1,0 +1,28 @@
+# a foreach and a try/catch inside tail-inlined bodies, a struct thrown
+# from a catch arm, caught and re-thrown across an inlined frame
+struct Bad { int at; }
+func sumto(array<int> a) {
+    var s = 0;
+    foreach (var v in a) s = s + 60 / v;
+    return s;
+}
+func w(array<int> a) { return sumto(a); }
+func safe(int x) {
+    try { return 10 / x; }
+    catch (DivisionByZeroEx) { throw Bad(x); }
+    return 0;
+}
+func guarded(int x) { return safe(x); }
+func drive(int n) {
+    var t = 0;
+    for (var i = 0; i < n; i++) {
+        var a = [3, 2, 1];
+        t = t + w(a);
+        try { t = t + guarded(n - 2 - i); }
+        catch (Bad as b) { if (i < n - 1) rethrow; }
+        if (i == n - 2) append(a, runtime(0));
+        t = t + w(a);
+    }
+    return t;
+}
+print(drive(runtime(4)));
