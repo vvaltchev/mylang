@@ -1240,6 +1240,58 @@ EvalValue builtin_reverse_lv(EvalContext *ctx, const ArgLocs *exprList,
     return reverse_core(ctx, exprList, RValue(EvalValue(target)), target);
 }
 
+/*
+ * #48: the sum of an EMPTY array. The static type of `sum(a)` is the
+ * element type (the key_func's return type with one), NON-opt - so the
+ * `none` this used to return put a none in a slot inference had proven
+ * numeric (RULE 1). The inferencer decides the answer from that type and
+ * stamps it on the args list (stamp_sum_identity): flat_i -> int 0,
+ * flat_f -> float 0.0. Unstamped (no inference, or `sum` reached as a
+ * function VALUE), the array's own flat numeric storage decides the same
+ * way. Anything else - a str/array/struct/dyn sum - has no identity to
+ * give, so it is an InvalidArgumentEx, like `max` of an empty array.
+ */
+static EvalValue
+sum_of_nothing(const ArgLocs *exprList, const SharedArrayObj &arr,
+               bool keyed)
+{
+    if (exprList->arr_hint == ArrHint::flat_i)
+        return EvalValue(static_cast<int_type>(0));
+    if (exprList->arr_hint == ArrHint::flat_f)
+        return EvalValue(static_cast<float_type>(0));
+    if (!keyed) {
+        switch (arr.skind()) {
+        case SharedArrayObj::Storage::ints:
+        case SharedArrayObj::Storage::bools:
+            return EvalValue(static_cast<int_type>(0));
+        case SharedArrayObj::Storage::floats:
+            return EvalValue(static_cast<float_type>(0));
+        default:
+            break;
+        }
+    }
+    const ArgLoc *arg0 = exprList->arg(0);
+    throw InvalidArgumentEx("sum() of an empty array has no value "
+                            "(only a numeric sum starts from 0)",
+                            arg0->start, arg0->end);
+}
+
+/*
+ * #48: the accumulator's seed - a COPY of the first term (`+=` mutates the
+ * accumulator in place, and the term may be an array the caller or a
+ * callback still references), with a BOOL promoted to int. The static
+ * type of a bool sum is int (it counts the `true`s), and every later
+ * `+` promotes anyway - but a ONE-term sum never reached a `+`, so
+ * `sum([5], func(x) => x > 1)` returned `true` into a slot proven int.
+ */
+static EvalValue
+sum_seed(const EvalValue &first)
+{
+    if (first.is<bool>())
+        return EvalValue(static_cast<int_type>(first.get<bool>() ? 1 : 0));
+    return first.clone();
+}
+
 EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
                       const EvalValue *args, size_t nargs)
 {
@@ -1267,7 +1319,7 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         const size_type off = arr.offset(), n = arr.size();
 
         if (n == 0)
-            return none;
+            return sum_of_nothing(exprList, arr, false);
 
         if (arr.skind() == SharedArrayObj::Storage::ints) {
             const auto &iv = arr.flat_ints();
@@ -1311,7 +1363,7 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
             throw TypeErrorEx("Expected function", arg1->start, arg1->end);
 
         if (arr.size() == 0)
-            return none; /* like the 1-arg form */
+            return sum_of_nothing(exprList, arr, true);
 
         VmInvoker inv(ctx, *val1.get<intrusive_ptr<FuncObject>>().get(),
                       exprList->start);
@@ -1319,7 +1371,7 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         /* Seed with a COPY of the first result, as the 1-arg path does:
          * `+=` mutates the accumulator in place, and a callback may return
          * an array it still references. */
-        EvalValue val = inv.call(arr_elem_at(arr, 0)).clone();
+        EvalValue val = sum_seed(inv.call(arr_elem_at(arr, 0)));
 
         for (size_type i = 1; i < arr.size(); i++)
             num_bin_op(val, inv.call(arr_elem_at(arr, i)), &Type::add);
@@ -1336,7 +1388,7 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
     const ArrayConstView &view = marr.get_view();
 
     if (view.size() == 0)
-        return none; /* sum of an empty array is none, like min()/max() */
+        return sum_of_nothing(exprList, arr, false);
 
     const EvalValue &first = view[0].get();
 
@@ -1375,7 +1427,7 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
      * `+=` appends to it), so aliasing view[0] would mutate the input array
      * - and would be rejected outright when the input is a read-only const.
      */
-    EvalValue val = first.clone();
+    EvalValue val = sum_seed(first);
 
     for (size_type i = 1; i < view.size(); i++) {
         num_bin_op(val, view[i].get(), &Type::add);

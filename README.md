@@ -2382,6 +2382,24 @@ return the result. In case the optional argument `key_func` is passed to `sum()`
 the operator `+` is applied to the result of `key_func(elem)`, for each element
 instead.
 
+The result has the type of the terms being added - the element type, or the
+return type of `key_func` - except that `bool` terms are counted, so a sum of
+bools is always an `int` (even of a single term: `sum([true]) == 1`).
+
+The sum of an **empty** array is the additive identity when the sum is
+numeric: `0` for an `int` (or `bool`) sum, `0.0` for a `float` one. Any other
+kind of sum (strings, arrays, `dyn`, ...) has no such value, so an empty one
+raises `InvalidArgumentEx`. Which case applies is decided by the sum's static
+type; where no type is known (under `-nti`, or `sum` called through a
+function value), only an array stored as flat ints/bools/floats yields
+`0`/`0.0`, and any other empty sum raises.
+
+```C#
+array<int> none_yet = [];
+print(sum(none_yet) + 1);                    # 1
+print(sum(none_yet, func(int x) => x * 0.5)); # 0.000000
+```
+
 ### Dictionary builtins
 
 #### `keys(dictionary)`
