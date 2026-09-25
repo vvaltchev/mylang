@@ -618,5 +618,30 @@ else
     fail "-nti: rc=$got_rc tw=[$a] vm=[$b]"
 fi
 
+# ---------------------------------------------------------------------
+# -nc (#54): the flag turns off constant FOLDING, and until #54 it also
+# stopped the parser REGISTERING consts, struct types and pure funcs -
+# so this program was refused ("expression is not const", "'P' is not a
+# type") and a nested POD field was laid out boxed. RULE 2: the flag is
+# an optimization switch, so the output must equal the default run's.
+cat > "$TMP/nc.my" <<'NCEOF'
+const K = 3;
+struct S { const Z = K * 2; }
+struct P { int x; }
+struct O { P p; int c; }
+pure func f(x) => x * K;
+const T = f(4);
+P q = P(runtime(5));
+print(S.Z, T, q.x, layout(O).pod, layout(O).size);
+NCEOF
+a=$("$BIN" "$TMP/nc.my" 2>&1)
+b=$("$BIN" -nc "$TMP/nc.my" 2>&1)
+got_rc=$?
+if [ "$got_rc" = 0 ] && [ "$a" = "6 12 5 true 16 " ] && [ "$a" = "$b" ]; then
+    pass "-nc: consts, struct types and layouts are the default run's"
+else
+    fail "-nc: rc=$got_rc default=[$a] -nc=[$b]"
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc
