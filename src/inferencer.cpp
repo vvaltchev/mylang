@@ -425,6 +425,7 @@ private:
     void check_if(IfStmt *i);
     TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
+    void stamp_untyped_calls(Construct *n);   /* #51: -nti's call hints */
     void set_array_repr_hint(Expr14 *e);    /* type-driven ArrHint on rvalue */
     void stamp_sum_identity(CallExpr *call);  /* #48: sum() of nothing */
     void check_call(CallExpr *call);
@@ -1625,8 +1626,14 @@ void Inferencer::infer_one(Block *rootBlock)
         for (auto &e : rootBlock->elems)
             reject_dev_builtins(e.get());
 
-    if (!checks_enabled)
+    if (!checks_enabled) {
+        /* #51: with no types, every call's callee is unknown - say so, or
+         * the codegen (which lowers a call only on a type proof) refuses
+         * the program. */
+        for (auto &e : rootBlock->elems)
+            stamp_untyped_calls(e.get());
         return;
+    }
 
     mark_lambda_templates();   /* safe var-bound lambdas become templates */
     run_fixpoint(rootBlock);
@@ -2449,6 +2456,29 @@ void Inferencer::dump_debug_ti(std::ostream &os)
         }
         os << "\n";
     }
+}
+
+/*
+ * #51: under -nti no type is proven, and the codegen lowers a call ONLY on
+ * a proof - a user-function callee (vm_direct_func -> CallV), a struct
+ * constructor (vm_struct_ctor_def), or a `dyn` callee (vm_dyn_callee ->
+ * the generic CheckCallableV + CallValueGenericV, which dispatches on the
+ * RUNTIME callee: function, struct descriptor or builtin). With none of
+ * the three, every non-inlined, non-folded user call was a NotLoweredEx
+ * compile refusal. The honest -nti answer IS "a dyn callee": that is what
+ * the typed pipeline answers for any callee it cannot type (and for a
+ * builtin used by name - type_of of a builtin identifier is dyn, so a
+ * typed `len(a)` carries the same stamp; a DirectBuiltinCallExpr never
+ * reads it). The generic dispatch is the tree-walker's own
+ * dispatch_call_value, so both engines stay identical.
+ */
+void Inferencer::stamp_untyped_calls(Construct *n)
+{
+    if (!n)
+        return;
+    if (ctag(n) == ConstructType::call)
+        static_cast<CallExpr *>(n)->vm_dyn_callee = true;
+    for_each_child(n, [&](Construct *c) { stamp_untyped_calls(c); });
 }
 
 void Inferencer::annotate_hints(Construct *n)

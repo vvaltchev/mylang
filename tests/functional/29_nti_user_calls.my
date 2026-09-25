@@ -1,0 +1,70 @@
+# #51: under -nti (no type inference) the VM codegen lowered a call ONLY
+# on a type proof - a user function (CallV), a struct constructor, or a
+# `dyn` callee - so with no types EVERY user call that survived the
+# inliner and the folder was a NotLoweredEx compile refusal, while the
+# tree-walker ran it:
+#
+#     InternalErrorEx: codegen: construct not lowered natively: ForStmt
+#
+# Found as a ForStmt because the statement-level dispatch reports the
+# outermost construct it failed on. Every call below is reached with a
+# runtime argument (no fold) and most bodies are too large for the
+# expression inliner, so they reach codegen AS calls.
+#
+# ⛔ THE ORACLE IS tests/corpus_diff.sh's `-nti` pass (both engines run
+# untyped and must agree); the plain pass runs it typed too.
+
+struct P { int x; int y; }
+
+func srt(a, f) {
+    sort(a, f);
+    var r = a[0];
+    return r;
+}
+func mk(i) { var p = P(i, i * 2); return p; }
+func area(p) { var r = p.x * p.y; return r; }
+func rec(n) { if (n < 2) return n; return rec(n - 1) + rec(n - 2); }
+func counter() { var n = 0; return func [n] () { n += 1; return n; }; }
+
+var t = 0;
+for (var i = 0; i < 5; i++) {
+    var a = [3, i, 1];
+    t += srt(a, func(x, y) => x < y);
+}
+print("srt", t);
+
+var ps = [];
+for (var i = 0; i < 4; i++)
+    append(ps, mk(runtime(i)));
+var s = 0;
+foreach (p in ps)
+    s += area(p);
+print("area", s);
+
+print("rec", rec(runtime(12)));
+var ff = rec;
+print("value call", ff(runtime(9)));
+
+var ct = counter();
+ct();
+ct();
+print("closure", ct());
+
+var total = 0;
+var k = 0;
+while (k < 3) {
+    total = total + area(mk(k)) + rec(k);
+    k++;
+}
+print("while", total);
+
+var caught = 0;
+for (var i = 0; i < 3; i++) {
+    try {
+        var z = mk(runtime(i));
+        print("div", 10 / (z.x - 1));
+    } catch (DivisionByZeroEx) {
+        caught++;
+    }
+}
+print("caught", caught);

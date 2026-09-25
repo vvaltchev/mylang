@@ -185,8 +185,9 @@ compiles_all() {
   return $bad
 }
 
-run_one() {                      # $1 = env assignment ("" = plain)
+run_one() {     # $1 = env assignment ("" = plain), $2 = extra engine flags
   local bad=0 n=0 a b
+  local flags=${2:-}
   for f in $(progs); do
     # ⛔ COMPARE THE WHOLE OUTPUT. This used to pipe both sides through
     # `tail -3`, so a divergence anywhere but a program's last three
@@ -196,23 +197,32 @@ run_one() {                      # $1 = env assignment ("" = plain)
     # truncation was only ever meant to keep the DIFF MESSAGE short,
     # which is what the diff below does instead: compare everything,
     # print the first few DIFFERING lines (more useful than the tail).
-    a=$(timeout 60 "$BIN" -tw "$f" 2>&1)
-    b=$(env $1 timeout 60 "$BIN" "$f" 2>&1)
+    a=$(timeout 60 "$BIN" -tw $flags "$f" 2>&1)
+    b=$(env $1 timeout 60 "$BIN" $flags "$f" 2>&1)
     n=$((n + 1))
     if [ "$a" != "$b" ]; then
-      echo "DIFF [${1:-plain}] $f"
+      echo "DIFF [${1:-plain}${flags:+ $flags}] $f"
       diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") \
         | head -8 | sed 's/^/  /'
       bad=$((bad + 1))
     fi
   done
-  printf "  %-28s %d/%d agree\n" "${1:-plain}" "$((n - bad))" "$n"
+  printf "  %-28s %d/%d agree\n" "${1:-plain}${flags:+ $flags}" \
+    "$((n - bad))" "$n"
   return $bad
 }
 
 rc=0
 compiles_all || rc=1
 run_one "" || rc=1
+# #51: -nti (no type inference) had NO net - and the codegen, which
+# lowers a call only on a TYPE proof, refused every non-inlined user
+# call there (NotLoweredEx) while the tree-walker ran it. Both SIDES run
+# -nti: the typed and untyped programs may legitimately differ (typestr
+# reports the runtime type, a `float` parameter no longer coerces an
+# int), but the ENGINES must agree within either mode. Always on - it
+# is one more corpus pass.
+run_one "" "-nti" || rc=1
 case "$MODE" in
   --levers)
     for L in $LEVERS all; do run_one "MYLANG_JIT_OFF=$L" || rc=1; done ;;

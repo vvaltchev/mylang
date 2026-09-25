@@ -3363,6 +3363,17 @@ decisions behind it: `plans/archived/type-inference.md`,
   disabled: `-nti` no longer makes `infer_types` a full no-op — it sets
   `checks_enabled = false`, and `run()` still does the structural pass +
   lowering, then returns before the fixpoint.
+  **⛔ AND IT STAMPS EVERY CALL A `dyn` CALLEE (`stamp_untyped_calls`,
+  #51).** The VM codegen lowers a call only on a TYPE proof -
+  `vm_direct_func` (CallV), `vm_struct_ctor_def`, or `vm_dyn_callee` (the
+  generic CheckCallableV + CallValueGenericV, which dispatches on the
+  RUNTIME callee) - so with no stamp at all, every user call that survived
+  the inliner and the folder was a NotLoweredEx compile refusal under
+  `-nti` while the tree-walker ran it. `dyn` is the honest answer with no
+  types, and `try_native_value_call` admits a `DirectCallExpr` carrying
+  it. **A hint the codegen requires must have an `-nti` answer too.** The
+  net is `corpus_diff.sh`'s always-on `-nti` pass (both engines untyped)
+  plus a `driver_checks.sh` case; nothing in `-rt` runs untyped.
 
   Both sites share **one** mapping implementation, `desugar_named_call`
   (`syntax.cpp`, declared in `syntax.h`): it takes the call plus a normalized

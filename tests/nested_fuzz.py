@@ -584,10 +584,11 @@ def main():
                          "--show inspection); the chosen seed is printed so you "
                          "can reproduce it with --seed")
     ap.add_argument("--engines", default="tw,vm,py,noopt,bi",
-                    help="comma list of engines to compare: tw,vm,py,noopt,bi "
-                         "(noopt re-runs both engines with every AST "
+                    help="comma list of engines to compare: tw,vm,py,noopt,bi"
+                         ",nti (noopt re-runs both engines with every AST "
                          "transform disabled - the only oracle for an "
-                         "optimizer that rewrites the tree)")
+                         "optimizer that rewrites the tree; nti, opt-in, "
+                         "re-runs both with type inference off - #51)")
     ap.add_argument("--keep-failures", default=None,
                     help="directory to save diverging .my/.py for debugging")
     ap.add_argument("--check-fallbacks", action="store_true",
@@ -681,6 +682,14 @@ def main():
                                        "--no-opt", "all"], my_path)
             results["tw-noopt"] = run([args.mylang, "-tw",
                                        "--no-opt", "all"], my_path)
+
+        # -nti (#51): the codegen lowers a call only on a TYPE proof, so
+        # untyped it once refused every surviving user call. These
+        # programs are int-only, so typed and untyped must print the same.
+        # Opt-in: tests/corpus_diff.sh's always-on -nti pass is the net.
+        if "nti" in engines:
+            results["vm-nti"] = run([args.mylang, "-vm", "-nti"], my_path)
+            results["tw-nti"] = run([args.mylang, "-tw", "-nti"], my_path)
 
         vals = list(results.values())
         # ⛔ A TIMEOUT IS "I DO NOT KNOW", NOT "A DIFFERENT ANSWER".
