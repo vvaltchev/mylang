@@ -29,19 +29,58 @@ static EvalValue struct_elem_at(const SharedArrayObj &arr, size_type i)
     return intrusive_ptr<StructObject>(obj);
 }
 
+/*
+ * A fresh GENERAL array holding this array's elements (this handle's range),
+ * leaving the storage every handle shares untouched - for a READ-only walk
+ * that wants the general view of a flat struct/strs array (sum/min/max).
+ */
+template <class LValueT>
+SharedArrayObjTempl<LValueT> SharedArrayObjTempl<LValueT>::general_copy() const
+{
+    const size_type n = size();
+    vec_type nv;
+    nv.reserve(n);
+    for (size_type i = 0; i < n; i++)
+        nv.emplace_back(arr_elem_at(*this, i), false);
+    return SharedArrayObjTempl(std::move(nv));
+}
+
+/*
+ * #53b: the promotion is IN PLACE, on the storage every handle shares.
+ *
+ * It used to RESEAT this handle onto a fresh general copy - so a cold op
+ * (pop/erase/insert/sort/reverse) on a flat struct or strs array through
+ * one variable left every OTHER variable holding the old storage, and
+ * MyLang's reference semantics ("assignment aliases") silently broke:
+ * `var f = e; pop(f)` shrank f and not e, where the same program over an
+ * int or a general array shrinks both. Three sites had patched the NAMED
+ * variable back through its lvalue; an alias, a parameter or a container
+ * element still diverged.
+ *
+ * A SLICE handle is a view with copy semantics - any write through it
+ * detaches it anyway - so it keeps the reseat, over its own range.
+ */
 template <class LValueT>
 void SharedArrayObjTempl<LValueT>::promote_structs_to_general()
 {
     if (shobj->kind != Storage::structs)
         return;
 
-    const size_type n = size();
+    if (slice) {
+        *this = general_copy();
+        return;
+    }
+
+    const size_type n = size();         /* a non-slice: the whole storage */
     vec_type nv;
     nv.reserve(n);
     for (size_type i = 0; i < n; i++)
         nv.emplace_back(struct_elem_at(*this, i), false);
 
-    *this = SharedArrayObjTempl(std::move(nv));
+    shobj->svec.~svec_type();
+    shobj->kind = Storage::general;
+    new (&shobj->vec) vec_type(std::move(nv));
+    len = n;
 }
 
 template <class LValueT>
@@ -50,14 +89,21 @@ void SharedArrayObjTempl<LValueT>::promote_strs_to_general()
     if (shobj->kind != Storage::strs)
         return;
 
+    if (slice) {
+        *this = general_copy();
+        return;
+    }
+
     const size_type n = size();
-    const size_type base = offset();
     vec_type nv;
     nv.reserve(n);
     for (size_type i = 0; i < n; i++)
-        nv.emplace_back(EvalValue(SharedStr(shobj->tvec[base + i])), false);
+        nv.emplace_back(EvalValue(SharedStr(shobj->tvec[i])), false);
 
-    *this = SharedArrayObjTempl(std::move(nv));
+    shobj->tvec.~tvec_type();
+    shobj->kind = Storage::general;
+    new (&shobj->vec) vec_type(std::move(nv));
+    len = n;
 }
 
 template <class LValueT>

@@ -7604,6 +7604,44 @@ static const std::vector<test> tests =
     },
 
     {
+        /* #53b: a cold op (pop/erase/insert/sort) PROMOTES a flat strs or
+         * struct array to general, and the promotion used to RESEAT only
+         * the handle it ran on - every alias kept the old storage, so
+         * `var f = e; pop(f)` shrank f and not e (an int or general array
+         * shrinks both). In place now: through a variable alias, a
+         * parameter and a container element alike. A READ-only general
+         * walk (min/max/sum) must not promote the caller's array. */
+        "cold ops on a flat strs/struct array keep aliases in sync (#53b)",
+        {
+            "struct P { int x; }",
+            "func popit(a) { pop(a); }",
+            "var e = split(\"b a c\", str(runtime(\" \")));",
+            "assert(array_storage(e) == \"str\");",
+            "assert(min(e) == \"a\" && max(e) == \"c\");",
+            "assert(array_storage(e) == \"str\");",
+            "var f = e;",
+            "pop(f);",
+            "assert(len(e) == 2 && len(f) == 2);",
+            "erase(f, 0);",
+            "insert(f, 0, \"w\");",
+            "assert(e == [\"w\", \"a\"] && f == e);",
+            "var g = split(\"x y z\", str(runtime(\" \")));",
+            "popit(g);",
+            "assert(len(g) == 2);",
+            "var ps = [P(int(runtime(3))), P(1), P(2)];",
+            "assert(array_storage(ps) == \"struct\");",
+            "var qs = ps;",
+            "sort(qs, func (p, q) => p.x < q.x);",
+            "assert(ps[0].x == 1 && ps[2].x == 3);",
+            "pop(qs);",
+            "assert(len(ps) == 2);",
+            "var box = [ps];",
+            "erase(box[0], 0);",
+            "assert(len(ps) == 1 && ps[0].x == 2);",
+        },
+    },
+
+    {
         "Min and Max builtins",
         {
             "assert(min(1,2) == 1);",

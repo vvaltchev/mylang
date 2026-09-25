@@ -1409,12 +1409,13 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         return val;
     }
 
-    /* A flat-strs array reaches the general path via promotion on a local
-     * HANDLE copy (the caller's array keeps its storage): sum of strings
-     * concatenates through the general `+=` loop, as it always did. */
-    SharedArrayObj marr = arr;
-    if (marr.skind() == SharedArrayObj::Storage::strs)
-        marr.promote_strs_to_general();
+    /* A flat-strs array reaches the general path through a general COPY
+     * (the caller's array keeps its storage - a promotion is in place on the
+     * shared storage now, #53b): sum of strings concatenates through the
+     * general `+=` loop, as it always did. */
+    const SharedArrayObj marr =
+        arr.skind() == SharedArrayObj::Storage::strs ? arr.general_copy()
+                                                      : arr;
     const ArrayConstView &view = marr.get_view();
 
     if (view.size() == 0)
