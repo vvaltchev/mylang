@@ -7336,7 +7336,8 @@ instrumentation (see `plans/archived/function-templates.md`).
 
 **⛔ A HIGHER-ORDER BUILTIN CALLS ITS CALLBACK THROUGH `VmInvoker::call`,
 AND THROUGH NOTHING ELSE (2026-08-14).** Construct one `VmInvoker inv(ctx,
-funcObj)` outside the loop and write `inv.call(args...)` per element —
+funcObj, exprList->start)` outside the loop and write `inv.call(args...)`
+per element —
 passing the arguments in whatever C++ types you already hold (a flat
 array's raw `int_type`, an `EvalValue`, a `SharedStr`). `call` boxes each
 argument exactly ONCE and picks the tier itself: the prepared window
@@ -7344,7 +7345,12 @@ argument exactly ONCE and picks the tier itself: the prepared window
 activation to run one on. Do NOT hand-roll the
 `inv.ready() ? inv.invoke(argv, n) : eval_func(...)` ladder — all five
 existing sites did, each slightly differently, and the shared entry is
-what stops the sixth from inventing a sixth spelling. It is also a
+what stops the sixth from inventing a sixth spelling. The third
+argument is the BUILTIN CALL's site (its argument list's start, which
+every engine has): a callback has no call op of its own, so it is what
+names the callback's backtrace frame - without it the frame was captured
+loc-less and its caller rendered "at line 0" in every engine (#44). It
+is required, not defaulted, for that reason. It is also a
 measured win, not just tidier: reaching the invoker through a
 `cmp2(EvalValue, EvalValue)` helper made `sort` box each operand TWICE
 (once for the helper's parameters, once into the argv), and removing that

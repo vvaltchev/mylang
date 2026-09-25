@@ -1237,7 +1237,8 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
  * MapFilterV (the shared vm_map_filter body; callback re-enters vm_dispatch). */
 extern "C" int jit_check_func(int_type slot) noexcept;
 extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
-                              int_type dst, int_type is_map) noexcept;
+                              int_type dst, int_type is_map,
+                              int_type site) noexcept;
 
 /* model-flip (nativize-ops): the dyn-callee generic call pair. CheckCallableV
  * (the callable guard - conveys a loc-less NotCallableEx, exc-stamped with

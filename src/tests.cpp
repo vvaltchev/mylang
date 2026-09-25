@@ -15777,6 +15777,154 @@ typed_inlined_backtrace_parity()
 }
 
 /*
+ * Run `src` in one engine configuration and return its stdout plus, when
+ * it ends in an exception, the exception's name and RENDERED backtrace -
+ * the thing a backtrace test must compare (a matching exception TYPE says
+ * nothing about the frames). `jit` and `splice` are the VM's two levers;
+ * the tree-walker ignores both. Shared by the #44 and #38 checks.
+ */
+static std::string
+engine_run_bt(const std::string &src, ExecEngine eng, bool jit, bool splice)
+{
+    std::vector<Tok> toks;
+    lexer(src, 1, toks);
+    const ExecEngine se = g_exec_engine;
+    const bool sj = g_jit_enabled, ss = g_bc_inline_enabled;
+    g_exec_engine = eng;
+    g_jit_enabled = jit;
+    g_bc_inline_enabled = splice;
+    std::ostringstream cap;
+    std::streambuf *old = cout.rdbuf(cap.rdbuf());
+    std::string tail;
+    /* OUTSIDE the try: the unwind would free the tree-walker's
+     * descriptors before the catch renders the backtrace from them */
+    unique_ptr<Construct> root;
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        if (eng == ExecEngine::Vm)
+            vm_execute(root.get());
+        else
+            root->eval(nullptr);
+    } catch (const Exception &e) {
+        tail = std::string("EXC ") + e.name + "\n" + format_backtrace(e);
+    }
+    cout.rdbuf(old);
+    g_exec_engine = se;
+    g_jit_enabled = sj;
+    g_bc_inline_enabled = ss;
+    return cap.str() + tail;
+}
+
+/* The five configurations RULE 2 says must render identically. */
+static bool
+engines_agree_bt(const char *what, const std::string &src, std::string *out)
+{
+    const std::string tw = engine_run_bt(src, ExecEngine::TreeWalk,
+                                         false, false);
+    const struct { const char *name; bool jit, splice; } cfgs[] = {
+        { "vm -nbi", false, false }, { "jit -nbi", true, false },
+        { "vm", false, true }, { "jit", true, true },
+    };
+    bool ok = true;
+    for (const auto &c : cfgs) {
+        const std::string r = engine_run_bt(src, ExecEngine::Vm,
+                                            c.jit, c.splice);
+        if (r != tw) {
+            cout << "  " << what << ": " << c.name
+                 << " differs from the tree-walker\n  tw:\n" << tw
+                 << "  " << c.name << ":\n" << r;
+            ok = false;
+        }
+    }
+    if (out)
+        *out = tw;
+    return ok;
+}
+
+/*
+ * #44: a function a BUILTIN calls back (a comparator, a key, a generator)
+ * has no call op of its own, so every engine captured its backtrace frame
+ * LOC-LESS and the frame BELOW it - the function that called the builtin
+ * - rendered "at line 0" (identically everywhere, which is why no engine
+ * differential saw it). The builtin call is the callback's call site;
+ * VmInvoker now carries it. One shape per callback builtin (sort over a
+ * flat AND a general array, map/filter direct and through a dyn value,
+ * make_array, make_dict, find, sum), each with the call on one line and
+ * with its arguments on the NEXT line (the frame names the line the
+ * argument list starts on - the builtin's own caret span), each thrown
+ * from a warmed loop (caught) and then uncaught, in all five engine
+ * configurations.
+ */
+static bool
+callback_frame_call_site()
+{
+    const struct { const char *name, *call; } shapes[] = {
+        { "find", "find(xs, k + 7, key)" },
+        { "sort flat", "sort(xs, func(int a, int b) => key(a) < key(b))" },
+        { "sort general", "sort(gs, func(a, b) => key(a[0]) < key(b[0]))" },
+        { "map", "map(key, xs)" },
+        { "filter", "filter(func(int x) => key(x) > 1, xs)" },
+        { "make_array", "make_array(len(xs), func(int i) => key(xs[i]))" },
+        { "make_dict", "make_dict(xs, key)" },
+        { "sum", "sum(xs, key)" },
+        { "map via dyn", "fm(key, xs)" },
+    };
+    bool ok = true;
+    for (const auto &sh : shapes) {
+        for (const bool ml : { false, true }) {
+            std::string call = sh.call;
+            if (ml)
+                call.insert(call.find('(') + 1, "\n      ");
+            const std::string src =
+                "struct Boom { int at; }\n"
+                "func key(int x) {\n"
+                "  if (x == 999) throw Boom(x);\n"
+                "  return x % 5;\n"
+                "}\n"
+                "var dyn fm = map;\n"
+                "func top(array<int> xs, int k) {\n"
+                "  var gs = [[1], [xs[len(xs) - 1]]];\n"
+                "  var dyn r = " + call + ";\n"
+                "  return k;\n"
+                "}\n"
+                "func drive(array<int> xs, int n) {\n"
+                "  var s = 0;\n"
+                "  for (var i = 0; i < n; i++) {\n"
+                "    try { s = s + top(xs, i); }\n"
+                "    catch (Boom as b) { s = s + 1; }\n"
+                "  }\n"
+                "  return s + top(xs, 0);\n"
+                "}\n"
+                "var xs = [5, 1, 4, 3];\n"
+                "append(xs, 999);\n"
+                "print(drive(xs, int(runtime(40))));\n";
+            const std::string what =
+                std::string(sh.name) + (ml ? " (multi-line)" : "");
+            std::string tw;
+            if (!engines_agree_bt(what.c_str(), src, &tw))
+                ok = false;
+            /* the call's argument list starts on line 9, or 10 when it
+             * is moved to the next line */
+            const size_t at = tw.find("top(xs, k)");
+            const std::string line = ml ? "at line 10" : "at line 9";
+            if (tw.find("EXC DynamicExceptionEx") == std::string::npos
+                    || at == std::string::npos
+                    || tw.find(line, at) != tw.find("at line", at)
+                    || tw.find("at line 0") != std::string::npos) {
+                cout << "  " << what << ": want `top(xs, k) ... " << line
+                     << "` and no line 0, got:\n" << tw;
+                ok = false;
+            }
+        }
+    }
+    return ok;
+}
+
+/*
  * Backtrace parity for a RECURSION whose self-call sits inside an INLINED
  * region (what the AST inliner's recursion unroll produces for the fib
  * shape). Two VM-only defects, both invisible under `-ni` and both found
@@ -45125,6 +45273,8 @@ static const std::vector<extra_check> extra_checks =
     { "backtrace: a recursion inlined into itself renders identically "
       "on both engines (loc + every call site's virtual frames)",
       inlined_recursion_backtrace_parity },
+    { "backtrace: a builtin callback's frame names the builtin call (#44)",
+      callback_frame_call_site },
     { "static_type: ground caching & with_opt", static_type_ground_caching },
     { "static_type: assignable rules", static_type_assignable_rules },
     { "static_type: join (LUB) rules", static_type_join_rules },

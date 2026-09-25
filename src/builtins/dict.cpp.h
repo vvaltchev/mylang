@@ -343,7 +343,8 @@ EvalValue builtin_make_dict(EvalContext *ctx, const ArgLocs *exprList,
     DictObject::inner_type data;
     data.reserve(n);   /* profile #5: kill the insert rehash chain */
 
-    VmInvoker inv(ctx, funcObj);   /* prepared per-loop invoker (vm.h) */
+    /* prepared per-loop invoker (vm.h); the call site names the frame */
+    VmInvoker inv(ctx, funcObj, exprList->start);
 
     for (size_type i = 0; i < n; i++) {
 

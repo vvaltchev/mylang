@@ -182,7 +182,14 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
 struct VmActivation;
 class VmInvoker {
 public:
-    VmInvoker(EvalContext *ctx, FuncObject &obj);
+    /* `site` is the BUILTIN CALL's location (its argument list's start,
+     * which every engine has: ArgLocs::start / the builtin_calls pool;
+     * map/filter pass their container argument's) - the callback's
+     * backtrace frame names it as its call site (#44). A callback has no
+     * call op of its own, so without it the frame was captured loc-less
+     * and its caller rendered "at line 0". Required, not defaulted, so a
+     * new higher-order builtin cannot forget it. */
+    VmInvoker(EvalContext *ctx, FuncObject &obj, Loc site);
     ~VmInvoker();
     VmInvoker(const VmInvoker &) = delete;
     bool ready() const { return ready_; }
@@ -238,6 +245,7 @@ private:
 
     bool ready_ = false;
     bool fast_bind_ = false;
+    Loc site_;                 /* the builtin call's site (#44) */
     VmActivation *act_ = nullptr;
     EvalContext *c_ = nullptr;
     const Chunk *cck_ = nullptr;
