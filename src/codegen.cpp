@@ -11305,10 +11305,6 @@ codegen_chunk(const Block *block, int slot_count, bool jit,
      * reason: both ends of a call protocol must read it BEFORE any jit.
      * Nothing consumes it to decide emission yet. */
     jit_chunk_frameless_derive(cg.chunk);           /* W3 / small-60 */
-#ifdef TESTS
-    if (cg.chunk.frameless_ok)
-        g_jit_frameless_chunks++;
-#endif
     if (jit)
         jit_compile_chunk(cg.chunk);  /* native-AOT (plans/archived/native-aot.md):
                                        * LAST - needs the specialized ops +
@@ -11402,6 +11398,13 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit)
      * Halt returning none): after the AST teardown the chunk is the only way
      * to run the body, so there is no "not worth it" tier anymore. */
     out = codegen_chunk(body, fn->desc->frame_size, jit, &seeds);
+#ifdef TESTS
+    /* a CALLEE-eligible chunk - counted here, for function bodies only:
+     * main is never a callee, and since #97 H1 (a builtin call no longer
+     * refuses a body) its print() stopped keeping it out of the count */
+    if (out.frameless_ok)
+        g_jit_frameless_chunks++;
+#endif
     return true;
 }
 

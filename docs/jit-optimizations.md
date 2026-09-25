@@ -14588,3 +14588,60 @@ exactly as C4d/C4e/C5 did. G2 stays (it is sound, it shrinks every such
 site, and it found the dead slow tail), but this line is NOT to be
 pushed further on Ir evidence: E2c's 0.95x on 09 came from the SELF
 case's depth at 900 levels, not from the chain in general.
+
+## #97 H1 - A FRAMELESS BODY MAY CALL BUILTINS (2026-09-24)
+
+**THE BENCHES FIRST (52f3163).** `abs`, `min`, `max`, `int` and `str` all
+stay run-time builtin calls (`call.blt.v`), and `frameless_ok` refused
+any body containing one as "not a leaf":
+ - **94_builtin_in_helper** - a helper using abs/min/max in a loop:
+   ~1,210 Ir per iteration, 5.71x C++;
+ - **95_recursion_with_builtin** - a recursion calling max per level:
+   ~540 Ir per level, 4.66x C++.
+
+**THE CHANGE IS ADMISSION.** The refusal was increment 2's, when nothing
+could walk a frame with a frameless one below it; F5 taught every walker
+the kind. What a builtin can do below a frameless frame: RAISE (the op
+conveys it as a status, like every conveying helper); read the frame
+through `ctx->frame` (the vframe - eager in a leaf, published before
+every C++ call in a calling body, E2e); run a CALLBACK (VmInvoker - a
+nested dispatch that consumes any depth-cap switch, so none can cross
+the frame). None needs the record the frame lacks, and the E2 pre-pass
+asks only about MyLang calls. VALUE calls stay refused.
+
+Three tests used "a builtin makes a body non-frameless" as their refusal
+shape and were re-aimed at what still refuses (a value call through a
+parameter - a write-once local is devirtualized into a direct call - or
+a try region); `frameless_chunks` now counts FUNCTION bodies only (main
+is never a callee, and its print() had been keeping it out). PINNED by
+`jit_frameless_builtins` (the E2 harness, against the JIT-off VM with
+backtraces): abs/min/max in a leaf; a raising builtin caught and
+uncaught; a CALLBACK (`find` with a key function - `sort`'s boxed result
+made a first version exceed the ref_slots bound and go vacuous) and a
+callback that throws through it; an LVALUE builtin writing a parameter
+array (use count flat); a recursion calling max through the bound.
+Watched: a leaf entry that skips its vframe store makes `jit_ret_audit`
+abort by name. Three PRE-EXISTING bugs surfaced while writing it, all
+identical at the pre-H1 commit and filed: `sum(array, key_func)` raises
+InternalErrorEx in every engine (README documents it); `-nj` drops an
+inlined frame from a backtrace the tree-walker and JIT show (#38's
+shape); a frame whose callee was entered through a builtin callback
+renders `at line 0` in every engine.
+
+Measured (callgrind Ir per scale unit, `OPT=1 ASSERTS=0`, `-npc`; wall =
+ONE interleaved `--baseline` run):
+
+    bench                        Ir         wall     vs C++
+    95_recursion_with_builtin  -11.88%     0.87x    4.66x -> 3.92x
+    94_builtin_in_helper        -3.47%     0.99x    5.71x -> 5.59x
+    40 / 12 / 34 / 91 / 93 / 09 / 10 / 08 / 45 / 76 / 63    flat
+
+**94 IS NOT A CALL-PROTOCOL BENCH ANY MORE - IT IS A BUILTIN-CALL ONE.**
+Its profile after H1: `jit_call_builtin` alone is 51% of the program
+(~200 Ir per builtin call before the builtin runs: it default-constructs
+and destroys EIGHT EvalValues in a `stackbuf[8]` whatever the argument
+count, copies the arguments out of the frame, builds the ArgLocs, and
+`put()`s the result back), plus ~100 Ir per `min`/`max` body (boxed,
+generic). Two candidate follow-ups, neither built: a cheaper generic
+helper (construct only `n` slots), and lowering abs/min/max on PROVEN
+ints to native ops, as `len()` already is (`ArrLen`).

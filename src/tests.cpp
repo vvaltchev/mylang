@@ -19748,7 +19748,7 @@ static bool jit_frameless_gate()
      * - the first version of this case read "OK"). `max()` survives as
      * `call.blt.v`.
      */
-    want("a body that calls a builtin", probe({
+    want("a body that calls a builtin (admitted since #97 H1)", probe({
         "var garr = [4, 2, 9, 1];",
         "func usesblt(dyn k) {",
         "  var dyn n = max(garr);",
@@ -19760,6 +19760,29 @@ static bool jit_frameless_gate()
         "  for (var i = 0; i < reps; i++) s = s + usesblt(i);",
         "  print(s);",               /* E2: a builtin keeps the DRIVER
                                       * out of the count */
+        "  return s;",
+        "}",
+        "print(drive(runtime(20)));" }), true);
+    /*
+     * REJECTS: a body that makes a VALUE call (through a PARAMETER - a
+     * write-once local is devirtualized into a direct call) - since #97
+     * H1 the one call the leaf clause still refuses. The driver and the
+     * callee hold try regions, which keep them out of the count.
+     */
+    want("a body that makes a value call", probe({
+        "struct Bad { int at; }",
+        "func app(f, dyn k) {",
+        "  var dyn a = f(k) * 3;",
+        "  return a - 1;",
+        "}",
+        "func sq(dyn x) {",           /* a try: out of the count */
+        "  try { if (x < 0) throw Bad(1); } catch (Bad as e) { return 0; }",
+        "  return x * x;",
+        "}",
+        "func drive(int reps) {",
+        "  var s = 0;",
+        "  try { for (var i = 0; i < reps; i++) s = s + app(sq, i); }",
+        "  catch (Bad as e) { s = 0; }",
         "  return s;",
         "}",
         "print(drive(runtime(20)));" }), false);
@@ -19777,8 +19800,10 @@ static bool jit_frameless_gate()
         "}",
         "func drive(int n) {",
         "  var s = 0;",
-        "  for (var i = 0; i < n; i++) s = s + guarded(i);",
-        "  print(s);",               /* E2: see above */
+        "  try { for (var i = 0; i < n; i++) s = s + guarded(i); }",
+        "  catch (Bad as e) { s = 0; }",  /* H1: a try keeps the DRIVER
+                                          * out of the count (a builtin
+                                          * no longer does) */
         "  return s;",
         "}",
         "print(drive(runtime(20)));" }), false);
@@ -19809,7 +19834,7 @@ static bool jit_frameless_gate()
  * the floor 24KB below the top on it); a throw at the bottom of a chain,
  * caught three times, then uncaught; a reference argument threaded
  * through every level. Plus the refusal: a partner that is not frameless-
- * eligible (it calls a builtin) refuses the OTHER's pre-pass too, whose
+ * eligible (a try region) refuses the OTHER's pre-pass too, whose
  * entry cell stays null - so the one G1 site emitted (into it) declines
  * on every call.
  * Watched failing: with the cell test removed, a refused partner is
@@ -19947,9 +19972,191 @@ static bool jit_frameless_mutual()
         "}",
         "print(s, rc1 == rc2);" }, "true");
     same("a partner that is not frameless-eligible: the null cell declines", {
+        "struct Boom { int at; }",
         "func ev(int n) { if (n <= 0) return 0; return od(n - 1) + 1; }",
-        "func od(int n) { if (n <= 0) return abs(n); return ev(n - 1) + 2; }",
+        /* a try region (not plain_frame) - a builtin no longer
+         * refuses a body (#97 H1) */
+        "func od(int n) {",
+        "  if (n <= 0) { try { return 1; } catch (Boom as b) { return 2; } }",
+        "  return ev(n - 1) + 2;",
+        "}",
         "print(ev(int(runtime(100))));" }, "\n", /*expect_tier=*/false);
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * #97 H1: A FRAMELESS BODY MAY CALL BUILTINS. Each case is compared with
+ * the VM with the JIT off - stdout AND the rendered backtrace - and must
+ * have made frameless calls into a body that calls a builtin:
+ *  - a leaf using abs/min/max, warmed (94's shape);
+ *  - a builtin that RAISES inside the leaf, caught then uncaught;
+ *  - a CALLBACK builtin inside the leaf (find with a named key function)
+ *    - a nested dispatch below a frameless frame - and a callback that
+ *    throws through it;
+ *  - an LVALUE builtin (append to a parameter array) - the builtin writes
+ *    the caller's array through the frame, and its use count must not
+ *    grow between two points in the loop;
+ *  - a recursion calling max at every level (95's shape) through the E2
+ *    harness's bounds (cap 16 off the native stack, a 24KB test floor on
+ *    it), so the boundary decline runs with builtins in the body.
+ */
+static bool jit_frameless_builtins()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled || !jit_norec_on())
+        return true;
+    struct Restore {
+        bool pc; int cap;
+        ~Restore() {
+            g_pure_cache_enabled = pc;
+            jit_set_sync_depth_cap(cap);
+            jit_test_nstack_floor(0);
+        }
+    } restore{ g_pure_cache_enabled, jit_sync_depth_cap() };
+    g_pure_cache_enabled = false;
+    jit_set_sync_depth_cap(16);       /* baked at emission: set it first */
+    jit_test_nstack_floor(24 * 1024);
+    const auto run = [&](const std::vector<const char *> &lines,
+                         bool jit) -> std::string {
+        const bool jit_was = g_jit_enabled;
+        g_jit_enabled = jit;
+        std::string src;
+        for (const char *l : lines) { src += l; src += "\n"; }
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        const ExecEngine se = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        std::ostringstream cap;
+        std::streambuf *old = cout.rdbuf(cap.rdbuf());
+        std::string tail;
+        unique_ptr<Construct> root;      /* outside: see jit_frameless_calling */
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (const Exception &e) {
+            tail = std::string("EXC ") + e.name + "\n" + format_backtrace(e);
+        }
+        cout.rdbuf(old);
+        g_exec_engine = se;
+        g_jit_enabled = jit_was;
+        return cap.str() + tail;
+    };
+    bool ok = true;
+    const auto same = [&](const char *what,
+                          const std::vector<const char *> &lines,
+                          const char *must, bool want_boundary = false) {
+        const unsigned long p0 = g_jit_frameless_pushes;
+        const unsigned long b0 = g_jit_frameless_boundary;
+        const std::string ref = run(lines, false);
+        const std::string vm = run(lines, true);
+        const unsigned long dp = g_jit_frameless_pushes - p0;
+        const unsigned long db = g_jit_frameless_boundary - b0;
+        if (ref != vm || ref.find(must) == std::string::npos) {
+            fprintf(stderr, "jit_frameless_builtins: %s differs\n  nj: %s\n"
+                    "  vm: %s\n", what, ref.c_str(), vm.c_str());
+            ok = false;
+        }
+        if (dp < 20 || (want_boundary && !db)) {
+            fprintf(stderr, "jit_frameless_builtins: %s VACUOUS - %lu "
+                    "frameless calls, %lu boundary calls\n", what, dp, db);
+            ok = false;
+        }
+    };
+    same("a leaf using abs/min/max, warmed", {
+        "func dist(int a, int b) {",
+        "  var d = abs(a - b);",
+        "  return min(d, 1000) + max(a % 7, b % 5);",
+        "}",
+        "func drive(int n) {",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++) s = (s + dist(i, s % 97)) % 100003;",
+        "  return s;",
+        "}",
+        "print(drive(int(runtime(300))));" }, "\n");
+    same("a builtin raising in the leaf, caught then uncaught", {
+        "func conv(int k) {",
+        "  var t = str(k);",
+        "  if (k == 37) t = \"abc\";",  /* int(\"37x\") parses: a
+                                         * non-numeric string raises */
+        "  return int(t) + 1;",
+        "}",
+        "func drive(int n) {",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++) s = s + conv(i);",
+        "  return s;",
+        "}",
+        "try { print(drive(int(runtime(50)))); }",
+        "catch (TypeErrorEx) { print(\"caught\"); }",
+        "print(drive(int(runtime(30))));",
+        "print(drive(int(runtime(60))));" }, "EXC");
+    /* find() with a KEY callback - a scalar result: sort()'s array
+     * result is boxed, and a body holding more references than the
+     * frameless bound (ref_slots) is refused for THAT reason, which made
+     * a sort-based first version vacuous */
+    same("a callback builtin in the leaf, and a throwing callback", {
+        "struct Boom { int at; }",
+        "func key(int x) {",
+        "  if (x == 999) throw Boom(x);",
+        "  return x % 5;",
+        "}",
+        "func top(array<int> xs, int k) {",
+        "  var j = find(xs, k % 5, key) ?? 7;",
+        "  return j * 3 + k;",
+        "}",
+        "func drive(array<int> xs, int n) {",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++) s = s + top(xs, i);",
+        "  return s;",
+        "}",
+        "var xs = [5, 1, 4, 3];",
+        "print(drive(xs, int(runtime(40))));",
+        "append(xs, 999);",
+        "append(xs, 999);",
+        "try { print(drive(xs, int(runtime(40)))); }",
+        "catch (Boom as b) { print(\"boom\", b.at); }",
+        "print(drive(xs, int(runtime(3))));" }, "EXC");
+    same("an lvalue builtin writing a parameter array", {
+        "func push2(array<int> a, int v) {",
+        "  append(a, v * 2);",
+        "  return len(a);",
+        "}",
+        "func drive(array<int> a, int n) {",
+        "  var s = 0;",
+        "  for (var i = 0; i < n; i++) s = s + push2(a, i);",
+        "  return s;",
+        "}",
+        "var arr = [1];",
+        "var s = 0;",
+        "var rc1 = 0;",
+        "var rc2 = 0;",
+        "for (var k = 0; k < 9; k++) {",
+        "  s = s + drive(arr, int(runtime(10)));",
+        "  if (k == 2) rc1 = refcount(arr);",
+        "  if (k == 8) rc2 = refcount(arr);",
+        "}",
+        "print(s, len(arr), rc1 == rc2);" }, "true");
+    same("a recursion calling max at every level, through the bound", {
+        /* TWO self calls: a CachedCallV, run-eligible under the test's
+         * cap (a lone self CallV is not - op_run_eligible's cap rule) */
+        "func climb(int n, int h) {",
+        "  if (n <= 0) return h;",
+        "  return climb(n - 1, max(h, (n * 37) % 1009) - 1)",
+        "         + climb(n % 2 - 5, h) % 2;",
+        "}",
+        "func drive(int reps) {",
+        "  var s = 0;",
+        "  for (var k = 0; k < reps; k++)",
+        "    s = (s + climb(int(runtime(200 + k)), k)) % 1000003;",
+        "  return s;",
+        "}",
+        "print(drive(int(runtime(3))));" }, "\n", /*want_boundary=*/true);
     return ok;
 #else
     return true;
@@ -29707,15 +29914,20 @@ static bool jit_frameless_entry_emitted()
     }
     /* a body that calls a builtin is not a leaf: no entry */
     if (ok)
+        /* #97 H1: a builtin call no longer refuses a body, so the
+         * non-leaf here makes a VALUE call - still refused */
         ok = run({
-            "var garr = [4, 2, 9, 1];",
-            "func usesblt(int k) { return max(garr) + k; }",
+            "func sq(int x) {",           /* a try: not frameless_ok */
+            "  try { if (x < 0) return 0; } catch (DivisionByZeroEx) {}",
+            "  return x * x;",
+            "}",
+            "func app(f, int k) { return f(k) + 1; }",
             "var s = 0;",
-            "for (var i = 0; i < runtime(40); i++) s = s + usesblt(i);",
-            "print(s);" }, "1140 \n", "builtin caller", &chunks,
+            "for (var i = 0; i < runtime(40); i++) s = s + app(sq, i);",
+            "print(s);" }, "20580 \n", "value caller", &chunks,
             &entries);
     if (ok && (chunks != 0 || entries != 0)) {
-        fprintf(stderr, "jit_frameless_entry_emitted [builtin caller]: "
+        fprintf(stderr, "jit_frameless_entry_emitted [value caller]: "
                         "%lu chunks, %lu entries - the gate admitted a "
                         "non-leaf\n", chunks, entries);
         ok = false;
@@ -44564,6 +44776,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 G1 - mutual recursion framelessly: values, the boundary "
       "decline, a throw caught and uncaught, a threaded reference, the "
       "refusal", jit_frameless_mutual },
+    { "jit: #97 H1 - a frameless body calls builtins: plain, raising, a "
+      "callback (and a throwing one), an lvalue write, a recursion "
+      "through the bound", jit_frameless_builtins },
     { "jit: an int/float param's WIDENING argument binds inline (G1)",
       jit_bind_widen_inline },
     { "jit: a reference argument binds IN PLACE, and the declines (#162)",
