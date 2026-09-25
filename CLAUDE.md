@@ -3106,7 +3106,9 @@ weight` lost `top`, every engine). A new frame-recording site must use
 `push_frame`, never `backtrace.emplace_back`. `tag_inline` must walk a
 COMPLETE child visitor (`fmi_children`): the resolver's `for_each_child`
 skips Block/for/foreach/try/Expr14, which left every STATEMENT of a spliced
-block body chain-less. Backtraces for **body** errors are
+block body chain-less. And an inlined frame renders the callee's
+`display_name` (`inline_frame_name`), exactly as a physical one does - it
+rendered `weight$0` where `-ni` rendered `weight`. Backtraces for **body** errors are
 byte-identical with/without inlining;
 **known limitation** — an error *evaluating an argument* (e.g. an undefined var)
 is attributed to the inlined callee rather than the call site (the arg node is
