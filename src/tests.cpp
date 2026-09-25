@@ -19737,14 +19737,17 @@ static bool jit_norec_shadow()
  */
 static bool norec_segment_boundary()
 {
+#if ML_JIT_SUPPORTED
     /* #97 G1: this test's call chain (functions calling functions) is
      * FRAMELESS now; the tier it tests still serves every call that is
-     * not frameless-eligible, so pin it by turning that lever off */
+     * not frameless-eligible, so pin it by turning that lever off (a JIT
+     * build only: the lever does not exist without one) */
     struct FlOff {
         unsigned saved = g_jit_off_extra;
         FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
         ~FlOff() { g_jit_off_extra = saved; }
     } fl_off;
+#endif
 #if ML_JIT_SUPPORTED
     auto run = [](bool jit) -> long {
         const std::vector<const char *> lines = {
@@ -19836,14 +19839,17 @@ static bool norec_segment_boundary()
  */
 static bool jit_norec_recon_sweep()
 {
+#if ML_JIT_SUPPORTED
     /* #97 G1: this test's call chain (functions calling functions) is
      * FRAMELESS now; the tier it tests still serves every call that is
-     * not frameless-eligible, so pin it by turning that lever off */
+     * not frameless-eligible, so pin it by turning that lever off (a JIT
+     * build only: the lever does not exist without one) */
     struct FlOff {
         unsigned saved = g_jit_off_extra;
         FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
         ~FlOff() { g_jit_off_extra = saved; }
     } fl_off;
+#endif
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -21727,14 +21733,17 @@ static bool jit_bind_widen_inline()
  * the inserted post-call EnterNative. Result asserted too. */
 static bool jit_post_call_entry()
 {
+#if ML_JIT_SUPPORTED
     /* #97 G1: this test's call chain (functions calling functions) is
      * FRAMELESS now; the tier it tests still serves every call that is
-     * not frameless-eligible, so pin it by turning that lever off */
+     * not frameless-eligible, so pin it by turning that lever off (a JIT
+     * build only: the lever does not exist without one) */
     struct FlOff {
         unsigned saved = g_jit_off_extra;
         FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
         ~FlOff() { g_jit_off_extra = saved; }
     } fl_off;
+#endif
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -29708,14 +29717,17 @@ static bool jit_intervals_check()
  */
 static bool jit_call_pins_survive_switch()
 {
+#if ML_JIT_SUPPORTED
     /* #97 G1: this test's call chain (functions calling functions) is
      * FRAMELESS now; the tier it tests still serves every call that is
-     * not frameless-eligible, so pin it by turning that lever off */
+     * not frameless-eligible, so pin it by turning that lever off (a JIT
+     * build only: the lever does not exist without one) */
     struct FlOff {
         unsigned saved = g_jit_off_extra;
         FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
         ~FlOff() { g_jit_off_extra = saved; }
     } fl_off;
+#endif
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -39318,14 +39330,17 @@ static bool jit_native_throw()
 
 static bool jit_call_switch_protocol()
 {
+#if ML_JIT_SUPPORTED
     /* #97 G1: this test's call chain (functions calling functions) is
      * FRAMELESS now; the tier it tests still serves every call that is
-     * not frameless-eligible, so pin it by turning that lever off */
+     * not frameless-eligible, so pin it by turning that lever off (a JIT
+     * build only: the lever does not exist without one) */
     struct FlOff {
         unsigned saved = g_jit_off_extra;
         FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
         ~FlOff() { g_jit_off_extra = saved; }
     } fl_off;
+#endif
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
