@@ -682,10 +682,15 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
         return true;
     }
 
-    /* A struct array has no flat insert fast path: fall through to get_vec(),
-     * which promotes it to general first (the cold-path cost). */
+    /* A struct or flat-STRING array has no flat insert fast path: fall
+     * through to get_vec(), which promotes it to general first (the
+     * cold-path cost, in place so every alias sees it). Both are
+     * VALUE-driven storage that may lose flatness but never rejects - a
+     * strs array used to land in the throw below for ANY value, a string
+     * included, so `insert(split(s, " "), 1, "x")` was a TypeErrorEx. */
     if (arr.skind() != SharedArrayObj::Storage::general &&
-        arr.skind() != SharedArrayObj::Storage::structs)
+        arr.skind() != SharedArrayObj::Storage::structs &&
+        arr.skind() != SharedArrayObj::Storage::strs)
         throw TypeErrorEx(flat_array_violation_msg);
 
     auto &v = arr.get_vec();

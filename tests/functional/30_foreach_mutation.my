@@ -243,6 +243,7 @@ func shifts() {
     append(out, midins([1.5, 2.5, float(runtime(3.5))], 9.5));
     append(out, midins([true, false, runtime(1) > 0], false));
     append(out, midins([[1], [2], [int(runtime(3))]], [9]));
+    append(out, midins(split("a b c", str(runtime(" "))), "z"));
     var dyn dd = [1, 2, 3, int(runtime(4))];
     append(out, delapp(dd));
 

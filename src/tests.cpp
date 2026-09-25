@@ -7642,6 +7642,24 @@ static const std::vector<test> tests =
     },
 
     {
+        /* insert() into a flat STRING array (split()'s storage) threw the
+         * flat-array TypeErrorEx for EVERY value, a string included: the
+         * insert path promoted structs on its cold path and forgot strs.
+         * It promotes in place now, so an alias sees the insert. */
+        "insert into a flat strs array promotes, never throws",
+        {
+            "var a = split(\"a b c\", str(runtime(\" \")));",
+            "assert(array_storage(a) == \"str\");",
+            "var b = a;",
+            "insert(a, 1, \"z\");",
+            "assert(a == [\"a\", \"z\", \"b\", \"c\"] && b == a);",
+            "var c = split(\"x y\", str(runtime(\" \")));",
+            "insert(c, 2, \"w\");",
+            "assert(c == [\"x\", \"y\", \"w\"]);",
+        },
+    },
+
+    {
         /* #53: a foreach body that mutates its own container - the README
          * semantics, asserted in every mode (the tree-walker used to read
          * freed dict nodes / past a vector's end, and the engines visited
