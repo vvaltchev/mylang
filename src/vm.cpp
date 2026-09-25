@@ -9562,7 +9562,10 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
         if (callee.is<Builtin>()) {
             const Builtin &b = callee.get<Builtin>();
             if (b.kind == Builtin::Kind::lvalue) {
-                LValue *target = n ? a0_lvalue() : nullptr;
+                LValue tmp;
+                LValue *target =
+                    n ? builtin_lv_target(b, a0_lvalue(), buf[0], tmp)
+                      : nullptr;
                 if (bail)
                     return 1;
                 EvalValue rest[8];
@@ -12485,7 +12488,11 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                         const Builtin &b = callee.get<Builtin>();
                         if (b.kind == Builtin::Kind::lvalue) {
                             /* the by-ref path: derive arg0's true LValue* */
-                            LValue *target = nargs ? a0_lvalue() : nullptr;
+                            LValue tmp;
+                            LValue *target = nargs
+                                ? builtin_lv_target(b, a0_lvalue(), buf[0],
+                                                    tmp)
+                                : nullptr;
                             EvalValue rest[8];
                             std::vector<EvalValue> resth;
                             EvalValue *rp = rest;

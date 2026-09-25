@@ -1,0 +1,32 @@
+# sort / rev_sort / reverse called INDIRECTLY (through a `dyn` value) with a
+# plain VALUE as arg0 - an array literal, a call result.
+#
+# The three are `lvalue` builtins that ALSO take a value: `sort([3, 1])`
+# returns a sorted copy. An indirect call reaches them through the lvalue
+# ABI (func_lv, arg0 handed over as an LValue*), and for a non-lvalue arg0
+# the dispatch handed over NULL - which they dereferenced: a SEGV in both
+# engines. The same null reached the compile-time folder under -nc, where
+# `sort(K)` of a const array K is left un-folded (#54's audit, via
+# bench/my/52_cse_dedup).
+#
+# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff.sh), which
+# also fails a program that crashes on both sides.
+
+var dyn s = sort;
+var dyn rs = rev_sort;
+var dyn rv = reverse;
+
+print("literal ", s([3, 1, 2]), rs([1, 3, 2]), rv([1, 2, 3]));
+print("call    ", s(runtime([9, 7, 8])), rv(range(4)));
+
+# an lvalue arg0 still sorts the variable itself, as a direct call does
+var a = [5, 4, 6];
+s(a);
+print("lvalue  ", a);
+
+# with a comparator
+print("cmp     ", s([1, 3, 2], func(x, y) => x > y));
+
+# a const array: a read-only value, sorted as a copy
+const K = [2, 1, 3];
+print("const   ", s(K), K);

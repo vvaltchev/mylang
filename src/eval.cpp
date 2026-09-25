@@ -1555,8 +1555,12 @@ EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
         /* The lvalue adapters' exact behavior: arg0's LValue* if it IS one
          * (else null -> the builtin throws NotLValueEx / its arity error),
          * the rest RValued by value. */
-        LValue *target = (n && args[0].is<LValue *>())
-                             ? args[0].get<LValue *>() : nullptr;
+        LValue tmp;
+        LValue *target = n
+            ? builtin_lv_target(b, args[0].is<LValue *>()
+                                       ? args[0].get<LValue *>() : nullptr,
+                                args[0], tmp)
+            : nullptr;
         const size_t n_rest = n ? n - 1 : 0;
         EvalValue stackbuf[8];
         std::vector<EvalValue> heapbuf;
