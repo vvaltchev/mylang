@@ -1747,6 +1747,16 @@ struct VmCallRec {
      * by the !sync_stop gate at the reader). */
     int_type call_site_packed = 0;
 
+    /* #38 repro B: the caret's twin for the call site's INLINED-AT
+     * chain - an index into ret_chunk->inline_frames (-1 = the call is
+     * not inlined code), baked where call_site_packed is and read under
+     * the same gate. The walk's pc lookup at ret_pc - 1 has the same
+     * collapse problem the caret had: every op of a deleted run maps to
+     * the head EnterNative, so the lookup named the FIRST inlined op's
+     * chain - a phantom `step(n)` frame for a call that sat next to an
+     * inlined `step` in a mutual recursion. */
+    int32_t call_site_chain = -1;
+
     unsigned char boundary = 0;
 
     /* M5 LEAN SYNC ENTER (plans/archived/model-flip.md): this frame was pushed by a
@@ -7579,6 +7589,7 @@ vm_frame_setup(VmActivation &act, EvalContext &ctx, const Chunk *ret_chunk,
     rec.desc = d;
     rec.caller_captures = ctx.captures;
     rec.call_site_packed = 0;            /* #56: no stale switch site */
+    rec.call_site_chain = -1;
     rec.cache_key = std::move(ckey);
 
     if (d->fast_bind) {
@@ -7655,6 +7666,7 @@ vm_frame_setup_lean(VmActivation &act, EvalContext &ctx,
     rec.desc = d;
     rec.caller_captures = ctx.captures;
     rec.call_site_packed = 0;            /* #56: no stale switch site */
+    rec.call_site_chain = -1;
     ML_CHECK(!rec.cache_key);            /* pop reset it / fresh is null */
 
     const uint64_t noesc = d->noescape_params;
@@ -8575,17 +8587,18 @@ unsigned long g_jit_cached_probe_calls = 0;
 static ML_COLD int
 jit_sync_boundary_call(EvalContext &ctx, FuncObject &fo, int_type argbase,
                        int_type nargs, int_type dst, int_type site_packed,
-                       bool cached) noexcept
+                       bool cached, int32_t inl_chain,
+                       const void *inl_pool) noexcept
 {
 #ifdef TESTS
     g_jit_sync_boundary_call++;
 #endif
+    /* the caret AND the site's inlined-at chain - the pair every other
+     * conversion stamps (#38 repro B; the chain was claimed by the
+     * caller and used to be dropped here) */
     const auto stamp_site = [&](Exception &e) {
-        if (!e.backtrace.empty() && e.backtrace.back().desc == fo.func
-                && !e.backtrace.back().call_site.line)
-            e.backtrace.back().call_site =
-                Loc(static_cast<int>(site_packed >> 32),
-                    static_cast<int>(site_packed & 0xffffffff));
+        vm_jit_stamp_call_site(e, fo.func, site_packed, inl_chain,
+                               inl_pool);
     };
     try {
         LValue *ap = nargs ? &ctx.frame->at(argbase) : nullptr;
@@ -8708,6 +8721,7 @@ static void norec_switch_retarget(VmActivation &act, const char *fp,
             rec.ret_pc = S->resume_pc;
             rec.sync_stop = 0;
             rec.call_site_packed = static_cast<int_type>(S->site_loc);
+            rec.call_site_chain = S->inline_chain;
             idx--;
         } else {
             /* RECORD-LESS (4-v): INSERT the full record this frame never
@@ -8735,6 +8749,7 @@ static void norec_switch_retarget(VmActivation &act, const char *fp,
             nr.ret_pc = S->resume_pc;
             nr.dst = S->dst;
             nr.call_site_packed = static_cast<int_type>(S->site_loc);
+            nr.call_site_chain = S->inline_chain;
             nr.caller_captures =
                 *reinterpret_cast<CaptureSlots *const *>(fp + 16);
             /* a record-less frame is plain: the watermarks never moved,
@@ -8790,6 +8805,16 @@ jit_call_sync_switch(EvalContext &ctx, VmActivation &act, FuncObject &fo,
                      int_type site_packed, int_type resume_pc,
                      bool cached, const char *entry_rbp) noexcept
 {
+    /* #88's CLAIM (read + reset), which every other helper the emitted
+     * slow tail reaches already performs. This one did not (#38 repro
+     * B): the switch left the site's chain in the globals, and the next
+     * claimer - a postexit at a site with NO chain, which stores
+     * nothing - flushed it as its own, a phantom virtual frame. The
+     * claimed chain rides the record instead (call_site_chain). */
+    const int32_t inl_chain = g_jit_call_inline_chain;
+    const void *inl_pool = g_jit_call_inline_pool;
+    g_jit_call_inline_chain = -1;
+    g_jit_call_inline_pool = nullptr;
     const FuncDescriptor *d = fo.func;
     if (!d->vm_chunk_tried) {
         fo.func->vm_chunk = vm_func_chunk(fo.func);
@@ -8797,7 +8822,8 @@ jit_call_sync_switch(EvalContext &ctx, VmActivation &act, FuncObject &fo,
     }
     if (!d->vm_chunk)
         return jit_sync_boundary_call(ctx, fo, argbase, nargs, dst,
-                                      site_packed, cached);
+                                      site_packed, cached, inl_chain,
+                                      inl_pool);
     const Chunk *cck = static_cast<const Chunk *>(d->vm_chunk);
 
     std::unique_ptr<PureCacheKey> key;
@@ -8879,6 +8905,7 @@ jit_call_sync_switch(EvalContext &ctx, VmActivation &act, FuncObject &fo,
             static_cast<const FuncDescriptor *>(seed->caller_desc),
             caller_win, caller_seg, caller_sg);
     act.back_rec().call_site_packed = site_packed;   /* backtrace caret */
+    act.back_rec().call_site_chain = inl_chain;      /* ...and its chain */
 #ifdef TESTS
     g_jit_sync_switch++;
 #endif
@@ -8921,7 +8948,8 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
          * base reached indirectly) - PERFORM the boundary call here (the
          * interpreted op's own tail) instead of declining to a re-run. */
         return jit_sync_boundary_call(ctx, fo, argbase, nargs, dst,
-                                      site_packed, cached);
+                                      site_packed, cached, inl_chain,
+                                      inl_pool);
     const Chunk *cck = static_cast<const Chunk *>(d->vm_chunk);
 
     std::unique_ptr<PureCacheKey> key;
@@ -9022,6 +9050,7 @@ jit_call_sync_core(FuncObject &fo, int_type argbase, int_type nargs,
                 mine.ret_pc = static_cast<size_t>(resume_pc);
                 mine.sync_stop = 0;
                 mine.call_site_packed = site_packed;
+                mine.call_site_chain = inl_chain;
             }
             if (entry_rbp && entry_site && my_idx >= 2) {
                 /* the CALLER's segment - OUR record's parent view, not
@@ -10641,8 +10670,19 @@ vm_unwind_walk(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
         ctx.captures = cur.caller_captures;
         chunk = cur.ret_chunk;
         pc = cur.ret_pc - 1;                   /* the call op */
+        /* a SWITCH-pushed / retargeted record BAKED its call site's
+         * chain (call_site_chain, #38) under the same gate as its
+         * caret: its ret_pc is a resume stub in a possibly DELETED run,
+         * where the pc lookup cannot name the call op's chain */
+        const bool baked = cur.call_site_packed && !cur.sync_stop;
+        const int32_t chain = cur.call_site_chain;
         act.pop_window();
-        vm_flush_inline_call(*chunk, pc, *ex);
+        if (!baked)
+            vm_flush_inline_call(*chunk, pc, *ex);
+        else if (chain >= 0
+                 && static_cast<size_t>(chain) < chunk->inline_frames.size())
+            vm_flush_inline_call_pool(chunk->inline_frames.data(), chain,
+                                      *ex);
     }
 }
 
