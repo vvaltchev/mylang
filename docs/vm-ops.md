@@ -1447,6 +1447,15 @@ per-step-loc pool — the last non-`locs` side table off the AST. (The tree-walk
 still uses the `InlineCtx*`-based `flush_inline_frames` directly, from
 `node->inline_ctx`.)
 
+**⛔ An op with NO node records NO chain.** The builtin-call ops
+(`CallBuiltinV`, `CallBuiltinLV`/`LVElem`/`LVMember`, `AppendV`) keep
+their carets in the `builtin_calls` pool and so carried no node - and a
+builtin call spliced from an inlined body lost its virtual frame under
+the VM (a callback's throw or the builtin's own error; #38). Their emit
+sites now attach the node exactly when it has an `inline_ctx`
+(`note_builtin_inline`); `extract_locs`' default arm drops it again. A
+new pooled-caret op that can sit in inlined code needs the same.
+
 **The disassembler dumps the WHOLE serializable image, not just funcs
 (`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
 (every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)

@@ -701,6 +701,24 @@ struct Codegen {
      * carets/hint pulled off the DirectBuiltinCallExpr) and return its
      * Chunk::builtin_calls index - so CallBuiltinV carries a serializable index,
      * not a `node`. See Chunk::BuiltinCall. */
+    /*
+     * #38: a builtin-call op's carets live in the builtin_calls pool, so
+     * it carries no node - and extract_locs records an op's INLINED-AT
+     * chain only from its node. A builtin call spliced from an inlined
+     * body therefore had no inline_ctxs entry, and the VM dropped the
+     * inlined callee's virtual frame from any backtrace crossing it (a
+     * callback's throw, or the builtin's own error) - the tree-walker,
+     * whose DirectBuiltinCallExpr carries the chain, rendered it. Give
+     * the op its node exactly when there is a chain to record; the
+     * default arm of extract_locs' switch then drops it, so nothing else
+     * changes and no node survives codegen.
+     */
+    void note_builtin_inline(CgInstr &cv, const DirectBuiltinCallExpr *dc)
+    {
+        if (dc->inline_ctx)
+            cv.node_idx = add_ast_node(dc);
+    }
+
     int add_builtin_call(const DirectBuiltinCallExpr *dc)
     {
         Chunk::BuiltinCall bc;
@@ -3533,6 +3551,7 @@ struct Codegen {
         /* AST-free: the builtin + its arg carets live in the builtin_calls pool
          * (index in target2), so no node. */
         cv.target2 = add_builtin_call(dc);
+        note_builtin_inline(cv, dc);
         cv.target = dst;
         cv.set_a(int_lit(argbase));
         cv.set_b(int_lit(static_cast<int>(dc->args->elems.size())));
@@ -3660,6 +3679,7 @@ struct Codegen {
                         cv.target2 =
                             static_cast<const Identifier *>(base)->sym.slot;
                         cv.set_a_dual(add_builtin_call(dc), bkind);
+                        note_builtin_inline(cv, dc);
                         cv.set_b(int_lit(runbase));
                         ops.push_back(cv);
                         out_slot = dst;
@@ -3711,6 +3731,7 @@ struct Codegen {
                             static_cast<const Identifier *>(base)->sym.slot;
                         const int bc = add_builtin_call(dc);
                         cv.set_a_dual(bc, bkind);
+                        note_builtin_inline(cv, dc);
                         chunk.builtin_calls[bc].member = m->memUid;
                         cv.set_b(int_lit(runbase));
                         ops.push_back(cv);
@@ -3896,6 +3917,7 @@ struct Codegen {
         cv.target = dst;
         cv.target2 = a0slot;
         cv.set_a_dual(add_builtin_call(dc), kind);
+        note_builtin_inline(cv, dc);
         if (rest_op)
             cv.set_b(int_lit(restbase));
         ops.push_back(cv);
