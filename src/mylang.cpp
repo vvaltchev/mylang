@@ -32,7 +32,7 @@ using std::string;
 
 static bool opt_show_tokens;
 static bool opt_show_syntax_tree;
-static bool opt_no_const_eval;
+static bool opt_no_const_fold;
 static bool opt_no_inline;
 static int opt_inline_threshold = 24;  /* max inlined body size (nodes) */
 static bool opt_no_run;
@@ -245,7 +245,7 @@ void help()
     cout << "   -s      Dump the syntax tree" << endl;
     cout << "   -v      Show how this binary was BUILT (opt, asserts, ...)"
          << endl;
-    cout << "  -nc      No const eval (debug)" << endl;
+    cout << "  -nc      No const FOLDING (debug; same program)" << endl;
     cout << "  -ni      No function inlining (debug)" << endl;
     cout << "  --no-opt L  Disable AST transforms (comma-separated): "
          << opt_pass_names() << endl;
@@ -398,7 +398,7 @@ parse_args(int argc, char **argv)
 
         } else if (!strcmp(arg, "-nc")) {
 
-            opt_no_const_eval = true;
+            opt_no_const_fold = true;
 
         } else if (!strcmp(arg, "-ni")) {
 
@@ -736,7 +736,7 @@ int main(int argc, char **argv)
             return 0;
         }
 
-        ParseContext ctx(TokenStream(tokens), !opt_no_const_eval);
+        ParseContext ctx(TokenStream(tokens), !opt_no_const_fold);
 
         /* -a: the parser records parse-time folds/DCE it would otherwise erase
          * (magenta folded calls, dim dead branches) into this collector; the
