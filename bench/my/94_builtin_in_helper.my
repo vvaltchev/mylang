@@ -1,0 +1,15 @@
+# a small helper that calls builtins (abs/min/max), called in a tight loop
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+func dist(int a, int b) {
+    var d = abs(a - b);
+    return min(d, 1000) + max(a % 7, b % 5);
+}
+
+var N = 1000000 * scale;
+var s = 0;
+for (var i = 0; i < N; i++)
+    s = (s + dist(i, s % 997)) % 1000000007;
+print("result:", s);
