@@ -168,6 +168,22 @@ public:
     int nest_depth = 0;
     static const int MAX_NEST = 256;
 
+    /*
+     * #47: FUNCTION LITERALS A CONST BAKE WOULD HAVE FREED. When the parser
+     * replaces a const subtree with ONE baked LiteralObj (cse_materialize),
+     * the replaced subtree dies - and with it any `pure func` LITERAL inside
+     * it, whose FuncDeclStmt owns the FuncDescriptor (desc_owner). A value
+     * like `[pure func(a, b) => a < b]` holds a FuncObject naming exactly
+     * that descriptor, so the bake left it dangling: a heap-use-after-free
+     * in the inferencer's baked-value walk, and a function with no body for
+     * codegen to compile. Such a decl is DETACHED instead and parked here;
+     * pBlock re-inserts it as a plain expression statement just before the
+     * statement that baked it, so every later pass (resolver, inferencer,
+     * codegen, descriptor ownership) sees a live, ordinary lambda. `pure`
+     * forbids captures, so evaluating it earlier is unobservable.
+     */
+    std::vector<unique_ptr<Construct>> baked_funcs;
+
     /* token operations */
     const Tok &operator*() const { return ts.get(); }
     const Tok &get_tok() const { return ts.get(); }

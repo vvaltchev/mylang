@@ -6378,6 +6378,35 @@ static const std::vector<test> tests =
         },
     },
     {
+        /* #47: a `pure func` LITERAL inside a value the parser BAKES into
+         * one LiteralObj. The bake used to free the replaced subtree - and
+         * with it the literal's FuncDeclStmt, which owns the descriptor the
+         * baked FuncObject names: a heap-use-after-free in the inferencer's
+         * baked-value walk (ASan, every engine), and no body for codegen.
+         * `sort(xs, OPS[k])` also made `srt` inlinable (the literal was
+         * gone from its body), which is how it first presented. The
+         * literals are now kept as statements (ParseContext::baked_funcs). */
+        "baked pure func literal: const array / dict / struct const",
+        {
+            "const OPS = [pure func(int a, int b) => a < b,",
+            "             pure func(a, b) => a > b];",
+            "const D = {\"inc\": pure func(int x) => x + 1};",
+            "struct S { const F = pure func(int a) => a * 10; }",
+            "func srt(xs, int k) { sort(xs, OPS[k]); return xs[0]; }",
+            "func g(int i) {",
+            "  const L = [pure func(int q) => q * q];",
+            "  return L[0](i) + D[\"inc\"](i) + S.F(i);",
+            "}",
+            "var ops = [pure func(int a) => a + 100];",
+            "var t = 0;",
+            "for (var i = 0; i < 5; i++)",
+            "  t += srt([3, i, 1], i % 2) + g(i) + ops[0](i);",
+            "assert(t == 663);",
+            "var dyn k0 = OPS[runtime(0)];",
+            "assert(k0(1, 2) && OPS[0] == OPS[0] && OPS[0] != OPS[1]);",
+        },
+    },
+    {
         /* REGRESSION (dead-dst peephole + E1 retarget): a closure-VALUE call
          * (CallValueV) whose result feeds a builtin/comparison arg through a
          * MoveV that E1 eliminates had its result WRONGLY DISCARDED - the

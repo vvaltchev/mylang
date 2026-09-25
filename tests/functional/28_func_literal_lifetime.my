@@ -1,0 +1,78 @@
+# #47: a function LITERAL whose FuncDescriptor was freed while a closure
+# still named it - a heap-use-after-free, by two unrelated paths. The
+# literal's FuncDeclStmt OWNS the descriptor (desc_owner) until vm_compile
+# moves it into the program, so anything that drops the decl first, or
+# that vm_compile cannot SEE, leaves it dangling. Run under the debug
+# (ASan) lane; the -rt harness keeps its AST and cannot see path 2.
+#
+# PATH 1: a `pure func` literal inside a value the PARSER bakes into one
+# LiteralObj. The bake replaces the whole const subtree - `[pure func..]`,
+# a dict, a struct's const member - and the replaced subtree used to die
+# with the lambda's decl in it, while the baked FuncObject still names its
+# descriptor: the inferencer's walk of the baked value read freed memory
+# (ASan: cs_eval_value), and codegen had no body to compile. Here too
+# inlining is in the picture: `sort(xs, OPS[k])` holds no literal after
+# the fold, so the inliner splices `srt` into the loop.
+#
+# Every place a parse-time bake can hold a literal is here: a const array
+# (typed and untyped parameters), a dict value, a struct's const members
+# (a bare literal and one inside an array), a function-local const, a
+# MUTABLE var bake, and a literal baked inside a brace-less branch.
+
+const OPS = [pure func(int a, int b) => a < b, pure func(a, b) => a > b];
+const D = {"inc": pure func(int x) => x + 1};
+struct S {
+    const F = pure func(int a) => a * 10;
+    const G = [pure func(a) => a - 1];
+}
+
+func srt(xs, int k) {
+    sort(xs, OPS[k]);
+    return xs[0];
+}
+
+func g(int i) {
+    const L = [pure func(int q) => q * q];
+    return L[0](i) + D["inc"](i) + S.F(i) + S.G[0](i);
+}
+
+var ops = [pure func(int a) => a + 100];
+var t = 0;
+for (var i = 0; i < 5; i++) {
+    var a = [3, i, 1];
+    t += srt(a, i % 2) + g(i) + ops[0](i);
+}
+assert(t == 668);
+print("baked func literals:", t);
+
+var dyn k0 = OPS[runtime(0)];
+var dyn k1 = OPS[runtime(1)];
+assert(k0(1, 2) && !k1(1, 2));
+assert(OPS[0] == OPS[0] && OPS[0] != OPS[1]);
+print("via dyn:", k0(1, 2), k1(1, 2), OPS[0] == OPS[0], OPS[0] == OPS[1]);
+
+var z = 0;
+if (runtime(true)) z = [pure func(int w) => w + 7][0](1);
+assert(z == 8);
+print("brace-less bake:", z);
+
+# PATH 2, the shape #47 was reported in: a function literal under a
+# TypedScalarExpr in the FINAL tree. `apply2`'s body holds no literal, so
+# the inliner splices it - and `f(x) + 1` becomes `(func(int a) =>
+# a * 2)(i) + 1`, which M8 turns into a TypedScalarExpr. vm_compile's
+# collect_funcs walked with for_each_child_of, which treated that node as
+# a LEAF: the lambda's body was never compiled, its descriptor never moved
+# into the program, and the AST teardown freed it under the MakeClosureV
+# the loop then ran (-nj and the JIT only; the tree-walker keeps its AST).
+# `sort(..)[0] * 1` and `sum(.., key) + 1` reach the same node with no
+# inlining at all.
+func apply2(f, int x) => f(x) + 1;
+func first(xs) => sort(xs, func(int a, int b) => a < b)[0] * 1;
+var v = 0;
+for (var i = 0; i < 5; i++) {
+    v += apply2(func(int a) => a * 2, i);
+    v += first([3, i, 1]);
+    v += sum([i, 2], func(int q) => q * 3) + 1;
+}
+assert(v == 94);
+print("typed-scalar lambdas:", v);

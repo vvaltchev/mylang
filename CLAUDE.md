@@ -2628,6 +2628,40 @@ and it lives *inside the parser*. Mechanics:
   literal). `bench/52_cse_dedup` and the `CSE:` tests cover it.
   `cse_materialize` is PIMPL-friendly: `CseCache` is forward-declared in
   `parser.h` with an out-of-line `~ParseContext()`.
+- **⛔ A BAKE MUST NOT FREE A FUNCTION THE BAKED VALUE STILL NAMES (#47,
+  2026-09-25).** A `pure func` LITERAL is const, so `[pure func(a, b) => a
+  < b]` (and a dict, a struct `const` member, a mutable `var` bake) folds
+  to ONE `LiteralObj` holding a FuncObject - whose `FuncDescriptor` is
+  owned by the literal's `FuncDeclStmt::desc_owner`, INSIDE the subtree
+  the bake replaces. The replaced subtree used to die with it: the
+  inferencer's baked-value walk (`cs_eval_value`) read the freed
+  descriptor (ASan, every engine) and codegen had no body to compile.
+  It presented as an INLINING bug because it hid one - `sort(xs, OPS[k])`
+  holds no function literal after the fold, so the inliner splices the
+  body. Now `cse_materialize` (and the struct-const path) DETACH every
+  literal the value names into `ParseContext::baked_funcs`, and `pBlock`
+  re-inserts it as a plain expression statement just before the
+  statement that baked it - same scope, so its body resolves as it would
+  have in place, and every later pass sees an ordinary lambda. `pure`
+  forbids captures, so evaluating it earlier is unobservable. A literal
+  the value does NOT name (`sort([3, 1], pure func..)` bakes ints) still
+  dies. (A struct const member holding a function is still refused by
+  `-c`, a pre-existing, explicit MyvError.)
+  **THE SAME UAF HAD A SECOND, UNRELATED PATH - the one #47 was reported
+  as.** `for_each_child_of` (inferencer.h), the "COMPLETE" walker that
+  `vm_compile`'s `collect_funcs` uses to decide which bodies to compile
+  and which descriptors the program takes, inherited the inferencer's
+  choice to treat a `TypedScalarExpr` as a LEAF - right for the
+  inferencer (its passes run before M8), wrong on the FINAL tree. So a
+  lambda under one (`sum(xs, func..) + 1`; an inlined `f(x) + 1` whose
+  `f` was a lambda argument, as with `sort` in a caller's loop) was never
+  compiled or owned, and the AST teardown freed its descriptor under the
+  closure the VM then built - `-nj` and the JIT only, and invisible to
+  `-rt`, whose harness keeps its AST. The exported wrapper descends a
+  `TypedScalarExpr` now. **A walker exported as COMPLETE must be complete
+  over the tree its CALLERS walk, not the tree its owner walks.** Both
+  paths are pinned by `tests/functional/28_func_literal_lifetime.my`
+  (and path 1 by the `baked pure func literal` `-rt` entry).
 - **Statement folding:** an `if` with a const condition is replaced by just its
   taken branch; a
   `while`/`foreach` proven to never execute (const-false condition / const-empty
