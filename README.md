@@ -1413,6 +1413,39 @@ foreach (var e in arr) { ... }    # OK: `var` shadows intentionally
 (Note: this differs from a previous behavior where a bare name reused an
 existing variable. A `foreach` loop variable is now always a fresh declaration.)
 
+#### Modifying the container during the loop
+
+The loop body may change the very array or dictionary it is walking; the
+result is defined, and identical in every engine:
+
+  * **An array** loop runs over the length the array had when the loop
+    **started** - elements the body appends are not visited. Each element is
+    read when its turn comes, so a store the body makes to a *later* element
+    is seen, while the loop variable itself is a copy (storing over the
+    current element does not change it). If the body removes elements so
+    that the next one no longer exists, the loop raises `OutOfBoundsEx` (at
+    the container).
+  * **A dictionary** loop visits each key the dictionary held when the loop
+    started, once, **if the key is still there when its turn comes**, with
+    its value at that moment. Keys the body inserts are not visited, keys it
+    erases before their turn are skipped.
+  * Reassigning the loop's container **variable** does not affect the loop:
+    it keeps walking the value it started with.
+
+```C#
+var a = [1, 2, 3];
+foreach (x in a)
+    append(a, x);                 # visits 1, 2, 3; a is now 6 long
+
+var d = {"a": 1, "b": 2, "c": 3};
+foreach (k in d)
+    erase(d, k);                  # fine: every key is visited, d ends empty
+
+var b = [1, 2, 3, 4];
+foreach (x in b)
+    pop(b);                       # OutOfBoundsEx on the third iteration
+```
+
 #### Extra features: the "indexed" keyword
 
 `MyLang` supports enumeration in foreach loops as well. Check the following

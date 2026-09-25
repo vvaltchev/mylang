@@ -239,6 +239,116 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
 }
 
 /*
+ * #53: may the body of a foreach change ANY array - its length, its storage
+ * kind, an element - or run code that could? The struct-foreach DIRECT read
+ * (a `p.x` compiled to a read of the array bytes at EVERY use, the loop var
+ * never materialized) is sound only when it cannot: a body that pops the
+ * array leaves the read out of range, one that stores into the array makes
+ * `p.x` read the new element where the loop var - a COPY bound when its
+ * turn came, in every other engine - holds the old one. So the direct read
+ * requires an INERT body; any other body binds `p` whole (LoadStructElemV,
+ * bounds-checked). Conservative by construction: an unrecognized node, any
+ * store through a subscript or member, a compound store to a non-scalar,
+ * and any call except a short list of builtins that neither mutate an
+ * argument nor call back into the program are all "not inert".
+ */
+static bool struct_fe_body_inert(const Construct *c)
+{
+    if (!c)
+        return true;
+    auto all = [](std::initializer_list<const Construct *> cs) {
+        for (const Construct *ch : cs)
+            if (!struct_fe_body_inert(ch))
+                return false;
+        return true;
+    };
+    auto scalar_th = [](const Construct *e) {
+        return e->th == TypeHint::i || e->th == TypeHint::f;
+    };
+    if (dynamic_cast<const Identifier *>(c))
+        return true;
+    if (ctag(c) == ConstructType::member)
+        return struct_fe_body_inert(
+            static_cast<const MemberExpr *>(c)->what.get());
+    if (auto *e = dynamic_cast<const Expr14 *>(c)) {
+        if (!dynamic_cast<const Identifier *>(e->lvalue.get()))
+            return false;                 /* a store through [] or . */
+        if (e->op != Op::assign && !scalar_th(e->lvalue.get()))
+            return false;                 /* `a += [x]` appends in place */
+        return struct_fe_body_inert(e->rvalue.get());
+    }
+    if (auto *inc = dynamic_cast<const IncDecExpr *>(c))
+        return dynamic_cast<const Identifier *>(inc->lvalue.get()) != nullptr;
+    if (auto *bc = dynamic_cast<const DirectBuiltinCallExpr *>(c)) {
+        static const char *const ok[] = {
+            "print", "len", "str", "int", "float", "abs", "sqrt", "cbrt",
+            "min", "max", "pow", "exp", "exp2", "log", "log2", "floor",
+            "ceil", "round", "trunc", "ord", "chr", "typestr", "kindstr",
+            "hash", "assert", "isnan", "isinf", "isfinite", "isnormal",
+            "runtime", "sin", "cos", "tan", "asin", "acos", "atan",
+        };
+        const auto *id = dynamic_cast<const Identifier *>(bc->what.get());
+        if (!id || bc->callable_arg_mask != 0)
+            return false;
+        bool listed = false;
+        for (const char *n : ok)
+            listed = listed || id->uid->val == n;
+        return listed && all({bc->args.get()});
+    }
+    if (dynamic_cast<const CallExpr *>(c))
+        return false;                     /* user code, or a builtin that
+                                           * may mutate / call back */
+    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+        for (const auto &pr : mo->elems)
+            if (!struct_fe_body_inert(pr.second.get()))
+                return false;
+        return true;
+    }
+    if (ctag(c) == ConstructType::typed_scalar) {
+        for (const auto &pr : static_cast<const TypedScalarExpr *>(c)->elems)
+            if (!struct_fe_body_inert(pr.second.get()))
+                return false;
+        return true;
+    }
+    if (auto *me = dynamic_cast<const MultiElemConstruct<> *>(c)) {
+        for (const auto &el : me->elems)
+            if (!struct_fe_body_inert(el.get()))
+                return false;
+        return true;
+    }
+    if (dynamic_cast<const InlinedCallExpr *>(c))
+        return false;                     /* a spliced body: not audited */
+    if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c))
+        return struct_fe_body_inert(sc->elem.get());
+    if (auto *sub = dynamic_cast<const Subscript *>(c))
+        return all({sub->what.get(), sub->index.get()});
+    if (auto *iff = dynamic_cast<const IfStmt *>(c))
+        return all({iff->condExpr.get(), iff->thenBlock.get(),
+                    iff->elseBlock.get()});
+    if (auto *w = dynamic_cast<const WhileStmt *>(c))
+        return all({w->condExpr.get(), w->body.get()});
+    if (auto *f = dynamic_cast<const ForStmt *>(c))
+        return all({f->init.get(), f->cond.get(), f->inc.get(),
+                    f->body.get()});
+    if (auto *fr = dynamic_cast<const ForRangeStmt *>(c))
+        return all({fr->init.get(), fr->bound.get(), fr->step.get(),
+                    fr->body.get()});
+    if (auto *fe2 = dynamic_cast<const ForeachStmt *>(c))
+        return all({fe2->container.get(), fe2->body.get()});
+    if (auto *te = dynamic_cast<const TernaryExpr *>(c))
+        return all({te->condExpr.get(), te->thenExpr.get(),
+                    te->elseExpr.get()});
+    if (auto *co = dynamic_cast<const CoalesceExpr *>(c))
+        return all({co->lhs.get(), co->rhs.get()});
+    if (auto *ret = dynamic_cast<const ReturnStmt *>(c))
+        return struct_fe_body_inert(ret->elem.get());
+    if (dynamic_cast<const Literal *>(c)
+        || dynamic_cast<const ChildlessConstruct *>(c))
+        return true;                             /* a childless leaf */
+    return false;                                /* unrecognized */
+}
+
+/*
  * True for an op that WRITES its result into `.target` as a pure value and does
  * not also READ `.target` - so it is safe to retarget its `.target` to a
  * different (fresh) slot. Used to fuse away `<produce t>; MoveV rD = t` into a
@@ -7189,7 +7299,8 @@ struct Codegen {
          * MATERIALIZE a fresh StructObject per iteration (LoadStructElemV) into
          * `p`'s slot and compile the body normally. */
         const bool whole_p = !struct_fe_body_ok(fe->body.get(), x_slot,
-                                                fe->container_struct_def, false);
+                                                fe->container_struct_def, false)
+                          || !struct_fe_body_inert(fe->body.get());   /* #53 */
 
         const size_t start = code.size();
         reset_temps();
@@ -7234,6 +7345,9 @@ struct Codegen {
              * iteration; the body reads p's slot normally (no sfe mapping). */
             CgInstr ld;
             ld.op = OpCode::LoadStructElemV;
+            /* #53: it can raise - the body may have shrunk the array -
+             * with the container's caret, like the other foreach loads */
+            ld.node_idx = add_ast_node(fe->container.get());
             ld.target = x_slot;
             ld.target2 = c;
             ld.set_a(slot_op(i));
@@ -7623,10 +7737,11 @@ struct Codegen {
         CgInstr nx;
         nx.op = OpCode::ForeachDynNext;
         nx.target2 = iter_id;              /* targets ride the iterator state */
-        /* A multi-var array element is strict-unpacked, so Next can throw;
-         * record the container caret (do_iter uses container->start/end). */
-        if (nvars - (fe->indexed ? 1 : 0) >= 2)
-            nx.node_idx = add_ast_node(fe->container.get());
+        /* A multi-var array element is strict-unpacked, and any array
+         * element may be GONE (#53: the body shrank the array), so Next can
+         * throw; record the container caret (do_iter uses
+         * container->start/end). */
+        nx.node_idx = add_ast_node(fe->container.get());
         const size_t nx_i = code.size();
         code.push_back(nx);          /* .target (end_pc) backpatched */
 
@@ -8035,7 +8150,8 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
                                       * throw (it used to be assumed no-throw,
                                       * which made the JIT std::terminate) */
         case OpCode::ForeachDynInit: /* node = container (unsupported caret) */
-        case OpCode::ForeachDynNext: /* node set only for a 2-var unpack caret */
+        case OpCode::ForeachDynNext: /* node = container: an unpack caret,
+                                      * or a GONE element's (#53) */
         case OpCode::JumpUnlessElemInt:  /* E4 fusion - keeps the load's
                                           * OOB caret */
         case OpCode::ForStepElemInt:     /* #9 fusion - the embedded back-edge
@@ -8049,9 +8165,10 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::LoadElem2Int:
         case OpCode::LoadElem2Float:
         case OpCode::LoadElemValue:
-        /* node = the container: the element may be GONE (the body shrank
-         * the array), an OutOfBoundsEx with this caret */
+        /* #53: the foreach binds whose element may be GONE (the body shrank
+         * the array) - node = the container (the OOB caret) */
         case OpCode::LoadElemBool:
+        case OpCode::LoadStructElemV:
         case OpCode::MultiUnpackV:   /* node = the Expr14 (unpack-length caret) */
         case OpCode::StoreElemInt:   /* node = the SUBSCRIPT (plain: OOB/type) or
                                       * the Expr14 (compound: its div0 caret) */

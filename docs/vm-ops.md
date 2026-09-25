@@ -72,7 +72,16 @@ forms are native: for indexed, the index var IS the loop counter (the body
 reads it) and the element loads into the 2nd var. A flat **`array<bool>`** binds
 each element as a REAL bool (not 0/1) via **`LoadElemBool`**
 (`ForeachStmt::elem_is_bool`), so `print(x)`/`str(x)` show `true`/`false` and
-`x == true` holds — matching `arr_elem_boxed`'s bool case. A **foreach over a
+`x == true` holds — matching `arr_elem_boxed`'s bool case. **#53: every
+foreach element load is re-checked against the array's CURRENT length** - the
+counter is bounded by the length at the loop's start, and a body that shrank
+the array leaves the element gone, the foreach's defined `OutOfBoundsEx` with
+the container's caret (`LoadElemBool`, `LoadStructElemV` and `ForeachDynNext`
+record it in `locs` for that reason; `LoadElemBool`'s JIT tier declines to
+`jit_load_elem_value`, a STATUS helper, where it used to bail). The struct
+DIRECT read (`p.x` off the array bytes at every use) is taken only for a body
+`struct_fe_body_inert` proves cannot change any array or run program code. A
+**foreach over a
 proven STRING**
 (`ForeachStmt::container_is_str`) is the same counted-loop shape with two string
 ops: **`StrLen`** (the char count

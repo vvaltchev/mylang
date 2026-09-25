@@ -7642,6 +7642,58 @@ static const std::vector<test> tests =
     },
 
     {
+        /* #53: a foreach body that mutates its own container - the README
+         * semantics, asserted in every mode (the tree-walker used to read
+         * freed dict nodes / past a vector's end, and the engines visited
+         * different sequences). */
+        "foreach: a body that mutates its container (#53)",
+        {
+            "struct P { int x; }",
+            "func mk() { var d = {}; for (var i = 0; i < 8; i++) d[i] = 5;",
+            "            return d; }",
+            "var d = mk();",
+            "var n = 0;",
+            "foreach (k, v in d) { d[k + 100] = v; n++; }",
+            "assert(n == 8 && len(d) == 16);",
+            "d = mk();",
+            "var s = 0;",
+            "foreach (k, v in d) { erase(d, k); s += v; }",
+            "assert(s == 40 && len(d) == 0);",
+            "d = mk();",
+            "n = 0;",
+            "foreach (k in d) {",
+            "    if (n == 0) for (var j = 0; j < 8; j++) if (j != k)",
+            "        erase(d, j);",
+            "    n++;",
+            "}",
+            "assert(n == 1);",
+            "var a = [1, 2, int(runtime(3))];",
+            "n = 0;",
+            "foreach (x in a) { append(a, x); n++; }",
+            "assert(n == 3 && len(a) == 6);",
+            "var ps = [P(1), P(2), P(int(runtime(3)))];",
+            "s = 0;",
+            "foreach (p in ps) { ps[0] = P(100); s += p.x; }",
+            "assert(s == 6);",
+            "var later = [1, 2, 3, int(runtime(4))];",
+            "s = 0;",
+            "foreach (x in later) { later[3] = 40; s += x; }",
+            "assert(s == 46);",
+        },
+    },
+
+    {
+        /* #53: ... and removing the NEXT element is OutOfBoundsEx */
+        "foreach: a body that shrinks its array raises OutOfBoundsEx (#53)",
+        {
+            "var b = [true, false, true];",
+            "var n = 0;",
+            "foreach (x in b) { pop(b); n++; }",
+        },
+        &typeid(OutOfBoundsEx),
+    },
+
+    {
         "Min and Max builtins",
         {
             "assert(min(1,2) == 1);",

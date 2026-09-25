@@ -1,0 +1,24 @@
+# #53: the CARET and BACKTRACE of a foreach whose body shrank its array
+# (RULE 2: they must be identical in every engine). The whole-`p` struct
+# bind is the deepest of the tiers - its JIT helper conveys the
+# OutOfBoundsEx through a status return and the interpreter stamps the
+# container's caret itself - and it runs warmed (three calls) before the
+# one that is not caught. tests/bt_oracle.py compares the whole
+# output, stderr included.
+
+struct P { int x; int y; }
+
+func walk(int drop) {
+    var a = [P(1, 2), P(3, 4), P(5, 6)];
+    var s = 0;
+    foreach (p in a) {
+        if (drop > 0) erase(a, 0);
+        var q = p;
+        s += q.x;
+    }
+    return s;
+}
+
+for (var i = 0; i < 3; i++)
+    print(walk(0));
+print(walk(runtime(1)));

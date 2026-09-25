@@ -3697,6 +3697,8 @@ LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
             const auto &it = data.find(memId);
             if (it != data.end())
                 return &it->second;
+            if (obj->get_has_default() || for_write)
+                obj->will_restructure();   /* #53: a new key (Cursor) */
             if (obj->get_has_default())
                 return &(*data.emplace(memId,
                     LValue(obj->get_default(), false)).first).second;
@@ -4247,7 +4249,16 @@ float_type vm_struct_elem_field_float(const EvalValue &arrv, int_type idx,
 EvalValue vm_struct_elem(const EvalValue &arrv, int_type idx)
 {
     const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
-    const auto &sv = arr.flat_structs();
+    /* #53: the index is bounded by the length at the loop's START, and the
+     * body may have shrunk the array (the foreach's defined OutOfBoundsEx,
+     * loc-less - the op's caret is stamped by the raise) or PROMOTED it to
+     * general storage (a cold op on a struct array; the element is then
+     * read the general way, as the tree-walker does). */
+    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+        throw OutOfBoundsEx();
+    if (arr.skind() == SharedArrayObj::Storage::general)
+        return arr_elem_boxed(arr, static_cast<size_type>(idx));
+    const auto &sv = arr.flat_structs();   /* any other kind: an image's */
     auto obj = make_intrusive<StructObject>(sv.def);
     std::memcpy(obj->bytes.data(),
                 sv.buf.data() + (arr.offset() + idx) * sv.stride, sv.stride);
@@ -5493,95 +5504,70 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
         const SharedArrayObj &arr = cval.get<SharedArrayObj>();
 
         /*
-         * Flat fast path: iterate the unboxed int/float vector directly, with
-         * no promotion to vector<LValue>. Each element is materialized into a
-         * scalar EvalValue per iteration (cheap, trivially-copyable).
+         * #53: the body may MUTATE the array it walks (append/pop/erase, an
+         * element store, a promotion of flat strs/struct storage to general),
+         * so nothing derived from its storage - a vector reference, a view, a
+         * size - survives an iteration. The DEFINED semantics, shared by
+         * every engine: the loop runs over the length the array had when it
+         * STARTED (an appended element is not visited); each element is read
+         * when its turn comes (a store the body made to a later element is
+         * seen); if the body removed elements so that the next one no longer
+         * exists, the loop raises OutOfBoundsEx at the container.
+         *
+         * So the storage is re-derived per element (`arr` shares it with the
+         * program's variables - the handle is the loop's pin). The flat
+         * scalar kinds cannot change kind (no promotion), the rest dispatch
+         * per element.
          */
-        if (arr.skind() == SharedArrayObj::Storage::ints) {
+        const size_type n = arr.size();
+        intrusive_ptr<StructObject> reuse;
 
-            const auto &iv = arr.flat_ints();
-            const size_type off = arr.offset(), n = arr.size();
+        for (size_type i = 0; i < n; i++) {
 
-            for (size_type i = 0; i < n; i++) {
-                const EvalValue elem(iv[off + i]);
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
-            }
+            if (i >= arr.size())
+                throw OutOfBoundsEx(container->start, container->end);
 
-        } else if (arr.skind() == SharedArrayObj::Storage::floats) {
+            const size_type at = arr.offset() + i;
+            EvalValue elem;
 
-            const auto &fv = arr.flat_floats();
-            const size_type off = arr.offset(), n = arr.size();
-
-            for (size_type i = 0; i < n; i++) {
-                const EvalValue elem(fv[off + i]);
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
-            }
-
-        } else if (arr.skind() == SharedArrayObj::Storage::bools) {
-
-            const auto &bv = arr.flat_bools();
-            const size_type off = arr.offset(), n = arr.size();
-
-            for (size_type i = 0; i < n; i++) {
-                const EvalValue elem(static_cast<bool>(bv[off + i]));
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
-            }
-
-        } else if (arr.skind() == SharedArrayObj::Storage::structs) {
-
-            /*
-             * Flat POD-struct array: rather than heap-allocate a StructObject
-             * per element, reuse ONE across iterations - overwrite its bytes in
-             * place and hand it to the body. COW guard: if the previous body
-             * captured the element (so something other than the loop var still
-             * holds it: use_count() > 2 == this local + the loop var's slot +
-             * a capture), allocate a fresh one so the capture keeps its value.
-             */
-            const auto &sv = arr.flat_structs();
-            const size_type n = arr.size(), base = arr.offset();
-            intrusive_ptr<StructObject> reuse;
-
-            for (size_type i = 0; i < n; i++) {
-
-                if (!reuse || reuse.use_count() > 2)
+            switch (arr.skind()) {
+            case SharedArrayObj::Storage::ints:
+                elem = EvalValue(arr.flat_ints()[at]);
+                break;
+            case SharedArrayObj::Storage::floats:
+                elem = EvalValue(arr.flat_floats()[at]);
+                break;
+            case SharedArrayObj::Storage::bools:
+                elem = EvalValue(static_cast<bool>(arr.flat_bools()[at]));
+                break;
+            case SharedArrayObj::Storage::structs: {
+                /*
+                 * Flat POD-struct array: rather than heap-allocate a
+                 * StructObject per element, reuse ONE across iterations -
+                 * overwrite its bytes in place and hand it to the body. COW
+                 * guard: if the previous body captured the element (so
+                 * something other than the loop var still holds it:
+                 * use_count() > 2 == this local + the loop var's slot + a
+                 * capture), allocate a fresh one so the capture keeps its
+                 * value.
+                 */
+                const auto &sv = arr.flat_structs();
+                if (!reuse || reuse.use_count() > 2 || reuse->def != sv.def)
                     reuse = intrusive_ptr<StructObject>(
                         make_intrusive<StructObject>(sv.def));
-
                 std::memcpy(reuse->bytes.data(),
-                            sv.buf.data() + (base + i) * sv.stride, sv.stride);
-
-                const EvalValue elem(reuse);
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
+                            sv.buf.data() + at * sv.stride, sv.stride);
+                elem = EvalValue(reuse);
+                break;
+            }
+            default:
+                /* general / strs (a handle copy, not a byte copy) */
+                elem = arr_elem_boxed(arr, i);
+                break;
             }
 
-        } else if (arr.skind() == SharedArrayObj::Storage::strs) {
-
-            /* Flat STRING array (top-10 #7): bind each element as a boxed
-             * SharedStr copy (a handle, not a byte copy). */
-            const auto &tv = arr.flat_strs();
-            const size_type n = arr.size(), base = arr.offset();
-
-            for (size_type i = 0; i < n; i++) {
-                const EvalValue elem((SharedStr(tv[base + i])));
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
-            }
-
-        } else {
-
-            const ArrayConstView &view = arr.get_view();
-
-            for (size_type i = 0; i < view.size(); i++) {
-
-                const EvalValue &elem = view[i].get();
-
-                if (!do_iter(&loopCtx, i, &elem, 1))
-                    break;
-            }
+            if (!do_iter(&loopCtx, i, &elem, 1))
+                break;
         }
 
     } else if (cval.is<SharedStr>()) {
@@ -5598,14 +5584,18 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
 
     } else if (cval.is<intrusive_ptr<DictObject>>()) {
 
-        const DictObject::inner_type &data
-            = cval.get<intrusive_ptr<DictObject>>()->get_ref();
+        /* #53: through a Cursor, so a body that inserts or erases keys of
+         * this dict is defined (DictObject::Cursor states the semantics).
+         * `cval` pins the dict for the loop. */
+        DictObject &dobj = *cval.get_ref<intrusive_ptr<DictObject>>();
+        DictObject::Cursor cur;
+        cur.start(dobj);
 
         size_type i = 0;
 
-        for (const auto &p : data) {
+        while (const auto *p = cur.next_entry(dobj)) {
 
-            const EvalValue elems[2] = { p.first, p.second.get() };
+            const EvalValue elems[2] = { p->first, p->second.get() };
 
             if (!do_iter(&loopCtx, i, elems, 2))
                 break;
@@ -5808,6 +5798,8 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
         if (!obj->is_readonly()) {
             if (it != data.end())
                 return &it->second;
+            if (obj->get_has_default() || for_write)
+                obj->will_restructure();   /* #53: a new key (Cursor) */
             if (obj->get_has_default())
                 return &(*data.emplace(memId, LValue(obj->get_default(), false))
                               .first).second;
