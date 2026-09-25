@@ -505,3 +505,8 @@ extern unsigned long g_ref_slots_proven_excluded;   /* C3 (TESTS) */
  * not emitted for it, so no emitted-code counter could see it.
  */
 extern unsigned long g_ref_slots_move_excluded;    /* #97 (TESTS) */
+
+#ifdef TESTS
+/* #97 B2: abs/min/max calls on proven ints lowered to int ops (emit-time) */
+extern unsigned long g_cg_minmax_lowered;
+#endif

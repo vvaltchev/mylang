@@ -14671,3 +14671,55 @@ H1; wall = ONE interleaved `--baseline` run):
     32_str_build_join            -7.46%     0.99x
     28_str_concat                -4.97%     0.96x
     38 / 31 / 47 / 36 / 39 / 75 / 67 / 35 / 79 / 23 / 40 / 34 / 13   flat
+
+## #97 B2 - abs/min/max ON PROVEN INTS LOWER TO INT OPS (2026-09-24)
+
+After H1 and B1, 94's cost was the builtin call itself. `abs(x)`,
+`min(a, b)` and `max(a, b)` whose arguments are PROVEN ints now lower in
+codegen (`try_native_min_max_abs`, beside lever 4b's `len` -> `ArrLen`)
+to a compare-and-branch over existing ops - `JumpUnlessIntCmp`, `MoveV`
+/ `LoadImmInt`, one `IntBin` for abs's negation - no new opcode, so none
+of the opcode tables, the verifier or the image format moved. The exact
+builtin semantics (builtins/num.cpp.h): `abs(x) = x >= 0 ? x : -x`, with
+`-x` as `x * -1` - the same wrapping negation, so `abs(INT_MIN)` stays
+INT_MIN; `min(a, b) = b < a ? b : a`, `max(a, b) = b > a ? b : a` - the
+FIRST argument wins a tie. Each argument is compiled once, in order.
+"Proven int" is `th == i && !th_bool`: a bool is stamped `i` too, and
+`min(true, 5)` must return the bool. Any other shape (a float, a dyn,
+one array argument, three arguments) keeps the generic call and its
+throws; the tree-walker always calls the builtin, so the five-mode
+differential is the lowering's oracle.
+
+⛔ **A LOWERING WITH TWO JOINING PRODUCERS MUST END ON AN ARM STORE.**
+The first version ended abs's else arm on `IntBin dst = x * -1`. The
+ARGUMENT-STAGING retarget (`op_writes_pure_target`: `<produce t>; MoveV
+rArg = t` -> produce into rArg) rewrote that last producer into the
+argument slot on the premise that it was the result's ONLY producer -
+here it was one of two, and the other arm's move kept writing the dead
+temp: `print(g1(5))`, `g1` = `return abs(a - 1)` inlined, printed a
+stale `<function>`. This is CLAUDE.md's third audit-table shape (#138's
+LogV chain) met from the other side: the table is right to exclude
+MoveV, and the lowering must give it a MoveV to see. Now abs negates
+into its own temp and ends on the MoveV, like the typed ternary; E1
+fuses the pair after staging has run. (The first diagnosis blamed the
+return peephole, and the first "the test does not catch it" readings
+came from reading only `-rt`'s HEADLINE - the tree-walker pass, which
+never runs codegen; the VM modes are on the Differential lines.)
+
+PINNED by a `-rt` entry that asserts its own results in all five modes
+- values, ties, INT_MIN, the assignment, return (a non-inlinable
+helper) and ARGUMENT positions (a builtin's argument, a user call's, an
+inlined helper's result), and the generic path for bool/float - plus
+`cg_minmax_reach` (a codegen counter): 3 of 3 int calls lowered, 0 of 3
+bool/float ones. Watched: ending abs on the IntBin fails the entry in
+all four VM modes (1705/1706); dropping the bool exclusion fails the
+reach check.
+
+Measured (callgrind Ir per scale unit, `OPT=1 ASSERTS=0`, `-npc`, baseline
+B1; wall = ONE interleaved `--baseline` run):
+
+    bench                        Ir          wall      vs C++
+    94_builtin_in_helper       -82.76%      0.16x     5.59x -> 0.92x
+    95_recursion_with_builtin  -76.08%      0.56x     3.92x -> 2.11x
+    38_min_max (array min/max - generic, as it must be)   flat
+    40 / 09 / 03 / 45 / 91                                 flat

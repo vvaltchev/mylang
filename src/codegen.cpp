@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "codegen.h"
+#ifdef TESTS
+unsigned long g_cg_minmax_lowered = 0;  /* #97 B2: emit-time (codegen) */
+#endif
 #include "env.h"
 #include "jit.h"
 #include "vm.h"      /* vm_aop_dispatchable - #137 tier 1 */
@@ -1689,6 +1692,8 @@ struct Codegen {
                 return true;
             if (try_native_map_filter(bc, out_slot, ops))
                 return true;
+            if (try_native_min_max_abs(bc, out_slot, ops))   /* #97 B2 */
+                return true;
             if (try_native_len(bc, out_slot, ops))
                 return true;
             if (try_native_ord(bc, out_slot, ops))
@@ -3294,6 +3299,138 @@ struct Codegen {
         return false;
     }
 
+    /*
+     * #97 B2: `abs(x)`, `min(a, b)`, `max(a, b)` on PROVEN INTS lower to a
+     * compare-and-branch over existing int ops, not the CallBuiltinV marshal
+     * (~200 Ir of argument boxing plus the boxed comparison, per call - the
+     * whole of 94_builtin_in_helper's cost after H1). Exactly the builtins'
+     * semantics (builtins/num.cpp.h):
+     *   abs(x)    = x >= 0 ? x : -x       (-x as x * -1: the SAME wrapping
+     *                                      negation, so abs(INT_MIN) stays
+     *                                      INT_MIN, as `-val` does there)
+     *   min(a, b) = b < a ? b : a         (the FIRST argument wins a tie)
+     *   max(a, b) = b > a ? b : a
+     * Each argument is compiled ONCE, in order, before the branch. "Proven
+     * int" is `th == i && !th_bool`: a bool is stamped `i` too, and
+     * `min(true, 5)` must return the BOOL. Any other shape - a float, a
+     * dyn, one array argument, three arguments - keeps the generic call
+     * and its throws. The tree-walker still calls the builtin, so the
+     * engine differential is this lowering's oracle.
+     */
+    bool try_native_min_max_abs(const DirectBuiltinCallExpr *dc,
+                                int &out_slot, std::vector<CgInstr> &ops)
+    {
+        static const UniqueId *abs_uid = UniqueId::get("abs");
+        static const UniqueId *min_uid = UniqueId::get("min");
+        static const UniqueId *max_uid = UniqueId::get("max");
+        if (!dc->args || dc->lvalue_arg0 || dc->th != TypeHint::i
+                || dc->th_bool)
+            return false;
+        const Identifier *bid =
+            dynamic_cast<const Identifier *>(dc->what.get());
+        if (!bid)
+            return false;
+        const bool is_abs = bid->uid == abs_uid;
+        const bool is_min = bid->uid == min_uid;
+        const bool is_max = bid->uid == max_uid;
+        const size_t want = is_abs ? 1 : 2;
+        if (!(is_abs || is_min || is_max)
+                || dc->args->elems.size() != want)
+            return false;
+        for (const auto &a : dc->args->elems)
+            if (!a || a->th != TypeHint::i || a->th_bool)
+                return false;
+        const size_t mark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int save_top = next_temp;
+        const auto fail = [&]() {
+            ops.resize(mark);
+            chunk.consts.resize(cmark);
+            next_temp = save_top;
+            return false;
+        };
+        const int dst = alloc_temp();        /* reserved BELOW the scratch */
+        Operand a, b;
+        if (!compile_int_expr(dc->args->elems[0].get(), a, ops))
+            return fail();
+        if (!is_abs && !compile_int_expr(dc->args->elems[1].get(), b, ops))
+            return fail();
+        const auto store = [&](const Operand &o) {
+            CgInstr in;
+            if (o.is_lit) {
+                in.op = OpCode::LoadImmInt;
+                in.target = dst;
+                in.set_a(o);
+            } else {
+                in.op = OpCode::MoveV;
+                in.target = dst;
+                in.target2 = static_cast<int>(o.slot);
+            }
+            ops.push_back(in);
+        };
+        /* the branch to the OTHER arm: abs - unless x >= 0; min - unless
+         * b < a; max - unless b > a */
+        CgInstr br;
+        br.op = OpCode::JumpUnlessIntCmp;
+        if (is_abs) {
+            Operand zero;
+            zero.is_lit = true;
+            zero.lit = 0;
+            br.aop = Op::ge;
+            br.set_a(a);
+            br.set_b(zero);
+        } else {
+            br.aop = is_min ? Op::lt : Op::gt;
+            br.set_a(b);
+            br.set_b(a);
+        }
+        const size_t cj = ops.size();
+        ops.push_back(br);
+        store(is_abs ? a : b);                /* the taken arm */
+        const size_t jmp_i = ops.size();
+        {
+            CgInstr j;
+            j.op = OpCode::Jump;
+            ops.push_back(j);
+        }
+        ops[cj].target = static_cast<int>(ops.size());
+        if (is_abs) {
+            /* t = x * -1; dst = t. ⛔ NOT `dst = x * -1` directly: the
+             * lowering must END on an arm store (MoveV/LoadImm), like the
+             * typed ternary. The ARGUMENT-STAGING retarget
+             * (op_writes_pure_target: `<produce t>; MoveV rArg = t` ->
+             * produce into rArg) rewrites the LAST producer on the premise
+             * that it is the result's ONLY one - here it is one of two
+             * joining arms, so the other arm's move kept writing the dead
+             * temp (watched: `print(g1(5))` with `g1` = `return abs(a-1)`
+             * inlined printed `<function>`, a stale slot). MoveV is kept
+             * out of that table for exactly this join shape (CLAUDE.md,
+             * the third audit-table shape - #138's LogV chain). E1 fuses
+             * this pair later, after staging. */
+            Operand m1;
+            m1.is_lit = true;
+            m1.lit = -1;
+            const int neg = alloc_temp();
+            CgInstr in;
+            in.op = OpCode::IntBin;
+            in.node_idx = add_ast_node(dc);
+            in.target = neg;
+            in.set_a(a);
+            in.set_b(m1);
+            in.aop = Op::times;
+            ops.push_back(in);
+            store(slot_op(neg));
+        } else {
+            store(a);
+        }
+        ops[jmp_i].target = static_cast<int>(ops.size());
+        out_slot = dst;
+#ifdef TESTS
+        g_cg_minmax_lowered++;
+#endif
+        return true;
+    }
+
     /* Lever 4b: `len(x)` whose arg the inferencer proved a non-opt ARRAY or
      * STRING (CallExpr::vm_len_kind; the DirectBuiltinCallExpr node itself
      * proves the callee is the unshadowed builtin) lowers to the existing
@@ -4580,6 +4717,7 @@ struct Codegen {
                 int t;
                 if (try_native_defined_global(bc, t, ops)   /* defined(global) */
                         || try_native_defined_expr(bc, t, ops)
+                        || try_native_min_max_abs(bc, t, ops) /* B2 */
                         || try_native_len(bc, t, ops)      /* lever 4b */
                         || try_native_ord(bc, t, ops)
                         || try_native_builtin(bc, t, ops)) { /* value ABI */
