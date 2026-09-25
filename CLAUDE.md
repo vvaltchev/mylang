@@ -3417,7 +3417,9 @@ decisions behind it: `plans/archived/type-inference.md`,
   comes from its non-dyn contribution (`0`), and the `dyn` rhs is a
   runtime-checked coercion.
   Higher-order builtins (`map(func,c)`, `filter(func,c)`, `sort(c,func)`,
-  `make_dict(keys,gen)`,...) feed the container's element type into the
+  `make_dict(keys,gen)`, `sum(a,key)`, `find(a,x,key)` - the last only
+  since #49, and only for an ARRAY container, the one kind that calls
+  its key) feed the container's element type into the
   callback's params (named **or** inline lambda; `callee_funcinfo`) — for
   `make_dict` the callback's param is the KEYS array's element type (the key),
   and the result is `dict<K, V>` (K the key type, V the callback's return), the
@@ -7419,7 +7421,18 @@ comparator-validity instrumentation that *hangs* on a non-ordering comparator.
 The default (no-comparator) path keeps `std::sort` — its `operator<` is a valid
 ordering for homogeneous types and throws `TypeErrorEx` for incomparable ones.
 Keep this distinction if you touch sorting or add another callback-driven
-algorithm. **Callback handle lifetime:** when a builtin keeps a raw
+algorithm. **The callback may also MUTATE the container being walked (#49,
+2026-09-25)** - five builtins read an array's length ONCE and indexed past
+its end after a `pop()` in the callback (`find`, `map`, `filter`,
+`make_dict`, and `sort`'s heapsort), and `map`/`filter` over a DICT walked
+an `unordered_map` the callback had just erased from (ASan UAF). The rule
+now: an ARRAY walk re-reads `size()` every step (`sum`'s key loop already
+did, #43); a DICT walk iterates a SNAPSHOT of its pairs taken before the
+first call; `sort` checks after every comparison that the array's length
+and storage kind are unchanged and raises `InvalidArgumentEx` otherwise
+(a strs array promoted by a non-string write DESTROYS the vector the sort
+holds a reference to). A new callback-driven builtin must pick one of
+these three, never a cached bound or a live iterator. **Callback handle lifetime:** when a builtin keeps a raw
 `FuncObject *` to the callback, the `shared_ptr` that owns it must outlive every
 call — an inline lambda (`find(a, x, func(e)=>…)`) has *no other owner*, so a
 raw pointer extracted from a `RValue()` temporary that goes out of scope before

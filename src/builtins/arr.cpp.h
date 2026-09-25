@@ -776,7 +776,10 @@ builtin_find_arr(const SharedArrayObj &arr,
         /* prepared per-loop invoker (vm.h); `site` names the frame */
         VmInvoker inv(ctx, *key, site);
 
-        for (size_type i = 0; i < n; i++) {
+        /* #49: the size is re-read per step - the key is arbitrary script
+         * code and may shrink the array under us (`n`, read once, then
+         * indexed past its end: an OOB read). */
+        for (size_type i = 0; i < arr.size(); i++) {
 
             const EvalValue r = inv.call(arr_elem_at(arr, i));
             if (r == v)
@@ -1019,11 +1022,32 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
          * twice, once for its own parameters and again into the argv. */
         VmInvoker inv(ctx, funcObj, exprList->start);
 
+        /*
+         * #49: the comparator is arbitrary script code and may MUTATE the
+         * array being sorted - the heapsort indexes a vector sized once, so
+         * a pop() read past its end, and a string array promoted to general
+         * storage by a non-string write destroyed the very vector being
+         * sorted. Like Python's "list modified during sort", a comparator
+         * that changes the array's length or storage is an error: checked
+         * after every comparison, before the sort touches the storage
+         * again. (An in-place element write keeps both, so it is merely
+         * observed - every index stays in bounds.)
+         */
+        size_type sort_n = arr.size();
+        auto sort_kind = arr.skind();
+        auto guard = [&]() {
+            if (arr.skind() != sort_kind || arr.size() != sort_n)
+                throw InvalidArgumentEx(
+                    "sort(): the comparator modified the array being sorted",
+                    exprList->start, exprList->end);
+        };
+
         switch (arr.skind()) {
             case SharedArrayObj::Storage::ints: {
                 auto &v = arr.flat_ints();
                 comparator_heapsort(v, [&](int_type a, int_type b) {
                     const bool lt = inv.call(a, b).is_true();
+                    guard();
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -1032,6 +1056,7 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
                 auto &v = arr.flat_floats();
                 comparator_heapsort(v, [&](float_type a, float_type b) {
                     const bool lt = inv.call(a, b).is_true();
+                    guard();
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -1041,6 +1066,7 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
                 comparator_heapsort(v, [&](unsigned char a, unsigned char b) {
                     const bool lt = inv.call(static_cast<bool>(a),
                                              static_cast<bool>(b)).is_true();
+                    guard();
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -1056,6 +1082,7 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
                                         const SharedStr &b) {
                     const bool lt = inv.call(SharedStr(a),
                                              SharedStr(b)).is_true();
+                    guard();
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -1072,10 +1099,13 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
 
                 if (promoting && lval)
                     lval->put(val0);
+                sort_kind = arr.skind();       /* general, now */
+                sort_n = arr.size();
 
                 comparator_heapsort(vec,
                                     [&](const LValue &a, const LValue &b) {
                     const bool lt = inv.call(a.get(), b.get()).is_true();
+                    guard();
                     return reverse ? !lt : lt;
                 });
                 break;

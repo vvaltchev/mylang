@@ -2359,7 +2359,9 @@ The comparator should be a *strict weak ordering* (return `a < b`, not a
 qsort-style numeric difference like `a - b`). A comparator that isn't one
 yields an **unspecified but well-defined, memory-safe** ordering — never a
 crash: with a custom comparator `sort()` uses a heapsort that stays within the
-array's bounds regardless of what the comparator returns.
+array's bounds regardless of what the comparator returns. A comparator that
+changes the array's length raises `InvalidArgumentEx` (see *Callbacks that
+change the container they run over*).
 
 Note: while `sort()` works in-place, it still can be used to sort arrays
 without altering them and to sort const arrays as well: in the first case,
@@ -2506,8 +2508,9 @@ of the `what` substring in `container` or `none`.
 
 When `container` is an array, it returns the index of the first element equal
 to `what`. Also, when `container` is an array, a 3rd parameter (`key_func`) is
-supported: it's a function object accepting a value (element of the array) and
-returning the value that must be compared to `what`. It's useful when we're
+supported: it's a function object accepting a value (element of the array,
+typed as the array's element type) and returning the value that must be
+compared to `what`. It's useful when we're
 searching something in an array of composite elements (e.g. tuples).
 
 When `container` is a dictionary, it returns the value associated with the
@@ -2547,6 +2550,25 @@ filter(func(x) => x > 3, [1, 2, 3, 4, 5]) == [4, 5]
 In case the container is a dictionary, `func` is required to accept two parameters,
 a key and a value, but the behavior will be semantically the same (a dictionary will
 be returned).
+
+#### Callbacks that change the container they run over
+
+A callback passed to a builtin is arbitrary code, and it may modify the very
+container the builtin is walking. The outcome is always defined:
+
+  * `find`, `map`, `filter`, `make_dict` and `sum` over an **array** visit
+    index 0, 1, 2, ... for as long as the index is below the array's
+    *current* length - elements a callback removes are not visited, elements
+    it appends are.
+  * `map` and `filter` over a **dictionary** visit the pairs the dictionary
+    held when the call began, with the values they had then; entries a
+    callback adds or removes do not change what is visited.
+  * `sort`/`rev_sort` raise `InvalidArgumentEx` when the comparator changes
+    the length of the array being sorted (or turns a string array into a
+    general one by storing a non-string in it).
+
+A callback must be a function: passing a builtin (`find(a, 3, len)`) is a
+`TypeErrorEx`, for every higher-order builtin alike.
 
 ### Numeric builtins
 

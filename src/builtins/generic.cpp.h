@@ -502,10 +502,12 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
         /* Read element-by-element WITHOUT promoting flat storage (arr_elem_at);
          * build a fresh array. */
         const SharedArrayObj &arr = container.get<SharedArrayObj>();
-        const size_type n = arr.size();
         SharedArrayObj::vec_type result;
 
-        for (size_type i = 0; i < n; i++) {
+        /* #49: the size is re-read per step - the callback is arbitrary
+         * script code and may shrink the array under us; a count read
+         * once indexed past its end. */
+        for (size_type i = 0; i < arr.size(); i++) {
             /* e / r non-const so the kept one is MOVED into the result vector
              * (avoiding a per-element retain for a general/str/dyn element),
              * not copied (#60 Tier 1). e is passed to the callback FIRST,
@@ -522,25 +524,34 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
 
     } else if (container.is<intrusive_ptr<DictObject>>()) {
 
+        /*
+         * #49: iterate a SNAPSHOT of the pairs, taken before the first
+         * call. The callback is arbitrary script code and may insert into
+         * or erase from this very dict; walking the live unordered_map
+         * then used an iterator the mutation had invalidated (ASan:
+         * heap-use-after-free on an erase, an unbounded walk on inserts).
+         * The callback sees the pairs that were there when the call
+         * began, with the values they had then (README).
+         */
         const DictObject::inner_type &data =
             container.get<intrusive_ptr<DictObject>>()->get_ref();
-
-        auto call_kv = [&](const EvalValue &k, const EvalValue &v) {
-            return inv.call(k, v);
-        };
+        std::vector<std::pair<EvalValue, LValue>> snap;
+        snap.reserve(data.size());
+        for (auto const &e : data)
+            snap.emplace_back(e.first, e.second);
 
         if (!is_filter) {
 
             SharedArrayObj::vec_type result;
-            for (auto const &e : data)
-                result.emplace_back(call_kv(e.first, e.second.get()),
+            for (auto const &e : snap)
+                result.emplace_back(inv.call(e.first, e.second.get()),
                                     ctx->const_ctx);
             return SharedArrayObj(std::move(result));
         }
 
         DictObject::inner_type result;
-        for (auto const &e : data)
-            if (call_kv(e.first, e.second.get()).is_true())
+        for (auto const &e : snap)
+            if (inv.call(e.first, e.second.get()).is_true())
                 result.insert(e);
         return make_intrusive<DictObject>(std::move(result));
     }
