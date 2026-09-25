@@ -650,7 +650,7 @@ vm_capture_frame(Exception &e, FuncObject &obj, const Chunk *call_ck,
         /* profile #3: the LAZY frame - no strings at capture time (the
          * descriptor outlives the render: AST/VmProgram-owned, and both are
          * declared OUTSIDE the driver's try; format_backtrace stringifies). */
-        e.backtrace.emplace_back(obj.func, cs);
+        e.push_frame(obj.func, cs);
     } else {
         /* A COMPILE-TIME fold (AutoConst / the inliner's refold) may run a
          * THROWAWAY clone whose descriptor dies with the fold, while the
@@ -663,7 +663,7 @@ vm_capture_frame(Exception &e, FuncObject &obj, const Chunk *call_ck,
         ps.reserve(d->params.size());
         for (const auto &p : d->params)
             ps.push_back(string(p.name->val));
-        e.backtrace.emplace_back(
+        e.push_frame(
             !d->display_name.empty()
                 ? d->display_name
                 : d->name ? string(d->name->val) : "<lambda>",
