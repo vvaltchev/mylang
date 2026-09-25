@@ -2995,10 +2995,13 @@ In the case `container` was an array, always return true or throws
 ### Non-const numeric builtins
 
 #### `rand(a, b)`
-Generate a random integer in the range [a, b].
+Generate a random integer in the range [a, b]. An empty range (`a > b`)
+raises `InvalidArgumentEx`.
 
 #### `randf(a, b)`
-Generate a random floating-point number in the range [a, b].
+Generate a random floating-point number in the range [a, b]. An empty range
+(`a > b`), a `nan` bound, or a range whose width is not finite (e.g.
+`randf(-inf, inf)`) raises `InvalidArgumentEx`.
 
 ### Non-const I/O builtins
 
