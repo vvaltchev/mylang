@@ -251,14 +251,25 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
  * store through a subscript or member, a compound store to a non-scalar,
  * and any call except a short list of builtins that neither mutate an
  * argument nor call back into the program are all "not inert".
+ *
+ * `shift_only` asks the WEAKER question the foreach SHIFT GUARD needs
+ * (#53 option 1, ArrEpochMark/Check): may the body MOVE an element of an
+ * array - pop, erase, an insert not at the end? Only a builtin call or
+ * user code can, so element stores, `+=` on an array (an append), and a
+ * short second list of builtins that grow or reorder but never move
+ * (append/push/sort/reverse and friends, callback-free by the
+ * callable_arg_mask test) are all fine, and a spliced InlinedCallExpr is
+ * just code to walk. A false "cannot shift" would drop the guard and let
+ * an element be SKIPPED silently, so this fails closed like the rest.
  */
-static bool struct_fe_body_inert(const Construct *c)
+static bool struct_fe_body_inert(const Construct *c,
+                                 bool shift_only = false)
 {
     if (!c)
         return true;
-    auto all = [](std::initializer_list<const Construct *> cs) {
+    auto all = [shift_only](std::initializer_list<const Construct *> cs) {
         for (const Construct *ch : cs)
-            if (!struct_fe_body_inert(ch))
+            if (!struct_fe_body_inert(ch, shift_only))
                 return false;
         return true;
     };
@@ -269,16 +280,21 @@ static bool struct_fe_body_inert(const Construct *c)
         return true;
     if (ctag(c) == ConstructType::member)
         return struct_fe_body_inert(
-            static_cast<const MemberExpr *>(c)->what.get());
+            static_cast<const MemberExpr *>(c)->what.get(), shift_only);
     if (auto *e = dynamic_cast<const Expr14 *>(c)) {
+        if (shift_only)                   /* a store moves no element */
+            return all({e->lvalue.get(), e->rvalue.get()});
         if (!dynamic_cast<const Identifier *>(e->lvalue.get()))
             return false;                 /* a store through [] or . */
         if (e->op != Op::assign && !scalar_th(e->lvalue.get()))
             return false;                 /* `a += [x]` appends in place */
         return struct_fe_body_inert(e->rvalue.get());
     }
-    if (auto *inc = dynamic_cast<const IncDecExpr *>(c))
+    if (auto *inc = dynamic_cast<const IncDecExpr *>(c)) {
+        if (shift_only)
+            return struct_fe_body_inert(inc->lvalue.get(), true);
         return dynamic_cast<const Identifier *>(inc->lvalue.get()) != nullptr;
+    }
     if (auto *bc = dynamic_cast<const DirectBuiltinCallExpr *>(c)) {
         static const char *const ok[] = {
             "print", "len", "str", "int", "float", "abs", "sqrt", "cbrt",
@@ -287,12 +303,22 @@ static bool struct_fe_body_inert(const Construct *c)
             "hash", "assert", "isnan", "isinf", "isfinite", "isnormal",
             "runtime", "sin", "cos", "tan", "asin", "acos", "atan",
         };
+        /* grow or reorder IN PLACE, never move an element to another
+         * position: allowed by the shift guard, not by inertness */
+        static const char *const grow[] = {
+            "append", "push", "sort", "rev_sort", "reverse", "keys",
+            "values", "join", "split", "range", "clone", "deepclone",
+            "top", "sum", "array", "dynarray", "array_storage",
+        };
         const auto *id = dynamic_cast<const Identifier *>(bc->what.get());
         if (!id || bc->callable_arg_mask != 0)
             return false;
         bool listed = false;
         for (const char *n : ok)
             listed = listed || id->uid->val == n;
+        if (shift_only)
+            for (const char *n : grow)
+                listed = listed || id->uid->val == n;
         return listed && all({bc->args.get()});
     }
     if (dynamic_cast<const CallExpr *>(c))
@@ -300,26 +326,26 @@ static bool struct_fe_body_inert(const Construct *c)
                                            * may mutate / call back */
     if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
         for (const auto &pr : mo->elems)
-            if (!struct_fe_body_inert(pr.second.get()))
+            if (!struct_fe_body_inert(pr.second.get(), shift_only))
                 return false;
         return true;
     }
     if (ctag(c) == ConstructType::typed_scalar) {
         for (const auto &pr : static_cast<const TypedScalarExpr *>(c)->elems)
-            if (!struct_fe_body_inert(pr.second.get()))
+            if (!struct_fe_body_inert(pr.second.get(), shift_only))
                 return false;
         return true;
     }
     if (auto *me = dynamic_cast<const MultiElemConstruct<> *>(c)) {
         for (const auto &el : me->elems)
-            if (!struct_fe_body_inert(el.get()))
+            if (!struct_fe_body_inert(el.get(), shift_only))
                 return false;
         return true;
     }
-    if (dynamic_cast<const InlinedCallExpr *>(c))
+    if (dynamic_cast<const InlinedCallExpr *>(c) && !shift_only)
         return false;                     /* a spliced body: not audited */
     if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c))
-        return struct_fe_body_inert(sc->elem.get());
+        return struct_fe_body_inert(sc->elem.get(), shift_only);
     if (auto *sub = dynamic_cast<const Subscript *>(c))
         return all({sub->what.get(), sub->index.get()});
     if (auto *iff = dynamic_cast<const IfStmt *>(c))
@@ -341,7 +367,7 @@ static bool struct_fe_body_inert(const Construct *c)
     if (auto *co = dynamic_cast<const CoalesceExpr *>(c))
         return all({co->lhs.get(), co->rhs.get()});
     if (auto *ret = dynamic_cast<const ReturnStmt *>(c))
-        return struct_fe_body_inert(ret->elem.get());
+        return struct_fe_body_inert(ret->elem.get(), shift_only);
     if (dynamic_cast<const Literal *>(c)
         || dynamic_cast<const ChildlessConstruct *>(c))
         return true;                             /* a childless leaf */
@@ -7076,6 +7102,42 @@ struct Codegen {
     }
 
     /*
+     * #53 option 1 - THE FOREACH SHIFT GUARD (see ArrEpochMark in
+     * bytecode.h). Called right after the loop's ArrLen, while the loop's
+     * temps are still being reserved: records the container temp `c`'s
+     * shift epoch into a fresh temp and returns it - or -1, emitting
+     * nothing, when the body PROVABLY cannot move an element (every
+     * foreach bench body), so a proven loop pays zero.
+     */
+    int emit_foreach_epoch_mark(const ForeachStmt *fe, int c)
+    {
+        if (struct_fe_body_inert(fe->body.get(), /*shift_only=*/true))
+            return -1;
+        const int m = alloc_temp();
+        CgInstr mk;
+        mk.op = OpCode::ArrEpochMark;
+        mk.target = m;
+        mk.target2 = c;
+        code.push_back(mk);
+        return m;
+    }
+
+    /* ... and its per-iteration test, at the loop head BEFORE the element
+     * load (a moved element must never be bound first). The caret is the
+     * container's, like the loads' own OutOfBoundsEx. */
+    void emit_foreach_epoch_check(const ForeachStmt *fe, int c, int m)
+    {
+        if (m < 0)
+            return;
+        CgInstr ck;
+        ck.op = OpCode::ArrEpochCheck;
+        ck.node_idx = add_ast_node(fe->container.get());
+        ck.target2 = c;
+        ck.set_a(slot_op(m));
+        code.push_back(ck);
+    }
+
+    /*
      * Native foreach over a flat int/float array with a single, non-indexed
      * loop var (ForeachStmt::elem_th, set by the inferencer - the only sound
      * case; a dict / string / general / tuple / indexed foreach stays the
@@ -7138,6 +7200,7 @@ struct Codegen {
         ln.target = n;
         ln.target2 = c;
         code.push_back(ln);
+        const int m = emit_foreach_epoch_mark(fe, c);     /* #53 */
 
         /* The counter: for an indexed foreach it IS the index var (ids[0], read
          * by the body); otherwise a fresh temp. Either way it starts at 0 and
@@ -7160,6 +7223,7 @@ struct Codegen {
                                    slot_op(i), slot_op(n));
 
         const int lbody = here();
+        emit_foreach_epoch_check(fe, c, m);
 
         /* x = c[i] : a direct flat int/float element load into the loop var,
          * re-run at the top of every iteration (the ForLoopStep re-enters
@@ -7357,6 +7421,10 @@ struct Codegen {
         ln.target = n;
         ln.target2 = c;
         code.push_back(ln);
+        /* #53: a DIRECT read needs an inert body, which cannot shift -
+         * so only the whole-`p` bind can carry a guard */
+        const int m = emit_foreach_epoch_mark(fe, c);
+        ML_CHECK(whole_p || m < 0);
 
         const int i = alloc_temp();
         CgInstr z;
@@ -7374,6 +7442,7 @@ struct Codegen {
         const int lbody = here();
 
         if (whole_p) {
+            emit_foreach_epoch_check(fe, c, m);
             /* Materialize p = c[i] (a fresh StructObject) at the top of each
              * iteration; the body reads p's slot normally (no sfe mapping). */
             CgInstr ld;
@@ -7506,6 +7575,7 @@ struct Codegen {
         ln.target = n;
         ln.target2 = c;
         code.push_back(ln);
+        const int m = emit_foreach_epoch_mark(fe, c);     /* #53 */
 
         /* The counter: for an indexed loop it IS the index var (base, read by
          * the body); otherwise a fresh temp. */
@@ -7524,6 +7594,7 @@ struct Codegen {
                                    slot_op(i), slot_op(n));
 
         const int lbody = here();
+        emit_foreach_epoch_check(fe, c, m);
 
         /* Per element: read pairs[i] (a sub-array), strict-check its length ==
          * nunpack, and write its scalars into unpack_base..+nunpack-1 - box-free
@@ -8202,6 +8273,8 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
          * the array) - node = the container (the OOB caret) */
         case OpCode::LoadElemBool:
         case OpCode::LoadStructElemV:
+        /* #53 option 1: the shift guard - node = the container */
+        case OpCode::ArrEpochCheck:
         case OpCode::MultiUnpackV:   /* node = the Expr14 (unpack-length caret) */
         case OpCode::StoreElemInt:   /* node = the SUBSCRIPT (plain: OOB/type) or
                                       * the Expr14 (compound: its div0 caret) */
@@ -8649,7 +8722,10 @@ static bool visit_use_def(const Instr &in, U u, D d)
         /* a = the member_keys pool idx (a lit), not a slot */
         u(in.target2); d(in.target); return true;
     case OpCode::ArrLen: case OpCode::StrLen:
+    case OpCode::ArrEpochMark:        /* #53: m = c's shift epoch */
         u(in.target2); d(in.target); return true;
+    case OpCode::ArrEpochCheck:       /* reads c and m, writes nothing */
+        u(in.target2); u(in.a_slot()); return true;
     case OpCode::OrdCharV:
         u(in.target2); opnd(in.a()); d(in.target); return true;
     case OpCode::SliceV:
@@ -9919,6 +9995,7 @@ bool op_writes_scalar(OpCode op)
     case OpCode::ForLoopStep: case OpCode::ForStepElemInt:
     case OpCode::StructFieldAddInt: case OpCode::MathFnV:
     case OpCode::ArrLen: case OpCode::StrLen: case OpCode::OrdCharV:
+    case OpCode::ArrEpochMark:        /* an int: the epoch, or -1 */
     case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
@@ -10794,8 +10871,15 @@ void ChunkVerifier::verify_one(const Instr &in)
     case OpCode::ArrLen:
     case OpCode::StrLen:
     case OpCode::MoveV:
+    case OpCode::ArrEpochMark:
         reg(in.target);
         reg(in.target2);
+        break;
+    case OpCode::ArrEpochCheck:
+        /* the mark `a` is read as a SLOT by the JIT's inline compare
+         * (never through the lit flag), so a literal is refused */
+        reg(in.target2);
+        a_slot_only(in);
         break;
     case OpCode::MemberV:
         reg(in.target);

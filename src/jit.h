@@ -1025,6 +1025,15 @@ extern "C" void jit_load_literal_obj(LValue *slots, int_type dst,
 extern "C" void jit_arr_len(LValue *slots, int_type dst,
                             int_type base) noexcept;
 
+/* #53 option 1: the foreach shift guard (bytecode.h, ArrEpochMark). The
+ * mark never throws; the check is the COLD tier of an inline compare -
+ * 1 = conveyed a loc-less OutOfBoundsEx through g_vm_jit_exc (the emitter
+ * stamps the container caret), 0 = no raise. */
+extern "C" void jit_arr_epoch_mark(LValue *slots, int_type dst,
+                                   int_type base) noexcept;
+extern "C" int jit_arr_epoch_check(LValue *slots, int_type base,
+                                   int_type m) noexcept;
+
 /* model-flip (nativize-ops): DictLoadInt/Float natively - the typed scalar dict
  * read. `key` is a baked const-pool value (member `d.k`) or a lea'd key-temp
  * slot (subscript `d[k]`). A missing key / non-dict base runs the shared
@@ -1337,7 +1346,8 @@ extern unsigned long g_jit_op_run[];
     X(memberv_readonly) X(memberv_val_kind) X(memberv_val_ex) \
     X(memberv_val_slice) \
     X(elemb_base_not_arr) X(elemb_base_slice) X(elemb_base_kind) \
-    X(elemb_bounds)
+    X(elemb_bounds) \
+    X(epoch_base_not_arr) X(epoch_shifted)
 
 enum JitDecline {
 #define ML_JD_ENUM(n) JD_##n,

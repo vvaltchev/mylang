@@ -168,6 +168,26 @@ private:
         size_t hash_cache = 0;
         bool hash_valid = false;
 
+        /*
+         * THE SHIFT EPOCH (#53, option 1). Bumped by every operation that
+         * MOVES existing elements of this storage in place - pop, erase,
+         * an insert that is not at the end (note_shift below, called at
+         * each in-place site AFTER the slice detach). A foreach over a
+         * NON-slice handle records it at its start and raises
+         * OutOfBoundsEx at its next step if it moved: removing an element
+         * already visited would otherwise silently SKIP the next one, and
+         * a middle insert would visit one twice. Appends, element stores,
+         * sort/reverse (a reorder in place, the length unchanged) and the
+         * in-place strs/structs promotion do NOT bump it - they move no
+         * element to another position the loop has not reached. A slice
+         * view never shifts: every shifting op on its parent detaches the
+         * overlapping views first, and an op through the view reseats or
+         * clones the VIEW's own handle - so a foreach over a slice does
+         * not check (fe_mark answers -1). An int_type so the JIT can
+         * compare it against a frame slot's payload in one instruction.
+         */
+        int_type shift_epoch = 0;
+
         SharedObject() : kind(Storage::general) { new (&vec) vec_type(); }
         SharedObject(vec_type &&a) : kind(Storage::general) {
             new (&vec) vec_type(std::move(a));
@@ -531,6 +551,16 @@ public:
 
     bool is_slice() const { return slice; }
 
+    /* #53 option 1 - see SharedObject::shift_epoch. `fe_mark` is what a
+     * foreach records at its start (-1 == never check: a slice view, or
+     * no storage); `fe_shifted(mark)` is its per-step test; `note_shift`
+     * is called by every op that moves elements in place. */
+    int_type fe_mark() const
+    { return (slice || !shobj) ? -1 : shobj->shift_epoch; }
+    bool fe_shifted(int_type mark) const   /* mark != -1: shobj is set */
+    { return mark != -1 && shobj->shift_epoch != mark; }
+    void note_shift() { shobj->shift_epoch++; }
+
     /*
      * Native-AOT (jit.cpp) LAYOUT PROBE. Returns the runtime pointers the
      * JIT's LoadElem fragment must navigate: the SharedObject, its `kind`
@@ -557,6 +587,9 @@ public:
          * so the emitter can learn the RefCounted base's offset without
          * SharedObject (private) being visible there. */
         const void *refcnt;
+        /* #53 option 1: &shobj->shift_epoch (int_type), which the
+         * foreach's ArrEpochCheck compares against its recorded mark. */
+        const void *shift_epoch;
     };
     JitProbe jit_probe() const {
         return { static_cast<const void *>(shobj.get()),
@@ -565,7 +598,8 @@ public:
                  static_cast<const void *>(&shobj->readonly),
                  static_cast<const void *>(&shobj->hash_valid),
                  static_cast<const void *>(&shobj->has_slices),
-                 static_cast<const void *>(&shobj->intr_refcount) };
+                 static_cast<const void *>(&shobj->intr_refcount),
+                 static_cast<const void *>(&shobj->shift_epoch) };
     }
     size_type offset() const { return slice ? off : 0; }
 

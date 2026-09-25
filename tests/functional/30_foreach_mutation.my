@@ -7,8 +7,12 @@
 #
 #  - an ARRAY loop runs over the length the array had when it started
 #    (appended elements are not visited); each element is read when its
-#    turn comes (a store to a later element is seen); if the body removed
-#    elements so that the next one is gone, OutOfBoundsEx at the container;
+#    turn comes (a store to a later element is seen); if the body MOVED
+#    elements - pop, erase, an insert not at the end, through any alias
+#    or call - OutOfBoundsEx at the container at the NEXT step (#53
+#    option 1: removing an element already visited used to skip the next
+#    one silently, a middle insert visited one twice). A slice view never
+#    shifts, so a loop over one never raises this way;
 #  - the loop variable is a COPY (a struct element stored over after its
 #    turn does not change `p`);
 #  - a DICT loop visits each key the dict held when the loop started,
@@ -203,7 +207,115 @@ func dicts() {
     return out;
 }
 
+# #53 option 1 - one shift per element kind and per foreach form. Each
+# case moves an element on its 2nd iteration WITHOUT changing the length
+# (erase + append) or with a middle insert, so only the shift epoch can
+# tell - the length test alone would have finished the loop.
+func delapp(a) {
+    var n = 0;
+    try {
+        foreach (x in a) {
+            n++;
+            if (n == 2) { erase(a, 0); append(a, x); }
+        }
+    } catch (OutOfBoundsEx) { n += 100; }
+    return n;
+}
+
+func midins(a, v) {
+    var n = 0;
+    try {
+        foreach (x in a) { n++; if (n == 2) insert(a, 1, v); }
+    } catch (OutOfBoundsEx) { n += 100; }
+    return n;
+}
+
+func dropfirst(a) { erase(a, 0); }
+
+func shifts() {
+    var out = [];
+    append(out, delapp([1, 2, 3, int(runtime(4))]));
+    append(out, delapp([1.5, 2.5, float(runtime(3.5))]));
+    append(out, delapp([true, false, runtime(1) > 0]));
+    append(out, delapp(split("a b c", str(runtime(" ")))));
+    append(out, delapp([[1], [2], [int(runtime(3))]]));
+    append(out, midins([1, 2, 3, int(runtime(4))], 9));
+    append(out, midins([1.5, 2.5, float(runtime(3.5))], 9.5));
+    append(out, midins([true, false, runtime(1) > 0], false));
+    append(out, midins([[1], [2], [int(runtime(3))]], [9]));
+    var dyn dd = [1, 2, 3, int(runtime(4))];
+    append(out, delapp(dd));
+
+    /* struct, whole-p bind (the body uses p as a value) */
+    var ps = [P(1, 2), P(3, 4), P(5, int(runtime(6)))];
+    var sp = 0;
+    try { foreach (p in ps) {
+        sp += p.x; if (p.x == 3) { erase(ps, 0); append(ps, p); } } }
+    catch (OutOfBoundsEx) { sp += 100; }
+    append(out, sp);
+
+    /* unpack, consecutive and with a `_` */
+    var pairs = [[1, 2], [3, 4], [5, int(runtime(6))]];
+    var su = 0;
+    try { foreach (a, b in pairs) {
+        su += a * b; if (a == 3) insert(pairs, 0, [7, 8]); } }
+    catch (OutOfBoundsEx) { su += 100; }
+    append(out, su);
+    var tr = [[1, 2, 3], [4, 5, 6], [7, 8, int(runtime(9))]];
+    var st = 0;
+    try { foreach (a, _, c in tr) {
+        st += a + c; if (a == 4) { pop(tr); append(tr, [0, 0, 0]); } } }
+    catch (OutOfBoundsEx) { st += 100; }
+    append(out, st);
+
+    /* indexed, over ints and over structs */
+    var ix = [5, 6, 7, int(runtime(8))];
+    var si = 0;
+    try { foreach (i, x in indexed ix) { si += x; if (i == 1) pop(ix); } }
+    catch (OutOfBoundsEx) { si += 100; }
+    append(out, si);
+
+    /* through a called function and through an alias */
+    var viafn = [1, 2, 3, int(runtime(4))];
+    var sf = 0;
+    try { foreach (x in viafn) {
+        sf += x; dropfirst(viafn); append(viafn, 0); } }
+    catch (OutOfBoundsEx) { sf += 100; }
+    append(out, sf);
+    var al = [1, 2, 3, int(runtime(4))];
+    var other = al;
+    var sa = 0;
+    try { foreach (x in al) { sa += x; pop(other); } }
+    catch (OutOfBoundsEx) { sa += 100; }
+    append(out, sa);
+
+    /* allowed: reorder, element store, append, insert at the end */
+    var r = [5, 3, 1, int(runtime(4))];
+    var seen = [];
+    foreach (x in r) {
+        append(seen, x);
+        if (x == 5) sort(r);
+        if (x == 3) reverse(r);
+        if (x == 4) r[3] = 42;
+        insert(r, len(r), 0);
+    }
+    append(out, seen);
+
+    /* a slice view never shifts: its parent's pop leaves it attached
+     * (out of range), the erase detaches it */
+    var base = [1, 2, 3, 4, 5, 6, 7, int(runtime(8))];
+    var sv = 0;
+    foreach (x in base[0:3]) { pop(base); erase(base, 0); sv += x; }
+    append(out, sv * 100 + len(base));
+    var sb = [true, false, true, true, false, runtime(1) > 0];
+    var nb = 0;
+    foreach (b in sb[1:5]) { pop(sb); if (b) nb++; }
+    append(out, nb * 100 + len(sb));
+    return out;
+}
+
 for (var r = 0; r < 3; r++) {
     print(arrays());
     print(dicts());
+    print(shifts());
 }

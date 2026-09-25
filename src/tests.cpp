@@ -7683,6 +7683,106 @@ static const std::vector<test> tests =
     },
 
     {
+        /* #53 option 1: a body that MOVES elements of the array it walks
+         * (pop / erase / an insert not at the end - SharedObject::
+         * shift_epoch) raises OutOfBoundsEx at the NEXT step, in every
+         * element kind and foreach form, through an alias and through a
+         * called function. Before, removing an element already visited
+         * silently SKIPPED the next one and a middle insert visited one
+         * twice - every case below ran to completion. Still allowed:
+         * appends (not visited), element stores, sort/reverse (reorder
+         * in place), an insert at the end, and anything done to the
+         * parent of a SLICE the loop walks (a view never shifts - the
+         * parent's shifting ops detach the overlapping views first). */
+        "foreach: a body that shifts its array raises (#53 option 1)",
+        {
+            "struct P { int x; }",
+            "func midins(a, v) {",
+            "    var n = 0;",
+            "    try {",
+            "        foreach (x in a) { n++; if (n == 2) insert(a, 1, v); }",
+            "    } catch (OutOfBoundsEx) { n += 100; }",
+            "    return n;",
+            "}",
+            "assert(midins([1, 2, 3, int(runtime(4))], 9) == 102);",
+            "assert(midins([1.5, 2.5, float(runtime(3.5))], 9.5) == 102);",
+            "assert(midins([true, false, runtime(1) > 0], true) == 102);",
+            "assert(midins([[1], [2], [int(runtime(3))]], [9]) == 102);",
+            "func shift(a) {",
+            "    var n = 0;",
+            "    try { foreach (x in a) {",
+            "        n++; if (n == 2) { erase(a, 0); append(a, x); } } }",
+            "    catch (OutOfBoundsEx) { n += 100; }",
+            "    return n;",
+            "}",
+            "assert(shift(split(\"a b c\", str(runtime(\" \")))) == 102);",
+            "var dyn dd = [1, 2, 3, 4];",
+            "assert(shift(dd) == 102);",
+            "var ps = [P(1), P(2), P(int(runtime(3)))];",
+            "var sp = 0;",
+            "try { foreach (p in ps) {",
+            "    sp += p.x; if (p.x == 2) { erase(ps, 0); append(ps, p); } } }",
+            "catch (OutOfBoundsEx) { sp += 100; }",
+            "assert(sp == 103);",
+            "var pairs = [[1, 2], [3, 4], [5, int(runtime(6))]];",
+            "var su = 0;",
+            "try { foreach (a, b in pairs) {",
+            "    su += a; if (a == 3) insert(pairs, 0, [7, 8]); } }",
+            "catch (OutOfBoundsEx) { su += 100; }",
+            "assert(su == 104);",
+            "var ix = [5, 6, 7, int(runtime(8))];",
+            "var si = 0;",
+            "try { foreach (i, x in indexed ix) {",
+            "    si += x; if (i == 1) pop(ix); } }",
+            "catch (OutOfBoundsEx) { si += 100; }",
+            "assert(si == 111);",
+            "func dropfirst(a) { erase(a, 0); }",
+            "var viafn = [1, 2, 3, int(runtime(4))];",
+            "var sf = 0;",
+            "try { foreach (x in viafn) {",
+            "    sf += x; dropfirst(viafn); append(viafn, 0); } }",
+            "catch (OutOfBoundsEx) { sf += 100; }",
+            "assert(sf == 101);",
+            "var alias = [1, 2, 3, int(runtime(4))];",
+            "var other = alias;",
+            "var sa = 0;",
+            "try { foreach (x in alias) { sa += x; pop(other); } }",
+            "catch (OutOfBoundsEx) { sa += 100; }",
+            "assert(sa == 101);",
+            "var r = [5, 3, 1, int(runtime(4))];",
+            "var seen = [];",
+            "foreach (x in r) {",
+            "    append(seen, x);",
+            "    if (x == 5) sort(r);",
+            "    if (x == 3) reverse(r);",
+            "    if (x == 4) r[3] = 42;",
+            "    insert(r, len(r), 0);",
+            "}",
+            "assert(seen == [5, 3, 4, 42]);",
+            "var base = [1, 2, 3, 4, 5, 6, 7, int(runtime(8))];",
+            "var sv = 0;",
+            "foreach (x in base[0:3]) { pop(base); erase(base, 0); sv += x; }",
+            "assert(sv == 6 && len(base) == 2);",
+        },
+    },
+
+    {
+        /* #53 option 1, uncaught: an erase followed by an append keeps
+         * the length, which the old length test could never see (it
+         * printed 10 20 40 5 and finished) */
+        "foreach: erase + append inside the body raises (#53 option 1)",
+        {
+            "var b = [10, 20, 30, int(runtime(40))];",
+            "var s = 0;",
+            "foreach (x in b) {",
+            "    s += x;",
+            "    if (x == 20) { erase(b, 0); append(b, 5); }",
+            "}",
+        },
+        &typeid(OutOfBoundsEx),
+    },
+
+    {
         /* #53: ... and removing the NEXT element is OutOfBoundsEx */
         "foreach: a body that shrinks its array raises OutOfBoundsEx (#53)",
         {
@@ -30488,6 +30588,10 @@ static bool opcode_table_census()
           "meta: reached only via vm_exec_block, never in a pre-jit chunk" },
         { OpCode::LoadElem2Int,          1,1,1,0,1,0, nullptr },
         { OpCode::LoadElem2Float,        1,1,1,0,1,0, nullptr },
+        { OpCode::ArrEpochMark,          1,1,1,0,0,0,
+          "r0: emitted only by the foreach lowering, never an arg" },
+        { OpCode::ArrEpochCheck,         1,1,1,0,0,0,
+          "d1: its raise CONVEYS with the exc-stamped caret" },
     };
     const size_t nrows = sizeof(rows) / sizeof(rows[0]);
     const Chunk ck;      /* empty - census_instr never makes a shape
@@ -41339,6 +41443,111 @@ static bool jit_closure_store_releases()
 #endif
 }
 
+/*
+ * #53 option 1 - THE FOREACH SHIFT GUARD, both halves of its contract:
+ *
+ *  1. SHAPE: a body that PROVABLY cannot move an element (the bench
+ *     shape `s += e`) emits NO guard - ArrEpochMark/Check cost it
+ *     nothing - while one that calls a user function, or erases, does.
+ *     (The differential cannot see this half: an extra guard changes no
+ *     answer.)
+ *  2. REACH: the JIT's INLINE compare really runs (its g_jit_op_run slot
+ *     is bumped by EMITTED code only), and the raise it takes on a shift
+ *     is the one the program catches.
+ */
+static bool foreach_shift_guard()
+{
+    auto compile_count = [](const char *src_text, int &guards) -> bool {
+        std::vector<Tok> toks;
+        const std::string src = src_text;
+        lexer(src, 1, toks);
+        guards = 0;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+            for (const Instr &in : prog.root.code)
+                if (in.op == OpCode::ArrEpochCheck)
+                    guards++;
+        } catch (...) {
+            return false;
+        }
+        return true;
+    };
+    int g = -1;
+    if (!compile_count(
+            "var a = range(int(runtime(10)));\n"
+            "var s = 0;\n"
+            "foreach (e in a) s += e;\n"
+            "var ps = [[1, 2], [3, int(runtime(4))]];\n"
+            "foreach (x, y in ps) { s += x * y; if (x > 9) print(x); }\n"
+            "print(s);", g) || g != 0) {
+        fprintf(stderr, "foreach_shift_guard: an inert body got %d "
+                        "guard(s), expected 0\n", g);
+        return false;
+    }
+    if (!compile_count(
+            "func f(q) { erase(q, 0); }\n"
+            "var a = range(int(runtime(10)));\n"
+            "var s = 0;\n"
+            "foreach (e in a) { s += e; if (e == 3) f(a); }\n"
+            "foreach (e in a) { s += e; if (e == 3) erase(a, 0); }\n"
+            "print(s);", g) || g != 2) {
+        fprintf(stderr, "foreach_shift_guard: a shifting body got %d "
+                        "guard(s), expected 2\n", g);
+        return false;
+    }
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const unsigned long c0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::ArrEpochCheck)];
+    const unsigned long m0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::ArrEpochMark)];
+    std::vector<Tok> toks;
+    const std::string src =
+        "func run(n) {\n"
+        "    var a = range(n);\n"
+        "    var s = 0;\n"
+        "    try { foreach (e in a) {\n"
+        "        s += e; if (e == 5) { erase(a, 0); append(a, 0); } } }\n"
+        "    catch (OutOfBoundsEx) { s += 1000; }\n"
+        "    return s;\n"
+        "}\n"
+        "var t = 0;\n"
+        "for (var k = 0; k < 3; k++) t += run(int(runtime(20)));\n"
+        "assert(t == 3 * 1015);";
+    lexer(src, 1, toks);
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        vm_execute(root.get());
+    } catch (Exception &e) {
+        fprintf(stderr, "foreach_shift_guard: run threw %s\n", e.name);
+        ok = false;
+    }
+    g_exec_engine = saved;
+    if (!ok)
+        return false;
+    if (g_jit_op_run[static_cast<size_t>(OpCode::ArrEpochCheck)] <= c0
+        || g_jit_op_run[static_cast<size_t>(OpCode::ArrEpochMark)] <= m0) {
+        fprintf(stderr, "foreach_shift_guard: the native guard DID NOT "
+                        "RUN\n");
+        return false;
+    }
+#endif
+    return true;
+}
+
 static bool jit_len_ord()
 {
 #if ML_JIT_SUPPORTED
@@ -45899,6 +46108,9 @@ static const std::vector<extra_check> extra_checks =
       jit_ord_char_inline },
     { "jit: native len() + fused ord(s[i]) run natively (lever 4b)",
       jit_len_ord },
+    { "foreach: the shift guard - absent on a provably inert body, "
+      "native and taken on a shifting one (#53 option 1)",
+      foreach_shift_guard },
     { "jit: LoadElem slow tier serves declined shapes (#56 inc 1)",
       jit_load_elem_slow_tier },
     { "jit: the nested-read fusion a[i][j] runs natively (unboxing A)",

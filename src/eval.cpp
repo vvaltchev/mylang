@@ -5560,8 +5560,13 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
          * every engine: the loop runs over the length the array had when it
          * STARTED (an appended element is not visited); each element is read
          * when its turn comes (a store the body made to a later element is
-         * seen); if the body removed elements so that the next one no longer
-         * exists, the loop raises OutOfBoundsEx at the container.
+         * seen); and if the body MOVED elements - pop, erase, an insert
+         * not at the end, through any alias - the loop raises
+         * OutOfBoundsEx at the container at its next step (option 1: the
+         * storage's shift epoch, recorded here; a slice view never shifts,
+         * so fe_mark answers -1 for one and nothing is checked). Without
+         * it, removing an element already visited silently SKIPPED the
+         * next one. The length test stays as the memory-safety net.
          *
          * So the storage is re-derived per element (`arr` shares it with the
          * program's variables - the handle is the loop's pin). The flat
@@ -5569,11 +5574,12 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
          * per element.
          */
         const size_type n = arr.size();
+        const int_type mark = arr.fe_mark();
         intrusive_ptr<StructObject> reuse;
 
         for (size_type i = 0; i < n; i++) {
 
-            if (i >= arr.size())
+            if (arr.fe_shifted(mark) || i >= arr.size())
                 throw OutOfBoundsEx(container->start, container->end);
 
             const size_type at = arr.offset() + i;

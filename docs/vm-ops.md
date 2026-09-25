@@ -78,7 +78,22 @@ counter is bounded by the length at the loop's start, and a body that shrank
 the array leaves the element gone, the foreach's defined `OutOfBoundsEx` with
 the container's caret (`LoadElemBool`, `LoadStructElemV` and `ForeachDynNext`
 record it in `locs` for that reason; `LoadElemBool`'s JIT tier declines to
-`jit_load_elem_value`, a STATUS helper, where it used to bail). The struct
+`jit_load_elem_value`, a STATUS helper, where it used to bail). **#53 option
+1 - THE SHIFT GUARD:** a body that MOVES elements (pop / erase / an insert
+not at the end - each bumps `SharedObject::shift_epoch`) raises that same
+`OutOfBoundsEx` at the next step even when the length is unchanged.
+**`ArrEpochMark m = c`** (once, after the loop's `ArrLen`; `arr.mark` in
+`-vd`) records the container temp's `fe_mark()` - the storage's epoch, or
+-1 for a slice view, which can never shift - and **`ArrEpochCheck c, m`**
+(`arr.check`, at the loop head BEFORE the element load, so a moved element
+is never bound first; the container's caret in `locs`) raises on a change.
+Both are emitted only when `struct_fe_body_inert(body, shift_only)` cannot
+prove the body free of pop/erase/insert and user calls - never for a bench
+body - so a proven loop pays nothing; the counted, struct whole-`p` and
+unpack forms carry it, and `ForeachDynNext` checks the same epoch in
+`DynIterState::mark`. The JIT emits the check inline (a tag guard and one
+epoch compare, the -1 test out of line) with `jit_arr_epoch_check` as its
+conveying cold tier. The struct
 DIRECT read (`p.x` off the array bytes at every use) is taken only for a body
 `struct_fe_body_inert` proves cannot change any array or run program code. A
 **foreach over a

@@ -1281,6 +1281,9 @@ struct DynIterState {
     int nvars = 1;         /* TOTAL loop vars (incl. the indexed counter) */
     const std::vector<int32_t> *targets = nullptr;   /* per-var slots */
     size_type idx = 0, size = 0;               /* array cursor + snapshot */
+    int_type mark = -1;                        /* #53 option 1: the array's
+                                                * shift epoch at Init
+                                                * (fe_mark) */
     int_type counter = 0;                      /* dict `indexed` counter */
     DictObject::Cursor cur;                    /* dict cursor (iff is_dict,
                                                 * #53 - see DictObject) */
@@ -1419,6 +1422,7 @@ vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
         st.is_dict = false;
         st.idx = 0;
         st.size = st.container.get<SharedArrayObj>().size();
+        st.mark = st.container.get_ref<SharedArrayObj>().fe_mark();
         /* lever 4: the single-var, non-indexed array loop binds per-skind
          * (a `_` var / indexed / N-var unpack keeps the generic body). */
         if (!st.indexed && nv == 1 && tg[0] >= 0) {
@@ -1478,7 +1482,8 @@ vm_foreach_dyn_next_body(DynIterState &st, Frame &frame,
     if (!st.is_dict) {
         if (st.idx >= st.size)
             return false;
-        if (st.idx >= st.container.get_ref<SharedArrayObj>().size()) {
+        const SharedArrayObj &ca = st.container.get_ref<SharedArrayObj>();
+        if (ca.fe_shifted(st.mark) || st.idx >= ca.size()) {
             st.oob = true;                              /* #53 */
             return false;
         }
@@ -1532,7 +1537,7 @@ vm_dyn_next_arr_int(DynIterState &st, Frame &frame, const Chunk *, size_t)
         return false;
     ML_DYN_FAST_RAN(0);
     const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
-    if (st.idx >= a.size()) {                           /* #53 */
+    if (a.fe_shifted(st.mark) || st.idx >= a.size()) {  /* #53 */
         st.oob = true;
         return false;
     }
@@ -1548,7 +1553,7 @@ vm_dyn_next_arr_float(DynIterState &st, Frame &frame, const Chunk *, size_t)
         return false;
     ML_DYN_FAST_RAN(1);
     const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
-    if (st.idx >= a.size()) {                           /* #53 */
+    if (a.fe_shifted(st.mark) || st.idx >= a.size()) {  /* #53 */
         st.oob = true;
         return false;
     }
@@ -1564,7 +1569,7 @@ vm_dyn_next_arr_bool(DynIterState &st, Frame &frame, const Chunk *, size_t)
         return false;
     ML_DYN_FAST_RAN(2);
     const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
-    if (st.idx >= a.size()) {                           /* #53 */
+    if (a.fe_shifted(st.mark) || st.idx >= a.size()) {  /* #53 */
         st.oob = true;
         return false;
     }
@@ -1580,7 +1585,8 @@ vm_dyn_next_arr_gen(DynIterState &st, Frame &frame, const Chunk *, size_t)
     if (st.idx >= st.size)
         return false;
     ML_DYN_FAST_RAN(3);
-    if (st.idx >= st.container.get_ref<SharedArrayObj>().size()) {  /* #53 */
+    const SharedArrayObj &a = st.container.get_ref<SharedArrayObj>();
+    if (a.fe_shifted(st.mark) || st.idx >= a.size()) {  /* #53 */
         st.oob = true;
         return false;
     }
@@ -4395,6 +4401,48 @@ extern "C" void jit_arr_len(LValue *slots, int_type dst, int_type base) noexcept
     }
     slots[dst].put(EvalValue(static_cast<int_type>(
         b.get_ref<SharedArrayObj>().size())));
+}
+
+/*
+ * #53 option 1 - THE FOREACH SHIFT GUARD's two bodies (bytecode.h,
+ * ArrEpochMark), ONE implementation each for the interpreter handler and
+ * the JIT helper. Both are total over a corrupt image's operands: a
+ * non-array container marks -1 (never checked) and a non-int mark never
+ * raises - the loads that follow keep their own bounds checks, so memory
+ * safety never rests on the guard.
+ */
+static ML_ALWAYS_INLINE int_type vm_epoch_mark(const EvalValue &c)
+{
+    return c.is<SharedArrayObj>() ? c.get_ref<SharedArrayObj>().fe_mark()
+                                  : static_cast<int_type>(-1);
+}
+
+static ML_ALWAYS_INLINE bool
+vm_epoch_shifted(const EvalValue &c, const EvalValue &m)
+{
+    return c.is<SharedArrayObj>() && m.is<int_type>()
+        && c.get_ref<SharedArrayObj>().fe_shifted(m.get<int_type>());
+}
+
+extern "C" void jit_arr_epoch_mark(LValue *slots, int_type dst,
+                                   int_type base) noexcept
+{
+    ML_JIT_OP_RAN(ArrEpochMark);
+    slots[dst].put(EvalValue(vm_epoch_mark(slots[base].get())));
+}
+
+/* The cold tier of the emitted check (its inline compare saw a mismatch,
+ * or a base it cannot navigate): 1 = conveyed the OutOfBoundsEx LOC-LESS
+ * (the emitter's exc-stamp gives it the container caret), 0 = no raise -
+ * a slice's -1 mark, or an image's non-array base. */
+extern "C" int jit_arr_epoch_check(LValue *slots, int_type base,
+                                   int_type m) noexcept
+{
+    /* (the execution proof is bumped by the EMITTED inline compare) */
+    if (!vm_epoch_shifted(slots[base].get(), slots[m].get()))
+        return 0;
+    g_vm_jit_exc.reset(new OutOfBoundsEx());
+    return 1;
 }
 
 /* model-flip (nativize-ops): the native DictLoadInt/Float body - the typed
@@ -12607,6 +12655,29 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                     ? EvalValue(static_cast<int_type>(
                           b.get_ref<SharedArrayObj>().size()))
                     : EvalValue());
+            pc++;
+        }
+        VM_NEXT;
+
+        VM_CASE(ArrEpochMark): {
+            /* #53 option 1: the foreach's shift-guard mark (vm_epoch_mark
+             * is shared with jit_arr_epoch_mark) */
+            ctx.frame->at(in->target).put(EvalValue(
+                vm_epoch_mark(ctx.frame->at(in->target2).get())));
+            pc++;
+        }
+        VM_NEXT;
+
+        VM_CASE(ArrEpochCheck): {
+            /* ... and its per-step test (shared with jit_arr_epoch_check):
+             * the body MOVED elements - the foreach's OutOfBoundsEx at the
+             * container */
+            if (vm_epoch_shifted(ctx.frame->at(in->target2).get(),
+                                 ctx.frame->at(in->a_slot()).get())) {
+                Loc ls, le;
+                chunk->loc_at(pc, ls, le);
+                throw OutOfBoundsEx(ls, le);
+            }
             pc++;
         }
         VM_NEXT;
