@@ -826,6 +826,36 @@ static const std::vector<test> tests =
       &typeid(DivisionByZeroEx), 29, 2, 35, 2 },
 
     /*
+     * An INLINED function writing through its parameter needs an LVALUE
+     * where the parameter was; the inliners substituted a literal argument
+     * there, so `h([1, 2, 3])` raised NotLValueEx in the tree-walker and
+     * was a NotLoweredEx compile refusal in the VM, while `-ni` ran it.
+     * One entry per inliner (block, expression, tail) plus the builtin
+     * and inc-dec write positions. Watched failing: without the
+     * writes_through gate every VM mode refuses to compile each one.
+     */
+    { "inline: a literal arg written through by a block-inlined body",
+      { "func h(p) { p[1] += 9; return p[1]; }",
+        "assert(h([1, 2, 3]) == 11);",
+        "func g(p) { p[0] = 9; return p[0] + p[1]; }",
+        "assert(g([1, 2, 3]) == 11);",
+        "func dk(d) { d[\"k\"] = 3; return len(d); }",
+        "assert(dk({\"a\": 1}) == 2);",
+        "func inc(p) { p[0]++; return p[0]; }",
+        "assert(inc([7]) == 8);",
+        "func ch(p) { p[0][1] = 4; return p[0][1]; }",
+        "assert(ch([[1, 2]]) == 4);",
+        "func pp(p) { pop(p); return len(p); }",
+        "assert(pp([1, 2, 3]) == 2);" } },
+    { "inline: a literal arg written through by an EXPRESSION body",
+      { "func ap(p) => pop(p) + 1;",
+        "assert(ap([1, 2]) == 3);" } },
+    { "inline: a literal arg written through by a TAIL-inlined body",
+      { "func w(p) { append(p, 1); return 7; }",
+        "func t(q) { return w([3, 5]); }",
+        "assert(t(runtime(3)) == 7);" } },
+
+    /*
      * #38 repro C: an N-level store (StoreElemChainV) whose INTERMEDIATE
      * step yields a VALUE - a read-only const reached through a parameter,
      * a scalar element - used to refuse AT that step (NotLValueEx carets
