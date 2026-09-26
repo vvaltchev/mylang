@@ -254,6 +254,23 @@ private:
 
     std::unordered_map<const Construct *, TypeSym *> id_sym;
     std::unordered_map<const Construct *, FuncInfo *> func_of_decl;
+    /*
+     * Subtrees a pass CUT OUT of the tree while the node-keyed maps
+     * above (and indirect_callee, cs_obj_ids, a FuncInfo's decl) may
+     * still name nodes inside them. A type query's argument is the
+     * case: fold_type_query replaces it with its folded literal, and
+     * the argument can hold any expression - identifiers, calls, a
+     * lambda, an allocation site. Freeing it left every one of those
+     * keys dangling: -dti and -a ITERATE id_sym and read the freed
+     * nodes (an ASan use-after-free), and a later allocation reusing
+     * one of the addresses would match a stale key - the identity bug
+     * CLAUDE.md warns about. Retiring the subtree for the inferencer's
+     * lifetime keeps every key a live, never-reused address, with no
+     * enumeration of "which maps might hold a node in here" to go
+     * stale. (Its identifiers are real source uses, so -dti listing
+     * them is right.)
+     */
+    std::vector<std::unique_ptr<Construct>> retired;
     /* struct types by name (for resolving a struct-typed field/annotation). */
     std::unordered_map<const UniqueId *, const StructTypeDef *> struct_by_name;
 
@@ -5147,6 +5164,8 @@ bool Inferencer::fold_type_query(CallExpr *call)
             return false;   /* type not determined yet: leave for runtime */
     }
 
+    /* the argument leaves the tree but not memory: see `retired` */
+    retired.push_back(std::move(args->elems[0]));
     if (is_type || is_decltype)              /* -> a baked Type object */
         args->elems[0] = make_unique<LiteralObj>(build_type_value(t), true);
     else                                     /* typestr / kindstr -> string */
