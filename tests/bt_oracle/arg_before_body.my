@@ -1,0 +1,12 @@
+# THE ARGUMENT RULE: a throwing argument runs BEFORE the inlined body's
+# side effect (no extra "tick"), and its error is the CALLER's (no
+# virtual frame for f)
+var n = 0;
+func tick() { n = n + 1; print("tick " + str(n)); return 1; }
+func f(x) => tick() + x;
+func drive(int m) {
+    var s = 0;
+    for (var i = 0; i < m; i++) s = s + f(12 / (m - 1 - i));
+    return s;
+}
+print(drive(runtime(4)));

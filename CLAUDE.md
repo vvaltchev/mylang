@@ -3102,15 +3102,14 @@ bodies) so the names resolve even when the pass doesn't fold them.
 (`Inliner` in `resolver.cpp`, run after `AutoConst`; gated by `-ni`).
 It splices eligible direct calls — top-level, expression-bodied, non-capturing,
 non-recursive, no nested function, arity match, body ≤ a node threshold (`-it
-N`, default 24), sound arg use
-(an arg is evaluated as often as the param is used; side-effecting args neither
-dropped nor duplicated). The spliced body's params are replaced by the args
-(which inherit the parameter occurrence's loc), and the whole splice is tagged
-with an `InlineCtx`. **The inliner re-scans each splice** (`walk(slot, depth+1)`
-after splicing), so a g-into-f-into-h chain collapses in one pass even when
-declaration order defeats the bottom-up walk (h declared before the callees it
-transitively reaches) or a call is newly exposed by the re-fold — this is the
-"fixpoint." Two bounds keep it finite: `MAX_INLINE_DEPTH` (16) caps nesting so
+N`, default 24), and THE ARGUMENT RULE (below). The spliced body's params are
+replaced by the INERT args (which inherit the parameter occurrence's loc), and
+the body is tagged with an `InlineCtx`. **The inliner re-scans each splice**
+(`walk(slot, depth+1)` after splicing), so a g-into-f-into-h chain collapses
+in one pass even when declaration order defeats the bottom-up walk (h
+declared before the callees it transitively reaches) or a call is newly
+exposed by the re-fold — this is the "fixpoint." Two bounds keep it
+finite: `MAX_INLINE_DEPTH` (16) caps nesting so
 mutual recursion (`a()=>b(); b()=>a()`) terminates, and `inline_budget`
 (`max(4096, 8 * program nodes)`) caps total nodes added so breadth-doubling
 (`f()=>g()+g()`) can't blow the tree up; hitting either bound just leaves the
@@ -3141,15 +3140,56 @@ block body chain-less. And an inlined frame renders the callee's
 rendered `weight$0` where `-ni` rendered `weight`. The oracle is
 `inlined_backtrace_oracle` (`-rt`) + `tests/bt_oracle.py` (CLI configs):
 every engine with inlining ON must render the `-ni -tw` backtrace and
-caret. Backtraces for **body** errors are byte-identical with/without
-inlining;
-**known limitation** — an error *evaluating an argument* (e.g. an undefined var)
-is attributed to the inlined callee rather than the call site (the arg node is
-both the call-site value and the in-body operand), in every engine alike, so
-it renders one extra virtual frame versus `-ni`. The same substitution can
-also REORDER a throwing argument after a side effect of the body (`func f(x)
-=> tick() + x; f(12 / z)` prints `tick` once more than `-ni` before the
-DivisionByZeroEx) - a RULE 2 output divergence, open (#38 report).
+caret. Backtraces are byte-identical with/without inlining, for an error in
+the body AND for one evaluating an argument.
+
+**⛔ THE ARGUMENT RULE (RULE 2, #38 follow-up, 2026-09-25) - every inlining
+path (`arg_substitutable` / `arg_is_inert`, resolver.cpp).** A real call -
+what `-ni` runs - evaluates every argument ONCE, left to right, BEFORE the
+body, binds it (coercing a param declared `int`/`float`), and an error in
+one is the CALLER's, with the argument's own caret. Pasting the argument
+EXPRESSION into the body moves its evaluation to wherever the parameter is
+used: after a side effect of the body (`func f(x) => tick() + x;
+f(12 / z)` printed `tick` before the DivisionByZeroEx), into a guard or a
+`&&` tail (the throw simply vanished when the arm was not taken), zero
+times, twice, past a body that reassigns the global it reads, and under
+the CALLEE's inlined-at chain (one extra virtual frame, every engine). So
+an argument is substituted ONLY when it is **INERT** - it cannot throw,
+has no side effect and reads nothing the body can change - AND its bind is
+the identity; every other argument is bound to a frame temp at the top of
+the body (`$a = arg`, "args as locals") in param order. INERT is a
+fail-closed WHITELIST: a scalar literal or a deep read-only `LiteralObj`;
+a caller LOCAL read; a top-level function name nothing reassigns;
+`+ - *`, comparisons, `& | ^`, `&& ||`, unary `- + ! ~` over inert
+operands inference proved scalar (`th` - int arithmetic wraps, float is
+IEEE), and `/` `%` by a literal other than 0 and -1. NOT a runtime
+divisor, NOT a shift (negative count), NOT a
+subscript/member/call/global read/string op, and NOTHING under `-nti`. A
+MUTABLE array/dict literal may be substituted only where the param is read
+at most once (each evaluation is a fresh object). The expression engine,
+when an arg is not substitutable - or when its body is not LOCAL-FREE any
+more (an earlier block splice left slots of the callee's frame in it,
+which the uid substitution cannot remap) - goes through the block
+engine's `splice_block_call` (an `=> expr` body is a `{ return expr; }`
+Block); in a loop condition (`no_block`) it declines instead. The temp
+stores carry the CALL SITE's chain and the argument's span, and are
+inserted after the body's statements are tagged (the Block keeps the call
+site's chain too), so an argument error renders exactly what `-ni` does.
+The same property had three more homes, fixed with it: the old "cheap
+arg to a PURE callee" substitution (the callee's purity says nothing about
+the ARGUMENT), `collapse_locals` (a `var q = a / b; return 1;` body lost
+its throw - it now requires an inert, value-stable rvalue, and
+`count_slot_writes` counts destructure/foreach/catch writes too), and
+`fold_int_arith` (`(k / z) * 0 -> 0` and `k/z - k/z -> 0` dropped a
+DivisionByZeroEx in plain code, since the fold runs only with the inliner:
+only inert terms merge or cancel). In the REPL a TEMPLATE BASE's body
+takes no splice that adds frame slots (`in_repl_tmpl_base`): a later input
+clones and RE-RESOLVES it, and the resolver cannot take a slot it did not
+allocate. Nets: `inlined_backtrace_oracle` + `tests/bt_oracle/arg_*.my`,
+`local_dropped.my` (the rendered backtrace), the `inline:` cases of
+`opt_layer_equivalence` (which now runs `-ni` as a layer), and
+`tests/functional/33_inline_arg_eval.my` (an event log - a VALUE
+assertion cannot see a reorder).
 After splicing, the inliner
 **re-folds** (`Inliner::refold`): a `MultiOpConstruct`, subscript, slice, member
 access, or const-builtin call folds to a literal when its operands are
@@ -3222,15 +3262,17 @@ pays — ~1.4x on a call-heavy non-const loop). **Scope (`block_inlinable_decl`)
 closure that is a decl rvalue `var h = func[..]..`, which let an inline break the
 capture), **non-recursive** (a COMPLETE `refs_uid` check), no scalar-param
 reassignment (a reassigned param is a by-value copy — substituting the arg would
-alias it). **Args (use count by SLOT):** a **value-stable** arg (`tail_arg_ok` —
-a caller LOCAL or const literal the body can't reassign) is substituted DIRECTLY;
-**any other arg** (a non-trivial expression, a global, a side-effecting call) is
-bound to a fresh frame **temp once** at the top of the body (`$a = arg`) and the
-param reads that temp — **"args as locals"**. Evaluating once captures the
-call-time value, so a body that mutates the passed-in global, or a multi-use
-side-effecting arg, stays sound (the earlier `sub_ok` allowed a bare global
-identifier, an unsoundness); it also lets `f(a+b)`, `f(g())`, `f(global)` inline,
-and is what the recursion-unroll needs (a self-call's arg is `n-1`). The size
+alias it). **Args (use count by SLOT) - THE ARGUMENT RULE above:** an INERT
+arg whose bind is the identity (`arg_substitutable`) is substituted DIRECTLY;
+**any other arg** (a call, a global, a subscript, a division, a value a typed
+param would coerce) is bound to a fresh frame **temp once** at the top of the
+body (`$a = arg`, carrying the param's `decl_type` so the store coerces as the
+bind would) and the param reads that temp — **"args as locals"**. Evaluating
+once, first, is what a real call does, so a body that mutates the passed-in
+global, a multi-use side-effecting arg, or a throwing arg the body reads
+conditionally all stay sound; it also lets `f(a+b)`, `f(g())`, `f(global)`
+inline. The recursion unroll's self-call args (`n-1` on an int `n`) are inert,
+so they stay substituted. The size
 gate is the **cost model**: `body_weight` (a weighted
 node sum, weights from `--weights`/`run_weight_bench`: a CALL is ~21x an arith
 op, assign 11, if 7, return 3) must be **below `CALL_WEIGHT` (21)**. **Bodies WITH
@@ -3261,19 +3303,24 @@ a **temp-free guard chain** — `{ if(c1) return a1; ...; return b; }`,
 `guard_to_ternary` — it is converted to the equivalent **`TernaryExpr`**
 `(c1 ? a1 : (... : b))`, real code that runs in the caller's frame like any
 expression (no flow boundary, no `InlinedCallExpr`). "Temp-free" requires the
-args to be DIRECT-substituted, not bound to temp statements; for a **pure**
-callee an arg is side-effect-free, so a cheap one (`body_weight ≤ ARG_SUBST_MAX`,
-which excludes a nested call) is substituted directly and re-evaluated at each
-param use (sound: a pure body can't change the arg's value). The recursion
+args to be DIRECT-substituted, not bound to temp statements - i.e. every arg
+INERT (THE ARGUMENT RULE; it used to be "any cheap arg of a PURE callee", which
+dropped a throwing `f(12 / z)` whenever its arm was not taken - the callee's
+purity says nothing about the ARGUMENT). An untyped template BASE's `n - 1` is
+not inert (`n` may be anything), so only the typed INSTANCES unroll to
+ternaries. The recursion
 unroll therefore produces **nested ternaries** (fib →
 `(n-1<2 ? n-1 : fib(..)+fib(..)) + (n-2<2 ? n-2 : ..)`), and the frontier
 self-calls in the ternary branches still hit the per-frame cache. **A body with
 write-once LOCALS** is first run through **`collapse_locals`** (copy propagation):
-a `var t = <cheap side-effect-free expr>` whose slot is written once is
-substituted into its uses and the decl dropped, so `{ var t=a*a; return t; }`
-collapses to `{ return a*a; }` → a temp-free guard chain → a ternary/expression
-(`uc(x)` → `x*x+1`). Sound — a write-once local with a side-effect-free rvalue is
-just a name for that expression (re-evaluating a cheap rvalue is exact). With
+a `var t = <cheap INERT expr>` whose slot is written once is substituted into
+its uses and the decl dropped, so `{ var t=a*a; return t; }` collapses to
+`{ return a*a; }` → a temp-free guard chain → a ternary/expression
+(`uc(x)` → `x*x+1`). Sound — a write-once local with an inert rvalue whose
+reads keep their values to the end of the block (`rvalue_stable_after`) is
+just a name for that expression. "Side-effect-free" was NOT enough: a
+throwing rvalue moved into a conditional or absent use threw conditionally
+or not at all. With
 this, the small bodies that used to inline as a non-expressible
 `InlinedCallExpr(Block(...))` now inline as **expressible** code; the
 `InlinedCallExpr` form survives only for a residual that can't collapse (a
@@ -6296,8 +6343,9 @@ lever the JIT has as `-nj`, one layer up. Three nets use them, and a new
 AST transform joins **all three** on the day it is written:
 
 1. **`opt_layer_equivalence` (`-rt`)** - a corpus run through EVERY
-   single-pass-off configuration, plus the all-off one, on BOTH engines,
-   requiring identical stdout AND identical exception behaviour. A
+   single-pass-off configuration, plus the all-off one - and the
+   inliner's own switch `-ni`, alone and with all passes off - on BOTH
+   engines, requiring identical stdout AND identical exception behaviour. A
    divergence names the pass and the layer. Give a new transform a bit in
    `OptPass`, a case in the corpus, and cases for whatever its gates
    REFUSE (a refusal that silently stops refusing is the dangerous

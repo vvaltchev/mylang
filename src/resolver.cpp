@@ -4225,13 +4225,15 @@ Resolver::walk(Construct *c, FuncState *cur)
  * with inlining on or off (the Construct::eval / do_func_call flush points
  * rebuild the virtual frame from it).
  *
- * Expression bodies have no locals, so after param substitution the spliced
+ * Expression bodies have no locals (one an earlier splice gave some goes
+ * through the slot-remapping splice_block_call), so after param substitution
+ * the spliced
  * expression contains only the caller's argument subtrees (already resolved)
  * and free identifiers (map-resolved, scope-independent) - no re-resolution is
  * needed. A body that was itself inlined-into keeps correct frames via chain
- * rebasing. Argument substitution is sound: an argument is evaluated exactly as
- * often as the parameter is used, and side-effecting args are never dropped or
- * duplicated.
+ * rebasing. Only an INERT argument is substituted (THE ARGUMENT RULE,
+ * arg_substitutable); any other is bound to a temp before the body, exactly
+ * where a real call evaluates it.
  */
 
 /*
@@ -4498,6 +4500,17 @@ class Inliner {
     std::vector<unique_ptr<Construct>> new_funcs;
     int spec_counter = 0;
 
+    /* The global slots of the TOP-LEVEL named functions (arg_is_inert). */
+    std::unordered_set<int> func_global_slots;
+
+    /* Walking a TEMPLATE BASE's body in the REPL. A later input CLONES that
+     * body into a new instance and RE-RESOLVES the clone, and the resolver
+     * cannot take a frame slot it did not allocate itself - so no splice
+     * that adds slots (an arg temp, a callee's remapped locals) may land
+     * in it. (A script instantiates every template BEFORE the inliner
+     * runs, so its bases are never cloned afterwards.) */
+    bool in_repl_tmpl_base = false;
+
     /*
      * Fixpoint bounds. Re-scanning a spliced body can expose more inlining (a
      * forward-declared callee, a call revealed by const-folding), so the
@@ -4527,11 +4540,11 @@ class Inliner {
     static const int REC_UNROLL_MAX = 3;
     /* A high node backstop for a pathological body (many self-calls x depth). */
     static const int REC_NODE_CAP = 600;
-    /* Max weight of an arg that is DIRECT-substituted (re-evaluated at each param
-     * use) instead of bound to a temp. Only for a PURE callee (its args are
-     * side-effect-free, so re-evaluation is sound); the cap keeps re-eval cheap
-     * and excludes a nested call (weight ~21). A temp-free body is what lets a
-     * guard body convert to an EXPRESSIBLE ternary (guard_to_ternary). */
+    /* Max weight of a write-once local's rvalue that collapse_locals copies
+     * into its uses (re-evaluated at each one): the cap keeps re-evaluation
+     * cheap. The rvalue must also be INERT (arg_is_inert) - which argument
+     * is substituted rather than bound is THE ARGUMENT RULE's call, not a
+     * weight. */
     static const long ARG_SUBST_MAX = 8;
     int rec_depth = 0;   /* current self-inline depth along the walk path */
     long inline_budget = 0;
@@ -4589,6 +4602,8 @@ public:
             auto *fd = dynamic_cast<FuncDeclStmt *>(e.get());
             if (!fd || !fd->id)
                 continue;
+            if (fd->id->sym.kind == SymKind::global)
+                func_global_slots.insert(fd->id->sym.slot);
             if (inlinable_decl(fd))
                 add_unique(funcs, fd);
             else if (specializable_decl(fd))
@@ -4786,15 +4801,39 @@ private:
     }
 
     /* A write to a resolved LOCAL slot (assignment LHS or ++/--). */
+    /* Every write to a local slot, COMPLETE: an assignment (plain or to an
+     * IdList destructure target), ++/--, a foreach loop variable and a
+     * catch binding. The last three were not counted, so a slot a
+     * destructure rewrites could read as "write-once" here. */
     static int count_slot_writes(Construct *c, int slot)
     {
         if (!c)
             return 0;
         int n = 0;
+        auto is_slot = [&](const Construct *x) {
+            auto *id = ctag(x) == ConstructType::id
+                ? static_cast<const Identifier *>(x) : nullptr;
+            return id && id->sym.kind == SymKind::local
+                && id->sym.slot == slot;
+        };
         if (ctag(c) == ConstructType::expr14) {
             auto *e14 = static_cast<Expr14 *>(c);
-            if (auto *id = dynamic_cast<Identifier *>(e14->lvalue.get()))
-                if (id->sym.kind == SymKind::local && id->sym.slot == slot)
+            if (is_slot(e14->lvalue.get()))
+                n++;
+            if (ctag(e14->lvalue.get()) == ConstructType::idlist)
+                for (auto &id : static_cast<IdList *>(e14->lvalue.get())
+                                    ->elems)
+                    if (is_slot(id.get()))
+                        n++;
+        } else if (ctag(c) == ConstructType::foreach_stmt) {
+            auto *fe = static_cast<ForeachStmt *>(c);
+            if (fe->ids)
+                for (auto &id : fe->ids->elems)
+                    if (is_slot(id.get()))
+                        n++;
+        } else if (ctag(c) == ConstructType::try_catch) {
+            for (auto &p : static_cast<TryCatchStmt *>(c)->catchStmts)
+                if (p.first.asId && is_slot(p.first.asId.get()))
                     n++;
         } else if (ctag(c) == ConstructType::incdec) {
             auto *inc = static_cast<IncDecExpr *>(c);
@@ -4806,6 +4845,30 @@ private:
             [&](unique_ptr<Construct> &ch) { n += count_slot_writes(ch.get(),
                                                                     slot); });
         return n;
+    }
+
+    /* True iff no local slot read by `rv` is written by body->elems[i+1..]
+     * (collapse_locals' value-stability half). */
+    static bool rvalue_stable_after(Block *body, size_t i, Construct *rv)
+    {
+        bool ok = true;
+        std::function<void(Construct *)> scan = [&](Construct *c) {
+            if (!c || !ok)
+                return;
+            if (ctag(c) == ConstructType::id) {
+                auto *id = static_cast<Identifier *>(c);
+                if (id->sym.kind == SymKind::local)
+                    for (size_t j = i + 1; j < body->elems.size(); j++)
+                        if (count_slot_writes(body->elems[j].get(),
+                                              id->sym.slot) != 0)
+                            ok = false;
+                return;
+            }
+            for_each_child_slot(c,
+                [&](unique_ptr<Construct> &ch) { scan(ch.get()); });
+        };
+        scan(rv);
+        return ok;
     }
 
     /* Replace every READ of local `slot` with a clone of `repl` (keeping the
@@ -4872,11 +4935,21 @@ private:
                 auto *lv = dynamic_cast<Identifier *>(e14->lvalue.get());
                 if (!lv || lv->sym.kind != SymKind::local)
                     continue;
+                /* INERT (arg_is_inert), not merely side-effect-free: the
+                 * decl runs unconditionally, once, HERE, while its uses
+                 * may be conditional, repeated, or absent - so a throwing
+                 * rvalue (`var q = a / b; return 1;`) moved into them
+                 * would throw conditionally or not at all (RULE 2). */
                 if (body_weight(e14->rvalue.get()) > ARG_SUBST_MAX
-                        || expr_has_side_effect(e14->rvalue.get()))
+                        || !arg_is_inert(e14->rvalue.get()))
                     continue;
                 const int slot = lv->sym.slot;
                 if (count_slot_writes(body, slot) != 1)   /* not write-once */
+                    continue;
+                /* ...and VALUE-STABLE: every local the rvalue reads keeps
+                 * its value from here to the end of the block, or a use
+                 * re-evaluating it would read the NEW value */
+                if (!rvalue_stable_after(body, i, e14->rvalue.get()))
                     continue;
                 unique_ptr<Construct> rv = std::move(e14->rvalue);
                 body->elems.erase(body->elems.begin() +
@@ -5008,7 +5081,13 @@ private:
                 constant += sign * li->ival();
                 return;
             }
-            const bool grp = !expr_has_side_effect(e.get());
+            /* only an INERT term may merge (arg_is_inert): merging moves
+             * the later occurrence's evaluation to the first one's place
+             * and cancelling (`t - t`) drops both, so a term that can
+             * throw (`k / z`, `a[i]`) or that reads something a sibling
+             * can change (a global) must stay verbatim - `-ni`, which
+             * skips this pass, evaluates every occurrence (RULE 2) */
+            const bool grp = arg_is_inert(e.get());
             if (grp)
                 for (auto &t : terms)
                     if (t.grp && expr_equal(t.expr.get(), e.get())) {
@@ -5109,7 +5188,10 @@ private:
             if (auto *li = dynamic_cast<LiteralInt *>(pr.second.get()))
                 product *= li->ival();
             else {
-                if (expr_has_side_effect(pr.second.get()))
+                /* `x * 0 -> 0` DROPS x: only sound when x is inert - a
+                 * throwing factor (`(k / z) * 0`, `a[i] * 0`) must still
+                 * throw (RULE 2; arg_is_inert) */
+                if (!arg_is_inert(pr.second.get()))
                     side_effects = true;
                 factors.push_back(std::move(pr.second));
             }
@@ -5303,9 +5385,12 @@ private:
          * and capture list hold no calls. */
         if (ctag(slot.get()) == ConstructType::func_decl) {
             auto *fd = static_cast<FuncDeclStmt *>(slot.get());
+            const bool saved = in_repl_tmpl_base;
+            in_repl_tmpl_base = repl_mode && fd->is_template;
             if (fd->body)
                 walk(fd->body, depth,
                      fd->desc->resolved ? &fd->desc->frame_size : nullptr);
+            in_repl_tmpl_base = saved;
             return;
         }
 
@@ -5339,14 +5424,16 @@ private:
         for_each_child_slot(slot.get(),
             [&](unique_ptr<Construct> &ch) { walk(ch, depth, fsize, no_block); });
 
-        try_inline(slot, depth, fsize);   /* re-scans its splice (depth + 1) */
+        /* re-scans its splice (depth + 1) */
+        try_inline(slot, depth, fsize, no_block);
         try_inline_tail(slot, depth, fsize);   /* tail call to a block func */
         if (!no_block)
             try_inline_block(slot, depth, fsize); /* non-tail block func */
         try_specialize(slot);   /* if still a call to a block-bodied func */
     }
 
-    void try_inline(unique_ptr<Construct> &slot, int depth, int *fsize)
+    void try_inline(unique_ptr<Construct> &slot, int depth, int *fsize,
+                    bool no_block = false)
     {
         auto *ce = dynamic_cast<CallExpr *>(slot.get());
         if (!ce)
@@ -5391,11 +5478,37 @@ private:
         if (bsz > max_nodes)
             return;
 
+        /* THE ARGUMENT RULE (arg_substitutable): an argument that is not
+         * inert cannot be pasted into the body - it must be evaluated
+         * ONCE, before the body, like the call it replaces. The splice
+         * then goes through the block engine's arg-temp form instead,
+         * where every such argument is bound to a frame temp first. In a
+         * loop condition that form is suppressed (for-range must still
+         * see the CALL - see walk's no_block), so the call stays. */
+        bool need_block = false;
         for (size_t i = 0; i < nparams; i++) {
             const int uses = count_uses(fexpr,
                                         f->params->elems[i]->uid);
-            if (!sub_ok(uses, ce->args->elems[i].get()))
-                return;
+            if (!arg_substitutable(f, i, ce->args->elems[i].get(), uses))
+                need_block = true;
+        }
+        /* ...and the body must be LOCAL-FREE for the uid substitution
+         * below: a block splice INTO this body (an arg temp, a callee's
+         * remapped locals) left slots of f's own frame in it, which only
+         * the slot-remapping splice can move into the caller's frame -
+         * pasted as they are, they index past the caller's frame. */
+        if (!need_block && f->desc->resolved) {
+            const int np = static_cast<int>(nparams);
+            need_block = count_matching(fexpr,
+                [&](const Identifier *id) {
+                    return id->sym.kind == SymKind::local
+                        && id->sym.slot >= np;
+                }) != 0;
+        }
+        if (need_block) {
+            if (!no_block)
+                splice_block_call(slot, depth, fsize, ce, f);
+            return;
         }
 
         /* Fixpoint bounds: stop nesting at the depth cap (terminates mutual
@@ -5651,9 +5764,24 @@ private:
         if (it == block_funcs.end() || !it->second)
             return;
 
-        FuncDeclStmt *f = it->second;
+        splice_block_call(slot, depth, fsize, ce, it->second);
+    }
+
+    /*
+     * The block engine's splice of the call `ce` to `f`, shared by
+     * try_inline_block and by the EXPRESSION engine when one of its
+     * arguments is not substitutable (THE ARGUMENT RULE) - an `=> expr`
+     * body is a `{ return expr; }` Block, so it splices here exactly like
+     * a hand-written one.
+     */
+    void splice_block_call(unique_ptr<Construct> &slot, int depth,
+                           int *fsize, CallExpr *ce, FuncDeclStmt *f)
+    {
+        auto *callee = static_cast<Identifier *>(ce->what.get());
         if (!f->desc->resolved)
             return;       /* its locals aren't slotted: nothing to remap into */
+        if (in_repl_tmpl_base)
+            return;       /* see in_repl_tmpl_base */
 
         /*
          * A SELF-RECURSIVE callee (block_inlinable_decl admitted it only if it
@@ -5687,16 +5815,15 @@ private:
         /*
          * Decide each param. A param REASSIGNED in the body can't be inlined (it
          * is a by-value copy; substituting the arg would wrongly alias it).
-         * Otherwise: a VALUE-STABLE arg (`tail_arg_ok` - a caller LOCAL or const
-         * literal the body can't reassign) is substituted DIRECTLY (cheap, read
-         * at each param use). Any other arg (a non-trivial expression, a global,
-         * a side-effecting call) is bound to a fresh frame TEMP once at the top
-         * of the body (`$a = arg`) and the param reads the temp - "args as
-         * locals". Evaluating once captures the call-time value, so a body that
-         * mutates the global / a multi-use side-effecting arg stays sound; it
-         * also lets `f(a+b)`, `f(g())`, `f(global)` inline (and is what the
-         * recursion-unroll needs, since a self-call's arg is `n-1`). Use count
-         * is by SLOT so a shadowing local doesn't mislead.
+         * Otherwise THE ARGUMENT RULE (arg_substitutable): an INERT arg - it
+         * cannot throw, has no effect, and reads nothing the body can
+         * change - is substituted DIRECTLY (read at each param use). Any
+         * other arg (a call, a global, a subscript, a division, an arg a
+         * typed param would COERCE) is bound to a fresh frame TEMP once, at
+         * the top of the body, in param order (`$a = arg`), and the param
+         * reads the temp - "args as locals": the evaluation a real call
+         * makes, at the time it makes it. Use count is by SLOT so a
+         * shadowing local doesn't mislead.
          */
         std::vector<bool> needs_temp(nparams, false);
         int ntemps = 0;
@@ -5710,14 +5837,11 @@ private:
                         && id->sym.slot == i;
                 });
             const Construct *arg = ce->args->elems[i].get();
-            /* A cheap arg to a PURE callee is direct-substituted (no temp): the
-             * callee's purity makes the arg side-effect-free, so re-evaluating
-             * it at each param use is sound, and a temp-free body can become an
-             * expressible ternary. Otherwise temp-bind (capture-once). */
-            const bool subst = tail_arg_ok(uses, arg)
-                || (f->desc->effective_pure
-                    && body_weight(arg) <= ARG_SUBST_MAX);
-            if (!subst) {
+            /* NOT "a cheap arg to a PURE callee" (the rule this replaced):
+             * the callee's purity says nothing about the ARGUMENT, and
+             * `f(12 / z)` pasted into a guard arm skipped the division's
+             * throw whenever the arm was not taken. */
+            if (!arg_substitutable(f, static_cast<size_t>(i), arg, uses)) {
                 needs_temp[i] = true;
                 ntemps++;
             }
@@ -5754,7 +5878,9 @@ private:
                 auto id = make_unique<Identifier>(
                     "$a" + std::to_string(temp_base + t));
                 id->sym = ResolvedSym{ SymKind::local, temp_base + t };
-                id->th = ce->args->elems[i]->th;   /* keep M8 hint if any */
+                /* the temp holds the BOUND value: the param's hint */
+                id->th = temp_hint(f, static_cast<size_t>(i),
+                                   ce->args->elems[i].get());
                 temp_reads.push_back(std::move(id));
                 args.push_back(temp_reads.back().get());
                 t++;
@@ -5769,26 +5895,8 @@ private:
             is_rec ? rec_orig.at(f)->clone() : f->body->clone();
         splice_tail(body, args, nparams, off);
 
-        /* Prepend `$a = arg` for each temp-bound param, in PARAM ORDER so the
-         * args evaluate left-to-right (insert at front in reverse). The arg is
-         * the ORIGINAL caller expression (not remapped). */
         auto *blk = dynamic_cast<Block *>(body.get());
         ML_CHECK(blk != nullptr);   /* block_inlinable_decl required is_block */
-        t = ntemps;
-        for (int i = nparams - 1; i >= 0; i--) {
-            if (!needs_temp[i])
-                continue;
-            t--;
-            auto asn = make_unique<Expr14>();
-            asn->op = Op::assign;
-            auto lv = make_unique<Identifier>(
-                "$a" + std::to_string(temp_base + t));
-            lv->sym = ResolvedSym{ SymKind::local, temp_base + t };
-            lv->th = ce->args->elems[i]->th;
-            asn->lvalue = std::move(lv);
-            asn->rvalue = ce->args->elems[i]->clone();
-            blk->elems.insert(blk->elems.begin(), std::move(asn));
-        }
 
         if (fsize)
             *fsize += grow;   /* the caller's frame absorbed locals + arg temps */
@@ -5802,7 +5910,9 @@ private:
          * a normal expression - it runs in the caller's frame (no flow boundary)
          * and the frontier self-calls in its branches still hit the per-frame
          * cache. Otherwise keep the InlinedCall (a body with locals / arg temps
-         * / a loop is not yet expression-convertible). */
+         * / a loop is not yet expression-convertible). Temp-free means every
+         * argument was INERT, so nothing in the ternary evaluates an argument
+         * that could throw - tagging it all as the callee's is exact. */
         unique_ptr<Construct> spliced;
         if (ntemps == 0) {
             /* copy-propagate write-once cheap locals so a simple body collapses
@@ -5816,7 +5926,48 @@ private:
             }
         }
         if (!spliced) {
-            tag_inline(body.get(), ic);
+            /* Tag the BODY's statements - and only them - as inlined code
+             * BEFORE the arg temps go in: an argument is evaluated by the
+             * CALLER, so an error in one must render the caller's frames
+             * (the call site's own chain), never the callee's. The Block
+             * keeps the call site's chain too: the tree-walker flushes the
+             * innermost CHAINED node an exception crosses, and a Block
+             * tagged with the callee would name it for an argument error
+             * that crossed only untagged caller nodes. */
+            for (auto &st : blk->elems)
+                tag_inline(st.get(), ic);
+            blk->inline_ctx = ce->inline_ctx;
+
+            /* Prepend `$a = arg` for each temp-bound param, in PARAM ORDER
+             * so the args evaluate left-to-right (insert at front in
+             * reverse). The arg is the ORIGINAL caller expression (not
+             * remapped), with its own locs and chain; the store carries
+             * the arg's span, which is where a real call's bind carets a
+             * failed coercion (bind_arg). A param declared int/float
+             * coerces: the temp carries its decl_type, so the store runs
+             * the same coerce_to_decl_type the bind runs. */
+            int tt = ntemps;
+            for (int i = nparams - 1; i >= 0; i--) {
+                if (!needs_temp[i])
+                    continue;
+                tt--;
+                const size_t pi = static_cast<size_t>(i);
+                const Construct *arg = ce->args->elems[pi].get();
+                auto asn = make_unique<Expr14>();
+                asn->op = Op::assign;
+                auto lv = make_unique<Identifier>(
+                    "$a" + std::to_string(temp_base + tt));
+                lv->sym = ResolvedSym{ SymKind::local, temp_base + tt };
+                lv->th = temp_hint(f, pi, arg);
+                lv->decl_type = param_decl_type(f, pi);
+                lv->start = asn->start = arg->start;
+                lv->end = asn->end = arg->end;
+                lv->inline_ctx = asn->inline_ctx = ce->inline_ctx;
+                asn->lvalue = std::move(lv);
+                asn->rvalue = arg->clone();
+                blk->elems.insert(blk->elems.begin(), std::move(asn));
+            }
+
             auto ica = make_unique<InlinedCallExpr>();
             ce->copy_base_fields(*ica);   /* loc + inline_ctx of the call site */
             ica->elem = std::move(body);
@@ -5862,8 +6013,8 @@ private:
      */
     void try_inline_tail(unique_ptr<Construct> &slot, int depth, int *fsize)
     {
-        if (!fsize)
-            return;       /* the enclosing function has no frame to grow */
+        if (!fsize || in_repl_tmpl_base)
+            return;       /* no frame to grow / see in_repl_tmpl_base */
 
         auto *ret = dynamic_cast<ReturnStmt *>(slot.get());
         if (!ret)
@@ -5919,7 +6070,9 @@ private:
                     return id->sym.kind == SymKind::local
                         && id->sym.slot == i;
                 });
-            if (!tail_arg_ok(uses, ce->args->elems[i].get()))
+            if (!tail_arg_ok(uses, ce->args->elems[i].get())
+                    || !bind_is_identity(f, static_cast<size_t>(i),
+                                         ce->args->elems[i].get()))
                 return;
         }
 
@@ -5961,21 +6114,193 @@ private:
         walk(slot, depth + 1, fsize);   /* re-scan: nested tail/expr calls */
     }
 
-    /* Sound iff the argument is evaluated as often as the param is used and a
-     * side-effecting arg is neither dropped nor duplicated. An identifier or a
-     * self-contained constant (scalar, or array/dict literal of constants) is
-     * side-effect-free, so it can be duplicated; a constant can also be dropped
-     * (an identifier cannot - that would skip an undefined-variable error). */
-    static bool sub_ok(int uses, const Construct *arg)
+    /*
+     * THE ARGUMENT RULE (RULE 2). A real call - what `-ni` runs - evaluates
+     * every argument ONCE, left to right, BEFORE the body; binds it,
+     * coercing a param declared int/float; and an error in an argument is
+     * the CALLER's, with the argument's own caret. Pasting the argument
+     * EXPRESSION into the body instead moves its evaluation to wherever the
+     * parameter is used: after a side effect of the body, into a ternary
+     * arm or a short-circuit tail (conditionally), zero times (dropped) or
+     * several, and under the callee's inlined-at chain (one extra virtual
+     * frame). All of that is unobservable exactly when the argument is
+     * INERT - it cannot throw, has no side effect, and reads nothing the
+     * body can change - and its bind is the identity. Every other argument
+     * is bound to a frame temp first ("args as locals", splice_block_call).
+     *
+     * A WHITELIST, fail-closed: a node kind not listed is not inert.
+     *  - a scalar literal, or a baked deep read-only (shared) value;
+     *  - a caller LOCAL read (a slot the spliced body cannot reach: its own
+     *    locals are remapped to fresh slots, and a read cannot fail - the
+     *    TDZ refuses a use above the declaration at compile time);
+     *  - a TOP-LEVEL FUNCTION name nothing reassigns (bound at scope entry,
+     *    #134, so the read cannot fail and never changes) - what lets
+     *    `apply(sq, i)` inline to `sq(i)` and then to `i * i`;
+     *  - `+ - *`, comparisons, `& | ^`, `&& ||` and unary `- + ! ~` over
+     *    inert operands that inference proved scalar (`th`): int arithmetic
+     *    WRAPS (-fwrapv), float arithmetic is IEEE, so none of them can
+     *    throw; `/` and `%` only by a literal divisor other than 0 and
+     *    -1 (INT_MIN / -1). NOT a runtime divisor, NOT the shifts (a
+     *    negative count throws), NOT a subscript / member / call / string
+     *    concatenation, and nothing at all under `-nti` (no `th`).
+     */
+    bool arg_is_inert(const Construct *c) const
     {
-        if (uses == 1)
-            return true;       /* single evaluation: any argument is fine */
+        if (!c)
+            return false;
+        switch (ctag(c)) {
+        case ConstructType::lit_int:
+        case ConstructType::lit_bool:
+        case ConstructType::lit_float:
+        case ConstructType::lit_none:
+        case ConstructType::lit_str:
+            return true;
+        case ConstructType::lit_obj:
+            /* a baked DEEP READ-ONLY value is one shared object: every
+             * evaluation yields it, so it may be read any number of times
+             * (a MUTABLE one is a fresh copy per evaluation - duplicating
+             * it would split one argument into several objects) */
+            return static_cast<const LiteralObj *>(c)->is_immutable();
+        case ConstructType::id: {
+            auto *id = static_cast<const Identifier *>(c);
+            if (id->sym.kind == SymKind::local)
+                return true;
+            if (id->sym.kind != SymKind::global || repl_mode || !root_block)
+                return false;
+            const int sl = id->sym.slot;
+            if (!func_global_slots.count(sl))
+                return false;
+            const auto &re = root_block->global_slot_reassigned;
+            return sl >= 0 && static_cast<size_t>(sl) < re.size()
+                && !re[static_cast<size_t>(sl)];
+        }
+        case ConstructType::expr02: {
+            auto *u = static_cast<const MultiOpConstruct *>(c);
+            if (u->elems.size() != 1)
+                return false;
+            const Op op = u->elems[0].first;
+            const Construct *e = u->elems[0].second.get();
+            if (op == Op::invalid)
+                return arg_is_inert(e);
+            if (!e || e->th == TypeHint::none)
+                return false;
+            if (op == Op::bnot && e->th != TypeHint::i)
+                return false;
+            if (op != Op::plus && op != Op::minus && op != Op::lnot
+                    && op != Op::bnot)
+                return false;
+            return arg_is_inert(e);
+        }
+        case ConstructType::expr03:
+        case ConstructType::expr04:
+        case ConstructType::expr06:
+        case ConstructType::expr07:
+        case ConstructType::expr08:
+        case ConstructType::expr09:
+        case ConstructType::expr10:
+        case ConstructType::expr11:
+        case ConstructType::expr12: {
+            auto *mo = static_cast<const MultiOpConstruct *>(c);
+            for (size_t k = 0; k < mo->elems.size(); k++) {
+                const Op op = mo->elems[k].first;
+                const Construct *e = mo->elems[k].second.get();
+                if (!e || e->th == TypeHint::none || !arg_is_inert(e))
+                    return false;
+                switch (op) {
+                case Op::invalid:
+                    if (k != 0)
+                        return false;
+                    break;
+                case Op::plus: case Op::minus: case Op::times:
+                case Op::lt: case Op::gt: case Op::le: case Op::ge:
+                case Op::eq: case Op::noteq:
+                case Op::land: case Op::lor:
+                    break;
+                case Op::band: case Op::bor: case Op::bxor:
+                    if (e->th != TypeHint::i)
+                        return false;
+                    break;
+                case Op::div: case Op::mod:
+                    /* only by a LITERAL that cannot fail: not 0 (the
+                     * division by zero) and not -1 (INT_MIN / -1) -
+                     * `n % 2 - 5` is the recursion unroll's own shape */
+                    if (ctag(e) == ConstructType::lit_int) {
+                        const int_type d =
+                            static_cast<const LiteralInt *>(e)->ival();
+                        if (d == 0 || d == -1)
+                            return false;
+                    } else if (ctag(e) == ConstructType::lit_float) {
+                        if (static_cast<const LiteralFloat *>(e)->fval()
+                                == 0.0)
+                            return false;
+                    } else {
+                        return false;
+                    }
+                    break;
+                default:
+                    return false;   /* a shift, a runtime divisor: throws */
+                }
+                /* the bitwise ops need EVERY operand int, incl. the first */
+                if ((ctag(c) == ConstructType::expr08
+                     || ctag(c) == ConstructType::expr09
+                     || ctag(c) == ConstructType::expr10)
+                        && e->th != TypeHint::i)
+                    return false;
+            }
+            return !mo->elems.empty();
+        }
+        default:
+            return false;
+        }
+    }
 
-        if (uses >= 2)
-            return dynamic_cast<const Identifier *>(arg)
-                || is_const_literal(arg);
+    /* The declared type a parameter's BIND coerces to - read off the
+     * descriptor, which is what every engine's bind reads. */
+    static DeclType param_decl_type(const FuncDeclStmt *f, size_t i)
+    {
+        const auto &ps = f->desc->params;
+        return i < ps.size() ? ps[i].decl_type : DeclType::none;
+    }
 
-        return is_const_literal(arg);     /* uses == 0: drop a const only */
+    /* Is binding `arg` to param i the identity? A param declared int/float
+     * WIDENS an int/bool into it (and throws on a dyn value that does not
+     * fit), so only an argument inference proved to already be exactly
+     * that type binds unchanged. */
+    static bool bind_is_identity(const FuncDeclStmt *f, size_t i,
+                                 const Construct *arg)
+    {
+        switch (param_decl_type(f, i)) {
+        case DeclType::i:
+            return arg->th == TypeHint::i && !arg->th_bool;
+        case DeclType::f:
+            return arg->th == TypeHint::f;
+        default:
+            return true;
+        }
+    }
+
+    /* The type hint of a temp holding param i's BOUND value. */
+    static TypeHint temp_hint(const FuncDeclStmt *f, size_t i,
+                              const Construct *arg)
+    {
+        switch (param_decl_type(f, i)) {
+        case DeclType::i: return TypeHint::i;
+        case DeclType::f: return TypeHint::f;
+        default:          return arg->th;
+        }
+    }
+
+    /* May `arg` be pasted into the body for a param used `uses` times? An
+     * inert arg any number of times; a constant array/dict literal (it
+     * cannot throw, but each evaluation is a fresh object) at most once. */
+    bool arg_substitutable(const FuncDeclStmt *f, size_t i,
+                           const Construct *arg, int uses) const
+    {
+        if (!bind_is_identity(f, i, arg))
+            return false;
+        if (arg_is_inert(arg))
+            return true;
+        return uses <= 1 && is_const_literal(arg);
     }
 
     /*

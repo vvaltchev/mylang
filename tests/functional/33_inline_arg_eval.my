@@ -1,0 +1,111 @@
+# THE ARGUMENT RULE (RULE 2): an inlined call evaluates its ARGUMENTS
+# exactly as the real call does - once each, left to right, BEFORE the
+# body, bound with the parameter's coercion - whatever the inliner does
+# with the body. A VALUE assertion cannot see a violation (the answer is
+# usually the same either way), so every case below records an EVENT LOG
+# and asserts the order and the count of what ran.
+#
+# Before the rule, the inliner pasted the argument EXPRESSION wherever the
+# parameter was used: after a side effect of the body, into a guard or a
+# short-circuit arm (conditionally), zero times, or twice. Each case here
+# printed a different event log, or no exception, with inlining on vs `-ni`.
+
+var trail = "";
+func note(str s, int v) { trail = trail + s; return v; }
+func tick() { trail = trail + "t"; return 1; }
+
+# 1. a throwing argument is evaluated BEFORE a body side effect:
+#    the body's `tick()` must never run
+func f1(x) => tick() + x;
+func case1(int z) {
+    trail = "";
+    try { var r = f1(12 / z); trail = trail + "r"; }
+    catch (DivisionByZeroEx) { trail = trail + "E"; }
+    return trail;
+}
+assert(case1(int(runtime(0))) == "E");
+
+# 2. an argument the TAKEN path never reads is still evaluated
+func pick(c, a, b) { if (c) return a; return b; }
+func case2(array<int> xs, int k) {
+    trail = "";
+    try { var r = pick(true, 1, xs[k]); trail = trail + "r"; }
+    catch (OutOfBoundsEx) { trail = trail + "E"; }
+    return trail;
+}
+assert(case2([1, 2], int(runtime(7))) == "E");
+
+# 3. an argument used inside a short-circuit tail is still evaluated
+func both(c, x) => c && x > 0;
+func case3(int z) {
+    trail = "";
+    try { var r = both(false, 12 / z); trail = trail + "r"; }
+    catch (DivisionByZeroEx) { trail = trail + "E"; }
+    return trail;
+}
+assert(case3(int(runtime(0))) == "E");
+
+# 4. an argument used THREE times is evaluated ONCE
+func cube(x) => x * x * x;
+func case4() {
+    trail = "";
+    var v = cube(note("n", int(runtime(3))));
+    return trail + str(v);
+}
+assert(case4() == "n27");
+
+# 5. arguments run left to right, all of them before the body
+func f5(a, b, c) => tick() + c + a;
+func case5() {
+    trail = "";
+    var v = f5(note("a", 1), note("b", 2), note("c", 3));
+    return trail + str(v);
+}
+assert(case5() == "abct5");
+
+# 6. a GLOBAL argument is read at the call, not after the body changed it
+var g = 5;
+func bumpg() { g = g + 100; return 1; }
+func f6(x) => bumpg() + x;
+assert(f6(g) == 6);
+assert(g == 105);
+
+# 7. a typed parameter's bind coerces: an int into `float` WIDENS
+func half(float x) { var t = x; return t; }
+func case7(int k) { return half(k); }
+assert(str(case7(int(runtime(3)))) == "3.000000");
+
+# 8. ...and a dyn value that does not fit an `int` parameter THROWS
+func inc(int x) => x + 1;
+func case8() {
+    var dyn d = runtime("s");
+    trail = "";
+    try { var r = inc(d); trail = trail + "r"; }
+    catch (TypeErrorEx) { trail = trail + "E"; }
+    return trail;
+}
+assert(case8() == "E");
+
+# 9. a throwing LOCAL of an inlined body is not dropped when unused
+#    (collapse_locals) ...
+func unused(a, b) { var q = a / b; return 1; }
+func case9(int k, int z) {
+    trail = "";
+    try { var r = unused(k, z); trail = trail + "r"; }
+    catch (DivisionByZeroEx) { trail = trail + "E"; }
+    return trail;
+}
+assert(case9(7, int(runtime(0))) == "E");
+
+# 10. ...and the int-algebra fold drops no throwing term either
+func case10(int k, int z) {
+    trail = "";
+    try { var r = (k / z) * 0; trail = trail + "r"; }
+    catch (DivisionByZeroEx) { trail = trail + "E"; }
+    try { var r = k / z - k / z; trail = trail + "r"; }
+    catch (DivisionByZeroEx) { trail = trail + "E"; }
+    return trail;
+}
+assert(case10(7, int(runtime(0))) == "EE");
+
+print("ok");
