@@ -7568,7 +7568,18 @@ these three, never a cached bound or a live iterator.
 IN THE LANGUAGE (#53, 2026-09-25; README *Modifying the container
 during the loop*).** An ARRAY loop runs over the length at its start,
 reads each element when its turn comes, and raises OutOfBoundsEx at
-the container when the body removed the next one - so EVERY foreach
+the container when the body removed the next one - or, since #53
+OPTION 1, when it MOVED any element (pop / erase / an insert not at the
+end, through any alias or call): **every op that shifts elements IN
+PLACE must call `SharedArrayObj::note_shift()`** after its slice detach
+(today: `builtin_pop`, `builtin_erase_arr`, `builtin_insert_arr`); a
+new shifting op that forgets it lets a loop skip an element silently,
+since only the SHIFT EPOCH sees a shift that restores the length. The
+loop records `fe_mark()` (-1 for a slice view, which never shifts) and
+tests it per step - in C++ for the tree-walker and ForeachDynNext, as
+`ArrEpochMark`/`ArrEpochCheck` in the VM and JIT, emitted only when
+`struct_fe_body_inert(body, shift_only)` cannot prove the body
+harmless. And EVERY foreach
 element load re-checks the CURRENT length (the TW loop, LoadElemInt/
 Float/Value as always, LoadElemBool and LoadStructElemV since #53,
 ForeachDynNext's array bodies through an `oob` flag so the specialized

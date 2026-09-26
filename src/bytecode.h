@@ -1161,6 +1161,34 @@ enum class OpCode : unsigned char {
     LoadElem2Float,
 
     /*
+     * #53 option 1 - THE FOREACH SHIFT GUARD. A foreach over an array
+     * raises OutOfBoundsEx (at the container) at its next step when its
+     * body MOVED elements of the array it walks - pop, erase, an insert
+     * that is not at the end (SharedObject::shift_epoch, bumped by each).
+     *
+     * ArrEpochMark  `target` = an int slot m, `target2` = the loop's
+     *               container temp c: m = c's fe_mark() - the storage's
+     *               shift epoch, or -1 for a SLICE view (which can never
+     *               shift) or a non-array (an image's corrupt operand).
+     *               Emitted once, after the loop's ArrLen. Never throws.
+     * ArrEpochCheck `target2` = c, `a` = the slot m (ALWAYS a slot - the
+     *               JIT reads it from memory; verify_chunk refuses a
+     *               literal): raise OutOfBoundsEx if c.fe_shifted(m). The
+     *               caret is the container (loc side table). Emitted at
+     *               the top of each iteration BEFORE the element load, so
+     *               a moved element can never be bound first (an unpack's
+     *               length error would otherwise beat the raise).
+     *
+     * Neither is emitted when struct_fe_body_inert(..., shift_only) PROVES
+     * the body cannot move an element (no user call, no pop / erase /
+     * insert) - every foreach bench body - so the guard costs nothing
+     * there. The tree-walker and the dyn foreach (DynIterState::mark)
+     * test the same epoch in C++.
+     */
+    ArrEpochMark,
+    ArrEpochCheck,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1210,7 +1238,8 @@ enum class OpCode : unsigned char {
     X(FloatSubRI) X(FloatMulRR) X(FloatMulRI) X(AppendV) X(MathFnV) \
     X(LoadMemberInt) X(LoadMemberFloat) X(IntAddModRI) X(JumpUnlessElemInt) \
     X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt) X(EnterNative) \
-    X(ExitBlock) X(LoadElem2Int) X(LoadElem2Float)
+    X(ExitBlock) X(LoadElem2Int) X(LoadElem2Float) X(ArrEpochMark) \
+    X(ArrEpochCheck)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin

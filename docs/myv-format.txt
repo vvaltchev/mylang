@@ -2,8 +2,14 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 20.  This document describes the on-disk image exhaustively:
+Format version 21.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v21 changes no encoding: two opcodes were APPENDED - ArrEpochMark and
+ArrEpochCheck, the foreach shift guard (#53 option 1) - so a v20 binary
+would meet an opcode it does not know; see the note on version 10 below.
+ArrEpochCheck's `a` operand must be a SLOT: the verifier refuses the
+literal flag on it.)
 
 (v20 adds the TABLE OF CONTENTS (section 7.0): the struct and descriptor
 COUNTS, both written before the struct table, which therefore no longer

@@ -734,6 +734,7 @@ struct JitLayout {
     int ro_off;        /* SharedObject: &readonly   - shobj */
     int hashv_off;     /* SharedObject: &hash_valid - shobj */
     int slices_off;    /* SharedObject: &has_slices - shobj */
+    int epoch_off;     /* SharedObject: &shift_epoch - shobj (#53) */
     int lv_const_off;  /* LValue: &is_const - &slot */
     int lv_borrowed_off; /* LValue: &borrowed - &slot (W5) */
     int type_t_off;       /* offset of Type::t (the TypeE enum) within a Type */
@@ -1034,6 +1035,8 @@ static const JitLayout &jit_layout()
             static_cast<const char *>(jp.hash_valid) - so);
         l.slices_off = static_cast<int>(
             static_cast<const char *>(jp.has_slices) - so);
+        l.epoch_off = static_cast<int>(
+            static_cast<const char *>(jp.shift_epoch) - so);
         l.lv_const_off = static_cast<int>(
             reinterpret_cast<const char *>(&alv.jit_const_probe()) -
             reinterpret_cast<const char *>(&alv));
@@ -7067,6 +7070,12 @@ static bool jit_op_eligible(const Instr &in)
      * via jit_arr_len - a proven flat array, never throws. */
     case OpCode::ArrLen:
         return true;
+    /* #53 option 1: the foreach shift guard - the mark is a helper call
+     * (once per loop), the check an inline compare whose cold tier
+     * conveys the OutOfBoundsEx */
+    case OpCode::ArrEpochMark:
+    case OpCode::ArrEpochCheck:
+        return true;
     /* model-flip (nativize-ops): typed dict scalar read d.k / d[k] via
      * jit_dict_load. A missing key CAN throw (catch -> g_vm_jit_exc, exit_pc),
      * so it is NOT op_fully_native. */
@@ -7841,6 +7850,7 @@ static bool jit_op_w4_safe(const Instr &in)
     case OpCode::LoadStructFieldInt: case OpCode::LoadStructFieldFloat:
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::ArrLen: case OpCode::StrLen: case OpCode::LoadStrChar:
+    case OpCode::ArrEpochMark: case OpCode::ArrEpochCheck:
     case OpCode::StructFieldAddInt:
     /* the boxed family: slot operands through the pool entry */
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
@@ -13495,6 +13505,8 @@ static bool jit_hoist_op_ok(const Instr &in)
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
     case OpCode::ArrLen: case OpCode::StrLen: case OpCode::OrdCharV:
+    case OpCode::ArrEpochMark:   /* reads the epoch; writes an int temp */
+    case OpCode::ArrEpochCheck:  /* reads only; a raise conveys out */
     case OpCode::ReturnV:
     /*
      * The PLAIN store family is read-only FOR A HOISTED BASE'S STORAGE,
@@ -15464,6 +15476,15 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
         /* dst written from memory; base (target2) holds an array reference,
          * never an int - both must stay in memory. */
         v.bad(in.target); v.bad(in.target2);
+        break;
+    case OpCode::ArrEpochMark:
+        /* #53: the helper writes m from memory; c holds a reference */
+        v.bad(in.target); v.bad(in.target2);
+        break;
+    case OpCode::ArrEpochCheck:
+        /* the inline compare reads BOTH from memory (m is a loop temp
+         * no other op touches - nothing to gain by pinning it) */
+        v.bad(in.target2); v.bad(in.a_slot());
         break;
     case OpCode::DictLoadInt:
     case OpCode::DictLoadFloat:
@@ -22197,6 +22218,82 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         return true;
 
+    case OpCode::ArrEpochMark:
+        /* #53 option 1: m = epoch(c) via jit_arr_epoch_mark (rdi=slots,
+         * rsi=dst, rdx=base) - once per loop, never throws. */
+        emit_call_prologue(e);
+        e.slots_to_arg0();
+        e.mov_imm(RSI,
+                  static_cast<uint64_t>(static_cast<int_type>(in.target)));
+        e.mov_imm(RDX,
+                  static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.call_direct(reinterpret_cast<const void *>(jit_arr_epoch_mark));
+        emit_call_epilogue(e);
+        return true;
+
+    case OpCode::ArrEpochCheck: {
+        /*
+         * #53 option 1: the per-iteration shift guard, INLINE - the tag
+         * guard (an image's container slot may hold anything, and the
+         * next load dereferences the payload), then ONE compare of the
+         * storage's epoch against the mark:
+         *
+         *     cmp  [c.type], t_arr ; jne cold
+         *     mov  acc, [c.payload]          ; the SharedObject
+         *     mov  acc, [acc + epoch]
+         *     cmp  acc, [m.payload] ; je done
+         *     mov  acc, [m.payload] ; cmp acc, -1 ; je done  ; a slice
+         *   cold:
+         *     call jit_arr_epoch_check ; test eax ; jz done
+         *     <exc-stamp the container caret> ; exit
+         *
+         * The -1 test is inline because a foreach over a SLICE marks -1
+         * and would otherwise call the helper every iteration.
+         */
+        const JitLayout &L = jit_layout();
+        const SlotAddr base = slot_addr(in.target2);
+        const SlotAddr mk = slot_addr(static_cast<int>(in.a_slot()));
+        DeclineJumps slows;
+        size_t j_ok = SIZE_MAX, j_slice = SIZE_MAX;
+        {
+            AccScratch acc(e);
+            e.bump_op(OpCode::ArrEpochCheck);         /* execution proof */
+            e.load(acc.r, base.type);
+            {
+                /* the scratch is touched only off the low-address arena;
+                 * a push-borrow's pop preserves the flags for the jne */
+                RefScratch rb(e, RCX);
+                e.cmp_reg_tag_via(acc.r, L.t_arr, rb.sc);
+                rb.release();
+            }
+            decline_jump(e, slows, 0x75, JD_epoch_base_not_arr);
+            e.load(acc.r, base.payload);              /* shobj */
+            e.load_base(acc.r, acc.r, L.epoch_off);
+            e.cmp_reg_slot(acc.r, mk.payload);
+            j_ok = e.j32(0x74);                       /* unchanged */
+            e.load(acc.r, mk.payload);
+            e.cmp_reg_imm(acc.r, -1);
+            j_slice = e.j32(0x74);                    /* a slice: -1 */
+            decline_jump(e, slows, 0xEB, JD_epoch_shifted);
+            decline_land(e, slows);
+        }
+        emit_call_prologue(e);
+        e.slots_to_arg0();
+        e.mov_imm(RSI,
+                  static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.mov_imm(RDX, static_cast<uint64_t>(in.a_slot()));
+        e.call_direct(reinterpret_cast<const void *>(jit_arr_epoch_check));
+        emit_call_epilogue(e);
+        e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
+        const size_t j_none = e.j8(0x74);    /* jz: no raise */
+        emit_exc_stamp(e, ck, old_pc);       /* cold: the container caret */
+        e.exit_pc(pc);
+        e.patch8(j_none, e.pos());
+        e.patch32_here(j_ok);
+        e.patch32_here(j_slice);
+        return true;
+    }
+
     case OpCode::DictLoadInt:
     case OpCode::DictLoadFloat: {
         /* d.k / d[k] via jit_dict_load(dst, base_slot, key, is_int). The key
@@ -25594,6 +25691,7 @@ static bool op_never_exits(const Instr &in)
     case OpCode::LoadCaptureV:
     case OpCode::LoadLiteralObjV:   /* a clone, never throws */
     case OpCode::ArrLen:            /* size() of a proven array, never throws */
+    case OpCode::ArrEpochMark:      /* #53: reads an epoch, never throws */
     case OpCode::MakeClosureV:      /* resolved-closure create, never throws */
     case OpCode::MakeArrayV:        /* array literal build, no error path */
     case OpCode::CmpIntV:           /* int compare -> bool; cannot fault */
@@ -25842,6 +25940,11 @@ static bool op_fully_native(const Instr &in)
      * array, the caret from the op's own loc. */
     case OpCode::LoadElemValue:
     case OpCode::LoadElemBool:
+        return true;
+    /* #53 option 1: the foreach shift guard's cold tier conveys the
+     * OutOfBoundsEx through the status return with the exc-stamped
+     * container caret - no bail, no re-run */
+    case OpCode::ArrEpochCheck:
         return true;
     /* LoadStructElemV (the whole-`p` foreach bind): never throws on
      * bytecode we compiled; on an IMAGE its helper conveys the corrupt-base

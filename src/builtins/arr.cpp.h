@@ -540,6 +540,7 @@ EvalValue builtin_pop(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
             default:
                 arr.get_vec().pop_back();     break;
         }
+        arr.note_shift();   /* #53: a foreach over it raises next step */
     }
 
     return last;
@@ -624,6 +625,7 @@ EvalValue builtin_erase_arr(LValue *lval, int_type index)
             auto &v = arr.get_vec();     v.erase(v.begin() + at); break;
         }
     }
+    arr.note_shift();       /* #53: a foreach over it raises next step */
     return true;
 }
 
@@ -643,6 +645,10 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
         arr.clone_all_slices();
 
     const size_type at = arr.offset() + index;
+    /* #53: an insert that is not at the end MOVES the elements after it,
+     * so a foreach walking this storage raises at its next step (an
+     * insert AT the end is an append - not visited, no raise). */
+    const bool shifts = static_cast<size_type>(index) != n;
 
     /* Flat in-place insert when the value matches the kind (#96: a bool
      * WIDENS into numeric storage, like the element store and append).
@@ -655,6 +661,7 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
         v.insert(v.begin() + at, val.is<bool>()
             ? (val.get<bool>() ? 1 : 0)
             : val.get<int_type>());
+        if (shifts) arr.note_shift();
         return true;
     }
     if (arr.skind() == SharedArrayObj::Storage::floats &&
@@ -665,11 +672,13 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
             : val.is<bool>()
                 ? (val.get<bool>() ? 1.0 : 0.0)
                 : val.get<float_type>());
+        if (shifts) arr.note_shift();
         return true;
     }
     if (arr.skind() == SharedArrayObj::Storage::bools && val.is<bool>()) {
         auto &v = arr.flat_bools();
         v.insert(v.begin() + at, val.get<bool>() ? 1 : 0);
+        if (shifts) arr.note_shift();
         return true;
     }
 
@@ -681,6 +690,8 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
 
     auto &v = arr.get_vec();
     v.insert(v.begin() + at, LValue(val, false));
+    if (shifts)
+        arr.note_shift();
     return true;
 }
 

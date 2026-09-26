@@ -1434,12 +1434,20 @@ The loop body may change the very array or dictionary it is walking; the
 result is defined, and identical in every engine:
 
   * **An array** loop runs over the length the array had when the loop
-    **started** - elements the body appends are not visited. Each element is
-    read when its turn comes, so a store the body makes to a *later* element
-    is seen, while the loop variable itself is a copy (storing over the
-    current element does not change it). If the body removes elements so
-    that the next one no longer exists, the loop raises `OutOfBoundsEx` (at
-    the container).
+    **started** - elements the body appends (with `append`, `push`, `+=`,
+    or an `insert` at the end) are not visited. Each element is read when
+    its turn comes, so a store the body makes to a *later* element is seen,
+    and `sort`/`reverse` (which reorder the elements in place) are seen the
+    same way; the loop variable itself is a copy (storing over the current
+    element does not change it). But if the body **moves** elements - a
+    `pop`, an `erase`, or an `insert` anywhere but the end, through any
+    variable that refers to the array, or in a function it calls - the loop
+    raises `OutOfBoundsEx` (at the container) when its next step comes,
+    even if the length is back where it was. Moving elements under the loop
+    would otherwise make it silently skip one element or visit another
+    twice. A loop over a **slice** walks a view that behaves as an
+    independent copy, so changing the array it was taken from never
+    affects it.
   * **A dictionary** loop visits each key the dictionary held when the loop
     started, once, **if the key is still there when its turn comes**, with
     its value at that moment. Keys the body inserts are not visited, keys it
@@ -1458,7 +1466,16 @@ foreach (k in d)
 
 var b = [1, 2, 3, 4];
 foreach (x in b)
-    pop(b);                       # OutOfBoundsEx on the third iteration
+    pop(b);                       # OutOfBoundsEx on the second iteration
+
+var c = [10, 20, 30, 40];
+foreach (x in c) {
+    print(x);                     # prints 10, 20 - then OutOfBoundsEx:
+    if (x == 20) {                # the erase moved 30 into the place
+        erase(c, 0);              # already visited, so the loop would
+        append(c, 5);             # have skipped it
+    }
+}
 ```
 
 #### Extra features: the "indexed" keyword

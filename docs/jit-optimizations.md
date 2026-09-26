@@ -14808,3 +14808,48 @@ back from a switch passes a chain site's own re-store. The chunk-less
 Every JIT configuration (`OFF=norec`, `OFF=frameless`, `OFF=all`, a
 `.myv` image) failed identically, which is the tell that all three are in
 the shared record/conversion machinery rather than in one tier.
+
+## #53 option 1 - THE FOREACH SHIFT GUARD (2026-09-25)
+
+A foreach over an array now raises `OutOfBoundsEx` at its next step when
+the body MOVED elements - pop, erase, an insert not at the end - where it
+used to skip one silently (an erase of a visited element) or visit one
+twice (a middle insert); the old length test could see neither when the
+length came back. The fact lives on the SHARED storage,
+`SharedObject::shift_epoch`, bumped by `note_shift()` at each in-place
+shifting site in builtins/arr.cpp.h AFTER the slice detach; a handle
+reads it through `fe_mark()` (-1 for a slice: a view never shifts - the
+parent's shifting ops detach the overlapping views first, and an op
+through a view reseats or clones the view's own handle) and
+`fe_shifted(mark)`.
+
+Two new opcodes, APPENDED (myv v21): `ArrEpochMark` (once per loop, a
+helper call `jit_arr_epoch_mark`, never exits) and `ArrEpochCheck` (per
+iteration, at the loop head BEFORE the element load). Its emitted form:
+
+    mov  rax, c.type ; cmp rax, <array-tag> ; jne cold    (image guard)
+    mov  rax, c ; mov rax, [rax + epoch] ; cmp rax, m ; je done
+    mov  rax, m ; cmp rax, -1 ; je done                   (a slice)
+  cold:
+    call jit_arr_epoch_check ; test eax ; jz done ; <exc-stamp> ; exit
+
+The cold tier CONVEYS the OutOfBoundsEx with the exc-stamped container
+caret, so the check is `op_fully_native` (deletable) but not
+`op_never_exits`. `m` is a loop temp read from memory (`pick_visit_op`
+marks both operands `bad` - nothing to gain by pinning it), and the
+verifier refuses a literal `a` since the inline compare reads it as a
+slot. The -1 test sits after the hot compare so a slice loop pays two
+predicted branches, not a helper call per element.
+
+**Zero cost where it cannot matter:** codegen emits neither op when
+`struct_fe_body_inert(body, /*shift_only=*/true)` proves the body cannot
+move an element - no user call, no spliced body it cannot see, no
+builtin outside the grow/reorder list. Every foreach bench body
+qualifies (18/19/20/58/65/66's shapes), so their bytecode is unchanged -
+and with it the #9 `ForStepElemInt` fusion, which a guard at the loop
+head would block (its target must be the element load). The tree-walker
+and `ForeachDynNext` test the same epoch in C++. Pinned by the
+`foreach_shift_guard` extra check (the SHAPE half - 0 guards on an inert
+body, 2 on two shifting ones - which no differential can see, and the
+REACH half through g_jit_op_run) plus the two `-rt` entries and
+tests/functional/30_foreach_mutation.my.

@@ -1746,6 +1746,14 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "arr.len      " << D(in.target) << " = len("
                 << D(in.target2) << ")";
             break;
+        case OpCode::ArrEpochMark:      /* #53 option 1 */
+            row << "arr.mark     " << D(in.target) << " = epoch("
+                << D(in.target2) << ")";
+            break;
+        case OpCode::ArrEpochCheck:
+            row << "arr.check    epoch(" << D(in.target2) << ") == "
+                << RI(in.a(), false) << "   ; else OutOfBounds";
+            break;
         case OpCode::StrLen:
             row << "str.len      " << D(in.target) << " = len("
                 << D(in.target2) << ")   ; str chars";
