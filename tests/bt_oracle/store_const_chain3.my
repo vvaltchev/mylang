@@ -1,0 +1,11 @@
+# a 3-level store into a const through an inlined parameter: the chain
+# walk used to refuse at the first READ-ONLY step (caret `p[1]`) where the
+# tree-walker fails at the final store (caret `p[1][0][0]`) (#38 repro C)
+const C = [[[1]], [[2]]];
+func g(p) { p[1][0][0] = 7; }
+func drive(int n) {
+    var m = [[[5]], [[6]]];
+    for (var i = 0; i < n; i++) { if (i == 2) g(C); else g(m); }
+    return n;
+}
+print(drive(runtime(4)));
