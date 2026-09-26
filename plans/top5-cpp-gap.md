@@ -898,9 +898,18 @@ decline is out of line (`call_scalars_boxed`), so the hot function
 saves fewer registers; and a callback's bool result is read inline
 (`EvalValue::truthy()`) instead of through the virtual `is_true()`.
 Ir: **34 -11.5%**, 35 -5.4%, 96 -2.9%; wall 34 0.96x, 35/96/67 flat.
-**Remaining on 34, per comparison:** ~36 Ir in the emitted body, the
-result's EvalValue move out of `flow->value` (~14), and the entry
-bookkeeping around `jit_enter`.
+**CB7 (same day): a truth-tested result is read IN PLACE.** sort's
+comparator and filter's predicate only ask whether the result is true,
+so `VmInvoker::test()` reads it in `flow->value` (releasing a reference
+result there, as the moved-out temporary's destructor used to) instead
+of moving an EvalValue out and destroying it. Ir: **34 -8.4%**, 35
+-3.6%. Wall: 34 **0.69x**, 35 0.85x - far above what the Ir predicts,
+so treat those two numbers as UNCONFIRMED until a second session
+reproduces them. Pinned by a refcount() test (a predicate returning a
+captured array leaves its count unchanged; watched failing in every VM
+mode with the in-place release removed).
+**Remaining on 34, per comparison:** ~36 Ir in the emitted body and
+the entry bookkeeping around `jit_enter`.
 
 ### An unrelated observation, NOT chased
 

@@ -558,28 +558,25 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
             switch (arr.skind()) {
                 case SharedArrayObj::Storage::ints: {
                     const int_type v = arr.flat_ints()[at];
-                    EvalValue r = inv.call(v);
                     if (!is_filter)
-                        push_res(std::move(r));
-                    else if (r.truthy())
+                        push_res(inv.call(v));
+                    else if (inv.test(v))
                         push_res(EvalValue(v));
                     continue;
                 }
                 case SharedArrayObj::Storage::floats: {
                     const float_type v = arr.flat_floats()[at];
-                    EvalValue r = inv.call(v);
                     if (!is_filter)
-                        push_res(std::move(r));
-                    else if (r.truthy())
+                        push_res(inv.call(v));
+                    else if (inv.test(v))
                         push_res(EvalValue(v));
                     continue;
                 }
                 case SharedArrayObj::Storage::bools: {
                     const bool v = arr.flat_bools()[at] != 0;
-                    EvalValue r = inv.call(v);
                     if (!is_filter)
-                        push_res(std::move(r));
-                    else if (r.truthy())
+                        push_res(inv.call(v));
+                    else if (inv.test(v))
                         push_res(EvalValue(v));
                     continue;
                 }
@@ -632,7 +629,7 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
 
         DictObject::inner_type result;
         for (auto const &e : snap)
-            if (inv.call(e.first, e.second.get()).truthy())
+            if (inv.test(e.first, e.second.get()))
                 result.insert(e);
         return make_intrusive<DictObject>(std::move(result));
     }

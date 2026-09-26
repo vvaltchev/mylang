@@ -1104,7 +1104,7 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
                 auto &v = arr.flat_ints();
                 const size_t vn = v.size();
                 comparator_heapsort(v, [&](int_type a, int_type b) {
-                    const bool lt = inv.call(a, b).truthy();
+                    const bool lt = inv.test(a, b);
                     guard(v, vn);
                     return reverse ? !lt : lt;
                 });
@@ -1114,7 +1114,7 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
                 auto &v = arr.flat_floats();
                 const size_t vn = v.size();
                 comparator_heapsort(v, [&](float_type a, float_type b) {
-                    const bool lt = inv.call(a, b).truthy();
+                    const bool lt = inv.test(a, b);
                     guard(v, vn);
                     return reverse ? !lt : lt;
                 });
@@ -1124,8 +1124,8 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
                 auto &v = arr.flat_bools();
                 const size_t vn = v.size();
                 comparator_heapsort(v, [&](unsigned char a, unsigned char b) {
-                    const bool lt = inv.call(static_cast<bool>(a),
-                                             static_cast<bool>(b)).truthy();
+                    const bool lt = inv.test(static_cast<bool>(a),
+                                             static_cast<bool>(b));
                     guard(v, vn);
                     return reverse ? !lt : lt;
                 });
@@ -1141,8 +1141,8 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
                 comparator_heapsort(v,
                                     [&](const SharedStr &a,
                                         const SharedStr &b) {
-                    const bool lt = inv.call(SharedStr(a),
-                                             SharedStr(b)).truthy();
+                    const bool lt = inv.test(SharedStr(a),
+                                             SharedStr(b));
                     guard(v, vn);
                     return reverse ? !lt : lt;
                 });
@@ -1165,7 +1165,7 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
 
                 comparator_heapsort(vec,
                                     [&](const LValue &a, const LValue &b) {
-                    const bool lt = inv.call(a.get(), b.get()).truthy();
+                    const bool lt = inv.test(a.get(), b.get());
                     guard(vec, vn);
                     return reverse ? !lt : lt;
                 });

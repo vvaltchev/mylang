@@ -7621,7 +7621,9 @@ bind the post-call release scan reads `Chunk::ref_slots_raw` (ref_slots
 with no parameter seeds - only the body's own writes can leave a
 reference); the two lists come out of ONE `compute_ref_slots` call and
 the bytecode splice extends both, so no site can derive one and not
-the other (#97 CB5).
+the other (#97 CB5). A builtin that only asks whether the callback's
+result is TRUE (a comparator, a predicate) calls `inv.test(...)`, which
+reads it in place and releases a reference result there (#97 CB7).
 ⛔ That was built in four shapes on 2026-08-14 and REJECTED at 1.20x
 slower - on a WSL2 box with no PMU, where "front-end/layout" could only
 be guessed. On native hardware the path is BACKEND-bound (top-down

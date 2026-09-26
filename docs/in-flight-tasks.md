@@ -678,8 +678,11 @@ work — but profile it before building, the way increment 0 was.
         trimmed (no per-slot raw_bindable test, one gate flag, boxed
         decline out of line, bool result read inline) - 34 -11.5% Ir /
         0.96x wall, 35 -5.4%, 96 -2.9%.
-        NEXT on the callback path: the result's EvalValue move out of
-        flow->value and the jit_enter bookkeeping.
+        ✅ **CB7 DONE 2026-09-26**: sort/filter read the callback's
+        truth value in place (VmInvoker::test) - 34 -8.4% Ir, 35 -3.6%
+        (wall 0.69x / 0.85x, unconfirmed - above what Ir predicts).
+        NEXT on the callback path: the jit_enter bookkeeping, then the
+        emitted comparator body itself.
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
 

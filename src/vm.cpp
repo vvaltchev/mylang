@@ -7516,11 +7516,11 @@ VmInvoker::~VmInvoker()
  * +19% wall clock at -27.2% instructions. If a second caller ever appears,
  * it must inline this too - never call it.
  */
-static ML_ALWAYS_INLINE EvalValue
-vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
-                const FuncDescriptor *d, LValue *win, int_type total,
-                const char *entry, Loc site,
-                const std::vector<int32_t> &scan)
+static ML_ALWAYS_INLINE void
+vm_invoker_run(const Chunk *cck, EvalContext *c, VmActivation *act,
+               const FuncDescriptor *d, LValue *win, int_type total,
+               const char *entry, Loc site,
+               const std::vector<int32_t> &scan)
 {
     c->flow->type = FlowState::none;
 
@@ -7577,12 +7577,40 @@ vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
     for (int_type i = 0; i < total; i++)
         ML_VM_CHECK(win[i].get().get_type()->t < Type::t_str);
 #endif
+}
 
+static ML_ALWAYS_INLINE EvalValue
+vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
+                const FuncDescriptor *d, LValue *win, int_type total,
+                const char *entry, Loc site,
+                const std::vector<int32_t> &scan)
+{
+    vm_invoker_run(cck, c, act, d, win, total, entry, site, scan);
     if (c->flow->type == FlowState::ret) {
         c->flow->type = FlowState::none;
         return std::move(c->flow->value);
     }
     return EvalValue();
+}
+
+/* #97 CB7: the body's result as a truth value, read IN PLACE. A reference
+ * result is released here, as the moved-out temporary's destructor would
+ * have done at the same point - it must not outlive the element. */
+static ML_ALWAYS_INLINE bool
+vm_invoker_test(const Chunk *cck, EvalContext *c, VmActivation *act,
+                const FuncDescriptor *d, LValue *win, int_type total,
+                const char *entry, Loc site,
+                const std::vector<int32_t> &scan)
+{
+    vm_invoker_run(cck, c, act, d, win, total, entry, site, scan);
+    if (c->flow->type != FlowState::ret)
+        return false;                     /* no value: none, falsy */
+    c->flow->type = FlowState::none;
+    EvalValue &v = c->flow->value;
+    const bool t = v.truthy();
+    if (v.get_type()->t >= Type::t_str)
+        v = EvalValue();
+    return t;
 }
 
 /*
@@ -7602,10 +7630,8 @@ vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
  * paid as a test. The boxed decline lives out of line so this hot
  * function saves fewer registers.
  */
-EvalValue VmInvoker::call_scalars(const CbScalar *ra, size_t n)
+ML_ALWAYS_INLINE void VmInvoker::bind_raw(const CbScalar *ra, size_t n)
 {
-    if (!raw_ok_ || n != nparams_)
-        return call_scalars_boxed(ra, n);
     LValue *win = w_->slots;
 #if ML_VM_HARDENING
     for (size_t i = 0; i < n; i++)
@@ -7623,7 +7649,24 @@ EvalValue VmInvoker::call_scalars(const CbScalar *ra, size_t n)
         else
             win[i].bind_scalar_raw(ra[i].i != 0);
     }
-    return vm_invoker_body(cck_, c_, act_, desc_, win,
+}
+
+EvalValue VmInvoker::call_scalars(const CbScalar *ra, size_t n)
+{
+    if (!raw_ok_ || n != nparams_)
+        return call_scalars_boxed(ra, n);
+    bind_raw(ra, n);
+    return vm_invoker_body(cck_, c_, act_, desc_, w_->slots,
+                           static_cast<int_type>(w_->size), entry_,
+                           site_, cck_->ref_slots_raw);
+}
+
+bool VmInvoker::call_scalars_test(const CbScalar *ra, size_t n)
+{
+    if (!raw_ok_ || n != nparams_)
+        return call_scalars_boxed(ra, n).truthy();
+    bind_raw(ra, n);
+    return vm_invoker_test(cck_, c_, act_, desc_, w_->slots,
                            static_cast<int_type>(w_->size), entry_,
                            site_, cck_->ref_slots_raw);
 }
