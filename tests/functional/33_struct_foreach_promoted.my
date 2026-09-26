@@ -1,0 +1,45 @@
+# The struct-FOREACH direct field read (LoadStructFieldInt/Float and the
+# fused StructFieldAddInt) over an array<PodStruct> that is NOT flat.
+#
+# A flat struct array AUTO-PROMOTES to general storage on a cold op
+# (insert/sort/map), so the STATIC type array<P> - all the loop's gate
+# proves - says nothing about the storage. The read assumed flat bytes and
+# answered 0 for every element of a promoted array, in the interpreter and
+# the JIT alike, while the tree-walker read the real fields. Found by the
+# #54 -nc audit (an un-folded `var pts = []` was built general).
+#
+# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff.sh).
+
+struct P { int x; float f; bool b; }
+
+var pts = [P(1, 1.5, true)];
+insert(pts, 0, P(0, 0.25, false));       # promotes to general storage
+append(pts, P(2, 2.0, true));
+print("storage ", array_storage(pts), len(pts));
+
+# the int, float and bool field reads, and the fused int reduction
+var s = 0;
+var fs = 0.0;
+var nb = 0;
+foreach (var p in pts) {
+    s = s + p.x;
+    fs = fs + p.f;
+    if (p.b)
+        nb = nb + 1;
+}
+print("fields  ", s, fs, nb);
+
+# a nested walk: both loop vars read directly
+var cross = 0;
+foreach (var a in pts)
+    foreach (var b in pts)
+        if (a.x < b.x)
+            cross = cross + a.x * 10 + b.x;
+print("cross   ", cross);
+
+# and the flat array, for contrast: the same loop, the same answers
+var flat = [P(0, 0.25, false), P(1, 1.5, true), P(2, 2.0, true)];
+var t = 0;
+foreach (var p in flat)
+    t = t + p.x;
+print("flat    ", array_storage(flat), t);
