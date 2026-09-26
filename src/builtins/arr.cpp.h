@@ -894,6 +894,16 @@ static void comparator_heapsort(Vec &vec, Cmp cmp)
  * exprList (`rest == nullptr`: the tree-walker). `rest` outlives this call (the
  * caller's stackbuf / register run), so the cmp FuncObject stays alive.
  */
+/* #49: the comparator changed the length or storage of the array being
+ * sorted - the defined error (cold: out of the per-comparison path) */
+[[noreturn]] static ML_COLD void
+sort_modified_fail(const ArgLocs *exprList)
+{
+    throw InvalidArgumentEx(
+        "sort(): the comparator modified the array being sorted",
+        exprList->start, exprList->end);
+}
+
 static EvalValue
 sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lval,
           bool reverse, const EvalValue *rest = nullptr)
@@ -1049,40 +1059,45 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
          * again. (An in-place element write keeps both, so it is merely
          * observed - every index stays in bounds.)
          */
-        size_type sort_n = arr.size();
         auto sort_kind = arr.skind();
-        auto guard = [&]() {
-            if (arr.skind() != sort_kind || arr.size() != sort_n)
-                throw InvalidArgumentEx(
-                    "sort(): the comparator modified the array being sorted",
-                    exprList->start, exprList->end);
+        /* Per comparison: the KIND first (a promotion destroys the vector
+         * the arm holds, so its size must not be read after one), then the
+         * held vector's own size against its size at the start - both
+         * inline. arr.size() here was an out-of-line kind switch per
+         * comparison: +7.7% Ir on 34_sort_custom_cmp. */
+        auto guard = [&](const auto &held, size_t held_n) {
+            if (arr.skind() != sort_kind || held.size() != held_n)
+                sort_modified_fail(exprList);
         };
 
         switch (arr.skind()) {
             case SharedArrayObj::Storage::ints: {
                 auto &v = arr.flat_ints();
+                const size_t vn = v.size();
                 comparator_heapsort(v, [&](int_type a, int_type b) {
                     const bool lt = inv.call(a, b).is_true();
-                    guard();
+                    guard(v, vn);
                     return reverse ? !lt : lt;
                 });
                 break;
             }
             case SharedArrayObj::Storage::floats: {
                 auto &v = arr.flat_floats();
+                const size_t vn = v.size();
                 comparator_heapsort(v, [&](float_type a, float_type b) {
                     const bool lt = inv.call(a, b).is_true();
-                    guard();
+                    guard(v, vn);
                     return reverse ? !lt : lt;
                 });
                 break;
             }
             case SharedArrayObj::Storage::bools: {
                 auto &v = arr.flat_bools();
+                const size_t vn = v.size();
                 comparator_heapsort(v, [&](unsigned char a, unsigned char b) {
                     const bool lt = inv.call(static_cast<bool>(a),
                                              static_cast<bool>(b)).is_true();
-                    guard();
+                    guard(v, vn);
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -1093,12 +1108,13 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
                  * two handles for the callback (a SharedStr is move-only,
                  * so the copy is explicit). */
                 auto &v = arr.flat_strs();
+                const size_t vn = v.size();
                 comparator_heapsort(v,
                                     [&](const SharedStr &a,
                                         const SharedStr &b) {
                     const bool lt = inv.call(SharedStr(a),
                                              SharedStr(b)).is_true();
-                    guard();
+                    guard(v, vn);
                     return reverse ? !lt : lt;
                 });
                 break;
@@ -1116,12 +1132,12 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
                 if (promoting && lval)
                     lval->put(val0);
                 sort_kind = arr.skind();       /* general, now */
-                sort_n = arr.size();
+                const size_t vn = vec.size();
 
                 comparator_heapsort(vec,
                                     [&](const LValue &a, const LValue &b) {
                     const bool lt = inv.call(a.get(), b.get()).is_true();
-                    guard();
+                    guard(vec, vn);
                     return reverse ? !lt : lt;
                 });
                 break;
