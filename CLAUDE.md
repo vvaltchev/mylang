@@ -3791,6 +3791,21 @@ decisions behind it: `plans/archived/type-inference.md`,
   arrived). A FRESH `var r = 3 + d` (only a dyn contribution) correctly stays
   `dyn` → `DynRequiredEx`; `var dyn r = 3 + d` holds the actual result.
   (`TypeSym::{round_got_dyn,coerces_dyn,decl_id}`.)
+- **A JOINED parameter binds like a DECLARED one (#38 C,
+  `stamp_inferred_param_types`).** A lambda's un-annotated param (and a
+  named function's `opt` one) joins every call site's argument, so
+  `f(1); f(2.5)` types it `float` - and the `int` then sat unconverted in a
+  slot every typed consumer reads as a float (RULE 1: `print(f(1))` gave
+  `1`). The param's `Identifier::decl_type` and its `ParamDesc::decl_type`
+  are stamped i/f after the check pass, exactly like the coerces_dyn stamp
+  for a local, so EVERY bind path (`bind_param`, `vm_bind_arg`, the JIT's
+  bind tiers and baked-callee checks, the `.myv` image, which already
+  carries ParamDesc::decl_type) coerces as for `float x`. It walks the
+  LIVE tree, not `all_funcs` (which keeps FuncInfos of literals a
+  parse-time bake freed), and skips a template base and an INSTANCE's
+  template params (keyed by the exact argument type, they join nothing,
+  and a typed param declines the bytecode splice and the frameless
+  tiers).
 - **Mandatory `opt` for params** (`enforce_nonnull_params`, same gate/timing as
   mandatory-`dyn`): a parameter that can receive `none` from *some* call path,
   if not declared `opt`, throws `OptRequiredEx` **at the param's declaration**

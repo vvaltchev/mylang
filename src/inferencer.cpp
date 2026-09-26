@@ -201,6 +201,8 @@ public:
     explicit Inferencer(Construct *root = nullptr) : root(root) { }
     void run();
     void stamp_proven_params();     /* C3: see the definition */
+    /* #38 C: see the definition */
+    void stamp_inferred_param_types(Construct *rootn);
     void setup();                  /* once: bottom + global scope */
     void infer_input(Block *root); /* REPL: one input, commit+pin its globals */
     void undef_global(const UniqueId *name);  /* REPL undef(x) */
@@ -2050,9 +2052,79 @@ void Inferencer::infer_one(Block *rootBlock)
         enforce_nonnull_params();
     }
 
+    stamp_inferred_param_types(rootBlock);
+
     /* Stamp TypeHints (int/float) for the M8 specializer + typed conditions. */
     for (auto &e : rootBlock->elems)
         annotate_hints(e.get());
+}
+
+/*
+ * #38 C: an UN-annotated parameter whose final type is `int` or `float`
+ * binds like one DECLARED so. The fixpoint JOINS every call site's
+ * argument into a non-template function's parameter (a capturing lambda,
+ * a factory-returned closure, a function reached through a value), so
+ * `f(1); f(2.5);` types `x` float - and the int argument then sat
+ * unconverted in a slot every typed consumer reads as a float (RULE 1:
+ * `print(f(1))` printed `1` where the signature says `func(float)->float`,
+ * and the typed tiers read an int's bits as a double). Stamping the
+ * param's `decl_type` - the Identifier (resolve_names propagates it to
+ * the uses, so a reassignment coerces too) and the descriptor's ParamDesc
+ * (what every bind path reads) - makes every engine's bind run
+ * coerce_to_decl_type, exactly as for `float x`: int/bool widen, a `dyn`
+ * argument of another kind throws, `none` passes (an `opt` param).
+ * A template BASE is skipped (its params are fallbacks), and so is an
+ * INSTANCE's template param (keyed by the exact argument type, it joins
+ * nothing - and a typed param would decline the bytecode splice and the
+ * frameless tiers for no reason); so are `dyn` params and pinned REPL
+ * functions. What remains is exactly the JOINED params: a lambda's, and
+ * an `opt` param's.
+ */
+void Inferencer::stamp_inferred_param_types(Construct *rootn)
+{
+    /* the LIVE functions: walk the tree (all_funcs also holds FuncInfos of
+     * literals a parse-time bake or an earlier input already freed) */
+    std::vector<FuncDeclStmt *> fds;
+    std::function<void(Construct *)> collect = [&](Construct *c) {
+        if (!c)
+            return;
+        if (ctag(c) == ConstructType::func_decl)
+            fds.push_back(static_cast<FuncDeclStmt *>(c));
+        for_each_child(c, collect);
+    };
+    collect(rootn);
+    for (FuncDeclStmt *fd : fds) {
+        auto it = func_of_decl.find(fd);
+        if (it == func_of_decl.end() || !it->second)
+            continue;
+        FuncInfo *fi = it->second;
+        if (fi->pinned || fi->is_template || fi->decl != fd || !fd->params)
+            continue;
+        /* a template INSTANCE (make_template_clone names it after its base
+         * via display_name): its template params are keyed by the exact
+         * argument type, so only its `opt` params can have been joined */
+        const bool instance = fd->desc && !fd->desc->display_name.empty();        auto &pe = fd->params->elems;
+        const size_t n = std::min(fi->params.size(), pe.size());
+        for (size_t i = 0; i < n; i++) {
+            const TypeSym *p = fi->params[i];
+            Identifier *pid = pe[i].get();
+            if (!p || p->dyn_decl || p->ann != DeclType::none || !p->type
+                    || p->in_template || pid->decl_type != DeclType::none
+                    || (instance && !p->opt_decl))
+                continue;
+            const StaticType *t = static_type_resolve(p->type);
+            DeclType dt = DeclType::none;
+            if (t && t->kind == StaticTypeKind::Int)
+                dt = DeclType::i;
+            else if (t && t->kind == StaticTypeKind::Float)
+                dt = DeclType::f;
+            if (dt == DeclType::none)
+                continue;
+            pid->decl_type = dt;
+            if (fd->desc && i < fd->desc->params.size())
+                fd->desc->params[i].decl_type = dt;
+        }
+    }
 }
 
 void Inferencer::run()
