@@ -2700,7 +2700,13 @@ and it lives *inside the parser*. Mechanics:
   `is_const = true` and is
   registered into `const_ctx`, so it *can* be invoked during const-eval (a plain
   `func` cannot). Pure
-  funcs may not have a capture list and see only consts + their own params. A
+  funcs may not have a capture list and see only consts + their own params -
+  the consts in scope at the DECLARATION: a FuncObject created in a const
+  scope remembers it (`FuncObject::const_scope` + the scope's
+  `EvalContext::scope_alive` token, #38 B), and a const-eval call parents
+  its body there while the scope is alive. The root const ctx holds only
+  builtins, so parenting to it (as before) lost every const container and
+  every other pure func (`const Z = f(1)` with `f(i) => A[i]` failed). A
   `CallExpr` folds when
   the callee and all args are const — that's how
   `sort(arr, pure func(a,b) => a<b)` runs at parse time.

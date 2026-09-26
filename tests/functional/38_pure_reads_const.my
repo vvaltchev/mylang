@@ -1,0 +1,40 @@
+# A pure function sees the consts in scope where it is DEFINED - scalars,
+# and also const CONTAINERS and other pure functions, which are not inlined
+# at the use but kept as bindings. Const-evaluating a call used to run the
+# body parented to the ROOT const scope, which holds only the builtins, so
+# `const Z = f(1);` below failed "Undefined variable 'A' while evaluating a
+# PURE function" in every engine (task #38 B).
+
+const A = [10, 20, 30];
+const D = {"x": 5, "y": 7};
+struct P { int x; int y; }
+const S = P(3, 4);
+const N = [[1, 2], [3, 4]];
+
+pure func at(i) => A[i];
+pure func dk(k) => D[k];
+pure func sx() => S.x + S.y;
+pure func ln() => len(A);
+pure func nn(i, j) => N[i][j];
+pure func twice(i) => at(i) * 2;          # a pure func calling a pure func
+
+const Z1 = at(1);
+const Z2 = dk("y");
+const Z3 = sx();
+const Z4 = ln();
+const Z5 = nn(1, 0);
+const Z6 = twice(2);
+print("const ", Z1, Z2, Z3, Z4, Z5, Z6);
+assert(Z1 == 20 && Z2 == 7 && Z3 == 7 && Z4 == 3 && Z5 == 3 && Z6 == 60);
+
+# the same functions called at RUN time
+int i = int(runtime(2));
+print("run   ", at(i), dk(runtime("x")), sx(), ln(), nn(i - 1, 1), twice(i));
+assert(at(i) == 30 && twice(i) == 60 && nn(i - 1, 1) == 4);
+
+# a const initializer in a NESTED block calls a top-level pure function
+{
+    const Y = twice(1) + nn(0, 1);
+    print("block ", Y);
+    assert(Y == 42);
+}

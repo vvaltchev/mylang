@@ -92,6 +92,9 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx,
     , flow((parent && !func_ctx) ? parent->flow : &flow_state)
     , root(parent ? parent->root : this)     /* #114 */
 {
+    if (const_ctx)
+        scope_alive = std::make_shared<bool>(true);
+
     /* Load builtins into the map ONLY for a context that resolves names through
      * the map: the const-evaluator (const_builtins) and the REPL (both). A
      * SCRIPT runtime root loads NOTHING - the resolver slotted every name (incl.
@@ -104,6 +107,12 @@ EvalContext::EvalContext(EvalContext *parent, bool const_ctx, bool func_ctx,
             symbols.insert(builtins.begin(), builtins.end());
         }
     }
+}
+
+EvalContext::~EvalContext()
+{
+    if (scope_alive)
+        *scope_alive = false;
 }
 
 LValue *EvalContext::lookup(const Identifier *id)
@@ -717,6 +726,12 @@ do_func_call(EvalContext *ctx,
 
     if (!croot && ctx)
         croot = get_root_ctx(ctx);
+
+    /* #38 B: a const-eval call of a function created in a const scope sees
+     * that scope (lexically), not only the root - FuncObject::const_scope */
+    if (obj.const_scope && ctx && ctx->in_const_eval()
+            && obj.const_scope_alive && *obj.const_scope_alive)
+        croot = obj.const_scope;
 
     EvalContext args_ctx(croot, false, true);
 

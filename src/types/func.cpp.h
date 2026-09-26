@@ -97,6 +97,8 @@ FuncObject::FuncObject(const FuncObject &rhs)
     , func(rhs.func)
     , capture_slots(rhs.capture_slots)
     , capture_root(rhs.capture_root)
+    , const_scope(rhs.const_scope)
+    , const_scope_alive(rhs.const_scope_alive)
 {
 #ifdef TESTS
     g_live_funcobjs++;
@@ -128,6 +130,11 @@ FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
 #ifdef TESTS
     g_live_funcobjs++;
 #endif
+    /* #38 B: remember the defining CONST scope (see const_scope) */
+    if (ctx && ctx->scope_alive) {
+        const_scope = ctx;
+        const_scope_alive = ctx->scope_alive;
+    }
     if (func->captures.empty())
         return;
 

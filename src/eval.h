@@ -368,6 +368,17 @@ public:
      */
     EvalContext *root;
 
+    /*
+     * A CONST scope's liveness (#38 B): set only on a const context, and
+     * cleared by its destructor. A `pure func` created during const
+     * evaluation remembers its DEFINING const scope (FuncObject::
+     * const_scope) - its body reads the consts in scope there, which a
+     * nested block's const context holds, not the root - and the parse
+     * pops block scopes long before a baked function value can be called
+     * again, so the token says whether the pointer may still be followed.
+     */
+    std::shared_ptr<bool> scope_alive;
+
     EvalContext(const EvalContext &rhs) = delete;
     EvalContext(EvalContext &&rhs) = delete;
 
@@ -375,6 +386,7 @@ public:
                 bool const_ctx = false,
                 bool func_ctx = false,
                 bool repl = false);
+    ~EvalContext();
 
     LValue *lookup(const Identifier *id);
     LValue *lookup(const UniqueId *uid);
@@ -913,6 +925,19 @@ public:
      * The VM never used it at all (it reads only capture_slots).
      */
     EvalContext *capture_root;
+
+    /*
+     * #38 B: the CONST scope a function was created in, when it was created
+     * during const evaluation (a `pure func` registered by the parser, or
+     * by AutoConst's fold context), with that scope's liveness token.
+     * do_func_call parents a const-eval call's body to it while it is
+     * alive, so the body sees the consts LEXICALLY in scope at the
+     * definition - a const CONTAINER or another pure func, which live in
+     * the defining block's const context. Parented to the root, `pure func
+     * f(i) => A[i]; const Z = f(1);` failed "Undefined variable 'A'".
+     */
+    EvalContext *const_scope = nullptr;
+    std::shared_ptr<bool> const_scope_alive;
 
     FuncObject(const FuncDescriptor *func, EvalContext *ctx);
     FuncObject(const FuncObject &rhs);

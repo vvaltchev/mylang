@@ -826,6 +826,35 @@ static const std::vector<test> tests =
       &typeid(DivisionByZeroEx), 29, 2, 35, 2 },
 
     /*
+     * #38 B: A PURE FUNCTION SEES THE CONSTS IN SCOPE WHERE IT IS DEFINED,
+     * in a const initializer too. A const CONTAINER (and another pure
+     * function) is a binding in the defining block's const scope, not the
+     * root, and the body of a const-evaluated call was parented to the
+     * root: `const Z = f(1);` failed "Undefined variable 'A' while
+     * evaluating a PURE function" in every engine. Watched failing: with
+     * do_func_call's const_scope arm removed, every entry here does.
+     */
+    { "pure: a const initializer calls a pure func reading a const array",
+      { "const A = [1, 2];",
+        "pure func f(i) => A[i];",
+        "const Z = f(1);",
+        "assert(Z == 2 && f(runtime(0)) == 1);" } },
+    { "pure: ...a const dict, a struct const, len(), a nested container",
+      { "const D = {\"k\": 5};",
+        "struct P { int x; int y; }",
+        "const S = P(3, 4);",
+        "const N = [[1, 2], [3, 4]];",
+        "pure func f(k) => D[k] + S.x * S.y + len(N) + N[1][0];",
+        "const Z = f(\"k\");",
+        "assert(Z == 22 && f(runtime(\"k\")) == 22);" } },
+    { "pure: a pure func calling a pure func, from a nested block",
+      { "const A = [10, 20];",
+        "pure func g(i) => A[i] + 1;",
+        "pure func f(i) => g(i) * 2;",
+        "{ const Z = f(1); assert(Z == 42); }",
+        "assert(f(runtime(0)) == 22);" } },
+
+    /*
      * #38 D: REASSIGNING A NAMED FUNCTION TAKES EFFECT. `sq = ng;` was
      * ignored in every engine, `-tw -ni -nc` included: template
      * instantiation redirected `sq(3)` to a clone of the ORIGINAL body,
