@@ -1,0 +1,44 @@
+# A parameter inference JOINS from several call sites binds like one
+# DECLARED with that type: `f(1); f(2.5);` types `x` float, so the int
+# argument is converted at the bind, exactly as for `float x`. It used to
+# sit unconverted in a slot every typed consumer reads as a float (RULE 1):
+# `print(f(1))` printed `1` where the signature says func(float)->float
+# (task #38 C). Every shape here JOINS - a template's own parameters do
+# not (each call signature gets its own instance).
+
+# a capturing lambda bound to a variable
+var b = 2;
+var f = func [b] (x) { return x; };
+print("lambda  ", f(1), f(2.5), typestr(f));
+
+# a factory-returned closure
+func mk(n) { var w = n; return func [w] (x) { return x; }; }
+var g = mk(2);
+print("factory ", g(1), g(2.5));
+
+# the same, called in a loop (the JIT'd call path, warmed)
+var s = 0.0;
+for (var i = 0; i < 20; i++) {
+    s = s + f(i) + g(runtime(i));
+    if (i == 19)
+        print("loop    ", f(i), g(i));
+}
+print("sum     ", s);
+
+# an int parameter joined from a bool and an int argument
+var c = 1;
+var h = func [c] (y) { return y; };
+print("bool    ", h(true), h(5));
+
+# an `opt` parameter of a named function joins every call site too
+func o(opt z) { return z; }
+print("opt     ", o(3), o(1.5), o());
+
+# a lambda stored in a container and called through it
+var k = 0;
+var ops = [func [k] (x) { return x; }];
+print("value   ", ops[0](7), ops[0](0.5));
+
+# a reassignment of the parameter coerces like the bind
+var m = func [c] (x) { x = 4; return x; };
+print("reassign", m(1.5), m(2));

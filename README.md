@@ -1624,6 +1624,20 @@ A lambda with un-annotated parameters is typed from the places it is
   `float`, and the `int` argument is then coerced); two irreconcilable ones
   are a compile error.
 
+**A joined parameter binds exactly like a declared one.** Once the call sites
+make `x` a `float`, `x` behaves as if written `float x`: an `int` (or `bool`)
+argument is converted when it is bound, so `f(1)` receives `1.000000`, not `1`;
+likewise a parameter joined to `int` converts a `bool` argument to `0`/`1`; and
+a `dyn` argument whose value does not fit throws `TypeErrorEx` at the call. The
+same holds for an un-annotated `opt` parameter of a named function, whose call
+sites join the same way (`func o(opt z)` called with `3` and `1.5`).
+
+```C#
+var b = 2;
+var f = func [b] (x) { return x; };
+print(f(1), f(2.5));      # 1.000000 2.500000
+```
+
 **How the closure reaches the call makes no difference.** Bound directly to a
 variable, returned from a factory, or read out of a container - as long as the
 compiler can tell *which* closure is being called, every call site joins:

@@ -826,6 +826,42 @@ static const std::vector<test> tests =
       &typeid(DivisionByZeroEx), 29, 2, 35, 2 },
 
     /*
+     * #38 C: A JOINED PARAMETER BINDS LIKE A DECLARED ONE. Inference joins
+     * every call site's argument into a lambda's (or an `opt`) param, so
+     * `f(1); f(2.5)` types x float - and the int then sat unconverted in a
+     * slot every typed consumer reads as a float (RULE 1). The param's
+     * decl_type is stamped now, so every bind coerces as for `float x`.
+     * Watched failing: with stamp_inferred_param_types disabled the first
+     * three fail in every mode.
+     */
+    { "coerce: a joined float lambda param converts an int argument",
+      { "var b = 2;",
+        "var f = func [b] (x) { return x; };",
+        "assert(typestr(f(1)) == \"float\" && str(f(1)) == \"1.000000\");",
+        "assert(f(2.5) == 2.5);",
+        "var s = 0.0;",
+        "for (var i = 0; i < 40; i++) s = s + f(i);",
+        "assert(s == 780.0);" } },
+    { "coerce: a factory closure's joined param, and an opt param",
+      { "func mk(n) { var w = n; return func [w] (x) { return x; }; }",
+        "var g = mk(2);",
+        "assert(str(g(1)) == \"1.000000\" && g(2.5) == 2.5);",
+        "func o(opt z) { return z; }",
+        "assert(str(o(3)) == \"3.000000\" && o(1.5) == 1.5 && o() == none);"
+        } },
+    { "coerce: a joined int param converts a bool argument",
+      { "var c = 1;",
+        "var h = func [c] (y) { return y; };",
+        "assert(str(h(true)) == \"1\" && h(5) == 5);" } },
+    { "coerce: a dyn argument the joined float param cannot take throws",
+      { "var b = 2;",
+        "var f = func [b] (x) { return x; };",
+        "var dyn d = runtime(\"s\");",
+        "f(2.5);",
+        "f(d);" },
+      &typeid(TypeErrorEx), 3, 5, 5, 5 },
+
+    /*
      * #38 B: A PURE FUNCTION SEES THE CONSTS IN SCOPE WHERE IT IS DEFINED,
      * in a const initializer too. A const CONTAINER (and another pure
      * function) is a binding in the defining block's const scope, not the
