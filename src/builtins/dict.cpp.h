@@ -354,6 +354,9 @@ EvalValue builtin_make_dict(EvalContext *ctx, const ArgLocs *exprList,
      * once indexed past its end. */
     for (size_type i = 0; i < keys.size(); i++) {
 
+        /* the key stays BOXED to the callback: it is boxed anyway for
+         * the dict, and a raw bind on top of that measured +5 Ir per
+         * call on 67_make_dict (#97 CB4) */
         const EvalValue k = arr_elem_at(keys, i);
         const EvalValue v = inv.call(k);
 

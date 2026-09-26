@@ -1,0 +1,23 @@
+# find() and sum() with a KEY callback over flat int / float arrays - one
+# callback call per element (the builtin-callback protocol, #97 CB4)
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var n = 500;
+var a = [];
+for (var i = 0; i < n; i++)
+    append(a, (i * 7919) % 1000);
+var f = [];
+for (var i = 0; i < n; i++)
+    append(f, i * 0.5);
+
+var reps = 1000 * scale;
+var s = 0;
+for (var r = 0; r < reps; r++) {
+    s = (s + sum(a, func(x) => x * x % 97)) % 1000000007;
+    s = (s + int(sum(f, func(x) => x * 3.0))) % 1000000007;
+    var k = find(a, (r * 13) % 1000, func(x) => x + 0);
+    s = (s + (k ?? 7)) % 1000000007;
+}
+print("result:", s);
