@@ -661,8 +661,11 @@ work — but profile it before building, the way increment 0 was.
         0.82x wall. The August rejection of the same idea did not
         reproduce on native hardware (backend-bound per top-down, a
         same-binary A/B -23% cycles); record in plans/top5-cpp-gap.md.
-        NEXT on the callback path: map/filter/find/sum's flat-array
-        arms passing raw elements (35 ~9x C++), then the post-call
+        ✅ **CB2 DONE 2026-09-25**: map/filter pass a flat array's raw
+        element - 35_map_filter -8.8% Ir, 0.92x wall (the map half;
+        map's result is general, so filter still boxes).
+        NEXT on the callback path: map's result storage (flat for an
+        all-int result), find/sum's flat arms, then the post-call
         release scan of seeded-but-scalar lambda params.
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).

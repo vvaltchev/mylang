@@ -508,6 +508,43 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
          * script code and may shrink the array under us; a count read
          * once indexed past its end. */
         for (size_type i = 0; i < arr.size(); i++) {
+            /* #97 CB2: a FLAT int/float/bool element goes to the callback
+             * RAW (VmInvoker::call_scalars binds it in place, no argv);
+             * filter boxes it only if it keeps it. The kind is re-read
+             * per step, like the size: the callback may promote the array
+             * (a non-scalar store), after which the general arm serves. */
+            const size_type at = arr.offset() + i;
+            switch (arr.skind()) {
+                case SharedArrayObj::Storage::ints: {
+                    const int_type v = arr.flat_ints()[at];
+                    EvalValue r = inv.call(v);
+                    if (!is_filter)
+                        result.emplace_back(std::move(r), ctx->const_ctx);
+                    else if (r.is_true())
+                        result.emplace_back(EvalValue(v), ctx->const_ctx);
+                    continue;
+                }
+                case SharedArrayObj::Storage::floats: {
+                    const float_type v = arr.flat_floats()[at];
+                    EvalValue r = inv.call(v);
+                    if (!is_filter)
+                        result.emplace_back(std::move(r), ctx->const_ctx);
+                    else if (r.is_true())
+                        result.emplace_back(EvalValue(v), ctx->const_ctx);
+                    continue;
+                }
+                case SharedArrayObj::Storage::bools: {
+                    const bool v = arr.flat_bools()[at] != 0;
+                    EvalValue r = inv.call(v);
+                    if (!is_filter)
+                        result.emplace_back(std::move(r), ctx->const_ctx);
+                    else if (r.is_true())
+                        result.emplace_back(EvalValue(v), ctx->const_ctx);
+                    continue;
+                }
+                default:
+                    break;
+            }
             /* e / r non-const so the kept one is MOVED into the result vector
              * (avoiding a per-element retain for a general/str/dyn element),
              * not copied (#60 Tier 1). e is passed to the callback FIRST,

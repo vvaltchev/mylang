@@ -25400,11 +25400,25 @@ static bool invoker_call_tiers()
           { "var g = make_array(40, func(i) { return i * 3; });",
             "assert(g[39] == 117);" },
           ExecEngine::Vm, true, 40, true },
-        /* map over already-boxed elements, still the prepared entry. */
-        { "map callback, VM engine",
+        /* map over a FLAT int array: the raw element (#97 CB2) */
+        { "map callback over flat ints, VM engine",
           { fill,
             "var m = map(func(x) { return x + 1; }, a);",
             "assert(m[29] == 2);" },
+          ExecEngine::Vm, true, 30, true },
+        /* ...and filter over flat floats */
+        { "filter callback over flat floats, VM engine",
+          { "var f = []; for (var i = 0; i < 30; i++) { append(f, i + 0.5); }",
+            "var k = filter(func(x) { return x > 10.0; }, f);",
+            "assert(len(k) == 20 && k[0] == 10.5);" },
+          ExecEngine::Vm, true, 30, true },
+        /* map over a GENERAL (mixed) array: already-boxed elements, still
+         * the prepared entry, never raw */
+        { "map callback over boxed elements, VM engine",
+          { "var g = []; for (var i = 0; i < 30; i++) { append(g, i); }",
+            "var dyn gg = dynarray(g);",
+            "var m = map(func(x) { return x; }, gg);",
+            "assert(m[29] == 29);" },
           ExecEngine::Vm, true, 30, false },
         /* THE FALLBACK: the tree-walker has no activation, so there is no
          * window to prepare and every element goes through eval_func. Same
