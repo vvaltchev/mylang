@@ -593,6 +593,45 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# The ANALYSIS DUMPS over a folded TYPE QUERY. `typestr`/`kindstr`/
+# `type`/`decltype` fold at inference time by REPLACING their argument
+# with the folded literal - and the argument used to be FREED while the
+# inferencer still keyed its identifiers (id_sym), its calls and its
+# lambdas by node address. `-dti` and `-a` then ITERATE id_sym and read
+# the freed nodes: a heap-use-after-free under ASan, a wild vtable read
+# without it. The argument now stays alive for the inferencer's
+# lifetime (`retired`), so its uses are real, listed occurrences.
+# `-rt` cannot see this: no in-process test runs a dump. The ASan lane
+# runs this file, which is what makes the case a net.
+cat > "$TMP/tq.my" <<'TQEOF'
+var x = 3;
+var a = [1, 2];
+print(typestr(x));
+print(kindstr(a));
+print(typestr(x + len(a)));
+print(typestr(func(int k) { return k + x; }));
+var dyn t = type(a);
+print(decltype(x));
+TQEOF
+for f in -dti "-a --no-color" -dcs -s; do
+    # shellcheck disable=SC2086
+    out=$("$BIN" $f "$TMP/tq.my" 2>&1)
+    if [ $? != 0 ]; then
+        fail "$f over a folded type query exited non-zero:
+$out"
+    else
+        pass "$f over a folded type query"
+    fi
+done
+out=$("$BIN" -dti "$TMP/tq.my" 2>&1)
+if ! printf '%s\n' "$out" | grep -Eq '^ti	x	.*	1:5,3:15'; then
+    fail "-dti lost the use of x INSIDE a folded typestr(x):
+$out"
+else
+    pass "-dti lists a use inside a folded type query"
+fi
+
+# ---------------------------------------------------------------------
 # -nti (#51): with type inference off, the VM codegen refused every user
 # call that reached it (NotLoweredEx: it lowered a call only on a TYPE
 # proof), while the tree-walker ran the program. A flag is the driver's,

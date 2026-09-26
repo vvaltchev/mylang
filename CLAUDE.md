@@ -3735,8 +3735,15 @@ decisions behind it: `plans/archived/type-inference.md`,
   elem/key/val are read with optional chaining `?.`, or narrowed with `if`);
   `typestr(x)`/`kindstr(x)` are the cheap string forms. The arg-slot
   rewrite (not a whole-node replacement) needs no slot-based inferencer walk
-  (`args->elems` is a direct vector). The `?`-suffix nullability format
-  (`static_type_to_string`) matches `:type` and error messages.
+  (`args->elems` is a direct vector). ⛔ The replaced argument is
+  RETIRED (`Inferencer::retired`, alive as long as the inferencer), NEVER
+  freed: its identifiers, calls and lambdas are keys in `id_sym` /
+  `func_of_decl` / the callee-set maps, and `-dti` / `-a` ITERATE
+  `id_sym` - freeing it was a heap-use-after-free in both dumps
+  (`driver_checks.sh` runs them over a folded query). A pass that cuts
+  a subtree out of the tree while those maps are live does the same.
+  The `?`-suffix nullability format (`static_type_to_string`) matches
+  `:type` and error messages.
 - **Nullable `?` suffix, `~` short form, `null` alias.** `?` is a token
   (`Op::questionmark`, `operators.h`) that is the canonical short form of `opt`:
   `int? x` ≡ `opt int x`, `var? x`, `dyn? x`, `array? a`. `pAcceptDeclPrefix` is
