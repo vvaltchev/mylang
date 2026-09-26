@@ -865,9 +865,13 @@ kind re-read per step, like the #49 size, since the callback may
 promote the array). 35_map_filter -8.8% Ir (289M -> 264M), **0.92x**
 wall - from the `map` half only: `map` returns a GENERAL array even for
 an all-int result, so `filter` still walks boxed elements.
-**Open siblings:** `map`'s result storage (a flat result for a proven
-array<int> - the make_array precedent - would put `filter` on the raw
-path too); find/sum still pass boxed elements. The post-call ref_slots release scan (26 Ir per call
+**CB3 (same day): map/filter build a FLAT result for a destination
+proven array<int>/<float>/<bool>** (the call's ArrHint, carried in
+MapFilterV's target2 bits 1-2; myv v23). Now every one of 35's 1M
+callbacks binds raw: **35_map_filter 289M -> 225M Ir (-22%), 0.50x
+wall** against the pre-CB2 tree - more than the Ir, since the flat
+result also drops a boxed array's construction and walk.
+**Open siblings:** find/sum still pass boxed elements. The post-call ref_slots release scan (26 Ir per call
 on 34, two int params seeded as references because a lambda's params
 are never C3-proven) is the next measured cost.
 

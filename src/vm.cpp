@@ -6309,9 +6309,10 @@ extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
         ctx->frame->at(dst).put(
             vm_map_filter(ctx, ctx->frame->at(fn_slot).get(),
                           ctx->frame->at(cont_slot).get(),
-                          is_map != 0, Loc(), Loc(),
+                          (is_map & 1) != 0, Loc(), Loc(),
                           Loc(static_cast<int>(site >> 32),
-                              static_cast<int>(site & 0xffffffff))));
+                              static_cast<int>(site & 0xffffffff)),
+                          static_cast<int>((is_map >> 1) & 3)));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -12819,7 +12820,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             ctx.frame->at(in->target).put(
                 vm_map_filter(&ctx, ctx.frame->at(in->a_slot()).get(),
                               ctx.frame->at(in->b_slot()).get(),
-                              in->target2 != 0, s, en, s));
+                              (in->target2 & 1) != 0, s, en, s,
+                              static_cast<int>((in->target2 >> 1) & 3)));
             pc++;
         }
         VM_NEXT;

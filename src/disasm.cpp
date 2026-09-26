@@ -2007,9 +2007,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << "  ; throw if not a function";
             break;
         case OpCode::MapFilterV:
-            row << (in.target2 ? "filter       " : "map          ")
+            row << ((in.target2 & 1) ? "filter       " : "map          ")
                 << D(in.target) << " = " << RI(in.a(), false) << "("
                 << RI(in.b(), false) << ")";
+            if ((in.target2 >> 1) & 3)
+                row << "  ; flat "
+                    << ((((in.target2 >> 1) & 3) == 1) ? "int"
+                        : (((in.target2 >> 1) & 3) == 2) ? "float" : "bool");
             break;
         case OpCode::ReturnV:
             row << "return.v     " << RI(in.a(), false);

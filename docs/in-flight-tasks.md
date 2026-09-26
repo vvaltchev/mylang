@@ -664,9 +664,11 @@ work — but profile it before building, the way increment 0 was.
         ✅ **CB2 DONE 2026-09-25**: map/filter pass a flat array's raw
         element - 35_map_filter -8.8% Ir, 0.92x wall (the map half;
         map's result is general, so filter still boxes).
-        NEXT on the callback path: map's result storage (flat for an
-        all-int result), find/sum's flat arms, then the post-call
-        release scan of seeded-but-scalar lambda params.
+        ✅ **CB3 DONE 2026-09-25**: map/filter build a flat result for a
+        proven flat destination (myv v23) - 35_map_filter -22% Ir,
+        **0.50x wall**.
+        NEXT on the callback path: find/sum's flat arms, then the
+        post-call release scan of seeded-but-scalar lambda params.
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
 

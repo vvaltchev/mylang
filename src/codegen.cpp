@@ -3886,7 +3886,10 @@ struct Codegen {
         in.op = OpCode::MapFilterV;
         in.node_idx = add_ast_node(dc->args->elems[1].get());    /* arg1's caret (container) */
         in.target = dst;
-        in.target2 = dc->map_filter_kind == 2 ? 1 : 0;   /* is_filter */
+        /* bit 0 = is_filter; bits 1-2 = the flat result kind (#97 CB3,
+         * map_filter_flat_hint) */
+        in.target2 = (dc->map_filter_kind == 2 ? 1 : 0)
+                   | (map_filter_flat_hint(dc->args->arr_hint) << 1);
         in.set_a(slot_op(t0));
         in.set_b(slot_op(t1));
         ops.push_back(in);
