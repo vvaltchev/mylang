@@ -16708,6 +16708,44 @@ print(drive(runtime(4)));)",
     return s;
 }
 print(drive(runtime(4)));)",
+        /* #38 repro C: a STORE whose carets live in a pool (chain_locs,
+         * member_keys) carries no node, so the op recorded no inlined-at
+         * chain and the VM rendered NO backtrace at all for a write
+         * through a block-inlined function's parameter into a const -
+         * one program per pooled store family */
+        R"(const D = {"a": [1, 2]};
+func g(d) { d["a"][0] = 9; }
+func drive(int n) {
+    var m = {"a": [5, 6]};
+    for (var i = 0; i < n; i++) { if (i == 2) g(D); else g(m); }
+    return n;
+}
+print(drive(runtime(4)));)",
+        R"(const D = {"a": {"b": 1}};
+func g(d) { d.a.b = 5; }
+func drive(int n) {
+    var m = {"a": {"b": 2}};
+    for (var i = 0; i < n; i++) { if (i == 2) g(D); else g(m); }
+    return n;
+}
+print(drive(runtime(4)));)",
+        R"(struct P { int x; int y; }
+const C = P(1, 2);
+func g(p) { p.x = 5; }
+func drive(int n) {
+    var m = P(runtime(3), 4);
+    for (var i = 0; i < n; i++) { if (i == 2) g(C); else g(m); }
+    return n;
+}
+print(drive(runtime(4)));)",
+        R"(func g(p) { p[0][9] = 1; }
+func drive(int n) {
+    var m = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]];
+    var s = [[1]];
+    for (var i = 0; i < n; i++) { if (i == 2) g(s); else g(m); }
+    return n;
+}
+print(drive(runtime(4)));)",
     };
     std::vector<std::string> corpus(std::begin(progs), std::end(progs));
     /* the fib-unroll shape at every depth the unroll distinguishes */

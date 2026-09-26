@@ -1,0 +1,9 @@
+# the member-chain store family (#38 repro C)
+const D = {"a": {"b": 1}};
+func g(d) { d.a.b = 5; }
+func drive(int n) {
+    var m = {"a": {"b": 2}};
+    for (var i = 0; i < n; i++) { if (i == 2) g(D); else g(m); }
+    return n;
+}
+print(drive(runtime(4)));

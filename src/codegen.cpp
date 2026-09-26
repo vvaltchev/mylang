@@ -773,6 +773,94 @@ struct Codegen {
 
     int here() const { return static_cast<int>(code.size()); }
 
+    /*
+     * The INHERITED inlined-at chain (CgInstr::inl). The six compile_*
+     * dispatchers and gen_stmt wrap their _impl: every op the node's
+     * compilation appended that has no chain yet takes the node's. The
+     * innermost dispatcher returns first, so the innermost tagged node
+     * wins - the chain the tree-walker's Construct::eval flushes. An op
+     * whose carets live in a pool (StoreElem2V, StoreElemChainV, the
+     * member-key ops, ...) has no node of its own, and dropped every
+     * virtual frame of an inlined callee (a const dict written through
+     * a block-inlined function's parameter printed no backtrace at all).
+     */
+    static void inherit_inline(const Construct *n, std::vector<CgInstr> &ops,
+                               size_t mark)
+    {
+        if (!n || !n->inline_ctx)
+            return;
+        for (size_t i = mark; i < ops.size(); i++)
+            if (!ops[i].inl)
+                ops[i].inl = n->inline_ctx;
+    }
+
+    bool compile_boxed_expr(const Construct *e, int &out_slot,
+                            std::vector<CgInstr> &ops,
+                            bool allow_typed = true,
+                            bool truthy_only = false)
+    {
+        const size_t mark = ops.size();
+        const bool ok = compile_boxed_expr_impl(e, out_slot, ops,
+                                                allow_typed, truthy_only);
+        if (ok)
+            inherit_inline(e, ops, mark);
+        return ok;
+    }
+
+    bool compile_boxed_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    {
+        const size_t mark = ops.size();
+        const bool ok = compile_boxed_stmt_impl(s, ops);
+        if (ok)
+            inherit_inline(s, ops, mark);
+        return ok;
+    }
+
+    bool compile_int_expr(const Construct *e, Operand &out,
+                          std::vector<CgInstr> &ops)
+    {
+        const size_t mark = ops.size();
+        const bool ok = compile_int_expr_impl(e, out, ops);
+        if (ok)
+            inherit_inline(e, ops, mark);
+        return ok;
+    }
+
+    bool compile_int_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    {
+        const size_t mark = ops.size();
+        const bool ok = compile_int_stmt_impl(s, ops);
+        if (ok)
+            inherit_inline(s, ops, mark);
+        return ok;
+    }
+
+    bool compile_float_expr(const Construct *e, Operand &out,
+                            std::vector<CgInstr> &ops)
+    {
+        const size_t mark = ops.size();
+        const bool ok = compile_float_expr_impl(e, out, ops);
+        if (ok)
+            inherit_inline(e, ops, mark);
+        return ok;
+    }
+
+    bool compile_float_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    {
+        const size_t mark = ops.size();
+        const bool ok = compile_float_stmt_impl(s, ops);
+        if (ok)
+            inherit_inline(s, ops, mark);
+        return ok;
+    }
+
+    void gen_stmt(const Construct *s)
+    {
+        const size_t mark = code.size();
+        gen_stmt_impl(s);
+        inherit_inline(s, code, mark);
+    }
+
     /* CODEGEN-SCRATCH node registry: `Instr::node_idx` indexes it - the
      * splice-stable handle an op uses to reach its node before its final pc
      * is known (ops grow + roll back; an index survives that where a pc
@@ -1186,7 +1274,7 @@ struct Codegen {
      * into a slot, which is precisely what the preamble is trying to avoid
      * doing - so skipping it is the intent, not a workaround.
      */
-    bool compile_boxed_expr(const Construct *e, int &out_slot,
+    bool compile_boxed_expr_impl(const Construct *e, int &out_slot,
                             std::vector<CgInstr> &ops,
                             bool allow_typed = true,
                             bool truthy_only = false)
@@ -2467,7 +2555,8 @@ struct Codegen {
         return true;
     }
 
-    bool compile_boxed_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    bool compile_boxed_stmt_impl(const Construct *s,
+                                 std::vector<CgInstr> &ops)
     {
         /* A global `g++`/`g--` or closure-capture `cap++`/`cap--` statement ->
          * a compound StoreGlobalV/StoreCaptureV (x += 1 / x -= 1). A LOCAL
@@ -4821,7 +4910,7 @@ struct Codegen {
         ops.push_back(st);
     }
 
-    bool compile_int_expr(const Construct *e, Operand &out,
+    bool compile_int_expr_impl(const Construct *e, Operand &out,
                           std::vector<CgInstr> &ops)
     {
         if (as_int_operand(e, out))
@@ -5232,7 +5321,8 @@ struct Codegen {
      * `x = <definitely-int expr>`. Returns false otherwise (a plain assign of a
      * bare/ bool rhs, a decl, a call, ...) so the loop falls back.
      */
-    bool compile_int_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    bool compile_int_stmt_impl(const Construct *s,
+                               std::vector<CgInstr> &ops)
     {
         if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
             Operand dst;
@@ -5767,7 +5857,7 @@ struct Codegen {
      * FloatBin writes a float slot. No bool-safety concern - a float
      * destination is never a bool slot. */
 
-    bool compile_float_expr(const Construct *e, Operand &out,
+    bool compile_float_expr_impl(const Construct *e, Operand &out,
                             std::vector<CgInstr> &ops)
     {
         if (as_float_operand(e, out))
@@ -5980,7 +6070,8 @@ struct Codegen {
         return true;
     }
 
-    bool compile_float_stmt(const Construct *s, std::vector<CgInstr> &ops)
+    bool compile_float_stmt_impl(const Construct *s,
+                                 std::vector<CgInstr> &ops)
     {
         if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
             const Identifier *id =
@@ -7909,7 +8000,7 @@ struct Codegen {
                 gen_stmt(e.get());
     }
 
-    void gen_stmt(const Construct *s)
+    void gen_stmt_impl(const Construct *s)
     {
         /* Native-first: the register machine applies to top-level AND
          * function-body statements, not only loop bodies. A resolved-local
@@ -8137,6 +8228,26 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         const Construct *locnode = node_at(in.loc_node_idx);
         in.loc_node_idx = -1;
         /*
+         * P8 Inc 4 + #38: an op spliced from an INLINED body records that
+         * body's inlined-at chain (FLATTENED into inline_frames), so a
+         * backtrace crossing it shows the virtual frames. The op's OWN
+         * node's chain when it has one, else the chain INHERITED from the
+         * innermost compiled node it was emitted for (CgInstr::inl) - an
+         * op whose carets live in a pool carries no node, and the
+         * tree-walker reaches the frames through any tagged ancestor.
+         * Read + cleared UNCONDITIONALLY, before any bail; pc-ascending,
+         * so inline_ctxs stays sorted.
+         */
+        {
+            const InlineCtx *ic =
+                (node && node->inline_ctx) ? node->inline_ctx : in.inl;
+            in.inl = nullptr;
+            if (ic)
+                chunk.inline_ctxs.push_back(
+                    {static_cast<uint32_t>(pc),
+                     intern_inline_ctx(ic, chunk, inline_memo)});
+        }
+        /*
          * #127: the store BASE's caret -> base_locs. Read + cleared
          * UNCONDITIONALLY and BEFORE the `!node` bail, for the same reason the
          * loc twin above is: a peephole fusion copies the source struct, and a
@@ -8210,15 +8321,6 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
             in.node_idx = -1;
             continue;
         }
-        /* P8 Inc 4: an op spliced from an INLINED body records that body's
-         * inlined-at chain (FLATTENED into inline_frames), so a backtrace
-         * crossing it shows the virtual frames. Recorded BEFORE the switch nulls
-         * the node; pc-ascending, so inline_ctxs stays sorted. (Rare - only
-         * inlined ops have one.) */
-        if (node->inline_ctx)
-            chunk.inline_ctxs.push_back(
-                {static_cast<uint32_t>(pc),
-                 intern_inline_ctx(node->inline_ctx, chunk, inline_memo)});
         switch (in.op) {
         case OpCode::IntBin:
         case OpCode::FloatBin:
@@ -8397,6 +8499,7 @@ static void verify_ast_free(const std::vector<CgInstr> &code)
         ML_CHECK(in.node_idx == -1);
         ML_CHECK(in.loc_node_idx == -1);   /* #76: the loc twin too */
         ML_CHECK(in.base_node_idx == -1);  /* #127: the base-caret twin */
+        ML_CHECK(in.inl == nullptr);       /* #38: the inherited chain */
         /* #97 E1: not an AST handle, but the same "consumed exactly once"
          * invariant - a stamp still set here never reached value_callees,
          * so the site would silently lose its baked callee. */

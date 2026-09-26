@@ -1,0 +1,10 @@
+# a const struct's field written through an inlined parameter (#38 C)
+struct P { int x; int y; }
+const C = P(1, 2);
+func g(p) { p.x = 5; }
+func drive(int n) {
+    var m = P(runtime(3), 4);
+    for (var i = 0; i < n; i++) { if (i == 2) g(C); else g(m); }
+    return n;
+}
+print(drive(runtime(4)));

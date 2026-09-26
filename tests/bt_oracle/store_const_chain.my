@@ -1,0 +1,11 @@
+# a write into a const through a block-inlined function's parameter: the
+# chain store's carets live in a pool, so the op carried no inlined-at
+# chain and the VM rendered no backtrace at all (#38 repro C)
+const D = {"a": [1, 2]};
+func g(d) { d["a"][0] = 9; }
+func drive(int n) {
+    var m = {"a": [5, 6]};
+    for (var i = 0; i < n; i++) { if (i == 2) g(D); else g(m); }
+    return n;
+}
+print(drive(runtime(4)));

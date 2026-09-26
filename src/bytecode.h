@@ -1548,6 +1548,17 @@ struct CgInstr : Instr {
      * pc. */
     int32_t callee_def_idx = -1;
     int32_t callee_def_idx2 = -1;
+    /*
+     * The INHERITED inlined-at chain: the chain of the innermost compiled
+     * AST node (statement or expression) this op was emitted for. An op
+     * whose carets live in a POOL (chain_locs, member_keys, ...) carries
+     * no node, so without this it recorded no inline_ctxs entry and a
+     * throw from it lost every virtual frame the tree-walker renders -
+     * which reaches them through ANY tagged ancestor's Construct::eval,
+     * not only the op's own node. extract_locs uses it when the op's
+     * node has no chain of its own. Codegen-transient like node_idx.
+     */
+    const InlineCtx *inl = nullptr;
     CgInstr() = default;
     CgInstr(const Instr &i) : Instr(i) {}
 };
