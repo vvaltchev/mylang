@@ -923,6 +923,20 @@ static const std::vector<test> tests =
         "var b = [3, 1, 2];",
         "sort(b, func(q, r) { return q < r ? \"y\" : \"\"; });",
         "assert(b[0] == 1 && b[2] == 3);" } },
+    /* #97 CB8: the boundary return copies an UNLISTED result as payload
+     * + type only. A builtin value is 16 bytes and trivial, so a slot
+     * holding one must stay ref-listed and take the full copy - a
+     * callback returning a builtin, called through the value it returned,
+     * is the shape that fails if it does not. */
+    { "callback: a callback returning a BUILTIN keeps the whole value",
+      { "var fs = map(func(x) { var dyn r = min; if (x > 1) { r = max; } "
+        "return r; }, [1, 2, 3]);",
+        "var dyn g = fs[2];",
+        "var dyn h = fs[0];",
+        "assert(g([4, 9, 2]) == 9 && h([4, 9, 2]) == 2);",
+        "var ks = map(func(x) => x > 1 ? len : abs, [1, 2]);",
+        "var dyn l = ks[1];",
+        "assert(l([7, 7, 7]) == 3);" } },
     { "coerce: a param fed only its final type stays unstamped (fast_bind)",
       { "var b = 2;",
         "var f = func [b] (x) { return x; };",

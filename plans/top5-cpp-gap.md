@@ -908,8 +908,19 @@ so treat those two numbers as UNCONFIRMED until a second session
 reproduces them. Pinned by a refcount() test (a predicate returning a
 captured array leaves its count unchanged; watched failing in every VM
 mode with the in-place release removed).
-**Remaining on 34, per comparison:** ~36 Ir in the emitted body and
-the entry bookkeeping around `jit_enter`.
+**CB8 (same day): the ReturnV BOUNDARY arm copies an unlisted result
+as 2 words.** jitprofile of 34's comparator: 9 of its 36 Ir compute
+`p < q`, 27 are the boundary return - which copied the result slot into
+flow->value as four qwords. An unlisted result slot is written only by
+a scalar-producing op (`op_writes_scalar`: never a builtin, whose value
+is 16 bytes and trivial), so payload + type is the whole value - the
+frameless arm's existing rule. Ir: 34 -2.6%, 35 -2.1%, 96 -1.6%
+(wall not timed: cheap instructions). Pinned by a 5-mode test whose
+callbacks RETURN builtins; with the 2-word copy forced onto a listed
+slot both JIT modes raise InternalErrorEx (the lost second word).
+**Remaining on 34, per comparison:** the result's store into the dead
+temp before the copy, the arm's frame checks, and the C++ entry
+bookkeeping around `jit_enter` (~78 Ir in call_scalars_test).
 
 ### An unrelated observation, NOT chased
 
