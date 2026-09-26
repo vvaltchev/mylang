@@ -825,6 +825,34 @@ static const std::vector<test> tests =
         "c(runtime(0));" },
       &typeid(DivisionByZeroEx), 29, 2, 35, 2 },
 
+    /*
+     * #38 repro C: an N-level store (StoreElemChainV) whose INTERMEDIATE
+     * step yields a VALUE - a read-only const reached through a parameter,
+     * a scalar element - used to refuse AT that step (NotLValueEx carets
+     * `p[1]`), where the tree-walker keeps walking the value and fails at
+     * the FINAL store (NotLValueEx at the whole lvalue) or at the step
+     * that indexes the scalar (its own TypeErrorEx). Watched failing: the
+     * old step refusal restored fails all four in every VM mode.
+     */
+    { "err loc: a 3-level store into a const carets the WHOLE lvalue",
+      { "const C = [[[1]], [[2]]];",
+        "func g(p) { p[1][0][0] = 7; }",
+        "g(C);" },
+      &typeid(NotLValueEx), 13, 2, 24, 2 },
+    { "err loc: a 3-level COMPOUND store into a const, the whole lvalue",
+      { "const C = [[[1]], [[2]]];",
+        "func g(p) { p[1][0][0] += 7; }",
+        "g(C);" },
+      &typeid(NotLValueEx), 13, 2, 24, 2 },
+    { "err loc: a chain store indexing a SCALAR element: its TypeError",
+      { "var dyn a = runtime([[1, 2]]);",
+        "a[0][1][0] = 3;" },
+      &typeid(TypeErrorEx), 1, 2, 12, 2 },
+    { "err loc: a 4-level chain store indexing a scalar, at that step",
+      { "var dyn a = runtime([[[1, 2]]]);",
+        "a[0][0][1][0] = 3;" },
+      &typeid(TypeErrorEx), 1, 2, 15, 2 },
+
     { "err loc: a typed a[i].field OOB marks the SUBSCRIPT, not the field",
       { "struct P { int x; int y; }",
         "func f(int i) { var r = [P(1,2)]; var a = 0; a += r[i].y; return a; }",

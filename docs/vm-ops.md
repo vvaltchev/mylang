@@ -395,7 +395,12 @@ AST-free with **PER-STEP subscript carets** in the **`Chunk::chain_locs`** pool
 the hot store stays cheap): an INTERMEDIATE `a[9]` OOB carets the inner
 subscript, the FINAL store the outer — byte-identical to the tree-walker's
 per-node stamp (this replaced an earlier single-outer-loc imprecision where an
-inner throw showed the whole `a[i][j]` span). **A store's base may be a GLOBAL
+inner throw showed the whole `a[i][j]` span). An intermediate step that yields
+a VALUE - a read-only const reached through a parameter, a scalar element -
+does NOT fail at that step: the walk continues on the value, exactly like the
+tree-walker's chained `Subscript::do_eval`, so a read-only inner fails at the
+FINAL store (NotLValueEx at the whole lvalue) and a scalar with its own
+TypeErrorEx at the step that indexes it (#38 repro C). **A store's base may be a GLOBAL
 or CAPTURE container**, not only a
 frame local: `as_container_base` (codegen) returns a slot **KIND** (0 local / 1
 global / 2 capture) which the store ops carry in `in.target`, and

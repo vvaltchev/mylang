@@ -4051,9 +4051,20 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
      * KeyNotFound is stamped here. The FINAL store's throws are loc-less and the
      * CALLER stamps them the outer/side-table loc (== the outermost subscript
      * = steplocs[nkeys-1]). */
+    /*
+     * An intermediate step may yield a VALUE rather than an element LValue -
+     * a READ-ONLY container (a const, reached through a parameter) hands out
+     * rvalues, and so does a flat element. The walk CONTINUES on the value,
+     * exactly like the tree-walker's chained Subscript::do_eval: a read-only
+     * inner is only refused at the FINAL store (NotLValueEx at the whole
+     * lvalue), and a scalar raises its own TypeErrorEx at the step that
+     * indexes it. Refusing at the step (as this did) carets `p[1]` where the
+     * tree-walker carets `p[1][0][0]` - a RULE 2 break (#38).
+     */
     for (size_t k = 0; k + 1 < nkeys; k++) {
         const Loc ks = steplocs[k].first, ke = steplocs[k].second;
-        Type *t = cur.get<LValue *>()->get().get_type();
+        Type *t = cur.is<LValue *>()
+            ? cur.get<LValue *>()->get().get_type() : cur.get_type();
         EvalValue next;
         try {
             next = t->subscript(cur, keys[k], /*for_write=*/false);
@@ -4061,15 +4072,13 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
             if (!e.loc_start) { e.loc_start = ks; e.loc_end = ke; }
             throw;
         }
-        if (!next.is<LValue *>())         /* a flat scalar can't be indexed */
-            throw NotLValueEx(ks, ke);
         cur = std::move(next);
     }
 
     const Loc fs = steplocs[nkeys - 1].first, fe = steplocs[nkeys - 1].second;
-    LValue *inner = cur.get<LValue *>();
+    LValue *inner = cur.is<LValue *>() ? cur.get<LValue *>() : nullptr;
     SharedArrayObj *arr;
-    if (flat_writable_array(inner, arr)) {
+    if (inner && flat_writable_array(inner, arr)) {
         EvalValue fout;
         if (flat_store_core(inner, *arr, keys[nkeys - 1], value, op,
                             fout, fs, fe, fs, fe))
@@ -4078,7 +4087,7 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
     /* The FINAL store's throws (subscript OOB/KeyNotFound, slot_rmw type) are
      * loc-less; stamp them the OUTERMOST subscript's caret. */
     try {
-        Type *t = inner->get().get_type();
+        Type *t = inner ? inner->get().get_type() : cur.get_type();
         const bool for_write = (op == Op::assign);
         EvalValue elv = t->subscript(cur, keys[nkeys - 1], for_write);
         if (!elv.is<LValue *>())
