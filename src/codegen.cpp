@@ -60,6 +60,11 @@ CodegenLiveDescs::~CodegenLiveDescs()
     g_live_descs = nullptr;
 }
 
+/* the pc-field table (defined with the peephole below) - the argument
+ * staging retarget asks it whether an element's code JOINS */
+template <typename F>
+static void visit_pc_fields(Instr &in, F f);
+
 namespace {
 
 /*
@@ -3124,12 +3129,34 @@ struct Codegen {
                              std::vector<CgInstr> &ops)
     {
         const int sub = next_temp;
+        const size_t start = ops.size();
         int out;
         if (!compile_boxed_expr(e, out, ops))
             return false;
+        /*
+         * ⛔ The retarget below rewrites the LAST producer on the premise
+         * that it is the value's ONLY one. A JOIN breaks that: when some
+         * branch of this element's code lands PAST the last op, another
+         * arm wrote `out` and skips the rewritten producer. The TYPED
+         * ternary ends its else arm on a LoadImm - a whitelisted op - so
+         * `g(1, i == 2 ? int(runtime(-5)) : 1)` staged the literal arm
+         * into the argument slot while the other arm kept writing the
+         * dead temp: the call saw the literal on BOTH paths (a wrong
+         * answer in the default engine; the tree-walker said -6, the VM
+         * 12). Table-free on purpose: the whitelist is an OPCODE fact,
+         * this is a CONTROL-FLOW one, and asking the code itself cannot
+         * go stale the way the MoveV / LogV exclusions each had to be
+         * learned (op_writes_pure_target's note).
+         */
+        bool joins = false;
+        for (size_t k = start; k < ops.size() && !joins; k++)
+            visit_pc_fields(ops[k], [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) >= ops.size())
+                    joins = true;
+            });
         if (out == dst) {
             /* already in place */
-        } else if (out >= temp_base && !ops.empty()
+        } else if (!joins && out >= temp_base && !ops.empty()
                    && ops.back().target == out
                    && op_writes_pure_target(ops.back().op)) {
             ops.back().target = dst;

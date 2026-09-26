@@ -5920,6 +5920,33 @@ static const std::vector<test> tests =
         "assert(str(s > 1 || s < 0) == \"true\");",
         "assert(str(s > 5 || s < 0) == \"false\");",
         "assert(str(s > 5 && s < 6 && s > 0) == \"false\");" } },
+    /* The same JOIN, through the TYPED ternary: its else arm ends on a
+     * LoadImm (a whitelisted producer), so as a call ARGUMENT only that
+     * arm was retargeted into the argument slot and the call saw the
+     * literal on both paths - `g(1, i == 2 ? int(runtime(-5)) : 1)`
+     * summed 12 where the tree-walker summed -6, in the DEFAULT engine.
+     * The callee has a LOOP so the AST inliner leaves the call a call
+     * (a spliced body has no argument run); the literal arm must be the
+     * ELSE arm, the one written last; and a USER call, since a builtin's
+     * argument run is staged the same way but was the one pinned above.
+     * compile_to_run_slot now declines the retarget when any branch in
+     * the element's code lands past its last op. */
+    { "typed ternary in an argument: both arms reach the call",
+      { "func g(int v, int k) {",
+        "    var s = 0;",
+        "    for (var j = 0; j < 3; j++) s = s + v * k;",
+        "    return s;",
+        "}",
+        "func drive(int n) {",
+        "    var s = 0;",
+        "    for (var i = 0; i < n; i++)",
+        "        s = s + g(1, i == 2 ? int(runtime(-5)) : 1);",
+        "    return s;",
+        "}",
+        "assert(drive(runtime(4)) == -6);",
+        "var f = float(runtime(2.5));",
+        "assert(g(1, f > 2.0 ? 4 : int(runtime(9))) == 12);",
+        "assert(g(1, f < 2.0 ? int(runtime(9)) : 4) == 12);" } },
     /* Incompatible-arm ternary -> dyn (a runtime variant), not a null
      * static type. The null used to escape type_of into contribute's
      * is_dyn - a SEGFAULT (pre-existing; found by the lever-1 step-5
