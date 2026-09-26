@@ -655,6 +655,15 @@ work — but profile it before building, the way increment 0 was.
         the callee's entry offset, the `norec_ok` fork and its
         high-water gate, the captures relay, the boxed four-qword
         argument copy (fib$0: 144 Ir per call, the site 74).
+        ✅ **CB1 DONE 2026-09-25 (the maintainer: the callback
+        protocol next)**: the raw scalar callback bind
+        (`VmInvoker::call_scalars`) - 34_sort_custom_cmp -16.1% Ir,
+        0.82x wall. The August rejection of the same idea did not
+        reproduce on native hardware (backend-bound per top-down, a
+        same-binary A/B -23% cycles); record in plans/top5-cpp-gap.md.
+        NEXT on the callback path: map/filter/find/sum's flat-array
+        arms passing raw elements (35 ~9x C++), then the post-call
+        release scan of seeded-but-scalar lambda params.
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
 

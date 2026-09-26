@@ -306,6 +306,26 @@ public:
     EvalValue &operator=(EvalValue &&other);
     ~EvalValue();
 
+    /* #97 callback bind: overwrite a TRIVIAL value with a scalar in place
+     * - no destroy/copy dispatch, since the old value owns nothing
+     * (asserted). A bool zeroes the whole ival first, like EvalValue(bool),
+     * so reading the slot as the int 0/1 stays valid. */
+    void set_trivial_int(int_type v) {
+        ML_CHECK(type->t < Type::t_str);
+        val.ival = v;
+        type = AllTypes[Type::t_int];
+    }
+    void set_trivial_float(float_type v) {
+        ML_CHECK(type->t < Type::t_str);
+        val.ldval = v;
+        type = AllTypes[Type::t_float];
+    }
+    void set_trivial_bool(bool v) {
+        ML_CHECK(type->t < Type::t_str);
+        val.ival = v ? 1 : 0;
+        type = AllTypes[Type::t_bool];
+    }
+
     Type *get_type() const {
         return type;
     }
@@ -857,6 +877,28 @@ public:
      * inline borrow (it writes 1 there) and the arm's skip (it tests it) */
     const bool &jit_borrowed_probe() const { return borrowed; }
     const EvalValue &get() const { return val; }
+    /* #97 callback bind (VmInvoker::call_scalars): a window slot a raw
+     * scalar bind may overwrite in place - it holds nothing to release
+     * and is not borrowed. The binds are rebind() for a scalar, minus the
+     * EvalValue assignment's type dispatch. */
+    bool raw_bindable() const {
+        return val.get_type()->t < Type::t_str && !borrowed;
+    }
+    void bind_scalar_raw(int_type v) {
+        val.set_trivial_int(v);
+        container = nullptr;
+        is_const = false;
+    }
+    void bind_scalar_raw(float_type v) {
+        val.set_trivial_float(v);
+        container = nullptr;
+        is_const = false;
+    }
+    void bind_scalar_raw(bool v) {
+        val.set_trivial_bool(v);
+        container = nullptr;
+        is_const = false;
+    }
     EvalValue get_rval() const { return val; }
     Type *valtype() const { return val.get_type(); }
 

@@ -833,6 +833,40 @@ TWO MORE TRAPS WORTH KEEPING, both cost real time:
    bench 34 fills its array with an LCG containing `x % 2147483647`, so
    most of that "win" belonged to the previous commit.
 
+### ⛔ REOPENED AND LANDED (2026-09-25, #97): THE AUGUST LOSS DOES NOT REPRODUCE
+
+Re-measured on native hardware (Intel Core Ultra 9 285T, pinned to a
+P-core) with the top-down counters this box has and WSL2 did not:
+
+ - **34 is BACKEND-bound, not front-end-bound**: retiring ~44%,
+   backend ~51% (memory only ~1.6% - core-bound), front-end ~2%, bad
+   speculation ~2%. The August diagnosis ("front-end / code layout")
+   was a guess the old box could not test, and it was wrong here.
+ - **Same-binary A/B**: the raw two-int bind behind an environment
+   switch, so both arms ran from ONE binary with IDENTICAL code layout
+   - off 761M Ir / ~594M cycles, on 575M Ir / ~456M cycles (-24.5% /
+   -23%), the top-down split unchanged (proportional work removed).
+ - **Wall clock**, interleaved `--baseline` against the unmodified tree:
+   **34_sort_custom_cmp 0.82x**; 12/33/35/67 flat (they pass no raw
+   scalars).
+
+LANDED as `VmInvoker::call_scalars` (vm.h/vm.cpp): any all-scalar
+argument list (int/float/bool, any arity) is bound in place when the
+callee binds plainly (`fast_bind`), the arity is exact, and every slot
+is trivial and not borrowed; anything else boxes once as before. The
+generic per-argument kind switch gives back part of the experiment's
+cut: 34 is **-16.1% Ir** (726M -> 609M at scale 1) and still **0.82x**
+wall. Reach: `cb_raw` in `MYLANG_JITSTATS`; `invoker_call_tiers`
+asserts the raw count per shape, and that a coercing param, an opt tail
+and boxed elements (map) never take it.
+
+**Open siblings:** map/filter/find/sum pass BOXED elements
+(`arr_elem_at`), so they do not reach the raw bind yet - a flat-array
+arm passing the raw element would (35_map_filter is the worst callback
+bench, ~9x C++). The post-call ref_slots release scan (26 Ir per call
+on 34, two int params seeded as references because a lambda's params
+are never C3-proven) is the next measured cost.
+
 ### An unrelated observation, NOT chased
 
 A `float`-annotated callback param does not appear to receive a coerced

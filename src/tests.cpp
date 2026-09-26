@@ -25352,6 +25352,10 @@ static bool invoker_call_tiers()
         ExecEngine engine;
         bool want_prepared;    /* the prepared entry must run ... */
         unsigned long min_n;   /* ... at least this many times */
+        /* #97: of those, bound RAW (call_scalars) - at least min_n when
+         * true, NEVER when false (a decline that silently took the raw
+         * path would bind an uncoerced / wrong-arity window) */
+        bool want_raw;
     };
 
     /* \u26d4 THE SETUP MAY NOT USE A CALLBACK. Building the input array with
@@ -25369,19 +25373,39 @@ static bool invoker_call_tiers()
           { fill,
             "sort(a, func(x, y) { return x < y; });",
             "assert(a[0] == 1 && a[29] == 30);" },
-          ExecEngine::Vm, true, 30 },
+          ExecEngine::Vm, true, 30, true },
+        /* the float arm, raw too */
+        { "sort comparator over floats, VM engine",
+          { "var f = []; for (var i = 0; i < 30; i++) { append(f, 30.5 - i); }",
+            "sort(f, func(x, y) { return x < y; });",
+            "assert(f[0] == 1.5 && f[29] == 30.5);" },
+          ExecEngine::Vm, true, 30, true },
+        /* THE THREE DECLINES: a param that COERCES (fast_bind is off - the
+         * raw bind would skip the conversion), an arity that does not
+         * match (the opt tail must be bound none), and elements that are
+         * already boxed (map passes EvalValues). Each still prepared. */
+        { "sort comparator with TYPED params (coerces, not raw)",
+          { fill,
+            "sort(a, func(float x, float y) { return x < y; });",
+            "assert(a[0] == 1 && a[29] == 30);" },
+          ExecEngine::Vm, true, 30, false },
+        { "sort comparator with an extra opt param (arity, not raw)",
+          { fill,
+            "sort(a, func(x, y, opt z) { return z == none && x < y; });",
+            "assert(a[0] == 1 && a[29] == 30);" },
+          ExecEngine::Vm, true, 30, false },
         /* One argument rather than two, and a different builtin - the
          * point of ONE call() entry is that neither needs its own ladder. */
         { "make_array generator, VM engine",
           { "var g = make_array(40, func(i) { return i * 3; });",
             "assert(g[39] == 117);" },
-          ExecEngine::Vm, true, 40 },
+          ExecEngine::Vm, true, 40, true },
         /* map over already-boxed elements, still the prepared entry. */
         { "map callback, VM engine",
           { fill,
             "var m = map(func(x) { return x + 1; }, a);",
             "assert(m[29] == 2);" },
-          ExecEngine::Vm, true, 30 },
+          ExecEngine::Vm, true, 30, false },
         /* THE FALLBACK: the tree-walker has no activation, so there is no
          * window to prepare and every element goes through eval_func. Same
          * source, same answers - which is the property that matters, since
@@ -25390,12 +25414,12 @@ static bool invoker_call_tiers()
           { fill,
             "sort(a, func(x, y) { return x < y; });",
             "assert(a[0] == 1 && a[29] == 30);" },
-          ExecEngine::TreeWalk, false, 30 },
+          ExecEngine::TreeWalk, false, 30, false },
         { "map callback, tree-walker (no activation to prepare)",
           { fill,
             "var m = map(func(x) { return x + 1; }, a);",
             "assert(m[29] == 2);" },
-          ExecEngine::TreeWalk, false, 30 },
+          ExecEngine::TreeWalk, false, 30, false },
     };
 
     auto run = [](const std::vector<const char *> &lines,
@@ -25434,6 +25458,7 @@ static bool invoker_call_tiers()
     for (const Case &c : cases) {
         g_invoke_prepared = 0;
         g_invoke_fallback = 0;
+        g_invoke_raw = 0;
         if (!run(c.lines, c.engine)) {
             fprintf(stderr, "invoker_call_tiers: '%s' did not run\n", c.what);
             return false;
@@ -25452,6 +25477,12 @@ static bool invoker_call_tiers()
             fprintf(stderr, "invoker_call_tiers: '%s' also took the %s entry "
                             "%lu times\n", c.what,
                     c.want_prepared ? "fallback" : "prepared", other);
+            return false;
+        }
+        if (c.want_raw ? g_invoke_raw < c.min_n : g_invoke_raw != 0) {
+            fprintf(stderr, "invoker_call_tiers: '%s' bound raw %lu times "
+                            "(want %s)\n", c.what, g_invoke_raw,
+                    c.want_raw ? ">= min" : "0");
             return false;
         }
     }

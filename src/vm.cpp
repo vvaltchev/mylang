@@ -7408,6 +7408,7 @@ unsigned long g_jit_invoke_direct = 0;   /* lever 2 execution proof */
  * boundary frame on). A tier is only proven by the counter for ITS OWN
  * shape, so a test must reset both first - they are process-global. */
 unsigned long g_invoke_prepared = 0;
+unsigned long g_invoke_raw = 0;
 unsigned long g_invoke_fallback = 0;
 #endif
 
@@ -7583,6 +7584,48 @@ vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
  * The PREPARED entry: bind the argv run into the window the ctor pushed,
  * then run the body. One out-of-line call per callback element.
  */
+/* #97: the RAW scalar bind - see the CbScalar comment in vm.h */
+EvalValue VmInvoker::call_scalars(const CbScalar *ra, size_t n)
+{
+    if (ready_ && fast_bind_ && n == nparams_) {
+        LValue *win = w_->slots;
+        bool ok = true;
+        for (size_t i = 0; i < n; i++)
+            ok = ok && win[i].raw_bindable();
+        if (ok) {
+#ifdef TESTS
+            g_invoke_prepared++;
+            g_invoke_raw++;
+#endif
+            for (size_t i = 0; i < n; i++) {
+                if (ra[i].kind == 0)
+                    win[i].bind_scalar_raw(ra[i].i);
+                else if (ra[i].kind == 1)
+                    win[i].bind_scalar_raw(ra[i].f);
+                else
+                    win[i].bind_scalar_raw(ra[i].i != 0);
+            }
+            return vm_invoker_body(cck_, c_, act_, desc_, win,
+                                   static_cast<int_type>(w_->size), entry_,
+                                   site_);
+        }
+    }
+    /* declined: box each argument once, as the template does */
+    SmallArgs<4> argv;
+    ML_CHECK(n <= 4);
+    for (size_t i = 0; i < n; i++) {
+        if (ra[i].kind == 0)
+            argv.push(EvalValue(ra[i].i));
+        else if (ra[i].kind == 1)
+            argv.push(EvalValue(ra[i].f));
+        else
+            argv.push(EvalValue(ra[i].i != 0));
+    }
+    if (ready_)
+        return invoke(argv.data(), n);
+    return call_eval_func(argv.data(), n);
+}
+
 EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
 {
 #ifdef TESTS
