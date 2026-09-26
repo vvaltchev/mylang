@@ -7616,7 +7616,12 @@ into the callee's window slots** (`VmInvoker::call_scalars`, #97,
 A flat array's element reaches it through `inv_call_elem` (arr.cpp.h).
 **It pays only when it REPLACES a boxing**: `make_dict`'s key is boxed
 anyway to become the dict key, and binding it raw on top measured +5
-Ir per call on 67 - so that site stays boxed, on purpose.
+Ir per call on 67 - so that site stays boxed, on purpose. After a raw
+bind the post-call release scan reads `Chunk::ref_slots_raw` (ref_slots
+with no parameter seeds - only the body's own writes can leave a
+reference); the two lists come out of ONE `compute_ref_slots` call and
+the bytecode splice extends both, so no site can derive one and not
+the other (#97 CB5).
 ⛔ That was built in four shapes on 2026-08-14 and REJECTED at 1.20x
 slower - on a WSL2 box with no PMU, where "front-end/layout" could only
 be guessed. On native hardware the path is BACKEND-bound (top-down

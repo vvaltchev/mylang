@@ -10192,7 +10192,9 @@ bool op_writes_scalar(OpCode op)
 template <class I>
 static void compute_ref_slots_impl(const std::vector<I> &code,
                                    Chunk &chunk,
-                                   const std::vector<int32_t> *seeds)
+                                   const std::vector<int32_t> *seeds,
+                                   std::vector<int32_t> &out,
+                                   bool count)
 {
     const int total = chunk.slot_count + chunk.n_temps;
     std::vector<char> is_ref(total, 0);
@@ -10383,28 +10385,44 @@ static void compute_ref_slots_impl(const std::vector<I> &code,
             break;
     }
 
-    chunk.ref_slots.clear();
+    out.clear();
     for (int i = 0; i < total; i++)
         if (bail || is_ref[i])
-            chunk.ref_slots.push_back(i);
+            out.push_back(i);
 #ifdef TESTS
-    if (!bail)
+    if (count && !bail)
         for (const auto &mv : moves)
             if (!is_ref[mv.first])
                 g_ref_slots_move_excluded++;   /* the engagement proof */
 #endif
 }
 
+/*
+ * #97 CB5: both lists come out of one call, so no site can derive one
+ * and forget the other. `ref_slots_raw` is the same analysis with NO
+ * parameter seeds - the answer for a frame whose every parameter was
+ * bound a raw SCALAR (VmInvoker::call_scalars), where the bind cannot
+ * have written a reference and only the body's own writes can.
+ */
+template <class I>
+static void compute_ref_slots_both(const std::vector<I> &code, Chunk &chunk,
+                                   const std::vector<int32_t> *seeds)
+{
+    compute_ref_slots_impl(code, chunk, seeds, chunk.ref_slots, true);
+    compute_ref_slots_impl(code, chunk, nullptr, chunk.ref_slots_raw,
+                           false);
+}
+
 static void compute_ref_slots(const std::vector<CgInstr> &code,
                               Chunk &chunk,
                               const std::vector<int32_t> *seeds)
 {
-    compute_ref_slots_impl(code, chunk, seeds);
+    compute_ref_slots_both(code, chunk, seeds);
 }
 
 void compute_ref_slots(Chunk &chunk, const std::vector<int32_t> *seeds)
 {
-    compute_ref_slots_impl(chunk.code, chunk, seeds);
+    compute_ref_slots_both(chunk.code, chunk, seeds);
 }
 
 /*
@@ -12715,12 +12733,16 @@ bool bc_inline_chunk(Chunk &ck,
     ck.value_callees = std::move(nvc);                 /* #97 E1 */
     ck.inline_ctxs = std::move(nctx);
     ck.n_temps = next_base - ck.slot_count;
-    for (const Site &S : sites)
-        for (const int32_t r : S.ref_slots)
-            ck.ref_slots.push_back(r + S.base);
-    std::sort(ck.ref_slots.begin(), ck.ref_slots.end());
-    ck.ref_slots.erase(std::unique(ck.ref_slots.begin(), ck.ref_slots.end()),
-                       ck.ref_slots.end());
+    /* both lists (#97 CB5): a spliced body's slots are not the caller's
+     * PARAMETERS, so a raw scalar bind of the caller says nothing about
+     * them - they join ref_slots_raw in full */
+    for (std::vector<int32_t> *rl : { &ck.ref_slots, &ck.ref_slots_raw }) {
+        for (const Site &S : sites)
+            for (const int32_t r : S.ref_slots)
+                rl->push_back(r + S.base);
+        std::sort(rl->begin(), rl->end());
+        rl->erase(std::unique(rl->begin(), rl->end()), rl->end());
+    }
     ck.set_plain_frame();
     /* boxed_ops is DERIVED from the final code + locs - rebuild rather
      * than re-base (the .myv loader's rule, for the same reason) */

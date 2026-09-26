@@ -1761,6 +1761,16 @@ struct Chunk {
     std::vector<int32_t> ref_slots;
 
     /*
+     * #97 CB5: `ref_slots` computed with NO parameter seeds - the slots a
+     * frame can hold a reference in when every parameter was bound a RAW
+     * SCALAR, so only the body's own writes can put one there. Its one
+     * consumer is VmInvoker::call_scalars' post-call release scan; the
+     * same VM_HARDENING whole-window audit follows it. Derived with
+     * ref_slots by the same call (compute_ref_slots), never stored.
+     */
+    std::vector<int32_t> ref_slots_raw;
+
+    /*
      * #106 phase 2 - THE NON-NEGATIVE SLOTS: frame slots this chunk can
      * only ever observe holding a value >= 0. Consumed by the JIT's
      * power-of-two div/mod reduction, where it deletes the whole
