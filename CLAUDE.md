@@ -642,6 +642,15 @@ RULE 2 divergence, latent in 8 corpus programs (bytecode changed,
 output did not). **When you change HOW a construct lowers, re-audit
 every table that classifies its OPCODE** - the entry does not have to
 be edited to become false.
+**IT HAPPENED A THIRD TIME, AND THE FIX STOPPED ASKING THE TABLE
+(2026-09-25).** The TYPED ternary ends its else arm on a `LoadImm`,
+which is whitelisted, so `g(1, i == 2 ? int(runtime(-5)) : 1)` staged
+the literal on both paths - a wrong answer in the DEFAULT engine
+whenever the callee is not inlined. A join is a CONTROL-FLOW fact, not
+an opcode one, so `compile_to_run_slot` now declines the retarget when
+any branch in the element's code lands past its last op
+(`visit_pc_fields`); the whitelist only says which producers CAN be
+retargeted, never whether this one is the sole producer.
 **⛔ AND A FOURTH SHAPE, THE CHEAPEST TO PREVENT: THE OPTIMIZATION
 WHITELIST NOBODY RE-READ (2026-08-16).** `jit_fwd_producer` /
 `jit_fwd_consumer` (jit.cpp) list the ops lever A may forward a value
