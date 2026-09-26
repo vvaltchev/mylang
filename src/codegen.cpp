@@ -5593,30 +5593,8 @@ struct Codegen {
              * AND a flat int array with a non-int-compilable index (fell through
              * above). EXCLUDES a proven flat FLOAT array (th==f && base_array),
              * left to compile_float_stmt's fast unboxed StoreElemFloat. */
-            if (!(sub->th == TypeHint::f && sub->base_array)) {
-                int aslot, akind;
-                if (e->op != Op::assign
-                        && compound_assign_base(e->op) == Op::invalid)
-                    return false;
-                if (!as_container_base(sub->what.get(), aslot, akind))
-                    return false;
-                int vslot, kslot;
-                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
-                    || !compile_boxed_expr(sub->index.get(), kslot, ops))
-                    return false;
-                CgInstr in;
-                in.op = OpCode::StoreElemValue;
-                in.node_idx = add_ast_node(sub);   /* the subscript, for its loc (extract_locs) */
-                in.base_node_idx =                 /* #127: the base caret */
-                    add_base_node(akind, sub->what.get());
-                in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
-                in.target2 = aslot;
-                in.set_a(slot_op(kslot));
-                in.set_b(slot_op(vslot));
-                in.aop = e->op;
-                ops.push_back(in);
-                return true;
-            }
+            if (!(sub->th == TypeHint::f && sub->base_array))
+                return emit_universal_store(e, sub, ops);
 
             return false;   /* proven flat float -> compile_float_stmt */
         }
@@ -5937,6 +5915,45 @@ struct Codegen {
         return false;
     }
 
+    /*
+     * The UNIVERSAL element store: any container-slot base -> StoreElemValue,
+     * whose vm_subscript_store dispatches at run time (flat / general / dict,
+     * matching the tree-walker's try_flat -> general). compile_int_stmt's
+     * catch-all, and compile_float_stmt's decline: a proven flat FLOAT
+     * element whose value compile_float_expr cannot lower unboxed. That
+     * never happens after M8 (the value is a typed node), which is why it
+     * went unnoticed - `--no-opt typed` leaves `a[i] = i * 1.5` an untyped
+     * chain, and the statement was refused (NotLoweredEx) where the
+     * tree-walker ran it (#54's audit; a RULE 2 violation of the switch).
+     */
+    bool emit_universal_store(const Expr14 *e, const Subscript *sub,
+                              std::vector<CgInstr> &ops)
+    {
+        int aslot, akind;
+        if (e->op != Op::assign
+                && compound_assign_base(e->op) == Op::invalid)
+            return false;
+        if (!as_container_base(sub->what.get(), aslot, akind))
+            return false;
+        int vslot, kslot;
+        if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
+            || !compile_boxed_expr(sub->index.get(), kslot, ops))
+            return false;
+        CgInstr in;
+        in.op = OpCode::StoreElemValue;
+        /* the subscript, for its loc (extract_locs) */
+        in.node_idx = add_ast_node(sub);
+        in.base_node_idx =                 /* #127: the base caret */
+            add_base_node(akind, sub->what.get());
+        in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
+        in.target2 = aslot;
+        in.set_a(slot_op(kslot));
+        in.set_b(slot_op(vslot));
+        in.aop = e->op;
+        ops.push_back(in);
+        return true;
+    }
+
     bool compile_float_stmt(const Construct *s, std::vector<CgInstr> &ops)
     {
         if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
@@ -6004,9 +6021,14 @@ struct Codegen {
             if (!as_container_base(sub->what.get(), aslot, akind))
                 return false;
             Operand val, idx;
+            const size_t vmark = ops.size();
+            const int vtop = next_temp;
             if (!compile_float_expr(e->rvalue.get(), val, ops)
-                || !compile_int_expr(sub->index.get(), idx, ops))
-                return false;
+                || !compile_int_expr(sub->index.get(), idx, ops)) {
+                ops.resize(vmark);
+                next_temp = vtop;
+                return emit_universal_store(e, sub, ops);
+            }
             CgInstr in;
             in.op = OpCode::StoreElemFloat;
             /* PLAIN assign -> the SUBSCRIPT loc (OOB/type, matching the tree-

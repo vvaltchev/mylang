@@ -22887,6 +22887,13 @@ static bool opt_layer_equivalence()
 {
     const std::vector<OptLayerCase> cases = {
         /* the LICM target: an invariant row read in a counted inner loop */
+        /* `typed` off leaves the value an UNTYPED chain, and the flat-float
+         * element store refused it (NotLoweredEx) instead of falling back
+         * to the universal StoreElemValue (#54's audit) */
+        { "flat float element store of an untyped int*float chain", {
+            "var af = [0.0, 0.0, 0.0];",
+            "for (var i = 0; i < 3; i++) { af[i] = i * 1.5; af[i] += i; }",
+            "print(af);" } },
         { "2-D row read (LICM's target shape)", {
             "var m = [[1,2,3],[4,5,6]]; var s = 0;",
             "for (var i = 0; i < 2; i++)",
