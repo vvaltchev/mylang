@@ -438,6 +438,14 @@ public:
         return type->is_true(*this);
     }
 
+    /* is_true() with the BOOL answer read inline, for a callback's
+     * result (#97 CB6): a comparator / predicate returns a bool on every
+     * element, and the virtual call was ~10 Ir of 34_sort_custom_cmp's
+     * per-comparison cost. Anything else takes the virtual. */
+    bool truthy() const {
+        return type->t == Type::t_bool ? val.bval : type->is_true(*this);
+    }
+
     bool operator!() const {
         return !is_true();
     }

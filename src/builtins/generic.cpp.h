@@ -561,7 +561,7 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                     EvalValue r = inv.call(v);
                     if (!is_filter)
                         push_res(std::move(r));
-                    else if (r.is_true())
+                    else if (r.truthy())
                         push_res(EvalValue(v));
                     continue;
                 }
@@ -570,7 +570,7 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                     EvalValue r = inv.call(v);
                     if (!is_filter)
                         push_res(std::move(r));
-                    else if (r.is_true())
+                    else if (r.truthy())
                         push_res(EvalValue(v));
                     continue;
                 }
@@ -579,7 +579,7 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                     EvalValue r = inv.call(v);
                     if (!is_filter)
                         push_res(std::move(r));
-                    else if (r.is_true())
+                    else if (r.truthy())
                         push_res(EvalValue(v));
                     continue;
                 }
@@ -594,7 +594,7 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
             EvalValue r = inv.call(e);
             if (!is_filter)
                 push_res(std::move(r));
-            else if (r.is_true())
+            else if (r.truthy())
                 push_res(std::move(e));
         }
 
@@ -632,7 +632,7 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
 
         DictObject::inner_type result;
         for (auto const &e : snap)
-            if (inv.call(e.first, e.second.get()).is_true())
+            if (inv.call(e.first, e.second.get()).truthy())
                 result.insert(e);
         return make_intrusive<DictObject>(std::move(result));
     }

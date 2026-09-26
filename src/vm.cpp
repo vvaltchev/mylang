@@ -7491,6 +7491,7 @@ VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj, Loc site)
     saved_gctx_ = g_current_ctx;
     g_current_ctx = c_;
     ready_ = true;
+    raw_ok_ = fast_bind_;
 }
 
 VmInvoker::~VmInvoker()
@@ -7589,32 +7590,48 @@ vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
  * then run the body. One out-of-line call per callback element.
  */
 /* #97: the RAW scalar bind - see the CbScalar comment in vm.h */
+/*
+ * #97 CB6: no per-slot raw_bindable() test. Between two calls of a live
+ * invoker EVERY window slot is trivial and not borrowed: the window is
+ * pushed fresh, each call ends in the release scan over the list its
+ * bind needs (ref_slots / ref_slots_raw), a slot outside that list can
+ * never hold a reference, and nothing else writes the window between
+ * elements (a throw unwinds the builtin, and the dtor pops it). That is
+ * exactly what the VM_HARDENING audit at the end of vm_invoker_body
+ * asserts over the whole window, so it is restated here as a check, not
+ * paid as a test. The boxed decline lives out of line so this hot
+ * function saves fewer registers.
+ */
 EvalValue VmInvoker::call_scalars(const CbScalar *ra, size_t n)
 {
-    if (ready_ && fast_bind_ && n == nparams_) {
-        LValue *win = w_->slots;
-        bool ok = true;
-        for (size_t i = 0; i < n; i++)
-            ok = ok && win[i].raw_bindable();
-        if (ok) {
-#ifdef TESTS
-            g_invoke_prepared++;
-            g_invoke_raw++;
+    if (!raw_ok_ || n != nparams_)
+        return call_scalars_boxed(ra, n);
+    LValue *win = w_->slots;
+#if ML_VM_HARDENING
+    for (size_t i = 0; i < n; i++)
+        ML_VM_CHECK(win[i].raw_bindable());
 #endif
-            for (size_t i = 0; i < n; i++) {
-                if (ra[i].kind == 0)
-                    win[i].bind_scalar_raw(ra[i].i);
-                else if (ra[i].kind == 1)
-                    win[i].bind_scalar_raw(ra[i].f);
-                else
-                    win[i].bind_scalar_raw(ra[i].i != 0);
-            }
-            return vm_invoker_body(cck_, c_, act_, desc_, win,
-                                   static_cast<int_type>(w_->size), entry_,
-                                   site_, cck_->ref_slots_raw);
-        }
+#ifdef TESTS
+    g_invoke_prepared++;
+    g_invoke_raw++;
+#endif
+    for (size_t i = 0; i < n; i++) {
+        if (ra[i].kind == 0)
+            win[i].bind_scalar_raw(ra[i].i);
+        else if (ra[i].kind == 1)
+            win[i].bind_scalar_raw(ra[i].f);
+        else
+            win[i].bind_scalar_raw(ra[i].i != 0);
     }
-    /* declined: box each argument once, as the template does */
+    return vm_invoker_body(cck_, c_, act_, desc_, win,
+                           static_cast<int_type>(w_->size), entry_,
+                           site_, cck_->ref_slots_raw);
+}
+
+/* declined: box each argument once, as the template does */
+ML_NOINLINE EvalValue
+VmInvoker::call_scalars_boxed(const CbScalar *ra, size_t n)
+{
     SmallArgs<4> argv;
     ML_CHECK(n <= 4);
     for (size_t i = 0; i < n; i++) {
