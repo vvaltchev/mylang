@@ -1712,7 +1712,8 @@ Running scripts:
 ./build/mylang -s FILE           # dump syntax tree (const-folded), then ALSO
                                  # the post-optimizer tree (inline/unroll), run
 ./build/mylang -t FILE           # dump tokens
-./build/mylang -nc FILE          # disable const-eval (compare -s with/without)
+./build/mylang -nc FILE          # disable const FOLDING (compare -s with/
+                                 # without) - NOT const-eval: see #54 below
 ./build/mylang -ni FILE          # disable function inlining (debug)
 ./build/mylang -npc FILE         # disable the per-frame pure-call cache
                                  # (recursion still unrolls; for measurement)
@@ -1899,6 +1900,30 @@ const-folding (and, after the optimizer runs, a second **"Optimized syntax
 tree"** dump showing the post-inline/unroll/specialize AST — the actual node
 shapes, e.g. an `InlinedCall(Block(...))`), and `-nc` lets you see the tree as
 written before folding. Reach for them whenever behavior surprises you.
+
+**⛔ `-nc` TURNS OFF FOLDING, NOT CONST-EVALUATION (#54, 2026-09-25).** It
+was ONE switch (`ParseContext::const_eval`) for two concerns, and turning
+it off removed the language's compile-time entities along with the
+optimization: `struct S { const Z = K * 2; }` was refused, `P p = P(1);`
+said "'P' is not a type", a nested POD field was stored BOXED (a different
+`layout()`), `const A = [1]; A[0] = 2;` became legal and `const X = f();`
+with an impure `f` compiled. RULE 2 forbids every one of those. The flag is
+`ParseContext::fold` now and means exactly: **do not REPLACE a constant
+expression by its value** (a call, a subscript, an operator chain, an
+expression statement, a `var` initializer, and the CSE that shares them).
+Still done either way, because each is part of the program's MEANING:
+evaluating and binding a `const` (a scalar const NAME still denotes its
+value - that is what a const scalar is, and a pure function body relies
+on it), registering a struct descriptor and a pure function, discarding a
+statically dead branch (`if`/`while`/`foreach`/`?:`/`??` on a constant -
+README *Const evaluation of conditional statements*: its contents are not
+checked, so keeping them would refuse programs), and EVALUATING each
+constant expression, so an error it raises is the same compile error
+(`nc_eval_const`). A folded node's absence is visible to exactly one rule,
+pExpr14's assignable shape (`K[0]` folds to a VALUE), which reads
+`Construct::nc_folds`. Nets: the `parse: -nc ...` `-rt` entry
+(`const_fold_equivalence`: fold on/off x both engines, byte-identical
+output AND rendered error) and `tests/corpus_diff.sh`'s `-nc` pass.
 
 ## Tests
 
@@ -3532,9 +3557,10 @@ decisions behind it: `plans/archived/type-inference.md`,
   decide decl-vs-expr). `A(...)`/`A.x`/`a = ...` don't match the shape and stay
   expressions. *Then* a SEMANTIC step resolves the type name via
   `lookup_struct_type` (an identifier bound to a `StructTypeDef*` in the const
-  ctx; needs const-eval on, since structs register their descriptor there at
-  parse time): a name that doesn't resolve to a struct type is a clear
-  `SyntaxErrorEx` ("'foo' is not a type"), not a silent fall-through.
+  ctx - structs register their descriptor there at parse time, with or without
+  `-nc`, which turns off folding only (#54)): a name that doesn't resolve
+  to a struct type is a clear `SyntaxErrorEx` ("'foo' is not a type"), not
+  a silent fall-through.
   **Decl-vs-ternary:** a `T ? name` run is ambiguous with a ternary
   (`flag ? a : b`), so when a `?` was seen the scanner requires the token after
   `name` to be a decl terminator (`is_decl_terminator`: `;` `=` `,` `}` EOF) —

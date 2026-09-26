@@ -828,6 +828,19 @@ literal is not derived from a const, so `var a = [1, 2, 3]` is mutable as usual
 (though an element that is itself a const stays read-only — `var a = [y]` with
 `y` const keeps `a[0]` read-only).
 
+#### Folding, and the `-nc` switch
+
+Replacing a constant expression by its value — `len(arr)` by `3`, `2 * K` by
+`6`, `arr[1]` by the element — is an *optimization*, and `mylang -nc FILE`
+turns it off (handy with `-s`, to see the tree as written). It turns off
+nothing else, because nothing else is an optimization: under `-nc` a `const`
+is still evaluated at compile time and its name still denotes its value, a
+struct still defines a type (usable in a declaration, with the same memory
+layout), a `pure func` can still be called from a `const` initializer, a
+statically dead branch is still discarded, and a constant expression that
+always fails is still a compile error. A program compiles, runs, prints and
+fails identically with and without `-nc` — only its syntax tree differs.
+
 #### De-duplication of const expressions
 
 Identical constant array/dictionary expressions are **evaluated only once**. The

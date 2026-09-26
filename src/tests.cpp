@@ -22662,6 +22662,152 @@ static bool hoist_slice_shapes()
 }
 
 /*
+ * #54 - `-nc` TURNS OFF FOLDING, NOT THE MEANING OF THE PROGRAM (RULE 2).
+ *
+ * The parse-time evaluator used to be one switch: `-nc` stopped folding AND
+ * stopped registering consts, struct descriptors and pure functions - so a
+ * struct const member reading another const was refused, `P p = ...` said
+ * "'P' is not a type", a nested POD field was stored boxed (a different
+ * layout), a const array element became ASSIGNABLE and a non-const `const`
+ * initializer compiled. ParseContext::fold is the optimization alone now.
+ *
+ * Each program runs parse -> infer -> optimize -> execute with folding ON
+ * and OFF, on BOTH engines, and the four runs must print the same stdout
+ * and render the same error (message, caret, backtrace) - byte for byte.
+ * The driver's -nc pass (tests/corpus_diff.sh) is the same check over the
+ * corpus; this is the in-process half, and it names the shapes.
+ */
+struct NcCase {
+    const char *name;
+    std::vector<const char *> lines;
+};
+
+static std::string nc_run(const std::string &src, ExecEngine eng, bool fold)
+{
+    std::vector<Tok> toks;
+    std::vector<std::string> lines;
+    {
+        std::string cur;
+        for (char ch : src) {
+            if (ch == '\n') {
+                lines.push_back(cur);
+                cur.clear();
+            } else {
+                cur += ch;
+            }
+        }
+        lines.push_back(cur);
+    }
+
+    const ExecEngine saved_eng = g_exec_engine;
+    g_exec_engine = eng;
+    std::ostringstream cap;
+    std::streambuf *saved_buf = cout.rdbuf(cap.rdbuf());
+    std::string err;
+    try {
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), fold);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get());
+        run_optimizers(root.get());
+        if (eng == ExecEngine::Vm)
+            vm_execute(root.get());
+        else
+            root->eval(nullptr);
+    } catch (const Exception &e) {
+        std::ostringstream eo;
+        format_exception(eo, e, lines);
+        err = eo.str();
+    } catch (...) {
+        err = "<non-Exception>";
+    }
+    cout.rdbuf(saved_buf);
+    g_exec_engine = saved_eng;
+    return cap.str() + "|" + err;
+}
+
+static bool const_fold_equivalence()
+{
+    const std::vector<NcCase> cases = {
+        /* the three shapes #54 was filed for */
+        { "a struct const member reads a const", {
+            "const K = 3;",
+            "struct S { const Z = K * 2; }",
+            "print(S.Z);" } },
+        { "a struct name is a type in a declaration", {
+            "struct P { int x; }",
+            "P p = P(runtime(1));",
+            "P q;",
+            "print(p.x, q.x);" } },
+        { "a nested POD field embeds inline (one layout)", {
+            "struct I { int a; int b; }",
+            "struct O { I i; int c; }",
+            "var o = O(I(runtime(1), 2), 3);",
+            "print(o.i.b, layout(O));" } },
+        /* ...and what the audit found beside them */
+        { "a pure func called from a const reads a const", {
+            "const K = 10;",
+            "pure func f(x) => x + K;",
+            "const Z = f(2);",
+            "print(Z, f(runtime(5)));" } },
+        { "a named call to a pure func initializes a const", {
+            "pure func f(a, opt b) => a + (b ?? 1);",
+            "const Z = f(a: 4, b: 5);",
+            "print(Z);" } },
+        { "a const array element is not a location", {
+            "const A = [1, 2, 3];",
+            "A[0] = 5;",
+            "print(A);" } },
+        { "a const scalar is not a location", {
+            "const K = 3;",
+            "K = 4;" } },
+        { "a const's initializer must be constant", {
+            "func f() { return 3; }",
+            "const X = f();",
+            "print(X);" } },
+        { "a const container is deep read-only at run time", {
+            "const D = {\"a\": [1, 2]};",
+            "var d = D;",
+            "d[\"a\"][0] = 9;" } },
+        /* a const subscript is evaluated by the PARSER alone (AutoConst
+         * would catch `7 / Z` for it - a weaker case) */
+        { "a failing constant expression is a compile error", {
+            "const A = [1, 2];",
+            "try { print(A[5]); } catch (OutOfBoundsEx) { print(1); }" } },
+        { "a statically dead branch is not checked", {
+            "const DEBUG = false;",
+            "if (DEBUG) { nope(); }",
+            "print(DEBUG ? missing : 4);",
+            "while (false) { gone(); }",
+            "print(1);" } },
+    };
+
+    bool ok = true;
+    for (const NcCase &c : cases) {
+        std::string src;
+        for (size_t i = 0; i < c.lines.size(); i++) {
+            if (i)
+                src += '\n';
+            src += c.lines[i];
+        }
+        const std::string ref = nc_run(src, ExecEngine::TreeWalk, true);
+        for (ExecEngine eng : { ExecEngine::TreeWalk, ExecEngine::Vm })
+            for (bool fold : { true, false }) {
+                const std::string got = nc_run(src, eng, fold);
+                if (got != ref) {
+                    fprintf(stderr, "const_fold_equivalence: '%s' (%s, "
+                            "fold %s)\n  want: %s\n  got:  %s\n", c.name,
+                            eng == ExecEngine::Vm ? "vm" : "tw",
+                            fold ? "on" : "OFF", ref.c_str(), got.c_str());
+                    ok = false;
+                }
+            }
+    }
+    return ok;
+}
+
+/*
  * OPTIMIZER-LAYER EQUIVALENCE - the net for AST transforms.
  *
  * The project's main correctness net is the tree-walker-vs-VM differential.
@@ -45915,6 +46061,8 @@ static const std::vector<extra_check> extra_checks =
       param_escape_analysis },
     { "opt: every AST transform is behaviour-preserving (layer equivalence)",
       opt_layer_equivalence },
+    { "parse: -nc turns off folding, not the program's meaning (#54)",
+      const_fold_equivalence },
     { "opt: loop-invariant container-subscript hoisting shapes (LICM)",
       hoist_subscript_shapes },
     { "opt: loop-invariant slice hoisting shapes (lever 3)",

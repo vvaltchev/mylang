@@ -181,6 +181,14 @@ public:
     bool th_bool = false;
 
     /*
+     * #54, `-nc` only: the parser would have REPLACED this constant node by
+     * a literal here, had folding been on (set by nc_eval_const). Read by
+     * pExpr14's assignable-shape rule, so `const A = [1]; A[0] = 2;` is the
+     * same compile error with and without folding. Parse-time only.
+     */
+    bool nc_folds = false;
+
+    /*
      * Representation hint for an array-producing node, set by the inferencer
      * from the destination type so the array is built in its final
      * representation (type-driven creation, no promotion). On a CallExpr's args

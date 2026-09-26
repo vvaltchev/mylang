@@ -69,7 +69,30 @@ class ParseContext {
 public:
 
     TokenStream ts;
-    const bool const_eval;
+
+    /*
+     * #54 - FOLDING, NOT CONST-EVALUATION. `-nc` clears this, and it turns
+     * off exactly one thing: REPLACING a constant expression by its value
+     * (a call, a subscript, an operator chain, an expression statement or
+     * a `var` initializer baked into a literal, and the CSE that shares
+     * those). Everything else the parse-time evaluator does is part of the
+     * program's MEANING and runs either way, because RULE 2 forbids a
+     * switch from changing whether a program compiles or what it does:
+     *  - a `const` declaration is evaluated and bound (a struct const
+     *    member or another const may read it; a scalar const NAME still
+     *    denotes its value, which is what a const scalar IS);
+     *  - a `struct` registers its descriptor (so its name is a TYPE in a
+     *    declaration, and a nested POD field embeds inline - one layout);
+     *  - a `pure func` registers itself (a const initializer may call it);
+     *  - a statically-dead branch (`if`/`while`/`foreach`/`?:`/`??` on a
+     *    constant) is discarded, since what it holds is not checked;
+     *  - a constant expression is still EVALUATED, so an error it raises
+     *    is the same compile-time error.
+     * It was one flag, `const_eval`, until #54: `-nc` then refused
+     * `struct S { const Z = K * 2; }`, called `P p;` "not a type" and
+     * boxed a nested POD field.
+     */
+    const bool fold;
     EvalContext *const_ctx; // points to const_ctx_owner's object
     unique_ptr<CseCache> cse; // const-expr de-dup cache (per-block scopes)
 
@@ -81,7 +104,7 @@ public:
      */
     AnalysisInfo *analysis = nullptr;
 
-    ParseContext(const TokenStream &ts, bool const_eval);
+    ParseContext(const TokenStream &ts, bool fold);
     ~ParseContext(); // out-of-line: CseCache is incomplete here (PIMPL)
 
     /*

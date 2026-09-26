@@ -52,10 +52,10 @@ struct CseCache {
     }
 };
 
-ParseContext::ParseContext(const TokenStream &ts, bool const_eval)
+ParseContext::ParseContext(const TokenStream &ts, bool fold)
     : const_ctx_owner(new EvalContext(nullptr, true))
     , ts(ts)
-    , const_eval(const_eval)
+    , fold(fold)
     , const_ctx(const_ctx_owner.get())
     , cse(new CseCache)
 {
@@ -187,13 +187,13 @@ static DeclType type_keyword(std::string_view s)
  * If `name` is bound to a struct TYPE descriptor in the const context (i.e. a
  * `struct` declared earlier in scope), return its StructTypeDef, else nullptr.
  * This is what lets `A obj;` recognize `A` as a type in declaration position.
- * Structs register their descriptor in the const ctx at parse time, so it is
- * only meaningful with const-eval on (no struct types are visible otherwise).
+ * Structs register their descriptor in the const ctx at parse time - with or
+ * without `-nc`, which turns off folding, not the registration (#54).
  */
 static const StructTypeDef *
 lookup_struct_type(ParseContext &c, std::string_view name)
 {
-    if (!c.const_eval || !c.const_ctx)
+    if (!c.const_ctx)
         return nullptr;
     Identifier id(name);
     LValue *lv = c.const_ctx->lookup(&id);
@@ -639,6 +639,22 @@ static void
 detach_baked_funcs(ParseContext &c, unique_ptr<Construct> &slot,
                    const std::unordered_set<const FuncDescriptor *> &descs);
 
+/*
+ * #54: a folding site under `-nc` (!c.fold). EVALUATE the constant node -
+ * so an error it raises is the same compile-time error the folding run
+ * raises - and record on it whether that run would have REPLACED it by a
+ * literal (Construct::nc_folds, read by pExpr14's assignable-shape rule:
+ * a folded `K[0]` is a value, not a location), but leave the node alone.
+ */
+static void
+nc_eval_const(ParseContext &c, Construct *node,
+              bool process_arrays, bool immutable)
+{
+    unique_ptr<Construct> scratch;
+    node->nc_folds = MakeConstructFromConstVal(
+        RValue(node->eval(c.const_ctx)), scratch, process_arrays, immutable);
+}
+
 bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
@@ -746,11 +762,12 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
         if (c.is_shadowed(static_cast<Identifier *>(v.get())->uid))
             resolve_const = false;
 
-        if (c.const_eval && resolve_const) {
+        if (resolve_const) {
 
             /*
-             * The const evaluation is enabled and we've been asked to resolve
-             * identifier, if possible. Steps:
+             * We've been asked to resolve the identifier, if possible (with
+             * or without `-nc`: a const scalar NAME denotes its value - that
+             * is what a const scalar is - #54). Steps:
              *
              *      1) Eval it in the const EvalContext
              *
@@ -1091,7 +1108,7 @@ pArgList(ParseContext &c, unsigned fl)
 static void
 pTryDesugarNamedCall(ParseContext &c, CallExpr *call)
 {
-    if (!c.const_eval || !call->what->is_const) {
+    if (!call->what->is_const) {
         call->args->is_const = false;
         return;
     }
@@ -1135,14 +1152,19 @@ pAcceptCallExpr(ParseContext &c,
          * coercion/validation makes it type-safe). Everywhere else it is
          * deferred to the inferencer (which gives the precise field type/arity
          * errors) + runtime. */
-        else if (c.const_eval && !(fl & pFlags::pInConstDecl) &&
+        else if (!(fl & pFlags::pInConstDecl) &&
                  expr->what->is_const && expr->args->is_const &&
                  RValue(expr->what->eval(c.const_ctx)).is<StructTypeDef *>())
             expr->args->is_const = false;
 
-        if (c.const_eval && expr->what->is_const && expr->args->is_const) {
-
+        if (expr->what->is_const && expr->args->is_const)
             expr->is_const = true;
+
+        if (expr->is_const && !c.fold)
+            nc_eval_const(c, expr.get(), (fl & pFlags::pInConstDecl) != 0,
+                          (fl & pFlags::pInConstDecl) != 0);
+
+        if (c.fold && expr->is_const) {
 
             /* -a: this call is about to fold to a literal at compile time -
              * color the callee identifier magenta before it is gone. */
@@ -1225,7 +1247,13 @@ pAcceptSubscript(ParseContext &c,
         ret->start = wstart;
         ret->end = c.get_loc() + 2;   /* get_loc() is the ']' */
 
-        if (c.const_eval && ret->is_const) {
+        if (!c.fold && ret->is_const) {
+
+            if (!in_slice || fl & pFlags::pInConstDecl)
+                nc_eval_const(c, ret.get(), true,
+                              (fl & pFlags::pInConstDecl) != 0);
+
+        } else if (ret->is_const) {
 
             if (!in_slice || fl & pFlags::pInConstDecl) {
 
@@ -1238,6 +1266,11 @@ pAcceptSubscript(ParseContext &c,
                         true,
                         (fl & pFlags::pInConstDecl) != 0))
                 {
+                    /* #54: keep the subscript's span, so `K[0] = v` is
+                     * refused WITH a caret - the -nc run refuses the
+                     * un-folded Subscript at the same place. */
+                    const_construct->start = ret->start;
+                    const_construct->end = ret->end;
                     ret = std::move(const_construct);
                 }
             }
@@ -1625,7 +1658,7 @@ pExprCoalesce(ParseContext &c, unsigned fl)
         noExprError(c);
     co->end = co->rhs->end;
 
-    if (c.const_eval && co->lhs->is_const) {
+    if (co->lhs->is_const) {
         const EvalValue &v = co->lhs->eval(c.const_ctx);
         return v.is<NoneVal>() ? std::move(co->rhs) : std::move(co->lhs);
     }
@@ -1659,7 +1692,7 @@ pExpr13(ParseContext &c, unsigned fl)
         noExprError(c);
     t->end = t->elseExpr->end;
 
-    if (c.const_eval && t->condExpr->is_const) {
+    if (t->condExpr->is_const) {
         const EvalValue &v = t->condExpr->eval(c.const_ctx);
         return v.get_type()->is_true(v) ? std::move(t->thenExpr)
                                         : std::move(t->elseExpr);
@@ -1855,7 +1888,9 @@ pExpr14(ParseContext &c, unsigned fl)
 
             /* Just return lside (doing const eval if possible) */
 
-            if (c.const_eval && lside->is_const)
+            if (lside->is_const && !c.fold)
+                nc_eval_const(c, lside.get(), false, false);
+            else if (lside->is_const)
                 MakeConstructFromConstVal(lside->eval(c.const_ctx), lside);
 
             return lside;
@@ -1901,9 +1936,12 @@ pExpr14(ParseContext &c, unsigned fl)
 
         const Construct *lv = ret->lvalue.get();
 
-        if (!lv->is_id() && !lv->is_idlist()
-            && !dynamic_cast<const Subscript *>(lv)
-            && !dynamic_cast<const MemberExpr *>(lv)) {
+        /* #54: under `-nc` a constant element is left in place, so ask
+         * whether the folding run would have made it a value. */
+        if (lv->nc_folds
+            || (!lv->is_id() && !lv->is_idlist()
+                && !dynamic_cast<const Subscript *>(lv)
+                && !dynamic_cast<const MemberExpr *>(lv))) {
 
             /* A CONST element/field target lands here too, because the
              * parser already folded `K[0]` to its literal value - which is
@@ -1971,7 +2009,16 @@ pExpr14(ParseContext &c, unsigned fl)
      * baked (and de-duplicated). Re-baking it here would just deep-clone the
      * value a second time and break that sharing; skip it.
      */
-    if (c.const_eval && ret->rvalue->is_const
+    /* #54: a CONST declaration's rvalue is materialized with or without
+     * `-nc` - its value, baked deep read-only, is what the const IS. Only a
+     * `var` initializer's bake is folding. */
+    if (!c.fold && ret->rvalue->is_const
+        && !(fl & pFlags::pInConstDecl)
+        && !dynamic_cast<LiteralObj *>(ret->rvalue.get()))
+    {
+        nc_eval_const(c, ret->rvalue.get(), true, false);
+    }
+    else if (ret->rvalue->is_const
         && !dynamic_cast<LiteralObj *>(ret->rvalue.get()))
     {
         unique_ptr<Construct> cc;
@@ -1987,7 +2034,7 @@ pExpr14(ParseContext &c, unsigned fl)
         }
     }
 
-    if (c.const_eval && fl & pFlags::pInConstDecl) {
+    if (fl & pFlags::pInConstDecl) {
 
         if (!ret->rvalue->is_const)
             throw ExpressionIsNotConstEx(ret->rvalue->start, ret->rvalue->end);
@@ -2040,8 +2087,12 @@ pExprTop(ParseContext &c, unsigned fl)
 {
     unique_ptr<Construct> e = pExpr14(c, fl);
 
-    if (c.const_eval && e && e->is_const && !e->is_nop())
-        MakeConstructFromConstVal(e->eval(c.const_ctx), e);
+    if (e && e->is_const && !e->is_nop()) {
+        if (c.fold)
+            MakeConstructFromConstVal(e->eval(c.const_ctx), e);
+        else
+            nc_eval_const(c, e.get(), false, false);
+    }
 
     return e;
 }
@@ -2407,7 +2458,7 @@ pAcceptIfStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     ifstmt->start = start;
     ifstmt->end = c.get_loc();
 
-    if (c.const_eval && ifstmt->condExpr->is_const) {
+    if (ifstmt->condExpr->is_const) {
 
         const EvalValue &v = ifstmt->condExpr->eval(c.const_ctx);
         const bool t = v.get_type()->is_true(v);
@@ -2466,7 +2517,7 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     whileStmt->start = start;
     whileStmt->end = c.get_loc();
 
-    if (c.const_eval && whileStmt->condExpr->is_const) {
+    if (whileStmt->condExpr->is_const) {
 
         const EvalValue &v = whileStmt->condExpr->eval(c.const_ctx);
 
@@ -2597,7 +2648,7 @@ pAcceptFuncDecl(ParseContext &c,
      * its params from the descriptor. */
     func->sync_params();
 
-    if (c.const_eval && is_pure && func->id)
+    if (is_pure && func->id)
         func->eval(c.const_ctx);
 
     ret = std::move(func);
@@ -2830,7 +2881,7 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
              * embedded inline (compute_layout); a forward-ref / boxed one stays
              * a boxed pointer field. A self/forward reference is simply not yet
              * in scope, so it boxes - no infinite layout. */
-            if (c.const_eval) {
+            {
                 Identifier nameRef(fd.struct_ty->val);
                 const EvalValue ev = nameRef.eval(c.const_ctx);
                 if (ev.is<LValue *>()) {
@@ -2874,13 +2925,12 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
      * field) with a clear "box it as 'dyn?'" message - before compute_layout,
      * which would otherwise just silently box the back-edge */
     check_struct_no_recursion(stmt->def, field_locs,
-                              c.const_eval ? c.const_ctx : nullptr);
+                              c.const_ctx);
 
     /* decide POD vs boxed storage and assign POD field byte offsets */
     stmt->def->compute_layout();
 
-    if (c.const_eval)
-        stmt->eval(c.const_ctx);
+    stmt->eval(c.const_ctx);
 
     ret = std::move(stmt);
     return true;
@@ -3433,7 +3483,7 @@ pAcceptForeachStmt(ParseContext &c,
         stmt->body = pBraceLessBody(c, fl | pFlags::pInLoop);
     c.shadow_pop();
 
-    if (c.const_eval && stmt->container->is_const) {
+    if (stmt->container->is_const) {
 
         const EvalValue &v = RValue(stmt->container->eval(c.const_ctx));
 
