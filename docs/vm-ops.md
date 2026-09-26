@@ -1457,7 +1457,14 @@ one is nulled when codegen finishes.
 
 **A THIRD side table — `Chunk::inline_ctxs` (`pc → inline_frames index`, P8 Inc
 4).** Same shape/cost as `locs` (sorted, binary-searched, throw path only),
-populated by `extract_locs` from an op's `node->inline_ctx`: it records the
+populated by `extract_locs` from an op's `node->inline_ctx` - or, for an op
+with no node of its own (every op whose carets live in a POOL: the chain
+stores, the member-key ops, ...), from `CgInstr::inl`, the chain INHERITED
+from the innermost compiled node the op was emitted for (the six
+`compile_*` dispatchers and `gen_stmt` stamp it on their way out, #38 repro
+C - such an op used to record NO entry, and a write through an inlined
+parameter into a const rendered no backtrace at all under the VM): it
+records the
 "inlined-at" chain of any op spliced from an inlined body, so a backtrace
 crossing inlined code shows the virtual frames under the VM too
 (`vm_flush_inline`, flushed at `vm_raise` / a call-op signal-propagation / the

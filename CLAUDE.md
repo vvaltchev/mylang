@@ -6003,7 +6003,14 @@ and two macros:
   The flag describes the frame the exception is CURRENTLY in, so recording a
   physical frame (`Exception::push_frame`, every engine's one entry point)
   resets it - otherwise a callee's virtual frame suppresses its caller's
-  (#38 repro B). `format_backtrace` is untouched. See
+  (#38 repro B). **The VM reads the chain per OP, and an op whose carets
+  live in a POOL has no node to read it from** (#38 repro C): such an op
+  INHERITS the chain of the innermost node it was compiled for
+  (`CgInstr::inl`, stamped by the six `compile_*` dispatchers and
+  `gen_stmt`) - which is what the tree-walker's per-ancestor
+  `Construct::eval` flush amounts to. A new codegen entry point that
+  compiles a node outside those dispatchers must stamp it too, or its
+  pooled ops drop the frames. `format_backtrace` is untouched. See
   `plans/archived/function-inlining.md`.
 - **Tests** pin caret spans via the `test` struct's
   `ex_col`/`ex_line`/`ex_col_end`/`ex_line_end` (each checked only when nonzero;
