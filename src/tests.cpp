@@ -22751,6 +22751,13 @@ static bool const_fold_equivalence()
             "pure func f(x) => x + K;",
             "const Z = f(2);",
             "print(Z, f(runtime(5)));" } },
+        /* a const CONTAINER is reachable from a pure body at compile time
+         * only through a folded use - so a pure body folds under -nc too */
+        { "a pure func called from a const reads a const array", {
+            "const NAMES = [\"a\", \"b\", \"c\"];",
+            "pure func f(x) => x + len(NAMES) + NAMES[1];",
+            "const T = f(\"<\");",
+            "print(T, f(runtime(\">\")));" } },
         { "a named call to a pure func initializes a const", {
             "pure func f(a, opt b) => a + (b ?? 1);",
             "const Z = f(a: 4, b: 5);",

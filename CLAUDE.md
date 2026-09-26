@@ -1921,7 +1921,11 @@ checked, so keeping them would refuse programs), and EVALUATING each
 constant expression, so an error it raises is the same compile error
 (`nc_eval_const`). A folded node's absence is visible to exactly one rule,
 pExpr14's assignable shape (`K[0]` folds to a VALUE), which reads
-`Construct::nc_folds`. Nets: the `parse: -nc ...` `-rt` entry
+`Construct::nc_folds`. ONE exception, `ParseContext::folding()`: a `pure
+func` BODY folds either way - it is the const evaluator's own code, and a
+const CONTAINER it reads (`len(NAMES)`) is reachable at compile time only
+through a folded use, so `const T = f(5);` failed under -nc alone. Nets:
+the `parse: -nc ...` `-rt` entry
 (`const_fold_equivalence`: fold on/off x both engines, byte-identical
 output AND rendered error) and `tests/corpus_diff.sh`'s `-nc` pass.
 

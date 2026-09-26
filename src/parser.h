@@ -93,6 +93,18 @@ public:
      * boxed a nested POD field.
      */
     const bool fold;
+
+    /*
+     * Inside a `pure func` body the parse-time evaluator folds with or
+     * without `-nc`: the body is the const evaluator's OWN code, and a
+     * const container it reads is reachable at compile time only through a
+     * folded use (`len(NAMES)`, `NAMES[1]`) - un-folded, `const T = f(5);`
+     * failed under -nc with "Undefined variable 'NAMES' while evaluating a
+     * PURE function" where the default compiled. So `-nc` shows a pure
+     * body folded; everything else stays as written.
+     */
+    int pure_depth = 0;
+    bool folding() const { return fold || pure_depth > 0; }
     EvalContext *const_ctx; // points to const_ctx_owner's object
     unique_ptr<CseCache> cse; // const-expr de-dup cache (per-block scopes)
 

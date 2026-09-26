@@ -640,7 +640,7 @@ detach_baked_funcs(ParseContext &c, unique_ptr<Construct> &slot,
                    const std::unordered_set<const FuncDescriptor *> &descs);
 
 /*
- * #54: a folding site under `-nc` (!c.fold). EVALUATE the constant node -
+ * #54: a folding site under `-nc` (!c.folding()). EVALUATE the constant node -
  * so an error it raises is the same compile-time error the folding run
  * raises - and record on it whether that run would have REPLACED it by a
  * literal (Construct::nc_folds, read by pExpr14's assignable-shape rule:
@@ -1160,11 +1160,11 @@ pAcceptCallExpr(ParseContext &c,
         if (expr->what->is_const && expr->args->is_const)
             expr->is_const = true;
 
-        if (expr->is_const && !c.fold)
+        if (expr->is_const && !c.folding())
             nc_eval_const(c, expr.get(), (fl & pFlags::pInConstDecl) != 0,
                           (fl & pFlags::pInConstDecl) != 0);
 
-        if (c.fold && expr->is_const) {
+        if (c.folding() && expr->is_const) {
 
             /* -a: this call is about to fold to a literal at compile time -
              * color the callee identifier magenta before it is gone. */
@@ -1247,7 +1247,7 @@ pAcceptSubscript(ParseContext &c,
         ret->start = wstart;
         ret->end = c.get_loc() + 2;   /* get_loc() is the ']' */
 
-        if (!c.fold && ret->is_const) {
+        if (!c.folding() && ret->is_const) {
 
             if (!in_slice || fl & pFlags::pInConstDecl)
                 nc_eval_const(c, ret.get(), true,
@@ -1888,7 +1888,7 @@ pExpr14(ParseContext &c, unsigned fl)
 
             /* Just return lside (doing const eval if possible) */
 
-            if (lside->is_const && !c.fold)
+            if (lside->is_const && !c.folding())
                 nc_eval_const(c, lside.get(), false, false);
             else if (lside->is_const)
                 MakeConstructFromConstVal(lside->eval(c.const_ctx), lside);
@@ -2012,7 +2012,7 @@ pExpr14(ParseContext &c, unsigned fl)
     /* #54: a CONST declaration's rvalue is materialized with or without
      * `-nc` - its value, baked deep read-only, is what the const IS. Only a
      * `var` initializer's bake is folding. */
-    if (!c.fold && ret->rvalue->is_const
+    if (!c.folding() && ret->rvalue->is_const
         && !(fl & pFlags::pInConstDecl)
         && !dynamic_cast<LiteralObj *>(ret->rvalue.get()))
     {
@@ -2088,7 +2088,7 @@ pExprTop(ParseContext &c, unsigned fl)
     unique_ptr<Construct> e = pExpr14(c, fl);
 
     if (e && e->is_const && !e->is_nop()) {
-        if (c.fold)
+        if (c.folding())
             MakeConstructFromConstVal(e->eval(c.const_ctx), e);
         else
             nc_eval_const(c, e.get(), false, false);
@@ -2609,6 +2609,8 @@ pAcceptFuncDecl(ParseContext &c,
         for (const auto &pm : func->params->elems)
             if (const auto *pid = dynamic_cast<const Identifier *>(pm.get()))
                 c.shadow_add(pid->uid);
+    if (is_pure)
+        c.pure_depth++;                /* #54: see ParseContext::folding */
 
     if (pAcceptOp(c, Op::arrow)) {
 
@@ -2640,6 +2642,8 @@ pAcceptFuncDecl(ParseContext &c,
         );
     }
     c.shadow_pop();                    /* #133: the params' scope */
+    if (is_pure)
+        c.pure_depth--;
 
     func->end = c.get_loc() + 1;
 

@@ -1,0 +1,51 @@
+# What a program MEANS at compile time - consts, struct types, pure
+# functions - must not depend on whether constant expressions are FOLDED.
+#
+# `-nc` turns folding off (an optimization), and until #54 it turned the
+# whole parse-time evaluator off with it: this file then failed to compile
+# ("expression is not const", "'P' is not a type") and a nested POD field
+# was stored boxed. tests/corpus_diff.sh compares default vs -nc (RULE 2),
+# so every line here is also an assertion about -nc.
+
+const K = 3;
+const NAMES = ["a", "b", "c"];
+
+struct S { const Z = K * 2; const W = len(NAMES) + K; }
+print("member  ", S.Z, S.W);
+
+struct P { int x; float f; }
+P p = P(runtime(4), 1.5);
+P q;
+print("typed   ", p.x, p.f, q.x, q.f);
+
+struct I { int a; int b; }
+struct O { I i; int c; }
+var o = O(I(runtime(1), 2), 3);
+print("layout  ", o.i.b, layout(O));
+
+pure func scaled(x) => x * K + len(NAMES);
+const T = scaled(5);
+print("pure    ", T, scaled(runtime(1)));
+
+pure func pair(a, opt b) => a + (b ?? 10);
+const U = pair(a: 1, b: 2);
+print("named   ", U, pair(runtime(1)));
+
+# a const container is read-only through any alias
+var alias = NAMES;
+try {
+    alias[0] = "z";
+} catch (NotLValueEx) {
+    print("readonly", NAMES);
+}
+
+# an empty [] into array<POD struct> starts flat
+var pts = [];
+for (var i = 0; i < 3; i++)
+    append(pts, P(i, i * 0.5));
+print("storage ", array_storage(pts), len(pts));
+
+# a statically dead branch is discarded, not checked
+const DEBUG = false;
+if (DEBUG) { trace_everything(); }
+print("dead    ", DEBUG ? undefined_thing : "skipped");

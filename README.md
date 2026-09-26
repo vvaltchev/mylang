@@ -839,7 +839,9 @@ struct still defines a type (usable in a declaration, with the same memory
 layout), a `pure func` can still be called from a `const` initializer, a
 statically dead branch is still discarded, and a constant expression that
 always fails is still a compile error. A program compiles, runs, prints and
-fails identically with and without `-nc` — only its syntax tree differs.
+fails identically with and without `-nc` — only its syntax tree differs (and
+not even inside a `pure func` body, which is folded either way: that is what
+lets it be called at compile time).
 
 #### De-duplication of const expressions
 
