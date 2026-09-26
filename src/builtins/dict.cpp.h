@@ -82,19 +82,15 @@ EvalValue
 builtin_erase_dict(LValue *lval, const EvalValue &key)
 {
     DictObject &dictObj = *lval->getval<intrusive_ptr<DictObject>>().get();
-    DictObject::inner_type &data = dictObj.get_ref();
-    dictObj.will_restructure();        /* #53: see DictObject::Cursor */
-    return data.erase(key) > 0;
+    return dictObj.erase_key(key);     /* #53: restructures - see Cursor */
 }
 
 EvalValue
 builtin_insert_dict(LValue *lval, const EvalValue &key, const EvalValue &val)
 {
     DictObject &dictObj = *lval->getval<intrusive_ptr<DictObject>>().get();
-    DictObject::inner_type &data = dictObj.get_ref();
-    dictObj.will_restructure();        /* #53: see DictObject::Cursor */
-    const auto &it = data.insert(make_pair(key, LValue(val, false)));
-    return it.second;
+    /* #53: restructures (see Cursor) only when the key is new */
+    return dictObj.insert_if_absent(EvalValue(key), LValue(val, false));
 }
 
 /*

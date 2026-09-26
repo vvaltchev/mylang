@@ -7590,12 +7590,18 @@ run program code - otherwise `p` is bound whole, a COPY. A DICT loop
 walks a **`DictObject::Cursor`** (shareddict.h): live until the body
 RESTRUCTURES the dict, then a snapshot of the remaining keys, each
 looked up when its turn comes. **Every structural change - a new key,
-an erase - must call `will_restructure()` first** (TypeDict::subscript's
-two emplaces, the member lvalue paths, erase/insert); a site that
-forgets it leaves a live cursor over a rehashed map, and the cursor's
-`ML_CHECK` on the map size is the tripwire. Calling it when nothing
-restructures is harmless (a snapshot of the same keys is
-unobservable). **Callback handle lifetime:** when a builtin keeps a raw
+an erase - snapshots the linked cursors first (`will_restructure()`),
+and since #53 part B that is ENFORCED BY THE TYPE, not by convention:
+the map is private, `get_ref()` hands out a CONST reference only (a
+`static_assert` in types/dict.cpp.h pins it), the hook is private, and
+a mutation goes through `insert_new` / `insert_if_absent` /
+`erase_key` (each calls the hook, and only when a key is really added
+or removed), `find_mut` (a mutable ITERATOR for a VALUE store into an
+existing entry - no snapshot; it cannot add or remove a key) or
+`build_emplace` (a fresh dict under construction, ML_CHECKed
+cursor-free).** A new site that needs another mutation adds a method
+there; do not hand out the map. The cursor's `ML_CHECK` on the map size
+stays as the tripwire. **Callback handle lifetime:** when a builtin keeps a raw
 `FuncObject *` to the callback, the `shared_ptr` that owns it must outlive every
 call — an inline lambda (`find(a, x, func(e)=>…)`) has *no other owner*, so a
 raw pointer extracted from a `RValue()` temporary that goes out of scope before
