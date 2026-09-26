@@ -16616,6 +16616,70 @@ inlined_builtin_backtrace_parity()
 }
 
 /*
+ * RULE 2: a NEGATIVE SHIFT COUNT carries the shift's caret in every
+ * engine. The interpreter's shifts - the specialized IntShl/IntShr RR/RI
+ * and IntBin's shl/shr/ushr - computed through bit_shl & co, whose
+ * InvalidValueEx is loc-less, and nothing stamped it on its way to the
+ * boundary walk: the error rendered with NO location (and a backtrace
+ * frame "at line 0") where the tree-walker and the JIT's emitted
+ * negative-count arm mark the shift. A negative IMMEDIATE never reaches
+ * the JIT at all (imm_shift_ok), so for `v << -1` the interpreter was
+ * the only engine, and the only one wrong. Each shape runs at the top
+ * level and in a function, over a literal, a typed local and a
+ * compound, and must render the -ni tree-walker's answer everywhere.
+ */
+static bool
+negative_shift_caret_parity()
+{
+    const char *const exprs[] = {
+        "var w = v << -1;", "var w = v >> -1;", "var w = v >>> -1;",
+        "var w = v << k;", "var w = v >> k;", "var w = v >>> k;",
+        "v <<= -1;", "v >>= k;", "v >>>= k;",
+    };
+    const struct { const char *name; bool jit, splice; } cfgs[] = {
+        { "tw", false, false }, { "vm -nbi", false, false },
+        { "jit -nbi", true, false }, { "vm", false, true },
+        { "jit", true, true },
+    };
+    bool ok = true;
+    int located = 0;
+    for (const char *ex : exprs) {
+        for (const bool top : { true, false }) {
+            const std::string body =
+                std::string("var v = int(runtime(7));\n")
+                + "var k = int(runtime(-1));\n" + ex + "\n";
+            const std::string src = top
+                ? body + "print(v);\n"
+                : "func go() {\n" + body + "return v;\n}\n"
+                  "print(\"start\");\nprint(go());\n";
+            int rv = 0;
+            const std::string ref = engine_run_bt(
+                src, ExecEngine::TreeWalk, false, false, false, &rv);
+            if (ref.find("EXC InvalidValueEx") == std::string::npos
+                    || ref.find("caret 0:0") != std::string::npos) {
+                cout << "  VACUOUS: the reference did not raise a located "
+                        "negative shift:\n" << src << ref;
+                ok = false;
+                continue;
+            }
+            located++;
+            for (const auto &c : cfgs) {
+                const bool tw = std::string(c.name) == "tw";
+                const std::string r = engine_run_bt(
+                    src, tw ? ExecEngine::TreeWalk : ExecEngine::Vm, c.jit,
+                    c.splice, true, &rv);
+                if (r != ref) {
+                    cout << "  " << c.name << " differs from -ni -tw for\n"
+                         << src << "  ref:\n" << ref << "  got:\n" << r;
+                    ok = false;
+                }
+            }
+        }
+    }
+    return ok && located == 18;
+}
+
+/*
  * #38 repro B - THE BACKTRACE ORACLE. The reference for an uncaught
  * error is the program run with inlining OFF in the tree-walker: no
  * inlined-at chain exists there, so every frame is a physical one and
@@ -46895,6 +46959,8 @@ static const std::vector<extra_check> extra_checks =
       inlined_builtin_backtrace_parity },
     { "backtrace: inlining renders the -ni backtrace, every engine (#38)",
       inlined_backtrace_oracle },
+    { "caret: a negative shift count carries the shift's caret, every "
+      "engine", negative_shift_caret_parity },
     { "static_type: ground caching & with_opt", static_type_ground_caching },
     { "static_type: assignable rules", static_type_assignable_rules },
     { "static_type: join (LUB) rules", static_type_join_rules },

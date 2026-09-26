@@ -10978,10 +10978,38 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         ML_IRI(IntOrRI,  a | b)
         ML_IRR(IntXorRR, a ^ b)
         ML_IRI(IntXorRI, a ^ b)
-        ML_IRR(IntShlRR, bit_shl(a, b))
-        ML_IRI(IntShlRI, bit_shl(a, b))
-        ML_IRR(IntShrRR, bit_shr(a, b))
-        ML_IRI(IntShrRI, bit_shr(a, b))
+        /*
+         * The SHIFTS raise on a negative count, and that raise must carry
+         * the op's caret like any other - it used to leave bit_shl's
+         * loc-less C++ throw to the boundary walk, which stamps nothing,
+         * so `v << k` with k < 0 rendered with NO location in the
+         * interpreter where the tree-walker (and the JIT's emitted
+         * negative-count arm) mark the shift (RULE 2). The raise goes
+         * through vm_raise, exactly as IntBin's div0 does. (An RI form
+         * with a negative immediate is never JIT'd - imm_shift_ok - so
+         * the interpreter is the only engine that runs it.)
+         */
+#define ML_ISH(NAME, BREAD, FN)                                              \
+        VM_CASE(NAME): {                                                     \
+            const int_type a = read_int_slot(&ctx, in->a_slot());              \
+            const int_type b = (BREAD);                                        \
+            if (b < 0) {                                                     \
+                if (!vm_raise(chunk, pc, act, ctx,                           \
+                              std::make_unique<InvalidValueEx>(              \
+                                  "negative shift count")))                  \
+                    return;               /* boundary: signal set */         \
+                code = chunk->code.data();                                   \
+                VM_NEXT;                  /* dispatched: skip the write */   \
+            }                                                                \
+            write_int_slot(&ctx, in->target, FN(a, b));                     \
+            pc++;                                                            \
+        }                                                                    \
+        VM_NEXT;
+        ML_ISH(IntShlRR, read_int_slot(&ctx, in->b_slot()), bit_shl)
+        ML_ISH(IntShlRI, in->b_lit(), bit_shl)
+        ML_ISH(IntShrRR, read_int_slot(&ctx, in->b_slot()), bit_shr)
+        ML_ISH(IntShrRI, in->b_lit(), bit_shr)
+#undef ML_ISH
 
         VM_CASE(IntModRI): {
             /* selected only for a NONZERO immediate - no zero check */
@@ -11047,9 +11075,20 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             case Op::band: r = a & b;          break;
             case Op::bor:  r = a | b;          break;
             case Op::bxor: r = a ^ b;          break;
-            case Op::shl:  r = bit_shl(a, b);  break;
-            case Op::shr:  r = bit_shr(a, b);  break;
-            case Op::ushr: r = bit_ushr(a, b); break;
+            case Op::shl: case Op::shr: case Op::ushr:
+                /* a negative count raises WITH the op's caret (see the
+                 * specialized shifts; bit_* would throw it loc-less) */
+                if (b < 0) {
+                    if (!vm_raise(chunk, pc, act, ctx,
+                                  std::make_unique<InvalidValueEx>(
+                                      "negative shift count")))
+                        return;
+                    code = chunk->code.data();
+                    VM_NEXT;
+                }
+                r = in->aop == Op::shl ? bit_shl(a, b)
+                  : in->aop == Op::shr ? bit_shr(a, b) : bit_ushr(a, b);
+                break;
             default: throw InternalErrorEx();
             }
 
