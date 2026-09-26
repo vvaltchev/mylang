@@ -16433,6 +16433,7 @@ engine_run_bt(const std::string &src, ExecEngine eng, bool jit, bool splice,
             for (const auto &bf : e.backtrace)
                 if (!bf.desc)
                     ++*virt;
+            tail += std::string("msg ") + (e.msg ? e.msg : "") + "\n";
             tail += "caret " + std::to_string(e.loc_start.line) + ":"
                   + std::to_string(e.loc_start.col) + "-"
                   + std::to_string(e.loc_end.line) + ":"
@@ -16677,6 +16678,255 @@ negative_shift_caret_parity()
         }
     }
     return ok && located == 18;
+}
+
+/*
+ * RULE 2 FOR A COMPOUND STORE'S CARET. `lv OP= rhs` (and `lv++`) can fail
+ * in two places, and the tree-walker carets them differently: REACHING
+ * the element (an out-of-bounds index, a missing key, not-an-lvalue) at
+ * the LVALUE - the node that raised it - and the OPERATION (a division by
+ * zero, a negative shift count, a type error) at the WHOLE compound
+ * expression, the first node whose Construct::eval stamps that loc-less
+ * throw. The VM used to carry ONE caret per store op: a dict / struct /
+ * dyn / general-array compound's operation error took the lvalue span, a
+ * flat array's compound OOB took the whole statement, and a nested store
+ * (whose carets live in chain_locs) raised with NO location at all.
+ *
+ * The check is a MATRIX, generated rather than hand-picked: every target
+ * shape (local, global, flat int / float array element, 2- and 3-level
+ * nesting, dict key, dict member, POD and boxed struct field, a flat
+ * struct array element's field, a dyn container, a dict of arrays, the
+ * member chains - a struct's array field, an array of dicts' member, a
+ * nested POD field, a dyn struct - and a const container reached
+ * through a parameter) x the errors that shape
+ * can raise x representative compound / inc-dec operators x how the
+ * failing operand is written (a literal, a `runtime()` call, a typed
+ * local, a `dyn` local), each both at the top level and inside a
+ * function. The reference is the tree-walker with inlining OFF (the
+ * bt_oracle convention); every engine configuration must render the
+ * same stdout, exception, message, backtrace and caret span.
+ *
+ * NOT VACUOUS: every program must end in an exception in the reference,
+ * and the run counts the programs whose caret is the WHOLE expression
+ * (an operation error) and those whose caret is the lvalue alone - both
+ * must be well represented, or the matrix no longer tests the split.
+ * tests/bt_oracle/compound_*.my carry representatives through the CLI
+ * configurations -rt cannot reach (.myv, the JIT levers).
+ */
+static bool
+compound_store_caret_parity()
+{
+    struct Shape { const char *name, *decl, *target; };
+    static const Shape shapes[] = {
+        { "local", "var v = 7;", "v" },
+        { "global", "", "gv" },
+        { "arr", "var a = [1, 2, 3];", "a[I]" },
+        { "farr", "var a = [1.5, 2.5];", "a[I]" },
+        { "nest2", "var m = [[1, 2], [3, 4]];", "m[J][I]" },
+        { "nest3", "var m = [[[1, 2]], [[3, 4]]];", "m[J][0][I]" },
+        { "dict", "var d = {\"k\": 5};", "d[K]" },
+        { "dmem", "var d = {\"k\": 5};", "d.M" },
+        { "pod", "var p = P(5, 6);", "p.x" },
+        { "boxed", "var q = Q(5, \"s\");", "q.n" },
+        { "dyn", "var dyn dy = [1, 2];", "dy[I]" },
+        { "dyndict", "var dyn dd = {\"k\": 5};", "dd[K]" },
+        { "arrstruct", "var ps = [P(1, 2), P(3, 4)];", "ps[I].x" },
+        { "dictarr", "var da = {\"k\": [1, 2]};", "da[K][I]" },
+        { "sfarr", "var sa = S(\"a\", [1, 2]);", "sa.v[I]" },
+        { "adm", "var ad = [{\"k\": 1}];", "ad[I].M" },
+        { "nestpod", "var np = N(P(1, 2), 3);", "np.p.x" },
+        { "dynq", "var dyn dq = Q(5, \"s\");", "dq.n" },
+        { "dynstr", "var dyn ds = [\"s\", 1];", "ds[I]" },
+        { "constp", "", "cp[I]" },
+        { "constdp", "", "cd[K]" },
+        { "constsp", "", "cs.x" },
+    };
+    /* the error kinds: which placeholder carries the failing operand
+     * (`@` = the variable one) and which operators raise it */
+    struct Err { const char *name; const char *I, *J, *K, *M, *Z;
+                 std::vector<const char *> ops; };
+    const std::vector<const char *> access = { "+=", "++X", "X--" };
+    const Err errs[] = {
+        { "oob", "@5", "0", "\"k\"", "k", "1", access },
+        { "oobouter", "0", "@5", "\"k\"", "k", "1", access },
+        { "key", "0", "0", "@\"nope\"", "nope", "1", access },
+        { "div0", "0", "0", "\"k\"", "k", "@0", { "/=", "%=" } },
+        { "neg", "0", "0", "\"k\"", "k", "@-1", { "<<=", ">>>=" } },
+        { "type", "0", "0", "\"k\"", "k", "1", { "-=", "X++" } },
+        { "const", "0", "0", "\"k\"", "k", "1", access },
+    };
+    /* how the failing operand is spelled */
+    enum Mode { lit, call, typed, dynvar };
+    const auto spell = [](const std::string &v, Mode m) -> std::string {
+        if (m == lit)
+            return v;
+        if (m == call)
+            return "runtime(" + v + ")";
+        return "vv";
+    };
+    const auto vdecl = [](const std::string &v, Mode m) -> std::string {
+        if (m == typed)
+            return std::string("var vv = ")
+                   + (v[0] == '"' ? "str" : "int") + "(runtime(" + v
+                   + "));\n";
+        if (m == dynvar)
+            return "var dyn vv = runtime(" + v + ");\n";
+        return "";
+    };
+    const auto has = [](const char *s, char c) {
+        return std::strchr(s, c) != nullptr;
+    };
+
+    /* each program, and whether its error is the OPERATION's */
+    std::vector<std::pair<std::string, bool>> progs;
+    for (const Shape &sh : shapes) {
+        const std::string nm = sh.name;
+        const bool is_const = nm.compare(0, 5, "const") == 0;
+        for (const Err &er : errs) {
+            const std::string en = er.name;
+            if (en == "oob" && !has(sh.target, 'I'))
+                continue;
+            if (en == "oobouter" && !has(sh.target, 'J'))
+                continue;
+            if (en == "key" && !has(sh.target, 'K') && !has(sh.target, 'M'))
+                continue;
+            if ((en == "type") != (nm == "dynstr"))
+                continue;
+            if (en == "const" && !is_const)
+                continue;
+            for (const char *op : er.ops) {
+                const std::string sop = op;
+                if (nm == "farr" && (sop == "%=" || sop == "<<="
+                                     || sop == ">>>="))
+                    continue;
+                for (Mode m : { lit, call, typed, dynvar }) {
+                    std::string failing;
+                    const auto fill = [&](const char *ph) {
+                        std::string s = ph;
+                        if (s[0] != '@')
+                            return s;
+                        failing = s.substr(1);
+                        return spell(failing, m);
+                    };
+                    std::string tgt = sh.target;
+                    const std::string I = fill(er.I), J = fill(er.J),
+                                      K = fill(er.K), Z = fill(er.Z);
+                    /* a member name is always a literal */
+                    std::string Mn = er.M;
+                    if (failing.empty() && m != lit)
+                        continue;          /* nothing varies: one mode */
+                    for (auto &pr : std::vector<std::pair<char,
+                                                          std::string>>{
+                             { 'M', Mn }, { 'K', K }, { 'J', J },
+                             { 'I', I } }) {
+                        size_t at;
+                        while ((at = tgt.find(pr.first)) != std::string::npos)
+                            tgt.replace(at, 1, pr.second);
+                    }
+                    std::string stmt;
+                    if (sop.find('X') != std::string::npos) {
+                        stmt = sop;
+                        stmt.replace(stmt.find('X'), 1, tgt);
+                    } else {
+                        stmt = tgt + " " + sop + " " + Z;
+                    }
+                    const std::string vd = failing.empty()
+                                               ? "" : vdecl(failing, m);
+                    const std::string head =
+                        "struct P { int x; int y; }\n"
+                        "struct Q { int n; str s; }\n"
+                        "struct S { str n; array<int> v; }\n"
+                        "struct N { P p; int z; }\n"
+                        "var gv = 7;\n";
+                    for (const bool top : { false, true }) {
+                        if (is_const && top)
+                            continue;
+                        std::string src = head;
+                        if (top) {
+                            src += std::string(sh.decl) + "\n"
+                                 + "print(\"start\");\n" + vd + stmt
+                                 + ";\n";
+                        } else {
+                            std::string params, call = "go()";
+                            if (is_const) {
+                                src += "const CA = [1, 2];\n"
+                                       "const CD = {\"k\": 5};\n"
+                                       "const CS = P(5, 6);\n";
+                                params = "array<int> cp, dict<str, int> cd, "
+                                         "P cs";
+                                call = "go(CA, CD, CS)";
+                            }
+                            src += "func go(" + params + ") {\n    "
+                                 + sh.decl + "\n    " + vd + stmt
+                                 + ";\n    return 1;\n}\n"
+                                 + "print(\"start\");\nprint(" + call
+                                 + ");\n";
+                        }
+                        progs.push_back({src, en == "div0"
+                                                  || en == "neg"
+                                                  || en == "type"});
+                    }
+                }
+            }
+        }
+    }
+
+    bool ok = true;
+    size_t whole = 0, part = 0, compile_refused = 0;
+    const struct { const char *name; bool jit, splice; } cfgs[] = {
+        { "vm -nbi", false, false }, { "jit -nbi", true, false },
+        { "vm", false, true }, { "jit", true, true },
+    };
+    for (const auto &pg : progs) {
+        const std::string &src = pg.first;
+        int rv = 0;
+        const std::string ref = engine_run_bt(src, ExecEngine::TreeWalk,
+                                              false, false, false, &rv);
+        if (ref.find("EXC ") == std::string::npos) {
+            cout << "  VACUOUS: the reference did not raise:\n" << src
+                 << "  ---\n" << ref;
+            ok = false;
+            continue;
+        }
+        /* a compile refusal (a statically proven error) is a correct
+         * answer too, and one no engine choice can change - it is
+         * counted, not compared */
+        if (ref.find("start") == std::string::npos) {
+            compile_refused++;
+            continue;
+        }
+        const std::vector<std::pair<const char *, std::string>> runs = {
+            { "tw", engine_run_bt(src, ExecEngine::TreeWalk, false, false,
+                                  true, &rv) },
+            { cfgs[0].name, engine_run_bt(src, ExecEngine::Vm, false, false,
+                                          true, &rv) },
+            { cfgs[1].name, engine_run_bt(src, ExecEngine::Vm, true, false,
+                                          true, &rv) },
+            { cfgs[2].name, engine_run_bt(src, ExecEngine::Vm, false, true,
+                                          true, &rv) },
+            { cfgs[3].name, engine_run_bt(src, ExecEngine::Vm, true, true,
+                                          true, &rv) },
+        };
+        for (const auto &r : runs)
+            if (r.second != ref) {
+                cout << "  compound caret: " << r.first
+                     << " differs from -ni -tw for\n" << src
+                     << "  ref:\n" << ref << "  got:\n" << r.second;
+                ok = false;
+            }
+        if (pg.second)
+            whole++;
+        else
+            part++;
+    }
+    if (whole < 100 || part < 100) {
+        cout << "  VACUOUS: " << whole << " operation-error and " << part
+             << " access-error programs ran over " << progs.size()
+             << " - the matrix no longer tests the split\n";
+        ok = false;
+    }
+    (void)compile_refused;
+    return ok;
 }
 
 /*
@@ -25780,13 +26030,15 @@ static bool myv_arg_locs_equal(const Chunk &x, const Chunk &y)
     return true;
 }
 
-/* All three pc-keyed caret tables: `locs`, the store-BASE carets (#127) and
- * the per-ARGUMENT carets (RULE 2) - the `-vd` dump prints the first two
- * only as `pc -> start`, the same blind spot. */
+/* All four pc-keyed caret tables: `locs`, the store-BASE carets (#127),
+ * the compound-OPERATION carets and the per-ARGUMENT carets (RULE 2) -
+ * the `-vd` dump prints the first two only as `pc -> start`, the same
+ * blind spot. */
 static bool myv_locs_equal(const Chunk &x, const Chunk &y)
 {
     return myv_loc_table_equal("loc", x.locs, y.locs)
            && myv_loc_table_equal("base_loc", x.base_locs, y.base_locs)
+           && myv_loc_table_equal("op_loc", x.op_locs, y.op_locs)
            && myv_arg_locs_equal(x, y);
 }
 
@@ -25849,7 +26101,10 @@ static bool myv_round_trip()
         /* #127: a store whose BASE is a GLOBAL - the only shape that fills
          * the `base_locs` table, which the count guard below requires. */
         "var tbl = [0, 0];",
-        "func setrec(int i, int v) { tbl[i] = v; d[\"b\"] = v; }",
+        /* RULE 2 (v22): a COMPOUND store - the only shape that fills
+         * `op_locs`, which the count guard below requires */
+        "func setrec(int i, int v) { tbl[i] = v; d[\"b\"] = v;",
+        "                            d[\"b\"] += 1; }",
         "setrec(1, 7);",
         "var t = 0;",
         "try { throw P(1, 2); } catch (P as e) { t = e.y; }",
@@ -26145,6 +26400,7 @@ static bool myv_round_trip()
          * global-based store above would make its comparison vacuous. */
         size_t nbase = prog.root.base_locs.size();
         size_t nargl = prog.root.arg_locs.size();   /* RULE 2: likewise */
+        size_t nopl = prog.root.op_locs.size();     /* RULE 2: likewise */
 
         for (size_t i = 0; locs_ok && i < prog.funcs.size(); i++) {
             const Chunk *a =
@@ -26154,6 +26410,7 @@ static bool myv_round_trip()
             if (a && b) {
                 nbase += a->base_locs.size();
                 nargl += a->arg_locs.size();
+                nopl += a->op_locs.size();
                 if (!myv_locs_equal(*a, *b))
                     locs_ok = false;
             }
@@ -26167,6 +26424,12 @@ static bool myv_round_trip()
         if (!nbase) {
             fprintf(stderr, "myv: no base_locs to compare - the program "
                             "above no longer stores through a global\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        if (!nopl) {
+            fprintf(stderr, "myv: no op_locs to compare - the program "
+                            "above no longer has a compound store\n");
             g_exec_engine = saved;
             return false;
         }
@@ -46961,6 +47224,9 @@ static const std::vector<extra_check> extra_checks =
       inlined_backtrace_oracle },
     { "caret: a negative shift count carries the shift's caret, every "
       "engine", negative_shift_caret_parity },
+    { "caret: a compound store carets the lvalue for an access error and "
+      "the whole expression for an operation error, every engine",
+      compound_store_caret_parity },
     { "static_type: ground caching & with_opt", static_type_ground_caching },
     { "static_type: assignable rules", static_type_assignable_rules },
     { "static_type: join (LUB) rules", static_type_join_rules },

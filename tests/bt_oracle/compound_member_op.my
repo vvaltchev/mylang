@@ -1,0 +1,11 @@
+# a struct field compound's operation error (POD and boxed)
+struct P { int x; int y; }
+struct Q { int n; str s; }
+func g(P p, Q q, z) { q.n <<= z; p.x /= z; }
+func drive(int n) {
+    var p = P(5, 6);
+    var q = Q(1, "s");
+    for (var i = 0; i < n; i++) g(p, q, i == 2 ? runtime(-1) : 1);
+    return n;
+}
+print(drive(runtime(4)));

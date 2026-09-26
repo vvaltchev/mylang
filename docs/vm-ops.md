@@ -1453,6 +1453,35 @@ JIT pc remaps and the splice like the other two; bounded by
 9.21); printed by `-vd` with both ends of every span. An arity error
 (about the list) keeps `base_locs`' span. Record: docs/jit-optimizations.md,
 *RULE 2, refined*.
+
+**`Chunk::op_locs` — a COMPOUND store's OPERATION caret (RULE 2,
+2026-09-25).** `lv OP= rhs` (and `lv++`) fails in two places, and the
+tree-walker carets them differently: REACHING the element (an OOB index, a
+missing key, not-an-lvalue) at the LVALUE, the node that raised it, and
+the OPERATION (div0, a negative shift count, a type error, INT_MIN / -1)
+at the WHOLE compound expression, the first node whose `Construct::eval`
+stamps that loc-less throw. So every store op has this contract: `locs`
+(or its pool - `member_keys`, `chain_locs`, `chain_steps`) carries the
+LVALUE's span, and a compound records the whole expression here -
+DictStore, StoreElemValue, StoreElemInt/Float, StoreMemberV, StoreElem2V,
+StoreElemChainV, StoreLValueChainV, from `CgInstr::op_node_idx` set through
+`add_op_node` (a plain assignment records nothing, so the table is
+sparse). An operation error is recognized by `Exception::op_caret`, which
+`apply_compound_op` sets on a loc-less throw and the flat store bodies set
+on their own div0 / negative-shift / overflow checks; the store cores
+leave such an exception LOC-LESS (their lvalue and step carets are for
+access errors only) and every stamp site selects on the flag -
+`vm_stamp_caret` (the interpreter's store handlers and `vm_raise`) and the
+JIT's `emit_exc_stamp`, which bakes both spans on the cold arm and tests
+the flag at run time (nothing is emitted for an op with no entry, so
+every other op's bytes are unchanged). Before it a dict / struct / dyn /
+general-array compound's operation error carried the lvalue span, a flat
+array's compound OOB the whole statement (StoreElemInt/Float recorded the
+Expr14 in `locs`), and a nested store's operation error NO location at
+all. Rides both JIT pc remaps and the splice; bounded by `verify_chunk`;
+serialized after `base_locs` as myv **v22** (section 9.2); printed by
+`-vd` with both ends. Pinned by the `caret: a compound store ...` `-rt`
+matrix and `tests/bt_oracle/compound_*.my`.
 The AST-node side table this section used to describe -
 `Chunk::node_table`/`node_at_pc` and the `ast_nodes` pool - is GONE with the
 fallback op it existed for; the codegen-transient handle now lives on

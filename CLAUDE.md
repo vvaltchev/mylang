@@ -5998,6 +5998,15 @@ and two macros:
   call, so its coercion keeps the builtin's list. `docs/vm-ops.md`,
   `Chunk::arg_locs`; the record is *RULE 2, refined* in
   docs/jit-optimizations.md.
+  **A COMPOUND store needs one more (RULE 2, 2026-09-25):** reaching the
+  element carets the LVALUE (`locs` / its pool), the OPERATION (div0, a
+  negative shift, a type error) the WHOLE `lv OP= rhs` - `Chunk::op_locs`.
+  `apply_compound_op` marks such a loc-less throw `Exception::op_caret`,
+  a store core must LEAVE it loc-less (never stamp its lvalue/step caret
+  on it), and every stamp site selects on the flag (`vm_stamp_caret`, the
+  JIT's `emit_exc_stamp`). A new store op with a compound form records
+  `op_node_idx` (`add_op_node`) and stamps through `vm_stamp_caret`.
+  `docs/vm-ops.md`, `Chunk::op_locs`.
 - **Context keywords**: `break`/`continue`/`return`/`rethrow` outside their
   valid context (gated by `pFlags` in `pStmt`) raise a clear `SyntaxErrorEx`
   ("... only allowed in a loop", etc.), not a generic "unexpected token".

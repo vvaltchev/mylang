@@ -23,11 +23,12 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 21;   /* v21: the foreach shift
-                                                 guard's two APPENDED
-                                                 opcodes (v20: a TABLE OF
-                                                 CONTENTS before the struct
-                                                 and descriptor tables) */
+constexpr unsigned MYV_FORMAT_VERSION = 22;   /* v22: a third loc table
+                                                 per chunk, `op_locs` (the
+                                                 compound-operation
+                                                 carets); v21: the foreach
+                                                 shift guard's two
+                                                 APPENDED opcodes */
 
 /*
  * The stored SOURCE REFERENCE (v2). An image does NOT embed the source text -

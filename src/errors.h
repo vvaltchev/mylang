@@ -164,6 +164,25 @@ struct Exception {
     int32_t bind_arg = -1;
 
     /*
+     * RAISED BY A COMPOUND ASSIGNMENT'S OPERATION (RULE 2): nonzero when
+     * this exception came out of the arithmetic / shift / type step of
+     * `lv OP= rhs` (or `lv++`) - apply_compound_op, or a flat store's
+     * own div0 / negative-shift check - rather than out of reaching the
+     * lvalue. The tree-walker carets the two differently: an access
+     * error (OOB, a missing key, not-an-lvalue) at the LVALUE, which is
+     * the node that raised it, and an operation error at the WHOLE
+     * compound expression, whose Construct::eval is the first to stamp
+     * a loc-less throw. A VM store op carries both spans - `locs` the
+     * lvalue, `op_locs` the whole expression (bytecode.h) - and a stamp
+     * site selects on this flag (vm_stamp_caret; the JIT's
+     * emit_exc_stamp reads it at run time). Only meaningful while the
+     * exception is LOC-LESS: every stamp that reads it is guarded by
+     * `!loc_start`. `int32_t` because the fragment tests it with one
+     * `cmp dword [rax+off], 0`.
+     */
+    int32_t op_caret = 0;
+
+    /*
      * Record a PHYSICAL frame - the one place every engine appends one
      * (#38 repro B). `inline_origin_emitted` and `jit_inline_frame` are
      * facts about the frame the exception is CURRENTLY unwinding

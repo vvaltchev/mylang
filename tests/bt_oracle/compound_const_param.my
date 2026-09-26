@@ -1,0 +1,10 @@
+# a const container reached through a parameter: a compound is not an
+# lvalue store - the caret is the lvalue, as for the plain store
+const CA = [1, 2];
+func g(array<int> p) { p[1] += 5; }
+func drive(int n) {
+    var a = [1, 2];
+    for (var i = 0; i < n; i++) { if (i == 2) g(CA); else g(a); }
+    return n;
+}
+print(drive(runtime(4)));

@@ -1203,6 +1203,10 @@ void write_chunk(Writer &w, const Chunk &c)
      * whose base can be an unbound global records one). */
     write_loc_table(w, c.base_locs);
     ct("  base_locs");
+    /* v22: the COMPOUND-OPERATION carets, same delta form (sparse - only
+     * a store op running a compound assignment records one) */
+    write_loc_table(w, c.op_locs);
+    ct("  op_locs");
     write_arg_locs(w, c);              /* v16: the per-argument carets */
     ct("  arg_locs");
     /*
@@ -1491,6 +1495,7 @@ void read_chunk(Reader &r, Chunk &c)
 
     read_loc_table(r, c.locs, c.code.size());
     read_loc_table(r, c.base_locs, c.code.size());     /* #127 */
+    read_loc_table(r, c.op_locs, c.code.size());       /* v22 */
     read_arg_locs(r, c, c.code.size());                /* v16 */
 
     n = r.countv();                                   /* #97 E1 */

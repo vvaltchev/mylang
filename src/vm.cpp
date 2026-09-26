@@ -373,12 +373,36 @@ vm_throw_oob(const Chunk &chunk, size_t pc)
     throw OutOfBoundsEx(s, en);
 }
 
-[[noreturn]] static ML_COLD void
-vm_throw_div0(const Chunk &chunk, size_t pc)
+/*
+ * Stamp a LOC-LESS exception with the caret of the op at `pc` (RULE 2):
+ * the op's compound-OPERATION caret (op_locs) when the exception came
+ * out of the operation step (Exception::op_caret) and the op recorded
+ * one, else its ordinary `locs` caret. The one stamp every store
+ * handler and vm_raise share, so an operation error cannot take the
+ * lvalue's span at one site and the whole expression's at another.
+ */
+static ML_COLD void
+vm_stamp_caret(const Chunk &chunk, size_t pc, Exception &e)
 {
-    Loc s, en;
-    chunk.loc_at(pc, s, en);
-    throw DivisionByZeroEx(s, en);
+    if (e.loc_start)
+        return;
+    if (e.op_caret && chunk.op_loc_at(pc, e.loc_start, e.loc_end))
+        return;
+    chunk.loc_at(pc, e.loc_start, e.loc_end);
+}
+
+/* A flat compound store's own OPERATION error (div0, a negative shift
+ * count, the INT_MIN / -1 overflow): marked op_caret and, in the
+ * interpreter (a chunk), stamped with the op's op_locs caret; the JIT
+ * helper (null chunk) throws it loc-less for the conveyance's stamp. */
+template <class Ex>
+[[noreturn]] static ML_COLD void
+vm_store_throw_op(Ex ex, const Chunk *chunk, size_t pc)
+{
+    ex.op_caret = 1;
+    if (chunk)
+        vm_stamp_caret(*chunk, pc, ex);
+    throw ex;
 }
 
 /* The store body below is shared by the interpreter (a valid chunk -> stamp
@@ -397,9 +421,7 @@ vm_store_throw_oob(const Chunk *chunk, size_t pc)
 [[noreturn]] static ML_COLD void
 vm_store_throw_div0(const Chunk *chunk, size_t pc)
 {
-    if (chunk)
-        vm_throw_div0(*chunk, pc);
-    throw DivisionByZeroEx();
+    vm_store_throw_op(DivisionByZeroEx(), chunk, pc);
 }
 
 /* The flat compound store's negative-shift-count throw (`a[i] <<= n`,
@@ -410,10 +432,17 @@ vm_store_throw_div0(const Chunk *chunk, size_t pc)
 [[noreturn]] static ML_COLD void
 vm_store_throw_negshift(const Chunk *chunk, size_t pc)
 {
-    Loc s, en;
-    if (chunk)
-        chunk->loc_at(pc, s, en);
-    throw InvalidValueEx("negative shift count", s, en);
+    vm_store_throw_op(InvalidValueEx("negative shift count"), chunk, pc);
+}
+
+/* The flat int store's INT_MIN / -1 check - an operation error too. */
+static ML_ALWAYS_INLINE void
+vm_store_check_div_overflow(int_type a, int_type b, const Chunk *chunk,
+                            size_t pc)
+{
+    if (b == -1 && a == INT_TYPE_MIN)
+        vm_store_throw_op(InvalidValueEx("integer overflow in division"),
+                          chunk, pc);
 }
 
 /* The StoreElemInt/StoreElemFloat store body, SHARED by the interpreter
@@ -469,9 +498,11 @@ vm_store_elem_int_body(LValue &alv, int_type idx, int_type rhs, Op aop,
             case Op::plus:    el += rhs; break;
             case Op::minus:   el -= rhs; break;
             case Op::times:   el *= rhs; break;
-            case Op::div:     check_int_div_overflow(el, rhs);
+            case Op::div:     vm_store_check_div_overflow(el, rhs,
+                                                          chunk, pc);
                               el /= rhs; break;
-            case Op::mod:     check_int_div_overflow(el, rhs);
+            case Op::mod:     vm_store_check_div_overflow(el, rhs,
+                                                          chunk, pc);
                               el %= rhs; break;
             case Op::band:    el &= rhs; break;
             case Op::bor:     el |= rhs; break;
@@ -867,7 +898,12 @@ vm_chain_lvalue_store_op(EvalContext &ctx,
             vm_subscript_store(curlv, key, value, op, last.lstart, last.lend);
         }
     } catch (Exception &ex) {
-        if (!ex.loc_start) { ex.loc_start = last.lstart; ex.loc_end = last.lend; }
+        /* an OPERATION error (op_caret) keeps no lvalue caret: the op's
+         * op_locs entry is stamped by the handler / the conveyance */
+        if (!ex.loc_start && !ex.op_caret) {
+            ex.loc_start = last.lstart;
+            ex.loc_end = last.lend;
+        }
         throw;
     }
 }
@@ -3420,7 +3456,9 @@ extern "C" int jit_store_member(int_type kind, int_type base_slot,
                         mk->mstart, mk->mend, mk->bstart, mk->bend,
                         mk->bake_def, mk->bake_slot);
     } catch (RuntimeException &e) {
-        if (!e.loc_start) {                  /* a compound div/mod is loc-less */
+        /* a compound's OPERATION error stays loc-less: the conveyance
+         * stamps the whole expression (op_locs, RULE 2) */
+        if (!e.loc_start && !e.op_caret) {
             e.loc_start = mk->mstart;
             e.loc_end = mk->mend;
         }
@@ -3843,6 +3881,16 @@ ptrdiff_t jit_off_exc_bind_arg()
     DivisionByZeroEx e;
     RuntimeException *b = &e;
     return reinterpret_cast<char *>(&b->bind_arg)
+         - reinterpret_cast<char *>(b);
+}
+
+/* RULE 2: the compound-OPERATION flag (Exception::op_caret) a store op's
+ * emitted stamp tests to pick its op_locs caret over its locs one. */
+ptrdiff_t jit_off_exc_op_caret()
+{
+    DivisionByZeroEx e;
+    RuntimeException *b = &e;
+    return reinterpret_cast<char *>(&b->op_caret)
          - reinterpret_cast<char *>(b);
 }
 
@@ -6709,12 +6757,7 @@ vm_raise(const Chunk *&chunk, size_t &pc, VmActivation &act, EvalContext &ctx,
         ML_CHECK(d && d->vm_chunk);
         chunk = static_cast<const Chunk *>(d->vm_chunk);
     }
-    if (!ex->loc_start) {
-        Loc s, en;
-        chunk->loc_at(pc, s, en);
-        ex->loc_start = s;
-        ex->loc_end = en;
-    }
+    vm_stamp_caret(*chunk, pc, *ex);       /* op_locs for an op error */
     vm_flush_inline(*chunk, pc, *ex);      /* frames if raised in inlined */
     if (norec_raiser) {
         const auto *d = static_cast<const FuncDescriptor *>(raise_desc);
@@ -11674,9 +11717,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             LValue &alv =
                 *vm_store_base(ctx, in->target, in->target2, *chunk, pc,
                                nullptr);
-            vm_store_elem_int_body(alv, read_int_operand(in->a(), &ctx),
-                                   read_int_operand(in->b(), &ctx), in->aop,
-                                   chunk, pc);
+            try {
+                vm_store_elem_int_body(alv, read_int_operand(in->a(), &ctx),
+                                       read_int_operand(in->b(), &ctx),
+                                       in->aop, chunk, pc);
+            } catch (Exception &e) {
+                /* the universal fallback's loc-less throws (a read-only
+                 * base's OOB, an operation error) - RULE 2 */
+                vm_stamp_caret(*chunk, pc, e);
+                throw;
+            }
             pc++;
         }
         VM_NEXT;
@@ -11688,9 +11738,14 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             LValue &alv =
                 *vm_store_base(ctx, in->target, in->target2, *chunk, pc,
                                nullptr);
-            vm_store_elem_float_body(alv, read_int_operand(in->a(), &ctx),
-                                     read_float_operand(in->b(), &ctx),
-                                     in->aop, chunk, pc);
+            try {
+                vm_store_elem_float_body(alv, read_int_operand(in->a(), &ctx),
+                                         read_float_operand(in->b(), &ctx),
+                                         in->aop, chunk, pc);
+            } catch (Exception &e) {
+                vm_stamp_caret(*chunk, pc, e);   /* see StoreElemInt */
+                throw;
+            }
             pc++;
         }
         VM_NEXT;
@@ -11714,8 +11769,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             try {
                 vm_subscript_store(&dlv, key, val, in->aop, Loc(), Loc());
             } catch (Exception &e) {
-                if (!e.loc_start)
-                    chunk->loc_at(pc, e.loc_start, e.loc_end);
+                vm_stamp_caret(*chunk, pc, e);
                 throw;
             }
             pc++;
@@ -11737,7 +11791,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 vm_member_store(blv, mk.memUid, in->aop, val,
                                 mk.mstart, mk.mend, mk.bstart, mk.bend);
             } catch (Exception &e) {
-                if (!e.loc_start) {          /* a compound div/mod is loc-less */
+                /* a compound's OPERATION error carets the whole
+                 * expression (op_locs); anything else loc-less the
+                 * member (RULE 2) */
+                if (!e.loc_start
+                    && !(e.op_caret
+                         && chunk->op_loc_at(pc, e.loc_start, e.loc_end))) {
                     e.loc_start = mk.mstart;
                     e.loc_end = mk.mend;
                 }
@@ -11762,8 +11821,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             try {
                 vm_subscript_store(&alv, idx, val, in->aop, Loc(), Loc());
             } catch (Exception &e) {
-                if (!e.loc_start)
-                    chunk->loc_at(pc, e.loc_start, e.loc_end);
+                vm_stamp_caret(*chunk, pc, e);
                 throw;
             }
             pc++;
@@ -11781,8 +11839,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             const EvalValue &k1 = ctx.frame->at(in->a_dual_lo()).get();
             const EvalValue &k2 = ctx.frame->at(in->b_slot()).get();
             const EvalValue &val = ctx.frame->at(in->target).get();
-            vm_nested_subscript_store(&alv, k1, k2, val, in->aop,
-                                      chunk->chain_locs[in->a_dual_hi()].data());
+            try {
+                vm_nested_subscript_store(
+                    &alv, k1, k2, val, in->aop,
+                    chunk->chain_locs[in->a_dual_hi()].data());
+            } catch (Exception &e) {
+                /* an operation error left loc-less by the per-step
+                 * carets: the whole expression's (op_locs) */
+                vm_stamp_caret(*chunk, pc, e);
+                throw;
+            }
             pc++;
         }
         VM_NEXT;
@@ -11797,8 +11863,13 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                                          *chunk, pc, nullptr);
             const EvalValue &val = ctx.frame->at(in->target).get();
             const auto &cl = chunk->chain_locs[in->a_dual_lo()];
-            vm_chain_store_op(ctx, base, in->b_lit(), cl.data(), cl.size(),
-                              val, in->aop);
+            try {
+                vm_chain_store_op(ctx, base, in->b_lit(), cl.data(),
+                                  cl.size(), val, in->aop);
+            } catch (Exception &e) {
+                vm_stamp_caret(*chunk, pc, e);   /* see StoreElem2V */
+                throw;
+            }
             pc++;
         }
         VM_NEXT;
@@ -11817,8 +11888,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                                          chunk->member_keys.data(), base, val,
                                          in->aop);
             } catch (Exception &e) {
-                if (!e.loc_start)
-                    chunk->loc_at(pc, e.loc_start, e.loc_end);
+                vm_stamp_caret(*chunk, pc, e);
                 throw;
             }
             pc++;

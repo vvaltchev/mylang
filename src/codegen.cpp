@@ -892,6 +892,20 @@ struct Codegen {
     }
 
     /*
+     * RULE 2: the handle for a store op's COMPOUND-OPERATION caret (->
+     * Chunk::op_locs): the whole `lv OP= rhs` / inc-dec node, the span the
+     * tree-walker gives an error raised by the operation step (div0, a
+     * negative shift count, a type error). `op` is the Expr14 op, or the
+     * aop an inc-dec synthesizes; a plain assignment has no operation step
+     * and records nothing, so the table stays sparse.
+     */
+    int add_op_node(Op op, const Construct *whole)
+    {
+        return op == Op::assign || op == Op::invalid ? -1
+                                                     : add_ast_node(whole);
+    }
+
+    /*
      * #97 E1: the closure_defs index of the single function a call site can
      * reach, from #116's callee-set answer - read as `CallExpr::callee_desc`,
      * the program-lifetime DESCRIPTOR, never `callee_fn`, whose AST node the
@@ -5194,6 +5208,7 @@ struct Codegen {
         /* DUAL operand: lo = the chain_steps pool idx, hi = the base kind */
         in.set_a_dual(steps_idx, bkind);
         in.aop = e->op;
+        in.op_node_idx = add_op_node(e->op, e);
         ops.push_back(in);
         return true;
     }
@@ -5378,6 +5393,7 @@ struct Codegen {
                     in.set_a_dual(k1slot, add_chain_locs({inner, sub}));
                     in.set_b(slot_op(k2slot));
                     in.aop = inc->is_inc ? Op::addeq : Op::subeq;
+                    in.op_node_idx = add_op_node(in.aop, s);
                     ops.push_back(in);
                     return true;
                 }
@@ -5397,6 +5413,7 @@ struct Codegen {
                     in.set_a(idx);
                     in.set_b(int_lit(1));
                     in.aop = inc->is_inc ? Op::plus : Op::minus;
+                    in.op_node_idx = add_op_node(in.aop, s);
                     ops.push_back(in);
                     return true;
                 }
@@ -5430,6 +5447,7 @@ struct Codegen {
                     in.set_a(slot_op(kslot));
                     in.set_b(slot_op(vtemp));
                     in.aop = inc->is_inc ? Op::addeq : Op::subeq;
+                    in.op_node_idx = add_op_node(in.aop, s);
                     ops.push_back(in);
                     return true;
                 }
@@ -5459,6 +5477,7 @@ struct Codegen {
                 ops.push_back(ld);
                 const Op cop = inc->is_inc ? Op::addeq : Op::subeq;
                 CgInstr in;
+                in.op_node_idx = add_op_node(cop, s);
                 in.base_node_idx =                 /* #127: the base caret */
                     add_base_node(bkind, m->what.get());
                 if (m->base_dict) {
@@ -5541,6 +5560,7 @@ struct Codegen {
                     in.set_a_dual(k1slot, add_chain_locs({inner, sub}));
                     in.set_b(slot_op(k2slot));
                     in.aop = e->op;
+                    in.op_node_idx = add_op_node(e->op, e);
                     ops.push_back(in);
                     return true;
                 }
@@ -5595,6 +5615,7 @@ struct Codegen {
                 in.set_a_dual(add_chain_locs(locnodes), bkind);
                 in.set_b(int_lit(keybase));
                 in.aop = e->op;
+                in.op_node_idx = add_op_node(e->op, e);
                 ops.push_back(in);
                 return true;
             }
@@ -5625,6 +5646,7 @@ struct Codegen {
                 in.set_a(slot_op(kslot));
                 in.set_b(slot_op(vslot));
                 in.aop = e->op;
+                in.op_node_idx = add_op_node(e->op, e);
                 ops.push_back(in);
                 return true;
             }
@@ -5668,16 +5690,15 @@ struct Codegen {
                         CgInstr in;
                         in.op = OpCode::StoreElemInt;
                         /* OOB/type errors carry the SUBSCRIPT loc (matching the
-                         * tree-walker's flat_store_core), a COMPOUND div0 the
-                         * Expr14 loc (stamped by Construct::eval). A PLAIN assign
-                         * can't div0, so the subscript loc is fully correct;
-                         * only a compound needs the Expr14 (its OOB then trails
-                         * the tree-walker by the `OP= rhs` width - a rare edge). */
-                        in.node_idx = add_ast_node(
-                            aop == Op::invalid ? static_cast<const Construct *>(
-                                                     sub)
-                                               : static_cast<const Construct *>(
-                                                     s));
+                         * tree-walker's flat_store_core); a COMPOUND's
+                         * operation errors (div0, a negative shift count,
+                         * an overflow) the whole Expr14's, through op_locs -
+                         * the tree-walker's Construct::eval stamp. It used to
+                         * be ONE caret, the Expr14's for any compound, so a
+                         * compound OOB carried the whole `a[5] += 1` where
+                         * the tree-walker marks `a[5]` (RULE 2). */
+                        in.node_idx = add_ast_node(sub);
+                        in.op_node_idx = add_op_node(aop, s);
                         in.base_node_idx =         /* #127: the base caret */
                             add_base_node(akind, sub->what.get());
                         in.target = akind;   /* 0 local / 1 global / 2 cap */
@@ -5747,6 +5768,7 @@ struct Codegen {
                 in.set_a(slot_op(kin.target));
                 in.set_b(slot_op(vslot));
                 in.aop = e->op;
+                in.op_node_idx = add_op_node(e->op, e);
                 ops.push_back(in);
                 return true;
             }
@@ -5773,6 +5795,7 @@ struct Codegen {
                 in.set_a(int_lit(add_member_key(m)));   /* AST-free: pool index */
                 in.set_b(slot_op(vslot));
                 in.aop = e->op;
+                in.op_node_idx = add_op_node(e->op, e);
                 ops.push_back(in);
                 return true;
             }
@@ -6066,6 +6089,7 @@ struct Codegen {
         in.set_a(slot_op(kslot));
         in.set_b(slot_op(vslot));
         in.aop = e->op;
+        in.op_node_idx = add_op_node(e->op, e);
         ops.push_back(in);
         return true;
     }
@@ -6105,6 +6129,7 @@ struct Codegen {
                     in.set_a(idx);
                     in.set_b(float_lit(1));
                     in.aop = inc->is_inc ? Op::plus : Op::minus;
+                    in.op_node_idx = add_op_node(in.aop, s);
                     ops.push_back(in);
                     return true;
                 }
@@ -6148,12 +6173,11 @@ struct Codegen {
             }
             CgInstr in;
             in.op = OpCode::StoreElemFloat;
-            /* PLAIN assign -> the SUBSCRIPT loc (OOB/type, matching the tree-
-             * walker); a COMPOUND -> the Expr14 loc (for its div0). See the
-             * StoreElemInt note. */
-            in.node_idx = add_ast_node(
-                aop == Op::invalid ? static_cast<const Construct *>(sub)
-                                   : static_cast<const Construct *>(s));
+            /* the SUBSCRIPT loc (OOB/type, matching the tree-walker); a
+             * COMPOUND's operation errors the Expr14's, via op_locs. See
+             * the StoreElemInt note. */
+            in.node_idx = add_ast_node(sub);
+            in.op_node_idx = add_op_node(aop, s);
             in.base_node_idx =                 /* #127: the base caret */
                 add_base_node(akind, sub->what.get());
             in.target = akind;   /* base kind: 0 local / 1 global / 2 cap */
@@ -8287,6 +8311,13 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
             }
         }
         in.base_node_idx = -1;
+        /* RULE 2: the compound-operation caret -> op_locs, on the same
+         * terms as the base caret (read + cleared before the `!node`
+         * bail; pc-ascending, so the table comes out sorted). */
+        if (const Construct *on = node_at(in.op_node_idx))
+            chunk.op_locs.push_back(
+                {static_cast<uint32_t>(pc), on->start, on->end});
+        in.op_node_idx = -1;
         /*
          * #97 E1: the named callee -> value_callees, on exactly the same
          * terms and for the same reason (the pc is only known here, and a
@@ -8499,6 +8530,7 @@ static void verify_ast_free(const std::vector<CgInstr> &code)
         ML_CHECK(in.node_idx == -1);
         ML_CHECK(in.loc_node_idx == -1);   /* #76: the loc twin too */
         ML_CHECK(in.base_node_idx == -1);  /* #127: the base-caret twin */
+        ML_CHECK(in.op_node_idx == -1);    /* RULE 2: the op-caret twin */
         ML_CHECK(in.inl == nullptr);       /* #38: the inherited chain */
         /* #97 E1: not an AST handle, but the same "consumed exactly once"
          * invariant - a stamp still set here never reached value_callees,
@@ -11470,6 +11502,8 @@ void verify_chunk(const Chunk &chunk, const ChunkLimits &lim)
         v.target_pc(static_cast<int_type>(e.pc));
     for (const Chunk::LocEntry &e : chunk.base_locs)
         v.target_pc(static_cast<int_type>(e.pc));
+    for (const Chunk::LocEntry &e : chunk.op_locs)       /* RULE 2 */
+        v.target_pc(static_cast<int_type>(e.pc));
     /*
      * The per-argument carets (RULE 2): the pc is remapped by indexing
      * like the two above, and `first`/`n` name a run of arg_loc_pool the
@@ -12288,6 +12322,7 @@ void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out)
     s.code = ck.code;
     s.locs = ck.locs;
     s.base_locs = ck.base_locs;                        /* #127 */
+    s.op_locs = ck.op_locs;                            /* RULE 2 */
     s.arg_locs = ck.arg_locs;                          /* RULE 2 */
     s.arg_loc_pool = ck.arg_loc_pool;
     s.ref_slots = ck.ref_slots;
@@ -12320,6 +12355,7 @@ bool bc_inline_chunk(Chunk &ck,
         std::vector<Instr> body;        /* SNAPSHOT (self-recursion) */
         std::vector<Chunk::LocEntry> locs;
         std::vector<Chunk::LocEntry> base_locs;   /* #127 */
+        std::vector<Chunk::LocEntry> op_locs;     /* RULE 2 */
         std::vector<Chunk::ArgLocEntry> arg_locs; /* RULE 2 */
         std::vector<ArgLoc> arg_loc_pool;
         std::vector<int32_t> ref_slots;
@@ -12380,6 +12416,9 @@ bool bc_inline_chunk(Chunk &ck,
          * belt-and-braces reasoning as the branch-past-end check.
          */
         s.base_locs = snap.base_locs;
+        /* RULE 2: the compound-operation carets - the same standing:
+         * no store op is whitelisted for a spliced body today */
+        s.op_locs = snap.op_locs;
         /* RULE 2: same standing as base_locs - no call op is whitelisted
          * for a spliced body today, so this carries nothing, and the day
          * one is admitted its per-argument carets ride along instead of
@@ -12413,6 +12452,7 @@ bool bc_inline_chunk(Chunk &ck,
     std::vector<Instr> nc;
     std::vector<Chunk::LocEntry> nlocs;
     std::vector<Chunk::LocEntry> nbase;                /* #127 */
+    std::vector<Chunk::LocEntry> nop;                  /* RULE 2 */
     std::vector<Chunk::CalleeName> nvc;                /* #97 E1 */
     std::vector<Chunk::InlineEntry> nctx;
     std::vector<char> from_caller;
@@ -12426,6 +12466,12 @@ bool bc_inline_chunk(Chunk &ck,
     /* #127: the store-base caret rides the splice exactly like the loc. */
     const auto caller_base_loc = [&](size_t pc, Loc &s, Loc &e) -> bool {
         for (const auto &le : ck.base_locs)
+            if (le.pc == pc) { s = le.start; e = le.end; return true; }
+        return false;
+    };
+    /* RULE 2: so does a compound store's operation caret. */
+    const auto caller_op_loc = [&](size_t pc, Loc &s, Loc &e) -> bool {
+        for (const auto &le : ck.op_locs)
             if (le.pc == pc) { s = le.start; e = le.end; return true; }
         return false;
     };
@@ -12514,6 +12560,12 @@ bool bc_inline_chunk(Chunk &ck,
                     if (le.pc == j) {
                         bbs = le.start; bbe = le.end; has_base = true; break;
                     }
+                Loc obs, obe;                          /* RULE 2 */
+                bool has_op = false;
+                for (const auto &le : S.op_locs)
+                    if (le.pc == j) {
+                        obs = le.start; obe = le.end; has_op = true; break;
+                    }
                 const Chunk::ArgLocEntry *bargs = nullptr;   /* RULE 2 */
                 for (const auto &ae : S.arg_locs)
                     if (ae.pc == j) { bargs = &ae; break; }
@@ -12560,6 +12612,9 @@ bool bc_inline_chunk(Chunk &ck,
                 if (has_base)
                     nbase.push_back({ static_cast<uint32_t>(nc.size()),
                                       bbs, bbe });
+                if (has_op)
+                    nop.push_back({ static_cast<uint32_t>(nc.size()),
+                                    obs, obe });
                 if (bargs) {
                     Chunk::ArgLocEntry ae;
                     ae.pc = static_cast<uint32_t>(nc.size());
@@ -12582,6 +12637,8 @@ bool bc_inline_chunk(Chunk &ck,
             nlocs.push_back({ static_cast<uint32_t>(nc.size()), s, e });
         if (caller_base_loc(pc, s, e))
             nbase.push_back({ static_cast<uint32_t>(nc.size()), s, e });
+        if (caller_op_loc(pc, s, e))
+            nop.push_back({ static_cast<uint32_t>(nc.size()), s, e });
         {
             uint32_t afirst, an;
             if (caller_arg_locs(pc, afirst, an))
@@ -12622,6 +12679,7 @@ bool bc_inline_chunk(Chunk &ck,
     ck.code = std::move(nc);
     ck.locs = std::move(nlocs);
     ck.base_locs = std::move(nbase);                   /* #127 */
+    ck.op_locs = std::move(nop);                       /* RULE 2 */
     ck.arg_locs = std::move(nargl);                    /* RULE 2 */
     ck.arg_loc_pool = std::move(nargpool);
     ck.value_callees = std::move(nvc);                 /* #97 E1 */

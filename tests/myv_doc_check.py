@@ -108,6 +108,7 @@ def chunk(r):
             if r.u8() == 0xff: r.i32(); r.i32()   # ecol escape: full end Loc
     loc_table()                                   # locs
     loc_table()                                   # base_locs (v13)
+    loc_table()                                   # op_locs (v22)
     for _ in range(r.u32()):                      # 9.21 arg_locs (v16)
         r.u32()                                   # pc
         for _ in range(r.u32()): r.loc(); r.loc() # n x {start, end}

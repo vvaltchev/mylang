@@ -8543,6 +8543,21 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
         args_caret ? loc_entry_in(ck.base_locs, old_pc) : nullptr);
     if (!le && !chain_only)
         le = static_cast<const Chunk::LocEntry *>(loc_entry_addr(ck, old_pc));
+    /*
+     * RULE 2: a COMPOUND store's OPERATION caret (Chunk::op_locs). An
+     * error out of the operation step (div0, a negative shift, a type
+     * error) carries Exception::op_caret and takes the whole compound
+     * expression's span; an error reaching the lvalue takes `le`, as
+     * before. Selected AT RUN TIME on the flag - two stamps and a
+     * `cmp` on the cold arm only, and nothing at all for an op without
+     * an entry, so every other op's bytes are unchanged. Never with the
+     * call form (`args_caret`): a call op records no op_locs entry.
+     */
+    const Chunk::LocEntry *oe =
+        !args_caret && !chain_only
+            ? static_cast<const Chunk::LocEntry *>(
+                  loc_entry_in(ck.op_locs, old_pc))
+            : nullptr;
     /* `arg_select`: the site's word on whether a bind coercion can be
      * thrown here at all (jit_site_may_coerce) - where it cannot, the
      * select would be ~60 dead cold bytes per call site */
@@ -8568,7 +8583,7 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
      * Skipping it there measured back the +1.9% this cost 69_exc_crossframe.
      */
     const bool need_no_chain_marker = !ck.inline_ctxs.empty();
-    if (!le && chain < 0 && !need_no_chain_marker)
+    if (!le && !oe && chain < 0 && !need_no_chain_marker)
         return;                    /* nothing to stamp - stays loc-less */
 
     const auto pack = [](const Loc &l) {
@@ -8616,9 +8631,22 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
     const size_t j_null = ae ? e.j32(0x74) : e.j8(0x74);   /* jz join */
 
     size_t j_has = 0;
-    if (le) {
+    if (le || oe) {
         e.cmp_dword_base_imm8(acc.r, off_s + 4, 0x00); /* loc_start.col */
         j_has = ae ? e.j32(0x75) : e.j8(0x75);   /* jnz: caret already set */
+        size_t j_done_op = SIZE_MAX;
+        if (oe) {
+            const uint32_t off_oc =
+                static_cast<uint32_t>(jit_off_exc_op_caret());
+            e.cmp_dword_base_imm8(acc.r, off_oc, 0x00);
+            const size_t j_not_op = e.j8(0x74);   /* jz: an lvalue error */
+            e.mov_imm(rs.sc, pack(oe->start));
+            e.store_base(rs.sc, acc.r, static_cast<int32_t>(off_s));
+            e.mov_imm(rs.sc, pack(oe->end));
+            e.store_base(rs.sc, acc.r, static_cast<int32_t>(off_e));
+            j_done_op = e.j8(0xEB);               /* jmp has */
+            e.patch8(j_not_op, e.pos());
+        }
         size_t j_done_arg = 0;
         if (ae) {
             const uint32_t off_ba =
@@ -8641,10 +8669,14 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
             j_done_arg = e.j8(0xEB);              /* jmp has */
             e.patch8(j_list, e.pos());
         }
-        e.mov_imm(rs.sc, pack(le->start));
-        e.store_base(rs.sc, acc.r, static_cast<int32_t>(off_s));
-        e.mov_imm(rs.sc, pack(le->end));
-        e.store_base(rs.sc, acc.r, static_cast<int32_t>(off_e));
+        if (le) {
+            e.mov_imm(rs.sc, pack(le->start));
+            e.store_base(rs.sc, acc.r, static_cast<int32_t>(off_s));
+            e.mov_imm(rs.sc, pack(le->end));
+            e.store_base(rs.sc, acc.r, static_cast<int32_t>(off_e));
+        }
+        if (j_done_op != SIZE_MAX)
+            e.patch8(j_done_op, e.pos());
         if (ae) {
             e.patch8(j_done_arg, e.pos());
             e.patch32_here(j_has);
@@ -21638,6 +21670,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
         {
             const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = ok) */
+            /* a COMPOUND's operation error leaves the helper loc-less
+             * (its member caret is for lvalue errors only), and this
+             * op's original may be deleted, so a pc lookup could name
+             * the run head's op: stamp the whole expression here
+             * (RULE 2). A plain store records no op caret, and its
+             * helper stamps everything itself. */
+            if (loc_entry_in(ck.op_locs, old_pc))
+                emit_exc_stamp(e, ck, old_pc);
             /* raise (exc set) or bail (unset) */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
@@ -26803,6 +26843,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &l : chunk.base_locs)          /* #127 */
         l.pc = static_cast<uint32_t>(remap[l.pc]);
+    for (auto &l : chunk.op_locs)            /* RULE 2: op carets */
+        l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &al : chunk.arg_locs)          /* RULE 2: per-arg carets */
         al.pc = static_cast<uint32_t>(remap[al.pc]);
     for (auto &vc : chunk.value_callees)     /* #97 E1 */
@@ -30189,6 +30231,8 @@ retry_emission:
     for (auto &l : chunk.locs)
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &l : chunk.base_locs)          /* #127 */
+        l.pc = static_cast<uint32_t>(remap[l.pc]);
+    for (auto &l : chunk.op_locs)            /* RULE 2: op carets */
         l.pc = static_cast<uint32_t>(remap[l.pc]);
     for (auto &al : chunk.arg_locs)          /* RULE 2: per-arg carets */
         al.pc = static_cast<uint32_t>(remap[al.pc]);
