@@ -48,6 +48,11 @@ namespace {
 
 struct FuncInfo;
 
+/* TypeSym::arg_kinds bits: the scalar kinds contributed to a parameter */
+enum : uint8_t {
+    ARGK_BOOL = 1, ARGK_INT = 2, ARGK_FLOAT = 4, ARGK_DYN = 8,
+};
+
 struct TypeSym {
     const UniqueId *name = nullptr;
     StaticTypeRef type = nullptr;     /* stable type read by type_of() */
@@ -81,6 +86,14 @@ struct TypeSym {
      */
     bool round_got_dyn = false;
     bool coerces_dyn = false;
+    /* A PARAMETER's contributed scalar kinds (bit per ArgKind), per round
+     * and as of the last committed round: what stamp_inferred_param_types
+     * reads to stamp a decl_type only where a bind can actually CONVERT
+     * (a float param some site feeds an int). Stamping one whose every
+     * contribution already has its final type turns fast_bind off for
+     * nothing - measured +49% Ir on 34_sort_custom_cmp's comparator. */
+    uint8_t round_arg_kinds = 0;
+    uint8_t arg_kinds = 0;
     Identifier *decl_id = nullptr;   /* the decl Identifier (for decl_type stamp) */
     /* Structural-pass bookkeeping for safe var-bound-lambda monomorphization:
      * how many times the name is written (decl + assigns), and whether it is
@@ -2136,6 +2149,15 @@ void Inferencer::stamp_inferred_param_types(Construct *rootn)
             else if (t && t->kind == StaticTypeKind::Float)
                 dt = DeclType::f;
             if (dt == DeclType::none)
+                continue;
+            /* only where the bind can CONVERT: a narrower scalar (or a
+             * dyn) reached the param. A param every site feeds its final
+             * type keeps fast_bind - stamping it would buy a coercion
+             * that can never fire, per call (see TypeSym::arg_kinds). */
+            const uint8_t narrower = dt == DeclType::f
+                ? (ARGK_BOOL | ARGK_INT | ARGK_DYN)
+                : (ARGK_BOOL | ARGK_DYN);
+            if (!(p->arg_kinds & narrower))
                 continue;
             pid->decl_type = dt;
             if (fd->desc && i < fd->desc->params.size())
@@ -4306,6 +4328,7 @@ void Inferencer::reset_round()
         if (s->func || s->pinned)   /* pinned: a prior input's fixed type */
             continue;
         s->round_got_dyn = false;   /* dyn-into-concrete coercion tracking */
+        s->round_arg_kinds = 0;
         /* A scalar annotation pins the type: seed the accumulator with the
          * declared type so it stays fixed (contribute() keeps it and checks
          * assignability). dyn next, else bottom. */
@@ -4325,6 +4348,7 @@ void Inferencer::commit_round()
         TypeSym *s = up.get();
         if (s->func || s->pinned)
             continue;
+        s->arg_kinds = s->round_arg_kinds;
         /*
          * dyn-into-concrete coercion decision (see contribute): a dyn value was
          * assigned to this plain `var`. If the NON-dyn contributions gave a
@@ -4377,6 +4401,19 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
      */
     if (!s || s->func)
         return;
+
+    if (s->is_param) {
+        /* which scalar kinds reach the param (see TypeSym::arg_kinds) */
+        const StaticTypeRef k = static_type_resolve(t);
+        if (k && k->kind == StaticTypeKind::Bool)
+            s->round_arg_kinds |= ARGK_BOOL;
+        else if (k && k->kind == StaticTypeKind::Int)
+            s->round_arg_kinds |= ARGK_INT;
+        else if (k && k->kind == StaticTypeKind::Float)
+            s->round_arg_kinds |= ARGK_FLOAT;
+        else if (k && k->kind == StaticTypeKind::Dyn)
+            s->round_arg_kinds |= ARGK_DYN;
+    }
 
     /*
      * REPL incremental: a symbol committed by a prior input has a FIXED type.
