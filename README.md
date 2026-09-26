@@ -1852,6 +1852,10 @@ To overcome the just-described limitation, `MyLang` has a special syntax for
 *both* during const evaluation and during runtime *but* the function cannot
 see global variables, nor capture anything: it can only use constants and the
 value of its parameters: that's exactly what we need during const evaluation.
+"Constants" means every constant in scope where the function is **declared** -
+scalars, but also const arrays, dicts and struct values, and other pure
+functions - and it holds when the call is itself const-evaluated:
+`const A = [1, 2]; pure func f(i) => A[i]; const Z = f(1);` gives `Z == 2`.
 For example, to generate `sorted_people` during const evaluation it's enough to
 write:
 
