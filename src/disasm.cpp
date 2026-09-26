@@ -454,6 +454,18 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             s << ";   pc" << l.pc << " -> " << l.start.line << ":"
               << l.start.col << "\n";
     }
+    if (!ch.op_locs.empty()) {
+        /* RULE 2: a compound store's OPERATION caret - the whole
+         * `lv OP= rhs` span a div0 / negative shift / type error takes
+         * (`locs` holds the lvalue, for the errors reaching it). Both
+         * ends: `end` is half the caret. */
+        s << "; -- op_locs: compound store pc -> line:col-line:col ("
+          << ch.op_locs.size() << ") --\n";
+        for (const auto &l : ch.op_locs)
+            s << ";   pc" << l.pc << " -> " << l.start.line << ":"
+              << l.start.col << "-" << l.end.line << ":" << l.end.col
+              << "\n";
+    }
     if (!ch.arg_locs.empty()) {
         /* RULE 2: a user call op's THIRD caret - one span per argument,
          * for a bind coercion to name the argument it rejected (`locs`

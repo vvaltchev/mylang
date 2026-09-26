@@ -2,8 +2,13 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 21.  This document describes the on-disk image exhaustively:
+Format version 22.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v22 adds one per-chunk record, `op_locs` - section 9.2 - a third loc
+table in the identical encoding, written right after `base_locs`: the
+COMPOUND-OPERATION carets of the store ops.  No existing encoding
+changes.)
 
 (v21 changes no encoding: two opcodes were APPENDED - ArrEpochMark and
 ArrEpochCheck, the foreach shift guard (#53 option 1) - so a v20 binary
@@ -567,6 +572,8 @@ Each chunk is:
     N x value consts
     N x LocEntry locs               9.2
     N x LocEntry base_locs          9.2 - the store-BASE carets (v13)
+    N x LocEntry op_locs            9.2 - the compound-OPERATION carets
+                                    (v22)
     u32      n_arg_locs             the per-ARGUMENT carets (v16)
     n x ArgLocs                     9.21
     u32      n_value_callees        the named value-call callees (v15)
@@ -666,8 +673,14 @@ at a byte boundary, decoded in O(1), and two compiles remain byte-identical.
 covers.  `base_locs` (v13) has the IDENTICAL encoding and holds an op's
 SECOND caret - a container store's base identifier, and (since 2026-09-20,
 no encoding change) a user call op's argument list - see the version note in
-section 12.  Both are pc-ascending, and each entry is FOUR bytes in the
-common case:
+section 12.  `op_locs` (v22), again identical, holds a store op's
+COMPOUND-OPERATION caret: the whole `lv OP= rhs` (or inc-dec) span, which
+an error raised by the operation step - div0, a negative shift count, a
+type error - takes, while `locs` keeps the lvalue's span for an error
+reaching the element.  It is sparse: only a store op whose assignment is
+a compound records one.  A reader bounds its pcs like the other two (they
+are remapped by indexing).  All three are pc-ascending, and each entry is
+FOUR bytes in the common case:
 
     u8    pcd       pc - previous pc            255  = escape
     i8    lined     start.line - previous line  -128 = escape
@@ -1180,6 +1193,19 @@ like `locs`); `n` is bounded like any element count.  The JIT bakes the
 run's ADDRESS into the call site's exception stamp and the emitted code
 indexes it at run time by the recorded parameter index, which is why the
 run is re-verified against the rebuilt pool before the load-time JIT.
+
+Version 22 adds `op_locs` (section 9.2), a third loc table per chunk in
+the identical encoding, written right after `base_locs`.  A compound
+store (`a[i] /= z`, `d[k] <<= n`, `p.x -= v`, `m[i][j] += v`) has TWO
+error spans: reaching the element carets the LVALUE (an out-of-bounds
+index, a missing key, not-an-lvalue - what `locs` records), while the
+OPERATION carets the whole compound expression (a division by zero, a
+negative shift count, a type error), because that is the first node the
+tree-walker's evaluator stamps such a loc-less throw with.  One table
+could hold only one of them: the VM reported the lvalue for both, and a
+nested store - whose `locs` records nothing - reported no location at
+all.  A chunk with no compound store pays the 4-byte count and nothing
+else.
 
 Version 16 adds `arg_locs` (section 9.21), the per-argument carets of a
 user call op, so a bind coercion's error names the argument it rejected

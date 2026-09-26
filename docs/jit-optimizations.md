@@ -14853,3 +14853,20 @@ and `ForeachDynNext` test the same epoch in C++. Pinned by the
 body, 2 on two shifting ones - which no differential can see, and the
 REACH half through g_jit_op_run) plus the two `-rt` entries and
 tests/functional/30_foreach_mutation.my.
+
+## RULE 2 - A COMPOUND STORE'S OPERATION CARET (2026-09-25)
+
+A compound store has two error spans (docs/vm-ops.md, `Chunk::op_locs`):
+reaching the element carets the lvalue, the OPERATION the whole
+`lv OP= rhs`. The JIT's store helpers throw loc-less and their conveyance
+stamps the op's caret in emitted code, so `emit_exc_stamp` learned a
+second span: for an op with an `op_locs` entry it bakes BOTH and, on the
+cold arm only, tests `Exception::op_caret` (one `cmp dword [exc+off], 0`)
+to pick one. An op with no entry emits byte-identical code - the hot
+path, and every other op, are untouched. StoreMemberV's exit had no
+stamp at all (its helper stamps the member caret itself, and its
+original may be deleted, so a pc lookup names the run head's op - the
+first run printed a POD field's div0 at the struct CONSTRUCTOR); it now
+calls `emit_exc_stamp` exactly when the op has an op caret. Watched
+failing: with `add_op_node` answering -1 the `-rt` matrix reports 1184
+divergences and `myv_round_trip`'s op_locs vacuity guard fires.

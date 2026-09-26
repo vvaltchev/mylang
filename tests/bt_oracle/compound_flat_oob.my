@@ -1,0 +1,12 @@
+# a flat array compound's OUT-OF-BOUNDS index carets the lvalue alone
+func g(array<int> a, int k) { a[k] += 1; }
+func drive(int n) {
+    var a = [1, 2, 3];
+    for (var i = 0; i < n; i++) {
+        var k = 1;
+        if (i == 2) k = int(runtime(5));
+        g(a, k);
+    }
+    return n;
+}
+print(drive(runtime(4)));

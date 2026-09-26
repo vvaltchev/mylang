@@ -1539,6 +1539,12 @@ struct CgInstr : Instr {
      * node_idx can only carry one. -1 = this op records no base caret.
      * Codegen-transient like node_idx. */
     int32_t base_node_idx = -1;
+    /* RULE 2: an optional THIRD node - the whole compound expression
+     * (`lv OP= rhs`, an inc-dec) of a store op -> the op_locs table, the
+     * caret an OPERATION error takes while node_idx/locs carries the
+     * lvalue's. -1 = a plain store, or an op with no such error.
+     * Codegen-transient like node_idx. */
+    int32_t op_node_idx = -1;
     /* #97 E1: the closure_defs index of the callee this CallValueV site
      * can reach, from #116's callee-set stamp - or -1 for "not named".
      * Codegen-transient like node_idx: it becomes a pc-keyed entry in
@@ -2099,6 +2105,29 @@ struct Chunk {
      */
     std::vector<LocEntry> base_locs;
 
+    /*
+     * THE COMPOUND-OPERATION CARETS (RULE 2): a store op running
+     * `lv OP= rhs` (or an inc-dec) can fail in two places, and the
+     * tree-walker carets them differently - reaching the lvalue (OOB, a
+     * missing key, not-an-lvalue) at the LVALUE, the node that raised it
+     * (which is what `locs` records for a store), and the OPERATION
+     * (div0, a negative shift count, a type error, an overflow) at the
+     * WHOLE compound expression, whose Construct::eval is the first to
+     * stamp that loc-less throw. The VM reported the lvalue for both, and
+     * a nested store - whose `locs` holds nothing, its per-step carets
+     * living in `chain_locs` - reported NO location at all.
+     *
+     * So a compound store op records the whole expression's span here; a
+     * raise out of the operation step carries Exception::op_caret, and a
+     * stamp site selects on it (vm_stamp_caret, and the JIT's
+     * emit_exc_stamp at run time). Same shape and cost as `locs` -
+     * pc-keyed, ascending, binary-searched, read ONLY on a throw path -
+     * and SPARSE: only a store op whose aop is a compound records one.
+     * Every pc mover carries it (the JIT's remaps, the bytecode splice);
+     * the loader bounds it (verify_chunk); docs/myv-format.txt 9.22.
+     */
+    std::vector<LocEntry> op_locs;
+
     /* Shared exact-match binary search over a pc-keyed, ascending loc table. */
     static bool loc_lookup(const std::vector<LocEntry> &tbl, size_t pc,
                            Loc &start, Loc &end)
@@ -2133,6 +2162,12 @@ struct Chunk {
     bool base_loc_at(size_t pc, Loc &start, Loc &end) const
     {
         return loc_lookup(base_locs, pc, start, end);
+    }
+
+    /* The COMPOUND-OPERATION Loc of the store op at `pc`; false if none. */
+    bool op_loc_at(size_t pc, Loc &start, Loc &end) const
+    {
+        return loc_lookup(op_locs, pc, start, end);
     }
 
     /*

@@ -3034,9 +3034,13 @@ EvalValue TypedScalarExpr::do_eval(EvalContext *ctx, bool rec) const
     return EvalValue(eval_int(ctx));
 }
 
-/* Apply a compound-assignment op (`+=`, `-=`, ...) to `acc` in place. */
+/* Apply a compound-assignment op (`+=`, `-=`, ...) to `acc` in place.
+ * A loc-less throw out of the operation is marked Exception::op_caret:
+ * it carets the WHOLE compound expression, not the lvalue (RULE 2 - the
+ * tree-walker's Expr14 is the first node to stamp it; a VM store op
+ * selects its op_locs entry on the flag, bytecode.h). */
 static inline void
-apply_compound_op(EvalValue &acc, const EvalValue &rhs, Op op)
+apply_compound_op_raw(EvalValue &acc, const EvalValue &rhs, Op op)
 {
     switch (op) {
         case Op::addeq:  num_bin_op(acc, rhs, &Type::add);  break;
@@ -3054,6 +3058,18 @@ apply_compound_op(EvalValue &acc, const EvalValue &rhs, Op op)
         case Op::boreq:  num_bin_op(acc, rhs, &Type::bor);  break;
         case Op::bxoreq: num_bin_op(acc, rhs, &Type::bxor); break;
         default:         throw InternalErrorEx();
+    }
+}
+
+static inline void
+apply_compound_op(EvalValue &acc, const EvalValue &rhs, Op op)
+{
+    try {
+        apply_compound_op_raw(acc, rhs, op);
+    } catch (Exception &e) {
+        if (!e.loc_start)
+            e.op_caret = 1;
+        throw;
     }
 }
 
@@ -3633,8 +3649,21 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
     }
 
     const bool for_write = (op == Op::assign);
-    EvalValue elv = base_lv->get().get_type()->subscript(
-        EvalValue(base_lv), key, for_write);
+    EvalValue elv;
+    try {
+        elv = base_lv->get().get_type()->subscript(
+            EvalValue(base_lv), key, for_write);
+    } catch (Exception &e) {
+        /* reaching the element is the LVALUE's error (an OOB, a missing
+         * key): its caret, as Subscript::do_eval stamps it - when the
+         * caller has one (the JIT helpers pass none; their conveyance
+         * stamps the op's `locs` entry, which is the same span) */
+        if (!e.loc_start) {
+            e.loc_start = lstart;
+            e.loc_end = lend;
+        }
+        throw;
+    }
     if (!elv.is<LValue *>())
         throw NotLValueEx(lstart, lend);
     return slot_rmw(*elv.get<LValue *>(), op, value);
@@ -4039,8 +4068,13 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
             throw NotLValueEx(locs[1].first, locs[1].second);
         return slot_rmw(*elv.get<LValue *>(), op, value);
     } catch (Exception &e) {
-        if (!e.loc_start) { e.loc_start = locs[1].first;
-                            e.loc_end = locs[1].second; }
+        /* an OPERATION error (op_caret) is not the outer subscript's: it
+         * stays loc-less for the op's op_locs caret (the handler's /
+         * the JIT conveyance's stamp) */
+        if (!e.loc_start && !e.op_caret) {
+            e.loc_start = locs[1].first;
+            e.loc_end = locs[1].second;
+        }
         throw;
     }
 }
@@ -4109,7 +4143,11 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
             throw NotLValueEx(fs, fe);
         return slot_rmw(*elv.get<LValue *>(), op, value);
     } catch (Exception &e) {
-        if (!e.loc_start) { e.loc_start = fs; e.loc_end = fe; }
+        /* an OPERATION error keeps no step caret: see the nested store */
+        if (!e.loc_start && !e.op_caret) {
+            e.loc_start = fs;
+            e.loc_end = fe;
+        }
         throw;
     }
 }

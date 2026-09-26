@@ -1,0 +1,12 @@
+# a negative shift count, compound and plain, carries the shift's caret
+func g(int v, int k) { v <<= k; return v >> k; }
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var k = 1;
+        if (i == 2) k = int(runtime(-1));
+        s = s + g(i, k);
+    }
+    return s;
+}
+print(drive(runtime(4)));
