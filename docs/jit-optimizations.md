@@ -14870,3 +14870,31 @@ first run printed a POD field's div0 at the struct CONSTRUCTOR); it now
 calls `emit_exc_stamp` exactly when the op has an op caret. Watched
 failing: with `add_op_node` answering -1 the `-rt` matrix reports 1184
 divergences and `myv_round_trip`'s op_locs vacuity guard fires.
+
+## #97 CB8 - THE BOUNDARY RETURN COPIES AN UNLISTED RESULT AS 2 WORDS (2026-09-26)
+
+A callback body (sort's comparator, map/filter's function) returns to
+C++ through ReturnV's BOUNDARY arm, which copied the result slot into
+`flow->value` as four qwords. `scripts/jitprofile.py` on
+34_sort_custom_cmp: of the comparator's 36 Ir per call, 9 compute
+`p < q` and 27 are that arm. An UNLISTED result slot (absent from
+`ref_slots`) is written only by a scalar-producing op -
+`op_writes_scalar`: int, float, bool; never a builtin, whose value is
+TWO pointers and still trivial - so the payload word and the type word
+are the whole value. That is the frameless arm's existing rule; the
+boundary arm now uses it too (`bnd_res_listed` keeps the 4-qword copy
+for a listed slot). No new operand form.
+
+Ir (scale3 - scale1, `OPT=1 ASSERTS=0`): 34 -2.6%, 35 -2.1%, 96 -1.6%;
+wall not timed (cheap instructions, the guard-elision family's
+ceiling). Watched failing: forcing the 2-word copy onto a LISTED slot,
+the `-rt` entry "callback: a callback returning a BUILTIN keeps the
+whole value" raises InternalErrorEx in both JIT modes (the builtin's
+lost second word - `func_v` - reads as null), while the interpreted
+modes stay green.
+
+**The rule it leans on, worth stating:** "trivial" does NOT mean "one
+payload word". `t_builtin` is trivial (`< t_str`) and 16 bytes. A copy
+that drops words 1-2 is sound only for a slot the ref_slots analysis
+proved is written by `op_writes_scalar` ops - never merely for a slot
+whose type is trivial at run time.
