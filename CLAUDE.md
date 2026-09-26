@@ -3272,7 +3272,15 @@ once, first, is what a real call does, so a body that mutates the passed-in
 global, a multi-use side-effecting arg, or a throwing arg the body reads
 conditionally all stay sound; it also lets `f(a+b)`, `f(g())`, `f(global)`
 inline. The recursion unroll's self-call args (`n-1` on an int `n`) are inert,
-so they stay substituted. The size
+so they stay substituted.
+**⛔ A parameter the body WRITES THROUGH takes only a NAME directly**
+(`writes_through` / `param_written_through`, resolver.cpp: the root of an
+assignment target, an inc-dec operand, or an lvalue builtin's first
+argument - `p[0] = v`, `p.x += v`, `append(p, v)`). The parameter slot is
+an lvalue; an inert literal put there is a store to a temporary - the
+tree-walker raised NotLValueEx for `h([1, 2, 3])` and the VM refused to
+compile it (NotLoweredEx) while `-ni` ran it. `arg_substitutable` and the
+tail inliner refuse it, so it is temp-bound. The size
 gate is the **cost model**: `body_weight` (a weighted
 node sum, weights from `--weights`/`run_weight_bench`: a CALL is ~21x an arith
 op, assign 11, if 7, return 3) must be **below `CALL_WEIGHT` (21)**. **Bodies WITH

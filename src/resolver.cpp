@@ -3024,6 +3024,86 @@ static void fmi_children(Construct *c,
     }
 }
 
+/* The identifier at the ROOT of an lvalue chain (`p`, `p[i]`, `p.f[j]`),
+ * or null when the chain is rooted at anything else. */
+static const Identifier *lvalue_chain_root(const Construct *c)
+{
+    for (;;) {
+        switch (ctag(c)) {
+        case ConstructType::id:
+            return static_cast<const Identifier *>(c);
+        case ConstructType::subscript:
+            c = static_cast<const Subscript *>(c)->what.get();
+            break;
+        case ConstructType::member:
+            c = static_cast<const MemberExpr *>(c)->what.get();
+            break;
+        default:
+            return nullptr;
+        }
+    }
+}
+
+/*
+ * Does `body` WRITE THROUGH an identifier `is_param` accepts - use it as the
+ * root of an assignment target (`p[0] = v`, `p.f += v`), of an inc-dec
+ * operand (`p[i]++`), or as the first argument of a builtin that takes an
+ * lvalue (`append(p, v)`, `pop(p)`)? Those positions need an LVALUE: in a
+ * physical call the parameter slot is one, so an inliner may substitute an
+ * argument there only when the argument is itself a name. A literal or a
+ * computed value put there turns a legal store into a store to a temporary -
+ * `NotLValueEx` in the tree-walker where the call succeeded, and a
+ * construct the codegen cannot lower (NotLoweredEx) - a RULE 2 break.
+ * A complete walk (fmi_children); a nested function body is not entered
+ * (the inliners refuse a callee that nests one).
+ */
+static bool writes_through(const Construct *body,
+                           const std::function<bool(const Identifier *)>
+                               &is_param)
+{
+    bool found = false;
+    std::function<void(const Construct *)> go = [&](const Construct *c) {
+        if (!c || found)
+            return;
+        const Construct *target = nullptr;
+        switch (ctag(c)) {
+        case ConstructType::expr14:
+            target = static_cast<const Expr14 *>(c)->lvalue.get();
+            if (ctag(target) == ConstructType::idlist) {
+                for (auto &e : static_cast<const IdList *>(target)->elems) {
+                    const Identifier *r = lvalue_chain_root(e.get());
+                    if (r && is_param(r))
+                        found = true;
+                }
+                target = nullptr;
+            }
+            break;
+        case ConstructType::incdec:
+            target = static_cast<const IncDecExpr *>(c)->lvalue.get();
+            break;
+        case ConstructType::call: {
+            auto *ce = static_cast<const CallExpr *>(c);
+            auto *callee = dynamic_cast<const Identifier *>(ce->what.get());
+            if (callee && ce->args && !ce->args->elems.empty()
+                    && is_lvalue_arg_builtin(callee->get_str()))
+                target = ce->args->elems[0].get();
+            break;
+        }
+        default:
+            break;
+        }
+        if (target) {
+            const Identifier *r = lvalue_chain_root(target);
+            if (r && is_param(r))
+                found = true;
+        }
+        fmi_children(const_cast<Construct *>(c),
+                     [&](Construct *ch) { go(ch); });
+    };
+    go(body);
+    return found;
+}
+
 /* `e`'s subtree reads some tainted id (over-approximates "may alias one"). */
 static bool fmi_mentions(const Construct *e,
                          const std::unordered_set<const UniqueId *> &t)
@@ -6070,9 +6150,12 @@ private:
                     return id->sym.kind == SymKind::local
                         && id->sym.slot == i;
                 });
-            if (!tail_arg_ok(uses, ce->args->elems[i].get())
-                    || !bind_is_identity(f, static_cast<size_t>(i),
-                                         ce->args->elems[i].get()))
+            const Construct *arg = ce->args->elems[i].get();
+            if (!tail_arg_ok(uses, arg)
+                    || !bind_is_identity(f, static_cast<size_t>(i), arg)
+                    || (ctag(arg) != ConstructType::id
+                        && param_written_through(f,
+                               static_cast<size_t>(i))))
                 return;
         }
 
@@ -6293,10 +6376,27 @@ private:
     /* May `arg` be pasted into the body for a param used `uses` times? An
      * inert arg any number of times; a constant array/dict literal (it
      * cannot throw, but each evaluation is a fresh object) at most once. */
+    /* Does f's body WRITE THROUGH parameter i (see writes_through)? By
+     * NAME, so it serves the expression engine (which substitutes by uid)
+     * and the block engines alike; a same-named shadowing local can only
+     * make it answer yes, which costs a substitution, never soundness. */
+    static bool param_written_through(const FuncDeclStmt *f, size_t i)
+    {
+        if (!f->params || i >= f->params->elems.size())
+            return false;
+        const UniqueId *puid = f->params->elems[i]->uid;
+        return writes_through(f->body.get(), [&](const Identifier *id) {
+            return id->uid == puid;
+        });
+    }
+
     bool arg_substitutable(const FuncDeclStmt *f, size_t i,
                            const Construct *arg, int uses) const
     {
         if (!bind_is_identity(f, i, arg))
+            return false;
+        /* a write position needs an lvalue: only a NAME may fill it */
+        if (ctag(arg) != ConstructType::id && param_written_through(f, i))
             return false;
         if (arg_is_inert(arg))
             return true;
