@@ -1,0 +1,13 @@
+# a tail call to a block body with a loop inside it
+func acc(n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) s = s + 12 / (i - 3);
+    return s;
+}
+func w(n) { return acc(n); }
+func go(n) {
+    var t = 0;
+    for (var j = 0; j < n; j++) t = t + w(runtime(j));
+    return t;
+}
+print(go(runtime(6)));

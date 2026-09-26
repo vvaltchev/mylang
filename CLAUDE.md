@@ -1694,7 +1694,8 @@ that `-rt` passes straight through, and the Net 3 enumeration catches a
 lanes so an `-rt` failure still reports quickly:
 - **differential** (Debug, ASan+UBSan+hardening): `corpus_diff.sh`
   plain AND `--levers`, `norec_enum.py --depth 3`,
-  `norec_sweep.py`, `nested_fuzz.py`;
+  `norec_sweep.py`, `nested_fuzz.py`, `bt_oracle.py` (#38: inlining
+  never changes a backtrace);
 - **myv-fuzz** on BOTH a Debug/ASan and an `ASSERTS=OFF` Release build,
   because those catch different things (a memory error vs. a check the
   debug build was relying on being compiled away). Findings are
@@ -3108,11 +3109,19 @@ COMPLETE child visitor (`fmi_children`): the resolver's `for_each_child`
 skips Block/for/foreach/try/Expr14, which left every STATEMENT of a spliced
 block body chain-less. And an inlined frame renders the callee's
 `display_name` (`inline_frame_name`), exactly as a physical one does - it
-rendered `weight$0` where `-ni` rendered `weight`. Backtraces for **body** errors are
-byte-identical with/without inlining;
+rendered `weight$0` where `-ni` rendered `weight`. The oracle is
+`inlined_backtrace_oracle` (`-rt`) + `tests/bt_oracle.py` (CLI configs):
+every engine with inlining ON must render the `-ni -tw` backtrace and
+caret. Backtraces for **body** errors are byte-identical with/without
+inlining;
 **known limitation** — an error *evaluating an argument* (e.g. an undefined var)
 is attributed to the inlined callee rather than the call site (the arg node is
-both the call-site value and the in-body operand). After splicing, the inliner
+both the call-site value and the in-body operand), in every engine alike, so
+it renders one extra virtual frame versus `-ni`. The same substitution can
+also REORDER a throwing argument after a side effect of the body (`func f(x)
+=> tick() + x; f(12 / z)` prints `tick` once more than `-ni` before the
+DivisionByZeroEx) - a RULE 2 output divergence, open (#38 report).
+After splicing, the inliner
 **re-folds** (`Inliner::refold`): a `MultiOpConstruct`, subscript, slice, member
 access, or const-builtin call folds to a literal when its operands are
 compile-time constants — scalar/array/dict literals *and* const globals (the

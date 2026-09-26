@@ -14,6 +14,10 @@ hand. The full set:
 - **`corpus_diff.sh`** — tree-walker vs the default engine over
   `tests/functional/` + `samples/`, plus the `--levers` / `--cold` JIT
   matrices.
+- **`bt_oracle.py`** — *CI (nets.yml)*. With inlining ON, every CLI
+  configuration (engines, JIT levers, `-nbi`, a `.myv`, `--no-opt all`)
+  must render an uncaught error byte-identically to `-ni -tw`, over
+  `tests/bt_oracle/*.my` plus generated recursion-unroll programs (#38).
 - **`myv_fuzz.py`** — a mutated `.myv` must never crash or hang the loader.
 - **`repl_fuzz.py`** — template-generated REPL sessions (the REPL has its
   own inferencer, retained ASTs and open-world globals).

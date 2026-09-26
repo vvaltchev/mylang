@@ -73,6 +73,14 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --levers
 
+    # #38 repro B: with inlining ON, every CLI configuration (the JIT
+    # levers, the splice off, a .myv image, --no-opt all) must render
+    # the backtrace and caret `-ni -tw` renders. An engine differential
+    # cannot see a frame the inliner loses: it is lost in every engine.
+    - name: "bt_oracle: inlining never changes a backtrace"
+      working-directory: ${{github.workspace}}/build
+      run: python3 $GITHUB_WORKSPACE/tests/bt_oracle.py ./mylang
+
     # Net 3: every program in a bounded shape space, four engines,
     # compared byte-for-byte. Depth 3 here (480 programs); the full
     # depth-4 space (2272) is a manual run.
