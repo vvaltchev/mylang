@@ -106,8 +106,12 @@ EvalValue builtin_readln(EvalContext *ctx, const ArgLocs *exprList,
     if (n != 0)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
+    /* none at END OF INPUT, so a script can tell it from an empty line
+     * (both used to read as ""). A last line with no newline is still
+     * returned; the call AFTER it answers none. Typed `opt str`. */
     string str;
-    getline(cin, str);
+    if (!getline(cin, str))
+        return EvalValue();
     return SharedStr(std::move(str));
 }
 

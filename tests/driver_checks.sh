@@ -682,5 +682,39 @@ else
     fail "-nc: rc=$got_rc default=[$a] -nc=[$b]"
 fi
 
+# ---------------------------------------------------------------------
+# readln() at END OF INPUT is none (typed `opt str`), so a script can
+# tell it from an empty line - both used to read as "", and
+# samples/shopping busy-looped forever on a closed stdin. A last line
+# with no newline is still returned; the call after it is none. -rt runs
+# in-process with no stdin to feed, so the net lives here. Every engine
+# and a .myv image must agree, and both interactive samples must exit 0
+# on an empty stdin.
+cat > "$TMP/eof.my" <<'EOFEOF'
+var a = readln();
+var b = readln();
+var c = readln();
+var d = readln();
+print(a, len(b), c, d == none, (d ?? "dflt"));
+EOFEOF
+"$BIN" -c "$TMP/eof.my" -o "$TMP/eof.myv" >/dev/null 2>&1
+want="x 0 z true dflt "
+eof_ok=1
+for mode in "" -nj -tw -nti "$TMP/eof.myv"; do
+    if [ "$mode" = "$TMP/eof.myv" ]; then
+        got=$(printf 'x\n\nz' | "$BIN" "$TMP/eof.myv" 2>&1)
+    else
+        got=$(printf 'x\n\nz' | "$BIN" $mode "$TMP/eof.my" 2>&1)
+    fi
+    [ "$got" = "$want" ] || { eof_ok=0; fail "readln EOF [$mode]: [$got]"; }
+done
+for s in shopping phonebook; do
+    if ! timeout 10 "$BIN" "$here/../samples/$s" </dev/null >/dev/null 2>&1
+    then
+        eof_ok=0; fail "readln EOF: samples/$s did not exit 0 on EOF"
+    fi
+done
+[ $eof_ok = 1 ] && pass "readln: none at end of input, every engine + image"
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc

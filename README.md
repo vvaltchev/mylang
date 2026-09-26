@@ -3111,7 +3111,16 @@ Write to the standard output the string-versions of the given
 arguments, separated by a single space and terminated by a line ending.
 
 #### `readln()`
-Read a single line from the standard input.
+Read a single line from the standard input, without its line ending. At
+the **end of input** (stdin closed, or a file piped in has been consumed)
+it returns `none`, so its type is `opt str` and a program can tell the
+end from an empty line (which reads as `""`). A last line with no line
+ending is still returned; the call after it returns `none`. The usual
+idiom supplies a default:
+
+```C#
+var cmd = readln() ?? "quit";     # end of input behaves like "quit"
+```
 
 #### `writeln(string)`
 Write the given string to the standard output, plus a line ending

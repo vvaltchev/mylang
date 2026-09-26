@@ -35,7 +35,10 @@ func read_quantity(pnum) {
     while (true) {
 
         write("How many " + products[pnum][0] + "? ");
-        var input = readln();
+        var line = readln();
+        if (line == none)
+            return qty;          # end of input: nothing more to read
+        var input = line;
 
         try {
 
@@ -62,7 +65,8 @@ while (true) {
 
     print();
     write("Enter product number ('q' to quit): ");
-    var input = readln();
+    # end of input (stdin closed) quits, like "q"
+    var input = readln() ?? "q";
     if (input == "q") {
         print();
         print("Quit");

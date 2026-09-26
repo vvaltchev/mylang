@@ -327,7 +327,8 @@ const BuiltinDoc builtin_docs[] = {
 { "print", "io", "print(...)",
   "Print the arguments space-separated, then a newline.", nullptr },
 { "readln", "io", "readln()",
-  "Read one line from stdin (without the trailing newline).", nullptr },
+  "Read one line from stdin (without the trailing newline); none at "
+  "the end of input.", nullptr },
 { "writeln", "io", "writeln(s, [file])",
   "Write s + a newline to stdout, or to file.", nullptr },
 { "write", "io", "write(s, [file])",
