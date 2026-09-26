@@ -28351,6 +28351,98 @@ static bool myv_untrusted_proven_arms()
 }
 
 /*
+ * myv_fuzz fat-1150 (2026-09-25): a Rethrow's region operand names the
+ * catch whose body holds it, so that region's pend slot is full - for
+ * bytecode we compiled. A mutated image pointed it at a region with no
+ * exception in hand: the debug build aborted on jit_rethrow's
+ * ML_VM_CHECK, and the interpreted op then DEREFERENCED the empty slot
+ * (a SEGV in an assert-free build). Both now raise InternalErrorEx, the
+ * fallback jit_rethrow already had. The image is patched BEFORE it is
+ * written, so the load-time JIT compiles the retargeted op too; run with
+ * the JIT off and on. Watched failing: rc 134 on the ML_VM_CHECK.
+ */
+static bool myv_rethrow_empty_region()
+{
+    const char *src =
+        "struct E { int v; }\n"
+        "try {\n"
+        "  try { throw E(runtime(1)); }\n"
+        "  catch (E) { rethrow; }\n"
+        "} catch (E) { print(\"outer\"); }\n"
+        "print(\"after\");";
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-rethrow.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    const bool saved_jit = g_jit_enabled;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    for (bool jit : { false, true }) {
+        g_jit_enabled = jit;
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+
+            VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+            int patched = 0;
+            for (Instr &in : prog.root.code)
+                if (in.op == OpCode::Rethrow) {
+                    /* the other of the two regions: the OUTER try, whose
+                     * catch is not running, so its slot is empty */
+                    in.pa = in.a_lit() == 0 ? 1 : 0;
+                    patched++;
+                }
+            if (patched != 1) {
+                fprintf(stderr, "myv-rethrow: expected one Rethrow, got "
+                                "%d - the shape changed\n", patched);
+                ok = false;
+                continue;
+            }
+            myv_write(prog, path, MyvSourceRef());
+            MyvSource ms;
+            VmProgram loaded = myv_read(path, ms);
+
+            std::ostringstream cap;
+            std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+            std::string ex;
+            try {
+                vm_run(loaded);
+            } catch (Exception &e) {
+                ex = e.name;
+            }
+            std::cout.rdbuf(old_buf);
+            if (ex != "InternalErrorEx" || !cap.str().empty()) {
+                fprintf(stderr, "myv-rethrow [jit %d]: expected "
+                                "InternalErrorEx and no output, got \"%s\" "
+                                "(out: %s)\n", jit, ex.c_str(),
+                        cap.str().c_str());
+                ok = false;
+            }
+        } catch (Exception &e) {
+            fprintf(stderr, "myv-rethrow [jit %d]: setup threw %s: %s\n",
+                    jit, e.name, e.msg ? e.msg : "");
+            ok = false;
+        }
+        remove(path.c_str());
+    }
+    g_exec_engine = saved;
+    g_jit_enabled = saved_jit;
+    return ok;
+}
+
+/*
  * A JIT'd root chunk is ADDRESS-BAKED (every NorecSite's `caller`, the
  * fragment -> chunk map), and main's VmProgram MOVES out of its producer's
  * return slot into the caller's variable. The script driver's compile
@@ -47120,6 +47212,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: a codegen-PROVEN arm on an image takes its defined fallback in "
       "every build (fat-845 float operand, fat-260 unpack base)",
       myv_untrusted_proven_arms },
+    { "myv: a Rethrow retargeted at an EMPTY region raises InternalErrorEx "
+      "in both engines (fat-1150)",
+      myv_rethrow_empty_region },
     { "vm: a moved VmProgram's root chunk keeps its baked addresses bound "
       "(the load path's stack-stale main)",
       vm_program_move_rebinds },
