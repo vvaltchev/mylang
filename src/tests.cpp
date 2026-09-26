@@ -22783,6 +22783,11 @@ static bool const_fold_equivalence()
             "array<P> e = [];",
             "for (var i = 0; i < runtime(3); i++) append(pts, P(i));",
             "print(array_storage(pts), array_storage(e), len(pts));" } },
+        /* un-folded, `sort(K)` reaches AutoConst's folder with an arg0 it
+         * cannot read: the lvalue ABI handed sort a NULL target (a SEGV) */
+        { "a const builtin over a const array, left un-folded", {
+            "const K = [3, 1, 2];",
+            "print(sort(K), reverse(K), K);" } },
         { "a statically dead branch is not checked", {
             "const DEBUG = false;",
             "if (DEBUG) { nope(); }",

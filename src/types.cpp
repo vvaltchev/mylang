@@ -305,6 +305,7 @@ inline auto make_const_builtin_lv(const char *name, decltype(Builtin::func) f,
     Builtin b{f};        /* the custom func (value-or-lvalue arg0) */
     b.func_lv = flv;     /* the VM's lvalue form */
     b.kind = Builtin::Kind::lvalue;
+    b.arg0_value_ok = true;   /* see Builtin::arg0_value_ok */
     return make_pair(UniqueId::get(name), LValue(b, true));
 }
 

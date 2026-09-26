@@ -123,6 +123,18 @@ struct Builtin {
     Kind kind = Kind::node;
 
     /*
+     * An `lvalue` builtin whose arg0 may also be a plain VALUE (sort,
+     * rev_sort, reverse: `sort([3, 1])` returns a sorted copy). Its func_lv
+     * reads the value THROUGH the target, so a caller that has no LValue
+     * for arg0 must hand it a temporary holding the value
+     * (builtin_lv_target, eval.h) - a null target was dereferenced (a
+     * SEGV on `var dyn s = sort; s([2, 1]);`). For every other lvalue
+     * builtin a null target is the "not an lvalue" answer it throws on.
+     * In the padding after `kind`: Builtin does not grow.
+     */
+    bool arg0_value_ok = false;
+
+    /*
      * Explicit ctors so no construction leaves the anonymous union member
      * uninitialized - aggregate init `Builtin{f}` / `Builtin{nullptr}` used to,
      * which -Wmissing-field-initializers (rightly) flagged. Both pointers null
