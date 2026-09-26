@@ -1085,9 +1085,19 @@ struct Codegen {
                                std::vector<CgInstr> &ops)
     {
         const int n = static_cast<int>(la->elems.size());
-        if (n == 0)
+        /* #54: an EMPTY `[]` whose destination is array<PodStruct> must
+         * start flat too - the def comes from the inferencer's hint, there
+         * being no element to take it from. MakeArrayV carries no def, so
+         * it built a GENERAL array: `var pts = []` then appended structs
+         * was stored boxed under the VM while the tree-walker (and a
+         * folding parse, which bakes the `[]` into a flat LiteralObj) kept
+         * it flat - exposed by -nc. */
+        const StructTypeDef *sdef =
+            n == 0 && la->arr_hint_struct
+                && la->arr_hint_struct->layout == StructTypeDef::Layout::pod
+            ? la->arr_hint_struct : nullptr;
+        if (n == 0 && !sdef)
             return false;
-        const StructTypeDef *sdef = nullptr;
         for (const auto &el : la->elems) {
             const CallExpr *ce = dynamic_cast<const CallExpr *>(el.get());
             if (!ce || !ce->vm_struct_ctor_def || !ce->args)
@@ -1128,7 +1138,8 @@ struct Codegen {
         const int dst = alloc_temp();
         CgInstr in;
         in.op = OpCode::MakeStructArrayV;
-        in.node_idx = add_ast_node(la->elems[0].get());   /* a ctor: defensive coerce loc (nulled) */
+        /* a ctor: defensive coerce loc (nulled) */
+        in.node_idx = add_ast_node(n ? la->elems[0].get() : la);
         in.target = dst;
         in.set_a(int_lit(base));
         in.set_b(int_lit(n));

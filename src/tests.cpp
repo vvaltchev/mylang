@@ -22775,6 +22775,14 @@ static bool const_fold_equivalence()
         { "a failing constant expression is a compile error", {
             "const A = [1, 2];",
             "try { print(A[5]); } catch (OutOfBoundsEx) { print(1); }" } },
+        /* an un-folded `[]` reaches the VM as a LITERAL, not a baked
+         * value: MakeArrayV carried no struct def and built it GENERAL */
+        { "an empty [] into array<PodStruct> starts flat", {
+            "struct P { int x; }",
+            "var pts = [];",
+            "array<P> e = [];",
+            "for (var i = 0; i < runtime(3); i++) append(pts, P(i));",
+            "print(array_storage(pts), array_storage(e), len(pts));" } },
         { "a statically dead branch is not checked", {
             "const DEBUG = false;",
             "if (DEBUG) { nope(); }",
