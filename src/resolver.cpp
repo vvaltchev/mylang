@@ -345,6 +345,23 @@ static bool func_is_cacheable_recursive(const FuncDeclStmt *fd)
         && count_uid(fd->body.get(), fd->id->uid) >= 2;
 }
 
+static void fmi_children(Construct *c,
+                         const std::function<void(Construct *)> &fn);
+
+/* Is `id` a global-table name the program ASSIGNS somewhere (`sq = ng;`)?
+ * The resolver publishes the reassigned slots on the root block
+ * (global_slot_reassigned); a function bound to such a name is a VALUE the
+ * program can replace, so no pass may fold, inline or specialize a call
+ * through the name as a call to the declared function. */
+static bool global_name_rebound(const Block *rb, const Identifier *id)
+{
+    if (!rb || !id || id->sym.kind != SymKind::global || id->sym.slot < 0)
+        return false;
+    const size_t slot = static_cast<size_t>(id->sym.slot);
+    return slot < rb->global_slot_reassigned.size()
+        && rb->global_slot_reassigned[slot];
+}
+
 class AutoConst {
 
     EvalContext cctx;   /* const context for evaluating folded constants */
@@ -387,6 +404,7 @@ public:
 
     void run(Block *root, const std::vector<int> &main_writes)
     {
+        root_rb = root;
         register_pure_funcs(root);
         fold_function(root, main_writes, nullptr);
     }
@@ -605,6 +623,9 @@ private:
      * auto-pure funcs - and pure calls whose args only become const via
      * auto-const - can fold too.
      */
+    /* The root block, for the rebound-name test (set by run). */
+    const Block *root_rb = nullptr;
+
     void register_pure_funcs(Construct *c)
     {
         if (!c)
@@ -618,7 +639,8 @@ private:
              * (for inlining/CSE) but its const-arg recursion folds only via the
              * depth/budget-bounded unroll. */
             if (fd->desc->effective_pure && fd->id
-                    && !func_is_self_recursive(fd)) {
+                    && !func_is_self_recursive(fd)
+                    && !global_name_rebound(root_rb, fd->id.get())) {
                 try {
                     fd->eval(&cctx);
                 } catch (const Exception &) {
@@ -1310,6 +1332,7 @@ public:
              bool repl = false, EvalContext *prior_pure = nullptr)
     {
         repl_mode = repl;
+        collect_rebound_names(root, rebound_names);
 
         /* REPL: a function from an earlier input that is effectively pure lets
          * a NEW function calling it is recognized pure too (cross-input
@@ -2344,6 +2367,39 @@ private:
      * is), letting its const-arg calls fold. Monotonic; populated as
      * process_function decides each function. */
     std::unordered_set<const UniqueId *> pure_func_names;
+
+    /* Names ASSIGNED anywhere in the program (`sq = ng;`, at any depth) -
+     * collected up front, because a function's purity is decided while
+     * the walk has not yet reached a later reassignment. A function whose
+     * NAME is rebound never joins pure_func_names: a call through the name
+     * may reach whatever was assigned to it, so neither a caller's
+     * auto-purity nor any fold may assume the declared body. By NAME, so a
+     * same-named local costs a missed optimization, never an answer. */
+    std::unordered_set<const UniqueId *> rebound_names;
+
+    static void collect_rebound_names(
+        Construct *c, std::unordered_set<const UniqueId *> &out)
+    {
+        if (!c)
+            return;
+        if (ctag(c) == ConstructType::expr14) {
+            auto *e = static_cast<Expr14 *>(c);
+            if (!(e->fl & pFlags::pInDecl)) {
+                Construct *lv = e->lvalue.get();
+                if (ctag(lv) == ConstructType::id)
+                    out.insert(static_cast<Identifier *>(lv)->uid);
+                else if (ctag(lv) == ConstructType::idlist)
+                    for (auto &x : static_cast<IdList *>(lv)->elems)
+                        out.insert(x->uid);
+            }
+        }
+        if (ctag(c) == ConstructType::func_decl)
+            collect_rebound_names(
+                static_cast<FuncDeclStmt *>(c)->body.get(), out);
+        fmi_children(c, [&](Construct *ch) {
+            collect_rebound_names(ch, out);
+        });
+    }
 
     /* Pass 2: function bodies are already resolved, so don't re-enter them. */
     bool top_level_only = false;
@@ -3870,9 +3926,19 @@ func_body_is_pure(const Construct *c,
                 return false;
         return func_body_is_pure(tc->finallyBody.get(), pure_names);
     }
-    if (auto *e14 = dynamic_cast<const Expr14 *>(c))
+    if (auto *e14 = dynamic_cast<const Expr14 *>(c)) {
+        /* an assignment to a NON-LOCAL name writes program state, whatever
+         * the name reads as: `tw = th` inside a body, where `tw` is a pure
+         * function's name, passed the identifier test below and made the
+         * writer auto-pure - then folded at compile time */
+        if (!(e14->fl & pFlags::pInDecl)
+                && ctag(e14->lvalue.get()) == ConstructType::id
+                && static_cast<const Identifier *>(e14->lvalue.get())
+                       ->sym.kind != SymKind::local)
+            return false;
         return func_body_is_pure(e14->lvalue.get(), pure_names)
             && func_body_is_pure(e14->rvalue.get(), pure_names);
+    }
 
     bool ok = true;
     for_each_child(const_cast<Construct *>(c), [&](Construct *ch) {
@@ -3988,7 +4054,8 @@ Resolver::process_function(FuncDeclStmt *fd)
          * NOT eagerly const-folded - see register_pure_funcs / the ctor guard.)
          */
         bool added_self = false;
-        if (fd->id && !pure_func_names.count(fd->id->uid)) {
+        if (fd->id && !pure_func_names.count(fd->id->uid)
+                && !rebound_names.count(fd->id->uid)) {
             pure_func_names.insert(fd->id->uid);
             added_self = true;
         }
@@ -4004,7 +4071,8 @@ Resolver::process_function(FuncDeclStmt *fd)
 
     /* record any proven-pure function (auto OR explicit) so a LATER function
      * that calls it is recognized pure too (see func_body_is_pure). */
-    if (fd->desc->effective_pure && fd->id)
+    if (fd->desc->effective_pure && fd->id
+            && !rebound_names.count(fd->id->uid))
         pure_func_names.insert(fd->id->uid);
 
     if (st.slottable && st.next_slot > 0) {
@@ -4684,6 +4752,10 @@ public:
                 continue;
             if (fd->id->sym.kind == SymKind::global)
                 func_global_slots.insert(fd->id->sym.slot);
+            /* a REBOUND name (`sq = ng;` somewhere) may call anything
+             * assigned to it: neither inline nor specialize through it */
+            if (global_name_rebound(root, fd->id.get()))
+                continue;
             if (inlinable_decl(fd))
                 add_unique(funcs, fd);
             else if (specializable_decl(fd))

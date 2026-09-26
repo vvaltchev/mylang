@@ -826,6 +826,65 @@ static const std::vector<test> tests =
       &typeid(DivisionByZeroEx), 29, 2, 35, 2 },
 
     /*
+     * #38 D: REASSIGNING A NAMED FUNCTION TAKES EFFECT. `sq = ng;` was
+     * ignored in every engine, `-tw -ni -nc` included: template
+     * instantiation redirected `sq(3)` to a clone of the ORIGINAL body,
+     * auto-purity folded it at compile time, the inliner spliced it -
+     * each by the declaration's name. A rebound name is a variable now
+     * (func_name_rebound, the resolver's rebound_names /
+     * global_name_rebound): no redirect, no fold, no inline, no unroll,
+     * and the callee-set analysis includes what was assigned. Watched
+     * failing: callee_funcinfo's rebound test removed fails the first
+     * entry in every mode (the template redirect alone keeps the old
+     * body). An explicit `pure func` is a compile-time binding and
+     * refuses the rebind (CannotRebindConstEx) - the tree-walker used
+     * to rebind it silently where the VM refused.
+     */
+    { "rebind: a template function name reassigned between calls",
+      { "func sq(x) { return x * x; }",
+        "func ng(x) { return 0 - x; }",
+        "func use(y) { return sq(y) + 1; }",
+        "assert(sq(3) == 9 && sq(runtime(3)) == 9 && use(2) == 5);",
+        "sq = ng;",
+        "assert(sq(3) == -3 && sq(runtime(3)) == -3 && use(2) == -1);",
+        "sq = func(x) { return x + 100; };",
+        "assert(sq(3) == 103 && use(runtime(2)) == 103);" } },
+    { "rebind: a typed function name reassigned inside another function",
+      { "func tw(int x) { return x * 2; }",
+        "func th(int x) { return x * 3; }",
+        "func flip() { tw = th; }",
+        "assert(tw(5) == 10);",
+        "flip();",
+        "assert(tw(5) == 15 && tw(runtime(5)) == 15);" } },
+    { "rebind: before the first call; a recursion's self calls follow it",
+      { "func fib(int n) { if (n < 2) return n;",
+        "                  return fib(n - 1) + fib(n - 2); }",
+        "func one(int n) { return 1; }",
+        "var keep = fib;",
+        "fib = one;",
+        "assert(fib(10) == 1 && keep(10) == 2);" } },
+    { "rebind: a block-scoped function name",
+      { "var r = 0;",
+        "{",
+        "    func loc(int x) { return x * 10; }",
+        "    func alt(int x) { return x * 20; }",
+        "    r = loc(2);",
+        "    loc = alt;",
+        "    r = r + loc(2);",
+        "}",
+        "assert(r == 60);" } },
+    { "rebind: a var-bound lambda reassigned",
+      { "var f = func(x) { return x * 2; };",
+        "var a = f(3);",
+        "f = func(x) { return x + 1; };",
+        "assert(a == 6 && f(3) == 4);" } },
+    { "rebind: an explicit pure func name is a const binding",
+      { "pure func a(x) => x + 1;",
+        "pure func b(x) => x + 2;",
+        "a = b;" },
+      &typeid(CannotRebindConstEx), 1, 3, 3, 3 },
+
+    /*
      * An INLINED function writing through its parameter needs an LVALUE
      * where the parameter was; the inliners substituted a literal argument
      * there, so `h([1, 2, 3])` raised NotLValueEx in the tree-walker and
@@ -21895,13 +21954,21 @@ static bool jit_frameless_calling()
      * reassigned slot is baked all the same, and while t's body runs
      * (entered through `keep`) its slot holds u - so each self call must
      * reach u. The site keeps its compare, fails it, and the slow tier
-     * calls u (202: the unroll inlines one level of t). Watched: with the
-     * predicate reading the forced bake
+     * calls u (200). Watched: with the predicate reading the forced bake
      * instead of the write-once flag, this prints 41 twice.
+     *
+     * It used to print 202 - the recursion unroll spliced one level of t's
+     * ORIGINAL body into itself although the name is rebound, a RULE 2
+     * break `-ni` does not share (task #38 D). A rebound name is neither
+     * pure nor unrolled now, so t's self calls are plain CallVs - which
+     * are run-eligible only past a depth cap of 1000 (op_run_eligible),
+     * so this case runs at a cap above it (t recurses 40 deep).
      */
     {
         const unsigned saved_force = g_jit_force_extra;
         g_jit_force_extra |= jit_lever_bit("bakecallee");
+        const int saved_cap = jit_sync_depth_cap();
+        jit_set_sync_depth_cap(2000);
         const unsigned long s0 = g_jit_frameless_self_sites;
         const unsigned long i0 = g_jit_frameless_self_id;
         const std::vector<const char *> lines = {
@@ -21917,7 +21984,8 @@ static bool jit_frameless_calling()
         const std::string tw = run(lines, false);
         const std::string vm = run(lines, true);
         g_jit_force_extra = saved_force;
-        if (tw != vm || tw.find("202") == std::string::npos) {
+        jit_set_sync_depth_cap(saved_cap);
+        if (tw != vm || tw.find("200") == std::string::npos) {
             fprintf(stderr, "jit_frameless_calling: a reassigned self slot "
                     "under FORCE differs\n  nj: %s\n  vm: %s\n",
                     tw.c_str(), vm.c_str());
@@ -37829,6 +37897,26 @@ static bool callee_set_analysis()
         "var g = fns[0];",
         "print(g(1));" },
         { "dcs\t5\t7\t-\tone\tlambda@1:19" });
+
+    /* ⛔ A REBOUND FUNCTION NAME IS A VARIABLE (#38 D). `sq(3)` after
+     * `sq = neg` reaches neg, and so does a call through the name in
+     * ANOTHER function; answering the declaration alone was a wrong MUST
+     * answer, and the #93 escape analysis reads it (callee_fn). The
+     * var-bound lambda reassigned is the same rule. Watched failing:
+     * with cs_eval's rebound arm removed every row reads `one`. */
+    want("rebound function name", {
+        "func sq(int x) => x * x;",
+        "func neg(int x) => 0 - x;",
+        "func use(int y) { return sq(y) + 1; }",
+        "sq = neg;",
+        "print(sq(3), use(2));" },
+        { "dcs\t3\t26\tuse\tmany\tneg,sq",
+          "dcs\t5\t7\t-\tmany\tneg,sq" });
+    want("rebound lambda variable", {
+        "var f = func(int x) { return x * 2; };",
+        "f = func(int x) { return x + 1; };",
+        "print(f(3));" },
+        { "dcs\t3\t7\t-\tmany\tlambda@1:9,lambda@2:5" });
 
     /* a dict VALUE, and a struct FIELD */
     want("dict value", {

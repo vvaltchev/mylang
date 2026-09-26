@@ -4381,6 +4381,18 @@ handle_single_expr14(EvalContext *ctx,
     } else if (!ctx->const_ctx) {
 
         /*
+         * A name the PARSER resolved as a compile-time binding (a `pure
+         * func`, which const initializers may already have called) cannot
+         * be rebound: its slot holds an ordinary LValue at run time, so
+         * the check is the name's, exactly as the VM codegen's rebind_const
+         * throw (RULE 2 - the tree-walker used to rebind it silently).
+         */
+        if (lvalue->is_id() && lvalue->is_const
+                && static_cast<const Identifier *>(lvalue)->sym.kind
+                       == SymKind::global)
+            throw CannotRebindConstEx(lvalue->start, lvalue->end);
+
+        /*
          * Fast path: an assignment / compound-assignment to a resolved, live,
          * non-const local. The slot's LValue has no `container` (only array
          * elements do), so we read-modify-write it in place, skipping the

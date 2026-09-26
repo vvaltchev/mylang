@@ -89,6 +89,12 @@ struct TypeSym {
      * a template (calls redirect to typed clones; nothing else holds it). */
     int writes = 0;
     bool value_used = false;
+    /* The symbol is a NAMED function's name (a FuncDeclStmt binds it; its
+     * declaration is not counted in `writes`). With writes > 0 the name is
+     * REBOUND - a global holding a function value - so no pass may treat a
+     * call through it as a call to the declared function (see
+     * func_name_rebound). */
+    bool named_func = false;
     /* A param that received a possibly-none (opt/none) argument at some call
      * site (set in the check pass). With strict_dyn on, a non-opt non-dyn param
      * with this set is a compile error demanding `opt` (enforce_nonnull_params,
@@ -546,12 +552,31 @@ TypeSym *Inferencer::lookup(Scope *s, const UniqueId *name)
 /* The FuncInfo a callee expression denotes, if statically a specific function:
  * an identifier bound to a function (named func, or a var initialized with a
  * lambda), or an inline lambda. */
+/*
+ * A named function whose NAME is assigned somewhere (`sq = ng;`, at any
+ * depth) - or a `var f = <lambda>` assigned again: the name is then a
+ * variable holding a function VALUE, and a call
+ * through it may reach any function assigned to it. Nothing may name the
+ * callee from the declaration - no template redirect (which pinned
+ * `sq(3)` to a clone of the ORIGINAL body, in every engine), no
+ * argument contribution to the declared params, no arity/type check
+ * against the declared signature (a call is checked against the NAME's
+ * static type instead, like any function-valued variable).
+ */
+static bool func_name_rebound(const TypeSym *s)
+{
+    /* a named function's declaration is not a counted write; a
+     * `var f = <lambda>` binding is */
+    return s && s->func && s->writes > (s->named_func ? 0 : 1);
+}
+
 FuncInfo *Inferencer::callee_funcinfo(Construct *e)
 {
     if (ctag(e) == ConstructType::id) {
         auto *id = static_cast<Identifier *>(e);
         auto it = id_sym.find(id);
-        if (it != id_sym.end() && it->second && it->second->func)
+        if (it != id_sym.end() && it->second && it->second->func
+                && !func_name_rebound(it->second))
             return it->second->func;
         return nullptr;
     }
@@ -1906,8 +1931,8 @@ void Inferencer::infer_one(Block *rootBlock)
         };
 
         for (auto &kv : tmpls)
-            if (kv.second->value_used)
-                keep(kv.second);
+            if (kv.second->value_used || func_name_rebound(kv.second))
+                keep(kv.second);    /* a rebound name's calls stay calls */
 
         for (auto &e : rootBlock->elems)
             scan_baked(e.get());
@@ -3012,6 +3037,7 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
         auto it = s->syms.find(nm);
         sym = (it != s->syms.end()) ? it->second : new_sym(nm, s, fd->start);
         sym->func = fi;
+        sym->named_func = true;
         id_sym[fd->id.get()] = sym;
     }
 }

@@ -3034,6 +3034,23 @@ grew by four. The generic push keeps the helper. **Remaining cases, none
 built:** the builtin-CALLBACK bind paths (`argv[i]` — sort/map/filter/
 make_dict) and the tree-walker's `do_func_bind_params`.
 
+**⛔ A REBOUND FUNCTION NAME IS A VARIABLE (#38 D, 2026-09-25).**
+`func sq(x) {...}; sq = ng;` - the name is then a global holding a function
+VALUE, and no pass may treat a call through it as a call to the declared
+body. That was ignored in EVERY engine, `-tw -ni -nc` included, by four
+passes each keyed on the declaration's name: the inferencer's template
+redirect (`callee_funcinfo`), auto-purity and AutoConst's fold, the
+inliner (and its recursion unroll), and the callee-set analysis (which
+answered `one sq` - a wrong MUST answer the #93 escape analysis reads).
+The guards: `func_name_rebound` (inferencer: a named func with any counted
+write, a var-bound lambda with more than one), the resolver's
+`rebound_names` (a pre-scan, by NAME, of every assignment target, because
+purity is decided before the walk reaches a later reassignment) and
+`global_name_rebound` (the published `global_slot_reassigned`, for
+AutoConst and the Inliner). An explicit `pure func` is the exception: its
+name is a compile-time binding, and rebinding it is CannotRebindConstEx in
+every engine (the tree-walker used to rebind it silently).
+
 **Auto-pure & const/pure introspection.** `func_body_is_pure` (`resolver.cpp`),
 run after a function body is resolved, promotes a non-pure, capture-free func to
 `effective_pure` when every free identifier (`sym.kind != local`) is

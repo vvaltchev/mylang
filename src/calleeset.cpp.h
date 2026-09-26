@@ -543,8 +543,21 @@ CsSet Inferencer::cs_eval(Construct *e)
             return out;
         }
         TypeSym *s = it->second;
-        if (s->func) {
+        if (s->func && !func_name_rebound(s)) {
             out.add_func(s->func);        /* the name of a function */
+            return out;
+        }
+        if (s->func) {
+            /*
+             * A REBOUND function name (`sq = ng;` somewhere, or a
+             * var-bound lambda assigned again): the declared function
+             * PLUS everything written to the name. Answering the
+             * declaration alone was a wrong MUST answer - `sq(3)` named
+             * `sq` for a site that reaches `ng` - and the #93 escape
+             * analysis reads it (a false "safe" is a use-after-free).
+             */
+            out = cs_pts[cs_loc(CsLocKind::sym, s, 0)];
+            out.add_func(s->func);
             return out;
         }
         if (s->struct_type)

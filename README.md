@@ -1575,6 +1575,24 @@ var add = func (x, y) => x + y;
 Note: when creating function objects in expressions, we're not allowed to assign
 them a name.
 
+Being a regular symbol, a function's name can be **reassigned** - to another
+function or a lambda with a compatible signature - and every later call through
+the name reaches the new value, including calls from inside other functions
+and a recursive function's calls to itself:
+
+```C#
+func sq(x) { return x * x; }
+func ng(x) { return 0 - x; }
+func use(y) => sq(y) + 1;
+print(sq(3), use(2));      # 9 5
+sq = ng;
+print(sq(3), use(2));      # -3 -1
+```
+
+The exception is a `pure func` (see [Pure functions](#pure-functions)): its name
+is a compile-time binding, like a `const`, so reassigning it raises
+`CannotRebindConstEx`.
+
 **Function scope is lexical, like a variable's.** A named function (or struct)
 declared inside a block — an `if`/`for`/`{ }` body, or another function's body —
 is **scoped to that block**: it is visible from its declaration to the end of
