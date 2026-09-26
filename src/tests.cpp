@@ -16503,6 +16503,76 @@ func drive(int d) {
     return s;
 }
 print(drive(runtime(60)));)",
+        /* THE ARGUMENT RULE - an inlined call's arguments run as the
+         * real call's do: once, left to right, BEFORE the body, their
+         * errors the CALLER's. Each of these rendered an extra virtual
+         * frame (the callee's) and/or printed a different output with
+         * inlining on, until the inliner bound a non-inert argument to
+         * a temp instead of pasting it into the body. */
+        /* a throwing argument vs a body side effect (the extra "tick") */
+        R"(var n = 0;
+func tick() { n = n + 1; print("tick " + str(n)); return 1; }
+func f(x) => tick() + x;
+func drive(int m) {
+    var s = 0;
+    for (var i = 0; i < m; i++) s = s + f(12 / (m - 1 - i));
+    return s;
+}
+print(drive(runtime(4)));)",
+        /* an argument the taken guard arm / a short-circuit tail skips */
+        R"(func pick(c, a, b) { if (c) return a; return b; }
+func both(c, x) => c && x > 0;
+func drive(int m) {
+    var xs = [1, 2, 3];
+    var s = 0;
+    for (var i = 0; i < m; i++) {
+        s = s + (both(i > 100, 12 / (4 - i)) ? 1 : 0);
+        s = s + pick(i < 100, i, xs[i]);
+    }
+    return s;
+}
+print(drive(runtime(5)));)",
+        /* an argument error at a call INSIDE an inlined body: outer's
+         * frame, never inner's */
+        R"(func inner(x) => x * 2;
+func outer(y) => inner(10 / y) + 1;
+func drive(int m) {
+    var s = 0;
+    for (var i = 0; i < m; i++) s = s + outer(m - 1 - i);
+    return s;
+}
+print(drive(runtime(4)));)",
+        /* a typed parameter's bind refusing a dyn value (caret on the
+         * argument) */
+        R"(func inc(int x) => x + 1;
+func drive(int m) {
+    var s = 0;
+    for (var i = 0; i < m; i++) {
+        var dyn d = i;
+        if (i == m - 1) d = runtime("s");
+        s = s + inc(d);
+    }
+    return s;
+}
+print(drive(runtime(4)));)",
+        /* a throwing local the inlined body never reads */
+        R"(func unused(a, b) { var q = a / b; return 1; }
+func drive(int m) {
+    var s = 0;
+    for (var i = 0; i < m; i++) s = s + unused(i, m - 1 - i);
+    return s;
+}
+print(drive(runtime(4)));)",
+        /* throwing terms the int-algebra fold would drop or cancel */
+        R"(func drive(int m) {
+    var s = 0;
+    for (var i = 0; i < m; i++) {
+        s = s + (m / (m - 1 - i)) * 0;
+        s = s + m / (m - 2 - i) - m / (m - 2 - i);
+    }
+    return s;
+}
+print(drive(runtime(4)));)",
     };
     std::vector<std::string> corpus(std::begin(progs), std::end(progs));
     /* the fib-unroll shape at every depth the unroll distinguishes */
@@ -17300,8 +17370,12 @@ inliner_refolds_non_multiop()
     const std::vector<const char *> src = {
         "var g = 1;",
         "g = 2;",                              /* g runtime */
-        "func f(a) => a[0] + len(a) + g;",     /* not pure (reads g) */
-        "var r = f([10, 20, 30]);",            /* -> 10 + 3 + g */
+        /* one use per param: a MUTABLE array literal is a fresh object
+         * per evaluation, so the inliner pastes it only where the param
+         * is read once (THE ARGUMENT RULE - duplicating it would split
+         * one argument into two arrays) */
+        "func f(a, b) => a[0] + len(b) + g;",  /* not pure (reads g) */
+        "var r = f([10, 20, 30], [1, 2, 3]);", /* -> 10 + 3 + g */
         "assert(r == 15);",
     };
 
@@ -18741,12 +18815,16 @@ static bool coderender_inline_fold_types()
     /* fib's guard body is inlined as an EXPRESSIBLE ternary (not a
      * block-with-returns): its render has the ternary operators and a frontier
      * fib() call. The unroll DEPTH/balance is pinned by inline_unroll_shape. */
-    const FuncDeclStmt *fib = find_top_func(root.get(), "fib");
+    /* the INSTANCE (int): the untyped base's `n - 1` could throw (n may be
+     * anything), so there the self-call args are bound to temps and the
+     * body stays an InlinedCall (THE ARGUMENT RULE) */
+    const FuncDeclStmt *fib = find_top_func(root.get(), "fib$0");
+    ok = ok && fib;
     if (fib) {
         const std::string sf = render_func_code(fib);
         ok = ok && sf.find(" ? ") != std::string::npos
                 && sf.find(" : ") != std::string::npos
-                && sf.find("fib(") != std::string::npos;
+                && sf.find("fib$0(") != std::string::npos;
     }
 
     /* an arbitrary expression renders too */
@@ -21126,8 +21204,11 @@ static bool cg_minmax_reach()
     const long ints = count({
         "func f(int a, int b) { return abs(a) + min(a, b) + max(a, b); }",
         "print(f(int(runtime(-3)), int(runtime(4))));" });
-    if (ints != 3) {
-        fprintf(stderr, "cg_minmax_reach: %ld of 3 int calls lowered\n",
+    /* f's body lowers 3; the call site, whose arguments are calls, is
+     * inlined too (its args bound to temps - THE ARGUMENT RULE), and each
+     * inlined copy lowers its own 3 */
+    if (ints < 3 || ints % 3 != 0) {
+        fprintf(stderr, "cg_minmax_reach: %ld lowered, want 3 per copy\n",
                 ints);
         ok = false;
     }
@@ -22854,7 +22935,7 @@ struct OptLayerCase {
  * exception type name ("" when it completed). Returns false only if the
  * pipeline itself could not be run. */
 static bool opt_layer_run(const std::string &src, ExecEngine eng,
-                          unsigned disabled, std::string &out,
+                          unsigned disabled, bool inl, std::string &out,
                           std::string &exname)
 {
     std::vector<Tok> toks;
@@ -22873,7 +22954,7 @@ static bool opt_layer_run(const std::string &src, ExecEngine eng,
         unique_ptr<Construct> root = pBlock(pc);
         mark_implicit_globals(root.get(), {});
         infer_types(root.get());
-        run_optimizers(root.get());
+        run_optimizers(root.get(), inl);
         if (eng == ExecEngine::Vm)
             vm_execute(root.get());
         else
@@ -23026,17 +23107,68 @@ static bool opt_layer_equivalence()
             "  return s;",
             "}",
             "print(dot([[1,2],[3,4]], [10,20], 2));" } },
+        /*
+         * THE ARGUMENT RULE - the INLINER's layer (its kill switch is
+         * -ni, the `-ni` configs below). A real call evaluates each
+         * argument once, left to right, before the body; the inliner
+         * used to paste the argument expression into the body instead.
+         * Every case records WHAT RAN, since the values mostly agree.
+         * Watched failing with the rule reverted: each case below.
+         */
+        { "inline: a throwing argument runs before the body's effect", {
+            "var t = \"\";",
+            "func tick() { t = t + \"t\"; return 1; }",
+            "func f(x) => tick() + x;",
+            "var z = int(runtime(0));",
+            "try { print(f(12 / z)); } catch (DivisionByZeroEx) { }",
+            "print(t);" } },
+        { "inline: an argument the taken guard arm ignores still runs", {
+            "func pick(c, a, b) { if (c) return a; return b; }",
+            "var xs = [1, 2]; var k = int(runtime(5));",
+            "print(pick(true, 1, xs[k]));" } },
+        { "inline: an argument in a short-circuit tail still runs", {
+            "func both(c, x) => c && x > 0;",
+            "var z = int(runtime(0));",
+            "print(both(false, 12 / z));" } },
+        { "inline: argument order + count vs the body's effects", {
+            "var t = \"\";",
+            "func note(str s, int v) { t = t + s; return v; }",
+            "func f(a, b, c) => note(\"B\", 0) + c * c + a;",
+            "print(f(note(\"a\", 1), note(\"b\", 2), note(\"c\", 3)));",
+            "print(t);" } },
+        { "inline: a global argument vs a body that changes it", {
+            "var g = 5;",
+            "func bumpg() { g = g + 100; return 1; }",
+            "func f(x) => bumpg() + x;",
+            "print(f(g), g);" } },
+        { "inline: typed parameters widen / refuse at the bind", {
+            "func half(float x) { var t = x; return t; }",
+            "func m(int k) { return half(k); }",
+            "print(m(int(runtime(3))));",
+            "func inc(int x) => x + 1;",
+            "var dyn d = runtime(\"s\");",
+            "print(inc(d));" } },
+        { "inline: an unused throwing local of the body", {
+            "func unused(a, b) { var q = a / b; return 1; }",
+            "var k = int(runtime(7)); var z = int(runtime(0));",
+            "print(unused(k, z));" } },
+        { "inline: the int-algebra fold keeps a throwing term", {
+            "var k = int(runtime(7)); var z = int(runtime(0));",
+            "try { print((k / z) * 0); } catch (DivisionByZeroEx) { }",
+            "print(k / z - k / z);" } },
     };
 
-    /* every single pass off, plus all of them - each isolates one layer */
+    /* every single pass off, plus all of them - each isolates one layer;
+     * the inliner's own switch (-ni) rides alongside, on and all-off */
     const unsigned masks[] = {
         0,
         opt_licm, opt_slice_hoist, opt_for_range, opt_typed,
-        opt_all_passes,
+        opt_all_passes, 0, opt_all_passes,
     };
+    const bool inl[] = { true, true, true, true, true, true, false, false };
     const char *mask_name[] = {
         "(all on)", "-licm", "-slice-hoist", "-for-range", "-typed",
-        "(all off)",
+        "(all off)", "-ni", "(all off, -ni)",
     };
     const ExecEngine engines[] = { ExecEngine::TreeWalk, ExecEngine::Vm };
     const char *eng_name[] = { "tw", "vm" };
@@ -23052,7 +23184,8 @@ static bool opt_layer_equivalence()
         for (size_t mi = 0; mi < sizeof(masks) / sizeof(masks[0]); mi++) {
             for (size_t ei = 0; ei < 2; ei++) {
                 std::string out, ex;
-                if (!opt_layer_run(src, engines[ei], masks[mi], out, ex)) {
+                if (!opt_layer_run(src, engines[ei], masks[mi], inl[mi],
+                                   out, ex)) {
                     fprintf(stderr, "opt_layer: '%s' could not run\n", c.name);
                     return false;
                 }
@@ -42401,7 +42534,14 @@ static bool jit_borrow_arg_shapes()
     const bool saved_jit = g_jit_enabled;
     g_jit_enabled = false;
     const bool scalar_ok =
-        run({ "func ig(dyn a, dyn b) { return 2; }",
+        /* a body over the inline weight: `{ return 2; }` is INLINED now
+         * that a local argument is inert (THE ARGUMENT RULE), which leaves
+         * no call to bind - the fourth way this case went vacuous */
+        run({ "func ig(dyn a, dyn b) {",
+              "  var z = 0;",
+              "  for (var j = 0; j < 1; j++) z = z + 2;",
+              "  return z;",
+              "}",
               "var s = 0;",
               "for (var i = 0; i < 60; i++) s = s + ig(i, i);",
               "assert(s == 120);" });
@@ -43671,7 +43811,14 @@ static bool jit_op_nativized()
             "}",
             "assert(f(runtime({\"k\": 9}), 4) == 5);" } },
         { OpCode::IncDecChainV, {
-            "func k(int i) => 0;",
+            /* k must stay a CALL (the chain form needs a non-simple
+             * index): an `=> 0` body is inlined now that a local arg
+             * is inert, so give it a body over the inline weight */
+            "func k(int i) {",
+            "  var z = 0;",
+            "  for (var j = 0; j < i; j++) z = z * 0;",
+            "  return z;",
+            "}",
             "func f(array<int> a, int n) {",
             "  var s = 0;",
             "  for (var i = 0; i < n; i++) s += a[k(i)]++;",

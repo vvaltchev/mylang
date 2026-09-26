@@ -1,0 +1,14 @@
+# THE ARGUMENT RULE: a typed parameter's bind coerces, and a dyn value
+# that does not fit throws AT THE BIND - caret on the argument, no frame
+# for the callee
+func inc(int x) => x + 1;
+func drive(int m) {
+    var s = 0;
+    for (var i = 0; i < m; i++) {
+        var dyn d = i;
+        if (i == m - 1) d = runtime("s");
+        s = s + inc(d);
+    }
+    return s;
+}
+print(drive(runtime(4)));

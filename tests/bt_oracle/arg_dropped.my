@@ -1,0 +1,15 @@
+# THE ARGUMENT RULE: an argument the taken guard arm never reads, and one
+# inside a short-circuit tail, are still evaluated - and throw as the
+# caller's
+func pick(c, a, b) { if (c) return a; return b; }
+func both(c, x) => c && x > 0;
+func drive(int m) {
+    var xs = [1, 2, 3];
+    var s = 0;
+    for (var i = 0; i < m; i++) {
+        s = s + (both(i > 100, 12 / (4 - i)) ? 1 : 0);
+        s = s + pick(i < 100, i, xs[i]);
+    }
+    return s;
+}
+print(drive(runtime(5)));
