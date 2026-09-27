@@ -7235,10 +7235,11 @@ extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
 #ifdef TESTS
     g_jit_rethrow_native++;
 #endif
-    ML_VM_CHECK(ps.exc != nullptr);
+    ML_VM_CHECK(ml_untrusted_bytecode() || ps.exc != nullptr);
     std::unique_ptr<RuntimeException> ex = std::move(ps.exc);
     if (!ex) {
-        /* unreachable by the has_rethrow invariant - be LOUD, not silent */
+        /* unreachable by the has_rethrow invariant for our own bytecode;
+         * a mutated image reaches it (fat-1150) - be LOUD, not silent */
         try {
             throw InternalErrorEx();
         } catch (...) {
@@ -13336,7 +13337,13 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                  * contains this `rethrow`) - its slot holds the caught
                  * exception, immune to inner regions' traffic. */
                 VmPendState &ps = act.pend_at(cur_rec(), in->a_lit());
-                ML_VM_CHECK(ps.exc != nullptr);
+                /* codegen bakes the region of the catch whose body holds
+                 * this op, so its slot is full - unless the image lied
+                 * (myv_fuzz fat-1150): then a defined InternalErrorEx,
+                 * as jit_rethrow raises, never a null dereference */
+                ML_VM_CHECK(ml_untrusted_bytecode() || ps.exc != nullptr);
+                if (!ps.exc)
+                    ps.exc = std::make_unique<InternalErrorEx>();
                 Loc ls, le;
                 chunk->loc_at(pc, ls, le);
                 ps.exc->loc_start = ls;
