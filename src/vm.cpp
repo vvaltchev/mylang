@@ -350,6 +350,17 @@ vm_throw_unpack_nonarray(const Chunk *chunk, size_t pc, int_type nvars)
                                  " variables"), s, en);
 }
 
+/* #53: the foreach's element is GONE (the body shrank the array) - the
+ * defined OutOfBoundsEx, loc-less for the JIT (the re-raise stamps it) */
+[[noreturn]] static ML_COLD void
+vm_throw_unpack_gone(const Chunk *chunk, size_t pc)
+{
+    Loc ls, le;
+    if (chunk)
+        chunk->loc_at(pc, ls, le);
+    throw OutOfBoundsEx(ls, le);
+}
+
 [[noreturn]] static ML_COLD void
 vm_throw_unpack_len(const Chunk *chunk, size_t pc, size_type m, int_type nvars)
 {
@@ -5253,18 +5264,53 @@ vm_unpack_elem_body(EvalContext &ctx, const EvalValue &base_v, int_type idx,
     /* #53: the index is bounded by the length at the loop's START; the
      * body may have shrunk the array since - the foreach's defined
      * OutOfBoundsEx (loc-less for the JIT: the re-raise stamps it). */
-    if (idx < 0 || static_cast<size_type>(idx) >= outer.size()) {
-        Loc ls, le;
-        if (chunk)
-            chunk->loc_at(pc, ls, le);
-        throw OutOfBoundsEx(ls, le);
+    /* The row is BORROWED from a general array's storage, as it was
+     * before #53: copying it (vm_arr_elem returns by value) cost a
+     * SharedArrayObj retain + live-slices registration + release per
+     * element - +49% Ir on 75_indexed_unpack. Only a flat storage kind,
+     * which holds no EvalValue to point at, needs the materialized
+     * copy. Safe: nothing runs between here and the last read of `sub`
+     * that could mutate `outer` (the binds below write loop slots).
+     * Both lengths are read INLINE for the general case: the kind-
+     * dispatching size() is an out-of-line call, and it was two per
+     * element. */
+    EvalValue elem_copy;
+    const EvalValue *elem_p;
+    if (outer.skind() == SharedArrayObj::Storage::general) {
+        const auto &ov = outer.get_vec();
+        /* a BYTE bound, not a count: vector::size() over 48-byte
+         * LValues is a subtract and a divide-by-48 per element (and no
+         * pointer is formed before the index is known to be in range) */
+        const LValue *const base = ov.data() + outer.offset();
+        const std::ptrdiff_t avail = outer.is_slice()
+            ? static_cast<std::ptrdiff_t>(outer.size() * sizeof(LValue))
+            : reinterpret_cast<const char *>(ov.data() + ov.size())
+                  - reinterpret_cast<const char *>(base);
+        if (idx < 0 || static_cast<std::ptrdiff_t>(idx * sizeof(LValue))
+                           >= avail)
+            vm_throw_unpack_gone(chunk, pc);
+        elem_p = &base[idx].get();
+    } else {
+        if (idx < 0 || static_cast<size_type>(idx) >= outer.size())
+            vm_throw_unpack_gone(chunk, pc);
+        elem_copy = vm_arr_elem(outer, static_cast<size_type>(idx));
+        elem_p = &elem_copy;
     }
-    const EvalValue elem = vm_arr_elem(outer, static_cast<size_type>(idx));
+    const EvalValue &elem = *elem_p;
     if (!elem.is<SharedArrayObj>())
         vm_throw_unpack_nonarray(chunk, pc, N);
     const SharedArrayObj &sub = elem.get_ref<SharedArrayObj>();
-    if (sub.size() != static_cast<size_type>(N))
+    if (sub.skind() == SharedArrayObj::Storage::general
+            && !sub.is_slice()) {
+        /* (bytes, not a count - see the pointer bound above) */
+        const auto &sv = sub.get_vec();
+        if (reinterpret_cast<const char *>(sv.data() + sv.size())
+                - reinterpret_cast<const char *>(sv.data())
+                != static_cast<std::ptrdiff_t>(N * sizeof(LValue)))
+            vm_throw_unpack_len(chunk, pc, sub.size(), N);
+    } else if (sub.size() != static_cast<size_type>(N)) {
         vm_throw_unpack_len(chunk, pc, sub.size(), N);
+    }
     const size_type off = sub.offset();
     const auto sk = sub.skind();
     /*
