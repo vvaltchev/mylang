@@ -21287,6 +21287,183 @@ static bool norec_segment_boundary()
 }
 
 /*
+ * #97 R1: THE NATIVE REFERENCE RETURN. The record-less and frameless
+ * return arms used to decline to jit_ret_norec whenever the result was
+ * a reference or the old dst held one - which is every return of a
+ * factory loop (63_closures: 1,000,000 of 1,000,000). They now move
+ * the result bit-for-bit and release the old dst in place; only an
+ * ARRAY result declines, because a slice registers its own slot
+ * address in its parent's set and a moved copy would leave the set
+ * naming the dead slot.
+ *
+ * A VALUE check sees none of this, so every case asserts on counts:
+ * refcount() of the object the callee returns, read twice in the loop,
+ * must not move (a skipped old-dst release leaks +1 per call, a missing
+ * retain double-releases), and g_live_funcobjs for the closure case,
+ * whose FuncObject is POOLED and so invisible to LeakSanitizer. Reach
+ * is the arm's emitted counter: >= most of the loop for the kinds that
+ * move, EXACTLY zero for the slice, which must decline. Each case runs
+ * twice - frameless (the default) and with the frameless lever off,
+ * which is the record-less arm.
+ */
+static bool jit_ret_ref_native()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    struct Case {
+        const char *name;
+        std::vector<const char *> lines;
+        bool moves;     /* true: the arm serves it; false: must decline */
+    };
+    /* 40 iterations; the rc reads at k == 5 and k == 39 are both past
+     * the first descent, which goes through the C++ tier */
+    const std::vector<Case> cases = {
+        { "closure result (the 63 shape)", {
+            "func mkc(int i) {",
+            "    var b = i * 2;",
+            "    var q = b + 1;",
+            "    return func [q] () { return q; };",
+            "}",
+            "var s = 0;",
+            "for (var k = 0; k < 40; k++) { var c = mkc(k); s = s + c(); }",
+            "assert(s == 1600);" }, true },
+        { "string result", {
+            "var keep = \"ab\" + str(runtime(7));",
+            "func gs(int i) { var t = keep;",
+            "    for (var j = 0; j < i % 2; j++) { t = keep; } return t; }",
+            "var n = 0;",
+            "var rc1 = 0;",
+            "var rc2 = 0;",
+            "for (var k = 0; k < 40; k++) {",
+            "    var t = gs(k); n = n + len(t);",
+            "    if (k == 5) rc1 = refcount(keep);",
+            "    if (k == 39) rc2 = refcount(keep);",
+            "}",
+            "assert(n == 120 && rc1 == rc2);" }, true },
+        { "dict result", {
+            "var kd = {};",
+            "kd[\"k\"] = runtime(4);",
+            "func gd(int i) { var t = kd;",
+            "    for (var j = 0; j < i % 2; j++) { t = kd; } return t; }",
+            "var n = 0;",
+            "var rc1 = 0;",
+            "var rc2 = 0;",
+            "for (var k = 0; k < 40; k++) {",
+            "    var m = gd(k); n = n + m[\"k\"];",
+            "    if (k == 5) rc1 = refcount(kd);",
+            "    if (k == 39) rc2 = refcount(kd);",
+            "}",
+            "assert(n == 160 && rc1 == rc2);" }, true },
+        { "struct result", {
+            "struct P { int x; str tag; }",
+            "var kp = P(runtime(3), \"t\");",
+            "func gp(int i) { var t = kp;",
+            "    for (var j = 0; j < i % 2; j++) { t = kp; } return t; }",
+            "var n = 0;",
+            "var rc1 = 0;",
+            "var rc2 = 0;",
+            "for (var k = 0; k < 40; k++) {",
+            "    var p = gp(k); n = n + p.x;",
+            "    if (k == 5) rc1 = refcount(kp);",
+            "    if (k == 39) rc2 = refcount(kp);",
+            "}",
+            "assert(n == 120 && rc1 == rc2);" }, true },
+        /* the old dst holds the SAME object the callee returns: the
+         * release before the move must not free what is moved in */
+        { "same object into its own dst", {
+            "var kf = func [] () { return 9; };",
+            "func gf(int i) { var t = kf;",
+            "    for (var j = 0; j < i % 2; j++) { t = kf; } return t; }",
+            "var c = gf(0);",
+            "var n = 0;",
+            "var rc1 = 0;",
+            "var rc2 = 0;",
+            "for (var k = 0; k < 40; k++) {",
+            "    c = gf(k); n = n + c();",
+            "    if (k == 5) rc1 = refcount(kf);",
+            "    if (k == 39) rc2 = refcount(kf);",
+            "}",
+            "assert(n == 360 && rc1 == rc2);" }, true },
+        /* DECLINE: a SLICE result, then a write to its parent - which
+         * walks the parent's slices set. A moved slice leaves the set
+         * naming the dead window slot (ASan, or a wrong detach). */
+        { "slice result declines", {
+            "var ka = [1, 2, 3, 4];",
+            "ka[0] = runtime(1);",
+            "func ga(int i) { var t = ka[1:3];",
+            "    for (var j = 0; j < i % 2; j++) { t = ka[1:3]; } return t; }",
+            "var n = 0;",
+            "for (var k = 0; k < 40; k++) {",
+            "    var z = ga(k); ka[3] = k; n = n + z[0];",
+            "}",
+            "assert(n == 80);" }, false },
+    };
+    struct FlOff {
+        unsigned saved = g_jit_off_extra;
+        FlOff() { g_jit_off_extra |= jit_lever_bit("frameless"); }
+        ~FlOff() { g_jit_off_extra = saved; }
+    };
+    for (const bool frameless : { true, false }) {
+        std::unique_ptr<FlOff> off;
+        if (!frameless)
+            off.reset(new FlOff());
+        for (const Case &c : cases) {
+            const unsigned long arm0 = g_jit_norec_ret_arm;
+            const unsigned long live0 = g_live_funcobjs;
+            if (!run(c.lines)) {
+                fprintf(stderr, "jit_ret_ref_native: '%s' (frameless=%d) "
+                                "FAILED - a value or a refcount moved\n",
+                        c.name, (int)frameless);
+                return false;
+            }
+            if (g_live_funcobjs > live0 + 2) {
+                fprintf(stderr, "jit_ret_ref_native: '%s' (frameless=%d) "
+                                "LEAKED %lu FuncObject(s)\n", c.name,
+                        (int)frameless, g_live_funcobjs - live0);
+                return false;
+            }
+            const unsigned long grew = g_jit_norec_ret_arm - arm0;
+            if (c.moves ? grew < 30 : grew != 0) {
+                fprintf(stderr, "jit_ret_ref_native: '%s' (frameless=%d) "
+                                "arm returns = %lu, wanted %s\n", c.name,
+                        (int)frameless, grew,
+                        c.moves ? ">= 30" : "exactly 0");
+                return false;
+            }
+        }
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
  * NET 2 - THE DETERMINISTIC EVENT SWEEP, in-suite seed.
  *
  * The full sweep is tests/norec_sweep.py, which walks N over a
@@ -24717,6 +24894,14 @@ static bool ref_bind_fast_shapes()
         lexer(src, 1, toks);
         const ExecEngine saved = g_exec_engine;
         g_exec_engine = ExecEngine::Vm;
+        /* #97 R1 serves a closure result NATIVELY in the record-less
+         * and frameless return arms, so under the JIT the 63 shape no
+         * longer reaches vm_slot_bind_ref. This test is about the C++
+         * bind, which the INTERPRETED ReturnV takes on every shape - so
+         * it runs with the JIT off, where no native arm can absorb a
+         * case and make it vacuous. */
+        const bool saved_jit = g_jit_enabled;
+        g_jit_enabled = false;
         bool ok = true;
         try {
             ParseContext pc(TokenStream(toks), true);
@@ -24728,6 +24913,7 @@ static bool ref_bind_fast_shapes()
         } catch (...) {
             ok = false;
         }
+        g_jit_enabled = saved_jit;
         g_exec_engine = saved;
         return ok;
     };
@@ -32999,7 +33185,17 @@ static bool jit_frameless_w2_shape()
                         "je +*",
                         "mov rax, [rdx+0x18]",
                         "cmp [rax+0x8], 8",
-                        "jge +*",
+                        /* #97 R1: a REFERENCE old dst is released
+                         * inline, not declined to jit_ret_norec */
+                        "jl +*",
+                        "push r8",
+                        "push r10",
+                        "push rdx",
+                        "mov rdi, rdx",
+                        "call <helper>",
+                        "pop rdx",
+                        "pop r10",
+                        "pop r8",
                         "mov r11, r2",
                         "mov [rdx+0x0], r11",
                         "mov r11, r2.type",
@@ -47476,6 +47672,8 @@ static const std::vector<extra_check> extra_checks =
       jit_norec_recon_sweep },
     { "jit: norec: a segment boundary crossed, and unwound across",
       norec_segment_boundary },
+    { "jit: #97 R1: a reference result returns natively (refcounts)",
+      jit_ret_ref_native },
     { "jit: the monomorphic callee cache hits (and a polymorphic site is "
       "still correct)", jit_callee_cache_hit },
     { "jit: a write-once global callee is BAKED, a reassigned one is not",

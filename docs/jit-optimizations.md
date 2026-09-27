@@ -14929,3 +14929,71 @@ both the Ir and the emitted code is that, until a pinned cycle count
 says otherwise. Watched failing: with `locals_only` ignored the new
 `-rt` check (`lsra_k4_no_idle_register`) and the caller's ML_CHECK
 both fire (the latter aborts `-rt`, naming the rule).
+
+## #97 R1 - A REFERENCE RESULT RETURNS NATIVELY (2026-09-26)
+
+The record-less and frameless ReturnV arms declined to
+`jit_ret_norec` whenever the result was a reference OR the old dst
+held one - i.e. every return of a factory loop. On 63_closures that was
+1,000,000 of 1,000,000 returns, ~232 Ir each in C++ (`jitprofile.py`).
+Both arms now:
+
+- **move a listed result bit-for-bit** (4 qwords) and stamp the source
+  slot `t_none`. Only an **ARRAY** result declines: a
+  `SharedArrayObj` slice registers its own slot ADDRESS in its
+  parent's set, so a moved copy leaves the set naming a dead window
+  slot. A closure, string, dict, struct or exception is a plain counted
+  pointer that registers itself nowhere, so the move is exact;
+- **release a reference old dst in place** (`jit_drop_dst`, r8/r10/rdx
+  preserved around it) instead of declining. The release runs BEFORE
+  the move, as `put()` does; a result that is the same object keeps its
+  own count in the result slot, so the order is safe;
+- **route a bit-1 (raw, E2b) dst to C++** in the record-less arm.
+  Masking bit 0 alone used to leave the address off by 2 and rely on a
+  misaligned type read happening to decline.
+
+⛔ **The `t_none` stamp is load-bearing, not tidy-up.** Dropping it is
+a heap-use-after-free under ASan in the new test (the source slot
+still names the moved closure, and a later release of the reused window
+frees it under the dst). A borrowed result is not a concern: the
+escape analysis never marks a RETURNED parameter non-escaping, which
+is the same premise `jit_ret_norec`'s `steal_value` already relies on.
+
+Reach (`MYLANG_JITSTATS` on 63): `norec_ret_arm` 1,000,000 of
+1,000,000. Ir (scale3 - scale1, `OPT=1 ASSERTS=0`): **63_closures
+351.6M -> 286.0M, -18.7%**; 11/76/78/09/64 flat to the instruction
+(their returns are scalars). Cycles (`taskset -c 2 perf stat`, a
+P-core, scale 10, against the exact parent commit): **306M -> 260M,
+-15%**.
+
+⛔ **THE FIRST VERSION WAS 10% SLOWER FOR 11.8% FEWER INSTRUCTIONS,
+AND THE CAUSE WAS A STACK TEMPORARY.** It released the old dst with
+`jit_release_slot` -> `LValue::frame_release()` -> `*this = LValue()`,
+which GCC compiles to two 8-byte stores of a zeroed temporary on the
+stack and ONE 16-byte `movdqa` reading it back. That load cannot be
+forwarded from two narrower stores still in the store buffer, so it
+blocks every call: `ld_blocks.store_forward` 4.0M -> 8.0M over 2M
+returns, top-down memory-bound 13% -> 40%, and five pinned runs each
+side agreed (305-309M vs 337-352M). `perf record -e
+cpu_core/ld_blocks.store_forward/pp` put the blocked load on that
+`movdqa` in `jit_release_slot`. `jit_ret_norec` had never paid it: its
+`vm_slot_bind_ref` swaps in place. The arm overwrites the dst right
+after, so it needs no reset at all - `LValue::drop_for_overwrite()`
+runs the payload's destructor in place and leaves one type-word store
+(`EvalValue::destroy_val`). Blocks back to 4.0M, and the cycles
+followed. **When Ir and cycles disagree in sign, count blocked
+store-forwards before anything else**, and look at what a helper's
+`x = T()` compiles to.
+
+Net: `jit_ret_ref_native` (`-rt`) - closure, string, dict, struct and
+same-object-into-its-own-dst results, each asserting a refcount read
+twice in the loop (and the live FuncObject count - pooled, so LSan
+cannot see a leaked closure) plus the arm's emitted counter; a SLICE
+result followed by a write to its parent must decline EXACTLY. Both
+arms (frameless, and the `frameless` lever off). Watched failing, one
+sabotage at a time: the release dropped (40 FuncObjects leaked + an
+ASan report), the array guard dropped (the slice case's reach 40,
+wanted 0), the `t_none` stamp dropped (ASan UAF). The #121
+`ref_bind_fast_shapes` test now runs with the JIT off - the 63 shape no
+longer reaches `vm_slot_bind_ref` under the JIT, and the interpreted
+ReturnV is where that bind is still taken on every shape.

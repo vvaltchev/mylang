@@ -6941,6 +6941,11 @@ extern "C" void jit_release_slot(LValue *lv) noexcept
     lv->frame_release();
 }
 
+extern "C" void jit_drop_dst(LValue *lv) noexcept
+{
+    lv->drop_for_overwrite();
+}
+
 extern "C" void jit_member_fact_audit(int_type slot,
                                       const void *def) noexcept
 {
@@ -8238,9 +8243,10 @@ extern "C" size_t jit_halt() noexcept
 }
 
 /* 4-v: the record-less return's decline tier (see jit.h). The steal /
- * the dst put are the C++ moves the emitted arm's guards exist for (a
- * reference result must unregister its slice from the dying slot; a
- * non-trivial old dst must release); the rest mirrors the emitted arm.
+ * the dst put are the C++ moves the emitted arm's guards exist for (an
+ * array result must unregister its slice from the dying slot; a raw
+ * bit-1 dst must be constructed - #97 R1 moves every other reference
+ * and releases the old dst natively); the rest mirrors the emitted arm.
  * The vframe/captures restores are the CALLER's sentinel arm's job. */
 extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr_raw,
                                 const void *descv,
