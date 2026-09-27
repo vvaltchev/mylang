@@ -552,7 +552,10 @@ extern unsigned long g_bc_inline_value_splices;   /* #97 closure inlining */
 extern unsigned long g_bc_inline_value_twoway;    /* #97 increment 2 */
 extern unsigned long g_bc_inline_closures;        /* #97 increment 3 */
 extern unsigned long g_bc_sra_closures;           /* #97 increment 5 */
+extern unsigned long g_bc_sra_collapsed;          /* its move collapse */
+extern unsigned long g_bc_sra_tagged;             /* two-closure slots */
 extern bool g_bc_sra_enabled;                     /* MYLANG_BCINLINE_SRA */
+extern bool g_bc_sra_collapse;                    /* MYLANG_BCINLINE_SRAC */
 extern unsigned long g_ref_slots_proven_excluded;   /* C3 (TESTS) */
 /*
  * #97: slots the MoveV rule kept OUT of `ref_slots` - a move's dst is a

@@ -12564,10 +12564,19 @@ unsigned long g_bc_inline_value_twoway = 0;
 unsigned long g_bc_inline_closures = 0;
 /* #97 increment 5: closure SLOTS scalar-replaced (no object is built) */
 unsigned long g_bc_sra_closures = 0;
+/* ...and the moves its collapse removed or retyped */
+unsigned long g_bc_sra_collapsed = 0;
+/* ...and the slots replaced with a TAG (two or more closures) */
+unsigned long g_bc_sra_tagged = 0;
 /* #97 increment 5 (MYLANG_BCINLINE_SRA=0): the scalar replacement of a
  * non-escaping closure, alone - the same-binary A/B */
 bool g_bc_sra_enabled = [] {
     const auto e = env_get("MYLANG_BCINLINE_SRA");
+    return !(e && !e->empty() && (*e)[0] == '0');
+}();
+/* ...and the collapse of its move chains alone (MYLANG_BCINLINE_SRAC=0) */
+bool g_bc_sra_collapse = [] {
+    const auto e = env_get("MYLANG_BCINLINE_SRAC");
     return !(e && !e->empty() && (*e)[0] == '0');
 }();
 unsigned long g_ref_slots_move_excluded = 0;    /* #97 (TESTS) */
@@ -13727,9 +13736,13 @@ static bool bc_inline_chunk_splice(Chunk &ck,
  * first replacement, a branch to a deleted one on the next op that
  * survives; a side-table entry moves with its op (to the first
  * replacement) and dies with a deleted one. The caller guarantees the
- * chunk has no handler sites (whose pcs this does not remap) and that
- * no replacement op carries a pc field of its own.
+ * chunk has no handler sites (whose pcs this does not remap); a
+ * replacement op's pc fields name OLD pcs, like every other op's.
  */
+/* #97 increment 5: the capture slots the replacement created in the
+ * chunk it is working on (scratch, cleared around each chunk) */
+static std::set<int> g_bc_sra_cap_slots;
+
 struct BcRepl {
     bool replace = false;
     std::vector<Instr> ops;
@@ -13753,16 +13766,14 @@ static void bc_rewrite_ops(Chunk &ck, const std::vector<BcRepl> &repl)
     }
     first[n] = static_cast<uint32_t>(nc.size());
     /* a deleted op's pc means the next op that survives: `first` of a
-     * deleted pc already IS that index, since nothing was pushed for it */
-    for (size_t pc = 0; pc < n; pc++) {
-        if (repl[pc].replace)
-            continue;               /* replacement ops carry no pc field */
-        Instr &in = nc[first[pc]];
+     * deleted pc already IS that index, since nothing was pushed for it.
+     * A replacement op's pc fields are in the OLD numbering too, so every
+     * op is remapped the same way. */
+    for (Instr &in : nc)
         visit_pc_fields(in, [&](int &t) {
             if (t >= 0 && static_cast<size_t>(t) <= n)
                 t = static_cast<int>(first[static_cast<size_t>(t)]);
         });
-    }
     const auto move_pc = [&](auto &table) {
         size_t w = 0;
         for (size_t r = 0; r < table.size(); r++) {
@@ -13825,53 +13836,188 @@ static bool bc_scalar_replace_closures(Chunk &ck)
             || !ck.handler_sites.empty())
         return false;
     const size_t n = ck.code.size();
-    bool has_mk = false;
-    for (const Instr &in : ck.code)
-        has_mk |= in.op == OpCode::MakeClosureV;
-    if (!has_mk)
-        return false;
-    std::vector<int> fslot;
-    std::vector<const FuncDescriptor *> fdef;
-    std::vector<uint32_t> fin;
-    if (!closure_slot_facts(ck, fslot, fdef, fin))
-        return false;
-    const auto holds = [&](size_t pc, int slot, const FuncDescriptor *d) {
-        for (size_t f = 0; f < fslot.size(); f++)
-            if ((fin[pc] & (uint32_t(1) << f)) && fslot[f] == slot
-                    && fdef[f] == d)
-                return true;
-        return false;
-    };
     const auto def_at = [&](int idx) -> const FuncDescriptor * {
         return idx >= 0 && static_cast<size_t>(idx) < ck.closure_defs.size()
                    ? ck.closure_defs[static_cast<size_t>(idx)] : nullptr;
     };
 
-    /* candidates: slot -> the ONE descriptor every make.closure writes.
-     * REDUNDANT BY CONSTRUCTION, and kept as the plain statement of the
-     * rule: a second descriptor's make.closure KILLS the (S, D) fact, so
-     * every read after it fails `holds` in the escape scan below and S
-     * is dropped there anyway - watched: deleting this rule changed no
-     * answer and no replacement anywhere in the suite or the corpus. */
-    std::map<int, const FuncDescriptor *> cand;
-    std::set<int> dead;
+    /* the candidate slots and, per slot, the closures written into it */
+    struct Cand {
+        int slot;
+        std::vector<const FuncDescriptor *> defs;
+        bool dead = false;
+    };
+    std::vector<Cand> cands;
+    std::map<int, size_t> cand_of;
     for (const Instr &in : ck.code) {
-        if (in.op != OpCode::MakeClosureV)
+        if (in.op != OpCode::MakeClosureV || in.target < 0)
             continue;
         const FuncDescriptor *d = def_at(in.target2);
         int lo = 0, span = 0;
-        if (!d || d->captures.empty() || !make_closure_span(d, lo, span)) {
-            dead.insert(in.target);
+        auto it = cand_of.find(in.target);
+        if (it == cand_of.end()) {
+            it = cand_of.emplace(in.target, cands.size()).first;
+            cands.push_back({ in.target, {}, false });
+        }
+        Cand &c = cands[it->second];
+        /* a capture-free closure has no state: only its identity, which
+         * the tag carries */
+        if (!d || (!d->captures.empty() && !make_closure_span(d, lo, span))) {
+            c.dead = true;              /* a capture that is not a local */
             continue;
         }
-        auto it = cand.find(in.target);
-        if (it == cand.end())
-            cand[in.target] = d;
-        else if (it->second != d)
-            dead.insert(in.target);
+        if (std::find(c.defs.begin(), c.defs.end(), d) == c.defs.end())
+            c.defs.push_back(d);
+        if (c.defs.size() > 14)
+            c.dead = true;              /* past the mask's width */
     }
-    for (int sl : dead)
-        cand.erase(sl);
+    if (cands.empty())
+        return false;
+    const size_t nc = cands.size();
+    /* per slot, a MAY mask: bit 0 = unwritten (none), bit 1 = some other
+     * value, bit 2 + j = a closure of defs[j] */
+    const uint16_t M_NONE = 1, M_OTHER = 2;
+    const auto dbit = [](size_t j) { return uint16_t(4u << j); };
+    const auto dbits = [&](const Cand &c) {
+        uint16_t m = 0;
+        for (size_t j = 0; j < c.defs.size(); j++)
+            m = static_cast<uint16_t>(m | dbit(j));
+        return m;
+    };
+    const auto djx = [&](const Cand &c, const FuncDescriptor *d) -> int {
+        for (size_t j = 0; j < c.defs.size(); j++)
+            if (c.defs[j] == d)
+                return static_cast<int>(j);
+        return -1;
+    };
+
+    /*
+     * THE MAY DATAFLOW, with its own reachability: a state per pc (one
+     * mask per candidate), unioned at joins, propagated only along edges
+     * the guards leave open - a guard on S for closure j lets through
+     * S & {j} on its fall-through and S & ~{j} on its else-edge, and an
+     * edge whose guarded mask is EMPTY is dead. So the miss arm of a
+     * guard chain that covers every closure the slot can hold is never
+     * reached, and neither is the call in it.
+     */
+    std::vector<uint16_t> in(n * nc, 0);
+    std::vector<char> reached(n, 0);
+    std::vector<size_t> work;
+    for (size_t k = 0; k < nc; k++)
+        in[k] = M_NONE;
+    reached[0] = 1;
+    work.push_back(0);
+    std::vector<uint16_t> out(nc);
+    while (!work.empty()) {
+        const size_t p = work.back();
+        work.pop_back();
+        const Instr &op = ck.code[p];
+        for (size_t k = 0; k < nc; k++)
+            out[k] = in[p * nc + k];
+        std::vector<int> defs;
+        if (!visit_use_def(op, [](int) {}, [&](int d) { defs.push_back(d); }))
+            return false;               /* an unaudited op may write S */
+        for (int d : defs) {
+            auto it = cand_of.find(d);
+            if (it == cand_of.end())
+                continue;
+            const Cand &c = cands[it->second];
+            if (op.op == OpCode::MakeClosureV && op.target == d) {
+                const int j = djx(c, def_at(op.target2));
+                out[it->second] = j >= 0 ? dbit(static_cast<size_t>(j))
+                                         : M_OTHER;
+            } else {
+                out[it->second] = M_OTHER;
+            }
+        }
+        const auto flow = [&](size_t t, int gk, uint16_t gmask) {
+            if (t >= n)
+                return;
+            bool changed = !reached[t];
+            for (size_t k = 0; k < nc; k++) {
+                const uint16_t v = static_cast<int>(k) == gk ? gmask : out[k];
+                uint16_t &dst = in[t * nc + k];
+                if ((dst | v) != dst) {
+                    dst = static_cast<uint16_t>(dst | v);
+                    changed = true;
+                }
+            }
+            reached[t] = 1;
+            if (changed)
+                work.push_back(t);
+        };
+        int gk = -1;
+        uint16_t gbit = 0;
+        if (op.op == OpCode::GuardCalleeV && !op.a_is_lit()) {
+            auto it = cand_of.find(op.a_slot());
+            if (it != cand_of.end()) {
+                const int j = djx(cands[it->second], def_at(op.target2));
+                gk = static_cast<int>(it->second);
+                gbit = j >= 0 ? dbit(static_cast<size_t>(j)) : 0;
+            }
+        }
+        if (gk >= 0) {
+            const uint16_t m = out[static_cast<size_t>(gk)];
+            /* else-edge: the slot does NOT hold closure j */
+            const uint16_t me = static_cast<uint16_t>(m & ~gbit);
+            if (me && op.target >= 0)
+                flow(static_cast<size_t>(op.target), gk, me);
+            const uint16_t mf = static_cast<uint16_t>(m & gbit);
+            if (mf && p + 1 < n)
+                flow(p + 1, gk, mf);
+            continue;
+        }
+        Instr tmp = op;
+        visit_pc_fields(tmp, [&](int &t) {
+            if (t >= 0)
+                flow(static_cast<size_t>(t), -1, 0);
+        });
+        if (op_falls_through(op.op) && p + 1 < n)
+            flow(p + 1, -1, 0);
+    }
+
+    /*
+     * THE ESCAPE SCAN, over reached code. A read of S while it may hold a
+     * closure must be one the replacement can express: a guard (only
+     * where S can hold nothing BUT closures - a stale tag must not
+     * answer for an int), or a plain capture op (only where S holds
+     * exactly one known closure - the op must know whose capture slots
+     * it reads). A read while S cannot hold a closure is not a closure
+     * read at all (the slot is reused as a scalar temp - a factory's
+     * renamed return slot does this) and stays as it is.
+     */
+    for (size_t pc = 0; pc < n; pc++) {
+        if (!reached[pc])
+            continue;
+        const Instr &op = ck.code[pc];
+        std::vector<int> uses;
+        visit_use_def(op, [&](int u) { uses.push_back(u); }, [](int) {});
+        for (int u : uses) {
+            auto it = cand_of.find(u);
+            if (it == cand_of.end())
+                continue;
+            Cand &c = cands[it->second];
+            const uint16_t m = in[pc * nc + it->second];
+            const uint16_t cl = static_cast<uint16_t>(m & dbits(c));
+            if (!cl)
+                continue;                /* not a closure read */
+            const bool single = (cl & (cl - 1)) == 0
+                                && !(m & (M_NONE | M_OTHER));
+            bool ok = false;
+            if (op.op == OpCode::GuardCalleeV && op.a_slot() == u)
+                ok = !(m & (M_NONE | M_OTHER));
+            else if (op.op == OpCode::LoadCaptureOfV && op.a_slot() == u
+                     && op.target != u)
+                ok = single;
+            else if (op.op == OpCode::StoreCaptureOfV && op.b_slot() == u
+                     && !op.a_is_lit() && op.a_slot() != u
+                     && op.aop == Op::invalid)
+                ok = single;
+            if (!ok)
+                c.dead = true;
+        }
+    }
+
     /*
      * PROFITABILITY: only where a closure is BUILT in a loop. There the
      * replacement removes an allocation, a capture snapshot, a
@@ -13880,9 +14026,9 @@ static bool bc_scalar_replace_closures(Chunk &ck)
      * iteration - its guards are already proven (G3) or hoisted (G1) and
      * its capture ops are proven-scalar 8-byte copies - while the
      * replacement's MoveV is the BOXED move the JIT deliberately never
-     * treats as type evidence (a full value copy with reference checks,
-     * never a register). Measured before this gate: 11_closure_counter
-     * +20% cycles and 98_local_closure_call +51%, instructions 2x.
+     * treats as type evidence. Measured before this gate:
+     * 11_closure_counter +20% cycles and 98_local_closure_call +51%,
+     * instructions 2x.
      */
     {
         std::vector<char> in_loop(n, 0);
@@ -13898,161 +14044,184 @@ static bool bc_scalar_replace_closures(Chunk &ck)
         for (size_t p = 0; p < n; p++)
             if (ck.code[p].op == OpCode::MakeClosureV && in_loop[p])
                 built_in_loop.insert(ck.code[p].target);
-        for (auto it = cand.begin(); it != cand.end(); )
-            it = built_in_loop.count(it->first) ? std::next(it)
-                                                : cand.erase(it);
+        for (Cand &c : cands)
+            if (!built_in_loop.count(c.slot) || c.defs.empty())
+                c.dead = true;
     }
-    if (cand.empty())
+    bool any_live = false;
+    for (const Cand &c : cands)
+        any_live |= !c.dead;
+    if (!any_live)
         return false;
 
-    /* reachability with each candidate's PROVEN guards falling through */
-    const auto proven_guard = [&](size_t pc) {
-        const Instr &in = ck.code[pc];
-        if (in.op != OpCode::GuardCalleeV || in.a_is_lit())
-            return false;
-        auto it = cand.find(in.a_slot());
-        return it != cand.end() && def_at(in.target2) == it->second
-               && holds(pc, in.a_slot(), it->second);
-    };
-    std::vector<char> live(n, 0);
-    std::vector<size_t> stack{ 0 };
-    live[0] = 1;
-    while (!stack.empty()) {
-        const size_t p = stack.back();
-        stack.pop_back();
-        const auto reach = [&](int t) {
-            if (t >= 0 && static_cast<size_t>(t) < n && !live[t]) {
-                live[t] = 1;
-                stack.push_back(static_cast<size_t>(t));
-            }
-        };
-        Instr &in = ck.code[p];
-        if (!proven_guard(p))
-            visit_pc_fields(in, [&](int &t) { reach(t); });
-        if (op_falls_through(in.op) && p + 1 < n)
-            reach(static_cast<int>(p + 1));
-    }
-
-    /* the escape scan, over reachable code */
-    for (size_t pc = 0; pc < n && !cand.empty(); pc++) {
-        if (!live[pc])
-            continue;
-        const Instr &in = ck.code[pc];
-        std::vector<int> uses, defs;
-        if (!visit_use_def(in, [&](int s) { uses.push_back(s); },
-                           [&](int s) { defs.push_back(s); })) {
-            return false;               /* an unaudited op: may read S */
-        }
-        for (int s : defs)
-            if (cand.count(s) && in.op != OpCode::MakeClosureV)
-                cand.erase(s);
-        for (int s : uses) {
-            auto it = cand.find(s);
-            if (it == cand.end())
-                continue;
-            const FuncDescriptor *d = it->second;
-            bool ok = false;
-            if (in.op == OpCode::GuardCalleeV)
-                ok = proven_guard(pc);
-            else if (in.op == OpCode::LoadCaptureOfV && in.a_slot() == s
-                     && in.target != s)
-                ok = holds(pc, s, d);
-            else if (in.op == OpCode::StoreCaptureOfV && in.b_slot() == s
-                     && !in.a_is_lit() && in.a_slot() != s
-                     && in.aop == Op::invalid)
-                ok = holds(pc, s, d);
-            if (!ok)
-                cand.erase(it);
-        }
-    }
-    if (cand.empty())
-        return false;
-
-    /* the capture slots: fresh temps past the frame */
+    /* the new slots: per closure its capture slots; per slot with more
+     * than one closure, an int TAG naming which one it holds */
     int next = ck.slot_count + ck.n_temps;
-    std::map<int, int> cap_base;        /* S -> its first capture slot */
-    for (auto &kv : cand) {
-        const int nc = static_cast<int>(kv.second->captures.size());
-        if (next + nc > BC_INLINE_MAX_FRAME)
-            return false;
-        cap_base[kv.first] = next;
-        next += nc;
+    std::vector<std::vector<int>> cap_base(nc);
+    std::vector<int> tag(nc, -1);
+    for (size_t k = 0; k < nc; k++) {
+        Cand &c = cands[k];
+        if (c.dead)
+            continue;
+        if (c.defs.size() > 1)
+            tag[k] = next++;
+        for (const FuncDescriptor *d : c.defs) {
+            cap_base[k].push_back(next);
+            next += static_cast<int>(d->captures.size());
+        }
     }
+    if (next > BC_INLINE_MAX_FRAME)
+        return false;
 
     std::vector<BcRepl> repl(n);
     std::set<int32_t> refs(ck.ref_slots.begin(), ck.ref_slots.end());
     std::set<int32_t> new_refs;
     /* a capture every access of which carries the #111 scalar proof
      * (`cap_scalar`: the captured variable's static type is int or
-     * float) can never hold a reference, whatever the temp it was
-     * copied from once held - such a slot stays off ref_slots */
-    std::map<std::pair<int, int>, bool> scalar_cap;   /* (S, k) */
-    for (size_t pc = 0; pc < n; pc++) {
-        const Instr &in = ck.code[pc];
-        int sl = -1, k = -1;
-        if (in.op == OpCode::LoadCaptureOfV && !in.a_is_lit()) {
-            sl = in.a_slot(); k = in.target2;
-        } else if (in.op == OpCode::StoreCaptureOfV && !in.b_is_lit()) {
-            sl = in.b_slot(); k = in.target;
-        }
-        if (sl < 0 || !cand.count(sl) || !live[pc])
-            continue;
-        auto key = std::make_pair(sl, k);
-        auto it = scalar_cap.find(key);
-        const bool sc = in.cap_scalar();
-        if (it == scalar_cap.end())
-            scalar_cap[key] = sc;
-        else
-            it->second = it->second && sc;
-    }
-    const auto is_scalar_cap = [&](int sl, int k) {
-        auto it = scalar_cap.find({ sl, k });
-        return it != scalar_cap.end() && it->second;
+     * float) can never hold a reference, whatever the temp it was copied
+     * from once held - such a slot stays off ref_slots */
+    std::map<int, bool> scalar_cap;              /* capture slot -> */
+    const auto cap_slot_at = [&](size_t pc, size_t k, int idx) -> int {
+        const uint16_t cl = static_cast<uint16_t>(
+            in[pc * nc + k] & dbits(cands[k]));
+        for (size_t j = 0; j < cands[k].defs.size(); j++)
+            if (cl == dbit(j))
+                return cap_base[k][j] + idx;
+        return -1;
     };
     for (size_t pc = 0; pc < n; pc++) {
-        const Instr &in = ck.code[pc];
+        if (!reached[pc])
+            continue;
+        const Instr &op = ck.code[pc];
+        int sl = -1, idx = -1;
+        if (op.op == OpCode::LoadCaptureOfV && !op.a_is_lit()) {
+            sl = op.a_slot(); idx = op.target2;
+        } else if (op.op == OpCode::StoreCaptureOfV && !op.b_is_lit()) {
+            sl = op.b_slot(); idx = op.target;
+        }
+        auto it = cand_of.find(sl);
+        if (sl < 0 || it == cand_of.end() || cands[it->second].dead)
+            continue;
+        const int cs = cap_slot_at(pc, it->second, idx);
+        if (cs < 0)
+            continue;
+        auto sc = scalar_cap.find(cs);
+        if (sc == scalar_cap.end())
+            scalar_cap[cs] = op.cap_scalar();
+        else
+            sc->second = sc->second && op.cap_scalar();
+    }
+    const auto is_scalar_cap = [&](int cs) {
+        auto it = scalar_cap.find(cs);
+        return it != scalar_cap.end() && it->second;
+    };
+    const auto mv = [](int dst, int src) {
+        Instr m;
+        m.op = OpCode::MoveV;
+        m.target = dst;
+        m.target2 = src;
+        return m;
+    };
+    for (size_t pc = 0; pc < n; pc++) {
+        const Instr &op = ck.code[pc];
         BcRepl &r = repl[pc];
-        const auto mv = [](int dst, int src) {
-            Instr m;
-            m.op = OpCode::MoveV;
-            m.target = dst;
-            m.target2 = src;
-            return m;
-        };
-        if (in.op == OpCode::MakeClosureV && cand.count(in.target)) {
-            const FuncDescriptor *d = cand[in.target];
-            const int off = make_closure_offset(in, d);
-            const int cb = cap_base[in.target];
+        if (op.op == OpCode::MakeClosureV) {
+            auto it = cand_of.find(op.target);
+            if (it == cand_of.end() || cands[it->second].dead)
+                continue;
+            const size_t k = it->second;
+            const FuncDescriptor *d = def_at(op.target2);
+            const int j = djx(cands[k], d);
+            const int off = make_closure_offset(op, d);
             r.replace = true;
-            for (size_t k = 0; k < d->captures.size(); k++) {
-                const int src = d->captures[k].slot + off;
-                r.ops.push_back(mv(cb + static_cast<int>(k), src));
-                if (refs.count(src)
-                        && !is_scalar_cap(in.target, static_cast<int>(k)))
-                    new_refs.insert(cb + static_cast<int32_t>(k));
+            for (size_t q = 0; q < d->captures.size(); q++) {
+                const int cs = cap_base[k][static_cast<size_t>(j)]
+                               + static_cast<int>(q);
+                const int src = d->captures[q].slot + off;
+                r.ops.push_back(mv(cs, src));
+                if (refs.count(src) && !is_scalar_cap(cs))
+                    new_refs.insert(cs);
             }
-        } else if (in.op == OpCode::GuardCalleeV && proven_guard(pc)) {
-            r.replace = true;           /* deleted: true by the facts */
-        } else if (live[pc] && in.op == OpCode::LoadCaptureOfV
-                   && cand.count(in.a_slot())) {
+            /* the tag LAST: the collapse forwards a move only into the
+             * op right after it, and the copy the factory made of a
+             * capture is that op's source */
+            if (tag[k] >= 0) {
+                Instr li;
+                li.op = OpCode::LoadImmInt;
+                li.target = tag[k];
+                li.set_a(int_lit(j));
+                r.ops.push_back(li);
+            }
+            continue;
+        }
+        if (!reached[pc])
+            continue;                   /* dead code keeps its ops */
+        if (op.op == OpCode::GuardCalleeV && !op.a_is_lit()) {
+            auto it = cand_of.find(op.a_slot());
+            if (it == cand_of.end() || cands[it->second].dead)
+                continue;
+            const size_t k = it->second;
+            const int j = djx(cands[k], def_at(op.target2));
+            const uint16_t m = in[pc * nc + k];
+            const uint16_t gb = j >= 0 ? dbit(static_cast<size_t>(j)) : 0;
             r.replace = true;
-            r.ops.push_back(mv(in.target,
-                               cap_base[in.a_slot()] + in.target2));
-        } else if (live[pc] && in.op == OpCode::StoreCaptureOfV
-                   && cand.count(in.b_slot())) {
-            const int cs = cap_base[in.b_slot()] + in.target;
+            if ((m & ~gb) == 0) {
+                /* proven: delete */
+            } else if ((m & gb) == 0) {
+                Instr jm;                /* refuted: always the else */
+                jm.op = OpCode::Jump;
+                jm.target = op.target;
+                r.ops.push_back(jm);
+            } else {
+                Instr cj;                /* the tag decides */
+                cj.op = OpCode::JumpUnlessIntCmp;
+                cj.aop = Op::eq;
+                Operand ta;
+                ta.slot = tag[k];
+                cj.set_a(ta);
+                cj.set_b(int_lit(j));
+                cj.target = op.target;
+                r.ops.push_back(cj);
+            }
+            continue;
+        }
+        if (op.op == OpCode::LoadCaptureOfV && !op.a_is_lit()) {
+            auto it = cand_of.find(op.a_slot());
+            if (it == cand_of.end() || cands[it->second].dead)
+                continue;
+            const int cs = cap_slot_at(pc, it->second, op.target2);
+            ML_CHECK(cs >= 0);
             r.replace = true;
-            r.ops.push_back(mv(cs, in.a_slot()));
-            if (refs.count(in.a_slot())
-                    && !is_scalar_cap(in.b_slot(), in.target))
+            r.ops.push_back(mv(op.target, cs));
+            continue;
+        }
+        if (op.op == OpCode::StoreCaptureOfV && !op.b_is_lit()) {
+            auto it = cand_of.find(op.b_slot());
+            if (it == cand_of.end() || cands[it->second].dead)
+                continue;
+            const int cs = cap_slot_at(pc, it->second, op.target);
+            ML_CHECK(cs >= 0);
+            r.replace = true;
+            r.ops.push_back(mv(cs, op.a_slot()));
+            if (refs.count(op.a_slot()) && !is_scalar_cap(cs))
                 new_refs.insert(cs);
         }
     }
 #ifdef TESTS
-    g_bc_sra_closures += static_cast<unsigned long>(cand.size());
+    for (const Cand &c : cands)
+        if (!c.dead) {
+            g_bc_sra_closures++;
+            if (c.defs.size() > 1)
+                g_bc_sra_tagged++;
+        }
 #endif
     bc_rewrite_ops(ck, repl);
     ck.n_temps = next - ck.slot_count;
+    for (size_t k = 0; k < nc; k++)
+        for (size_t j = 0; j < cap_base[k].size(); j++)
+            for (size_t q = 0; q < cands[k].defs[j]->captures.size(); q++)
+                g_bc_sra_cap_slots.insert(cap_base[k][j]
+                                          + static_cast<int>(q));
     /* a capture slot may hold a reference exactly when something that
      * may hold one is copied into it (the MoveV rule of ref_slots) */
     for (std::vector<int32_t> *rl : { &ck.ref_slots, &ck.ref_slots_raw }) {
@@ -14064,13 +14233,175 @@ static bool bc_scalar_replace_closures(Chunk &ck)
     return true;
 }
 
+/*
+ * #97 increment 5 follow-up: COLLAPSE the move chains the replacement
+ * leaves. Each capture op became a MoveV, and so did the capture copy at
+ * construction - the BOXED move, which the JIT never treats as type
+ * evidence. So a capture slot written only by moves can never live in a
+ * register, and every access is a full value copy with reference checks.
+ * Three local rewrites, over moves touching a capture slot C only, each
+ * at a pc no branch lands on (a path around the move would see the
+ * other slot's old value):
+ *   FORWARD   move x = C ; op(x)      ->  op(C)
+ *             x a temp the move alone writes and the op alone reads;
+ *   RETARGET  op y = ... ; move C = y  ->  op C = ...
+ *             y a temp that op alone writes and the move alone reads;
+ *   SWAP      op y = ... ; move C = y  ->  op C = ... ; move y = C
+ *             y read again later - the TYPED op now writes C, which is
+ *             what lets the JIT keep C in a register.
+ * `op` is one that writes exactly its `target` (checked through
+ * visit_use_def, not assumed): the typed arithmetic and compares, the
+ * immediates, a move, a flat element read. A retarget carries y's
+ * reference status to C. Returns true if anything changed.
+ */
+static bool bc_collapse_capture_moves(Chunk &ck)
+{
+    const auto retargetable = [](const Instr &in) {
+        const OpCode op = in.op;
+        const bool fam = static_cast<int>(op)
+                             >= static_cast<int>(OpCode::IntAddRR)
+                         && static_cast<int>(op)
+                             <= static_cast<int>(OpCode::FloatMulRI);
+        const bool listed = fam || op == OpCode::IntBin
+            || op == OpCode::FloatBin || op == OpCode::CmpIntV
+            || op == OpCode::CmpFloatV || op == OpCode::IntModRI
+            || op == OpCode::IntAddModRI || op == OpCode::LoadImmInt
+            || op == OpCode::LoadImmFloat || op == OpCode::MoveV
+            || op == OpCode::LoadElemInt || op == OpCode::LoadElemFloat;
+        if (!listed || in.target < 0)
+            return false;
+        std::vector<int> defs;
+        if (!visit_use_def(in, [](int) {}, [&](int d) { defs.push_back(d); }))
+            return false;
+        return defs.size() == 1 && defs[0] == in.target;
+    };
+    const auto renamable = [](const Instr &in) {
+        return (bc_inline_op_ok(in.op) && in.op != OpCode::CallV)
+               || in.op == OpCode::StoreElemInt
+               || in.op == OpCode::StoreElemFloat;
+    };
+    bool changed_any = false;
+    for (int iter = 0; iter < 16; iter++) {
+        const size_t n = ck.code.size();
+        std::vector<int> nuse(ck.slot_count + ck.n_temps + 1, 0),
+                         ndef(ck.slot_count + ck.n_temps + 1, 0);
+        std::vector<char> is_target(n + 1, 0);
+        for (size_t p = 0; p < n; p++) {
+            const Instr &in = ck.code[p];
+            if (!visit_use_def(in,
+                    [&](int s) {
+                        if (s >= 0 && static_cast<size_t>(s) < nuse.size())
+                            nuse[s]++;
+                    },
+                    [&](int s) {
+                        if (s >= 0 && static_cast<size_t>(s) < ndef.size())
+                            ndef[s]++;
+                    }))
+                return changed_any;         /* an unaudited op: stop */
+            Instr tmp = in;
+            visit_pc_fields(tmp, [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) <= n)
+                    is_target[static_cast<size_t>(t)] = 1;
+            });
+        }
+        const auto temp1 = [&](int s) {       /* one def, one use, a temp */
+            return s >= ck.slot_count
+                   && static_cast<size_t>(s) < nuse.size()
+                   && ndef[s] == 1 && nuse[s] == 1;
+        };
+        std::set<int32_t> refs(ck.ref_slots.begin(), ck.ref_slots.end());
+        std::vector<BcRepl> repl(n);
+        std::vector<char> touched(n, 0);
+        bool any = false;
+        for (size_t pc = 0; pc < n; pc++) {
+            if (touched[pc])
+                continue;
+            Instr &in = ck.code[pc];
+            if (in.op != OpCode::MoveV)
+                continue;
+            const int dst = in.target, src = in.target2;
+            /* FORWARD: move x = C ; op(x) */
+            if (g_bc_sra_cap_slots.count(src) && temp1(dst)
+                    && pc + 1 < n && !touched[pc + 1]
+                    && !is_target[pc + 1] && renamable(ck.code[pc + 1])) {
+                Instr &nx = ck.code[pc + 1];
+                bool reads = false, writes = false;
+                visit_use_def(nx, [&](int s) { reads |= s == dst; },
+                              [&](int s) { writes |= s == dst; });
+                if (reads && !writes) {
+#ifdef TESTS
+                    g_bc_sra_collapsed++;
+#endif
+                    bc_rename_slot(nx, dst, src);
+                    repl[pc].replace = true;          /* delete */
+                    touched[pc] = touched[pc + 1] = 1;
+                    any = true;
+                    continue;
+                }
+            }
+            /* RETARGET / SWAP: op y = ... ; move C = y */
+            /* no count of y's OTHER writers is needed: the move is
+             * reached only from the op before it (no branch lands on
+             * it), so the value it copies is that op's */
+            if (g_bc_sra_cap_slots.count(dst) && src >= ck.slot_count
+                    && pc > 0 && !touched[pc - 1] && !is_target[pc]
+                    && static_cast<size_t>(src) < nuse.size()) {
+                Instr &pv = ck.code[pc - 1];
+                if (!retargetable(pv) || pv.target != src)
+                    continue;
+                bool reads_dst = false;
+                visit_use_def(pv, [&](int s) { reads_dst |= s == dst; },
+                              [](int) {});
+                if (nuse[src] == 1) {
+                    pv.target = dst;                  /* RETARGET */
+                    repl[pc].replace = true;
+                } else if (pv.op != OpCode::MoveV) {
+                    pv.target = dst;                  /* SWAP */
+                    Instr back;
+                    back.op = OpCode::MoveV;
+                    back.target = src;
+                    back.target2 = dst;
+                    repl[pc].replace = true;
+                    repl[pc].ops.push_back(back);
+                } else {
+                    continue;
+                }
+                (void)reads_dst;    /* op reads C then writes it: fine */
+                if (refs.count(src)) {
+                    ck.ref_slots.push_back(dst);
+                    ck.ref_slots_raw.push_back(dst);
+                }
+                touched[pc] = touched[pc - 1] = 1;
+                any = true;
+#ifdef TESTS
+                g_bc_sra_collapsed++;
+#endif
+            }
+        }
+        if (!any)
+            break;
+        bc_rewrite_ops(ck, repl);
+        changed_any = true;
+    }
+    for (std::vector<int32_t> *rl : { &ck.ref_slots, &ck.ref_slots_raw }) {
+        std::sort(rl->begin(), rl->end());
+        rl->erase(std::unique(rl->begin(), rl->end()), rl->end());
+    }
+    return changed_any;
+}
+
 bool bc_inline_chunk(Chunk &ck,
                      const std::vector<const FuncDescriptor *> &slot_desc,
                      const BcInlineSnapshots &snaps, bool value_only)
 {
     const bool spliced = bc_inline_chunk_splice(ck, slot_desc, snaps,
                                                 value_only);
-    if (!bc_scalar_replace_closures(ck))
+    g_bc_sra_cap_slots.clear();
+    const bool replaced = bc_scalar_replace_closures(ck);
+    if (replaced && g_bc_sra_collapse)
+        bc_collapse_capture_moves(ck);
+    g_bc_sra_cap_slots.clear();
+    if (!replaced)
         return spliced;
     ck.set_plain_frame();
     ck.boxed_ops.clear();
