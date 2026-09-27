@@ -15641,3 +15641,64 @@ hoisted guard as reach (and adds a `ghoist`-off run so the
 per-iteration guard keeps its own), and `vm_disasm_driver_jit_parity`
 now expects 6 frameless sites for 78 - the loop's cold copy emits its
 two miss-arm calls a second time.
+
+**#97 CLOSURE INLINING, INCREMENT 2 - TWO-WAY VALUE SITES
+(2026-09-28).** A value call whose callee the callee-set analysis
+narrows to TWO functions (`Chunk::value_callees` has carried both since
+E3) is spliced as a GUARD CHAIN:
+
+    GuardCalleeV fn, D1 else L2 ; binds ; body 1 ; Jump join
+    L2: GuardCalleeV fn, D2 else Lmiss ; binds ; body 2 ; Jump join
+    Lmiss: [sunk staging] ; CallValueV (the original call)
+    join:
+
+`bc_inline_chunk`'s site became a SITE (the caller-side facts: pc, arg
+run, dst, callee slot, step 1's staging and sources) holding one ARM per
+inlined body (descriptor, frame base, body snapshot, carets, the
+per-body result rename and in-place parameters). The layout is sized
+before emission, so each guard's else-pc is the next arm's guard. A
+candidate the gate refuses is simply not an arm - its calls take the
+miss arm - so a site with one eligible candidate of two is still
+spliced. Three admissions came with it, each needed by 76:
+ - **the element READS** `LoadElemInt`/`LoadElemFloat` join
+   `bc_inline_op_ok` (census rows updated) - base, index and dst are
+   frame slots, no pool;
+ - **the element STORES** `StoreElemInt`/`StoreElemFloat` are admitted
+   by `bc_inline_callee_ok` UNLESS their base kind is a capture (2):
+   `target` is the base KIND, not a slot, and a capture base would index
+   the caller's `ctx.captures`. A local base is re-based, a GLOBAL base
+   (kind 1) left alone - `bc_map_slots` must not touch `target`, or it
+   turns the kind into a slot. Their `base_locs` / `op_locs` carets now
+   actually ride the splice (the "#127 unreachable today" note is
+   retired);
+ - **a VOID body** (ending in `Halt`, the implicit `return none`) is
+   inlined only where the call's result is DISCARDED (76's `fn(st, i);`)
+   - the Halt maps to "fall to what follows". A used result would need
+   `none` loaded into dst; that site declines.
+The admissions apply to plain CallV splices too; measured blast radius
+over bench/my + samples/ + tests/functional: -vd changes on 76 and on
+four functional programs (all two-way or element shapes), nowhere else.
+
+76 is now two guards and two three-op bodies per iteration, with both
+parameters read in place. Same binary, `MYLANG_BCINLINE_VALUE=0` as the
+A/B (76's site was not spliced before this increment, so that IS the
+previous state), pinned, scale 3, twice:
+
+    76   cycles 93.7/93.5M -> 57.0/57.1M (-39%)
+         instructions 564.7M -> 353.5M (-37%)
+    11 / 78 / 63 unchanged (19.9 / 28.8 / 51.9M cycles)
+
+Pinned by three new `closure_inline_parity` shapes (int results; void
+bodies with element stores into a parameter AND a global base, plus a
+used void result that must decline; an out-of-bounds read inside an arm
+on a warmed iteration - caret and backtrace compared), a two-way reach
+count (`g_bc_inline_value_twoway`), and
+`tests/functional/43_closure_twoway.my` (also closures from two
+factories with mutable captures, and a captured-array store that must
+decline). Watched failing: each guard naming the other arm's descriptor
+(both nets); a void body inlined though its result is used (both - but
+only after the case's dst was made to hold a STALE value first: a fresh
+`var r` already holds none, so an unwritten dst looked right); a global
+store base remapped like a frame slot (both). Three call-protocol tests
+reached their tier through a two-closure array - the shape this now
+inlines - and hold `ValueSpliceOff` (the CLAUDE.md rule for such tests).

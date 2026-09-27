@@ -16817,8 +16817,40 @@ closure_inline_parity()
           "var add = ma(runtime(7)); var s = 0;\n"
           "for (var i = 0; i < 30; i++) s = s + add(i > 5 ? i : 2 * i);\n"
           "print(s);\n" },
+        /* #97 increment 2: TWO-WAY sites - the callee-set analysis names
+         * two functions, each inlined behind its own guard, the call
+         * after them */
+        { "two-way: int results",
+          "func inc(int x) { var y = x + 1; return y; }\n"
+          "func dbl(int x) { var y = x * 2; return y; }\n"
+          "var ops = [inc, dbl];\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 40; i++) { var f = ops[i % 2]; s = s + f(i); }\n"
+          "print(s);\n" },
+        { "two-way: void bodies, element stores (param + global base)",
+          "var g = [0, 0];\n"
+          "func a1(st, x) { st[0] = st[0] + x; g[1] = x; }\n"
+          "func a2(st, x) { st[0] = st[0] - x; }\n"
+          "var ops = [a1, a2];\n"
+          "var st = [0];\n"
+          "for (var i = 0; i < 40; i++) { var fn = ops[i % 2]; fn(st, i); }\n"
+          "var fr = ops[runtime(0)];\n"
+          /* a USED void result declines; `r` holds 7 first, so a body
+           * inlined anyway (leaving dst unwritten) prints 7, not none */
+          "var r = 7;\n"
+          "r = fr(st, 1);\n"
+          "print(st[0], g[1], r);\n" },
+        { "two-way: an element read out of bounds (warmed)",
+          "func r0(arr, int k) { var v = arr[k]; return v; }\n"
+          "func r1(arr, int k) { var v = arr[k + 1]; return v; }\n"
+          "var ops = [r0, r1];\n"
+          "var a = [1, 2, 3, 4, 5];\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 8; i++) { var f = ops[i % 2]; s = s + f(a, i); }\n"
+          "print(s);\n" },
     };
     bool ok = true;
+    const unsigned long tw0 = g_bc_inline_value_twoway;
     const unsigned long rn0 = g_bc_step1_renamed;
     const unsigned long sr0 = g_bc_step1_sourced;
     const unsigned long pr0 = g_bc_step1_params;
@@ -16932,6 +16964,12 @@ closure_inline_parity()
 #endif
     /* step 1 fired: each rule is a compile-time counter, bumped only
      * where the splice took it */
+    if (g_bc_inline_value_twoway < tw0 + 3) {
+        cout << "  closure_inline_parity: " << (g_bc_inline_value_twoway - tw0)
+             << " two-way sites spliced (want >= 3) - increment 2 is "
+             << "vacuous\n";
+        ok = false;
+    }
     if (g_bc_step1_renamed == rn0 || g_bc_step1_sourced == sr0
             || g_bc_step1_params == pr0) {
         cout << "  closure_inline_parity: step 1 never renamed a result ("
@@ -23594,6 +23632,11 @@ static bool jit_baked_callee_tier()
 
 static bool jit_callee_cache_hit()
 {
+    /* #97 increment 2: its callee comes out of a TWO-closure array - the
+     * shape a two-way value site now inlines behind a guard chain - so
+     * the protocol under test is reached only with the value splice off
+     * (see ValueSpliceOff) */
+    ValueSpliceOff vso;
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -23744,6 +23787,11 @@ static bool jit_callee_cache_hit()
  */
 static bool jit_bind_widen_inline()
 {
+    /* #97 increment 2: its callee comes out of a TWO-closure array - the
+     * shape a two-way value site now inlines behind a guard chain - so
+     * the protocol under test is reached only with the value splice off
+     * (see ValueSpliceOff) */
+    ValueSpliceOff vso;
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -32600,8 +32648,8 @@ static bool opcode_table_census()
         { OpCode::CmpIntV,               1,1,1,0,1,1, nullptr },
         { OpCode::CmpFloatV,             1,1,1,0,1,1, nullptr },
         { OpCode::ForLoopStep,           1,1,1,0,0,1, nullptr },
-        { OpCode::LoadElemInt,           1,1,1,0,1,0, nullptr },
-        { OpCode::LoadElemFloat,         1,1,1,0,1,0, nullptr },
+        { OpCode::LoadElemInt,           1,1,1,0,1,1, nullptr },
+        { OpCode::LoadElemFloat,         1,1,1,0,1,1, nullptr },
         { OpCode::LoadElemBool,          1,1,1,0,0,0, nullptr },
         { OpCode::ArrLen,                1,1,1,0,1,0, nullptr },
         { OpCode::StrLen,                1,1,1,0,1,0, nullptr },
@@ -44631,6 +44679,11 @@ static bool jit_ref_arg_bind()
  */
 static bool jit_borrow_arg_shapes()
 {
+    /* #97 increment 2: its callee comes out of a TWO-closure array - the
+     * shape a two-way value site now inlines behind a guard chain - so
+     * the protocol under test is reached only with the value splice off
+     * (see ValueSpliceOff) */
+    ValueSpliceOff vso;
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;

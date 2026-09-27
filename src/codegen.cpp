@@ -12313,6 +12313,12 @@ bool bc_inline_op_ok(OpCode op)
      * frame slot - the remapper must leave it alone, and does) */
     case OpCode::ReturnV:
     case OpCode::CallV:
+    /* #97 increment 2: the flat element READS - base (target2) and
+     * index (a) read, dst written; no pool. (The element STORES are
+     * admitted by bc_inline_callee_ok, since whether one may run in
+     * another frame depends on its base KIND, not its opcode.) */
+    case OpCode::LoadElemInt:
+    case OpCode::LoadElemFloat:
         return true;
     default:
         return false;
@@ -12334,7 +12340,12 @@ bool bc_inline_callee_ok(const Chunk &callee, std::string *why,
         return no("empty");
     if (callee.code.size() > BC_INLINE_MAX_OPS)
         return no("too-big");
-    if (callee.code.back().op != OpCode::ReturnV)
+    /* #97 increment 2: a VOID body ends in Halt (the implicit `return
+     * none`); a site inlines one only when the call's result is
+     * DISCARDED (bc_inline_chunk), where falling off the body is exactly
+     * what the call did */
+    if (callee.code.back().op != OpCode::ReturnV
+            && callee.code.back().op != OpCode::Halt)
         return no("no-tail-return");
     /* per-frame side state lives in watermarked slices of shared stacks,
      * indexed per CALL RECORD - a splice has no record of its own */
@@ -12371,7 +12382,17 @@ bool bc_inline_callee_ok(const Chunk &callee, std::string *why,
         }
     }
 
-    for (const Instr &in : callee.code) {
+    for (size_t pc = 0; pc < callee.code.size(); pc++) {
+        const Instr &in = callee.code[pc];
+        if (in.op == OpCode::Halt && pc + 1 == callee.code.size())
+            continue;                  /* the void body's end, above */
+        /* #97 increment 2: an element STORE runs in the caller's frame
+         * as it did in the callee's - its base is a frame slot (re-based)
+         * or a GLOBAL (untouched) - except a CAPTURE base, which would
+         * index the caller's ctx.captures; that one declines. */
+        if ((in.op == OpCode::StoreElemInt
+             || in.op == OpCode::StoreElemFloat) && in.target != 2)
+            continue;
         /* #97 closure inlining: a VALUE site reaches the callee's
          * captures through the callee slot, so its body may read and
          * PLAINLY write them; a CallV site cannot (its callee is not in a
@@ -12450,6 +12471,8 @@ unsigned long g_bc_inline_splices = 0;
 /* #97 closure inlining: VALUE sites spliced behind a guard (a subset of
  * g_bc_inline_splices) */
 unsigned long g_bc_inline_value_splices = 0;
+/* #97 increment 2: value sites spliced with TWO arms (a guard chain) */
+unsigned long g_bc_inline_value_twoway = 0;
 unsigned long g_ref_slots_move_excluded = 0;    /* #97 (TESTS) */
 unsigned long g_ref_slots_proven_excluded = 0;  /* C3 (TESTS): params the
                                                  * proven-type stamp kept
@@ -12746,6 +12769,22 @@ static void bc_map_slots(Instr &in, const F &map)
     case OpCode::LoadCaptureOfV:
         rt(); ra();
         break;
+    /* #97 increment 2: the flat element ops. The READ: target2 = the
+     * base slot (always a frame slot), a = the index, target = dst. The
+     * STORE: target = the base KIND (0 local / 1 global / 2 capture -
+     * the gate refuses 2), target2 = the base, a slot only for a local;
+     * a = the index, b = the value. `target` is not a slot there, so rt()
+     * would corrupt it into one. */
+    case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
+        rt(); ra();
+        if (in.target2 >= 0)
+            in.target2 = map(in.target2);
+        break;
+    case OpCode::StoreElemInt: case OpCode::StoreElemFloat:
+        if (in.target == 0 && in.target2 >= 0)
+            in.target2 = map(in.target2);
+        ra(); rb();
+        break;
     case OpCode::StoreCaptureOfV:
         ra(); rb();
         break;
@@ -12843,13 +12882,15 @@ bool bc_inline_chunk(Chunk &ck,
     if (ck.n_trys != 0)
         return false;
 
-    struct Site {
-        size_t pc;
+    /* One inlined BODY. A plain CallV site and a one-way value site
+     * have one; a TWO-WAY value site (#97 increment 2 - the callee-set
+     * analysis names two functions) has one per candidate the gate
+     * admits, each behind its own guard, the original call after them. */
+    struct Arm {
         int base;                       /* the callee frame's slot base */
-        int nargs;
-        int argbase;                    /* the caller's arg run */
-        int dst;                        /* the call's result slot */
+        int32_t def = -1;               /* value site: closure_defs idx */
         std::vector<Instr> body;        /* SNAPSHOT (self-recursion) */
+        bool halts = false;             /* ends in Halt: a void body */
         std::vector<Chunk::LocEntry> locs;
         std::vector<Chunk::LocEntry> base_locs;   /* #127 */
         std::vector<Chunk::LocEntry> op_locs;     /* RULE 2 */
@@ -12857,29 +12898,37 @@ bool bc_inline_chunk(Chunk &ck,
         std::vector<ArgLoc> arg_loc_pool;
         std::vector<int32_t> ref_slots;
         Chunk::InlineFrame frame;
-        /* #97 closure inlining: a VALUE site - the inline cache. The
-         * guard compares `callee_slot` against closure_defs[def]; each
-         * typed parameter binds through CoerceNumV (`coerce[i]` = 1 int,
-         * 2 float, 0 a plain move), carrying its argument's caret. */
-        bool value = false;
-        int callee_slot = -1;
-        int32_t def = -1;
+        /* each typed parameter binds through CoerceNumV (`coerce[i]` =
+         * 1 int, 2 float, 0 a plain move), carrying its argument's caret */
         std::vector<uint8_t> coerce;
         /* step 1: the body's returned slot (callee-relative) renamed to
          * `dst`, so no result move is emitted - or -1 */
         int rename_from = -1;
-        /* step 1: the caller's argument-STAGING moves, pcs
-         * [stage_first, pc), each `MoveV argbase+i = src`: the inlined
-         * body binds from `src` directly and the moves themselves are
-         * SUNK into the miss arm, the one path that reads the run.
-         * `src_of[i]` is -1 for an argument not sourced this way. */
-        size_t stage_first = 0;
-        std::vector<int> src_of;
         bool ref_rename = false;       /* the renamed slot is ref-listed */
         /* step 1b: parameter i is read straight from src_of[i] - its bind
          * is the identity and the body never writes it - so no bind op
          * is emitted and every field naming it names the source */
         std::vector<char> param_renamed;
+    };
+    struct Site {
+        size_t pc;
+        int nargs;
+        int argbase;                    /* the caller's arg run */
+        int dst;                        /* the call's result slot */
+        /* #97 closure inlining: a VALUE site - the inline cache. Each
+         * arm's guard compares `callee_slot` against its closure_defs
+         * entry. */
+        bool value = false;
+        int callee_slot = -1;
+        /* step 1: the caller's argument-STAGING moves, pcs
+         * [stage_first, pc), each `MoveV argbase+i = src`: the inlined
+         * bodies bind from `src` directly and the moves themselves are
+         * SUNK into the miss arm, the one path that reads the run.
+         * `src_of[i]` is -1 for an argument not sourced this way. A
+         * caller-side fact, so every arm shares it. */
+        size_t stage_first = 0;
+        std::vector<int> src_of;
+        std::vector<Arm> arms;
     };
     std::vector<Site> sites;
     int next_base = ck.slot_count + ck.n_temps;
@@ -12915,112 +12964,141 @@ bool bc_inline_chunk(Chunk &ck,
             continue;                   /* main: value sites only */
         if (is_value && !g_bc_inline_value_enabled)
             continue;
-        const FuncDescriptor *d = nullptr;
-        int32_t vdef = -1;
+        /* the candidate callees: a CallV names one through its global
+         * slot; a value site takes what the callee-set analysis named -
+         * one function, or (increment 2) two. The GUARDS, not the
+         * analysis, are what each inlined body's soundness rests on. */
+        std::vector<std::pair<const FuncDescriptor *, int32_t>> cands;
         if (is_value) {
-            /* #97 closure inlining: the callee-set analysis named ONE
-             * function for this site (a two-way site answers -1 - a
-             * later increment). The guard, not the analysis, is what the
-             * inlined body's soundness rests on. */
-            vdef = ck.value_callee_at(pc);
-            if (vdef < 0 || static_cast<size_t>(vdef) >= ck.closure_defs.size())
-                continue;
-            d = ck.closure_defs[static_cast<size_t>(vdef)];
-            if (!d || !d->vm_chunk)
-                continue;
+            int32_t vd[2];
+            const int nv = ck.value_callees_at(pc, vd);
+            for (int k = 0; k < nv; k++) {
+                if (vd[k] < 0
+                        || static_cast<size_t>(vd[k]) >= ck.closure_defs.size())
+                    continue;
+                const FuncDescriptor *cd =
+                    ck.closure_defs[static_cast<size_t>(vd[k])];
+                bool dup = false;
+                for (const auto &c : cands)
+                    dup |= c.first == cd;
+                if (cd && cd->vm_chunk && !dup)
+                    cands.push_back({ cd, vd[k] });
+            }
         } else {
             const int g = in.target2;
-            d = (g >= 0 && static_cast<size_t>(g) < slot_desc.size())
+            const FuncDescriptor *d =
+                (g >= 0 && static_cast<size_t>(g) < slot_desc.size())
                     ? slot_desc[g] : nullptr;
-            if (!d || !d->vm_chunk || !d->fast_bind)
-                continue;               /* typed params need coercion */
+            if (d && d->vm_chunk && d->fast_bind)   /* typed params need
+                                                     * coercion */
+                cands.push_back({ d, -1 });
         }
-        const Chunk *cc = static_cast<const Chunk *>(d->vm_chunk);
-        /* the PRE-PASS snapshot, never the live chunk: by now an earlier
-         * iteration may have spliced this callee, and which one that is
-         * depends on an unordered_map's order (see BcInlineSnapshot). */
-        const auto snap_it = snaps.find(cc);
-        if (snap_it == snaps.end())
-            continue;                   /* not part of this pass (main) */
-        const BcInlineSnapshot &snap = snap_it->second;
-        if (is_value ? !snap.value_eligible : !snap.eligible)
-            continue;                   /* gate ran on the pristine body,
-                                         * incl. "no inline_ctxs" - the
-                                         * callee's own chains would need
-                                         * re-parenting (a later step) */
         const int nargs = static_cast<int>(in.b_lit());
-        if (nargs != static_cast<int>(d->params.size()))
-            continue;                   /* an omitted trailing opt param
-                                         * binds none - the bind loop here
-                                         * only moves what was passed */
-        if (snap.code.back().a_is_lit())
-            continue;                   /* ReturnV always emits a slot;
-                                         * a literal would need a load */
-        const int cframe = snap.slot_count + snap.n_temps;
-        if (next_base + cframe > BC_INLINE_MAX_FRAME)
-            continue;
 
         Site s;
-        s.stage_first = pc;             /* nothing sunk unless step 1 says */
-        if (is_value) {
-            s.value = true;
-            s.callee_slot = in.target2;
-            s.def = vdef;
-            for (const auto &p : d->params)
-                s.coerce.push_back(p.decl_type == DeclType::i ? 1
-                                   : p.decl_type == DeclType::f ? 2 : 0);
-        }
-        if (g_bc_inline_value_step1) {
-            caller_facts();
-            bc_value_site_step1(ck, pc, nargs, snap,
-                                static_cast<int>(d->params.size()),
-                                is_value ? in.target2 : -1,
-                                is_target, live, s.stage_first,
-                                s.src_of, s.rename_from, s.ref_rename);
-            bc_site_param_renames(ck, pc, snap, s.coerce, s.src_of,
-                                  s.rename_from >= 0 ? in.target : -1,
-                                  s.param_renamed);
-        }
         s.pc = pc;
-        s.base = next_base;
         s.nargs = nargs;
         s.argbase = static_cast<int>(in.a_lit());
         s.dst = in.target;
-        s.body = snap.code;             /* the PRISTINE body (see above) */
-        s.locs = snap.locs;
-        /*
-         * #127: UNREACHABLE today and deliberately kept. `bc_inline_op_ok`
-         * whitelists no store op, so a spliced body can hold no base caret -
-         * but the day one is admitted, silently dropping them would be a
-         * caret regression nothing tests (the CALLER half below IS covered,
-         * by "unbound global base survives the bytecode splice"). Same
-         * belt-and-braces reasoning as the branch-past-end check.
-         */
-        s.base_locs = snap.base_locs;
-        /* RULE 2: the compound-operation carets - the same standing:
-         * no store op is whitelisted for a spliced body today */
-        s.op_locs = snap.op_locs;
-        /* RULE 2: same standing as base_locs - no call op is whitelisted
-         * for a spliced body today, so this carries nothing, and the day
-         * one is admitted its per-argument carets ride along instead of
-         * silently vanishing. */
-        s.arg_locs = snap.arg_locs;
-        s.arg_loc_pool = snap.arg_loc_pool;
-        s.ref_slots = snap.ref_slots;
-        /* the virtual frame, built to render EXACTLY as the physical one
-         * would (backtrace.cpp's frame_display over the descriptor) */
-        s.frame.callee_name = !d->display_name.empty()
-                                  ? d->display_name
-                                  : d->name ? std::string(d->name->val)
-                                            : std::string("<lambda>");
-        for (const auto &p : d->params)
-            s.frame.params.push_back(std::string(p.name->val));
-        Loc ls, le;
-        ck.loc_at(pc, ls, le);
-        s.frame.call_site = ls;
-        s.frame.parent = ck.inline_frame_at(pc);
+        s.stage_first = pc;             /* nothing sunk unless step 1 says */
+        s.value = is_value;
+        s.callee_slot = is_value ? in.target2 : -1;
+        int site_base = next_base;
+        bool step1_done = false;
+        for (const auto &cand : cands) {
+            const FuncDescriptor *d = cand.first;
+            const Chunk *cc = static_cast<const Chunk *>(d->vm_chunk);
+            /* the PRE-PASS snapshot, never the live chunk: by now an
+             * earlier iteration may have spliced this callee, and which
+             * one that is depends on an unordered_map's order (see
+             * BcInlineSnapshot). */
+            const auto snap_it = snaps.find(cc);
+            if (snap_it == snaps.end())
+                continue;               /* not part of this pass (main) */
+            const BcInlineSnapshot &snap = snap_it->second;
+            if (is_value ? !snap.value_eligible : !snap.eligible)
+                continue;               /* gate ran on the pristine body,
+                                         * incl. "no inline_ctxs" - the
+                                         * callee's own chains would need
+                                         * re-parenting (a later step) */
+            if (nargs != static_cast<int>(d->params.size()))
+                continue;               /* an omitted trailing opt param
+                                         * binds none - the bind loop here
+                                         * only moves what was passed */
+            const Instr &last = snap.code.back();
+            if (last.op == OpCode::ReturnV && last.a_is_lit())
+                continue;               /* ReturnV always emits a slot;
+                                         * a literal would need a load */
+            if (last.op == OpCode::Halt && in.target >= 0)
+                continue;               /* a void body's result is none,
+                                         * which a used dst would need
+                                         * loaded - only a DISCARDED call
+                                         * inlines one (76's shape) */
+            const int cframe = snap.slot_count + snap.n_temps;
+            if (site_base + cframe > BC_INLINE_MAX_FRAME)
+                continue;
+
+            Arm a;
+            a.base = site_base;
+            a.def = cand.second;
+            a.halts = last.op == OpCode::Halt;
+            if (is_value)
+                for (const auto &p : d->params)
+                    a.coerce.push_back(p.decl_type == DeclType::i ? 1
+                                       : p.decl_type == DeclType::f ? 2
+                                                                    : 0);
+            if (g_bc_inline_value_step1) {
+                caller_facts();
+                /* the staging half is a CALLER fact - identical for
+                 * every arm, so the first arm's answer is the site's */
+                size_t sf = pc;
+                std::vector<int> so;
+                bc_value_site_step1(ck, pc, nargs, snap,
+                                    static_cast<int>(d->params.size()),
+                                    is_value ? in.target2 : -1,
+                                    is_target, live, sf, so,
+                                    a.rename_from, a.ref_rename);
+                if (!step1_done) {
+                    s.stage_first = sf;
+                    s.src_of = std::move(so);
+                    step1_done = true;
+                }
+                bc_site_param_renames(ck, pc, snap, a.coerce, s.src_of,
+                                      a.rename_from >= 0 ? in.target : -1,
+                                      a.param_renamed);
+            }
+            a.body = snap.code;         /* the PRISTINE body (see above) */
+            a.locs = snap.locs;
+            /* #127 / RULE 2: every caret pool rides along - the element
+             * STORE ops (increment 2) are the first spliced ops to carry
+             * a base caret (a global base) and an operation caret (a
+             * compound store) */
+            a.base_locs = snap.base_locs;
+            a.op_locs = snap.op_locs;
+            /* RULE 2: a nested CallV's per-argument carets */
+            a.arg_locs = snap.arg_locs;
+            a.arg_loc_pool = snap.arg_loc_pool;
+            a.ref_slots = snap.ref_slots;
+            /* the virtual frame, built to render EXACTLY as the physical
+             * one would (backtrace.cpp's frame_display over the
+             * descriptor) */
+            a.frame.callee_name = !d->display_name.empty()
+                                      ? d->display_name
+                                      : d->name ? std::string(d->name->val)
+                                                : std::string("<lambda>");
+            for (const auto &p : d->params)
+                a.frame.params.push_back(std::string(p.name->val));
+            Loc ls, le;
+            ck.loc_at(pc, ls, le);
+            a.frame.call_site = ls;
+            a.frame.parent = ck.inline_frame_at(pc);
+            s.arms.push_back(std::move(a));
+            site_base += cframe;
+        }
+        if (s.arms.empty())
+            continue;
+        next_base = site_base;
         sites.push_back(std::move(s));
-        next_base += cframe;
     }
     if (sites.empty())
         return false;
@@ -13133,234 +13211,286 @@ bool bc_inline_chunk(Chunk &ck,
             continue;
         if (si < sites.size() && sites[si].pc == pc) {
             const Site &S = sites[si++];
-            const int32_t fidx = static_cast<int32_t>(ck.inline_frames.size());
-            ck.inline_frames.push_back(S.frame);
-
-            /* #97 closure inlining: a VALUE site opens with the inline
-             * cache's guard; its else-pc - the original call, placed
-             * after the body - is patched once the body's size is known */
-            size_t gidx = 0;
-            if (S.value) {
-                Instr gd;
-                gd.op = OpCode::GuardCalleeV;
-                Operand co;
-                co.slot = S.callee_slot;
-                gd.set_a(co);
-                gd.target2 = S.def;
-                gidx = nc.size();
-                nc.push_back(gd);
-                from_caller.push_back(0);
-            }
-            /* the arg bind: the interpreted call's fast_bind, as MoveVs
-             * (frame slots have no container back-pointer, so put() is
-             * rebind()) - or, for a TYPED parameter of a value site, the
-             * coercion bind_param performs, as CoerceNumV: the identity
-             * for an argument of the declared type, a widening for int
-             * into float, a TypeErrorEx for a dyn value that fits
-             * neither - carrying that ARGUMENT's caret and the CALLER's
-             * inlined-at chain, since a bind error is the caller's */
-            for (int i = 0; i < S.nargs; i++) {
-                if (static_cast<size_t>(i) < S.param_renamed.size()
-                        && S.param_renamed[static_cast<size_t>(i)]) {
-#ifdef TESTS
-                    g_bc_step1_params++;
-#endif
-                    continue;               /* step 1b: read in place */
-                }
-                const uint8_t co = S.value ? S.coerce[i] : 0;
-                /* step 1: an argument whose staging was sunk binds from
-                 * its source */
-                const int from =
-                    (static_cast<size_t>(i) < S.src_of.size()
-                     && S.src_of[static_cast<size_t>(i)] >= 0)
-                        ? S.src_of[static_cast<size_t>(i)] : S.argbase + i;
-#ifdef TESTS
-                if (from != S.argbase + i)
-                    g_bc_step1_sourced++;
-#endif
-                Instr mv;
-                mv.op = co ? OpCode::CoerceNumV : OpCode::MoveV;
-                mv.target = S.base + i;
-                if (co) {
-                    Operand ao;
-                    ao.slot = from;
-                    mv.set_a(ao);
-                    mv.target2 = co == 2 ? 1 : 0;
-                    Loc as, ae;
-                    if (ck.arg_loc_at(S.pc, static_cast<size_t>(i), as, ae)
-                            || caller_loc(S.pc, as, ae))
-                        nlocs.push_back({ static_cast<uint32_t>(nc.size()),
-                                          as, ae });
-                    const int32_t cf = ck.inline_frame_at(S.pc);
-                    if (cf >= 0)
-                        nctx.push_back({ static_cast<uint32_t>(nc.size()),
-                                         cf });
-                } else {
-                    mv.target2 = from;
-                }
-                nc.push_back(mv);
-                from_caller.push_back(0);
-            }
             /*
-             * pass 1: the body's local pc map. A ReturnV becomes up to TWO
-             * ops - the result move, and a jump to the join when it is not
-             * already the last one.
-             *
-             * `S.dst < 0` is the call whose RESULT IS DISCARDED (`c(a);` as
-             * a statement - the peephole's dead-dst rule). There is then no
-             * destination to move into, and emitting the move anyway wrote
-             * frame slot -1: `Frame::at(-1)` is out of bounds, and the JIT's
-             * store would have computed an address one LValue BELOW the
-             * window. It survived only because the one corpus shape that
-             * reached it sat in a chunk the const-folder had made dead;
-             * #137's verifier is what found it.
+             * THE LAYOUT, sized first so every forward pc is known:
+             *   per arm:  [GuardCalleeV (value)] binds body [Jump join]
+             *   then (value): the sunk staging + the original call
+             *   join:
+             * A guard's else-pc is the NEXT arm's guard, or the miss arm
+             * for the last one - so a two-way site is a guard CHAIN, and
+             * a callee the gate refused is simply left to the call.
              */
-            const size_t nb = S.body.size();
-            /* step 1: a renamed result is already in dst - no move */
-            const bool keep_result = S.dst >= 0 && S.rename_from < 0;
+            struct ArmPlan {
+                std::vector<uint32_t> lmap;
+                size_t emitted = 0;     /* the body's own ops */
+                size_t start = 0;       /* its first op (the guard) */
+                bool keep_result = false;
+            };
+            std::vector<ArmPlan> plans(S.arms.size());
+            size_t cursor = nc.size();
+            for (size_t k = 0; k < S.arms.size(); k++) {
+                const Arm &A = S.arms[k];
+                ArmPlan &P = plans[k];
+                /* step 1: a renamed result is already in dst - no move */
+                P.keep_result = S.dst >= 0 && A.rename_from < 0;
 #ifdef TESTS
-            if (S.rename_from >= 0)
-                g_bc_step1_renamed++;
+                if (A.rename_from >= 0)
+                    g_bc_step1_renamed++;
 #endif
-            std::vector<uint32_t> lmap(nb);
-            size_t emitted = 0;
-            for (size_t j = 0; j < nb; j++) {
-                lmap[j] = static_cast<uint32_t>(emitted);
-                if (S.body[j].op == OpCode::ReturnV)
-                    emitted += (keep_result ? 1u : 0u)
-                               + (j + 1 != nb ? 1u : 0u);
-                else
-                    emitted++;
-            }
-            const size_t body_base = nc.size();
-            const size_t body_end = body_base + emitted;
-            /* a value site's body is followed by `Jump join`, the sunk
-             * staging moves and the original call, so its returns land
-             * past all of them */
-            const size_t join = body_end
-                + (S.value ? 2 + (S.pc - S.stage_first) : 0);
-            /* pass 2: emit */
-            for (size_t j = 0; j < nb; j++) {
-                Loc bs, be;
-                bool has_loc = false;
-                for (const auto &le : S.locs)
-                    if (le.pc == j) {
-                        bs = le.start; be = le.end; has_loc = true; break;
-                    }
-                Loc bbs, bbe;                          /* #127 */
-                bool has_base = false;
-                for (const auto &le : S.base_locs)
-                    if (le.pc == j) {
-                        bbs = le.start; bbe = le.end; has_base = true; break;
-                    }
-                Loc obs, obe;                          /* RULE 2 */
-                bool has_op = false;
-                for (const auto &le : S.op_locs)
-                    if (le.pc == j) {
-                        obs = le.start; obe = le.end; has_op = true; break;
-                    }
-                const Chunk::ArgLocEntry *bargs = nullptr;   /* RULE 2 */
-                for (const auto &ae : S.arg_locs)
-                    if (ae.pc == j) { bargs = &ae; break; }
-                if (S.body[j].op == OpCode::ReturnV) {
-                    if (keep_result) {
-                        Instr mv;
-                        mv.op = OpCode::MoveV;
-                        mv.target = S.dst;
-                        mv.target2 = S.body[j].a_slot() + S.base;
-                        nctx.push_back(
-                            { static_cast<uint32_t>(nc.size()), fidx });
-                        nc.push_back(mv);
-                        from_caller.push_back(0);
-                    }
-                    if (j + 1 != nb) {
-                        Instr jm;
-                        jm.op = OpCode::Jump;
-                        jm.target = static_cast<int>(join);
-                        nc.push_back(jm);
-                        from_caller.push_back(0);
-                    }
-                    continue;
+                const size_t nb = A.body.size();
+                P.lmap.resize(nb);
+                for (size_t j = 0; j < nb; j++) {
+                    P.lmap[j] = static_cast<uint32_t>(P.emitted);
+                    if (A.body[j].op == OpCode::ReturnV)
+                        P.emitted += (P.keep_result ? 1u : 0u)
+                                     + (j + 1 != nb ? 1u : 0u);
+                    else if (A.body[j].op == OpCode::Halt)
+                        ;               /* the terminal Halt of a void
+                                         * body falls to what follows */
+                    else
+                        P.emitted++;
                 }
-                Instr bi = S.body[j];
-                bc_remap_slots(bi, S.base);
-                /* #97 closure inlining: the body now runs in the CALLER's
-                 * frame, whose ctx.captures is the caller's own - so each
-                 * capture op reaches the closure through the callee slot
-                 * the guard just checked (a CALLER slot: not re-based) */
-                if (bi.op == OpCode::LoadCaptureV) {
+                size_t nbinds = 0;
+                for (int i = 0; i < S.nargs; i++)
+                    if (!(static_cast<size_t>(i) < A.param_renamed.size()
+                          && A.param_renamed[static_cast<size_t>(i)]))
+                        nbinds++;
+                P.start = cursor;
+                cursor += (S.value ? 2 : 0) + nbinds + P.emitted;
+            }
+            const size_t miss_start = cursor;
+            const size_t join = S.value ? miss_start + (S.pc - S.stage_first)
+                                          + 1
+                                        : miss_start;
+
+            for (size_t k = 0; k < S.arms.size(); k++) {
+                const Arm &A = S.arms[k];
+                const ArmPlan &P = plans[k];
+                ML_CHECK(nc.size() == P.start);
+                const int32_t fidx =
+                    static_cast<int32_t>(ck.inline_frames.size());
+                ck.inline_frames.push_back(A.frame);
+                if (S.value) {
+                    Instr gd;
+                    gd.op = OpCode::GuardCalleeV;
                     Operand co;
                     co.slot = S.callee_slot;
-                    bi.op = OpCode::LoadCaptureOfV;
-                    bi.set_a(co);
-                } else if (bi.op == OpCode::StoreCaptureV) {
-                    Operand co;
-                    co.slot = S.callee_slot;
-                    bi.op = OpCode::StoreCaptureOfV;
-                    bi.set_b(co);
+                    gd.set_a(co);
+                    gd.target2 = A.def;
+                    gd.target = static_cast<int>(
+                        k + 1 < S.arms.size() ? plans[k + 1].start
+                                              : miss_start);
+                    nc.push_back(gd);
+                    from_caller.push_back(0);
                 }
-                if (S.rename_from >= 0)
-                    bc_rename_slot(bi, S.rename_from + S.base, S.dst);
-                for (size_t k = 0; k < S.param_renamed.size(); k++)
-                    if (S.param_renamed[k])
-                        bc_rename_slot(bi, S.base + static_cast<int>(k),
-                                       S.src_of[k]);
-                visit_pc_fields(bi, [&](int &t) {
-                    /*
-                     * The gate's `branch-past-end` rejection means every
-                     * target is a real pc of this body. It did NOT always:
-                     * this used to map an out-of-range target to the join,
-                     * which SILENTLY left the call's dst unwritten - the
-                     * caller then read a stale value where the callee
-                     * would have returned none. So assert rather than
-                     * "handle" it: the handling was the bug, and a loud
-                     * abort is what a revived shape should get.
-                     */
-                    ML_CHECK_MSG(t >= 0 && static_cast<size_t>(t) < nb,
-                                 "bc splice: callee branch past its end");
-                    t = static_cast<int>(body_base + lmap[t]);
-                });
-                if (has_loc)
-                    nlocs.push_back({ static_cast<uint32_t>(nc.size()),
-                                      bs, be });
-                if (has_base)
-                    nbase.push_back({ static_cast<uint32_t>(nc.size()),
-                                      bbs, bbe });
-                if (has_op)
-                    nop.push_back({ static_cast<uint32_t>(nc.size()),
-                                    obs, obe });
-                if (bargs) {
-                    Chunk::ArgLocEntry ae;
-                    ae.pc = static_cast<uint32_t>(nc.size());
-                    ae.first = static_cast<uint32_t>(nargpool.size());
-                    ae.n = bargs->n;
-                    for (uint32_t k = 0; k < bargs->n; k++)
-                        nargpool.push_back(
-                            S.arg_loc_pool[bargs->first + k]);
-                    nargl.push_back(ae);
+                /* the arg bind: the interpreted call's fast_bind, as
+                 * MoveVs (frame slots have no container back-pointer, so
+                 * put() is rebind()) - or, for a TYPED parameter of a
+                 * value site, the coercion bind_param performs, as
+                 * CoerceNumV: the identity for an argument of the
+                 * declared type, a widening for int into float, a
+                 * TypeErrorEx for a dyn value that fits neither -
+                 * carrying that ARGUMENT's caret and the CALLER's
+                 * inlined-at chain, since a bind error is the caller's */
+                for (int i = 0; i < S.nargs; i++) {
+                    if (static_cast<size_t>(i) < A.param_renamed.size()
+                            && A.param_renamed[static_cast<size_t>(i)]) {
+#ifdef TESTS
+                        g_bc_step1_params++;
+#endif
+                        continue;           /* step 1b: read in place */
+                    }
+                    const uint8_t co = S.value ? A.coerce[i] : 0;
+                    /* step 1: an argument whose staging was sunk binds
+                     * from its source */
+                    const int from =
+                        (static_cast<size_t>(i) < S.src_of.size()
+                         && S.src_of[static_cast<size_t>(i)] >= 0)
+                            ? S.src_of[static_cast<size_t>(i)]
+                            : S.argbase + i;
+#ifdef TESTS
+                    if (from != S.argbase + i)
+                        g_bc_step1_sourced++;
+#endif
+                    Instr mv;
+                    mv.op = co ? OpCode::CoerceNumV : OpCode::MoveV;
+                    mv.target = A.base + i;
+                    if (co) {
+                        Operand ao;
+                        ao.slot = from;
+                        mv.set_a(ao);
+                        mv.target2 = co == 2 ? 1 : 0;
+                        Loc as, ae;
+                        if (ck.arg_loc_at(S.pc, static_cast<size_t>(i), as,
+                                          ae)
+                                || caller_loc(S.pc, as, ae))
+                            nlocs.push_back(
+                                { static_cast<uint32_t>(nc.size()), as,
+                                  ae });
+                        const int32_t cf = ck.inline_frame_at(S.pc);
+                        if (cf >= 0)
+                            nctx.push_back(
+                                { static_cast<uint32_t>(nc.size()), cf });
+                    } else {
+                        mv.target2 = from;
+                    }
+                    nc.push_back(mv);
+                    from_caller.push_back(0);
                 }
-                nctx.push_back({ static_cast<uint32_t>(nc.size()), fidx });
-                nc.push_back(bi);
-                from_caller.push_back(0);
+                /*
+                 * `S.dst < 0` is the call whose RESULT IS DISCARDED (`c(a);`
+                 * as a statement - the peephole's dead-dst rule). There is
+                 * then no destination to move into, and emitting the move
+                 * anyway wrote frame slot -1: `Frame::at(-1)` is out of
+                 * bounds, and the JIT's store would have computed an
+                 * address one LValue BELOW the window. It survived only
+                 * because the one corpus shape that reached it sat in a
+                 * chunk the const-folder had made dead; #137's verifier is
+                 * what found it.
+                 */
+                const size_t nb = A.body.size();
+                const size_t body_base = nc.size();
+                /* a body's returns land past the whole site - its own
+                 * `Jump join` exists only for the fall-through */
+                for (size_t j = 0; j < nb; j++) {
+                    Loc bs, be;
+                    bool has_loc = false;
+                    for (const auto &le : A.locs)
+                        if (le.pc == j) {
+                            bs = le.start; be = le.end; has_loc = true;
+                            break;
+                        }
+                    Loc bbs, bbe;                          /* #127 */
+                    bool has_base = false;
+                    for (const auto &le : A.base_locs)
+                        if (le.pc == j) {
+                            bbs = le.start; bbe = le.end; has_base = true;
+                            break;
+                        }
+                    Loc obs, obe;                          /* RULE 2 */
+                    bool has_op = false;
+                    for (const auto &le : A.op_locs)
+                        if (le.pc == j) {
+                            obs = le.start; obe = le.end; has_op = true;
+                            break;
+                        }
+                    const Chunk::ArgLocEntry *bargs = nullptr; /* RULE 2 */
+                    for (const auto &ae : A.arg_locs)
+                        if (ae.pc == j) { bargs = &ae; break; }
+                    if (A.body[j].op == OpCode::Halt) {
+                        ML_CHECK(j + 1 == nb);
+                        continue;
+                    }
+                    if (A.body[j].op == OpCode::ReturnV) {
+                        if (P.keep_result) {
+                            Instr mv;
+                            mv.op = OpCode::MoveV;
+                            mv.target = S.dst;
+                            mv.target2 = A.body[j].a_slot() + A.base;
+                            nctx.push_back(
+                                { static_cast<uint32_t>(nc.size()), fidx });
+                            nc.push_back(mv);
+                            from_caller.push_back(0);
+                        }
+                        if (j + 1 != nb) {
+                            Instr jm;
+                            jm.op = OpCode::Jump;
+                            jm.target = static_cast<int>(join);
+                            nc.push_back(jm);
+                            from_caller.push_back(0);
+                        }
+                        continue;
+                    }
+                    Instr bi = A.body[j];
+                    bc_remap_slots(bi, A.base);
+                    /* #97 closure inlining: the body now runs in the
+                     * CALLER's frame, whose ctx.captures is the caller's
+                     * own - so each capture op reaches the closure
+                     * through the callee slot the guard just checked (a
+                     * CALLER slot: not re-based) */
+                    if (bi.op == OpCode::LoadCaptureV) {
+                        Operand co;
+                        co.slot = S.callee_slot;
+                        bi.op = OpCode::LoadCaptureOfV;
+                        bi.set_a(co);
+                    } else if (bi.op == OpCode::StoreCaptureV) {
+                        Operand co;
+                        co.slot = S.callee_slot;
+                        bi.op = OpCode::StoreCaptureOfV;
+                        bi.set_b(co);
+                    }
+                    if (A.rename_from >= 0)
+                        bc_rename_slot(bi, A.rename_from + A.base, S.dst);
+                    for (size_t q = 0; q < A.param_renamed.size(); q++)
+                        if (A.param_renamed[q])
+                            bc_rename_slot(bi, A.base + static_cast<int>(q),
+                                           S.src_of[q]);
+                    visit_pc_fields(bi, [&](int &t) {
+                        /*
+                         * The gate's `branch-past-end` rejection means
+                         * every target is a real pc of this body. It did
+                         * NOT always: this used to map an out-of-range
+                         * target to the join, which SILENTLY left the
+                         * call's dst unwritten - the caller then read a
+                         * stale value where the callee would have returned
+                         * none. So assert rather than "handle" it: the
+                         * handling was the bug, and a loud abort is what
+                         * a revived shape should get. (A target naming a
+                         * void body's terminal Halt maps to the op after
+                         * the body, which is exactly where it falls.)
+                         */
+                        ML_CHECK_MSG(t >= 0 && static_cast<size_t>(t) < nb,
+                                     "bc splice: callee branch past its "
+                                     "end");
+                        t = static_cast<int>(body_base + P.lmap[t]);
+                    });
+                    if (has_loc)
+                        nlocs.push_back({ static_cast<uint32_t>(nc.size()),
+                                          bs, be });
+                    if (has_base)
+                        nbase.push_back({ static_cast<uint32_t>(nc.size()),
+                                          bbs, bbe });
+                    if (has_op)
+                        nop.push_back({ static_cast<uint32_t>(nc.size()),
+                                        obs, obe });
+                    if (bargs) {
+                        Chunk::ArgLocEntry ae;
+                        ae.pc = static_cast<uint32_t>(nc.size());
+                        ae.first = static_cast<uint32_t>(nargpool.size());
+                        ae.n = bargs->n;
+                        for (uint32_t q = 0; q < bargs->n; q++)
+                            nargpool.push_back(
+                                A.arg_loc_pool[bargs->first + q]);
+                        nargl.push_back(ae);
+                    }
+                    nctx.push_back({ static_cast<uint32_t>(nc.size()),
+                                     fidx });
+                    nc.push_back(bi);
+                    from_caller.push_back(0);
+                }
+                ML_CHECK(nc.size() == body_base + P.emitted);
+                if (S.value) {
+                    /* the hit path leaves over the rest of the site */
+                    Instr jm;
+                    jm.op = OpCode::Jump;
+                    jm.target = static_cast<int>(join);
+                    nc.push_back(jm);
+                    from_caller.push_back(0);
+                }
             }
-            ML_CHECK(nc.size() == body_end);
             if (S.value) {
-                /* the hit path leaves over the miss arm; the guard's
-                 * else-pc IS the miss arm - the original call, carried
-                 * with its own side tables */
-                Instr jm;
-                jm.op = OpCode::Jump;
-                jm.target = static_cast<int>(join);
-                nc.push_back(jm);
-                from_caller.push_back(0);
-                nc[gidx].target = static_cast<int>(nc.size());
+                /* the miss arm - the original call, carried with its own
+                 * side tables, after the step-1 staging it reads */
+                ML_CHECK(nc.size() == miss_start);
                 for (size_t q = S.stage_first; q < S.pc; q++)
-                    emit_caller_op(q);      /* step 1: the sunk staging */
+                    emit_caller_op(q);
                 emit_caller_op(pc);
                 from_caller.back() = 0;     /* no pc fields to remap */
                 ML_CHECK(nc.size() == join);
 #ifdef TESTS
                 g_bc_inline_value_splices++;
+                if (S.arms.size() > 1)
+                    g_bc_inline_value_twoway++;
 #endif
             }
             continue;
@@ -13392,13 +13522,14 @@ bool bc_inline_chunk(Chunk &ck,
      * PARAMETERS, so a raw scalar bind of the caller says nothing about
      * them - they join ref_slots_raw in full */
     for (std::vector<int32_t> *rl : { &ck.ref_slots, &ck.ref_slots_raw }) {
-        for (const Site &S : sites) {
-            for (const int32_t r : S.ref_slots)
-                rl->push_back(r + S.base);
-            /* step 1: a renamed reference result lives in dst now */
-            if (S.ref_rename)
-                rl->push_back(S.dst);
-        }
+        for (const Site &S : sites)
+            for (const Arm &A : S.arms) {
+                for (const int32_t r : A.ref_slots)
+                    rl->push_back(r + A.base);
+                /* step 1: a renamed reference result lives in dst now */
+                if (A.ref_rename)
+                    rl->push_back(S.dst);
+            }
         std::sort(rl->begin(), rl->end());
         rl->erase(std::unique(rl->begin(), rl->end()), rl->end());
     }

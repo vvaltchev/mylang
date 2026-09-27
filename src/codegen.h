@@ -524,6 +524,7 @@ extern unsigned long g_bc_inline_caller_frames;
 /* Total call sites spliced - the shape matrix's non-vacuity check. */
 extern unsigned long g_bc_inline_splices;
 extern unsigned long g_bc_inline_value_splices;   /* #97 closure inlining */
+extern unsigned long g_bc_inline_value_twoway;    /* #97 increment 2 */
 extern unsigned long g_ref_slots_proven_excluded;   /* C3 (TESTS) */
 /*
  * #97: slots the MoveV rule kept OUT of `ref_slots` - a move's dst is a
