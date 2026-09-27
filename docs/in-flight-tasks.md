@@ -674,8 +674,12 @@ work — but profile it before building, the way increment 0 was.
         ✅ **CB5 DONE 2026-09-26**: after a raw scalar bind the release
         scan reads ref_slots_raw (no param seeds) - 34 -10.8% Ir /
         0.97x wall, 35 -5.1%, 96 -4.4%.
-        NEXT on the callback path: the ~95 Ir/call of C++ around the
-        emitted body (call_scalars + vm_invoker_body).
+        ✅ **CB6 DONE 2026-09-26**: the C++ around the emitted body
+        trimmed (no per-slot raw_bindable test, one gate flag, boxed
+        decline out of line, bool result read inline) - 34 -11.5% Ir /
+        0.96x wall, 35 -5.4%, 96 -2.9%.
+        NEXT on the callback path: the result's EvalValue move out of
+        flow->value and the jit_enter bookkeeping.
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
 

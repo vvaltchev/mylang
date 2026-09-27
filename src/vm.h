@@ -282,11 +282,14 @@ private:
     static constexpr bool cb_scalar_v = std::is_same_v<T, int_type>
         || std::is_same_v<T, float_type> || std::is_same_v<T, bool>;
     EvalValue call_scalars(const CbScalar *ra, size_t n);
+    EvalValue call_scalars_boxed(const CbScalar *ra, size_t n);
 
     EvalValue call_eval_func(const EvalValue *argv, size_t n);
 
     bool ready_ = false;
     bool fast_bind_ = false;
+    /* ready_ && fast_bind_, the raw bind's one gate (#97 CB6) */
+    bool raw_ok_ = false;
     Loc site_;                 /* the builtin call's site (#44) */
     VmActivation *act_ = nullptr;
     EvalContext *c_ = nullptr;

@@ -889,10 +889,18 @@ never-C3-proven params). Measured (Ir, scale3-scale1): **34 -10.8%**,
 0.98x / 0.99x. Pinned by `ref_slots_raw_derivation` and a 5-mode entry
 whose callbacks build string/array locals; with the raw list emptied,
 both the structural check and the VM_HARDENING window audit fire.
-**Next measured cost on this path:** the ~95 Ir/call left in
-`call_scalars` + the inlined body around the emitted comparator (34:
-prologue/epilogue, `raw_bindable`, flow reset/read), vs 36 Ir in the
-emitted body itself.
+**CB6 (same day): the C++ around the emitted body, trimmed on a line
+profile.** Four cuts: the per-slot `raw_bindable()` test is gone (every
+window slot is trivial between calls - the release scan leaves it so,
+and the VM_HARDENING audit asserts it; the check stays as an
+ML_VM_CHECK); `ready_ && fast_bind_` is one `raw_ok_` flag; the boxed
+decline is out of line (`call_scalars_boxed`), so the hot function
+saves fewer registers; and a callback's bool result is read inline
+(`EvalValue::truthy()`) instead of through the virtual `is_true()`.
+Ir: **34 -11.5%**, 35 -5.4%, 96 -2.9%; wall 34 0.96x, 35/96/67 flat.
+**Remaining on 34, per comparison:** ~36 Ir in the emitted body, the
+result's EvalValue move out of `flow->value` (~14), and the entry
+bookkeeping around `jit_enter`.
 
 ### An unrelated observation, NOT chased
 
