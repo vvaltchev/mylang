@@ -1,0 +1,36 @@
+# #97 R3: a closure calls a CAPTURE-FREE function framelessly, then reads
+# its own capture. The callee's site leaves ctx.captures alone (W4); it
+# used to store the EMPTY capture set there while the return arm, trusting
+# W4, never restored the caller's - so the capture read after the call
+# (one use: no capture-base register, it goes through ctx->captures)
+# faulted in a release build. `helper` has a loop so it is not inlined.
+func helper(int x) {
+    var r = x;
+    for (var j = 0; j < 3; j++)
+        r = r * 3 + j;
+    return r % 1000;
+}
+
+func mk(int k) {
+    var a = k * 7;
+    return func [a] (int n) {
+        var t = helper(n);
+        return t + a;
+    };
+}
+
+# and a capture-free FACTORY (all-local MakeClosureV, W4 since R3) whose
+# closures are called in the same loop
+func mk2(int k) {
+    var c = k + 1;
+    return func [c] () { return c * 2; };
+}
+
+var f = mk(runtime(5));
+var s = 0;
+for (var i = 0; i < 50; i++) {
+    s += f(i);
+    var g = mk2(i);
+    s += g();
+}
+print(s);

@@ -105,6 +105,27 @@ static const std::vector<test> tests =
         "assert(ls == 50);",
         "assert(s2 == 580.0);" } },
     /*
+     * #97 R3: a CAPTURE-FREE callee whose site leaves ctx.captures alone
+     * (W4) must not leave anything else there either. Its G2 site used
+     * to store the EMPTY capture set, and the release arm - trusting W4
+     * - never restored the caller's: the closure's one capture, read
+     * AFTER the call through ctx->captures (a single use claims no
+     * capture base), faulted in a release build. `w4h` has a loop so it
+     * is not inlined. The TESTS arm now aborts by name on it
+     * (jit_w4_captures_replaced); watched failing with the site's old
+     * order restored.
+     */
+    { "closure: a capture read after a call to a capture-free frameless "
+      "callee reads the closure's own capture (#97 R3)", {
+        "func w4h(int x) { var r = x;",
+        "    for (var j = 0; j < 3; j++) { r = r * 3 + j; }",
+        "    return r % 1000; }",
+        "func mka(int k) { var a = k * 7;",
+        "    return func [a] (int n) { var t = w4h(n); return t + a; }; }",
+        "var f = mka(runtime(5)); var s = 0;",
+        "for (var i = 0; i < 50; i++) { s = s + f(i); }",
+        "assert(s == 22075);" } },
+    /*
      * #97 B2: abs/min/max on PROVEN INTS lower to a compare-and-branch over
      * int ops (codegen), not the builtin call. The builtins' exact
      * semantics, in the three positions whose peepholes treat a lowering's
@@ -33233,6 +33254,17 @@ static bool jit_frameless_w2_shape()
                         "mov [rdx+0x0], r11",
                         "mov r11, r2.type",
                         "mov [rdx+0x18], r11",
+                        /* #97 R3: a TESTS build checks the W4 callee
+                         * returned with the POISON captures still in
+                         * place (jit_w4_captures_replaced otherwise) */
+                        "mov r9, [<addr>]@rax",
+                        "mov rax, [r9+0x*]",
+                        "movabs r11, <addr>",
+                        "cmp rax, r11",
+                        "je +*",
+                        "sub rsp, 8",
+                        "call <helper>",
+                        "add rsp, 8",
                         "mov r9, [<addr>]@rax",
                         "mov rax, [rbp+0x10]",
                         "mov [r9+0x*], rax",

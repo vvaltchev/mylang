@@ -1340,7 +1340,12 @@ collision). Three nets now:
   emitted call targets against `jit_w4_unsafe_helpers`, and a TESTS
   build's `jit_poison_captures()` installed as ctx.captures. A helper
   that starts reading `ctx->captures` joins that list - the poison is
-  what tells you it did not), xcache (#96: the
+  what tells you it did not. The TESTS arm restores the caller's
+  captures UNCONDITIONALLY, which the release arm does not - so it
+  first CHECKS the poison is still there (`jit_w4_captures_replaced`):
+  a site that wrote anything else (the G2 empty set did, a release
+  SEGV, #97 R3) was invisible to every TESTS lane until it did), xcache
+  (#96: the
   CALLER-saved half of the
   pin pool - it holds hot locals too, spilled/reloaded around every
   helper call by emit_call_prologue/epilogue. **Which members a run

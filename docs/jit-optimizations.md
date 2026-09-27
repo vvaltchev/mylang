@@ -15089,3 +15089,62 @@ Pinned P-core, scale 10, against R2b: instructions **-11.9%**, stores
 gained a TWO-capture factory; watched failing both ways - the
 one-capture helper reading the wrong slot aborts the suite, the
 many-capture one shifted by a slot fails 6 tests per JIT mode.
+
+## #97 R3 - W4 FOR ALL-LOCAL CLOSURES; THE G2 SITE BUG (2026-09-27)
+
+**THE BUG IT FIXES FIRST, which shipped.** A frameless site whose
+callee is CAPTURE-FREE (G2: `self_running`, the identity compare
+elided) stored the EMPTY capture set into `ctx.captures` - and that
+branch was tested BEFORE the W4 one, so it ran for a W4 callee too.
+The release return arm trusts W4 ("the site never repointed it") and
+does not restore. So after the call `ctx.captures` was the empty set,
+and a caller that then read a capture through it - a closure with ONE
+capture use claims no capture-base register, so the read goes through
+`ctx->captures` - read past the end of an empty array:
+
+    func helper(int x) { var r = x;
+        for (var j = 0; j < 3; j++) r = r * 3 + j;   # not inlined
+        return r % 1000; }
+    func mk(int k) { var a = k * 7;
+        return func [a] (int n) { var t = helper(n); return t + a; }; }
+
+SIGSEGV in every `OPT=1` build at 4b5dc41 (default flags). **Nothing
+could see it**: a TESTS build's arm restores UNCONDITIONALLY (its W4
+site installs the poison captures, which must not outlive the call),
+so `-rt`, `corpus_diff` on a debug lane and every fuzzer ran the
+restore that hides the bug. The site now tests W4 first: a W4 callee,
+capture-free or not, gets no repoint (and, in a TESTS build, the
+poison). **And the TESTS arm now CHECKS the contract before it
+restores**: a W4 callee must return with the poison still installed,
+else `jit_w4_captures_replaced` aborts by name. The general form: a
+TESTS-only instruction that REPAIRS state hides every bug in the
+state it repairs - make it verify, then repair.
+
+**THE OPTIMIZATION.** `MakeClosureV` was not W4-safe, so a factory
+(`make_counter`, `make_adder`: capture-free, their body builds one
+closure) paid the repoint at the site and the restore in the arm on
+every call. When every capture is a frame LOCAL the construction
+reads the frame and `ctx->root`, never `ctx->captures`
+(`jit_make_closure_1` / `_locals`, and a new storing twin
+`jit_make_closure_locals_st` for a site with no scratch register, so
+the answer does not depend on the allocator). `jit_op_w4_safe` takes
+the chunk now and admits the op on exactly that test.
+`jit_make_closure_ptr` joined `jit_w4_unsafe_helpers` (it reaches
+`ctx->captures` through the FuncObject ctor; it was missing, latent
+because nothing whitelisted reached it).
+
+Measured (pinned P-core, `-npc`, `OPT=1 ASSERTS=0`, one run each):
+63_closures scale 3 stores **-2.4%** (2 per factory call),
+instructions -1.7%, cycles -3.7% / -5.3%; the capture-free W4 sites
+elsewhere lose the empty-set store too - 91/92/97 instructions -1.9%
+/ -1.3% / -1.2%, stores -4.8% / -2.8% / -3.5%. 11/76/78 flat (no such
+site). 32 corpus programs change emitted code, all at those sites.
+
+Nets, each watched failing: the old site order restored -> `-rt`
+aborts by name in `jit_w4_captures_replaced`, and
+`tests/functional/40_w4_capture_free_callee.my` does too (the parent
+release build SEGVs on it); an all-local closure built through
+`jit_make_closure_ptr` -> the post-emission `jit_w4_helpers_ok`
+ML_CHECK. The storing twin was exercised once with the scratch
+forced off: `-rt` green except `jit_closure_store` (which asserts the
+inline tier ran), every differential and `corpus_diff` pass green.
