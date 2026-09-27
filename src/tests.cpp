@@ -79,8 +79,8 @@ static const std::vector<test> tests =
      * in a loop (the JIT'd site; the first descent takes C++), and the
      * float one is fed an int-then-float so a wrong word would show.
      */
-    { "closure: all-local captures of every scalar kind and a string "
-      "survive the factory (#97 R2b)", {
+    { "closure: all-local captures of every scalar kind, a string and "
+      "two at once survive the factory (#97 R2b/R2c)", {
         "func mki(int k) { var c = k * 3; return func [c] () { return c; }; }",
         "func mkf(float f) { var c = f * 0.5;",
         "    return func [c] () { return c + 0.25; }; }",
@@ -88,9 +88,13 @@ static const std::vector<test> tests =
         "    return func [c] () { return c; }; }",
         "func mks(int k) { var c = \"s\" + str(k);",
         "    return func [c] () { return c; }; }",
-        "var si = 0; var sf = 0.0; var nb = 0; var ls = 0;",
+        /* TWO captures: the many-capture constructor, not R2c's */
+        "func mk2(int k) { var c = k * 2; var e = k + 0.5;",
+        "    return func [c, e] () { return c + e; }; }",
+        "var si = 0; var sf = 0.0; var nb = 0; var ls = 0; var s2 = 0.0;",
         "for (var k = 0; k < 20; k++) {",
         "    var a = mki(k); si = si + a();",
+        "    var g = mk2(k); s2 = s2 + g();",
         "    var b = mkf(k); sf = sf + b();",
         "    var c = mkb(k); if (c()) { nb = nb + 1; }",
         "    var d = mks(k); ls = ls + len(d());",
@@ -98,7 +102,8 @@ static const std::vector<test> tests =
         "assert(si == 570);",
         "assert(sf == 100.0);",
         "assert(nb == 10);",
-        "assert(ls == 50);" } },
+        "assert(ls == 50);",
+        "assert(s2 == 580.0);" } },
     /*
      * #97 B2: abs/min/max on PROVEN INTS lower to a compare-and-branch over
      * int ops (codegen), not the builtin call. The builtins' exact

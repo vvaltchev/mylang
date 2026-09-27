@@ -141,6 +141,22 @@ FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *root,
     }
 }
 
+FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *root,
+                       const LValue &src, OneLocal)
+    : func(func)
+    , capture_root(root)
+{
+#ifdef TESTS
+    g_live_funcobjs++;
+#endif
+    ML_CHECK(func->captures.size() == 1
+             && func->captures[0].kind == SymKind::local);
+    const EvalValue &v = src.get();
+    const Type::TypeE t = v.get_type()->t;
+    capture_slots.set_single(
+        v, t == Type::t_int || t == Type::t_float || t == Type::t_bool);
+}
+
 FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
     : func(func)
     /*

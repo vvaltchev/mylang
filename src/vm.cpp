@@ -4569,6 +4569,19 @@ extern "C" void *jit_make_closure_locals(const void *defv,
     return fo;
 }
 
+/* #97 R2c: exactly one local capture, `src` its source slot */
+extern "C" void *jit_make_closure_1(const void *defv,
+                                    const LValue *src) noexcept
+{
+    ML_JIT_OP_RAN(MakeClosureV);
+    const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
+    ML_CHECK(!g_current_ctx->const_ctx);
+    FuncObject *fo = new FuncObject(def, get_root_ctx(g_current_ctx), *src,
+                                    FuncObject::OneLocal());
+    fo->intr_refcount = 1;          /* the destination slot owns it */
+    return fo;
+}
+
 extern "C" int jit_make_closure(int_type dst, const void *defv) noexcept
 {
     ML_JIT_OP_RAN(MakeClosureV);
