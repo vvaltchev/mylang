@@ -45,6 +45,10 @@ import random
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testjobs  # noqa: E402  (tests/jobs.sh: worker count + idle class)
 
 # A SMALL modulus keeps every value 2 digits, so the generated code is readable
 # and the variety is visibly in the control flow / operation KINDS, not in the
@@ -599,7 +603,12 @@ def main():
     ap.add_argument("--show-depth", type=int, default=None,
                     help="with --show, force this exact depth (default random)")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="programs checked at once (default: tests/jobs.sh "
+                         "count); the report is identical for any value")
     args = ap.parse_args()
+    testjobs.ensure_idle()
+    jobs = args.jobs if args.jobs > 0 else testjobs.count()
 
     if args.random:
         args.seed = random.randrange(1, 2 ** 31)
@@ -643,17 +652,31 @@ def main():
     fallbacks = 0
     timeouts = 0
     tmp = tempfile.mkdtemp(prefix="mylang_fuzz_")
-    my_path = os.path.join(tmp, "p.my")
-    py_path = os.path.join(tmp, "p.py")
 
-    for i in range(args.count):
+    # Each program is independent - generated from its own seed, written
+    # to its own files, run through every engine - so they are checked
+    # `jobs` at a time and REPORTED IN PROGRAM ORDER afterwards
+    # (pool.map keeps order): the output is the serial run's, byte for
+    # byte, whatever the job count. Threads suffice: the work is child
+    # processes, and a thread waiting on one holds no lock.
+    def check(i):
         seed = args.seed + i
         depth = random.Random(seed * 2654435761 & 0xffffffff).randint(
             args.min_depth, args.max_depth)
         my_src, py_src = Gen(seed, depth).program(args.reps)
-        open(my_path, "w").write(my_src)
-        open(py_path, "w").write(py_src)
+        my_path = os.path.join(tmp, "p%d.my" % i)
+        py_path = os.path.join(tmp, "p%d.py" % i)
+        with open(my_path, "w") as f:
+            f.write(my_src)
+        with open(py_path, "w") as f:
+            f.write(py_src)
+        results = run_engines(my_path, py_path)
+        fb = args.check_fallbacks and has_fallback(args.mylang, my_path)
+        os.remove(my_path)
+        os.remove(py_path)
+        return seed, depth, my_src, py_src, results, fb
 
+    def run_engines(my_path, py_path):
         results = {}
         if "tw" in engines:
             results["tw"] = run([args.mylang, "-tw"], my_path)
@@ -690,7 +713,13 @@ def main():
         if "nti" in engines:
             results["vm-nti"] = run([args.mylang, "-vm", "-nti"], my_path)
             results["tw-nti"] = run([args.mylang, "-tw", "-nti"], my_path)
+        return results
 
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        checked = list(pool.map(check, range(args.count)))
+    os.rmdir(tmp)       # every program removed its own files
+
+    for i, (seed, depth, my_src, py_src, results, fb) in enumerate(checked):
         vals = list(results.values())
         # ⛔ A TIMEOUT IS "I DO NOT KNOW", NOT "A DIFFERENT ANSWER".
         #
@@ -716,7 +745,6 @@ def main():
         agree_but_slow = bool(timed_out) and answered and all(
             v == answered[0] for v in answered
         ) and not answered[0].startswith("<")
-        fb = args.check_fallbacks and has_fallback(args.mylang, my_path)
         if fb:
             fallbacks += 1
 

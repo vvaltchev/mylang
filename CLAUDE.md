@@ -1766,7 +1766,10 @@ puts the whole tree in the IDLE scheduling and I/O classes (`chrt
 --idle 0`, `ionice -c3`), falling back silently to `nice -n 19` where
 those are refused (`MYLANG_TEST_IDLE=0` forces the fallback). A
 battery is background work: it must never slow the person at the
-keyboard.
+keyboard. `tests/nested_fuzz.py` checks its programs on a thread pool
+of that size too (`--jobs`) and prints them in PROGRAM ORDER, so its
+report is byte-identical to the serial one for any job count (checked
+over 100 programs, and over a sabotaged binary's 13 divergences).
 
 Running scripts:
 ```

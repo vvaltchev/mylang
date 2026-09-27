@@ -171,7 +171,7 @@ def plan(args, jobs, bins, build_lanes):
          "--jobs", str(wide)], cost=wide, est=300)
     add("nested_fuzz:dbg", "dbg",
         [py, os.path.join(t, "nested_fuzz.py"), "--mylang", b("dbg"),
-         "--count", "300"], est=600)
+         "--count", "300", "--jobs", str(wide)], cost=wide, est=60)
     rx_only = re.compile(args.only) if args.only else None
     rx_skip = re.compile(args.skip) if args.skip else None
     for st in steps:
