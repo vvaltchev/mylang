@@ -777,6 +777,35 @@ EvalValue builtin_range(EvalContext *ctx, const ArgLocs *exprList,
     return SharedArrayObj(std::move(ivec));
 }
 
+/*
+ * #97 CB4: call a callback on element i, a FLAT int/float/bool element
+ * RAW (VmInvoker::call_scalars binds it in place, no boxed argv - the
+ * map/filter arms of CB2, shared by find's and sum's key). The kind is
+ * read per call: the callback is script code and may promote the array
+ * (a non-scalar store), after which the general arm serves.
+ */
+static EvalValue inv_call_elem(VmInvoker &inv, const SharedArrayObj &arr,
+                               size_type i)
+{
+    const size_type at = arr.offset() + i;
+    switch (arr.skind()) {
+        case SharedArrayObj::Storage::ints: {
+            const int_type v = arr.flat_ints()[at];
+            return inv.call(v);
+        }
+        case SharedArrayObj::Storage::floats: {
+            const float_type v = arr.flat_floats()[at];
+            return inv.call(v);
+        }
+        case SharedArrayObj::Storage::bools: {
+            const bool v = arr.flat_bools()[at] != 0;
+            return inv.call(v);
+        }
+        default:
+            return inv.call(arr_elem_at(arr, i));
+    }
+}
+
 EvalValue
 builtin_find_arr(const SharedArrayObj &arr,
                  const EvalValue &v,
@@ -797,7 +826,7 @@ builtin_find_arr(const SharedArrayObj &arr,
          * indexed past its end: an OOB read). */
         for (size_type i = 0; i < arr.size(); i++) {
 
-            const EvalValue r = inv.call(arr_elem_at(arr, i));
+            const EvalValue r = inv_call_elem(inv, arr, i);
             if (r == v)
                 return static_cast<int_type>(i);
         }
@@ -1433,10 +1462,10 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         /* Seed with a COPY of the first result, as the 1-arg path does:
          * `+=` mutates the accumulator in place, and a callback may return
          * an array it still references. */
-        EvalValue val = sum_seed(inv.call(arr_elem_at(arr, 0)));
+        EvalValue val = sum_seed(inv_call_elem(inv, arr, 0));
 
         for (size_type i = 1; i < arr.size(); i++)
-            num_bin_op(val, inv.call(arr_elem_at(arr, i)), &Type::add);
+            num_bin_op(val, inv_call_elem(inv, arr, i), &Type::add);
 
         return val;
     }

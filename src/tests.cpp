@@ -25446,6 +25446,23 @@ static bool invoker_call_tiers()
             "var k = filter(func(x) { return x > 20; }, m);",
             "assert(len(k) == 20);" },
           ExecEngine::Vm, true, 60, true },
+        /* find's key and sum's key over flat arrays: raw too (#97 CB4) */
+        { "find key over flat ints, VM engine",
+          { fill,
+            "var r = find(a, -1, func(x) { return x * 2; });",
+            "assert(r == none);" },
+          ExecEngine::Vm, true, 30, true },
+        { "sum key over flat floats, VM engine",
+          { "var f = []; for (var i = 0; i < 30; i++) { append(f, i + 0.5); }",
+            "var s = sum(f, func(x) { return x * 2.0; });",
+            "assert(s == 900.0);" },
+          ExecEngine::Vm, true, 30, true },
+        /* make_dict keeps the key boxed on purpose (#97 CB4) */
+        { "make_dict over flat int keys, VM engine",
+          { fill,
+            "var d = make_dict(a, func(k) { return k * 3; });",
+            "assert(d[7] == 21 && len(d) == 30);" },
+          ExecEngine::Vm, true, 30, false },
         /* map over a GENERAL (mixed) array: already-boxed elements, still
          * the prepared entry, never raw */
         { "map callback over boxed elements, VM engine",

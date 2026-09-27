@@ -871,7 +871,15 @@ MapFilterV's target2 bits 1-2; myv v23). Now every one of 35's 1M
 callbacks binds raw: **35_map_filter 289M -> 225M Ir (-22%), 0.50x
 wall** against the pre-CB2 tree - more than the Ir, since the flat
 result also drops a boxed array's construction and walk.
-**Open siblings:** find/sum still pass boxed elements. The post-call ref_slots release scan (26 Ir per call
+**CB4 (same day): find's and sum's KEY callback take a flat element
+raw** (`inv_call_elem`, arr.cpp.h - the CB2 switch, shared). Reach was
+zero in bench/, so bench/my/96_find_sum_key came first (my/py/cpp):
+**738M -> 691M Ir (-6.4%, ~17 Ir per callback), 0.66x wall**, every one
+of its 1.375M callbacks raw. **make_dict was tried and DROPPED**: its
+key must be boxed anyway (it becomes the dict key), so a raw bind is an
+extra cost, not a replacement - 67_make_dict read **+5 Ir per call**
+(968M -> 980M) with all 1.2M calls raw. The `-rt` case pins it boxed.
+**Open sibling:** the post-call ref_slots release scan (26 Ir per call
 on 34, two int params seeded as references because a lambda's params
 are never C3-proven) is the next measured cost.
 
