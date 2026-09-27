@@ -15019,3 +15019,46 @@ built once). Pinned P-core cycles: 260M -> 256M, -1.5% - the removed
 work is cheap, well-predicted C++. Watched failing: admitting a
 non-local capture to the lean form aborts `-rt` on the constructor's
 `ML_CHECK(cap.kind == SymKind::local)` (the F4 frameless-call test).
+
+## #97 R2b - A SCALAR CAPTURE IS COPIED BY ITS PAYLOAD WORD (2026-09-26)
+
+After R2, a pinned cycle profile of 63_closures (`perf record -e
+cpu_core/cycles/` with `MYLANG_JIT_MAP`, JIT samples mapped to their
+fragments) put **54% of all cycles in `jit_make_closure_locals`**, a
+function worth ~12% of the instructions - 77% of its samples on ONE
+load. The lean constructor copied each captured value with the ordinary
+`EvalValue` copy, `val = other.val`, which GCC compiles to a 16-byte
+`movdqu` of the 24-byte union - and the source is a frame slot the
+factory's EMITTED code wrote a few instructions earlier as separate
+8-byte stores. A load spanning two in-flight stores cannot be forwarded
+from the store buffer, so it waits for them to retire: exactly one
+blocked store-forward per closure (`ld_blocks.store_forward` 4.0M over
+2M closures).
+
+The first fix built an `EvalValue(int)` temporary and moved it in - and
+moved the stall with it: the temporary is written with 8-byte stores
+and read back with the same 16-byte load (`perf record -e
+cpu_core/ld_blocks.store_forward/pp` named the new site). The fix that
+holds writes the slot IN PLACE: `CaptureSlots::emplace_scalar` ->
+`LValue::init_scalar` -> `EvalValue::copy_scalar_word`, one 8-byte load
+of the payload word (int, float and bool all live in it; a bool's ctor
+zeroes the whole word) plus the type pointer. Any other kind keeps the
+ordinary copy.
+
+`ld_blocks.store_forward` 4.0M -> ~2k. Pinned P-core cycles (scale 10):
+**265-269M -> 227-235M, -14%** on top of R2 (the pre-R1 parent: ~307M,
+so -25% for the three steps). Ir **+1.3%** (254.8M -> 258.0M, the type
+branch) - the instruction count and the clock disagree in sign again,
+and the clock is the one that matters. Net: a five-mode `tests` entry,
+closures capturing an int, a float, a bool and a string from each
+factory's frame, checked by value after the frame is gone; watched
+failing with the copied word corrupted (27 tests per JIT mode, the
+interpreted modes green - the lean constructor is reached only from
+emitted code).
+
+**The general hazard, stated once:** emitted code writes a slot as
+8-byte words, and a C++ helper that copies a value out of that slot
+with a WIDER load stalls whenever the stores are still in flight. R1
+met it through a stack temporary, R2b through the source slot itself.
+Any helper that reads a slot the emitted code just wrote is a
+candidate.

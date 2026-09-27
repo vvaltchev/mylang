@@ -371,6 +371,26 @@ public:
     }
 
     /*
+     * #97 R2b: copy an int/float/bool from `src` into this TRIVIAL value
+     * through ONE 8-byte payload word (all three live in the union's
+     * first word; a bool's ctor zeroes the whole word first). The
+     * ordinary copy moves the whole 24-byte union with a 16-byte load,
+     * and when `src` is a frame slot the emitted code wrote a moment
+     * ago as separate 8-byte stores, that load cannot be forwarded
+     * from the store buffer and stalls every time.
+     */
+    void copy_scalar_word(const EvalValue &src) {
+        ML_CHECK(type->t < Type::t_str
+                 && (src.type->t == Type::t_int
+                     || src.type->t == Type::t_float
+                     || src.type->t == Type::t_bool));
+        uint64_t w;
+        std::memcpy(&w, static_cast<const void *>(&src.val), sizeof w);
+        std::memcpy(static_cast<void *>(&val), &w, sizeof w);
+        type = src.type;
+    }
+
+    /*
      * #121: reset the tag to `none` AFTER the payload has already been moved
      * out by a hand-written, type-specific assign (vm_slot_bind_ref, vm.cpp).
      * The moved-from handle is null, so no destructor and no decrement is
@@ -881,7 +901,13 @@ public:
      * dst is never borrowed (a written parameter is never non-escaping),
      * and its container/flags are those of a frame local.
      */
-    void drop_for_overwrite() {
+    /* #97 R2b: a freshly default-constructed slot takes an
+     * int/float/bool by its payload word (EvalValue::copy_scalar_word) */
+    void init_scalar(const EvalValue &v) {
+        val.copy_scalar_word(v);
+    }
+
+        void drop_for_overwrite() {
         ML_CHECK(!borrowed);
         val.drop_in_place();
     }
