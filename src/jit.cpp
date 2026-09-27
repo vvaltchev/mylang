@@ -12508,9 +12508,11 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             const int32_t s = static_cast<int32_t>(
                 static_cast<long>(res_slot)
                 * static_cast<long>(sizeof(LValue)));
-            if (std::binary_search(ck.ref_slots.begin(),
+            const bool bnd_res_listed =
+                std::binary_search(ck.ref_slots.begin(),
                                    ck.ref_slots.end(),
-                                   static_cast<int32_t>(res_slot))) {
+                                   static_cast<int32_t>(res_slot));
+            if (bnd_res_listed) {
                 /* the result itself may hold a reference - a raw copy
                  * would leave the slices set pointing at the dying slot
                  * (the jit_bind_ref_arg lesson): decline to the C++
@@ -12527,9 +12529,24 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                          + static_cast<int32_t>(EvalValue::jit_type_off()));
             cmp_d_imm8(RAX, L.type_t_off, static_cast<int8_t>(L.t_str_val));
             j_slow.push_back(e.j32(0x7D));         /* jge slow */
-            for (int32_t o = 0; o <= 24; o += 8) {
-                ld(R11, RBX, s + o);
-                st(RCX, L.fs_value + o, R11);
+            if (bnd_res_listed) {
+                for (int32_t o = 0; o <= 24; o += 8) {
+                    ld(R11, RBX, s + o);
+                    st(RCX, L.fs_value + o, R11);
+                }
+            } else {
+                /* #97 CB8: an UNLISTED result slot is written only by a
+                 * scalar-producing op (op_writes_scalar: int, float,
+                 * bool - never a builtin or any 16-byte trivial), so its
+                 * value is the payload word and the type word - the
+                 * frameless arm's rule, now on the boundary arm every
+                 * callback return takes */
+                ld(R11, RBX, s);                   /* the payload */
+                st(RCX, L.fs_value, R11);
+                ld(R11, RBX, s + static_cast<int32_t>(L.off_type));
+                st(RCX, L.fs_value
+                            + static_cast<int32_t>(EvalValue::jit_type_off()),
+                   R11);
             }
             /* flow->type = FlowState::ret */
             e.u8(0xC6);                            /* mov byte [rcx+d], imm8 */
