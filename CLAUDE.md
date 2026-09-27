@@ -2187,6 +2187,18 @@ and 1.34x SLOWER for -0.8% Ir and a pure register renaming, while
 cycles. A ratio that contradicts both the Ir and the emitted code gets
 a pinned cycle count before it is believed.
 
+**⛔ AND A PINNED CYCLE COUNT CAN CONTRADICT THE Ir FOR A REAL REASON
+(#97 R1, 2026-09-26).** R1's first version was **10% SLOWER in cycles
+for 11.8% FEWER instructions**, reproducibly, against the exact parent
+commit. Cause: a hot helper's `*this = LValue()` compiles to two 8-byte
+stores of a stack temporary and one 16-byte reload - a BLOCKED
+store-forward per call (`ld_blocks.store_forward` doubled; `perf record
+-e cpu_core/ld_blocks.store_forward/pp` names the load). **When Ir and
+cycles disagree in sign, run top-down (`perf stat -M TopdownL2
+--cputype core`) and count blocked store-forwards before anything
+else.** The fix was an in-place destructor, and it turned -11.8% Ir into
+-15% cycles. Record: docs/jit-optimizations.md, *#97 R1*.
+
 **THE ASSERTS=0 MEASUREMENT RULE (maintainer-set, 2026-08-01).** EVERY
 performance measurement — callgrind Ir or wall-clock, a one-off A/B or a
 full-suite run — is taken with **`OPT=1 ASSERTS=0` on BOTH sides**. A plain

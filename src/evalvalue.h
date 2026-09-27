@@ -347,6 +347,16 @@ public:
     }
 
     /*
+     * #97 R1: run the payload's destructor IN PLACE and leave `none`
+     * behind - one type-word store. For a slot that is overwritten
+     * right after (the native return arm's old dst). NOT a substitute
+     * for frame_release(): it ignores the borrow, which LValue asks.
+     */
+    void drop_in_place() {
+        destroy_val();
+    }
+
+    /*
      * The mirror of abandon_borrowed(): take the bits of another value
      * WITHOUT taking a reference to what they point at. Same single caller
      * (LValue::borrow_from), same #94 justification.
@@ -862,6 +872,20 @@ public:
      * live-slices set, so it cannot be reduced to a refcount decrement (the
      * jit_bind_ref_arg lesson, from the push side).
      */
+    /*
+     * #97 R1: the native return arm's release of the OLD dst, which the
+     * arm overwrites with the result right after. `*this = LValue()`
+     * (frame_release) builds a zeroed temporary on the stack and reads
+     * it back with one 16-byte load over two 8-byte stores - a blocked
+     * store-forward on every call, +10% cycles on 63_closures. A call
+     * dst is never borrowed (a written parameter is never non-escaping),
+     * and its container/flags are those of a frame local.
+     */
+    void drop_for_overwrite() {
+        ML_CHECK(!borrowed);
+        val.drop_in_place();
+    }
+
     void frame_release() {
         if (borrowed) {
             val.abandon_borrowed();

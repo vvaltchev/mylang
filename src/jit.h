@@ -1820,8 +1820,9 @@ bool jit_fwd_op_is_fconsumer(OpCode op);
  * throw-free, so the pop/leave here cannot throw. */
 extern "C" size_t jit_ret(int_type res_slot) noexcept;
 
-/* 4-v: the RECORD-LESS return's decline tier (a ref result / a
- * non-trivial old dst need C++'s proper steal/release) - jit_ret's twin
+/* 4-v: the RECORD-LESS return's decline tier (an ARRAY result, whose
+ * slice registration names its slot, and a raw bit-1 dst need C++'s
+ * steal/put; #97 R1 moves every other reference) - jit_ret's twin
  * with no record to read: the destination comes from the residue
  * (dst_addr), the frame's identity from the BAKED desc (the returning
  * chunk is known at its own ReturnV's emit), the parent window from the
@@ -1841,6 +1842,9 @@ void *jit_addr_resume_chunk();
  * scan body (an LValue assignment, so slice unregistration is correct by
  * construction). */
 extern "C" void jit_release_slot(LValue *lv) noexcept;
+/* #97 R1: the native return arm's OLD-dst release - the payload's
+ * destructor in place, no stack temporary (LValue::drop_for_overwrite) */
+extern "C" void jit_drop_dst(LValue *lv) noexcept;
 
 /* C4c: the VM_HARDENING audit the emitted inline pop calls before its
  * guards - re-runs the every-slot-trivial + plain-frame watermark checks

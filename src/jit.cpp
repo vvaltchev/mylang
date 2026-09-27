@@ -12600,9 +12600,9 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                  * ref_slots invariant, so its copy is the 8-byte payload
                  * and the type word, not four qwords. What stays: the
                  * dst word from the residue (bit 0 masked; 0 = discarded),
-                 * the old dst's own type test (a reference there must be
-                 * released - jit_ret_norec, which reads the bit), a
-                 * ref-listed result's runtime test, and ctx.captures from
+                 * the old dst's own type test (a reference there is
+                 * released in place - #97 R1), a ref-listed result's
+                 * runtime test (an ARRAY declines), and ctx.captures from
                  * [rbp+16]. The oracle runs here too (TESTS): its fork
                  * branch checks what a record-less frame leaves checkable.
                  */
@@ -12617,14 +12617,17 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                 e.call_rax();
                 e.bump_counter(&g_jit_frameless_rets);
 #endif
+                /* #97 R1 (the record-less arm's rule, below): only an
+                 * ARRAY result declines - its slices set holds its
+                 * address; any other reference moves bit-for-bit */
                 if (res_listed) {
                     ld(RAX, RBX, static_cast<int32_t>(
                                      res_slot
                                      * static_cast<int32_t>(sizeof(LValue)))
                                  + static_cast<int32_t>(L.off_type));
                     cmp_d_imm8(RAX, L.type_t_off,
-                               static_cast<int8_t>(L.t_str_val));
-                    j_nslow.push_back(e.j32(0x7D));    /* a reference */
+                               static_cast<int8_t>(L.t_arr_val));
+                    j_nslow.push_back(e.j32(0x74));    /* je: an array */
                 }
                 ld(RDX, 5, 24);
                 e.op_reg_imm(Op::band, RDX, -4);       /* clear bits 0, 1 */
@@ -12637,10 +12640,25 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                     e.test_byte_base_imm8(RBP, 24, 2);
                     j_triv_old = e.j32(0x75);          /* jnz: trivial */
                 }
+                /* #97 R1: an old dst holding a REFERENCE is released in
+                 * place (frame_release) rather than declining the return.
+                 * A bit-1 dst (raw, E2b) jumped over this: trivial. */
                 ld(RAX, RDX, static_cast<int32_t>(L.off_type));
                 cmp_d_imm8(RAX, L.type_t_off,
                            static_cast<int8_t>(L.t_str_val));
-                j_nslow.push_back(e.j32(0x7D));        /* old dst: reference */
+                {
+                    const size_t j_odtriv = e.j32(0x7C);   /* jl: trivial */
+                    e.push_reg(R8R);
+                    e.push_reg(R10);
+                    e.push_reg(RDX);
+                    e.mov_rr(RDI, RDX);                    /* reg:abi */
+                    e.call_direct(
+                        reinterpret_cast<const void *>(jit_drop_dst));
+                    e.pop_reg(RDX);
+                    e.pop_reg(R10);
+                    e.pop_reg(R8R);
+                    e.patch32_here(j_odtriv);
+                }
                 if (j_triv_old)
                     e.patch32_here(j_triv_old);
                 if (res_slot >= 0) {
@@ -12652,6 +12670,10 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                             ld(R11, RBX, s + o);
                             st(RDX, o, R11);
                         }
+                        /* moved: the source slot no longer owns it */
+                        e.movabs(RAX,
+                                 reinterpret_cast<uint64_t>(L.t_none));
+                        st(RBX, s + static_cast<int32_t>(L.off_type), RAX);
                     } else {
                         ld(R11, RBX, s);               /* the payload */
                         st(RDX, 0, R11);
@@ -12736,17 +12758,25 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             /* 4-v: NO cache guards - the gate excludes cached-call
              * bodies (norec_had_cached), so a record-less frame can
              * never hold a parked key, a stashed caller cache, or a
-             * live vframe pure cache. The residual declines (a ref
-             * result, a non-trivial old dst) go to jit_ret_norec -
-             * jit_ret would pop an ANCESTOR's record. */
+             * live vframe pure cache. The residual declines (an
+             * ARRAY result, a raw bit-1 dst - #97 R1) go to
+             * jit_ret_norec - jit_ret would pop an ANCESTOR's record. */
+            /* #97 R1: a REFERENCE result is moved natively too - only an
+             * ARRAY declines. The raw-move hazard is the slices set: a
+             * SharedArrayObj slice registers its own ADDRESS in its
+             * parent, so a moved bit-copy leaves the set naming the dead
+             * slot. No other reference type registers itself anywhere
+             * (a closure, string, dict, struct, exception is a plain
+             * counted pointer), so for them the move below is exact once
+             * the source slot is stamped none. */
             if (res_listed) {
                 ld(RAX, RBX, static_cast<int32_t>(
                                  res_slot
                                  * static_cast<int32_t>(sizeof(LValue)))
                              + static_cast<int32_t>(L.off_type));
                 cmp_d_imm8(RAX, L.type_t_off,
-                           static_cast<int8_t>(L.t_str_val));
-                j_nslow.push_back(e.j32(0x7D));    /* a reference result */
+                           static_cast<int8_t>(L.t_arr_val));
+                j_nslow.push_back(e.j32(0x74));    /* je: an array result */
             }
             /* rdx = dst_addr from the residue; 0 = discarded result.
              * #97 increment 2: a FRAMELESS caller pushes the same word
@@ -12756,14 +12786,38 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
              * 48-byte aligned, so a recorded site's word never has it)
              * and re-read at the adjust; a frameless site that discards
              * its result pushes a bare 1, which masks to the same 0. */
+            /* #97 E2b's bit 1 - the dst slot may be RAW memory (a calling
+             * frameless body's W3-skipped call dst): only jit_ret_norec
+             * constructs an LValue there before the put. Masking bit 0
+             * alone used to leave the address off by 2 and rely on the
+             * misaligned type read happening to decline. */
+            e.test_byte_base_imm8(5 /* rbp */, 24, 2);
+            j_nslow.push_back(e.j32(0x75));            /* jnz: raw dst */
             ld(RDX, 5, 24);
             e.op_reg_imm(Op::band, RDX, -2);           /* clear bit 0 */
             e.test_rr(RDX, RDX);
             const size_t j_nw = e.j32(0x74);       /* jz no_write */
+            /* #97 R1: an old dst holding a REFERENCE is released here
+             * (frame_release - a borrowed one is abandoned, a counted one
+             * dropped) instead of declining the whole return. Before the
+             * move, as put() does; a result that is the same object keeps
+             * its own count in the result slot, so the order is safe. */
             ld(RAX, RDX, static_cast<int32_t>(L.off_type));
             cmp_d_imm8(RAX, L.type_t_off,
                        static_cast<int8_t>(L.t_str_val));
-            j_nslow.push_back(e.j32(0x7D));        /* old dst: reference */
+            {
+                const size_t j_odtriv = e.j32(0x7C);   /* jl: trivial */
+                e.push_reg(R8R);
+                e.push_reg(R10);
+                e.push_reg(RDX);
+                e.mov_rr(RDI, RDX);                    /* reg:abi */
+                e.call_direct(
+                    reinterpret_cast<const void *>(jit_drop_dst));
+                e.pop_reg(RDX);
+                e.pop_reg(R10);
+                e.pop_reg(R8R);
+                e.patch32_here(j_odtriv);
+            }
             if (res_slot >= 0) {
                 const int32_t s = static_cast<int32_t>(
                     static_cast<long>(res_slot)
@@ -12771,6 +12825,12 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                 for (int32_t o = 0; o <= 24; o += 8) {
                     ld(R11, RBX, s + o);
                     st(RDX, o, R11);
+                }
+                if (res_listed) {
+                    /* the value MOVED: the source slot must not own it
+                     * any more (its window is reused by the next push) */
+                    e.movabs(RAX, reinterpret_cast<uint64_t>(L.t_none));
+                    st(RBX, s + static_cast<int32_t>(L.off_type), RAX);
                 }
             } else {
                 /* Halt: the result is none - the singleton's type, a
@@ -12836,9 +12896,10 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             e.mov_reg_imm32(RAX, 0xFFFFFFFFu);   /* mov rax, -1 */
             e.frag_ret(Emitter::RetFlush::flushed);
             /* the record-less DECLINE tier: jit_ret_norec(res_slot,
-             * [rbp+24], the baked desc, rbp) - the C++ steal/put for a
-             * reference result / a non-trivial old dst; returns the
-             * sentinel in rax */
+             * [rbp+24], the baked desc, rbp) - the C++ steal/put for an
+             * ARRAY result (its slice registration) or a raw bit-1 dst
+             * (#97 R1: every other reference moves natively); returns
+             * the sentinel in rax */
             if (!j_nslow.empty()) {
                 for (const size_t j : j_nslow)
                     e.patch32_here(j);
