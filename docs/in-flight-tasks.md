@@ -684,8 +684,11 @@ work — but profile it before building, the way increment 0 was.
         ✅ **CB8 DONE 2026-09-26**: the ReturnV boundary arm copies an
         unlisted result as payload + type (2 words, not 4) - 34 -2.6%
         Ir, 35 -2.1%, 96 -1.6%.
-        NEXT on the callback path: the dead-temp store before the
-        boundary copy, then the jit_enter bookkeeping.
+        ✅ **CB9 DONE 2026-09-29** (#71): the dead-temp store before
+        the boundary copy - a return takes a forwarded result from a
+        register (34 -2.66% Ir, 35 -2.36%, everything else flat;
+        record: *#97 CB9* in docs/jit-optimizations.md).
+        NEXT on the callback path: the jit_enter bookkeeping.
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
 
