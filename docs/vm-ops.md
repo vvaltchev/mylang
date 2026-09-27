@@ -375,7 +375,23 @@ even/value at odd), and the op builds via the shared **`build_dict_from_pairs`**
 (which freezes each key). Both share **`compile_to_run_slot`** (factored out of
 `emit_args_range`) to place each element in its run slot. Dict-literal loops
 (`25_dict_member` 0.63x, `62_dict_word_count` 0.69x vs the tree-walker) go
-native. A **CLOSURE** `func [caps] (params) {..}` in expression position (a
+native. **The run is WIDENED before the build (#75):** an element (a dict
+value) whose own hint is narrower than the literal's static element type
+(`LiteralArray::elem_coerce` / `LiteralDict::val_coerce`, stamped by the
+inferencer from the literal's type IN CONTEXT - an enclosing literal pushes
+its element type down, so `[[1, 2.5], [3, 4]]`'s second row is float) gets a
+`CoerceNumV` in place on its run slot (`emit_literal_widen`), the tree-walker's
+`literal_widen`. A value-selecting expression does the same on its merge temp:
+the boxed ternary and `??` end in a `CoerceNumV` when their `th` is numeric
+(`emit_select_widen`), and the typed ternary stores a narrower arm through
+`CoerceNumV` instead of `MoveV` (`store_arm`). Without it a typed reader -
+`LoadElemFloat`, `DictLoadFloat`, a float consumer of the ternary - met an int
+the inferencer had promised was a float. A fully CONSTANT literal is built at
+parse time, before any stamp exists, so the const evaluator widens it by the
+join of its own values instead (`const_values_widen`, eval.cpp: a numeric
+SHAPE through nested arrays and dict values, rebuilding - never editing - a
+container that changes, since it may be a named shared constant).
+A **CLOSURE** `func [caps] (params) {..}` in expression position (a
 returned / var-bound / call-arg lambda, `id == null`) builds via
 **`MakeClosureV`**: `make_intrusive<FuncObject>(def, &ctx)` snapshots the
 captures from `ctx` — byte-identical to `FuncDeclStmt::do_eval` for a lambda —

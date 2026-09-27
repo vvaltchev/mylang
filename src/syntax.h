@@ -558,6 +558,17 @@ class LiteralArray final: public MultiElemConstruct<> {
 
 public:
 
+    /*
+     * The literal's static ELEMENT type, when it is a numeric kind the
+     * elements must be WIDENED to (i: a bool becomes an int; f: an int or
+     * bool becomes a float) - stamped by the inferencer (annotate_hints).
+     * `[fi, 2.5]` is an array<float> whatever position it is written in,
+     * so its int element is stored as a float: every typed reader (the
+     * VM's element tiers) trusts the element type, and the tree-walker
+     * binding the raw int was the divergence (task #75).
+     */
+    DeclType elem_coerce = DeclType::none;
+
     LiteralArray()
         : MultiElemConstruct<>("LiteralArray",
                                ConstructType::lit_arr) { }
@@ -567,6 +578,7 @@ public:
         auto c = make_unique<LiteralArray>();
         copy_base_fields(*c);
         clone_elems_into(*c);
+        c->elem_coerce = elem_coerce;
         return c;
     }
 };
@@ -660,6 +672,10 @@ class LiteralDict final: public MultiElemConstruct<LiteralDictKVPair> {
 
 public:
 
+    /* the dict's static VALUE type's widening, as LiteralArray's
+     * elem_coerce (keys are left as written) */
+    DeclType val_coerce = DeclType::none;
+
     LiteralDict()
         : MultiElemConstruct<LiteralDictKVPair>(
               "LiteralDict", ConstructType::lit_dict) { }
@@ -669,6 +685,7 @@ public:
         auto c = make_unique<LiteralDict>();
         copy_base_fields(*c);
         clone_elems_into(*c);
+        c->val_coerce = val_coerce;
         return c;
     }
 };

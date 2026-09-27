@@ -2916,6 +2916,17 @@ bool into an `array<int>` writes `0`/`1`, into an `array<float>` `0.0`/`1.0`.
 The reverse (an int into an `array<bool>`) stays a `TypeError` — that would be
 a narrowing, which the language never does implicitly.
 
+The same widening applies to the values a **literal** or a **selection**
+produces, wherever it is written: a container literal holds its values at its
+static element (value) type, and a ternary or `??` result at the type its two
+arms join to. So `[1, 2.5]` is an `array<float>` holding `1.0` and `2.5`,
+`[true, 3]` an `array<int>` holding `1` and `3`, `{"a": 1, "b": 2.5}` a
+`dict<str,float>`, `flag ? 1 : 2.5` a `float`, and `x ?? 2.5` a float for an
+`opt int` `x`. Nested literals follow the outer type: in `[[1, 2.5], [3, 4]]`,
+an `array<array<float>>`, the second row holds `3.0` and `4.0`. A constant
+array that is merely *named* inside another keeps its own type
+(`const A = [3, 4]; const N = [[1, 2.5], A];` leaves `A` an `array<int>`).
+
 Because the representation is fixed, the *only* way to ask a flat
 (statically-typed) array to hold a value of a different type is to launder it
 through a `dyn` alias and mutate that (e.g. `var dyn d = int_array;

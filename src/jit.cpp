@@ -548,9 +548,12 @@ static char *&g_nstack_top = *ml_lowmem_new<char *>(nullptr); /* the top (read f
  * the C stack, bounded by the sync depth cap instead, and the unsigned
  * compare against 0 never declines. */
 static char *&g_nstack_floor = *ml_lowmem_new<char *>(nullptr);
-/* E2d: the floor the mapping gives (g_nstack_floor is moved by a
- * boundary call and, in a TESTS build, by jit_test_nstack_floor) */
+#ifdef TESTS
+/* E2d: the floor the mapping gives, which jit_test_nstack_floor restores
+ * (TESTS only: nothing else reads it, and a sanitized non-TESTS build,
+ * which never maps the stack, would not reference it at all) */
 static char *g_nstack_floor_default = nullptr;
+#endif
 /* E2d: armed == a self site bounds its chain by the floor alone */
 static bool jit_nstack_armed()
 {
@@ -614,7 +617,9 @@ void jit_native_stack_init()
                  "emitted switch would leave every call on it misaligned");
     g_nstack_cur = g_nstack_top;
     g_nstack_floor = static_cast<char *>(m) + 4096 + (1u << 20);
+#ifdef TESTS
     g_nstack_floor_default = g_nstack_floor;
+#endif
     jit_set_sync_depth_cap(500000);
 #else
     /* SANITIZED build (the stack is pass-through): every sync level below
