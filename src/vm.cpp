@@ -7518,7 +7518,8 @@ VmInvoker::~VmInvoker()
 static ML_ALWAYS_INLINE EvalValue
 vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
                 const FuncDescriptor *d, LValue *win, int_type total,
-                const char *entry, Loc site)
+                const char *entry, Loc site,
+                const std::vector<int32_t> &scan)
 {
     c->flow->type = FlowState::none;
 
@@ -7563,8 +7564,9 @@ vm_invoker_body(const Chunk *cck, EvalContext *c, VmActivation *act,
      * extraction below - it touches only the window SLOTS, never flow->value
      * (a separate FlowState member), so the order is immaterial and this lets
      * the result be MOVE-CONSTRUCTED into the return (#60 Tier 1) instead of
-     * move-ASSIGNED into a default-constructed local. */
-    for (const int32_t sidx : cck->ref_slots) {
+     * move-ASSIGNED into a default-constructed local. `scan` is
+     * ref_slots, or ref_slots_raw after a raw scalar bind (#97 CB5). */
+    for (const int32_t sidx : scan) {
         if (sidx >= total)
             break;                       /* sorted */
         if (win[sidx].get().get_type()->t >= Type::t_str)
@@ -7609,7 +7611,7 @@ EvalValue VmInvoker::call_scalars(const CbScalar *ra, size_t n)
             }
             return vm_invoker_body(cck_, c_, act_, desc_, win,
                                    static_cast<int_type>(w_->size), entry_,
-                                   site_);
+                                   site_, cck_->ref_slots_raw);
         }
     }
     /* declined: box each argument once, as the template does */
@@ -7654,7 +7656,8 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
     }
 
     return vm_invoker_body(cck_, c_, act_, d, w_->slots,
-                           static_cast<int_type>(w_->size), entry_, site_);
+                           static_cast<int_type>(w_->size), entry_, site_,
+                           cck_->ref_slots);
 }
 
 /*

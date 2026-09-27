@@ -890,6 +890,21 @@ static const std::vector<test> tests =
         "assert(array_storage(e) == \"general\" && e[11] == 12);",
         "append(d, \"still accepts anything\");",
         "assert(len(d) == 13);" } },
+    /* #97 CB5: after a raw scalar bind the release scan reads
+     * ref_slots_raw. A callback whose BODY builds references (a string
+     * local, an array it returns) must still release them per element -
+     * the VM_HARDENING audit after the scan aborts on a leftover, and
+     * refcount() pins that the returned arrays are not kept alive by the
+     * window. */
+    { "callback: a raw-bound callback still releases its body's references",
+      { "var a = [];",
+        "for (var i = 0; i < 30; i++) { append(a, i); }",
+        "var m = map(func(x) { var s = str(x) + \"!\"; return len(s); }, a);",
+        "assert(m[5] == 2 && m[25] == 3);",
+        "var n = filter(func(x) { var t = [x, x]; return len(t) == 2; }, a);",
+        "assert(len(n) == 30);",
+        "sort(a, func(p, q) { var u = str(p); return p > q; });",
+        "assert(a[0] == 29);" } },
     { "coerce: a param fed only its final type stays unstamped (fast_bind)",
       { "var b = 2;",
         "var f = func [b] (x) { return x; };",
@@ -28368,6 +28383,97 @@ static bool myv_untrusted_proven_arms()
 }
 
 /*
+ * #97 CB5: `Chunk::ref_slots_raw` is ref_slots with NO parameter seeds -
+ * the list VmInvoker::call_scalars scans after a raw scalar bind. Pinned
+ * in both directions: a comparator's two params are in ref_slots (a
+ * lambda's params are never C3-proven) and OUT of the raw list, while a
+ * callback that builds a string LOCAL keeps that local in the raw list
+ * (a body write is the one way a reference gets there, and dropping it
+ * would leak the string - the VM_HARDENING audit after the scan is the
+ * runtime net for that direction).
+ */
+static bool ref_slots_raw_derivation()
+{
+    const char *src =
+        "var a = [];\n"
+        "for (var i = 0; i < 20; i++) { append(a, 20 - i); }\n"
+        "sort(a, func(p, q) => p < q);\n"
+        "var m = map(func(x) { var s = str(x) + \"!\"; "
+        "return len(s); }, a);\n"
+        "print(m[0]);";
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        const Chunk *cmp = nullptr, *key = nullptr;
+        for (const auto &d : prog.funcs) {
+            const Chunk *ck = static_cast<const Chunk *>(d->vm_chunk);
+            if (!ck)
+                continue;
+            if (d->params.size() == 2)
+                cmp = ck;
+            else if (d->params.size() == 1)
+                key = ck;
+        }
+        const auto has = [](const std::vector<int32_t> &v, int32_t x) {
+            return std::find(v.begin(), v.end(), x) != v.end();
+        };
+        const auto subset = [&](const Chunk *ck) {
+            for (const int32_t r : ck->ref_slots_raw)
+                if (!has(ck->ref_slots, r))
+                    return false;
+            return true;
+        };
+        if (!cmp || !key) {
+            fprintf(stderr, "ref_slots_raw: the two callbacks did not "
+                            "compile to chunks\n");
+            ok = false;
+        } else {
+            if (!has(cmp->ref_slots, 0) || !has(cmp->ref_slots, 1)) {
+                fprintf(stderr, "ref_slots_raw: the comparator's params "
+                                "are not seeded - the shape no longer "
+                                "tests anything\n");
+                ok = false;
+            }
+            if (has(cmp->ref_slots_raw, 0) || has(cmp->ref_slots_raw, 1)) {
+                fprintf(stderr, "ref_slots_raw: a raw-bound param is still "
+                                "in the raw list\n");
+                ok = false;
+            }
+            if (has(key->ref_slots_raw, 0)) {
+                fprintf(stderr, "ref_slots_raw: the key's param is in the "
+                                "raw list\n");
+                ok = false;
+            }
+            if (key->ref_slots_raw.empty()) {
+                fprintf(stderr, "ref_slots_raw: the string local left the "
+                                "raw list - it would leak\n");
+                ok = false;
+            }
+            if (!subset(cmp) || !subset(key)) {
+                fprintf(stderr, "ref_slots_raw: the raw list is not a "
+                                "subset of ref_slots\n");
+                ok = false;
+            }
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "ref_slots_raw: threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
  * myv_fuzz fat-1150 (2026-09-25): a Rethrow's region operand names the
  * catch whose body holds it, so that region's pend slot is full - for
  * bytecode we compiled. A mutated image pointed it at a region with no
@@ -47232,6 +47338,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: a Rethrow retargeted at an EMPTY region raises InternalErrorEx "
       "in both engines (fat-1150)",
       myv_rethrow_empty_region },
+    { "vm: ref_slots_raw drops the raw-bound params and keeps the body's "
+      "own reference writes (#97 CB5)",
+      ref_slots_raw_derivation },
     { "vm: a moved VmProgram's root chunk keeps its baked addresses bound "
       "(the load path's stack-stale main)",
       vm_program_move_rebinds },

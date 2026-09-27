@@ -879,9 +879,20 @@ of its 1.375M callbacks raw. **make_dict was tried and DROPPED**: its
 key must be boxed anyway (it becomes the dict key), so a raw bind is an
 extra cost, not a replacement - 67_make_dict read **+5 Ir per call**
 (968M -> 980M) with all 1.2M calls raw. The `-rt` case pins it boxed.
-**Open sibling:** the post-call ref_slots release scan (26 Ir per call
-on 34, two int params seeded as references because a lambda's params
-are never C3-proven) is the next measured cost.
+**CB5 (2026-09-26): after a raw scalar bind the release scan reads
+`Chunk::ref_slots_raw`** - ref_slots derived with NO parameter seeds,
+since a window whose every parameter was bound a raw scalar can hold a
+reference only where the BODY writes one. The scan was 26 Ir per call
+on 34 (line profile: the loop over the comparator's two seeded,
+never-C3-proven params). Measured (Ir, scale3-scale1): **34 -10.8%**,
+35 -5.1%, 96 -4.4%, 67 flat (make_dict stays boxed); wall 0.97x /
+0.98x / 0.99x. Pinned by `ref_slots_raw_derivation` and a 5-mode entry
+whose callbacks build string/array locals; with the raw list emptied,
+both the structural check and the VM_HARDENING window audit fire.
+**Next measured cost on this path:** the ~95 Ir/call left in
+`call_scalars` + the inlined body around the emitted comparator (34:
+prologue/epilogue, `raw_bindable`, flow reset/read), vs 36 Ir in the
+emitted body itself.
 
 ### An unrelated observation, NOT chased
 

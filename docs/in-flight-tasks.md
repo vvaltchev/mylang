@@ -671,8 +671,11 @@ work — but profile it before building, the way increment 0 was.
         raw - new bench 96_find_sum_key -6.4% Ir, **0.66x wall**;
         make_dict measured +5 Ir/call (its key is boxed anyway), kept
         boxed.
-        NEXT on the callback path: the post-call release scan of
-        seeded-but-scalar lambda params.
+        ✅ **CB5 DONE 2026-09-26**: after a raw scalar bind the release
+        scan reads ref_slots_raw (no param seeds) - 34 -10.8% Ir /
+        0.97x wall, 35 -5.1%, 96 -4.4%.
+        NEXT on the callback path: the ~95 Ir/call of C++ around the
+        emitted body (call_scalars + vm_invoker_body).
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
 
