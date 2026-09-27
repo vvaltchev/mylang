@@ -7789,7 +7789,9 @@ static size_t jit_capbase_uses(const Chunk &ck, size_t begin, size_t end)
  * list (grep `ctx->captures` / `ctx.captures` in vm.cpp, plus
  * jit_make_closure through the FuncObject ctor's read_sym_lv):
  *   jit_load_capture / jit_store_capture (the non-capbase arms),
- *   jit_store_capture_compound, jit_make_closure, the four jit_incdec_*,
+ *   jit_store_capture_compound, jit_make_closure, jit_make_closure_ptr
+ *   (both through the FuncObject ctor's read_sym_lv), the four
+ *   jit_incdec_*,
  *   jit_append, the three jit_call_builtin_lv*, jit_emplace_struct,
  *   jit_store_elem_value / _chain, jit_store_member,
  *   jit_store_lvalue_chain.
@@ -7809,9 +7811,20 @@ static size_t jit_capbase_uses(const Chunk &ck, size_t begin, size_t end)
  * jit_poison_captures() as ctx.captures for the callee's duration, so a
  * reader the list is missing aborts by name (W3's poison, one level up).
  */
-static bool jit_op_w4_safe(const Instr &in)
+static bool jit_op_w4_safe(const Chunk &ck, const Instr &in)
 {
     switch (in.op) {
+    /* #97 R3: a closure whose every capture is a frame LOCAL is built
+     * by jit_make_closure_1 / _locals / _locals_st, which read the
+     * frame and ctx->root, never ctx->captures (the emitter picks one
+     * of the three on the same test, with or without a scratch) */
+    case OpCode::MakeClosureV: {
+        const FuncDescriptor *def = ck.closure_defs[in.target2];
+        for (const auto &cap : def->captures)
+            if (cap.kind != SymKind::local)
+                return false;
+        return true;
+    }
     /* the plain capture ops: through capbase (jit_chunk_w4 requires it) */
     case OpCode::LoadCaptureV:
         return true;
@@ -7872,6 +7885,7 @@ static const void *const jit_w4_unsafe_helpers[] = {
     reinterpret_cast<const void *>(jit_store_capture),
     reinterpret_cast<const void *>(jit_store_capture_compound),
     reinterpret_cast<const void *>(jit_make_closure),
+    reinterpret_cast<const void *>(jit_make_closure_ptr),
     reinterpret_cast<const void *>(jit_incdec_checked),
     reinterpret_cast<const void *>(jit_incdec_elem),
     reinterpret_cast<const void *>(jit_incdec_member),
@@ -7902,7 +7916,7 @@ static bool jit_w4_helpers_ok(const Emitter &e)
 static bool jit_chunk_w4_static(const Chunk &ck)
 {
     for (const Instr &in : ck.code)
-        if (!jit_op_w4_safe(in))
+        if (!jit_op_w4_safe(ck, in))
             return false;
     return true;
 }
@@ -11662,7 +11676,24 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                         static_cast<int32_t>(jit_layout().ctx_captures));
                                                   /* push [r9+caps]: the
                                                    * caller's captures */
-            if (self_running) {
+            if (fl_ck->frameless_capbase) {
+                /* W4: the callee's entry takes its capture base from
+                 * rdx (fo) itself and nothing in its body reads
+                 * ctx->captures - so the repoint is not emitted, for a
+                 * capture-free callee (G2's empty set) as much as for
+                 * a capturing one. In a TESTS build the POISON captures
+                 * go there instead (jit_poison_captures: a reader the
+                 * classification missed aborts by name; the arm
+                 * restores the caller's) */
+#ifdef TESTS
+                e.movabs(RAX, reinterpret_cast<uint64_t>(   /* reg:proto */
+                                  jit_poison_captures()));
+                e.store_base(RAX, R9,             /* reg:proto */
+                             static_cast<int32_t>(
+                                 jit_layout().ctx_captures));
+                g_jit_frameless_capbase++;        /* emit-time */
+#endif
+            } else if (self_running) {
                 /* E2c: capture-free, and the caller IS the callee - the
                  * captures pushed above stay current; G2: another
                  * capture-free callee gets an EMPTY set (the callee's own
@@ -11674,28 +11705,13 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                  static_cast<int32_t>(
                                      jit_layout().ctx_captures));
                 }
-            } else if (!fl_ck->frameless_capbase) {
+            } else {
                 /* ctx.captures = &fo.capture_slots */
                 e.lea_base(RAX, RDX,              /* reg:proto */
                            static_cast<int32_t>(JP.fo_capture_slots));
                 e.store_base(RAX, R9,             /* reg:proto */
                              static_cast<int32_t>(
                                  jit_layout().ctx_captures));
-            } else {
-                /* W4: the callee's entry takes its capture base from
-                 * rdx (fo) itself and nothing in its body reads
-                 * ctx->captures - so the repoint is not emitted. In a
-                 * TESTS build the POISON captures go there instead
-                 * (jit_poison_captures: a reader the classification
-                 * missed aborts by name; the arm restores the caller's) */
-#ifdef TESTS
-                e.movabs(RAX, reinterpret_cast<uint64_t>(   /* reg:proto */
-                                  jit_poison_captures()));
-                e.store_base(RAX, R9,             /* reg:proto */
-                             static_cast<int32_t>(
-                                 jit_layout().ctx_captures));
-                g_jit_frameless_capbase++;        /* emit-time */
-#endif
             }
 #ifdef TESTS
             if (!fl_self && g_cur_caller_desc)
@@ -12722,6 +12738,27 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                  * its captures through capbase alone). A TESTS build
                  * restores regardless: its W4 site installed the poison
                  * captures, which must not outlive the call. */
+#ifdef TESTS
+                /* #97 R3: and a TESTS build CHECKS the W4 half of that
+                 * contract before it restores - the site installed the
+                 * poison, and nothing a W4 body runs may replace it. A
+                 * site that wrote anything else there (the G2 site's
+                 * EMPTY set did, while the release arm, trusting W4,
+                 * left it in place: the caller's next capture read
+                 * through ctx->captures faulted) aborts by name here,
+                 * where the unconditional restore used to hide it */
+                if (ck.frameless_capbase) {
+                    e.load_global(R9R, L.addr_ctx, RAX);   /* reg:proto */
+                    ld(RAX, R9R, static_cast<int32_t>(L.ctx_captures));
+                    e.movabs(R11, reinterpret_cast<uint64_t>(
+                                      jit_poison_captures()));
+                    e.cmp_rr(RAX, R11);                 /* reg:proto */
+                    const size_t j_cap_ok = e.j32(0x74);    /* je */
+                    e.call_direct(reinterpret_cast<const void *>(
+                        jit_w4_captures_replaced));      /* noreturn */
+                    e.patch32_here(j_cap_ok);
+                }
+#endif
 #ifndef TESTS
                 if (!ck.frameless_capbase)
 #endif
@@ -22486,9 +22523,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* #97 R2: every capture a frame local -> the lean constructor,
          * which cannot throw (so no status test below) */
         const FuncDescriptor *mc_def = ck.closure_defs[in.target2];
-        bool mc_locals = mc_s1 >= 0;
+        bool mc_all_local = true;
         for (const auto &cap : mc_def->captures)
-            mc_locals = mc_locals && cap.kind == SymKind::local;
+            mc_all_local = mc_all_local && cap.kind == SymKind::local;
+        const bool mc_locals = mc_s1 >= 0 && mc_all_local;
         emit_call_prologue(e);
         /* #97 R2c: exactly one local capture -> its own straight-line
          * helper, handed the source slot directly */
@@ -22512,6 +22550,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.movabs(RSI,
                      reinterpret_cast<uint64_t>(ck.closure_defs[in.target2]));
         }
+        /* R3: the all-local storing form reads no ctx->captures, which
+         * is what jit_op_w4_safe admits the op on - with or without a
+         * scratch - and it cannot throw */
         e.call_direct(
             mc_one
                 ? reinterpret_cast<const void *>(jit_make_closure_1)
@@ -22519,9 +22560,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 ? reinterpret_cast<const void *>(jit_make_closure_locals)
             : mc_s1 >= 0
                 ? reinterpret_cast<const void *>(jit_make_closure_ptr)
+            : mc_all_local
+                ? reinterpret_cast<const void *>(jit_make_closure_locals_st)
                 : reinterpret_cast<const void *>(jit_make_closure));
         emit_call_epilogue(e);
 
+        if (mc_s1 < 0 && mc_all_local)
+            return true;
         if (mc_s1 < 0) {
             e.test32_rr(RAX, RAX);       /* test eax, eax; reg:abi */
             const size_t j_ok = e.j8(0x74);   /* jz -> continue */

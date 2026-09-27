@@ -699,6 +699,10 @@ const void *jit_poison_type();
 const void *jit_poison_captures();
 /* #97 E2e: a window of poison slots (the lazy vframe's stale state) */
 const void *jit_poison_window();
+/* #97 R3: a W4 callee returned with ctx.captures no longer the poison
+ * its site installed - some site wrote it, and the release arm would
+ * not restore it. Aborts by name. */
+extern "C" [[noreturn]] void jit_w4_captures_replaced();
 #endif
 extern unsigned long g_jit_frameless_capbase;   /* W4 (emit-time): sites
                                                  * that skip the repoint */
@@ -1071,6 +1075,10 @@ extern "C" void *jit_make_closure_locals(const void *def,
 /* #97 R2c: exactly one local capture - (def, &its source slot) */
 extern "C" void *jit_make_closure_1(const void *def,
                                     const LValue *src) noexcept;
+/* #97 R3: the all-local STORING form, for a site with no scratch -
+ * (dst, def); cannot throw, reads no ctx->captures (W4-safe) */
+extern "C" void jit_make_closure_locals_st(int_type dst,
+                                           const void *def) noexcept;
 
 /* model-flip (nativize-ops): MakeArrayV natively - build an array LITERAL from
  * the element run [base, base+n) via the shared build_array_from_values, honoring

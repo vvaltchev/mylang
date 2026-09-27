@@ -4390,6 +4390,14 @@ const void *jit_poison_captures()
     return g_jit_poison_caps;
 }
 
+extern "C" [[noreturn]] void jit_w4_captures_replaced()
+{
+    fprintf(stderr, "W4: a frameless callee whose site leaves "
+                    "ctx.captures alone returned with it REPLACED (the "
+                    "release arm does not restore it)\n");
+    abort();
+}
+
 /* #97 E2e's net: the WINDOW a TESTS build leaves in act.view_frame where
  * the lazy scheme leaves a stale one (after a self call returns, at a
  * frameless entry) - the poison captures' slots, so a C++ reader that
@@ -4580,6 +4588,22 @@ extern "C" void *jit_make_closure_1(const void *defv,
                                     FuncObject::OneLocal());
     fo->intr_refcount = 1;          /* the destination slot owns it */
     return fo;
+}
+
+/* #97 R3: the all-local form for a site with no scratch register -
+ * stores through the frame like jit_make_closure, and like the other
+ * all-local forms reads no ctx->captures and cannot throw */
+extern "C" void jit_make_closure_locals_st(int_type dst,
+                                           const void *defv) noexcept
+{
+    ML_JIT_OP_RAN(MakeClosureV);
+    const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
+    ML_CHECK(!g_current_ctx->const_ctx);
+    Frame *fr = g_current_ctx->frame;
+    fr->at(dst).put(EvalValue(intrusive_ptr<FuncObject>(
+        make_intrusive<FuncObject>(def, get_root_ctx(g_current_ctx),
+                                   fr->slots,
+                                   FuncObject::LocalCaptures()))));
 }
 
 extern "C" int jit_make_closure(int_type dst, const void *defv) noexcept
