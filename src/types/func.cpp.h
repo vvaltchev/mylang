@@ -113,6 +113,21 @@ unsigned long g_live_funcobjs = 0;
 FuncObject::~FuncObject() { g_live_funcobjs--; }
 #endif
 
+FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *root,
+                       const LValue *frame, LocalCaptures)
+    : func(func)
+    , capture_root(root)
+{
+#ifdef TESTS
+    g_live_funcobjs++;
+#endif
+    capture_slots.reserve(func->captures.size());
+    for (const auto &cap : func->captures) {
+        ML_CHECK(cap.kind == SymKind::local);
+        capture_slots.emplace_back(frame[cap.slot].get(), false);
+    }
+}
+
 FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *ctx)
     : func(func)
     /*

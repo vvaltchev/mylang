@@ -940,6 +940,18 @@ public:
     std::shared_ptr<bool> const_scope_alive;
 
     FuncObject(const FuncDescriptor *func, EvalContext *ctx);
+    /*
+     * #97 R2: the closure whose captures are ALL frame locals, which the
+     * JIT proves at emit time from the descriptor. `frame` is the
+     * creating frame's slot 0 and `root` the program root; each capture
+     * is a copy of frame[cap.slot]. No per-capture kind dispatch, no
+     * unbound-name path (a local cannot be unbound at run time - the
+     * TDZ is a compile error), no const-scope test (a JIT frame is never
+     * a const-eval context).
+     */
+    struct LocalCaptures { };
+    FuncObject(const FuncDescriptor *func, EvalContext *root,
+               const LValue *frame, LocalCaptures);
     FuncObject(const FuncObject &rhs);
 #ifdef TESTS
     /*

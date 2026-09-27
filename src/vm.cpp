@@ -4554,6 +4554,21 @@ extern "C" void *jit_make_closure_ptr(const void *defv) noexcept
     }
 }
 
+/* #97 R2: every capture is a frame local (the emitter checked), so the
+ * construction cannot throw and reads the slots straight from `frame` */
+extern "C" void *jit_make_closure_locals(const void *defv,
+                                         const LValue *frame) noexcept
+{
+    ML_JIT_OP_RAN(MakeClosureV);
+    const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
+    ML_CHECK(!g_current_ctx->const_ctx
+             && frame == g_current_ctx->frame->slots);
+    FuncObject *fo = new FuncObject(def, get_root_ctx(g_current_ctx),
+                                    frame, FuncObject::LocalCaptures());
+    fo->intr_refcount = 1;          /* the destination slot owns it */
+    return fo;
+}
+
 extern "C" int jit_make_closure(int_type dst, const void *defv) noexcept
 {
     ML_JIT_OP_RAN(MakeClosureV);

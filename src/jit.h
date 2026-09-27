@@ -1064,6 +1064,10 @@ extern "C" int jit_make_closure(int_type dst, const void *def) noexcept;
  * do the slot store inline instead of paying EvalValue::operator='s
  * two type-erased indirect calls. Null after conveying a throw. */
 extern "C" void *jit_make_closure_ptr(const void *def) noexcept;
+/* #97 R2: the all-local-captures form - (def, &slot 0) -> the pointer,
+ * count 1; cannot throw */
+extern "C" void *jit_make_closure_locals(const void *def,
+                                         const LValue *frame) noexcept;
 
 /* model-flip (nativize-ops): MakeArrayV natively - build an array LITERAL from
  * the element run [base, base+n) via the shared build_array_from_values, honoring
