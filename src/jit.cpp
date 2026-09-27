@@ -188,6 +188,7 @@ unsigned long g_jit_capbase_cs = 0;    /* W6: runs holding the capture
  * guards that fell through into the inlined body, and explicit-closure
  * capture accesses served by the inline copy rather than the helper */
 unsigned long g_jit_guard_hits = 0;
+unsigned long g_jit_guard_proven = 0;
 unsigned long g_jit_capof_fast = 0;
 /* the CoerceNumV inline arm (exact copy / int->float widen), per run */
 unsigned long g_jit_coerce_fast = 0;
@@ -398,14 +399,14 @@ enum JitLever {
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
     JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA,
-    JL_FRAMELESS, JL_CAPPROT, JL_VFQUIET, JL_COUNT
+    JL_FRAMELESS, JL_CAPPROT, JL_VFQUIET, JL_GPROOF, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
     "peep", "bakecallee", "capbase", "lsra", "frameless", "capprot",
-    "vfquiet"
+    "vfquiet", "gproof"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -8149,6 +8150,9 @@ static JitHoist g_hoist2;
  * register binding - so no helper call, no exit and no cache barrier can
  * invalidate it, and it needs no epilogue re-derivation.
  */
+/* #97 G3: per-pc, the GuardCalleeVs a local make.closure proves true
+ * (jit_guard_facts, codegen.cpp), recomputed per chunk. */
+static std::vector<char> g_guard_proven;
 static std::vector<int> g_sf_slot;
 static std::vector<const StructTypeDef *> g_sf_def;
 static std::vector<uint32_t> g_sf_in;
@@ -14263,7 +14267,8 @@ void jit_stats_report()
         { "cold_copy",        &g_jit_cold_copy },
         { "hoist2",           &g_jit_hoist2 },
         { "capbase",          &g_jit_capbase },
-        { "guard_hits",       &g_jit_guard_hits },   /* #97 closure inl */
+        { "guard_hits",       &g_jit_guard_hits },
+        { "guard_proven",     &g_jit_guard_proven },   /* #97 closure inl */
         { "capof_fast",       &g_jit_capof_fast },
         { "coerce_fast",      &g_jit_coerce_fast },
         { "coerce_pin",       &g_jit_coerce_pin },
@@ -25880,6 +25885,15 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
          * against `[fo + func]`, so the only register load left is the
          * FuncObject pointer itself - 6 instructions where the
          * load-then-compare form took 8 (#97 guard cost). */
+        if (old_pc < g_guard_proven.size() && g_guard_proven[old_pc]) {
+            /* G3: every path here passed a make.closure of this very
+             * descriptor into the slot, with no other write since -
+             * the guard is true by construction and costs nothing */
+#ifdef TESTS
+            e.bump_counter(&g_jit_guard_proven);
+#endif
+            return;
+        }
         AccScratch acc(e);
         {
             RefScratch rn(e, RCX);
@@ -27811,6 +27825,10 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                                   }),
                       entries.end());
     }
+
+    /* #97 G3: the guards a local make.closure proves */
+    if (jit_lever_off(JL_GPROOF) || !jit_guard_facts(chunk, g_guard_proven))
+        g_guard_proven.clear();
 
     /* C4d: the struct-identity facts, over the FINAL code and with the
      * entry-stub pcs (bottom - a resume brings no history) now known. */

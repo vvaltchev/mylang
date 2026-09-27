@@ -10,7 +10,10 @@ from its register - 78 -39% cycles (112 -> 70 instr/iter), 11 -12%, 63
 -14% vs increment 1. STEP 1b (plain-splice staging/result, parameters
 read in place when the bind is the identity): 63 -3..-7% cycles, 78 -4%
 instructions but +2..4% cycles, undiagnosed (record: *STEP 1b*).
-Increments 2-5 not started. Designed from
+GUARD COST (record: *G2* / *G3* under STEP 1b): G2 shortened the guard
+(6% fewer instructions on 11/78, ~1% cycles); G3 is increment 4 - a
+guard a local `make.closure` proves emits nothing (bench 98, written
+for it: -16.5% cycles). Increments 2, 3 and 5 not started. Designed from
 measurement (2026-09-27). Maintainer's call: this replaces the
 call-protocol store trimming (R5/R6 both measured flat and are parked
 on `r5-offpath-framefree` / `r6-return-forward`).

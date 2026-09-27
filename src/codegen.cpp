@@ -9514,6 +9514,186 @@ bool jit_struct_facts(const Chunk &chunk, const std::vector<int> &entry_pcs,
 }
 
 /*
+ * #97 G3: WHICH INLINE-CACHE GUARDS ARE TRUE BY CONSTRUCTION. A
+ * GuardCalleeV asks "does slot S hold a closure of descriptor D?"; when
+ * every path reaching it passes through a `make.closure S = D` with no
+ * other write to S in between, the answer is yes before the program
+ * runs, and the JIT emits nothing for the guard. The proof is over the
+ * bytecode that is about to EXECUTE - so, unlike a claim the compiler
+ * recorded, it is as sound on a loaded image as on our own compile: a
+ * tampered image either still contains the proving make.closure on
+ * every path (then the guard really is true) or it does not (then the
+ * guard stays).
+ *
+ * A forward MUST dataflow, the C4d shape (jit_struct_facts above): a
+ * fact is (slot, descriptor), one bit each, at most 32.
+ *   GEN  - MakeClosureV writes a fresh FuncObject of closure_defs[t2]
+ *          into slot `target` (it cannot throw, and nothing else can
+ *          be in the slot afterwards). Descriptors are compared by
+ *          POINTER, so two pool entries naming one descriptor agree.
+ *   KILL - any write to S per `visit_use_def`; an unaudited op is a
+ *          barrier that kills everything. A call does NOT kill: the
+ *          callee has its own window, and the call's dst is a listed
+ *          write. A FuncObject's descriptor never changes, so a capture
+ *          store through the slot (StoreCaptureOfV) keeps the fact.
+ *   MEET - intersection over the fall-through and every pc field that
+ *          names this op (visit_pc_fields).
+ *   BOTTOM - pc 0 and every handler body/finally pc (an exception can
+ *          arrive from any op of the region). Unreachable pcs too.
+ *
+ * Unlike jit_struct_facts, the JIT's post-call RESUME pcs are NOT
+ * bottom: a resume continues the same frame right after its call op,
+ * whose only write to the frame is its listed dst - which is exactly
+ * the fall-through edge the dataflow already has. Making them bottom
+ * would lose every proof past the first call in a loop (a miss arm is
+ * a call, and it rejoins right before the next guard).
+ *
+ * `proven[pc]` is set for each GuardCalleeV the facts decide. Returns
+ * false when there is nothing to prove.
+ */
+bool jit_guard_facts(const Chunk &chunk, std::vector<char> &proven)
+{
+    const size_t n = chunk.code.size();
+    proven.assign(n, 0);
+    bool any_guard = false;
+    for (size_t p = 0; p < n; p++)
+        if (chunk.code[p].op == OpCode::GuardCalleeV)
+            any_guard = true;
+    if (!any_guard)
+        return false;
+
+    const auto def_at = [&](int idx) -> const FuncDescriptor * {
+        return idx >= 0 && static_cast<size_t>(idx)
+                                < chunk.closure_defs.size()
+            ? chunk.closure_defs[static_cast<size_t>(idx)] : nullptr;
+    };
+    std::vector<int> fact_slot;
+    std::vector<const FuncDescriptor *> fact_def;
+    std::vector<int> gen_of(n, -1);
+    for (size_t p = 0; p < n; p++) {
+        const Instr &i = chunk.code[p];
+        if (i.op != OpCode::MakeClosureV || i.target < 0)
+            continue;
+        const FuncDescriptor *const d = def_at(i.target2);
+        if (!d)
+            continue;
+        int idx = -1;
+        for (size_t f = 0; f < fact_slot.size(); f++)
+            if (fact_slot[f] == i.target && fact_def[f] == d) {
+                idx = static_cast<int>(f);
+                break;
+            }
+        if (idx < 0) {
+            if (fact_slot.size() >= 32)
+                return false;                      /* out of bits */
+            idx = static_cast<int>(fact_slot.size());
+            fact_slot.push_back(i.target);
+            fact_def.push_back(d);
+        }
+        gen_of[p] = idx;
+    }
+    if (fact_slot.empty())
+        return false;
+    const size_t nf = fact_slot.size();
+    const uint32_t all = nf == 32 ? ~uint32_t(0)
+                                  : ((uint32_t(1) << nf) - 1);
+
+    std::vector<uint32_t> kill(n, 0);
+    for (size_t p = 0; p < n; p++) {
+        uint32_t k = 0;
+        const bool known = visit_use_def(chunk.code[p],
+            [](int) {},
+            [&](int s) {
+                for (size_t f = 0; f < nf; f++)
+                    if (fact_slot[f] == s)
+                        k |= uint32_t(1) << f;
+            });
+        kill[p] = known ? k : all;                 /* unaudited = barrier */
+    }
+
+    std::vector<char> is_entry(n, 0);
+    is_entry[0] = 1;
+    for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+        for (const Chunk::HandlerClause &cl : hs.clauses)
+            if (cl.body_pc >= 0 && static_cast<size_t>(cl.body_pc) < n)
+                is_entry[cl.body_pc] = 1;
+        if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) < n)
+            is_entry[hs.fin_pc] = 1;
+    }
+    std::vector<std::vector<int>> preds(n);
+    std::vector<char> live(n, 0);
+    std::vector<int> stack;
+    for (size_t p = 0; p < n; p++) {
+        Instr &i = const_cast<Instr &>(chunk.code[p]);
+        visit_pc_fields(i, [&](int &t) {
+            if (t >= 0 && static_cast<size_t>(t) < n)
+                preds[t].push_back(static_cast<int>(p));
+        });
+        if (op_falls_through(i.op) && p + 1 < n)
+            preds[p + 1].push_back(static_cast<int>(p));
+        if (is_entry[p]) {
+            live[p] = 1;
+            stack.push_back(static_cast<int>(p));
+        }
+    }
+    while (!stack.empty()) {
+        const size_t p = static_cast<size_t>(stack.back());
+        stack.pop_back();
+        const auto reach = [&](int t) {
+            if (t >= 0 && static_cast<size_t>(t) < n && !live[t]) {
+                live[t] = 1;
+                stack.push_back(t);
+            }
+        };
+        Instr &i = const_cast<Instr &>(chunk.code[p]);
+        visit_pc_fields(i, [&](int &t) { reach(t); });
+        if (op_falls_through(i.op) && p + 1 < n)
+            reach(static_cast<int>(p + 1));
+    }
+
+    std::vector<uint32_t> in(n, 0), out(n, all);
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (size_t p = 0; p < n; p++) {
+            uint32_t v = 0;
+            if (live[p] && !is_entry[p] && !preds[p].empty()) {
+                v = all;
+                for (int q : preds[p])
+                    v &= out[q];
+            }
+            uint32_t o = v & ~kill[p];
+            if (gen_of[p] >= 0)
+                o |= uint32_t(1) << gen_of[p];
+            if (!live[p])
+                o = 0;
+            if (v != in[p] || o != out[p]) {
+                in[p] = v;
+                out[p] = o;
+                changed = true;
+            }
+        }
+    }
+
+    bool any = false;
+    for (size_t p = 0; p < n; p++) {
+        const Instr &i = chunk.code[p];
+        if (i.op != OpCode::GuardCalleeV)
+            continue;
+        const FuncDescriptor *const d = def_at(i.target2);
+        if (!d)
+            continue;
+        for (size_t f = 0; f < nf; f++)
+            if ((in[p] & (uint32_t(1) << f)) && fact_slot[f] == i.a_slot()
+                    && fact_def[f] == d) {
+                proven[p] = 1;
+                any = true;
+                break;
+            }
+    }
+    return any;
+}
+
+/*
  * C4e: the audited enumeration itself, for an emitter policy that has to
  * ask "does this op touch slot S, and how". Exported rather than copied
  * into jit.cpp for the reason jit_fwd_info/jit_struct_facts are: a second
