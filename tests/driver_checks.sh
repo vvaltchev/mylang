@@ -199,11 +199,13 @@ fi
 # must match is everything else: that the overflow happened, that it was
 # caught, and all the output around it. The caps straddle a SEG_SLOTS
 # (16384) boundary, where the budget arithmetic changes, and the shapes
-# are the ones the call tiers treat differently: plain self recursion, a
-# leaf call per level, mutual recursion, a closure call per level, and a
-# leaf called from MAIN (the frameless site's home). Its first run, in
-# its earlier depth-exact form, found two real bugs in the depth-cap
-# SWITCH materializer (docs/jit-optimizations.md).
+# are the ones the call tiers treat differently (the vacuity threshold
+# is 200, not 500: the closure-inlining splice grows viacl's frame from
+# 5 slots to 8, and cap 3001 then holds ~370 levels): plain self
+# recursion, a leaf call per level, mutual recursion, a closure call per
+# level, and a leaf called from MAIN (the frameless site's home). Its
+# first run, in its earlier depth-exact form, found two real bugs in the
+# depth-cap SWITCH materializer (docs/jit-optimizations.md).
 cat > "$TMP/sodepth.my" <<'SODEOF'
 var depth = 0;
 func leaf(int x) { var a = x + 1; var b = a * 2; return b - a; }
@@ -223,7 +225,7 @@ func run(int which) {
         if (which == 1) print(withleaf(runtime(1)));
         if (which == 2) print(ev(runtime(1)));
         if (which == 3) print(viacl(runtime(1)));
-    } catch (StackOverflowEx) { print("overflow", which, depth > 500); }
+    } catch (StackOverflowEx) { print("overflow", which, depth > 200); }
 }
 for (var w = 0; w < 4; w++) { print(leaf(w)); run(w); }
 SODEOF
@@ -490,9 +492,13 @@ fi
 # the temps' type words; in a release build NOTHING - the tag store is
 # followed straight by the residue's `lea rcx`. Both configurations are
 # asserted, so neither can rot: the poison (the net) and the elision
-# (the point).
+# (the point). The VALUE-SITE SPLICE is off for this and the W4 check
+# (MYLANG_BCINLINE_VALUE=0): since #97's closure inlining, `add(i)` is
+# inlined behind a guard and the frameless site under test survives
+# only as the guard's miss arm, in a different shape.
 if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
-    site=$("$BIN" -npc -vdj "$here/../bench/my/78_typed_param_call.my" \
+    site=$(MYLANG_BCINLINE_VALUE=0 "$BIN" -npc -vdj \
+            "$here/../bench/my/78_typed_param_call.my" \
             2>/dev/null | sed -n '/; ===== main/,$p' \
           | sed -n '/sub rsp, 144/,/call <helper>/p' \
           | sed -n '1,/call <helper>/p')
@@ -530,7 +536,8 @@ fi
 # over 78's `add(i)` site again (the closure is a W4 body: one proven
 # capture read, one add).
 if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
-    site=$("$BIN" -npc -vdj "$here/../bench/my/78_typed_param_call.my" \
+    site=$(MYLANG_BCINLINE_VALUE=0 "$BIN" -npc -vdj \
+            "$here/../bench/my/78_typed_param_call.my" \
             2>/dev/null | sed -n '/; ===== main/,$p' \
           | sed -n '/sub rsp, 144/,/call <helper>/p' \
           | sed -n '1,/call <helper>/p' \

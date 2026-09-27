@@ -2,8 +2,20 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 23.  This document describes the on-disk image exhaustively:
+Format version 24.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v24 changes no encoding: three opcodes were APPENDED - GuardCalleeV,
+LoadCaptureOfV and StoreCaptureOfV, the inline cache the bytecode splice
+builds at a value-call site (#97 closure inlining) - so a v23 binary would
+meet an opcode it does not know; see the note on version 10 below.  Their
+frame-slot operands are ALWAYS slots (the verifier refuses the literal
+flag on GuardCalleeV's `a`, LoadCaptureOfV's `a` and StoreCaptureOfV's `a`
+and `b`); GuardCalleeV's `target2` indexes `closure_defs` and its `target`
+is a pc.  The capture INDEX (LoadCaptureOfV's `target2`, StoreCaptureOfV's
+`target`) names a capture of the closure held in a slot, whose descriptor
+no static pass can name, so the loader bounds only its sign and the
+runtime refuses an index past that closure's captures.)
 
 (v23 changes no encoding: MapFilterV's `target2` gains two meaning bits.
 Bit 0 is still is_filter; bits 1-2 are the flat RESULT kind (0 none /

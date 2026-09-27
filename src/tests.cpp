@@ -16676,6 +16676,134 @@ engines_agree_bt(const char *what, const std::string &src, std::string *out)
 }
 
 /*
+ * #97 CLOSURE INLINING (plans/closure-inlining.md, increment 1): a value
+ * call whose callee the analysis names is spliced behind a guard. Every
+ * shape must render IDENTICALLY with the splice on and off, in every
+ * engine - stdout, the exception, its message and caret, the backtrace
+ * (RULE 2) - and the check must prove the splice was REACHED, since
+ * "all configurations agree" is also what a splice that fires nowhere
+ * produces:
+ *   - the compile spliced value sites (g_bc_inline_value_splices);
+ *   - the emitted guard fell through into the inlined body at run time
+ *     (g_jit_guard_hits), and the proven-scalar capture copy ran
+ *     (g_jit_capof_fast) - both bumped by EMITTED code only.
+ * Shapes: a mutable capture persisting across calls AND two closures of
+ * one factory keeping separate captures; exact `int` and widening
+ * `float` typed binds; a REFERENCE capture read and written (the helper
+ * arm, refcounted); a discarded result; a throw inside the inlined body
+ * on a WARMED iteration; a bind coercion refusing a dyn argument.
+ */
+static bool
+closure_inline_parity()
+{
+#if ML_UNTRUSTED_CHECKS
+    /* this check compiles its OWN programs, so it runs trusted - but the
+     * harness loads .myv images earlier in the same process, and that
+     * flag is never cleared (serialize.cpp); left set it would send every
+     * explicit-closure capture op to its helper arm (capof_fast) */
+    struct Trusted {
+        bool saved = g_untrusted_bytecode;
+        Trusted() { g_untrusted_bytecode = false; }
+        ~Trusted() { g_untrusted_bytecode = saved; }
+    } trusted;
+#endif
+    static const char *const progs[][2] = {
+        { "counter",
+          "func mk(int s) { var c = s;\n"
+          "  return func [c] () { c++; return c; }; }\n"
+          "var a = mk(runtime(10)); var b = mk(runtime(100));\n"
+          "var t = 0;\n"
+          "for (var i = 0; i < 50; i++) { t = t + a() + a() + b(); }\n"
+          "print(t, a(), b());\n" },
+        { "typed binds",
+          "func ma(int base) {\n"
+          "  return func [base] (int k) { return base + k; }; }\n"
+          "func ms(float f) {\n"
+          "  return func [f] (float x) { return f * x; }; }\n"
+          "var add = ma(runtime(7)); var sc = ms(runtime(0.5));\n"
+          "var s = 0; var u = 0.0;\n"
+          "for (var i = 0; i < 40; i++) { s = s + add(i); u = u + sc(i); }\n"
+          "print(s, u);\n" },
+        { "reference capture",
+          "func mka(int n) { var a = [n, n + 1];\n"
+          "  return func [a] () { return a; }; }\n"
+          "func mks(str s0) { var s = s0;\n"
+          "  return func [s] (str x) { s = x; return s; }; }\n"
+          "var g = mka(runtime(3)); var h = mks(runtime(\"x\"));\n"
+          "var tot = 0; var last = \"\";\n"
+          "for (var i = 0; i < 20; i++) {\n"
+          "  var q = g(); tot = tot + q[0] + q[1]; last = h(str(i)); }\n"
+          "print(tot, last, h(\"end\"));\n" },
+        { "discarded result",
+          "func mk(int s) { var c = s;\n"
+          "  return func [c] () { c++; return c; }; }\n"
+          "var a = mk(runtime(0));\n"
+          "for (var i = 0; i < 30; i++) { a(); }\n"
+          "print(a());\n" },
+        { "throw in the body (warmed)",
+          "func mkd(int d) {\n"
+          "  return func [d] (int x) { return d / (x - 3); }; }\n"
+          "var h = mkd(runtime(100)); var z = 0;\n"
+          "for (var i = 0; i < 6; i++) { z = z + h(i); }\n"
+          "print(z);\n" },
+        { "bind coercion refused",
+          "func ma(int base) {\n"
+          "  return func [base] (int k) { return base + k; }; }\n"
+          "var add = ma(runtime(7)); var s = 0;\n"
+          "for (var i = 0; i < 5; i++) { s = s + add(i); }\n"
+          "var dyn v = runtime(\"x\");\n"
+          "print(s, add(v));\n" },
+    };
+    bool ok = true;
+    for (const auto &p : progs) {
+        const std::string src = p[1];
+        int v = 0;
+        const std::string ref = engine_run_bt(src, ExecEngine::TreeWalk,
+                                              false, false, true, &v);
+        const unsigned long s0 = g_bc_inline_value_splices;
+#if ML_JIT_SUPPORTED
+        const unsigned long h0 = g_jit_guard_hits;
+#endif
+        const struct { const char *name; bool jit, splice; } cfgs[] = {
+            { "vm -nbi", false, false }, { "jit -nbi", true, false },
+            { "vm", false, true }, { "jit", true, true },
+        };
+        for (const auto &c : cfgs) {
+            const std::string got = engine_run_bt(src, ExecEngine::Vm,
+                                                  c.jit, c.splice, true, &v);
+            if (got != ref) {
+                cout << "  closure_inline_parity [" << p[0] << "] "
+                     << c.name << " differs from the tree-walker:\n--- tw\n"
+                     << ref << "--- " << c.name << "\n" << got;
+                ok = false;
+            }
+        }
+        if (g_bc_inline_value_splices == s0) {
+            cout << "  closure_inline_parity [" << p[0]
+                 << "]: no value site was spliced - the shape is vacuous\n";
+            ok = false;
+        }
+#if ML_JIT_SUPPORTED
+        if (g_jit_guard_hits == h0) {
+            cout << "  closure_inline_parity [" << p[0]
+                 << "]: no emitted guard fell into an inlined body\n";
+            ok = false;
+        }
+#endif
+    }
+#if ML_JIT_SUPPORTED
+    /* the proven-scalar capture copy (not the helper) served the counter */
+    const unsigned long c0 = g_jit_capof_fast;
+    engine_run_bt(progs[0][1], ExecEngine::Vm, true, true);
+    if (g_jit_capof_fast == c0) {
+        cout << "  closure_inline_parity: the inline capture copy never ran\n";
+        ok = false;
+    }
+#endif
+    return ok;
+}
+
+/*
  * #44: a function a BUILTIN calls back (a comparator, a key, a generator)
  * has no call op of its own, so every engine captured its backtrace frame
  * LOC-LESS and the frame BELOW it - the function that called the builtin
@@ -22790,8 +22918,22 @@ static bool jit_frameless_calling()
  *      as int. A capture-to-capture copy of a `true` must still print
  *      `true`, not `1` (bug #108's shape).
  */
+/*
+ * #97 closure inlining: a call-PROTOCOL test reaches its tier (the
+ * frameless call, the capture base, capture forwarding, the coercing
+ * bake) through a CLOSURE call - and the value splice now inlines exactly
+ * those, leaving the tier nothing to run. Such a test holds the value
+ * splice off for its duration; it tests the call, not the splice.
+ */
+struct ValueSpliceOff {
+    bool saved = g_bc_inline_value_enabled;
+    ValueSpliceOff() { g_bc_inline_value_enabled = false; }
+    ~ValueSpliceOff() { g_bc_inline_value_enabled = saved; }
+};
+
 static bool jit_capture_fwd()
 {
+    ValueSpliceOff vso;   /* #97: a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -22924,6 +23066,7 @@ static bool jit_capture_fwd()
  */
 static bool jit_capbase_pinned()
 {
+    ValueSpliceOff vso;   /* #97: a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -27650,6 +27793,116 @@ static bool myv_ref_slots_derived()
  * be a MyvError by name. Watched failing: with the check removed both
  * loads were accepted.
  */
+/*
+ * #97 closure inlining: THE GUARD IS WHAT MAKES A SPLICE SOUND ON AN
+ * IMAGE. In a program we compiled the guard can only hit - the analysis
+ * named the one closure that reaches the site. In a loaded image nothing
+ * is ours to trust (#137), and the dangerous case is not a wrong def in
+ * the guard (that only decides hit or miss) but a DIFFERENT CLOSURE in
+ * the callee slot than the one whose body was inlined: that body would
+ * read and write captures of an object it knows nothing about.
+ *
+ * So the image is tampered the way a mutation could: the two factory
+ * calls are swapped, and each site now receives the OTHER closure - a
+ * counter (writes its capture) where a doubler (reads its) was named,
+ * and back. Every guard must MISS and run the original call, so the
+ * tampered image must print exactly what the same tampered program
+ * prints with the value splice OFF. Watched failing: a guard that always
+ * hits runs the counter's body over the doubler's capture.
+ */
+static bool myv_closure_guard_tamper()
+{
+    const char *lines_arr[] = {
+        "func mk(int s) { var c = s;",
+        "  return func [c] () { c++; return c; }; }",
+        "func md(int b) { var base = b;",
+        "  return func [base] () { return base * 2; }; }",
+        "var a = mk(runtime(10)); var d = md(runtime(7));",
+        "var t = 0;",
+        "for (var i = 0; i < 30; i++) { t = t + a() + d(); }",
+        "print(t, a(), d());" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-guard-tamper.myv";
+    const auto run_image = [&](const VmProgram &prog) -> std::string {
+        myv_write(prog, path, MyvSourceRef());
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(loaded);
+        } catch (Exception &e) {
+            cap << "EXC " << e.name << "\n";
+        }
+        std::cout.rdbuf(old_buf);
+        return cap.str();
+    };
+    /* compile, swap the two factory calls (the only CallVs in main),
+     * and run the image; `guards` reports how many guards it held */
+    const auto tampered_run = [&](bool splice, size_t &guards)
+        -> std::string {
+        const bool sv = g_bc_inline_value_enabled;
+        g_bc_inline_value_enabled = splice;
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        g_bc_inline_value_enabled = sv;
+        std::vector<size_t> calls;
+        guards = 0;
+        for (size_t p = 0; p < prog.root.code.size(); p++) {
+            if (prog.root.code[p].op == OpCode::CallV)
+                calls.push_back(p);
+            else if (prog.root.code[p].op == OpCode::GuardCalleeV)
+                guards++;
+        }
+        if (calls.size() != 2)
+            return "SHAPE: " + std::to_string(calls.size()) + " calls";
+        std::swap(prog.root.code[calls[0]].target2,
+                  prog.root.code[calls[1]].target2);
+        return run_image(prog);
+    };
+    try {
+        size_t g_on = 0, g_off = 0;
+        const std::string spliced = tampered_run(true, g_on);
+        const std::string plain = tampered_run(false, g_off);
+        if (g_on < 2 || g_off != 0) {
+            fprintf(stderr, "myv_closure_guard_tamper: %zu guards spliced, "
+                            "%zu with the splice off - the shape is "
+                            "vacuous\n", g_on, g_off);
+            ok = false;
+        }
+        if (plain.empty() || plain.find("SHAPE") != std::string::npos
+                || spliced != plain) {
+            fprintf(stderr, "myv_closure_guard_tamper: splice off \"%s\", "
+                            "spliced \"%s\"\n", plain.c_str(),
+                    spliced.c_str());
+            ok = false;
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_closure_guard_tamper: %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
 static bool myv_root_slot_count_checked()
 {
     const char *lines_arr[] = {
@@ -31892,6 +32145,13 @@ static bool opcode_table_census()
           "r0: emitted only by the foreach lowering, never an arg" },
         { OpCode::ArrEpochCheck,         1,1,1,0,0,0,
           "d1: its raise CONVEYS with the exc-stamped caret" },
+        { OpCode::GuardCalleeV,          1,1,1,0,0,0,
+          "r0/b0: emitted only BY the splice, after the retarget "
+          "peephole; a spliced body never holds one (pristine snapshot)" },
+        { OpCode::LoadCaptureOfV,        1,1,1,0,0,0,
+          "d1: its helper arm CONVEYS an image's refused operand" },
+        { OpCode::StoreCaptureOfV,       1,1,1,0,0,0,
+          "d1: its helper arm CONVEYS an image's refused operand" },
     };
     const size_t nrows = sizeof(rows) / sizeof(rows[0]);
     const Chunk ck;      /* empty - census_instr never makes a shape
@@ -32521,6 +32781,7 @@ static bool jit_cached_probe_elided()
  */
 static bool jit_bake_coercing()
 {
+    ValueSpliceOff vso;   /* #97: a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -33161,6 +33422,7 @@ static bool native_mark_empty(const std::string &dump,
  */
 static bool jit_frameless_w2_shape()
 {
+    ValueSpliceOff vso;   /* #97: a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -34526,6 +34788,7 @@ static bool jit_call_seam_is_total()
  */
 static bool jit_frameless_call_reach()
 {
+    ValueSpliceOff vso;   /* #97: a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -44590,6 +44853,7 @@ static bool jit_counter_coverage()
 
 static bool jit_op_nativized()
 {
+    ValueSpliceOff vso;   /* #97: a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -47583,6 +47847,10 @@ static const std::vector<extra_check> extra_checks =
     { "myv: v19 - the root chunk's slot_count and the stored root slot "
       "count must agree, either copy mutated is refused",
       myv_root_slot_count_checked },
+    { "myv: #97 closure inlining - an image whose callee slot holds a "
+      "DIFFERENT closure than the inlined one runs right (the guard "
+      "misses, the original call runs)",
+      myv_closure_guard_tamper },
     { "myv: the verifier bounds a planned ctor's mini-run (small-938, a "
       "load-time HANG)", myv_verify_ctor_minirun },
     { "jit: #97 inc 3 (W1/W2) - the CALLER builds the frameless window "
@@ -47957,6 +48225,10 @@ static const std::vector<extra_check> extra_checks =
     { "backtrace: a WARMED inline call whose callee throws keeps the "
       "callee frame's call site (tw == vm; the -2 conveyance stamp)",
       vm_warmed_throw_backtrace_parity },
+    { "call: #97 closure inlining - a guarded value-site splice renders "
+      "identically with the splice on and off in every engine (output, "
+      "exception, caret, backtrace) and reaches its emitted code",
+      closure_inline_parity },
     { "backtrace: typed-chain inlined-frame parity (#75)",
       typed_inlined_backtrace_parity },
     { "backtrace: a recursion inlined into itself renders identically "

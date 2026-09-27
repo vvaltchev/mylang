@@ -1,6 +1,10 @@
 # Closure inlining - a GUARDED splice at value-call sites (#97)
 
-Status: **DESIGN, scoped from measurement (2026-09-28).** Maintainer's
+Status: **INCREMENT 1 DONE (2026-09-27)** - record and measurements in
+docs/jit-optimizations.md, *#97 CLOSURE INLINING, INCREMENT 1*: 11
+-28.6% cycles (57 -> 40 instr/iter, vs the ~15 predicted: the staging
+and result MoveVs remain), 78 -8.5%, 63 -10.5%. Increments 2-5 not
+started. Designed from measurement (2026-09-27). Maintainer's
 call: this replaces the call-protocol store trimming (R5/R6 both measured
 flat and are parked on `r5-offpath-framefree` / `r6-return-forward`).
 

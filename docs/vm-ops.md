@@ -287,7 +287,46 @@ same plain/compound/inc-dec `aop` split, no defined check (a capture is always
 defined - snapshot at closure creation). So a closure BODY is now fully native
 (the capture write was its last `EvalStmt`); 0-bench (the `do_func_call` call
 overhead, engine-neutral, dominates a counter loop) but it completes the
-slot-write family (local / global / capture). An **array LITERAL**
+slot-write family (local / global / capture).
+
+**#97 CLOSURE INLINING - THE INLINE CACHE (2026-09-28, plans/closure-
+inlining.md).** Codegen proper never emits these three; the bytecode
+SPLICE does, at a `CallValueV` site whose `value_callees` names ONE
+closure (`bc_inline_chunk`, main included, as `value_only`):
+
+    guard.callee  fn is closure_defs[D], else Lcall   (GuardCalleeV)
+    <binds: MoveV, or CoerceNumV for an int/float parameter>
+    <D's body, slots re-based; ReturnV -> MoveV dst + Jump join>
+    jmp           join
+  Lcall:
+    call.val      dst = fn(args)                      (the ORIGINAL op)
+  join:
+
+**`GuardCalleeV`** (`a` = the callee SLOT, always a slot; `target2` = a
+`closure_defs` index; `target` = the else-pc) falls through iff the slot
+holds a FuncObject whose `func` IS that descriptor. It never throws and
+is kept even though the analysis proves it true: on a loaded image the
+callee in the slot is input, and its miss arm is the untouched call.
+**`LoadCaptureOfV`** (`target` = dst, `target2` = the capture index,
+`a` = the closure's slot) and **`StoreCaptureOfV`** (`a` = the value,
+`target` = the index, `b` = the closure's slot; PLAIN only) are the
+capture ops with an EXPLICIT closure: the inlined body runs in the
+CALLER's frame, whose `ctx.captures` is the caller's own, so the splice
+rewrites each `LoadCaptureV`/`StoreCaptureV` of the body to reach the
+closure through the slot the guard checked. `cap_scalar` carries over.
+The VM reaches the capture through `vm_closure_capture`, which refuses
+a non-function slot or an out-of-range index on a loaded image (the
+capture index belongs to the closure's def, which no static pass can
+name, so `verify_chunk` bounds only its sign). The JIT shares the
+`LoadCaptureV`/`StoreCaptureV` emitters - the proven-scalar copy and
+lever A's producer/consumer arms - with the capture array loaded from
+the FuncObject (`emit_capof_base`) instead of the ctx chain; a boxed
+capture, a reference-listed dst and any loaded image take the status
+helpers `jit_load_capture_of` / `jit_store_capture_of`, which convey.
+`MYLANG_JIT_COLD=guard` forces every guard to MISS (the original call)
+- in our own compilation that arm is otherwise unreachable.
+
+An **array LITERAL**
 `[a, b, ..]` whose elements aren't all const (a fully-const *scalar* one is a
 baked `LoadConstV`) builds native via **`MakeArrayV`**: the element expressions
 compile into a

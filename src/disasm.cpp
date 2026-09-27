@@ -2188,6 +2188,19 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "jmp.notnone  " << RI(in.a(), false) << ", L" << in.target
                 << "   ; ?? short-circuit";
             break;
+        case OpCode::GuardCalleeV:
+            row << "guard.callee " << D(in.a_slot()) << " is closure_defs["
+                << in.target2 << "], else L" << in.target
+                << "   ; inlined value call";
+            break;
+        case OpCode::LoadCaptureOfV:
+            row << "load.capof   " << D(in.target) << ", "
+                << D(in.a_slot()) << ".cap[" << in.target2 << "]";
+            break;
+        case OpCode::StoreCaptureOfV:
+            row << "store.capof  " << D(in.b_slot()) << ".cap[" << in.target
+                << "] = " << RI(in.a(), false);
+            break;
         case OpCode::Halt:
             row << "halt";
             break;
@@ -2378,6 +2391,8 @@ std::string disassemble_program(const Block *root)
         if (it != chunks.end())
             bc_inline_chunk(it->second, slot_desc, bc_snaps);
     }
+    /* #97 closure inlining: main's VALUE sites, as vm_precompile_all */
+    bc_inline_chunk(main_ck, slot_desc, bc_snaps, /*value_only=*/true);
 
     /* Pass B: the native tier through the ONE driver (vm_jit_program,
      * vm.h) - the frameless pre-pass over main, every body with its own

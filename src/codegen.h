@@ -413,7 +413,8 @@ void verify_chunk(const Chunk &chunk, const ChunkLimits &lim);
  * visit_pc_fields) have all gone stale at least once when an op was added;
  * here that failure mode costs an optimization and nothing else.
  */
-bool bc_inline_callee_ok(const Chunk &callee, std::string *why);
+bool bc_inline_callee_ok(const Chunk &callee, std::string *why,
+                         bool captures_ok = false);
 
 /* The splice's per-OP whitelist behind bc_inline_callee_ok, exported for
  * the #98 census ratchet (opcode_table_census, tests.cpp), which walks
@@ -466,6 +467,10 @@ struct BcInlineSnapshot {
     int slot_count = 0;
     int n_temps = 0;
     bool eligible = false;
+    /* #97 closure inlining: eligible for a VALUE-call site, whose body may
+     * also read and plainly write its captures (bc_inline_callee_ok's
+     * `captures_ok`) */
+    bool value_eligible = false;
 };
 typedef std::unordered_map<const Chunk *, BcInlineSnapshot> BcInlineSnapshots;
 
@@ -487,16 +492,19 @@ void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out);
  */
 bool bc_inline_chunk(Chunk &ck,
                      const std::vector<const FuncDescriptor *> &slot_desc,
-                     const BcInlineSnapshots &snaps);
+                     const BcInlineSnapshots &snaps,
+                     bool value_only = false);
 
 /* The splice's kill switch (-nbi / MYLANG_BCINLINE=0): the same-binary
  * A/B, since the un-inlined bytecode is the only oracle for a splice. */
 extern bool g_bc_inline_enabled;
+extern bool g_bc_inline_value_enabled;   /* #97 closure inlining */
 
 /* Execution proof for the caller-frame path - see codegen.cpp. */
 extern unsigned long g_bc_inline_caller_frames;
 /* Total call sites spliced - the shape matrix's non-vacuity check. */
 extern unsigned long g_bc_inline_splices;
+extern unsigned long g_bc_inline_value_splices;   /* #97 closure inlining */
 extern unsigned long g_ref_slots_proven_excluded;   /* C3 (TESTS) */
 /*
  * #97: slots the MoveV rule kept OUT of `ref_slots` - a move's dst is a

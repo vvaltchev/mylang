@@ -159,7 +159,7 @@ lsra capbase frameless capprot"
 # caller has expressed no preference; a real ASAN_OPTIONS always wins.
 : "${ASAN_OPTIONS:=hard_rss_limit_mb=8000}"
 export ASAN_OPTIONS
-COLD_TIERS="refstore"
+COLD_TIERS="refstore guard"
 # ⛔ DERIVED FROM THE BINARY, NOT HARDCODED (2026-08-18). This was
 # `XROTS="0 1 2 3"`, a literal, and the whole point of the mode is that
 # `take_reg` scans the pool in preference order so its LAST member gets

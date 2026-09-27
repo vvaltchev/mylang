@@ -1269,6 +1269,15 @@ extern "C" int jit_unary(const void *bop) noexcept;
 extern "C" int jit_coerce_num(int_type dst, int_type src_slot,
                               int is_float) noexcept;
 
+/* #97 closure inlining: LoadCaptureOfV / StoreCaptureOfV's helper arm -
+ * capture `idx` of the closure in frame slot `fn_slot`, through the
+ * interpreter's checked vm_closure_capture. 0 = done; 1 = a conveyed
+ * RuntimeException in g_vm_jit_exc (EnterNative re-raises). */
+extern "C" int jit_load_capture_of(int_type dst, int_type fn_slot,
+                                   int_type idx) noexcept;
+extern "C" int jit_store_capture_of(int_type fn_slot, int_type idx,
+                                    int_type src) noexcept;
+
 /* model-flip (nativize-ops): CallBuiltinV - a value-ABI read-only builtin call.
  * `bc` is a baked `&chunk.builtin_calls[idx]` (func_v ptr + arg carets). Args
  * are copied from frame slots [base, base+n); a throw catches into g_vm_jit_exc
@@ -1537,6 +1546,12 @@ extern "C" unsigned long g_jit_hoist2;        /* C2b: second-base preheader
 extern "C" unsigned long g_jit_capbase;       /* #112: fragment entries with
                                                * ctx->captures->data() pinned
                                                * for the run */
+/* #97 closure inlining (bumped by EMITTED code): guards that fell into
+ * the inlined body; explicit-closure capture accesses served by the
+ * inline copy; CoerceNumV inline-arm executions */
+extern "C" unsigned long g_jit_guard_hits;
+extern "C" unsigned long g_jit_capof_fast;
+extern "C" unsigned long g_jit_coerce_fast;
 /* SP: every emitted call goes through Emitter::call_direct or
  * call_reg; this counts them, and `spcheck_sites` the MYLANG_JIT_SPCHECK
  * runtime alignment checks emitted beside them. */
