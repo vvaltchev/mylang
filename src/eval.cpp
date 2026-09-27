@@ -4846,7 +4846,7 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
      * itself, not at the whole `lhs = rhs` assignment. */
     EvalValue rval_storage;
     try {
-        rval_storage = RValue(rvalue->eval(ctx));
+        rval_storage = literal_widen(RValue(rvalue->eval(ctx)), rv_coerce);
     } catch (Exception &e) {
         stamp_operand_loc(rvalue.get(), e);
         throw;
@@ -5077,7 +5077,8 @@ EvalValue ContinueStmt::do_eval(EvalContext *ctx, bool rec) const
 EvalValue ReturnStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     /* RValue() throws UndefinedVariableEx (with this stmt's loc) if needed */
-    ctx->flow->value = elem ? RValue(elem->eval(ctx)) : none;
+    ctx->flow->value = elem
+        ? literal_widen(RValue(elem->eval(ctx)), ret_coerce) : none;
     ctx->flow->type = FlowState::ret;
     return none;
 }
@@ -5372,7 +5373,9 @@ EvalValue Subscript::do_eval(EvalContext *ctx, bool rec) const
         );
     }
 
-    return t->subscript(lval, RValue(index->eval(ctx)), for_write);
+    return t->subscript(lval,
+                        literal_widen(RValue(index->eval(ctx)), key_coerce),
+                        for_write);
 }
 
 /*
@@ -5967,6 +5970,12 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
     /* the VALUES widen as LiteralArray's elements do: by the stamp, or -
      * a fully CONSTANT literal - by their own join */
     const auto widen_vals = [&](EvalValue *buf) {
+        if (key_coerce != DeclType::none) {
+            for (size_t i = 0; i < np; i++)
+                buf[2 * i] = literal_widen(std::move(buf[2 * i]), key_coerce);
+        } else if (is_const && ctx->in_const_eval()) {
+            const_values_widen(buf, np, 2, ctx->const_ctx);
+        }
         if (val_coerce != DeclType::none) {
             for (size_t i = 0; i < np; i++)
                 buf[2 * i + 1] =

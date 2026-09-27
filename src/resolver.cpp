@@ -1378,6 +1378,12 @@ public:
             auto it = global_func_slots.find(id->uid);
             if (it != global_func_slots.end()) {
                 id->sym = ResolvedSym{ SymKind::global, it->second };
+                /* ...and its declared type, as resolve_ref carries it to a
+                 * use in the declaring function: a function's `gl = v`
+                 * into a `float gl` must coerce the int like main's does */
+                auto dt = global_decl_types.find(id->uid);
+                if (dt != global_decl_types.end())
+                    id->decl_type = dt->second;
                 continue;
             }
             stamp_builtin(id);
@@ -2327,6 +2333,8 @@ private:
      * compare. */
     std::vector<const UniqueId *> guarded;
     std::vector<EscapedRef> escaped_refs;
+    /* a top-level variable's declared type, by name, for the escaped uses */
+    std::unordered_map<const UniqueId *, DeclType> global_decl_types;
     /*
      * The GLOBAL table: every top-level function (hoisted up front so a forward
      * / mutually-recursive reference resolves) AND every top-level variable a
@@ -2484,6 +2492,7 @@ private:
             cur->scopes.back().decls.push_back(
                 { id->uid, gslot, SymKind::global, id->decl_type });
             id->sym = ResolvedSym{ SymKind::global, gslot };
+            global_decl_types[id->uid] = id->decl_type;
             return;
         }
 
