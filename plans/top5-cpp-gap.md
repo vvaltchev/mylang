@@ -860,10 +860,14 @@ wall. Reach: `cb_raw` in `MYLANG_JITSTATS`; `invoker_call_tiers`
 asserts the raw count per shape, and that a coercing param, an opt tail
 and boxed elements (map) never take it.
 
-**Open siblings:** map/filter/find/sum pass BOXED elements
-(`arr_elem_at`), so they do not reach the raw bind yet - a flat-array
-arm passing the raw element would (35_map_filter is the worst callback
-bench, ~9x C++). The post-call ref_slots release scan (26 Ir per call
+**CB2 (same day): map/filter pass a FLAT array's raw element** (the
+kind re-read per step, like the #49 size, since the callback may
+promote the array). 35_map_filter -8.8% Ir (289M -> 264M), **0.92x**
+wall - from the `map` half only: `map` returns a GENERAL array even for
+an all-int result, so `filter` still walks boxed elements.
+**Open siblings:** `map`'s result storage (a flat result for a proven
+array<int> - the make_array precedent - would put `filter` on the raw
+path too); find/sum still pass boxed elements. The post-call ref_slots release scan (26 Ir per call
 on 34, two int params seeded as references because a lambda's params
 are never C3-proven) is the next measured cost.
 
