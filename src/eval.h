@@ -851,12 +851,28 @@ public:
     }
 
     /* #97 R2b: an int/float/bool capture, copied by its payload word
-     * (EvalValue::copy_scalar_word says why) - no temporary */
+     * (EvalValue::ScalarWord says why) - no temporary */
     void emplace_scalar(const EvalValue &v) {
         ML_CHECK(n < cap);
-        LValue *lv = new (ptr + n) LValue();
-        lv->init_scalar(v);
+        new (ptr + n) LValue(EvalValue::ScalarWord(), v);
         n++;
+    }
+
+    /*
+     * #97 R2c: the ONE-capture closure - every capture list in the
+     * corpus names one variable. Straight into the inline buffer: no
+     * reserve, no loop, the count written once instead of bumped
+     * through memory. `is_scalar` picks the word copy.
+     */
+    void set_single(const EvalValue &v, bool is_scalar) {
+        ML_CHECK(n == 0 && cap == 0);
+        ptr = inline_slots();
+        if (is_scalar)
+            new (ptr) LValue(EvalValue::ScalarWord(), v);
+        else
+            new (ptr) LValue(v, false);
+        n = 1;
+        cap = inline_cap;
     }
 
     /*
@@ -961,6 +977,12 @@ public:
     struct LocalCaptures { };
     FuncObject(const FuncDescriptor *func, EvalContext *root,
                const LValue *frame, LocalCaptures);
+    /* #97 R2c: exactly ONE local capture, `src` its source slot - a
+     * straight-line constructor for its own helper, so the many-capture
+     * loop's register pressure is not paid on every closure */
+    struct OneLocal { };
+    FuncObject(const FuncDescriptor *func, EvalContext *root,
+               const LValue &src, OneLocal);
     FuncObject(const FuncObject &rhs);
 #ifdef TESTS
     /*

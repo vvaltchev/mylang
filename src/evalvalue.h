@@ -258,6 +258,28 @@ public:
         : val(), type(AllTypes[Type::t_none]) { }
 
     /*
+     * #97 R2b: an int/float/bool copied through ONE 8-byte payload word
+     * (all three live in the union's first word; a bool's ctor zeroes
+     * the whole word). The ordinary copy moves the whole 24-byte union
+     * with a 16-byte load, and when `src` is a frame slot the emitted
+     * code wrote a moment ago as separate 8-byte stores, that load
+     * cannot be forwarded from the store buffer and stalls every time.
+     * Each word of the new value is written ONCE.
+     */
+    struct ScalarWord { };
+    EvalValue(ScalarWord, const EvalValue &src)
+        : val(scalar_word(src)), type(src.type)
+    {
+        ML_CHECK(src.type->t == Type::t_int || src.type->t == Type::t_float
+                 || src.type->t == Type::t_bool);
+    }
+    static int_type scalar_word(const EvalValue &src) {
+        int_type w;
+        std::memcpy(&w, static_cast<const void *>(&src.val), sizeof w);
+        return w;
+    }
+
+    /*
      * Constructor accepting bool. SFINAE is used to prevent implicit
      * conversions from pointer types.
      */
@@ -370,25 +392,6 @@ public:
         std::memcpy(static_cast<void *>(this), &src, sizeof(EvalValue));
     }
 
-    /*
-     * #97 R2b: copy an int/float/bool from `src` into this TRIVIAL value
-     * through ONE 8-byte payload word (all three live in the union's
-     * first word; a bool's ctor zeroes the whole word first). The
-     * ordinary copy moves the whole 24-byte union with a 16-byte load,
-     * and when `src` is a frame slot the emitted code wrote a moment
-     * ago as separate 8-byte stores, that load cannot be forwarded
-     * from the store buffer and stalls every time.
-     */
-    void copy_scalar_word(const EvalValue &src) {
-        ML_CHECK(type->t < Type::t_str
-                 && (src.type->t == Type::t_int
-                     || src.type->t == Type::t_float
-                     || src.type->t == Type::t_bool));
-        uint64_t w;
-        std::memcpy(&w, static_cast<const void *>(&src.val), sizeof w);
-        std::memcpy(static_cast<void *>(&val), &w, sizeof w);
-        type = src.type;
-    }
 
     /*
      * #121: reset the tag to `none` AFTER the payload has already been moved
@@ -770,6 +773,14 @@ public:
         type_checks();
     }
 
+    /* #97 R2b: an int/float/bool slot, each word written once */
+    LValue(EvalValue::ScalarWord t, const EvalValue &src)
+        : val(t, src)
+        , container(nullptr)
+        , is_const(false)
+        , borrowed(false)
+    { }
+
     LValue(EvalValue &&val, bool is_const)
         : val(std::move(val))
         , container(nullptr)
@@ -901,13 +912,7 @@ public:
      * dst is never borrowed (a written parameter is never non-escaping),
      * and its container/flags are those of a frame local.
      */
-    /* #97 R2b: a freshly default-constructed slot takes an
-     * int/float/bool by its payload word (EvalValue::copy_scalar_word) */
-    void init_scalar(const EvalValue &v) {
-        val.copy_scalar_word(v);
-    }
-
-        void drop_for_overwrite() {
+    void drop_for_overwrite() {
         ML_CHECK(!borrowed);
         val.drop_in_place();
     }

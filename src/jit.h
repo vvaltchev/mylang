@@ -1068,6 +1068,9 @@ extern "C" void *jit_make_closure_ptr(const void *def) noexcept;
  * count 1; cannot throw */
 extern "C" void *jit_make_closure_locals(const void *def,
                                          const LValue *frame) noexcept;
+/* #97 R2c: exactly one local capture - (def, &its source slot) */
+extern "C" void *jit_make_closure_1(const void *def,
+                                    const LValue *src) noexcept;
 
 /* model-flip (nativize-ops): MakeArrayV natively - build an array LITERAL from
  * the element run [base, base+n) via the shared build_array_from_values, honoring

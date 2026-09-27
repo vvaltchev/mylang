@@ -15062,3 +15062,30 @@ with a WIDER load stalls whenever the stores are still in flight. R1
 met it through a stack temporary, R2b through the source slot itself.
 Any helper that reads a slot the emitted code just wrote is a
 candidate.
+
+## #97 R2c - A ONE-CAPTURE CLOSURE HAS ITS OWN HELPER (2026-09-26)
+
+After R2b the pinned top-down said 63_closures was STORE-bound (23.6%
+of slots, `EXE_ACTIVITY.BOUND_ON_STORES`): 181 stores per iteration,
+28% of all instructions. The construction helper was ~25 of them per
+closure, and its disassembly showed why: six callee-saved pushes and
+pops (the many-capture loop's register pressure, paid on every
+closure), the generic `reserve`, a count bumped through memory, and a
+slot default-initialised and then overwritten.
+
+Every capture list in the corpus names ONE variable, and the emitter
+knows the count at emit time. So a one-capture closure calls
+`jit_make_closure_1(def, &source slot)` -> the straight-line
+`FuncObject(func, root, src, OneLocal)` -> `CaptureSlots::set_single`
+(the inline buffer, `n`/`cap` written once); a scalar is built by the
+write-once `LValue(EvalValue::ScalarWord, src)` (R2b's word copy as a
+constructor, so no word is stored twice). The helper spills one
+register instead of six. Two or more captures keep
+`jit_make_closure_locals`.
+
+Pinned P-core, scale 10, against R2b: instructions **-11.9%**, stores
+**-9.9%** (363M -> 327M), cycles **-4.5%** (medians ~230M -> ~219.5M;
+~307M before R1 - **-28.5%** over R1-R2c). Net: R2b's five-mode test
+gained a TWO-capture factory; watched failing both ways - the
+one-capture helper reading the wrong slot aborts the suite, the
+many-capture one shifted by a slot fails 6 tests per JIT mode.

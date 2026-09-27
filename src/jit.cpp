@@ -22490,7 +22490,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         for (const auto &cap : mc_def->captures)
             mc_locals = mc_locals && cap.kind == SymKind::local;
         emit_call_prologue(e);
-        if (mc_locals) {
+        /* #97 R2c: exactly one local capture -> its own straight-line
+         * helper, handed the source slot directly */
+        const bool mc_one = mc_locals && mc_def->captures.size() == 1;
+        if (mc_one) {
+            e.movabs(RDI, reinterpret_cast<uint64_t>(mc_def));
+            e.lea(RSI, static_cast<int32_t>(                 /* reg:abi */
+                mc_def->captures[0].slot
+                * static_cast<int32_t>(sizeof(LValue))));
+        } else if (mc_locals) {
             e.movabs(RDI, reinterpret_cast<uint64_t>(mc_def));
             e.lea(RSI, 0);                       /* reg:abi: &slot 0 */
         } else if (mc_s1 >= 0) {
@@ -22505,7 +22513,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                      reinterpret_cast<uint64_t>(ck.closure_defs[in.target2]));
         }
         e.call_direct(
-            mc_locals
+            mc_one
+                ? reinterpret_cast<const void *>(jit_make_closure_1)
+            : mc_locals
                 ? reinterpret_cast<const void *>(jit_make_closure_locals)
             : mc_s1 >= 0
                 ? reinterpret_cast<const void *>(jit_make_closure_ptr)
