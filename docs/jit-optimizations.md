@@ -15504,3 +15504,20 @@ cheaper or to run it less often:
  - increment 4's local proof (the closure is created in the same
    chunk) removes it outright, but reaches neither 11 nor 78, whose
    closures come from a factory CALL.
+
+**G2 - THE SHORTER GUARD (2026-09-27).** Both compares now read memory:
+`cmp qword [slot.type], t_func` (one instruction on the arena; the
+movabs pair off it, through `cmp_mem_tag`) and `cmp [fo + func], D`, so
+the only register load left is the FuncObject pointer - 6 instructions
+where the load-then-compare form took 8. All three dependent loads
+remain, so the cycle effect is small, as predicted. Pinned, scale 3,
+twice each, against step 1b:
+
+    bench  instructions   cycles
+    11     -6.0%          -1.5% (23.8/23.0M -> 23.3/22.7M)
+    78     -5.7%          -0.8% (35.7/35.8M -> 35.5/35.4M)
+    63     -1.3%          flat
+
+`-rt` 2086/2086 in all five modes; `corpus_diff --cold --nolowmem`
+51/51 in every configuration (the off-arena rows run the register
+fallback of both compares, `COLD=guard` the miss arm).
