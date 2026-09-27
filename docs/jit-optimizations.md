@@ -15702,3 +15702,121 @@ only after the case's dst was made to hold a STALE value first: a fresh
 store base remapped like a frame slot (both). Three call-protocol tests
 reached their tier through a two-closure array - the shape this now
 inlines - and hold `ValueSpliceOff` (the CLAUDE.md rule for such tests).
+
+**#97 CLOSURE INLINING, INCREMENT 3 - CLOSURE FACTORIES SPLICED
+(2026-09-28).** A body that CREATES a closure (`make.closure`) may now be
+spliced, and main - which splices only value sites - also splices a plain
+call whose callee builds a closure (the factory shape; every other
+top-level call keeps its bytecode). Two things move with the body:
+ - **the descriptor index** is re-pointed from the factory's
+   `closure_defs` into the caller's (found by pointer, else appended);
+ - **the captures' frame slots**: the descriptor's capture list names
+   slots of the factory's frame, which the splice shifts by its base. The
+   list lives in the shared descriptor, so the OP records the shift: `a`
+   becomes a DUAL (lo = the lowest captured slot in the caller's frame,
+   hi = the span), and the VM and every JIT construction form read each
+   capture at slot + (lo - the descriptor's lowest slot) - the lean
+   constructors through the `lea` displacement, the storing form through
+   a new third argument. The dual is ALSO what lists the reads to
+   `visit_use_def`: the factory's locals are the caller's TEMPS now, and a
+   temp read the audited table cannot see is exactly the dead-store
+   hazard of the audit-table trap. Only frame-local captures are
+   admitted (a capture of a capture or of a global declines); a parameter
+   inside a capture span keeps its bind, and a result rename may not land
+   inside one - a one-slot rename cannot move a span.
+myv v25: no encoding change, `a` gains the meaning; the verifier refuses a
+set dual whose span is not the descriptor's, whose shift is negative, whose
+run leaves the frame, or any other non-default value.
+
+The splice lets increment 4 (G3) fire: main now runs `make.closure c = D`
+itself, so every guard on `c` is proven - 63's 600,000 guards emit
+nothing. But the closure is still BUILT per iteration, and on its own the
+increment measured the wrong way on 63 (9.6% fewer instructions, ~22%
+MORE cycles, against increment 2's binary). Two findings:
+ - **`make.closure` was a register-cache BARRIER** (flush every pin, reload
+   after) on the claim that the emitter cannot enumerate the captured
+   slots. It can - the descriptor lists them, and a spliced op carries its
+   shift - so it now marks exactly those slots (and its dst) `bad`, and
+   main's four pinned locals stay in registers around it: 247.5M -> 235.5M
+   instructions, ~67 -> ~62M cycles;
+ - **the rest is 1.2M blocked store-forwards** (2 per iteration, from
+   ~2,300): the loop now builds a closure and reads it back a few
+   instructions later, where the frameless call's return path used to put
+   distance between them. PEBS attributes the blocked loads next to plain
+   stores, so the exact load is not identified. Increment 5 removes the
+   object outright, which makes the question moot for 63.
+
+Pinned by four `closure_inline_parity` shapes (63's factories; a captured
+parameter, a span with a gap, a parameter beside a local, a function
+caller; a closure capturing a capture, which declines; a throw inside a
+factory on a warmed iteration), a pinned-accumulator capture shape for the
+barrier's replacement, `myv_spliced_closure_span` (the image round-trips;
+three tampered spans are refused; the use/def row lists every captured
+slot) and `tests/functional/44_closure_factory_splice.my`. Watched failing:
+the VM ignoring the shift (aborts on a type assertion), the JIT ignoring
+it (both nets), `visit_use_def` not listing the captured slots (the
+structural check - no live pass exploits those temps today), a captured
+parameter read in place (the corpus, once a parameter sits inside a
+two-slot span - a one-slot span is renamed WITH its parameter and stays
+right by coincidence), and the pin marking dropped (an earlier suite
+entry reads a poisoned slot).
+
+**#97 CLOSURE INLINING, INCREMENT 5 - SCALAR REPLACEMENT OF A CLOSURE
+THAT NEVER ESCAPES (2026-09-28).** `bc_scalar_replace_closures`
+(codegen.cpp, run at the end of `bc_inline_chunk` so the run and the dump
+drivers stay in step): a slot every write of which is `make.closure` of
+one descriptor with frame-local captures, and every REACHABLE read of
+which is a guard on it or one of its own capture ops - with the slot
+proven to hold that closure at the read (`closure_slot_facts`, the G3
+dataflow, now exported with `jit_guard_facts` built on it) - needs no
+object. Its captures become fresh frame slots; `make.closure` becomes
+one move per capture, the capture ops plain moves, the proven guards are
+deleted (their miss arms become dead code, which keeps its call). Any
+other read - a copy, a call, a return, an argument, a container store,
+an unaudited op - is an ESCAPE and keeps the object. `bc_rewrite_ops` is
+the generic "replace or delete ops, remap every pc field and pc-keyed
+table" step it needs (no handler sites: a chunk with try regions
+declines).
+
+**THE PROFITABILITY GATE is not optional.** The replacement's moves are
+the BOXED MoveV, which the JIT deliberately never takes as type evidence:
+a full value copy with reference checks, never a register. That is a
+large win where it removes an allocation per iteration, and a LOSS where
+the closure is built once before its loop - the guards there are
+already proven or hoisted and the capture ops are proven-scalar 8-byte
+copies. Measured before the gate: 11_closure_counter +20% cycles and
+98_local_closure_call +51% (instructions 2x). So only a slot some
+`make.closure` of which sits inside a loop is replaced. A capture whose
+every access carries the #111 scalar proof stays off `ref_slots` however
+its source temp was used elsewhere.
+
+Against increment 2's binary (the last one before 3 and 5), pinned,
+scale 3, twice; `MYLANG_BCINLINE_SRA=0` is the same-binary A/B:
+
+    bench  cycles                     instructions
+    63     52.0/55.0M -> 19.4/19.5M   273.9M -> 85.6M (-69%)
+           (SRA off, increment 3 alone: 61.8/62.5M, 235.5M)
+    11 / 98 / 78 / 76   flat
+
+-vd blast radius of increments 3 and 5 together over bench/my + samples/
++ tests/functional: 11 and 63 among the benches (11's factory is spliced
+into main; its closure is built once, so not replaced - flat), the rest
+closure-shaped functional programs.
+
+Pinned by `bc_sra_closures` (replaced: 63's factories, a closure literal
+built in main's loop, a span with a gap, a parameter beside a local;
+kept: built once before its loop, returned, stored in an array, copied
+into a second variable - which must share ONE counter - and a slot
+written with two different closures; plus a captured array whose body
+runs boxed and so is not inlined today), SRA-on runs of every
+`closure_inline_parity` shape, and
+`tests/functional/45_closure_scalar_replace.my`. Tests of the guards or
+of a spliced make.closure hold `SraOff`. Watched failing: the escape
+scan accepting any read (the returned closure and the array case, both
+nets), every capture read mapped to capture 0 (both nets). The
+one-descriptor rule is REDUNDANT BY CONSTRUCTION - a second descriptor's
+make.closure kills the fact, so the escape scan drops the slot anyway;
+deleting it changed nothing, and the code says so. **Not reachable
+today:** a replaced closure with a REFERENCE capture (a closure body over
+a captured array runs boxed, so its call is not inlined) - the path that
+lists such a capture slot in ref_slots has no reaching shape yet.

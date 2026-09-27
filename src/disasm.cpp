@@ -2031,6 +2031,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::MakeClosureV:
             row << "make.closure " << D(in.target) << " = closure_defs["
                 << in.target2 << "]";
+            if (in.a_dual_hi() > 0)             /* #97 increment 3 */
+                row << "   ; captures from " << D(in.a_dual_lo())
+                    << " (spliced)";
             break;
         case OpCode::StructCtorV:
             row << "struct.ctor  " << D(in.target) << " = struct_defs["

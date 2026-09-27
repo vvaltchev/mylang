@@ -17,7 +17,13 @@ for it: -16.5% cycles); G1 checks a loop-invariant guard once, before
 the loop (loop versioning on C1's machinery): 11 and 78 reach the
 no-guard ceiling. INCREMENT 2 DONE (2026-09-28): two-way value sites as
 a guard chain, plus the element ops and void bodies - 76 -39% cycles.
-Increments 3 and 5 not started. Designed from
+INCREMENTS 3 AND 5 DONE (2026-09-28): closure factories spliced (their
+make.closure's captures follow the splice base), and a closure built in a
+loop that never escapes is scalar-replaced - 63 -64% cycles, -69%
+instructions. Increment 4 is G3. The plan is complete; what remains is
+listed in the increment 5 record (a reference capture has no reaching
+shape; multi-candidate factories; copy-propagating the replacement's
+move chains). Designed from
 measurement (2026-09-27). Maintainer's call: this replaces the
 call-protocol store trimming (R5/R6 both measured flat and are parked
 on `r5-offpath-framefree` / `r6-return-forward`).

@@ -16701,9 +16701,23 @@ engines_agree_bt(const char *what, const std::string &src, std::string *out)
  * lands on the staging - each run with step 1 OFF too, which must
  * render the same.
  */
+/*
+ * #97 increment 5: a test of the inline cache's GUARDS (or of the
+ * make.closure a factory splice leaves) holds scalar replacement off -
+ * on a closure that never escapes it deletes both, which is its whole
+ * point and leaves such a test nothing to test. (ValueSpliceOff, below,
+ * is the same rule one layer out.)
+ */
+struct SraOff {
+    bool saved = g_bc_sra_enabled;
+    SraOff() { g_bc_sra_enabled = false; }
+    ~SraOff() { g_bc_sra_enabled = saved; }
+};
+
 static bool
 closure_inline_parity()
 {
+    SraOff sra_off;   /* the guarded forms; SRA-on runs are added below */
 #if ML_UNTRUSTED_CHECKS
     /* this check compiles its OWN programs, so it runs trusted - but the
      * harness loads .myv images earlier in the same process, and that
@@ -16848,8 +16862,62 @@ closure_inline_parity()
           "var s = 0;\n"
           "for (var i = 0; i < 8; i++) { var f = ops[i % 2]; s = s + f(a, i); }\n"
           "print(s);\n" },
+        /* #97 increment 3: closure FACTORIES spliced - the body's
+         * make.closure lands in the caller with its captures shifted */
+        { "factory: counter and adder in main (63's shape)",
+          "func mc(start) { var count = start;\n"
+          "  return func [count] () { count++; return count; }; }\n"
+          "func ma(n) { var base = n * 10;\n"
+          "  return func [base] (x) { return base + x; }; }\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 30; i++) {\n"
+          "  var c = mc(i); s = s + c() + c();\n"
+          "  var add = ma(i); s = s + add(i); }\n"
+          "print(s);\n" },
+        { "factory: a captured PARAMETER, a span with a gap, a function "
+          "caller",
+          "func mp(n) { return func [n] (int x) { return n * 100 + x; }; }\n"
+          /* a PARAMETER inside a wider span: the one-slot rename that
+           * reads a parameter in place cannot move a span */
+          "func mq(n) { var w = n + 1;\n"
+          "  return func [n, w] (int x) { return n * 1000 + w + x; }; }\n"
+          "func mg(a) { var p = a * 2; var q = a + 1; var z = q * 3;\n"
+          "  return func [p, z] (int x) { return p + z + x; }; }\n"
+          "func run(int k) { var c = mg(k); var d = mp(k);\n"
+          "  var r = c(1) + d(2); return r; }\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 25; i++) {\n"
+          "  var f = mp(i); var g = mg(i); var h = mq(i);\n"
+          "  s = s + f(i) + g(i) + h(i) + run(i); }\n"
+          "print(s);\n" },
+        /* #97 increment 3's barrier fix: make.closure marks exactly its
+         * captured slots (the descriptor names them) instead of flushing
+         * every pin - so a HOT PINNED accumulator it captures must still
+         * be in memory when the snapshot reads it */
+        { "a closure created per iteration captures a pinned accumulator",
+          "func sum(int n) { var acc = 0; var t = 0;\n"
+          "  for (var i = 0; i < n; i++) {\n"
+          "    acc = acc + i * 3;\n"
+          "    var f = func [acc] () { return acc; };\n"
+          "    t = t + f(); }\n"
+          "  return t; }\n"
+          "var s = 0;\n"
+          "for (var k = 0; k < 5; k++) s = s + sum(runtime(40) + k);\n"
+          "print(s);\n" },
+        { "factory: a closure capturing a capture (declines) and a throw "
+          "inside a factory (warmed)",
+          "func outer(int k) {\n"
+          "  return func [k] () { return func [k] (int x) { return k + x; }; }; }\n"
+          "func md(d) { var b = 100 / d;\n"
+          "  return func [b] (int x) { return b + x; }; }\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 12; i++) {\n"
+          "  var mk = outer(i); var h = mk(); s = s + h(i);\n"
+          "  var e = md(6 - i); s = s + e(i); }\n"
+          "print(s);\n" },
     };
     bool ok = true;
+    const unsigned long cl0 = g_bc_inline_closures;
     const unsigned long tw0 = g_bc_inline_value_twoway;
     const unsigned long rn0 = g_bc_step1_renamed;
     const unsigned long sr0 = g_bc_step1_sourced;
@@ -16866,7 +16934,8 @@ closure_inline_parity()
 #if ML_JIT_SUPPORTED
         /* a guard falls into its body per iteration (hits) or, hoisted
          * out of its loop (#97 G1), executes as nothing (ghoist_hot) */
-        const unsigned long h0 = g_jit_guard_hits + g_jit_ghoist_hot;
+        const unsigned long h0 = g_jit_guard_hits + g_jit_ghoist_hot
+                                 + g_jit_guard_proven;
 #endif
         const struct { const char *name; bool jit, splice; } cfgs[] = {
             { "vm -nbi", false, false }, { "jit -nbi", true, false },
@@ -16879,6 +16948,21 @@ closure_inline_parity()
                 cout << "  closure_inline_parity [" << p[0] << "] "
                      << c.name << " differs from the tree-walker:\n--- tw\n"
                      << ref << "--- " << c.name << "\n" << got;
+                ok = false;
+            }
+        }
+        /* #97 increment 5: the same program with scalar replacement ON
+         * (the default) - wherever a closure does not escape, no object
+         * and no guard remain, and the answer must not move */
+        for (const bool jit : { false, true }) {
+            g_bc_sra_enabled = true;
+            const std::string got = engine_run_bt(src, ExecEngine::Vm, jit,
+                                                  true, true, &v);
+            g_bc_sra_enabled = false;
+            if (got != ref) {
+                cout << "  closure_inline_parity [" << p[0] << "] SRA on, "
+                     << "jit=" << jit << " differs from the tree-walker:\n"
+                     << "--- tw\n" << ref << "--- got\n" << got;
                 ok = false;
             }
         }
@@ -16924,7 +17008,8 @@ closure_inline_parity()
             ok = false;
         }
 #if ML_JIT_SUPPORTED
-        if (g_jit_guard_hits + g_jit_ghoist_hot == h0) {
+        if (g_jit_guard_hits + g_jit_ghoist_hot + g_jit_guard_proven
+                == h0) {
             cout << "  closure_inline_parity [" << p[0]
                  << "]: no emitted guard fell into an inlined body\n";
             ok = false;
@@ -16934,11 +17019,12 @@ closure_inline_parity()
         {
             const unsigned oe = g_jit_off_extra;
             g_jit_off_extra |= jit_lever_bit("ghoist");
-            const unsigned long hg = g_jit_guard_hits;
+            /* (a guard G3 proves emits nothing either way - it counts) */
+            const unsigned long hg = g_jit_guard_hits + g_jit_guard_proven;
             const std::string got = engine_run_bt(src, ExecEngine::Vm,
                                                   true, true, true, &v);
             g_jit_off_extra = oe;
-            if (got != ref || g_jit_guard_hits == hg) {
+            if (got != ref || g_jit_guard_hits + g_jit_guard_proven == hg) {
                 cout << "  closure_inline_parity [" << p[0] << "] ghoist "
                      << "off: " << (got != ref ? "differs from the "
                      "tree-walker" : "no per-iteration guard hit") << "\n";
@@ -16964,6 +17050,12 @@ closure_inline_parity()
 #endif
     /* step 1 fired: each rule is a compile-time counter, bumped only
      * where the splice took it */
+    if (g_bc_inline_closures < cl0 + 5) {
+        cout << "  closure_inline_parity: " << (g_bc_inline_closures - cl0)
+             << " closures created in spliced bodies (want >= 5) - "
+             << "increment 3 is vacuous\n";
+        ok = false;
+    }
     if (g_bc_inline_value_twoway < tw0 + 3) {
         cout << "  closure_inline_parity: " << (g_bc_inline_value_twoway - tw0)
              << " two-way sites spliced (want >= 3) - increment 2 is "
@@ -28345,6 +28437,7 @@ static bool myv_closure_guard_tamper()
  */
 static bool jit_guard_proof_g3()
 {
+    SraOff sra_off;   /* #97 increment 5 would delete what this tests */
     bool ok = true;
     const auto compile_count = [](const std::string &src, size_t &guards,
                                   size_t &proven) -> bool {
@@ -28534,6 +28627,244 @@ static bool jit_guard_proof_g3()
         ok = false;
     }
     g_exec_engine = saved;
+    return ok;
+}
+
+/*
+ * #97 increment 3: a closure FACTORY spliced into main leaves a
+ * MakeClosureV whose `a` dual says where its captures now live (lo = the
+ * lowest captured slot in main's frame, hi = the span). On an image that
+ * dual is INPUT: a wrong one makes the construction read other slots.
+ * So the image must round-trip and run exactly as the source does, and
+ * each of three tampers must be REFUSED by the loader: a span that is
+ * not the descriptor's, a shift below the descriptor's own slots, and a
+ * run past the frame.
+ */
+static bool myv_spliced_closure_span()
+{
+    SraOff sra_off;   /* #97 increment 5 would delete what this tests */
+    const std::string src =
+        "func mg(a) { var p = a * 2; var q = a + 1; var z = q * 3;\n"
+        "  return func [p, z] (x) { return p + z + x; }; }\n"
+        "var s = 0;\n"
+        "for (var i = 0; i < 20; i++) { var g = mg(i); s = s + g(i); }\n"
+        "print(s);\n";
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-closure-span.myv";
+    const auto run_image = [&](const VmProgram &prog) -> std::string {
+        myv_write(prog, path, MyvSourceRef());
+        MyvSource img_src;
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            VmProgram loaded = myv_read(path, img_src);
+            vm_run(loaded);
+        } catch (Exception &e) {
+            cap << "EXC " << e.name << "\n";
+        }
+        std::cout.rdbuf(old_buf);
+        return cap.str();
+    };
+    try {
+        const std::string ref = engine_run_bt(src, ExecEngine::TreeWalk,
+                                              false, false);
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        size_t mk = SIZE_MAX;
+        for (size_t p = 0; p < prog.root.code.size(); p++)
+            if (prog.root.code[p].op == OpCode::MakeClosureV
+                    && prog.root.code[p].a_dual_hi() > 0)
+                mk = p;
+        if (mk == SIZE_MAX) {
+            fprintf(stderr, "myv_spliced_closure_span: no spliced "
+                            "make.closure in main - vacuous\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        /* the captured slots are TEMPS of main now, so the audited
+         * use/def enumeration must list every one as a read (a missing
+         * one lets a liveness-driven pass drop the write that fills it) */
+        {
+            const Instr &mi = prog.root.code[mk];
+            std::vector<int> uses, defs;
+            jit_op_slot_refs(mi, uses, defs);
+            for (int k = 0; k < mi.a_dual_hi(); k++)
+                if (std::find(uses.begin(), uses.end(), mi.a_dual_lo() + k)
+                        == uses.end()) {
+                    fprintf(stderr, "myv_spliced_closure_span: captured "
+                                    "slot %d is not a listed use\n",
+                            mi.a_dual_lo() + k);
+                    ok = false;
+                }
+        }
+        const std::string intact = run_image(prog);
+        if (intact != ref) {
+            fprintf(stderr, "myv_spliced_closure_span: the image printed "
+                            "\"%s\", the tree-walker \"%s\"\n",
+                    intact.c_str(), ref.c_str());
+            ok = false;
+        }
+        Instr &in = prog.root.code[mk];
+        const int lo = in.a_dual_lo(), hi = in.a_dual_hi();
+        const struct { const char *what; int lo, hi; } tampers[] = {
+            { "a span that is not the descriptor's", lo, hi + 1 },
+            { "a negative shift", 0, hi },
+            { "a run past the frame", 1000000, hi },
+        };
+        for (const auto &t : tampers) {
+            in.set_a_dual(t.lo, t.hi);
+            const std::string got = run_image(prog);
+            if (got.find("EXC MyvError") == std::string::npos) {
+                fprintf(stderr, "myv_spliced_closure_span: %s was not "
+                                "refused (got \"%s\")\n", t.what,
+                        got.c_str());
+                ok = false;
+            }
+        }
+        in.set_a_dual(lo, hi);
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_spliced_closure_span: %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
+ * #97 increment 5: SCALAR REPLACEMENT of a closure that never escapes -
+ * its captures become frame slots, and neither the object nor its
+ * guards remain. Every shape must print what the tree-walker prints in
+ * every engine, and the transform must fire exactly where it may:
+ *  - REPLACED: a factory spliced into main (63's shape), a closure
+ *    literal built in main's loop, a two-capture span with a gap, a
+ *    parameter captured beside a local;
+ *  - KEPT (not profitable): a closure built once, before its loop;
+ *  - KEPT (an escape): a closure returned, one stored in an array, one
+ *    COPIED into a second variable (both must share ONE counter), and a
+ *    slot written with two different closures.
+ * `g_bc_sra_closures` counts the slots replaced at compile time.
+ */
+static bool bc_sra_closures()
+{
+    struct Shape { const char *name; const char *src; bool want; };
+    const Shape shapes[] = {
+        { "63's factories",
+          "func mc(start) { var count = start;\n"
+          "  return func [count] () { count++; return count; }; }\n"
+          "func ma(n) { var base = n * 10;\n"
+          "  return func [base] (x) { return base + x; }; }\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 30; i++) {\n"
+          "  var c = mc(i); s = s + c() + c();\n"
+          "  var add = ma(i); s = s + add(i); }\n"
+          "print(s);\n", true },
+        { "a closure literal built in main's loop",
+          "var s = 0;\n"
+          "for (var i = 0; i < 30; i++) {\n"
+          "  var st = i * 2;\n"
+          "  var tick = func [st] () { st++; return st; };\n"
+          "  s = s + tick() + tick(); }\n"
+          "print(s);\n", true },
+        /* the PROFITABILITY gate: a closure built once, before its loop,
+         * is kept - its guards are already proven/hoisted, and the
+         * replacement's boxed moves measured 2x the instructions */
+        { "a closure built once before the loop (kept: not profitable)",
+          "var st = int(runtime(0));\n"
+          "var tick = func [st] () { st++; return st; };\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 30; i++) s = s + tick() * 2;\n"
+          "print(s, tick());\n", false },
+        { "two captures with a gap, a parameter beside a local",
+          "func mg(a) { var p = a * 2; var q = a + 1; var z = q * 3;\n"
+          "  return func [p, z] (int x) { return p + z + x; }; }\n"
+          "func mq(n) { var w = n + 1;\n"
+          "  return func [n, w] (int x) { return n * 1000 + w + x; }; }\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 20; i++) {\n"
+          "  var g = mg(i); var h = mq(i); s = s + g(i) + h(i); }\n"
+          "print(s);\n", true },
+        /* NOT replaced today, and for a good reason: a closure body over
+         * a captured array runs BOXED (its element type is not inferred),
+         * so the call is not inlined and stays a real call - an escape.
+         * Kept as a parity case: the day such a body inlines, this flips
+         * and must still print the aliased array. */
+        { "a captured array mutated through the closure (boxed body: kept)",
+          "func mk(a) { return func [a] (int k) { a[0] = a[0] + k;\n"
+          "  return a[0]; }; }\n"
+          "var arr = [0];\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 20; i++) { var f = mk(arr); s = s + f(i); }\n"
+          "print(s, arr[0]);\n", false },
+        { "a closure returned (escape)",
+          "func mc(start) { var count = start;\n"
+          "  return func [count] () { count++; return count; }; }\n"
+          "func wrap(int k) { var c = mc(k); var r = c(); return c; }\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 10; i++) { var w = wrap(i); s = s + w(); }\n"
+          "print(s);\n", false },
+        { "a closure stored in an array (escape)",
+          "var st = int(runtime(0));\n"
+          "var tick = func [st] () { st++; return st; };\n"
+          "var fs = [tick];\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 10; i++) s = s + tick() + fs[0]();\n"
+          "print(s);\n", false },
+        { "a closure copied into a second variable (escape)",
+          "var st = int(runtime(0));\n"
+          "var f = func [st] () { st++; return st; };\n"
+          "var g = f;\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 10; i++) s = s + f() + g();\n"
+          "print(s, f());\n", false },
+        { "one slot, two different closures (declines)",
+          "var a = int(runtime(1)); var b = int(runtime(2));\n"
+          "var f = func [a] () { return a; };\n"
+          "if (runtime(1) > 0) f = func [b] () { return b * 10; };\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 10; i++) s = s + f();\n"
+          "print(s);\n", false },
+    };
+    bool ok = true;
+    for (const Shape &sh : shapes) {
+        const std::string src = sh.src;
+        const std::string ref = engine_run_bt(src, ExecEngine::TreeWalk,
+                                              false, false);
+        const unsigned long c0 = g_bc_sra_closures;
+        for (const bool jit : { false, true }) {
+            const std::string got = engine_run_bt(src, ExecEngine::Vm, jit,
+                                                  true);
+            if (ref.empty() || ref.find("EXC") != std::string::npos
+                    || got != ref) {
+                fprintf(stderr, "bc_sra_closures [%s] jit=%d differs from "
+                                "the tree-walker:\n--- tw\n%s--- got\n%s",
+                        sh.name, jit, ref.c_str(), got.c_str());
+                ok = false;
+            }
+        }
+        const bool fired = g_bc_sra_closures != c0;
+        if (fired != sh.want) {
+            fprintf(stderr, "bc_sra_closures [%s]: scalar replacement %s\n",
+                    sh.name, fired ? "FIRED on an escaping closure"
+                                   : "did not fire - the shape is vacuous");
+            ok = false;
+        }
+    }
     return ok;
 }
 
@@ -48499,6 +48830,12 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 G1 - a loop-invariant guard is checked once before the "
       "loop; the cold copy and the resume stubs keep it sound",
       jit_guard_hoist_g1 },
+    { "myv: #97 increment 3 - a spliced factory's make.closure capture "
+      "span round-trips, and a tampered span is refused",
+      myv_spliced_closure_span },
+    { "call: #97 increment 5 - a closure that never escapes is SCALAR-"
+      "REPLACED (its captures become frame slots); an escaping one is kept",
+      bc_sra_closures },
     { "myv: the verifier bounds a planned ctor's mini-run (small-938, a "
       "load-time HANG)", myv_verify_ctor_minirun },
     { "jit: #97 inc 3 (W1/W2) - the CALLER builds the frameless window "

@@ -1916,7 +1916,17 @@ Running scripts:
                                  # capture forwarding) reaches its tier
                                  # through a closure call the splice now
                                  # inlines: it holds ValueSpliceOff
-                                 # (tests.cpp) or it tests nothing
+                                 # (tests.cpp) or it tests nothing.
+                                 # #97 inc 3: main also splices a call to
+                                 # a closure FACTORY (a body that builds a
+                                 # closure; its captures follow the splice
+                                 # base); inc 5: a closure BUILT IN A LOOP
+                                 # that never escapes is scalar-replaced -
+                                 # its captures become frame slots and no
+                                 # object is built (MYLANG_BCINLINE_SRA=0
+                                 # keeps the object; a test of the guards
+                                 # or of a spliced make.closure holds
+                                 # SraOff, or it tests nothing)
 ./build/mylang -vdj FILE         # -vd + the native x86-64 disassembly of
                                  # each JIT fragment, interleaved under its
                                  # `enter.nat` line with `; vm pc N` markers

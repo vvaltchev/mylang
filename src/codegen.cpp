@@ -41,6 +41,8 @@ struct NotLoweredEx : public Exception {
 
 #include <vector>
 #include <algorithm>   /* std::count (peephole_chunk) */
+#include <map>         /* #97 increment 5 */
+#include <set>
 
 /* #97 E1: see codegen.h - the descriptors codegen may trust a stamp for. */
 static const std::unordered_set<const FuncDescriptor *> *g_live_descs
@@ -8863,7 +8865,14 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::LoadConstV: case OpCode::LoadLiteralObjV:
     case OpCode::LoadGlobalV: case OpCode::LoadCaptureV:
     case OpCode::LoadBuiltinV: case OpCode::DefinedGlobalV:
-    case OpCode::MakeClosureV:   /* captures snapshot NAMED locals, not temps */
+        d(in.target); return true;
+    case OpCode::MakeClosureV:
+        /* an unspliced op's captures snapshot NAMED locals, which no
+         * temp analysis tracks; a SPLICED one (#97 increment 3) reads
+         * what are now the caller's TEMPS, and says which in `a` */
+        if (in.a_dual_hi() > 0)
+            for (int k = 0; k < in.a_dual_hi(); k++)
+                u(in.a_dual_lo() + k);
         d(in.target); return true;
     case OpCode::UnaryV: case OpCode::CoerceNumV:
         opnd(in.a()); d(in.target); return true;
@@ -9551,24 +9560,20 @@ bool jit_struct_facts(const Chunk &chunk, const std::vector<int> &entry_pcs,
  * `proven[pc]` is set for each GuardCalleeV the facts decide. Returns
  * false when there is nothing to prove.
  */
-bool jit_guard_facts(const Chunk &chunk, std::vector<char> &proven)
+bool closure_slot_facts(const Chunk &chunk, std::vector<int> &fact_slot,
+                        std::vector<const FuncDescriptor *> &fact_def,
+                        std::vector<uint32_t> &in)
 {
     const size_t n = chunk.code.size();
-    proven.assign(n, 0);
-    bool any_guard = false;
-    for (size_t p = 0; p < n; p++)
-        if (chunk.code[p].op == OpCode::GuardCalleeV)
-            any_guard = true;
-    if (!any_guard)
-        return false;
+    fact_slot.clear();
+    fact_def.clear();
+    in.clear();
 
     const auto def_at = [&](int idx) -> const FuncDescriptor * {
         return idx >= 0 && static_cast<size_t>(idx)
                                 < chunk.closure_defs.size()
             ? chunk.closure_defs[static_cast<size_t>(idx)] : nullptr;
     };
-    std::vector<int> fact_slot;
-    std::vector<const FuncDescriptor *> fact_def;
     std::vector<int> gen_of(n, -1);
     for (size_t p = 0; p < n; p++) {
         const Instr &i = chunk.code[p];
@@ -9651,7 +9656,8 @@ bool jit_guard_facts(const Chunk &chunk, std::vector<char> &proven)
             reach(static_cast<int>(p + 1));
     }
 
-    std::vector<uint32_t> in(n, 0), out(n, all);
+    in.assign(n, 0);
+    std::vector<uint32_t> out(n, all);
     for (bool changed = true; changed; ) {
         changed = false;
         for (size_t p = 0; p < n; p++) {
@@ -9674,12 +9680,35 @@ bool jit_guard_facts(const Chunk &chunk, std::vector<char> &proven)
         }
     }
 
+    return true;
+}
+
+bool jit_guard_facts(const Chunk &chunk, std::vector<char> &proven)
+{
+    const size_t n = chunk.code.size();
+    proven.assign(n, 0);
+    bool any_guard = false;
+    for (size_t p = 0; p < n; p++)
+        if (chunk.code[p].op == OpCode::GuardCalleeV)
+            any_guard = true;
+    if (!any_guard)
+        return false;
+    std::vector<int> fact_slot;
+    std::vector<const FuncDescriptor *> fact_def;
+    std::vector<uint32_t> in;
+    if (!closure_slot_facts(chunk, fact_slot, fact_def, in))
+        return false;
+    const size_t nf = fact_slot.size();
     bool any = false;
     for (size_t p = 0; p < n; p++) {
         const Instr &i = chunk.code[p];
         if (i.op != OpCode::GuardCalleeV)
             continue;
-        const FuncDescriptor *const d = def_at(i.target2);
+        const FuncDescriptor *const d =
+            i.target2 >= 0
+                && static_cast<size_t>(i.target2) < chunk.closure_defs.size()
+                ? chunk.closure_defs[static_cast<size_t>(i.target2)]
+                : nullptr;
         if (!d)
             continue;
         for (size_t f = 0; f < nf; f++)
@@ -11540,6 +11569,18 @@ void ChunkVerifier::verify_one(const Instr &in)
         reg(in.target);
         pool(in.target2, ck.closure_defs.size(), "closure def");
         defined_ptr(ck.closure_defs[in.target2], "closure def");
+        /* #97 increment 3: a SPLICED op's capture span (`a` as a dual)
+         * must be the descriptor's own span, shifted up, inside this
+         * frame - the construction reads every capture at slot + shift */
+        if (in.a_dual_hi() > 0) {
+            int lo = 0, span = 0;
+            if (!make_closure_span(ck.closure_defs[in.target2], lo, span)
+                    || span != in.a_dual_hi() || in.a_dual_lo() < lo)
+                reject("spliced closure capture span");
+            run(in.a_dual_lo(), in.a_dual_hi());
+        } else if (in.a_dual_lo() != -1 || in.a_dual_hi() != -1) {
+            reject("closure capture span");
+        }
         /*
          * The new closure SNAPSHOTS its captures here, through `read_sym`,
          * from THIS chunk's frame / captures and the program tables - so the
@@ -11550,7 +11591,10 @@ void ChunkVerifier::verify_one(const Instr &in)
         for (const FuncDescriptor::CaptureDesc &cd
                  : ck.closure_defs[in.target2]->captures) {
             switch (cd.kind) {
-            case SymKind::local:   reg(cd.slot);     break;
+            case SymKind::local:
+                reg(cd.slot + make_closure_offset(
+                                  in, ck.closure_defs[in.target2]));
+                break;
             case SymKind::global:  gslot(cd.slot);   break;
             case SymKind::capture: cslot(cd.slot);   break;
             case SymKind::builtin: builtin(cd.slot); break;
@@ -12276,6 +12320,34 @@ bool bc_test_op_writes_pure_target(OpCode op)
     return op_writes_pure_target(op);
 }
 
+bool make_closure_span(const FuncDescriptor *d, int &lo, int &span)
+{
+    if (!d || d->captures.empty())
+        return false;
+    int mn = INT32_MAX, mx = -1;
+    for (const auto &cap : d->captures) {
+        if (cap.kind != SymKind::local || cap.slot < 0)
+            return false;
+        mn = std::min(mn, cap.slot);
+        mx = std::max(mx, cap.slot);
+    }
+    lo = mn;
+    span = mx - mn + 1;
+    return true;
+}
+
+int make_closure_offset(const Instr &in, const FuncDescriptor *d)
+{
+    if (in.a_dual_hi() <= 0)
+        return 0;                       /* unspliced: the default -1 */
+    int lo = 0, span = 0;
+    const bool ok = make_closure_span(d, lo, span);
+    ML_CHECK_MSG(ok && span == in.a_dual_hi() && in.a_dual_lo() >= lo,
+                 "a spliced MakeClosureV disagrees with its descriptor");
+    (void)ok;
+    return in.a_dual_lo() - lo;
+}
+
 bool bc_inline_op_ok(OpCode op)
 {
     switch (op) {
@@ -12393,6 +12465,21 @@ bool bc_inline_callee_ok(const Chunk &callee, std::string *why,
         if ((in.op == OpCode::StoreElemInt
              || in.op == OpCode::StoreElemFloat) && in.target != 2)
             continue;
+        /* #97 increment 3: a closure CREATED in the body. Its captures
+         * are read from the running frame at construction, so they move
+         * with the splice base (make_closure_offset) - possible only
+         * when every capture is a frame local; a capture of a capture
+         * or of a global reads other tables, and declines. */
+        if (in.op == OpCode::MakeClosureV && in.a_dual_hi() <= 0
+                && in.target2 >= 0
+                && static_cast<size_t>(in.target2)
+                       < callee.closure_defs.size()) {
+            const FuncDescriptor *cd = callee.closure_defs[in.target2];
+            int lo = 0, span = 0;
+            if (cd && (cd->captures.empty()
+                       || make_closure_span(cd, lo, span)))
+                continue;
+        }
         /* #97 closure inlining: a VALUE site reaches the callee's
          * captures through the callee slot, so its body may read and
          * PLAINLY write them; a CallV site cannot (its callee is not in a
@@ -12473,6 +12560,16 @@ unsigned long g_bc_inline_splices = 0;
 unsigned long g_bc_inline_value_splices = 0;
 /* #97 increment 2: value sites spliced with TWO arms (a guard chain) */
 unsigned long g_bc_inline_value_twoway = 0;
+/* #97 increment 3: closures created in a spliced body */
+unsigned long g_bc_inline_closures = 0;
+/* #97 increment 5: closure SLOTS scalar-replaced (no object is built) */
+unsigned long g_bc_sra_closures = 0;
+/* #97 increment 5 (MYLANG_BCINLINE_SRA=0): the scalar replacement of a
+ * non-escaping closure, alone - the same-binary A/B */
+bool g_bc_sra_enabled = [] {
+    const auto e = env_get("MYLANG_BCINLINE_SRA");
+    return !(e && !e->empty() && (*e)[0] == '0');
+}();
 unsigned long g_ref_slots_move_excluded = 0;    /* #97 (TESTS) */
 unsigned long g_ref_slots_proven_excluded = 0;  /* C3 (TESTS): params the
                                                  * proven-type stamp kept
@@ -12590,6 +12687,17 @@ static void bc_value_site_step1(const Chunk &ck, size_t pc, int nargs,
     }
     if (r < nparams || r >= 64 || ((snap.read_first >> r) & 1))
         return;
+    /* #97 increment 3: a closure created in the body reads a SPAN of
+     * slots; a rename cannot split a span */
+    for (const Instr &bi : snap.code) {
+        if (bi.op != OpCode::MakeClosureV || bi.target2 < 0
+                || static_cast<size_t>(bi.target2) >= snap.closure_defs.size())
+            continue;
+        int lo = 0, span = 0;
+        if (make_closure_span(snap.closure_defs[bi.target2], lo, span)
+                && r >= lo && r < lo + span)
+            return;
+    }
     rename_from = r;
     ref_rename = std::find(snap.ref_slots.begin(), snap.ref_slots.end(), r)
                  != snap.ref_slots.end();
@@ -12630,6 +12738,19 @@ static void bc_site_param_renames(const Chunk &ck, size_t pc,
         });
         if (!known)
             return;
+    }
+    /* #97 increment 3: a parameter a body closure CAPTURES is read as
+     * part of that closure's capture span, which a one-slot rename cannot
+     * reach - it keeps its bind */
+    for (const Instr &bi : snap.code) {
+        if (bi.op != OpCode::MakeClosureV || bi.target2 < 0
+                || static_cast<size_t>(bi.target2) >= snap.closure_defs.size())
+            continue;
+        int lo = 0, span = 0;
+        if (make_closure_span(snap.closure_defs[bi.target2], lo, span))
+            for (int k = lo; k < lo + span; k++)
+                if (k >= 0 && static_cast<size_t>(k) < written.size())
+                    written[static_cast<size_t>(k)] = 1;
     }
     const uint32_t kinds = ck.value_arg_kinds_at(pc);
     for (size_t i = 0; i < src_of.size(); i++) {
@@ -12785,6 +12906,17 @@ static void bc_map_slots(Instr &in, const F &map)
             in.target2 = map(in.target2);
         ra(); rb();
         break;
+    /* #97 increment 3: target = dst; target2 = a closure_defs index (a
+     * POOL index - the splice re-points it into the caller's pool); `a`
+     * the capture DUAL (lo = the lowest captured slot, a frame slot;
+     * hi = the span, a count). The renames never name a slot inside the
+     * span (bc_value_site_step1 / bc_site_param_renames keep them out),
+     * so mapping lo is exact for the re-base and a no-op for them. */
+    case OpCode::MakeClosureV:
+        rt();
+        if (in.a_dual_hi() > 0)
+            in.set_a_dual(map(in.a_dual_lo()), in.a_dual_hi());
+        break;
     case OpCode::StoreCaptureOfV:
         ra(); rb();
         break;
@@ -12859,6 +12991,7 @@ void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out)
     s.arg_locs = ck.arg_locs;                          /* RULE 2 */
     s.arg_loc_pool = ck.arg_loc_pool;
     s.ref_slots = ck.ref_slots;
+    s.closure_defs = ck.closure_defs;     /* #97 increment 3 */
     s.slot_count = ck.slot_count;
     s.n_temps = ck.n_temps;
     /* The gate runs on the PRISTINE body: after a splice the chunk gains
@@ -12871,7 +13004,7 @@ void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out)
     out.emplace(&ck, std::move(s));
 }
 
-bool bc_inline_chunk(Chunk &ck,
+static bool bc_inline_chunk_splice(Chunk &ck,
                      const std::vector<const FuncDescriptor *> &slot_desc,
                      const BcInlineSnapshots &snaps, bool value_only)
 {
@@ -12897,6 +13030,9 @@ bool bc_inline_chunk(Chunk &ck,
         std::vector<Chunk::ArgLocEntry> arg_locs; /* RULE 2 */
         std::vector<ArgLoc> arg_loc_pool;
         std::vector<int32_t> ref_slots;
+        /* the callee's closure_defs pool (increment 3: a make.closure in
+         * the body names ITS pool, re-pointed into the caller's) */
+        std::vector<const FuncDescriptor *> closure_defs;
         Chunk::InlineFrame frame;
         /* each typed parameter binds through CoerceNumV (`coerce[i]` =
          * 1 int, 2 float, 0 a plain move), carrying its argument's caret */
@@ -12960,8 +13096,9 @@ bool bc_inline_chunk(Chunk &ck,
         const bool is_value = in.op == OpCode::CallValueV;
         if (in.op != OpCode::CallV && !is_value)
             continue;
-        if (value_only && !is_value)
-            continue;                   /* main: value sites only */
+        /* main: value sites only - plus (increment 3) a call to a
+         * closure FACTORY, checked below once the callee is known */
+        const bool factory_only = value_only && !is_value;
         if (is_value && !g_bc_inline_value_enabled)
             continue;
         /* the candidate callees: a CallV names one through its global
@@ -13016,6 +13153,20 @@ bool bc_inline_chunk(Chunk &ck,
             if (snap_it == snaps.end())
                 continue;               /* not part of this pass (main) */
             const BcInlineSnapshot &snap = snap_it->second;
+            if (factory_only) {
+                /* #97 increment 3: main splices a plain call only when
+                 * the body CREATES a closure - the factory shape, whose
+                 * splice is what lets main's own value sites see the
+                 * closure's make.closure (G3 then proves their guards).
+                 * Every other top-level call stays a call: admitting
+                 * them all would change every program's main, a
+                 * separate and separately measured step. */
+                bool makes = false;
+                for (const Instr &bi : snap.code)
+                    makes |= bi.op == OpCode::MakeClosureV;
+                if (!makes)
+                    continue;
+            }
             if (is_value ? !snap.value_eligible : !snap.eligible)
                 continue;               /* gate ran on the pristine body,
                                          * incl. "no inline_ctxs" - the
@@ -13079,6 +13230,7 @@ bool bc_inline_chunk(Chunk &ck,
             a.arg_locs = snap.arg_locs;
             a.arg_loc_pool = snap.arg_loc_pool;
             a.ref_slots = snap.ref_slots;
+            a.closure_defs = snap.closure_defs;
             /* the virtual frame, built to render EXACTLY as the physical
              * one would (backtrace.cpp's frame_display over the
              * descriptor) */
@@ -13402,6 +13554,31 @@ bool bc_inline_chunk(Chunk &ck,
                         continue;
                     }
                     Instr bi = A.body[j];
+                    /* #97 increment 3: a closure created in the body -
+                     * record its capture span (callee-relative, so the
+                     * re-base below shifts it), then re-point its
+                     * descriptor into the CALLER's pool */
+                    if (bi.op == OpCode::MakeClosureV) {
+                        const FuncDescriptor *cd =
+                            A.closure_defs[static_cast<size_t>(bi.target2)];
+                        int lo = 0, span = 0;
+                        if (make_closure_span(cd, lo, span))
+                            bi.set_a_dual(lo, span);
+                        int idx = -1;
+                        for (size_t q = 0; q < ck.closure_defs.size(); q++)
+                            if (ck.closure_defs[q] == cd) {
+                                idx = static_cast<int>(q);
+                                break;
+                            }
+                        if (idx < 0) {
+                            idx = static_cast<int>(ck.closure_defs.size());
+                            ck.closure_defs.push_back(cd);
+                        }
+                        bi.target2 = idx;
+#ifdef TESTS
+                        g_bc_inline_closures++;
+#endif
+                    }
                     bc_remap_slots(bi, A.base);
                     /* #97 closure inlining: the body now runs in the
                      * CALLER's frame, whose ctx.captures is the caller's
@@ -13540,5 +13717,365 @@ bool bc_inline_chunk(Chunk &ck,
     build_boxed_ops(ck);
     ck.native_leaf = jit_chunk_is_native_leaf(ck);
     jit_chunk_frameless_derive(ck);   /* #97 reach probe, W3, small-60 */
+    return true;
+}
+
+/*
+ * Rewrite a chunk's code op by op: `repl[pc].replace` swaps the op at pc
+ * for `repl[pc].ops` (none = delete it). Every pc field and every
+ * pc-keyed side table follows - a branch to a replaced op lands on its
+ * first replacement, a branch to a deleted one on the next op that
+ * survives; a side-table entry moves with its op (to the first
+ * replacement) and dies with a deleted one. The caller guarantees the
+ * chunk has no handler sites (whose pcs this does not remap) and that
+ * no replacement op carries a pc field of its own.
+ */
+struct BcRepl {
+    bool replace = false;
+    std::vector<Instr> ops;
+};
+static void bc_rewrite_ops(Chunk &ck, const std::vector<BcRepl> &repl)
+{
+    const size_t n = ck.code.size();
+    ML_CHECK(repl.size() == n && ck.handler_sites.empty());
+    std::vector<uint32_t> first(n + 1), alive(n, 1);
+    std::vector<Instr> nc;
+    for (size_t pc = 0; pc < n; pc++) {
+        first[pc] = static_cast<uint32_t>(nc.size());
+        if (!repl[pc].replace) {
+            nc.push_back(ck.code[pc]);
+            continue;
+        }
+        if (repl[pc].ops.empty())
+            alive[pc] = 0;
+        for (const Instr &o : repl[pc].ops)
+            nc.push_back(o);
+    }
+    first[n] = static_cast<uint32_t>(nc.size());
+    /* a deleted op's pc means the next op that survives: `first` of a
+     * deleted pc already IS that index, since nothing was pushed for it */
+    for (size_t pc = 0; pc < n; pc++) {
+        if (repl[pc].replace)
+            continue;               /* replacement ops carry no pc field */
+        Instr &in = nc[first[pc]];
+        visit_pc_fields(in, [&](int &t) {
+            if (t >= 0 && static_cast<size_t>(t) <= n)
+                t = static_cast<int>(first[static_cast<size_t>(t)]);
+        });
+    }
+    const auto move_pc = [&](auto &table) {
+        size_t w = 0;
+        for (size_t r = 0; r < table.size(); r++) {
+            const uint32_t p = table[r].pc;
+            if (p >= n || !alive[p])
+                continue;
+            table[w] = table[r];
+            table[w].pc = first[p];
+            w++;
+        }
+        table.resize(w);
+    };
+    move_pc(ck.locs);
+    move_pc(ck.base_locs);
+    move_pc(ck.op_locs);
+    move_pc(ck.arg_locs);
+    move_pc(ck.value_callees);
+    move_pc(ck.value_arg_kinds);
+    move_pc(ck.inline_ctxs);
+    ck.code = std::move(nc);
+}
+
+/*
+ * #97 closure inlining, INCREMENT 5 - SCALAR REPLACEMENT OF A CLOSURE
+ * THAT NEVER ESCAPES. After increments 3 and 4 a factory's closure is
+ * built in the frame that calls it (`make.closure c = D`) and every call
+ * of it is inlined behind a guard the make.closure proves. The object
+ * then does nothing a frame slot could not: its captures are per-
+ * instance state, and when nothing but those capture ops ever sees the
+ * instance, the instance is unobservable. So the captures become frame
+ * slots of the caller:
+ *     make.closure c = D   ->  move cap_k = <capture k's source slot>
+ *     load.capof x, c.cap[k]  ->  move x = cap_k
+ *     store.capof c.cap[k] = y  ->  move cap_k = y
+ *     guard.callee c is D  ->  (deleted: proven, see below)
+ * and no FuncObject is allocated, snapshotted, reference-counted, read
+ * through or freed.
+ *
+ * A slot S qualifies when, over the whole chunk:
+ *  - every WRITE of S is a make.closure of ONE descriptor D, whose
+ *    captures are all frame locals (the construction then only COPIES
+ *    slots, which moves reproduce);
+ *  - every READ of S in REACHABLE code (with S's proven guards counted
+ *    as falling through - their miss arms become dead) is a guard on S
+ *    or a plain capture op through S, AND at that pc every path has S
+ *    holding a D closure (closure_slot_facts - the G3 dataflow). Any
+ *    other read - a copy, a call, a return, an argument, a store into a
+ *    container, an unaudited op - is an ESCAPE, and S stays an object.
+ * Reassigning S (the next iteration's make.closure) starts a fresh
+ * instance, exactly as the copies re-initialise cap_k; the old instance
+ * was unreachable. A dead miss arm keeps its call through S - it never
+ * runs, and S is simply never written any more.
+ *
+ * Not in a chunk with try regions (handler pcs are not remapped) or
+ * past the splice's frame bound. Returns true if anything changed.
+ */
+static bool bc_scalar_replace_closures(Chunk &ck)
+{
+    if (!g_bc_inline_enabled || !g_bc_sra_enabled || ck.n_trys != 0
+            || !ck.handler_sites.empty())
+        return false;
+    const size_t n = ck.code.size();
+    bool has_mk = false;
+    for (const Instr &in : ck.code)
+        has_mk |= in.op == OpCode::MakeClosureV;
+    if (!has_mk)
+        return false;
+    std::vector<int> fslot;
+    std::vector<const FuncDescriptor *> fdef;
+    std::vector<uint32_t> fin;
+    if (!closure_slot_facts(ck, fslot, fdef, fin))
+        return false;
+    const auto holds = [&](size_t pc, int slot, const FuncDescriptor *d) {
+        for (size_t f = 0; f < fslot.size(); f++)
+            if ((fin[pc] & (uint32_t(1) << f)) && fslot[f] == slot
+                    && fdef[f] == d)
+                return true;
+        return false;
+    };
+    const auto def_at = [&](int idx) -> const FuncDescriptor * {
+        return idx >= 0 && static_cast<size_t>(idx) < ck.closure_defs.size()
+                   ? ck.closure_defs[static_cast<size_t>(idx)] : nullptr;
+    };
+
+    /* candidates: slot -> the ONE descriptor every make.closure writes.
+     * REDUNDANT BY CONSTRUCTION, and kept as the plain statement of the
+     * rule: a second descriptor's make.closure KILLS the (S, D) fact, so
+     * every read after it fails `holds` in the escape scan below and S
+     * is dropped there anyway - watched: deleting this rule changed no
+     * answer and no replacement anywhere in the suite or the corpus. */
+    std::map<int, const FuncDescriptor *> cand;
+    std::set<int> dead;
+    for (const Instr &in : ck.code) {
+        if (in.op != OpCode::MakeClosureV)
+            continue;
+        const FuncDescriptor *d = def_at(in.target2);
+        int lo = 0, span = 0;
+        if (!d || d->captures.empty() || !make_closure_span(d, lo, span)) {
+            dead.insert(in.target);
+            continue;
+        }
+        auto it = cand.find(in.target);
+        if (it == cand.end())
+            cand[in.target] = d;
+        else if (it->second != d)
+            dead.insert(in.target);
+    }
+    for (int sl : dead)
+        cand.erase(sl);
+    /*
+     * PROFITABILITY: only where a closure is BUILT in a loop. There the
+     * replacement removes an allocation, a capture snapshot, a
+     * reference count and a free per iteration (63_closures: -65%
+     * cycles). A closure built once, before its loop, costs nothing per
+     * iteration - its guards are already proven (G3) or hoisted (G1) and
+     * its capture ops are proven-scalar 8-byte copies - while the
+     * replacement's MoveV is the BOXED move the JIT deliberately never
+     * treats as type evidence (a full value copy with reference checks,
+     * never a register). Measured before this gate: 11_closure_counter
+     * +20% cycles and 98_local_closure_call +51%, instructions 2x.
+     */
+    {
+        std::vector<char> in_loop(n, 0);
+        for (size_t p = 0; p < n; p++) {
+            Instr tmp = ck.code[p];
+            visit_pc_fields(tmp, [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) <= p)
+                    for (size_t q = static_cast<size_t>(t); q <= p; q++)
+                        in_loop[q] = 1;
+            });
+        }
+        std::set<int> built_in_loop;
+        for (size_t p = 0; p < n; p++)
+            if (ck.code[p].op == OpCode::MakeClosureV && in_loop[p])
+                built_in_loop.insert(ck.code[p].target);
+        for (auto it = cand.begin(); it != cand.end(); )
+            it = built_in_loop.count(it->first) ? std::next(it)
+                                                : cand.erase(it);
+    }
+    if (cand.empty())
+        return false;
+
+    /* reachability with each candidate's PROVEN guards falling through */
+    const auto proven_guard = [&](size_t pc) {
+        const Instr &in = ck.code[pc];
+        if (in.op != OpCode::GuardCalleeV || in.a_is_lit())
+            return false;
+        auto it = cand.find(in.a_slot());
+        return it != cand.end() && def_at(in.target2) == it->second
+               && holds(pc, in.a_slot(), it->second);
+    };
+    std::vector<char> live(n, 0);
+    std::vector<size_t> stack{ 0 };
+    live[0] = 1;
+    while (!stack.empty()) {
+        const size_t p = stack.back();
+        stack.pop_back();
+        const auto reach = [&](int t) {
+            if (t >= 0 && static_cast<size_t>(t) < n && !live[t]) {
+                live[t] = 1;
+                stack.push_back(static_cast<size_t>(t));
+            }
+        };
+        Instr &in = ck.code[p];
+        if (!proven_guard(p))
+            visit_pc_fields(in, [&](int &t) { reach(t); });
+        if (op_falls_through(in.op) && p + 1 < n)
+            reach(static_cast<int>(p + 1));
+    }
+
+    /* the escape scan, over reachable code */
+    for (size_t pc = 0; pc < n && !cand.empty(); pc++) {
+        if (!live[pc])
+            continue;
+        const Instr &in = ck.code[pc];
+        std::vector<int> uses, defs;
+        if (!visit_use_def(in, [&](int s) { uses.push_back(s); },
+                           [&](int s) { defs.push_back(s); })) {
+            return false;               /* an unaudited op: may read S */
+        }
+        for (int s : defs)
+            if (cand.count(s) && in.op != OpCode::MakeClosureV)
+                cand.erase(s);
+        for (int s : uses) {
+            auto it = cand.find(s);
+            if (it == cand.end())
+                continue;
+            const FuncDescriptor *d = it->second;
+            bool ok = false;
+            if (in.op == OpCode::GuardCalleeV)
+                ok = proven_guard(pc);
+            else if (in.op == OpCode::LoadCaptureOfV && in.a_slot() == s
+                     && in.target != s)
+                ok = holds(pc, s, d);
+            else if (in.op == OpCode::StoreCaptureOfV && in.b_slot() == s
+                     && !in.a_is_lit() && in.a_slot() != s
+                     && in.aop == Op::invalid)
+                ok = holds(pc, s, d);
+            if (!ok)
+                cand.erase(it);
+        }
+    }
+    if (cand.empty())
+        return false;
+
+    /* the capture slots: fresh temps past the frame */
+    int next = ck.slot_count + ck.n_temps;
+    std::map<int, int> cap_base;        /* S -> its first capture slot */
+    for (auto &kv : cand) {
+        const int nc = static_cast<int>(kv.second->captures.size());
+        if (next + nc > BC_INLINE_MAX_FRAME)
+            return false;
+        cap_base[kv.first] = next;
+        next += nc;
+    }
+
+    std::vector<BcRepl> repl(n);
+    std::set<int32_t> refs(ck.ref_slots.begin(), ck.ref_slots.end());
+    std::set<int32_t> new_refs;
+    /* a capture every access of which carries the #111 scalar proof
+     * (`cap_scalar`: the captured variable's static type is int or
+     * float) can never hold a reference, whatever the temp it was
+     * copied from once held - such a slot stays off ref_slots */
+    std::map<std::pair<int, int>, bool> scalar_cap;   /* (S, k) */
+    for (size_t pc = 0; pc < n; pc++) {
+        const Instr &in = ck.code[pc];
+        int sl = -1, k = -1;
+        if (in.op == OpCode::LoadCaptureOfV && !in.a_is_lit()) {
+            sl = in.a_slot(); k = in.target2;
+        } else if (in.op == OpCode::StoreCaptureOfV && !in.b_is_lit()) {
+            sl = in.b_slot(); k = in.target;
+        }
+        if (sl < 0 || !cand.count(sl) || !live[pc])
+            continue;
+        auto key = std::make_pair(sl, k);
+        auto it = scalar_cap.find(key);
+        const bool sc = in.cap_scalar();
+        if (it == scalar_cap.end())
+            scalar_cap[key] = sc;
+        else
+            it->second = it->second && sc;
+    }
+    const auto is_scalar_cap = [&](int sl, int k) {
+        auto it = scalar_cap.find({ sl, k });
+        return it != scalar_cap.end() && it->second;
+    };
+    for (size_t pc = 0; pc < n; pc++) {
+        const Instr &in = ck.code[pc];
+        BcRepl &r = repl[pc];
+        const auto mv = [](int dst, int src) {
+            Instr m;
+            m.op = OpCode::MoveV;
+            m.target = dst;
+            m.target2 = src;
+            return m;
+        };
+        if (in.op == OpCode::MakeClosureV && cand.count(in.target)) {
+            const FuncDescriptor *d = cand[in.target];
+            const int off = make_closure_offset(in, d);
+            const int cb = cap_base[in.target];
+            r.replace = true;
+            for (size_t k = 0; k < d->captures.size(); k++) {
+                const int src = d->captures[k].slot + off;
+                r.ops.push_back(mv(cb + static_cast<int>(k), src));
+                if (refs.count(src)
+                        && !is_scalar_cap(in.target, static_cast<int>(k)))
+                    new_refs.insert(cb + static_cast<int32_t>(k));
+            }
+        } else if (in.op == OpCode::GuardCalleeV && proven_guard(pc)) {
+            r.replace = true;           /* deleted: true by the facts */
+        } else if (live[pc] && in.op == OpCode::LoadCaptureOfV
+                   && cand.count(in.a_slot())) {
+            r.replace = true;
+            r.ops.push_back(mv(in.target,
+                               cap_base[in.a_slot()] + in.target2));
+        } else if (live[pc] && in.op == OpCode::StoreCaptureOfV
+                   && cand.count(in.b_slot())) {
+            const int cs = cap_base[in.b_slot()] + in.target;
+            r.replace = true;
+            r.ops.push_back(mv(cs, in.a_slot()));
+            if (refs.count(in.a_slot())
+                    && !is_scalar_cap(in.b_slot(), in.target))
+                new_refs.insert(cs);
+        }
+    }
+#ifdef TESTS
+    g_bc_sra_closures += static_cast<unsigned long>(cand.size());
+#endif
+    bc_rewrite_ops(ck, repl);
+    ck.n_temps = next - ck.slot_count;
+    /* a capture slot may hold a reference exactly when something that
+     * may hold one is copied into it (the MoveV rule of ref_slots) */
+    for (std::vector<int32_t> *rl : { &ck.ref_slots, &ck.ref_slots_raw }) {
+        for (const int32_t r : new_refs)
+            rl->push_back(r);
+        std::sort(rl->begin(), rl->end());
+        rl->erase(std::unique(rl->begin(), rl->end()), rl->end());
+    }
+    return true;
+}
+
+bool bc_inline_chunk(Chunk &ck,
+                     const std::vector<const FuncDescriptor *> &slot_desc,
+                     const BcInlineSnapshots &snaps, bool value_only)
+{
+    const bool spliced = bc_inline_chunk_splice(ck, slot_desc, snaps,
+                                                value_only);
+    if (!bc_scalar_replace_closures(ck))
+        return spliced;
+    ck.set_plain_frame();
+    ck.boxed_ops.clear();
+    build_boxed_ops(ck);
+    ck.native_leaf = jit_chunk_is_native_leaf(ck);
+    jit_chunk_frameless_derive(ck);
     return true;
 }

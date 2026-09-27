@@ -4634,15 +4634,17 @@ extern "C" void *jit_make_closure_1(const void *defv,
  * stores through the frame like jit_make_closure, and like the other
  * all-local forms reads no ctx->captures and cannot throw */
 extern "C" void jit_make_closure_locals_st(int_type dst,
-                                           const void *defv) noexcept
+                                           const void *defv,
+                                           int_type off) noexcept
 {
     ML_JIT_OP_RAN(MakeClosureV);
     const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
     ML_CHECK(!g_current_ctx->const_ctx);
     Frame *fr = g_current_ctx->frame;
+    /* `off`: #97 increment 3's capture shift (0 unless spliced) */
     fr->at(dst).put(EvalValue(intrusive_ptr<FuncObject>(
         make_intrusive<FuncObject>(def, get_root_ctx(g_current_ctx),
-                                   fr->slots,
+                                   fr->slots + off,
                                    FuncObject::LocalCaptures()))));
 }
 
@@ -12330,9 +12332,21 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * FuncDescriptor* from the pool (the Instr holds only the index) -
              * no AST. The ctor never throws (a resolved closure's captures are
              * defined), so no loc. */
-            ctx.frame->at(in->target).put(EvalValue(intrusive_ptr<FuncObject>(
-                make_intrusive<FuncObject>(chunk->closure_defs[in->target2],
-                                           &ctx))));
+            if (in->a_dual_hi() > 0) {
+                /* #97 increment 3: spliced from a factory - every capture
+                 * a frame local, `off` slots higher than the descriptor
+                 * says (the verifier bounded the span) */
+                const FuncDescriptor *cd = chunk->closure_defs[in->target2];
+                const int off = make_closure_offset(*in, cd);
+                ctx.frame->at(in->target).put(EvalValue(
+                    intrusive_ptr<FuncObject>(make_intrusive<FuncObject>(
+                        cd, get_root_ctx(&ctx), &ctx.frame->at(off),
+                        FuncObject::LocalCaptures()))));
+            } else {
+                ctx.frame->at(in->target).put(EvalValue(
+                    intrusive_ptr<FuncObject>(make_intrusive<FuncObject>(
+                        chunk->closure_defs[in->target2], &ctx))));
+            }
             pc++;
         }
         VM_NEXT;

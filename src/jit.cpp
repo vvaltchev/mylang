@@ -15897,16 +15897,33 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
         v.bad(in.target); v.bad(in.target2);
         if (!in.a_is_lit()) v.bad(in.a_slot());
         break;
-    case OpCode::MakeClosureV:
-        /* A closure SNAPSHOTS its capture sources from frame MEMORY, but
-         * the captured slots are the closure's (runtime) capture list - the
-         * emitter can't enumerate them to disqualify individually. An N5
-         * register-cached capture source (e.g. a hot loop accumulator the
-         * closure captures) would be STALE in memory when jit_make_closure
-         * reads it. BRACKET it (flush before / reload after) so the rest of
-         * the fragment keeps its pinned registers. */
-        v.mark_barrier(pc);
+    case OpCode::MakeClosureV: {
+        /* A closure SNAPSHOTS its capture sources from frame MEMORY, so a
+         * register-cached source would be stale there. This used to be a
+         * BARRIER (flush every pin before, reload after) on the claim
+         * that the emitter cannot enumerate the captured slots - but it
+         * can: the descriptor lists them, and a SPLICED op (#97
+         * increment 3) records its shift. Found when increment 3 moved
+         * two closure factories into main: the barrier flushed and
+         * reloaded main's four pinned locals around each of them, which
+         * was 24% MORE cycles on 63_closures for 10% fewer instructions.
+         * Only a LOCAL capture reads the frame; a global, capture or
+         * builtin one reads a table no pin mirrors. The dst is written
+         * with a reference. */
+        if (in.target2 < 0
+                || static_cast<size_t>(in.target2) >= ck.closure_defs.size()
+                || !ck.closure_defs[in.target2]) {
+            v.mark_barrier(pc);         /* nothing to enumerate from */
+            break;
+        }
+        const FuncDescriptor *def = ck.closure_defs[in.target2];
+        const int off = make_closure_offset(in, def);
+        for (const auto &cap : def->captures)
+            if (cap.kind == SymKind::local)
+                v.bad(cap.slot + off);
+        v.bad(in.target);
         break;
+    }
     case OpCode::CallBuiltinV:
         /* A callback builtin (make_array/make_dict/find) re-enters
          * vm_dispatch and can mutate ARBITRARY slots (globals, captures,
@@ -22889,6 +22906,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         bool mc_all_local = true;
         for (const auto &cap : mc_def->captures)
             mc_all_local = mc_all_local && cap.kind == SymKind::local;
+        /* #97 increment 3: a spliced op's captures sit `mc_off` slots
+         * higher (all frame locals - the verifier and the splice gate
+         * both require it, so only the local forms below are reached) */
+        const int mc_off = make_closure_offset(in, mc_def);
+        ML_CHECK(mc_off == 0 || mc_all_local);
+        const int32_t mc_disp = static_cast<int32_t>(
+            mc_off * static_cast<int32_t>(sizeof(LValue)));
         const bool mc_locals = mc_s1 >= 0 && mc_all_local;
         emit_call_prologue(e);
         /* #97 R2c: exactly one local capture -> its own straight-line
@@ -22898,10 +22922,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.movabs(RDI, reinterpret_cast<uint64_t>(mc_def));
             e.lea(RSI, static_cast<int32_t>(                 /* reg:abi */
                 mc_def->captures[0].slot
-                * static_cast<int32_t>(sizeof(LValue))));
+                * static_cast<int32_t>(sizeof(LValue))) + mc_disp);
         } else if (mc_locals) {
             e.movabs(RDI, reinterpret_cast<uint64_t>(mc_def));
-            e.lea(RSI, 0);                       /* reg:abi: &slot 0 */
+            e.lea(RSI, mc_disp);                 /* reg:abi: &slot off */
         } else if (mc_s1 >= 0) {
             /* the CONSTRUCT-ONLY form: (def) -> the pointer */
             e.movabs(RDI,
@@ -22912,6 +22936,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                               static_cast<int_type>(in.target)));
             e.movabs(RSI,
                      reinterpret_cast<uint64_t>(ck.closure_defs[in.target2]));
+            if (mc_all_local)           /* #97 inc 3: the capture shift */
+                e.mov_imm(RDX, static_cast<uint64_t>(          /* reg:abi */
+                                   static_cast<int_type>(mc_off)));
         }
         /* R3: the all-local storing form reads no ctx->captures, which
          * is what jit_op_w4_safe admits the op on - with or without a

@@ -1090,7 +1090,8 @@ extern const LValue *g_jit_audit_window;
 /* #97 R3: the all-local STORING form, for a site with no scratch -
  * (dst, def); cannot throw, reads no ctx->captures (W4-safe) */
 extern "C" void jit_make_closure_locals_st(int_type dst,
-                                           const void *def) noexcept;
+                                           const void *def,
+                                           int_type off) noexcept;
 
 /* model-flip (nativize-ops): MakeArrayV natively - build an array LITERAL from
  * the element run [base, base+n) via the shared build_array_from_values, honoring
