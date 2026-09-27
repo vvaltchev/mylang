@@ -25319,31 +25319,24 @@ static bool unpack_fast_bind_shapes()
         bool exact_zero;          /* the decline shape: growth must be 0 */
     };
     const std::vector<Case> cases = {
-        /* 75_indexed_unpack's shape: GENERAL string rows, foreach unpack
-         * in a loop. 3 rounds x 3 rows x 2 binds = 18; only the 2 first-
-         * round first-row binds miss (the slots still hold none). */
-        { "general str rows (the 75 shape)", {
-            "var rows = [];",
-            "for (var j = 0; j < 3; j++)",
-            "    append(rows, [\"a\" + str(j), str(j)]);",
-            "var n = 0;",
-            "for (var r = 0; r < 3; r++)",
-            "    foreach (var a, b in rows) n += len(a) + len(b);",
-            "assert(n == 27);" }, 10, false },
-        /* flat-strs rows (split()) - the flat_strs() arm */
-        { "flat strs rows (split)", {
-            "var rows = [];",
-            "for (var j = 0; j < 3; j++)",
-            "    append(rows, split(\"x\" + str(j) + \" y\", \" \"));",
-            "var n = 0;",
-            "for (var r = 0; r < 3; r++)",
-            "    foreach (var a, b in rows) n += len(a) + len(b);",
-            "assert(n == 27);" }, 10, false },
-        /* MultiUnpackV: a string destructure re-run in a loop */
+        /* The general-row FOREACH cases below (slices, `_`) no longer
+         * reach the bind this test counts - they are lowered to element
+         * reads - so their floor is 0 and they stand as VALUE tests of
+         * the lowered path (the slice offset, the `_` skip); the
+         * multi-unpack cases (a `dyn` rvalue) still count MultiUnpackV. */
+        /* (75_indexed_unpack's shape - GENERAL string rows - and flat
+         * strs rows (split()) are no longer UnpackElemValue: the codegen
+         * lowers a general-row foreach unpack to LoadElemValue +
+         * UnpackLenCheck, whose element reads take LoadElemValue's inline
+         * tier - its general and flat-strs arms - not this bind.) */
+        /* MultiUnpackV: a string destructure re-run in a loop. The
+         * rvalue goes through runtime() so it is `dyn`: a PROVEN array
+         * is lowered to UnpackLenCheck + element loads and never
+         * reaches this op's arms. */
         { "multi-unpack str destructure", {
             "var p = [\"mm\", \"nn\"]; append(p, \"oo\");",
             "var a = \"\"; var b = \"\"; var c = \"\";",
-            "for (var i = 0; i < 3; i++) { a, b, c = p; }",
+            "for (var i = 0; i < 3; i++) { a, b, c = runtime(p); }",
             "assert(a == \"mm\" && b == \"nn\" && c == \"oo\");" },
           4, false },
         /* MultiUnpackV over a SLICE rvalue - the multi-unpack twin of the
@@ -25353,7 +25346,7 @@ static bool unpack_fast_bind_shapes()
         { "multi-unpack over a str slice", {
             "var src = split(\"zz aa bbb\", \" \");",
             "var a = \"\"; var b = \"\";",
-            "for (var i = 0; i < 3; i++) { a, b = src[1:3]; }",
+            "for (var i = 0; i < 3; i++) { a, b = runtime(src[1:3]); }",
             "assert(a == \"aa\" && b == \"bbb\");" }, 3, false },
         /* MultiUnpackV: the scalar string SPREAD */
         { "multi-unpack str spread", {
@@ -25376,7 +25369,7 @@ static bool unpack_fast_bind_shapes()
             "    foreach (var a, b in rows) {",
             "        n += len(a) + len(b); last = a + b;",
             "    }",
-            "assert(n == 45); assert(last == \"a2bb2\");" }, 6, false },
+            "assert(n == 45); assert(last == \"a2bb2\");" }, 0, false },
         /* the GENERAL-storage twin of the slice case above, and it is
          * NOT optional: with only the strs case, dropping the general
          * arm's `+ off` left the whole suite GREEN (watched). The row is
@@ -25395,7 +25388,7 @@ static bool unpack_fast_bind_shapes()
             "        n += len(str(a)) + len(str(b));",
             "        last = str(a) + str(b);",
             "    }",
-            "assert(n == 45); assert(last == \"a2bb2\");" }, 6, false },
+            "assert(n == 45); assert(last == \"a2bb2\");" }, 0, false },
         /* the TARGETS variant (a `_` placeholder makes the run
          * non-consecutive) over the same hoisted string base */
         { "targets with _ over strs", {
@@ -25407,7 +25400,7 @@ static bool unpack_fast_bind_shapes()
             "    foreach (var a, _, c in rows) {",
             "        n += len(a) + len(c); last = a + c;",
             "    }",
-            "assert(n == 24); assert(last == \"p1q1\");" }, 6, false },
+            "assert(n == 24); assert(last == \"p1q1\");" }, 0, false },
         /* DECLINE: alternating str/int re-binds - every bind is a type
          * change, so the fast arm must never fire (growth EXACTLY 0) */
         { "alternating types decline", {
@@ -28765,6 +28758,100 @@ static bool myv_spliced_closure_span()
  * `g_bc_sra_closures` counts the slots replaced at compile time,
  * `g_bc_sra_tagged` those that needed a tag.
  */
+/*
+ * THE LOWERED STRICT UNPACK - a destructure of a PROVEN array (multi-assign)
+ * and a GENERAL-row foreach unpack become UnpackLenCheck + one element read
+ * per target. The shape test: it must fire where the rvalue is proven an
+ * array (typed reads behind the flat-kind flag for int/float elements,
+ * LoadElemValue otherwise), and must NOT fire for a `dyn` rvalue, an OPT
+ * array (a runtime none SPREADS - a different operation), a compound
+ * `a, b += arr`, a coercing typed target, or a flat int/float foreach row
+ * (which keeps UnpackElemInt/Float). The VALUES are
+ * tests/functional/48_unpack_lowered.my's job; this pins the SHAPE, which
+ * no engine differential can see (both engines run the same bytecode).
+ */
+static bool unpack_lowering_shapes()
+{
+    struct Shape {
+        const char *name;
+        const char *src;
+        bool want_check;          /* an UnpackLenCheck in main */
+        OpCode want_read;         /* the typed read, or OpCount_ = none */
+    };
+    const Shape shapes[] = {
+        { "flat int destructure (the 73 shape)",
+          "var arr = [1, 2, 3]; var a, b, c = arr; print(a + b + c);\n",
+          true, OpCode::LoadElemInt },
+        { "flat float destructure",
+          "var f = [1.5, 2.5]; var x, y = f; print(x + y);\n",
+          true, OpCode::LoadElemFloat },
+        { "string destructure (value reads only)",
+          "var s = [\"a\", \"b\"]; var x, y = s; print(x + y);\n",
+          true, OpCode::OpCount_ },
+        { "general-row foreach (the 75 shape)",
+          "var rows = [[\"a\", \"b\"]]; var n = 0;\n"
+          "foreach (var x, y in rows) n += len(x) + len(y); print(n);\n",
+          true, OpCode::OpCount_ },
+        { "dyn rvalue (kept: MultiUnpackV)",
+          "var p = [1, 2]; var dyn x = 0; var dyn y = 0;\n"
+          "x, y = runtime(p); print(x, y);\n", false, OpCode::OpCount_ },
+        { "opt array rvalue (kept: a none SPREADS)",
+          "func f(opt array<int> a) { var x = 0; var y = 0;\n"
+          "  x, y = a; return x; }\n"
+          "print(f(runtime([4, 5])));\n", false, OpCode::OpCount_ },
+        { "compound destructure (kept)",
+          "var p = [1, 2]; var x = 1; var y = 2; x, y += p;\n"
+          "print(x, y);\n", false, OpCode::OpCount_ },
+        { "coercing typed target (kept)",
+          "var p = [1, 2]; float x = 0.0; float y = 0.0; x, y = p;\n"
+          "print(x, y);\n", false, OpCode::OpCount_ },
+        { "flat int foreach row (kept: UnpackElemInt)",
+          "var rows = [[1, 2], [3, 4]]; var n = 0;\n"
+          "foreach (var x, y in rows) n += x * y; print(n);\n",
+          false, OpCode::OpCount_ },
+    };
+    bool ok = true;
+    const ExecEngine saved = g_exec_engine;
+    for (const Shape &sh : shapes) {
+        try {
+            std::vector<Tok> toks;
+            lexer(sh.src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+            bool check = false, read = false;
+            const auto scan = [&](const Chunk &ck) {
+                for (const Instr &in : ck.code) {
+                    if (in.op == OpCode::UnpackLenCheck)
+                        check = true;
+                    if (in.op == sh.want_read)
+                        read = true;
+                }
+            };
+            scan(prog.root);
+            for (const auto &d : prog.funcs)
+                if (d->vm_chunk)
+                    scan(*static_cast<const Chunk *>(d->vm_chunk));
+            if (check != sh.want_check
+                    || (sh.want_read != OpCode::OpCount_ && !read)) {
+                fprintf(stderr, "unpack_lowering_shapes [%s]: check=%d "
+                                "typed-read=%d\n", sh.name, (int)check,
+                        (int)read);
+                ok = false;
+            }
+        } catch (Exception &e) {
+            fprintf(stderr, "unpack_lowering_shapes [%s]: %s: %s\n",
+                    sh.name, e.name, e.msg ? e.msg : "");
+            ok = false;
+        }
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
 static bool bc_sra_closures()
 {
     struct Shape { const char *name; const char *src; bool want; };
@@ -32712,12 +32799,14 @@ static bool jit_slot_liveness_check()
          * POOL, so visit_use_def does not name it - a BARRIER, and this
          * case is what makes check (2) non-vacuous. (It was an array
          * element store until #25 audited that family, 2026-09-21; the
-         * store case stays below as an AUDITED op, exercising (1).) */
+         * store case stays below as an AUDITED op, exercising (1).)
+         * The rvalue is `dyn` (runtime()): a PROVEN array is lowered to
+         * UnpackLenCheck + element loads, which ARE audited. */
         { "multi-assign (an UNAUDITED op)",
           "var lim = 0; lim = lim + runtime(4);\n"
           "var p = [lim, lim + 1];\n"
-          "var x = 0; var y = 0;\n"
-          "for (var i = 0; i < lim; i++) { x, y = p; x = x + i; }\n"
+          "var dyn x = 0; var dyn y = 0;\n"
+          "for (var i = 0; i < lim; i++) { x, y = runtime(p); x = x + i; }\n"
           "print(x + y);\n" },
         { "array element store (audited since #25)",
           "var lim = 0; lim = lim + runtime(4);\n"
@@ -33186,6 +33275,8 @@ static bool opcode_table_census()
           "d1: its helper arm CONVEYS an image's refused operand" },
         { OpCode::StoreCaptureOfV,       1,1,1,0,0,0,
           "d1: its helper arm CONVEYS an image's refused operand" },
+        { OpCode::UnpackLenCheck,        1,1,1,0,0,0,
+          "d1: its cold tier CONVEYS the strict unpack TypeErrorEx" },
     };
     const size_t nrows = sizeof(rows) / sizeof(rows[0]);
     const Chunk ck;      /* empty - census_instr never makes a shape
@@ -46612,7 +46703,10 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime([[1.5, 2.0], [0.5, 4.0]])) == 5.0);" } },
-        { OpCode::UnpackElemValue, {
+        /* (UnpackElemValue is no longer emitted: a general-row foreach
+         * unpack lowers to LoadElemValue + UnpackLenCheck, and the
+         * shape that used to reach it proves UnpackLenCheck instead.) */
+        { OpCode::UnpackLenCheck, {
             "func f(array<array<str>> a) {",
             "  var s = \"\";",
             "  foreach (x, y in a) s = s + x + y;",
@@ -48905,6 +48999,9 @@ static const std::vector<extra_check> extra_checks =
     { "call: #97 increment 5 - a closure that never escapes is SCALAR-"
       "REPLACED (its captures become frame slots); an escaping one is kept",
       bc_sra_closures },
+    { "codegen: a PROVEN-array destructure lowers to UnpackLenCheck + "
+      "element reads; dyn / opt / compound / coercing / flat-row kept",
+      unpack_lowering_shapes },
     { "myv: the verifier bounds a planned ctor's mini-run (small-938, a "
       "load-time HANG)", myv_verify_ctor_minirun },
     { "jit: #97 inc 3 (W1/W2) - the CALLER builds the frameless window "

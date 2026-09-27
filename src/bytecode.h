@@ -1227,6 +1227,32 @@ enum class OpCode : unsigned char {
     StoreCaptureOfV,
 
     /*
+     * THE STRICT-UNPACK LENGTH TEST of a destructure whose rvalue the
+     * inferencer PROVED an array - a multi-assign `a, b, c = arr`
+     * (Expr14::unpack_rv_array) or a foreach unpack's row.
+     *   `target2` = the array's slot (always a slot);
+     *   `a`       = a literal N, the target count (`_` included);
+     *   `b`       = literal flags: bit 0 the FOREACH message (its
+     *               "foreach: " prefix), bit 1 / bit 2 = the rvalue is
+     *               PROVEN array<int> / array<float>;
+     *   `target`  = a flag slot, or -1 - with bit 1 or 2 set it receives
+     *               int 1 when the array's storage IS that flat kind, else
+     *               0.
+     * Raises the destructure's TypeErrorEx - "cannot unpack an array of
+     * length M into N variables", caret = the loc side table (the Expr14,
+     * or the foreach's container) - unless the array holds exactly N
+     * elements. The codegen follows it with one element read per target:
+     * LoadElemInt/Float on the flag, else LoadElemValue - which binds each
+     * element's ACTUAL value, as the ops this replaces (MultiUnpackV,
+     * UnpackElem*) always did: an array<float> built in an unhinted
+     * position can hold an int, and a typed read of it raises. Unlike
+     * those ops (pool-target ops, barriers to every dataflow table) it has
+     * an exact use/def row. A non-array base (an image's corrupt operand)
+     * raises nothing and flags 0; the reads keep their own checks.
+     */
+    UnpackLenCheck,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1277,7 +1303,8 @@ enum class OpCode : unsigned char {
     X(LoadMemberInt) X(LoadMemberFloat) X(IntAddModRI) X(JumpUnlessElemInt) \
     X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt) X(EnterNative) \
     X(ExitBlock) X(LoadElem2Int) X(LoadElem2Float) X(ArrEpochMark) \
-    X(ArrEpochCheck) X(GuardCalleeV) X(LoadCaptureOfV) X(StoreCaptureOfV)
+    X(ArrEpochCheck) X(GuardCalleeV) X(LoadCaptureOfV) X(StoreCaptureOfV) \
+    X(UnpackLenCheck)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin

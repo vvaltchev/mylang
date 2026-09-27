@@ -4537,6 +4537,59 @@ extern "C" void jit_arr_epoch_mark(LValue *slots, int_type dst,
     slots[dst].put(EvalValue(vm_epoch_mark(slots[base].get())));
 }
 
+/* UnpackLenCheck's shared test: the size of a destructure's proven-
+ * array rvalue when it is NOT the target count (the op then raises),
+ * else -1. A non-array base (an image's corrupt operand) answers -1 -
+ * the loads after the check keep their own checks. */
+static ML_ALWAYS_INLINE int64_t vm_unpack_len_bad(const EvalValue &v,
+                                                   int_type n)
+{
+    if (!v.is<SharedArrayObj>())
+        return -1;
+    const size_type m = v.get_ref<SharedArrayObj>().size();
+    return static_cast<int_type>(m) == n ? -1 : static_cast<int64_t>(m);
+}
+
+/* UnpackLenCheck's flag: the storage IS the proven flat kind (b bit 1
+ * ints, bit 2 floats) - the only case the typed element reads take. */
+static ML_ALWAYS_INLINE bool vm_unpack_flat_ok(const EvalValue &v,
+                                               int_type flags)
+{
+    if (!v.is<SharedArrayObj>())
+        return false;
+    const auto sk = v.get_ref<SharedArrayObj>().skind();
+    return (flags & 2) ? sk == SharedArrayObj::Storage::ints
+                       : sk == SharedArrayObj::Storage::floats;
+}
+
+/* UnpackLenCheck's cold tier (the emitted inline compare saw a mismatch,
+ * or a storage kind it does not read): 1 = conveyed the TypeErrorEx
+ * LOC-LESS (the emitter's exc-stamp gives it the caret), 0 = the length
+ * is right - and then the flag slot, if any, is written. */
+extern "C" int jit_unpack_len_check(LValue *slots, int_type base,
+                                    int_type n, int_type flags,
+                                    int_type dst) noexcept
+{
+    ML_JIT_OP_RAN(UnpackLenCheck);
+    const EvalValue &v = slots[base].get();
+    const int64_t m = vm_unpack_len_bad(v, n);
+    if (m < 0) {
+        if (dst >= 0)
+            slots[dst].put(EvalValue(static_cast<int_type>(
+                vm_unpack_flat_ok(v, flags) ? 1 : 0)));
+        return 0;
+    }
+    try {
+        if (flags & 1)
+            vm_throw_unpack_len(nullptr, 0, static_cast<size_type>(m), n);
+        vm_throw_multi_unpack_len(nullptr, 0, static_cast<size_type>(m),
+                                  static_cast<size_t>(n));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+    }
+    return 1;
+}
+
 /* The cold tier of the emitted check (its inline compare saw a mismatch,
  * or a base it cannot navigate): 1 = conveyed the OutOfBoundsEx LOC-LESS
  * (the emitter's exc-stamp gives it the container caret), 0 = no raise -
@@ -13099,6 +13152,29 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * is shared with jit_arr_epoch_mark) */
             ctx.frame->at(in->target).put(EvalValue(
                 vm_epoch_mark(ctx.frame->at(in->target2).get())));
+            pc++;
+        }
+        VM_NEXT;
+
+        VM_CASE(UnpackLenCheck): {
+            /* the destructure's strict length test + its flat-kind flag
+             * (shared with jit_unpack_len_check) */
+            const EvalValue &v = ctx.frame->at(in->target2).get();
+            const int_type n = in->a_lit();
+            const int_type fl = in->b_lit();
+            const int64_t m = vm_unpack_len_bad(v, n);
+            if (m >= 0) {
+                if (fl & 1)                 /* the foreach flavour */
+                    vm_throw_unpack_len(chunk, pc,
+                                        static_cast<size_type>(m), n);
+                vm_throw_multi_unpack_len(chunk, pc,
+                                          static_cast<size_type>(m),
+                                          static_cast<size_t>(n));
+            }
+            if (in->target >= 0)
+                ctx.frame->at(in->target).put(EvalValue(
+                    static_cast<int_type>(vm_unpack_flat_ok(v, fl) ? 1
+                                                                   : 0)));
             pc++;
         }
         VM_NEXT;

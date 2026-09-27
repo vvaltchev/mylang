@@ -15919,3 +15919,71 @@ candidates is not spliced, so it reads the object). Watched failing: an
 undecided guard deleted, every tag 0 (both nets, both). The else-edge
 keeping the refuted closure fails CLOSED - the miss call becomes
 reachable and nothing is replaced; the vacuity checks name every shape.
+
+**THE UNPACK LOWERING (2026-09-28): a destructure of a proven array and a
+general-row foreach unpack become a length check + element reads.** The
+two worst benches on the `my/cpp` table after #97 were both destructures:
+73_multi_unpack 7.19x (`var a, b, c = arr` on a flat int array, every
+iteration) and 75_indexed_unpack 9.19x (`foreach (i, name, val in indexed
+rows)` over string rows). Profile first: 73 spent ~347 Ir per iteration in
+C++ - `vm_multi_unpack_body` 165, `arr_elem_at` 84, `LValue::put` 57 - for
+three ints, because a flat-int source took the op's generic
+`d.put(vm_arr_elem(...))` arm; 75 spent ~180 Ir per row in
+`vm_unpack_elem_body` + `jit_unpack_elem`.
+
+**THE CHANGE.** A new op, **`UnpackLenCheck`** (appended - myv v26): the
+strict length test alone, raising the multi-assign's or (`b` bit 0) the
+foreach's TypeErrorEx; with `b` bit 1/2 it also writes a flag slot = "the
+storage IS flat ints/floats". `emit_lowered_unpack` (codegen.cpp) follows
+it with one element read per target - LoadElemInt/Float behind the flag,
+LoadElemValue otherwise. The inferencer stamps `Expr14::unpack_rv_array` /
+`unpack_rv_th` for a non-opt Array rvalue. Two supporting tiers: **ArrLen
+inline** for a non-slice flat scalar array (the helper cost ~63 Ir - 43 in
+`jit_arr_len`, 20 in the boxed put - for a subtract and a shift), and a
+**flat-strs arm in LoadElemValue's inline tier** (retain the StrObj,
+release dst's old value, copy the 24-byte SharedStr as the payload, store
+the t_str tag; a null StrObj declines) - without it split() rows REGRESSED
++42% cycles, since UnpackElemValue had a strs arm and LoadElemValue's tier
+read only general storage. UnpackLenCheck's own inline test compares the
+vector's byte length with N x the element size per storage kind (8, 1,
+24, 48 - no divide), the flag being a constant per kind arm.
+
+**WHY THE FLAG, and it is not optional.** An array<float> built in an
+UNHINTED position - `append(lst, [fi, ff])` - keeps GENERAL storage holding
+an int, and a typed LoadElemFloat of it raises TypeErrorEx where
+MultiUnpackV / UnpackElemFloat bound the int (as the tree-walker does). The
+first version used typed reads unconditionally and failed the "box-safe
+mixed sub-array" `-rt` entry. That typing hole is PRE-EXISTING and wider
+than this change (`var x = r[0]` on the same row raises under the VM and
+prints `3` in the tree-walker, and a joined int/float accumulator prints
+`7.000000` vs `7`); the flag keeps the lowering from spreading it. Its
+cost: the boxed fallback's LoadElemValue may bind a reference (a general
+array<int> can take a string through a `dyn` alias), so the targets are
+ref-listed - 73 reads 84 Ir per iteration without the flag, 210 with it.
+
+**WHY IT PAID BEYOND THE HELPER.** MultiUnpackV is a pool-target op, so
+`visit_use_def` answers BARRIER for it and `compute_ref_slots` lists EVERY
+slot of the chunk as reference-carrying: every int store in 73's main paid
+a release test. UnpackLenCheck has an exact row.
+
+Pinned, OPT=1 ASSERTS=0, taskset -c 2, against 28209a2, bench scales:
+
+    73  cycles 1170M -> 258M (-78%)   instructions 5014M -> 2046M
+    75  cycles 1129M ->  761M (-33%)  instructions 4600M -> 3665M
+    split() rows (75's shape, flat strs)  279M -> 196M cycles (-30%)
+    20 / 26 / 74 / 14 / 18   instructions identical (bytecode unchanged)
+
+`my/cpp` (one run): 73 7.19x -> 2.21x, 75 9.19x -> 6.58x. A FLAT int/float
+foreach row keeps UnpackElemInt/Float (-2% measured on 20 - not worth the
+flag's branch); UnpackElemValue is no longer emitted by any codegen path.
+
+Pinned by `unpack_lowering_shapes` (fires for flat int / float / string
+destructures and a general-row foreach; kept for a dyn rvalue, an OPT array
+- a runtime none SPREADS - a compound, a coercing target and a flat foreach
+row) and `tests/functional/48_unpack_lowered.my` (both typed kinds, the
+mixed row, a bool row, `_`, a slice rvalue, general and split() rows,
+both strict errors caught on a later iteration, a container shrinking under
+the loop). Watched failing: the flag always "flat" (corpus 48), the length
+check never raising (four -rt differentials + corpus 48), the strs arm
+without its retain (corpus: 08, 30, 48), an opt array lowered (the shape
+test only - no corpus program destructures an opt array).

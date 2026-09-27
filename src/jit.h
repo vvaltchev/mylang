@@ -1052,6 +1052,12 @@ extern "C" void jit_arr_len(LValue *slots, int_type dst,
  * stamps the container caret), 0 = no raise. */
 extern "C" void jit_arr_epoch_mark(LValue *slots, int_type dst,
                                    int_type base) noexcept;
+/* UnpackLenCheck's cold tier: 1 = conveyed the strict unpack TypeErrorEx
+ * loc-less (the emitter stamps the caret), 0 = the length is right (the
+ * flag slot `dst`, if >= 0, then written) */
+extern "C" int jit_unpack_len_check(LValue *slots, int_type base,
+                                    int_type n, int_type flags,
+                                    int_type dst) noexcept;
 extern "C" int jit_arr_epoch_check(LValue *slots, int_type base,
                                    int_type m) noexcept;
 
@@ -1382,7 +1388,7 @@ extern unsigned long g_jit_op_run[];
 #define ML_FOR_EACH_JIT_DECLINE(X) \
     X(elemv_base_not_arr) X(elemv_base_slice) X(elemv_base_kind) \
     X(elemv_scale_wrap) X(elemv_bounds) X(elemv_elem_ex) \
-    X(elemv_elem_slice) \
+    X(elemv_elem_slice) X(elemv_str_null) \
     X(storev_base_not_arr) X(storev_base_const) X(storev_base_slice) \
     X(storev_readonly) X(storev_base_kind) X(storev_has_slices) \
     X(storev_scale_wrap) X(storev_bounds) X(storev_elem_const) \
@@ -1392,7 +1398,10 @@ extern unsigned long g_jit_op_run[];
     X(memberv_val_slice) \
     X(elemb_base_not_arr) X(elemb_base_slice) X(elemb_base_kind) \
     X(elemb_bounds) \
-    X(epoch_base_not_arr) X(epoch_shifted)
+    X(epoch_base_not_arr) X(epoch_shifted) \
+    X(arrlen_base_not_arr) X(arrlen_base_slice) X(arrlen_base_kind) \
+    X(unpacklen_base_not_arr) X(unpacklen_base_slice) \
+    X(unpacklen_base_kind) X(unpacklen_len)
 
 enum JitDecline {
 #define ML_JD_ENUM(n) JD_##n,
@@ -1433,6 +1442,8 @@ extern "C" unsigned long g_jit_elem2_fast;
 /* G5: emitted-code proof that the INLINE len(str) ran (the helper is gone
  * for a proven-string base, so jit_str_len's own counter cannot say). */
 extern "C" unsigned long g_jit_strlen_fast;
+/* the inline flat-array len (ArrLen) runs - bumped by EMITTED code */
+extern "C" unsigned long g_jit_arrlen_fast;
 /* #95: the EMITTED inline ord(s[i]) arm (execution proof) */
 extern "C" unsigned long g_jit_ord_inline;
 /* G4: execution proof for the CHECKED a[i].f helper (the subscript form). */

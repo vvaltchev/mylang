@@ -1766,6 +1766,19 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "arr.check    epoch(" << D(in.target2) << ") == "
                 << RI(in.a(), false) << "   ; else OutOfBounds";
             break;
+        case OpCode::UnpackLenCheck:
+        {
+            const int_type fl = in.b_is_lit() ? in.b_lit() : 0;
+            row << "unpack.len   ";
+            if (in.target >= 0)
+                row << D(in.target) << " = flat "
+                    << ((fl & 2) ? "int" : "float") << "(" << D(in.target2)
+                    << ") ; ";
+            row << "len(" << D(in.target2) << ") == "
+                << (in.a_is_lit() ? in.a_lit() : -1) << " else the strict "
+                << ((fl & 1) ? "foreach " : "") << "unpack error";
+        }
+            break;
         case OpCode::StrLen:
             row << "str.len      " << D(in.target) << " = len("
                 << D(in.target2) << ")   ; str chars";
