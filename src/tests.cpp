@@ -853,6 +853,34 @@ static const std::vector<test> tests =
       { "var c = 1;",
         "var h = func [c] (y) { return y; };",
         "assert(str(h(true)) == \"1\" && h(5) == 5);" } },
+    /*
+     * ...but ONLY a param a bind can actually CONVERT is stamped: one every
+     * site feeds its final type keeps fast_bind. Stamping it turned the
+     * invoker's plain copy into a per-argument coercion - +49% Ir on
+     * 34_sort_custom_cmp's comparator, +24% on 35_map_filter - for a
+     * conversion that could never fire. signature() renders a stamped
+     * param with its type, so the stamp itself is what is asserted.
+     * Watched failing: stamping every int/float param fails all three
+     * unstamped rows in every mode.
+     */
+    { "coerce: a param fed only its final type stays unstamped (fast_bind)",
+      { "var b = 2;",
+        "var f = func [b] (x) { return x; };",
+        "f(1); f(2);",
+        "assert(signature(f) == \"func <lambda>(x)\");",
+        "var g = func [b] (x) { return x; };",
+        "g(1.5); g(2.5);",
+        "assert(signature(g) == \"func <lambda>(x)\");",
+        "var xs = [3, 1, 2];",
+        "var c = func [b] (p, q) { return p < q; };",
+        "sort(xs, c);",
+        "assert(signature(c) == \"func <lambda>(p, q)\");",
+        "var h = func [b] (x) { return x; };",
+        "h(1); h(2.5);",
+        "assert(signature(h) == \"func <lambda>(float x)\");",
+        "var k = func [b] (y) { return y; };",
+        "k(true); k(5);",
+        "assert(signature(k) == \"func <lambda>(int y)\");" } },
     { "coerce: a dyn argument the joined float param cannot take throws",
       { "var b = 2;",
         "var f = func [b] (x) { return x; };",
