@@ -15558,3 +15558,86 @@ parity with `g_jit_guard_proven` moving, and an IMAGE whose two
 same tamper with the splice off. Watched failing: dropping the
 descriptor compare fails the image case; dropping the kill fails the
 array case. `corpus_diff --levers --cold` 34/34 configurations clean.
+
+**G1 - THE GUARD CHECKED ONCE PER LOOP (loop versioning, 2026-09-27).**
+A loop whose inline-cache guards read a callee slot that no op in the
+loop writes checks them ONCE, in a preheader, and runs a hot copy in
+which those guards emit nothing; a miss runs the cold copy - the
+ordinary emission, every guard in place. Sound because the guard's
+truth is a function of the slot's value alone (a FuncObject's
+descriptor never changes), and the slot cannot change inside the loop:
+nothing in it writes the slot, and a callee cannot reach the caller's
+frame.
+
+It is C1's machinery, not a copy of it: a guard region is a
+`HoistRegion` with `base == -1` and a `guards` list, so the preheader
+placement (before `label[T]`, so a back edge skips it), the cold copy
+emitted against the replayed register state at T, the LSRA `noreach`
+and share-plan `noseam` exclusions, and lever A's refusal to forward
+across a preheader all apply unchanged. What differs from an element
+region, and why:
+ - **no register claim** - the check needs none after it runs, so a
+   guard region does not deny r10/r11 to the pin pool
+   (`has_elem_hoist` feeds `jit_xcache_clobber`, not "any region");
+ - **CALLS are allowed** - every guard's miss arm IS a call. C1
+   refuses calls only because a sync call does not re-derive r10/r11;
+ - **so post-call RESUMES are allowed, and each one RE-CHECKS.** C1
+   refuses an entry stub inside a region; a guard region cannot (the
+   miss arm's call has one), and a stub landing in the hot copy
+   would skip the guards. So every stub inside a guard region runs
+   the region's checks after its register replay and resumes at the
+   COLD copy's label for that pc on a miss. `emit_guard_check` is the
+   ONE body behind the op, the preheader and the stub;
+ - the pick: T past the run head (the frameless entry and a head
+   entry land after the preheader bytes), no jump in from outside, no
+   handler pc inside, every op known to `jit_op_slot_refs` (an unknown
+   op may write anything), and a guard is hoisted only if no op in
+   [T, L] lists its slot as a def. G3-proven guards need nothing and
+   are skipped; a region holding a C4e-established ctor is declined
+   (its cold copy would bypass the establish; none exists today).
+`MYLANG_JIT_COLD=guard` makes the preheader and every stub re-check
+compare the descriptor against 1 - a conditional edge that always
+misses - so the cold copy runs; an unconditional jmp would leave the
+hot copy's label with no stack model. Lever: `MYLANG_JIT_OFF=ghoist`.
+
+Measured, same binary with `MYLANG_JIT_OFF=ghoist` as the A/B, pinned,
+scale 3, twice each (G2 and G3 in both):
+
+    bench  cycles (off -> on)          instructions
+    11     26.1/22.8M -> 20.6/20.0M    93.75M -> 75.79M (-19.2%)
+    78     35.5/35.3M -> 28.9/29.1M   196.88M -> 160.97M (-18.2%)
+    63     flat (its loop rebinds both closures - not hoisted)
+    98     flat (G3 already removed its guards)
+
+That is the NO-GUARD CEILING measured by the unsound lane above (11
+20.2/20.1M cycles and 75.68M instructions; 78 29.0M and 160.8M) to
+within noise: on the benches it reaches, the guard's per-iteration
+cost is gone. Against step 1b's binary the three G steps together
+read 11 -13% and 78 -19% cycles.
+
+Pinned by `jit_guard_hoist_g1`: HOT (the preheader passed and the hot
+copy's guards executed as nothing - `g_jit_ghoist_pre` /
+`g_jit_ghoist_hot`), COLD (every guard forced to miss runs the cold
+copy - `g_jit_cold_copy`), RESUME (a call in the loop returns through
+its stub with the sync cap at 1 and the frameless tier off; the stub
+re-checks - `g_jit_ghoist_stub` - and resumes hot, or cold when
+forced), and REBIND (a loop that rewrites the slot keeps its guard,
+with the slot ALREADY holding the right closure at loop entry - with
+`var a` inside the loop the slot is none at entry and a wrongly
+hoisted guard just goes cold, invisibly; the first version of the case
+had that shape and passed the sabotage). `myv_closure_guard_tamper`
+now requires the cold copy to have run: its loop's guards are hoisted,
+so the tamper is seen by the preheader. Watched failing: a stub that
+does not re-check (RESUME COLD: hot 19), a guard hoisted although the
+loop rewrites its slot (REBIND), a preheader that checks nothing (COLD,
+and the tampered image prints a wrong answer). Two instrument fixes
+came out of that: the hot copy's elision now precedes the COLD arm (a
+second forced miss there masked a wrong route into the hot copy), and
+the stub's counter is bumped before its checks (a miss leaves from
+them). `MYLANG_HOISTDBG=1` prints each guard region's refusal reason.
+`corpus_diff --levers --cold --nolowmem --xrot`: 52/52 configurations.
+Two test expectations moved with it: `closure_inline_parity` counts a
+hoisted guard as reach (and adds a `ghoist`-off run so the
+per-iteration guard keeps its own), and `vm_disasm_driver_jit_parity`
+now expects 6 frameless sites for 78 - the loop's cold copy emits its
+two miss-arm calls a second time.

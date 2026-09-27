@@ -13,7 +13,9 @@ instructions but +2..4% cycles, undiagnosed (record: *STEP 1b*).
 GUARD COST (record: *G2* / *G3* under STEP 1b): G2 shortened the guard
 (6% fewer instructions on 11/78, ~1% cycles); G3 is increment 4 - a
 guard a local `make.closure` proves emits nothing (bench 98, written
-for it: -16.5% cycles). Increments 2, 3 and 5 not started. Designed from
+for it: -16.5% cycles); G1 checks a loop-invariant guard once, before
+the loop (loop versioning on C1's machinery): 11 and 78 reach the
+no-guard ceiling. Increments 2, 3 and 5 not started. Designed from
 measurement (2026-09-27). Maintainer's call: this replaces the
 call-protocol store trimming (R5/R6 both measured flat and are parked
 on `r5-offpath-framefree` / `r6-return-forward`).
