@@ -124,7 +124,20 @@ FuncObject::FuncObject(const FuncDescriptor *func, EvalContext *root,
     capture_slots.reserve(func->captures.size());
     for (const auto &cap : func->captures) {
         ML_CHECK(cap.kind == SymKind::local);
-        capture_slots.emplace_back(frame[cap.slot].get(), false);
+        /*
+         * A SCALAR is copied through its 8-byte payload word, never the
+         * whole union: the generic copy is one 16-byte load, and the
+         * slot was written by EMITTED code a few instructions earlier as
+         * separate 8-byte stores - a load that spans two in-flight
+         * stores cannot be forwarded and stalls until they retire. On
+         * 63_closures that one load was 54% of all cycles (#97 R2b).
+         */
+        const EvalValue &src = frame[cap.slot].get();
+        const Type::TypeE t = src.get_type()->t;
+        if (t == Type::t_int || t == Type::t_float || t == Type::t_bool)
+            capture_slots.emplace_scalar(src);
+        else
+            capture_slots.emplace_back(src, false);
     }
 }
 

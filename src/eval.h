@@ -850,6 +850,15 @@ public:
         n++;
     }
 
+    /* #97 R2b: an int/float/bool capture, copied by its payload word
+     * (EvalValue::copy_scalar_word says why) - no temporary */
+    void emplace_scalar(const EvalValue &v) {
+        ML_CHECK(n < cap);
+        LValue *lv = new (ptr + n) LValue();
+        lv->init_scalar(v);
+        n++;
+    }
+
     /*
      * #114: build the slot straight from a source VALUE. The
      * rvalue-ref overload above exists for a caller holding a

@@ -72,6 +72,34 @@ struct test {
 static const std::vector<test> tests =
 {
     /*
+     * #97 R2/R2b: a closure whose captures are all frame locals is built
+     * by the lean constructor, which copies an int/float/bool capture by
+     * its payload WORD and anything else by the ordinary value copy.
+     * Each kind is checked by value after the factory's frame is gone,
+     * in a loop (the JIT'd site; the first descent takes C++), and the
+     * float one is fed an int-then-float so a wrong word would show.
+     */
+    { "closure: all-local captures of every scalar kind and a string "
+      "survive the factory (#97 R2b)", {
+        "func mki(int k) { var c = k * 3; return func [c] () { return c; }; }",
+        "func mkf(float f) { var c = f * 0.5;",
+        "    return func [c] () { return c + 0.25; }; }",
+        "func mkb(int k) { var c = k % 2 == 0;",
+        "    return func [c] () { return c; }; }",
+        "func mks(int k) { var c = \"s\" + str(k);",
+        "    return func [c] () { return c; }; }",
+        "var si = 0; var sf = 0.0; var nb = 0; var ls = 0;",
+        "for (var k = 0; k < 20; k++) {",
+        "    var a = mki(k); si = si + a();",
+        "    var b = mkf(k); sf = sf + b();",
+        "    var c = mkb(k); if (c()) { nb = nb + 1; }",
+        "    var d = mks(k); ls = ls + len(d());",
+        "}",
+        "assert(si == 570);",
+        "assert(sf == 100.0);",
+        "assert(nb == 10);",
+        "assert(ls == 50);" } },
+    /*
      * #97 B2: abs/min/max on PROVEN INTS lower to a compare-and-branch over
      * int ops (codegen), not the builtin call. The builtins' exact
      * semantics, in the three positions whose peepholes treat a lowering's
