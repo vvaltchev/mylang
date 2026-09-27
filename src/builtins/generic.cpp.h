@@ -120,7 +120,11 @@ EvalValue builtin_str(EvalContext *ctx, const ArgLocs *exprList,
              */
             const int slen = snprintf(nullptr, 0, "%.*f", precision, fval);
 
-            if (slen < 0)
+            /* `%f` always writes at least one digit, so a length below 1
+             * is an error like a negative one - and saying so lets GCC
+             * see the buffer below is never the 1-byte one it otherwise
+             * warns (format-truncation) the second call could truncate */
+            if (slen < 1)
                 throw InternalErrorEx(exprList->arg(0)->start,
                                       exprList->arg(0)->end);
 
