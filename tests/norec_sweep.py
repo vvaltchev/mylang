@@ -35,6 +35,15 @@ THE PROBE MUST BE INVISIBLE.  Every sweep run's stdout and exit code
 are compared against a baseline run with no probe, so a probe that
 perturbs the program fails the sweep even when nothing mismatches.
 
+PARALLEL, WITH THE SERIAL OUTPUT (2026-09-27).  Every sweep run is
+its own process, so they run `tests/jobs.sh count` at a time (--jobs /
+MYLANG_TEST_JOBS override) in the idle scheduling class.  Each (program,
+mode) sweep still walks N in order and stops exactly where the serial
+walk stopped: it submits a small WINDOW of the next N values at once and
+then reads the results in N order, so a run past the stopping point is
+merely discarded.  The report is printed in program order afterwards and
+is the text the one-at-a-time version printed.
+
 Stdlib only, like the other fuzzers here (the project takes no
 third-party dependencies, tests included).
 """
@@ -43,6 +52,10 @@ import argparse
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testjobs  # noqa: E402  (tests/jobs.sh: worker count + idle class)
 
 PROBE = "norec recon probe:"
 # Anything on stderr that means the run went wrong rather than merely
@@ -75,27 +88,44 @@ def bad_stderr(err):
     return [m for m in BAD if m in err]
 
 
-def sweep_one(binary, prog, mode, max_events, timeout, verbose):
-    """Returns (events_probed, [failures], skip_reason_or_None)."""
+# how many N values one sweep puts in flight at once: past the stopping
+# point at most WINDOW - 1 runs are wasted, and with dozens of sweeps
+# sharing the pool a small window already keeps every worker busy
+WINDOW = 4
+
+
+def sweep_one(pool, binary, prog, mode, max_events, timeout):
+    """Returns (events_probed, [failures], skip_reason_or_None,
+    [verbose lines]).  `pool` runs the processes; the walk over N and
+    every decision on its results are the serial walk's, in N order."""
     envm = MODES[mode]
-    base_rc, base_out, base_err = run(binary, prog, envm, timeout)
+    base_rc, base_out, base_err = pool.submit(
+        run, binary, prog, envm, timeout).result()
     fails = []
+    vlines = []
     # A program we cannot get a clean baseline from is SKIPPED, not
     # failed: an interactive sample (phonebook, shopping) blocks or
     # loops on an empty stdin, which says nothing about reconstruction.
     # Skips are reported, never silent - a sweep that quietly skipped
     # everything would print a green zero.
     if base_rc is None:
-        return 0, fails, "baseline timed out (interactive?)"
+        return 0, fails, "baseline timed out (interactive?)", vlines
     hits = bad_stderr(base_err)
     if hits:
-        return 0, fails, "baseline stderr has %s" % hits
+        return 0, fails, "baseline stderr has %s" % hits, vlines
+
+    def probe(k):
+        return pool.submit(run, binary, prog,
+                           dict(envm, MYLANG_RECON_AT=str(k)), timeout)
 
     n = 0
+    pending = {}
     while n < max_events:
         n += 1
-        rc, out, err = run(binary, prog, dict(envm, MYLANG_RECON_AT=str(n)),
-                           timeout)
+        for k in range(n, min(n + WINDOW, max_events + 1)):
+            if k not in pending:
+                pending[k] = probe(k)
+        rc, out, err = pending.pop(n).result()
         if rc is None:
             fails.append("%s [%s] N=%d: TIMED OUT" % (prog, mode, n))
             break
@@ -114,10 +144,13 @@ def sweep_one(binary, prog, mode, max_events, timeout, verbose):
         if out != base_out:
             fails.append("%s [%s] N=%d: stdout differs from baseline"
                          % (prog, mode, n))
-        if verbose:
-            line = [l for l in err.splitlines() if PROBE in l]
-            print("    %s" % (line[0] if line else "?"))
-    return n, fails, None
+        line = [l for l in err.splitlines() if PROBE in l]
+        vlines.append("    %s" % (line[0] if line else "?"))
+    # the speculative runs past the stopping point: wait them out, so
+    # no process outlives the sweep that started it
+    for f in pending.values():
+        f.result()
+    return n, fails, None, vlines
 
 
 def main():
@@ -135,7 +168,11 @@ def main():
                     help="comma-separated: shadow, production")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="worker processes (default: tests/jobs.sh count)")
     args = ap.parse_args()
+    testjobs.ensure_idle()
+    jobs = args.jobs if args.jobs > 0 else testjobs.count()
 
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.dirname(here)
@@ -161,12 +198,23 @@ def main():
     with_events = 0
     capped = []
     skipped = []
+    # every (program, mode) sweep at once; `pool` bounds the processes
+    # and `drivers` the sweeps walking their N values
+    with ThreadPoolExecutor(max_workers=jobs) as pool, \
+            ThreadPoolExecutor(max_workers=jobs) as drivers:
+        results = {(prog, mode): drivers.submit(
+            sweep_one, pool, args.binary, prog, mode, args.max_events,
+            args.timeout)
+            for prog in progs for mode in modes}
+        results = {k: f.result() for k, f in results.items()}
+
     for prog in progs:
         shown = False
         for mode in modes:
-            n, fails, skip = sweep_one(args.binary, prog, mode,
-                                       args.max_events, args.timeout,
-                                       args.verbose)
+            n, fails, skip, vlines = results[(prog, mode)]
+            if args.verbose:
+                for l in vlines:
+                    print(l)
             if skip:
                 skipped.append("%s [%s]: %s"
                                % (os.path.relpath(prog, root), mode, skip))

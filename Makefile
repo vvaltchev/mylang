@@ -156,7 +156,13 @@ ifdef TESTS
 	endif
 endif
 
-DEPDIR := .d
+# Header dependencies live INSIDE the build dir. They used to share one
+# top-level `.d/`, which two builds of different lanes running at once
+# (tests/run_battery.py) both rewrite: the .Td temp file races, and the
+# surviving .d names the OTHER lane's object as its target, so this lane
+# silently loses its header dependencies and a later header edit leaves a
+# stale object behind.
+DEPDIR := $(BUILD_DIR)/.d
 DEPFLAGS = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.Td
 POSTCOMPILE = mv -f $(DEPDIR)/$*.Td $(DEPDIR)/$*.d
 SOURCES:=$(wildcard src/*.cpp)
