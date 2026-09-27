@@ -14898,3 +14898,34 @@ payload word". `t_builtin` is trivial (`< t_str`) and 16 bytes. A copy
 that drops words 1-2 is sound only for a slot the ref_slots analysis
 proved is written by `op_writes_scalar` ops - never merely for a slot
 whose type is trivial at run time.
+
+## #124(a) - THE LINEAR SCAN KEEPS TEMPS OUT OF ITS CONTEST (2026-09-26)
+
+At K=4 with five hot locals (program A of plans/frameless-callee.md §3b)
+the scan used THREE registers. It was not an eviction or a snap
+problem: the walk ran with TEMPS as candidates, and at pc 7 the loop's
+scratch temp `r7` (ten uses in the body, the densest interval) beat the
+local `c` for register 2. The GP caller then stripped every temp's
+register - v1 pins locals only - and nothing re-offered the freed one.
+The float twin did the same. `jit_lsra_assign` gained `locals_only`
+(both callers pass true), so a temp is simply not a candidate; the old
+post-walk strip became an ML_CHECK that no temp won a register.
+The `-rt` harness's direct callers keep the default and their
+expectations.
+
+Emitted code changed on 15 of 147 corpus programs (`vdjcmp`). Ir
+(scale3 - scale1): 81_regs_int_14 -1.4%, 82 -0.8%, 83 -0.5%, 09/63 flat,
+**68_nested +0.40%** - `s3` now draws an abstract register that maps to
+a CALLER-saved one (r8) and is spilled/reloaded around each of main's
+132 helper calls, where before it sat in r13. That is #124(b)'s cost
+(a caller-saved pin across a call), exposed here, not introduced.
+
+⛔ **A WALL-CLOCK RATIO FROM bench/run.py IS NOT PINNED TO A CORE.** 82
+read 1.38x and then 1.34x SLOWER for -0.8% Ir and a pure register
+renaming. `taskset -c 2 perf stat` (a P-core) said the opposite: 761M
+vs 786M cycles, **-3.2%**, front-end-bound unchanged. On this hybrid
+CPU an unpinned run can land on an E-core; a ratio that contradicts
+both the Ir and the emitted code is that, until a pinned cycle count
+says otherwise. Watched failing: with `locals_only` ignored the new
+`-rt` check (`lsra_k4_no_idle_register`) and the caller's ML_CHECK
+both fire (the latter aborts `-rt`, naming the rule).

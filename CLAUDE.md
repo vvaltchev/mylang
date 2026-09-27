@@ -2179,6 +2179,14 @@ binaries, plus the my/py geomean, which run.py prints with THREE digits
 for >=2 interleaved A/B/A/B runs to cancel machine drift; that is HIS call, not
 a routine default. A phase does not land on a probe geomean.
 
+**⛔ bench/run.py DOES NOT PIN A CORE, AND THIS CPU IS HYBRID
+(2026-09-26).** A run can land on an E-core, so one bench's wall ratio
+can move 30%+ with no code cause: #124(a) read 82_regs_int_25 at 1.38x
+and 1.34x SLOWER for -0.8% Ir and a pure register renaming, while
+`taskset -c 2 perf stat` (a P-core; `cpu_core/*` counters) gave -3.2%
+cycles. A ratio that contradicts both the Ir and the emitted code gets
+a pinned cycle count before it is believed.
+
 **THE ASSERTS=0 MEASUREMENT RULE (maintainer-set, 2026-08-01).** EVERY
 performance measurement — callgrind Ir or wall-clock, a one-off A/B or a
 full-suite run — is taken with **`OPT=1 ASSERTS=0` on BOTH sides**. A plain

@@ -478,7 +478,14 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                      const std::vector<MemEvent> &mem,
                      const std::vector<MemEvent> &int_uses,
                      int K, LsraOut &out,
-                     const std::vector<FltEvent> *fev = nullptr);
+                     const std::vector<FltEvent> *fev = nullptr,
+                     bool locals_only = false);
+/* `locals_only` (#124(a)): a TEMP slot (>= ck.slot_count) is never a
+ * candidate. The emitter pins locals only (v1), so a temp that won a
+ * contest used to be stripped AFTER the walk - and the local it had
+ * evicted never got the register back (program A at K=4: three of four
+ * registers used, `c` in memory). Keeping temps out of the contest is
+ * what hands that register to a local. */
 
 /*
  * D3.b step 2b-iii-a (plans/register-allocator-endgame.md): SNAP the
