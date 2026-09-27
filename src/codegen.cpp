@@ -12277,6 +12277,104 @@ bool g_bc_inline_value_enabled = [] {
     return !(e && !e->empty() && (*e)[0] == '0');
 }();
 
+/* #97 closure inlining STEP 1 - the result rename and the argument
+ * sourcing (MYLANG_BCINLINE_STEP1=0 turns both off: the same-binary A/B,
+ * and the oracle - the step-1 form must render what the increment-1
+ * form does). */
+bool g_bc_inline_value_step1 = [] {
+    const auto e = env_get("MYLANG_BCINLINE_STEP1");
+    return !(e && !e->empty() && (*e)[0] == '0');
+}();
+unsigned long g_bc_step1_renamed = 0;   /* sites whose result move went */
+unsigned long g_bc_step1_sourced = 0;   /* arguments bound from source */
+
+/*
+ * #97 closure inlining STEP 1: what a VALUE site can drop, decided on the
+ * caller before the splice.
+ *
+ * THE ARGUMENT STAGING. A call needs its arguments in a contiguous run of
+ * temps, so codegen stages each one - `move argbase+i = src` - right
+ * before the call. Of the two paths an inline cache splits into, only the
+ * MISS arm (the original call) reads that run. So the inlined body binds
+ * from `src` directly and the staging moves are sunk into the miss arm.
+ * Taken only for the maximal run of such moves IMMEDIATELY before the
+ * call, where each is sound by construction:
+ *  - `src` is not written between its move and the call: the run writes
+ *    only its own argument temps, and a source inside the run declines;
+ *  - nothing branches INTO the run past its first op - a join there would
+ *    make the move one of several producers (the JOIN trap the staging
+ *    retarget met, CLAUDE.md); a branch to the FIRST op lands on the
+ *    guard, which binds from the same unmodified sources;
+ *  - the staging temp is dead after the call (liveness), or it IS the
+ *    call's dst, which both paths write.
+ *
+ * THE RESULT RENAME. Every ReturnV of the body returns ONE slot R, a
+ * local or temp of the body (a parameter is written by its bind), which
+ * the body never reads before writing (`read_first`), and the body holds
+ * no call (whose argument RUN a one-slot rename would split). Then every
+ * field naming R names the call's dst instead and no result move is
+ * emitted. dst is a caller slot the body cannot otherwise touch - it
+ * reaches only its own slots, the binds' sources (read BEFORE the body)
+ * and the callee slot, which is why dst == callee slot declines. Writing
+ * dst early, mid-body, is unobservable: a splice caller has no try
+ * region (bc_inline_chunk's gate), so an exception after the write leaves
+ * the frame that holds dst.
+ */
+static void bc_value_site_step1(const Chunk &ck, size_t pc, int nargs,
+                                const BcInlineSnapshot &snap, int nparams,
+                                const std::vector<char> &is_target,
+                                const SlotLiveness &live,
+                                size_t &stage_first, std::vector<int> &src_of,
+                                int &rename_from, bool &ref_rename)
+{
+    const Instr &call = ck.code[pc];
+    const int argbase = static_cast<int>(call.a_lit());
+    const int dst = call.target;
+    const int callee = call.target2;
+    src_of.assign(static_cast<size_t>(nargs), -1);
+    stage_first = pc;
+    size_t p = pc;
+    while (p > 0 && nargs > 0) {
+        const Instr &m = ck.code[p - 1];
+        if (m.op != OpCode::MoveV || is_target[p])
+            break;
+        const int t = m.target, src = m.target2;
+        if (t < argbase || t >= argbase + nargs || src < 0
+                || (src >= argbase && src < argbase + nargs))
+            break;
+        const size_t i = static_cast<size_t>(t - argbase);
+        if (src_of[i] >= 0)
+            break;
+        if (t != dst && live.live_out(pc, t))
+            break;
+        src_of[i] = src;
+        p--;
+    }
+    stage_first = p;
+
+    rename_from = -1;
+    ref_rename = false;
+    if (dst < 0 || dst == callee)
+        return;
+    int r = -1;
+    for (const Instr &bi : snap.code) {
+        if (bi.op == OpCode::CallV)
+            return;
+        if (bi.op != OpCode::ReturnV)
+            continue;
+        if (bi.a_is_lit() || bi.a_slot() < 0)
+            return;
+        if (r >= 0 && r != bi.a_slot())
+            return;
+        r = bi.a_slot();
+    }
+    if (r < nparams || r >= 64 || ((snap.read_first >> r) & 1))
+        return;
+    rename_from = r;
+    ref_rename = std::find(snap.ref_slots.begin(), snap.ref_slots.end(), r)
+                 != snap.ref_slots.end();
+}
+
 /*
  * Remap every FRAME SLOT field of a whitelisted op by +base.
  *
@@ -12289,23 +12387,26 @@ bool g_bc_inline_value_enabled = [] {
  * rather than duplicated - duplication is exactly how the other per-op
  * tables drifted.
  */
-static void bc_remap_slots(Instr &in, int base)
+template <class F>
+static void bc_map_slots(Instr &in, const F &map)
 {
     const auto ra = [&]() {
         if (!in.a_is_lit() && in.a_slot() >= 0) {
             Operand o = in.a();
-            o.slot += base;
+            o.slot = map(o.slot);
             in.set_a(o);
         }
     };
     const auto rb = [&]() {
         if (!in.b_is_lit() && in.b_slot() >= 0) {
             Operand o = in.b();
-            o.slot += base;
+            o.slot = map(o.slot);
             in.set_b(o);
         }
     };
-    const auto rt = [&]() { if (in.target >= 0) in.target += base; };
+    const auto rt = [&]() {
+        if (in.target >= 0) in.target = map(in.target);
+    };
 
     switch (in.op) {
     case OpCode::Jump:
@@ -12320,7 +12421,7 @@ static void bc_remap_slots(Instr &in, int base)
     case OpCode::MoveV:
         rt();
         if (in.target2 >= 0)
-            in.target2 += base;
+            in.target2 = map(in.target2);
         break;
     case OpCode::ReturnV:
         /* UNREACHABLE today, and gcov says so: the emit loop rewrites a
@@ -12346,7 +12447,7 @@ static void bc_remap_slots(Instr &in, int base)
     case OpCode::ForLoopStep:
         /* target2 = the COUNTER slot; a = the bound operand; b = step */
         if (in.target2 >= 0)
-            in.target2 += base;
+            in.target2 = map(in.target2);
         ra(); rb();
         break;
 
@@ -12366,10 +12467,10 @@ static void bc_remap_slots(Instr &in, int base)
          * silent wrong-iteration-count, not a crash. So save and restore.
          */
         if (in.target2 >= 0)
-            in.target2 += base;
+            in.target2 = map(in.target2);
         const bool lit = in.a_is_lit();
-        const int lo = in.a_dual_lo() + base;
-        const int hi = lit ? in.a_dual_hi() : in.a_dual_hi() + base;
+        const int lo = map(in.a_dual_lo());
+        const int hi = lit ? in.a_dual_hi() : map(in.a_dual_hi());
         in.set_a_dual(lo, hi);
         if (lit)
             in.opflags = static_cast<uint8_t>(in.opflags | 1u);
@@ -12381,7 +12482,7 @@ static void bc_remap_slots(Instr &in, int base)
          * alone is the whole reason this is written by hand. `a` is the
          * ARG RUN's base, a frame slot carried as a literal. */
         rt();
-        in.set_a(int_lit(in.a_lit() + base));
+        in.set_a(int_lit(map(static_cast<int>(in.a_lit()))));
         break;
     /* #97 closure inlining - a VALUE site's body only (the gate admits
      * them nowhere else). The capture index is NOT a frame slot: the
@@ -12393,6 +12494,16 @@ static void bc_remap_slots(Instr &in, int base)
         break;
     case OpCode::StoreCaptureV:
         ra();
+        break;
+    /* ...and their explicit-closure forms, which only the step-1 RESULT
+     * RENAME meets (it runs after the rewrite): the closure's slot is a
+     * CALLER slot, mapped like any other - the rename never names it,
+     * since a site whose dst IS the callee slot does not rename. */
+    case OpCode::LoadCaptureOfV:
+        rt(); ra();
+        break;
+    case OpCode::StoreCaptureOfV:
+        ra(); rb();
         break;
     case OpCode::IntBin:      case OpCode::FloatBin:
     case OpCode::IntAddRR:    case OpCode::IntAddRI:
@@ -12416,11 +12527,30 @@ static void bc_remap_slots(Instr &in, int base)
         ML_CHECK_MSG(false, "bc_remap_slots: op not on the whitelist");
         break;
     }
+}
 
+static void bc_remap_slots(Instr &in, int base)
+{
+    bc_map_slots(in, [base](int s) { return s + base; });
 #ifndef NDEBUG
     visit_use_def(in,
                   [&](int s) { ML_CHECK(s >= base); },
                   [&](int s) { ML_CHECK(s >= base); });
+#endif
+}
+
+/* #97 closure inlining step 1: the RESULT RENAME - every field naming
+ * `from` (the body's returned slot, already re-based) names `to` (the
+ * call's dst). Checked the same way the re-base is: `visit_use_def`
+ * enumerates the op's slots independently, so a field this pass MISSED
+ * still names `from` and the check fires. */
+static void bc_rename_slot(Instr &in, int from, int to)
+{
+    bc_map_slots(in, [from, to](int s) { return s == from ? to : s; });
+#ifndef NDEBUG
+    visit_use_def(in,
+                  [&](int s) { ML_CHECK(s != from); },
+                  [&](int s) { ML_CHECK(s != from); });
 #endif
 }
 
@@ -12454,6 +12584,7 @@ void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out)
     s.eligible = bc_inline_callee_ok(ck, nullptr) && ck.inline_ctxs.empty();
     s.value_eligible = bc_inline_callee_ok(ck, nullptr, true)
                        && ck.inline_ctxs.empty();
+    s.read_first = chunk_read_before_write(ck);
     out.emplace(&ck, std::move(s));
 }
 
@@ -12490,9 +12621,42 @@ bool bc_inline_chunk(Chunk &ck,
         int callee_slot = -1;
         int32_t def = -1;
         std::vector<uint8_t> coerce;
+        /* step 1: the body's returned slot (callee-relative) renamed to
+         * `dst`, so no result move is emitted - or -1 */
+        int rename_from = -1;
+        /* step 1: the caller's argument-STAGING moves, pcs
+         * [stage_first, pc), each `MoveV argbase+i = src`: the inlined
+         * body binds from `src` directly and the moves themselves are
+         * SUNK into the miss arm, the one path that reads the run.
+         * `src_of[i]` is -1 for an argument not sourced this way. */
+        size_t stage_first = 0;
+        std::vector<int> src_of;
+        bool ref_rename = false;       /* the renamed slot is ref-listed */
     };
     std::vector<Site> sites;
     int next_base = ck.slot_count + ck.n_temps;
+
+    /* step 1's two facts about the CALLER, computed once and only if a
+     * value site may want them: every branch target (a staging run
+     * something jumps INTO is not a run), and slot liveness (a staging
+     * temp read after the call must still be written on the hit path) */
+    std::vector<char> is_target;
+    SlotLiveness live;
+    bool facts_ready = false;
+    const auto caller_facts = [&]() {
+        if (facts_ready)
+            return;
+        facts_ready = true;
+        is_target.assign(ck.code.size() + 1, 0);
+        for (const Instr &ci : ck.code) {
+            Instr c = ci;
+            visit_pc_fields(c, [&](int &t) {
+                if (t >= 0 && static_cast<size_t>(t) < is_target.size())
+                    is_target[static_cast<size_t>(t)] = 1;
+            });
+        }
+        jit_slot_liveness(ck, live);
+    };
 
     for (size_t pc = 0; pc < ck.code.size(); pc++) {
         const Instr &in = ck.code[pc];
@@ -12549,6 +12713,7 @@ bool bc_inline_chunk(Chunk &ck,
             continue;
 
         Site s;
+        s.stage_first = pc;             /* nothing sunk unless step 1 says */
         if (is_value) {
             s.value = true;
             s.callee_slot = in.target2;
@@ -12556,6 +12721,14 @@ bool bc_inline_chunk(Chunk &ck,
             for (const auto &p : d->params)
                 s.coerce.push_back(p.decl_type == DeclType::i ? 1
                                    : p.decl_type == DeclType::f ? 2 : 0);
+            if (g_bc_inline_value_step1) {
+                caller_facts();
+                bc_value_site_step1(ck, pc, nargs, snap,
+                                    static_cast<int>(d->params.size()),
+                                    is_target, live, s.stage_first,
+                                    s.src_of, s.rename_from,
+                                    s.ref_rename);
+            }
         }
         s.pc = pc;
         s.base = next_base;
@@ -12695,9 +12868,18 @@ bool bc_inline_chunk(Chunk &ck,
         from_caller.push_back(1);
     };
 
+    /* step 1: the staging moves sunk into their site's miss arm; a
+     * branch to the first one lands on the guard (old2new below) */
+    std::vector<char> staged(ck.code.size(), 0);
+    for (const Site &S : sites)
+        for (size_t q = S.stage_first; q < S.pc; q++)
+            staged[q] = 1;
+
     size_t si = 0;
     for (size_t pc = 0; pc < ck.code.size(); pc++) {
         old2new[pc] = static_cast<uint32_t>(nc.size());
+        if (staged[pc])
+            continue;
         if (si < sites.size() && sites[si].pc == pc) {
             const Site &S = sites[si++];
             const int32_t fidx = static_cast<int32_t>(ck.inline_frames.size());
@@ -12728,12 +12910,22 @@ bool bc_inline_chunk(Chunk &ck,
              * inlined-at chain, since a bind error is the caller's */
             for (int i = 0; i < S.nargs; i++) {
                 const uint8_t co = S.value ? S.coerce[i] : 0;
+                /* step 1: an argument whose staging was sunk binds from
+                 * its source */
+                const int from =
+                    (static_cast<size_t>(i) < S.src_of.size()
+                     && S.src_of[static_cast<size_t>(i)] >= 0)
+                        ? S.src_of[static_cast<size_t>(i)] : S.argbase + i;
+#ifdef TESTS
+                if (from != S.argbase + i)
+                    g_bc_step1_sourced++;
+#endif
                 Instr mv;
                 mv.op = co ? OpCode::CoerceNumV : OpCode::MoveV;
                 mv.target = S.base + i;
                 if (co) {
                     Operand ao;
-                    ao.slot = S.argbase + i;
+                    ao.slot = from;
                     mv.set_a(ao);
                     mv.target2 = co == 2 ? 1 : 0;
                     Loc as, ae;
@@ -12746,7 +12938,7 @@ bool bc_inline_chunk(Chunk &ck,
                         nctx.push_back({ static_cast<uint32_t>(nc.size()),
                                          cf });
                 } else {
-                    mv.target2 = S.argbase + i;
+                    mv.target2 = from;
                 }
                 nc.push_back(mv);
                 from_caller.push_back(0);
@@ -12766,7 +12958,12 @@ bool bc_inline_chunk(Chunk &ck,
              * #137's verifier is what found it.
              */
             const size_t nb = S.body.size();
-            const bool keep_result = S.dst >= 0;
+            /* step 1: a renamed result is already in dst - no move */
+            const bool keep_result = S.dst >= 0 && S.rename_from < 0;
+#ifdef TESTS
+            if (S.rename_from >= 0)
+                g_bc_step1_renamed++;
+#endif
             std::vector<uint32_t> lmap(nb);
             size_t emitted = 0;
             for (size_t j = 0; j < nb; j++) {
@@ -12779,9 +12976,11 @@ bool bc_inline_chunk(Chunk &ck,
             }
             const size_t body_base = nc.size();
             const size_t body_end = body_base + emitted;
-            /* a value site's body is followed by `Jump join` and the
-             * original call, so its returns land past both */
-            const size_t join = body_end + (S.value ? 2 : 0);
+            /* a value site's body is followed by `Jump join`, the sunk
+             * staging moves and the original call, so its returns land
+             * past all of them */
+            const size_t join = body_end
+                + (S.value ? 2 + (S.pc - S.stage_first) : 0);
             /* pass 2: emit */
             for (size_t j = 0; j < nb; j++) {
                 Loc bs, be;
@@ -12842,6 +13041,8 @@ bool bc_inline_chunk(Chunk &ck,
                     bi.op = OpCode::StoreCaptureOfV;
                     bi.set_b(co);
                 }
+                if (S.rename_from >= 0)
+                    bc_rename_slot(bi, S.rename_from + S.base, S.dst);
                 visit_pc_fields(bi, [&](int &t) {
                     /*
                      * The gate's `branch-past-end` rejection means every
@@ -12891,6 +13092,8 @@ bool bc_inline_chunk(Chunk &ck,
                 nc.push_back(jm);
                 from_caller.push_back(0);
                 nc[gidx].target = static_cast<int>(nc.size());
+                for (size_t q = S.stage_first; q < S.pc; q++)
+                    emit_caller_op(q);      /* step 1: the sunk staging */
                 emit_caller_op(pc);
                 from_caller.back() = 0;     /* no pc fields to remap */
                 ML_CHECK(nc.size() == join);
@@ -12926,9 +13129,13 @@ bool bc_inline_chunk(Chunk &ck,
      * PARAMETERS, so a raw scalar bind of the caller says nothing about
      * them - they join ref_slots_raw in full */
     for (std::vector<int32_t> *rl : { &ck.ref_slots, &ck.ref_slots_raw }) {
-        for (const Site &S : sites)
+        for (const Site &S : sites) {
             for (const int32_t r : S.ref_slots)
                 rl->push_back(r + S.base);
+            /* step 1: a renamed reference result lives in dst now */
+            if (S.ref_rename)
+                rl->push_back(S.dst);
+        }
         std::sort(rl->begin(), rl->end());
         rl->erase(std::unique(rl->begin(), rl->end()), rl->end());
     }

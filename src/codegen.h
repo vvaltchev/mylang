@@ -471,8 +471,18 @@ struct BcInlineSnapshot {
      * also read and plainly write its captures (bc_inline_callee_ok's
      * `captures_ok`) */
     bool value_eligible = false;
+    /* #97 closure inlining step 1: the slots some path of the pristine
+     * body reads before it writes them (chunk_read_before_write). A
+     * value site may rename the returned slot to the call's dst only
+     * when that slot is NOT in here - the body then never observes what
+     * dst held before. */
+    uint64_t read_first = ~uint64_t(0);
 };
 typedef std::unordered_map<const Chunk *, BcInlineSnapshot> BcInlineSnapshots;
+/* #97 closure inlining step 1 (codegen.cpp): the lever and its counters */
+extern bool g_bc_inline_value_step1;
+extern unsigned long g_bc_step1_renamed;
+extern unsigned long g_bc_step1_sourced;
 
 /* Record `ck`'s pristine body into `out`. Call for EVERY chunk of the
  * program before the first bc_inline_chunk. */

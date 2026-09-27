@@ -16692,6 +16692,14 @@ engines_agree_bt(const char *what, const std::string &src, std::string *out)
  * `float` typed binds; a REFERENCE capture read and written (the helper
  * arm, refcounted); a discarded result; a throw inside the inlined body
  * on a WARMED iteration; a bind coercion refusing a dyn argument.
+ * STEP 1 (the result renamed into the call's dst, arguments bound from
+ * their sources with the staging sunk into the miss arm, a pinned source
+ * read from its register): a dst that is also the argument's source,
+ * mixed argument sources, pinned int/float sources into a float
+ * parameter, branching bodies (one renamed, one with two returns of
+ * different slots, which must not be), a ternary argument whose join
+ * lands on the staging - each run with step 1 OFF too, which must
+ * render the same.
  */
 static bool
 closure_inline_parity()
@@ -16753,8 +16761,57 @@ closure_inline_parity()
           "for (var i = 0; i < 5; i++) { s = s + add(i); }\n"
           "var dyn v = runtime(\"x\");\n"
           "print(s, add(v));\n" },
+        /* step 1: the result renamed into a dst that is ALSO the
+         * argument's source - the bind reads it before the body writes */
+        { "result into its own argument",
+          "func ma(int base) {\n"
+          "  return func [base] (int k) { return base + k * 2; }; }\n"
+          "var add = ma(runtime(3)); var x = 1;\n"
+          "for (var i = 0; i < 20; i++) { x = add(x) % 1000003; }\n"
+          "print(x);\n" },
+        /* step 1: two arguments - one source twice, a literal (staged by
+         * a load, so its run is not all moves), a computed temp */
+        { "mixed argument sources",
+          "func mk(int b) {\n"
+          "  return func [b] (int p, int q) { return b * p - q; }; }\n"
+          "var f = mk(runtime(2)); var s = 0;\n"
+          "for (var i = 0; i < 25; i++)\n"
+          "  s = s + f(i, i) + f(i, 3) + f(i * 2, i);\n"
+          "print(s);\n" },
+        /* step 1: a float PIN and an int pin into a float parameter */
+        { "pinned sources into a float parameter",
+          "func ms(float m) {\n"
+          "  return func [m] (float x) { return m * x + 0.5; }; }\n"
+          "var g = ms(runtime(1.5)); var u = 0.0; var w = 0.25;\n"
+          "for (var i = 0; i < 20; i++) { w = w + 1.0; u = u + g(w) + g(i); }\n"
+          "print(u);\n" },
+        /* step 1: a renamed result written on two paths of a branching
+         * body; and a body with two returns of DIFFERENT slots, which
+         * must not rename */
+        { "branching bodies",
+          "func mr(int t) {\n"
+          "  return func [t] (int x) { var r = x; if (x > t) r = x - t;\n"
+          "                            return r; }; }\n"
+          "func m2(int t) {\n"
+          "  return func [t] (int x) { if (x > t) return x - t;\n"
+          "                            return t - x; }; }\n"
+          "var a = mr(runtime(10)); var b = m2(runtime(10)); var s = 0;\n"
+          "for (var i = 0; i < 30; i++) s = s + a(i) * 3 + b(i);\n"
+          "print(s);\n" },
+        /* step 1: a TERNARY argument - its join lands on the staging */
+        { "ternary argument",
+          "func ma(int base) {\n"
+          "  return func [base] (int k) { return base + k; }; }\n"
+          "var add = ma(runtime(7)); var s = 0;\n"
+          "for (var i = 0; i < 30; i++) s = s + add(i > 5 ? i : 2 * i);\n"
+          "print(s);\n" },
     };
     bool ok = true;
+    const unsigned long rn0 = g_bc_step1_renamed;
+    const unsigned long sr0 = g_bc_step1_sourced;
+#if ML_JIT_SUPPORTED
+    const unsigned long cp0 = g_jit_coerce_pin;
+#endif
     for (const auto &p : progs) {
         const std::string src = p[1];
         int v = 0;
@@ -16775,6 +16832,42 @@ closure_inline_parity()
                 cout << "  closure_inline_parity [" << p[0] << "] "
                      << c.name << " differs from the tree-walker:\n--- tw\n"
                      << ref << "--- " << c.name << "\n" << got;
+                ok = false;
+            }
+        }
+#if ML_JIT_SUPPORTED
+        /* THE MISS ARM: every guard forced to miss runs the original call
+         * - with step 1's staging sunk in front of it - and must render
+         * what the tree-walker does. No emitted guard may hit here, or
+         * the run did not take the arm it is meant to test. */
+        {
+            const unsigned ce = g_jit_cold_extra;
+            g_jit_cold_extra |= JIT_COLD_GUARD_BIT;
+            const unsigned long hm = g_jit_guard_hits;
+            const std::string got = engine_run_bt(src, ExecEngine::Vm,
+                                                  true, true, true, &v);
+            g_jit_cold_extra = ce;
+            if (got != ref || g_jit_guard_hits != hm) {
+                cout << "  closure_inline_parity [" << p[0] << "] every "
+                     << "guard MISSING: " << (got != ref ? "differs from "
+                     "the tree-walker" : "a guard still hit") << "\n--- tw\n"
+                     << ref << "--- got\n" << got;
+                ok = false;
+            }
+        }
+#endif
+        /* step 1 off: the increment-1 form is step 1's own oracle */
+        for (const bool jit : { false, true }) {
+            const bool s1 = g_bc_inline_value_step1;
+            g_bc_inline_value_step1 = false;
+            const std::string got = engine_run_bt(src, ExecEngine::Vm,
+                                                  jit, true, true, &v);
+            g_bc_inline_value_step1 = s1;
+            if (got != ref) {
+                cout << "  closure_inline_parity [" << p[0] << "] step 1 "
+                     << "off, jit=" << jit << " differs from the "
+                     << "tree-walker:\n--- tw\n" << ref << "--- got\n"
+                     << got;
                 ok = false;
             }
         }
@@ -16799,7 +16892,21 @@ closure_inline_parity()
         cout << "  closure_inline_parity: the inline capture copy never ran\n";
         ok = false;
     }
+    /* step 1: a sourced parameter bind read a PINNED argument from its
+     * register (78's `i`) - else the pinned-source arm is untested */
+    if (g_jit_coerce_pin == cp0) {
+        cout << "  closure_inline_parity: no CoerceNumV bound from a pin\n";
+        ok = false;
+    }
 #endif
+    /* step 1 fired: each rule is a compile-time counter, bumped only
+     * where the splice took it */
+    if (g_bc_step1_renamed == rn0 || g_bc_step1_sourced == sr0) {
+        cout << "  closure_inline_parity: step 1 never renamed a result ("
+             << (g_bc_step1_renamed - rn0) << ") or sourced an argument ("
+             << (g_bc_step1_sourced - sr0) << ") - vacuous\n";
+        ok = false;
+    }
     return ok;
 }
 
