@@ -905,6 +905,24 @@ static const std::vector<test> tests =
         "assert(len(n) == 30);",
         "sort(a, func(p, q) { var u = str(p); return p > q; });",
         "assert(a[0] == 29);" } },
+    /* #97 CB7: sort/filter read a raw-bound callback's result as a truth
+     * value IN PLACE. A reference result must be released right there,
+     * as the moved-out temporary used to be: refcount() of the array the
+     * predicate returns is unchanged after the filter (a leftover in
+     * flow->value would hold one more), and a non-bool result still
+     * decides by truthiness. */
+    { "callback: a truth-tested REFERENCE result is released in place",
+      { "var keep = [7, 8];",
+        "var p = func [keep] (x) { return x > 1 ? keep : []; };",
+        "var a = [];",
+        "for (var i = 0; i < 6; i++) { append(a, i); }",
+        "var before = refcount(keep);",
+        "var n = filter(p, a);",
+        "assert(len(n) == 4 && n[0] == 2);",
+        "assert(refcount(keep) == before);",
+        "var b = [3, 1, 2];",
+        "sort(b, func(q, r) { return q < r ? \"y\" : \"\"; });",
+        "assert(b[0] == 1 && b[2] == 3);" } },
     { "coerce: a param fed only its final type stays unstamped (fast_bind)",
       { "var b = 2;",
         "var f = func [b] (x) { return x; };",

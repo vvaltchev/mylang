@@ -242,6 +242,25 @@ public:
      * this trick - invoke's argv is contiguous, and two separate
      * lvalues are not.
      */
+    /*
+     * #97 CB7: the callback's result as a TRUTH VALUE - what sort's
+     * comparator and filter's predicate ask. The scalar path reads it in
+     * place in flow->value (no EvalValue move out, no temporary to
+     * destroy); anything else is call(...).truthy().
+     */
+    template <class... A>
+    bool test(A &&... args)
+    {
+        if constexpr (sizeof...(A) > 0
+                      && (cb_scalar_v<std::decay_t<A>> && ...)) {
+            const CbScalar ra[] = {
+                CbScalar(static_cast<std::decay_t<A>>(args))... };
+            return call_scalars_test(ra, sizeof...(A));
+        } else {
+            return call(static_cast<A &&>(args)...).truthy();
+        }
+    }
+
     EvalValue call(const EvalValue &arg)
     {
         if (ready_)
@@ -283,6 +302,8 @@ private:
         || std::is_same_v<T, float_type> || std::is_same_v<T, bool>;
     EvalValue call_scalars(const CbScalar *ra, size_t n);
     EvalValue call_scalars_boxed(const CbScalar *ra, size_t n);
+    bool call_scalars_test(const CbScalar *ra, size_t n);
+    void bind_raw(const CbScalar *ra, size_t n);
 
     EvalValue call_eval_func(const EvalValue *argv, size_t n);
 
