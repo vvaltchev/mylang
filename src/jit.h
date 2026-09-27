@@ -703,8 +703,17 @@ const void *jit_poison_window();
  * its site installed - some site wrote it, and the release arm would
  * not restore it. Aborts by name. */
 extern "C" [[noreturn]] void jit_w4_captures_replaced();
+/* #97 R4: a site whose callee claims a quiet vframe found the cell
+ * written after the call. Aborts by name. */
+extern "C" [[noreturn]] void jit_vframe_published();
 #endif
-extern unsigned long g_jit_frameless_capbase;   /* W4 (emit-time): sites
+extern unsigned long g_jit_frameless_capbase;
+extern unsigned long g_jit_vframe_quiet_sites;  /* #97 R4 (emit-time):
+                                                 * sites that skip the
+                                                 * vframe restore */
+extern unsigned long g_jit_vframe_quiet_lost;   /* #97 R4: leaves whose
+                                                 * bet lost (re-emitted
+                                                 * eagerly) */   /* W4 (emit-time): sites
                                                  * that skip the repoint */
 extern unsigned long g_jit_borrow_inline;       /* W5 (emitted code): a
                                                  * borrow bound INLINE at
@@ -1075,6 +1084,9 @@ extern "C" void *jit_make_closure_locals(const void *def,
 /* #97 R2c: exactly one local capture - (def, &its source slot) */
 extern "C" void *jit_make_closure_1(const void *def,
                                     const LValue *src) noexcept;
+/* #97 R4: the frame window jit_ret_audit scans, stored by the emitted
+ * code right before the call (so the call need not publish) */
+extern const LValue *g_jit_audit_window;
 /* #97 R3: the all-local STORING form, for a site with no scratch -
  * (dst, def); cannot throw, reads no ctx->captures (W4-safe) */
 extern "C" void jit_make_closure_locals_st(int_type dst,

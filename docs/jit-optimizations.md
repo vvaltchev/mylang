@@ -15148,3 +15148,58 @@ release build SEGVs on it); an all-local closure built through
 ML_CHECK. The storing twin was exercised once with the scratch
 forced off: `-rt` green except `jit_closure_store` (which asserts the
 inline tier ran), every differential and `corpus_diff` pass green.
+
+## #97 R4 - A QUIET FRAMELESS LEAF: NO VFRAME PUBLISH, NO RESTORE (2026-09-27)
+
+Every frameless call paid four stores for `act.view_frame` (the cell
+C++ finds the running frame in): the callee's entry published its
+window, and the site put the caller's back after the call. E2e made a
+CALLING body lazy (publish before each C++ call instead); a LEAF still
+published eagerly, and on 63_closures the pair was ~20 of ~160 stores
+per iteration - on bodies that never reach C++ between entry and
+return.
+
+**The bet.** A frameless leaf (`frameless_ok`, no calls - so compiled
+before every caller, F1's ordering) is emitted LAZY, and
+`Emitter::vframe_pub_hot` counts the publishes emitted on its
+normal-return path. Emission a frameless frame cannot take on that
+path is marked `pub_offpath`: the exception epilogues (a raise
+publishes; the site's exception path restores anyway) and ReturnV
+after the frameless discriminator, including the slow tail. If the
+main stream published, the chunk is re-emitted EAGERLY (one retry, the
+W6 shape) - a leaf calling helpers per iteration must not pay a
+publish per helper call. If it did not, `Chunk::frameless_vframe_quiet`
+is set and every site calling it skips the restore: the cell still
+names the caller. A late publish (a C1 cold copy, emitted after the
+check) keeps the body lazy with the site restoring - E2e's model.
+
+**Frame-free C++ on the path.** `call_direct_framefree` /
+`call_rax_framefree` call without publishing, for helpers that read no
+running frame: `jit_drop_dst` and `jit_release_slot` (a value's
+destruction), `jit_make_closure_1` / `_locals` (handed their source
+slots; they read `ctx->root`), the TESTS verifier (which skips its
+vframe checks when the cell holds the poison), `jit_ret_audit` (it now
+takes its window from `g_jit_audit_window`, stored from rbx before the
+call) and the frameless arm's own array-result decline to
+`jit_ret_norec`, which now finds a frameless window at
+`rbp + JIT_FRAMELESS_WIN_OFF` instead of through `ctx.frame`.
+
+**Nets.** A TESTS build's lazy entry parks the POISON window in the
+cell; the quiet site checks it is still there after the call
+(`jit_vframe_published` aborts by name), then restores. Watched
+failing: counting no publish as hot -> `-rt` aborts in
+`jit_vframe_published`; `jit_ret_norec` reading `ctx.frame` again ->
+POISON HIT in the JIT differential modes (the new `-rt` entry) and in
+`tests/functional/41_quiet_leaf_vframe.my`.
+
+Measured (pinned P-core, `-npc`, `OPT=1 ASSERTS=0`, scale 1, one run
+each, vs R3): 63_closures cycles **-8.0%** (stores -12.1%);
+11_closure_counter **-14.0%** (stores -22.4%); 78_typed_param_call
+**-14.3%** (stores -22.9%); 92 cycles -3.4%; 91/97 stores -10.0% /
+-7.2%, cycles flat; 09 flat (its calls are self calls, already lazy);
+76 flat (both callees lose the bet - their element stores' helper
+arms publish; three runs at scale 3 inside the noise).
+
+**Not done, recorded:** a raise arm's helper call is counted hot
+though its continuation is always the exception exit - counting those
+offpath would make a leaf with a division or a bounds check quiet too.

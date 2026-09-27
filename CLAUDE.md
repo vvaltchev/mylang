@@ -1060,7 +1060,16 @@ and a new emitter must obey all four:
    (unless fixed-frame) and `call_rax` - so a C++ helper there must
    be reached through one of those two, never a bare `call_reg`,
    or it runs with a stale `ctx->frame` (a TESTS build's poison
-   window then aborts it by name). **Any other way control reaches
+   window then aborts it by name). **#97 R4 made a frameless LEAF
+   lazy too, on a bet** that its normal-return path publishes
+   nothing, so its site skips the restore. The one way to call C++
+   there without publishing is `call_direct_framefree` /
+   `call_rax_framefree`, for a helper that PROVABLY reads no running
+   frame (a value's release, a lean closure constructor handed its
+   slots, `jit_ret_norec` for a frameless frame, which finds the
+   window from rbp). A helper wrongly called that way reads the
+   poison window in a TESTS build; a publish the bet's count missed
+   is caught at the site (`jit_vframe_published`). **Any other way control reaches
    C++ publishes too**: the exception epilogues and the ReturnV's
    BOUNDARY arm (a callback's owner reuses the frame for the next
    element - missing it was a release SEGV, 2026-09-25).

@@ -390,13 +390,14 @@ enum JitLever {
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
     JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA,
-    JL_FRAMELESS, JL_CAPPROT, JL_COUNT
+    JL_FRAMELESS, JL_CAPPROT, JL_VFQUIET, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
-    "peep", "bakecallee", "capbase", "lsra", "frameless", "capprot"
+    "peep", "bakecallee", "capbase", "lsra", "frameless", "capprot",
+    "vfquiet"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -3625,10 +3626,22 @@ struct Emitter {
      */
     int32_t lazy_vframe_total = -1;
     int32_t lazy_vframe_slots_off = 0, lazy_vframe_size_off = 0;
+    /*
+     * #97 R4: publishes emitted on a frameless LEAF's normal-return path
+     * - the bet (Chunk::frameless_vframe_quiet) holds only while this is
+     * 0. `pub_offpath` > 0 marks emission a frameless frame never
+     * reaches on that path: the exception epilogues (a raise publishes,
+     * and the site's exception path restores anyway) and ReturnV's
+     * record-ful arms (the frameless discriminator comes first).
+     */
+    int vframe_pub_hot = 0;
+    int pub_offpath = 0;
     void vframe_publish()
     {
         if (lazy_vframe_total < 0)
             return;
+        if (pub_offpath == 0)
+            vframe_pub_hot++;
         PinMach pm(*this);              /* machinery: no pin is written */
         load_global(11, jit_layout().addr_act, 11);
         store_base(3 /* rbx */, 11, lazy_vframe_slots_off);
@@ -4361,12 +4374,15 @@ struct Emitter {
                 cache.swap(sc); fcache.swap(sf); tflush.swap(st_);
                 scache.swap(ss);
             }
+            pub_offpath++;             /* R4: the exception path, the
+                                        * frameless exit release too */
             vframe_publish();          /* E2e: an exit to C++ (after the
                                         * flush - a pin may be in r11) */
             if (pre_ret)
                 pre_ret();
             relay_store();
             frag_ret(RetFlush::epilogue);
+            pub_offpath--;
             for (const ExitSite &x : exits)
                 if (x.state == st)
                     patch32(x.at, static_cast<uint32_t>(at - (x.at + 4)));
@@ -4558,6 +4574,15 @@ struct Emitter {
     void call_rax() { vframe_publish();  /* always a C++ helper */
                       call_reg(0 /* rax: the Reg enum is
                                 * declared below the class */); }
+    /* R4: call_rax for a helper that reads no running frame (see
+     * call_direct_framefree) */
+    void call_rax_framefree()
+    {
+        const int32_t t = lazy_vframe_total;
+        lazy_vframe_total = -1;
+        call_rax();
+        lazy_vframe_total = t;
+    }
     /* lea reg, [rbx + disp32]  (an EvalValue-ptr / LValue-ptr helper arg;
      * rm = rbx = slots base). reg is a raw GP number (the Reg enum is
      * declared after this struct, so lea_rdi passes REG_ARG0). */
@@ -5122,6 +5147,18 @@ struct Emitter {
         call_relocs.push_back({ pos(), fn });
         u8(0xE8); u32(0);
         call_done();
+    }
+    /* #97 R4: a C++ helper that PROVABLY never reads the running frame
+     * (ctx->frame / act.view_frame) - a value's destruction, an audit
+     * handed its window by other means - is called WITHOUT the lazy
+     * publish. A TESTS build's lazy entry leaves the POISON window in
+     * the cell, so a helper wrongly listed here aborts by name. */
+    void call_direct_framefree(const void *fn)
+    {
+        const int32_t t = lazy_vframe_total;
+        lazy_vframe_total = -1;
+        call_direct(fn);
+        lazy_vframe_total = t;
     }
     /*
      * #97 E2: the THIRD spelling - a call to an offset IN THIS BUFFER
@@ -11765,11 +11802,33 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             e.cmp_reg_imm(RAX, -1);
             const size_t j_fexc = e.j32(0x75);    /* jne: an exception */
             e.op_reg_imm(Op::plus, RSP, 16 + fl_win);  /* residue + window */
-            if (e.lazy_vframe_total < 0)          /* E2e: lazy - no */
-                vframe_restore();                 /* restore; the next C++
-                                                   * call publishes */
-            else
-                e.vframe_poison();                /* TESTS only */
+            if (e.lazy_vframe_total >= 0) {       /* E2e: lazy - no */
+                e.vframe_poison();                /* restore; the next C++
+                                                   * call publishes (TESTS:
+                                                   * the poison) */
+            } else if (fl_ck->frameless_vframe_quiet) {
+                /* R4: the callee never wrote the cell - it still names
+                 * this frame. A TESTS build's lazy entry left the POISON
+                 * there instead, so it checks that nothing else did
+                 * (jit_vframe_published aborts by name: a publish on
+                 * the path the bet missed) and then restores */
+#ifdef TESTS
+                e.load_global(RCX, jit_layout().addr_act, RCX);
+                e.load_base(RCX, RCX, static_cast<int32_t>(
+                                          JP.act_vframe + JP.frame_slots));
+                e.movabs(R11, reinterpret_cast<uint64_t>(
+                                  jit_poison_window()));
+                e.cmp_rr(RCX, R11);
+                const size_t j_vq = e.j32(0x74);  /* je: untouched */
+                e.call_direct(reinterpret_cast<const void *>(
+                    jit_vframe_published));       /* noreturn */
+                e.patch32_here(j_vq);
+                vframe_restore();
+                g_jit_vframe_quiet_sites++;       /* emit-time */
+#endif
+            } else {
+                vframe_restore();
+            }
             j_done_fl.push_back(e.j32(0xEB));     /* jmp done */
             /* an exception conveyed out of the frameless callee: park
              * the pushed captures in the relay (the postexit restores
@@ -12306,7 +12365,16 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
          * here made the audit read a dangling stack address (ASan:
          * stack-use-after-scope). The audit gets what it needs from
          * the activation instead; see jit_ret_audit's fork note. */
-        e.call_direct(reinterpret_cast<const void *>(jit_ret_audit));
+        /* #97 R4: the audit's window is rbx (it is, at every
+         * terminator), handed over through a global so the call need
+         * not publish the vframe - a lazy frameless leaf publishes
+         * nothing on its normal-return path, hardened builds included */
+        if (!e.store_abs32(&g_jit_audit_window, RBX)) {
+            e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_audit_window));
+            e.store_base0(RBX, RAX);
+        }
+        e.call_direct_framefree(
+            reinterpret_cast<const void *>(jit_ret_audit));
 #endif
         /*
          * #97 INCREMENT 2 (F6) / 3 (W1): THE FRAMELESS FRAME IS TOLD
@@ -12333,6 +12401,13 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             e.cmp_rr(RAX, RBX);                    /* cmp rax, rbx */
             j_frameless = e.j32(0x74);             /* je frameless arm */
         }
+        /* #97 R4: from here on a frameless frame is ONLY in the arm
+         * below (which counts again), so any publish is off its path */
+        struct OffPath {
+            Emitter &e;
+            explicit OffPath(Emitter &em) : e(em) { e.pub_offpath++; }
+            ~OffPath() { e.pub_offpath--; }
+        } off_path(e);
         /* r8 = act, r10 = top_rec (OUR record) */
         e.load_global(R8R, L.addr_act, RAX);
         ld(R10, R8R, static_cast<int32_t>(L.act_top_rec));
@@ -12606,6 +12681,19 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             std::vector<size_t> j_nslow;   /* -> jit_ret_norec (no record
                                             * exists for jit_ret to pop) */
             if (arm_frameless) {
+                /* R4: the frameless path again - a publish here counts */
+                struct OnPath {
+                    Emitter &e;
+                    int saved;
+                    explicit OnPath(Emitter &em)
+                        : e(em), saved(em.pub_offpath)
+                    { e.pub_offpath = 0; }
+                    ~OnPath() { e.pub_offpath = saved; }
+                } on_path(e);
+                /* the ARRAY-result decline, the frameless frame's own:
+                 * jit_ret_norec finds a frameless window at rbp+32, so
+                 * the call does not publish */
+                std::vector<size_t> j_fslow;
                 /*
                  * THE FRAMELESS ARM. What the record-less arm does minus
                  * what the frameless site does for it: the caller
@@ -12630,7 +12718,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                                   static_cast<int_type>(my_total)));
                 e.movabs(RAX, reinterpret_cast<uint64_t>(
                                   &jit_norec_retarm_verify));
-                e.call_rax();
+                e.call_rax_framefree();   /* R4 */
                 e.bump_counter(&g_jit_frameless_rets);
 #endif
                 /* #97 R1 (the record-less arm's rule, below): only an
@@ -12643,7 +12731,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                                  + static_cast<int32_t>(L.off_type));
                     cmp_d_imm8(RAX, L.type_t_off,
                                static_cast<int8_t>(L.t_arr_val));
-                    j_nslow.push_back(e.j32(0x74));    /* je: an array */
+                    j_fslow.push_back(e.j32(0x74));    /* je: an array */
                 }
                 ld(RDX, 5, 24);
                 e.op_reg_imm(Op::band, RDX, -4);       /* clear bits 0, 1 */
@@ -12668,7 +12756,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                     e.push_reg(R10);
                     e.push_reg(RDX);
                     e.mov_rr(RDI, RDX);                    /* reg:abi */
-                    e.call_direct(
+                    e.call_direct_framefree(
                         reinterpret_cast<const void *>(jit_drop_dst));
                     e.pop_reg(RDX);
                     e.pop_reg(R10);
@@ -12728,7 +12816,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                     const size_t j_bw = e.j32(0x75);   /* jne: borrowed ->
                                                         * nothing to do */
                     e.lea_rdi(d);                     /* reg:abi */
-                    e.call_direct(
+                    e.call_direct_framefree(
                         reinterpret_cast<const void *>(jit_release_slot));
                     e.patch32_here(j_tr);
                     e.patch32_here(j_bw);
@@ -12754,7 +12842,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                                       jit_poison_captures()));
                     e.cmp_rr(RAX, R11);                 /* reg:proto */
                     const size_t j_cap_ok = e.j32(0x74);    /* je */
-                    e.call_direct(reinterpret_cast<const void *>(
+                    e.call_direct_framefree(reinterpret_cast<const void *>(
                         jit_w4_captures_replaced));      /* noreturn */
                     e.patch32_here(j_cap_ok);
                 }
@@ -12775,6 +12863,19 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
 #endif
                 e.mov_reg_imm32(RAX, 0xFFFFFFFFu);   /* mov rax, -1 */
                 e.frag_ret(Emitter::RetFlush::flushed);
+                if (!j_fslow.empty()) {
+                    for (const size_t j : j_fslow)
+                        e.patch32_here(j);
+                    e.mov_imm(RDI, static_cast<uint64_t>( /* reg:abi */
+                                      static_cast<int_type>(res_slot)));
+                    ld(RSI, 5, 24);             /* reg:abi: [rbp+24] */
+                    e.movabs(RDX, reinterpret_cast<uint64_t>(
+                                      g_cur_caller_desc));
+                    e.mov_rr(RCX, RBP);
+                    e.call_direct_framefree(
+                        reinterpret_cast<const void *>(jit_ret_norec));
+                    e.frag_ret(Emitter::RetFlush::flushed);
+                }
             }
             e.patch32_here(j_norec);
 #ifdef TESTS
@@ -12953,7 +13054,10 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         }
     }
 
-    /* slow (and the whole op outside the emit-time gate): the C++ tier */
+    /* slow (and the whole op outside the emit-time gate): the C++ tier.
+     * R4: a frameless frame never reaches it (its discriminator is the
+     * first test, and a frame outside the gate has no frameless entry) */
+    e.pub_offpath++;
     for (const size_t j : j_slow)
         e.patch32_here(j);
     if (res_slot >= 0)
@@ -12962,6 +13066,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
     e.call_direct(res_slot >= 0
                       ? reinterpret_cast<const void *>(jit_ret)
                       : reinterpret_cast<const void *>(jit_halt));
+    e.pub_offpath--;
     /* ret (rax = sentinel) */
     e.frag_ret(Emitter::RetFlush::flushed);
 }
@@ -14029,6 +14134,8 @@ void jit_stats_report()
         { "frameless_rets",    &g_jit_frameless_rets },
         { "frameless_init_free", &g_jit_frameless_init_free },
         { "frameless_capbase", &g_jit_frameless_capbase },
+        { "vframe_quiet_sites", &g_jit_vframe_quiet_sites },
+        { "vframe_quiet_lost", &g_jit_vframe_quiet_lost },
         /* #97 E2: self sites EMITTED frameless, and the BOUNDARY calls a
          * frameless frame's declines took (the cap / the floor) */
         { "frameless_self_sites", &g_jit_frameless_self_sites },
@@ -22553,7 +22660,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* R3: the all-local storing form reads no ctx->captures, which
          * is what jit_op_w4_safe admits the op on - with or without a
          * scratch - and it cannot throw */
-        e.call_direct(
+        const void *mc_fn =
             mc_one
                 ? reinterpret_cast<const void *>(jit_make_closure_1)
             : mc_locals
@@ -22562,7 +22669,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 ? reinterpret_cast<const void *>(jit_make_closure_ptr)
             : mc_all_local
                 ? reinterpret_cast<const void *>(jit_make_closure_locals_st)
-                : reinterpret_cast<const void *>(jit_make_closure));
+                : reinterpret_cast<const void *>(jit_make_closure);
+        /* R4: the two lean forms are handed their source slots and read
+         * ctx->root only - no running frame, so no publish */
+        if (mc_one || mc_locals)
+            e.call_direct_framefree(mc_fn);
+        else
+            e.call_direct(mc_fn);
         emit_call_epilogue(e);
 
         if (mc_s1 < 0 && mc_all_local)
@@ -22613,7 +22726,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_call_prologue(e);
             e.lea(REG_ARG0, dst.payload
                                 - static_cast<int32_t>(slot_addr(0).payload));
-            e.call_direct(reinterpret_cast<const void *>(jit_release_slot));
+            e.call_direct_framefree(   /* R4: a value's release */
+                reinterpret_cast<const void *>(jit_release_slot));
             emit_call_epilogue(e);
             e.pop_reg(s1);
             e.pop_reg(RAX);                  /* reg:abi */
@@ -27500,6 +27614,9 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * loop is bounded by the number of runs.
      */
     std::vector<char> pad_off(runs.size(), 0);
+    /* #97 R4: the lazy-vframe bet for a frameless LEAF (see below);
+     * goes false -> true once, bounding its own retry */
+    bool vframe_quiet_lost = false;
     g_jit_pins_denied = 0;
 retry_emission:
     /* Phase A: the one-shot re-emission after a rax-pin conflict. The
@@ -27507,7 +27624,24 @@ retry_emission:
      * and reconstructs fresh - the same total-discard semantics the
      * emit_ok=false give-up path has always had. */
     Emitter e;
-    if (g_cur_self_fl) {            /* E2e: the lazy vframe (Emitter) */
+    /*
+     * #97 R4: a frameless LEAF is lazy too, ON A BET - that its
+     * frameless path publishes nothing at all (Emitter::vframe_pub_hot).
+     * A leaf makes no call, so the only C++ it reaches on that path is
+     * what its ops' helper arms and its return arm call; when none
+     * publishes, the vframe cell is never written between the site's
+     * call and its return, and the site need not restore it
+     * (Chunk::frameless_vframe_quiet). When one does, the chunk is
+     * emitted again EAGERLY - a leaf that calls helpers per iteration
+     * must not pay a publish per helper call for a store per call.
+     */
+    const bool vframe_quiet_bet =
+        !g_cur_self_fl && !vframe_quiet_lost && g_cur_caller_desc
+        && chunk.frameless_ok && chunk.frameless_wanted
+        && !chunk.frameless_calls && jit_norec_on()
+        && !jit_lever_off(JL_FRAMELESS) && !jit_lever_off(JL_VFQUIET);
+    chunk.frameless_vframe_quiet = false;
+    if (g_cur_self_fl || vframe_quiet_bet) {   /* E2e: the lazy vframe */
         e.lazy_vframe_total =
             static_cast<int32_t>(chunk.slot_count + chunk.n_temps);
         e.lazy_vframe_slots_off = static_cast<int32_t>(
@@ -29687,6 +29821,18 @@ retry_emission:
             chunk.arg_stage_pools.clear();
             goto retry_emission;
         }
+        if (vframe_quiet_bet && e.vframe_pub_hot > 0) {
+            vframe_quiet_lost = true;   /* R4: the bet lost - eager */
+            g_hoist = JitHoist{};
+            g_hoist2 = JitHoist{};
+            chunk.call_caches.clear();
+            chunk.norec_sites.clear();
+            chunk.arg_stage_pools.clear();
+#ifdef TESTS
+            g_jit_vframe_quiet_lost++;
+#endif
+            goto retry_emission;
+        }
         if (e.capbase >= 0
                 && !jit_reg_is_callee_saved(
                        static_cast<uint8_t>(e.capbase))
@@ -30478,6 +30624,12 @@ retry_emission:
     chunk.frameless_entry_off = fe_off;
     chunk.frameless_entry_abs =
         fe_off >= 0 ? static_cast<char *>(mem) + fe_off : nullptr;
+    /* #97 R4: the bet held through the WHOLE emission. The check after
+     * the main stream re-emits eagerly when it lost there; a publish
+     * emitted later (a C1 cold copy) keeps the body lazy with the site
+     * restoring - E2e's model exactly, only without the saved store */
+    chunk.frameless_vframe_quiet =
+        vframe_quiet_bet && fe_off >= 0 && e.vframe_pub_hot == 0;
     if (jit_map_wanted())
         jit_write_map(chunk, map_name);
 }

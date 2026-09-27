@@ -126,6 +126,25 @@ static const std::vector<test> tests =
         "for (var i = 0; i < 50; i++) { s = s + f(i); }",
         "assert(s == 22075);" } },
     /*
+     * #97 R4: a frameless LEAF whose normal-return path reaches no
+     * frame-reading C++ never writes the vframe, and its site does not
+     * restore it (a TESTS build checks the poison window is still there
+     * instead). An ARRAY result still declines to jit_ret_norec - which
+     * finds the frameless window from rbp: reading it through the
+     * unpublished vframe hits the poison (watched failing).
+     */
+    { "call: a quiet frameless leaf returning an ARRAY declines through "
+      "its own window, and the caller's view survives (#97 R4)", {
+        "func pick(array<int> a, int k) { var r = 0;",
+        "    for (var j = 0; j < k; j++) { r += j * 3; }",
+        "    if (r < 0) { return a; }",
+        "    return a; }",
+        "var a = [1, 2, 3, 4]; var s = 0;",
+        "for (var i = 0; i < 40; i++) {",
+        "    var b = pick(a, runtime(3));",
+        "    s = s + b[1] + len(b) + len(str(s)); }",
+        "assert(s == 345);" } },
+    /*
      * #97 B2: abs/min/max on PROVEN INTS lower to a compare-and-branch over
      * int ops (codegen), not the builtin call. The builtins' exact
      * semantics, in the three positions whose peepholes treat a lowering's
@@ -33204,9 +33223,14 @@ static bool jit_frameless_w2_shape()
                      * this per-CALL prologue is three instructions,
                      * and W6's second one is recovered here. */
                     "lea rbx, [rbp+0x20]",       /* the caller's window */
-                    "mov r8, [<addr>]@r11",      /* act */
-                    "mov [r8+0x*], rbx",         /* vframe.slots */
-                    "mov [r8+0x*], 3",           /* vframe.size = 3 */
+                    /* #97 R4: a LEAF is lazy - the vframe is NOT
+                     * published; a TESTS build parks the poison window
+                     * there instead (the site checks it is still there
+                     * after the call) */
+                    "movabs r11, <addr>",        /* jit_poison_window */
+                    "mov rcx, [<addr>]@rcx",     /* act */
+                    "mov [rcx+0x*], r11",        /* vframe.slots */
+                    "mov [rcx+0x*], 0",          /* vframe.size = 0 */
                     "mov r1*, [rdx+0x*]",        /* W4: the capture data
                                                   * pointer from fo (rdx) -
                                                   * ONE load, no ctx walk.
