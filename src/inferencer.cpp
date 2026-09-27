@@ -4119,9 +4119,13 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     if (n == "int")    return A.int_ty();
     if (n == "str" || n == "typestr" || n == "kindstr" || n == "chr" ||
         n == "join" || n == "lpad" || n == "rpad" || n == "lstrip" ||
-        n == "rstrip" || n == "strip" || n == "readln" || n == "read" ||
+        n == "rstrip" || n == "strip" || n == "read" ||
         n == "tmpdir")
         return A.str_ty();
+
+    /* readln() is none at the end of input */
+    if (n == "readln")
+        return A.str_ty(true);
 
     /* type(x) / decltype(v) -> a Type reflection object (native composite) */
     if (n == "type" || n == "decltype") {
