@@ -778,6 +778,29 @@ still read plausibly. An intrusive surface that could assert *"this
 compile installed a live-descriptor set"* would have caught it
 instantly; nothing available today could.
 
+**TODO WHEN IT EXISTS - three splice gates no test can reach today
+(#97 closure inlining step 1, 2026-09-27; maintainer's call: wait for
+this infrastructure rather than hand-assemble bytecode).** Each guards
+a shape our CODEGEN never emits, so no `.my` program - the only input
+any test has - can produce it, and removing any of them left every net
+green (watched). A stored image does not reach them either: the splice
+runs at compile time, not at load. Each needs a HOOK BETWEEN CODEGEN
+AND THE SPLICE (`bc_inline_chunk`) that edits a real compiled chunk,
+and a test asserting the splice then DECLINES the site (and that the
+program still prints what `-nbi` prints):
+ 1. **a staging temp LIVE after the call** - insert a read of the
+    argument temp after the `call.val`; `bc_value_site_step1` must not
+    sink that staging move (the `live_out` gate);
+ 2. **a body that reads its returned slot BEFORE writing it** - edit
+    the callee's pristine chunk so its first op reads the returned
+    slot; the result must not be renamed into dst (the `read_first`
+    gate);
+ 3. **a call whose dst IS the callee slot** (`c = c()` lowered with no
+    intermediate temp) - retarget the `call.val`'s dst to its callee
+    slot; the rename must be refused (a capture op after the write
+    would read the WRONG closure).
+Record: docs/jit-optimizations.md, *#97 CLOSURE INLINING STEP 1*.
+
 ---
 
 ## 3. TASK #110 — VM `foreach` OVER A FLAT STRUCT ARRAY  [PENDING]
