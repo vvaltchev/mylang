@@ -602,8 +602,9 @@ enum class OpCode : unsigned char {
 
     /*
      * MapFilterV: `target` = dst; `a` = the (already CheckFuncV'd) function
-     * slot; `b` = the container slot; `target2` = is_filter (0 = map, 1 =
-     * filter). Calls the shared vm_map_filter (generic.cpp.h) - map builds a
+     * slot; `b` = the container slot; `target2` bit 0 = is_filter (0 = map,
+     * 1 = filter), bits 1-2 = the flat RESULT kind (map_filter_flat_hint:
+     * 0 general, 1 int, 2 float, 3 bool - #97 CB3, myv v23). Calls the shared vm_map_filter (generic.cpp.h) - map builds a
      * fresh array, filter keeps truthy elements (array->array, dict->dict).
      * `node` = arg1 (the unsupported-container caret).
      */

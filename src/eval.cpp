@@ -1602,9 +1602,10 @@ EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
             throw TypeErrorEx("Expected function",
                               al->arg(0)->start, al->arg(0)->end);
         const EvalValue c = RValue(args[1]);
+        /* an indirect call has no destination hint: a general result */
         return vm_map_filter(ctx, f, c, b.kind == Builtin::Kind::filter,
                              al->arg(1)->start, al->arg(1)->end,
-                             al->arg(1)->start);
+                             al->arg(1)->start, 0);
     }
 
     case Builtin::Kind::lazy:

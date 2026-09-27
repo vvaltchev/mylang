@@ -2,8 +2,14 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 22.  This document describes the on-disk image exhaustively:
+Format version 23.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v23 changes no encoding: MapFilterV's `target2` gains two meaning bits.
+Bit 0 is still is_filter; bits 1-2 are the flat RESULT kind (0 none /
+general, 1 int, 2 float, 3 bool - #97 CB3).  A v22 binary read any
+nonzero `target2` as "filter", so it would run a hinted `map` as a
+filter; the version bump is what makes it refuse the image instead.)
 
 (v22 adds one per-chunk record, `op_locs` - section 9.2 - a third loc
 table in the identical encoding, written right after `base_locs`: the

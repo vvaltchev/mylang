@@ -2652,6 +2652,12 @@ In case the container is a dictionary, `func` is required to accept two paramete
 a key and a value, but the behavior will be semantically the same (a dictionary will
 be returned).
 
+Like `make_array()`, `map` and `filter` build their result array in the compact
+*flat* representation (see `array_storage()`) when it is stored where the
+element type is known to be `int`, `float` or `bool` (e.g. `var b = map(func(x)
+=> x * 2, range(10))`); a `dyn` destination gets the general representation.
+The result's contents are the same either way.
+
 #### Callbacks that change the container they run over
 
 A callback passed to a builtin is arbitrary code, and it may modify the very

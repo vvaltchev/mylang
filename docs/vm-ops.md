@@ -805,7 +805,12 @@ shared **`vm_map_filter`** in generic.cpp.h, declared in eval.h — map builds a
 fresh array, filter keeps truthy elements; array→array, dict→dict — the SAME
 core the tree-walker's `builtin_map`/`builtin_filter` now call). The
 devirtualize pass sets `DirectBuiltinCallExpr::map_filter_kind` from the callee
-name. So the residual old-ABI (`func`, node-based) floor is now exactly ONE
+name. `target2` bit 0 = is_filter; bits 1-2 = the FLAT RESULT kind (#97 CB3,
+`map_filter_flat_hint`: the call's `ArrHint` when the destination is proven
+`array<int>`/`<float>`/`<bool>` - 1/2/3, else 0 = general), so the result of
+`var b = map(f, a)` is flat like `make_array`'s and a following map/filter/
+sort hands its callback raw elements. `-vd` prints `; flat int` etc.
+(myv v23: a v22 reader took any nonzero `target2` for "filter"). So the residual old-ABI (`func`, node-based) floor is now exactly ONE
 principled group — the **AST builtins** (`defined`/`isconst`/`isconstdecl`/
 `type`/`decltype`/`typestr`/`kindstr`/`show`: an unevaluated / node-property
 operand, inherently node-based).

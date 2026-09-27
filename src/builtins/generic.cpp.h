@@ -486,7 +486,7 @@ EvalValue builtin_hash(EvalContext *ctx, const ArgLocs *exprList,
  */
 EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                         const EvalValue &container, bool is_filter,
-                        Loc cstart, Loc cend, Loc site)
+                        Loc cstart, Loc cend, Loc site, int flat_hint)
 {
     FuncObject &funcObj = *func_val.get<intrusive_ptr<FuncObject>>().get();
 
@@ -503,6 +503,47 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
          * build a fresh array. */
         const SharedArrayObj &arr = container.get<SharedArrayObj>();
         SharedArrayObj::vec_type result;
+        /*
+         * #97 CB3: a destination PROVEN array<int>/<float>/<bool> (the
+         * flat_hint - see map_filter_flat_hint) gets a FLAT result, built
+         * optimistically like make_array's: while every element is the
+         * hinted scalar it goes to the flat vector; the first one that is
+         * not spills to the general vector and the rest go there. A flat
+         * result is what lets a following map/filter/sort hand ITS
+         * callback raw elements (CB1/CB2). Never in a const-eval context,
+         * whose general elements carry the const flag.
+         */
+        int fmode = ctx->const_ctx ? 0 : flat_hint;
+        SharedArrayObj::ivec_type fi;
+        SharedArrayObj::fvec_type ff;
+        SharedArrayObj::bvec_type fb;
+        auto push_res = [&](EvalValue &&v) {
+            if (fmode == 1 && v.is<int_type>()) {
+                fi.push_back(v.get<int_type>());
+                return;
+            }
+            if (fmode == 2 && v.is<float_type>()) {
+                ff.push_back(v.get<float_type>());
+                return;
+            }
+            if (fmode == 3 && v.is<bool>()) {
+                fb.push_back(v.get<bool>() ? 1 : 0);
+                return;
+            }
+            if (fmode != 0) {            /* spill what is flat so far */
+                for (int_type x : fi)
+                    result.emplace_back(EvalValue(x), ctx->const_ctx);
+                for (float_type x : ff)
+                    result.emplace_back(EvalValue(x), ctx->const_ctx);
+                for (unsigned char x : fb)
+                    result.emplace_back(EvalValue(x != 0), ctx->const_ctx);
+                fi.clear();
+                ff.clear();
+                fb.clear();
+                fmode = 0;
+            }
+            result.emplace_back(std::move(v), ctx->const_ctx);
+        };
 
         /* #49: the size is re-read per step - the callback is arbitrary
          * script code and may shrink the array under us; a count read
@@ -519,27 +560,27 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                     const int_type v = arr.flat_ints()[at];
                     EvalValue r = inv.call(v);
                     if (!is_filter)
-                        result.emplace_back(std::move(r), ctx->const_ctx);
+                        push_res(std::move(r));
                     else if (r.is_true())
-                        result.emplace_back(EvalValue(v), ctx->const_ctx);
+                        push_res(EvalValue(v));
                     continue;
                 }
                 case SharedArrayObj::Storage::floats: {
                     const float_type v = arr.flat_floats()[at];
                     EvalValue r = inv.call(v);
                     if (!is_filter)
-                        result.emplace_back(std::move(r), ctx->const_ctx);
+                        push_res(std::move(r));
                     else if (r.is_true())
-                        result.emplace_back(EvalValue(v), ctx->const_ctx);
+                        push_res(EvalValue(v));
                     continue;
                 }
                 case SharedArrayObj::Storage::bools: {
                     const bool v = arr.flat_bools()[at] != 0;
                     EvalValue r = inv.call(v);
                     if (!is_filter)
-                        result.emplace_back(std::move(r), ctx->const_ctx);
+                        push_res(std::move(r));
                     else if (r.is_true())
-                        result.emplace_back(EvalValue(v), ctx->const_ctx);
+                        push_res(EvalValue(v));
                     continue;
                 }
                 default:
@@ -552,11 +593,14 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
             EvalValue e = arr_elem_at(arr, i);
             EvalValue r = inv.call(e);
             if (!is_filter)
-                result.emplace_back(std::move(r), ctx->const_ctx);
+                push_res(std::move(r));
             else if (r.is_true())
-                result.emplace_back(std::move(e), ctx->const_ctx);
+                push_res(std::move(e));
         }
 
+        if (fmode == 1) return SharedArrayObj(std::move(fi));
+        if (fmode == 2) return SharedArrayObj(std::move(ff));
+        if (fmode == 3) return SharedArrayObj(std::move(fb));
         return SharedArrayObj(std::move(result));
 
     } else if (container.is<intrusive_ptr<DictObject>>()) {
@@ -633,7 +677,8 @@ EvalValue builtin_map(EvalContext *ctx, ExprList *exprList)
 
     const EvalValue val1 = RValue(arg1->eval(ctx));
     return vm_map_filter(ctx, val0, val1, /*is_filter=*/false,
-                         arg1->start, arg1->end, arg1->start);
+                         arg1->start, arg1->end, arg1->start,
+                         map_filter_flat_hint(exprList->arr_hint));
 }
 
 EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
@@ -650,5 +695,6 @@ EvalValue builtin_filter(EvalContext *ctx, ExprList *exprList)
 
     const EvalValue val1 = RValue(arg1->eval(ctx));
     return vm_map_filter(ctx, val0, val1, /*is_filter=*/true,
-                         arg1->start, arg1->end, arg1->start);
+                         arg1->start, arg1->end, arg1->start,
+                         map_filter_flat_hint(exprList->arr_hint));
 }

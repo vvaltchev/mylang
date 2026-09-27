@@ -863,6 +863,33 @@ static const std::vector<test> tests =
      * Watched failing: stamping every int/float param fails all three
      * unstamped rows in every mode.
      */
+    /*
+     * #97 CB3: map/filter build a FLAT result for a destination proven
+     * array<int>/<float>/<bool> (the call's ArrHint, carried in
+     * MapFilterV's target2) - and only then: a dyn destination and an
+     * indirect call stay general, so no later store is refused an
+     * element it used to take. Every engine must report the same
+     * storage (RULE 2: array_storage is observable). Watched failing:
+     * without the hint in codegen, the VM modes report "general" while
+     * the tree-walker reports "int".
+     */
+    { "map/filter: a proven flat destination gets a flat result",
+      { "var a = range(12);",
+        "var b = map(func(x) => x * 2, a);",
+        "var c = filter(func(x) => x % 3 == 0, b);",
+        "assert(array_storage(b) == \"int\" && array_storage(c) == \"int\");",
+        "assert(c == [0, 6, 12, 18]);",
+        "var f = map(func(x) => x * 0.5, a);",
+        "assert(array_storage(f) == \"float\" && f[3] == 1.5);",
+        "var g = map(func(x) => x > 5, a);",
+        "assert(array_storage(g) == \"bool\" && g[6] && !g[5]);",
+        "var dyn d = map(func(x) => x, a);",
+        "assert(array_storage(d) == \"general\");",
+        "var dyn m = map;",
+        "var dyn e = m(func(x) => x + 1, a);",
+        "assert(array_storage(e) == \"general\" && e[11] == 12);",
+        "append(d, \"still accepts anything\");",
+        "assert(len(d) == 13);" } },
     { "coerce: a param fed only its final type stays unstamped (fast_bind)",
       { "var b = 2;",
         "var f = func [b] (x) { return x; };",
@@ -25412,6 +25439,13 @@ static bool invoker_call_tiers()
             "var k = filter(func(x) { return x > 10.0; }, f);",
             "assert(len(k) == 20 && k[0] == 10.5);" },
           ExecEngine::Vm, true, 30, true },
+        /* filter over a MAP RESULT: flat since CB3, so raw too */
+        { "filter over a map result, VM engine",
+          { fill,
+            "var m = map(func(x) { return x * 2; }, a);",
+            "var k = filter(func(x) { return x > 20; }, m);",
+            "assert(len(k) == 20);" },
+          ExecEngine::Vm, true, 60, true },
         /* map over a GENERAL (mixed) array: already-boxed elements, still
          * the prepared entry, never raw */
         { "map callback over boxed elements, VM engine",

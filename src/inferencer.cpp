@@ -2993,7 +2993,7 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
          * scalar dict into a flat array<int>/<float>/<bool> avoids per-element
          * boxing (a big win for keys()/values() of a large dict). */
         if (nm == "range" || nm == "array" || nm == "make_array" ||
-            nm == "keys" || nm == "values") {
+            nm == "keys" || nm == "values" || nm == "map" || nm == "filter") {
             call->args->arr_hint = hint;
             call->args->arr_hint_struct = sdef;
         }

@@ -101,6 +101,17 @@ enum class ArrHint : unsigned char {
     dflt, general, flat_i, flat_f, flat_b, flat_s
 };
 
+/* #97 CB3: the flat result kind map/filter may build, from the call's
+ * ArrHint - 1 int, 2 float, 3 bool, 0 none (general). Only an EXPLICIT
+ * flat hint counts: the destination was proven that array type, so no
+ * later store can be refused an element a general result accepted. The
+ * VM carries it in MapFilterV's target2 bits 1-2. */
+inline int map_filter_flat_hint(ArrHint h)
+{
+    return h == ArrHint::flat_i ? 1 : h == ArrHint::flat_f ? 2
+         : h == ArrHint::flat_b ? 3 : 0;
+}
+
 /* DeclType / SymKind / ResolvedSym / FuncDescriptor moved to funcdesc.h (the
  * serializable runtime function descriptor lives outside the AST headers'
  * node classes - see plans/archived/vm-ast-free-runtime.md). */
