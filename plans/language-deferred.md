@@ -106,3 +106,14 @@ when `x` really does not exist the guarded code is also deleted), but
 the early-DCE half was never built. Note CLAUDE.md's only pointer to
 this mislabels it "(#135)", which is the landed, DIFFERENT feature —
 worth fixing if this is ever picked up.
+
+## Immutable views of a mutable container
+
+**Raised by the maintainer (2026-09-25), not designed.** Pass code a
+read-only VIEW of a container that is not `const`, and prove at
+COMPILE time that the receiver cannot mutate it - directly or through a
+function it hands the view to. The motivating case is a builtin
+callback: `sort`'s comparator, `map`/`filter`'s function and a
+`foreach` body over the container each pay a RUN-TIME mutation check
+today (#49, #53) that a compile-time guarantee would delete. Intro and
+open questions: `plans/immutable-views.md`.
