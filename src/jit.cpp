@@ -13897,6 +13897,7 @@ void jit_stats_report()
         { "noesc_cs_named",   &g_esc_named_by_cs },
         { "cb_prepared",      &g_invoke_prepared },
         { "cb_fallback",      &g_invoke_fallback },
+        { "cb_raw",           &g_invoke_raw },
         /* #121: slot binds served by the dispatch-free same-kind handle
          * move-assign, vs the ordinary put() they decline to. */
         { "ref_bind_fast",    &g_ref_bind_fast },

@@ -7610,11 +7610,17 @@ measured win, not just tidier: reaching the invoker through a
 `cmp2(EvalValue, EvalValue)` helper made `sort` box each operand TWICE
 (once for the helper's parameters, once into the argv), and removing that
 double boxing read −16.2% instructions and 0.89x wall clock on
-34_sort_custom_cmp. **Do not "improve" it by writing the raw scalar
-straight into the callee's window slot** — that was built in four shapes
-and lost the wall clock every time while winning every simulated metric;
-the record, including how to prove reach with `MYLANG_JITSTATS`'
-`cb_prepared`/`cb_fallback`, is in `plans/top5-cpp-gap.md`.
+34_sort_custom_cmp. **An all-SCALAR argument list is written straight
+into the callee's window slots** (`VmInvoker::call_scalars`, #97,
+2026-09-25: 34 -16.1% Ir, 0.82x wall; `cb_raw` in `MYLANG_JITSTATS`).
+⛔ That was built in four shapes on 2026-08-14 and REJECTED at 1.20x
+slower - on a WSL2 box with no PMU, where "front-end/layout" could only
+be guessed. On native hardware the path is BACKEND-bound (top-down
+counters), and a SAME-BINARY A/B around the path - identical layout -
+measured -23% cycles. **When a result is better on every simulated
+metric and worse on the clock, measure top-down on the real CPU and
+A/B inside ONE binary before concluding "layout"**; the record is in
+`plans/top5-cpp-gap.md`.
 
 **Memory safety with user callbacks.** A builtin that drives a sort/search with
 a *user-supplied* callback must not assume the callback is well-behaved — it is

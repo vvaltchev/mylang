@@ -4,6 +4,7 @@
 
 #include "bytecode.h"   /* Chunk */
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 class Construct;
@@ -106,6 +107,7 @@ extern unsigned long g_esc_named_by_cs;
 /* Which VmInvoker::call entry each callback element took (vm.cpp) */
 extern unsigned long g_invoke_prepared;
 extern unsigned long g_invoke_fallback;
+extern unsigned long g_invoke_raw;   /* prepared entries bound RAW (#97) */
 /* lever 4 execution proof: per-element runs of the SPECIALIZED dyn-foreach
  * Next bodies (resolved once at ForeachDynInit): 0 int / 1 float / 2 bool /
  * 3 gen / 4 dict */
@@ -204,6 +206,15 @@ public:
     template <class... A>
     EvalValue call(A &&... args)
     {
+        /* #97: an all-SCALAR argument list (a flat int/float/bool array's
+         * raw elements, make_array's index) skips the argv entirely - the
+         * prepared window's slots are written in place (call_scalars). */
+        if constexpr (sizeof...(A) > 0
+                      && (cb_scalar_v<std::decay_t<A>> && ...)) {
+            const CbScalar ra[] = {
+                CbScalar(static_cast<std::decay_t<A>>(args))... };
+            return call_scalars(ra, sizeof...(A));
+        }
         /* Each argument is boxed EXACTLY ONCE, here, straight from its
          * static C++ type - that single-boxing is the win (see the class
          * comment). Then the prepared window entry, or the per-call path
@@ -241,6 +252,37 @@ public:
     EvalValue invoke(const EvalValue *argv, size_t n);
 
 private:
+    /*
+     * #97 THE RAW SCALAR BIND. A scalar argument is written straight into
+     * its window slot - no argv, no EvalValue assignment's type dispatch
+     * - when the callee binds plainly (fast_bind: no parameter coerces),
+     * the arity is exact, and each slot is trivial and not borrowed
+     * (after a call the release scan leaves every ref-listed slot
+     * trivial, so this holds on every element but a pathological one,
+     * which boxes instead). 34_sort_custom_cmp -24.5% Ir, 0.82x wall.
+     *
+     * ⛔ THIS WAS BUILT IN FOUR SHAPES ON 2026-08-14 AND REJECTED (1.20x
+     * slower on the wall clock at -28% Ir; plans/top5-cpp-gap.md). The
+     * diagnosis then was "front-end / code layout", unmeasurable on that
+     * box (WSL2, no PMU). On native hardware with top-down counters
+     * (2026-09-25) the path is BACKEND-bound, not front-end, and a
+     * same-binary A/B (an env switch around this very path, so layout
+     * was identical) measured -23% cycles; the interleaved --baseline
+     * wall clock against the unmodified tree agreed (0.82x). The August
+     * loss does not reproduce here.
+     */
+    struct CbScalar {
+        uint8_t kind;            /* 0 int, 1 float, 2 bool */
+        union { int_type i; float_type f; };
+        CbScalar(int_type v) : kind(0), i(v) {}
+        CbScalar(float_type v) : kind(1), f(v) {}
+        CbScalar(bool v) : kind(2), i(v ? 1 : 0) {}
+    };
+    template <class T>
+    static constexpr bool cb_scalar_v = std::is_same_v<T, int_type>
+        || std::is_same_v<T, float_type> || std::is_same_v<T, bool>;
+    EvalValue call_scalars(const CbScalar *ra, size_t n);
+
     EvalValue call_eval_func(const EvalValue *argv, size_t n);
 
     bool ready_ = false;
