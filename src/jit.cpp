@@ -16756,7 +16756,8 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                      const std::vector<MemEvent> &mem,
                      const std::vector<MemEvent> &int_uses,
                      int K, LsraOut &out,
-                     const std::vector<FltEvent> *fev)
+                     const std::vector<FltEvent> *fev,
+                     bool locals_only)
 {
     out = LsraOut();
     if (begin >= end || iv.size() != q.size() || K < 0)
@@ -16861,6 +16862,7 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
              * inside - a stretch nothing reads gains nothing - of a
              * slot over the run-wide floor (pick parity, above) */
             const bool cand = !forced && !fl && evid
+                    && !(locals_only && l.slot >= ck.slot_count)
                     && slot_wint[l.slot] >= 3
                     && nu(s, l.slot) < static_cast<int>(e2 - s);
             out.pieces.push_back({ static_cast<int>(k), l.slot, s, e2,
@@ -27663,10 +27665,13 @@ retry_emission:
                 std::vector<LsraTrans> tr;
                 if (jit_lsra_assign(chunk, begin, end, liv, lq, lev,
                                     liu, static_cast<int>(max_pins),
-                                    tp)) {
-                    for (LsraPiece &p : tp.pieces)
-                        if (p.slot >= chunk.slot_count)
-                            p.reg = -1;          /* v1: no temps */
+                                    tp, nullptr, /*locals_only=*/true)) {
+                    /* v1: no temps - kept OUT of the contest (#124(a)),
+                     * so none can hold a register here */
+#ifndef NDEBUG
+                    for (const LsraPiece &p : tp.pieces)
+                        ML_CHECK(p.reg < 0 || p.slot < chunk.slot_count);
+#endif
                     if (jit_lsra_snap(chunk, begin, end, liv, lq,
                                       liu, static_cast<int>(max_pins),
                                       tp.pieces, entry, tr, nullptr,
@@ -27899,10 +27904,13 @@ retry_emission:
                     if (jit_lsra_assign(chunk, begin, end, liv, lq,
                                         lev, liu,
                                         static_cast<int>(MAX_FCACHED),
-                                        fp, &lfev)) {
-                        for (LsraPiece &p : fp.pieces)
-                            if (p.slot >= chunk.slot_count)
-                                p.reg = -1;      /* v1: no temps */
+                                        fp, &lfev, /*locals_only=*/true)) {
+                        /* v1: no temps - out of the contest (#124(a)) */
+#ifndef NDEBUG
+                        for (const LsraPiece &p : fp.pieces)
+                            ML_CHECK(p.reg < 0
+                                     || p.slot < chunk.slot_count);
+#endif
                         if (jit_lsra_snap(chunk, begin, end, liv, lq,
                                           liu,
                                           static_cast<int>(MAX_FCACHED),

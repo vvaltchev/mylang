@@ -28415,6 +28415,75 @@ static bool myv_untrusted_proven_arms()
 }
 
 /*
+ * #124(a): at K=4 with five hot locals the scan used THREE registers.
+ * The loop's scratch temp won a contest (evicting local `c`), the
+ * caller then stripped every temp (v1 pins locals only) and the freed
+ * register was never offered back. Temps are now kept OUT of the
+ * contest (`locals_only`); this runs the scan exactly as the GP caller
+ * does and requires all four registers to end up holding a local.
+ * Watched failing with `locals_only` ignored: 3 of 4.
+ */
+static bool lsra_k4_no_idle_register()
+{
+#if !ML_JIT_SUPPORTED
+    return true;                   /* the scan exists only with the JIT */
+#else
+    const char *src =
+        "func hot(int n) {\n"
+        "  var a = 0; var b = 1; var c = 2; var d = 3; var e = 4;\n"
+        "  for (var i = 0; i < n; i++) {\n"
+        "    a = a + i * 3;  b = b ^ (i >> 1);  c = c + a - b;\n"
+        "    d = d + c * 2;  e = e ^ (d + i);\n"
+        "  }\n"
+        "  return a + b + c + d + e;\n"
+        "}\n"
+        "print(hot(runtime(1000)));\n";
+    std::vector<Tok> toks;
+    lexer(src, 1, toks);
+    ParseContext pctx(TokenStream(toks), true);
+    unique_ptr<Construct> root = pBlock(pctx);
+    mark_implicit_globals(root.get(), {});
+    infer_types(root.get(), true);
+    run_optimizers(root.get());
+    VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+    const Chunk *ck = nullptr;
+    for (const auto &fd : prog.funcs)
+        if (fd->vm_chunk && fd->name && fd->name->val == "hot")
+            ck = static_cast<const Chunk *>(fd->vm_chunk);
+    if (!ck) {
+        fprintf(stderr, "lsra_k4: hot() did not compile to a chunk\n");
+        return false;
+    }
+    SlotLiveness sl;
+    std::vector<LiveInterval> iv;
+    std::vector<IntervalQual> q;
+    std::vector<MemEvent> ev, iu;
+    LsraOut plan;
+    const size_t n = ck->code.size();
+    if (!jit_slot_liveness(*ck, sl)
+            || !jit_build_intervals(*ck, 0, n, sl, iv)
+            || !jit_qualify_intervals(*ck, 0, n, iv, q, nullptr, &ev,
+                                      &iu)
+            || !jit_lsra_assign(*ck, 0, n, iv, q, ev, iu, 4, plan,
+                                nullptr, /*locals_only=*/true)) {
+        fprintf(stderr, "lsra_k4: the scan declined the chunk\n");
+        return false;
+    }
+    std::set<int> regs;
+    for (const LsraPiece &p : plan.pieces)
+        if (p.reg >= 0 && p.slot < ck->slot_count)   /* the caller's
+                                                      * v1 view */
+            regs.insert(p.reg);
+    if (regs.size() != 4) {
+        fprintf(stderr, "lsra_k4: %zu of 4 registers hold a local "
+                        "(a freed register left idle)\n", regs.size());
+        return false;
+    }
+    return true;
+#endif
+}
+
+/*
  * #97 CB5: `Chunk::ref_slots_raw` is ref_slots with NO parameter seeds -
  * the list VmInvoker::call_scalars scans after a raw scalar bind. Pinned
  * in both directions: a comparator's two params are in ref_slots (a
@@ -47373,6 +47442,9 @@ static const std::vector<extra_check> extra_checks =
     { "vm: ref_slots_raw drops the raw-bound params and keeps the body's "
       "own reference writes (#97 CB5)",
       ref_slots_raw_derivation },
+    { "jit: the linear scan uses every register at K=4 - temps stay out "
+      "of the contest (#124(a))",
+      lsra_k4_no_idle_register },
     { "vm: a moved VmProgram's root chunk keeps its baked addresses bound "
       "(the load path's stack-stale main)",
       vm_program_move_rebinds },

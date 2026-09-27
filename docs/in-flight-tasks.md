@@ -824,6 +824,10 @@ corpus hole of the same family as the field store's.
 ---
 
 ## 3b. TASK #124 — REMOVE THE 4-REGISTER CAP ON CALL-CONTAINING RUNS
+**✅ (a) DONE 2026-09-26** - the cause was not eviction: TEMPS competed
+in the scan and were stripped afterwards, leaving the freed register
+idle. `jit_lsra_assign(..., locals_only)`; record: *#124(a)* in
+docs/jit-optimizations.md. (b) and (c) remain.
 ## [PENDING — maintainer's call 2026-09-19: "completely fix this with
 ## both approaches, but not as a detour right now"]
 
