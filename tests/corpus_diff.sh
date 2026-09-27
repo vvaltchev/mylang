@@ -26,6 +26,11 @@
 #                                              call site (TESTS builds)
 #                                              REFUSED (the imm32 tags fall
 #                                              back to registers)
+#   tests/corpus_diff.sh [binary] MODE...    - several modes in ONE run:
+#                                              the plain part and the
+#                                              tree-walker references run
+#                                              once, each mode's rows
+#                                              follow in the order given
 #
 # --nolowmem exists because the JIT emits MATERIALLY different code when
 # ml_lowmem_fits_imm32 is false: every type tag becomes a register read
@@ -46,7 +51,44 @@
 #
 # Excluded from samples/: rand_sort (rand()), shopping/phonebook (they
 # read stdin and reprint their menu forever on EOF).
+#
+# PARALLEL, AND THE REPORT IS THE SERIAL ONE (2026-09-27). Every
+# (configuration x program) run is an independent process, so they all
+# run up front, `tests/jobs.sh count` at a time (MYLANG_TEST_JOBS
+# overrides), in the IDLE scheduling class (tests/jobs.sh run); the
+# report is then printed from the saved outputs in exactly the order,
+# and with exactly the text, the one-at-a-time version printed. The
+# tree-walker reference does not depend on the JIT configuration - the
+# serial script passed the env only to the default engine - so it runs
+# ONCE per flag set (plain, -nc, -nti) and every configuration compares
+# against that one run, and fold_same's two sides are the same runs as
+# the plain and -nc default-engine rows. Programs run with stdin from
+# /dev/null. Needs `xargs -P` (GNU and BSD both have it).
 set -u
+
+# ---- one unit of work, run by xargs: the parallel half ------------- #
+# $2 = results dir, $3 = unit id, $4 = env assignment or '-', $5 = the
+# mylang flags or '-', $6 = the program. Writes <id>.out and <id>.rc.
+if [ "${1:-}" = __unit ]; then
+    _d=$2 _id=$3 _e=$4 _fl=$5 _f=$6
+    [ "$_e" = - ] && _e=
+    [ "$_fl" = - ] && _fl=
+    # The program's own stdout/stderr go to the unit's file; this shell's
+    # stderr goes nowhere, so a signal death is not ALSO announced by
+    # bash ("Segmentation fault ...") on the report's stderr - the serial
+    # script ran each program in a $(...), where bash stays silent.
+    exec 2>/dev/null
+    # shellcheck disable=SC2086
+    env $_e timeout 60 "$CORPUS_DIFF_BIN" $_fl "$_f" \
+        >"$_d/$_id.out" 2>&1 </dev/null
+    echo $? >"$_d/$_id.rc"
+    exit 0
+fi
+
+# ---- the idle policy, applied once at the top-level entry ---------- #
+if [ "${MYLANG_TEST_IDLED:-0}" != 1 ]; then
+    exec sh "$(dirname "$0")/jobs.sh" run bash "$0" "$@"
+fi
 
 # ⛔ RESOLVE $BIN *BEFORE* THE cd, AND PROVE IT RUNS.
 #
@@ -71,6 +113,7 @@ case "$_bin_arg" in
   /*) BIN=$_bin_arg ;;
   *)  BIN=$PWD/$_bin_arg ;;
 esac
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 cd "$(dirname "$0")/.."
 if [ ! -x "$BIN" ]; then
     echo "corpus_diff.sh: '$_bin_arg' is not an executable ($BIN)." >&2
@@ -78,7 +121,8 @@ if [ ! -x "$BIN" ]; then
     echo "  resolved against your CURRENT directory, not the root." >&2
     exit 2
 fi
-MODE=${2:-}
+# the modes, in report order (none = the plain differential only)
+MODES="${*:2}"
 # ⛔ KEEP IN SYNC WITH jit_lever_names (jit.cpp) - this list went stale
 # once (#101 found argfuse/xcache/scache/rshare missing, so those four
 # levers' per-lever-off configs were tested by nothing but `all`).
@@ -155,6 +199,74 @@ progs() {
   done
 }
 
+# ---- every unit of work, run up front ------------------------------ #
+# A key is a flag set or an env assignment reduced to a file-name-safe
+# word ('p' for none). The unit ids:
+#   nr.<i>            the compile gate's `-nr` run of program i
+#   tw.<fk>.<i>       the tree-walker reference, per FLAG SET only
+#   vm.<ek>.<fk>.<i>  the default engine under env <ek>, flags <fk>
+key() {
+  if [ -z "$1" ]; then echo p
+  else printf '%s' "$1" | tr -c 'A-Za-z0-9' _
+  fi
+}
+RES=$(mktemp -d "${TMPDIR:-/tmp}/corpus_diff.XXXXXX") || exit 2
+trap 'rm -rf "$RES"' EXIT
+JOBS=$(sh tests/jobs.sh count)
+export CORPUS_DIFF_BIN="$BIN"
+
+# The configurations run_one reports, in report order, one
+# "env|flags" per line. The mode's rows all use the plain flag set.
+CONFIGS='|
+|-nc
+|-nti'
+SPCHECK_OK=1
+add_config() {
+  printf '%s\n' "$CONFIGS" | grep -Fqx "$1|" || CONFIGS="$CONFIGS
+$1|"
+}
+for MODE in $MODES; do
+case "$MODE" in
+  --levers)   for L in $LEVERS all; do add_config "MYLANG_JIT_OFF=$L"; done ;;
+  --cold)     for T in $COLD_TIERS all; do
+                add_config "MYLANG_JIT_COLD=$T"; done ;;
+  --xrot)     for K in $XROTS; do add_config "MYLANG_JIT_XROT=$K"; done ;;
+  --nolowmem) add_config "MYLANG_NO_LOWMEM=1" ;;
+  --spcheck)
+    if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then
+      add_config "MYLANG_JIT_SPCHECK=1"
+    else
+      SPCHECK_OK=0
+    fi ;;
+esac
+done
+
+emit_units() {
+  local i=0 f cfg e fl
+  for f in $(progs); do
+    i=$((i + 1))
+    printf '%s\0%s\0%s\0%s\0' "nr.$i" - -nr "$f"
+    for fl in "" -nc -nti; do
+      printf '%s\0%s\0%s\0%s\0' "tw.$(key "$fl").$i" - \
+        "-tw${fl:+ $fl}" "$f"
+    done
+    while IFS= read -r cfg; do
+      e=${cfg%%|*} fl=${cfg#*|}
+      printf '%s\0%s\0%s\0%s\0' "vm.$(key "$e").$(key "$fl").$i" \
+        "${e:--}" "${fl:--}" "$f"
+    done <<EOF_CFG
+$CONFIGS
+EOF_CFG
+  done
+}
+emit_units | xargs -0 -n 4 -P "$JOBS" bash "$SELF" __unit "$RES"
+
+# the saved output / exit status of unit $1
+out_of() { cat "$RES/$1.out"; }
+rc_of()  { cat "$RES/$1.rc"; }
+
+# ---- the report: the serial loops, reading the saved results ------- #
+
 # ⛔ A PROGRAM THAT STOPS COMPILING "AGREES" WITH ITSELF.
 #
 # This is the `tail -3` lesson in a new shape (see run_one below): the
@@ -172,10 +284,11 @@ progs() {
 # A comparison oracle must compare everything it claims to; this one
 # claims the corpus RUNS.
 compiles_all() {
-  local bad=0 n=0
+  local bad=0 n=0 out
   for f in $(progs); do
     n=$((n + 1))
-    if ! out=$(timeout 60 "$BIN" -nr "$f" 2>&1); then
+    if [ "$(rc_of "nr.$n")" != 0 ]; then
+      out=$(out_of "nr.$n")
       echo "REFUSED $f"
       printf '%s\n' "$out" | head -4 | sed 's/^/  /'
       bad=$((bad + 1))
@@ -186,8 +299,9 @@ compiles_all() {
 }
 
 run_one() {     # $1 = env assignment ("" = plain), $2 = extra engine flags
-  local bad=0 n=0 a b
+  local bad=0 n=0 a b ra rb fk ek
   local flags=${2:-}
+  fk=$(key "$flags") ek=$(key "$1")
   for f in $(progs); do
     # ⛔ COMPARE THE WHOLE OUTPUT. This used to pipe both sides through
     # `tail -3`, so a divergence anywhere but a program's last three
@@ -197,11 +311,11 @@ run_one() {     # $1 = env assignment ("" = plain), $2 = extra engine flags
     # truncation was only ever meant to keep the DIFF MESSAGE short,
     # which is what the diff below does instead: compare everything,
     # print the first few DIFFERING lines (more useful than the tail).
-    a=$(timeout 60 "$BIN" -tw $flags "$f" 2>&1)
-    local ra=$?
-    b=$(env $1 timeout 60 "$BIN" $flags "$f" 2>&1)
-    local rb=$?
     n=$((n + 1))
+    a=$(out_of "tw.$fk.$n")
+    ra=$(rc_of "tw.$fk.$n")
+    b=$(out_of "vm.$ek.$fk.$n")
+    rb=$(rc_of "vm.$ek.$fk.$n")
     # ⛔ A PROGRAM THAT CRASHES THE SAME WAY IN BOTH ENGINES "AGREES".
     # The compile gate's lesson one step later: an assertion abort (or a
     # sanitizer report, or a timeout) that both engines reach prints the
@@ -232,15 +346,17 @@ run_one() {     # $1 = env assignment ("" = plain), $2 = extra engine flags
 # -nc mistake): for months `-nc` refused struct programs, stored a nested
 # POD field boxed and let a const array element be assigned, and nothing
 # ran it. The default engine is compared; the -nc pass of run_one then
-# checks the engines agree within the mode, as the -nti pass does.
+# checks the engines agree within the mode, as the -nti pass does. Its
+# two sides are the plain and -nc default-engine runs run_one reports
+# too - the same command lines, so they run once.
 fold_same() {
   local bad=0 n=0 a b ra rb
   for f in $(progs); do
-    a=$(timeout 60 "$BIN" "$f" 2>&1)
-    ra=$?
-    b=$(timeout 60 "$BIN" -nc "$f" 2>&1)
-    rb=$?
     n=$((n + 1))
+    a=$(out_of "vm.p.p.$n")
+    ra=$(rc_of "vm.p.p.$n")
+    b=$(out_of "vm.p.$(key -nc).$n")
+    rb=$(rc_of "vm.p.$(key -nc).$n")
     if [ "$ra" -ge 124 ] || [ "$rb" -ge 124 ]; then
       echo "CRASH [-nc vs default] $f (default rc=$ra, -nc rc=$rb)"
       printf '%s\n' "$b" | tail -4 | sed 's/^/  /'
@@ -269,6 +385,7 @@ run_one "" "-nc" || rc=1
 # int), but the ENGINES must agree within either mode. Always on - it
 # is one more corpus pass.
 run_one "" "-nti" || rc=1
+for MODE in $MODES; do
 case "$MODE" in
   --levers)
     for L in $LEVERS all; do run_one "MYLANG_JIT_OFF=$L" || rc=1; done ;;
@@ -284,11 +401,12 @@ case "$MODE" in
   # corpus program. A TESTS build only (the emission is #ifdef TESTS);
   # elsewhere the lane runs the plain corpus and says so.
   --spcheck)
-    if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then
+    if [ "$SPCHECK_OK" = 1 ]; then
       run_one "MYLANG_JIT_SPCHECK=1" || rc=1
     else
       echo "  spcheck: SKIPPED - '$BIN' is not a TESTS build" >&2
       rc=1
     fi ;;
 esac
+done
 exit $rc

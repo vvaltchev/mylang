@@ -139,7 +139,16 @@ them means anything:**
   build (see *THE 16-ALIGNMENT RULE* below).
 - **`tests/corpus_diff.sh`** - do the engines agree. Oracle: the
   `--levers` / `--cold` / `--xrot` / `--nolowmem` / `--spcheck`
-  matrices.
+  matrices (several may be given in ONE run; the plain part and the
+  tree-walker references then run once).
+  **IT IS PARALLEL, AND ITS REPORT IS THE SERIAL ONE (2026-09-27).**
+  Every (configuration x program) run is its own process, run up
+  front `tests/jobs.sh count` at a time; the report is then printed
+  from the saved outputs in the serial order, BYTE-IDENTICAL to the
+  one-at-a-time script (checked for every mode on the debug binary:
+  `--levers` 419 s -> 30 s). The tree-walker reference runs ONCE per
+  flag set, since the serial script never passed the configuration's
+  env to it.
   **⛔ IT COMPARED ONLY `tail -3` UNTIL 2026-08-26** - the last THREE
   LINES of each program - so a divergence anywhere earlier was
   INVISIBLE, and the tool answered "28/28 agree" for a binary that
@@ -379,7 +388,12 @@ make clean
 is what compiles the
 `-rt` suite into the binary. Base flags:
 `-std=c++17 -Wall -Wextra -Wno-unused-parameter
--fwrapv`. The Makefile auto-generates header dependencies under `.d/`.
+-fwrapv`. The Makefile auto-generates header dependencies under
+`$(BUILD_DIR)/.d/` - PER BUILD DIR since 2026-09-27: a shared top-level
+`.d/` was rewritten by every lane, so two lanes building at once (the
+battery runner does exactly that) raced on the `.Td` temp file and left
+each other's object named in the surviving `.d`, silently dropping a
+lane's header dependencies.
 
 **⛔ DEBUG INFO IS OFF BY DEFAULT — `DEBUG_INFO` (default 0, EVERY build
 type, both build systems; maintainer-set 2026-08-26).** The `-ggdb` that
@@ -1639,7 +1653,10 @@ collision). Three nets now:
   the slot stack leaks a slot per call and nothing else in the tree
   looks. The in-suite seed is the `Net 2` `-rt` entry (a few forced
   events, asserting frames were actually walked); the full sweep is
-  the script, ~5.5 min over the default corpus.
+  the script, ~5.5 min over the default corpus serially - it runs a
+  process pool now (`tests/jobs.sh count`), each sweep submitting a
+  small window of N values and reading them in order, so it stops
+  exactly where the serial walk did and prints the same report.
 A fourth - forcing a guarded tier's DECLINE arm so a rare cold path
 becomes the only path (the RECYCLE=1 philosophy for the JIT) - is
 DESIGNED and NOT BUILT: a first attempt overrode the SHARED
@@ -1727,6 +1744,29 @@ lanes so an `-rt` failure still reports quickly:
 - **repl-fuzz** under `RECYCLE=ON` + ASan, the combination this file
   names for the REPL's retained-AST/stale-node class;
 - **coverage-gate** — Net 4's ratchet (below).
+
+**LOCALLY, THE WHOLE BATTERY IS ONE COMMAND: `tests/run_battery.py`
+(2026-09-27).** It builds the six lanes (dbg, clang, rel-hard, release
+and the two NON-JIT builds, those from a copy of the tree with jit.h's
+platform test flipped - never the src/jit.h other lanes compile) and
+runs `-rt` everywhere, driver_checks, corpus_diff in every mode, the
+vdjcmp self-test, disasmcheck, Nets 2 and 3 and the nested fuzzer as a
+DEPENDENCY GRAPH over `tests/jobs.sh count` cores, with per-step logs,
+timeouts, a PRIVATE `$TMPDIR` per step (`-rt` writes fixed names such as
+`/tmp/mylang-myv-corrupt.myv`, so two lanes' suites sharing one `/tmp`
+fail each other - watched on its first run) and a PASS/FAIL summary.
+`--no-build` / `--bin LANE=PATH`
+point it at existing lanes (`perf`, an `OPT=1 ASSERTS=0` build, only
+that way); `--dry-run` prints the plan. **`tests/jobs.sh` is the ONE
+definition every parallel tool asks:** workers = nproc - max(2,
+nproc/8) (`MYLANG_TEST_JOBS` overrides), memory caps for concurrent
+`-rt` runs and builds (the measured peaks are in the file), and the
+priority - each tool re-execs itself ONCE through `jobs.sh run`, which
+puts the whole tree in the IDLE scheduling and I/O classes (`chrt
+--idle 0`, `ionice -c3`), falling back silently to `nice -n 19` where
+those are refused (`MYLANG_TEST_IDLE=0` forces the fallback). A
+battery is background work: it must never slow the person at the
+keyboard.
 
 Running scripts:
 ```
@@ -7957,7 +7997,7 @@ dynamic_cast. Total: 139.7M -> 23.8M on 83's compile, -83%.
   `GIT_SEQUENCE_EDITOR` (rewrite the todo) and `GIT_EDITOR` (supply messages).
   `exp-work` is a topic branch whose history may be rewritten freely.
 - **Never edit a source file while a build that compiles it is running.** A
-  background `make`/`cmake` reads `src/` AND writes shared dep files (`.d/`) as
+  background `make`/`cmake` reads `src/` AND writes dep files (`.d/`) as
   it goes; editing during that window makes it compile a half-written file or
   corrupt a dep, producing a *bogus* "BUILD FAILED" that looks like a real
   regression and wastes a debugging cycle. Serialize: let a background build (or

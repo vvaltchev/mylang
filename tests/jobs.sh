@@ -1,0 +1,111 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# jobs.sh - THE ONE DEFINITION of how many workers the functional test
+#           tools use, and of the priority they run at.
+#
+#   tests/jobs.sh count            print the worker count
+#   tests/jobs.sh rtcap            print the cap on concurrent -rt runs
+#   tests/jobs.sh buildcap         print the cap on concurrent builds
+#   tests/jobs.sh run CMD [ARG..]  exec CMD under the idle policy
+#   tests/jobs.sh policy           print the policy `run` would apply
+#
+# Every parallel tool asks THIS script (corpus_diff.sh, norec_sweep.py,
+# norec_enum.py, run_battery.sh), so the formula lives in one place.
+#
+# WORKERS.  nproc - max(2, nproc/8), at least 1: a 24-core box runs 21,
+# leaving three cores for whoever is sitting at the machine.  Override
+# with MYLANG_TEST_JOBS=N.
+#
+# PRIORITY.  The functional battery is background work: it must never
+# get in the way of an interactive user.  `run` puts CMD in the IDLE
+# scheduling class (`chrt --idle 0`: it gets a CPU only when nothing
+# else wants it) and the idle I/O class (`ionice -c3`), ONCE, at the
+# top-level entry - children inherit both, so a tool that re-execs
+# itself through here marks MYLANG_TEST_IDLED=1 and the nested call is
+# a plain exec.  Where either is unavailable or refused (a CI
+# container, macOS), it falls back SILENTLY to `nice -n 19` and goes
+# on; MYLANG_TEST_IDLE=0 skips the idle classes and uses that fallback
+# directly.  Priority only changes WHEN work runs, never what it
+# computes, so no tool's output depends on it.
+#
+# MEMORY.  At most 4 GB per worker on average.  Measured peak RSS
+# (the largest single process, 2026-09-27, a 24-core 125 GB box):
+#     debug ASan+UBSan `-rt`                 0.84 GB   63 s
+#     clang debug `-rt`                      0.75 GB   66 s
+#     rel-hard `-rt`                         0.09 GB    3 s
+#     one corpus program under ASan          0.19 GB  (the worst of 100)
+#     g++ -c src/tests.cpp OPT=0 (ASan)      3.87 GB   33 s  <- the peak
+#     g++ -c src/jit.cpp OPT=0 (ASan)        1.03 GB
+#     clang++ -c src/tests.cpp OPT=0         0.73 GB
+#     g++ -c tests.cpp OPT=1 (LTO, rel-hard) 1.44 GB
+#     release / rel-hard LTO link            0.28 / 0.30 GB
+# A build's worst moment is its one tests.cpp beside (make -j - 1) other
+# units at ~1 GB, so at the battery's `make -j` share of 3 six builds
+# peak near 6 x 6 GB = 36 GB, and even jobs/3 concurrent -rt runs add
+# under 6 GB: every mix stays far inside jobs x 4 GB (84 GB here). The
+# caps below exist so that stays true on a box with fewer GB per core:
+#     rtcap    = max(1, jobs / 3)   concurrent -rt runs
+#     buildcap = max(1, jobs / 3)   concurrent builds, each `make -j`
+#                                   jobs / (lanes built), run_battery.py
+
+ncpu() {
+    n=$(nproc 2>/dev/null) ||
+        n=$(getconf _NPROCESSORS_ONLN 2>/dev/null) ||
+        n=$(sysctl -n hw.ncpu 2>/dev/null) || n=4
+    case "$n" in ''|*[!0-9]*) n=4 ;; esac
+    echo "$n"
+}
+
+count() {
+    case "${MYLANG_TEST_JOBS:-}" in
+        ''|*[!0-9]*) ;;
+        *) if [ "$MYLANG_TEST_JOBS" -ge 1 ]; then
+               echo "$MYLANG_TEST_JOBS"; return
+           fi ;;
+    esac
+    n=$(ncpu)
+    r=$((n / 8))
+    [ "$r" -lt 2 ] && r=2
+    j=$((n - r))
+    [ "$j" -lt 1 ] && j=1
+    echo "$j"
+}
+
+# the prefix `run` applies, as words
+prefix() {
+    p=""
+    if [ "${MYLANG_TEST_IDLE:-1}" != 0 ] &&
+       command -v chrt >/dev/null 2>&1 &&
+       chrt --idle 0 true >/dev/null 2>&1; then
+        p="chrt --idle 0"
+    else
+        p="nice -n 19"
+    fi
+    if [ "${MYLANG_TEST_IDLE:-1}" != 0 ] &&
+       command -v ionice >/dev/null 2>&1 &&
+       ionice -c3 true >/dev/null 2>&1; then
+        p="ionice -c3 $p"
+    fi
+    echo "$p"
+}
+
+case "${1:-}" in
+    count) count ;;
+    rtcap) j=$(count); c=$((j / 3)); [ "$c" -lt 1 ] && c=1; echo "$c" ;;
+    buildcap) j=$(count); c=$((j / 3)); [ "$c" -lt 1 ] && c=1; echo "$c" ;;
+    policy) prefix ;;
+    run)
+        shift
+        [ $# -ge 1 ] || { echo "usage: $0 run CMD [ARG..]" >&2; exit 2; }
+        if [ "${MYLANG_TEST_IDLED:-0}" = 1 ]; then
+            exec "$@"
+        fi
+        MYLANG_TEST_IDLED=1
+        export MYLANG_TEST_IDLED
+        # shellcheck disable=SC2046
+        exec $(prefix) "$@" ;;
+    *)
+        echo "usage: $0 count|rtcap|buildcap|policy|run CMD.." >&2
+        exit 2 ;;
+esac

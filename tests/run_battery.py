@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+"""
+THE FUNCTIONAL TEST BATTERY, on many cores, without getting in the way.
+
+    tests/run_battery.py                 build every lane, then test
+    tests/run_battery.py --no-build      test the lanes already built
+    tests/run_battery.py --bin dbg=PATH --bin perf=PATH ...
+    tests/run_battery.py --dry-run       print the plan and stop
+
+It runs the correctness nets the maintainer otherwise runs by hand, one
+after another - builds, `-rt` in every lane, driver_checks, corpus_diff
+in every mode, the vdjcmp self-test, the objdump disassembly check, the
+no-record nets 2 and 3 and the nested fuzzer - as a DEPENDENCY GRAPH:
+a step starts as soon as the binary it needs is built and there are
+cores for it, so the whole battery overlaps instead of queueing.
+
+PERFORMANCE MEASUREMENT IS NOT PART OF THIS. Nothing here times the
+interpreter; bench/ is untouched.
+
+CORES AND MEMORY (tests/jobs.sh is the one definition). The battery
+spends `tests/jobs.sh count` cores (--jobs or MYLANG_TEST_JOBS
+override). Each step declares what it costs: a single-process step one
+core, a build its `make -j` share, and a step that is itself parallel
+(corpus_diff, norec_enum, norec_sweep) the share it is handed through
+MYLANG_TEST_JOBS. Two classes are also capped by COUNT for memory:
+concurrent `-rt` runs (`jobs.sh rtcap`) and concurrent builds
+(`jobs.sh buildcap`) - the measured peaks are in jobs.sh.
+
+PRIORITY. The battery re-execs itself through `tests/jobs.sh run` ONCE,
+so it and every child run in the IDLE scheduling and I/O classes (or at
+`nice 19` where those are refused): an interactive user never waits for
+it.
+
+THE NON-JIT BUILDS are made from a COPY of the tree (src/ + Makefile
+under BUILD_ROOT/nojit-src) with jit.h's platform test flipped to
+`#if 0` - never by editing the src/jit.h the other lanes are compiling.
+
+EVERY STEP GETS ITS OWN $TMPDIR. `-rt` writes fixed file names under it
+(/tmp/mylang-myv-corrupt.myv and a dozen more), so two lanes' `-rt`
+sharing one /tmp overwrite each other's images and fail each other.
+It is made in the SYSTEM temp dir (one of -rt's .myv tests needs its
+temp files outside the working tree) and removed when the step passes;
+a failed step keeps it and names it at the top of its log.
+
+Every step has a timeout, writes its own log into the log directory the
+run prints, and the summary lists PASS / FAIL / SKIP and the wall time
+of each. Exit status 0 only when nothing FAILED.
+
+Stdlib only.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testjobs  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+# lane -> (make variables, uses the non-JIT source copy)
+LANES = {
+    "dbg":         ("TESTS=1 OPT=0", False),
+    "clang":       ("CXX=clang++ TESTS=1 OPT=0", False),
+    "rel-hard":    ("TESTS=1 OPT=1 VM_HARDENING=1", False),
+    "release":     ("OPT=1", False),
+    "nojit-gcc":   ("TESTS=1 OPT=0", True),
+    "nojit-clang": ("CXX=clang++ TESTS=1 OPT=0", True),
+}
+JIT_GUARD = "#if defined(__linux__) && defined(__x86_64__)"
+
+
+def jobs_sh(what):
+    out = subprocess.run(["sh", os.path.join(HERE, "jobs.sh"), what],
+                         capture_output=True, text=True, check=True)
+    return max(1, int(out.stdout.strip()))
+
+
+class Step:
+    def __init__(self, name, cmd, deps=(), cost=1, klass=None, env=None,
+                 cwd=ROOT, est=60, lanes=(), prep=None):
+        self.name, self.cmd, self.deps = name, cmd, list(deps)
+        self.cost, self.klass, self.env = cost, klass, dict(env or {})
+        self.cwd, self.est, self.lanes, self.prep = cwd, est, lanes, prep
+        self.status, self.secs, self.why = "WAIT", 0.0, ""
+        self.proc = self.log = self.t0 = self.tmp = None
+
+
+def make_nojit_copy(root_dir):
+    """A fresh copy of src/ + Makefile with the JIT compiled out."""
+    dst = os.path.join(root_dir, "nojit-src")
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    os.makedirs(dst)
+    shutil.copytree(os.path.join(ROOT, "src"), os.path.join(dst, "src"))
+    shutil.copy2(os.path.join(ROOT, "Makefile"), dst)
+    jh = os.path.join(dst, "src", "jit.h")
+    s = open(jh).read()
+    if s.count(JIT_GUARD) != 1:
+        raise RuntimeError("jit.h: the platform guard %r is not there "
+                           "exactly once" % JIT_GUARD)
+    with open(jh, "w") as f:
+        f.write(s.replace(JIT_GUARD, "#if 0"))
+
+
+def plan(args, jobs, bins, build_lanes):
+    """The step graph. `bins` maps lane -> binary path; `build_lanes`
+    are the lanes this run builds (their steps depend on the build)."""
+    steps = []
+    nb = max(1, len(build_lanes))
+    bcost = max(1, jobs // nb)
+    wide = max(1, jobs // 3)
+    if any(LANES[l][1] for l in build_lanes):
+        # first in line: two builds wait on it
+        steps.append(Step("nojit-src", ["true"], est=10 ** 6,
+                          prep=lambda: make_nojit_copy(args.build_root)))
+    for lane in build_lanes:
+        vars_, nojit = LANES[lane]
+        src = os.path.join(args.build_root, "nojit-src") if nojit else ROOT
+        cmd = (["make", "-C", src, "-j%d" % bcost,
+                "BUILD_DIR=" + os.path.join(args.build_root, lane)]
+               + vars_.split())
+        steps.append(Step("build:" + lane, cmd, cost=bcost, klass="build",
+                          deps=["nojit-src"] if nojit else [], est=240,
+                          lanes=(lane,)))
+
+    def need(lane):
+        return ["build:" + lane] if lane in build_lanes else []
+
+    def add(name, lane, cmd, **kw):
+        if lane not in bins:
+            return
+        deps = kw.pop("deps", []) + need(lane)
+        steps.append(Step(name, cmd, deps=deps, lanes=(lane,), **kw))
+
+    py = sys.executable
+    t = os.path.join(ROOT, "tests")
+    s = os.path.join(ROOT, "scripts")
+    b = bins.get
+    # -rt everywhere it is compiled in
+    for lane in ("dbg", "clang", "rel-hard", "nojit-gcc", "nojit-clang"):
+        add("rt:" + lane, lane, [b(lane), "-rt"], klass="rt", est=150)
+    add("rt:dbg-nolowmem", "dbg", [b("dbg"), "-rt"], klass="rt", est=150,
+        env={"MYLANG_NO_LOWMEM": "1"})
+    for lane in ("dbg", "release"):
+        add("driver:" + lane, lane, ["sh", os.path.join(t, "driver_checks.sh"),
+                                     b(lane)], est=120)
+    modes = ["--levers", "--cold", "--xrot", "--nolowmem"]
+    for lane in ("dbg", "release", "perf"):
+        add("corpus:" + lane, lane,
+            ["bash", os.path.join(t, "corpus_diff.sh"), b(lane)] + modes,
+            cost=wide, env={"MYLANG_TEST_JOBS": str(wide)}, est=400)
+    add("vdjcmp:dbg", "dbg", ["sh", os.path.join(s, "vdjcmp.sh"),
+                              b("dbg"), b("dbg")], est=300)
+    add("disasmcheck:dbg", "dbg",
+        [py, os.path.join(s, "disasmcheck.py"), b("dbg")],
+        env={"MYLANG_VDJ_HEX": "1"}, est=300)
+    add("norec_enum:dbg", "dbg",
+        [py, os.path.join(t, "norec_enum.py"), b("dbg"), "--depth", "3",
+         "--jobs", str(wide)], cost=wide, est=120)
+    add("norec_sweep:dbg", "dbg",
+        [py, os.path.join(t, "norec_sweep.py"), b("dbg"),
+         "--jobs", str(wide)], cost=wide, est=300)
+    add("nested_fuzz:dbg", "dbg",
+        [py, os.path.join(t, "nested_fuzz.py"), "--mylang", b("dbg"),
+         "--count", "300"], est=600)
+    rx_only = re.compile(args.only) if args.only else None
+    rx_skip = re.compile(args.skip) if args.skip else None
+    for st in steps:
+        if st.klass == "build" or st.name == "nojit-src":
+            continue
+        if (rx_only and not rx_only.search(st.name)) or \
+                (rx_skip and rx_skip.search(st.name)):
+            st.status, st.why = "SKIP", "filtered out"
+    return steps
+
+
+def fmt_cmd(st):
+    env = " ".join("%s=%s" % kv for kv in sorted(st.env.items()))
+    return (env + " " if env else "") + " ".join(st.cmd)
+
+
+def run_graph(steps, jobs, caps, logdir, timeout):
+    by = {s.name: s for s in steps}
+    used = 0
+    inuse = {}
+    running = []
+    t_start = time.time()
+
+    def settle():
+        # a step whose dependency did not PASS cannot run
+        changed = True
+        while changed:
+            changed = False
+            for s in steps:
+                if s.status != "WAIT":
+                    continue
+                bad = [d for d in s.deps if by[d].status in ("FAIL", "SKIP")]
+                if bad:
+                    s.status, s.why = "SKIP", "needs " + ", ".join(bad)
+                    changed = True
+
+    while True:
+        settle()
+        ready = [s for s in steps if s.status == "WAIT"
+                 and all(by[d].status == "PASS" for d in s.deps)]
+        ready.sort(key=lambda s: -s.est)
+        for s in ready:
+            cap = caps.get(s.klass)
+            if cap is not None and inuse.get(s.klass, 0) >= cap:
+                continue
+            if used + s.cost > jobs and running:
+                continue
+            if s.prep:
+                try:
+                    s.prep()
+                except Exception as e:          # noqa: BLE001
+                    s.status, s.why = "FAIL", "prep: %s" % e
+                    continue
+            s.log = open(os.path.join(logdir, s.name.replace(":", "_")
+                                      + ".log"), "w")
+            s.log.write("$ %s\n\n" % fmt_cmd(s))
+            s.log.flush()
+            env = dict(os.environ)
+            env.update(s.env)
+            # a PRIVATE temp dir per step: `-rt` writes fixed names under
+            # $TMPDIR (/tmp/mylang-myv-corrupt.myv and a dozen more), so two
+            # lanes' -rt running at once overwrote each other's images and
+            # failed each other - watched, on the first battery run. It
+            # lives in the SYSTEM temp dir, not under the tree: -rt's myv
+            # --source test relocates a source written under $TMPDIR and
+            # needs it OUTSIDE the cwd (myv_source_ref roots a file under
+            # the cwd AT the cwd), so a TMPDIR inside the repo fails it
+            s.tmp = tempfile.mkdtemp(
+                prefix="mylang-battery-%s-" % s.name.replace(":", "_"))
+            env["TMPDIR"] = s.tmp
+            s.log.write("TMPDIR=%s\n\n" % s.tmp)
+            s.log.flush()
+            s.t0 = time.time()
+            s.proc = subprocess.Popen(s.cmd, cwd=s.cwd, env=env,
+                                      stdin=subprocess.DEVNULL,
+                                      stdout=s.log, stderr=subprocess.STDOUT,
+                                      start_new_session=True)
+            s.status = "RUN"
+            used += s.cost
+            inuse[s.klass] = inuse.get(s.klass, 0) + 1
+            running.append(s)
+            print("  start %-22s (%d cores busy)" % (s.name, used),
+                  flush=True)
+        if not running:
+            break
+        time.sleep(0.25)
+        for s in list(running):
+            rc = s.proc.poll()
+            if rc is None and time.time() - s.t0 > timeout:
+                try:
+                    os.killpg(s.proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                s.proc.wait()
+                rc = None
+                s.why = "TIMED OUT after %ds" % timeout
+            elif rc is None:
+                continue
+            else:
+                s.why = "" if rc == 0 else "exit %d" % rc
+            s.secs = time.time() - s.t0
+            s.status = "PASS" if rc == 0 else "FAIL"
+            s.log.write("\n[%s in %.1fs%s]\n" % (s.status, s.secs,
+                                                 ", " + s.why if s.why
+                                                 else ""))
+            s.log.close()
+            if s.status == "PASS":
+                shutil.rmtree(s.tmp, ignore_errors=True)
+            running.remove(s)
+            used -= s.cost
+            inuse[s.klass] -= 1
+            print("  %-5s %-22s %7.1fs %s" % (s.status.lower(), s.name,
+                                             s.secs, s.why), flush=True)
+    return time.time() - t_start
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Run the functional test battery on many cores.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__)
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="cores to spend (default: tests/jobs.sh count)")
+    ap.add_argument("--build-root", default=os.path.join(ROOT,
+                                                         "build-claude"),
+                    help="where the lanes live (default: build-claude/)")
+    ap.add_argument("--lanes", default=",".join(LANES),
+                    help="lanes to build and test (default: all of %s)"
+                         % ", ".join(LANES))
+    ap.add_argument("--no-build", action="store_true",
+                    help="build nothing; test the lanes' existing binaries")
+    ap.add_argument("--bin", action="append", default=[],
+                    metavar="LANE=PATH",
+                    help="use this binary for a lane (not built); `perf` "
+                         "(an OPT=1 ASSERTS=0 build) is only ever given "
+                         "this way")
+    ap.add_argument("--logs", default=None,
+                    help="log directory (default: BUILD_ROOT/battery-logs/"
+                         "<time>)")
+    ap.add_argument("--timeout", type=int, default=3600,
+                    help="per-step timeout in seconds (default 3600)")
+    ap.add_argument("--only", default=None,
+                    help="regex: run only the test steps it matches")
+    ap.add_argument("--skip", default=None,
+                    help="regex: skip the test steps it matches")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the plan and exit")
+    args = ap.parse_args()
+    testjobs.ensure_idle()
+    jobs = args.jobs if args.jobs > 0 else testjobs.count()
+    os.environ["MYLANG_TEST_JOBS"] = str(jobs)
+    args.build_root = os.path.abspath(args.build_root)
+
+    lanes = [l for l in args.lanes.split(",") if l]
+    for l in lanes:
+        if l not in LANES:
+            sys.exit("unknown lane %r (want: %s)" % (l, ", ".join(LANES)))
+    bins = {}
+    for spec in args.bin:
+        lane, _, path = spec.partition("=")
+        if not path:
+            sys.exit("--bin wants LANE=PATH, got %r" % spec)
+        bins[lane] = os.path.abspath(path)
+    build_lanes = [] if args.no_build else [l for l in lanes
+                                            if l not in bins]
+    for l in lanes:
+        if l not in bins:
+            bins[l] = os.path.join(args.build_root, l, "mylang")
+    for l in lanes:
+        if l not in build_lanes and not os.access(bins[l], os.X_OK):
+            print("note: no binary for lane %s (%s); its steps are "
+                  "skipped" % (l, bins[l]))
+            del bins[l]
+
+    caps = {"rt": jobs_sh("rtcap"), "build": jobs_sh("buildcap")}
+    steps = plan(args, jobs, bins, build_lanes)
+    policy = subprocess.run(["sh", os.path.join(HERE, "jobs.sh"), "policy"],
+                            capture_output=True, text=True).stdout.strip()
+    print("battery: %d cores, caps rt=%d build=%d, policy: %s"
+          % (jobs, caps["rt"], caps["build"], policy))
+    if args.dry_run:
+        for s in steps:
+            print("  %-22s cost %-2d deps %-28s %s%s"
+                  % (s.name, s.cost, ",".join(s.deps) or "-", fmt_cmd(s),
+                     "  [" + s.why + "]" if s.status == "SKIP" else ""))
+        return 0
+    logdir = os.path.abspath(
+        args.logs or os.path.join(args.build_root, "battery-logs",
+                                  time.strftime("%Y%m%d-%H%M%S")))
+    os.makedirs(logdir, exist_ok=True)
+    print("logs   : %s" % logdir, flush=True)
+    try:
+        wall = run_graph(steps, jobs, caps, logdir, args.timeout)
+    except KeyboardInterrupt:
+        for s in steps:
+            if s.status == "RUN":
+                try:
+                    os.killpg(s.proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        raise
+    print()
+    print("%-22s %-5s %8s  %s" % ("step", "", "secs", ""))
+    for s in steps:
+        print("%-22s %-5s %8.1f  %s" % (s.name, s.status, s.secs, s.why))
+    failed = [s for s in steps if s.status == "FAIL"
+              or (s.status == "SKIP" and s.why.startswith("needs"))]
+    print("\nwall %.1fs, %d steps, %d failed; logs in %s"
+          % (wall, len(steps), len(failed), logdir))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

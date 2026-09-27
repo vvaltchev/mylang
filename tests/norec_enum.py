@@ -56,6 +56,9 @@ import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testjobs  # noqa: E402  (tests/jobs.sh: worker count + idle class)
+
 KINDS = ("plain", "try", "tryfin", "diter")
 TERMINALS = ("ret_int", "ret_float", "throw")
 
@@ -230,7 +233,8 @@ def main():
     ap.add_argument("binary")
     ap.add_argument("--depth", type=int, default=4,
                     help="max chain depth (default 4)")
-    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="worker processes (default: tests/jobs.sh count)")
     ap.add_argument("--limit", type=int, default=0,
                     help="stop after N programs (0 = all)")
     ap.add_argument("--keep-dir", default=None,
@@ -238,6 +242,9 @@ def main():
     ap.add_argument("--reach", type=int, default=25,
                     help="sample size for the tier-reach report (0 = off)")
     args = ap.parse_args()
+    testjobs.ensure_idle()
+    if args.jobs <= 0:
+        args.jobs = testjobs.count()
 
     shapes = list(enumerate_shapes(args.depth))
     if args.limit:
