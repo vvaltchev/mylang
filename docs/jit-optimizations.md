@@ -14997,3 +14997,25 @@ wanted 0), the `t_none` stamp dropped (ASan UAF). The #121
 `ref_bind_fast_shapes` test now runs with the JIT off - the 63 shape no
 longer reaches `vm_slot_bind_ref` under the JIT, and the interpreted
 ReturnV is where that bind is still taken on every shape.
+
+## #97 R2 - AN ALL-LOCALS CLOSURE IS BUILT BY A LEAN CONSTRUCTOR (2026-09-26)
+
+After R1, 63_closures' C++ side was the closure LIFECYCLE: 87 Ir per
+closure in `FuncObject::FuncObject`, 28 in `jit_make_closure_ptr`,
+with no hot line - the general constructor pays a root lookup, a
+const-scope test, and per capture a `read_sym_lv` kind dispatch
+inside a try. When every capture is a frame LOCAL - decided at EMIT
+time from the descriptor - `MakeClosureV` now calls
+`jit_make_closure_locals(def, &slot 0)`, whose constructor
+(`FuncObject::LocalCaptures`) copies `frame[cap.slot]` per capture and
+nothing else. It cannot throw (a local is never unbound at run time:
+the TDZ is a compile error), so the emitted null test goes too. It
+reads the same frame memory the generic helper reads, so the register
+cache's flush contract around the call is unchanged.
+
+Ir (scale3 - scale1, `OPT=1 ASSERTS=0`): 63_closures 286.0M -> 254.8M,
+**-10.9%** (-27.5% with R1); 11_closure_counter flat (its closure is
+built once). Pinned P-core cycles: 260M -> 256M, -1.5% - the removed
+work is cheap, well-predicted C++. Watched failing: admitting a
+non-local capture to the lean form aborts `-rt` on the constructor's
+`ML_CHECK(cap.kind == SymKind::local)` (the F4 frameless-call test).

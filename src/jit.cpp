@@ -22483,8 +22483,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const int mc_s1 = jit_layout().elemv_inline_ok
                           ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
                                             /*transient=*/true) : -1;
+        /* #97 R2: every capture a frame local -> the lean constructor,
+         * which cannot throw (so no status test below) */
+        const FuncDescriptor *mc_def = ck.closure_defs[in.target2];
+        bool mc_locals = mc_s1 >= 0;
+        for (const auto &cap : mc_def->captures)
+            mc_locals = mc_locals && cap.kind == SymKind::local;
         emit_call_prologue(e);
-        if (mc_s1 >= 0) {
+        if (mc_locals) {
+            e.movabs(RDI, reinterpret_cast<uint64_t>(mc_def));
+            e.lea(RSI, 0);                       /* reg:abi: &slot 0 */
+        } else if (mc_s1 >= 0) {
             /* the CONSTRUCT-ONLY form: (def) -> the pointer */
             e.movabs(RDI,
                      reinterpret_cast<uint64_t>(ck.closure_defs[in.target2]));
@@ -22496,7 +22505,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                      reinterpret_cast<uint64_t>(ck.closure_defs[in.target2]));
         }
         e.call_direct(
-            mc_s1 >= 0 ? reinterpret_cast<const void *>(jit_make_closure_ptr) : reinterpret_cast<const void *>(jit_make_closure));
+            mc_locals
+                ? reinterpret_cast<const void *>(jit_make_closure_locals)
+            : mc_s1 >= 0
+                ? reinterpret_cast<const void *>(jit_make_closure_ptr)
+                : reinterpret_cast<const void *>(jit_make_closure));
         emit_call_epilogue(e);
 
         if (mc_s1 < 0) {
@@ -22510,11 +22523,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const uint8_t s1 = static_cast<uint8_t>(mc_s1);
         /* rax IS the helper's return value (SysV), and it stays the
          * live FuncObject* until the store below */
-        e.test_rr(RAX, RAX);       /* reg:abi: null = it threw */
-        const size_t j_ok = e.j8(0x75);  /* jnz -> store */
-        emit_exc_stamp(e, ck, pc);
-        e.exit_pc(pc);
-        e.patch8(j_ok, e.pos());
+        if (!mc_locals) {
+            e.test_rr(RAX, RAX);       /* reg:abi: null = it threw */
+            const size_t j_ok = e.j8(0x75);  /* jnz -> store */
+            emit_exc_stamp(e, ck, pc);
+            e.exit_pc(pc);
+            e.patch8(j_ok, e.pos());
+        }
         /* RELEASE the old dst (compile-skipped when the slot provably
          * never holds a reference) */
         if (std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
