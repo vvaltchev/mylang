@@ -5836,7 +5836,9 @@ but the per-element `StructObject` allocation is gone (build overhead
   `static_type_from_value`); **`foreach` reuses one `StructObject`** across
   iterations
   (overwrite-in-place with a `use_count` COW guard, so a captured element keeps
-  its value). Cold ops (insert/sort/map/...) **auto-promote** to a general array
+  its value) - in the VM too since #110: `vm_struct_elem_into` copies the
+  next element over the loop variable's own object when that slot is its
+  only holder (`use_count() == 1`). Cold ops (insert/sort/map/...) **auto-promote** to a general array
   via `get_vec()`'s `promote_structs_to_general()` - IN PLACE, so every alias
   sees it (#53b, see the strs bullet) - so every existing array op
   works with no dedicated case and nothing throws. `array_storage` reports

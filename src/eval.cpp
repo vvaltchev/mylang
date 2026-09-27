@@ -4557,6 +4557,35 @@ EvalValue vm_struct_elem(const EvalValue &arrv, int_type idx)
     return EvalValue(intrusive_ptr<StructObject>(obj));
 }
 
+/* #110: the whole-`p` foreach bind INTO the loop variable's slot. The
+ * tree-walker reuses one StructObject across iterations (Foreach's
+ * `reuse`); here the slot itself is the holder: when it still holds the
+ * previous iteration's object and NOTHING ELSE references it - use_count
+ * 1, i.e. the body neither stored, captured, appended nor aliased it -
+ * the element's bytes are copied over it in place, and no object is
+ * allocated or freed. Anything else (a captured element, a different
+ * def, a read-only value the body assigned, a general array) takes the
+ * fresh-object path, so a captured element keeps its value. */
+void vm_struct_elem_into(LValue &dst, const EvalValue &arrv, int_type idx)
+{
+    const SharedArrayObj &arr = arrv.get_ref<SharedArrayObj>();
+    if (idx >= 0 && static_cast<size_type>(idx) < arr.size()
+        && arr.skind() == SharedArrayObj::Storage::structs
+        && dst.get().is<intrusive_ptr<StructObject>>()) {
+        const auto &sv = arr.flat_structs();
+        const intrusive_ptr<StructObject> &o =
+            dst.get().get_ref<intrusive_ptr<StructObject>>();
+        if (o.use_count() == 1 && o->def == sv.def && !o->readonly
+            && o->bytes.size() == static_cast<size_t>(sv.stride)) {
+            std::memcpy(o->bytes.data(),
+                        sv.buf.data() + (arr.offset() + idx) * sv.stride,
+                        sv.stride);
+            return;
+        }
+    }
+    dst.put(vm_struct_elem(arrv, idx));
+}
+
 static EvalValue
 handle_single_expr14(EvalContext *ctx,
                      bool inDecl,
