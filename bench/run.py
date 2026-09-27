@@ -162,6 +162,11 @@ def resolve_scale(name, table, overrides, global_scale):
 # Color the my/py ratio on a TTY only (never when redirected / into the CSV).
 USE_COLOR = sys.stdout.isatty()
 
+# Width of the table's first (benchmark name) column: at least 24, widened
+# in main() to the longest SELECTED name so a long one cannot push the
+# following columns out of line.
+NAME_W = 24
+
 
 def rgb_to_xterm256(r, g, b):
     """Nearest xterm-256 palette index for an RGB triple - picks the closer of
@@ -234,7 +239,7 @@ def render_row(row, has_base):
     ratio); the base(s) / cur-base columns appear only when `has_base`."""
     (name, base_s, my_s, py_s, speedup_s, ratio_s, status,
      speedup, ratio) = row
-    out = "%-24s" % name
+    out = "%-*s" % (NAME_W, name)
     if has_base:
         # cur/base: <1 means the current binary is FASTER (colored green, the
         # same good/bad convention as my/py).
@@ -842,6 +847,8 @@ def main():
         names = [n for n in names if any(s in n for s in subs)]
     if not names:
         sys.exit("no benchmarks matched")
+    global NAME_W
+    NAME_W = max(24, max(len(n) for n in names))
 
     # Parse --scale: a bare int is a global scale; <key>:<N> is a per-bench
     # override (repeatable). Both may be present (per-bench wins).
@@ -899,9 +906,10 @@ def main():
                                           args.timeout, cache, refresh=True)
             if err:
                 failed.append(n)
-                print("  %-24s FAILED: %s" % (n, err))
+                print("  %-*s FAILED: %s" % (NAME_W, n, err))
             else:
-                print("  %-24s %.3fs  (scale %d)" % (n, t, scales[n]))
+                print("  %-*s %.3fs  (scale %d)" % (NAME_W, n, t,
+                                                 scales[n]))
             save_cache(lobj.name, cache)     # persist incrementally
         if failed:
             sys.exit("recompute: %d bench(es) failed to time" % len(failed))
@@ -1026,12 +1034,12 @@ def main():
     comp_col = "%s(s)" % lobj.name       # e.g. python(s) / cpp(s)
     ratio_col = "my/%s" % lobj.name       # e.g. my/py / my/cpp
     if has_base:
-        hdr = "%-24s %10s %10s %8s %10s %8s  %s" % (
-            "benchmark", "base(s)", "mylang(s)", "cur/base",
+        hdr = "%-*s %10s %10s %8s %10s %8s  %s" % (
+            NAME_W, "benchmark", "base(s)", "mylang(s)", "cur/base",
             comp_col, ratio_col, "result")
     else:
-        hdr = "%-24s %10s %10s %8s  %s" % (
-            "benchmark", "mylang(s)", comp_col, ratio_col, "result")
+        hdr = "%-*s %10s %10s %8s  %s" % (
+            NAME_W, "benchmark", "mylang(s)", comp_col, ratio_col, "result")
     print(hdr)
     print("-" * len(hdr))
 
@@ -1184,7 +1192,8 @@ def main():
               "bench/reps.txt:"
               % (len(noisy_unsettled), args.var_threshold * 100))
         for name, reps, v in noisy_unsettled:
-            print("  %-24s %d reps, var %.1f%%" % (name, reps, v * 100))
+            print("  %-*s %d reps, var %.1f%%"
+                  % (NAME_W, name, reps, v * 100))
 
     # Repeat the machine-speed check under the geomean: the tail is what gets
     # read, and this is exactly the line that explains a ratio that moved
