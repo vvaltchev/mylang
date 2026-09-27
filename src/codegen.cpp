@@ -3439,6 +3439,15 @@ struct Codegen {
             if (cv.callee_def_idx2 < 0)
                 cv.callee_def_idx = -1;
         }
+        /* step 1b: what inference PROVED each argument is - a bool is
+         * stamped `th == i` too, and binding one into an int parameter is
+         * a retag, not the identity, so it does not count */
+        for (size_t i = 0; i < call->args->elems.size() && i < 16; i++) {
+            const Construct *ae = call->args->elems[i].get();
+            const uint32_t k = ae->th == TypeHint::f ? 2u
+                : (ae->th == TypeHint::i && !ae->th_bool) ? 1u : 0u;
+            cv.arg_kinds |= k << (2 * i);
+        }
         cv.target = dst;
         cv.target2 = callee_slot;
         cv.set_a(int_lit(argbase));
@@ -8357,12 +8366,16 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         if (in.callee_def_idx >= 0) {
             chunk.value_callees.push_back(
                 {static_cast<uint32_t>(pc), in.callee_def_idx});
+            if (in.arg_kinds)                     /* step 1b */
+                chunk.value_arg_kinds.push_back(
+                    {static_cast<uint32_t>(pc), in.arg_kinds});
             if (in.callee_def_idx2 >= 0)          /* #97 E3: the pair */
                 chunk.value_callees.push_back(
                     {static_cast<uint32_t>(pc), in.callee_def_idx2});
             in.callee_def_idx = -1;
         }
         in.callee_def_idx2 = -1;
+        in.arg_kinds = 0;
         if (!node)
             continue;
         /*
@@ -12287,10 +12300,14 @@ bool g_bc_inline_value_step1 = [] {
 }();
 unsigned long g_bc_step1_renamed = 0;   /* sites whose result move went */
 unsigned long g_bc_step1_sourced = 0;   /* arguments bound from source */
+unsigned long g_bc_step1_params = 0;    /* 1b: parameters read in place */
 
 /*
- * #97 closure inlining STEP 1: what a VALUE site can drop, decided on the
- * caller before the splice.
+ * #97 closure inlining STEP 1: what a spliced site can drop, decided on
+ * the caller before the splice - a VALUE site (step 1) and, since step
+ * 1b, a plain CallV site, whose staging has no miss arm to sink into and
+ * is simply DELETED under the same gates (`callee` is -1 there: a CallV
+ * names a global slot, not a frame slot the body could reach).
  *
  * THE ARGUMENT STAGING. A call needs its arguments in a contiguous run of
  * temps, so codegen stages each one - `move argbase+i = src` - right
@@ -12322,6 +12339,7 @@ unsigned long g_bc_step1_sourced = 0;   /* arguments bound from source */
  */
 static void bc_value_site_step1(const Chunk &ck, size_t pc, int nargs,
                                 const BcInlineSnapshot &snap, int nparams,
+                                int callee,
                                 const std::vector<char> &is_target,
                                 const SlotLiveness &live,
                                 size_t &stage_first, std::vector<int> &src_of,
@@ -12330,7 +12348,6 @@ static void bc_value_site_step1(const Chunk &ck, size_t pc, int nargs,
     const Instr &call = ck.code[pc];
     const int argbase = static_cast<int>(call.a_lit());
     const int dst = call.target;
-    const int callee = call.target2;
     src_of.assign(static_cast<size_t>(nargs), -1);
     stage_first = pc;
     size_t p = pc;
@@ -12373,6 +12390,53 @@ static void bc_value_site_step1(const Chunk &ck, size_t pc, int nargs,
     rename_from = r;
     ref_rename = std::find(snap.ref_slots.begin(), snap.ref_slots.end(), r)
                  != snap.ref_slots.end();
+}
+
+/*
+ * #97 closure inlining STEP 1b: the PARAMETERS a site can read straight
+ * from their argument's slot. Parameter i qualifies when
+ *  - its argument was SOURCED (step 1: the staging move is gone, so the
+ *    source is a caller slot the body cannot write - the body reaches
+ *    only its own slots, the callee slot's captures through the closure
+ *    object, and dst, excluded next);
+ *  - the source is not the renamed result's dst (the body writes dst
+ *    mid-body, and would then read the new value as the parameter);
+ *  - its bind is the IDENTITY: an untyped parameter (a MoveV bind), or
+ *    a typed one whose argument inference PROVED exactly that type
+ *    (`value_arg_kinds` - an int that is not a bool into `int`, a float
+ *    into `float`); a widening or a dyn argument keeps its CoerceNumV;
+ *  - the body never WRITES the parameter (a barrier op counts as a
+ *    write), and holds no call - the rename must not name a slot inside
+ *    an argument run.
+ */
+static void bc_site_param_renames(const Chunk &ck, size_t pc,
+                                  const BcInlineSnapshot &snap,
+                                  const std::vector<uint8_t> &coerce,
+                                  const std::vector<int> &src_of,
+                                  int renamed_dst,
+                                  std::vector<char> &out)
+{
+    out.assign(src_of.size(), 0);
+    std::vector<char> written(src_of.size(), 0);
+    for (const Instr &bi : snap.code) {
+        if (bi.op == OpCode::CallV)
+            return;
+        const bool known = visit_use_def(bi, [](int) {}, [&](int sl) {
+            if (sl >= 0 && static_cast<size_t>(sl) < written.size())
+                written[static_cast<size_t>(sl)] = 1;
+        });
+        if (!known)
+            return;
+    }
+    const uint32_t kinds = ck.value_arg_kinds_at(pc);
+    for (size_t i = 0; i < src_of.size(); i++) {
+        if (src_of[i] < 0 || written[i] || src_of[i] == renamed_dst)
+            continue;
+        const uint8_t co = i < coerce.size() ? coerce[i] : 0;
+        const uint32_t k = i < 16 ? (kinds >> (2 * i)) & 3u : 0u;
+        if (co == 0 || (co == 1 && k == 1) || (co == 2 && k == 2))
+            out[i] = 1;
+    }
 }
 
 /*
@@ -12632,6 +12696,10 @@ bool bc_inline_chunk(Chunk &ck,
         size_t stage_first = 0;
         std::vector<int> src_of;
         bool ref_rename = false;       /* the renamed slot is ref-listed */
+        /* step 1b: parameter i is read straight from src_of[i] - its bind
+         * is the identity and the body never writes it - so no bind op
+         * is emitted and every field naming it names the source */
+        std::vector<char> param_renamed;
     };
     std::vector<Site> sites;
     int next_base = ck.slot_count + ck.n_temps;
@@ -12721,14 +12789,17 @@ bool bc_inline_chunk(Chunk &ck,
             for (const auto &p : d->params)
                 s.coerce.push_back(p.decl_type == DeclType::i ? 1
                                    : p.decl_type == DeclType::f ? 2 : 0);
-            if (g_bc_inline_value_step1) {
-                caller_facts();
-                bc_value_site_step1(ck, pc, nargs, snap,
-                                    static_cast<int>(d->params.size()),
-                                    is_target, live, s.stage_first,
-                                    s.src_of, s.rename_from,
-                                    s.ref_rename);
-            }
+        }
+        if (g_bc_inline_value_step1) {
+            caller_facts();
+            bc_value_site_step1(ck, pc, nargs, snap,
+                                static_cast<int>(d->params.size()),
+                                is_value ? in.target2 : -1,
+                                is_target, live, s.stage_first,
+                                s.src_of, s.rename_from, s.ref_rename);
+            bc_site_param_renames(ck, pc, snap, s.coerce, s.src_of,
+                                  s.rename_from >= 0 ? in.target : -1,
+                                  s.param_renamed);
         }
         s.pc = pc;
         s.base = next_base;
@@ -12909,6 +12980,13 @@ bool bc_inline_chunk(Chunk &ck,
              * neither - carrying that ARGUMENT's caret and the CALLER's
              * inlined-at chain, since a bind error is the caller's */
             for (int i = 0; i < S.nargs; i++) {
+                if (static_cast<size_t>(i) < S.param_renamed.size()
+                        && S.param_renamed[static_cast<size_t>(i)]) {
+#ifdef TESTS
+                    g_bc_step1_params++;
+#endif
+                    continue;               /* step 1b: read in place */
+                }
                 const uint8_t co = S.value ? S.coerce[i] : 0;
                 /* step 1: an argument whose staging was sunk binds from
                  * its source */
@@ -13043,6 +13121,10 @@ bool bc_inline_chunk(Chunk &ck,
                 }
                 if (S.rename_from >= 0)
                     bc_rename_slot(bi, S.rename_from + S.base, S.dst);
+                for (size_t k = 0; k < S.param_renamed.size(); k++)
+                    if (S.param_renamed[k])
+                        bc_rename_slot(bi, S.base + static_cast<int>(k),
+                                       S.src_of[k]);
                 visit_pc_fields(bi, [&](int &t) {
                     /*
                      * The gate's `branch-past-end` rejection means every
@@ -13123,6 +13205,7 @@ bool bc_inline_chunk(Chunk &ck,
     ck.arg_locs = std::move(nargl);                    /* RULE 2 */
     ck.arg_loc_pool = std::move(nargpool);
     ck.value_callees = std::move(nvc);                 /* #97 E1 */
+    ck.value_arg_kinds.clear();      /* step 1b: its pcs die here */
     ck.inline_ctxs = std::move(nctx);
     ck.n_temps = next_base - ck.slot_count;
     /* both lists (#97 CB5): a spliced body's slots are not the caller's

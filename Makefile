@@ -172,8 +172,16 @@ DEPDIR := $(BUILD_DIR)/.d
 # and an object compiled against an old header survives a rebuild. That
 # happened (2026-09-28): a stale serialize.o kept the old opcode count
 # and refused every image holding a new opcode as "corrupt". A duplicate
-# target when the two spellings agree is harmless.
-DEPFLAGS = -MT $@ -MT $(abspath $@) -MMD -MP -MF $(DEPDIR)/$*.Td
+# target when the spellings agree is harmless.
+# THREE spellings, not two: `$(abspath $@)` only ADDS the absolute form,
+# so a .d written by an ABSOLUTE build named nothing else and a later
+# relative build still missed every header - watched the next day, a
+# stale vm.o compiled against the old Chunk layout (an ASan stack
+# overflow in vm_compile). The third is the path relative to the
+# Makefile's directory, whichever spelling the build was given.
+DEP_REL = $(patsubst $(CURDIR)/%,%,$(abspath $@))
+DEPFLAGS = -MT $@ -MT $(abspath $@) -MT $(DEP_REL) -MMD -MP \
+           -MF $(DEPDIR)/$*.Td
 POSTCOMPILE = mv -f $(DEPDIR)/$*.Td $(DEPDIR)/$*.d
 SOURCES:=$(wildcard src/*.cpp)
 OBJECTS=$(SOURCES:src/%.cpp=$(BUILD_DIR)/%.o)

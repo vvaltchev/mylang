@@ -16798,6 +16798,18 @@ closure_inline_parity()
           "var a = mr(runtime(10)); var b = m2(runtime(10)); var s = 0;\n"
           "for (var i = 0; i < 30; i++) s = s + a(i) * 3 + b(i);\n"
           "print(s);\n" },
+        /* step 1b: a parameter read IN PLACE (exact int into `int k`,
+         * feeding a local), and a BOOL into an int parameter, whose bind
+         * is a retag and so must stay (`id(true)` renders 1, not true) */
+        { "bool argument into an int parameter",
+          "func ma(int base) { return func [base] (int k) {\n"
+          "  var r = k * 3; return r + base; }; }\n"
+          "func mb(int base) { return func [base] (int k) { return k; }; }\n"
+          "var add = ma(runtime(1)); var id = mb(runtime(0));\n"
+          "var y = 2; var s = 0;\n"
+          "for (var i = 0; i < 10; i++) {\n"
+          "  y = add(y) % 1009; var fl = i > 4; s = s + id(fl); }\n"
+          "print(y, s, id(true));\n" },
         /* step 1: a TERNARY argument - its join lands on the staging */
         { "ternary argument",
           "func ma(int base) {\n"
@@ -16809,6 +16821,7 @@ closure_inline_parity()
     bool ok = true;
     const unsigned long rn0 = g_bc_step1_renamed;
     const unsigned long sr0 = g_bc_step1_sourced;
+    const unsigned long pr0 = g_bc_step1_params;
 #if ML_JIT_SUPPORTED
     const unsigned long cp0 = g_jit_coerce_pin;
 #endif
@@ -16901,10 +16914,102 @@ closure_inline_parity()
 #endif
     /* step 1 fired: each rule is a compile-time counter, bumped only
      * where the splice took it */
-    if (g_bc_step1_renamed == rn0 || g_bc_step1_sourced == sr0) {
+    if (g_bc_step1_renamed == rn0 || g_bc_step1_sourced == sr0
+            || g_bc_step1_params == pr0) {
         cout << "  closure_inline_parity: step 1 never renamed a result ("
-             << (g_bc_step1_renamed - rn0) << ") or sourced an argument ("
-             << (g_bc_step1_sourced - sr0) << ") - vacuous\n";
+             << (g_bc_step1_renamed - rn0) << "), sourced an argument ("
+             << (g_bc_step1_sourced - sr0) << ") or read a parameter in "
+             << "place (" << (g_bc_step1_params - pr0) << ") - vacuous\n";
+        ok = false;
+    }
+    return ok;
+}
+
+/*
+ * #97 closure inlining STEP 1b at a PLAIN function splice (CallV): the
+ * argument staging is DELETED (there is no miss arm to sink it into), a
+ * parameter the body only reads is read straight from the argument's
+ * slot, and the returned slot is renamed into the call's dst. The
+ * callers are FUNCTIONS (main splices value sites only) and the callee
+ * bodies are too big for the AST inliner but under the splice's
+ * whitelist (a loop). Shapes: read-only parameters (renamed); a
+ * parameter the body WRITES (sourced, but its bind must stay - the
+ * write would land in the caller's variable); a caller that changes the
+ * argument's variable AFTER the call; the same variable passed twice.
+ * Every shape renders what the tree-walker does, in every VM mode and
+ * with step 1 off, and the counters prove each rule fired.
+ */
+static bool bc_step1_plain_sites()
+{
+    static const char *const progs[][2] = {
+        { "read-only parameters",
+          "func tri(n, m) {\n"
+          "  var s = 0; var i = 0;\n"
+          "  while (i < n) { s = s + i * m; i++; }\n"
+          "  return s;\n"
+          "}\n"
+          "func drive(int k) {\n"
+          "  var a = k + 1; var b = k * 2;\n"
+          "  var r = tri(a, b);\n"
+          "  a = a + 100;\n"
+          "  var q = tri(a, a);\n"
+          "  return r + q + a;\n"
+          "}\n"
+          "var t = 0;\n"
+          "for (var j = 0; j < 6; j++) t = t + drive(runtime(j));\n"
+          "print(t);\n" },
+        { "a parameter the body writes",
+          "func down(n) {\n"
+          "  var c = 0;\n"
+          "  while (n > 0) { n = n - 2; c++; }\n"
+          "  return c;\n"
+          "}\n"
+          "func drive(int k) {\n"
+          "  var a = k * 3;\n"
+          "  var r = down(a);\n"
+          "  return r * 1000 + a;\n"
+          "}\n"
+          "var t = 0;\n"
+          "for (var j = 0; j < 6; j++) t = t + drive(runtime(j));\n"
+          "print(t);\n" },
+    };
+    bool ok = true;
+    const unsigned long rn0 = g_bc_step1_renamed;
+    const unsigned long sr0 = g_bc_step1_sourced;
+    const unsigned long pr0 = g_bc_step1_params;
+    const unsigned long sp0 = g_bc_inline_splices;
+    for (const auto &p : progs) {
+        const std::string src = p[1];
+        const std::string ref = engine_run_bt(src, ExecEngine::TreeWalk,
+                                              false, false, true);
+        const struct { const char *name; bool jit, splice, s1; } cfgs[] = {
+            { "vm -nbi", false, false, true },
+            { "jit -nbi", true, false, true },
+            { "vm", false, true, true }, { "jit", true, true, true },
+            { "vm step1-off", false, true, false },
+            { "jit step1-off", true, true, false },
+        };
+        for (const auto &c : cfgs) {
+            const bool s1 = g_bc_inline_value_step1;
+            g_bc_inline_value_step1 = c.s1;
+            const std::string got = engine_run_bt(src, ExecEngine::Vm,
+                                                  c.jit, c.splice, true);
+            g_bc_inline_value_step1 = s1;
+            if (got != ref) {
+                cout << "  bc_step1_plain_sites [" << p[0] << "] " << c.name
+                     << " differs from the tree-walker:\n--- tw\n" << ref
+                     << "--- got\n" << got;
+                ok = false;
+            }
+        }
+    }
+    if (g_bc_inline_splices == sp0 || g_bc_step1_renamed == rn0
+            || g_bc_step1_sourced == sr0 || g_bc_step1_params == pr0) {
+        cout << "  bc_step1_plain_sites: vacuous - splices "
+             << (g_bc_inline_splices - sp0) << ", renamed "
+             << (g_bc_step1_renamed - rn0) << ", sourced "
+             << (g_bc_step1_sourced - sr0) << ", params "
+             << (g_bc_step1_params - pr0) << "\n";
         ok = false;
     }
     return ok;
@@ -48336,6 +48441,10 @@ static const std::vector<extra_check> extra_checks =
       "identically with the splice on and off in every engine (output, "
       "exception, caret, backtrace) and reaches its emitted code",
       closure_inline_parity },
+    { "call: #97 closure inlining step 1b - a PLAIN function splice drops "
+      "its argument staging, reads read-only parameters in place and "
+      "renames its result (every engine, step 1 on and off)",
+      bc_step1_plain_sites },
     { "backtrace: typed-chain inlined-frame parity (#75)",
       typed_inlined_backtrace_parity },
     { "backtrace: a recursion inlined into itself renders identically "

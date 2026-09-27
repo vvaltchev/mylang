@@ -7,7 +7,10 @@ and result MoveVs remain), 78 -8.5%, 63 -10.5%. STEP 1 of the follow-ups
 DONE the same day (record: *#97 CLOSURE INLINING STEP 1*): staging sunk
 into the miss arm, results renamed into dst, a pinned bind source read
 from its register - 78 -39% cycles (112 -> 70 instr/iter), 11 -12%, 63
--14% vs increment 1. Increments 2-5 not started. Designed from
+-14% vs increment 1. STEP 1b (plain-splice staging/result, parameters
+read in place when the bind is the identity): 63 -3..-7% cycles, 78 -4%
+instructions but +2..4% cycles, undiagnosed (record: *STEP 1b*).
+Increments 2-5 not started. Designed from
 measurement (2026-09-27). Maintainer's call: this replaces the
 call-protocol store trimming (R5/R6 both measured flat and are parked
 on `r5-offpath-framefree` / `r6-return-forward`).

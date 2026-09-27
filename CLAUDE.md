@@ -393,8 +393,10 @@ is what compiles the
 `.d/` was rewritten by every lane, so two lanes building at once (the
 battery runner does exactly that) raced on the `.Td` temp file and left
 each other's object named in the surviving `.d`, silently dropping a
-lane's header dependencies. **And each `.d` names its object under BOTH
-spellings of the path (`-MT $@ -MT $(abspath $@)`, 2026-09-28):** the
+lane's header dependencies. **And each `.d` names its object under
+EVERY spelling of the path - as given, absolute, and relative to the
+repo (`DEPFLAGS`, 2026-09-28; the first fix named only two, and a .d
+an absolute build wrote then held the absolute form alone):** the
 battery builds a lane with an ABSOLUTE `BUILD_DIR`, a hand build of the
 same lane passes a relative one, and a `.d` whose target string differs
 from the object make is asked for matches nothing - every header change

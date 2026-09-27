@@ -15402,3 +15402,66 @@ the same liveness rule); a parameter bound by an EXACT move whose source
 the body never writes could be renamed to the source outright, removing
 the bind too; the guard still compares the type word and the descriptor
 through memory (8 instructions).
+
+## #97 CLOSURE INLINING STEP 1b - PLAIN SPLICES, AND PARAMETERS READ IN
+## PLACE (2026-09-27)
+
+Two siblings of step 1, same machinery (`bc_value_site_step1`,
+`bc_site_param_renames`, codegen.cpp):
+
+**A plain function splice (CallV) drops its staging and result copy
+too.** It has no miss arm, so the argument staging run is simply
+DELETED under step 1's gates (no source inside the run, no branch into
+it, each staging temp dead after the call), and the returned slot is
+renamed into dst on the same terms. (`callee` is -1 there: a CallV
+names a global slot, not a frame slot the body could reach.)
+
+**A parameter whose bind is the identity is read straight from its
+argument's slot**, so no bind op is emitted at all. It qualifies when
+its argument was sourced (the staging is gone), the source is not the
+renamed result's dst (which the body writes mid-body), the body never
+writes the parameter (a barrier op counts as a write) and holds no
+call, and the bind is the IDENTITY: an untyped parameter's MoveV, or a
+typed one whose argument inference PROVED exactly that type. That last
+fact is not in the bytecode - a slot has no type there - so codegen
+records it at the call: `CgInstr::arg_kinds` (two bits per argument: 1
+an int that is NOT a bool, 2 a float) becomes
+`Chunk::value_arg_kinds`, a COMPILE-TIME-ONLY table the splice reads in
+the same process and then clears. It is never serialized: the splice
+runs before an image is written and never after one is loaded. A bool
+into an `int` parameter keeps its CoerceNumV - that bind is a retag,
+and reading the bool in place would let a typed read see a bool
+(sabotage S8: the parity test aborts in `read_int_slot`). A widening
+(int into `float`) keeps its CoerceNumV too.
+
+**Nets.** `closure_inline_parity` gained a bool-into-int shape and
+requires `g_bc_step1_params`; `bc_step1_plain_sites` (new) runs plain
+splices with read-only parameters, a parameter the body WRITES (sourced
+but bound - watched: renaming it writes the caller's variable, S7), the
+same variable twice, and an argument changed after the call, against
+the tree-walker in every VM mode with step 1 on and off, and requires
+all four step-1 counters.
+
+**The Makefile fix needed a third spelling.** The first fix
+(`-MT $@ -MT $(abspath $@)`) only ADDS the absolute form, so a .d an
+absolute build wrote named nothing else, and the next relative build
+missed the `Chunk` layout change: a stale `vm.o` and an ASan stack
+overflow in `vm_compile`. `DEPFLAGS` now also names the repo-relative
+path.
+
+Reach: only 12, 63 and 78 change bytecode across bench/my (`-vd`
+diffed against the step-1 binary). Measured (pinned P-core, `-npc`,
+`OPT=1 ASSERTS=0`, whole scale-3 runs, two each):
+
+    bench  instructions   cycles
+    78     -4.1%          +2.2% / +3.8%
+    63     -1.5%          -2.9% / -6.6%
+    12     flat           flat
+
+**78 is the open question: FEWER instructions, MORE cycles, and the
+emitted code is a strict SUBSET** - the int site's `mov r11.type` /
+`mov r11, r14` / `mov rcx, r11` (a store and its reload) are gone and
+nothing was added. Blocked store-forwards are unchanged (1812 vs 1813);
+top-down moves from 12.9% to 20.4% CORE-bound while fetch latency and
+bandwidth both fall slightly. Not diagnosed - recorded for the
+maintainer, per the do-not-revert-an-optimization rule.
