@@ -4580,7 +4580,7 @@ struct Emitter {
     {
         const int32_t t = lazy_vframe_total;
         lazy_vframe_total = -1;
-        call_rax();
+        call_rax();                 /* reg:abi: the callee in rax */
         lazy_vframe_total = t;
     }
     /* lea reg, [rbx + disp32]  (an EvalValue-ptr / LValue-ptr helper arg;
