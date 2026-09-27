@@ -827,7 +827,21 @@ corpus hole of the same family as the field store's.
 **✅ (a) DONE 2026-09-26** - the cause was not eviction: TEMPS competed
 in the scan and were stripped afterwards, leaving the freed register
 idle. `jit_lsra_assign(..., locals_only)`; record: *#124(a)* in
-docs/jit-optimizations.md. (b) and (c) remain.
+docs/jit-optimizations.md.
+
+**(b) MEASURED BEFORE BUILDING, 2026-09-26 - NOT BUILT, ON THE NUMBERS.**
+bench/my/97_regs_int_call (eight int recurrences + one real call per
+iteration; my/cpp **1.41x** already) is the shape (b) exists for. Its
+CEILING, measured on the call-free twin pinned to a P-core
+(`taskset -c 2 perf stat`, 10M iterations): all pins 150.0M cycles vs
+`MYLANG_JIT_MAXPINS=4` 152.8M - **four extra pins are worth 1.8%**,
+because a memory-resident local costs the same instruction count as a
+pinned one and the loop is latency-light. (b) would pay a store + load
+per caller-saved pin per CALL on top (the 1b barrier measured stores on
+the call path at 1.10x wall), so on its own best shape it nets ~0 or
+worse. (c) avoids the spills but shares the same ~2% ceiling. Both stay
+filed; neither is worth building until a bench shows a larger ceiling.
+The bench stays as the probe.
 ## [PENDING — maintainer's call 2026-09-19: "completely fix this with
 ## both approaches, but not as a detour right now"]
 
