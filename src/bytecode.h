@@ -2048,6 +2048,16 @@ struct Chunk {
      */
     bool frameless_capbase = false;
     /*
+     * #97 R4: this chunk is a frameless LEAF whose frameless path never
+     * PUBLISHES the vframe (the lazy scheme of E2e, bet on and kept only
+     * when the emission published nothing on that path - see
+     * Emitter::vframe_pub_hot). A site calling it then leaves the
+     * caller's vframe in place instead of restoring it after the call.
+     * Written by the JIT at this chunk's compile; leaves compile first,
+     * so every reader sees the settled value. Never stored.
+     */
+    bool frameless_vframe_quiet = false;
+    /*
      * #97 increment 2 (F6): main NAMES this chunk at a site the shared
      * predicate (jit_frameless_callee) says will be frameless - so the
      * frameless ENTRY and the frameless RETURN ARM are worth emitting.

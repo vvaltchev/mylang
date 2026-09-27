@@ -3640,6 +3640,8 @@ unsigned long g_jit_frameless_rets = 0;    /* #97 inc 2: frameless RETURN
 unsigned long g_jit_frameless_init_free = 0; /* #97 inc 3 W3: window slots
                                               * a site left uninitialised
                                               * (emit-time) */
+unsigned long g_jit_vframe_quiet_sites = 0;
+unsigned long g_jit_vframe_quiet_lost = 0;
 unsigned long g_jit_frameless_capbase = 0;   /* #97 inc 3 W4: sites that
                                               * skip the captures repoint
                                               * (emit-time) */
@@ -4390,6 +4392,14 @@ const void *jit_poison_captures()
     return g_jit_poison_caps;
 }
 
+extern "C" [[noreturn]] void jit_vframe_published()
+{
+    fprintf(stderr, "R4: a frameless callee claimed a quiet vframe, but "
+                    "the cell was written during the call (the release "
+                    "site does not restore it)\n");
+    abort();
+}
+
 extern "C" [[noreturn]] void jit_w4_captures_replaced()
 {
     fprintf(stderr, "W4: a frameless callee whose site leaves "
@@ -4569,8 +4579,9 @@ extern "C" void *jit_make_closure_locals(const void *defv,
 {
     ML_JIT_OP_RAN(MakeClosureV);
     const FuncDescriptor *def = static_cast<const FuncDescriptor *>(defv);
-    ML_CHECK(!g_current_ctx->const_ctx
-             && frame == g_current_ctx->frame->slots);
+    /* (R4: `frame` is not checked against ctx->frame - a lazy frameless
+     * leaf calls this without publishing it; the emitter hands rbx) */
+    ML_CHECK(!g_current_ctx->const_ctx && frame != nullptr);
     FuncObject *fo = new FuncObject(def, get_root_ctx(g_current_ctx),
                                     frame, FuncObject::LocalCaptures());
     fo->intr_refcount = 1;          /* the destination slot owns it */
@@ -7022,6 +7033,12 @@ extern "C" void jit_member_fact_audit(int_type slot,
 #endif
 }
 
+/* #97 R4: the window of the frame calling jit_ret_audit - the emitted
+ * code stores rbx here right before the call, so the audit need not
+ * read it through a published vframe (a lazy frameless leaf publishes
+ * none on its normal-return path) */
+const LValue *g_jit_audit_window = nullptr;
+
 extern "C" void jit_ret_audit() noexcept
 {
 #if ML_VM_HARDENING
@@ -7091,8 +7108,8 @@ extern "C" void jit_ret_audit() noexcept
      * ref-listed (an unlisted one would leak - exactly what the ref_slots
      * audit in pop_window catches after ITS release scan; here the scan
      * has not run yet, so a listed slot may legitimately hold one). */
-    if (my_ck && g_current_ctx && g_current_ctx->frame) {
-        const LValue *win = g_current_ctx->frame->slots;
+    const LValue *win = g_jit_audit_window;
+    if (my_ck && win) {
         const int_type total = static_cast<int_type>(my_ck->slot_count)
                                + my_ck->n_temps;
         for (int_type i = 0; i < total; i++) {
@@ -7120,8 +7137,7 @@ extern "C" void jit_ret_audit() noexcept
         }
         g_jit_ret_audit_refscan++;
     }
-    if (g_current_ctx && g_current_ctx->frame
-            && rec.window != g_current_ctx->frame->slots) {
+    if (win && rec.window != win) {
         g_jit_ret_audit_skipped++;   /* record-less: no bases to compare */
         return;
     }
@@ -8322,10 +8338,15 @@ extern "C" size_t jit_ret_norec(int_type res_slot, LValue *dst_addr_raw,
     const Chunk *ck =
         desc ? static_cast<const Chunk *>(desc->vm_chunk) : nullptr;
     ML_CHECK(ck != nullptr);
-    EvalValue res = res_slot >= 0
-        ? ctx.frame->at(res_slot).steal_value()
-        : EvalValue();
-    LValue *win = ctx.frame->slots;
+    /* #97 R4: a FRAMELESS frame's window is at a fixed offset from its
+     * rbp (the site built it there), and its arm calls here WITHOUT
+     * publishing the vframe - a lazy leaf's cell may name the caller */
+    LValue *win = frameless
+        ? reinterpret_cast<LValue *>(const_cast<char *>(
+              static_cast<const char *>(rbp)) + JIT_FRAMELESS_WIN_OFF)
+        : ctx.frame->slots;
+    EvalValue res = res_slot >= 0 ? win[res_slot].steal_value()
+                                  : EvalValue();
     const int_type total = static_cast<int_type>(ck->slot_count)
                            + ck->n_temps;
     for (const int32_t s : ck->ref_slots) {
@@ -10581,6 +10602,19 @@ extern "C" void jit_norec_retarm_verify(const void *dst_addr,
         EvalContext *fctx = g_current_ctx;
         if (!fctx || !fctx->frame)
             norec_fail("retarm fork: no ctx", fctx, nullptr);
+        /* #97 R4: a LAZY frameless body publishes no vframe on this
+         * path (the call reaching here does not publish either) - its
+         * entry left the POISON window, and the vframe facts below are
+         * then not facts about this frame. The [rbp-8] chain still is. */
+        if (fctx->frame->slots
+                == static_cast<const LValue *>(jit_poison_window())) {
+            const void *pw = *reinterpret_cast<const void *const *>(
+                static_cast<const char *>(rbp) - 8);
+            if (!pw)
+                norec_fail("retarm fork: [rbp-8] is null", pw, nullptr);
+            g_jit_norec_retarm_verify++;
+            return;
+        }
         if (rec.window == fctx->frame->slots)
             norec_fail("retarm fork: top record IS this frame's",
                        rec.window, fctx->frame->slots);
