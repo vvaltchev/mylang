@@ -152,3 +152,31 @@ func refs(int n) {
     return acc;
 }
 print("references", refs(int(runtime(12))));
+
+# REGCALL step 4: float parameters arrive in xmm registers - a float, an
+# int WIDENED into one (pinned, and from a slot), a dyn whose tag is
+# decided at the load, more float parameters than registers, and a
+# parameter read often enough to be pinned where it lands
+func fmix(float a, float b) {
+    var t = a * 0.5 + b;
+    for (var j = 0; j < 2; j++) t = t + a * b * 0.001 + a - a;
+    return t;
+}
+func fwide(float a, float b, float c, float d, float e, float f) {
+    var r = 0.0;
+    for (var j = 0; j < 2; j++) r = r + j;
+    return a + b * 2.0 + c * 3.0 + d * 4.0 + e * 5.0 + f * 6.0 + r;
+}
+func floats(int n) {
+    var s = 0.0;
+    var w = 0.0;
+    var dyn d = runtime(3);
+    var dyn e = runtime(1.5);
+    var k = 7;
+    for (var i = 0; i < n; i++) {
+        s = fmix(s, 1.25) * 0.5;
+        w = w + fmix(i, d) + fmix(e, k) + fwide(s, i, 2.0, w * 0.0, e, d);
+    }
+    return int(s * 1000.0) + int(w);
+}
+print("floats", floats(int(runtime(12))));

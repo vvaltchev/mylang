@@ -1475,7 +1475,10 @@ collision). Three nets now:
   the loop), regcall (REGCALL 1A: a frameless callee's int parameters
   arrive in rdi/rcx/r9/r10 and its entry moves each straight into the
   parameter's pin, or writes the slot when it is not pinned - one rule,
-  `jit_regcall_arg_reg`, for the site and the entry; 1B, the result in
+  `jit_regcall_arg_reg`, for the site and the entry; step 4 is its float
+  twin, `jit_regcall_farg_reg`, in xmm2-xmm5 (a declared or proven
+  `float` parameter also gains pin evidence from its BIND, so it can be
+  float-pinned at all); 1B, the result in
   rdx/rcx for a callee whose every return is trivial, has no lever:
   `Chunk::frameless_ret_regs` is derived and the site and the arm both
   read it), pincs (REGCALL step 1: a FUNCTION BODY whose run brackets

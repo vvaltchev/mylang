@@ -182,6 +182,10 @@ unsigned long g_jit_entry_pad_off = 0;
 unsigned long g_jit_pins_cs = 0;      /* REGCALL 1: runs whose pins
                                        * took the caller-saved bet */
 unsigned long g_jit_pins_cs_lost = 0; /* ...and re-emitted on losing */
+unsigned long g_jit_regcall_fargs = 0; /* REGCALL 4: float args sent
+                                        * in xmm (emitted-code bumps) */
+unsigned long g_jit_regcall_fpinned = 0; /* ...and taken straight into
+                                          * a float pin (emit-time) */
 unsigned long g_jit_regcall_proven = 0; /* REGCALL 3: register args
                                          * bound with no type dispatch */
 unsigned long g_jit_ret_unflushed = 0; /* REGCALL 2: returns that left a
@@ -4000,7 +4004,7 @@ struct Emitter {
      * cache registers are callee-saved, so save the caller's and take them
      * over. Called AFTER `saved` is filled (the cache pick decides it). */
     void frag_entry(bool load_window = true, bool keep_rdx = false,
-                    uint32_t keep_mask = 0)
+                    uint32_t keep_mask = 0, uint32_t fkeep_mask = 0)
     {
         /* the entry pushes are teardown-balanced (frag_ret), not
          * op-balanced - machinery, like frag_ret's pops already are.
@@ -4038,6 +4042,13 @@ struct Emitter {
         for (uint8_t r = 0; r < 16; r++)
             if (((keep_mask >> r) & 1) && r != REG_ARG0)   /* reg:abi */
                 push_reg(r);
+        /* REGCALL 4: and the float argument registers - through rax,
+         * which the probe clobbers anyway */
+        for (uint8_t x = 0; x < 8; x++)
+            if ((fkeep_mask >> x) & 1) {
+                movq_r_x(0 /* rax */, x);
+                push_reg(0 /* rax */);
+            }
         /* rdi = the HARDWARE return address, which sits at the entry
          * datum: depth 0, so `sp_depth` bytes above rsp right now
          * (rdi is the checker's first argument) */
@@ -4045,6 +4056,11 @@ struct Emitter {
         movabs(0 /* RAX */, reinterpret_cast<uint64_t>(
                                 &jit_norec_ret_verify));
         call_rax();   /* reg:abi */
+        for (int x = 7; x >= 0; x--)
+            if ((fkeep_mask >> x) & 1) {
+                pop_reg(0 /* rax */);
+                movq_xmm_from(static_cast<uint8_t>(x), 0);
+            }
         for (int r = 15; r >= 0; r--)
             if (((keep_mask >> r) & 1) && r != REG_ARG0)   /* reg:abi */
                 pop_reg(static_cast<uint8_t>(r));
@@ -4054,6 +4070,7 @@ struct Emitter {
 #else
         (void)keep_rdx;
         (void)keep_mask;
+        (void)fkeep_mask;
 #endif
       /* G1 STEP 3 - THE FRAME-POINTER CHAIN (plans/archived/g1-no-record-tier.md,
       
@@ -9726,6 +9743,57 @@ static int jit_regcall_arg_reg(const FuncDescriptor *callee,
     return -1;
 }
 
+/*
+ * REGCALL step 4 - THE FLOAT ARGUMENT REGISTERS, the same rule on the
+ * float file: a declared `float` (the bind COERCES: a float or an int
+ * binds, the int widened) or an inference-PROVEN one (only an exact
+ * float), not `opt`, not `dyn`, not ref-listed - the k-th in
+ * JIT_REGCALL_FLT[k]. xmm2-xmm5: below 8 (the float encoders take no
+ * REX for the pools), clear of the staging pair xmm0/xmm1 and of the
+ * site's own widening scratch (xmm0). Every xmm is caller-saved, so
+ * between the site's loads and the entry's consumption only the TESTS
+ * probe can clobber them, and it saves them (frag_entry's fkeep mask).
+ */
+static constexpr uint8_t JIT_REGCALL_FLT[] = { 2, 3, 4, 5 };
+static constexpr int JIT_REGCALL_NFLT =
+    static_cast<int>(sizeof(JIT_REGCALL_FLT) / sizeof(JIT_REGCALL_FLT[0]));
+
+static int jit_regcall_farg_reg(const FuncDescriptor *callee,
+                                const Chunk &cck, int i)
+{
+    if (jit_lever_off(JL_REGCALL))
+        return -1;
+    int k = 0;
+    for (int j = 0; j < static_cast<int>(callee->params.size()); j++) {
+        const FuncDescriptor::ParamDesc &pd = callee->params[j];
+        const bool flt_p = pd.decl_type == DeclType::f
+                           || (pd.decl_type == DeclType::none
+                               && pd.proven_type == DeclType::f);
+        const bool ok = flt_p && !pd.opt && !pd.dyn_mod
+                        && !jit_slot_ref_listed(cck, j);
+        if (!ok)
+            continue;
+        if (k >= JIT_REGCALL_NFLT)
+            return -1;
+        if (j == i)
+            return JIT_REGCALL_FLT[k];
+        k++;
+    }
+    return -1;
+}
+
+static uint32_t jit_regcall_fmask(const FuncDescriptor *callee,
+                                  const Chunk &cck)
+{
+    uint32_t m = 0;
+    for (int i = 0; i < static_cast<int>(callee->params.size()); i++) {
+        const int x = jit_regcall_farg_reg(callee, cck, i);
+        if (x >= 0)
+            m |= 1u << x;
+    }
+    return m;
+}
+
 /* the mask of JIT_REGCALL_INT registers a callee takes (frag_entry's
  * TESTS probe saves exactly these) */
 static uint32_t jit_regcall_mask(const FuncDescriptor *callee,
@@ -9747,6 +9815,14 @@ struct RegArg {
     int pin = -1;          /* the caller's pin register, or */
     int spill = -1;        /* its spill home, or */
     int32_t slot = -1;     /* a caller window slot (payload read) */
+    /* REGCALL 4: `abi` is an xmm register. `fpin` = a float pin source;
+     * `cvt` = an INT source (pin / spill / slot) widened into a float
+     * parameter; `dyn_tag` = a slot whose tag is float or int at run
+     * time, decided again at the load (the fill declined the rest) */
+    bool flt = false;
+    int fpin = -1;
+    bool cvt = false;
+    bool dyn_tag = false;
 };
 
 /*
@@ -9846,6 +9922,50 @@ static void emit_frameless_window(Emitter &e, const Chunk &ck,
          * below is the window's own, minus the stores: an int or a
          * bool (its payload is the int 0/1) binds, anything else -
          * none included, which the register cannot carry - declines. */
+        const int fabi = jit_regcall_farg_reg(callee, cck, i);
+        if (fabi >= 0) {
+            /* REGCALL 4: the float twin of the dispatch below. A
+             * declared float takes a float or an int (widened); a
+             * PROVEN one only an exact float. */
+            const bool proven_only = req == nullptr;
+            ML_CHECK(req == L.t_float || proven_only);
+            RegArg ra;
+            ra.flt = true;
+            ra.abi = static_cast<uint8_t>(fabi);
+            const int fr = e.freg_at(ss), ir = e.reg_at(ss),
+                      sp = e.spill_at(ss);
+            if (fr >= 0) {
+                ra.fpin = fr;
+            } else if (ir >= 0 || sp >= 0) {
+                if (proven_only) {           /* an int cannot be one */
+                    j_slow_win.push_back(e.j32(0xEB));
+                    continue;
+                }
+                ra.pin = ir;
+                ra.spill = sp;
+                ra.cvt = true;
+#ifdef TESTS
+                e.bump_counter(&g_jit_bake_widen);   /* a baked widening */
+#endif
+            } else {
+                ra.slot = s;
+                e.cmp_mem_tag(RBX, s + 24, L.t_float, R11);  /* reg:proto */
+                if (proven_only) {
+                    j_slow_win.push_back(e.j32(0x75));       /* jne slow */
+                } else {
+                    const size_t j_ok = e.j32(0x74);         /* je float */
+                    e.cmp_mem_tag(RBX, s + 24, L.t_int, R11); /* reg:proto */
+                    j_slow_win.push_back(e.j32(0x75));       /* jne slow */
+                    e.patch32_here(j_ok);
+                    ra.dyn_tag = true;
+                }
+            }
+#ifdef TESTS
+            e.bump_counter(&g_jit_regcall_fargs);
+#endif
+            reg_args.push_back(ra);
+            continue;
+        }
         const int abi = jit_regcall_arg_reg(callee, cck, i);
         if (abi >= 0) {
             /* a PROVEN (undeclared) int binds no coercion: only an exact
@@ -12078,7 +12198,42 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
              * behind us), and nothing below touches rdi/rcx/r9/r10. A
              * caller's pin is callee-saved across a MyLang call, so no
              * source can be a register an earlier load wrote. */
+            /* REGCALL 4: the float ones FIRST - an int source widened
+             * into one may be a GP pin, and only the int loads below
+             * write GP argument registers. rax is free scratch here
+             * (the callee reads nothing in it). */
             for (const RegArg &ra : reg_args) {
+                if (!ra.flt)
+                    continue;
+                const uint8_t x = ra.abi;
+                if (ra.fpin >= 0) {
+                    if (ra.fpin != x)
+                        e.fmov_rr(x, static_cast<uint8_t>(ra.fpin));
+                } else if (ra.cvt && ra.pin >= 0) {
+                    e.trk_read_pin(static_cast<uint8_t>(ra.pin));
+                    e.cvt_reg(x, static_cast<uint8_t>(ra.pin));
+                } else if (ra.cvt) {
+                    e.reload(RAX, ra.spill);              /* reg:proto */
+                    e.cvt_reg(x, RAX);                    /* reg:proto */
+                } else if (ra.dyn_tag) {
+                    e.cmp_mem_tag(RBX, ra.slot + 24,
+                                  jit_layout().t_float, RAX); /* reg:proto */
+                    const size_t j_f = e.j32(0x74);       /* je float */
+#ifdef TESTS
+                    e.bump_counter(&g_jit_bake_widen);    /* widened */
+#endif
+                    e.cvt(x, ra.slot);                    /* an int */
+                    const size_t j_d = e.j32(0xEB);
+                    e.patch32_here(j_f);
+                    e.fload(x, ra.slot);
+                    e.patch32_here(j_d);
+                } else {
+                    e.fload(x, ra.slot);
+                }
+            }
+            for (const RegArg &ra : reg_args) {
+                if (ra.flt)
+                    continue;
                 if (ra.pin >= 0) {
                     e.trk_read_pin(static_cast<uint8_t>(ra.pin));
                     e.mov_rr(ra.abi, static_cast<uint8_t>(ra.pin));
@@ -14874,6 +15029,8 @@ void jit_stats_report()
         { "pins_cs_lost",     &g_jit_pins_cs_lost },
         { "ret_unflushed",    &g_jit_ret_unflushed },
         { "regcall_proven",   &g_jit_regcall_proven },
+        { "regcall_fargs",    &g_jit_regcall_fargs },
+        { "regcall_fpinned",  &g_jit_regcall_fpinned },
         { "call_align",       &g_jit_call_align },
         { "call_dead_model",  &g_jit_call_dead_model },
         { "hoist_rmw",        &g_jit_hoist_rmw },
@@ -17305,6 +17462,40 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
         if (!pick_visit_op(ck, ck.code[pc], pc, vis))
             return false;
     }
+    /*
+     * REGCALL step 4: a declared (or inference-proven) `float` parameter
+     * that is not `opt` or `dyn` HOLDS A FLOAT from its bind - the bind
+     * widens an int and refuses anything else (vm_bind_arg, the
+     * frameless site's dispatch, coerce_to_decl_type). That is the type
+     * evidence `wrote_float` stands for (a pin's flush writes t_float),
+     * supplied by the CALL instead of by a float op in the body - which
+     * a parameter that is only READ never has, so no float parameter
+     * could be pinned at all. `g_cur_caller_desc` is the descriptor of
+     * the chunk being compiled (null for main, and for a caller that
+     * is not jit_compile_chunk - no evidence then).
+     */
+    /* ...and for the float TRANSITION mode, whose per-piece evidence is
+     * a write EVENT (the write-first rule): the bind's write, at the run
+     * head - a same-pc read beside it is admissible */
+    if (g_cur_caller_desc && g_cur_caller_desc->vm_chunk == &ck)
+        for (size_t k = 0; k < out.size(); k++) {
+            const int s = iv[k].slot;
+            if (s < 0 || s >= static_cast<int>(
+                                  g_cur_caller_desc->params.size()))
+                continue;
+            const FuncDescriptor::ParamDesc &pd =
+                g_cur_caller_desc->params[static_cast<size_t>(s)];
+            if ((pd.decl_type == DeclType::f
+                 || (pd.decl_type == DeclType::none
+                     && pd.proven_type == DeclType::f))
+                    && !pd.opt && !pd.dyn_mod) {
+                out[k].wrote_float = true;
+                if (flt_events && iv[k].start == begin)
+                    flt_events->insert(flt_events->begin(),
+                        { static_cast<uint32_t>(begin), s,
+                          FltEvent::write });
+            }
+        }
     if (orphans)
         *orphans = vis.orphans;
     return true;
@@ -30379,7 +30570,16 @@ retry_emission:
                  * float file - not a scan of a hand-written pool. The
                  * staging pair is already fbusy from grant_fstage, so
                  * it cannot be handed out here. */
-                const int xr = e.ra.ftake();
+                /* REGCALL 4: a float parameter prefers the register
+                 * its argument arrives in (the entry then moves
+                 * nothing) - free, every xmm being caller-saved */
+                const int fx = g_cur_caller_desc
+                    && fhot[h] < static_cast<int>(
+                           g_cur_caller_desc->params.size())
+                    ? jit_regcall_farg_reg(g_cur_caller_desc, chunk,
+                                           fhot[h])
+                    : -1;
+                const int xr = e.ra.ftake(fx >= 0 ? (1u << fx) : 0u);
                 ML_CHECK(xr >= 0);       /* fhot.size() <= MAX_FCACHED */
                 e.fcache.push_back({ fhot[h], a.payload, a.type,
                                      static_cast<uint8_t>(xr) });
@@ -31818,6 +32018,32 @@ retry_emission:
         /* REGCALL 1A: slots the frameless entry already moved into their
          * pins from the argument registers - establish skips their load */
         std::vector<int> regcall_preloaded;
+        std::vector<int> regcall_fpreloaded;          /* REGCALL 4 */
+        /* F4b: the FLOAT cache as of `at_pc` - base_fcache with every
+         * float transition at or before it applied */
+        const auto fpins_at = [&](size_t at_pc) {
+                std::vector<Emitter::CacheEnt> st_f = base_fcache;
+                for (const LsraTrans &tr : lsra_ftr) {
+                    if (tr.pc > at_pc)
+                        break;
+                    if (tr.evict_slot >= 0)
+                        for (size_t ci = 0; ci < st_f.size(); ci++)
+                            if (st_f[ci].reg
+                                    == static_cast<uint8_t>(tr.reg)) {
+                                st_f.erase(st_f.begin()
+                                    + static_cast<long>(ci));
+                                break;
+                            }
+                    if (tr.install_slot >= 0) {
+                        const SlotAddr na = slot_addr(tr.install_slot);
+                        st_f.push_back({ tr.install_slot, na.payload,
+                                         na.type,
+                                         static_cast<uint8_t>(
+                                             tr.reg) });
+                    }
+                }
+                return st_f;
+        };
         const auto establish = [&](size_t at_pc, bool frameless = false) {
             {
                 /* the tracker: entry establishment is machinery - the
@@ -31876,27 +32102,11 @@ retry_emission:
                  * (e.fcache here is the post-all-transitions FINAL
                  * state, the inc-2 lesson; with no float transitions
                  * this degenerates to the old run-constant loop) */
-                std::vector<Emitter::CacheEnt> st_f = base_fcache;
-                for (const LsraTrans &tr : lsra_ftr) {
-                    if (tr.pc > at_pc)
-                        break;
-                    if (tr.evict_slot >= 0)
-                        for (size_t ci = 0; ci < st_f.size(); ci++)
-                            if (st_f[ci].reg
-                                    == static_cast<uint8_t>(tr.reg)) {
-                                st_f.erase(st_f.begin()
-                                    + static_cast<long>(ci));
-                                break;
-                            }
-                    if (tr.install_slot >= 0) {
-                        const SlotAddr na = slot_addr(tr.install_slot);
-                        st_f.push_back({ tr.install_slot, na.payload,
-                                         na.type,
-                                         static_cast<uint8_t>(
-                                             tr.reg) });
-                    }
-                }
-                for (const Emitter::CacheEnt &c : st_f)
+                for (const Emitter::CacheEnt &c : fpins_at(at_pc))
+                    if (!(frameless
+                          && std::find(regcall_fpreloaded.begin(),
+                                       regcall_fpreloaded.end(), c.slot)
+                             != regcall_fpreloaded.end()))
                     e.fload(c.reg, c.payload);    /* C2a float pins */
             }
             for (const Emitter::FLit &fl : e.flits)
@@ -32014,9 +32224,11 @@ retry_emission:
             Emitter::PinMach pm(e);
             const uint32_t rc_mask =
                 jit_regcall_mask(g_cur_caller_desc, chunk);   /* 1A */
+            const uint32_t rcf_mask =
+                jit_regcall_fmask(g_cur_caller_desc, chunk);  /* 4 */
             e.frag_entry(/*load_window=*/false,   /* rdi: unused here */
                          /*keep_rdx=*/chunk.frameless_capbase,
-                         /*keep_mask=*/rc_mask);
+                         /*keep_mask=*/rc_mask, /*fkeep_mask=*/rcf_mask);
             /* the window the caller built: [rbp+32] (the contract) */
             e.lea_base(RBX, RBP, JIT_FRAMELESS_WIN_OFF);
             /* act.vframe = this window (helpers read the frame there);
@@ -32051,6 +32263,83 @@ retry_emission:
              * a pin in rdx while W4 still needs it, demotes to a store.
              */
             regcall_preloaded.clear();
+            regcall_fpreloaded.clear();
+            if (rcf_mask) {
+                /*
+                 * REGCALL 4: the float arguments, the same discipline on
+                 * the float file - a parameter pinned at the entry moves
+                 * into its float pin (establish skips its load), any
+                 * other is stored with the float tag and, unless the W5
+                 * bit says nothing reads them, zero tails. Stores first,
+                 * then the moves in an order no move clobbers a pending
+                 * source; a cycle demotes to a store. Nothing before
+                 * here touched an xmm register (frag_entry's TESTS probe
+                 * saved them; the vframe block is GP-only).
+                 */
+                const std::vector<Emitter::CacheEnt> fp = fpins_at(begin);
+                const FuncDescriptor *self = g_cur_caller_desc;
+                const int np = static_cast<int>(self->params.size());
+                const uint64_t tfree = np >= 64 ? 0
+                    : chunk.frameless_init_free
+                      & ((uint64_t(1) << np) - 1);
+                struct Mv { int slot; uint8_t x; int pin; };
+                std::vector<Mv> mv;
+                for (int i = 0; i < np; i++) {
+                    const int x = jit_regcall_farg_reg(self, chunk, i);
+                    if (x < 0)
+                        continue;
+                    int pin = -1;
+                    for (const Emitter::CacheEnt &c : fp)
+                        if (c.slot == i)
+                            pin = c.reg;
+                    mv.push_back({ i, static_cast<uint8_t>(x), pin });
+                }
+                std::vector<size_t> order;
+                {
+                    std::vector<char> done(mv.size(), 0);
+                    bool progress = true;
+                    while (progress) {
+                        progress = false;
+                        for (size_t a = 0; a < mv.size(); a++) {
+                            if (done[a] || mv[a].pin < 0)
+                                continue;
+                            bool blocks = false;
+                            for (size_t b = 0; b < mv.size(); b++)
+                                if (b != a && !done[b]
+                                        && mv[b].x == mv[a].pin)
+                                    blocks = true;
+                            if (!blocks) {
+                                order.push_back(a);
+                                done[a] = 1;
+                                progress = true;
+                            }
+                        }
+                    }
+                    for (size_t a = 0; a < mv.size(); a++)
+                        if (!done[a])
+                            mv[a].pin = -1;
+                }
+                for (const Mv &m : mv) {
+                    if (m.pin >= 0)
+                        continue;
+                    const int32_t d = m.slot
+                                      * static_cast<int32_t>(sizeof(LValue));
+                    e.fstore(m.x, d);
+                    e.store_type_tag_via(d + 24, L.t_float, R11); /* reg:proto */
+                    if (!((tfree >> m.slot) & 1)) {
+                        e.store_qword_base_imm32(RBX, d + 32, 0);
+                        e.store_qword_base_imm32(RBX, d + 40, 0);
+                    }
+                }
+                for (const size_t a : order) {
+                    if (mv[a].pin != mv[a].x)
+                        e.fmov_rr(static_cast<uint8_t>(mv[a].pin), mv[a].x);
+                    regcall_fpreloaded.push_back(mv[a].slot);
+#ifdef TESTS
+                    g_jit_regcall_fpinned++;      /* emit-time */
+#endif
+                }
+            }
             if (rc_mask) {
                 const std::vector<Emitter::CacheEnt> ep = pins_at(begin);
                 const FuncDescriptor *self = g_cur_caller_desc;
