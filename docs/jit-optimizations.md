@@ -16611,6 +16611,77 @@ that lose the bet, and on 97 - the shape it exists for - the ceiling
 is 0.9% of cycles. Closed (docs/in-flight-tasks.md §3b has the
 numbers).
 
+## #86 - EXPRESSION TEMPS IN REGISTERS (2026-10-01)
+
+**WHAT IT COST.** `a*a + b*b + a*b - a + b` computes `a*a` into a temp
+whose consumer is two ops later. Lever A forwards a value only into the
+NEXT op, so that temp went through memory: a tag store, a payload store
+and a reload - 3 instructions per temp, 6 per call on the REGCALL probe
+`g`. Temps were kept out of the linear scan entirely (`locals_only`,
+#124(a)).
+
+**WHAT CHANGED (lever `tregs`).**
+ - **A second plan.** The locals' plan runs first, exactly as before;
+   if it leaves at least three registers idle, the scan runs again with
+   temps admitted, at a budget TWO below the pool. Filling the whole
+   file drove the emitters' per-op scratch asks into borrow paths
+   almost nothing reached - the first version tripped the register
+   tracker with a NESTED rcx borrow in a loop test at eleven pinned
+   locals plus temps. The locals' plan cannot be displaced: it already
+   fits the smaller budget.
+ - **Admission.** A temp competes only if it is NOT ref-listed (a
+   pinned store would skip the release of the reference its slot
+   held), every op touching it in the run is the specialized int
+   family `IntAddRR .. IntModRI` (pin-aware emitters with no boxed arm
+   borrowing scratch across a helper call - the generic IntBin does),
+   no ReturnV reads it (the arms and #71's write-back store the result
+   SLOT), and its interval spans NO MyLang call. The last rule is a
+   measurement: `fib(n-1) + fib(n-2)`'s partial sum held in r13 across
+   the second call made 09_fib **+5.0% Ir** (a push/pop, an entry load
+   and an exit write-back per call to save one store pair). Its floor
+   is 2 (a def and a use) - the pick's 3 prices an entry load and an
+   exit flush a temp defined in the run does not pay.
+ - **Registers.** Never rax, rcx or rdx - the emitters claim them by ISA
+   (idiv's rdx, the shift count's cl, the accumulator) and reconcile a
+   pin only by conflict-and-retry - and never a callee-saved register:
+   with no call in its interval a temp gains nothing from one but a
+   push/pop per ENTRY (95 read +1.15% Ir until this).
+ - **Install and evict.** A piece is installed at its own definition, so
+   when the op at the install pc writes the temp without reading it the
+   install's load is skipped. A dead temp's evict writes nothing - in
+   main too, unlike REGCALL step 2's locals: nothing reads a dead temp,
+   so no frame-lifetime argument is needed (still no try region).
+
+**A PRE-EXISTING BUG IT EXPOSED.** IntShlRR/IntShrRR with a FORWARDED
+count moved it into rcx without `reg_pin_conflict(RCX)`, which the
+slot-count path two lines below declares. Latent while nothing pinned
+in rcx in such a run; temps in registers pushed a local there and the
+register tracker named the write. Fixed in place.
+
+**MEASURED** (callgrind Ir, scale 3 minus scale 1, `-npc`, `OPT=1
+ASSERTS=0`, against #124(b)'s binary, 38 benches):
+
+    91_call_from_function     -1.22%
+    92_recursion_with_helper  -0.80%
+    97_regs_int_call          -0.81%
+    45_gcd                    -0.55%
+    every other bench: flat to the instruction (09 and 95 included)
+
+The reach is small because lever A already forwards every temp whose
+consumer is the next op - the common case. On the probe `g` both temps
+leave memory (`mov r10, rax` in place of three instructions each).
+
+**NETS.** `jit_temp_regs`: ON, `g_jit_temp_regs` moves and g stores
+fewer temp type words than OFF; both agree with the tree-walker over a
+loop. Watched failing with admission disabled ("no temp was given a
+register"). The register tracker (`JIT-REGTRACK`) caught every unsound
+first cut - a ReturnV writing a pinned temp's slot, an IntBin borrow
+across a helper call, the shift count above, the nested borrow - which
+is why the admission rules read as they do. `tregs` joined
+`corpus_diff --levers`; every matrix, `-rt` in all five modes,
+`norec_enum`, `norec_sweep`, `nested_fuzz` (300) and `driver_checks`
+(debug and release) are green.
+
 ## TWO FINDINGS OF THE REGCALL WORK, FIXED (2026-09-30)
 
 **A `dyn` CALL RAN A NESTED C++ ACTIVATION PER CALL.** The generic
