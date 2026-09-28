@@ -8716,6 +8716,7 @@ static void visit_pc_fields(Instr &in, F f)
     case OpCode::JumpUnlessElemInt:    /* E4 fusion; target2 = the BASE slot */
     case OpCode::IntAddStep:           /* #9 fusion; target2 = COUNTER slot */
     case OpCode::ForStepElemInt:       /* #9 fusion; target2 = COUNTER slot */
+    case OpCode::GuardCalleeV:         /* #97 closure inlining; a = callee */
         f(in.target);
         break;
     default:
@@ -8921,6 +8922,15 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::StoreGlobalV: case OpCode::StoreCaptureV:
         /* target = the GLOBAL/CAPTURE index, NOT a frame slot - no def */
         opnd(in.a()); return true;
+    /* #97 closure inlining: the callee slot is read by all three; the
+     * capture index is an index into the CLOSURE's captures, never a
+     * frame slot (target2 on the load, target on the store) */
+    case OpCode::GuardCalleeV:
+        u(in.a_slot()); return true;
+    case OpCode::LoadCaptureOfV:
+        u(in.a_slot()); d(in.target); return true;
+    case OpCode::StoreCaptureOfV:
+        u(in.a_slot()); u(in.b_slot()); return true;
     case OpCode::CallV: case OpCode::CachedCallV: case OpCode::CallBuiltinV:
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
@@ -10284,7 +10294,9 @@ static void compute_ref_slots_impl(const std::vector<I> &code,
                  * the emitted read disappears, and so does the slot from
                  * the return path's release scan.
                  */
-                if (in.op == OpCode::LoadCaptureV && in.cap_scalar())
+                if ((in.op == OpCode::LoadCaptureV
+                     || in.op == OpCode::LoadCaptureOfV)
+                        && in.cap_scalar())
                     return;
                 /*
                  * #120: a CALL whose RETURN TYPE the inferencer proved
@@ -10984,6 +10996,14 @@ void ChunkVerifier::verify_one(const Instr &in)
         target_pc(in.target);
         reg(in.target2);
         break;
+    case OpCode::GuardCalleeV:
+        /* #97 closure inlining: the else-pc, the callee SLOT (read raw,
+         * never through the lit flag), and the def it is compared to */
+        target_pc(in.target);
+        a_slot_only(in);
+        pool(in.target2, ck.closure_defs.size(), "guarded closure def");
+        defined_ptr(ck.closure_defs[in.target2], "guarded closure def");
+        break;
     case OpCode::JumpUnlessElemInt:     /* E4: `if (!a[i]) jump` */
         target_pc(in.target);
         reg(in.target2);
@@ -11466,6 +11486,24 @@ void ChunkVerifier::verify_one(const Instr &in)
         cslot(in.target);
         a_reg(in);
         aop_opt_dispatchable(in.aop);
+        break;
+    /*
+     * #97 closure inlining: the capture index is into the CLOSURE in the
+     * callee slot, whose def this chunk cannot name statically - so it is
+     * bounded at run time (vm_closure_capture's provenance check), as a
+     * value in a slot must be. What is bounded here is every frame slot.
+     */
+    case OpCode::LoadCaptureOfV:
+        reg(in.target);
+        a_slot_only(in);
+        if (in.target2 < 0)
+            reject("closure capture index");
+        break;
+    case OpCode::StoreCaptureOfV:
+        a_slot_only(in);
+        b_slot_only(in);
+        if (in.target < 0)
+            reject("closure capture index");
         break;
     case OpCode::LoadBuiltinV:
         reg(in.target);
@@ -12094,7 +12132,8 @@ bool bc_inline_op_ok(OpCode op)
  * frame and its I-cache footprint for calls that are not the bottleneck. */
 static const size_t BC_INLINE_MAX_OPS = 24;
 
-bool bc_inline_callee_ok(const Chunk &callee, std::string *why)
+bool bc_inline_callee_ok(const Chunk &callee, std::string *why,
+                         bool captures_ok)
 {
     const auto no = [&](const char *r) { if (why) *why = r; return false; };
 
@@ -12139,12 +12178,22 @@ bool bc_inline_callee_ok(const Chunk &callee, std::string *why)
         }
     }
 
-    for (const Instr &in : callee.code)
+    for (const Instr &in : callee.code) {
+        /* #97 closure inlining: a VALUE site reaches the callee's
+         * captures through the callee slot, so its body may read and
+         * PLAINLY write them; a CallV site cannot (its callee is not in a
+         * slot of the caller), and a compound store's target2 is a pool
+         * index - both stay declined. */
+        if (captures_ok && (in.op == OpCode::LoadCaptureV
+                            || (in.op == OpCode::StoreCaptureV
+                                && in.aop == Op::invalid)))
+            continue;
         if (!bc_inline_op_ok(in.op)) {
             if (why)
                 *why = std::string("op:") + bc_op_name(in.op);
             return false;
         }
+    }
     return true;
 }
 
@@ -12205,6 +12254,9 @@ unsigned long g_bc_inline_caller_frames = 0;
  * shape it believes is spliceable actually was - without it a "all modes
  * agree" table is satisfied by a pass that inlines nothing. */
 unsigned long g_bc_inline_splices = 0;
+/* #97 closure inlining: VALUE sites spliced behind a guard (a subset of
+ * g_bc_inline_splices) */
+unsigned long g_bc_inline_value_splices = 0;
 unsigned long g_ref_slots_move_excluded = 0;    /* #97 (TESTS) */
 unsigned long g_ref_slots_proven_excluded = 0;  /* C3 (TESTS): params the
                                                  * proven-type stamp kept
@@ -12214,6 +12266,15 @@ bool g_bc_inline_enabled = [] {
     const auto e = env_get("MYLANG_BCINLINE");
     return !(e && !e->empty() && (*e)[0] == '0');
                                       /* DEFAULT ON since 2026-08-02 */
+}();
+/* #97 closure inlining: the VALUE-site half of the splice alone
+ * (MYLANG_BCINLINE_VALUE=0), under the whole-splice switch above. The
+ * call-protocol tests hold it off: a closure call is their only reach into
+ * the frameless / capbase / capture-forwarding tiers, and inlining it
+ * would leave those tiers nothing to run. */
+bool g_bc_inline_value_enabled = [] {
+    const auto e = env_get("MYLANG_BCINLINE_VALUE");
+    return !(e && !e->empty() && (*e)[0] == '0');
 }();
 
 /*
@@ -12322,6 +12383,17 @@ static void bc_remap_slots(Instr &in, int base)
         rt();
         in.set_a(int_lit(in.a_lit() + base));
         break;
+    /* #97 closure inlining - a VALUE site's body only (the gate admits
+     * them nowhere else). The capture index is NOT a frame slot: the
+     * load's is `target2`, the store's is `target`; both become an
+     * explicit-closure op right after this remap. The store is PLAIN
+     * (the gate refuses a compound one, whose target2 is a pool index). */
+    case OpCode::LoadCaptureV:
+        rt();
+        break;
+    case OpCode::StoreCaptureV:
+        ra();
+        break;
     case OpCode::IntBin:      case OpCode::FloatBin:
     case OpCode::IntAddRR:    case OpCode::IntAddRI:
     case OpCode::IntSubRR:    case OpCode::IntSubRI:
@@ -12380,12 +12452,14 @@ void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out)
      * inline_ctxs entries (and different ops), so asking it later would
      * answer about a body no caller is going to inline anyway. */
     s.eligible = bc_inline_callee_ok(ck, nullptr) && ck.inline_ctxs.empty();
+    s.value_eligible = bc_inline_callee_ok(ck, nullptr, true)
+                       && ck.inline_ctxs.empty();
     out.emplace(&ck, std::move(s));
 }
 
 bool bc_inline_chunk(Chunk &ck,
                      const std::vector<const FuncDescriptor *> &slot_desc,
-                     const BcInlineSnapshots &snaps)
+                     const BcInlineSnapshots &snaps, bool value_only)
 {
     if (!g_bc_inline_enabled)
         return false;
@@ -12408,20 +12482,47 @@ bool bc_inline_chunk(Chunk &ck,
         std::vector<ArgLoc> arg_loc_pool;
         std::vector<int32_t> ref_slots;
         Chunk::InlineFrame frame;
+        /* #97 closure inlining: a VALUE site - the inline cache. The
+         * guard compares `callee_slot` against closure_defs[def]; each
+         * typed parameter binds through CoerceNumV (`coerce[i]` = 1 int,
+         * 2 float, 0 a plain move), carrying its argument's caret. */
+        bool value = false;
+        int callee_slot = -1;
+        int32_t def = -1;
+        std::vector<uint8_t> coerce;
     };
     std::vector<Site> sites;
     int next_base = ck.slot_count + ck.n_temps;
 
     for (size_t pc = 0; pc < ck.code.size(); pc++) {
         const Instr &in = ck.code[pc];
-        if (in.op != OpCode::CallV)
+        const bool is_value = in.op == OpCode::CallValueV;
+        if (in.op != OpCode::CallV && !is_value)
             continue;
-        const int g = in.target2;
-        const FuncDescriptor *d =
-            (g >= 0 && static_cast<size_t>(g) < slot_desc.size())
-                ? slot_desc[g] : nullptr;
-        if (!d || !d->vm_chunk || !d->fast_bind)
-            continue;                   /* typed params need coercion */
+        if (value_only && !is_value)
+            continue;                   /* main: value sites only */
+        if (is_value && !g_bc_inline_value_enabled)
+            continue;
+        const FuncDescriptor *d = nullptr;
+        int32_t vdef = -1;
+        if (is_value) {
+            /* #97 closure inlining: the callee-set analysis named ONE
+             * function for this site (a two-way site answers -1 - a
+             * later increment). The guard, not the analysis, is what the
+             * inlined body's soundness rests on. */
+            vdef = ck.value_callee_at(pc);
+            if (vdef < 0 || static_cast<size_t>(vdef) >= ck.closure_defs.size())
+                continue;
+            d = ck.closure_defs[static_cast<size_t>(vdef)];
+            if (!d || !d->vm_chunk)
+                continue;
+        } else {
+            const int g = in.target2;
+            d = (g >= 0 && static_cast<size_t>(g) < slot_desc.size())
+                    ? slot_desc[g] : nullptr;
+            if (!d || !d->vm_chunk || !d->fast_bind)
+                continue;               /* typed params need coercion */
+        }
         const Chunk *cc = static_cast<const Chunk *>(d->vm_chunk);
         /* the PRE-PASS snapshot, never the live chunk: by now an earlier
          * iteration may have spliced this callee, and which one that is
@@ -12430,7 +12531,7 @@ bool bc_inline_chunk(Chunk &ck,
         if (snap_it == snaps.end())
             continue;                   /* not part of this pass (main) */
         const BcInlineSnapshot &snap = snap_it->second;
-        if (!snap.eligible)
+        if (is_value ? !snap.value_eligible : !snap.eligible)
             continue;                   /* gate ran on the pristine body,
                                          * incl. "no inline_ctxs" - the
                                          * callee's own chains would need
@@ -12448,6 +12549,14 @@ bool bc_inline_chunk(Chunk &ck,
             continue;
 
         Site s;
+        if (is_value) {
+            s.value = true;
+            s.callee_slot = in.target2;
+            s.def = vdef;
+            for (const auto &p : d->params)
+                s.coerce.push_back(p.decl_type == DeclType::i ? 1
+                                   : p.decl_type == DeclType::f ? 2 : 0);
+        }
         s.pc = pc;
         s.base = next_base;
         s.nargs = nargs;
@@ -12547,6 +12656,45 @@ bool bc_inline_chunk(Chunk &ck,
             if (e.pc == pc) out.push_back(e.def);   /* #97 E3: both */
     };
 
+    /* A CALLER op carried to its new pc with every pc-keyed side table
+     * it owns. Also how a VALUE site keeps its original call - the inline
+     * cache's miss arm - so that arm's carets, backtrace chain and
+     * value-callee entry are exactly an untouched op's. */
+    const auto emit_caller_op = [&](size_t pc) {
+        Loc s, e;
+        if (caller_loc(pc, s, e))
+            nlocs.push_back({ static_cast<uint32_t>(nc.size()), s, e });
+        if (caller_base_loc(pc, s, e))
+            nbase.push_back({ static_cast<uint32_t>(nc.size()), s, e });
+        if (caller_op_loc(pc, s, e))
+            nop.push_back({ static_cast<uint32_t>(nc.size()), s, e });
+        {
+            uint32_t afirst, an;
+            if (caller_arg_locs(pc, afirst, an))
+                nargl.push_back({ static_cast<uint32_t>(nc.size()),
+                                  afirst, an });
+        }
+        {
+            std::vector<int32_t> vcds;
+            caller_value_callees(pc, vcds);
+            for (const int32_t vcd : vcds)
+                nvc.push_back({ static_cast<uint32_t>(nc.size()), vcd });
+        }
+        const int32_t f = ck.inline_frame_at(pc);
+        if (f >= 0) {
+#ifdef TESTS
+            g_bc_inline_caller_frames++;
+#endif
+            /* a CALLER op that is itself inlined-at code keeps its frame
+             * index: the caller's own chains must survive the splice, or
+             * a throw from AST-inlined code in a spliced body renders the
+             * wrong virtual frames */
+            nctx.push_back({ static_cast<uint32_t>(nc.size()), f });
+        }
+        nc.push_back(ck.code[pc]);
+        from_caller.push_back(1);
+    };
+
     size_t si = 0;
     for (size_t pc = 0; pc < ck.code.size(); pc++) {
         old2new[pc] = static_cast<uint32_t>(nc.size());
@@ -12555,14 +12703,51 @@ bool bc_inline_chunk(Chunk &ck,
             const int32_t fidx = static_cast<int32_t>(ck.inline_frames.size());
             ck.inline_frames.push_back(S.frame);
 
+            /* #97 closure inlining: a VALUE site opens with the inline
+             * cache's guard; its else-pc - the original call, placed
+             * after the body - is patched once the body's size is known */
+            size_t gidx = 0;
+            if (S.value) {
+                Instr gd;
+                gd.op = OpCode::GuardCalleeV;
+                Operand co;
+                co.slot = S.callee_slot;
+                gd.set_a(co);
+                gd.target2 = S.def;
+                gidx = nc.size();
+                nc.push_back(gd);
+                from_caller.push_back(0);
+            }
             /* the arg bind: the interpreted call's fast_bind, as MoveVs
              * (frame slots have no container back-pointer, so put() is
-             * rebind()) */
+             * rebind()) - or, for a TYPED parameter of a value site, the
+             * coercion bind_param performs, as CoerceNumV: the identity
+             * for an argument of the declared type, a widening for int
+             * into float, a TypeErrorEx for a dyn value that fits
+             * neither - carrying that ARGUMENT's caret and the CALLER's
+             * inlined-at chain, since a bind error is the caller's */
             for (int i = 0; i < S.nargs; i++) {
+                const uint8_t co = S.value ? S.coerce[i] : 0;
                 Instr mv;
-                mv.op = OpCode::MoveV;
+                mv.op = co ? OpCode::CoerceNumV : OpCode::MoveV;
                 mv.target = S.base + i;
-                mv.target2 = S.argbase + i;
+                if (co) {
+                    Operand ao;
+                    ao.slot = S.argbase + i;
+                    mv.set_a(ao);
+                    mv.target2 = co == 2 ? 1 : 0;
+                    Loc as, ae;
+                    if (ck.arg_loc_at(S.pc, static_cast<size_t>(i), as, ae)
+                            || caller_loc(S.pc, as, ae))
+                        nlocs.push_back({ static_cast<uint32_t>(nc.size()),
+                                          as, ae });
+                    const int32_t cf = ck.inline_frame_at(S.pc);
+                    if (cf >= 0)
+                        nctx.push_back({ static_cast<uint32_t>(nc.size()),
+                                         cf });
+                } else {
+                    mv.target2 = S.argbase + i;
+                }
                 nc.push_back(mv);
                 from_caller.push_back(0);
             }
@@ -12593,7 +12778,10 @@ bool bc_inline_chunk(Chunk &ck,
                     emitted++;
             }
             const size_t body_base = nc.size();
-            const size_t join = body_base + emitted;
+            const size_t body_end = body_base + emitted;
+            /* a value site's body is followed by `Jump join` and the
+             * original call, so its returns land past both */
+            const size_t join = body_end + (S.value ? 2 : 0);
             /* pass 2: emit */
             for (size_t j = 0; j < nb; j++) {
                 Loc bs, be;
@@ -12639,6 +12827,21 @@ bool bc_inline_chunk(Chunk &ck,
                 }
                 Instr bi = S.body[j];
                 bc_remap_slots(bi, S.base);
+                /* #97 closure inlining: the body now runs in the CALLER's
+                 * frame, whose ctx.captures is the caller's own - so each
+                 * capture op reaches the closure through the callee slot
+                 * the guard just checked (a CALLER slot: not re-based) */
+                if (bi.op == OpCode::LoadCaptureV) {
+                    Operand co;
+                    co.slot = S.callee_slot;
+                    bi.op = OpCode::LoadCaptureOfV;
+                    bi.set_a(co);
+                } else if (bi.op == OpCode::StoreCaptureV) {
+                    Operand co;
+                    co.slot = S.callee_slot;
+                    bi.op = OpCode::StoreCaptureOfV;
+                    bi.set_b(co);
+                }
                 visit_pc_fields(bi, [&](int &t) {
                     /*
                      * The gate's `branch-past-end` rejection means every
@@ -12677,41 +12880,27 @@ bool bc_inline_chunk(Chunk &ck,
                 nc.push_back(bi);
                 from_caller.push_back(0);
             }
-            ML_CHECK(nc.size() == join);
+            ML_CHECK(nc.size() == body_end);
+            if (S.value) {
+                /* the hit path leaves over the miss arm; the guard's
+                 * else-pc IS the miss arm - the original call, carried
+                 * with its own side tables */
+                Instr jm;
+                jm.op = OpCode::Jump;
+                jm.target = static_cast<int>(join);
+                nc.push_back(jm);
+                from_caller.push_back(0);
+                nc[gidx].target = static_cast<int>(nc.size());
+                emit_caller_op(pc);
+                from_caller.back() = 0;     /* no pc fields to remap */
+                ML_CHECK(nc.size() == join);
+#ifdef TESTS
+                g_bc_inline_value_splices++;
+#endif
+            }
             continue;
         }
-        Loc s, e;
-        if (caller_loc(pc, s, e))
-            nlocs.push_back({ static_cast<uint32_t>(nc.size()), s, e });
-        if (caller_base_loc(pc, s, e))
-            nbase.push_back({ static_cast<uint32_t>(nc.size()), s, e });
-        if (caller_op_loc(pc, s, e))
-            nop.push_back({ static_cast<uint32_t>(nc.size()), s, e });
-        {
-            uint32_t afirst, an;
-            if (caller_arg_locs(pc, afirst, an))
-                nargl.push_back({ static_cast<uint32_t>(nc.size()),
-                                  afirst, an });
-        }
-        {
-            std::vector<int32_t> vcds;
-            caller_value_callees(pc, vcds);
-            for (const int32_t vcd : vcds)
-                nvc.push_back({ static_cast<uint32_t>(nc.size()), vcd });
-        }
-        const int32_t f = ck.inline_frame_at(pc);
-        if (f >= 0) {
-#ifdef TESTS
-            g_bc_inline_caller_frames++;
-#endif
-            /* a CALLER op that is itself inlined-at code keeps its frame
-             * index: the caller's own chains must survive the splice, or
-             * a throw from AST-inlined code in a spliced body renders the
-             * wrong virtual frames */
-            nctx.push_back({ static_cast<uint32_t>(nc.size()), f });
-        }
-        nc.push_back(ck.code[pc]);
-        from_caller.push_back(1);
+        emit_caller_op(pc);
     }
     old2new[ck.code.size()] = static_cast<uint32_t>(nc.size());
 

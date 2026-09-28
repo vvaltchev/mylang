@@ -1308,7 +1308,11 @@ collision). Three nets now:
 - **`MYLANG_JIT_COLD=tier[,...]`** - force a guarded tier's DECLINE arm
   so a path normally reached only by a runtime coincidence becomes the
   ONLY path (the RECYCLE=1 philosophy for the JIT). `refstore` forces
-  the ref-listed scalar store's release-helper arm. On its FIRST run it
+  the ref-listed scalar store's release-helper arm; `guard` (#97
+  closure inlining) makes every GuardCalleeV MISS, running the inline
+  cache's miss arm - the original call - which our own compilation
+  never reaches (the analysis named the one callee), and which a wrong
+  or tampered image would. On its FIRST run `refstore`
   found a real latent bug in 0.7s: `store_dst`'s cold arm gated its RAX
   reload on `keep_rax`, but `ForLoopStep`/`IntAddStep` store the
   counter and then `cmp rax, <bound>` - so a ref-listed counter taking
@@ -1883,7 +1887,18 @@ Running scripts:
                                  # -bi forces it on, MYLANG_BCINLINE=0/1.
                                  # The same-binary A/B lever - the
                                  # un-inlined bytecode is a splice's only
-                                 # oracle (plans/bytecode-inliner.md)
+                                 # oracle (plans/bytecode-inliner.md).
+                                 # #97: it also splices a VALUE call
+                                 # whose callee the analysis names, main
+                                 # included, behind a GuardCalleeV - the
+                                 # inline cache (plans/closure-inlining
+                                 # .md); MYLANG_BCINLINE_VALUE=0 turns
+                                 # that half off alone. ⛔ A call-
+                                 # PROTOCOL test (frameless, capbase,
+                                 # capture forwarding) reaches its tier
+                                 # through a closure call the splice now
+                                 # inlines: it holds ValueSpliceOff
+                                 # (tests.cpp) or it tests nothing
 ./build/mylang -vdj FILE         # -vd + the native x86-64 disassembly of
                                  # each JIT fragment, interleaved under its
                                  # `enter.nat` line with `; vm pc N` markers

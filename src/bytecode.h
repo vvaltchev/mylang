@@ -1190,6 +1190,43 @@ enum class OpCode : unsigned char {
     ArrEpochCheck,
 
     /*
+     * #97 CLOSURE INLINING (plans/closure-inlining.md) - the inline cache
+     * the bytecode splice builds at a CallValueV site whose callee set the
+     * callee-set analysis names as ONE function:
+     *
+     *     GuardCalleeV     fn, closure_defs[D] -> else Lcall
+     *     <D's body, re-based; its capture ops read THROUGH fn>
+     *     Jump             Ljoin
+     *   Lcall:
+     *     CallValueV       (the original op)
+     *   Ljoin:
+     *
+     * GuardCalleeV     `a` = the callee SLOT (always a slot), `target2` =
+     *                  a closure_defs index, `target` = the else-pc. Falls
+     *                  through iff the slot holds a FuncObject whose
+     *                  `func` IS closure_defs[target2]; otherwise jumps.
+     *                  Reads, never writes, never throws. The guard is
+     *                  kept even though the analysis proves it true: on a
+     *                  loaded image the callee set is INPUT, and the miss
+     *                  arm is the original call, so a wrong table costs
+     *                  speed, never an answer.
+     * LoadCaptureOfV   LoadCaptureV with an EXPLICIT closure: `target` =
+     *                  the dst slot, `target2` = the capture index, `a` =
+     *                  the slot holding the FuncObject (always a slot;
+     *                  the guard above proved it one, of the right def).
+     * StoreCaptureOfV  a PLAIN StoreCaptureV with an explicit closure:
+     *                  `a` = the value slot, `target` = the capture index,
+     *                  `b` = the FuncObject's slot. No compound form (the
+     *                  splice declines a compound capture store).
+     *
+     * Only the splice emits these; codegen proper never does. `cap_scalar`
+     * (0x40) carries over from the op each one replaces.
+     */
+    GuardCalleeV,
+    LoadCaptureOfV,
+    StoreCaptureOfV,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1240,7 +1277,7 @@ enum class OpCode : unsigned char {
     X(LoadMemberInt) X(LoadMemberFloat) X(IntAddModRI) X(JumpUnlessElemInt) \
     X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt) X(EnterNative) \
     X(ExitBlock) X(LoadElem2Int) X(LoadElem2Float) X(ArrEpochMark) \
-    X(ArrEpochCheck)
+    X(ArrEpochCheck) X(GuardCalleeV) X(LoadCaptureOfV) X(StoreCaptureOfV)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin

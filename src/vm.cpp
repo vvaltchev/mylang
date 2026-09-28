@@ -312,6 +312,28 @@ vm_store_base(EvalContext &ctx, int_type kind, int slot,
  * the Expr14 op vm_subscript_store expects (Op::assign / addeq / …) - the
  * StoreElem* universal fallback boxes its operands and dispatches through the
  * shared store, which uses the Expr14 op convention (like DictStore). */
+/*
+ * #97 closure inlining: capture `idx` of the closure held in frame slot
+ * `slot` - LoadCaptureOfV / StoreCaptureOfV. In bytecode WE compiled the
+ * dominating GuardCalleeV proved the slot holds a FuncObject of the def
+ * the index was taken from, so both checks are true by construction; on
+ * a loaded image neither the dominance nor the index is ours, and a miss
+ * must be a clean refusal, never a wild read (#137).
+ */
+static LValue &vm_closure_capture(EvalContext &ctx, int_type slot,
+                                  int_type idx)
+{
+    const EvalValue &v = ctx.frame->at(slot).get();
+    const bool isfo = v.is<intrusive_ptr<FuncObject>>();
+    ML_UNTRUSTED_CHECK(isfo, "a closure capture op's slot holds no function");
+    ML_VM_CHECK(ml_untrusted_bytecode() || isfo);
+    FuncObject &fo = *v.get_ref<intrusive_ptr<FuncObject>>().get();
+    ML_UNTRUSTED_CHECK(idx >= 0
+                       && static_cast<size_t>(idx) < fo.capture_slots.size(),
+                       "a closure capture index is out of range");
+    return fo.capture_slots[static_cast<size_t>(idx)];
+}
+
 static inline Op vm_base_to_expr14_op(Op base)
 {
     switch (base) {
@@ -2544,7 +2566,7 @@ vm_compile(const Construct *root_c, bool jit)
      * global slot -> descriptor map to bake its callees (#97 step 4), and
      * it must come after every body so their `native_leaf` flags and
      * fragments exist (#55 STEP 2). */
-    vm_precompile_all(root, jit, jit ? &prog.root : nullptr);
+    vm_precompile_all(root, jit, &prog.root);
 
     /* Root-context data the run needs, copied OUT of the root Block. */
     prog.root_slot_count = root->slot_count;
@@ -2820,6 +2842,13 @@ vm_precompile_all(const Block *root, bool jit, Chunk *main_chunk)
         bc_inline_snapshot(kv.second, bc_snaps);
     for (auto &kv : g_func_chunks)
         bc_inline_chunk(kv.second, slot_desc, bc_snaps);
+    /* #97 closure inlining: MAIN too, where every hot value call of the
+     * call cluster lives - VALUE sites only, so main's CallV sites keep
+     * the bytecode they always had (admitting those is its own step).
+     * Unconditional: a `.myv` writer (jit=false) stores this form. */
+    if (main_chunk)
+        bc_inline_chunk(*main_chunk, slot_desc, bc_snaps,
+                        /*value_only=*/true);
 
     /* Pass B: the native tier, through the ONE driver (vm.h) - the
      * frameless pre-pass over main, every body with its own JitCtx, then
@@ -6202,6 +6231,42 @@ extern "C" int jit_coerce_num(int_type dst, int_type src_slot,
     try {
         ctx->frame->at(dst).put(vm_coerce_decl_num(
             ctx->frame->at(src_slot).get(), is_float != 0));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* #97 closure inlining: the explicit-closure capture ops' helper arm -
+ * every shape the emitted inline copy does not take (a boxed capture, a
+ * reference-listed dst, any loaded image). vm_closure_capture is the
+ * interpreter's own accessor, so the two tiers cannot disagree; its
+ * provenance refusal (an image's corrupt operand) conveys like any
+ * RuntimeException - the op is exc-stamped, never noexcept-terminated. */
+extern "C" int jit_load_capture_of(int_type dst, int_type fn_slot,
+                                   int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadCaptureOfV);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        ctx->frame->at(dst).put(
+            vm_closure_capture(*ctx, fn_slot, idx).get());
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_store_capture_of(int_type fn_slot, int_type idx,
+                                    int_type src) noexcept
+{
+    ML_JIT_OP_RAN(StoreCaptureOfV);
+    EvalContext *ctx = g_current_ctx;
+    try {
+        vm_closure_capture(*ctx, fn_slot, idx).put(
+            RValue(ctx->frame->at(src).get()));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -13346,6 +13411,39 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 }
                 lv.put(std::move(nv));
             }
+            pc++;
+        }
+        VM_NEXT;
+
+        /*
+         * #97 closure inlining (plans/closure-inlining.md): the guard and
+         * the explicit-closure capture ops a splice at a value-call site
+         * emits. The guard falls through iff `a` holds a FuncObject of
+         * closure_defs[target2]; the capture ops then reach that object's
+         * captures through the same slot - the body's own frame is the
+         * CALLER's, whose ctx.captures is not the closure's.
+         */
+        VM_CASE(GuardCalleeV): {
+            const EvalValue &cv = ctx.frame->at(in->a_slot()).get();
+            if (cv.is<intrusive_ptr<FuncObject>>()
+                    && cv.get_ref<intrusive_ptr<FuncObject>>()->func
+                           == chunk->closure_defs[in->target2])
+                pc++;
+            else
+                pc = static_cast<size_t>(in->target);
+        }
+        VM_NEXT;
+
+        VM_CASE(LoadCaptureOfV): {
+            ctx.frame->at(in->target).put(
+                vm_closure_capture(ctx, in->a_slot(), in->target2).get());
+            pc++;
+        }
+        VM_NEXT;
+
+        VM_CASE(StoreCaptureOfV): {
+            vm_closure_capture(ctx, in->b_slot(), in->target).put(
+                RValue(ctx.frame->at(in->a_slot()).get()));
             pc++;
         }
         VM_NEXT;

@@ -15203,3 +15203,109 @@ arms publish; three runs at scale 3 inside the noise).
 **Not done, recorded:** a raise arm's helper call is counted hot
 though its continuation is always the exception exit - counting those
 offpath would make a leaf with a division or a bounds check quiet too.
+
+## #97 CLOSURE INLINING, INCREMENT 1 - A GUARDED SPLICE AT MONO VALUE
+## SITES (2026-09-27)
+
+Design: `plans/closure-inlining.md`. R5/R6 measured flat, so the
+protocol had stopped paying; the next factor was not making the call.
+Every hot call in the cluster is a `call.val` in MAIN whose callee set
+(#116, `Chunk::value_callees`) names ONE closure, and the bytecode
+splice reached none of them (CallV only; main never a splice caller;
+capture ops off the whitelist; typed parameters declined).
+
+**The shape** (`bc_inline_chunk`, value sites):
+
+        guard.callee  fn, closure_defs[D]  else Lcall
+        <binds: MoveV, or CoerceNumV for a widening typed param>
+        <D's body, slots re-based; cap[i] -> cap[i] OF fn;
+         each ReturnV -> MoveV dst + Jump Ljoin>
+        Jump Ljoin
+    Lcall:
+        call.val (the original op, unchanged)
+    Ljoin:
+
+Three new opcodes (myv v24), each classified in the six #98 census
+columns, `visit_use_def`, `visit_pc_fields`, `verify_chunk` and the
+disassembler: `GuardCalleeV` (hit iff the slot holds a `t_func` whose
+descriptor is `closure_defs[target2]`), and `LoadCaptureOfV` /
+`StoreCaptureOfV` - the capture ops with the closure named EXPLICITLY
+by a slot. The rewrite is required, not tidy: the inlined body runs in
+the CALLER's frame, whose `ctx->captures` is the caller's set (a
+sabotage leaving the ops unrewritten read main's - none - and failed).
+The explicit ops share the LoadCaptureV/StoreCaptureV emitters, lever
+A's producer/consumer rows included; their base is
+`[slot].payload -> FuncObject::capture_slots` (`emit_capof_base`). The
+raw copy (`capof_fast`) needs `cap_scalar` AND trusted bytecode; any
+other case is a STATUS helper (`jit_load_capture_of` /
+`jit_store_capture_of`) that checks the slot holds a closure with that
+many captures - on an image the operands are input.
+
+**The guard stays, on purpose.** In our own compilation it is always
+true; it is what makes the splice sound on an IMAGE, where the callee
+slot's content is only as trustworthy as the bytecode that wrote it.
+The dangerous tamper is not a wrong def in the guard (that only
+misses) but a different closure in the slot - the guard then misses and
+the call runs, and `myv_closure_guard_tamper` swaps two sites' closures
+in a written image and requires the output of the unspliced image. Its
+miss arm is the original op, so every caret and backtrace there is the
+un-inlined one by construction. `MYLANG_JIT_COLD=guard` forces every
+emitted guard to miss (the only way to execute that arm in a program
+we compiled); `corpus_diff --cold` runs it.
+
+**The widening bind is the one place emitted code grew.** 78's
+`scale_it(i)` binds an int into `float x`; `bind_param`'s coercion is a
+`CoerceNumV`, which the JIT emitted as a helper call - and 78 read 5x
+SLOWER until it got an inline arm (exact tag -> copy; int -> float ->
+`cvtsi2sd`; anything else, or a ref-listed dst, the helper). Counted by
+`g_jit_coerce_fast`.
+
+**Main becomes a splice caller for VALUE sites only** (after the
+function splices, so a spliced function body is not re-spliced into
+main - one level, as before). Admitting main's `CallV` sites is a
+separate step: it would change the bytecode of every program with a
+top-level call.
+
+**Tests.** `closure_inline_parity` (six shapes, the tree-walker vs
+four VM configurations, stdout + exception + caret + backtrace; it
+fails vacuous unless value sites were spliced AND emitted guards fell
+through - both counters bumped only by emitted code - and the raw
+capture copy ran), `tests/functional/42_closure_inline.my` (its `try`
+sits in its own function: a try region in main declines every site,
+which the first version of the file did - vacuously), the image tamper
+above, and `ValueSpliceOff` in the six `-rt` tests that pin the CALL
+protocol's own emitted forms (they now need a call to exist). Watched
+failing: S1 the capture rewrite dropped, S2 a guard that always hits
+(caught by the tamper test only once it swapped CLOSURES - its first
+version swapped the guard's def, which cannot make a guard wrongly
+hit), S3 the callee slot re-based with the body.
+
+**driver_checks, two shapes updated.** The W3/W4 `-vdj` site forms
+read 78's `add(i)` frameless site, which now survives only as a miss
+arm: they run with `MYLANG_BCINLINE_VALUE=0`. The overflow check's
+vacuity threshold dropped 500 -> 200: the splice grows `viacl`'s frame
+5 -> 8 slots, and cap 3001 then holds ~370 levels (depth is
+unspecified, RULE 2).
+
+**Found on the way: a Makefile dependency hole.** A `.d` file named
+its target with the BUILD_DIR spelling it was built under, so a lane
+built once with an ABSOLUTE path (the battery) and once relative lost
+its header dependencies: `serialize.o` kept the v23 opcode count and
+refused every v24 image. `-MT` now names both spellings.
+
+Measured (pinned P-core, `-npc`, `OPT=1 ASSERTS=0`, scale-3 minus
+scale-1, one run each, vs R4):
+
+    bench  cycles    instructions   per iteration
+    11     -28.6%    -29.8%         57 -> 40 instr
+    78      -8.5%    -13.8%         130 -> 112 instr, 17.4 -> 15.9 cyc
+    63     -10.5%     -6.9%
+    76/91/92/97      flat           (no mono value site reached)
+
+**What is left per inlined call, recorded:** the argument staging
+`MoveV` (with its reference check) and the result `MoveV` into dst -
+binding from the original sources and retargeting the result would
+remove both; a `CoerceNumV` reads through memory even when its source
+is pinned. Increments 2-5 of the plan (two-way sites for 76,
+`MakeClosureV` in a spliced body, local guard elision, scalar
+replacement of a non-escaping closure) are untouched.

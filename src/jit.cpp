@@ -184,6 +184,13 @@ unsigned long g_jit_call_dead_model = 0;
 unsigned long g_jit_capbase_cs = 0;    /* W6: runs holding the capture
                                         * base in a CALLER-saved
                                         * register (no entry push) */
+/* #97 closure inlining (TESTS; bumped by EMITTED code): inline-cache
+ * guards that fell through into the inlined body, and explicit-closure
+ * capture accesses served by the inline copy rather than the helper */
+unsigned long g_jit_guard_hits = 0;
+unsigned long g_jit_capof_fast = 0;
+/* the CoerceNumV inline arm (exact copy / int->float widen), per run */
+unsigned long g_jit_coerce_fast = 0;
 unsigned long g_jit_capbase = 0;       /* #112: runs entering with the
                                         * capture base pinned */
 unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
@@ -484,8 +491,15 @@ bool jit_norec_on()
  * register bugs found on 2026-08-04. Forced, every scalar store
  * exercises the helper call and its register discipline.
  */
-enum JitColdTier { JC_REFSTORE, JC_COUNT };
-static const char *const jit_cold_names[JC_COUNT] = { "refstore" };
+/*
+ * `guard` (#97 closure inlining): every GuardCalleeV MISSES - an
+ * unconditional jump to the original call. In our own compilation the
+ * guard can only hit (the analysis named the one callee), so without
+ * this the miss arm - the call op carried past the inlined body, with
+ * its side tables - runs nowhere but on a tampered image.
+ */
+enum JitColdTier { JC_REFSTORE, JC_GUARD, JC_COUNT };
+static const char *const jit_cold_names[JC_COUNT] = { "refstore", "guard" };
 static unsigned jit_cold_mask()
 {
     static const unsigned m =
@@ -7079,6 +7093,14 @@ static bool jit_op_eligible(const Instr &in)
      * closure creation, always defined, so never throws -> op_fully_native). */
     case OpCode::LoadCaptureV:
         return true;
+    /* #97 closure inlining: the inline cache's guard (an inline type-tag
+     * and descriptor compare, see emit_branch) and the explicit-closure
+     * capture ops (inline for a proven-scalar capture in bytecode we
+     * compiled, else a status helper - see emit_op). */
+    case OpCode::GuardCalleeV:
+    case OpCode::LoadCaptureOfV:
+    case OpCode::StoreCaptureOfV:
+        return true;
     /* model-flip (nativize-ops): a global store `g = expr` (PLAIN, aop invalid,
      * via jit_store_global - never throws) OR `g OP=`/`g++` (COMPOUND, via
      * jit_store_global_compound - reads the rhs from the boxed_ops pool, runs
@@ -13381,6 +13403,7 @@ bool jit_fwd_op_is_producer(OpCode op)
      * capture copies 24 payload bytes and a reference is not a value
      * anything downstream can consume from a register.
      */
+    case OpCode::LoadCaptureOfV:  /* #97: the explicit-closure twin */
     case OpCode::LoadCaptureV:
         return true;
     default:
@@ -13450,7 +13473,13 @@ static bool jit_fwd_producer(const Instr &in, int &dst)
      * clause that keeps the producer's contract - "the value is a
      * single register" - true by construction rather than by the
      * consumer list's current membership. */
-    if (in.op == OpCode::LoadCaptureV && !in.cap_scalar())
+    if ((in.op == OpCode::LoadCaptureV || in.op == OpCode::LoadCaptureOfV)
+            && !in.cap_scalar())
+        return false;
+    /* #97: the explicit-closure read's copy exists only in our own
+     * bytecode (capof_fast) - an image's goes through the helper, whose
+     * status clobbers the bus */
+    if (in.op == OpCode::LoadCaptureOfV && ml_untrusted_bytecode())
         return false;
     dst = in.target;
     return true;
@@ -13572,6 +13601,7 @@ unsigned jit_fwd_op_consumer_slots(OpCode op)
      * write rather than by refusing the pair.
      */
     case OpCode::StoreCaptureV:
+    case OpCode::StoreCaptureOfV:   /* #97: `a` only - `b` is the closure */
         return JIT_FWD_A;
     default:
         return 0;
@@ -13598,7 +13628,7 @@ static bool jit_fwd_consumer_reads_type(OpCode op)
      * "a consumer that reads the temp's TYPE word is a live read the
      * liveness fixpoint cannot see" - which no other line does.
      */
-    return op == OpCode::StoreCaptureV;
+    return op == OpCode::StoreCaptureV || op == OpCode::StoreCaptureOfV;
 }
 
 static bool jit_fwd_consumer(const Instr &nx, int t)
@@ -13621,6 +13651,11 @@ static bool jit_fwd_consumer(const Instr &nx, int t)
      */
     if (nx.op == OpCode::StoreCaptureV
             && (!nx.cap_scalar() || nx.aop != Op::invalid))
+        return false;
+    /* #97: likewise, and the explicit-closure store's copy exists only
+     * in our own bytecode (capof_fast) */
+    if (nx.op == OpCode::StoreCaptureOfV
+            && (!nx.cap_scalar() || ml_untrusted_bytecode()))
         return false;
     /* the per-op aliasing rules - "any OTHER field naming the temp reads
      * the SLOT, which skip_write may have left stale" */
@@ -14223,6 +14258,9 @@ void jit_stats_report()
         { "cold_copy",        &g_jit_cold_copy },
         { "hoist2",           &g_jit_hoist2 },
         { "capbase",          &g_jit_capbase },
+        { "guard_hits",       &g_jit_guard_hits },   /* #97 closure inl */
+        { "capof_fast",       &g_jit_capof_fast },
+        { "coerce_fast",      &g_jit_coerce_fast },
         /* W6: how many of those hold it CALLER-saved, which is the
          * emit-time reach of the entry push/pop elision (compile-time,
          * so it counts RUNS, not calls - `capbase` above is bumped by
@@ -15996,6 +16034,18 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
     case OpCode::JumpIfNotNoneV:
         /* reads the lhs slot's type tag from memory (a boxed value). */
         v.bad(in.a_slot());
+        break;
+    /* #97 closure inlining: every slot these name is read or written
+     * through MEMORY - the callee slot holds a reference, the capture
+     * value moves as a slot copy (the LoadCaptureV / StoreCaptureV rule) */
+    case OpCode::GuardCalleeV:
+        v.bad(in.a_slot());
+        break;
+    case OpCode::LoadCaptureOfV:
+        v.bad(in.a_slot()); v.bad(in.target);
+        break;
+    case OpCode::StoreCaptureOfV:
+        v.bad(in.a_slot()); v.bad(in.b_slot());
         break;
     case OpCode::DeclConstV:
         /* the helper reads src (a) + writes the dst LValue from memory;
@@ -18718,6 +18768,8 @@ static ElemRoleSig op_elem_role_sig(OpCode op)
     case OpCode::LoadCaptureV:
     case OpCode::StoreCaptureV:
     case OpCode::StoreGlobalV:
+    case OpCode::LoadCaptureOfV:    /* #97: the same one base register */
+    case OpCode::StoreCaptureOfV:
         return ElemRoleSig::chain;
     default:
         return ElemRoleSig::none;
@@ -20236,6 +20288,64 @@ static void emit_dict_store(Emitter &e, const Chunk &ck, const Instr &in,
 /* fwd (defined with the run-building code below): the #55 native-call gate
  * the CallV emit uses to pick the direct-call vs the M5 sync form. */
 static bool callv_native_ok(const Instr &in, const JitCtx *jc);
+
+
+/*
+ * #97 closure inlining: the explicit-closure capture ops' HELPER arm -
+ * every shape the emitted copy in the LoadCaptureV / StoreCaptureV cases
+ * does not take: a boxed capture, a reference-listed dst, and ANY loaded
+ * image. The copy relies on the dominating GuardCalleeV (the slot holds
+ * a FuncObject of the def the capture index was taken from), which is
+ * true by construction of bytecode WE compiled and an unchecked claim in
+ * an image (#137) - so an image always comes here, where
+ * vm_closure_capture refuses a wrong operand by name. The helper
+ * CONVEYS: test eax, the op's own caret, exit so EnterNative re-raises.
+ */
+static bool capof_fast(const Instr &in)
+{
+    return in.cap_scalar() && !ml_untrusted_bytecode();
+}
+
+static void emit_capof_call(Emitter &e, const Chunk &ck, const Instr &in,
+                            uint32_t pc, size_t old_pc)
+{
+    const bool ld = in.op == OpCode::LoadCaptureOfV;
+    emit_call_prologue(e);
+    if (ld) {
+        e.mov_imm(RDI, static_cast<uint64_t>(
+                           static_cast<int_type>(in.target)));
+        e.mov_imm(RSI, static_cast<uint64_t>(
+                           static_cast<int_type>(in.a_slot())));
+        e.mov_imm(RDX, static_cast<uint64_t>(
+                           static_cast<int_type>(in.target2)));
+        e.call_direct(reinterpret_cast<const void *>(jit_load_capture_of));
+    } else {
+        e.mov_imm(RDI, static_cast<uint64_t>(
+                           static_cast<int_type>(in.b_slot())));
+        e.mov_imm(RSI, static_cast<uint64_t>(
+                           static_cast<int_type>(in.target)));
+        e.mov_imm(RDX, static_cast<uint64_t>(
+                           static_cast<int_type>(in.a_slot())));
+        e.call_direct(reinterpret_cast<const void *>(jit_store_capture_of));
+    }
+    emit_call_epilogue(e);
+    e.test32_rr(RAX, RAX);                   /* test eax, eax; reg:abi */
+    const size_t j_ok = e.j8(0x74);
+    emit_exc_stamp(e, ck, old_pc);           /* cold: the op's own caret */
+    e.exit_pc(pc);
+    e.patch8(j_ok, e.pos());
+}
+
+/* The capture ARRAY of the closure in frame slot `fn_slot`, into `cb`:
+ * the FuncObject is the slot's payload, and CaptureSlots' data pointer
+ * is its FIRST member (the static_assert in CaptureSlots) - the explicit
+ * twin of emit_ctx_chain's `ctx -> captures -> data()` walk. */
+static void emit_capof_base(Emitter &e, uint8_t cb, int fn_slot)
+{
+    e.load(cb, slot_addr(fn_slot).payload);
+    e.load_base(cb, cb, static_cast<int32_t>(
+                            jit_push_layout().fo_capture_slots));
+}
 
 static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     uint32_t pc, const JitCtx *jc, size_t old_pc)
@@ -22189,7 +22299,20 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
-    case OpCode::LoadCaptureV: {
+    case OpCode::LoadCaptureV:
+    case OpCode::LoadCaptureOfV: {
+        /* #97 closure inlining: the explicit-closure form shares this
+         * whole emitter - the proven-scalar copy, lever A's producer arm
+         * - and differs only in WHERE the capture array comes from (the
+         * closure in slot `a`, not ctx->captures) and in its helper,
+         * which conveys (emit_capof_call). A boxed capture or a loaded
+         * image takes that helper outright. */
+        const bool of = in.op == OpCode::LoadCaptureOfV;
+        if (of && !capof_fast(in)) {
+            e.bump_op(in.op);
+            emit_capof_call(e, ck, in, pc, old_pc);
+            return true;
+        }
         /* De-helperize 6b: dst = (*ctx->captures)[idx] INLINE for a TRIVIAL
          * capture over a trivial dst - walk the ctx chain to the captures
          * data (r9), then the MoveV copy shape (src runtime ref check on
@@ -22205,13 +22328,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * two or more inline capture accesses). Then this op walks
          * nothing - and must not `scratch()` the register either, since
          * the NEXT access reads it. */
-        const bool cpin = e.capbase >= 0;
+        const bool cpin = !of && e.capbase >= 0;
         const uint8_t cb = cpin ? static_cast<uint8_t>(e.capbase)
                                 : ctx_chain_reg(e);
         if (cb == ELEM_NO_REG)
             return false;      /* no free chain register - decline */
-        e.bump_op(OpCode::LoadCaptureV);
-        if (!cpin)
+        e.bump_op(in.op);
+#ifdef TESTS
+        if (of)
+            e.bump_counter(&g_jit_capof_fast);
+#endif
+        if (of)
+            emit_capof_base(e, cb, static_cast<int>(in.a_slot()));
+        else if (!cpin)
             emit_ctx_chain(e, cb, /*cap=*/true, 0xFF);
         std::vector<size_t> jhelp;
         /*
@@ -22283,6 +22412,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const size_t j_done = e.j32(0xEB);
         for (const size_t sj : jhelp)
             e.patch32_here(sj);
+        if (of) {
+            /* the only arm here is a reference-listed dst */
+            emit_capof_call(e, ck, in, pc, old_pc);
+            if (fw)
+                e.load(g_fwd.res_reg, slot_addr(in.target).payload);
+            e.patch32_here(j_done);
+            if (fw)
+                g_fwd.armed = true;
+            return true;
+        }
         emit_call_prologue(e);
         e.mov_imm(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         const void *fn;
@@ -24259,22 +24398,88 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
 
     case OpCode::CoerceNumV: {
-        /* jit_coerce_num(dst, src_slot, is_float, lep) - rdi=dst=target,
-         * rsi=src=a_slot, rdx=is_float=(target2!=0), rcx=&locs[i]. Uses
-         * g_current_ctx->frame, not the slots arg. CAN throw -> conveyed with
-         * the baked caret; test eax + exit_pc. */
-        emit_call_prologue(e);
-        e.mov_imm(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
-        e.mov_imm(RSI, static_cast<uint64_t>(static_cast<int_type>(in.a_slot())));
-        e.mov_imm(RDX, in.target2 != 0 ? 1u : 0u);
-        e.call_direct(reinterpret_cast<const void *>(jit_coerce_num));
-        emit_call_epilogue(e);
-        e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
-        const size_t j_ok_cn = e.j8(0x74);
-        emit_exc_stamp(e, ck, old_pc);        /* cold: the op's own caret */
-        e.exit_pc(pc);
-        e.patch8(j_ok_cn, e.pos());
-        return true;
+        /*
+         * #97 closure inlining: THE INLINE ARM. A typed parameter of an
+         * inlined closure binds through this op once per call (78's
+         * `int k` / `float x`), and the helper alone made that inline
+         * body 5x slower than the call it replaced. coerce_to_decl_type
+         * is the IDENTITY for a value already of the declared type and
+         * one cvtsi2sd for an int into a float - the same dispatch the
+         * frameless window's bind does (W2/1c). Everything else - a bool
+         * retag, none, a value that throws - declines to the helper,
+         * which owns the semantics. A reference-listed dst declines too
+         * (its old value may need a release).
+         */
+        e.bump_op(in.op);
+        {
+            const bool isf = in.target2 != 0;
+            const SlotAddr src = slot_addr(in.a_slot());
+            const SlotAddr dst = slot_addr(in.target);
+            const JitLayout &CL = jit_layout();
+            std::vector<size_t> jslow;
+            if (jit_slot_ref_listed(ck, static_cast<int>(in.target)))
+                jslow.push_back(emit_ref_check_jae(e, dst.type));
+            const int xr = isf ? e.alloc_fscratch() : -1;
+            {
+                AccScratch acc(e);
+                e.load(acc.r, src.type);
+                {
+                    RefScratch rn(e, RCX);
+                    e.cmp_reg_tag_via(acc.r, isf ? CL.t_float : CL.t_int,
+                                      rn.sc);
+                    rn.release();
+                }
+                size_t j_other = e.j32(0x75);         /* jne: not exact */
+                e.load(acc.r, src.payload);
+                e.store(acc.r, dst.payload);
+                e.store_type_tag_via(dst.type, isf ? CL.t_float : CL.t_int,
+                                     acc.r);
+                if (xr >= 0) {
+                    /* float param: an INT argument widens here */
+                    const size_t j_fdone = e.j32(0xEB);
+                    e.patch32_here(j_other);
+                    e.load(acc.r, src.type);
+                    {
+                        RefScratch rn(e, RCX);
+                        e.cmp_reg_tag_via(acc.r, CL.t_int, rn.sc);
+                        rn.release();
+                    }
+                    j_other = e.j32(0x75);            /* jne: helper */
+                    e.cvt(static_cast<uint8_t>(xr), src.payload);
+                    e.fstore(static_cast<uint8_t>(xr), dst.payload);
+                    e.store_type_tag_via(dst.type, CL.t_float, acc.r);
+                    e.patch32_here(j_fdone);
+                }
+                jslow.push_back(j_other);
+            }
+            if (xr >= 0)
+                e.free_fscratch(static_cast<uint8_t>(xr));
+#ifdef TESTS
+            e.bump_counter(&g_jit_coerce_fast);
+#endif
+            const size_t j_done = e.j32(0xEB);
+            for (const size_t sj : jslow)
+                e.patch32_here(sj);
+            /* jit_coerce_num(dst, src_slot, is_float) - rdi = dst,
+             * rsi = src, rdx = is_float. Uses g_current_ctx->frame. CAN
+             * throw -> conveyed with the baked caret; test eax +
+             * exit_pc. */
+            emit_call_prologue(e);
+            e.mov_imm(RDI, static_cast<uint64_t>(
+                               static_cast<int_type>(in.target)));
+            e.mov_imm(RSI, static_cast<uint64_t>(
+                               static_cast<int_type>(in.a_slot())));
+            e.mov_imm(RDX, isf ? 1u : 0u);
+            e.call_direct(reinterpret_cast<const void *>(jit_coerce_num));
+            emit_call_epilogue(e);
+            e.test32_rr(RAX, RAX);           /* test eax, eax; reg:abi */
+            const size_t j_ok_cn = e.j8(0x74);
+            emit_exc_stamp(e, ck, old_pc);    /* cold: the op's own caret */
+            e.exit_pc(pc);
+            e.patch8(j_ok_cn, e.pos());
+            e.patch32_here(j_done);
+            return true;
+        }
     }
 
     case OpCode::CallBuiltinV: {
@@ -24471,8 +24676,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
 
     case OpCode::StoreGlobalV:
-    case OpCode::StoreCaptureV: {
-        const bool is_cap = in.op == OpCode::StoreCaptureV;
+    case OpCode::StoreCaptureV:
+    case OpCode::StoreCaptureOfV: {
+        /* #97 closure inlining: see LoadCaptureOfV in the load case - the
+         * explicit-closure store is always PLAIN, and a proven-scalar one
+         * in our own bytecode takes the copy below with both guards
+         * elided (so it never reaches this case's helper arm) */
+        const bool of = in.op == OpCode::StoreCaptureOfV;
+        if (of && !capof_fast(in)) {
+            e.bump_op(in.op);
+            emit_capof_call(e, ck, in, pc, old_pc);
+            return true;
+        }
+        const bool is_cap = in.op == OpCode::StoreCaptureV || of;
         if (in.aop != Op::invalid) {
             /* COMPOUND `g OP=`/`cap OP=` via jit_store_*_compound(&boxed_ops[
              * target2]) - the rhs operand + slot ride the pool (like CompoundV).
@@ -24542,7 +24758,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* #112: only the CAPTURE chain is pinnable - the GLOBAL side
          * walks to a different table AND leaves it in `tbl` for the
          * `defined` byte, so it keeps its own walk. */
-        const bool cpin = is_cap && e.capbase >= 0;
+        const bool cpin = !of && is_cap && e.capbase >= 0;
         const uint8_t cb = cpin ? static_cast<uint8_t>(e.capbase)
                                 : ctx_chain_reg(e);
         if (cb == ELEM_NO_REG) {
@@ -24550,7 +24766,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.free_scratch(static_cast<uint8_t>(tbl));
             return false;      /* no free chain register - decline */
         }
-        if (!cpin)
+#ifdef TESTS
+        if (of)
+            e.bump_counter(&g_jit_capof_fast);
+#endif
+        if (of)
+            emit_capof_base(e, cb, static_cast<int>(in.b_slot()));
+        else if (!cpin)
             emit_ctx_chain(e, cb, is_cap,
                            is_cap ? 0xFF : static_cast<uint8_t>(tbl));
         const size_t j_dref =
@@ -25570,6 +25792,55 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         return;
     }
 
+    case OpCode::GuardCalleeV: {
+        /* #97 closure inlining: fall through into the inlined body iff
+         * the callee slot holds a FuncObject whose descriptor IS the one
+         * the splice inlined - the type word, then `fo->func`, each
+         * compare jumping to the original call. Never throws: the slot
+         * is read, never dereferenced as anything but a FuncObject once
+         * its tag says it is one. */
+        const SlotAddr a = slot_addr(in.a_slot());
+        const JitPushLayout &P = jit_push_layout();
+        e.bump_op(OpCode::GuardCalleeV);
+        if (jit_cold_forced(JC_GUARD)) {
+            /* MYLANG_JIT_COLD=guard: the miss arm, unconditionally
+             * (Jump's own emission) */
+            const size_t tgt = static_cast<size_t>(in.target);
+            if (tgt >= begin && tgt < end) {
+                e.u8(0xE9);
+                fixups.push_back({ e.pos(), tgt });
+                e.u32(0);
+            } else {
+                e.exit_pc(static_cast<uint32_t>(remap[in.target]));
+            }
+            return;
+        }
+        AccScratch acc(e);
+        e.load(acc.r, a.type);
+        {
+            RefScratch rn(e, RCX);
+            e.cmp_reg_tag_via(acc.r, P.t_func, rn.sc);
+            rn.release();                  /* before the edge */
+        }
+        emit_cond_jump_raw(e, 0x85 /* jne near */, 0x74 /* je short */,
+                           static_cast<size_t>(in.target), begin, end,
+                           remap, fixups);
+        e.load(acc.r, a.payload);          /* the FuncObject */
+        e.load_base(acc.r, acc.r, static_cast<int32_t>(P.fo_func));
+        {
+            RefScratch rn(e, RCX);
+            e.cmp_reg_tag_via(acc.r, ck.closure_defs[in.target2], rn.sc);
+            rn.release();
+        }
+        emit_cond_jump_raw(e, 0x85 /* jne near */, 0x74 /* je short */,
+                           static_cast<size_t>(in.target), begin, end,
+                           remap, fixups);
+#ifdef TESTS
+        e.bump_counter(&g_jit_guard_hits);
+#endif
+        return;
+    }
+
     case OpCode::ForStepElemInt: {
         const uint8_t ir = elem_read_idx(e, in.op);
         /* the FIFTH ElemRead construction site - it was built by hand
@@ -25880,7 +26151,10 @@ static bool op_is_branch(OpCode op)
          * to the loop target when the loop continues. */
         || op == OpCode::ForStepElemInt
         /* the `??` short-circuit: jump when the lhs is NOT none. */
-        || op == OpCode::JumpIfNotNoneV;
+        || op == OpCode::JumpIfNotNoneV
+        /* #97 closure inlining: the inline cache's guard - jump to the
+         * original call when the callee is not the inlined closure. */
+        || op == OpCode::GuardCalleeV;
 }
 
 /*
@@ -26027,6 +26301,7 @@ static bool op_never_exits(const Instr &in)
     case OpCode::JumpIfNotNoneV:
     case OpCode::DeclConstV:
     case OpCode::DefinedGlobalV:
+    case OpCode::GuardCalleeV:      /* #97: two compares, never throws */
     /* the inline exception ops: pure activation state, never throw (the
      * PushHandler's pushed catch_pc is remapped at emit). */
     case OpCode::PushHandler:
@@ -26393,6 +26668,12 @@ static bool op_fully_native(const Instr &in)
     case OpCode::StoreGlobalV:
     case OpCode::StoreCaptureV:
         return true;
+    /* #97 closure inlining: the explicit-closure capture ops - their
+     * helper arm CONVEYS vm_closure_capture's provenance refusal (a
+     * loaded image's corrupt operand) with the op's exc-stamped caret */
+    case OpCode::LoadCaptureOfV:
+    case OpCode::StoreCaptureOfV:
+        return true;
     /* #98 (the census audit): the two struct ctors the #56 batch left
      * undecided in silence - both convey-only, so both deletable. The
      * UNPLANNED StructCtorV shares MakeStructArrayV's emit (the same
@@ -26505,7 +26786,7 @@ static int branch_pc_target(const Instr &in)
     case OpCode::JumpIfNotNoneV: case OpCode::ForLoopStep:
     case OpCode::DictIterNext: case OpCode::ForeachDynNext:
     case OpCode::JumpUnlessElemInt: case OpCode::IntAddStep:
-    case OpCode::ForStepElemInt:
+    case OpCode::ForStepElemInt: case OpCode::GuardCalleeV:
         return in.target;
     default:
         return -1;
@@ -27451,6 +27732,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
             case OpCode::JumpUnlessElemInt:
             case OpCode::IntAddStep:
             case OpCode::ForStepElemInt:
+            case OpCode::GuardCalleeV:
             /* #74 inc 2 gave the CATCH BODY an entry via CatchTest's
              * target; #78 step D deleted that op, and the handler-table
              * loop below supplies the same pcs (plus every fin_pc). */
@@ -30479,6 +30761,7 @@ retry_emission:
             case OpCode::JumpUnlessElemInt:
             case OpCode::IntAddStep:
             case OpCode::ForStepElemInt:
+            case OpCode::GuardCalleeV:
                 /*
                  * A control-flow target is a RESUME, so it takes the ENTRY
                  * map (a run head's EnterNative, or an interior entry's
