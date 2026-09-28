@@ -15309,3 +15309,96 @@ remove both; a `CoerceNumV` reads through memory even when its source
 is pinned. Increments 2-5 of the plan (two-way sites for 76,
 `MakeClosureV` in a spliced body, local guard elision, scalar
 replacement of a non-escaping closure) are untouched.
+
+## #97 CLOSURE INLINING STEP 1 - NO STAGING, NO RESULT COPY, A PINNED
+## BIND SOURCE (2026-09-27)
+
+Increment 1 left three pieces of call scaffolding around every inlined
+body, and `-vdj` showed what they cost (78's `add(i)`, per call):
+
+    move      r7 = i               the argument staging: ~8 executed -
+                                   r7 is ref-listed (main reuses it)
+    coerce    r11 = int(r7)        the bind reads the staging temp
+    ...body...
+    move      r8 = r13             the result copy: 13 instructions,
+                                   ref check + a 32-byte copy (r8 too
+                                   is a reused, ref-listed temp)
+
+**The argument staging is SUNK into the miss arm.** Only the original
+call reads the argument run, so the inlined body binds from each
+argument's own slot and the staging moves move behind the guard's else
+target (`bc_value_site_step1`, codegen.cpp). Taken for the maximal run
+of `move argbase+i = src` immediately before the call, when: no source
+is inside the run (the run writes only its own temps); nothing branches
+INTO the run past its first op (a branch to the first op lands on the
+guard - the JOIN trap, CLAUDE.md, is why the rest are refused); and each
+staging temp is dead after the call or is the call's dst
+(`jit_slot_liveness` on the caller).
+
+**The result is RENAMED into the call's dst.** When every ReturnV of the
+body returns one slot R - a local or temp, not a parameter, never read
+before written (`chunk_read_before_write`, stored in the snapshot as
+`read_first`), and the body holds no call (a one-slot rename would split
+its argument run) - every field naming R names dst and no result move is
+emitted (`bc_rename_slot`, checked against `visit_use_def` the way the
+re-base is). dst is a caller slot the body cannot otherwise reach, so the
+early write is unobservable: a splice caller has no try region, and an
+exception after the write leaves the frame that holds dst. A
+reference-carrying R puts dst into the caller's `ref_slots`.
+
+**CoerceNumV reads a pinned source from its register.** Binding from
+the source made the loop counter an operand of `CoerceNumV`, whose
+`pick_visit_op` row DISQUALIFIED its source - `i` would have lost its
+register for the whole fragment. The row now marks the source like
+MoveV's (a full read, no weight), and the emitter reads a pinned int
+(register or spill home) straight into an int parameter or through one
+`cvtsi2sd` into a float one, and a pinned float into a float parameter;
+a pinned float into an INT parameter (a narrowing, which raises) is
+written back to its slot first and takes the helper. Counted by
+`g_jit_coerce_pin`.
+
+**The lever and the nets.** `MYLANG_BCINLINE_STEP1=0` restores the
+increment-1 form (`g_bc_inline_value_step1`). `closure_inline_parity`
+gained five shapes (a dst that is also the argument's source, mixed
+argument sources, pinned int and float sources into a float parameter,
+branching bodies - one renamed, one with two different return slots,
+which must not be - and a ternary argument), a step-1-OFF run of every
+shape against the tree-walker, compile-time reach counters
+(`g_bc_step1_renamed` / `g_bc_step1_sourced`), and a run with EVERY GUARD
+MISSING - `g_jit_cold_extra`, the new in-process twin of
+`MYLANG_JIT_COLD` - which must also render the tree-walker's output with
+no guard hit.
+
+Sabotages, each watched: binding from the staging temp after sinking it
+(functional 42 prints wrong values); the CoerceNumV register path
+disabled, reading the stale slot (the JIT register tracker aborts
+`frame-payload READ of a slot whose home is a register`); the result
+move kept after the rename (four `-rt` failures, one a refcount check);
+the miss arm fed a WRONG argument (caught ONLY by the forced-miss lane
+until the parity test got its forced-miss run - which is why it has
+one). Two gates are fail-closed and unreachable by any shape codegen
+produces, and removing either leaves every net green: the staging
+temp's liveness after the call, and R being read before written. A dst
+equal to the callee slot is likewise refused but never produced - a
+value call always writes a fresh temp.
+
+**Found on the way:** a CallV site's `stage_first` defaulted to 0, so
+the first draft treated everything before any plain splice site as sunk
+staging and dropped it (`-rt`'s caller-frames test caught it: the
+spliced function lost `p = small(a)`).
+
+Measured vs increment 1 (pinned P-core, `-npc`, `OPT=1 ASSERTS=0`,
+scale-3 minus scale-1, one run each):
+
+    bench  cycles    instructions   per iteration
+    78     -39.0%    -37.5%         112 -> 70 instr, 16.2 -> 9.9 cycles
+    11     -12.4%    -22.5%         40 -> 31 instr
+    63     -14.0%     -8.8%
+    76/91/92/97      flat           (no value site reached)
+
+**Sibling cases, not done:** the same two moves exist at a plain `CallV`
+splice (no miss arm - the staging could be DELETED there, not sunk, under
+the same liveness rule); a parameter bound by an EXACT move whose source
+the body never writes could be renamed to the source outright, removing
+the bind too; the guard still compares the type word and the descriptor
+through memory (8 instructions).

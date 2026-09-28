@@ -191,6 +191,7 @@ unsigned long g_jit_guard_hits = 0;
 unsigned long g_jit_capof_fast = 0;
 /* the CoerceNumV inline arm (exact copy / int->float widen), per run */
 unsigned long g_jit_coerce_fast = 0;
+unsigned long g_jit_coerce_pin = 0;   /* #97 step 1: pinned source */
 unsigned long g_jit_capbase = 0;       /* #112: runs entering with the
                                         * capture base pinned */
 unsigned long g_jit_telide = 0;        /* C3: type-elided fragment entries */
@@ -506,9 +507,13 @@ static unsigned jit_cold_mask()
         jit_parse_mask("MYLANG_JIT_COLD", jit_cold_names, JC_COUNT);
     return m;
 }
+/* the in-process twin of MYLANG_JIT_COLD (OR'd in), for a test that
+ * must drive a cold arm and restore it - the g_jit_off_extra pattern */
+unsigned g_jit_cold_extra = 0;
+static_assert(JC_GUARD == 1, "jit.h's JIT_COLD_GUARD_BIT names bit 1");
 static bool jit_cold_forced(JitColdTier t)
 {
-    return jit_cold_mask() & (1u << t);
+    return (jit_cold_mask() | g_jit_cold_extra) & (1u << t);
 }
 
 #if defined(__SANITIZE_ADDRESS__)
@@ -14261,6 +14266,7 @@ void jit_stats_report()
         { "guard_hits",       &g_jit_guard_hits },   /* #97 closure inl */
         { "capof_fast",       &g_jit_capof_fast },
         { "coerce_fast",      &g_jit_coerce_fast },
+        { "coerce_pin",       &g_jit_coerce_pin },
         /* W6: how many of those hold it CALLER-saved, which is the
          * emit-time reach of the entry push/pop elision (compile-time,
          * so it counts RUNS, not calls - `capbase` above is bumped by
@@ -15853,9 +15859,16 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
     case OpCode::CoerceNumV:
         /* dst (a typed int/float coerces_dyn accumulator - COULD be a hot
          * int slot) is written from memory by the helper; an N5-cached dst
-         * would be overwritten stale by the flush. src (a_slot) holds a dyn
-         * value (never int-cached). Disqualify both. */
-        v.bad(in.target); v.bad(in.a_slot());
+         * would be overwritten stale by the flush - disqualified.
+         * #97 closure inlining step 1: the SOURCE is cache-aware, exactly
+         * as MoveV's is (see there): an inlined closure's typed parameter
+         * binds straight from the argument's own slot - a loop counter,
+         * 78's `i` - and disqualifying it cost that slot its register for
+         * the whole fragment. A pinned source is a proven int/float, read
+         * from the register by the emitter; the op contributes NO weight,
+         * and an unpinned one is read from memory as a full value (C3). */
+        v.bad(in.target);
+        v.full_read_mark(in.a_slot());
         break;
     case OpCode::StoreGlobalV:
     case OpCode::StoreCaptureV:
@@ -24416,6 +24429,53 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             const SlotAddr src = slot_addr(in.a_slot());
             const SlotAddr dst = slot_addr(in.target);
             const JitLayout &CL = jit_layout();
+            /* #97 closure inlining step 1: a REGISTER-resident source (see
+             * pick_visit_op) - its slot memory is STALE. A pinned int is
+             * a proven int: the identity into an int parameter, one
+             * cvtsi2sd into a float one - the frameless window's W2
+             * rule, an emit-time fact. A pinned float into a float
+             * parameter is the identity; into an INT one it is a
+             * narrowing, which the helper raises - so the pin is written
+             * back to its slot first and the op falls to the memory path
+             * below, whose tag test sends it there. */
+            {
+                const int sreg = e.reg_at(in.a_slot());
+                const int ssk = e.spill_at(in.a_slot());
+                if (sreg >= 0 || ssk >= 0) {
+                    AccScratch acc(e);
+                    uint8_t r = acc.r;
+                    if (sreg >= 0)
+                        r = static_cast<uint8_t>(sreg);
+                    else
+                        e.reload(acc.r, ssk);
+                    if (isf) {
+                        e.cvt_reg(X0, r);                /* reg:abi */
+                        emit_float_store(e, ck, X0,      /* reg:abi */
+                                         in.target, pc);
+                    } else {
+                        store_dst(e, ck, r, in.target, pc);
+                    }
+#ifdef TESTS
+                    e.bump_counter(&g_jit_coerce_pin);
+#endif
+                    return true;
+                }
+                const int sfr = e.freg_at(in.a_slot());
+                if (sfr >= 0 && isf) {
+                    e.fmov_rr(X0, static_cast<uint8_t>(sfr)); /* reg:abi */
+                    emit_float_store(e, ck, X0, in.target,    /* reg:abi */
+                                     pc);
+#ifdef TESTS
+                    e.bump_counter(&g_jit_coerce_pin);
+#endif
+                    return true;
+                }
+                if (sfr >= 0) {
+                    AccScratch acc(e);
+                    e.fstore(static_cast<uint8_t>(sfr), src.payload);
+                    e.store_type_tag_via(src.type, CL.t_float, acc.r);
+                }
+            }
             std::vector<size_t> jslow;
             if (jit_slot_ref_listed(ck, static_cast<int>(in.target)))
                 jslow.push_back(emit_ref_check_jae(e, dst.type));

@@ -1534,6 +1534,10 @@ extern "C" unsigned long g_jit_peep_depbrk;
 /* the in-process OFF override for the lever mask (tests; pairs with
  * jit_lever_bit) - the env masks are cached statics. */
 extern "C" unsigned g_jit_off_extra;
+/* the in-process twin of MYLANG_JIT_COLD: OR'd into the parsed mask, so
+ * a test can drive a cold arm and restore it (bit = 1 << JitColdTier) */
+extern "C" unsigned g_jit_cold_extra;
+static const unsigned JIT_COLD_GUARD_BIT = 1u << 1;   /* `guard` */
 extern "C" unsigned long g_jit_rax_retries;
 /* #96 increment 3: a counted loop whose counter is PINNED - the step
  * and the bound test run entirely in registers, RAX untouched. */
@@ -1552,6 +1556,7 @@ extern "C" unsigned long g_jit_capbase;       /* #112: fragment entries with
 extern "C" unsigned long g_jit_guard_hits;
 extern "C" unsigned long g_jit_capof_fast;
 extern "C" unsigned long g_jit_coerce_fast;
+extern "C" unsigned long g_jit_coerce_pin;
 /* SP: every emitted call goes through Emitter::call_direct or
  * call_reg; this counts them, and `spcheck_sites` the MYLANG_JIT_SPCHECK
  * runtime alignment checks emitted beside them. */

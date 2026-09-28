@@ -1312,8 +1312,11 @@ collision). Three nets now:
   closure inlining) makes every GuardCalleeV MISS, running the inline
   cache's miss arm - the original call - which our own compilation
   never reaches (the analysis named the one callee), and which a wrong
-  or tampered image would. On its FIRST run `refstore`
-  found a real latent bug in 0.7s: `store_dst`'s cold arm gated its RAX
+  or tampered image would. `g_jit_cold_extra` (jit.h) is its
+  in-process twin, OR'd in the way `g_jit_off_extra` is for the levers:
+  a test that must run a cold arm sets and restores it. On its FIRST
+  run `refstore` found a real latent bug in 0.7s: `store_dst`'s cold
+  arm gated its RAX
   reload on `keep_rax`, but `ForLoopStep`/`IntAddStep` store the
   counter and then `cmp rax, <bound>` - so a ref-listed counter taking
   that arm compared garbage and the loop ran the wrong number of times.
@@ -1893,7 +1896,10 @@ Running scripts:
                                  # included, behind a GuardCalleeV - the
                                  # inline cache (plans/closure-inlining
                                  # .md); MYLANG_BCINLINE_VALUE=0 turns
-                                 # that half off alone. ⛔ A call-
+                                 # that half off alone, and
+                                 # MYLANG_BCINLINE_STEP1=0 keeps it but
+                                 # restores the staging moves and the
+                                 # result copy (step 1's A/B). ⛔ A call-
                                  # PROTOCOL test (frameless, capbase,
                                  # capture forwarding) reaches its tier
                                  # through a closure call the splice now

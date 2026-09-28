@@ -3,10 +3,14 @@
 Status: **INCREMENT 1 DONE (2026-09-27)** - record and measurements in
 docs/jit-optimizations.md, *#97 CLOSURE INLINING, INCREMENT 1*: 11
 -28.6% cycles (57 -> 40 instr/iter, vs the ~15 predicted: the staging
-and result MoveVs remain), 78 -8.5%, 63 -10.5%. Increments 2-5 not
-started. Designed from measurement (2026-09-27). Maintainer's
-call: this replaces the call-protocol store trimming (R5/R6 both measured
-flat and are parked on `r5-offpath-framefree` / `r6-return-forward`).
+and result MoveVs remain), 78 -8.5%, 63 -10.5%. STEP 1 of the follow-ups
+DONE the same day (record: *#97 CLOSURE INLINING STEP 1*): staging sunk
+into the miss arm, results renamed into dst, a pinned bind source read
+from its register - 78 -39% cycles (112 -> 70 instr/iter), 11 -12%, 63
+-14% vs increment 1. Increments 2-5 not started. Designed from
+measurement (2026-09-27). Maintainer's call: this replaces the
+call-protocol store trimming (R5/R6 both measured flat and are parked
+on `r5-offpath-framefree` / `r6-return-forward`).
 
 ## Why the protocol arc has stopped paying
 
