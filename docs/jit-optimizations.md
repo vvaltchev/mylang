@@ -16599,6 +16599,18 @@ the fused check removed fails `[fused int]` with a wrong value; the
 reload of live pins removed HANGS `-rt` (a loop counter loses its
 value) - caught, though as a hang rather than a named failure.
 
+**(c), IPA-RA, MEASURED AND NOT BUILT.** Keeping a caller-saved pin
+across a call with no write-back needs a register neither the site
+(rax, rcx, rdx, rdi, r9, r10, r11) nor the callee writes; the only
+candidates are rsi and r8, so it is a CONVENTION (rsi/r8 preserved
+across a frameless call). All 218 frameless callees in bench/my +
+tests/functional write one of them somewhere and contain a C++ helper
+call; a sound convention would push/pop both in every such callee per
+call, or need a path-aware emitter. Its whole payoff is the 6 programs
+that lose the bet, and on 97 - the shape it exists for - the ceiling
+is 0.9% of cycles. Closed (docs/in-flight-tasks.md §3b has the
+numbers).
+
 ## TWO FINDINGS OF THE REGCALL WORK, FIXED (2026-09-30)
 
 **A `dyn` CALL RAN A NESTED C++ ACTIVATION PER CALL.** The generic
