@@ -1592,6 +1592,12 @@ struct CgInstr : Instr {
      * pc. */
     int32_t callee_def_idx = -1;
     int32_t callee_def_idx2 = -1;
+    /* #97 closure inlining step 1b: each argument's PROVEN kind at a
+     * named CallValueV site, two bits per argument (1 = exactly an int -
+     * not a bool, 2 = a float, 0 = not proven), arguments 0..15. Read by
+     * the splice to drop a typed parameter's bind when it is the
+     * identity. Codegen-transient: it becomes Chunk::value_arg_kinds. */
+    uint32_t arg_kinds = 0;
     /*
      * The INHERITED inlined-at chain: the chain of the innermost compiled
      * AST node (statement or expression) this op was emitted for. An op
@@ -2312,6 +2318,27 @@ struct Chunk {
         int32_t def;              /* index into this chunk's closure_defs */
     };
     std::vector<CalleeName> value_callees;
+    /*
+     * #97 closure inlining step 1b: per named CallValueV pc, the
+     * arguments' PROVEN kinds (CgInstr::arg_kinds' encoding). COMPILE-
+     * TIME ONLY - filled at finalize, read by the bytecode splice in the
+     * same process, and CLEARED by it (its pcs die with the splice). It
+     * is never serialized: the splice runs before an image is written and
+     * never after one is loaded, so a loaded chunk has an empty table and
+     * nothing asks. pc-ascending.
+     */
+    struct ArgKinds {
+        uint32_t pc;
+        uint32_t kinds;
+    };
+    std::vector<ArgKinds> value_arg_kinds;
+    uint32_t value_arg_kinds_at(size_t pc) const
+    {
+        for (const ArgKinds &k : value_arg_kinds)
+            if (k.pc == pc)
+                return k.kinds;
+        return 0;
+    }
 
     /* the entries at `pc`: 0, 1 or 2 closure_defs indices in `out` */
     int value_callees_at(size_t pc, int32_t out[2]) const

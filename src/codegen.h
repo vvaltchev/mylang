@@ -483,6 +483,7 @@ typedef std::unordered_map<const Chunk *, BcInlineSnapshot> BcInlineSnapshots;
 extern bool g_bc_inline_value_step1;
 extern unsigned long g_bc_step1_renamed;
 extern unsigned long g_bc_step1_sourced;
+extern unsigned long g_bc_step1_params;
 
 /* Record `ck`'s pristine body into `out`. Call for EVERY chunk of the
  * program before the first bc_inline_chunk. */
