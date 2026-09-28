@@ -82,6 +82,45 @@ RUN, 2026-09-22 (`my/cpp`), which is the table above one arc later:**
     75_indexed_unpack             0.209      0.024    8.69x
     58_structs                    0.079      0.009    8.87x
 
+**AND 2026-10-01, AFTER THE CALLBACK, CLOSURE-INLINING, REGCALL, #124(b),
+#86 AND #84 ARCS** (`bench/run.py -cl cpp`, build-claude/perf at ff44488
+built `OPT=1 ASSERTS=0 TESTS=0`, `-npc`, one run; geomean over 99:
+**1.695x**). ⛔ The machine-speed marker read ~14% FASTER than when the
+cpp cache was timed, so these ratios read LOW by about that much
+(divide by ~0.86 to compare with the cache's day); `bench/run.py -cl
+cpp --recompute --force` would re-time C++ on today's machine. Worst
+fifteen, then the benches the tables above tracked:
+
+    58_structs                0.075   0.011   7.05x
+    64_struct_create          0.103   0.017   5.95x
+    96_find_sum_key           0.137   0.025   5.50x
+    26_dict_iterate           0.109   0.022   4.85x
+    74_dyn_foreach_kv         0.119   0.026   4.55x
+    75_indexed_unpack         0.104   0.024   4.33x
+    20_foreach_unpack         0.125   0.030   4.20x
+    86_elem_arith_compound    0.098   0.023   4.19x
+    76_funcval_dispatch       0.072   0.017   4.14x
+    28_str_concat             0.066   0.016   4.13x
+    32_str_build_join         0.212   0.054   3.94x
+    29_str_slice_readonly     0.162   0.041   3.91x
+    13_array_append           0.034   0.009   3.90x
+    100_funcval_dispatch4     0.079   0.021   3.84x
+    41_str_int_conv           0.154   0.042   3.65x
+
+    09_fib_recursive 3.27x  11_closure_counter 3.07x  35_map_filter 2.98x
+    78_typed_param_call 2.81x  34_sort_custom_cmp 2.04x  73_multi_unpack
+    1.95x  63_closures 1.17x  97_regs_int_call 1.41x  101_float_call 3.06x
+    102_call_outer_hot_inner 1.62x
+
+By the `my` column (the trustworthy one - the C++ side is cached) since
+2026-09-22: 34 0.106 -> 0.041, 11 0.079 -> 0.038, 63 0.190 -> 0.029,
+78 0.051 -> 0.021, 09 0.152 -> 0.071, 73 0.227 -> 0.062, 35 0.190 ->
+0.072, 75 0.209 -> 0.104, 76 0.113 -> 0.072; 58 0.079 -> 0.075 and 64
+0.103 flat. **The call cluster is no longer the worst: the struct
+benches (58, 64), 96's key callbacks, and the dict/foreach-unpack
+family now lead**, and only 58, 64 and 96 are over 5x as printed (with
+26/74/75 joining them once the machine marker's correction is applied).
+
 **NOTHING IS OVER 9x ANY MORE** (76 was 9.72x and 11.45x before it),
 and 34 is within 0.21x of the standing <= 5x requirement.
 
