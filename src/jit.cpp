@@ -189,6 +189,10 @@ unsigned long g_jit_capbase_cs = 0;    /* W6: runs holding the capture
  * capture accesses served by the inline copy rather than the helper */
 unsigned long g_jit_guard_hits = 0;
 unsigned long g_jit_guard_proven = 0;
+unsigned long g_jit_ghoist_pre = 0;     /* G1 preheaders that PASSED */
+unsigned long g_jit_ghoist_hot = 0;     /* hoisted guards executed as
+                                         * nothing in the hot copy */
+unsigned long g_jit_ghoist_stub = 0;    /* resume stubs that re-checked */
 unsigned long g_jit_capof_fast = 0;
 /* the CoerceNumV inline arm (exact copy / int->float widen), per run */
 unsigned long g_jit_coerce_fast = 0;
@@ -399,14 +403,14 @@ enum JitLever {
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
     JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA,
-    JL_FRAMELESS, JL_CAPPROT, JL_VFQUIET, JL_GPROOF, JL_COUNT
+    JL_FRAMELESS, JL_CAPPROT, JL_VFQUIET, JL_GPROOF, JL_GHOIST, JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
     "peep", "bakecallee", "capbase", "lsra", "frameless", "capprot",
-    "vfquiet", "gproof"
+    "vfquiet", "gproof", "ghoist"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -8153,6 +8157,11 @@ static JitHoist g_hoist2;
 /* #97 G3: per-pc, the GuardCalleeVs a local make.closure proves true
  * (jit_guard_facts, codegen.cpp), recomputed per chunk. */
 static std::vector<char> g_guard_proven;
+/* #97 G1: while a GUARD region's HOT copy emits, the guards its
+ * preheader checked (by pc) emit nothing. Off for the cold copies. */
+static std::vector<char> g_ghoist_pc;
+static bool g_ghoist_on = false;
+static size_t g_ghoist_end = 0;
 static std::vector<int> g_sf_slot;
 static std::vector<const StructTypeDef *> g_sf_def;
 static std::vector<uint32_t> g_sf_in;
@@ -13889,6 +13898,11 @@ struct HoistRegion {
     int base2 = -1, kind2 = 0;
     bool has_store2 = false;
     int uses2 = 0;
+    /* #97 G1: a GUARD region (base == -1): the inline-cache guards at
+     * these pcs are checked ONCE, in the preheader, and emit nothing in
+     * the hot copy - their callee slots are not written in [T, L] and a
+     * FuncObject's descriptor never changes. */
+    std::vector<size_t> guards;
 };
 
 /*
@@ -14066,12 +14080,94 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
             }
         }
         out.push_back({ T, L, best, best_kind, best_store,
-                        best2, best2_kind, best2_store, best2_uses });
+                        best2, best2_kind, best2_store, best2_uses, {} });
         if (dbg) fprintf(stderr,
                          "hoist[%zu,%zu): PICKED slot %d kind %d%s%s\n",
                          T, L, best, best_kind,
                          best_store ? " +store" : "",
                          best2 >= 0 ? " (+2nd)" : "");
+    }
+    /*
+     * #97 G1: GUARD REGIONS - loop versioning for the inline cache. A
+     * loop whose inline-cache guards read a callee slot nothing in the
+     * loop writes checks each guard ONCE, before the loop; the hot copy
+     * emits nothing for them and a failed check runs the ordinary
+     * (guarded) cold copy. Unlike an element region this needs no
+     * register and tolerates CALLS - the miss arm of every guard is one
+     * - and so POST-CALL RESUMES: every resume stub inside the region
+     * re-checks the guards and resumes in the cold copy when one fails
+     * (a switched miss-arm call resumes after the loop has, in effect,
+     * been left). The rest is C1's: no jump in from outside, no handler
+     * pc inside, T past the run head (the frameless entry and a head
+     * entry land AFTER the preheader bytes).
+     */
+    if (!jit_lever_off(JL_GHOIST)) {
+        for (const auto &rg : regions) {
+            const size_t T = rg.first, L = rg.second;
+            if (T <= begin)
+                continue;
+            bool ok = true;
+            for (const HoistRegion &acc : out)
+                if (T <= acc.L && acc.T <= L)
+                    ok = false;
+            if (!ok)
+                continue;
+            std::vector<int> defs, uses, tmp_d;
+            for (size_t p = T; p <= L && ok; p++) {
+                uses.clear();
+                tmp_d.clear();
+                if (!jit_op_slot_refs(chunk.code[p], uses, tmp_d)) {
+                    ok = false;              /* an unaudited op */
+                    if (dbg) fprintf(stderr, "ghoist[%zu,%zu]: op %d at "
+                                     "%zu is unaudited\n", T, L,
+                                     (int)chunk.code[p].op, p);
+                }
+                defs.insert(defs.end(), tmp_d.begin(), tmp_d.end());
+            }
+            for (size_t p = begin; p < end && ok; p++) {
+                const Instr &in = chunk.code[p];
+                if (op_is_branch(in.op)
+                        && in.target >= static_cast<int>(T)
+                        && in.target <= static_cast<int>(L)
+                        && (p < T || p > L))
+                    ok = false;
+            }
+            for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
+                for (const Chunk::HandlerClause &cl : hs.clauses)
+                    if (cl.body_pc >= static_cast<int>(T)
+                            && cl.body_pc <= static_cast<int>(L))
+                        ok = false;
+                if (hs.fin_pc >= static_cast<int>(T)
+                        && hs.fin_pc <= static_cast<int>(L))
+                    ok = false;
+            }
+            if (!ok) {
+                if (dbg) fprintf(stderr, "ghoist[%zu,%zu]: declined (a "
+                                 "jump in, a handler pc, or an unaudited "
+                                 "op)\n", T, L);
+                continue;
+            }
+            HoistRegion hr{ T, L, -1, 0, false, -1, 0, false, 0, {} };
+            for (size_t p = T; p <= L; p++) {
+                const Instr &in = chunk.code[p];
+                if (in.op != OpCode::GuardCalleeV)
+                    continue;
+                if (p < g_guard_proven.size() && g_guard_proven[p])
+                    continue;                /* G3: already free */
+                if (std::find(defs.begin(), defs.end(), in.a_slot())
+                        != defs.end())
+                    continue;                /* the loop rebinds it */
+                hr.guards.push_back(p);
+            }
+            if (hr.guards.empty()) {
+                if (dbg) fprintf(stderr, "ghoist[%zu,%zu]: no guard it "
+                                 "may hoist\n", T, L);
+                continue;
+            }
+            if (dbg) fprintf(stderr, "hoist[%zu,%zu): GUARD region, "
+                             "%zu guard(s)\n", T, L, hr.guards.size());
+            out.push_back(std::move(hr));
+        }
     }
     std::sort(out.begin(), out.end(),
               [](const HoistRegion &a, const HoistRegion &b) {
@@ -14268,7 +14364,10 @@ void jit_stats_report()
         { "hoist2",           &g_jit_hoist2 },
         { "capbase",          &g_jit_capbase },
         { "guard_hits",       &g_jit_guard_hits },
-        { "guard_proven",     &g_jit_guard_proven },   /* #97 closure inl */
+        { "guard_proven",     &g_jit_guard_proven },
+        { "ghoist_pre",       &g_jit_ghoist_pre },
+        { "ghoist_hot",       &g_jit_ghoist_hot },
+        { "ghoist_stub",      &g_jit_ghoist_stub },   /* #97 closure inl */
         { "capof_fast",       &g_jit_capof_fast },
         { "coerce_fast",      &g_jit_coerce_fast },
         { "coerce_pin",       &g_jit_coerce_pin },
@@ -25352,6 +25451,44 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
  * stores use store_dst (their slots are scalar-writers -> not ref-listed
  * -> the branchless two-store; RSI holds t_int, set once at fragment
  * entry and preserved across the loop). */
+/*
+ * #97: the inline-cache guard's two compares (G2's form), each MISS
+ * recorded as a rel32 jcc site in `miss` for the caller to patch - the
+ * shared body of the op itself (emit_branch), a G1 region's PREHEADER
+ * and its RESUME-STUB re-check, so the three cannot disagree about what
+ * "the guard holds" means. The type word and `[fo + func]` are compared
+ * in memory; the FuncObject pointer is the one register load.
+ */
+static void emit_guard_check(Emitter &e, const Chunk &ck, const Instr &in,
+                             std::vector<size_t> &miss,
+                             bool force_miss = false)
+{
+    /* `force_miss` (MYLANG_JIT_COLD=guard at a G1 preheader or stub):
+     * the descriptor is compared against 1, which no pointer equals -
+     * still a CONDITIONAL edge, so the code after it keeps its stack
+     * model (an unconditional jmp would leave the hot copy with none) */
+    const void *const want = force_miss
+        ? reinterpret_cast<const void *>(uintptr_t(1))
+        : static_cast<const void *>(ck.closure_defs[in.target2]);
+    const SlotAddr a = slot_addr(in.a_slot());
+    const JitPushLayout &P = jit_push_layout();
+    AccScratch acc(e);
+    {
+        RefScratch rn(e, RCX);
+        e.cmp_mem_tag(RBX, a.type, P.t_func, rn.sc);
+        rn.release();                      /* before the edge */
+    }
+    miss.push_back(e.j32(0x75));           /* jne: not a function */
+    e.load(acc.r, a.payload);              /* the FuncObject */
+    {
+        RefScratch rn(e, RCX);
+        e.cmp_mem_tag(acc.r, static_cast<int32_t>(P.fo_func), want,
+                      rn.sc);
+        rn.release();
+    }
+    miss.push_back(e.j32(0x75));           /* jne: another closure */
+}
+
 static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                         uint32_t pc, size_t begin, size_t end,
                         const std::vector<int> &remap,
@@ -25867,6 +26004,20 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         const SlotAddr a = slot_addr(in.a_slot());
         const JitPushLayout &P = jit_push_layout();
         e.bump_op(OpCode::GuardCalleeV);
+        if (g_ghoist_on && old_pc < g_ghoist_pc.size()
+                && g_ghoist_pc[old_pc]) {
+            /* G1: the region's preheader (or the resume stub that led
+             * here) checked this guard, and nothing in the loop writes
+             * its slot. BEFORE the COLD arm on purpose: forcing a miss
+             * happens at the preheader and the stubs, so a path that
+             * wrongly reaches the hot copy still runs guard-free here
+             * and is counted, instead of being masked by a second
+             * forced miss */
+#ifdef TESTS
+            e.bump_counter(&g_jit_ghoist_hot);
+#endif
+            return;
+        }
         if (jit_cold_forced(JC_GUARD)) {
             /* MYLANG_JIT_COLD=guard: the miss arm, unconditionally
              * (Jump's own emission) */
@@ -27829,6 +27980,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     /* #97 G3: the guards a local make.closure proves */
     if (jit_lever_off(JL_GPROOF) || !jit_guard_facts(chunk, g_guard_proven))
         g_guard_proven.clear();
+    g_ghoist_on = false;        /* G1 state never crosses a chunk */
+    g_ghoist_pc.clear();
 
     /* C4d: the struct-identity facts, over the FINAL code and with the
      * entry-stub pcs (bottom - a resume brings no history) now known. */
@@ -28090,6 +28243,7 @@ retry_emission:
          */
         g_hoist = JitHoist{};
         g_hoist2 = JitHoist{};
+        g_ghoist_on = false;    /* #97 G1: per-RUN, like the pair */
         std::vector<HoistRegion> hregs =
             jit_hoist_pick(chunk, begin, end, entries);
         /* C4e: the ctors this run's loop preheaders can establish */
@@ -28098,9 +28252,33 @@ retry_emission:
             jit_pick_ctor_establish(chunk, begin, end, entries,
                                     g_est_pc, g_est_at);
         if (jit_lever_off(JL_HOIST))
-            hregs.clear();
+            hregs.erase(std::remove_if(hregs.begin(), hregs.end(),
+                                       [](const HoistRegion &h) {
+                                           return h.base >= 0;
+                                       }),
+                        hregs.end());
         else if (jit_lever_off(JL_HOIST2))
             for (HoistRegion &hr : hregs) hr.base2 = -1;
+        /* #97 G1: a guard region's cold copy is entered from its
+         * preheader, which sits before any C4e establish at T - a
+         * region holding an established ctor would run that ctor's
+         * guard-free form unestablished. None exists today; decline. */
+        hregs.erase(std::remove_if(hregs.begin(), hregs.end(),
+            [&](const HoistRegion &h) {
+                if (h.base >= 0)
+                    return false;
+                for (size_t p = h.T; p <= h.L; p++)
+                    if ((p < g_est_pc.size() && g_est_pc[p])
+                            || g_est_at.count(p))
+                        return true;
+                return false;
+            }), hregs.end());
+        /* #97 G1: a guard region claims no register - only an ELEMENT
+         * region's r10/r11 pair is a clobber */
+        bool has_elem_hoist = false;
+        for (const HoistRegion &hr : hregs)
+            if (hr.base >= 0)
+                has_elem_hoist = true;
         std::vector<int> fhot;                    /* C2a float picks */
         std::vector<int> hot_counts;
         std::vector<int> textra, textra_f;        /* C3: type-elided */
@@ -28121,7 +28299,7 @@ retry_emission:
         const uint32_t tagres =
             e.grant_tag_regs(run_needs_float_tag(chunk, begin, end));
         const uint32_t xclob =
-            jit_xcache_clobber(chunk, begin, end, !hregs.empty(),
+            jit_xcache_clobber(chunk, begin, end, has_elem_hoist,
                                tagres);
         /* #123: the budget is simply HOW MANY REGISTERS ARE LEFT -
          * every allocatable one this run has not denied (xclob) and
@@ -29853,6 +30031,32 @@ retry_emission:
                 g_hoist.active = false;
                 g_hoist2.active = false;
             }
+            if (g_ghoist_on && pc == g_ghoist_end) {
+                g_ghoist_on = false;
+                std::fill(g_ghoist_pc.begin(), g_ghoist_pc.end(), 0);
+            }
+            if (hri < hregs.size() && pc == hregs[hri].T
+                    && hregs[hri].base < 0) {
+                /* #97 G1: the GUARD region's preheader - each hoisted
+                 * guard once; a miss runs the cold copy (the ordinary,
+                 * guarded emission). Before label[T]: the back edge
+                 * lands after it. */
+                const HoistRegion &hr = hregs[hri];
+                std::vector<size_t> &cold = h_cold[hri];
+                for (const size_t gp : hr.guards)
+                    emit_guard_check(e, chunk, chunk.code[gp], cold,
+                                     jit_cold_forced(JC_GUARD));
+#ifdef TESTS
+                e.bump_counter(&g_jit_ghoist_pre);
+#endif
+                g_ghoist_pc.assign(n, 0);
+                for (const size_t gp : hr.guards)
+                    g_ghoist_pc[gp] = 1;
+                g_ghoist_on = true;
+                g_ghoist_end = hr.L + 1;
+                g_fwd = JitFwd{};                 /* the checks used rax */
+                hri++;
+            }
             if (hri < hregs.size() && pc == hregs[hri].T) {
                 /* B3: the region claims its pair THROUGH THE MODEL.
                  * A pin holding r10/r11 (the pick is optimistic about
@@ -30294,6 +30498,10 @@ retry_emission:
          * alone; region-internal branches patch against the copy's own
          * labels, exits against the main stream's, and the fall-through
          * end rejoins after the region. */
+        /* #97 G1: every guard stays a guard in a cold copy; and each
+         * copy's labels outlive it, for the resume stubs below */
+        g_ghoist_on = false;
+        std::vector<std::vector<size_t>> cold_labels(hregs.size());
         for (size_t ri = 0; ri < hregs.size() && emit_ok; ri++) {
             const size_t cT = hregs[ri].T, cL = hregs[ri].L;
             for (const size_t j : h_cold[ri])
@@ -30402,6 +30610,7 @@ retry_emission:
                 cold_label[pc - cT] = e.pos();
                 emit_one(pc, /*in_cold=*/true, cL + 1);
             }
+            cold_labels[ri] = cold_label;
             cur_fix = &fixups;
             if (!emit_ok)
                 break;
@@ -30602,6 +30811,28 @@ retry_emission:
 #ifdef TESTS
             e.bump_counter(&g_jit_entry_resume);
 #endif
+            /* #97 G1: a resume INSIDE a guard region lands in its HOT
+             * copy only if the region's guards still hold - a miss-arm
+             * call that switched ran with some other closure in the
+             * slot, and the rest of that iteration and every later one
+             * belong to the COLD copy, at the same pc */
+            for (size_t ri = 0; ri < hregs.size(); ri++) {
+                const HoistRegion &hr = hregs[ri];
+                if (hr.base >= 0 || pe.first < hr.T || pe.first > hr.L
+                        || cold_labels[ri].empty())
+                    continue;
+                /* counted BEFORE the checks: a miss leaves from them */
+#ifdef TESTS
+                e.bump_counter(&g_jit_ghoist_stub);
+#endif
+                std::vector<size_t> miss;
+                for (const size_t gp : hr.guards)
+                    emit_guard_check(e, chunk, chunk.code[gp], miss,
+                                     jit_cold_forced(JC_GUARD));
+                const size_t ct = cold_labels[ri][pe.first - hr.T];
+                for (const size_t at : miss)
+                    e.patch32(at, static_cast<uint32_t>(ct - (at + 4)));
+            }
             const size_t tgt = label[pe.first - begin];
             e.u8(0xE9);
             e.u32(static_cast<uint32_t>(

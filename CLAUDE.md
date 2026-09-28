@@ -1467,7 +1467,12 @@ collision). Three nets now:
   vfquiet (#97 R4, the quiet vframe of a frameless leaf), gproof (#97
   G3: an inline-cache guard a local `make.closure` proves emits
   nothing - `jit_guard_facts`, recomputed over the bytecode being
-  run, so sound on an image), `all`.
+  run, so sound on an image), ghoist (#97 G1: a loop whose inline-
+  cache guards read a slot the loop never writes checks them once,
+  before the loop - a C1 hoist region with no element base; every
+  post-call resume stub inside it RE-CHECKS the guards and resumes in
+  the cold copy on a miss, since a switched call can come back into
+  the loop), `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the

@@ -16832,7 +16832,9 @@ closure_inline_parity()
                                               false, false, true, &v);
         const unsigned long s0 = g_bc_inline_value_splices;
 #if ML_JIT_SUPPORTED
-        const unsigned long h0 = g_jit_guard_hits;
+        /* a guard falls into its body per iteration (hits) or, hoisted
+         * out of its loop (#97 G1), executes as nothing (ghoist_hot) */
+        const unsigned long h0 = g_jit_guard_hits + g_jit_ghoist_hot;
 #endif
         const struct { const char *name; bool jit, splice; } cfgs[] = {
             { "vm -nbi", false, false }, { "jit -nbi", true, false },
@@ -16856,11 +16858,11 @@ closure_inline_parity()
         {
             const unsigned ce = g_jit_cold_extra;
             g_jit_cold_extra |= JIT_COLD_GUARD_BIT;
-            const unsigned long hm = g_jit_guard_hits;
+            const unsigned long hm = g_jit_guard_hits + g_jit_ghoist_hot;
             const std::string got = engine_run_bt(src, ExecEngine::Vm,
                                                   true, true, true, &v);
             g_jit_cold_extra = ce;
-            if (got != ref || g_jit_guard_hits != hm) {
+            if (got != ref || g_jit_guard_hits + g_jit_ghoist_hot != hm) {
                 cout << "  closure_inline_parity [" << p[0] << "] every "
                      << "guard MISSING: " << (got != ref ? "differs from "
                      "the tree-walker" : "a guard still hit") << "\n--- tw\n"
@@ -16890,10 +16892,26 @@ closure_inline_parity()
             ok = false;
         }
 #if ML_JIT_SUPPORTED
-        if (g_jit_guard_hits == h0) {
+        if (g_jit_guard_hits + g_jit_ghoist_hot == h0) {
             cout << "  closure_inline_parity [" << p[0]
                  << "]: no emitted guard fell into an inlined body\n";
             ok = false;
+        }
+        /* G1 off: the per-iteration guard is the form every hoisted
+         * guard's cold copy still runs, so it keeps its own reach */
+        {
+            const unsigned oe = g_jit_off_extra;
+            g_jit_off_extra |= jit_lever_bit("ghoist");
+            const unsigned long hg = g_jit_guard_hits;
+            const std::string got = engine_run_bt(src, ExecEngine::Vm,
+                                                  true, true, true, &v);
+            g_jit_off_extra = oe;
+            if (got != ref || g_jit_guard_hits == hg) {
+                cout << "  closure_inline_parity [" << p[0] << "] ghoist "
+                     << "off: " << (got != ref ? "differs from the "
+                     "tree-walker" : "no per-iteration guard hit") << "\n";
+                ok = false;
+            }
         }
 #endif
     }
@@ -28022,6 +28040,139 @@ static bool myv_ref_slots_derived()
  * prints with the value splice OFF. Watched failing: a guard that always
  * hits runs the counter's body over the doubler's capture.
  */
+/*
+ * #97 G1: a loop whose inline-cache guards read a callee slot the loop
+ * never writes checks them ONCE, before the loop (a C1-style preheader
+ * over a GUARD region), runs a guard-free hot copy, and falls to the
+ * ordinary guarded cold copy on a miss. Every path must render what the
+ * tree-walker renders, and each must be proven to have RUN:
+ *  - HOT: the preheader passed and the hot copy's guards executed as
+ *    nothing (g_jit_ghoist_pre / g_jit_ghoist_hot, emitted-code only);
+ *  - COLD: every guard forced to miss (g_jit_cold_extra) - the preheader
+ *    fails and the cold copy runs (g_jit_cold_copy);
+ *  - RESUME: a call in the region resumes through a post-call stub
+ *    (the sync cap lowered to 1, frameless tier off - the
+ *    jit_post_call_entry recipe), and the stub RE-CHECKS the guards
+ *    (g_jit_ghoist_stub): hot when they hold, cold when forced to miss;
+ *  - NOT HOISTED: a loop that rebinds the slot keeps a per-iteration
+ *    guard (the preheader count does not move, the ordinary guard hits).
+ * The image half - a guard that really misses on a tampered image -
+ * is myv_closure_guard_tamper's, which now asserts the cold copy ran.
+ */
+static bool jit_guard_hoist_g1()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    bool ok = true;
+    const std::string hot_src =
+        "func mk(int s) { var c = s;\n"
+        "  return func [c] () { c++; return c; }; }\n"
+        "func ma(int b) { return func [b] (int k) { return b + k; }; }\n"
+        "var a = mk(runtime(10)); var add = ma(runtime(7));\n"
+        "var t = 0;\n"
+        "for (var i = 0; i < 50; i++) { t = t + a() + add(i); }\n"
+        "print(t, a());\n";
+    /* the loop's call is made from depth 1 with the sync cap at 1, so
+     * it declines the native push, runs interpreted and RETURNS through
+     * the post-call stub - inside the guard region. (A deep recursion
+     * is not enough: a frame past the cap is entered through a fresh
+     * activation, whose own calls are shallow again.) */
+    const std::string stub_src =
+        "func mk(int s) { var c = s;\n"
+        "  return func [c] (int k) { c = c + k; return c; }; }\n"
+        "func hb(int k) { if (k < 0) { var r = ha(k + 1); return r; }\n"
+        "  return k * 2; }\n"
+        "func ha(int k) { if (k < 0) { var r = hb(k + 1); return r; }\n"
+        "  return k * 3; }\n"
+        "func da(int n) {\n"
+        "  var f = mk(runtime(3));\n"
+        "  var s = 0;\n"
+        "  for (var i = 0; i < n; i++) s = s + f(i) + ha(i);\n"
+        "  return s + f(0); }\n"
+        "print(da(runtime(20)));\n";
+    /* the slot holds the right closure at loop ENTRY, so a preheader
+     * would pass - only the pick's "the loop writes it" rule keeps the
+     * guard per-iteration (with `var a` inside the loop the slot is none
+     * at entry and a wrongly-hoisted guard just goes cold, unseen) */
+    const std::string rebind_src =
+        "func mk(int s) { var c = s;\n"
+        "  return func [c] () { c++; return c; }; }\n"
+        "var t = 0;\n"
+        "var a = mk(runtime(0));\n"
+        "for (var i = 0; i < 20; i++) { t = t + a() + a(); a = mk(i); }\n"
+        "print(t);\n";
+    struct Cnt {
+        unsigned long pre, hot, stub, cold, hits;
+        static Cnt now()
+        {
+            return { g_jit_ghoist_pre, g_jit_ghoist_hot, g_jit_ghoist_stub,
+                     g_jit_cold_copy, g_jit_guard_hits };
+        }
+    };
+    const unsigned saved_off = g_jit_off_extra;
+    const unsigned saved_cold = g_jit_cold_extra;
+    const int saved_cap = jit_sync_depth_cap();
+    const auto run = [&](const char *name, const std::string &src,
+                         bool cold, bool resume) -> Cnt {
+        g_jit_cold_extra = cold ? (saved_cold | JIT_COLD_GUARD_BIT)
+                                : saved_cold;
+        if (resume) {
+            g_jit_off_extra = saved_off | jit_lever_bit("frameless");
+            jit_set_sync_depth_cap(1);
+        }
+        const Cnt c0 = Cnt::now();
+        const std::string ref = engine_run_bt(src, ExecEngine::TreeWalk,
+                                              false, false);
+        const std::string got = engine_run_bt(src, ExecEngine::Vm, true,
+                                              true);
+        const Cnt c1 = Cnt::now();
+        g_jit_off_extra = saved_off;
+        g_jit_cold_extra = saved_cold;
+        jit_set_sync_depth_cap(saved_cap);
+        if (ref.empty() || ref.find("EXC") != std::string::npos
+                || got != ref) {
+            fprintf(stderr, "jit_guard_hoist_g1 [%s%s]: jit differs from "
+                            "the tree-walker:\n--- tw\n%s--- jit\n%s",
+                    name, cold ? ", cold" : "", ref.c_str(), got.c_str());
+            ok = false;
+        }
+        return { c1.pre - c0.pre, c1.hot - c0.hot, c1.stub - c0.stub,
+                 c1.cold - c0.cold, c1.hits - c0.hits };
+    };
+    const auto need = [&](bool cond, const char *what) {
+        if (!cond) {
+            fprintf(stderr, "jit_guard_hoist_g1: %s\n", what);
+            ok = false;
+        }
+    };
+    Cnt d = run("hot", hot_src, false, false);
+    need(d.pre > 0 && d.hot >= 100, "HOT: the preheader or the hot copy "
+                                    "did not run");
+    need(d.cold == 0, "HOT: the cold copy ran with every guard holding");
+    d = run("hot", hot_src, true, false);
+    need(d.cold > 0 && d.hot == 0, "COLD: a failed preheader did not run "
+                                   "the cold copy (or ran the hot one)");
+    d = run("resume", stub_src, false, true);
+    need(d.stub > 0 && d.hot > 0, "RESUME: no stub inside a guard region "
+                                  "re-checked the guards");
+    need(d.cold == 0, "RESUME: a holding re-check went cold");
+    d = run("resume", stub_src, true, true);
+    if (!(d.stub > 0 && d.cold > 0 && d.hot == 0))
+        fprintf(stderr, "jit_guard_hoist_g1: resume cold: pre %lu hot %lu "
+                        "stub %lu cold %lu hits %lu\n", d.pre, d.hot,
+                d.stub, d.cold, d.hits);
+    need(d.stub > 0 && d.cold > 0 && d.hot == 0,
+         "RESUME COLD: a forced-miss re-check did not resume cold");
+    d = run("rebind", rebind_src, false, false);
+    need(d.pre == 0 && d.hits > 0, "REBIND: a loop that rebinds the slot "
+                                   "hoisted its guard");
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool myv_closure_guard_tamper()
 {
     const char *lines_arr[] = {
@@ -28091,7 +28242,19 @@ static bool myv_closure_guard_tamper()
     };
     try {
         size_t g_on = 0, g_off = 0;
+#if ML_JIT_SUPPORTED
+        const unsigned long cc0 = g_jit_cold_copy;
+#endif
         const std::string spliced = tampered_run(true, g_on);
+#if ML_JIT_SUPPORTED
+        /* #97 G1: the loop's guards are hoisted, so the tamper is seen
+         * by the PREHEADER - the guarded cold copy must be what ran */
+        if (g_jit_enabled && g_jit_cold_copy == cc0) {
+            fprintf(stderr, "myv_closure_guard_tamper: the hoisted guards' "
+                            "cold copy never ran\n");
+            ok = false;
+        }
+#endif
         const std::string plain = tampered_run(false, g_off);
         if (g_on < 2 || g_off != 0) {
             fprintf(stderr, "myv_closure_guard_tamper: %zu guards spliced, "
@@ -33506,13 +33669,16 @@ static bool vm_disasm_driver_jit_parity()
     const unsigned long entries = g_jit_frameless_entries - e0;
     const unsigned long sites = g_jit_frameless_sites - s0;
     bool ok = true;
-    /* FOUR, not two: the two factories are leaves main calls once
-     * each (`make.closure; ret`), so they qualify exactly like the two
-     * closures - the count JITSTATS reports for bench/my/78 */
-    if (entries != 4 || sites != 4) {
+    /* FOUR entries, not two: the two factories are leaves main calls
+     * once each (`make.closure; ret`), so they qualify exactly like the
+     * two closures - the count JITSTATS reports for bench/my/78. SIX
+     * sites: the factory calls, the two closure calls in the inline
+     * cache's miss arms, and those two again in the loop's COLD copy
+     * (#97 G1 versions the loop, and the counter counts emissions) */
+    if (entries != 4 || sites != 6) {
         fprintf(stderr, "vm_disasm_driver_jit_parity: the dump driver "
                         "emitted %lu frameless entries and %lu frameless "
-                        "sites (want 4 and 4) - it is not running the "
+                        "sites (want 4 and 6) - it is not running the "
                         "sequence a run does\n", entries, sites);
         ok = false;
     }
@@ -48277,6 +48443,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 G3 - a guard a local make.closure proves is elided, "
       "and a tampered image keeps it",
       jit_guard_proof_g3 },
+    { "jit: #97 G1 - a loop-invariant guard is checked once before the "
+      "loop; the cold copy and the resume stubs keep it sound",
+      jit_guard_hoist_g1 },
     { "myv: the verifier bounds a planned ctor's mini-run (small-938, a "
       "load-time HANG)", myv_verify_ctor_minirun },
     { "jit: #97 inc 3 (W1/W2) - the CALLER builds the frameless window "
