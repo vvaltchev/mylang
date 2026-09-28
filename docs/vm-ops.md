@@ -162,11 +162,12 @@ so it covers int/float/str/dyn sub-arrays uniformly). Handles the non-indexed
 `foreach (a, _, c in pairs)` AND the indexed `foreach (i, _, v in indexed
 rows)`. A non-local target still falls back. `20_foreach_unpack` (flat) 0.80x,
 `75_indexed_unpack` (indexed str) 0.71x vs the tree-walker.
-**⛔ SINCE 2026-09-28 A GENERAL-ROW UNPACK IS LOWERED, AND
-`UnpackElemValue` IS NO LONGER EMITTED** (the VM keeps it for an image; no
-codegen path produces it). The op bound every element through a C++ helper -
-~180 Ir per row on 75_indexed_unpack - so a general row (`unpack_elem_value`,
-indexed or not, with or without `_`) is now
+**⛔ SINCE 2026-09-28 A GENERAL-ROW UNPACK WITH A `_` IS LOWERED; since
+2026-09-29 (#74) one with CONSECUTIVE targets is `UnpackElemValue` again**,
+whose JIT case has an inline tier that borrows the row from `c[i]`, checks
+its length once and copies each element into its target (the helper serves
+the declines). The op used to bind every element through a C++ helper -
+~180 Ir per row on 75_indexed_unpack - so a general row with a `_` is
 `row = c[i]` (LoadElemValue - the #53 OOB of a shrunk container) +
 **`UnpackLenCheck row, N`** (the foreach's strict length error, `b` bit 0)
 + one **LoadElemValue per target** (`_` reads nothing), which take

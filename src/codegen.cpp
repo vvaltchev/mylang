@@ -7973,7 +7973,7 @@ struct Codegen {
         z.set_a(int_lit(0));
         code.push_back(z);
         /* the current ROW (the lowered general-row unpack reads it) */
-        const int row = flat ? -1 : alloc_temp();
+        const int row = flat || consecutive ? -1 : alloc_temp();
 
         const int saved_base = temp_base;
         temp_base = next_temp;   /* reserve c/n/(i)/row */
@@ -7990,9 +7990,10 @@ struct Codegen {
          * op that binds the scalars (UnpackElemInt/Float, or the targets
          * pool for a `_` / non-consecutive layout): lowering it measured
          * -2% on 20_foreach_unpack. A GENERAL row (unpack_elem_value -
-         * strings, mixed, 75_indexed_unpack's shape) is LOWERED, because
-         * the op bound every element through a C++ helper (~180 Ir per
-         * row there) that the element tiers do inline:
+         * strings, mixed, 75_indexed_unpack's shape) with CONSECUTIVE
+         * targets is UnpackElemValue, whose JIT tier borrows the row and
+         * binds every element inline (#74); one with a `_` is LOWERED,
+         * since the op's helper (~180 Ir per row) is all it has there:
          *
          *     row = c[i]                     LoadElemValue (the OOB of a
          *                                    shrunk container, #53)
@@ -8001,10 +8002,16 @@ struct Codegen {
          *
          * All carets are the container's, as the op's were.
          */
-        if (flat) {
+        if (flat || consecutive) {
             CgInstr up;
             if (consecutive) {
-                up.op = fe->unpack_elem_th == TypeHint::i
+                /* #74: a GENERAL row whose targets are consecutive takes
+                 * the one op too - its JIT tier borrows the row from
+                 * c[i] and copies each element straight into its target
+                 * (no row temp to retain, release and re-navigate per
+                 * element, which the lowering below pays) */
+                up.op = !flat ? OpCode::UnpackElemValue
+                      : fe->unpack_elem_th == TypeHint::i
                             ? OpCode::UnpackElemInt
                             : OpCode::UnpackElemFloat;
                 up.target = unpack_base;

@@ -16035,3 +16035,42 @@ the loop). Watched failing: the flag always "flat" (corpus 48), the length
 check never raising (four -rt differentials + corpus 48), the strs arm
 without its retain (corpus: 08, 30, 48), an opt array lowered (the shape
 test only - no corpus program destructures an opt array).
+
+**#74 - THE GENERAL-ROW UNPACK TIER (2026-09-29): UnpackElemValue comes
+back, inline.** The lowering above left 75 at 189 Ir per row, and
+`jitprofile.py` showed why: the row went into a TEMP - a retain of the
+row, a release of the previous one - and each element read then
+re-navigated that temp from scratch (its type, slice byte, kind and
+bounds), three navigations and a refcount pair for a value alive for
+three instructions. For a general row whose targets are CONSECUTIVE,
+codegen emits `UnpackElemValue` again and its JIT case gains an inline
+tier: navigate the container to `&c[i]` (non-slice, general), check the
+ROW in place - borrowed, the container's slot holds it for the whole op:
+an array, not a slice, general storage, exactly N elements - then per
+element the boxed-element tier's lifecycle (retain before touching the
+target, dec-release the old value with a cold full-release arm for the
+last count, decline an exception value or a slice). A STRING is tested
+first on both sides, so the common element pays neither of those
+gates. A decline part-way through a row is sound because the helper
+rebinds all N from scratch. `_` layouts stay lowered. **StrLen joins
+lever A as a producer** (tag t_int: one load from the string window, no
+slow path) - the `len(a) + len(b)` chain stops storing and reloading its
+temps.
+
+Ir (scale3 - scale1, `OPT=1 ASSERTS=0`): **75_indexed_unpack 189 -> 118
+per row (-37.6%)**, 29_str_slice_readonly -1.86%, 73 / 20 / 28 / 30 / 32 /
+62 flat. `my/cpp` (one run): 75 6.24x -> **4.52x**; 73 2.29x. Both are
+under #74's 5x.
+
+**THE ROW-SLICE GUARD IS NOT REDUNDANT WITH THE LENGTH CHECK**, and the
+first sabotage said it was: the length check reads the row's SharedObject,
+i.e. the PARENT's whole vector, so a view is usually refused by it anyway.
+But a SHORT view of a parent that has exactly N elements - `big2[0:1]` of
+a two-element array - passes it, and without the guard the tier binds both
+parent elements where the strict error is required. That case is now in
+both tests. Pinned by `jit_unpackv_native` (the fast counter, then six
+declines each proven TAKEN through the ledger) and
+`tests/functional/53_unpack_value_rows.my`; watched failing, each alone:
+the element retain dropped (ASan), the length check dropped, the row-slice
+guard dropped (the short view), and the last-reference test disabled (a
+leak - LSan).

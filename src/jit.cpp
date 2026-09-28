@@ -133,6 +133,8 @@ unsigned long g_jit_peep_fold = 0;     /* #101: literal cmp folded to an
                                         * immediate (COMPILE-time count) */
 unsigned long g_jit_peep_selfmov = 0;  /* #101: mov X,X suppressed
                                         * (COMPILE-time count) */
+unsigned long g_jit_unpackv_fast = 0;  /* #74: inline general-row
+                                        * unpacks (UnpackElemValue) */
 unsigned long g_jit_elemv_fast = 0;    /* #97: inline boxed-element reads
                                         * (bumped from EMITTED code) */
 unsigned long g_jit_storev_fast = 0;   /* #97: inline boxed-element stores
@@ -13533,6 +13535,9 @@ bool jit_fwd_op_is_producer(OpCode op)
      * arming site admits it only in front of a ReturnV (a comparator's
      * `return a < b` - the callback path's dead temp) */
     case OpCode::CmpIntV:
+    /* #74: len(str), an int loaded straight from the string window -
+     * no slow path, so the value is in the bus register at every exit */
+    case OpCode::StrLen:
     /*
      * #113: the PROVEN-SCALAR capture read. Its payload is the whole
      * value, it lands in the bus register, and its helper arm REJOINS -
@@ -13588,6 +13593,8 @@ static const void *jit_fwd_bus_tag(OpCode op)
         return jit_layout().t_int;
     case OpCode::CmpIntV:
         return jit_layout().t_bool;   /* a REAL bool, by construction */
+    case OpCode::StrLen:
+        return jit_layout().t_int;
     default:
         return nullptr;
     }
@@ -14456,6 +14463,7 @@ void jit_stats_report()
         { "peep_fold",        &g_jit_peep_fold },
         { "peep_selfmov",     &g_jit_peep_selfmov },
         { "elemv_fast",       &g_jit_elemv_fast },
+        { "unpackv_fast",     &g_jit_unpackv_fast },
         { "storev_fast",      &g_jit_storev_fast },
         { "memberv_fast",     &g_jit_memberv_fast },
         { "closure_fast",     &g_jit_closure_fast },
@@ -23706,6 +23714,182 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                        : in.op == OpCode::UnpackElemFloat ? 1 : 2;
         const bool tg = in.op == OpCode::UnpackElemTargets;
         AccScratch acc(e);
+        /*
+         * #74 - THE GENERAL-ROW INLINE TIER (UnpackElemValue: `foreach
+         * (i, name, val in indexed rows)` over rows of strings). The
+         * lowered form this replaces loaded the row into a temp -
+         * retaining it, releasing the previous row - and then every
+         * element read re-navigated that temp from scratch. Here the ROW
+         * IS BORROWED: the container's own slot holds it for the whole
+         * op, so it is read in place from c[i]; its length is checked
+         * once against N (the strict unpack - a mismatch declines to the
+         * helper, which raises the foreach's error); and each element is
+         * copied straight into its target with the boxed-element tier's
+         * lifecycle (LoadElemValue, above): RETAIN the element before
+         * touching the target, dec-RELEASE the target's old value with a
+         * COLD arm for the last count, DECLINE an exception value or a
+         * slice on either side. A decline after some targets are written
+         * is sound: the helper rebinds all N from scratch, and a target
+         * already holding its element takes it again unchanged (the
+         * gates therefore run per element, beside its retain).
+         * The targets must not overlap the container or the index slot
+         * (checked here); scratch is grant-only, as there.
+         */
+        DeclineJumps uv_slows;
+        size_t uv_done = SIZE_MAX;
+        const int uv_n = in.op == OpCode::UnpackElemValue && in.b_is_lit()
+                         ? static_cast<int>(in.b_lit()) : 0;
+        const auto uv_overlaps = [&](int s) {
+            return s >= in.target && s < in.target + uv_n;
+        };
+        int uv_s[3] = { -1, -1, -1 };
+        if (uv_n >= 1 && uv_n <= 8 && jit_layout().elemv_inline_ok
+                && !uv_overlaps(in.target2)
+                && (in.a_is_lit() || !uv_overlaps(in.a_slot()))) {
+            for (int k = 0; k < 3; k++) {
+                uv_s[k] = e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                          /*transient=*/true);
+                if (uv_s[k] < 0)
+                    break;
+            }
+        }
+        if (uv_s[2] >= 0) {
+            const JitLayout &L = jit_layout();
+            const SlotAddr base = slot_addr(in.target2);
+            const uint8_t s1 = static_cast<uint8_t>(uv_s[0]);
+            const uint8_t s2 = static_cast<uint8_t>(uv_s[1]);
+            const uint8_t s3 = static_cast<uint8_t>(uv_s[2]);
+            const auto decline_ne = [&](JitDecline why) {
+                decline_jump(e, uv_slows, 0x75, why);     /* jne -> slow */
+            };
+            /* the CONTAINER: a non-slice general array */
+            e.load(s1, base.type);
+            e.cmp_reg_tag_via(s1, L.t_arr, s2);
+            decline_ne(JD_unpackv_base_not_arr);
+            e.cmp_byte_slot(base.payload + L.slice_off, 0);
+            decline_ne(JD_unpackv_base_slice);
+            e.load(s1, base.payload);                     /* shobj */
+            e.cmp_byte_base(s1, L.kind_off, L.kind_general);
+            decline_ne(JD_unpackv_base_kind);
+            load_operand(e, acc.r, in.a_is_lit(), in.a_lit(),
+                         in.a_slot());                    /* the index */
+            e.imul_rr_imm8(acc.r, acc.r,
+                           static_cast<uint8_t>(sizeof(LValue)));
+            decline_jump(e, uv_slows, 0x70, JD_unpackv_scale_wrap);
+            e.load_base(s2, s1, L.data_off + 8);          /* end */
+            e.load_base(s1, s1, L.data_off);              /* data */
+            e.sub_rr(s2, s1);
+            e.cmp_rr(acc.r, s2);
+            decline_jump(e, uv_slows, 0x73,     /* jae: negative OR OOB */
+                         JD_unpackv_bounds);
+            e.add_rr(acc.r, s1);                          /* &row */
+            /* the ROW: a non-slice general array of exactly N */
+            e.load_base(s1, acc.r, static_cast<int32_t>(L.off_type));
+            e.cmp_reg_tag_via(s1, L.t_arr, s2);
+            decline_ne(JD_unpackv_row_not_arr);
+            e.cmp_byte_base(acc.r, static_cast<int32_t>(L.off_payload)
+                                       + L.slice_off, 0);
+            decline_ne(JD_unpackv_row_slice);
+            e.load_base(s1, acc.r, static_cast<int32_t>(L.off_payload));
+            e.cmp_byte_base(s1, L.kind_off, L.kind_general);
+            decline_ne(JD_unpackv_row_kind);
+            e.load_base(s3, s1, L.data_off);              /* row data */
+            e.load_base(s2, s1, L.data_off + 8);          /* row end */
+            e.sub_rr(s2, s3);
+            e.cmp_reg_imm(s2, uv_n * static_cast<int32_t>(sizeof(LValue)));
+            decline_ne(JD_unpackv_len);
+            /* per element: its gates, RETAIN, release the target's old
+             * value, copy. A STRING - the common element - is tested
+             * FIRST on both sides, so it pays neither the exception nor
+             * the slice gate. A decline part-way through is sound: the
+             * helper rebinds all N targets from scratch, and one that
+             * already holds its element takes it again unchanged. */
+            for (int k = 0; k < uv_n; k++) {
+                const int32_t eo = k * static_cast<int32_t>(sizeof(LValue));
+                const int tslot = in.target + k;
+                const SlotAddr dst = slot_addr(tslot);
+                e.lea_base(acc.r, s3, eo);                /* &elem */
+                e.load_base(s1, acc.r, static_cast<int32_t>(L.off_type));
+                e.load32_base(s2, s1, L.type_t_off);
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_str_val));
+                const size_t j_triv = e.j8(0x72);         /* jb: trivial */
+                const size_t j_str = e.j8(0x74);          /* je: a str */
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_ex_val));
+                decline_jump(e, uv_slows, 0x74, JD_unpackv_elem_ex);
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_arr_val));
+                const size_t j_nsl = e.j8(0x75);
+                e.cmp_byte_base(acc.r, static_cast<int32_t>(L.off_payload)
+                                           + L.slice_off, 0);
+                decline_ne(JD_unpackv_elem_slice);
+                e.patch8(j_nsl, e.pos());
+                e.patch8(j_str, e.pos());
+                e.load_base(s2, acc.r, static_cast<int32_t>(L.off_payload));
+                e.inc_dword_base(s2);                     /* RETAIN */
+                e.patch8(j_triv, e.pos());
+                /* RELEASE the target's old value (compile-skipped when the
+                 * slot can never hold a reference) */
+                if (std::binary_search(ck.ref_slots.begin(),
+                                       ck.ref_slots.end(),
+                                       static_cast<int32_t>(tslot))) {
+                    e.load(s2, dst.type);
+                    e.load32_base(s2, s2, L.type_t_off);
+                    e.cmp_reg32_imm32(s2,
+                                      static_cast<uint32_t>(L.t_str_val));
+                    const size_t j_st = e.j32(0x72);      /* jb: trivial */
+                    const size_t j_ostr = e.j8(0x74);     /* je: a str */
+                    e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_ex_val));
+                    const size_t j_cold = e.j32(0x74);
+                    e.cmp_reg32_imm32(s2,
+                                      static_cast<uint32_t>(L.t_arr_val));
+                    const size_t j_ons = e.j8(0x75);
+                    e.cmp_byte_slot(dst.payload + L.slice_off, 0);
+                    const size_t j_cold2 = e.j32(0x75);
+                    e.patch8(j_ons, e.pos());
+                    e.patch8(j_ostr, e.pos());
+                    e.load(s2, dst.payload);
+                    e.cmp_dword_base_imm32(s2, 0, 1);
+                    const size_t j_cold3 = e.j32(0x74);   /* last ref */
+                    e.dec_dword_base(s2);
+                    const size_t j_st2 = e.j32(0xEB);
+                    /* the COLD full release: acc/s1/s3 are caller-saved
+                     * grants the C++ call clobbers */
+                    e.patch32_here(j_cold);
+                    e.patch32_here(j_cold2);
+                    e.patch32_here(j_cold3);
+                    e.push_reg(acc.r);
+                    e.push_reg(s1);
+                    e.push_reg(s3);
+                    emit_call_prologue(e);
+                    e.lea(REG_ARG0, dst.payload
+                                        - static_cast<int32_t>(
+                                              slot_addr(0).payload));
+                    e.call_direct(reinterpret_cast<const void *>(
+                                      jit_release_slot));
+                    emit_call_epilogue(e);
+                    e.pop_reg(s3);
+                    e.pop_reg(s1);
+                    e.pop_reg(acc.r);
+                    e.patch32_here(j_st);
+                    e.patch32_here(j_st2);
+                }
+                /* the copy: 24 payload bytes + the Type* */
+                for (int32_t o = 0; o < 24; o += 8) {
+                    e.load_base(s2, acc.r,
+                                static_cast<int32_t>(L.off_payload) + o);
+                    e.store(s2, dst.payload + o);
+                }
+                e.store(s1, dst.type);
+            }
+#ifdef TESTS
+            e.bump_counter(&g_jit_unpackv_fast);
+#endif
+            e.bump_op(OpCode::UnpackElemValue);   /* the helper's twin */
+            uv_done = e.j32(0xEB);                        /* -> done */
+            decline_land(e, uv_slows);
+        }
+        for (int k = 0; k < 3; k++)
+            if (uv_s[k] >= 0)
+                e.free_scratch(static_cast<uint8_t>(uv_s[k]));
         load_operand(e, acc.r, in.a_is_lit(), in.a_lit(), in.a_slot());
         emit_call_prologue(e);
         e.mov_imm(RDI, static_cast<uint64_t>(
@@ -23727,6 +23911,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
+        if (uv_done != SIZE_MAX)
+            e.patch32_here(uv_done);
         return true;
     }
 
@@ -24202,7 +24388,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 #ifdef TESTS
         e.bump_counter(&g_jit_strlen_fast);
 #endif
-        store_dst(e, ck, acc.r, in.target, pc);
+        /* #74: lever A, the PRODUCER side (the shifts' shape) */
+        const bool fw = g_fwd.prod == in.target;
+        if (!(fw && g_fwd.skip_write))
+            store_dst(e, ck, acc.r, in.target, pc);
+        if (fw) {
+            g_fwd.res_reg = acc.r;
+            g_fwd.armed = true;
+        }
         return true;
     }
 

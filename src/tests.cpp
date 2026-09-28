@@ -28806,8 +28806,9 @@ static bool myv_spliced_closure_span()
  */
 /*
  * THE LOWERED STRICT UNPACK - a destructure of a PROVEN array (multi-assign)
- * and a GENERAL-row foreach unpack become UnpackLenCheck + one element read
- * per target. The shape test: it must fire where the rvalue is proven an
+ * and a GENERAL-row foreach unpack with a `_` become UnpackLenCheck + one
+ * element read per target (a general row with consecutive targets keeps
+ * UnpackElemValue, #74). The shape test: it must fire where the rvalue is proven an
  * array (typed reads behind the flat-kind flag for int/float elements,
  * LoadElemValue otherwise), and must NOT fire for a `dyn` rvalue, an OPT
  * array (a runtime none SPREADS - a different operation), a compound
@@ -28834,9 +28835,16 @@ static bool unpack_lowering_shapes()
         { "string destructure (value reads only)",
           "var s = [\"a\", \"b\"]; var x, y = s; print(x + y);\n",
           true, OpCode::OpCount_ },
-        { "general-row foreach (the 75 shape)",
+        /* #74: a general row with CONSECUTIVE targets keeps the one op -
+         * UnpackElemValue, whose JIT tier borrows the row - and only a
+         * `_` (non-consecutive) layout is lowered */
+        { "general-row foreach (the 75 shape: UnpackElemValue)",
           "var rows = [[\"a\", \"b\"]]; var n = 0;\n"
           "foreach (var x, y in rows) n += len(x) + len(y); print(n);\n",
+          false, OpCode::UnpackElemValue },
+        { "general-row foreach with a `_` (lowered)",
+          "var rows = [[\"a\", \"b\", \"c\"]]; var n = 0;\n"
+          "foreach (var x, _, z in rows) n += len(x) + len(z); print(n);\n",
           true, OpCode::OpCount_ },
         { "dyn rvalue (kept: MultiUnpackV)",
           "var p = [1, 2]; var dyn x = 0; var dyn y = 0;\n"
@@ -43552,6 +43560,149 @@ static bool jit_load_elem2_native()
 }
 
 /*
+ * #74: THE GENERAL-ROW UNPACK TIER (UnpackElemValue - `foreach (i, a, b in
+ * indexed rows)` over rows of strings, 75_indexed_unpack's shape). It
+ * borrows the row from rows[i], checks its length once and copies each
+ * element into its target; g_jit_unpackv_fast is bumped by the EMITTED
+ * code only. Every guard is proven TAKEN through the decline ledger, as
+ * jit_elemv_native's are; the helper serves each decline and must give
+ * the same answer (the corpus checks values - this checks the guards).
+ */
+static bool jit_unpackv_native()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (Exception &e) {
+            fprintf(stderr, "jit_unpackv_native: %s: %s\n", e.name,
+                    e.msg ? e.msg : "");
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    const unsigned long f0 = g_jit_unpackv_fast;
+    /* the FAST shape, plus the COLD full release: the body replaces the
+     * row it just unpacked, so the next bind finds the target holding
+     * the LAST reference to its old string */
+    if (!run({
+            "var rows = [];",
+            "for (var j = 0; j < 6; j++)",
+            "  append(rows, [\"n\" + str(j), str(j * 2)]);",
+            "var acc = 0;",
+            "for (var r = 0; r < 4; r++)",
+            "  foreach (var i, a, b in indexed rows) {",
+            "    acc += i + len(a) + len(b);",
+            "    rows[i] = [a + \"!\", b];",
+            "  }",
+            "assert(acc == 172);",
+            "assert(rows[5][0] == \"n5!!!!\");",
+            /* every element kind the tier binds: trivial, str, array,
+             * dict, a closure */
+            "var dyn mix = [[1, \"s\"], [2.5, [1, 2]], [{\"k\": 1}, none],",
+            "               [func() => 7, true]];",
+            "var n = 0;",
+            "foreach (var p, q in mix) n += 1;",
+            "assert(n == 4);" }))
+        return false;
+    if (g_jit_unpackv_fast <= f0) {
+        fprintf(stderr, "jit_unpackv_native: the INLINE tier DID NOT "
+                        "RUN\n");
+        return false;
+    }
+    unsigned long d0[JD_COUNT];
+    for (int r = 0; r < JD_COUNT; r++)
+        d0[r] = g_jit_decline[r];
+    if (!run({
+            /* a SLICE container */
+            "var rows = [[\"a\", \"b\"], [\"c\", \"d\"], [\"e\", \"f\"]];",
+            "var sl = rows[1:3];",
+            "var s = \"\";",
+            "foreach (var x, y in sl) s = s + x + y;",
+            "assert(s == \"cdef\");",
+            /* a SLICE row */
+            "var big = [\"p\", \"q\", \"r\"];",
+            /* (offset 1: a raw read of a view starting at 0 would
+             * coincide with the right answer) */
+            "var r2 = [big[1:3], [\"s\", \"t\"]];",
+            "s = \"\";",
+            "foreach (var x, y in r2) s = s + x + y;",
+            "assert(s == \"qrst\");",
+            /* a FLAT (strs) row: split() builds one */
+            "var r3 = [split(\"u v\", \" \"), [\"w\", \"z\"]];",
+            "s = \"\";",
+            "foreach (var x, y in r3) s = s + x + y;",
+            "assert(s == \"uvwz\");",
+            /* a SLICE element */
+            "var r4 = [[big[1:3], \"k\"], [[\"m\"], \"l\"]];",
+            "var m = 0;",
+            "foreach (var x, y in r4) m += len(x);",
+            "assert(m == 3);",
+            /* an EXCEPTION element */
+            "var r5 = [[0, \"x\"], [1, \"y\"]];",
+            "try { var qq = [1]; qq[5] = 1; }",
+            "catch (OutOfBoundsEx as e) { r5[0][0] = e; }",
+            "s = \"\";",
+            "foreach (var x, y in r5) s = s + y;",
+            "assert(s == \"xy\");",
+            /* the WRONG LENGTH: the helper raises the strict error */
+            "var r6 = [[\"a\", \"b\"], [\"c\"]];",
+            "var caught = 0;",
+            "try { foreach (var x, y in r6) s = s + x; }",
+            "catch (TypeErrorEx) { caught = 1; }",
+            "assert(caught == 1);",
+            /* a short VIEW of a parent that has N elements: only the
+             * row-slice guard tells it from a right-length row (the
+             * length check reads the parent's vector) */
+            "var big2 = [\"p\", \"q\"];",
+            "var r7 = [big2[0:1]];",
+            "caught = 0;",
+            "try { foreach (var x, y in r7) s = s + x + y; }",
+            "catch (TypeErrorEx) { caught = 1; }",
+            "assert(caught == 1);" }))
+        return false;
+    /* unpackv_base_not_arr / _base_kind / _scale_wrap / _bounds /
+     * _row_not_arr are absent: the op is emitted only for a container
+     * proven array<array<...>>, iterated by its own counter below its
+     * length - an image's operands are the only way there (the
+     * ML_UNTRUSTED_CHECK tier-2 case), as for jit_elemv_native */
+    static const int want[] = {
+        JD_unpackv_base_slice, JD_unpackv_row_slice, JD_unpackv_row_kind,
+        JD_unpackv_len, JD_unpackv_elem_ex, JD_unpackv_elem_slice,
+    };
+    for (const int r : want) {
+        if (g_jit_decline[r] > d0[r])
+            continue;
+        fprintf(stderr, "jit_unpackv_native: the guard `%s` was never "
+                        "TAKEN - its case is vacuous\n",
+                jit_decline_name(r));
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
  * #97: THE BOXED-ELEMENT INLINE TIER (LoadElemValue). g_jit_elemv_fast is
  * bumped by the EMITTED fast path only - the helper serves the declines
  * and makes the values right too, so requiring the counter strictly is
@@ -46758,10 +46909,10 @@ static bool jit_op_nativized()
             "  return s;",
             "}",
             "assert(f(runtime([[1.5, 2.0], [0.5, 4.0]])) == 5.0);" } },
-        /* (UnpackElemValue is no longer emitted: a general-row foreach
-         * unpack lowers to LoadElemValue + UnpackLenCheck, and the
-         * shape that used to reach it proves UnpackLenCheck instead.) */
-        { OpCode::UnpackLenCheck, {
+        /* #74: a general row with consecutive targets is UnpackElemValue
+         * again (its JIT tier borrows the row); a `_` layout is still
+         * lowered to LoadElemValue + UnpackLenCheck */
+        { OpCode::UnpackElemValue, {
             "func f(array<array<str>> a) {",
             "  var s = \"\";",
             "  foreach (x, y in a) s = s + x + y;",
@@ -46769,6 +46920,14 @@ static bool jit_op_nativized()
             "}",
             "assert(f(runtime([[\"a\", \"b\"], [\"c\", \"d\"]])) ==",
             "       \"abcd\");" } },
+        { OpCode::UnpackLenCheck, {
+            "func f(array<array<str>> a) {",
+            "  var s = \"\";",
+            "  foreach (x, _, z in a) s = s + x + z;",
+            "  return s;",
+            "}",
+            "assert(f(runtime([[\"a\", \"-\", \"b\"],",
+            "                  [\"c\", \"-\", \"d\"]])) == \"abcd\");" } },
         { OpCode::UnpackElemTargets, {
             "func f(array<array<int>> a) {",
             "  var s = 0;",
@@ -48919,6 +49078,10 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 the boxed-element inline read tier - fires on reference "
       "elements, DECLINES slice / t_ex / negative / scale-wrap index",
       jit_elemv_native },
+    { "jit: #74 the general-row unpack tier - borrows the row, binds each "
+      "element inline; declines slice / flat / wrong-length rows and "
+      "slice / t_ex elements",
+      jit_unpackv_native },
     { "jit: #97 the boxed-element inline STORE tier - fires on a general "
       "array, DECLINES const/readonly/slice/live-views/kind/bounds",
       jit_storev_native },
