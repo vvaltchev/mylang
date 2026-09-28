@@ -182,6 +182,11 @@ unsigned long g_jit_entry_pad_off = 0;
 unsigned long g_jit_pins_cs = 0;      /* REGCALL 1: runs whose pins
                                        * took the caller-saved bet */
 unsigned long g_jit_pins_cs_lost = 0; /* ...and re-emitted on losing */
+unsigned long g_jit_xcall_lost = 0; /* #124(b): runs re-emitted with the
+                                     * denial (a live pin in a loop) */
+unsigned long g_jit_xcall_brackets = 0; /* #124(b): call ops emitted
+                                         * with caller-saved pins written
+                                         * back around them */
 unsigned long g_jit_regcall_fargs = 0; /* REGCALL 4: float args sent
                                         * in xmm (emitted-code bumps) */
 unsigned long g_jit_regcall_fpinned = 0; /* ...and taken straight into
@@ -418,7 +423,7 @@ enum JitLever {
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
     JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA,
     JL_FRAMELESS, JL_CAPPROT, JL_VFQUIET, JL_GPROOF, JL_GHOIST, JL_REGCALL,
-    JL_PINCS, JL_RETWB,
+    JL_PINCS, JL_RETWB, JL_XCALL,
     JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
@@ -426,7 +431,7 @@ static const char *const jit_lever_names[JL_COUNT] = {
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
     "peep", "bakecallee", "capbase", "lsra", "frameless", "capprot",
-    "vfquiet", "gproof", "ghoist", "regcall", "pincs", "retwb"
+    "vfquiet", "gproof", "ghoist", "regcall", "pincs", "retwb", "xcall"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -9936,6 +9941,7 @@ static void emit_frameless_window(Emitter &e, const Chunk &ck,
                       sp = e.spill_at(ss);
             if (fr >= 0) {
                 ra.fpin = fr;
+                ra.slot = s;     /* the spilled payload, for a clash */
             } else if (ir >= 0 || sp >= 0) {
                 if (proven_only) {           /* an int cannot be one */
                     j_slow_win.push_back(e.j32(0xEB));
@@ -12206,7 +12212,17 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 if (!ra.flt)
                     continue;
                 const uint8_t x = ra.abi;
-                if (ra.fpin >= 0) {
+                /* a float pin sitting in ANOTHER argument's register
+                 * may already be overwritten by that argument's load:
+                 * read it from its slot, which the call bracket's
+                 * prologue made current (a pin is a known float) */
+                bool fpin_clash = false;
+                for (const RegArg &o : reg_args)
+                    if (o.flt && &o != &ra && ra.fpin == o.abi)
+                        fpin_clash = true;
+                if (ra.fpin >= 0 && fpin_clash) {
+                    e.fload(x, ra.slot);
+                } else if (ra.fpin >= 0) {
                     if (ra.fpin != x)
                         e.fmov_rr(x, static_cast<uint8_t>(ra.fpin));
                 } else if (ra.cvt && ra.pin >= 0) {
@@ -15030,6 +15046,8 @@ void jit_stats_report()
         { "ret_unflushed",    &g_jit_ret_unflushed },
         { "regcall_proven",   &g_jit_regcall_proven },
         { "regcall_fargs",    &g_jit_regcall_fargs },
+        { "xcall_brackets",   &g_jit_xcall_brackets },
+        { "xcall_lost",       &g_jit_xcall_lost },
         { "regcall_fpinned",  &g_jit_regcall_fpinned },
         { "call_align",       &g_jit_call_align },
         { "call_dead_model",  &g_jit_call_dead_model },
@@ -16158,10 +16176,12 @@ static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
  *   - the C1 hoist owns r10/r11 for the duration of a region;
  *   - a MyLang CALL emitter (emit_sync_push_native /
  *     emit_sync_call_inline) uses r8, r10 and r11 as RAW scratch
- *     OUTSIDE any emit_call_prologue bracket - i.e. the whole pool.
- *     `jit_assert_no_volatile_pin` is the standing check that this
- *     stays true, and it asserts the strong form (no caller-saved pin
- *     at all), so widening the pool cannot silently outrun this line;
+ *     OUTSIDE any emit_call_prologue bracket - so since #124(b) the
+ *     call op is emitted with the caller-saved pins written back and
+ *     out of the register view (the emission loop's call bracket),
+ *     and the whole pool is denied only to a run that LOST the bet.
+ *     `jit_assert_no_volatile_pin` is the standing check that the
+ *     emitters still meet no caller-saved pin;
  *   - a type singleton still in a register claims it (the B1 grant,
  *     ra.busy - see Emitter::grant_tag_regs);
  *   - the kill switch claims everything.
@@ -16171,7 +16191,8 @@ static uint32_t elem_scratch_reserve(const Chunk &ck, size_t begin,
  */
 static uint32_t jit_xcache_clobber(const Chunk &ck, size_t begin,
                                    size_t end, bool has_hoist,
-                                   uint32_t tag_claimed)
+                                   uint32_t tag_claimed,
+                                   bool xcall_lost = false)
 {
     if (jit_lever_off(JL_XCACHE))
         return xcache_mask();
@@ -16190,7 +16211,12 @@ static uint32_t jit_xcache_clobber(const Chunk &ck, size_t begin,
      * is still passed to elem_scratch_reserve below: the reservation
      * runs at pick time and must model the claim the region will
      * make at emit time. */
-    if (jit_run_blocks_xcache(ck, begin, end))
+    /* #124(b): a MyLang CALL no longer denies the pool - the call op
+     * is emitted with the caller-saved pins written back and out of
+     * the register view (the emission loop's call bracket), so the
+     * call emitters' raw scratch use meets no pin */
+    if (jit_run_blocks_xcache(ck, begin, end)
+            && (jit_lever_off(JL_XCALL) || xcall_lost))
         clob |= xcache_mask();
     /*
      * ⛔ THE ELEMENT TIER NEEDS TWO FREE CANDIDATES, AND THE POOL MUST
@@ -29325,6 +29351,31 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      */
     std::vector<char> pins_cs_lost(runs.size(), 0);
     /*
+     * #124(b): THE CALLER-SAVED-ACROSS-A-CALL BET. A caller-saved
+     * register is FREE for a value that is not live across a call and
+     * COSTS a write-back and a reload per call for one that is - the
+     * ordinary compiler rule, and the reason the first cut (write back
+     * every caller-saved pin at every call) read +17% Ir on
+     * 97_regs_int_call, whose eight locals are all loop-carried
+     * across its call. So the call bracket writes back only the pins
+     * LIVE across the call (`xcall_lsl`; a dead one is dropped and
+     * re-adopted without a reload), and a run in which a call INSIDE A
+     * LOOP had to write back a live caller-saved pin LOSES the bet: it
+     * is emitted again with the old denial (the clobber mask). Goes
+     * 0 -> 1 once per run, bounding its retry.
+     */
+    std::vector<char> xcall_lost(runs.size(), 0);
+    SlotLiveness xcall_lsl;
+    const bool xcall_lsl_ok = jit_slot_liveness(chunk, xcall_lsl);
+    std::vector<char> xcall_in_loop(chunk.code.size(), 0);
+    for (size_t p = 0; p < chunk.code.size(); p++) {
+        const Instr &bi = chunk.code[p];
+        if (op_is_branch(bi.op) && bi.target >= 0
+                && static_cast<size_t>(bi.target) <= p)
+            for (size_t q = static_cast<size_t>(bi.target); q <= p; q++)
+                xcall_in_loop[q] = 1;
+    }
+    /*
      * REGCALL step 2: a linear-scan EVICT whose slot nothing reads
      * again is a dead write-back - the window dies with the frame. Its
      * proof is the all-slot liveness (jit_slot_liveness), and it is
@@ -29505,7 +29556,7 @@ retry_emission:
             e.grant_tag_regs(run_needs_float_tag(chunk, begin, end));
         const uint32_t xclob =
             jit_xcache_clobber(chunk, begin, end, has_elem_hoist,
-                               tagres);
+                               tagres, xcall_lost[r] != 0);
         /* #123: the budget is simply HOW MANY REGISTERS ARE LEFT -
          * every allocatable one this run has not denied (xclob) and
          * nothing has claimed (tagres). It used to be
@@ -30192,12 +30243,60 @@ retry_emission:
                     if (pin_abi[h] >= 0)
                         abi_mask |= 1u << pin_abi[h];
                 }
-        std::vector<uint8_t> hot_reg(hot.size());
-        for (int pass = 0; pass < 2; pass++)
-            for (size_t h = 0; h < hot.size(); h++) {
-                if ((pin_abi[h] >= 0) != (pass == 0))
+        /*
+         * #124(b): in a run that CALLS, which pins are live across a
+         * call? Those ask for the callee-saved registers first (the
+         * callee preserves them for free) and the rest prefer the
+         * caller-saved half (free while nothing live is in them at a
+         * call) - the ordinary compiler assignment. Weight order alone
+         * hands callee-saved registers to the heaviest pins, so a
+         * light value live across the call (an outer accumulator)
+         * landed caller-saved and lost the xcall bet for the run.
+         */
+        std::vector<char> across(hot.size(), 0);
+        bool xcall_run = !pins_cs_bet && !xcall_lost[r]
+            && !jit_lever_off(JL_XCALL)
+            && jit_run_blocks_xcache(chunk, begin, end);
+        if (xcall_run)
+            for (size_t p = begin; p < end; p++) {
+                if (!jit_run_blocks_xcache(chunk, p, p + 1))
                     continue;
-                const uint32_t pref = !pins_cs_bet ? 0u
+                const auto fit = argfuse.find(p);
+                for (size_t h = 0; h < hot.size(); h++) {
+                    bool live = !xcall_lsl_ok
+                        || !chunk.handler_sites.empty()
+                        || xcall_lsl.live_in(p, hot[h])
+                        || xcall_lsl.live_out(p, hot[h]);
+                    if (fit != argfuse.end())
+                        for (const int src : fit->second.src)
+                            if (src == hot[h])
+                                live = true;
+                    if (live)
+                        across[h] = 1;
+                }
+            }
+        std::vector<uint8_t> hot_reg(hot.size());
+        for (int pass = 0; pass < 3; pass++)
+            for (size_t h = 0; h < hot.size(); h++) {
+                /* 0: REGCALL parameters; 1: live across a call;
+                 * 2: the rest */
+                const int want = pin_abi[h] >= 0 ? 0
+                               : across[h] ? 1 : 2;
+                if (want != pass)
+                    continue;
+                if (pass == 1) {
+                    int rg = e.ra.take(CAP_ALLOCATABLE | CAP_CALLEE_SAVED);
+                    if (rg < 0)
+                        rg = e.ra.take(CAP_ALLOCATABLE);
+                    ML_CHECK(rg >= 0);
+                    hot_reg[h] = static_cast<uint8_t>(rg);
+                    if (jit_reg_is_callee_saved(hot_reg[h]))
+                        e.saved.push_back(hot_reg[h]);
+                    continue;
+                }
+                const uint32_t pref =
+                    (xcall_run && pass == 2) ? gp_caller_saved_mask()
+                    : !pins_cs_bet ? 0u
                     : pin_abi[h] >= 0 ? (1u << pin_abi[h])
                     : (gp_caller_saved_mask() & ~abi_mask);
                 int rg = e.ra.take(CAP_ALLOCATABLE, pref, pins_cs_excl);
@@ -30442,6 +30541,7 @@ retry_emission:
             g_jit_capbase_cs++;              /* W6 reach, emit-time */
 #endif
         const size_t cb_prologues0 = e.n_prologues;   /* W6: the verify */
+        bool xcall_flushed_in_loop = false;           /* #124(b) bet */
 
         /* C5: which ref-listed temps each loop preheader releases, and
          * where each release is still in force. Picked BEFORE any op is
@@ -31231,6 +31331,81 @@ retry_emission:
                  * denied register or a live tag holder. */
                 e.clear_cache_state();
             }
+            /*
+             * #124(b): A MyLang CALL op with CALLER-SAVED pins live. The
+             * call emitters were written for a world with no such pin
+             * (jit_assert_no_volatile_pin): between their prologue and
+             * the `call` they write rax/rcx/r9/r10/r11 (and xmm0, the
+             * REGCALL argument registers) RAW and read argument sources
+             * after those writes - and the callee clobbers the rest by
+             * ABI. So the op is emitted in that world: every caller-
+             * saved GP pin and every float pin (xmm is all caller-saved)
+             * is written back WHOLE - payload and tag, so an argument
+             * read from memory dispatches on a true tag - and taken out
+             * of the register view (its register given back, so busy
+             * <=> entry holds) for the op's emission; where the op's
+             * paths rejoin, each is re-claimed and reloaded. An exit
+             * inside the op flushes what is left and finds these slots
+             * current; a post-call resume stub reloads every pin from
+             * memory as of its pc, which these writes made current; the
+             * call's dst, if it is one of them, is written to memory
+             * by the op and picked up by the reload. Callee-saved pins
+             * are untouched - the callee preserves them.
+             */
+            std::vector<Emitter::CacheEnt> xcs;
+            std::vector<char> xcs_live;
+            const bool xbrk = !brk && jit_run_blocks_xcache(chunk, pc,
+                                                            pc + 1);
+            /* live ACROSS the call: read by the call, or live after it
+             * (NOT-covered reads as live - the may-direction) */
+            /* the call's FUSED argument sources (#162/W2): a staging
+             * move the fusion dropped reads its source at the move's
+             * pc as far as the liveness knows, but the call binds
+             * from that source - at THIS pc. (Missing this dropped a
+             * loop-carried float pin read only by a fused move:
+             * 101_float_call printed 771 for 3055.) */
+            const auto af_it = argfuse.find(pc);
+            const auto xlive = [&](int slot) {
+                if (af_it != argfuse.end())
+                    for (const int src : af_it->second.src)
+                        if (src == slot)
+                            return true;
+                /* a try region's handler is an exceptional reader the
+                 * argument does not model (REGCALL step 2's rule):
+                 * there, everything is live */
+                return !xcall_lsl_ok || !chunk.handler_sites.empty()
+                       || xcall_lsl.live_in(pc, slot)
+                       || xcall_lsl.live_out(pc, slot);
+            };
+            if (xbrk) {
+                std::vector<Emitter::CacheEnt> keep;
+                for (const Emitter::CacheEnt &c : e.cache)
+                    (jit_reg_is_callee_saved(c.reg) ? keep : xcs)
+                        .push_back(c);
+                /* float pins are NOT taken out: xmm is all caller-
+                 * saved, so they have always been allowed in a call run
+                 * and spilled/reloaded as payloads by the call bracket
+                 * (emit_call_prologue/epilogue) - REGCALL 4's loads
+                 * read a float argument whose pin sits in another
+                 * argument's register from its (spilled) slot */
+                if (!xcs.empty()) {
+                    Emitter::PinMach pm(e);
+                    for (const Emitter::CacheEnt &c : xcs) {
+                        xcs_live.push_back(xlive(c.slot));
+                        if (xcs_live.back()) {
+                            e.store_type_tag(c.type, jit_layout().t_int);
+                            e.store(c.reg, c.payload);
+                            xcall_flushed_in_loop |=
+                                xcall_in_loop[pc] != 0;
+                        }
+                        e.ra.give(c.reg);
+                    }
+                    e.cache.swap(keep);
+#ifdef TESTS
+                    g_jit_xcall_brackets++;          /* emit-time reach */
+#endif
+                }
+            }
             if (op_is_branch(in.op)) {
                 /* targets get entry_remap (an external exit is a RESUME -
                  * enter the target run natively); the op's OWN pc (arg 4,
@@ -31244,6 +31419,24 @@ retry_emission:
             if (brk) {
                 e.restore_cache(std::move(saved_state));
                 e.reload_cache();
+            }
+            if (xbrk && !xcs.empty()) {
+                Emitter::PinMach pm(e);              /* #124(b) */
+                /* a pin DEAD across the call is re-adopted with no
+                 * reload: nothing reads its value again before the
+                 * slot is next written, and a later write-back of the
+                 * register stores a dead, trivial int */
+                for (size_t xi = 0; xi < xcs.size(); xi++) {
+                    const Emitter::CacheEnt &c = xcs[xi];
+                    const bool got = e.ra.take_fixed(c.reg);
+                    ML_CHECK_MSG(got, "#124(b): a caller-saved pin's "
+                                      "register was still held after "
+                                      "its call op");
+                    (void)got;
+                    e.cache.push_back(c);
+                    if (xcs_live[xi])
+                        e.load(c.reg, c.payload);
+                }
             }
         };
 
@@ -31488,6 +31681,15 @@ retry_emission:
             /* REGCALL step 2: an evict of a slot no later op reads
              * (ret_lsl_ok has the conditions) writes nothing */
             const auto evict_dead = [&](int slot) {
+                /* a FUSED argument source is read by its CALL, at a pc
+                 * past the dropped staging move the liveness credits
+                 * with the read (#124(b) found the hole: an evict
+                 * between the two would skip the write-back the call
+                 * then binds from) */
+                for (const auto &af : argfuse)
+                    for (const int src : af.second.src)
+                        if (src == slot)
+                            return false;
                 return ret_lsl_ok && begin == 0 && end == n
                        && slot >= 0 && slot < 64
                        && !std::binary_search(chunk.ref_slots.begin(),
@@ -31689,6 +31891,24 @@ retry_emission:
          * the caller-saved half is spilled at a bracket either way, and
          * jit_xcache_clobber denies whatever a run uses raw.
          */
+        /* #124(b): THE CALLER-SAVED-ACROSS-A-CALL BET, SETTLED - a
+         * call inside a loop wrote back a live caller-saved pin, i.e.
+         * pays a store and a reload per iteration for a register a
+         * memory-resident local nearly matches (xcall_lost has the
+         * measurement). Emitted again with the run's old denial. */
+        if (xcall_flushed_in_loop && !xcall_lost[r]
+                && !jit_lever_forced(JL_XCALL)) {
+            xcall_lost[r] = 1;
+#ifdef TESTS
+            g_jit_xcall_lost++;
+#endif
+            g_hoist = JitHoist{};
+            g_hoist2 = JitHoist{};
+            chunk.call_caches.clear();
+            chunk.norec_sites.clear();
+            chunk.arg_stage_pools.clear();
+            goto retry_emission;
+        }
         if (pins_cs_bet && pins_cs_used
                 && e.n_prologues != cb_prologues0) {
             pins_cs_lost[r] = 1;

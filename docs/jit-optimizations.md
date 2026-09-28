@@ -16523,6 +16523,82 @@ wrong value against the tree-walker. `jit_frameless_w2_shape`'s
 call instead of a window store. `-rt` green in all five modes, every
 corpus matrix agrees, `driver_checks` green on debug and release.
 
+## #124(b) - CALLER-SAVED PINS IN A RUN THAT CALLS (2026-10-01)
+
+**THE CAP.** A native run holding a MyLang call could pin only in the
+four callee-saved registers (r12-r15): `jit_xcache_clobber` denied the
+whole caller-saved pool to it, because the call emitters use rax, rcx,
+r9, r10 and r11 RAW between their prologue and the `call`, and read
+argument sources after those writes. Lifted, at the maintainer's call,
+on an architectural argument the ~1% ceiling measurement (97's call-
+free twin, all pins vs four: 146.8M vs 148.1M cycles) did not settle.
+
+**HOW.**
+ - **The call bracket.** Each MyLang call op (`jit_run_blocks_xcache`'s
+   ops) is emitted with every caller-saved GP pin LIVE across it
+   written back - payload AND tag, so an argument read from memory
+   dispatches on a true tag - and taken out of the register view
+   (register given back, so busy <=> entry holds); where the op's paths
+   rejoin each is re-claimed and reloaded. The call emitters therefore
+   run in exactly the world they were written for. An exit inside the
+   op finds those slots current; a post-call resume stub reloads every
+   pin from memory, which the write-back made current; a call dst
+   that is one of them is written by the op and picked up by the
+   reload. A pin DEAD across the call is dropped with no store and
+   re-adopted with no reload.
+ - **"Live" includes the call's FUSED argument sources.** The fusion
+   drops the staging move, but the liveness credits the read to the
+   move's pc while the call binds at its own: 101_float_call printed
+   **771 for 3055** until the fused sources counted (watched again
+   with the check removed: `jit_xcall_brackets [fused int]` fails).
+   The same hole was latent in REGCALL step 2's dead-evict elision -
+   an evict between the move and its call would have skipped the
+   write-back the call then binds from - and is closed there too.
+ - **The assignment.** In a run that calls, the pins live across a
+   call ask for callee-saved registers first; the rest prefer the
+   caller-saved half - the ordinary compiler assignment. Weight order
+   alone gave the callee-saved ones to the heaviest pins and left a
+   light outer accumulator in a caller-saved register.
+ - **The bet.** Writing a live pin back at a call INSIDE A LOOP costs a
+   store pair and a reload per iteration for a register a memory-
+   resident local nearly matches: the first cut, with no bet, read
+   **+17.1% Ir / +13.8% cycles on 97_regs_int_call** and +9.7% Ir on
+   101. So a run that had to do it LOSES the bet and is emitted again
+   with the old denial (`xcall_lost`, one re-emission).
+   `MYLANG_JIT_FORCE=xcall` skips the bet - the soundness half alone,
+   which is how the tests run the bracket on the hostile shapes.
+ - **Float pins are untouched.** xmm is all caller-saved, so float pins
+   have always been allowed in a call run and saved as payloads by the
+   call bracket (`emit_call_prologue`). A first version wrote them back
+   whole and let them lose the bet - which then re-emitted a run the
+   GP denial could not change. REGCALL 4's loads read a float argument
+   whose pin sits in another argument's register from its slot.
+
+**MEASURED** (callgrind Ir scale 3 minus scale 1, `-npc`, `OPT=1
+ASSERTS=0`, against REGCALL 4's commit), with a bench written first
+since no existing one had the shape - **102_call_outer_hot_inner**: an
+outer loop calls a helper once per iteration around an inner loop of
+eight int recurrences, only the outer accumulator live across the call
+(my / py / cpp agree):
+
+    102_call_outer_hot_inner  -2.08% Ir, 165.8M -> 130.4M cycles
+                              (-21.4%, pinned P-core, best of 3)
+    93_mutual_recursion       -1.22%
+    95_recursion_with_builtin -1.13%
+    every other bench (34 measured, 97 and 101 included): flat
+
+**NETS.** `jit_xcall_brackets`: FORCED, against the tree-walker - a
+plain call, a self recursion deep enough to switch and resume through
+a post-call stub, a throw caught across a call, a float shape and the
+fused int source; unforced, the call-outside-the-loop shape keeps the
+registers with no lost bet and the loop-carried one loses it.
+`tests/functional/56_xcall_pins.my` puts the shapes under every corpus
+matrix (`xcall` joined `--levers`). `jit_xcache_pins`' call case now
+DECLINES by the bet and a call-outside-the-loop case ENGAGES. Watched:
+the fused check removed fails `[fused int]` with a wrong value; the
+reload of live pins removed HANGS `-rt` (a loop counter loses its
+value) - caught, though as a hang rather than a named failure.
+
 ## TWO FINDINGS OF THE REGCALL WORK, FIXED (2026-09-30)
 
 **A `dyn` CALL RAN A NESTED C++ ACTIVATION PER CALL.** The generic

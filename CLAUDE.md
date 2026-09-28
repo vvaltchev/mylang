@@ -1398,7 +1398,8 @@ collision). Three nets now:
   loop" and "may pin a caller-saved register" were mutually exclusive,
   0 of 20 hoist runs corpus-wide having a register left. Each
   contributor now names its own: hoist -> {r10,r11}, a MyLang call ->
-  the whole pool; a type singleton still in a register is a B1 GRANT
+  the whole pool ONLY when the run lost #124(b)'s bet (below); a type
+  singleton still in a register is a B1 GRANT
   claimed as ra.busy, not a clobber entry - Emitter::grant_tag_regs
   decides it once per run and tag_holder() is the one query.
   **⛔ A DENY IS ABOUT SPENDING, NOT OCCUPANCY (#97, 2026-08-26):**
@@ -1409,9 +1410,25 @@ collision). Three nets now:
   always ignored it, is the precedent), while `busy` - a hoist
   region's claim, a tag grant - still excludes. Getting that
   backwards is not a wrong answer, it is a SILENT STARVATION: a run
-  containing a MyLang call denies the whole pool, so every inline
+  containing a MyLang call denied the whole pool, so every inline
   tier asking for scratch in exactly the shape it exists for
-  declined to its helper and the counter read zero),
+  declined to its helper and the counter read zero), xcall (#124(b):
+  a run that CALLS may pin caller-saved too. Each MyLang call op is
+  emitted with every caller-saved GP pin LIVE across it written back
+  (payload and tag) and out of the register view - the call emitters
+  use rax/rcx/r9/r10/r11 raw between their prologue and the `call`,
+  so they must meet no such pin - and reloaded where the op's paths
+  rejoin; a pin DEAD across it is dropped and re-adopted with no
+  reload. ⛔ "Live" includes the call's FUSED argument sources: the
+  dropped staging move is where the liveness credits the read, but
+  the call binds at its own pc (missing it printed 771 for 3055). Pins
+  live across a call are assigned callee-saved first. A run whose call
+  INSIDE A LOOP had to write back a live caller-saved pin LOSES the
+  bet and is emitted again with the old whole-pool denial - writing
+  back per iteration measured +17% Ir on 97_regs_int_call;
+  `MYLANG_JIT_FORCE=xcall` skips the bet (the soundness half alone).
+  Float pins are untouched: xmm is all caller-saved and they were
+  always spilled as payloads by the call bracket),
   bakecallee (#97 step 4: a call to a WRITE-ONCE global slot has a
   callee the emitter can NAME - `jit_baked_callee` reads it out of
   `JitCtx::slot_desc`, the same map `callv_native_ok` has always
