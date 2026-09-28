@@ -240,6 +240,12 @@ class EvalValue final {
 
 public:
 
+    /* #84: the payload read straight, for a caller that has ALREADY
+     * checked the type word (VmInvoker's inline test path: t_bool ->
+     * raw_bval, t_int -> raw_ival). No check here - that is the point. */
+    bool raw_bval() const { return val.bval; }
+    int_type raw_ival() const { return val.ival; }
+
     /*
      * Native-AOT layout probes (jit.cpp): the emitter bakes these as x86
      * addressing displacements. Class-internal offsetof (access-legal;
@@ -985,6 +991,25 @@ public:
         val.set_trivial_bool(v);
         container = nullptr;
         is_const = false;
+    }
+    /* #84: the same bind into a slot whose tail is ALREADY clear - a
+     * prepared callback window between two elements: it is pushed with
+     * container = null and is_const = false, nothing writes either into
+     * a window slot (container belongs to array-element LValues; const
+     * is a compile-time rule here), and every raw bind keeps them so.
+     * Two stores (payload, type) where bind_scalar_raw makes four;
+     * hardened builds check the premise. */
+    void bind_scalar_payload(int_type v) {
+        ML_VM_CHECK(container == nullptr && !is_const);
+        val.set_trivial_int(v);
+    }
+    void bind_scalar_payload(float_type v) {
+        ML_VM_CHECK(container == nullptr && !is_const);
+        val.set_trivial_float(v);
+    }
+    void bind_scalar_payload(bool v) {
+        ML_VM_CHECK(container == nullptr && !is_const);
+        val.set_trivial_bool(v);
     }
     EvalValue get_rval() const { return val; }
     Type *valtype() const { return val.get_type(); }

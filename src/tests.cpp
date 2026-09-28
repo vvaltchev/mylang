@@ -36318,6 +36318,60 @@ static bool jit_temp_regs()
 }
 
 /*
+ * ==========  #84: THE CALLBACK TRUTH, INLINE AND FROM RDX  ==========
+ *
+ * sort's comparator is answered on the inline test path
+ * (g_invoke_test_inline) and, for a body whose every return is an int
+ * or a bool, from the payload register (g_invoke_test_regs) - including
+ * when the return takes the C++ tier (a try region: the slow tier
+ * reloads rdx from flow->value, g_jit_ret_truth_slow). The ORDER is the
+ * oracle: tree-walker parity; a stale rdx scrambles it.
+ */
+static bool jit_callback_truth_regs()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const std::string src =
+        "var a = []; var x = 777;\n"
+        "for (var i = 0; i < 200; i++) {\n"
+        "  x = (x * 1103515245 + 12345) % 2147483647;\n"
+        "  append(a, x % 1000); }\n"
+        "var s1 = clone(a); sort(s1, func(p, q) => p < q);\n"
+        "var s2 = clone(a);\n"
+        "sort(s2, func(p, q) {\n"
+        "  var r = p < q;\n"
+        "  try { if (p == -1) { var z = p - p; r = 1 / z == 0; } }\n"
+        "  catch { r = q < p; }\n"
+        "  return r; });\n"
+        "print(s1[0], s1[100], s1[199], s2[0], s2[100], s2[199]);\n";
+    bool ok = true;
+    const unsigned long i0 = g_invoke_test_inline, r0 = g_invoke_test_regs;
+    const unsigned long s0 = g_jit_ret_truth_slow;
+    const std::string want =
+        engine_run_bt(src, ExecEngine::TreeWalk, false, false);
+    const std::string got =
+        engine_run_bt(src, ExecEngine::Vm, true, /*splice=*/false);
+    if (got != want) {
+        fprintf(stderr, "jit_callback_truth_regs: got \"%s\", the "
+                        "tree-walker \"%s\"\n", got.c_str(), want.c_str());
+        ok = false;
+    }
+    if (g_invoke_test_inline == i0 || g_invoke_test_regs == r0
+            || g_jit_ret_truth_slow == s0) {
+        fprintf(stderr, "jit_callback_truth_regs: reach - inline %lu, "
+                        "from rdx %lu, slow-tier rdx %lu (each must "
+                        "move)\n", g_invoke_test_inline - i0,
+                g_invoke_test_regs - r0, g_jit_ret_truth_slow - s0);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * ==========  THE ENTRY FILLER IS FOR THE CALLS  ==========
  *
  * SP3. `entry_pad` pads a fragment's prologue to CALL-READY when its
@@ -50051,6 +50105,10 @@ static const std::vector<extra_check> extra_checks =
       "lives in a register (no tag store, no payload store, no reload); "
       "the tregs lever off stores it",
       jit_temp_regs },
+    { "jit: #84 - a callback's truth value is read inline and, for an "
+      "int/bool-returning body, from rdx - on the inline return arm and "
+      "through the C++ tier alike (sort order vs the tree-walker)",
+      jit_callback_truth_regs },
     { "jit: the shape tests' MACHINE-INSTRUCTION MODEL parses every "
       "form the emitter produces (it fails closed, so a form it does "
       "not know must fail HERE and not silently match nothing)",

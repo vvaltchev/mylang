@@ -732,6 +732,9 @@ extern unsigned long g_jit_borrow_inline;       /* W5 (emitted code): a
  * here, so the arg is void* (the real ABI is size_t(LValue*)).
  */
 size_t jit_enter(const void *frag, void *slots);
+/* #84 step 3: jit_enter plus the fragment's RDX (rax:rdx - see jit.cpp) */
+struct JitRet2 { size_t r; uint64_t pay; };
+JitRet2 jit_enter2(const void *frag, void *slots);
 
 /* Register-cache audit (env MYLANG_CACHEAUDIT=1): print, per opcode, how
  * many slot candidacies its disqualification killed. The "what to make
@@ -1597,6 +1600,7 @@ extern "C" unsigned long g_jit_regcall_fargs;   /* REGCALL 4 reach */
 extern "C" unsigned long g_jit_xcall_brackets;  /* #124(b) reach */
 extern "C" unsigned long g_jit_xcall_lost;      /* ...and lost bets */
 extern "C" unsigned long g_jit_temp_regs;       /* #86 reach */
+extern "C" unsigned long g_jit_ret_truth_slow;  /* #84 slow-tier rdx */
 extern "C" unsigned long g_jit_regcall_fpinned; /* ...into a pin */
 extern "C" unsigned long g_jit_call_align;      /* SP3: self-aligned */
 extern "C" unsigned long g_jit_call_dead_model; /* SP3: unreachable */

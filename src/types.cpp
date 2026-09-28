@@ -2,6 +2,7 @@
 
 #include "eval.h"
 #include "vm.h"    /* VmInvoker - the prepared callback invoker */
+#include "vminvoke.h"  /* ...and its inline test() hot path (#84) */
 #include "bitops.h"
 #include "hashing.h"
 #include "poolalloc.h"

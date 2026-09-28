@@ -688,7 +688,11 @@ work — but profile it before building, the way increment 0 was.
         the boundary copy - a return takes a forwarded result from a
         register (34 -2.66% Ir, 35 -2.36%, everything else flat;
         record: *#97 CB9* in docs/jit-optimizations.md).
-        NEXT on the callback path: the jit_enter bookkeeping.
+        ✅ **#84 DONE 2026-10-01** - the callback entry bookkeeping
+        (record: *#84* in docs/jit-optimizations.md): test() inline,
+        a two-store bind, the truth in rdx. 34_sort_custom_cmp
+        824.6M -> 567.9M Ir (-31.1%), 796M -> 547M cycles (-31.3%);
+        35 -6.0% Ir, 96 -0.7%.
         ✅ **REGCALL DONE 2026-09-30** (records: *#97 REGCALL STEP 1*,
         *REGCALL 1, CONTINUED*, *REGCALL 2*, *REGCALL 3*, *REGCALL 4*):
         typed int arguments in rdi/rcx/r9/r10 and trivial results in
