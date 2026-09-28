@@ -1478,7 +1478,11 @@ collision). Three nets now:
   `jit_regcall_arg_reg`, for the site and the entry; 1B, the result in
   rdx/rcx for a callee whose every return is trivial, has no lever:
   `Chunk::frameless_ret_regs` is derived and the site and the arm both
-  read it), `all`.
+  read it), pincs (REGCALL step 1: a FUNCTION BODY whose run brackets
+  no call pins in the CALLER-saved half - a REGCALL parameter in its
+  own argument register - since a callee-saved pin costs a push/pop
+  per ENTRY, i.e. per call; settled from `n_prologues` after emission
+  with one re-emission, the W6/SP3 bet shape), `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the

@@ -179,6 +179,9 @@ unsigned long g_jit_spcheck_sites = 0;
  * single `lea` off a register-resident operand - the `fib(n-k)` shape */
 unsigned long g_jit_lea_addsub = 0;
 unsigned long g_jit_entry_pad_off = 0;
+unsigned long g_jit_pins_cs = 0;      /* REGCALL 1: runs whose pins
+                                       * took the caller-saved bet */
+unsigned long g_jit_pins_cs_lost = 0; /* ...and re-emitted on losing */
 unsigned long g_jit_call_align = 0;
 /* calls emitted into code no branch has reached yet (MoveV's dead
  * helper arm is the corpus's whole population) - see call_site */
@@ -407,6 +410,7 @@ enum JitLever {
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
     JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA,
     JL_FRAMELESS, JL_CAPPROT, JL_VFQUIET, JL_GPROOF, JL_GHOIST, JL_REGCALL,
+    JL_PINCS,
     JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
@@ -414,7 +418,7 @@ static const char *const jit_lever_names[JL_COUNT] = {
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
     "peep", "bakecallee", "capbase", "lsra", "frameless", "capprot",
-    "vfquiet", "gproof", "ghoist", "regcall"
+    "vfquiet", "gproof", "ghoist", "regcall", "pincs"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -3707,10 +3711,13 @@ struct Emitter {
         if (lazy_vframe_total < 0)
             return;
         PinMach pm(*this);
+        /* r8/r11 only: at a frameless entry this runs BEFORE the
+         * REGCALL arguments are taken, and they arrive in rdi/rcx/r9/
+         * r10 (JIT_REGCALL_INT) */
         movabs(11, reinterpret_cast<uint64_t>(jit_poison_window()));
-        load_global(1 /* rcx */, jit_layout().addr_act, 1);
-        store_base(11, 1, lazy_vframe_slots_off);
-        store_dword_base_imm32(1, lazy_vframe_size_off, 0);
+        load_global(8 /* r8 */, jit_layout().addr_act, 8);
+        store_base(11, 8, lazy_vframe_slots_off);
+        store_dword_base_imm32(8, lazy_vframe_size_off, 0);
 #endif
     }
     bool sp_fixed_frame = false;
@@ -14761,6 +14768,8 @@ void jit_stats_report()
         { "spcheck_sites",    &g_jit_spcheck_sites },
         { "lea_addsub",       &g_jit_lea_addsub },
         { "entry_pad_off",    &g_jit_entry_pad_off },
+        { "pins_cs",          &g_jit_pins_cs },
+        { "pins_cs_lost",     &g_jit_pins_cs_lost },
         { "call_align",       &g_jit_call_align },
         { "call_dead_model",  &g_jit_call_dead_model },
         { "hoist_rmw",        &g_jit_hoist_rmw },
@@ -28985,6 +28994,19 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     /* #97 R4: the lazy-vframe bet for a frameless LEAF (see below);
      * goes false -> true once, bounding its own retry */
     bool vframe_quiet_lost = false;
+    /*
+     * REGCALL step 1: per RUN, has the CALLER-SAVED pin bet been lost?
+     * A function body's entry runs PER CALL, and every callee-saved
+     * pin costs a push there and a pop at every exit - for a frameless
+     * callee, a pair per call. A run that brackets no helper call has
+     * nothing for a callee-saved register to survive, so its pins
+     * prefer the caller-saved half (and a REGCALL parameter its own
+     * argument register, so the entry moves nothing). Whether the run
+     * brackets a call is known only after it is emitted: the bet is
+     * settled from `n_prologues`, the W6/SP3 shape, at the cost of one
+     * re-emission. Goes 0 -> 1 once per run, bounding its retry.
+     */
+    std::vector<char> pins_cs_lost(runs.size(), 0);
     g_jit_pins_denied = 0;
 retry_emission:
     /* Phase A: the one-shot re-emission after a rax-pin conflict. The
@@ -29812,14 +29834,50 @@ retry_emission:
          * pushes that list and frag_ret pops it, and a caller-saved
          * pin is handled by emit_call_prologue/epilogue instead.
          */
+        /*
+         * REGCALL step 1: THE CALLER-SAVED BET (pins_cs_lost has the
+         * contract). The REGCALL parameters ask FIRST, each preferring
+         * the register its argument arrives in; the other pins then
+         * prefer the rest of the caller-saved half, so no parameter's
+         * register is taken from under it. Never rax: the accumulator
+         * and the status every call tests (the W6 note).
+         */
+        const bool pins_cs_bet =
+            g_cur_caller_desc && !pins_cs_lost[r]
+            && !jit_run_blocks_xcache(chunk, begin, end)
+            && !jit_lever_off(JL_PINCS);
+        const uint32_t pins_cs_excl =
+            pins_cs_bet ? (1u << RAX) : 0u;  /* reg:abi */
+        bool pins_cs_used = false;   /* the bet has a stake */
+        std::vector<int> pin_abi(hot.size(), -1);
+        uint32_t abi_mask = 0;
+        if (pins_cs_bet)
+            for (size_t h = 0; h < hot.size(); h++)
+                if (hot[h] >= 0 && hot[h] < static_cast<int>(
+                            g_cur_caller_desc->params.size())) {
+                    pin_abi[h] = jit_regcall_arg_reg(g_cur_caller_desc,
+                                                     chunk, hot[h]);
+                    if (pin_abi[h] >= 0)
+                        abi_mask |= 1u << pin_abi[h];
+                }
         std::vector<uint8_t> hot_reg(hot.size());
-        for (size_t h = 0; h < hot.size(); h++) {
-            const int r = e.ra.take(CAP_ALLOCATABLE);
-            ML_CHECK(r >= 0);            /* hot.size() <= max_pins */
-            hot_reg[h] = static_cast<uint8_t>(r);
-            if (jit_reg_is_callee_saved(hot_reg[h]))
-                e.saved.push_back(hot_reg[h]);
-        }
+        for (int pass = 0; pass < 2; pass++)
+            for (size_t h = 0; h < hot.size(); h++) {
+                if ((pin_abi[h] >= 0) != (pass == 0))
+                    continue;
+                const uint32_t pref = !pins_cs_bet ? 0u
+                    : pin_abi[h] >= 0 ? (1u << pin_abi[h])
+                    : (gp_caller_saved_mask() & ~abi_mask);
+                int rg = e.ra.take(CAP_ALLOCATABLE, pref, pins_cs_excl);
+                if (rg < 0)              /* a full pool: rax is a pin */
+                    rg = e.ra.take(CAP_ALLOCATABLE, pref);
+                ML_CHECK(rg >= 0);       /* hot.size() <= max_pins */
+                hot_reg[h] = static_cast<uint8_t>(rg);
+                if (jit_reg_is_callee_saved(hot_reg[h]))
+                    e.saved.push_back(hot_reg[h]);
+                else if (pins_cs_bet)
+                    pins_cs_used = true;
+            }
         /* 2b-iii-b: bind ABSTRACT registers to physical pool members.
          * Entry occupants ride the zip above (hot is in abstract-reg
          * order); an areg with only mid-run pieces takes its own pool
@@ -29844,7 +29902,11 @@ retry_emission:
             for (const int ar : lsra_aregs) {
                 if (aphys[static_cast<size_t>(ar)] != 0xFF)
                     continue;
-                const int pr = e.ra.take(CAP_ALLOCATABLE);
+                const uint32_t apref = pins_cs_bet
+                    ? (gp_caller_saved_mask() & ~abi_mask) : 0u;
+                int pr = e.ra.take(CAP_ALLOCATABLE, apref, pins_cs_excl);
+                if (pr < 0 && pins_cs_excl)  /* never DROP an areg over */
+                    pr = e.ra.take(CAP_ALLOCATABLE, apref);  /* the bet */
                 if (pr < 0)
                     continue;            /* denied-shrunk pool: drop */
                 /* #123: the PLAN owns this for the whole run, even
@@ -29857,6 +29919,8 @@ retry_emission:
                     static_cast<uint8_t>(pr);
                 if (jit_reg_is_callee_saved(static_cast<uint8_t>(pr)))
                     e.saved.push_back(static_cast<uint8_t>(pr));
+                else if (pins_cs_bet)
+                    pins_cs_used = true;
             }
             /* busy is PER-PC under transitions - busy <=> a cache
              * entry exists, the invariant the conflict-evict and the
@@ -31248,6 +31312,33 @@ retry_emission:
             chunk.arg_stage_pools.clear();
             goto retry_emission;
         }
+        /*
+         * REGCALL step 1: THE PIN BET, SETTLED. A caller-saved pin is
+         * spilled and reloaded around every BRACKETED helper call
+         * (emit_call_prologue/epilogue) - per call, where a callee-saved
+         * one costs a push/pop per ENTRY. So a run that brackets any
+         * call loses the bet and is emitted again with the cost model's
+         * own (callee-saved) preference. Soundness never rides on it:
+         * the caller-saved half is spilled at a bracket either way, and
+         * jit_xcache_clobber denies whatever a run uses raw.
+         */
+        if (pins_cs_bet && pins_cs_used
+                && e.n_prologues != cb_prologues0) {
+            pins_cs_lost[r] = 1;
+#ifdef TESTS
+            g_jit_pins_cs_lost++;
+#endif
+            g_hoist = JitHoist{};
+            g_hoist2 = JitHoist{};
+            chunk.call_caches.clear();
+            chunk.norec_sites.clear();
+            chunk.arg_stage_pools.clear();
+            goto retry_emission;
+        }
+#ifdef TESTS
+        if (pins_cs_bet && pins_cs_used)
+            g_jit_pins_cs++;                 /* emit-time reach */
+#endif
         if (vframe_quiet_bet && e.vframe_pub_hot > 0) {
             vframe_quiet_lost = true;   /* R4: the bet lost - eager */
             g_hoist = JitHoist{};
@@ -31761,6 +31852,24 @@ retry_emission:
                          /*keep_mask=*/rc_mask);
             /* the window the caller built: [rbp+32] (the contract) */
             e.lea_base(RBX, RBP, JIT_FRAMELESS_WIN_OFF);
+            /* act.vframe = this window (helpers read the frame there);
+             * r8 = act is the push protocol's own register for it.
+             * BEFORE the REGCALL arguments are taken: it writes r8/r11
+             * only, which no argument arrives in, so a parameter may be
+             * pinned in any register (REGCALL step 1) */
+            /* E2e: a calling body's vframe is published at its C++
+             * calls instead (Emitter::vframe_publish) */
+            if (e.lazy_vframe_total < 0) {
+                e.load_global(R8R, L.addr_act, R11);        /* reg:proto */
+                e.store_base(RBX, R8R,                      /* reg:proto */
+                             static_cast<int32_t>(P.act_vframe
+                                                  + P.frame_slots));
+                e.store_dword_base_imm32(R8R,               /* reg:proto */
+                    static_cast<int32_t>(P.act_vframe + P.frame_size),
+                    static_cast<uint32_t>(total));
+            } else {
+                e.vframe_poison();                /* TESTS only */
+            }
             /*
              * REGCALL 1A: take the register arguments. A parameter PINNED
              * at the entry moves straight into its pin and its slot is
@@ -31792,13 +31901,9 @@ retry_emission:
                     for (const Emitter::CacheEnt &c : ep)
                         if (c.slot == i)
                             pin = c.reg;
-                    if ((pin == RDX                   /* reg:proto */
-                         && chunk.frameless_capbase)
-                            || pin == R8R || pin == R11   /* reg:proto */
-                            || pin == RCX)                /* reg:proto */
-                        pin = -1;    /* W4 reads fo in rdx; the vframe
-                                      * store below writes r8/r11, the
-                                      * TESTS poison rcx */
+                    if (pin == RDX                    /* reg:proto */
+                            && chunk.frameless_capbase)
+                        pin = -1;    /* W4 reads fo in rdx */
                     mv.push_back({ i, static_cast<uint8_t>(abi), pin });
                 }
                 /* order the moves; whatever cannot be ordered stores */
@@ -31848,21 +31953,6 @@ retry_emission:
                     g_jit_regcall_pinned++;       /* emit-time */
 #endif
                 }
-            }
-            /* act.vframe = this window (helpers read the frame there);
-             * r8 = act is the push protocol's own register for it */
-            /* E2e: a calling body's vframe is published at its C++
-             * calls instead (Emitter::vframe_publish) */
-            if (e.lazy_vframe_total < 0) {
-                e.load_global(R8R, L.addr_act, R11);        /* reg:proto */
-                e.store_base(RBX, R8R,                      /* reg:proto */
-                             static_cast<int32_t>(P.act_vframe
-                                                  + P.frame_slots));
-                e.store_dword_base_imm32(R8R,               /* reg:proto */
-                    static_cast<int32_t>(P.act_vframe + P.frame_size),
-                    static_cast<uint32_t>(total));
-            } else {
-                e.vframe_poison();                /* TESTS only */
             }
             }                                    /* end of the machinery */
             establish(begin, /*frameless=*/true);

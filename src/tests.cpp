@@ -34686,19 +34686,21 @@ static bool jit_frameless_w2_shape()
                      * this per-CALL prologue is three instructions,
                      * and W6's second one is recovered here. */
                     "lea rbx, [rbp+0x20]",       /* the caller's window */
+                    /* #97 R4: a LEAF is lazy - the vframe is NOT
+                     * published; a TESTS build parks the poison window
+                     * there instead (the site checks it is still there
+                     * after the call). REGCALL step 1: BEFORE the
+                     * arguments are taken, through r8/r11 - registers
+                     * no argument arrives in */
+                    "movabs r11, <addr>",        /* jit_poison_window */
+                    "mov r8, [<addr>]@r8",       /* act */
+                    "mov [r8+0x*], r11",         /* vframe.slots */
+                    "mov [r8+0x*], 0",           /* vframe.size = 0 */
                     /* REGCALL 1A: the int parameter `k` arrives in rdi;
                      * read once, it is not pinned, so the entry writes
                      * its slot (W5: no tails - unlisted, bound raw) */
                     "mov r0, rdi",
                     "mov r0.type, <int-tag>@r11",
-                    /* #97 R4: a LEAF is lazy - the vframe is NOT
-                     * published; a TESTS build parks the poison window
-                     * there instead (the site checks it is still there
-                     * after the call) */
-                    "movabs r11, <addr>",        /* jit_poison_window */
-                    "mov rcx, [<addr>]@rcx",     /* act */
-                    "mov [rcx+0x*], r11",        /* vframe.slots */
-                    "mov [rcx+0x*], 0",          /* vframe.size = 0 */
                     "mov r1*, [rdx+0x*]",        /* W4: the capture data
                                                   * pointer from fo (rdx) -
                                                   * ONE load, no ctx walk.
@@ -35678,6 +35680,126 @@ static bool jit_lea_addsub_shape()
                     pin, mv.ops[1].reg);
             ok = false;
         }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * ==========  REGCALL STEP 1: CALL-FREE PINS ARE CALLER-SAVED  ==========
+ *
+ * A function body's entry runs PER CALL, and a callee-saved pin costs a
+ * push there and a pop at every exit. A run that brackets no call pins
+ * in the caller-saved half instead - and a REGCALL parameter in the
+ * register its argument ARRIVES in, so the frameless entry moves
+ * nothing at all. Both directions, in one program each:
+ *
+ *   ON   g's frameless entry pushes no r12-r15 and moves no argument
+ *        register (`mov <pin>, rdi` / `rcx`); g_jit_pins_cs bumps;
+ *   OFF  (the `pincs` lever) the same entry pushes callee-saved pins -
+ *        so the ON assertion is not satisfied by a shape that never
+ *        pinned anything.
+ *
+ * g's body is weighed past the AST inliner and the splice is held off,
+ * so the call survives to a frameless site.
+ */
+static bool jit_regcall_pins_caller_saved()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const bool splice_was = g_bc_inline_enabled;
+    g_bc_inline_enabled = false;
+    const unsigned off_was = g_jit_off_extra;
+    struct Restore {
+        bool sp; unsigned off;
+        ~Restore() { g_bc_inline_enabled = sp; g_jit_off_extra = off; }
+    } restore{ splice_was, off_was };
+    const std::vector<const char *> lines = {
+        "func g(int a, int b) {",
+        "  var t = a * a + b * b;",
+        "  if (t > 1000) { t = t - a * b; } else { t = t + a * b; }",
+        "  if (t > 99999) { t = t & 4095; }",
+        "  return t - a + b; }",
+        "var s = 0;",
+        "for (var i = 0; i < runtime(5); i++) {",
+        "  s = (s + g(i, s & 7)) & 1023; }",
+        "print(s);"
+    };
+    /* the frameless entry's prologue, up to its `jmp` into the body */
+    const auto entry = [&](const std::string &d,
+                           std::vector<NativeIns> &out) -> bool {
+        const std::vector<NativeIns> in = native_ins_of(d, "func g");
+        const long fe = native_frameless_entry_off(d, "func g");
+        if (fe < 0 || in.empty())
+            return false;
+        for (const NativeIns &ni : in) {
+            if (ni.off < static_cast<uint32_t>(fe))
+                continue;
+            out.push_back(ni);
+            if (ni.text.compare(0, 4, "jmp ") == 0)
+                break;
+        }
+        return !out.empty();
+    };
+    const auto pushes_cs = [](const std::vector<NativeIns> &in) {
+        for (const NativeIns &ni : in)
+            if (ni.text == "push r12" || ni.text == "push r13"
+                    || ni.text == "push r14" || ni.text == "push r15")
+                return true;
+        return false;
+    };
+    bool ok = true;
+    std::string d;
+    const unsigned long c0 = g_jit_pins_cs;
+    try {
+        d = native_dump_of(lines);
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_regcall_pins_caller_saved: threw %s: %s\n",
+                e.name, e.msg);
+        return false;
+    }
+    std::vector<NativeIns> on;
+    if (!entry(d, on)) {
+        fprintf(stderr, "jit_regcall_pins_caller_saved: VACUOUS - g "
+                        "has no frameless entry in the dump\n");
+        return false;
+    }
+    if (g_jit_pins_cs == c0) {
+        fprintf(stderr, "jit_regcall_pins_caller_saved: the bet never "
+                        "engaged (g_jit_pins_cs did not move)\n");
+        ok = false;
+    }
+    if (pushes_cs(on)) {
+        fprintf(stderr, "jit_regcall_pins_caller_saved: g's frameless "
+                        "entry still pushes a callee-saved pin\n");
+        ok = false;
+    }
+    for (const NativeIns &ni : on)
+        if (ni.text.size() > 5 && ni.text.compare(0, 4, "mov ") == 0
+                && (ni.text.find(", rdi") == ni.text.size() - 5
+                    || ni.text.find(", rcx") == ni.text.size() - 5)
+                && ni.text.find('[') == std::string::npos
+                /* `mov r0, rdi` is a SLOT store (an unpinned
+                 * parameter), not a register move */
+                && ni.text.compare(0, 7, "mov r0,") != 0
+                && ni.text.compare(0, 7, "mov r1,") != 0) {
+            fprintf(stderr, "jit_regcall_pins_caller_saved: the entry "
+                            "MOVES an argument register: `%s` - a "
+                            "pinned parameter should live where it "
+                            "arrives\n", ni.text.c_str());
+            ok = false;
+        }
+    /* the OFF direction: the same program pushes callee-saved pins */
+    g_jit_off_extra = off_was | jit_lever_bit("pincs");
+    std::vector<NativeIns> off;
+    if (!entry(native_dump_of(lines), off) || !pushes_cs(off)) {
+        fprintf(stderr, "jit_regcall_pins_caller_saved: with `pincs` "
+                        "off g's entry pushes no callee-saved pin - "
+                        "the ON check above proves nothing\n");
+        ok = false;
     }
     return ok;
 #else
@@ -38423,6 +38545,15 @@ static bool jit_two_address()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
+    /* REGCALL step 1: the caller-saved pin bet changes WHICH slots win
+     * a register in this crafted pressure shape (the transition plan
+     * follows the register choice), and the memory STEP form needs the
+     * counter to lose. The tier is what is under test, not the pick. */
+    struct PincsOff {
+        unsigned v = g_jit_off_extra;
+        PincsOff() { g_jit_off_extra |= jit_lever_bit("pincs"); }
+        ~PincsOff() { g_jit_off_extra = v; }
+    } pincs_off;
 
     auto go = [&](const std::vector<std::string> &src,
                   unsigned long *hits,
@@ -39681,8 +39812,11 @@ static bool jit_xcache_pins()
     /* #103 (A'): the allocator choice is the JL_LSRA LEVER now,
      * set through the same in-process seam every other lever's
      * coverage test uses.  `g_jit_lsra` is deleted. */
+    /* REGCALL step 1: and the caller-saved pin bet, which takes r10/
+     * r11 FIRST in a call-free function body - the pick's own
+     * preference is what this test pins */
     const unsigned lsra_saved = g_jit_off_extra;
-    g_jit_off_extra |= jit_lever_bit("lsra");
+    g_jit_off_extra |= jit_lever_bit("lsra") | jit_lever_bit("pincs");
     struct LsraRestore {
         unsigned v;
         ~LsraRestore() { g_jit_off_extra = v; }
@@ -49358,6 +49492,11 @@ static const std::vector<extra_check> extra_checks =
       "call-free leaf's prologue drops it, a calling leaf's keeps it "
       "(one program, both directions, every prologue)",
       jit_entry_pad_is_for_calls },
+    { "jit: REGCALL step 1 - a call-free function body pins CALLER-saved "
+      "and a register parameter where it arrives: no callee-saved push, "
+      "no argument move at the frameless entry (and the lever-off twin "
+      "does push)",
+      jit_regcall_pins_caller_saved },
     { "jit: the shape tests' MACHINE-INSTRUCTION MODEL parses every "
       "form the emitter produces (it fails closed, so a form it does "
       "not know must fail HERE and not silently match nothing)",
