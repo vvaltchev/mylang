@@ -370,7 +370,14 @@ captures from `ctx` — byte-identical to `FuncDeclStmt::do_eval` for a lambda �
 where `def` is a program-lifetime **`FuncDescriptor*`** from a
 `Chunk::closure_defs` pool (the `Instr` holds only the index, and the pool
 holds NO `Construct*`; the ctor never throws for a resolved closure, so no
-loc). A **top-level `func f(..){}` decl
+loc). **A SPLICED one (#97 increment 3)** - a closure factory's body pasted
+into its caller - sets `a` as a DUAL (lo = the lowest captured slot in THIS
+frame, hi = the span of captured slots): every capture is then a frame
+local, read at the descriptor's slot + (lo - the descriptor's lowest
+captured slot), which is how the captures follow the splice base. The dual
+is also what lists those reads to `visit_use_def` (they are the caller's
+TEMPS now). Unspliced, `a` stays at its default (-1).
+A **top-level `func f(..){}` decl
 STATEMENT** bound into a hoisted GLOBAL slot reuses the same op — `gen_stmt`
 emits `MakeClosureV` (the `FuncObject`) + **`StoreGlobalV`** (write the slot +
 mark `defined`), byte-identical to `FuncDeclStmt::do_eval`'s global-bind

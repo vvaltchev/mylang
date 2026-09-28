@@ -294,12 +294,35 @@ bool jit_struct_facts(const Chunk &chunk, const std::vector<int> &entry_pcs,
                       std::vector<uint32_t> &in);
 
 /*
+ * #97 increment 3: a MakeClosureV spliced into another frame. The
+ * descriptor's capture list names slots of the frame it was compiled
+ * for; pasted into a caller at base B, those slots are B higher. The
+ * op records it in `a` as a DUAL: lo = its lowest captured slot in THIS
+ * frame, hi = the span of captured slots - which is also what makes the
+ * reads visible to visit_use_def (they are temps of the caller now). An
+ * unspliced op leaves `a` at its default (-1): offset 0.
+ *
+ * `make_closure_span` - the descriptor's local capture span, false when
+ * it has no capture or one that is not a frame local (a splice declines
+ * those). `make_closure_offset` - the slot shift a VM/JIT construction
+ * applies to every capture, 0 for an unspliced op.
+ */
+bool make_closure_span(const FuncDescriptor *d, int &lo, int &span);
+int make_closure_offset(const Instr &in, const FuncDescriptor *d);
+
+/*
  * #97 G3: `proven[pc]` = the GuardCalleeV at pc is TRUE on every path -
  * its slot's only reaching writes are `make.closure` of the guarded
  * descriptor. A must-dataflow over the chunk's own code, so it is sound
  * on a loaded image. Returns false when no guard is proven.
  */
 bool jit_guard_facts(const Chunk &chunk, std::vector<char> &proven);
+/* The facts behind it: fact f = (fact_slot[f] holds a closure of
+ * fact_def[f]); `in[pc] & (1 << f)` = on every path reaching pc. False
+ * when there is no make.closure to generate one (or more than 32). */
+bool closure_slot_facts(const Chunk &chunk, std::vector<int> &fact_slot,
+                        std::vector<const FuncDescriptor *> &fact_def,
+                        std::vector<uint32_t> &in);
 
 /*
  * C4e: one op's frame-slot reads and writes, from the SAME audited
@@ -472,6 +495,8 @@ struct BcInlineSnapshot {
     std::vector<Chunk::ArgLocEntry> arg_locs; /* RULE 2: per-arg carets */
     std::vector<ArgLoc> arg_loc_pool;
     std::vector<int32_t> ref_slots;
+    /* #97 increment 3: the pool a make.closure in the body indexes */
+    std::vector<const FuncDescriptor *> closure_defs;
     int slot_count = 0;
     int n_temps = 0;
     bool eligible = false;
@@ -525,6 +550,9 @@ extern unsigned long g_bc_inline_caller_frames;
 extern unsigned long g_bc_inline_splices;
 extern unsigned long g_bc_inline_value_splices;   /* #97 closure inlining */
 extern unsigned long g_bc_inline_value_twoway;    /* #97 increment 2 */
+extern unsigned long g_bc_inline_closures;        /* #97 increment 3 */
+extern unsigned long g_bc_sra_closures;           /* #97 increment 5 */
+extern bool g_bc_sra_enabled;                     /* MYLANG_BCINLINE_SRA */
 extern unsigned long g_ref_slots_proven_excluded;   /* C3 (TESTS) */
 /*
  * #97: slots the MoveV rule kept OUT of `ref_slots` - a move's dst is a

@@ -2,8 +2,20 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 24.  This document describes the on-disk image exhaustively:
+Format version 25.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v25 changes no encoding: MakeClosureV's `a` gains a meaning.  At its
+default (-1, i.e. absent) the op is as before.  Set, it is a DUAL - lo =
+the lowest captured slot in this chunk's frame, hi = the span of captured
+slots - written by the bytecode splice when it pastes a closure FACTORY's
+body into a caller (#97 increment 3): every capture is then a frame local,
+read at the descriptor's slot + (lo - the descriptor's lowest captured
+slot).  The verifier refuses a set dual whose span is not the
+descriptor's own, whose shift is negative, whose run leaves the frame, or
+whose descriptor has a capture that is not a frame local, and any other
+value than the default.  A v24 binary would ignore the dual and read the
+captures from the unshifted slots.)
 
 (v24 changes no encoding: three opcodes were APPENDED - GuardCalleeV,
 LoadCaptureOfV and StoreCaptureOfV, the inline cache the bytecode splice

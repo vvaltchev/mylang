@@ -1,0 +1,58 @@
+# #97 closure inlining, increment 5: a closure that never ESCAPES is
+# scalar-replaced - its captures become frame slots of the caller and no
+# object is built. Every shape must print what the calls printed:
+#  - REPLACED (a closure BUILT IN A LOOP - the profitability gate):
+#    63's two factories; a closure literal built in main's loop; a
+#    two-capture span with a gap; a parameter captured beside a local;
+#  - KEPT (not profitable): a counter built once, before the loop;
+#  - KEPT (an escape): a closure returned from a function, one stored in
+#    an array, one COPIED into a second variable - the two must share
+#    ONE counter - and a slot written with two different closures.
+# MYLANG_BCINLINE_SRA=0 is the same program with the objects kept.
+func mc(start) {
+    var count = start;
+    return func [count] () { count++; return count; };
+}
+func ma(n) { var base = n * 10; return func [base] (x) { return base + x; }; }
+func mg(a) {
+    var p = a * 2;
+    var q = a + 1;
+    var z = q * 3;
+    return func [p, z] (int x) { return p + z + x; };
+}
+func mq(n) {
+    var w = n + 1;
+    return func [n, w] (int x) { return n * 1000 + w + x; };
+}
+func wrap(int k) { var c = mc(k); var r = c(); return c; }
+
+var st = int(runtime(0));
+var tick = func [st] () { st++; return st; };
+var st2 = int(runtime(5));
+var shared = func [st2] () { st2++; return st2; };
+var alias = shared;
+var st3 = int(runtime(7));
+var boxed = func [st3] () { st3++; return st3; };
+var fs = [boxed];
+var a1 = int(runtime(1));
+var b1 = int(runtime(2));
+var either = func [a1] () { return a1; };
+if (runtime(1) > 0)
+    either = func [b1] () { return b1 * 10; };
+
+var s = 0;
+var t = 0;
+for (var i = 0; i < 25; i++) {
+    var c = mc(i);
+    s = s + c() + c();
+    var add = ma(i);
+    s = s + add(i);
+    var g = mg(i);
+    var h = mq(i);
+    var lit = i * 2;
+    var one = func [lit] () { lit++; return lit; };
+    s = s + g(i) + h(i) + tick() + one() + one();
+    var w = wrap(i);
+    t = t + w() + shared() + alias() + boxed() + fs[0]() + either();
+}
+print(s, t, tick(), shared(), alias(), boxed());

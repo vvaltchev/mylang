@@ -23,7 +23,10 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 24;   /* v24: the closure-inlining
+constexpr unsigned MYV_FORMAT_VERSION = 25;   /* v25: a spliced
+                                                 MakeClosureV's `a` is its
+                                                 capture span (#97 inc 3);
+                                                 v24: the closure-inlining
                                                  inline cache's three
                                                  APPENDED opcodes;
                                                  v23: MapFilterV's target2
