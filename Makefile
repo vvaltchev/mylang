@@ -163,7 +163,17 @@ endif
 # silently loses its header dependencies and a later header edit leaves a
 # stale object behind.
 DEPDIR := $(BUILD_DIR)/.d
-DEPFLAGS = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.Td
+# The dependency rule names the object under BOTH spellings of its path -
+# as make sees it this run ($@) and absolute. A lane built once with an
+# ABSOLUTE BUILD_DIR (tests/run_battery.py passes one) and later with a
+# relative one (`make BUILD_DIR=build-claude/dbg`) otherwise has .d files
+# whose target is a DIFFERENT string from the object make is asked for:
+# the rule matches nothing, every header dependency is silently dropped,
+# and an object compiled against an old header survives a rebuild. That
+# happened (2026-09-28): a stale serialize.o kept the old opcode count
+# and refused every image holding a new opcode as "corrupt". A duplicate
+# target when the two spellings agree is harmless.
+DEPFLAGS = -MT $@ -MT $(abspath $@) -MMD -MP -MF $(DEPDIR)/$*.Td
 POSTCOMPILE = mv -f $(DEPDIR)/$*.Td $(DEPDIR)/$*.d
 SOURCES:=$(wildcard src/*.cpp)
 OBJECTS=$(SOURCES:src/%.cpp=$(BUILD_DIR)/%.o)

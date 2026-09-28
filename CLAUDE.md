@@ -393,7 +393,15 @@ is what compiles the
 `.d/` was rewritten by every lane, so two lanes building at once (the
 battery runner does exactly that) raced on the `.Td` temp file and left
 each other's object named in the surviving `.d`, silently dropping a
-lane's header dependencies.
+lane's header dependencies. **And each `.d` names its object under BOTH
+spellings of the path (`-MT $@ -MT $(abspath $@)`, 2026-09-28):** the
+battery builds a lane with an ABSOLUTE `BUILD_DIR`, a hand build of the
+same lane passes a relative one, and a `.d` whose target string differs
+from the object make is asked for matches nothing - every header change
+was silently ignored for that lane, and a stale `serialize.o` kept the
+old opcode count and refused every image holding a new opcode as
+"corrupt". After a header change, a surprising result from a lane the
+battery also builds is a reason to `make clean` that lane first.
 
 **⛔ DEBUG INFO IS OFF BY DEFAULT — `DEBUG_INFO` (default 0, EVERY build
 type, both build systems; maintainer-set 2026-08-26).** The `-ggdb` that
