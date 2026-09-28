@@ -1554,6 +1554,7 @@ extern "C" unsigned long g_jit_capbase;       /* #112: fragment entries with
  * the inlined body; explicit-closure capture accesses served by the
  * inline copy; CoerceNumV inline-arm executions */
 extern "C" unsigned long g_jit_guard_hits;
+extern "C" unsigned long g_jit_guard_proven;
 extern "C" unsigned long g_jit_capof_fast;
 extern "C" unsigned long g_jit_coerce_fast;
 extern "C" unsigned long g_jit_coerce_pin;

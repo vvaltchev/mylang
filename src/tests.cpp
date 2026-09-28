@@ -28115,6 +28115,217 @@ static bool myv_closure_guard_tamper()
     return ok;
 }
 
+/*
+ * #97 G3: an inline-cache guard whose slot's ONLY reaching writes are a
+ * `make.closure` of the guarded descriptor is true by construction, and
+ * the JIT emits nothing for it (jit_guard_facts). Three halves:
+ *  - STRUCTURAL: the proof holds for closures created in the calling
+ *    chunk (main AND a function body), and does NOT hold when the slot
+ *    is reached through a copy (a MoveV is not a GEN) or rewritten from
+ *    an array element (a KILL) - both still splice, both keep the guard.
+ *    Counting guards as well as proofs keeps the negatives non-vacuous.
+ *  - EXECUTION: the proven program renders identically in every engine
+ *    and the emitted-code counter g_jit_guard_proven moved.
+ *  - IMAGE: two local closures' make.closure descriptors swapped in a
+ *    .myv - the proof must now FAIL (the slot holds the other closure),
+ *    the guard miss, and the run match the same tamper with the splice
+ *    off. A proof that ignored the descriptor would elide the guard and
+ *    run the wrong body over the wrong captures.
+ */
+static bool jit_guard_proof_g3()
+{
+    bool ok = true;
+    const auto compile_count = [](const std::string &src, size_t &guards,
+                                  size_t &proven) -> bool {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        guards = proven = 0;
+        std::vector<const Chunk *> chunks { &prog.root };
+        for (const auto &fd : prog.funcs)
+            if (fd->vm_chunk)
+                chunks.push_back(static_cast<const Chunk *>(fd->vm_chunk));
+        for (const Chunk *ck : chunks) {
+            std::vector<char> pv;
+            jit_guard_facts(*ck, pv);
+            for (size_t p = 0; p < ck->code.size(); p++)
+                if (ck->code[p].op == OpCode::GuardCalleeV) {
+                    guards++;
+                    if (p < pv.size() && pv[p])
+                        proven++;
+                }
+        }
+        return true;
+    };
+    const std::string proven_src =
+        "var st = int(runtime(0));\n"
+        "var tick = func [st] () { st++; return st; };\n"
+        "var bs = int(runtime(7));\n"
+        "var add = func [bs] (int k) { return bs + k; };\n"
+        "func inner(int n) { var m = n * 3;\n"
+        "  var h = func [m] (int x) { return m - x; };\n"
+        "  var r = 0;\n"
+        "  for (var j = 0; j < n; j++) r = r + h(j);\n"
+        "  return r; }\n"
+        "var s = 0;\n"
+        "for (var i = 0; i < 40; i++) s = s + tick() + add(i) + inner(i);\n"
+        "print(s, tick());\n";
+    const struct { const char *name; std::string src; bool want_proven; }
+    cases[] = {
+        { "local closures (main + a function body)", proven_src, true },
+        { "reached through a copy",
+          "var bs = int(runtime(7));\n"
+          "var f = func [bs] (int k) { return bs + k; };\n"
+          "var g = f;\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 40; i++) s = s + g(i);\n"
+          "print(s);\n", false },
+        { "rewritten from an array element",
+          "var bs = int(runtime(7));\n"
+          "var f = func [bs] (int k) { return bs + k; };\n"
+          "var arr = [f];\n"
+          "f = arr[0];\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 40; i++) s = s + f(i);\n"
+          "print(s);\n", false },
+    };
+    for (const auto &c : cases) {
+        size_t guards = 0, proven = 0;
+        try {
+            compile_count(c.src, guards, proven);
+        } catch (Exception &e) {
+            fprintf(stderr, "jit_guard_proof_g3 [%s]: %s\n", c.name, e.name);
+            ok = false;
+            continue;
+        }
+        if (guards == 0) {
+            fprintf(stderr, "jit_guard_proof_g3 [%s]: no guard - the shape "
+                            "is vacuous\n", c.name);
+            ok = false;
+        } else if (c.want_proven ? proven != guards : proven != 0) {
+            fprintf(stderr, "jit_guard_proof_g3 [%s]: %zu of %zu guards "
+                            "proven, want %s\n", c.name, proven, guards,
+                    c.want_proven ? "all" : "none");
+            ok = false;
+        }
+    }
+
+    /* EXECUTION: five engines agree, and the elided guard ran */
+    const std::string ref = engine_run_bt(proven_src, ExecEngine::TreeWalk,
+                                          false, false);
+#if ML_JIT_SUPPORTED
+    const unsigned long pv0 = g_jit_guard_proven;
+#endif
+    const struct { const char *name; bool jit, splice; } cfgs[] = {
+        { "vm -nbi", false, false }, { "jit -nbi", true, false },
+        { "vm", false, true }, { "jit", true, true },
+    };
+    for (const auto &c : cfgs) {
+        const std::string got = engine_run_bt(proven_src, ExecEngine::Vm,
+                                              c.jit, c.splice);
+        if (got != ref) {
+            fprintf(stderr, "jit_guard_proof_g3: %s differs from the "
+                            "tree-walker:\n--- tw\n%s--- %s\n%s", c.name,
+                    ref.c_str(), c.name, got.c_str());
+            ok = false;
+        }
+    }
+#if ML_JIT_SUPPORTED
+    if (g_jit_enabled && g_jit_guard_proven == pv0) {
+        fprintf(stderr, "jit_guard_proof_g3: no proven guard ran\n");
+        ok = false;
+    }
+#endif
+
+    /* IMAGE: swap the two make.closure descriptors */
+    const std::string tsrc =
+        "var c = int(runtime(10));\n"
+        "var a = func [c] () { c++; return c; };\n"
+        "var b = int(runtime(7));\n"
+        "var d = func [b] () { return b * 2; };\n"
+        "var t = 0;\n"
+        "for (var i = 0; i < 30; i++) { t = t + a() + d(); }\n"
+        "print(t, a(), d());\n";
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-guard-proof.myv";
+    const auto tampered_run = [&](bool splice, size_t &guards)
+        -> std::string {
+        const bool sv = g_bc_inline_value_enabled;
+        g_bc_inline_value_enabled = splice;
+        std::vector<Tok> toks;
+        lexer(tsrc, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        g_bc_inline_value_enabled = sv;
+        std::vector<size_t> mk;
+        guards = 0;
+        for (size_t p = 0; p < prog.root.code.size(); p++) {
+            if (prog.root.code[p].op == OpCode::MakeClosureV)
+                mk.push_back(p);
+            else if (prog.root.code[p].op == OpCode::GuardCalleeV)
+                guards++;
+        }
+        if (mk.size() != 2)
+            return "SHAPE: " + std::to_string(mk.size()) + " closures";
+        std::swap(prog.root.code[mk[0]].target2,
+                  prog.root.code[mk[1]].target2);
+        myv_write(prog, path, MyvSourceRef());
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(loaded);
+        } catch (Exception &e) {
+            cap << "EXC " << e.name << "\n";
+        }
+        std::cout.rdbuf(old_buf);
+        return cap.str();
+    };
+    try {
+        size_t g_on = 0, g_off = 0;
+        const std::string spliced = tampered_run(true, g_on);
+        const std::string plain = tampered_run(false, g_off);
+        if (g_on < 2 || g_off != 0) {
+            fprintf(stderr, "jit_guard_proof_g3: image: %zu guards "
+                            "spliced, %zu with the splice off - vacuous\n",
+                    g_on, g_off);
+            ok = false;
+        }
+        if (plain.empty() || plain.find("SHAPE") != std::string::npos
+                || plain.find("EXC") != std::string::npos
+                || spliced != plain) {
+            fprintf(stderr, "jit_guard_proof_g3: image: splice off \"%s\", "
+                            "spliced \"%s\"\n", plain.c_str(),
+                    spliced.c_str());
+            ok = false;
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_guard_proof_g3: image: %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
 static bool myv_root_slot_count_checked()
 {
     const char *lines_arr[] = {
@@ -48063,6 +48274,9 @@ static const std::vector<extra_check> extra_checks =
       "DIFFERENT closure than the inlined one runs right (the guard "
       "misses, the original call runs)",
       myv_closure_guard_tamper },
+    { "jit: #97 G3 - a guard a local make.closure proves is elided, "
+      "and a tampered image keeps it",
+      jit_guard_proof_g3 },
     { "myv: the verifier bounds a planned ctor's mini-run (small-938, a "
       "load-time HANG)", myv_verify_ctor_minirun },
     { "jit: #97 inc 3 (W1/W2) - the CALLER builds the frameless window "

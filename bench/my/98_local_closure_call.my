@@ -1,0 +1,24 @@
+# CLOSURES CREATED IN THE FUNCTION THAT CALLS THEM - the inline cache's
+# third shape. 11 and 78 build their closures in a factory CALL, so the
+# splice's guard must be checked (a call's result is not visible to the
+# caller); here the closure literal sits in the same chunk as the call,
+# so the guard is provably true from the code alone (#97, the guard
+# elided by a LOCAL proof). A mutable capture (the counter) and a
+# read-only one with an int argument (the adder), called once each per
+# iteration.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 1000000 * scale;
+
+var start = int(runtime(0));
+var tick = func [start] () { start++; return start; };
+var base = int(runtime(7));
+var add = func [base] (int k) { return base + k; };
+
+var s = 0;
+for (var i = 0; i < N; i++)
+    s = s + tick() + add(i);
+
+print("result:", s);

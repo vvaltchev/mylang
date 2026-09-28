@@ -294,6 +294,14 @@ bool jit_struct_facts(const Chunk &chunk, const std::vector<int> &entry_pcs,
                       std::vector<uint32_t> &in);
 
 /*
+ * #97 G3: `proven[pc]` = the GuardCalleeV at pc is TRUE on every path -
+ * its slot's only reaching writes are `make.closure` of the guarded
+ * descriptor. A must-dataflow over the chunk's own code, so it is sound
+ * on a loaded image. Returns false when no guard is proven.
+ */
+bool jit_guard_facts(const Chunk &chunk, std::vector<char> &proven);
+
+/*
  * C4e: one op's frame-slot reads and writes, from the SAME audited
  * enumeration (visit_use_def) the peephole and jit_fwd_info use. Returns
  * false for an op the table does not know - the caller must then treat it

@@ -15521,3 +15521,40 @@ twice each, against step 1b:
 `-rt` 2086/2086 in all five modes; `corpus_diff --cold --nolowmem`
 51/51 in every configuration (the off-arena rows run the register
 fallback of both compares, `COLD=guard` the miss arm).
+
+**G3 - A GUARD A LOCAL `make.closure` PROVES IS NOT EMITTED (increment
+4 of plans/closure-inlining.md, 2026-09-27).** `jit_guard_facts`
+(codegen.cpp) is a forward MUST dataflow in C4d's shape: a fact is
+(slot, descriptor); `make.closure S = D` generates it, any write to S
+per `visit_use_def` kills it (an unaudited op kills all), meet is
+intersection, pc 0 and every handler pc are bottom. A GuardCalleeV
+whose (slot, descriptor) holds on entry emits NOTHING. Two choices
+worth knowing:
+ - **the proof is over the bytecode being executed**, recomputed by
+   the JIT on every compile AND every image load, so it is as sound on
+   a `.myv` as on our own compile - a tampered image either keeps the
+   proving `make.closure` on every path or loses the proof. Nothing is
+   recorded in the image; the interpreter still checks every guard.
+ - **post-call resume pcs are NOT bottom** here, unlike C4d: a resume
+   continues the same frame right after its call op, whose only frame
+   write is its listed dst - the fall-through edge already models it.
+   Bottom there would lose every proof past the first call in a loop,
+   and a miss arm IS a call that rejoins right before the next guard.
+
+Descriptors compare by POINTER. Reach: no pre-existing bench has the
+shape (11/78/63 build their closures in factory calls), so
+**bench 98_local_closure_call** was written for it (a counter and an
+adder created in main; my/py/cpp). Same binary, `MYLANG_JIT_OFF=gproof`
+as the A/B, pinned, scale 3, twice:
+
+    98   cycles 29.3/29.2M -> 24.8/24.0M (-16.5%)
+         54 -> 42 instructions per iteration (6 per guard)
+
+Pinned by `jit_guard_proof_g3`: structural (every guard proven in main
+AND a function body; NOT proven through a `g = f` copy or after
+`f = arr[0]`, each case also requiring a guard to exist), five-engine
+parity with `g_jit_guard_proven` moving, and an IMAGE whose two
+`make.closure` descriptors are swapped, which must run exactly as the
+same tamper with the splice off. Watched failing: dropping the
+descriptor compare fails the image case; dropping the kill fails the
+array case. `corpus_diff --levers --cold` 34/34 configurations clean.

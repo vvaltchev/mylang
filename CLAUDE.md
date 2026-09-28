@@ -1464,7 +1464,10 @@ collision). Three nets now:
   loads must declare themselves MACHINERY. **`--xrot` found that
   last part on its first run** (r11 at rotation 11; the default
   rotation picks r10 and never meets the arm)),
-  `all`.
+  vfquiet (#97 R4, the quiet vframe of a frameless leaf), gproof (#97
+  G3: an inline-cache guard a local `make.closure` proves emits
+  nothing - `jit_guard_facts`, recomputed over the bytecode being
+  run, so sound on an image), `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the
