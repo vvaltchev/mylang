@@ -25875,21 +25875,25 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             }
             return;
         }
+        /* Both compares read MEMORY: the type word is compared in
+         * place (one instruction on the arena) and the descriptor
+         * against `[fo + func]`, so the only register load left is the
+         * FuncObject pointer itself - 6 instructions where the
+         * load-then-compare form took 8 (#97 guard cost). */
         AccScratch acc(e);
-        e.load(acc.r, a.type);
         {
             RefScratch rn(e, RCX);
-            e.cmp_reg_tag_via(acc.r, P.t_func, rn.sc);
+            e.cmp_mem_tag(RBX, a.type, P.t_func, rn.sc);
             rn.release();                  /* before the edge */
         }
         emit_cond_jump_raw(e, 0x85 /* jne near */, 0x74 /* je short */,
                            static_cast<size_t>(in.target), begin, end,
                            remap, fixups);
         e.load(acc.r, a.payload);          /* the FuncObject */
-        e.load_base(acc.r, acc.r, static_cast<int32_t>(P.fo_func));
         {
             RefScratch rn(e, RCX);
-            e.cmp_reg_tag_via(acc.r, ck.closure_defs[in.target2], rn.sc);
+            e.cmp_mem_tag(acc.r, static_cast<int32_t>(P.fo_func),
+                          ck.closure_defs[in.target2], rn.sc);
             rn.release();
         }
         emit_cond_jump_raw(e, 0x85 /* jne near */, 0x74 /* je short */,
