@@ -2081,6 +2081,18 @@ struct Chunk {
      */
     bool frameless_calls = false;
     /*
+     * REGCALL 1B: a frameless_ok chunk none of whose ReturnVs returns a
+     * ref-listed slot - so every value it can return is TRIVIAL (the
+     * ref_slots invariant) and travels back in registers: the frameless
+     * return arm leaves the payload in RDX and the type word in RCX
+     * (status -1 in RAX as ever) and never touches the dst word; every
+     * frameless SITE of such a callee stores the pair into its dst
+     * itself. Derived beside frameless_ok (jit_chunk_frameless_derive),
+     * never stored - the site and the arm must read the same answer, and
+     * a chunk's own code is the only input either has.
+     */
+    bool frameless_ret_regs = false;
+    /*
      * #97 increment 3 (W3): bit `s` set = window slot `s` is written ONLY
      * by ops that store it raw (payload + type word, never through
      * LValue::put) and is not ref-listed, so a frameless SITE building

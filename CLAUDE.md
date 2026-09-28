@@ -1472,7 +1472,13 @@ collision). Three nets now:
   before the loop - a C1 hoist region with no element base; every
   post-call resume stub inside it RE-CHECKS the guards and resumes in
   the cold copy on a miss, since a switched call can come back into
-  the loop), `all`.
+  the loop), regcall (REGCALL 1A: a frameless callee's int parameters
+  arrive in rdi/rcx/r9/r10 and its entry moves each straight into the
+  parameter's pin, or writes the slot when it is not pinned - one rule,
+  `jit_regcall_arg_reg`, for the site and the entry; 1B, the result in
+  rdx/rcx for a callee whose every return is trivial, has no lever:
+  `Chunk::frameless_ret_regs` is derived and the site and the arm both
+  read it), `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the
