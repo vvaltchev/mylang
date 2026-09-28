@@ -15465,3 +15465,42 @@ nothing was added. Blocked store-forwards are unchanged (1812 vs 1813);
 top-down moves from 12.9% to 20.4% CORE-bound while fetch latency and
 bandwidth both fall slightly. Not diagnosed - recorded for the
 maintainer, per the do-not-revert-an-optimization rule.
+
+**Top-down LEVEL 3 does not localize it either** (each metric group
+measured on its own - `-M TopdownL3` at once multiplexes the counters
+until most metrics read `nan`): core bound 12.9% -> 19.6%, but its only
+populated child, ports utilization, FALLS 8.8% -> 7.7%, serializing
+stays ~0.3%, >=3 ports busy is ~97% in both, and load / store port
+utilization fall 75% -> 70% / 26% -> 20% (fewer memory ops, as the code
+says). The extra cycles are core-bound time top-down attributes to no
+child - most plausibly a scheduling / dependency-latency effect in the
+loop. The next tool is a pipeline model of the loop body, not more
+counters.
+
+**THE GUARD'S COST, measured (2026-09-27).** A measurement-only lane
+emitted NO guard (unsound - built from a temporary edit, the source
+restored at once, the lane deleted), against the step-1b binary, whole
+scale-3 runs, pinned, twice each:
+
+    bench  instructions            cycles
+    11     -24.1% (8 per call)     -13.5%  (~1.1 cycles per guard)
+    78     -23.0% (2 per iter)     -19.1%  (~2.3 cycles per iteration)
+    63      -5.2%                  ~flat   (its 2 allocations dominate)
+
+This CONTRADICTS the guard-elision ledger in CLAUDE.md ("an instruction
+win with a wall-clock ceiling near zero"), and the level-3 data says
+why: those guards sat beside heavy work, while these bodies are three
+ops long and the loop is LOAD-PORT bound (70-75% load-op utilization) -
+the guard's three dependent loads (type word, FuncObject, descriptor)
+compete with the real work for the same ports. The guard is still
+REQUIRED for soundness (a loaded image); the options are to make it
+cheaper or to run it less often:
+ - HOIST it out of the loop when nothing in the loop writes the callee
+   slot (a FuncObject's descriptor never changes), with a guarded
+   fallback copy of the loop - the C1 loop-versioning family's shape;
+   removes all of it from the loop in 11 and 78;
+ - SHORTEN it: compare the type word against memory directly and drop
+   the register round trip - a few instructions, same three loads;
+ - increment 4's local proof (the closure is created in the same
+   chunk) removes it outright, but reaches neither 11 nor 78, whose
+   closures come from a factory CALL.
