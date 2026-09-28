@@ -182,6 +182,8 @@ unsigned long g_jit_entry_pad_off = 0;
 unsigned long g_jit_pins_cs = 0;      /* REGCALL 1: runs whose pins
                                        * took the caller-saved bet */
 unsigned long g_jit_pins_cs_lost = 0; /* ...and re-emitted on losing */
+unsigned long g_jit_ret_unflushed = 0; /* REGCALL 2: returns that left a
+                                        * dead write-back out */
 unsigned long g_jit_call_align = 0;
 /* calls emitted into code no branch has reached yet (MoveV's dead
  * helper arm is the corpus's whole population) - see call_site */
@@ -410,7 +412,7 @@ enum JitLever {
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
     JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA,
     JL_FRAMELESS, JL_CAPPROT, JL_VFQUIET, JL_GPROOF, JL_GHOIST, JL_REGCALL,
-    JL_PINCS,
+    JL_PINCS, JL_RETWB,
     JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
@@ -418,7 +420,7 @@ static const char *const jit_lever_names[JL_COUNT] = {
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
     "peep", "bakecallee", "capbase", "lsra", "frameless", "capprot",
-    "vfquiet", "gproof", "ghoist", "regcall", "pincs"
+    "vfquiet", "gproof", "ghoist", "regcall", "pincs", "retwb"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -3165,6 +3167,53 @@ struct Emitter {
             }
             pop_reg(0 /* rax */);
         }
+    }
+    /*
+     * REGCALL step 2: the flush a function body's RETURN needs. The
+     * window dies with the frame, so a register-resident value is
+     * written back only where something still reads it: a ref-listed
+     * slot (the release scan) and the result slot (the arms copy it
+     * out). Every other entry is skipped and its slot recorded in
+     * `ret_unflushed` (Chunk::ret_unflushed has the contract - the
+     * hardened audit skips exactly those). A slot past 63 has no bit
+     * and is written as before.
+     */
+    uint64_t ret_unflushed = 0;
+    void flush_cache_ret(const std::vector<int32_t> &ref_slots, int res_slot)
+    {
+        const auto dead = [&](int slot) {
+            return slot >= 0 && slot < 64 && slot != res_slot
+                   && !std::binary_search(ref_slots.begin(),
+                                          ref_slots.end(),
+                                          static_cast<int32_t>(slot));
+        };
+        std::vector<CacheEnt> c0 = cache, f0 = fcache;
+        std::vector<TypedEnt> t0 = tflush;
+        std::vector<SpillEnt> s0 = scache;
+        uint64_t m = 0;
+        const auto keep = [&](auto &v) {
+            size_t w = 0;
+            for (size_t i = 0; i < v.size(); i++)
+                if (dead(v[i].slot))
+                    m |= uint64_t(1) << v[i].slot;
+                else
+                    v[w++] = v[i];
+            v.resize(w);
+        };
+        keep(cache);
+        keep(fcache);
+        keep(tflush);
+        keep(scache);
+        flush_cache();
+        cache.swap(c0);
+        fcache.swap(f0);
+        tflush.swap(t0);
+        scache.swap(s0);
+        ret_unflushed |= m;
+#ifdef TESTS
+        if (m)
+            g_jit_ret_unflushed++;              /* emit-time reach */
+#endif
     }
     /* The inverse: re-load every pinned slot's payload from memory. Used with
      * flush_cache to BRACKET an op that reads or writes frame slots the emitter
@@ -12615,7 +12664,10 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                                fwd_reg == RAX ? RCX : RAX);
         fwd = false;
     }
-    e.flush_cache();
+    if (g_cur_caller_desc && !jit_lever_off(JL_RETWB))
+        e.flush_cache_ret(ck.ref_slots, res_slot);   /* REGCALL 2 */
+    else
+        e.flush_cache();
     /* the value stays in RAX (the lever's bus - a producer that left
      * it elsewhere is moved there), and every RAX scratch use before
      * the arms split takes r11 instead when a result is forwarded */
@@ -14770,6 +14822,7 @@ void jit_stats_report()
         { "entry_pad_off",    &g_jit_entry_pad_off },
         { "pins_cs",          &g_jit_pins_cs },
         { "pins_cs_lost",     &g_jit_pins_cs_lost },
+        { "ret_unflushed",    &g_jit_ret_unflushed },
         { "call_align",       &g_jit_call_align },
         { "call_dead_model",  &g_jit_call_dead_model },
         { "hoist_rmw",        &g_jit_hoist_rmw },
@@ -29007,6 +29060,20 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * re-emission. Goes 0 -> 1 once per run, bounding its retry.
      */
     std::vector<char> pins_cs_lost(runs.size(), 0);
+    /*
+     * REGCALL step 2: a linear-scan EVICT whose slot nothing reads
+     * again is a dead write-back - the window dies with the frame. Its
+     * proof is the all-slot liveness (jit_slot_liveness), and it is
+     * taken only where that proof needs nothing else: a function body
+     * (the frame's slots are read by nobody after its return), with no
+     * try region (an exception edge into a handler of THIS frame is
+     * the one reader a straight-line argument would have to model).
+     * Computed once: the code does not change across re-emissions.
+     */
+    SlotLiveness ret_lsl;
+    const bool ret_lsl_ok = g_cur_caller_desc
+        && chunk.handler_sites.empty() && !jit_lever_off(JL_RETWB)
+        && jit_slot_liveness(chunk, ret_lsl);
     g_jit_pins_denied = 0;
 retry_emission:
     /* Phase A: the one-shot re-emission after a rax-pin conflict. The
@@ -31143,6 +31210,16 @@ retry_emission:
                 e.bump_counter(&g_jit_range_share);
 #endif
             }
+            /* REGCALL step 2: an evict of a slot no later op reads
+             * (ret_lsl_ok has the conditions) writes nothing */
+            const auto evict_dead = [&](int slot) {
+                return ret_lsl_ok && begin == 0 && end == n
+                       && slot >= 0 && slot < 64
+                       && !std::binary_search(chunk.ref_slots.begin(),
+                                              chunk.ref_slots.end(),
+                                              static_cast<int32_t>(slot))
+                       && !ret_lsl.live_in(pc, slot);
+            };
             /* 2b-iii-b: the lsra TRANSITIONS - the same pattern with
              * the arms split: an interior-end FLUSH evicts and frees
              * the register (the entry leaves e.cache, so every later
@@ -31162,8 +31239,15 @@ retry_emission:
                         if (c.reg != static_cast<uint8_t>(tr.reg))
                             continue;
                         ML_CHECK(c.slot == tr.evict_slot);
-                        e.store_type_tag(c.type, jit_layout().t_int);
-                        e.store(c.reg, c.payload);
+                        if (evict_dead(c.slot)) {         /* REGCALL 2 */
+                            e.ret_unflushed |= uint64_t(1) << c.slot;
+#ifdef TESTS
+                            g_jit_ret_unflushed++;   /* emit-time reach */
+#endif
+                        } else {
+                            e.store_type_tag(c.type, jit_layout().t_int);
+                            e.store(c.reg, c.payload);
+                        }
                         e.cache.erase(e.cache.begin()
                                       + static_cast<long>(ci));
                         e.ra.give(static_cast<uint8_t>(tr.reg));
@@ -31223,8 +31307,16 @@ retry_emission:
                         if (c.reg != static_cast<uint8_t>(tr.reg))
                             continue;
                         ML_CHECK(c.slot == tr.evict_slot);
-                        e.store_type_tag(c.type, jit_layout().t_float);
-                        e.fstore(c.reg, c.payload);
+                        if (evict_dead(c.slot)) {         /* REGCALL 2 */
+                            e.ret_unflushed |= uint64_t(1) << c.slot;
+#ifdef TESTS
+                            g_jit_ret_unflushed++;   /* emit-time reach */
+#endif
+                        } else {
+                            e.store_type_tag(c.type,
+                                             jit_layout().t_float);
+                            e.fstore(c.reg, c.payload);
+                        }
                         e.fcache.erase(e.fcache.begin()
                                        + static_cast<long>(ci));
                         e.ra.fgive(static_cast<uint8_t>(tr.reg));
@@ -32277,6 +32369,7 @@ retry_emission:
      * restoring - E2e's model exactly, only without the saved store */
     chunk.frameless_vframe_quiet =
         vframe_quiet_bet && fe_off >= 0 && e.vframe_pub_hot == 0;
+    chunk.ret_unflushed = e.ret_unflushed;       /* REGCALL 2 */
     if (jit_map_wanted())
         jit_write_map(chunk, map_name);
 }

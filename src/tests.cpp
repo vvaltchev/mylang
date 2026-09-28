@@ -35808,6 +35808,87 @@ static bool jit_regcall_pins_caller_saved()
 }
 
 /*
+ * ==========  REGCALL STEP 2: NO WRITE-BACK INTO A DYING WINDOW  ==========
+ *
+ * A function body's window dies with its frame, so a register-resident
+ * value nothing reads again - at the return, or at a linear-scan evict
+ * past its last use - is not written back (Chunk::ret_unflushed). One
+ * program, both directions: ON, g's parameter slots are never stored
+ * from their pins and g_jit_ret_unflushed bumps; OFF (`retwb`), the
+ * same dump stores them - so the ON half is not satisfied by a shape
+ * that never had a write-back to drop.
+ */
+static bool jit_regcall_ret_unflushed()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const bool splice_was = g_bc_inline_enabled;
+    g_bc_inline_enabled = false;
+    const unsigned off_was = g_jit_off_extra;
+    struct Restore {
+        bool sp; unsigned off;
+        ~Restore() { g_bc_inline_enabled = sp; g_jit_off_extra = off; }
+    } restore{ splice_was, off_was };
+    const std::vector<const char *> lines = {
+        "func g(int a, int b) {",
+        "  var t = a * a + b * b;",
+        "  if (t > 1000) { t = t - a * b; } else { t = t + a * b; }",
+        "  if (t > 99999) { t = t & 4095; }",
+        "  return t - a + b; }",
+        "var s = 0;",
+        "for (var i = 0; i < runtime(5); i++) {",
+        "  s = (s + g(i, s & 7)) & 1023; }",
+        "print(s);"
+    };
+    /* stores of g's two parameter slots (r0, r1): payload or type word */
+    const auto param_stores = [&](const std::string &d) {
+        size_t k = 0;
+        for (const NativeIns &ni : native_ins_of(d, "func g"))
+            if (ni.text.compare(0, 7, "mov r0,") == 0
+                    || ni.text.compare(0, 7, "mov r1,") == 0
+                    || ni.text.compare(0, 11, "mov r0.type") == 0
+                    || ni.text.compare(0, 11, "mov r1.type") == 0)
+                k++;
+        return k;
+    };
+    bool ok = true;
+    const unsigned long u0 = g_jit_ret_unflushed;
+    std::string on, off;
+    try {
+        on = native_dump_of(lines);
+        g_jit_off_extra = off_was | jit_lever_bit("retwb");
+        off = native_dump_of(lines);
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_regcall_ret_unflushed: threw %s: %s\n",
+                e.name, e.msg);
+        return false;
+    }
+    if (g_jit_ret_unflushed == u0) {
+        fprintf(stderr, "jit_regcall_ret_unflushed: no write-back was "
+                        "elided (g_jit_ret_unflushed did not move)\n");
+        ok = false;
+    }
+    const size_t n_on = param_stores(on), n_off = param_stores(off);
+    if (n_off == 0) {
+        fprintf(stderr, "jit_regcall_ret_unflushed: VACUOUS - with "
+                        "`retwb` off g stores no parameter slot\n");
+        ok = false;
+    }
+    if (n_on != 0) {
+        fprintf(stderr, "jit_regcall_ret_unflushed: g still stores its "
+                        "parameter slots %zu time(s) (%zu with the lever "
+                        "off) - the window dies with the frame\n",
+                n_on, n_off);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * ==========  THE ENTRY FILLER IS FOR THE CALLS  ==========
  *
  * SP3. `entry_pad` pads a fragment's prologue to CALL-READY when its
@@ -49497,6 +49578,10 @@ static const std::vector<extra_check> extra_checks =
       "no argument move at the frameless entry (and the lever-off twin "
       "does push)",
       jit_regcall_pins_caller_saved },
+    { "jit: REGCALL step 2 - a function body writes no register-resident "
+      "value back into its dying window, at the return or at a dead "
+      "evict (and the lever-off twin does)",
+      jit_regcall_ret_unflushed },
     { "jit: the shape tests' MACHINE-INSTRUCTION MODEL parses every "
       "form the emitter produces (it fails closed, so a form it does "
       "not know must fail HERE and not silently match nothing)",

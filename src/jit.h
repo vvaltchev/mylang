@@ -1591,6 +1591,7 @@ extern "C" unsigned long g_jit_lea_addsub;      /* #97 1b(ii) reach */
 extern "C" unsigned long g_jit_entry_pad_off;   /* SP3 reach */
 extern "C" unsigned long g_jit_pins_cs;        /* REGCALL 1 reach */
 extern "C" unsigned long g_jit_pins_cs_lost;   /* ...and lost bets */
+extern "C" unsigned long g_jit_ret_unflushed;  /* REGCALL 2 reach */
 extern "C" unsigned long g_jit_call_align;      /* SP3: self-aligned */
 extern "C" unsigned long g_jit_call_dead_model; /* SP3: unreachable */
 extern "C" unsigned long g_jit_spcheck_sites;
