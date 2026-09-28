@@ -13001,14 +13001,41 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             };
 
             EvalValue res;
+            /* a FuncObject with a chunk is entered IN THIS ACTIVATION,
+             * like CallValueV - vm_call_func runs a NESTED vm_run_chunk,
+             * so a `dyn` recursion (every call under -nti) grew the C
+             * stack per level and crashed where every other call tier
+             * reaches the catchable StackOverflowEx at the slot cap
+             * (found 2026-09-30: a 300-deep linear recursion under -nti,
+             * ASan). The switch to the callee happens after this scope
+             * (the dispatch cannot jump out of it: `holder`/`res`). */
+            const Chunk *entered = nullptr;
             try {
                 if (callee.is<intrusive_ptr<FuncObject>>()) {
                     if (nargs)
                         ctx.frame->at(argbase).put(RValue(a0_value()));
-                    res = vm_call_func(
-                        &ctx,
-                        *callee.get_ref<intrusive_ptr<FuncObject>>().get(),
-                        &ctx.frame->at(argbase), nargs, chunk, pc);
+                    FuncObject &fo =
+                        *callee.get_ref<intrusive_ptr<FuncObject>>().get();
+                    if (!fo.func->vm_chunk_tried) {   /* AOT net */
+                        fo.func->vm_chunk = vm_func_chunk(fo.func);
+                        fo.func->vm_chunk_tried = true;
+                    }
+                    const Chunk *cck =
+                        static_cast<const Chunk *>(fo.func->vm_chunk);
+                    if (cck) {
+#ifdef TESTS
+                        norec_classify(fo, cck);
+#endif
+                        /* its bind error takes THIS op's carets (the
+                         * CallSite's argument spans, stamped below), not
+                         * the pc-keyed tables vm_enter_call stamps from */
+                        vm_frame_setup(act, ctx, chunk, pc, fo, cck,
+                                       argbase, nargs, in->target, nullptr);
+                        entered = cck;
+                    } else {
+                        res = vm_call_func(&ctx, fo, &ctx.frame->at(argbase),
+                                           nargs, chunk, pc);
+                    }
                 } else {
                     /* Builtin / struct: the raw values (arg0 from the
                      * descriptor - may be UndefinedId, RValued by need). */
@@ -13064,16 +13091,22 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                                                     * list */
                 throw;
             }
-            if (g_vm_exc_pending) {                /* FuncObject cross-frame */
-                vm_flush_inline_call(*chunk, pc, *g_vm_exc_pending);
-                if (vm_dispatch_exc(act, cur_rec(), ctx, pc,
-                                    g_vm_exc_pending)) {
-                    VM_NEXT_COLD;
+            if (entered) {                         /* the in-VM call */
+                chunk = entered;
+                pc = 0;
+                code = chunk->code.data();
+            } else {
+                if (g_vm_exc_pending) {            /* FuncObject cross-frame */
+                    vm_flush_inline_call(*chunk, pc, *g_vm_exc_pending);
+                    if (vm_dispatch_exc(act, cur_rec(), ctx, pc,
+                                        g_vm_exc_pending)) {
+                        VM_NEXT_COLD;
+                    }
+                    return;
                 }
-                return;
+                ctx.frame->at(in->target).put(std::move(res));
+                pc++;
             }
-            ctx.frame->at(in->target).put(std::move(res));
-            pc++;
         }
         VM_NEXT;
 

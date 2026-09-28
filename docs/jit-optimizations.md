@@ -16281,3 +16281,44 @@ reference parameters and a slice), the updated `jit_frameless_w2_shape`
 `mov rdx, rax; mov* *cx, <int-tag>`, and no dst-word read), and
 `jit_bake_coercing`'s bool->int counter, now bumped by the register
 path's bool arm.
+
+## TWO FINDINGS OF THE REGCALL WORK, FIXED (2026-09-30)
+
+**A `dyn` CALL RAN A NESTED C++ ACTIVATION PER CALL.** The generic
+indirect call (`CallValueGenericV` - every user call under `-nti`, and
+any call through a `dyn` callee) handed a FuncObject to `vm_call_func`,
+i.e. a nested `vm_run_chunk`, where the typed value call (`CallValueV`)
+enters the callee inside the running activation. So a `dyn` recursion
+grew the C stack per level and was ended by the C stack, not by the
+slot cap: an ASan stack-overflow at ~300 levels in the debug build, a
+SIGSEGV past the budget in a release one - never the catchable
+`StackOverflowEx` every call tier owes (CLAUDE.md, *EVERY CALL TIER MUST
+END A RUNAWAY RECURSION IN StackOverflowEx*). The op now calls
+`vm_frame_setup` itself for a FuncObject with a chunk (not
+`vm_enter_call`: a bind error takes the op's own CallSite carets,
+`vm_stamp_args_caret`, as before) and switches to the callee after its
+scope closes - the computed-goto dispatch cannot leave a scope that
+holds `holder`/`res`. The JIT's helper for the op already used the
+sync protocol. Net: `tests/driver_checks.sh`'s overflow case now runs
+`-nti` and `-nti -nj` at all four caps (watched failing with the old
+path, every cap, ASan stack-overflow).
+
+**A SANITIZED BUILD NEVER RAN THE FRAMELESS SELF SITE FOR A LINEAR
+RECURSION.** A direct self `CallV` is run-eligible only when the depth
+cap exceeds 1000 (M5a: past a small cap every level paid an enter ->
+bail -> re-dispatch round trip), and with the native stack off - every
+ASan build, `MYLANG_NATIVE_STACK=0`, a failed mmap - the cap is 32/200,
+so the op stayed interpreted, split the body into two runs, and the E2
+pre-pass (which needs one run over the whole body) never saw it. A
+release build took the frameless self site for `sumto` in
+tests/functional/55 on every call; the debug lanes never did. The gate
+now also admits a self CallV whose body the E2 pre-pass can enter
+framelessly (`frameless_ok && frameless_calls`): there the site is a
+frameless one and its decline past the cap is a boundary call. Release
+with the stack armed is unchanged. One `jit_frameless_calling` case
+had been REFUSED only by that split - `v` calls `deep`, a linear
+recursion - and G1 rightly admits it now; the case keeps its intent
+(a callee that can NOT be entered framelessly) by recursing through a
+function value. Pinned by a new `jit_frameless_calling` case (a linear
+self recursion called from a function), watched VACUOUS with the gate
+reverted.
