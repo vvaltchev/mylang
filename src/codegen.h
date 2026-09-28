@@ -543,6 +543,7 @@ bool bc_inline_chunk(Chunk &ck,
  * A/B, since the un-inlined bytecode is the only oracle for a splice. */
 extern bool g_bc_inline_enabled;
 extern bool g_bc_inline_value_enabled;   /* #97 closure inlining */
+extern unsigned long g_bc_chain_partial;  /* #72 */
 
 /* Execution proof for the caller-frame path - see codegen.cpp. */
 extern unsigned long g_bc_inline_caller_frames;

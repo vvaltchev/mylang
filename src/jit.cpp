@@ -9269,7 +9269,9 @@ static int jit_frameless_candidates(const Chunk &ck, size_t old_pc,
     int n = 0;
     if (is_value && !jit_lever_off(JL_BAKECALLEE)) {
         int32_t di[2];
-        const int k = ck.value_callees_at(old_pc, di);
+        int k = ck.value_callees_at(old_pc, di);
+        if (k > 2)
+            k = 0;          /* #72: a guard-chain site is the splice's */
         for (int i = 0; i < k; i++) {
             const FuncDescriptor *d =
                 (di[i] >= 0
@@ -11407,7 +11409,7 @@ static bool jit_site_may_coerce(const Chunk &ck, size_t old_pc,
         return !d->fast_bind;
     if (is_value) {                      /* a two-way site (E3) */
         int32_t di[2];
-        const int k = ck.value_callees_at(old_pc, di);
+        const int k = ck.value_callees_at(old_pc, di);   /* the true count */
         if (k == 2) {
             bool coerce = false;
             for (int i = 0; i < 2; i++) {

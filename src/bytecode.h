@@ -1619,6 +1619,9 @@ struct CgInstr : Instr {
      * pc. */
     int32_t callee_def_idx = -1;
     int32_t callee_def_idx2 = -1;
+    /* #97 (#72): the third and later candidates, -1 past the last */
+    int32_t callee_def_more[ML_VALUE_CANDS_HARD - 2] = {
+        -1, -1, -1, -1, -1, -1 };
     /* #97 closure inlining step 1b: each argument's PROVEN kind at a
      * named CallValueV site, two bits per argument (1 = exactly an int -
      * not a bool, 2 = a float, 0 = not proven), arguments 0..15. Read by
@@ -2339,6 +2342,9 @@ struct Chunk {
      * returns both; `value_callee_at` - the single-candidate query the
      * generic push's bake asks - answers -1 for such a pc, so a two-way
      * site is UNNAMED to every consumer but the frameless dispatch.
+     * #72 (2026-09-29): a GUARD-CHAIN site records every candidate, up
+     * to ML_VALUE_CANDS_HARD (8) entries at one pc; only the bytecode
+     * splice consumes more than two (the frameless dispatch declines).
      */
     struct CalleeName {
         uint32_t pc;
@@ -2367,8 +2373,9 @@ struct Chunk {
         return 0;
     }
 
-    /* the entries at `pc`: 0, 1 or 2 closure_defs indices in `out` */
-    int value_callees_at(size_t pc, int32_t out[2]) const
+    /* the entries at `pc`: how many there are (every candidate of a
+     * guard-chain site - #72), the first `cap` of them in `out` */
+    int value_callees_at(size_t pc, int32_t *out, int cap = 2) const
     {
         size_t lo = 0, hi = value_callees.size();
         while (lo < hi) {
@@ -2379,9 +2386,10 @@ struct Chunk {
                 hi = mid;
         }
         int n = 0;
-        for (; lo < value_callees.size() && value_callees[lo].pc == pc
-               && n < 2; lo++)
-            out[n++] = value_callees[lo].def;
+        for (; lo < value_callees.size() && value_callees[lo].pc == pc;
+               lo++, n++)
+            if (n < cap)
+                out[n] = value_callees[lo].def;
         return n;
     }
 

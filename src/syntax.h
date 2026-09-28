@@ -936,6 +936,11 @@ public:
      * lifetime and copy rules as `callee_desc`.
      */
     const FuncDescriptor *callee_desc2 = nullptr;
+    /* #97 (#72): the THIRD and later candidates of a value site the
+     * callee-set analysis names at most g_value_cands_max functions for
+     * (callee_desc, callee_desc2, then these) - for the splice's guard
+     * chain alone; the JIT's frameless dispatch serves exactly two */
+    std::vector<const FuncDescriptor *> callee_desc_more;
 
     /* Set by the inferencer when the callee's static type is `dyn` (callable at
      * runtime, resolved dynamically). The VM lowers it to CallValueGenericV — a

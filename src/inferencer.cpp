@@ -10,6 +10,7 @@
 #include "trace.h"
 #include "resolver.h"     /* for_each_child_slot (fold_show_calls) */
 #include "coderender.h"   /* render_func_code / render_construct_code */
+#include "env.h"          /* env_get (#72: MYLANG_BCINLINE_CANDS) */
 
 #include <unordered_map>
 #include <unordered_set>
@@ -22,6 +23,18 @@
 #include <algorithm>
 #include <ostream>
 #include <cstdio>
+
+/* #97 (#72): the most candidates a value call site is stamped with -
+ * the splice's guard-chain cap, measured (see docs/jit-optimizations.md,
+ * *#97 #72*). MYLANG_BCINLINE_CANDS overrides it (2 = the two-way sites
+ * only, as before #72), clamped to ML_VALUE_CANDS_HARD. */
+int g_value_cands_max = [] {
+    const auto e = env_get("MYLANG_BCINLINE_CANDS");
+    int v = 8;      /* measured: every k <= 8 wins when fully spliced */
+    if (e && !e->empty())
+        v = std::atoi(e->c_str());
+    return v < 2 ? 2 : v > ML_VALUE_CANDS_HARD ? ML_VALUE_CANDS_HARD : v;
+}();
 
 /*
  * Whole-program static type inference + checking. See plans/archived/type-inference.md
@@ -1302,6 +1315,7 @@ void Inferencer::stamp_callee_fn(Block *rootBlock)
         call->callee_fn = nullptr;
         call->callee_desc = nullptr;
         call->callee_desc2 = nullptr;
+        call->callee_desc_more.clear();
         if (cs_struct_callee(call->what.get()))
             continue;                     /* a construction, not a call */
         const CsSet cs = callee_set(call->what.get());
@@ -1315,13 +1329,23 @@ void Inferencer::stamp_callee_fn(Block *rootBlock)
          * two-entry pool pc as unnamed. Both must be nameable, unescaped
          * functions with a body; a set of three or more stays unnamed.
          */
-        if (cs.funcs.size() == 2) {
-            FuncInfo *a = cs.funcs[0], *b = cs.funcs[1];
-            if (!a || !a->decl || !b || !b->decl || a == b
-                    || callee_escaped(a) || callee_escaped(b))
+        /* #72: and a site of up to g_value_cands_max candidates, for the
+         * splice's guard chain - on exactly the same terms */
+        if (cs.funcs.size() >= 2
+                && cs.funcs.size() <= static_cast<size_t>(g_value_cands_max)) {
+            bool ok = true;
+            for (size_t k = 0; k < cs.funcs.size() && ok; k++) {
+                FuncInfo *f = cs.funcs[k];
+                ok = f && f->decl && !callee_escaped(f);
+                for (size_t j = 0; j < k && ok; j++)
+                    ok = cs.funcs[j] != f;
+            }
+            if (!ok)
                 continue;
-            call->callee_desc = a->decl->desc;
-            call->callee_desc2 = b->decl->desc;
+            call->callee_desc = cs.funcs[0]->decl->desc;
+            call->callee_desc2 = cs.funcs[1]->decl->desc;
+            for (size_t k = 2; k < cs.funcs.size(); k++)
+                call->callee_desc_more.push_back(cs.funcs[k]->decl->desc);
             continue;
         }
         if (cs.funcs.size() != 1)

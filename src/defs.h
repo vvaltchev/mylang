@@ -208,6 +208,11 @@ extern bool g_untrusted_bytecode;
  * that `ML_VM_CHECK(ml_untrusted_bytecode() || <invariant>)`.
  * Constant-folds to `false` when the tier is compiled out.
  */
+/* #97 (#72): the most candidates a value call site may be spliced as a
+ * guard chain of - the HARD limit the per-instruction storage is sized by;
+ * the inferencer's tuned cap (g_value_cands_max) sits at or below it */
+#define ML_VALUE_CANDS_HARD 8
+
 inline bool ml_untrusted_bytecode()
 {
 #if ML_UNTRUSTED_CHECKS

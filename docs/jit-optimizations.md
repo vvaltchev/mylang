@@ -16074,3 +16074,91 @@ declines each proven TAKEN through the ledger) and
 the element retain dropped (ASan), the length check dropped, the row-slice
 guard dropped (the short view), and the last-reference test disabled (a
 leak - LSan).
+
+## #97 #72 - A VALUE CALL WITH 3..8 CANDIDATES IS SPLICED AS A GUARD
+## CHAIN (2026-09-29)
+
+Increment 2 spliced a value site whose callee set has TWO members; a
+site reaching three or more took the generic value call. #72 extends the
+chain to any `k` up to a cap: the inferencer stamps every candidate
+(`CallExpr::callee_desc_more` beyond the first two), codegen records them
+all in `value_callees` (still `pc, def` per entry - the format is
+unchanged), and the splice emits one `GuardCalleeV` + body per
+candidate, the last guard's miss arm being the original `call.val`.
+`value_callees_at` now returns the TRUE count; the JIT's two-way
+frameless site (E3) keeps serving exactly two and treats a larger count
+as unnamed.
+
+**THE CAP WAS MEASURED, NOT CHOSEN.** The requirement: the chain's
+guards and its code size must stay cheaper than the call they replace.
+A generated probe per `(k, body size, which candidate)` - `ops[j]` with
+`j` fixed, so the dispatch is steady - timed the spliced chain against
+the same binary with the chain turned off (`MYLANG_BCINLINE_CANDS=2`),
+pinned cycles per call (`taskset -c 2 perf stat -e cpu_core/cycles/u`,
+scale5 - scale1, best of 3). `uni` = candidate 0 (first guard hits),
+`last` = candidate k-1 (every guard runs):
+
+    k   small uni  small last   large uni  large last   (chain/call)
+    2     0.59       0.66         0.75       0.73
+    3     0.39       0.36         0.47       0.43
+    4     0.37       0.38         0.42       0.46
+    5     0.38       0.41         0.48       0.49
+    6     0.41       0.43         0.48       0.52
+    7     0.40       0.45         0.47       0.55
+    8     0.39       0.47         0.47       0.58
+
+(k = 2 is the increment-2 site vs E3's frameless two-way call, which is
+already cheaper than the generic one - hence the higher ratio.) Each
+extra guard the last candidate pays costs ~1.3 cycles against a call of
+~50; extrapolated, the chain stops paying near 25 guards. Code size did
+not show up at k = 8 with ~20-op bodies. The cap is therefore the HARD
+limit the per-instruction storage is sized by, `ML_VALUE_CANDS_HARD` =
+8; `MYLANG_BCINLINE_CANDS=N` (2..8) lowers it for an A/B.
+
+**ALL OR NOTHING, from the one measured loss.** Eight candidates of
+~22-op bodies overflow the splice's frame budget (`BC_INLINE_MAX_FRAME`)
+after five arms. The partial chain made the three candidates left out
+reach their call only after failing five guards: 61.5 vs 54.9 cycles per
+call (1.12x SLOWER) for the last one. A site of three or more now
+splices every candidate or none (`g_bc_chain_partial` counts the
+declines; that probe measures 1.00 since). Sites of one or two keep
+their partial splice, as before.
+
+**Where a call's ~50 cycles go** (the question that set the cap: "isn't
+a frameless call two moves and a CALL?"). Not yet - measured on the
+generic value call bench 100 took, ~74 Ir per call beyond the body:
+the caller's side ~45 (the identity check on the callee value; the
+48-byte-per-slot window - four LValue slots here, 192 bytes - its
+boxed argument copies, each reference argument's type/slice test and
+borrowed flag; the residue pushes; the status test; republishing the
+vframe), the callee's entry ~9 (publishing its vframe) and the return
+arm ~20 (telling a frameless frame from a pushed one, releasing
+reference parameters). A value is still a 32-byte TAGGED box and the
+exception/backtrace protocol still needs a published frame - which is
+why a splice, which has neither, wins by 2-3x.
+
+Measured (Ir, scale3 - scale1, `OPT=1 ASSERTS=0`, same binary,
+`MYLANG_BCINLINE_CANDS=2` as the baseline): **100_funcval_dispatch4
+(written for this, four ops, `ops[i % 4]`) 307 -> 124 Ir per iteration
+(-59.7%)**; `my/cpp` 9.36x -> 3.82x. 76, 99, 63, 11, 78, 12 unchanged.
+
+**TWO BUGS the new test found, both older than #72:**
+ - a spliced body returning its PARAMETER (`func id(x) => x`) with that
+   parameter read in place (step 1b) moved the result from the
+   never-bound parameter slot - `A.base + x` - instead of the argument's
+   source. A stale-temp read (a `read_int_slot` abort under `-nj`, a
+   wrong sum under the JIT). Reachable at a TWO-arm site already; pinned
+   by the "identity arm" section of `tests/functional/54_value_chain.my`
+   (watched: 2-arm and 3-arm both fail without the fix);
+ - closure SRA (`bc_scalar_replace_closures`) kept collecting defs into
+   a slot it had already declared dead (> 14 closures), and its masks
+   are built over every candidate's defs: a 29th def shifted a 32-bit
+   `4u` by 32 - UB (UBSan). A dead slot stops collecting.
+
+Pinned by `value_chain_shapes` (k = 3, 4, 8 splice k guards over k
+distinct targets; k = 9 and a cap of 2 splice none; an 8-way site of
+large bodies splices none and bumps `g_bc_chain_partial`),
+`tests/functional/54_value_chain.my` (value/discarded/eight-way/closure
+chains, a throw out of a middle arm caught by the caller, the identity
+arm) and `tests/bt_oracle/value_chain_throw.my` (the throw's backtrace
+matches `-ni -tw`).
