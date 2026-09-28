@@ -35889,6 +35889,82 @@ static bool jit_regcall_ret_unflushed()
 }
 
 /*
+ * ==========  REGCALL STEP 3: AN ARGUMENT COMPUTED FOR THE CALL  ==========
+ *
+ * `s = g(s & 1023, i)` in a loop computes its first argument into a
+ * staging temp, which main also reuses for a builtin's result - so the
+ * temp is ref-listed and its store paid a reference test, and the site
+ * then re-dispatched on its type. Two changes, both asserted here:
+ *
+ *  - C5 releases the temp in the loop PREHEADER although the loop holds
+ *    a call (its post-call resume cannot bypass the preheader in a run
+ *    whose originals are deleted) - g_jit_release_entry runs;
+ *  - the site binds the temp with NO type dispatch, its producer being
+ *    the int op just before the call (g_jit_regcall_proven), while a
+ *    `dyn` local argument keeps the dispatch - the decline direction.
+ */
+static bool jit_regcall_arg_proven()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const std::string body =
+        "func g(int a, int b) {\n"
+        "  var t = a * a + b * b;\n"
+        "  if (t > 1000) { t = t - a * b; } else { t = t + a * b; }\n"
+        "  if (t > 99999) { t = t & 4095; }\n"
+        "  return t - a + b; }\n";
+    const std::string prog_a = body +
+        "var n = int(runtime(50)); var s = 0;\n"
+        "for (var i = 0; i < n; i++) { s = g(s & 1023, i); }\n"
+        "print(s);\n";
+    const std::string prog_b = body +
+        "var n = int(runtime(50)); var s = 0; var dyn d = runtime(3);\n"
+        "for (var i = 0; i < n; i++) { s = (s + g(d, i)) & 1023; }\n"
+        "print(s);\n";
+    bool ok = true;
+    const auto run = [&](const std::string &src, unsigned long &proven,
+                         unsigned long &rel) {
+        const unsigned long p0 = g_jit_regcall_proven;
+        const unsigned long r0 = g_jit_release_entry;
+        const std::string out =
+            engine_run_bt(src, ExecEngine::Vm, true, /*splice=*/false);
+        const std::string want =
+            engine_run_bt(src, ExecEngine::TreeWalk, false, false);
+        if (out != want) {
+            fprintf(stderr, "jit_regcall_arg_proven: got \"%s\", the "
+                            "tree-walker \"%s\"\n", out.c_str(),
+                    want.c_str());
+            ok = false;
+        }
+        proven = g_jit_regcall_proven - p0;
+        rel = g_jit_release_entry - r0;
+    };
+    unsigned long pa = 0, ra = 0, pb = 0, rb = 0;
+    run(prog_a, pa, ra);
+    run(prog_b, pb, rb);
+    if (pa == 0) {
+        fprintf(stderr, "jit_regcall_arg_proven: `s & 1023` was not "
+                        "bound as a proven int\n");
+        ok = false;
+    }
+    if (ra == 0) {
+        fprintf(stderr, "jit_regcall_arg_proven: the loop with a call "
+                        "released no temp in its preheader (C5)\n");
+        ok = false;
+    }
+    if (pb != 0) {
+        fprintf(stderr, "jit_regcall_arg_proven: a `dyn` argument was "
+                        "bound with no type dispatch (%lu)\n", pb);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * ==========  THE ENTRY FILLER IS FOR THE CALLS  ==========
  *
  * SP3. `entry_pad` pads a fragment's prologue to CALL-READY when its
@@ -49582,6 +49658,10 @@ static const std::vector<extra_check> extra_checks =
       "value back into its dying window, at the return or at a dead "
       "evict (and the lever-off twin does)",
       jit_regcall_ret_unflushed },
+    { "jit: REGCALL step 3 - an argument an int op computed for the call "
+      "binds with no type dispatch and its temp is released in the loop "
+      "preheader despite the call; a dyn argument keeps the dispatch",
+      jit_regcall_arg_proven },
     { "jit: the shape tests' MACHINE-INSTRUCTION MODEL parses every "
       "form the emitter produces (it fails closed, so a form it does "
       "not know must fail HERE and not silently match nothing)",
