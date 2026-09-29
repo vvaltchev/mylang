@@ -12368,12 +12368,59 @@ static constexpr size_t RET_REF_GUARD_MAX = 6;
 
 /* reg:proto(fn) - the RETURN half of the call protocol (the record /
  * no-record walk): the same MyLang-call pool denial. */
-static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
+static constexpr uint8_t JIT_RET_NO_FWD = 0xFF;   /* no forwarded result */
+
+/* #71: a forwarded result's slot, written back from `src` (the payload)
+ * and the producer's TAG - exactly the two stores the producer skipped.
+ * `scratch` builds the tag off the low arena (it must differ from src). */
+static void emit_ret_fwd_writeback(Emitter &e, int res_slot, uint8_t src,
+                                   const void *tag, uint8_t scratch)
 {
+    const int32_t s = static_cast<int32_t>(
+        res_slot * static_cast<int32_t>(sizeof(LValue)));
+    e.store(src, s);
+    e.store_type_tag_via(s + static_cast<int32_t>(jit_layout().off_type),
+                         tag, scratch);
+}
+
+static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
+                            uint8_t fwd_reg, const void *fwd_tag)
+{
+    /*
+     * #71: THE RESULT IN A REGISTER. The producer (lever A) skipped the
+     * result slot's stores, so the value is in `fwd_reg` - and only the
+     * BOUNDARY arm (a callback's return to C++: sort's comparator,
+     * map's function) can use it from there; every other arm, and the
+     * C++ tiers, read the slot. So the value stays in its register
+     * (RAX, whose scratch uses up to the arms take r11 instead) and the
+     * slot is written back at the head of each arm but the boundary
+     * one, and on the boundary arm's own slow edge. Where that cannot be arranged (a
+     * pinned register to flush, the out-of-gate shape, a ref-listed
+     * result), the slot is written back HERE, which is exactly the
+     * store the producer would have made.
+     */
+    const bool gate = ck.plain_frame
+        && ck.ref_slots.size() <= RET_REF_GUARD_MAX;
+    bool fwd = fwd_reg != JIT_RET_NO_FWD && res_slot >= 0;
+    if (fwd && (!gate || e.cache_live()
+                || std::binary_search(ck.ref_slots.begin(),
+                                      ck.ref_slots.end(),
+                                      static_cast<int32_t>(res_slot)))) {
+        emit_ret_fwd_writeback(e, res_slot, fwd_reg, fwd_tag,
+                               fwd_reg == RAX ? RCX : RAX);
+        fwd = false;
+    }
     e.flush_cache();
+    /* the value stays in RAX (the lever's bus - a producer that left
+     * it elsewhere is moved there), and every RAX scratch use before
+     * the arms split takes r11 instead when a result is forwarded */
+    const uint8_t FWD = RAX;               /* reg:proto */
+    const uint8_t SCR = fwd ? 11 : RAX;    /* r11 / rax - see above */
+    if (fwd)
+        e.mov_rr(FWD, fwd_reg);            /* nothing when already RAX */
 
     std::vector<size_t> j_slow;
-    if (ck.plain_frame && ck.ref_slots.size() <= RET_REF_GUARD_MAX) {
+    if (gate) {
         const JitLayout &L = jit_layout();
         const JitPushLayout &P = jit_push_layout();
         const uint8_t R8R = 8, R9R = 9, R10 = 10, R11 = 11;
@@ -12435,11 +12482,19 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
          * not publish the vframe - a lazy frameless leaf publishes
          * nothing on its normal-return path, hardened builds included */
         if (!e.store_abs32(&g_jit_audit_window, RBX)) {
-            e.movabs(RAX, reinterpret_cast<uint64_t>(&g_jit_audit_window));
-            e.store_base0(RBX, RAX);
+            e.movabs(SCR, reinterpret_cast<uint64_t>(&g_jit_audit_window));
+            e.store_base0(RBX, SCR);
+        }
+        if (fwd) {                /* #71: rax is caller-saved */
+            e.push_reg(FWD);
+            e.push_reg(FWD);
         }
         e.call_direct_framefree(
             reinterpret_cast<const void *>(jit_ret_audit));
+        if (fwd) {
+            e.pop_reg(FWD);
+            e.pop_reg(FWD);
+        }
 #endif
         /*
          * #97 INCREMENT 2 (F6) / 3 (W1): THE FRAMELESS FRAME IS TOLD
@@ -12462,8 +12517,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             jit_norec_on() && ck.frameless_ok && ck.frameless_wanted
             && !jit_lever_off(JL_FRAMELESS);
         if (arm_frameless) {
-            e.lea_base(RAX, RBP, JIT_FRAMELESS_WIN_OFF);  /* reg:proto */
-            e.cmp_rr(RAX, RBX);                    /* cmp rax, rbx */
+            e.lea_base(SCR, RBP, JIT_FRAMELESS_WIN_OFF);  /* reg:proto */
+            e.cmp_rr(SCR, RBX);                    /* cmp scr, rbx */
             j_frameless = e.j32(0x74);             /* je frameless arm */
         }
         /* #97 R4: from here on a frameless frame is ONLY in the arm
@@ -12474,7 +12529,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
             ~OffPath() { e.pub_offpath--; }
         } off_path(e);
         /* r8 = act, r10 = top_rec (OUR record) */
-        e.load_global(R8R, L.addr_act, RAX);
+        e.load_global(R8R, L.addr_act, SCR);
         ld(R10, R8R, static_cast<int32_t>(L.act_top_rec));
         /* the record guards FIRST - guard order is decline-frequency, not
          * per-guard cost: the common decliners are a BOUNDARY record (a
@@ -12501,6 +12556,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         }
         cmp_b_imm8(R10, static_cast<int32_t>(P.rec_boundary), 0);
         const size_t j_bnd = e.j32(0x75);          /* jne boundary arm */
+        if (fwd)                                   /* #71: the record arm */
+            emit_ret_fwd_writeback(e, res_slot, FWD, fwd_tag, R11);
         /* chunk-local total, NOT g_cur_caller_desc: the value-template
          * instances compile with a null jc, which silently skipped the
          * arm on every one of 76_funcval_dispatch's returns (found by
@@ -12660,6 +12717,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
          * per ELEMENT, so serving it inline is what keeps them from
          * paying a dead guard walk + the helper round trip. */
         e.patch32_here(j_bnd);
+        std::vector<size_t> j_bslow;   /* #71: slow edges needing the
+                                        * slot written back first */
         if (res_slot >= 0) {
             const int32_t s = static_cast<int32_t>(
                 static_cast<long>(res_slot)
@@ -12678,14 +12737,25 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                            static_cast<int8_t>(L.t_str_val));
                 j_slow.push_back(e.j32(0x7D));     /* jge slow */
             }
-            e.load_global(R9R, L.addr_ctx, RAX);   /* reg:proto: r9 = ctx */
+            e.load_global(R9R, L.addr_ctx, SCR);   /* reg:proto: r9 = ctx */
             ld(RCX, R9R, L.ctx_flow);              /* reg:proto: rcx = flow */
             /* flow->value's OLD value must be trivial (else: release) */
-            ld(RAX, RCX, L.fs_value
+            ld(SCR, RCX, L.fs_value
                          + static_cast<int32_t>(EvalValue::jit_type_off()));
-            cmp_d_imm8(RAX, L.type_t_off, static_cast<int8_t>(L.t_str_val));
-            j_slow.push_back(e.j32(0x7D));         /* jge slow */
-            if (bnd_res_listed) {
+            cmp_d_imm8(SCR, L.type_t_off, static_cast<int8_t>(L.t_str_val));
+            if (fwd)          /* #71: the slot is written back first */
+                j_bslow.push_back(e.j32(0x7D));    /* jge the stub */
+            else
+                j_slow.push_back(e.j32(0x7D));     /* jge slow */
+            if (fwd) {
+                /* #71: the forwarded result, straight from the register
+                 * - no slot store before, no slot load here */
+                st(RCX, L.fs_value, FWD);
+                e.store_type_tag_base(
+                    RCX, L.fs_value
+                         + static_cast<int32_t>(EvalValue::jit_type_off()),
+                    fwd_tag, R11);
+            } else if (bnd_res_listed) {
                 for (int32_t o = 0; o <= 24; o += 8) {
                     ld(R11, RBX, s + o);
                     st(RCX, L.fs_value + o, R11);
@@ -12724,6 +12794,20 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
         e.vframe_publish();
         e.mov_reg_imm32(RAX, 0xFFFFFFFEu);   /* mov rax, -2 */
         e.frag_ret(Emitter::RetFlush::flushed);
+        if (!j_bslow.empty()) {
+            /* #71: the boundary arm's decline, with the slot jit_ret
+             * reads written back from r11 first.
+             * ⛔ UNFALSIFIABLE TODAY (watched: dropping the write-back
+             * leaves every net green, a string-then-bool callback
+             * included) - every C++ owner MOVES the result out of
+             * flow->value after the call, so its old value is never a
+             * reference here. It is the belt for the owner that does
+             * not. */
+            for (const size_t j : j_bslow)
+                e.patch32_here(j);
+            emit_ret_fwd_writeback(e, res_slot, FWD, fwd_tag, R11);
+            j_slow.push_back(e.jmp32());
+        }
 
         /* ---- 4-iii: THE RECORD-LESS ARM (the norec tier, DEFAULT ON).
          * Every datum the record-ful pop reads from the record comes
@@ -12776,6 +12860,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                  * branch checks what a record-less frame leaves checkable.
                  */
                 e.patch32_here(j_frameless);
+                if (fwd)                     /* #71: before the oracle */
+                    emit_ret_fwd_writeback(e, res_slot, FWD, fwd_tag, R11);
 #ifdef TESTS
                 ld(RDI, 5, 24);        /* rdi = [rbp+24] (reg:abi) */
                 e.mov_rr(RSI, RBP);  /* reg:abi */
@@ -12943,6 +13029,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot)
                 }
             }
             e.patch32_here(j_norec);
+            if (fwd)                         /* #71: before the oracle */
+                emit_ret_fwd_writeback(e, res_slot, FWD, fwd_tag, R11);
 #ifdef TESTS
             /* the pre-mutation oracle (jit_norec_retarm_verify) - under
              * the fork there is no record; the C++ discriminates and
@@ -13374,6 +13462,10 @@ struct JitFwd {
      */
     const void *res_tag = nullptr;
     const void *in_tag = nullptr;   /* consumer side: the tag behind in_reg */
+    /* #71: consumer side - the producer SKIPPED its slot stores (only
+     * then may a consumer write the slot back itself: a slot the
+     * producer wrote may live in a register) */
+    bool in_skipped = false;
     bool skip_write = false;
     bool armed = false; /* the producer's emit confirmed res_reg at exit */
     /*
@@ -13437,6 +13529,10 @@ bool jit_fwd_op_is_producer(OpCode op)
     case OpCode::IntShlRI: case OpCode::IntShrRI:
     case OpCode::LoadElemInt:
     case OpCode::LoadElem2Int:
+    /* #71: the int compare, whose bool lands in the bus register; the
+     * arming site admits it only in front of a ReturnV (a comparator's
+     * `return a < b` - the callback path's dead temp) */
+    case OpCode::CmpIntV:
     /*
      * #113: the PROVEN-SCALAR capture read. Its payload is the whole
      * value, it lands in the bus register, and its helper arm REJOINS -
@@ -13490,6 +13586,8 @@ static const void *jit_fwd_bus_tag(OpCode op)
          * because the day codegen emits a plain `capA = capB` in typed
          * form, this is the line that has to already be right. */
         return jit_layout().t_int;
+    case OpCode::CmpIntV:
+        return jit_layout().t_bool;   /* a REAL bool, by construction */
     default:
         return nullptr;
     }
@@ -13633,6 +13731,13 @@ unsigned jit_fwd_op_consumer_slots(OpCode op)
         /* the accumulate VALUE only; the accumulator, the counter and a
          * slot bound all read their SLOTS */
         return JIT_FWD_B;
+    /* #71: the RETURN - its value is the result slot at `a`.
+     * emit_ret_native writes the slot back on every arm that reads it
+     * from memory and hands the boundary arm (a callback's return to
+     * C++) the register itself; a producer with no known TAG keeps its
+     * write (the arming site), since a written-back slot needs one. */
+    case OpCode::ReturnV:
+        return JIT_FWD_A;
     /*
      * #113: the capture/global STORE reads its source at `a`. ⛔ IT
      * ALSO READS THAT SLOT'S TYPE WORD, which no other consumer does -
@@ -23550,7 +23655,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                         (cc_for(in.aop).near_op + 0x10) & 0x0F),
                     acc.r);
         e.movzx_r32_lo8(acc.r, acc.r);
-        store_dst_bool(e, ck, acc.r, in.target);
+        /* #71: lever A, the PRODUCER side (in front of a ReturnV only -
+         * the arming site): the bool stays in acc.r for the return */
+        const bool fw = g_fwd.prod == in.target;
+        if (!(fw && g_fwd.skip_write))
+            store_dst_bool(e, ck, acc.r, in.target);
+        if (fw) {
+            g_fwd.res_reg = acc.r;
+            g_fwd.armed = true;
+        }
         return true;
     }
 
@@ -25601,14 +25714,24 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         /* #55 + C4c: the return - the INLINE frame pop for the common shape
          * (emit_ret_native; guards decline to jit_ret). rsp is call-ready
          * here: frag_entry's discipline leaves the body at rsp % 16 == 0. */
-        emit_ret_native(e, ck, static_cast<int>(in.a_slot()));
+    {
+        /* #71: a forwarded result (lever A) - its register and TAG */
+        uint8_t fr = JIT_RET_NO_FWD;
+        const void *ftag = nullptr;
+        if (g_fwd.in_temp >= 0 && in.a_slot() == g_fwd.in_temp
+                && g_fwd.in_tag && g_fwd.in_skipped) {
+            fr = emit_fwd_bump(e, g_fwd.in_temp < ck.slot_count);
+            ftag = g_fwd.in_tag;
+        }
+        emit_ret_native(e, ck, static_cast<int>(in.a_slot()), fr, ftag);
         return true;
+    }
 
     case OpCode::Halt:
         /* model-flip (nativize-ops) + C4c: the native `return none` - the
          * same inline pop with the result hard-wired to none (res_slot -1;
          * the slow tier is jit_halt). */
-        emit_ret_native(e, ck, -1);
+        emit_ret_native(e, ck, -1, JIT_RET_NO_FWD, nullptr);
         return true;
 
     case OpCode::CachedCallV:
@@ -30061,6 +30184,7 @@ retry_emission:
             g_fwd.in_temp = g_fwd.armed ? g_fwd.prod : -1;
             g_fwd.in_reg = g_fwd.res_reg;
             g_fwd.in_tag = g_fwd.armed ? g_fwd.res_tag : nullptr;
+            g_fwd.in_skipped = g_fwd.armed && g_fwd.skip_write;
             g_fwd.prod = -1;
             /* THE BUS DEFAULT - the one conv-tagged line that
              * names the whole accumulator convention: a producer
@@ -30110,6 +30234,9 @@ retry_emission:
                      * the trap in doing this the lazy way.
                      */
                     && jit_fwd_consumer(chunk.code[pc + 1], fdst)
+                    /* #71: a compare forwards only into a return */
+                    && (in.op != OpCode::CmpIntV
+                        || chunk.code[pc + 1].op == OpCode::ReturnV)
                     /* #96 rax: lever A travels IN rax - the producer
                      * adapter is `mov rax, pin` and the consumer reads
                      * rax - so a run that pinned rax cannot forward.
@@ -30162,7 +30289,11 @@ retry_emission:
                      * again") is false for it. The pair still forwards;
                      * only the write survives.
                      */
-                    && !jit_fwd_consumer_reads_type(chunk.code[pc + 1].op);
+                    && !jit_fwd_consumer_reads_type(chunk.code[pc + 1].op)
+                    /* #71: a return writes the slot back (and the
+                     * boundary arm stores the TAG) - it needs one */
+                    && !(chunk.code[pc + 1].op == OpCode::ReturnV
+                         && !g_fwd.res_tag);
 #ifdef TESTS
                 if (g_fwd.skip_write && listed)
                     g_jit_fwd_skip_rel++;   /* the C5-discharged case only */

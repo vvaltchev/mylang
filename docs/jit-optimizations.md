@@ -14899,6 +14899,54 @@ that drops words 1-2 is sound only for a slot the ref_slots analysis
 proved is written by `op_writes_scalar` ops - never merely for a slot
 whose type is trivial at run time.
 
+## #97 CB9 (#71) - A RETURN TAKES ITS FORWARDED RESULT FROM A REGISTER (2026-09-29)
+
+A comparator `func(p, q) => p < q` computed its bool into a temp -
+two stores, the tag and the payload - and the return's boundary arm
+read both straight back to copy them into `flow->value`. The temp is
+dead after the return, so the stores were lever A's to remove, and
+two ends were missing: `CmpIntV` was not a lever-A producer, and
+`ReturnV` not a consumer.
+
+Both are now, `CmpIntV` only in front of a `ReturnV` (its tag is
+`t_bool` - `jit_fwd_bus_tag`). The whole difficulty is that ReturnV
+has several arms and only ONE of them can use a register: the
+boundary arm stores the value and the tag immediate into
+`flow->value` directly, and every other reader of the slot gets it
+written back first (`emit_ret_fwd_writeback`) - the record arm's
+fall-through, the record-less and frameless arms' heads (before
+their TESTS oracles, which clobber caller-saved registers), and the
+boundary arm's own decline edge. The value stays in RAX: every RAX
+scratch use on the way to the arms (the frameless discriminator's
+`lea`, the global loads, the hardened audit's window store, the
+boundary guard) takes r11 instead when a result is forwarded, and the
+hardened audit call saves RAX around itself. A first version moved
+the value to r11 and cost one `mov` on EVERY non-boundary return -
+10_recursion_deep read +1.0% Ir - which is why the scratch moved
+instead of the value.
+
+Three conditions keep it exact. The consumer takes the register only
+when the producer really SKIPPED its stores (`JitFwd::in_skipped`): a
+producer that wrote a LOCAL may have written its register home, and
+writing the slot back under it is what the register tracker aborted
+on in the first version. A producer with no known TAG keeps its
+write (the arming site), since a written-back slot needs one. And a
+live register cache, the out-of-gate shape or a ref-listed result
+write the slot back at the op's entry - exactly the producer's own
+store, relocated.
+
+Ir (scale3 - scale1, `OPT=1 ASSERTS=0`): 34_sort_custom_cmp -2.66%,
+35_map_filter -2.36%; 96, 09, 10, 92, 78, 63, 11 flat to the
+instruction. Wall flat (one pinned run each) - the guard-elision
+family's ceiling. Watched failing, each write-back removed alone on
+`tests/functional/52_return_forward.my`: the record arm (caught by
+the sanitized lane) and the frameless and record-less arms (caught
+only WITHOUT sanitizers - ASan turns the native stack off, and with
+it both tiers), plus the boundary arm storing the wrong register.
+The boundary DECLINE edge's write-back is unfalsifiable today: every
+C++ owner moves the result out of `flow->value` after a call, so its
+old value is never a reference there.
+
 ## #124(a) - THE LINEAR SCAN KEEPS TEMPS OUT OF ITS CONTEST (2026-09-26)
 
 At K=4 with five hot locals (program A of plans/frameless-callee.md §3b)

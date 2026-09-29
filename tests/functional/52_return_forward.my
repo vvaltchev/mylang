@@ -1,0 +1,61 @@
+# #71: a function whose last op computes its result (`return a < b`,
+# `return n + k`) hands the result to its return in a REGISTER; the slot
+# store is skipped and each return arm that reads the slot writes it
+# back. Every arm is reached here, with the result checked:
+#  - the BOUNDARY arm: sort's comparator, filter's predicate (a callback
+#    returning to C++);
+#  - the RECORD arm: a recursive call's first descent;
+#  - the RECORD-LESS arm: the same recursion warmed;
+#  - the FRAMELESS arm: a small leaf called in a loop.
+var n = int(runtime(40));
+var a = [];
+var x = 12345;
+for (var i = 0; i < n; i++) {
+    x = (x * 1103515245 + 12345) % 2147483647;
+    append(a, x % 1000);
+}
+sort(a, func(p, q) => p < q);
+var ok = true;
+for (var i = 1; i < n; i++) if (a[i - 1] > a[i]) ok = false;
+print("sorted", ok, a[0], a[n - 1]);
+var small = filter(func(v) => v < 300, a);
+print("filter", len(small));
+sort(a, func(p, q) { var t = p * 7; return t > q * 7; });
+print("desc  ", a[0] >= a[n - 1]);
+
+func depth(int k) { if (k < 1) return 0; var d = depth(k - 1); return d + 1; }
+var s = 0;
+for (var r = 0; r < 30; r++) s = s + depth(r);
+print("rec   ", s);
+
+func lt(int p, int q) { var t = p * 3; return t < q; }
+func add3(int p) { var t = p * 2; return t + 3; }
+var c = 0;
+var t = 0;
+for (var i = 0; i < 200; i++) {
+    if (lt(i, 300)) c++;
+    t = t + add3(i);
+}
+print("leaf  ", c, t);
+
+# no local in the body, so no register holds one at the return: the
+# forwarded result reaches the frameless and record-less arms themselves
+func mix(int p, int q) { return (p * 3 + q * 5 - p) % 7 < (q ^ p) % 5; }
+func mix2(int p, int q) { return (p * 3 + q * 5 - p) % 7 + (q ^ p) % 5; }
+var m = 0;
+var m2 = 0;
+for (var i = 0; i < 300; i++) {
+    if (mix(i, i + 3)) m++;
+    m2 = m2 + mix2(i, 2 * i);
+}
+print("mix   ", m, m2);
+func sumto(int k) { if (k < 1) return 0; return sumto(k - 1) + k; }
+var st = 0;
+for (var r = 0; r < 40; r++) st = st + sumto(r % 12);
+print("sumto ", st);
+
+# a callback with a string return beside a forwarded one: the string
+# declines to the C++ tier (a reference result), the bool returns inline
+var dyn mm = map(func(v) { if (v % 3 == 0) return "t"; return v * 2 < 9; },
+                 [1, 3, 5, 6, 9, 2]);
+print("mixed ", mm);

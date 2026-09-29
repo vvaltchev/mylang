@@ -34680,16 +34680,25 @@ static bool jit_frameless_w2_shape()
     {
         /* the return arm: the discriminator, then the frameless arm at
          * its `je` target - the dst word, the old dst's type test, the
-         * two-qword result copy, ctx.captures back from [rbp+16] */
-        const size_t at = native_find(cl, 0, "lea rax, [rbp+0x20]");
+         * two-qword result copy, ctx.captures back from [rbp+16].
+         * #71: `base + k` is FORWARDED to the return in rax, so the
+         * discriminator's scratch is r11 and the arm opens by writing
+         * the result slot back from rax */
+        const size_t at = native_find(cl, 0, "lea r11, [rbp+0x20]");
         ok = at != std::string::npos
              && native_expect(cl, at, {
-                    "lea rax, [rbp+0x20]",
-                    "cmp rax, rbx",
+                    "lea r11, [rbp+0x20]",
+                    "cmp r11, rbx",
                     "je +*" }, "W2 arm discriminator") && ok;
         if (ok) {
             const uint32_t tgt = static_cast<uint32_t>(
                 std::atoi(cl[at + 2].text.c_str() + 4));
+            const size_t wb = native_find(cl, tgt, "mov r*, rax");
+            ok = wb != std::string::npos && cl[wb].off == tgt
+                 && native_expect(cl, wb, {
+                        "mov r*, rax",
+                        "mov r*.type, <int-tag>@r11" },
+                        "W2 arm write-back (#71)") && ok;
             const size_t arm = native_find(cl, tgt, "mov rdx, [rbp+0x18]");
             ok = arm != std::string::npos
                  && native_expect(cl, arm, {
