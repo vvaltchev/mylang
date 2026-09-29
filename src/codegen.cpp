@@ -1772,6 +1772,9 @@ struct Codegen {
                 chunk.consts.resize(cmark);   /* emit_args_range won't undo */
                 return false;
             }
+            for (size_t i = 0; i < la->elems.size(); i++)
+                emit_literal_widen(la->elems[i].get(), la->elem_coerce,
+                                   base + static_cast<int>(i), la, ops);
             const int dst = alloc_temp();
             CgInstr in;
             in.op = OpCode::MakeArrayV;
@@ -1798,11 +1801,16 @@ struct Codegen {
             if (next_temp > max_temp)
                 max_temp = next_temp;
             bool ok = true;
-            for (int i = 0; i < npairs && ok; i++)
+            for (int i = 0; i < npairs && ok; i++) {
                 ok = compile_to_run_slot(ld->elems[i]->key.get(),
                                          base + 2 * i, ops)
                   && compile_to_run_slot(ld->elems[i]->value.get(),
                                          base + 2 * i + 1, ops);
+                if (ok)
+                    emit_literal_widen(ld->elems[i]->value.get(),
+                                       ld->val_coerce, base + 2 * i + 1,
+                                       ld, ops);
+            }
             if (!ok) {
                 ops.resize(mark);
                 next_temp = save_top;
@@ -2034,6 +2042,7 @@ struct Codegen {
             next_temp = scratch;
 
             ops[jmp_i].target = static_cast<int>(ops.size());   /* merge */
+            emit_select_widen(t, dst, ops);
             out_slot = dst;
             return true;
         }
@@ -2074,6 +2083,7 @@ struct Codegen {
             next_temp = scratch;
 
             ops[jn_i].target = static_cast<int>(ops.size());   /* merge */
+            emit_select_widen(co, dst, ops);
             out_slot = dst;
             return true;
         }
@@ -2579,6 +2589,51 @@ struct Codegen {
         ops[j_boxed].target = static_cast<int>(ops.size());
         loads(OpCode::LoadElemValue);
         ops[j_done].target = static_cast<int>(ops.size());
+    }
+
+    /* A container literal's element WIDENING (LiteralArray::elem_coerce,
+     * LiteralDict::val_coerce) - the tree-walker's literal_widen: a
+     * CoerceNumV IN PLACE on the element's run slot (a temp this literal
+     * owns), skipped where the element is already of the literal's kind.
+     * CoerceNumV widens int/bool -> float and bool -> int and passes
+     * `none`; it cannot meet a non-numeric value here, since the
+     * literal's element type is the join of its elements' types. */
+    void emit_literal_widen(const Construct *elem, DeclType dt, int slot,
+                            const Construct *lit, std::vector<CgInstr> &ops)
+    {
+        if (dt != DeclType::i && dt != DeclType::f)
+            return;
+        if (dt == DeclType::f && elem->th == TypeHint::f)
+            return;
+        if (dt == DeclType::i && elem->th == TypeHint::i && !elem->th_bool)
+            return;
+        CgInstr co;
+        co.op = OpCode::CoerceNumV;
+        co.node_idx = add_ast_node(lit);
+        co.target = slot;
+        co.target2 = dt == DeclType::f ? 1 : 0;
+        co.set_a(slot_op(slot));
+        ops.push_back(co);
+    }
+
+    /* A value-selecting expression (a ternary, `??`) whose arms join to a
+     * numeric type widens the arm it picked - the tree-walker's
+     * select_widen (task #75): a CoerceNumV IN PLACE on the merge temp,
+     * after the join. */
+    void emit_select_widen(const Construct *sel, int dst,
+                           std::vector<CgInstr> &ops)
+    {
+        const bool f = sel->th == TypeHint::f;
+        const bool i = sel->th == TypeHint::i && !sel->th_bool;
+        if (!f && !i)
+            return;
+        CgInstr co;
+        co.op = OpCode::CoerceNumV;
+        co.node_idx = add_ast_node(sel);
+        co.target = dst;
+        co.target2 = f ? 1 : 0;
+        co.set_a(slot_op(dst));
+        ops.push_back(co);
     }
 
     bool try_multi_unpack(const Expr14 *e, const IdList *il,
@@ -4843,12 +4898,25 @@ struct Codegen {
         }
         next_temp = scratch;
 
-        /* dst = <operand>: a lit -> LoadImm, a slot -> MoveV (E1 retargets). */
-        const auto store_arm = [&](const Operand &o) {
+        /* dst = <operand>: a lit -> LoadImm, a slot -> MoveV (E1 retargets).
+         * An arm NOT of the ternary's kind (an int arm of a float ternary,
+         * a bool arm of an int one) is WIDENED into dst - the operand
+         * compilers hand its raw slot back, and a MoveV would leave the
+         * int in a float-typed result (task #75). */
+        const auto store_arm = [&](const Operand &o, const Construct *arm) {
             CgInstr in;
+            const bool widen = flt ? arm->th != TypeHint::f
+                                   : (arm->th != TypeHint::i
+                                      || arm->th_bool);
             if (o.is_lit) {
                 in.op = flt ? OpCode::LoadImmFloat : OpCode::LoadImmInt;
                 in.target = dst;
+                in.set_a(o);
+            } else if (widen) {
+                in.op = OpCode::CoerceNumV;
+                in.node_idx = add_ast_node(t);
+                in.target = dst;
+                in.target2 = flt ? 1 : 0;
                 in.set_a(o);
             } else {
                 in.op = OpCode::MoveV;
@@ -4865,7 +4933,7 @@ struct Codegen {
             next_temp = save_top;
             return false;
         }
-        store_arm(a1);
+        store_arm(a1, t->thenExpr.get());
         const size_t jmp_i = ops.size();
         {
             CgInstr j;
@@ -4883,7 +4951,7 @@ struct Codegen {
             next_temp = save_top;
             return false;
         }
-        store_arm(a2);
+        store_arm(a2, t->elseExpr.get());
         next_temp = scratch;
         ops[jmp_i].target = static_cast<int>(ops.size());  /* merge */
         out = slot_op(dst);

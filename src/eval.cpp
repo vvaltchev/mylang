@@ -2045,6 +2045,28 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
     return SharedArrayObj(std::move(gvec));
 }
 
+/* A container literal's numeric WIDENING (LiteralArray::elem_coerce,
+ * LiteralDict::val_coerce): int/bool -> float, bool -> int; every other
+ * value (none included) as it is. The VM applies the same rule with
+ * CoerceNumV on the element's run slot. */
+static EvalValue literal_widen(EvalValue v, DeclType dt)
+{
+    if (dt == DeclType::f) {
+        if (v.is<int_type>())
+            return EvalValue(static_cast<float_type>(v.get<int_type>()));
+        if (v.is<bool>())
+            return EvalValue(static_cast<float_type>(v.get<bool>() ? 1 : 0));
+    } else if (dt == DeclType::i && v.is<bool>()) {
+        return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+    }
+    return v;
+}
+
+/* a fully CONSTANT literal's values, widened by their own join
+ * (const_values_widen, below arr_elem_boxed) */
+static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
+                               bool is_const);
+
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
     /* Evaluate the element nodes into a buffer (stack for the common small
@@ -2052,10 +2074,25 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
      * the same builder the VM's MakeArrayV op calls with register values. */
     const size_t n = elems.size();
 
+    /* widened by the inferencer's stamp, or - a fully CONSTANT literal
+     * built by the const evaluator, before any stamp exists - by the join
+     * of its own values (const_values_widen) */
+    const auto widen = [&](EvalValue *buf) {
+        if (elem_coerce != DeclType::none) {
+            for (size_t i = 0; i < n; i++)
+                buf[i] = literal_widen(std::move(buf[i]), elem_coerce);
+        } else if (is_const && ctx->in_const_eval()) {
+            /* only the PARSE-TIME build: at run time an unstamped literal
+             * means no inference ran (-nti), so no typed reader trusts
+             * a type, and the VM builds it unwidened too */
+            const_values_widen(buf, n, 1, ctx->const_ctx);
+        }
+    };
     if (n <= 16) {
         EvalValue buf[16];
         for (size_t i = 0; i < n; i++)
             buf[i] = RValue(elems[i]->eval(ctx));
+        widen(buf);
         return build_array_from_values(buf, n, arr_hint, arr_hint_struct,
                                        ctx->const_ctx);
     }
@@ -2063,6 +2100,7 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
     std::vector<EvalValue> buf(n);
     for (size_t i = 0; i < n; i++)
         buf[i] = RValue(elems[i]->eval(ctx));
+    widen(buf.data());
     return build_array_from_values(buf.data(), n, arr_hint, arr_hint_struct,
                                    ctx->const_ctx);
 }
@@ -2434,6 +2472,151 @@ arr_elem_boxed(const SharedArrayObj &a, size_type i)
             return EvalValue(SharedStr(a.flat_strs()[a.offset() + i]));
         default:
             return a.get_view()[i].get();
+    }
+}
+
+/* The numeric SHAPE a constant value's static type has - the part of
+ * static_type_from_value (inferencer.cpp) the widening needs: the numeric
+ * join bool <= int <= float, through arrays' elements and dicts' values,
+ * `none` joining as nothing (it only makes a type opt), anything else
+ * `other` (the join is dyn, and nothing widens). A constant literal is
+ * built at parse time, before inference exists, so this is how its
+ * values reach the type the inferencer will then give it (#75). */
+namespace {
+struct NumShape {
+    enum Kind { bot, b, i, f, arr, dict, other } k = bot;
+    std::unique_ptr<NumShape> sub;       /* arr: element, dict: value */
+};
+
+void shape_join(NumShape &a, const NumShape &x)
+{
+    using K = NumShape::Kind;
+    if (x.k == K::bot || a.k == K::other)
+        return;
+    if (a.k == K::bot) {
+        a.k = x.k;
+        if (x.sub) {
+            a.sub = std::make_unique<NumShape>();
+            shape_join(*a.sub, *x.sub);
+        }
+        return;
+    }
+    const bool an = a.k == K::b || a.k == K::i || a.k == K::f;
+    const bool xn = x.k == K::b || x.k == K::i || x.k == K::f;
+    if (an && xn) {
+        a.k = std::max(a.k, x.k);
+    } else if (a.k == x.k && (a.k == K::arr || a.k == K::dict)) {
+        if (x.sub)
+            shape_join(*a.sub, *x.sub);
+    } else {
+        a.k = K::other;
+        a.sub.reset();
+    }
+}
+
+NumShape shape_of(const EvalValue &v)
+{
+    NumShape s;
+    if (v.is<NoneVal>())
+        return s;
+    if (v.is<bool>()) { s.k = NumShape::b; return s; }
+    if (v.is<int_type>()) { s.k = NumShape::i; return s; }
+    if (v.is<float_type>()) { s.k = NumShape::f; return s; }
+    if (v.is<SharedArrayObj>()) {
+        const auto &a = v.get_ref<SharedArrayObj>();
+        s.k = NumShape::arr;
+        s.sub = std::make_unique<NumShape>();
+        for (size_type i = 0; i < a.size(); i++)
+            shape_join(*s.sub, shape_of(arr_elem_boxed(a, i)));
+        return s;
+    }
+    if (v.is<intrusive_ptr<DictObject>>()) {
+        s.k = NumShape::dict;
+        s.sub = std::make_unique<NumShape>();
+        for (const auto &kv : v.get_ref<intrusive_ptr<DictObject>>()
+                                   ->get_ref())
+            shape_join(*s.sub, shape_of(kv.second.get()));
+        return s;
+    }
+    s.k = NumShape::other;
+    return s;
+}
+
+/* `v` widened to shape `s`; `changed` says whether anything moved. A
+ * container is REBUILT, never edited: it may be a shared constant
+ * reached through a name (`const N = [[1, 2.5], A];` - A keeps its own
+ * type) */
+EvalValue shape_widen(const EvalValue &v, const NumShape &s, bool is_const,
+                      bool &changed)
+{
+    changed = false;
+    if (s.k == NumShape::f && (v.is<int_type>() || v.is<bool>())) {
+        changed = true;
+        return EvalValue(static_cast<float_type>(
+            v.is<bool>() ? (v.get<bool>() ? 1 : 0) : v.get<int_type>()));
+    }
+    if (s.k == NumShape::i && v.is<bool>()) {
+        changed = true;
+        return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+    }
+    if (s.k == NumShape::arr && v.is<SharedArrayObj>()) {
+        const auto &a = v.get_ref<SharedArrayObj>();
+        std::vector<EvalValue> buf(a.size());
+        bool any = false;
+        for (size_type i = 0; i < a.size(); i++) {
+            bool c;
+            buf[i] = shape_widen(arr_elem_boxed(a, i), *s.sub, is_const, c);
+            any |= c;
+        }
+        if (!any)
+            return v;
+        changed = true;
+        EvalValue r = build_array_from_values(buf.data(), buf.size(),
+                                              ArrHint::dflt, nullptr,
+                                              is_const);
+        if (a.is_readonly())
+            r = make_const_clone(r);
+        return r;
+    }
+    if (s.k == NumShape::dict && v.is<intrusive_ptr<DictObject>>()) {
+        const auto &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        if (d.get_has_default())
+            return v;
+        std::vector<EvalValue> buf;
+        buf.reserve(2 * d.get_ref().size());
+        bool any = false;
+        for (const auto &kv : d.get_ref()) {
+            bool c;
+            buf.push_back(kv.first);
+            buf.push_back(shape_widen(kv.second.get(), *s.sub, is_const, c));
+            any |= c;
+        }
+        if (!any)
+            return v;
+        changed = true;
+        EvalValue r = build_dict_from_pairs(buf.data(), buf.size() / 2,
+                                            is_const);
+        if (d.is_readonly())
+            r = make_const_clone(r);
+        return r;
+    }
+    return v;
+}
+} // namespace
+
+static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
+                               bool is_const)
+{
+    NumShape s;
+    for (size_t i = 0; i < n; i++)
+        shape_join(s, shape_of(vals[i * stride]));
+    if (s.k == NumShape::bot || s.k == NumShape::other)
+        return;
+    for (size_t i = 0; i < n; i++) {
+        bool c;
+        EvalValue w = shape_widen(vals[i * stride], s, is_const, c);
+        if (c)
+            vals[i * stride] = std::move(w);
     }
 }
 
@@ -4748,20 +4931,34 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
  * The inferencer rejects a non-lvalue / const / non-numeric operand at compile
  * time; the runtime checks are the `dyn` safety net.
  */
+/* A value-selecting expression (`c ? a : b`, `a ?? b`) whose arms join
+ * to a numeric type WIDENS the arm it picked to that type (task #75):
+ * `c ? 1 : 2.5` is a float, and the VM's typed paths read it as one - the
+ * raw int was the divergence. th == i without th_bool is an int (a bool
+ * arm widens); a th_bool node is a real bool and keeps its arms. */
+static EvalValue select_widen(const Construct *self, EvalValue v)
+{
+    if (self->th == TypeHint::f)
+        return literal_widen(std::move(v), DeclType::f);
+    if (self->th == TypeHint::i && !self->th_bool)
+        return literal_widen(std::move(v), DeclType::i);
+    return v;
+}
+
 EvalValue TernaryExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     const EvalValue c = RValue(condExpr->eval(ctx));
     if (c.get_type()->is_true(c))
-        return RValue(thenExpr->eval(ctx));
-    return RValue(elseExpr->eval(ctx));
+        return select_widen(this, RValue(thenExpr->eval(ctx)));
+    return select_widen(this, RValue(elseExpr->eval(ctx)));
 }
 
 EvalValue CoalesceExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue l = RValue(lhs->eval(ctx));
     if (l.is<NoneVal>())
-        return RValue(rhs->eval(ctx));
-    return l;
+        return select_widen(this, RValue(rhs->eval(ctx)));
+    return select_widen(this, std::move(l));
 }
 
 EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
@@ -5767,6 +5964,17 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
      * common small literal, heap for a large one), then the shared builder -
      * the same builder the VM's MakeDictV op calls with register values. */
     const size_t np = elems.size();
+    /* the VALUES widen as LiteralArray's elements do: by the stamp, or -
+     * a fully CONSTANT literal - by their own join */
+    const auto widen_vals = [&](EvalValue *buf) {
+        if (val_coerce != DeclType::none) {
+            for (size_t i = 0; i < np; i++)
+                buf[2 * i + 1] =
+                    literal_widen(std::move(buf[2 * i + 1]), val_coerce);
+        } else if (is_const && ctx->in_const_eval()) {
+            const_values_widen(buf + 1, np, 2, ctx->const_ctx);
+        }
+    };
 
     if (np <= 8) {
         EvalValue buf[16];
@@ -5774,6 +5982,7 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
             buf[2 * i]     = RValue(elems[i]->key->eval(ctx));
             buf[2 * i + 1] = RValue(elems[i]->value->eval(ctx));
         }
+        widen_vals(buf);
         return build_dict_from_pairs(buf, np, ctx->const_ctx);
     }
 
@@ -5782,6 +5991,7 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
         buf[2 * i]     = RValue(elems[i]->key->eval(ctx));
         buf[2 * i + 1] = RValue(elems[i]->value->eval(ctx));
     }
+    widen_vals(buf.data());
     return build_dict_from_pairs(buf.data(), np, ctx->const_ctx);
 }
 

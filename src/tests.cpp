@@ -907,6 +907,34 @@ static const std::vector<test> tests =
      * Watched failing: with stamp_inferred_param_types disabled the first
      * three fail in every mode.
      */
+    /*
+     * #75: a container literal and a value-selecting expression hold
+     * values of their STATIC numeric type, whatever position they are
+     * written in - the typed readers of every engine trust it (RULE 1).
+     * The sabotage run (each of the seven widening sites removed alone)
+     * was watched on tests/functional/49_literal_widen.my, the fuller
+     * program this entry samples.
+     */
+    { "coerce: literals and selections widen to their static type",
+      { "var i = int(runtime(0)); var fi = int(runtime(3));",
+        "var a = [fi, 2.5];",
+        "assert(typestr(a[i]) == \"float\" && a[i] / 2 == 1.5);",
+        "var bi = [true, fi];",
+        "assert(typestr(bi[i]) == \"int\" && bi[i] + 1 == 2);",
+        "var d = {\"x\": fi, \"y\": 0.5}; var k = str(runtime(\"x\"));",
+        "assert(typestr(d[k]) == \"float\");",
+        "var m = [[1, 2.5], [fi, 4]];",
+        "assert(str(m[i + 1][1]) == \"4.000000\");",
+        "const N = [[1, 2.5], [3, 4]];",
+        "assert(str(N[i + 1][0]) == \"3.000000\");",
+        "var b = fi > 1;",
+        "var t = b ? fi : 2.5;",
+        "assert(typestr(t) == \"float\" && t / 2 == 1.5);",
+        "var on = runtime(0) > 0 ? none : fi;",
+        "var co = on ?? 2.5;",
+        "assert(typestr(co) == \"float\");",
+        "var mp = map(func(x) => x > 1 ? x : 0.5, [1, fi]);",
+        "assert(typestr(mp[i + 1]) == \"float\");" } },
     { "coerce: a joined float lambda param converts an int argument",
       { "var b = 2;",
         "var f = func [b] (x) { return x; };",

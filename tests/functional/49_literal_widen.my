@@ -1,0 +1,45 @@
+# A container literal or a value-selecting expression holds values of its
+# STATIC numeric type (#75): an array<float> literal stores its ints as
+# floats, an array<int> one its bools as ints, and so on through dict
+# values, nested literals, constant (parse-time baked) literals, the
+# ternary and `??`. The typed readers the VM and the JIT use trust that
+# type, so before #75 each shape below either raised TypeErrorEx or
+# printed an int where the tree-walker printed a float. Every read goes
+# through a runtime index, so no read folds away.
+var i = int(runtime(0));
+var fi = int(runtime(3));
+var b = int(runtime(1)) > 0;
+
+var a = [fi, 2.5];
+print(a[i], typestr(a[i]), a[i] / 2);
+var bi = [true, fi];
+print(bi[i], typestr(bi[i]), bi[i] + 1);
+var d = {"x": fi, "y": 0.5};
+var key = str(runtime("x"));
+print(d[key], d[key] / 2);
+func half(array<float> v) { var t = v[0]; return t / 2; }
+print(half([fi, 2.5]));
+var m = [[1, 2.5], [fi, 4]];
+print(m[i + 1][1], m[i + 1][0] / 2, typestr(m));
+var dm = {"p": [fi, 1.5], "q": [7]};
+var kq = str(runtime("q"));
+print(dm[kq][i], typestr(dm));
+
+const C = [1, 2.5];
+const N = [[1, 2.5], [3, 4]];
+const A = [3, 4];
+const NA = [[1, 2.5], A];
+const CD = {"p": [true, 2], "q": [1.5]};
+var kp = str(runtime("p"));
+print(C[i], N[i + 1][1], NA[i + 1][0], A[i], typestr(A));
+print(CD[kp][i], CD[kp][i + 1]);
+
+var mp = map(func(x) => x > 1 ? x : 0.5, [1, fi, 2]);
+print(mp[i + 1], typestr(mp[i + 1]));
+var t = b ? fi : 2.5;
+print(t, t / 2);
+var tb = b ? true : 3;
+print(tb, typestr(tb));
+var on = runtime(0) > 0 ? none : fi;
+var co = on ?? 2.5;
+print(co, co / 2);

@@ -5,8 +5,9 @@
 #  - a flat int array (the typed reads, 73_multi_unpack's shape) and a
 #    flat float one;
 #  - a MIXED row built in an unhinted position (an append argument): it is
-#    typed array<float> but holds an int, so the typed reads must NOT be
-#    taken - each element binds its actual value, as before the lowering;
+#    typed array<float>, and since #75 the literal stores its int as a
+#    float, so both targets bind floats (before #75 the row held the int
+#    and the typed reads had to be declined);
 #  - a bool row, a `_` placeholder, a slice rvalue;
 #  - general string rows and split() rows (the flat-strs read) in a
 #    foreach, indexed and with `_`;

@@ -463,6 +463,9 @@ private:
     void check_if(IfStmt *i);
     TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
+    void stamp_literal_coerce(Construct *n, StaticTypeRef t);
+    /* literals whose widening an enclosing literal stamped (#75) */
+    std::unordered_set<const Construct *> lit_coerce_by_parent;
     void stamp_untyped_calls(Construct *n);   /* #51: -nti's call hints */
     void set_array_repr_hint(Expr14 *e);    /* type-driven ArrHint on rvalue */
     void stamp_sum_identity(CallExpr *call);  /* #48: sum() of nothing */
@@ -2617,6 +2620,45 @@ void Inferencer::stamp_untyped_calls(Construct *n)
     for_each_child(n, [&](Construct *c) { stamp_untyped_calls(c); });
 }
 
+/* Stamp a container literal's numeric widening from the type it has IN
+ * CONTEXT, and push that type down into the literals nested directly in
+ * it: `[[1, 2.5], [3, 4]]` is array<array<float>>, so the inner `[3, 4]`
+ * stores floats although its own type is array<int>. The nested literals
+ * are remembered so annotate_hints' own visit of them - before or after
+ * this one - does not restamp them from their narrower own type. */
+void Inferencer::stamp_literal_coerce(Construct *n, StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+    StaticTypeRef el = nullptr;
+    if (t && t->kind == StaticTypeKind::Array)
+        el = static_type_resolve(t->elem);
+    else if (t && t->kind == StaticTypeKind::Dict)
+        el = static_type_resolve(t->val);
+    const DeclType dt =
+        !el ? DeclType::none
+        : el->kind == StaticTypeKind::Float ? DeclType::f
+        : el->kind == StaticTypeKind::Int ? DeclType::i
+        : DeclType::none;
+    const auto nested = [&](Construct *c) {
+        if (el && c && (ctag(c) == ConstructType::lit_arr
+                        || ctag(c) == ConstructType::lit_dict)) {
+            lit_coerce_by_parent.insert(c);
+            stamp_literal_coerce(c, el);
+        }
+    };
+    if (ctag(n) == ConstructType::lit_arr) {
+        auto *la = static_cast<LiteralArray *>(n);
+        la->elem_coerce = dt;
+        for (auto &e : la->elems)
+            nested(e.get());
+    } else {
+        auto *ld = static_cast<LiteralDict *>(n);
+        ld->val_coerce = dt;
+        for (auto &kv : ld->elems)
+            nested(kv->value.get());
+    }
+}
+
 void Inferencer::annotate_hints(Construct *n)
 {
     if (!n)
@@ -2854,6 +2896,15 @@ void Inferencer::annotate_hints(Construct *n)
             }
         }
     }
+
+    /* A container LITERAL's numeric widening (task #75): its static
+     * element (value) type decides - an array<float> literal stores its
+     * int elements as floats wherever it is written, not only in a
+     * position whose DESTINATION hint makes it flat. */
+    if ((ctag(n) == ConstructType::lit_arr
+         || ctag(n) == ConstructType::lit_dict)
+        && !lit_coerce_by_parent.count(n))
+        stamp_literal_coerce(n, type_of(n));
 
     /* A multi-assign destructure `a, b, c = <rvalue>` whose rvalue is
      * PROVEN a non-opt array: the codegen then lowers the strict unpack
