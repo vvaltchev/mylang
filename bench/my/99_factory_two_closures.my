@@ -1,0 +1,27 @@
+# A FACTORY THAT RETURNS ONE OF TWO CLOSURES, called in a loop. 63 has a
+# factory per closure; here one factory picks between an adder and a
+# multiplier by its argument, so every call site downstream can reach
+# either - the closure-inlining arc's two-way case (a guard chain over two
+# bodies) meeting its factory case (the factory spliced into the caller)
+# and its scalar replacement (no object built for a closure that never
+# escapes, with a tag saying which of the two it is).
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+func make_op(k) {
+    if (k % 3 == 0) {
+        var base = k;
+        return func [base] (int x) { return base + x; };
+    }
+    var factor = k % 7 + 1;
+    return func [factor] (int x) { return factor * x; };
+}
+
+var N = 400000 * scale;
+var s = 0;
+for (var i = 0; i < N; i++) {
+    var f = make_op(i);
+    s = (s + f(i)) % 1000000007;
+}
+print("result:", s);

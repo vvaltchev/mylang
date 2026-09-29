@@ -379,6 +379,19 @@ public:
     }
 
     /*
+     * #97 increment 3 follow-up: what `*this = EvalValue()` does - the
+     * payload destroyed, `none` left behind with a zero payload word -
+     * but IN PLACE: the assignment from a temporary built a zeroed value
+     * on the stack and read it back with one 16-byte load over two 8-byte
+     * stores, a blocked store-forward on every call (R1's finding, one
+     * helper over).
+     */
+    void release_to_none() {
+        destroy_val();
+        val.ival = 0;
+    }
+
+    /*
      * The mirror of abandon_borrowed(): take the bits of another value
      * WITHOUT taking a reference to what they point at. Same single caller
      * (LValue::borrow_from), same #94 justification.
@@ -925,7 +938,18 @@ public:
             is_const = false;
             return;
         }
-        *this = LValue();
+        /*
+         * `*this = LValue()`, in place. The assignment built a zeroed
+         * LValue on the stack with 8-byte stores and copied it in with a
+         * 16-byte load - a BLOCKED STORE-FORWARD on every release, the
+         * shape R1 removed from the return arm (drop_for_overwrite). It
+         * was 1.2M of them on 63_closures once increment 3 released each
+         * iteration's closure here: two per iteration. (container_idx is
+         * left alone: the default constructor never initialised it.)
+         */
+        val.release_to_none();
+        container = nullptr;
+        is_const = false;
     }
 
     bool is_const_var() const { return is_const; }

@@ -28755,10 +28755,15 @@ static bool myv_spliced_closure_span()
  *    literal built in main's loop, a two-capture span with a gap, a
  *    parameter captured beside a local;
  *  - KEPT (not profitable): a closure built once, before its loop;
+ *  - REPLACED WITH A TAG: a slot that may hold either of two closures
+ *    (a factory with two returns) - an int tag says which, and each
+ *    closure keeps its own capture slots;
  *  - KEPT (an escape): a closure returned, one stored in an array, one
- *    COPIED into a second variable (both must share ONE counter), and a
- *    slot written with two different closures.
- * `g_bc_sra_closures` counts the slots replaced at compile time.
+ *    COPIED into a second variable (both must share ONE counter);
+ *  - KEPT (not profitable): a slot written with two different closures
+ *    OUTSIDE any loop.
+ * `g_bc_sra_closures` counts the slots replaced at compile time,
+ * `g_bc_sra_tagged` those that needed a tag.
  */
 static bool bc_sra_closures()
 {
@@ -28773,6 +28778,53 @@ static bool bc_sra_closures()
           "for (var i = 0; i < 30; i++) {\n"
           "  var c = mc(i); s = s + c() + c();\n"
           "  var add = ma(i); s = s + add(i); }\n"
+          "print(s);\n", true },
+        /* the COLLAPSE's branch-target rule: the capture store after a
+         * ternary is a JOIN - retargeting one arm's producer into the
+         * capture slot would skip the store on the other path */
+        { "a capture stored at a branch join (a ternary)",
+          "func mt(n) { var c = n;\n"
+          "  return func [c] (int k) { c = k > 3 ? c + k : c - 1;\n"
+          "    return c; }; }\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 20; i++) { var f = mt(i);\n"
+          "  s = s + f(i) + f(i + 5); }\n"
+          "print(s);\n", true },
+        /* the COLLAPSE's forward rule: `old` is read twice, around a
+         * capture store - only a temp read ONCE may be renamed to the
+         * capture slot (the second read must see the value before) */
+        { "a capture copied out and read twice around its store",
+          "func mo(n) { var c = n;\n"
+          "  return func [c] (int k) { var old = c; c = old + k;\n"
+          "    return old * 100 + c; }; }\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 20; i++) { var f = mo(i);\n"
+          "  s = s + f(i) + f(3); }\n"
+          "print(s);\n", true },
+        /* TWO closures in one slot: the object becomes an int TAG plus
+         * each closure's captures, and a guard the analysis cannot
+         * decide becomes a compare of the tag */
+        { "a factory returning one of two closures (a tag)",
+          "func mk(k) {\n"
+          "  if (k % 3 == 0) { var base = k * 10;\n"
+          "    return func [base] (int x) { return base + x; }; }\n"
+          "  var fac = k % 7 + 1;\n"
+          "  return func [fac] (int x) { return fac * x; }; }\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 40; i++) { var f = mk(i);\n"
+          "  s = s + f(i) + f(3); }\n"
+          "print(s);\n", true },
+        /* ...and each keeps its OWN mutable capture: the tag must pick
+         * the counter that belongs to the closure the slot holds */
+        { "two counters from one factory (a tag, mutable captures)",
+          "func mk(k) {\n"
+          "  if (k % 2 == 0) { var c = k;\n"
+          "    return func [c] () { c++; return c; }; }\n"
+          "  var d = k * 3;\n"
+          "  return func [d] () { d = d - 2; return d; }; }\n"
+          "var s = 0;\n"
+          "for (var i = 0; i < 40; i++) { var f = mk(i);\n"
+          "  s = s * 3 % 1000003 + f() * 7 + f(); }\n"
           "print(s);\n", true },
         { "a closure literal built in main's loop",
           "var s = 0;\n"
@@ -28832,7 +28884,7 @@ static bool bc_sra_closures()
           "var s = 0;\n"
           "for (var i = 0; i < 10; i++) s = s + f() + g();\n"
           "print(s, f());\n", false },
-        { "one slot, two different closures (declines)",
+        { "one slot, two different closures, built once (kept)",
           "var a = int(runtime(1)); var b = int(runtime(2));\n"
           "var f = func [a] () { return a; };\n"
           "if (runtime(1) > 0) f = func [b] () { return b * 10; };\n"
@@ -28841,19 +28893,27 @@ static bool bc_sra_closures()
           "print(s);\n", false },
     };
     bool ok = true;
+    const unsigned long col0 = g_bc_sra_collapsed;
+    const unsigned long tag0 = g_bc_sra_tagged;
     for (const Shape &sh : shapes) {
         const std::string src = sh.src;
         const std::string ref = engine_run_bt(src, ExecEngine::TreeWalk,
                                               false, false);
         const unsigned long c0 = g_bc_sra_closures;
-        for (const bool jit : { false, true }) {
+        /* the collapse ON (the default) and OFF: both must agree */
+        for (const bool jit : { false, true })
+        for (const bool col : { true, false }) {
+            const bool sc = g_bc_sra_collapse;
+            g_bc_sra_collapse = col;
             const std::string got = engine_run_bt(src, ExecEngine::Vm, jit,
                                                   true);
+            g_bc_sra_collapse = sc;
             if (ref.empty() || ref.find("EXC") != std::string::npos
                     || got != ref) {
-                fprintf(stderr, "bc_sra_closures [%s] jit=%d differs from "
-                                "the tree-walker:\n--- tw\n%s--- got\n%s",
-                        sh.name, jit, ref.c_str(), got.c_str());
+                fprintf(stderr, "bc_sra_closures [%s] jit=%d collapse=%d "
+                                "differs from the tree-walker:\n--- tw\n%s"
+                                "--- got\n%s", sh.name, jit, col,
+                        ref.c_str(), got.c_str());
                 ok = false;
             }
         }
@@ -28864,6 +28924,15 @@ static bool bc_sra_closures()
                                    : "did not fire - the shape is vacuous");
             ok = false;
         }
+    }
+    if (g_bc_sra_collapsed == col0) {
+        fprintf(stderr, "bc_sra_closures: the move collapse never fired\n");
+        ok = false;
+    }
+    if (g_bc_sra_tagged == tag0) {
+        fprintf(stderr, "bc_sra_closures: no slot was replaced with a "
+                        "TAG - the two-closure shapes are vacuous\n");
+        ok = false;
     }
     return ok;
 }

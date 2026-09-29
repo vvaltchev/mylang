@@ -1,0 +1,32 @@
+# #97 closure inlining, increment 5's MOVE COLLAPSE: a scalar-replaced
+# closure's capture ops are moves, which the collapse folds away - a
+# temp copied out of a capture slot is renamed to it, a temp copied in
+# is replaced by the slot itself as its producer's target. Two shapes it
+# must leave alone, each of which printed a wrong answer when the rule
+# guarding it was removed:
+#  - a capture stored at a branch JOIN (after a ternary): folding one
+#    arm's producer into the capture slot skips the store on the other;
+#  - a capture copied out and read TWICE around its store: renaming the
+#    first read would make the second see the updated value.
+# MYLANG_BCINLINE_SRAC=0 is the same program without the collapse.
+func mt(n) {
+    var c = n;
+    return func [c] (int k) { c = k > 3 ? c + k : c - 1; return c; };
+}
+func mo(n) {
+    var c = n;
+    return func [c] (int k) {
+        var old = c;
+        c = old + k;
+        return old * 100 + c;
+    };
+}
+
+var s = 0;
+for (var i = 0; i < 25; i++) {
+    var tj = mt(i);
+    s = s + tj(i) + tj(i + 5);
+    var ot = mo(i);
+    s = s + ot(i) + ot(3);
+}
+print(s);

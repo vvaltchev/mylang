@@ -1923,10 +1923,13 @@ Running scripts:
                                  # base); inc 5: a closure BUILT IN A LOOP
                                  # that never escapes is scalar-replaced -
                                  # its captures become frame slots and no
-                                 # object is built (MYLANG_BCINLINE_SRA=0
-                                 # keeps the object; a test of the guards
-                                 # or of a spliced make.closure holds
-                                 # SraOff, or it tests nothing)
+                                 # object is built - a slot that may hold
+                                 # one of several closures keeps an int
+                                 # TAG (MYLANG_BCINLINE_SRA=0 keeps the
+                                 # object, MYLANG_BCINLINE_SRAC=0 its move
+                                 # collapse; a test of the guards or of a
+                                 # spliced make.closure holds SraOff, or
+                                 # it tests nothing)
 ./build/mylang -vdj FILE         # -vd + the native x86-64 disassembly of
                                  # each JIT fragment, interleaved under its
                                  # `enter.nat` line with `; vm pc N` markers

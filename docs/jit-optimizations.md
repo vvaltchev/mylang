@@ -15744,7 +15744,9 @@ MORE cycles, against increment 2's binary). Two findings:
    instructions later, where the frameless call's return path used to put
    distance between them. PEBS attributes the blocked loads next to plain
    stores, so the exact load is not identified. Increment 5 removes the
-   object outright, which makes the question moot for 63.
+   object outright, which makes the question moot for 63. **Explained
+   and fixed afterwards** - it was `LValue::frame_release`, not the
+   closure: see *FOLLOW-UP A* below.
 
 Pinned by four `closure_inline_parity` shapes (63's factories; a captured
 parameter, a span with a gap, a parameter beside a local, a function
@@ -15807,16 +15809,113 @@ Pinned by `bc_sra_closures` (replaced: 63's factories, a closure literal
 built in main's loop, a span with a gap, a parameter beside a local;
 kept: built once before its loop, returned, stored in an array, copied
 into a second variable - which must share ONE counter - and a slot
-written with two different closures; plus a captured array whose body
+written with two different closures (now kept only because it is built
+once: see *FOLLOW-UP C*); plus a captured array whose body
 runs boxed and so is not inlined today), SRA-on runs of every
 `closure_inline_parity` shape, and
 `tests/functional/45_closure_scalar_replace.my`. Tests of the guards or
 of a spliced make.closure hold `SraOff`. Watched failing: the escape
 scan accepting any read (the returned closure and the array case, both
-nets), every capture read mapped to capture 0 (both nets). The
-one-descriptor rule is REDUNDANT BY CONSTRUCTION - a second descriptor's
-make.closure kills the fact, so the escape scan drops the slot anyway;
-deleting it changed nothing, and the code says so. **Not reachable
+nets), every capture read mapped to capture 0 (both nets). (The
+one-descriptor rule this version had is gone: FOLLOW-UP C replaced the
+must-analysis with a may-analysis that admits several.) **Not reachable
 today:** a replaced closure with a REFERENCE capture (a closure body over
 a captured array runs boxed, so its call is not inlined) - the path that
 lists such a capture slot in ref_slots has no reaching shape yet.
+
+**#97 INCREMENT 5 FOLLOW-UPS (2026-09-28): the store-forward stalls,
+the move chains, and factories with two closures.**
+
+**FOLLOW-UP A - the blocked store-forwards were `frame_release`.**
+Increment 3's 1.2M blocked store-forwards on 63 (two per iteration) came
+from `jit_release_slot` -> `LValue::frame_release()`, whose last line
+was `*this = LValue();`: GCC builds the default LValue as a stack
+temporary with two 8-byte stores and copies it with ONE 16-byte load -
+a load that spans two in-flight stores cannot be forwarded and waits
+for them to retire. The same shape as #97 R1's `*this = LValue()` in a
+hot helper. It is written in place now (`EvalValue::release_to_none()`:
+destroy, then `ival = 0`; then the two fields). An earlier theory - a
+4-byte refcount store read back as 8 - was wrong: the release is a
+dword both ways. Pinned, scale 3, SRA OFF (the object still built):
+
+    63  cycles 62M -> 39.4/39.6M   instructions 235.5M -> 205.5M
+        ld_blocks.store_forward 1.2M -> ~2,300
+    63 with SRA on: 19.3/19.6M, unchanged (no object, no release)
+
+The fix is in a helper every engine's frame pop calls, so it is not
+63-specific; no other bench was measured for it.
+
+**FOLLOW-UP B - collapsing the move chains SRA leaves
+(`bc_collapse_capture_moves`, lever `MYLANG_BCINLINE_SRAC`, counter
+`g_bc_sra_collapsed`).** The replacement turns `make.closure` into
+`move cap = x` and each capture op into a move, so a counter closure
+became `move r = cap; r = r + 1; move cap = r; move out = cap` - four
+boxed moves around one add. Three local rules, iterated to a fixpoint
+(at most 16 rounds), each confined to the capture slots SRA created
+(`g_bc_sra_cap_slots`):
+ - FORWARD: `move x = C` then an op reading x - rename x to C in that
+   op and delete the move, when x is a temp with ONE def and ONE use and
+   the op is not a branch target;
+ - RETARGET: `op y = ...` then `move C = y` - make the op write C and
+   delete the move, when y has one use and the move is not a branch
+   target;
+ - SWAP: the same with y used again - `op C = ...; move y = C`, so the
+   capture is written by the producer and the copy goes the other way.
+The producer must be an op whose only def is `target` (the specialized
+family, IntBin/FloatBin, compares, LoadImm, MoveV, LoadElemInt/Float).
+The branch-target conditions are the whole soundness argument: a join
+is a control-flow fact (the TYPED-ternary lesson in CLAUDE.md), and
+both were watched failing - CS1 (retarget/swap into a join: the ternary
+shape, `c = k > 3 ? c + k : c - 1`) and CS2 (forward renaming a temp
+read twice around its capture's store) fail `bc_sra_closures` AND
+corpus_diff on `tests/functional/46_closure_move_collapse.my`. (They
+were first written into 45, whose main hit the splice's frame budget
+and left them calls - so only `-rt` saw them; 46 exists for that.)
+Pinned, scale 3, lever on vs off:
+
+    63  cycles 14.7-15.2M vs 19.0-19.1M   instructions 67.0M vs 85.6M
+
+**FOLLOW-UP C - a slot that may hold ONE OF SEVERAL closures.** A
+factory with two returns (`bench/my/99_factory_two_closures.my`,
+written for this: `k % 3 == 0` gives an adder, else a multiplier)
+spliced into a loop leaves a slot written by two `make.closure`s, and
+increment 2's guard chain dispatches on it - so increment 5's
+single-descriptor must-analysis kept the object. It is a MAY-analysis
+now: per candidate slot a bitmask (bit 0 unwritten, bit 1 some other
+value, bit 2+j closure j, up to 14), unioned at joins, and a guard
+REFINES its two out-edges - the fall-through keeps `mask & {j}`, the
+else-edge `mask & ~{j}`, an empty mask making the edge dead. So a chain
+that covers every closure the slot can hold leaves its miss call
+unreachable, which is what lets the slot be replaced at all. A slot
+with more than one closure gets an int TAG (`LoadImmInt tag = j` after
+the capture moves, where the collapse's forward rule still reaches the
+factory's copy), and each guard becomes: deleted where the mask is
+{j}, a `Jump` to its else where j is not in it, and otherwise
+`JumpUnlessIntCmp tag == j`. The escape scan is mask-aware: a read
+where the slot cannot hold a closure is not a closure read (a spliced
+factory reuses its return slot as an int temp - `f = i % 3` above);
+a guard needs a mask with no "unwritten"/"other" bit; a capture op
+needs exactly one closure. A capture-free closure has nothing to
+replace but its identity, which the tag carries. `bc_rewrite_ops` now
+remaps the pc fields of REPLACEMENT ops too (they are written in the
+old numbering, like everything else) - the refined guard is the first
+replacement with a branch.
+
+Pinned, scale 3, against the commit before it (04ae4c5), one run each:
+
+    99   cycles 58.6M -> 23.0M (-61%)   instructions 258.3M -> 91.4M
+         (SRA off on the new binary: 62.7M, 258.1M)
+    63 / 11 / 78 / 76 / 98   -nj -vd byte-identical; instructions
+         within 0.1%
+
+Bench 99 needed its closures' parameter annotated `int x`: #115's gate
+(c) types a closure's parameters only from sites that name it alone,
+and every site here can reach both - a language rule, left alone.
+Pinned by two `bc_sra_closures` shapes (bench 99's; two counters with
+mutable captures called twice per iteration) and
+`tests/functional/47_closure_tag_replace.my`, which also keeps a THREE-
+closure factory as a parity case (not replaced: a value call with three
+candidates is not spliced, so it reads the object). Watched failing: an
+undecided guard deleted, every tag 0 (both nets, both). The else-edge
+keeping the refuted closure fails CLOSED - the miss call becomes
+reachable and nothing is replaced; the vacuity checks name every shape.
