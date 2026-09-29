@@ -5146,7 +5146,7 @@ extern "C" int jit_load_struct_elem(int_type dst, int_type base,
     ML_JIT_OP_RAN(LoadStructElemV);
     Frame *f = g_current_ctx->frame;
     try {
-        f->at(dst).put(vm_struct_elem(f->at(base).get(), idx));
+        vm_struct_elem_into(f->at(dst), f->at(base).get(), idx);
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(static_cast<RuntimeException *>(e.clone()));
         return 1;
@@ -12524,9 +12524,9 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * may be GONE (the body shrank the array) - the loc-less
              * OutOfBoundsEx takes the container's caret here. */
             try {
-                ctx.frame->at(in->target).put(
-                    vm_struct_elem(ctx.frame->at(in->target2).get(),
-                                   read_int_operand(in->a(), &ctx)));
+                vm_struct_elem_into(ctx.frame->at(in->target),
+                                    ctx.frame->at(in->target2).get(),
+                                    read_int_operand(in->a(), &ctx));
             } catch (Exception &e) {
                 vm_stamp_loc(*chunk, pc, e);
                 throw;

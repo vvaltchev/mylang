@@ -1,0 +1,64 @@
+# #110: the VM's whole-`p` foreach bind (LoadStructElemV) REUSES the loop
+# variable's StructObject - it copies the next element's bytes over it -
+# whenever nothing but the loop variable holds it. Every way the body can
+# make it escape must instead leave the escaped element intact, which is
+# what this program checks: each shape keeps elements from DIFFERENT
+# iterations and prints them afterwards. The oracle is the engine
+# differential (tests/corpus_diff.sh): the tree-walker has always reused
+# behind its own COW guard.
+struct P { int x; int y; }
+
+var n = int(runtime(5));
+var pts = [];
+for (var i = 0; i < n; i++)
+    append(pts, P(i, i * 10));
+
+# (1) no escape: the reuse path, the value passed to a function
+func sum2(P q) { return q.x + q.y; }
+var s = 0;
+foreach (var p in pts) s = s + sum2(p);
+print("plain  ", s);
+
+# (2) kept in a general (dyn) array: each element must stay distinct
+var dyn kept = dynarray([]);
+foreach (var p in pts) append(kept, p);
+print("kept   ", kept[0].x, kept[2].x, kept[4].y);
+
+# (3) captured by a closure, called after the loop
+var fs = [];
+foreach (var p in pts) {
+    var c = func [p] () { return p.x * 100 + p.y; };
+    append(fs, c);
+}
+print("closure", fs[0](), fs[3]());
+
+# (4) aliased by a variable declared outside, read after the loop
+var first = P(-1, -1);
+var prev = P(-1, -1);
+foreach (var p in pts) {
+    if (p.x == 0) first = p;
+    prev = p;
+}
+print("alias  ", first.x, first.y, prev.x);
+
+# (5) stored in a dict
+var byx = {};
+foreach (var p in pts) byx[p.x] = p;
+print("dict   ", byx[1].y, byx[3].y);
+
+# (6) the body writes a field of the loop variable, then keeps it
+var dyn marked = dynarray([]);
+foreach (var p in pts) {
+    p.y = p.y + 1;
+    if (p.x % 2 == 0) append(marked, p);
+}
+print("marked ", marked[0].y, marked[1].y, marked[2].y, pts[2].y);
+
+# (7) the body rebinds the loop variable to a fresh struct
+var t = 0;
+foreach (var p in pts) {
+    t = t + p.x;
+    p = P(100, 100);
+    t = t + p.x;
+}
+print("rebind ", t);

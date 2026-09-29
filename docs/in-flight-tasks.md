@@ -803,7 +803,18 @@ Record: docs/jit-optimizations.md, *#97 CLOSURE INLINING STEP 1*.
 
 ---
 
-## 3. TASK #110 — VM `foreach` OVER A FLAT STRUCT ARRAY  [PENDING]
+## 3. TASK #110 — VM `foreach` OVER A FLAT STRUCT ARRAY  [✅ DONE 2026-09-29]
+
+**DONE:** `vm_struct_elem_into` (eval.cpp), called by the LoadStructElemV
+handler and `jit_load_struct_elem`, copies the next element's bytes over
+the loop variable's own StructObject when that slot is its ONLY holder
+(`use_count() == 1`, same def, not read-only); anything else allocates as
+before. Measured on a 1000-element array x 300 reps with `p` passed to a
+non-inlined call (`OPT=1 ASSERTS=0`, scale 3 minus scale 1): **547 -> 283
+Ir per iteration (-48%)**, one pinned wall run 0.118 s -> 0.058 s
+(0.49x). Net: `tests/functional/51_struct_foreach_reuse.my` (seven
+escape shapes); dropping the `use_count` test fails it in `-nj` and the
+default engine (watched). The notes below are the original sizing.
 
 **MEASURED 2026-08-26** while sizing #97's sibling cases.
 
