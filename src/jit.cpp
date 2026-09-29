@@ -12366,8 +12366,6 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
  */
 static constexpr size_t RET_REF_GUARD_MAX = 6;
 
-/* reg:proto(fn) - the RETURN half of the call protocol (the record /
- * no-record walk): the same MyLang-call pool denial. */
 static constexpr uint8_t JIT_RET_NO_FWD = 0xFF;   /* no forwarded result */
 
 /* #71: a forwarded result's slot, written back from `src` (the payload)
@@ -12383,6 +12381,8 @@ static void emit_ret_fwd_writeback(Emitter &e, int res_slot, uint8_t src,
                          tag, scratch);
 }
 
+/* reg:proto(fn) - the RETURN half of the call protocol (the record /
+ * no-record walk): the same MyLang-call pool denial. */
 static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                             uint8_t fwd_reg, const void *fwd_tag)
 {
