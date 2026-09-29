@@ -935,6 +935,24 @@ static const std::vector<test> tests =
         "assert(typestr(co) == \"float\");",
         "var mp = map(func(x) => x > 1 ? x : 0.5, [1, fi]);",
         "assert(typestr(mp[i + 1]) == \"float\");" } },
+    /* The #75 follow-up: a return, a dict key, a dict element / member
+     * store, a joined local and a float global assigned from a function
+     * hold the WIDER static type. Sabotage (each of the ten sites alone)
+     * watched on tests/functional/50_store_return_widen.my. */
+    { "coerce: returns, dict keys and stores widen to their static type",
+      { "var fi = int(runtime(1));",
+        "func g(b) { if (b) return fi; return 2.5; }",
+        "assert(str(g(runtime(true))) == \"1.000000\");",
+        "var e = {0.5: \"x\"}; e[fi] = \"y\";",
+        "foreach (var k, v in e) if (v == \"y\") assert(str(k) == \"1.000000\");",
+        "var lit = {fi: \"a\", 2.5: \"b\"};",
+        "foreach (var k2, v2 in lit) if (v2 == \"a\") assert(str(k2) == \"1.000000\");",
+        "var d = {\"a\": 0.5}; d[\"b\"] = fi; d.c = fi;",
+        "assert(str(d[str(runtime(\"b\"))]) == \"1.000000\");",
+        "assert(str(d[str(runtime(\"c\"))]) == \"1.000000\");",
+        "var x = fi; assert(str(x) == \"1.000000\"); x = 2.5;",
+        "float gl = 0.5; func setg(int v) { gl = v; } setg(fi);",
+        "assert(str(gl) == \"1.000000\");" } },
     { "coerce: a joined float lambda param converts an int argument",
       { "var b = 2;",
         "var f = func [b] (x) { return x; };",

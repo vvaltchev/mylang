@@ -814,6 +814,60 @@ struct Codegen {
         return ok;
     }
 
+    /* #75 follow-up: a numeric WIDENING the inferencer stamped, applied to
+     * a compiled value - a CoerceNumV into a FRESH temp (the value may sit
+     * in a named local's own slot, which must keep its value). */
+    void emit_widen(DeclType dt, int &slot, const Construct *node,
+                    std::vector<CgInstr> &ops)
+    {
+        if (dt != DeclType::i && dt != DeclType::f)
+            return;
+        CgInstr co;
+        co.op = OpCode::CoerceNumV;
+        co.node_idx = add_ast_node(node);
+        co.target = alloc_temp();
+        co.target2 = dt == DeclType::f ? 1 : 0;
+        co.set_a(slot_op(slot));
+        ops.push_back(co);
+        slot = co.target;
+    }
+
+    /* A container store's KEY (a dict<float, _> stores an int key as a
+     * float - Subscript::key_coerce) and its VALUE (Expr14::rv_coerce). */
+    bool compile_key(const Subscript *sub, int &slot,
+                     std::vector<CgInstr> &ops)
+    {
+        if (!compile_boxed_expr(sub->index.get(), slot, ops))
+            return false;
+        emit_widen(sub->key_coerce, slot, sub, ops);
+        return true;
+    }
+    bool compile_rvalue(const Expr14 *e, int &slot,
+                        std::vector<CgInstr> &ops)
+    {
+        if (!compile_boxed_expr(e->rvalue.get(), slot, ops))
+            return false;
+        emit_widen(e->rv_coerce, slot, e, ops);
+        return true;
+    }
+    bool compile_key_to_run_slot(const Subscript *sub, int dst,
+                                 std::vector<CgInstr> &ops)
+    {
+        if (!compile_to_run_slot(sub->index.get(), dst, ops))
+            return false;
+        if (sub->key_coerce == DeclType::i
+            || sub->key_coerce == DeclType::f) {
+            CgInstr co;             /* the run slot is this key's own */
+            co.op = OpCode::CoerceNumV;
+            co.node_idx = add_ast_node(sub);
+            co.target = dst;
+            co.target2 = sub->key_coerce == DeclType::f ? 1 : 0;
+            co.set_a(slot_op(dst));
+            ops.push_back(co);
+        }
+        return true;
+    }
+
     bool compile_boxed_stmt(const Construct *s, std::vector<CgInstr> &ops)
     {
         const size_t mark = ops.size();
@@ -1806,10 +1860,14 @@ struct Codegen {
                                          base + 2 * i, ops)
                   && compile_to_run_slot(ld->elems[i]->value.get(),
                                          base + 2 * i + 1, ops);
-                if (ok)
+                if (ok) {
+                    emit_literal_widen(ld->elems[i]->key.get(),
+                                       ld->key_coerce, base + 2 * i,
+                                       ld, ops);
                     emit_literal_widen(ld->elems[i]->value.get(),
                                        ld->val_coerce, base + 2 * i + 1,
                                        ld, ops);
+                }
             }
             if (!ok) {
                 ops.resize(mark);
@@ -1888,7 +1946,7 @@ struct Codegen {
 
             int base_slot, idx_slot;
             if (!compile_boxed_expr(sub->what.get(), base_slot, ops)
-                || !compile_boxed_expr(sub->index.get(), idx_slot, ops))
+                || !compile_key(sub, idx_slot, ops))
                 return false;
             const int t = alloc_temp();
             CgInstr in;
@@ -2663,7 +2721,7 @@ struct Codegen {
         const size_t cmark = chunk.consts.size();
         const int save_top = next_temp;
         int rslot;
-        if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+        if (!compile_rvalue(e, rslot, ops)) {
             ops.resize(omark);
             next_temp = save_top;
             chunk.consts.resize(cmark);
@@ -2816,7 +2874,7 @@ struct Codegen {
                 if (!as_container_base(sub->what.get(), bslot, bkind))
                     return false;
                 int kslot;
-                if (!compile_boxed_expr(sub->index.get(), kslot, ops))
+                if (!compile_key(sub, kslot, ops))
                     return false;
                 CgInstr in;
                 in.op = OpCode::IncDecElemCheckedV;
@@ -2931,7 +2989,7 @@ struct Codegen {
                 const size_t cm = chunk.consts.size();
                 const int st = next_temp;
                 int rslot;
-                if (compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+                if (compile_rvalue(e, rslot, ops)) {
                     emit_throw(tk, tstart, tend, tname, ops);
                     return true;
                 }
@@ -2975,7 +3033,7 @@ struct Codegen {
             const size_t cm = chunk.consts.size();
             const int st = next_temp;
             int rslot;
-            if (compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+            if (compile_rvalue(e, rslot, ops)) {
                 CgInstr in;
                 in.op = OpCode::DeclConstV;
                 in.target = lv->sym.slot;
@@ -3002,7 +3060,7 @@ struct Codegen {
             const size_t cm = chunk.consts.size();
             const int st = next_temp;
             int rslot;
-            if (compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+            if (compile_rvalue(e, rslot, ops)) {
                 emit_throw(Chunk::ThrowKind::rebind_const,
                            e->lvalue->start, e->lvalue->end, nullptr, ops);
                 return true;
@@ -3030,7 +3088,7 @@ struct Codegen {
                                         : OpCode::StoreCaptureV;
             if (is_assign) {
                 int rslot;
-                if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+                if (!compile_rvalue(e, rslot, ops)) {
                     ops.resize(omark);
                     chunk.consts.resize(cmark);
                     return false;
@@ -3117,7 +3175,7 @@ struct Codegen {
 
         /* Plain assign: compile the rvalue, then retarget/move it. */
         int rslot;
-        if (!compile_boxed_expr(e->rvalue.get(), rslot, ops)) {
+        if (!compile_rvalue(e, rslot, ops)) {
             ops.resize(omark);
             chunk.consts.resize(cmark);
             return false;
@@ -3444,7 +3502,7 @@ struct Codegen {
                  * order; the index temp is re-read by the dispatch. */
                 int bval, kslot;
                 if (compile_boxed_expr(sub->what.get(), bval, ops)
-                    && compile_boxed_expr(sub->index.get(), kslot, ops)) {
+                    && compile_key(sub, kslot, ops)) {
                     CgInstr in;
                     in.op = OpCode::SubscriptV;
                     in.node_idx = add_ast_node(sub);   /* subscript caret */
@@ -4119,7 +4177,7 @@ struct Codegen {
                     if (next_temp > max_temp)
                         max_temp = next_temp;
                     bool ok =
-                        compile_to_run_slot(sub->index.get(), runbase, ops);
+                        compile_key_to_run_slot(sub, runbase, ops);
                     for (int i = 0; ok && i < nvals; i++)
                         ok = compile_to_run_slot(
                             dc->args->elems[1 + i].get(),
@@ -4462,6 +4520,9 @@ struct Codegen {
                 next_temp = save_top;
                 return false;
             }
+            /* #75 follow-up: the value widens to the function's return
+             * type (ReturnStmt::ret_coerce) */
+            emit_widen(ret->ret_coerce, vslot, ret, ops);
         } else {
             vslot = alloc_temp();
             CgInstr ld;
@@ -4643,7 +4704,7 @@ struct Codegen {
         if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
             int dslot, kslot;
             if (!sub->base_dict || !as_array_slot(sub->what.get(), dslot)
-                || !compile_boxed_expr(sub->index.get(), kslot, ops))
+                || !compile_key(sub, kslot, ops))
                 return false;
             tt = alloc_temp();
             CgInstr in;
@@ -5371,7 +5432,7 @@ struct Codegen {
         const int st = next_temp;
 
         int vslot;
-        if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)) {
+        if (!compile_rvalue(e, vslot, ops)) {
             ops.resize(omark);
             chunk.consts.resize(cmark);
             next_temp = st;
@@ -5393,7 +5454,7 @@ struct Codegen {
             } else {
                 const Subscript *sub = static_cast<const Subscript *>(c);
                 int kslot;
-                if (!compile_boxed_expr(sub->index.get(), kslot, ops)) {
+                if (!compile_key(sub, kslot, ops)) {
                     ok = false;
                     break;
                 }
@@ -5493,7 +5554,7 @@ struct Codegen {
             } else {
                 const Subscript *sub = static_cast<const Subscript *>(cn);
                 int kslot;
-                if (!compile_boxed_expr(sub->index.get(), kslot, ops)) {
+                if (!compile_key(sub, kslot, ops)) {
                     ops.resize(omark);
                     chunk.consts.resize(cmark);
                     next_temp = st;
@@ -5591,8 +5652,8 @@ struct Codegen {
                     ld.target2 = add_const(EvalValue((int_type)1));
                     ops.push_back(ld);
                     int k1slot, k2slot;
-                    if (!compile_boxed_expr(inner->index.get(), k1slot, ops)
-                        || !compile_boxed_expr(sub->index.get(), k2slot, ops))
+                    if (!compile_key(inner, k1slot, ops)
+                        || !compile_key(sub, k2slot, ops))
                         return false;
                     CgInstr in;
                     in.op = OpCode::StoreElem2V;
@@ -5646,7 +5707,7 @@ struct Codegen {
                     ld.target2 = add_const(EvalValue((int_type)1));
                     ops.push_back(ld);
                     int kslot;
-                    if (!compile_boxed_expr(sub->index.get(), kslot, ops))
+                    if (!compile_key(sub, kslot, ops))
                         return false;
                     CgInstr in;
                     in.op = OpCode::DictStore;
@@ -5759,9 +5820,9 @@ struct Codegen {
                 if (nkeys == 2 && as_array_slot(cur, aslot)) {
                     const Subscript *inner = chain[1];
                     int vslot, k1slot, k2slot;
-                    if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
-                        || !compile_boxed_expr(inner->index.get(), k1slot, ops)
-                        || !compile_boxed_expr(sub->index.get(), k2slot, ops))
+                    if (!compile_rvalue(e, vslot, ops)
+                        || !compile_key(inner, k1slot, ops)
+                        || !compile_key(sub, k2slot, ops))
                         return false;
                     CgInstr in;
                     in.op = OpCode::StoreElem2V;
@@ -5784,7 +5845,7 @@ struct Codegen {
                 const size_t cmark = chunk.consts.size();
                 const int st = next_temp;
                 int vslot;
-                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)) {
+                if (!compile_rvalue(e, vslot, ops)) {
                     ops.resize(omark);
                     chunk.consts.resize(cmark);
                     next_temp = st;
@@ -5798,7 +5859,7 @@ struct Codegen {
                 for (int k = 0; k < nkeys && ok; k++)
                     /* base-to-innermost: chain is outermost-first, so index k
                      * (from the base) is chain[nkeys-1-k]'s index. */
-                    ok = compile_to_run_slot(chain[nkeys - 1 - k]->index.get(),
+                    ok = compile_key_to_run_slot(chain[nkeys - 1 - k],
                                              keybase + k, ops);
                 if (!ok) {
                     ops.resize(omark);
@@ -5844,8 +5905,8 @@ struct Codegen {
                 if (!as_container_base(sub->what.get(), dslot, dkind))
                     return false;
                 int vslot, kslot;
-                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
-                    || !compile_boxed_expr(sub->index.get(), kslot, ops))
+                if (!compile_rvalue(e, vslot, ops)
+                    || !compile_key(sub, kslot, ops))
                     return false;
                 CgInstr in;
                 in.op = OpCode::DictStore;
@@ -5961,7 +6022,7 @@ struct Codegen {
                 if (!as_container_base(m->what.get(), dslot, dkind))
                     return false;
                 int vslot;
-                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops))
+                if (!compile_rvalue(e, vslot, ops))
                     return false;
                 CgInstr kin;               /* the member name as a string key */
                 kin.op = OpCode::LoadConstV;
@@ -5995,7 +6056,7 @@ struct Codegen {
                 if (!as_container_base(m->what.get(), sslot, skind))
                     return false;
                 int vslot;
-                if (!compile_boxed_expr(e->rvalue.get(), vslot, ops))
+                if (!compile_rvalue(e, vslot, ops))
                     return false;
                 CgInstr in;
                 in.op = OpCode::StoreMemberV;
@@ -6286,8 +6347,8 @@ struct Codegen {
         if (!as_container_base(sub->what.get(), aslot, akind))
             return false;
         int vslot, kslot;
-        if (!compile_boxed_expr(e->rvalue.get(), vslot, ops)
-            || !compile_boxed_expr(sub->index.get(), kslot, ops))
+        if (!compile_rvalue(e, vslot, ops)
+            || !compile_key(sub, kslot, ops))
             return false;
         CgInstr in;
         in.op = OpCode::StoreElemValue;

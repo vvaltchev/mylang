@@ -464,6 +464,7 @@ private:
     TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
     void stamp_literal_coerce(Construct *n, StaticTypeRef t);
+    FuncInfo *hint_func = nullptr;   /* annotate_hints: the enclosing func */
     /* literals whose widening an enclosing literal stamped (#75) */
     std::unordered_set<const Construct *> lit_coerce_by_parent;
     void stamp_untyped_calls(Construct *n);   /* #51: -nti's call hints */
@@ -2000,6 +2001,27 @@ void Inferencer::infer_one(Block *rootBlock)
          * rule wants. Skip a param (bound, not decl_type-coerced) and a pinned
          * REPL global.
          */
+        /*
+         * #75 follow-up: a plain `var` whose type the join WIDENED past one
+         * of its contributions (`var x = fi; ... x = 2.5;` is a float) must
+         * store that contribution widened, or the slot holds an int its
+         * float type denies - the tree-walker printed `1` where the VM,
+         * whose typed stores convert, printed `1.000000`. Same stamp as the
+         * dyn coercion below: the store's coerce_to_decl_type widens. Only
+         * where a narrower kind actually arrived (arg_kinds), so a var
+         * whose every store already has its type keeps no decl_type.
+         */
+        if (!s->is_param && !s->pinned && !s->dyn_decl && s->decl_id &&
+                s->decl_id->decl_type == DeclType::none &&
+                s->ann == DeclType::none) {
+            const StaticTypeRef ty = static_type_resolve(s->type);
+            if (ty->kind == StaticTypeKind::Float
+                && (s->arg_kinds & (ARGK_INT | ARGK_BOOL)))
+                s->decl_id->decl_type = DeclType::f;
+            else if (ty->kind == StaticTypeKind::Int
+                     && (s->arg_kinds & ARGK_BOOL))
+                s->decl_id->decl_type = DeclType::i;
+        }
         if (s->coerces_dyn && !s->is_param && !s->pinned && s->decl_id &&
                 s->decl_id->decl_type == DeclType::none) {
             const StaticTypeRef ty = static_type_resolve(s->type);
@@ -2620,6 +2642,26 @@ void Inferencer::stamp_untyped_calls(Construct *n)
     for_each_child(n, [&](Construct *c) { stamp_untyped_calls(c); });
 }
 
+/* The widening a value of static type `val` needs to be stored where the
+ * static type is `target` (#75 follow-up): f for an int or bool into a
+ * float, i for a bool into an int, else none. Opt-ness is ignored on both
+ * sides - every widening passes `none` through. */
+static DeclType numeric_widen(StaticTypeRef target, StaticTypeRef val)
+{
+    if (!target || !val)
+        return DeclType::none;
+    target = static_type_resolve(target);
+    val = static_type_resolve(val);
+    if (target->kind == StaticTypeKind::Float
+        && (val->kind == StaticTypeKind::Int
+            || val->kind == StaticTypeKind::Bool))
+        return DeclType::f;
+    if (target->kind == StaticTypeKind::Int
+        && val->kind == StaticTypeKind::Bool)
+        return DeclType::i;
+    return DeclType::none;
+}
+
 /* Stamp a container literal's numeric widening from the type it has IN
  * CONTEXT, and push that type down into the literals nested directly in
  * it: `[[1, 2.5], [3, 4]]` is array<array<float>>, so the inner `[3, 4]`
@@ -2654,6 +2696,14 @@ void Inferencer::stamp_literal_coerce(Construct *n, StaticTypeRef t)
     } else {
         auto *ld = static_cast<LiteralDict *>(n);
         ld->val_coerce = dt;
+        const StaticTypeRef kt =
+            t && t->kind == StaticTypeKind::Dict
+                ? static_type_resolve(t->key) : nullptr;
+        ld->key_coerce =
+            !kt ? DeclType::none
+            : kt->kind == StaticTypeKind::Float ? DeclType::f
+            : kt->kind == StaticTypeKind::Int ? DeclType::i
+            : DeclType::none;
         for (auto &kv : ld->elems)
             nested(kv->value.get());
     }
@@ -2687,9 +2737,44 @@ void Inferencer::annotate_hints(Construct *n)
     /* Mark `a[i]` whose base is statically an ARRAY, so the VM only compiles a
      * native element load/store for arrays (a dict subscript stays a fallback -
      * see Subscript::base_array). */
+    if (ctag(n) == ConstructType::func_decl) {
+        /* a ReturnStmt below reads its function's return type */
+        FuncInfo *prev = hint_func;
+        auto it = func_of_decl.find(static_cast<FuncDeclStmt *>(n));
+        hint_func = it != func_of_decl.end() ? it->second : nullptr;
+        for_each_child(n, [&](Construct *c) { annotate_hints(c); });
+        hint_func = prev;
+        return;
+    }
+    if (ctag(n) == ConstructType::ret) {
+        auto *r = static_cast<ReturnStmt *>(n);
+        if (hint_func && r->elem && !hint_func->is_template)
+            r->ret_coerce = numeric_widen(hint_func->ret,
+                                          type_of(r->elem.get()));
+    }
+    if (ctag(n) == ConstructType::expr14) {
+        auto *e = static_cast<Expr14 *>(n);
+        const Construct *lv = e->lvalue.get();
+        if (e->op == Op::assign && lv
+            && (ctag(lv) == ConstructType::subscript
+                || ctag(lv) == ConstructType::member)) {
+            const Construct *base =
+                ctag(lv) == ConstructType::subscript
+                    ? static_cast<const Subscript *>(lv)->what.get()
+                    : static_cast<const MemberExpr *>(lv)->what.get();
+            StaticTypeRef bt = static_type_resolve(
+                type_of(const_cast<Construct *>(base)));
+            if (bt->kind == StaticTypeKind::Dict)
+                e->rv_coerce = numeric_widen(bt->val,
+                                             type_of(e->rvalue.get()));
+        }
+    }
     if (ctag(n) == ConstructType::subscript) {
         auto *sub = static_cast<Subscript *>(n);
         StaticTypeRef bt = static_type_resolve(type_of(sub->what.get()));
+        if (bt->kind == StaticTypeKind::Dict)
+            sub->key_coerce = numeric_widen(bt->key,
+                                            type_of(sub->index.get()));
         sub->base_array = bt->kind == StaticTypeKind::Array;
         sub->base_dict = bt->kind == StaticTypeKind::Dict;
         sub->base_str = bt->kind == StaticTypeKind::Str && !bt->opt;
@@ -4476,8 +4561,9 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
     if (!s || s->func)
         return;
 
-    if (s->is_param) {
-        /* which scalar kinds reach the param (see TypeSym::arg_kinds) */
+    {
+        /* which scalar kinds reach the symbol (see TypeSym::arg_kinds): a
+         * param's decides its bind coercion, a local's its store one */
         const StaticTypeRef k = static_type_resolve(t);
         if (k && k->kind == StaticTypeKind::Bool)
             s->round_arg_kinds |= ARGK_BOOL;

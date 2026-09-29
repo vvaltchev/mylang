@@ -2927,6 +2927,14 @@ an `array<array<float>>`, the second row holds `3.0` and `4.0`. A constant
 array that is merely *named* inside another keeps its own type
 (`const A = [3, 4]; const N = [[1, 2.5], A];` leaves `A` an `array<int>`).
 
+The rule holds for every other place a value lands where the static type is
+wider: a function whose return type is `float` returns its `int` paths as
+floats (`func g(b) { if (b) return 1; return 2.5; }` returns `1.0`); a
+`dict<float, _>` stores an int key as a float key and a `dict<_, float>`
+element or member (`d[k] = 1`, `d.k = 1`) holds `1.0`; a plain `var` whose
+type joins to `float` (`var x = 1; ... x = 2.5;`) holds `1.0` from the start;
+and a `float` global keeps a float when a function assigns it an int.
+
 Because the representation is fixed, the *only* way to ask a flat
 (statically-typed) array to hold a value of a different type is to launder it
 through a `dyn` alias and mutate that (e.g. `var dyn d = int_array;

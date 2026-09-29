@@ -391,6 +391,18 @@ parse time, before any stamp exists, so the const evaluator widens it by the
 join of its own values instead (`const_values_widen`, eval.cpp: a numeric
 SHAPE through nested arrays and dict values, rebuilding - never editing - a
 container that changes, since it may be a named shared constant).
+**The same widening at a STORE or a RETURN (#75 follow-up)** rides on the
+node that survives the optimizers, not on the value expression (AutoConst may
+replace that with a fresh literal): `ReturnStmt::ret_coerce` (the function's
+return type), `Expr14::rv_coerce` (a dict element / member store's value
+type), `Subscript::key_coerce` (a dict key) and `LiteralDict::key_coerce`.
+Codegen applies them through `compile_rvalue` / `compile_key` /
+`compile_key_to_run_slot` - every store path compiles its value and keys
+through those - and `try_native_return`, each a `CoerceNumV` into a FRESH temp
+(`emit_widen`: the value may sit in a named local's own slot). A plain `var`
+joined to a wider numeric type gets a `decl_type` stamp instead (the
+coerces_dyn precedent), and the resolver now carries a global's `decl_type`
+to its uses inside functions too.
 A **CLOSURE** `func [caps] (params) {..}` in expression position (a
 returned / var-bound / call-arg lambda, `id == null`) builds via
 **`MakeClosureV`**: `make_intrusive<FuncObject>(def, &ctx)` snapshots the

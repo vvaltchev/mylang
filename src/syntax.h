@@ -675,6 +675,7 @@ public:
     /* the dict's static VALUE type's widening, as LiteralArray's
      * elem_coerce (keys are left as written) */
     DeclType val_coerce = DeclType::none;
+    DeclType key_coerce = DeclType::none;   /* the same, for the keys */
 
     LiteralDict()
         : MultiElemConstruct<LiteralDictKVPair>(
@@ -686,6 +687,7 @@ public:
         copy_base_fields(*c);
         clone_elems_into(*c);
         c->val_coerce = val_coerce;
+        c->key_coerce = key_coerce;
         return c;
     }
 };
@@ -1436,6 +1438,10 @@ public:
      */
     bool unpack_rv_array = false;
     TypeHint unpack_rv_th = TypeHint::none;
+    /* A plain store into a DICT element or dict member whose static value
+     * type is numeric and wider than the rvalue's (#75 follow-up): the
+     * rvalue widens to it (i/f) before the store, in every engine. */
+    DeclType rv_coerce = DeclType::none;
 
     Expr14()
         : Construct("Expr14", false, ConstructType::expr14)
@@ -1452,6 +1458,7 @@ public:
         c->op = op;
         c->unpack_rv_array = unpack_rv_array;
         c->unpack_rv_th = unpack_rv_th;
+        c->rv_coerce = rv_coerce;
         return c;
     }
 };
@@ -1570,6 +1577,10 @@ class ReturnStmt final: public Construct {
 
 public:
     unique_ptr<Construct> elem;
+    /* The enclosing function's static return type is numeric and wider
+     * than this value's (`if (b) return 1; return 2.5;`): the value widens
+     * to it (i/f) before it is returned, in every engine (#75 follow-up). */
+    DeclType ret_coerce = DeclType::none;
 
     ReturnStmt(): Construct("ReturnStmt", false, ConstructType::ret) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1579,6 +1590,7 @@ public:
         auto c = make_unique<ReturnStmt>();
         copy_base_fields(*c);
         c->elem = clone_as(elem);
+        c->ret_coerce = ret_coerce;
         return c;
     }
 };
@@ -1787,6 +1799,10 @@ public:
      * so the JIT's hoist pick guards the bools kind - ADVISORY (a wrong
      * hint fails a runtime guard and the loop runs its cold twin). */
     bool elem_bool = false;
+    /* A DICT subscript whose static key type is numeric and wider than the
+     * index's: the key widens to it (i/f) - so an int stored under a
+     * dict<float, _> is a float key, as its type says (#75 follow-up). */
+    DeclType key_coerce = DeclType::none;
 
     Subscript() : Construct("Subscript", false, ConstructType::subscript) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1803,6 +1819,7 @@ public:
         c->base_str = base_str;
         c->base_dict = base_dict;
         c->elem_bool = elem_bool;
+        c->key_coerce = key_coerce;
         return c;
     }
 };
