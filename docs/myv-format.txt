@@ -2,8 +2,15 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 25.  This document describes the on-disk image exhaustively:
+Format version 26.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v26 changes no encoding: one opcode was APPENDED - UnpackLenCheck, the
+strict length test of a destructure `a, b = arr` whose rvalue is a proven
+array - so a v25 binary would meet an opcode it does not know; see the
+note on version 10 below.  Its `target2` is a frame SLOT (the array);
+its `target` is a COUNT, not an index into anything, and the verifier
+refuses only a negative one.)
 
 (v25 changes no encoding: MakeClosureV's `a` gains a meaning.  At its
 default (-1, i.e. absent) the op is as before.  Set, it is a DUAL - lo =

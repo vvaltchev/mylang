@@ -162,6 +162,18 @@ so it covers int/float/str/dyn sub-arrays uniformly). Handles the non-indexed
 `foreach (a, _, c in pairs)` AND the indexed `foreach (i, _, v in indexed
 rows)`. A non-local target still falls back. `20_foreach_unpack` (flat) 0.80x,
 `75_indexed_unpack` (indexed str) 0.71x vs the tree-walker.
+**⛔ SINCE 2026-09-28 A GENERAL-ROW UNPACK IS LOWERED, AND
+`UnpackElemValue` IS NO LONGER EMITTED** (the VM keeps it for an image; no
+codegen path produces it). The op bound every element through a C++ helper -
+~180 Ir per row on 75_indexed_unpack - so a general row (`unpack_elem_value`,
+indexed or not, with or without `_`) is now
+`row = c[i]` (LoadElemValue - the #53 OOB of a shrunk container) +
+**`UnpackLenCheck row, N`** (the foreach's strict length error, `b` bit 0)
++ one **LoadElemValue per target** (`_` reads nothing), which take
+LoadElemValue's inline tier - its general arm and a FLAT-STRS arm added for
+this (split() rows). All carets are the container's. A FLAT int/float row
+keeps UnpackElemInt/Float/Targets: lowering it measured -2% on
+20_foreach_unpack.
 **Dict `foreach (k, v in d)` / `foreach (k in d)`** is native via a **LIVE
 dict iterator** — a dict has no O(1) index, so it is NOT the counted-loop
 but a while-shaped loop over two ops: **`DictIterInit`** pins the dict
@@ -763,7 +775,21 @@ in the loc side table records the enclosing `Expr14`'s span — matching the
 tree-walker, whose loc-less IdList lvalue makes the error inherit the Expr14
 loc via `Construct::eval`. So the WHOLE IdList branch is native (no residual
 `EvalStmt`); a typed/const target still falls back. **Effect: `73_multi_unpack`
-(the array-value form) 0.30x vs the tree-walker.** A
+(the array-value form) 0.30x vs the tree-walker.** **⛔ SINCE 2026-09-28 A
+PROVEN-ARRAY rvalue is LOWERED instead** (`Expr14::unpack_rv_array`, stamped
+by the inferencer for a non-opt Array; `emit_lowered_unpack`, shared with the
+foreach): **`UnpackLenCheck f = arr, N`** raises the strict error when the
+length differs and, for an int/float element type, writes `f` = "the storage
+IS that flat kind"; on `f == 1` one LoadElemInt/Float per target, else one
+LoadElemValue per target - the ACTUAL element, because an array<float> built
+in an unhinted position (an append argument) can hold an int, and a typed
+read of it raises where MultiUnpackV bound the int. Other elements take
+LoadElemValue directly. Unlike MultiUnpackV (a pool-target op - a BARRIER to
+visit_use_def, so compute_ref_slots listed EVERY slot of the chunk as
+reference-carrying) every op here has an exact row. MultiUnpackV stays for a
+`dyn` rvalue, an OPT array (a runtime none SPREADS), a compound
+`a, b += arr`, a coercing typed target, or a target that is the rvalue's own
+slot. 73_multi_unpack: 7.19x -> 2.21x of C++. A
 **`return <expr>;`** likewise lowers to a
 `ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
 sets flow={ret,value} and stops the chunk. A **ternary VALUE** (`cond ? a : b`)

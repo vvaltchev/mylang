@@ -2855,6 +2855,29 @@ void Inferencer::annotate_hints(Construct *n)
         }
     }
 
+    /* A multi-assign destructure `a, b, c = <rvalue>` whose rvalue is
+     * PROVEN a non-opt array: the codegen then lowers the strict unpack
+     * into a length test + one element read per target (a MultiUnpackV
+     * only on a length mismatch, which raises the strict error). The
+     * element kind picks the read: int/float read unboxed, anything else
+     * (bool included - a th==i read would lose the bool) boxed. */
+    if (ctag(n) == ConstructType::expr14) {
+        auto *e14 = static_cast<Expr14 *>(n);
+        if (ctag(e14->lvalue.get()) == ConstructType::idlist) {
+            StaticTypeRef r = static_type_resolve(
+                type_of(e14->rvalue.get()));
+            if (!r->opt && r->kind == StaticTypeKind::Array) {
+                StaticTypeRef el = static_type_resolve(r->elem);
+                e14->unpack_rv_array = true;
+                e14->unpack_rv_th =
+                    el->opt ? TypeHint::none
+                    : el->kind == StaticTypeKind::Int ? TypeHint::i
+                    : el->kind == StaticTypeKind::Float ? TypeHint::f
+                    : TypeHint::none;
+            }
+        }
+    }
+
     for_each_child(n, [&](Construct *c) { annotate_hints(c); });
 }
 

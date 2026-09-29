@@ -204,6 +204,7 @@ unsigned long g_jit_fread = 0;         /* C4a-i: read-elided fragment entries */
 unsigned long g_jit_store_prep = 0;    /* #92: prep (COW-clone) slow calls */
 unsigned long g_jit_elem2_fast = 0;    /* #93: inline nested-READ runs */
 unsigned long g_jit_strlen_fast = 0;   /* G5: inline len(str) runs */
+unsigned long g_jit_arrlen_fast = 0;   /* inline flat len(arr) runs */
 /* #95: the INLINE ord(s[i]) - bumped by the EMITTED arm only, so the
  * helper's own ML_JIT_OP_RAN cannot satisfy it. */
 unsigned long g_jit_ord_inline = 0;
@@ -755,6 +756,12 @@ struct JitLayout {
                            * _M_start is at +0, _M_finish at +8) */
     unsigned char kind_ints, kind_floats, kind_bools;  /* Storage values */
     unsigned char kind_general;   /* #93: the nested read's OUTER array */
+    /* the boxed-element tier's FLAT-STRS arm: a split() result keeps
+     * SharedStr handles in its vector - each one IS a str EvalValue's
+     * payload (24 bytes, the StrObj pointer at str_obj_off) */
+    unsigned char kind_strs;
+    const void *t_str;            /* the str Type singleton */
+    bool str_elem_ok;             /* the layout the arm assumes, verified */
     /* #92 the inline STORE tier (see SharedArrayObj::JitProbe) */
     int ro_off;        /* SharedObject: &readonly   - shobj */
     int hashv_off;     /* SharedObject: &hash_valid - shobj */
@@ -1054,6 +1061,8 @@ static const JitLayout &jit_layout()
             SharedArrayObj::Storage::bools);
         l.kind_general = static_cast<unsigned char>(
             SharedArrayObj::Storage::general);
+        l.kind_strs = static_cast<unsigned char>(
+            SharedArrayObj::Storage::strs);
         l.ro_off = static_cast<int>(
             static_cast<const char *>(jp.readonly) - so);
         l.hashv_off = static_cast<int>(
@@ -1113,6 +1122,12 @@ static const JitLayout &jit_layout()
             ML_CHECK_MSG(l.elemv_inline_ok,
                          "a RefCounted base moved off offset 0 - the "
                          "boxed-element inline tier is disabled");
+            /* the FLAT-STRS arm copies a vector's SharedStr as the 24
+             * payload bytes of a str value, the StrObj pointer at +0 */
+            LValue sprobe(EvalValue(SharedStr(std::string("x"))), false);
+            l.t_str = sprobe.get().get_type();
+            l.str_elem_ok = l.elemv_inline_ok && l.str_obj_off == 0
+                            && sizeof(SharedStr) == 24;
         }
         /* #55 STEP 2.1: native-call member offsets (vm.cpp probes) */
         l.addr_ctx = jit_addr_current_ctx();
@@ -7145,6 +7160,10 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::ArrEpochMark:
     case OpCode::ArrEpochCheck:
         return true;
+    /* the destructure's strict length test: an inline compare whose cold
+     * tier conveys the TypeErrorEx */
+    case OpCode::UnpackLenCheck:
+        return true;
     /* model-flip (nativize-ops): typed dict scalar read d.k / d[k] via
      * jit_dict_load. A missing key CAN throw (catch -> g_vm_jit_exc, exit_pc),
      * so it is NOT op_fully_native. */
@@ -7933,6 +7952,7 @@ static bool jit_op_w4_safe(const Chunk &ck, const Instr &in)
     case OpCode::DictLoadInt: case OpCode::DictLoadFloat:
     case OpCode::ArrLen: case OpCode::StrLen: case OpCode::LoadStrChar:
     case OpCode::ArrEpochMark: case OpCode::ArrEpochCheck:
+    case OpCode::UnpackLenCheck:
     case OpCode::StructFieldAddInt:
     /* the boxed family: slot operands through the pool entry */
     case OpCode::BinOpV: case OpCode::CmpV: case OpCode::LogV:
@@ -13812,6 +13832,7 @@ static bool jit_hoist_op_ok(const Instr &in)
     case OpCode::ArrLen: case OpCode::StrLen: case OpCode::OrdCharV:
     case OpCode::ArrEpochMark:   /* reads the epoch; writes an int temp */
     case OpCode::ArrEpochCheck:  /* reads only; a raise conveys out */
+    case OpCode::UnpackLenCheck: /* reads only; a raise conveys out */
     case OpCode::ReturnV:
     /*
      * The PLAIN store family is read-only FOR A HOISTED BASE'S STORAGE,
@@ -14358,6 +14379,7 @@ void jit_stats_report()
         { "store_prep",       &g_jit_store_prep },
         { "store2_fast",      &g_jit_store2_fast },
         { "elem2_fast",       &g_jit_elem2_fast },
+        { "arrlen_fast",      &g_jit_arrlen_fast },
         { "elem_slice_fast",  &g_jit_elem_slice_fast },
         { "hoist",            &g_jit_hoist },
         { "cold_copy",        &g_jit_cold_copy },
@@ -15888,6 +15910,13 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
         /* the inline compare reads BOTH from memory (m is a loop temp
          * no other op touches - nothing to gain by pinning it) */
         v.bad(in.target2); v.bad(in.a_slot());
+        break;
+    case OpCode::UnpackLenCheck:
+        /* reads the array (a reference) from memory; the flag, if any,
+         * is written from memory by the cold tier */
+        v.bad(in.target2);
+        if (in.target >= 0)
+            v.bad(in.target);
         break;
     case OpCode::DictLoadInt:
     case OpCode::DictLoadFloat:
@@ -22744,17 +22773,76 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         return true;
 
-    case OpCode::ArrLen:
-        /* n = size(frame[base]) via jit_arr_len (rdi=slots from rbx,
-         * rsi=dst=target,
-         * rdx=base=target2). Base is a proven flat array -> never throws. */
+    case OpCode::ArrLen: {
+        /*
+         * INLINE for a non-slice FLAT scalar array (ints/floats: the
+         * vector's byte length / 8; bools: the byte length itself) -
+         * the helper cost ~63 Ir per call (43 in jit_arr_len, 20 in the
+         * boxed put of the result) for what is a subtract and a shift.
+         * It is per-iteration work wherever a destructure is lowered to
+         * a length test (73_multi_unpack). Every other array - a slice
+         * (its length is the view's, not the vector's), general,
+         * strs, structs - DECLINES to the helper, as does a non-array
+         * base (only a corrupt image; the helper writes `none`).
+         */
+        DeclineJumps al_slows;
+        size_t al_done = SIZE_MAX;
+        const int al1 = e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                        /*transient=*/true);
+        const int al2 = al1 >= 0
+                        ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                          /*transient=*/true) : -1;
+        if (al1 >= 0 && al2 < 0)
+            e.free_scratch(static_cast<uint8_t>(al1));
+        if (al1 >= 0 && al2 >= 0) {
+            const JitLayout &L = jit_layout();
+            const SlotAddr b = slot_addr(in.target2);
+            const uint8_t s1 = static_cast<uint8_t>(al1);
+            const uint8_t s2 = static_cast<uint8_t>(al2);
+            e.bump_op(OpCode::ArrLen);                /* execution proof */
+            e.load(s1, b.type);
+            e.cmp_reg_tag_via(s1, L.t_arr, s2);
+            decline_jump(e, al_slows, 0x75, JD_arrlen_base_not_arr);
+            e.cmp_byte_slot(b.payload + L.slice_off, 0);
+            decline_jump(e, al_slows, 0x75, JD_arrlen_base_slice);
+            e.load(s1, b.payload);                        /* shobj */
+            e.load_base(s2, s1, L.data_off + 8);          /* end */
+            e.cmp_byte_base(s1, L.kind_off, L.kind_bools);
+            const size_t j_b = e.j8(0x74);                /* bytes */
+            e.cmp_byte_base(s1, L.kind_off, L.kind_ints);
+            const size_t j_i = e.j8(0x74);
+            e.cmp_byte_base(s1, L.kind_off, L.kind_floats);
+            decline_jump(e, al_slows, 0x75, JD_arrlen_base_kind);
+            e.patch8(j_i, e.pos());
+            e.load_base(s1, s1, L.data_off);              /* data */
+            e.sub_rr(s2, s1);
+            e.sar_rr_imm8(s2, 3);                         /* 8-byte elems */
+            const size_t j_st = e.j8(0xEB);
+            e.patch8(j_b, e.pos());
+            e.load_base(s1, s1, L.data_off);
+            e.sub_rr(s2, s1);                             /* 1-byte elems */
+            e.patch8(j_st, e.pos());
+#ifdef TESTS
+            e.bump_counter(&g_jit_arrlen_fast);
+#endif
+            store_dst(e, ck, s2, in.target, pc);
+            al_done = e.j32(0xEB);
+            decline_land(e, al_slows);
+            e.free_scratch(s2);
+            e.free_scratch(s1);
+        }
+        /* the slow tier: n = size(frame[base]) via jit_arr_len (rdi=slots
+         * from rbx, rsi=dst=target, rdx=base=target2); never throws */
         emit_call_prologue(e);
         e.slots_to_arg0();          /* rdi = the slot window */
         e.mov_imm(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.mov_imm(RDX, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
         e.call_direct(reinterpret_cast<const void *>(jit_arr_len));
         emit_call_epilogue(e);
+        if (al_done != SIZE_MAX)
+            e.patch32_here(al_done);
         return true;
+    }
 
     case OpCode::ArrEpochMark:
         /* #53 option 1: m = epoch(c) via jit_arr_epoch_mark (rdi=slots,
@@ -22829,6 +22917,111 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.patch8(j_none, e.pos());
         e.patch32_here(j_ok);
         e.patch32_here(j_slice);
+        return true;
+    }
+
+    case OpCode::UnpackLenCheck: {
+        /*
+         * The destructure's strict length test, INLINE for a non-slice
+         * array whose storage keeps its elements in the vector: the
+         * vector's BYTE length against N times the element size - no
+         * divide, the element size being 8 (ints/floats), 1 (bools) or
+         * sizeof(LValue) (general). The flat-kind flag (when the op has
+         * one) is a constant PER ARM: the arm IS the storage kind. A
+         * slice, strs, structs, a non-array (an image) and a MISMATCH go
+         * to the cold helper, which decides, raises or writes the flag:
+         *
+         *     <kind arm> ; cmp end - data, N*size ; jne cold
+         *     [flag = arm == proven kind] ; jmp done
+         *   cold:
+         *     call jit_unpack_len_check ; test eax ; jz done
+         *     <exc-stamp the caret> ; exit
+         */
+        const int_type n = in.a_is_lit() ? in.a_lit() : 0;
+        const int_type fl = in.b_is_lit() ? in.b_lit() : 0;
+        const bool fits = n >= 0
+            && n <= static_cast<int_type>(INT32_MAX / sizeof(LValue))
+            && sizeof(LValue) >= sizeof(SharedStr);
+        DeclineJumps slows;
+        std::vector<size_t> oks;
+        const int u1 = fits ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                              /*transient=*/true) : -1;
+        const int u2 = u1 >= 0
+                       ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                         /*transient=*/true) : -1;
+        if (u1 >= 0 && u2 < 0)
+            e.free_scratch(static_cast<uint8_t>(u1));
+        if (u1 >= 0 && u2 >= 0) {
+            const JitLayout &L = jit_layout();
+            const SlotAddr b = slot_addr(in.target2);
+            const uint8_t s1 = static_cast<uint8_t>(u1);
+            const uint8_t s2 = static_cast<uint8_t>(u2);
+            e.bump_op(OpCode::UnpackLenCheck);        /* execution proof */
+            e.load(s1, b.type);
+            e.cmp_reg_tag_via(s1, L.t_arr, s2);
+            decline_jump(e, slows, 0x75, JD_unpacklen_base_not_arr);
+            e.cmp_byte_slot(b.payload + L.slice_off, 0);
+            decline_jump(e, slows, 0x75, JD_unpacklen_base_slice);
+            e.load(s1, b.payload);                    /* shobj */
+            e.load_base(s2, s1, L.data_off + 8);      /* end */
+            /* one arm per element size: data -> s1, bytes -> s2; `flat`
+             * = the flag this storage kind answers */
+            const auto arm = [&](int_type elem_size, int flat) {
+                e.load_base(s1, s1, L.data_off);
+                e.sub_rr(s2, s1);
+                e.cmp_reg_imm(s2, static_cast<int32_t>(n * elem_size));
+                decline_jump(e, slows, 0x75, JD_unpacklen_len);
+                if (in.target >= 0) {
+                    e.mov_imm(s2, static_cast<uint64_t>(flat));
+                    store_dst(e, ck, s2, in.target, pc);
+                }
+                oks.push_back(e.j32(0xEB));           /* -> done */
+            };
+            e.cmp_byte_base(s1, L.kind_off, L.kind_general);
+            const size_t j_g = e.j32(0x74);
+            size_t j_s = SIZE_MAX;
+            if (L.str_elem_ok) {
+                e.cmp_byte_base(s1, L.kind_off, L.kind_strs);
+                j_s = e.j32(0x74);
+            }
+            e.cmp_byte_base(s1, L.kind_off, L.kind_bools);
+            const size_t j_b = e.j32(0x74);
+            e.cmp_byte_base(s1, L.kind_off, L.kind_ints);
+            const size_t j_i = e.j32(0x74);
+            e.cmp_byte_base(s1, L.kind_off, L.kind_floats);
+            decline_jump(e, slows, 0x75, JD_unpacklen_base_kind);
+            arm(8, (fl & 4) ? 1 : 0);                 /* floats */
+            e.patch32_here(j_i);
+            arm(8, (fl & 2) ? 1 : 0);                 /* ints */
+            e.patch32_here(j_b);
+            arm(1, 0);                                /* bools */
+            if (j_s != SIZE_MAX) {
+                e.patch32_here(j_s);
+                arm(static_cast<int_type>(sizeof(SharedStr)), 0); /* strs */
+            }
+            e.patch32_here(j_g);
+            arm(static_cast<int_type>(sizeof(LValue)), 0);  /* general */
+            decline_land(e, slows);
+            e.free_scratch(s2);
+            e.free_scratch(s1);
+        }
+        emit_call_prologue(e);
+        e.slots_to_arg0();
+        e.mov_imm(RSI,
+                  static_cast<uint64_t>(static_cast<int_type>(in.target2)));
+        e.mov_imm(RDX, static_cast<uint64_t>(n));
+        e.mov_imm(RCX, static_cast<uint64_t>(fl));
+        e.mov_imm(R8, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target)));
+        e.call_direct(reinterpret_cast<const void *>(jit_unpack_len_check));
+        emit_call_epilogue(e);
+        e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
+        const size_t j_none = e.j8(0x74);    /* jz: no raise */
+        emit_exc_stamp(e, ck, old_pc);       /* cold: the caret */
+        e.exit_pc(pc);
+        e.patch8(j_none, e.pos());
+        for (size_t j : oks)
+            e.patch32_here(j);
         return true;
     }
 
@@ -23945,6 +24138,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          */
         DeclineJumps lev_slows;
         size_t lev_done = SIZE_MAX;
+        size_t lev_done2 = SIZE_MAX;       /* the flat-strs arm's join */
         const int lev_s1 = in.op == OpCode::LoadElemValue
                                && in.target != in.target2
                                && jit_layout().elemv_inline_ok
@@ -23971,6 +24165,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.cmp_byte_slot(base.payload + L.slice_off, 0);
             decline_ne(JD_elemv_base_slice);
             e.load(s1, base.payload);                     /* shobj */
+            size_t j_strs = SIZE_MAX;
+            if (L.str_elem_ok) {
+                e.cmp_byte_base(s1, L.kind_off, L.kind_strs);
+                j_strs = e.j32(0x74);               /* -> the strs arm */
+            }
             e.cmp_byte_base(s1, L.kind_off, L.kind_general);
             decline_ne(JD_elemv_base_kind);
             load_operand(e, acc.r, in.a_is_lit(), in.a_lit(),
@@ -24009,7 +24208,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.inc_dword_base(s2);                         /* RETAIN */
             e.patch8(j_triv, e.pos());
             /* RELEASE-OLD dst (runtime type check; compile-skipped when
-             * the slot can never hold a reference) */
+             * the slot can never hold a reference) - shared by the two
+             * arms: acc = &element and s1 are kept across its cold call */
+            const auto release_old = [&]() {
             size_t j_st = SIZE_MAX, j_cold = SIZE_MAX, j_st2 = SIZE_MAX;
             if (std::binary_search(ck.ref_slots.begin(),
                                    ck.ref_slots.end(),
@@ -24051,6 +24252,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.patch32_here(j_st);
             if (j_st2 != SIZE_MAX)
                 e.patch32_here(j_st2);
+            };
+            release_old();
             /* the copy: 24 payload bytes + the Type* */
             e.load_base(s2, acc.r, static_cast<int32_t>(L.off_payload));
             e.store(s2, dst.payload);
@@ -24065,6 +24268,45 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.bump_counter(&g_jit_elemv_fast);
 #endif
             lev_done = e.j32(0xEB);                       /* -> done */
+            if (j_strs != SIZE_MAX) {
+                /*
+                 * THE FLAT-STRS ARM (a split() result - and since the
+                 * general-row foreach unpack was lowered to these reads,
+                 * every string row it destructures): the element IS a
+                 * str value's payload, so retain its StrObj, release
+                 * dst's old value, copy the 24 bytes and store the
+                 * t_str tag. A null StrObj (a default or moved-from
+                 * handle) declines to the helper.
+                 */
+                e.patch32_here(j_strs);
+                load_operand(e, acc.r, in.a_is_lit(), in.a_lit(),
+                             in.a_slot());                /* the index */
+                e.imul_rr_imm8(acc.r, acc.r,
+                               static_cast<uint8_t>(sizeof(SharedStr)));
+                decline_jump(e, lev_slows, 0x70, JD_elemv_scale_wrap);
+                e.load_base(s2, s1, L.data_off + 8);      /* end */
+                e.load_base(s1, s1, L.data_off);          /* data */
+                e.sub_rr(s2, s1);
+                e.cmp_rr(acc.r, s2);
+                decline_jump(e, lev_slows, 0x73, JD_elemv_bounds);
+                e.add_rr(acc.r, s1);                      /* &SharedStr */
+                e.load_base(s2, acc.r, L.str_obj_off);    /* StrObj * */
+                e.test_rr(s2, s2);
+                decline_jump(e, lev_slows, 0x74, JD_elemv_str_null);
+                e.inc_dword_base(s2);                     /* RETAIN */
+                release_old();
+                e.load_base(s2, acc.r, 0);
+                e.store(s2, dst.payload);
+                e.load_base(s2, acc.r, 8);
+                e.store(s2, dst.payload + 8);
+                e.load_base(s2, acc.r, 16);
+                e.store(s2, dst.payload + 16);
+                e.store_type_tag_via(dst.type, L.t_str, s1);
+#ifdef TESTS
+                e.bump_counter(&g_jit_elemv_fast);
+#endif
+                lev_done2 = e.j32(0xEB);
+            }
             decline_land(e, lev_slows);
             e.free_scratch(s2);
             e.free_scratch(s1);
@@ -24171,6 +24413,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
         }
+        if (lev_done2 != SIZE_MAX)
+            e.patch32_here(lev_done2);
         if (lev_done != SIZE_MAX)
             e.patch32_here(lev_done);         /* #97: the fast tier joins
                                                * past the helper + status */
@@ -26781,6 +27025,10 @@ static bool op_fully_native(const Instr &in)
      * OutOfBoundsEx through the status return with the exc-stamped
      * container caret - no bail, no re-run */
     case OpCode::ArrEpochCheck:
+        return true;
+    /* the destructure's length test: the same shape - its cold tier
+     * conveys the strict TypeErrorEx with the exc-stamped caret */
+    case OpCode::UnpackLenCheck:
         return true;
     /* LoadStructElemV (the whole-`p` foreach bind): never throws on
      * bytecode we compiled; on an IMAGE its helper conveys the corrupt-base

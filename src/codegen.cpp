@@ -2509,6 +2509,78 @@ struct Codegen {
      * STRICT destructure (array -> length-checked distribute; else spread).
      * Every target must be a real or `_` slot, resolved-local, non-const,
      * non-typed (or dyn) - a typed/const/map target falls back. */
+    /*
+     * THE LOWERED STRICT UNPACK of the proven array in `arr` into
+     * `targets` (-1 = a `_`, which reads nothing) - shared by the
+     * multi-assign and the foreach unpack:
+     *
+     *     UnpackLenCheck f = len(arr) == N, flat kind?  (raises)
+     *     if (f != 1) goto boxed;
+     *     t0 = arr[0] ... (LoadElemInt/Float)  goto done;
+     *   boxed:
+     *     t0 = arr[0] ... (LoadElemValue: the ACTUAL element)
+     *   done:
+     *
+     * An untyped element (th none) needs no flag: LoadElemValue alone.
+     * The typed reads are taken only when the storage IS the proven flat
+     * kind, because a mixed literal built in an unhinted position (an
+     * append argument) can put an int in an array<float> - a typed read
+     * of it raises, where the ops this replaces bound the int.
+     */
+    void emit_lowered_unpack(const Construct *node, int arr,
+                             const std::vector<int32_t> &targets,
+                             TypeHint th, bool foreach,
+                             std::vector<CgInstr> &ops)
+    {
+        const int n = static_cast<int>(targets.size());
+        const bool typed = th == TypeHint::i || th == TypeHint::f;
+        const int nn = add_ast_node(node);
+        const int flag = typed ? alloc_temp() : -1;
+        CgInstr ck;
+        ck.op = OpCode::UnpackLenCheck;
+        ck.node_idx = nn;
+        ck.target = flag;
+        ck.target2 = arr;
+        ck.set_a(int_lit(n));
+        ck.set_b(int_lit((foreach ? 1 : 0)
+                         | (th == TypeHint::i ? 2 : 0)
+                         | (th == TypeHint::f ? 4 : 0)));
+        ops.push_back(ck);
+        const auto loads = [&](OpCode op) {
+            for (int k = 0; k < n; k++) {
+                if (targets[static_cast<size_t>(k)] < 0)
+                    continue;
+                CgInstr ld;
+                ld.op = op;
+                ld.node_idx = nn;
+                ld.target = targets[static_cast<size_t>(k)];
+                ld.target2 = arr;
+                ld.set_a(int_lit(k));
+                ops.push_back(ld);
+            }
+        };
+        if (!typed) {
+            loads(OpCode::LoadElemValue);
+            return;
+        }
+        CgInstr br;
+        br.op = OpCode::JumpUnlessIntCmp;
+        br.aop = Op::eq;
+        br.set_a(slot_op(flag));
+        br.set_b(int_lit(1));
+        const size_t j_boxed = ops.size();
+        ops.push_back(br);
+        loads(th == TypeHint::i ? OpCode::LoadElemInt
+                                : OpCode::LoadElemFloat);
+        CgInstr j;
+        j.op = OpCode::Jump;
+        const size_t j_done = ops.size();
+        ops.push_back(j);
+        ops[j_boxed].target = static_cast<int>(ops.size());
+        loads(OpCode::LoadElemValue);
+        ops[j_done].target = static_cast<int>(ops.size());
+    }
+
     bool try_multi_unpack(const Expr14 *e, const IdList *il,
                           std::vector<CgInstr> &ops,
                           Op compound_op = Op::invalid)
@@ -2548,6 +2620,36 @@ struct Codegen {
         for (const auto &t : il->elems)
             targets.push_back(t->is_underscore()
                                   ? -1 : static_cast<int32_t>(t->sym.slot));
+
+        /*
+         * A PROVEN-array rvalue (Expr14::unpack_rv_array): the strict
+         * unpack is a length test plus one element read per target -
+         *
+         *     UnpackLenCheck r, N     (the strict length error)
+         *     t0 = r[0]; t1 = r[1]; ...
+         *
+         * so the reads take the element tiers (unboxed for int/float) and
+         * the targets can be pinned, where MultiUnpackV went through a
+         * helper that boxed every element - and the check has an exact
+         * use/def row, where MultiUnpackV is a barrier that made every
+         * slot of the chunk reference-carrying. The length is checked
+         * BEFORE any target is written, as the op does, with the op's
+         * message and caret. Only a plain, non-coercing unpack whose
+         * targets do not include the rvalue's own slot (writing it
+         * would change what the next read sees).
+         */
+        bool lower = e->unpack_rv_array && compound_op == Op::invalid
+                     && !any_coerce;
+        for (int32_t t : targets)
+            if (t == rslot)
+                lower = false;
+        if (lower) {
+            emit_lowered_unpack(e, rslot, targets, e->unpack_rv_th,
+                                /*foreach=*/false, ops);
+            next_temp = save_top;
+            return true;
+        }
+
         CgInstr in;
         in.op = OpCode::MultiUnpackV;
         /* The strict-length caret matches the tree-walker: its IdList lvalue
@@ -7741,9 +7843,11 @@ struct Codegen {
         z.target = i;
         z.set_a(int_lit(0));
         code.push_back(z);
+        /* the current ROW (the lowered general-row unpack reads it) */
+        const int row = flat ? -1 : alloc_temp();
 
         const int saved_base = temp_base;
-        temp_base = next_temp;   /* reserve c/n/(i) */
+        temp_base = next_temp;   /* reserve c/n/(i)/row */
 
         const size_t jt = emit_cmp(OpCode::JumpUnlessIntCmp,
                                    fe->container.get(), Op::lt,
@@ -7752,29 +7856,52 @@ struct Codegen {
         const int lbody = here();
         emit_foreach_epoch_check(fe, c, m);
 
-        /* Per element: read pairs[i] (a sub-array), strict-check its length ==
-         * nunpack, and write its scalars into unpack_base..+nunpack-1 - box-free
-         * raw for a flat int/float sub-array (UnpackElemInt/Float), else each
-         * element's boxed value (UnpackElemValue, for a general/dyn/str/mixed
-         * sub-array like shopping's [str, float]). */
-        CgInstr up;
-        if (consecutive) {
-            up.op = fe->unpack_elem_th == TypeHint::i ? OpCode::UnpackElemInt
-                  : fe->unpack_elem_th == TypeHint::f ? OpCode::UnpackElemFloat
-                                                      : OpCode::UnpackElemValue;
-            up.target = unpack_base;
+        /*
+         * Per element. A flat int/float row (unpack_elem_th) keeps the ONE
+         * op that binds the scalars (UnpackElemInt/Float, or the targets
+         * pool for a `_` / non-consecutive layout): lowering it measured
+         * -2% on 20_foreach_unpack. A GENERAL row (unpack_elem_value -
+         * strings, mixed, 75_indexed_unpack's shape) is LOWERED, because
+         * the op bound every element through a C++ helper (~180 Ir per
+         * row there) that the element tiers do inline:
+         *
+         *     row = c[i]                     LoadElemValue (the OOB of a
+         *                                    shrunk container, #53)
+         *     <emit_lowered_unpack of row>   (the foreach's strict error,
+         *                                    then one LoadElemValue each)
+         *
+         * All carets are the container's, as the op's were.
+         */
+        if (flat) {
+            CgInstr up;
+            if (consecutive) {
+                up.op = fe->unpack_elem_th == TypeHint::i
+                            ? OpCode::UnpackElemInt
+                            : OpCode::UnpackElemFloat;
+                up.target = unpack_base;
+            } else {
+                /* A `_` (or non-consecutive layout): per-position
+                 * targets pool, each element bound box-free. */
+                up.op = OpCode::UnpackElemTargets;
+                up.target = static_cast<int>(chunk.unpack_targets.size());
+                chunk.unpack_targets.push_back(targets);
+            }
+            up.node_idx = add_ast_node(fe->container.get());
+            up.target2 = c;
+            up.set_a(slot_op(i));
+            up.set_b(int_lit(nunpack));
+            code.push_back(up);
         } else {
-            /* A `_` (or non-consecutive layout): per-position targets pool,
-             * each element bound box-free (vm_arr_elem, flat or general). */
-            up.op = OpCode::UnpackElemTargets;
-            up.target = static_cast<int>(chunk.unpack_targets.size());
-            chunk.unpack_targets.push_back(targets);
+            CgInstr lr;
+            lr.op = OpCode::LoadElemValue;
+            lr.node_idx = add_ast_node(fe->container.get());
+            lr.target = row;
+            lr.target2 = c;
+            lr.set_a(slot_op(i));
+            code.push_back(lr);
+            emit_lowered_unpack(fe->container.get(), row, targets,
+                                TypeHint::none, /*foreach=*/true, code);
         }
-        up.node_idx = add_ast_node(fe->container.get());
-        up.target2 = c;
-        up.set_a(slot_op(i));
-        up.set_b(int_lit(nunpack));
-        code.push_back(up);
 
         push_loop();
         if (!compile_scalar_body(body_stmts(fe->body.get()))) {
@@ -8454,6 +8581,7 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         /* #53 option 1: the shift guard - node = the container */
         case OpCode::ArrEpochCheck:
         case OpCode::MultiUnpackV:   /* node = the Expr14 (unpack-length caret) */
+        case OpCode::UnpackLenCheck: /* node = the Expr14 (the same caret) */
         case OpCode::StoreElemInt:   /* node = the SUBSCRIPT (plain: OOB/type) or
                                       * the Expr14 (compound: its div0 caret) */
         case OpCode::StoreElemFloat:
@@ -8914,6 +9042,11 @@ static bool visit_use_def(const Instr &in, U u, D d)
         u(in.target2); d(in.target); return true;
     case OpCode::ArrEpochCheck:       /* reads c and m, writes nothing */
         u(in.target2); u(in.a_slot()); return true;
+    case OpCode::UnpackLenCheck:      /* reads the array; the flag, if any */
+        u(in.target2);
+        if (in.target >= 0)
+            d(in.target);
+        return true;
     case OpCode::OrdCharV:
         u(in.target2); opnd(in.a()); d(in.target); return true;
     case OpCode::SliceV:
@@ -10393,6 +10526,7 @@ bool op_writes_scalar(OpCode op)
     case OpCode::StructFieldAddInt: case OpCode::MathFnV:
     case OpCode::ArrLen: case OpCode::StrLen: case OpCode::OrdCharV:
     case OpCode::ArrEpochMark:        /* an int: the epoch, or -1 */
+    case OpCode::UnpackLenCheck:      /* its flag: an int 0/1 */
     case OpCode::LoadImmInt: case OpCode::LoadImmFloat:
     case OpCode::LoadElemInt: case OpCode::LoadElemFloat:
     case OpCode::LoadElem2Int: case OpCode::LoadElem2Float:
@@ -11305,6 +11439,20 @@ void ChunkVerifier::verify_one(const Instr &in)
          * (never through the lit flag), so a literal is refused */
         reg(in.target2);
         a_slot_only(in);
+        break;
+    case OpCode::UnpackLenCheck:
+        /* `target` is a COUNT, not a slot: bounded by sign only (the
+         * test compares it with a length; no index is formed from it) */
+        reg(in.target2);
+        reg_opt(in.target);
+        /* `a` = the count, `b` = the flags - both literals; a flat-kind
+         * bit needs the flag slot, and names ONE kind */
+        if (!in.a_is_lit() || in.a_lit() < 0)
+            reject("unpack length count");
+        if (!in.b_is_lit() || in.b_lit() < 0 || in.b_lit() > 5
+                || (in.b_lit() & 6) == 6
+                || ((in.b_lit() & 6) != 0) != (in.target >= 0))
+            reject("unpack length flags");
         break;
     case OpCode::MemberV:
         reg(in.target);

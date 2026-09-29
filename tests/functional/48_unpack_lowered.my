@@ -1,0 +1,92 @@
+# A destructure of a PROVEN array (`var a, b, c = arr`) and a foreach over
+# GENERAL rows (`foreach (x, y in rows)`) are lowered to a length check
+# (UnpackLenCheck) plus one element read per target. Every shape must
+# print what the tree-walker prints:
+#  - a flat int array (the typed reads, 73_multi_unpack's shape) and a
+#    flat float one;
+#  - a MIXED row built in an unhinted position (an append argument): it is
+#    typed array<float> but holds an int, so the typed reads must NOT be
+#    taken - each element binds its actual value, as before the lowering;
+#  - a bool row, a `_` placeholder, a slice rvalue;
+#  - general string rows and split() rows (the flat-strs read) in a
+#    foreach, indexed and with `_`;
+#  - the strict length error of both forms, caught on a later iteration,
+#    and the container shrinking under a foreach.
+var arr = [0, 0, 0];
+var s = 0;
+for (var i = 0; i < 50; i++) {
+    arr[0] = i; arr[1] = i + 1; arr[2] = i * 2;
+    var a, b, c = arr;
+    s += a * 3 + b - c;
+}
+var fa = [0.5, 1.5];
+var fsum = 0.0;
+for (var i = 0; i < 20; i++) {
+    fa[0] = fa[0] + 0.25;
+    var x, y = fa;
+    fsum += x * y;
+}
+print(s, fsum);
+
+var lst = [];
+var fi = int(runtime(3));
+var ff = 2.5;
+append(lst, [fi, ff]);
+append(lst, [fi + 1, ff + 1.0]);
+var r0 = lst[0];
+var mx, my = r0;
+print(mx, my);
+var bl = [];
+append(bl, [true, fi]);
+var p, q = bl[0];
+print(p, q);
+var w = [7, 8, 9, 10];
+var h, _, k = w[1:4];
+print(h, k);
+
+var rows = [];
+for (var j = 0; j < 6; j++)
+    append(rows, ["n" + str(j), str(j * 3)]);
+var sp = [];
+for (var j = 0; j < 6; j++)
+    append(sp, split("p" + str(j) + " q" + str(j) + " r" + str(j), " "));
+var acc = 0;
+var last = "";
+for (var r = 0; r < 4; r++) {
+    foreach (var i, nm, vl in indexed rows) {
+        acc += i + len(nm) + len(vl);
+        last = nm + vl;
+    }
+    foreach (var u, _, v in sp) {
+        acc += len(u) * 10 + len(v);
+        last = last + u + v;
+    }
+}
+print(acc, last);
+
+var bad = [[1, 2], [3, 4], [5, 6, 7]];
+var z = 0;
+var msg = "";
+for (var t = 0; t < 3; t++) {
+    try {
+        foreach (var a, b in bad) z += a + b;
+    } catch (TypeErrorEx as e) {
+        z += 100;
+    }
+    try {
+        var a3, b3 = bad[t];
+        z += a3 * b3;
+    } catch (TypeErrorEx as e) {
+        z += 1000;
+    }
+}
+print(z);
+var srows = [["a", "b"], ["c", "d"], ["e", "f"]];
+var o = "";
+try {
+    foreach (var i, g1, g2 in indexed srows) {
+        o += g1 + g2;
+        if (i == 0) pop(srows);
+    }
+} catch (OutOfBoundsEx) { o += "!"; }
+print(o);

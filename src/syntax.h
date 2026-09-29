@@ -1411,6 +1411,14 @@ public:
     unique_ptr<Construct> rvalue;
     unsigned fl;
     Op op;
+    /*
+     * A destructure `a, b = <rvalue>` whose rvalue the inferencer PROVED a
+     * non-opt array (annotate_hints), and its element kind (i/f, or none
+     * for any other element - read boxed). The codegen lowers such an
+     * unpack into a length test plus per-target element reads.
+     */
+    bool unpack_rv_array = false;
+    TypeHint unpack_rv_th = TypeHint::none;
 
     Expr14()
         : Construct("Expr14", false, ConstructType::expr14)
@@ -1425,6 +1433,8 @@ public:
         c->rvalue = clone_as(rvalue);
         c->fl = fl;
         c->op = op;
+        c->unpack_rv_array = unpack_rv_array;
+        c->unpack_rv_th = unpack_rv_th;
         return c;
     }
 };
