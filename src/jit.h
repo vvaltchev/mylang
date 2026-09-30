@@ -1401,7 +1401,11 @@ extern unsigned long g_jit_op_run[];
     X(epoch_base_not_arr) X(epoch_shifted) \
     X(arrlen_base_not_arr) X(arrlen_base_slice) X(arrlen_base_kind) \
     X(unpacklen_base_not_arr) X(unpacklen_base_slice) \
-    X(unpacklen_base_kind) X(unpacklen_len)
+    X(unpacklen_base_kind) X(unpacklen_len) \
+    X(unpackv_base_not_arr) X(unpackv_base_slice) X(unpackv_base_kind) \
+    X(unpackv_scale_wrap) X(unpackv_bounds) X(unpackv_row_not_arr) \
+    X(unpackv_row_slice) X(unpackv_row_kind) X(unpackv_len) \
+    X(unpackv_elem_ex) X(unpackv_elem_slice)
 
 enum JitDecline {
 #define ML_JD_ENUM(n) JD_##n,
@@ -1530,6 +1534,7 @@ extern "C" unsigned long g_jit_peep_selfmov;
  * reference lifecycle inline: retain-new, dec-release-old with a cold
  * C++ arm for destruction). Bumped from the EMITTED code. */
 extern "C" unsigned long g_jit_elemv_fast;
+extern "C" unsigned long g_jit_unpackv_fast;
 /* #97 inc 3: the boxed-element inline STORE tier (`a[i] = v` into a
  * general array: retain-new, release-old with a cold arm, the COW
  * guards the interpreter's put would run, and the hash byte). Bumped
