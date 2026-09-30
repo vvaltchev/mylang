@@ -34667,6 +34667,11 @@ static bool jit_frameless_w2_shape()
                      * this per-CALL prologue is three instructions,
                      * and W6's second one is recovered here. */
                     "lea rbx, [rbp+0x20]",       /* the caller's window */
+                    /* REGCALL 1A: the int parameter `k` arrives in rdi;
+                     * read once, it is not pinned, so the entry writes
+                     * its slot (W5: no tails - unlisted, bound raw) */
+                    "mov r0, rdi",
+                    "mov r0.type, <int-tag>@r11",
                     /* #97 R4: a LEAF is lazy - the vframe is NOT
                      * published; a TESTS build parks the poison window
                      * there instead (the site checks it is still there
@@ -34701,50 +34706,37 @@ static bool jit_frameless_w2_shape()
         if (ok) {
             const uint32_t tgt = static_cast<uint32_t>(
                 std::atoi(cl[at + 2].text.c_str() + 4));
-            const size_t wb = native_find(cl, tgt, "mov r*, rax");
+            /* #71 + REGCALL 1B: the forwarded result goes straight
+             * into the return registers - no write-back, no reload */
+            const size_t wb = native_find(cl, tgt, "mov rdx, rax");
             ok = wb != std::string::npos && cl[wb].off == tgt
                  && native_expect(cl, wb, {
-                        "mov r*, rax",
-                        "mov r*.type, <int-tag>@r11" },
-                        "W2 arm write-back (#71)") && ok;
-            const size_t arm = native_find(cl, tgt, "mov rdx, [rbp+0x18]");
+                        "mov rdx, rax",
+                        "mov* *cx, <int-tag>" },   /* movabs off-arena */
+                        "W2 arm result registers (#71, 1B)") && ok;
+            /* REGCALL 1B: the arm never reads the dst word */
+            const size_t ret_at = native_find(cl, tgt, "ret");
+            const size_t dw = native_find(cl, tgt, "mov rdx, [rbp+0x18]");
+            if (dw != std::string::npos && dw < ret_at) {
+                fprintf(stderr, "jit_frameless_w2_shape: the 1B arm still "
+                                "reads the dst word\n");
+                ok = false;
+            }
+            /* #97 R3: a TESTS build checks the W4 callee returned with
+             * the POISON captures still in place */
+            if (native_find_seq(cl, tgt, {
+                    "mov r9, [<addr>]@rax",
+                    "mov rax, [r9+0x*]",
+                    "movabs r11, <addr>",
+                    "cmp rax, r11",
+                    "je +*" }) == std::string::npos) {
+                fprintf(stderr, "jit_frameless_w2_shape: no R3 poison "
+                                "check in the arm\n");
+                ok = false;
+            }
+            const size_t arm = native_find(cl, tgt, "mov rax, -1");
             ok = arm != std::string::npos
                  && native_expect(cl, arm, {
-                        "mov rdx, [rbp+0x18]",
-                        "and rdx, -4",   /* bits 0 and 1 (E2b) */
-                        "test rdx, rdx",
-                        "je +*",
-                        "mov rax, [rdx+0x18]",
-                        "cmp [rax+0x8], 8",
-                        /* #97 R1: a REFERENCE old dst is released
-                         * inline, not declined to jit_ret_norec */
-                        "jl +*",
-                        "push r8",
-                        "push r10",
-                        "push rdx",
-                        "mov rdi, rdx",
-                        "call <helper>",
-                        "pop rdx",
-                        "pop r10",
-                        "pop r8",
-                        "mov r11, r2",
-                        "mov [rdx+0x0], r11",
-                        "mov r11, r2.type",
-                        "mov [rdx+0x18], r11",
-                        /* #97 R3: a TESTS build checks the W4 callee
-                         * returned with the POISON captures still in
-                         * place (jit_w4_captures_replaced otherwise) */
-                        "mov r9, [<addr>]@rax",
-                        "mov rax, [r9+0x*]",
-                        "movabs r11, <addr>",
-                        "cmp rax, r11",
-                        "je +*",
-                        "sub rsp, 8",
-                        "call <helper>",
-                        "add rsp, 8",
-                        "mov r9, [<addr>]@rax",
-                        "mov rax, [rbp+0x10]",
-                        "mov [r9+0x*], rax",
                         "mov rax, -1",
                         /* W6: rbx ALONE - the caller-saved base is
                          * pushed by nobody, so the restore is one slot
@@ -34770,10 +34762,9 @@ static bool jit_frameless_w2_shape()
              && native_expect(mn, at, {
                     "sub rsp, 144",              /* the callee's 3 slots */
                     "mov r10, rsp",
-                    /* W5: no tail stores for the declared-int parameter
-                     * (unlisted, bound raw, never written) */
-                    "mov [r10+0x0], r1*",        /* the pinned i, r12-r15 */
-                    "mov [r10+0x18], <int-tag>@r11",  /* declared int */
+                    /* REGCALL 1A: the declared-int parameter is NOT
+                     * written into the window - the pinned `i` goes in
+                     * rdi, loaded just before the call (below) */
                     /* W3: the two temps are written raw by the body
                      * (a proven-scalar capture read, an int add), so
                      * the site leaves them UNINITIALISED - in this
@@ -34800,6 +34791,7 @@ static bool jit_frameless_w2_shape()
                      * the call, is pinned by tests/driver_checks.sh */
                     "movabs rax, <addr>",        /* jit_poison_captures */
                     "mov [r9+0x*], rax",
+                    "mov rdi, r1*",              /* 1A: the pinned i */
                     "call <helper>",             /* the frameless entry */
                     "cmp rax, -1",
                     "jne +*",
@@ -34828,25 +34820,16 @@ static bool jit_frameless_w2_shape()
                     "mov r10, rsp",
                     "cmp a.type, <int-tag>@r11", /* exact? */
                     "je +*",
-                    "mov rsi, a.type",
-                    "movzx rsi, [rsi+0x8]",
-                    "cmp rsi, 0",                /* none? */
-                    "je +*",
-                    "cmp rsi, 6",                /* bool? else decline */
-                    "jne +*",
-                    "mov r11, a",                /* bool: retag */
-                    "mov [r10+0x0], r11",
-                    "mov [r10+0x18], <int-tag>@r11",
-                    "jmp +*",
-                    "mov r11, a",                /* none: both words */
-                    "mov [r10+0x0], r11",
-                    "mov r11, a.type",
-                    "mov [r10+0x18], r11",
-                    "jmp +*",
-                    "mov r11, a",                /* exact */
-                    "mov [r10+0x0], r11",
-                    "mov [r10+0x18], <int-tag>@r11",
-                    "xor r11, r11" }, "W2 site fi(dyn a)") && ok;
+                    /* REGCALL 1A: `k` is an int parameter, so `a` goes
+                     * in RDI - an int or a bool (its payload IS the int)
+                     * binds, anything else (none included) declines */
+                    "cmp a.type, <addr>@r11",    /* bool? */
+                    "jne +*" }, "W2 site fi(dyn a)") && ok;
+        if (native_find(m2, 0, "mov rdi, a") == std::string::npos) {
+            fprintf(stderr, "jit_frameless_w2_shape: fi(dyn a) does not "
+                            "load `a` into rdi (REGCALL 1A)\n");
+            ok = false;
+        }
         if (!native_mark_empty(d2, "main", "= a")) {
             fprintf(stderr, "jit_frameless_w2_shape: the staging move of "
                             "`a` still emits code\n");

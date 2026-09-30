@@ -16162,3 +16162,122 @@ large bodies splices none and bumps `g_bc_chain_partial`),
 chains, a throw out of a middle arm caught by the caller, the identity
 arm) and `tests/bt_oracle/value_chain_throw.my` (the throw's backtrace
 matches `-ni -tw`).
+
+## #97 REGCALL STEP 1 - TYPED ARGUMENTS AND TRIVIAL RESULTS IN REGISTERS
+## (2026-09-29)
+
+The maintainer's ask: a fully typed call should not build a window of
+48-byte slots and copy 32-byte tagged values into it - "pass the values
+in the registers, at least for integers and floats". Measured first,
+on `func f(int a, int b) => a*3 + b` called in a loop with inlining off
+(`-ni -nbi -npc`, jitprofile, `OPT=1 ASSERTS=0`): **51 instructions
+per call** over the call-free loop (59 vs 8 per iteration) - 21 in the
+caller, 30 in the callee.
+
+**1B - THE RESULT COMES BACK IN RDX (payload) / RCX (type word).** A
+frameless callee none of whose ReturnVs returns a ref-listed slot can
+only return a TRIVIAL value (the ref_slots invariant), so
+`Chunk::frameless_ret_regs` (derived in `jit_chunk_frameless_derive`,
+never stored) makes its frameless return arm load the pair and skip the
+whole dst-word walk: the pointer load and mask, the old-value type test
+and its release call, the two stores through it. Every frameless SITE
+of such a callee stores the pair into its dst itself; an UNLISTED dst
+holds a trivial old value and may be a raw W3 slot, so its type word is
+never read; a LISTED one keeps the #97 R1 in-place release. A
+forwarded result (#71, in rax) goes straight into rdx/rcx - no
+write-back, no reload - when no release call can clobber them.
+**⛔ FOUND BY THE `nolowmem` -rt LANE, ON THE FIRST RUN: the self site's
+depth DECREMENT after the call used rcx as its scratch when the counter
+is not an abs32 operand** - off the low arena, i.e. the configuration a
+failed `MAP_32BIT` ships. It replaced the returned type word with the
+counter's address, and the hardened return audit read that as a Type
+(ASan heap-buffer-overflow). The scratch is r11 now. A register that
+starts carrying a value across a seam is an ABI change for every
+emission between the two ends, including the ones that only run in
+another configuration.
+
+**1A - INT ARGUMENTS IN rdi / rcx / r9 / r10.** `jit_regcall_arg_reg`
+- ONE rule for the site and the callee's frameless entry, from the
+descriptor and the chunk alone (so a self or mutual site reads the
+answer a leaf's does, whatever the emission order): a parameter
+declared int, or joined-int (#38 C stamps those), or C3-PROVEN int,
+not opt, not dyn, not ref-listed, in order, up to four. The site runs
+the window fill's own type dispatch without the stores (an int or, for
+a DECLARED int, a bool - its payload is the int 0/1 - binds; anything
+else, none included, declines; a PROVEN-only int binds no coercion, so
+it accepts an exact int only), then loads the registers LAST, after the
+residue pushes, from the caller's pin, spill home or slot. The entry
+takes them right after `lea rbx`: a parameter PINNED at the entry moves
+straight into its pin and its slot is never written (a pin is a
+write-back cache - the state the body would be in had it assigned the
+parameter at pc 0), so establish skips its load; any other one is
+stored into its slot with its int tag and, unless the W5 bit frees
+them, the tails. The moves are ordered so none clobbers a pending
+source; a cycle, or a pin in r8/r11/rcx (the vframe store and the
+TESTS poison write those) or in rdx while W4 still needs fo, falls back
+to the store. rsi and r8 are out (the off-arena tag singletons), rdx
+(fo), rax (the site's descriptor), r11 (G1's `call r11`); the TESTS
+entry probe saves the four (frag_entry's `keep_mask`). Lever:
+`MYLANG_JIT_OFF=regcall`.
+
+**What it measured** (Ir per two scale units, scale3 - scale1,
+callgrind `-npc`, `OPT=1 ASSERTS=0`, against the parent commit):
+
+    09_fib_recursive          -8.81%
+    10_recursion_deep         -9.06%
+    91_call_from_function     -6.52%
+    92_recursion_with_helper  -9.63%
+    93_mutual_recursion       -8.71%
+    94_builtin_in_helper      -3.65%
+    95_recursion_with_builtin -7.97%
+    97_regs_int_call          -5.22%
+    78, 11, 12, 63, 76, 99, 100, 03, 46, 34: flat to the instruction
+
+1A alone is NEUTRAL where a parameter is not pinned (the probe `f`: its
+two slot stores moved from the caller to the callee), and pays where it
+is: the probe `g` (parameters read five times) enters as
+`mov r12, rdi; mov r13, rcx` with no window traffic at all.
+
+**WHAT IS LEFT OF THE CALL, measured on `g`** - the next steps if the
+maintainer wants them, all found reading its jitprofile listing:
+ - the parameters are pinned in CALLEE-saved registers, so every call
+   pushes and pops them (4 per call here) - a call-free body should pin
+   in the caller-saved half, ideally in the argument register itself
+   (then the entry does nothing);
+ - the return FLUSHES every pin into a window that dies with the frame
+   (4 here). Not elided yet because the hardened return audit reads
+   every window slot's type word, and a register-bound parameter's
+   slot was never written - that audit has to learn the frameless
+   frame first;
+ - intermediate results go through memory with a tag store and a
+   reload (6 here) - lever A's reach, not the call protocol;
+ - an argument computed into its staging temp is stored with a
+   reference test and reloaded for the register (about 8 per call) -
+   forwarding the producer straight into the argument register.
+
+**STEP 2 (REFERENCES) WAS BUILT AND WITHDRAWN.** The retain/release is
+already gone for a non-escaping reference (#94's borrow, inline at a
+frameless site since W5); what a reference argument still costs is the
+32-byte copy plus its type and slice tests (about 21 instructions at
+the site) and a type-plus-borrowed test at the return (5). Removing the
+COPY needs the callee to address that parameter through a pointer
+instead of `rbx + slot*48` - every slot access in the emitter is written
+against rbx, so that is a refactor of the emitter, not a step. The step
+that was tried - a parameter the body never writes always arrives
+borrowed, a SLICE declining to the slow tier, so the return arm skips
+it - LEAKED: the decline trampoline's materialisation assumes every
+decline RAISES ("reached only by a decline, every one of which raises
+in C++"), and a slice decline returns normally, leaving a retained copy
+in an argument run slot nothing releases (tests/functional/55's
+`references` section, LeakSanitizer). Five instructions per reference
+argument did not justify reworking that path.
+
+Pinned by `tests/functional/55_regcall.my` (every shape: pinned and
+unpinned parameters, more than four, a float among them, int / float /
+bool / none results, a dyn bool argument, a result over a reference
+dst, self / mutual / linear recursion, an exception out of the callee,
+reference parameters and a slice), the updated `jit_frameless_w2_shape`
+(the entry's `mov r0, rdi`, the site's `mov rdi, r1*`, the arm's
+`mov rdx, rax; mov* *cx, <int-tag>`, and no dst-word read), and
+`jit_bake_coercing`'s bool->int counter, now bumped by the register
+path's bool arm.

@@ -680,6 +680,11 @@ extern unsigned long g_jit_frameless_self_id;  /* E2c: self sites whose
                                                 * was elided (emit-time) */
 extern unsigned long g_jit_frameless_boundary;  /* E2: boundary calls RUN */
 extern unsigned long g_jit_frameless_rets;      /* inc 2 (emitted code) */
+extern unsigned long g_jit_frameless_ret_regs;  /* REGCALL 1B (emitted) */
+extern unsigned long g_jit_regcall_args;        /* REGCALL 1A (emitted) */
+extern unsigned long g_jit_regcall_pinned;      /* REGCALL 1A entry: a
+                                                 * parameter moved straight
+                                                 * into its pin (emit-time) */
 extern unsigned long g_jit_frameless_init_free; /* inc 3 W3 (emit-time):
                                                  * window slots a site
                                                  * left UNINITIALISED */

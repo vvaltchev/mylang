@@ -406,14 +406,15 @@ enum JitLever {
     JL_FWD, JL_FFWD, JL_RESREG, JL_HOIST, JL_HOIST2, JL_MFACT,
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
     JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA,
-    JL_FRAMELESS, JL_CAPPROT, JL_VFQUIET, JL_GPROOF, JL_GHOIST, JL_COUNT
+    JL_FRAMELESS, JL_CAPPROT, JL_VFQUIET, JL_GPROOF, JL_GHOIST, JL_REGCALL,
+    JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
     "cache", "fcache", "telide", "fread", "flit",
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
     "peep", "bakecallee", "capbase", "lsra", "frameless", "capprot",
-    "vfquiet", "gproof", "ghoist"
+    "vfquiet", "gproof", "ghoist", "regcall"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -3940,7 +3941,8 @@ struct Emitter {
      * emitted sync `call rdx`, or a native_leaf direct call). rbx and the
      * cache registers are callee-saved, so save the caller's and take them
      * over. Called AFTER `saved` is filled (the cache pick decides it). */
-    void frag_entry(bool load_window = true, bool keep_rdx = false)
+    void frag_entry(bool load_window = true, bool keep_rdx = false,
+                    uint32_t keep_mask = 0)
     {
         /* the entry pushes are teardown-balanced (frag_ret), not
          * op-balanced - machinery, like frag_ret's pops already are.
@@ -3973,6 +3975,11 @@ struct Emitter {
                                   * own register, saved across the C
                                   * call the probe makes) */
         push_reg(REG_ARG0);              /* save rdi (reg:abi) */
+        /* REGCALL 1A: the frameless entry's register arguments live
+         * across this probe too (rdi is saved above) */
+        for (uint8_t r = 0; r < 16; r++)
+            if (((keep_mask >> r) & 1) && r != REG_ARG0)   /* reg:abi */
+                push_reg(r);
         /* rdi = the HARDWARE return address, which sits at the entry
          * datum: depth 0, so `sp_depth` bytes above rsp right now
          * (rdi is the checker's first argument) */
@@ -3980,11 +3987,15 @@ struct Emitter {
         movabs(0 /* RAX */, reinterpret_cast<uint64_t>(
                                 &jit_norec_ret_verify));
         call_rax();   /* reg:abi */
+        for (int r = 15; r >= 0; r--)
+            if (((keep_mask >> r) & 1) && r != REG_ARG0)   /* reg:abi */
+                pop_reg(static_cast<uint8_t>(r));
         pop_reg(REG_ARG0);                            /* reg:abi */
         if (keep_rdx)
             pop_reg(RDX);                                 /* reg:proto */
 #else
         (void)keep_rdx;
+        (void)keep_mask;
 #endif
       /* G1 STEP 3 - THE FRAME-POINTER CHAIN (plans/archived/g1-no-record-tier.md,
       
@@ -9537,6 +9548,17 @@ void jit_chunk_frameless_derive(Chunk &ck)
                 ck.frameless_calls = true;
     ck.frameless_init_free = jit_chunk_frameless_init_free(ck);
     ck.frameless_read_first = chunk_read_before_write(ck);
+    /* REGCALL 1B: every return trivial (see the field) */
+    ck.frameless_ret_regs = ck.frameless_ok;
+    if (ck.frameless_ret_regs)
+        for (const Instr &in : ck.code)
+            if (in.op == OpCode::ReturnV
+                    && (in.a_is_lit() || in.a_slot() < 0
+                        || std::binary_search(ck.ref_slots.begin(),
+                                              ck.ref_slots.end(),
+                                              static_cast<int32_t>(
+                                                  in.a_slot()))))
+                ck.frameless_ret_regs = false;
 }
 
 #ifdef TESTS
@@ -9597,10 +9619,83 @@ bool jit_test_instr_stores_dst_raw(const Instr &in)
  * release scan would drop a count it never took (watched, inc 2:
  * jit_ret_inline_c4c's `h(arr, n)`).
  */
+/*
+ * REGCALL 1A - THE ARGUMENT REGISTERS. A frameless callee's INT parameter
+ * (declared or inference-joined `int` - #38 C stamps the joined ones, so
+ * ParamDesc::decl_type covers both - not `opt`, not ref-listed) arrives
+ * in a register instead of its window slot: the k-th such parameter in
+ * JIT_REGCALL_INT[k]. ONE function answers "which register, if any" for
+ * the SITE (which loads it) and the callee's FRAMELESS ENTRY (which
+ * takes it), from the descriptor and the chunk alone, so the two cannot
+ * disagree - and it depends on no emission order, so a self or mutual
+ * site reads the same answer as a leaf's.
+ * The registers: none is touched between the site's loads (after its
+ * residue pushes and the captures repoint) and the entry's consumption
+ * (after frag_entry and the vframe store, which use r8/r11), except by
+ * the TESTS entry probe, which saves them (frag_entry's keep mask).
+ * rsi / r8 are out (the off-arena tag singletons), rdx (W4's fo), rax
+ * (the site's descriptor), r11 (G1's `call r11`).
+ */
+static constexpr uint8_t JIT_REGCALL_INT[] = { 7 /* rdi */, 1 /* rcx */,
+                                               9 /* r9 */, 10 /* r10 */ };
+static constexpr int JIT_REGCALL_NINT =
+    static_cast<int>(sizeof(JIT_REGCALL_INT) / sizeof(JIT_REGCALL_INT[0]));
+
+static int jit_regcall_arg_reg(const FuncDescriptor *callee,
+                               const Chunk &cck, int i)
+{
+    if (jit_lever_off(JL_REGCALL))
+        return -1;
+    int k = 0;
+    for (int j = 0; j < static_cast<int>(callee->params.size()); j++) {
+        const FuncDescriptor::ParamDesc &pd = callee->params[j];
+        /* a declared int (the bind COERCES: an int or a bool binds) or
+         * an inference-PROVEN one (C3: no coercion - only an exact int
+         * can arrive, and the site checks exactly that) */
+        const bool int_p = pd.decl_type == DeclType::i
+                           || (pd.decl_type == DeclType::none
+                               && pd.proven_type == DeclType::i);
+        const bool ok = int_p && !pd.opt && !pd.dyn_mod
+                        && !jit_slot_ref_listed(cck, j);
+        if (!ok)
+            continue;
+        if (k >= JIT_REGCALL_NINT)
+            return -1;
+        if (j == i)
+            return JIT_REGCALL_INT[k];
+        k++;
+    }
+    return -1;
+}
+
+/* the mask of JIT_REGCALL_INT registers a callee takes (frag_entry's
+ * TESTS probe saves exactly these) */
+static uint32_t jit_regcall_mask(const FuncDescriptor *callee,
+                                 const Chunk &cck)
+{
+    uint32_t m = 0;
+    for (int i = 0; i < static_cast<int>(callee->params.size()); i++) {
+        const int r = jit_regcall_arg_reg(callee, cck, i);
+        if (r >= 0)
+            m |= 1u << r;
+    }
+    return m;
+}
+
+/* 1A: an argument the site loads into its register AFTER the residue
+ * pushes (its type dispatch - the declines - ran in the window fill) */
+struct RegArg {
+    uint8_t abi;
+    int pin = -1;          /* the caller's pin register, or */
+    int spill = -1;        /* its spill home, or */
+    int32_t slot = -1;     /* a caller window slot (payload read) */
+};
+
 static void emit_frameless_window(Emitter &e, const Instr &in,
                                   const FuncDescriptor *callee,
                                   const Chunk &cck, const ArgFuse *af,
-                                  std::vector<size_t> &j_slow_win)
+                                  std::vector<size_t> &j_slow_win,
+                                  std::vector<RegArg> &reg_args)
 {
     const JitLayout &L = jit_layout();
     const uint8_t R9R = 9, R10 = 10, R11 = 11;
@@ -9645,6 +9740,48 @@ static void emit_frameless_window(Emitter &e, const Instr &in,
         const void *req = pd.decl_type == DeclType::i ? L.t_int
                         : pd.decl_type == DeclType::f ? L.t_float
                         : nullptr;
+        /* REGCALL 1A: the value goes in a register, not in slot i
+         * (the callee's entry writes the slot - tails included - only
+         * where it cannot keep the parameter in a pin). The dispatch
+         * below is the window's own, minus the stores: an int or a
+         * bool (its payload is the int 0/1) binds, anything else -
+         * none included, which the register cannot carry - declines. */
+        const int abi = jit_regcall_arg_reg(callee, cck, i);
+        if (abi >= 0) {
+            /* a PROVEN (undeclared) int binds no coercion: only an exact
+             * int may go in the register - a bool would bind AS a bool */
+            const bool proven_only = req == nullptr;
+            ML_CHECK(req == L.t_int || proven_only);
+            RegArg ra;
+            ra.abi = static_cast<uint8_t>(abi);
+            const int ir = e.reg_at(ss), sp = e.spill_at(ss);
+            if (ir >= 0) {
+                ra.pin = ir;
+            } else if (sp >= 0) {
+                ra.spill = sp;
+            } else if (e.freg_at(ss) >= 0) {
+                j_slow_win.push_back(e.j32(0xEB));   /* a narrowing */
+                continue;
+            } else {
+                ra.slot = s;
+                e.cmp_mem_tag(RBX, s + 24, L.t_int, R11);    /* reg:proto */
+                if (proven_only) {
+                    j_slow_win.push_back(e.j32(0x75));       /* jne slow */
+                } else {
+                    const size_t j_ok = e.j32(0x74);         /* je int */
+                    e.cmp_mem_tag(RBX, s + 24, L.t_bool, R11); /* reg:proto */
+                    j_slow_win.push_back(e.j32(0x75));       /* jne slow */
+#ifdef TESTS
+                    e.bump_counter(&g_jit_bake_widen);   /* bool -> int:
+                                                          * the payload IS
+                                                          * the int */
+#endif
+                    e.patch32_here(j_ok);
+                }
+            }
+            reg_args.push_back(ra);
+            continue;
+        }
         if (!((tail_free >> i) & 1)) {
             e.store_qword_base_imm32(R10, d + 32, 0);    /* reg:proto */
             e.store_qword_base_imm32(R10, d + 40, 0);    /* reg:proto */
@@ -11743,7 +11880,9 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             const int32_t fl_win =
                 (fl_ck->slot_count + fl_ck->n_temps) * 48;
             WinTramp wt; wt.win = fl_win;
-            emit_frameless_window(e, in, fl_callee, *fl_ck, af, wt.j);
+            std::vector<RegArg> reg_args;         /* REGCALL 1A */
+            emit_frameless_window(e, in, fl_callee, *fl_ck, af, wt.j,
+                                  reg_args);
             /* the dst word: the slot address with bit 0 set, or bare 1
              * for a discarded result (the arm masks the bit, so it reads
              * 0 = no write, exactly the record-less spelling). A
@@ -11767,6 +11906,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
              * the old value `none`. Watched: without it, the TESTS
              * poison type aborts the E2 test's leaf case by name. */
             if (!fl_rec && g_cur_self_fl && in.target >= 0
+                    && !fl_ck->frameless_ret_regs   /* 1B: no arm read */
                     && !jit_slot_ref_listed(ck, in.target))
                 e.store_type_tag_via(
                     in.target * static_cast<int32_t>(sizeof(LValue)) + 24,
@@ -11827,6 +11967,25 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             e.bump_counter(&g_jit_sync_inline);
             e.bump_counter(&g_jit_op_run[static_cast<size_t>(in.op)]);
 #endif
+            /* REGCALL 1A: the register arguments, loaded LAST - their
+             * type dispatch ran in the window fill (every decline is
+             * behind us), and nothing below touches rdi/rcx/r9/r10. A
+             * caller's pin is callee-saved across a MyLang call, so no
+             * source can be a register an earlier load wrote. */
+            for (const RegArg &ra : reg_args) {
+                if (ra.pin >= 0) {
+                    e.trk_read_pin(static_cast<uint8_t>(ra.pin));
+                    e.mov_rr(ra.abi, static_cast<uint8_t>(ra.pin));
+                } else if (ra.spill >= 0) {
+                    e.reload(ra.abi, ra.spill);
+                } else {
+                    e.load_base(ra.abi, RBX, ra.slot);
+                }
+            }
+#ifdef TESTS
+            if (!reg_args.empty())
+                e.bump_counter(&g_jit_regcall_args);
+#endif
             /* the callee reads its WINDOW at [rbp+32], through the
              * residue just pushed - nothing may come between (the depth
              * bump is register- and stack-neutral) */
@@ -11862,15 +12021,50 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 kns->frameless = true;
             }
             if (fl_count) {                       /* the level ended */
+                /* r11, not rcx: REGCALL 1B's callee left the result's
+                 * TYPE WORD in rcx (and the payload in rdx). Off the
+                 * low arena the counter is not an abs32 operand, and
+                 * the rcx scratch this used silently replaced a
+                 * returned type with the counter's address (watched:
+                 * fib under MYLANG_NO_LOWMEM, the return audit read
+                 * it as a Type) */
                 if (!e.dec_abs32(reinterpret_cast<const void *>(depth_addr),
                                  true)) {
-                    e.movabs(RCX, depth_addr);
-                    e.dec_dword_base(RCX);
+                    e.movabs(R11, depth_addr);            /* reg:proto */
+                    e.dec_dword_base(R11);
                 }
             }
             e.cmp_reg_imm(RAX, -1);
             const size_t j_fexc = e.j32(0x75);    /* jne: an exception */
             e.op_reg_imm(Op::plus, RSP, 16 + fl_win);  /* residue + window */
+            if (fl_ck->frameless_ret_regs && in.target >= 0) {
+                /* REGCALL 1B: the callee left the trivial result in
+                 * RDX (payload) / RCX (type word); the dst is this
+                 * site's to write. An unlisted dst holds a trivial old
+                 * value (the ref_slots invariant - and may be a raw,
+                 * never-initialised W3 slot, so its type word is not
+                 * read); a listed one may hold a reference, released in
+                 * place as the arm used to (#97 R1) */
+                const int32_t d = in.target
+                                  * static_cast<int32_t>(sizeof(LValue));
+                if (jit_slot_ref_listed(ck, in.target)) {
+                    e.load_base(RAX, RBX, d + 24);
+                    e.cmp_dword_base_imm8(RAX, jit_layout().type_t_off,
+                                          static_cast<int8_t>(
+                                              jit_layout().t_str_val));
+                    const size_t j_triv = e.j32(0x7C);    /* jl: trivial */
+                    e.push_reg(RDX);
+                    e.push_reg(RCX);
+                    e.lea_base(RDI, RBX, d);              /* reg:abi */
+                    e.call_direct_framefree(
+                        reinterpret_cast<const void *>(jit_drop_dst));
+                    e.pop_reg(RCX);
+                    e.pop_reg(RDX);
+                    e.patch32_here(j_triv);
+                }
+                e.store_base(RDX, RBX, d);                /* payload */
+                e.store_base(RCX, RBX, d + 24);           /* type word */
+            }
             if (e.lazy_vframe_total >= 0) {       /* E2e: lazy - no */
                 e.vframe_poison();                /* restore; the next C++
                                                    * call publishes (TESTS:
@@ -12864,9 +13058,23 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                  * branch checks what a record-less frame leaves checkable.
                  */
                 e.patch32_here(j_frameless);
-                if (fwd)                     /* #71: before the oracle */
+                /* REGCALL 1B + #71: a FORWARDED result of a 1B chunk goes
+                 * straight into the return registers - no write-back and
+                 * no reload - when no release call can clobber them (the
+                 * TESTS oracle's call saves them itself) */
+                const bool fwd_regs = fwd && ck.frameless_ret_regs
+                                      && ck.ref_slots.empty();
+                if (fwd_regs) {
+                    e.mov_rr(RDX, FWD);
+                    e.mov_imm(RCX, reinterpret_cast<uint64_t>(fwd_tag));
+                } else if (fwd) {            /* #71: before the oracle */
                     emit_ret_fwd_writeback(e, res_slot, FWD, fwd_tag, R11);
+                }
 #ifdef TESTS
+                if (fwd_regs) {
+                    e.push_reg(RDX);
+                    e.push_reg(RCX);
+                }
                 ld(RDI, 5, 24);        /* rdi = [rbp+24] (reg:abi) */
                 e.mov_rr(RSI, RBP);  /* reg:abi */
                 e.mov_imm(RDX, static_cast<uint64_t>(
@@ -12874,8 +13082,19 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                 e.movabs(RAX, reinterpret_cast<uint64_t>(
                                   &jit_norec_retarm_verify));
                 e.call_rax_framefree();   /* R4 */
+                if (fwd_regs) {
+                    e.pop_reg(RCX);
+                    e.pop_reg(RDX);
+                }
                 e.bump_counter(&g_jit_frameless_rets);
 #endif
+                /* REGCALL 1B: the result travels back in RDX/RCX (loaded
+                 * last, below - the release scan's calls clobber both),
+                 * so none of the dst-word work happens here */
+                const bool ret_regs = ck.frameless_ret_regs;
+                ML_CHECK(!ret_regs || !res_listed);
+                size_t j_fnw = 0;
+                if (!ret_regs) {
                 /* #97 R1 (the record-less arm's rule, below): only an
                  * ARRAY result declines - its slices set holds its
                  * address; any other reference moves bit-for-bit */
@@ -12891,7 +13110,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                 ld(RDX, 5, 24);
                 e.op_reg_imm(Op::band, RDX, -4);       /* clear bits 0, 1 */
                 e.test_rr(RDX, RDX);
-                const size_t j_fnw = e.j32(0x74);      /* jz no_write */
+                j_fnw = e.j32(0x74);                   /* jz no_write */
                 /* E2b: a self site says the old dst is trivial (bit 1) -
                  * no load chain; only a CALLING body has self sites */
                 size_t j_triv_old = 0;
@@ -12946,6 +13165,7 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                     st(RDX, 0, RAX);
                 }
                 e.patch32_here(j_fnw);                 /* no_write: */
+                }                                      /* !ret_regs */
                 /* the release scan - the window dies with this frame,
                  * so every ref-listed slot but the moved result is
                  * released here (the record-less arm's exact shape;
@@ -13015,7 +13235,23 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                 e.bump_counter(&g_jit_native_returns);
                 e.bump_counter(&g_jit_norec_ret_arm);  /* a record-less
                                                         * arm variant */
+                if (ret_regs)
+                    e.bump_counter(&g_jit_frameless_ret_regs);
 #endif
+                if (ret_regs && !fwd_regs) {
+                    /* REGCALL 1B: payload -> RDX, type word -> RCX; a
+                     * void body (Halt) returns none */
+                    if (res_slot >= 0) {
+                        const int32_t s = static_cast<int32_t>(
+                            static_cast<long>(res_slot)
+                            * static_cast<long>(sizeof(LValue)));
+                        ld(RDX, RBX, s);
+                        ld(RCX, RBX, s + 24);
+                    } else {
+                        e.zero_reg32(RDX);             /* xor edx, edx */
+                        e.movabs(RCX, reinterpret_cast<uint64_t>(L.t_none));
+                    }
+                }
                 e.mov_reg_imm32(RAX, 0xFFFFFFFFu);   /* mov rax, -1 */
                 e.frag_ret(Emitter::RetFlush::flushed);
                 if (!j_fslow.empty()) {
@@ -14412,6 +14648,9 @@ void jit_stats_report()
         { "frameless_sites",   &g_jit_frameless_sites },
         { "frameless_pushes",  &g_jit_frameless_pushes },
         { "frameless_rets",    &g_jit_frameless_rets },
+        { "frameless_ret_regs", &g_jit_frameless_ret_regs },
+        { "regcall_args",      &g_jit_regcall_args },
+        { "regcall_pinned",    &g_jit_regcall_pinned },
         { "frameless_init_free", &g_jit_frameless_init_free },
         { "frameless_capbase", &g_jit_frameless_capbase },
         { "vframe_quiet_sites", &g_jit_vframe_quiet_sites },
@@ -31265,6 +31504,48 @@ retry_emission:
          * used to hold it inline, and a second entry kind is exactly
          * the moment two copies would start to drift.
          */
+        /* the pin ASSIGNMENT as of a pc: the base cache with every seam
+         * and LSRA transition at or before it applied (establish's own
+         * rule, shared with the REGCALL entry that must know which
+         * parameters are pinned before establish runs) */
+        const auto pins_at = [&](size_t at_pc) {
+                std::vector<Emitter::CacheEnt> st_cache = base_cache;
+                for (const ShareSeam &sm : seams) {
+                    if (sm.pc > at_pc)
+                        break;
+                    for (Emitter::CacheEnt &c : st_cache)
+                        if (c.reg == sm.reg) {
+                            const SlotAddr na = slot_addr(sm.to_slot);
+                            c.slot = sm.to_slot;
+                            c.payload = na.payload;
+                            c.type = na.type;
+                            break;
+                        }
+                }
+                for (const LsraTrans &tr : lsra_tr) {
+                    if (tr.pc > at_pc)
+                        break;
+                    if (tr.evict_slot >= 0)
+                        for (size_t ci = 0; ci < st_cache.size(); ci++)
+                            if (st_cache[ci].reg
+                                    == static_cast<uint8_t>(tr.reg)) {
+                                st_cache.erase(st_cache.begin()
+                                    + static_cast<long>(ci));
+                                break;
+                            }
+                    if (tr.install_slot >= 0) {
+                        const SlotAddr na = slot_addr(tr.install_slot);
+                        st_cache.push_back({ tr.install_slot,
+                                             na.payload, na.type,
+                                             static_cast<uint8_t>(
+                                                 tr.reg) });
+                    }
+                }
+                return st_cache;
+        };
+        /* REGCALL 1A: slots the frameless entry already moved into their
+         * pins from the argument registers - establish skips their load */
+        std::vector<int> regcall_preloaded;
         const auto establish = [&](size_t at_pc, bool frameless = false) {
             {
                 /* the tracker: entry establishment is machinery - the
@@ -31308,43 +31589,12 @@ retry_emission:
                  * before the pc applied. e.cache holds the FINAL
                  * (post-all-seams) state here, which is right only
                  * for entries past the last seam. */
-                std::vector<Emitter::CacheEnt> st_cache = base_cache;
-                for (const ShareSeam &sm : seams) {
-                    if (sm.pc > at_pc)
-                        break;
-                    for (Emitter::CacheEnt &c : st_cache)
-                        if (c.reg == sm.reg) {
-                            const SlotAddr na = slot_addr(sm.to_slot);
-                            c.slot = sm.to_slot;
-                            c.payload = na.payload;
-                            c.type = na.type;
-                            break;
-                        }
-                }
-                /* 2b-iii-b: the lsra transitions at or before this
-                 * entry, replayed the same way (a transition AT the
-                 * entry pc is included - the stub jumps to label[pc],
-                 * which is emitted after the transitions there) */
-                for (const LsraTrans &tr : lsra_tr) {
-                    if (tr.pc > at_pc)
-                        break;
-                    if (tr.evict_slot >= 0)
-                        for (size_t ci = 0; ci < st_cache.size(); ci++)
-                            if (st_cache[ci].reg
-                                    == static_cast<uint8_t>(tr.reg)) {
-                                st_cache.erase(st_cache.begin()
-                                    + static_cast<long>(ci));
-                                break;
-                            }
-                    if (tr.install_slot >= 0) {
-                        const SlotAddr na = slot_addr(tr.install_slot);
-                        st_cache.push_back({ tr.install_slot,
-                                             na.payload, na.type,
-                                             static_cast<uint8_t>(
-                                                 tr.reg) });
-                    }
-                }
+                std::vector<Emitter::CacheEnt> st_cache = pins_at(at_pc);
                 for (const Emitter::CacheEnt &c : st_cache)
+                    if (!(frameless
+                          && std::find(regcall_preloaded.begin(),
+                                       regcall_preloaded.end(), c.slot)
+                             != regcall_preloaded.end()))
                     e.load(c.reg, c.payload);   /* #96: the ENTRY's own
                                                  * assignment, not the
                                                  * positional zip a
@@ -31490,10 +31740,101 @@ retry_emission:
             /* the frame build is pin MACHINERY to the tracker: no pin
              * is live before establish() below loads it */
             Emitter::PinMach pm(e);
+            const uint32_t rc_mask =
+                jit_regcall_mask(g_cur_caller_desc, chunk);   /* 1A */
             e.frag_entry(/*load_window=*/false,   /* rdi: unused here */
-                         /*keep_rdx=*/chunk.frameless_capbase);
+                         /*keep_rdx=*/chunk.frameless_capbase,
+                         /*keep_mask=*/rc_mask);
             /* the window the caller built: [rbp+32] (the contract) */
             e.lea_base(RBX, RBP, JIT_FRAMELESS_WIN_OFF);
+            /*
+             * REGCALL 1A: take the register arguments. A parameter PINNED
+             * at the entry moves straight into its pin and its slot is
+             * never written (the pin is a write-back cache: the next
+             * flush writes payload and tag - the state the body would be
+             * in had it assigned the parameter at pc 0), so establish
+             * skips its load. Any other one is stored into its slot as
+             * the site used to: payload, the int tag, and the tails
+             * unless the W5 bit says nothing reads them. Stores first
+             * (every argument register is still intact), then the moves
+             * in an order no move clobbers a pending source; a cycle, or
+             * a pin in rdx while W4 still needs it, demotes to a store.
+             */
+            regcall_preloaded.clear();
+            if (rc_mask) {
+                const std::vector<Emitter::CacheEnt> ep = pins_at(begin);
+                const FuncDescriptor *self = g_cur_caller_desc;
+                const int np = static_cast<int>(self->params.size());
+                const uint64_t tfree = np >= 64 ? 0
+                    : chunk.frameless_init_free
+                      & ((uint64_t(1) << np) - 1);
+                struct Mv { int slot; uint8_t abi; int pin; };
+                std::vector<Mv> mv;
+                for (int i = 0; i < np; i++) {
+                    const int abi = jit_regcall_arg_reg(self, chunk, i);
+                    if (abi < 0)
+                        continue;
+                    int pin = -1;
+                    for (const Emitter::CacheEnt &c : ep)
+                        if (c.slot == i)
+                            pin = c.reg;
+                    if ((pin == RDX                   /* reg:proto */
+                         && chunk.frameless_capbase)
+                            || pin == R8R || pin == R11   /* reg:proto */
+                            || pin == RCX)                /* reg:proto */
+                        pin = -1;    /* W4 reads fo in rdx; the vframe
+                                      * store below writes r8/r11, the
+                                      * TESTS poison rcx */
+                    mv.push_back({ i, static_cast<uint8_t>(abi), pin });
+                }
+                /* order the moves; whatever cannot be ordered stores */
+                std::vector<size_t> order;
+                {
+                    std::vector<char> done(mv.size(), 0);
+                    bool progress = true;
+                    while (progress) {
+                        progress = false;
+                        for (size_t a = 0; a < mv.size(); a++) {
+                            if (done[a] || mv[a].pin < 0)
+                                continue;
+                            bool blocks = false;
+                            for (size_t b = 0; b < mv.size(); b++)
+                                if (b != a && !done[b]
+                                        && mv[b].abi == mv[a].pin)
+                                    blocks = true;
+                            if (!blocks) {
+                                order.push_back(a);
+                                done[a] = 1;
+                                progress = true;
+                            }
+                        }
+                    }
+                    for (size_t a = 0; a < mv.size(); a++)
+                        if (!done[a])
+                            mv[a].pin = -1;       /* unpinned, or a cycle */
+                }
+                for (const Mv &m : mv) {
+                    if (m.pin >= 0)
+                        continue;
+                    const int32_t d = m.slot
+                                      * static_cast<int32_t>(sizeof(LValue));
+                    e.store_base(m.abi, RBX, d);
+                    e.store_type_tag_via(d + 24, L.t_int, R11); /* reg:proto */
+                    if (!((tfree >> m.slot) & 1)) {
+                        e.store_qword_base_imm32(RBX, d + 32, 0);
+                        e.store_qword_base_imm32(RBX, d + 40, 0);
+                    }
+                }
+                for (const size_t a : order) {
+                    if (mv[a].pin != mv[a].abi)
+                        e.mov_rr(static_cast<uint8_t>(mv[a].pin),
+                                 mv[a].abi);
+                    regcall_preloaded.push_back(mv[a].slot);
+#ifdef TESTS
+                    g_jit_regcall_pinned++;       /* emit-time */
+#endif
+                }
+            }
             /* act.vframe = this window (helpers read the frame there);
              * r8 = act is the push protocol's own register for it */
             /* E2e: a calling body's vframe is published at its C++

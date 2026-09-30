@@ -1,0 +1,154 @@
+# REGCALL (#97): the frameless calling convention for typed callees.
+# An int parameter (declared or inferred) arrives in a register; a result
+# that can never be a reference comes back in registers. Every shape here
+# must print exactly what the tree-walker prints.
+
+# Every callee carries a small loop: an inliner (the AST's, or the
+# bytecode splice) would otherwise paste it into the caller and no call
+# would be left to test.
+# pinned parameters (used often) and an unpinned one (used once)
+func poly(int a, int b) {
+    var r = 0;
+    for (var j = 0; j < 2; j++) r = r + a * a + b * b + a * b - a + b + j;
+    return r;
+}
+func once(int a, int b) {
+    var r = 0;
+    for (var j = 0; j < 2; j++) r = r + j;
+    return a * 3 + b + r;
+}
+# more int parameters than argument registers, and a float among them
+func wide(int a, int b, float c, int d, int e, int f) {
+    var r = 0;
+    for (var j = 0; j < 2; j++) r = r + j;
+    return a + b * 2 + int(c) + d * 3 + e * 5 + f * 7 + r;
+}
+# results of every trivial kind: int, float, bool, none
+func half(int a) {
+    var r = 0.0;
+    for (var j = 0; j < 2; j++) r = r + a * 0.25;
+    return r;
+}
+func even(int a) {
+    var r = 0;
+    for (var j = 0; j < 2; j++) r = r + a;
+    return r % 4 == 0;
+}
+func nothing(int a) {
+    var t = 0;
+    for (var j = 0; j < 2; j++) t = t + a;
+}
+func sel(int a, int b) {
+    var r = 0;
+    for (var j = 0; j < 2; j++) r = r + j;
+    return a > b ? a + r : b;
+}
+
+var s = 0; var fs = 0.0; var bs = 0;
+for (var i = 0; i < 40; i++) {
+    s = s + poly(s & 255, i) + once(i, s & 7);
+    s = s + wide(i, i + 1, i * 0.25, i + 2, i + 3, i + 4);
+    fs = fs + half(i);
+    if (even(i)) bs = bs + 1;
+    nothing(i);
+    s = s + sel(i, 20);
+}
+print("sums", s, fs, bs);
+
+# a bool argument into an int parameter (its payload is the int 0/1),
+# through a dyn so the site's runtime dispatch decides
+var dyn d = true;
+var bsum = 0;
+for (var i = 0; i < 10; i++) {
+    bsum = bsum + once(d, i);
+    d = i % 3 == 0;
+}
+print("bool args", bsum);
+
+# a dst that held a REFERENCE before the call writes over it
+var dyn slot = "a string";
+for (var i = 0; i < 3; i++)
+    slot = poly(i, i);
+print("over a ref", slot);
+
+# self recursion deep enough for the depth bound, and mutual recursion
+func fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }
+func ev(int n) { if (n == 0) return true; return od(n - 1); }
+func od(int n) { if (n == 0) return false; return ev(n - 1); }
+var fsum = 0;
+for (var k = 0; k < 3; k++)
+    fsum = fsum + fib(int(runtime(18)) + k);
+print("recursion", fsum, ev(int(runtime(41))), od(int(runtime(41))));
+# an IMPURE self recursion (it counts its calls) - the pure-call cache
+# serves `fib` above in the default configuration, never this one
+var calls = 0;
+func fibi(int n) {
+    calls = calls + 1;
+    if (n < 2) return n;
+    return fibi(n - 1) + fibi(n - 2);
+}
+# (a CALLING callee is frameless only when called from a function)
+func run_fibi(int n) {
+    var r = 0;
+    for (var j = 0; j < 2; j++) r = r + fibi(n + j);
+    return r;
+}
+print("impure recursion", run_fibi(int(runtime(18))), calls);
+# a LINEAR self recursion (one self call: the pure-call cache is for tree
+# recursions) called from a function - the frameless self site, deep
+# enough to cross the depth bound
+func sumto(int n) { if (n == 0) return 0; return n + sumto(n - 1); }
+func run_sumto(int n) {
+    var r = 0;
+    for (var j = 0; j < 3; j++) r = r + sumto(n + j);
+    return r;
+}
+print("linear recursion", run_sumto(int(runtime(60))));
+
+# an exception out of a register-called callee, caught by its caller
+func divi(int a, int b) {
+    var r = 0;
+    for (var j = 0; j < 2; j++) r = r + j;
+    return a / b + r;
+}
+func guarded(int n) {
+    var acc = 0;
+    for (var i = 0; i < n; i++) {
+        try { acc = acc + divi(100, i - 5); }
+        catch (DivisionByZeroEx) { acc = acc + 1000; }
+    }
+    return acc;
+}
+print("thrown", guarded(int(runtime(10))));
+
+# REGCALL step 2: a non-escaping reference parameter the body never
+# writes is always BORROWED at a frameless site (a SLICE declines to the
+# slow tier instead), and the return arm releases nothing for it
+func pick(array<int> a, int k) {
+    var r = 0;
+    for (var j = 0; j < 2; j++) r = r + a[(k + j) % len(a)];
+    return r;
+}
+func slen(str t, int k) {
+    var r = 0;
+    for (var j = 0; j < 2; j++) r = r + len(t) + k;
+    return r;
+}
+func dget(dict<str, int> d, int k) {
+    var r = 0;
+    for (var j = 0; j < 2; j++) r = r + d["x"] * k;
+    return r;
+}
+func refs(int n) {
+    var arr = [1, 2, 3, 4, 5, 6, 7, 8];
+    var sl = arr[2:6];                 # a slice: declines, still right
+    var t = "hello";
+    var d = {"x": 3};
+    var acc = 0;
+    for (var i = 0; i < n; i++) {
+        acc = acc + pick(arr, i) + pick(sl, i) + slen(t, i) + dget(d, i);
+        if (i == 5) arr[0] = 100;      # the caller still owns and writes
+    }
+    return acc;
+}
+print("references", refs(int(runtime(12))));

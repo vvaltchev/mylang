@@ -3664,6 +3664,12 @@ unsigned long g_jit_frameless_fixed = 0;     /* #97 G2: emit-time */
 unsigned long g_jit_frameless_boundary = 0;   /* #97 E2: run-time */
 unsigned long g_jit_frameless_pushes = 0;  /* #97 inc 2: frameless CALLS
                                             * (emitted code) */
+unsigned long g_jit_regcall_args = 0;      /* REGCALL 1A: a frameless call
+                                            * with register args (emitted) */
+unsigned long g_jit_regcall_pinned = 0;    /* REGCALL 1A: an entry move
+                                            * into a pin (emit-time) */
+unsigned long g_jit_frameless_ret_regs = 0; /* REGCALL 1B: a frameless
+                                            * return in RDX/RCX (emitted) */
 unsigned long g_jit_frameless_rets = 0;    /* #97 inc 2: frameless RETURN
                                             * arm taken (emitted code) */
 unsigned long g_jit_frameless_init_free = 0; /* #97 inc 3 W3: window slots
