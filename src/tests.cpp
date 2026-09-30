@@ -23171,6 +23171,19 @@ static bool jit_frameless_calling()
         "var s = 0;",
         "for (var k = 0; k < 3; k++) s = s + t(int(runtime(200 + k)));",
         "print(s);" }, "606");
+    /* a LINEAR self recursion: ONE self call, a plain CallV (the pure
+     * cache is for tree recursions), called from a function. Off the
+     * native stack (a sanitized build) a direct self CallV was left
+     * INTERPRETED, splitting the body's run, so the frameless self path
+     * a release takes for it was never exercised here (2026-09-30) */
+    same("a LINEAR self recursion (a plain CallV) from a function", {
+        "func down(int n) { if (n <= 0) return 0; return down(n - 1) + 1; }",
+        "func run(int k) {",
+        "  var s = 0;",
+        "  for (var j = 0; j < 3; j++) s = s + down(k + j);",
+        "  return s;",
+        "}",
+        "print(run(int(runtime(200))));" }, "603");
     same("a throw deep in the chain: caught (warmed), then uncaught", {
         "struct Boom { int at; }",
         /* ⛔ `u(n % 2 - 5)`, not `u(-1)`: a CONST argument is
@@ -23203,15 +23216,21 @@ static bool jit_frameless_calling()
         "var rc1 = refcount(arr);",
         "for (var k = 0; k < 6; k++) s = s + r(int(runtime(80)), arr);",
         "print(s, refcount(arr) == rc1);" }, "true");
-    /* REFUSED: the body also calls another CALLING function (F2 admits
-     * a LEAF - it cannot switch - so the other callee here recurses). A
-     * normal push from a frameless frame could switch THROUGH it; the
-     * pre-pass must refuse the whole body. Watched (E2): with the
-     * refusal removed, norec_switch_retarget's tripwire aborts on this
-     * shape (the cap is 16, the recursion 60). */
+    /* REFUSED: the body also calls another CALLING function that can
+     * NOT be entered framelessly (F2 admits a LEAF - it cannot switch -
+     * and G1 a calling callee whose own pre-pass admits it; `deep`
+     * recurses through a function VALUE, which no frameless body may
+     * hold). A normal push from a frameless frame could switch THROUGH
+     * it; the pre-pass must refuse the whole body. Watched (E2): with
+     * the refusal removed, norec_switch_retarget's tripwire aborts on
+     * this shape (the cap is 16, the recursion 60). Until 2026-09-30
+     * `deep` recursed by NAME and was refused only because a sanitized
+     * build left its self CallV interpreted (a split run) - once it
+     * takes the frameless self site, G1 admits it, and rightly. */
     same("a body that also calls a CALLING function is refused", {
         "struct Boom { int at; }",
-        "func deep(int n) { if (n <= 0) return 1; return deep(n - 1) + 1; }",
+        "func deep(int n) { if (n <= 0) return 1; var dyn f = deep;",
+        "  return f(n - 1) + 1; }",
         "func v(int n) {",
         "  if (n == 0) throw Boom(n + 7);",
         "  if (n < 0) return 1;",

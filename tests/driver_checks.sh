@@ -252,6 +252,19 @@ for cap in 3001 16384 16390 40000; do
             sod_ok=0
         fi
     done
+    # -nti: every call is a `dyn` one (CallValueGenericV), which ran a
+    # NESTED vm_run_chunk per call until 2026-09-30 - the C stack, not
+    # the slot cap, ended the recursion (an ASan stack-overflow at ~300
+    # levels, a SIGSEGV past the budget in a release build)
+    for flags in "-nti" "-nti -nj"; do
+        got=$(MYLANG_VM_STACK=$cap "$BIN" $flags "$TMP/sodepth.my" 2>&1)
+        if [ "$got" != "$want" ]; then
+            fail "overflow: cap $cap, [$flags] differs from -nj:
+      want: $(printf '%s' "$want" | tr '\n' '|')
+      got:  $(printf '%s' "$got" | tr '\n' '|' | cut -c1-300)"
+            sod_ok=0
+        fi
+    done
 done
 [ $sod_ok = 1 ] &&
     pass "overflow: a catchable StackOverflowEx in every engine configuration (4 caps)"
@@ -502,8 +515,10 @@ if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
             2>/dev/null | sed -n '/; ===== main/,$p' \
           | sed -n '/sub rsp, 144/,/call <helper>/p' \
           | sed -n '1,/call <helper>/p')
+    # REGCALL 1A: the int parameter goes in rdi, not into the window -
+    # so the window base is followed directly by the residue's lea
     after_tag=$(printf '%s\n' "$site" \
-          | sed -n '/mov \[r10+0x18\], <int-tag>/{n;p;}' | head -1)
+          | sed -n '/mov r10, rsp/{n;p;}' | head -1)
     if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then
         if printf '%s\n' "$site" | grep -q 'movabs r11, <addr>' \
                 && printf '%s\n' "$site" | grep -q 'mov \[r10+0x48\], r11' \
@@ -519,9 +534,10 @@ $site"
         *"lea rcx, [rbx+"*)
             pass "-vdj: W3 - a release build leaves the temps' init out" ;;
         *)
-            fail "-vdj: W3 - a release build should follow the parameter's
-      int tag straight with the residue's lea (the temps' init elided);
-      the instruction after it was: $after_tag" ;;
+            fail "-vdj: W3 - a release build should follow the window base
+      straight with the residue's lea (the temps' init elided, the int
+      parameter in rdi - REGCALL 1A); the instruction after it was:
+      $after_tag" ;;
         esac
     fi
 else
@@ -541,7 +557,8 @@ if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
             2>/dev/null | sed -n '/; ===== main/,$p' \
           | sed -n '/sub rsp, 144/,/call <helper>/p' \
           | sed -n '1,/call <helper>/p' \
-          | grep -v 'push rax\|inc \[rax+0x0\]\|pop rax')
+          | grep -v 'push rax\|inc \[rax+0x0\]\|pop rax' \
+          | grep -v 'mov rdi, ')   # REGCALL 1A: the argument register
     after_push=$(printf '%s\n' "$site" \
           | sed -n '/push \[r9+0x/{n;p;}' | head -1)
     if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then

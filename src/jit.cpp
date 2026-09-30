@@ -27833,8 +27833,22 @@ static bool op_run_eligible(const Instr &in, const JitCtx *jc)
              * cap is ~500k and unreachable in practice, so direct
              * self-recursion becomes a native fragment self-call. The
              * old gate stays when the stack is off (ASan / kill switch /
-             * mmap failure). */
-            return jit_sync_depth_cap() > 1000;
+             * mmap failure) - EXCEPT for a body the E2 pre-pass can
+             * enter framelessly: there the self site is a frameless one
+             * (its decline past the cap is a boundary call, no
+             * re-dispatch), and leaving the op interpreted SPLIT the run,
+             * so a sanitized build never ran the frameless self path a
+             * release takes for every linear recursion (found 2026-09-30:
+             * `sumto` in tests/functional/55 took it in release and not
+             * under ASan) */
+        {
+            if (jit_sync_depth_cap() > 1000)
+                return true;
+            const Chunk *self = static_cast<const Chunk *>(
+                jc->caller_desc->vm_chunk);
+            return self && self->frameless_ok && self->frameless_calls
+                   && jit_norec_on() && !jit_lever_off(JL_FRAMELESS);
+        }
         return true;
     }
     if (in.op == OpCode::CachedCallV || in.op == OpCode::CallValueV)
