@@ -61,6 +61,9 @@ void dump_callee_sets(Construct *root, std::ostream &os);
  * descriptor/struct-def ownership transfer (vm_compile). Calls `f` on each
  * DIRECT child of `c` (some may be null-skipped internally).
  */
+/* #97 (#72): the value-site guard-chain cap - inferencer.cpp */
+extern int g_value_cands_max;
+
 void for_each_child_of(Construct *c,
                        const std::function<void (Construct *)> &f);
 

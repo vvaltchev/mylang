@@ -98,3 +98,4 @@
 95_recursion_with_builtin 4
 96_find_sum_key          10
 97_regs_int_call         10
+100_funcval_dispatch4    18

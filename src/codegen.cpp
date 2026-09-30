@@ -3655,6 +3655,16 @@ struct Codegen {
             cv.callee_def_idx2 = add_value_callee(call->callee_desc2);
             if (cv.callee_def_idx2 < 0)
                 cv.callee_def_idx = -1;
+            /* #72: the rest of a guard-chain site - ALL or none, too */
+            for (size_t k = 0; k < call->callee_desc_more.size()
+                                && k < static_cast<size_t>(
+                                           ML_VALUE_CANDS_HARD - 2)
+                               && cv.callee_def_idx >= 0; k++) {
+                cv.callee_def_more[k] =
+                    add_value_callee(call->callee_desc_more[k]);
+                if (cv.callee_def_more[k] < 0)
+                    cv.callee_def_idx = -1;
+            }
         }
         /* step 1b: what inference PROVED each argument is - a bool is
          * stamped `th == i` too, and binding one into an int parameter is
@@ -8637,9 +8647,15 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
             if (in.callee_def_idx2 >= 0)          /* #97 E3: the pair */
                 chunk.value_callees.push_back(
                     {static_cast<uint32_t>(pc), in.callee_def_idx2});
+            for (const int32_t m : in.callee_def_more)   /* #72 */
+                if (in.callee_def_idx2 >= 0 && m >= 0)
+                    chunk.value_callees.push_back(
+                        {static_cast<uint32_t>(pc), m});
             in.callee_def_idx = -1;
         }
         in.callee_def_idx2 = -1;
+        for (int32_t &m : in.callee_def_more)
+            m = -1;
         in.arg_kinds = 0;
         if (!node)
             continue;
@@ -12891,6 +12907,8 @@ bool g_bc_inline_value_step1 = [] {
     const auto e = env_get("MYLANG_BCINLINE_STEP1");
     return !(e && !e->empty() && (*e)[0] == '0');
 }();
+unsigned long g_bc_chain_partial = 0;   /* #72: chains declined as
+                                        * partial (all-or-nothing) */
 unsigned long g_bc_step1_renamed = 0;   /* sites whose result move went */
 unsigned long g_bc_step1_sourced = 0;   /* arguments bound from source */
 unsigned long g_bc_step1_params = 0;    /* 1b: parameters read in place */
@@ -13400,8 +13418,10 @@ static bool bc_inline_chunk_splice(Chunk &ck,
          * analysis, are what each inlined body's soundness rests on. */
         std::vector<std::pair<const FuncDescriptor *, int32_t>> cands;
         if (is_value) {
-            int32_t vd[2];
-            const int nv = ck.value_callees_at(pc, vd);
+            int32_t vd[ML_VALUE_CANDS_HARD];
+            const int nv = std::min(
+                ck.value_callees_at(pc, vd, ML_VALUE_CANDS_HARD),
+                ML_VALUE_CANDS_HARD);
             for (int k = 0; k < nv; k++) {
                 if (vd[k] < 0
                         || static_cast<size_t>(vd[k]) >= ck.closure_defs.size())
@@ -13542,6 +13562,18 @@ static bool bc_inline_chunk_splice(Chunk &ck,
         }
         if (s.arms.empty())
             continue;
+        /* #72: a guard CHAIN of three or more is ALL OR NOTHING. A
+         * candidate left out (the frame budget, an ineligible body)
+         * would reach its call only after failing every guard of the
+         * chain - measured SLOWER than no splice at all (8 candidates of
+         * ~22-op bodies, 5 fitting: 61.5 vs 54.9 cycles per call for the
+         * last one). Sites of one or two keep their partial splice. */
+        if (cands.size() >= 3 && s.arms.size() < cands.size()) {
+#ifdef TESTS
+            g_bc_chain_partial++;
+#endif
+            continue;
+        }
         next_base = site_base;
         sites.push_back(std::move(s));
     }
@@ -13831,7 +13863,19 @@ static bool bc_inline_chunk_splice(Chunk &ck,
                             Instr mv;
                             mv.op = OpCode::MoveV;
                             mv.target = S.dst;
-                            mv.target2 = A.body[j].a_slot() + A.base;
+                            /* a body returning a PARAMETER read in place
+                             * (step 1b) returns the argument's source -
+                             * `func id(x) => x` - the slot A.base + x is
+                             * never bound (#72 found it: a third arm of
+                             * that shape read a stale temp) */
+                            const int rs = A.body[j].a_slot();
+                            mv.target2 =
+                                rs >= 0
+                                && static_cast<size_t>(rs)
+                                       < A.param_renamed.size()
+                                && A.param_renamed[static_cast<size_t>(rs)]
+                                    ? S.src_of[static_cast<size_t>(rs)]
+                                    : rs + A.base;
                             nctx.push_back(
                                 { static_cast<uint32_t>(nc.size()), fidx });
                             nc.push_back(mv);
@@ -14150,6 +14194,11 @@ static bool bc_scalar_replace_closures(Chunk &ck)
             c.dead = true;              /* a capture that is not a local */
             continue;
         }
+        /* a dead slot stops collecting: the masks below are built over
+         * EVERY candidate's defs, and a 17th def shifts past uint16_t
+         * (and a 29th past the 32-bit shift itself - UB) */
+        if (c.dead)
+            continue;
         if (std::find(c.defs.begin(), c.defs.end(), d) == c.defs.end())
             c.defs.push_back(d);
         if (c.defs.size() > 14)

@@ -1,0 +1,25 @@
+# A FOUR-WAY call through a func-VALUE picked from an array (76's shape
+# with four candidates): the callee-set analysis names all four, so the
+# call site is a candidate for a guard chain of inlined bodies (#97, the
+# 3+-candidate splice). The target rotates by i%4, so every candidate is
+# hot and the chain's LAST link is paid a quarter of the time.
+var scale = 1;
+if (len(argv) > 0)
+    scale = int(argv[0]);
+
+var N = 1000000 * scale;
+
+func add_op(st, x) { st[0] = st[0] + x; }
+func sub_op(st, x) { st[0] = st[0] - x; }
+func xor_op(st, x) { st[0] = st[0] ^ x; }
+func mix_op(st, x) { st[0] = (st[0] * 3 + x) % 1000000007; }
+var ops = [add_op, sub_op, xor_op, mix_op];
+
+var st = [0];
+
+for (var i = 0; i < N; i++) {
+    var fn = ops[i % 4];
+    fn(st, i);              # indirect call statement, result discarded
+}
+
+print("result:", st[0]);

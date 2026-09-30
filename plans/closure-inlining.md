@@ -26,7 +26,9 @@ store-forwards were `frame_release` (63 SRA-off -36% cycles); the
 replacement's move chains collapse (63 -21% cycles); a slot holding one
 of several closures is replaced with a tag (bench 99, written for it:
 -61% cycles). Still open: a reference capture has no reaching shape; a
-value call with three or more candidates is not spliced. Designed from
+value call with three to eight candidates is spliced as a guard chain
+since #72 (2026-09-29; record: *#97 #72*; bench 100 -59.7% Ir); more
+than eight is not. Designed from
 measurement (2026-09-27). Maintainer's call: this replaces the
 call-protocol store trimming (R5/R6 both measured flat and are parked
 on `r5-offpath-framefree` / `r6-return-forward`).

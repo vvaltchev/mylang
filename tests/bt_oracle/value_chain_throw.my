@@ -1,0 +1,17 @@
+# #72: an error thrown inside the THIRD arm of a four-way guard chain (a
+# spliced value call) renders the backtrace the real call does - the
+# callee's virtual frame at the call site, the caller's frame below it
+func add_op(st, x) { st[0] = st[0] + x; }
+func sub_op(st, x) { st[0] = st[0] - x; }
+func div_op(st, x) { st[0] = st[0] / (x - 6); }
+func xor_op(st, x) { st[0] = st[0] ^ x; }
+func drive(int n) {
+    var ops = [add_op, sub_op, div_op, xor_op];
+    var st = [100];
+    for (var i = 0; i < n; i++) {
+        var fn = ops[i % 4];
+        fn(st, i);
+    }
+    return st[0];
+}
+print(drive(runtime(12)));

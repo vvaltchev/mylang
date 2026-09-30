@@ -1903,8 +1903,8 @@ Running scripts:
                                  # oracle (plans/bytecode-inliner.md).
                                  # #97: it also splices a VALUE call
                                  # whose callee the analysis names (one,
-                                 # or two as a guard CHAIN - increment
-                                 # 2), main included, behind a
+                                 # or 2..8 as a guard CHAIN - increment
+                                 # 2 and #72), main included, behind a
                                  # GuardCalleeV - the
                                  # inline cache (plans/closure-inlining
                                  # .md); MYLANG_BCINLINE_VALUE=0 turns

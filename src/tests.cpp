@@ -43560,6 +43560,101 @@ static bool jit_load_elem2_native()
 }
 
 /*
+ * #97 (#72): A VALUE SITE OF 3..g_value_cands_max CANDIDATES IS SPLICED AS
+ * A GUARD CHAIN, ALL OR NOTHING. No engine can see this - every arm checks
+ * identity and a miss makes the original call, so a missing or duplicate
+ * candidate changes the speed, never the answer - so this pins the SHAPE:
+ * k guards naming k DISTINCT candidates for k = 3, 4 and 8; no chain at
+ * all for a site over the hard limit, nor for one whose arms do not all
+ * fit the frame budget (the all-or-nothing rule, proven by its counter);
+ * and none with the cap lowered to 2 (MYLANG_BCINLINE_CANDS's lever).
+ */
+static bool value_chain_shapes()
+{
+    const auto prog_of = [](int k, bool xl, std::string &src) {
+        src = "var st = [0];\n";
+        std::string names;
+        for (int j = 0; j < k; j++) {
+            const std::string n = "op" + std::to_string(j);
+            if (xl)
+                src += "func " + n + "(st, x) { var a = x * " +
+                       std::to_string(j + 3) +
+                       "; var b = a ^ (x >> 2); var c = (b + 1) % 1000003;"
+                       " var d = (a * 7 + c) % 999983; var e = (d ^ b) +"
+                       " (c >> 1); st[0] = (st[0] + a + b + c + d + e) %"
+                       " 1000000007; }\n";
+            else
+                src += "func " + n + "(st, x) { st[0] = st[0] + x + " +
+                       std::to_string(j + 1) + "; }\n";
+            names += (j ? ", " : "") + n;
+        }
+        src += "var ops = [" + names + "];\n"
+               "for (var i = 0; i < 40; i++) { var fn = ops[i % " +
+               std::to_string(k) + "]; fn(st, i); }\nprint(st[0]);\n";
+    };
+    const auto chain = [&](int k, bool xl, size_t &distinct) -> size_t {
+        std::string src;
+        prog_of(k, xl, src);
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        size_t guards = 0;
+        std::set<int> defs;
+        for (const Instr &in : prog.root.code)
+            if (in.op == OpCode::GuardCalleeV) {
+                guards++;
+                defs.insert(in.target2);
+            }
+        distinct = defs.size();
+        return guards;
+    };
+    bool ok = true;
+    try {
+        for (const int k : { 3, 4, 8 }) {
+            size_t d = 0;
+            const size_t g = chain(k, false, d);
+            if (g != static_cast<size_t>(k) || d != g) {
+                fprintf(stderr, "value_chain_shapes: a %d-way site has %zu "
+                                "guards over %zu candidates\n", k, g, d);
+                ok = false;
+            }
+        }
+        size_t d = 0;
+        if (chain(9, false, d) != 0) {
+            fprintf(stderr, "value_chain_shapes: a 9-way site (over the "
+                            "hard limit) was spliced\n");
+            ok = false;
+        }
+        const unsigned long p0 = g_bc_chain_partial;
+        if (chain(8, true, d) != 0 || g_bc_chain_partial <= p0) {
+            fprintf(stderr, "value_chain_shapes: an 8-way site of large "
+                            "bodies was not declined whole (partial=%lu)\n",
+                    g_bc_chain_partial - p0);
+            ok = false;
+        }
+        const int saved = g_value_cands_max;
+        g_value_cands_max = 2;
+        const size_t g2 = chain(4, false, d);
+        g_value_cands_max = saved;
+        if (g2 != 0) {
+            fprintf(stderr, "value_chain_shapes: the cap at 2 still "
+                            "spliced a 4-way site (%zu guards)\n", g2);
+            ok = false;
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "value_chain_shapes: %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    return ok;
+}
+
+/*
  * #74: THE GENERAL-ROW UNPACK TIER (UnpackElemValue - `foreach (i, a, b in
  * indexed rows)` over rows of strings, 75_indexed_unpack's shape). It
  * borrows the row from rows[i], checks its length once and copies each
@@ -49078,6 +49173,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 the boxed-element inline read tier - fires on reference "
       "elements, DECLINES slice / t_ex / negative / scale-wrap index",
       jit_elemv_native },
+    { "codegen: #72 a value site of 3..8 candidates is a guard chain, "
+      "all or nothing",
+      value_chain_shapes },
     { "jit: #74 the general-row unpack tier - borrows the row, binds each "
       "element inline; declines slice / flat / wrong-length rows and "
       "slice / t_ex elements",
