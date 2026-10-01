@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <map>
+#include <set>
 #include <unordered_set>
 #include <cstring>
 #include <cmath>
@@ -182,6 +183,8 @@ unsigned long g_jit_entry_pad_off = 0;
 unsigned long g_jit_pins_cs = 0;      /* REGCALL 1: runs whose pins
                                        * took the caller-saved bet */
 unsigned long g_jit_pins_cs_lost = 0; /* ...and re-emitted on losing */
+unsigned long g_jit_temp_regs = 0; /* #86: temp pieces given a register
+                                     * (emit-time) */
 unsigned long g_jit_xcall_lost = 0; /* #124(b): runs re-emitted with the
                                      * denial (a live pin in a loop) */
 unsigned long g_jit_xcall_brackets = 0; /* #124(b): call ops emitted
@@ -423,7 +426,7 @@ enum JitLever {
     JL_CEST, JL_RELENT, JL_NOREC, JL_ARGFUSE, JL_XCACHE, JL_SCACHE,
     JL_RSHARE, JL_PEEP, JL_BAKECALLEE, JL_CAPBASE, JL_LSRA,
     JL_FRAMELESS, JL_CAPPROT, JL_VFQUIET, JL_GPROOF, JL_GHOIST, JL_REGCALL,
-    JL_PINCS, JL_RETWB, JL_XCALL,
+    JL_PINCS, JL_RETWB, JL_XCALL, JL_TREGS,
     JL_COUNT
 };
 static const char *const jit_lever_names[JL_COUNT] = {
@@ -431,7 +434,7 @@ static const char *const jit_lever_names[JL_COUNT] = {
     "fwd", "ffwd", "resreg", "hoist", "hoist2", "mfact", "cest",
     "relent", "norec", "argfuse", "xcache", "scache", "rshare",
     "peep", "bakecallee", "capbase", "lsra", "frameless", "capprot",
-    "vfquiet", "gproof", "ghoist", "regcall", "pincs", "retwb", "xcall"
+    "vfquiet", "gproof", "ghoist", "regcall", "pincs", "retwb", "xcall", "tregs"
 };
 static unsigned jit_parse_mask(const char *env, const char *const *names,
                                int n)
@@ -15048,6 +15051,7 @@ void jit_stats_report()
         { "regcall_fargs",    &g_jit_regcall_fargs },
         { "xcall_brackets",   &g_jit_xcall_brackets },
         { "xcall_lost",       &g_jit_xcall_lost },
+        { "temp_regs",        &g_jit_temp_regs },
         { "regcall_fpinned",  &g_jit_regcall_fpinned },
         { "call_align",       &g_jit_call_align },
         { "call_dead_model",  &g_jit_call_dead_model },
@@ -17857,6 +17861,22 @@ jit_test_pick_cached_slots(const Chunk &ck, size_t begin, size_t end,
  * registers are taken lowest-index-first, eviction ties break toward
  * the smaller slot.
  */
+/*
+ * #86: TEMPS IN REGISTERS. `locals_only` kept every temp out of the
+ * scan (#124(a)), so an expression temp whose consumer is not the very
+ * next op - `a*a + b*b`'s first product - went through memory: a tag
+ * store, a payload store and a reload, where lever A (next-op only)
+ * cannot reach. With this set, a NON-REF-LISTED temp competes too, at
+ * a floor of 2 (a def and a use): the pick's floor of 3 prices an
+ * ENTRY load and an exit flush, and a temp defined inside the run has
+ * neither - its piece is installed at its own definition (no load,
+ * see the install arm) and its evict at death writes nothing (the dead
+ * temp elision). A ref-listed temp stays out: a pinned store would
+ * skip the release of the reference its slot held. Set by
+ * jit_compile_chunk for the GP plan of a run with no try region.
+ */
+static bool g_lsra_temps_ok = false;
+
 bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                      const std::vector<LiveInterval> &iv,
                      const std::vector<IntervalQual> &q,
@@ -17968,9 +17988,55 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
             /* admit only an int-evidenced, float-free piece with a USE
              * inside - a stretch nothing reads gains nothing - of a
              * slot over the run-wide floor (pick parity, above) */
+            const bool temp = l.slot >= ck.slot_count;
+            /* a temp a ReturnV reads stays out: the return arms (and
+             * #71's forwarded-result write-back) store the result
+             * SLOT, which a pin would leave stale under the register */
+            /* and every op that TOUCHES it must be the specialized
+             * int family (IntAddRR .. IntModRI) - emitters written for
+             * pins on their operands and dst, with no boxed arm that
+             * borrows scratch across a helper call (the generic IntBin
+             * does, and tripped the borrow tracker). That family is
+             * what an expression tree's temps are; anything else - a
+             * ReturnV whose arms store the result SLOT, a call's
+             * argument staging - keeps the temp in memory. */
+            bool ret_read = false;
+            if (temp) {
+                std::vector<int> tu, td;
+                for (size_t rp = begin; rp < end && !ret_read; rp++) {
+                    const OpCode op = ck.code[rp].op;
+                    if (!jit_op_slot_refs(ck.code[rp], tu, td)) {
+                        ret_read = true;     /* an unaudited op */
+                        break;
+                    }
+                    const bool touches =
+                        std::find(tu.begin(), tu.end(), l.slot) != tu.end()
+                        || std::find(td.begin(), td.end(), l.slot)
+                               != td.end();
+                    if (touches && !(op >= OpCode::IntAddRR
+                                     && op <= OpCode::IntModRI))
+                        ret_read = true;
+                }
+            }
+            /* and its interval must not span a MyLang CALL: across
+             * one it needs a callee-saved register (a push/pop per
+             * ENTRY - per call, in a function body) or a write-back
+             * per call, either of which costs more than the store pair
+             * it saves (09_fib read +5.0% Ir: `fib(n-1) + fib(n-2)`'s
+             * partial sum held in r13 across the second call) */
+            bool spans_call = false;
+            if (temp)
+                for (uint32_t cp = l.start; cp < l.end && !spans_call;
+                     cp++)
+                    if (cp < ck.code.size()
+                            && jit_run_blocks_xcache(ck, cp, cp + 1))
+                        spans_call = true;
+            const bool temp_ok = temp && !fm && g_lsra_temps_ok
+                    && !ret_read && !spans_call
+                    && !jit_slot_ref_listed(ck, l.slot);
             const bool cand = !forced && !fl && evid
-                    && !(locals_only && l.slot >= ck.slot_count)
-                    && slot_wint[l.slot] >= 3
+                    && !(locals_only && temp && !temp_ok)
+                    && slot_wint[l.slot] >= (temp_ok ? 2 : 3)
                     && nu(s, l.slot) < static_cast<int>(e2 - s);
             out.pieces.push_back({ static_cast<int>(k), l.slot, s, e2,
                                    -1, forced || fl || !cand });
@@ -21973,8 +22039,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 A = acc.r;
             }
         }
-        if (fb)
+        if (fb) {
+            /* the forwarded COUNT goes to CL as well: a pinned rcx is
+             * the same conflicting event as on the slot path below
+             * (#86 exposed it: a temp in a register put a local in rcx,
+             * and this move overwrote it undeclared) */
+            e.reg_pin_conflict(RCX);         /* reg:isa: CL */
             e.mov_rr(tmp, A);            /* the count, before the value */
+        }
         if (!fa) {
             acc.take();
             read_slot(e, acc.r, in.a_slot());
@@ -29678,6 +29750,11 @@ retry_emission:
         std::vector<LsraTrans> lsra_tr;      /* ABSTRACT until bound */
         std::vector<int> lsra_entry;
         std::vector<int> lsra_aregs;
+        /* #86: the abstract registers that host a TEMP piece - bound
+         * clear of rax/rcx/rdx, which emitters claim by ISA (idiv's
+         * rdx, the shift count's cl, the accumulator) and reconcile
+         * with a pin only by conflict-and-retry */
+        std::set<int> lsra_temp_aregs;
         std::vector<int> lsra_homes;         /* the home-tier overflow */
         /*
          * #103 (A'): THE ALLOCATOR CHOICE IS A LEVER, so it joins the
@@ -29726,14 +29803,48 @@ retry_emission:
                 LsraOut tp;
                 std::vector<int> entry;
                 std::vector<LsraTrans> tr;
-                if (jit_lsra_assign(chunk, begin, end, liv, lq, lev,
+                /*
+                 * #86: the LOCALS' plan first, exactly as before; then,
+                 * if it leaves at least three registers idle, a second
+                 * plan that lets the temps in at a budget TWO below the
+                 * pool - so two registers always stay free for the
+                 * emitters' scratch. Filling the whole file drove the
+                 * per-op scratch asks into borrow paths almost nothing
+                 * reached (a nested rcx borrow in a loop test, at
+                 * eleven pinned locals plus temps), and the locals'
+                 * plan is never displaced: it already fits in the
+                 * smaller budget.
+                 */
+                bool lsra_ok_gp =
+                    jit_lsra_assign(chunk, begin, end, liv, lq, lev,
                                     liu, static_cast<int>(max_pins),
-                                    tp, nullptr, /*locals_only=*/true)) {
-                    /* v1: no temps - kept OUT of the contest (#124(a)),
-                     * so none can hold a register here */
+                                    tp, nullptr, /*locals_only=*/true);
+                if (lsra_ok_gp && !jit_lever_off(JL_TREGS)
+                        && chunk.handler_sites.empty()) {
+                    std::set<int> used;
+                    for (const LsraPiece &p : tp.pieces)
+                        if (p.reg >= 0)
+                            used.insert(p.reg);
+                    const int k2 = static_cast<int>(max_pins) - 2;
+                    if (static_cast<int>(used.size()) + 1 <= k2 - 0
+                            && static_cast<int>(max_pins)
+                                   - static_cast<int>(used.size()) >= 3) {
+                        LsraOut tp2;
+                        g_lsra_temps_ok = true;
+                        if (jit_lsra_assign(chunk, begin, end, liv, lq,
+                                            lev, liu, k2, tp2, nullptr,
+                                            /*locals_only=*/true))
+                            tp = std::move(tp2);
+                        g_lsra_temps_ok = false;
+                    }
+                }
+                if (lsra_ok_gp) {
+                    /* #86: a temp holds a register only where
+                     * g_lsra_temps_ok admitted it - non-ref-listed */
 #ifndef NDEBUG
                     for (const LsraPiece &p : tp.pieces)
-                        ML_CHECK(p.reg < 0 || p.slot < chunk.slot_count);
+                        ML_CHECK(p.reg < 0 || p.slot < chunk.slot_count
+                                 || !jit_slot_ref_listed(chunk, p.slot));
 #endif
                     if (jit_lsra_snap(chunk, begin, end, liv, lq,
                                       liu, static_cast<int>(max_pins),
@@ -29762,6 +29873,13 @@ retry_emission:
                         for (const LsraPiece &p : tp.pieces)
                             if (p.reg >= 0)
                                 lsra_aregs.push_back(p.reg);
+                        for (const LsraPiece &p : tp.pieces)
+                            if (p.reg >= 0 && p.slot >= chunk.slot_count) {
+                                lsra_temp_aregs.insert(p.reg);
+#ifdef TESTS
+                                g_jit_temp_regs++;      /* emit-time */
+#endif
+                            }
                         std::sort(lsra_aregs.begin(), lsra_aregs.end());
                         lsra_aregs.erase(
                             std::unique(lsra_aregs.begin(),
@@ -30284,9 +30402,18 @@ retry_emission:
                                : across[h] ? 1 : 2;
                 if (want != pass)
                     continue;
+                /* #86: a TEMP pin stays off rax/rcx/rdx (see
+                 * lsra_temp_aregs) */
+                const uint32_t hexcl = hot[h] >= chunk.slot_count
+                    ? ((1u << RAX) | (1u << RCX) | (1u << RDX)  /* reg:isa */
+                       | (~gp_caller_saved_mask() & 0xFFFFu))
+                    : 0u;
                 if (pass == 1) {
-                    int rg = e.ra.take(CAP_ALLOCATABLE | CAP_CALLEE_SAVED);
+                    int rg = e.ra.take(CAP_ALLOCATABLE | CAP_CALLEE_SAVED,
+                                       0u, hexcl);
                     if (rg < 0)
+                        rg = e.ra.take(CAP_ALLOCATABLE, 0u, hexcl);
+                    if (rg < 0)          /* an entry occupant must bind */
                         rg = e.ra.take(CAP_ALLOCATABLE);
                     ML_CHECK(rg >= 0);
                     hot_reg[h] = static_cast<uint8_t>(rg);
@@ -30299,8 +30426,11 @@ retry_emission:
                     : !pins_cs_bet ? 0u
                     : pin_abi[h] >= 0 ? (1u << pin_abi[h])
                     : (gp_caller_saved_mask() & ~abi_mask);
-                int rg = e.ra.take(CAP_ALLOCATABLE, pref, pins_cs_excl);
+                int rg = e.ra.take(CAP_ALLOCATABLE, pref,
+                                   pins_cs_excl | hexcl);
                 if (rg < 0)              /* a full pool: rax is a pin */
+                    rg = e.ra.take(CAP_ALLOCATABLE, pref, hexcl);
+                if (rg < 0)              /* an entry occupant must bind */
                     rg = e.ra.take(CAP_ALLOCATABLE, pref);
                 ML_CHECK(rg >= 0);       /* hot.size() <= max_pins */
                 hot_reg[h] = static_cast<uint8_t>(rg);
@@ -30335,9 +30465,17 @@ retry_emission:
                     continue;
                 const uint32_t apref = pins_cs_bet
                     ? (gp_caller_saved_mask() & ~abi_mask) : 0u;
-                int pr = e.ra.take(CAP_ALLOCATABLE, apref, pins_cs_excl);
+                /* #86: and clear of every CALLEE-saved register: a
+                 * temp never lives across a call (the admission rule),
+                 * so one buys nothing but a push/pop per ENTRY */
+                const uint32_t texcl = lsra_temp_aregs.count(ar)
+                    ? ((1u << RAX) | (1u << RCX) | (1u << RDX)  /* reg:isa */
+                       | (~gp_caller_saved_mask() & 0xFFFFu))
+                    : 0u;
+                int pr = e.ra.take(CAP_ALLOCATABLE, apref,
+                                   pins_cs_excl | texcl);
                 if (pr < 0 && pins_cs_excl)  /* never DROP an areg over */
-                    pr = e.ra.take(CAP_ALLOCATABLE, apref);  /* the bet */
+                    pr = e.ra.take(CAP_ALLOCATABLE, apref, texcl);
                 if (pr < 0)
                     continue;            /* denied-shrunk pool: drop */
                 /* #123: the PLAN owns this for the whole run, even
@@ -31690,6 +31828,15 @@ retry_emission:
                     for (const int src : af.second.src)
                         if (src == slot)
                             return false;
+                /* #86: a dead TEMP is read by nobody, in main too -
+                 * no frame-lifetime argument needed, only the liveness
+                 * (and no try region, whose handler it cannot see) */
+                if (slot >= chunk.slot_count && slot < 64
+                        && xcall_lsl_ok && chunk.handler_sites.empty()
+                        && !jit_lever_off(JL_TREGS)
+                        && !jit_slot_ref_listed(chunk, slot)
+                        && !xcall_lsl.live_in(pc, slot))
+                    return true;
                 return ret_lsl_ok && begin == 0 && end == n
                        && slot >= 0 && slot < 64
                        && !std::binary_search(chunk.ref_slots.begin(),
@@ -31742,8 +31889,21 @@ retry_emission:
                                             na.payload, na.type,
                                             static_cast<uint8_t>(
                                                 tr.reg) });
-                        e.load(static_cast<uint8_t>(tr.reg),
-                               na.payload);
+                        /* #86: installed AT ITS DEFINITION - the op at
+                         * this pc writes the slot and does not read it,
+                         * so the register is written before anything
+                         * reads it and the load would be dead */
+                        std::vector<int> iu, idf;
+                        const bool def_first =
+                            !jit_lever_off(JL_TREGS)
+                            && jit_op_slot_refs(chunk.code[pc], iu, idf)
+                            && std::find(idf.begin(), idf.end(),
+                                         tr.install_slot) != idf.end()
+                            && std::find(iu.begin(), iu.end(),
+                                         tr.install_slot) == iu.end();
+                        if (!def_first)
+                            e.load(static_cast<uint8_t>(tr.reg),
+                                   na.payload);
                     } else {
                         /* ⛔ the register is CLAIMED mid-run (a C1
                          * region's B3 take at its entry, a B1

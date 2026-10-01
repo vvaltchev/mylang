@@ -36227,6 +36227,97 @@ static bool jit_xcall_brackets()
 }
 
 /*
+ * ==========  #86: EXPRESSION TEMPS IN REGISTERS  ==========
+ *
+ * `a*a + b*b + a*b - a + b`: the first product's consumer is not the
+ * next op, so lever A cannot forward it and it went through memory - a
+ * tag store, a payload store and a reload. A non-ref-listed temp
+ * touched only by the specialized int family, not spanning a call, now
+ * competes in the linear scan (`tregs`): ON, g's body stores neither
+ * temp and g_jit_temp_regs moves; OFF, the same dump stores them. The
+ * value is checked against the tree-walker in both, over a loop.
+ */
+static bool jit_temp_regs()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const bool splice_was = g_bc_inline_enabled;
+    g_bc_inline_enabled = false;
+    const unsigned off_was = g_jit_off_extra;
+    struct Restore {
+        bool sp; unsigned off;
+        ~Restore() { g_bc_inline_enabled = sp; g_jit_off_extra = off; }
+    } restore{ splice_was, off_was };
+    const std::vector<const char *> lines = {
+        "func g(int a, int b) {",
+        "  var t = a * a + b * b + a * b - a + b;",
+        "  if (t > 99999) { t = t & 4095; }",
+        "  return t; }",
+        "var s = 0;",
+        "for (var i = 0; i < runtime(40); i++) {",
+        "  s = (s + g(i, s & 7)) & 1023; }",
+        "print(s);"
+    };
+    std::string src;
+    for (const char *l : lines) { src += l; src += '\n'; }
+    /* stores of a temp's TYPE WORD in g - a temp in memory pays one per
+     * definition; the dump names temps rN with N >= the local count.
+     * ANY source operand: on the low-address arena the tag is an imm32
+     * (`<int-tag>`), off it (MYLANG_NO_LOWMEM, the nolowmem CI lane) a
+     * register (`rsi`) - matching only the first counted 0 stores both
+     * ways there and failed the lane while the property held. */
+    const auto temp_tag_stores = [&](const std::string &d) {
+        size_t k = 0;
+        for (const NativeIns &ni : native_ins_of(d, "func g"))
+            if (ni.text.compare(0, 5, "mov r") == 0
+                    && ni.text.find(".type, ") != std::string::npos
+                    && ni.text.compare(0, 7, "mov r0.") != 0
+                    && ni.text.compare(0, 7, "mov r1.") != 0)
+                k++;
+        return k;
+    };
+    bool ok = true;
+    const std::string want =
+        engine_run_bt(src, ExecEngine::TreeWalk, false, false);
+    const unsigned long t0 = g_jit_temp_regs;
+    std::string on, off;
+    try {
+        on = native_dump_of(lines);
+        if (engine_run_bt(src, ExecEngine::Vm, true, false) != want) {
+            fprintf(stderr, "jit_temp_regs: tregs ON disagrees with the "
+                            "tree-walker\n");
+            ok = false;
+        }
+        g_jit_off_extra = off_was | jit_lever_bit("tregs");
+        off = native_dump_of(lines);
+        if (engine_run_bt(src, ExecEngine::Vm, true, false) != want) {
+            fprintf(stderr, "jit_temp_regs: tregs OFF disagrees with the "
+                            "tree-walker\n");
+            ok = false;
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "jit_temp_regs: threw %s: %s\n", e.name, e.msg);
+        return false;
+    }
+    if (g_jit_temp_regs == t0) {
+        fprintf(stderr, "jit_temp_regs: no temp was given a register\n");
+        ok = false;
+    }
+    const size_t n_on = temp_tag_stores(on), n_off = temp_tag_stores(off);
+    if (n_off == 0 || n_on >= n_off) {
+        fprintf(stderr, "jit_temp_regs: g's temp type-word stores - %zu "
+                        "with tregs, %zu without (want fewer with)\n",
+                n_on, n_off);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * ==========  THE ENTRY FILLER IS FOR THE CALLS  ==========
  *
  * SP3. `entry_pad` pads a fragment's prologue to CALL-READY when its
@@ -49956,6 +50047,10 @@ static const std::vector<extra_check> extra_checks =
       "hostile shape against the tree-walker); a call in a loop with a "
       "live one loses the bet, a call outside the loop keeps them",
       jit_xcall_brackets },
+    { "jit: #86 - an expression temp whose consumer is not the next op "
+      "lives in a register (no tag store, no payload store, no reload); "
+      "the tregs lever off stores it",
+      jit_temp_regs },
     { "jit: the shape tests' MACHINE-INSTRUCTION MODEL parses every "
       "form the emitter produces (it fails closed, so a form it does "
       "not know must fail HERE and not silently match nothing)",

@@ -1428,7 +1428,15 @@ collision). Three nets now:
   back per iteration measured +17% Ir on 97_regs_int_call;
   `MYLANG_JIT_FORCE=xcall` skips the bet (the soundness half alone).
   Float pins are untouched: xmm is all caller-saved and they were
-  always spilled as payloads by the call bracket),
+  always spilled as payloads by the call bracket), tregs (#86: an
+  expression TEMP may hold a register - the linear scan's second plan,
+  run only when the locals' plan leaves three registers idle, at a
+  budget two below the pool so the emitters keep scratch. A temp is
+  admitted only if non-ref-listed, touched only by the specialized int
+  family (IntAddRR .. IntModRI), not read by a ReturnV, not spanning a
+  MyLang call, and never in rax/rcx/rdx (ISA roles) or a callee-saved
+  register (a push/pop per entry); installed at its definition with no
+  load, and a dead temp's evict writes nothing, in main too),
   bakecallee (#97 step 4: a call to a WRITE-ONCE global slot has a
   callee the emitter can NAME - `jit_baked_callee` reads it out of
   `JitCtx::slot_desc`, the same map `callv_native_ok` has always
