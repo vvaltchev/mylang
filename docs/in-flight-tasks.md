@@ -83,38 +83,36 @@ RUN, 2026-09-22 (`my/cpp`), which is the table above one arc later:**
     58_structs                    0.079      0.009    8.87x
 
 **AND 2026-10-01, AFTER THE CALLBACK, CLOSURE-INLINING, REGCALL, #124(b),
-#86 AND #84 ARCS** (`bench/run.py -cl cpp`, build-claude/perf at ff44488
-built `OPT=1 ASSERTS=0 TESTS=0`, `-npc`, one run, the cpp cache
-RE-TIMED the same day with `--recompute --force` - no machine-speed
-warning; geomean over 99: **1.698x**). Worst fifteen, then the benches
-the tables above tracked:
+#86 AND #84 ARCS** (`bench/run.py -cl cpp`, build-claude/perf at 406657f
+built `OPT=1 ASSERTS=0 TESTS=0`, `-npc`, one run; the cpp cache
+re-timed the same day under the converging calibration - marker
+method 2, no drift warning; geomean over 99: **1.695x**). Worst
+fifteen, then the benches the tables above tracked:
 
-    58_structs                0.073   0.011   6.76x
-    64_struct_create          0.103   0.018   5.73x
-    96_find_sum_key           0.136   0.025   5.47x
-    26_dict_iterate           0.107   0.023   4.68x
-    74_dyn_foreach_kv         0.119   0.026   4.53x
-    75_indexed_unpack         0.108   0.024   4.49x
-    20_foreach_unpack         0.127   0.030   4.17x
-    29_str_slice_readonly     0.164   0.040   4.07x
-    28_str_concat             0.067   0.016   4.07x
-    86_elem_arith_compound    0.092   0.023   3.96x
-    100_funcval_dispatch4     0.081   0.020   3.94x
-    32_str_build_join         0.211   0.054   3.93x
-    13_array_append           0.033   0.009   3.87x
-    76_funcval_dispatch       0.070   0.018   3.85x
-    87_elem_shift_compound    0.075   0.021   3.59x
+    58_structs                0.072   0.009   7.77x
+    64_struct_create          0.105   0.018   5.90x
+    96_find_sum_key           0.137   0.025   5.51x
+    26_dict_iterate           0.107   0.022   4.90x
+    74_dyn_foreach_kv         0.121   0.026   4.64x
+    75_indexed_unpack         0.106   0.024   4.40x
+    20_foreach_unpack         0.126   0.031   4.10x
+    28_str_concat             0.066   0.016   4.06x
+    29_str_slice_readonly     0.161   0.040   4.01x
+    100_funcval_dispatch4     0.081   0.021   3.95x
+    32_str_build_join         0.210   0.053   3.94x
+    13_array_append           0.034   0.009   3.92x
+    86_elem_arith_compound    0.091   0.023   3.90x
+    76_funcval_dispatch       0.071   0.018   3.83x
+    68_nested                 0.078   0.021   3.71x
 
-    09_fib_recursive 3.38x  11_closure_counter 3.07x  35_map_filter 3.06x
-    78_typed_param_call 2.94x  34_sort_custom_cmp 1.96x  73_multi_unpack
-    1.95x  63_closures 1.16x  97_regs_int_call 1.40x  101_float_call 3.03x
-    102_call_outer_hot_inner 1.81x
+    09_fib_recursive 3.36x  11_closure_counter 3.05x  35_map_filter 3.02x
+    78_typed_param_call 2.95x  34_sort_custom_cmp 1.98x  73_multi_unpack
+    1.94x  63_closures 1.16x  97_regs_int_call 1.30x  101_float_call 3.08x
+    102_call_outer_hot_inner 1.77x
 
-(The first run of this table, against the old cache, warned that the
-machine read ~14% faster than the cache's day; re-timing C++ moved the
-per-bench cpp times by a few percent at most and the geomean 1.695x ->
-1.698x - the calibration loop's drift did not carry over to the
-benches. The `my` column, cached-free, is the comparison to trust.)
+(58's C++ time is ~9-11ms, so its ratio moves 6.8x-7.8x between C++
+re-times on the C++ side alone - its `my` column, 0.072-0.075, is
+steady.)
 
 By the `my` column since 2026-09-22: 34 0.106 -> 0.040, 11 0.079 ->
 0.038, 63 0.190 -> 0.029, 78 0.051 -> 0.021, 09 0.152 -> 0.071, 73
