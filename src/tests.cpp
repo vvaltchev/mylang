@@ -36058,6 +36058,175 @@ static bool jit_regcall_float_args()
 }
 
 /*
+ * ==========  #124(b): CALLER-SAVED PINS IN A RUN THAT CALLS  ==========
+ *
+ * A MyLang call op is emitted with every caller-saved GP pin LIVE
+ * across it written back (payload and tag) and out of the register
+ * view, and reloaded where its paths rejoin; a dead one is dropped and
+ * re-adopted with no reload. The profitability BET then re-emits a run
+ * whose call INSIDE A LOOP had to write a live one back. So:
+ *
+ *  - FORCED (`MYLANG_JIT_FORCE=xcall`: the bet never loses) - the
+ *    bracket runs on the hostile shapes: locals live across a plain
+ *    call, a self recursion deep enough to switch and resume through a
+ *    post-call stub, mutual recursion, a throw caught across a call, a
+ *    closure call, float pins, and a FUSED argument read only by its
+ *    call (the hole that printed 771 for 3055). Tree-walker parity is
+ *    the oracle; g_jit_xcall_brackets must move.
+ *  - UNFORCED - a call outside the loop keeps the registers (brackets,
+ *    no lost bet); the loop-carried shape loses the bet.
+ */
+static bool jit_xcall_brackets()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const std::string leaf =
+        "func leaf(int x) {\n"
+        "  var t = x * 3;\n"
+        "  for (var j = 0; j < 2; j++) t = t + j;\n"
+        "  return t & 1023; }\n";
+    const std::string loop = leaf +
+        "func plain(int n) {\n"
+        "  var a0 = 1; var a1 = 2; var a2 = 3; var a3 = 4;\n"
+        "  var a4 = 5; var a5 = 6; var a6 = 7; var a7 = 8;\n"
+        "  for (var i = 0; i < n; i++) {\n"
+        "    a0 = (a0 * 3 + i) & 65535; a1 = (a1 ^ i) + 7;\n"
+        "    a2 = (a2 + a0) & 65535; a3 = (a3 * 5 + 1) & 65535;\n"
+        "    a4 = (a4 ^ a1) & 65535; a5 = (a5 + i * 2) & 65535;\n"
+        "    a6 = (a6 * 7 + a2) & 65535;\n"
+        "    a7 = (a7 + leaf(a3 + a5)) & 65535; }\n"
+        "  return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7; }\n"
+        "print(plain(int(runtime(50))));\n";
+    const std::string deep =
+        "func deep(int n) {\n"
+        "  if (n == 0) return 1;\n"
+        "  var a0 = n; var a1 = n * 2; var a2 = n * 3; var a3 = n * 5;\n"
+        "  var a4 = n * 7; var a5 = n * 11; var a6 = n * 13;\n"
+        "  var a7 = n * 17;\n"
+        "  var r = deep(n - 1);\n"
+        "  return (r + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7)\n"
+        "         & 1048575; }\n"
+        "print(deep(int(runtime(600))));\n";
+    const std::string thrown = leaf +
+        "struct Boom { int v; }\n"
+        "func thrower(int x) {\n"
+        "  var t = x;\n"
+        "  for (var j = 0; j < 2; j++) t = t + j;\n"
+        "  if (x % 7 == 3) throw Boom(x);\n"
+        "  return t; }\n"
+        "func catching(int n) {\n"
+        "  var a0 = 1; var a1 = 2; var a2 = 3; var a3 = 4;\n"
+        "  var a4 = 5; var a5 = 6; var a6 = 7; var a7 = 0;\n"
+        "  for (var i = 0; i < n; i++) {\n"
+        "    a0 = a0 + i; a1 = a1 + a0; a2 = a2 ^ a1; a3 = a3 + 3;\n"
+        "    a4 = a4 + a2; a5 = (a5 * 3) & 65535; a6 = a6 + a5;\n"
+        "    try { a7 = a7 + thrower(i); }\n"
+        "    catch (Boom as b) { a7 = a7 - b.v; } }\n"
+        "  return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7; }\n"
+        "print(catching(int(runtime(40))));\n";
+    const std::string fused =
+        "func blend(float a, float b) {\n"
+        "  var t = a * 0.75 + b * 0.25;\n"
+        "  t = t + a * b * 0.0001;\n"
+        "  if (t > 1000.0) t = t - 1000.0;\n"
+        "  return t * 0.999 + a * 0.0005; }\n"
+        "func drive(int n) {\n"
+        "  var x0 = 1.0; var x1 = 2.0; var x2 = 3.0; var x3 = 4.0;\n"
+        "  var s = 0.0;\n"
+        "  for (var i = 0; i < n; i++) {\n"
+        "    x0 = x0 * 0.5 + 1.0; x1 = x1 * 0.25 + x0;\n"
+        "    x2 = x2 * 0.125 + x1; x3 = x3 * 0.5 + x2 * 0.5;\n"
+        "    s = blend(s, x3); }\n"
+        "  return int(s * 1000.0) + int(x0 + x1 + x2 + x3); }\n"
+        "print(drive(int(runtime(300))));\n";
+    /* the GP twin of `fused`: `s` is pinned (written by an int op,
+     * not by the call - a call's dst is never a pin), READ only by
+     * the staging move the fusion drops, and dead at the call - the
+     * liveness credits the move's pc, the call binds at its own - and
+     * eight more locals push it into a caller-saved register (rcx) */
+    const std::string fused_int = leaf +
+        "func ifused(int n) {\n"
+        "  var a0 = 1; var a1 = 2; var a2 = 3; var a3 = 4;\n"
+        "  var a4 = 5; var a5 = 6; var a6 = 7; var a7 = 8;\n"
+        "  var s = 0; var t = 0;\n"
+        "  for (var i = 0; i < n; i++) {\n"
+        "    a0 = (a0 * 3 + i) & 65535; a1 = (a1 ^ i) + 7;\n"
+        "    a2 = (a2 + a0) & 65535; a3 = (a3 * 5 + 1) & 65535;\n"
+        "    a4 = (a4 ^ a1 ^ s) & 65535; a5 = (a5 + i * 2 + s) & 65535;\n"
+        "    a6 = (a6 * 7 + a2) & 65535; a7 = (a7 + a3 + a5) & 65535;\n"
+        "    t = leaf(s); s = (t + 1) & 65535; }\n"
+        "  return s + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7; }\n"
+        "print(ifused(int(runtime(50))));\n";
+    const std::string pre = leaf +
+        "func pre(int n) {\n"
+        "  var base = leaf(n);\n"
+        "  var a0 = base; var a1 = 2; var a2 = 3; var a3 = 4;\n"
+        "  var a4 = 5; var a5 = 6; var a6 = 7; var a7 = 8;\n"
+        "  for (var i = 0; i < n; i++) {\n"
+        "    a0 = (a0 * 3 + i) & 65535; a1 = (a1 ^ i) + 7;\n"
+        "    a2 = (a2 + a0) & 65535; a3 = (a3 * 5 + 1) & 65535;\n"
+        "    a4 = (a4 ^ a1) & 65535; a5 = (a5 + i * 2) & 65535;\n"
+        "    a6 = (a6 * 7 + a2) & 65535; a7 = (a7 + a3 + a5) & 65535; }\n"
+        "  var tail = leaf(a7);\n"
+        "  return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + tail; }\n"
+        "print(pre(int(runtime(60))));\n";
+    bool ok = true;
+    const auto parity = [&](const char *name, const std::string &src) {
+        const std::string want =
+            engine_run_bt(src, ExecEngine::TreeWalk, false, false);
+        const std::string got =
+            engine_run_bt(src, ExecEngine::Vm, true, /*splice=*/false);
+        if (got != want) {
+            fprintf(stderr, "jit_xcall_brackets [%s]: got \"%s\", the "
+                            "tree-walker \"%s\"\n", name, got.c_str(),
+                    want.c_str());
+            ok = false;
+        }
+    };
+    const unsigned force_was = g_jit_force_extra;
+    {
+        g_jit_force_extra |= jit_lever_bit("xcall");
+        const unsigned long b0 = g_jit_xcall_brackets;
+        parity("plain", loop);
+        parity("deep", deep);
+        parity("thrown", thrown);
+        parity("fused", fused);
+        parity("fused int", fused_int);
+        g_jit_force_extra = force_was;
+        if (g_jit_xcall_brackets == b0) {
+            fprintf(stderr, "jit_xcall_brackets: FORCED, no call op was "
+                            "emitted with a caller-saved pin written "
+                            "back\n");
+            ok = false;
+        }
+    }
+    {
+        const unsigned long b0 = g_jit_xcall_brackets;
+        const unsigned long l0 = g_jit_xcall_lost;
+        parity("pre", pre);
+        if (g_jit_xcall_brackets == b0 || g_jit_xcall_lost != l0) {
+            fprintf(stderr, "jit_xcall_brackets [pre]: a call outside "
+                            "the loop should keep the registers "
+                            "(brackets %lu, lost bets %lu)\n",
+                    g_jit_xcall_brackets - b0, g_jit_xcall_lost - l0);
+            ok = false;
+        }
+        const unsigned long l1 = g_jit_xcall_lost;
+        parity("plain (unforced)", loop);
+        if (g_jit_xcall_lost == l1) {
+            fprintf(stderr, "jit_xcall_brackets: the loop-carried shape "
+                            "did not lose the bet\n");
+            ok = false;
+        }
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
  * ==========  THE ENTRY FILLER IS FOR THE CALLS  ==========
  *
  * SP3. `entry_pad` pads a fragment's prologue to CALL-READY when its
@@ -40149,16 +40318,19 @@ static bool jit_xcache_pins()
           "print(f(runtime(40)));" }, true },
 
       /*
-       * THE DECLINE THAT MATTERS. `emit_sync_push_native` builds a call
-       * RECORD with r10/r11 as raw scratch, outside any prologue
-       * bracket, so a run containing a MyLang CALL must not spend them.
-       * Same six accumulators, one call in the loop.
+       * A MyLang CALL INSIDE THE LOOP, its accumulators live across it.
+       * #124(b) lets a call run spend caller-saved registers - the call
+       * op is emitted with them written back and out of the register
+       * view - but a pin live across a call INSIDE A LOOP pays a store
+       * and a reload per iteration, so the run loses the profitability
+       * bet and is emitted with the old denial: DECLINES, by design.
+       * (The bracket's correctness on this shape is
+       * jit_xcall_brackets' job, under MYLANG_JIT_FORCE=xcall.)
        *
-       * The VALUE is the real oracle here: with the decline removed the
-       * push overwrites two live accumulators and the sum is wrong (the
-       * counter would still say "engaged").
+       * The VALUE stays the oracle: a wrong bracket or a wrong bet
+       * corrupts a live accumulator, and the sum is wrong.
        */
-      { "a MyLang call in the loop DECLINES the extension",
+      { "a MyLang call in the loop DECLINES (the #124(b) bet)",
         { "var sink = 0;",
           /* IMPURE and OVER THE INLINE WEIGHT on purpose - the first
            * version of this case wrote `func h(int x) => x + 1`, which
@@ -40181,6 +40353,26 @@ static bool jit_xcache_pins()
           "        d = d + c; e = e + d; g = g + h(e); }",
           "    return a + b + c + d + e + g; }",
           "print(f(runtime(40)));" }, false },
+
+      /* #124(b): the same run, its call moved OUT of the loop - nothing
+       * caller-saved is live across a call in a loop, so the loop keeps
+       * the extension although the run calls */
+      { "a MyLang call OUTSIDE the loop ENGAGES (#124(b))",
+        { "var sink = 0;",
+          "func h(int x) {",
+          "    sink = sink + 1;",
+          "    var t = x * 3; var u = t - 1;",
+          "    var v = u + t; var w = v * 2;",
+          "    if (w > 1000000) { w = w - 1000000; }",
+          "    return w + u + t + 7; }",
+          "func f(int n) {",
+          "    var a = h(n); var b = 2; var c = 3;",
+          "    var d = 4; var e = 5; var g = 6;",
+          "    for (var i = 0; i < n; i++) {",
+          "        a = a + i; b = b + a; c = c + b;",
+          "        d = d + c; e = e + d; g = g + e; }",
+          "    return a + b + c + d + e + g; }",
+          "print(f(runtime(40)));" }, true },
 
       /*
        * ⛔ THE C1-HOIST SHAPE, AND IT ANSWERED `false` BY CONSTRUCTION
@@ -49759,6 +49951,11 @@ static const std::vector<extra_check> extra_checks =
       "a widened int and a dyn source, a pinned parameter taken into its "
       "float pin; the regcall lever off sends none",
       jit_regcall_float_args },
+    { "jit: #124(b) - a run that calls pins caller-saved too: the call "
+      "op writes back the live ones and reloads them (forced: every "
+      "hostile shape against the tree-walker); a call in a loop with a "
+      "live one loses the bet, a call outside the loop keeps them",
+      jit_xcall_brackets },
     { "jit: the shape tests' MACHINE-INSTRUCTION MODEL parses every "
       "form the emitter produces (it fails closed, so a form it does "
       "not know must fail HERE and not silently match nothing)",
@@ -49801,7 +49998,7 @@ static const std::vector<extra_check> extra_checks =
       "encoders, pool invariants, allocator contract (#96 (c))",
       jit_reg_model },
     { "jit: the CALLER-SAVED pin extension r10/r11 - engages on a "
-      "call-free fragment, declines around a MyLang call (#96)",
+      "call-free fragment and, since #124(b), around a MyLang call (#96)",
       jit_xcache_pins },
     { "jit: RAX as the 13th pin - engages on a fully-pinned accumulator "
       "kernel, declines on shape and on coverage (#96 rax)",

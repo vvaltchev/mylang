@@ -902,6 +902,13 @@ in the scan and were stripped afterwards, leaving the freed register
 idle. `jit_lsra_assign(..., locals_only)`; record: *#124(a)* in
 docs/jit-optimizations.md.
 
+**✅ (b) BUILT 2026-10-01 (the maintainer's call: an architectural
+objection to the cap, not a ceiling question)** - record: *#124(b)* in
+docs/jit-optimizations.md. A run that calls may pin caller-saved; each
+call op writes back the live ones and reloads them; a call inside a
+loop with a live one loses the bet. 102_call_outer_hot_inner -21.4%
+cycles. (c) next.
+
 **(b) MEASURED BEFORE BUILDING, 2026-09-26 - NOT BUILT, ON THE NUMBERS.**
 bench/my/97_regs_int_call (eight int recurrences + one real call per
 iteration; my/cpp **1.41x** already) is the shape (b) exists for. Its

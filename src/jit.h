@@ -1594,6 +1594,8 @@ extern "C" unsigned long g_jit_pins_cs_lost;   /* ...and lost bets */
 extern "C" unsigned long g_jit_ret_unflushed;  /* REGCALL 2 reach */
 extern "C" unsigned long g_jit_regcall_proven; /* REGCALL 3 reach */
 extern "C" unsigned long g_jit_regcall_fargs;   /* REGCALL 4 reach */
+extern "C" unsigned long g_jit_xcall_brackets;  /* #124(b) reach */
+extern "C" unsigned long g_jit_xcall_lost;      /* ...and lost bets */
 extern "C" unsigned long g_jit_regcall_fpinned; /* ...into a pin */
 extern "C" unsigned long g_jit_call_align;      /* SP3: self-aligned */
 extern "C" unsigned long g_jit_call_dead_model; /* SP3: unreachable */
