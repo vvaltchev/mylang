@@ -182,6 +182,8 @@ unsigned long g_jit_entry_pad_off = 0;
 unsigned long g_jit_pins_cs = 0;      /* REGCALL 1: runs whose pins
                                        * took the caller-saved bet */
 unsigned long g_jit_pins_cs_lost = 0; /* ...and re-emitted on losing */
+unsigned long g_jit_regcall_proven = 0; /* REGCALL 3: register args
+                                         * bound with no type dispatch */
 unsigned long g_jit_ret_unflushed = 0; /* REGCALL 2: returns that left a
                                         * dead write-back out */
 unsigned long g_jit_call_align = 0;
@@ -9747,7 +9749,49 @@ struct RegArg {
     int32_t slot = -1;     /* a caller window slot (payload read) */
 };
 
-static void emit_frameless_window(Emitter &e, const Instr &in,
+/*
+ * REGCALL step 3: is the argument SOURCE slot `ss` of the call at `pc`
+ * a PROVEN int at the call - written by the op just before it with an
+ * int bus tag (jit_fwd_bus_tag: ints by construction), with nothing in
+ * between but argument moves the fusion emits nothing for, and no
+ * branch, handler or resume landing on the way (fwd_tgt)? Then the
+ * site's type dispatch on it is an emit-time fact and is not emitted.
+ * The producer's store is not in question: `ss` is read by the call,
+ * so lever A's write elision (dead temps only) cannot have taken it.
+ */
+static const std::vector<char> *g_cur_fwd_tgt = nullptr;
+static size_t g_cur_run_begin = 0;
+static bool jit_fwd_producer(const Instr &in, int &dst);
+static const void *jit_fwd_bus_tag(OpCode op);
+static bool jit_arg_src_proven_int(const Chunk &ck, size_t pc, int ss)
+{
+    if (!g_cur_fwd_tgt || pc >= ck.code.size())
+        return false;
+    const std::vector<char> &tgt = *g_cur_fwd_tgt;
+    size_t q = pc;
+    while (q > g_cur_run_begin) {
+        if (q < tgt.size() && tgt[q])
+            return false;            /* control may arrive from elsewhere */
+        const size_t p = q - 1;
+        const Instr &w = ck.code[p];
+        if (g_cur_argfuse_skip && p < g_cur_argfuse_skip->size()
+                && (*g_cur_argfuse_skip)[p]) {
+            /* an argument move whose staging the fusion dropped: it
+             * emits nothing - unless it touches `ss`, step past it */
+            if (w.target == ss || (!w.a_is_lit() && w.a_slot() == ss))
+                return false;
+            q = p;
+            continue;
+        }
+        int d = -1;
+        return jit_fwd_producer(w, d) && d == ss
+               && jit_fwd_bus_tag(w.op) == jit_layout().t_int;
+    }
+    return false;
+}
+
+static void emit_frameless_window(Emitter &e, const Chunk &ck,
+                                  const Instr &in,
                                   const FuncDescriptor *callee,
                                   const Chunk &cck, const ArgFuse *af,
                                   std::vector<size_t> &j_slow_win,
@@ -9818,6 +9862,12 @@ static void emit_frameless_window(Emitter &e, const Instr &in,
             } else if (e.freg_at(ss) >= 0) {
                 j_slow_win.push_back(e.j32(0xEB));   /* a narrowing */
                 continue;
+            } else if (jit_arg_src_proven_int(
+                           ck, static_cast<size_t>(e.cur_pc), ss)) {
+                ra.slot = s;            /* REGCALL 3: no dispatch */
+#ifdef TESTS
+                e.bump_counter(&g_jit_regcall_proven);
+#endif
             } else {
                 ra.slot = s;
                 e.cmp_mem_tag(RBX, s + 24, L.t_int, R11);    /* reg:proto */
@@ -11937,7 +11987,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 (fl_ck->slot_count + fl_ck->n_temps) * 48;
             WinTramp wt; wt.win = fl_win;
             std::vector<RegArg> reg_args;         /* REGCALL 1A */
-            emit_frameless_window(e, in, fl_callee, *fl_ck, af, wt.j,
+            emit_frameless_window(e, ck, in, fl_callee, *fl_ck, af, wt.j,
                                   reg_args);
             /* the dst word: the slot address with bit 0 set, or bare 1
              * for a discarded result (the arm masks the bit, so it reads
@@ -14823,6 +14873,7 @@ void jit_stats_report()
         { "pins_cs",          &g_jit_pins_cs },
         { "pins_cs_lost",     &g_jit_pins_cs_lost },
         { "ret_unflushed",    &g_jit_ret_unflushed },
+        { "regcall_proven",   &g_jit_regcall_proven },
         { "call_align",       &g_jit_call_align },
         { "call_dead_model",  &g_jit_call_dead_model },
         { "hoist_rmw",        &g_jit_hoist_rmw },
@@ -18435,11 +18486,31 @@ pick_float_lits(Emitter &e, const Chunk &chunk, size_t begin, size_t end)
 static bool region_preheader_reached(
     const Chunk &chunk, size_t begin, size_t end,
     const std::vector<std::pair<size_t, size_t>> &entries,
-    size_t T, size_t L)
+    size_t T, size_t L, bool post_call_ok = false)
 {
-    for (const auto &pe : entries)
-        if (pe.first >= T && pe.first <= L)
-            return false;
+    /*
+     * REGCALL step 3 (C5 only - `post_call_ok`): a POST-CALL resume
+     * whose call is inside the region does not breach it in a run
+     * whose originals are DELETED. The stub is entered only by a
+     * record the emitted call site wrote, i.e. after native code ran
+     * that call - and native code reaches the call only through the
+     * preheader, the back edge, or another such resume (induction).
+     * With the originals kept the interpreter could run the call
+     * itself and land on the inserted EnterNative, so the caller
+     * passes it only for a deletable run. C4e cannot take it: its
+     * invariant is a constructed VALUE the resume would skip.
+     */
+    for (const auto &pe : entries) {
+        if (pe.first < T || pe.first > L)
+            continue;
+        if (post_call_ok && pe.first > T) {
+            const OpCode op = chunk.code[pe.first - 1].op;
+            if (op == OpCode::CallV || op == OpCode::CachedCallV
+                    || op == OpCode::CallValueV)
+                continue;
+        }
+        return false;
+    }
     for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
         for (const Chunk::HandlerClause &cl : hs.clauses)
             if (cl.body_pc >= static_cast<int>(T)
@@ -18525,7 +18596,7 @@ static void jit_pick_release_slots(
     const std::vector<std::pair<size_t, size_t>> &entries,
     const std::vector<uint64_t> &fwd_lin, bool fwd_live_ok,
     std::vector<std::vector<int>> &active,
-    std::map<size_t, std::vector<int>> &rel_at)
+    std::map<size_t, std::vector<int>> &rel_at, bool deleted_run)
 {
     static const bool dbg = getenv("MYLANG_RELDBG") != nullptr;
     active.assign(end - begin, {});
@@ -18544,7 +18615,8 @@ static void jit_pick_release_slots(
                 { L = p; found = true; }
         }
         if (!found
-                || !region_preheader_reached(chunk, begin, end, entries, T, L))
+                || !region_preheader_reached(chunk, begin, end, entries,
+                                             T, L, deleted_run))
             continue;
 
         /* every def in the region, split by whether it keeps the slot
@@ -28675,6 +28747,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     std::vector<char> fwd_tgt;
     const bool fwd_live_ok =
         jit_fwd_info(chunk, fwd_lout, fwd_lin, fwd_tgt);
+    g_cur_fwd_tgt = fwd_live_ok ? &fwd_tgt : nullptr;   /* REGCALL 3 */
     g_fwd = JitFwd{};
 
     /* op -> enum NAME (the audit's label; from the X-macro, so it can
@@ -29122,6 +29195,7 @@ retry_emission:
         argfuse_skip.clear();
         g_cur_argfuse = nullptr;
         g_cur_argfuse_skip = nullptr;
+        g_cur_run_begin = begin;                   /* REGCALL 3 */
 
         /* N5: pin up to `max_pins` hot int slots for this run. The PICK
          * runs BEFORE the entry is emitted, because it decides which
@@ -30184,7 +30258,8 @@ retry_emission:
         std::vector<std::vector<int>> rel_active;
         std::map<size_t, std::vector<int>> rel_at;
         jit_pick_release_slots(chunk, begin, end, entries, fwd_lin,
-                               fwd_live_ok, rel_active, rel_at);
+                               fwd_live_ok, rel_active, rel_at,
+                               deletable[r] != 0);
 
         /* #96 inc-2: chain overflow slots onto registers with disjoint
          * ranges; a chained slot leaves spill_hot (a seam beats a
@@ -32297,6 +32372,7 @@ retry_emission:
     g_cur_entry_remap = nullptr;        /* #56: emission done */
     g_cur_argfuse = nullptr;            /* #162: fragment-scoped storage */
     g_cur_argfuse_skip = nullptr;
+    g_cur_fwd_tgt = nullptr;
     g_cur_arg_stage_pools = nullptr;
     g_cur_call_caches = nullptr;
     g_cur_norec_sites = nullptr;

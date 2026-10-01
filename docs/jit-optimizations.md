@@ -16410,6 +16410,63 @@ slots 4 time(s)". `retwb` joined `corpus_diff --levers`; plain /
 in all five modes, `norec_enum --depth 3` and `bt_oracle` agree,
 `driver_checks` green on debug and release.
 
+## #97 REGCALL 3 - AN ARGUMENT COMPUTED FOR THE CALL (2026-09-30)
+
+**WHAT IT COST.** `s = g(s & 1023, i)` computes its first argument into
+a staging temp, and main also reuses that temp for a builtin's result -
+so the temp is REF-LISTED. Its store paid the four-instruction
+reference test and a cold release call, and the REGCALL site then
+re-read it with a type dispatch (`cmp r3.type, int; je; cmp r3.type,
+bool; jne decline`) before `mov rdi, r3`. Two changes:
+
+ - **C5 RELEASES IT IN A LOOP THAT CALLS.** The preheader release
+   (`jit_pick_release_slots`) refused every loop containing a MyLang
+   call, because the call's POST-CALL RESUME stub is an interior entry
+   and `region_preheader_reached` refuses them all. That stub cannot
+   bypass the preheader in a run whose originals are DELETED: it is
+   entered only by a record the emitted call site wrote, i.e. after
+   native code ran that call, which native code reaches only through
+   the preheader, the back edge or another such resume. So C5 (and
+   only C5, `post_call_ok`) admits it there - with the originals kept,
+   the interpreter could run the call itself and land on the inserted
+   EnterNative. C4e keeps the strict rule: its invariant is a
+   constructed VALUE a resume would skip.
+ - **THE SITE KNOWS THE TYPE.** `jit_arg_src_proven_int`: walking back
+   from the call over argument moves the fusion emits nothing for, if
+   the op that wrote the source temp has an int bus tag
+   (`jit_fwd_bus_tag` - ints by construction) and no branch, handler
+   or resume lands in between (`fwd_tgt`), the dispatch is an emit-time
+   fact and is not emitted. The producer's store is not in question:
+   the call reads the temp, so lever A's write elision (dead temps
+   only) cannot have taken it.
+
+**NOT DONE, and why:** the value still goes through memory (`mov r3,
+rax` then `mov rdi, r3`). Lever A forwards only into the NEXT op, and
+here an argument move sits between producer and call; and the site
+uses rcx/r9/r10/r11 as scratch before it loads the argument registers,
+so rax cannot be held that long without moving the site's own scratch.
+
+**MEASURED** (callgrind Ir, scale 3 minus scale 1, `-npc`,
+`OPT=1 ASSERTS=0`, against step 2's commit):
+
+    63_closures               -6.25%   (C5 in main's loop, which calls)
+    09_fib_recursive          -2.80%
+    94_builtin_in_helper      -2.53%
+    10_recursion_deep         -2.27%
+    95_recursion_with_builtin -2.23%
+    92_recursion_with_helper  -1.58%
+    01 03 07 11 12 34 43 46 54 55 76 78 83 91 93 97 99: flat
+
+**NETS.** `jit_regcall_arg_proven` (runs the program against the
+tree-walker; requires `g_jit_release_entry` and `g_jit_regcall_proven`
+to move for the int-argument loop, and the proven counter NOT to move
+for a `dyn` local argument). Watched failing: with the resume
+exception ignored it reports "released no temp in its preheader", with
+the fact forced off "was not bound as a proven int". `-rt` green in all
+five modes; corpus_diff plain / `--levers` / `--xrot` / `--nolowmem` /
+`--spcheck`, `norec_enum --depth 3`, `norec_sweep`, `driver_checks`
+(debug and release) all green.
+
 ## TWO FINDINGS OF THE REGCALL WORK, FIXED (2026-09-30)
 
 **A `dyn` CALL RAN A NESTED C++ ACTIVATION PER CALL.** The generic
