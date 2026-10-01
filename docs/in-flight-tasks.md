@@ -698,8 +698,9 @@ work — but profile it before building, the way increment 0 was.
         C5 releases in a loop that calls, and an int-op argument binds
         with no dispatch; float arguments in xmm2-5 with float params
         pinnable from their bind (new bench 101_float_call). Cumulative
-        Ir from 13b0dbc: 09 -4.2%, 10 -4.4%, 91 -4.7%, 92 -4.6%, 93
-        -2.4%, 94 -2.5%, 95 -4.3%, 97 -3.1%, 63 -6.3%, 101 -8.3%; one
+        Ir from 13b0dbc: 09 -4.1%, 10 -4.4%, 91 -4.7%, 92 -4.6%, 93
+        -2.4%, 94 -2.5%, 95 -4.3%, 97 -3.1%, 63 -6.3% (101: -8.3% from
+        step 4 alone, written for it); one
         wall run 0.85x-1.01x. LEFT (task #81): an argument held in a
         register into the site (lever A past an argument move), the
         reference-by-pointer parameter, and #124 next.
