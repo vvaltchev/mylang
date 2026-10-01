@@ -16282,6 +16282,77 @@ reference parameters and a slice), the updated `jit_frameless_w2_shape`
 `jit_bake_coercing`'s bool->int counter, now bumped by the register
 path's bool arm.
 
+## #97 REGCALL 1, CONTINUED - CALL-FREE PINS (2026-09-30)
+
+**WHAT.** A function body's entry runs PER CALL - for a frameless
+callee the prologue is on the call's own path - and every CALLEE-saved
+pin costs a push there and a pop at every exit. The weight model
+(`gp_weight`) prices callee-saved as the cheaper kind because it
+assumes a call to survive; a run that brackets no call has none. Such
+a run now pins in the CALLER-saved half, and a REGCALL parameter
+(`jit_regcall_arg_reg`) in the register its argument ARRIVES in, so
+the frameless entry moves nothing: the probe `g(int a, int b)` enters
+as `push rbp; mov rbp, rsp; push rbx; lea rbx, [rbp+0x20]` and its
+body reads `rdi`/`rcx` directly, where it used to `push r12; push
+r13; ...; mov r12, rdi; mov r13, rcx` and pop both at the exit.
+
+**HOW.** A per-run BET (`pins_cs_lost`, jit_compile_chunk), the W6/SP3
+shape: taken for a function body (`g_cur_caller_desc`) whose run has
+no MyLang call op (`jit_run_blocks_xcache` - those emitters use
+caller-saved registers raw), and settled from `n_prologues` after the
+run is emitted - a run that BRACKETS a helper call would spill and
+reload every caller-saved pin around it, per call, so it loses and is
+emitted again with the model's own preference. The REGCALL parameters
+ask the allocator FIRST, each preferring its argument register; the
+other pins then prefer the rest of the caller-saved half, so no
+parameter's register is taken from under it. rax is excluded unless
+the pool is exactly full (the W6 note: the accumulator and the
+status every call tests).
+
+**SOUNDNESS** never rides on the bet: a caller-saved pin is spilled at
+a bracket either way (the xcache machinery), and `jit_xcache_clobber`
+denies whatever a run uses raw - this changes only which register a
+pin gets FIRST, exactly the axis `--xrot` has always permuted. The
+frameless entry needed one change for it: the vframe publish (and the
+TESTS poison, which used rcx) now runs BEFORE the REGCALL arguments
+are taken, through r8/r11 only - no argument arrives there - so the
+"pin in r8/r11/rcx demotes to a store" rule is gone (rdx under W4
+remains).
+
+**ONE TRAP, found by the measurement.** The first version passed the
+rax exclusion to the mid-run abstract-register take too, with no
+fallback - and an areg the take cannot serve is DROPPED by design.
+83_regs_int_40 lost the loop counter's register that way: **+44.6%
+Ir**, with every correctness net green (a dropped areg only leaves its
+slot in memory). Both takes fall back to the full pool now.
+
+**MEASURED** (callgrind Ir, scale 3 minus scale 1, `-npc`,
+`OPT=1 ASSERTS=0` both sides):
+
+    91_call_from_function     -2.33%
+    97_regs_int_call          -1.57%
+    92_recursion_with_helper  -1.52%
+    03 09 10 11 12 34 46 63 76 78 83 93 94 95 99: flat to the
+    instruction
+
+09/10/93/95 are flat by construction: their bodies CALL (self or
+mutual recursion), so a caller-saved pin would be clobbered and the
+bet is not taken. The win is the push/pop pairs of a call-free
+callee; it is small because the probe's remaining cost is elsewhere
+(steps 2 and 3).
+
+**NETS.** `jit_regcall_pins_caller_saved` (both directions in one
+program: ON, g's frameless entry pushes no r12-r15 and moves no
+argument register, and `g_jit_pins_cs` bumps; OFF via the new `pincs`
+lever, the same entry does push - so the ON half cannot pass on a
+shape that never pinned). Watched failing: dropping the
+argument-register preference makes it report `mov r10, rdi` /
+`mov r11, rcx`. `jit_two_address` and `jit_xcache_pins` hold `pincs`
+off for their duration - they pin the PICK's own preference and the
+memory step form, which a different register choice re-plans. `pincs`
+joined `corpus_diff --levers`; plain / `--levers` / `--xrot` /
+`--nolowmem` / `--spcheck` all agree, `-rt` green in all five modes.
+
 ## TWO FINDINGS OF THE REGCALL WORK, FIXED (2026-09-30)
 
 **A `dyn` CALL RAN A NESTED C++ ACTIVATION PER CALL.** The generic
