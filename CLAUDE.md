@@ -7801,6 +7801,15 @@ the bytecode splice extends both, so no site can derive one and not
 the other (#97 CB5). A builtin that only asks whether the callback's
 result is TRUE (a comparator, a predicate) calls `inv.test(...)`, which
 reads it in place and releases a reference result there (#97 CB7).
+**test()'s scalar path is INLINE (#84, `src/vminvoke.h`, included by
+types.cpp and vm.cpp):** bind, ONE fragment call (`jit_enter2`, rax:rdx)
+and the result read sit in the builtin's loop - for a body whose every
+return is an int or a bool (`Chunk::ret_truth_regs`) the truth is the
+payload the boundary return leaves in rdx, on the inline arm and after
+the C++ tier alike. ⛔ ONE CALL PER ELEMENT is the rule that governs it:
+when the inline function outgrew GCC's budget it became an out-of-line
+clone again (+12% Ir), and forcing it inline at every comparator site
+cost +17% cycles - keep it small, never let a second call appear.
 ⛔ That was built in four shapes on 2026-08-14 and REJECTED at 1.20x
 slower - on a WSL2 box with no PMU, where "front-end/layout" could only
 be guessed. On native hardware the path is BACKEND-bound (top-down

@@ -7,6 +7,7 @@
 #include "bytecode.h"
 #include "syntax.h"
 #include "eval.h"
+#include "vminvoke.h"   /* VmInvoker::bind_raw (#84) */
 #include "errors.h"
 #include "backtrace.h"   /* flush_inline_frames (Inc 4 backtrace parity) */
 #include "bitops.h"
@@ -7620,6 +7621,8 @@ unsigned long g_jit_invoke_direct = 0;   /* lever 2 execution proof */
  * shape, so a test must reset both first - they are process-global. */
 unsigned long g_invoke_prepared = 0;
 unsigned long g_invoke_raw = 0;
+unsigned long g_invoke_test_inline = 0;  /* #84: inline test() entries */
+unsigned long g_invoke_test_regs = 0;    /* #84: ...answered from rdx */
 unsigned long g_invoke_fallback = 0;
 #endif
 
@@ -7826,39 +7829,8 @@ vm_invoker_test(const Chunk *cck, EvalContext *c, VmActivation *act,
  * The PREPARED entry: bind the argv run into the window the ctor pushed,
  * then run the body. One out-of-line call per callback element.
  */
-/* #97: the RAW scalar bind - see the CbScalar comment in vm.h */
-/*
- * #97 CB6: no per-slot raw_bindable() test. Between two calls of a live
- * invoker EVERY window slot is trivial and not borrowed: the window is
- * pushed fresh, each call ends in the release scan over the list its
- * bind needs (ref_slots / ref_slots_raw), a slot outside that list can
- * never hold a reference, and nothing else writes the window between
- * elements (a throw unwinds the builtin, and the dtor pops it). That is
- * exactly what the VM_HARDENING audit at the end of vm_invoker_body
- * asserts over the whole window, so it is restated here as a check, not
- * paid as a test. The boxed decline lives out of line so this hot
- * function saves fewer registers.
- */
-ML_ALWAYS_INLINE void VmInvoker::bind_raw(const CbScalar *ra, size_t n)
-{
-    LValue *win = w_->slots;
-#if ML_VM_HARDENING
-    for (size_t i = 0; i < n; i++)
-        ML_VM_CHECK(win[i].raw_bindable());
-#endif
-#ifdef TESTS
-    g_invoke_prepared++;
-    g_invoke_raw++;
-#endif
-    for (size_t i = 0; i < n; i++) {
-        if (ra[i].kind == 0)
-            win[i].bind_scalar_raw(ra[i].i);
-        else if (ra[i].kind == 1)
-            win[i].bind_scalar_raw(ra[i].f);
-        else
-            win[i].bind_scalar_raw(ra[i].i != 0);
-    }
-}
+/* VmInvoker::bind_raw lives in vminvoke.h (#84: the test path inlines
+ * it into the builtin's loop) */
 
 EvalValue VmInvoker::call_scalars(const CbScalar *ra, size_t n)
 {
@@ -7868,6 +7840,58 @@ EvalValue VmInvoker::call_scalars(const CbScalar *ra, size_t n)
     return vm_invoker_body(cck_, c_, act_, desc_, w_->slots,
                            static_cast<int_type>(w_->size), entry_,
                            site_, cck_->ref_slots_raw);
+}
+
+/*
+ * #84: everything after the fragment call that the inline test path
+ * (VmInvoker::test_scalars, vminvoke.h) does not handle itself - a
+ * non-boundary exit (the raise dispatch or the interpreted
+ * continuation), a pending raise, a release scan, a result that is
+ * not a bool or an int - in exactly vm_invoker_run's order. ONE
+ * out-of-line call, on the uncommon path only.
+ */
+ML_NOINLINE bool VmInvoker::test_tail(size_t r)
+{
+    if (r != JIT_RET_BOUNDARY) {
+        try {
+            vm_invoke_postexit(*cck_, *c_, *act_, r);
+        } catch (Exception &e) {
+            vm_capture_desc_frame(e, desc_, site_);
+            throw;
+        }
+    }
+    if (g_vm_exc_pending) {
+        vm_capture_desc_frame(*g_vm_exc_pending, desc_, site_);
+        std::unique_ptr<RuntimeException> ex = std::move(g_vm_exc_pending);
+        ex->rethrow();
+    }
+    LValue *win = w_->slots;
+    const int_type total = static_cast<int_type>(w_->size);
+    for (const int32_t sidx : cck_->ref_slots_raw) {
+        if (sidx >= total)
+            break;                       /* sorted */
+        if (win[sidx].get().get_type()->t >= Type::t_str)
+            win[sidx].frame_release();
+    }
+#if ML_VM_HARDENING
+    for (int_type i = 0; i < total; i++)
+        ML_VM_CHECK(win[i].get().get_type()->t < Type::t_str);
+#endif
+    return test_result();
+}
+
+/* the result's truth, read in place (CB7) - shared by the inline path's
+ * rare result kinds and the tail above */
+ML_NOINLINE bool VmInvoker::test_result()
+{
+    if (c_->flow->type != FlowState::ret)
+        return false;                     /* no value: none, falsy */
+    c_->flow->type = FlowState::none;
+    EvalValue &v = c_->flow->value;
+    const bool t = v.truthy();
+    if (v.get_type()->t >= Type::t_str)
+        v = EvalValue();
+    return t;
 }
 
 bool VmInvoker::call_scalars_test(const CbScalar *ra, size_t n)

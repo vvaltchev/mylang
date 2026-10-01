@@ -1,0 +1,56 @@
+# #84: a callback's truth value - sort's comparator, filter's predicate,
+# find's key - is read on an INLINE path, and for a body whose every
+# return is an int or a bool, straight from the payload register the
+# boundary return leaves (Chunk::ret_truth_regs). Each shape must print
+# exactly what the tree-walker prints.
+
+var a = [];
+var x = 12345;
+for (var i = 0; i < 300; i++) {
+    x = (x * 1103515245 + 12345) % 2147483647;
+    append(a, x % 1000);
+}
+
+# a bool comparator (CmpIntV: the payload register path)
+var s1 = clone(a);
+sort(s1, func(p, q) => p < q);
+print("bool", s1[0], s1[150], s1[299]);
+
+# an INT-valued "comparator" (truthy when non-zero)
+var s2 = clone(a);
+sort(s2, func(p, q) { var d = q - p; if (d < 0) d = 0; return d; });
+print("int", s2[0], s2[150], s2[299]);
+
+# a nested callback returning STRINGS before the comparator's own
+# return: flow->value holds a reference, so the boundary return takes
+# the C++ slow tier - which must still hand back the payload
+var s3 = clone(a);
+sort(s3, func(p, q) {
+    var t = map(func(v) => str(v), [p, q]);
+    var r = p < q;
+    if (len(t) > 5) r = q < p;
+    return r;
+});
+print("nested", s3[0], s3[150], s3[299]);
+
+# a TRY region makes the frame not plain, so the whole return takes the
+# C++ tier (the inline arm's gate) - which must still hand back the
+# payload register, the result being a plain comparison
+var s5 = clone(a);
+sort(s5, func(p, q) {
+    var r = p < q;
+    try { if (p == -1) { var z = p - p; r = 1 / z == 0; } }
+    catch { r = q < p; }
+    return r;
+});
+print("slow tier", s5[0], s5[150], s5[299]);
+
+# a FLOAT result: not eligible (-0.0 is falsy with a non-zero payload)
+var s4 = clone(a);
+sort(s4, func(p, q) => (p < q) * 1.0);
+print("float", s4[0], s4[150], s4[299]);
+
+# filter and find through the same path
+var ev = filter(func(v) => v % 2 == 0, a);
+print("filter", len(ev), ev[0]);
+print("find", find(a, a[7], func(v) => v));

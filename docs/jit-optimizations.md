@@ -16682,6 +16682,76 @@ is why the admission rules read as they do. `tregs` joined
 `norec_enum`, `norec_sweep`, `nested_fuzz` (300) and `driver_checks`
 (debug and release) are green.
 
+## #84 - THE CALLBACK ENTRY'S BOOKKEEPING (2026-10-01)
+
+**MEASURED FIRST.** On 34_sort_custom_cmp each comparison cost ~145
+instructions (callgrind, scale 3 minus scale 1, `-npc`): ~34 in
+`sort_core`'s heapsort, ~28 in the emitted comparator, and **~83 in
+the C++ entry around it** (`VmInvoker::call_scalars_test` with
+`vm_invoker_test` inlined) - its prologue/epilogue and marshalling
+(~25), a four-store bind per argument (~11), the `FlowState` round
+trip and result read (~24), the gates and the call (~20). Three steps,
+measured after each (pinned P-core cycles are best of 3):
+
+| step | 34 Ir | 34 cycles | also |
+|---|---|---|---|
+| 1. test()'s scalar path INLINE in the builtin's loop (`src/vminvoke.h`) | -29.1% | -23.4% | 35 -5.8% |
+| 2. the bind writes payload + type only (`bind_scalar_payload`) | -3.9% | -3.4% | 35 -1.3%, 96 -0.9% |
+| 3. the truth in RDX for an int/bool-returning body | +1.0% | -7.4% | 35 +1.0% |
+
+Cumulative on 34: **824.6M -> 567.9M Ir (-31.1%), 796M -> 547M cycles
+(-31.3%)**; 35_map_filter -6.0% Ir, 96 -0.7%; 32, 41, 67 flat.
+
+ - **Step 1.** The hot path - the gates, the raw bind, ONE fragment
+   call, the exit checks, a bool/int result read - is an inline member
+   (`test_scalars`) in a header the builtins' TU includes. Everything
+   else leaves through out-of-line halves on its own path only:
+   `test_tail` (a non-boundary exit, a pending raise, a release scan -
+   vm_invoker_run's order exactly) and `test_result`. Its Ir win is
+   larger than the ~25 the wrapper cost, because the compiler now
+   optimises `sort_core`'s loop around it.
+ - **Step 2.** A prepared window slot's `container` and `is_const` are
+   already clear between elements (pushed so, written by no op, kept so
+   by every raw bind); `bind_scalar_payload` writes two words where
+   `bind_scalar_raw` writes four, and ML_VM_CHECKs the premise.
+ - **Step 3.** `Chunk::ret_truth_regs` (derived beside the frameless
+   facts, never stored): no Halt, and every ReturnV returns a slot that
+   is not ref-listed, never read before written, and written only by a
+   compare (setcc + movzx: a clean 0/1) or an int op - so its payload
+   IS its truth. The boundary return arm then also leaves the payload
+   in rdx (`mov rdx, r11` / the forwarded register), the C++ slow tier
+   reloads rdx from `flow->value` after `jit_ret` (it returns the same
+   status with rdx clobbered - the one place this could go silently
+   wrong), and `jit_enter2` returns rax:rdx (a 16-byte struct under
+   SysV). The Ir is FLAT - the type read became a branch on the chunk
+   flag - but the result no longer goes store -> load through
+   `flow->value`, which is the latency the cycle count sees.
+
+**⛔ THE LESSON STEP 3 COST TWO TRIES TO LEARN: ONE CALL, AND SMALL.**
+The first version added a second `jit_enter2` call sequence beside the
+first; the inline function outgrew GCC's budget and became an
+out-of-line `constprop` clone - the two-call shape vm_invoker_run's
+comment already warns about - for **+12% Ir**. Forcing it inline at
+every comparator site in `sort_core` made it **+14% Ir / +17%
+cycles**. One call for both kinds (`jit_enter2` always; rdx is garbage
+when the flag is off and is not read) fixed both.
+
+**A TOOL FIX ON THE WAY.** Step 3's first cut added a 33rd lever: the
+lever masks are 32-bit `unsigned`, so `1u << 32` - UBSan reported it,
+a release build would have aliased it onto lever 0. Step 3 has no lever
+(a derived fact, REGCALL 1B's rule) and `static_assert(JL_COUNT <= 32)`
+now fails the build instead.
+
+**NETS.** `jit_callback_truth_regs` (sort order vs the tree-walker; the
+inline path, the rdx path and the slow tier's rdx reload must each
+run - the slow tier reached through a TRY region in a reference-free
+comparator, the only shape that consumes its rdx: map moves every
+result out of flow->value, so the arm's other slow edge is
+unreachable). `tests/functional/57_callback_test_regs.my` (bool, int,
+nested-callback, slow-tier and float comparators, filter, find) runs
+under every corpus matrix. Watched: the slow tier's reload removed
+scrambles that sort (`515 4 561` for `0 519 998`).
+
 ## TWO FINDINGS OF THE REGCALL WORK, FIXED (2026-09-30)
 
 **A `dyn` CALL RAN A NESTED C++ ACTIVATION PER CALL.** The generic

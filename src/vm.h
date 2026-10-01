@@ -108,6 +108,8 @@ extern unsigned long g_esc_named_by_cs;
 extern unsigned long g_invoke_prepared;
 extern unsigned long g_invoke_fallback;
 extern unsigned long g_invoke_raw;   /* prepared entries bound RAW (#97) */
+extern unsigned long g_invoke_test_inline; /* #84: test() served inline */
+extern unsigned long g_invoke_test_regs;   /* #84: ...answered from rdx */
 /* lever 4 execution proof: per-element runs of the SPECIALIZED dyn-foreach
  * Next bodies (resolved once at ForeachDynInit): 0 int / 1 float / 2 bool /
  * 3 gen / 4 dict */
@@ -255,7 +257,7 @@ public:
                       && (cb_scalar_v<std::decay_t<A>> && ...)) {
             const CbScalar ra[] = {
                 CbScalar(static_cast<std::decay_t<A>>(args))... };
-            return call_scalars_test(ra, sizeof...(A));
+            return test_scalars(ra, sizeof...(A));  /* vminvoke.h */
         } else {
             return call(static_cast<A &&>(args)...).truthy();
         }
@@ -304,6 +306,12 @@ private:
     EvalValue call_scalars_boxed(const CbScalar *ra, size_t n);
     bool call_scalars_test(const CbScalar *ra, size_t n);
     void bind_raw(const CbScalar *ra, size_t n);
+    /* #84: the INLINE test path (vminvoke.h - included by the one TU
+     * whose builtins call test(), and by vm.cpp) and its out-of-line
+     * uncommon half */
+    bool test_scalars(const CbScalar *ra, size_t n);
+    bool test_tail(size_t r);
+    bool test_result();
 
     EvalValue call_eval_func(const EvalValue *argv, size_t n);
 

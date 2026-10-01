@@ -2093,6 +2093,16 @@ struct Chunk {
      */
     bool frameless_ret_regs = false;
     /*
+     * #84 step 3: every value this chunk returns is an int or a bool
+     * whose payload is its own truth value, so a BOUNDARY return (a
+     * callback's return to C++) also leaves the payload in RDX - on the
+     * inline arm and after the C++ slow tier alike - and VmInvoker's
+     * inline test path reads `rdx != 0` instead of flow->value's type
+     * and payload (jit_enter2). Derived beside the frameless facts
+     * (jit_chunk_frameless_derive), never stored.
+     */
+    bool ret_truth_regs = false;
+    /*
      * #97 increment 3 (W3): bit `s` set = window slot `s` is written ONLY
      * by ops that store it raw (payload + type word, never through
      * LValue::put) and is not ref-listed, so a frameless SITE building

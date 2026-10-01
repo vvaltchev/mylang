@@ -183,6 +183,8 @@ unsigned long g_jit_entry_pad_off = 0;
 unsigned long g_jit_pins_cs = 0;      /* REGCALL 1: runs whose pins
                                        * took the caller-saved bet */
 unsigned long g_jit_pins_cs_lost = 0; /* ...and re-emitted on losing */
+unsigned long g_jit_ret_truth_slow = 0; /* #84: boundary returns through
+                                         * the C++ tier that reloaded rdx */
 unsigned long g_jit_temp_regs = 0; /* #86: temp pieces given a register
                                      * (emit-time) */
 unsigned long g_jit_xcall_lost = 0; /* #124(b): runs re-emitted with the
@@ -471,6 +473,12 @@ static unsigned jit_force_mask()
  * tests that must A/B a lever without an environment round-trip (the
  * env masks are cached statics). */
 unsigned g_jit_off_extra = 0;
+/* ⛔ THE MASKS ARE 32 BITS WIDE: a 33rd lever is `1u << 32`, undefined
+ * behaviour that UBSan reports and a release build silently aliases
+ * onto lever 0 (#84 added one and watched it fire). Widen
+ * g_jit_off_extra / g_jit_force_extra and the env masks before adding
+ * past 32. */
+static_assert(JL_COUNT <= 32, "the lever masks are 32-bit");
 /* OFF wins over FORCE (a disabled lever stays disabled). */
 static bool jit_lever_off(JitLever l)
 {
@@ -680,6 +688,22 @@ size_t jit_enter(const void *frag, void *slots)
      * jit_enter_deep (the helper path's direct entry, below). */
     typedef size_t (*NativeFrag)(void *);
     return reinterpret_cast<NativeFrag>(const_cast<void *>(frag))(slots);
+}
+
+/* #84 step 3: jit_enter that also returns RDX - a callee whose chunk
+ * has ret_truth_regs leaves its result's payload there on a boundary
+ * return. A 16-byte trivially-copyable struct comes back in rax:rdx
+ * under SysV, so this is the same call as jit_enter with nothing added
+ * on the C++ side. */
+#if defined(__clang__)
+__attribute__((no_sanitize("function")))
+#elif defined(__GNUC__)
+__attribute__((no_sanitize_undefined))
+#endif
+JitRet2 jit_enter2(const void *frag, void *slots)
+{
+    typedef JitRet2 (*NativeFrag2)(void *);
+    return reinterpret_cast<NativeFrag2>(const_cast<void *>(frag))(slots);
 }
 
 /* The switching entry for jit_call_sync_core's DIRECT callee entry (the
@@ -9642,6 +9666,64 @@ void jit_chunk_frameless_derive(Chunk &ck)
                                               static_cast<int32_t>(
                                                   in.a_slot()))))
                 ck.frameless_ret_regs = false;
+    /*
+     * #84 step 3: is every value this chunk can return an INT or a BOOL
+     * whose 64-bit payload is its own truth value (non-zero <=> truthy)?
+     * Then a callback's boundary return also leaves the payload in rdx
+     * and the inline test path reads it from there (Chunk::
+     * ret_truth_regs). Every ReturnV must return a slot that is not
+     * ref-listed and never read before written (so its value came from
+     * an instruction, not the bind), every writer of which is a compare
+     * (setcc + movzx: a clean 0/1) or an int op; and no Halt, whose
+     * boundary return leaves no value at all.
+     */
+    ck.ret_truth_regs = true;     /* no lever: a derived fact (1B's rule) */
+    bool any_ret = false;
+    std::vector<int> ru, rd;
+    for (const Instr &in : ck.code) {
+        if (!ck.ret_truth_regs)
+            break;
+        if (in.op == OpCode::Halt) {
+            ck.ret_truth_regs = false;
+            break;
+        }
+        if (in.op != OpCode::ReturnV)
+            continue;
+        any_ret = true;
+        const int rs = in.a_is_lit() ? -1 : in.a_slot();
+        if (rs < 0 || rs >= 64
+                || std::binary_search(ck.ref_slots.begin(),
+                                      ck.ref_slots.end(),
+                                      static_cast<int32_t>(rs))
+                || ((ck.frameless_read_first >> rs) & 1)) {
+            ck.ret_truth_regs = false;
+            break;
+        }
+        bool written = false;
+        for (const Instr &w : ck.code) {
+            if (!jit_op_slot_refs(w, ru, rd)) {
+                ck.ret_truth_regs = false;   /* an unaudited op */
+                break;
+            }
+            if (std::find(rd.begin(), rd.end(), rs) == rd.end())
+                continue;
+            written = true;
+            const OpCode o = w.op;
+            const bool int_or_bool =
+                o == OpCode::CmpIntV || o == OpCode::CmpFloatV
+                || o == OpCode::IntBin || o == OpCode::LoadImmInt
+                || o == OpCode::IntAddModRI
+                || (o >= OpCode::IntAddRR && o <= OpCode::IntModRI);
+            if (!int_or_bool) {
+                ck.ret_truth_regs = false;
+                break;
+            }
+        }
+        if (!written)
+            ck.ret_truth_regs = false;
+    }
+    if (!any_ret)
+        ck.ret_truth_regs = false;
 }
 
 #ifdef TESTS
@@ -13231,6 +13313,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
             if (fwd) {
                 /* #71: the forwarded result, straight from the register
                  * - no slot store before, no slot load here */
+                if (ck.ret_truth_regs)
+                    e.mov_rr(RDX, FWD);   /* #84: the payload, for C++ */
                 st(RCX, L.fs_value, FWD);
                 e.store_type_tag_base(
                     RCX, L.fs_value
@@ -13250,6 +13334,8 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                  * callback return takes */
                 ld(R11, RBX, s);                   /* the payload */
                 st(RCX, L.fs_value, R11);
+                if (ck.ret_truth_regs)
+                    e.mov_rr(RDX, R11);   /* #84: the payload, for C++ */
                 ld(R11, RBX, s + static_cast<int32_t>(L.off_type));
                 st(RCX, L.fs_value
                             + static_cast<int32_t>(EvalValue::jit_type_off()),
@@ -13743,6 +13829,19 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                       ? reinterpret_cast<const void *>(jit_ret)
                       : reinterpret_cast<const void *>(jit_halt));
     e.pub_offpath--;
+    /* #84 step 3: a boundary return through the C++ tier owes the
+     * payload in rdx too (Chunk::ret_truth_regs) - jit_ret wrote it to
+     * flow->value; rax (the status) is preserved */
+    if (ck.ret_truth_regs && res_slot >= 0) {
+        e.load_global(RCX, jit_layout().addr_ctx, RCX);      /* reg:abi */
+        e.load_base(RCX, RCX,                                /* reg:abi */
+                    static_cast<int32_t>(jit_layout().ctx_flow));
+        e.load_base(RDX, RCX,                                /* reg:abi */
+                    static_cast<int32_t>(jit_layout().fs_value));
+#ifdef TESTS
+        e.bump_counter(&g_jit_ret_truth_slow);   /* preserves rax */
+#endif
+    }
     /* ret (rax = sentinel) */
     e.frag_ret(Emitter::RetFlush::flushed);
 }
@@ -14917,6 +15016,8 @@ void jit_stats_report()
         { "cb_prepared",      &g_invoke_prepared },
         { "cb_fallback",      &g_invoke_fallback },
         { "cb_raw",           &g_invoke_raw },
+        { "cb_test_inline",   &g_invoke_test_inline },
+        { "cb_test_regs",     &g_invoke_test_regs },
         /* #121: slot binds served by the dispatch-free same-kind handle
          * move-assign, vs the ordinary put() they decline to. */
         { "ref_bind_fast",    &g_ref_bind_fast },
@@ -15052,6 +15153,7 @@ void jit_stats_report()
         { "xcall_brackets",   &g_jit_xcall_brackets },
         { "xcall_lost",       &g_jit_xcall_lost },
         { "temp_regs",        &g_jit_temp_regs },
+        { "ret_truth_slow",   &g_jit_ret_truth_slow },
         { "regcall_fpinned",  &g_jit_regcall_fpinned },
         { "call_align",       &g_jit_call_align },
         { "call_dead_model",  &g_jit_call_dead_model },
@@ -33146,6 +33248,7 @@ void jit_chunk_frameless_derive(Chunk &ck)
     ck.frameless_calls = false;
     ck.frameless_init_free = 0;
     ck.frameless_read_first = 0;
+    ck.ret_truth_regs = false;          /* #84: no fragment to return it */
 }
 
 void jit_mark_frameless_wanted(const Chunk &, const JitCtx *)
