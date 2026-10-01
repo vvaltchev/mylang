@@ -7256,6 +7256,16 @@ extern "C" void jit_ret_audit() noexcept
                 continue;
             }
 #endif
+            /* REGCALL step 2: a register-resident value this return
+             * did not write back (Chunk::ret_unflushed) - its slot may
+             * hold stale stack in a frameless window, and is not
+             * ref-listed by construction */
+            if (i < 64 && (my_ck->ret_unflushed >> i & 1)) {
+                ML_VM_CHECK(!std::binary_search(my_ck->ref_slots.begin(),
+                                                my_ck->ref_slots.end(),
+                                                static_cast<int32_t>(i)));
+                continue;
+            }
             if (win[i].get().get_type()->t >= Type::t_str)
                 ML_VM_CHECK(std::binary_search(my_ck->ref_slots.begin(),
                                                my_ck->ref_slots.end(),

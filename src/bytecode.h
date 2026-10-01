@@ -2118,6 +2118,18 @@ struct Chunk {
      */
     uint64_t frameless_read_first = 0;
     /*
+     * REGCALL step 2: bit `s` set = some native RETURN of this chunk
+     * left slot `s`'s register-resident value unwritten (a pin, a
+     * float pin, a spill home or a C3 type word that is not ref-listed
+     * and is not the result) - the window dies with the frame, so the
+     * write-back was dead. Only the hardened return audit reads every
+     * slot, and a frameless window's never-written slot (a REGCALL
+     * parameter that arrived in its pin) holds stale stack: the audit
+     * skips exactly these bits. Set by the JIT at emit time, never
+     * stored.
+     */
+    uint64_t ret_unflushed = 0;
+    /*
      * #97 increment 3 (W4): this chunk's frameless callee runs without
      * ctx.captures being repointed to its FuncObject's capture slots - the
      * site skips the repoint, the return arm the restore, and the

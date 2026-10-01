@@ -16353,6 +16353,63 @@ memory step form, which a different register choice re-plans. `pincs`
 joined `corpus_diff --levers`; plain / `--levers` / `--xrot` /
 `--nolowmem` / `--spcheck` all agree, `-rt` green in all five modes.
 
+## #97 REGCALL 2 - NO WRITE-BACK INTO A DYING WINDOW (2026-09-30)
+
+**WHAT.** A pin is a write-back cache, and a function body used to
+write every one back before it returned - into a window that dies with
+the frame. Two places, and the second was the real one:
+ - **the return** (`emit_ret_native`'s flush) now goes through
+   `Emitter::flush_cache_ret`, which writes back only a ref-listed
+   slot (the release scan reads it) and the result slot (the arms copy
+   it out) - for int pins, float pins, spill homes and C3 type words;
+ - **a linear-scan EVICT** at a pin's last use. Under the shipping
+   allocator a parameter's piece ends at its LAST READ, so its
+   write-back sat in the body, not at the return - the first version
+   elided only the return flush and measured zero reach. An evict is
+   now skipped when `jit_slot_liveness` says the slot is not live-in
+   at that pc - the proof the lever-A write elision uses for temps,
+   taken here only where it needs nothing else: a FUNCTION body (its
+   slots are read by nobody after its return), the run covering the
+   whole chunk, and **no try region** (an exception edge into a
+   handler of this frame is the one reader the argument would have to
+   model).
+
+**THE AUDIT.** The hardened `jit_ret_audit` reads every window slot's
+type word, and a frameless window's REGCALL parameter that arrived in
+its pin is never written at all - its slot holds stale stack. The
+skipped slots are recorded per chunk (`Chunk::ret_unflushed`, a 64-bit
+mask set at emit time, never stored) and the audit skips exactly those
+- after checking each is NOT ref-listed, which is what makes skipping
+it sound. Nothing else reads a non-ref slot after the return: the
+release scans read `ref_slots`, a segment window is zeroed at its next
+push, and the hardened `pop_window` re-scan only asks for TRIVIAL
+types, which a stale int or none is.
+
+**MEASURED** (callgrind Ir, scale 3 minus scale 1, `-npc`,
+`OPT=1 ASSERTS=0`, against step 1's commit):
+
+    91_call_from_function     -2.38%
+    93_mutual_recursion       -2.39%
+    10_recursion_deep         -2.21%
+    95_recursion_with_builtin -2.17%
+    97_regs_int_call          -1.60%
+    92_recursion_with_helper  -1.55%
+    09_fib_recursive          -1.38%
+    03 11 12 34 46 54 55 63 76 78 83 94 99: flat to the instruction
+
+Unlike step 1, the recursion benches move: their bodies call, so their
+pins stay callee-saved, but the evict of a parameter after its last
+read is dead either way.
+
+**NETS.** `jit_regcall_ret_unflushed` (both directions: ON, g's
+parameter slots are never stored and `g_jit_ret_unflushed` bumps; OFF
+via the new `retwb` lever, the same dump stores them 4 times). Watched
+failing: disabling the evict elision reports "stores its parameter
+slots 4 time(s)". `retwb` joined `corpus_diff --levers`; plain /
+`--levers` / `--xrot` / `--nolowmem` / `--spcheck` agree, `-rt` green
+in all five modes, `norec_enum --depth 3` and `bt_oracle` agree,
+`driver_checks` green on debug and release.
+
 ## TWO FINDINGS OF THE REGCALL WORK, FIXED (2026-09-30)
 
 **A `dyn` CALL RAN A NESTED C++ ACTIVATION PER CALL.** The generic

@@ -1482,7 +1482,13 @@ collision). Three nets now:
   no call pins in the CALLER-saved half - a REGCALL parameter in its
   own argument register - since a callee-saved pin costs a push/pop
   per ENTRY, i.e. per call; settled from `n_prologues` after emission
-  with one re-emission, the W6/SP3 bet shape), `all`.
+  with one re-emission, the W6/SP3 bet shape), retwb (REGCALL step 2:
+  a function body writes no register-resident value back into its
+  dying window - at the return, and at a linear-scan evict of a slot
+  `jit_slot_liveness` proves dead (no try region in the body); the
+  skipped slots are `Chunk::ret_unflushed`, which the hardened
+  `jit_ret_audit` skips, since a frameless window's never-written
+  REGCALL parameter slot holds stale stack), `all`.
   `tests/corpus_diff.sh BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the
