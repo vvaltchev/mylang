@@ -16467,6 +16467,62 @@ five modes; corpus_diff plain / `--levers` / `--xrot` / `--nolowmem` /
 `--spcheck`, `norec_enum --depth 3`, `norec_sweep`, `driver_checks`
 (debug and release) all green.
 
+## #97 REGCALL 4 - FLOAT ARGUMENTS IN XMM (2026-09-30)
+
+**WHAT.** The float twin of 1A: a frameless callee's float parameter -
+declared `float` (the bind coerces: a float, or an int WIDENED) or
+inference-proven (an exact float only), not `opt`, not `dyn`, not
+ref-listed - arrives in `JIT_REGCALL_FLT[k]` = xmm2..xmm5, one rule
+(`jit_regcall_farg_reg`) for the site and the entry. xmm2-5 because
+the float encoders take no REX for the pools (xmm0-7), xmm0/xmm1 are
+the staging pair, and xmm0 is the site's own widening scratch.
+
+ - **The site** dispatches in the window fill and loads LAST, floats
+   before ints (an int source widened into a float register may be a
+   GP pin): a float pin moves (`movaps`), an int pin or spill home is
+   converted (`cvtsi2sd`), a slot whose tag is float or int at run time
+   is decided again at the load (the fill declined everything else),
+   a float slot is a plain `movsd`.
+ - **The entry** takes them after the GP ones, the same discipline: a
+   parameter pinned at the entry moves into its float pin (`establish`
+   skips its load, `regcall_fpreloaded`), any other is stored with the
+   float tag and the W5 tail rule; a cycle demotes to a store. Every
+   xmm is caller-saved, so between the loads and the consumption only
+   the TESTS entry probe can clobber them - `frag_entry` saves them
+   (`fkeep_mask`, through rax). A float parameter's pin prefers its own
+   argument register, so the usual case moves nothing at all.
+
+**THE HALF THAT WAS MISSING: NO FLOAT PARAMETER COULD BE PINNED.** A
+float pin's flush writes t_float, so admission needs TYPE EVIDENCE -
+`wrote_float`, i.e. a float op writing the slot in the body. A
+parameter that is only READ has none, so `x` read twenty times in a
+loop stayed in memory and every read paid a float-or-int dispatch. A
+declared or proven non-`opt` float parameter HOLDS a float from its
+bind (vm_bind_arg, the frameless site's dispatch, coerce_to_decl_type
+all widen or refuse), so `jit_qualify_intervals` now records that
+evidence for the chunk being compiled - as `wrote_float` for the pick
+(F4a) and as a write EVENT at the run head for the transition mode
+(F4b, whose write-first rule admits the same-pc first read).
+
+**MEASURED.** No existing bench passes a float to a call that survives
+the splice - every bench was flat to the instruction - so bench
+**101_float_call** was written first (four float recurrences plus one
+call per iteration to `blend(float a, float b)`, the float twin of
+97_regs_int_call; my / py / cpp agree on `result: 3055`):
+
+    101_float_call   157 -> 144 Ir per iteration   -8.28%
+
+**NETS.** `jit_regcall_float_args`, against the tree-walker: a float, a
+widened int and a `dyn` source; requires `g_jit_regcall_fargs`,
+`g_jit_regcall_fpinned` and `g_jit_bake_widen` to move, and the
+`regcall` lever off to send none. Watched failing two ways in one
+build: without the bind evidence "h's entry took no float argument
+into its pin"; with the run-time-tagged load always reading a float, a
+wrong value against the tree-walker. `jit_frameless_w2_shape`'s
+`scale_it(i)` site now expects `cvtsi2sd xmm2, r1*` right before the
+call instead of a window store. `-rt` green in all five modes, every
+corpus matrix agrees, `driver_checks` green on debug and release.
+
 ## TWO FINDINGS OF THE REGCALL WORK, FIXED (2026-09-30)
 
 **A `dyn` CALL RAN A NESTED C++ ACTIVATION PER CALL.** The generic

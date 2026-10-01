@@ -34818,18 +34818,31 @@ static bool jit_frameless_w2_shape()
                     "jne +*",
                     "add rsp, 160" },            /* residue + window */
                     "W2 site add(i)") && ok;
-        /* scale_it(i): the same pin, converted straight into the window */
+        /* scale_it(i): the same pin, widened - REGCALL 4: not into
+         * the window but into xmm2, the float parameter's register,
+         * right before the call */
         const size_t at2 = at == std::string::npos ? at
                            : native_find(mn, mn[at].off + 1, "sub rsp, 144");
         ok = at2 != std::string::npos
              && native_expect(mn, at2, {
                     "sub rsp, 144",
                     "mov r10, rsp",
-                    "xorps xmm0, xmm0",          /* the merge-dep break */
-                    "cvtsi2sd xmm0, r1*",        /* from the register */
-                    "movsd [r10+0x0], xmm0",
-                    "mov [r10+0x18], <float-tag>@r11",
-                    "xor r11, r11" }, "W2 site scale_it(i)") && ok;
+                    "xor r11, r11",
+                    "mov [r10+0x50], r11",
+                    "mov [r10+0x58], r11",
+                    "mov [r10+0x80], r11",
+                    "mov [r10+0x88], r11",
+                    "movabs r11, <addr>",        /* jit_poison_type */
+                    "mov [r10+0x48], r11",
+                    "mov [r10+0x78], r11",
+                    "lea rcx, [rbx+0x*]",        /* dst|1 */
+                    "push rcx",
+                    "push [r9+0x*]",
+                    "movabs rax, <addr>",        /* jit_poison_captures */
+                    "mov [r9+0x*], rax",
+                    "xorps xmm2, xmm2",          /* the merge-dep break */
+                    "cvtsi2sd xmm2, r1*",        /* from the register */
+                    "call <helper>" }, "W2 site scale_it(i)") && ok;
     }
     {
         /* fi(a), `a` dyn: the dispatch on the source's own type word */
@@ -35956,6 +35969,86 @@ static bool jit_regcall_arg_proven()
     if (pb != 0) {
         fprintf(stderr, "jit_regcall_arg_proven: a `dyn` argument was "
                         "bound with no type dispatch (%lu)\n", pb);
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
+/*
+ * ==========  REGCALL STEP 4: FLOAT ARGUMENTS IN XMM  ==========
+ *
+ * A frameless callee's float parameter arrives in xmm2.. instead of its
+ * window slot. Three sources, one program, against the tree-walker: a
+ * float (the loop-carried `s`), an int WIDENED into the float parameter
+ * (`i`, pinned - converted at the load), and a `dyn` whose tag is
+ * decided again at the load (float or int, the fill declined the
+ * rest). `h`'s parameter is read often enough to be PINNED, and the
+ * entry takes it straight into its float pin (regcall_fpinned). The
+ * `regcall` lever off sends none - so the reach is not a shape that
+ * never qualified.
+ */
+static bool jit_regcall_float_args()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const std::string src =
+        "func h(float x) {\n"
+        "  var t = x * x + x * 2.0 - x * 0.25;\n"
+        "  if (t > 1000.0) { t = t / x; }\n"
+        "  return t + x; }\n"
+        "func f(float a, float b) {\n"
+        "  var t = a * 0.5 + b;\n"
+        "  if (t > 1.0e9) { t = 0.0; }\n"
+        "  return t; }\n"
+        "var n = int(runtime(40)); var s = 0.0; var w = 0.0;\n"
+        "var dyn d = runtime(3); var dyn e = runtime(1.5);\n"
+        "for (var i = 0; i < n; i++) {\n"
+        "  s = f(s, 1.0) + h(s * 0.01);\n"
+        "  w = w + f(i, d) + f(e, i); }\n"
+        "print(s, w);\n";
+    bool ok = true;
+    const unsigned long a0 = g_jit_regcall_fargs;
+    const unsigned long p0 = g_jit_regcall_fpinned;
+    const unsigned long w0 = g_jit_bake_widen;
+    const std::string want =
+        engine_run_bt(src, ExecEngine::TreeWalk, false, false);
+    const std::string got =
+        engine_run_bt(src, ExecEngine::Vm, true, /*splice=*/false);
+    if (got != want) {
+        fprintf(stderr, "jit_regcall_float_args: got \"%s\", the "
+                        "tree-walker \"%s\"\n", got.c_str(), want.c_str());
+        ok = false;
+    }
+    if (g_jit_regcall_fargs == a0) {
+        fprintf(stderr, "jit_regcall_float_args: no float argument went "
+                        "in a register\n");
+        ok = false;
+    }
+    if (g_jit_regcall_fpinned == p0) {
+        fprintf(stderr, "jit_regcall_float_args: h's entry took no float "
+                        "argument into its pin\n");
+        ok = false;
+    }
+    if (g_jit_bake_widen == w0) {
+        fprintf(stderr, "jit_regcall_float_args: no int argument was "
+                        "widened into a float register\n");
+        ok = false;
+    }
+    /* the lever off: the same program, no xmm argument */
+    const unsigned off_was = g_jit_off_extra;
+    g_jit_off_extra |= jit_lever_bit("regcall");
+    const unsigned long a1 = g_jit_regcall_fargs;
+    const std::string got_off =
+        engine_run_bt(src, ExecEngine::Vm, true, false);
+    g_jit_off_extra = off_was;
+    if (got_off != want || g_jit_regcall_fargs != a1) {
+        fprintf(stderr, "jit_regcall_float_args: with `regcall` off: "
+                        "\"%s\", %lu float register argument(s)\n",
+                got_off.c_str(), g_jit_regcall_fargs - a1);
         ok = false;
     }
     return ok;
@@ -49662,6 +49755,10 @@ static const std::vector<extra_check> extra_checks =
       "binds with no type dispatch and its temp is released in the loop "
       "preheader despite the call; a dyn argument keeps the dispatch",
       jit_regcall_arg_proven },
+    { "jit: REGCALL step 4 - float arguments arrive in xmm2..: a float, "
+      "a widened int and a dyn source, a pinned parameter taken into its "
+      "float pin; the regcall lever off sends none",
+      jit_regcall_float_args },
     { "jit: the shape tests' MACHINE-INSTRUCTION MODEL parses every "
       "form the emitter produces (it fails closed, so a form it does "
       "not know must fail HERE and not silently match nothing)",
