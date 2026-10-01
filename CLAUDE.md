@@ -2312,8 +2312,8 @@ warranted. For ordinary OPTIMIZATION work the default is lean:
   proved HEAD was 1.02x FASTER than the 10.7x binary and callgrind Ir was flat
   or better on 13 benches; re-timing the byte-identical `.py` scripts showed
   CPython itself **1.148x slower** than the Jul-20 cache (median 1.205x). So a
-  whole-cache `--recompute` stores a `__machine__` entry (best-of-3 of a fixed
-  in-process CPU loop, ~0.1s), and a measure run re-times it and prints — above
+  whole-cache `--recompute` stores a `__machine__` entry, and a measure run
+  re-times it and prints — above
   the table AND under the geomean — how far off the box is plus the CORRECTION
   FACTOR to apply to the printed "x faster" figures. A cache with no marker gets
   a one-line note. **A PARTIAL recompute (`--filter`, or stale-only) does NOT
@@ -2321,6 +2321,22 @@ warranted. For ordinary OPTIMIZATION work the default is lean:
   would wrongly certify them — a false negative is worse than no marker. The
   lasting lesson: **`cur/base` from `--baseline` is the trustworthy number**
   (both binaries timed interleaved, so drift cancels); my/py alone is not.
+  **⛔ THE MARKER ITSELF MUST BE STABLE, AND IT REFUSES WHEN IT CANNOT BE
+  (maintainer-set, 2026-10-01).** The first marker (best-of-3 of a 0.1s loop,
+  unpinned) read this hybrid box "~14% faster" than the C++ cache's day; a
+  full `--force` re-time followed and moved the C++ benches by a few percent
+  at most - the marker had measured which CORE it landed on. It is now a
+  CONVERGING calibration (`machine_calibration`, method 2): pinned to the
+  lowest-numbered P-core other than CPU 0, GC off, a 0.1s warm-up, ~20ms
+  samples sized Google Benchmark's way, and sampled until the LOW CLUSTER
+  agrees - 5 samples, and 20% of all, within 2% of the fastest (timing noise
+  on deterministic CPU-bound code is one-sided, so the fast end is the truth:
+  Chen & Revels 2016) - its median is the marker. Measured: 15 runs, all
+  converged in ~0.35s, 2.1% spread. **No convergence within 1s, or other
+  processes using more than one CPU on average (from /proc/stat) REFUSES the
+  run** - and a `--recompute` calibrates BEFORE re-timing anything, so a noisy
+  box never writes a cache. A marker from the old method is not compared (a
+  note says so) until the next whole-cache re-time replaces it.
 
 **THE FULL-SUITE MEASUREMENT HARD RULE (maintainer-set, 2026-07-16; applies to
 DEEP, maintainer-initiated perf sessions — see the 1-vs-1 default above).** Any
