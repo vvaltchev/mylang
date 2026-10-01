@@ -689,6 +689,20 @@ work — but profile it before building, the way increment 0 was.
         register (34 -2.66% Ir, 35 -2.36%, everything else flat;
         record: *#97 CB9* in docs/jit-optimizations.md).
         NEXT on the callback path: the jit_enter bookkeeping.
+        ✅ **REGCALL DONE 2026-09-30** (records: *#97 REGCALL STEP 1*,
+        *REGCALL 1, CONTINUED*, *REGCALL 2*, *REGCALL 3*, *REGCALL 4*):
+        typed int arguments in rdi/rcx/r9/r10 and trivial results in
+        rdx/rcx (1A/1B); call-free function bodies pin caller-saved, a
+        parameter where it arrives (lever `pincs`); no write-back into
+        a dying window, at the return or a dead evict (lever `retwb`);
+        C5 releases in a loop that calls, and an int-op argument binds
+        with no dispatch; float arguments in xmm2-5 with float params
+        pinnable from their bind (new bench 101_float_call). Cumulative
+        Ir from 13b0dbc: 09 -4.2%, 10 -4.4%, 91 -4.7%, 92 -4.6%, 93
+        -2.4%, 94 -2.5%, 95 -4.3%, 97 -3.1%, 63 -6.3%, 101 -8.3%; one
+        wall run 0.85x-1.01x. LEFT (task #81): an argument held in a
+        register into the site (lever A past an argument move), the
+        reference-by-pointer parameter, and #124 next.
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
 
