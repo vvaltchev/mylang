@@ -701,9 +701,30 @@ work — but profile it before building, the way increment 0 was.
         Ir from 13b0dbc: 09 -4.1%, 10 -4.4%, 91 -4.7%, 92 -4.6%, 93
         -2.4%, 94 -2.5%, 95 -4.3%, 97 -3.1%, 63 -6.3% (101: -8.3% from
         step 4 alone, written for it); one
-        wall run 0.85x-1.01x. LEFT (task #81): an argument held in a
-        register into the site (lever A past an argument move), the
-        reference-by-pointer parameter, and #124 next.
+        wall run 0.85x-1.01x.
+        ⛔ **CLOSED WITHOUT BUILDING (maintainer's call, 2026-09-30),
+        and why - do not reopen without a new measurement:**
+         - *An argument held in a register up to the call.* After step
+           3 what is left is `mov r3, rax` + `mov rdi, r3`. Replacing
+           the reload with `mov rdi, rax` is the SAME instruction count
+           (latency only), and rax cannot survive the site anyway: from
+           its first instruction the site uses rax (the callee
+           descriptor / identity compare), rcx (the dst word), r9 (ctx)
+           and r10 (the window base). The version that saves anything
+           (~2 Ir/call) also drops the temp's STORE, which the site's
+           decline trampoline reads to rebuild the C++ call - so the
+           producer would need to know the site has no decline path,
+           a fact decided deep in the hottest emitter.
+         - *Reference parameters by pointer.* The 32-byte copy carries
+           an array value's offset and length, so it cannot shrink by
+           itself; passing a pointer means the callee addresses that
+           parameter through another register instead of
+           `rbx + slot*48`, and every slot access in the emitter is
+           written against rbx. ~21 Ir per reference argument at the
+           site and 5 at the return, only for typed frameless callees
+           taking arrays/dicts/strings: an emitter-wide addressing
+           refactor, a planned increment if ever, not a micro-step.
+        NEXT: #124.
     4.  E3 - the two-entry inline cache. ✅ DONE 2026-09-20 as the
         two-way frameless site (76 -20.2% Ir; record: *#97 E3*).
 
