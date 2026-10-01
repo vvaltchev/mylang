@@ -896,7 +896,7 @@ corpus hole of the same family as the field store's.
 
 ---
 
-## 3b. TASK #124 — REMOVE THE 4-REGISTER CAP ON CALL-CONTAINING RUNS
+## 3b. TASK #124 — REMOVE THE 4-REGISTER CAP ON CALL-CONTAINING RUNS  [✅ CLOSED 2026-10-01]
 **✅ (a) DONE 2026-09-26** - the cause was not eviction: TEMPS competed
 in the scan and were stripped afterwards, leaving the freed register
 idle. `jit_lsra_assign(..., locals_only)`; record: *#124(a)* in
@@ -907,7 +907,30 @@ objection to the cap, not a ceiling question)** - record: *#124(b)* in
 docs/jit-optimizations.md. A run that calls may pin caller-saved; each
 call op writes back the live ones and reloads them; a call inside a
 loop with a live one loses the bet. 102_call_outer_hot_inner -21.4%
-cycles. (c) next.
+cycles.
+
+**⛔ (c) MEASURED, NOT BUILT - #124 CLOSED (maintainer's call,
+2026-10-01).** The design that would make IPA-RA pay is a convention:
+rsi/r8 preserved across a frameless call (callees save them, the site
+stops using them as scratch, callers keep loop-carried values there
+with no write-back). Measured first:
+ - frameless callees writing rsi or r8 anywhere in their fragment:
+   **218 of 218** (bench/my + tests/functional), and **218 of 218**
+   contain a C++ helper call, which clobbers both. In 97's `mix` the
+   writes sit on the record-ful / record-less return arms and the cold
+   helper calls, not on the frameless path - but a callee cannot tell
+   statically which path it is on, so a sound convention either saves
+   rsi/r8 at EVERY callee entry (two push/pop pairs per frameless
+   call corpus-wide, undoing much of REGCALL step 1) or needs a
+   path-aware emitter (spill around the cold helper calls reachable
+   from the frameless entry only) - a substantial change to the
+   return arms and the call bracket;
+ - programs that lose the #124(b) bet, i.e. could gain at all:
+   **6** - bench 97 and five functional tests;
+ - the ceiling on 97, the shape (c) exists for (all pins vs the
+   4-pin cap, its call-free twin, pinned P-core): **0.9% of cycles**.
+Do not reopen without a bench whose lost-bet ceiling is materially
+larger.
 
 **(b) MEASURED BEFORE BUILDING, 2026-09-26 - NOT BUILT, ON THE NUMBERS.**
 bench/my/97_regs_int_call (eight int recurrences + one real call per
