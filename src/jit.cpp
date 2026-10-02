@@ -1555,6 +1555,13 @@ static constexpr size_t FP_STAGE_RESERVED = 2;   /* fsa() + fsb() */
  * pretending otherwise would just push the hardcoding somewhere the
  * model cannot see it.
  */
+#ifdef INT_TESTS
+/* #107 P3: the function whose chunk is being emitted, as the prefix of a
+ * reg_choice instance key (the allocator cannot reach the descriptor
+ * helpers, which live further down) */
+static std::string g_int_regkey_fn = "main";
+#endif
+
 struct RegAlloc {
     uint32_t busy = 0;          /* bit r: register r is taken */
     uint32_t denied = 0;        /* bit r: this RUN may not spend it */
@@ -1665,10 +1672,60 @@ struct RegAlloc {
             const int w = gp_weight(r) - ((prefer & (1u << r)) ? 8 : 0);
             if (best < 0 || w < best_w) { best = r; best_w = w; }
         }
+        ML_INT_ONLY(best = int_enumerate(best, "gp", [&](uint8_t r) {
+            return (gp_caps(r) & need) == need && free_reg(r)
+                && !(planned & (1u << r)) && !(exclude & (1u << r));
+        });)
         if (best >= 0)
             busy |= 1u << static_cast<uint8_t>(best);
         return best;
     }
+
+#ifdef INT_TESTS
+    /* #107 P3: the ordinal of this allocator's picks - with the function,
+     * the instance key of each (an Emitter, and so its RegAlloc, is
+     * rebuilt for every emission attempt, so it restarts per attempt) */
+    int int_ord = 0;
+    /*
+     * The enumerated half of a pick: `legal` is EXACTLY the filter the
+     * scan applied, so any register it admits is one the heuristic could
+     * have returned had the weights been different - the only thing the
+     * deviation changes. Records the instance (reg_choice) and returns
+     * the register the enumerator asks for.
+     */
+    /* noexcept: the hook allocates (the key string), and a throwing call
+     * here would add an exception edge to every take()/ftake() caller -
+     * the instrumentation would change the very branch graph the INT
+     * coverage gate measures (it did: grant_fstage's call site in
+     * jit_try_container became a new uncovered "branch"). */
+    template <class Legal>
+    int int_enumerate(int best, const char *file, Legal legal) noexcept
+    {
+        if (best < 0)
+            return best;            /* pressure: no legal register at all */
+        std::vector<uint8_t> cands;
+        for (uint8_t r = 0; r < 16; r++)
+            if (legal(r))
+                cands.push_back(r);
+        int dflt = 0;
+        for (size_t k = 0; k < cands.size(); k++)
+            if (cands[k] == best)
+                dflt = static_cast<int>(k);
+        const std::string key = g_int_regkey_fn + "/" + file + "#"
+                              + std::to_string(int_ord++);
+        const int n = static_cast<int>(cands.size());
+        const int pick = int_choose(key, n, dflt);
+        const uint8_t reg = cands[static_cast<size_t>(pick)];
+        if (pick != dflt) {
+            std::string line = "choose_reg";
+            int_put(line, "key", key);
+            int_put(line, "reg", static_cast<int64_t>(reg));
+            int_applied_note(line);
+        }
+        ML_INT(reg_choice, key, n, dflt, pick, reg);
+        return reg;
+    }
+#endif
 
     /*
      * Take one specific register, because the instruction or the ABI
@@ -1712,6 +1769,10 @@ struct RegAlloc {
                         - ((prefer & (1u << x)) ? 8 : 0);
             if (best < 0 || w < best_w) { best = x; best_w = w; }
         }
+        ML_INT_ONLY(best = int_enumerate(best, "fp", [&](uint8_t x) {
+            return fp_allocatable(x)
+                && !((fbusy | fplanned | exclude) & (1u << x));
+        });)
         if (best >= 0)
             fbusy |= 1u << static_cast<uint8_t>(best);
         return best;
@@ -9081,6 +9142,19 @@ static std::string jit_int_fn_name(const FuncDescriptor *d)
     return !d ? std::string("?")
          : !d->display_name.empty() ? d->display_name
          : d->name ? std::string(d->name->val) : std::string("<lambda>");
+}
+/* a function's STABLE identity for an enumerated-decision key: the
+ * internal name (a template instance's `f$0`, so it does not collide with
+ * its base), `main`, or a lambda's first source line */
+static std::string jit_int_key_fn(const Chunk &ck)
+{
+    if (!g_cur_caller_desc)
+        return "main";
+    if (g_cur_caller_desc->name)
+        return std::string(g_cur_caller_desc->name->val);
+    return "<lambda>@" + (ck.locs.empty()
+                              ? std::string("?")
+                              : std::to_string(ck.locs.front().start.line));
 }
 static std::string jit_int_func()
 {
@@ -29583,6 +29657,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     g_cur_arg_stage_pools = &chunk.arg_stage_pools;
     g_cur_norec_sites = &chunk.norec_sites;
     g_cur_caller_desc = jc ? jc->caller_desc : nullptr;   /* step 3b */
+    ML_INT_ONLY(g_int_regkey_fn = jit_int_key_fn(chunk);)
     g_cur_jc = jc;                       /* #97 step 4: the bake gate */
     /*
      * #97 E2: THE PRE-PASS - may this CALLING body be entered framelessly?

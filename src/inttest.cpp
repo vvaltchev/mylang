@@ -14,10 +14,22 @@
  * it through int_hits/int_events. tests/int_run.py sums these over its
  * runs for the site census - a site no test CHECKS fails, since reaching
  * a site without asserting on it verifies nothing.
+ *
+ * MYLANG_INT_DUMP=<path>: at exit, every event the process recorded,
+ * sorted - the decision instances a run reached, for tests/int_enum.py -
+ * plus one `choose_applied key=... pick=...` line per MYLANG_INT_CHOOSE
+ * override int_choose actually honoured, written the moment it is
+ * honoured (int_applied_note), so the file is APPENDED to and a crashing
+ * run still names its deviation. That record bypasses IntDefer on
+ * purpose: a deviation can make the JIT DISCARD the attempt it was taken
+ * in (a lost bet, a register conflict) and re-emit, and the re-emission
+ * numbers its decisions afresh - so the committed events may never show
+ * the deviated pick although the deviation is what changed the code.
  */
 
 #ifdef INT_TESTS
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -43,6 +55,7 @@ static_assert(sizeof(site_names) / sizeof(site_names[0]) == N_SITES,
               "intsites.h: name table out of step with the enum");
 
 struct Log {
+    std::vector<std::string> applied;   /* honoured overrides, undeferred */
     uint64_t hits[N_SITES] = {};
     uint64_t queries[N_SITES] = {};
     std::vector<std::string> events[N_SITES];
@@ -58,6 +71,23 @@ Log &log()
  * static initializer so a script run needs no explicit call. */
 void dump_at_exit()
 {
+    /* MYLANG_INT_DUMP=<path>: every recorded event, one per line, in
+     * canonical (sorted) order - what tests/int_enum.py reads to learn
+     * which decision instances a run reached */
+    if (const char *dp = std::getenv("MYLANG_INT_DUMP")) {
+        if (*dp) {
+            std::vector<std::string> all;
+            for (int i = 0; i < N_SITES; i++)
+                all.insert(all.end(), log().events[i].begin(),
+                           log().events[i].end());
+            std::sort(all.begin(), all.end());
+            if (FILE *f = std::fopen(dp, "a")) {
+                for (const std::string &e : all)
+                    std::fprintf(f, "%s\n", e.c_str());
+                std::fclose(f);
+            }
+        }
+    }
     const char *path = std::getenv("MYLANG_INT_OUT");
     if (!path || !*path)
         return;
@@ -162,6 +192,55 @@ void int_reset()
         log().events[i].clear();
     /* the hit counts are NOT reset: they feed the exit census, which must
      * see every event the process recorded */
+}
+
+int int_choose(const std::string &key, int n, int dflt)
+{
+    /* parsed once: MYLANG_INT_CHOOSE is fixed for the process */
+    static const std::vector<std::pair<std::string, int>> overrides = [] {
+        std::vector<std::pair<std::string, int>> out;
+        const char *env = std::getenv("MYLANG_INT_CHOOSE");
+        std::string spec = env ? env : "";
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            /* `;` or `,`: a test header's INT-CONFIGS already spends
+             * `;` on separating configurations */
+            size_t end = spec.find_first_of(";,", pos);
+            if (end == std::string::npos)
+                end = spec.size();
+            const std::string item = spec.substr(pos, end - pos);
+            const size_t eq = item.rfind('=');
+            if (eq != std::string::npos && eq > 0)
+                out.emplace_back(item.substr(0, eq),
+                                 std::atoi(item.c_str() + eq + 1));
+            pos = end + 1;
+        }
+        return out;
+    }();
+    for (const auto &o : overrides)
+        if (o.first == key && o.second >= 0 && o.second < n) {
+            std::string line = "choose_applied";
+            int_put(line, "key", key);
+            int_put(line, "pick", static_cast<int64_t>(o.second));
+            if (std::find(log().applied.begin(), log().applied.end(),
+                          line) == log().applied.end()) {
+                int_applied_note(line);
+                log().applied.push_back(std::move(line));
+            }
+            return o.second;
+        }
+    return dflt;
+}
+
+void int_applied_note(const std::string &line)
+{
+    const char *dp = std::getenv("MYLANG_INT_DUMP");
+    if (!dp || !*dp)
+        return;
+    if (FILE *f = std::fopen(dp, "a")) {
+        std::fprintf(f, "%s\n", line.c_str());
+        std::fclose(f);
+    }
 }
 
 void int_put(std::string &o, const char *key, int64_t v)

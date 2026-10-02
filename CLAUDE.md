@@ -516,6 +516,22 @@ sort AFTER every other builtin, so an INT build moves no builtin slot;
 the `int` job in `nets.yml` checks the INT build emits byte-identical
 `-vdj` to a `TESTS` build (`vdjcmp.sh`) - an instrumented point may only
 READ the state it reports.
+**THE DECISION ENUMERATOR (P3, `tests/int_enum.py`).** A heuristic with
+several LEGAL answers asks `int_choose(key, n, dflt)` (inttest.h) and
+records a `reg_choice` instance; `MYLANG_INT_CHOOSE=key=idx` forces an
+alternative, and tier 1 re-runs every program once per alternative of
+every instance, requiring the tree-walker's output. **Correctness must
+not depend on which legal register the allocator picks** - its first
+run found five JIT bugs the default picks never reach. Run it on the
+FAST lane: `make OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1
+BUILD_DIR=build-claude/int-rel` (the whole functional corpus in ~40 s).
+A hook in a product function must be `noexcept` and allocate nothing
+the product sees: `int_enumerate` added an exception edge to every
+`take()` caller and the coverage gate counted it as a new branch.
+**Long runs use `tests/testrun.py`** (a `Run`: heartbeat, a unix
+control socket - `tests/testctl.py status|stop|pause|jobs N` - and
+resume by a low-water-mark token); a new multi-minute tool should
+drive its work through it.
 
 **Assertions: `ASSERTS` (default 1).** The C `assert()` + the project's
 `ML_CHECK()` invariant net (see *Invariants & hazards*) are **on for every build
