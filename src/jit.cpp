@@ -9299,8 +9299,18 @@ static bool jit_slot_ref_listed(const Chunk &ck, int slot)
  * a COLD path (the slow tail, the exception exits), so writing
  * unconditionally costs nothing measurable and makes the channel's value
  * always THIS site's.
+ *
+ * `staged`: helper ARGUMENT registers the caller has already loaded (the
+ * two postexit sites move the exit pc into RDI first, since rax - the
+ * accumulator this uses - holds it). An argument register is not a pin
+ * and not a grant, so the allocator sees it as FREE; only the caller can
+ * name it. The scratch takes rcx by preference, which is why this never
+ * showed - until the #107 enumerator handed it RDI and the postexit
+ * received exit pc 0 (an `ML_CHECK(d && ck)` abort in every throw that
+ * crossed a frameless call).
  */
-static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
+static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc,
+                                uint32_t staged = 0)
 {
     const int32_t chain = ck.inline_frame_at(old_pc);
     const uint64_t pool =
@@ -9311,7 +9321,7 @@ static void emit_bake_call_site(Emitter &e, const Chunk &ck, size_t old_pc)
     e.movabs(acc.r, reinterpret_cast<uint64_t>(jit_addr_call_inline_chain()));
     e.store_dword_base_imm32(acc.r, 0, static_cast<uint32_t>(chain));
     e.movabs(acc.r, reinterpret_cast<uint64_t>(jit_addr_call_inline_pool()));
-    RefScratch rs(e, RCX);
+    RefScratch rs(e, RCX, staged);
     e.movabs(rs.sc, pool);
     e.store_base0(rs.sc, acc.r);
     rs.release();
@@ -12638,7 +12648,7 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                                    * released them) */
             vframe_restore();
             e.mov_rr(RDI, RAX);                   /* reg:abi */
-            emit_bake_call_site(e, ck, old_pc);
+            emit_bake_call_site(e, ck, old_pc, 1u << RDI);
             e.mov_imm(RSI, site);                 /* reg:abi */
             e.mov_rr(RDX, RBX);
             e.mov_imm(RCX, static_cast<uint64_t>(
@@ -12883,8 +12893,9 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     e.mov_rr(RDI, RAX);                               /* reg:abi */
     /* #88: AFTER the callee ran - it may have made calls of its own and
      * overwritten the globals, so this site re-claims them. rax is dead
-     * once the exit pc has moved to rdi. */
-    emit_bake_call_site(e, ck, old_pc);
+     * once the exit pc has moved to rdi - which the scratch must
+     * therefore not take. */
+    emit_bake_call_site(e, ck, old_pc, 1u << RDI);
     e.mov_imm(RSI, site);  /* reg:abi */
     /* 4-v: the CALLER's window (rbx) + baked total (-1 = main: the
      * postexit reads top_rec->nslots, main being record-ful always) -

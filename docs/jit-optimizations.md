@@ -16876,3 +16876,30 @@ shipped. Both were holes that the first change to the grant - the "day
 Phase D moves the stage off 0/1" the grant's comment anticipates - would
 have opened. **Net:** the enumerator's tier 1 over `55_regcall` (3,929
 deviations, 0 failures after the fix; 28 aborts before it, watched).
+
+## THE CALL-SITE BAKE TOOK THE STAGED EXIT PC's REGISTER (2026-10-02)
+
+**Found by the #107 P3 decision enumerator**: six deviations, every one
+a pick of `rdi`, aborted in `jit_frameless_postexit` - `ML_CHECK(d &&
+ck)`, or "a frameless frame exited with no signal" - on the four
+functional programs whose throws cross a frameless or sync call
+(07_exceptions, 09_norec_deep_calls, 11_catch_bind_release,
+23_baked_callee).
+
+**Cause.** Both post-exit sites of the sync call emitter move the exit
+pc out of `rax` into `rdi` (the helper's first argument) and only THEN
+call `emit_bake_call_site`, which writes the #88 inline-chain pair
+through `rax` and a `RefScratch` that prefers `rcx`. `rdi` there is a
+staged ARGUMENT - not a pin, not a grant - so the allocator sees it as
+free, and any pick other than `rcx` that lands on `rdi` overwrites the
+exit pc with the pool pointer (0 for a chain-less site). The postexit
+then takes pc 0 for a real exit and finds no exit relay. In a release
+the check is compiled out and the null descriptor is dereferenced.
+
+**Fix.** `emit_bake_call_site` takes the mask of argument registers its
+caller has already staged and passes it as `RefScratch`'s exclusion;
+the two postexit sites pass `rdi`. Byte-identical while `rcx` is free
+(the default pick). The same reasoning as `RefScratch`'s `excl`: an
+argument or ISA-result register is invisible to the allocator, so only
+the caller can name it. **Net:** the enumerator over
+`tests/functional` (0 `gp#` failures after, 6 before, watched).
