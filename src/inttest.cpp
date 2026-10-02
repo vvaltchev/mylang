@@ -77,11 +77,50 @@ struct AtExit {
 
 }  // namespace
 
+static IntDefer *g_defer = nullptr;     /* the innermost live scope */
+
 void int_record(IntSite s, std::string &&line)
 {
+    if (g_defer) {
+        g_defer->buf.emplace_back(s, std::move(line));
+        return;
+    }
     const int i = static_cast<int>(s);
     log().hits[i]++;
     log().events[i].push_back(std::move(line));
+}
+
+IntDefer::IntDefer() : prev(g_defer)
+{
+    g_defer = this;
+}
+
+IntDefer::~IntDefer()
+{
+    /* uncommitted: the buffered events are dropped with the scope */
+    g_defer = prev;
+}
+
+void IntDefer::commit()
+{
+    /* an identical event twice in one committed attempt is ONE fact: the
+     * JIT emits an op more than once inside a single emission (a C1 cold
+     * copy re-emits the loop), and its site states a property of the op,
+     * not a count of how many copies of it exist */
+    std::vector<std::pair<IntSite, std::string>> out;
+    for (auto &ev : buf) {
+        bool dup = false;
+        for (const auto &o : out)
+            dup = dup || (o.first == ev.first && o.second == ev.second);
+        if (!dup)
+            out.push_back(std::move(ev));
+    }
+    buf.clear();
+    IntDefer *const self = g_defer;
+    g_defer = prev;                 /* publish to the enclosing scope */
+    for (auto &ev : out)
+        int_record(ev.first, std::move(ev.second));
+    g_defer = self;
 }
 
 const char *int_site_name(IntSite s)

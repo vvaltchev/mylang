@@ -1,0 +1,37 @@
+# INT-ENGINES: default
+# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra
+#
+# INT test (#107 P2): the JIT records a `pin` event for each (variable,
+# register) a chunk's FINAL emission held in a register. It asserts the
+# register CLASS, not the register: which one is the allocator's choice
+# and free to change; that an int lives in a GP register and a float in
+# an xmm one is not. And one variable that must NEVER be GP-pinned: a
+# reference (the array) - GP admission needs int-op evidence, or the
+# exit flush would write t_int over it. Default engine only: -nj and the
+# tree-walker have no register allocator.
+
+func hot(int n) {
+    var a = [1, 2, 3];
+    var s = 0;
+    var f = 0.5;
+    for (var i = 0; i < n; i++) {
+        s += i * 3 + a[i % 3];
+        f = f * 1.0001 + 0.25;
+    }
+    return s + int(f);
+}
+var r = hot(int(runtime(1000)));
+print(r);
+assert(r == 1500762);
+
+var ev = int_events("pin");
+foreach (e in ev) print(e);
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+assert(has(ev, "func=\"hot\" var=\"s\" reg=\"r"));
+assert(has(ev, "func=\"hot\" var=\"i\" reg=\"r"));
+assert(has(ev, "func=\"hot\" var=\"f\" reg=\"xmm"));
+assert(!has(ev, "func=\"hot\" var=\"a\" reg=\"r"));

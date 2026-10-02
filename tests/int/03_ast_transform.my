@@ -1,0 +1,49 @@
+# INT test (#107 P2): the AST loop transforms record an `ast_transform`
+# event at the loop they rewrote. Each pass is shown FIRING at its loop,
+# and two gates are shown REFUSING (a refusal that silently stops
+# refusing is the dangerous direction). Runs in both engines: the
+# transforms happen before either one sees the tree.
+
+func work(int n) {
+    var m = [[1, 2, 3], [4, 5, 6]];
+    var base = [10, 20, 30, 40];
+    var s = 0;
+    for (var i = 0; i < 2; i++)               # line 11: for_range (outer)
+        for (var k = 0; k < 3; k++)           # line 12: licm (m[i] hoisted)
+            s += m[i][k];
+    var t = 0;
+    var j = 0;
+    while (j < n) {                           # line 16: slice_hoist
+        var sl = base[1:3];
+        t += sl[0] + sl[1];
+        j++;
+    }
+    var u = 0;
+    for (var q = 0; q < 2; q++) {             # line 22: LICM refused -
+        m[q] = [7, 8, 9];                     #   the loop writes the base
+        u += m[q][1];
+    }
+    var lim = n;
+    var w = 0;
+    for (var r = 0; r < lim; r++) {           # line 28: for_range refused -
+        lim = lim - 1;                        #   the body changes the bound
+        w += r;
+    }
+    return s + t + u + w;
+}
+var res = work(int(runtime(3)));
+print(res);
+assert(res == 21 + 150 + 16 + 1);
+
+var ev = int_events("ast_transform");
+foreach (e in ev) print(e);
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+assert(has(ev, "pass=\"licm\" line=12"));
+assert(has(ev, "pass=\"slice_hoist\" line=16"));
+assert(has(ev, "pass=\"for_range\" line=11"));
+assert(!has(ev, "pass=\"licm\" line=22"));
+assert(!has(ev, "pass=\"for_range\" line=28"));

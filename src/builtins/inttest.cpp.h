@@ -40,15 +40,21 @@ EvalValue builtin_int_hits(EvalContext *ctx, const ArgLocs *exprList,
     return static_cast<int_type>(int_hits(int_builtin_site(exprList, args, n)));
 }
 
-/* int_events(site): the events themselves, in program order, each in its
- * canonical one-line form (`inline_ast engine="expr" callee="f" ...`). */
+/* int_events(site): the events themselves, each in its canonical one-line
+ * form (`inline_ast engine="expr" callee="f" ...`), SORTED. Not program
+ * order: some passes walk a pointer-keyed map (the bytecode splice runs
+ * over chunks in an unordered_map), so their order would differ from run
+ * to run - and every answer this surface gives must be deterministic
+ * (plans/intrusive-tests.md, principle 1). */
 EvalValue builtin_int_events(EvalContext *ctx, const ArgLocs *exprList,
                              const EvalValue *args, size_t n)
 {
     const IntSite s = int_builtin_site(exprList, args, n);
+    std::vector<std::string> sorted = int_events(s);
+    std::sort(sorted.begin(), sorted.end());
     SharedArrayObj::vec_type vec;
-    for (const std::string &e : int_events(s))
-        vec.emplace_back(SharedStr(std::string(e)), false);
+    for (std::string &e : sorted)
+        vec.emplace_back(SharedStr(std::move(e)), false);
     return SharedArrayObj(std::move(vec));
 }
 

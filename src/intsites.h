@@ -28,4 +28,29 @@
     /* Display names, so a template instance reads as its base.            */ \
     X(inline_ast, "the AST inliner spliced a call",                           \
       F(std::string, engine) F(std::string, caller)                           \
-      F(std::string, callee) F(int64_t, line) F(int64_t, col))
+      F(std::string, callee) F(int64_t, line) F(int64_t, col))             \
+    /* The bytecode splice decided one (call site, candidate callee):     */ \
+    /* `verdict` is `spliced` or the decline reason (codegen.cpp,         */ \
+    /* bc_inline_chunk_splice), `kind` call / value, line:col the call.   */ \
+    X(splice, "the bytecode splice decided a call site",                      \
+      F(std::string, verdict) F(std::string, kind) F(std::string, callee)    \
+      F(int64_t, line) F(int64_t, col)) \
+    /* An AST loop transform FIRED on the loop at line:col: `pass` is      */ \
+    /* slice_hoist / licm / for_range (inferencer.cpp, specialize).        */ \
+    X(ast_transform, "an AST loop transform rewrote a loop",                  \
+      F(std::string, pass) F(int64_t, line) F(int64_t, col)) \
+    /* The JIT held a frame slot in a register somewhere in a function:   */ \
+    /* `func` the function (`main` at the top level), `var` the slot's    */ \
+    /* source name (`tN` for the Nth expression temp), `reg` the register */ \
+    /* (`xmmN` for a float). One event per distinct (var, reg) per chunk, */ \
+    /* from the FINAL emission only (a bet's discarded attempt records    */ \
+    /* nothing). jit.cpp, jit_compile_chunk.                              */ \
+    X(pin, "the JIT held a slot in a register",                               \
+      F(std::string, func) F(std::string, var) F(std::string, reg)) \
+    /* The JIT chose a call site's PROTOCOL at emit time: `tier` is       */ \
+    /* frameless / push (the sync call, emit_sync_call_inline) or         */ \
+    /* native_direct (a native leaf callee, CallV's #55 path); `callee`   */ \
+    /* the named function(s) (`a|b` for a two-way site, `?` unknown).     */ \
+    X(call_tier, "the JIT chose a call site's protocol",                      \
+      F(std::string, tier) F(std::string, callee)                            \
+      F(int64_t, line) F(int64_t, col))

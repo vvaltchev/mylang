@@ -12,6 +12,22 @@ per-compiler floor ratchet in `tests/int/coverage-floor.txt`), sites
 counted only when CHECKED. First measurement (gcc 16.2): 144,746
 elements, 45,055 uncovered; `-rt` owns 77,561, `01_inline_ast` 270.
 
+P2 PART 1 DONE 2026-10-02: sites `splice` (every verdict, by reason),
+`ast_transform` (licm / slice_hoist / for_range, fired - plus asserted
+refusals), `pin` (each variable held in a register, by source name, from
+the final emission), `call_tier` (frameless / push / native_direct);
+`IntDefer` (a discarded JIT attempt records nothing; duplicates within one
+attempt collapse); `int_events` sorted (a pointer-keyed walk made program
+order nondeterministic); runner headers INT-ENGINES / INT-CONFIGS; the
+universe narrowed to the PRODUCT (tests.cpp, the INT core and `*int_*`
+helpers excluded): 114,495 elements, 32,433 uncovered (gcc 16.2).
+**Findings so far:** a direct call with a typed parameter never splices
+(`typed_params`) while the same callee through a value call does; a value
+call inside a template INSTANCE gets no callee set (only the base's site
+is analysed, as top).
+Remaining P2: the forwarding and guard-elision sites, and moving the
+existing shape tests' vacuity guards onto the ledger.
+
 ## 0. What already exists (P0)
 
 - `make INT_TESTS=1` / CMake `-DINT_TESTS=ON`, default 0. Implies
