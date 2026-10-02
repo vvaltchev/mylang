@@ -16821,3 +16821,27 @@ call, compared across the three engines - two reproduced (`assert`, the
 member read), the scan named the other three. **Net:**
 `tests/bt_oracle/after_inline_op_raise.my` (every inlining-on
 configuration against `-ni -tw`); watched failing on the pre-fix build.
+
+## THE FLOAT LITERAL POOL CLOBBERED A PINNED rcx (2026-10-02)
+
+**Found by the #107 P3 decision enumerator** on its first override: forcing
+one legal register pick put a slot in `rcx`, and the register tracker
+aborted at `flit_load`'s `movabs rcx, <bits>`.
+
+**The bug is reachable without the enumerator.** `rcx` is allocatable -
+7th in the cost order - so a run with enough live ints pins a slot there,
+and `flit_load` runs at the fragment ENTRY after the entry pins are
+loaded (and in every entry stub and call epilogue). The linear scan
+installs high-pressure pins at TRANSITIONS, after the entry load, so the
+default allocator happened to miss it; the legacy allocator
+(`MYLANG_JIT_OFF=lsra`, a shipped lever) pins at ENTRY, and nine hot ints
+plus a float literal aborted a checked build - in a release, silent
+corruption whenever the slot is live at the run's entry.
+
+**Fix:** `flit_load` asks the allocator for a transient scratch,
+preferring `rcx` (byte-identical while it is free: the whole corpus emits
+the same code) with `rax` excluded (the call epilogue's status); refused,
+it borrows `rcx` around its two instructions with push/pop when it holds
+a pin - `RefScratch`'s protocol. **Net:**
+`tests/functional/58_flit_pinned_rcx.my`, which `corpus_diff --levers`
+runs under the legacy allocator; the pre-fix binary aborts on it.
