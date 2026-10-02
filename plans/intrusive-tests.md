@@ -328,16 +328,15 @@ assertions on values.
 - **CI:** a `int` job in `nets.yml` from P1 on (Debug + ASan, runs
   `int_run.py`); its sweeps sized to the lane's budget.
 
-## 7. Questions for the maintainer
+## 7. Decided (maintainer, 2026-10-02)
 
-1. **Builtin namespace:** `int_*` names registered only in INT builds
-   (recommended - a stray use in a normal build is then a plain
-   "undefined name" compile error), or reuse `make_dev_builtin`'s
-   reservation so the names exist everywhere?
-2. **`.my` vs C++ balance:** recommended - observation and forcing from
-   `.my` programs, state EDITING (chunk hook) from C++ only.
-3. **Enumeration budget in CI:** tier 1 (single deviations) on every
-   push; tiers 2 and 3 on `workflow_dispatch`. All three deterministic.
+1. `int_*` builtins exist only in INT builds.
+2. `.my` programs observe and force; only C++ tests edit internal state.
+3. CI: enumeration tier 1 on every push, tiers 2-3 on dispatch.
+4. **An INT binary never runs under the random-program fuzzers**
+   (`nested_fuzz`, `myv_fuzz`, `repl_fuzz`). They keep running on the
+   ordinary builds; INT runs only the suite of section 9.
+5. **The INT suite is EXHAUSTIVE BUT MINIMAL** - section 9.
 
 ## 8. How hard
 
@@ -363,3 +362,129 @@ Honest sizing, hardest first:
 - **Everything else** (registry, ledger, VM checker, census, chunk
   hook, assembler) is ordinary C++ against data structures we already
   have.
+
+## 9. Exhaustive but minimal
+
+Goal (maintainer, 2026-10-02): cover EVERYTHING, and run each piece of
+code exactly as many times as covering it needs - SQLite's discipline
+(100% branch coverage, MC/DC) applied to an interpreter that also
+writes machine code. Determinism is what makes it possible: a test's
+coverage is a FACT, identical on every run, so "this test adds nothing"
+is decidable and stays true until the code changes.
+
+### 9.1 "Everything" must be a finite, explicit list
+
+The suite is measured against a COVERAGE UNIVERSE, the union of six
+element kinds. Each element has a stable name.
+
+| Kind | Element | Recorded by |
+|---|---|---|
+| C++ branch | each outcome of each branch in `src/` | gcov (`GCOV=1`) |
+| C++ MC/DC | each condition of a compound `&&`/`||` shown to flip its decision on its own | gcov conditions (gcc >= 14 `-fcondition-coverage`) |
+| Emitted edge | each conditional branch an EMITTER emits, both outcomes, keyed by (emitter site, edge) - NOT per fragment | INT edge probe |
+| Decision alternative | each legal value at each `ML_INT_CHOICE` site | ledger |
+| Value class | a declared boundary of an operation: shift count 63/64/-1, index -1/len/len+1, int min/max, empty/one-element container, ... | `ML_INT(value_class, ...)` at the operation |
+| Configuration | each build/env axis that changes emitted code (low-mem arena on/off, native stack on/off) - an element only through the edges it changes | the config is part of a test's identity |
+
+Two kinds are worth calling out.
+- **Emitted edges:** gcov sees the C++ that EMITS a guard, not the
+  guard. A guard emitted into 300 fragments is ONE element per outcome;
+  one test that takes its cold arm covers it everywhere.
+- **Value classes:** branch coverage cannot see an off-by-one - a shift
+  by 63 and by 64 take the same C++ branch in a saturating
+  implementation that is wrong at 64. The boundaries are DECLARED where
+  the operation is defined, so they become countable elements and not
+  "tests someone remembered".
+
+**Uncoverable by design** - an `ML_CHECK` failure arm, a `default:` over
+a closed enum, an allocation failure. As in SQLite (`ALWAYS()` /
+`NEVER()`), these are MARKED in the source (the `NOREC-COV-EXEMPT`
+convention we already use, generalised to `INT-COV-EXEMPT: reason`), so
+the universe excludes them by an explicit, reviewable claim. Where an
+INT forcing switch can reach the arm (4.5), it is covered instead of
+exempted - an exemption reached by forcing is reported STALE.
+
+### 9.2 Exploration is not the suite
+
+Exhaustiveness and minimality are reconciled by separating TWO
+activities:
+
+1. **Exploration (offline, at suite-construction time).** Generate
+   CANDIDATES - every corpus program x every configuration x the
+   enumerator's tier-1 deviations (tiers 2-3 when needed), hand-written
+   shapes, and every bug reproducer ever found (including fuzzer
+   findings, which are converted on a NORMAL build and enter only as
+   programs). Run each candidate once under INT and record its coverage
+   vector. This is where the expensive, exhaustive work happens, and it
+   runs only when the code changes.
+2. **The suite (what CI runs).** An IRREDUNDANT COVER chosen from the
+   candidates: every reachable element is covered by at least one
+   test, and removing any test would uncover something.
+
+### 9.3 What "minimal" can honestly mean
+
+- **Globally minimal** - the fewest tests that cover everything - is
+  set cover, which is NP-hard. It is not claimed.
+- **IRREDUNDANT** - no test can be dropped without losing an element -
+  IS claimed, and it is checkable exactly: for each test, the elements
+  only it covers (its OWNED set) must be non-empty. Greedy selection
+  (largest new coverage first, ties broken by smaller cost, then by
+  name, so the result is deterministic) followed by a removal pass
+  gives this, and stays within a ln(n) factor of the true minimum.
+- **Cost-minimal per test** - after selection, each test's program is
+  shrunk by delta debugging while it keeps its owned elements, so a
+  covering test is the smallest program that covers what it owns. A
+  bench-sized loop never survives into the suite.
+
+### 9.4 Every covering run is also an oracle run
+
+Coverage without a check proves only that code RAN. Each suite test
+is run with:
+- the tree-walker as the output oracle (output, exception, caret,
+  backtrace, exit code byte-identical);
+- the state checker at EVERY op (4.3);
+- the census back at its start (4.3);
+- its expected ledger entries, where it owns a decision element.
+
+So covering an element means checking it, once.
+
+### 9.5 Keeping it minimal as the code changes
+
+On a change, the suite is re-run (cheap - it is minimal) and its
+coverage diffed against the universe:
+- **newly uncovered elements** - new code, or a test that stopped
+  reaching its owned set: exploration runs for THOSE elements only,
+  searching the candidate pool for a covering run, and the change
+  cannot land with an element uncovered and unexempted;
+- **a test whose owned set became empty** - redundant now; it is
+  dropped (reported, never silently);
+- **an owned set that moved to another test** - recorded, so the
+  ownership table stays the reviewable answer to "why does this test
+  exist?".
+
+CI enforces both directions on every push: no uncovered element, no
+test that owns nothing.
+
+### 9.6 What this does NOT replace (yet)
+
+- The **random fuzzers** stay, on ordinary builds: they find programs
+  nobody wrote, and a finding becomes a candidate.
+- The existing **`-rt` suite, corpus_diff and the Nets jobs** stay
+  until the INT suite's coverage provably SUBSUMES each of them - then
+  the redundancy is a measured number per net, and retiring one is the
+  maintainer's call.
+- **Branch + MC/DC + value classes is not correctness.** It is the
+  strongest MEASURABLE bar we know; data-dependent bugs on a covered
+  branch are exactly what value classes exist to name, and the list
+  grows when a bug escapes it - every escape adds an element first,
+  then the test that owns it.
+
+### 9.7 Phase changes
+
+- **P1** gains the coverage universe: gcov + MC/DC in the INT lane, the
+  `INT-COV-EXEMPT` marker, the ownership table, and the two CI checks.
+- **P2 / P5** gain emitted-edge probes (P5 makes them invisible to the
+  emitter, as for the state probes).
+- A new **P8 - selection and reduction tooling** (`tests/int_select.py`:
+  candidate runs, greedy + removal, delta-debugging shrink, the
+  ownership table). It is offline tooling, not CI.
