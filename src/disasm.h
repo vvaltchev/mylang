@@ -141,6 +141,25 @@ struct DecodedFrag {
  */
 extern std::vector<DecodedFrag> *g_jit_decode_sink;
 
+/*
+ * Decode ONE instruction at code[p] (advancing p) into `out` - the
+ * same decoder `-vdj` renders and `scripts/disasmcheck.py` cross-checks
+ * against objdump. `out.ok` is false for a byte it does not know (p
+ * then advances by one).
+ *
+ * ⛔ `decoded_gp_writes` IS THE JIT REGISTER TRACKER's GROUND TRUTH
+ * (REGTRACK, 2026-10-02): the mask of general registers the
+ * instruction WRITES, explicit and implicit (cqo -> rdx; div/idiv/mul
+ * and one-operand imul -> rax+rdx). A `call` returns 0 - its clobber
+ * of the caller-saved set is the call bracket's business. It FAILS
+ * TOWARDS "writes": any mnemonic not known to leave its first operand
+ * alone is taken to write it, so a new non-writing form reads as an
+ * undeclared write (loud) and never as a silent pass.
+ */
+void decode_ins(const uint8_t *code, uint32_t n, uint32_t &p,
+                DecodedIns &out);
+uint32_t decoded_gp_writes(const DecodedIns &d);
+
 /* The LOADED-IMAGE twin (plans/archived/myv-serializer.md): dump a VmProgram exactly
  * as disassemble_program dumps a fresh compile - the ROUND-TRIP ORACLE
  * (`-vd file.my` vs `-vd file.myv` must be byte-identical) and the everyday

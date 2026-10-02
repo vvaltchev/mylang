@@ -2131,6 +2131,7 @@ struct Emitter {
     void wrote(uint8_t r)
     {
 #ifndef NDEBUG
+        trk_wlog.push_back({static_cast<uint32_t>(pos()), r});
         const uint32_t bit = 1u << r;
         if (trk_borrowed & bit) {
             if (trk_mach > 0)
@@ -2164,6 +2165,97 @@ struct Emitter {
             return;      /* spilled by the prologue; reloaded after */
         trk_fail("write to a PINNED register with no borrow and no "
                  "declaration", r);
+#else
+        (void)r;
+#endif
+    }
+#ifndef NDEBUG
+    /*
+     * ⛔ THE COMPLETENESS HALF: A WRITE THE TRACKER CANNOT SEE IS A
+     * SILENCED CHECK (REGTRACK, 2026-10-02). wrote() only judges the
+     * writes it is TOLD about. A sequence emitted as raw bytes
+     * (`e.u8(0x48); e.u8(0x8B); ...`), or an encoder that forgot to
+     * call wrote(), writes a register no check ever looks at - and the
+     * tracker then reports a clean run for code that clobbers a pin.
+     * Auditing the encoders by grep is the sixth audit-table shape (the
+     * register is in a byte literal, not an argument), so it is not
+     * audited by grep: every byte this Emitter emits is DECODED - by
+     * the decoder `-vdj` uses, which disasmcheck.py holds to objdump -
+     * and every general register an instruction writes must have been
+     * DECLARED by a wrote() call (the log below) in the same encoder
+     * group: the most recent run of wrote() calls at or before the
+     * instruction, with no later declaration between them. An
+     * undecodable byte fails too - the tracker cannot vouch for an
+     * instruction it cannot read.
+     *
+     * rsp is exempt (its every move is sp_move's model, checked at
+     * op_boundary), and so is a `call`'s clobber of the caller-saved
+     * set (the bracket's business). Debug-only; emits nothing.
+     */
+    std::vector<std::pair<uint32_t, uint8_t>> trk_wlog;
+
+    size_t trk_wlog_i = 0;       /* first log entry not yet absorbed  */
+    size_t trk_vpos = 0;         /* bytes already verified            */
+    void trk_scan_writes()
+    {
+        const size_t n = b.size();
+        if (trk_vpos > n) {      /* the buffer was cleared: restart   */
+            trk_vpos = 0;
+            trk_wlog_i = 0;
+            trk_wlog.clear();
+        }
+        uint32_t p = static_cast<uint32_t>(trk_vpos);
+        uint32_t cover = 0;
+        while (p < n) {
+            const uint32_t at = p;
+            DecodedIns d;
+            decode_ins(b.data(), static_cast<uint32_t>(n), p, d);
+            /* the declarations made before this instruction ENDS (an
+             * encoder may report between its prefix and its modrm) */
+            uint32_t fresh = 0;
+            bool any = false;
+            while (trk_wlog_i < trk_wlog.size()
+                    && trk_wlog[trk_wlog_i].first < p) {
+                fresh |= 1u << trk_wlog[trk_wlog_i].second;
+                any = true;
+                trk_wlog_i++;
+            }
+            if (any)
+                cover = fresh;
+            if (!d.ok) {
+                fprintf(stderr, "JIT-REGTRACK: byte 0x%02x at emission "
+                        "offset %u\n", b[at], at);
+                trk_fail("an emitted byte the decoder does not know - "
+                         "the tracker cannot vouch for a write it "
+                         "cannot read", b[at]);
+            }
+            const uint32_t w = decoded_gp_writes(d)
+                             & ~(1u << REG_STACK_PTR);
+            const uint32_t undeclared = w & ~cover;
+            if (undeclared) {
+                unsigned r = 0;
+                while (!(undeclared & (1u << r)))
+                    r++;
+                fprintf(stderr, "JIT-REGTRACK: `%s` at emission offset "
+                        "%u (declared group %#x)\n", d.mn.c_str(), at,
+                        cover);
+
+                trk_fail("an emitted instruction WRITES a general "
+                         "register no wrote() declared - raw bytes, or "
+                         "an encoder that does not report its write",
+                         r);
+            }
+        }
+        trk_vpos = n;
+    }
+    ~Emitter() { trk_scan_writes(); }
+#endif
+    /* a write with NO tracker transition (pop_bytes, a divergent-path
+     * restore): declared, so the scan accepts it, and nothing else */
+    void trk_declare(uint8_t r)
+    {
+#ifndef NDEBUG
+        trk_wlog.push_back({static_cast<uint32_t>(pos()), r});
 #else
         (void)r;
 #endif
@@ -2216,6 +2308,10 @@ struct Emitter {
                 trk_bn--;
             trk_borrowed &= ~bit;
             trk_dirty &= ~bit;
+#ifndef NDEBUG
+            /* the restore WRITES r too - a declared write */
+            trk_wlog.push_back({static_cast<uint32_t>(pos()), r});
+#endif
             return;
         }
         wrote(r);                        /* any other pop WRITES r */
@@ -2255,6 +2351,7 @@ struct Emitter {
     void op_boundary()
     {
 #ifndef NDEBUG
+        trk_scan_writes();
         if (trk_borrowed)
             trk_fail("op boundary reached with a BORROW still open "
                      "(its pop is dead code or missing)",
@@ -2338,6 +2435,7 @@ struct Emitter {
          * really does move rsp. Leaving it out made the cold arm of
          * PushHandler's grow call at an odd depth. */
         sp_move(-8);
+        trk_declare(r);              /* a pop WRITES r: the restore */
         if (r >= 8) u8(0x41);
         u8(0x58 | (r & 7));
     }
@@ -4050,6 +4148,7 @@ struct Emitter {
             u8(0x48); u8(0xF7); u8(0xC4); u32(15);  /* test rsp, 15 */
             const size_t sk = pos();
             u8(0x74); u8(0);                        /* jz over */
+            wrote(REG_ARG0);                        /* reg:abi */
             u8(0x48); u8(0x89); u8(0xE7);           /* mov rdi, rsp */
             u8(0x48); u8(0x83); u8(0xE4); u8(0xF0); /* and rsp, -16 */
             call_relocs.push_back(
@@ -4284,6 +4383,7 @@ struct Emitter {
          * audited FREE (the Reg enum omits 4/rsp and 5/rbp; no emitted
          * code encodes it), and every exit funnels through frag_ret. */
         push_rbp();
+        wrote(REG_FRAME_ANCHOR);
         u8(0x48); u8(0x89); u8(0xE5);                 /* mov rbp, rsp */
         sp_rbp = sp_depth;               /* rbp names THIS depth forever */
         /* G1 step 3c: REG_SLOTS_BASE (rbx) is pushed FIRST after rbp,
@@ -4613,6 +4713,15 @@ struct Emitter {
         assert_no_borrow("exit with a BORROW open - the epilogue's "
                          "flush would store the borrowed-away temp "
                          "(wrap the arm in BorrowSuspend)");
+        /* ⛔ the exit pc travels in rax, and the epilogue then FLUSHES
+         * every pin of this state - a live rax pin would be stored as
+         * the pc. An exit is therefore a conflicting event like a
+         * helper call: evict and re-emit with rax denied. Found when
+         * REGTRACK began decoding every emitted byte: this `mov eax`
+         * was raw bytes, invisible to wrote() (the #107 enumerator,
+         * 43_closure_twoway main/gp#3 = rax). */
+        rax_pin_conflict();
+        wrote(RAX);                     /* reg:abi: the exit pc in rax */
         u8(0xB8); u32(pc);                                /* mov eax, pc */
         u8(0xE9);
         exits.push_back({ pos(), intern_exit_state(), sp_depth });
@@ -4654,7 +4763,12 @@ struct Emitter {
         const auto relay_store = [&]() {
             const uint64_t a = reinterpret_cast<uint64_t>(exit_relay);
             const uint64_t d = reinterpret_cast<uint64_t>(exit_desc);
+            /* the epilogue is machinery: the flush above emptied
+             * every pin (or the state had none) */
+            PinMach pm(*this);
+            wrote(1);
             u8(0x48); u8(0xB9); u64(a);              /* movabs rcx, relay */
+            wrote(2);
             u8(0x48); u8(0xBA); u64(d);              /* movabs rdx, desc */
             u8(0x48); u8(0x89); u8(0x11);            /* mov [rcx], rdx */
         };
@@ -4890,7 +5004,8 @@ struct Emitter {
      * sites used to spell it as a raw byte and were invisible to both
      * the pin tracker and the rsp model. Named, so they are not. */
     void push_rbp() { sp_move(8); u8(0x55); }
-    void pop_rbp()  { sp_move(-8); u8(0x5D); }
+    void pop_rbp()
+    { sp_move(-8); wrote(REG_FRAME_ANCHOR); u8(0x5D); }
     /*
      * `mov reg64, [rsp + disp]` - THE ONE SPELLING for an rsp-relative
      * read, and the reason the rsp model earns its keep beyond
@@ -5017,11 +5132,6 @@ struct Emitter {
         trk_fread(d); trk_fread(s);
         u8(0x66); sse_rex(d, s); u8(0x0F); u8(0x2E);
         u8(static_cast<uint8_t>(0xC0 | ((d & 7) << 3) | (s & 7)));
-    }
-    /* mov rax, [rbx+disp]  (a slot's type ptr) */
-    void load_type(int32_t d)
-    {
-        u8(0x48); u8(0x8B); u8(MODRM_SLOT); u32(uint32_t(d));
     }
     /* cmp <dst>, <src>  (GP reg-reg, both 0-15) - the general form the
      * old hand-rolled cmp_rax_r8 / cmp_rax_rsi / cmp_rdx_rsi /
@@ -10877,6 +10987,10 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
                            int32_t d, bool w) {
         uint8_t rex = static_cast<uint8_t>(
             (w ? 0x48 : 0x40) | (reg >= 8 ? 4 : 0) | (base >= 8 ? 1 : 0));
+        /* REGTRACK: every form but a store / compare WRITES `reg`
+         * (the raw bytes would otherwise be invisible to wrote()) */
+        if (op != 0x89 && op != 0x39 && op != 0x3B)
+            e.wrote(reg);
         if (rex != 0x40)
             e.u8(rex);
         e.u8(op);
@@ -13257,6 +13371,9 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                                int32_t d, bool w) {
             uint8_t rex = static_cast<uint8_t>(
                 (w ? 0x48 : 0x40) | (reg >= 8 ? 4 : 0) | (base >= 8 ? 1 : 0));
+            /* REGTRACK: every form but a store / compare WRITES `reg` */
+            if (op != 0x89 && op != 0x39 && op != 0x3B)
+                e.wrote(reg);
             if (rex != 0x40)
                 e.u8(rex);
             e.u8(op);

@@ -17024,3 +17024,72 @@ push's bind-widening arm (cold), which moved from raw bytes to the
 had). **Net:** `int_enum` over `tests/functional`: 87 `fp#` failures
 before, 0 after; the 7 remaining failures are the pre-existing `gp#`
 ones, unchanged.
+
+## REGTRACK DECODES EVERY EMITTED BYTE: A WRITE IT CANNOT SEE IS A SILENCED CHECK (2026-10-02)
+
+**The hole.** `Emitter::wrote()` judges only the writes it is TOLD
+about. A sequence emitted as raw bytes (`e.u8(0x48); e.u8(0x8B); ...`),
+or an encoder that never calls `wrote()`, writes a general register no
+check looks at - and the tracker then reports a clean run for code that
+clobbers a pin. Finding such sites by grep is the sixth audit-table
+shape: the register is a byte literal, not an argument.
+
+**The net.** So they are not found by grep. `Emitter::trk_scan_writes`
+(ASSERTS builds; emits nothing) DECODES every byte the emitter produced
+- with `decode_ins`, the decoder `-vdj` renders and
+`scripts/disasmcheck.py` holds to objdump - at every `op_boundary` and
+in the destructor, and requires each general register an instruction
+writes (`decoded_gp_writes`: explicit operand, plus `cqo` -> rdx and
+`div`/`idiv`/`mul`/one-operand `imul` -> rax+rdx; fails towards
+"writes" for an unknown mnemonic) to have been DECLARED by a `wrote()`
+(or `trk_declare`, for the restore pops that carry no tracker
+transition) made before that instruction ended and after the previous
+declaring encoder. An undecodable byte fails too: the tracker cannot
+vouch for an instruction it cannot read. rsp is exempt (`sp_move`'s
+model), as is a `call`'s clobber (the bracket's business).
+
+**What it found** - the enumeration is the scan itself, run over `-rt`
+and every `tests/functional` + `bench/my` program in report mode with
+each emitted byte attributed to its emitting call site:
+ - `emit_sync_push_native`'s and `emit_ret_native`'s `modrm` lambdas -
+   every load/lea/add/sub/movsxd through them (the push and return
+   protocols' whole register traffic) was invisible. They declare now,
+   by opcode (all but the store and the compares write `reg`);
+ - `exit_pc`'s `mov eax, pc` - **a latent wrong answer, see below**;
+ - the epilogue's relay store (`movabs rcx/rdx`), `frag_entry`'s
+   `mov rbp, rsp`, `pop_rbp`, `pop_bytes` (the divergent-path borrow
+   restore), the `MYLANG_JIT_SPCHECK` arm's `mov rdi, rsp`, and the
+   unused `load_type` (`mov rax, [rbx+d]`);
+ - the DECODER did not know `pxor` (66 0F EF), which the previous
+   entry's `59_float_abi_calls.my` emits: its `-vdj` printed `DUMP IS
+   UNRELIABLE: 8 undecoded byte(s)` from the day it was added, and the
+   `-rt` decode-coverage check does not run that program. Found
+   independently here and by the disassembler work the same day; the
+   decode arm is that commit's (`disasm: decode pxor ...`) - an
+   instrument gap a new consumer found, which is the usual way.
+
+**The real bug.** An exit is `mov eax, pc; jmp <epilogue>`, and the
+epilogue FLUSHES every pin of that exit's state. A live rax pin was
+therefore written back as the pc. `exit_pc` was raw bytes, so the
+tracker never saw it; once declared, the #107 enumerator aborted it at
+once (`43_closure_twoway` `main/gp#3` = rax, a `i.jmp.ifnot` exit).
+`exit_pc` now calls `rax_pin_conflict()` first - an exit cannot
+coexist with a rax pin any more than a helper call can, so the attempt
+re-emits with rax denied. Not observed as a wrong answer in a release
+build (the attempt that aborted was later evicted for another
+conflict, and rax pins stand in no corpus run), but nothing prevented a
+standing one.
+
+**Watched failing:** with `exit_pc`'s declaration removed (the old
+raw-byte form), the scan aborts in the first JIT test of `-rt`, in the
+DEFAULT configuration, by name (`mov` at its emission offset writes r0,
+no `wrote()`) - the old tracker was silent there; with the
+declaration kept and the `rax_pin_conflict()` removed, the enumerator's
+`43_closure_twoway main/gp#3=0` deviation aborts "write to a PINNED
+register". **Cost:** debug (ASan) `-rt` 65 s -> 74 s, the decode of
+every emitted instruction. **Net:** `int_enum` over `tests/functional`
+0 failures (68,225 deviations); `vdjcmp` against the parent 172 of 173
+identical, the one difference `59_float_abi_calls`'s dump decoding
+`pxor` where it printed `.byte` - the emitted bytes are identical (the
+conflict fires only where a rax pin is live at an exit, which no
+standing attempt has).
