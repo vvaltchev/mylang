@@ -4904,6 +4904,20 @@ correctly declines to stamp `g$0` - an instance reachable as a VALUE is
 dyn-launderable - which is its own `value_used` rule doing what it
 says, not a lost optimization.
 
+**⛔ A SET'S MEMBER ORDER IS THE FIXPOINT'S INSERTION ORDER, AND THAT
+FOLLOWS POINTERS (2026-10-01).** `CsSet::funcs` is a vector in the order
+members arrived, and the fixpoint visits locations keyed by `FuncInfo*` /
+`TypeSym*` - i.e. by heap address. Two consumers turned that order into
+emitted code: the guard chain of a multi-candidate value call (stamped
+from `cs.funcs`), and value-template instantiation, whose
+`std::map<FuncInfo *, ...>` iteration decided which instance was created
+first and so which got the lower global slot. An `INT_TESTS` build, which
+interns more strings, swapped `a1$0`/`a2$0` in `43_closure_twoway`, and
+#107's `vdjcmp` non-perturbation check refused it. Both now order by the
+declaration's monotonic `node_id`. **Anything that turns the analysis's
+answer into code must impose a deterministic order first** - and an
+ordered container keyed by a pointer is an unordered one.
+
 **Testing it: `-dcs` is the ONLY possible oracle.** The analysis changes
 no answer any program computes, so the five-mode differential,
 `corpus_diff` and every fuzzer are blind by construction. The `-rt`
