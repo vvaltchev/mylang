@@ -1874,6 +1874,9 @@ lanes so an `-rt` failure still reports quickly:
 - **repl-fuzz** under `RECYCLE=ON` + ASan, the combination this file
   names for the REPL's retained-AST/stale-node class;
 - **coverage-gate** — Net 4's ratchet (below).
+- **int-enum** — the #107 P3 decision enumerator, tier 1 over
+  tests/functional on an optimized `ASSERTS=ON` `INT_TESTS` build (the
+  REGTRACK net live), after a vacuity guard on `mylang -v`.
 
 **LOCALLY, THE WHOLE BATTERY IS ONE COMMAND: `tests/run_battery.py`
 (2026-09-27).** It builds the six lanes (dbg, clang, rel-hard, release
