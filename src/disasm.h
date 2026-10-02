@@ -109,6 +109,14 @@ struct DecOp {
     bool slot_type = false;/* Slot: the `.type` half of the slot     */
     bool byte_ptr = false; /* Mem/Slot printed with a `byte` size    */
     bool rex8 = false;     /* Gpr8: the uniform low-byte set         */
+    /* Gpr: the operand WIDTH the encoding selects (64, or 32/16/8 when
+     * neither REX.W nor a 64-bit default applies); Mem/Slot: 8 marks a
+     * byte memory operand the default dump does not mark. Only the
+     * MYLANG_VDJ_RAW rendering reads it - the default dump names every
+     * Gpr by its 64-bit register, and changing that text is a separate
+     * decision (it would move every vdjcmp baseline). rex8 picks the
+     * low-byte set when size == 8. */
+    unsigned char size = 64;
     /* HOW the address was ENCODED, which the rendering differs on: a
      * SIB form omits a zero displacement and carries the no-base
      * absolute, a plain one always prints its disp. Recorded rather
@@ -159,6 +167,12 @@ extern std::vector<DecodedFrag> *g_jit_decode_sink;
 void decode_ins(const uint8_t *code, uint32_t n, uint32_t &p,
                 DecodedIns &out);
 uint32_t decoded_gp_writes(const DecodedIns &d);
+/* MYLANG_VDJ_RAW's instruction rendering, for -rt (see disasm.cpp) */
+/* -vdj's rendering of one instruction, no slot names (an -rt hook) */
+std::string render_ins_for_test(const DecodedIns &d);
+/* MYLANG_VDJ_RAW as read at load; -rt sets it in-process (save and
+ * restore it) */
+extern bool g_vdj_raw;
 
 /* The LOADED-IMAGE twin (plans/archived/myv-serializer.md): dump a VmProgram exactly
  * as disassemble_program dumps a fresh compile - the ROUND-TRIP ORACLE

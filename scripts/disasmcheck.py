@@ -5,7 +5,7 @@ disasmcheck.py - is `-vdj` DECODING CORRECTLY, judged by a second
                  disassembler?
 
     scripts/disasmcheck.py BINARY [--matrix] [--env K=V[,K=V...]]...
-                           [--only FILE]... [-v]
+                           [--only FILE|DIR]... [-v]
 
 ⛔ WHY THIS EXISTS, AND WHY THE EXISTING NETS CANNOT REPLACE IT.
 
@@ -51,12 +51,26 @@ precisely the one whose REX-prefixed encoding nothing has ever decoded
 intrusive-test build's forced picks (`MYLANG_INT_CHOOSE`), which put a
 float stage in xmm8-15 and so emit the REX-prefixed SSE forms no default
 run produces (`pxor xmm10, xmm10` was undecoded for exactly that
-reason). `--only FILE` restricts the corpus (repeatable), since a forced
-pick names a site in ONE program.
+reason). `--only FILE|DIR` restricts the corpus (repeatable), since a
+forced pick names a site in ONE program (a DIR selects every corpus file
+under it). A value may hold commas (`MYLANG_INT_CHOOSE=k1=a,k2=b`): a
+comma starts a new variable only before `NAME=`.
 
-Beyond the mnemonic, the XMM REGISTERS are compared in order: an SSE
-form whose REX.R/REX.B we dropped decodes to the right mnemonic on the
-wrong register (`xmm1` for `xmm9`), which a mnemonic-only check passes.
+Beyond the mnemonic, EVERY OPERAND is compared (3), from a second dump
+taken with `MYLANG_VDJ_RAW=1`, which renders operands the way objdump
+does: registers by their real names (a frame slot is `[rbx+0x30]`, not
+`n`; a 32-bit register `r8d`), memory as base+index*scale+disp, baked
+addresses and tags as numbers, branch and call targets as fragment
+offsets. The comparison is per operand: register names exactly (GP and
+xmm - a decoder that drops REX.R/REX.B/REX.X decodes the right mnemonic
+on the WRONG register, `rax` for `r8`, which (2) passes), memory base,
+index, scale and displacement, a `byte` size both ways, immediates (by
+value, at objdump's operand width) and targets.
+
+  3. OPERANDS - the RAW dump vs objdump, operand by operand. A
+     rendering difference that is not a decode error belongs in the RAW
+     mode (disasm.cpp `render_op_raw`), never in a normalisation here:
+     this script compares, the tool renders.
 """
 
 import os
@@ -88,7 +102,7 @@ def corpus():
     return out
 
 
-def frags(binary, path, env):
+def frags(binary, path, env, raw=False):
     """[(start_off, [(off, bytes, mnemonic)])] - one entry per fragment.
 
     A fragment ENDS at the `end native` marker; instructions are only
@@ -97,6 +111,10 @@ def frags(binary, path, env):
     e = dict(os.environ)
     e.update(env)
     e['MYLANG_VDJ_HEX'] = '1'
+    if raw:
+        e['MYLANG_VDJ_RAW'] = '1'
+    else:
+        e.pop('MYLANG_VDJ_RAW', None)
     r = subprocess.run([binary, '-vdj', path], capture_output=True,
                        text=True, env=e)
     if r.returncode != 0:
@@ -181,16 +199,136 @@ def norm(s):
     return s.strip()
 
 
+SIZE = re.compile(r'\b(byte|word|dword|qword|xmmword|tbyte|oword|ymmword)'
+                  r'(?:\s+ptr)?\s+')
+REG = re.compile(r'^(?:[re]?[abcd]x|[abcd]l|[abcd]h|[re]?(?:si|di|sp|bp)'
+                 r'|(?:si|di|sp|bp)l|r(?:[89]|1[0-5])[dwb]?|xmm\d+|rip'
+                 r'|[cdefgs]s)$')
+BRANCH = re.compile(r'^(j[a-z]+|call|loop[a-z]*|jmp)$')
+
+
+def split_ops(s):
+    """mnemonic, [operand text] - Intel syntax has no comma inside a
+    memory operand, so a plain split is exact."""
+    s = s.split(';')[0].split('#')[0].strip().lower()
+    parts = s.split(None, 1)
+    if not parts:
+        return '', []
+    mn = parts[0]
+    rest = parts[1] if len(parts) > 1 else ''
+    return mn, [o.strip() for o in rest.split(',') if o.strip()]
+
+
+def num(t):
+    return int(t, 16) if t.lstrip('-').startswith('0x') else int(t)
+
+
+def parse_op(t):
+    """An operand as a comparable tuple:
+       ('reg', name) | ('mem', base, index, scale, disp, byte) |
+       ('num', value) | ('?', text)."""
+    m = SIZE.match(t)
+    size = m.group(1) if m else None
+    if m:
+        t = t[m.end():]
+    if t.startswith('ds:'):
+        return ('mem', None, None, 1, num(t[3:]), size == 'byte')
+    if t.startswith('[') and t.endswith(']'):
+        base = index = None
+        scale, disp = 1, 0
+        for sign, term in re.findall(r'([+-]?)([^+-]+)', t[1:-1]):
+            term = term.strip()
+            if '*' in term:
+                r, sc = term.split('*')
+                index, scale = r.strip(), int(sc)
+            elif REG.match(term):
+                if base is None:
+                    base = term
+                else:
+                    index = term
+            else:
+                v = num(term)
+                disp += -v if sign == '-' else v
+        return ('mem', base, index, scale, disp, size == 'byte')
+    if REG.match(t):
+        return ('reg', t)
+    try:
+        return ('num', num(t))
+    except ValueError:
+        return ('?', t)
+
+
+def num_eq(ours, od):
+    """an immediate: objdump prints it unsigned at the OPERAND's width,
+    which the text does not carry - so equal at some width it fits."""
+    for bits in (8, 16, 32, 64):
+        if 0 <= od < (1 << bits) and ours % (1 << bits) == od:
+            return True
+    return ours == od
+
+
+OPS_COMPARED = [0]
+
+
+def ops_mismatch(raw, omn, base, off):
+    """None when every operand agrees, else a short reason."""
+    mn, a = split_ops(raw)
+    _, b = split_ops(omn)
+    if len(a) != len(b):
+        return "operand count %d vs %d" % (len(a), len(b))
+    for i, (x, y) in enumerate(zip(a, b)):
+        OPS_COMPARED[0] += 1
+        p, q = parse_op(x), parse_op(y)
+        if p[0] != q[0]:
+            return "operand %d kind %s vs %s" % (i, x, y)
+        if p[0] == 'reg' and p[1] != q[1]:
+            return "operand %d register %s vs %s" % (i, x, y)
+        if p[0] == 'mem':
+            if p[1:4] != q[1:4]:
+                return "operand %d address %s vs %s" % (i, x, y)
+            if (p[4] - q[4]) % (1 << 32):
+                return "operand %d displacement %s vs %s" % (i, x, y)
+            if p[5] != q[5]:
+                return "operand %d byte size %s vs %s" % (i, x, y)
+        if p[0] == 'num':
+            if BRANCH.match(mn):
+                if (p[1] - base - q[1]) % (1 << 64):
+                    return "operand %d target %s vs %s" % (i, x, y)
+            elif not num_eq(p[1], q[1]):
+                return "operand %d immediate %s vs %s" % (i, x, y)
+        if p[0] == '?' and x != y:
+            return "operand %d unparsed %s vs %s" % (i, x, y)
+    return None
+
+
 def check(binary, env, files, verbose):
-    bad_len = bad_mn = insns = frag_n = wraps = 0
+    bad_len = bad_mn = bad_op = insns = frag_n = wraps = 0
     for path in files:
         fs = frags(binary, path, env)
         if fs is None:
             continue
-        for ins in fs:
+        rs = frags(binary, path, env, raw=True)
+        if rs is None or [[(o, len(h)) for o, h, _ in f] for f in rs] != \
+                [[(o, len(h)) for o, h, _ in f] for f in fs]:
+            #
+            # The RAW dump must be the SAME instructions as the plain
+            # one - it differs in rendering only. If it is not, the
+            # operand check below would compare a different stream.
+            # Offsets and LENGTHS, not bytes: the bytes hold baked
+            # addresses, which differ between the two processes.
+            #
+            # And objdump is handed the RAW run's bytes, so the
+            # addresses it prints are the ones the RAW dump printed.
+            #
+            bad_op += 1
+            print("RAW %s: MYLANG_VDJ_RAW changed the decoded stream"
+                  % path)
+            rs = None
+        for fi, ins in enumerate(fs):
             frag_n += 1
             base = ins[0][0]
-            blob = b''.join(bytes.fromhex(b) for _, b, _ in ins)
+            src = rs[fi] if rs is not None else ins
+            blob = b''.join(bytes.fromhex(b) for _, b, _ in src)
             od, wr = objdump_lens(blob)
             wraps += wr
             for i, (off, hx, mn) in enumerate(ins):
@@ -215,7 +353,38 @@ def check(binary, env, files, verbose):
                     if verbose or bad_mn <= 20:
                         print("MNEMONIC %s +%d: {%s} we %-28r objdump %r"
                               % (path, off, hx, mn, omn))
-    return bad_len, bad_mn, insns, frag_n, wraps
+                    continue
+                if rs is None:
+                    continue
+                raw = rs[fi][i][2]
+                why = ops_mismatch(raw, omn, base, rel)
+                if why:
+                    bad_op += 1
+                    if verbose or bad_op <= 20:
+                        print("OPERAND %s +%d: {%s} %s: we %r objdump %r"
+                              % (path, off, hx, why, raw, omn))
+    return bad_len, bad_mn, bad_op, insns, frag_n, wraps
+
+
+ENV_NAME = re.compile(r'^[A-Z_][A-Z0-9_]*=')
+
+
+def parse_env(spec):
+    """`K=V[,K=V...]` -> dict. A comma starts a new variable only when
+    what follows is `NAME=`: a value may itself hold commas -
+    `MYLANG_INT_CHOOSE=main@0/fp#0=11,main@21/fp#0=11` is ONE variable
+    with two keys, and splitting it at every comma used to turn the
+    second key into an environment variable of its own, silently
+    dropping the pick."""
+    out, cur = {}, None
+    for part in spec.split(','):
+        if ENV_NAME.match(part) or cur is None:
+            k, _, v = part.partition('=')
+            out[k] = v
+            cur = k
+        else:
+            out[cur] += ',' + part
+    return out
 
 
 def main():
@@ -226,8 +395,7 @@ def main():
         a = argv[i]
         if a in ('--env', '--only') and i + 1 < len(argv):
             if a == '--env':
-                kv = dict(x.split('=', 1) for x in argv[i + 1].split(','))
-                extra.append((kv, argv[i + 1]))
+                extra.append((parse_env(argv[i + 1]), argv[i + 1]))
             else:
                 only.append(os.path.abspath(argv[i + 1]))
             i += 2
@@ -238,7 +406,7 @@ def main():
     if not args:
         print(__doc__.strip().split('\n')[2], file=sys.stderr)
         print("usage: disasmcheck.py BINARY [--matrix] "
-              "[--env K=V[,K=V...]]... [--only FILE]... [-v]",
+              "[--env K=V[,K=V...]]... [--only FILE|DIR]... [-v]",
               file=sys.stderr)
         return 2
     binary = args[0]
@@ -253,7 +421,11 @@ def main():
         return 2
     files = corpus()
     if only:
-        files = [f for f in files if os.path.abspath(f) in only]
+        # a FILE, or a DIRECTORY meaning every corpus file under it
+        files = [f for f in files
+                 if any(os.path.abspath(f) == o
+                        or os.path.abspath(f).startswith(o + os.sep)
+                        for o in only)]
         if not files:
             print("error: --only matched no corpus file", file=sys.stderr)
             return 2
@@ -267,21 +439,24 @@ def main():
             envs.append(({'MYLANG_JIT_MAXPINS': str(p)}, 'maxpins=%d' % p))
     envs.extend(extra)
 
-    tl = tm = ti = tf = tw = 0
+    tl = tm = to = ti = tf = tw = 0
     for env, name in envs:
-        bl, bm, n, fn, wr = check(binary, env, files, verbose)
+        bl, bm, bo, n, fn, wr = check(binary, env, files, verbose)
         print("%-12s %6d insns in %4d frags   boundary-errors %d   "
-              "mnemonic-errors %d%s"
-              % (name, n, fn, bl, bm,
+              "mnemonic-errors %d   operand-errors %d%s"
+              % (name, n, fn, bl, bm, bo,
                  "   ⛔ %d WRAPPED objdump lines" % wr if wr else ""))
         tl += bl
         tm += bm
+        to += bo
         ti += n
         tf += fn
         tw += wr
 
     print("\nTOTAL %d instructions, %d fragments" % (ti, tf))
-    print("  boundary errors: %d   mnemonic errors: %d" % (tl, tm))
+    print("  boundary errors: %d   mnemonic errors: %d   "
+          "operand errors: %d (of %d operands compared)"
+          % (tl, tm, to, OPS_COMPARED[0]))
     if tw:
         print("\n⛔ objdump WRAPPED %d instruction(s) across lines despite "
               "-w and\n   --insn-width=16. The comparison below cannot be "
@@ -289,7 +464,7 @@ def main():
               "instruction. THE ORACLE is misconfigured,\n   not the "
               "decoder - fix the objdump invocation." % tw, file=sys.stderr)
         return 2
-    if tl or tm:
+    if tl or tm or to:
         print("\n⛔ the disassembler DISAGREES with objdump. A boundary "
               "error means\n   every mnemonic after it in that fragment "
               "is read at the wrong\n   offset - fix decode_one.",
@@ -298,6 +473,10 @@ def main():
     if ti == 0:
         print("\n⛔ VACUOUS: no instructions were compared. Is "
               "MYLANG_VDJ_HEX honoured?", file=sys.stderr)
+        return 2
+    if OPS_COMPARED[0] == 0:
+        print("\n⛔ VACUOUS: no operands were compared. Is "
+              "MYLANG_VDJ_RAW honoured?", file=sys.stderr)
         return 2
     print("  every instruction agrees with objdump.")
     return 0

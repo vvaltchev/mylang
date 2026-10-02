@@ -22,6 +22,12 @@
 #include <unordered_map>
 #include <unordered_set>
 
+namespace { bool env_flag_on(const char *name); }
+
+/* MYLANG_VDJ_RAW, read once at load - a plain flag, so -rt can set it
+ * in-process (see vdj_raw) */
+bool g_vdj_raw = env_flag_on("MYLANG_VDJ_RAW");
+
 namespace {
 
 /* A register slot as text: the source VARIABLE NAME for a resolved local
@@ -574,6 +580,45 @@ bool vdj_show_addrs()
     return on;
 }
 
+/*
+ * MYLANG_VDJ_RAW=1 - render every operand the way objdump does, for
+ * `scripts/disasmcheck.py`'s operand comparison. A frame slot prints as
+ * the `[rbx+disp]` it is, a baked address or a Type tag as its number,
+ * a 32-bit register by its real name (r8d, not e8), a branch or call
+ * target as its FRAGMENT offset, and every memory operand as
+ * base+index*scale+disp. NOT reproducible by construction (the digits
+ * are the point), so nothing that compares dumps may use it - the same
+ * contract as MYLANG_VDJ_HEX. The default rendering is untouched.
+ */
+bool vdj_raw()
+{
+    return g_vdj_raw;
+}
+
+static std::string raw_hex(long long v)
+{
+    std::ostringstream o;
+    const unsigned long long u = v < 0 ? 0ull - static_cast<unsigned
+                                                long long>(v)
+                                       : static_cast<unsigned long long>(v);
+    o << (v < 0 ? "-0x" : "0x") << std::hex << u;
+    return o.str();
+}
+
+static const char *gp16(int r)
+{
+    static const char *n[16] = { "ax","cx","dx","bx","sp","bp",
+        "si","di","r8w","r9w","r10w","r11w","r12w","r13w","r14w","r15w" };
+    return (r >= 0 && r < 16) ? n[r] : "r?w";
+}
+
+static const char *gp32(int r)
+{
+    static const char *n[16] = { "eax","ecx","edx","ebx","esp","ebp",
+        "esi","edi","r8d","r9d","r10d","r11d","r12d","r13d","r14d","r15d" };
+    return (r >= 0 && r < 16) ? n[r] : "r?d";
+}
+
 const char *gp64(int r)
 {
     static const char *n[16] = { "rax","rcx","rdx","rbx","rsp","rbp",
@@ -705,15 +750,21 @@ DecOp mem_op(int base_reg, int32_t disp)
     DecOp x;
     if (base_reg == 3 /*rbx*/) {
         const int stride = 48, poff = 0, toff = 24;
+        /* reg/disp are kept beside the slot for the RAW rendering,
+         * which prints the encoding rather than the name. */
         if (disp >= 0 && disp % stride == poff) {
             x.kind = DecOp::Slot;
             x.slot = disp / stride;
+            x.reg = base_reg;
+            x.disp = disp;
             return x;
         }
         if (disp >= 0 && disp % stride == toff) {
             x.kind = DecOp::Slot;
             x.slot = disp / stride;
             x.slot_type = true;
+            x.reg = base_reg;
+            x.disp = disp;
             return x;
         }
     }
@@ -738,6 +789,48 @@ DecOp dop_rel(long long t)
 DecOp dop_callrel(long long d)
 { DecOp x; x.kind = DecOp::CallRel; x.imm = d; return x; }
 DecOp dop_byte(DecOp x) { x.byte_ptr = true; return x; }
+
+/* MYLANG_VDJ_RAW's rendering (see vdj_raw): objdump's spelling. */
+static std::string render_op_raw(const DecOp &x)
+{
+    std::ostringstream o;
+    const char *bp = x.byte_ptr || x.size == 8 ? "byte " : "";
+    switch (x.kind) {
+    case DecOp::Gpr:
+        if (x.size == 32) return gp32(x.reg);
+        if (x.size == 16) return gp16(x.reg);
+        if (x.size == 8)  return gp8(x.reg, x.rex8);
+        return gp64(x.reg);
+    case DecOp::Gpr32:  return gp32(x.reg);
+    case DecOp::Gpr8:   return gp8(x.reg, x.rex8);
+    case DecOp::Xmm:    o << "xmm" << x.reg; return o.str();
+    case DecOp::Cl:     return "cl";
+    case DecOp::Slot:
+    case DecOp::Mem:
+        o << bp << "[";
+        if (x.rip) {
+            o << "rip";
+        } else {
+            if (x.reg >= 0) o << gp64(x.reg);
+            if (x.index >= 0)
+                o << (x.reg >= 0 ? "+" : "") << gp64(x.index) << "*"
+                  << x.scale;
+        }
+        if (!x.rip && x.reg < 0 && x.index < 0)
+            o << raw_hex(x.disp);
+        else
+            o << (x.disp < 0 ? "" : "+") << raw_hex(x.disp);
+        o << "]";
+        return o.str();
+    case DecOp::Imm:
+    case DecOp::ImmDec:
+    case DecOp::Rel:
+    case DecOp::CallRel:
+        return raw_hex(x.imm);
+    default: break;
+    }
+    return "?";
+}
 
 /* THE ONE PLACE A MACHINE OPERAND BECOMES TEXT. */
 std::string render_op(const DecOp &x, const SlotNamer &nm,
@@ -795,9 +888,27 @@ std::string render_op(const DecOp &x, const SlotNamer &nm,
     return "?";
 }
 
+/* RAW mode's instruction line (MYLANG_VDJ_RAW): every operand in
+ * objdump's spelling, a call's target as a FRAGMENT offset - as objdump
+ * prints it for a blob that starts at the fragment */
+static std::string render_ins_raw(const DecodedIns &d)
+{
+    std::string s = d.mn;
+    for (int i = 0; i < d.n; i++) {
+        s += i ? ", " : " ";
+        DecOp t = d.ops[i];
+        if (t.kind == DecOp::CallRel)
+            t.imm = static_cast<long long>(d.off) + d.len + t.imm;
+        s += render_op_raw(t);
+    }
+    return s;
+}
+
 std::string render_ins(const DecodedIns &d, const SlotNamer &nm,
                        const void *ti, const void *tf, const void *ta)
 {
+    if (vdj_raw())
+        return render_ins_raw(d);
     std::string s = d.mn;
     for (int i = 0; i < d.n; i++) {
         s += i ? ", " : " ";
@@ -911,7 +1022,13 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
              * job; nobody ran it. Same shape as the 2026-08-17
              * mask-rot, one arena later.
              */
-            rm.index = idx3 != 4 ? idx : -1;      /* 4 == no index */
+            /* ⛔ "no index" is the FULL 4-bit field == 4, i.e. 100b
+             * WITHOUT REX.X. With REX.X it is r12, a real index: the
+             * test used to read the 3-bit field, so
+             * `lea rax, [r14+r12]` printed as `lea rax, [r14+0x0]` -
+             * found by disasmcheck's operand comparison (2026-10-02),
+             * which the mnemonic check had passed. */
+            rm.index = idx != 4 ? idx : -1;       /* 4 == no index */
             rm.scale = scale;
             rm.disp = d;
             return;
@@ -928,6 +1045,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         rm = mem_op(rmf, d);   /* REX.B-extended base (r9 chains) */
     };
     int regf; DecOp rm;
+    uint8_t op2 = 0;             /* the 0F map's second byte */
 
     switch (op) {
     case 0xB8: case 0xB9: case 0xBA: case 0xBB:
@@ -1121,6 +1239,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
         A(dop_rel(int32_t(p) + d)); break; }
     case 0x0F: {
         const uint8_t o2 = c[p++];
+        op2 = o2;
         /* the rm REGISTER of an SSE form is an XMM, not a GP (the
          * generic modrm would print `rsi` for xmm6 - found live on
          * 89_regs_float_08's xmm-pinned fj) */
@@ -1184,7 +1303,52 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
     default:
         goto undecoded;
     }
-    (void)pf_f2; (void)pf_66;
+    (void)pf_f2;
+    {
+        /* The operand WIDTH each general register operand was encoded
+         * at (DecOp::size, read by the RAW rendering only). An op with
+         * an operand-size attribute is 64-bit under REX.W, 16 under a
+         * 66 prefix, else 32; the byte forms are 8; push/pop/call/jmp
+         * default to 64. Fails towards 64, which RAW then prints as
+         * the 64-bit name - a mismatch disasmcheck reports. */
+        const int osz = W ? 64 : pf_66 ? 16 : 32;
+        const auto set_sz = [&](int i, int bits) {
+            if (i >= D.n)
+                return;
+            DecOp &x = D.ops[i];
+            if (x.kind == DecOp::Gpr) {
+                x.size = static_cast<unsigned char>(bits);
+                x.rex8 = rex != 0;
+            } else if ((x.kind == DecOp::Mem || x.kind == DecOp::Slot)
+                       && bits == 8) {
+                x.size = 8;      /* a byte memory operand */
+            }
+        };
+        const auto all_sz = [&](int bits) {
+            for (int i = 0; i < D.n; i++) set_sz(i, bits);
+        };
+        switch (op) {
+        case 0x01: case 0x03: case 0x09: case 0x0B: case 0x21: case 0x23:
+        case 0x29: case 0x2B: case 0x31: case 0x33: case 0x39: case 0x3B:
+        case 0x3D: case 0x69: case 0x6B: case 0x81: case 0x83: case 0x85:
+        case 0x89: case 0x8B: case 0x8D: case 0xC1: case 0xC7: case 0xD1:
+        case 0xD3: case 0xF7:
+            all_sz(osz); break;
+        case 0x63: set_sz(0, osz); set_sz(1, 32); break;
+        case 0x80: case 0x88: case 0x8A: case 0xC6: case 0xF6:
+            all_sz(8); break;
+        case 0xFF:
+            if (D.mn == "inc" || D.mn == "dec") all_sz(osz);
+            break;
+        case 0x0F:
+            if (op2 == 0xAF) all_sz(osz);
+            else if (op2 == 0xB6) { set_sz(0, osz); set_sz(1, 8); }
+            else if (op2 >= 0x90 && op2 <= 0x9F) all_sz(8);
+            else if (op2 == 0x2A) set_sz(1, osz);
+            break;
+        default: break;
+        }
+    }
     D.ok = true;
     D.len = p - start;
     if (render)                  /* decode_ins wants the structure only */
@@ -2758,4 +2922,13 @@ uint32_t decoded_gp_writes(const DecodedIns &d)
     default: break;
     }
     return gp(0);
+}
+
+/* the instruction rendering -vdj prints, with no slot names: -rt sets
+ * g_vdj_raw and checks RAW mode against what objdump prints for the
+ * same bytes */
+std::string render_ins_for_test(const DecodedIns &d)
+{
+    return render_ins(d, [](int) { return std::string(); }, nullptr,
+                      nullptr, nullptr);
 }

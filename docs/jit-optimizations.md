@@ -7059,6 +7059,65 @@ disagreements** over the corpus x both arenas x 16 rotations x 5 pin
 budgets, plus the four forced float-stage picks (x both arenas) on
 59_float_abi_calls and 16_elem2_fused.
 
+### EVERY OPERAND IS COMPARED NOW - `MYLANG_VDJ_RAW` (2026-10-02)
+
+The xmm comparison closed the hole for SSE forms only. A GP register
+operand was still compared by SHAPE alone, because the default `-vdj`
+spells operands differently from objdump on purpose (a frame slot by
+its NAME, a temp as `rN`, a baked pointer as `<addr>`) - so a decoder
+that dropped REX.B on a GP r/m register decoded the right mnemonic on
+the WRONG register and passed.
+
+**The fix is in the TOOL, not in a regex in the checker:**
+`MYLANG_VDJ_RAW=1` makes `render_op` render through `render_op_raw`,
+objdump's spelling - registers by their real names at their ENCODED
+width (`r8d`, `eax`, `al`, `sil`), a slot as the `[rbx+0x30]` it is,
+every memory operand as base+index*scale+disp, immediates and baked
+addresses as numbers, a branch or call target as its fragment offset.
+The width needed one new decoded fact, `DecOp::size` (a GP operand's
+encoded width; a byte memory operand), filled by one post-pass in
+`decode_one` from the opcode, REX.W and the 66 prefix. **The default
+rendering does not read it** and is byte-identical to before (vdjcmp
+against a132c8a3: 170/173 identical, the 3 differing lines being
+exactly the bug below) - so the default dump still prints `rax` for a
+32-bit `eax` operand, `rax` for a `sete al`, and `e8` for `mov r8d`.
+That is a READABILITY question for the default text, now visible, and
+changing it moves every vdjcmp baseline; it is left as is.
+
+disasmcheck takes a second dump with the switch (compared to the plain
+one by offsets and lengths - the BYTES differ, they hold addresses the
+two processes baked differently), hands objdump the RAW run's bytes, and
+compares per operand: register names exactly (GP and xmm), memory base,
+index, scale and displacement (mod 2^32), the `byte` size both ways,
+immediates by value at some width objdump's unsigned print fits, and
+targets. It counts what it compared and fails VACUOUS at zero.
+
+**Its first run found a real decoder bug on the default corpus.** The
+SIB arm treated index field 100b as "no index" from the 3-bit field,
+before REX.X - but with REX.X set it is **r12**, a real index. So
+`lea rax, [r14+r12*1]` printed as `lea rax, [r14]` on 68_nested,
+16_elem2_fused and 56_xcall_pins - right mnemonic, right length, wrong
+address, and the comment above the line said the opposite of what the
+code did. The other 39,800 first-run errors were the RAW rendering
+learning objdump's widths, not decode bugs.
+
+**Watched failing:** dropping REX.B from the mod=3 GP r/m register
+(an `OPT=1 ASSERTS=0` build - in a checked build REGTRACK aborts first,
+since the decode is its ground truth): the old checker reports **zero**
+disagreements over 575,294 instructions; the new one **11,986**
+operand errors.
+
+Matrix result: **13,268,805 instructions, 16,997 fragments, 21,571,485
+operands, zero disagreements** (corpus x both arenas x 16 rotations x 5
+pin budgets; 4m08s on an `OPT=1 ASSERTS=1 LTO=0 TESTS=1` build - the
+second dump doubles it). `--env` now splits only before `NAME=`, so a
+multi-key `MYLANG_INT_CHOOSE=k1=a,k2=b` is one variable (it was split
+into two, the second key silently dropped), and `--only` takes a
+directory. CI (`nets.yml`, int-enum) runs tests/functional under three
+forced-pick configurations on the INT build - a float stage in xmm11
+and xmm10, a GP scratch in r8 and a pin in r15 - after a guard that
+proves each pick still lands in r8-r15/xmm8-15 (28 s locally).
+
 ### And one EMITTER defect it found
 
 `load_elem_sd` / `store_elem_sd` passed `w=true` to `rex_sib`, but
