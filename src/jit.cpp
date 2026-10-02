@@ -2064,8 +2064,55 @@ struct Emitter {
                 return true;
         return false;
     }
+    /*
+     * ⛔ THE READ-BEFORE-WRITE HALF (2026-10-02). fwrote() below asks
+     * "does this write CLOBBER a pin?" - and three silent wrong answers
+     * the #107 enumerator found were a different shape it cannot see:
+     * an op computed its value into a LITERAL xmm0 (raw bytes, or an
+     * encoder given `0`) and then stored the float STAGE, which this op
+     * never wrote. While the stage IS xmm0 the two coincide and nothing
+     * is wrong; the day it moves the store writes whatever the stage
+     * last held, and no pin was touched, so nothing aborted.
+     *
+     * So every xmm an encoder writes is recorded here for the CURRENT
+     * op (reset at op_boundary), and every encoder that READS an xmm
+     * (trk_fread) requires it to have been written by this op, or to
+     * be a pin or a pooled literal (the forward bus carried in from
+     * the previous op is seeded as written). A RAW-BYTE
+     * write records nothing, so it now fails in the DEFAULT
+     * configuration too, where the bug was invisible. A call that
+     * returns in a register declares it: trk_fdef_note.
+     */
+    uint32_t trk_fdef = 0;
+    void trk_fdef_note(uint8_t x) { trk_fdef |= 1u << x; }
+    /* EVERY encoder that READS an xmm reports it here: a register read
+     * before this op wrote it reads a value some other op (or nothing)
+     * left there - unless it is a pin or a pooled literal, which are
+     * their own value. All xmm are caller-saved, so nothing else
+     * survives an op boundary. */
+    void trk_fread(uint8_t x) const
+    {
+#ifndef NDEBUG
+        if (cur_pc < 0 || trk_mach > 0)
+            return;                  /* entries/epilogues: no op value */
+        if (trk_fdef & (1u << x))
+            return;                  /* this op put the value there */
+        if (freg_holds_pin(x))
+            return;                  /* a pin is its own value */
+        for (const FLit &f : flits)
+            if (f.reg == x)
+                return;              /* so is a pooled literal */
+        trk_fail("a float op READS an xmm register no one defined - not "
+                 "written by this op, not a pin, not a pooled literal "
+                 "(a literal xmm0/xmm1 where the stage was meant, or "
+                 "raw bytes the tracker cannot see?)", x);
+#else
+        (void)x;
+#endif
+    }
     void fwrote(uint8_t x)
     {
+        trk_fdef |= 1u << x;         /* before any early return */
 #ifndef NDEBUG
         if (trk_mach > 0)
             return;                  /* entry loads / declared updates */
@@ -2247,6 +2294,7 @@ struct Emitter {
         /* the RESETS are unconditional - trk_flushed feeds trk_push's
          * discrimination, which drives EMISSION (see trk_push's ⛔) */
         trk_pushes = 0;
+        trk_fdef = 0;              /* diagnostics only: emits nothing */
         /* ⛔ THE FLUSH STATE IS PER-OP, NOT PER-EMISSION-ORDER. A run
          * may contain a TERMINAL op mid-sequence (an early return): its
          * flush ends ITS path, but the next op in EMISSION order is
@@ -2901,6 +2949,7 @@ struct Emitter {
     void movsd_store_base(uint8_t base, int32_t disp, uint8_t xmm)
     {
         ML_CHECK((base & 7) != 4);
+        trk_fread(xmm);
         u8(0xF2);
         const uint8_t rex = static_cast<uint8_t>(
             0x40 | (xmm >= 8 ? 4 : 0) | (base >= 8 ? 1 : 0));
@@ -4712,6 +4761,7 @@ struct Emitter {
     /* movsd [rbx+disp], xmm<r> */
     void fstore(uint8_t r, int32_t d)
     {
+        trk_fread(r);
         slot_mem_check(d, true);
         u8(0xF2); sse_rex(r, REG_SLOTS_BASE); u8(0x0F); u8(0x11);
         u8(static_cast<uint8_t>(MODRM_SLOT | ((r & 7) << 3)));
@@ -4723,7 +4773,21 @@ struct Emitter {
     {
         ML_CHECK_MSG(!base_needs_sib(base),
                      "fstore_base: rsp/r12 need a SIB byte");
+        trk_fread(r);
         u8(0xF2); sse_rex(r, base); u8(0x0F); u8(0x11);
+        u8(static_cast<uint8_t>(0x80 | ((r & 7) << 3) | (base & 7)));
+        u32(uint32_t(d));
+    }
+    /* movsd xmm<r>, [base+disp32] - the baked struct-member float
+     * read. It was RAW BYTES at its one site, with xmm0 in the modrm:
+     * invisible to the tracker (no fwrote) and wrong the moment the
+     * stage left xmm0 (the #107 P3 enumerator, fp#0). */
+    void fload_base(uint8_t r, uint8_t base, int32_t d)
+    {
+        ML_CHECK_MSG(!base_needs_sib(base),
+                     "fload_base: rsp/r12 need a SIB byte");
+        fwrote(r);
+        u8(0xF2); sse_rex(r, base); u8(0x0F); u8(0x10);
         u8(static_cast<uint8_t>(0x80 | ((r & 7) << 3) | (base & 7)));
         u32(uint32_t(d));
     }
@@ -4740,8 +4804,9 @@ struct Emitter {
      * pick the other scratch instead deletes that move - the result is
      * then in xmm1, the next op's forwarded operand lives there, and
      * the two alternate. Both < 8 (no REX): the pools are xmm0-xmm7. */
-    void farith(uint8_t op, uint8_t dst = 0, uint8_t src = 1)
-    { fwrote(dst); u8(0xF2); sse_rex(dst, src); u8(0x0F); u8(op);
+    void farith(uint8_t op, uint8_t dst, uint8_t src)
+    { trk_fread(dst); trk_fread(src);
+      fwrote(dst); u8(0xF2); sse_rex(dst, src); u8(0x0F); u8(op);
       u8(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7))); }
 #ifdef TESTS
     /* the strength reduction's execution proof - bumped by the EMITTED
@@ -4777,6 +4842,7 @@ struct Emitter {
      * DELETED - the sixth audit shape's rule). */
     void movq_r_x(uint8_t dst, uint8_t src)
     {
+        trk_fread(src);
         wrote(dst);
         u8(0x66);
         u8(static_cast<uint8_t>(0x48 | (src >= 8 ? 4 : 0)
@@ -4794,11 +4860,11 @@ struct Emitter {
      * rename stage eliminates it. The upper half is dead everywhere
      * here - every consumer is a scalar sd op. */
     void fmov_rr(uint8_t dst, uint8_t src)
-    { fwrote(dst); sse_rex(dst, src); u8(0x0F); u8(0x28);
+    { trk_fread(src); fwrote(dst); sse_rex(dst, src); u8(0x0F); u8(0x28);
       u8(static_cast<uint8_t>(0xC0 | ((dst & 7) << 3) | (src & 7))); }
     /* sqrtsd xmm<d>, xmm<s>  (SSE2) */
     void sqrtsd(uint8_t d, uint8_t s)
-    { fwrote(d); u8(0xF2); sse_rex(d, s); u8(0x0F); u8(0x51);
+    { trk_fread(s); fwrote(d); u8(0xF2); sse_rex(d, s); u8(0x0F); u8(0x51);
       u8(static_cast<uint8_t>(0xC0 | ((d & 7) << 3) | (s & 7))); }
     /* push/pop a GP reg (0x50+r / 0x58+r; REX.B for r8..r15) */
     void push_reg(uint8_t r)
@@ -4948,6 +5014,7 @@ struct Emitter {
     /* ucomisd xmm<d>, xmm<s> */
     void ucomisd(uint8_t d, uint8_t s)
     {
+        trk_fread(d); trk_fread(s);
         u8(0x66); sse_rex(d, s); u8(0x0F); u8(0x2E);
         u8(static_cast<uint8_t>(0xC0 | ((d & 7) << 3) | (s & 7)));
     }
@@ -6178,7 +6245,7 @@ struct Emitter {
     void load_elem_sd(uint8_t xmm, uint8_t base, uint8_t index)
     { fwrote(xmm); elem_sd(xmm, base, index, 0x10); }
     void store_elem_sd(uint8_t base, uint8_t index, uint8_t xmm)
-    { elem_sd(xmm, base, index, 0x11); }
+    { trk_fread(xmm); elem_sd(xmm, base, index, 0x11); }
     /* cvtsi2sd <xmm>, qword [base + index*8]  (an int element promotes;
      * REX.W is LOAD-BEARING here - it picks the 64-bit source) */
     void cvtsi2sd_elem(uint8_t xmm, uint8_t base, uint8_t index)
@@ -6261,9 +6328,15 @@ struct Emitter {
      * covers the first; pxor_rr is the generic zero/xor form. */
     void pxor_rr(uint8_t d, uint8_t s2)
     {
+        if (d != s2) {               /* `pxor d, d` is a zero idiom */
+            trk_fread(d); trk_fread(s2);
+        }
         fwrote(d);
-        u8(0x66); u8(0x0F); u8(0xEF);
-        u8(static_cast<uint8_t>(0xC0 | (d << 3) | s2));
+        /* sse_rex: without it an xmm8-15 operand overflowed the modrm
+         * fields - `pxor xmm9, xmm9` assembled as `pxor xmm1, xmm1`
+         * (reachable only with the stage off xmm0/xmm1) */
+        u8(0x66); sse_rex(d, s2); u8(0x0F); u8(0xEF);
+        u8(static_cast<uint8_t>(0xC0 | ((d & 7) << 3) | (s2 & 7)));
     }
     /* ---- #95, the nested-STORE tier (boxed slot type guards in rdx) ---- */
     /* ---- C1, the hoisted-base navigation (r12-r15 operands) ---- */
@@ -11325,11 +11398,11 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
         e.patch32_here(j_cvt);
         /* cvtsi2sd xmm0, [rbx+s] ; movsd [rbx+s], xmm0. xmm0 is free: the
          * call prologue already spilled the C2a float pins, and the call
-         * about to happen clobbers every xmm anyway. */
-        e.u8(0xF2); e.u8(0x48); e.u8(0x0F); e.u8(0x2A); e.u8(0x83);
-        e.u32(static_cast<uint32_t>(s));
-        e.u8(0xF2); e.u8(0x0F); e.u8(0x11); e.u8(0x83);
-        e.u32(static_cast<uint32_t>(s));
+         * about to happen clobbers every xmm anyway. Through the
+         * ENCODERS, not raw bytes, so the register tracker sees the
+         * write (its sibling arm in the baked push already does). */
+        e.cvt(X0, s);                                    /* reg:abi */
+        e.fstore(X0, s);                                 /* reg:abi */
         movabs_r10(reinterpret_cast<uint64_t>(L.t_float));
         st(RBX, s + 24, R10);
         e.patch32_here(j_retagged);
@@ -19457,13 +19530,48 @@ static FOperands emit_float_operands(Emitter &e, const Instr &in, uint32_t pc,
  * an out-of-line TRAMPOLINE in the same buffer (`movabs rax, fn; jmp rax`,
  * always rel32-reachable). The trampoline path is the arm64-style veneer the
  * short-range branch will need there too. */
-static void emit_libm_call(Emitter &e, const void *fn)
+/*
+ * ⛔ THE SysV FLOAT ABI IS MARSHALLED HERE, INSIDE THE BRACKET - THE
+ * CALLER NEVER NAMES xmm0/xmm1 (the 2026-10-02 enumerator fix). The
+ * arguments arrive in `a` (and `b` for a two-argument function, else
+ * pass -1) - wherever the caller's operands landed, normally the float
+ * stage - and the result is left in `res`. Loading xmm0 BEFORE the
+ * prologue spilled the float pins, and storing xmm0 AFTER the epilogue
+ * reloaded them, were both correct only while no float pin could live
+ * in xmm0/xmm1, i.e. only while the stage sat there. `res` must not be
+ * a float pin: the epilogue's reload would overwrite it (the stage
+ * never is - it is a run-scoped claim).
+ */
+static void emit_libm_call(Emitter &e, const void *fn, uint8_t a, int b,
+                           uint8_t res)
 {
-    /* args in xmm0[/xmm1] (GP-reg saves don't touch them). A MathFnV run
-     * caches nothing today, so the prologue is usually EMPTY - but going
-     * through it keeps the call correct if that ever changes. */
     emit_call_prologue(e);
+    /* from here every xmm is scratch: the float pins are in their
+     * slots and the epilogue reloads them; the literal pool too */
+    if (b < 0) {
+        if (a != X0)                                      /* reg:abi */
+            e.fmov_rr(X0, a);                             /* reg:abi */
+    } else {
+        const uint8_t ub = static_cast<uint8_t>(b);
+        if (a == X1 && ub == X0) {                        /* reg:abi */
+            /* the exact swap: through a third register */
+            const uint8_t t = 2;                          /* reg:abi */
+            e.fmov_rr(t, ub);
+            e.fmov_rr(X0, a);                             /* reg:abi */
+            e.fmov_rr(X1, t);                             /* reg:abi */
+        } else if (ub == X0) {                            /* reg:abi */
+            e.fmov_rr(X1, ub);                            /* reg:abi */
+            if (a != X0) e.fmov_rr(X0, a);                /* reg:abi */
+        } else {
+            if (a != X0) e.fmov_rr(X0, a);                /* reg:abi */
+            if (ub != X1) e.fmov_rr(X1, ub);              /* reg:abi */
+        }
+    }
     e.call_direct(fn);
+    /* the result leaves xmm0 BEFORE the pin reload can touch it */
+    if (res != X0)                                        /* reg:abi */
+        e.fmov_rr(res, X0);                               /* reg:abi */
+    e.trk_fdef_note(res);         /* the call DEFINED it (no encoder) */
     emit_call_epilogue(e);
 }
 
@@ -20537,7 +20645,7 @@ static bool emit_store_elem_inline(Emitter &e, const Instr &in,
 #endif
         if (!compound) {
             if (is_float)
-                e.store_elem_sd(H->rdata, sc.idx, 0);
+                e.store_elem_sd(H->rdata, sc.idx, e.fsa());
             else if (hoist_want == 3)
                 /* 0/1 lit -> dil */
                 e.store_elem_b(H->rdata, sc.idx, sc.val);
@@ -21017,7 +21125,12 @@ static void emit_load_elem2_inline(Emitter &e, uint8_t ir,
         e.cmp_byte_base(r.obj, L.kind_off, L.kind_ints);
         decline_ne();
         count_and_idx(/*bytes=*/false);
-        e.cvtsi2sd_elem(0, r.data, r.idx);       /* xmm0 = (double)elem */
+        /* into the STAGE, which is what the store below reads - this
+         * was a literal xmm0, right only while the stage IS xmm0: off
+         * it, the conversion clobbered whatever lived in xmm0 (a float
+         * pin, once the stage moves) and the store wrote a stale
+         * stage register (the #107 P3 enumerator, fp#0) */
+        e.cvtsi2sd_elem(e.fsa(), r.data, r.idx); /* stage-a = elem */
         bump();
         emit_float_store(e, ck, e.fsa(), in.target, pc);
         dones.push_back(e.jmp32());
@@ -21482,9 +21595,14 @@ static void emit_store_elem(Emitter &e, const Chunk &ck, const Instr &in,
          * the 2-way form exactly as read_float_slot does) - the store op's
          * ONLY exit was this load's bail, which kept it non-deletable.
          * (No staging-clobber hazard: it reads slot MEMORY, current
-         * post-prologue, never a GP pin.) */
-        emit_float_load(e, e.fsa(), in.b_is_lit(), in.b_flit(), in.b_slot(), pc,
-                        /*no_bail=*/true);
+         * post-prologue, never a GP pin.)
+         * ⛔ xmm0 is the helper's ABI (SysV float arg 0), NOT the float
+         * stage: this read stage-a, which only coincides with xmm0 while
+         * the stage sits there - off it, the helper read whatever xmm0
+         * held (a float pin: `f[i] %= 1.1` stored `s % s`, the #107
+         * enumerator, fp#0). Inside the bracket xmm0 is free scratch. */
+        emit_float_load(e, X0, in.b_is_lit(), in.b_flit(),   /* reg:abi */
+                        in.b_slot(), pc, /*no_bail=*/true);
     else
         /* avoid RSI: the index staging above clobbered it, and the rhs
          * slot's pin may BE rsi - the shipped divide-by-the-index bug */
@@ -22528,14 +22646,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * armed by the previous op hands its value over in XMM0), and
          * returning the register operand b actually landed in (its own,
          * when it already lived in a pin or the literal pool). */
-        /* fmod forces the pair BECAUSE libm wants xmm0/xmm1 (SysV) -
-         * force_x0_x1 forces the STAGE, so this is sound only while
-         * the stage IS the ABI pair. A Phase D stage move must add
-         * marshalling moves here instead. */
-        if (is_mod)
-            ML_CHECK_MSG(e.fsa() == 0 && e.fsb() == 1,
-                         "fmod: the stage moved off the SysV pair - "
-                         "marshal explicitly");
+        /* fmod forces the operands into the STAGE pair (a in stage-a,
+         * b in stage-b); emit_libm_call marshals the stage into the
+         * SysV pair inside its bracket, so a stage off xmm0/xmm1 is
+         * correct too (it used to ML_CHECK that it never moved). */
         const FOperands ops = emit_float_operands(e, in, pc, is_mod);
         if (fop == 0x5E || is_mod) {
             /* float DIV and MOD throw DivisionByZeroEx on a +-0.0 divisor
@@ -22555,7 +22669,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * xmm1 (the SysV float args); the prologue/epilogue inside
              * save any pinned cache regs. */
             emit_libm_call(e, reinterpret_cast<const void *>(
-                static_cast<double (*)(double, double)>(&::fmod)));
+                static_cast<double (*)(double, double)>(&::fmod)),
+                ops.dst, ops.src, ops.dst);
         else
             e.farith(fop, ops.dst, ops.src);
         /* C4a-ii: the result is in XMM0 - arm the pair, and when the
@@ -22563,11 +22678,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * entirely (the two-store round trip this lever exists to
          * delete). Nothing is emitted between two ops, so XMM0 carries
          * across the boundary. */
-        /* the result register: the arith's dst, except fmod's libm
-         * call, which always returns in xmm0 */
-        const uint8_t res =
-            is_mod ? uint8_t(X0)     /* reg:abi: libm returns in xmm0 */
-                   : ops.dst;
+        /* the result register: the arith's dst (emit_libm_call leaves
+         * fmod's result there too) */
+        const uint8_t res = ops.dst;
         const bool fwd_arm = g_fwd.fprod == in.target;
         if (fwd_arm) {
             g_fwd.farmed = true;
@@ -22590,14 +22703,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             /* Load the arg(s) FIRST (a bail here re-runs the op cleanly),
              * THEN the call sequence. pow is the only 2-arg selector:
              * x in xmm0, y in xmm1 - the SysV order. */
-            emit_float_load(e, X0, in.a_is_lit(), in.a_flit(),  /* reg:abi */
+            /* into the STAGE; emit_libm_call does the SysV marshal
+             * inside its bracket (loading xmm0 here, before the
+             * prologue spilled the pins, clobbered a pin in xmm0) */
+            emit_float_load(e, e.fsa(), in.a_is_lit(), in.a_flit(),
                             in.a_slot(), pc, /*no_bail=*/true);
-            if (fn == MathFn::pow_)
-                emit_float_load(e, X1, in.b_is_lit(), in.b_flit(),  /* reg:abi */
+            const bool two = fn == MathFn::pow_;
+            if (two)
+                emit_float_load(e, e.fsb(), in.b_is_lit(), in.b_flit(),
                                 in.b_slot(), pc, /*no_bail=*/true);
-            emit_libm_call(e, jit_math_fn_ptr(fn));
-            emit_float_store(e, ck, X0, in.target, pc);  /* reg:abi:
-                                          * the libm result (SysV) */
+            emit_libm_call(e, jit_math_fn_ptr(fn), e.fsa(),
+                           two ? int(e.fsb()) : -1, e.fsa());
+            emit_float_store(e, ck, e.fsa(), in.target, pc);
             return true;
         }
         emit_float_load(e, e.fsa(), in.a_is_lit(), in.a_flit(), in.a_slot(), pc,
@@ -26121,9 +26238,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     else
                         e.reload(acc.r, ssk);
                     if (isf) {
-                        e.cvt_reg(X0, r);                /* reg:abi */
-                        emit_float_store(e, ck, X0,      /* reg:abi */
-                                         in.target, pc);
+                        /* through the float STAGE, not a literal xmm0:
+                         * nothing here is a call ABI (emit_float_store
+                         * takes the value register and marshals its own
+                         * cold helper call), and xmm0 may hold a float
+                         * pin once the stage moves off it */
+                        e.cvt_reg(e.fsa(), r);
+                        emit_float_store(e, ck, e.fsa(), in.target, pc);
                     } else {
                         store_dst(e, ck, r, in.target, pc);
                     }
@@ -26134,9 +26255,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 }
                 const int sfr = e.freg_at(in.a_slot());
                 if (sfr >= 0 && isf) {
-                    e.fmov_rr(X0, static_cast<uint8_t>(sfr)); /* reg:abi */
-                    emit_float_store(e, ck, X0, in.target,    /* reg:abi */
-                                     pc);
+                    /* the pin's own register IS the value - no copy
+                     * (the MoveV arm's 2026-10-01 fix, same shape) */
+                    emit_float_store(e, ck, static_cast<uint8_t>(sfr),
+                                     in.target, pc);
 #ifdef TESTS
                     e.bump_counter(&g_jit_coerce_pin);
 #endif
@@ -26761,13 +26883,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 store_dst(e, ck, acc.r, in.target, pc);
                 break;
             case 1:                                   /* float field */
-                /* movsd xmm0, [acc + moff] */
-                e.u8(0xF2);
-                if (acc.r >= 8)
-                    e.u8(0x41);
-                e.u8(0x0F); e.u8(0x10);
-                e.u8(static_cast<uint8_t>(0x80 | (acc.r & 7)));
-                e.u32(static_cast<uint32_t>(moff));
+                /* movsd stage-a, [acc + moff] - through the encoder:
+                 * this was raw bytes naming xmm0, which the store
+                 * below then did not read once the stage moved */
+                e.fload_base(e.fsa(), acc.r, static_cast<int32_t>(moff));
                 emit_float_store(e, ck, e.fsa(), in.target, pc);
                 break;
             case 2:                                   /* bool -> 0/1 int */
@@ -26781,11 +26900,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             default:                       /* int field read as float */
                 /* mov rax, [rax + moff] */
                 e.load_base(acc.r, acc.r, static_cast<int32_t>(moff));
-                /* cvtsi2sd xmm0, acc */
-                e.u8(0xF2);
-                e.u8(static_cast<uint8_t>(0x48 | (acc.r >= 8 ? 1 : 0)));
-                e.u8(0x0F); e.u8(0x2A);
-                e.u8(static_cast<uint8_t>(0xC0 | (acc.r & 7)));
+                /* cvtsi2sd stage-a, acc (the encoder - see case 1) */
+                e.cvt_reg(e.fsa(), acc.r);
                 emit_float_store(e, ck, e.fsa(), in.target, pc);
                 break;
             }
@@ -31663,6 +31779,10 @@ retry_emission:
              * whichever scratch the producer's emit reported (C4b) */
             g_fwd.fin_temp = g_fwd.farmed ? g_fwd.fprod : -1;
             g_fwd.fin_reg = g_fwd.fres_reg;
+            /* the forward bus carries a value INTO this op: the
+             * read-before-write check must see it as defined */
+            if (g_fwd.fin_temp >= 0)
+                e.trk_fdef_note(g_fwd.fin_reg);
             g_fwd.fprod = -1;
             g_fwd.fskip_write = false;
             g_fwd.farmed = false;
