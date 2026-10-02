@@ -21955,8 +21955,22 @@ static bool norec_segment_boundary()
  * twice - frameless (the default) and with the frameless lever off,
  * which is the record-less arm.
  */
+/*
+ * The bytecode inliner takes a direct call to a TYPED callee too (int /
+ * float parameters bind through CoerceNumV). A call-PROTOCOL test whose
+ * only reach into its tier is such a call - `func f(int n)` was how a
+ * test kept a call a call - holds that half off for its duration; it
+ * tests the call, not the inliner.
+ */
+struct TypedInlineOff {
+    bool saved = g_bc_inline_typed_enabled;
+    TypedInlineOff() { g_bc_inline_typed_enabled = false; }
+    ~TypedInlineOff() { g_bc_inline_typed_enabled = saved; }
+};
+
 static bool jit_ret_ref_native()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -22137,6 +22151,7 @@ static bool jit_ret_ref_native()
  */
 static bool jit_norec_recon_sweep()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     /* #97 G1: this test's call chain (functions calling functions) is
      * FRAMELESS now; the tier it tests still serves every call that is
@@ -22480,6 +22495,7 @@ static bool jit_frameless_gate()
  */
 static bool jit_frameless_mutual()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled || !jit_norec_on())
         return true;
@@ -22642,6 +22658,7 @@ static bool jit_frameless_mutual()
  */
 static bool jit_frameless_builtins()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled || !jit_norec_on())
         return true;
@@ -22875,6 +22892,7 @@ static bool cg_minmax_reach()
  */
 static bool jit_frameless_nonmain()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled || !jit_norec_on())
         return true;
@@ -24093,6 +24111,7 @@ static bool jit_bind_widen_inline()
  * the inserted post-call EnterNative. Result asserted too. */
 static bool jit_post_call_entry()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     /* #97 G1: this test's call chain (functions calling functions) is
      * FRAMELESS now; the tier it tests still serves every call that is
@@ -25576,6 +25595,7 @@ static bool unpack_fast_bind_shapes()
  */
 static bool ref_bind_fast_shapes()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
     auto run = [](const std::vector<const char *> &lines) -> bool {
         std::string src;
         std::vector<Tok> toks;
@@ -28307,6 +28327,7 @@ static bool myv_ref_slots_derived()
  */
 static bool jit_guard_hoist_g1()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -28421,6 +28442,7 @@ static bool jit_guard_hoist_g1()
 
 static bool myv_closure_guard_tamper()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
     const char *lines_arr[] = {
         "func mk(int s) { var c = s;",
         "  return func [c] () { c++; return c; }; }",
@@ -33656,6 +33678,7 @@ static bool jit_intervals_check()
  */
 static bool jit_call_pins_survive_switch()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     /* #97 G1: this test's call chain (functions calling functions) is
      * FRAMELESS now; the tier it tests still serves every call that is
@@ -34182,6 +34205,7 @@ static bool jit_bake_coercing()
  */
 static bool jit_frameless_entry_emitted()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -34287,6 +34311,7 @@ static bool jit_frameless_entry_emitted()
  */
 static bool vm_disasm_driver_jit_parity()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -35162,6 +35187,7 @@ static bool jit_frameless_w3_shape()
  */
 static bool jit_frameless_w4_shape()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
@@ -44500,6 +44526,7 @@ static bool jit_native_throw()
 
 static bool jit_call_switch_protocol()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     /* #97 G1: this test's call chain (functions calling functions) is
      * FRAMELESS now; the tier it tests still serves every call that is
@@ -46515,6 +46542,7 @@ static bool cross_compile_specialize_stable()
  * specialized to a clone (a const arg -> nleaf$0, a not-yet-native case). */
 static bool jit_native_call()
 {
+    TypedInlineOff tio;   /* a protocol test (see the struct) */
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;

@@ -1623,10 +1623,10 @@ struct CgInstr : Instr {
     int32_t callee_def_more[ML_VALUE_CANDS_HARD - 2] = {
         -1, -1, -1, -1, -1, -1 };
     /* #97 closure inlining step 1b: each argument's PROVEN kind at a
-     * named CallValueV site, two bits per argument (1 = exactly an int -
+     * named CallValueV or a CallV site, two bits per argument (1 = exactly an int -
      * not a bool, 2 = a float, 0 = not proven), arguments 0..15. Read by
      * the splice to drop a typed parameter's bind when it is the
-     * identity. Codegen-transient: it becomes Chunk::value_arg_kinds. */
+     * identity. Codegen-transient: it becomes Chunk::call_arg_kinds. */
     uint32_t arg_kinds = 0;
     /*
      * The INHERITED inlined-at chain: the chain of the innermost compiled
@@ -2386,9 +2386,9 @@ struct Chunk {
     };
     std::vector<CalleeName> value_callees;
     /*
-     * #97 closure inlining step 1b: per named CallValueV pc, the
+     * #97 closure inlining step 1b: per CallV / named CallValueV pc, the
      * arguments' PROVEN kinds (CgInstr::arg_kinds' encoding). COMPILE-
-     * TIME ONLY - filled at finalize, read by the bytecode splice in the
+     * TIME ONLY - filled at finalize, read by the bytecode inliner in the
      * same process, and CLEARED by it (its pcs die with the splice). It
      * is never serialized: the splice runs before an image is written and
      * never after one is loaded, so a loaded chunk has an empty table and
@@ -2398,10 +2398,10 @@ struct Chunk {
         uint32_t pc;
         uint32_t kinds;
     };
-    std::vector<ArgKinds> value_arg_kinds;
-    uint32_t value_arg_kinds_at(size_t pc) const
+    std::vector<ArgKinds> call_arg_kinds;
+    uint32_t call_arg_kinds_at(size_t pc) const
     {
-        for (const ArgKinds &k : value_arg_kinds)
+        for (const ArgKinds &k : call_arg_kinds)
             if (k.pc == pc)
                 return k.kinds;
         return 0;

@@ -495,14 +495,20 @@ fi
 # vm_jit_program now; this asks the CLI itself, over the bench the tier
 # was built for: its four leaves (two factories, two closures - the
 # count MYLANG_JITSTATS reports) must each show their frameless entry.
+# The factories take TYPED parameters, so by default the bytecode
+# inliner pastes them into main and only the two closures remain;
+# MYLANG_BCINLINE_TYPED=0 keeps all four reachable.
 if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
-    n=$("$BIN" -npc -vdj "$here/../bench/my/78_typed_param_call.my" \
-            2>/dev/null | grep -c '^; frameless entry @+')
-    if [ "$n" = "4" ]; then
-        pass "-vdj: the dump carries the frameless tier a run uses (4 entries)"
+    b78="$here/../bench/my/78_typed_param_call.my"
+    n=$("$BIN" -npc -vdj "$b78" 2>/dev/null \
+            | grep -c '^; frameless entry @+')
+    n4=$(MYLANG_BCINLINE_TYPED=0 "$BIN" -npc -vdj "$b78" 2>/dev/null \
+            | grep -c '^; frameless entry @+')
+    if [ "$n" = "2" ] && [ "$n4" = "4" ]; then
+        pass "-vdj: the dump carries the frameless tier a run uses (2 / 4)"
     else
-        fail "-vdj shows $n frameless entries for bench/my/78 (want 4): the
-      dump driver is not running the JIT sequence a run does"
+        fail "-vdj shows $n / $n4 frameless entries for bench/my/78 (want
+      2 / 4): the dump driver is not running the JIT sequence a run does"
     fi
 else
     echo "  skip  -vdj frameless parity (this build reports jit 0)"

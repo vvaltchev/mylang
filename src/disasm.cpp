@@ -2582,17 +2582,19 @@ std::string disassemble_program(const Block *root)
         if (it != chunks.end())
             bc_inline_snapshot(it->second, bc_snaps);
     }
+    const std::vector<const FuncDescriptor *> bc_slots =
+        bc_inline_slot_map(slot_desc, root->global_slot_reassigned);
     for (const FuncDeclStmt *fn : funcs) {
         auto it = chunks.find(fn->desc);
         if (it != chunks.end()) {
             ML_INT_ONLY(g_bc_int_caller = bc_int_key_fn(fn->desc,
                                                         it->second);)
-            bc_inline_chunk(it->second, slot_desc, bc_snaps);
+            bc_inline_chunk(it->second, bc_slots, bc_snaps);
         }
     }
     /* #97 closure inlining: main's VALUE sites, as vm_precompile_all */
     ML_INT_ONLY(g_bc_int_caller = "main";)
-    bc_inline_chunk(main_ck, slot_desc, bc_snaps, /*value_only=*/true);
+    bc_inline_chunk(main_ck, bc_slots, bc_snaps, /*value_only=*/true);
 
     /* Pass B: the native tier through the ONE driver (vm_jit_program,
      * vm.h) - the frameless pre-pass over main, every body with its own

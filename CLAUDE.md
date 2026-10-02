@@ -71,6 +71,25 @@ code in this repository.
 > A change that alters behavior or architecture but leaves the docs stale is
 > incomplete.
 
+## ⛔ TERMINOLOGY: "BYTECODE INLINING", NEVER "SPLICE" (maintainer-set,
+## 2026-10-02 - a HARD RULE)
+
+Say **"bytecode inlining"** for the transform and **"the bytecode
+inliner"** for the pass - in replies, reports, commit messages, comments
+and docs. **Never "splice", "spliced" or "splicing" for it.** MyLang has
+TWO inliners (the AST inliner, which rewrites the tree before any
+bytecode exists, and the bytecode inliner, which pastes a callee's
+compiled bytecode into its caller's chunk), and a private word for one of
+them confused the maintainer about which one a finding was about. When
+both could be meant, name the one you mean: "the AST inliner" / "the
+bytecode inliner".
+
+Existing identifiers and old text still say splice - `bc_inline_chunk_splice`,
+the `splice_choice` INT site, `-nbi`'s "splice ON/OFF" mode names,
+`ValueSpliceOff`, older paragraphs of this file. They are not renamed by
+this rule; read "splice" in them as "bytecode inlining", and do not write
+the word in anything new.
+
 ## ⛔ INFRASTRUCTURE FIRST, TESTS SECOND, FEATURES/OPTIMIZATIONS LAST
 ## (maintainer-set, 2026-08-18)
 
@@ -2066,6 +2085,22 @@ Running scripts:
                                  # through a closure call the splice now
                                  # inlines: it holds ValueSpliceOff
                                  # (tests.cpp) or it tests nothing.
+                                 # A DIRECT call to a TYPED callee is
+                                 # inlined too (2026-10-02): each int/
+                                 # float parameter binds through
+                                 # CoerceNumV - the identity when
+                                 # inference proved the argument's kind
+                                 # (`call_arg_kinds`), a widening or a
+                                 # TypeErrorEx with the argument's caret
+                                 # otherwise. MYLANG_BCINLINE_TYPED=0 is
+                                 # its A/B; a protocol test that reached
+                                 # its tier through `func f(int n)` holds
+                                 # TypedInlineOff. ⛔ The inliner trusts a
+                                 # global slot's descriptor only for a
+                                 # WRITE-ONCE slot (bc_inline_slot_map):
+                                 # it pasted a reassigned function's
+                                 # DECLARED body until then, a shipped
+                                 # wrong answer.
                                  # #97 inc 3: main also splices a call to
                                  # a closure FACTORY (a body that builds a
                                  # closure; its captures follow the splice
@@ -4118,8 +4153,8 @@ decisions behind it: `plans/archived/type-inference.md`,
   LIVE tree, not `all_funcs` (which keeps FuncInfos of literals a
   parse-time bake freed), and skips a template base and an INSTANCE's
   template params (keyed by the exact argument type, they join nothing,
-  and a typed param declines the bytecode splice and the frameless
-  tiers).
+  and a typed param declines the frameless tiers; the bytecode inliner
+  takes it, binding through CoerceNumV).
 - **Mandatory `opt` for params** (`enforce_nonnull_params`, same gate/timing as
   mandatory-`dyn`): a parameter that can receive `none` from *some* call path,
   if not declared `opt`, throws `OptRequiredEx` **at the param's declaration**
