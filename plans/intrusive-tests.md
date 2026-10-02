@@ -51,25 +51,96 @@ cases someone thought of.
 
 ## 2. Principles
 
-1. **Observe from INSIDE, assert from a test.** Instrumentation records
-   facts at the place they are decided; a test (C++ in `-rt`, or a
-   `.my` program) asserts on them.
-2. **One registry of sites, and a site nobody exercises is a failure.**
+1. **100% DETERMINISTIC.** MyLang is single-threaded with no timing
+   input, so a compile and a run are a pure function of (source, build,
+   flags). The instrumentation keeps that property: no sampling, no
+   seeds, no "every Nth". Every op is checked; every decision space is
+   walked in a FIXED order (4.2). Two sources of variation exist inside
+   the system and the instrumentation must not inherit them: ADDRESSES
+   (ASLR, pointer-keyed maps) and DICT ORDER (unordered by spec). So
+   nothing it records or reports is keyed or ordered by a pointer - it
+   uses source Locs, `node_id`, opcode pcs, op marks and interned
+   names - and a ledger is printed in a canonical sort.
+2. **INT MAY CHANGE MEMORY AND SPEED, AND NOTHING ELSE - INCLUDING NO
+   DECISION.** Output, exceptions, carets, backtraces and exit code stay
+   identical, and so does every INTERNAL decision: the register plan,
+   the tier taken, the splice/inline/specialize choice, the bets, the
+   emitted machine code (apart from the probes themselves). An INT
+   build that decides differently tests a different program than the
+   one that ships. Section 2b is how this is enforced and checked.
+3. **Observe from INSIDE, assert from a test.** Instrumentation records
+   facts where they are decided; a test (C++ in `-rt`, or a `.my`
+   program) asserts on them.
+4. **One registry of sites, and a site nobody exercises is a failure.**
    *A hook nobody calls is a hook that lies* (in-flight §2). Every site
-   is declared in ONE X-macro list (`src/intsites.h`); the INT runner
-   ends with a census and fails on any site no test reached - the
-   `opcode_table_census` ratchet applied to the hooks themselves.
-3. **Instrumentation must not perturb what it measures.** A probe that
-   flushes registers to inspect them tests a different register plan.
-   Section 4.3 is the hard part of this design for that reason.
-4. **Compiled out completely without `INT_TESTS`**, and INERT at
-   runtime until a test turns it on. Oracle for both: an INT build with
-   every probe off must emit BYTE-IDENTICAL `-vdj` to a `TESTS=1` build
-   of the same commit (`scripts/vdjcmp.sh`), and `-rt` must agree.
-5. **Prefer a SWEEP to a hand-written case.** Where an axis can be
-   enumerated (every guard site, every legal register choice), the
-   harness walks all of it over the corpus against the tree-walker, the
-   way `norec_sweep.py` walks every call event.
+   is declared once (`src/intsites.def`); the runner ends with a census
+   and fails on any site no test reached.
+5. **Compiled out completely without `INT_TESTS`.** Every abstraction
+   in 2b expands to nothing (or to its default argument) when the flag
+   is 0, so a shipping and a `TESTS=1` build are byte-identical to
+   today. Checked by building both and comparing the binaries' `-vdj`
+   over the corpus.
+6. **Prefer an EXHAUSTIVE WALK to a hand-written case.** Where an axis
+   can be enumerated (every guard site, every legal choice at every
+   decision), the harness walks it over the corpus against the
+   tree-walker, the way `norec_sweep.py` walks every call event.
+
+## 2b. The abstractions, and how they stay out of the way
+
+All of them live in `src/inttest.h` and expand to nothing - or to the
+plain expression they wrap - when `INT_TESTS` is 0. The goal is that a
+reader of `jit.cpp` sees a handful of one-line markers, not a second
+program interleaved with the first.
+
+| Abstraction | INT_TESTS=0 | INT_TESTS=1 |
+|---|---|---|
+| `ML_INT(site, fields...)` | nothing | records a typed event |
+| `ML_INT_CHOICE(site, n, dflt)` | `dflt` | the enumerator's pick |
+| `ML_INT_FORCE(site)` | `false` | true when a test forces it |
+| `ML_INT_SCOPE(site, loc)` | nothing | RAII context push/pop |
+| `ML_INT_FIELD(type, name)` | nothing | an extra struct member |
+| `IntShadow<K>` side tables | absent | state the checker reads |
+
+- **The site registry** (`intsites.def`, an X-macro list like
+  `ML_FOR_EACH_OPCODE`): each row is `name, payload struct, what it
+  means`. It generates the site enum, a TYPED payload struct per site
+  (so `ML_INT(splice_value, .line = l, .declined = why)` is checked by
+  the compiler), the census table, and the canonical printer.
+- **Context without parameter threading.** Most sites need "which
+  function, which pc, which source line". Rather than add parameters
+  through call chains, `ML_INT_SCOPE` pushes that context onto a global
+  stack (single-threaded, so no thread_local) that `ML_INT` reads.
+  Extra parameters are used only where a scope cannot reach - mainly
+  the emitter's per-op state - and then as `ML_INT_ARG(...)` trailing
+  defaults that vanish when off.
+- **Shadow state lives in SIDE TABLES, never in hot layouts.** `LValue`
+  (48 bytes), `EvalValue`, `Frame` and the `JitProbe` structs are BAKED
+  into emitted code and into the `.myv` format; growing them under INT
+  would change the emitted code - a different program (principle 2).
+  `ML_INT_FIELD` is for structs nothing emitted reads (`Chunk`,
+  `FuncDescriptor`, the emitter's own state, the inferencer's records);
+  everything else goes into `IntShadow` tables keyed by a stable id.
+- **Emitted code: probes the emitter cannot see.** The emitter's
+  decisions depend on its own accounting - the call seam's rsp model,
+  `n_prologues` (the W6/SP3 "made no call" bets), the pin plan. A probe
+  emitted through the ordinary `call_direct` would flip those bets and
+  change the plan. So probes go through ONE raw path,
+  `Emitter::int_probe(mark)`, that bypasses every counter and model:
+  it emits `call <int_probe_stub>` and nothing else, and the STUB does
+  all the work - save flags and every GP/XMM register, realign rsp
+  itself (it cannot know the site's alignment, so it computes it), call
+  the checker with the op mark and the saved register file, restore,
+  return. The site loses nothing and learns nothing.
+- **Proving non-perturbation, not asserting it.** Two oracles, both
+  deterministic:
+  1. *Decisions:* an INT build with probes OFF must emit byte-identical
+     `-vdj` to a `TESTS=1` build of the same commit (`vdjcmp.sh`).
+  2. *Probes:* with probes ON, the emitted code must equal the probes-
+     off code with every probe call deleted. Compared at the
+     INSTRUCTION level through the `DecodedIns` model - branch targets
+     as instruction indices, not byte offsets, since inserting 5-byte
+     calls moves every offset. Probe calls are recognised by their
+     target, so the comparison needs no marker bytes.
 
 ## 3. The surface
 
@@ -116,23 +187,43 @@ What it buys:
   This replaces the reintroduce-the-defect step as the first line of
   defense (it stays as the second).
 
-### 4.2 The DECISION PERTURBER (B4) - the strongest item
+### 4.2 The DECISION ENUMERATOR (B4) - the strongest item
 
-Every heuristic with more than one LEGAL answer asks the core instead
-of deciding alone: `int_choose(site, n_legal, default)`. Without
-`INT_TESTS` it is `default`. With it, a seeded perturber may return any
-legal index. Candidates: which free register a pin takes (generalises
-`XROT`), which slot spills, inline-or-not under the cost model,
-splice-or-not, pin budget (generalises `MAXPINS`), tier choice where
-two are sound, unroll depth, literal-pool admission.
+Every heuristic with more than one LEGAL answer asks through
+`ML_INT_CHOICE(site, n_legal, default)` instead of deciding alone.
+Candidates: which free register a pin takes (generalises `XROT`),
+which slot spills, inline-or-not under the cost model, splice-or-not,
+the pin budget (generalises `MAXPINS`), tier choice where two are
+sound, unroll depth, literal-pool admission.
 
-Correctness must not depend on any of these, so the harness runs the
-corpus x N seeds and requires output identical to the tree-walker.
-This is `MYLANG_JIT_FORCE`'s "test the gate independently of its
-profitability" for EVERY gate at once, and it is the general answer to
-*"a pool ordered by preference hides its own tail"*. A failing seed is
-reproducible from `(program, seed)`; the ledger names which choices it
-made, so the harness can bisect to the one choice that breaks.
+Correctness must not depend on any of these choices, so the harness
+re-runs each corpus program under OTHER legal choices and requires
+output identical to the tree-walker. No randomness: the walk is a
+fixed enumeration, in three deterministic tiers, recorded by the
+ledger so every run is named by its exact choice vector.
+
+1. **Every SINGLE deviation.** For each decision instance the program
+   actually reached (from the default run's ledger), run once with
+   that one instance taking each other legal value. Complete for
+   single-site bugs - the r9 bug, the give-back bug and the missing
+   whitelist rows were all single-site.
+2. **The full product, where it is small.** A program whose decision
+   space is under a fixed bound is run under every combination.
+3. **Every PAIR elsewhere,** through a fixed covering array (a
+   deterministic construction, not a sample): every pair of values at
+   every pair of instances appears in some run.
+
+The full product is exponential, so tiers 1 and 3 do not claim
+completeness beyond what they state; they are reproducible and their
+claims are exact. A failing run names its choice vector, and the
+harness reduces it to a minimal one by re-running subsets in a fixed
+order.
+
+**Decisions taken inside a decision.** A different register choice
+can change which LATER decisions are reached at all. The enumeration
+is therefore over decision INSTANCES as the ledger records them for
+the run in hand (site + stable id + ordinal), and a deviation that
+makes a later instance disappear simply has fewer instances.
 
 ### 4.3 The STATE CHECKER (B2, B5)
 
@@ -160,10 +251,11 @@ register (the LSRA snapshot/transitions); it publishes that map into a
 per-fragment side table the checker reads. Nothing is flushed, so the
 pins the checker sees are the ones the program runs with.
 
-Cost: one call per checked op, so checking is SAMPLED - every op in a
-`tests/int` program, every Nth op in a corpus sweep. Its own oracle:
-a checked run must print what an unchecked run prints, and probes off
-must emit byte-identical code (principle 4).
+Every op is checked, in every INT run: one probe per op mark in every
+fragment, one VM check per dispatched op. That is a large slowdown and
+a large memory cost - both explicitly allowed - and it is the price of
+the 100% claim. If a CI lane cannot afford the whole corpus at that
+rate, the lane runs FEWER PROGRAMS, never fewer checks per program.
 
 B5 extends it: an object CENSUS per kind (StructObject, SharedObject,
 DictObject, StrObj, FuncObject, closure captures) counted at the pooled
@@ -227,8 +319,8 @@ assertions on values.
 - **P2 - ledger** at the inliner, splice, LICM, for-range, forwarding,
   guard elision, pin grant and call-tier sites; migrate the vacuity
   guards of existing shape tests onto `int_assert_ran`.
-- **P3 - perturber** for register choice, pin budget, inline/splice;
-  the seed sweep in the runner.
+- **P3 - enumerator** for register choice, pin budget, inline/splice;
+  the three-tier walk in the runner.
 - **P4 - VM state checker + object census.**
 - **P5 - JIT preserving probe stub** + the per-op register map.
 - **P6 - chunk hook + assembler**; build the three splice-gate tests.
@@ -244,7 +336,30 @@ assertions on values.
    reservation so the names exist everywhere?
 2. **`.my` vs C++ balance:** recommended - observation and forcing from
    `.my` programs, state EDITING (chunk hook) from C++ only.
-3. **Perturber scope in CI:** seeds x corpus grows fast. Recommended:
-   a fixed small seed set per push, a large one on `workflow_dispatch`.
-4. **Probe-stub sampling rate** for the corpus sweep - to be set from a
-   measured lane time in P5, not guessed now.
+3. **Enumeration budget in CI:** tier 1 (single deviations) on every
+   push; tiers 2 and 3 on `workflow_dispatch`. All three deterministic.
+
+## 8. How hard
+
+Honest sizing, hardest first:
+
+- **The JIT probe stub and its invisibility (P5).** The emitter has
+  several pieces of self-accounting (rsp model, prologue counts, bets,
+  re-emission retries); the probe must bypass all of them, and the
+  stub must preserve flags and the full register file and find its own
+  alignment. And a `call` writes its return address just below `rsp`:
+  any emitted code that keeps data there (a red zone) would be
+  clobbered, so the first P5 step is an audit of that, with an
+  `ML_CHECK` in the emitter that no probe lands where it would. The instruction-level probe-stripping comparison is what
+  makes it safe to attempt: any accidental influence shows up as a
+  diff in a deterministic check.
+- **The enumerator's coverage of decision sites (P3).** Each heuristic
+  has to be restated as "a default among N legal answers", which means
+  finding where its legality is decided. The register allocator is the
+  big one; the inliner and splice are simpler.
+- **Not making a mess.** The abstractions in 2b keep each site to one
+  line. The real discipline is the side-table rule: nothing goes into a
+  layout emitted code or the `.myv` format reads.
+- **Everything else** (registry, ledger, VM checker, census, chunk
+  hook, assembler) is ordinary C++ against data structures we already
+  have.
