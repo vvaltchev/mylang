@@ -18,8 +18,9 @@
 #   Complete for a bug that needs one decision to be different - the r9 pin
 #   and the float-literal rcx clobber were both of that kind.
 #
-# Each deviation run must print the tree-walker's stdout, exit with its
-# code, and ACTUALLY TAKE the deviation (its dump's `choose_applied` line:
+# Each deviation run must print the tree-walker's stdout AND stderr (the
+# caret and backtrace of an uncaught error - RULE 2), exit with its code,
+# and ACTUALLY TAKE the deviation (its dump's `choose_applied` line:
 # int_choose honoured the override, possibly in an emission attempt the JIT
 # then discarded and redid - that redo is the deviation's effect) - a
 # vacuous deviation fails too. A later instance may
@@ -57,8 +58,8 @@ sys.path.insert(0, HERE)
 from testrun import Run, fingerprint, file_digest  # noqa: E402
 
 # every ENUMERATED decision site records `<site> key=... n= dflt= pick=`
-CHOICE = re.compile(r'^(?:reg_choice|pin_budget) key="([^"]+)" n=(\d+) '
-                    r'dflt=(\d+) pick=(\d+)')
+CHOICE = re.compile(r'^(?:reg_choice|pin_budget|splice_choice|inline_choice) '
+                    r'key="([^"]+)" n=(\d+) dflt=(\d+) pick=(\d+)')
 APPLIED = re.compile(r'^choose_applied key="([^"]+)" pick=(\d+)')
 
 
@@ -181,7 +182,7 @@ def main():
         for k, (prog, (ref, got, inst)) in enumerate(zip(progs, found)):
             refs.append(ref)
             name = os.path.relpath(prog, ROOT)
-            if got[:2] != ref[:2]:
+            if got != ref:
                 failures.append("%s: the DEFAULT run differs from the "
                                 "tree-walker" % name)
                 continue
@@ -214,11 +215,14 @@ def main():
                 pass
             ref = refs[k]
             name = os.path.relpath(progs[k], ROOT)
-            if r[:2] != ref[:2]:
-                msg = "%s %s=%d%s: rc=%s%s" % (
+            # RULE 2: everything observable - exit code, stdout AND
+            # stderr (an uncaught error's caret and backtrace live there)
+            if r != ref:
+                msg = "%s %s=%d%s: rc=%s%s%s" % (
                     name, key, alt,
                     " (reg %s)" % "/".join(regs) if regs else "", r[0],
-                    "" if r[1] == ref[1] else ", stdout differs")
+                    "" if r[1] == ref[1] else ", stdout differs",
+                    "" if r[2] == ref[2] else ", stderr differs")
                 if r[2]:
                     msg += " | " + r[2].strip().splitlines()[0][:150]
                 return msg

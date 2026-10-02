@@ -78,4 +78,15 @@
     /* `dflt` the maximum. `key` is `<fn>@<run begin pc>/budget`.       */ \
     /* jit.cpp, jit_compile_chunk's run loop.                           */ \
     X(pin_budget, "a run's pin budget (how many values it pins)",         \
+      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))  \
+    /* An ENUMERATED decision: the bytecode SPLICE of a call site that  */ \
+    /* would be spliced - pick 0 splices, 1 declines (the call stays a  */ \
+    /* call). `key` is `<caller>/splice@<line>:<col>`. codegen.cpp,     */ \
+    /* bc_inline_chunk_splice.                                          */ \
+    X(splice_choice, "the bytecode splice of a site (0 splice, 1 decline)", \
+      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))  \
+    /* An ENUMERATED decision: the AST INLINE of a call site an engine   */ \
+    /* would inline - 0 inlines, 1 declines. `key` is                    */ \
+    /* `<caller>/inline@<line>:<col>`. resolver.cpp, the Inliner.        */ \
+    X(inline_choice, "the AST inline of a site (0 inline, 1 decline)",    \
       F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))

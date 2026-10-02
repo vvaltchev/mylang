@@ -381,8 +381,12 @@ assertions on values.
   94 failures, all fixed - two xmm0 writes outside the call bracket,
   the call-site bake's scratch taking the staged rdi, a capture base a
   pin conflict left live, and the float-stage class (see
-  docs/jit-optimizations.md, 2026-10-01/02). NOT built yet: the pin
-  BUDGET and inline/splice decision sites, tiers 2-3, and a CI step.
+  docs/jit-optimizations.md, 2026-10-01/02). Since then: the CI step
+  (`int-enum`, tests/functional + samples/), the PIN BUDGET site (its
+  budget-0 deviation found the rel8 flush hazard in Throw/Rethrow/
+  EndFinally), per-RUN register keys, the SPLICE and AST INLINE sites
+  (every single decline over the corpus is RULE-2 clean), and stderr in
+  the oracle. NOT built yet: tiers 2-3 (pairs of deviations).
 - **P4 - VM state checker + object census.**
 - **P5 - JIT preserving probe stub** + the per-op register map.
 - **P6 - chunk hook + assembler**; build the three splice-gate tests.

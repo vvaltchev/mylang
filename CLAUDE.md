@@ -538,9 +538,13 @@ READ the state it reports.
 several LEGAL answers asks `int_choose(key, n, dflt)` (inttest.h) and
 records a `reg_choice` instance; `MYLANG_INT_CHOOSE=key=idx` forces an
 alternative, and tier 1 re-runs every program once per alternative of
-every instance, requiring the tree-walker's output. Two sites today:
-`reg_choice` (every register pick) and `pin_budget` (a run's pin cap);
-keys name the RUN, `<fn>@<begin pc>/...`. **Correctness must
+every instance, requiring the tree-walker's stdout, stderr AND exit
+code (RULE 2 - a caret or backtrace is observable). Four sites today:
+`reg_choice` (every register pick) and `pin_budget` (a run's pin cap),
+keyed by RUN (`<fn>@<begin pc>/...`); `splice_choice` (a bytecode
+splice) and `inline_choice` (an AST inline), keyed by CALL SITE
+(`<caller>/splice@L:C`, `<caller>/inline@L:C`) - declining is always
+legal, so each decline is RULE 2 checked at that one site. **Correctness must
 not depend on which legal register the allocator picks** - its first
 run found five JIT bugs the default picks never reach. Run it on the
 FAST lane: `make OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1

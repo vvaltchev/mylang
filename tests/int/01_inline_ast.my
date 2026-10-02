@@ -36,3 +36,15 @@ assert(has(ev, "engine=\"expr\" caller=\"main\" callee=\"dbl\" line=21"));
 assert(has(ev, "engine=\"block\" caller=\"main\" callee=\"sq1\" line=22"));
 assert(has(ev, "engine=\"tail\" caller=\"via_tail\" callee=\"last\" line=16"));
 assert(int_hits("inline_ast") == len(ev));
+
+# The decision behind it is ENUMERATED (`inline_choice`, #107 P3): one instance
+# per site that would be taken, pick 0 takes it, 1 declines - and
+# tests/int_enum.py forces each decline. Unforced, every instance takes
+# its default.
+var dec = int_events("inline_choice");
+var dec_ok = len(dec) > 0;
+foreach (e in dec)
+    if (find(e, "pick=0") == none)
+        dec_ok = false;
+print(dec_ok);
+assert(dec_ok);

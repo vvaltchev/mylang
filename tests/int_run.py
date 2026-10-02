@@ -66,9 +66,10 @@ EXEMPT = "INT-COV-EXEMPT"
 # INT helper - which is why they are named int_* / jit_int_* / bc_int_*.
 TEST_FILES = {"src/tests.cpp", "src/inttest.cpp", "src/inttest.h",
               "src/intsites.h", "src/builtins/inttest.cpp.h"}
-# `[(<]`: a TEMPLATE helper demangles as `int_enumerate<...>(` - the
-# bare `\(` let every instantiation of one count as product code
-INT_HELPER = re.compile(r"(^|[\s:*&])(int_|jit_int_|bc_int_)\w*[(<]")
+# `[(<[]`: a TEMPLATE helper demangles as `int_enumerate<...>(`, and one
+# returning std::string as `bc_int_key_fn[abi:cxx11](` - a bare `\(` let
+# either count as product code
+INT_HELPER = re.compile(r"(^|[\s:*&])(int_|jit_int_|bc_int_)\w*[(<\[]")
 
 
 def build_config(binary):

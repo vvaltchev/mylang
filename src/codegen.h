@@ -538,6 +538,15 @@ bool bc_inline_chunk(Chunk &ck,
                      const std::vector<const FuncDescriptor *> &slot_desc,
                      const BcInlineSnapshots &snaps,
                      bool value_only = false);
+#ifdef INT_TESTS
+/* #107 P3: the caller whose chunk bc_inline_chunk is splicing into, as
+ * the prefix of a `splice_choice` instance key - set by the driver loop
+ * (vm.cpp, disasm.cpp) from the chunk's descriptor, the same identity
+ * the JIT's keys use (`main`, a template instance's `f$0`, a lambda's
+ * `<lambda>@<first line>`) */
+extern std::string g_bc_int_caller;
+std::string bc_int_key_fn(const FuncDescriptor *d, const Chunk &ck);
+#endif
 
 /* The splice's kill switch (-nbi / MYLANG_BCINLINE=0): the same-binary
  * A/B, since the un-inlined bytecode is the only oracle for a splice. */
