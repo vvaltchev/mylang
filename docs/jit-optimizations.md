@@ -16845,3 +16845,34 @@ it borrows `rcx` around its two instructions with push/pop when it holds
 a pin - `RefScratch`'s protocol. **Net:**
 `tests/functional/58_flit_pinned_rcx.my`, which `corpus_diff --levers`
 runs under the legacy allocator; the pre-fix binary aborts on it.
+
+## TWO WRITES TO xmm0 OUTSIDE THE CALL BRACKET (2026-10-01)
+
+**Found by the #107 P3 decision enumerator** on `55_regcall`: with the
+float staging pair moved off xmm0/xmm1 (a deviation of the run's first
+`ftake`, the `<func>/fp#0` instance), a float pin lands in xmm0, and two
+sites overwrote it - REGTRACK aborted both by name.
+
+1. **`MoveV`'s float-pinned source arm** did `fmov xmm0, xr` and then
+   `emit_float_store(.., xmm0, ..)`, on the reasoning that the store's
+   cold path calls `jit_put_float`, whose ABI reads xmm0. The copy is
+   redundant - `emit_float_store` takes the value register and hands it
+   on - so the arm now passes the pin's own register (one instruction
+   fewer on the hot path).
+2. **`emit_put_scalar_call` itself** marshalled `fmov xmm0, value_reg`
+   BEFORE `emit_call_prologue`, i.e. before the prologue saves the
+   caller-saved float pins - against the prologue's own stated rule that
+   every call site emits it before its argument setup (its int twin,
+   `emit_put_int_call`, always did). Approach 3 (*A HELPER'S REGISTER ABI
+   IS THE EMITTER'S JOB*) moved the ABI into this function and put the
+   move on the wrong side of the save. It now follows the prologue; the
+   save is a store, so `value_reg` still holds the value. Emitted bytes
+   change only in that cold arm's instruction order.
+
+**Not reachable in a shipping configuration**: the staging grant prefers
+xmm0/xmm1 and always gets them on a fresh allocator (`MYLANG_JIT_XROT`
+does not move it), so no float pin was ever in xmm0 and no wrong answer
+shipped. Both were holes that the first change to the grant - the "day
+Phase D moves the stage off 0/1" the grant's comment anticipates - would
+have opened. **Net:** the enumerator's tier 1 over `55_regcall` (3,929
+deviations, 0 failures after the fix; 28 aborts before it, watched).

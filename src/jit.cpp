@@ -18721,10 +18721,16 @@ static void jit_put_float(LValue *lv, double v) noexcept
 static void emit_put_scalar_call(Emitter &e, const void *fn, int slot,
                                  uint8_t value_reg)
 {
+    /* the prologue FIRST, like every call site (its own comment says
+     * why): it saves the caller-saved pins, and marshalling into xmm0
+     * before it overwrote a float pin living in xmm0 before the save -
+     * unreachable while the staging pair always holds xmm0, found by
+     * the #107 enumerator moving the stage. The save is a store, so
+     * value_reg still holds the value afterwards. */
+    emit_call_prologue(e);               /* save the cache regs, align */
     if (value_reg != X0)                 /* reg:abi */
         e.fmov_rr(X0, value_reg);        /* reg:abi: the helper (SysV
                                           * float arg0) reads XMM0 */
-    emit_call_prologue(e);               /* save the cache regs, align */
     e.lea_rdi(static_cast<int32_t>(static_cast<long>(slot)
                                    * static_cast<long>(sizeof(LValue))));
     e.call_direct(fn);
@@ -23383,10 +23389,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * an arg-staging `move rN = x` cost x its register for the
          * whole fragment - 04_float_arith's accumulator never pinned
          * because of its final str(x, 4). */
+        /* ⛔ the pin's OWN register goes to the store, NOT a copy in
+         * xmm0: emit_float_store takes the value register and puts it in
+         * xmm0 itself, inside the helper bracket where the float pins
+         * are spilled (approach 3). The old `fmov xmm0, xr` here wrote
+         * xmm0 OUTSIDE any bracket - safe only while the staging pair
+         * happened to occupy xmm0, which the grant's preference made
+         * true and nothing guaranteed; the #107 P3 decision enumerator
+         * moved staging and a float pin in xmm0 was overwritten. */
         if (const int fr = e.freg_at(in.target2); fr >= 0) {
-            e.fmov_rr(X0, static_cast<uint8_t>(fr));     /* reg:abi */
-            emit_float_store(e, ck, X0, in.target, pc);  /* reg:abi:
-                                          * jit_put_float reads xmm0 */
+            emit_float_store(e, ck, static_cast<uint8_t>(fr), in.target,
+                             pc);
             return true;
         }
         std::vector<size_t> jhelp;
