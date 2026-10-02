@@ -519,7 +519,10 @@ nothing. Two checks: every unit OWNS an element no other covers (else it
 is redundant and goes), and uncovered elements stay under the per-compiler
 floor in `tests/int/coverage-floor.txt` - a ratchet, lowered when tests
 cover more, NEVER raised to let a change land. Mark a genuinely
-unreachable line `INT-COV-EXEMPT: reason`. The universe is the PRODUCT:
+unreachable line `INT-COV-EXEMPT: reason`. **A coverage build defaults
+UBSan OFF** (both build systems): its check on every variable shift and
+bounded access is a branch gcov counts and no input can take - 5,198
+such edges were in the universe until 2026-10-02. The universe is the PRODUCT:
 `tests.cpp`, the INT core and every INT helper (NAME IT `int_*` /
 `jit_int_*` / `bc_int_*`, or its branches count) are outside it, and so
 are the lines of an `ML_INT(...)` / `ML_INT_ONLY(...)` call inside a

@@ -57,6 +57,13 @@ endif
 # UBSan excludes signed-integer-overflow: the project builds with -fwrapv and
 # *relies* on signed wraparound (see defs.h / the README), so that overflow is
 # defined behavior here, not a bug to flag.
+# A COVERAGE build (GCOV=1) defaults UBSan OFF: its check on every
+# variable shift and bounded access is a BRANCH gcov counts, whose taken
+# arm no input can reach - so the coverage universe would hold sanitizer
+# edges, not the product's. ASan stays (it adds no branches gcov sees).
+ifeq ($(GCOV),1)
+	UBSAN ?= 0
+endif
 ifeq ($(OPT),0)
 	ASAN ?= 1
 	UBSAN ?= 1
@@ -242,6 +249,9 @@ clean:
 	rm -f $(BUILD_DIR)/*.o
 	rm -f $(BUILD_DIR)/$(TARGET)
 	rm -rf $(DEPDIR)
+	# a GCOV=1 lane's notes and counters: a stale .gcda left by a clean
+	# build of different code makes every later run warn about checksums
+	rm -f $(BUILD_DIR)/*.gcno $(BUILD_DIR)/*.gcda
 
 $(DEPDIR)/%.d: ;
 .PRECIOUS: $(DEPDIR)/%.d
