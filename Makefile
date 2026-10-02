@@ -170,6 +170,26 @@ ifeq ($(INT_TESTS),1)
 	endif
 endif
 
+# GCOV=1: a coverage build (parity with CMake's -DGCOV=ON). Use it with
+# OPT=0 (an optimized build folds branches away; with LTO the counters
+# would describe the link, not the source). Where the compiler supports
+# it (GCC >= 14) it also records MC/DC condition coverage
+# (-fcondition-coverage): the bar the intrusive suite is measured against
+# (plans/intrusive-tests.md, section 9; tests/int_coverage.py).
+ifeq ($(GCOV),1)
+	BASE_FLAGS += -fprofile-arcs -ftest-coverage
+	ifeq ($(shell $(CXX) -fcondition-coverage -fsyntax-only -x c++ \
+	              /dev/null 2>/dev/null && echo 1),1)
+		# GCC caps MC/DC at 64 conditions per decision, with no parameter
+		# to raise it; 5 decisions in vm.cpp's dispatch exceed it and keep
+		# plain BRANCH coverage. The warning still PRINTS (it is the record
+		# of which ones); it is only not fatal - a tool limit, not a code
+		# defect. Listed in plans/intrusive-tests.md section 9.1.
+		BASE_FLAGS += -fcondition-coverage \
+		              -Wno-error=coverage-too-many-conditions
+	endif
+endif
+
 # Header dependencies live INSIDE the build dir. They used to share one
 # top-level `.d/`, which two builds of different lanes running at once
 # (tests/run_battery.py) both rewrite: the .Td temp file races, and the

@@ -151,6 +151,19 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
    if (GCOV)
       target_compile_options(mylang PUBLIC -fprofile-arcs -ftest-coverage)
       target_link_options(mylang PUBLIC  -fprofile-arcs -ftest-coverage)
+      # MC/DC condition coverage where the compiler has it (GCC >= 14) - the
+      # intrusive suite's bar (plans/intrusive-tests.md section 9). Parity
+      # with the Makefile's GCOV=1.
+      include(CheckCXXCompilerFlag)
+      check_cxx_compiler_flag(-fcondition-coverage ML_HAS_MCDC)
+      if (ML_HAS_MCDC)
+         # GCC caps MC/DC at 64 conditions per decision (no parameter); the
+         # few vm.cpp decisions over it keep branch coverage and still WARN
+         # - not fatal, since it is a tool limit (see the Makefile note).
+         target_compile_options(mylang PUBLIC -fcondition-coverage
+                                -Wno-error=coverage-too-many-conditions)
+         target_link_options(mylang PUBLIC -fcondition-coverage)
+      endif()
    endif()
 endif()
 

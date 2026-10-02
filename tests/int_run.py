@@ -3,32 +3,53 @@
 #
 # THE INTRUSIVE-TEST RUNNER (#107, plans/intrusive-tests.md).
 #
-#   tests/int_run.py BINARY [--no-rt]
+#   tests/int_run.py BINARY [--no-rt] [--gcov [--require-floor] [--report F]]
 #
 # 1. REFUSES a binary whose `mylang -v` does not say `int_tests 1`: every
-#    check below would be vacuous on an ordinary build (the int_* builtins
-#    would not exist, no site would record anything).
-# 2. Runs `BINARY -rt` - the C++ half of the INT suite lives in the -rt
-#    table, compiled in only under INT_TESTS.
-# 3. Runs every tests/int/*.my under the default engine AND the tree-walker:
-#    each must exit 0 (the programs self-assert) and the two must print the
-#    same stdout.
-# 4. THE SITE CENSUS: every process above appends its per-site event counts
-#    to one file (MYLANG_INT_OUT, see src/inttest.cpp). A site of
-#    src/intsites.h that NO run reached fails the run - "a hook nobody calls
-#    is a hook that lies". Add a site together with the test that reaches it.
+#    check below would be vacuous on an ordinary build.
+# 2. Runs the TEST UNITS, each one an oracle:
+#      `-rt`                  the C++ half (it exits non-zero on a failure);
+#      every tests/int/*.my   under the default engine AND the tree-walker -
+#                             both must exit 0 (the programs self-assert)
+#                             and print the same stdout.
+# 3. THE SITE CENSUS: every process appends `site hits queries` to one file
+#    (MYLANG_INT_OUT, src/inttest.cpp). A site of src/intsites.h that no
+#    test CHECKED (read through int_hits / int_events) fails - reaching a
+#    site and asserting nothing about it verifies nothing.
+# 4. --gcov (a GCOV=1 INT build): the COVERAGE UNIVERSE of plan section 9.
+#    Each unit runs with the gcov counters cleared first, so it yields its
+#    own coverage vector of
+#        br:   each non-exception branch outcome in src/
+#        mcdc: each condition of each decision, shown TRUE and FALSE on its
+#              own (GCC >= 14, -fcondition-coverage)
+#        site: each intrusive-test site the unit checked
+#    named `kind:file:function:+line-offset:...` so an edit elsewhere in a
+#    file does not rename them. A line marked `INT-COV-EXEMPT: reason` is
+#    outside the universe. Two checks, as in SQLite's discipline:
+#      - every unit OWNS at least one element no other unit covers
+#        (otherwise it is redundant and must go - the suite is minimal);
+#      - uncovered elements <= the FLOOR (a ratchet: it may only go down).
+#        Branch and condition counts depend on the COMPILER, so the floor
+#        file (--floor-file, default tests/int/coverage-floor.txt) holds one
+#        `<compiler> <N>` line per compiler `mylang -v` can report; with
+#        --require-floor a compiler with no line fails, naming the count to
+#        record.
 #
-# Everything is deterministic: no seeds, no sampling, a fixed program order.
-# The random-program fuzzers never run an INT binary (plan section 7).
+# Deterministic: no seeds, no sampling, a fixed unit order. The random-
+# program fuzzers never run an INT binary (plan section 7).
 
 import argparse
 import glob
+import gzip
+import json
 import os
 import subprocess
 import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+EXEMPT = "INT-COV-EXEMPT"
 
 
 def build_config(binary):
@@ -39,6 +60,8 @@ def build_config(binary):
         parts = line.split()
         if len(parts) >= 2:
             cfg[parts[0]] = parts[1]
+            if parts[0] == "compiler":       # `compiler gcc 16.2`
+                cfg["compiler"] = " ".join(parts[1:3])
     return cfg
 
 
@@ -48,14 +71,134 @@ def run(cmd, env, timeout):
     return p.returncode, p.stdout, p.stderr
 
 
+# ------------------------------------------------------------- coverage --
+
+def exempt_lines(rel, cache):
+    """1-based line numbers of `rel` carrying the INT-COV-EXEMPT marker."""
+    if rel not in cache:
+        marked = set()
+        try:
+            with open(os.path.join(ROOT, rel), errors="replace") as f:
+                for n, text in enumerate(f, 1):
+                    if EXEMPT in text:
+                        marked.add(n)
+        except OSError:
+            pass
+        cache[rel] = marked
+    return cache[rel]
+
+
+def gcov_tool(cfg):
+    """The gcov that matches the compiler: gcov reads the .gcno/.gcda format
+    of ITS OWN GCC version and fails on another's. $GCOV wins; else, for
+    `compiler gcc 14.2`, `gcov-14` when it exists (a runner whose default
+    gcc is older), else plain `gcov`."""
+    if os.environ.get("GCOV"):
+        return os.environ["GCOV"]
+    comp = cfg.get("compiler", "")
+    if comp.startswith("gcc "):
+        major = comp.split()[1].split(".")[0]
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            if os.access(os.path.join(d, "gcov-" + major), os.X_OK):
+                return "gcov-" + major
+    return "gcov"
+
+
+def collect(build_dir, scratch, ex_cache, tool):
+    """gcov every object of `build_dir`; return {element: covered?}."""
+    for g in glob.glob(os.path.join(scratch, "*.gcov.json.gz")):
+        os.remove(g)
+    # Makefile objects sit next to the binary; CMake's under
+    # CMakeFiles/mylang.dir/src - so find every .gcno, gcov per directory.
+    by_dir = {}
+    for gcno in glob.glob(os.path.join(build_dir, "**", "*.gcno"),
+                          recursive=True):
+        base = gcno[:-len(".gcno")]
+        obj = next((base + ext for ext in (".o", ".cpp.o")
+                    if os.path.exists(base + ext)), None)
+        if obj:
+            by_dir.setdefault(os.path.dirname(obj), []).append(obj)
+    for d, objs in sorted(by_dir.items()):
+        try:
+            r = subprocess.run([tool, "--json-format",
+                                "--branch-probabilities", "--conditions",
+                                "-o", d] + sorted(objs),
+                               cwd=scratch, capture_output=True, text=True,
+                               timeout=1800)
+        except OSError as err:
+            raise RuntimeError("cannot run %s: %s" % (tool, err))
+        if r.returncode != 0:
+            raise RuntimeError("%s failed in %s:\n%s" % (tool, d,
+                                                       r.stderr[-2000:]))
+    elems = {}
+    for g in sorted(glob.glob(os.path.join(scratch, "*.gcov.json.gz"))):
+        with gzip.open(g, "rt") as f:
+            data = json.load(f)
+        for fobj in data.get("files", []):
+            rel = fobj["file"].replace("\\", "/")
+            if "/src/" in rel and not rel.startswith("src/"):
+                rel = rel[rel.rindex("/src/") + 1:]  # an absolute CMake path
+            if not rel.startswith("src/"):
+                continue
+            funcs = sorted((fn["start_line"], fn["end_line"],
+                            fn.get("demangled_name", fn["name"]))
+                           for fn in fobj.get("functions", []))
+            marked = exempt_lines(rel, ex_cache)
+
+            def owner(line):
+                best = None
+                for s, e, name in funcs:
+                    if s <= line <= e and (best is None or s >= best[0]):
+                        best = (s, name)
+                return best
+
+            for ln in fobj.get("lines", []):
+                n = ln["line_number"]
+                if n in marked:
+                    continue
+                o = owner(n)
+                where = ("%s:%s:+%d" % (rel, o[1], n - o[0]) if o
+                         else "%s:?:%d" % (rel, n))
+                k = 0
+                for b in ln.get("branches", []):
+                    if b.get("throw"):
+                        continue
+                    name = "br:%s:%d" % (where, k)
+                    k += 1
+                    elems[name] = elems.get(name, False) or b["count"] > 0
+                for j, dec in enumerate(ln.get("conditions", [])):
+                    nconds = dec["count"] // 2
+                    for c in range(nconds):
+                        for tag, miss in (("T", dec["not_covered_true"]),
+                                          ("F", dec["not_covered_false"])):
+                            name = "mcdc:%s:%d:%d:%s" % (where, j, c, tag)
+                            elems[name] = elems.get(name, False) \
+                                or c not in miss
+    return elems
+
+
+# --------------------------------------------------------------- driver --
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
     ap.add_argument("--no-rt", action="store_true",
-                    help="skip the -rt suite (iterating on tests/int only)")
-    ap.add_argument("--timeout", type=float, default=1800.0)
+                    help="skip the -rt unit (iterating on tests/int only)")
+    ap.add_argument("--gcov", action="store_true",
+                    help="measure the coverage universe (a GCOV=1 build)")
+    ap.add_argument("--floor-file",
+                    default=os.path.join(HERE, "int", "coverage-floor.txt"),
+                    help="--gcov: `<compiler> <max uncovered>` lines")
+    ap.add_argument("--require-floor", action="store_true",
+                    help="--gcov: fail when the floor file has no line for "
+                         "this binary's compiler")
+    ap.add_argument("--report", default=None,
+                    help="--gcov: write the ownership table and the "
+                         "uncovered list here")
+    ap.add_argument("--timeout", type=float, default=3600.0)
     args = ap.parse_args()
     binary = os.path.abspath(args.binary)
+    build_dir = os.path.dirname(binary)
 
     cfg = build_config(binary)
     if cfg.get("int_tests") != "1":
@@ -64,56 +207,157 @@ def main():
                                                      cfg.get("int_tests")),
               file=sys.stderr)
         return 2
+    if args.gcov and not glob.glob(os.path.join(build_dir, "**", "*.gcno"),
+                                   recursive=True):
+        print("int_run: --gcov needs a GCOV=1 build (no .gcno files next "
+              "to %s)" % binary, file=sys.stderr)
+        return 2
+
+    tool = gcov_tool(cfg) if args.gcov else None
+    if tool:
+        print("  gcov: %s" % tool)
+    units = []
+    if not args.no_rt:
+        units.append(("-rt", [["-rt"]]))
+    progs = sorted(glob.glob(os.path.join(HERE, "int", "*.my")))
+    for prog in progs:
+        units.append((os.path.relpath(prog, ROOT), [[prog], ["-tw", prog]]))
 
     failures = []
+    if not progs:
+        failures.append("no tests/int/*.my programs")
+    covered_by = {}
+    universe = {}
+    ex_cache = {}
     with tempfile.TemporaryDirectory(prefix="mylang-int-") as tmp:
         census = os.path.join(tmp, "census.txt")
+        scratch = os.path.join(tmp, "gcov")
+        os.mkdir(scratch)
         env = dict(os.environ, MYLANG_INT_OUT=census, TMPDIR=tmp)
 
-        if not args.no_rt:
-            rc, out, err = run([binary, "-rt"], env, args.timeout)
-            tail = [l for l in out.splitlines()
-                    if l.startswith(("Tests passed", "Differential"))]
-            for l in tail:
-                print("  -rt  " + l)
-            if rc != 0:
-                failures.append("-rt exited %d" % rc)
-
-        progs = sorted(glob.glob(os.path.join(HERE, "int", "*.my")))
-        if not progs:
-            failures.append("no tests/int/*.my programs")
-        for prog in progs:
-            name = os.path.relpath(prog, os.path.dirname(HERE))
-            rc_d, out_d, err_d = run([binary, prog], env, args.timeout)
-            rc_t, out_t, err_t = run([binary, "-tw", prog], env, args.timeout)
-            ok = rc_d == 0 and rc_t == 0 and out_d == out_t
+        for name, cmds in units:
+            if args.gcov:
+                for g in glob.glob(os.path.join(build_dir, "**", "*.gcda"),
+                                   recursive=True):
+                    os.remove(g)
+            before = os.path.getsize(census) if os.path.exists(census) else 0
+            results = [run([binary] + c, env, args.timeout) for c in cmds]
+            ok = all(r[0] == 0 for r in results)
+            if len(results) == 2 and results[0][1] != results[1][1]:
+                ok = False
+                print("        stdout differs between the engines")
+            if name == "-rt":
+                for l in results[0][1].splitlines():
+                    if l.startswith(("Tests passed", "Differential")):
+                        print("  -rt  " + l)
             print("  %s  %s" % ("ok  " if ok else "FAIL", name))
+            for c, r in zip(cmds, results):
+                if r[0] != 0:
+                    print("        `%s` rc=%d\n%s" % (" ".join(c), r[0],
+                                                     r[2][-2000:]))
             if not ok:
                 failures.append(name)
-                if rc_d != 0:
-                    print("        default engine rc=%d\n%s" % (rc_d, err_d))
-                if rc_t != 0:
-                    print("        tree-walker rc=%d\n%s" % (rc_t, err_t))
-                if out_d != out_t:
-                    print("        stdout differs between the engines")
+
+            if args.gcov:
+                try:
+                    elems = collect(build_dir, scratch, ex_cache, tool)
+                except RuntimeError as err:
+                    print("int_run: %s" % err, file=sys.stderr)
+                    return 2
+                # THE VACUITY GUARD: a coverage pass that measured nothing
+                # must not pass (a gcov of the wrong version once returned
+                # nothing here, silently, and every check was green).
+                if not any(e.startswith(("br:", "mcdc:")) for e in elems):
+                    print("int_run: gcov reported no src/ branch at all for "
+                          "%s - the coverage pass measured nothing" % name,
+                          file=sys.stderr)
+                    return 2
+                cov = {e for e, c in elems.items() if c}
+                for e in elems:
+                    universe.setdefault(e, True)
+                # the sites this unit CHECKED are elements too
+                with open(census) as f:
+                    f.seek(before)
+                    for line in f:
+                        site, _hits, queries = line.split()
+                        universe.setdefault("site:" + site, True)
+                        if int(queries) > 0:
+                            cov.add("site:" + site)
+                covered_by[name] = cov
 
         totals = {}
         if os.path.exists(census):
             with open(census) as f:
                 for line in f:
-                    site, count = line.split()
-                    totals[site] = totals.get(site, 0) + int(count)
+                    site, hits, queries = line.split()
+                    h, q = totals.get(site, (0, 0))
+                    totals[site] = (h + int(hits), q + int(queries))
         if not totals:
             failures.append("no census was written (MYLANG_INT_OUT)")
-        unreached = sorted(s for s, c in totals.items() if c == 0)
-        print("  census: %d site(s), %d unreached"
-              % (len(totals), len(unreached)))
-        for s in unreached:
-            print("    UNREACHED  %s" % s)
-            failures.append("site %s reached by no test" % s)
+        unchecked = sorted(s for s, (h, q) in totals.items() if q == 0)
+        print("  census: %d site(s), %d not checked by any test"
+              % (len(totals), len(unchecked)))
+        for s in unchecked:
+            print("    UNCHECKED  %s  (%d event(s) recorded)"
+                  % (s, totals[s][0]))
+            failures.append("site %s checked by no test" % s)
+
+    if args.gcov:
+        all_cov = set().union(*covered_by.values()) if covered_by else set()
+        uncovered = sorted(e for e in universe if e not in all_cov)
+        print("  coverage: %d element(s), %d covered, %d uncovered"
+              % (len(universe), len(all_cov), len(uncovered)))
+        for kind in ("br", "mcdc", "site"):
+            tot = sum(1 for e in universe if e.startswith(kind + ":"))
+            cov = sum(1 for e in all_cov if e.startswith(kind + ":"))
+            print("    %-5s %7d / %7d" % (kind, cov, tot))
+        owned = {}
+        for name, cov in covered_by.items():
+            others = set().union(*(c for n, c in covered_by.items()
+                                   if n != name))
+            owned[name] = sorted(cov - others)
+            print("    owns %7d  %s" % (len(owned[name]), name))
+            if not owned[name]:
+                failures.append("%s owns no element - redundant" % name)
+        comp = cfg.get("compiler", "?")
+        floor = None
+        if os.path.exists(args.floor_file):
+            with open(args.floor_file) as f:
+                for line in f:
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    key, _, n = line.rpartition(" ")
+                    if key == comp:
+                        floor = int(n)
+        if floor is None:
+            msg = ("no coverage floor for `%s` in %s - record `%s %d`"
+                   % (comp, os.path.relpath(args.floor_file, ROOT), comp,
+                      len(uncovered)))
+            print("  " + msg)
+            if args.require_floor:
+                failures.append(msg)
+        elif len(uncovered) > floor:
+            failures.append("%d uncovered elements, over the %s floor of %d"
+                            % (len(uncovered), comp, floor))
+        elif len(uncovered) < floor:
+            print("  note: %d uncovered, below the %s floor of %d - lower "
+                  "it in %s" % (len(uncovered), comp, floor,
+                                os.path.relpath(args.floor_file, ROOT)))
+        if args.report:
+            with open(args.report, "w") as f:
+                for name in sorted(owned):
+                    f.write("== %s owns %d\n" % (name, len(owned[name])))
+                    for e in owned[name]:
+                        f.write("  %s\n" % e)
+                f.write("== uncovered %d\n" % len(uncovered))
+                for e in uncovered:
+                    f.write("  %s\n" % e)
 
     if failures:
         print("int_run: FAIL (%d)" % len(failures))
+        for f in failures:
+            print("  - " + f)
         return 1
     print("int_run: PASS")
     return 0

@@ -58,6 +58,7 @@ const char *int_site_name(IntSite s);
 const char *int_site_desc(IntSite s);
 int int_site_by_name(const std::string &name);      /* -1 when unknown */
 uint64_t int_hits(IntSite s);
+void int_note_query(IntSite s);                     /* a test READ it */
 const std::vector<std::string> &int_events(IntSite s);
 void int_reset();                                   /* every site */
 

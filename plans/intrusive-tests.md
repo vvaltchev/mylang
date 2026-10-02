@@ -5,8 +5,12 @@ Status: P0 DONE (the build flag). P1 CORE DONE 2026-10-02: `inttest.h`
 registry, typed payloads), `inttest.cpp` (the log + the MYLANG_INT_OUT
 exit census), `int_hits` / `int_events`, the first site (`inline_ast`,
 all three AST inline engines) and its test, `tests/int_run.py`, the `int`
-CI job with the non-perturbation `vdjcmp`. P1's COVERAGE half (gcov +
-MC/DC, `INT-COV-EXEMPT`, the ownership table) is next.
+CI job with the non-perturbation `vdjcmp`. P1 COVERAGE DONE the same day:
+`GCOV=1` in the Makefile, MC/DC wherever the compiler has it,
+`int_run.py --gcov` (per-unit vectors, ownership, `INT-COV-EXEMPT`, the
+per-compiler floor ratchet in `tests/int/coverage-floor.txt`), sites
+counted only when CHECKED. First measurement (gcc 16.2): 144,746
+elements, 45,055 uncovered; `-rt` owns 77,561, `01_inline_ast` 270.
 
 ## 0. What already exists (P0)
 
@@ -401,6 +405,12 @@ Two kinds are worth calling out.
   implementation that is wrong at 64. The boundaries are DECLARED where
   the operation is defined, so they become countable elements and not
   "tests someone remembered".
+
+**MC/DC's one tool limit.** GCC instruments at most 64 conditions per
+decision and has no parameter to raise it. Five decisions in `vm.cpp`
+exceed it (found 67 / 114 / 144 / 150 / 276 conditions, all inside the
+dispatch function) and keep plain BRANCH coverage; the GCOV build still
+prints the warning for each (non-fatal there), which is the list.
 
 **Uncoverable by design** - an `ML_CHECK` failure arm, a `default:` over
 a closed enum, an allocation failure. As in SQLite (`ALWAYS()` /

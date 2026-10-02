@@ -27,6 +27,8 @@ static IntSite int_builtin_site(const ArgLocs *exprList, const EvalValue *args,
     const int i = int_site_by_name(name);
     if (i < 0)
         throw InvalidArgumentEx(arg->start, arg->end);
+    /* the census counts a site as CHECKED only through a test's read */
+    int_note_query(static_cast<IntSite>(i));
     return static_cast<IntSite>(i);
 }
 

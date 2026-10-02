@@ -1,0 +1,9 @@
+# The intrusive suite's coverage RATCHET (tests/int_run.py --gcov; plan
+# section 9): the most uncovered elements (branch outcomes + MC/DC
+# conditions + intrusive sites) the suite may leave, per compiler, since
+# the element counts depend on the compiler. It may only go DOWN: lower a
+# line when a test covers more, never raise one to let a change land.
+#
+# <compiler as `mylang -v` reports it> <max uncovered>
+gcc 16.2 45055
+gcc 14.2 44946

@@ -258,11 +258,15 @@ jobs:
   # ---------------------------------------------------------------- #
   int:
     runs-on: ubuntu-latest
+    env:
+      CXX: g++-14        # MC/DC (-fcondition-coverage) needs GCC >= 14
     steps:
     - uses: actions/checkout@v4
-    - name: Build (INT_TESTS)
+    - name: Install GCC 14
+      run: sudo apt-get update && sudo apt-get install -y g++-14
+    - name: Build (INT_TESTS + GCOV)
       run: |
-        cmake -S $GITHUB_WORKSPACE -B build-int -DINT_TESTS=ON \
+        cmake -S $GITHUB_WORKSPACE -B build-int -DINT_TESTS=ON -DGCOV=ON \
               -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
         cmake --build build-int -j
     - name: Build (TESTS, the reference)
@@ -280,8 +284,19 @@ jobs:
     - name: "non-perturbation: INT emits what TESTS emits"
       run: scripts/vdjcmp.sh ./build-tests/mylang ./build-int/mylang
 
-    - name: tests/int_run.py
-      run: tests/int_run.py ./build-int/mylang
+    # The suite, the site census and the coverage universe in ONE pass:
+    # every unit must own an element, and the uncovered count may not
+    # exceed this compiler's line in tests/int/coverage-floor.txt.
+    - name: tests/int_run.py --gcov
+      run: |
+        tests/int_run.py ./build-int/mylang --gcov --require-floor \
+                         --report int-coverage.txt
+    - name: Upload the coverage report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: int-coverage
+        path: int-coverage.txt
 
     - name: driver_checks
       run: MYLANG_EXPECT_INT_TESTS=1 sh tests/driver_checks.sh ./build-int/mylang
