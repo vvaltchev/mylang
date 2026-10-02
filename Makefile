@@ -156,6 +156,20 @@ ifdef TESTS
 	endif
 endif
 
+# INT_TESTS: the INTRUSIVE test build (#107, plans/intrusive-tests.md). It
+# compiles in heavy instrumentation at every pipeline stage - observers,
+# forcing switches and test-only builtins - so it is NEVER a measurement
+# subject: `mylang -v` reports `int_tests 1` and bench/run.py refuses such
+# a binary. It is a superset of the `-rt` suite, so it implies TESTS. Off
+# by default; `make INT_TESTS=1 OPT=0 BUILD_DIR=build-claude/int`.
+INT_TESTS ?= 0
+ifeq ($(INT_TESTS),1)
+	BASE_FLAGS += -DINT_TESTS
+	ifneq ($(TESTS),1)
+		BASE_FLAGS += -DTESTS
+	endif
+endif
+
 # Header dependencies live INSIDE the build dir. They used to share one
 # top-level `.d/`, which two builds of different lanes running at once
 # (tests/run_battery.py) both rewrite: the .Td temp file races, and the

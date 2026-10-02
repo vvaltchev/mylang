@@ -201,6 +201,12 @@ def main():
     mylang = run.find_mylang(args.mylang)
     if not mylang:
         sys.exit("error: mylang binary not found; build it or pass --mylang")
+    # The scales it writes are TIMINGS, so it takes run.py's build gate:
+    # a debug, an ASSERTS=1 or an INT_TESTS build would tune to the wrong
+    # costs (an INT build times its own instrumentation).
+    problem = run.build_config_problem(mylang, "mylang")
+    if problem:
+        sys.exit("error: refusing to tune - " + problem)
     prio = run.raise_priority()   # best-effort less-noise (children inherit)
     if prio is None:
         print("note: could not raise priority (run with sudo / cap_sys_nice "

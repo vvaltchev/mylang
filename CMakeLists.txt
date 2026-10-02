@@ -78,8 +78,16 @@ if (MSVC)
    target_link_options(mylang PUBLIC "/STACK:8388608")
 endif()
 
-if (TESTS)
+# INT_TESTS: the INTRUSIVE test build (#107, plans/intrusive-tests.md) -
+# heavy instrumentation at every pipeline stage, so never benchmarked
+# (`mylang -v` reports it, bench/run.py refuses it). Implies TESTS.
+# Parity with the Makefile's INT_TESTS=1.
+set(INT_TESTS OFF CACHE BOOL "Compile-in the intrusive test instrumentation")
+if (TESTS OR INT_TESTS)
    target_compile_definitions(mylang PUBLIC "TESTS")
+endif()
+if (INT_TESTS)
+   target_compile_definitions(mylang PUBLIC "INT_TESTS")
 endif()
 
 # ASSERTS: the defense-in-depth assertion net (C assert + ML_CHECK, defs.h).

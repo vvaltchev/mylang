@@ -825,7 +825,13 @@ maintaining a derived `ctx->captures->data()` in an arena cell.
 
 ---
 
-## 2. TASK #107 — INTRUSIVE_TESTS  [PENDING, NOT DESIGNED]
+## 2. TASK #107 — INTRUSIVE_TESTS  [P0 DONE, DESIGN IN REVIEW]
+
+**2026-10-02:** the build flag is `INT_TESTS` (make + CMake, default 0,
+implies TESTS); `mylang -v` reports `int_tests`, `bench/run.py` and
+`tune_scales.py` refuse such a binary. The design - one instrument per
+blind spot, phases P1-P7, open questions - is
+**`plans/intrusive-tests.md`**. The idea capture below is its input.
 
 **IDEA CAPTURE (maintainer, 2026-08-26) — deliberately not designed.**
 
