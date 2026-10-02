@@ -1,5 +1,5 @@
 # INT-ENGINES: default
-# INT-CONFIGS: MYLANG_INT_CHOOSE=<lambda>@17/gp#2=1
+# INT-CONFIGS: MYLANG_INT_CHOOSE=<lambda>@17@0/gp#2=1
 #
 # INT test (#107 P3, an enumerator finding): the caller-saved CAPTURE
 # BASE of a frameless leaf (#112 / W6) deviated into rdx. The division
@@ -26,7 +26,7 @@ assert(s == 36237);
 
 var taken = false;
 foreach (e in int_events("reg_choice"))
-    if (find(e, "key=\"<lambda>@17/gp#2\"") != none
+    if (find(e, "key=\"<lambda>@17@0/gp#2\"") != none
             && find(e, "pick=1 ") != none)
         taken = true;
 print(taken);

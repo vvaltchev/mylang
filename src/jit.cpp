@@ -1561,6 +1561,12 @@ static constexpr size_t FP_STAGE_RESERVED = 2;   /* fsa() + fsb() */
  * reg_choice instance key (the allocator cannot reach the descriptor
  * helpers, which live further down) */
 static std::string g_int_regkey_fn = "main";
+/* ...and the RUN within it: `<fn>@<begin pc>` (a container is `@c`). A
+ * function can hold several runs, each with its own allocator, so the
+ * function name alone named one instance per run with ONE key - a forced
+ * key deviated all of them at once and tier 1 was not one deviation.
+ * The begin pc is stable across the JIT's discard-and-retry. */
+static std::string g_int_runkey = "main";
 #endif
 
 struct RegAlloc {
@@ -1712,7 +1718,7 @@ struct RegAlloc {
         for (size_t k = 0; k < cands.size(); k++)
             if (cands[k] == best)
                 dflt = static_cast<int>(k);
-        const std::string key = g_int_regkey_fn + "/" + file + "#"
+        const std::string key = g_int_runkey + "/" + file + "#"
                               + std::to_string(int_ord++);
         const int n = static_cast<int>(cands.size());
         const int pick = int_choose(key, n, dflt);
@@ -3590,6 +3596,9 @@ struct Emitter {
     {
         assert_no_borrow("flush_cache with a BORROW open - it would "
                          "store the borrowed-away temp as a slot value");
+#ifndef NDEBUG
+        n_flushes++;            /* the rel8 rule: see j8 */
+#endif
         trk_flushed = true;              /* state, not a check - it
                                           * feeds trk_push (see its ⛔) */
         trk_flushdirty = 0;
@@ -6683,7 +6692,7 @@ struct Emitter {
         const size_t at = pos();
         u8(0);
 #ifndef NDEBUG
-        j8_calls[at] = n_prologues;
+        j8_marks[at] = J8Mark{n_prologues, n_flushes};
 #endif
         sp_note_jump(at);
         if (op == 0xEB)
@@ -6694,28 +6703,55 @@ struct Emitter {
     {
         /* A rel8 displacement is a SIGNED BYTE. Truncating an over-127 jump
          * silently lands in the middle of an instruction - it shows up only as
-         * a SEGV in generated code, with no hint where it came from. Assert
-         * instead, and use j32 for any span that can grow (an exit_pc carries
-         * an N5 flush, a helper call its whole prologue/epilogue). */
+         * a SEGV in generated code, with no hint where it came from. So a
+         * span that can GROW may not be rel8 at all, and that is checked by
+         * COUNTING what the span emits, which fires on the shape whatever
+         * this run's register state:
+         *  - a HELPER CALL: its prologue/epilogue grows with the live pins;
+         *  - a REGISTER-CACHE FLUSH (a raw ret's flush_cache): one store
+         *    pair per live pin or spill home. Found by the #107 enumerator
+         *    forcing a pin budget of 0, which homes the hot slots in spill
+         *    slots and pushed Throw's dispatch span to 144 bytes.
+         * Each verdict names the op (emit_op inlines every opcode, so a
+         * backtrace stops there) and goes through trk_fail, so
+         * jit_test_regtrack can watch each one fire. */
 #ifndef NDEBUG
-        const auto it = j8_calls.find(at);
-        ML_CHECK_MSG(it == j8_calls.end() || it->second == n_prologues,
-                     "a rel8 span contains a helper call, whose length "
-                     "grows with the pin budget - use j32");
+        /* every patch8 patches a j8, so the mark is always there */
+        const J8Mark m = j8_marks[at];
+        if (m.calls != n_prologues) {
+            trk_fail("a rel8 span contains a HELPER CALL, whose length "
+                     "grows with the pins - use j32", 0);
+            return;
+        }
+        if (m.flushes != n_flushes) {
+            trk_fail("a rel8 span contains a REGISTER-CACHE FLUSH, whose "
+                     "length grows with the pins - use j32", 0);
+            return;
+        }
 #endif
         if (target == pos())
             sp_check_join(at);
         else
             sp_check_target(at, target);
         const long d = static_cast<long>(target) - static_cast<long>(at + 1);
-        ML_CHECK(d >= -128 && d <= 127);
+#ifndef NDEBUG
+        if (d < -128 || d > 127) {
+            trk_fail("a rel8 span is OUT OF RANGE - use j32",
+                     static_cast<unsigned>(d));
+            return;
+        }
+#endif
         b[at] = static_cast<uint8_t>(d);
     }
     /* Bumped by emit_call_prologue; read by the j8/patch8 pair above.
      * Debug-only bookkeeping - a release build has neither member. */
     size_t n_prologues = 0;
 #ifndef NDEBUG
-    std::unordered_map<size_t, size_t> j8_calls;
+    /* what a j8 saw when it was emitted: patch8 requires the span
+     * between them to have added no helper call and no cache flush */
+    struct J8Mark { size_t calls, flushes; };
+    std::unordered_map<size_t, J8Mark> j8_marks;
+    size_t n_flushes = 0;
 #endif
     /* A NEAR (rel32) jmp/jcc, patched to here later. `short_op` is the SHORT
      * opcode (0xEB jmp, 0x7x jcc); the near forms are 0xE9 and 0x0F 0x8x. */
@@ -17041,6 +17077,36 @@ bool jit_test_regtrack(std::vector<JitTrkCase> &out)
         bytes(e, {0x48, 0x89, 0xC8});
     });
 
+    /* ---- patch8: a rel8 span that can grow ---- */
+    run("rel8/short-span", [&](Emitter &e) {
+        const size_t at = e.j8(0x75);
+        bytes(e, {0x90, 0x90});
+        e.patch8(at, e.pos());
+    });
+    run("rel8/helper-call", [&](Emitter &e) {
+        const size_t at = e.j8(0x75);
+        e.n_prologues++;            /* what emit_call_prologue counts */
+        e.patch8(at, e.pos());
+    });
+    run("rel8/flush", [&](Emitter &e) {
+        const size_t at = e.j8(0x75);
+        e.flush_cache();            /* empty cache: no bytes, still counted */
+        e.patch8(at, e.pos());
+    });
+    run("rel8/out-of-range-back", [&](Emitter &e) {
+        const size_t top = e.pos();
+        for (int k = 0; k < 130; k++)
+            e.u8(0x90);
+        const size_t at = e.j8(0xEB);
+        e.patch8(at, top);          /* d = top - (at + 1) = -132 */
+    });
+    run("rel8/out-of-range", [&](Emitter &e) {
+        const size_t at = e.j8(0x75);
+        for (int k = 0; k < 130; k++)
+            e.u8(0x90);
+        e.patch8(at, e.pos());
+    });
+
     g_jit_trk_verdict = was;
     return true;
 #endif
@@ -25865,19 +25931,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         const size_t j_none = e.j32(0x74);        /* je -> fall through */
         e.cmp_reg32_imm8(RAX, 2);   /* reg:abi */
         {
-            const size_t j_not2 = e.j8(0x75);
+            const size_t j_not2 = e.j32(0x75);
             emit_exc_stamp(e, ck, old_pc);        /* (already located) */
             e.exit_pc(pc);
-            e.patch8(j_not2, e.pos());
+            e.patch32_here(j_not2);
         }
         e.test32_rr(RAX, RAX);                   /* test eax, eax; reg:abi */
         {
-            const size_t j_disp = e.j8(0x74);     /* jz -> dispatched */
+            const size_t j_disp = e.j32(0x74);     /* jz -> dispatched */
             e.flush_cache();                      /* every raw ret must */
             e.mov_imm(RAX,                /* reg:abi */
                      static_cast<uint64_t>(-2));  /* JIT_RET_BOUNDARY */
             e.frag_ret(Emitter::RetFlush::flushed);
-            e.patch8(j_disp, e.pos());
+            e.patch32_here(j_disp);
         }
         e.flush_cache();
         e.movabs(RAX,                    /* reg:abi */
@@ -25915,14 +25981,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.cmp_reg32_imm8(RAX, 2);   /* reg:abi */
         {
-            const size_t j_not2 = e.j8(0x75);
+            const size_t j_not2 = e.j32(0x75);
             emit_exc_stamp(e, ck, old_pc);        /* (already located) */
             e.exit_pc(pc);
-            e.patch8(j_not2, e.pos());
+            e.patch32_here(j_not2);
         }
         e.test32_rr(RAX, RAX);                   /* test eax, eax; reg:abi */
         {
-            const size_t j_disp = e.j8(0x74);     /* jz -> dispatched */
+            const size_t j_disp = e.j32(0x74);     /* jz -> dispatched */
             /* the N5 register cache MUST be flushed before ANY return -
              * exit_pc does it implicitly; these raw rets must do it
              * explicitly or the interpreter reads stale pinned slots
@@ -25932,7 +25998,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                      static_cast<uint64_t>(-2));  /* JIT_RET_BOUNDARY */
             /* ret */
             e.frag_ret(Emitter::RetFlush::flushed);
-            e.patch8(j_disp, e.pos());
+            e.patch32_here(j_disp);
         }
         e.flush_cache();
         e.movabs(RAX,                    /* reg:abi */
@@ -25966,19 +26032,19 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.cmp_reg32_imm8(RAX, 2);   /* reg:abi */
         {
-            const size_t j_not2 = e.j8(0x75);
+            const size_t j_not2 = e.j32(0x75);
             emit_exc_stamp(e, ck, old_pc);
             e.exit_pc(pc);
-            e.patch8(j_not2, e.pos());
+            e.patch32_here(j_not2);
         }
         e.test32_rr(RAX, RAX);                   /* test eax, eax; reg:abi */
         {
-            const size_t j_disp = e.j8(0x74);     /* jz -> dispatched */
+            const size_t j_disp = e.j32(0x74);     /* jz -> dispatched */
             e.flush_cache();                      /* every raw ret must */
             e.mov_imm(RAX,                /* reg:abi */
                      static_cast<uint64_t>(-2));  /* JIT_RET_BOUNDARY */
             e.frag_ret(Emitter::RetFlush::flushed);
-            e.patch8(j_disp, e.pos());
+            e.patch32_here(j_disp);
         }
         e.flush_cache();
         e.movabs(RAX,                    /* reg:abi */
@@ -29792,6 +29858,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     /* B1: a container takes the holder grants too - it has no pins,
      * but its scratch asks must not land on a granted holder. */
     e.ra.busy |= e.grant_tag_regs(run_needs_float_tag(chunk, 0, n));
+    ML_INT_ONLY(g_int_runkey = g_int_regkey_fn + "@c";)
     e.grant_fstage();           /* C3: the float staging pair */
     emit_type_tags(e);
     size_t isl_idx = 0;                     /* islands are in ascending order */
@@ -30375,7 +30442,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     g_cur_arg_stage_pools = &chunk.arg_stage_pools;
     g_cur_norec_sites = &chunk.norec_sites;
     g_cur_caller_desc = jc ? jc->caller_desc : nullptr;   /* step 3b */
-    ML_INT_ONLY(g_int_regkey_fn = jit_int_key_fn(chunk);)
+    ML_INT_ONLY(g_int_regkey_fn = jit_int_key_fn(chunk);
+                g_int_runkey = g_int_regkey_fn;)
     g_cur_jc = jc;                       /* #97 step 4: the bake gate */
     /*
      * #97 E2: THE PRE-PASS - may this CALLING body be entered framelessly?
@@ -30554,6 +30622,8 @@ retry_emission:
         g_cur_argfuse = nullptr;
         g_cur_argfuse_skip = nullptr;
         g_cur_run_begin = begin;                   /* REGCALL 3 */
+        ML_INT_ONLY(g_int_runkey = g_int_regkey_fn + "@"
+                                   + std::to_string(begin);)
 
         /* N5: pin up to `max_pins` hot int slots for this run. The PICK
          * runs BEFORE the entry is emitted, because it decides which
@@ -30716,6 +30786,18 @@ retry_emission:
             if (cap < max_pins)
                 max_pins = cap;
         }
+        /* #107 P3: the budget is a DECISION with max_pins + 1 legal
+         * answers - any cap is sound (the MAXPINS oracle: a binding cap
+         * changes only what is pinned, never a result) - so the
+         * enumerator may force any of them. */
+        ML_INT_ONLY({
+            const std::string bkey = g_int_runkey + "/budget";
+            const int nb = static_cast<int>(max_pins) + 1;
+            const int db = static_cast<int>(max_pins);
+            const int pb = int_choose(bkey, nb, db);
+            max_pins = static_cast<size_t>(pb);
+            ML_INT(pin_budget, bkey, nb, db, pb);
+        })
         /* the run's DENIED set, not its BUSY set: these registers
          * are not occupied by anything, this fragment simply may not
          * spend them (jit_xcache_clobber says why for each). The model

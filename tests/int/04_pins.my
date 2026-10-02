@@ -60,3 +60,24 @@ func press(int n) {
 var pr = press(int(runtime(1000)));
 print(pr);
 assert(pr == 263073);
+
+# The run's PIN BUDGET is an enumerated decision too (`pin_budget`, #107
+# P3): one instance per run, keyed `<fn>@<run begin pc>/budget`, whose
+# default is the maximum and whose alternatives are every smaller cap -
+# tests/int_enum.py forces each one. Unforced, every run takes the
+# default, and `hot`'s run has room for at least the three values above.
+func bfield(e, name) {
+    var parts = split(e, " ");
+    foreach (p in parts)
+        if (startswith(p, name + "="))
+            return p[len(name) + 1:];
+    return "";
+}
+var hot_budget = false;
+foreach (e in int_events("pin_budget")) {
+    assert(bfield(e, "pick") == bfield(e, "dflt"));
+    if (startswith(bfield(e, "key"), "\"hot@") && int(bfield(e, "n")) > 3)
+        hot_budget = true;
+}
+print(hot_budget);
+assert(hot_budget);

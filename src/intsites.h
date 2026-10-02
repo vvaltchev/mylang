@@ -72,4 +72,10 @@
     /* jit.cpp, RegAlloc::take / ftake.                                   */ \
     X(reg_choice, "the register allocator picked among legal registers",     \
       F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick)  \
-      F(int64_t, reg))
+      F(int64_t, reg))                                                  \
+    /* An ENUMERATED decision: a run's PIN BUDGET - how many values it  */ \
+    /* may keep in registers, `n` = max + 1 legal answers (0..max),     */ \
+    /* `dflt` the maximum. `key` is `<fn>@<run begin pc>/budget`.       */ \
+    /* jit.cpp, jit_compile_chunk's run loop.                           */ \
+    X(pin_budget, "a run's pin budget (how many values it pins)",         \
+      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))

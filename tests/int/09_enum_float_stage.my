@@ -1,6 +1,8 @@
 # INT-ENGINES: default
-# INT-CONFIGS: MYLANG_INT_CHOOSE=main/fp#0=11 ; MYLANG_INT_CHOOSE=main/fp#1=9 ;
-#   MYLANG_INT_CHOOSE=main/fp#0=1 ; MYLANG_INT_CHOOSE=main/fp#0=11,main/fp#1=0
+# INT-CONFIGS: MYLANG_INT_CHOOSE=main@0/fp#0=11,main@29/fp#0=11 ;
+#   MYLANG_INT_CHOOSE=main@0/fp#1=9,main@29/fp#1=9 ;
+#   MYLANG_INT_CHOOSE=main@0/fp#0=1,main@29/fp#0=1 ;
+#   MYLANG_INT_CHOOSE=main@0/fp#0=11,main@0/fp#1=0
 #
 # INT test (#107 P3, an enumerator finding): the float STAGING PAIR is not
 # the float ABI. Forcing main's first float pick off xmm0 moves the stage
@@ -63,7 +65,7 @@ func field(e, name) {
 }
 var forced = false;
 foreach (e in int_events("reg_choice"))
-    if (find(e, "key=\"main/fp#") != none
+    if (find(e, "key=\"main@") != none
             && field(e, "pick") != field(e, "dflt"))
         forced = true;
 print(forced);
