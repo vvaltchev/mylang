@@ -1945,6 +1945,37 @@ private:
     Helper() = default;
 };
 
+#ifndef NDEBUG
+/*
+ * THE REGISTER TRACKER's VERDICT (Emitter::trk_fail). The default ends
+ * the process: every arm that reaches it is code that would silently
+ * corrupt live register state. A TESTS build routes it through
+ * `g_jit_trk_verdict`, which `jit_test_regtrack` points at a recorder
+ * for the duration of its scenarios - so each failure arm is driven by
+ * a deliberately wrong emission and asserted to NAME it, rather than
+ * being reachable by no test at all. Nothing else may swap it.
+ */
+static void jit_trk_verdict_abort(const char *line)
+{
+    /* INT-COV-EXEMPT, every marked line: this function ends the
+     * process, so no passing run reaches it (jit_test_regtrack drives
+     * every CALLER of it through the TESTS sink instead); report mode
+     * is the admission survey's, run by hand */
+    fputs(line, stderr);                     /* INT-COV-EXEMPT: aborts */
+    static const bool report =               /* INT-COV-EXEMPT: aborts */
+        getenv("MYLANG_REGTRACK_REPORT") != nullptr; /* INT-COV-EXEMPT */
+    if (report)                              /* INT-COV-EXEMPT: aborts */
+        return;
+    fprintf(stderr,                          /* INT-COV-EXEMPT: aborts */
+            "  the emitted code at this point would silently "
+            "corrupt live register state.\n");
+    abort();
+}
+#ifdef TESTS
+static void (*g_jit_trk_verdict)(const char *) = jit_trk_verdict_abort;
+#endif
+#endif
+
 struct Emitter {
     std::vector<uint8_t> b;
 
@@ -2111,21 +2142,23 @@ struct Emitter {
      * so the run's OUTPUT is meaningless: only the report lines are.
      * Never set it outside a survey.
      */
-    void trk_fail(const char *what, unsigned r) const
+    void trk_fail(const char *what, unsigned r,
+                  const char *detail = "") const
     {
-        fprintf(stderr,
-                "JIT-REGTRACK: %s: r%u  (vm pc %d, opcode %d; "
-                "borrowed=%#x dirty=%#x mach=%d bracket=%d)\n",
-                what, r, cur_pc, dbg_op,
-                trk_borrowed, trk_dirty, trk_mach, trk_bracket);
-        static const bool report =
-            getenv("MYLANG_REGTRACK_REPORT") != nullptr;
-        if (report)
-            return;
-        fprintf(stderr,
-                "  the emitted code at this point would silently "
-                "corrupt live register state.\n");
-        abort();
+        char line[512];
+        snprintf(line, sizeof(line),
+                 "%sJIT-REGTRACK: %s: r%u  (vm pc %d, opcode %d; "
+                 "borrowed=%#x dirty=%#x mach=%d bracket=%d)\n",
+                 detail, what, r, cur_pc, dbg_op,
+                 trk_borrowed, trk_dirty, trk_mach, trk_bracket);
+        /* the verdict goes through ONE function - the TESTS sink lets
+         * jit_test_regtrack record it instead of dying, so every arm
+         * above can be watched failing (REGTRACK, 2026-10-02) */
+#ifdef TESTS
+        g_jit_trk_verdict(line);
+#else
+        jit_trk_verdict_abort(line);
+#endif
     }
 #endif
     /* EVERY encoder that writes a GP register reports it here first. */
@@ -2340,12 +2373,13 @@ struct Emitter {
             }
             if (any)
                 cover = fresh;
+            char where[160];
             if (!d.ok) {
-                fprintf(stderr, "JIT-REGTRACK: byte 0x%02x at emission "
-                        "offset %u\n", b[at], at);
+                snprintf(where, sizeof(where), "JIT-REGTRACK: byte "
+                         "0x%02x at emission offset %u\n", b[at], at);
                 trk_fail("an emitted byte the decoder does not know - "
                          "the tracker cannot vouch for a write it "
-                         "cannot read", b[at]);
+                         "cannot read", b[at], where);
             }
             const uint32_t w = decoded_gp_writes(d)
                              & ~(1u << REG_STACK_PTR);
@@ -2354,14 +2388,13 @@ struct Emitter {
                 unsigned r = 0;
                 while (!(undeclared & (1u << r)))
                     r++;
-                fprintf(stderr, "JIT-REGTRACK: `%s` at emission offset "
-                        "%u (declared group %#x)\n", d.mn.c_str(), at,
-                        cover);
-
+                snprintf(where, sizeof(where), "JIT-REGTRACK: `%s` at "
+                         "emission offset %u (declared group %#x)\n",
+                         d.mn.c_str(), at, cover);
                 trk_fail("an emitted instruction WRITES a general "
                          "register no wrote() declared - raw bytes, or "
                          "an encoder that does not report its write",
-                         r);
+                         r, where);
             }
         }
         trk_vpos = n;
@@ -16730,6 +16763,288 @@ static bool reg_model_check(std::string &err)
 }
 
 bool jit_reg_model_check(std::string &err) { return reg_model_check(err); }
+
+/*
+ * REGTRACK's FAILURE ARMS, DRIVEN (2026-10-02). Every check of the
+ * register tracker fires only on code that would corrupt live register
+ * state, so correct emission reaches none of them - and an arm no run
+ * reaches is an arm nobody has seen work. Each scenario below builds a
+ * bare Emitter, puts it in a state, emits (or declares) something
+ * deliberately WRONG, and records what the tracker said through the
+ * TESTS verdict sink instead of aborting. The EXPECTATIONS are not
+ * here: `regtrack_failure_arms` (tests.cpp) holds the message and the
+ * register each scenario must produce, so this function only builds
+ * shapes and has no branch of its own to leave uncovered.
+ */
+#ifndef NDEBUG
+static std::vector<std::string> *g_trk_said = nullptr;
+static void trk_record(const char *line) { g_trk_said->push_back(line); }
+/* a TYPED helper: the call seams derive its argument registers from
+ * this signature - two GP (rdi, rsi), one float (xmm0) */
+static void trk_probe_helper(void *, long, double) {}
+#endif
+
+bool jit_test_regtrack(std::vector<JitTrkCase> &out)
+{
+#ifdef NDEBUG
+    (void)out;
+    return false;                   /* the tracker is compiled out */
+#else
+    void (*const was)(const char *) = g_jit_trk_verdict;
+    g_jit_trk_verdict = trk_record;
+    const auto run = [&](const char *name, auto &&body) {
+        out.push_back(JitTrkCase{name, {}});
+        g_trk_said = &out.back().said;
+        {
+            Emitter e;
+            body(e);
+        }                           /* ~Emitter scans the bytes too */
+        g_trk_said = nullptr;
+    };
+    const auto pin = [](Emitter &e, uint8_t reg) {
+        e.cache.push_back(Emitter::CacheEnt{0, 0, 0, reg});
+    };
+    const auto fpin = [](Emitter &e, uint8_t x) {
+        e.fcache.push_back(Emitter::CacheEnt{0, 0, 0, x});
+    };
+    const auto bytes = [](Emitter &e, std::initializer_list<uint8_t> v) {
+        for (const uint8_t c : v)
+            e.u8(c);
+    };
+
+    /* ---- wrote(): the GP write check ---- */
+    run("wrote/borrowed-by-machinery", [&](Emitter &e) {
+        pin(e, 12);
+        e.saved.push_back(12);
+        e.trk_push(12);                      /* borrow r12 */
+        Emitter::PinMach m(e);
+        e.wrote(12);                         /* a reload over the temp */
+    });
+    run("wrote/borrower-then-read", [&](Emitter &e) {
+        pin(e, 12);
+        e.saved.push_back(12);
+        e.trk_push(12);
+        e.trk_read_pin(12);                  /* not yet written: fine */
+        e.wrote(12);                         /* the borrower's own use */
+        e.trk_read_pin(12);                  /* reads the temp */
+    });
+    run("wrote/unsaved-callee-saved", [&](Emitter &e) {
+        e.saved.push_back(12);
+        e.saved.push_back(14);
+        e.wrote(3);                          /* rbx: a reserved role */
+        e.wrote(14);                         /* saved here: fine */
+        e.wrote(13);                         /* the C caller's r13 */
+    });
+    run("wrote/pinned", [&](Emitter &e) {
+        pin(e, 10);
+        e.wrote(10);
+    });
+    run("wrote/callee-saved-pin-in-bracket", [&](Emitter &e) {
+        pin(e, 10);
+        pin(e, 12);
+        e.saved.push_back(12);
+        e.trk_bracket = 1;
+        e.wrote(10);         /* caller-saved: spilled by the prologue */
+        e.wrote(12);         /* callee-saved: NOT spilled */
+        e.trk_bracket = 0;
+    });
+    run("wrote/machinery", [&](Emitter &e) {
+        pin(e, 10);
+        Emitter::PinMach m(e);
+        e.wrote(10);
+    });
+    run("wrote/flushed-then-read", [&](Emitter &e) {
+        pin(e, 10);
+        pin(e, 11);
+        e.trk_flushed = true;
+        e.wrote(10);                         /* repurposed: allowed */
+        e.trk_read_pin(11);                  /* untouched: fine */
+        e.trk_read_pin(10);                  /* the slot is in memory */
+    });
+
+    /* ---- the borrow stack ---- */
+    run("push/nested", [&](Emitter &e) {
+        pin(e, 10);
+        e.trk_push(10);
+        e.trk_push(10);
+    });
+    run("push/overflow", [&](Emitter &e) {
+        static const uint8_t regs[9] = { 0, 1, 2, 6, 7, 8, 9, 10, 11 };
+        for (const uint8_t r : regs)
+            pin(e, r);
+        for (const uint8_t r : regs)
+            e.trk_push(r);
+    });
+    run("push/what-borrows", [&](Emitter &e) {
+        pin(e, 10);
+        pin(e, 12);
+        e.saved.push_back(12);
+        {
+            Emitter::PinMach m(e);
+            e.trk_push(10);                  /* machinery: no borrow */
+        }
+        e.trk_push(11);                      /* not a pin */
+        e.trk_flushed = true;
+        e.trk_push(10);                      /* dead until reload */
+        e.trk_flushed = false;
+        e.trk_bracket = 1;
+        e.trk_push(10);                      /* spilled scratch */
+        e.trk_push(12);                      /* callee-saved: BORROWS */
+        e.trk_bracket = 0;
+        e.assert_no_borrow("probe: the borrowed set");
+    });
+    run("pop/out-of-order", [&](Emitter &e) {
+        pin(e, 10);
+        pin(e, 11);
+        e.trk_push(10);
+        e.trk_push(11);
+        e.trk_pop(10);
+    });
+    run("pop/borrowed-with-empty-stack", [&](Emitter &e) {
+        pin(e, 10);
+        e.trk_borrowed = 1u << 10;           /* a state with no push */
+        e.trk_pop(10);
+    });
+    run("pop/restore-then-plain", [&](Emitter &e) {
+        pin(e, 10);
+        pin(e, 11);
+        e.trk_push(10);
+        e.trk_pop(10);                       /* the restore */
+        e.trk_pop(11);                       /* a pop INTO a pin */
+    });
+    run("assert-no-borrow", [&](Emitter &e) {
+        pin(e, 10);
+        e.assert_no_borrow("a spill, nothing borrowed");
+        e.trk_push(10);
+        e.assert_no_borrow("a spill with a borrow open");
+    });
+
+    /* ---- op_boundary: nothing transient may cross an op ---- */
+    run("boundary/borrow-open", [&](Emitter &e) {
+        pin(e, 10);
+        e.trk_push(10);
+        e.op_boundary();
+    });
+    run("boundary/take-open", [&](Emitter &e) {
+        e.trk_takes = 1;
+        e.op_boundary();
+        e.trk_takes = 0;
+    });
+    run("boundary/net-push", [&](Emitter &e) {
+        e.trk_pushes = 2;
+        e.op_boundary();
+    });
+    run("boundary/net-pop", [&](Emitter &e) {
+        e.trk_pushes = -1;
+        e.op_boundary();
+    });
+    run("boundary/stack-depth", [&](Emitter &e) {
+        e.sp_depth = 8;
+        e.sp_live = false;                   /* dead model: no check */
+        e.op_boundary();
+        e.sp_depth = 8;                      /* live (op_boundary) */
+        e.op_boundary();
+    });
+    run("boundary/bracket-open", [&](Emitter &e) {
+        e.trk_bracket = 1;
+        e.op_boundary();
+        e.trk_bracket = 0;
+    });
+    run("boundary/bracket-overclosed", [&](Emitter &e) {
+        e.trk_bracket = -2;
+        e.op_boundary();
+        e.trk_bracket = 0;
+    });
+
+    /* ---- a helper call's argument registers ---- */
+    run("callargs/gp", [&](Emitter &e) {
+        const Helper h(trk_probe_helper);
+        e.cur_pc = 0;
+        e.trk_declare(7);                    /* rdi staged, rsi not */
+        e.trk_fdef_note(0);
+        e.trk_call_args(h);
+    });
+    run("callargs/float", [&](Emitter &e) {
+        const Helper h(trk_probe_helper);
+        e.cur_pc = 0;
+        e.trk_declare(7);
+        e.trk_declare(6);                    /* xmm0 never written */
+        e.trk_call_args(h);
+    });
+    run("callargs/complete", [&](Emitter &e) {
+        const Helper h(trk_probe_helper);
+        e.trk_call_args(h);                  /* no op: not checked */
+        e.cur_pc = 0;
+        static const uint8_t gps[6] = { 7, 6, 2, 1, 8, 9 };
+        for (const uint8_t r : gps)
+            e.trk_declare(r);
+        for (uint8_t x = 0; x < 8; x++)
+            e.trk_fdef_note(x);
+        /* more than the ABI has registers for: the rest is stack */
+        e.trk_call_args(Helper::untyped(
+            reinterpret_cast<const void *>(trk_probe_helper), 7, 9));
+    });
+
+    /* ---- the float file ---- */
+    run("fread/undefined", [&](Emitter &e) {
+        fpin(e, 4);
+        e.flits.push_back(Emitter::FLit{1.0, 5});
+        e.trk_fread(3);                      /* outside an op */
+        e.cur_pc = 0;
+        {
+            Emitter::PinMach m(e);
+            e.trk_fread(3);                  /* machinery */
+        }
+        e.trk_fdef_note(2);
+        e.trk_fread(2);                      /* this op wrote it */
+        e.trk_fread(4);                      /* a pin */
+        e.trk_fread(5);                      /* a pooled literal */
+        e.trk_fread(3);                      /* nobody's value */
+    });
+    run("fwrote/pinned", [&](Emitter &e) {
+        fpin(e, 4);
+        {
+            Emitter::PinMach m(e);
+            e.fwrote(4);
+        }
+        e.fwrote(5);                         /* not a pin */
+        e.trk_flushed = true;
+        e.fwrote(4);
+        e.trk_flushed = false;
+        e.trk_bracket = 1;
+        e.fwrote(4);
+        e.trk_bracket = 0;
+        e.fwrote(4);
+    });
+
+    /* ---- the completeness scan: every emitted byte is decoded ---- */
+    run("scan/undeclared-raw-write", [&](Emitter &e) {
+        bytes(e, {0x48, 0x89, 0xCA});        /* mov rdx, rcx */
+        e.trk_scan_writes();
+    });
+    run("scan/undecodable-byte", [&](Emitter &e) {
+        bytes(e, {0x06});                    /* push es: not in 64-bit */
+        e.trk_scan_writes();
+    });
+    run("scan/declaration-groups", [&](Emitter &e) {
+        e.wrote(0);
+        bytes(e, {0x48, 0x89, 0xC8});        /* mov rax, rcx */
+        bytes(e, {0x48, 0x89, 0xD0});        /* mov rax, rdx: same group */
+        bytes(e, {0x48, 0x83, 0xEC, 0x08});  /* sub rsp, 8: sp_move's */
+        e.trk_scan_writes();
+        e.trk_declare(2);                    /* a NEW group: rdx only */
+        bytes(e, {0x48, 0x89, 0xC8});        /* mov rax, rcx */
+        e.trk_scan_writes();
+        e.b.clear();                /* a discarded attempt (emit_ok) */
+        e.trk_scan_writes();                 /* the scan restarts */
+        e.wrote(0);
+        bytes(e, {0x48, 0x89, 0xC8});
+    });
+
+    g_jit_trk_verdict = was;
+    return true;
+#endif
+}
 #endif /* TESTS */
 
 /* #123: the float pin budget, DERIVED from the register model - the
