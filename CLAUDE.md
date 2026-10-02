@@ -92,7 +92,9 @@ them means anything:**
   objdump does (a slot as `[rbx+0x30]`, a temp's real register, digits
   for baked addresses). That is the TOOL rendering differently, not a
   regex in the checker; it is non-reproducible by construction like
-  `MYLANG_VDJ_HEX`, and the default dump does not change. Its first run
+  `MYLANG_VDJ_HEX`. The default dump spells a GP register at its
+  ENCODED width too (`eax`, `r11d`, `al`, since 2026-10-02 - it used
+  to print `rax` for all of them, and `e8` for `r8d`). Its first run
   found the SIB arm dropping an r12 INDEX (100b + REX.X) - right
   mnemonic, wrong address - which every earlier layer passed; plus the
   self-report `DUMP IS UNRELIABLE` and the `-rt` entry

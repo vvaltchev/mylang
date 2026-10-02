@@ -839,8 +839,15 @@ std::string render_op(const DecOp &x, const SlotNamer &nm,
     std::ostringstream o;
     const char *bp = x.byte_ptr ? "byte " : "";
     switch (x.kind) {
-    case DecOp::Gpr:    return gp64(x.reg);
-    case DecOp::Gpr32:  return std::string("e") + (gp64(x.reg) + 1);
+    /* a register at its ENCODED width, as objdump spells it: `mov eax,
+     * ecx` writes 32 bits and zeroes the top half, which `rax, rcx`
+     * would misstate (and `er9` is not a register) */
+    case DecOp::Gpr:
+        if (x.size == 32) return gp32(x.reg);
+        if (x.size == 16) return gp16(x.reg);
+        if (x.size == 8)  return gp8(x.reg, x.rex8);
+        return gp64(x.reg);
+    case DecOp::Gpr32:  return gp32(x.reg);
     case DecOp::Gpr8:   return gp8(x.reg, x.rex8);
     case DecOp::Xmm:    o << "xmm" << x.reg; return o.str();
     case DecOp::Cl:     return "cl";
