@@ -110,12 +110,32 @@ fifteen, then the benches the tables above tracked:
     1.94x  63_closures 1.16x  97_regs_int_call 1.30x  101_float_call 3.08x
     102_call_outer_hot_inner 1.77x
 
-(58 was UNDER-SCALED: its C++ side ran ~9-11ms, below tune_scales.py's
-20ms floor, and its ratio moved 6.8x-7.8x between C++ re-times alone.
-Re-tuned the same day, scale 20 -> 46: C++ 26.7-27.4ms over three
-re-times, my 0.158, **5.83x**. The 7.77x row above is the under-scaled
-reading. 21 other cached C++ entries are still under 20ms - smallest
-98/99/101/102 at 1-2ms - and need the same treatment.)
+(That table rested on UNDER-SCALED C++ denominators: 22 entries ran
+below tune_scales.py's 20ms floor, 98/99/101/102 at 1-2ms, so their
+ratios moved with C++ startup and noise. Re-tuned the same day -
+23 scales raised, every C++ entry now >= 20ms, the whole cpp cache
+and the 22 changed python entries re-timed - and re-measured, same
+binary: geomean over 99 **1.663x**.
+
+    58_structs                0.160   0.027   5.96x
+    64_struct_create          0.156   0.027   5.81x
+    96_find_sum_key           0.139   0.025   5.60x
+    26_dict_iterate           0.107   0.023   4.71x
+    74_dyn_foreach_kv         0.119   0.026   4.53x
+    75_indexed_unpack         0.106   0.024   4.40x
+    28_str_concat             0.101   0.024   4.17x
+    76_funcval_dispatch       0.104   0.025   4.15x
+    20_foreach_unpack         0.126   0.031   4.12x
+    29_str_slice_readonly     0.164   0.040   4.06x
+    100_funcval_dispatch4     0.082   0.021   3.96x
+    32_str_build_join         0.210   0.054   3.92x
+    86_elem_arith_compound    0.089   0.023   3.82x
+    41_str_int_conv           0.157   0.043   3.68x
+    87_elem_shift_compound    0.075   0.021   3.61x
+
+    09 3.40x  11 3.06x  13 3.01x  101 2.99x  35 2.95x  78 2.61x
+    98 2.31x  34 1.97x  73 1.95x  97 1.34x  63 1.16x  99 1.15x
+    102 1.11x)
 
 By the `my` column since 2026-09-22: 34 0.106 -> 0.040, 11 0.079 ->
 0.038, 63 0.190 -> 0.029, 78 0.051 -> 0.021, 09 0.152 -> 0.071, 73
