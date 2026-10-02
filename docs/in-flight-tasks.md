@@ -110,9 +110,12 @@ fifteen, then the benches the tables above tracked:
     1.94x  63_closures 1.16x  97_regs_int_call 1.30x  101_float_call 3.08x
     102_call_outer_hot_inner 1.77x
 
-(58's C++ time is ~9-11ms, so its ratio moves 6.8x-7.8x between C++
-re-times on the C++ side alone - its `my` column, 0.072-0.075, is
-steady.)
+(58 was UNDER-SCALED: its C++ side ran ~9-11ms, below tune_scales.py's
+20ms floor, and its ratio moved 6.8x-7.8x between C++ re-times alone.
+Re-tuned the same day, scale 20 -> 46: C++ 26.7-27.4ms over three
+re-times, my 0.158, **5.83x**. The 7.77x row above is the under-scaled
+reading. 21 other cached C++ entries are still under 20ms - smallest
+98/99/101/102 at 1-2ms - and need the same treatment.)
 
 By the `my` column since 2026-09-22: 34 0.106 -> 0.040, 11 0.079 ->
 0.038, 63 0.190 -> 0.029, 78 0.051 -> 0.021, 09 0.152 -> 0.071, 73
