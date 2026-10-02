@@ -17093,3 +17093,59 @@ identical, the one difference `59_float_abi_calls`'s dump decoding
 `pxor` where it printed `.byte` - the emitted bytes are identical (the
 conflict fires only where a rax pin is live at an exit, which no
 standing attempt has).
+
+## REGTRACK: A HELPER CALL READS ITS ARGUMENT REGISTERS - DECLARED BY ITS SIGNATURE (2026-10-02)
+
+**The hole.** The tracker modelled every WRITE an op makes and, since
+the float stage entry above, every float READ an encoder makes - but not
+the read a C++ helper makes through the SysV ABI. `emit_store_elem`
+loaded the stored value into the float STAGE while
+`jit_store_elem_float(.., double)` reads xmm0: correct while the stage
+sat in xmm0, a wrong answer (a float pin's value stored) the moment the
+#107 enumerator moved it, and found only by a VALUE check. Nothing at
+the call said which registers the callee reads.
+
+**The declaration.** Every C++ call seam - `call_direct`,
+`call_direct_framefree`, `call_rax`, `call_rax_framefree` - takes a
+`Helper`, built from the helper's TYPED function pointer. Its template
+constructor classifies each parameter the way SysV does (integral /
+pointer / enum / reference -> the next of rdi rsi rdx rcx r8 r9;
+floating -> the next xmm), so the declaration IS the C++ signature and
+cannot drift from it; a by-value class parameter does not compile. The
+100 sites that passed `reinterpret_cast<const void *>(helper)` pass the
+helper itself now, and the eight runtime-selected `const void *fn`
+variables are `Helper`s. An untyped pointer must state its ABI:
+`Helper::untyped` (the libm selector of `MathFnV`), `Helper::fragment`
+(a fragment entry - no SysV arguments; `call_fixed_frame`). `call_rax`
+now takes the helper and emits its `movabs rax` itself (the five
+open-coded `movabs rax, &helper; call rax` pairs). The fragment-to-
+fragment `call_reg` forms are the push / frameless protocol and carry no
+SysV arguments.
+
+**The check.** `Emitter::trk_call_args` requires each argument register
+the signature names to have been WRITTEN by the op emitting the call
+(`trk_fdef` for xmm, its new GP twin `trk_gdef`). A pin does NOT count
+and neither does a pooled literal - inside a bracket their registers are
+scratch, and a helper reading one reads whatever the pin left there,
+which is exactly the bug above. A move ELIDED because the value already
+sits in the argument register does count (`mov_rr`'s self-move,
+`fmov_to`): there the pin IS the value the site means, and the elision
+says so. Debug-only; emits nothing.
+
+**What it found:** nothing the enumerator's tier 1 reaches - the seven
+float-ABI sites of the entry above were already fixed. Its two false
+positives were the elided self-moves (a pin already in rsi / rdi /
+xmm0), which now declare.
+
+**Watched failing:** reverting `emit_store_elem`'s float argument to the
+stage (`emit_float_load(e, e.fsa(), ..)`) aborts by name under the
+enumerator's `fp#0` deviation (`59_float_abi_calls`) - "a helper call's
+FLOAT argument register ... was not written by this op" - where before
+the stage entry only the printed value differed (watched: with the
+check disabled the same 15 deviations exit 0 with a wrong stdout); staging
+`emit_put_int_call`'s value into rdx instead of rsi aborts in the
+DEFAULT configuration ("GP argument register ... r6"). **Net:**
+`int_enum` over `tests/functional` 0 failures; `-rt` green on the INT
+and debug lanes; `vdjcmp` emitted code byte-identical (the call_rax
+seam now emits the `movabs rax` it used to receive - same bytes, same
+order).
