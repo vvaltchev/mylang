@@ -49100,6 +49100,15 @@ static bool jit_disasm_decodes_all()
       { "var dyn q = runtime(3); var s = 0;",
         "for (var i = 0; i < 40; i++) { s = s + int(q) + i; }",
         "print(s);" },
+      /* a float compound `/=` on an element with a RUNTIME divisor:
+       * the store tier's zero test is `pxor fsb, fsb; ucomisd`, and
+       * `pxor` (66 0F EF) was undecoded until 2026-10-02 - eight
+       * `.byte` lines on 59_float_abi_calls.my, ten with the stage
+       * forced into xmm8-15 (the REX form). */
+      { "var g = [1.0, 2.0, 3.0, 4.0]; var d = 1.0;",
+        "for (var i = 0; i < 4; i++) {",
+        "    d = d + 0.5; g[i] /= d; g[i] += d * 0.25; }",
+        "print(g, d);" },
     };
 
     /* ⛔ `-vdj` IS `g_jit_annotate`, NOT A DUMP FLAG. The native

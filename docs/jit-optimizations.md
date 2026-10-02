@@ -7025,6 +7025,40 @@ over the whole corpus x {both arenas} x {7 pin-pool rotations} x
 Watched failing: reintroducing the `/5` gap gives 46 boundary errors,
 fires the banner, and fails `-rt`.
 
+**`pxor` WAS UNDECODED FOR AS LONG AS IT WAS EMITTED, AND THE MATRIX
+COULD NOT SEE IT (2026-10-02).** `66 [REX] 0F EF /r` - the float
+divisor's zero test (`pxor fsb, fsb; ucomisd`) in the element-store
+tier's compound `/=` / `%=` - printed four `.byte` lines on
+`tests/functional/59_float_abi_calls.my` in the DEFAULT configuration,
+five with the float stage forced into xmm8-15 (the #107 P3 enumerator's
+`MYLANG_INT_CHOOSE=main/fp#1=9` gives `66 45 0F EF D2`,
+`pxor xmm10, xmm10`). No corpus BENCH has that shape and the `-rt`
+decode check had no float compound element store, so the banner fired
+only on a functional test no instrument ran `-vdj` over. Decoded now
+(only with the 66 prefix - the bare form is MMX, never emitted, and
+stays undecoded); the `-rt` check gained the shape (watched failing
+with the arm disabled: `disasm[14]: DUMP IS UNRELIABLE: 8 undecoded
+byte(s)`).
+
+The script grew three things with it:
+
+  * **`--env K=V[,K=V...]`** (repeatable) adds one configuration, and
+    **`--only FILE`** narrows the corpus - a forced allocator pick names
+    a site in ONE program, and those picks are the only way to reach
+    the REX-prefixed SSE forms;
+  * the **XMM registers are compared in order**, not just the
+    mnemonic: an SSE arm that drops REX.R/REX.B decodes the right
+    opcode on the wrong register, which the mnemonic-only check passed.
+    Watched: dropping REX.B from `xmm_rm` gives 28 errors on one
+    forced-pick run (`movaps xmm1, xmm2` vs `xmm1, xmm10`);
+  * `--matrix` sweeps all **16** rotations (the period since #123
+    moved XROT into `RegAlloc::take`; it still said 7).
+
+Re-run: **13,268,805 instructions, 16,997 fragments, zero
+disagreements** over the corpus x both arenas x 16 rotations x 5 pin
+budgets, plus the four forced float-stage picks (x both arenas) on
+59_float_abi_calls and 16_elem2_fused.
+
 ### And one EMITTER defect it found
 
 `load_elem_sd` / `store_elem_sd` passed `w=true` to `rex_sib`, but
