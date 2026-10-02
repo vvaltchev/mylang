@@ -503,7 +503,9 @@ floor in `tests/int/coverage-floor.txt` - a ratchet, lowered when tests
 cover more, NEVER raised to let a change land. Mark a genuinely
 unreachable line `INT-COV-EXEMPT: reason`. The universe is the PRODUCT:
 `tests.cpp`, the INT core and every INT helper (NAME IT `int_*` /
-`jit_int_*` / `bc_int_*`, or its branches count) are outside it. A test
+`jit_int_*` / `bc_int_*`, or its branches count) are outside it, and so
+are the lines of an `ML_INT(...)` / `ML_INT_ONLY(...)` call inside a
+product function (keep an INT-only condition INSIDE the macro). A test
 program's header picks its runs: `# INT-ENGINES: default` for a codegen or
 JIT decision (the tree-walker never runs those passes),
 `# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra` for several environments.

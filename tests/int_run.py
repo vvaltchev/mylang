@@ -30,8 +30,9 @@
 #    named `kind:file:function:+line-offset:...` so an edit elsewhere in a
 #    file does not rename them. The universe is the PRODUCT: the test
 #    harness (tests.cpp), the INT core and every INT helper function (named
-#    int_* / jit_int_* / bc_int_*) are outside it, and so is a line marked
-#    `INT-COV-EXEMPT: reason`. Two checks, as in SQLite's discipline:
+#    int_* / jit_int_* / bc_int_*) are outside it, as are the lines of an
+#    ML_INT(...) / ML_INT_ONLY(...) call inside a product function and a
+#    line marked `INT-COV-EXEMPT: reason`. Two checks, as in SQLite's discipline:
 #      - every unit OWNS at least one element no other unit covers
 #        (otherwise it is redundant and must go - the suite is minimal);
 #      - uncovered elements <= the FLOOR (a ratchet: it may only go down).
@@ -89,17 +90,52 @@ def run(cmd, env, timeout):
 
 # ------------------------------------------------------------- coverage --
 
+INT_SPAN = re.compile(r"\bML_INT(_ONLY)?\s*\(")
+
+
 def exempt_lines(rel, cache):
-    """1-based line numbers of `rel` carrying the INT-COV-EXEMPT marker."""
+    """1-based line numbers of `rel` outside the universe: a line carrying
+    the INT-COV-EXEMPT marker, and every line of an `ML_INT(...)` or
+    `ML_INT_ONLY(...)` call - the instrumentation's own branches inside a
+    product function (a guard on an event, an INT-only bookkeeping `if`)
+    are not product code, any more than an INT helper function is. The
+    span is found by counting parentheses from the macro name (string and
+    char literals skipped), so a multi-line ML_INT_ONLY block is covered
+    whole."""
     if rel not in cache:
         marked = set()
         try:
             with open(os.path.join(ROOT, rel), errors="replace") as f:
-                for n, text in enumerate(f, 1):
-                    if EXEMPT in text:
-                        marked.add(n)
+                lines = f.readlines()
         except OSError:
-            pass
+            lines = []
+        depth = 0
+        for n, text in enumerate(lines, 1):
+            if EXEMPT in text:
+                marked.add(n)
+            i = 0
+            if depth == 0:
+                m = INT_SPAN.search(text)
+                if not m:
+                    continue
+                i = m.end()
+                depth = 1
+            marked.add(n)
+            quote = None
+            while i < len(text) and depth > 0:
+                c = text[i]
+                if quote:
+                    if c == "\\":
+                        i += 1
+                    elif c == quote:
+                        quote = None
+                elif c in "\"'":
+                    quote = c
+                elif c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                i += 1
         cache[rel] = marked
     return cache[rel]
 
