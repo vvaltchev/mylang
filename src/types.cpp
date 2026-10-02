@@ -34,6 +34,7 @@ static inline ArgLocs build_arglocs(ExprList *exprList, ArgLoc *locbuf, size_t n
 #include "builtins/dict.cpp.h"
 #include "builtins/generic.cpp.h"
 #include "builtins/reflect.cpp.h"
+#include "builtins/inttest.cpp.h"
 
 #include <cmath>
 #include <limits>
@@ -357,6 +358,16 @@ bool is_dev_builtin(const UniqueId *uid)
 bool g_dev_builtins_allowed = false;
 
 /*
+ * The INTRUSIVE-TEST builtins (#107): registered only in an INT_TESTS build,
+ * and recorded here so the builtin TABLE puts them AFTER every other builtin
+ * (build_builtin_table_once). Sorting them in among the rest by name would
+ * shift the slot index of every builtin named after them, so an INT build
+ * would emit different bytecode - and an INT build may not decide anything
+ * differently (plans/intrusive-tests.md, section 2).
+ */
+static std::set<const UniqueId *> g_int_builtin_ids;
+
+/*
  * The LAZY-ARG builtin category (see eval.h): a builtin whose argument is
  * NOT evaluated - a NODE property (`defined`'s UndefinedId probe,
  * `isconst`/`isconstdecl`'s `is_const` flag) that a runtime VALUE can never
@@ -474,6 +485,13 @@ inline auto make_builtin_v(const char *name)
 {
     return make_pair(UniqueId::get(name),
                      LValue(Builtin{builtin_v_adapter<FV>, FV}, false));
+}
+
+template <decltype(Builtin::func_v) FV>
+inline auto make_int_builtin(const char *name)
+{
+    g_int_builtin_ids.insert(UniqueId::get(name));
+    return make_builtin_v<FV>(name);
 }
 
 /*
@@ -721,6 +739,11 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_dev_builtin("show", builtin_show),
     /* refcount() is DEV-ONLY too: the use_count of a reference, in place */
     make_dev_builtin_lv<builtin_refcount>("refcount"),
+#ifdef INT_TESTS
+    /* The intrusive-test builtins (builtins/inttest.cpp.h) - INT builds only */
+    make_int_builtin<builtin_int_hits>("int_hits"),
+    make_int_builtin<builtin_int_events>("int_events"),
+#endif
 
     /* Diagnostic tracing (see trace.h) */
     make_builtin_v<builtin_trace>("trace"),
@@ -813,6 +836,12 @@ build_builtin_table_once()
     std::sort(all.begin(), all.end(),
               [](const std::pair<const UniqueId *, bool> &a,
                  const std::pair<const UniqueId *, bool> &b) {
+                  /* the intrusive-test builtins last (see
+                   * g_int_builtin_ids), so they move no other slot */
+                  const bool ia = g_int_builtin_ids.count(a.first) != 0;
+                  const bool ib = g_int_builtin_ids.count(b.first) != 0;
+                  if (ia != ib)
+                      return ib;
                   return a.first->val < b.first->val;
               });
     for (const auto &e : all) {
@@ -892,6 +921,15 @@ builtin_slot_name(int index)
     if (index >= 0 && static_cast<size_t>(index) < g_builtin_names.size())
         return g_builtin_names[index]->val;
     return "?";
+}
+
+/* True for a slot holding an INTRUSIVE-TEST builtin (#107) - the group the
+ * table sorts after every other builtin. Always false outside INT_TESTS. */
+bool builtin_slot_is_int(int index)
+{
+    build_builtin_table_once();
+    return index >= 0 && static_cast<size_t>(index) < g_builtin_names.size()
+        && g_int_builtin_ids.count(g_builtin_names[index]) != 0;
 }
 
 bool

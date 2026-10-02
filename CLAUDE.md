@@ -487,6 +487,15 @@ REFUSES a binary reporting `int_tests 1`, and the intrusive runner will
 refuse one reporting `0` (`driver_checks.sh` pins the line; set
 `MYLANG_EXPECT_INT_TESTS=1` when running it on an INT lane). Design and
 phases: `plans/intrusive-tests.md` - READ IT before adding a hook.
+**A site is one row of `src/intsites.h` plus one `ML_INT(site, ...)`
+line**, its payload typed and pointer-free (an event must print the same
+on every run); `tests/int_run.py BIN` runs `-rt`, every `tests/int/*.my`
+under both engines, and the SITE CENSUS - a site no run reaches FAILS, so
+add a site together with the test that reaches it. The `int_*` builtins
+sort AFTER every other builtin, so an INT build moves no builtin slot;
+the `int` job in `nets.yml` checks the INT build emits byte-identical
+`-vdj` to a `TESTS` build (`vdjcmp.sh`) - an instrumented point may only
+READ the state it reports.
 
 **Assertions: `ASSERTS` (default 1).** The C `assert()` + the project's
 `ML_CHECK()` invariant net (see *Invariants & hazards*) are **on for every build
@@ -2486,13 +2495,15 @@ neutral (geomean 1.00x), as it must be.
 
 ## Source layout & compilation model
 
-**Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty-three
+**Only `src/*.cpp` are compiled** (the Makefile globs them) — twenty-four
 translation units:
 `lexer.cpp`, `parser.cpp`, `syntax.cpp`, `resolver.cpp`, `inferencer.cpp`,
 `eval.cpp`, `types.cpp`, `statictype.cpp`, `trace.cpp`, `coderender.cpp`,
 `backtrace.cpp`, `errfmt.cpp`, `highlight.cpp`, `lineedit.cpp`, `replhelp.cpp`,
 `repl.cpp`, `codegen.cpp`, `vm.cpp`, `jit.cpp`, `disasm.cpp`, `serialize.cpp`,
-`mylang.cpp`, `tests.cpp`
+`mylang.cpp`, `tests.cpp`, `inttest.cpp` (the intrusive-test core, #107 -
+empty unless `INT_TESTS`; its macros are `inttest.h`, its site list
+`intsites.h`, its builtins `builtins/inttest.cpp.h`)
 (six of them are the REPL — see "The interactive REPL" below; `trace.cpp` is the
 diagnostic tracer and `coderender.cpp` the optimized-AST "decompiler", both used
 by the REPL; `codegen.cpp`/`vm.cpp` are the bytecode-VM engine and `disasm.cpp`

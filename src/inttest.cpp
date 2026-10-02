@@ -1,0 +1,146 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
+/*
+ * The intrusive-test core (#107, plans/intrusive-tests.md): the event log
+ * and per-site hit counts behind ML_INT. Compiled empty without INT_TESTS.
+ *
+ * Determinism: events are recorded in program order and printed from their
+ * typed payloads only (intsites.h forbids pointers in a payload), so the log
+ * is the same on every run of the same (source, build, flags).
+ *
+ * MYLANG_INT_OUT=<path>: at exit, the process appends one `site count` line
+ * per site to <path> (every site, zeros included). tests/int_run.py sums
+ * these over its runs for the site census - a site no run reached fails.
+ */
+
+#ifdef INT_TESTS
+
+#include <cstdio>
+#include <cstdlib>
+
+#include "inttest.h"
+
+namespace {
+
+constexpr int N_SITES = static_cast<int>(IntSite::count_);
+
+const char *const site_names[] = {
+#define X(name, desc, fields) #name,
+    ML_INT_SITES(X)
+#undef X
+};
+
+const char *const site_descs[] = {
+#define X(name, desc, fields) desc,
+    ML_INT_SITES(X)
+#undef X
+};
+
+static_assert(sizeof(site_names) / sizeof(site_names[0]) == N_SITES,
+              "intsites.h: name table out of step with the enum");
+
+struct Log {
+    uint64_t hits[N_SITES] = {};
+    std::vector<std::string> events[N_SITES];
+};
+
+Log &log()
+{
+    static Log l;
+    return l;
+}
+
+/* Write the per-site counts at exit, when asked to. Registered from a
+ * static initializer so a script run needs no explicit call. */
+void dump_at_exit()
+{
+    const char *path = std::getenv("MYLANG_INT_OUT");
+    if (!path || !*path)
+        return;
+    FILE *f = std::fopen(path, "a");
+    if (!f)
+        return;
+    for (int i = 0; i < N_SITES; i++)
+        std::fprintf(f, "%s %llu\n", site_names[i],
+                     static_cast<unsigned long long>(log().hits[i]));
+    std::fclose(f);
+}
+
+struct AtExit {
+    AtExit() { log(); std::atexit(dump_at_exit); }
+} at_exit_registration;
+
+}  // namespace
+
+void int_record(IntSite s, std::string &&line)
+{
+    const int i = static_cast<int>(s);
+    log().hits[i]++;
+    log().events[i].push_back(std::move(line));
+}
+
+const char *int_site_name(IntSite s)
+{
+    return site_names[static_cast<int>(s)];
+}
+
+const char *int_site_desc(IntSite s)
+{
+    return site_descs[static_cast<int>(s)];
+}
+
+int int_site_by_name(const std::string &name)
+{
+    for (int i = 0; i < N_SITES; i++)
+        if (name == site_names[i])
+            return i;
+    return -1;
+}
+
+uint64_t int_hits(IntSite s)
+{
+    return log().hits[static_cast<int>(s)];
+}
+
+const std::vector<std::string> &int_events(IntSite s)
+{
+    return log().events[static_cast<int>(s)];
+}
+
+void int_reset()
+{
+    for (int i = 0; i < N_SITES; i++)
+        log().events[i].clear();
+    /* the hit counts are NOT reset: they feed the exit census, which must
+     * see every event the process recorded */
+}
+
+void int_put(std::string &o, const char *key, int64_t v)
+{
+    o += ' ';
+    o += key;
+    o += '=';
+    o += std::to_string(v);
+}
+
+void int_put(std::string &o, const char *key, bool v)
+{
+    o += ' ';
+    o += key;
+    o += v ? "=true" : "=false";
+}
+
+void int_put(std::string &o, const char *key, const std::string &v)
+{
+    o += ' ';
+    o += key;
+    o += "=\"";
+    for (char c : v) {
+        if (c == '"' || c == '\\')
+            o += '\\';
+        o += c;
+    }
+    o += '"';
+}
+
+#endif  /* INT_TESTS */

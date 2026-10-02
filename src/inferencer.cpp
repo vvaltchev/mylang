@@ -4301,7 +4301,8 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 
     /* int-returning */
     if (n == "len" || n == "hash" || n == "ord" || n == "rand" ||
-        n == "intptr" || n == "refcount" || n == "remove")
+        n == "intptr" || n == "refcount" || n == "remove" ||
+        n == "int_hits")
         return A.int_ty();
 
     /* bool-returning predicates */
@@ -4338,7 +4339,8 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return A.struct_ty(ty, ty->name);
     }
 
-    if (n == "split" || n == "splitlines" || n == "readlines")
+    if (n == "split" || n == "splitlines" || n == "readlines" ||
+        n == "int_events")
         return A.array_of(A.str_ty());
 
     /* layout(S) -> a StructLayout reflection object (native composite type) */

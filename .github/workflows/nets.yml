@@ -248,6 +248,44 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --spcheck
 
+  # ---------------------------------------------------------------- #
+  # THE INTRUSIVE TESTS (#107, plans/intrusive-tests.md). An INT_TESTS
+  # build runs tests/int_run.py (-rt, every tests/int program under both
+  # engines, and the site census: a site no run reached fails). Plus the
+  # NON-PERTURBATION check: the INT build must emit byte-identical
+  # bytecode and machine code to a plain TESTS build of the same commit -
+  # an INT build may cost speed and memory, never a decision.
+  # ---------------------------------------------------------------- #
+  int:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build (INT_TESTS)
+      run: |
+        cmake -S $GITHUB_WORKSPACE -B build-int -DINT_TESTS=ON \
+              -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build-int -j
+    - name: Build (TESTS, the reference)
+      run: |
+        cmake -S $GITHUB_WORKSPACE -B build-tests -DTESTS=1 \
+              -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build-tests -j
+
+    # THE VACUITY GUARD: both answers, both directions.
+    - name: "assert -v reports int_tests 1 / 0"
+      run: |
+        ./build-int/mylang -v | grep -q '^  int_tests  *1'
+        ./build-tests/mylang -v | grep -q '^  int_tests  *0'
+
+    - name: "non-perturbation: INT emits what TESTS emits"
+      run: scripts/vdjcmp.sh ./build-tests/mylang ./build-int/mylang
+
+    - name: tests/int_run.py
+      run: tests/int_run.py ./build-int/mylang
+
+    - name: driver_checks
+      run: MYLANG_EXPECT_INT_TESTS=1 sh tests/driver_checks.sh ./build-int/mylang
+
   myv-fuzz:
     runs-on: ubuntu-latest
     strategy:
