@@ -1923,6 +1923,12 @@ struct Helper {
         static_assert(sysv_count<A...>(0) == 0,
                       "a helper argument this table cannot classify "
                       "(a by-value class?) - declare it explicitly");
+        /* the tracker checks only REGISTER arguments (trk_call_args):
+         * a helper that would pass some on the stack is refused here
+         * rather than left unchecked */
+        static_assert(sysv_count<A...>(1) <= 6 && sysv_count<A...>(2) <= 8,
+                      "a helper with stack-passed arguments - the tracker "
+                      "does not model them; pass a struct pointer");
     }
     template <class R, class... A>
     Helper(R (*f)(A...) noexcept)
@@ -1933,6 +1939,12 @@ struct Helper {
         static_assert(sysv_count<A...>(0) == 0,
                       "a helper argument this table cannot classify "
                       "(a by-value class?) - declare it explicitly");
+        /* the tracker checks only REGISTER arguments (trk_call_args):
+         * a helper that would pass some on the stack is refused here
+         * rather than left unchecked */
+        static_assert(sysv_count<A...>(1) <= 6 && sysv_count<A...>(2) <= 8,
+                      "a helper with stack-passed arguments - the tracker "
+                      "does not model them; pass a struct pointer");
     }
     /* a pointer whose type was lost (a runtime-selected libm function):
      * the caller states the counts */
@@ -2239,6 +2251,33 @@ struct Emitter {
                          static_cast<unsigned>(i));
 #else
         (void)h;
+#endif
+    }
+    /* A FRAGMENT call's register ABI (REGCALL: a frameless callee takes
+     * its int parameters in rdi/rcx/r9/r10 and its floats in xmm2-xmm5,
+     * jit_regcall_arg_reg / _farg_reg): the site states the masks, and
+     * each register must have been written by this op - the same rule as
+     * a helper's SysV arguments (trk_call_args). */
+    void trk_call_regs(uint32_t gp, uint32_t xmm) const
+    {
+#ifndef NDEBUG
+        /* only ever called inside an op (a frameless call site), and the
+         * bit walks by a CONSTANT shift - a variable `1u << r` gains a
+         * sanitizer edge per test that no input can take */
+        const uint32_t gmiss = gp & ~trk_gdef, fmiss = xmm & ~trk_fdef;
+        uint32_t bit = 1;
+        for (unsigned r = 0; r < 16; r++, bit <<= 1)
+            if (gmiss & bit)
+                trk_fail("a fragment call's GP argument register was not "
+                         "written by this op (REGCALL)", r);
+        bit = 1;
+        for (unsigned x = 0; x < 16; x++, bit <<= 1)
+            if (fmiss & bit)
+                trk_fail("a fragment call's FLOAT argument register was "
+                         "not written by this op (REGCALL)", x);
+#else
+        (void)gp;
+        (void)xmm;
 #endif
     }
     /* EVERY encoder that READS an xmm reports it here: a register read
@@ -12897,8 +12936,9 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                 if (ra.fpin >= 0 && fpin_clash) {
                     e.fload(x, ra.slot);
                 } else if (ra.fpin >= 0) {
-                    if (ra.fpin != x)
-                        e.fmov_rr(x, static_cast<uint8_t>(ra.fpin));
+                    /* fmov_to: a pin already in its argument register
+                     * still counts as this op's definition */
+                    e.fmov_to(x, static_cast<uint8_t>(ra.fpin));
                 } else if (ra.cvt && ra.pin >= 0) {
                     e.trk_read_pin(static_cast<uint8_t>(ra.pin));
                     e.cvt_reg(x, static_cast<uint8_t>(ra.pin));
@@ -12945,6 +12985,12 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
                                                    * before r11 is loaded */
                 e.bump_counter32_live(
                     reinterpret_cast<const void *>(depth_addr));
+            {
+                uint32_t gm = 0, fm = 0;
+                for (const RegArg &ra : reg_args)
+                    (ra.flt ? fm : gm) |= 1u << ra.abi;
+                e.trk_call_regs(gm, fm);
+            }
             if (fl_self) {
                 ML_CHECK(g_cur_self_fl_calls != nullptr);
                 g_cur_self_fl_calls->push_back(e.call_local_fixed_frame());
@@ -17075,6 +17121,23 @@ bool jit_test_regtrack(std::vector<JitTrkCase> &out)
         e.trk_scan_writes();                 /* the scan restarts */
         e.wrote(0);
         bytes(e, {0x48, 0x89, 0xC8});
+    });
+
+    /* ---- trk_call_regs: a fragment call's REGCALL registers ---- */
+    run("callregs/complete", [&](Emitter &e) {
+        e.cur_pc = 0;
+        e.trk_declare(7);                    /* rdi staged */
+        e.trk_fdef_note(2);                  /* xmm2 staged */
+        e.trk_call_regs(1u << 7, 1u << 2);
+    });
+    run("callregs/gp", [&](Emitter &e) {
+        e.cur_pc = 0;
+        e.trk_declare(7);
+        e.trk_call_regs((1u << 7) | (1u << 1), 0);   /* rcx not written */
+    });
+    run("callregs/float", [&](Emitter &e) {
+        e.cur_pc = 0;
+        e.trk_call_regs(0, 1u << 3);                 /* xmm3 not written */
     });
 
     /* ---- patch8: a rel8 span that can grow ---- */
