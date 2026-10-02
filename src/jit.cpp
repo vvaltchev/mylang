@@ -2497,6 +2497,20 @@ struct Emitter {
         if (!reg_holds_pin(r))
             return;
         pin_conflicts |= 1u << r;
+        /* THE CAPTURE BASE is a pin too (reg_holds_pin says so, W6),
+         * with no cache entry to erase: end its live range for this
+         * DOOMED attempt, or the ISA write that follows the conflict
+         * is judged a clobber of a live base. The retry denies the
+         * register like any other (the base's take reads ra.denied),
+         * so the attempt that STANDS never holds it there. Found by
+         * the #107 enumerator handing a call-free closure's base RDX,
+         * which `d / (x - 3)` then writes by ISA. */
+        if (capbase_live
+                && static_cast<uint8_t>(capbase) == r) {
+            capbase_live = false;
+            ra.give(r);
+            return;
+        }
         for (size_t i = 0; i < cache.size(); i++) {
             if (cache[i].reg == r) {
                 cache.erase(cache.begin()
@@ -2616,6 +2630,9 @@ struct Emitter {
      * never met it - the pool-tail blindness CLAUDE.md names, caught by
      * the axis built for exactly that.
      */
+    /* live implies capbase >= 0: both are set together where the base
+     * is taken and cleared together, so a test of `capbase_live` alone
+     * is the whole question */
     bool capbase_live = false;
     /*
      * #97 inc 3 (W4): this run's capture base came from the FuncObject
@@ -3574,7 +3591,7 @@ struct Emitter {
          * literally declare their clobber through `scratch(r)`, which
          * asks exactly this. Answering "no" there would be a silent
          * clobber of the base every capture access reads. */
-        if (capbase >= 0 && capbase_live
+        if (capbase_live
                 && static_cast<uint8_t>(capbase) == r)
             return true;
         for (const CacheEnt &c : cache)

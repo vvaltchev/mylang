@@ -1,0 +1,33 @@
+# INT-ENGINES: default
+# INT-CONFIGS: MYLANG_INT_CHOOSE=<lambda>@17/gp#2=1
+#
+# INT test (#107 P3, an enumerator finding): the caller-saved CAPTURE
+# BASE of a frameless leaf (#112 / W6) deviated into rdx. The division
+# needs rdx (idiv), `reg_pin_conflict(RDX)` flags it, and the retry
+# re-emits with rdx denied - but the base had no cache entry to evict,
+# so it stayed live and the checked build's REGTRACK aborted on the
+# next ISA write to rdx, in an attempt that was going to be discarded.
+# The config forces exactly that pick; the `reg_choice` event proves the
+# forced pick was taken (an ordinal key drifts when the code changes,
+# and then this fails instead of passing vacuously), and the value is
+# the oracle. Found as 42_closure_inline.my `<lambda>@42/gp#2=1`.
+
+func mkd(int d) {
+    return func [d] (int x) {
+        return d / (x - 3) + 1000;
+    };
+}
+var f = mkd(runtime(60));
+var s = 0;
+for (var i = 4; i < 40; i++)
+    s += f(i);
+print(s);
+assert(s == 36237);
+
+var taken = false;
+foreach (e in int_events("reg_choice"))
+    if (find(e, "key=\"<lambda>@17/gp#2\"") != none
+            && find(e, "pick=1 ") != none)
+        taken = true;
+print(taken);
+assert(taken);
