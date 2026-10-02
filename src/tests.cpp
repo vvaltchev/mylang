@@ -49,6 +49,47 @@
 #include <vector>
 #include <algorithm>
 
+/*
+ * #107 P2: THE "RAN HERE" HALF OF A COUNTER CHECK. An emitted-code counter
+ * proves a tier EXECUTED - which no log can - but only "somewhere in the
+ * program"; a test whose program has several shapes cannot tell which one
+ * moved it (the vacuous-test trap's item 5). An IntWatch marks the
+ * intrusive log and then asks whether `site` recorded an event matching
+ * `needle` SINCE - a decision AT the function and variable the test is
+ * about. Outside an INT_TESTS build both questions answer true, so a test
+ * keeps its counter check everywhere and gains the site check in the INT
+ * lane.
+ */
+struct IntWatch {
+#ifdef INT_TESTS
+    IntSite site;
+    size_t from;
+    explicit IntWatch(const char *name)
+        : site(static_cast<IntSite>(int_site_by_name(name))),
+          from(0)
+    {
+        ML_CHECK_MSG(int_site_by_name(name) >= 0, "IntWatch: no such site");
+        from = int_events(site).size();
+    }
+    bool saw(const std::string &needle) const
+    {
+        const std::vector<std::string> &ev = int_events(site);
+        for (size_t i = from; i < ev.size(); i++)
+            if (ev[i].find(needle) != std::string::npos)
+                return true;
+        return false;
+    }
+    bool missing(const std::string &needle) const { return !saw(needle); }
+    bool active() const { return true; }
+#else
+    explicit IntWatch(const char *) { }
+    bool saw(const std::string &) const { return true; }
+    bool missing(const std::string &) const { return true; }
+    bool active() const { return false; }   /* for a computed check */
+#endif
+};
+
+
 using std::setw;
 using std::setfill;
 
@@ -22307,6 +22348,7 @@ static bool jit_frameless_gate()
         }
     };
     /* ADMITS: a scalar leaf, and (the Halt clause) a void one. */
+    IntWatch w_leaf("call_tier");    /* #107: AT the call to leaf */
     want("a scalar leaf", probe({
         "var sink = 0;",
         "func leaf(dyn k) {",
@@ -22320,6 +22362,11 @@ static bool jit_frameless_gate()
         "  return s;",
         "}",
         "print(drive(runtime(20)));" }), true);
+    if (!w_leaf.saw("tier=\"frameless\" callee=\"leaf\"")) {
+        fprintf(stderr, "jit_frameless_gate: the call TO leaf was not "
+                        "emitted frameless (the chunk count counts any)\n");
+        ok = false;
+    }
     /*
      * REJECTS: a body that CALLS - and it calls a BUILTIN, deliberately.
      *
@@ -35723,6 +35770,7 @@ static bool jit_lea_addsub_shape()
  * g's body is weighed past the AST inliner and the splice is held off,
  * so the call survives to a frameless site.
  */
+
 static bool jit_regcall_pins_caller_saved()
 {
 #if ML_JIT_SUPPORTED
@@ -35772,12 +35820,21 @@ static bool jit_regcall_pins_caller_saved()
     bool ok = true;
     std::string d;
     const unsigned long c0 = g_jit_pins_cs;
+    IntWatch w("pin");               /* #107: the decision, in g itself */
     try {
         d = native_dump_of(lines);
     } catch (Exception &e) {
         fprintf(stderr, "jit_regcall_pins_caller_saved: threw %s: %s\n",
                 e.name, e.msg);
         return false;
+    }
+    /* REGCALL's own registers for the two int parameters - a protocol
+     * fact, not an allocator choice */
+    if (!w.saw("func=\"g\" var=\"a\" reg=\"rdi\"")
+            || !w.saw("func=\"g\" var=\"b\" reg=\"rcx\"")) {
+        fprintf(stderr, "jit_regcall_pins_caller_saved: g's parameters are "
+                        "not pinned in their argument registers\n");
+        ok = false;
     }
     std::vector<NativeIns> on;
     if (!entry(d, on)) {
@@ -36287,6 +36344,17 @@ static bool jit_temp_regs()
         engine_run_bt(src, ExecEngine::TreeWalk, false, false);
     const unsigned long t0 = g_jit_temp_regs;
     std::string on, off;
+    /* #107: in g itself - a temp of the function under test, held in a
+     * register with the lever, and none without it */
+    IntWatch w_on("pin");
+    IntWatch w_off("pin");
+    /* an expression TEMP of g (`t<digit>` - g also has a LOCAL named t) */
+    const auto g_temp = [](const IntWatch &w) {
+        for (int k = 0; k < 16; k++)
+            if (w.saw("func=\"g\" var=\"t" + std::to_string(k) + "\""))
+                return true;
+        return false;
+    };
     try {
         on = native_dump_of(lines);
         if (engine_run_bt(src, ExecEngine::Vm, true, false) != want) {
@@ -36294,11 +36362,21 @@ static bool jit_temp_regs()
                             "tree-walker\n");
             ok = false;
         }
+        if (!g_temp(w_on)) {
+            fprintf(stderr, "jit_temp_regs: no temp OF g was pinned\n");
+            ok = false;
+        }
         g_jit_off_extra = off_was | jit_lever_bit("tregs");
+        w_off = IntWatch("pin");
         off = native_dump_of(lines);
         if (engine_run_bt(src, ExecEngine::Vm, true, false) != want) {
             fprintf(stderr, "jit_temp_regs: tregs OFF disagrees with the "
                             "tree-walker\n");
+            ok = false;
+        }
+        if (w_off.active() && g_temp(w_off)) {
+            fprintf(stderr, "jit_temp_regs: a temp of g was pinned with "
+                            "the tregs lever OFF\n");
             ok = false;
         }
     } catch (Exception &e) {
@@ -40779,6 +40857,9 @@ static bool jit_fwd_deadtemp()
          * halves have different soundness arguments - a local's write is
          * never skipped - so one total could hide either going dark. */
         long loc_exact;
+        /* #107: the function the forwards must be IN (INT builds; unset
+         * leaves the case to its counters) */
+        const char *in_func = nullptr;
     };
     const std::vector<Case> cases = {
       /* the canonical chain: load -> mulRI -> addstep, two forwards per
@@ -40793,7 +40874,7 @@ static bool jit_fwd_deadtemp()
           "    var a = array(n); var i = 0;",
           "    while (i < n) { a[i] = i + 1; i++; }",
           "    return a; }",
-          "print(f(mk(32), 32));" }, 64, 0, 0 },
+          "print(f(mk(32), 32));" }, 64, 0, 0, "f" },
 
       /* the 46_matrix_mult inner shape: elem2 -> mul -> addstep */
       { "nested-read -> mul -> accumulate (the matmul shape)",
@@ -40809,7 +40890,7 @@ static bool jit_fwd_deadtemp()
           "    for (var j = 0; j < 32; j++)",
           "        s += m[j % 4][j % 8] * w[j % 8];",
           "    return s; }",
-          "print(f(mk(4), mk(1)[0]));" }, 32, 0, 0 },
+          "print(f(mk(4), mk(1)[0]));" }, 32, 0, 0, "f" },
 
       /*
        * The SLOW-PATH REJOIN: a negative index declines the load to the
@@ -40887,8 +40968,15 @@ static bool jit_fwd_deadtemp()
     bool ok = true;
     for (const Case &c : cases) {
         unsigned long fwd = 0, loc = 0;
+        IntWatch w("forward");
         const std::string got = go(c.src, true, &fwd, &loc);
         const std::string ref = go(c.src, false, nullptr, nullptr);
+        if (c.in_func
+                && !w.saw(std::string("func=\"") + c.in_func + "\"")) {
+            cout << "  fwd [" << c.name << "]: no forward IN "
+                 << c.in_func << " (the counter counts the program)\n";
+            ok = false;
+        }
         if (got != ref || ref.empty()) {
             cout << "  fwd [" << c.name << "]: tw=[" << ref
                  << "] vm=[" << got << "]\n";
@@ -45752,6 +45840,7 @@ static bool jit_release_c5()
      */
     const unsigned long r0 = g_jit_release_entry;
     const unsigned long s0 = g_jit_relent_stores;
+    IntWatch w("guard_elided");      /* #107: the decision, in main */
     if (!run({
             "var av = [\"3\"];",
             "var n = int(av[0]) * 3;",
@@ -45769,6 +45858,11 @@ static bool jit_release_c5()
     }
     if (g_jit_relent_stores <= s0) {
         fprintf(stderr, "jit_release_c5: no store dropped its ref guard\n");
+        return false;
+    }
+    if (!w.saw("kind=\"store\" func=\"main\"")) {
+        fprintf(stderr, "jit_release_c5: no store OF THIS PROGRAM'S main "
+                        "dropped its ref guard\n");
         return false;
     }
 
