@@ -2596,8 +2596,38 @@ struct Emitter {
     {
         uint64_t bits;
         std::memcpy(&bits, &f.val, sizeof bits);
-        movabs(1 /*rcx*/, bits);
-        movq_xmm_from(f.reg, 1 /*rcx*/);
+        /*
+         * ⛔ rcx MAY BE A PIN. It is an allocatable register (7th in the
+         * cost order), so a run with enough live ints pins a slot in it,
+         * and this load runs at the fragment ENTRY - after the entry
+         * pins are loaded - and in every entry stub and call epilogue.
+         * Under the legacy allocator, which pins at entry, a function
+         * with seven hot ints and a float literal overwrote the pinned
+         * slot with the literal's bits (found by the #107 P3 decision
+         * enumerator: forcing one legal register pick reproduced it;
+         * the heuristic reaches the same state under pressure). So the
+         * scratch is ASKED for, preferring rcx - byte-identical while it
+         * is free - with rax excluded (its status is live in the call
+         * epilogue, see above); refused, rcx is BORROWED around the two
+         * instructions when it holds a pin (push/pop, RefScratch's
+         * protocol - pop leaves the flags alone).
+         */
+        const int g = alloc_scratch(CAP_ALLOCATABLE, 1u << 1, 1u << 0,
+                                    /*transient=*/true);
+        /* refused: borrow rcx whether or not it holds a pin right now -
+         * a register merely PLANNED for the run (busy at another pc) is
+         * refused too, and preserving it is correct either way. One arm,
+         * not two: the unoccupied variant had no test that could reach
+         * it (coverage gate, #107). */
+        const uint8_t sc = g >= 0 ? static_cast<uint8_t>(g) : 1;
+        if (g < 0)
+            push_reg(1);
+        movabs(sc, bits);
+        movq_xmm_from(f.reg, sc);
+        if (g >= 0)
+            free_scratch(sc);
+        else
+            pop_reg(1);
     }
     /* C4a-i: slots whose READS skip emit_float_load's 3-way type
      * dispatch - every in-run writer is a float op, so the type word
