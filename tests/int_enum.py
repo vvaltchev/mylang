@@ -18,15 +18,15 @@
 #   Complete for a bug that needs one decision to be different - the r9 pin
 #   and the float-literal rcx clobber were both of that kind.
 #
-#   TIERS 2-3 (--tier 2) - TWO DECISIONS AT ONCE, within one SCOPE: the
+#   TIERS 2 AND 3 - TWO DECISIONS AT ONCE, within one SCOPE: the
 #   instances whose keys share the part before the last `/` (one JIT run's
 #   register picks, budget, spills and literals; one caller's inline and
-#   bytecode-inlining sites; every frameless site). A scope whose space of
-#   2+-deviation combinations is at most TIER2_PRODUCT is run under EVERY
-#   one of them (tier 2); a larger scope under a deterministic greedy
-#   covering array in which every pair of NON-default values at every
-#   pair of its instances appears (tier 3 - a pair with a default on one
-#   side is a tier-1 run already). A failing row is reduced to a minimal
+#   bytecode-inlining sites; every frameless site). --tier 2: a scope
+#   whose space of 2+-deviation combinations is at most TIER2_PRODUCT is
+#   run under EVERY one of them. --tier 3: each larger scope under a
+#   deterministic greedy covering array in which every pair of NON-default
+#   values at every pair of its instances appears (a pair with a default
+#   on one side is a tier-1 run already). Each scope is in exactly one. A failing row is reduced to a minimal
 #   vector by dropping its overrides one at a time, in key order, while
 #   it still fails. Pairs across scopes are not claimed.
 #
@@ -146,14 +146,14 @@ def read_list(path):
     return out
 
 
-TIER2_PRODUCT = 64
+TIER2_PRODUCT = 512
 
 
 def scope_of(key):
     return key.rsplit("/", 1)[0] if "/" in key else ""
 
 
-def tier2_rows(factors):
+def tier2_rows(factors, tier=2):
     """Rows (tuples of (key, alt)) for one scope's factors, each a
     (key, n, dflt) with n >= 2, sorted by key: every combination with two
     or more non-default values when that space is small, else a greedy
@@ -171,7 +171,12 @@ def tier2_rows(factors):
         if space > 1 << 20:
             break
     rows = []
-    if space - 1 - sum(len(a) for a in alts) <= TIER2_PRODUCT:
+    small = space - 1 - sum(len(a) for a in alts) <= TIER2_PRODUCT
+    # tier 2 is the small scopes' full product, tier 3 the covering
+    # arrays of the rest: each scope belongs to exactly one of them
+    if small != (tier == 2):
+        return rows
+    if small:
         def rec(i, cur):
             if i == k:
                 if len(cur) >= 2:
@@ -231,9 +236,10 @@ def main():
     ap.add_argument("--resume", default=None,
                     help="continue a stopped run from its <mark>@<fp> token")
     ap.add_argument("--heartbeat", type=float, default=60.0)
-    ap.add_argument("--tier", type=int, default=1, choices=(1, 2),
-                    help="1: every single deviation; 2: tiers 2-3, "
-                         "pairs within a scope")
+    ap.add_argument("--tier", type=int, default=1, choices=(1, 2, 3),
+                    help="1: every single deviation; 2: every 2+-"
+                         "deviation combination of each SMALL scope; 3: "
+                         "a pairwise covering array of each larger one")
     ap.add_argument("--failures-out", default=None,
                     help="write EVERY failure here (stdout shows 40)")
     args = ap.parse_intermixed_args()
@@ -299,7 +305,7 @@ def main():
                         scopes.setdefault(scope_of(key), []).append(
                             (key, n, dflt))
                 for sc in sorted(scopes):
-                    for row in tier2_rows(scopes[sc]):
+                    for row in tier2_rows(scopes[sc], args.tier):
                         plan_text.append("%s %s" % (name, row))
                         items.append((k, row))
         fp = fingerprint(file_digest(binary), "\n".join(plan_text),

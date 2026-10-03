@@ -598,14 +598,16 @@ a retain before the slice-element decline (balanced on the fast path)
 leaks on 10 forced declines in 6 programs, with `-rt` and every
 default run green. **Correctness must
 not depend on which legal register the allocator picks** - its first
-run found five JIT bugs the default picks never reach. `--tier 2` runs
-TWO decisions at once within a SCOPE (keys sharing the prefix before the
-last `/`): every combination where that space is small, else a
-deterministic greedy covering array holding every pair of non-default
-values, and a failing row is reduced to a minimal vector. Watched:
-without the call epilogue's float-pool restore, tier 1 fails 4 corpus
-runs and tier 2 fails 301 in 12 programs (11 of them invisible to
-tier 1), each reduced to a 2-4 decision vector. ~112k runs, ~5 min. Run it on the
+run found five JIT bugs the default picks never reach. Tiers 2 and 3
+run TWO decisions at once within a SCOPE (keys sharing the prefix before
+the last `/`): `--tier 2` every combination of each scope with at most
+512 of them (~3k runs, seconds - CI, every push), `--tier 3` a
+deterministic greedy covering array of every non-default value pair of
+each larger scope (~110k runs, ~6 min here, ~10x on a hosted runner -
+`int-deep.yml`, on demand); a failing row is reduced to a minimal
+vector. Watched: without the call epilogue's float-pool restore, tier 1
+fails 4 corpus programs, tier 2 one, tier 3 eleven (most invisible to
+tier 1), each reduced to a 2-4 decision vector. Run it on the
 FAST lane: `make OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1
 BUILD_DIR=build-claude/int-rel` (the whole functional corpus in ~40 s).
 A hook in a product function must be `noexcept` and allocate nothing
@@ -2050,9 +2052,15 @@ lanes so an `-rt` failure still reports quickly:
 - **repl-fuzz** under `RECYCLE=ON` + ASan, the combination this file
   names for the REPL's retained-AST/stale-node class;
 - **coverage-gate** — Net 4's ratchet (below).
-- **int-enum** — the #107 P3 decision enumerator, tier 1 over
+- **int-enum** — the #107 P3 decision enumerator, tiers 1 and 2 over
   tests/functional on an optimized `ASSERTS=ON` `INT_TESTS` build (the
   REGTRACK net live), after a vacuity guard on `mylang -v`.
+**`int-deep.yml` is ON DEMAND (workflow_dispatch):** the enumerator's
+tier 3 and `tests/int_select.py --with-rt`, each a checkbox - minutes
+locally, an hour or more on a hosted runner. (Measured 2026-10-03: the
+push workflows finish in Linux 8.7 min, Coverage 3.8, Windows and macOS
+2 each, Nets 50 min - of which `differential` is 50, and its
+`disasmcheck` step alone 28.7.)
 
 **LOCALLY, THE WHOLE BATTERY IS ONE COMMAND: `tests/run_battery.py`
 (2026-09-27).** It builds the six lanes (dbg, clang, rel-hard, release
