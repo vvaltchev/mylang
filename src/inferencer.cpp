@@ -1343,10 +1343,21 @@ void Inferencer::stamp_callee_fn(Block *rootBlock)
             }
             if (!ok)
                 continue;
-            call->callee_desc = cs.funcs[0]->decl->desc;
-            call->callee_desc2 = cs.funcs[1]->decl->desc;
-            for (size_t k = 2; k < cs.funcs.size(); k++)
-                call->callee_desc_more.push_back(cs.funcs[k]->decl->desc);
+            /* the set's member ORDER is the fixpoint's insertion order,
+             * which follows pointer-keyed iteration - i.e. the heap
+             * layout - and it becomes the guard chain's order. Sort by
+             * the declaration's monotonic node_id so the emitted code is
+             * the same in every binary (found by #107's vdjcmp: an INT
+             * build, which interns more strings, swapped a1$0/a2$0) */
+            std::vector<FuncInfo *> order(cs.funcs.begin(), cs.funcs.end());
+            std::sort(order.begin(), order.end(),
+                      [](const FuncInfo *a, const FuncInfo *b) {
+                          return a->decl->node_id < b->decl->node_id;
+                      });
+            call->callee_desc = order[0]->decl->desc;
+            call->callee_desc2 = order[1]->decl->desc;
+            for (size_t k = 2; k < order.size(); k++)
+                call->callee_desc_more.push_back(order[k]->decl->desc);
             continue;
         }
         if (cs.funcs.size() != 1)
@@ -1408,7 +1419,19 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
      * surviving would be an asymmetry with no reason behind it.
      */
     struct Use { Identifier *id; TypeSym *sym; bool in_func; };
-    std::map<FuncInfo *, std::vector<Use>> uses;
+    /* keyed in DECLARATION order, not by pointer: iterating `uses` is
+     * what creates the instances, and their creation order decides their
+     * global slots - by address it followed the heap layout, so two
+     * binaries numbered a1$0/a2$0 differently (found by #107's vdjcmp) */
+    struct ByDecl {
+        bool operator()(const FuncInfo *a, const FuncInfo *b) const
+        {
+            /* every FuncInfo has its declaration (declare_funcdecl is
+             * the one creator), and node_id is unique per node */
+            return a->decl->node_id < b->decl->node_id;
+        }
+    };
+    std::map<FuncInfo *, std::vector<Use>, ByDecl> uses;
 
     std::function<void(Construct *, bool)> walk =
         [&](Construct *n, bool in_func) {
@@ -1476,7 +1499,7 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
     /* 2) Every INDIRECT call (no direct FuncInfo) whose callee type carries
      * a finfo set: attribute its signature to each member. */
     struct Site { CallExpr *call; bool in_func; };
-    std::map<FuncInfo *, std::vector<Site>> sites;
+    std::map<FuncInfo *, std::vector<Site>, ByDecl> sites;
     std::vector<std::pair<CallExpr *, bool>> calls;
     for (auto &e : rootBlock->elems)
         collect_calls(e.get(), calls);
