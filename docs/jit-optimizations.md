@@ -16903,3 +16903,29 @@ the two postexit sites pass `rdi`. Byte-identical while `rcx` is free
 argument or ISA-result register is invisible to the allocator, so only
 the caller can name it. **Net:** the enumerator over
 `tests/functional` (0 `gp#` failures after, 6 before, watched).
+
+## AN ISA WRITE AFTER A CAPTURE-BASE CONFLICT WAS JUDGED A CLOBBER (2026-10-02)
+
+**Found by the #107 P3 decision enumerator** on 42_closure_inline: a
+call-free closure (`d / (x - 3) + 1000`) whose #112 capture base the
+deviation put in `rdx` aborted in REGTRACK at the division guard's
+`lea rdx, [rcx+1]` - "write to a PINNED register with no borrow and no
+declaration".
+
+**Cause.** The division calls `reg_pin_conflict(RDX)` before its raw
+writes. For a cache pin that erases the entry and gives the register
+back, flags the conflict, and the doomed attempt finishes emitting and
+re-emits with `rdx` denied. The W6 caller-saved capture base is a pin
+too - `reg_holds_pin` answers yes for it - but it has no cache entry,
+so the conflict flagged it and left it holding the register, and the
+tracker judged the next ISA write a clobber. A release build has no
+tracker and retried correctly; the checked builds aborted on an attempt
+that was going to be discarded. **No wrong answer was reachable** - the
+attempt that stands never holds a conflicted register.
+
+**Fix.** `reg_pin_conflict` ends the capture base's live range
+(`capbase_live = false`) and gives its register back, like an evicted
+cache pin. The retry's `ra.denied` (from `g_jit_pins_denied`) then keeps
+the base off `rdx`. Emitted code unchanged in every configuration a
+default pick reaches. **Net:** the enumerator over `tests/functional`
+(the `<lambda>@42/gp#2` deviation aborted before, passes after).
