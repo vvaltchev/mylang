@@ -1,0 +1,32 @@
+# INT-CONFIGS: default ; MYLANG_INT_CHOOSE=fib$0/unroll=0,trib$0/unroll=3
+#
+# INT test (#107 P3): the inliner's RECURSION UNROLL depth is an
+# enumerated decision (`unroll_choice`, key `<fn>/unroll`). The cost model
+# picks 2 levels for fib and 1 for tribonacci; every depth up to the cap
+# is legal, so the second configuration forces the extremes (none for
+# fib, three for trib) and the asserts below must still hold - keyed
+# by the instances that run (`fib$0`; the template base never does). The
+# per-frame pure-call cache the unroll relies on stays on.
+
+func fib(n) {
+    if (n < 2) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+func trib(n) {
+    if (n < 3) return n;
+    return trib(n - 1) + trib(n - 2) + trib(n - 3);
+}
+var a = fib(int(runtime(20)));
+var b = trib(int(runtime(15)));
+print(a, b);
+assert(a == 6765 && b == 4841);
+
+var ev = int_events("unroll_choice");
+foreach (e in ev) print(e);
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+assert(has(ev, "/unroll\" n=4 dflt=2"));
+assert(has(ev, "/unroll\" n=4 dflt=1"));

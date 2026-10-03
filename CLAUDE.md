@@ -572,7 +572,7 @@ several LEGAL answers asks `int_choose(key, n, dflt)` (inttest.h) and
 records a `reg_choice` instance; `MYLANG_INT_CHOOSE=key=idx` forces an
 alternative, and tier 1 re-runs every program once per alternative of
 every instance, requiring the tree-walker's stdout, stderr AND exit
-code (RULE 2 - a caret or backtrace is observable). Six sites today:
+code (RULE 2 - a caret or backtrace is observable). Seven sites today:
 `reg_choice` (every register pick), `pin_budget` (a run's pin cap),
 `spill_choice` (which piece loses its register in the linear scan's
 pressure contest) and `flit_choice` (the float literal pool: its cost
@@ -580,7 +580,10 @@ gate, and each literal it would hold), keyed by RUN (`<fn>@<begin
 pc>/...`); `splice_choice` (the bytecode inlining of a site) and
 `inline_choice` (an AST inline), keyed by CALL SITE
 (`<caller>/splice@L:C`, `<caller>/inline@L:C`) - declining is always
-legal, so each decline is RULE 2 checked at that one site. **Correctness must
+legal, so each decline is RULE 2 checked at that one site; and
+`unroll_choice` (a pure tree-recursive function's unroll depth, any of
+0..REC_UNROLL_MAX, keyed `<fn>/unroll` - the instance, `fib$0`, is the
+one that runs). **Correctness must
 not depend on which legal register the allocator picks** - its first
 run found five JIT bugs the default picks never reach. Run it on the
 FAST lane: `make OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1
