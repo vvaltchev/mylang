@@ -301,6 +301,42 @@ jobs:
     - name: driver_checks
       run: MYLANG_EXPECT_INT_TESTS=1 sh tests/driver_checks.sh ./build-int/mylang
 
+  # ---------------------------------------------------------------- #
+  # The #107 P3 DECISION ENUMERATOR, tier 1: every legal alternative of
+  # every register pick a default run makes, over tests/functional,
+  # against the tree-walker. Correctness must not depend on which legal
+  # register the allocator picks - its first run found five JIT bugs no
+  # default pick reaches. The FAST lane (optimized, ASSERTS on so the
+  # REGTRACK net and the ML_CHECKs stay live, LTO off for the build
+  # time): ~40 s locally for the whole corpus.
+  # ---------------------------------------------------------------- #
+  int-enum:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build (INT_TESTS, optimized, asserts on)
+      run: |
+        cmake -S $GITHUB_WORKSPACE -B build-enum -DINT_TESTS=ON \
+              -DCMAKE_BUILD_TYPE=Release -DASSERTS=ON -DLTO=OFF
+        cmake --build build-enum -j
+    # THE VACUITY GUARD: an enumerator run on a build without the hooks
+    # (or without the tracker) would answer "0 failures" doing nothing
+    - name: "assert -v reports int_tests 1, asserts 1"
+      run: |
+        ./build-enum/mylang -v | grep -q '^  int_tests  *1'
+        ./build-enum/mylang -v | grep -q '^  asserts  *1'
+    - name: tests/int_enum.py (tier 1, tests/functional)
+      run: |
+        python3 tests/int_enum.py ./build-enum/mylang --heartbeat 60 \
+                --failures-out int-enum-failures.txt
+    - name: Upload the failures
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: int-enum-failures
+        path: int-enum-failures.txt
+        if-no-files-found: ignore
+
   myv-fuzz:
     runs-on: ubuntu-latest
     strategy:
