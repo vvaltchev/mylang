@@ -1,0 +1,70 @@
+# INT-ENGINES: default
+# INT-CONFIGS: MYLANG_INT_CHOOSE=main/fp#0=11 ; MYLANG_INT_CHOOSE=main/fp#1=9 ;
+#   MYLANG_INT_CHOOSE=main/fp#0=1 ; MYLANG_INT_CHOOSE=main/fp#0=11,main/fp#1=0
+#
+# INT test (#107 P3, an enumerator finding): the float STAGING PAIR is not
+# the float ABI. Forcing main's first float pick off xmm0 moves the stage
+# (fp#0), forcing the second onto an xmm8-15 register needs REX forms
+# (fp#1), the other two configurations reach the libm marshalling's
+# exact swap (stage in xmm1/xmm0) and its b-in-xmm0 arm; every op that
+# calls libm or a C++ helper with a float argument
+# must then marshal xmm0/xmm1 itself, inside the call bracket - and seven
+# sites did not (docs/jit-optimizations.md, "THE FLOAT STAGE IS NOT THE
+# FLOAT ABI"). The values are the oracle; the `reg_choice` check proves
+# the forced pick was taken, so a drifted key fails instead of passing
+# vacuously. tests/functional/59_float_abi_calls.my is the same program
+# for corpus_diff and the enumerator.
+var a = 0.5;
+var b = 1.25;
+var c = 3.0;
+var n = int(runtime(40));
+for (var i = 0; i < n; i++) {
+    a = a + 0.25;
+    b = b * 1.01;
+    c = c % 1.7 + a;
+    a = a % 2.5;
+    b = b + pow(a, 2.0) * 0.01 + sqrt(b) * 0.001;
+    c = c + exp(0.01) - floor(c) * 0.0;
+    c = c + log(b) * 0.0001;
+}
+print(a, b, c);
+var f = [0.0, 0.0, 0.0, 0.0];
+var s = 0.0;
+for (var i = 0; i < 4; i++) {
+    f[i] = s;
+    s = s + 1.5;
+    f[i] %= 1.1;
+}
+print(f);
+var z = 0.0;
+for (var i = 0; i < n; i++) {
+    z = z + 0.5;
+    if (z / 2.0 > 100.0) { z = 0.0; }
+    var w = z % 3.0;
+    z = z + w * 0.0;
+}
+print(z);
+var g = [1.0, 2.0, 3.0, 4.0];
+var d = 1.0;
+for (var i = 0; i < 4; i++) {
+    d = d + 0.5;
+    g[i] /= d;
+    g[i] += d * 0.25;
+}
+print(g, d);
+
+# a forced pick shows as an instance whose pick is not its default
+func field(e, name) {
+    var parts = split(e, " ");
+    foreach (p in parts)
+        if (startswith(p, name + "="))
+            return p[len(name) + 1:];
+    return "";
+}
+var forced = false;
+foreach (e in int_events("reg_choice"))
+    if (find(e, "key=\"main/fp#") != none
+            && field(e, "pick") != field(e, "dflt"))
+        forced = true;
+print(forced);
+assert(forced);
