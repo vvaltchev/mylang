@@ -12,6 +12,9 @@
 07_nested_loops          16
 08_func_call             28
 09_fib_recursive         44
+100_funcval_dispatch4    18
+101_float_call           1
+102_call_outer_hot_inner 1
 10_recursion_deep        12
 11_closure_counter       35
 12_higher_order          7
@@ -60,7 +63,7 @@
 55_float_sum             5
 56_sieve_bool            6
 57_bool_reduce           11
-58_structs               20
+58_structs               46
 59_bit_hash              16
 60_bit_sieve             32
 61_popcount              30
@@ -91,6 +94,8 @@
 86_elem_arith_compound   61
 87_elem_shift_compound   103
 88_elem_float_compound   17
+89_regs_float_08         1
+90_struct_field_store    1
 91_call_from_function    6
 92_recursion_with_helper 5
 93_mutual_recursion      8
@@ -98,4 +103,5 @@
 95_recursion_with_builtin 4
 96_find_sum_key          10
 97_regs_int_call         10
-100_funcval_dispatch4    18
+98_local_closure_call    1
+99_factory_two_closures  1
