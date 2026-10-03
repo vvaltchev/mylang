@@ -9043,11 +9043,28 @@ static const JitCtx *g_cur_jc = nullptr;
 
 /* #107: a function's name as a backtrace renders it, for INT events */
 #ifdef INT_TESTS
+/* the chunk being compiled - for a site whose emitter is not handed it */
+static const Chunk *g_int_chunk = nullptr;
+
 static std::string jit_int_fn_name(const FuncDescriptor *d)
 {
     return !d ? std::string("?")
          : !d->display_name.empty() ? d->display_name
          : d->name ? std::string(d->name->val) : std::string("<lambda>");
+}
+static std::string jit_int_func()
+{
+    return g_cur_caller_desc ? jit_int_fn_name(g_cur_caller_desc) : "main";
+}
+/* a slot by its source name: a local's name, `tN` for the Nth temp */
+static std::string jit_int_var_name(const Chunk &ck, int slot)
+{
+    if (slot >= ck.slot_count)
+        return "t" + std::to_string(slot - ck.slot_count);
+    std::string v;
+    if (slot >= 0 && static_cast<size_t>(slot) < ck.slot_names.size())
+        v = ck.slot_names[static_cast<size_t>(slot)];
+    return v.empty() ? "r" + std::to_string(slot) : v;
 }
 #endif
 
@@ -13915,6 +13932,9 @@ static void store_dst(Emitter &e, const Chunk &ck, uint8_t src_reg,
     if (reflisted && e.relok(dst))
         g_jit_relent_stores++;           /* C5: this store dropped its test */
 #endif
+    ML_INT_ONLY(if (reflisted && e.relok(dst))
+                    ML_INT(guard_elided, "store", jit_int_func(),
+                           jit_int_var_name(ck, dst));)
     if (reflisted && !e.relok(dst)) {
         const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE,
                                               RCX,  /* reg:proto */
@@ -13977,6 +13997,9 @@ static void store_dst_bool(Emitter &e, const Chunk &ck, uint8_t src_reg, int dst
     if (reflisted && e.relok(dst))
         g_jit_relent_stores++;           /* C5: this store dropped its test */
 #endif
+    ML_INT_ONLY(if (reflisted && e.relok(dst))
+                    ML_INT(guard_elided, "store", jit_int_func(),
+                           jit_int_var_name(ck, dst));)
     if (reflisted && !e.relok(dst)) {
         const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE,
                                               RCX,  /* reg:proto */
@@ -14519,6 +14542,9 @@ static bool jit_fwd_consumer(const Instr &nx, int t)
  */
 static uint8_t emit_fwd_bump(Emitter &e, bool local)
 {
+    ML_INT_ONLY(if (g_int_chunk)
+                    ML_INT(forward, jit_int_func(),
+                           jit_int_var_name(*g_int_chunk, g_fwd.in_temp));)
 #ifdef TESTS
     e.bump_counter(&g_jit_fwd);
     if (local) {
@@ -18684,6 +18710,9 @@ static void emit_float_store(Emitter &e, const Chunk &ck, uint8_t xr,
     if (reflisted && e.relok(dst))
         g_jit_relent_stores++;           /* C5: this store dropped its test */
 #endif
+    ML_INT_ONLY(if (reflisted && e.relok(dst))
+                    ML_INT(guard_elided, "store", jit_int_func(),
+                           jit_int_var_name(ck, dst));)
     if (reflisted && !e.relok(dst)) {
         const size_t jb_fast = emit_ref_check(e, a.type, JC_REFSTORE);
 #ifdef TESTS
@@ -26637,6 +26666,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 #ifdef TESTS
             e.bump_counter(&g_jit_member_noguard);
 #endif
+            ML_INT(guard_elided, "member", jit_int_func(),
+                   jit_int_var_name(ck, in.target2));
             e.load(acc.r, b.payload);            /* rax = StructObject* */
             emit_field_read();
             return true;
@@ -29099,15 +29130,7 @@ static void jit_int_flush_pins(const Chunk &chunk,
         const int slot = code >> 9;
         const int reg = code & 0xff;
         const bool fp = (code & 0x100) != 0;
-        std::string var;
-        if (slot < chunk.slot_count) {
-            if (static_cast<size_t>(slot) < chunk.slot_names.size())
-                var = chunk.slot_names[static_cast<size_t>(slot)];
-            if (var.empty())
-                var = "r" + std::to_string(slot);
-        } else {
-            var = "t" + std::to_string(slot - chunk.slot_count);
-        }
+        const std::string var = jit_int_var_name(chunk, slot);
         ML_INT(pin, func, var,
                fp ? "xmm" + std::to_string(reg) : std::string(gp[reg & 15]));
     }
@@ -29116,6 +29139,7 @@ static void jit_int_flush_pins(const Chunk &chunk,
 
 void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 {
+    ML_INT_ONLY(g_int_chunk = &chunk;)
     if (jit_map_wanted())
         g_jit_annotate = true;
     /* captured HERE: the placement site below runs after

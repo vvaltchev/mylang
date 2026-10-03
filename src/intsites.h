@@ -53,4 +53,13 @@
     /* the named function(s) (`a|b` for a two-way site, `?` unknown).     */ \
     X(call_tier, "the JIT chose a call site's protocol",                      \
       F(std::string, tier) F(std::string, callee)                            \
-      F(int64_t, line) F(int64_t, col))
+      F(int64_t, line) F(int64_t, col)) \
+    /* Lever A FORWARDED a value to its consumer in a register instead of */ \
+    /* through its slot: `var` the slot (a local's name, `tN` a temp).    */ \
+    X(forward, "the JIT forwarded a value in a register",                     \
+      F(std::string, func) F(std::string, var))                              \
+    /* The JIT ELIDED a reference guard: `kind` store (C5: a ref-listed   */ \
+    /* slot's store dropped its release test) or member (C4d: a proven    */ \
+    /* struct's member read dropped its type guard); `var` the slot.      */ \
+    X(guard_elided, "the JIT elided a reference guard",                       \
+      F(std::string, kind) F(std::string, func) F(std::string, var))

@@ -25,8 +25,12 @@ helpers excluded): 114,495 elements, 32,433 uncovered (gcc 16.2).
 (`typed_params`) while the same callee through a value call does; a value
 call inside a template INSTANCE gets no callee set (only the base's site
 is analysed, as top).
-Remaining P2: the forwarding and guard-elision sites, and moving the
-existing shape tests' vacuity guards onto the ledger.
+P2 PART 2 DONE the same day: `forward` (lever A, at `emit_fwd_bump`, the
+one consumer path) and `guard_elided` (C5 store tests at the three
+`store_dst*` points, C4d member guards), with `06_forward_guards`; every
+new site's test watched failing. Remaining P2: moving the existing `-rt`
+shape tests' vacuity guards onto the ledger (they count lever counters
+today, which say "ran somewhere", not "ran HERE").
 
 ## 0. What already exists (P0)
 
