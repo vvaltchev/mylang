@@ -16792,3 +16792,32 @@ recursion - and G1 rightly admits it now; the case keeps its intent
 function value. Pinned by a new `jit_frameless_calling` case (a linear
 self recursion called from a function), watched VACUOUS with the gate
 reverted.
+
+## FIVE RAISING OPS MISSED THE INLINE-CHAIN STAMP (RULE 2, 2026-10-02)
+
+**Found by the first intrusive test** (#107 P1, `tests/int/01_inline_ast.my`):
+its own failing assertion printed a backtrace with a phantom frame. With
+the JIT, an op raising AFTER an inlined call in the same fragment rendered
+`[0] dbl(x)` where `-nj`, `-tw` and `-ni` render no such frame.
+
+**Cause.** A whole body is one fragment whose interpreted originals are
+deleted (#56), so every op's pc collapses onto the head `EnterNative`. The
+raise path (`vm_flush_inline_walk`) therefore prefers the chain the
+FRAGMENT baked into `Exception::jit_inline_frame` - a chain, or `-2` for
+"not inlined code" - and only falls back to `inline_frame_at(pc)` when
+nothing was baked; on a collapsed pc that lookup returns whichever inlined
+op shares it. Five ops whose helper stamps its own CARET from a pool
+conveyed with no stamp at all, so they took the fallback:
+`CallBuiltinV` (`assert`, any throwing builtin), `MemberV` (a `dyn` member
+read), `LoadGlobalV`, `ThrowRuntimeV`, and the compound global/capture
+store. Each now emits `emit_exc_chain_stamp` (chain-only, and nothing in a
+chunk with no inlined code) before its exit. `CallValueGenericV` is not in
+the list on purpose: a raise from inside its callee goes through the
+call-site flush, which has its own mechanism.
+
+**How the five were found:** a scan for every emitted `exit_pc` with no
+stamp in reach, then one program per candidate raising after an inlined
+call, compared across the three engines - two reproduced (`assert`, the
+member read), the scan named the other three. **Net:**
+`tests/bt_oracle/after_inline_op_raise.my` (every inlining-on
+configuration against `-ni -tw`); watched failing on the pre-fix build.

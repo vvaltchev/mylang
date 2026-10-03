@@ -23515,6 +23515,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
         {
             const size_t j_ok = e.j8(0x74);   /* jz -> continue (0 = ok) */
+            emit_exc_chain_stamp(e, ck, old_pc);  /* #88: the op's chain */
             e.exit_pc(pc);                    /* bail: interpreter re-throws */
             e.patch8(j_ok, e.pos());
         }
@@ -25122,6 +25123,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.movabs(RDI, reinterpret_cast<uint64_t>(&ck.throws[in.target]));
         e.call_direct(reinterpret_cast<const void *>(jit_throw_runtime));
         emit_call_epilogue(e);
+        emit_exc_chain_stamp(e, ck, old_pc);  /* #88: the op's chain */
         e.exit_pc(pc);
         return true;
 
@@ -26010,6 +26012,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
         const size_t j_ok_cb = e.j8(0x74);
+        emit_exc_chain_stamp(e, ck, old_pc);  /* #88/RULE 2: the op's inlined-at chain (or its absence), so a raise
+           * from a deleted run cannot borrow a collapsed neighbour's */
         e.exit_pc(pc);
         e.patch8(j_ok_cb, e.pos());
         return true;
@@ -26214,6 +26218,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             emit_call_epilogue(e);
             e.test32_rr(RAX, RAX);             /* test eax, eax; reg:abi */
             const size_t j_ok = e.j8(0x74);
+            emit_exc_chain_stamp(e, ck, old_pc);  /* #88: the op's chain */
             e.exit_pc(pc);
             e.patch8(j_ok, e.pos());
             return true;
@@ -26664,6 +26669,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);             /* test eax, eax; reg:abi */
         const size_t j_ok = e.j8(0x74);
+        emit_exc_chain_stamp(e, ck, old_pc);  /* #88/RULE 2: the op's inlined-at chain (or its absence), so a raise
+           * from a deleted run cannot borrow a collapsed neighbour's */
         e.exit_pc(pc);                      /* threw -> EnterNative re-raises */
         e.patch8(j_ok, e.pos());
         return true;
