@@ -1273,10 +1273,33 @@ vm_num_binop(EvalValue &a, const EvalValue &b, Op aop)
 #  define ML_CGOTO 1
 #endif
 
+#ifdef INT_TESTS
+/*
+ * #107 P4 - THE VM STATE CHECKER (every INT build, every op - no switch:
+ * a runtime switch would put a never-taken branch at every dispatch, and
+ * the plan's bar is every op of every INT run).
+ * At EVERY op boundary of interpreted execution, the frame is checked
+ * against what the compiler proved: a slot NOT in the chunk's ref_slots
+ * holds no reference (the release scans skip such a slot, and a scalar
+ * store into it overwrites without releasing - so a reference there is a
+ * leak the moment it happens, found here at the op that put it there, not
+ * at the frame pop the VM_HARDENING audit looks at), and a `borrowed` slot
+ * holds a non-slice reference (#94's two runtime declines). A violation
+ * aborts naming the function, the pc and the slot.
+ */
+
+static void int_vm_state_check(const Chunk &ck, const EvalContext &ctx,
+                               size_t pc) noexcept;
+#define VM_INT_STATE() int_vm_state_check(*chunk, ctx, pc)
+#else
+#define VM_INT_STATE() ((void)0)
+#endif
+
 #ifdef ML_CGOTO
 #  define VM_CASE(N)  lbl_##N
-#  define VM_NEXT     goto *vm_optbl[static_cast<size_t>(                    \
-                          (in = &code[pc])->op)]
+#  define VM_NEXT     do { VM_INT_STATE();                                   \
+                           goto *vm_optbl[static_cast<size_t>(               \
+                               (in = &code[pc])->op)]; } while (0)
    /* A VM_NEXT that must EXIT a scope holding live non-trivially-
     * destructible locals (the call ops' cross-frame exception dispatch).
     * clang forbids an INDIRECT goto from exiting such a scope (it cannot
@@ -1306,6 +1329,51 @@ static bool g_vm_executing = false;
  * (the VM is not used in the REPL).
  */
 static std::unordered_map<const FuncDescriptor *, Chunk> g_func_chunks;
+
+#ifdef INT_TESTS
+static void int_vm_state_fail(const Chunk &ck, size_t pc, int slot,
+                              const char *what) noexcept
+{
+    const char *fn = "main";
+    for (const auto &kv : g_func_chunks)
+        if (&kv.second == &ck && kv.first->name)
+            fn = kv.first->name->val.c_str();
+    std::fprintf(stderr, "INT-VMSTATE: %s, pc %zu, slot %d: %s\n", fn, pc,
+                 slot, what);
+    std::abort();
+}
+
+static void int_vm_state_check(const Chunk &ck, const EvalContext &ctx,
+                               size_t pc) noexcept
+{
+    const Frame *fr = ctx.frame;
+    if (!fr)
+        return;
+    const int n = std::min(fr->size, ck.slot_count + ck.n_temps);
+    size_t ri = 0;                       /* ref_slots is sorted */
+    for (int i = 0; i < n; i++) {
+        while (ri < ck.ref_slots.size() && ck.ref_slots[ri] < i)
+            ri++;
+        const bool listed = ri < ck.ref_slots.size()
+                            && ck.ref_slots[ri] == i;
+        const LValue &lv = fr->slots[i];
+        const EvalValue &v = lv.get();
+        const bool ref = v.get_type()->t >= Type::t_str;
+        if (ref && !listed)
+            int_vm_state_fail(ck, pc, i, "holds a reference but is not in "
+                                         "ref_slots");
+        if (lv.jit_borrowed_probe()) {
+            if (!ref)
+                int_vm_state_fail(ck, pc, i, "is borrowed but holds no "
+                                             "reference");
+            if (v.is<SharedArrayObj>()
+                    && v.get_ref<SharedArrayObj>().is_slice())
+                int_vm_state_fail(ck, pc, i, "is borrowed but holds a "
+                                             "slice");
+        }
+    }
+}
+#endif
 
 static void vm_precompile_all(const Block *root, bool jit = true,
                               Chunk *main_chunk = nullptr);
@@ -2716,8 +2784,6 @@ VmProgram::VmProgram(VmProgram &&o) noexcept
 VmProgram &VmProgram::operator=(VmProgram &&o) noexcept
 {
     if (this != &o) {
-        for (const auto &f : funcs)          /* as the destructor does */
-            g_func_chunks.erase(f.get());
         root = std::move(o.root);
         root_slot_count = o.root_slot_count;
         global_func_names = std::move(o.global_func_names);
@@ -11311,6 +11377,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
 #else
     for (; ; ) {
 
+        VM_INT_STATE();
         in = &code[pc];
 
         switch (in->op) {

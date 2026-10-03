@@ -602,7 +602,16 @@ free lists, so LeakSanitizer cannot see such a leak - this can (watched:
 a frame release that dropped closures without releasing them). A
 `VmProgram` now erases its function chunks from the process-global
 chunk map when destroyed (they kept their constants alive past the
-program).
+program). **THE VM STATE CHECKER runs on EVERY op of EVERY INT run**
+(`int_vm_state_check`, at each dispatch in vm.cpp - no switch, since a
+runtime switch would leave a never-taken branch at every `VM_NEXT`): a
+slot not in the chunk's `ref_slots` holding a reference, or a `borrowed`
+slot holding no reference or a slice, aborts with `INT-VMSTATE: <fn>, pc
+N, slot S: ...` at the op that caused it. Watched: removing the catch
+bind slots from `ref_slots` (the #78 step D gap) is caught at its pc,
+where an assert-on, hardening-off run printed the right answer. A hook
+in the dispatch loop must be `noexcept` (an exception edge per dispatch
+is a coverage-universe branch) and named `int_*`.
 **Long runs use `tests/testrun.py`** (a `Run`: heartbeat, a unix
 control socket - `tests/testctl.py status|stop|pause|jobs N` - and
 resume by a low-water-mark token); a new multi-minute tool should

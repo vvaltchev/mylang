@@ -42,13 +42,17 @@
 #        --require-floor a compiler with no line fails, naming the count to
 #        record.
 #
-# 5. THE OBJECT CENSUS (P4): every tests/int run, and every program of the
-#    corpus (tests/functional + the non-interactive samples) under the
-#    default engine and the tree-walker, runs with MYLANG_INT_CENSUS=1 and
-#    fails on a `census LEAK` line - a runtime heap object (str, arr, dict,
-#    struct, func, exc) still alive after the program, which LeakSanitizer
-#    cannot see for a POOLED object. `-rt` is exempt: the harness retains
-#    its programs on purpose.
+# 5. THE OBJECT CENSUS and THE VM STATE CHECKER (P4): every tests/int run,
+#    and every program of the corpus (tests/functional + the
+#    non-interactive samples) under the default engine, -nj and the
+#    tree-walker, runs with MYLANG_INT_CENSUS=1 (the state checker runs on
+#    every op of every INT run, -rt included) and fails on a `census LEAK`
+#    line - a runtime heap object (str, arr,
+#    dict, struct, func, exc) still alive after the program, which
+#    LeakSanitizer cannot see for a POOLED object - or an `INT-VMSTATE`
+#    abort (a frame slot contradicting what the compiler proved, at the op
+#    boundary where it happened). `-rt` is exempt: the harness retains its
+#    programs on purpose.
 #
 # Deterministic: no seeds, no sampling, a fixed unit order. The random-
 # program fuzzers never run an INT binary (plan section 7).
@@ -397,7 +401,7 @@ def main():
                            for c, extra in group]
                 for (c, extra), r in zip(group, results):
                     for l in r[2].splitlines():
-                        if l.startswith("census LEAK"):
+                        if l.startswith(("census LEAK", "INT-VMSTATE")):
                             ok = False
                             fails.append("`%s`: %s" % (" ".join(c), l))
                 if name == "-rt":
@@ -456,17 +460,17 @@ def main():
         corpus += [os.path.join(ROOT, "samples", s) for s in CENSUS_SAMPLES]
         leaks = 0
         for prog in corpus:
-            for eng in ([], ["-tw"]):
+            for eng in ([], ["-nj"], ["-tw"]):
                 r = run([binary] + eng + [prog],
                         dict(env, MYLANG_INT_CENSUS="1"), args.timeout)
                 for l in r[2].splitlines():
-                    if l.startswith("census LEAK"):
+                    if l.startswith(("census LEAK", "INT-VMSTATE")):
                         leaks += 1
                         failures.append("census: %s %s: %s" % (
                             " ".join(eng) or "default",
                             os.path.relpath(prog, ROOT), l))
-        print("  object census: %d corpus program(s) x 2 engines, %d leak "
-              "line(s)" % (len(corpus), leaks))
+        print("  object census + VM state: %d corpus program(s) x 3 "
+              "engines, %d finding(s)" % (len(corpus), leaks))
 
         totals = {}
         if os.path.exists(census):
