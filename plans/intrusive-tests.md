@@ -402,8 +402,13 @@ assertions on values.
   `unroll_choice`, the inliner's recursion unroll depth (any depth to
   REC_UNROLL_MAX is legal; tests/int/13_unroll.my forces fib to 0 and
   tribonacci to 3, every depth changes the tree, 21 corpus deviations
-  all agree). NOT built yet: tiers 2-3 (pairs of deviations), the
-  call-tier site.
+  all agree). Then the CALL TIER: `frameless_choice` - a site the JIT
+  would make frameless takes the push (always legal), asked inside the
+  one predicate the site, the fusion decision and the pre-passes share,
+  so a forced decline is consistent; tests/int/14_frameless.my forces
+  two sites, and the CI corpus gains 239 deviations, all agree (shown
+  live and clean, like spill_choice: no sabotage found that only a
+  forced push reaches). NOT built yet: tiers 2-3 (pairs of deviations).
 - **P4 - VM state checker + object census.**
   **STATUS (2026-10-03): the OBJECT CENSUS is built** - per-kind
   counters at the pooled `operator new/delete`, `int_live(kind)`,

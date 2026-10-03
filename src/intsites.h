@@ -111,4 +111,9 @@
     /* the inline budget still bound the growth. `key` is `<fn>/unroll`. */ \
     /* resolver.cpp, rec_unroll_depth.                                   */ \
     X(unroll_choice, "the recursion unroll depth of a function",         \
+      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick)) \
+    /* An ENUMERATED decision: a call site the JIT would make FRAMELESS */ \
+    /* - 0 frameless, 1 the general push. `key` is `frameless@L:C`, the */ \
+    /* site's source position. jit.cpp, jit_frameless_candidates.      */ \
+    X(frameless_choice, "a call site's frameless tier (0 take, 1 push)", \
       F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))
