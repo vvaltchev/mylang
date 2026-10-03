@@ -4,7 +4,8 @@
 disasmcheck.py - is `-vdj` DECODING CORRECTLY, judged by a second
                  disassembler?
 
-    scripts/disasmcheck.py BINARY [--matrix] [-v]
+    scripts/disasmcheck.py BINARY [--matrix] [--env K=V[,K=V...]]...
+                           [--only FILE]... [-v]
 
 ⛔ WHY THIS EXISTS, AND WHY THE EXISTING NETS CANNOT REPLACE IT.
 
@@ -44,6 +45,18 @@ arena configurations, every pin-pool rotation, and a range of pin
 budgets - because a register only reachable at a high budget is
 precisely the one whose REX-prefixed encoding nothing has ever decoded
 (the r9 lesson, one level down).
+
+`--env K=V[,K=V...]` adds ONE more configuration with that environment
+(repeatable). It is how a run reaches what no matrix axis does - an
+intrusive-test build's forced picks (`MYLANG_INT_CHOOSE`), which put a
+float stage in xmm8-15 and so emit the REX-prefixed SSE forms no default
+run produces (`pxor xmm10, xmm10` was undecoded for exactly that
+reason). `--only FILE` restricts the corpus (repeatable), since a forced
+pick names a site in ONE program.
+
+Beyond the mnemonic, the XMM REGISTERS are compared in order: an SSE
+form whose REX.R/REX.B we dropped decodes to the right mnemonic on the
+wrong register (`xmm1` for `xmm9`), which a mnemonic-only check passes.
 """
 
 import os
@@ -55,6 +68,7 @@ CORPUS_DIRS = [("bench/my", ".my"), ("samples", ""),
                ("tests/functional", ".my")]
 
 INSN = re.compile(r'^\s+\.\s+\+\s*(\d+):\s+\{([0-9a-f]+)\}\s+(.*?)\s*$')
+XMM = re.compile(r'\bxmm\d+\b')
 OBJD = re.compile(r'^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*(.*?)\s*$')
 
 
@@ -195,7 +209,8 @@ def check(binary, env, files, verbose):
                           % (path, off, len(hx) // 2, mn, olen, omn))
                     break
                 a, b = norm(mn), norm(omn)
-                if a.split(' ')[0] != b.split(' ')[0]:
+                if a.split(' ')[0] != b.split(' ')[0] \
+                        or XMM.findall(a) != XMM.findall(b):
                     bad_mn += 1
                     if verbose or bad_mn <= 20:
                         print("MNEMONIC %s +%d: {%s} we %-28r objdump %r"
@@ -204,10 +219,26 @@ def check(binary, env, files, verbose):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith('-')]
+    argv = sys.argv[1:]
+    extra, only, args = [], [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('--env', '--only') and i + 1 < len(argv):
+            if a == '--env':
+                kv = dict(x.split('=', 1) for x in argv[i + 1].split(','))
+                extra.append((kv, argv[i + 1]))
+            else:
+                only.append(os.path.abspath(argv[i + 1]))
+            i += 2
+            continue
+        if not a.startswith('-'):
+            args.append(a)
+        i += 1
     if not args:
         print(__doc__.strip().split('\n')[2], file=sys.stderr)
-        print("usage: disasmcheck.py BINARY [--matrix] [-v]",
+        print("usage: disasmcheck.py BINARY [--matrix] "
+              "[--env K=V[,K=V...]]... [--only FILE]... [-v]",
               file=sys.stderr)
         return 2
     binary = args[0]
@@ -221,14 +252,20 @@ def main():
               "binutils.", file=sys.stderr)
         return 2
     files = corpus()
+    if only:
+        files = [f for f in files if os.path.abspath(f) in only]
+        if not files:
+            print("error: --only matched no corpus file", file=sys.stderr)
+            return 2
 
     envs = [({}, 'default')]
     if '--matrix' in sys.argv:
         envs.append(({'MYLANG_NO_LOWMEM': '1'}, 'no-lowmem'))
-        for r in range(7):
+        for r in range(16):
             envs.append(({'MYLANG_JIT_XROT': str(r)}, 'xrot=%d' % r))
         for p in (4, 6, 8, 10, 11):
             envs.append(({'MYLANG_JIT_MAXPINS': str(p)}, 'maxpins=%d' % p))
+    envs.extend(extra)
 
     tl = tm = ti = tf = tw = 0
     for env, name in envs:

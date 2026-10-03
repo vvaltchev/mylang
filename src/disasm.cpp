@@ -1141,6 +1141,13 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
                                         * merge-dependency break; always
                                         * reg-reg, dst == src) */
             xmm_rm(rm); MN("xorps"); A(dop_xmm(regf)); A(rm); }
+        else if (o2 == 0xEF && pf_66) {  /* pxor (66 [REX] 0F EF /r):
+                                        * the float divisor's zero test
+                                        * (`pxor fsb, fsb` before the
+                                        * ucomisd). Without 66 it is the
+                                        * MMX form, which the JIT never
+                                        * emits - left undecoded. */
+            xmm_rm(rm); MN("pxor"); A(dop_xmm(regf)); A(rm); }
         else if (o2 == 0x10 || o2 == 0x11 || o2 == 0x51) {
             xmm_rm(rm);
             MN(o2 == 0x51 ? "sqrtsd" : "movsd");

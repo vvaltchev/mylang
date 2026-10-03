@@ -85,7 +85,8 @@ them means anything:**
 - **`-vdj`** (disasm.cpp) - what machine code was emitted. Oracle:
   **`scripts/disasmcheck.py`**, which cross-checks EVERY emitted
   instruction against **objdump** - both the BOUNDARIES (a wrong length
-  desynchronises the rest of the fragment) and the mnemonics; plus the
+  desynchronises the rest of the fragment), the mnemonics and the xmm
+  registers; plus the
   self-report `DUMP IS UNRELIABLE` and the `-rt` entry
   `jit: -vdj decodes every emitted form, address-free`.
   **⛔ THE SELF-REPORT IS NOT ENOUGH AND CANNOT BE.** It counts `.byte`
@@ -98,8 +99,11 @@ them means anything:**
   claiming a length it had not earned. **Every "I do not know" path in
   `decode_one` must end at the single `undecoded:` label**; adding a
   new one that prints a placeholder re-opens the hole. Current status:
-  2,209,682 instructions over the corpus x both arenas x 7 pin
-  rotations x 5 pin budgets, ZERO disagreements. `MYLANG_VDJ_HEX=1`
+  13,268,805 instructions over the corpus x both arenas x 16 pin
+  rotations x 5 pin budgets, ZERO disagreements; `--env K=V` adds a
+  configuration (a forced `MYLANG_INT_CHOOSE` pick is the only way to
+  reach the xmm8-15 SSE forms - `pxor` was undecoded there and in the
+  default run alike until 2026-10-02). `MYLANG_VDJ_HEX=1`
   puts the raw bytes in the dump, which is what makes the check
   possible.
 - **`-vd`** (disasm.cpp) - what bytecode was emitted. Oracle:
