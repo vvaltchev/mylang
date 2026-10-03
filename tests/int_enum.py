@@ -31,7 +31,9 @@
 #   it still fails. Pairs across scopes are not claimed.
 #
 # Each deviation run must print the tree-walker's stdout AND stderr (the
-# caret and backtrace of an uncaught error - RULE 2), exit with its code,
+# caret and backtrace of an uncaught error - RULE 2; with the object
+# census on, so a leaked reference is a stderr difference), exit with its
+# code,
 # and ACTUALLY TAKE the deviation (its dump's `choose_applied` line:
 # int_choose honoured the override, possibly in an emission attempt the JIT
 # then discarded and redid - that redo is the deviation's effect) - a
@@ -72,7 +74,7 @@ from testrun import Run, fingerprint, file_digest  # noqa: E402
 # every ENUMERATED decision site records `<site> key=... n= dflt= pick=`
 CHOICE = re.compile(r'^(?:reg_choice|pin_budget|splice_choice|inline_choice'
                     r'|flit_choice|spill_choice|unroll_choice'
-                    r'|frameless_choice) '
+                    r'|frameless_choice|decline_choice) '
                     r'key="([^"]+)" n=(\d+) dflt=(\d+) pick=(\d+)')
 APPLIED = re.compile(r'^choose_applied key="([^"]+)" pick=(\d+)')
 
@@ -251,7 +253,11 @@ def main():
     jobs = args.jobs or jobs_count()
 
     with tempfile.TemporaryDirectory(prefix="mylang-enum-") as tmp:
-        base_env = dict(os.environ, TMPDIR=tmp)
+        # the OBJECT CENSUS on for every run (P4): a deviation that leaks
+        # a reference prints `census LEAK ...` on stderr, which the
+        # tree-walker's reference run does not - a leak is a failure
+        # even when every value printed is right
+        base_env = dict(os.environ, TMPDIR=tmp, MYLANG_INT_CENSUS="1")
         base_env.pop("MYLANG_INT_CHOOSE", None)
 
         # DISCOVERY: each program's tree-walker reference and the decision

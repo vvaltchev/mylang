@@ -499,6 +499,26 @@ assertions on values.
   run, so it is a barrier), so it was not added. NOT built: the
   ASSEMBLER (sizing in docs/in-flight-tasks.md §2).
 - **P7 - per-site forcing sweep.**
+  **STATUS (2026-10-03): BUILT, as an enumerated decision.** Every
+  `decline_jump` (31 emitters, the #97 decline ledger's seam) and the
+  three reference checks (`emit_ref_check`, `_jae`, `_jae_chain`) ask
+  `decline_choice` (key `<run>/<guard>@<pc>#<k>`, k an Emitter-local
+  ordinal, so a retry re-asks the same keys); pick 1 forces that one
+  site to its slow tier - the conditional jump plus its inverse to the
+  same pad (an already-unconditional decline asks nothing: inverting
+  0xEB is not a jump, which REGTRACK caught on the first sweep), or the
+  reference compare against 0. tests/int_enum.py's tier 1 IS the
+  sweep: ~5,500 forced sites over the CI corpus, each run against the
+  tree-walker, 0 failures; the enumerator now runs with the OBJECT
+  CENSUS on, so a leak is a failure. 33 of 50 decline reasons are taken
+  by no corpus program on its own - their slow tiers ran for the first
+  time. Watched: a retain placed before the slice-element decline and
+  released on its fall-through (balanced fast path) leaks on 10 forced
+  declines in 6 programs; -rt and every default run stay green.
+  tests/int/15_decline.my reads the site and forces the boxed element
+  read's bounds decline (taken on all 5 iterations). The inline cache's
+  guard (GuardCalleeV, MYLANG_JIT_COLD=guard's arm) is a site too
+  (`guard_miss`); a G1-HOISTED guard's preheader check is not.
 - **CI:** a `int` job in `nets.yml` from P1 on (Debug + ASan, runs
   `int_run.py`); its sweeps sized to the lane's budget.
 

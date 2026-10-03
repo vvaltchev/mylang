@@ -1,0 +1,27 @@
+# INT-ENGINES: default
+# INT-CONFIGS: default ; MYLANG_INT_CHOOSE=main@0/elemv_bounds@11#0=1
+#
+# INT test (#107 P7): every guarded tier's DECLINE is an enumerated
+# decision (`decline_choice`, key `<run>/<guard>@<pc>#<k>`) - pick 1
+# sends that one site to its slow tier for every value, which must
+# change nothing. tests/int_enum.py's tier 1 forces each site of the
+# corpus in turn; this program reads the events and its second
+# configuration forces the boxed element read's bounds decline.
+
+var rows = [[1, 2], "ab", [3], "cde", [4, 5, 6]];
+var n = 0;
+for (var i = 0; i < int(runtime(5)); i++) {
+    var dyn r = rows[i];
+    n = n + len(r);
+}
+print(n);
+assert(n == 11);
+
+var ev = int_events("decline_choice");
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+assert(has(ev, "key=\"main@0/elemv_bounds@11#0\" n=2 dflt=0"));
+assert(has(ev, "/refcheck"));
