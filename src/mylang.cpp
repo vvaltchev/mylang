@@ -18,6 +18,7 @@
 #include "jit.h"
 #include "lowmem.h"
 #include "disasm.h"
+#include "inttest.h"
 
 #include <initializer_list>
 #include <fstream>
@@ -692,6 +693,9 @@ int main(int argc, char **argv)
     try {
 
         parse_args(argc, argv);
+        /* #107 P4: the object census's baseline - after parse_args, which
+         * registers `argv` (a builtin that lives as long as the process) */
+        ML_INT_ONLY(int_census_mark();)
 
         /* Color the trace tags on a stderr TTY (the trace sink is stderr for a
          * script), unless --no-color. Harmless when no category is enabled. */

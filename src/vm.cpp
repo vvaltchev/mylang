@@ -2694,6 +2694,12 @@ vm_execute(const Construct *root_c)
     vm_run(retained.back());
 }
 
+VmProgram::~VmProgram()
+{
+    for (const auto &f : funcs)
+        g_func_chunks.erase(f.get());
+}
+
 /* The move operations rebind the root chunk's baked addresses - see the
  * contract on the struct (vm.h). Out of line: vm.h does not see jit.h. */
 VmProgram::VmProgram(VmProgram &&o) noexcept
@@ -2710,6 +2716,8 @@ VmProgram::VmProgram(VmProgram &&o) noexcept
 VmProgram &VmProgram::operator=(VmProgram &&o) noexcept
 {
     if (this != &o) {
+        for (const auto &f : funcs)          /* as the destructor does */
+            g_func_chunks.erase(f.get());
         root = std::move(o.root);
         root_slot_count = o.root_slot_count;
         global_func_names = std::move(o.global_func_names);

@@ -102,6 +102,34 @@ inline void pool_free_one(void *p, size_t size) noexcept
  */
 #define ML_POOL_NEW_DELETE                                                      static void *operator new(size_t sz) { return pool_alloc_one(sz); }         static void operator delete(void *p, size_t sz) noexcept {                      pool_free_one(p, sz);                                                   }                                                                           static void *operator new(size_t, void *p) noexcept { return p; }           static void operator delete(void *, void *) noexcept {}
 
+/*
+ * #107 P4 - THE OBJECT CENSUS. The same allocation counted per KIND in an
+ * INT_TESTS build, so a test can ask how many of each runtime heap object
+ * are alive (`int_live(kind)`) and the runner can require a program to end
+ * with every count back where it started. Pooled objects are reachable
+ * from the pool's free lists, so LeakSanitizer cannot see one leak; this
+ * can. Outside INT_TESTS the counted form IS the plain one.
+ */
+enum IntObjKind { IOK_STR, IOK_ARR, IOK_DICT, IOK_STRUCT, IOK_FUNC, IOK_EXC,
+                  IOK_N };
+#ifdef INT_TESTS
+extern long long g_int_live[IOK_N];
+#define ML_POOL_NEW_DELETE_K(kind)                                             \
+    static void *operator new(size_t sz)                                       \
+    {                                                                          \
+        ++g_int_live[kind];                                                    \
+        return pool_alloc_one(sz);                                             \
+    }                                                                          \
+    static void operator delete(void *p, size_t sz) noexcept {                 \
+        --g_int_live[kind];                                                    \
+        pool_free_one(p, sz);                                                  \
+    }                                                                          \
+    static void *operator new(size_t, void *p) noexcept { return p; }          \
+    static void operator delete(void *, void *) noexcept {}
+#else
+#define ML_POOL_NEW_DELETE_K(kind) ML_POOL_NEW_DELETE
+#endif
+
 template <typename T>
 struct PoolAlloc {
 

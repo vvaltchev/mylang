@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "eval.h"
+#include "inttest.h"
 #include "vm.h"    /* VmInvoker - the prepared callback invoker */
 #include "vminvoke.h"  /* ...and its inline test() hot path (#84) */
 #include "bitops.h"
@@ -70,6 +71,8 @@ EvalValue builtin_exit(EvalContext *ctx, const ArgLocs *exprList,
     if (!e.is<int_type>())
         throw TypeErrorEx("Expected integer", arg->start, arg->end);
 
+    /* #107 P4: an exit() leaves main's state alive - not a leak */
+    ML_INT_ONLY(int_census_exiting();)
     exit(static_cast<int>(e.get<int_type>()));
 }
 
@@ -743,6 +746,7 @@ EvalContext::SymbolsType EvalContext::builtins =
     /* The intrusive-test builtins (builtins/inttest.cpp.h) - INT builds only */
     make_int_builtin<builtin_int_hits>("int_hits"),
     make_int_builtin<builtin_int_events>("int_events"),
+    make_int_builtin<builtin_int_live>("int_live"),
 #endif
 
     /* Diagnostic tracing (see trace.h) */

@@ -1,0 +1,49 @@
+# INT-ENGINES: default tw
+#
+# INT test (#107 P4): THE OBJECT CENSUS. `int_live(kind)` is how many
+# runtime heap objects of a kind are alive; every closure, struct, dict,
+# array and string a scope builds must be gone once nothing names it.
+# Pooled objects are reachable from the pool's free lists, so
+# LeakSanitizer cannot see one leak - this can. (The runner also checks
+# the whole-program census of every tests/int and corpus run at exit.)
+
+struct P { int x; dyn tag; }
+
+func build(int n) {
+    var fs = [];
+    var ps = [];
+    var d = {};
+    for (var i = 0; i < n; i++) {
+        var k = i * 2;
+        append(fs, func [k] (int y) { return y + k; });
+        append(ps, P(i, [i, "t" + str(i)]));
+        d["k" + str(i)] = [i];
+    }
+    var s = 0;
+    foreach (f in fs) s += f(1);
+    foreach (p in ps) s += p.x + len(p.tag);
+    return s + len(d);
+}
+
+var f0 = int_live("func");
+var s0 = int_live("struct");
+var d0 = int_live("dict");
+var a0 = int_live("arr");
+var r = build(int(runtime(50)));
+print(r);
+assert(r == 3875);
+assert(int_live("func") == f0);
+assert(int_live("struct") == s0);
+assert(int_live("dict") == d0);
+assert(int_live("arr") == a0);
+
+# a caught exception's object is gone once the handler is done
+struct Boom { str why; }
+func thrower(int i) { throw Boom("b" + str(i)); }
+var e0 = int_live("exc");
+var caught = 0;
+for (var i = 0; i < 5; i++) {
+    try { thrower(runtime(i)); } catch (Boom as b) { caught += len(b.why); }
+}
+assert(caught == 10);
+assert(int_live("exc") == e0);

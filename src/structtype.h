@@ -244,7 +244,7 @@ class StructObject : public RefCounted {
 
 public:
 
-    ML_POOL_NEW_DELETE
+    ML_POOL_NEW_DELETE_K(IOK_STRUCT)
 
     StructTypeDef *def = nullptr;
     bool readonly = false;

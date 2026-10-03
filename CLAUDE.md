@@ -588,6 +588,21 @@ BUILD_DIR=build-claude/int-rel` (the whole functional corpus in ~40 s).
 A hook in a product function must be `noexcept` and allocate nothing
 the product sees: `int_enumerate` added an exception edge to every
 `take()` caller and the coverage gate counted it as a new branch.
+**THE OBJECT CENSUS (P4, 2026-10-03).** Each pooled heap object kind
+(str, arr, dict, struct, func, exc) is counted at its class `operator
+new/delete` in an INT build (`ML_POOL_NEW_DELETE_K`, poolalloc.h - the
+plain macro elsewhere); `int_live(kind)` reads a count, and with
+`MYLANG_INT_CENSUS=1` a process prints `census LEAK <kind> base B end E`
+for any kind not back at its baseline (marked in `main` after
+`parse_args`; checked after `main`'s locals die, before any static
+destructor; an `exit()` ending prints `census skipped (exit)`).
+`int_run.py` fails on a LEAK line in every tests/int run and over the
+corpus under both engines. Pooled memory is reachable from the pool's
+free lists, so LeakSanitizer cannot see such a leak - this can (watched:
+a frame release that dropped closures without releasing them). A
+`VmProgram` now erases its function chunks from the process-global
+chunk map when destroyed (they kept their constants alive past the
+program).
 **Long runs use `tests/testrun.py`** (a `Run`: heartbeat, a unix
 control socket - `tests/testctl.py status|stop|pause|jobs N` - and
 resume by a low-water-mark token); a new multi-minute tool should

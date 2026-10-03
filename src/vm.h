@@ -382,6 +382,11 @@ struct VmProgram {
      * else - a caller cannot forget what the type does for it.
      */
     VmProgram() = default;
+    /* erases THIS program's function chunks from the process-global chunk
+     * map: they are keyed by descriptors this object owns and frees, so a
+     * chunk outliving its program is a stale-keyed entry (and kept its
+     * constants alive - the #107 object census saw it) */
+    ~VmProgram();
     VmProgram(VmProgram &&o) noexcept;
     VmProgram &operator=(VmProgram &&o) noexcept;
     VmProgram(const VmProgram &) = delete;

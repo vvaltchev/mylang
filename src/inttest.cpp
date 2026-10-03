@@ -34,6 +34,7 @@
 #include <cstdlib>
 
 #include "inttest.h"
+#include "poolalloc.h"
 
 namespace {
 
@@ -66,6 +67,70 @@ Log &log()
     static Log l;
     return l;
 }
+
+}  // namespace
+
+/* #107 P4: the object census (poolalloc.h) - live heap objects per kind,
+ * and the counts at the mark taken when the program starts */
+long long g_int_live[IOK_N] = {};
+static long long g_int_live_base[IOK_N] = {};
+static bool g_int_census_marked = false;
+
+static const char *const g_iok_names[IOK_N] = {
+    "str", "arr", "dict", "struct", "func", "exc" };
+
+/* runs after main's locals are destroyed (a return from main) and BEFORE
+ * any static destructor - registered from main, so it is the LAST handler
+ * registered and the first to run - which makes "end == base" exactly
+ * "everything the program created is freed" */
+static bool g_int_census_exiting = false;
+
+void int_census_exiting()
+{
+    g_int_census_exiting = true;
+}
+
+long long int_live_count(const std::string &kind)
+{
+    for (int k = 0; k < IOK_N; k++)
+        if (kind == g_iok_names[k])
+            return g_int_live[k];
+    return -1;
+}
+
+/* MYLANG_INT_CENSUS=1: one `census LEAK <kind> base B end E` line per
+ * kind whose count did not come back (tests/int_run.py fails on it), or
+ * `census skipped (exit)`; MYLANG_INT_CENSUS=all also prints the
+ * balanced kinds. stderr, so a program's own output is untouched. */
+static void census_at_exit()
+{
+    const char *mode = std::getenv("MYLANG_INT_CENSUS");
+    if (!mode || !*mode)
+        return;
+    if (g_int_census_exiting) {
+        std::fprintf(stderr, "census skipped (exit)\n");
+        return;
+    }
+    const bool all = std::string(mode) == "all";
+    for (int k = 0; k < IOK_N; k++)
+        if (all || g_int_live[k] != g_int_live_base[k])
+            std::fprintf(stderr, "census %s%s base %lld end %lld\n",
+                         g_int_live[k] != g_int_live_base[k] ? "LEAK "
+                                                             : "",
+                         g_iok_names[k], g_int_live_base[k],
+                         g_int_live[k]);
+}
+
+void int_census_mark()
+{
+    for (int k = 0; k < IOK_N; k++)
+        g_int_live_base[k] = g_int_live[k];
+    if (!g_int_census_marked)
+        std::atexit(census_at_exit);
+    g_int_census_marked = true;
+}
+
+namespace {
 
 /* Write the per-site counts at exit, when asked to. Registered from a
  * static initializer so a script run needs no explicit call. */
