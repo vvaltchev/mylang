@@ -913,6 +913,33 @@ program still prints what `-nbi` prints):
     would read the WRONG closure).
 Record: docs/jit-optimizations.md, *#97 CLOSURE INLINING STEP 1*.
 
+**DONE (2026-10-03, #107 P6):** all three are `int_splice_gates` in
+`-rt` (INT builds), through the chunk hook (`pre_splice` edits,
+`post_splice` reads the verdict); each gate's removal fails it alone.
+**One finding it left open:** the JIT's argument fusion (argfuse,
+jit.cpp) has no gate 1 - it drops a staging move whose temp is read
+after the call, so gate 1's edited program prints a stale value under
+the JIT with `-nbi`. Unreachable from source (codegen's staging temps
+die at their call). A gate on `jit_slot_liveness` is sound but declines
+fusions wherever a CallBuiltinLV-family op follows (a barrier: its
+argument run lives in the builtin_calls pool, beyond an Instr-only
+table), which costs the W5 refcount test its measurement; the precise
+fix is a use/def row for that family that can see the pool.
+
+**THE ASSEMBLER (P6's second half) - SIZED, NOT BUILT.** The plan's
+oracle is `assemble(disasm(chunk)) == chunk`, field for field, over the
+corpus. Today's `-vd` cannot be its input: it is written for READERS and
+drops fields - a loc prints its start and never its end, a boxed op its
+`target` and `aop` only - so a parser
+of it would have to guess, which is the second-decoder trap CLAUDE.md
+warns about. The honest shape is a SECOND, lossless rendering (an
+`-vd`-like text every Instr field and pool entry appears in, one writer
+beside disasm's) plus its parser, every opcode each way. The chunk
+hook already gives a test a real Chunk to edit, which covers the three
+gates and any shape that is "a compiled chunk with one field changed".
+Worth building when a test needs a bytecode sequence no compiled chunk
+is close to.
+
 ---
 
 ## 3. TASK #110 — VM `foreach` OVER A FLAT STRUCT ARRAY  [✅ DONE 2026-09-29]

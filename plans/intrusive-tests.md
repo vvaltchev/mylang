@@ -481,6 +481,23 @@ assertions on values.
   tail unwritten by design). NOT done: the pinned-register comparison
   (no shadow value exists); edge probes (P2/P5 in 9.7).
 - **P6 - chunk hook + assembler**; build the three splice-gate tests.
+  **STATUS (2026-10-03): the CHUNK HOOK is built** - `int_on`/
+  `IntHookScope` for `pre_splice` (every chunk codegen produced, before
+  the inliner's snapshots) and `post_splice` (the inliner's output,
+  before the JIT), called by vm_precompile_all. `int_splice_gates`
+  (`-rt`, INT builds) edits drive's or the lambda's chunk and reads the
+  verdict off post_splice - the staging move kept before the guard, or a
+  result move inside the inlined arm - on the unedited program (the
+  refinement taken) and the edited one (declined), and requires the
+  inlined program to print what -nbi prints, JIT on and off. Watched:
+  each of the three gates removed fails exactly that test. FOUND: the
+  JIT's argument fusion (argfuse) drops a staging move with no liveness
+  check, so gate 1's edited program prints a stale value under the JIT
+  with the inliner off - the same hazard, unreachable from source; a
+  gate on the barrier-conservative slot liveness declines fusions next to
+  any CallBuiltinLV (an Instr-only table cannot express its argument
+  run, so it is a barrier), so it was not added. NOT built: the
+  ASSEMBLER (sizing in docs/in-flight-tasks.md §2).
 - **P7 - per-site forcing sweep.**
 - **CI:** a `int` job in `nets.yml` from P1 on (Debug + ASan, runs
   `int_run.py`); its sweeps sized to the lane's budget.
