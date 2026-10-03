@@ -9057,13 +9057,20 @@ static std::string jit_int_func()
     return g_cur_caller_desc ? jit_int_fn_name(g_cur_caller_desc) : "main";
 }
 /* a slot by its source name: a local's name, `tN` for the Nth temp */
-static std::string jit_int_var_name(const Chunk &ck, int slot)
+static std::string jit_int_var_name(const Chunk &ck, int slot,
+                                    const FuncDescriptor *desc =
+                                        g_cur_caller_desc)
 {
     if (slot >= ck.slot_count)
         return "t" + std::to_string(slot - ck.slot_count);
     std::string v;
     if (slot >= 0 && static_cast<size_t>(slot) < ck.slot_names.size())
         v = ck.slot_names[static_cast<size_t>(slot)];
+    /* a PARAMETER's name is the descriptor's - slot_names holds the
+     * declared locals only */
+    if (v.empty() && desc && slot >= 0
+            && static_cast<size_t>(slot) < desc->params.size())
+        v = std::string(desc->params[static_cast<size_t>(slot)].name->val);
     return v.empty() ? "r" + std::to_string(slot) : v;
 }
 #endif
@@ -29130,7 +29137,7 @@ static void jit_int_flush_pins(const Chunk &chunk,
         const int slot = code >> 9;
         const int reg = code & 0xff;
         const bool fp = (code & 0x100) != 0;
-        const std::string var = jit_int_var_name(chunk, slot);
+        const std::string var = jit_int_var_name(chunk, slot, desc);
         ML_INT(pin, func, var,
                fp ? "xmm" + std::to_string(reg) : std::string(gp[reg & 15]));
     }

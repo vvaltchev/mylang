@@ -28,9 +28,24 @@ is analysed, as top).
 P2 PART 2 DONE the same day: `forward` (lever A, at `emit_fwd_bump`, the
 one consumer path) and `guard_elided` (C5 store tests at the three
 `store_dst*` points, C4d member guards), with `06_forward_guards`; every
-new site's test watched failing. Remaining P2: moving the existing `-rt`
-shape tests' vacuity guards onto the ledger (they count lever counters
-today, which say "ran somewhere", not "ran HERE").
+new site's test watched failing.
+
+P2 DONE (part 3, 2026-10-02): `IntWatch` (tests.cpp) - the "ran HERE"
+half of a counter check. An emitted-code counter proves a tier EXECUTED,
+which no log can, but only somewhere in the program; an IntWatch asks
+whether a site recorded a matching event since it was made, so a test
+names the function and variable it is about. Outside INT both answers
+are true, so every test keeps its counter checks and gains the site
+check in the INT lane. Applied to one representative per site:
+`jit_temp_regs` (a temp OF g pinned with the lever, none without),
+`jit_regcall_pins_caller_saved` (g's parameters in rdi/rcx, the protocol
+registers), `jit_release_c5` (a store guard of main elided),
+`jit_fwd_deadtemp` (forwards IN f, per case), `jit_frameless_gate` (the
+call TO leaf emitted frameless - the test had added a builtin call purely
+to keep the DRIVER out of a global chunk count). Not migrated: tests whose
+counter is already per-program (the splice parity), where a site check
+adds nothing. Parameters now print by name (the descriptor's), not
+`r<slot>`. GCC 14 floor measured on CI: 32,256.
 
 ## 0. What already exists (P0)
 

@@ -6,4 +6,4 @@
 #
 # <compiler as `mylang -v` reports it> <max uncovered>
 gcc 16.2 32347
-gcc 14.2 44946
+gcc 14.2 32256
