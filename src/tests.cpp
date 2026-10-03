@@ -30486,7 +30486,11 @@ static bool myv_builtin_set_guard()
         const std::string_view cur = builtin_slot_name(i);
         if (cur == "?")                 /* past the end of the table */
             break;
-        if (!(prev < cur)) {
+        /* sorted by (intrusive-test builtin?, name): an INT build puts its
+         * int_* builtins after every other one, so they shift no slot */
+        const bool iprev = builtin_slot_is_int(i - 1);
+        const bool icur = builtin_slot_is_int(i);
+        if (iprev != icur ? iprev : !(prev < cur)) {
             fprintf(stderr, "myv-bset: the builtin table is NOT name-sorted "
                             "at %d (%s then %s) - a baked slot index is no "
                             "longer portable\n", i,

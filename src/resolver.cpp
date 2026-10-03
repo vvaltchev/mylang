@@ -2,6 +2,7 @@
 
 #include "syntax.h"
 #include "resolver.h"
+#include "inttest.h"
 #include "inferencer.h"   /* specialize_types (run_optimizers) */
 #include "analyzer.h"
 #include "errors.h"
@@ -5535,6 +5536,10 @@ private:
      * nullptr means the enclosing function is unresolved (no frame), so block-
      * body inlining is skipped there.
      */
+    /* INT_TESTS: the function whose body the walk is in (null = main),
+     * for the inline_ast event's `caller` field */
+    ML_INT_FIELD(const FuncDeclStmt *, int_caller, nullptr)
+
     void walk(unique_ptr<Construct> &slot, int depth, int *fsize,
               bool no_block = false)
     {
@@ -5548,9 +5553,12 @@ private:
             auto *fd = static_cast<FuncDeclStmt *>(slot.get());
             const bool saved = in_repl_tmpl_base;
             in_repl_tmpl_base = repl_mode && fd->is_template;
+            ML_INT_ONLY(const FuncDeclStmt *int_saved = int_caller;
+                        int_caller = fd;)
             if (fd->body)
                 walk(fd->body, depth,
                      fd->desc->resolved ? &fd->desc->frame_size : nullptr);
+            ML_INT_ONLY(int_caller = int_saved;)
             in_repl_tmpl_base = saved;
             return;
         }
@@ -5709,6 +5717,9 @@ private:
             analysis->mark(callee->start,
                 static_cast<int>(callee->get_str().length()),
                 AnnoKind::inlined);
+        ML_INT(inline_ast, "expr", int_caller_name(),
+               std::string(inline_frame_name(f)),
+               ce->start.line, ce->start.col);
 
         TRACE(inlining, 0, std::string(f->id->get_str()) + "(" +
               std::to_string(nparams) + " arg(s))  body " +
@@ -6139,6 +6150,9 @@ private:
             analysis->mark(callee->start,
                 static_cast<int>(callee->get_str().length()),
                 AnnoKind::inlined);
+        ML_INT(inline_ast, "block", int_caller_name(),
+               std::string(inline_frame_name(f)),
+               ce->start.line, ce->start.col);
 
         TRACE(inlining, 0, std::string(f->id->get_str()) + "(" +
               std::to_string(nparams) + " arg(s))  block body " +
@@ -6268,6 +6282,9 @@ private:
             analysis->mark(callee->start,
                 static_cast<int>(callee->get_str().length()),
                 AnnoKind::inlined);
+        ML_INT(inline_ast, "tail", int_caller_name(),
+               std::string(inline_frame_name(f)),
+               ce->start.line, ce->start.col);
 
         TRACE(inlining, 0, std::string(f->id->get_str()) +
               "  tail call -> splice (+" + std::to_string(nlocals) +
@@ -6522,6 +6539,20 @@ private:
             return f->desc->display_name;
         return std::string(f->id->get_str());
     }
+
+#ifdef INT_TESTS
+    /* The caller as a backtrace names it: `main` at the top level,
+     * `<lambda>` for an anonymous function (inline_frame_name assumes a
+     * named one - a lambda has no `id`). */
+    std::string int_caller_name() const
+    {
+        if (!int_caller)
+            return "main";
+        if (!int_caller->desc->display_name.empty() || int_caller->id)
+            return inline_frame_name(int_caller);
+        return "<lambda>";
+    }
+#endif
 
     static std::vector<std::string> param_names(const FuncDeclStmt *f)
     {

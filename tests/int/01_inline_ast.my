@@ -1,0 +1,38 @@
+# INT test (#107): the AST inliner records one `inline_ast` event per
+# splice - its engine, the caller, the callee and the call site. Each
+# engine is driven once, with arguments that are caller LOCALS (inert, so
+# the expression engine may substitute them) holding runtime() values
+# (so const-folding cannot delete the call before the inliner sees it).
+
+func dbl(x) => x * 2 + 1;                 # expr engine: an => body
+
+func sq1(x) { if (x > 9) { return 0; } return x; }   # block engine
+
+func last(x) {                            # tail engine: return f(...)
+    var y = x + 3;
+    if (y > 999999) { return 0; }
+    return y * 5;
+}
+func via_tail(x) { return last(x); }
+
+var n4 = int(runtime(4));
+var n5 = int(runtime(5));
+var n6 = int(runtime(6));
+var a = dbl(n4);
+var b = sq1(n5) + 22;
+var c = via_tail(n6);
+print(a, b, c);
+assert(a == 9 && b == 27 && c == 45);
+
+var ev = int_events("inline_ast");
+foreach (e in ev) print(e);
+
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+assert(has(ev, "engine=\"expr\" caller=\"main\" callee=\"dbl\" line=21"));
+assert(has(ev, "engine=\"block\" caller=\"main\" callee=\"sq1\" line=22"));
+assert(has(ev, "engine=\"tail\" caller=\"via_tail\" callee=\"last\" line=16"));
+assert(int_hits("inline_ast") == len(ev));

@@ -1,6 +1,12 @@
 # #107 - INTRUSIVE TESTS (`INT_TESTS`)
 
-Status: P0 DONE (the build flag), design below for review. 2026-10-02.
+Status: P0 DONE (the build flag). P1 CORE DONE 2026-10-02: `inttest.h`
+(ML_INT / ML_INT_FIELD / ML_INT_ONLY), `intsites.h` (the X-macro
+registry, typed payloads), `inttest.cpp` (the log + the MYLANG_INT_OUT
+exit census), `int_hits` / `int_events`, the first site (`inline_ast`,
+all three AST inline engines) and its test, `tests/int_run.py`, the `int`
+CI job with the non-perturbation `vdjcmp`. P1's COVERAGE half (gcov +
+MC/DC, `INT-COV-EXEMPT`, the ownership table) is next.
 
 ## 0. What already exists (P0)
 
