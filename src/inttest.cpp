@@ -8,9 +8,12 @@
  * typed payloads only (intsites.h forbids pointers in a payload), so the log
  * is the same on every run of the same (source, build, flags).
  *
- * MYLANG_INT_OUT=<path>: at exit, the process appends one `site count` line
- * per site to <path> (every site, zeros included). tests/int_run.py sums
- * these over its runs for the site census - a site no run reached fails.
+ * MYLANG_INT_OUT=<path>: at exit, the process appends one
+ * `site hits queries` line per site to <path> (every site, zeros
+ * included): how many events it recorded, and how many times a test READ
+ * it through int_hits/int_events. tests/int_run.py sums these over its
+ * runs for the site census - a site no test CHECKS fails, since reaching
+ * a site without asserting on it verifies nothing.
  */
 
 #ifdef INT_TESTS
@@ -41,6 +44,7 @@ static_assert(sizeof(site_names) / sizeof(site_names[0]) == N_SITES,
 
 struct Log {
     uint64_t hits[N_SITES] = {};
+    uint64_t queries[N_SITES] = {};
     std::vector<std::string> events[N_SITES];
 };
 
@@ -61,8 +65,9 @@ void dump_at_exit()
     if (!f)
         return;
     for (int i = 0; i < N_SITES; i++)
-        std::fprintf(f, "%s %llu\n", site_names[i],
-                     static_cast<unsigned long long>(log().hits[i]));
+        std::fprintf(f, "%s %llu %llu\n", site_names[i],
+                     static_cast<unsigned long long>(log().hits[i]),
+                     static_cast<unsigned long long>(log().queries[i]));
     std::fclose(f);
 }
 
@@ -95,6 +100,11 @@ int int_site_by_name(const std::string &name)
         if (name == site_names[i])
             return i;
     return -1;
+}
+
+void int_note_query(IntSite s)
+{
+    log().queries[static_cast<int>(s)]++;
 }
 
 uint64_t int_hits(IntSite s)

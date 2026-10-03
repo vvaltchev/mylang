@@ -491,7 +491,17 @@ phases: `plans/intrusive-tests.md` - READ IT before adding a hook.
 line**, its payload typed and pointer-free (an event must print the same
 on every run); `tests/int_run.py BIN` runs `-rt`, every `tests/int/*.my`
 under both engines, and the SITE CENSUS - a site no run reaches FAILS, so
-add a site together with the test that reaches it. The `int_*` builtins
+add a site together with the test that reaches it (a site counts only when
+a test READS it through `int_*` - reaching it and asserting nothing checks
+nothing). **`--gcov` (a `GCOV=1` INT build) measures the coverage
+universe** (plan section 9): branch outcomes + MC/DC conditions (GCC >= 14,
+`-fcondition-coverage`) + sites, per TEST UNIT (`-rt`, each `tests/int`
+program), named `file:function:+offset` so an edit elsewhere renames
+nothing. Two checks: every unit OWNS an element no other covers (else it
+is redundant and goes), and uncovered elements stay under the per-compiler
+floor in `tests/int/coverage-floor.txt` - a ratchet, lowered when tests
+cover more, NEVER raised to let a change land. Mark a genuinely
+unreachable line `INT-COV-EXEMPT: reason`. The `int_*` builtins
 sort AFTER every other builtin, so an INT build moves no builtin slot;
 the `int` job in `nets.yml` checks the INT build emits byte-identical
 `-vdj` to a `TESTS` build (`vdjcmp.sh`) - an instrumented point may only
