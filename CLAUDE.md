@@ -617,7 +617,13 @@ in the struct, stamped by both drivers), and the dst of the op just run
 holds the one kind that op writes (`int_op_result_kind`, a short list;
 read at the fall-through successor in the same frame, since an op that
 raised skipped its write). Watched: a bind that stops widening an int
-into a `float` param, and CmpIntV writing an int, each abort by name. A
+into a `float` param, and CmpIntV writing an int, each abort by name.
+And SLICES (`SharedArrayObj::int_slice_fault`): a slice in a slot is
+registered in its storage's set with its window inside the storage, the
+`has_slices` mirror matches the set, and every registered view is a
+slice of that storage. Watched: a copy-assign that skips the
+registration, and an overwrite that skips the unregistration, each
+abort at their op. A
 hook in the dispatch loop must be `noexcept` (an exception edge per
 dispatch is a coverage-universe branch) and named `int_*`.
 **Long runs use `tests/testrun.py`** (a `Run`: heartbeat, a unix

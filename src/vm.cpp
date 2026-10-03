@@ -1418,6 +1418,10 @@ static void int_vm_state_check(const Chunk &ck, const EvalContext &ctx,
                 int_vm_state_fail(ck, pc, i, "is borrowed but holds a "
                                              "slice");
         }
+        if (v.is<SharedArrayObj>())
+            if (const char *f = v.get_ref<SharedArrayObj>()
+                                    .int_slice_fault())
+                int_vm_state_fail(ck, pc, i, f);
     }
     /*
      * THE PROVEN TYPES. A loaded image's proofs are input, not facts
