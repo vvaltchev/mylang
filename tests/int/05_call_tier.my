@@ -1,0 +1,43 @@
+# INT-ENGINES: default
+#
+# INT test (#107 P2): the JIT records the PROTOCOL it emitted for each call
+# site (`call_tier`). The callees take DECLARED ints and hold a loop or a
+# recursion, so neither the AST inliner (a loop is over its cost) nor the
+# bytecode splice (a typed parameter needs fast_bind) removes the calls
+# before the JIT sees them. Default engine only: no JIT elsewhere.
+
+func leaf(int x) {                          # a LEAF: frameless
+    var s = 0;
+    for (var i = 0; i < 3; i++) s += x;
+    return s;
+}
+var calls = 0;
+func rec(int n) {                           # a CALLING body: frameless too
+    calls++;                                #   (#97 G1); IMPURE, or the
+    if (n < 2) { return n; }                #   AST inliner unrolls it
+    var a = rec(n - 1);
+    var b = rec(n - 2);
+    return a + b;
+}
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) { var t = leaf(i); s += t; }
+    var r = rec(n);
+    return s + r;
+}
+var res = drive(int(runtime(10)));          # main -> drive: the push
+print(res);
+assert(res == 135 + 55);
+
+var ev = int_events("call_tier");
+foreach (e in ev) print(e);
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+assert(has(ev, "tier=\"frameless\" callee=\"leaf\" line=24"));
+assert(has(ev, "tier=\"frameless\" callee=\"rec\" line=18"));
+assert(has(ev, "tier=\"frameless\" callee=\"rec\" line=19"));
+assert(has(ev, "tier=\"frameless\" callee=\"rec\" line=25"));
+assert(has(ev, "tier=\"push\" callee=\"drive\" line=28"));

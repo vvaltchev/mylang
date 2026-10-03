@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "codegen.h"
+#include "inttest.h"
 #ifdef TESTS
 unsigned long g_cg_minmax_lowered = 0;  /* #97 B2: emit-time (codegen) */
 #endif
@@ -13315,6 +13316,25 @@ void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out)
     out.emplace(&ck, std::move(s));
 }
 
+#ifdef INT_TESTS
+/* #107: one `splice` event per (call site, candidate) - the verdict the
+ * splice reached for it, so a test can name a site and ask why. */
+static void bc_int_note(const Chunk &ck, size_t pc,
+                        const FuncDescriptor *d, bool value,
+                        const char *verdict)
+{
+    Loc ls, le;
+    ck.loc_at(pc, ls, le);
+    const std::string callee =
+        !d ? std::string("?")
+        : !d->display_name.empty() ? d->display_name
+        : d->name ? std::string(d->name->val) : std::string("<lambda>");
+    ML_INT(splice, verdict, value ? "value" : "call", callee, ls.line,
+           ls.col);
+}
+#endif
+#define BC_NOTE(d, why) ML_INT_ONLY(bc_int_note(ck, pc, d, is_value, why))
+
 static bool bc_inline_chunk_splice(Chunk &ck,
                      const std::vector<const FuncDescriptor *> &slot_desc,
                      const BcInlineSnapshots &snaps, bool value_only)
@@ -13417,6 +13437,7 @@ static bool bc_inline_chunk_splice(Chunk &ck,
          * one function, or (increment 2) two. The GUARDS, not the
          * analysis, are what each inlined body's soundness rests on. */
         std::vector<std::pair<const FuncDescriptor *, int32_t>> cands;
+        ML_INT_ONLY(const char *no_cand_why = "no_candidate";)
         if (is_value) {
             int32_t vd[ML_VALUE_CANDS_HARD];
             const int nv = std::min(
@@ -13442,6 +13463,9 @@ static bool bc_inline_chunk_splice(Chunk &ck,
             if (d && d->vm_chunk && d->fast_bind)   /* typed params need
                                                      * coercion */
                 cands.push_back({ d, -1 });
+            ML_INT_ONLY(else if (!d) no_cand_why = "callee_unknown";
+                        else if (!d->vm_chunk) no_cand_why = "no_chunk";
+                        else no_cand_why = "typed_params";)
         }
         const int nargs = static_cast<int>(in.b_lit());
 
@@ -13455,6 +13479,7 @@ static bool bc_inline_chunk_splice(Chunk &ck,
         s.callee_slot = is_value ? in.target2 : -1;
         int site_base = next_base;
         bool step1_done = false;
+        ML_INT_ONLY(std::vector<const FuncDescriptor *> admitted;)
         for (const auto &cand : cands) {
             const FuncDescriptor *d = cand.first;
             const Chunk *cc = static_cast<const Chunk *>(d->vm_chunk);
@@ -13463,8 +13488,10 @@ static bool bc_inline_chunk_splice(Chunk &ck,
              * one that is depends on an unordered_map's order (see
              * BcInlineSnapshot). */
             const auto snap_it = snaps.find(cc);
-            if (snap_it == snaps.end())
+            if (snap_it == snaps.end()) {
+                BC_NOTE(d, "not_in_pass");
                 continue;               /* not part of this pass (main) */
+            }
             const BcInlineSnapshot &snap = snap_it->second;
             if (factory_only) {
                 /* #97 increment 3: main splices a plain call only when
@@ -13477,30 +13504,42 @@ static bool bc_inline_chunk_splice(Chunk &ck,
                 bool makes = false;
                 for (const Instr &bi : snap.code)
                     makes |= bi.op == OpCode::MakeClosureV;
-                if (!makes)
+                if (!makes) {
+                    BC_NOTE(d, "main_not_factory");
                     continue;
+                }
             }
-            if (is_value ? !snap.value_eligible : !snap.eligible)
+            if (is_value ? !snap.value_eligible : !snap.eligible) {
+                BC_NOTE(d, "body_ineligible");
                 continue;               /* gate ran on the pristine body,
                                          * incl. "no inline_ctxs" - the
                                          * callee's own chains would need
                                          * re-parenting (a later step) */
-            if (nargs != static_cast<int>(d->params.size()))
+            }
+            if (nargs != static_cast<int>(d->params.size())) {
+                BC_NOTE(d, "arity");
                 continue;               /* an omitted trailing opt param
                                          * binds none - the bind loop here
                                          * only moves what was passed */
+            }
             const Instr &last = snap.code.back();
-            if (last.op == OpCode::ReturnV && last.a_is_lit())
+            if (last.op == OpCode::ReturnV && last.a_is_lit()) {
+                BC_NOTE(d, "literal_return");
                 continue;               /* ReturnV always emits a slot;
                                          * a literal would need a load */
-            if (last.op == OpCode::Halt && in.target >= 0)
+            }
+            if (last.op == OpCode::Halt && in.target >= 0) {
+                BC_NOTE(d, "void_result_used");
                 continue;               /* a void body's result is none,
                                          * which a used dst would need
                                          * loaded - only a DISCARDED call
                                          * inlines one (76's shape) */
+            }
             const int cframe = snap.slot_count + snap.n_temps;
-            if (site_base + cframe > BC_INLINE_MAX_FRAME)
+            if (site_base + cframe > BC_INLINE_MAX_FRAME) {
+                BC_NOTE(d, "frame_budget");
                 continue;
+            }
 
             Arm a;
             a.base = site_base;
@@ -13558,8 +13597,19 @@ static bool bc_inline_chunk_splice(Chunk &ck,
             a.frame.call_site = ls;
             a.frame.parent = ck.inline_frame_at(pc);
             s.arms.push_back(std::move(a));
+            ML_INT_ONLY(admitted.push_back(d);)
             site_base += cframe;
         }
+        /* a value site the callee-set analysis named nothing for, or a
+         * direct call whose global slot names no spliceable descriptor */
+        ML_INT_ONLY(if (cands.empty())
+                        bc_int_note(ck, pc,
+                                    is_value || in.target2 < 0
+                                        || static_cast<size_t>(in.target2)
+                                               >= slot_desc.size()
+                                        ? nullptr
+                                        : slot_desc[in.target2],
+                                    is_value, no_cand_why);)
         if (s.arms.empty())
             continue;
         /* #72: a guard CHAIN of three or more is ALL OR NOTHING. A
@@ -13572,8 +13622,12 @@ static bool bc_inline_chunk_splice(Chunk &ck,
 #ifdef TESTS
             g_bc_chain_partial++;
 #endif
+            ML_INT_ONLY(for (const FuncDescriptor *ad : admitted)
+                            BC_NOTE(ad, "chain_partial");)
             continue;
         }
+        ML_INT_ONLY(for (const FuncDescriptor *ad : admitted)
+                        BC_NOTE(ad, "spliced");)
         next_base = site_base;
         sites.push_back(std::move(s));
     }

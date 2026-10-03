@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "defs.h"
+#include "inttest.h"
 #include <iostream>
 #include <iomanip>
 #include <cstdlib>
@@ -49846,6 +49847,60 @@ ast_node_pool_minimal()
     return true;
 }
 
+
+#ifdef INT_TESTS
+/*
+ * #107: THE DEFERRAL SCOPE (IntDefer) - the JIT records its events inside
+ * one, so a discarded emission attempt (a lost bet's retry, a give-up
+ * return) must record NOTHING. Each property is checked through the real
+ * log, using the `inline_ast` site as a carrier.
+ */
+static bool int_defer_semantics()
+{
+    const IntSite s = IntSite::inline_ast;
+    const auto count = [&] { return int_events(s).size(); };
+    int_reset();
+    bool ok = true;
+    const auto ev = [](const char *callee) {
+        ML_INT(inline_ast, "expr", "main", callee, 1, 1);
+    };
+    { ML_INT_DEFER(d); ev("dropped"); }                /* uncommitted */
+    if (count() != 0) {
+        fprintf(stderr, "int-defer: an uncommitted scope published\n");
+        ok = false;
+    }
+    { ML_INT_DEFER(d); ev("kept"); ev("kept"); ML_INT_COMMIT(d); }
+    if (count() != 1) {
+        fprintf(stderr, "int-defer: commit published %zu events, want 1 "
+                        "(two identical ones collapse)\n", count());
+        ok = false;
+    }
+    {
+        ML_INT_DEFER(outer);
+        { ML_INT_DEFER(inner); ev("nested"); ML_INT_COMMIT(inner); }
+        if (count() != 1) {
+            fprintf(stderr, "int-defer: an inner commit bypassed the outer "
+                            "scope\n");
+            ok = false;
+        }
+        /* outer dropped: the inner's event goes with it */
+    }
+    if (count() != 1) {
+        fprintf(stderr, "int-defer: a dropped outer scope leaked its "
+                        "inner's event\n");
+        ok = false;
+    }
+    ev("direct");                                     /* no scope: live */
+    if (count() != 2) {
+        fprintf(stderr, "int-defer: an event outside any scope was not "
+                        "recorded\n");
+        ok = false;
+    }
+    int_reset();
+    return ok;
+}
+#endif
+
 static const std::vector<extra_check> extra_checks =
 {
     { "jit: a straight-line int run compiles + executes natively",
@@ -50109,6 +50164,11 @@ static const std::vector<extra_check> extra_checks =
       "lives in a register (no tag store, no payload store, no reload); "
       "the tregs lever off stores it",
       jit_temp_regs },
+#ifdef INT_TESTS
+    { "int: #107 - the deferral scope drops an uncommitted attempt's events,"
+      " publishes a committed one's (identical ones collapsing) and nests",
+      int_defer_semantics },
+#endif
     { "jit: #84 - a callback's truth value is read inline and, for an "
       "int/bool-returning body, from rdx - on the inline return arm and "
       "through the C++ tier alike (sort order vs the tree-walker)",

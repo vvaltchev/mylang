@@ -9,9 +9,13 @@
 #    check below would be vacuous on an ordinary build.
 # 2. Runs the TEST UNITS, each one an oracle:
 #      `-rt`                  the C++ half (it exits non-zero on a failure);
-#      every tests/int/*.my   under the default engine AND the tree-walker -
-#                             both must exit 0 (the programs self-assert)
-#                             and print the same stdout.
+#      every tests/int/*.my   under each configuration of its
+#                             `# INT-CONFIGS:` header (default: none) and
+#                             each engine of `# INT-ENGINES:` (default: the
+#                             default engine AND the tree-walker) - each
+#                             run must exit 0 (the programs self-assert),
+#                             and the engines of one configuration must
+#                             print the same stdout.
 # 3. THE SITE CENSUS: every process appends `site hits queries` to one file
 #    (MYLANG_INT_OUT, src/inttest.cpp). A site of src/intsites.h that no
 #    test CHECKED (read through int_hits / int_events) fails - reaching a
@@ -24,8 +28,10 @@
 #              own (GCC >= 14, -fcondition-coverage)
 #        site: each intrusive-test site the unit checked
 #    named `kind:file:function:+line-offset:...` so an edit elsewhere in a
-#    file does not rename them. A line marked `INT-COV-EXEMPT: reason` is
-#    outside the universe. Two checks, as in SQLite's discipline:
+#    file does not rename them. The universe is the PRODUCT: the test
+#    harness (tests.cpp), the INT core and every INT helper function (named
+#    int_* / jit_int_* / bc_int_*) are outside it, and so is a line marked
+#    `INT-COV-EXEMPT: reason`. Two checks, as in SQLite's discipline:
 #      - every unit OWNS at least one element no other unit covers
 #        (otherwise it is redundant and must go - the suite is minimal);
 #      - uncovered elements <= the FLOOR (a ratchet: it may only go down).
@@ -43,6 +49,7 @@ import glob
 import gzip
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -50,6 +57,15 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 EXEMPT = "INT-COV-EXEMPT"
+
+# The universe is the PRODUCT, as in SQLite: the test harness and the
+# intrusive instrumentation are not measured. A test's failure arm never
+# runs while the test passes, so counting it would make 100% impossible
+# for a reason that has nothing to do with testing. Whole files, plus every
+# INT helper - which is why they are named int_* / jit_int_* / bc_int_*.
+TEST_FILES = {"src/tests.cpp", "src/inttest.cpp", "src/inttest.h",
+              "src/intsites.h", "src/builtins/inttest.cpp.h"}
+INT_HELPER = re.compile(r"(^|[\s:*&])(int_|jit_int_|bc_int_)\w*\(")
 
 
 def build_config(binary):
@@ -138,7 +154,7 @@ def collect(build_dir, scratch, ex_cache, tool):
             rel = fobj["file"].replace("\\", "/")
             if "/src/" in rel and not rel.startswith("src/"):
                 rel = rel[rel.rindex("/src/") + 1:]  # an absolute CMake path
-            if not rel.startswith("src/"):
+            if not rel.startswith("src/") or rel in TEST_FILES:
                 continue
             funcs = sorted((fn["start_line"], fn["end_line"],
                             fn.get("demangled_name", fn["name"]))
@@ -157,6 +173,8 @@ def collect(build_dir, scratch, ex_cache, tool):
                 if n in marked:
                     continue
                 o = owner(n)
+                if o and INT_HELPER.search(o[1]):
+                    continue
                 where = ("%s:%s:+%d" % (rel, o[1], n - o[0]) if o
                          else "%s:?:%d" % (rel, n))
                 k = 0
@@ -175,6 +193,55 @@ def collect(build_dir, scratch, ex_cache, tool):
                             elems[name] = elems.get(name, False) \
                                 or c not in miss
     return elems
+
+
+def int_header(prog, key):
+    """The value of a `# KEY:` line in the program's leading comment."""
+    with open(prog) as f:
+        for line in f:
+            if line.startswith("# " + key + ":"):
+                return line.split(":", 1)[1].strip()
+            if not line.startswith("#"):
+                break
+    return None
+
+
+def int_configs(prog):
+    """The CONFIGURATIONS a tests/int program runs under: its
+    `# INT-CONFIGS:` line, `;`-separated, each `default` or space-separated
+    KEY=VALUE environment settings (`default ; MYLANG_JIT_OFF=lsra` runs it
+    under both allocators). Every configuration must pass; stdout is
+    compared only between ENGINES of one configuration, since another
+    configuration may legitimately record different decisions."""
+    h = int_header(prog, "INT-CONFIGS")
+    if not h:
+        return [{}]
+    confs = []
+    for part in h.split(";"):
+        part = part.strip()
+        env = {}
+        if part != "default":
+            for kv in part.split():
+                k, _, v = kv.partition("=")
+                env[k] = v
+        confs.append(env)
+    return confs
+
+
+def int_engines(prog):
+    """The engines a tests/int program runs under: its `# INT-ENGINES:`
+    header line (`default`, `tw`, `nj`), else both the default engine and
+    the tree-walker. A test asserting on a CODEGEN or JIT decision names
+    `default` alone - the tree-walker never runs those passes, so it
+    records nothing there."""
+    h = int_header(prog, "INT-ENGINES")
+    if not h:
+        return ["default", "tw"]
+    engs = h.split()
+    for e in engs:
+        if e not in ("default", "tw", "nj"):
+            raise SystemExit("int_run: %s: unknown engine %r" % (prog, e))
+    return engs
 
 
 # --------------------------------------------------------------- driver --
@@ -218,10 +285,14 @@ def main():
         print("  gcov: %s" % tool)
     units = []
     if not args.no_rt:
-        units.append(("-rt", [["-rt"]]))
+        units.append(("-rt", [[(["-rt"], {})]]))
     progs = sorted(glob.glob(os.path.join(HERE, "int", "*.my")))
     for prog in progs:
-        units.append((os.path.relpath(prog, ROOT), [[prog], ["-tw", prog]]))
+        groups = []          # one per configuration: [(cmd, env-extra)]
+        for conf in int_configs(prog):
+            groups.append([([prog] if eng == "default" else ["-" + eng, prog],
+                            conf) for eng in int_engines(prog)])
+        units.append((os.path.relpath(prog, ROOT), groups))
 
     failures = []
     if not progs:
@@ -241,20 +312,32 @@ def main():
                                    recursive=True):
                     os.remove(g)
             before = os.path.getsize(census) if os.path.exists(census) else 0
-            results = [run([binary] + c, env, args.timeout) for c in cmds]
-            ok = all(r[0] == 0 for r in results)
-            if len(results) == 2 and results[0][1] != results[1][1]:
-                ok = False
-                print("        stdout differs between the engines")
-            if name == "-rt":
-                for l in results[0][1].splitlines():
-                    if l.startswith(("Tests passed", "Differential")):
-                        print("  -rt  " + l)
+            ok = True
+            fails = []
+            for group in cmds:
+                results = [run([binary] + c, dict(env, **extra), args.timeout)
+                           for c, extra in group]
+                if name == "-rt":
+                    for l in results[0][1].splitlines():
+                        if l.startswith(("Tests passed", "Differential")):
+                            print("  -rt  " + l)
+                if any(r[0] != 0 for r in results):
+                    ok = False
+                if len(results) >= 2 and any(r[1] != results[0][1]
+                                             for r in results[1:]):
+                    ok = False
+                    fails.append("stdout differs between the engines (%s)"
+                                 % (" ".join("%s=%s" % kv for kv in
+                                             group[0][1].items())
+                                    or "default"))
+                for (c, extra), r in zip(group, results):
+                    if r[0] != 0:
+                        fails.append("`%s%s` rc=%d\n%s" % (
+                            "".join("%s=%s " % kv for kv in extra.items()),
+                            " ".join(c), r[0], r[2][-2000:]))
             print("  %s  %s" % ("ok  " if ok else "FAIL", name))
-            for c, r in zip(cmds, results):
-                if r[0] != 0:
-                    print("        `%s` rc=%d\n%s" % (" ".join(c), r[0],
-                                                     r[2][-2000:]))
+            for f in fails:
+                print("        " + f)
             if not ok:
                 failures.append(name)
 

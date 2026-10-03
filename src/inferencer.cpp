@@ -4,6 +4,7 @@
 #include "statictype.h"
 #include "errors.h"
 #include "inferencer.h"
+#include "inttest.h"
 #include "analyzer.h"
 #include "evalvalue.h"
 #include "eval.h"
@@ -7124,16 +7125,27 @@ static unique_ptr<Construct> specialize(unique_ptr<Construct> n, int *fsize)
     /* lever 3: hoist loop-invariant slice decls FIRST (the loop keeps its
      * raw form for try_for_range below; the wrapper block's children then
      * specialize individually). */
+    /* #107: each pass FIRED iff it changed the node's kind (a wrapper
+     * Block, a ForRangeStmt) - recorded here, outside the passes' gates */
+    ML_INT_ONLY(const Loc int_at = n->start;)
     if (dynamic_cast<ForStmt *>(n.get())
             || dynamic_cast<WhileStmt *>(n.get())) {
-        if (!(g_opt_disabled & opt_slice_hoist))
+        if (!(g_opt_disabled & opt_slice_hoist)) {
             n = try_hoist_loop_slices(std::move(n));
+            ML_INT_ONLY(if (ctag(n.get()) == ConstructType::block)
+                            ML_INT(ast_transform, "slice_hoist",
+                                   int_at.line, int_at.col);)
+        }
         /* then the invariant container reads INSIDE the loop (a `for` only).
          * If the slice hoist already produced a wrapper Block, the recursion
          * below re-enters specialize() on the loop and it gets its turn. */
         if (!(g_opt_disabled & opt_licm)
-            && dynamic_cast<ForStmt *>(n.get()))
+            && dynamic_cast<ForStmt *>(n.get())) {
             n = try_hoist_loop_subscripts(std::move(n), fsize);
+            ML_INT_ONLY(if (ctag(n.get()) == ConstructType::block)
+                            ML_INT(ast_transform, "licm",
+                                   int_at.line, int_at.col);)
+        }
         if (ctag(n.get()) == ConstructType::block) {
             auto *blk = static_cast<Block *>(n.get());
             for (auto &e : blk->elems)
@@ -7146,8 +7158,10 @@ static unique_ptr<Construct> specialize(unique_ptr<Construct> n, int *fsize)
     if (!(g_opt_disabled & opt_for_range)
         && dynamic_cast<ForStmt *>(n.get())) {
         n = try_for_range(std::move(n), fsize);
-        if (dynamic_cast<ForRangeStmt *>(n.get()))
+        if (dynamic_cast<ForRangeStmt *>(n.get())) {
+            ML_INT(ast_transform, "for_range", int_at.line, int_at.col);
             return n;     /* matched: sub-trees already specialized */
+        }
     }
     specialize_children(n.get(), fsize);     /* bottom-up: children first */
     if (g_opt_disabled & opt_typed)

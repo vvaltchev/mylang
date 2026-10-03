@@ -21,6 +21,10 @@
  *                               code or the .myv format reads (LValue,
  *                               EvalValue, Frame, the JitProbe structs): see
  *                               plan section 2b
+ *   ML_INT_DEFER(name) / ML_INT_COMMIT(name)
+ *                               a scope whose events publish only when
+ *                               committed (a pass that may discard and
+ *                               redo its work - see IntDefer)
  *   ML_INT_ONLY(stmts...)       statements that exist only in an INT build
  *                               (keeping an INT_FIELD up to date); like
  *                               ML_INT they may only READ the code's state
@@ -79,13 +83,39 @@ ML_INT_SITES(X)
 #undef X
 #undef F
 
+/*
+ * A DEFERRAL scope: while one is live, events are BUFFERED; commit()
+ * publishes them, and destroying the scope uncommitted DISCARDS them. For
+ * a pass that may throw away its own work and redo it - the JIT re-emits a
+ * chunk when a bet loses, and the backward goto destroys everything
+ * declared after the retry label - so a discarded attempt records nothing.
+ * Scopes nest; a commit hands the events to the enclosing one, dropping
+ * exact duplicates (one attempt may emit the same op twice - a cold copy).
+ */
+class IntDefer {
+public:
+    IntDefer();
+    ~IntDefer();
+    void commit();
+    IntDefer(const IntDefer &) = delete;
+    IntDefer &operator=(const IntDefer &) = delete;
+private:
+    friend void int_record(IntSite s, std::string &&line);
+    std::vector<std::pair<IntSite, std::string>> buf;
+    IntDefer *prev;
+};
+
 #define ML_INT(site, ...) int_event(IntPay_##site{ __VA_ARGS__ })
+#define ML_INT_DEFER(name) IntDefer name
+#define ML_INT_COMMIT(name) name.commit()
 #define ML_INT_FIELD(type, name, init) type name = init;
 #define ML_INT_ONLY(...) __VA_ARGS__
 
 #else  /* !INT_TESTS */
 
 #define ML_INT(site, ...) ((void)0)
+#define ML_INT_DEFER(name)
+#define ML_INT_COMMIT(name) ((void)0)
 #define ML_INT_FIELD(type, name, init)
 #define ML_INT_ONLY(...)
 

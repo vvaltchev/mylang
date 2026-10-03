@@ -30,6 +30,7 @@
 
 #include <queue>
 #include "jit.h"
+#include "inttest.h"
 #include "disasm.h"
 #include "env.h"      /* env_get - MSVC deprecates getenv */
 #include <optional>
@@ -1830,6 +1831,17 @@ struct Emitter {
      * push/pop around every call. */
     struct CacheEnt { int slot; int32_t payload, type; uint8_t reg; };
     std::vector<CacheEnt> cache;
+    /* #107: every (slot, register) pin THIS emission installed, encoded
+     * slot << 9 | float << 8 | reg - flushed as `pin` events once the
+     * chunk's emission is final (a retry rebuilds the Emitter, so a
+     * discarded attempt records nothing) */
+    ML_INT_FIELD(std::vector<int>, int_pins, {})
+#ifdef INT_TESTS
+    void int_note_pin(int slot, uint8_t reg, bool fp)
+    {
+        int_pins.push_back(slot << 9 | (fp ? 0x100 : 0) | reg);
+    }
+#endif
     /*
      * #96 INCREMENT 1 - the SPILL-EXTENDED hot set. A slot that
      * qualified for a pin but lost the ranking is homed in a bare
@@ -9029,6 +9041,16 @@ static std::vector<size_t> *g_cur_self_fl_calls = nullptr;
  */
 static const JitCtx *g_cur_jc = nullptr;
 
+/* #107: a function's name as a backtrace renders it, for INT events */
+#ifdef INT_TESTS
+static std::string jit_int_fn_name(const FuncDescriptor *d)
+{
+    return !d ? std::string("?")
+         : !d->display_name.empty() ? d->display_name
+         : d->name ? std::string(d->name->val) : std::string("<lambda>");
+}
+#endif
+
 /*
  * ⛔ THE CALLEE A CALL SITE PROVABLY REACHES, decided at JIT TIME - the
  * #97 step 4 gate, and a COMPILE-TIME decision, never a runtime bail
@@ -11917,6 +11939,21 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
     const FuncDescriptor *fl_c[2] = { nullptr, nullptr };
     const bool frameless_site =
         residue && jit_frameless_candidates(ck, old_pc, in, fl_c, nullptr) > 0;
+    ML_INT_ONLY({
+        std::string callee;
+        if (frameless_site)
+            callee = jit_int_fn_name(fl_c[0])
+                   + (fl_c[1] ? "|" + jit_int_fn_name(fl_c[1]) : "");
+        else if (!is_value && g_cur_jc && g_cur_jc->slot_desc
+                 && in.target2 >= 0
+                 && static_cast<size_t>(in.target2)
+                        < g_cur_jc->slot_desc->size())
+            callee = jit_int_fn_name((*g_cur_jc->slot_desc)[in.target2]);
+        else
+            callee = "?";
+        ML_INT(call_tier, frameless_site ? "frameless" : "push", callee,
+               ls.line, ls.col);
+    })
     std::vector<size_t> j_slows, j_dones;
     if (!frameless_site) {
         /* depth guard: cmp dword [&g_jit_sync_depth], CAP; jge slow */
@@ -26746,6 +26783,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * g_vm_jit_exc. */
         const JitLayout &L = jit_layout();
         const FuncDescriptor *callee = (*jc->slot_desc)[in.target2];
+        ML_INT_ONLY({
+            Loc ls, le;
+            ck.loc_at(old_pc, ls, le);
+            ML_INT(call_tier, "native_direct", jit_int_fn_name(callee),
+                   ls.line, ls.col);
+        })
 
         emit_call_prologue(e);              /* empty cache -> nothing */
         /* jit_call_setup(callee_slot, argbase, nargs, dst, caller_desc, pc): */
@@ -29036,6 +29079,41 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     return true;
 }
 
+#ifdef INT_TESTS
+/* #107: the `pin` events of one chunk's FINAL emission - one per distinct
+ * (slot, register), named by source (a local's name, `tN` for the Nth
+ * expression temp) so a test can say "in f, `s` lived in a register"
+ * without depending on slot numbers. */
+static void jit_int_flush_pins(const Chunk &chunk,
+                               const FuncDescriptor *desc,
+                               const std::vector<int> &pins)
+{
+    static const char *const gp[16] = {
+        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
+    const std::string func = desc ? jit_int_fn_name(desc) : "main";
+    std::vector<int> uniq = pins;
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+    for (int code : uniq) {
+        const int slot = code >> 9;
+        const int reg = code & 0xff;
+        const bool fp = (code & 0x100) != 0;
+        std::string var;
+        if (slot < chunk.slot_count) {
+            if (static_cast<size_t>(slot) < chunk.slot_names.size())
+                var = chunk.slot_names[static_cast<size_t>(slot)];
+            if (var.empty())
+                var = "r" + std::to_string(slot);
+        } else {
+            var = "t" + std::to_string(slot - chunk.slot_count);
+        }
+        ML_INT(pin, func, var,
+               fp ? "xmm" + std::to_string(reg) : std::string(gp[reg & 15]));
+    }
+}
+#endif
+
 void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
 {
     if (jit_map_wanted())
@@ -29576,6 +29654,9 @@ retry_emission:
      * backward goto DESTROYS everything declared below it (e included)
      * and reconstructs fresh - the same total-discard semantics the
      * emit_ok=false give-up path has always had. */
+    /* #107: the same goes for this emission's intrusive-test events - a
+     * discarded attempt (a retry, a give-up return) records nothing */
+    ML_INT_DEFER(int_defer);
     Emitter e;
     /*
      * #97 R4: a frameless LEAF is lazy too, ON A BET - that its
@@ -30876,6 +30957,7 @@ retry_emission:
                 const SlotAddr a = slot_addr(hot[h]);
                 e.cache.push_back(
                     { hot[h], a.payload, a.type, hot_reg[h] });
+                ML_INT_ONLY(e.int_note_pin(hot[h], hot_reg[h], false);)
                 e.load(hot_reg[h], a.payload);            /* entry load */
             }
         }
@@ -30930,6 +31012,9 @@ retry_emission:
                 ML_CHECK(xr >= 0);       /* fhot.size() <= MAX_FCACHED */
                 e.fcache.push_back({ fhot[h], a.payload, a.type,
                                      static_cast<uint8_t>(xr) });
+                ML_INT_ONLY(e.int_note_pin(fhot[h],
+                                           static_cast<uint8_t>(xr),
+                                           true);)
                 e.fload(static_cast<uint8_t>(xr), a.payload);
             }
         }
@@ -31681,6 +31766,7 @@ retry_emission:
                                       "its call op");
                     (void)got;
                     e.cache.push_back(c);
+                    ML_INT_ONLY(e.int_note_pin(c.slot, c.reg, false);)
                     if (xcs_live[xi])
                         e.load(c.reg, c.payload);
                 }
@@ -31998,6 +32084,8 @@ retry_emission:
                                             na.payload, na.type,
                                             static_cast<uint8_t>(
                                                 tr.reg) });
+                        ML_INT_ONLY(e.int_note_pin(tr.install_slot,
+                                    static_cast<uint8_t>(tr.reg), false);)
                         /* #86: installed AT ITS DEFINITION - the op at
                          * this pc writes the slot and does not read it,
                          * so the register is written before anything
@@ -32076,6 +32164,8 @@ retry_emission:
                     e.fcache.push_back({ tr.install_slot, na.payload,
                                          na.type,
                                          static_cast<uint8_t>(tr.reg) });
+                    ML_INT_ONLY(e.int_note_pin(tr.install_slot,
+                                static_cast<uint8_t>(tr.reg), true);)
                     e.fload(static_cast<uint8_t>(tr.reg), na.payload);
                 }
 #ifdef TESTS
@@ -32376,6 +32466,8 @@ retry_emission:
                                             na.payload, na.type,
                                             static_cast<uint8_t>(
                                                 tr.reg) });
+                        ML_INT_ONLY(e.int_note_pin(tr.install_slot,
+                                    static_cast<uint8_t>(tr.reg), false);)
                     }
                 }
                 e.fcache = base_fcache;
@@ -32396,6 +32488,8 @@ retry_emission:
                                              na.payload, na.type,
                                              static_cast<uint8_t>(
                                                  tr.reg) });
+                        ML_INT_ONLY(e.int_note_pin(tr.install_slot,
+                                    static_cast<uint8_t>(tr.reg), true);)
                     }
                 }
                 for (const Emitter::CacheEnt &c : e.cache)
@@ -33158,6 +33252,7 @@ retry_emission:
      * frameless self site would call offset 0 of nothing */
     ML_CHECK(self_fl_calls.empty() || fe_off >= 0);
     g_cur_self_fl_calls = nullptr;
+    ML_INT_ONLY(const FuncDescriptor *const int_desc = g_cur_caller_desc;)
     g_cur_caller_desc = nullptr;
     g_cur_self_fl = false;
     g_cur_jc = nullptr;
@@ -33226,6 +33321,8 @@ retry_emission:
     chunk.ret_unflushed = e.ret_unflushed;       /* REGCALL 2 */
     if (jit_map_wanted())
         jit_write_map(chunk, map_name);
+    ML_INT_ONLY(jit_int_flush_pins(chunk, int_desc, e.int_pins);)
+    ML_INT_COMMIT(int_defer);
 }
 
 #else   /* !ML_JIT_SUPPORTED */

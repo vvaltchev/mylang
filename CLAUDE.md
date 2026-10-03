@@ -501,7 +501,15 @@ nothing. Two checks: every unit OWNS an element no other covers (else it
 is redundant and goes), and uncovered elements stay under the per-compiler
 floor in `tests/int/coverage-floor.txt` - a ratchet, lowered when tests
 cover more, NEVER raised to let a change land. Mark a genuinely
-unreachable line `INT-COV-EXEMPT: reason`. The `int_*` builtins
+unreachable line `INT-COV-EXEMPT: reason`. The universe is the PRODUCT:
+`tests.cpp`, the INT core and every INT helper (NAME IT `int_*` /
+`jit_int_*` / `bc_int_*`, or its branches count) are outside it. A test
+program's header picks its runs: `# INT-ENGINES: default` for a codegen or
+JIT decision (the tree-walker never runs those passes),
+`# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra` for several environments.
+**A pass that may discard and redo its work records inside an
+`ML_INT_DEFER` scope** (the JIT's retry label has one): a discarded
+attempt then records nothing. The `int_*` builtins
 sort AFTER every other builtin, so an INT build moves no builtin slot;
 the `int` job in `nets.yml` checks the INT build emits byte-identical
 `-vdj` to a `TESTS` build (`vdjcmp.sh`) - an instrumented point may only
