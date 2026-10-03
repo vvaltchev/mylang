@@ -621,7 +621,10 @@ FORCE_BANNER = (
     "  ############################################################\n")
 
 
-# --- MACHINE-SPEED CALIBRATION (a WARNING only - it never blocks a run) ----
+# --- MACHINE-SPEED CALIBRATION ---------------------------------------------
+# A drift from the cache's marker only WARNS; a calibration that cannot
+# CONVERGE, or a machine that is busy, REFUSES the run (and a --recompute
+# before it re-times anything) - see machine_calibration.
 #
 # The my/<lang> column divides a LIVE MyLang timing by a CACHED comparison
 # timing, so a box that is merely slower today reads as a MyLang REGRESSION
@@ -632,36 +635,196 @@ FORCE_BANNER = (
 #
 # So each cache records how fast the machine was when it was written, and a
 # measure run re-times the same fixed workload and says so when the two
-# disagree. It ONLY warns: every number is still measured and printed exactly
-# as before, and the run always completes.
+# disagree. The drift only warns: every number is still measured and printed.
 CALIB_KEY = "__machine__"        # reserved key - no bench can be named this
-CALIB_ITERS = 300000
+CALIB_ITERS = 300000             # the marker is "seconds per CALIB_ITERS"
 CALIB_TOLERANCE = 0.08           # +-8% before it is worth mentioning
+#
+# THE CALIBRATION MUST BE STABLE, OR IT IS WORSE THAN NONE (2026-10-01).
+# The first marker was best-of-3 of a 0.1s loop: on this hybrid CPU it read
+# the box "~14% FASTER" than when the C++ cache was timed, a full --force
+# re-time followed - and the re-timed C++ benches moved by a few percent at
+# most. The marker was measuring which CORE the loop landed on and what else
+# was running, not the machine.
+#
+# The estimator is the LOW CLUSTER, not a mean and not a lone minimum.
+# For deterministic CPU-bound code timing noise is one-sided - interrupts,
+# preemption, a frequency dip or cache pollution can only ADD time - so the
+# fastest samples are the truest (Chen & Revels, "Robust benchmarking in
+# noisy environments", 2016 - the BenchmarkTools.jl rationale). A lone
+# minimum can itself be a fluke, so the marker waits until several samples
+# AGREE near it: CALIB_CLUSTER_K of them within CALIB_CLUSTER_TOL of the
+# fastest, out of at least CALIB_MIN_SAMPLES - the more it samples, the more
+# the timings pile up at the bottom and the rest separates as noise. Each
+# sample is sized first, Google Benchmark's way (grow the iteration count
+# until one sample lasts CALIB_SAMPLE_SECS), so timer and loop overhead are
+# negligible. Google Benchmark itself does not stop on variance - it times
+# for a fixed min_time and reports the mean - which is right for its job and
+# wrong for this one: here the question is "has the low end settled?".
+#
+# It also runs on ONE core (the lowest-numbered one this process may use - the
+# P-cores come first on Intel hybrid parts) with the garbage collector off,
+# and it measures how busy the REST of the machine was meanwhile: a box
+# running something else gives timings nobody should trust, the cached
+# comparison least of all. Either failure REFUSES the run - and a --recompute
+# calibrates FIRST, so a noisy box never re-times a cache.
+CALIB_BUDGET_SECS = 1.0          # the whole calibration, hard
+CALIB_WARMUP_SECS = 0.1          # let the clock ramp up first
+CALIB_SAMPLE_SECS = 0.02         # one sample's target length
+CALIB_MIN_SAMPLES = 10
+CALIB_CLUSTER_K = 5              # samples within TOL of the fastest ...
+CALIB_CLUSTER_FRAC = 0.2         # ... and at least this share of all
+CALIB_CLUSTER_TOL = 0.02         # +-2% of the fastest sample
+CALIB_MAX_OTHER_CPUS = 1.0       # other processes' average busy CPUs
+CALIB_METHOD = 2                 # bump when the marker's meaning changes
+
+
+class CalibrationError(Exception):
+    pass
+
+
+def calib_cpu(allowed):
+    """The ONE core the calibration runs on - the same one every run, so the
+    marker compares like with like: the lowest-numbered PERFORMANCE core this
+    process may use other than CPU 0 (which takes most of the interrupts),
+    from Linux's hybrid-CPU topology when it has one."""
+    perf = set()
+    try:
+        with open("/sys/devices/cpu_core/cpus") as f:
+            for part in f.read().strip().split(","):
+                lo, _, hi = part.partition("-")
+                perf.update(range(int(lo), int(hi or lo) + 1))
+    except (OSError, ValueError):
+        perf = set()
+    for pool in (perf & allowed, allowed):
+        rest = sorted(pool - {0}) or sorted(pool)
+        if rest:
+            return rest[0]
+    return min(allowed)
+
+
+def _calib_unit(n):
+    acc = 0
+    for i in range(n):
+        acc = (acc + i * 3) & 0xFFFFF
+    return acc
+
+
+def _proc_stat_cpu():
+    """(busy, total) jiffies over all CPUs from /proc/stat, or None."""
+    try:
+        with open("/proc/stat") as f:
+            parts = f.readline().split()
+    except OSError:
+        return None
+    if not parts or parts[0] != "cpu":
+        return None
+    vals = [int(x) for x in parts[1:]]
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)   # idle + iowait
+    return sum(vals) - idle, sum(vals)
 
 
 def machine_calibration():
-    """Best-of-3 seconds for a fixed CPU-bound loop - a cheap MACHINE-SPEED
-    marker. Runs IN-PROCESS (no subprocess, no toolchain), so it costs ~0.1s
-    and behaves identically for every comparison language."""
-    best = None
-    for _ in range(3):
-        t0 = time.perf_counter()
-        acc = 0
-        for i in range(CALIB_ITERS):
-            acc = (acc + i * 3) & 0xFFFFF
-        dt = time.perf_counter() - t0
-        if best is None or dt < best:
-            best = dt
-    return best
+    """Seconds per CALIB_ITERS of a fixed CPU-bound loop, from the converged
+    LOW CLUSTER of samples (see above). Raises CalibrationError when the
+    timings do not converge within CALIB_BUDGET_SECS or the rest of the
+    machine is busy."""
+    import gc
+    pinned = None
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            pinned = os.sched_getaffinity(0)
+            os.sched_setaffinity(0, {calib_cpu(pinned)})
+        except OSError:
+            pinned = None
+    gc_was = gc.isenabled()
+    gc.disable()
+    try:
+        t_start = time.perf_counter()
+        st0 = _proc_stat_cpu()
+        cpu0 = os.times()
+        while time.perf_counter() - t_start < CALIB_WARMUP_SECS:
+            _calib_unit(20000)            # the clock ramps up
+        n = 2000
+        while True:                       # size one sample (Google's way)
+            t0 = time.perf_counter()
+            _calib_unit(n)
+            dt = time.perf_counter() - t0
+            if dt >= CALIB_SAMPLE_SECS or n >= (1 << 26):
+                break
+            n *= 2 if dt < CALIB_SAMPLE_SECS / 4 else 1
+            if dt >= CALIB_SAMPLE_SECS / 4:
+                n = int(n * CALIB_SAMPLE_SECS / max(dt, 1e-9)) + 1
+        samples = []
+        value = None
+        while time.perf_counter() - t_start < CALIB_BUDGET_SECS:
+            t0 = time.perf_counter()
+            _calib_unit(n)
+            samples.append(time.perf_counter() - t0)
+            if len(samples) < CALIB_MIN_SAMPLES:
+                continue
+            lo = min(samples)
+            cluster = sorted(x for x in samples
+                             if x <= lo * (1.0 + CALIB_CLUSTER_TOL))
+            if (len(cluster) >= CALIB_CLUSTER_K
+                    and len(cluster) >= CALIB_CLUSTER_FRAC * len(samples)):
+                value = cluster[len(cluster) // 2]
+                break
+        st1 = _proc_stat_cpu()
+        cpu1 = os.times()
+    finally:
+        if gc_was:
+            gc.enable()
+        if pinned is not None:
+            try:
+                os.sched_setaffinity(0, pinned)
+            except OSError:
+                pass
+    wall = time.perf_counter() - t_start
+    if st0 and st1 and wall > 0:
+        hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        busy = (st1[0] - st0[0]) / hz
+        mine = (cpu1.user + cpu1.system) - (cpu0.user + cpu0.system)
+        others = max(0.0, busy - mine) / wall
+        if others > CALIB_MAX_OTHER_CPUS:
+            raise CalibrationError(
+                "the machine is BUSY: other processes used ~%.1f CPUs on "
+                "average during the calibration (the limit is %.1f).\n"
+                "  Wall-clock benchmarks need an approximately idle machine "
+                "- stop the other\n  work and run again."
+                % (others, CALIB_MAX_OTHER_CPUS))
+    if value is None:
+        lo = min(samples) if samples else 0.0
+        near = sum(1 for x in samples if x <= lo * (1.0 + CALIB_CLUSTER_TOL))
+        raise CalibrationError(
+            "the calibration did not CONVERGE in %.1fs: %d samples, only %d "
+            "within %.0f%% of the fastest (need %d, and %.0f%% of the samples)"
+            ".\n  The timings are too "
+            "noisy for a wall-clock comparison - is something else\n  "
+            "running, or is the CPU frequency still settling? Run again on a "
+            "quiet machine."
+            % (CALIB_BUDGET_SECS, len(samples), near,
+               CALIB_CLUSTER_TOL * 100, CALIB_CLUSTER_K,
+               CALIB_CLUSTER_FRAC * 100))
+    return value / n * CALIB_ITERS
 
 
-def calibration_stamp():
-    """The marker stored beside a cache when it is (re)computed."""
-    return {"secs": machine_calibration(),
+def require_calibration():
+    """machine_calibration(), or exit with its refusal."""
+    try:
+        return machine_calibration()
+    except CalibrationError as ce:
+        sys.exit("error: refusing to time anything - %s" % ce)
+
+
+def calibration_stamp(secs):
+    """The marker stored beside a cache when it is (re)computed - `secs` is
+    the calibration this recompute ran BEFORE timing anything."""
+    return {"secs": secs, "method": CALIB_METHOD,
             "python": "%d.%d.%d" % sys.version_info[:3]}
 
 
-def calibration_warning(cache, lang, filt=""):
+def calibration_warning(cache, lang, now, filt=""):
     """None, or a message saying this machine looks materially different from
     the one the cache was timed on. NEVER blocks - the caller prints it and
     carries on."""
@@ -672,7 +835,15 @@ def calibration_warning(cache, lang, filt=""):
                 "  bench/run.py -cl %s --recompute --force%s"
                 % (lang, lang, filt))
 
-    now = machine_calibration()
+    if ent.get("method") != CALIB_METHOD:
+        # a marker from the old best-of-3, unpinned loop measured which core
+        # it landed on - comparing it with this one invents a drift (it read
+        # "13% faster" on the day it was retired)
+        return ("note: %s.json's machine marker predates the converging "
+                "calibration (method %d), so\n  it is not compared. It is "
+                "replaced the next time the whole cache is re-timed:\n"
+                "  bench/run.py -cl %s --recompute --force"
+                % (lang, CALIB_METHOD, lang))
     ratio = now / ent["secs"]
     if abs(ratio - 1.0) <= CALIB_TOLERANCE:
         return None
@@ -896,6 +1067,9 @@ def main():
             print("%s: all %d selected result(s) already fresh - nothing to "
                   "recompute." % (lobj.name, len(comparable)))
             return
+        # calibrate FIRST: a box too noisy or too busy to calibrate is a box
+        # whose timings would poison the cache for every later run
+        calib_secs = require_calibration()
         print("%s: recomputing %d of %d selected result(s)%s ..."
               % (lobj.name, len(todo), len(comparable),
                  " (--force: all)" if args.force else " (stale)"))
@@ -923,7 +1097,7 @@ def main():
         # prevent). The mixed cache keeps its old marker and keeps warning.
         whole = not args.filter and len(todo) == len(comparable)
         if whole:
-            cache[CALIB_KEY] = calibration_stamp()
+            cache[CALIB_KEY] = calibration_stamp(calib_secs)
             save_cache(lobj.name, cache)
         print("done - %d %s comparison result(s) cached%s."
               % (len(todo), lobj.name,
@@ -991,7 +1165,8 @@ def main():
 
     # MACHINE-SPEED check: warn (never block) when this box no longer matches
     # the one the comparison cache was timed on - see calibration_warning.
-    calib_msg = calibration_warning(cache, lobj.name, filt)
+    calib_now = require_calibration()     # refuses on a noisy/busy box
+    calib_msg = calibration_warning(cache, lobj.name, calib_now, filt)
     if calib_msg:
         print(calib_msg + "\n")
 
