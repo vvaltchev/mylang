@@ -1994,6 +1994,34 @@ static void (*g_jit_trk_verdict)(const char *) = jit_trk_verdict_abort;
 #endif
 #endif
 
+#ifdef INT_TESTS
+/*
+ * #107 P5: THE JIT PROBE's side table. With MYLANG_INT_PROBE=1 every op
+ * boundary of every fragment emits `call [cell]` (the cell, in the low
+ * arena, holds jit_int_probe_stub): the stub saves the whole register
+ * file and the flags, aligns the stack and calls jit_int_probe_check,
+ * which finds THIS record by its return address and runs the frame-slot
+ * half of the state checker over the slots whose memory is
+ * authoritative at that pc - `skip` names the rest (a pin, a spill home,
+ * an elided type). The call goes around every self-accounting seam (the
+ * call seam, the rsp model, the bets), so it changes no decision; what
+ * that rests on is checked by int_run (`probe-stripped -vdj`).
+ */
+struct JitIntProbeChunk {
+    std::vector<int32_t> ref_slots;
+    std::vector<unsigned char> param_kinds;
+    int total = 0;
+    uint64_t ret_unflushed = 0;          /* known once emission is final */
+    std::string fn;
+};
+struct JitIntProbe {
+    std::shared_ptr<JitIntProbeChunk> ck;
+    uint32_t pc = 0;
+    std::vector<char> skip;
+};
+typedef std::vector<std::pair<size_t, JitIntProbe>> JitIntProbeList;
+#endif
+
 struct Emitter {
     std::vector<uint8_t> b;
 
@@ -2027,6 +2055,9 @@ struct Emitter {
      * chunk's emission is final (a retry rebuilds the Emitter, so a
      * discarded attempt records nothing) */
     ML_INT_FIELD(std::vector<int>, int_pins, {})
+    /* #107 P5: (end of the probe call, its record) - committed by
+     * jit_int_probes_commit once the fragment is mapped */
+    ML_INT_FIELD(JitIntProbeList, int_probes, {})
 #ifdef INT_TESTS
     void int_note_pin(int slot, uint8_t reg, bool fp)
     {
@@ -9646,6 +9677,212 @@ static bool jit_int_frameless_declined(const Chunk &ck,
     const int pick = int_choose(key, 2, 0);
     ML_INT(frameless_choice, key, int64_t(2), int64_t(0), int64_t(pick));
     return pick == 1;
+}
+
+/*
+ * #107 P5: THE PROBE STUB. Reached by `call [cell]` from an op boundary,
+ * with every register and the flags live. It saves them all - the 15
+ * GPRs (rsp is the stack), the flags and the 16 xmm registers - aligns
+ * the stack for the C++ call, and restores everything bit for bit, so
+ * the code around a probe cannot tell it ran. The GP save area, as
+ * jit_int_probe_check reads it: [0] r15 .. [7] r8, [8] rdi, [9] rsi,
+ * [10] rbp, [11] rbx, [12] rdx, [13] rcx, [14] rax, [15] flags, [16] the
+ * return address.
+ */
+extern "C" void jit_int_probe_stub();
+extern "C" void jit_int_probe_check(const uint64_t *gp) noexcept;
+asm(R"(
+    .text
+    .globl jit_int_probe_stub
+    .type jit_int_probe_stub, @function
+jit_int_probe_stub:
+    pushfq
+    push %rax
+    push %rcx
+    push %rdx
+    push %rbx
+    push %rbp
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    mov %rsp, %rbx
+    sub $256, %rsp
+    and $-16, %rsp
+    movdqu %xmm0, 0(%rsp)
+    movdqu %xmm1, 16(%rsp)
+    movdqu %xmm2, 32(%rsp)
+    movdqu %xmm3, 48(%rsp)
+    movdqu %xmm4, 64(%rsp)
+    movdqu %xmm5, 80(%rsp)
+    movdqu %xmm6, 96(%rsp)
+    movdqu %xmm7, 112(%rsp)
+    movdqu %xmm8, 128(%rsp)
+    movdqu %xmm9, 144(%rsp)
+    movdqu %xmm10, 160(%rsp)
+    movdqu %xmm11, 176(%rsp)
+    movdqu %xmm12, 192(%rsp)
+    movdqu %xmm13, 208(%rsp)
+    movdqu %xmm14, 224(%rsp)
+    movdqu %xmm15, 240(%rsp)
+    cld
+    mov %rbx, %rdi
+    call jit_int_probe_check@PLT
+    movdqu 0(%rsp), %xmm0
+    movdqu 16(%rsp), %xmm1
+    movdqu 32(%rsp), %xmm2
+    movdqu 48(%rsp), %xmm3
+    movdqu 64(%rsp), %xmm4
+    movdqu 80(%rsp), %xmm5
+    movdqu 96(%rsp), %xmm6
+    movdqu 112(%rsp), %xmm7
+    movdqu 128(%rsp), %xmm8
+    movdqu 144(%rsp), %xmm9
+    movdqu 160(%rsp), %xmm10
+    movdqu 176(%rsp), %xmm11
+    movdqu 192(%rsp), %xmm12
+    movdqu 208(%rsp), %xmm13
+    movdqu 224(%rsp), %xmm14
+    movdqu 240(%rsp), %xmm15
+    mov %rbx, %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rdi
+    pop %rsi
+    pop %rbp
+    pop %rbx
+    pop %rdx
+    pop %rcx
+    pop %rax
+    popfq
+    ret
+    .size jit_int_probe_stub, .-jit_int_probe_stub
+)");
+
+/* the cell the probe calls through: in the low arena, so `call [abs32]`
+ * reaches it from any fragment with no relocation (null off the arena -
+ * the probe is then not emitted, and jit_int_probe_on says so once) */
+static void **jit_int_probe_cell()
+{
+    static void **cell = [] {
+        void **c = nullptr;
+        if (ml_lowmem_available()) {
+            c = ml_lowmem_new<void *>(nullptr);
+            if (!ml_lowmem_fits_imm32(c))
+                c = nullptr;
+            else
+                *c = reinterpret_cast<void *>(&jit_int_probe_stub);
+        }
+        return c;
+    }();
+    return cell;
+}
+static bool jit_int_probe_on()
+{
+    static const bool on = [] {
+        const char *v = std::getenv("MYLANG_INT_PROBE");
+        if (!v || !*v || std::string(v) == "0")
+            return false;
+        if (!jit_int_probe_cell()) {
+            std::fprintf(stderr, "INT: MYLANG_INT_PROBE needs the low "
+                                 "arena - no probes in this run\n");
+            return false;
+        }
+        return true;
+    }();
+    return on;
+}
+
+static std::unordered_map<uintptr_t, JitIntProbe> g_int_probe_map;
+
+/* what every probe of this chunk shares: copied, so main's chunk moving
+ * with its VmProgram leaves the table valid */
+static std::shared_ptr<JitIntProbeChunk> jit_int_probe_chunk(const Chunk &ck)
+{
+    if (!jit_int_probe_on())
+        return nullptr;
+    auto p = std::make_shared<JitIntProbeChunk>();
+    p->ref_slots = ck.ref_slots;
+    p->param_kinds = ck.int_param_kinds;
+    p->total = ck.slot_count + ck.n_temps;
+    p->fn = jit_int_func();
+    return p;
+}
+
+/* the probe at an op boundary (see JitIntProbe) */
+static void jit_int_probe(Emitter &e,
+                          const std::shared_ptr<JitIntProbeChunk> &ci,
+                          size_t pc)
+{
+    if (!ci)
+        return;
+    JitIntProbe p;
+    p.ck = ci;
+    p.pc = static_cast<uint32_t>(pc);
+    p.skip.assign(static_cast<size_t>(ci->total), 0);
+    for (int sl = 0; sl < ci->total; sl++)
+        if (e.reg_at(sl) >= 0 || e.spill_at(sl) >= 0 || e.freg_at(sl) >= 0)
+            p.skip[static_cast<size_t>(sl)] = 1;
+    for (const Emitter::TypedEnt &t : e.tflush)
+        if (t.slot >= 0 && t.slot < ci->total)
+            p.skip[static_cast<size_t>(t.slot)] = 1;
+    const uint32_t cell = static_cast<uint32_t>(
+        reinterpret_cast<uintptr_t>(jit_int_probe_cell()));
+    e.u8(0xFF);                          /* call qword [abs32] */
+    e.u8(0x14);
+    e.u8(0x25);
+    e.u32(cell);
+    e.int_probes.push_back({ e.pos(), std::move(p) });
+}
+
+/* the fragment is mapped at `mem`: its probes become findable */
+static void jit_int_probes_commit(Emitter &e, void *mem)
+{
+    for (auto &pr : e.int_probes) {
+        /* the Emitter's own: Chunk::ret_unflushed is copied from it
+         * only after the fragment is mapped */
+        pr.second.ck->ret_unflushed = e.ret_unflushed;
+        g_int_probe_map[reinterpret_cast<uintptr_t>(mem) + pr.first] =
+            std::move(pr.second);
+    }
+    e.int_probes.clear();
+}
+
+extern "C" void jit_int_probe_check(const uint64_t *gp) noexcept
+{
+    const auto it = g_int_probe_map.find(static_cast<uintptr_t>(gp[16]));
+    if (it == g_int_probe_map.end()) {
+        std::fprintf(stderr, "INT-JITSTATE: a probe with no record (return "
+                             "address %#llx)\n",
+                     static_cast<unsigned long long>(gp[16]));
+        std::abort();
+    }
+    const JitIntProbe &p = it->second;
+    std::vector<char> skip = p.skip;
+    for (int sl = 0; sl < 64 && sl < p.ck->total; sl++)
+        if (p.ck->ret_unflushed & (uint64_t(1) << sl))
+            skip[static_cast<size_t>(sl)] = 1;
+    const LValue *slots = reinterpret_cast<const LValue *>(gp[11]);
+    int bad = -1;
+    if (const char *f = int_slots_fault(p.ck->ref_slots, p.ck->param_kinds,
+                                        slots, p.ck->total, &skip, bad)) {
+        std::fprintf(stderr, "INT-JITSTATE: %s, vm pc %u, slot %d: %s\n",
+                     p.ck->fn.c_str(), p.pc, bad, f);
+        std::abort();
+    }
+    g_int_probe_hits++;
 }
 /* a slot by its source name: a local's name, `tN` for the Nth temp */
 static std::string jit_int_var_name(const Chunk &ck, int slot,
@@ -29992,6 +30229,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     e.spill_slots = 0;
     e.fread.clear();                       /* C4a-i: nor read elision */
     std::vector<NativeCode::OpMark> marks;  /* -vdj: op-boundary annotations */
+    ML_INT_ONLY(const std::shared_ptr<JitIntProbeChunk> int_pinfo =
+                    jit_int_probe_chunk(chunk);)
     /* fragment offset of each body pc */
     std::vector<size_t> label(n, 0);
     std::vector<Fixup> fixups;              /* fragment-local branch fixups */
@@ -30023,6 +30262,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         }
         label[pc] = e.pos();
         e.op_boundary();
+        ML_INT_ONLY(jit_int_probe(e, int_pinfo, pc);)
         e.cur_pc = static_cast<int>(pc);
         e.dbg_op = static_cast<int>(chunk.code[pc].op);
         if (op_is_branch(chunk.code[pc].op))
@@ -30058,6 +30298,7 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     if (mem == MAP_FAILED)
         return false;                      /* chunk still pristine */
     std::memcpy(mem, e.b.data(), len);
+    ML_INT_ONLY(jit_int_probes_commit(e, mem);)
     for (const Emitter::CallReloc &r : e.call_relocs) {
         uint8_t *dst = static_cast<uint8_t *>(mem) + r.off;
         intptr_t rel = reinterpret_cast<intptr_t>(r.fn)
@@ -30712,6 +30953,8 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
         && chunk.handler_sites.empty() && !jit_lever_off(JL_RETWB)
         && jit_slot_liveness(chunk, ret_lsl);
     g_jit_pins_denied = 0;
+    ML_INT_ONLY(const std::shared_ptr<JitIntProbeChunk> int_pinfo =
+                    jit_int_probe_chunk(chunk);)
 retry_emission:
     /* Phase A: the one-shot re-emission after a rax-pin conflict. The
      * backward goto DESTROYS everything declared below it (e included)
@@ -32529,6 +32772,7 @@ retry_emission:
              * unfreed alloc_scratch take silently reassigns every
              * later allocation in the fragment */
             e.op_boundary();
+            ML_INT_ONLY(jit_int_probe(e, int_pinfo, pc);)
             e.cur_pc = static_cast<int>(pc);
             e.dbg_op = static_cast<int>(in.op);
             if (g_jit_annotate)
@@ -34370,6 +34614,7 @@ retry_emission:
     if (mem == MAP_FAILED)
         return;   /* out of memory: the EnterNative ops... must NOT stay */
     std::memcpy(mem, e.b.data(), len);
+    ML_INT_ONLY(jit_int_probes_commit(e, mem);)
     /* Patch each call site's rel32 now the base is known: DIRECT to libm
      * when in +-2GB (~always), else through the in-buffer trampoline (which
      * is only KBs away, so it always fits). Only the 4-byte rel32 is

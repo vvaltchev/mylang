@@ -83,8 +83,10 @@ TEST_FILES = {"src/tests.cpp", "src/inttest.cpp", "src/inttest.h",
               "src/intsites.h", "src/builtins/inttest.cpp.h"}
 # `[(<[]`: a TEMPLATE helper demangles as `int_enumerate<...>(`, and one
 # returning std::string as `bc_int_key_fn[abi:cxx11](` - a bare `\(` let
-# either count as product code
-INT_HELPER = re.compile(r"(^|[\s:*&])(int_|jit_int_|bc_int_)\w*[(<\[]")
+# either count as product code. `$`: an `extern "C"` helper (the JIT
+# probe's checker, called from assembly) is not mangled, so gcov names it
+# with no parameter list at all
+INT_HELPER = re.compile(r"(^|[\s:*&])(int_|jit_int_|bc_int_)\w*([(<\[]|$)")
 
 
 def build_config(binary):
@@ -98,6 +100,24 @@ def build_config(binary):
             if parts[0] == "compiler":       # `compiler gcc 16.2`
                 cfg["compiler"] = " ".join(parts[1:3])
     return cfg
+
+
+PROBE_LINE = re.compile(r"^\s*\.\s*\+\s*\d+: call \[<addr>\]\s*$", re.M)
+_VDJ_OFF = re.compile(r"^(\s*\.\s*)\+\s*\d+:", re.M)
+_VDJ_TGT = re.compile(r"(\b(?:j[a-z]+|call|loop[a-z]*)\s+)\+\d+")
+_VDJ_FRAG = re.compile(r"@\+\d+")
+
+
+def vdj_mask(text, strip=False):
+    """A -vdj dump with every BYTE OFFSET masked (an instruction's own,
+    a jump/call target, a fragment's `frag@+N`), and with strip, the
+    probe calls dropped - what the probe-invisibility check compares."""
+    if strip:
+        text = PROBE_LINE.sub("", text)
+    text = _VDJ_OFF.sub(r"\1+N:", text)
+    text = _VDJ_TGT.sub(r"\1+N", text)
+    text = _VDJ_FRAG.sub("@+N", text)
+    return [l for l in text.splitlines() if l.strip()]
 
 
 def run(cmd, env, timeout):
@@ -396,12 +416,14 @@ def main():
                 results = [run([binary] + c,
                                dict(env, **extra,
                                     **({} if name == "-rt"
-                                       else {"MYLANG_INT_CENSUS": "1"})),
+                                       else {"MYLANG_INT_CENSUS": "1",
+                                             "MYLANG_INT_PROBE": "1"})),
                                args.timeout)
                            for c, extra in group]
                 for (c, extra), r in zip(group, results):
                     for l in r[2].splitlines():
-                        if l.startswith(("census LEAK", "INT-VMSTATE")):
+                        if l.startswith(("census LEAK", "INT-VMSTATE",
+                                         "INT-JITSTATE")):
                             ok = False
                             fails.append("`%s`: %s" % (" ".join(c), l))
                 if name == "-rt":
@@ -459,18 +481,62 @@ def main():
         corpus = sorted(glob.glob(os.path.join(HERE, "functional", "*.my")))
         corpus += [os.path.join(ROOT, "samples", s) for s in CENSUS_SAMPLES]
         leaks = 0
+        probes = 0
         for prog in corpus:
-            for eng in ([], ["-nj"], ["-tw"]):
+            outs = {}
+            for eng in (["-tw"], [], ["-nj"]):
                 r = run([binary] + eng + [prog],
-                        dict(env, MYLANG_INT_CENSUS="1"), args.timeout)
+                        dict(env, MYLANG_INT_CENSUS="all",
+                             MYLANG_INT_PROBE="1"), args.timeout)
+                # the probed engines print what the tree-walker prints
+                # (a stub that failed to restore a register would not)
+                outs[" ".join(eng)] = (r[0], r[1])
+                if eng and outs[" ".join(eng)] != outs["-tw"]:
+                    leaks += 1
+                    failures.append("probe: %s %s: the output differs from "
+                                    "the tree-walker's"
+                                    % (" ".join(eng) or "default",
+                                       os.path.relpath(prog, ROOT)))
                 for l in r[2].splitlines():
-                    if l.startswith(("census LEAK", "INT-VMSTATE")):
+                    if l.startswith("census probes "):
+                        probes += int(l.split()[2])
+                    if l.startswith(("census LEAK", "INT-VMSTATE",
+                                     "INT-JITSTATE")):
                         leaks += 1
                         failures.append("census: %s %s: %s" % (
                             " ".join(eng) or "default",
                             os.path.relpath(prog, ROOT), l))
-        print("  object census + VM state: %d corpus program(s) x 3 "
-              "engines, %d finding(s)" % (len(corpus), leaks))
+        print("  object census + VM state + JIT probes: %d corpus "
+              "program(s) x 3 engines, %d finding(s), %d probe(s) run"
+              % (len(corpus), leaks, probes))
+        if probes == 0:
+            failures.append("the JIT probe never ran (MYLANG_INT_PROBE) - "
+                            "the JIT half of the state checker is vacuous")
+        # (6) THE PROBE IS INVISIBLE: the emitted code with probes, the
+        # probe calls dropped and byte offsets masked, is the emitted code
+        # without them - instruction for instruction
+        invis = 0
+        for prog in corpus:
+            plain = run([binary, "-vdj", prog], env, args.timeout)[1]
+            probed = run([binary, "-vdj", prog],
+                         dict(env, MYLANG_INT_PROBE="1"), args.timeout)[1]
+            if PROBE_LINE.search(plain):
+                failures.append("probe-strip: %s's plain -vdj already "
+                                "holds a `call [<addr>]` - a probe line "
+                                "would be ambiguous"
+                                % os.path.relpath(prog, ROOT))
+                continue
+            n_probe = len(PROBE_LINE.findall(probed))
+            if "enter.nat" in plain and n_probe == 0:
+                failures.append("probe-strip: %s has native code and no "
+                                "probe" % os.path.relpath(prog, ROOT))
+            if vdj_mask(plain) != vdj_mask(probed, strip=True):
+                invis += 1
+                failures.append("probe-strip: %s - the probes changed "
+                                "the emitted code"
+                                % os.path.relpath(prog, ROOT))
+        print("  probe invisibility: %d corpus program(s), %d differ"
+              % (len(corpus), invis))
 
         totals = {}
         if os.path.exists(census):

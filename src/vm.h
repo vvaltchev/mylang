@@ -120,6 +120,24 @@ extern unsigned long g_unpack_fast_binds;
 /* #121 execution proof: slot binds that took the direct same-kind handle
  * move-assign (vm_slot_bind_ref) instead of put()'s three-frame chain */
 extern unsigned long g_ref_bind_fast;
+#ifdef INT_TESTS
+/*
+ * #107 P4/P5: the FRAME-SLOT half of the state checker - a slot outside
+ * `ref_slots` holds no reference, a borrowed slot a non-slice one, an
+ * array value's slice registration holds, no object counts fewer handles
+ * than the owning slots holding it, and (our own bytecode only) a typed
+ * parameter holds its scalar. `skip[i]` marks a slot whose memory is not
+ * authoritative (a JIT pin, a spill home, an elided type); a slot whose
+ * type word is the W3 poison is skipped too. Returns null, or what is
+ * wrong with slot `bad`. Shared by the dispatch loop and the JIT probe.
+ */
+const char *int_slots_fault(const std::vector<int32_t> &ref_slots,
+                            const std::vector<unsigned char> &param_kinds,
+                            const LValue *slots, int n,
+                            const std::vector<char> *skip,
+                            int &bad) noexcept;
+#endif
+
 #endif
 
 /*

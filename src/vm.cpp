@@ -1441,40 +1441,49 @@ static const Chunk *g_int_vms_ck = nullptr;
 static const Frame *g_int_vms_fr = nullptr;
 static size_t g_int_vms_pc = 0;
 
-static void int_vm_state_check(const Chunk &ck, const EvalContext &ctx,
-                               size_t pc) noexcept
+/* Declared in vm.h: the frame-slot half of the state checker, shared by
+ * the dispatch loop and the JIT's probe (jit.cpp). */
+const char *int_slots_fault(const std::vector<int32_t> &ref_slots,
+                            const std::vector<unsigned char> &param_kinds,
+                            const LValue *slots, int n,
+                            const std::vector<char> *skip,
+                            int &bad) noexcept
 {
-    const Frame *fr = ctx.frame;
-    if (!fr)
-        return;
-    const int n = std::min(fr->size, ck.slot_count + ck.n_temps);
+    const void *poison = jit_poison_type();
+    const auto skipped = [&](int i) {
+        return (skip && i < static_cast<int>(skip->size()) && (*skip)[i])
+               || static_cast<const void *>(slots[i].get().get_type())
+                      == poison;
+    };
+    const char *fault = nullptr;
     size_t ri = 0;                       /* ref_slots is sorted */
-    for (int i = 0; i < n; i++) {
-        while (ri < ck.ref_slots.size() && ck.ref_slots[ri] < i)
+    for (int i = 0; i < n && !fault; i++) {
+        while (ri < ref_slots.size() && ref_slots[ri] < i)
             ri++;
-        const bool listed = ri < ck.ref_slots.size()
-                            && ck.ref_slots[ri] == i;
-        const LValue &lv = fr->slots[i];
+        if (skipped(i))
+            continue;
+        const bool listed = ri < ref_slots.size() && ref_slots[ri] == i;
+        const LValue &lv = slots[i];
         const EvalValue &v = lv.get();
         const bool ref = v.get_type()->t >= Type::t_str;
+        bad = i;
+        /* the borrowed byte is read only by the release scans, which
+         * visit listed slots only - an unlisted slot's tail may be stale
+         * (a frameless window leaves a scalar parameter's tail unwritten,
+         * W5), and an unlisted slot holding a reference fails the first
+         * rule anyway */
+        const bool borrowed = listed && lv.jit_borrowed_probe();
         if (ref && !listed)
-            int_vm_state_fail(ck, pc, i, "holds a reference but is not in "
-                                         "ref_slots");
-        if (lv.jit_borrowed_probe()) {
-            if (!ref)
-                int_vm_state_fail(ck, pc, i, "is borrowed but holds no "
-                                             "reference");
-            if (v.is<SharedArrayObj>()
-                    && v.get_ref<SharedArrayObj>().is_slice())
-                int_vm_state_fail(ck, pc, i, "is borrowed but holds a "
-                                             "slice");
-        }
-        if (v.is<SharedArrayObj>())
-            if (const char *f = v.get_ref<SharedArrayObj>()
-                                    .int_slice_fault())
-                int_vm_state_fail(ck, pc, i, f);
+            fault = "holds a reference but is not in ref_slots";
+        else if (borrowed && !ref)
+            fault = "is borrowed but holds no reference";
+        else if (borrowed && v.is<SharedArrayObj>()
+                 && v.get_ref<SharedArrayObj>().is_slice())
+            fault = "is borrowed but holds a slice";
+        else if (v.is<SharedArrayObj>())
+            fault = v.get_ref<SharedArrayObj>().int_slice_fault();
         IntRefSlot r;
-        if (ref && !lv.jit_borrowed_probe()
+        if (!fault && ref && !borrowed
                 && int_ref_count(v, r.id, r.cnt)) {
             r.slot = i;
             g_int_refs.push_back(r);
@@ -1490,49 +1499,63 @@ static void int_vm_state_check(const Chunk &ck, const EvalContext &ctx,
               [](const IntRefSlot &a, const IntRefSlot &b) {
                   return a.id < b.id;
               });
-    for (size_t i = 0; i < g_int_refs.size();) {
+    for (size_t i = 0; i < g_int_refs.size() && !fault;) {
         size_t j = i;
         while (j < g_int_refs.size()
                && g_int_refs[j].id == g_int_refs[i].id)
             j++;
-        if (g_int_refs[i].cnt < static_cast<long>(j - i))
-            int_vm_state_fail(ck, pc, g_int_refs[i].slot,
-                              "an object counts fewer handles than the "
-                              "slots of this frame holding it");
+        if (g_int_refs[i].cnt < static_cast<long>(j - i)) {
+            bad = g_int_refs[i].slot;
+            fault = "an object counts fewer handles than the slots of "
+                    "this frame holding it";
+        }
         i = j;
     }
     g_int_refs.clear();
     /*
      * THE PROVEN TYPES. A loaded image's proofs are input, not facts
-     * (the audits' rule, CLAUDE.md #142), so only our own bytecode.
-     *  - a typed or inference-proven PARAMETER holds that scalar (or
-     *    none, when it is opt) at every op of its body;
-     *  - the dst of the op just run, when that op writes one kind, holds
-     *    it - read at the FALL-THROUGH successor in the same frame only:
-     *    an op that raised skipped its write, and the next op dispatched
-     *    in that frame is then a handler elsewhere.
+     * (the audits' rule, CLAUDE.md #142), so only our own bytecode: a
+     * typed or inference-proven PARAMETER holds that scalar (or none,
+     * when it is opt) at every op of its body.
      */
-    if (g_untrusted_bytecode)
-        return;
-    const size_t np = std::min(ck.int_param_kinds.size(),
-                               static_cast<size_t>(n));
+    if (fault || g_untrusted_bytecode)
+        return fault;
+    const size_t np = std::min(param_kinds.size(), static_cast<size_t>(n));
     for (size_t i = 0; i < np; i++) {
-        const unsigned char want = ck.int_param_kinds[i];
-        if (!want)
+        const unsigned char want = param_kinds[i];
+        if (!want || skipped(static_cast<int>(i)))
             continue;
-        const EvalValue &v = fr->slots[i].get();
-        const int k = int_value_kind(v);
-        if (k == (want & 3))
+        const EvalValue &v = slots[i].get();
+        if (int_value_kind(v) == (want & 3))
             continue;
         if ((want & 4) && v.get_type()->t == Type::t_none)
             continue;
-        int_vm_state_fail(ck, pc, static_cast<int>(i),
-                          (want & 3) == 1
-                              ? "a proven-int parameter holds a non-int"
-                              : "a proven-float parameter holds a "
-                                "non-float");
+        bad = static_cast<int>(i);
+        return (want & 3) == 1 ? "a proven-int parameter holds a non-int"
+                               : "a proven-float parameter holds a "
+                                 "non-float";
     }
-    if (g_int_vms_ck == &ck && g_int_vms_fr == fr
+    return nullptr;
+}
+
+static void int_vm_state_check(const Chunk &ck, const EvalContext &ctx,
+                               size_t pc) noexcept
+{
+    const Frame *fr = ctx.frame;
+    if (!fr)
+        return;
+    const int n = std::min(fr->size, ck.slot_count + ck.n_temps);
+    int bad = -1;
+    if (const char *f = int_slots_fault(ck.ref_slots, ck.int_param_kinds,
+                                        fr->slots, n, nullptr, bad))
+        int_vm_state_fail(ck, pc, bad, f);
+    /*
+     * The dst of the op just run, when that op writes one kind, holds it
+     * - read at the FALL-THROUGH successor in the same frame only: an op
+     * that raised skipped its write, and the next op dispatched in that
+     * frame is then a handler elsewhere.
+     */
+    if (!g_untrusted_bytecode && g_int_vms_ck == &ck && g_int_vms_fr == fr
             && pc == g_int_vms_pc + 1) {
         const Instr &prev = ck.code[g_int_vms_pc];
         const int want = int_op_result_kind(prev);
