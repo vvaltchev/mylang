@@ -9355,6 +9355,51 @@ static bool visit_use_def(const Instr &in, U u, D d)
     }
 }
 
+/*
+ * The table's POOL-AWARE twin, for a caller that can hand the chunk the
+ * op belongs to. The in-place builtin call (pop/sort/insert/... on a
+ * NAMED arg0) keeps its value arguments in a RUN whose length lives in
+ * the builtin_calls pool, beyond an Instr - so only this entry point has
+ * its row, and visit_use_def proper keeps the barrier (a separate
+ * function so the row's branches are not instantiated once per caller).
+ * Reads: arg0's slot when it is a local (a = DUAL: lo the pool index, hi
+ * arg0's kind 0 local / 1 global / 2 capture) and the rest run at `b`
+ * (when set: nargs - 1 slots, what vm_call_builtin_lv_rest reads).
+ * Writes: the dst. arg0 is NOT a def: the builtin mutates it IN PLACE
+ * (the store family's rule), and a missing def can only cost a kill.
+ * The Elem form (`append(a[i], x)`) reads the same base plus a run whose
+ * first slot is the INDEX (nargs slots); the Member form (`append(s.f,
+ * x)`) the base plus the values (nargs - 1) - its field name is in the
+ * pool. Neither defines the base: the element/field is reached through
+ * it and mutated in place, and a COW detach rewrites the handle with its
+ * type unchanged (the element-store family's argument).
+ */
+template <typename U, typename D>
+static bool visit_use_def_pooled(const Instr &in, U u, D d,
+                                 const Chunk *pools)
+{
+    const bool lv = in.op == OpCode::CallBuiltinLV
+                    || in.op == OpCode::CallBuiltinLVElem
+                    || in.op == OpCode::CallBuiltinLVMember;
+    if (!lv || !pools)
+        return visit_use_def(in, u, d);
+    /* the pool index is in range: verify_chunk bounds it, for our own
+     * bytecode and a loaded image alike */
+    const size_t na = pools->builtin_calls[
+        static_cast<size_t>(in.a_dual_lo())].args.size();
+    if (in.a_dual_hi() == 0)
+        u(in.target2);
+    /* the run at `b`: Elem's holds the INDEX first, then the values */
+    if (in.b_is_lit()) {
+        const size_t nrun = in.op == OpCode::CallBuiltinLVElem ? na
+                                                                : na - 1;
+        for (size_t i = 0; i < nrun; i++)
+            u(static_cast<int>(in.b_lit() + static_cast<int64_t>(i)));
+    }
+    d(in.target);
+    return true;
+}
+
 /* Producer ops whose ONLY frame-slot write is `target` (verified above) and
  * whose semantics don't otherwise depend on the dst - safe to retarget. */
 static bool retargetable_dst(OpCode op)
@@ -9480,9 +9525,9 @@ static void jit_liveness_core(const Chunk &chunk,
                     out[w] |= livein[(p + 1) * words + w];
             std::fill(use.begin(), use.end(), 0);
             std::fill(def.begin(), def.end(), 0);
-            const bool known = visit_use_def(in,
+            const bool known = visit_use_def_pooled(in,
                 [&](int s) { set_bit(use, 0, s); },
-                [&](int s) { set_bit(def, 0, s); });
+                [&](int s) { set_bit(def, 0, s); }, &chunk);
             for (size_t w = 0; w < words; w++) {
                 uint64_t all = ~uint64_t(0);
                 const int hi = count - static_cast<int>(w) * 64;
@@ -10034,13 +10079,13 @@ bool jit_guard_facts(const Chunk &chunk, std::vector<char> &proven)
  * treat it as touching EVERYTHING.
  */
 bool jit_op_slot_refs(const Instr &in, std::vector<int> &uses,
-                      std::vector<int> &defs)
+                      std::vector<int> &defs, const Chunk *pools)
 {
     uses.clear();
     defs.clear();
-    return visit_use_def(in,
-                         [&](int s) { uses.push_back(s); },
-                         [&](int s) { defs.push_back(s); });
+    return visit_use_def_pooled(in,
+                                [&](int s) { uses.push_back(s); },
+                                [&](int s) { defs.push_back(s); }, pools);
 }
 
 static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)

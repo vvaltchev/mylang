@@ -17408,3 +17408,46 @@ touches it:
 - Records live on the `Emitter` and are committed when the fragment is
   mapped (`jit_int_probes_commit`, both mmap sites): a retry builds a
   fresh Emitter, and a give-up never reaches the commit.
+
+### IN-PLACE BUILTIN CALLS GET USE/DEF ROWS; ARGFUSE GETS GATE 1 (2026-10-03)
+
+`CallBuiltinLV` (pop/sort/insert/... on a named arg0) was a BARRIER in
+`visit_use_def`: its value arguments are a run whose length lives in the
+`builtin_calls` pool, beyond an Instr-only table - the reason CLAUDE.md
+gives for the chain stores. So every temp read as live up to it. The
+table's pool-aware twin `visit_use_def_pooled` gives it a row: the op reads
+arg0's slot (kind 0, a local) and the rest run (`args.size() - 1` slots
+from `b`, what `vm_call_builtin_lv_rest` reads) and writes the dst; arg0
+is not a def (mutated in place - the store family's rule). Every caller
+of `visit_use_def` proper is unchanged; `jit_liveness_core` uses the twin, so
+the JIT's slot liveness (lever A, the linear scan, retwb, argfuse) sees
+the row. The Elem form (`push(a[i], x)`: the run starts with the INDEX,
+nargs slots) and the Member form (`pop(s.f)`: the values, nargs - 1)
+followed the same day: same base rule, no def of the base (reached
+through it and mutated in place, as the element-store family argues).
+Emitted code for those two is byte-identical corpus-wide - no corpus
+program puts one where liveness decides anything yet - so the row test
+is their whole net (watched: Elem's index dropped and Member's base
+dropped each fail it by name).
+
+It was found by the #107 P6 chunk hook: the JIT's argument FUSION drops
+a staging move without asking whether the temp is read after the call -
+the bytecode inliner's gate 1, missing on the JIT side - and a gate on
+the barrier-conservative liveness declined fusions next to every such
+call (the W5 refcount test's `refcount(x)` is one). With the row the gate
+is free: argfuse now skips a staging temp `jit_slot_liveness` says is
+live after its call (a failed liveness covers nothing, and an uncovered
+slot reads as live - the move is kept, the safe answer).
+
+Emitted code: 6 corpus programs change, every one SMALLER - 12_compound
+_bitops 3,246 -> 2,465 instructions (-24%), the sorts by 4 each - and
+168 are byte-identical. Wall clock (one interleaved run, `OPT=1
+ASSERTS=0`): 33_sort_ints 1.00x, 34_sort_custom_cmp 1.02x - flat, as
+four instructions would be. Nets: `use_def_builtin_lv` derives the
+expected sets from the VM handler, one case per arg0 kind and both rest
+forms, and checks the op stays a barrier without pools; it is the ONLY
+net that saw a dropped rest-run read or a dropped arg0 read (watched -
+-rt and corpus_diff stayed green, no consumer's answer depends on them
+yet). Removing the argfuse gate fails `int_splice_gates` (watched).
+corpus_diff's whole matrix (57 configurations x 69 programs), the
+enumerator's tiers 1 and 2 and int_run are green.

@@ -2830,4 +2830,16 @@ struct Chunk {
      */
     std::vector<unsigned char> int_param_kinds;
 #endif
+#ifdef TESTS
+    /*
+     * The G1 reach probe's leaf verdict (vm.cpp norec_body_is_leaf), -1
+     * until computed. It used to live in a process-wide map KEYED BY THE
+     * Chunk*, which outlived the chunks: a freed chunk's address reused by
+     * a new one returned the old chunk's answer - address-dependent, so it
+     * showed only on Windows (a test of the classifier went vacuous there
+     * and passed on Linux). Kept ON the chunk, it dies with it. LAST in
+     * the struct, so no offset the JIT bakes moves.
+     */
+    mutable signed char norec_leaf_memo = -1;
+#endif
 };

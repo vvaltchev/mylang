@@ -8499,10 +8499,8 @@ unsigned long g_norec_total, g_norec_plain, g_norec_leaf,
 
 static bool norec_body_is_leaf(const Chunk *c)
 {
-    static std::unordered_map<const Chunk *, bool> memo;
-    auto it = memo.find(c);
-    if (it != memo.end())
-        return it->second;
+    if (c->norec_leaf_memo >= 0)
+        return c->norec_leaf_memo != 0;
     bool leaf = true;
     for (const Instr &i : c->code) {
         switch (i.op) {
@@ -8516,11 +8514,11 @@ static bool norec_body_is_leaf(const Chunk *c)
         if (!leaf)
             break;
     }
-    memo.emplace(c, leaf);
+    c->norec_leaf_memo = leaf ? 1 : 0;
     return leaf;
 }
 
-static void norec_classify(const FuncObject &fo, const Chunk *cck)
+static void norec_classify(const FuncDescriptor *fd, const Chunk *cck)
 {
     g_norec_total++;
     if (!cck->plain_frame)
@@ -8529,8 +8527,8 @@ static void norec_classify(const FuncObject &fo, const Chunk *cck)
     if (!norec_body_is_leaf(cck))
         return;                       /* a deeper frame needs our record */
     g_norec_leaf++;
-    const auto &ps = fo.func->params;
-    if (fo.func->min_args != static_cast<int>(ps.size()))
+    const auto &ps = fd->params;
+    if (fd->min_args != static_cast<int>(ps.size()))
         return;                       /* a skipped opt param binds none */
     g_norec_arity++;
     for (const auto &p : ps) {
@@ -8540,6 +8538,13 @@ static void norec_classify(const FuncObject &fo, const Chunk *cck)
             return;                   /* a reference param needs refcounting */
     }
     g_norec_scalar++;
+}
+
+/* the classifier on a compiled function directly, for its test - which
+ * must not depend on which call path a platform's run takes into it */
+void vm_test_norec_classify(const FuncDescriptor *fd, const Chunk *cck)
+{
+    norec_classify(fd, cck);
 }
 #endif
 
@@ -8622,7 +8627,7 @@ vm_enter_call_lean(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
                    int_type argbase, size_t nargs, int_type dst)
 {
 #ifdef TESTS
-    norec_classify(fo, cck);
+    norec_classify(fo.func, cck);
 #endif
     try {
         vm_frame_setup_lean(act, ctx, chunk, pc, fo, cck, argbase, nargs,
@@ -8648,7 +8653,7 @@ vm_enter_call(VmActivation &act, EvalContext &ctx, const Chunk *&chunk,
               std::unique_ptr<PureCacheKey> ckey)
 {
 #ifdef TESTS
-    norec_classify(fo, cck);
+    norec_classify(fo.func, cck);
 #endif
     try {
         vm_frame_setup(act, ctx, chunk, pc, fo, cck, argbase, nargs, dst,
@@ -13377,7 +13382,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                         static_cast<const Chunk *>(fo.func->vm_chunk);
                     if (cck) {
 #ifdef TESTS
-                        norec_classify(fo, cck);
+                        norec_classify(fo.func, cck);
 #endif
                         /* its bind error takes THIS op's carets (the
                          * CallSite's argument spans, stamped below), not

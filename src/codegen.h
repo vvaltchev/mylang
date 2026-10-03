@@ -330,9 +330,12 @@ bool closure_slot_facts(const Chunk &chunk, std::vector<int> &fact_slot,
  * false for an op the table does not know - the caller must then treat it
  * as touching every slot. Exported so an emitter policy that needs
  * per-slot facts cannot grow a second, drifting copy of the table.
+ * `pools`: the chunk the op belongs to, for the rows whose operand run
+ * lives in a pool (CallBuiltinLV); without it those ops are barriers.
  */
 bool jit_op_slot_refs(const Instr &in, std::vector<int> &uses,
-                      std::vector<int> &defs);
+                      std::vector<int> &defs,
+                      const Chunk *pools = nullptr);
 
 /*
  * C5: does this opcode write its dst as a plain SCALAR (int/float/bool)?
