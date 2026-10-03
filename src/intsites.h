@@ -85,6 +85,21 @@
     /* bc_inline_chunk_splice.                                          */ \
     X(splice_choice, "the bytecode splice of a site (0 splice, 1 decline)", \
       F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))  \
+    /* An ENUMERATED decision: the linear scan's PRESSURE CONTEST -    */ \
+    /* which piece loses its register (spills) when the pool is full.  */ \
+    /* 0 is the newcomer, 1+a the a-th active piece. `key` is          */ \
+    /* `<run>/spill#<k>` (GP) or `<run>/fspill#<k>` (float), k the     */ \
+    /* contest's ordinal in that scan. jit.cpp, jit_lsra_assign.        */ \
+    X(spill_choice, "which value spills at register pressure",           \
+      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))  \
+    /* An ENUMERATED decision: the C4b FLOAT LITERAL POOL of a run.     */ \
+    /* `<run>/flitgate` - the cost gate refused the pool (a helper call */ \
+    /* in a loop): 0 refuses, 1 takes it anyway (what FORCE=flit does - */ \
+    /* the epilogues restore the pool). `<run>/flit#<i>` - the i-th    */ \
+    /* ranked literal the pool would hold: 0 holds it, 1 leaves it     */ \
+    /* inline. jit.cpp, pick_float_lits.                                */ \
+    X(flit_choice, "the float literal pool (gate / admit one literal)",   \
+      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))  \
     /* An ENUMERATED decision: the AST INLINE of a call site an engine   */ \
     /* would inline - 0 inlines, 1 declines. `key` is                    */ \
     /* `<caller>/inline@<line>:<col>`. resolver.cpp, the Inliner.        */ \

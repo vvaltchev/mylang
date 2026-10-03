@@ -58,7 +58,8 @@ sys.path.insert(0, HERE)
 from testrun import Run, fingerprint, file_digest  # noqa: E402
 
 # every ENUMERATED decision site records `<site> key=... n= dflt= pick=`
-CHOICE = re.compile(r'^(?:reg_choice|pin_budget|splice_choice|inline_choice) '
+CHOICE = re.compile(r'^(?:reg_choice|pin_budget|splice_choice|inline_choice'
+                    r'|flit_choice|spill_choice) '
                     r'key="([^"]+)" n=(\d+) dflt=(\d+) pick=(\d+)')
 APPLIED = re.compile(r'^choose_applied key="([^"]+)" pick=(\d+)')
 
