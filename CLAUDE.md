@@ -476,6 +476,18 @@ instead of diagnose-and-continue — otherwise a real UB could print and still
 exit 0 past CI's exit-code check. `-fno-omit-frame-pointer` is added whenever
 either sanitizer is on. `-rt` is verified green under both.
 
+**Intrusive tests: `INT_TESTS` (default 0; CMake `-DINT_TESTS=ON`, #107).**
+The test build that may instrument EVERY pipeline stage - observers,
+per-site forcing switches, decision perturbers, test-only builtins - all
+behind `#ifdef INT_TESTS`, so a shipping or a plain `TESTS=1` build is
+unchanged. It IMPLIES `TESTS` (defs.h `#error`s on a hand-rolled
+`-DINT_TESTS` without it). **It is never a measurement subject:**
+`mylang -v` reports `int_tests 0/1` in every build, `bench/run.py`
+REFUSES a binary reporting `int_tests 1`, and the intrusive runner will
+refuse one reporting `0` (`driver_checks.sh` pins the line; set
+`MYLANG_EXPECT_INT_TESTS=1` when running it on an INT lane). Design and
+phases: `plans/intrusive-tests.md` - READ IT before adding a hook.
+
 **Assertions: `ASSERTS` (default 1).** The C `assert()` + the project's
 `ML_CHECK()` invariant net (see *Invariants & hazards*) are **on for every build
 type** (debug AND release), so every build and CI lane exercises them. With

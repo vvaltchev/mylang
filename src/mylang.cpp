@@ -179,6 +179,14 @@ static void show_build_config()
          << "0"
 #endif
          << "        (-rt suite compiled in)" << endl;
+    cout << "  int_tests         "
+#ifdef INT_TESTS
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (intrusive test instrumentation - never benchmark)"
+         << endl;
     cout << "  recycle           "
 #ifdef RECYCLE_ALLOC
          << "1"

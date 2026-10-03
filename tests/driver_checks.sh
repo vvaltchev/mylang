@@ -288,6 +288,19 @@ else
     fail "-v: MYLANG_NO_LOWMEM=1 did not refuse the arena [$out]"
 fi
 
+# -v REPORTS WHETHER THE INTRUSIVE TEST INSTRUMENTATION IS COMPILED IN
+# (#107). bench/run.py refuses `int_tests 1`, and the intrusive runner
+# will refuse `int_tests 0` - both read this line, so it must exist in
+# every build and its value must match the build: MYLANG_EXPECT_INT_TESTS
+# (default 0) names what this lane was built with.
+out=$("$BIN" -v 2>&1)
+want_int=${MYLANG_EXPECT_INT_TESTS:-0}
+if printf '%s' "$out" | grep -q "^  int_tests  *$want_int"; then
+    pass "-v: reports int_tests $want_int"
+else
+    fail "-v: expected 'int_tests $want_int' [$out]"
+fi
+
 # A .myv whose chunk pool holds a FUNCTION value must LOAD. #137 bounds
 # every operand an image CONTAINS, but nothing bounded a constructor the
 # LOADER ITSELF calls: read_value built FuncObject(desc, nullptr), and the

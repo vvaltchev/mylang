@@ -36,6 +36,13 @@ using std::make_unique;
 typedef double float_type;
 typedef intptr_t int_type;
 
+/* INT_TESTS (#107) is the intrusive superset of the -rt suite: both build
+ * systems define TESTS with it. A hand-rolled -DINT_TESTS alone would
+ * compile hooks with nothing to drive them. */
+#if defined(INT_TESTS) && !defined(TESTS)
+#error "INT_TESTS requires TESTS (make INT_TESTS=1 / cmake -DINT_TESTS=ON)"
+#endif
+
 #ifndef _MSC_VER
 
    /*

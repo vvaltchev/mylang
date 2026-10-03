@@ -600,6 +600,13 @@ def build_config_problem(binary, label):
     if cfg.get("opt") != "1" or cfg.get("asserts") != "0":
         return ("%s (%s): built OPT=%s ASSERTS=%s, need OPT=1 ASSERTS=0"
                 % (label, binary, cfg.get("opt"), cfg.get("asserts")))
+    # The INTRUSIVE test build (#107) instruments every pipeline stage, so
+    # its timings measure the instrumentation. A binary too old to report
+    # the key predates the flag and cannot have it.
+    if cfg.get("int_tests", "0") != "0":
+        return ("%s (%s): built INT_TESTS=1 (intrusive test instrumentation)"
+                " - a test build, never a measurement subject; rebuild "
+                "without it" % (label, binary))
     return None
 
 
