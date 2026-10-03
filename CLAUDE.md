@@ -623,7 +623,9 @@ registered in its storage's set with its window inside the storage, the
 `has_slices` mirror matches the set, and every registered view is a
 slice of that storage. Watched: a copy-assign that skips the
 registration, and an overwrite that skips the unregistration, each
-abort at their op. A
+abort at their op. And REFCOUNTS: no object counts fewer handles than
+the owning (non-borrowed) slots of the frame holding it - watched: a
+MoveV that copies a reference without a retain. A
 hook in the dispatch loop must be `noexcept` (an exception edge per
 dispatch is a coverage-universe branch) and named `int_*`.
 **Long runs use `tests/testrun.py`** (a `Run`: heartbeat, a unix

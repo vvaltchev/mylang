@@ -637,6 +637,9 @@ public:
      * is a dangling pointer the next detach writes through (an ASan
      * build reports the read itself).
      */
+    /* the refcounted storage, as an identity (the refcount check) */
+    const void *int_storage() const noexcept { return shobj.get(); }
+
     const char *int_slice_fault() const noexcept
     {
         const SharedObject *o = shobj.get();
