@@ -62,4 +62,14 @@
     /* slot's store dropped its release test) or member (C4d: a proven    */ \
     /* struct's member read dropped its type guard); `var` the slot.      */ \
     X(guard_elided, "the JIT elided a reference guard",                       \
-      F(std::string, kind) F(std::string, func) F(std::string, var))
+      F(std::string, kind) F(std::string, func) F(std::string, var)) \
+    /* An ENUMERATED decision (plan 4.2): the register allocator picked   */ \
+    /* one of `n` legal registers - `dflt` the heuristic's index, `pick`  */ \
+    /* the one taken (they differ only under MYLANG_INT_CHOOSE). `key` is */ \
+    /* the instance: function, file (gp/fp) and the pick's ordinal in     */ \
+    /* that function's emission; `reg` the register number picked (the  */ \
+    /* diagnosis: an index says nothing about WHICH register broke).     */ \
+    /* jit.cpp, RegAlloc::take / ftake.                                   */ \
+    X(reg_choice, "the register allocator picked among legal registers",     \
+      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick)  \
+      F(int64_t, reg))

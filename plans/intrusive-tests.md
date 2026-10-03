@@ -366,6 +366,23 @@ assertions on values.
   guards of existing shape tests onto `int_assert_ran`.
 - **P3 - enumerator** for register choice, pin budget, inline/splice;
   the three-tier walk in the runner.
+  **STATUS (2026-10-02): tier 1 over REGISTER CHOICE is built** -
+  `int_choose` + the `reg_choice` site (RegAlloc::take/ftake),
+  `tests/int_enum.py` (every single deviation, oracle = the
+  tree-walker, a deviation must be TAKEN - `choose_applied`, written at
+  once so a crashing run still names it) on the long-run harness
+  `tests/testrun.py` / `tests/testctl.py` (heartbeat, a control socket,
+  resume by a `<mark>@<fingerprint>` low-water-mark token). On an
+  `OPT=1 ASSERTS=1 INT_TESTS=1` lane the whole of tests/functional
+  (68,379 deviations) runs in ~40 s - 35x the debug+ASan lane, REGTRACK
+  and the ML_CHECKs still live - so the planned coverage-chosen program
+  subset was DROPPED: it would save seconds, and a default run's
+  coverage does not measure what its deviations reach. First full run:
+  94 failures, all fixed - two xmm0 writes outside the call bracket,
+  the call-site bake's scratch taking the staged rdi, a capture base a
+  pin conflict left live, and the float-stage class (see
+  docs/jit-optimizations.md, 2026-10-01/02). NOT built yet: the pin
+  BUDGET and inline/splice decision sites, tiers 2-3, and a CI step.
 - **P4 - VM state checker + object census.**
 - **P5 - JIT preserving probe stub** + the per-op register map.
 - **P6 - chunk hook + assembler**; build the three splice-gate tests.

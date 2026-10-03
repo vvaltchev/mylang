@@ -66,6 +66,24 @@ void int_note_query(IntSite s);                     /* a test READ it */
 const std::vector<std::string> &int_events(IntSite s);
 void int_reset();                                   /* every site */
 
+/*
+ * THE DECISION ENUMERATOR (plan section 4.2): a heuristic with several
+ * LEGAL answers asks here instead of deciding alone. `key` names the
+ * decision INSTANCE stably (function + an ordinal, never an address);
+ * the answer is `dflt` unless MYLANG_INT_CHOOSE names this key
+ * (`key=idx`, several separated by `;` or `,`) with an index below `n`. The
+ * runner reads the instances a default run recorded and re-runs the
+ * program once per alternative - deterministically, no seeds.
+ */
+int int_choose(const std::string &key, int n, int dflt);
+
+/* A line about an HONOURED override, written to MYLANG_INT_DUMP at once
+ * (appended and flushed, not at exit): a deviation that aborts the
+ * process must still say what it applied - those are the runs that need
+ * diagnosing. int_choose writes `choose_applied`; a caller may add what
+ * the index meant (the allocator: `choose_reg key=... reg=N`). */
+void int_applied_note(const std::string &line);
+
 /* The canonical printer's value formats - one per allowed field type. */
 void int_put(std::string &o, const char *key, int64_t v);
 void int_put(std::string &o, const char *key, bool v);

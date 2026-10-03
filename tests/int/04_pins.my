@@ -35,3 +35,28 @@ assert(has(ev, "func=\"hot\" var=\"s\" reg=\"r"));
 assert(has(ev, "func=\"hot\" var=\"i\" reg=\"r"));
 assert(has(ev, "func=\"hot\" var=\"f\" reg=\"xmm"));
 assert(!has(ev, "func=\"hot\" var=\"a\" reg=\"r"));
+
+# The float literal pool's load BORROWS rcx (push/pop) when the scratch
+# ask is refused - which nine hot ints and a float literal make happen
+# under the legacy allocator (the MYLANG_JIT_OFF=lsra run of this file),
+# which pins at fragment entry and puts one of them in rcx. The value is
+# the oracle for the clobber; the coverage gate (int_run --gcov) is what
+# proves this file reaches the borrow arm. tests/functional/
+# 58_flit_pinned_rcx.my is the same shape for corpus_diff --levers.
+func press(int n) {
+    var a = 1; var b = 2; var c = 3; var d = 4; var e = 5;
+    var f = 6; var g = 7; var h = 8; var k = 9;
+    var x = 0.5;
+    for (var i = 0; i < n; i++) {
+        a += i; b += a; c += b; d += c; e += d; f += e; g += f; h += g;
+        k += h;
+        x = x * 1.25 + 0.75;
+        a = a & 65535; b = b & 65535; c = c & 65535; d = d & 65535;
+        e = e & 65535; f = f & 65535; g = g & 65535; h = h & 65535;
+        k = k & 65535;
+    }
+    return a + b + c + d + e + f + g + h + k + int(x) % 7;
+}
+var pr = press(int(runtime(1000)));
+print(pr);
+assert(pr == 263073);

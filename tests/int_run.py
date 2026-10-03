@@ -66,7 +66,9 @@ EXEMPT = "INT-COV-EXEMPT"
 # INT helper - which is why they are named int_* / jit_int_* / bc_int_*.
 TEST_FILES = {"src/tests.cpp", "src/inttest.cpp", "src/inttest.h",
               "src/intsites.h", "src/builtins/inttest.cpp.h"}
-INT_HELPER = re.compile(r"(^|[\s:*&])(int_|jit_int_|bc_int_)\w*\(")
+# `[(<]`: a TEMPLATE helper demangles as `int_enumerate<...>(` - the
+# bare `\(` let every instantiation of one count as product code
+INT_HELPER = re.compile(r"(^|[\s:*&])(int_|jit_int_|bc_int_)\w*[(<]")
 
 
 def build_config(binary):
@@ -170,6 +172,22 @@ def collect(build_dir, scratch, ex_cache, tool):
                     if os.path.exists(base + ext)), None)
         if obj:
             by_dir.setdefault(os.path.dirname(obj), []).append(obj)
+    # EVERY object must carry notes: make does not track flags, so a lane
+    # rebuilt with GCOV=1 after a plain build recompiles only what changed
+    # and leaves the rest un-instrumented - the universe then silently
+    # loses whole files (watched: 7 of 23 objects, 70k elements of 114k)
+    missing = []
+    for obj in glob.glob(os.path.join(build_dir, "**", "*.o"),
+                         recursive=True):
+        # the notes sit beside the object, named after it minus `.o`:
+        # Makefile `x.o` -> `x.gcno`, CMake `x.cpp.o` -> `x.cpp.gcno`
+        if not os.path.exists(obj[:-2] + ".gcno"):
+            missing.append(os.path.relpath(obj, build_dir))
+    if missing:
+        raise RuntimeError(
+            "%d object(s) have no coverage notes (a lane built partly "
+            "without GCOV=1 - `make clean` it): %s"
+            % (len(missing), " ".join(sorted(missing)[:8])))
     for d, objs in sorted(by_dir.items()):
         try:
             r = subprocess.run([tool, "--json-format",
@@ -233,12 +251,20 @@ def collect(build_dir, scratch, ex_cache, tool):
 
 def int_header(prog, key):
     """The value of a `# KEY:` line in the program's leading comment."""
+    # a value may continue on following `#   ...` lines (3+ spaces), so
+    # a long configuration list stays within 80 columns
     with open(prog) as f:
-        for line in f:
-            if line.startswith("# " + key + ":"):
-                return line.split(":", 1)[1].strip()
-            if not line.startswith("#"):
-                break
+        lines = f.read().split("\n")
+    for i, line in enumerate(lines):
+        if not line.startswith("#"):
+            break
+        if line.startswith("# " + key + ":"):
+            val = line.split(":", 1)[1].strip()
+            for more in lines[i + 1:]:
+                if not more.startswith("#   "):
+                    break
+                val += " " + more[1:].strip()
+            return val
     return None
 
 
