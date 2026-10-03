@@ -609,9 +609,17 @@ slot not in the chunk's `ref_slots` holding a reference, or a `borrowed`
 slot holding no reference or a slice, aborts with `INT-VMSTATE: <fn>, pc
 N, slot S: ...` at the op that caused it. Watched: removing the catch
 bind slots from `ref_slots` (the #78 step D gap) is caught at its pc,
-where an assert-on, hardening-off run printed the right answer. A hook
-in the dispatch loop must be `noexcept` (an exception edge per dispatch
-is a coverage-universe branch) and named `int_*`.
+where an assert-on, hardening-off run printed the right answer. It also
+checks PROVEN TYPES (our own bytecode only - a loaded image's proofs are
+input): a typed or C3-proven parameter holds its scalar (or `none` when
+`opt`) at every op of its body (`Chunk::int_param_kinds`, INT-only, last
+in the struct, stamped by both drivers), and the dst of the op just run
+holds the one kind that op writes (`int_op_result_kind`, a short list;
+read at the fall-through successor in the same frame, since an op that
+raised skipped its write). Watched: a bind that stops widening an int
+into a `float` param, and CmpIntV writing an int, each abort by name. A
+hook in the dispatch loop must be `noexcept` (an exception edge per
+dispatch is a coverage-universe branch) and named `int_*`.
 **Long runs use `tests/testrun.py`** (a `Run`: heartbeat, a unix
 control socket - `tests/testctl.py status|stop|pause|jobs N` - and
 resume by a low-water-mark token); a new multi-minute tool should

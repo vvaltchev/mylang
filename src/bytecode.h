@@ -2819,4 +2819,15 @@ struct Chunk {
         return al;
     }
 
+#ifdef INT_TESTS
+    /*
+     * #107 P4, the VM state checker's proven-type half: per PARAMETER
+     * slot, what the descriptor promises it holds - 0 nothing, 1 an
+     * int, 2 a float, +4 when `none` is also legal (an `opt` param).
+     * Stamped by both drivers (vm_precompile_all, the loader) from the
+     * descriptor keying the chunk; LAST in the struct, so no field the
+     * JIT bakes an offset of moves in an INT build.
+     */
+    std::vector<unsigned char> int_param_kinds;
+#endif
 };
