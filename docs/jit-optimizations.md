@@ -16929,3 +16929,64 @@ cache pin. The retry's `ra.denied` (from `g_jit_pins_denied`) then keeps
 the base off `rdx`. Emitted code unchanged in every configuration a
 default pick reaches. **Net:** the enumerator over `tests/functional`
 (the `<lambda>@42/gp#2` deviation aborted before, passes after).
+
+
+## THE FLOAT STAGE IS NOT THE FLOAT ABI (2026-10-02)
+
+**Found by the #107 P3 enumerator** over `tests/functional`: with the
+run's first float pick (`<func>/fp#0`) deviated, the staging pair leaves
+xmm0/xmm1 and 87 deviations failed - three programs printing a WRONG
+ANSWER with rc 0 (`04_struct_ctor_fields`, `05_elem_tiers`,
+`35_const_meaning`) and three REGTRACK aborts (`16_elem2_fused`,
+`39_joined_param_coerce`, `42_closure_inline`). Same class as the
+2026-10-01 entry: a site that names xmm0/xmm1 where it means the stage,
+or the stage where it means the SysV argument registers.
+
+1. **`LoadMemberFloat`'s baked read** (forms 1 and 3) emitted RAW BYTES
+   naming xmm0, then stored `fsa()`. Now `Emitter::fload_base` (new) and
+   `cvt_reg` into the stage.
+2. **`LoadElem2Float`'s int-row promote arm** converted into a literal
+   `0` and stored `fsa()`.
+3. **The hoisted float element store** (C1b) stored from a literal `0`.
+4. **`CoerceNumV`'s pinned-source arms** converted / copied into xmm0
+   (tagged `reg:abi`, but nothing there is an ABI). Into the stage now;
+   the float-pin arm passes the pin's own register (one `movaps` fewer).
+5. **`emit_store_elem`'s helper call** loaded the value into `fsa()` -
+   the converse mistake: `jit_store_elem_float` takes it in xmm0, so a
+   moved stage made `f[i] %= 1.1` compute with whatever float pin lived
+   in xmm0. Loads xmm0 now, inside the bracket.
+6. **`emit_libm_call`** (fmod, and `MathFnV`'s libm selectors) loaded
+   xmm0/xmm1 BEFORE the prologue saved the float pins, stored xmm0
+   AFTER the epilogue reloaded them, and fmod `ML_CHECK`ed that the stage
+   never moved. It now takes the argument and result registers and
+   marshals the SysV pair INSIDE the bracket (a parallel move, the swap
+   through xmm2); the result leaves xmm0 before the pin reload.
+7. **`pxor_rr`** had no REX: an xmm8-15 operand overflowed the modrm
+   fields (`pxor xmm9, xmm9` assembled as `pxor xmm1, xmm1`). Reachable
+   by an `fp#1` deviation in the float `/=` element arm.
+
+**Not reachable in a shipping configuration** for the reason the
+2026-10-01 entry gives - the grant always takes xmm0/xmm1. Sites 5-7 had
+no corpus program reaching them, so `tests/functional/59_float_abi_calls.my`
+is new: 202 deviations, 29 failures before (fmod's `ML_CHECK`), 0 after.
+
+**WHY REGTRACK MISSED THE THREE SILENT ONES, AND THE NET THAT CLOSES
+IT.** The tracker answers "does this write CLOBBER a pin?". The silent
+failures clobbered nothing: the value went into an unpinned xmm0 and the
+store READ a stage register this op had never written. Two holes: a
+read had no hook at all, and a raw-byte write (site 1) is invisible to
+`fwrote`. `Emitter::trk_fdef` now records every xmm an encoder writes
+within the current op (reset at `op_boundary`; the float forward bus is
+seeded as written), and every encoder that READS an xmm calls
+`trk_fread`, which aborts unless the register was written by this op,
+is a float pin, or holds a pooled literal. A call that returns a value
+declares it (`trk_fdef_note`). Debug-only, emits nothing; `-rt` green
+in the default configuration, so it has no false positives there.
+
+**Emitted code:** `vdjcmp` against the parent, 23 of 172 programs
+differ, every difference one `xorps xmm0, xmm0` per site in the generic
+push's bind-widening arm (cold), which moved from raw bytes to the
+`cvt` encoder (whose dependency break its baked-push sibling already
+had). **Net:** `int_enum` over `tests/functional`: 87 `fp#` failures
+before, 0 after; the 7 remaining failures are the pre-existing `gp#`
+ones, unchanged.
