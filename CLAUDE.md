@@ -588,7 +588,14 @@ frameless takes the general push instead, keyed `frameless@L:C`, asked
 inside `jit_frameless_candidates` so every consumer of that predicate
 gets the same answer). **Correctness must
 not depend on which legal register the allocator picks** - its first
-run found five JIT bugs the default picks never reach. Run it on the
+run found five JIT bugs the default picks never reach. `--tier 2` runs
+TWO decisions at once within a SCOPE (keys sharing the prefix before the
+last `/`): every combination where that space is small, else a
+deterministic greedy covering array holding every pair of non-default
+values, and a failing row is reduced to a minimal vector. Watched:
+without the call epilogue's float-pool restore, tier 1 fails 4 corpus
+runs and tier 2 fails 301 in 12 programs (11 of them invisible to
+tier 1), each reduced to a 2-4 decision vector. ~112k runs, ~5 min. Run it on the
 FAST lane: `make OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1
 BUILD_DIR=build-claude/int-rel` (the whole functional corpus in ~40 s).
 A hook in a product function must be `noexcept` and allocate nothing

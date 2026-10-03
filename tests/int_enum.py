@@ -18,6 +18,18 @@
 #   Complete for a bug that needs one decision to be different - the r9 pin
 #   and the float-literal rcx clobber were both of that kind.
 #
+#   TIERS 2-3 (--tier 2) - TWO DECISIONS AT ONCE, within one SCOPE: the
+#   instances whose keys share the part before the last `/` (one JIT run's
+#   register picks, budget, spills and literals; one caller's inline and
+#   bytecode-inlining sites; every frameless site). A scope whose space of
+#   2+-deviation combinations is at most TIER2_PRODUCT is run under EVERY
+#   one of them (tier 2); a larger scope under a deterministic greedy
+#   covering array in which every pair of NON-default values at every
+#   pair of its instances appears (tier 3 - a pair with a default on one
+#   side is a tier-1 run already). A failing row is reduced to a minimal
+#   vector by dropping its overrides one at a time, in key order, while
+#   it still fails. Pairs across scopes are not claimed.
+#
 # Each deviation run must print the tree-walker's stdout AND stderr (the
 # caret and backtrace of an uncaught error - RULE 2), exit with its code,
 # and ACTUALLY TAKE the deviation (its dump's `choose_applied` line:
@@ -132,6 +144,81 @@ def read_list(path):
     return out
 
 
+TIER2_PRODUCT = 64
+
+
+def scope_of(key):
+    return key.rsplit("/", 1)[0] if "/" in key else ""
+
+
+def tier2_rows(factors):
+    """Rows (tuples of (key, alt)) for one scope's factors, each a
+    (key, n, dflt) with n >= 2, sorted by key: every combination with two
+    or more non-default values when that space is small, else a greedy
+    pairwise covering array over the non-default values. Deterministic:
+    the first uncovered pair seeds a row, every other factor takes the
+    value covering the most uncovered pairs with the factors decided so
+    far (ties: the default, then the smallest)."""
+    k = len(factors)
+    if k < 2:
+        return []
+    alts = [[a for a in range(n) if a != d] for _, n, d in factors]
+    space = 1
+    for a in alts:
+        space *= len(a) + 1
+        if space > 1 << 20:
+            break
+    rows = []
+    if space - 1 - sum(len(a) for a in alts) <= TIER2_PRODUCT:
+        def rec(i, cur):
+            if i == k:
+                if len(cur) >= 2:
+                    rows.append(tuple(cur))
+                return
+            rec(i + 1, cur)
+            for a in alts[i]:
+                rec(i + 1, cur + [(factors[i][0], a)])
+        rec(0, [])
+        return rows
+    unc = set()
+    for i in range(k):
+        for j in range(i + 1, k):
+            for a in alts[i]:
+                for b in alts[j]:
+                    unc.add((i, a, j, b))
+    while unc:
+        i0, a0, j0, b0 = min(unc)
+        row = [factors[x][2] for x in range(k)]
+        fixed = {i0: a0, j0: b0}
+        row[i0], row[j0] = a0, b0
+        done = set(fixed)
+        for x in range(k):
+            if x in fixed:
+                continue
+            best, best_gain = factors[x][2], -1
+            for v in [factors[x][2]] + alts[x]:
+                g = 0
+                if v != factors[x][2]:
+                    for y in done:
+                        if row[y] == factors[y][2]:
+                            continue
+                        t = (y, row[y], x, v) if y < x else (x, v, y, row[y])
+                        if t in unc:
+                            g += 1
+                if g > best_gain:
+                    best, best_gain = v, g
+            row[x] = best
+            done.add(x)
+        nd = [x for x in range(k) if row[x] != factors[x][2]]
+        for p in range(len(nd)):
+            for q in range(p + 1, len(nd)):
+                x, y = nd[p], nd[q]
+                unc.discard((x, row[x], y, row[y]))
+        if len(nd) >= 2:
+            rows.append(tuple((factors[x][0], row[x]) for x in nd))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
@@ -142,6 +229,9 @@ def main():
     ap.add_argument("--resume", default=None,
                     help="continue a stopped run from its <mark>@<fp> token")
     ap.add_argument("--heartbeat", type=float, default=60.0)
+    ap.add_argument("--tier", type=int, default=1, choices=(1, 2),
+                    help="1: every single deviation; 2: tiers 2-3, "
+                         "pairs within a scope")
     ap.add_argument("--failures-out", default=None,
                     help="write EVERY failure here (stdout shows 40)")
     args = ap.parse_intermixed_args()
@@ -188,54 +278,85 @@ def main():
                 failures.append("%s: the DEFAULT run differs from the "
                                 "tree-walker" % name)
                 continue
-            for key in sorted(inst):
-                n, dflt, _ = inst[key]
-                plan_text.append("%s %s %d %d" % (name, key, n, dflt))
-                for alt in range(n):
-                    if alt != dflt:
-                        items.append((k, key, alt))
+            if args.tier == 1:
+                for key in sorted(inst):
+                    n, dflt, _ = inst[key]
+                    plan_text.append("%s %s %d %d" % (name, key, n, dflt))
+                    for alt in range(n):
+                        if alt != dflt:
+                            items.append((k, ((key, alt),)))
+            else:
+                scopes = {}
+                for key in sorted(inst):
+                    n, dflt, _ = inst[key]
+                    if n >= 2:
+                        scopes.setdefault(scope_of(key), []).append(
+                            (key, n, dflt))
+                for sc in sorted(scopes):
+                    for row in tier2_rows(scopes[sc]):
+                        plan_text.append("%s %s" % (name, row))
+                        items.append((k, row))
         fp = fingerprint(file_digest(binary), "\n".join(plan_text),
-                         args.timeout)
+                         args.timeout, args.tier)
         print("int_enum: %d program(s), %d deviation(s), plan %s"
               % (len(progs), len(items), fp), file=sys.stderr, flush=True)
 
-        def work(i, item):
-            k, key, alt = item
+        def spell(row):
+            return ",".join("%s=%d" % kv for kv in row)
+
+        def attempt(i, k, row):
             dp = os.path.join(tmp, "d-%d.txt" % i)
             try:
                 os.remove(dp)       # the dump is appended to
             except OSError:
                 pass
-            env = dict(base_env, MYLANG_INT_CHOOSE="%s=%d" % (key, alt),
+            env = dict(base_env, MYLANG_INT_CHOOSE=spell(row),
                        MYLANG_INT_DUMP=dp)
             r = run(binary, [progs[k]], env, args.timeout)
-            taken = (key, alt) in applied(dp)
+            got = applied(dp)
             regs = chosen_regs(dp)
             try:
                 os.remove(dp)
             except OSError:
                 pass
+            return r, got, regs
+
+        def work(i, item):
+            k, row = item
+            r, got, regs = attempt(i, k, row)
             ref = refs[k]
             name = os.path.relpath(progs[k], ROOT)
             # RULE 2: everything observable - exit code, stdout AND
             # stderr (an uncaught error's caret and backtrace live there)
             if r != ref:
-                msg = "%s %s=%d%s: rc=%s%s%s" % (
-                    name, key, alt,
+                if len(row) > 1:
+                    # reduce: drop overrides in key order while it fails
+                    cur = list(row)
+                    for kv in list(row):
+                        trial = [x for x in cur if x != kv]
+                        if trial and attempt(i, k, tuple(trial))[0] != ref:
+                            cur = trial
+                    row = tuple(cur)
+                    r, got, regs = attempt(i, k, row)
+                msg = "%s %s%s: rc=%s%s%s" % (
+                    name, spell(row),
                     " (reg %s)" % "/".join(regs) if regs else "", r[0],
                     "" if r[1] == ref[1] else ", stdout differs",
                     "" if r[2] == ref[2] else ", stderr differs")
                 if r[2]:
                     msg += " | " + r[2].strip().splitlines()[0][:150]
                 return msg
-            if not taken:
-                return "%s %s=%d: the deviation was NOT taken (vacuous)" % (
-                    name, key, alt)
+            # tier 1: the one deviation must be taken. A combination may
+            # legitimately lose an instance to another of its deviations,
+            # so it is vacuous only when none of its overrides was taken.
+            if not any(kv in got for kv in row):
+                return "%s %s: the deviation was NOT taken (vacuous)" % (
+                    name, spell(row))
             return None
 
         def describe(item):
-            k, key, alt = item
-            return "%s %s=%d" % (os.path.basename(progs[k]), key, alt)
+            k, row = item
+            return "%s %s" % (os.path.basename(progs[k]), spell(row))
 
         r = Run("int_enum", items, work, fp, jobs, resume=args.resume,
                 heartbeat=args.heartbeat, describe=describe)
