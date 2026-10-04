@@ -5,6 +5,7 @@ tests/run - every kind of MyLang test, from one entry point.
 
     tests/run                       the quick check: short + med tests
     tests/run -l                    list what would run (-L: everything)
+    tests/run -n                    print every command it would run
     tests/run -l -d                 ... with each test's cases
     tests/run -t long               short, med and long tests
     tests/run -T fuzz               one test type (a prefix is enough)
@@ -691,12 +692,19 @@ def tail_lines(path, n):
         return []
 
 
+def rel_arg(a):
+    """An argument with the checkout's own paths made relative (inside
+    a `sh -c` script too)."""
+    a = a.replace(ROOT + os.sep, "")
+    return re.sub(re.escape(ROOT) + r"(?=[\s'\"]|$)", ".", a)
+
+
 def quote_cmd(st):
     env = " ".join("%s=%s" % (k, shlex.quote(v))
                    for k, v in sorted(st.env.items())
                    if k != "MYLANG_TEST_JOBS")
     return (env + " " if env else "") + " ".join(
-        shlex.quote(rel(a)) for a in st.cmd)
+        shlex.quote(rel_arg(a)) for a in st.cmd)
 
 
 def reproduce(st, failed_cases):
@@ -1030,6 +1038,9 @@ def parse_args(cat):
                    help="list the builds, their recipes and what each "
                         "binary's `mylang -v` must say")
     g = ap.add_argument_group("running")
+    g.add_argument("-n", "--dry-run", action="store_true",
+                   help="print the builds, checks and every test's command "
+                        "line, and run nothing")
     g.add_argument("-o", "--show-output", action="store_true",
                    help="show each test's whole output, even on success")
     g.add_argument("-j", "--jobs", type=int, default=0,
@@ -1081,6 +1092,7 @@ def parse_args(cat):
         args.bins[lane] = os.path.abspath(path)
     if args.list_all:
         args.list, args.max_class, args.allow_manual = True, "any", True
+    args.seed_given = args.seed is not None
     if args.seed is None:
         args.seed = random.SystemRandom().randrange(1, 10 ** 9)
     return args
@@ -1200,7 +1212,8 @@ def main():
         do_list(sel, args, times)
         return OK
 
-    testjobs.ensure_idle()
+    if not args.dry_run:
+        testjobs.ensure_idle()
     jobs = args.jobs if args.jobs > 0 else testjobs.count()
     # a wide test runs its own pool: up to three at once, but never with
     # fewer than four workers each - on a small box (a 4-core CI runner
@@ -1213,10 +1226,11 @@ def main():
     stamp = time.strftime("%Y%m%d-%H%M%S")
     logdir = os.path.abspath(args.logs or os.path.join(
         args.build_root, "test-logs", stamp))
-    os.makedirs(logdir, exist_ok=True)
     latest = os.path.join(os.path.dirname(logdir), "latest")
     try:
-        if not args.logs and (os.path.islink(latest)
+        if not args.dry_run:
+            os.makedirs(logdir, exist_ok=True)
+        if not args.dry_run and not args.logs and (os.path.islink(latest)
                               or not os.path.exists(latest)):
             if os.path.islink(latest):
                 os.unlink(latest)
@@ -1238,6 +1252,9 @@ def main():
                 sel.remove(t)
     need = sorted({l for t in sel for l in t.lanes()})
     build = [] if args.no_build else [l for l in need if l not in args.bins]
+    if args.dry_run:
+        return dry_run(sel, args, ctx, need, build, skipped, jobs, share,
+                       times)
 
     caps = {"rt": testjobs_cap("rtcap"), "build": testjobs_cap("buildcap")}
     out.line("tests/run: %d test(s), %d build(s), %d cores, seed %d" % (
@@ -1270,24 +1287,8 @@ def main():
             steps = []
             need = []
     for t in sel:
-        tc = TestCtx(ctx, t)
-        cmd = t.cmd(tc)
-        if args.shard:
-            cmd += t.shard(args.shard)
-        cmd += args.extra
-        env = dict(t.env)
-        if t.wide:
-            env["MYLANG_TEST_JOBS"] = str(share)
-        if t.lane and LANES[t.lane].expect.get("int_tests") == "1":
-            # driver_checks pins `int_tests 0` unless told otherwise
-            env["MYLANG_EXPECT_INT_TESTS"] = "1"
-        st = Step(t.name, cmd, deps=["check:" + l for l in t.lanes()
-                                     if l in need],
-                  cost=share if t.wide else 1, klass=t.klass,
-                  env=env, est=expected(t, times), test=t,
-                  label="%s: %s" % (t.type, t.name),
-                  prep=(lambda g, c: lambda: [f(c) for f in g])(
-                      t.guards, tc) if t.guards else None)
+        st = test_step(t, ctx, args, share, need, times)
+        cmd = st.cmd
         if args.case:
             cases = list_cases(t, ctx.bin(t.lane))
             rx = re.compile(args.case)
@@ -1337,6 +1338,91 @@ def main():
     save_times(args.build_root, times)
 
     return summary(steps, skipped, wall, logdir, out)
+
+
+def test_step(t, ctx, args, share, need, times):
+    """The step that runs test `t` - what a run executes and what a dry
+    run prints."""
+    tc = TestCtx(ctx, t)
+    cmd = t.cmd(tc)
+    if args.shard:
+        cmd += t.shard(args.shard)
+    cmd += args.extra
+    env = dict(t.env)
+    if t.wide:
+        env["MYLANG_TEST_JOBS"] = str(share)
+    if t.lane and LANES[t.lane].expect.get("int_tests") == "1":
+        # driver_checks pins `int_tests 0` unless told otherwise
+        env["MYLANG_EXPECT_INT_TESTS"] = "1"
+    return Step(t.name, cmd, deps=["check:" + l for l in t.lanes()
+                                   if l in need],
+                cost=share if t.wide else 1, klass=t.klass,
+                env=env, est=expected(t, times), test=t,
+                label="%s: %s" % (t.type, t.name),
+                prep=(lambda g, c: lambda: [f(c) for f in g])(
+                    t.guards, tc) if t.guards else None)
+
+
+def dry_run(sel, args, ctx, need, build, skipped, jobs, share, times):
+    """Print what a run would do, in the order it would do it, and do
+    none of it: no build, no check, no test, no log directory."""
+    print("tests/run: dry run - nothing is built or run")
+    print("%d test(s), %d build(s), %d cores, seed %d%s" % (
+        len(sel), len(build), jobs, args.seed,
+        "" if args.seed_given else " (a run draws a fresh one; --seed N "
+        "fixes it)"))
+    if build:
+        print()
+        print("builds (incremental):")
+        steps = build_steps(build, args.build_root, jobs)
+        for st in steps:
+            if st.name == "nojit-src":
+                print("  copy src/ and the Makefile to %s, jit.h's platform "
+                      "guard set to #if 0" % rel_arg(os.path.join(
+                          args.build_root, "nojit-src")))
+            else:
+                print("  " + quote_cmd(st))
+    if need:
+        print()
+        print("binary checks (mylang -v must say):")
+        for l in need:
+            want = ", ".join("%s %s" % (k, "|".join(v) if isinstance(
+                v, tuple) else v) for k, v in LANES[l].expect.items())
+            print("  %-12s %s%s" % (l, rel_arg(ctx.bin(l)) + ": ", want))
+    for t, why in skipped:
+        print("not run: %s - %s" % (t.name, why))
+    print()
+    print("tests:")
+    total = 0.0
+    for t in sel:
+        st = test_step(t, ctx, args, share, need, times)
+        notes = [t.cls, "~" + human(st.est)]
+        total += st.est
+        if t.wide:
+            notes.append("%d workers" % share)
+        if t.exclusive:
+            notes.append("alone on its build")
+        if t.guards:
+            notes.append("first checks: " + ", ".join(
+                g.__name__.replace("guard_", "") for g in t.guards))
+        print("  %s  [%s]" % (st.label, "; ".join(notes)))
+        cmd = quote_cmd(st)
+        if args.case:
+            cases = list_cases(t, ctx.bin(t.lane))
+            if cases is None:
+                cmd += "  # + --only <the cases matching %s>" % shlex.quote(
+                    args.case)
+            else:
+                rx = re.compile(args.case)
+                hit = [c for c in cases if rx.search(c)]
+                cmd = (quote_cmd(Step(st.name, st.cmd + CASES[t.cases][1](
+                    rx_exact(hit)), env=st.env)) if hit
+                       else "# no case matches %r" % args.case)
+        print("      " + (cmd if len(cmd) < 400 else cmd[:397] + "..."))
+    print()
+    print("the tests' expected times add up to %s; they run side by side "
+          "on %d cores (builds not included)" % (human(total), jobs))
+    return OK
 
 
 def testjobs_cap(what):
