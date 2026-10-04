@@ -1,0 +1,18 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> SyntaxError at line 1, col 5
+
+    var _ = _;
+        ^^^^^^
+'_' is reserved as the destructuring/foreach placeholder and cannot be used as a variable, parameter, or function name
+>> >> Undefined variable 'v1' at line 3, col 10:12
+
+    var v1 = v1;
+             ^^
+>> _ = [1,2];
+>> DivisionByZeroEx: Division by zero at line 4, col 3:4
+
+    1/0;
+      ^
+>> No help for 'q'. Try :help, :help builtins, :help language, or :help commands
+>> No help for ':a'. Try :help, :help builtins, :help language, or :help commands
+>> 

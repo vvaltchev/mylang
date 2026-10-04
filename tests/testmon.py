@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# A PROGRESS MONITOR FOR A SHELL TOOL (tests/testrun.py's Monitor, served
+# from outside the process doing the work).
+#
+#   tests/testmon.py NAME TOTAL DIR GLOB --pid PID [--phase P]
+#                    [--heartbeat S]
+#
+# Serves NAME's status socket - so `tests/testctl.py` lists it with its
+# percentage - where `done` is the number of files in DIR matching GLOB:
+# a tool that writes one result file per finished unit of work (as
+# tests/corpus_diff.sh does) gets progress without knowing Python. It
+# exits on its own when PID (the tool) is gone, so a tool killed
+# mid-run leaves no monitor behind; the tool should still kill it when
+# done.
+
+import argparse
+import glob
+import os
+import signal
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from testrun import Monitor  # noqa: E402
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("name")
+    ap.add_argument("total", type=int)
+    ap.add_argument("dir")
+    ap.add_argument("pattern")
+    ap.add_argument("--pid", type=int, required=True)
+    ap.add_argument("--phase", default=None)
+    ap.add_argument("--heartbeat", type=float, default=60.0)
+    args = ap.parse_args()
+    # `kill` from the tool must still remove the socket (the with below)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    # named for the TOOL's pid, so testctl shows the pid a user would kill
+    mon = Monitor(args.name, total=args.total, phase=args.phase,
+                  heartbeat=args.heartbeat, pid=args.pid)
+    with mon:
+        while alive(args.pid):
+            n = len(glob.glob(os.path.join(args.dir, args.pattern)))
+            with mon.lock:
+                mon.done = n
+            time.sleep(1)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

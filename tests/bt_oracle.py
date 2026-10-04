@@ -27,6 +27,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from testrun import Monitor  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # (name, extra argv, extra env). The reference is first.
@@ -126,7 +129,12 @@ def main():
 
     fails = 0
     inlined = 0
+    # progress: tests/testctl.py lists this run with its percentage
+    mon = Monitor("bt_oracle", total=len(progs), phase="programs")
+    mon.__enter__()
     for prog in progs:
+        mon.set_current(os.path.basename(prog))
+        mon.advance()
         ref = run(binary, prog, REF[1], REF[2])
         name = os.path.basename(prog)
         bad = False
@@ -159,6 +167,7 @@ def main():
         if bad:
             fails += 1
     shutil.rmtree(tmp, ignore_errors=True)
+    mon.__exit__(None, None, None)
     print("bt_oracle: %d/%d programs render identically to `-ni -tw` "
           "in %d configurations; %d inline" % (
               len(progs) - fails, len(progs), len(CONFIGS) + 1, inlined))

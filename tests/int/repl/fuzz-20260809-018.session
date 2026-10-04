@@ -1,0 +1,7 @@
+b;
+func len(a) { return a; }
+var _ = {
+:type
+:trace q on
+g(1);
+:quit

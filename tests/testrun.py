@@ -28,6 +28,18 @@
 # every failure found so far, so a resumed run still reports them) and
 # prints the resume token.
 #
+# A tool whose work is NOT a list of independent items - sequential
+# phases, a shrink with no fixed total, a loop that must stay serial -
+# uses a `Monitor` instead: the same socket, heartbeat line and status
+# fields, fed by the tool's own `advance()` / `phase()` calls, without
+# the resume machinery. EVERY test tool that can run for more than a
+# minute serves one or the other, so `tests/testctl.py` (no arguments)
+# lists everything running with a percentage.
+#
+# THE STATUS FIELDS both serve (the `status` action): name, pid, phase,
+# done, total, `percent` (0-100, the obvious one), elapsed_s, eta_s and
+# `eta` (human), rate_per_s, failures, plus each kind's extras.
+#
 # Stdlib only. Single-host. The runs directory is $MYLANG_TEST_RUNS, else
 # $XDG_RUNTIME_DIR/mylang-tests, else /tmp/mylang-tests-<uid>.
 
@@ -71,6 +83,177 @@ def file_digest(path):
     return h.hexdigest()
 
 
+def fmt_secs(secs):
+    if secs is None:
+        return "?"
+    secs = int(secs)
+    if secs >= 3600:
+        return "%dh%02dm" % (secs // 3600, secs % 3600 // 60)
+    return "%dm%02ds" % divmod(secs, 60)
+
+
+def percent_of(done, total):
+    return round(100.0 * done / total, 1) if total else 0.0
+
+
+def serve_socket(sock_path, handle):
+    """Listen on `sock_path`; each request line (JSON) is answered with
+    handle(request) (JSON). Returns the listening socket (close it to
+    stop)."""
+    try:
+        os.unlink(sock_path)
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    srv.listen(8)
+
+    def client(conn):
+        with conn:
+            f = conn.makefile("rw")
+            for line in f:
+                try:
+                    resp = handle(json.loads(line))
+                except (ValueError, TypeError) as e:
+                    resp = {"error": str(e)}
+                f.write(json.dumps(resp) + "\n")
+                f.flush()
+
+    def accept():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=client, args=(conn,),
+                             daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    return srv
+
+
+class Monitor:
+    """Progress and status for a tool that is not a `Run` (see the header).
+
+        mon = Monitor("int_run", total=len(units), phase="units")
+        with mon:
+            for u in units:
+                mon.set_current(u)
+                ...
+                mon.advance()
+            mon.phase("census", total=len(corpus))
+
+    `percent_fn`, when given, overrides done/total (a time-budgeted
+    shrink knows its progress only as elapsed / budget)."""
+
+    def __init__(self, name, total=0, phase=None, heartbeat=60.0,
+                 percent_fn=None, pid=None):
+        self.name = name
+        # the pid shown and used in the socket name: the tool's own, or
+        # (tests/testmon.py) the shell tool it watches
+        self.pid = pid or os.getpid()
+        self.total = total
+        self.done = 0
+        self.failures = 0
+        self.cur_phase = phase
+        self.current = None
+        self.extra = {}
+        self.heartbeat = heartbeat
+        self.percent_fn = percent_fn
+        self.lock = threading.Lock()
+        self.t0 = self.tp = time.time()
+        self.sock_path = os.path.join(
+            runs_dir(), "%s-%d.sock" % (name, self.pid))
+        self.srv = None
+        self.stop_beat = threading.Event()
+
+    def __enter__(self):
+        self.srv = serve_socket(self.sock_path, self._handle)
+        print("[%s] started; control socket %s" % (self.name,
+                                                   self.sock_path),
+              file=sys.stderr, flush=True)
+
+        def beat():
+            while not self.stop_beat.wait(self.heartbeat):
+                print(self.line(), file=sys.stderr, flush=True)
+
+        threading.Thread(target=beat, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop_beat.set()
+        if self.srv:
+            self.srv.close()
+        try:
+            os.unlink(self.sock_path)
+        except OSError:
+            pass
+        return False
+
+    def advance(self, n=1, failed=False):
+        with self.lock:
+            self.done += n
+            if failed:
+                self.failures += 1
+
+    def phase(self, name, total=None):
+        """Enter a new phase; its own done/total restart from 0."""
+        with self.lock:
+            self.cur_phase = name
+            self.done = 0
+            self.tp = time.time()
+            if total is not None:
+                self.total = total
+
+    def set_total(self, total):
+        with self.lock:
+            self.total = total
+
+    def set_current(self, what):
+        with self.lock:
+            self.current = str(what)
+
+    def set_extra(self, **kw):
+        with self.lock:
+            self.extra.update(kw)
+
+    def status(self):
+        with self.lock:
+            now = time.time()
+            el = now - self.tp
+            rate = self.done / el if el > 0 else 0.0
+            pct = (self.percent_fn() if self.percent_fn
+                   else percent_of(self.done, self.total))
+            left = self.total - self.done
+            eta = (round(left / rate, 1)
+                   if rate > 0 and left >= 0 and not self.percent_fn
+                   else (round(el * (100 - pct) / pct, 1)
+                         if self.percent_fn and pct > 0 else None))
+            st = {"name": self.name, "pid": self.pid,
+                  "phase": self.cur_phase, "percent": round(pct, 1),
+                  "done": self.done, "total": self.total,
+                  "elapsed_s": round(now - self.t0, 1),
+                  "rate_per_s": round(rate, 2), "eta_s": eta,
+                  "eta": fmt_secs(eta), "failures": self.failures,
+                  "current": self.current}
+            st.update(self.extra)
+            return st
+
+    def line(self):
+        s = self.status()
+        return ("[%s] %s%.1f%% (%d/%d), ETA %s, %d failure(s)%s"
+                % (self.name, (s["phase"] + ": ") if s["phase"] else "",
+                   s["percent"], s["done"], s["total"], s["eta"],
+                   s["failures"],
+                   (", now " + s["current"]) if s["current"] else ""))
+
+    def _handle(self, req):
+        if req.get("action") == "status":
+            return self.status()
+        return {"error": "%s supports only `status` (it is a Monitor, "
+                         "not a resumable Run)" % self.name}
+
+
 def parse_token(token):
     """`<mark>@<fingerprint>` -> (mark, fingerprint)."""
     mark, _, fp = token.partition("@")
@@ -85,8 +268,10 @@ class Run:
     item for status displays."""
 
     def __init__(self, name, items, work, fp, jobs, resume=None,
-                 heartbeat=60.0, describe=str, window_per_job=4):
+                 heartbeat=60.0, describe=str, window_per_job=4,
+                 phase=None):
         self.name = name
+        self.phase = phase
         self.items = items
         self.work = work
         self.fp = fp
@@ -149,14 +334,19 @@ class Run:
             el = time.time() - self.t0
             rate = self.ndone / el if el > 0 else 0.0
             left = len(self.items) - self.mark - len(self.done)
+            eta = round(left / rate, 1) if rate > 0 else None
+            done = self.mark + len(self.done)
             return {
                 "name": self.name, "pid": os.getpid(),
+                "phase": self.phase,
+                "percent": percent_of(done, len(self.items)),
+                "eta": fmt_secs(eta),
                 "total": len(self.items), "mark": self.mark,
-                "done": self.mark + len(self.done),
+                "done": done,
                 "this_run_done": self.ndone,
                 "elapsed_s": round(el, 1),
                 "rate_per_s": round(rate, 2),
-                "eta_s": round(left / rate, 1) if rate > 0 else None,
+                "eta_s": eta,
                 "failures": len(self.failures),
                 "jobs": self.jobs,
                 "paused": not self.paused.is_set(),
@@ -168,11 +358,11 @@ class Run:
 
     def _line(self):
         s = self.status()
-        eta = ("%dm%02ds" % divmod(int(s["eta_s"]), 60)
-               if s["eta_s"] is not None else "?")
-        return ("[%s] %d/%d done, %.1f/s, ETA %s, %d failure(s), "
-                "resume %s" % (self.name, s["done"], s["total"],
-                               s["rate_per_s"], eta, s["failures"],
+        return ("[%s] %s%.1f%% (%d/%d), %.1f/s, ETA %s, %d failure(s), "
+                "resume %s" % (self.name,
+                               (s["phase"] + ": ") if s["phase"] else "",
+                               s["percent"], s["done"], s["total"],
+                               s["rate_per_s"], s["eta"], s["failures"],
                                s["token"]))
 
     # -- control socket ----------------------------------------------------

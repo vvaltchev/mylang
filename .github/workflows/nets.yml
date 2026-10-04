@@ -103,11 +103,15 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --levers
 
-    # random deep-nested programs against a CPython twin, all engines
+    # random deep-nested programs against a CPython twin, all engines.
+    # A FRESH SEED PER RUN (the run id; a re-run keeps it): with a fixed
+    # seed every push ran the same 250 programs, a regression corpus
+    # rather than a fuzzer. The seed is printed; a failure reproduces
+    # with it. All three fuzzers here do this.
     - name: nested_fuzz
       working-directory: ${{github.workspace}}/build
       run: python3 $GITHUB_WORKSPACE/tests/nested_fuzz.py
-           --mylang ./mylang --count 250
+           --mylang ./mylang --count 250 --seed ${{github.run_id}}
 
   # ---------------------------------------------------------------- #
   # ⛔ IS THE DISASSEMBLER TELLING THE TRUTH? Every instruction the JIT
@@ -455,7 +459,7 @@ jobs:
     - name: myv_fuzz
       working-directory: ${{github.workspace}}/build
       run: python3 $GITHUB_WORKSPACE/tests/myv_fuzz.py ./mylang -n 400
-           --save $GITHUB_WORKSPACE/myv-fuzz-bad
+           --seed ${{github.run_id}} --save $GITHUB_WORKSPACE/myv-fuzz-bad
 
     # a finding cannot be regenerated from a seed - an image embeds its
     # source path - so keep it
@@ -489,7 +493,7 @@ jobs:
     - name: repl_fuzz
       working-directory: ${{github.workspace}}/build
       run: python3 $GITHUB_WORKSPACE/tests/repl_fuzz.py ./mylang -n 400
-           --save $GITHUB_WORKSPACE/repl-fuzz-bad
+           --seed ${{github.run_id}} --save $GITHUB_WORKSPACE/repl-fuzz-bad
     - name: Upload findings
       if: failure()
       uses: actions/upload-artifact@v4

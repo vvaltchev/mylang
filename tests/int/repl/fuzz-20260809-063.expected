@@ -1,0 +1,99 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> => 201
+>> TypeMismatchEx: can only throw a struct instance, got 'int'
+>> SyntaxError at line 3, col 1
+
+    return -9223372036854775808;
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+'return' is only allowed inside a function
+>> => [
+     [
+       [
+         [
+           [
+             [
+               [
+                 [
+                   [
+                     [
+                       [
+                         [
+                           [
+                             [
+                               [
+                                 [
+                                   [
+                                     [
+                                       [
+                                         [
+                                           [
+                                             [
+                                               [
+                                                 [
+                                                   [
+                                                     [
+                                                       [
+                                                         [
+                                                           [
+                                                             [
+                                                               [
+                                                                 [
+                                                                   [
+                                                                     [
+                                                                       [
+                                                                         [
+                                                                           [
+                                                                             [
+                                                                               [
+                                                                                 []
+                                                                               ]
+                                                                             ]
+                                                                           ]
+                                                                         ]
+                                                                       ]
+                                                                     ]
+                                                                   ]
+                                                                 ]
+                                                               ]
+                                                             ]
+                                                           ]
+                                                         ]
+                                                       ]
+                                                     ]
+                                                   ]
+                                                 ]
+                                               ]
+                                             ]
+                                           ]
+                                         ]
+                                       ]
+                                     ]
+                                   ]
+                                 ]
+                               ]
+                             ]
+                           ]
+                         ]
+                       ]
+                     ]
+                   ]
+                 ]
+               ]
+             ]
+           ]
+         ]
+       ]
+     ]
+   ]
+>> CannotRebindBuiltinEx: Cannot rebind builtin at line 1, col 9
+
+    var int = [];
+            ^^^^^
+>> tracing: arrays autoconst autopure fold infer inline specialize template
+>> builtin   (runtime type)
+>> SyntaxError at line 5, col 1
+
+    return {};
+    ^^^^^^^^^^
+'return' is only allowed inside a function
+>> 

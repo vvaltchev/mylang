@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+"""
+mutate.py - MUTATION TESTING: does any test notice when the code is wrong?
+
+    tests/mutate.py [--files src/jit.cpp,...] [--count N] [--seed S]
+                    [--shard I/N] [--stages rt,corpus,int,enum,fuzz]
+                    [--jobs W] [--out FILE.json] [--list]
+
+WHY. Coverage says a test REACHED a line; it says nothing about whether
+the test would FAIL if that line computed the wrong thing. A function
+that should return 2*x and returns 2+x passes every test whose input is
+x = 2, at full coverage. A mutation tester makes that wrong version on
+purpose - one small edit to the source (`<` for `<=`, `-` for `+`, a
+condition negated, a constant off by one), a rebuild, the tests - and
+asks whether anything failed. A mutant nothing kills is a SURVIVOR: a
+concrete place where a wrong answer would ship unnoticed. The survivors
+are the output; the score is only a summary.
+
+HOW.
+  1. ENUMERATE every mutation site in the chosen files (.cpp only: an
+     edit to a header rebuilds everything), skipping comments, string
+     and character literals, preprocessor lines and `operator` names.
+     The operators (OPS below) are deliberately the small classic set.
+  2. SAMPLE --count of them, deterministically from --seed; --shard I/N
+     keeps every Nth of the sample, so N CI jobs split one run.
+  3. Each worker owns a COPY of the tree (never the checkout: a
+     mutation is a sabotage, and CLAUDE.md's rule is that a sabotage
+     harness must not touch the working tree) and an INT_TESTS build in
+     it - `OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1`, the fast lane,
+     ML_CHECK and REGTRACK live. The PRISTINE build must pass every
+     stage first, or the run stops: a stage that fails without a
+     mutation would kill every mutant and mean nothing.
+  4. Per mutant: apply the edit, rebuild (one translation unit and the
+     link), run the stages IN ORDER and stop at the first that fails -
+         build   the mutant does not compile: STILLBORN, not counted
+         rt      ./mylang -rt
+         corpus  tests/corpus_diff.sh (the engine differential)
+         int     tests/int_run.py --no-rt (tests/int, the REPL
+                 sessions, the object census, the VM/JIT state checkers)
+         enum    tests/int_enum.py --tier 1 over tests/functional
+         fuzz    nested_fuzz, myv_fuzz and repl_fuzz, fixed seeds
+     A stage over its timeout (5x its pristine time, at least 60 s)
+     counts as a kill: a mutant that loops forever was noticed.
+     The deterministic stages run before `fuzz`, so "killed by fuzz"
+     means EXACTLY "no deterministic test noticed it" - the measured
+     value of the fuzzers.
+  5. REPORT: the score, kills per stage, and every survivor with its
+     file, line and edit (--out writes it all as JSON).
+
+COST. A mutant costs a recompile of its file at -O3 (tens of seconds
+for the big ones), a link, and the stages up to its first kill; a
+survivor runs them all. Hours for a few hundred mutants - which is why
+CI runs it ON DEMAND (.github/workflows/mutate.yml), sharded, and why
+nobody should run a full sample locally. A local `--count 3` checks the
+tool itself.
+"""
+
+import argparse
+import json
+import os
+import queue
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import int_run   # noqa: E402
+import testjobs  # noqa: E402
+from testrun import Run, Monitor, fingerprint  # noqa: E402
+
+BUILD = ["OPT=1", "ASSERTS=1", "LTO=0", "TESTS=1", "INT_TESTS=1"]
+DEFAULT_FILES = ["src/jit.cpp", "src/codegen.cpp", "src/vm.cpp",
+                 "src/eval.cpp", "src/inferencer.cpp", "src/resolver.cpp",
+                 "src/parser.cpp", "src/serialize.cpp"]
+
+# (name, regex on the CODE part of a line, replacement function). Each
+# regex match is one site. The spacing requirements are what keep `<`
+# from matching a template argument list or `->`.
+OPS = [
+    ("rel", re.compile(r"(?<=\s)(<=|>=|<|>)(?=\s)"),
+     {"<": "<=", "<=": "<", ">": ">=", ">=": ">"}),
+    ("eq", re.compile(r"(?<=\s)(==|!=)(?=\s)"), {"==": "!=", "!=": "=="}),
+    ("logic", re.compile(r"(?<=\s)(&&|\|\|)(?=\s)"),
+     {"&&": "||", "||": "&&"}),
+    ("arith", re.compile(r"(?<=\s)(\+|-)(?=\s)"), {"+": "-", "-": "+"}),
+    ("bool", re.compile(r"\b(true|false)\b"),
+     {"true": "false", "false": "true"}),
+    ("const", re.compile(r"(?<![\w.])([0-9]|[1-5][0-9]|6[0-4])(?![\w.])"),
+     None),                                 # n -> n+1 (and 1 -> 0)
+    ("cond", re.compile(r"^(\s*(?:\}\s*else\s+)?(?:if|while)\s*)\((.*)\)"
+                        r"(\s*\{?\s*)$"), None),   # negate the condition
+]
+
+
+def code_spans(text):
+    """Per line, the text with comments, string and char literals blanked
+    to spaces (same length, so columns stay valid). Preprocessor lines
+    blank entirely."""
+    out = []
+    in_block = False
+    for line in text.split("\n"):
+        res = []
+        i = 0
+        n = len(line)
+        if not in_block and line.lstrip().startswith("#"):
+            out.append(" " * n)
+            continue
+        while i < n:
+            if in_block:
+                j = line.find("*/", i)
+                if j < 0:
+                    res.append(" " * (n - i))
+                    i = n
+                else:
+                    res.append(" " * (j + 2 - i))
+                    i = j + 2
+                    in_block = False
+                continue
+            c = line[i]
+            if line.startswith("//", i):
+                res.append(" " * (n - i))
+                break
+            if line.startswith("/*", i):
+                in_block = True
+                res.append("  ")
+                i += 2
+                continue
+            if c in "\"'":
+                j = i + 1
+                while j < n and line[j] != c:
+                    j += 2 if line[j] == "\\" else 1
+                res.append(c + " " * (min(j, n) - i - 1)
+                           + (c if j < n else ""))
+                i = j + 1
+                continue
+            res.append(c)
+            i += 1
+        out.append("".join(res)[:n].ljust(n))
+    return out
+
+
+TEST_ONLY_IF = re.compile(r"^\s*#\s*(?:ifdef\s+(?:INT_TESTS|TESTS)\b"
+                          r"|if\s+defined\s*\(?\s*(?:INT_TESTS|TESTS)\b)")
+INT_HELPER_DEF = re.compile(r"^\S.*\b(?:jit_|bc_)?int_\w*\s*\(")
+
+
+def not_product(text, rel):
+    """0-based indices of lines that are not PRODUCT code - the coverage
+    universe's rule (tests/int_run.py): ML_INT / ML_INT_ONLY spans and
+    INT-COV-EXEMPT lines, the body of an INT helper function (named
+    int_* / jit_int_* / bc_int_*), and `#ifdef INT_TESTS` / `#ifdef
+    TESTS` regions. A mutant there tests the test machinery, not
+    MyLang."""
+    skip = {n - 1 for n in int_run.exempt_lines(rel, {})}
+    stack = []                  # per open #if: is it a test-only region
+    in_helper = False
+    for li, line in enumerate(text.split("\n")):
+        st = line.strip()
+        if st.startswith("#"):
+            if re.match(r"#\s*if", st):
+                stack.append(bool(TEST_ONLY_IF.match(line)))
+            elif re.match(r"#\s*(else|elif)", st) and stack:
+                stack[-1] = False       # the other arm ships
+            elif re.match(r"#\s*endif", st) and stack:
+                stack.pop()
+        if any(stack):
+            skip.add(li)
+        if not in_helper and INT_HELPER_DEF.match(line) \
+                and not st.endswith(";"):
+            in_helper = True
+        if in_helper:
+            skip.add(li)
+            if line.startswith("}"):
+                in_helper = False
+    return skip
+
+
+def sites(path):
+    """Every mutation site in `path`: (op, line index, start, end, new)."""
+    with open(os.path.join(ROOT, path)) as f:
+        text = f.read()
+    raw = text.split("\n")
+    skip = not_product(text, path)
+    found = []
+    for li, code in enumerate(code_spans(text)):
+        if li in skip or not code.strip() or "operator" in code:
+            continue
+        for name, rx, table in OPS:
+            if name == "cond":
+                m = rx.match(code)
+                if m and m.group(2).count("(") == m.group(2).count(")"):
+                    a, b = m.start(2), m.end(2)
+                    found.append((name, li, a, b,
+                                  "!(" + raw[li][a:b] + ")"))
+                continue
+            for m in rx.finditer(code):
+                old = m.group(1)
+                if name == "const":
+                    new = "0" if old == "1" else str(int(old) + 1)
+                else:
+                    new = table[old]
+                found.append((name, li, m.start(1), m.end(1), new))
+    return [(path,) + s for s in found]
+
+
+def describe(m, raw=None):
+    path, op, li, a, b, new = m
+    if raw is None:
+        with open(os.path.join(ROOT, path)) as f:
+            raw = f.read().split("\n")
+    return "%s:%d [%s] %r -> %r" % (path, li + 1, op, raw[li][a:b], new)
+
+
+def stage_cmds(root, binary, seed):
+    py = sys.executable
+    t = os.path.join(root, "tests")
+    funcs = sorted(f for f in os.listdir(os.path.join(t, "functional"))
+                   if f.endswith(".my"))
+    return {
+        "rt": [[binary, "-rt"]],
+        "corpus": [[os.path.join(t, "corpus_diff.sh"), binary]],
+        "int": [[py, os.path.join(t, "int_run.py"), binary, "--no-rt"]],
+        "enum": [[py, os.path.join(t, "int_enum.py"), binary, "--tier",
+                  "1"] + [os.path.join(t, "functional", f) for f in funcs]],
+        "fuzz": [[py, os.path.join(t, "nested_fuzz.py"), "--mylang",
+                  binary, "--count", "60", "--seed", str(seed)],
+                 [py, os.path.join(t, "myv_fuzz.py"), binary, "-n", "100",
+                  "--seed", str(seed), "--save",
+                  os.path.join(root, "myv-bad")],
+                 [py, os.path.join(t, "repl_fuzz.py"), binary, "-n", "100",
+                  "--seed", str(seed), "--save",
+                  os.path.join(root, "repl-bad")]],
+    }
+
+
+def run_stage(cmds, cwd, env, timeout):
+    """(passed, seconds). A timeout is a failure - the mutant was
+    noticed."""
+    t0 = time.time()
+    for c in cmds:
+        try:
+            r = subprocess.run(c, cwd=cwd, env=env, timeout=timeout,
+                               stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return False, time.time() - t0
+        if r.returncode != 0:
+            return False, time.time() - t0
+    return True, time.time() - t0
+
+
+class Worker:
+    """A private copy of the tree and its build."""
+
+    def __init__(self, base, k, make_jobs):
+        self.root = os.path.join(base, "w%d" % k)
+        shutil.copytree(ROOT, self.root, symlinks=True, ignore=(
+            shutil.ignore_patterns(".git", "build*", "*.myv",
+                                   "myv-fuzz-bad", "repl-fuzz-bad")))
+        self.build = os.path.join(self.root, "build-mut")
+        self.binary = os.path.join(self.build, "mylang")
+        self.make_jobs = make_jobs
+
+    def make(self, timeout=3600):
+        try:
+            r = subprocess.run(["make", "-j%d" % self.make_jobs,
+                                "BUILD_DIR=" + self.build] + BUILD,
+                               cwd=self.root, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=timeout)
+            return r.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap.add_argument("--files", default=",".join(DEFAULT_FILES))
+    ap.add_argument("--count", type=int, default=200)
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--shard", default="0/1")
+    ap.add_argument("--stages", default="rt,corpus,int,enum,fuzz")
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="workers, each with its own tree and build "
+                         "(default: tests/jobs.sh count / 4)")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--list", action="store_true",
+                    help="print the sampled mutants and exit")
+    ap.add_argument("--heartbeat", type=float, default=300.0)
+    args = ap.parse_args()
+    testjobs.ensure_idle()
+
+    m = re.fullmatch(r"(\d+)/(\d+)", args.shard)
+    if not m or not 0 <= int(m.group(1)) < int(m.group(2)):
+        print("mutate: --shard wants I/N with 0 <= I < N", file=sys.stderr)
+        return 2
+    si, sn = int(m.group(1)), int(m.group(2))
+    files = [f.strip() for f in args.files.split(",") if f.strip()]
+    for f in files:
+        if not f.endswith(".cpp"):
+            print("mutate: %s: only .cpp files (a header edit rebuilds "
+                  "everything)" % f, file=sys.stderr)
+            return 2
+    stages = [s.strip() for s in args.stages.split(",") if s.strip()]
+
+    every = [s for f in files for s in sites(f)]
+    rnd = random.Random(args.seed)
+    sample = rnd.sample(every, min(args.count, len(every)))
+    sample = sample[si::sn]
+    # one file at a time per worker keeps the rebuilds incremental
+    sample.sort(key=lambda s: (s[0], s[2], s[3]))
+    print("mutate: %d site(s) in %d file(s); %d mutant(s) in this shard "
+          "(seed %d, shard %d/%d)" % (len(every), len(files), len(sample),
+                                       args.seed, si, sn), flush=True)
+    raws = {}
+    for f in files:
+        with open(os.path.join(ROOT, f)) as fh:
+            raws[f] = fh.read()
+    if args.list:
+        for s in sample:
+            print("  " + describe(s, raws[s[0]].split("\n")))
+        return 0
+
+    nw = args.jobs or max(1, testjobs.count() // 4)
+    nw = max(1, min(nw, len(sample)))
+    make_jobs = max(1, testjobs.count() // nw)
+    base = tempfile.mkdtemp(prefix="mylang-mutate-")
+    # progress for the setup (the mutants' own Run reports after it)
+    setup = Monitor("mutate", total=1 + len(stages), phase="setup",
+                    heartbeat=args.heartbeat).__enter__()
+    try:
+        print("mutate: %d worker(s), building each (make -j%d)"
+              % (nw, make_jobs), flush=True)
+        setup.set_current("copying and building %d worker(s)" % nw)
+        workers = [Worker(base, k, make_jobs) for k in range(nw)]
+        ths = []
+        okb = [False] * nw
+
+        def build(k):
+            okb[k] = workers[k].make()
+        for k in range(nw):
+            ths.append(threading.Thread(target=build, args=(k,)))
+            ths[-1].start()
+        for t in ths:
+            t.join()
+        setup.advance()
+        if not all(okb):
+            print("mutate: the PRISTINE build failed", file=sys.stderr)
+            return 2
+
+        # THE SELF-TEST: every stage must pass on the unmutated build,
+        # and its time sets the mutants' timeout
+        w0 = workers[0]
+        env = dict(os.environ, TMPDIR=base, MYLANG_TEST_IDLED="1")
+        cmds = stage_cmds(w0.root, w0.binary, args.seed)
+        limit = {}
+        for st in stages:
+            setup.set_current("pristine " + st)
+            ok, secs = run_stage(cmds[st], w0.root, env, 7200)
+            setup.advance()
+            print("mutate: pristine %-6s %s in %.0fs"
+                  % (st, "passes" if ok else "FAILS", secs), flush=True)
+            if not ok:
+                print("mutate: stage %s fails WITHOUT a mutation - it would "
+                      "kill every mutant and mean nothing" % st,
+                      file=sys.stderr)
+                return 2
+            limit[st] = max(60.0, 5 * secs)
+
+        setup.__exit__(None, None, None)
+        free = queue.Queue()
+        for w in workers:
+            free.put(w)
+        results = {}
+
+        def work(i, mut):
+            w = free.get()
+            try:
+                path, op, li, a, b, new = mut
+                src = os.path.join(w.root, path)
+                lines = raws[path].split("\n")
+                lines[li] = lines[li][:a] + new + lines[li][b:]
+                with open(src, "w") as f:
+                    f.write("\n".join(lines))
+                try:
+                    if not w.make(timeout=1800):
+                        verdict = "stillborn"
+                    else:
+                        verdict = "survived"
+                        wenv = dict(env, TMPDIR=tempfile.mkdtemp(dir=base))
+                        wc = stage_cmds(w.root, w.binary, args.seed)
+                        for st in stages:
+                            ok, _s = run_stage(wc[st], w.root, wenv,
+                                               limit[st])
+                            if not ok:
+                                verdict = st
+                                break
+                        shutil.rmtree(wenv["TMPDIR"], ignore_errors=True)
+                finally:
+                    with open(src, "w") as f:   # the next make rebuilds it
+                        f.write(raws[path])
+                results[i] = verdict
+                return None
+            finally:
+                free.put(w)
+
+        fp = fingerprint(args.files, str(args.count), str(args.seed),
+                         args.shard, args.stages)
+        r = Run("mutate", sample, work, fp, nw, heartbeat=args.heartbeat,
+                describe=lambda s: describe(s, raws[s[0]].split("\n")),
+                phase="mutants")
+        r.execute()
+        if not r.complete:
+            print("mutate: STOPPED - partial results below")
+
+        counts = {}
+        for v in results.values():
+            counts[v] = counts.get(v, 0) + 1
+        viable = sum(c for v, c in counts.items() if v != "stillborn")
+        killed = viable - counts.get("survived", 0)
+        print("\nmutate: %d mutant(s): %d stillborn, %d viable, %d killed, "
+              "%d SURVIVED" % (len(results), counts.get("stillborn", 0),
+                               viable, killed, counts.get("survived", 0)))
+        if viable:
+            print("  score %.1f%% (killed / viable)" % (100.0 * killed
+                                                          / viable))
+        for st in stages:
+            print("  killed by %-6s %d" % (st, counts.get(st, 0)))
+        surv = [describe(sample[i], raws[sample[i][0]].split("\n"))
+                for i in sorted(results) if results[i] == "survived"]
+        fuzz_only = [describe(sample[i], raws[sample[i][0]].split("\n"))
+                     for i in sorted(results) if results[i] == "fuzz"]
+        if fuzz_only:
+            print("\nkilled ONLY by the fuzzers (no deterministic test "
+                  "noticed):")
+            for s in fuzz_only:
+                print("  " + s)
+        if surv:
+            print("\nSURVIVORS (a wrong answer here ships unnoticed):")
+            for s in surv:
+                print("  " + s)
+        if args.out:
+            with open(args.out, "w") as f:
+                json.dump({"seed": args.seed, "shard": args.shard,
+                           "files": files, "stages": stages,
+                           "sites": len(every), "counts": counts,
+                           "mutants": [{"mutant": describe(
+                               sample[i], raws[sample[i][0]].split("\n")),
+                               "verdict": results[i]}
+                               for i in sorted(results)]}, f, indent=1)
+        return 0
+    finally:
+        setup.__exit__(None, None, None)
+        shutil.rmtree(base, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

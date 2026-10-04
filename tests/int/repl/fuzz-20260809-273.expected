@@ -1,0 +1,8 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> => <Builtin(int)>
+>> .. .. .. .. SyntaxError at line 3, col 7
+
+    var a = int(none);
+          ^^^^^^^^^^^^
+Expected operator ')', got: '='
+>> 

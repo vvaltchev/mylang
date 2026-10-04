@@ -1,0 +1,18 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> tracing: arrays autoconst autopure fold infer inline specialize template
+>> Unknown command ':int' (try :help)
+>>   infer      x  ? -> array<none>
+infer      var x : array<none>  (final)
+arrays     x  dest array<none> -> general
+=> []
+>> TypeErrorEx: The object does NOT support subscript operator [] at line 2, col 1:11
+
+    print[3.5];
+    ^^^^^^^^^^
+>> Invalid token: 2_ at line 3, col 9:11
+
+    var i = 2_;
+            ^^
+>> x : array<none>   [var]
+>> no global named 'i'
+>> 

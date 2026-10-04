@@ -560,6 +560,17 @@ product function (keep an INT-only condition INSIDE the macro). A test
 program's header picks its runs: `# INT-ENGINES: default` for a codegen or
 JIT decision (the tree-walker never runs those passes),
 `# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra` for several environments.
+An engine is a name from `ENGINE_FLAGS` (int_run.py: `default`, `tw`,
+`nj`, `vm`, `nbi`, `noopt` = `--no-opt all`), two joined with `+`
+(`nbi+nj`); the engines of one configuration must print the same stdout.
+**`tests/int/repl/*.session` are REPL units:** each is fed to `--repl`
+on stdin under a fresh `HOME` and must print exactly its `.expected`, nothing
+on stderr - the interactive front end (input loop, history, the line
+editor's off-TTY path), which `-rt`'s REPL tests never reach because
+they drive `ReplEngine` directly. They came from `repl_fuzz`
+(2026-10-04: 24 of its CI sessions reached 365 elements nothing else
+did); `int_run.py --update-repl` rewrites the `.expected` files (not
+`.out`: .gitignore drops that extension).
 **A pass that may discard and redo its work records inside an
 `ML_INT_DEFER` scope** (the JIT's retry label has one): a discarded
 attempt then records nothing. The `int_*` builtins
@@ -700,13 +711,32 @@ removal-pass IRREDUNDANT cover of everything reached, with the
 ownership table (each selected test owns an element no other covers,
 checked). `--shrink NAME` ddmin-reduces a selected `.my` while it keeps
 its owned elements, its exit code and its agreement with `-tw` (so a
-program's own asserts may go - the tree-walker is the oracle). First
-run (2026-10-03): 521 candidates reach 81,332 elements; 64 tests cover
-them all, 83 s of runs against 210 s, and `-rt` alone owns 25,962.
-**Long runs use `tests/testrun.py`** (a `Run`: heartbeat, a unix
-control socket - `tests/testctl.py status|stop|pause|jobs N` - and
-resume by a low-water-mark token); a new multi-minute tool should
-drive its work through it.
+program's own asserts may go - the tree-walker is the oracle); NAME may
+be a PROGRAM, which then keeps what it owns under EVERY configuration it
+was selected for, and several shrink side by side. The default
+configurations include the four `nested_fuzz` runs (`-nbi`, `-nbi -nj`,
+`--no-opt all`, `-tw --no-opt all`) - the only route to the code behind
+those flags. Coverage is collected in worker PROCESSES: parsing gcov's
+JSON is pure Python, and on the candidate threads the GIL made the pass
+~10x slower. First run (2026-10-03): 521 candidates reach 81,332
+elements; 64 tests cover them all, 83 s of runs against 210 s, and
+`-rt` alone owns 25,962.
+**EVERY TEST TOOL THAT CAN RUN FOR MORE THAN A MINUTE SERVES ITS
+PROGRESS (maintainer-set, 2026-10-04), and `tests/testctl.py` with no
+arguments lists them all**, one line each: the PERCENTAGE, done/total,
+phase, elapsed, ETA, failures, what it is on now (`testctl.py watch`
+refreshes it; `status [RUN]` is the full JSON, whose `percent` field is
+the obvious one). Two server kinds in `tests/testrun.py`: a `Run`
+(independent ordered items: heartbeat, the control socket, stop / pause
+/ `jobs N`, resume by a low-water-mark token - int_enum, int_select's
+exploration, mutate) and a `Monitor` (sequential phases or a loop: the
+same socket, heartbeat line and status fields, fed by the tool's
+`advance()` / `phase()`, `status` only - int_run, nested_fuzz, myv_fuzz,
+repl_fuzz, norec_enum, norec_sweep, bt_oracle, disasmcheck,
+int_select's shrink, mutate's setup, run_battery). A SHELL tool runs
+`tests/testmon.py` beside it, which counts its result files
+(corpus_diff.sh). A new long tool gets one of the three; the heartbeat
+lines are the CI log's view of the same numbers.
 
 **Assertions: `ASSERTS` (default 1).** The C `assert()` + the project's
 `ML_CHECK()` invariant net (see *Invariants & hazards*) are **on for every build
@@ -2058,6 +2088,11 @@ lanes so an `-rt` failure still reports quickly:
   --matrix` split three ways by `--shard I/3` - as a `differential`
   step it was 34 of that job's 57 minutes and set the workflow's wall
   time;
+- **all three fuzzers take a FRESH SEED per run** (`--seed
+  ${{github.run_id}}`, printed first; a re-run keeps it): with a fixed
+  seed every push ran the same programs - a regression corpus, not a
+  fuzzer. A failure is a real bug with a reproducible seed, whichever
+  push it lands on;
 - **myv-fuzz** on BOTH a Debug/ASan and an `ASSERTS=OFF` Release build,
   because those catch different things (a memory error vs. a check the
   debug build was relying on being compiled away). Findings are
@@ -2075,7 +2110,27 @@ locally, an hour or more on a hosted runner. (Measured 2026-10-03: the
 push workflows finish in Linux 8.7 min, Coverage 3.8, Windows and macOS
 2 each, Nets 57 min - all of it `differential`, whose `disasmcheck`
 step was 34; that step is its own three-shard job since, which made
-Nets 31 min with `differential` at 28 - itself split in two since.)
+Nets 31 min with `differential` at 28 - itself split in two since:
+Nets is 18 min.)
+
+**MUTATION TESTING IS ON DEMAND TOO (`mutate.yml`, `tests/mutate.py`,
+2026-10-04).** Coverage says a test REACHED a line, never that it would
+FAIL if the line were wrong: `2*x` and `2+x` agree at x = 2. A mutant is
+one edit to product code (`<`/`<=`, `+`/`-`, `==`/`!=`, `&&`/`||`, a
+negated `if`/`while`, a constant off by one, `true`/`false`) in a COPY
+of the tree, rebuilt (`OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1`) and
+run through the stages in order - `-rt`, `corpus_diff`, `int_run`, the
+enumerator's tier 1, the fuzzers - stopping at the first failure. A
+mutant nothing kills is a SURVIVOR: a missing check. Since the fuzzers
+run LAST, "killed by fuzz" is exactly what no deterministic test
+noticed - the evidence any decision to cut a fuzzer needs. Test-only
+code (ML_INT spans, INT helpers, `#ifdef TESTS`/`INT_TESTS`) is not
+mutated, and the pristine build must pass every stage first (else the
+stage would kill everything and mean nothing). Hours for a few hundred
+mutants, so 8 sharded CI jobs, dispatched after an arc of complex
+changes; never locally beyond `--count 2` to check the tool.
+**LONG RUNS GO TO A MANUAL CI WORKFLOW, NOT THE LOCAL MACHINE AND NOT
+EVERY PUSH (maintainer-set, 2026-10-04).**
 
 **LOCALLY, THE WHOLE BATTERY IS ONE COMMAND: `tests/run_battery.py`
 (2026-09-27).** It builds the six lanes (dbg, clang, rel-hard, release

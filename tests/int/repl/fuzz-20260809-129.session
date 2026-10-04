@@ -1,0 +1,8 @@
+var _ = _;
+func print(q) { return q + 1; }
+var v1 = v1;
+:analyze _ = [1,2];
+1/0;
+:help q
+:help :a
+:quit

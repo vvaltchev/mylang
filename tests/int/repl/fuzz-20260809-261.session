@@ -1,0 +1,7 @@
+var print = print;
+:type q + 1
+:type q + 1
+print = "x";
+print.print;
+if (9223372036854775807) {
+:quit

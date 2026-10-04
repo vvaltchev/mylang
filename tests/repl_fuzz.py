@@ -16,6 +16,10 @@ rejects a line must stay usable for the next one.
     tests/repl_fuzz.py ./build/mylang            # the default 1500 sessions
     tests/repl_fuzz.py ./build/mylang -n 6000
     tests/repl_fuzz.py ./build/mylang --save /tmp/bad
+    tests/repl_fuzz.py ./build/mylang --seed 77      # other sessions
+
+The seed is printed first. CI passes a fresh one per run, so each push
+tries new sessions; the default is fixed, so a bare run is repeatable.
 
 Run it against a DEBUG (ASan+UBSan) build - that is where a use-after-free in
 the retained-AST / interned-pointer machinery shows up, and the REPL is where
@@ -28,6 +32,9 @@ import os
 import random
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from testrun import Monitor  # noqa: E402
 
 # The generator is TEMPLATE-based rather than character-random on purpose:
 # random bytes mostly bounce off the lexer, while these reach the passes that
@@ -91,9 +98,17 @@ def main():
     if '--save' in sys.argv:
         savedir = sys.argv[sys.argv.index('--save') + 1]
 
-    rnd = random.Random(20260809)
+    seed = 20260809
+    if '--seed' in sys.argv:
+        seed = int(sys.argv[sys.argv.index('--seed') + 1])
+    print('seed %d (reproduce with --seed %d -n %d)' % (seed, seed, n))
+    rnd = random.Random(seed)
     hangs = crashes = 0
+    # progress: tests/testctl.py lists this run with its percentage
+    mon = Monitor('repl_fuzz', total=n, phase='sessions').__enter__()
     for i in range(n):
+        mon.set_current('session %d' % i)
+        mon.advance()
         src = session(rnd, rnd.randrange(1, 9))
         try:
             r = subprocess.run([binary, '--repl'], input=src.encode(),
@@ -117,6 +132,7 @@ def main():
                   % (bad, i, err.strip().splitlines()[-1][:150]
                      if err.strip() else '', path))
 
+    mon.__exit__(None, None, None)
     print('\n=== %d hangs, %d crashes over %d sessions ==='
           % (hangs, crashes, n))
     return 1 if (hangs or crashes) else 0

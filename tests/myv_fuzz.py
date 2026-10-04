@@ -24,6 +24,10 @@ USAGE
     tests/myv_fuzz.py ./build/mylang -n 4000         # longer
     tests/myv_fuzz.py ./build/mylang --triage        # classify survivors
     tests/myv_fuzz.py ./build/mylang --save /tmp/bad # keep the offenders
+    tests/myv_fuzz.py ./build/mylang --seed 77       # other mutations
+
+The seed is printed first. CI passes a fresh one per run, so each push
+tries new mutations; the default is fixed, so a bare run is repeatable.
 
 A finding is SAVED (--save, default ./myv-fuzz-bad) because it cannot be
 regenerated from the seed alone: an image embeds its SOURCE PATH, so the
@@ -42,6 +46,9 @@ import random
 import subprocess
 import sys
 import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from testrun import Monitor  # noqa: E402
 
 # Two programs, because the SHAPE decides which pools exist at all: a small
 # one keeps the signal-to-offset ratio high, while the fat one is the only
@@ -152,7 +159,8 @@ def save(savedir, name, i, blob):
     return path
 
 
-def sweep(binary, name, src, n, seed, timeout, triage, tmp, savedir):
+def sweep(binary, name, src, n, seed, timeout, triage, tmp, savedir,
+          mon):
     my = os.path.join(tmp, name + '.my')
     img = os.path.join(tmp, name + '.myv')
     mut = os.path.join(tmp, name + '_m.myv')
@@ -165,6 +173,8 @@ def sweep(binary, name, src, n, seed, timeout, triage, tmp, savedir):
     rnd = random.Random(seed)
     hangs = crashes = 0
     for i in range(n):
+        mon.set_current("%s #%d" % (name, i))
+        mon.advance()
         blob, mode = mutate(base, i, rnd)
         open(mut, 'wb').write(blob)
         rc, err = run(binary, mut, timeout)
@@ -202,12 +212,17 @@ def main():
         n = int(sys.argv[sys.argv.index('-n') + 1])
     if '--save' in sys.argv:
         savedir = sys.argv[sys.argv.index('--save') + 1]
+    if '--seed' in sys.argv:
+        seed = int(sys.argv[sys.argv.index('--seed') + 1])
+    print('seed %d (reproduce with --seed %d -n %d)' % (seed, seed, n))
 
     total_h = total_c = 0
-    with tempfile.TemporaryDirectory(prefix='mylang-myvfuzz-') as tmp:
+    # progress: tests/testctl.py lists this run with its percentage
+    mon = Monitor('myv_fuzz', total=2 * n, phase='mutations')
+    with mon, tempfile.TemporaryDirectory(prefix='mylang-myvfuzz-') as tmp:
         for name, src in (('small', SMALL), ('fat', FAT)):
             h, c = sweep(binary, name, src, n, seed, timeout, triage, tmp,
-                         savedir)
+                         savedir, mon)
             total_h += h
             total_c += c
 

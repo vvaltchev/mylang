@@ -56,6 +56,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testjobs  # noqa: E402  (tests/jobs.sh: worker count + idle class)
+from testrun import Monitor  # noqa: E402
 
 PROBE = "norec recon probe:"
 # Anything on stderr that means the run went wrong rather than merely
@@ -200,12 +201,21 @@ def main():
     skipped = []
     # every (program, mode) sweep at once; `pool` bounds the processes
     # and `drivers` the sweeps walking their N values
-    with ThreadPoolExecutor(max_workers=jobs) as pool, \
+    # progress: tests/testctl.py lists this run with its percentage (a
+    # sweep's own length is discovered as it walks, so the unit is one
+    # (program, mode) sweep)
+    mon = Monitor("norec_sweep", total=len(progs) * len(modes),
+                  phase="sweeps")
+    with mon, ThreadPoolExecutor(max_workers=jobs) as pool, \
             ThreadPoolExecutor(max_workers=jobs) as drivers:
         results = {(prog, mode): drivers.submit(
             sweep_one, pool, args.binary, prog, mode, args.max_events,
             args.timeout)
             for prog in progs for mode in modes}
+        for (prog, mode), f in results.items():
+            f.add_done_callback(lambda _f, p=prog, m=mode: (
+                mon.set_current("%s [%s]" % (os.path.basename(p), m)),
+                mon.advance()))
         results = {k: f.result() for k, f in results.items()}
 
     for prog in progs:

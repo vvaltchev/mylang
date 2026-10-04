@@ -62,6 +62,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testjobs  # noqa: E402
+from testrun import Monitor  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -189,6 +190,25 @@ def fmt_cmd(st):
 
 
 def run_graph(steps, jobs, caps, logdir, timeout):
+    # progress: tests/testctl.py lists the battery with its percentage,
+    # weighted by each step's estimated time (a build and a fuzzer are
+    # not one unit each), and the tools it runs list themselves too
+    # (capped: `nojit-src`'s est is a huge number only to start it first)
+    def weight(s):
+        return min(s.est, 1800)
+    total_est = float(sum(weight(s) for s in steps)) or 1.0
+
+    def pct():
+        return 100.0 * sum(weight(s) for s in steps
+                           if s.status in ("PASS", "FAIL", "SKIP")) \
+            / total_est
+    mon = Monitor("battery", total=len(steps), phase="steps",
+                  percent_fn=pct)
+    with mon:
+        return _run_graph(steps, jobs, caps, logdir, timeout, mon)
+
+
+def _run_graph(steps, jobs, caps, logdir, timeout, mon):
     by = {s.name: s for s in steps}
     used = 0
     inuse = {}
@@ -255,6 +275,11 @@ def run_graph(steps, jobs, caps, logdir, timeout):
             running.append(s)
             print("  start %-22s (%d cores busy)" % (s.name, used),
                   flush=True)
+        mon.set_current(", ".join(r.name for r in running))
+        with mon.lock:
+            mon.done = sum(1 for x in steps
+                           if x.status in ("PASS", "FAIL", "SKIP"))
+            mon.failures = sum(1 for x in steps if x.status == "FAIL")
         if not running:
             break
         time.sleep(0.25)

@@ -308,9 +308,12 @@ def ops_mismatch(raw, omn, base, off):
     return None
 
 
-def check(binary, env, files, verbose):
+def check(binary, env, files, verbose, mon=None):
     bad_len = bad_mn = bad_op = insns = frag_n = wraps = 0
     for path in files:
+        if mon:
+            mon.set_current(os.path.basename(path))
+            mon.advance()
         fs = frags(binary, path, env)
         if fs is None:
             continue
@@ -459,8 +462,15 @@ def main():
                                    ', '.join(n for _, n in envs)))
 
     tl = tm = to = ti = tf = tw = 0
+    # progress: tests/testctl.py lists this run with its percentage
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(
+        __file__)), "..", "tests"))
+    from testrun import Monitor
+    mon = Monitor("disasmcheck", total=len(envs) * len(files),
+                  phase="configs").__enter__()
     for env, name in envs:
-        bl, bm, bo, n, fn, wr = check(binary, env, files, verbose)
+        mon.set_extra(config=name)
+        bl, bm, bo, n, fn, wr = check(binary, env, files, verbose, mon)
         print("%-12s %6d insns in %4d frags   boundary-errors %d   "
               "mnemonic-errors %d   operand-errors %d%s"
               % (name, n, fn, bl, bm, bo,
@@ -472,6 +482,7 @@ def main():
         tf += fn
         tw += wr
 
+    mon.__exit__(None, None, None)
     print("\nTOTAL %d instructions, %d fragments" % (ti, tf))
     print("  boundary errors: %d   mnemonic errors: %d   "
           "operand errors: %d (of %d operands compared)"

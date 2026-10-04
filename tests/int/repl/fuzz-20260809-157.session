@@ -1,0 +1,6 @@
+var b = f({"k":1});
+func mk(a) { return a; }
+:q
+:type i
+:show
+:quit

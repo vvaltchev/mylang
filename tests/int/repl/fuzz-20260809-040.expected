@@ -1,0 +1,36 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> SyntaxError at line 1, col 8
+
+    throw -9223372036854775808;
+           ^^^^^^^^^^^^^^^^^^^^
+Integer literal out of range
+>> TypeErrorEx: Can only throw a struct instance at line 2, col 1:10
+
+    throw none;
+    ^^^^^^^^^
+>> MyLang REPL help
+Documentation:
+  :help builtins          all builtins, grouped by category
+  :help builtins <cat>    one builtin category
+  :help <builtin>         one builtin (signature + description)
+  :help language          language features, grouped by category
+  :help <category>        one language category
+  :help <feature>         one language feature (incl. optimizations)
+  :help commands          the REPL commands (:help <command> for one)
+Inspection:
+  :globals  :type <expr>  :show <func>  :tree <code>  :analyze <code>
+  :trace <cat> on|off     narrate the compiler's reasoning (:trace help)
+Session: :source <file>  :quit
+>> Undefined variable 'a' at line 3, col 3:4
+
+    		a;
+    		^
+>> TypeMismatchEx: can only throw a struct instance, got 'array<int>' at line 4, col 7:12
+
+    throw [1,2];
+          ^^^^^
+>> .. .. .. .. Invalid token: /* at line 5, col 1
+
+    /* unterminated
+    ^^^^^^^^^^^^^^^
+>> 

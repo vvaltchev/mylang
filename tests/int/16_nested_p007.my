@@ -1,0 +1,390 @@
+# INT-ENGINES: default tw nbi nj
+#
+# FROM nested_fuzz (seed 8, program 7 of the CI run
+# `--count 250 --seed 1`), kept as a fixed test because it
+# reached coverage nothing else does (under -nbi, -nj);
+# shrunk by `tests/int_select.py --shrink`, then every
+# top-level variable printed at the end (observe_globals), so
+# the engines are compared on the VALUES, not on reaching the
+# code. Generated, not hand-written: do not tidy it.
+var A = [1, 2, 3, 4, 5, 6, 7];
+var G = [0];
+var D = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0};
+var M = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+var s0 = 0; var s1 = 1; var s2 = 2; var s3 = 3; var s4 = 4; var s5 = 5; var s6
+    = 6;
+func mix(a, b, c) => (a + b * c) % 100;
+func rsum(n) { if (n <= 0) return 0; return (n + rsum(n - 1)) % 100; }
+func gcd(a, b) { if (b == 0) return a; return gcd(b, a % b); }
+func comp(x) => mix(x, x, 2);
+func rf0(p0, p1) {
+  var v = (p0 + p1) % 100;
+  var i = 0;
+  if (v > 15) return (v + 3) % 100;
+  return v;
+}
+func rf1(p0) {
+  var v = (p0) % 100;
+  var t = rf0((v + 0) % 100, (v + 1) % 100);
+  v = (v + t) % 100;
+  var i = 0;
+  if (v > 68) return (v + 3) % 100;
+  return v;
+}
+s0 = (s0 + rf0(3, 5)) % 100;
+s0 = (s0 + rf1(4)) % 100;
+for (var rep = 0; rep < 2; rep++) {
+  if (len(G) < 20) append(G, (min(s1, rep)) % 100);
+  var v0 = 0;
+  while (v0 < 3 && s3 < 73) {
+    v0 += 1;
+    var t0 = ((gcd(s1 % 50, s1 % 50) | rf0(s0, s5))) % 100;
+    s3 = (s3 + t0) % 100;
+    var v1 = 0;
+    while (v1 < 2 && s5 < 71) {
+      v1 += 1;
+      var t1 = (max(v1, s1)) % 100;
+      if (s4 % 4 != 0) {
+        D[2] = (D[2] + rep) % 100;
+        for (var v3 = 0; v3 < 2; v3++) {
+          if (s0 % 11 == 0) continue;
+          for (var v4 = 1; v4 < 4; v4 = v4 * 2) {
+            s4 = ((s1 >= v1)) % 100;
+            M[s0 % 3][s1 % 3] = (((sum(A[4:7])) % 100 + 100 - rf1(v4))) % 100;
+            var v5 = 0;
+            while (v5 < 2) {
+              v5 += 1;
+              if (s6 % 4 != 0) {
+                s2 = (rep) % 100;
+                s4 = ((A[v5 % 7] + 100 - len(G))) % 100;
+                for (var v7 = 3; v7 > 0; v7--) {
+                  s5 = ((rep == v4) ? ((A[(v1) % 7] * (s3 < s0))) % 100 : ((s3
+                      < v4)) % 100);
+                  var v8 = 0;
+                  while (v8 < 3 && s4 < 67) {
+                    v8 += 1;
+                    for (var v9 = 2; v9 > 0; v9--) {
+                      s4 = ((1 & A[v1 % 7])) % 100;
+                      for (var v10 = 3; v10 > 0; v10--) {
+                        var t4, t5 = [((len(G) | 5)) % 100, ((gcd(s3 % 50, s6 %
+                            50) * len(G))) % 100];
+                        for (var v11 = 0; v11 < 2; v11++) {
+                          if (s0 % 11 == 0) continue;
+                          for (var v12 = 3; v12 > 0; v12--) {
+                            A[((max(v4, v9)) % 100) % 7] = (comp(s2)) % 100;
+                            s0, s4 = [s4, s0];
+                            var v13 = 0;
+                            while (v13 < 3) {
+                              v13 += 1;
+                              s3 = ((v1 != v12)) % 100;
+                              for (var v14 = 3; v14 > 0; v14--) {
+                              }
+                            }
+                            if (s2 % 13 == 0) break;
+                          }
+                          if (s6 % 13 == 0) break;
+                        }
+                        if (s0 % 13 == 0) break;
+                      }
+                      if (s6 % 13 == 0) break;
+                    }
+                  }
+                  if (s0 % 13 == 0) break;
+                }
+              } else {
+                for (var v7 = 3; v7 > 0; v7--) {
+                  A[((s1) % 100) % 7] = ((v1 & A[s4 % 7])) % 100;
+                  s5 = ((mix(v0, s3, s1) + 100 - 3)) % 100;
+                  if (s0 % 2 != 0) {
+                    var v9 = 0;
+                    while (v9 < 3) {
+                      M[v4 % 3][rep % 3] = (v4) % 100;
+                      for (var v10 = 0; v10 < 3; v10++) {
+                        s4 = ((v1 > v5) ? (comp(v10)) % 100 : (0) % 100);
+                        for (var v11 = 0; v11 < 3; v11++) {
+                          var v12 = 0;
+                          while (v12 < 3) {
+                            foreach (var e11 in A) s4 = (s4 + e11) % 100;
+                            if (s2 % 4 != 0) {
+                              s4 = ((sum(A[2:5])) % 100) % 100;
+                              if (len(G) < 20) append(G, ((M[v10 % 3][v9 % 3] +
+                                  100 - max(v4, v9))) % 100);
+                              var t15 = (A[v11 % 7]) % 100;
+                              s3 = (s3 + t15) % 100;
+                              var v14 = 0;
+                              while (v14 < 2) {
+                                v14 += 1;
+                                s6 = ((sum(A[2:4])) % 100) % 100;
+                              }
+                            }
+                          }
+                          if (s5 % 13 == 0) break;
+                        }
+                        if (s3 % 13 == 0) break;
+                      }
+                    }
+                  } else {
+                    A[((A[s1 % 7]) % 100) % 7] = ((A[((sum(A[1:4])) % 100) % 7]
+                        + v4)) % 100;
+                    s1 = (min(s0, s0)) % 100;
+                    D[0] = (D[0] + len(G)) % 100;
+                    if (s6 % 4 != 0) {
+                      s4 = ((A[v5 % 7] + (s1 > s2))) % 100;
+                      M[v5 % 3][v5 % 3] = (((sum(A[2:7])) % 100 ^ A[(len(G)) %
+                          7])) % 100;
+                      if (s2 % 2 != 0) {
+                        if (len(G) > 0) pop(G);
+                        D[1] = (D[1] + A[s6 % 7]) % 100;
+                        A[((M[s6 % 3][v5 % 3]) % 100) % 7] = ((sum(A[5:6])) %
+                            100) % 100;
+                        if (s6 % 4 != 0) {
+                          var t16, t17 = [(rep) % 100, ((sum(A[2:4])) % 100) %
+                              100];
+                          s3 = (s3 + t16 + t17) % 100;
+                          D[4] = (D[4] + rf1(rep)) % 100;
+                          s4 = ((s2 >= s1) ? ((A[v5 % 7] | v0)) % 100 : ((A[s3
+                              % 7] ^ (sum(A[1:4])) % 100)) % 100);
+                          var v12 = 0;
+                          while (v12 < 2 && s6 < 76) {
+                            v12 += 1;
+                            A[v1 % 7] = ((A[s3 % 7] + s6)) % 100;
+                            if (len(G) > 0) pop(G);
+                            if (s0 % 3 != 0) {
+                            } else {
+                              s0 = ((s0 <= s5) ? ((len(G) & M[rep % 3][v4 %
+                                  3])) % 100 : (mix(rep, v7, rep)) % 100);
+                              s4 = (s4 + sum(clone(A))) % 100;
+                              for (var v14 = 3; v14 > 0; v14--) {
+                                s6, s5, s1 = [s5, s1, s6];
+                                if (s0 % 13 == 0) break;
+                              }
+                            }
+                          }
+                        } else {
+                          foreach (var e19 in A) s4 = (s4 + e19) % 100;
+                          var t20 = ((A[s5 % 7] | min(v1, s1))) % 100;
+                          s5 = (s5 + t20) % 100;
+                          foreach (var e21 in A) s2 = (s2 + e21) % 100;
+                          var v12 = 0;
+                          while (v12 < 3) {
+                            v12 += 1;
+                            D[0] = (D[0] + (sum(A[4:6])) % 100) % 100;
+                            var v13 = 0;
+                            while (v13 < 3) {
+                              v13 += 1;
+                              if (len(G) < 20) append(G, ((sum(A[1:5])) % 100)
+                                  % 100);
+                              var v14 = 0;
+                              while (v14 < 3 && s1 < 44) {
+                                v14 += 1;
+                                if (len(G) < 20) append(G, ((max(s5, v13) |
+                                    A[s6 % 7])) % 100);
+                              }
+                            }
+                          }
+                        }
+                      } else {
+                        if (len(G) < 20) append(G, (mix(v0, s5, s4)) % 100);
+                        foreach (var e22 in A) s3 = (s3 + e22) % 100;
+                        for (var v11 = 2; v11 > 0; v11--) {
+                          if (len(G) < 20) append(G, ((len(G) + A[v7 % 7])) %
+                              100);
+                          if (len(G) < 20) append(G, ((v7 != s2)) % 100);
+                          for (var v12 = 0; v12 < 2; v12++) {
+                            if (s3 % 11 == 0) continue;
+                            if (len(G) < 20) append(G, ((8 | A[v5 % 7])) % 100);
+                            var t23, t24 = [(M[s4 % 3][s2 % 3]) % 100, ((A[s6 %
+                                7] | max(s6, s0))) % 100];
+                            s6 = (s6 + t23 + t24) % 100;
+                            for (var v13 = 0; v13 < 3; v13++) {
+                              if (s0 % 11 == 0) continue;
+                              if (len(G) < 20) insert(G, 0, ((v7 == v1)) % 100);
+                            }
+                            if (s5 % 13 == 0) break;
+                          }
+                          if (s0 % 13 == 0) break;
+                        }
+                      }
+                    } else {
+                      s4 = ((len(G) + gcd(s0 % 50, v3 % 50))) % 100;
+                      s4 = ((s1 == rep) ? (s0) % 100 : (A[(s5) % 7]) % 100);
+                      for (var v10 = 0; v10 < 3; v10++) {
+                        if (s6 % 11 == 0) continue;
+                        var t25 = (1) % 100;
+                        if (s6 % 13 == 0) break;
+                      }
+                    }
+                  }
+                  if (s5 % 13 == 0) break;
+                }
+              }
+            }
+          }
+          if (s4 % 13 == 0) break;
+        }
+      } else {
+        for (var v3 = 2; v3 > 0; v3--) {
+          if (len(G) < 20) insert(G, 0, (min(s6, s5)) % 100);
+          foreach (var e28 in A) s6 = (s6 + e28) % 100;
+          for (var v4 = 2; v4 > 0; v4--) {
+            s1 = (s1 + sum(clone(A))) % 100;
+            if (len(G) < 20) append(G, ((A[rep % 7] + (v1 > s2))) % 100);
+            for (var v5 = 0; v5 < 2; v5++) {
+              if (s6 % 11 == 0) continue;
+              M[v5 % 3][s3 % 3] = ((A[s0 % 7] | max(s2, v3))) % 100;
+              A[rep % 7] = (A[(rf1(v5)) % 7]) % 100;
+              var v6 = 0;
+              while (v6 < 4 && s6 < 82) {
+                v6 += 1;
+                s5 = ((A[(A[s4 % 7]) % 7] ^ A[v5 % 7])) % 100;
+                var v7 = 0;
+                while (v7 < 4 && s1 < 84) {
+                  v7 += 1;
+                  if (len(G) > 0) pop(G);
+                  if (s3 % 3 != 0) {
+                    var t29, t30 = [(len(G)) % 100, ((7 * s6)) % 100];
+                    s1 = (s1 + t29 + t30) % 100;
+                    A[s1 % 7] = ((A[s3 % 7] + (s4 > v6))) % 100;
+                    s3 = (s3 + sum(clone(A))) % 100;
+                    if (s0 % 2 != 0) {
+                      if (len(G) < 20) append(G, (v3) % 100);
+                      A[v7 % 7] = (rf1(v1)) % 100;
+                      for (var v10 = 1; v10 < 8; v10 = v10 * 2) {
+                        s5 = (s5 + sum(clone(A))) % 100;
+                        if (s4 % 3 != 0) {
+                          A[(((4 | rf1(rep))) % 100) % 7] = (A[s2 % 7]) % 100;
+                          if (len(G) < 20) append(G, ((A[(A[v0 % 7]) % 7] ^
+                              s3)) % 100);
+                          var v12 = 0;
+                          while (v12 < 3 && s5 < 66) {
+                            v12 += 1;
+                            M[v4 % 3][v10 % 3] = ((len(G) | A[(len(G)) % 7])) %
+                                100;
+                            D[2] = (D[2] + 7) % 100;
+                            if (s5 % 2 != 0) {
+                              for (var v14 = 2; v14 > 0; v14--) {
+                                s2 = (((rep > v5) & M[v6 % 3][s0 % 3])) % 100;
+                                if (s1 % 13 == 0) break;
+                              }
+                            }
+                          }
+                        } else {
+                          s6 = ((v7 < s4) ? (7) % 100 : (((s1 < s2) ^ rf0(v6,
+                              v3))) % 100);
+                          s2 = (A[(A[(v10) % 7]) % 7]) % 100;
+                          s3 = (((v0 >= v3) | 0)) % 100;
+                          var v12 = 0;
+                          while (v12 < 2) {
+                            v12 += 1;
+                            if (len(G) < 20) append(G, ((A[v1 % 7] + A[v0 %
+                                7])) % 100);
+                            for (var v13 = 3; v13 > 0; v13--) {
+                              if (len(G) < 20) append(G, ((s6 * 4)) % 100);
+                              for (var v14 = 3; v14 > 0; v14--) {
+                                s6, s3 = [s3, s6];
+                                if (s0 % 13 == 0) break;
+                              }
+                              if (s4 % 13 == 0) break;
+                            }
+                          }
+                        }
+                      }
+                    } else {
+                      A[((A[(A[v0 % 7]) % 7]) % 100) % 7] = ((M[s6 % 3][s2 % 3]
+                          ^ gcd(v1 % 50, s4 % 50))) % 100;
+                      if (len(G) < 20) append(G, (A[((v5 == s4)) % 7]) % 100);
+                      A[(((rep < v7)) % 100) % 7] = (A[((s2 == s5)) % 7]) % 100;
+                      for (var v10 = 0; v10 < 2; v10++) {
+                        if (s1 % 11 == 0) continue;
+                        D[2] = (D[2] + (sum(A[1:2])) % 100) % 100;
+                        for (var v11 = 3; v11 > 0; v11--) {
+                          if (len(G) < 20) insert(G, 0, (A[(rf0(v4, s1)) % 7])
+                              % 100);
+                          s1 = (((sum(A[5:6])) % 100 + 100 - 0)) % 100;
+                          for (var v12 = 3; v12 > 0; v12--) {
+                            s4 = ((v11 <= s5)) % 100;
+                            var t32 = (((sum(A[3:4])) % 100 * A[v11 % 7])) %
+                                100;
+                            s4 = (s4 + t32) % 100;
+                            for (var v13 = 2; v13 > 0; v13--) {
+                              if (len(G) > 0) pop(G);
+                              var t33, t34 = [(A[s1 % 7]) % 100, ((A[s5 % 7] +
+                                  max(v12, s1))) % 100];
+                              s6 = (s6 + t33 + t34) % 100;
+                              for (var v14 = 1; v14 < 4; v14 = v14 * 2) {
+                                A[(((sum(A[0:4])) % 100) % 100) % 7] = ((v1 &
+                                    M[v14 % 3][v3 % 3])) % 100;
+                              }
+                              if (s2 % 13 == 0) break;
+                            }
+                            if (s0 % 13 == 0) break;
+                          }
+                          if (s6 % 13 == 0) break;
+                        }
+                        if (s4 % 13 == 0) break;
+                      }
+                    }
+                    var v9 = 0;
+                    while (v9 < 2 && s1 < 48) {
+                      v9 += 1;
+                      var t38, t39 = [(min(s1, v4)) % 100, (((v7 > s6) + M[rep
+                          % 3][rep % 3])) % 100];
+                      s6 = (s6 + t38 + t39) % 100;
+                      for (var v10 = 3; v10 > 0; v10--) {
+                        D[1] = (D[1] + len(G)) % 100;
+                        s2 = (A[(len(G)) % 7]) % 100;
+                        for (var v11 = 3; v11 > 0; v11--) {
+                          var t40, t41 = [(A[v0 % 7]) % 100, (9) % 100];
+                          s3 = (s3 + t40 + t41) % 100;
+                          s5 = ((v0 & rep)) % 100;
+                          var v12 = 0;
+                          while (v12 < 3) {
+                            v12 += 1;
+                            s2 = ((A[v12 % 7] & len(G))) % 100;
+                            M[s4 % 3][v10 % 3] = (A[v5 % 7]) % 100;
+                            for (var v13 = 0; v13 < 2; v13++) {
+                              if (s1 % 11 == 0) continue;
+                              s2 = (A[(s2) % 7]) % 100;
+                              A[(((comp(s5) ^ 8)) % 100) % 7] = (((sum(A[3:6]))
+                                  % 100 | s0)) % 100;
+                              var v14 = 0;
+                              while (v14 < 2 && s6 < 56) {
+                                v14 += 1;
+                                A[s4 % 7] = (((sum(A[5:7])) % 100 ^ max(rep,
+                                    s6))) % 100;
+                              }
+                              if (s1 % 13 == 0) break;
+                            }
+                          }
+                          if (s2 % 13 == 0) break;
+                        }
+                        if (s3 % 13 == 0) break;
+                      }
+                    }
+                  }
+                }
+              }
+              if (s6 % 13 == 0) break;
+            }
+            if (s4 % 13 == 0) break;
+          }
+          if (s4 % 13 == 0) break;
+        }
+      }
+    }
+  }
+}
+var acc = 0;
+print("result:", acc);
+print("A:", A);
+print("G:", G);
+print("D:", D);
+print("M:", M);
+print("s0:", s0);
+print("s1:", s1);
+print("s2:", s2);
+print("s3:", s3);
+print("s4:", s4);
+print("s5:", s5);
+print("s6:", s6);
+print("acc:", acc);

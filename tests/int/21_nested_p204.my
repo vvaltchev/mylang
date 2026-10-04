@@ -1,0 +1,54 @@
+# INT-ENGINES: default tw nbi+nj
+#
+# FROM nested_fuzz (seed 205, program 204 of the CI run
+# `--count 250 --seed 1`), kept as a fixed test because it
+# reached coverage nothing else does (under the default engine, -nbi -nj);
+# shrunk by `tests/int_select.py --shrink`, then every
+# top-level variable printed at the end (observe_globals), so
+# the engines are compared on the VALUES, not on reaching the
+# code. Generated, not hand-written: do not tidy it.
+var A = [1, 2, 3, 4, 5, 6, 7];
+var G = [0];
+var M = [[1, 2, 3], [4, 5, 6], [7, 8, 9]];
+var s0 = 0; var s1 = 1; var s2 = 2; var s3 = 3; var s4 = 4; var s5 = 5; var s6
+    = 6;
+func rf0(p0, p1) {
+}
+for (var rep = 0; rep < 2; rep++) {
+  M[s0 % 3][s4 % 3] = ((4 + A[s4 % 7])) % 100;
+  for (var v0 = 0; v0 < 2; v0++) {
+    var t0, t1 = [((s2 | max(rep, s4))) % 100, (s4) % 100];
+    var v1 = 0;
+    while (v1 < 2) {
+      v1 += 1;
+      for (var v2 = 3; v2 > 0; v2--) {
+        s3 = (min(v0, v1)) % 100;
+        var t2 = (((rep <= s4) * s4)) % 100;
+        s0 = (s0 + t2) % 100;
+        for (var v3 = 0; v3 < 3; v3++) {
+          for (var v4 = 0; v4 < 2; v4++) {
+            var v5 = 0;
+            while (v5 < 2) {
+              v5 += 1;
+              s1 = ((v2 == v5) ? ((len(G) & s3)) % 100 : ((s6 == s1)) % 100);
+            }
+          }
+        }
+      }
+    }
+    if (s1 % 13 == 0) break;
+  }
+}
+var acc = 0;
+print("result:", acc);
+print("A:", A);
+print("G:", G);
+print("M:", M);
+print("s0:", s0);
+print("s1:", s1);
+print("s2:", s2);
+print("s3:", s3);
+print("s4:", s4);
+print("s5:", s5);
+print("s6:", s6);
+print("acc:", acc);

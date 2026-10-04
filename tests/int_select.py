@@ -6,7 +6,8 @@
 #   tests/int_select.py GCOV_INT_BINARY [--configs default,-nj,...]
 #                       [--programs-file F] [--with-rt] [--jobs N]
 #                       [--out FILE.json] [--shrink NAME[,NAME...]]
-#                       [--shrink-dir DIR]
+#                       [--shrink-dir DIR]   (NAME: a selected test, or a
+#                       program - every configuration it was selected for)
 #                       [--heartbeat S] [--resume TOKEN]
 #
 # OFFLINE tooling, not CI. It answers "which tests are worth running?"
@@ -42,13 +43,18 @@
 # Candidates by default: tests/functional/*.my, the non-interactive
 # samples, tests/bt_oracle/*.my (whose ERRORS are the output), each under
 # every --configs entry (default: the default engine, -nj, -tw,
-# MYLANG_JIT_OFF=lsra and MYLANG_NO_LOWMEM=1). --with-rt adds `-rt` as
+# MYLANG_JIT_OFF=lsra, MYLANG_NO_LOWMEM=1, -nbi, -nbi -nj, --no-opt all and
+# -tw --no-opt all - the last four the configurations nested_fuzz runs, and
+# the only route to the code behind those flags; a config word with no `=`
+# that is not a flag is the previous flag's argument). --with-rt adds `-rt` as
 # one candidate (minutes on a debug build). Runs through
 # tests/testrun.py: heartbeat, control socket, resume.
 
 import argparse
+import concurrent.futures as cf
 import glob
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -61,11 +67,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import int_run  # noqa: E402
-from testrun import Run, fingerprint, file_digest  # noqa: E402
+from testrun import Run, Monitor, fingerprint, file_digest  # noqa: E402
 
 SAMPLES = ["fib", "gcd", "loop", "primes", "primes2", "strloop"]
 DEFAULT_CONFIGS = ["default", "-nj", "-tw", "MYLANG_JIT_OFF=lsra",
-                   "MYLANG_NO_LOWMEM=1"]
+                   "MYLANG_NO_LOWMEM=1", "-nbi", "-nbi -nj", "--no-opt all",
+                   "-tw --no-opt all"]
+
+
+def int_select_jobs():
+    return JOBS[0] or jobs_count()
+
+
+JOBS = [0]
 
 
 def jobs_count():
@@ -79,11 +93,13 @@ def jobs_count():
 
 def parse_config(spec):
     """`default`, an engine flag (`-nj`), or space-separated KEY=VALUE
-    settings, optionally with flags among them - (flags, env)."""
+    settings, optionally with flags among them - (flags, env). A word
+    with no `=` that is not a flag is the previous flag's ARGUMENT
+    (`--no-opt all`)."""
     flags, env = [], {}
     if spec != "default":
         for part in spec.split():
-            if part.startswith("-"):
+            if part.startswith("-") or "=" not in part:
                 flags.append(part)
             else:
                 k, _, v = part.partition("=")
@@ -109,6 +125,14 @@ class Candidate:
         return [binary] + self.flags + [prog or self.prog]
 
 
+def _collect(objdir, scratch, tool):
+    # in a worker PROCESS: parsing gcov's JSON is pure Python, and on the
+    # candidate threads it ran one CPU at a time under the GIL - the
+    # whole pass was bound by it (a fuzz-coverage run of the same shape
+    # measured ~10x slower that way)
+    return int_run.collect(objdir, scratch, {}, tool)
+
+
 def mirror_build(build_dir, prefix):
     """The object directory as GCOV_PREFIX leaves it for one run: the
     run's .gcda files sit under prefix + the absolute build path, and
@@ -132,14 +156,21 @@ class Explorer:
         self.tmp = tmp
         self.timeout = timeout
         self.tool = int_run.gcov_tool(int_run.build_config(binary))
-        self.ex_cache = {}
         self.refs = {}              # program -> tree-walker (rc, stdout)
+        self.pool = cf.ProcessPoolExecutor(
+            int_select_jobs(),
+            mp_context=multiprocessing.get_context("forkserver"))
 
-    def reference(self, prog):
+    def reference(self, prog, timeout=None):
+        """The tree-walker's (rc, stdout); rc None on a timeout - a
+        shrink trial can delete a loop's increment and never end."""
         if prog not in self.refs:
-            r = int_run.run([self.binary, "-tw", prog], dict(os.environ),
-                            self.timeout)
-            self.refs[prog] = (r[0], r[1])
+            try:
+                r = int_run.run([self.binary, "-tw", prog],
+                                dict(os.environ), timeout or self.timeout)
+                self.refs[prog] = (r[0], r[1])
+            except subprocess.TimeoutExpired:
+                self.refs[prog] = (None, "")
         return self.refs[prog]
 
     def measure(self, cand, key, prog=None):
@@ -172,7 +203,8 @@ class Explorer:
         objdir = mirror_build(self.build_dir, prefix)
         scratch = os.path.join(prefix, "gcov")
         os.makedirs(scratch, exist_ok=True)
-        elems = int_run.collect(objdir, scratch, self.ex_cache, self.tool)
+        elems = self.pool.submit(_collect, objdir, scratch,
+                                 self.tool).result()
         cov = {e for e, c in elems.items() if c}
         if os.path.exists(out):
             with open(out) as f:
@@ -209,11 +241,38 @@ def select(cover, cost):
     return chosen, owned
 
 
-def ddmin(lines, keep):
+TOP_VAR = re.compile(r"(?:^|;\s*)var\s+([A-Za-z_]\w*)\s*(?:=|;)")
+
+
+def observe_globals(lines):
+    """Append a print of every top-level `var` the program declares.
+    The shrink's oracle is agreement with the tree-walker ON THE SHRUNK
+    PROGRAM, so a deletion that changes the program's state is accepted
+    as long as both engines agree - the pinned output line survives,
+    but the values feeding it may not (watched: `var acc = 0;
+    print("result:", acc);`, a check of a constant). Printing every
+    remaining variable at the end puts the VALUES back under the
+    engines' comparison."""
+    names = []
+    for l in lines:
+        if not l.startswith("var"):         # top level only
+            continue
+        for n in TOP_VAR.findall(l):
+            if n not in names and n != "_":
+                names.append(n)
+    return lines + ["print(\"%s:\", %s);" % (n, n) for n in names]
+
+
+def ddmin(lines, keep, progress=None, deadline=None):
     """Zeller's ddmin over LINES: the smallest subsequence (1-minimal)
-    for which keep(subsequence) holds."""
+    for which keep(subsequence) holds. `progress(lines)` sees every
+    accepted reduction (so an interrupted shrink keeps its best);
+    past `deadline` (a time.time() value) it stops with the best so
+    far - not 1-minimal then, still correct."""
     n = 2
     while len(lines) >= 2:
+        if deadline and time.time() > deadline:
+            break
         chunk = max(1, len(lines) // n)
         parts = [lines[i:i + chunk] for i in range(0, len(lines), chunk)]
         reduced = False
@@ -221,6 +280,8 @@ def ddmin(lines, keep):
             comp = [l for j, p in enumerate(parts) if j != i for l in p]
             if comp and keep(comp):
                 lines = comp
+                if progress:
+                    progress(lines)
                 n = max(n - 1, 2)
                 reduced = True
                 break
@@ -244,6 +305,9 @@ def main():
                     help="comma-separated selected test names to reduce")
     ap.add_argument("--shrink-dir", default=tempfile.gettempdir(),
                     help="where a shrunk program is written")
+    ap.add_argument("--shrink-budget", type=float, default=0,
+                    help="seconds per shrunk program (0: until 1-minimal); "
+                         "the best so far is on disk throughout")
     ap.add_argument("--heartbeat", type=float, default=60.0)
     ap.add_argument("--resume", default=None)
     args = ap.parse_intermixed_args()
@@ -268,6 +332,7 @@ def main():
         cands.append(Candidate("-rt", "default"))
 
     jobs = args.jobs or jobs_count()
+    JOBS[0] = jobs
     with tempfile.TemporaryDirectory(prefix="mylang-select-") as tmp:
         ex = Explorer(binary, tmp, args.timeout)
         for p in progs:                 # the oracle's runs, up front
@@ -282,7 +347,8 @@ def main():
         fp = fingerprint(file_digest(binary),
                          "\n".join(c.name for c in cands))
         r = Run("int_select", cands, work, fp, jobs, resume=args.resume,
-                heartbeat=args.heartbeat, describe=lambda c: c.name)
+                heartbeat=args.heartbeat, describe=lambda c: c.name,
+                phase="exploring")
         excluded = r.execute()
         if not r.complete:
             print("int_select: STOPPED - resume with --resume %s" %
@@ -319,46 +385,132 @@ def main():
             return 1
 
         shrunk = {}
+        targets = []                    # (label, prog, [(cand, owned)])
         for name in [s.strip() for s in args.shrink.split(",")
                      if s.strip()]:
-            if name not in owned:
-                print("int_select: --shrink %s: not a selected test" % name)
+            if name in owned:
+                cand = next(c for c in cands if c.name == name)
+                if cand.prog == "-rt":
+                    print("int_select: --shrink: -rt is not a program")
+                    continue
+                targets.append((name, cand.prog, [(cand, owned[name])]))
                 continue
-            cand = next(c for c in cands if c.name == name)
-            if cand.prog == "-rt":
-                print("int_select: --shrink: -rt is not a program")
+            # a PROGRAM: every selected candidate of it must keep what
+            # it owns, so a program selected under several
+            # configurations shrinks for all of them at once
+            prog = os.path.abspath(os.path.join(ROOT, name))
+            mine = [(c, owned[c.name]) for c in cands
+                    if c.prog == prog and c.name in owned]
+            if not mine:
+                print("int_select: --shrink %s: neither a selected test "
+                      "nor a program with one" % name)
                 continue
-            with open(cand.prog) as f:
-                lines = f.read().split("\n")
-            want = owned[name]
-            want_rc = ex.reference(cand.prog)[0]
-            trials = [0]
+            targets.append((name, prog, mine))
 
-            def keep(sub, cand=cand, want=want, want_rc=want_rc):
+        sizes = {}                      # target -> its current line count
+
+        def shrink_one(target):
+            label, prog, mine = target
+            short = os.path.basename(prog)
+            with open(prog) as f:
+                lines = f.read().split("\n")
+            # OUTPUT LINES ARE PINNED: never offered for deletion. The
+            # oracle is agreement with the tree-walker, and an empty
+            # output agrees trivially - without the pin a shrunk test
+            # still REACHES its code but checks no VALUE (watched: three
+            # nested_fuzz programs shrank to no print at all). Whatever
+            # a pinned line reads stays too, since deleting it changes
+            # the output or stops the compile.
+            pinned = {i for i, l in enumerate(lines)
+                      if re.search(r"\b(print|assert)\s*\(", l)}
+            free = [i for i in range(len(lines)) if i not in pinned]
+
+            def compose(kept):
+                keep_set = set(kept) | pinned
+                return [lines[i] for i in range(len(lines))
+                        if i in keep_set]
+            want_rc = ex.reference(prog)[0]
+            trials = [0]
+            tag = re.sub(r"[^A-Za-z0-9_.]+", "_", label)
+
+            def keep(kept):
+                sub = compose(kept)
                 # the reduced program must still end as the original does
                 # (a compile error agrees with itself in every engine),
-                # agree with the tree-walker, and cover what it owns
+                # agree with the tree-walker, and cover what it owns -
+                # under every configuration it was selected for
                 trials[0] += 1
-                path = os.path.join(tmp, "shrink-%d.my" % trials[0])
+                path = os.path.join(tmp, "shrink-%s-%d.my" % (tag,
+                                                              trials[0]))
                 with open(path, "w") as f:
                     f.write("\n".join(sub))
-                ex.refs.pop(path, None)
-                if ex.reference(path)[0] != want_rc:
+                # a short leash: the original runs in seconds, and a trial
+                # that loops forever must cost seconds, not the default
+                if ex.reference(path, timeout=30)[0] != want_rc:
                     return False
-                ok, cov, _s, _w = ex.measure(cand, "s%d" % trials[0], path)
-                return ok and want <= cov
+                for k, (cand, want) in enumerate(mine):
+                    ok, cov, _s, _w = ex.measure(
+                        cand, "s%s-%d-%d" % (tag, trials[0], k), path)
+                    if not (ok and want <= cov):
+                        return False
+                return True
 
-            small = ddmin(lines, keep)
             dst = os.path.join(args.shrink_dir, "int-select-%s"
                                % re.sub(r"[^A-Za-z0-9_.]+", "_",
-                                        os.path.basename(cand.prog)))
+                                        os.path.basename(prog)))
+
+            def save(kept):
+                sizes[short] = len(compose(kept))
+                mon.set_extra(sizes=dict(sizes))
+                mon.set_current(", ".join("%s %d" % kv
+                                          for kv in sorted(sizes.items())))
+                with open(dst, "w") as f:
+                    f.write("\n".join(compose(kept)))
+            sizes[short] = len(lines)
+            kept = ddmin(free, keep, save,
+                         time.time() + args.shrink_budget
+                         if args.shrink_budget else None)
+            small = compose(kept)
+            # put the VALUES back under comparison (observe_globals),
+            # kept only if the result still passes the same oracle
+            observed = observe_globals(small)
+            if observed != small:
+                path = os.path.join(tmp, "shrink-%s-observed.my" % tag)
+                with open(path, "w") as f:
+                    f.write("\n".join(observed))
+                ok = ex.reference(path, timeout=30)[0] == want_rc
+                for k, (cand, want) in enumerate(mine):
+                    if ok:
+                        good, cov, _s, _w = ex.measure(
+                            cand, "s%s-obs-%d" % (tag, k), path)
+                        ok = good and want <= cov
+                if ok:
+                    small = observed
             with open(dst, "w") as f:
                 f.write("\n".join(small))
-            shrunk[name] = dst
-            print("int_select: shrank %s: %d -> %d line(s) in %d trial(s), "
-                  "still owning %d element(s): %s"
-                  % (name, len(lines), len(small), trials[0], len(want),
-                     dst))
+            mon.advance()
+            return (label, dst, len(lines), len(small), trials[0],
+                    sum(len(w) for _c, w in mine))
+
+        # targets shrink side by side: each ddmin is serial, they are not.
+        # Progress: a ddmin has no fixed total, so with a budget the
+        # percentage is the budget spent; without one, targets finished.
+        t_shrink = time.time()
+
+        def shrink_pct():
+            if args.shrink_budget:
+                return min(99.9, 100.0 * (time.time() - t_shrink)
+                           / args.shrink_budget)
+            return 100.0 * mon.done / max(1, len(targets))
+        mon = Monitor("int_select", total=len(targets), phase="shrinking",
+                      heartbeat=args.heartbeat, percent_fn=shrink_pct)
+        with mon, cf.ThreadPoolExecutor(max(1, len(targets))) as tex:
+            for label, dst, n0, n1, nt, nown in tex.map(shrink_one,
+                                                        targets):
+                shrunk[label] = dst
+                print("int_select: shrank %s: %d -> %d line(s) in %d "
+                      "trial(s), still owning %d element(s): %s"
+                      % (label, n0, n1, nt, nown, dst))
 
         if args.out:
             with open(args.out, "w") as f:
