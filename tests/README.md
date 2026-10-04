@@ -203,7 +203,10 @@ Intrusive tests (need an INT_TESTS=1 build, see "Builds" below)
 |------------|-------------------------------|----------|-------|--------|
 | int_run    | tests/int programs, REPL      | INT      | ~6 m  | 8 m    |
 |            | sessions, leak census, VM and | (+GCOV)  |       |        |
-|            | JIT state checkers            |          |       |        |
+|            | JIT state checkers, and every |          |       |        |
+|            | declared value boundary (a    |          |       |        |
+|            | shift by 64, index -1, ...)   |          |       |        |
+|            | exercised by some test        |          |       |        |
 | int_enum   | forcing any legal compiler    | INT      | 1-6 m | 16 m   |
 |            | decision changes no output    |          |       |        |
 | int_select | which tests cover what;       | INT GCOV | ~6 m  | manual |

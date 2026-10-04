@@ -592,6 +592,30 @@ Two kinds are worth calling out.
   implementation that is wrong at 64. The boundaries are DECLARED where
   the operation is defined, so they become countable elements and not
   "tests someone remembered".
+  **STATUS (2026-10-04): five families BUILT** - 56 classes in
+  `ML_INT_VCLASSES` (intsites.h): shift counts (each edge of [0, 64) per
+  operator, plus `>>`'s sign fill and `>>>`'s zero fill), integer `/`
+  and `%` (zero, INT_MIN / -1, truncation and the remainder's sign),
+  wraparound (`+ - *`, -INT_MIN), indexing (each edge of [-len, len)
+  and an empty container, arrays and strings) and the container
+  builtins at zero and one element. COUNTERS, not events, through
+  noexcept `int_vc_*` classifiers placed where the operation is defined
+  for the reference engine - the shared helper (bitops.h, a builtin),
+  else the tree-walker (TypeInt, the M8 loop, eight subscript sites);
+  the fast engines are checked against it by running the same test.
+  int_run fails on a class no run exercises and, with --gcov, counts
+  each as a `vc:` element; int_select counts them too. First run: the
+  existing suite exercised 46. The ten it never did (-INT_MIN, a
+  wrapping subtraction, a shift by 0, `x >> 63`, `a[-len-1]`, an empty
+  string's index, `pop`/`top` of an empty array, `sort` of an empty and
+  a one-element array) and the other 46 are all
+  `tests/int/22_value_classes.my`, each result asserted from README.md -
+  which first had to GAIN three rules to be the oracle: the sign of `/`
+  and `%`, negative and out-of-range indexes, and `pop`/`top`/`join` of
+  an empty array. Watched: a shift wrong at exactly 64, `a[len]` let
+  through on the boxed path, and a flooring `/` each fail it. Not yet
+  declared: slice bounds, float boundaries (NaN, inf, -0.0, `int()` of
+  them), string/number conversion, `range()` steps, literal limits.
 
 **MC/DC's one tool limit.** GCC instruments at most 64 conditions per
 decision and has no parameter to raise it. Five decisions in `vm.cpp`
@@ -703,8 +727,9 @@ test that owns nothing.
   nothing beyond the rest. `--shrink`: 35_const_meaning 52 -> 24 lines
   in 220 trials (~4 min), still owning its 1,614 elements. Not done:
   tier-1 deviations, the tests/int programs (which carry their own
-  configs) and fuzzer findings as candidates; emitted-edge and value-
-  class elements (9.1) do not exist yet, so the universe is gcov's.
+  configs) and fuzzer findings as candidates; emitted-edge elements
+  (9.1) do not exist yet, so the universe is gcov's plus the sites and
+  the value classes.
 
 ### 9.8 What the fuzzers add, measured (2026-10-04)
 

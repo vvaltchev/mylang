@@ -502,6 +502,7 @@ EvalValue builtin_pop(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
 
     const size_type n = arr.size();
 
+    ML_INT_ONLY(int_vc_size(IntVc::pop_empty, IntVc::pop_one, n);)
     if (!n)
         throw OutOfBoundsEx(arg->start, arg->end);
 
@@ -561,6 +562,7 @@ EvalValue builtin_top(EvalContext *ctx, const ArgLocs *exprList,
     const SharedArrayObj &arr = e.get<SharedArrayObj>();
     const size_type n = arr.size();
 
+    ML_INT_ONLY(int_vc_size(IntVc::top_empty, IntVc::top_one, n);)
     if (!n)
         throw OutOfBoundsEx(arg->start, arg->end);
 
@@ -944,6 +946,8 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
 
     if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
+    ML_INT_ONLY(int_vc_size(IntVc::sort_empty, IntVc::sort_one,
+                            val0.get<SharedArrayObj>().size());)
 
     /*
      * Sorting a `const` (a read-only value, or a const-declared variable)
@@ -1396,6 +1400,7 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
 
     const SharedArrayObj &arr = val0.get<SharedArrayObj>();
+    ML_INT_ONLY(int_vc_size(IntVc::sum_empty, IntVc::sum_one, arr.size());)
 
     /*
      * Flat (unboxed) fast path: sum the int/float vector directly, with no

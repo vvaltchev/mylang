@@ -19,7 +19,10 @@
 # 3. THE SITE CENSUS: every process appends `site hits queries` to one file
 #    (MYLANG_INT_OUT, src/inttest.cpp). A site of src/intsites.h that no
 #    test CHECKED (read through int_hits / int_events) fails - reaching a
-#    site and asserting nothing about it verifies nothing.
+#    site and asserting nothing about it verifies nothing. The same file
+#    carries `vc <class> <hits>` per VALUE CLASS (intsites.h: a declared
+#    boundary - shift by 64, index -1, INT_MIN / -1, an empty array): one
+#    no run exercised fails too.
 # 4. --gcov (a GCOV=1 INT build): the COVERAGE UNIVERSE of plan section 9.
 #    Each unit runs with the gcov counters cleared first, so it yields its
 #    own coverage vector of
@@ -27,6 +30,7 @@
 #        mcdc: each condition of each decision, shown TRUE and FALSE on its
 #              own (GCC >= 14, -fcondition-coverage)
 #        site: each intrusive-test site the unit checked
+#        vc:   each value class the unit's runs exercised
 #    named `kind:file:function:+line-offset:...` so an edit elsewhere in a
 #    file does not rename them. The universe is the PRODUCT: the test
 #    harness (tests.cpp), the INT core and every INT helper function (named
@@ -278,11 +282,18 @@ def main():
                 cov = {e for e, c in elems.items() if c}
                 for e in elems:
                     universe.setdefault(e, True)
-                # the sites this unit CHECKED are elements too
+                # the sites this unit CHECKED are elements too, and so
+                # are the value classes its runs exercised
                 with open(census) as f:
                     f.seek(before)
                     for line in f:
-                        site, _hits, queries = line.split()
+                        parts = line.split()
+                        if parts[0] == "vc":
+                            universe.setdefault("vc:" + parts[1], True)
+                            if int(parts[2]) > 0:
+                                cov.add("vc:" + parts[1])
+                            continue
+                        site, _hits, queries = parts
                         universe.setdefault("site:" + site, True)
                         if int(queries) > 0:
                             cov.add("site:" + site)
@@ -363,10 +374,16 @@ def main():
             print("  probe invisibility: skipped (--only)")
 
         totals = {}
+        vc_totals = {}
         if os.path.exists(census):
             with open(census) as f:
                 for line in f:
-                    site, hits, queries = line.split()
+                    parts = line.split()
+                    if parts[0] == "vc":
+                        vc_totals[parts[1]] = (vc_totals.get(parts[1], 0)
+                                               + int(parts[2]))
+                        continue
+                    site, hits, queries = parts
                     h, q = totals.get(site, (0, 0))
                     totals[site] = (h + int(hits), q + int(queries))
         if not totals and not only:
@@ -384,6 +401,16 @@ def main():
             print("    UNCHECKED  %s  (%d event(s) recorded)"
                   % (s, totals[s][0]))
             failures.append("site %s checked by no test" % s)
+        # the value classes (intsites.h): a declared boundary no run
+        # exercised is a boundary no test checks
+        unhit = [] if only else \
+            sorted(c for c, h in vc_totals.items() if h == 0)
+        if not only:
+            print("  value classes: %d declared, %d exercised by no test"
+                  % (len(vc_totals), len(unhit)))
+        for c in unhit:
+            print("    UNEXERCISED  %s" % c)
+            failures.append("value class %s exercised by no test" % c)
 
     if args.gcov and only:
         print("  coverage: --only ran a subset - ownership and the floor "
@@ -393,7 +420,7 @@ def main():
         uncovered = sorted(e for e in universe if e not in all_cov)
         print("  coverage: %d element(s), %d covered, %d uncovered"
               % (len(universe), len(all_cov), len(uncovered)))
-        for kind in ("br", "mcdc", "site"):
+        for kind in ("br", "mcdc", "site", "vc"):
             tot = sum(1 for e in universe if e.startswith(kind + ":"))
             cov = sum(1 for e in all_cov if e.startswith(kind + ":"))
             print("    %-5s %7d / %7d" % (kind, cov, tot))

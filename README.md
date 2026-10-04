@@ -949,6 +949,8 @@ runtime instead.
     `InvalidValueEx` ("integer overflow in division"); `%` follows the same
     rule. Both are ordinary catchable runtime errors (and, like any
     always-failing constant expression, a build error when fully constant).
+    Otherwise `/` truncates toward zero and `%` takes the sign of the
+    dividend, as in C: `-7 / 2 == -3`, `-7 % 2 == -1`, `7 % -2 == 1`.
 
   * **Float**
     A floating-point number (e.g. `1.23`). Internally, it's a C `double`
@@ -957,6 +959,7 @@ runtime instead.
   * **String**
     A string like "hello". Strings are immutable and support slices (e.g.
     `s[3:5]` or `s[3:]` or `s[-2:]`, having the same meaning as in `Python`).
+    `s[i]` is the one-character string at `i`, indexed like an array (below).
     Immutability holds through aliases, exactly as in Python: after
     `var b = a; a += "!"`, `b` is unchanged. `s += x` is still amortized
     O(n) for the usual accumulator loop - it appends in place when it can
@@ -970,6 +973,11 @@ runtime instead.
     A mutable type for arrays and tuples (e.g. `[1,2,3]`). It can contain items
     of different type and it supports writable slices. Array slices behave like
     copies while, under the hood, they use copy-on-write techniques.
+    `a[i]` reads or writes the element at `i`, counting from 0; a negative
+    index counts from the end, so `a[-1]` is the last element and
+    `a[-len(a)]` the first. Any other index - below `-len(a)`, or `len(a)`
+    and beyond, which is every index of an empty array - throws
+    `OutOfBoundsEx`.
 
   * **Dictionary**
     Dictionaries are hash-maps (O(1) lookup) defined using `Python`'s syntax:
@@ -2436,7 +2444,8 @@ flat (`int`/`float`/`bool`) when every element the callback returns is that one
 scalar kind, otherwise general.
 
 #### `top(array)`
-Return the last element of the array. This is an alias for `array[-1]`.
+Return the last element of the array. This is an alias for `array[-1]`, so
+an empty array throws `OutOfBoundsEx`.
 It is useful when a given array is used as a stack, in combination with
 other builtins like `push()` and `pop()`.
 
@@ -2555,7 +2564,8 @@ without a none-check). Same behavior as the `d[key]` / `d.key` sugar.
 Split the given string by the given delimiter. Returns an array.
 
 #### `join(array_of_strings, delim)`
-Join the given array of strings with the given delimiter. Returns a string.
+Join the given array of strings with the given delimiter. Returns a string:
+`""` for an empty array, the one element itself for a single one.
 
 #### `ord(string)`
 Return the numeric value of the given 1-char string.
@@ -3090,7 +3100,8 @@ Append `value` to the given array.
 An alias for `append()`. Useful for symmetry when used with `pop()`.
 
 #### `pop(array)`
-Pop (and return) the last element from the given array.
+Pop (and return) the last element from the given array. Popping an empty
+array throws `OutOfBoundsEx`.
 
 #### `dynarray(array)`
 Return a fresh, **general (polymorphic) copy** of `array` — its static type is

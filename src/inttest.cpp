@@ -11,7 +11,8 @@
  * MYLANG_INT_OUT=<path>: at exit, the process appends one
  * `site hits queries` line per site to <path> (every site, zeros
  * included): how many events it recorded, and how many times a test READ
- * it through int_hits/int_events. tests/int_run sums these over its
+ * it through int_hits/int_events; then one `vc <class> <hits>` line per
+ * declared value class. tests/int_run sums these over its
  * runs for the site census - a site no test CHECKS fails, since reaching
  * a site without asserting on it verifies nothing.
  *
@@ -147,6 +148,137 @@ void int_census_mark()
     g_int_census_marked = true;
 }
 
+/* The value classes: plain counters in static storage (zero-initialized,
+ * no constructor), so a recording point is one increment. */
+static constexpr int N_VCLASSES = static_cast<int>(IntVc::count_);
+static uint64_t g_int_vc_hits[N_VCLASSES];
+static const char *const g_vc_names[] = {
+#define V(name, desc) #name,
+    ML_INT_VCLASSES(V)
+#undef V
+};
+static_assert(sizeof(g_vc_names) / sizeof(g_vc_names[0]) == N_VCLASSES,
+              "intsites.h: value-class names out of step with the enum");
+/* the classes name 64-bit boundaries (shl_63, shl_64, INT_MIN) */
+static_assert(sizeof(intptr_t) == 8, "value classes assume a 64-bit int");
+
+void int_vc(IntVc c) noexcept
+{
+    g_int_vc_hits[static_cast<int>(c)]++;
+}
+
+static void int_vc_count(int64_t n, IntVc neg, IntVc zero, IntVc w63,
+                         IntVc w64, IntVc over) noexcept
+{
+    if (n < 0)
+        int_vc(neg);
+    else if (n == 0)
+        int_vc(zero);
+    else if (n == 63)
+        int_vc(w63);
+    else if (n == 64)
+        int_vc(w64);
+    else if (n > 64)
+        int_vc(over);
+}
+
+void int_vc_shift(char op, int64_t v, int64_t n) noexcept
+{
+    switch (op) {
+    case 'l':
+        int_vc_count(n, IntVc::shl_neg, IntVc::shl_zero, IntVc::shl_63,
+                     IntVc::shl_64, IntVc::shl_over);
+        break;
+    case 'r':
+        int_vc_count(n, IntVc::shr_neg, IntVc::shr_zero, IntVc::shr_63,
+                     IntVc::shr_64, IntVc::shr_over);
+        if (v < 0 && n >= 64)
+            int_vc(IntVc::shr_fill);
+        break;
+    default:
+        int_vc_count(n, IntVc::ushr_neg, IntVc::ushr_zero, IntVc::ushr_63,
+                     IntVc::ushr_64, IntVc::ushr_over);
+        if (v < 0 && n > 0 && n < 64)
+            int_vc(IntVc::ushr_negval);
+        break;
+    }
+}
+
+void int_vc_divmod(bool mod, int64_t a, int64_t b) noexcept
+{
+    if (b == 0) {
+        int_vc(mod ? IntVc::mod_zero : IntVc::div_zero);
+        return;
+    }
+    if (b == -1 && a == INT64_MIN) {
+        int_vc(mod ? IntVc::mod_min_neg1 : IntVc::div_min_neg1);
+        return;
+    }
+    if (a % b == 0)
+        return;
+    if (!mod) {
+        if ((a < 0) != (b < 0))
+            int_vc(IntVc::div_neg_trunc);
+    } else if (a < 0) {
+        int_vc(IntVc::mod_neg);
+    } else if (b < 0) {
+        int_vc(IntVc::mod_neg_divisor);
+    }
+}
+
+void int_vc_arith(char op, int64_t a, int64_t b) noexcept
+{
+    int64_t r;
+    switch (op) {
+    case '+':
+        if (__builtin_add_overflow(a, b, &r))
+            int_vc(IntVc::add_wrap);
+        break;
+    case '-':
+        if (__builtin_sub_overflow(a, b, &r))
+            int_vc(IntVc::sub_wrap);
+        break;
+    case '*':
+        if (__builtin_mul_overflow(a, b, &r))
+            int_vc(IntVc::mul_wrap);
+        break;
+    default:
+        if (a == INT64_MIN)
+            int_vc(IntVc::neg_min);
+        break;
+    }
+}
+
+void int_vc_index(bool str, int64_t idx, uint64_t len) noexcept
+{
+    const int64_t n = static_cast<int64_t>(len);
+    if (n == 0) {
+        int_vc(str ? IntVc::str_idx_empty : IntVc::arr_idx_empty);
+        return;
+    }
+    /* each boundary the index sits on - at len 1, 0 is first AND last */
+    if (idx == -n - 1)
+        int_vc(str ? IntVc::str_idx_below : IntVc::arr_idx_below);
+    if (idx == -n)
+        int_vc(str ? IntVc::str_idx_neg_first : IntVc::arr_idx_neg_first);
+    if (idx == -1)
+        int_vc(str ? IntVc::str_idx_neg_last : IntVc::arr_idx_neg_last);
+    if (idx == 0)
+        int_vc(str ? IntVc::str_idx_first : IntVc::arr_idx_first);
+    if (idx == n - 1)
+        int_vc(str ? IntVc::str_idx_last : IntVc::arr_idx_last);
+    if (idx == n)
+        int_vc(str ? IntVc::str_idx_len : IntVc::arr_idx_len);
+}
+
+void int_vc_size(IntVc empty, IntVc one, uint64_t n) noexcept
+{
+    if (n == 0)
+        int_vc(empty);
+    else if (n == 1)
+        int_vc(one);
+}
+
 namespace {
 
 /* Write the per-site counts at exit, when asked to. Registered from a
@@ -180,6 +312,10 @@ void dump_at_exit()
         std::fprintf(f, "%s %llu %llu\n", site_names[i],
                      static_cast<unsigned long long>(log().hits[i]),
                      static_cast<unsigned long long>(log().queries[i]));
+    /* `vc <class> <hits>`, every declared class, zeros included */
+    for (int i = 0; i < N_VCLASSES; i++)
+        std::fprintf(f, "vc %s %llu\n", g_vc_names[i],
+                     static_cast<unsigned long long>(g_int_vc_hits[i]));
     std::fclose(f);
 }
 

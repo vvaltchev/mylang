@@ -210,8 +210,12 @@ class Explorer:
             with open(out) as f:
                 for line in f:
                     parts = line.split()
-                    if len(parts) == 3 and int(parts[2]) > 0:
-                        cov.add("site:" + parts[0])
+                    if len(parts) != 3 or int(parts[2]) == 0:
+                        continue
+                    # `vc <class> <hits>` - a value class exercised -
+                    # or `<site> <hits> <queries>` - a site checked
+                    cov.add(("vc:" + parts[1]) if parts[0] == "vc"
+                            else ("site:" + parts[0]))
         shutil.rmtree(prefix, ignore_errors=True)
         return why is None, cov, secs, why
 

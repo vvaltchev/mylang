@@ -626,6 +626,7 @@ EvalValue TypeArr::subscript(const EvalValue &what_lval,
     const SharedArrayObj &arr = what.get_ref<SharedArrayObj>();
     int_type idx = idx_val.get<int_type>();
 
+    ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
     if (idx < 0)
         idx += arr.size();
 

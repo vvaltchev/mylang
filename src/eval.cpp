@@ -3056,7 +3056,11 @@ int_type TypedScalarExpr::eval_int_body(EvalContext *ctx) const
         case Cat::neg:
             if (kind == TypeHint::f)
                 return static_cast<int_type>(-elems[0].second->eval_float(ctx));
-            return -elems[0].second->eval_int(ctx);
+            {
+                const int_type v = elems[0].second->eval_int(ctx);
+                ML_INT_ONLY(int_vc_arith('n', v, 0);)
+                return -v;
+            }
 
         case Cat::lnot:
             return elems[0].second->eval_int(ctx) == 0 ? 1 : 0;
@@ -3068,13 +3072,20 @@ int_type TypedScalarExpr::eval_int_body(EvalContext *ctx) const
             for (size_t i = 1; i < elems.size(); i++) {
                 const int_type r = elems[i].second->eval_int(ctx);
                 switch (elems[i].first) {
-                    case Op::plus:  acc += r; break;
-                    case Op::minus: acc -= r; break;
-                    case Op::times: acc *= r; break;
+                    case Op::plus:
+                        ML_INT_ONLY(int_vc_arith('+', acc, r);)
+                        acc += r; break;
+                    case Op::minus:
+                        ML_INT_ONLY(int_vc_arith('-', acc, r);)
+                        acc -= r; break;
+                    case Op::times:
+                        ML_INT_ONLY(int_vc_arith('*', acc, r);)
+                        acc *= r; break;
                     /* div0 carets the DIVISOR operand (#76) - the boxed
                      * ladder's operand-precise convention, so the engines
                      * agree regardless of which path lowered the chain */
                     case Op::div:
+                        ML_INT_ONLY(int_vc_divmod(false, acc, r);)
                         if (r == 0)
                             throw DivisionByZeroEx(elems[i].second->start,
                                                    elems[i].second->end);
@@ -3083,6 +3094,7 @@ int_type TypedScalarExpr::eval_int_body(EvalContext *ctx) const
                                                elems[i].second->end);
                         acc /= r; break;
                     case Op::mod:
+                        ML_INT_ONLY(int_vc_divmod(true, acc, r);)
                         if (r == 0)
                             throw DivisionByZeroEx(elems[i].second->start,
                                                    elems[i].second->end);
@@ -3442,6 +3454,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
             throw TypeErrorEx("Expected integer as subscript",
                               idx_start, idx_end);
         int_type idx = idx_v.get<int_type>();
+        ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
         if (idx < 0)
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
@@ -3486,6 +3499,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
             throw TypeErrorEx("Expected integer as subscript",
                               idx_start, idx_end);
         int_type idx = idx_v.get<int_type>();
+        ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
         if (idx < 0)
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
@@ -3509,6 +3523,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
                           idx_start, idx_end);
 
     int_type idx = idx_v.get<int_type>();
+    ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
     if (idx < 0)
         idx += arr.size();
     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
@@ -5428,6 +5443,7 @@ int_type Subscript::eval_int(EvalContext *ctx) const
     if (base.is<SharedArrayObj>()) {
         const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
         int_type idx = index->eval_int(ctx);
+        ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
         if (idx < 0)
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
@@ -5462,6 +5478,7 @@ float_type Subscript::eval_float(EvalContext *ctx) const
     if (base.is<SharedArrayObj>()) {
         const SharedArrayObj &arr = base.get_ref<SharedArrayObj>();
         int_type idx = index->eval_int(ctx);
+        ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
         if (idx < 0)
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
@@ -6224,6 +6241,7 @@ static bool member_pod_array_scalar(const Subscript *sub, EvalContext *ctx,
         return false;
 
     int_type idx = sub->index->eval_int(ctx);
+    ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
     if (idx < 0)
         idx += arr.size();
     if (idx < 0 || static_cast<size_t>(idx) >= arr.size())

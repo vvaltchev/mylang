@@ -57,6 +57,7 @@ void TypeInt::add(EvalValue &a, const EvalValue &b)
     if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
+    ML_INT_ONLY(int_vc_arith('+', a.get<int_type>(), b.get<int_type>());)
     a.get<int_type>() += b.get<int_type>();
 }
 
@@ -65,6 +66,7 @@ void TypeInt::sub(EvalValue &a, const EvalValue &b)
     if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
+    ML_INT_ONLY(int_vc_arith('-', a.get<int_type>(), b.get<int_type>());)
     a.get<int_type>() -= b.get<int_type>();
 }
 
@@ -73,6 +75,7 @@ void TypeInt::mul(EvalValue &a, const EvalValue &b)
     if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
+    ML_INT_ONLY(int_vc_arith('*', a.get<int_type>(), b.get<int_type>());)
     a.get<int_type>() *= b.get<int_type>();
 }
 
@@ -81,6 +84,7 @@ void TypeInt::div(EvalValue &a, const EvalValue &b)
     if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
+    ML_INT_ONLY(int_vc_divmod(false, a.get<int_type>(), b.get<int_type>());)
     if (b.get<int_type>() == 0)
         throw DivisionByZeroEx();
 
@@ -93,6 +97,7 @@ void TypeInt::mod(EvalValue &a, const EvalValue &b)
     if (!b.is<int_type>())
         throw TypeErrorEx("Expected integer on the right side");
 
+    ML_INT_ONLY(int_vc_divmod(true, a.get<int_type>(), b.get<int_type>());)
     if (b.get<int_type>() == 0)
         throw DivisionByZeroEx();
 
@@ -220,6 +225,7 @@ void TypeInt::noteq(EvalValue &a, const EvalValue &b)
 
 void TypeInt::opneg(EvalValue &a)
 {
+    ML_INT_ONLY(int_vc_arith('n', a.get<int_type>(), 0);)
     a.get<int_type>() = -a.get<int_type>();
 }
 

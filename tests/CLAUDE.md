@@ -196,6 +196,12 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   stderr be empty, rc 0. `--update-repl` rewrites the .expected files -
   READ the diff, it is the assertion. (Not .out: .gitignore drops *.out,
   which is how the first push lost all 24 of them.)
+- VALUE CLASSES (src/intsites.h, ML_INT_VCLASSES): declared operation
+  boundaries, counted at the operation (`vc <class> <hits>` lines in the
+  MYLANG_INT_OUT census). A class no run exercises fails int_run; with
+  --gcov each is a `vc:` element. 22_value_classes.my asserts every one
+  against README.md - extend it with each new class, and give the
+  README the rule first if it does not state the boundary.
 - With --gcov every unit must OWN an element no other unit covers, and
   uncovered must stay <= tests/int/coverage-floor.txt for the compiler.
   Lower the floor when a change covers more (the note says by how much);

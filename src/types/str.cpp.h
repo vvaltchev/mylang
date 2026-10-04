@@ -269,6 +269,7 @@ EvalValue TypeStr::subscript(const EvalValue &what_lval,
     const SharedStr &s = what.get_ref<SharedStr>();
     int_type idx = idx_val.get<int_type>();
 
+    ML_INT_ONLY(int_vc_index(true, idx, s.size());)
     if (idx < 0)
         idx += s.size();
 

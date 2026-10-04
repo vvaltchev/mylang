@@ -626,6 +626,19 @@ BUILD_DIR=build-claude/int-rel` (the whole functional corpus in ~40 s).
 A hook in a product function must be `noexcept` and allocate nothing
 the product sees: `int_enumerate` added an exception edge to every
 `take()` caller and the coverage gate counted it as a new branch.
+**VALUE CLASSES (plan 9.1, 2026-10-04).** A declared BOUNDARY of an
+operation - a shift by 64, an index of -1 or of len, INT_MIN / -1, an
+empty array - is a row of `ML_INT_VCLASSES` (intsites.h), counted by a
+noexcept `int_vc_*` classifier (through `ML_INT_ONLY`) where the
+operation is defined for the reference engine: the shared helper when
+there is one, else the tree-walker. `int_run` fails on a class no run
+exercises and, with `--gcov`, counts each as a `vc:` coverage element.
+A new class comes with its recording point AND a `tests/int` assertion
+of its result FROM THE README; if the README is silent on that
+boundary it gains the rule first - the spec is the oracle, and a
+boundary it does not state cannot be checked (three rules were added
+that way: the sign of `/` and `%`, negative indexes, `pop`/`top`/`join`
+on an empty array).
 **THE OBJECT CENSUS (P4, 2026-10-03).** Each pooled heap object kind
 (str, arr, dict, struct, func, exc) is counted at its class `operator
 new/delete` in an INT build (`ML_POOL_NEW_DELETE_K`, poolalloc.h - the
