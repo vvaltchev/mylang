@@ -53,8 +53,9 @@ the INT_TESTS section); read those first.
 - BUILDS are `LANES`: a make or cmake recipe plus an `expect` dict that
   the binary's `mylang -v` must match. Add the expectation that would
   catch the wrong binary (int_tests 1 for an INT lane, ...), never an
-  empty one. Builds go to --build-root (default build-claude/, which is
-  also where Claude must build).
+  empty one. Builds go to --build-root: default build-tests/, the
+  maintainer's; Claude passes --build-root build-claude (or exports
+  MYLANG_TEST_BUILD_ROOT=build-claude), since it builds only there.
 - CASES: a test with `cases=` can list (`--list`) and run a subset
   (`--only REGEX`) through its tool; `CASES` maps the kind to the list
   command, the selection suffix and a FAILED-CASE PARSER that reads the

@@ -826,10 +826,10 @@ def parse_args(cat):
     g = ap.add_argument_group("builds")
     g.add_argument("--build-root",
                    default=os.environ.get("MYLANG_TEST_BUILD_ROOT",
-                                          os.path.join(ROOT,
-                                                       "build-claude")),
-                   help="where the builds live (default: build-claude/, "
-                        "or $MYLANG_TEST_BUILD_ROOT)")
+                                          os.path.join(ROOT, "build-tests")),
+                   help="where the builds, logs and timings live "
+                        "(default: build-tests/, or "
+                        "$MYLANG_TEST_BUILD_ROOT)")
     g.add_argument("--no-build", action="store_true",
                    help="build nothing; skip tests whose build is missing")
     g.add_argument("--bin", action="append", default=[],
