@@ -417,9 +417,17 @@ assertions on values.
   slot outside `ref_slots`, a `borrowed` slot holds a non-slice
   reference. -rt (all five modes), the corpus x 3 engines and all 83,213
   enumerator deviations pass it. Watched: the #78 catch-bind gap
-  reintroduced aborts at its pc. NOT built yet: the proven-type check
-  (`th` / `proven_type` against the slot's tag), live-slice registration,
-  refcount sanity.
+  reintroduced aborts at its pc.
+  **Second increment, PROVEN TYPES (2026-10-03):** a typed or C3-proven
+  parameter holds its scalar (or none when opt) at every op of its body,
+  and the dst of the op just run holds the one kind that op writes (the
+  specialized int/float family, IntBin/FloatBin, LoadImm*, StrLen,
+  CmpIntV/CmpFloatV), read at the fall-through successor in the same
+  frame. Skipped for a loaded image. -rt, int_run and all 83,064 CI-corpus
+  deviations pass; watched: a float-param bind that does not widen, and
+  CmpIntV writing an int, abort at their pc. `th` per instruction operand
+  stays VM_HARDENING's read-side check. NOT built yet: live-slice
+  registration, refcount sanity.
 - **P5 - JIT preserving probe stub** + the per-op register map.
 - **P6 - chunk hook + assembler**; build the three splice-gate tests.
 - **P7 - per-site forcing sweep.**

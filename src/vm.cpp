@@ -1343,6 +1343,53 @@ static void int_vm_state_fail(const Chunk &ck, size_t pc, int slot,
     std::abort();
 }
 
+/* The kind a value is, in int_param_kinds' / int_op_result_kind's
+ * encoding: 1 int, 2 float, 3 bool, 0 anything else. */
+static int int_value_kind(const EvalValue &v) noexcept
+{
+    switch (v.get_type()->t) {
+    case Type::t_int:   return 1;
+    case Type::t_float: return 2;
+    case Type::t_bool:  return 3;
+    default:            return 0;
+    }
+}
+
+/* What an op's dst holds once it has run, for the ops whose handler
+ * writes ONE kind unconditionally (0: not checked). A deliberately small
+ * list - an op not here is simply not checked; one here that writes
+ * another kind is a bug in the op or in the codegen that chose it. */
+static int int_op_result_kind(const Instr &in) noexcept
+{
+    switch (in.op) {
+    case OpCode::IntAddRR: case OpCode::IntAddRI:
+    case OpCode::IntSubRR: case OpCode::IntSubRI:
+    case OpCode::IntMulRR: case OpCode::IntMulRI:
+    case OpCode::IntAndRR: case OpCode::IntAndRI:
+    case OpCode::IntOrRR:  case OpCode::IntOrRI:
+    case OpCode::IntXorRR: case OpCode::IntXorRI:
+    case OpCode::IntShlRR: case OpCode::IntShlRI:
+    case OpCode::IntShrRR: case OpCode::IntShrRI:
+    case OpCode::IntModRI: case OpCode::IntBin:
+    case OpCode::LoadImmInt: case OpCode::StrLen:
+        return 1;
+    case OpCode::FloatAddRR: case OpCode::FloatAddRI:
+    case OpCode::FloatSubRR: case OpCode::FloatSubRI:
+    case OpCode::FloatMulRR: case OpCode::FloatMulRI:
+    case OpCode::FloatBin: case OpCode::LoadImmFloat:
+        return 2;
+    case OpCode::CmpIntV: case OpCode::CmpFloatV:
+        return 3;
+    default:
+        return 0;
+    }
+}
+
+/* The op this frame ran last, so the next check can read its dst. */
+static const Chunk *g_int_vms_ck = nullptr;
+static const Frame *g_int_vms_fr = nullptr;
+static size_t g_int_vms_pc = 0;
+
 static void int_vm_state_check(const Chunk &ck, const EvalContext &ctx,
                                size_t pc) noexcept
 {
@@ -1371,6 +1418,69 @@ static void int_vm_state_check(const Chunk &ck, const EvalContext &ctx,
                 int_vm_state_fail(ck, pc, i, "is borrowed but holds a "
                                              "slice");
         }
+    }
+    /*
+     * THE PROVEN TYPES. A loaded image's proofs are input, not facts
+     * (the audits' rule, CLAUDE.md #142), so only our own bytecode.
+     *  - a typed or inference-proven PARAMETER holds that scalar (or
+     *    none, when it is opt) at every op of its body;
+     *  - the dst of the op just run, when that op writes one kind, holds
+     *    it - read at the FALL-THROUGH successor in the same frame only:
+     *    an op that raised skipped its write, and the next op dispatched
+     *    in that frame is then a handler elsewhere.
+     */
+    if (g_untrusted_bytecode)
+        return;
+    const size_t np = std::min(ck.int_param_kinds.size(),
+                               static_cast<size_t>(n));
+    for (size_t i = 0; i < np; i++) {
+        const unsigned char want = ck.int_param_kinds[i];
+        if (!want)
+            continue;
+        const EvalValue &v = fr->slots[i].get();
+        const int k = int_value_kind(v);
+        if (k == (want & 3))
+            continue;
+        if ((want & 4) && v.get_type()->t == Type::t_none)
+            continue;
+        int_vm_state_fail(ck, pc, static_cast<int>(i),
+                          (want & 3) == 1
+                              ? "a proven-int parameter holds a non-int"
+                              : "a proven-float parameter holds a "
+                                "non-float");
+    }
+    if (g_int_vms_ck == &ck && g_int_vms_fr == fr
+            && pc == g_int_vms_pc + 1) {
+        const Instr &prev = ck.code[g_int_vms_pc];
+        const int want = int_op_result_kind(prev);
+        if (want && prev.target >= 0 && prev.target < n
+                && int_value_kind(fr->slots[prev.target].get()) != want)
+            int_vm_state_fail(ck, pc, prev.target,
+                              want == 1 ? "the previous op writes an int, "
+                                          "the slot holds another kind"
+                              : want == 2 ? "the previous op writes a float"
+                                            ", the slot holds another kind"
+                              : "the previous op writes a bool, the slot "
+                                "holds another kind");
+    }
+    g_int_vms_ck = &ck;
+    g_int_vms_fr = fr;
+    g_int_vms_pc = pc;
+}
+
+/* int_param_kinds, from the descriptor keying the chunk (bytecode.h). */
+static void int_stamp_param_kinds(Chunk &ck, const FuncDescriptor *d)
+{
+    ck.int_param_kinds.assign(d->params.size(), 0);
+    for (size_t i = 0; i < d->params.size(); i++) {
+        const FuncDescriptor::ParamDesc &pd = d->params[i];
+        const DeclType t = pd.decl_type != DeclType::none ? pd.decl_type
+                                                          : pd.proven_type;
+        const unsigned char k = t == DeclType::i ? 1
+                              : t == DeclType::f ? 2 : 0;
+        ck.int_param_kinds[i] = k ? static_cast<unsigned char>(
+                                        k | (pd.opt ? 4 : 0))
+                                  : 0;
     }
 }
 #endif
@@ -2429,7 +2539,8 @@ void vm_jit_loaded_image(VmProgram &prog)
                        const_cast<void *>(d->vm_chunk)), d.get());
     };
 
-    for_each_chunk([](Chunk &ck, const FuncDescriptor *) {
+    for_each_chunk([](Chunk &ck, const FuncDescriptor *d) {
+        ML_INT_ONLY(int_stamp_param_kinds(ck, d);)
         ck.native_leaf = jit_chunk_is_native_leaf(ck);
         /* #97 increment 2: derived from the ops exactly like native_leaf,
          * never stored - and read by the CALLER's site (frameless_site),
@@ -2898,6 +3009,9 @@ vm_precompile_all(const Block *root, bool jit, Chunk *main_chunk)
             if (slot >= 0 && static_cast<size_t>(slot) < slot_desc.size())
                 slot_desc[slot] = fn->desc;
         }
+
+    ML_INT_ONLY(for (auto &kv : g_func_chunks)
+                    int_stamp_param_kinds(kv.second, kv.first);)
 
     /* THE BYTECODE INLINER's corpus audit (env MYLANG_INLAUDIT=1): with
      * every chunk codegen'd and the slot->descriptor map built, report what
