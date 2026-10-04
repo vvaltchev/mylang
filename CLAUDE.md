@@ -929,6 +929,13 @@ forget an ABI. Measured byte-flat (55/46/01 per scale) - the cold arm
 already paid the move, and the hot two-store path preserves RAX free.
 **When you add a helper the emitter calls, make its argument registers
 PARAMETERS and say what it clobbers.**
+**And the CALLEE's side is declared by its SIGNATURE (2026-10-02):**
+`call_direct` / `call_direct_framefree` / `call_rax` take a `Helper`
+built from the helper's TYPED function pointer, which derives the SysV
+argument registers it reads (GP and xmm, by position); REGTRACK's
+`trk_call_args` requires each to be written by the op emitting the call.
+Pass the helper, never `reinterpret_cast<const void *>(helper)`; an
+untyped pointer states its ABI (`Helper::untyped`, `Helper::fragment`).
 
 **⛔ A FIFTH AUDIT-TABLE SHAPE: AN `&&` OVER A FAMILY IS A TABLE THAT
 DOES NOT LOOK LIKE ONE (#96, 2026-08-16).** The four traps above are all
