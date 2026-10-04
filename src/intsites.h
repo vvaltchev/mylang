@@ -116,4 +116,10 @@
     /* - 0 frameless, 1 the general push. `key` is `frameless@L:C`, the */ \
     /* site's source position. jit.cpp, jit_frameless_candidates.      */ \
     X(frameless_choice, "a call site's frameless tier (0 take, 1 push)", \
+      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick)) \
+    /* An ENUMERATED decision: a guarded tier's DECLINE (a decline_jump  */ \
+    /* or a reference check's helper arm) - 0 as emitted, 1 forced to   */ \
+    /* the slow tier for every value. `key` is `<run>/<guard>@<pc>#<k>`. */ \
+    /* jit.cpp, jit_int_force_decline (P7, the per-site forcing sweep).  */ \
+    X(decline_choice, "a guarded tier's decline (0 as emitted, 1 forced)", \
       F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))

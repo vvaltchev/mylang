@@ -2020,6 +2020,7 @@ struct JitIntProbe {
     std::vector<char> skip;
 };
 typedef std::vector<std::pair<size_t, JitIntProbe>> JitIntProbeList;
+typedef std::map<std::string, int> JitIntForceK;
 #endif
 
 struct Emitter {
@@ -2058,6 +2059,9 @@ struct Emitter {
     /* #107 P5: (end of the probe call, its record) - committed by
      * jit_int_probes_commit once the fragment is mapped */
     ML_INT_FIELD(JitIntProbeList, int_probes, {})
+    /* #107 P7: per (pc, guard) ordinals for decline_choice keys - fresh
+     * with every emission attempt, so a retry asks the same keys */
+    ML_INT_FIELD(JitIntForceK, int_force_k, {})
 #ifdef INT_TESTS
     void int_note_pin(int slot, uint8_t reg, bool fp)
     {
@@ -8102,10 +8106,43 @@ static bool jit_op_eligible(const Instr &in)
 struct DeclineJump { size_t at; int reason; };
 typedef std::vector<DeclineJump> DeclineJumps;
 
+#ifdef INT_TESTS
+/*
+ * #107 P7: THE PER-SITE FORCING SWEEP. Every guarded tier's decline -
+ * a decline_jump, a reference check's helper arm - is an ENUMERATED
+ * DECISION (`decline_choice`): pick 1 sends that ONE site to its slow
+ * tier unconditionally, which must change nothing observable, because a
+ * decline is legal on every value. tests/int_enum.py's tier 1 then IS
+ * the sweep the plan asked for: every site of every corpus program
+ * forced in turn, each run against the tree-walker - the per-call-site
+ * MYLANG_JIT_COLD, without forcing every site at once. Keyed
+ * `<run>/<guard>@<pc>#<k>`, k the ordinal of that (pc, guard) in this
+ * emission attempt (a C1 cold copy re-emits a pc).
+ */
+static bool jit_int_force_decline(Emitter &e, const char *what) noexcept
+{
+    std::string key = g_int_runkey + "/" + what + "@"
+                    + std::to_string(e.cur_pc);
+    const int k = e.int_force_k[key]++;
+    key += "#" + std::to_string(k);
+    const int pick = int_choose(key, 2, 0);
+    ML_INT(decline_choice, key, int64_t(2), int64_t(0), int64_t(pick));
+    return pick == 1;
+}
+#endif
+
 static void decline_jump(Emitter &e, DeclineJumps &v, uint8_t cc,
                          JitDecline why)
 {
     v.push_back({ e.j32(cc), static_cast<int>(why) });
+    /* forced: the INVERSE condition jumps to the same pad, so the
+     * decline is always taken while the emitter still sees a
+     * conditional jump (an unconditional one would end the straight-line
+     * code its stack and register models follow) */
+    ML_INT_ONLY(if (cc != 0xEB          /* already unconditional */
+                    && jit_int_force_decline(e, jit_decline_name(why)))
+                    v.push_back({ e.j32(static_cast<uint8_t>(cc ^ 1)),
+                                  static_cast<int>(why) });)
 }
 
 static void decline_land(Emitter &e, DeclineJumps &v)
@@ -8428,7 +8465,10 @@ static size_t emit_ref_check(Emitter &e, int32_t type_off,
                              uint32_t excl = 0)  /* the VALUE's regs */
 {
     const JitLayout &L = jit_layout();
-    const bool force = cold != JC_COUNT && jit_cold_forced(cold);
+    bool force = cold != JC_COUNT && jit_cold_forced(cold);
+    /* #107 P7: the release-helper arm, forced for this one site */
+    ML_INT_ONLY(if (jit_int_force_decline(e, "refcheck"))
+                    force = true;)
     RefScratch rs(e, scr, excl);
     const uint8_t sc = rs.sc;
     e.load(sc, type_off);                     /* sc = current Type* */
@@ -8460,11 +8500,13 @@ static size_t emit_ref_check_jae_chain(Emitter &e, uint8_t cb,
                                        uint8_t scr = RCX)  /* reg:proto */
 {
     const JitLayout &L = jit_layout();
+    uint32_t refv = static_cast<uint32_t>(L.t_str_val);
+    ML_INT_ONLY(if (jit_int_force_decline(e, "refcheck_chain")) refv = 0;)
     RefScratch rs(e, scr);
     const uint8_t sc = rs.sc;
     e.load_base(sc, cb, type_off);
     e.load32_base(sc, sc, L.type_t_off);
-    e.cmp_reg32_imm32(sc, static_cast<uint32_t>(L.t_str_val));
+    e.cmp_reg32_imm32(sc, refv);
     rs.release();
     return e.j32(0x73);                        /* jae -> the helper (a ref) */
 }
@@ -8748,11 +8790,14 @@ static size_t emit_ref_check_jae(Emitter &e, int32_t type_off,
                                  uint8_t scr = RCX)  /* reg:proto */
 {
     const JitLayout &L = jit_layout();
+    /* #107 P7: forced, every value takes the helper (jae over 0) */
+    uint32_t refv = static_cast<uint32_t>(L.t_str_val);
+    ML_INT_ONLY(if (jit_int_force_decline(e, "refcheck_jae")) refv = 0;)
     RefScratch rs(e, scr);
     const uint8_t sc = rs.sc;
     e.load(sc, type_off);
     e.load32_base(sc, sc, L.type_t_off);
-    e.cmp_reg32_imm32(sc, static_cast<uint32_t>(L.t_str_val));
+    e.cmp_reg32_imm32(sc, refv);
     rs.release();
     return e.j32(0x73);                        /* jae -> the helper (a ref) */
 }
@@ -28730,7 +28775,11 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
 #endif
             return;
         }
-        if (jit_cold_forced(JC_GUARD)) {
+        bool force_miss = jit_cold_forced(JC_GUARD);
+        /* #107 P7: the inline cache's miss arm, forced for this site */
+        ML_INT_ONLY(if (jit_int_force_decline(e, "guard_miss"))
+                        force_miss = true;)
+        if (force_miss) {
             /* MYLANG_JIT_COLD=guard: the miss arm, unconditionally
              * (Jump's own emission) */
             const size_t tgt = static_cast<size_t>(in.target);
