@@ -1,115 +1,377 @@
-# tests/ — auxiliary test tools (NOT the `-rt` unit suite)
+MyLang tests
+============
 
-These are standalone test *programs*, separate from the built-in `-rt` unit
-suite (`src/tests.cpp`). They exist for kinds of testing that can't be
-exhaustively hard-coded — mainly **differential fuzzing** of the interpreter
-against CPython — or that `-rt` structurally cannot reach. They have no
-third-party dependencies (Python 3 standard library only, or POSIX `sh`).
+MyLang is tested in two ways.
 
-Two of them run in CI (`.github/workflows/linux.yml`); the rest are run by
-hand. The full set:
+The built-in unit suite lives inside the interpreter itself (src/tests.cpp).
+You run it with "mylang -rt" on a build made with TESTS=1. It runs every test
+in five execution modes, from the tree-walker to the JIT, and it is the
+first thing to run after any change.
 
-- **`nested_fuzz.py`** — random deeply-nested programs, compared across
-  tree-walker / VM / CPython / optimizers-off.
-- **`corpus_diff.sh`** — tree-walker vs the default engine over
-  `tests/functional/` + `samples/`, plus the `--levers` / `--cold` JIT
-  matrices.
-- **`bt_oracle.py`** — *CI (nets.yml)*. With inlining ON, every CLI
-  configuration (engines, JIT levers, `-nbi`, a `.myv`, `--no-opt all`)
-  must render an uncaught error byte-identically to `-ni -tw`, over
-  `tests/bt_oracle/*.my` plus generated recursion-unroll programs (#38).
-- **`myv_fuzz.py`** — a mutated `.myv` must never crash or hang the loader.
-- **`repl_fuzz.py`** — template-generated REPL sessions (the REPL has its
-  own inferencer, retained ASTs and open-world globals).
-- **`myv_doc_check.py`** — *CI*. A reader written from `docs/myv-format.txt`
-  alone must consume every image to exactly EOF.
-- **`driver_checks.sh`** — *CI*. The CLI flags do what they say.
-- **`system_smoke.py`** — *CI*. A RELEASE binary with no `-rt` suite
-  (TESTS=0) still runs actual scripts correctly: the bench pairs vs
-  CPython through both engines, plus the self-asserting functional tests,
-  all at scale 1.
+Everything else is in this directory: standalone programs that test what
+the built-in suite cannot reach from the inside. They compare engines
+against each other, feed the interpreter random or corrupted input, check
+the command-line driver, force the compiler down unusual paths, and measure
+coverage. None of them needs anything beyond Python 3 and a POSIX shell.
 
-### Why `driver_checks.sh` exists
 
-`-rt` runs **in-process**: it calls lexer/parser/infer/resolve directly and
-never goes through `mylang.cpp`'s argument handling. So a flag wired to the
-wrong side of an `if` is invisible to every one of its ~1866 tests. That is
-not hypothetical — `-nr` ("compile and validate, don't run") called
-`run_optimizers` only when it was going to *run*, so the step 7 prover, the
-whole warning tier, FIX-1, the TDZ and the duplicate-decl check were all
-skipped, and `-nr` exited 0 in silence on a program a plain run refuses
-(#147). Reverting that wiring fails 7 of its 9 checks while `-rt` stays
-green at 1866/1866.
+Quick start
+-----------
 
-## `nested_fuzz.py` — deep-nesting differential fuzzer
+Build a debug binary with the suite compiled in (sanitizers are on by
+default in debug builds):
 
-Generates thousands of random, **deeply-nested** MyLang programs (if / while /
-counted-for / general-for, arbitrarily nested) full of side effects — a fixed
-array with reads/writes at **arbitrary expression indices** (`A[<large expr>]`,
-including nested `A[A[A[i]]]`) + `foreach`, a bounded growing array with
-`append`, a dict, seven cross-level scalar accumulators, per-level temp
-variables, `break`/`continue`, and rich value expressions (`+ - * % & | ^`,
-comparisons used as `0/1`, `min`/`max`/`len`) — together with a
-**semantically-identical Python** twin of each, then checks
+    make -j TESTS=1 OPT=0 BUILD_DIR=build-dbg
 
-```
-tree-walker result  ==  VM (-vm) result  ==  CPython result
-```
+Then, from the fastest check to the slowest:
 
-on every program.
+    build-dbg/mylang -rt
 
-**Why:** for the recursive tree-walker, "N levels of nesting work" is almost
-self-evident. For the **flat bytecode VM** it is not — nested loops/ifs compile
-into one linear instruction stream with jump backpatching and reused scratch
-registers, so deep nesting can expose codegen bugs (a wrong backpatch target, a
-temp-slot collision across levels, a `break`/`continue` targeting the wrong
-loop, array COW under mutation) that never arise in the tree-walker. CPython is
-the independent oracle that also validates the tree-walker itself.
+    tests/corpus_diff.sh build-dbg/mylang
 
-The generator stays strictly inside the documented MyLang/Python **equivalence
-subset** (see `bench/README.md`), so any mismatch is a real interpreter bug, not
-a known semantic difference: every value is kept in `[0, MOD)` (operands are
-non-negative before each `%` — MyLang truncates, Python floors), no 64-bit
-overflow, no division (`/` truncates vs floats), and dicts use only fixed
-integer keys read by index (never iterated — MyLang is unordered).
+    tests/driver_checks.sh build-dbg/mylang
 
-### Usage
+    python3 tests/nested_fuzz.py --mylang build-dbg/mylang --count 200
 
-```
-python3 tests/nested_fuzz.py                 # 1000 programs, depth <= 15
-python3 tests/nested_fuzz.py --count 5000 --max-depth 20
-python3 tests/nested_fuzz.py --check-fallbacks   # also flag any AST fallback op
-python3 tests/nested_fuzz.py --keep-failures /tmp/ff   # save diverging cases
-python3 tests/nested_fuzz.py --engines vm,py   # compare only VM vs CPython
-python3 tests/nested_fuzz.py --mylang build/mylang --seed 1 -v
-```
+To run everything CI runs, on every build lane, in one go:
 
-Every program `i` uses `--seed + i`, so a reported failure is exactly
-reproducible: rerun with `--seed <that> --count 1` (or `--keep-failures` to dump
-the offending `.my`/`.py`). Exit code is non-zero if any program diverges (or,
-with `--check-fallbacks`, compiles to an AST fallback op).
+    python3 tests/run_battery.py
 
-### Primary check = RESULT correctness; `--check-fallbacks` is a bonus audit
+While any of these is running, see how far along it is from another
+terminal:
 
-The default run asserts only that **the three engines produce the same result**
-— that is the guarantee that matters, and it holds on every generated program.
-`--check-fallbacks` is a separate, optional audit of native *coverage* (did the
-program compile to bytecode with no AST-fallback op?). Deep NESTING is fully
-native; but the maximally-varied EXPRESSIONS the fuzzer emits do surface one
-benign, orthogonal gap: a **comparison result used as an int** (`0/1`) inside a
-**flat-array index or value** (`A[(s > t) + r] = v`) isn't materialized on the
-native int path, so that statement drops to the tree-walker — with an identical
-result. It is correct, just not native, and unrelated to nesting. So expect a
-nonzero `--check-fallbacks` count with the full expression palette; the result
-agreement is what proves correctness.
+    python3 tests/testctl.py
 
-### What it has already caught
 
-- A **VM codegen gap**: a const-folded `if (true) { ... }` leaves a bare nested
-  `{ ... }` block, which the loop-body compiler didn't handle → the whole
-  enclosing loop fell back to one `EvalStmt`. Fixed in `codegen.cpp`
-  (`compile_scalar_body` now compiles a scope-free bare block in place).
-- Several **generator/translation bugs** in the harness itself (a `%`-format
-  escaping slip; an expression evaluated separately for the `.my` and `.py`
-  sides so they diverged) — exactly the class of subtle bug a hand-written test
-  would hide, and the reason three-way agreement (incl. CPython) is the check.
+The test categories
+-------------------
+
+| Category                | What it answers                                  |
+|-------------------------|--------------------------------------------------|
+| Unit suite              | Does each feature behave as specified?           |
+| Engine differentials    | Do the tree-walker, VM and JIT agree?            |
+| Fuzzers                 | Does random or broken input ever crash us?       |
+| Intrusive tests         | Is every legal compiler decision also correct?   |
+| Driver and system       | Do the CLI and a real release build work?        |
+| Machine-code checks     | Is the JIT's disassembly telling the truth?      |
+| Coverage                | Which code has no test reaching it?              |
+| Mutation testing        | Would a test notice if the code were wrong?      |
+
+An "oracle" below is whatever a test compares against. Most tests here use
+the tree-walker as the oracle: it is the simplest engine and has no JIT, so
+when the fast engines disagree with it, the fast engines are wrong.
+
+
+The tools
+---------
+
+Times are rough: "local" is a 16-core machine, "CI" a 4-core GitHub runner.
+The build column says what the binary must be built with.
+
+Engine differentials
+
+| Tool              | Checks                     | Build    | Local | CI     |
+|-------------------|----------------------------|----------|-------|--------|
+| corpus_diff.sh    | engines and JIT settings   | any      | ~10 s | 2-7 m  |
+|                   | all match the tree-walker  |          |       |        |
+| bt_oracle.py      | inlining never changes an  | any      | ~30 s | 1 m    |
+|                   | error's backtrace or caret |          |       |        |
+| norec_enum.py     | every program of a bounded | any      | ~1 m  | 2 m    |
+|                   | shape agrees in 4 engines  |          |       |        |
+| norec_sweep.py    | a forced call-stack        | any      | ~2 m  | 3 m    |
+|                   | rebuild at every call      |          |       |        |
+|                   | event changes nothing      |          |       |        |
+
+Fuzzers
+
+| Tool              | Checks                     | Build    | Local | CI     |
+|-------------------|----------------------------|----------|-------|--------|
+| nested_fuzz.py    | random nested programs     | any      | ~1 m  | 8 m    |
+|                   | agree with CPython on the  |          |       |        |
+|                   | same code                  |          |       |        |
+| myv_fuzz.py       | a damaged .myv image never | any      | ~30 s | 1.5 m  |
+|                   | crashes or hangs us        |          |       |        |
+| repl_fuzz.py      | random REPL sessions never | any      | ~15 s | 0.5 m  |
+|                   | crash it                   |          |       |        |
+
+Intrusive tests (need an INT_TESTS=1 build, see "Builds" below)
+
+| Tool              | Checks                     | Build    | Local | CI     |
+|-------------------|----------------------------|----------|-------|--------|
+| int_run.py        | tests/int programs, REPL   | INT      | ~6 m  | 8 m    |
+|                   | sessions, leak census, VM  | (+GCOV)  |       |        |
+|                   | and JIT state checkers     |          |       |        |
+| int_enum.py       | forcing any legal compiler | INT      | 1-6 m | 16 m   |
+|                   | decision changes no output |          |       |        |
+| int_select.py     | which tests cover what;    | INT GCOV | ~6 m  | manual |
+|                   | shrinks a test to the      |          |       |        |
+|                   | lines that matter          |          |       |        |
+
+Driver, system, documentation
+
+| Tool              | Checks                     | Build    | Local | CI     |
+|-------------------|----------------------------|----------|-------|--------|
+| driver_checks.sh  | the CLI flags do what they | any      | ~20 s | 1 m    |
+|                   | say (-rt cannot see them)  |          |       |        |
+| system_smoke.py   | a release build with no    | TESTS=0  | ~1 m  | 2 m    |
+|                   | -rt suite runs scripts     |          |       |        |
+| myv_doc_check.py  | the .myv spec in docs/     | any      | ~1 s  | 1 s    |
+|                   | matches every byte         |          |       |        |
+
+Machine code, coverage, mutation
+
+| Tool              | Checks                     | Build    | Local | CI     |
+|-------------------|----------------------------|----------|-------|--------|
+| disasmcheck.py    | -vdj decodes each JIT      | TESTS=1  | ~10 m | 3x15 m |
+| (in scripts/)     | instruction like objdump   |          |       |        |
+| vdjcmp.sh         | two binaries emit          | any      | ~30 s | 1 m    |
+| (in scripts/)     | identical machine code     |          |       |        |
+| norec_coverage.py | no-record call tier keeps  | GCOV     | ~5 m  | 10 m   |
+|                   | its coverage floor         |          |       |        |
+| mutate.py         | planted bugs are caught by | builds   | hours | manual |
+|                   | some test                  | its own  |       |        |
+
+Helpers (not tests themselves)
+
+| Tool           | Does                                                    |
+|----------------|---------------------------------------------------------|
+| run_battery.py | builds every lane and runs the whole set in parallel    |
+| testctl.py     | shows the progress of every running test tool           |
+| testrun.py     | the progress and resume library the tools share         |
+| testmon.py     | progress for a shell tool, by counting its result files |
+| jobs.sh        | how many cores to use, and at what priority             |
+| testjobs.py    | the Python face of jobs.sh                              |
+
+
+How to run them
+---------------
+
+All tools take the binary to test as an argument, so you can point any of
+them at any build. They run at idle priority, so they never slow down the
+machine for you.
+
+Unit suite
+
+    build-dbg/mylang -rt
+
+    build-dbg/mylang -rt -s            (dump the tree of a failing test)
+
+Engine differentials
+
+    tests/corpus_diff.sh build-dbg/mylang
+
+    tests/corpus_diff.sh build-dbg/mylang --levers --cold --xrot
+
+    python3 tests/bt_oracle.py build-dbg/mylang
+
+    python3 tests/norec_enum.py build-dbg/mylang --depth 3
+
+    python3 tests/norec_sweep.py build-dbg/mylang --max-events 25
+
+corpus_diff.sh modes can be combined in one run:
+
+| Mode        | What it adds                                             |
+|-------------|----------------------------------------------------------|
+| (none)      | tree-walker, VM and JIT, plus the -nc and -nti forms     |
+| --levers    | a run per JIT optimization, each turned off in turn      |
+| --cold      | a run per JIT fast path, each forced onto its fallback   |
+| --xrot      | a run per rotation of the register allocator's order     |
+| --nolowmem  | a run with the other type-tag encoding                   |
+| --spcheck   | a run that checks stack alignment at every native call   |
+
+Fuzzers
+
+    python3 tests/nested_fuzz.py --mylang build-dbg/mylang --count 250
+
+    python3 tests/myv_fuzz.py build-dbg/mylang -n 400
+
+    python3 tests/repl_fuzz.py build-dbg/mylang -n 400
+
+Each fuzzer prints its seed first. To reproduce a failure, run it again
+with that seed:
+
+    python3 tests/nested_fuzz.py --mylang build-dbg/mylang --seed 1234
+
+A .myv finding cannot be regenerated from a seed (an image contains its
+source path), so myv_fuzz.py saves every crashing image instead; run the
+saved file directly.
+
+Intrusive tests
+
+    make -j OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1 BUILD_DIR=build-int
+
+    python3 tests/int_run.py build-int/mylang
+
+    python3 tests/int_enum.py build-int/mylang --tier 1 tests/functional/*.my
+
+    python3 tests/int_enum.py build-int/mylang --tier 2 tests/functional/*.my
+
+With coverage, on a GCOV build:
+
+    make -j OPT=0 TESTS=1 INT_TESTS=1 GCOV=1 BUILD_DIR=build-gcov
+
+    python3 tests/int_run.py build-gcov/mylang --gcov --require-floor
+
+    python3 tests/int_select.py build-gcov/mylang --with-rt
+
+Driver, system, documentation
+
+    tests/driver_checks.sh build-dbg/mylang
+
+    python3 tests/system_smoke.py build-rel/mylang
+
+    build-dbg/mylang -c samples/gcd -o /tmp/gcd.myv
+    python3 tests/myv_doc_check.py /tmp/gcd.myv
+
+Machine code
+
+    python3 scripts/disasmcheck.py build-dbg/mylang --matrix
+
+    scripts/vdjcmp.sh build-old/mylang build-new/mylang
+
+Everything at once
+
+    python3 tests/run_battery.py
+
+    python3 tests/run_battery.py --no-build
+
+    python3 tests/run_battery.py --dry-run
+
+The battery builds its own lanes under build-claude/ and writes one log
+per step; the summary at the end names the logs of anything that failed.
+
+
+Builds
+------
+
+| Build      | Command                                                     |
+|------------|-------------------------------------------------------------|
+| debug      | make -j TESTS=1 OPT=0                                       |
+| release    | make -j OPT=1                                               |
+| INT        | make -j OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1           |
+| GCOV       | make -j OPT=0 TESTS=1 INT_TESTS=1 GCOV=1                    |
+| no suite   | make -j OPT=1 TESTS=0                  (for system_smoke)   |
+
+Add BUILD_DIR=some-dir to keep builds apart. A debug build has the address
+and undefined-behaviour sanitizers on, which is where most memory bugs
+show up first. "mylang -v" prints how a binary was built.
+
+Never benchmark an INT or debug build: they are slow on purpose.
+
+
+Watching progress
+-----------------
+
+Every tool that can run for more than a minute reports its progress. From
+any terminal:
+
+    python3 tests/testctl.py
+
+prints one line per running tool:
+
+    TOOL             PID      %  DONE/TOTAL  PHASE   ELAPSED     ETA  FAIL
+    int_run       790151  42.2%       19/45  units     2m10s   2m58s     0
+    corpus_diff   764141  74.7%     361/483  runs      0m03s   0m01s     0
+
+To keep it on screen, refreshed every two seconds:
+
+    python3 tests/testctl.py watch
+
+The same numbers appear in each tool's own output as a heartbeat line
+every minute, which is also what you see in a CI log.
+
+Some tools (int_enum, int_select, mutate) can also be paused, stopped and
+resumed:
+
+    python3 tests/testctl.py status int_enum
+
+    python3 tests/testctl.py stop int_enum
+
+    python3 tests/testctl.py jobs 4 int_enum
+
+A stopped run prints a resume token; pass it back with --resume to carry
+on where it stopped.
+
+
+What CI runs
+------------
+
+On every push:
+
+| Workflow  | Runs                                                         |
+|-----------|--------------------------------------------------------------|
+| Linux     | -rt on seven builds (debug and release, gcc and clang,       |
+|           | adversarial allocator, non-LTO, debug info), driver_checks,  |
+|           | myv_doc_check, system_smoke                                  |
+| macOS     | -rt                                                          |
+| Windows   | -rt                                                          |
+| Coverage  | -rt with coverage, uploaded                                  |
+| Nets      | corpus_diff (plain, --levers, --nolowmem, --spcheck),        |
+|           | bt_oracle, norec_enum, norec_sweep, vdjcmp, disasmcheck,     |
+|           | the three fuzzers, int_run, int_enum tiers 1 and 2, and the  |
+|           | coverage gates                                               |
+
+Nets takes about 18 minutes; the others finish in under 10. The fuzzers
+use a new seed on every run, so each push tries new programs.
+
+On demand only (Actions tab, "Run workflow"):
+
+| Workflow  | Runs                                              | Takes     |
+|-----------|---------------------------------------------------|-----------|
+| INT deep  | int_enum tier 3, int_select over everything       | ~1 hour   |
+| Mutation  | mutate.py over 200 planted bugs, in 8 jobs        | 1-3 hours |
+
+Run these after a series of complex changes rather than on every push.
+
+
+Adding a test
+-------------
+
+| You want to test                      | Put it in                         |
+|---------------------------------------|-----------------------------------|
+| a language feature or an error        | src/tests.cpp (the -rt suite)     |
+| a JIT or VM shape, on every engine    | tests/functional/NAME.my          |
+| a backtrace or caret                  | tests/bt_oracle/NAME.my           |
+| a compiler decision, under INT hooks  | tests/int/NN_NAME.my              |
+| a REPL session                        | tests/int/repl/NAME.session       |
+| a command-line flag                   | tests/driver_checks.sh            |
+
+A functional test is a small program that checks its own results and
+builds the tricky shape on purpose. corpus_diff then runs it on every
+engine and every JIT setting automatically.
+
+A REPL session is the text you would type, one input per line, ending with
+:quit. Its expected output lives next to it in NAME.expected; write it with
+
+    python3 tests/int_run.py build-int/mylang --update-repl
+
+and read it before committing: that file is the assertion.
+
+Before trusting a new test, break the code it tests on purpose and watch
+the test fail. A test that passes either way checks nothing.
+
+
+About the fuzzers
+-----------------
+
+nested_fuzz.py writes thousands of random, deeply nested programs (loops
+inside conditions inside loops, with arrays, dicts, break and continue)
+together with the same program in Python, and requires every MyLang engine
+and CPython to print the same result. CPython is an independent oracle: it
+also catches a bug where all MyLang engines agree on the same wrong
+answer. The programs stay inside the subset where MyLang and Python are
+meant to agree (no negative modulo, no overflow, no dict iteration order),
+so any difference is a real bug.
+
+myv_fuzz.py takes two compiled images and damages them in five ways
+(flipped bits, random bytes, truncation, random bursts, 0xFF words). A
+damaged image may be refused or may even run, but it must never crash or
+hang the interpreter.
+
+repl_fuzz.py feeds the interactive REPL random sessions built from
+fragments: declarations, redefinitions, unfinished input, meta-commands
+with nonsense arguments. The REPL must survive every one.
+
+Fuzzers find what nobody thought to write a test for. When one finds
+something, the program that found it becomes a fixed test, so the bug
+stays caught.

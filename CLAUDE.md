@@ -2436,6 +2436,13 @@ output AND rendered error) and `tests/corpus_diff.sh`'s `-nc` pass.
                                  # use OPT=1 ASSERTS=0 for meaningful numbers)
 ```
 
+**The standalone test tools (`tests/`) have their own
+`tests/CLAUDE.md`** - which tool runs where in CI, the progress API every
+long tool must serve, the reach-vs-check traps of shrinking and coverage,
+the tests/int unit formats, mutate.py's rules. READ IT before writing or
+changing a test tool. `tests/README.md` is the human overview: keep it
+plain prose with space-aligned tables, readable on a console.
+
 **`--weights` — the inlining cost-model calibration** (`run_weight_bench`,
 eval.cpp). Measures the per-node-type eval cost of the tree-walker by building
 the AST nodes **by hand in C++** (never parsed, so no fold/inline/specialize can
