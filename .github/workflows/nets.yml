@@ -334,6 +334,36 @@ jobs:
                 --failures-out int-enum-failures.txt \
                 tests/functional/*.my samples/fib samples/gcd samples/loop \
                 samples/primes samples/primes2 samples/strloop
+    # disasmcheck (-vdj vs objdump, every operand) in configurations no
+    # matrix axis reaches: forced allocator picks that put a float stage
+    # in xmm8-15 and a GP scratch/pin in r8/r15 - the REX.R/X/B forms a
+    # decoder can drop and still print the right mnemonic. The keys name
+    # 59_float_abi_calls' two runs; the guard first proves each still
+    # lands in r8-r15 / xmm8-15, so a key the program drifted away from
+    # fails here instead of checking the default registers again.
+    - name: disasmcheck, forced picks into the REX registers
+      run: |
+        P=tests/functional/59_float_abi_calls.my
+        C1='main@0/fp#0=11,main@21/fp#0=11'
+        C2='main@0/fp#1=9,main@21/fp#1=9'
+        C3='main@0/gp#5=4,main@21/gp#2=9'
+        for c in "$C1" "$C2" "$C3"; do
+          rm -f pick.txt
+          MYLANG_INT_CHOOSE="$c" MYLANG_INT_DUMP=pick.txt \
+            ./build-enum/mylang $P > /dev/null
+          n=$(grep -E '^choose_reg .* reg=(8|9|1[0-5])$' pick.txt \
+              | grep -o 'key="[^"]*"' | sort -u | wc -l)
+          if [ "$n" -ne 2 ]; then
+            echo "forced picks $c no longer land in r8-r15/xmm8-15:"
+            grep '^choose_' pick.txt
+            exit 1
+          fi
+        done
+        python3 scripts/disasmcheck.py ./build-enum/mylang \
+                --only tests/functional \
+                --env "MYLANG_INT_CHOOSE=$C1" \
+                --env "MYLANG_INT_CHOOSE=$C2" \
+                --env "MYLANG_INT_CHOOSE=$C3"
     - name: Upload the failures
       if: failure()
       uses: actions/upload-artifact@v4
