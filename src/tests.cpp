@@ -5,8 +5,10 @@
 #include <iostream>
 #include <iomanip>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
+#include <regex>
 
 /* mkdir(), for the .myv source-reference relocation test; dup2()/close(),
  * for the audit test's stderr capture (POSIX only - it self-skips on
@@ -51521,10 +51523,71 @@ static const std::vector<extra_check> extra_checks =
       jit_counter_coverage },
 };
 
-void run_tests(bool dump_syntax_tree)
+void run_tests(bool dump_syntax_tree, int argc, char **argv)
 {
     size_t pass_count = 0;
     int err_line;
+
+    /*
+     * -rt's own options, all AFTER it: --list (print every case's name),
+     * --only REGEX (run the cases the regex finds) and -s. Parsed HERE,
+     * in the harness, so they add no branch to the product code the
+     * coverage gate counts. -rt used to run the moment it was seen, so
+     * `-rt -s` silently ignored the -s its own help line documents.
+     */
+    const char *only = nullptr;
+    bool list = false;
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--list")) {
+            list = true;
+        } else if (!strcmp(argv[i], "--only") && i + 1 < argc) {
+            only = argv[++i];
+        } else if (!strcmp(argv[i], "-s")) {
+            dump_syntax_tree = true;
+        } else {
+            cout << "-rt: unknown option '" << argv[i]
+                 << "' (want --list, --only REGEX or -s)" << endl;
+            exit(1);
+        }
+    }
+
+    /*
+     * CASE SELECTION (tests/run reproduces ONE failing case this way).
+     * A case's name is what its `[ RUN  ]` line prints - a `tests` entry's
+     * name, an extra check's, `repl: ` + a REPL test's - and `--only`
+     * keeps the cases whose name the regex finds (ECMAScript, a search,
+     * not a full match). The differential modes rerun the selected
+     * `tests` entries only. A regex that selects nothing is a failure,
+     * so a misspelled reproduction cannot pass by running nothing.
+     */
+    std::regex only_rx;
+    if (only) {
+        try {
+            only_rx = std::regex(only, std::regex::ECMAScript);
+        } catch (const std::regex_error &e) {
+            cout << "-rt --only: bad regex '" << only << "': " << e.what()
+                 << endl;
+            exit(1);
+        }
+    }
+    auto selected = [&](const std::string &name) {
+        return !only || std::regex_search(name, only_rx);
+    };
+
+    if (list) {
+        for (const auto &t : tests)
+            if (selected(t.name))
+                cout << t.name << "\n";
+        for (const auto &ec : extra_checks)
+            if (selected(ec.name))
+                cout << ec.name << "\n";
+        for (const auto &rt : repl_tests)
+            if (selected(std::string("repl: ") + rt.name))
+                cout << "repl: " << rt.name << "\n";
+        exit(0);
+    }
+
+    size_t n_tests = 0, n_total = 0;
 
     /* The test harness is a DEV environment (like the REPL): dev-only builtins
      * (show()) are allowed here so the optimizer-introspection tests can use
@@ -51536,6 +51599,9 @@ void run_tests(bool dump_syntax_tree)
 
     for (const auto &test : tests) {
 
+        if (!selected(test.name))
+            continue;
+        n_tests++;
         cout << "[ RUN  ] " << test.name << endl;
 
         err_line = 0;
@@ -51555,6 +51621,9 @@ void run_tests(bool dump_syntax_tree)
 
     for (const auto &ec : extra_checks) {
 
+        if (!selected(ec.name))
+            continue;
+        n_total++;
         cout << "[ RUN  ] " << ec.name << endl;
 
         if (ec.fn()) {
@@ -51572,6 +51641,9 @@ void run_tests(bool dump_syntax_tree)
 
     for (const auto &rt : repl_tests) {
 
+        if (!selected(std::string("repl: ") + rt.name))
+            continue;
+        n_total++;
         cout << "[ RUN  ] repl: " << rt.name << endl;
 
         if (run_one_repl_test(rt)) {
@@ -51587,13 +51659,21 @@ void run_tests(bool dump_syntax_tree)
         cout << endl << endl;
     }
 
-    const size_t total =
-        tests.size() + extra_checks.size() + repl_tests.size();
+    const size_t total = n_tests + n_total;
+
+    if (only && total == 0) {
+        cout << "-rt --only '" << only << "': no test case matches" << endl;
+        exit(1);
+    }
 
     cout << "SUMMARY" << endl;
     cout << "===========================================" << endl;
     cout << "Tests passed: " << pass_count << "/" << total << " ";
     cout << (pass_count == total ? "[ PASS ]" : "[ FAIL ]") << endl;
+    if (only)
+        cout << "  (--only '" << only << "': " << total << " of "
+             << tests.size() + extra_checks.size() + repl_tests.size()
+             << " cases)" << endl;
 
     /*
      * THE 3-WAY DIFFERENTIAL (maintainer-set, 2026-08-02).
@@ -51661,6 +51741,8 @@ void run_tests(bool dump_syntax_tree)
         g_bc_inline_enabled = modes[m].splice;
         for (const auto &test : tests) {
 
+            if (!selected(test.name))
+                continue;
             cout << "[ RUN  ] " << modes[m].tag << ": " << test.name << endl;
 
             err_line = 0;
@@ -51685,11 +51767,11 @@ void run_tests(bool dump_syntax_tree)
 
     bool all_modes_ok = true;
     for (size_t m = 0; m < modes.size(); m++) {
-        const bool ok = mode_pass[m] == tests.size();
+        const bool ok = mode_pass[m] == n_tests;
         all_modes_ok = all_modes_ok && ok;
-        cout << "Differential (same " << tests.size() << " tests) - "
+        cout << "Differential (same " << n_tests << " tests) - "
              << modes[m].label << ": " << mode_pass[m] << "/"
-             << tests.size() << " " << (ok ? "[ PASS ]" : "[ FAIL ]")
+             << n_tests << " " << (ok ? "[ PASS ]" : "[ FAIL ]")
              << endl;
     }
     if (!ML_JIT_SUPPORTED)
@@ -51704,7 +51786,7 @@ void run_tests(bool dump_syntax_tree)
 
 #else
 
-void run_tests(bool)
+void run_tests(bool, int, char **)
 {
     cout << "Tests NOT compiled in. Build with TESTS=1" << endl;
     exit(1);

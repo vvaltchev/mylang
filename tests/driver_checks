@@ -759,5 +759,26 @@ for s in shopping phonebook; do
 done
 [ $eof_ok = 1 ] && pass "readln: none at end of input, every engine + image"
 
+# ---- -rt's own options (2026-10-05): --list, --only REGEX, -s -------- #
+# tests/run reproduces one failing -rt case with --only, so the selection
+# must run exactly what --list says it selects, refuse a regex matching
+# nothing (a misspelt reproduction must not pass by running nothing) and
+# refuse an option it does not know. Only a TESTS build has the suite.
+if "$BIN" -v 2>/dev/null | grep -q '^  tests  *1'; then
+    rt_ok=1
+    n=$("$BIN" -rt --only '^elem2: ' --list | wc -l | tr -d ' ')
+    out=$("$BIN" -rt --only '^elem2: ' 2>&1)
+    [ "$n" -gt 0 ] 2>/dev/null || { rt_ok=0; fail "-rt --list: no elem2 case"; }
+    printf '%s\n' "$out" | grep -q "^Tests passed: $n/$n " \
+        || { rt_ok=0; fail "-rt --only: did not run the $n listed cases"; }
+    if "$BIN" -rt --only 'no such case at all' >/dev/null 2>&1; then
+        rt_ok=0; fail "-rt --only: a regex matching nothing passed"
+    fi
+    if "$BIN" -rt --no-such-option >/dev/null 2>&1; then
+        rt_ok=0; fail "-rt: an unknown option was accepted"
+    fi
+    [ $rt_ok = 1 ] && pass "-rt: --list and --only select the same cases"
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc

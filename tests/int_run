@@ -93,28 +93,18 @@ def main():
                     help="--gcov: write the ownership table and the "
                          "uncovered list here")
     ap.add_argument("--timeout", type=float, default=3600.0)
+    ap.add_argument("--list", action="store_true",
+                    help="print every unit's name and stop")
+    ap.add_argument("--only", default=None, metavar="REGEX",
+                    help="run only the units whose name the regex finds "
+                         "(the whole-suite checks - ownership, the floor, "
+                         "the site census - are then skipped)")
     ap.add_argument("--update-repl", action="store_true",
                     help="rewrite tests/int/repl/*.expected from this binary")
     args = ap.parse_args()
     binary = os.path.abspath(args.binary)
     build_dir = os.path.dirname(binary)
 
-    cfg = build_config(binary)
-    if cfg.get("int_tests") != "1":
-        print("int_run: %s is not an INT_TESTS build (-v says int_tests=%s);"
-              " build it with `make INT_TESTS=1`" % (binary,
-                                                     cfg.get("int_tests")),
-              file=sys.stderr)
-        return 2
-    if args.gcov and not glob.glob(os.path.join(build_dir, "**", "*.gcno"),
-                                   recursive=True):
-        print("int_run: --gcov needs a GCOV=1 build (no .gcno files next "
-              "to %s)" % binary, file=sys.stderr)
-        return 2
-
-    tool = gcov_tool(cfg) if args.gcov else None
-    if tool:
-        print("  gcov: %s" % tool)
     units = []
     if not args.no_rt:
         units.append(("-rt", [[(["-rt"], {}, None)]]))
@@ -138,6 +128,43 @@ def main():
             text = f.read()
         units.append((os.path.relpath(sess, ROOT),
                       [[(["--repl"], {}, (text, sess[:-8] + ".expected"))]]))
+
+    # the two corpus-wide passes are cases too, so --only can pick them
+    CENSUS, INVIS = "corpus: object census", "corpus: probe invisibility"
+    names = [n for n, _ in units] + [CENSUS, INVIS]
+    only = re.compile(args.only) if args.only else None
+    if args.list:
+        for n in names:
+            if not only or only.search(n):
+                print(n)
+        return 0
+    cfg = build_config(binary)
+    if cfg.get("int_tests") != "1":
+        print("int_run: %s is not an INT_TESTS build (-v says int_tests=%s);"
+              " build it with `make INT_TESTS=1`" % (binary,
+                                                     cfg.get("int_tests")),
+              file=sys.stderr)
+        return 2
+    if args.gcov and not glob.glob(os.path.join(build_dir, "**", "*.gcno"),
+                                   recursive=True):
+        print("int_run: --gcov needs a GCOV=1 build (no .gcno files next "
+              "to %s)" % binary, file=sys.stderr)
+        return 2
+
+    tool = gcov_tool(cfg) if args.gcov else None
+    if tool:
+        print("  gcov: %s" % tool)
+
+    if only:
+        units = [(n, c) for n, c in units if only.search(n)]
+        run_census = bool(only.search(CENSUS))
+        run_invis = bool(only.search(INVIS))
+        if not units and not run_census and not run_invis:
+            print("int_run: --only '%s' matches no unit" % args.only,
+                  file=sys.stderr)
+            return 2
+    else:
+        run_census = run_invis = True
 
     failures = []
     if not progs:
@@ -267,7 +294,7 @@ def main():
         leaks = 0
         probes = 0
         mon.phase("census", total=len(corpus))
-        for prog in corpus:
+        for prog in (corpus if run_census else []):
             mon.set_current(os.path.relpath(prog, ROOT))
             mon.advance()
             outs = {}
@@ -293,10 +320,14 @@ def main():
                         failures.append("census: %s %s: %s" % (
                             " ".join(eng) or "default",
                             os.path.relpath(prog, ROOT), l))
-        print("  object census + VM state + JIT probes: %d corpus "
-              "program(s) x 3 engines, %d finding(s), %d probe(s) run"
-              % (len(corpus), leaks, probes))
-        if probes == 0:
+        if run_census:
+            print("  object census + VM state + JIT probes: %d corpus "
+                  "program(s) x 3 engines, %d finding(s), %d probe(s) run"
+                  % (len(corpus), leaks, probes))
+        else:
+            print("  object census + VM state + JIT probes: skipped "
+                  "(--only)")
+        if probes == 0 and run_census:
             failures.append("the JIT probe never ran (MYLANG_INT_PROBE) - "
                             "the JIT half of the state checker is vacuous")
         # (6) THE PROBE IS INVISIBLE: the emitted code with probes, the
@@ -304,7 +335,7 @@ def main():
         # without them - instruction for instruction
         invis = 0
         mon.phase("probe-invisible", total=len(corpus))
-        for prog in corpus:
+        for prog in (corpus if run_invis else []):
             mon.set_current(os.path.relpath(prog, ROOT))
             mon.advance()
             plain = run([binary, "-vdj", prog], env, args.timeout)[1]
@@ -325,8 +356,11 @@ def main():
                 failures.append("probe-strip: %s - the probes changed "
                                 "the emitted code"
                                 % os.path.relpath(prog, ROOT))
-        print("  probe invisibility: %d corpus program(s), %d differ"
-              % (len(corpus), invis))
+        if run_invis:
+            print("  probe invisibility: %d corpus program(s), %d differ"
+                  % (len(corpus), invis))
+        else:
+            print("  probe invisibility: skipped (--only)")
 
         totals = {}
         if os.path.exists(census):
@@ -335,17 +369,26 @@ def main():
                     site, hits, queries = line.split()
                     h, q = totals.get(site, (0, 0))
                     totals[site] = (h + int(hits), q + int(queries))
-        if not totals:
+        if not totals and not only:
             failures.append("no census was written (MYLANG_INT_OUT)")
-        unchecked = sorted(s for s, (h, q) in totals.items() if q == 0)
-        print("  census: %d site(s), %d not checked by any test"
-              % (len(totals), len(unchecked)))
+        # a subset of the units cannot check every site: the site census
+        # is a whole-suite check
+        unchecked = [] if only else \
+            sorted(s for s, (h, q) in totals.items() if q == 0)
+        if only:
+            print("  site census: skipped (--only - a whole-suite check)")
+        else:
+            print("  census: %d site(s), %d not checked by any test"
+                  % (len(totals), len(unchecked)))
         for s in unchecked:
             print("    UNCHECKED  %s  (%d event(s) recorded)"
                   % (s, totals[s][0]))
             failures.append("site %s checked by no test" % s)
 
-    if args.gcov:
+    if args.gcov and only:
+        print("  coverage: --only ran a subset - ownership and the floor "
+              "are whole-suite checks, skipped")
+    elif args.gcov:
         all_cov = set().union(*covered_by.values()) if covered_by else set()
         uncovered = sorted(e for e in universe if e not in all_cov)
         print("  coverage: %d element(s), %d covered, %d uncovered"

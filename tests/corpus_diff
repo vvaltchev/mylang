@@ -26,6 +26,11 @@
 #                                              call site (TESTS builds)
 #                                              REFUSED (the imm32 tags fall
 #                                              back to registers)
+#   tests/corpus_diff [binary] --list     - print the programs and stop
+#   tests/corpus_diff [binary] --only RE  - only the programs whose path
+#                                              the extended regex RE matches
+#                                              (how tests/run reproduces
+#                                              one failing program)
 #   tests/corpus_diff [binary] MODE...    - several modes in ONE run:
 #                                              the plain part and the
 #                                              tree-walker references run
@@ -108,21 +113,64 @@ fi
 #
 # Both halves are needed: resolving the path fixes it, and the
 # executable test is what stops it ever being silent again.
-_bin_arg=${1:-build-claude/dbg/mylang}
+# the binary is the first argument that is not an option; the rest are
+# modes, plus --list / --only RE (case selection, for tests/run)
+_bin_arg=build-claude/dbg/mylang
+MODES=
+LIST=0
+ONLY=
+_first=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --list) LIST=1 ;;
+    --only)
+      [ $# -ge 2 ] || { echo "corpus_diff: --only needs a regex" >&2; exit 2; }
+      ONLY=$2; shift ;;
+    -*) MODES="${MODES:+$MODES }$1" ;;
+    *)
+      if [ $_first = 1 ]; then _bin_arg=$1
+      else echo "corpus_diff: unexpected argument '$1'" >&2; exit 2
+      fi ;;
+  esac
+  _first=0
+  shift
+done
 case "$_bin_arg" in
   /*) BIN=$_bin_arg ;;
   *)  BIN=$PWD/$_bin_arg ;;
 esac
 SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 cd "$(dirname "$0")/.."
+# the programs, and --list / --only (needs no binary: tests/run lists
+# cases before anything is built)
+all_progs() {
+  ls tests/functional/*.my 2>/dev/null
+  for f in samples/*; do
+    [ -f "$f" ] || continue
+    case "$f" in *rand_sort*|*shopping*|*phonebook*) continue ;; esac
+    echo "$f"
+  done
+}
+progs() {
+  if [ -n "$ONLY" ]; then all_progs | grep -E -- "$ONLY"
+  else all_progs
+  fi
+}
+if [ $LIST = 1 ]; then
+  progs
+  exit 0
+fi
+if [ -n "$ONLY" ] && [ -z "$(progs)" ]; then
+  echo "corpus_diff: --only '$ONLY' matches no program" >&2
+  exit 2
+fi
 if [ ! -x "$BIN" ]; then
     echo "corpus_diff: '$_bin_arg' is not an executable ($BIN)." >&2
     echo "  This script cd's to the repo root, so a relative path is" >&2
     echo "  resolved against your CURRENT directory, not the root." >&2
     exit 2
 fi
-# the modes, in report order (none = the plain differential only)
-MODES="${*:2}"
+# MODES (above): in report order (none = the plain differential only)
 # ⛔ KEEP IN SYNC WITH jit_lever_names (jit.cpp) - this list went stale
 # once (#101 found argfuse/xcache/scache/rshare missing, so those four
 # levers' per-lever-off configs were tested by nothing but `all`).
@@ -190,14 +238,6 @@ else
   XROTS="0 1 2 3"
 fi
 
-progs() {
-  ls tests/functional/*.my 2>/dev/null
-  for f in samples/*; do
-    [ -f "$f" ] || continue
-    case "$f" in *rand_sort*|*shopping*|*phonebook*) continue ;; esac
-    echo "$f"
-  done
-}
 
 # ---- every unit of work, run up front ------------------------------ #
 # A key is a flag set or an env assignment reduced to a file-name-safe

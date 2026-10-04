@@ -14,6 +14,9 @@ the whole backtrace) and exit code.
 Usage: tests/bt_oracle BINARY [PROGRAM.my ...]
        (default corpus: tests/backtrace/*.my plus the generated
         recursion-unroll programs, one per depth 1..8)
+       tests/bt_oracle BINARY --list         the default corpus's names
+       tests/bt_oracle BINARY --only REGEX   the ones whose name matches
+                                             (how tests/run reproduces one)
 
 NOT VACUOUS: the whole point is inlined code, so the run fails unless
 the inliner actually changed the program somewhere - the corpus must
@@ -22,6 +25,7 @@ contain programs whose `-s` optimized tree holds an inlined splice.
 
 import difflib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -116,8 +120,19 @@ def main():
         print(__doc__)
         return 2
     binary = os.path.abspath(sys.argv[1])
+    rest = sys.argv[2:]
+    listing = "--list" in rest
+    only = None
+    if "--only" in rest:
+        i = rest.index("--only")
+        if i + 1 >= len(rest):
+            print("bt_oracle: --only needs a regex", file=sys.stderr)
+            return 2
+        only = re.compile(rest[i + 1])
+        del rest[i:i + 2]
+    rest = [a for a in rest if a != "--list"]
     tmp = tempfile.mkdtemp(prefix="bt_oracle.")
-    progs = sys.argv[2:]
+    progs = rest
     if not progs:
         d = os.path.join(HERE, "backtrace")
         progs = sorted(os.path.join(d, f) for f in os.listdir(d)
@@ -127,6 +142,20 @@ def main():
             with open(p, "w") as f:
                 f.write(REC_TEMPLATE % depth)
             progs.append(p)
+
+    # a case's name is its file name without .my
+    def case(p):
+        return os.path.basename(p)[:-3] if p.endswith(".my") \
+            else os.path.basename(p)
+    if only:
+        progs = [p for p in progs if only.search(case(p))]
+    if listing:
+        for p in progs:
+            print(case(p))
+        return 0
+    if only and not progs:
+        print("bt_oracle: --only matches no program", file=sys.stderr)
+        return 2
 
     fails = 0
     inlined = 0
@@ -172,7 +201,9 @@ def main():
     print("bt_oracle: %d/%d programs render identically to `-ni -tw` "
           "in %d configurations; %d inline" % (
               len(progs) - fails, len(progs), len(CONFIGS) + 1, inlined))
-    if inlined * 2 < len(progs):
+    # a CORPUS property: one program picked by --only may legitimately
+    # inline nothing
+    if inlined * 2 < len(progs) and not only:
         print("bt_oracle: VACUOUS - fewer than half the programs are "
               "changed by the inliner")
         return 1
