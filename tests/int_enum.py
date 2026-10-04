@@ -56,7 +56,9 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 from testrun import Run, fingerprint, file_digest  # noqa: E402
 
-CHOICE = re.compile(r'^reg_choice key="([^"]+)" n=(\d+) dflt=(\d+) pick=(\d+)')
+# every ENUMERATED decision site records `<site> key=... n= dflt= pick=`
+CHOICE = re.compile(r'^(?:reg_choice|pin_budget) key="([^"]+)" n=(\d+) '
+                    r'dflt=(\d+) pick=(\d+)')
 APPLIED = re.compile(r'^choose_applied key="([^"]+)" pick=(\d+)')
 
 

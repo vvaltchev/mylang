@@ -17187,3 +17187,40 @@ writing rdx (`gp-writes [cdq]: classifier says 0, the ISA says 4`), the
 unsaved-callee-saved arm silenced and the float-argument loop emptied
 (both named by `regtrack_failure_arms`) - `-rt` 2102/2104. **Cost:**
 debug `-rt` 75 s -> 76 s.
+
+## A REL8 SPAN MAY NOT CONTAIN A REGISTER-CACHE FLUSH EITHER (2026-10-02)
+
+**Found by the #107 P3 enumerator's second decision site, the PIN
+BUDGET** (`pin_budget`, one instance per run, `n` = max + 1, default the
+maximum). Forcing `27_struct_whole_p`'s main run to a budget of 0 homes
+its hot slots in native-stack spill slots, and `Throw`'s dispatch jump
+(`jz` over `flush_cache(); mov rax, -2; frag_ret`) spanned **144 bytes**
+in a rel8: `patch8`'s range `ML_CHECK` aborted. In an `ASSERTS=0` build
+the displacement truncates and the jump lands inside an instruction.
+
+`j8`/`patch8` already refused a span containing a HELPER CALL (a call's
+prologue grows with the live pins) - by COUNTING prologues, so the check
+fires on the SHAPE whatever the budget. A register-cache flush has the
+same property (one store pair per live pin or spill home) and was not
+counted. It is now: `flush_cache` bumps `n_flushes`, `j8` records it,
+`patch8` requires it unchanged and names the op when it is not. The
+survey with the rule report-only, over `-rt`, tests/functional and
+samples, found exactly three ops - `Throw`, `Rethrow` and `EndFinally`,
+each with the same two jumps (`j_not2` over the exception stamp and
+`exit_pc`, `j_disp` over the flush and the raw ret). All six are `j32`
+now; `j_not2`'s span holds no flush (`exit_pc` is a fixed 10 bytes, its
+flush lives in the shared epilogue) but the stamp's length has no stated
+bound, and the path is cold.
+
+**Watched failing:** `Throw`'s `j_disp` put back to rel8 aborts by name
+in an ordinary `-rt` run and on `07_exceptions.my` - default
+configuration, no forced pick. **Net:** the rule itself, plus the
+enumerator over tests/functional (74,465 deviations, 0 failures). Emitted
+code changes only in those three ops' cold arms (+3 bytes per jump).
+
+**The enumerator's keys are per RUN now** (`<fn>@<run begin pc>/...`).
+The register-pick ordinal lives in the per-run allocator, so a function
+with several runs had ONE key per instance number across all of them: a
+forced key deviated every run at once, and tier 1 was not a single
+deviation (`09_enum_float_stage`'s `main` has two runs, `@0` and `@29`).
+

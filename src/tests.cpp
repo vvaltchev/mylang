@@ -39903,6 +39903,13 @@ static bool regtrack_failure_arms()
           "byte 0x06 at emission offset 0" },
         { "scan/declaration-groups", "no wrote() declared", ": r0 ",
           "`mov` at emission offset 10 (declared group 0x4)" },
+        { "rel8/short-span", nullptr, nullptr, nullptr },
+        { "rel8/helper-call", "contains a HELPER CALL", ": r0 ", nullptr },
+        { "rel8/flush", "contains a REGISTER-CACHE FLUSH", ": r0 ",
+          nullptr },
+        { "rel8/out-of-range-back", "OUT OF RANGE", ": r4294967164 ",
+          nullptr },
+        { "rel8/out-of-range", "OUT OF RANGE", ": r130 ", nullptr },
     };
     std::vector<JitTrkCase> got;
     if (!jit_test_regtrack(got))
