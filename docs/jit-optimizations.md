@@ -7082,7 +7082,19 @@ against a132c8a3: 170/173 identical, the 3 differing lines being
 exactly the bug below) - so the default dump still prints `rax` for a
 32-bit `eax` operand, `rax` for a `sete al`, and `e8` for `mov r8d`.
 That is a READABILITY question for the default text, now visible, and
-changing it moves every vdjcmp baseline; it is left as is.
+changing it moves every vdjcmp baseline; it was left as is here.
+
+**The default dump reads it too (maintainer's call, the same day):** a
+GP register prints at its encoded width in the plain `-vdj` as well
+(`xor r11d, r11d`, `cmp r11d, 10`, `mov byte [rcx+r9*1], dil`), and the
+`Gpr32` arm spells through `gp32`, so `r8d` no longer prints as the
+non-register `e8`. `eax` and `rax` are different instructions - the
+32-bit write zeroes the top half - and a reader of the dump has to be
+told which one ran. Three shape tests pinned the old spelling
+(`xor r11, r11` at the W2/W3 sites, `cmp r11, 10` at the W5 borrow);
+`vdj_raw_rendering` now also checks the default rendering over the
+register-only cases, both 8/16/32-bit arms included. Every vdjcmp
+baseline taken before this change differs from one taken after it.
 
 disasmcheck takes a second dump with the switch (compared to the plain
 one by offsets and lengths - the BYTES differ, they hold addresses the

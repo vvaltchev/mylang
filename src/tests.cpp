@@ -34845,7 +34845,7 @@ static bool jit_frameless_w2_shape()
                      * their type words instead (the static sentinel
                      * through r11; t_none would be an arena immediate
                      * `mov [..], <addr>` - jit_frameless_w3_shape) */
-                    "xor r11, r11",
+                    "xor r11d, r11d",
                     "mov [r10+0x50], r11",
                     "mov [r10+0x58], r11",
                     "mov [r10+0x80], r11",
@@ -34879,7 +34879,7 @@ static bool jit_frameless_w2_shape()
              && native_expect(mn, at2, {
                     "sub rsp, 144",
                     "mov r10, rsp",
-                    "xor r11, r11",
+                    "xor r11d, r11d",
                     "mov [r10+0x50], r11",
                     "mov [r10+0x58], r11",
                     "mov [r10+0x80], r11",
@@ -35104,10 +35104,10 @@ static bool jit_frameless_w3_shape()
     }
     /* the init follows the second parameter's bind join: find the
      * `xor r11, r11` after the site's start */
-    const size_t xr = native_find(mn, mn[at].off + 1, "xor r11, r11");
+    const size_t xr = native_find(mn, mn[at].off + 1, "xor r11d, r11d");
     ok = xr != std::string::npos
          && native_expect(mn, xr, {
-                "xor r11, r11",
+                "xor r11d, r11d",
                 "mov [r10+0x80], r11",       /* r2's tails (kept) */
                 "mov [r10+0x88], r11",
                 "mov [r10+0xb0], r11",       /* r3's, r4's (poisoned) */
@@ -35303,7 +35303,7 @@ static bool jit_frameless_w5_shape()
     {
         const std::vector<NativeIns> mn = native_ins_of(d, "main");
         const size_t at = native_find_seq(mn, 0, {
-            "cmp r11, 10",               /* an array? */
+            "cmp r11d, 10",              /* an array? */
             "jne +*",
             "cmp byte [rbx+0x*], 0",     /* its slice flag (in the payload) */
             "jne +*",                    /* a slice -> the helper */
@@ -39709,6 +39709,30 @@ static bool vdj_raw_rendering()
             ok = false;
         }
     }
+    // the DEFAULT -vdj spells a register at its encoded width too (the
+    // two renderings differ in memory operands and addresses, not here)
+    g_vdj_raw = false;
+    for (const char *hex : { "89c8", "6689c8", "88c8", "4088f0", "4488c0",
+                             "0fb6c1" }) {
+        for (const Case &c : cases) {
+            if (std::string(c.hex) != hex)
+                continue;
+            std::vector<uint8_t> b;
+            for (const char *h = c.hex; h[0] && h[1]; h += 2)
+                b.push_back(static_cast<uint8_t>(
+                    std::stoi(std::string(h, 2), nullptr, 16)));
+            uint32_t p = 0;
+            DecodedIns d;
+            decode_ins(b.data(), static_cast<uint32_t>(b.size()), p, d);
+            const std::string got = render_ins_for_test(d);
+            if (got != c.want) {
+                std::cout << "  vdj default [" << c.hex << "]: got `" << got
+                          << "`, want `" << c.want << "`\n";
+                ok = false;
+            }
+        }
+    }
+    g_vdj_raw = true;
     // an operand kind the decoder never produces renders as a marker,
     // never as an empty string that would line up with objdump by luck
     DecodedIns none;
