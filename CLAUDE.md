@@ -636,9 +636,15 @@ exercises and, with `--gcov`, counts each as a `vc:` coverage element.
 A new class comes with its recording point AND a `tests/int` assertion
 of its result FROM THE README; if the README is silent on that
 boundary it gains the rule first - the spec is the oracle, and a
-boundary it does not state cannot be checked (three rules were added
-that way: the sign of `/` and `%`, negative indexes, `pop`/`top`/`join`
-on an empty array).
+boundary it does not state cannot be checked (rules added that way:
+the sign of `/` and `%`, negative indexes, `pop`/`top`/`join` on an empty
+array, slice clamping for arrays, float division by zero, how a NaN and
+-0.0 print, `int()` of a float with no int value). The float family's
+first run found three real defects: `-x` of 0.0 was +0.0 in the VM and
+JIT (codegen lowered it to `0.0 - x`; it is `-0.0 - x` now), `int()` of
+NaN / inf / an out-of-range float was an undefined C++ cast (it throws
+`InvalidValueEx` - two tests had asserted the x86 result), and a NaN
+printed `-nan` or `nan` by platform (always `nan` now).
 **THE OBJECT CENSUS (P4, 2026-10-03).** Each pooled heap object kind
 (str, arr, dict, struct, func, exc) is counted at its class `operator
 new/delete` in an INT build (`ML_POOL_NEW_DELETE_K`, poolalloc.h - the
@@ -5771,6 +5777,16 @@ payoff.
   (`ExceptionObject`), and `rethrow`
   (`RethrowEx`, defined locally in `eval.cpp`) — caught by
   `do_catch`/`TryCatchStmt`.
+- **⛔ EVALUATE OPERANDS INTO LOCALS, LEFT TO RIGHT - NEVER AS TWO
+  ARGUMENTS OF ONE CALL (2026-10-05).** C++ leaves the order of a call's
+  arguments unspecified and GCC evaluates them RIGHT TO LEFT, so
+  `typed_cmp(op, a->eval_int(ctx), b->eval_int(ctx))` ran `b` first: in a
+  GCC-built tree-walker `a() < b()` and `x[f():g()]` called the right
+  operand first, while the VM, the JIT and a clang build went left to
+  right (RULE 2, printed output). Found by the value-class work, which had
+  to restructure exactly that line; pinned by
+  `tests/functional/62_eval_order.my` (an event log - a value assertion
+  cannot see a reorder).
 - **⛔ `&&` / `||` SHORT-CIRCUIT — in THREE places that must agree (#138,
   2026-08-09).** The determining operand (false for `&&`, true for `||`) stops
   the chain: the rest is not evaluated, so its side effects do not happen and

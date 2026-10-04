@@ -31,6 +31,7 @@
 #ifdef INT_TESTS
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -277,6 +278,109 @@ void int_vc_size(IntVc empty, IntVc one, uint64_t n) noexcept
         int_vc(empty);
     else if (n == 1)
         int_vc(one);
+}
+
+void int_vc_slice(bool str, bool has_s, int64_t s, bool has_e, int64_t e,
+                  uint64_t len) noexcept
+{
+#define VC(name) int_vc(str ? IntVc::str_slice_##name : IntVc::arr_slice_##name)
+    const int64_t n = static_cast<int64_t>(len);
+    if (n == 0) {
+        VC(of_empty);
+        return;
+    }
+    if (!has_s && !has_e)
+        VC(open);
+    /* Python's rules, as TypeArr::slice applies them */
+    int64_t ns = 0, ne = n;
+    if (has_s) {
+        if (s < -n)
+            VC(start_below);
+        else if (s < 0)
+            VC(start_neg);
+        else if (s == n)
+            VC(start_len);
+        ns = s < 0 ? std::max<int64_t>(s + n, 0) : s;
+    }
+    if (has_e) {
+        if (e < -n)
+            VC(end_below);
+        else if (e < 0)
+            VC(end_neg);
+        else if (e == n)
+            VC(end_len);
+        else if (e > n)
+            VC(end_past);
+        ne = e < 0 ? e + n : std::min(e, n);
+    }
+    if (ns < n) {
+        if (ne == ns)
+            VC(empty_range);
+        else if (ne < ns)
+            VC(reversed);
+    }
+#undef VC
+}
+
+void int_vc_float_div0(bool mod, double b) noexcept
+{
+    if (b == 0.0)
+        int_vc(mod ? IntVc::fmod_zero : IntVc::fdiv_zero);
+}
+
+void int_vc_float_op(double a, double b, double r) noexcept
+{
+    if (std::isnan(a) || std::isnan(b))
+        int_vc(IntVc::f_nan_operand);
+    else if (std::isnan(r))
+        int_vc(IntVc::f_nan_made);
+    else if (std::isinf(r) && std::isfinite(a) && std::isfinite(b))
+        int_vc(IntVc::f_overflow);
+    if (r == 0.0 && std::signbit(r))
+        int_vc(IntVc::f_neg_zero);
+}
+
+void int_vc_float_neg(double a) noexcept
+{
+    if (std::isnan(a))
+        int_vc(IntVc::f_nan_operand);
+    else if (a == 0.0 && !std::signbit(a))
+        int_vc(IntVc::f_neg_zero);           /* the result: -0.0 */
+}
+
+void int_vc_float_cmp(double a, double b) noexcept
+{
+    if (std::isnan(a) || std::isnan(b))
+        int_vc(IntVc::fcmp_nan);
+    else if (a == 0.0 && b == 0.0 && std::signbit(a) != std::signbit(b))
+        int_vc(IntVc::fcmp_zero_signs);
+}
+
+void int_vc_float_int(double f) noexcept
+{
+    const double lim = 9223372036854775808.0;      /* 2^63 */
+    if (std::isnan(f))
+        int_vc(IntVc::fint_nan);
+    else if (std::isinf(f))
+        int_vc(IntVc::fint_inf);
+    else if (!(f >= -lim && f < lim))
+        int_vc(IntVc::fint_range);
+    else if (f == -lim)
+        int_vc(IntVc::fint_min);
+    else if (f == 0.0 && std::signbit(f))
+        int_vc(IntVc::fint_neg_zero);
+    else if (f < 0.0 && f != std::trunc(f))
+        int_vc(IntVc::fint_neg_frac);
+}
+
+void int_vc_float_text(double v) noexcept
+{
+    if (std::isnan(v))
+        int_vc(IntVc::fstr_nan);
+    else if (std::isinf(v))
+        int_vc(IntVc::fstr_inf);
+    else if (v == 0.0 && std::signbit(v))
+        int_vc(IntVc::fstr_neg_zero);
 }
 
 namespace {

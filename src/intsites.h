@@ -205,4 +205,47 @@
     V(join_empty, "join([], d): \"\"")                                        \
     V(join_one, "join([s], d): s, no delimiter")                              \
     V(sort_empty, "sort([])")                                                 \
-    V(sort_one, "sort([x])")
+    V(sort_one, "sort([x])")                                                  \
+    /* a[s:e] / s[s:e] (TypeArr / TypeStr::slice): Python's clamping, at */ \
+    /* each edge of both bounds                                          */ \
+    V(arr_slice_of_empty, "a[s:e] of an empty array: []")                     \
+    V(arr_slice_open, "a[:]: a copy of the whole")                            \
+    V(arr_slice_start_neg, "a[s:], -len <= s < 0: counts from the end")      \
+    V(arr_slice_start_below, "a[s:], s < -len: clamps to 0")                  \
+    V(arr_slice_start_len, "a[len:]: []")                                     \
+    V(arr_slice_end_len, "a[:len]")                                           \
+    V(arr_slice_end_past, "a[:e], e > len: clamps to len")                    \
+    V(arr_slice_end_neg, "a[:e], -len <= e < 0: counts from the end")        \
+    V(arr_slice_end_below, "a[:e], e < -len: []")                             \
+    V(arr_slice_empty_range, "a[s:e], s == e after clamping: []")            \
+    V(arr_slice_reversed, "a[s:e], s > e after clamping: []")                \
+    V(str_slice_of_empty, "s[a:b] of an empty string: \"\"")                 \
+    V(str_slice_open, "s[:]: the whole string")                               \
+    V(str_slice_start_neg, "s[a:], -len <= a < 0: counts from the end")      \
+    V(str_slice_start_below, "s[a:], a < -len: clamps to 0")                  \
+    V(str_slice_start_len, "s[len:]: \"\"")                                  \
+    V(str_slice_end_len, "s[:len]")                                           \
+    V(str_slice_end_past, "s[:b], b > len: clamps to len")                    \
+    V(str_slice_end_neg, "s[:b], -len <= b < 0: counts from the end")        \
+    V(str_slice_end_below, "s[:b], b < -len: \"\"")                          \
+    V(str_slice_empty_range, "s[a:b], a == b after clamping: \"\"")          \
+    V(str_slice_reversed, "s[a:b], a > b after clamping: \"\"")              \
+    /* floats (TypeFloat, the M8 typed loop, int(), the renderer): IEEE  */ \
+    /* edges and how the language defines them                           */ \
+    V(fdiv_zero, "x / 0.0 (or -0.0): DivisionByZeroEx")                       \
+    V(fmod_zero, "x % 0.0 (or -0.0): DivisionByZeroEx")                       \
+    V(f_overflow, "finite operands, an infinite result")                     \
+    V(f_nan_made, "a NaN result from non-NaN operands (inf - inf)")          \
+    V(f_nan_operand, "a NaN operand: the result is NaN")                     \
+    V(f_neg_zero, "a -0.0 result (-0.0, 0.0 * -1.0)")                         \
+    V(fcmp_nan, "a comparison with a NaN: false, except !=")                 \
+    V(fcmp_zero_signs, "-0.0 compared with 0.0: equal")                       \
+    V(fint_nan, "int(NaN): InvalidValueEx")                                   \
+    V(fint_inf, "int(inf), int(-inf): InvalidValueEx")                        \
+    V(fint_range, "int(x), finite, x < -2^63 or x >= 2^63: InvalidValueEx")  \
+    V(fint_min, "int(-2^63.0): the lowest int")                               \
+    V(fint_neg_frac, "int(x), x < 0 not integral: truncates toward 0")        \
+    V(fint_neg_zero, "int(-0.0): 0")                                          \
+    V(fstr_nan, "a NaN as text: nan")                                         \
+    V(fstr_inf, "an infinity as text: inf / -inf")                            \
+    V(fstr_neg_zero, "-0.0 as text: -0.000000")

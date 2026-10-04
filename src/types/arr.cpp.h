@@ -686,6 +686,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
      * slice-view ctor below does its OWN shobj retain, so the extra handle
      * copy a by-value get<> makes is pure churn. */
     const SharedArrayObj &arr = what.get_ref<SharedArrayObj>();
+    ML_INT_ONLY(int_vc_slice_vals(false, start_val, end_val, arr.size());)
     int_type start = 0, end = arr.size();
 
     if (start_val.is<int_type>()) {

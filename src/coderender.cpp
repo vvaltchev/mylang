@@ -9,6 +9,7 @@
 #include "structtype.h"
 #include "reflect.h"        /* reflect_typeof for LiteralObj element types */
 
+#include <cmath>
 #include <sstream>
 #include <string>
 #include <cstdio>
@@ -37,6 +38,8 @@ const int PREC_PRIMARY = 10;   /* literal / id / parenthesized */
 /* A readable float literal: %g, with ".0" when it would otherwise look int. */
 string fmt_float(float_type v)
 {
+    if (std::isnan(v))
+        return "nan";                  /* never C's sign-bit `-nan` */
     char buf[64];
     snprintf(buf, sizeof buf, "%g", static_cast<double>(v));
     string s(buf);
