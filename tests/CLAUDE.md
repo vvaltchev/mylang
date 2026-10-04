@@ -41,6 +41,35 @@ the INT_TESTS section); read those first.
 - **Per-push CI stays bounded** (Nets ~18 min). A new per-push step goes
   into a job that is not the long pole, or gets its own parallel job.
 
+## tests/run - the runner (after Tilck's run_all_tests)
+
+- The CATALOG is `catalog()` at the top of tests/run: one `add(name,
+  type, class, build, est_seconds, cmd, ...)` per test. A new tool or a
+  new configuration of one gets a line there, with an HONEST class (the
+  run alone, build excluded): short <= 30 s, med <= 3 min, long <= 30
+  min, manual = hours. short + med is the default run, and a test whose
+  build is not `dbg` is `long` - building that lane is minutes on its
+  own. test-times.json keeps the measured times; trust them over `est`.
+- BUILDS are `LANES`: a make or cmake recipe plus an `expect` dict that
+  the binary's `mylang -v` must match. Add the expectation that would
+  catch the wrong binary (int_tests 1 for an INT lane, ...), never an
+  empty one. Builds go to --build-root (default build-claude/, which is
+  also where Claude must build).
+- CASES: a test with `cases=` can list (`--list`) and run a subset
+  (`--only REGEX`) through its tool; `CASES` maps the kind to the list
+  command, the selection suffix and a FAILED-CASE PARSER that reads the
+  tool's own failure lines (rt: `[ RUN  ]` + `[ FAIL ]`; corpus_diff:
+  `DIFF [..] path`, `CRASH [..] path`, `REFUSED path`; int_run: `  FAIL
+  path`; bt_oracle: `FAIL name`, `VACUOUS name:`). **Changing a tool's
+  failure line breaks its reproduce line silently: update the parser in
+  the same change.** A fuzzer's reproduce line comes from its printed
+  seed (nested_fuzz: `seed=N`).
+- --case regexes go through `rx_exact`, which escapes only what is
+  special in all three dialects the tools speak (ECMAScript for -rt,
+  Python, POSIX ERE for corpus_diff's grep -E).
+- The runner never tests a binary it did not check: every build gets a
+  `check:` step (in-process `check_build`) before its tests.
+
 ## The progress API (tests/lib/testrun.py)
 
     from testrun import Run, Monitor
@@ -128,6 +157,11 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   uncovered must stay <= tests/int/coverage-floor.txt for the compiler.
   Lower the floor when a change covers more (the note says by how much);
   never raise it. CI's gcc 14.2 number comes from the `int` job log.
+- nested_fuzz's generator has a WORK BUDGET (WORK_BUDGET: the product of
+  the enclosing loops' iteration counts; past it a level nests an `if`).
+  Without it a depth-15 program ran 1.7 million innermost iterations and
+  the debug tree-walker timed out on it (26 s alone, CPython 0.5 s) -
+  with fresh seeds in CI that would be a red run with no bug behind it.
 - 16-21_nested_*.my are GENERATED (nested_fuzz -> int_select --shrink ->
   observe_globals -> wrapped to 80 columns, output checked identical).
   Do not tidy them by hand; regenerate.

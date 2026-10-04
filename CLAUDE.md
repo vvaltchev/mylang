@@ -438,20 +438,20 @@ is what compiles the
 `-std=c++17 -Wall -Wextra -Wno-unused-parameter
 -fwrapv`. The Makefile auto-generates header dependencies under
 `$(BUILD_DIR)/.d/` - PER BUILD DIR since 2026-09-27: a shared top-level
-`.d/` was rewritten by every lane, so two lanes building at once (the
-battery runner does exactly that) raced on the `.Td` temp file and left
+`.d/` was rewritten by every lane, so two lanes building at once
+(`tests/run` does exactly that) raced on the `.Td` temp file and left
 each other's object named in the surviving `.d`, silently dropping a
 lane's header dependencies. **And each `.d` names its object under
 EVERY spelling of the path - as given, absolute, and relative to the
 repo (`DEPFLAGS`, 2026-09-28; the first fix named only two, and a .d
-an absolute build wrote then held the absolute form alone):** the
-battery builds a lane with an ABSOLUTE `BUILD_DIR`, a hand build of the
+an absolute build wrote then held the absolute form alone):**
+`tests/run` builds a lane with an ABSOLUTE `BUILD_DIR`, a hand build of the
 same lane passes a relative one, and a `.d` whose target string differs
 from the object make is asked for matches nothing - every header change
 was silently ignored for that lane, and a stale `serialize.o` kept the
 old opcode count and refused every image holding a new opcode as
-"corrupt". After a header change, a surprising result from a lane the
-battery also builds is a reason to `make clean` that lane first.
+"corrupt". After a header change, a surprising result from a lane
+`tests/run` also builds is a reason to `make clean` that lane first.
 
 **⛔ DEBUG INFO IS OFF BY DEFAULT — `DEBUG_INFO` (default 0, EVERY build
 type, both build systems; maintainer-set 2026-08-26).** The `-ggdb` that
@@ -733,7 +733,7 @@ exploration, mutate) and a `Monitor` (sequential phases or a loop: the
 same socket, heartbeat line and status fields, fed by the tool's
 `advance()` / `phase()`, `status` only - int_run, nested_fuzz, myv_fuzz,
 repl_fuzz, norec_enum, norec_sweep, bt_oracle, disasmcheck,
-int_select's shrink, mutate's setup, run_battery). A SHELL tool runs
+int_select's shrink, mutate's setup, tests/run). A SHELL tool runs
 `tests/testmon` beside it, which counts its result files
 (corpus_diff). A new long tool gets one of the three; the heartbeat
 lines are the CI log's view of the same numbers.
@@ -2132,19 +2132,31 @@ changes; never locally beyond `--count 2` to check the tool.
 **LONG RUNS GO TO A MANUAL CI WORKFLOW, NOT THE LOCAL MACHINE AND NOT
 EVERY PUSH (maintainer-set, 2026-10-04).**
 
-**LOCALLY, THE WHOLE BATTERY IS ONE COMMAND: `tests/run_battery`
-(2026-09-27).** It builds the six lanes (dbg, clang, rel-hard, release
-and the two NON-JIT builds, those from a copy of the tree with jit.h's
-platform test flipped - never the src/jit.h other lanes compile) and
-runs `-rt` everywhere, driver_checks, corpus_diff in every mode, the
-vdjcmp self-test, disasmcheck, Nets 2 and 3 and the nested fuzzer as a
-DEPENDENCY GRAPH over `tests/jobs count` cores, with per-step logs,
-timeouts, a PRIVATE `$TMPDIR` per step (`-rt` writes fixed names such as
+**LOCALLY, EVERY TEST IS ONE COMMAND: `tests/run` (2026-10-05, after
+Tilck's `run_all_tests`; it replaced `run_battery`).** A catalog of
+TESTS - one run of one tool, each with a TYPE (unit, diff, fuzz, int,
+cli, jit, coverage, mutation), a time CLASS (short <= 30 s, med <= 3 min,
+long <= 30 min, manual = hours) and the BUILD it needs. A bare
+`tests/run` is the quick check (short + med, all on the debug build,
+about 4 minutes); `-t long` adds every other build (clang, rel-hard,
+release, rna, recycle, both non-JIT builds - those from a COPY of the
+tree with jit.h's platform test flipped, never the src/jit.h other
+lanes compile - int-rel, int-gcov, cmake-gcov); `-a` the manual ones.
+`-l` / `-L` list (`-d` with each test's CASES), `-T` / `-f` / names
+select, `--case REGEX` runs some cases of a test (`mylang -rt --only`,
+`corpus_diff` / `int_run` / `bt_oracle --only`). Builds are made
+incrementally under `--build-root` (default `build-claude/`) and each
+binary's `mylang -v` is CHECKED against its recipe before a test runs on
+it, so a wrong `--bin` or a stale directory is refused, not tested.
+Tests run as a dependency graph over `tests/jobs count` cores with
+per-test logs (`BUILD_ROOT/test-logs/latest`), timeouts and a PRIVATE
+`$TMPDIR` each (`-rt` writes fixed names such as
 `/tmp/mylang-myv-corrupt.myv`, so two lanes' suites sharing one `/tmp`
-fail each other - watched on its first run) and a PASS/FAIL summary.
-`--no-build` / `--bin LANE=PATH`
-point it at existing lanes (`perf`, an `OPT=1 ASSERTS=0` build, only
-that way); `--dry-run` prints the plan. **`tests/jobs` is the ONE
+fail each other). A pass is one line; a failure prints the end of its
+output, its log and a REPRODUCE line naming exactly the failing cases
+(or a fuzzer's seed). The fuzzers get a fresh seed per run (`--seed` to
+repeat), and the measured times go to `BUILD_ROOT/test-times.json`.
+**`tests/jobs` is the ONE
 definition every parallel tool asks:** workers = nproc - max(2,
 nproc/8) (`MYLANG_TEST_JOBS` overrides), memory caps for concurrent
 `-rt` runs and builds (the measured peaks are in the file), and the

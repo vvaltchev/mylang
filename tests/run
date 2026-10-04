@@ -1,0 +1,1101 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+"""
+tests/run - every kind of MyLang test, from one entry point.
+
+    tests/run                       the quick check: short + med tests
+    tests/run -l                    list what would run (-L: everything)
+    tests/run -l -d                 ... with each test's cases
+    tests/run -t long               short, med and long tests
+    tests/run -T fuzz               one test type (a prefix is enough)
+    tests/run -f corpus             tests whose name matches a regex
+    tests/run nested_fuzz rt        exactly these tests
+    tests/run rt --case '^elem2: '  only some cases of a test
+    tests/run --classes             what short / med / long mean
+
+A TEST is one run of one tool (rt, corpus_diff-levers, nested_fuzz...),
+with a TYPE (unit, diff, fuzz, int, cli, jit, coverage, mutation), a
+time CLASS and the BUILD it needs. Builds are made on demand under
+--build-root (incremental make; --no-build to skip). Some tests have
+CASES (an -rt entry, a corpus program, a tests/int unit, a backtrace
+program): a test runs as one unit unless --case selects some of them,
+and a failure prints the command that reruns just the failing cases.
+
+Passes are one line each; a failure prints the end of its output, its
+log and how to reproduce it. tests/testctl shows the progress of a run.
+
+Stdlib only.
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(HERE, "lib"))
+import testjobs  # noqa: E402
+from testrun import Monitor, fmt_secs  # noqa: E402
+
+# exit codes (named, as in Tilck's runner)
+OK, BAD_ARGS, BUILD_FAILED, TESTS_FAILED, NO_TESTS, INTERRUPTED = range(6)
+
+# ------------------------------------------------------------ classes --
+# A test's CLASS is how long it runs (its build not included). The
+# default run is short + med: the quick check.
+CLASSES = [("short", 30), ("med", 180), ("long", 1800), ("manual", None)]
+CLASS_RANK = {c: i for i, (c, _) in enumerate(CLASSES)}
+
+TYPES = [
+    ("unit", "Unit tests (-rt)"),
+    ("diff", "Engine differentials"),
+    ("fuzz", "Fuzzers"),
+    ("int", "Intrusive tests"),
+    ("cli", "Driver, system and docs"),
+    ("jit", "Machine-code checks"),
+    ("coverage", "Coverage gates"),
+    ("mutation", "Mutation testing"),
+]
+TYPE_NAMES = [t for t, _ in TYPES]
+
+# -------------------------------------------------------------- builds --
+JIT_GUARD = "#if defined(__linux__) && defined(__x86_64__)"
+
+
+class Lane:
+    """A build: its directory is BUILD_ROOT/<name>."""
+
+    def __init__(self, name, args, desc, kind="make", nojit=False,
+                 expect=None):
+        self.name, self.args, self.desc = name, args, desc
+        self.kind, self.nojit = kind, nojit
+        self.expect = expect or {}      # `mylang -v` key -> value
+
+
+LANES = {l.name: l for l in [
+    Lane("dbg", "TESTS=1 OPT=0", "debug, ASan + UBSan",
+         expect={"tests": "1", "opt": "0"}),
+    Lane("clang", "CXX=clang++ TESTS=1 OPT=0", "debug, clang",
+         expect={"tests": "1"}),
+    Lane("rel-hard", "TESTS=1 OPT=1 VM_HARDENING=1",
+         "optimized, asserts and VM hardening on", expect={"tests": "1"}),
+    Lane("release", "OPT=1", "the shipping build, no -rt suite",
+         expect={"tests": "0"}),
+    Lane("rna", "OPT=1 ASSERTS=0 TESTS=1", "optimized, no asserts",
+         expect={"tests": "1", "asserts": "0"}),
+    Lane("recycle", "TESTS=1 OPT=0 RECYCLE=1",
+         "debug, the adversarial node allocator", expect={"recycle": "1"}),
+    Lane("nojit-gcc", "TESTS=1 OPT=0", "debug, JIT compiled out",
+         nojit=True, expect={"jit": "0"}),
+    Lane("nojit-clang", "CXX=clang++ TESTS=1 OPT=0",
+         "debug, clang, JIT compiled out", nojit=True, expect={"jit": "0"}),
+    Lane("int-rel", "OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1",
+         "intrusive tests, optimized", expect={"int_tests": "1"}),
+    Lane("int-gcov", "OPT=0 TESTS=1 INT_TESTS=1 GCOV=1",
+         "intrusive tests with coverage", expect={"int_tests": "1"}),
+    Lane("cmake-gcov",
+         "-DTESTS=1 -DGCOV=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug",
+         "CMake coverage build (norec_coverage reads its layout)",
+         kind="cmake", expect={"tests": "1"}),
+]}
+
+# --------------------------------------------------------------- tests --
+
+
+class Test:
+    """One run of one tool. `cmd(ctx)` builds the argv; `cases` names a
+    case kind (see CASES) when the test can run a subset."""
+
+    def __init__(self, name, type_, cls, lane, est, cmd, env=None,
+                 wide=False, klass=None, cases=None, desc=""):
+        self.name, self.type, self.cls, self.lane = name, type_, cls, lane
+        self.est, self.cmd, self.env = est, cmd, dict(env or {})
+        self.wide, self.klass, self.cases, self.desc = wide, klass, cases, desc
+
+
+def T(*a):
+    return os.path.join(ROOT, "tests", *a)
+
+
+def S(*a):
+    return os.path.join(ROOT, "scripts", *a)
+
+
+def functional():
+    d = T("functional")
+    return sorted(os.path.join(d, f) for f in os.listdir(d)
+                  if f.endswith(".my"))
+
+
+def myv_doc(ctx, lane):
+    b = ctx.bin(lane)
+    progs = [os.path.join(ROOT, "samples", f)
+             for f in sorted(os.listdir(os.path.join(ROOT, "samples")))]
+    progs += [os.path.join(ROOT, "bench", "my", f)
+              for f in sorted(os.listdir(os.path.join(ROOT, "bench", "my")))
+              if f.endswith(".my")]
+    script = "set -e; d=$(mktemp -d); " + "; ".join(
+        "%s -c %s -o $d/%d.myv" % (shlex.quote(b), shlex.quote(p), i)
+        for i, p in enumerate(progs) if os.path.isfile(p))
+    script += "; %s $d/*.myv" % shlex.quote(T("myv_doc_check"))
+    return ["sh", "-c", script]
+
+
+def catalog():
+    ts = []
+
+    def add(*a, **kw):
+        ts.append(Test(*a, **kw))
+
+    # unit: the built-in suite, in every build that compiles it in
+    add("rt", "unit", "med", "dbg", 80, lambda c: [c.bin("dbg"), "-rt"],
+        cases="rt", klass="rt", desc="the built-in suite, five modes")
+    add("rt-nolowmem", "unit", "med", "dbg", 80,
+        lambda c: [c.bin("dbg"), "-rt"], env={"MYLANG_NO_LOWMEM": "1"},
+        cases="rt", klass="rt", desc="the same, type tags in registers")
+    for lane, est in (("clang", 90), ("rel-hard", 10), ("recycle", 90),
+                      ("nojit-gcc", 60), ("nojit-clang", 60)):
+        add("rt-" + lane, "unit", "long", lane, est,
+            (lambda l: lambda c: [c.bin(l), "-rt"])(lane), cases="rt",
+            klass="rt", desc="the suite on the %s build" % lane)
+    add("rt-rna-nolowmem", "unit", "long", "rna", 10,
+        lambda c: [c.bin("rna"), "-rt"], env={"MYLANG_NO_LOWMEM": "1"},
+        cases="rt", klass="rt",
+        desc="no asserts, type tags in registers")
+
+    # diff: the engines against each other
+    cd = T("corpus_diff")
+    add("corpus_diff", "diff", "short", "dbg", 15,
+        lambda c: [cd, c.bin("dbg")], wide=True, cases="corpus",
+        desc="every engine agrees with the tree-walker")
+    for mode, cls, est in (("levers", "med", 90), ("cold", "med", 30),
+                           ("xrot", "med", 90), ("nolowmem", "short", 15),
+                           ("spcheck", "short", 15)):
+        add("corpus_diff-" + mode, "diff", cls, "dbg", est,
+            (lambda m: lambda c: [cd, c.bin("dbg"), "--" + m])(mode),
+            wide=True, cases="corpus", desc="corpus_diff --" + mode)
+    add("corpus_diff-release", "diff", "long", "release", 120,
+        lambda c: [cd, c.bin("release"), "--levers", "--cold", "--xrot",
+                   "--nolowmem"], wide=True, cases="corpus",
+        desc="four modes on the shipping build")
+    add("corpus_diff-rna", "diff", "long", "rna", 40,
+        lambda c: [cd, c.bin("rna"), "--nolowmem", "--spcheck"], wide=True,
+        cases="corpus", desc="no asserts: --nolowmem, --spcheck")
+    add("bt_oracle", "diff", "med", "dbg", 60,
+        lambda c: [T("bt_oracle"), c.bin("dbg")], cases="backtrace",
+        desc="inlining never changes a backtrace")
+    add("norec_enum", "diff", "med", "dbg", 90,
+        lambda c: [T("norec_enum"), c.bin("dbg"), "--depth", "3",
+                   "--reach", "0", "--jobs", str(c.share)], wide=True,
+        desc="every small call-stack shape, 4 engines")
+    add("norec_sweep", "diff", "med", "dbg", 150,
+        lambda c: [T("norec_sweep"), c.bin("dbg"), "--max-events", "25",
+                   "--jobs", str(c.share)], wide=True,
+        desc="a forced frame rebuild at each call changes nothing")
+
+    # fuzz: a fresh seed every run, printed in the reproduce line
+    add("nested_fuzz", "fuzz", "med", "dbg", 90,
+        lambda c: [T("nested_fuzz"), "--mylang", c.bin("dbg"), "--count",
+                   "250", "--seed", str(c.seed), "--jobs", str(c.share)],
+        wide=True, desc="random nested programs vs CPython")
+    add("myv_fuzz", "fuzz", "med", "dbg", 60,
+        lambda c: [T("myv_fuzz"), c.bin("dbg"), "-n", "400", "--seed",
+                   str(c.seed), "--save", c.logpath("myv_fuzz-bad")],
+        desc="damaged .myv images never crash the loader")
+    add("myv_fuzz-rna", "fuzz", "long", "rna", 10,
+        lambda c: [T("myv_fuzz"), c.bin("rna"), "-n", "400", "--seed",
+                   str(c.seed), "--save", c.logpath("myv_fuzz-rna-bad")],
+        desc="the same without asserts")
+    add("repl_fuzz", "fuzz", "med", "dbg", 40,
+        lambda c: [T("repl_fuzz"), c.bin("dbg"), "-n", "400", "--seed",
+                   str(c.seed), "--save", c.logpath("repl_fuzz-bad")],
+        desc="random REPL sessions never crash it")
+    add("repl_fuzz-recycle", "fuzz", "long", "recycle", 40,
+        lambda c: [T("repl_fuzz"), c.bin("recycle"), "-n", "400",
+                   "--seed", str(c.seed), "--save",
+                   c.logpath("repl_fuzz-recycle-bad")],
+        desc="the same with the adversarial allocator")
+
+    # int: the intrusive suite
+    add("int_run", "int", "long", "int-rel", 240,
+        lambda c: [T("int_run"), c.bin("int-rel")], cases="int",
+        desc="tests/int, REPL sessions, census, state checkers")
+    for tier, cls, est in ((1, "long", 300), (2, "long", 600),
+                           (3, "manual", 3600)):
+        add("int_enum-%d" % tier, "int", cls, "int-rel", est,
+            (lambda t: lambda c: [T("int_enum"), c.bin("int-rel"),
+                                  "--tier", str(t)] + functional())(tier),
+            wide=True, desc="every legal compiler decision, tier %d" % tier)
+
+    # cli: the driver, a shipping build, the .myv spec
+    add("driver_checks", "cli", "short", "dbg", 30,
+        lambda c: [T("driver_checks"), c.bin("dbg")],
+        desc="the command-line flags do what they say")
+    add("driver_checks-release", "cli", "long", "release", 20,
+        lambda c: [T("driver_checks"), c.bin("release")],
+        desc="the same on the shipping build")
+    add("myv_doc_check", "cli", "short", "dbg", 20,
+        lambda c: myv_doc(c, "dbg"),
+        desc="docs/myv-format.txt reads every image")
+    add("system_smoke", "cli", "long", "release", 120,
+        lambda c: [T("system_smoke"), c.bin("release")],
+        desc="a build with no -rt suite runs real scripts")
+
+    # jit: the disassembler and the emitted code
+    add("vdjcmp", "jit", "med", "dbg", 60,
+        lambda c: [S("vdjcmp"), c.bin("dbg"), c.bin("dbg")],
+        desc="-vdj is reproducible (a binary against itself)")
+    add("disasmcheck", "jit", "med", "dbg", 120,
+        lambda c: [S("disasmcheck"), c.bin("dbg")],
+        desc="-vdj decodes like objdump, default config")
+    add("disasmcheck-matrix", "jit", "long", "dbg", 1200,
+        lambda c: [S("disasmcheck"), c.bin("dbg"), "--matrix"],
+        desc="the same over 23 configurations")
+
+    # coverage
+    add("int_run-gcov", "coverage", "long", "int-gcov", 600,
+        lambda c: [T("int_run"), c.bin("int-gcov"), "--gcov",
+                   "--require-floor"], cases="int",
+        desc="the coverage floor, every unit owns an element")
+    add("norec_coverage", "coverage", "long", "cmake-gcov", 900,
+        lambda c: [T("norec_coverage"), "--build-dir",
+                   os.path.dirname(c.bin("cmake-gcov")), "--run",
+                   "--min-lines", "70", "--min-branches", "55"],
+        desc="the no-record call tier's coverage floor")
+    add("int_select", "coverage", "manual", "int-gcov", 1800,
+        lambda c: [T("int_select"), c.bin("int-gcov"), "--with-rt"],
+        desc="which tests cover what (an irredundant cover)")
+
+    # mutation: builds its own copies of the tree
+    add("mutate", "mutation", "manual", None, 3 * 3600,
+        lambda c: [T("mutate"), "--count", "200", "--seed", "1"],
+        desc="planted bugs are caught (CI: Mutation workflow)")
+    return {t.name: t for t in ts}
+
+
+# --------------------------------------------------------------- cases --
+# kind -> (list argv, run-a-subset argv suffix, failed-case parser)
+
+
+def rt_failed(out):
+    """The [ RUN ] name of every case followed by [ FAIL ]; after the
+    SUMMARY line the differential modes prefix the name with their tag."""
+    bad, name, modes = [], None, False
+    for line in out.splitlines():
+        if line.startswith("SUMMARY"):
+            modes = True
+        elif line.startswith("[ RUN  ] "):
+            name = line[9:]
+            if modes:
+                name = re.sub(r"^(vm-nbi|jit-nbi|vm|jit): ", "", name)
+        elif line.startswith("[ FAIL ]") and name and name not in bad:
+            bad.append(name)
+    return bad
+
+
+def corpus_failed(out):
+    bad = []
+    for m in re.finditer(r"^(?:DIFF|CRASH) \[[^\]]*\] (\S+)|^REFUSED (\S+)",
+                         out, re.M):
+        p = m.group(1) or m.group(2)
+        if p not in bad:
+            bad.append(p)
+    return bad
+
+
+def int_failed(out):
+    return [m.group(1) for m in
+            re.finditer(r"^  FAIL  (\S+)", out, re.M)]
+
+
+def bt_failed(out):
+    return [m.group(1) for m in
+            re.finditer(r"^(?:FAIL|VACUOUS) ([^\s:]+)", out, re.M)]
+
+
+CASES = {
+    "rt": (lambda b: [b, "-rt", "--list"],
+           lambda rx: ["--only", rx], rt_failed),
+    "corpus": (lambda b: [T("corpus_diff"), b, "--list"],
+               lambda rx: ["--only", rx], corpus_failed),
+    "int": (lambda b: [T("int_run"), b, "--list"],
+            lambda rx: ["--only", rx], int_failed),
+    "backtrace": (lambda b: [T("bt_oracle"), b, "--list"],
+                  lambda rx: ["--only", rx], bt_failed),
+}
+
+
+def rx_exact(names):
+    """A regex matching exactly these names, in every regex dialect the
+    tools speak (ECMAScript, Python, POSIX ERE)."""
+    esc = [re.sub(r"([\\^$.|?*+()\[\]{}])", r"\\\1", n) for n in names]
+    if len(esc) == 1:
+        return "^" + esc[0] + "$"
+    return "^(" + "|".join(esc) + ")$"
+
+
+def list_cases(test, binary):
+    """The test's cases, or None when they cannot be listed yet."""
+    if not test.cases:
+        return None
+    if test.cases == "rt" and not os.access(binary, os.X_OK):
+        return None
+    try:
+        out = subprocess.run(CASES[test.cases][0](binary),
+                             capture_output=True, text=True, timeout=120,
+                             env=dict(os.environ, MYLANG_TEST_IDLED="1"))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return [l for l in out.stdout.splitlines() if l]
+
+
+# ---------------------------------------------------------- the runner --
+
+
+class Ctx:
+    def __init__(self, args, logdir, share):
+        self.args, self.logdir, self.share = args, logdir, share
+        self.seed = args.seed
+
+    def bin(self, lane):
+        if lane in self.args.bins:
+            return self.args.bins[lane]
+        return os.path.join(self.args.build_root, lane, "mylang")
+
+    def logpath(self, name):
+        return os.path.join(self.logdir, name)
+
+
+class Step:
+    def __init__(self, name, cmd, deps=(), cost=1, klass=None, env=None,
+                 est=60, test=None, cwd=ROOT, prep=None, label=None):
+        self.name, self.cmd, self.deps = name, cmd, list(deps)
+        self.cost, self.klass, self.env = cost, klass, dict(env or {})
+        self.est, self.test, self.cwd, self.prep = est, test, cwd, prep
+        self.label = label or name
+        self.status, self.secs, self.why = "WAIT", 0.0, ""
+        self.proc = self.log = self.t0 = self.tmp = self.logfile = None
+        self.case_rx = None
+
+
+def make_nojit_copy(build_root):
+    dst = os.path.join(build_root, "nojit-src")
+    if os.path.isdir(dst):
+        shutil.rmtree(dst)
+    os.makedirs(dst)
+    shutil.copytree(os.path.join(ROOT, "src"), os.path.join(dst, "src"))
+    shutil.copy2(os.path.join(ROOT, "Makefile"), dst)
+    jh = os.path.join(dst, "src", "jit.h")
+    s = open(jh).read()
+    if s.count(JIT_GUARD) != 1:
+        raise RuntimeError("jit.h: the platform guard is not there once")
+    with open(jh, "w") as f:
+        f.write(s.replace(JIT_GUARD, "#if 0"))
+
+
+def check_build(binary, want):
+    """`mylang -v` must say what the build's recipe says; raises with the
+    reason otherwise."""
+    try:
+        out = subprocess.run([binary, "-v"], capture_output=True, text=True,
+                             timeout=60).stdout
+    except OSError as e:
+        raise RuntimeError("cannot run %s: %s" % (binary, e.strerror))
+    got = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            got[parts[0]] = parts[1]
+    bad = ["%s %s, want %s" % (k, got.get(k, "?"), v)
+           for k, v in want.items() if got.get(k) != v]
+    if bad:
+        raise RuntimeError("%s is not this build (%s)"
+                           % (os.path.relpath(binary, ROOT), "; ".join(bad)))
+
+
+def check_steps(lanes, ctx, built):
+    """One step per build: `mylang -v` must match the build's recipe, so
+    a wrong --bin or a stale directory is refused, not tested."""
+    steps = []
+    for l in lanes:
+        binary, want = ctx.bin(l), LANES[l].expect
+        steps.append(Step("check:" + l, ["true"],
+                          deps=["build:" + l] if l in built else [],
+                          est=1, label="check " + l,
+                          prep=(lambda b, w: lambda: check_build(b, w))(
+                              binary, want)))
+    return steps
+
+
+def build_steps(lanes, build_root, jobs):
+    steps = []
+    per = max(1, jobs // max(1, len(lanes)))
+    if any(LANES[l].nojit for l in lanes):
+        steps.append(Step("nojit-src", ["true"], est=1, label="copy src",
+                          prep=lambda: make_nojit_copy(build_root)))
+    for l in lanes:
+        lane = LANES[l]
+        out = os.path.join(build_root, l)
+        if lane.kind == "cmake":
+            cmd = ["sh", "-c", "cmake -S %s -B %s %s >/dev/null && "
+                   "cmake --build %s -j%d" % (
+                       shlex.quote(ROOT), shlex.quote(out), lane.args,
+                       shlex.quote(out), per)]
+        else:
+            src = os.path.join(build_root, "nojit-src") if lane.nojit \
+                else ROOT
+            cmd = ["make", "-C", src, "-j%d" % per,
+                   "BUILD_DIR=" + out] + lane.args.split()
+        steps.append(Step("build:" + l, cmd, cost=per, klass="build",
+                          deps=["nojit-src"] if lane.nojit else [],
+                          est=240, label="build " + l))
+    return steps
+
+
+class Out:
+    """Console output: one line per finished step, the failure details,
+    and on a terminal a live status line at the bottom."""
+
+    def __init__(self, color):
+        self.tty = sys.stdout.isatty()
+        self.color = color and self.tty
+        self.status = ""
+
+    def c(self, code, text):
+        return "\033[%sm%s\033[0m" % (code, text) if self.color else text
+
+    def clear(self):
+        if self.tty and self.status:
+            sys.stdout.write("\r\033[K")
+            self.status = ""
+
+    def line(self, text=""):
+        self.clear()
+        print(text, flush=True)
+
+    def set_status(self, text):
+        if not self.tty:
+            return
+        cols = shutil.get_terminal_size((100, 20)).columns
+        text = text[:cols - 1]
+        sys.stdout.write("\r\033[K" + self.c("2", text))
+        sys.stdout.flush()
+        self.status = text
+
+
+def tail_lines(path, n):
+    try:
+        with open(path, errors="replace") as f:
+            return f.read().splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def quote_cmd(st):
+    env = " ".join("%s=%s" % (k, shlex.quote(v))
+                   for k, v in sorted(st.env.items())
+                   if k != "MYLANG_TEST_JOBS")
+    return (env + " " if env else "") + " ".join(
+        shlex.quote(os.path.relpath(a, ROOT) if os.path.isabs(a)
+                    and a.startswith(ROOT + os.sep) else a)
+        for a in st.cmd)
+
+
+def reproduce(st, failed_cases):
+    """The commands that rerun what failed: tests/run with the failing
+    cases when the test has them, and the tool's own command line."""
+    t = st.test
+    lines = []
+    if t.cases and failed_cases:
+        rx = rx_exact(failed_cases[:20])
+        lines.append("tests/run %s --case %s" % (t.name, shlex.quote(rx)))
+        base = Step(st.name, [a for a in st.cmd], env=st.env)
+        if "--only" in base.cmd:        # already a --case run
+            i = base.cmd.index("--only")
+            del base.cmd[i:i + 2]
+        base.cmd += CASES[t.cases][1](rx)
+        lines.append(quote_cmd(base))
+    elif t.name.startswith("nested_fuzz"):
+        seeds = re.findall(r"seed=(\d+)", "\n".join(tail_lines(
+            st.logfile, 400)))
+        for s in seeds[:3]:
+            lines.append("tests/nested_fuzz --mylang %s --seed %s "
+                         "--count 1" % (shlex.quote(os.path.relpath(
+                             st.cmd[2], ROOT)), s))
+    if not lines or not (t.cases and failed_cases):
+        lines.append(quote_cmd(st))
+    return lines
+
+
+def run_steps(steps, jobs, caps, out, timeout, mon, show_output):
+    by = {s.name: s for s in steps}
+    any_tests = any(s.test for s in steps)
+    used, inuse, running = 0, {}, []
+    t0 = time.time()
+
+    def settle():
+        changed = True
+        while changed:
+            changed = False
+            for s in steps:
+                if s.status != "WAIT":
+                    continue
+                bad = [d for d in s.deps if by[d].status in ("FAIL", "SKIP")]
+                if bad:
+                    s.status = "SKIP"
+                    s.why = "needs " + ", ".join(
+                        by[d].label for d in bad)
+                    changed = True
+                    if s.test:
+                        out.line("%s %-26s %s" % (
+                            out.c("33", "[ SKIPPED ]"), s.label, s.why))
+
+    while True:
+        settle()
+        ready = [s for s in steps if s.status == "WAIT"
+                 and all(by[d].status == "PASS" for d in s.deps)]
+        ready.sort(key=lambda s: -s.est)
+        for s in ready:
+            cap = caps.get(s.klass)
+            if cap is not None and inuse.get(s.klass, 0) >= cap:
+                continue
+            if used + s.cost > jobs and running:
+                continue
+            if s.prep:
+                try:
+                    s.prep()
+                except Exception as e:          # noqa: BLE001
+                    s.status, s.why = "FAIL", str(e)
+                    report_step(s, out, False)
+                    continue
+            s.log = open(s.logfile, "w")
+            s.log.write("$ %s\n\n" % quote_cmd(s))
+            s.log.flush()
+            env = dict(os.environ)
+            env.update(s.env)
+            # a PRIVATE temp dir per step: -rt writes fixed names under
+            # $TMPDIR, so two -rt runs sharing one would fail each other
+            s.tmp = tempfile.mkdtemp(prefix="mylang-test-%s-"
+                                     % s.name.replace(":", "_"))
+            env["TMPDIR"] = s.tmp
+            s.t0 = time.time()
+            s.proc = subprocess.Popen(s.cmd, cwd=s.cwd, env=env,
+                                      stdin=subprocess.DEVNULL,
+                                      stdout=s.log, stderr=subprocess.STDOUT,
+                                      start_new_session=True)
+            s.status = "RUN"
+            used += s.cost
+            inuse[s.klass] = inuse.get(s.klass, 0) + 1
+            running.append(s)
+        with mon.lock:
+            # count the tests; a builds-only phase (--case) counts builds
+            mon.done = sum(1 for x in steps if (x.test or not any_tests)
+                           and x.status in ("PASS", "FAIL", "SKIP"))
+            mon.failures = sum(1 for x in steps if x.status == "FAIL")
+        mon.set_current(", ".join(r.label for r in running))
+        if not running:
+            # a failure just now may have unblocked nothing but SKIPs:
+            # settle once more, and stop only when nothing can start
+            settle()
+            if not [x for x in steps if x.status == "WAIT"
+                    and all(by[d].status == "PASS" for d in x.deps)]:
+                break
+            continue
+        st = mon.status()
+        out.set_status("[%3.0f%%] %d/%d done, ETA %s  running: %s" % (
+            st["percent"], st["done"], st["total"], st["eta"],
+            ", ".join(r.label for r in running)))
+        time.sleep(0.25)
+        for s in list(running):
+            rc = s.proc.poll()
+            if rc is None and time.time() - s.t0 > timeout:
+                try:
+                    os.killpg(s.proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                s.proc.wait()
+                rc = None
+                s.why = "timed out after %s" % fmt_secs(timeout)
+            elif rc is None:
+                continue
+            else:
+                s.why = "" if rc == 0 else "exit %d" % rc
+            s.secs = time.time() - s.t0
+            s.status = "PASS" if rc == 0 else "FAIL"
+            s.log.write("\n[%s in %.1fs%s]\n" % (s.status, s.secs,
+                                                 ", " + s.why if s.why
+                                                 else ""))
+            s.log.close()
+            if s.status == "PASS":
+                shutil.rmtree(s.tmp, ignore_errors=True)
+            running.remove(s)
+            used -= s.cost
+            inuse[s.klass] -= 1
+            report_step(s, out, show_output)
+    out.clear()
+    return time.time() - t0
+
+
+def report_step(s, out, show_output):
+    took = human(s.secs) if s.secs >= 60 else "%.1f s" % s.secs
+    if s.status == "PASS" and s.name.startswith("check:"):
+        return
+    if s.status == "PASS":
+        tag = out.c("32", "[ PASSED  ]") if s.test else \
+            out.c("32", "[ BUILT   ]")
+        out.line("%s %-26s %8s" % (tag, s.label, took))
+        if show_output and s.test:
+            for l in tail_lines(s.logfile, 10 ** 6)[2:]:
+                out.line("    " + l)
+        return
+    out.line("%s %-26s %8s  %s" % (out.c("31", "[ FAILED  ]"), s.label,
+                                    took, s.why))
+    if s.proc is None:          # failed before it ran: the reason is all
+        return
+    body = tail_lines(s.logfile, 10 ** 6 if show_output else 40)
+    out.line()
+    for l in body:
+        out.line("    " + l)
+    out.line()
+    out.line("    log: %s" % s.logfile)
+    if s.test:
+        failed = CASES[s.test.cases][2]("\n".join(
+            tail_lines(s.logfile, 10 ** 6))) if s.test.cases else []
+        s.failed_cases = failed
+        for i, r in enumerate(reproduce(s, failed)):
+            out.line("    %s %s" % ("reproduce:" if i == 0 else
+                                    "       or:", r))
+    out.line()
+
+
+# ------------------------------------------------------------ the CLI --
+
+
+def human(secs):
+    """30 s, 3 min, 1 h 20 min - for people, not for parsing."""
+    secs = int(round(secs))
+    if secs < 60:
+        return "%d s" % secs
+    if secs < 3600:
+        m, s = divmod(secs, 60)
+        return "%d min" % m if s == 0 or m >= 10 else "%d min %d s" % (m, s)
+    h, m = divmod(secs // 60, 60)
+    return "%d h" % h if m == 0 else "%d h %d min" % (h, m)
+
+
+def times_path(build_root):
+    return os.path.join(build_root, "test-times.json")
+
+
+def load_times(build_root):
+    try:
+        with open(times_path(build_root)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_times(build_root, times):
+    try:
+        os.makedirs(build_root, exist_ok=True)
+        tmp = times_path(build_root) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(times, f, indent=1, sort_keys=True)
+        os.replace(tmp, times_path(build_root))
+    except OSError:
+        pass
+
+
+def expected(t, times):
+    h = times.get(t.name)
+    if h:
+        h = sorted(h)
+        return h[len(h) // 2]
+    return t.est
+
+
+def box_table(cols, rows):
+    w = [max([len(c)] + [len(r[i]) for r in rows if r is not None])
+         for i, c in enumerate(cols)]
+    sep = "+" + "+".join("-" * (x + 2) for x in w) + "+"
+    out = [sep, "|" + "|".join(" " + c.center(x) + " "
+                               for c, x in zip(cols, w)) + "|", sep]
+    for r in rows:
+        if r is None:
+            out.append(sep)
+            continue
+        out.append("|" + "|".join(" " + c.ljust(x) + " "
+                                  for c, x in zip(r, w)) + "|")
+    out.append(sep)
+    return "\n".join(out)
+
+
+def do_list(sel, args, times):
+    rows = []
+    for ty in TYPE_NAMES:
+        group = [t for t in sel if t.type == ty]
+        if not group:
+            continue
+        for t in group:
+            rows.append([t.name, t.type, t.cls, t.lane or "(own)",
+                         human(expected(t, times)) if t.cls != "manual"
+                         else "hours", t.desc])
+        rows.append(None)
+    if rows and rows[-1] is None:
+        rows.pop()
+    cols = ["test", "type", "class", "build", "time", "checks"]
+    table = box_table(cols, rows)
+    width = shutil.get_terminal_size((80, 20)).columns
+    if sys.stdout.isatty() and len(table.splitlines()[0]) > width:
+        # no room for the descriptions: drop that column
+        table = box_table(cols[:-1], [r[:-1] if r else r for r in rows])
+    print(table)
+    print("%d test(s)" % len(sel))
+    if not args.detailed:
+        return
+    ctx = Ctx(args, "", 1)
+    for t in sel:
+        if not t.cases:
+            continue
+        cases = list_cases(t, ctx.bin(t.lane))
+        print()
+        if cases is None:
+            print("%s: cases listed once its build exists (%s)"
+                  % (t.name, t.lane))
+            continue
+        if args.case:
+            rx = re.compile(args.case)
+            cases = [c for c in cases if rx.search(c)]
+        print("%s: %d case(s)" % (t.name, len(cases)))
+        for c in cases:
+            print("    " + c)
+
+
+def parse_args(cat):
+    ap = argparse.ArgumentParser(
+        prog="tests/run", usage="tests/run [options] [TEST ...]",
+        description="Run MyLang's tests (see tests/README.md).",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("tests", nargs="*", metavar="TEST",
+                    help="run exactly these tests (names from -L)")
+    g = ap.add_argument_group("selecting")
+    g.add_argument("-t", "--max-class", default="med",
+                   choices=[c for c, _ in CLASSES if c != "manual"] +
+                   ["any"],
+                   help="run tests up to this time class (default: med)")
+    g.add_argument("-T", "--type", default=None,
+                   help="only these test types, comma-separated; a "
+                        "prefix is enough (%s)" % ", ".join(TYPE_NAMES))
+    g.add_argument("-f", "--filter", default=None, metavar="REGEX",
+                   help="only tests whose name the regex matches")
+    g.add_argument("--case", default=None, metavar="REGEX",
+                   help="only these cases of the selected tests (-rt "
+                        "entries, corpus programs, tests/int units, "
+                        "backtrace programs)")
+    g.add_argument("-a", "--allow-manual", action="store_true",
+                   help="also run manual tests (hours: mutation, tier 3)")
+    g = ap.add_argument_group("listing")
+    g.add_argument("-l", "--list", action="store_true",
+                   help="list the tests that would run, and stop")
+    g.add_argument("-L", "--list-all", action="store_true",
+                   help="list every test (same as -l -t any -a)")
+    g.add_argument("-d", "--detailed", action="store_true",
+                   help="with -l: also list each test's cases")
+    g.add_argument("--classes", action="store_true",
+                   help="list the time classes and the test types")
+    g = ap.add_argument_group("running")
+    g.add_argument("-o", "--show-output", action="store_true",
+                   help="show each test's whole output, even on success")
+    g.add_argument("-j", "--jobs", type=int, default=0,
+                   help="cores to use (default: tests/jobs count)")
+    g.add_argument("--seed", type=int, default=None,
+                   help="the fuzzers' seed (default: a fresh one)")
+    g.add_argument("--timeout", type=int, default=3 * 3600,
+                   help="per-test timeout in seconds (default 3 hours)")
+    g = ap.add_argument_group("builds")
+    g.add_argument("--build-root",
+                   default=os.environ.get("MYLANG_TEST_BUILD_ROOT",
+                                          os.path.join(ROOT,
+                                                       "build-claude")),
+                   help="where the builds live (default: build-claude/, "
+                        "or $MYLANG_TEST_BUILD_ROOT)")
+    g.add_argument("--no-build", action="store_true",
+                   help="build nothing; skip tests whose build is missing")
+    g.add_argument("--bin", action="append", default=[],
+                   metavar="BUILD=PATH",
+                   help="use this binary for a build instead of making it")
+    g.add_argument("--logs", default=None,
+                   help="log directory (default: BUILD_ROOT/test-logs/"
+                        "<time>)")
+    g.add_argument("--no-color", action="store_true")
+    args = ap.parse_args()
+    args.build_root = os.path.abspath(args.build_root)
+    args.bins = {}
+    for spec in args.bin:
+        lane, _, path = spec.partition("=")
+        if lane not in LANES or not path:
+            ap.error("--bin wants BUILD=PATH with BUILD one of %s"
+                     % ", ".join(LANES))
+        args.bins[lane] = os.path.abspath(path)
+    if args.list_all:
+        args.list, args.max_class, args.allow_manual = True, "any", True
+    if args.seed is None:
+        args.seed = random.SystemRandom().randrange(1, 10 ** 9)
+    return args
+
+
+def select(cat, args):
+    """(selected tests, why-not hints)."""
+    if args.tests:
+        unknown = [n for n in args.tests if n not in cat]
+        if unknown:
+            for n in unknown:
+                near = [m for m in cat if n in m]
+                print("tests/run: no test named %r%s" % (
+                    n, " (did you mean: %s?)" % ", ".join(near[:5])
+                    if near else " (tests/run -L lists them)"))
+            sys.exit(BAD_ARGS)
+        sel = [cat[n] for n in args.tests]
+        manual = [t.name for t in sel if t.cls == "manual"]
+        if manual and not args.allow_manual and not args.list:
+            print("tests/run: %s %s hours long (a manual test); add -a to "
+                  "run %s" % (", ".join(manual),
+                              "runs" if len(manual) == 1 else "run",
+                              "it" if len(manual) == 1 else "them"))
+            sys.exit(BAD_ARGS)
+        return sel
+    sel = list(cat.values())
+    if args.type:
+        want = set()
+        for p in args.type.split(","):
+            m = [t for t in TYPE_NAMES if t.startswith(p.strip())]
+            if len(m) != 1:
+                print("tests/run: -T %r matches %s (types: %s)" % (
+                    p, "nothing" if not m else "several",
+                    ", ".join(TYPE_NAMES)))
+                sys.exit(BAD_ARGS)
+            want.add(m[0])
+        sel = [t for t in sel if t.type in want]
+    if args.filter:
+        rx = re.compile(args.filter)
+        sel = [t for t in sel if rx.search(t.name)]
+    pre_class = list(sel)
+    maxr = 99 if args.max_class == "any" else CLASS_RANK[args.max_class]
+    sel = [t for t in sel if CLASS_RANK[t.cls] <= maxr
+           or (t.cls == "manual" and args.allow_manual)]
+    sel = [t for t in sel if t.cls != "manual" or args.allow_manual]
+    if not sel and pre_class:
+        print("tests/run: no test up to class %s matches; these match at "
+              "a longer one:" % args.max_class)
+        for t in pre_class:
+            print("    %-24s %s" % (t.name, t.cls))
+        print("add -t long, or -t any -a for the manual ones")
+        sys.exit(NO_TESTS)
+    return sel
+
+
+def main():
+    cat = catalog()
+    args = parse_args(cat)
+    if args.classes:
+        for c, secs in CLASSES:
+            print("  %-7s %s" % (c, "up to %s" % human(secs) if secs
+                                  else "hours (needs -a; CI: on demand)"))
+        print()
+        for t, d in TYPES:
+            print("  %-9s %s" % (t, d))
+        return OK
+    sel = select(cat, args)
+    if args.case and not args.list:
+        sel = [t for t in sel if t.cases]
+        if not sel:
+            print("tests/run: --case needs a test with cases (%s)" %
+                  ", ".join(sorted({t.name for t in cat.values()
+                                    if t.cases})))
+            return BAD_ARGS
+    if not sel:
+        print("tests/run: no test matches")
+        return NO_TESTS
+    times = load_times(args.build_root)
+    if args.list:
+        do_list(sel, args, times)
+        return OK
+
+    testjobs.ensure_idle()
+    jobs = args.jobs if args.jobs > 0 else testjobs.count()
+    share = max(1, jobs // 3)
+    out = Out(color=not args.no_color and not os.environ.get("NO_COLOR"))
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    logdir = os.path.abspath(args.logs or os.path.join(
+        args.build_root, "test-logs", stamp))
+    os.makedirs(logdir, exist_ok=True)
+    latest = os.path.join(os.path.dirname(logdir), "latest")
+    try:
+        if os.path.islink(latest) or not os.path.exists(latest):
+            if os.path.islink(latest):
+                os.unlink(latest)
+            os.symlink(logdir, latest)
+    except OSError:
+        pass
+    ctx = Ctx(args, logdir, share)
+
+    # the builds the selection uses; those not given by --bin are made
+    # (incrementally) unless --no-build, and every one is checked
+    skipped = []
+    if args.no_build:
+        for t in list(sel):
+            if t.lane and not os.access(ctx.bin(t.lane), os.X_OK):
+                skipped.append((t, "no %s build (%s)" % (
+                    t.lane, ctx.bin(t.lane))))
+                sel.remove(t)
+    need = sorted({t.lane for t in sel if t.lane})
+    build = [] if args.no_build else [l for l in need if l not in args.bins]
+
+    caps = {"rt": testjobs_cap("rtcap"), "build": testjobs_cap("buildcap")}
+    out.line("tests/run: %d test(s), %d build(s), %d cores, seed %d" % (
+        len(sel), len(build), jobs, args.seed))
+    out.line("logs: %s" % logdir)
+    for t, why in skipped:
+        out.line("%s %-26s %s" % (out.c("33", "[ SKIPPED ]"), t.name, why))
+    out.line()
+
+    def assign_logs(ss):
+        for x in ss:
+            if not x.logfile:
+                x.logfile = os.path.join(logdir,
+                                         x.name.replace(":", "_") + ".log")
+
+    steps = build_steps(build, args.build_root, jobs)
+    steps += check_steps(need, ctx, build)
+    assign_logs(steps)
+    if args.case:
+        # the cases exist only once the builds do: build first
+        if steps:
+            run_steps(steps, jobs, caps, out, args.timeout,
+                      Monitor("run", total=len(steps), phase="builds",
+                              heartbeat=60).__enter__(), False)
+            if any(s.status != "PASS" for s in steps):
+                return BUILD_FAILED
+            steps = []
+            need = []
+    for t in sel:
+        cmd = t.cmd(ctx)
+        env = dict(t.env)
+        if t.wide:
+            env["MYLANG_TEST_JOBS"] = str(share)
+        st = Step(t.name, cmd, deps=["check:" + t.lane] if t.lane in need
+                  else [], cost=share if t.wide else 1, klass=t.klass,
+                  env=env, est=expected(t, times), test=t,
+                  label="%s: %s" % (t.type, t.name))
+        if args.case:
+            cases = list_cases(t, ctx.bin(t.lane))
+            rx = re.compile(args.case)
+            hit = [c for c in (cases or []) if rx.search(c)]
+            if not hit:
+                out.line("%s %-26s no case matches %r" % (
+                    out.c("33", "[ SKIPPED ]"), st.label, args.case))
+                continue
+            st.cmd = cmd + CASES[t.cases][1](rx_exact(hit))
+        steps.append(st)
+    assign_logs(steps)
+    tests_run = [s for s in steps if s.test]
+    if not tests_run:
+        out.line("tests/run: nothing to run")
+        return NO_TESTS
+
+    # progress counts TESTS, weighted by their expected time: a build
+    # that is already up to date finishes at once and says nothing
+    # about how far along the run is
+    total_w = float(sum(min(s.est, 3600) for s in tests_run)) or 1.0
+
+    def pct():
+        return 100.0 * sum(min(s.est, 3600) for s in tests_run
+                           if s.status in ("PASS", "FAIL", "SKIP")) \
+            / total_w
+    mon = Monitor("run", total=len(tests_run), phase="tests",
+                  heartbeat=60, percent_fn=pct)
+    try:
+        with mon:
+            wall = run_steps(steps, jobs, caps, out, args.timeout, mon,
+                             args.show_output)
+    except KeyboardInterrupt:
+        out.clear()
+        for s in steps:
+            if s.status == "RUN":
+                try:
+                    os.killpg(s.proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        print("\ntests/run: interrupted; logs in %s" % logdir)
+        return INTERRUPTED
+
+    # the timing record: the last five runs of each test
+    for s in tests_run:
+        if s.status == "PASS" and not args.case:
+            h = times.get(s.name, [])[-4:] + [round(s.secs, 1)]
+            times[s.name] = h
+    save_times(args.build_root, times)
+
+    return summary(steps, skipped, wall, logdir, out)
+
+
+def testjobs_cap(what):
+    try:
+        r = subprocess.run(["sh", os.path.join(HERE, "jobs"), what],
+                           capture_output=True, text=True, check=True)
+        return max(1, int(r.stdout.strip()))
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return 2
+
+
+def summary(steps, skipped, wall, logdir, out):
+    tests = [s for s in steps if s.test]
+    builds_bad = [s for s in steps if not s.test and s.status == "FAIL"]
+    out.line("-" * 72)
+    for ty, pretty in TYPES:
+        group = [s for s in tests if s.test.type == ty]
+        if not group:
+            continue
+        ok = sum(1 for s in group if s.status == "PASS")
+        bad = [s.test.name for s in group if s.status == "FAIL"]
+        skip = [s.test.name for s in group if s.status == "SKIP"]
+        note = ""
+        if bad:
+            note += out.c("31", "  FAILED: " + ", ".join(bad))
+        if skip:
+            note += out.c("33", "  skipped: " + ", ".join(skip))
+        out.line("%-26s passed: %3d/%-3d%s" % (pretty, ok, len(group), note))
+    if skipped:
+        out.line("%-26s %s" % ("Not run (no build)", ", ".join(
+            t.name for t, _ in skipped)))
+    failed = [s for s in tests if s.status == "FAIL"]
+    out.line()
+    verdict = out.c("32", "PASSED") if not failed and not builds_bad \
+        else out.c("31", "FAILED")
+    out.line("%s: %d/%d tests passed in %s; logs in %s" % (
+        verdict, sum(1 for s in tests if s.status == "PASS"), len(tests),
+        human(wall), os.path.relpath(logdir, ROOT)))
+    if failed:
+        out.line()
+        out.line("to reproduce:")
+        for s in failed:
+            for r in reproduce(s, getattr(s, "failed_cases", [])):
+                out.line("    " + r)
+    if builds_bad:
+        return BUILD_FAILED
+    return TESTS_FAILED if failed else OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

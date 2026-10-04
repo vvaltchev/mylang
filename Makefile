@@ -199,14 +199,14 @@ endif
 
 # Header dependencies live INSIDE the build dir. They used to share one
 # top-level `.d/`, which two builds of different lanes running at once
-# (tests/run_battery) both rewrite: the .Td temp file races, and the
+# (tests/run) both rewrite: the .Td temp file races, and the
 # surviving .d names the OTHER lane's object as its target, so this lane
 # silently loses its header dependencies and a later header edit leaves a
 # stale object behind.
 DEPDIR := $(BUILD_DIR)/.d
 # The dependency rule names the object under BOTH spellings of its path -
 # as make sees it this run ($@) and absolute. A lane built once with an
-# ABSOLUTE BUILD_DIR (tests/run_battery passes one) and later with a
+# ABSOLUTE BUILD_DIR (tests/run passes one) and later with a
 # relative one (`make BUILD_DIR=build-claude/dbg`) otherwise has .d files
 # whose target is a DIFFERENT string from the object make is asked for:
 # the rule matches nothing, every header dependency is silently dropped,

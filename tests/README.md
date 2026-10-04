@@ -14,33 +14,122 @@ against each other, feed the interpreter random or corrupted input, check
 the command-line driver, force the compiler down unusual paths, and measure
 coverage. None of them needs anything beyond Python 3 and a POSIX shell.
 
+One command runs them all: tests/run.
+
 
 Quick start
 -----------
 
-Build a debug binary with the suite compiled in (sanitizers are on by
-default in debug builds):
+    $ tests/run
 
-    $ make -j TESTS=1 OPT=0 BUILD_DIR=build-dbg
+That builds what it needs (an incremental make of a debug build under
+build-claude/dbg), runs the quick check - every short and medium test,
+about four minutes on 16 cores - and prints one line per test:
 
-Then, from the fastest check to the slowest:
+    tests/run: 18 test(s), 1 build(s), 21 cores, seed 134701015
+    logs: build-claude/test-logs/20261004-160952
 
-    $ build-dbg/mylang -rt
+    [ BUILT   ] build dbg                     0.3 s
+    [ PASSED  ] cli: driver_checks           41.0 s
+    [ PASSED  ] unit: rt                   2 min 33 s
+    ...
+    ------------------------------------------------------------------------
+    Unit tests (-rt)           passed:   2/2
+    Engine differentials       passed:   9/9
+    Fuzzers                    passed:   3/3
+    Driver, system and docs    passed:   2/2
+    Machine-code checks        passed:   2/2
 
-    $ tests/corpus_diff build-dbg/mylang
+    PASSED: 18/18 tests passed in 3 min 54 s
 
-    $ tests/driver_checks build-dbg/mylang
+A few more:
 
-    $ tests/nested_fuzz --mylang build-dbg/mylang --count 200
+    $ tests/run -l                     # list what would run
 
-To run everything CI runs, on every build lane, in one go:
+    $ tests/run -t long                # everything but the hours-long tests
 
-    $ tests/run_battery
+    $ tests/run rt corpus_diff         # just these tests
 
-While any of these is running, see how far along it is from another
-terminal:
+    $ tests/run -T fuzz                # one type of test
+
+While it runs, from another terminal:
 
     $ tests/testctl
+
+
+The test runner
+---------------
+
+A test is one run of one tool. It has a name (rt, corpus_diff-levers,
+nested_fuzz, ...), a type, a time class and the build it runs on. See them
+all with
+
+    $ tests/run -L
+
+| Type     | What it runs                                               |
+|----------|------------------------------------------------------------|
+| unit     | the built-in suite (-rt), on every build that has it       |
+| diff     | the engines against each other (corpus_diff, bt_oracle...) |
+| fuzz     | the fuzzers, with a fresh seed on every run                |
+| int      | the intrusive tests (an INT_TESTS build)                   |
+| cli      | the command line, a shipping build, the .myv spec          |
+| jit      | the disassembler against objdump, -vdj reproducibility     |
+| coverage | the coverage floors                                        |
+| mutation | mutation testing                                           |
+
+| Class  | Runs for         | Included                                 |
+|--------|------------------|------------------------------------------|
+| short  | up to 30 seconds | by default                               |
+| med    | up to 3 minutes  | by default                               |
+| long   | up to 30 minutes | with -t long (or -t any)                 |
+| manual | hours            | only with -a; meant for the CI workflows |
+
+Choosing what runs:
+
+| Option       | Effect                                                |
+|--------------|-------------------------------------------------------|
+| NAME ...     | exactly these tests (any class except manual)         |
+| -t CLASS     | up to this class: short, med (the default), long, any |
+| -T TYPE      | only these types, comma-separated; a prefix is enough |
+| -f REGEX     | only tests whose name matches                         |
+| -a           | also the manual tests                                 |
+| -l, -L       | list instead of running (-L: every test)              |
+| -d           | with -l: list each test's cases too                   |
+| --case REGEX | run only the matching cases of the selected tests     |
+| -o           | show each test's whole output, even when it passes    |
+| -j N         | use N cores                                           |
+| --seed N     | the fuzzers' seed, to repeat a run exactly            |
+| --no-build   | build nothing; skip tests whose build is missing      |
+| --bin B=PATH | use this binary as build B instead of making it       |
+
+Some tests have cases: each -rt entry, each corpus program, each tests/int
+program and REPL session, each backtrace program. A test runs as one unit,
+but its cases can be listed and run on their own:
+
+    $ tests/run -l -d rt --case elem2
+
+    $ tests/run rt --case '^elem2: '
+
+When a test fails, the runner prints the end of its output, the log file,
+and the command that reruns exactly what failed - the failing cases, or a
+fuzzer's seed:
+
+    [ FAILED  ] unit: rt                       2 min 31 s  exit 1
+        ...
+        log: build-claude/test-logs/latest/rt.log
+        reproduce: tests/run rt --case '^beta: two$'
+               or: build-claude/dbg/mylang -rt --only '^beta: two$'
+
+Builds live under build-claude/ (--build-root or MYLANG_TEST_BUILD_ROOT
+to change it). Before a test runs, its binary's "mylang -v" is checked
+against the build's recipe, so a wrong --bin or a stale directory is
+refused instead of tested. Logs go to build-claude/test-logs/, the newest
+run under latest/, and each test's measured time is remembered in
+build-claude/test-times.json for the next run's estimates.
+
+The exit status is 0 when everything passed, 3 when a test failed, 2 when
+a build failed, 4 when nothing matched, 1 for a bad option and 5 when
+interrupted.
 
 
 The test categories
@@ -131,43 +220,50 @@ Machine code, coverage, mutation
 
 Helpers (not tests themselves)
 
-| Tool        | Does                                                          |
-|-------------|---------------------------------------------------------------|
-| run_battery | builds every lane and runs the whole set in parallel          |
-| testctl     | shows the progress of every running test tool                 |
-| testmon     | progress for a shell tool, by counting its result files       |
-| jobs        | how many cores to use, and at what priority                   |
-| lib/        | the Python code the tools share: progress and resume          |
-|             | (testrun.py), core counts (testjobs.py), coverage (intcov.py) |
+| Tool    | Does                                                          |
+|---------|---------------------------------------------------------------|
+| run     | the test runner: builds, runs and reports every test above    |
+| testctl | shows the progress of every running test tool                 |
+| testmon | progress for a shell tool, by counting its result files       |
+| jobs    | how many cores to use, and at what priority                   |
+| lib/    | the Python code the tools share: progress and resume          |
+|         | (testrun.py), core counts (testjobs.py), coverage (intcov.py) |
 
 Everything directly in tests/ is a program you can run; lib/ holds only
 library code, and the other directories hold test data.
 
 
-How to run them
----------------
+Running a tool directly
+-----------------------
 
-All tools take the binary to test as an argument, so you can point any of
-them at any build. They run at idle priority, so they never slow down the
+tests/run is the usual way in, but every tool also runs on its own. All of
+them take the binary to test as an argument, so you can point any of them
+at any build. They run at idle priority, so they never slow down the
 machine for you.
 
 Unit suite
 
-    $ build-dbg/mylang -rt
+    $ build-claude/dbg/mylang -rt
 
-    $ build-dbg/mylang -rt -s        # also dump the tree of a failing test
+    $ build-claude/dbg/mylang -rt -s                 # dump a failing tree
+
+    $ build-claude/dbg/mylang -rt --list             # every case's name
+
+    $ build-claude/dbg/mylang -rt --only '^elem2: '  # only these cases
+
+corpus_diff, int_run and bt_oracle take the same --list and --only REGEX.
 
 Engine differentials
 
-    $ tests/corpus_diff build-dbg/mylang
+    $ tests/corpus_diff build-claude/dbg/mylang
 
-    $ tests/corpus_diff build-dbg/mylang --levers --cold --xrot
+    $ tests/corpus_diff build-claude/dbg/mylang --levers --cold --xrot
 
-    $ tests/bt_oracle build-dbg/mylang
+    $ tests/bt_oracle build-claude/dbg/mylang
 
-    $ tests/norec_enum build-dbg/mylang --depth 3
+    $ tests/norec_enum build-claude/dbg/mylang --depth 3
 
-    $ tests/norec_sweep build-dbg/mylang --max-events 25
+    $ tests/norec_sweep build-claude/dbg/mylang --max-events 25
 
 corpus_diff modes can be combined in one run:
 
@@ -182,16 +278,16 @@ corpus_diff modes can be combined in one run:
 
 Fuzzers
 
-    $ tests/nested_fuzz --mylang build-dbg/mylang --count 250
+    $ tests/nested_fuzz --mylang build-claude/dbg/mylang --count 250
 
-    $ tests/myv_fuzz build-dbg/mylang -n 400
+    $ tests/myv_fuzz build-claude/dbg/mylang -n 400
 
-    $ tests/repl_fuzz build-dbg/mylang -n 400
+    $ tests/repl_fuzz build-claude/dbg/mylang -n 400
 
 Each fuzzer prints its seed first. To reproduce a failure, run it again
 with that seed:
 
-    $ tests/nested_fuzz --mylang build-dbg/mylang --seed 1234
+    $ tests/nested_fuzz --mylang build-claude/dbg/mylang --seed 1234
 
 A .myv finding cannot be regenerated from a seed (an image contains its
 source path), so myv_fuzz saves every crashing image instead; run the
@@ -199,63 +295,62 @@ saved file directly.
 
 Intrusive tests
 
-    $ make -j OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1 BUILD_DIR=build-int
+    $ make -j OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1 \
+          BUILD_DIR=build-claude/int-rel
 
-    $ tests/int_run build-int/mylang
+    $ tests/int_run build-claude/int-rel/mylang
 
-    $ tests/int_enum build-int/mylang --tier 1 tests/functional/*.my
+    $ tests/int_enum build-claude/int-rel/mylang --tier 1 tests/functional/*.my
 
-    $ tests/int_enum build-int/mylang --tier 2 tests/functional/*.my
+    $ tests/int_enum build-claude/int-rel/mylang --tier 2 tests/functional/*.my
 
 With coverage, on a GCOV build:
 
-    $ make -j OPT=0 TESTS=1 INT_TESTS=1 GCOV=1 BUILD_DIR=build-gcov
+    $ make -j OPT=0 TESTS=1 INT_TESTS=1 GCOV=1 BUILD_DIR=build-claude/int-gcov
 
-    $ tests/int_run build-gcov/mylang --gcov --require-floor
+    $ tests/int_run build-claude/int-gcov/mylang --gcov --require-floor
 
-    $ tests/int_select build-gcov/mylang --with-rt
+    $ tests/int_select build-claude/int-gcov/mylang --with-rt
 
 Driver, system, documentation
 
-    $ tests/driver_checks build-dbg/mylang
+    $ tests/driver_checks build-claude/dbg/mylang
 
-    $ tests/system_smoke build-rel/mylang
+    $ tests/system_smoke build-claude/release/mylang
 
-    $ build-dbg/mylang -c samples/gcd -o /tmp/gcd.myv
+    $ build-claude/dbg/mylang -c samples/gcd -o /tmp/gcd.myv
     $ tests/myv_doc_check /tmp/gcd.myv
 
 Machine code
 
-    $ scripts/disasmcheck build-dbg/mylang --matrix
+    $ scripts/disasmcheck build-claude/dbg/mylang --matrix
 
     $ scripts/vdjcmp build-old/mylang build-new/mylang
-
-Everything at once
-
-    $ tests/run_battery
-
-    $ tests/run_battery --no-build
-
-    $ tests/run_battery --dry-run
-
-The battery builds its own lanes under build-claude/ and writes one log
-per step; the summary at the end names the logs of anything that failed.
-
 
 Builds
 ------
 
-| Build    | Command                                                   |
-|----------|-----------------------------------------------------------|
-| debug    | make -j TESTS=1 OPT=0                                     |
-| release  | make -j OPT=1                                             |
-| INT      | make -j OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1         |
-| GCOV     | make -j OPT=0 TESTS=1 INT_TESTS=1 GCOV=1                  |
-| no suite | make -j OPT=1 TESTS=0                  (for system_smoke) |
+tests/run makes these on demand, each under build-claude/NAME:
 
-Add BUILD_DIR=some-dir to keep builds apart. A debug build has the address
-and undefined-behaviour sanitizers on, which is where most memory bugs
-show up first. "mylang -v" prints how a binary was built.
+| Build       | make (or cmake) options                     | Used by        |
+|-------------|---------------------------------------------|----------------|
+| dbg         | TESTS=1 OPT=0                               | the quick run  |
+| clang       | CXX=clang++ TESTS=1 OPT=0                   | rt-clang       |
+| rel-hard    | TESTS=1 OPT=1 VM_HARDENING=1                | rt-rel-hard    |
+| release     | OPT=1                                       | system_smoke   |
+| rna         | OPT=1 ASSERTS=0 TESTS=1                     | no-assert runs |
+| recycle     | TESTS=1 OPT=0 RECYCLE=1                     | rt, repl_fuzz  |
+| nojit-gcc   | TESTS=1 OPT=0, JIT compiled out             | rt-nojit-gcc   |
+| nojit-clang | CXX=clang++ TESTS=1 OPT=0, JIT compiled out | rt-nojit-clang |
+| int-rel     | OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1   | int tests      |
+| int-gcov    | OPT=0 TESTS=1 INT_TESTS=1 GCOV=1            | int_run-gcov   |
+| cmake-gcov  | cmake -DTESTS=1 -DGCOV=1 -DVM_HARDENING=ON  | norec_coverage |
+
+A debug build has the address and undefined-behaviour sanitizers on,
+which is where most memory bugs show up first. "mylang -v" prints how a
+binary was built. To build one by hand:
+
+    $ make -j TESTS=1 OPT=0 BUILD_DIR=build-dbg
 
 Never benchmark an INT or debug build: they are slow on purpose.
 
@@ -337,6 +432,9 @@ Adding a test
 | a REPL session                       | tests/int/repl/NAME.session   |
 | a command-line flag                  | tests/driver_checks           |
 
+A new tool also gets a line in tests/run's catalog (the catalog() function
+at the top of tests/run): its name, type, class, build and command.
+
 A functional test is a small program that checks its own results and
 builds the tricky shape on purpose. corpus_diff then runs it on every
 engine and every JIT setting automatically.
@@ -344,7 +442,7 @@ engine and every JIT setting automatically.
 A REPL session is the text you would type, one input per line, ending with
 :quit. Its expected output lives next to it in NAME.expected; write it with
 
-    $ tests/int_run build-int/mylang --update-repl
+    $ tests/int_run build-claude/int-rel/mylang --update-repl
 
 and read it before committing: that file is the assertion.
 
