@@ -33,7 +33,14 @@ else()
    set(_san_default OFF)
 endif()
 set(ASAN  ${_san_default} CACHE BOOL "AddressSanitizer (GCC/Clang)")
-set(UBSAN ${_san_default} CACHE BOOL "UndefinedBehaviorSanitizer (GCC/Clang)")
+# A COVERAGE build defaults UBSan OFF (the Makefile's twin): its checks
+# are branches gcov counts and no input can take.
+if (GCOV)
+   set(_ubsan_default OFF)
+else()
+   set(_ubsan_default ${_san_default})
+endif()
+set(UBSAN ${_ubsan_default} CACHE BOOL "UndefinedBehaviorSanitizer (GCC/Clang)")
 
 # DEBUG_INFO (default OFF, for EVERY build type - the Makefile's twin):
 # debug info multiplies the binary's size many times over and is unused

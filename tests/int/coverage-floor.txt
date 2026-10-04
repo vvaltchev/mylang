@@ -5,5 +5,5 @@
 # line when a test covers more, never raise one to let a change land.
 #
 # <compiler as `mylang -v` reports it> <max uncovered>
-gcc 16.2 32193
+gcc 16.2 29483
 gcc 14.2 32115
