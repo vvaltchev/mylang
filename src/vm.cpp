@@ -3129,6 +3129,16 @@ vm_precompile_all(const Block *root, bool jit, Chunk *main_chunk)
                         kv.first->name ? kv.first->name->val.c_str() : "?",
                         slot_desc);
 
+    /* #107 P6: a test's chunk hook edits codegen's output here, before
+     * the splice snapshots any callee (inttest.h) */
+    ML_INT_ONLY(for (auto &kv : g_func_chunks)
+                    int_stage(IntStage::pre_splice,
+                              kv.first->name ? kv.first->name->val
+                                             : std::string("<lambda>"),
+                              kv.second);
+                if (main_chunk)
+                    int_stage(IntStage::pre_splice, "main", *main_chunk);)
+
     /* THE SPLICE, before any jit: it produces bytecode, so the JIT (and a
      * `.myv` writer, which stores this same pre-jit code) sees the inlined
      * form. One pass, one level - the snapshot rule keeps a self-recursive
@@ -3150,6 +3160,14 @@ vm_precompile_all(const Block *root, bool jit, Chunk *main_chunk)
     if (main_chunk)
         bc_inline_chunk(*main_chunk, bc_slots, bc_snaps,
                         /*value_only=*/true);
+
+    ML_INT_ONLY(for (auto &kv : g_func_chunks)
+                    int_stage(IntStage::post_splice,
+                              kv.first->name ? kv.first->name->val
+                                             : std::string("<lambda>"),
+                              kv.second);
+                if (main_chunk)
+                    int_stage(IntStage::post_splice, "main", *main_chunk);)
 
     /* Pass B: the native tier, through the ONE driver (vm.h) - the
      * frameless pre-pass over main, every body with its own JitCtx, then

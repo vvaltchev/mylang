@@ -104,6 +104,19 @@ long long int_live_count(const std::string &kind)
  * balanced kinds. stderr, so a program's own output is untouched. */
 unsigned long long g_int_probe_hits = 0;
 
+static IntChunkHook g_int_hooks[static_cast<int>(IntStage::N)];
+
+void int_on(IntStage st, IntChunkHook fn)
+{
+    g_int_hooks[static_cast<int>(st)] = std::move(fn);
+}
+void int_off(IntStage st) { g_int_hooks[static_cast<int>(st)] = nullptr; }
+void int_stage(IntStage st, const std::string &fn, Chunk &ck)
+{
+    if (const IntChunkHook &h = g_int_hooks[static_cast<int>(st)])
+        h(fn, ck);
+}
+
 static void census_at_exit()
 {
     const char *mode = std::getenv("MYLANG_INT_CENSUS");

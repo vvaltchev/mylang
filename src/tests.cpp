@@ -50406,6 +50406,221 @@ ast_node_pool_minimal()
 
 #ifdef INT_TESTS
 /*
+ * #107 P6: THE THREE SPLICE GATES NO PROGRAM CAN REACH (#97 closure
+ * inlining step 1; docs/in-flight-tasks.md §2). Each guards a shape our
+ * codegen never emits, so each test EDITS the compiled chunk through the
+ * pre_splice hook and then requires (a) the bytecode inliner still took
+ * the site, (b) the gate DECLINED - the step-1 counter it feeds does not
+ * move, where the unedited program moves it - and (c) the edited program
+ * prints the same with the inliner on and off, JIT on and off. Each edit
+ * reports that it found its target, so a codegen change that moves the
+ * shape fails here instead of testing nothing.
+ */
+static bool int_splice_gates()
+{
+    const std::string g1 =
+        "func mk(int b) {\n"
+        "    return func [b] (int x) { var r = x * 2; r = r + b; return r; };\n"
+        "}\n"
+        "func drive(int k) {\n"
+        "    var f = mk(k);\n"
+        "    var a = k + 3;\n"
+        "    var r = f(a);\n"
+        "    var z = k;\n"
+        "    return r * 100 + z;\n"
+        "}\n"
+        "var t = 0;\n"
+        "for (var j = 0; j < 5; j++) t = t + drive(runtime(j));\n"
+        "print(t);\n";
+    const std::string g23 =
+        "func mk(int b) {\n"
+        "    return func [b] (int x) { var r = 0; r = x * 2 + b; return r; };\n"
+        "}\n"
+        "func drive(int k) {\n"
+        "    var f = mk(k);\n"
+        "    var a = k + 3;\n"
+        "    var r = f(a);\n"
+        "    print(r);\n"
+        "    return 0;\n"
+        "}\n"
+        "var t = 0;\n"
+        "for (var j = 0; j < 5; j++) t = t + drive(runtime(j));\n"
+        "print(t);\n";
+    /* what the pre_splice hook saw at drive's value call */
+    struct Site { int argtemp = -1, src = -1, dst = -1; bool edited = false; };
+    Site site;
+    bool edit = false;
+    /* the first value call in `drive`, with the staging move before it */
+    const auto value_call = [](const Chunk &ck) -> int {
+        for (size_t p = 1; p < ck.code.size(); p++)
+            if (ck.code[p].op == OpCode::CallValueV
+                    && ck.code[p - 1].op == OpCode::MoveV)
+                return static_cast<int>(p);
+        return -1;
+    };
+    const auto note_site = [&](const std::string &fn, const Chunk &ck) {
+        if (fn != "drive")
+            return -1;
+        const int p = value_call(ck);
+        if (p >= 0) {
+            site.argtemp = ck.code[p - 1].target;
+            site.src = ck.code[p - 1].target2;
+            site.dst = ck.code[p].target;
+        }
+        return p;
+    };
+    /* the inliner's verdict, read off drive's post-splice code: did the
+     * staging move stay BEFORE the guard, and did the inlined arm end in
+     * a result MOVE into dst (i.e. the result was not renamed)? -1 when
+     * the site was not inlined at all */
+    struct Verdict { int kept_staging = -1, result_move = -1; };
+    Verdict v;
+    const auto observe = [&](const std::string &fn, Chunk &ck) {
+        if (fn != "drive")
+            return;
+        size_t g = 0;
+        while (g < ck.code.size() && ck.code[g].op != OpCode::GuardCalleeV)
+            g++;
+        if (g == ck.code.size())
+            return;
+        v.kept_staging = 0;
+        for (size_t q = 0; q < g; q++)
+            if (ck.code[q].op == OpCode::MoveV
+                    && ck.code[q].target == site.argtemp
+                    && ck.code[q].target2 == site.src)
+                v.kept_staging = 1;
+        v.result_move = 0;
+        for (size_t q = g + 1; q < ck.code.size()
+                 && ck.code[q].op != OpCode::Jump; q++)
+            if (ck.code[q].op == OpCode::MoveV
+                    && ck.code[q].target == site.dst)
+                v.result_move = 1;
+    };
+    struct Gate {
+        const char *name;
+        const std::string *src;
+        bool staging;               /* gate 1: the staging, else the rename */
+        IntChunkHook edit;
+    };
+    const Gate gates[] = {
+        /* 1: the staging temp read AFTER the call (`z = <staging temp>`
+         * in place of `z = k`) - the staging move must not be sunk into
+         * the miss arm (live_out) */
+        { "a staging temp live after the call", &g1, true,
+          [&](const std::string &fn, Chunk &ck) {
+              const int p = note_site(fn, ck);
+              if (!edit || p < 0
+                      || static_cast<size_t>(p) + 1 >= ck.code.size()
+                      || ck.code[p + 1].op != OpCode::MoveV)
+                  return;
+              ck.code[p + 1].target2 = ck.code[p - 1].target;
+              site.edited = true;
+          } },
+        /* 2: the callee reads its returned slot BEFORE writing it (its
+         * `load r, 0` becomes `move <capture temp> = r`; the temp is
+         * overwritten by the capture read next) - the result must not be
+         * renamed into dst (read_first) */
+        { "a body reading its returned slot first", &g23, false,
+          [&](const std::string &fn, Chunk &ck) {
+              note_site(fn, ck);
+              if (!edit || fn != "<lambda>" || ck.code.size() < 3
+                      || ck.code[0].op != OpCode::LoadImmInt)
+                  return;
+              int tmp = -1;
+              for (const Instr &in : ck.code)
+                  if (in.op == OpCode::LoadCaptureV)
+                      tmp = in.target;
+              if (tmp < 0)
+                  return;
+              Instr mv = ck.code[0];
+              mv.op = OpCode::MoveV;
+              mv.opflags = 0;
+              mv.target2 = mv.target;
+              mv.target = tmp;
+              mv.pa = -1;
+              mv.pb = -1;
+              ck.code[0] = mv;
+              site.edited = true;
+          } },
+        /* 3: the call's dst IS its callee slot (`f = f(a)`) - the rename
+         * must be refused: the body's capture read after the write would
+         * read the result, not the closure */
+        { "a call whose dst is its callee slot", &g23, false,
+          [&](const std::string &fn, Chunk &ck) {
+              const int p = note_site(fn, ck);
+              if (!edit || p < 0)
+                  return;
+              ck.code[p].target = ck.code[p].target2;
+              site.dst = ck.code[p].target;
+              site.edited = true;
+          } },
+    };
+    bool ok = true;
+    for (const Gate &g : gates) {
+        IntHookScope pre(IntStage::pre_splice, g.edit);
+        IntHookScope post(IntStage::post_splice, observe);
+        const auto taken = [&](const Verdict &x) {
+            return g.staging ? x.kept_staging == 0 : x.result_move == 0;
+        };
+        /* the unedited program takes the refinement */
+        edit = false;
+        site = Site();
+        v = Verdict();
+        engine_run_bt(*g.src, ExecEngine::Vm, false, true);
+        const Verdict base = v;
+        /* the edited one declines it, and prints the same either way */
+        edit = true;
+        site = Site();
+        v = Verdict();
+        const std::string ref = engine_run_bt(*g.src, ExecEngine::Vm, false,
+                                              false);
+        site = Site();
+        v = Verdict();
+        const std::string vm = engine_run_bt(*g.src, ExecEngine::Vm, false,
+                                             true);
+        const Verdict ed = v;
+        const bool applied = site.edited;
+        const std::string jit = engine_run_bt(*g.src, ExecEngine::Vm, true,
+                                              true);
+        /* NOT compared: the JIT with the inliner OFF. Its argument
+         * fusion (argfuse) drops a staging move with no liveness check,
+         * so gate 1's edited program prints a stale value there - the
+         * same hazard, unreachable from source (docs/in-flight-tasks.md
+         * §2 records it and why its gate is not a one-liner). */
+        if (!applied || base.kept_staging < 0 || !taken(base)
+                || ed.kept_staging < 0) {
+            cout << "  int_splice_gates [" << g.name << "]: vacuous - edit "
+                 << (applied ? "applied" : "NOT applied")
+                 << ", unedited site " << (base.kept_staging < 0
+                                               ? "not inlined"
+                                               : taken(base)
+                                                 ? "refined" : "NOT refined")
+                 << ", edited site "
+                 << (ed.kept_staging < 0 ? "not inlined" : "inlined")
+                 << "\n";
+            ok = false;
+            continue;
+        }
+        if (taken(ed)) {
+            cout << "  int_splice_gates [" << g.name << "]: the gate did not "
+                 << "decline - the edited site was still "
+                 << (g.staging ? "sunk" : "renamed") << "\n";
+            ok = false;
+        }
+        if (vm != ref || jit != ref) {
+            cout << "  int_splice_gates [" << g.name << "]: the edited "
+                 << "program prints differently in some engine\n"
+                 << "--- -nbi -nj\n" << ref << "--- vm\n" << vm
+                 << "--- jit\n" << jit;
+            ok = false;
+        }
+    }
+    return ok;
+}
+#endif
+
+#ifdef INT_TESTS
+/*
  * #107: THE DEFERRAL SCOPE (IntDefer) - the JIT records its events inside
  * one, so a discarded emission attempt (a lost bet's retry, a give-up
  * return) must record NOTHING. Each property is checked through the real
@@ -50721,6 +50936,10 @@ static const std::vector<extra_check> extra_checks =
       "the tregs lever off stores it",
       jit_temp_regs },
 #ifdef INT_TESTS
+    { "int: #107 P6 - the three splice gates no program can reach, each "
+      "reached by editing the compiled chunk (pre_splice hook): the gate "
+      "declines and the inlined program prints what -nbi prints",
+      int_splice_gates },
     { "int: #107 - the deferral scope drops an uncommitted attempt's events,"
       " publishes a committed one's (identical ones collapsing) and nests",
       int_defer_semantics },

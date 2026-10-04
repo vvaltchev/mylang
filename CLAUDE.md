@@ -667,6 +667,18 @@ borrowing a SLICE (the W5 decline removed) aborts 55_regcall at the
 callee's entry, where the unprobed run and the VM checker see nothing.
 NOT done: comparing a pinned register with what its slot would hold -
 there is no shadow value to compare it with.
+**THE CHUNK HOOK (P6, inttest.h): `IntHookScope h(IntStage::pre_splice,
+fn)` hands a C++ `-rt` test every chunk codegen produced, by function
+name, before the bytecode inliner snapshots any of them; `post_splice`
+hands it the inliner's output before the JIT.** A test EDITS a real
+compiled chunk to build a shape codegen never emits - prefer
+retargeting an operand over inserting an instruction, which would shift
+every pc-keyed table - and READS the verdict off `post_splice` rather
+than off a counter (a counter also counts the program's other sites).
+`int_splice_gates` reaches the three step-1 gates no program can (a
+staging temp live after the call, a body reading its returned slot
+first, a call whose dst is its callee slot); removing any one gate now
+fails it, and nothing else.
 **Long runs use `tests/testrun.py`** (a `Run`: heartbeat, a unix
 control socket - `tests/testctl.py status|stop|pause|jobs N` - and
 resume by a low-water-mark token); a new multi-minute tool should

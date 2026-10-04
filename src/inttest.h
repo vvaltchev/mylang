@@ -35,6 +35,7 @@
 #ifdef INT_TESTS
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -76,6 +77,31 @@ long long int_live_count(const std::string &kind);
 /* #107 P5: JIT probes run (MYLANG_INT_PROBE) - printed as `census probes
  * N` under MYLANG_INT_CENSUS=all, so a runner can prove they ran */
 extern unsigned long long g_int_probe_hits;
+
+/*
+ * #107 P6: THE CHUNK HOOK. A C++ test registers a function for a pipeline
+ * STAGE and gets every compiled chunk there - `fn` is the function's
+ * internal name (`main` for the root) - and may EDIT it before the next
+ * stage runs: a shape our codegen never emits, reached without writing a
+ * second compiler. One hook per stage; int_off clears it, and a test
+ * must clear it before returning (IntHookScope does both).
+ *   pre_splice  - every chunk codegen produced, before the bytecode
+ *                 inliner snapshots any of them (so an edit to a callee
+ *                 is what an inlined copy of it contains)
+ *   post_splice - every chunk after the bytecode inliner, before the
+ *                 JIT: what a test reads to see what the inliner did
+ */
+struct Chunk;
+enum class IntStage { pre_splice, post_splice, N };
+typedef std::function<void(const std::string &fn, Chunk &ck)> IntChunkHook;
+void int_on(IntStage st, IntChunkHook fn);
+void int_off(IntStage st);
+void int_stage(IntStage st, const std::string &fn, Chunk &ck);
+struct IntHookScope {
+    IntStage st;
+    IntHookScope(IntStage s, IntChunkHook fn) : st(s) { int_on(s, fn); }
+    ~IntHookScope() { int_off(st); }
+};
 
 /*
  * THE DECISION ENUMERATOR (plan section 4.2): a heuristic with several
