@@ -39633,6 +39633,324 @@ static bool jit_mul_strength_check()
 #endif
 }
 
+/*
+ * REGTRACK's GROUND TRUTH, ASKED OF THE ISA (2026-10-02).
+ * `decoded_gp_writes` decides which general registers an emitted
+ * instruction WRITES, and the register tracker trusts it completely: a
+ * row that answered "writes nothing" for a form that does would blind
+ * the completeness scan to exactly the raw-byte clobber it exists for.
+ * Most of its rows cover forms the JIT does not emit today, so no run
+ * reaches them - and the day one is emitted is the day the row is
+ * needed. Each case is a HAND-ENCODED instruction and the mask the
+ * x86-64 manual says it writes (explicit destination plus the implicit
+ * ones: cqo/cdq -> rdx, div/idiv/mul/one-operand imul -> rdx:rax);
+ * a store, a compare, a branch or an SSE destination writes none. The
+ * decode must also consume exactly the bytes given, so a wrong
+ * encoding here fails as such instead of testing something else. A few
+ * mnemonics the decoder never produces are fed as structures: they
+ * pin the classifier's rule for an UNKNOWN form (its first operand is
+ * written), which is what keeps a new non-writing form loud.
+ */
+static bool regtrack_gp_write_classifier()
+{
+    enum : uint32_t {
+        AX = 1u << 0, CX = 1u << 1, DX = 1u << 2, BP = 1u << 5,
+        SP = 1u << 4, R9 = 1u << 9, R10 = 1u << 10, R11 = 1u << 11,
+    };
+    struct Case {
+        const char *what;
+        std::vector<uint8_t> code;
+        uint32_t writes;
+    };
+    const uint8_t i32[4] = { 0x10, 0, 0, 0 };
+    const auto imm = [&](std::vector<uint8_t> v) {
+        v.insert(v.end(), i32, i32 + 4);
+        return v;
+    };
+    const std::vector<Case> cases = {
+        /* moves */
+        { "mov rax, rcx (89 /r)",        {0x48, 0x89, 0xC8}, AX },
+        { "mov rax, rcx (8B /r)",        {0x48, 0x8B, 0xC1}, AX },
+        { "mov [rax], rcx",              {0x48, 0x89, 0x08}, 0 },
+        { "mov rcx, [rax]",              {0x48, 0x8B, 0x08}, CX },
+        { "mov r9, [rsp+8] (SIB)",       {0x4C, 0x8B, 0x4C, 0x24, 0x08},
+          R9 },
+        { "mov eax, imm32",              imm({0xB8}), AX },
+        { "mov r10d, imm32",             imm({0x41, 0xBA}), R10 },
+        { "movabs rcx, imm64",           {0x48, 0xB9, 1, 2, 3, 4, 5, 6, 7,
+                                          8}, CX },
+        { "mov al, cl (8A /r)",          {0x8A, 0xC1}, AX },
+        { "mov al, dil (88 /r)",         {0x40, 0x88, 0xF8}, AX },
+        { "mov [rax], cl",               {0x88, 0x08}, 0 },
+        { "mov byte [rax], imm8",        {0xC6, 0x00, 0x01}, 0 },
+        { "mov qword [rax], imm32",      imm({0x48, 0xC7, 0x00}), 0 },
+        { "mov rax, imm32 (C7 /0)",      imm({0x48, 0xC7, 0xC0}), AX },
+        { "movzx eax, cl",               {0x0F, 0xB6, 0xC1}, AX },
+        { "movsxd rax, ecx",             {0x48, 0x63, 0xC1}, AX },
+        { "lea rax, [rcx+8]",            {0x48, 0x8D, 0x41, 0x08}, AX },
+        /* compares and tests write flags only */
+        { "test rax, rax",               {0x48, 0x85, 0xC0}, 0 },
+        { "test rax, imm32",             imm({0x48, 0xF7, 0xC0}), 0 },
+        { "test byte [rax], imm8",       {0xF6, 0x00, 0x01}, 0 },
+        { "cmp rax, rcx (39 /r)",        {0x48, 0x39, 0xC8}, 0 },
+        { "cmp rax, rcx (3B /r)",        {0x48, 0x3B, 0xC1}, 0 },
+        { "cmp rax, imm32 (3D)",         imm({0x48, 0x3D}), 0 },
+        { "cmp rax, imm8 (83 /7)",       {0x48, 0x83, 0xF8, 0x05}, 0 },
+        { "cmp byte [rax], imm8",        {0x80, 0x38, 0x05}, 0 },
+        /* arithmetic writes its destination */
+        { "add rax, imm8",               {0x48, 0x83, 0xC0, 0x05}, AX },
+        { "sub rcx, imm32",              imm({0x48, 0x81, 0xE9}), CX },
+        { "adc rax, imm8",               {0x48, 0x83, 0xD0, 0x01}, AX },
+        { "sbb rax, imm8",               {0x48, 0x83, 0xD8, 0x01}, AX },
+        { "add rax, rcx (01 /r)",        {0x48, 0x01, 0xC8}, AX },
+        { "add rax, rcx (03 /r)",        {0x48, 0x03, 0xC1}, AX },
+        { "sub rax, rcx",                {0x48, 0x29, 0xC8}, AX },
+        { "and rax, rcx",                {0x48, 0x21, 0xC8}, AX },
+        { "or rax, rcx",                 {0x48, 0x0B, 0xC1}, AX },
+        { "xor rax, rcx",                {0x48, 0x33, 0xC1}, AX },
+        { "add [rax], rcx",              {0x48, 0x01, 0x08}, 0 },
+        { "sub rsp, 8 (rsp IS written)", {0x48, 0x83, 0xEC, 0x08}, SP },
+        { "neg rax",                     {0x48, 0xF7, 0xD8}, AX },
+        { "not rax",                     {0x48, 0xF7, 0xD0}, AX },
+        { "inc rax",                     {0x48, 0xFF, 0xC0}, AX },
+        { "dec rcx",                     {0x48, 0xFF, 0xC9}, CX },
+        { "inc qword [rax]",             {0x48, 0xFF, 0x00}, 0 },
+        { "shl rax, 3",                  {0x48, 0xC1, 0xE0, 0x03}, AX },
+        { "shr rax, 3",                  {0x48, 0xC1, 0xE8, 0x03}, AX },
+        { "sar rax, 3",                  {0x48, 0xC1, 0xF8, 0x03}, AX },
+        { "shl rax, 1",                  {0x48, 0xD1, 0xE0}, AX },
+        { "shl rdx, cl",                 {0x48, 0xD3, 0xE2}, DX },
+        { "imul rax, rcx",               {0x48, 0x0F, 0xAF, 0xC1}, AX },
+        { "imul rax, rcx, imm8",         {0x48, 0x6B, 0xC1, 0x30}, AX },
+        { "imul rax, rcx, imm32",        imm({0x48, 0x69, 0xC1}), AX },
+        /* the implicit rdx:rax family */
+        { "cqo",                         {0x48, 0x99}, DX },
+        { "cdq",                         {0x99}, DX },
+        { "idiv rcx",                    {0x48, 0xF7, 0xF9}, AX | DX },
+        { "div rcx",                     {0x48, 0xF7, 0xF1}, AX | DX },
+        { "mul rcx",                     {0x48, 0xF7, 0xE1}, AX | DX },
+        { "imul rcx (one operand)",      {0x48, 0xF7, 0xE9}, AX | DX },
+        /* setcc writes its byte register */
+        { "sete al",                     {0x0F, 0x94, 0xC0}, AX },
+        { "setl byte [rax]",             {0x0F, 0x9C, 0x00}, 0 },
+        /* the stack: rsp is the push/pop model's, the pop destination
+         * is written */
+        { "push rax",                    {0x50}, 0 },
+        { "push qword [rax]",            {0xFF, 0x30}, 0 },
+        { "pop r9",                      {0x41, 0x59}, R9 },
+        { "pop rbp",                     {0x5D}, BP },
+        /* control transfer: the call's caller-saved clobber is the
+         * bracket's business, not an instruction write */
+        { "ret",                         {0xC3}, 0 },
+        { "nop",                         {0x90}, 0 },
+        { "call rel32",                  imm({0xE8}), 0 },
+        { "call rax",                    {0xFF, 0xD0}, 0 },
+        { "jmp rax",                     {0xFF, 0xE0}, 0 },
+        { "jmp rel32",                   imm({0xE9}), 0 },
+        { "jmp rel8",                    {0xEB, 0x00}, 0 },
+        { "je rel8",                     {0x74, 0x00}, 0 },
+        { "je rel32",                    imm({0x0F, 0x84}), 0 },
+        /* SSE: an xmm destination writes no GP; movq TO a GP does */
+        { "movsd xmm0, xmm1",            {0xF2, 0x0F, 0x10, 0xC1}, 0 },
+        { "movsd [rax], xmm0",           {0xF2, 0x0F, 0x11, 0x00}, 0 },
+        { "addsd xmm0, xmm1",            {0xF2, 0x0F, 0x58, 0xC1}, 0 },
+        { "mulsd xmm0, xmm1",            {0xF2, 0x0F, 0x59, 0xC1}, 0 },
+        { "subsd xmm0, xmm1",            {0xF2, 0x0F, 0x5C, 0xC1}, 0 },
+        { "divsd xmm0, xmm1",            {0xF2, 0x0F, 0x5E, 0xC1}, 0 },
+        { "sqrtsd xmm0, xmm1",           {0xF2, 0x0F, 0x51, 0xC1}, 0 },
+        { "movaps xmm0, xmm1",           {0x0F, 0x28, 0xC1}, 0 },
+        { "xorps xmm0, xmm0",            {0x0F, 0x57, 0xC0}, 0 },
+        { "pxor xmm0, xmm0",             {0x66, 0x0F, 0xEF, 0xC0}, 0 },
+        { "ucomisd xmm0, xmm1",          {0x66, 0x0F, 0x2E, 0xC1}, 0 },
+        { "cvtsi2sd xmm0, rcx",          {0xF2, 0x48, 0x0F, 0x2A, 0xC1},
+          0 },
+        { "movq xmm0, rcx",              {0x66, 0x48, 0x0F, 0x6E, 0xC1},
+          0 },
+        { "movq rcx, xmm0",              {0x66, 0x48, 0x0F, 0x7E, 0xC1},
+          CX },
+        /* a byte the decoder does not know: no claim (the tracker
+         * fails on !ok itself) */
+        { "(undecodable: push es)",      {0x06}, 0 },
+    };
+    bool ok = true;
+    for (const Case &c : cases) {
+        DecodedIns d;
+        uint32_t p = 0;
+        decode_ins(c.code.data(), static_cast<uint32_t>(c.code.size()),
+                   p, d);
+        const bool want_ok = c.code[0] != 0x06;
+        if (d.ok != want_ok
+                || (want_ok && p != c.code.size())) {
+            cout << "  gp-writes [" << c.what << "]: decoded "
+                 << (d.ok ? d.mn : "nothing") << " over " << p << " of "
+                 << c.code.size() << " byte(s) - the encoding is wrong\n";
+            ok = false;
+            continue;
+        }
+        const uint32_t got = decoded_gp_writes(d);
+        if (got != c.writes) {
+            cout << "  gp-writes [" << c.what << "] (`" << d.mn
+                 << "`): classifier says " << std::hex << got
+                 << ", the ISA says " << c.writes << std::dec << "\n";
+            ok = false;
+        }
+    }
+    /* forms the decoder never produces, as structures: the rule for an
+     * UNKNOWN mnemonic is "its first operand is written" */
+    struct Synth {
+        const char *mn;
+        DecOp::Kind k0;
+        int reg;
+        int n;
+        uint32_t writes;
+    };
+    const Synth synth[] = {
+        { "rol",      DecOp::Gpr,   11, 2, R11 },   /* writes r/m */
+        { "tzcnt",    DecOp::Gpr32, 1,  2, CX  },   /* writes reg */
+        { "bswap",    DecOp::Gpr,   2,  1, DX  },
+        { "unpcklpd", DecOp::Xmm,   1,  2, 0   },   /* an xmm dest */
+        { "cld",      DecOp::None,  -1, 0, 0   },   /* no operands */
+        { "ud2",      DecOp::None,  -1, 0, 0   },
+        { "tzcnt",    DecOp::Mem,   0,  2, 0   },   /* malformed: a
+                                                     * memory first op
+                                                     * writes no GP */
+        { "",         DecOp::Gpr,   0,  1, 0   },   /* !ok: no claim */
+    };
+    for (const Synth &s : synth) {
+        DecodedIns d;
+        d.ok = s.mn[0] != 0;
+        d.mn = s.mn;
+        d.n = s.n;
+        d.ops[0].kind = s.k0;
+        d.ops[0].reg = s.reg;
+        const uint32_t got = decoded_gp_writes(d);
+        if (got != s.writes) {
+            cout << "  gp-writes [synthetic `" << s.mn << "`]: "
+                 << "classifier says " << std::hex << got << ", want "
+                 << s.writes << std::dec << "\n";
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+/*
+ * REGTRACK's FAILURE ARMS (2026-10-02). Every check of the register
+ * tracker fires only on emission that would corrupt live register
+ * state, so a correct run reaches none of them. jit_test_regtrack
+ * (jit.cpp) builds a bare Emitter per scenario, makes it do the wrong
+ * thing on purpose, and records the tracker's verdict through the
+ * TESTS sink instead of aborting; this table says what each scenario
+ * MUST produce - the message and the register (or mask) it names, or
+ * nothing at all for a scenario that exercises the arms that ACCEPT.
+ * A scenario with no row, or a row with no scenario, fails.
+ */
+static bool regtrack_failure_arms()
+{
+#if ML_JIT_SUPPORTED
+    struct Want {
+        const char *name;
+        const char *msg;          /* nullptr: no verdict at all */
+        const char *reg;          /* ": rN " as the verdict prints it */
+        const char *detail;       /* nullptr: none required */
+    };
+    static const Want want[] = {
+        { "wrote/borrowed-by-machinery",
+          "pin machinery writes a BORROWED register", ": r12 ", nullptr },
+        { "wrote/borrower-then-read",
+          "the borrower has already overwritten", ": r12 ", nullptr },
+        { "wrote/unsaved-callee-saved",
+          "UNSAVED callee-saved", ": r13 ", nullptr },
+        { "wrote/pinned",
+          "write to a PINNED register", ": r10 ", nullptr },
+        { "wrote/callee-saved-pin-in-bracket",
+          "write to a PINNED register", ": r12 ", nullptr },
+        { "wrote/machinery", nullptr, nullptr, nullptr },
+        { "wrote/flushed-then-read",
+          "REPURPOSED after the flush", ": r10 ", nullptr },
+        { "push/nested", "NESTED borrow", ": r10 ", nullptr },
+        { "push/overflow", "borrow stack overflow", ": r11 ", nullptr },
+        /* only the callee-saved pin in the bracket borrows: 1 << 12 */
+        { "push/what-borrows",
+          "probe: the borrowed set", ": r4096 ", nullptr },
+        { "pop/out-of-order", "pops out of order", ": r10 ", nullptr },
+        { "pop/borrowed-with-empty-stack",
+          "pops out of order", ": r10 ", nullptr },
+        { "pop/restore-then-plain",
+          "write to a PINNED register", ": r11 ", nullptr },
+        { "assert-no-borrow",
+          "a spill with a borrow open", ": r1024 ", nullptr },
+        { "boundary/borrow-open", "BORROW still open", ": r1024 ",
+          nullptr },
+        { "boundary/take-open", "alloc_scratch take", ": r1 ", nullptr },
+        { "boundary/net-push", "NET EMITTED PUSH", ": r2 ", nullptr },
+        { "boundary/net-pop", "NET EMITTED PUSH", ": r1 ", nullptr },
+        { "boundary/stack-depth", "NOT at the body depth", ": r8 ",
+          nullptr },
+        { "boundary/bracket-open", "UNBALANCED call bracket", ": r1 ",
+          nullptr },
+        { "boundary/bracket-overclosed", "UNBALANCED call bracket",
+          ": r2 ", nullptr },
+        { "callargs/gp", "GP argument register", ": r6 ", nullptr },
+        { "callargs/float", "FLOAT argument register", ": r0 ", nullptr },
+        { "callargs/complete", nullptr, nullptr, nullptr },
+        { "fread/undefined", "READS an xmm register no one defined",
+          ": r3 ", nullptr },
+        { "fwrote/pinned", "float-PINNED xmm", ": r4 ", nullptr },
+        { "scan/undeclared-raw-write", "no wrote() declared", ": r2 ",
+          "`mov` at emission offset 0 (declared group 0)" },
+        { "scan/undecodable-byte", "decoder does not know", ": r6 ",
+          "byte 0x06 at emission offset 0" },
+        { "scan/declaration-groups", "no wrote() declared", ": r0 ",
+          "`mov` at emission offset 10 (declared group 0x4)" },
+    };
+    std::vector<JitTrkCase> got;
+    if (!jit_test_regtrack(got))
+        return true;                /* NDEBUG: the tracker is gone */
+    bool ok = true;
+    std::vector<bool> seen(sizeof(want) / sizeof(want[0]), false);
+    for (const JitTrkCase &c : got) {
+        const Want *w = nullptr;
+        for (size_t i = 0; i < seen.size(); i++)
+            if (std::string(want[i].name) == c.name) {
+                w = &want[i];
+                seen[i] = true;
+            }
+        if (!w) {
+            cout << "  regtrack [" << c.name << "]: no expectation row\n";
+            ok = false;
+            continue;
+        }
+        const size_t n_want = w->msg ? 1 : 0;
+        bool good = c.said.size() == n_want;
+        if (good && w->msg) {
+            const std::string &s = c.said[0];
+            good = s.find(w->msg) != std::string::npos
+                && s.find(w->reg) != std::string::npos
+                && (!w->detail || s.find(w->detail) != std::string::npos);
+        }
+        if (!good) {
+            cout << "  regtrack [" << c.name << "]: want "
+                 << (w->msg ? w->msg : "(no verdict)")
+                 << (w->reg ? w->reg : "") << ", the tracker said "
+                 << c.said.size() << " thing(s):\n";
+            for (const std::string &s : c.said)
+                cout << "    " << s;
+            ok = false;
+        }
+    }
+    for (size_t i = 0; i < seen.size(); i++)
+        if (!seen[i]) {
+            cout << "  regtrack [" << want[i].name
+                 << "]: no such scenario ran\n";
+            ok = false;
+        }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 static bool jit_reg_model()
 {
 #if ML_JIT_SUPPORTED
@@ -50317,6 +50635,10 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the register MODEL - capability bits re-derived from the "
       "encoders, pool invariants, allocator contract (#96 (c))",
       jit_reg_model },
+    { "jit: REGTRACK's write classifier answers what the ISA says, "
+      "for every form it distinguishes", regtrack_gp_write_classifier },
+    { "jit: REGTRACK's failure arms each name a deliberately wrong "
+      "emission (recorded, not aborted)", regtrack_failure_arms },
     { "jit: the CALLER-SAVED pin extension r10/r11 - engages on a "
       "call-free fragment and, since #124(b), around a MyLang call (#96)",
       jit_xcache_pins },

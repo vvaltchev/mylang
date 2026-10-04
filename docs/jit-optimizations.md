@@ -17149,3 +17149,41 @@ DEFAULT configuration ("GP argument register ... r6"). **Net:**
 and debug lanes; `vdjcmp` emitted code byte-identical (the call_rax
 seam now emits the `movabs rax` it used to receive - same bytes, same
 order).
+
+### Addendum: the tracker's checks, watched firing (2026-10-02)
+
+The two entries above added checks that fire only on WRONG emission, so
+no correct run reached them, and the forms `decoded_gp_writes` classifies
+but the JIT does not emit today were reached by nothing either: the
+`int_run.py --gcov` gate read 32,350 uncovered against the GCC 16 floor
+of 32,305. Two `-rt` extra_checks close it, and the floor is ratcheted to
+the new measurement (32,209).
+
+ - **`regtrack_gp_write_classifier`** feeds the classifier ~85
+   HAND-ENCODED instructions (every mnemonic and operand shape the
+   decoder produces: register and memory destinations, stores,
+   compares, the rdx:rax family, setcc, push/pop, every control
+   transfer, the SSE forms and `movq` to a GP) plus a few synthetic
+   structures for the unknown-mnemonic rule, and asserts the write mask
+   the x86 manual gives - not the one the code computes. Each encoding
+   must decode over exactly its bytes, so a wrong test encoding fails as
+   such.
+ - **`regtrack_failure_arms`**: `Emitter::trk_fail` reports through
+   `g_jit_trk_verdict` in a TESTS build (default: the old abort);
+   `jit_test_regtrack` (jit.cpp) points it at a recorder and drives 29
+   scenarios on bare Emitters - every `wrote` arm, the borrow stack
+   (nested, overflow, out of order, a restore), `assert_no_borrow`,
+   each `op_boundary` leak, a helper's missing GP and xmm argument,
+   `trk_fread`/`fwrote`, and the completeness scan on raw bytes (an
+   undeclared write, an undecodable byte, declaration groups, a cleared
+   buffer). The expected message and register per scenario are in
+   tests.cpp; a scenario without a row, or a row without a scenario,
+   fails. Release builds and emitted bytes are untouched (`vdjcmp`
+   173/173 identical against 658db8b7).
+
+**INT-COV-EXEMPT:** only `jit_trk_verdict_abort`'s body, which ends the
+process. **Watched failing**, three rows broken at once: `cdq` no longer
+writing rdx (`gp-writes [cdq]: classifier says 0, the ISA says 4`), the
+unsaved-callee-saved arm silenced and the float-argument loop emptied
+(both named by `regtrack_failure_arms`) - `-rt` 2102/2104. **Cost:**
+debug `-rt` 75 s -> 76 s.

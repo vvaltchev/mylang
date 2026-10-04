@@ -600,6 +600,17 @@ bool jit_test_pick_op_classified(const Chunk &ck, const Instr &in);
  */
 bool jit_reg_model_check(std::string &err);
 
+/* REGTRACK: drive every failure arm of the register tracker with a
+ * deliberately wrong emission and return, per named scenario, every
+ * verdict the tracker gave (recorded, not aborted). False when the
+ * tracker is compiled out (NDEBUG). The expectations live in tests.cpp
+ * (regtrack_failure_arms). */
+struct JitTrkCase {
+    const char *name;
+    std::vector<std::string> said;
+};
+bool jit_test_regtrack(std::vector<JitTrkCase> &out);
+
 /* #78 step E: times EndFinally's cold RERAISE arm ran natively (see
  * jit_end_finally, vm.cpp) - the coverage counter for the arm that used
  * to bail to the interpreter. */

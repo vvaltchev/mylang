@@ -114,6 +114,12 @@ them means anything:**
   writes implicitly) before any checked build can emit it, and a
   GP-writing raw-byte sequence must call `wrote()` - see
   docs/jit-optimizations.md, *REGTRACK DECODES EVERY EMITTED BYTE*.
+  **The tracker's own checks are tested by watching them fire:** a new
+  `decoded_gp_writes` row gets an ISA-derived case in
+  `regtrack_gp_write_classifier`, and a new `trk_fail` arm a scenario
+  in `jit_test_regtrack` plus an expectation row in
+  `regtrack_failure_arms` (tests.cpp) - the verdict goes through the
+  TESTS sink `g_jit_trk_verdict`, so no correct run reaches it.
 - **`-vd`** (disasm.cpp) - what bytecode was emitted. Oracle:
   `myv_round_trip` (a loaded image vs a fresh compile).
 - **`-s` / `-a` / `-dti`** - what the optimizers did to the tree.
