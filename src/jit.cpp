@@ -32693,6 +32693,23 @@ retry_emission:
                     if (af.src[static_cast<size_t>(d - abase)] >= 0)
                         break;                     /* written twice: stop */
                     af.src[static_cast<size_t>(d - abase)] = -1;
+                    /* A staging temp READ AFTER THE CALL must keep its
+                     * move: fusing it leaves the temp unwritten. Codegen
+                     * never emits that shape (a staging temp dies at its
+                     * call, or is the call's dst, which the call writes),
+                     * so no program reaches this - the #107 P6 chunk hook
+                     * did, and the edited program printed a stale value
+                     * where -nj printed the argument. The bytecode
+                     * inliner's step 1 has had the same gate (live_out)
+                     * from the start. (The slot liveness covers every
+                     * frame slot; a staging temp that is also the call's
+                     * dst is written by the call, so it is not live out
+                     * of it unless the dst is read later - and then
+                     * keeping its move costs one store. A liveness that
+                     * failed covers nothing, and an uncovered slot reads
+                     * as live: the move is kept, the safe answer.) */
+                    if (xcall_lsl.live_out(pc, d))
+                        continue;
                     /* A move this fragment cannot fuse is simply LEFT
                      * ALONE and the scan CONTINUES: every gate here is
                      * about THIS move's source, and the moves between it

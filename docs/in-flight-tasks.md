@@ -925,6 +925,12 @@ fusions wherever a CallBuiltinLV-family op follows (a barrier: its
 argument run lives in the builtin_calls pool, beyond an Instr-only
 table), which costs the W5 refcount test its measurement; the precise
 fix is a use/def row for that family that can see the pool.
+**CLOSED (2026-10-03):** `visit_use_def_pooled` (the table's pool-aware
+twin - `visit_use_def` proper keeps the barrier) gives CallBuiltinLV a
+row (arg0 when local, the rest run, the dst); `jit_liveness_core` passes
+them, and argfuse declines a staging temp live after its call.
+`int_splice_gates` compares the JIT with the inliner off again;
+`use_def_builtin_lv` pins the row.
 
 **THE ASSEMBLER (P6's second half) - SIZED, NOT BUILT.** The plan's
 oracle is `assemble(disasm(chunk)) == chunk`, field for field, over the

@@ -32783,6 +32783,194 @@ static const char *fwd_opcode_name(OpCode op)
  * optimizations silently or a miscompile only in a shape the corpus does
  * not contain; the answers it produces are not an oracle for it.
  */
+/*
+ * The in-place builtin calls' use/def rows (CallBuiltinLV / LVElem /
+ * LVMember): with the chunk's POOLS each reads its base slot (a local)
+ * and its run - Elem's starts with the INDEX - and writes the dst;
+ * without them each stays a barrier. The expected sets are
+ * written from vm.cpp's VM_CASE (vm_call_builtin_lv_rest reads
+ * args.size() - 1 slots from `b`), one case per arg0 kind and both rest
+ * forms - the only net that can see a wrong row today, since no liveness
+ * consumer's answer yet depends on these reads (watched: the rest-run
+ * uses dropped left -rt and corpus_diff green).
+ */
+/*
+ * The no-record tier's reach classifier (norec_classify, MYLANG_JITSTATS'
+ * `scalar_params` row) counts a leaf whose every parameter binds a
+ * SCALAR - int, float AND bool. Its bool arm was reached only incidentally
+ * (by a JIT test's factory call, until a liveness change moved that call
+ * to another tier), so it is pinned here: an interpreted call to a leaf
+ * taking (bool, int) must count, and one taking an array must not.
+ */
+extern unsigned long g_norec_scalar, g_norec_arity;
+void vm_test_norec_classify(const FuncDescriptor *fd, const Chunk *cck);
+static bool norec_classify_scalar_params()
+{
+    /* compiled, not run: the classifier is asked directly, so the test
+     * does not depend on which call path a platform takes into it. Its
+     * first versions went vacuous on Windows alone - the classifier's leaf
+     * verdict was memoized in a map keyed by Chunk*, and a freed chunk's
+     * reused address returned the old answer (fixed: Chunk::
+     * norec_leaf_memo) */
+    const char *src =
+        "func pick(bool b, int k) {\n"
+        "    var s = 0;\n"
+        "    for (var i = 0; i < k; i++) { if (b) s += i; }\n"
+        "    return s;\n"
+        "}\n"
+        "func first(array<int> a, int k) {\n"
+        "    var s = 0;\n"
+        "    for (var i = 0; i < k; i++) { s += a[0]; }\n"
+        "    return s;\n"
+        "}\n"
+        "print(pick(runtime(true), 4), first([runtime(2)], 3));\n";
+    std::vector<Tok> toks;
+    lexer(src, 1, toks);
+    ParseContext pctx(TokenStream(toks), true);
+    unique_ptr<Construct> root = pBlock(pctx);
+    mark_implicit_globals(root.get(), {});
+    infer_types(root.get(), true);
+    run_optimizers(root.get());
+    VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+    const FuncDescriptor *pick = nullptr, *first = nullptr;
+    for (const auto &fd : prog.funcs)
+        if (fd->name && fd->vm_chunk) {
+            if (fd->name->val == "pick")
+                pick = fd.get();
+            else if (fd->name->val == "first")
+                first = fd.get();
+        }
+    if (!pick || !first) {
+        cout << "  norec_classify_scalar_params: vacuous - pick/first not "
+                "compiled as functions\n";
+        return false;
+    }
+    const unsigned long s0 = g_norec_scalar, a0 = g_norec_arity;
+    vm_test_norec_classify(pick,
+                           static_cast<const Chunk *>(pick->vm_chunk));
+    const unsigned long s1 = g_norec_scalar, a1 = g_norec_arity;
+    vm_test_norec_classify(first,
+                           static_cast<const Chunk *>(first->vm_chunk));
+    if (a1 == a0 || g_norec_arity == a1) {
+        cout << "  norec_classify_scalar_params: vacuous - a leaf did not "
+                "reach the parameter check (plain frame / leaf / arity)\n";
+        return false;
+    }
+    if (s1 == s0 || g_norec_scalar != s1) {
+        cout << "  norec_classify_scalar_params: (bool, int) counted "
+             << (s1 - s0) << ", (array, int) counted "
+             << (g_norec_scalar - s1) << "\n";
+        return false;
+    }
+    return true;
+}
+
+static bool use_def_builtin_lv()
+{
+#if ML_JIT_SUPPORTED
+    const char *src =
+        "struct Bag { array<int> items; }\n"
+        "var garr = [1];\n"
+        "func gpush(int i) { append(garr, i); return pop(garr); }\n"
+        "var carr = [1];\n"
+        "var cpush = func [carr] (int i) { append(carr, i);\n"
+        "                                   return pop(carr); };\n"
+        "var a = [3, 1, 2];\n"
+        "var rows = [[3, 1, 2], [5, 4]];\n"
+        "var bag = Bag([7, 8, 9]);\n"
+        "var s = 0;\n"
+        "for (var i = 0; i < runtime(2); i++) {\n"
+        "  append(a, i * 2);\n"                  /* LV: local, a rest run */
+        "  s = s + pop(a);\n"                    /* LV: local, no rest */
+        "  sort(a, func (x, y) => x > y);\n"     /* LV: a callback */
+        "  sort(rows[i]);\n"                     /* Elem: index only */
+        "  push(rows[i], i);\n"                   /* Elem: index + values */
+        "  s = s + pop(bag.items);\n"            /* Member: no rest */
+        "  insert(bag.items, 0, i);\n"           /* Member: values */
+        "  s = s + gpush(i) + cpush(i);\n"
+        "}\n"
+        "print(s, a, rows, bag);\n";
+    std::vector<Tok> toks;
+    lexer(src, 1, toks);
+    ParseContext pctx(TokenStream(toks), true);
+    unique_ptr<Construct> root = pBlock(pctx);
+    mark_implicit_globals(root.get(), {});
+    infer_types(root.get(), true);
+    run_optimizers(root.get());
+    VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+    std::vector<const Chunk *> chunks;
+    chunks.push_back(&prog.root);
+    for (const auto &fd : prog.funcs)
+        if (fd->vm_chunk)
+            chunks.push_back(static_cast<const Chunk *>(fd->vm_chunk));
+
+    int seen_kind[3] = { 0, 0, 0 };
+    int seen_rest = 0, seen_norest = 0;
+    int seen_elem[2] = { 0, 0 }, seen_member[2] = { 0, 0 };
+    for (const Chunk *ck : chunks)
+        for (size_t p = 0; p < ck->code.size(); p++) {
+            const Instr &in = ck->code[p];
+            const bool elem = in.op == OpCode::CallBuiltinLVElem;
+            const bool member = in.op == OpCode::CallBuiltinLVMember;
+            if (in.op != OpCode::CallBuiltinLV && !elem && !member)
+                continue;
+            /* what the VM_CASE reads (vm.cpp) */
+            std::vector<int> want;
+            const int kind = in.a_dual_hi();
+            if (kind == 0)
+                want.push_back(static_cast<int>(in.target2));
+            const size_t na = ck->builtin_calls[
+                static_cast<size_t>(in.a_dual_lo())].args.size();
+            if (in.b_is_lit()) {
+                const size_t nrun = elem ? na : na - 1;
+                for (size_t k = 0; k < nrun; k++)
+                    want.push_back(static_cast<int>(in.b_lit() + k));
+            }
+            if (elem)
+                seen_elem[na > 1 ? 1 : 0]++;
+            else if (member)
+                seen_member[na > 1 ? 1 : 0]++;
+            else {
+                (in.b_is_lit() ? seen_rest : seen_norest)++;
+                seen_kind[kind >= 0 && kind < 3 ? kind : 0]++;
+            }
+            std::vector<int> uses, defs;
+            if (jit_op_slot_refs(in, uses, defs)) {
+                printf("  pc %zu: answered WITHOUT the pools - it must "
+                       "stay a barrier there\n", p);
+                return false;
+            }
+            if (!jit_op_slot_refs(in, uses, defs, ck)) {
+                printf("  pc %zu: still a BARRIER with the pools\n", p);
+                return false;
+            }
+            std::sort(uses.begin(), uses.end());
+            std::sort(want.begin(), want.end());
+            if (uses != want || defs.size() != 1
+                    || defs[0] != static_cast<int>(in.target)) {
+                printf("  pc %zu (op %d, kind %d): uses %zu vs %zu the VM "
+                       "reads, defs %zu (want the dst only)\n", p,
+                       static_cast<int>(in.op), kind, uses.size(),
+                       want.size(), defs.size());
+                return false;
+            }
+        }
+    for (int k = 0; k < 3; k++)
+        if (!seen_kind[k]) {
+            printf("  VACUOUS: arg0 kind %d never compiled\n", k);
+            return false;
+        }
+    if (!seen_rest || !seen_norest || !seen_elem[0] || !seen_elem[1]
+            || !seen_member[0] || !seen_member[1]) {
+        printf("  VACUOUS: LV rest %d/none %d, Elem %d/%d, Member %d/%d\n",
+               seen_rest, seen_norest, seen_elem[0], seen_elem[1],
+               seen_member[0], seen_member[1]);
+        return false;
+    }
+#endif
+    return true;
+}
+
 static bool use_def_store_family()
 {
 #if ML_JIT_SUPPORTED
@@ -50582,11 +50770,10 @@ static bool int_splice_gates()
         const bool applied = site.edited;
         const std::string jit = engine_run_bt(*g.src, ExecEngine::Vm, true,
                                               true);
-        /* NOT compared: the JIT with the inliner OFF. Its argument
-         * fusion (argfuse) drops a staging move with no liveness check,
-         * so gate 1's edited program prints a stale value there - the
-         * same hazard, unreachable from source (docs/in-flight-tasks.md
-         * §2 records it and why its gate is not a one-liner). */
+        /* and the JIT's own argument fusion, with the inliner OFF: it
+         * drops a staging move too, under the same liveness gate */
+        const std::string nbi_jit = engine_run_bt(*g.src, ExecEngine::Vm,
+                                                  true, false);
         if (!applied || base.kept_staging < 0 || !taken(base)
                 || ed.kept_staging < 0) {
             cout << "  int_splice_gates [" << g.name << "]: vacuous - edit "
@@ -50607,11 +50794,11 @@ static bool int_splice_gates()
                  << (g.staging ? "sunk" : "renamed") << "\n";
             ok = false;
         }
-        if (vm != ref || jit != ref) {
+        if (vm != ref || jit != ref || nbi_jit != ref) {
             cout << "  int_splice_gates [" << g.name << "]: the edited "
                  << "program prints differently in some engine\n"
                  << "--- -nbi -nj\n" << ref << "--- vm\n" << vm
-                 << "--- jit\n" << jit;
+                 << "--- jit\n" << jit << "--- -nbi jit\n" << nbi_jit;
             ok = false;
         }
     }
@@ -50793,6 +50980,14 @@ static const std::vector<extra_check> extra_checks =
     { "jit: the OPCODE-TABLE CENSUS - every opcode decided against the "
       "six opcode-keyed optimization tables, vs the live predicates (#98)",
       opcode_table_census },
+    { "vm: the no-record reach classifier counts a leaf whose parameters "
+      "are all scalars - a bool one included - and not one taking an array",
+      norec_classify_scalar_params },
+    { "codegen: the IN-PLACE BUILTIN calls' use/def rows (CallBuiltinLV, "
+      "LVElem, LVMember) - with the chunk's pools each reads its base (a "
+      "local) and its run and writes the dst, per the VM; without them a "
+      "barrier",
+      use_def_builtin_lv },
     { "jit: the ELEMENT-STORE family's use/def rows match the VM's own "
       "operand reads, no defs, every op and base kind seen (#25)",
       use_def_store_family },
@@ -50938,7 +51133,7 @@ static const std::vector<extra_check> extra_checks =
 #ifdef INT_TESTS
     { "int: #107 P6 - the three splice gates no program can reach, each "
       "reached by editing the compiled chunk (pre_splice hook): the gate "
-      "declines and the inlined program prints what -nbi prints",
+      "declines and every engine prints what -nbi -nj prints",
       int_splice_gates },
     { "int: #107 - the deferral scope drops an uncommitted attempt's events,"
       " publishes a committed one's (identical ones collapsing) and nests",

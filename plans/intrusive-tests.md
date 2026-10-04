@@ -497,7 +497,9 @@ assertions on values.
   with the inliner off - the same hazard, unreachable from source; a
   gate on the barrier-conservative slot liveness declines fusions next to
   any CallBuiltinLV (an Instr-only table cannot express its argument
-  run, so it is a barrier), so it was not added. NOT built: the
+  run, so it is a barrier), so it was not added - until the same day
+  gave that family a pool-aware use/def row (CLOSED, see in-flight §2);
+  the gate is in and the test compares all four engines. NOT built: the
   ASSEMBLER (sizing in docs/in-flight-tasks.md §2).
 - **P7 - per-site forcing sweep.**
   **STATUS (2026-10-03): BUILT, as an enumerated decision.** Every

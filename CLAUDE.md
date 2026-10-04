@@ -1003,6 +1003,14 @@ three sabotaged rows** - the five-mode differential and corpus_diff
 stayed green through a dropped value use, an invented def and a global
 index reported as a frame slot. A wrong row in this table is not an
 answer the engines can disagree about.
+**AND A POOL-KEYED RUN CAN JOIN THE TABLE (2026-10-03):**
+`visit_use_def_pooled(in, u, d, chunk)` is the table's pool-aware twin:
+an op whose operand run lives in a pool (the in-place builtin calls:
+CallBuiltinLV, LVElem, LVMember) gets its row only there, and stays a
+barrier in `visit_use_def` proper (a separate function, so the row's
+branches are not instantiated once per caller - they cost 14 coverage
+elements that way). Pinned the same way,
+by `use_def_builtin_lv`.
 
 **THE FIX, AND THE PATTERN TO REUSE: derive the test from the OPCODE
 ENUM, not from the table.** The B1/B2 specialized family is a
