@@ -408,7 +408,18 @@ assertions on values.
   so a forced decline is consistent; tests/int/14_frameless.my forces
   two sites, and the CI corpus gains 239 deviations, all agree (shown
   live and clean, like spill_choice: no sabotage found that only a
-  forced push reaches). NOT built yet: tiers 2-3 (pairs of deviations).
+  forced push reaches). Then TIERS 2-3 (`int_enum.py --tier 2`): per
+  SCOPE (keys sharing the prefix before the last `/` - one JIT run, one
+  caller's inlining sites, all frameless sites) every 2+-deviation
+  combination when there are at most 64, else a deterministic greedy
+  covering array of every NON-default value pair (a default-side pair is
+  a tier-1 run); a failing row is reduced by dropping overrides in key
+  order while it still fails. Pairs ACROSS scopes are not claimed. CI
+  corpus: 111,896 rows, 0 failures, ~5 min. Watched: with the call
+  epilogue's float-pool restore removed, tier 1 fails 4 runs; tier 2
+  fails 301 in 12 programs, 11 of which tier 1 passes, each reduced to
+  2-4 decisions (01_float_chain_ref_temp: three float picks together).
+  Not in CI (it would add ~5 min to the int-enum job).
 - **P4 - VM state checker + object census.**
   **STATUS (2026-10-03): the OBJECT CENSUS is built** - per-kind
   counters at the pooled `operator new/delete`, `int_live(kind)`,
