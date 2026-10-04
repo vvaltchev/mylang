@@ -401,6 +401,17 @@ assertions on values.
   an eviction breaks the default evictions too). NOT built yet: tiers
   2-3 (pairs of deviations), the unroll-depth and call-tier sites.
 - **P4 - VM state checker + object census.**
+  **STATUS (2026-10-03): the OBJECT CENSUS is built** - per-kind
+  counters at the pooled `operator new/delete`, `int_live(kind)`,
+  `MYLANG_INT_CENSUS=1` (`census LEAK ...` at exit, checked after main's
+  locals and before static destructors), `int_run.py` checking every
+  tests/int run and the corpus under both engines (69 programs, 0
+  leaks), `tests/int/12_census.my`. Its first run found one real
+  leftover: a program's function chunks outlived it in the process-global
+  chunk map (keyed by its freed descriptors, holding its constants) -
+  `~VmProgram` erases them now. Watched: a frame release skipping
+  closures fails 12_census, 02_splice and 14 corpus runs. The VM STATE
+  CHECKER is next.
 - **P5 - JIT preserving probe stub** + the per-op register map.
 - **P6 - chunk hook + assembler**; build the three splice-gate tests.
 - **P7 - per-site forcing sweep.**

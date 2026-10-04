@@ -21,7 +21,7 @@ private:
      */
     struct StrObj final : RefCounted {
 
-        ML_POOL_NEW_DELETE
+        ML_POOL_NEW_DELETE_K(IOK_STR)
 
         inner_type s;
         /*

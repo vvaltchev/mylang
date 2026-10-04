@@ -22,7 +22,7 @@ class ExceptionObjectTempl : public RuntimeException, public RefCounted {
 
 public:
 
-    ML_POOL_NEW_DELETE
+    ML_POOL_NEW_DELETE_K(IOK_EXC)
 
     /* `uid`: the already-interned type name when the caller has it (a
      * thrown struct's def->name - the hot path); else the ctor interns

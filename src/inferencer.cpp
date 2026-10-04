@@ -4326,7 +4326,7 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     /* int-returning */
     if (n == "len" || n == "hash" || n == "ord" || n == "rand" ||
         n == "intptr" || n == "refcount" || n == "remove" ||
-        n == "int_hits")
+        n == "int_hits" || n == "int_live")
         return A.int_ty();
 
     /* bool-returning predicates */

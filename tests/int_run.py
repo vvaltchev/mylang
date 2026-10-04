@@ -42,6 +42,14 @@
 #        --require-floor a compiler with no line fails, naming the count to
 #        record.
 #
+# 5. THE OBJECT CENSUS (P4): every tests/int run, and every program of the
+#    corpus (tests/functional + the non-interactive samples) under the
+#    default engine and the tree-walker, runs with MYLANG_INT_CENSUS=1 and
+#    fails on a `census LEAK` line - a runtime heap object (str, arr, dict,
+#    struct, func, exc) still alive after the program, which LeakSanitizer
+#    cannot see for a POOLED object. `-rt` is exempt: the harness retains
+#    its programs on purpose.
+#
 # Deterministic: no seeds, no sampling, a fixed unit order. The random-
 # program fuzzers never run an INT binary (plan section 7).
 
@@ -58,6 +66,9 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 EXEMPT = "INT-COV-EXEMPT"
+# the samples the census runs: the ones that read no stdin and call no
+# rand() (phonebook / shopping read input; rand_sort is random)
+CENSUS_SAMPLES = ["fib", "gcd", "loop", "primes", "primes2", "strloop"]
 
 # The universe is the PRODUCT, as in SQLite: the test harness and the
 # intrusive instrumentation are not measured. A test's failure arm never
@@ -87,7 +98,7 @@ def build_config(binary):
 
 def run(cmd, env, timeout):
     p = subprocess.run(cmd, capture_output=True, text=True, env=env,
-                       timeout=timeout)
+                       timeout=timeout, stdin=subprocess.DEVNULL)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -378,8 +389,17 @@ def main():
             ok = True
             fails = []
             for group in cmds:
-                results = [run([binary] + c, dict(env, **extra), args.timeout)
+                results = [run([binary] + c,
+                               dict(env, **extra,
+                                    **({} if name == "-rt"
+                                       else {"MYLANG_INT_CENSUS": "1"})),
+                               args.timeout)
                            for c, extra in group]
+                for (c, extra), r in zip(group, results):
+                    for l in r[2].splitlines():
+                        if l.startswith("census LEAK"):
+                            ok = False
+                            fails.append("`%s`: %s" % (" ".join(c), l))
                 if name == "-rt":
                     for l in results[0][1].splitlines():
                         if l.startswith(("Tests passed", "Differential")):
@@ -430,6 +450,23 @@ def main():
                         if int(queries) > 0:
                             cov.add("site:" + site)
                 covered_by[name] = cov
+
+        # the corpus census (5): not a coverage unit - an oracle pass
+        corpus = sorted(glob.glob(os.path.join(HERE, "functional", "*.my")))
+        corpus += [os.path.join(ROOT, "samples", s) for s in CENSUS_SAMPLES]
+        leaks = 0
+        for prog in corpus:
+            for eng in ([], ["-tw"]):
+                r = run([binary] + eng + [prog],
+                        dict(env, MYLANG_INT_CENSUS="1"), args.timeout)
+                for l in r[2].splitlines():
+                    if l.startswith("census LEAK"):
+                        leaks += 1
+                        failures.append("census: %s %s: %s" % (
+                            " ".join(eng) or "default",
+                            os.path.relpath(prog, ROOT), l))
+        print("  object census: %d corpus program(s) x 2 engines, %d leak "
+              "line(s)" % (len(corpus), leaks))
 
         totals = {}
         if os.path.exists(census):

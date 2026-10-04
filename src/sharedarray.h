@@ -101,7 +101,7 @@ private:
 
     struct SharedObject final : RefCounted {
 
-        ML_POOL_NEW_DELETE
+        ML_POOL_NEW_DELETE_K(IOK_ARR)
 
 
         Storage kind;

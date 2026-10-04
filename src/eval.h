@@ -913,7 +913,7 @@ class FuncObject : public RefCounted {
 
 public:
 
-    ML_POOL_NEW_DELETE
+    ML_POOL_NEW_DELETE_K(IOK_FUNC)
 
     /*
      * The function's RUNTIME identity (funcdesc.h) - NOT an AST node. Binding,

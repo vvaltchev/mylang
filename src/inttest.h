@@ -65,6 +65,14 @@ uint64_t int_hits(IntSite s);
 void int_note_query(IntSite s);                     /* a test READ it */
 const std::vector<std::string> &int_events(IntSite s);
 void int_reset();                                   /* every site */
+/* #107 P4: mark the object census's baseline (main, before any program) */
+void int_census_mark();
+/* ...and the program is ending through exit(): main's locals stay alive,
+ * so the census has nothing to compare */
+void int_census_exiting();
+/* the live count of one object kind ("str", "arr", "dict", "struct",
+ * "func", "exc"), or -1 for an unknown name - `int_live(kind)` */
+long long int_live_count(const std::string &kind);
 
 /*
  * THE DECISION ENUMERATOR (plan section 4.2): a heuristic with several

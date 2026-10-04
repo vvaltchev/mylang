@@ -40,6 +40,25 @@ EvalValue builtin_int_hits(EvalContext *ctx, const ArgLocs *exprList,
     return static_cast<int_type>(int_hits(int_builtin_site(exprList, args, n)));
 }
 
+/* int_live(kind): how many runtime heap objects of `kind` ("str", "arr",
+ * "dict", "struct", "func", "exc") are alive right now - the object census
+ * (#107 P4), so a test can assert that what it built is freed. */
+EvalValue builtin_int_live(EvalContext *ctx, const ArgLocs *exprList,
+                           const EvalValue *args, size_t n)
+{
+    if (n != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+    const ArgLoc *arg = exprList->arg(0);
+    if (!args[0].is<SharedStr>())
+        throw TypeErrorEx("Expected an object kind (str)", arg->start,
+                          arg->end);
+    const long long c =
+        int_live_count(std::string(args[0].get<SharedStr>().get_view()));
+    if (c < 0)
+        throw InvalidArgumentEx(arg->start, arg->end);
+    return static_cast<int_type>(c);
+}
+
 /* int_events(site): the events themselves, each in its canonical one-line
  * form (`inline_ast engine="expr" callee="f" ...`), SORTED. Not program
  * order: some passes walk a pointer-keyed map (the bytecode splice runs

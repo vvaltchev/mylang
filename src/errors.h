@@ -238,7 +238,7 @@ struct RuntimeException : public Exception {
      * `throw X` value still uses the EH runtime's own allocation - only
      * explicit new/clone routes through this.)
      */
-    ML_POOL_NEW_DELETE
+    ML_POOL_NEW_DELETE_K(IOK_EXC)
 
     RuntimeException(const char *name,
                      const char *msg,
