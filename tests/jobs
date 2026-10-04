@@ -11,7 +11,7 @@
 #   tests/jobs policy           print the policy `run` would apply
 #
 # Every parallel tool asks THIS script (corpus_diff, norec_sweep,
-# norec_enum, run_battery), so the formula lives in one place.
+# norec_enum, run), so the formula lives in one place.
 #
 # WORKERS.  nproc - max(2, nproc/8), at least 1: a 24-core box runs 21,
 # leaving three cores for whoever is sitting at the machine.  Override
@@ -47,7 +47,7 @@
 # caps below exist so that stays true on a box with fewer GB per core:
 #     rtcap    = max(1, jobs / 3)   concurrent -rt runs
 #     buildcap = max(1, jobs / 3)   concurrent builds, each `make -j`
-#                                   jobs / (lanes built), run_battery
+#                                   jobs / (lanes built), tests/run
 
 ncpu() {
     n=$(nproc 2>/dev/null) ||
