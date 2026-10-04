@@ -9631,6 +9631,22 @@ static std::string jit_int_func()
 {
     return g_cur_caller_desc ? jit_int_fn_name(g_cur_caller_desc) : "main";
 }
+/* #107 P3: a call site's FRAMELESS protocol as an enumerated decision -
+ * the push is the general tier, so declining is always legal. Asked
+ * inside the one predicate every consumer shares (the site, the fusion
+ * decision, the pre-passes), keyed by the site's source position, so a
+ * forced decline is the same answer to all of them. */
+static bool jit_int_frameless_declined(const Chunk &ck,
+                                       size_t old_pc) noexcept
+{
+    Loc ls, le;
+    ck.loc_at(old_pc, ls, le);
+    const std::string key = "frameless@" + std::to_string(ls.line) + ":"
+                          + std::to_string(ls.col);
+    const int pick = int_choose(key, 2, 0);
+    ML_INT(frameless_choice, key, int64_t(2), int64_t(0), int64_t(pick));
+    return pick == 1;
+}
 /* a slot by its source name: a local's name, `tN` for the Nth temp */
 static std::string jit_int_var_name(const Chunk &ck, int slot,
                                     const FuncDescriptor *desc =
@@ -10043,6 +10059,8 @@ static int jit_frameless_candidates(const Chunk &ck, size_t old_pc,
         why = "not baked";
     for (int i = 0; i < n && !why; i++)
         why = jit_frameless_callee_why(out[i], in, with_placement);
+    ML_INT_ONLY(if (!why && jit_int_frameless_declined(ck, old_pc))
+                    why = "declined (MYLANG_INT_CHOOSE)";)
     if (fl_why)
         *fl_why = why;
     return why ? 0 : n;
