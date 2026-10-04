@@ -810,7 +810,7 @@ std::string render_ins(const DecodedIns &d, const SlotNamer &nm,
 void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
                 std::string &cmt, const SlotNamer &nm,
                 const void *ti, const void *tf, const void *ta,
-                DecodedIns *di = nullptr)
+                DecodedIns *di = nullptr, bool render = true)
 {
     const uint32_t start = p;
     DecodedIns D;
@@ -1186,7 +1186,8 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
     (void)pf_f2; (void)pf_66;
     D.ok = true;
     D.len = p - start;
-    out = render_ins(D, nm, ti, tf, ta);
+    if (render)                  /* decode_ins wants the structure only */
+        out = render_ins(D, nm, ti, tf, ta);
     if (di) *di = D;
     return;
     }
@@ -2697,4 +2698,59 @@ std::string highlight_disasm(const std::string &plain)
         start = nl + 1;
     }
     return out.str();
+}
+
+void decode_ins(const uint8_t *code, uint32_t n, uint32_t &p,
+                DecodedIns &out)
+{
+    std::string mn, cmt;
+    static const SlotNamer nm = [](int i) {
+        return "s" + std::to_string(i);
+    };
+    decode_one(code, n, p, mn, cmt, nm, nullptr, nullptr, nullptr, &out,
+               /*render=*/false);
+}
+
+uint32_t decoded_gp_writes(const DecodedIns &d)
+{
+    const std::string &m = d.mn;
+    const auto gp = [&](int i) -> uint32_t {
+        if (i >= d.n)
+            return 0;
+        const DecOp &o = d.ops[i];
+        if (o.kind == DecOp::Gpr || o.kind == DecOp::Gpr32
+                || o.kind == DecOp::Gpr8)
+            return 1u << o.reg;
+        return 0;
+    };
+    if (m.empty())
+        return 0;
+    /* the forms that write NO general register (an xmm destination is
+     * handled by gp() returning 0 for a non-GP operand); dispatched on
+     * the first letter, since this runs on every emitted instruction
+     * of every ASSERTS build */
+    const uint32_t RAX = 1u << 0, RDX = 1u << 2;
+    switch (m[0]) {
+    case 'j':
+        return 0;                                /* jmp / jcc */
+    case 'c':
+        if (m == "cmp" || m == "call")
+            return 0;
+        if (m == "cqo" || m == "cdq")
+            return RDX;
+        break;
+    case 't': if (m == "test") return 0; break;
+    case 'p': if (m == "push") return 0; break;
+    case 'r': if (m == "ret") return 0; break;
+    case 'n': if (m == "nop") return 0; break;
+    case 'u': if (m == "ucomisd") return 0; break;
+    case 'd': if (m == "div") return RAX | RDX; break;
+    case 'm': if (m == "mul") return RAX | RDX; break;
+    case 'i':
+        if (m == "idiv" || (m == "imul" && d.n == 1))
+            return RAX | RDX;
+        break;
+    default: break;
+    }
+    return gp(0);
 }

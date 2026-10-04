@@ -106,6 +106,14 @@ them means anything:**
   default run alike until 2026-10-02). `MYLANG_VDJ_HEX=1`
   puts the raw bytes in the dump, which is what makes the check
   possible.
+  **⛔ THE SAME DECODER IS NOW REGTRACK's GROUND TRUTH (2026-10-02):**
+  every ASSERTS build decodes every byte the JIT emits
+  (`Emitter::trk_scan_writes`) and aborts on an undecodable byte or
+  on a general-register write no `wrote()` declared. So a new emitted
+  form must be taught to `decode_one` (and `decoded_gp_writes`, if it
+  writes implicitly) before any checked build can emit it, and a
+  GP-writing raw-byte sequence must call `wrote()` - see
+  docs/jit-optimizations.md, *REGTRACK DECODES EVERY EMITTED BYTE*.
 - **`-vd`** (disasm.cpp) - what bytecode was emitted. Oracle:
   `myv_round_trip` (a loaded image vs a fresh compile).
 - **`-s` / `-a` / `-dti`** - what the optimizers did to the tree.
