@@ -2048,10 +2048,12 @@ catches a JIT abort (a mixed-kind call chain tripping `jit_ret_audit`)
 that `-rt` passes straight through, and the Net 3 enumeration catches a
 `ref_slots` leak that BOTH miss. Four jobs, in parallel with the fast
 lanes so an `-rt` failure still reports quickly:
-- **differential** (Debug, ASan+UBSan+hardening): `corpus_diff.sh`
-  plain AND `--levers`, `norec_enum.py --depth 3`,
-  `norec_sweep.py`, `nested_fuzz.py`, `bt_oracle.py` (#38: inlining
-  never changes a backtrace), the `vdjcmp` self-test;
+- **differential** (Debug, ASan+UBSan+hardening): `corpus_diff.sh`,
+  `norec_enum.py --depth 3`, `norec_sweep.py`, `bt_oracle.py` (#38:
+  inlining never changes a backtrace), the `vdjcmp` self-test;
+- **differential-levers-fuzz** (the same build): `corpus_diff.sh
+  --levers` and `nested_fuzz.py`, the two longest steps, split out so
+  the halves run side by side;
 - **disasmcheck** (the same Debug build), `scripts/disasmcheck.py
   --matrix` split three ways by `--shard I/3` - as a `differential`
   step it was 34 of that job's 57 minutes and set the workflow's wall
@@ -2072,7 +2074,8 @@ tier 3 and `tests/int_select.py --with-rt`, each a checkbox - minutes
 locally, an hour or more on a hosted runner. (Measured 2026-10-03: the
 push workflows finish in Linux 8.7 min, Coverage 3.8, Windows and macOS
 2 each, Nets 57 min - all of it `differential`, whose `disasmcheck`
-step was 34; that step is its own three-shard job since.)
+step was 34; that step is its own three-shard job since, which made
+Nets 31 min with `differential` at 28 - itself split in two since.)
 
 **LOCALLY, THE WHOLE BATTERY IS ONE COMMAND: `tests/run_battery.py`
 (2026-09-27).** It builds the six lanes (dbg, clang, rel-hard, release

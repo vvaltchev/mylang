@@ -55,11 +55,6 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: $GITHUB_WORKSPACE/scripts/vdjcmp.sh ./mylang ./mylang
 
-    # the same corpus with each JIT lever forced off, one at a time
-    - name: corpus_diff --levers
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --levers
-
     # #38 repro B: with inlining ON, every CLI configuration (the JIT
     # levers, the splice off, a .myv image, --no-opt all) must render
     # the backtrace and caret `-ni -tw` renders. An engine differential
@@ -82,6 +77,31 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: python3 $GITHUB_WORKSPACE/tests/norec_sweep.py ./mylang
            --max-events 25
+
+  # ---------------------------------------------------------------- #
+  # The two longest steps of `differential`, on the same Debug build in
+  # a job of their own, so the two halves run side by side: the corpus
+  # under every JIT lever turned off, and the random nested fuzzer.
+  # ---------------------------------------------------------------- #
+  differential-levers-fuzz:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure
+      run: cmake -E make_directory ${{github.workspace}}/build
+    - name: CMake
+      working-directory: ${{github.workspace}}/build
+      run: cmake -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
+           $GITHUB_WORKSPACE
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      run: cmake --build . -j
+
+    # the same corpus with each JIT lever forced off, one at a time
+    - name: corpus_diff --levers
+      working-directory: ${{github.workspace}}/build
+      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --levers
 
     # random deep-nested programs against a CPython twin, all engines
     - name: nested_fuzz
