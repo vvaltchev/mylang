@@ -433,8 +433,12 @@ assertions on values.
   and every registered view is a slice of it. Watched: copy-assign not
   registering (sl.my and four corpus programs abort at the op) and an
   overwrite not unregistering (a stale entry, caught at the next op).
-  The enumerator's 83,064 deviations and int_run pass. NOT built yet:
-  refcount sanity.
+  The enumerator's 83,064 deviations and int_run pass.
+  **Fourth increment, REFCOUNTS (2026-10-03):** no object counts fewer
+  handles than the owning (non-borrowed) slots of the frame holding it.
+  Watched: a MoveV copying a reference without a retain aborts four
+  corpus programs at the next op. With this the VM half of 4.3 is done
+  except the pinned-register comparison, which needs the JIT probe (P5).
 - **P5 - JIT preserving probe stub** + the per-op register map.
 - **P6 - chunk hook + assembler**; build the three splice-gate tests.
 - **P7 - per-site forcing sweep.**

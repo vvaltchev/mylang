@@ -1385,6 +1385,57 @@ static int int_op_result_kind(const Instr &in) noexcept
     }
 }
 
+/* A slot's reference as (the refcounted object, its count); false for a
+ * value that holds no count. Reads through get_ref: get<T>() copies the
+ * handle, and the copy's own count would be part of the answer. */
+static bool int_ref_count(const EvalValue &v, const void *&id,
+                          long &cnt) noexcept
+{
+    switch (v.get_type()->t) {
+    case Type::t_str: {
+        const SharedStr &h = v.get_ref<SharedStr>();
+        id = &h.get_ref();
+        cnt = h.use_count();
+        return true;
+    }
+    case Type::t_arr: {
+        const SharedArrayObj &h = v.get_ref<SharedArrayObj>();
+        id = h.int_storage();
+        cnt = h.use_count();
+        return true;
+    }
+    case Type::t_dict: {
+        const auto &h = v.get_ref<intrusive_ptr<DictObject>>();
+        id = h.get();
+        cnt = h.use_count();
+        return true;
+    }
+    case Type::t_struct: {
+        const auto &h = v.get_ref<intrusive_ptr<StructObject>>();
+        id = h.get();
+        cnt = h.use_count();
+        return true;
+    }
+    case Type::t_func: {
+        const auto &h = v.get_ref<intrusive_ptr<FuncObject>>();
+        id = h.get();
+        cnt = h.use_count();
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+/* (object, count, slot) per owning reference slot - reused, so the check
+ * allocates only while the largest frame seen grows */
+struct IntRefSlot {
+    const void *id;
+    long cnt;
+    int slot;
+};
+static std::vector<IntRefSlot> g_int_refs;
+
 /* The op this frame ran last, so the next check can read its dst. */
 static const Chunk *g_int_vms_ck = nullptr;
 static const Frame *g_int_vms_fr = nullptr;
@@ -1422,7 +1473,35 @@ static void int_vm_state_check(const Chunk &ck, const EvalContext &ctx,
             if (const char *f = v.get_ref<SharedArrayObj>()
                                     .int_slice_fault())
                 int_vm_state_fail(ck, pc, i, f);
+        IntRefSlot r;
+        if (ref && !lv.jit_borrowed_probe()
+                && int_ref_count(v, r.id, r.cnt)) {
+            r.slot = i;
+            g_int_refs.push_back(r);
+        }
     }
+    /*
+     * REFCOUNT SANITY: every slot that owns a reference (not borrowed)
+     * holds one count of it, so no object may count fewer handles than
+     * the slots of this frame holding it - a missing retain shows here,
+     * at the op that made it, rather than as a use-after-free later.
+     */
+    std::sort(g_int_refs.begin(), g_int_refs.end(),
+              [](const IntRefSlot &a, const IntRefSlot &b) {
+                  return a.id < b.id;
+              });
+    for (size_t i = 0; i < g_int_refs.size();) {
+        size_t j = i;
+        while (j < g_int_refs.size()
+               && g_int_refs[j].id == g_int_refs[i].id)
+            j++;
+        if (g_int_refs[i].cnt < static_cast<long>(j - i))
+            int_vm_state_fail(ck, pc, g_int_refs[i].slot,
+                              "an object counts fewer handles than the "
+                              "slots of this frame holding it");
+        i = j;
+    }
+    g_int_refs.clear();
     /*
      * THE PROVEN TYPES. A loaded image's proofs are input, not facts
      * (the audits' rule, CLAUDE.md #142), so only our own bytecode.
