@@ -2432,6 +2432,9 @@ output AND rendered error) and `tests/corpus_diff`'s `-nc` pass.
 ```
 ./build/mylang -rt               # run the whole suite (needs a TESTS=1 build)
 ./build/mylang -rt -s            # same, but dump the tree of a failing test
+./build/mylang -rt --list        # print every case's name (what [ RUN ] says)
+./build/mylang -rt --only REGEX  # run only the cases the regex finds, in all
+                                 # five modes; matching nothing is a failure
 ./build/mylang --weights         # inlining cost-model calibration (any build;
                                  # use OPT=1 ASSERTS=0 for meaningful numbers)
 ```
@@ -2476,8 +2479,12 @@ Tests are **not** a separate framework — they are entries in the `tests` table
 a name, a list of source-line strings, and an optional `&typeid(ExpectedEx)`.
 `check()` lexes+parses+evals the joined source lines. A test **passes** if it
 throws nothing — or, when an expected exception type is given, throws *exactly*
-that type (compared via `&typeid(e) != t.ex`). There is no single-test CLI
-selector; `-rt` runs all of them and `exit(1)`s if any fail. Add a test by
+that type (compared via `&typeid(e) != t.ex`). `-rt` runs all of them and
+`exit(1)`s if any fail; `-rt --only REGEX` runs the cases whose name the
+regex finds (a `repl:` case by its `repl: ` name) - how `tests/run`
+reproduces one failure - and `--list` prints what it would select. Its
+options come AFTER `-rt` (it used to run the moment it was parsed, which
+silently dropped the documented `-rt -s`). Add a test by
 appending an entry to that table (no registration needed). Note the expected
 exception is matched against the *static* C++ type; a user-level
 `throw <struct>` always surfaces as `ExceptionObject` (a.k.a.

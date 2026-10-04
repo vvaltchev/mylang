@@ -79,7 +79,7 @@ lex_all()
     lexer(source, 1, tokens);
 }
 
-void run_tests(bool dump_syntax_tree);
+void run_tests(bool dump_syntax_tree, int argc, char **argv);
 
 /*
  * `-v`: report HOW THIS BINARY WAS BUILT.
@@ -309,7 +309,8 @@ void help()
          << endl;
 
 #ifdef TESTS
-    cout << "  -rt      Run unit tests" << endl;
+    cout << "  -rt      Run unit tests  (then: --list, --only REGEX, -s)"
+         << endl;
 #endif
 }
 
@@ -391,7 +392,12 @@ parse_args(int argc, char **argv)
 
         } else if (!strcmp(arg, "-rt")) {
 
-            run_tests(opt_show_syntax_tree); exit(0);
+            /*
+             * The arguments AFTER -rt are the test harness's own options
+             * (--list, --only REGEX, -s): tests.cpp parses them, so they
+             * add no branch to the product code the coverage gate counts.
+             */
+            run_tests(opt_show_syntax_tree, argc - 1, argv + 1); exit(0);
 
         } else if (!strcmp(arg, "--weights")) {
 
