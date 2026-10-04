@@ -3,7 +3,7 @@
 #
 # SELECTION AND REDUCTION (#107 P8, plans/intrusive-tests.md section 9).
 #
-#   tests/int_select.py GCOV_INT_BINARY [--configs default,-nj,...]
+#   tests/int_select GCOV_INT_BINARY [--configs default,-nj,...]
 #                       [--programs-file F] [--with-rt] [--jobs N]
 #                       [--out FILE.json] [--shrink NAME[,NAME...]]
 #                       [--shrink-dir DIR]   (NAME: a selected test, or a
@@ -17,7 +17,7 @@
 #   1. EXPLORATION. Every CANDIDATE - a program x a configuration (an
 #      engine flag and/or KEY=VALUE environment) - runs ONCE on a GCOV
 #      INT build and gets its coverage vector: the branch outcomes and
-#      MC/DC conditions of src/ (int_run.py's universe, so INT helpers
+#      MC/DC conditions of src/ (int_run's universe, so INT helpers
 #      and tests.cpp are outside it) plus the int sites it READ. Each run
 #      is also an ORACLE run: its stdout and exit code must equal the
 #      tree-walker's on the same program, or the candidate is EXCLUDED
@@ -41,14 +41,14 @@
 #      tree is changed.
 #
 # Candidates by default: tests/functional/*.my, the non-interactive
-# samples, tests/bt_oracle/*.my (whose ERRORS are the output), each under
+# samples, tests/backtrace/*.my (whose ERRORS are the output), each under
 # every --configs entry (default: the default engine, -nj, -tw,
 # MYLANG_JIT_OFF=lsra, MYLANG_NO_LOWMEM=1, -nbi, -nbi -nj, --no-opt all and
 # -tw --no-opt all - the last four the configurations nested_fuzz runs, and
 # the only route to the code behind those flags; a config word with no `=`
 # that is not a flag is the previous flag's argument). --with-rt adds `-rt` as
 # one candidate (minutes on a debug build). Runs through
-# tests/testrun.py: heartbeat, control socket, resume.
+# tests/lib/testrun.py: heartbeat, control socket, resume.
 
 import argparse
 import concurrent.futures as cf
@@ -65,8 +65,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-sys.path.insert(0, HERE)
-import int_run  # noqa: E402
+sys.path.insert(0, os.path.join(HERE, "lib"))
+import intcov  # noqa: E402
 from testrun import Run, Monitor, fingerprint, file_digest  # noqa: E402
 
 SAMPLES = ["fib", "gcd", "loop", "primes", "primes2", "strloop"]
@@ -84,7 +84,7 @@ JOBS = [0]
 
 def jobs_count():
     try:
-        out = subprocess.run([os.path.join(HERE, "jobs.sh"), "count"],
+        out = subprocess.run([os.path.join(HERE, "jobs"), "count"],
                              capture_output=True, text=True, timeout=30)
         return max(1, int(out.stdout.strip()))
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -130,7 +130,7 @@ def _collect(objdir, scratch, tool):
     # candidate threads it ran one CPU at a time under the GIL - the
     # whole pass was bound by it (a fuzz-coverage run of the same shape
     # measured ~10x slower that way)
-    return int_run.collect(objdir, scratch, {}, tool)
+    return intcov.collect(objdir, scratch, {}, tool)
 
 
 def mirror_build(build_dir, prefix):
@@ -155,7 +155,7 @@ class Explorer:
         self.build_dir = os.path.dirname(binary)
         self.tmp = tmp
         self.timeout = timeout
-        self.tool = int_run.gcov_tool(int_run.build_config(binary))
+        self.tool = intcov.gcov_tool(intcov.build_config(binary))
         self.refs = {}              # program -> tree-walker (rc, stdout)
         self.pool = cf.ProcessPoolExecutor(
             int_select_jobs(),
@@ -166,7 +166,7 @@ class Explorer:
         shrink trial can delete a loop's increment and never end."""
         if prog not in self.refs:
             try:
-                r = int_run.run([self.binary, "-tw", prog],
+                r = intcov.run([self.binary, "-tw", prog],
                                 dict(os.environ), timeout or self.timeout)
                 self.refs[prog] = (r[0], r[1])
             except subprocess.TimeoutExpired:
@@ -313,7 +313,7 @@ def main():
     args = ap.parse_intermixed_args()
     binary = os.path.abspath(args.binary)
 
-    cfg = int_run.build_config(binary)
+    cfg = intcov.build_config(binary)
     if cfg.get("int_tests") != "1" or not glob.glob(
             os.path.join(os.path.dirname(binary), "*.gcno")):
         print("int_select: %s is not a GCOV INT_TESTS build (make GCOV=1 "
@@ -325,7 +325,7 @@ def main():
     else:
         progs = sorted(glob.glob(os.path.join(HERE, "functional", "*.my")))
         progs += [os.path.join(ROOT, "samples", s) for s in SAMPLES]
-        progs += sorted(glob.glob(os.path.join(HERE, "bt_oracle", "*.my")))
+        progs += sorted(glob.glob(os.path.join(HERE, "backtrace", "*.my")))
     configs = [c.strip() for c in args.configs.split(",") if c.strip()]
     cands = [Candidate(p, c) for p in progs for c in configs]
     if args.with_rt:

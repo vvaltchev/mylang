@@ -3,7 +3,7 @@
 # FROM nested_fuzz (seed 150, program 149 of the CI run
 # `--count 250 --seed 1`), kept as a fixed test because it
 # reached coverage nothing else does (under -nj);
-# shrunk by `tests/int_select.py --shrink`, then every
+# shrunk by `tests/int_select --shrink`, then every
 # top-level variable printed at the end (observe_globals), so
 # the engines are compared on the VALUES, not on reaching the
 # code. Generated, not hand-written: do not tidy it.

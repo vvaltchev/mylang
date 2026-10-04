@@ -59,7 +59,7 @@ code in this repository.
 >
 >       make -j BUILD_DIR=build-claude/dbg TESTS=1 OPT=0
 >       ./build-claude/dbg/mylang -c samples/gcd -o /tmp/gcd.myv
->       tests/myv_doc_check.py /tmp/gcd.myv
+>       tests/myv_doc_check /tmp/gcd.myv
 >
 >   That script is written from the DOCUMENT and deliberately not from
 >   `serialize.cpp`; consuming an image to exactly EOF is what proves the doc
@@ -102,7 +102,7 @@ fact, and which must therefore be correct before anything built on
 them means anything:**
 
 - **`-vdj`** (disasm.cpp) - what machine code was emitted. Oracle:
-  **`scripts/disasmcheck.py`**, which cross-checks EVERY emitted
+  **`scripts/disasmcheck`**, which cross-checks EVERY emitted
   instruction against **objdump** - both the BOUNDARIES (a wrong length
   desynchronises the rest of the fragment), the mnemonics, and EVERY
   OPERAND - register names (GP and xmm) at their encoded width, memory
@@ -154,14 +154,14 @@ them means anything:**
   `myv_round_trip` (a loaded image vs a fresh compile).
 - **`-s` / `-a` / `-dti`** - what the optimizers did to the tree.
   Oracle: the `analyze:` `-rt` entry.
-- **`scripts/vdjcmp.sh`** - "is my JIT change a pure restructuring?"
+- **`scripts/vdjcmp`** - "is my JIT change a pure restructuring?"
   Oracle: a SELF-TEST - one binary against itself must be 124/124.
   **⛔ IT RUNS IN CI NOW (`nets.yml`, the differential job), because
   for one day it was correctly REFUSING every comparison and nobody
   invoked it** (see the `-vdj` reproducibility note below). Two more
   layers cover the same property: `-rt`'s address-free invariant (which
   a new OPERAND FORM once walked straight past) and
-  `driver_checks.sh`'s two-process dump comparison.
+  `driver_checks`'s two-process dump comparison.
 - **`scripts/regcensus.py`** - how much work is left to free a
   register. Oracle: it DERIVES its accessor list from the source.
 - **`bench/run.py`** - is it faster. Oracle: RULE B1, the build-config
@@ -181,17 +181,17 @@ them means anything:**
   rsp. Oracle: it needs NO MODEL - which is the whole point, since the
   emitter's own `sp_depth`/`sp_mod` model is complete only while every
   rsp-moving emission goes through a `sp_move` seam, and a MISSING seam
-  would silence the very check it feeds. `corpus_diff.sh --spcheck` is
+  would silence the very check it feeds. `corpus_diff --spcheck` is
   its lane, and it belongs on an **`OPT=1 ASSERTS=0`** build as much as
   a debug one: the first bug it caught was invisible to every checked
   build (see *THE 16-ALIGNMENT RULE* below).
-- **`tests/corpus_diff.sh`** - do the engines agree. Oracle: the
+- **`tests/corpus_diff`** - do the engines agree. Oracle: the
   `--levers` / `--cold` / `--xrot` / `--nolowmem` / `--spcheck`
   matrices (several may be given in ONE run; the plain part and the
   tree-walker references then run once).
   **IT IS PARALLEL, AND ITS REPORT IS THE SERIAL ONE (2026-09-27).**
   Every (configuration x program) run is its own process, run up
-  front `tests/jobs.sh count` at a time; the report is then printed
+  front `tests/jobs count` at a time; the report is then printed
   from the saved outputs in the serial order, BYTE-IDENTICAL to the
   one-at-a-time script (checked for every mode on the debug binary:
   `--levers` 419 s -> 30 s). The tree-walker reference runs ONCE per
@@ -236,7 +236,7 @@ them means anything:**
   sabotage build. Note ⊥ ("nothing can reach here") and ⊤ ("I do not
   know") are DIFFERENT answers and both are pinned - collapsing them
   is the flaw in `StaticType::finfos` that this replaces.
-- **`tests/myv_doc_check.py`** - is `docs/myv-format.txt` still the
+- **`tests/myv_doc_check`** - is `docs/myv-format.txt` still the
   spec. Oracle: it is written from the DOC, not from serialize.cpp.
 - **`scripts/jitprofile.py` + `MYLANG_JIT_MAP=<path>`** - WHICH
   EMITTED INSTRUCTION does the JIT spend its instructions on. It joins
@@ -268,7 +268,7 @@ repo, all found in one week, all the same shape:
    bytes** corpus-wide — six missing opcodes and a SIB decoder that
    never consumed its displacement — and printed confident wrong
    mnemonics rather than admitting it. The first response was to mask
-   the symptoms in `vdjcmp.sh` with a sed pipeline plus `setarch -R`.
+   the symptoms in `vdjcmp` with a sed pipeline plus `setarch -R`.
    The mask was hex-only, #96 step 3 made the values decimal, and from
    that day the script reported **0 identical / 108 differing for every
    comparison** — it had stopped being an oracle and looked exactly
@@ -302,7 +302,7 @@ already exists so a new one can copy it:
     real instruction boundary, so stepping past one proves the decode
     drifted) and prints a banner. `run.py` prints its
     `mylang : <path>` header and refuses a wrong build config.
- 3. **IT SELF-TESTS.** `vdjcmp.sh` compares a binary with ITSELF and
+ 3. **IT SELF-TESTS.** `vdjcmp` compares a binary with ITSELF and
     exits 2 if that is not identical — otherwise it cannot distinguish
     "your change altered the code" from "the tool broke", and it
     reported the second as the first for weeks.
@@ -532,12 +532,12 @@ unchanged. It IMPLIES `TESTS` (defs.h `#error`s on a hand-rolled
 `-DINT_TESTS` without it). **It is never a measurement subject:**
 `mylang -v` reports `int_tests 0/1` in every build, `bench/run.py`
 REFUSES a binary reporting `int_tests 1`, and the intrusive runner will
-refuse one reporting `0` (`driver_checks.sh` pins the line; set
+refuse one reporting `0` (`driver_checks` pins the line; set
 `MYLANG_EXPECT_INT_TESTS=1` when running it on an INT lane). Design and
 phases: `plans/intrusive-tests.md` - READ IT before adding a hook.
 **A site is one row of `src/intsites.h` plus one `ML_INT(site, ...)`
 line**, its payload typed and pointer-free (an event must print the same
-on every run); `tests/int_run.py BIN` runs `-rt`, every `tests/int/*.my`
+on every run); `tests/int_run BIN` runs `-rt`, every `tests/int/*.my`
 under both engines, and the SITE CENSUS - a site no run reaches FAILS, so
 add a site together with the test that reaches it (a site counts only when
 a test READS it through `int_*` - reaching it and asserting nothing checks
@@ -560,7 +560,7 @@ product function (keep an INT-only condition INSIDE the macro). A test
 program's header picks its runs: `# INT-ENGINES: default` for a codegen or
 JIT decision (the tree-walker never runs those passes),
 `# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra` for several environments.
-An engine is a name from `ENGINE_FLAGS` (int_run.py: `default`, `tw`,
+An engine is a name from `ENGINE_FLAGS` (int_run: `default`, `tw`,
 `nj`, `vm`, `nbi`, `noopt` = `--no-opt all`), two joined with `+`
 (`nbi+nj`); the engines of one configuration must print the same stdout.
 **`tests/int/repl/*.session` are REPL units:** each is fed to `--repl`
@@ -569,16 +569,16 @@ on stderr - the interactive front end (input loop, history, the line
 editor's off-TTY path), which `-rt`'s REPL tests never reach because
 they drive `ReplEngine` directly. They came from `repl_fuzz`
 (2026-10-04: 24 of its CI sessions reached 365 elements nothing else
-did); `int_run.py --update-repl` rewrites the `.expected` files (not
+did); `int_run --update-repl` rewrites the `.expected` files (not
 `.out`: .gitignore drops that extension).
 **A pass that may discard and redo its work records inside an
 `ML_INT_DEFER` scope** (the JIT's retry label has one): a discarded
 attempt then records nothing. The `int_*` builtins
 sort AFTER every other builtin, so an INT build moves no builtin slot;
 the `int` job in `nets.yml` checks the INT build emits byte-identical
-`-vdj` to a `TESTS` build (`vdjcmp.sh`) - an instrumented point may only
+`-vdj` to a `TESTS` build (`vdjcmp`) - an instrumented point may only
 READ the state it reports.
-**THE DECISION ENUMERATOR (P3, `tests/int_enum.py`).** A heuristic with
+**THE DECISION ENUMERATOR (P3, `tests/int_enum`).** A heuristic with
 several LEGAL answers asks `int_choose(key, n, dflt)` (inttest.h) and
 records a `reg_choice` instance; `MYLANG_INT_CHOOSE=key=idx` forces an
 alternative, and tier 1 re-runs every program once per alternative of
@@ -632,7 +632,7 @@ plain macro elsewhere); `int_live(kind)` reads a count, and with
 for any kind not back at its baseline (marked in `main` after
 `parse_args`; checked after `main`'s locals die, before any static
 destructor; an `exit()` ending prints `census skipped (exit)`).
-`int_run.py` fails on a LEAK line in every tests/int run and over the
+`int_run` fails on a LEAK line in every tests/int run and over the
 corpus under both engines. Pooled memory is reachable from the pool's
 free lists, so LeakSanitizer cannot see such a leak - this can (watched:
 a frame release that dropped closures without releasing them). A
@@ -702,7 +702,7 @@ than off a counter (a counter also counts the program's other sites).
 staging temp live after the call, a body reading its returned slot
 first, a call whose dst is its callee slot); removing any one gate now
 fails it, and nothing else.
-**SELECTION AND REDUCTION (P8, `tests/int_select.py`, offline - not
+**SELECTION AND REDUCTION (P8, `tests/int_select`, offline - not
 CI):** on a GCOV INT build, every candidate (program x configuration,
 `-rt` with `--with-rt`) runs once - in parallel, each under its own
 `GCOV_PREFIX` tree with the objects symlinked beside its counters - and
@@ -722,11 +722,11 @@ JSON is pure Python, and on the candidate threads the GIL made the pass
 elements; 64 tests cover them all, 83 s of runs against 210 s, and
 `-rt` alone owns 25,962.
 **EVERY TEST TOOL THAT CAN RUN FOR MORE THAN A MINUTE SERVES ITS
-PROGRESS (maintainer-set, 2026-10-04), and `tests/testctl.py` with no
+PROGRESS (maintainer-set, 2026-10-04), and `tests/testctl` with no
 arguments lists them all**, one line each: the PERCENTAGE, done/total,
-phase, elapsed, ETA, failures, what it is on now (`testctl.py watch`
+phase, elapsed, ETA, failures, what it is on now (`testctl watch`
 refreshes it; `status [RUN]` is the full JSON, whose `percent` field is
-the obvious one). Two server kinds in `tests/testrun.py`: a `Run`
+the obvious one). Two server kinds in `tests/lib/testrun.py`: a `Run`
 (independent ordered items: heartbeat, the control socket, stop / pause
 / `jobs N`, resume by a low-water-mark token - int_enum, int_select's
 exploration, mutate) and a `Monitor` (sequential phases or a loop: the
@@ -734,8 +734,8 @@ same socket, heartbeat line and status fields, fed by the tool's
 `advance()` / `phase()`, `status` only - int_run, nested_fuzz, myv_fuzz,
 repl_fuzz, norec_enum, norec_sweep, bt_oracle, disasmcheck,
 int_select's shrink, mutate's setup, run_battery). A SHELL tool runs
-`tests/testmon.py` beside it, which counts its result files
-(corpus_diff.sh). A new long tool gets one of the three; the heartbeat
+`tests/testmon` beside it, which counts its result files
+(corpus_diff). A new long tool gets one of the three; the heartbeat
 lines are the CI log's view of the same numbers.
 
 **Assertions: `ASSERTS` (default 1).** The C `assert()` + the project's
@@ -1097,7 +1097,7 @@ silently disabled the no-record tier at the one site that needs it.
 **AND THE FIX IS NOT "READ IT IF IT HAPPENS TO BE SET".** That makes
 the EMITTED CODE DEPEND ON COMPILATION ORDER, and the JIT's Pass B
 walks a POINTER-keyed map - so `-vdj` would stop being reproducible,
-which is precisely what `scripts/vdjcmp.sh` is. The elision is allowed
+which is precisely what `scripts/vdjcmp` is. The elision is allowed
 for exactly ONE caller, on a structural argument rather than on luck:
 **MAIN is compiled LAST**, after every function body, so every callee
 it can name is already placed (`bake_final`; a null
@@ -1299,7 +1299,7 @@ Three separate failures let that ship, and each earns a rule:
   three heavily and r9 essentially never. A bigger corpus does not fix
   this - the allocator's own preference is what hides the tail.
   **`MYLANG_JIT_XROT=N` rotates the pool** so member N is handed out
-  first; `corpus_diff.sh --xrot` runs the matrix, and the
+  first; `corpus_diff --xrot` runs the matrix, and the
   `jit_xcache_pins` `-rt` case sweeps every rotation in-process. Making
   r9 FIRST fails `-rt` in seconds - which is how it was found.
   **Generalise: when a resource is allocated in a fixed preference
@@ -1438,7 +1438,7 @@ Record, with the measurements and the seven watched sabotages:
 (2026-09-23).** Recursion depth is unspecified (RULE 2) - a tier may
 carve windows from the native stack and go deeper than the slot
 segment would - but it must still reach a CATCHABLE overflow, never a
-SIGSEGV, and the rest of the output must not change. `driver_checks.sh`'s
+SIGSEGV, and the rest of the output must not change. `driver_checks`'s
 *overflow* case runs five recursion shapes at four caps under `-nj` and
 five JIT configurations and compares everything but the depth. Its first
 run found two real bugs in the depth-cap SWITCH materializer, reachable
@@ -1457,7 +1457,7 @@ IDENTICAL text, and the new operand form was added without learning it.
 **THIS IS THE MOST INSTRUCTIVE INSTRUMENT FAILURE IN THE REPO, because
 the defences existed and each failed DIFFERENTLY:**
 
-1. **`vdjcmp.sh`'s SELF-TEST was correct and refused every comparison**
+1. **`vdjcmp`'s SELF-TEST was correct and refused every comparison**
    from that commit on ("the same binary gave two different dumps for
    samples/gcd"). It was not lying - it was shouting. **Nobody ran it.**
    A self-test that fires only when someone remembers is not a net; it
@@ -1476,7 +1476,7 @@ the defences existed and each failed DIFFERENTLY:**
    (a control transfer's operand is a fragment-RELATIVE offset).
 3. **Nothing checked the property END TO END.** `-rt` runs in-process,
    so it can only assert the invariant that IMPLIES reproducibility,
-   never reproducibility itself. `tests/driver_checks.sh` now spawns
+   never reproducibility itself. `tests/driver_checks` now spawns
    the binary twice and compares - the same split as every other
    driver-visible property.
 
@@ -1486,7 +1486,7 @@ the defences existed and each failed DIFFERENTLY:**
   A new addressing mode, a new immediate position, a new prefix: the
   rendering obligation (mask every baked address) attaches to it, and
   no existing check can be assumed to cover a shape it was not written
-  against. Run `scripts/vdjcmp.sh BIN BIN` - not only after a change
+  against. Run `scripts/vdjcmp BIN BIN` - not only after a change
   you believe is a pure restructuring.
 - **⛔ A SELF-TEST THAT IS NOT IN CI IS NOT A NET.** The whole point of
   one is that it fires without being asked. If a tool can check itself,
@@ -1502,7 +1502,7 @@ use it, and why the driver check compares the plain dump.)
 **⛔ `-vdj` IS REPRODUCIBLE - AND THE FOUR YEARS OF WORKAROUNDS THAT
 SAY WHY YOU MUST FIX A TOOL, NOT ITS CALLERS (2026-08-17).** Comparing
 two binaries' emitted code is a plain `cmp` now
-(`scripts/vdjcmp.sh OLD NEW`): baked addresses print as
+(`scripts/vdjcmp OLD NEW`): baked addresses print as
 `<int-tag>`/`<addr>`/`<helper>` - the operand SHAPE, which is all a
 reader or a differ needs - with the digits behind `MYLANG_VDJ_ADDRS=1`.
 
@@ -1514,7 +1514,7 @@ page lands. Every word was true and the whole approach was wrong:
  - **the masks rotted silently.** They were hex-only, and #96 step 3
    moved the Type singletons into a low-address arena so a tag encodes
    as an `imm32` - which the disassembler printed in DECIMAL. From that
-   day `vdjcmp.sh` reported **0 identical / 108 differing** for ANY
+   day `vdjcmp` reported **0 identical / 108 differing** for ANY
    pair of binaries. It was not an oracle; it was a constant
    "everything changed", and nobody noticed because that is also what a
    broken change looks like;
@@ -1544,7 +1544,7 @@ loop counts. Functional tests live in **`tests/functional/`** - tiny,
 self-asserting programs that CONSTRUCT the hazard shape on purpose
 (a reference parked in the very temp a float chain reuses, a
 ref-listed loop counter, each element tier and its decline) rather
-than hoping a benchmark happens to contain it. `tests/corpus_diff.sh`
+than hoping a benchmark happens to contain it. `tests/corpus_diff`
 runs those plus `samples/` in **0.2 seconds**, and its `--cold` matrix
 in 0.7. Write a new dedicated test for the construct under test; do
 not reach for a bench.
@@ -1572,7 +1572,7 @@ reference when the guarded op runs, so the cold arm is taken), and an
 EMITTER DECISION (which register the value is in - forwarding armed?
 result in xmm0 or xmm1? pinned?). Measured against that: `-rt` varies
 only the first, weakly (hand-written tests have few locals, so their
-temps rarely collide); `tests/nested_fuzz.py` varies control flow but
+temps rarely collide); `tests/nested_fuzz` varies control flow but
 is **INT-ONLY** by construction - it maintains a CPython twin, which
 forbids int `/`, negative `%`, >64-bit ints and dict iteration - so it
 can never build a reference/float temp collision; the 5-mode
@@ -1581,7 +1581,7 @@ varied axes 2 or 3. That is why TWO bugs in one day were green
 everywhere and both died instantly on a bench program (a real `main`
 reuses its low temps for argv/print AND for the hot loop - exactly the
 collision). Three nets now:
-- **`tests/corpus_diff.sh`** - tree-walker vs the default engine over
+- **`tests/corpus_diff`** - tree-walker vs the default engine over
   `tests/functional/` + samples (14 programs, 0.2s). RUN IT with -rt,
   rel-hard, clang and the fuzzer on any JIT/register batch.
 - **`MYLANG_JIT_COLD=tier[,...]`** - force a guarded tier's DECLINE arm
@@ -1794,7 +1794,7 @@ collision). Three nets now:
   skipped slots are `Chunk::ret_unflushed`, which the hardened
   `jit_ret_audit` skips, since a frameless window's never-written
   REGCALL parameter slot holds stale stack), `all`.
-  `tests/corpus_diff.sh BIN --levers`
+  `tests/corpus_diff BIN --levers`
   runs the whole matrix. NOTE a lever-off config FAILS `-rt` by
   design - the coverage tests assert their own lever ran - so the
   matrix runs against the CORPUS, not the suite.
@@ -1824,7 +1824,7 @@ collision). Three nets now:
   UNNECESSARY must not leave an argument behind claiming it is still
   LOADED.** Delete the parameter or honour it.
   **NET: the `nolowmem` JOB** (`.github/workflows/nets.yml`) - `-rt`
-  off-arena, `corpus_diff.sh --nolowmem` and `driver_checks.sh`, over
+  off-arena, `corpus_diff --nolowmem` and `driver_checks`, over
   TWO builds because they catch different things, MEASURED by
   reintroducing the defect: **debug+ASan/UBSan ABORTS (rc=134)** with a
   located report, **release `ASSERTS=OFF` SEGFAULTS (rc=139)** - the
@@ -1837,7 +1837,7 @@ collision). Three nets now:
   `lto 0` first).
 - **`MYLANG_JIT_XROT=N` - ROTATE THE ALLOCATOR'S SCAN** so a different
   one of several EQUALLY-WEIGHTED registers is met first
-  (`tests/corpus_diff.sh BIN --xrot` runs the matrix; `g_jit_xrot` is
+  (`tests/corpus_diff BIN --xrot` runs the matrix; `g_jit_xrot` is
   settable in-process, and `jit_xcache_pins` sweeps every rotation).
   `RegAlloc::take` scans in PREFERENCE order, so its last candidate is
   reached only by a run with the maximum pin count - which is how an
@@ -1923,7 +1923,7 @@ collision). Three nets now:
   power: it tests a gate's CORRECTNESS independently of its
   PROFITABILITY. `FORCE=flit` is how C4b's "correctness lives in
   emit_call_epilogue, not the gate" claim is checked.
-- **`tests/norec_coverage.py` - the NO-RECORD COVERAGE RATCHET (Net 4,
+- **`tests/norec_coverage` - the NO-RECORD COVERAGE RATCHET (Net 4,
   built 2026-08-13).** Reads gcov's JSON from the existing `-DGCOV=1`
   lane and reports LINE + BRANCH coverage of the tier's walk /
   reconstruction / verification surface, function by function (the
@@ -1944,7 +1944,7 @@ collision). Three nets now:
   `docs/jit-optimizations.md` for what is left and why. CI pins the
   current floor instead (`--min-lines`/`--min-branches`), so the
   surface can only improve.
-- **`tests/norec_enum.py` - the EXHAUSTIVE SMALL-SCOPE ENUMERATION
+- **`tests/norec_enum` - the EXHAUSTIVE SMALL-SCOPE ENUMERATION
   (Net 3, built 2026-08-13). NOT a fuzzer:** it emits EVERY program in
   a bounded shape space - depth 1-4 x per-level frame kind
   {plain, try, try/finally, dict-iter} x terminal {int, float, throw}
@@ -1978,7 +1978,7 @@ collision). Three nets now:
   It is an `extra_check`, not a `tests` entry, and that is FORCED: the
   differential reruns `tests` entries in the TREE-WALKER, which
   recurses on the C stack and overflows at this depth.
-- **`MYLANG_RECON_AT=N` + `tests/norec_sweep.py` - the NO-RECORD
+- **`MYLANG_RECON_AT=N` + `tests/norec_sweep` - the NO-RECORD
   tier's DETERMINISTIC EVENT SWEEP (Net 2, built 2026-08-13).** The
   G1 tier does not write a call record it can REBUILD later, and the
   rebuild runs only where an exception happens to fall - so its
@@ -2000,7 +2000,7 @@ collision). Three nets now:
   looks. The in-suite seed is the `Net 2` `-rt` entry (a few forced
   events, asserting frames were actually walked); the full sweep is
   the script, ~5.5 min over the default corpus serially - it runs a
-  process pool now (`tests/jobs.sh count`), each sweep submitting a
+  process pool now (`tests/jobs count`), each sweep submitting a
   small window of N values and reading them in order, so it stops
   exactly where the serial walk did and prints the same report.
 A fourth - forcing a guarded tier's DECLINE arm so a rare cold path
@@ -2071,20 +2071,20 @@ lanes carry as many checks as possible.
 
 **THE `Nets` LANE (`.github/workflows/nets.yml`, added 2026-08-13) runs
 everything `-rt` is BLIND TO.** Until it existed CI ran `-rt`,
-`driver_checks.sh` and `myv_doc_check.py` and nothing else — the
+`driver_checks` and `myv_doc_check` and nothing else — the
 differential corpus and all four fuzzers only ran when someone
 remembered to, by hand. That gap was not theoretical: `corpus_diff`
 catches a JIT abort (a mixed-kind call chain tripping `jit_ret_audit`)
 that `-rt` passes straight through, and the Net 3 enumeration catches a
 `ref_slots` leak that BOTH miss. Four jobs, in parallel with the fast
 lanes so an `-rt` failure still reports quickly:
-- **differential** (Debug, ASan+UBSan+hardening): `corpus_diff.sh`,
-  `norec_enum.py --depth 3`, `norec_sweep.py`, `bt_oracle.py` (#38:
+- **differential** (Debug, ASan+UBSan+hardening): `corpus_diff`,
+  `norec_enum --depth 3`, `norec_sweep`, `bt_oracle` (#38:
   inlining never changes a backtrace), the `vdjcmp` self-test;
-- **differential-levers-fuzz** (the same build): `corpus_diff.sh
-  --levers` and `nested_fuzz.py`, the two longest steps, split out so
+- **differential-levers-fuzz** (the same build): `corpus_diff
+  --levers` and `nested_fuzz`, the two longest steps, split out so
   the halves run side by side;
-- **disasmcheck** (the same Debug build), `scripts/disasmcheck.py
+- **disasmcheck** (the same Debug build), `scripts/disasmcheck
   --matrix` split three ways by `--shard I/3` - as a `differential`
   step it was 34 of that job's 57 minutes and set the workflow's wall
   time;
@@ -2105,7 +2105,7 @@ lanes so an `-rt` failure still reports quickly:
   tests/functional on an optimized `ASSERTS=ON` `INT_TESTS` build (the
   REGTRACK net live), after a vacuity guard on `mylang -v`.
 **`int-deep.yml` is ON DEMAND (workflow_dispatch):** the enumerator's
-tier 3 and `tests/int_select.py --with-rt`, each a checkbox - minutes
+tier 3 and `tests/int_select --with-rt`, each a checkbox - minutes
 locally, an hour or more on a hosted runner. (Measured 2026-10-03: the
 push workflows finish in Linux 8.7 min, Coverage 3.8, Windows and macOS
 2 each, Nets 57 min - all of it `differential`, whose `disasmcheck`
@@ -2113,7 +2113,7 @@ step was 34; that step is its own three-shard job since, which made
 Nets 31 min with `differential` at 28 - itself split in two since:
 Nets is 18 min.)
 
-**MUTATION TESTING IS ON DEMAND TOO (`mutate.yml`, `tests/mutate.py`,
+**MUTATION TESTING IS ON DEMAND TOO (`mutate.yml`, `tests/mutate`,
 2026-10-04).** Coverage says a test REACHED a line, never that it would
 FAIL if the line were wrong: `2*x` and `2+x` agree at x = 2. A mutant is
 one edit to product code (`<`/`<=`, `+`/`-`, `==`/`!=`, `&&`/`||`, a
@@ -2132,28 +2132,28 @@ changes; never locally beyond `--count 2` to check the tool.
 **LONG RUNS GO TO A MANUAL CI WORKFLOW, NOT THE LOCAL MACHINE AND NOT
 EVERY PUSH (maintainer-set, 2026-10-04).**
 
-**LOCALLY, THE WHOLE BATTERY IS ONE COMMAND: `tests/run_battery.py`
+**LOCALLY, THE WHOLE BATTERY IS ONE COMMAND: `tests/run_battery`
 (2026-09-27).** It builds the six lanes (dbg, clang, rel-hard, release
 and the two NON-JIT builds, those from a copy of the tree with jit.h's
 platform test flipped - never the src/jit.h other lanes compile) and
 runs `-rt` everywhere, driver_checks, corpus_diff in every mode, the
 vdjcmp self-test, disasmcheck, Nets 2 and 3 and the nested fuzzer as a
-DEPENDENCY GRAPH over `tests/jobs.sh count` cores, with per-step logs,
+DEPENDENCY GRAPH over `tests/jobs count` cores, with per-step logs,
 timeouts, a PRIVATE `$TMPDIR` per step (`-rt` writes fixed names such as
 `/tmp/mylang-myv-corrupt.myv`, so two lanes' suites sharing one `/tmp`
 fail each other - watched on its first run) and a PASS/FAIL summary.
 `--no-build` / `--bin LANE=PATH`
 point it at existing lanes (`perf`, an `OPT=1 ASSERTS=0` build, only
-that way); `--dry-run` prints the plan. **`tests/jobs.sh` is the ONE
+that way); `--dry-run` prints the plan. **`tests/jobs` is the ONE
 definition every parallel tool asks:** workers = nproc - max(2,
 nproc/8) (`MYLANG_TEST_JOBS` overrides), memory caps for concurrent
 `-rt` runs and builds (the measured peaks are in the file), and the
-priority - each tool re-execs itself ONCE through `jobs.sh run`, which
+priority - each tool re-execs itself ONCE through `jobs run`, which
 puts the whole tree in the IDLE scheduling and I/O classes (`chrt
 --idle 0`, `ionice -c3`), falling back silently to `nice -n 19` where
 those are refused (`MYLANG_TEST_IDLE=0` forces the fallback). A
 battery is background work: it must never slow the person at the
-keyboard. `tests/nested_fuzz.py` checks its programs on a thread pool
+keyboard. `tests/nested_fuzz` checks its programs on a thread pool
 of that size too (`--jobs`) and prints them in PROGRAM ORDER, so its
 report is byte-identical to the serial one for any job count (checked
 over 100 programs, and over a sabotaged binary's 13 divergences).
@@ -2322,12 +2322,12 @@ Running scripts:
                                  # (main with no map, no frameless pre-pass)
                                  # and showed a push the run never took;
                                  # pinned by the `-vd/-vdj's driver` -rt
-                                 # check and a driver_checks.sh case.
+                                 # check and a driver_checks case.
                                  # REPRODUCIBLE: a baked address prints as
                                  # <int-tag>/<addr>/<helper>, so two runs
                                  # and two separately-linked binaries give
                                  # byte-identical output and `cmp` is the
-                                 # whole comparison (scripts/vdjcmp.sh).
+                                 # whole comparison (scripts/vdjcmp).
                                  # MYLANG_VDJ_ADDRS=1 shows the numbers
                                  # when you need one specific pointer.
                                  # It SELF-REPORTS: a fragment it cannot
@@ -2425,7 +2425,7 @@ const CONTAINER it reads (`len(NAMES)`) is reachable at compile time only
 through a folded use, so `const T = f(5);` failed under -nc alone. Nets:
 the `parse: -nc ...` `-rt` entry
 (`const_fold_equivalence`: fold on/off x both engines, byte-identical
-output AND rendered error) and `tests/corpus_diff.sh`'s `-nc` pass.
+output AND rendered error) and `tests/corpus_diff`'s `-nc` pass.
 
 ## Tests
 
@@ -2439,9 +2439,11 @@ output AND rendered error) and `tests/corpus_diff.sh`'s `-nc` pass.
 **The standalone test tools (`tests/`) have their own
 `tests/CLAUDE.md`** - which tool runs where in CI, the progress API every
 long tool must serve, the reach-vs-check traps of shrinking and coverage,
-the tests/int unit formats, mutate.py's rules. READ IT before writing or
+the tests/int unit formats, mutate's rules. READ IT before writing or
 changing a test tool. `tests/README.md` is the human overview: keep it
-plain prose with space-aligned tables, readable on a console.
+plain prose with space-aligned tables, readable on a console, and a `$ `
+before each command. The tools have NO extension (755, a shebang); their
+shared Python code is `tests/lib/*.py`.
 
 **`--weights` — the inlining cost-model calibration** (`run_weight_bench`,
 eval.cpp). Measures the per-node-type eval cost of the tree-walker by building
@@ -2464,7 +2466,7 @@ validate, don't run") called `run_optimizers` only when it was going to
 FIX-1, the TDZ and the duplicate-decl check: `mylang -nr prog.my` exited 0
 in silence on a program `mylang prog.my` refuses. The whole suite was green
 throughout, and stays green when the bug is reintroduced. **`tests/
-driver_checks.sh` (POSIX sh, in CI) is the net** — spawn the binary and
+driver_checks` (POSIX sh, in CI) is the net** — spawn the binary and
 assert the flag's behaviour; reverting the wiring fails 7 of its 9 checks.
 **Add a case there when you add or change a CLI flag**, because no `-rt`
 entry can cover one.
@@ -3704,7 +3706,7 @@ skips Block/for/foreach/try/Expr14, which left every STATEMENT of a spliced
 block body chain-less. And an inlined frame renders the callee's
 `display_name` (`inline_frame_name`), exactly as a physical one does - it
 rendered `weight$0` where `-ni` rendered `weight`. The oracle is
-`inlined_backtrace_oracle` (`-rt`) + `tests/bt_oracle.py` (CLI configs):
+`inlined_backtrace_oracle` (`-rt`) + `tests/bt_oracle` (CLI configs):
 every engine with inlining ON must render the `-ni -tw` backtrace and
 caret. Backtraces are byte-identical with/without inlining, for an error in
 the body AND for one evaluating an argument.
@@ -3751,7 +3753,7 @@ DivisionByZeroEx in plain code, since the fold runs only with the inliner:
 only inert terms merge or cancel). In the REPL a TEMPLATE BASE's body
 takes no splice that adds frame slots (`in_repl_tmpl_base`): a later input
 clones and RE-RESOLVES it, and the resolver cannot take a slot it did not
-allocate. Nets: `inlined_backtrace_oracle` + `tests/bt_oracle/arg_*.my`,
+allocate. Nets: `inlined_backtrace_oracle` + `tests/backtrace/arg_*.my`,
 `local_dropped.my` (the rendered backtrace), the `inline:` cases of
 `opt_layer_equivalence` (which now runs `-ni` as a layer), and
 `tests/functional/33_inline_arg_eval.my` (an event log - a VALUE
@@ -4043,8 +4045,8 @@ decisions behind it: `plans/archived/type-inference.md`,
   `-nti` while the tree-walker ran it. `dyn` is the honest answer with no
   types, and `try_native_value_call` admits a `DirectCallExpr` carrying
   it. **A hint the codegen requires must have an `-nti` answer too.** The
-  net is `corpus_diff.sh`'s always-on `-nti` pass (both engines untyped)
-  plus a `driver_checks.sh` case; nothing in `-rt` runs untyped.
+  net is `corpus_diff`'s always-on `-nti` pass (both engines untyped)
+  plus a `driver_checks` case; nothing in `-rt` runs untyped.
 
   Both sites share **one** mapping implementation, `desugar_named_call`
   (`syntax.cpp`, declared in `syntax.h`): it takes the call plus a normalized
@@ -4283,7 +4285,7 @@ decisions behind it: `plans/archived/type-inference.md`,
   freed: its identifiers, calls and lambdas are keys in `id_sym` /
   `func_of_decl` / the callee-set maps, and `-dti` / `-a` ITERATE
   `id_sym` - freeing it was a heap-use-after-free in both dumps
-  (`driver_checks.sh` runs them over a folded query). A pass that cuts
+  (`driver_checks` runs them over a folded query). A pass that cuts
   a subtree out of the tree while those maps are live does the same.
   The `?`-suffix nullability format (`static_type_to_string`) matches
   `:type` and error messages.
@@ -6978,7 +6980,7 @@ AST transform joins **all three** on the day it is written:
    `OptPass`, a case in the corpus, and cases for whatever its gates
    REFUSE (a refusal that silently stops refusing is the dangerous
    direction).
-2. **`tests/nested_fuzz.py`** - its `noopt` engine (on by default) re-runs
+2. **`tests/nested_fuzz`** - its `noopt` engine (on by default) re-runs
    each random deep-nested program with every transform disabled, on both
    engines. Random programs hit gate COMBINATIONS no hand-written case
    covers.
@@ -7116,7 +7118,7 @@ that is too deep raises the catchable `StackOverflowEx`, in every
 engine - never a crash. (The tree-walker, which recurses on the C
 stack, is the one documented exception, README *StackOverflowEx*.)
 So a test of overflow compares the OUTCOME, never the depth -
-`driver_checks.sh`'s *overflow* case masks the number.
+`driver_checks`'s *overflow* case masks the number.
 
 This is stronger than "the tests agree", and it is the reason the
 engine differential exists. It applies to:
@@ -7541,9 +7543,9 @@ SEGFAULTED for any image whose pool holds a FUNCTION value, i.e. on a
 VALID image of our own making, not a hostile one. **A `pure func` in a
 const array (`const OPS = [sq];`) is the whole reproducer**, and no net
 saw it for one reason worth generalising: **no corpus program produced
-that record**, so `myv_fuzz.py` mutated an image that never contained a
+that record**, so `myv_fuzz` mutated an image that never contained a
 `func` value and `myv_round_trip` round-tripped one too. The fat fuzz
-corpus now ends with exactly that shape, and `driver_checks.sh` runs the
+corpus now ends with exactly that shape, and `driver_checks` runs the
 image and compares it to the source run (watched failing: `img 139`).
 A ctx-less closure is capture-free - the reader now REFUSES any other
 kind rather than trusting the writer's assertion - and gets a null
@@ -7574,7 +7576,7 @@ does for it. Pinned in-process by `vm_program_move_rebinds` (a
 move-constructed and a move-assigned program's sites must name the
 object it lives in; watched: the assignment's rebind alone removed
 fails it, both removed kills the whole suite in the harness) and
-end-to-end by the `driver_checks.sh` deep-image case (watched failing).
+end-to-end by the `driver_checks` deep-image case (watched failing).
 **And the net that found it is now a rule: run EVERY corpus image
 against its source run after a loader change** (`tests/functional/*` +
 `samples/*`, stdout+rc compared; skip the two stdin-driven samples and
@@ -7681,7 +7683,7 @@ bytecode type-checker, and halting is undecidable. `-rt`'s
 `myv_corrupt_refused` is the net: it writes 0xFFFFFFFF over every
 4-byte-aligned word and requires each load to be a clean Exception,
 knowing nothing about which words are counts or indices. The BROAD net is
-**`tests/myv_fuzz.py BINARY`** (stdlib-only, like `nested_fuzz.py`): five
+**`tests/myv_fuzz BINARY`** (stdlib-only, like `nested_fuzz`): five
 mutation modes over a small and a fat image, a crash always failing the
 run and `--triage` telling a non-terminating PROGRAM (legitimate - it
 loads cleanly) from a hang in the LOADER (a bug). **Run it after any
@@ -7690,7 +7692,7 @@ format or loader change**, against BOTH a debug (ASan+UBSan) and an
 tier-2 throw-through-noexcept and the codegen-audit false alarm below
 within minutes of being checked in. A finding is SAVED, because it cannot
 be regenerated from the seed: an image embeds its SOURCE PATH. Its sibling
-**`tests/repl_fuzz.py BINARY`** does the same for the REPL - a THIRD front
+**`tests/repl_fuzz BINARY`** does the same for the REPL - a THIRD front
 end that shares almost none of the script path (its own incremental
 inferencer with cross-input type commitment, retained per-input ASTs, an
 open world of map-resident redefinable globals, and a dozen `:` commands

@@ -15,7 +15,7 @@
  * printed event must be a deterministic function of the program, so no
  * pointer, address or hash ever goes in a payload.
  *
- * A row nobody's tests reach is a failure (tests/int_run.py's site census):
+ * A row nobody's tests reach is a failure (tests/int_run's site census):
  * add a site together with the test that exercises it.
  */
 

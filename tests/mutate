@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause
 """
-mutate.py - MUTATION TESTING: does any test notice when the code is wrong?
+mutate - MUTATION TESTING: does any test notice when the code is wrong?
 
-    tests/mutate.py [--files src/jit.cpp,...] [--count N] [--seed S]
+    tests/mutate [--files src/jit.cpp,...] [--count N] [--seed S]
                     [--shard I/N] [--stages rt,corpus,int,enum,fuzz]
                     [--jobs W] [--out FILE.json] [--list]
 
@@ -35,10 +35,10 @@ HOW.
      link), run the stages IN ORDER and stop at the first that fails -
          build   the mutant does not compile: STILLBORN, not counted
          rt      ./mylang -rt
-         corpus  tests/corpus_diff.sh (the engine differential)
-         int     tests/int_run.py --no-rt (tests/int, the REPL
+         corpus  tests/corpus_diff (the engine differential)
+         int     tests/int_run --no-rt (tests/int, the REPL
                  sessions, the object census, the VM/JIT state checkers)
-         enum    tests/int_enum.py --tier 1 over tests/functional
+         enum    tests/int_enum --tier 1 over tests/functional
          fuzz    nested_fuzz, myv_fuzz and repl_fuzz, fixed seeds
      A stage over its timeout (5x its pristine time, at least 60 s)
      counts as a kill: a mutant that loops forever was noticed.
@@ -71,8 +71,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-sys.path.insert(0, HERE)
-import int_run   # noqa: E402
+sys.path.insert(0, os.path.join(HERE, "lib"))
+import intcov   # noqa: E402
 import testjobs  # noqa: E402
 from testrun import Run, Monitor, fingerprint  # noqa: E402
 
@@ -154,12 +154,12 @@ INT_HELPER_DEF = re.compile(r"^\S.*\b(?:jit_|bc_)?int_\w*\s*\(")
 
 def not_product(text, rel):
     """0-based indices of lines that are not PRODUCT code - the coverage
-    universe's rule (tests/int_run.py): ML_INT / ML_INT_ONLY spans and
+    universe's rule (tests/int_run): ML_INT / ML_INT_ONLY spans and
     INT-COV-EXEMPT lines, the body of an INT helper function (named
     int_* / jit_int_* / bc_int_*), and `#ifdef INT_TESTS` / `#ifdef
     TESTS` regions. A mutant there tests the test machinery, not
     MyLang."""
-    skip = {n - 1 for n in int_run.exempt_lines(rel, {})}
+    skip = {n - 1 for n in intcov.exempt_lines(rel, {})}
     stack = []                  # per open #if: is it a test-only region
     in_helper = False
     for li, line in enumerate(text.split("\n")):
@@ -226,16 +226,16 @@ def stage_cmds(root, binary, seed):
                    if f.endswith(".my"))
     return {
         "rt": [[binary, "-rt"]],
-        "corpus": [[os.path.join(t, "corpus_diff.sh"), binary]],
-        "int": [[py, os.path.join(t, "int_run.py"), binary, "--no-rt"]],
-        "enum": [[py, os.path.join(t, "int_enum.py"), binary, "--tier",
+        "corpus": [[os.path.join(t, "corpus_diff"), binary]],
+        "int": [[py, os.path.join(t, "int_run"), binary, "--no-rt"]],
+        "enum": [[py, os.path.join(t, "int_enum"), binary, "--tier",
                   "1"] + [os.path.join(t, "functional", f) for f in funcs]],
-        "fuzz": [[py, os.path.join(t, "nested_fuzz.py"), "--mylang",
+        "fuzz": [[py, os.path.join(t, "nested_fuzz"), "--mylang",
                   binary, "--count", "60", "--seed", str(seed)],
-                 [py, os.path.join(t, "myv_fuzz.py"), binary, "-n", "100",
+                 [py, os.path.join(t, "myv_fuzz"), binary, "-n", "100",
                   "--seed", str(seed), "--save",
                   os.path.join(root, "myv-bad")],
-                 [py, os.path.join(t, "repl_fuzz.py"), binary, "-n", "100",
+                 [py, os.path.join(t, "repl_fuzz"), binary, "-n", "100",
                   "--seed", str(seed), "--save",
                   os.path.join(root, "repl-bad")]],
     }
@@ -291,7 +291,7 @@ def main():
     ap.add_argument("--stages", default="rt,corpus,int,enum,fuzz")
     ap.add_argument("--jobs", type=int, default=0,
                     help="workers, each with its own tree and build "
-                         "(default: tests/jobs.sh count / 4)")
+                         "(default: tests/jobs count / 4)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--list", action="store_true",
                     help="print the sampled mutants and exit")

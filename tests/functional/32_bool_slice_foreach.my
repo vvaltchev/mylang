@@ -4,7 +4,7 @@
 # "a frameless frame exited with no signal", an assertion in a checked
 # build. Every decline goes to the status helper now. The function is
 # called repeatedly so the warmed / frameless tiers run it.
-# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff.sh).
+# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff).
 
 func count(int k) {
     var a = [true, false, true, true, false, true];

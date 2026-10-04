@@ -16,17 +16,17 @@
 # collide with reference-producing code). Two such bugs were green under
 # -rt AND the 400-program fuzzer.
 #
-#   tests/corpus_diff.sh [binary]            - the differential
-#   tests/corpus_diff.sh [binary] --levers   - once per JIT lever off
-#   tests/corpus_diff.sh [binary] --cold     - once per forced cold tier
-#   tests/corpus_diff.sh [binary] --xrot     - once per pin-pool rotation
-#   tests/corpus_diff.sh [binary] --nolowmem - with the low-address arena
-#   tests/corpus_diff.sh [binary] --spcheck  - with the emitted rsp
+#   tests/corpus_diff [binary]            - the differential
+#   tests/corpus_diff [binary] --levers   - once per JIT lever off
+#   tests/corpus_diff [binary] --cold     - once per forced cold tier
+#   tests/corpus_diff [binary] --xrot     - once per pin-pool rotation
+#   tests/corpus_diff [binary] --nolowmem - with the low-address arena
+#   tests/corpus_diff [binary] --spcheck  - with the emitted rsp
 #                                              alignment check at every
 #                                              call site (TESTS builds)
 #                                              REFUSED (the imm32 tags fall
 #                                              back to registers)
-#   tests/corpus_diff.sh [binary] MODE...    - several modes in ONE run:
+#   tests/corpus_diff [binary] MODE...    - several modes in ONE run:
 #                                              the plain part and the
 #                                              tree-walker references run
 #                                              once, each mode's rows
@@ -54,8 +54,8 @@
 #
 # PARALLEL, AND THE REPORT IS THE SERIAL ONE (2026-09-27). Every
 # (configuration x program) run is an independent process, so they all
-# run up front, `tests/jobs.sh count` at a time (MYLANG_TEST_JOBS
-# overrides), in the IDLE scheduling class (tests/jobs.sh run); the
+# run up front, `tests/jobs count` at a time (MYLANG_TEST_JOBS
+# overrides), in the IDLE scheduling class (tests/jobs run); the
 # report is then printed from the saved outputs in exactly the order,
 # and with exactly the text, the one-at-a-time version printed. The
 # tree-walker reference does not depend on the JIT configuration - the
@@ -87,14 +87,14 @@ fi
 
 # ---- the idle policy, applied once at the top-level entry ---------- #
 if [ "${MYLANG_TEST_IDLED:-0}" != 1 ]; then
-    exec sh "$(dirname "$0")/jobs.sh" run bash "$0" "$@"
+    exec sh "$(dirname "$0")/jobs" run bash "$0" "$@"
 fi
 
 # ⛔ RESOLVE $BIN *BEFORE* THE cd, AND PROVE IT RUNS.
 #
 # This script cd's to the repo root, so a RELATIVE binary path given by
 # the caller is silently re-anchored - and CI passes exactly that:
-# `corpus_diff.sh ./mylang` with working-directory `build/`. After the
+# `corpus_diff ./mylang` with working-directory `build/`. After the
 # cd, `./mylang` is <repo>/mylang, which does not exist.
 #
 # ⛔ THAT MADE THE WHOLE Nets DIFFERENTIAL VACUOUS, and it could not
@@ -116,7 +116,7 @@ esac
 SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 cd "$(dirname "$0")/.."
 if [ ! -x "$BIN" ]; then
-    echo "corpus_diff.sh: '$_bin_arg' is not an executable ($BIN)." >&2
+    echo "corpus_diff: '$_bin_arg' is not an executable ($BIN)." >&2
     echo "  This script cd's to the repo root, so a relative path is" >&2
     echo "  resolved against your CURRENT directory, not the root." >&2
     exit 2
@@ -212,7 +212,7 @@ key() {
 }
 RES=$(mktemp -d "${TMPDIR:-/tmp}/corpus_diff.XXXXXX") || exit 2
 trap 'rm -rf "$RES"' EXIT
-JOBS=$(sh tests/jobs.sh count)
+JOBS=$(tests/jobs count)
 export CORPUS_DIFF_BIN="$BIN"
 
 # The configurations run_one reports, in report order, one
@@ -259,13 +259,13 @@ $CONFIGS
 EOF_CFG
   done
 }
-# PROGRESS: tests/testctl.py lists this run with its percentage - a
-# finished unit leaves its .rc file, which tests/testmon.py counts (it
+# PROGRESS: tests/testctl lists this run with its percentage - a
+# finished unit leaves its .rc file, which tests/testmon counts (it
 # exits by itself if this script dies; python3 is optional here)
 MON=
 if command -v python3 >/dev/null 2>&1; then
   TOTAL=$(emit_units | tr -cd '\000' | wc -c)
-  python3 tests/testmon.py corpus_diff $((TOTAL / 4)) "$RES" '*.rc' \
+  tests/testmon corpus_diff $((TOTAL / 4)) "$RES" '*.rc' \
     --pid $$ --phase runs &
   MON=$!
 fi

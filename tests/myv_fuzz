@@ -20,11 +20,11 @@ cleanly (`mylang -vd img.myv` exits 0), which is the discriminator - use
 --triage to see it.
 
 USAGE
-    tests/myv_fuzz.py ./build/mylang                 # both corpora
-    tests/myv_fuzz.py ./build/mylang -n 4000         # longer
-    tests/myv_fuzz.py ./build/mylang --triage        # classify survivors
-    tests/myv_fuzz.py ./build/mylang --save /tmp/bad # keep the offenders
-    tests/myv_fuzz.py ./build/mylang --seed 77       # other mutations
+    tests/myv_fuzz ./build/mylang                 # both corpora
+    tests/myv_fuzz ./build/mylang -n 4000         # longer
+    tests/myv_fuzz ./build/mylang --triage        # classify survivors
+    tests/myv_fuzz ./build/mylang --save /tmp/bad # keep the offenders
+    tests/myv_fuzz ./build/mylang --seed 77       # other mutations
 
 The seed is printed first. CI passes a fresh one per run, so each push
 tries new mutations; the default is fixed, so a bare run is repeatable.
@@ -39,7 +39,7 @@ Run it against a DEBUG (ASan + UBSan) build for detection, and against
 sanitized build sees a bad read the release silently survives, and the
 release exposes anything an assertion was papering over.
 
-Stdlib only (the no-dependencies rule), like tests/nested_fuzz.py.
+Stdlib only (the no-dependencies rule), like tests/nested_fuzz.
 """
 import os
 import random
@@ -47,7 +47,8 @@ import subprocess
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib"))
 from testrun import Monitor  # noqa: E402
 
 # Two programs, because the SHAPE decides which pools exist at all: a small
@@ -217,7 +218,7 @@ def main():
     print('seed %d (reproduce with --seed %d -n %d)' % (seed, seed, n))
 
     total_h = total_c = 0
-    # progress: tests/testctl.py lists this run with its percentage
+    # progress: tests/testctl lists this run with its percentage
     mon = Monitor('myv_fuzz', total=2 * n, phase='mutations')
     with mon, tempfile.TemporaryDirectory(prefix='mylang-myvfuzz-') as tmp:
         for name, src in (('small', SMALL), ('fat', FAT)):

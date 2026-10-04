@@ -11,7 +11,7 @@ which is exactly what a reader of the doc would hit.
 
 Usage:
     mylang -c samples/gcd -o /tmp/gcd.myv
-    tests/myv_doc_check.py /tmp/*.myv
+    tests/myv_doc_check /tmp/*.myv
 
 Stdlib only (the no-dependencies rule). Exits nonzero if any image fails.
 Keep it in step with docs/myv-format.txt, NOT with serialize.cpp - a change

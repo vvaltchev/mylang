@@ -4,7 +4,7 @@
 # (CoerceNumV): the identity for an argument already of the declared
 # type, a widening for an int into a float, and a TypeErrorEx carrying
 # THAT argument's caret for a dyn value that fits neither (its
-# uncaught rendering: tests/bt_oracle/arg_typed_bc_inline.my). Every
+# uncaught rendering: tests/backtrace/arg_typed_bc_inline.my). Every
 # body here holds a loop, so the AST inliner leaves the call alone and the
 # bytecode inliner is the one that takes it (MYLANG_BCINLINE_TYPED=0 is
 # the A/B; tests/int/02_splice.my asserts the inlining happens).

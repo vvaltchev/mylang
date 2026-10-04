@@ -63,7 +63,7 @@ assert(has(ev, "verdict=\"main_not_factory\" kind=\"call\" callee=\"lp\" line=43
 
 # The decision behind it is ENUMERATED (`splice_choice`, #107 P3): one instance
 # per site that would be taken, pick 0 takes it, 1 declines - and
-# tests/int_enum.py forces each decline. Unforced, every instance takes
+# tests/int_enum forces each decline. Unforced, every instance takes
 # its default.
 var dec = int_events("splice_choice");
 var dec_ok = len(dec) > 0;

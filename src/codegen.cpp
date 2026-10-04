@@ -9010,7 +9010,7 @@ static void specialize_arith_ops(Chunk &ck)
  * site in vm.cpp. THE TRAP (fuzzer-caught in E-v1): a "target" field is NOT
  * always a pc - ForLoopStep::target2 is the COUNTER SLOT, JumpUnlessTrueV's
  * target2 the value slot, SetPend::target a Pend enum. A new branching op
- * MUST be added here, and ALWAYS run tests/nested_fuzz.py after touching
+ * MUST be added here, and ALWAYS run tests/nested_fuzz after touching
  * this pass.
  */
 template <typename F>

@@ -22,7 +22,7 @@
 #   scripts/sabotage.sh src/jit.cpp 'a && b' 'a' \
 #       './build-claude/dbg/mylang -rt'
 #   scripts/sabotage.sh src/codegen.cpp 'x : all;' 'x : 0;' \
-#       'tests/corpus_diff.sh ./build-claude/dbg/mylang'
+#       'tests/corpus_diff ./build-claude/dbg/mylang'
 #
 # The check is EXPECTED TO FAIL. Exit status:
 #   0  the check failed  -> the test has teeth (what you want)

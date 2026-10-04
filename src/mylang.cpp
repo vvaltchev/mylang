@@ -214,7 +214,7 @@ static void show_build_config()
     /* #96: the JIT's pin budget, and the CALLER-saved half of it. The
      * second number is what MYLANG_JIT_XROT rotates, so a test lane
      * that sweeps the pool must READ it rather than hardcode a count -
-     * `tests/corpus_diff.sh --xrot` does, and would otherwise
+     * `tests/corpus_diff --xrot` does, and would otherwise
      * under-sweep the day a register is admitted, leaving the newest
      * (and least-exercised) member in the tail position that hid an
      * unsafe r9 for a day. Printed even on a non-JIT build, where both

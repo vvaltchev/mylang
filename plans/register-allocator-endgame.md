@@ -1248,7 +1248,7 @@ FOUND WHILE DIAGNOSING, FIXED FIRST (infrastructure rule): the
 disassembler printed a REG-FORM movsd/sqrtsd rm operand with the
 GP table ('movsd xmm0, rsi' for movsd xmm0, xmm6) - the 0x58
 arithmetic family had the reg-form fix, the 0x10/0x11/0x51 arms
-did not. disasmcheck.py is structurally blind to it (it compares
+did not. disasmcheck is structurally blind to it (it compares
 MNEMONICS, not operand text) - recorded as a known oracle limit.
 Also: jit_lsra_assign's float-mode LSRADBG now dumps fpiece rows
 (only ftrans was printed - the phase-2 diagnosis was impossible

@@ -4,10 +4,10 @@ Status: P0 DONE (the build flag). P1 CORE DONE 2026-10-02: `inttest.h`
 (ML_INT / ML_INT_FIELD / ML_INT_ONLY), `intsites.h` (the X-macro
 registry, typed payloads), `inttest.cpp` (the log + the MYLANG_INT_OUT
 exit census), `int_hits` / `int_events`, the first site (`inline_ast`,
-all three AST inline engines) and its test, `tests/int_run.py`, the `int`
+all three AST inline engines) and its test, `tests/int_run`, the `int`
 CI job with the non-perturbation `vdjcmp`. P1 COVERAGE DONE the same day:
 `GCOV=1` in the Makefile, MC/DC wherever the compiler has it,
-`int_run.py --gcov` (per-unit vectors, ownership, `INT-COV-EXEMPT`, the
+`int_run --gcov` (per-unit vectors, ownership, `INT-COV-EXEMPT`, the
 per-compiler floor ratchet in `tests/int/coverage-floor.txt`), sites
 counted only when CHECKED. First measurement (gcc 16.2): 144,746
 elements, 45,055 uncovered; `-rt` owns 77,561, `01_inline_ast` 270.
@@ -55,7 +55,7 @@ adds nothing. Parameters now print by name (the descriptor's), not
 - `mylang -v` prints `int_tests 0/1` in EVERY build.
 - `bench/run.py` refuses a binary reporting `int_tests 1` (and so does
   `tune_scales.py`, which runs the same gate).
-- `driver_checks.sh` pins the `-v` line; `MYLANG_EXPECT_INT_TESTS=1`
+- `driver_checks` pins the `-v` line; `MYLANG_EXPECT_INT_TESTS=1`
   names an INT lane.
 
 Nothing is instrumented yet. Everything below is the proposal.
@@ -129,7 +129,7 @@ cases someone thought of.
 6. **Prefer an EXHAUSTIVE WALK to a hand-written case.** Where an axis
    can be enumerated (every guard site, every legal choice at every
    decision), the harness walks it over the corpus against the
-   tree-walker, the way `norec_sweep.py` walks every call event.
+   tree-walker, the way `norec_sweep` walks every call event.
 
 ## 2b. The abstractions, and how they stay out of the way
 
@@ -180,7 +180,7 @@ program interleaved with the first.
 - **Proving non-perturbation, not asserting it.** Two oracles, both
   deterministic:
   1. *Decisions:* an INT build with probes OFF must emit byte-identical
-     `-vdj` to a `TESTS=1` build of the same commit (`vdjcmp.sh`).
+     `-vdj` to a `TESTS=1` build of the same commit (`vdjcmp`).
   2. *Probes:* with probes ON, the emitted code must equal the probes-
      off code with every probe call deleted. Compared at the
      INSTRUCTION level through the `DecodedIns` model - branch targets
@@ -202,7 +202,7 @@ TU, compiled empty without `INT_TESTS`):
   `int_slot_state(name)`, `int_live(kind)`, `int_assert_ran(site)`.
   Programs live in `tests/int/*.my` and self-assert, like
   `tests/functional`.
-- **Runner**: `tests/int_run.py BINARY` - refuses a binary whose `-v`
+- **Runner**: `tests/int_run BINARY` - refuses a binary whose `-v`
   says `int_tests 0`, runs `-rt` (which carries the C++ half), every
   `tests/int/*.my` under the default engine and its forced variants,
   then the sweeps, then the site census.
@@ -360,7 +360,7 @@ assertions on values.
 ## 6. Phases (each lands green, with its own watched-failing sabotage)
 
 - **P1 - core + registry + census + runner.** `inttest.{h,cpp}`,
-  `intsites.h`, `ML_INT`, the `int_*` builtin plumbing, `int_run.py`,
+  `intsites.h`, `ML_INT`, the `int_*` builtin plumbing, `int_run`,
   the never-hit-site failure. One real site to prove the pipe.
 - **P2 - ledger** at the inliner, splice, LICM, for-range, forwarding,
   guard elision, pin grant and call-tier sites; migrate the vacuity
@@ -369,10 +369,10 @@ assertions on values.
   the three-tier walk in the runner.
   **STATUS (2026-10-02): tier 1 over REGISTER CHOICE is built** -
   `int_choose` + the `reg_choice` site (RegAlloc::take/ftake),
-  `tests/int_enum.py` (every single deviation, oracle = the
+  `tests/int_enum` (every single deviation, oracle = the
   tree-walker, a deviation must be TAKEN - `choose_applied`, written at
   once so a crashing run still names it) on the long-run harness
-  `tests/testrun.py` / `tests/testctl.py` (heartbeat, a control socket,
+  `tests/lib/testrun.py` / `tests/testctl` (heartbeat, a control socket,
   resume by a `<mark>@<fingerprint>` low-water-mark token). On an
   `OPT=1 ASSERTS=1 INT_TESTS=1` lane the whole of tests/functional
   (68,379 deviations) runs in ~40 s - 35x the debug+ASan lane, REGTRACK
@@ -425,7 +425,7 @@ assertions on values.
   **STATUS (2026-10-03): the OBJECT CENSUS is built** - per-kind
   counters at the pooled `operator new/delete`, `int_live(kind)`,
   `MYLANG_INT_CENSUS=1` (`census LEAK ...` at exit, checked after main's
-  locals and before static destructors), `int_run.py` checking every
+  locals and before static destructors), `int_run` checking every
   tests/int run and the corpus under both engines (69 programs, 0
   leaks), `tests/int/12_census.my`. Its first run found one real
   leftover: a program's function chunks outlived it in the process-global
@@ -510,7 +510,7 @@ assertions on values.
   site to its slow tier - the conditional jump plus its inverse to the
   same pad (an already-unconditional decline asks nothing: inverting
   0xEB is not a jump, which REGTRACK caught on the first sweep), or the
-  reference compare against 0. tests/int_enum.py's tier 1 IS the
+  reference compare against 0. tests/int_enum's tier 1 IS the
   sweep: ~5,500 forced sites over the CI corpus, each run against the
   tree-walker, 0 failures; the enumerator now runs with the OBJECT
   CENSUS on, so a leak is a failure. 33 of 50 decline reasons are taken
@@ -523,7 +523,7 @@ assertions on values.
   guard (GuardCalleeV, MYLANG_JIT_COLD=guard's arm) is a site too
   (`guard_miss`); a G1-HOISTED guard's preheader check is not.
 - **CI:** a `int` job in `nets.yml` from P1 on (Debug + ASan, runs
-  `int_run.py`); its sweeps sized to the lane's budget.
+  `int_run`); its sweeps sized to the lane's budget.
 
 ## 7. Decided (maintainer, 2026-10-02)
 
@@ -688,7 +688,7 @@ test that owns nothing.
   `INT-COV-EXEMPT` marker, the ownership table, and the two CI checks.
 - **P2 / P5** gain emitted-edge probes (P5 makes them invisible to the
   emitter, as for the state probes).
-- A new **P8 - selection and reduction tooling** (`tests/int_select.py`:
+- A new **P8 - selection and reduction tooling** (`tests/int_select`:
   candidate runs, greedy + removal, delta-debugging shrink, the
   ownership table). It is offline tooling, not CI.
   **STATUS (2026-10-03): BUILT.** Candidates = tests/functional,
@@ -737,7 +737,7 @@ x = 2). What followed from it:
   `.expected` files;
 - the CI fuzzers take a FRESH SEED per run - with a fixed seed they were
   a regression corpus, not exploration;
-- the evidence a cut needs is MUTATION testing (`tests/mutate.py`,
+- the evidence a cut needs is MUTATION testing (`tests/mutate`,
   `mutate.yml`, on demand): the fuzzers run as the last stage, so
   "killed by fuzz" counts exactly the planted bugs no deterministic test
   noticed.

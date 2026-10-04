@@ -11,7 +11,7 @@
 # runtime argument (no fold) and most bodies are too large for the
 # expression inliner, so they reach codegen AS calls.
 #
-# ⛔ THE ORACLE IS tests/corpus_diff.sh's `-nti` pass (both engines run
+# ⛔ THE ORACLE IS tests/corpus_diff's `-nti` pass (both engines run
 # untyped and must agree); the plain pass runs it typed too.
 
 struct P { int x; int y; }

@@ -11,7 +11,7 @@
 # Every line below is compared against the tree-walker, which computes
 # `%` and `/` in plain C++ - so a wrongly-claimed non-negative dividend
 # shows up as a DIFFERENT NUMBER on exactly the line whose loop var can
-# go negative. tests/corpus_diff.sh is what runs it.
+# go negative. tests/corpus_diff is what runs it.
 #
 # ⛔ AND THE BOUND IS A RUNTIME SLOT ON PURPOSE (the vacuous-test trap,
 # case 7): a literal bound lowers the loop to the top-tested form, which

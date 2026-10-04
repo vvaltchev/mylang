@@ -28,7 +28,7 @@ registers buy nothing" is an artifact of the cap. Do not quote it.
 ⛔ **VERIFICATION IS BY READING.** A `vdjcmp` diff against the OLD
 emission is circular - the old emission is what is being replaced. Still
 valid and still required: vdjcmp's SELF-test (a binary vs itself),
-`disasmcheck.py` vs objdump, `-rt`, `corpus_diff`.
+`disasmcheck` vs objdump, `-rt`, `corpus_diff`.
 
 ## WHAT THE MODEL ACTUALLY IS (investigated)
 
@@ -457,9 +457,9 @@ independent of everything above.
 ## VERIFICATION BATTERY (for the next change here)
 
     make -j BUILD_DIR=build-claude/t123 TESTS=1 OPT=0 && ./... -rt
-    tests/corpus_diff.sh build-claude/t123/mylang  (+ every matrix)
-    scripts/disasmcheck.py build-claude/rel123/mylang
-    scripts/vdjcmp.sh BIN BIN                      (self-test)
+    tests/corpus_diff build-claude/t123/mylang  (+ every matrix)
+    scripts/disasmcheck build-claude/rel123/mylang
+    scripts/vdjcmp BIN BIN                      (self-test)
     read -vdj for the touched shapes, by hand
 
 ---

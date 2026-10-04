@@ -880,7 +880,7 @@ memory.
 A wrong modrm byte is a SILENT MISCOMPILE, not a build error, so:
 
   1. `-rt` on gcc-debug/ASan, clang-debug, and hardened release.
-  2. `tests/nested_fuzz.py` - it found the N5 temp-corruption bug that
+  2. `tests/nested_fuzz` - it found the N5 temp-corruption bug that
      hand-written tests missed, and it is the right net for exactly this
      class.
   3. The corpus differential with **`-nj` as the oracle**: JIT-on vs
@@ -1127,7 +1127,7 @@ whole remaining piece of #96.** Sketch, to be argued before building:
  1. give the Emitter a scratch REQUEST api (`take_scratch()` /
     `scoped_scratch`), initially satisfied by exactly the registers
     hardcoded today, so the change is provably byte-identical
-    (`scripts/vdjcmp.sh` over the corpus is the oracle);
+    (`scripts/vdjcmp` over the corpus is the oracle);
  2. convert the ~670 sites family by family, each conversion
     byte-identical, never a behaviour change bundled with a refactor
     (see [[bundled-change-needs-a-kill-switch]]);
@@ -1192,7 +1192,7 @@ requested register is not currently holding a pin - the invariant
 `jit_assert_no_volatile_pin` checks by hand today), while still handing
 back the SAME register, so emission stays byte-identical.
 
-**THE ORACLE FOR EVERY INCREMENT IS `scripts/vdjcmp.sh`**: emitted code
+**THE ORACLE FOR EVERY INCREMENT IS `scripts/vdjcmp`**: emitted code
 byte-identical across the corpus. A conversion that changes one byte is
 not a conversion, it is an optimization wearing one - and those get
 measured separately ([[bundled-change-needs-a-kill-switch]]).
@@ -1271,7 +1271,7 @@ raw scratch in the capture ops and every element tier. Removed from
 ("#96 - r9 was NEVER safe as a pin"). Three nets came out of it:
 `MYLANG_JIT_XROT=N` (rotate the pool so its TAIL gets first-choice
 traffic), `Emitter::scratch(reg)` (declare raw-scratch use at the site;
-ML_CHECK that no pin lives there), and a REPAIRED `vdjcmp.sh` (it had
+ML_CHECK that no pin lives there), and a REPAIRED `vdjcmp` (it had
 been reporting 0-identical for every comparison since #96 step 3, and
 77/31 against itself).
 
@@ -1315,7 +1315,7 @@ smallest-first:
     contract and its call sites become the first conversions.
  2. Convert ONE emitter family end-to-end (`emit_store_elem_inline` +
     `emit_store_elem2_inline` - 21 RDI sites and 20 r9 sites, and they
-    already declare their scratch). Oracle: `vdjcmp.sh` must stay
+    already declare their scratch). Oracle: `vdjcmp` must stay
     108/108 identical when the allocator happens to choose the same
     registers, and `-rt` + `--xrot` must be green when it does not.
  3. Only then reconsider the pool, WITH a measurement.
@@ -1326,7 +1326,7 @@ The store-elem emitters no longer name registers. `ElemScratch` gives
 the tier five ROLES - obj / data / count / idx / val - and
 `elem_scratch_plan()` allocates `idx` and `val`, declining to the helper
 if nothing is free. 149 hardcoded references became role names, and
-`vdjcmp.sh` proves the emitted code byte-identical.
+`vdjcmp` proves the emitted code byte-identical.
 
 **AND THEN IT MEASURES ITSELF UNREACHABLE, WHICH IS THE FINDING.**
 
@@ -2500,7 +2500,7 @@ ORDER: the element `data` role first (55 sites, one mechanical pass,
 and it doubles as the rdx `count` work since the two are computed
 together), then the arith staging, then the tail. Expect it to be
 larger than r9's conversion and to land inert at every step -
-`scripts/vdjcmp.sh` byte-identical is the check that it did.
+`scripts/vdjcmp` byte-identical is the check that it did.
 
 ## (s) the rcx element pass - and THREE shipped bugs it turned up
 
@@ -2635,7 +2635,7 @@ requirement"). It was not met, and the reason it looked met is the
 whole lesson: `DUMP IS UNRELIABLE` counts `.byte` lines, so it can only
 report bytes we KNOW we failed on. A decoder cannot check itself.
 
- - **`scripts/disasmcheck.py`** - `MYLANG_VDJ_HEX=1` puts each
+ - **`scripts/disasmcheck`** - `MYLANG_VDJ_HEX=1` puts each
    instruction's raw bytes in the dump; the script hands each fragment
    to **objdump** and compares BOUNDARIES and MNEMONICS. Now in the
    Nets CI lane with `--matrix` (both arenas x 7 pin rotations x 5 pin
@@ -2685,7 +2685,7 @@ has a direct, empirical answer, and it should have been the metric all
 along:
 
     XCACHE_ORDER[] = { 1, 10, 11, 8, 7, 6, 9 }   /* rcx FIRST */
-    ./mylang -rt  &&  tests/corpus_diff.sh ./mylang
+    ./mylang -rt  &&  tests/corpus_diff ./mylang
 
 `take_reg` scans the pool in preference order, so putting a register
 first hands it out to essentially every run with a pin - the `--xrot`
@@ -2838,7 +2838,7 @@ the columns are a fidelity measure.**
 ### Batches 3 and 5 were byte-identical. Batches 4 and 6 could not be.
 
 Batch 3 (67 sites) and batch 5 (20 sites) reached encoders that already
-existed or that encode one exact form, so `vdjcmp.sh` reported 111/111
+existed or that encode one exact form, so `vdjcmp` reported 111/111
 byte-identical in BOTH arenas - the strong claim.
 
 Batches 4 and 6 (25 + 38 sites) are the BASE-FORM shapes -
@@ -2851,7 +2851,7 @@ invisible". Leaving them invisible defeats #96, so: convert, and say
 so. Total -2142 bytes over the corpus, which is a rounding error and is
 claimed as nothing more.
 
-### THE INSTRUMENT THAT MADE THAT SAFE: `vdjcmp.sh --same-shape`
+### THE INSTRUMENT THAT MADE THAT SAFE: `vdjcmp --same-shape`
 
 Byte identity is the wrong oracle for a change that alters LENGTH. The
 new mode normalises exactly three things - the `+ NN:` offset column, a
@@ -3156,7 +3156,7 @@ The first reading of the "after" number was **288**, which looked like
 a 6x win and was an ARTIFACT: three programs aborted early on the
 pressure check, so their remaining conflicts were never counted. The
 spill made them compile, and the honest number went UP. **A count taken
-over runs that DIED is not a count** - the same lesson `vdjcmp.sh`
+over runs that DIED is not a count** - the same lesson `vdjcmp`
 learned when it reported a crashed run as a difference.
 
 ### Where this leaves step 2
@@ -3616,7 +3616,7 @@ tag on a register-free line = STALE, both watched), splits the
 table into justified/UNJUSTIFIED, and `--gate` ratchets every
 register against scripts/regcensus_floor.txt IN BOTH DIRECTIONS -
 a new site fails, and an improvement whose floor was not lowered in
-the same commit fails too. driver_checks.sh runs the gate, so every
+the same commit fails too. driver_checks runs the gate, so every
 CI lane and the local battery enforce it.
 
 ## (aj) 2026-08-20 - the admission FINISHED: both arenas green; what the

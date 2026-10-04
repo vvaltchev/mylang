@@ -1807,7 +1807,7 @@ extern bool g_norec_audit;
  * record-less unwind would perform at the Nth CALL EVENT and compares
  * it against the live records, so reconstruction is exercised at every
  * point it COULD be demanded rather than only where an exception
- * happens to fall. The driver is tests/norec_sweep.py.
+ * happens to fall. The driver is tests/norec_sweep.
  *   norec_events        call events seen so far this run
  *   norec_recon_probes  probes that actually fired
  *   norec_recon_frames  frames those probes reconstructed

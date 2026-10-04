@@ -3,7 +3,7 @@
 """
 NET 3 - EXHAUSTIVE SMALL-SCOPE ENUMERATION for the G1 no-record tier.
 
-    tests/norec_enum.py BINARY [--depth 4] [--jobs N]
+    tests/norec_enum BINARY [--depth 4] [--jobs N]
 
 NOT A FUZZER.  It emits EVERY program in a bounded shape space and runs
 each one through four engine configurations, comparing stdout, stderr
@@ -56,8 +56,9 @@ import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import testjobs  # noqa: E402  (tests/jobs.sh: worker count + idle class)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib"))
+import testjobs  # noqa: E402  (tests/jobs: worker count + idle class)
 from testrun import Monitor  # noqa: E402
 
 KINDS = ("plain", "try", "tryfin", "diter")
@@ -235,7 +236,7 @@ def main():
     ap.add_argument("--depth", type=int, default=4,
                     help="max chain depth (default 4)")
     ap.add_argument("--jobs", type=int, default=0,
-                    help="worker processes (default: tests/jobs.sh count)")
+                    help="worker processes (default: tests/jobs count)")
     ap.add_argument("--limit", type=int, default=0,
                     help="stop after N programs (0 = all)")
     ap.add_argument("--keep-dir", default=None,
@@ -268,7 +269,7 @@ def main():
 
     fails = []
     done = 0
-    # progress: tests/testctl.py lists this run with its percentage
+    # progress: tests/testctl lists this run with its percentage
     mon = Monitor("norec_enum", total=len(paths), phase="programs")
     with mon, ProcessPoolExecutor(max_workers=args.jobs) as ex:
         for path, problems, ref_err in ex.map(

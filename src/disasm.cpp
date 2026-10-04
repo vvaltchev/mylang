@@ -582,7 +582,7 @@ bool vdj_show_addrs()
 
 /*
  * MYLANG_VDJ_RAW=1 - render every operand the way objdump does, for
- * `scripts/disasmcheck.py`'s operand comparison. A frame slot prints as
+ * `scripts/disasmcheck`'s operand comparison. A frame slot prints as
  * the `[rbx+disp]` it is, a baked address or a Type tag as its number,
  * a 32-bit register by its real name (r8d, not e8), a branch or call
  * target as its FRAGMENT offset, and every memory operand as
@@ -655,7 +655,7 @@ std::string hex2(uint8_t v)
  * twice produced different text. That is not cosmetic: `-vdj` is the
  * evidence a JIT change is a pure restructuring, and a dump that
  * differs from itself cannot be that evidence. It cost exactly that:
- * scripts/vdjcmp.sh reported 77 of 108 programs as differing from
+ * scripts/vdjcmp reported 77 of 108 programs as differing from
  * THEMSELVES, and worked around it with regex masking that then went
  * stale the moment tags became imm32.
  *
@@ -1018,11 +1018,11 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
              * baked address in this dump prints as `<addr>` /
              * `<int-tag>` / `<helper>` precisely so two runs and two
              * separately-linked binaries produce IDENTICAL text - that
-             * is what `scripts/vdjcmp.sh` IS - and this form was added
+             * is what `scripts/vdjcmp` IS - and this form was added
              * later without learning the rule.
              *
              * ⛔ IT BROKE THE ORACLE AND NOTHING SAID SO. From the day
-             * the arena landed, `vdjcmp.sh` failed its own SELF-TEST
+             * the arena landed, `vdjcmp` failed its own SELF-TEST
              * ("the same binary gave two different dumps") on every
              * invocation, so every "verified byte-identical emitted
              * code" claim since was unverifiable. The self-test did its
@@ -1135,7 +1135,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
      * nor a `.byte` - so the UNRELIABLE banner, which counts `.byte`
      * lines, stayed quiet while the dump showed a placeholder. 284
      * corpus sites: the div-magic sequence's `neg rdx` and `imul rdx`.
-     * Found by cross-checking against objdump (scripts/disasmcheck.py),
+     * Found by cross-checking against objdump (scripts/disasmcheck),
      * because no self-check can see this - the decoder is the subject.
      */
     case 0xF7: { modrm(regf, rm); const uint8_t sub = regf & 7;
@@ -1229,7 +1229,7 @@ void decode_one(const uint8_t *c, uint32_t n, uint32_t &p, std::string &out,
          * distance from this code page to the callee, so BOTH ends move
          * under ASLR and the number is noise - and worse, its WIDTH
          * varies (5 or 6 hex digits for the same libm target), which is
-         * what made a width-based mask in vdjcmp.sh race with a
+         * what made a width-based mask in vdjcmp race with a
          * call-based one and report a file as differing from itself.
          * render_op prints the shape, not the digits. */
         MN("call"); A(dop_callrel(d));
@@ -1400,7 +1400,7 @@ undecoded:
  * wrong). No self-check can find that: the decoder is the thing under
  * test. Only a SECOND decoder can.
  *
- * With the bytes in the dump, `scripts/disasmcheck.py` feeds them to
+ * With the bytes in the dump, `scripts/disasmcheck` feeds them to
  * objdump and compares both the instruction BOUNDARIES and the
  * MNEMONICS. objdump is a development-time cross-check invoked by a
  * script, exactly like python3 in the other scripts - it is not a
@@ -1519,7 +1519,7 @@ void disasm_native_frag(std::ostream &s, const uint8_t *code,
  * address, appended to the file named by MYLANG_JIT_MAP.
  *
  * It reuses `decode_one`, the SAME decoder `-vdj` uses and that
- * `scripts/disasmcheck.py` cross-checks against objdump - so a length
+ * `scripts/disasmcheck` cross-checks against objdump - so a length
  * this writes is a length objdump agrees with, which is what makes the
  * address join sound. An undecodable byte would desynchronise the rest
  * of the fragment, so the writer reports it in the header rather than

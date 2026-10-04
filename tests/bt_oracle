@@ -11,8 +11,8 @@ bytecode splice on and off, a stored `.myv` image, every AST transform
 off - must print a BYTE-IDENTICAL stdout, stderr (the header, the caret,
 the whole backtrace) and exit code.
 
-Usage: tests/bt_oracle.py BINARY [PROGRAM.my ...]
-       (default corpus: tests/bt_oracle/*.my plus the generated
+Usage: tests/bt_oracle BINARY [PROGRAM.my ...]
+       (default corpus: tests/backtrace/*.my plus the generated
         recursion-unroll programs, one per depth 1..8)
 
 NOT VACUOUS: the whole point is inlined code, so the run fails unless
@@ -27,7 +27,8 @@ import subprocess
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib"))
 from testrun import Monitor  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -118,7 +119,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="bt_oracle.")
     progs = sys.argv[2:]
     if not progs:
-        d = os.path.join(HERE, "bt_oracle")
+        d = os.path.join(HERE, "backtrace")
         progs = sorted(os.path.join(d, f) for f in os.listdir(d)
                        if f.endswith(".my"))
         for depth in range(1, 9):
@@ -129,7 +130,7 @@ def main():
 
     fails = 0
     inlined = 0
-    # progress: tests/testctl.py lists this run with its percentage
+    # progress: tests/testctl lists this run with its percentage
     mon = Monitor("bt_oracle", total=len(progs), phase="programs")
     mon.__enter__()
     for prog in progs:

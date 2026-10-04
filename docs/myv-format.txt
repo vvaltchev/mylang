@@ -1342,7 +1342,7 @@ ORDER of a const dict's entries (section 11.2).
 
 15.1  Is THIS DOCUMENT correct?
 
-`tests/myv_doc_check.py` is an independent reader written from this document
+`tests/myv_doc_check` is an independent reader written from this document
 and deliberately NOT from serialize.cpp.  If it consumes an image to exactly
 EOF, the document is complete: every byte is accounted for by some record
 described here.  A leftover byte means the doc and the format have drifted -
@@ -1351,7 +1351,7 @@ precisely what a reader of the doc would hit.
     for f in samples/* bench/my/*.my; do
         ./mylang -c "$f" -o /tmp/i/$(basename "$f").myv
     done
-    tests/myv_doc_check.py /tmp/i/*.myv
+    tests/myv_doc_check /tmp/i/*.myv
 
 As of version 10 it reads all 89 corpus images to exactly EOF, including a
 `--strip-source` image, a struct-bearing one, and one built to force all four

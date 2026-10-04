@@ -1514,7 +1514,7 @@ static constexpr uint32_t gp_caller_saved_mask()
  *    encoder goes through it, and it emits the byte ONLY when it
  *    carries a bit, so an xmm0-7 form is byte-identical to what it
  *    was. `-vdj` decodes the extended forms (the rm operand of every
- *    reg-reg SSE arm gained REX.B) and disasmcheck.py cross-checks
+ *    reg-reg SSE arm gained REX.B) and disasmcheck cross-checks
  *    them against objdump;
  *  - ALL xmm registers are caller-saved (there is no callee-saved
  *    concept in the SysV float file), so there is no fp analog of the
@@ -1845,7 +1845,7 @@ struct RegAlloc {
  *
  * It is a separate knob rather than "on in every TESTS build" because
  * it changes the emitted bytes, and `-vdj` reproducibility, the shape
- * tests and scripts/vdjcmp.sh all read those. `corpus_diff.sh
+ * tests and scripts/vdjcmp all read those. `corpus_diff
  * --spcheck` runs the whole corpus under it.
  */
 static bool jit_spcheck_env()
@@ -2411,7 +2411,7 @@ struct Emitter {
      * Auditing the encoders by grep is the sixth audit-table shape (the
      * register is in a byte literal, not an argument), so it is not
      * audited by grep: every byte this Emitter emits is DECODED - by
-     * the decoder `-vdj` uses, which disasmcheck.py holds to objdump -
+     * the decoder `-vdj` uses, which disasmcheck holds to objdump -
      * and every general register an instruction writes must have been
      * DECLARED by a wrote() call (the log below) in the same encoder
      * group: the most recent run of wrote() calls at or before the
@@ -6614,7 +6614,7 @@ struct Emitter {
      * architecturally IGNORED. These two passed `w=true`, so every
      * float element access carried a prefix bit that does nothing;
      * objdump renders it as a `rex.WX` pseudo-prefix, which is how it
-     * was found (scripts/disasmcheck.py). Where no R/X/B bit is needed
+     * was found (scripts/disasmcheck). Where no R/X/B bit is needed
      * either, the whole REX byte goes and the instruction is a byte
      * shorter.
      *
@@ -8112,7 +8112,7 @@ typedef std::vector<DeclineJump> DeclineJumps;
  * a decline_jump, a reference check's helper arm - is an ENUMERATED
  * DECISION (`decline_choice`): pick 1 sends that ONE site to its slow
  * tier unconditionally, which must change nothing observable, because a
- * decline is legal on every value. tests/int_enum.py's tier 1 then IS
+ * decline is legal on every value. tests/int_enum's tier 1 then IS
  * the sweep the plan asked for: every site of every corpus program
  * forced in turn, each run against the tree-walker - the per-call-site
  * MYLANG_JIT_COLD, without forcing every site at once. Keyed
@@ -11471,7 +11471,7 @@ static void emit_sync_push_native(Emitter &e, const Chunk &ck,
      * makes the EMITTED CODE DEPEND ON COMPILATION ORDER - and Pass B
      * walks a POINTER-keyed map, so that order is not stable across
      * runs. `-vdj` reproducibility (two runs, two separately-linked
-     * binaries, byte-identical text) is what `scripts/vdjcmp.sh` is,
+     * binaries, byte-identical text) is what `scripts/vdjcmp` is,
      * and an order-dependent elision would quietly end it.
      *
      * So the elision is allowed for exactly ONE caller, on a structural
@@ -16568,7 +16568,7 @@ static constexpr size_t gp_pool_count()
  * never. That is not a coverage gap a bigger corpus fixes: it is the
  * allocator's own preference order hiding its tail.
  *
- * With the rotation, `corpus_diff.sh BIN --xrot` runs the whole matrix
+ * With the rotation, `corpus_diff BIN --xrot` runs the whole matrix
  * and every member gets the first-choice traffic. A member that is not
  * actually safe fails immediately and BY NAME.
  *
@@ -31322,7 +31322,7 @@ retry_emission:
          * `MYLANG_JIT_LSRA=0` has always selected the legacy pick, and
          * `g_jit_lsra` is settable in-process for the coverage tests
          * that need the pick's pin sets. What it was NOT is a member
-         * of `jit_lever_names`, so `tests/corpus_diff.sh --levers` -
+         * of `jit_lever_names`, so `tests/corpus_diff --levers` -
          * the matrix CI runs - never covered it. A whole second
          * allocator was therefore exercised by four hand-written `-rt`
          * cases and nothing else: the "configuration nobody runs"

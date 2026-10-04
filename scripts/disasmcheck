@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause
 """
-disasmcheck.py - is `-vdj` DECODING CORRECTLY, judged by a second
+disasmcheck - is `-vdj` DECODING CORRECTLY, judged by a second
                  disassembler?
 
-    scripts/disasmcheck.py BINARY [--matrix] [--env K=V[,K=V...]]...
+    scripts/disasmcheck BINARY [--matrix] [--env K=V[,K=V...]]...
                            [--only FILE|DIR]... [--shard I/N] [-v]
 
 ⛔ WHY THIS EXISTS, AND WHY THE EXISTING NETS CANNOT REPLACE IT.
@@ -423,7 +423,7 @@ def main():
         i += 1
     if not args:
         print(__doc__.strip().split('\n')[2], file=sys.stderr)
-        print("usage: disasmcheck.py BINARY [--matrix] "
+        print("usage: disasmcheck BINARY [--matrix] "
               "[--env K=V[,K=V...]]... [--only FILE|DIR]... [-v]",
               file=sys.stderr)
         return 2
@@ -462,9 +462,9 @@ def main():
                                    ', '.join(n for _, n in envs)))
 
     tl = tm = to = ti = tf = tw = 0
-    # progress: tests/testctl.py lists this run with its percentage
+    # progress: tests/testctl lists this run with its percentage
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(
-        __file__)), "..", "tests"))
+        __file__)), "..", "tests", "lib"))
     from testrun import Monitor
     mon = Monitor("disasmcheck", total=len(envs) * len(files),
                   phase="configs").__enter__()

@@ -8,7 +8,7 @@ function value read while descriptors were shells, the bind-flag cross
 check). The count bound is the per-record minimum size this plan asks
 for (12 bytes a struct, 40 a descriptor). A future table (classes) joins
 the table of contents the same way. Pinned by the `myv_struct_const_func`
-`-rt` entry, the round-trip program and a driver_checks.sh case.
+`-rt` entry, the round-trip program and a driver_checks case.
 
 Original status: **DESIGNED, NOT STARTED.** The one shape that can hit it
 today
@@ -141,13 +141,13 @@ been designed yet.
   (`N <= remaining / smallest possible record`), or the shells become
   an unbounded allocation from an attacker-controlled number.
   `vm_verify_program` still bounds every instruction operand
-  afterwards, and `tests/myv_fuzz.py` is the net.
+  afterwards, and `tests/myv_fuzz` is the net.
 - **Derived data stays derived.** `boxed_ops`, `catch_uids`, layouts and
   `bind_req` are rebuilt, never stored (v4's rule). Phase 3 is where
   they belong; do not let the reordering tempt anything into the file.
 - **The doc IS the spec.** `docs/myv-format.txt` and
   `MYV_FORMAT_VERSION` (serialize.h, currently **14**) move in the SAME
-  commit, and `tests/myv_doc_check.py` is written FROM the doc, so it
+  commit, and `tests/myv_doc_check` is written FROM the doc, so it
   follows too — it must still consume an image to exactly EOF.
 
 ## Interim state (what is in the tree now)
@@ -156,7 +156,7 @@ been designed yet.
   with the reason in the message (serialize.cpp, `in_struct_consts`);
 - `docs/myv-format.txt` says so in both places that matter — the struct
   table's `Const` record and value tag 9 — and points here;
-- `tests/driver_checks.sh` pins the refusal, and pins that a function
+- `tests/driver_checks` pins the refusal, and pins that a function
   value in a CHUNK pool compiles, loads and CALLS correctly.
 
 If a guard is wanted before the restructure lands, `in_struct_consts`
@@ -168,11 +168,11 @@ image.
 ## Acceptance, when it is built
 
 - the program at the top of this file compiles to an image, loads, and
-  prints `49`; add that shape to the FAT corpus in `tests/myv_fuzz.py`
+  prints `49`; add that shape to the FAT corpus in `tests/myv_fuzz`
   (the `const OPS = [sq]` shape is already there, added when the
   loader's null-context crash was fixed);
 - `-vd` of the loaded image is byte-identical to `-vd` of a fresh
   compile (the round-trip oracle);
-- `tests/myv_doc_check.py` consumes a fresh image to exactly EOF;
-- `myv_fuzz.py` over BOTH a Debug/ASan and an `ASSERTS=OFF` Release
+- `tests/myv_doc_check` consumes a fresh image to exactly EOF;
+- `myv_fuzz` over BOTH a Debug/ASan and an `ASSERTS=OFF` Release
   build: 0 crashes, 0 loader hangs.

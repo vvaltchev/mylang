@@ -2063,7 +2063,7 @@ static const std::vector<test> tests =
          * same temp) reproduced that corruption before temps were excluded
          * from the cache; the differential reruns it under the VM+JIT, and
          * the result must match the tree-walker (acc == 86). Found by
-         * tests/nested_fuzz.py (seed 116, depth 3). */
+         * tests/nested_fuzz (seed 116, depth 3). */
         "jit: a reused temp (foreach snapshot) is never register-cached",
         {
             "var A = [1, 2, 3, 4, 5, 6, 7];",
@@ -8741,7 +8741,7 @@ static const std::vector<test> tests =
         /*
          * A const-folded `if (true) { ... }` inside a loop leaves a bare nested
          * block; verify it RUNS correctly on both engines (the codegen compiles
-         * a scope-free bare block in place). Found by tests/nested_fuzz.py.
+         * a scope-free bare block in place). Found by tests/nested_fuzz.
          */
         "vm/codegen: const-folded if leaves a runnable native bare block",
         {
@@ -17488,7 +17488,7 @@ negative_shift_caret_parity()
  * and the run counts the programs whose caret is the WHOLE expression
  * (an operation error) and those whose caret is the lvalue alone - both
  * must be well represented, or the matrix no longer tests the split.
- * tests/bt_oracle/compound_*.my carry representatives through the CLI
+ * tests/backtrace/compound_*.my carry representatives through the CLI
  * configurations -rt cannot reach (.myv, the JIT levers).
  */
 static bool
@@ -17734,7 +17734,7 @@ compound_store_caret_parity()
  *    record's pop did the same (a phantom `pre` above every level of
  *    deep_mutual under `jit cap 32`).
  * Every program throws on a WARMED iteration (a first descent never
- * takes the emitted push). tests/bt_oracle.py runs the same property
+ * takes the emitted push). tests/bt_oracle runs the same property
  * over the CLI configurations -rt cannot reach (the JIT levers, a .myv
  * image, --no-opt all).
  *
@@ -17869,7 +17869,7 @@ print(drive(runtime(4)));)",
          * cap (the SWITCH path), every call site inside an inlined
          * region. NOT deeper: the -ni tree-walker reference recurses on
          * the C STACK, and at 300 levels MSVC's frames overflowed the
-         * Windows lane's 8MB (exit 127). tests/bt_oracle.py keeps the
+         * Windows lane's 8MB (exit 127). tests/bt_oracle keeps the
          * full depth for the CLI's default cap. */
         R"(func walk(int n, int k) {
     if (n == 0) return 10 / (k - 1);
@@ -22129,7 +22129,7 @@ static bool jit_ret_ref_native()
 /*
  * NET 2 - THE DETERMINISTIC EVENT SWEEP, in-suite seed.
  *
- * The full sweep is tests/norec_sweep.py, which walks N over a
+ * The full sweep is tests/norec_sweep, which walks N over a
  * program's whole call-event count, one process per N; that is too many
  * processes for -rt. This entry is the seed: it forces the probe at a
  * few events IN PROCESS and asserts it actually reconstructed frames,
@@ -24457,7 +24457,7 @@ static bool hoist_slice_shapes()
  * Each program runs parse -> infer -> optimize -> execute with folding ON
  * and OFF, on BOTH engines, and the four runs must print the same stdout
  * and render the same error (message, caret, backtrace) - byte for byte.
- * The driver's -nc pass (tests/corpus_diff.sh) is the same check over the
+ * The driver's -nc pass (tests/corpus_diff) is the same check over the
  * corpus; this is the in-process half, and it names the shapes.
  */
 struct NcCase {
@@ -29487,7 +29487,7 @@ static bool myv_struct_const_func()
  * tree-walker arm into a NULL DEREFERENCE: a named abort in a debug build,
  * and a SIGSEGV in the ASSERTS=0 release where that ML_CHECK is compiled
  * away - the exact failure #137's hardening exists to prevent. Found by
- * tests/myv_fuzz.py.
+ * tests/myv_fuzz.
  *
  * BOTH HALVES ARE ASSERTED, because neither tier is sufficient alone:
  *
@@ -35074,7 +35074,7 @@ static bool jit_frameless_w2_shape()
                      * this TESTS build the POISON captures are stored
                      * there instead (jit_poison_captures); the release
                      * form, with nothing at all between the push and
-                     * the call, is pinned by tests/driver_checks.sh */
+                     * the call, is pinned by tests/driver_checks */
                     "movabs rax, <addr>",        /* jit_poison_captures */
                     "mov [r9+0x*], rax",
                     "mov rdi, r1*",              /* 1A: the pinned i */
@@ -35159,7 +35159,7 @@ static bool jit_frameless_w2_shape()
  * proven-scalar capture (LoadCaptureV with cap_scalar: raw, SKIPPED)
  * and an int add (SKIPPED). The parameters' tails and binds precede.
  * The RELEASE form (no poison, the slots simply absent from the site)
- * is pinned by tests/driver_checks.sh against a non-TESTS binary.
+ * is pinned by tests/driver_checks against a non-TESTS binary.
  */
 /*
  * W3's derivation and a slot that is READ BUT NEVER WRITTEN (2026-09-22,
@@ -35357,7 +35357,7 @@ static bool jit_frameless_w3_shape()
  * #97 increment 3, W4 - THE CAPTURE BASE FROM THE SITE. Read from the
  * dump (a TESTS build, so the site's repoint is replaced by the POISON
  * store - jit_poison_captures - where the release build emits nothing;
- * the release form is pinned by tests/driver_checks.sh):
+ * the release form is pinned by tests/driver_checks):
  *  - a callee with NO captures (76's shape): the site pushes the
  *    caller's captures into the residue and does NOT repoint - the
  *    two instructions after the push are the poison store, then the
@@ -49336,7 +49336,7 @@ static bool vm_codegen_shapes()
      * block `{ ... }`; the loop-body compiler compiles a scope-free bare block
      * IN PLACE (it used to bail the whole loop to one EvalStmt). `1 < 2` folds
      * to true, so the if drops but keeps its braced body. (Found by the
-     * tests/nested_fuzz.py differential fuzzer.) */
+     * tests/nested_fuzz differential fuzzer.) */
     VmOpCounts blk;
     if (!codegen_counts({
             "var s = 0;",
@@ -49646,7 +49646,7 @@ static bool vm_codegen_shapes()
  * and desynchronised the rest of the fragment.
  *
  * NONE of that failed anything. The dump just quietly lied, and two
- * tools built on top of it (vdjcmp.sh, and my own reading of `-vdj`)
+ * tools built on top of it (vdjcmp, and my own reading of `-vdj`)
  * inherited the lie.
  *
  * So the check is DERIVED FROM THE EMITTED CODE, not from a list of
@@ -49885,7 +49885,7 @@ static bool jit_disasm_decodes_all()
                  * in one instruction - and put an address inside the
                  * brackets the scanner was skipping. A raw pointer then
                  * reached the text, `-vdj` stopped being reproducible,
-                 * and `vdjcmp.sh` refused every comparison from that
+                 * and `vdjcmp` refused every comparison from that
                  * day.
                  *
                  * A check that enumerates the PLACES a hazard can occur
@@ -49941,7 +49941,7 @@ static bool jit_disasm_decodes_all()
          * The oracle property `-vdj` must have is: THE SAME BINARY ON
          * THE SAME PROGRAM, IN SEPARATE PROCESSES, GIVES IDENTICAL
          * TEXT (and so does a second binary built from the same
-         * source). That is what scripts/vdjcmp.sh rests on, and it is
+         * source). That is what scripts/vdjcmp rests on, and it is
          * verified there over 108 programs.
          *
          * A first version of this test asserted something STRONGER and

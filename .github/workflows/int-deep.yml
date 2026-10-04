@@ -10,7 +10,7 @@
 #            every larger decision scope (~110k runs). Under the
 #            float-pool-restore sabotage it failed 11 programs where
 #            tier 1 failed 4 and tier 2 one.
-#  - select: tests/int_select.py - every candidate's coverage, the
+#  - select: tests/int_select - every candidate's coverage, the
 #            irredundant cover and its ownership table (a report and a
 #            JSON artifact; it fails only on a wrong answer or a broken
 #            coverage pass).
@@ -24,7 +24,7 @@ on:
         type: boolean
         default: true
       select:
-        description: "tests/int_select.py (cover + ownership table)"
+        description: "tests/int_select (cover + ownership table)"
         type: boolean
         default: true
 
@@ -44,9 +44,9 @@ jobs:
       run: |
         ./build-enum/mylang -v | grep -q '^  int_tests  *1'
         ./build-enum/mylang -v | grep -q '^  asserts  *1'
-    - name: tests/int_enum.py (tier 3, tests/functional + samples)
+    - name: tests/int_enum (tier 3, tests/functional + samples)
       run: |
-        python3 tests/int_enum.py ./build-enum/mylang --tier 3 \
+        tests/int_enum ./build-enum/mylang --tier 3 \
                 --heartbeat 120 --failures-out int-enum-failures-t3.txt \
                 tests/functional/*.my samples/fib samples/gcd samples/loop \
                 samples/primes samples/primes2 samples/strloop
@@ -73,9 +73,9 @@ jobs:
     - name: Build (INT_TESTS + GCOV, debug)
       run: make -j"$(nproc)" CXX=g++-14 OPT=0 TESTS=1 INT_TESTS=1 GCOV=1 \
                 BUILD_DIR=build-sel
-    - name: tests/int_select.py (--with-rt)
+    - name: tests/int_select (--with-rt)
       run: |
-        python3 tests/int_select.py ./build-sel/mylang --with-rt \
+        tests/int_select ./build-sel/mylang --with-rt \
                 --heartbeat 120 --out int-select.json | tee int-select.txt
     - name: Upload the report
       if: always()

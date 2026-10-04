@@ -8,7 +8,7 @@
 #   PROGRESS   a heartbeat line on stderr every `heartbeat` seconds (done /
 #              total, rate, ETA, failures) - the CI log's view;
 #   CONTROL    a unix-domain socket the run listens on, registered in the
-#              runs directory (tests/testctl.py list | status | failures |
+#              runs directory (tests/testctl list | status | failures |
 #              stop | pause | resume | jobs N). One JSON object per line in
 #              each direction, so a new action is one more `elif`;
 #   RESUME     the work is an ORDERED, DETERMINISTIC sequence of items, so
@@ -33,7 +33,7 @@
 # uses a `Monitor` instead: the same socket, heartbeat line and status
 # fields, fed by the tool's own `advance()` / `phase()` calls, without
 # the resume machinery. EVERY test tool that can run for more than a
-# minute serves one or the other, so `tests/testctl.py` (no arguments)
+# minute serves one or the other, so `tests/testctl` (no arguments)
 # lists everything running with a percentage.
 #
 # THE STATUS FIELDS both serve (the `status` action): name, pid, phase,
@@ -150,7 +150,7 @@ class Monitor:
                  percent_fn=None, pid=None):
         self.name = name
         # the pid shown and used in the socket name: the tool's own, or
-        # (tests/testmon.py) the shell tool it watches
+        # (tests/testmon) the shell tool it watches
         self.pid = pid or os.getpid()
         self.total = total
         self.done = 0
@@ -263,7 +263,7 @@ def parse_token(token):
 class Run:
     """Drives `work(i, item) -> failure-text-or-None` over `items`.
 
-    `name` labels the run (tests/testctl.py list), `fp` is the plan
+    `name` labels the run (tests/testctl list), `fp` is the plan
     fingerprint, `resume` an optional token. `describe(item)` renders an
     item for status displays."""
 

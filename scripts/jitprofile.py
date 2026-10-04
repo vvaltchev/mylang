@@ -15,7 +15,7 @@ This joins two things that already exist:
 
   * `MYLANG_JIT_MAP=<path>` (disasm.cpp) - one line per emitted
     instruction at its RUNTIME address, decoded by the SAME decoder
-    `-vdj` uses and `scripts/disasmcheck.py` cross-checks against
+    `-vdj` uses and `scripts/disasmcheck` cross-checks against
     objdump, so a length here is a length objdump agrees with;
   * callgrind `--dump-instr=yes` - Ir per absolute address.
 

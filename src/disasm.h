@@ -71,7 +71,7 @@ std::string disassemble_program(const Block *root);
  * are different kinds here.
  *
  * So `decode_one` FILLS one of these and the dump is `render(it)` -
- * one decoder still, the one `scripts/disasmcheck.py` verifies against
+ * one decoder still, the one `scripts/disasmcheck` verifies against
  * objdump, and the text cannot disagree with the structure because it
  * is derived from it.
  *
@@ -151,7 +151,7 @@ extern std::vector<DecodedFrag> *g_jit_decode_sink;
 
 /*
  * Decode ONE instruction at code[p] (advancing p) into `out` - the
- * same decoder `-vdj` renders and `scripts/disasmcheck.py` cross-checks
+ * same decoder `-vdj` renders and `scripts/disasmcheck` cross-checks
  * against objdump. `out.ok` is false for a byte it does not know (p
  * then advances by one).
  *

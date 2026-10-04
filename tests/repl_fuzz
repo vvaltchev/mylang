@@ -13,10 +13,10 @@ THE CONTRACT is the same one: an error is fine, an ERROR MESSAGE is fine,
 `:quit` is fine - a SIGSEGV, a std::terminate or a hang is not. A REPL that
 rejects a line must stay usable for the next one.
 
-    tests/repl_fuzz.py ./build/mylang            # the default 1500 sessions
-    tests/repl_fuzz.py ./build/mylang -n 6000
-    tests/repl_fuzz.py ./build/mylang --save /tmp/bad
-    tests/repl_fuzz.py ./build/mylang --seed 77      # other sessions
+    tests/repl_fuzz ./build/mylang            # the default 1500 sessions
+    tests/repl_fuzz ./build/mylang -n 6000
+    tests/repl_fuzz ./build/mylang --save /tmp/bad
+    tests/repl_fuzz ./build/mylang --seed 77      # other sessions
 
 The seed is printed first. CI passes a fresh one per run, so each push
 tries new sessions; the default is fixed, so a bare run is repeatable.
@@ -26,14 +26,15 @@ the retained-AST / interned-pointer machinery shows up, and the REPL is where
 this codebase has historically had those (see the cross-input template
 instantiation bug in CLAUDE.md).
 
-Stdlib only (the no-dependencies rule), like tests/nested_fuzz.py.
+Stdlib only (the no-dependencies rule), like tests/nested_fuzz.
 """
 import os
 import random
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib"))
 from testrun import Monitor  # noqa: E402
 
 # The generator is TEMPLATE-based rather than character-random on purpose:
@@ -104,7 +105,7 @@ def main():
     print('seed %d (reproduce with --seed %d -n %d)' % (seed, seed, n))
     rnd = random.Random(seed)
     hangs = crashes = 0
-    # progress: tests/testctl.py lists this run with its percentage
+    # progress: tests/testctl lists this run with its percentage
     mon = Monitor('repl_fuzz', total=n, phase='sessions').__enter__()
     for i in range(n):
         mon.set_current('session %d' % i)
