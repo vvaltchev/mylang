@@ -1,0 +1,8 @@
+:trace all on
+:int
+x = [];
+print[3.5];
+var i = 2_;
+:globals
+:undef i
+:quit

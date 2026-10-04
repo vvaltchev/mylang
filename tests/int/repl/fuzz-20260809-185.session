@@ -1,0 +1,7 @@
+throw -9223372036854775808;
+:trace _ on
+:analyze v1 = 9223372036854775807;
+:trace a on
+:a
+continue;
+:quit

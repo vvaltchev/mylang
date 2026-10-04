@@ -1,0 +1,5 @@
+struct P { float a; str b; }
+:analyze a = 9223372036854775807;
+:show {"k":1} + {"k":1}
+:tree var a = 3.5;
+:quit

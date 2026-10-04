@@ -1,0 +1,9 @@
+throw -9223372036854775808;
+throw none;
+:help
+		a;
+throw [1,2];
+/* unterminated
+rethrow;
+/* unterminated
+:quit

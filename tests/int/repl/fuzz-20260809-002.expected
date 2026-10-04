@@ -1,0 +1,15 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> a = 9223372036854775807;
+>> SyntaxError at line 1, col 5
+
+    {"k":1} + {"k":1};
+        ^^^^^^^^^^^^^^
+Expected operator ';', got: ':'
+>> Block(
+  VarDecl(
+    Id("a")
+    Op '='
+    Float(3.500000)
+  )
+)
+>> 

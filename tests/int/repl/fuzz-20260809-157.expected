@@ -1,0 +1,6 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> Undefined variable 'f' at line 1, col 9:10
+
+    var b = f({"k":1});
+            ^
+>> >> 

@@ -1,0 +1,24 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> => <Builtin(print)>
+>> Undefined variable 'q' at line 1, col 1:2
+
+    q + 1;
+    ^
+>> Undefined variable 'q' at line 1, col 1:2
+
+    q + 1;
+    ^
+>> CannotRebindBuiltinEx: Cannot rebind builtin at line 2, col 1:11
+
+    print = "x";
+    ^^^^^^^^^^
+>> NullabilityEx: possibly-none value used as a member-access base (type 'dyn?') at line 3, col 1:6
+
+    print.print;
+    ^^^^^
+>> .. .. SyntaxError at line 5, col 1
+
+    :quit;
+    ^^^^^^
+Expected operator '}', got: ':'
+>> 

@@ -1,0 +1,14 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> usage: :undef <name>
+>> TypeErrorEx: The object does NOT support subscript operator [] at line 1, col 1:13
+
+    len[{"k":1}];
+    ^^^^^^^^^^^^
+>> Failed to open file '/nonexistent'
+>> Unknown command ':' (try :help)
+>> SyntaxError at line 1, col 11
+
+    var v1 = -9223372036854775808;
+              ^^^^^^^^^^^^^^^^^^^^
+Integer literal out of range
+>> 

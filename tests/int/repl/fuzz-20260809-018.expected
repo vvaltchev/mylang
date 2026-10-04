@@ -1,0 +1,11 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> Invalid token:  at line 1, col 1:3
+
+    b;
+    ^^
+>> >> .. .. .. .. .. SyntaxError at line 4, col 1
+
+    :type
+    ^^^^^
+Expected expression, got ':'
+>> 

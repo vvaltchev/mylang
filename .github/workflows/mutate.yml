@@ -1,0 +1,103 @@
+# MUTATION TESTING (tests/mutate.py) - ON DEMAND ONLY.
+#
+# Coverage says a test REACHED a line; this asks whether any test would
+# FAIL if the line computed the wrong thing. Each mutant is one small
+# edit to src/ (`<` for `<=`, `-` for `+`, a negated condition, a
+# constant off by one), a rebuild and the test stages in order; a mutant
+# no stage kills is a SURVIVOR - a place where a wrong answer would ship
+# unnoticed. "Killed only by fuzz" is the measured value of the fuzzers:
+# the deterministic stages all run first.
+#
+# Hours of machine time for a few hundred mutants, so it is never run on
+# push: dispatch it after an arc of complex changes. The sample is split
+# over 8 jobs; the `report` job merges them into the run summary and an
+# artifact.
+name: Mutation
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "mutants in the whole sample (split over 8 jobs)"
+        default: "200"
+      seed:
+        description: "sample seed (keep it to compare two runs)"
+        default: "1"
+      files:
+        description: "comma-separated .cpp files to mutate"
+        default: "src/jit.cpp,src/codegen.cpp,src/vm.cpp,src/eval.cpp,src/inferencer.cpp,src/resolver.cpp,src/parser.cpp,src/serialize.cpp"
+      stages:
+        description: "stages, in order (rt,corpus,int,enum,fuzz)"
+        default: "rt,corpus,int,enum,fuzz"
+
+jobs:
+  mutate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    name: mutate (shard ${{matrix.shard}}/8)
+    env:
+      # a CI runner has nobody at the keyboard: use every core
+      MYLANG_TEST_JOBS: 4
+    steps:
+    - uses: actions/checkout@v4
+    - name: tests/mutate.py
+      run: python3 tests/mutate.py --count ${{inputs.count}}
+           --seed ${{inputs.seed}} --shard ${{matrix.shard}}/8 --jobs 1
+           --files "${{inputs.files}}" --stages "${{inputs.stages}}"
+           --heartbeat 600 --out mutate-${{matrix.shard}}.json
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: mutate-${{matrix.shard}}
+        path: mutate-${{matrix.shard}}.json
+        if-no-files-found: ignore
+
+  report:
+    needs: mutate
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: mutate-*
+        merge-multiple: true
+    - name: merge the shards
+      run: |
+        python3 - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+        import glob, json
+        muts, stages = [], []
+        for f in sorted(glob.glob("mutate-*.json")):
+            d = json.load(open(f))
+            muts += d["mutants"]
+            stages = d["stages"]
+        n = {}
+        for m in muts:
+            n[m["verdict"]] = n.get(m["verdict"], 0) + 1
+        viable = len(muts) - n.get("stillborn", 0)
+        killed = viable - n.get("survived", 0)
+        print("## Mutation testing\n")
+        print("%d mutants: %d stillborn, %d viable, %d killed, **%d "
+              "survived**" % (len(muts), n.get("stillborn", 0), viable,
+                               killed, n.get("survived", 0)))
+        if viable:
+            print("\nscore **%.1f%%**\n" % (100.0 * killed / viable))
+        print("| stage | killed |\n|---|---|")
+        for s in stages:
+            print("| %s | %d |" % (s, n.get(s, 0)))
+        for title, v in (("Killed only by the fuzzers", "fuzz"),
+                         ("Survivors", "survived")):
+            rows = [m["mutant"] for m in muts if m["verdict"] == v]
+            if rows:
+                print("\n### %s (%d)\n" % (title, len(rows)))
+                for r in rows:
+                    print("- `%s`" % r)
+        json.dump(muts, open("mutate-all.json", "w"), indent=1)
+        EOF
+    - uses: actions/upload-artifact@v4
+      with:
+        name: mutate-report
+        path: mutate-all.json

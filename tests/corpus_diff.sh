@@ -259,7 +259,21 @@ $CONFIGS
 EOF_CFG
   done
 }
+# PROGRESS: tests/testctl.py lists this run with its percentage - a
+# finished unit leaves its .rc file, which tests/testmon.py counts (it
+# exits by itself if this script dies; python3 is optional here)
+MON=
+if command -v python3 >/dev/null 2>&1; then
+  TOTAL=$(emit_units | tr -cd '\000' | wc -c)
+  python3 tests/testmon.py corpus_diff $((TOTAL / 4)) "$RES" '*.rc' \
+    --pid $$ --phase runs &
+  MON=$!
+fi
 emit_units | xargs -0 -n 4 -P "$JOBS" bash "$SELF" __unit "$RES"
+if [ -n "$MON" ]; then
+  kill "$MON" 2>/dev/null
+  wait "$MON" 2>/dev/null
+fi
 
 # the saved output / exit status of unit $1
 out_of() { cat "$RES/$1.out"; }

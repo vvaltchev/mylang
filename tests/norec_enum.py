@@ -58,6 +58,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testjobs  # noqa: E402  (tests/jobs.sh: worker count + idle class)
+from testrun import Monitor  # noqa: E402
 
 KINDS = ("plain", "try", "tryfin", "diter")
 TERMINALS = ("ret_int", "ret_float", "throw")
@@ -267,10 +268,13 @@ def main():
 
     fails = []
     done = 0
-    with ProcessPoolExecutor(max_workers=args.jobs) as ex:
+    # progress: tests/testctl.py lists this run with its percentage
+    mon = Monitor("norec_enum", total=len(paths), phase="programs")
+    with mon, ProcessPoolExecutor(max_workers=args.jobs) as ex:
         for path, problems, ref_err in ex.map(
                 run_one, [(args.binary, p) for p in paths], chunksize=4):
             done += 1
+            mon.advance(failed=bool(problems))
             if problems:
                 fails.append((path, problems, ref_err))
             if done % 200 == 0:

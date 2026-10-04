@@ -1,0 +1,38 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> TypeErrorEx: Struct 'int' has no member 'int' at line 2, col 1:7
+
+    int.int;
+    ^^^^^^
+>> Undefined variable 'i' at line 1, col 1:2
+
+    i + 1;
+    ^
+>> MyLang REPL help
+Documentation:
+  :help builtins          all builtins, grouped by category
+  :help builtins <cat>    one builtin category
+  :help <builtin>         one builtin (signature + description)
+  :help language          language features, grouped by category
+  :help <category>        one language category
+  :help <feature>         one language feature (incl. optimizations)
+  :help commands          the REPL commands (:help <command> for one)
+Inspection:
+  :globals  :type <expr>  :show <func>  :tree <code>  :analyze <code>
+  :trace <cat> on|off     narrate the compiler's reasoning (:trace help)
+Session: :source <file>  :quit
+>> Invalid token:  at line 3, col 1:3
+
+    int;
+    ^^
+>> .. Invalid token: 2_ at line 5, col 13:15
+
+    var print = 2_;
+                ^^
+>> Block(
+  VarDecl(
+    Id("i")
+    Op '='
+    Obj({})
+  )
+)
+>> 

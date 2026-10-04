@@ -69,6 +69,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+from testrun import Monitor  # noqa: E402
 EXEMPT = "INT-COV-EXEMPT"
 # the samples the census runs: the ones that read no stdin and call no
 # rand() (phonebook / shopping read input; rand_sort is random)
@@ -120,9 +122,11 @@ def vdj_mask(text, strip=False):
     return [l for l in text.splitlines() if l.strip()]
 
 
-def run(cmd, env, timeout):
+def run(cmd, env, timeout, stdin=None):
     p = subprocess.run(cmd, capture_output=True, text=True, env=env,
-                       timeout=timeout, stdin=subprocess.DEVNULL)
+                       timeout=timeout, errors="surrogateescape",
+                       **({"input": stdin} if stdin is not None
+                          else {"stdin": subprocess.DEVNULL}))
     return p.returncode, p.stdout, p.stderr
 
 
@@ -326,18 +330,33 @@ def int_configs(prog):
     return confs
 
 
+# an engine name -> its command-line flags. `vm` is the default engine
+# spelled out, `nbi` the bytecode inliner off, `noopt` every AST
+# transform off (`--no-opt all`); `+` joins two (`nbi+nj`, `tw+noopt`).
+ENGINE_FLAGS = {"default": [], "tw": ["-tw"], "nj": ["-nj"],
+                "vm": ["-vm"], "nbi": ["-nbi"],
+                "noopt": ["--no-opt", "all"]}
+
+
+def engine_flags(eng):
+    out = []
+    for part in eng.split("+"):
+        out += ENGINE_FLAGS[part]
+    return out
+
+
 def int_engines(prog):
     """The engines a tests/int program runs under: its `# INT-ENGINES:`
-    header line (`default`, `tw`, `nj`), else both the default engine and
-    the tree-walker. A test asserting on a CODEGEN or JIT decision names
-    `default` alone - the tree-walker never runs those passes, so it
-    records nothing there."""
+    header line (names from ENGINE_FLAGS, joined with `+`), else both the
+    default engine and the tree-walker. A test asserting on a CODEGEN or
+    JIT decision names `default` alone - the tree-walker never runs those
+    passes, so it records nothing there."""
     h = int_header(prog, "INT-ENGINES")
     if not h:
         return ["default", "tw"]
     engs = h.split()
     for e in engs:
-        if e not in ("default", "tw", "nj"):
+        if any(p not in ENGINE_FLAGS for p in e.split("+")):
             raise SystemExit("int_run: %s: unknown engine %r" % (prog, e))
     return engs
 
@@ -361,6 +380,8 @@ def main():
                     help="--gcov: write the ownership table and the "
                          "uncovered list here")
     ap.add_argument("--timeout", type=float, default=3600.0)
+    ap.add_argument("--update-repl", action="store_true",
+                    help="rewrite tests/int/repl/*.expected from this binary")
     args = ap.parse_args()
     binary = os.path.abspath(args.binary)
     build_dir = os.path.dirname(binary)
@@ -383,14 +404,27 @@ def main():
         print("  gcov: %s" % tool)
     units = []
     if not args.no_rt:
-        units.append(("-rt", [[(["-rt"], {})]]))
+        units.append(("-rt", [[(["-rt"], {}, None)]]))
     progs = sorted(glob.glob(os.path.join(HERE, "int", "*.my")))
     for prog in progs:
         groups = []          # one per configuration: [(cmd, env-extra)]
         for conf in int_configs(prog):
-            groups.append([([prog] if eng == "default" else ["-" + eng, prog],
-                            conf) for eng in int_engines(prog)])
+            groups.append([(engine_flags(eng) + [prog], conf, None)
+                           for eng in int_engines(prog)])
         units.append((os.path.relpath(prog, ROOT), groups))
+    # REPL SESSIONS (tests/int/repl/*.session): the interactive front end
+    # - the input loop, history, the line editor's off-TTY path, error
+    # rendering - which `-rt`'s REPL tests never reach (they drive
+    # ReplEngine directly). Each is fed on stdin under a fresh HOME (the
+    # history file) and must print exactly its `.expected`, nothing on
+    # stderr, exit 0. Found by repl_fuzz; kept because each owns
+    # coverage nothing else has. --update-repl rewrites the `.expected` files.
+    for sess in sorted(glob.glob(os.path.join(HERE, "int", "repl",
+                                              "*.session"))):
+        with open(sess, errors="surrogateescape") as f:
+            text = f.read()
+        units.append((os.path.relpath(sess, ROOT),
+                      [[(["--repl"], {}, (text, sess[:-8] + ".expected"))]]))
 
     failures = []
     if not progs:
@@ -398,13 +432,16 @@ def main():
     covered_by = {}
     universe = {}
     ex_cache = {}
-    with tempfile.TemporaryDirectory(prefix="mylang-int-") as tmp:
+    # progress: tests/testctl.py lists this run with its percentage
+    mon = Monitor("int_run", total=len(units), phase="units")
+    with mon, tempfile.TemporaryDirectory(prefix="mylang-int-") as tmp:
         census = os.path.join(tmp, "census.txt")
         scratch = os.path.join(tmp, "gcov")
         os.mkdir(scratch)
         env = dict(os.environ, MYLANG_INT_OUT=census, TMPDIR=tmp)
 
         for name, cmds in units:
+            mon.set_current(name)
             if args.gcov:
                 for g in glob.glob(os.path.join(build_dir, "**", "*.gcda"),
                                    recursive=True):
@@ -413,14 +450,47 @@ def main():
             ok = True
             fails = []
             for group in cmds:
-                results = [run([binary] + c,
-                               dict(env, **extra,
-                                    **({} if name == "-rt"
-                                       else {"MYLANG_INT_CENSUS": "1",
-                                             "MYLANG_INT_PROBE": "1"})),
-                               args.timeout)
-                           for c, extra in group]
-                for (c, extra), r in zip(group, results):
+                results = []
+                for c, extra, repl in group:
+                    if repl:
+                        # the REPL retains its inputs' programs, like -rt:
+                        # no object census; a fresh HOME per session
+                        home = tempfile.mkdtemp(dir=tmp)
+                        results.append(run([binary] + c,
+                                           dict(env, HOME=home),
+                                           args.timeout, stdin=repl[0]))
+                        continue
+                    results.append(run(
+                        [binary] + c,
+                        dict(env, **extra,
+                             **({} if name == "-rt"
+                                else {"MYLANG_INT_CENSUS": "1",
+                                      "MYLANG_INT_PROBE": "1"})),
+                        args.timeout))
+                for (c, extra, repl), r in zip(group, results):
+                    if not repl:
+                        continue
+                    if args.update_repl:
+                        with open(repl[1], "w",
+                                  errors="surrogateescape") as f:
+                            f.write(r[1])
+                    want = None
+                    if os.path.exists(repl[1]):
+                        with open(repl[1], errors="surrogateescape") as f:
+                            want = f.read()
+                    if want is None:
+                        ok = False
+                        fails.append("no %s (--update-repl writes it)"
+                                     % os.path.relpath(repl[1], ROOT))
+                    elif r[1] != want:
+                        ok = False
+                        fails.append("the REPL printed something other "
+                                     "than %s"
+                                     % os.path.relpath(repl[1], ROOT))
+                    if r[2]:
+                        ok = False
+                        fails.append("stderr: " + r[2][-2000:])
+                for (c, extra, _repl), r in zip(group, results):
                     for l in r[2].splitlines():
                         if l.startswith(("census LEAK", "INT-VMSTATE",
                                          "INT-JITSTATE")):
@@ -439,7 +509,7 @@ def main():
                                  % (" ".join("%s=%s" % kv for kv in
                                              group[0][1].items())
                                     or "default"))
-                for (c, extra), r in zip(group, results):
+                for (c, extra, _repl), r in zip(group, results):
                     if r[0] != 0:
                         fails.append("`%s%s` rc=%d\n%s" % (
                             "".join("%s=%s " % kv for kv in extra.items()),
@@ -449,6 +519,7 @@ def main():
                 print("        " + f)
             if not ok:
                 failures.append(name)
+            mon.advance(failed=not ok)
 
             if args.gcov:
                 try:
@@ -482,7 +553,10 @@ def main():
         corpus += [os.path.join(ROOT, "samples", s) for s in CENSUS_SAMPLES]
         leaks = 0
         probes = 0
+        mon.phase("census", total=len(corpus))
         for prog in corpus:
+            mon.set_current(os.path.relpath(prog, ROOT))
+            mon.advance()
             outs = {}
             for eng in (["-tw"], [], ["-nj"]):
                 r = run([binary] + eng + [prog],
@@ -516,7 +590,10 @@ def main():
         # probe calls dropped and byte offsets masked, is the emitted code
         # without them - instruction for instruction
         invis = 0
+        mon.phase("probe-invisible", total=len(corpus))
         for prog in corpus:
+            mon.set_current(os.path.relpath(prog, ROOT))
+            mon.advance()
             plain = run([binary, "-vdj", prog], env, args.timeout)[1]
             probed = run([binary, "-vdj", prog],
                          dict(env, MYLANG_INT_PROBE="1"), args.timeout)[1]

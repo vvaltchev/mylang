@@ -49,6 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testjobs  # noqa: E402  (tests/jobs.sh: worker count + idle class)
+from testrun import Monitor  # noqa: E402
 
 # A SMALL modulus keeps every value 2 digits, so the generated code is readable
 # and the variety is visibly in the control flow / operation KINDS, not in the
@@ -612,8 +613,11 @@ def main():
 
     if args.random:
         args.seed = random.randrange(1, 2 ** 31)
-        print("# --random: base seed = %d "
-              "(reproduce with --seed %d)\n" % (args.seed, args.seed))
+    if not args.show:
+        # always: CI passes a fresh --seed per run, and a failure must
+        # say how to reproduce it
+        print("# base seed = %d (reproduce with --seed %d --count %d)\n"
+              % (args.seed, args.seed, args.count))
 
     def pick_depth(seed):
         if args.show and args.show_depth is not None:
@@ -674,6 +678,8 @@ def main():
         fb = args.check_fallbacks and has_fallback(args.mylang, my_path)
         os.remove(my_path)
         os.remove(py_path)
+        mon.set_current("seed %d" % seed)
+        mon.advance()
         return seed, depth, my_src, py_src, results, fb
 
     def run_engines(my_path, py_path):
@@ -715,7 +721,9 @@ def main():
             results["tw-nti"] = run([args.mylang, "-tw", "-nti"], my_path)
         return results
 
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
+    # progress: tests/testctl.py lists this run with its percentage
+    mon = Monitor("nested_fuzz", total=args.count, phase="programs")
+    with mon, ThreadPoolExecutor(max_workers=jobs) as pool:
         checked = list(pool.map(check, range(args.count)))
     os.rmdir(tmp)       # every program removed its own files
 

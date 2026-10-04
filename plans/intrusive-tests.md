@@ -705,3 +705,39 @@ test that owns nothing.
   tier-1 deviations, the tests/int programs (which carry their own
   configs) and fuzzer findings as candidates; emitted-edge and value-
   class elements (9.1) do not exist yet, so the universe is gcov's.
+
+### 9.8 What the fuzzers add, measured (2026-10-04)
+
+Every program the per-push CI fuzzers run (their fixed seeds then) was
+measured once on the GCOV INT build against the deterministic set
+(int_select's candidates + tests/int + `-rt`, 81,428 elements):
+
+- **nested_fuzz** (250 programs x 6 engines): 99 elements no
+  deterministic test reaches (43 of them the `-nbi` / `--no-opt` CLI
+  handling); 11 of its 1,500 runs cover them all.
+- **myv_fuzz** (800 images): 84 (48 in the loader's refusal paths);
+  12 of 800.
+- **repl_fuzz** (400 sessions): 365 (the REPL front end - run_repl,
+  history, the line editor); 24 of 400.
+
+**This is REACH, not checking, and it does not justify cutting a
+fuzzer** (maintainer, the same day): a run that adds no coverage can
+still catch a wrong VALUE on a covered line (`2*x` vs `2+x` agree at
+x = 2). What followed from it:
+
+- the four nested_fuzz engine configurations joined int_select's
+  defaults, which absorbed 2 of the 8 contributing programs outright;
+- the other 6 are tests/int/16-21, shrunk (`--shrink`, output lines
+  pinned) and then made to print every top-level variable
+  (`observe_globals`) - the first shrink kept their coverage and
+  printed NOTHING, the second kept a print of a constant; the oracle is
+  agreement with the tree-walker on the SHRUNK program, so the values
+  have to be put back under comparison explicitly;
+- the 24 REPL sessions are tests/int/repl/, compared against fixed
+  `.expected` files;
+- the CI fuzzers take a FRESH SEED per run - with a fixed seed they were
+  a regression corpus, not exploration;
+- the evidence a cut needs is MUTATION testing (`tests/mutate.py`,
+  `mutate.yml`, on demand): the fuzzers run as the last stage, so
+  "killed by fuzz" counts exactly the planted bugs no deterministic test
+  noticed.
