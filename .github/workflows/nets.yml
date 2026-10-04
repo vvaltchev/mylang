@@ -325,10 +325,15 @@ jobs:
       run: |
         ./build-enum/mylang -v | grep -q '^  int_tests  *1'
         ./build-enum/mylang -v | grep -q '^  asserts  *1'
-    - name: tests/int_enum.py (tier 1, tests/functional)
+    # tests/functional plus samples/ - minus phonebook and shopping
+    # (stdin-driven: with no input they reach no decision) and rand_sort
+    # (its output is random). bench/ is NOT a correctness corpus.
+    - name: tests/int_enum.py (tier 1, tests/functional + samples)
       run: |
         python3 tests/int_enum.py ./build-enum/mylang --heartbeat 60 \
-                --failures-out int-enum-failures.txt
+                --failures-out int-enum-failures.txt \
+                tests/functional/*.my samples/fib samples/gcd samples/loop \
+                samples/primes samples/primes2 samples/strloop
     - name: Upload the failures
       if: failure()
       uses: actions/upload-artifact@v4
