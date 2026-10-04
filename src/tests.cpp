@@ -29255,6 +29255,181 @@ static bool myv_root_slot_count_checked()
     return ok;
 }
 
+/*
+ * myv_fuzz fat-259 / fat-309 (2026-10-04): a uid's null form (0xFFFFFFFF)
+ * written over a STRUCT's name loaded cleanly, and the `throw` naming the
+ * struct dereferenced it (UBSan in a debug build, SIGSEGV in a release
+ * one). Every name a record cannot do without is now refused at load;
+ * this nulls each one in the writer-side program and requires a refusal
+ * that names it. Three are required only in one form of their record
+ * (an undefined_var throw site, an undef call argument), two only for the
+ * op that reads them (verify_chunk: the inc-dec member form, the
+ * `append(s.f, x)` builtin call); the call argument's form byte is bounded
+ * too. Each shape is asserted present, so a test that stops reaching one
+ * fails instead of passing vacuously.
+ */
+static bool myv_names_required()
+{
+    const char *lines_arr[] = {
+        "struct P { int x; int y; const K = 7; }",
+        "struct E { int code; }",
+        "struct B { array a; }",
+        "func add(a, b) { return a + b; }",
+        "var ps = [P(1, 2)];",
+        "append(ps, P(runtime(3), 4));",
+        "var dyn d = runtime({\"f\": 1});",
+        "d.f++;",
+        "var b = B([runtime(1)]);",
+        "append(b.a, 2);",
+        "var k = int(runtime(10));",
+        "var c = func [k] (x) { return x + k; };",
+        "try { throw E(add(ps[1].x, c(1))); }",
+        "catch (E as e) { print(e.code + d.f + len(b.a) + P.K); }" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        std::string tdir = "/tmp";
+        for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+            const std::optional<std::string> e = env_get(var);
+            if (e && !e->empty()) { tdir = *e; break; }
+        }
+        while (tdir.size() > 1
+               && (tdir.back() == '/' || tdir.back() == '\\'))
+            tdir.pop_back();
+        const std::string path = tdir + "/mylang-myv-names.myv";
+
+        /* the entries each case nulls, found by shape */
+        StructTypeDef *sd_p = nullptr, *sd_e = nullptr;
+        for (auto &sd : prog.structs) {
+            if (std::string(sd->name->val) == "P") sd_p = sd.get();
+            if (std::string(sd->name->val) == "E") sd_e = sd.get();
+        }
+        FuncDescriptor *f_add = nullptr, *f_cap = nullptr;
+        for (auto &d : prog.funcs) {
+            if (d->name && std::string(d->name->val) == "add")
+                f_add = d.get();
+            if (!d->captures.empty())
+                f_cap = d.get();
+        }
+        Chunk &ck = prog.root;
+        int lvm = -1, incm = -1;
+        for (const Instr &in : ck.code) {
+            if (in.op == OpCode::CallBuiltinLVMember)
+                lvm = static_cast<int>(in.a_dual_lo());
+            if (in.op == OpCode::IncDecMemberCheckedV)
+                incm = static_cast<int>(in.b_lit());
+        }
+        if (!sd_p || !sd_e || sd_p->fields.empty() || sd_p->consts.empty()
+            || !f_add || f_add->params.empty() || !f_cap
+            || ck.member_keys.empty() || ck.emplace_sites.empty()
+            || lvm < 0 || incm < 0 || prog.global_func_names.empty()) {
+            fprintf(stderr, "myv_names_required: a shape is missing (P %d, "
+                            "E %d, add %d, capture %d, member keys %zu, "
+                            "emplace %zu, lvm %d, incdec %d, globals %zu)\n",
+                    !!sd_p, !!sd_e, !!f_add, !!f_cap, ck.member_keys.size(),
+                    ck.emplace_sites.size(), lvm, incm,
+                    prog.global_func_names.size());
+            g_exec_engine = saved;
+            return false;
+        }
+
+        const auto refused = [&](const char *what,
+                                 const char *needle) -> bool {
+            myv_write(prog, path, MyvSourceRef());
+            try {
+                MyvSource img_src;
+                VmProgram loaded = myv_read(path, img_src);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError" && e.msg
+                        && strstr(e.msg, needle))
+                    return true;
+                fprintf(stderr, "myv_names_required [%s]: threw %s: %s\n",
+                        what, e.name, e.msg ? e.msg : "");
+                return false;
+            }
+            fprintf(stderr, "myv_names_required [%s]: ACCEPTED\n", what);
+            return false;
+        };
+        /* null one name, require the refusal, put it back */
+        const auto nulled = [&](const char *what, const UniqueId *&slot,
+                                const char *needle) {
+            const UniqueId *keep = slot;
+            slot = nullptr;
+            ok = refused(what, needle) && ok;
+            slot = keep;
+        };
+        nulled("struct name", sd_e->name, "struct with no name");
+        nulled("field name", sd_p->fields[0].name, "field with no name");
+        nulled("struct const name", sd_p->consts[0].first,
+               "struct const with no name");
+        nulled("parameter name", f_add->params[0].name,
+               "parameter with no name");
+        nulled("capture name", f_cap->captures[0].name,
+               "capture with no name");
+        nulled("member key", ck.member_keys[0].memUid,
+               "member key with no name");
+        nulled("emplace callee", ck.emplace_sites[0].bname,
+               "emplace callee with no name");
+        nulled("incdec member", ck.incdec_sites[incm].memUid,
+               "incdec member with no name");
+        nulled("builtin member", ck.builtin_calls[lvm].member,
+               "builtin member with no name");
+        nulled("global slot name", prog.global_func_names[0],
+               "global slot with no name");
+
+        /* the form-dependent ones: an extra record of that form */
+        Chunk::ThrowSite ts;
+        ts.kind = Chunk::ThrowKind::undefined_var;
+        ck.throws.push_back(ts);
+        ok = refused("undefined_var throw", "undefined_var throw with no "
+                                            "name") && ok;
+        ck.throws.pop_back();
+        Chunk::CallSite cs;
+        cs.a0_form = Chunk::CallSite::A0::undef;
+        ck.call_sites.push_back(cs);
+        ok = refused("undef call argument", "undefined call argument with "
+                                            "no name") && ok;
+        ck.call_sites.back().a0_form =
+            static_cast<Chunk::CallSite::A0>(9);
+        ok = refused("call argument form", "call site arg0 form") && ok;
+        ck.call_sites.pop_back();
+
+        myv_write(prog, path, MyvSourceRef());   /* intact: loads + runs */
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(loaded);
+        } catch (Exception &) {
+        }
+        std::cout.rdbuf(old_buf);
+        if (cap.str().compare(0, 2, "25") != 0) {
+            fprintf(stderr, "myv_names_required: ran to \"%s\"\n",
+                    cap.str().c_str());
+            ok = false;
+        }
+        std::remove(path.c_str());
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_names_required: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
 static bool myv_corrupt_refused()
 {
     const char *lines_arr[] = {
@@ -51049,6 +51224,10 @@ static const std::vector<extra_check> extra_checks =
     { "myv: v19 - the root chunk's slot_count and the stored root slot "
       "count must agree, either copy mutated is refused",
       myv_root_slot_count_checked },
+    { "myv: a name its record cannot do without (a struct's, a field's, "
+      "a parameter's... - myv_fuzz fat-259/fat-309) is refused when null, "
+      "and the form-dependent ones in that form",
+      myv_names_required },
     { "myv: #97 closure inlining - an image whose callee slot holds a "
       "DIFFERENT closure than the inlined one runs right (the guard "
       "misses, the original call runs)",

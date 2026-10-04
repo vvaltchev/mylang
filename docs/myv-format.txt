@@ -132,7 +132,11 @@ sees a kind of field the others structurally cannot (#137):
      a real entry (Reader::idx - the permissive idx_opt is opt-in, for a field
      with a genuine null form); every ENUM stored as a byte bounded by its
      last valid enumerator (Reader::enumv), since each is cast straight into
-     a type the VM switches on or indexes a table with.
+     a type the VM switches on or indexes a table with; every NAME a record
+     cannot do without (a uid, below) refused in its null form
+     (Reader::uid_req) - myv_fuzz fat-259 / fat-309 (2026-10-04): a struct
+     whose name was nulled loaded cleanly and crashed the `throw` that
+     named it.
 
   2. THE STANDALONE COUNTS.  A count that no record array follows, so layer 1
      has nothing to bound it against: a chunk's slot_count / n_temps, its
@@ -268,7 +272,17 @@ Notation used throughout this document:
                   reference).  May contain NUL and newlines.
     sid           u32 index into the string table (section 6)
     uid           u32 index into the string table, or 0xFFFFFFFF for null.
-                  The loader re-interns the string into a UniqueId.
+                  The loader re-interns the string into a UniqueId.  Null is
+                  legal ONLY where a record says so: a descriptor's name (a
+                  lambda has none), a field's struct_ty (a non-struct
+                  field), a ThrowSite's name (except an undefined_var one),
+                  a BuiltinCall's member (except one a CallBuiltinLVMember
+                  op uses), an IncDecSite's memUid (except one an
+                  IncDecMemberCheckedV op uses) and a CallSite's a0_name
+                  (except in the `undef` form).  Every other uid - a
+                  struct's, field's, const's, parameter's or capture's name,
+                  a member key, an emplace callee, a builtin's name, a
+                  global slot's name - is refused when null.
     sref          u32 index into the struct table, or 0xFFFFFFFF for null
     dref          u32 index into the descriptor table
     loc           a source location, 3 bytes in the common case (section 2.1)

@@ -11763,6 +11763,10 @@ void ChunkVerifier::verify_one(const Instr &in)
     case OpCode::IncDecMemberCheckedV:
         base(in.target, in.target2);
         pool(in.b_lit(), ck.incdec_sites.size(), "incdec site");
+        /* the member form's site must name its member (the elem form's
+         * has none); vm_incdec_member reads it */
+        if (!ck.incdec_sites[in.b_lit()].memUid)
+            reject("incdec member with no name");
         break;
     case OpCode::IncDecChainV:
         /* kind 3 is the fourth form: an rvalue ROOT held in a frame slot. */
@@ -11843,6 +11847,10 @@ void ChunkVerifier::verify_one(const Instr &in)
          * the pool entry's ArgLoc list gives (arg0 is not in the run). */
         reg(in.target);
         pool(in.a_dual_lo(), ck.builtin_calls.size(), "builtin call");
+        /* `append(s.f, x)`: vm_member_lvalue reads the entry's member */
+        if (in.op == OpCode::CallBuiltinLVMember
+            && !ck.builtin_calls[in.a_dual_lo()].member)
+            reject("builtin member with no name");
         base(in.a_dual_hi(), in.target2);
         if (in.b_is_lit()) {
             const size_t nargs =

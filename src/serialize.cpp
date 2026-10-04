@@ -554,6 +554,18 @@ struct Reader {
             bad_image("corrupt .myv (string index)");
         return uids[id];
     }
+    /* A name its record cannot do without - a struct's, a field's, a
+     * parameter's: the null form (0xFFFFFFFF) is refused HERE, not
+     * dereferenced later. myv_fuzz fat-259 / fat-309 (2026-10-04): a
+     * struct whose name was nulled loaded cleanly and crashed the `throw`
+     * that named it (UBSan in a debug build, SIGSEGV in a release one). */
+    const UniqueId *uid_req(const char *what)
+    {
+        const UniqueId *u = uidv();
+        if (!u)
+            bad_image(what);
+        return u;
+    }
     const std::string &strv()
     {
         const uint32_t id = u32v();
@@ -1534,7 +1546,7 @@ void read_chunk(Reader &r, Chunk &c)
     for (uint32_t i = 0; i < n; i++) {
         Chunk::MemberKey m;
         m.memId = read_value(r);
-        m.memUid = r.uidv();
+        m.memUid = r.uid_req("corrupt .myv (member key with no name)");
         m.optional = r.boolv();
         m.mstart = r.locv(); m.mend = r.locv();
         m.bstart = r.locv(); m.bend = r.locv();
@@ -1674,7 +1686,7 @@ void read_chunk(Reader &r, Chunk &c)
         Chunk::EmplaceSite es;
         const uint32_t di = r.idx_opt(r.structs.size(), "corrupt .myv (emplace)");
         es.def = di == 0xffffffffu ? nullptr : r.structs[di];
-        es.bname = r.uidv();
+        es.bname = r.uid_req("corrupt .myv (emplace callee with no name)");
         es.a0_start = r.locv(); es.a0_end = r.locv();
         es.field_locs = read_arglocs(r);
         c.emplace_sites.push_back(std::move(es));
@@ -1688,6 +1700,8 @@ void read_chunk(Reader &r, Chunk &c)
                          "corrupt .myv (throw kind)");
         t.start = r.locv(); t.end = r.locv();
         t.name = r.uidv();
+        if (t.kind == Chunk::ThrowKind::undefined_var && !t.name)
+            bad_image("corrupt .myv (undefined_var throw with no name)");
         c.throws.push_back(t);
     }
 
@@ -1735,11 +1749,14 @@ void read_chunk(Reader &r, Chunk &c)
         cs.args = read_arglocs(r);
         cs.arr_hint = r.enumv(ArrHint::flat_s,
                               "corrupt .myv (array hint)");
-        cs.a0_form = static_cast<Chunk::CallSite::A0>(r.u8v());
+        cs.a0_form = r.enumv(Chunk::CallSite::A0::undef,
+                             "corrupt .myv (call site arg0 form)");
         cs.a0_kind = static_cast<unsigned char>(r.u32v());
         cs.a0_slot = static_cast<int32_t>(r.u32v());
         cs.a0_operand = static_cast<int32_t>(r.u32v());
         cs.a0_name = r.uidv();
+        if (cs.a0_form == Chunk::CallSite::A0::undef && !cs.a0_name)
+            bad_image("corrupt .myv (undefined call argument with no name)");
         c.call_sites.push_back(std::move(cs));
     }
 
@@ -2089,12 +2106,12 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
     n = n_structs;
     for (uint32_t i = 0; i < n; i++) {
         StructTypeDef &sd = *prog.structs[i];
-        sd.name = r.uidv();
+        sd.name = r.uid_req("corrupt .myv (struct with no name)");
         const uint32_t nf = r.countv();
         sd.fields.reserve(nf);
         for (uint32_t j = 0; j < nf; j++) {
             FieldDef fd;
-            fd.name = r.uidv();
+            fd.name = r.uid_req("corrupt .myv (field with no name)");
             fd.kind = r.enumv(FieldKind::f_struct,
                               "corrupt .myv (field kind)");
             fd.struct_ty = r.uidv();
@@ -2107,7 +2124,8 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         const uint32_t nc = r.countv();
         sd.consts.reserve(nc);
         for (uint32_t j = 0; j < nc; j++) {
-            const UniqueId *cn = r.uidv();
+            const UniqueId *cn =
+                r.uid_req("corrupt .myv (struct const with no name)");
             sd.consts.emplace_back(cn, read_value(r));
         }
     }
@@ -2123,7 +2141,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         d.params.reserve(np);
         for (uint32_t j = 0; j < np; j++) {
             FuncDescriptor::ParamDesc p;
-            p.name = r.uidv();
+            p.name = r.uid_req("corrupt .myv (parameter with no name)");
             p.opt = r.boolv(); p.cnst = r.boolv(); p.dyn_mod = r.boolv();
             p.decl_type = r.enumv(DeclType::dyn,
                                   "corrupt .myv (param type)");
@@ -2135,7 +2153,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         d.captures.reserve(ncp);
         for (uint32_t j = 0; j < ncp; j++) {
             FuncDescriptor::CaptureDesc cp;
-            cp.name = r.uidv();
+            cp.name = r.uid_req("corrupt .myv (capture with no name)");
             cp.kind = r.enumv(SymKind::builtin,
                               "corrupt .myv (capture kind)");
             cp.slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
@@ -2258,7 +2276,8 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
     n = r.countv();
     prog.global_func_names.reserve(n);
     for (uint32_t i = 0; i < n; i++)
-        prog.global_func_names.push_back(r.uidv());
+        prog.global_func_names.push_back(
+            r.uid_req("corrupt .myv (global slot with no name)"));
 
     /*
      * #137: VERIFY BEFORE ANYTHING INDEXES IT. Every check above bounds a
