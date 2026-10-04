@@ -5685,6 +5685,7 @@ private:
          * Either way the call is left for runtime - still correct. */
         if (depth >= MAX_INLINE_DEPTH || bsz > inline_budget)
             return;
+        ML_INT_ONLY(if (int_inline_declined(ce)) return;)
         inline_budget -= bsz;
 
         /*
@@ -6033,6 +6034,7 @@ private:
         const int bsz = count_all_nodes(f->body.get());
         if (depth >= MAX_INLINE_DEPTH || bsz > inline_budget)
             return;
+        ML_INT_ONLY(if (int_inline_declined(ce)) return;)
         inline_budget -= bsz;
 
         /* Splice: substitute params (by slot) + remap locals to [*fsize, ...).
@@ -6259,6 +6261,7 @@ private:
             return;       /* would overflow the 64-slot frame */
         if (depth >= MAX_INLINE_DEPTH || bsz > inline_budget)
             return;
+        ML_INT_ONLY(if (int_inline_declined(ce)) return;)
         inline_budget -= bsz;
 
         /* Splice: substitute params, remap locals into [caller_fsize, ...). */
@@ -6544,6 +6547,24 @@ private:
     /* The caller as a backtrace names it: `main` at the top level,
      * `<lambda>` for an anonymous function (inline_frame_name assumes a
      * named one - a lambda has no `id`). */
+    /* #107 P3: the AST INLINE of a site as an enumerated decision - the
+     * engines ask at their commit point (eligible, within budget, nothing
+     * mutated yet) and pick 1 declines: the call stays a call, which RULE
+     * 2 says must not change anything observable. One key per call site,
+     * not per engine, so a forced decline is a decline by every engine. */
+    bool int_inline_declined(const CallExpr *ce) const
+    {
+        const std::string caller =
+            !int_caller ? std::string("main")
+            : int_caller->id ? std::string(int_caller->id->get_str())
+            : "<lambda>@" + std::to_string(int_caller->start.line);
+        const std::string key = caller + "/inline@"
+                              + std::to_string(ce->start.line) + ":"
+                              + std::to_string(ce->start.col);
+        const int pick = int_choose(key, 2, 0);
+        ML_INT(inline_choice, key, int64_t(2), int64_t(0), int64_t(pick));
+        return pick == 1;
+    }
     std::string int_caller_name() const
     {
         if (!int_caller)

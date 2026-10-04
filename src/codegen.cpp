@@ -13332,6 +13332,31 @@ static void bc_int_note(const Chunk &ck, size_t pc,
     ML_INT(splice, verdict, value ? "value" : "call", callee, ls.line,
            ls.col);
 }
+std::string g_bc_int_caller = "?";
+std::string bc_int_key_fn(const FuncDescriptor *d, const Chunk &ck)
+{
+    if (!d)
+        return "main";
+    if (d->name)
+        return std::string(d->name->val);
+    return "<lambda>@" + (ck.locs.empty()
+                              ? std::string("?")
+                              : std::to_string(ck.locs.front().start.line));
+}
+/* the SPLICE as an enumerated decision: a committed site may be declined
+ * (alternative 1) - the call stays a call, which RULE 2 says must not
+ * change anything observable */
+static bool bc_int_splice_declined(const Chunk &ck, size_t pc)
+{
+    Loc ls, le;
+    ck.loc_at(pc, ls, le);
+    const std::string key = g_bc_int_caller + "/splice@"
+                          + std::to_string(ls.line) + ":"
+                          + std::to_string(ls.col);
+    const int pick = int_choose(key, 2, 0);
+    ML_INT(splice_choice, key, int64_t(2), int64_t(0), int64_t(pick));
+    return pick == 1;
+}
 #endif
 #define BC_NOTE(d, why) ML_INT_ONLY(bc_int_note(ck, pc, d, is_value, why))
 
@@ -13626,6 +13651,11 @@ static bool bc_inline_chunk_splice(Chunk &ck,
                             BC_NOTE(ad, "chain_partial");)
             continue;
         }
+        ML_INT_ONLY(if (bc_int_splice_declined(ck, pc)) {
+                        for (const FuncDescriptor *ad : admitted)
+                            BC_NOTE(ad, "forced_decline");
+                        continue;
+                    })
         ML_INT_ONLY(for (const FuncDescriptor *ad : admitted)
                         BC_NOTE(ad, "spliced");)
         next_base = site_base;

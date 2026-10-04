@@ -2,6 +2,7 @@
 
 #include "disasm.h"
 #include "codegen.h"
+#include "inttest.h"
 #include "vm.h"
 #include "eval.h"      /* builtin_slot / builtin_slot_name */
 #include "env.h"      /* env_get / file_open - MSVC deprecates
@@ -2412,10 +2413,14 @@ std::string disassemble_program(const Block *root)
     }
     for (const FuncDeclStmt *fn : funcs) {
         auto it = chunks.find(fn->desc);
-        if (it != chunks.end())
+        if (it != chunks.end()) {
+            ML_INT_ONLY(g_bc_int_caller = bc_int_key_fn(fn->desc,
+                                                        it->second);)
             bc_inline_chunk(it->second, slot_desc, bc_snaps);
+        }
     }
     /* #97 closure inlining: main's VALUE sites, as vm_precompile_all */
+    ML_INT_ONLY(g_bc_int_caller = "main";)
     bc_inline_chunk(main_ck, slot_desc, bc_snaps, /*value_only=*/true);
 
     /* Pass B: the native tier through the ONE driver (vm_jit_program,
