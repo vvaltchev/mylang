@@ -73,6 +73,9 @@ void int_census_exiting();
 /* the live count of one object kind ("str", "arr", "dict", "struct",
  * "func", "exc"), or -1 for an unknown name - `int_live(kind)` */
 long long int_live_count(const std::string &kind);
+/* #107 P5: JIT probes run (MYLANG_INT_PROBE) - printed as `census probes
+ * N` under MYLANG_INT_CENSUS=all, so a runner can prove they ran */
+extern unsigned long long g_int_probe_hits;
 
 /*
  * THE DECISION ENUMERATOR (plan section 4.2): a heuristic with several

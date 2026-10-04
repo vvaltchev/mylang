@@ -102,6 +102,8 @@ long long int_live_count(const std::string &kind)
  * kind whose count did not come back (tests/int_run.py fails on it), or
  * `census skipped (exit)`; MYLANG_INT_CENSUS=all also prints the
  * balanced kinds. stderr, so a program's own output is untouched. */
+unsigned long long g_int_probe_hits = 0;
+
 static void census_at_exit()
 {
     const char *mode = std::getenv("MYLANG_INT_CENSUS");
@@ -119,6 +121,8 @@ static void census_at_exit()
                                                              : "",
                          g_iok_names[k], g_int_live_base[k],
                          g_int_live[k]);
+    if (all)
+        std::fprintf(stderr, "census probes %llu\n", g_int_probe_hits);
 }
 
 void int_census_mark()

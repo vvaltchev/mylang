@@ -458,8 +458,28 @@ assertions on values.
   handles than the owning (non-borrowed) slots of the frame holding it.
   Watched: a MoveV copying a reference without a retain aborts four
   corpus programs at the next op. With this the VM half of 4.3 is done
-  except the pinned-register comparison, which needs the JIT probe (P5).
+  except the pinned-register comparison (see P5).
 - **P5 - JIT preserving probe stub** + the per-op register map.
+  **STATUS (2026-10-03): BUILT.** `MYLANG_INT_PROBE=1`: a `call [abs32]`
+  at every op boundary of every fragment (main stream, cold copies,
+  containers) through a low-arena cell to `jit_int_probe_stub` (saves
+  15 GPRs, flags, xmm0-15; aligns; restores bit for bit), whose checker
+  finds the probe's record by return address - the chunk's ref_slots
+  and parameter kinds, and a SKIP mask built from the emitter's view at
+  that pc (pins, spill homes, elided types; plus ret_unflushed and W3
+  poison at check time) - and runs the shared `int_slots_fault`. The
+  red-zone audit found no emitted access below rsp (`load_rsp_disp`
+  asserts disp >= 0; frameless windows are carved above rsp). The
+  invisibility oracle is int_run's: probed -vdj minus probe lines with
+  byte offsets masked == plain -vdj, over the corpus. 30.7M probes over
+  the corpus x 3 engines, 0 findings. Watched: xmm3 clobbered by the
+  stub (8 outputs change), an extra emitted byte (63 programs flagged),
+  a slice borrowed by a frameless site (55_regcall aborts at the
+  callee; invisible to the VM checker and to the outputs). The first
+  run's one false positive changed a rule: a borrowed byte is checked
+  on LISTED slots only (a frameless window leaves a scalar parameter's
+  tail unwritten by design). NOT done: the pinned-register comparison
+  (no shadow value exists); edge probes (P2/P5 in 9.7).
 - **P6 - chunk hook + assembler**; build the three splice-gate tests.
 - **P7 - per-site forcing sweep.**
 - **CI:** a `int` job in `nets.yml` from P1 on (Debug + ASan, runs

@@ -17376,3 +17376,35 @@ ENUMERATOR:**
    `leaf(int x)` was inlined into a run that pins rcx (the nolowmem CI
    lane's corpus_diff; the default config cannot reach the movabs arm).
    The seam now skips the push for a register in `trk_borrowed`.
+
+### #107 P5: THE JIT PROBE - THE STATE CHECKER INSIDE NATIVE CODE (2026-10-03)
+
+An INT build with `MYLANG_INT_PROBE=1` emits `call qword [abs32]` (7
+bytes) at every op boundary of every fragment - after the LSRA
+transitions and the label, before the op - through a cell in the low
+arena holding `jit_int_probe_stub`. The stub (top-level asm, jit.cpp)
+saves the 15 GPRs, the flags and xmm0-15, aligns the stack and calls
+`jit_int_probe_check`; the record it finds by return address holds the
+chunk's `ref_slots` and parameter kinds (COPIED - main's chunk moves
+with its VmProgram) and a skip mask taken from the emitter at that pc:
+`reg_at`/`spill_at`/`freg_at` residents and `tflush` entries; the
+Emitter's `ret_unflushed` (the chunk's copy is written after mapping)
+and W3-poisoned slots are skipped at check time. Rules for whoever
+touches it:
+
+- **The probe bypasses every self-accounting seam on purpose**: raw
+  bytes, no `call_site`/`call_done` (so `n_calls`, SP3's filler bet and
+  the alignment seam never see it), no `sp_move`, no `wrote()` (the
+  classifier treats `call` as writing nothing). REGTRACK still decodes
+  it. Routing it through any seam would make the probed build emit
+  different code.
+- **Invisibility is CHECKED, not argued**: int_run compares the probed
+  `-vdj`, probe lines dropped and byte offsets masked, with the plain
+  one over the whole corpus. A plain dump must hold no `call [<addr>]`,
+  or a probe line would be ambiguous.
+- **No emitted code may keep data below rsp** - the probe's return
+  address would land on it. `load_rsp_disp` already refuses a negative
+  displacement; a new rsp-relative accessor must too.
+- Records live on the `Emitter` and are committed when the fragment is
+  mapped (`jit_int_probes_commit`, both mmap sites): a retry builds a
+  fresh Emitter, and a give-up never reaches the commit.

@@ -638,9 +638,35 @@ slice of that storage. Watched: a copy-assign that skips the
 registration, and an overwrite that skips the unregistration, each
 abort at their op. And REFCOUNTS: no object counts fewer handles than
 the owning (non-borrowed) slots of the frame holding it - watched: a
-MoveV that copies a reference without a retain. A
+MoveV that copies a reference without a retain. (The borrowed byte is
+checked on listed slots only: a frameless window leaves a scalar
+parameter's tail unwritten, W5, and only release scans read it.) A
 hook in the dispatch loop must be `noexcept` (an exception edge per
 dispatch is a coverage-universe branch) and named `int_*`.
+**THE JIT PROBE (P5): with `MYLANG_INT_PROBE=1` the same slot checks
+(`int_slots_fault`, vm.h) run INSIDE NATIVE CODE, at every op boundary
+of every fragment.** The emitter puts a 7-byte `call [abs32]` there (the
+cell is in the low arena; no arena, no probes); `jit_int_probe_stub`
+saves all 15 GPRs, the flags and xmm0-15, aligns the stack and calls
+`jit_int_probe_check`, which finds the probe's record by its return
+address and checks the slots whose memory is authoritative at that pc -
+a pin, a spill home, a type-elided slot, a `ret_unflushed` slot and a
+W3-poisoned one are skipped. The call goes AROUND every self-accounting
+seam (the call seam, the rsp model, the bets, `wrote()`), so it changes
+no decision, and `int_run` checks exactly that: the probed `-vdj`, its
+`call [<addr>]` lines dropped and every byte offset masked, must equal
+the plain `-vdj` (a plain dump holding such a line fails as ambiguous).
+`int_run` turns the probe on for every tests/int run and the corpus
+pass (whose probed engines must also print what `-tw` prints), and
+fails if no probe ran; `-rt` runs without it (its shape tests read the
+dump). No emitted code addresses below `rsp` (`load_rsp_disp` asserts
+it), so the probe's return address clobbers nothing. Watched: the stub
+clobbering xmm3 changes 8 corpus outputs; one extra emitted byte per
+probe fails the invisibility check on 63 programs; a frameless site
+borrowing a SLICE (the W5 decline removed) aborts 55_regcall at the
+callee's entry, where the unprobed run and the VM checker see nothing.
+NOT done: comparing a pinned register with what its slot would hold -
+there is no shadow value to compare it with.
 **Long runs use `tests/testrun.py`** (a `Run`: heartbeat, a unix
 control socket - `tests/testctl.py status|stop|pause|jobs N` - and
 resume by a low-water-mark token); a new multi-minute tool should
