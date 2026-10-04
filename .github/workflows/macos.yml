@@ -32,7 +32,15 @@ jobs:
       shell: bash
       run: cmake --build . --config $BUILD_TYPE
 
+    # a clang debug build: tests/run's `clang` build, checked against it
     - name: Test
-      working-directory: ${{github.workspace}}/build
       shell: bash
-      run:  ./mylang -rt
+      run: tests/run -o --logs test-logs --bin clang=build/mylang rt@clang
+
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore

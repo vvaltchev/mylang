@@ -10,13 +10,17 @@ tests/run - every kind of MyLang test, from one entry point.
     tests/run -T fuzz               one test type (a prefix is enough)
     tests/run -f corpus             tests whose name matches a regex
     tests/run nested_fuzz rt        exactly these tests
+    tests/run rt@clang              a test on another build
     tests/run rt --case '^elem2: '  only some cases of a test
     tests/run --classes             what short / med / long mean
+    tests/run --builds              the builds and their recipes
 
 A TEST is one run of one tool (rt, corpus_diff-levers, nested_fuzz...),
 with a TYPE (unit, diff, fuzz, int, cli, jit, coverage, mutation), a
-time CLASS and the BUILD it needs. Builds are made on demand under
---build-root (incremental make; --no-build to skip). Some tests have
+time CLASS and the BUILD it needs; NAME@BUILD runs it on another one.
+Builds are made on demand under --build-root (incremental make;
+--no-build to skip), or given with --bin BUILD=PATH, which is how CI
+hands over the binaries it built. Some tests have
 CASES (an -rt entry, a corpus program, a tests/int unit, a backtrace
 program): a test runs as one unit unless --case selects some of them,
 and a failure prints the command that reruns just the failing cases.
@@ -72,7 +76,10 @@ JIT_GUARD = "#if defined(__linux__) && defined(__x86_64__)"
 
 
 class Lane:
-    """A build: its directory is BUILD_ROOT/<name>."""
+    """A build: its directory is BUILD_ROOT/<name>. `expect` is what its
+    `mylang -v` must say (a value or a tuple of accepted values), so a
+    binary given with --bin is checked against the build it stands for.
+    """
 
     def __init__(self, name, args, desc, kind="make", nojit=False,
                  expect=None):
@@ -82,16 +89,25 @@ class Lane:
 
 
 LANES = {l.name: l for l in [
+    # MSVC defines no optimization macro, so a Windows debug build
+    # reports `opt unknown`
     Lane("dbg", "TESTS=1 OPT=0", "debug, ASan + UBSan",
-         expect={"tests": "1", "opt": "0"}),
+         expect={"tests": "1", "opt": ("0", "unknown"),
+                 "int_tests": "0"}),
     Lane("clang", "CXX=clang++ TESTS=1 OPT=0", "debug, clang",
          expect={"tests": "1"}),
     Lane("rel-hard", "TESTS=1 OPT=1 VM_HARDENING=1",
-         "optimized, asserts and VM hardening on", expect={"tests": "1"}),
+         "optimized, asserts and VM hardening on",
+         expect={"tests": "1", "vm_hardening": "1"}),
     Lane("release", "OPT=1", "the shipping build, no -rt suite",
-         expect={"tests": "0"}),
+         expect={"tests": "0", "asserts": "1"}),
+    Lane("ship", "OPT=1 ASSERTS=0", "the shipping build without asserts",
+         expect={"tests": "0", "asserts": "0"}),
     Lane("rna", "OPT=1 ASSERTS=0 TESTS=1", "optimized, no asserts",
          expect={"tests": "1", "asserts": "0"}),
+    Lane("lto0", "OPT=1 TESTS=1 LTO=0",
+         "optimized without LTO (-Wclobbered sees the whole function)",
+         expect={"tests": "1", "opt": "1", "lto": "0"}),
     Lane("recycle", "TESTS=1 OPT=0 RECYCLE=1",
          "debug, the adversarial node allocator", expect={"recycle": "1"}),
     Lane("nojit-gcc", "TESTS=1 OPT=0", "debug, JIT compiled out",
@@ -99,7 +115,8 @@ LANES = {l.name: l for l in [
     Lane("nojit-clang", "CXX=clang++ TESTS=1 OPT=0",
          "debug, clang, JIT compiled out", nojit=True, expect={"jit": "0"}),
     Lane("int-rel", "OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1",
-         "intrusive tests, optimized", expect={"int_tests": "1"}),
+         "intrusive tests, optimized",
+         expect={"int_tests": "1", "asserts": "1"}),
     Lane("int-gcov", "OPT=0 TESTS=1 INT_TESTS=1 GCOV=1",
          "intrusive tests with coverage", expect={"int_tests": "1"}),
     Lane("cmake-gcov",
@@ -112,14 +129,35 @@ LANES = {l.name: l for l in [
 
 
 class Test:
-    """One run of one tool. `cmd(ctx)` builds the argv; `cases` names a
-    case kind (see CASES) when the test can run a subset."""
+    """One run of one tool. `cmd(c)` builds the argv (c: a TestCtx, whose
+    `b` is the test's binary); `cases` names a case kind (see CASES) when
+    the test can run a subset. `guards` run before the tool and raise
+    when the binary is not in the configuration the test is about (a
+    vacuity guard); `uses` names other builds the command reads; `shard`
+    turns "I/N" into the tool's own arguments for running part of it.
+    An `exclusive` test runs alone on its build: a coverage tool clears
+    and reads the build's gcov counters, which any other run of that
+    binary would add to."""
 
     def __init__(self, name, type_, cls, lane, est, cmd, env=None,
-                 wide=False, klass=None, cases=None, desc=""):
+                 wide=False, klass=None, cases=None, desc="", guards=(),
+                 uses=(), shard=None, exclusive=False):
         self.name, self.type, self.cls, self.lane = name, type_, cls, lane
         self.est, self.cmd, self.env = est, cmd, dict(env or {})
         self.wide, self.klass, self.cases, self.desc = wide, klass, cases, desc
+        self.guards, self.uses, self.shard = list(guards), list(uses), shard
+        self.exclusive = exclusive
+
+    def lanes(self):
+        return [self.lane] + self.uses if self.lane else []
+
+    def on(self, lane, cls=None, est=None):
+        """This test on another build: NAME@BUILD."""
+        t = Test("%s@%s" % (self.name, lane), self.type, cls or self.cls,
+                 lane, est or self.est, self.cmd, self.env, self.wide,
+                 self.klass, self.cases, "%s (%s build)" % (self.desc, lane),
+                 self.guards, self.uses, self.shard, self.exclusive)
+        return t
 
 
 def T(*a):
@@ -136,150 +174,259 @@ def functional():
                   if f.endswith(".my"))
 
 
-def myv_doc(ctx, lane):
-    b = ctx.bin(lane)
+def enum_corpus():
+    """tests/functional plus the samples that reach a decision without
+    input (phonebook and shopping read stdin, rand_sort is random)."""
+    return functional() + [os.path.join(ROOT, "samples", p) for p in (
+        "fib", "gcd", "loop", "primes", "primes2", "strloop")]
+
+
+def myv_doc(c):
     progs = [os.path.join(ROOT, "samples", f)
              for f in sorted(os.listdir(os.path.join(ROOT, "samples")))]
     progs += [os.path.join(ROOT, "bench", "my", f)
               for f in sorted(os.listdir(os.path.join(ROOT, "bench", "my")))
               if f.endswith(".my")]
     script = "set -e; d=$(mktemp -d); " + "; ".join(
-        "%s -c %s -o $d/%d.myv" % (shlex.quote(b), shlex.quote(p), i)
+        "%s -c %s -o $d/%d.myv" % (shlex.quote(c.b), shlex.quote(p), i)
         for i, p in enumerate(progs) if os.path.isfile(p))
     script += "; %s $d/*.myv" % shlex.quote(T("myv_doc_check"))
     return ["sh", "-c", script]
 
 
+# ------------------------------------------------------------- guards --
+# A test of a CONFIGURATION must first prove the binary is in it, or it
+# passes green testing the default the day a default moves (the reason
+# the lto0 lane asserts `lto 0` first). Each guard raises with the
+# reason; the test then fails without running.
+
+
+def version_keys(binary, env=None):
+    """`mylang -v` as a dict."""
+    try:
+        out = subprocess.run([binary, "-v"], capture_output=True, text=True,
+                             timeout=60, env=dict(os.environ, **(env or {})))
+    except OSError as e:
+        raise RuntimeError("cannot run %s: %s" % (binary, e.strerror))
+    got = {}
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            got[parts[0]] = parts[1]
+    return got
+
+
+def guard_nolowmem(c):
+    """The register-form type tags: the arena is ON by default and
+    MYLANG_NO_LOWMEM=1 refuses it, both directions."""
+    if version_keys(c.b).get("lowmem") != "1":
+        raise RuntimeError("the low-address arena is not on by default")
+    if version_keys(c.b, {"MYLANG_NO_LOWMEM": "1"}).get("lowmem") != "0":
+        raise RuntimeError("MYLANG_NO_LOWMEM=1 did not refuse the arena")
+
+
+def guard_spcheck(c):
+    """The alignment check is emitted code: it must be there under the
+    lever and absent without it."""
+    def vdj(env):
+        return subprocess.run([c.b, "-vdj", os.path.join(ROOT, "samples",
+                                                         "gcd")],
+                              capture_output=True, text=True, timeout=120,
+                              env=dict(os.environ, **env)).stdout
+    if "test rsp, 15" not in vdj({"MYLANG_JIT_SPCHECK": "1"}):
+        raise RuntimeError("MYLANG_JIT_SPCHECK=1 emitted no check")
+    if "test rsp, 15" in vdj({}):
+        raise RuntimeError("the alignment check is emitted WITHOUT the "
+                           "lever")
+
+
+# forced allocator picks that put a float stage in xmm8-15 and a GP
+# scratch/pin in r8-r15 - the REX.R/X/B forms a decoder can drop and
+# still print the right mnemonic. The keys name 59_float_abi_calls' two
+# JIT runs.
+REX_PROG = os.path.join(ROOT, "tests", "functional", "59_float_abi_calls.my")
+REX_PICKS = ["main@0/fp#0=11,main@21/fp#0=11",
+             "main@0/fp#1=9,main@21/fp#1=9",
+             "main@0/gp#5=4,main@21/gp#2=9"]
+
+
+def guard_rex(c):
+    """Each forced pick must still land in r8-r15 / xmm8-15 (both runs),
+    or a key the program drifted away from would check the default
+    registers again."""
+    for pick in REX_PICKS:
+        d = tempfile.mkdtemp(prefix="mylang-rex-")
+        dump = os.path.join(d, "pick.txt")
+        try:
+            subprocess.run([c.b, REX_PROG], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=120,
+                           env=dict(os.environ, MYLANG_INT_CHOOSE=pick,
+                                    MYLANG_INT_DUMP=dump))
+            try:
+                with open(dump) as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                lines = []
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        keys = set()
+        for l in lines:
+            if re.match(r"^choose_reg .* reg=(8|9|1[0-5])$", l):
+                m = re.search(r'key="[^"]*"', l)
+                if m:
+                    keys.add(m.group(0))
+        if len(keys) != 2:
+            raise RuntimeError(
+                "forced picks %s no longer land in r8-r15/xmm8-15:\n%s"
+                % (pick, "\n".join(l for l in lines
+                                   if l.startswith("choose_"))))
+
+
 def catalog():
-    ts = []
+    ts = {}
 
     def add(*a, **kw):
-        ts.append(Test(*a, **kw))
+        t = Test(*a, **kw)
+        ts[t.name] = t
+        return t
+
+    def on(t, lane, est, cls="long"):
+        v = t.on(lane, cls, est)
+        ts[v.name] = v
 
     # unit: the built-in suite, in every build that compiles it in
-    add("rt", "unit", "med", "dbg", 80, lambda c: [c.bin("dbg"), "-rt"],
-        cases="rt", klass="rt", desc="the built-in suite, five modes")
-    add("rt-nolowmem", "unit", "med", "dbg", 80,
-        lambda c: [c.bin("dbg"), "-rt"], env={"MYLANG_NO_LOWMEM": "1"},
-        cases="rt", klass="rt", desc="the same, type tags in registers")
+    rt = add("rt", "unit", "med", "dbg", 80, lambda c: [c.b, "-rt"],
+             cases="rt", klass="rt", desc="the built-in suite, five modes")
     for lane, est in (("clang", 90), ("rel-hard", 10), ("recycle", 90),
                       ("nojit-gcc", 60), ("nojit-clang", 60)):
-        add("rt-" + lane, "unit", "long", lane, est,
-            (lambda l: lambda c: [c.bin(l), "-rt"])(lane), cases="rt",
-            klass="rt", desc="the suite on the %s build" % lane)
-    add("rt-rna-nolowmem", "unit", "long", "rna", 10,
-        lambda c: [c.bin("rna"), "-rt"], env={"MYLANG_NO_LOWMEM": "1"},
-        cases="rt", klass="rt",
-        desc="no asserts, type tags in registers")
+        on(rt, lane, est)
+    t = add("rt-nolowmem", "unit", "med", "dbg", 80,
+            lambda c: [c.b, "-rt"], env={"MYLANG_NO_LOWMEM": "1"},
+            guards=[guard_nolowmem], cases="rt", klass="rt",
+            desc="the suite with type tags in registers")
+    on(t, "rna", 10)
+    t = add("rt-spcheck", "unit", "med", "dbg", 80,
+            lambda c: [c.b, "-rt"], env={"MYLANG_JIT_SPCHECK": "1"},
+            guards=[guard_spcheck], cases="rt", klass="rt",
+            desc="the suite, every call's stack alignment checked")
+    on(t, "rna", 10)
 
     # diff: the engines against each other
     cd = T("corpus_diff")
-    add("corpus_diff", "diff", "short", "dbg", 15,
-        lambda c: [cd, c.bin("dbg")], wide=True, cases="corpus",
+    add("corpus_diff", "diff", "short", "dbg", 15, lambda c: [cd, c.b],
+        wide=True, cases="corpus",
         desc="every engine agrees with the tree-walker")
-    for mode, cls, est in (("levers", "med", 90), ("cold", "med", 30),
-                           ("xrot", "med", 90), ("nolowmem", "short", 15),
-                           ("spcheck", "short", 15)):
-        add("corpus_diff-" + mode, "diff", cls, "dbg", est,
-            (lambda m: lambda c: [cd, c.bin("dbg"), "--" + m])(mode),
-            wide=True, cases="corpus", desc="corpus_diff --" + mode)
-    add("corpus_diff-release", "diff", "long", "release", 120,
-        lambda c: [cd, c.bin("release"), "--levers", "--cold", "--xrot",
-                   "--nolowmem"], wide=True, cases="corpus",
-        desc="four modes on the shipping build")
-    add("corpus_diff-rna", "diff", "long", "rna", 40,
-        lambda c: [cd, c.bin("rna"), "--nolowmem", "--spcheck"], wide=True,
-        cases="corpus", desc="no asserts: --nolowmem, --spcheck")
+    for mode, cls, est, guards, lanes in (
+            ("levers", "med", 90, [], ["release"]),
+            ("cold", "med", 30, [], ["release"]),
+            ("xrot", "med", 90, [], ["release"]),
+            ("nolowmem", "short", 15, [guard_nolowmem], ["release", "rna"]),
+            ("spcheck", "short", 15, [guard_spcheck], ["rna"])):
+        t = add("corpus_diff-" + mode, "diff", cls, "dbg", est,
+                (lambda m: lambda c: [cd, c.b, "--" + m])(mode), wide=True,
+                guards=guards, cases="corpus", desc="corpus_diff --" + mode)
+        for lane in lanes:
+            on(t, lane, 30)
     add("bt_oracle", "diff", "med", "dbg", 60,
-        lambda c: [T("bt_oracle"), c.bin("dbg")], cases="backtrace",
+        lambda c: [T("bt_oracle"), c.b], cases="backtrace",
         desc="inlining never changes a backtrace")
     add("norec_enum", "diff", "med", "dbg", 90,
-        lambda c: [T("norec_enum"), c.bin("dbg"), "--depth", "3",
-                   "--reach", "0", "--jobs", str(c.share)], wide=True,
+        lambda c: [T("norec_enum"), c.b, "--depth", "3", "--reach", "0",
+                   "--jobs", str(c.share)], wide=True,
         desc="every small call-stack shape, 4 engines")
     add("norec_sweep", "diff", "med", "dbg", 150,
-        lambda c: [T("norec_sweep"), c.bin("dbg"), "--max-events", "25",
+        lambda c: [T("norec_sweep"), c.b, "--max-events", "25",
                    "--jobs", str(c.share)], wide=True,
         desc="a forced frame rebuild at each call changes nothing")
 
-    # fuzz: a fresh seed every run, printed in the reproduce line
+    # fuzz: a fresh seed every run, printed in the reproduce line; a
+    # finding is saved beside the logs (a .myv one cannot be regenerated)
     add("nested_fuzz", "fuzz", "med", "dbg", 90,
-        lambda c: [T("nested_fuzz"), "--mylang", c.bin("dbg"), "--count",
-                   "250", "--seed", str(c.seed), "--jobs", str(c.share)],
+        lambda c: [T("nested_fuzz"), "--mylang", c.b, "--count", "250",
+                   "--seed", str(c.seed), "--jobs", str(c.share)],
         wide=True, desc="random nested programs vs CPython")
-    add("myv_fuzz", "fuzz", "med", "dbg", 60,
-        lambda c: [T("myv_fuzz"), c.bin("dbg"), "-n", "400", "--seed",
-                   str(c.seed), "--save", c.logpath("myv_fuzz-bad")],
-        desc="damaged .myv images never crash the loader")
-    add("myv_fuzz-rna", "fuzz", "long", "rna", 10,
-        lambda c: [T("myv_fuzz"), c.bin("rna"), "-n", "400", "--seed",
-                   str(c.seed), "--save", c.logpath("myv_fuzz-rna-bad")],
-        desc="the same without asserts")
-    add("repl_fuzz", "fuzz", "med", "dbg", 40,
-        lambda c: [T("repl_fuzz"), c.bin("dbg"), "-n", "400", "--seed",
-                   str(c.seed), "--save", c.logpath("repl_fuzz-bad")],
-        desc="random REPL sessions never crash it")
-    add("repl_fuzz-recycle", "fuzz", "long", "recycle", 40,
-        lambda c: [T("repl_fuzz"), c.bin("recycle"), "-n", "400",
-                   "--seed", str(c.seed), "--save",
-                   c.logpath("repl_fuzz-recycle-bad")],
-        desc="the same with the adversarial allocator")
+    t = add("myv_fuzz", "fuzz", "med", "dbg", 60,
+            lambda c: [T("myv_fuzz"), c.b, "-n", "400", "--seed",
+                       str(c.seed), "--save", c.out("-bad")],
+            desc="damaged .myv images never crash the loader")
+    on(t, "rna", 10)
+    t = add("repl_fuzz", "fuzz", "med", "dbg", 40,
+            lambda c: [T("repl_fuzz"), c.b, "-n", "400", "--seed",
+                       str(c.seed), "--save", c.out("-bad")],
+            desc="random REPL sessions never crash it")
+    on(t, "recycle", 40)
 
     # int: the intrusive suite
     add("int_run", "int", "long", "int-rel", 240,
-        lambda c: [T("int_run"), c.bin("int-rel")], cases="int",
+        lambda c: [T("int_run"), c.b], cases="int",
         desc="tests/int, REPL sessions, census, state checkers")
+    add("int-vdjcmp", "int", "long", "int-gcov", 60,
+        lambda c: [S("vdjcmp"), c.bin("dbg"), c.b], uses=["dbg"],
+        desc="an INT build emits what a TESTS build emits")
     for tier, cls, est in ((1, "long", 300), (2, "long", 600),
                            (3, "manual", 3600)):
         add("int_enum-%d" % tier, "int", cls, "int-rel", est,
-            (lambda t: lambda c: [T("int_enum"), c.bin("int-rel"),
-                                  "--tier", str(t)] + functional())(tier),
+            (lambda n: lambda c: [T("int_enum"), c.b, "--tier", str(n),
+                                  "--heartbeat", "60", "--failures-out",
+                                  c.out("-failures.txt")] +
+             enum_corpus())(tier),
             wide=True, desc="every legal compiler decision, tier %d" % tier)
 
     # cli: the driver, a shipping build, the .myv spec
-    add("driver_checks", "cli", "short", "dbg", 30,
-        lambda c: [T("driver_checks"), c.bin("dbg")],
-        desc="the command-line flags do what they say")
-    add("driver_checks-release", "cli", "long", "release", 20,
-        lambda c: [T("driver_checks"), c.bin("release")],
-        desc="the same on the shipping build")
-    add("myv_doc_check", "cli", "short", "dbg", 20,
-        lambda c: myv_doc(c, "dbg"),
-        desc="docs/myv-format.txt reads every image")
+    t = add("driver_checks", "cli", "short", "dbg", 30,
+            lambda c: [T("driver_checks"), c.b],
+            desc="the command-line flags do what they say")
+    for lane in ("clang", "rel-hard", "release", "rna", "int-gcov"):
+        on(t, lane, 30)
+    t = add("myv_doc_check", "cli", "short", "dbg", 20, myv_doc,
+            desc="docs/myv-format.txt reads every image")
+    for lane in ("clang", "rel-hard"):
+        on(t, lane, 20)
     add("system_smoke", "cli", "long", "release", 120,
-        lambda c: [T("system_smoke"), c.bin("release")],
+        lambda c: [T("system_smoke"), c.b],
         desc="a build with no -rt suite runs real scripts")
 
     # jit: the disassembler and the emitted code
     add("vdjcmp", "jit", "med", "dbg", 60,
-        lambda c: [S("vdjcmp"), c.bin("dbg"), c.bin("dbg")],
+        lambda c: [S("vdjcmp"), c.b, c.b],
         desc="-vdj is reproducible (a binary against itself)")
     add("disasmcheck", "jit", "med", "dbg", 120,
-        lambda c: [S("disasmcheck"), c.bin("dbg")],
+        lambda c: [S("disasmcheck"), c.b],
         desc="-vdj decodes like objdump, default config")
     add("disasmcheck-matrix", "jit", "long", "dbg", 1200,
-        lambda c: [S("disasmcheck"), c.bin("dbg"), "--matrix"],
+        lambda c: [S("disasmcheck"), c.b, "--matrix"],
+        shard=lambda spec: ["--shard", spec],
         desc="the same over 23 configurations")
+    rex = []
+    for p in REX_PICKS:
+        rex += ["--env", "MYLANG_INT_CHOOSE=" + p]
+    add("disasmcheck-rex", "jit", "long", "int-rel", 60,
+        lambda c: [S("disasmcheck"), c.b, "--only", "tests/functional"] + rex,
+        guards=[guard_rex],
+        desc="the same with forced picks in r8-r15 and xmm8-15")
 
     # coverage
     add("int_run-gcov", "coverage", "long", "int-gcov", 600,
-        lambda c: [T("int_run"), c.bin("int-gcov"), "--gcov",
-                   "--require-floor"], cases="int",
+        lambda c: [T("int_run"), c.b, "--gcov", "--require-floor",
+                   "--report", c.out("-report.txt")], cases="int",
+        exclusive=True,
         desc="the coverage floor, every unit owns an element")
     add("norec_coverage", "coverage", "long", "cmake-gcov", 900,
         lambda c: [T("norec_coverage"), "--build-dir",
-                   os.path.dirname(c.bin("cmake-gcov")), "--run",
+                   os.path.dirname(c.b), "--run",
                    "--min-lines", "70", "--min-branches", "55"],
-        desc="the no-record call tier's coverage floor")
+        exclusive=True, desc="the no-record call tier's coverage floor")
     add("int_select", "coverage", "manual", "int-gcov", 1800,
-        lambda c: [T("int_select"), c.bin("int-gcov"), "--with-rt"],
+        lambda c: [T("int_select"), c.b, "--with-rt", "--heartbeat", "120",
+                   "--out", c.out(".json")], exclusive=True,
         desc="which tests cover what (an irredundant cover)")
 
     # mutation: builds its own copies of the tree
     add("mutate", "mutation", "manual", None, 3 * 3600,
         lambda c: [T("mutate"), "--count", "200", "--seed", "1"],
+        shard=lambda spec: ["--shard", spec],
         desc="planted bugs are caught (CI: Mutation workflow)")
-    return {t.name: t for t in ts}
+    return ts
 
 
 # --------------------------------------------------------------- cases --
@@ -373,8 +520,22 @@ class Ctx:
             return self.args.bins[lane]
         return os.path.join(self.args.build_root, lane, "mylang")
 
-    def logpath(self, name):
-        return os.path.join(self.logdir, name)
+
+class TestCtx:
+    """What a test's `cmd` sees: its binary `b`, the other builds, the
+    seed, its share of the cores, and a path for its own output files
+    beside the logs."""
+
+    def __init__(self, ctx, test):
+        self.ctx, self.test = ctx, test
+        self.b = ctx.bin(test.lane) if test.lane else None
+        self.seed, self.share = ctx.seed, ctx.share
+
+    def bin(self, lane):
+        return self.ctx.bin(lane)
+
+    def out(self, suffix):
+        return os.path.join(self.ctx.logdir, self.test.name + suffix)
 
 
 class Step:
@@ -384,6 +545,8 @@ class Step:
         self.cost, self.klass, self.env = cost, klass, dict(env or {})
         self.est, self.test, self.cwd, self.prep = est, test, cwd, prep
         self.label = label or name
+        self.lanes = test.lanes() if test else []
+        self.exclusive = bool(test and test.exclusive)
         self.status, self.secs, self.why = "WAIT", 0.0, ""
         self.proc = self.log = self.t0 = self.tmp = self.logfile = None
         self.case_rx = None
@@ -404,24 +567,36 @@ def make_nojit_copy(build_root):
         f.write(s.replace(JIT_GUARD, "#if 0"))
 
 
+def rel(path):
+    """`path` relative to the checkout when it is inside it."""
+    if path.startswith(ROOT + os.sep):
+        return os.path.relpath(path, ROOT)
+    return path
+
+
 def check_build(binary, want):
     """`mylang -v` must say what the build's recipe says; raises with the
     reason otherwise."""
-    try:
-        out = subprocess.run([binary, "-v"], capture_output=True, text=True,
-                             timeout=60).stdout
-    except OSError as e:
-        raise RuntimeError("cannot run %s: %s" % (binary, e.strerror))
-    got = {}
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            got[parts[0]] = parts[1]
-    bad = ["%s %s, want %s" % (k, got.get(k, "?"), v)
-           for k, v in want.items() if got.get(k) != v]
+    got = version_keys(binary)
+    bad = []
+    for k, v in want.items():
+        ok = v if isinstance(v, tuple) else (v,)
+        if got.get(k) not in ok:
+            bad.append("%s %s, want %s" % (k, got.get(k, "?"), " or ".join(ok)))
     if bad:
         raise RuntimeError("%s is not this build (%s)"
-                           % (os.path.relpath(binary, ROOT), "; ".join(bad)))
+                           % (rel(binary), "; ".join(bad)))
+
+
+def kill_tree(proc):
+    """Kill a step and everything it started (its own session)."""
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except OSError:
+        pass
 
 
 def check_steps(lanes, ctx, built):
@@ -494,9 +669,23 @@ class Out:
         self.status = text
 
 
+def last_line(path, span=4096):
+    """The last non-empty line of a log (read from its end)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - span))
+            lines = [l.strip() for l in
+                     f.read().decode(errors="replace").splitlines()
+                     if l.strip()]
+    except OSError:
+        return ""
+    return lines[-1][:120] if lines else ""
+
+
 def tail_lines(path, n):
     try:
-        with open(path, errors="replace") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             return f.read().splitlines()[-n:]
     except OSError:
         return []
@@ -507,15 +696,15 @@ def quote_cmd(st):
                    for k, v in sorted(st.env.items())
                    if k != "MYLANG_TEST_JOBS")
     return (env + " " if env else "") + " ".join(
-        shlex.quote(os.path.relpath(a, ROOT) if os.path.isabs(a)
-                    and a.startswith(ROOT + os.sep) else a)
-        for a in st.cmd)
+        shlex.quote(rel(a)) for a in st.cmd)
 
 
 def reproduce(st, failed_cases):
     """The commands that rerun what failed: tests/run with the failing
     cases when the test has them, and the tool's own command line."""
     t = st.test
+    if st.proc is None:         # stopped before it ran (a guard)
+        return ["tests/run %s" % t.name]
     lines = []
     if t.cases and failed_cases:
         rx = rx_exact(failed_cases[:20])
@@ -531,8 +720,7 @@ def reproduce(st, failed_cases):
             st.logfile, 400)))
         for s in seeds[:3]:
             lines.append("tests/nested_fuzz --mylang %s --seed %s "
-                         "--count 1" % (shlex.quote(os.path.relpath(
-                             st.cmd[2], ROOT)), s))
+                         "--count 1" % (shlex.quote(rel(st.cmd[2])), s))
     if not lines or not (t.cases and failed_cases):
         lines.append(quote_cmd(st))
     return lines
@@ -542,7 +730,9 @@ def run_steps(steps, jobs, caps, out, timeout, mon, show_output):
     by = {s.name: s for s in steps}
     any_tests = any(s.test for s in steps)
     used, inuse, running = 0, {}, []
+    users, alone = {}, set()        # lane -> running steps; exclusive
     t0 = time.time()
+    tails = [0.0, ""]               # when read, what: the running logs
 
     def settle():
         changed = True
@@ -566,11 +756,20 @@ def run_steps(steps, jobs, caps, out, timeout, mon, show_output):
         ready = [s for s in steps if s.status == "WAIT"
                  and all(by[d].status == "PASS" for d in s.deps)]
         ready.sort(key=lambda s: -s.est)
+        # a lane an exclusive step waits for takes no new users
+        held = {l for s in ready if s.exclusive for l in s.lanes}
         for s in ready:
             cap = caps.get(s.klass)
             if cap is not None and inuse.get(s.klass, 0) >= cap:
                 continue
             if used + s.cost > jobs and running:
+                continue
+            if any(l in alone for l in s.lanes):
+                continue
+            if s.exclusive:
+                if any(users.get(l) for l in s.lanes):
+                    continue
+            elif any(l in held for l in s.lanes):
                 continue
             if s.prep:
                 try:
@@ -597,13 +796,24 @@ def run_steps(steps, jobs, caps, out, timeout, mon, show_output):
             s.status = "RUN"
             used += s.cost
             inuse[s.klass] = inuse.get(s.klass, 0) + 1
+            for l in s.lanes:
+                users[l] = users.get(l, 0) + 1
+                if s.exclusive:
+                    alone.add(l)
             running.append(s)
         with mon.lock:
             # count the tests; a builds-only phase (--case) counts builds
             mon.done = sum(1 for x in steps if (x.test or not any_tests)
                            and x.status in ("PASS", "FAIL", "SKIP"))
             mon.failures = sum(1 for x in steps if x.status == "FAIL")
-        mon.set_current(", ".join(r.label for r in running))
+        # the heartbeat (and testctl) show each running test's latest
+        # output line: in a CI log that is the only live view of a long
+        # tool, whose own progress lines go to its log file
+        if time.time() - tails[0] > 5:
+            tails[:] = [time.time(), "; ".join(
+                "%s [%s]" % (r.label, last_line(r.logfile))
+                if last_line(r.logfile) else r.label for r in running)]
+        mon.set_current(tails[1])
         if not running:
             # a failure just now may have unblocked nothing but SKIPs:
             # settle once more, and stop only when nothing can start
@@ -620,10 +830,7 @@ def run_steps(steps, jobs, caps, out, timeout, mon, show_output):
         for s in list(running):
             rc = s.proc.poll()
             if rc is None and time.time() - s.t0 > timeout:
-                try:
-                    os.killpg(s.proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                kill_tree(s.proc)
                 s.proc.wait()
                 rc = None
                 s.why = "timed out after %s" % fmt_secs(timeout)
@@ -642,6 +849,9 @@ def run_steps(steps, jobs, caps, out, timeout, mon, show_output):
             running.remove(s)
             used -= s.cost
             inuse[s.klass] -= 1
+            for l in s.lanes:
+                users[l] -= 1
+                alone.discard(l)
             report_step(s, out, show_output)
     out.clear()
     return time.time() - t0
@@ -784,11 +994,13 @@ def do_list(sel, args, times):
 
 def parse_args(cat):
     ap = argparse.ArgumentParser(
-        prog="tests/run", usage="tests/run [options] [TEST ...]",
+        prog="tests/run",
+        usage="tests/run [options] [TEST[@BUILD] ...] [-- TOOL-ARGS]",
         description="Run MyLang's tests (see tests/README.md).",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("tests", nargs="*", metavar="TEST",
-                    help="run exactly these tests (names from -L)")
+                    help="run exactly these tests (names from -L); "
+                         "NAME@BUILD runs a test on another build")
     g = ap.add_argument_group("selecting")
     g.add_argument("-t", "--max-class", default="med",
                    choices=[c for c, _ in CLASSES if c != "manual"] +
@@ -814,6 +1026,9 @@ def parse_args(cat):
                    help="with -l: also list each test's cases")
     g.add_argument("--classes", action="store_true",
                    help="list the time classes and the test types")
+    g.add_argument("--builds", action="store_true",
+                   help="list the builds, their recipes and what each "
+                        "binary's `mylang -v` must say")
     g = ap.add_argument_group("running")
     g.add_argument("-o", "--show-output", action="store_true",
                    help="show each test's whole output, even on success")
@@ -823,6 +1038,10 @@ def parse_args(cat):
                    help="the fuzzers' seed (default: a fresh one)")
     g.add_argument("--timeout", type=int, default=3 * 3600,
                    help="per-test timeout in seconds (default 3 hours)")
+    g.add_argument("--shard", default=None, metavar="I/N",
+                   help="run part I (from 0) of N of each selected test "
+                        "(those that can split: %s)" % ", ".join(
+                            sorted(n for n, t in cat.items() if t.shard)))
     g = ap.add_argument_group("builds")
     g.add_argument("--build-root",
                    default=os.environ.get("MYLANG_TEST_BUILD_ROOT",
@@ -839,7 +1058,19 @@ def parse_args(cat):
                    help="log directory (default: BUILD_ROOT/test-logs/"
                         "<time>)")
     g.add_argument("--no-color", action="store_true")
-    args = ap.parse_args()
+    # after `--`: arguments for the one selected test's tool, appended
+    # to its command line (a CI workflow's inputs, an extra flag)
+    argv = sys.argv[1:]
+    extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    args = ap.parse_args(argv)
+    args.extra = extra
+    if args.shard is not None:
+        m = re.fullmatch(r"(\d+)/(\d+)", args.shard)
+        if not m or not int(m.group(1)) < int(m.group(2)):
+            ap.error("--shard wants I/N with 0 <= I < N")
     args.build_root = os.path.abspath(args.build_root)
     args.bins = {}
     for spec in args.bin:
@@ -858,13 +1089,23 @@ def parse_args(cat):
 def select(cat, args):
     """(selected tests, why-not hints)."""
     if args.tests:
+        for n in args.tests:
+            # NAME@BUILD: a catalog test on another build
+            base, _, lane = n.rpartition("@")
+            if n in cat or base not in cat or not cat[base].lane:
+                continue
+            if lane == cat[base].lane:
+                cat[n] = cat[base]
+            elif lane in LANES:
+                cat[n] = cat[base].on(lane)
         unknown = [n for n in args.tests if n not in cat]
         if unknown:
             for n in unknown:
                 near = [m for m in cat if n in m]
                 print("tests/run: no test named %r%s" % (
                     n, " (did you mean: %s?)" % ", ".join(near[:5])
-                    if near else " (tests/run -L lists them)"))
+                    if near else " (tests/run -L lists them, "
+                    "--builds the builds for NAME@BUILD)"))
             sys.exit(BAD_ARGS)
         sel = [cat[n] for n in args.tests]
         manual = [t.name for t in sel if t.cls == "manual"]
@@ -906,6 +1147,13 @@ def select(cat, args):
 
 
 def main():
+    # a console that cannot encode a log's text (Windows' cp1252) gets
+    # a replacement character, not an exception
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     cat = catalog()
     args = parse_args(cat)
     if args.classes:
@@ -915,6 +1163,15 @@ def main():
         print()
         for t, d in TYPES:
             print("  %-9s %s" % (t, d))
+        return OK
+    if args.builds:
+        for l in LANES.values():
+            want = ", ".join("%s %s" % (k, "|".join(v) if isinstance(
+                v, tuple) else v) for k, v in l.expect.items())
+            print("  %-12s %s\n  %-12s %s%s: %s\n  %-12s mylang -v: %s"
+                  % (l.name, l.desc, "", l.kind,
+                     " (jit.h's guard off)" if l.nojit else "", l.args,
+                     "", want))
         return OK
     sel = select(cat, args)
     if args.case and not args.list:
@@ -927,6 +1184,17 @@ def main():
     if not sel:
         print("tests/run: no test matches")
         return NO_TESTS
+    if args.shard:
+        bad = [t.name for t in sel if not t.shard]
+        if bad:
+            print("tests/run: --shard: %s cannot be split (these can: %s)"
+                  % (", ".join(bad), ", ".join(sorted(
+                      n for n, t in cat.items() if t.shard))))
+            return BAD_ARGS
+    if args.extra and len(sel) != 1:
+        print("tests/run: the arguments after -- go to one test's tool; "
+              "%d tests are selected" % len(sel))
+        return BAD_ARGS
     times = load_times(args.build_root)
     if args.list:
         do_list(sel, args, times)
@@ -934,7 +1202,13 @@ def main():
 
     testjobs.ensure_idle()
     jobs = args.jobs if args.jobs > 0 else testjobs.count()
-    share = max(1, jobs // 3)
+    # a wide test runs its own pool: up to three at once, but never with
+    # fewer than four workers each - on a small box (a 4-core CI runner
+    # gets 2) they run one after another at full width, since a split
+    # share is fixed at start and the longer test would keep half the
+    # cores after the shorter one is done
+    k = max(1, min(3, sum(1 for t in sel if t.wide), jobs // 4))
+    share = max(1, jobs // k)
     out = Out(color=not args.no_color and not os.environ.get("NO_COLOR"))
     stamp = time.strftime("%Y%m%d-%H%M%S")
     logdir = os.path.abspath(args.logs or os.path.join(
@@ -942,7 +1216,8 @@ def main():
     os.makedirs(logdir, exist_ok=True)
     latest = os.path.join(os.path.dirname(logdir), "latest")
     try:
-        if os.path.islink(latest) or not os.path.exists(latest):
+        if not args.logs and (os.path.islink(latest)
+                              or not os.path.exists(latest)):
             if os.path.islink(latest):
                 os.unlink(latest)
             os.symlink(logdir, latest)
@@ -955,16 +1230,21 @@ def main():
     skipped = []
     if args.no_build:
         for t in list(sel):
-            if t.lane and not os.access(ctx.bin(t.lane), os.X_OK):
+            gone = [l for l in t.lanes()
+                    if not os.access(ctx.bin(l), os.X_OK)]
+            if gone:
                 skipped.append((t, "no %s build (%s)" % (
-                    t.lane, ctx.bin(t.lane))))
+                    gone[0], ctx.bin(gone[0]))))
                 sel.remove(t)
-    need = sorted({t.lane for t in sel if t.lane})
+    need = sorted({l for t in sel for l in t.lanes()})
     build = [] if args.no_build else [l for l in need if l not in args.bins]
 
     caps = {"rt": testjobs_cap("rtcap"), "build": testjobs_cap("buildcap")}
     out.line("tests/run: %d test(s), %d build(s), %d cores, seed %d" % (
         len(sel), len(build), jobs, args.seed))
+    for l in need:
+        if l in args.bins:
+            out.line("build %s: %s (--bin)" % (l, rel(args.bins[l])))
     out.line("logs: %s" % logdir)
     for t, why in skipped:
         out.line("%s %-26s %s" % (out.c("33", "[ SKIPPED ]"), t.name, why))
@@ -990,14 +1270,24 @@ def main():
             steps = []
             need = []
     for t in sel:
-        cmd = t.cmd(ctx)
+        tc = TestCtx(ctx, t)
+        cmd = t.cmd(tc)
+        if args.shard:
+            cmd += t.shard(args.shard)
+        cmd += args.extra
         env = dict(t.env)
         if t.wide:
             env["MYLANG_TEST_JOBS"] = str(share)
-        st = Step(t.name, cmd, deps=["check:" + t.lane] if t.lane in need
-                  else [], cost=share if t.wide else 1, klass=t.klass,
+        if t.lane and LANES[t.lane].expect.get("int_tests") == "1":
+            # driver_checks pins `int_tests 0` unless told otherwise
+            env["MYLANG_EXPECT_INT_TESTS"] = "1"
+        st = Step(t.name, cmd, deps=["check:" + l for l in t.lanes()
+                                     if l in need],
+                  cost=share if t.wide else 1, klass=t.klass,
                   env=env, est=expected(t, times), test=t,
-                  label="%s: %s" % (t.type, t.name))
+                  label="%s: %s" % (t.type, t.name),
+                  prep=(lambda g, c: lambda: [f(c) for f in g])(
+                      t.guards, tc) if t.guards else None)
         if args.case:
             cases = list_cases(t, ctx.bin(t.lane))
             rx = re.compile(args.case)
@@ -1033,16 +1323,15 @@ def main():
         out.clear()
         for s in steps:
             if s.status == "RUN":
-                try:
-                    os.killpg(s.proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                kill_tree(s.proc)
         print("\ntests/run: interrupted; logs in %s" % logdir)
         return INTERRUPTED
 
     # the timing record: the last five runs of each test
     for s in tests_run:
-        if s.status == "PASS" and not args.case:
+        # only whole, unmodified runs say how long a test takes
+        if s.status == "PASS" and not (args.case or args.shard
+                                       or args.extra):
             h = times.get(s.name, [])[-4:] + [round(s.secs, 1)]
             times[s.name] = h
     save_times(args.build_root, times)
@@ -1085,7 +1374,7 @@ def summary(steps, skipped, wall, logdir, out):
         else out.c("31", "FAILED")
     out.line("%s: %d/%d tests passed in %s; logs in %s" % (
         verdict, sum(1 for s in tests if s.status == "PASS"), len(tests),
-        human(wall), os.path.relpath(logdir, ROOT)))
+        human(wall), rel(logdir)))
     if failed:
         out.line()
         out.line("to reproduce:")

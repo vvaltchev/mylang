@@ -66,6 +66,11 @@ all with
 
     $ tests/run -L
 
+Any test also runs on another build: NAME@BUILD. rt@clang is the unit
+suite on the clang build, driver_checks@release the CLI checks on the
+shipping one. The catalog lists the combinations the long run covers;
+--builds lists every build.
+
 | Type     | What it runs                                               |
 |----------|------------------------------------------------------------|
 | unit     | the built-in suite (-rt), on every build that has it       |
@@ -89,6 +94,7 @@ Choosing what runs:
 | Option       | Effect                                                |
 |--------------|-------------------------------------------------------|
 | NAME ...     | exactly these tests (any class except manual)         |
+| NAME@BUILD   | a test on another build (--builds lists them)         |
 | -t CLASS     | up to this class: short, med (the default), long, any |
 | -T TYPE      | only these types, comma-separated; a prefix is enough |
 | -f REGEX     | only tests whose name matches                         |
@@ -101,6 +107,8 @@ Choosing what runs:
 | --seed N     | the fuzzers' seed, to repeat a run exactly            |
 | --no-build   | build nothing; skip tests whose build is missing      |
 | --bin B=PATH | use this binary as build B instead of making it       |
+| --shard I/N  | run part I (from 0) of N of a test that can split     |
+| -- ARGS      | pass ARGS to the one selected test's tool             |
 
 Some tests have cases: each -rt entry, each corpus program, each tests/int
 program and REPL session, each backtrace program. A test runs as one unit,
@@ -123,9 +131,14 @@ fuzzer's seed:
 Builds live under build-tests/ (--build-root or MYLANG_TEST_BUILD_ROOT
 to change it). Before a test runs, its binary's "mylang -v" is checked
 against the build's recipe, so a wrong --bin or a stale directory is
-refused instead of tested. Logs go to build-tests/test-logs/, the newest
-run under latest/, and each test's measured time is remembered in
-build-tests/test-times.json for the next run's estimates.
+refused instead of tested. A test of a configuration also proves the
+binary is in it first: the no-arena tests check that MYLANG_NO_LOWMEM=1
+really refuses the arena, the alignment tests that the check is really
+emitted. Otherwise such a test would pass while testing the default.
+
+Logs go to build-tests/test-logs/, the newest run under latest/, and each
+test's measured time is remembered in build-tests/test-times.json for the
+next run's estimates.
 
 The exit status is 0 when everything passed, 3 when a test failed, 2 when
 a build failed, 4 when nothing matched, 1 for a bad option and 5 when
@@ -335,16 +348,21 @@ tests/run makes these on demand, each under build-tests/NAME:
 | Build       | make (or cmake) options                     | Used by        |
 |-------------|---------------------------------------------|----------------|
 | dbg         | TESTS=1 OPT=0                               | the quick run  |
-| clang       | CXX=clang++ TESTS=1 OPT=0                   | rt-clang       |
-| rel-hard    | TESTS=1 OPT=1 VM_HARDENING=1                | rt-rel-hard    |
+| clang       | CXX=clang++ TESTS=1 OPT=0                   | rt@clang       |
+| rel-hard    | TESTS=1 OPT=1 VM_HARDENING=1                | rt@rel-hard    |
 | release     | OPT=1                                       | system_smoke   |
+| ship        | OPT=1 ASSERTS=0                             | CI only        |
 | rna         | OPT=1 ASSERTS=0 TESTS=1                     | no-assert runs |
+| lto0        | OPT=1 TESTS=1 LTO=0                         | CI only        |
 | recycle     | TESTS=1 OPT=0 RECYCLE=1                     | rt, repl_fuzz  |
-| nojit-gcc   | TESTS=1 OPT=0, JIT compiled out             | rt-nojit-gcc   |
-| nojit-clang | CXX=clang++ TESTS=1 OPT=0, JIT compiled out | rt-nojit-clang |
+| nojit-gcc   | TESTS=1 OPT=0, JIT compiled out             | rt@nojit-gcc   |
+| nojit-clang | CXX=clang++ TESTS=1 OPT=0, JIT compiled out | rt@nojit-clang |
 | int-rel     | OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1   | int tests      |
 | int-gcov    | OPT=0 TESTS=1 INT_TESTS=1 GCOV=1            | int_run-gcov   |
 | cmake-gcov  | cmake -DTESTS=1 -DGCOV=1 -DVM_HARDENING=ON  | norec_coverage |
+
+"CI only" builds have no test of their own in the catalog: CI builds them
+to check the build itself, then runs tests on them with NAME@BUILD.
 
 A debug build has the address and undefined-behaviour sanitizers on,
 which is where most memory bugs show up first. "mylang -v" prints how a
@@ -392,6 +410,16 @@ on where it stopped.
 What CI runs
 ------------
 
+CI builds its binaries itself, mostly with CMake (the one place that
+build system gets exercised), and runs every test through tests/run:
+
+    $ tests/run -o --logs test-logs --bin rna=build/mylang \
+                rt-nolowmem@rna corpus_diff-nolowmem@rna driver_checks@rna
+
+So a CI test is exactly the local one: the same command, the same checks
+on the binary, the same reproduce lines. A failed job uploads its
+test-logs/ directory, findings included.
+
 On every push:
 
 | Workflow | Runs                                                        |
@@ -402,10 +430,11 @@ On every push:
 | macOS    | -rt                                                         |
 | Windows  | -rt                                                         |
 | Coverage | -rt with coverage, uploaded                                 |
-| Nets     | corpus_diff (plain, --levers, --nolowmem, --spcheck),       |
-|          | bt_oracle, norec_enum, norec_sweep, vdjcmp, disasmcheck,    |
-|          | the three fuzzers, int_run, int_enum tiers 1 and 2, and the |
-|          | coverage gates                                              |
+| Nets     | corpus_diff (plain, --levers, --nolowmem, --spcheck), -rt   |
+|          | with the arena refused and with the alignment check, on a   |
+|          | debug and a no-assert build, bt_oracle, norec_enum,         |
+|          | norec_sweep, vdjcmp, disasmcheck, the three fuzzers,        |
+|          | int_run, int_enum tiers 1 and 2, and the coverage gates     |
 
 Nets takes about 18 minutes; the others finish in under 10. The fuzzers
 use a new seed on every run, so each push tries new programs.

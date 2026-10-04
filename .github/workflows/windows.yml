@@ -9,6 +9,11 @@ jobs:
       matrix:
         os: [windows-latest]
         bt: [Debug, Release]
+        include:          # the tests/run build each one stands for
+          - bt: Debug
+            lane: dbg
+          - bt: Release
+            lane: rel-hard
 
     env:
       BUILD_TYPE: ${{ matrix.bt }}
@@ -34,8 +39,21 @@ jobs:
       shell: bash
       run: cmake --build . --config $BUILD_TYPE
 
+    # The binary stands for tests/run's `dbg` / `rel-hard` build and is
+    # checked against it first (MSVC sets no optimization macro, so the
+    # debug one reports `opt unknown`, which `dbg` accepts). No live
+    # progress socket here (no Unix sockets); the heartbeat lines print.
     - name: Test
-      working-directory: ${{github.workspace}}/build/${{ matrix.bt }}
       shell: bash
-      run:  ./mylang -rt
+      run: python tests/run -o --logs test-logs
+           --bin ${{ matrix.lane }}=build/${{ matrix.bt }}/mylang.exe
+           rt@${{ matrix.lane }}
+
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
 

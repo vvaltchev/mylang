@@ -28,11 +28,19 @@ jobs:
       run: cmake --build . --config $BUILD_TYPE
 
     - name: Test
-      working-directory: ${{github.workspace}}/build
       shell: bash
-      run:  ./mylang -rt
+      run: tests/run -o --logs test-logs --bin cmake-gcov=build/mylang
+           rt@cmake-gcov
 
     - name: Upload coverage data
       working-directory: ${{github.workspace}}/build
       shell: bash
       run:  bash <(curl -s https://codecov.io/bash)
+
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore

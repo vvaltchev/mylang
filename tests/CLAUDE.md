@@ -44,12 +44,38 @@ the INT_TESTS section); read those first.
 ## tests/run - the runner (after Tilck's run_all_tests)
 
 - The CATALOG is `catalog()` at the top of tests/run: one `add(name,
-  type, class, build, est_seconds, cmd, ...)` per test. A new tool or a
+  type, class, build, est_seconds, cmd, ...)` per test, `cmd(c)` reading
+  the binary as `c.b` (never a hard-coded build), so the same test runs
+  on any build as NAME@BUILD; `on(test, build, est)` puts such a
+  combination in the catalog (the long run covers it). A new tool or a
   new configuration of one gets a line there, with an HONEST class (the
   run alone, build excluded): short <= 30 s, med <= 3 min, long <= 30
   min, manual = hours. short + med is the default run, and a test whose
   build is not `dbg` is `long` - building that lane is minutes on its
   own. test-times.json keeps the measured times; trust them over `est`.
+- CI RUNS THE CATALOG (2026-10-04): every workflow builds its binary
+  itself (CMake mostly - CI is where that build system is exercised,
+  and the coverage floors were measured on those recipes) and runs
+  `tests/run -o --logs test-logs --bin LANE=PATH NAME@LANE ...`. So a
+  check CI needs is a catalog test, never a workflow shell step: a new
+  per-push check means a catalog entry plus its name in the job's
+  tests/run line. A CI build stands for a lane (Windows Debug for dbg,
+  hence `opt unknown` in dbg's expect; both Linux Release lanes for
+  rel-hard; `ship` and `lto0` are build-check lanes with no catalog
+  test of their own).
+- A test of a CONFIGURATION carries `guards=`: in-process checks run
+  before the tool that raise when the binary is not in that
+  configuration (guard_nolowmem, guard_spcheck, guard_rex). They replace
+  the workflows' old vacuity-guard steps; a new env lever whose test
+  could pass vacuously gets one.
+- `uses=[lane]` adds a build the command reads (int-vdjcmp's reference);
+  `exclusive=True` runs the test alone on its build - any tool that
+  clears and reads gcov counters (int_run --gcov, norec_coverage,
+  int_select): another run of the same binary would add to them.
+  `shard=` turns --shard I/N into the tool's own option; `-- ARGS` go to
+  the single selected test's tool (the Mutation workflow's inputs).
+- The heartbeat line carries each running test's latest output line:
+  in a CI log that is the only live view of a long tool.
 - BUILDS are `LANES`: a make or cmake recipe plus an `expect` dict that
   the binary's `mylang -v` must match. Add the expectation that would
   catch the wrong binary (int_tests 1 for an INT lane, ...), never an
@@ -99,27 +125,43 @@ shell that runs the pkill (exit 144, the command dies with it).
 
 ## Where each tool runs in CI
 
-| tool             | per push (job)                    | on demand       |
-|------------------|-----------------------------------|-----------------|
-| -rt              | Linux x7, macOS, Windows,         |                 |
-|                  | Coverage, nolowmem x2, spcheck x2 |                 |
-| corpus_diff      | differential, differential-levers |                 |
-|                  | -fuzz, nolowmem, spcheck          |                 |
-| bt_oracle        | differential                      |                 |
-| norec_enum/sweep | differential                      |                 |
-| vdjcmp           | differential                      |                 |
-| disasmcheck      | disasmcheck x3 (--shard I/3)      |                 |
-| nested_fuzz      | differential-levers-fuzz          |                 |
-| myv_fuzz         | myv-fuzz (debug-asan, release)    |                 |
-| repl_fuzz        | repl-fuzz (RECYCLE + ASan)        |                 |
-| int_run          | int (--gcov --require-floor)      |                 |
-| int_enum         | int-enum (tiers 1, 2)             | int-deep tier 3 |
-| int_select       |                                   | int-deep select |
-| norec_coverage   | coverage-gate                     |                 |
-| driver_checks    | Linux, lto0, nolowmem             |                 |
-| system_smoke     | Linux release-smoke               |                 |
-| myv_doc_check    | Linux                             |                 |
-| mutate           |                                   | Mutation        |
+Every job: its own build, then one `tests/run --bin` line naming these
+catalog tests.
+
+| workflow job             | build (lane)       | tests                     |
+|--------------------------|--------------------|---------------------------|
+| Linux build x4           | cmake (dbg, clang, | rt, myv_doc_check,        |
+|                          | rel-hard x2)       | driver_checks @lane       |
+| Linux recycle            | cmake (recycle)    | rt@recycle                |
+| Linux release-smoke x2   | cmake (release,    | system_smoke @lane        |
+|                          | ship)              |                           |
+| Linux lto0 x2            | make + cmake       | rt@lto0, driver_checks@   |
+|                          | (lto0, ship)       | lto0, system_smoke@ship   |
+| Linux dbginfo x2         | make (dbg)         | rt                        |
+| macOS                    | cmake (clang)      | rt@clang                  |
+| Windows x2               | cmake MSVC (dbg,   | rt @lane                  |
+|                          | rel-hard)          |                           |
+| Coverage                 | cmake (cmake-gcov) | rt@cmake-gcov + codecov   |
+| Nets differential        | cmake (dbg)        | corpus_diff, vdjcmp,      |
+|                          |                    | bt_oracle, norec_enum,    |
+|                          |                    | norec_sweep               |
+| Nets levers-fuzz         | cmake (dbg)        | corpus_diff-levers,       |
+|                          |                    | nested_fuzz               |
+| Nets disasmcheck x3      | cmake (dbg)        | disasmcheck-matrix        |
+|                          |                    | --shard I/3               |
+| Nets nolowmem x2         | cmake (dbg, rna)   | rt-nolowmem, corpus_diff- |
+|                          |                    | nolowmem, driver_checks   |
+| Nets spcheck x2          | cmake (dbg, rna)   | rt-spcheck,               |
+|                          |                    | corpus_diff-spcheck       |
+| Nets int                 | cmake g++-14       | int-vdjcmp, int_run-gcov, |
+|                          | (int-gcov, dbg)    | driver_checks@int-gcov    |
+| Nets int-enum            | cmake (int-rel)    | int_enum-1, int_enum-2,   |
+|                          |                    | disasmcheck-rex           |
+| Nets myv-fuzz x2         | cmake (dbg, rna)   | myv_fuzz                  |
+| Nets repl-fuzz           | cmake (recycle)    | repl_fuzz@recycle         |
+| Nets coverage-gate       | cmake (cmake-gcov) | norec_coverage            |
+| int-deep (on demand)     | cmake, make        | int_enum-3, int_select    |
+| Mutation (on demand) x8  | its own            | mutate --shard I/8        |
 
 The CI fuzzers take `--seed ${{github.run_id}}` (a re-run keeps it): a
 fixed seed made them a regression corpus. A finding reproduces from the

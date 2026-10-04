@@ -40,22 +40,17 @@ jobs:
         cmake -S $GITHUB_WORKSPACE -B build-enum -DINT_TESTS=ON \
               -DCMAKE_BUILD_TYPE=Release -DASSERTS=ON -DLTO=OFF
         cmake --build build-enum -j
-    - name: "assert -v reports int_tests 1, asserts 1"
-      run: |
-        ./build-enum/mylang -v | grep -q '^  int_tests  *1'
-        ./build-enum/mylang -v | grep -q '^  asserts  *1'
-    - name: tests/int_enum (tier 3, tests/functional + samples)
-      run: |
-        tests/int_enum ./build-enum/mylang --tier 3 \
-                --heartbeat 120 --failures-out int-enum-failures-t3.txt \
-                tests/functional/*.my samples/fib samples/gcd samples/loop \
-                samples/primes samples/primes2 samples/strloop
-    - name: Upload the failures
+    # tests/run checks the binary first (`int_tests 1`, `asserts 1`),
+    # then runs tier 3 over tests/functional and the input-free samples
+    - name: tests/run int_enum-3
+      run: tests/run -o -a --timeout 17400 --logs test-logs
+           --bin int-rel=build-enum/mylang int_enum-3
+    - name: Upload the logs and failures
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: int-enum-failures-t3
-        path: int-enum-failures-t3.txt
+        name: int-enum-t3
+        path: test-logs/
         if-no-files-found: ignore
 
   select:
@@ -73,14 +68,14 @@ jobs:
     - name: Build (INT_TESTS + GCOV, debug)
       run: make -j"$(nproc)" CXX=g++-14 OPT=0 TESTS=1 INT_TESTS=1 GCOV=1 \
                 BUILD_DIR=build-sel
-    - name: tests/int_select (--with-rt)
-      run: |
-        tests/int_select ./build-sel/mylang --with-rt \
-                --heartbeat 120 --out int-select.json | tee int-select.txt
+    # the report is the test's log, the cover its JSON (test-logs/)
+    - name: tests/run int_select
+      run: tests/run -o -a --timeout 17400 --logs test-logs
+           --bin int-gcov=build-sel/mylang int_select
     - name: Upload the report
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: int-select
-        path: int-select.*
+        path: test-logs/int_select*
         if-no-files-found: ignore
