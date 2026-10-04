@@ -62,6 +62,12 @@ GCAP = 20         # cap on the growing array G (so len(G) stays small too)
 MDIM = 3          # M is an MDIM x MDIM nested array (2-D structure)
 
 
+# THE WORK BUDGET (see Gen.work): how many times the innermost code may
+# run per pass of the rep loop. 3^8: deep programs keep a loop at most
+# levels, and the slowest engine (the debug tree-walker) stays in seconds.
+WORK_BUDGET = 6561
+
+
 class Gen:
     """Generate one random program (MyLang + Python) for a given seed/depth."""
 
@@ -75,6 +81,16 @@ class Gen:
         # a stack of loop variables currently in scope (for use in expressions)
         self.loopvars = []
         self.tempcount = 0
+        # THE WORK BUDGET: `work` is the product of the iteration counts of
+        # the loops enclosing the current nesting level, i.e. how many
+        # times code placed here runs per pass. Past WORK_BUDGET a level
+        # nests an `if` instead of another loop (both branches still
+        # recurse, so the depth is kept). Without it a depth-15 program of
+        # loops runs millions of innermost iterations: the debug
+        # tree-walker took 26 s on one (CPython 0.5 s), over the fuzzer's
+        # 30 s limit under load - a TIMEOUT, with every engine agreeing.
+        self.work = 1
+        self.max_work = 1
         # RANDOM helper functions: [(name, arity)], generated per program.
         # They exist for the BYTECODE SPLICE, which only ever sees non-main
         # chunks - a call in main's rep loop can never be spliced, so the
@@ -401,6 +417,14 @@ class Gen:
         fold = "%s = (%s + %s + %s) %% %d" % (tgt, tgt, a, b, MOD)
         self.emit(im + fold + ";", ip + fold)
 
+    def nest(self, trips, level, im, ip):
+        """build() one level down, inside a loop of up to `trips`
+        iterations: the work budget's bookkeeping."""
+        self.work *= trips
+        self.max_work = max(self.max_work, self.work)
+        self.build(level, im, ip)
+        self.work //= trips
+
     def build(self, level, im, ip):
         # a side effect at this level, then (if not innermost) a nested construct
         self.side_effect(im, ip)
@@ -412,6 +436,8 @@ class Gen:
 
         kind = self.rng.choice(["if", "while", "for_opt", "for_gen",
                                 "for_down", "while_data"])
+        if self.work * 4 > WORK_BUDGET:
+            kind = "if"
         v = "v%d" % level
 
         if kind == "if":
@@ -436,7 +462,7 @@ class Gen:
             # increment FIRST so any later continue is translation-safe
             self.emit(im + "  %s += 1;" % v, ip + "    %s += 1" % v)
             self.loopvars.append(v)
-            self.build(level + 1, im + "  ", ip + "    ")
+            self.nest(n, level + 1, im + "  ", ip + "    ")
             self.loopvars.pop()
             self.emit(im + "}", "")
 
@@ -450,7 +476,7 @@ class Gen:
             self.emit(im + "  if (%s %% 11 == 0) continue;" % g1,
                       ip + "    if %s %% 11 == 0: continue" % g1)
             self.loopvars.append(v)
-            self.build(level + 1, im + "  ", ip + "    ")
+            self.nest(n, level + 1, im + "  ", ip + "    ")
             self.loopvars.pop()
             g2 = self.rng.choice(self.scalars)
             self.emit(im + "  if (%s %% 13 == 0) break;" % g2,
@@ -463,7 +489,7 @@ class Gen:
             self.emit(im + "for (var %s = %d; %s > 0; %s--) {" % (v, n, v, v),
                       ip + "for %s in range(%d, 0, -1):" % (v, n))
             self.loopvars.append(v)
-            self.build(level + 1, im + "  ", ip + "    ")
+            self.nest(n, level + 1, im + "  ", ip + "    ")
             self.loopvars.pop()
             g = self.rng.choice(self.scalars)
             self.emit(im + "  if (%s %% 13 == 0) break;" % g,
@@ -482,7 +508,7 @@ class Gen:
                       ip + "while %s < %d and %s < %d:" % (v, n, g, lim))
             self.emit(im + "  %s += 1;" % v, ip + "    %s += 1" % v)
             self.loopvars.append(v)
-            self.build(level + 1, im + "  ", ip + "    ")
+            self.nest(n, level + 1, im + "  ", ip + "    ")
             self.loopvars.pop()
             self.emit(im + "}", "")
 
@@ -494,7 +520,7 @@ class Gen:
                       ip + "%s = 1" % v)
             self.emit("", ip + "while %s < %d:" % (v, top))
             self.loopvars.append(v)
-            self.build(level + 1, im + "  ", ip + "    ")
+            self.nest((2 if top == 4 else 3), level + 1, im + "  ", ip + "    ")
             self.loopvars.pop()
             self.emit(im + "}", ip + "    %s = %s * 2" % (v, v))
 
