@@ -19351,6 +19351,7 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                 return;
             }
     };
+    ML_INT_ONLY(int int_contests = 0;)
     while (!wq.empty()) {
         const WEv wev = wq.top();
         wq.pop();
@@ -19427,6 +19428,20 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                     far_i < 0 ? "NEWCOMER" : "active",
                     far_i < 0 ? p.slot
                               : out.pieces[active[far_i]].slot);
+        /* #107 P3: WHICH piece loses is a COST decision - any of the
+         * newcomer and the active pieces may (a wrong loser costs a
+         * reload, never a result). Option 0 is the newcomer, 1+a the
+         * a-th active piece; keyed per run, per pool and per contest. */
+        ML_INT_ONLY({
+            const std::string key = g_int_runkey + (fm ? "/fspill#"
+                                                       : "/spill#")
+                                  + std::to_string(int_contests++);
+            const int n = static_cast<int>(active.size()) + 1;
+            const int pick = int_choose(key, n, far_i + 1);
+            ML_INT(spill_choice, key, int64_t(n), int64_t(far_i + 1),
+                   int64_t(pick));
+            far_i = pick - 1;
+        })
         if (far_i < 0) {
             /* the loser is the (re)bidder itself: park it - the
              * second chance. A re-bid that loses parks again at the
@@ -19805,10 +19820,11 @@ pick_float_lits(Emitter &e, const Chunk &chunk, size_t begin, size_t end)
     /* FORCE skips the COST gate (calls in the loop re-materialise the
      * pool) but NOT correctness - emit_call_epilogue restores it either
      * way, which is precisely the property this lets a test check. */
+    bool hot_call = false;
     if (!jit_lever_forced(JL_FLIT))
         for (size_t pc = begin; pc < end; pc++)
             if (in_loop[pc - begin] && op_calls_on_hot_path(chunk.code[pc]))
-                return {};
+                hot_call = true;
 
     /* weight: an operand-b literal saves BOTH instructions, an
      * operand-a literal saves one (it still has to reach xmm0) */
@@ -19840,10 +19856,33 @@ pick_float_lits(Emitter &e, const Chunk &chunk, size_t begin, size_t end)
                         const std::pair<double, int> &b) {
                          return a.second > b.second;
                      });
+    /* the cost gate, decided once the pool is known to be non-empty */
+    if (hot_call && !w.empty() && w.front().second >= 2) {
+        /* #107 P3: refusing is a COST decision - taking the pool anyway
+         * is what FORCE=flit does, and must change nothing observable */
+        ML_INT_ONLY({
+            const std::string key = g_int_runkey + "/flitgate";
+            const int pick = int_choose(key, 2, 0);
+            ML_INT(flit_choice, key, int64_t(2), int64_t(0), int64_t(pick));
+            hot_call = pick == 0;
+        })
+    }
+    if (hot_call)
+        return {};
     std::vector<Emitter::FLit> out;
     for (size_t i = 0; i < w.size(); i++) {
         if (w[i].second < 2)
             break;                     /* a single a-use is a wash */
+        /* #107 P3: leaving a literal inline is always legal - its uses
+         * materialise it themselves, as for a literal past the cap */
+        ML_INT_ONLY({
+            const std::string key = g_int_runkey + "/flit#"
+                                  + std::to_string(i);
+            const int pick = int_choose(key, 2, 0);
+            ML_INT(flit_choice, key, int64_t(2), int64_t(0), int64_t(pick));
+            if (pick == 1)
+                continue;
+        })
         const int r = e.ra.ftake();
         if (r < 0)
             break;                     /* the file is full: the rest of

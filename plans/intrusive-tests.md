@@ -21,7 +21,8 @@ attempt collapse); `int_events` sorted (a pointer-keyed walk made program
 order nondeterministic); runner headers INT-ENGINES / INT-CONFIGS; the
 universe narrowed to the PRODUCT (tests.cpp, the INT core and `*int_*`
 helpers excluded): 114,495 elements, 32,433 uncovered (gcc 16.2).
-**Findings so far:** a direct call with a typed parameter never splices
+**Findings so far (the first FIXED 2026-10-02):** a direct call with a
+typed parameter never splices
 (`typed_params`) while the same callee through a value call does; a value
 call inside a template INSTANCE gets no callee set (only the base's site
 is analysed, as top).
@@ -386,7 +387,19 @@ assertions on values.
   budget-0 deviation found the rel8 flush hazard in Throw/Rethrow/
   EndFinally), per-RUN register keys, the SPLICE and AST INLINE sites
   (every single decline over the corpus is RULE-2 clean), and stderr in
-  the oracle. NOT built yet: tiers 2-3 (pairs of deviations).
+  the oracle. 2026-10-02/03: the TYPED-callee bytecode inlining (the
+  `typed_params` finding, fixed - it exposed a shipped wrong answer, a
+  reassigned function's declared body inlined, and an entry-stub
+  `flit_load` clobbering a REGCALL pin); then two more decision sites,
+  `flit_choice` (the literal pool's cost gate - forcing it is
+  FORCE=flit - and each literal it holds; watched: with the call
+  epilogue's pool restore removed, the forced-gate deviations fail 4
+  corpus programs and tests/int/10_flit.my's forced config) and
+  `spill_choice` (the scan's pressure contest: any loser is legal;
+  12 of 20 sampled deviations emit different code, all agree - no
+  sabotage was found that ONLY a forced loser reaches, since breaking
+  an eviction breaks the default evictions too). NOT built yet: tiers
+  2-3 (pairs of deviations), the unroll-depth and call-tier sites.
 - **P4 - VM state checker + object census.**
 - **P5 - JIT preserving probe stub** + the per-op register map.
 - **P6 - chunk hook + assembler**; build the three splice-gate tests.
