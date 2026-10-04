@@ -688,3 +688,17 @@ test that owns nothing.
 - A new **P8 - selection and reduction tooling** (`tests/int_select.py`:
   candidate runs, greedy + removal, delta-debugging shrink, the
   ownership table). It is offline tooling, not CI.
+  **STATUS (2026-10-03): BUILT.** Candidates = tests/functional,
+  the non-interactive samples and tests/bt_oracle x {default, -nj, -tw,
+  MYLANG_JIT_OFF=lsra, MYLANG_NO_LOWMEM=1} (+ `-rt`), each run once in
+  parallel under its own GCOV_PREFIX (checked: the same run measured in
+  place and prefixed gives the identical 15,806 covered elements), each
+  an oracle run against -tw (a mismatch EXCLUDES it). First run: 521
+  candidates, 0 excluded, 81,332 elements reached; the irredundant cover
+  is 64 tests - 83 s of runs against 210 s for all of them - and -rt
+  owns 25,962 of the elements alone; most of tests/bt_oracle owns
+  nothing beyond the rest. `--shrink`: 35_const_meaning 52 -> 24 lines
+  in 220 trials (~4 min), still owning its 1,614 elements. Not done:
+  tier-1 deviations, the tests/int programs (which carry their own
+  configs) and fuzzer findings as candidates; emitted-edge and value-
+  class elements (9.1) do not exist yet, so the universe is gcov's.

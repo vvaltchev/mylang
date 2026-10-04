@@ -689,6 +689,18 @@ than off a counter (a counter also counts the program's other sites).
 staging temp live after the call, a body reading its returned slot
 first, a call whose dst is its callee slot); removing any one gate now
 fails it, and nothing else.
+**SELECTION AND REDUCTION (P8, `tests/int_select.py`, offline - not
+CI):** on a GCOV INT build, every candidate (program x configuration,
+`-rt` with `--with-rt`) runs once - in parallel, each under its own
+`GCOV_PREFIX` tree with the objects symlinked beside its counters - and
+is EXCLUDED unless it prints what `-tw` prints; then a greedy +
+removal-pass IRREDUNDANT cover of everything reached, with the
+ownership table (each selected test owns an element no other covers,
+checked). `--shrink NAME` ddmin-reduces a selected `.my` while it keeps
+its owned elements, its exit code and its agreement with `-tw` (so a
+program's own asserts may go - the tree-walker is the oracle). First
+run (2026-10-03): 521 candidates reach 81,332 elements; 64 tests cover
+them all, 83 s of runs against 210 s, and `-rt` alone owns 25,962.
 **Long runs use `tests/testrun.py`** (a `Run`: heartbeat, a unix
 control socket - `tests/testctl.py status|stop|pause|jobs N` - and
 resume by a low-water-mark token); a new multi-minute tool should
