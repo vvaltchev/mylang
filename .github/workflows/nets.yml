@@ -334,6 +334,16 @@ jobs:
                 --failures-out int-enum-failures.txt \
                 tests/functional/*.my samples/fib samples/gcd samples/loop \
                 samples/primes samples/primes2 samples/strloop
+    # tier 2: TWO decisions at once, every combination, in each SMALL
+    # scope (one JIT run's choices, one caller's inlining sites) - ~3k
+    # runs. Tier 3 (the pairwise covering arrays of the larger scopes,
+    # ~110k runs) is on demand: .github/workflows/int-deep.yml.
+    - name: tests/int_enum.py (tier 2, the same corpus)
+      run: |
+        python3 tests/int_enum.py ./build-enum/mylang --tier 2 \
+                --heartbeat 60 --failures-out int-enum-failures-t2.txt \
+                tests/functional/*.my samples/fib samples/gcd samples/loop \
+                samples/primes samples/primes2 samples/strloop
     # disasmcheck (-vdj vs objdump, every operand) in configurations no
     # matrix axis reaches: forced allocator picks that put a float stage
     # in xmm8-15 and a GP scratch/pin in r8/r15 - the REX.R/X/B forms a
@@ -369,7 +379,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: int-enum-failures
-        path: int-enum-failures.txt
+        path: int-enum-failures*.txt
         if-no-files-found: ignore
 
   myv-fuzz:

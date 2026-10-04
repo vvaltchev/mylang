@@ -408,18 +408,19 @@ assertions on values.
   so a forced decline is consistent; tests/int/14_frameless.my forces
   two sites, and the CI corpus gains 239 deviations, all agree (shown
   live and clean, like spill_choice: no sabotage found that only a
-  forced push reaches). Then TIERS 2-3 (`int_enum.py --tier 2`): per
-  SCOPE (keys sharing the prefix before the last `/` - one JIT run, one
-  caller's inlining sites, all frameless sites) every 2+-deviation
-  combination when there are at most 64, else a deterministic greedy
-  covering array of every NON-default value pair (a default-side pair is
-  a tier-1 run); a failing row is reduced by dropping overrides in key
-  order while it still fails. Pairs ACROSS scopes are not claimed. CI
-  corpus: 111,896 rows, 0 failures, ~5 min. Watched: with the call
-  epilogue's float-pool restore removed, tier 1 fails 4 runs; tier 2
-  fails 301 in 12 programs, 11 of which tier 1 passes, each reduced to
-  2-4 decisions (01_float_chain_ref_temp: three float picks together).
-  Not in CI (it would add ~5 min to the int-enum job).
+  forced push reaches). Then TIERS 2 and 3: per SCOPE (keys sharing the
+  prefix before the last `/` - one JIT run, one caller's inlining sites,
+  all frameless sites) `--tier 2` runs every 2+-deviation combination of
+  a scope with at most 512 of them, `--tier 3` a deterministic greedy
+  covering array of every NON-default value pair of each larger scope (a
+  default-side pair is a tier-1 run); each scope is in exactly one, and
+  a failing row is reduced by dropping overrides in key order while it
+  still fails. Pairs ACROSS scopes are not claimed. CI corpus: tier 2
+  2,935 rows (2 s), tier 3 111,502 (6 min), 0 failures. Watched: with
+  the call epilogue's float-pool restore removed, tier 1 fails 4
+  programs, tier 2 one, tier 3 eleven, each reduced to 2-4 decisions
+  (01_float_chain_ref_temp: three float picks together). CI: tiers 1
+  and 2 on every push (`int-enum`), tier 3 on demand (`int-deep.yml`).
 - **P4 - VM state checker + object census.**
   **STATUS (2026-10-03): the OBJECT CENSUS is built** - per-kind
   counters at the pooled `operator new/delete`, `int_live(kind)`,
@@ -526,7 +527,7 @@ assertions on values.
 
 1. `int_*` builtins exist only in INT builds.
 2. `.my` programs observe and force; only C++ tests edit internal state.
-3. CI: enumeration tier 1 on every push, tiers 2-3 on dispatch.
+3. CI: enumeration tiers 1-2 on every push, tier 3 on dispatch.
 4. **An INT binary never runs under the random-program fuzzers**
    (`nested_fuzz`, `myv_fuzz`, `repl_fuzz`). They keep running on the
    ordinary builds; INT runs only the suite of section 9.
