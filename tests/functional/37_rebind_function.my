@@ -44,3 +44,14 @@ var f = func(x) { return x * 2; };
 print("var     ", f(3));
 f = func(x) { return x + 1; };
 print("var     ", f(3));
+
+# the BYTECODE INLINER must not paste the declared body behind a slot the
+# program reassigns: `a` is called (and inlinable) inside `drive`, then
+# rebound - the second call runs `b`. It printed `3 3` while the
+# tree-walker printed `3 103` (shipped; found by the #107 P3 enumerator)
+func ia(x) { var s = 0; for (var i = 0; i < 3; i++) s += i; return s + 0 * x; }
+func ib(x) { var s = 100; for (var i = 0; i < 3; i++) s += i; return s; }
+func drive(int n) { var r = ia(n); return r; }
+var d1 = drive(runtime(1));
+ia = ib;
+print("inlined ", d1, drive(runtime(1)));

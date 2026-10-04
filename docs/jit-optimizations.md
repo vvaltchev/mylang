@@ -17314,3 +17314,65 @@ only, and refusing is complete where a partial model would not be. None
 exists today (the build proved it); the static assertion was watched
 firing on a seven-argument probe. `jit_test_regtrack` gains the
 `callregs/*` scenarios.
+
+### THE BYTECODE INLINER TAKES TYPED CALLEES (2026-10-02)
+
+A direct call (`CallV`) to a function with a declared `int`/`float`
+parameter was never bytecode-inlined: the candidate gate required
+`fast_bind`, which is false exactly when a parameter has a declared
+type. A value call (`CallValueV`) had always taken such a callee,
+binding each typed parameter through `CoerceNumV` - the same conversion
+`bind_param` performs, carrying the argument's own caret. The direct
+call now does the same: `a.coerce` is filled for every arm, and the
+proven argument kinds are recorded at a `CallV` too (`call_arg_kinds`,
+renamed from `value_arg_kinds`; `proven_arg_kinds` is the one place
+they are computed), so an argument inference proved to be exactly the
+declared kind is read in place with no conversion at all.
+`MYLANG_BCINLINE_TYPED=0` restores the old decline (the A/B). Fifteen
+`-rt` protocol tests and `tests/int/05_call_tier.my` had reached their
+call tier through `func f(int n)` precisely because it stayed a call;
+they hold `TypedInlineOff` / the env config for their duration.
+Pinned by `tests/functional/60_typed_bc_inline.my` (identity, int ->
+float widening, a fitting and a failing `dyn` argument, an uncaught
+bind error's caret) and by `tests/int/02_splice.my`'s verdict for the
+typed callee. **Watched failing:** dropping the conversion for direct
+arms makes `isum("str")` loop forever where the tree-walker raises.
+
+**IT EXPOSED THREE OLDER BUGS, THE FIRST TWO FOUND BY THE #107 P3
+ENUMERATOR:**
+
+1. **The bytecode inliner pasted a REASSIGNED function's declared
+   body.** Its global-slot -> descriptor map (`slot_desc`) is the JIT's,
+   which lists every function slot - the JIT's call tiers check the
+   callee's identity at run time, the inliner has none. So
+   `func drive(int n) { return a(n); } ... a = b; drive(1);` kept
+   running `a`'s body: `3 3` where the tree-walker prints `3 103`,
+   reachable with UNTYPED callees before this change (typed ones only
+   added 37_rebind_function's `fib`). `bc_inline_slot_map` clears every
+   slot in `global_slot_reassigned`, and both drivers (the run's and the
+   `-vd/-vdj` dump's) hand the inliner that map. The case is appended to
+   `tests/functional/37_rebind_function.my`; watched failing on the
+   unfixed binary.
+2. **`flit_load` staged a float literal through a register an ENTRY had
+   just filled.** An entry stub and the frameless entry are emitted
+   after the whole run, so the allocator's view at their emission is the
+   run's FINAL state - and a REGCALL parameter moved into its pin in rcx
+   (`mov rcx, rdi`) was overwritten by `movabs rcx, 0x4000000000000000`
+   (the literal `2.0`), turning a loop bound into 2^62. `establish` now
+   passes the registers its own pins occupy at its pc (`entry_pins`) to
+   `flit_load`, which excludes them from the scratch ask. **REGTRACK was
+   blind to it for the same reason** (it judges against `cache`, the
+   final view): `trk_entry_pins` gives it the entry's pin set while the
+   literal loads run, and with the exclusion removed it now aborts by
+   name (`write to a PINNED register ... r1`) where the program used to
+   hang silently.
+3. **`cmp_reg_tag_via` borrowed a register its CALLER had already
+   borrowed.** Eight emitters (CoerceNumV's tag tests among them) open
+   a `RefScratch(RCX)` - which push-borrows a PINNED rcx - and hand it
+   to `cmp_reg_tag_via` as the scratch; off the low-address arena that
+   function pushes it again when it is occupied. Balanced, so the code
+   was right, but the inner pop ends the outer borrow early and REGTRACK
+   aborts on it: `56_xcall_pins` under `MYLANG_NO_LOWMEM=1`, once its
+   `leaf(int x)` was inlined into a run that pins rcx (the nolowmem CI
+   lane's corpus_diff; the default config cannot reach the movabs arm).
+   The seam now skips the push for a register in `trk_borrowed`.

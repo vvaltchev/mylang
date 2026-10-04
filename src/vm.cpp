@@ -2842,9 +2842,11 @@ vm_precompile_all(const Block *root, bool jit, Chunk *main_chunk)
     BcInlineSnapshots bc_snaps;
     for (const auto &kv : g_func_chunks)
         bc_inline_snapshot(kv.second, bc_snaps);
+    const std::vector<const FuncDescriptor *> bc_slots =
+        bc_inline_slot_map(slot_desc, root->global_slot_reassigned);
     for (auto &kv : g_func_chunks) {
         ML_INT_ONLY(g_bc_int_caller = bc_int_key_fn(kv.first, kv.second);)
-        bc_inline_chunk(kv.second, slot_desc, bc_snaps);
+        bc_inline_chunk(kv.second, bc_slots, bc_snaps);
     }
     /* #97 closure inlining: MAIN too, where every hot value call of the
      * call cluster lives - VALUE sites only, so main's CallV sites keep
@@ -2852,7 +2854,7 @@ vm_precompile_all(const Block *root, bool jit, Chunk *main_chunk)
      * Unconditional: a `.myv` writer (jit=false) stores this form. */
     ML_INT_ONLY(g_bc_int_caller = "main";)
     if (main_chunk)
-        bc_inline_chunk(*main_chunk, slot_desc, bc_snaps,
+        bc_inline_chunk(*main_chunk, bc_slots, bc_snaps,
                         /*value_only=*/true);
 
     /* Pass B: the native tier, through the ONE driver (vm.h) - the

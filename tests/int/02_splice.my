@@ -23,8 +23,8 @@ func opt2(x, opt y) {                      # called with the opt omitted
     for (var i = 0; i < x; i++) s += i;
     return s;
 }
-func typed(int x) {                        # a declared type: the direct
-    var s = 0;                             # splice needs fast_bind
+func typed(int x) {                        # a declared type: inlined,
+    var s = 0;                             # the bind kept as a coercion
     for (var i = 0; i < x; i++) s += i;
     return s;
 }
@@ -35,7 +35,7 @@ func run(int n) {
     var b = lpv(n);                        # void_result_used
     lpv(n);                                # spliced (discarded)
     var d = opt2(n);                       # arity
-    var t = typed(n);                      # typed_params
+    var t = typed(n);                      # spliced (typed param)
     var e = mk(n);                         # spliced (factory)
     return a + d + t + e(1);               # spliced (value)
 }
@@ -56,7 +56,7 @@ assert(has(ev, "verdict=\"spliced\" kind=\"call\" callee=\"lp\" line=34"));
 assert(has(ev, "verdict=\"void_result_used\" kind=\"call\" callee=\"lpv\" line=35"));
 assert(has(ev, "verdict=\"spliced\" kind=\"call\" callee=\"lpv\" line=36"));
 assert(has(ev, "verdict=\"arity\" kind=\"call\" callee=\"opt2\" line=37"));
-assert(has(ev, "verdict=\"typed_params\" kind=\"call\" callee=\"typed\" line=38"));
+assert(has(ev, "verdict=\"spliced\" kind=\"call\" callee=\"typed\" line=38"));
 assert(has(ev, "verdict=\"spliced\" kind=\"call\" callee=\"mk\" line=39"));
 assert(has(ev, "verdict=\"spliced\" kind=\"value\" callee=\"<lambda>\" line=40"));
 assert(has(ev, "verdict=\"main_not_factory\" kind=\"call\" callee=\"lp\" line=43"));

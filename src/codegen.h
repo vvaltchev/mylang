@@ -523,6 +523,20 @@ extern unsigned long g_bc_step1_params;
 void bc_inline_snapshot(const Chunk &ck, BcInlineSnapshots &out);
 
 /*
+ * The global slot -> descriptor map the bytecode inliner may trust at a
+ * DIRECT call: `slot_desc` with every REASSIGNED slot cleared. A slot the
+ * program writes after its declaration (`f = g;`, from anywhere) may hold
+ * another function when the call runs, and inlining the declared body
+ * there is a wrong answer (`a = b; drive()` kept running `a`'s body). The
+ * JIT keeps the full map - its call tiers check the callee's identity at
+ * run time; the inliner has no such check, so it gets write-once slots
+ * only. Both drivers (the run's and the -vd/-vdj dump's) build it here.
+ */
+std::vector<const FuncDescriptor *> bc_inline_slot_map(
+    const std::vector<const FuncDescriptor *> &slot_desc,
+    const std::vector<char> &reassigned);
+
+/*
  * THE SPLICE. Replace every inline-able CallV in `ck` with the callee's
  * body - arg binds as MoveVs, the body slot-remapped into a fresh range
  * above the caller's frame, each ReturnV rewritten to "move the result to
@@ -552,6 +566,7 @@ std::string bc_int_key_fn(const FuncDescriptor *d, const Chunk &ck);
  * A/B, since the un-inlined bytecode is the only oracle for a splice. */
 extern bool g_bc_inline_enabled;
 extern bool g_bc_inline_value_enabled;   /* #97 closure inlining */
+extern bool g_bc_inline_typed_enabled;   /* typed-param direct calls */
 extern unsigned long g_bc_chain_partial;  /* #72 */
 
 /* Execution proof for the caller-frame path - see codegen.cpp. */

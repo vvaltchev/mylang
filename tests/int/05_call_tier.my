@@ -1,10 +1,12 @@
 # INT-ENGINES: default
+# INT-CONFIGS: MYLANG_BCINLINE_TYPED=0
 #
 # INT test (#107 P2): the JIT records the PROTOCOL it emitted for each call
 # site (`call_tier`). The callees take DECLARED ints and hold a loop or a
-# recursion, so neither the AST inliner (a loop is over its cost) nor the
-# bytecode splice (a typed parameter needs fast_bind) removes the calls
-# before the JIT sees them. Default engine only: no JIT elsewhere.
+# recursion, so the AST inliner (a loop is over its cost) leaves the calls,
+# and the config above keeps the bytecode inliner from taking a typed
+# callee - this tests the call, not the inliner. Default engine only: no
+# JIT elsewhere.
 
 func leaf(int x) {                          # a LEAF: frameless
     var s = 0;
@@ -36,8 +38,8 @@ func has(arr, needle) {
         if (find(e, needle) != none) return true;
     return false;
 }
-assert(has(ev, "tier=\"frameless\" callee=\"leaf\" line=24"));
-assert(has(ev, "tier=\"frameless\" callee=\"rec\" line=18"));
-assert(has(ev, "tier=\"frameless\" callee=\"rec\" line=19"));
-assert(has(ev, "tier=\"frameless\" callee=\"rec\" line=25"));
-assert(has(ev, "tier=\"push\" callee=\"drive\" line=28"));
+assert(has(ev, "tier=\"frameless\" callee=\"leaf\" line=26"));
+assert(has(ev, "tier=\"frameless\" callee=\"rec\" line=20"));
+assert(has(ev, "tier=\"frameless\" callee=\"rec\" line=21"));
+assert(has(ev, "tier=\"frameless\" callee=\"rec\" line=27"));
+assert(has(ev, "tier=\"push\" callee=\"drive\" line=30"));

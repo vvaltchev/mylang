@@ -2351,7 +2351,7 @@ struct Emitter {
                 trk_fail("write to an UNSAVED callee-saved register - "
                          "the C caller's value is destroyed", r);
         }
-        if (!reg_holds_pin(r))
+        if (!reg_holds_pin(r) && !(trk_entry_pins & bit))
             return;
         if (trk_flushed) {
             trk_flushdirty |= bit;   /* dead until reload: repurposable */
@@ -2389,6 +2389,11 @@ struct Emitter {
      * set (the bracket's business). Debug-only; emits nothing.
      */
     std::vector<std::pair<uint32_t, uint8_t>> trk_wlog;
+    /* the pins an ENTRY STUB or the frameless entry establishes at its
+     * pc, while its literal loads run: `cache` is the run's FINAL view
+     * there, so without this the tracker could not see a write to a
+     * register the entry has just filled (the flit_load rcx clobber) */
+    uint32_t trk_entry_pins = 0;
 
     size_t trk_wlog_i = 0;       /* first log entry not yet absorbed  */
     size_t trk_vpos = 0;         /* bytes already verified            */
@@ -3015,7 +3020,7 @@ struct Emitter {
      * read a bogus one; it surfaced as a spurious DivisionByZeroEx.
      * rcx is caller-saved, so no call site can rely on it either way.
      */
-    void flit_load(const FLit &f)
+    void flit_load(const FLit &f, uint32_t avoid = 0)
     {
         uint64_t bits;
         std::memcpy(&bits, &f.val, sizeof bits);
@@ -3035,7 +3040,14 @@ struct Emitter {
          * instructions when it holds a pin (push/pop, RefScratch's
          * protocol - pop leaves the flags alone).
          */
-        const int g = alloc_scratch(CAP_ALLOCATABLE, 1u << 1, 1u << 0,
+        /* `avoid`: registers holding pins the allocator's CURRENT view
+         * does not show - an entry stub or the frameless entry is
+         * emitted after the whole run, so that view is the run's FINAL
+         * state, not the state at the entry's pc (a REGCALL parameter
+         * moved into its pin in rcx lost it to the literal: found by
+         * the #107 P3 enumerator on a bytecode-inlined typed call) */
+        const int g = alloc_scratch(CAP_ALLOCATABLE, 1u << 1,
+                                    (1u << 0) | avoid,
                                     /*transient=*/true);
         /* refused: borrow rcx whether or not it holds a pin right now -
          * a register merely PLANNED for the run (busy at another pc) is
@@ -6147,11 +6159,20 @@ struct Emitter {
          * Same rule as "a helper's register ABI is the emitter's job":
          * state the clobber at the instruction that makes it. */
         /* #96 (c): and BORROWED where it happens too - `pop` preserves
-         * the flags, so the caller's jcc still reads this compare. */
-        const bool sp = reg_is_occupied(sc);
+         * the flags, so the caller's jcc still reads this compare.
+         * ⛔ Unless the CALLER already borrowed it (a RefScratch that
+         * pushed a pinned rcx to hand it here): its pin is saved and its
+         * pop restores it, so this write needs nothing - a second push
+         * is a NESTED borrow, whose inner pop would end the outer one
+         * early (REGTRACK aborts on it). Off the arena only, so every
+         * default-config fragment hid it: 56_xcall_pins under
+         * MYLANG_NO_LOWMEM=1, once the bytecode inliner pasted a typed
+         * callee's CoerceNumV into a run that pins rcx. */
+        const bool sp = reg_is_occupied(sc)
+                        && !(trk_borrowed & (1u << sc));
         if (sp)
             push_reg(sc);
-        else
+        else if (!(trk_borrowed & (1u << sc)))
             scratch(sc);
         movabs(sc, static_cast<uint64_t>(
                        reinterpret_cast<uintptr_t>(tag)));
@@ -33631,6 +33652,9 @@ retry_emission:
                 return st_f;
         };
         const auto establish = [&](size_t at_pc, bool frameless = false) {
+            /* the GP registers this entry's pins occupy AT ITS PC -
+             * the literal loads below must not stage through one */
+            uint32_t entry_pins = 0;
             {
                 /* the tracker: entry establishment is machinery - the
                  * loads are the pin loads. The flit loads below stay
@@ -33675,6 +33699,8 @@ retry_emission:
                  * for entries past the last seam. */
                 std::vector<Emitter::CacheEnt> st_cache = pins_at(at_pc);
                 for (const Emitter::CacheEnt &c : st_cache)
+                    entry_pins |= 1u << c.reg;
+                for (const Emitter::CacheEnt &c : st_cache)
                     if (!(frameless
                           && std::find(regcall_preloaded.begin(),
                                        regcall_preloaded.end(), c.slot)
@@ -33695,8 +33721,14 @@ retry_emission:
                              != regcall_fpreloaded.end()))
                     e.fload(c.reg, c.payload);    /* C2a float pins */
             }
+#ifndef NDEBUG
+            e.trk_entry_pins = entry_pins;
+#endif
             for (const Emitter::FLit &fl : e.flits)
-                e.flit_load(fl);                  /* C4b literal pool */
+                e.flit_load(fl, entry_pins);      /* C4b literal pool */
+#ifndef NDEBUG
+            e.trk_entry_pins = 0;
+#endif
             /* #112: a stub IS an entry - the run head's walk did not
              * run on this path, and the register holds the C caller's
              * value. Emits ZERO bytes corpus-wide today (vdjcmp: 125

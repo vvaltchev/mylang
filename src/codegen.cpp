@@ -744,6 +744,27 @@ bool boxed_literal(const Construct *e, EvalValue &out)
  * frame slots. Nested int expressions use scratch TEMP slots laid out above the
  * resolved locals. See plans/archived/bytecode-vm.md.
  */
+/*
+ * Step 1b: what inference PROVED each argument of a call is, two bits per
+ * argument (1 = exactly an int - not a bool, 2 = a float, 0 = not
+ * proven), arguments 0..15. A bool is stamped `th == i` too, and binding
+ * one into an int parameter is a retag, not the identity, so it does not
+ * count. Read by the bytecode inliner to drop a typed parameter's
+ * conversion when it is the identity - at a direct call and a value call
+ * alike.
+ */
+static uint32_t proven_arg_kinds(const ExprList *args)
+{
+    uint32_t kinds = 0;
+    for (size_t i = 0; i < args->elems.size() && i < 16; i++) {
+        const Construct *ae = args->elems[i].get();
+        const uint32_t k = ae->th == TypeHint::f ? 2u
+            : (ae->th == TypeHint::i && !ae->th_bool) ? 1u : 0u;
+        kinds |= k << (2 * i);
+    }
+    return kinds;
+}
+
 struct Codegen {
 
     /* The CODEGEN-side instruction vector (CgInstr = Instr + the transient
@@ -3456,6 +3477,7 @@ struct Codegen {
          */
         if (dc->th == TypeHint::i || dc->th == TypeHint::f)
             cv.set_ret_scalar();
+        cv.arg_kinds = proven_arg_kinds(dc->args.get());
         ops.push_back(cv);
         out_slot = dst;
         return true;
@@ -3667,15 +3689,7 @@ struct Codegen {
                     cv.callee_def_idx = -1;
             }
         }
-        /* step 1b: what inference PROVED each argument is - a bool is
-         * stamped `th == i` too, and binding one into an int parameter is
-         * a retag, not the identity, so it does not count */
-        for (size_t i = 0; i < call->args->elems.size() && i < 16; i++) {
-            const Construct *ae = call->args->elems[i].get();
-            const uint32_t k = ae->th == TypeHint::f ? 2u
-                : (ae->th == TypeHint::i && !ae->th_bool) ? 1u : 0u;
-            cv.arg_kinds |= k << (2 * i);
-        }
+        cv.arg_kinds = proven_arg_kinds(call->args.get());
         cv.target = dst;
         cv.target2 = callee_slot;
         cv.set_a(int_lit(argbase));
@@ -8639,12 +8653,14 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
          * peephole fusion can copy the source struct into an op that never
          * had one). pc-ascending, so the table comes out sorted.
          */
+        /* step 1b: a direct CallV's too - the bytecode inliner reads it
+         * for a typed parameter of either kind of call */
+        if (in.arg_kinds)
+            chunk.call_arg_kinds.push_back(
+                {static_cast<uint32_t>(pc), in.arg_kinds});
         if (in.callee_def_idx >= 0) {
             chunk.value_callees.push_back(
                 {static_cast<uint32_t>(pc), in.callee_def_idx});
-            if (in.arg_kinds)                     /* step 1b */
-                chunk.value_arg_kinds.push_back(
-                    {static_cast<uint32_t>(pc), in.arg_kinds});
             if (in.callee_def_idx2 >= 0)          /* #97 E3: the pair */
                 chunk.value_callees.push_back(
                     {static_cast<uint32_t>(pc), in.callee_def_idx2});
@@ -12900,6 +12916,16 @@ bool g_bc_inline_value_enabled = [] {
     return !(e && !e->empty() && (*e)[0] == '0');
 }();
 
+/* The bytecode inliner takes a DIRECT call to a function with typed
+ * (int/float) parameters too, binding each through CoerceNumV as a value
+ * site always did (MYLANG_BCINLINE_TYPED=0 restores the old decline: the
+ * same-binary A/B). A call-protocol test whose only reach into its tier
+ * was a typed callee holds it off. */
+bool g_bc_inline_typed_enabled = [] {
+    const auto e = env_get("MYLANG_BCINLINE_TYPED");
+    return !(e && !e->empty() && (*e)[0] == '0');
+}();
+
 /* #97 closure inlining STEP 1 - the result rename and the argument
  * sourcing (MYLANG_BCINLINE_STEP1=0 turns both off: the same-binary A/B,
  * and the oracle - the step-1 form must render what the increment-1
@@ -13026,7 +13052,7 @@ static void bc_value_site_step1(const Chunk &ck, size_t pc, int nargs,
  *    mid-body, and would then read the new value as the parameter);
  *  - its bind is the IDENTITY: an untyped parameter (a MoveV bind), or
  *    a typed one whose argument inference PROVED exactly that type
- *    (`value_arg_kinds` - an int that is not a bool into `int`, a float
+ *    (`call_arg_kinds` - an int that is not a bool into `int`, a float
  *    into `float`); a widening or a dyn argument keeps its CoerceNumV;
  *  - the body never WRITES the parameter (a barrier op counts as a
  *    write), and holds no call - the rename must not name a slot inside
@@ -13064,7 +13090,7 @@ static void bc_site_param_renames(const Chunk &ck, size_t pc,
                 if (k >= 0 && static_cast<size_t>(k) < written.size())
                     written[static_cast<size_t>(k)] = 1;
     }
-    const uint32_t kinds = ck.value_arg_kinds_at(pc);
+    const uint32_t kinds = ck.call_arg_kinds_at(pc);
     for (size_t i = 0; i < src_of.size(); i++) {
         if (src_of[i] < 0 || written[i] || src_of[i] == renamed_dst)
             continue;
@@ -13485,8 +13511,11 @@ static bool bc_inline_chunk_splice(Chunk &ck,
             const FuncDescriptor *d =
                 (g >= 0 && static_cast<size_t>(g) < slot_desc.size())
                     ? slot_desc[g] : nullptr;
-            if (d && d->vm_chunk && d->fast_bind)   /* typed params need
-                                                     * coercion */
+            /* a typed parameter binds through CoerceNumV, exactly as at
+             * a value site (a.coerce below) - its type is information
+             * the inlined body keeps, not a reason to decline */
+            if (d && d->vm_chunk
+                    && (d->fast_bind || g_bc_inline_typed_enabled))
                 cands.push_back({ d, -1 });
             ML_INT_ONLY(else if (!d) no_cand_why = "callee_unknown";
                         else if (!d->vm_chunk) no_cand_why = "no_chunk";
@@ -13570,11 +13599,10 @@ static bool bc_inline_chunk_splice(Chunk &ck,
             a.base = site_base;
             a.def = cand.second;
             a.halts = last.op == OpCode::Halt;
-            if (is_value)
-                for (const auto &p : d->params)
-                    a.coerce.push_back(p.decl_type == DeclType::i ? 1
-                                       : p.decl_type == DeclType::f ? 2
-                                                                    : 0);
+            for (const auto &p : d->params)
+                a.coerce.push_back(p.decl_type == DeclType::i ? 1
+                                   : p.decl_type == DeclType::f ? 2
+                                                                : 0);
             if (g_bc_inline_value_step1) {
                 caller_facts();
                 /* the staging half is a CALLER fact - identical for
@@ -13861,7 +13889,9 @@ static bool bc_inline_chunk_splice(Chunk &ck,
 #endif
                         continue;           /* step 1b: read in place */
                     }
-                    const uint8_t co = S.value ? A.coerce[i] : 0;
+                    const uint8_t co =
+                        static_cast<size_t>(i) < A.coerce.size()
+                            ? A.coerce[static_cast<size_t>(i)] : 0;
                     /* step 1: an argument whose staging was sunk binds
                      * from its source */
                     const int from =
@@ -14113,7 +14143,7 @@ static bool bc_inline_chunk_splice(Chunk &ck,
     ck.arg_locs = std::move(nargl);                    /* RULE 2 */
     ck.arg_loc_pool = std::move(nargpool);
     ck.value_callees = std::move(nvc);                 /* #97 E1 */
-    ck.value_arg_kinds.clear();      /* step 1b: its pcs die here */
+    ck.call_arg_kinds.clear();      /* step 1b: its pcs die here */
     ck.inline_ctxs = std::move(nctx);
     ck.n_temps = next_base - ck.slot_count;
     /* both lists (#97 CB5): a spliced body's slots are not the caller's
@@ -14203,7 +14233,7 @@ static void bc_rewrite_ops(Chunk &ck, const std::vector<BcRepl> &repl)
     move_pc(ck.op_locs);
     move_pc(ck.arg_locs);
     move_pc(ck.value_callees);
-    move_pc(ck.value_arg_kinds);
+    move_pc(ck.call_arg_kinds);
     move_pc(ck.inline_ctxs);
     ck.code = std::move(nc);
 }
@@ -14805,6 +14835,17 @@ static bool bc_collapse_capture_moves(Chunk &ck)
         rl->erase(std::unique(rl->begin(), rl->end()), rl->end());
     }
     return changed_any;
+}
+
+std::vector<const FuncDescriptor *> bc_inline_slot_map(
+    const std::vector<const FuncDescriptor *> &slot_desc,
+    const std::vector<char> &reassigned)
+{
+    std::vector<const FuncDescriptor *> m = slot_desc;
+    for (size_t s = 0; s < m.size(); s++)
+        if (s < reassigned.size() && reassigned[s])
+            m[s] = nullptr;
+    return m;
 }
 
 bool bc_inline_chunk(Chunk &ck,

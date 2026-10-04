@@ -1,0 +1,56 @@
+# A DIRECT call to a function with TYPED parameters is bytecode-inlined
+# (since 2026-10-02 - it used to be declined for having a type). The bind
+# a real call performs survives the inlining as a per-argument conversion
+# (CoerceNumV): the identity for an argument already of the declared
+# type, a widening for an int into a float, and a TypeErrorEx carrying
+# THAT argument's caret for a dyn value that fits neither (its
+# uncaught rendering: tests/bt_oracle/arg_typed_bc_inline.my). Every
+# body here holds a loop, so the AST inliner leaves the call alone and the
+# bytecode inliner is the one that takes it (MYLANG_BCINLINE_TYPED=0 is
+# the A/B; tests/int/02_splice.my asserts the inlining happens).
+
+func isum(int n) {                      # identity bind: n is an int
+    var s = 0;
+    for (var i = 0; i < n; i++) s += i;
+    return s;
+}
+
+func fscale(float x, int k) {           # x widens from an int argument
+    var r = 0.0;
+    for (var i = 0; i < k; i++) r += x;
+    return r;
+}
+
+func fhalf(float x) {                   # a float result proves the widen
+    var r = x;
+    for (var i = 0; i < 1; i++) r = r / 2;
+    return r;
+}
+
+func run(int n) {
+    var a = isum(n);
+    var b = fscale(n, 3);               # 5 -> 5.0, three times
+    var c = fhalf(n);                   # 5 / 2 must be 2.5, not 2
+    var d = fscale(1.5, n);
+    return [a, b, c, d];
+}
+print(run(int(runtime(5))));
+
+# a dyn argument whose runtime value fits the declared type converts
+func pick(dyn v) {
+    var x = fhalf(v);
+    return x;
+}
+print(pick(runtime(7)));
+
+# ...and one that does not raises the bind's TypeErrorEx, caught here
+func bad(dyn v) {
+    try {
+        var x = isum(v);
+        return x;
+    } catch (TypeErrorEx) {
+        return -1;
+    }
+}
+print(bad(runtime("str")));
+print(bad(runtime(2.5)));
