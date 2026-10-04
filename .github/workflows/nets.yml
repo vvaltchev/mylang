@@ -41,19 +41,6 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang
 
-    # ⛔ IS THE DISASSEMBLER TELLING THE TRUTH? Every instruction the
-    # JIT emits, cross-checked against objdump - boundaries AND
-    # mnemonics. This is the only net that can catch a CONFIDENTLY
-    # WRONG decode; `DUMP IS UNRELIABLE` and the -rt coverage check both
-    # only catch bytes we KNOW we failed on. It found two missing F7
-    # sub-opcodes (neg, imul) that printed a silent `f7/?` placeholder
-    # on 284 corpus sites. --matrix sweeps both arenas, every pin-pool
-    # rotation and a range of pin budgets, because those change WHICH
-    # encodings get emitted.
-    - name: "disasm: every emitted instruction agrees with objdump"
-      working-directory: ${{github.workspace}}/build
-      run: python3 $GITHUB_WORKSPACE/scripts/disasmcheck.py ./mylang --matrix
-
     # ⛔ AND IS IT REPRODUCIBLE? vdjcmp.sh's SELF-TEST - one binary
     # against ITSELF over the whole corpus - is what makes every
     # "emitted code byte-identical" claim mean anything, and until
@@ -101,6 +88,47 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: python3 $GITHUB_WORKSPACE/tests/nested_fuzz.py
            --mylang ./mylang --count 250
+
+  # ---------------------------------------------------------------- #
+  # ⛔ IS THE DISASSEMBLER TELLING THE TRUTH? Every instruction the JIT
+  # emits, cross-checked against objdump - boundaries, mnemonics AND
+  # every operand. This is the only net that can catch a CONFIDENTLY
+  # WRONG decode; `DUMP IS UNRELIABLE` and the -rt coverage check both
+  # only catch bytes we KNOW we failed on. It found two missing F7
+  # sub-opcodes (neg, imul) that printed a silent `f7/?` placeholder on
+  # 284 corpus sites. --matrix sweeps both arenas, every pin-pool
+  # rotation and a range of pin budgets, because those change WHICH
+  # encodings get emitted.
+  #
+  # Its own job, split three ways (--shard): run as one step of
+  # `differential` it took 34 of that job's 57 minutes, and so set the
+  # wall time of the whole workflow. Same Debug build as before, so
+  # ASan/UBSan still watch the decoder.
+  # ---------------------------------------------------------------- #
+  disasmcheck:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
+    name: disasmcheck (shard ${{matrix.shard}}/3)
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure
+      run: cmake -E make_directory ${{github.workspace}}/build
+    - name: CMake
+      working-directory: ${{github.workspace}}/build
+      run: cmake -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
+           $GITHUB_WORKSPACE
+    - name: Build
+      working-directory: ${{github.workspace}}/build
+      run: cmake --build . -j
+
+    - name: "disasm: every emitted instruction agrees with objdump"
+      working-directory: ${{github.workspace}}/build
+      run: python3 $GITHUB_WORKSPACE/scripts/disasmcheck.py ./mylang
+           --matrix --shard ${{matrix.shard}}/3
 
   # ---------------------------------------------------------------- #
   # The .myv corruption fuzzer, on BOTH build types on purpose:

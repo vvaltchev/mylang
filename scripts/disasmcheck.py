@@ -5,7 +5,7 @@ disasmcheck.py - is `-vdj` DECODING CORRECTLY, judged by a second
                  disassembler?
 
     scripts/disasmcheck.py BINARY [--matrix] [--env K=V[,K=V...]]...
-                           [--only FILE|DIR]... [-v]
+                           [--only FILE|DIR]... [--shard I/N] [-v]
 
 ⛔ WHY THIS EXISTS, AND WHY THE EXISTING NETS CANNOT REPLACE IT.
 
@@ -55,6 +55,13 @@ reason). `--only FILE|DIR` restricts the corpus (repeatable), since a
 forced pick names a site in ONE program (a DIR selects every corpus file
 under it). A value may hold commas (`MYLANG_INT_CHOOSE=k1=a,k2=b`): a
 comma starts a new variable only before `NAME=`.
+
+`--shard I/N` (0 <= I < N) keeps every Nth configuration, starting at
+the Ith, so N CI jobs split one `--matrix` run between them (the
+configurations are dealt round-robin, so neighbouring xrot values land
+in different shards). Each shard checks its own result in full -
+including the VACUOUS guards - so a shard left with no work fails
+rather than passing.
 
 Beyond the mnemonic, EVERY OPERAND is compared (3), from a second dump
 taken with `MYLANG_VDJ_RAW=1`, which renders operands the way objdump
@@ -390,11 +397,19 @@ def parse_env(spec):
 def main():
     argv = sys.argv[1:]
     extra, only, args = [], [], []
+    shard = (0, 1)
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in ('--env', '--only') and i + 1 < len(argv):
-            if a == '--env':
+        if a in ('--env', '--only', '--shard') and i + 1 < len(argv):
+            if a == '--shard':
+                m = re.fullmatch(r'(\d+)/(\d+)', argv[i + 1])
+                if not m or not 0 <= int(m.group(1)) < int(m.group(2)):
+                    print("error: --shard wants I/N with 0 <= I < N",
+                          file=sys.stderr)
+                    return 2
+                shard = (int(m.group(1)), int(m.group(2)))
+            elif a == '--env':
                 extra.append((parse_env(argv[i + 1]), argv[i + 1]))
             else:
                 only.append(os.path.abspath(argv[i + 1]))
@@ -438,6 +453,10 @@ def main():
         for p in (4, 6, 8, 10, 11):
             envs.append(({'MYLANG_JIT_MAXPINS': str(p)}, 'maxpins=%d' % p))
     envs.extend(extra)
+    envs = envs[shard[0]::shard[1]]
+    if shard[1] > 1:
+        print("shard %d/%d: %s" % (shard[0], shard[1],
+                                   ', '.join(n for _, n in envs)))
 
     tl = tm = to = ti = tf = tw = 0
     for env, name in envs:
