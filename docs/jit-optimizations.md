@@ -17224,3 +17224,22 @@ with several runs had ONE key per instance number across all of them: a
 forced key deviated every run at once, and tier 1 was not a single
 deviation (`09_enum_float_stage`'s `main` has two runs, `@0` and `@29`).
 
+
+## REGTRACK: A FRAGMENT CALL'S REGCALL REGISTERS, AND NO STACK ARGUMENTS (2026-10-02)
+
+Two gaps the helper-argument check left, both closed. **A frameless
+callee's REGCALL parameters** (int in rdi/rcx/r9/r10, float in
+xmm2-xmm5) were invisible to the tracker - `trk_call_args` models a
+C++ helper's SysV order, and a fragment call declared no ABI at all. The
+frameless site now states its masks from its own `reg_args` and
+`trk_call_regs` requires each register written by the op, the same rule.
+The float loop's "the pin already sits in its argument register" arm
+now uses `fmov_to`, so the skipped move still counts as a definition.
+**Watched failing:** the site skipping its first int argument aborts on
+`55_regcall.my` in the default configuration (`r7`, rdi). **A helper
+with STACK-passed arguments** (more than 6 GP or 8 xmm) is refused at
+compile time by `Helper`'s constructor - the tracker models registers
+only, and refusing is complete where a partial model would not be. None
+exists today (the build proved it); the static assertion was watched
+firing on a seven-argument probe. `jit_test_regtrack` gains the
+`callregs/*` scenarios.
