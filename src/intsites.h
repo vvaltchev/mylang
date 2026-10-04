@@ -104,4 +104,11 @@
     /* would inline - 0 inlines, 1 declines. `key` is                    */ \
     /* `<caller>/inline@<line>:<col>`. resolver.cpp, the Inliner.        */ \
     X(inline_choice, "the AST inline of a site (0 inline, 1 decline)",    \
+      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick)) \
+    /* An ENUMERATED decision: how many levels the inliner UNROLLS a     */ \
+    /* pure tree-recursive function (0..REC_UNROLL_MAX; the cost model's */ \
+    /* depth is the default). Every depth is legal - the node cap and   */ \
+    /* the inline budget still bound the growth. `key` is `<fn>/unroll`. */ \
+    /* resolver.cpp, rec_unroll_depth.                                   */ \
+    X(unroll_choice, "the recursion unroll depth of a function",         \
       F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))

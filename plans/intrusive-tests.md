@@ -398,8 +398,12 @@ assertions on values.
   `spill_choice` (the scan's pressure contest: any loser is legal;
   12 of 20 sampled deviations emit different code, all agree - no
   sabotage was found that ONLY a forced loser reaches, since breaking
-  an eviction breaks the default evictions too). NOT built yet: tiers
-  2-3 (pairs of deviations), the unroll-depth and call-tier sites.
+  an eviction breaks the default evictions too). 2026-10-03:
+  `unroll_choice`, the inliner's recursion unroll depth (any depth to
+  REC_UNROLL_MAX is legal; tests/int/13_unroll.my forces fib to 0 and
+  tribonacci to 3, every depth changes the tree, 21 corpus deviations
+  all agree). NOT built yet: tiers 2-3 (pairs of deviations), the
+  call-tier site.
 - **P4 - VM state checker + object census.**
   **STATUS (2026-10-03): the OBJECT CENSUS is built** - per-kind
   counters at the pooled `operator new/delete`, `int_live(kind)`,

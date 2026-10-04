@@ -4737,9 +4737,24 @@ class Inliner {
               std::string(f->id->get_str()) + " w0=" + std::to_string(w0) +
               " branching=" + std::to_string(branching) +
               " -> " + std::to_string(k) + " level(s)");
+        ML_INT_ONLY(k = int_unroll_depth(f, k);)
         rec_levels[f] = k;
         return k;
     }
+
+#ifdef INT_TESTS
+    /* #107 P3: the unroll depth as an enumerated decision - any depth up
+     * to REC_UNROLL_MAX is legal (0 simply leaves the recursion a call),
+     * so each is RULE 2 checked against the cost model's choice. */
+    static int int_unroll_depth(const FuncDeclStmt *f, int k) noexcept
+    {
+        const std::string key = std::string(f->id->get_str()) + "/unroll";
+        const int pick = int_choose(key, REC_UNROLL_MAX + 1, k);
+        ML_INT(unroll_choice, key, int64_t(REC_UNROLL_MAX + 1), int64_t(k),
+               int64_t(pick));
+        return pick;
+    }
+#endif
 
 public:
 
