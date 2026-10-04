@@ -426,8 +426,15 @@ assertions on values.
   frame. Skipped for a loaded image. -rt, int_run and all 83,064 CI-corpus
   deviations pass; watched: a float-param bind that does not widen, and
   CmpIntV writing an int, abort at their pc. `th` per instruction operand
-  stays VM_HARDENING's read-side check. NOT built yet: live-slice
-  registration, refcount sanity.
+  stays VM_HARDENING's read-side check.
+  **Third increment, SLICES (2026-10-03):** a slice held in a slot is
+  registered in its storage's set and its window lies inside the
+  storage; the storage's `has_slices` mirror equals the set's emptiness
+  and every registered view is a slice of it. Watched: copy-assign not
+  registering (sl.my and four corpus programs abort at the op) and an
+  overwrite not unregistering (a stale entry, caught at the next op).
+  The enumerator's 83,064 deviations and int_run pass. NOT built yet:
+  refcount sanity.
 - **P5 - JIT preserving probe stub** + the per-op register map.
 - **P6 - chunk hook + assembler**; build the three splice-gate tests.
 - **P7 - per-site forcing sweep.**

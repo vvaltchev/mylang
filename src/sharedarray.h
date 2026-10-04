@@ -624,4 +624,40 @@ public:
     ArrayConstViewTempl<LValueT> get_view() const {
         return ArrayConstViewTempl<LValueT>(get_vec(), offset(), size());
     };
+
+#ifdef INT_TESTS
+    /*
+     * #107 P4, the VM state checker's slice half: what a slice view
+     * promises its parent's storage. Returns null when consistent, else
+     * what is wrong. A slice must be registered in its storage's set
+     * (an element write detaches only the registered views) and its
+     * window must lie inside that storage; the `has_slices` mirror the
+     * JIT's inline store reads must equal the set's emptiness; and every
+     * registered view must be a slice of THIS storage - a stale entry
+     * is a dangling pointer the next detach writes through (an ASan
+     * build reports the read itself).
+     */
+    const char *int_slice_fault() const noexcept
+    {
+        const SharedObject *o = shobj.get();
+        if (!o)
+            return nullptr;
+        if (o->has_slices != !o->slices.empty())
+            return "the storage's has_slices mirror disagrees with its set";
+        for (const SharedArrayObjTempl *p : o->slices)
+            if (p->shobj.get() != o || !p->slice)
+                return "the storage's slice set names a view that is not "
+                       "a slice of it";
+        if (!slice)
+            return nullptr;
+        if (!o->slices.count(const_cast<SharedArrayObjTempl *>(this)))
+            return "a slice is not registered in its storage's set";
+        SharedArrayObjTempl whole;
+        whole.shobj = shobj;
+        const size_type n = whole.size();
+        if (off > n || len > n - off)
+            return "a slice's window runs past its storage";
+        return nullptr;
+    }
+#endif
 };
