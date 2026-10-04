@@ -3,7 +3,7 @@
 """
 NET 2 - the DETERMINISTIC EVENT SWEEP for the G1 no-record call tier.
 
-    tests/norec_sweep.py BINARY [programs...] [--max-events N]
+    tests/norec_sweep BINARY [programs...] [--max-events N]
 
 WHAT IT IS FOR.  The no-record tier does not write a VmCallRec for a
 call it can rebuild later; the rebuild happens on the rare paths that
@@ -36,7 +36,7 @@ are compared against a baseline run with no probe, so a probe that
 perturbs the program fails the sweep even when nothing mismatches.
 
 PARALLEL, WITH THE SERIAL OUTPUT (2026-09-27).  Every sweep run is
-its own process, so they run `tests/jobs.sh count` at a time (--jobs /
+its own process, so they run `tests/jobs count` at a time (--jobs /
 MYLANG_TEST_JOBS override) in the idle scheduling class.  Each (program,
 mode) sweep still walks N in order and stops exactly where the serial
 walk stopped: it submits a small WINDOW of the next N values at once and
@@ -54,8 +54,9 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import testjobs  # noqa: E402  (tests/jobs.sh: worker count + idle class)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib"))
+import testjobs  # noqa: E402  (tests/jobs: worker count + idle class)
 from testrun import Monitor  # noqa: E402
 
 PROBE = "norec recon probe:"
@@ -170,7 +171,7 @@ def main():
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--jobs", type=int, default=0,
-                    help="worker processes (default: tests/jobs.sh count)")
+                    help="worker processes (default: tests/jobs count)")
     args = ap.parse_args()
     testjobs.ensure_idle()
     jobs = args.jobs if args.jobs > 0 else testjobs.count()
@@ -201,7 +202,7 @@ def main():
     skipped = []
     # every (program, mode) sweep at once; `pool` bounds the processes
     # and `drivers` the sweeps walking their N values
-    # progress: tests/testctl.py lists this run with its percentage (a
+    # progress: tests/testctl lists this run with its percentage (a
     # sweep's own length is discovered as it walks, so the unit is one
     # (program, mode) sweep)
     mon = Monitor("norec_sweep", total=len(progs) * len(modes),

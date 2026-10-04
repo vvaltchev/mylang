@@ -1,10 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: BSD-2-Clause
 #
-# vdjcmp.sh - compare the EMITTED NATIVE CODE of two mylang binaries
+# vdjcmp - compare the EMITTED NATIVE CODE of two mylang binaries
 #             across the whole corpus (bench/my + samples + functional).
 #
-#   scripts/vdjcmp.sh OLD_BINARY NEW_BINARY [-v]
+#   scripts/vdjcmp OLD_BINARY NEW_BINARY [-v]
 #
 # This is the oracle for "my change to the JIT is a pure restructuring":
 # if every program's `-vdj` disassembly is unchanged, the change cannot
@@ -116,7 +116,7 @@ last_off() {
 # The executable test below runs in the CALLER's directory but every
 # USE of $A/$B happens after `cd "$ROOT"` - so a relative path passed
 # from elsewhere passes the check and then fails on every invocation.
-# CI does exactly that: `vdjcmp.sh ./mylang ./mylang` with
+# CI does exactly that: `vdjcmp ./mylang ./mylang` with
 # working-directory `build/`. The script reported it honestly (a `FAIL`
 # per program, `exit 127`, and a banner saying the run DIED rather than
 # differed - which is the refusal discipline working), but it could

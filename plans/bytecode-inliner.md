@@ -456,6 +456,6 @@ oracle here, unlike an AST transform. But add all of:
   - `-vd` before/after on the corpus: the un-inlined dump must be
     unchanged for every program the gate declines
   - backtrace parity through a spliced body, byte-identical
-  - `nested_fuzz.py`, which is what caught the N5 temp-caching bug
+  - `nested_fuzz`, which is what caught the N5 temp-caching bug
   - and, per the standing rule, REINTRODUCE a wrong slot remap and
     confirm a test fails

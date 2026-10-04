@@ -18,7 +18,7 @@ maintainer decision first and live in `plans/language-deferred.md`.
 Ground rules (maintainer): a change must be perf-neutral-or-better in
 the worst case, verified by the FULL-SUITE interleaved A/B rule
 (CLAUDE.md, Benchmarks). Correctness is gated by the `-rt` VM
-differential + `tests/nested_fuzz.py`.
+differential + `tests/nested_fuzz`.
 
 Most entries below were lifted out of plans archived on 2026-08-13;
 each names the archived file that holds its full design. Those files
@@ -247,10 +247,10 @@ as a problem".
   `archived/g1-no-record-tier.md`. **The tier is DEFAULT-ON**, which is
   what makes these worth carrying.
   - **Net 2 - DONE (2026-08-13)**: `MYLANG_RECON_AT=N` +
-    `tests/norec_sweep.py`, with an in-suite seed. Sabotage-verified -
+    `tests/norec_sweep`, with an in-suite seed. Sabotage-verified -
     a one-off `seg_top_before` leaves `-rt` and `corpus_diff` green
     and only the sweep fails.
-  - **Net 3 - DONE (2026-08-13)**: `tests/norec_enum.py`, 2272
+  - **Net 3 - DONE (2026-08-13)**: `tests/norec_enum`, 2272
     programs / 9088 engine runs at depth 4. Found two real bugs on its
     first run (the mixed-kind ret-audit abort and the catch-bind
     `ref_slots` gap), neither caught by `-rt` or `corpus_diff`.
@@ -265,7 +265,7 @@ as a problem".
     plan's own sabotage matrix name Net 3 as their only catcher
     ("interleave ignores the SP bound", "caller_captures pop skipped").
   - **Net 4 - BUILT as a RATCHET (2026-08-13), 100% NOT reached**:
-    `tests/norec_coverage.py` measures line+branch coverage of the
+    `tests/norec_coverage` measures line+branch coverage of the
     walk/reconstruction surface per function and is wired into the new
     `Nets` CI lane with a floor. It found that a plain `-rt` leaves
     `norec_walk_chain` at ZERO; the shadow workload plus two new
@@ -279,10 +279,10 @@ as a problem".
     failure the design forbids, so the floor holds the line until it
     is genuinely covered. Detail: `docs/jit-optimizations.md`.
 - **A `.myv` agreement lane** (`archived/myv-serializer.md`, S5's
-  fourth lane, never built): `nested_fuzz.py --myv` (compile -> file ->
+  fourth lane, never built): `nested_fuzz --myv` (compile -> file ->
   load -> run as a fourth agreement engine) plus a CI round-trip step.
   Today CI compiles every sample/bench to an image but only feeds it to
-  the doc reader, never RUNS it; `tests/myv_fuzz.py` is a CORRUPTION
+  the doc reader, never RUNS it; `tests/myv_fuzz` is a CORRUPTION
   fuzzer, not an agreement lane; and CLAUDE.md's "83/84 run identically
   from an image" is a one-off manual verification.
 - **A `VM_HARDENING` per-write type audit**

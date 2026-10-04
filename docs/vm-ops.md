@@ -927,7 +927,7 @@ conditions long met — full parity + the VM ~2.2x the tree-walker on the
 bench geomean, suite 5.0x CPython); `-tw` selects the tree-walker, `-vm` is
 accepted as the explicit default (pre-flip scripts/CI), the two are
 mutually exclusive. The REPL and parse-time const-eval remain tree-walker
-by design (they need the AST). `tests/nested_fuzz.py`'s tw lane passes
+by design (they need the AST). `tests/nested_fuzz`'s tw lane passes
 `-tw` explicitly; `bench/run.py` runs the VM by default (`--tw` for the
 tree-walker; `--vm --baseline <same post-flip binary>` still gates VM vs
 tree-walker — the baseline now gets `-tw`). Implemented in its **own files** — `bytecode.h` (the `OpCode`
@@ -1045,7 +1045,7 @@ prove int-not-bool for a raw store, since a bool is `th==i` too), but a boxed
 move preserves the real type. A **15-level randomly-nested if/while/for
 (optimized + general) spine lowers with ZERO `EvalStmt` fallback** (see the
 `vm/codegen: deep 15-level nest` test + `bench/*/68_nested`, ~4x CPython; and
-the `tests/nested_fuzz.py` differential fuzzer, which generates thousands of
+the `tests/nested_fuzz` differential fuzzer, which generates thousands of
 random deep-nested programs + their Python twins and checks tree-walker == VM ==
 CPython). The
 register choice (over a stack machine, which the
@@ -1587,7 +1587,7 @@ Expr14 in `locs`), and a nested store's operation error NO location at
 all. Rides both JIT pc remaps and the splice; bounded by `verify_chunk`;
 serialized after `base_locs` as myv **v22** (section 9.2); printed by
 `-vd` with both ends. Pinned by the `caret: a compound store ...` `-rt`
-matrix and `tests/bt_oracle/compound_*.my`.
+matrix and `tests/backtrace/compound_*.my`.
 The AST-node side table this section used to describe -
 `Chunk::node_table`/`node_at_pc` and the `ast_nodes` pool - is GONE with the
 fallback op it existed for; the codegen-transient handle now lives on

@@ -11,12 +11,12 @@
  * MYLANG_INT_OUT=<path>: at exit, the process appends one
  * `site hits queries` line per site to <path> (every site, zeros
  * included): how many events it recorded, and how many times a test READ
- * it through int_hits/int_events. tests/int_run.py sums these over its
+ * it through int_hits/int_events. tests/int_run sums these over its
  * runs for the site census - a site no test CHECKS fails, since reaching
  * a site without asserting on it verifies nothing.
  *
  * MYLANG_INT_DUMP=<path>: at exit, every event the process recorded,
- * sorted - the decision instances a run reached, for tests/int_enum.py -
+ * sorted - the decision instances a run reached, for tests/int_enum -
  * plus one `choose_applied key=... pick=...` line per MYLANG_INT_CHOOSE
  * override int_choose actually honoured, written the moment it is
  * honoured (int_applied_note), so the file is APPENDED to and a crashing
@@ -99,7 +99,7 @@ long long int_live_count(const std::string &kind)
 }
 
 /* MYLANG_INT_CENSUS=1: one `census LEAK <kind> base B end E` line per
- * kind whose count did not come back (tests/int_run.py fails on it), or
+ * kind whose count did not come back (tests/int_run fails on it), or
  * `census skipped (exit)`; MYLANG_INT_CENSUS=all also prints the
  * balanced kinds. stderr, so a program's own output is untouched. */
 unsigned long long g_int_probe_hits = 0;
@@ -154,7 +154,7 @@ namespace {
 void dump_at_exit()
 {
     /* MYLANG_INT_DUMP=<path>: every recorded event, one per line, in
-     * canonical (sorted) order - what tests/int_enum.py reads to learn
+     * canonical (sorted) order - what tests/int_enum reads to learn
      * which decision instances a run reached */
     if (const char *dp = std::getenv("MYLANG_INT_DUMP")) {
         if (*dp) {

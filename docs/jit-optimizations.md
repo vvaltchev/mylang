@@ -734,7 +734,7 @@ DFS, then compaction with a prefix-sum pc remap over `visit_pc_fields`.
 "target" field is NOT always a pc - `ForLoopStep::target2` is the
 COUNTER SLOT, `JumpUnlessTrueV::target2` the value slot,
 `SetPend::target` a Pend enum; the E-v1 fuzzer catch) - a new branching
-op MUST be added there, and ALWAYS run tests/nested_fuzz.py after a
+op MUST be added there, and ALWAYS run tests/nested_fuzz after a
 codegen-pass change. E2 (temp renumbering) was evaluated + DEFERRED (the
 native call stack made per-call temp cost ~nil - see the plan); E4 =
 this pass IS the fusion framework (no new fusions shipped). Measured
@@ -1861,7 +1861,7 @@ whole fragment) would overwrite a temp still LIVE as an array with the
 int register + the `t_int` tag, corrupting the snapshot -> a later
 `LoadElemValue` `InternalErrorEx`. A resolved local has a stable identity
 and (counted only via proven-int ops) a stable int type. This corruption
-was a `tests/nested_fuzz.py` find, NOT a `-rt` one (the aliasing needs a
+was a `tests/nested_fuzz` find, NOT a `-rt` one (the aliasing needs a
 specific temp-slot coincidence a hand-written test rarely hits), pinned
 by two `jit:` regression tests. The classifier's operand extraction must
 EXACTLY match the emitter's per-op layout: an earlier `IntAddStep`
@@ -3755,7 +3755,7 @@ was exercised wherever a corpus happens to throw, and nowhere else.
 
 `MYLANG_RECON_AT=N` (or `g_norec_recon_at` from a test) forces
 `norec_recon_probe` at the Nth CALL EVENT - every emitted M5b push is
-one - and the driver `tests/norec_sweep.py` walks N over a program's
+one - and the driver `tests/norec_sweep` walks N over a program's
 whole event count, one process per N. SQLite's fail-the-Nth-malloc,
 applied to frame reconstruction.
 
@@ -3814,7 +3814,7 @@ enumeration) and Net 4 (the GCOV coverage gate).
 ## NET 3 - EXHAUSTIVE SMALL-SCOPE ENUMERATION (2026-08-13)
 
 The second of the no-record tier's unbuilt nets. NOT a fuzzer:
-`tests/norec_enum.py` emits EVERY program in a bounded shape space and
+`tests/norec_enum` emits EVERY program in a bounded shape space and
 runs each through four engine configurations, comparing stdout, stderr
 and exit status BYTE-FOR-BYTE.
 
@@ -3869,7 +3869,7 @@ STILL OPEN from the plan's testing arc: Net 4, the GCOV coverage gate.
 
 ## NET 4 - the COVERAGE RATCHET for the no-record tier (2026-08-13)
 
-The last of the tier's unbuilt nets. `tests/norec_coverage.py` reads
+The last of the tier's unbuilt nets. `tests/norec_coverage` reads
 gcov's JSON from the existing `-DGCOV=1` lane and reports LINE and
 BRANCH coverage of the walk / reconstruction / verification surface,
 per function, against the `SCOPE` list in the script.
@@ -4211,7 +4211,7 @@ StackOverflowEx is the whole point of the segmented slot stack ("a
 clean, located error where the old per-call C-stack model segfaulted")
 and nothing exercised it. It cannot be tested from `-rt`: the cap is
 read ONCE per process into a static, so only a spawned binary can set
-`MYLANG_VM_STACK`. Three checks in `tests/driver_checks.sh` now cover
+`MYLANG_VM_STACK`. Three checks in `tests/driver_checks` now cover
 it - a deep recursion caught by `catch (StackOverflowEx)`, an UNCAUGHT
 one rendering as a located error rather than a crash, and (the
 dangerous direction) a recursion that FITS still completing, since a
@@ -5331,11 +5331,11 @@ by reintroducing the ORIGINAL defect** (delete `tflush.clear()`):
     live: a cache vector was added to cache_live() but not here")'
 
 Verified as a pure restructuring: emitted code byte-identical on all 108
-corpus programs (`scripts/vdjcmp.sh`).
+corpus programs (`scripts/vdjcmp`).
 
 **Two tools came out of this session and now live in `scripts/`**, since
 both were re-derived from scratch more than once:
-`scripts/vdjcmp.sh` (compare two binaries' emitted native code across
+`scripts/vdjcmp` (compare two binaries' emitted native code across
 the corpus - the oracle for "this refactor changed nothing", with the
 four normalisation traps recorded in its header) and
 `scripts/sabotage.sh` (apply a defect, rebuild, run a check, always
@@ -5630,7 +5630,7 @@ SEVENTH pin. `-rt`, all four differentials, `corpus_diff` and every
 fuzzer hammered the first three and reached r9 essentially never. A
 bigger corpus does not fix that; the allocator's own preference is the
 hole. **`MYLANG_JIT_XROT=N` rotates the pool** so member N is first;
-`corpus_diff.sh --xrot` runs the matrix, and `jit_xcache_pins` sweeps
+`corpus_diff --xrot` runs the matrix, and `jit_xcache_pins` sweeps
 every rotation in-process. Making r9 first fails `-rt` in seconds -
 which is exactly how this was found.
 
@@ -5644,7 +5644,7 @@ spilled - which is precisely the (a)/(b)/(c) split the census draws.
 
 ### And the oracle for all of this had quietly stopped working
 
-`scripts/vdjcmp.sh` - "the oracle for a pure restructuring" - reported
+`scripts/vdjcmp` - "the oracle for a pure restructuring" - reported
 **0 identical / 108 differing** for any two separately-linked binaries,
 and **77/31 for a binary against ITSELF**. Two independent holes, both
 opened by earlier work in this same arc:
@@ -5720,7 +5720,7 @@ the operand SHAPE, which is all a reader or a differ needs, with the
 digits behind `MYLANG_VDJ_ADDRS=1`.
 
 The previous answer was a sed pipeline plus `setarch -R` inside
-`scripts/vdjcmp.sh`, and it failed exactly the way workarounds do:
+`scripts/vdjcmp`, and it failed exactly the way workarounds do:
 
  - **it rotted silently.** The masks were hex-only; #96 step 3 made
    Type tags `imm32`, which the disassembler printed in DECIMAL. From
@@ -5734,7 +5734,7 @@ The previous answer was a sed pipeline plus `setarch -R` inside
  - **it left the tool broken for its most important consumer** - a
    human reading the dump.
 
-`vdjcmp.sh` is now a plain `cmp` with a self-test that refuses to report
+`vdjcmp` is now a plain `cmp` with a self-test that refuses to report
 anything if one binary gives two different dumps.
 
 ### The self-check, and three vacuous tests before it worked
@@ -5805,8 +5805,8 @@ wrongly (`57_bool_reduce` -> a null `Type *` in the ret audit;
 WATCHED, with the defect reintroduced and the new ML_CHECK removed:
 
     ./mylang -rt                     1922/1922  PASS   (blind)
-    corpus_diff.sh                   20/20 agree       (blind)
-    corpus_diff.sh --nolowmem        18/20             CATCHES IT
+    corpus_diff                   20/20 agree       (blind)
+    corpus_diff --nolowmem        18/20             CATCHES IT
 
 **THE FIX IS A SEAM SPLIT, not a re-added instruction.**
 `store_type_tag(disp, tag, held_reg)` now ML_CHECKs that `tag` is one
@@ -5820,7 +5820,7 @@ when it is not an immediate. `cmp_reg_tag` carries the same tripwire.
 leave behind an argument that says the register is still LOADED.**
 Delete the parameter or honour it.
 
-Nets: `tests/corpus_diff.sh --nolowmem`, plus `-rt` under the same env,
+Nets: `tests/corpus_diff --nolowmem`, plus `-rt` under the same env,
 both in the `Nets` CI lane's `differential` job.
 
 ## 2026-08-18 - #96: the xcache gate becomes a per-register CLOBBER MASK
@@ -6356,7 +6356,7 @@ pays nothing.
 The reservation absorbs exactly the pressure each admission creates and
 nothing has starved with it in place. Emitted code on-arena was
 **byte-identical over all 109 corpus programs** for the reservation
-alone (`scripts/vdjcmp.sh`), i.e. it landed inert and rsi is what moved
+alone (`scripts/vdjcmp`), i.e. it landed inert and rsi is what moved
 it.
 
 **TWO ROTTED SITES had to be fixed before rsi could join**, and neither
@@ -6694,7 +6694,7 @@ closed the second.
 
 ### The hole
 
-`scripts/vdjcmp.sh` compares emitted code over bench/my + samples +
+`scripts/vdjcmp` compares emitted code over bench/my + samples +
 tests/functional. Of those 109 programs, **zero emitted
 `LoadElem2Float`** - so neither float arm of the fused nested read, nor
 its row-slice arm, was covered by the oracle every emitter refactor is
@@ -6985,7 +6985,7 @@ now FAILS (1923/1924); it passed for the gap's entire lifetime, because
 `/7` (idiv) was decoded. The whole group is now handled (/0 test, /2
 not, /3 neg, /4 mul, /5 imul, /6 div, /7 idiv).
 
-### The oracle: `scripts/disasmcheck.py`
+### The oracle: `scripts/disasmcheck`
 
 `MYLANG_VDJ_HEX=1` makes `-vdj` print each instruction's raw bytes;
 the script hands each fragment to **objdump** and compares
@@ -7623,7 +7623,7 @@ alloc_scratch(caps). regcensus.py enforces it: sites are
 bracketed / tagged (reg:isa, reg:abi, reg:conv - validated, stale
 tags reported) / UNJUSTIFIED, and `--gate` ratchets every register's
 UNJUSTIFIED count against scripts/regcensus_floor.txt in both
-directions, run by driver_checks.sh in every lane.
+directions, run by driver_checks in every lane.
 
 **THE SITE AUDIT'S FIRST READ FOUND A SHIPPED WRONG ANSWER (the
 default configuration).** The flat compound store's decline path
@@ -9170,7 +9170,7 @@ the fresh compile's, so every following offset disagreed - the exact
 -vdj reproducibility contract (vdjcmp is a plain cmp). Value/address
 is a CALLER fact, hence the separate mov_imm.
 
-FIXED IN PASSING: corpus_diff.sh's LEVERS list was itself a stale
+FIXED IN PASSING: corpus_diff's LEVERS list was itself a stale
 table - argfuse/xcache/scache/rshare never joined it, so those four
 levers' per-lever-off configs were tested by nothing but `all`. Synced
 + a keep-in-sync warning; `peep` added (MYLANG_JIT_OFF=peep is the
@@ -9675,9 +9675,9 @@ RECORD-LESS return the record's cache line is otherwise never touched.
 
 **NETS - and this is the change that needed the frame-shaped ones**, a
 wrong nslots corrupts the VM's view of the caller's window rather than
-producing a wrong value: `norec_enum.py --depth 3` (1920 engine runs
+producing a wrong value: `norec_enum --depth 3` (1920 engine runs
 over the enumerated frame-kind space, 9 of 25 sampled programs making
-record-less pushes) and `norec_sweep.py` (the forced reconstruction at
+record-less pushes) and `norec_sweep` (the forced reconstruction at
 every call event) both agree, plus -rt 1961/1961 and corpus_diff 29/29.
 
 ## #97 step 3 - THE CLOSURE STORE IS INLINE, THE CONSTRUCTION IS NOT
@@ -9807,7 +9807,7 @@ The audit-table stage trap in its "a value computed later" shape.
 IT**, because it makes the EMITTED CODE DEPEND ON COMPILATION ORDER -
 and Pass B walks a POINTER-keyed map, whose order is not stable across
 runs. `-vdj` reproducibility (two runs, two separately-linked binaries,
-byte-identical text) is what `scripts/vdjcmp.sh` IS. So the elision is
+byte-identical text) is what `scripts/vdjcmp` IS. So the elision is
 allowed for exactly one caller, on a structural argument: **MAIN is
 compiled LAST**, after every function body (`vm_precompile_all`'s Pass B
 and `vm_jit_loaded_image`), so every callee it can name is already
@@ -9978,7 +9978,7 @@ under it.**
 
 Its measured effect on the four call benches is **0.00%**, and it is
 kept anyway on evidence rather than on taste: the restored
-`vdjcmp.sh` says it changes the EMITTED CODE of **9 of 124** corpus
+`vdjcmp` says it changes the EMITTED CODE of **9 of 124** corpus
 programs, so it has real reach - just not in the shapes those four
 benches use, where temp REUSE (an argument temp shared with a string
 argument to `print`) marks the slot for a genuine reason. A rule with
@@ -10716,7 +10716,7 @@ real work. Take the Ir; do not expect the seconds.
 
 **AND THE RUN CARRIES ITS OWN NOISE FLOOR, which is worth more than the
 geomean:** `18_foreach_array` read **1.21x** and `67_make_dict`
-**1.10x**, and `scripts/vdjcmp.sh` says their emitted code is
+**1.10x**, and `scripts/vdjcmp` says their emitted code is
 **BYTE-IDENTICAL between the two binaries - zero differing lines**. A
 bench whose machine code did not change by one byte measured 21%
 slower, so ±20% per bench is this box's spread today and the 1.008x
@@ -10835,7 +10835,7 @@ was throttling, not the one case that led you there.**
 ## #118 - two `.myv` PROVENANCE gaps: a corrupt image must not take the
 ## process down (2026-08-29)
 
-Found by `tests/myv_fuzz.py` while validating #106 phase 2, and
+Found by `tests/myv_fuzz` while validating #106 phase 2, and
 PRE-EXISTING - both reproduce byte-identically on the commit before it,
 debug and release alike. Both are the #137 TIER-2 shape: the fact is
 VALUE-dependent, so `verify_chunk` structurally cannot decide it at load
@@ -10898,7 +10898,7 @@ debug build and in the `ASSERTS=0` release -
 where before the build type decided whether you got an abort, a
 terminate, or a silent continue.
 
-**THE NET IS `myv_fuzz.py` ITSELF, and it is already in CI** (the
+**THE NET IS `myv_fuzz` ITSELF, and it is already in CI** (the
 `myv-fuzz` job, both build types). Its seed is FIXED, so mutation #740
 and #1485 of the fat corpus reproduce deterministically. Crashes over
 3200 mutations: **release (`OPT=1 ASSERTS=0`) 1 -> 0, debug+ASan
@@ -11218,7 +11218,7 @@ corpus differential over five matrices, the ASan/LSan debug lane).
 ## #122 - a CALLABLE descriptor with no chunk: refused at load, guarded at
 ## the call (2026-08-29)
 
-`tests/myv_fuzz.py` found a mutated image that took the process down:
+`tests/myv_fuzz` found a mutated image that took the process down:
 
     debug   (TESTS=1 OPT=0, ASan):  rc=134, a NAMED abort -
         src/eval.cpp: do_func_call: Assertion `(obj.func->decl) &&
@@ -11266,7 +11266,7 @@ one does it without taxing every trusted run.
                                              with a backtrace
     fat-740.myv      rc=1 (already covered by #118's EndFinally check)
     fat-1485.myv     rc=1 OutOfBoundsEx
-    fat-5, fat-680   rc=124 - HANGS, and `myv_fuzz.py --triage` says
+    fat-5, fat-680   rc=124 - HANGS, and `myv_fuzz --triage` says
                      both "load cleanly - a non-terminating program",
                      i.e. #137's documented, accepted residual rather
                      than a loader bug. Nothing open there.
@@ -11478,7 +11478,7 @@ vdjcmp's SELF-test, the objdump oracle, `-rt`, `corpus_diff`.
     -rt                1978/1978 + 4 differential modes 1696/1696
     corpus_diff        plain / --levers / --cold / --xrot (0..15) /
                        --nolowmem - all 34/34 agree
-    disasmcheck.py     202,433 instructions, 332 fragments,
+    disasmcheck     202,433 instructions, 332 fragments,
                        ZERO objdump disagreements
     vdjcmp self-test   127/127 identical
 
@@ -11625,7 +11625,7 @@ configuration a user can select that no net can enter.
 **THE CHANGE.** `JL_LSRA` joins the lever enum and `jit_lever_names`;
 `MYLANG_JIT_LSRA` and `g_jit_lsra` are DELETED; the in-process need is
 `g_jit_off_extra`, the seam every other lever's test already uses; and
-`tests/corpus_diff.sh` gains `lsra` to `LEVERS`, so CI runs the whole
+`tests/corpus_diff` gains `lsra` to `LEVERS`, so CI runs the whole
 corpus under the legacy pick on every push. A suspected allocator bug
 is now one lever away from a same-binary A/B.
 
@@ -12502,7 +12502,7 @@ intact prints exactly as before. `render_row(pc)` became
 `; frameless entry @+N` beside its `native_leaf` line.
 
 **A pre-existing reproducibility bug it exposed.** With main jitted
-through the real sequence, `scripts/vdjcmp.sh BIN BIN` refused THREE
+through the real sequence, `scripts/vdjcmp BIN BIN` refused THREE
 corpus programs (64_struct_create, 11_catch_bind_release,
 23_baked_callee): `movabs rcx, 2` in one run, `9` in the next. The
 LoadConstV inline copy bakes a trivial const's payload as immediates,
@@ -12520,9 +12520,9 @@ emit-time counters `frameless_entries` and the new `frameless_sites`
 (bumped only when the site takes the frameless tail) advance by the
 program's four leaves during `disassemble_program`, the text carries
 four `frameless entry` lines, and main's marks name a `call.val`.
-`driver_checks.sh` asks the CLI the same over bench/my/78. Both watched
-failing against the old driver (0 entries, 0 sites). `disasmcheck.py`:
-233,153 instructions, 0 disagreements; `vdjcmp.sh` self-test 127/127.
+`driver_checks` asks the CLI the same over bench/my/78. Both watched
+failing against the old driver (0 entries, 0 sites). `disasmcheck`:
+233,153 instructions, 0 disagreements; `vdjcmp` self-test 127/127.
 
 ## #97 increment 3, W1 - THE CALLER BUILDS THE FRAMELESS WINDOW: a
 ## relocation, verified instruction for instruction on the dump
@@ -12874,7 +12874,7 @@ to have compiled - the first sabotage of the select did NOT, an
 The `err loc:` entries: the three re-pinned to the argument, plus the
 FIRST of two arguments (so the index is what is tested), a `float`
 parameter (the coercion's other throw), and the callback shape above;
-`driver_checks.sh` renders the caret from a `.myv` image and compares
+`driver_checks` renders the caret from a `.myv` image and compares
 it to the source run; `myv_round_trip`'s program has user calls in
 every chunk. Verification: see the commit.
 
@@ -13049,7 +13049,7 @@ stack garbage, and it is guarded three ways:
 A TESTS build therefore emits MORE at the site than W2 did (a
 `movabs r11` plus one register store per skipped slot); the elision
 exists in the release build only, which is what `-rt` cannot see and
-`tests/driver_checks.sh` pins on a non-TESTS binary (the poison form
+`tests/driver_checks` pins on a non-TESTS binary (the poison form
 on a TESTS one, so neither configuration can rot).
 
 **The expected dump, and the dump** (78, the perf build):
@@ -13083,7 +13083,7 @@ slow tier every call (a slice does not - it has its own inline arm);
 locals written raw (all five non-parameter slots skipped); a skipped
 temp written and then a zero divisor thrown on a warmed call
 (backtrace parity - the raise path touches no skipped slot).
-`driver_checks.sh`: the release form and the poison form, by
+`driver_checks`: the release form and the poison form, by
 `mylang -v`'s `tests` line.
 
 **Wall clock, one 1-vs-1 run at the end of the task (W3 + the
@@ -13204,7 +13204,7 @@ the W4 form, four reach cases (values on both engines: a reference
 capture through both `_at` arms, a factory in a loop declining with
 each closure reading its own base, a nested closure capturing a
 capture, an inc/dec closure declining beside a W4 sibling on the same
-capture), `driver_checks.sh` pins the release form (the residue push
+capture), `driver_checks` pins the release form (the residue push
 followed straight by the call) and the TESTS form. The lever:
 `MYLANG_JIT_OFF=capprot` (in `corpus_diff --levers`).
 
@@ -13278,7 +13278,7 @@ reference through the helper with `noesc = 0` - a retain where the
 fresh compile borrowed - and `myv_round_trip` (a loaded image's `-vdj`
 vs a fresh compile's) failed the moment the site started baking the
 bit. Section 8 of `docs/myv-format.txt` gained the `i64` after the six
-bools, `tests/myv_doc_check.py` consumes it, the version is 17. That
+bools, `tests/myv_doc_check` consumes it, the version is 17. That
 the pre-W5 loader ran correctly with the field missing is the #94
 design working as intended - a false "escapes" costs a retain, never a
 count - and it is also why nothing had noticed for six weeks.
@@ -13372,7 +13372,7 @@ single byte turns a `LoadLiteralObjV` into a `PopHandler` with no
 vector - pre-existing, reached because v17 shifted the seeded mutation
 space, task #26's third finding (docs/in-flight-tasks.md §3d). The
 debug lane had counted the same mutation CLEAN: UBSan exits 1, exactly
-as a `MyvError` refusal does. `myv_fuzz.py` treats a sanitizer report
+as a `MyvError` refusal does. `myv_fuzz` treats a sanitizer report
 as a crash now.
 
 ## #25 - `visit_use_def` LEARNS THE ELEMENT-STORE FAMILY: six store ops
@@ -13571,7 +13571,7 @@ identical move and the load path did not. The rebind is the MOVE's job
 now (VmProgram's move ctor / move assignment, vm.h), the harness's
 explicit rebind loop is gone. Pinned by `vm_program_move_rebinds`
 (watched: the assignment's rebind alone removed fails it; both removed
-kills the suite in the harness) and a `driver_checks.sh` deep-image case.
+kills the suite in the harness) and a `driver_checks` deep-image case.
 Not visible to -rt (its loads are elided initialisations, no move), nor
 to myv_fuzz (its corpus has no switched call from main).
 
@@ -13783,7 +13783,7 @@ through `jit_sp_misaligned` with the real rsp. It needs no model, which
 is exactly why it is worth its bytes - it is the layer that catches a
 MISSING `sp_move`. A lever rather than always-on because it changes the
 emitted bytes that `-vdj`, the shape tests and `vdjcmp` read;
-`corpus_diff.sh --spcheck` is its lane, and it belongs on an
+`corpus_diff --spcheck` is its lane, and it belongs on an
 **`ASSERTS=0`** build as much as a debug one (see the bug below).
 
 The completeness net for SP1 is the `-rt` entry *the CALL SEAM is
@@ -14149,7 +14149,7 @@ get a window from the budget, so the depth a runaway recursion reaches
 is OBSERVABLE - a program can catch the overflow and print it - and a
 tier that carved its window anywhere else would move that depth. No
 test pinned it: `-rt` cannot set `MYLANG_VM_STACK` (read once into a
-static) and the tree-walker overflows the C stack. `driver_checks.sh`
+static) and the tree-walker overflows the C stack. `driver_checks`
 now runs one program - plain self recursion, a leaf call per level,
 mutual recursion, a closure call per level, and a leaf called from
 MAIN (the frameless site's home) - at four caps straddling a
@@ -14228,7 +14228,7 @@ of them overflows at a different depth than `-nj`. RULE 2 said that was
 observable and forbidden; the maintainer revised it (CLAUDE.md, RULE 2):
 recursion depth, like speed and memory, is an unspecified property of
 the environment - what must hold is that a runaway recursion ends in a
-catchable `StackOverflowEx`. `driver_checks.sh`'s *overflow* case now
+catchable `StackOverflowEx`. `driver_checks`'s *overflow* case now
 compares everything but the depth.
 
 **WHAT WAS STILL HARD: THE DEPTH-CAP SWITCH.** Past the sync depth cap a
@@ -14444,7 +14444,7 @@ The `-rt` case lowers whichever bound the build uses - a TESTS knob puts
 the floor 24KB below the top (`jit_test_nstack_floor`) - and requires
 every self site to have taken its build's form (`frameless_self_floor`,
 a JITSTATS row). Watched: with the floor compare removed, `-rt` reports
-all three cases VACUOUS (zero boundary calls) and `driver_checks.sh`
+all three cases VACUOUS (zero boundary calls) and `driver_checks`
 crashes with SIGSEGV (rc 139) where StackOverflowEx is required.
 Measured (callgrind per scale unit and ONE interleaved `--baseline` run,
 baseline E2c):
@@ -14861,7 +14861,7 @@ byte load, a `jae` to the decline pad where the `jb`+bail was.
 ## (2026-09-25)
 
 Found by the backtrace oracle (`inlined_backtrace_oracle`,
-`tests/bt_oracle.py`): with inlining ON, every configuration must render
+`tests/bt_oracle`): with inlining ON, every configuration must render
 the backtrace the `-ni -tw` run renders. Once the tree-walker and `-nj`
 were fixed (tag_inline completeness, the per-frame guard, the display
 name - CLAUDE.md *Inlined (virtual) frames*), every remaining failure was
@@ -14899,7 +14899,7 @@ same `!sync_stop` gate - its ret_pc is a resume stub in a deleted run,
 so the pop's pc lookup named the first inlined op's chain: a phantom
 `pre(n)` above every level of a mutual recursion past the sync depth
 cap. Reached only where the cap is 32 - a sanitized build, or
-`MYLANG_NATIVE_STACK=0` (bt_oracle.py has that config; the -rt oracle
+`MYLANG_NATIVE_STACK=0` (bt_oracle has that config; the -rt oracle
 reaches it in the sanitized lanes); with the native stack armed the
 recursion goes frameless and never switches. To fill the record,
 `jit_call_sync_switch` now performs #88's CLAIM at entry, the one
@@ -16265,7 +16265,7 @@ distinct targets; k = 9 and a cap of 2 splice none; an 8-way site of
 large bodies splices none and bumps `g_bc_chain_partial`),
 `tests/functional/54_value_chain.my` (value/discarded/eight-way/closure
 chains, a throw out of a middle arm caught by the caller, the identity
-arm) and `tests/bt_oracle/value_chain_throw.my` (the throw's backtrace
+arm) and `tests/backtrace/value_chain_throw.my` (the throw's backtrace
 matches `-ni -tw`).
 
 ## #97 REGCALL STEP 1 - TYPED ARGUMENTS AND TRIVIAL RESULTS IN REGISTERS
@@ -16874,7 +16874,7 @@ END A RUNAWAY RECURSION IN StackOverflowEx*). The op now calls
 `vm_stamp_args_caret`, as before) and switches to the callee after its
 scope closes - the computed-goto dispatch cannot leave a scope that
 holds `holder`/`res`. The JIT's helper for the op already used the
-sync protocol. Net: `tests/driver_checks.sh`'s overflow case now runs
+sync protocol. Net: `tests/driver_checks`'s overflow case now runs
 `-nti` and `-nti -nj` at all four caps (watched failing with the old
 path, every cap, ASan stack-overflow).
 
@@ -16924,7 +16924,7 @@ call-site flush, which has its own mechanism.
 stamp in reach, then one program per candidate raising after an inlined
 call, compared across the three engines - two reproduced (`assert`, the
 member read), the scan named the other three. **Net:**
-`tests/bt_oracle/after_inline_op_raise.my` (every inlining-on
+`tests/backtrace/after_inline_op_raise.my` (every inlining-on
 configuration against `-ni -tw`); watched failing on the pre-fix build.
 
 ## THE FLOAT LITERAL POOL CLOBBERED A PINNED rcx (2026-10-02)
@@ -17108,7 +17108,7 @@ shape: the register is a byte literal, not an argument.
 **The net.** So they are not found by grep. `Emitter::trk_scan_writes`
 (ASSERTS builds; emits nothing) DECODES every byte the emitter produced
 - with `decode_ins`, the decoder `-vdj` renders and
-`scripts/disasmcheck.py` holds to objdump - at every `op_boundary` and
+`scripts/disasmcheck` holds to objdump - at every `op_boundary` and
 in the destructor, and requires each general register an instruction
 writes (`decoded_gp_writes`: explicit operand, plus `cqo` -> rdx and
 `div`/`idiv`/`mul`/one-operand `imul` -> rax+rdx; fails towards
@@ -17226,7 +17226,7 @@ order).
 The two entries above added checks that fire only on WRONG emission, so
 no correct run reached them, and the forms `decoded_gp_writes` classifies
 but the JIT does not emit today were reached by nothing either: the
-`int_run.py --gcov` gate read 32,350 uncovered against the GCC 16 floor
+`int_run --gcov` gate read 32,350 uncovered against the GCC 16 floor
 of 32,305. Two `-rt` extra_checks close it, and the floor is ratcheted to
 the new measurement (32,209).
 

@@ -378,17 +378,17 @@ ASan+UBSan, unless noted):
     corpus_diff --cold              rc=0
     corpus_diff --xrot              34/34 x 16 rotations
     corpus_diff --nolowmem          34/34
-    driver_checks.sh                all passed
-    vdjcmp.sh (self-test)           127 identical, 0 differing
-    disasmcheck.py (objdump)        239,032 instructions, 0 disagreements
-    myv_fuzz.py release + ASan      0 crashes / 3,200 mutations each;
+    driver_checks                all passed
+    vdjcmp (self-test)           127 identical, 0 differing
+    disasmcheck (objdump)        239,032 instructions, 0 disagreements
+    myv_fuzz release + ASan      0 crashes / 3,200 mutations each;
                                     1 hang, triaged "loads cleanly - a
                                     non-terminating program" (benign)
-    myv_doc_check.py                gcd.myv AND an image containing the
+    myv_doc_check                gcd.myv AND an image containing the
                                     new v15 record both consume to EOF
-    norec_enum.py --depth 3         480 programs / 1920 runs, all agree
-    norec_sweep.py                  OK (shadow + production)
-    nested_fuzz.py --count 300      300 programs x 5 engines, 0 diverged
+    norec_enum --depth 3         480 programs / 1920 runs, all agree
+    norec_sweep                  OK (shadow + production)
+    nested_fuzz --count 300      300 programs x 5 engines, 0 diverged
     image vs source run             byte-identical output, and both
                                     report bake_push 1,000,001
 
@@ -491,7 +491,7 @@ hazards a successor must not walk past:
  2. **The exception path.** A callee can throw through the fragment.
     The exceptional exit already does `emit_call_epilogue` then
     `exit_pc`, so pins are reloaded and then flushed — but that must be
-    PROVEN with `norec_enum.py` (a throw crossing a call frame is
+    PROVEN with `norec_enum` (a throw crossing a call frame is
     exactly its shape space), not assumed.
  3. **The staging hazard, which has already shipped a wrong answer
     once.** A bracketed helper call's own ARGUMENT STAGING can clobber
@@ -1290,7 +1290,7 @@ the v18 fix above: the maintainer answered the "does an LSan report on
 a hostile image count" question with "derive ref_slots at load".)
 **And the fuzzer could not SEE the third in the debug lane** (fixed
 2026-09-21): UBSan under `-fno-sanitize-recover` reports and exits 1,
-the SAME code a clean `MyvError` refusal uses, so `myv_fuzz.py` counted
+the SAME code a clean `MyvError` refusal uses, so `myv_fuzz` counted
 it clean while the release build segfaulted on the identical bytes. A
 sanitizer report in stderr is a CRASH now, whatever the exit code.
 
@@ -1383,7 +1383,7 @@ reading VmSize or commit accounting kills long ASan matrices anyway
 34). It happened three times.
 
 Consequences, both already applied:
- - `tests/corpus_diff.sh` now sets
+ - `tests/corpus_diff` now sets
    `ASAN_OPTIONS=hard_rss_limit_mb=8000` unless the caller overrides it,
    so a genuine runaway aborts as a NAMED ASan report attributed to one
    program and one config, instead of the harness dying with its output
@@ -1396,11 +1396,11 @@ Consequences, both already applied:
 **SCRIPT INVOCATION DIFFERS BETWEEN NETS, and both forms fail loudly
 (rc=2 + usage), so a mis-invocation cannot silently pass:**
 
-    tests/norec_enum.py  BINARY --depth 3      # positional
-    tests/norec_sweep.py BINARY                # positional
-    tests/nested_fuzz.py --mylang BINARY --count 300
-    tests/myv_fuzz.py    BINARY [--triage]     # positional
-    tests/corpus_diff.sh BINARY [--levers|--cold|--xrot|--nolowmem]
+    tests/norec_enum  BINARY --depth 3      # positional
+    tests/norec_sweep BINARY                # positional
+    tests/nested_fuzz --mylang BINARY --count 300
+    tests/myv_fuzz    BINARY [--triage]     # positional
+    tests/corpus_diff BINARY [--levers|--cold|--xrot|--nolowmem]
 
 **RULE B1 REMINDER for any perf run:** `rm -rf build` first, pass
 `--mylang build-claude/<lane>/mylang` AND `--baseline` explicitly, read

@@ -8,7 +8,7 @@
 # the JIT alike, while the tree-walker read the real fields. Found by the
 # #54 -nc audit (an un-folded `var pts = []` was built general).
 #
-# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff.sh).
+# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff).
 
 struct P { int x; float f; bool b; }
 

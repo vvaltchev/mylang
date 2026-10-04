@@ -2214,7 +2214,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
              * first call to it walked do_func_call's tree-walker arm into a
              * null dereference. A debug build caught it on the ML_CHECK
              * there; an ASSERTS=0 release, where that check is compiled
-             * away, SEGFAULTED. Found by tests/myv_fuzz.py, and it is
+             * away, SEGFAULTED. Found by tests/myv_fuzz, and it is
              * precisely the failure #137's hardening exists to make
              * impossible: a corrupt image must be REFUSED, never obeyed.
              *

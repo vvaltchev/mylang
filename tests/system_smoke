@@ -25,7 +25,7 @@ Non-deterministic pairs (rand*) are skipped; samples/ is skipped (its
 scripts are the interactive human showcase - they read stdin and take argv
 in their own way, not a fixed scale). Stdlib only.
 
-    tests/system_smoke.py ./mylang
+    tests/system_smoke ./mylang
 
 Exit 0 if everything passed, 1 otherwise.
 """

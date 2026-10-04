@@ -3,7 +3,7 @@
 # bind is the deepest of the tiers - its JIT helper conveys the
 # OutOfBoundsEx through a status return and the interpreter stamps the
 # container's caret itself - and it runs warmed (three calls) before the
-# one that is not caught. tests/bt_oracle.py compares the whole
+# one that is not caught. tests/bt_oracle compares the whole
 # output, stderr included.
 
 struct P { int x; int y; }

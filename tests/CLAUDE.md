@@ -6,26 +6,42 @@ traps, APIs. The root CLAUDE.md holds the project-wide testing rules
 (the INSTRUMENTS list, THE VACUOUS-TEST TRAP, Testing an AST TRANSFORM,
 the INT_TESTS section); read those first.
 
+## Layout
+
+- Every program in tests/ (and the test tools in scripts/) has NO
+  extension, mode 755 and a shebang: people run `tests/nested_fuzz`, not
+  `python3 tests/nested_fuzz.py` (maintainer-set, 2026-10-04). A new tool
+  follows suit - `git add --chmod=+x` if the mode does not stick.
+- Library code lives in tests/lib/ and keeps `.py` (Python cannot import
+  an extensionless file): testrun.py (progress, resume), testjobs.py
+  (core counts, the idle re-exec), intcov.py (`mylang -v`, the coverage
+  universe). A tool reaches it with
+  `sys.path.insert(0, os.path.join(<dir of __file__>, "lib"))`. Never
+  import one tool from another: move the shared code into tests/lib.
+- Data directories: functional/, int/ (and int/repl/), backtrace/ (the
+  bt_oracle programs - renamed from bt_oracle/ because a file and a
+  directory cannot share the tool's name).
+
 ## Rules (maintainer-set)
 
 - **Hour-scale runs go to a MANUAL CI workflow** (workflow_dispatch:
   int-deep.yml, mutate.yml), never the local machine for hours, never
   per-push CI. Locally, check a long tool on a tiny input only
-  (mutate.py --count 2, int_enum on one program). Dispatching is the
+  (mutate --count 2, int_enum on one program). Dispatching is the
   maintainer's call unless he asked.
 - **State the cost before starting anything multi-minute**, and pick the
   smallest run that answers the question.
 - **Every tool that can run > 1 minute serves its progress** so
-  `tests/testctl.py` lists it with a percentage. A new long tool uses one
+  `tests/testctl` lists it with a percentage. A new long tool uses one
   of: `Run` (independent ordered items, resumable), `Monitor` (phases or a
-  loop), or tests/testmon.py beside a shell tool. No exceptions.
+  loop), or tests/testmon beside a shell tool. No exceptions.
 - **Every tool re-execs at idle priority** (`testjobs.ensure_idle()`
-  first in main; shell tools exec through `tests/jobs.sh run`) and sizes
-  its pool with `testjobs.count()` / `tests/jobs.sh count`.
+  first in main; shell tools exec through `tests/jobs run`) and sizes
+  its pool with `testjobs.count()` / `tests/jobs count`.
 - **Per-push CI stays bounded** (Nets ~18 min). A new per-push step goes
   into a job that is not the long pole, or gets its own parallel job.
 
-## The progress API (tests/testrun.py)
+## The progress API (tests/lib/testrun.py)
 
     from testrun import Run, Monitor
 
@@ -53,27 +69,27 @@ shell that runs the pkill (exit 144, the command dies with it).
 
 ## Where each tool runs in CI
 
-| tool             | per push (job)                    | on demand        |
-|------------------|-----------------------------------|------------------|
-| -rt              | Linux x7, macOS, Windows,         |                  |
-|                  | Coverage, nolowmem x2, spcheck x2 |                  |
-| corpus_diff.sh   | differential, differential-levers |                  |
-|                  | -fuzz, nolowmem, spcheck          |                  |
-| bt_oracle.py     | differential                      |                  |
-| norec_enum/sweep | differential                      |                  |
-| vdjcmp.sh        | differential                      |                  |
-| disasmcheck.py   | disasmcheck x3 (--shard I/3)      |                  |
-| nested_fuzz.py   | differential-levers-fuzz          |                  |
-| myv_fuzz.py      | myv-fuzz (debug-asan, release)    |                  |
-| repl_fuzz.py     | repl-fuzz (RECYCLE + ASan)        |                  |
-| int_run.py       | int (--gcov --require-floor)      |                  |
-| int_enum.py      | int-enum (tiers 1, 2)             | int-deep tier 3  |
-| int_select.py    |                                   | int-deep select  |
-| norec_coverage   | coverage-gate                     |                  |
-| driver_checks.sh | Linux, lto0, nolowmem             |                  |
-| system_smoke.py  | Linux release-smoke               |                  |
-| myv_doc_check.py | Linux                             |                  |
-| mutate.py        |                                   | Mutation         |
+| tool             | per push (job)                    | on demand       |
+|------------------|-----------------------------------|-----------------|
+| -rt              | Linux x7, macOS, Windows,         |                 |
+|                  | Coverage, nolowmem x2, spcheck x2 |                 |
+| corpus_diff      | differential, differential-levers |                 |
+|                  | -fuzz, nolowmem, spcheck          |                 |
+| bt_oracle        | differential                      |                 |
+| norec_enum/sweep | differential                      |                 |
+| vdjcmp           | differential                      |                 |
+| disasmcheck      | disasmcheck x3 (--shard I/3)      |                 |
+| nested_fuzz      | differential-levers-fuzz          |                 |
+| myv_fuzz         | myv-fuzz (debug-asan, release)    |                 |
+| repl_fuzz        | repl-fuzz (RECYCLE + ASan)        |                 |
+| int_run          | int (--gcov --require-floor)      |                 |
+| int_enum         | int-enum (tiers 1, 2)             | int-deep tier 3 |
+| int_select       |                                   | int-deep select |
+| norec_coverage   | coverage-gate                     |                 |
+| driver_checks    | Linux, lto0, nolowmem             |                 |
+| system_smoke     | Linux release-smoke               |                 |
+| myv_doc_check    | Linux                             |                 |
+| mutate           |                                   | Mutation        |
 
 The CI fuzzers take `--seed ${{github.run_id}}` (a re-run keeps it): a
 fixed seed made them a regression corpus. A finding reproduces from the
@@ -86,7 +102,7 @@ Coverage proves a line was REACHED, never that a wrong result there would
 fail a test (`2*x` vs `2+x` agree at x = 2). So:
 
 - never cut a fuzzer or a test on coverage alone - the evidence for a cut
-  is mutation testing (mutate.py: the fuzzers run as the LAST stage, so
+  is mutation testing (mutate: the fuzzers run as the LAST stage, so
   "killed by fuzz" counts what no deterministic test noticed);
 - a test must print or assert VALUES. The int_select shrink oracle is
   agreement with the tree-walker ON THE SHRUNK PROGRAM, so it accepts any
@@ -97,7 +113,7 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
 - a self-check counter (`g_jit_*`, int_hits) proves the PATH ran; the
   value check proves it was right. A test usually needs both.
 
-## int_run.py units (tests/int)
+## int_run units (tests/int)
 
 - `# INT-ENGINES:` names from ENGINE_FLAGS (default tw nj vm nbi noopt),
   `+` joins (`nbi+nj`); engines of one config must print the same stdout,
@@ -116,7 +132,7 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   observe_globals -> wrapped to 80 columns, output checked identical).
   Do not tidy them by hand; regenerate.
 
-## int_select.py
+## int_select
 
 - Coverage collection runs in worker PROCESSES (forkserver): gcov JSON
   parsing is pure Python and the GIL made the threaded pass ~10x slower.
@@ -131,7 +147,7 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   the parse): ~1000 trials for a 450-line program, and a trial can loop
   forever (30 s leash on its reference run).
 
-## mutate.py
+## mutate
 
 - Mutates product .cpp only; skips ML_INT spans, INT-COV-EXEMPT lines,
   int_*/jit_int_*/bc_int_* bodies, #ifdef TESTS / INT_TESTS regions.
@@ -143,14 +159,14 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
 
 ## Adding a test - where
 
-| test of                                | goes in                       |
-|----------------------------------------|-------------------------------|
-| language semantics, an error, a caret  | src/tests.cpp (-rt, 5 modes)  |
-| a JIT/VM shape on every engine/lever   | tests/functional/*.my         |
-| a backtrace across inlining            | tests/bt_oracle/*.my          |
-| a compiler decision via INT hooks      | tests/int/NN_*.my             |
-| the REPL front end                     | tests/int/repl/*.session      |
-| a CLI flag                             | tests/driver_checks.sh        |
+| test of                               | goes in                      |
+|---------------------------------------|------------------------------|
+| language semantics, an error, a caret | src/tests.cpp (-rt, 5 modes) |
+| a JIT/VM shape on every engine/lever  | tests/functional/*.my        |
+| a backtrace across inlining           | tests/backtrace/*.my         |
+| a compiler decision via INT hooks     | tests/int/NN_*.my            |
+| the REPL front end                    | tests/int/repl/*.session     |
+| a CLI flag                            | tests/driver_checks          |
 
 Then: watch it fail against a sabotaged build (commit first, sabotage a
 COPY, rebuild inside the restore - root CLAUDE.md), and if it is a new

@@ -6,7 +6,7 @@
 #
 # ⛔ WHY THIS FILE EXISTS. Until it was written, the ENTIRE corpus
 # (bench/my + samples + tests/functional) emitted this arm ZERO times.
-# So `scripts/vdjcmp.sh` - the oracle for "my emitter change is a pure
+# So `scripts/vdjcmp` - the oracle for "my emitter change is a pure
 # restructuring" - reported 108/108 identical for a change that
 # rewrote every instruction in the arm, and would have reported the
 # same for one that broke it. A tool cannot compare code no program

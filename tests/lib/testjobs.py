@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: BSD-2-Clause
 """
-The Python face of tests/jobs.sh - the ONE definition of the functional
+The Python face of tests/jobs - the ONE definition of the functional
 test tools' worker count and priority. Nothing here computes a number
-or picks a scheduling class itself: it asks jobs.sh, so the formula
+or picks a scheduling class itself: it asks jobs, so the formula
 cannot drift between the shell and the Python tools.
 
     import testjobs
@@ -16,12 +16,12 @@ import subprocess
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_JOBS = os.path.join(_HERE, "jobs.sh")
+_JOBS = os.path.join(os.path.dirname(_HERE), "jobs")
 
 
 def count():
-    """The worker count (tests/jobs.sh count). Falls back to the CPU
-    count only where jobs.sh cannot run at all (no POSIX shell)."""
+    """The worker count (tests/jobs count). Falls back to the CPU
+    count only where jobs cannot run at all (no POSIX shell)."""
     try:
         out = subprocess.run(["sh", _JOBS, "count"], capture_output=True,
                              text=True, check=True).stdout.strip()
@@ -31,7 +31,7 @@ def count():
 
 
 def ensure_idle():
-    """Re-exec the running script through `tests/jobs.sh run`, which
+    """Re-exec the running script through `tests/jobs run`, which
     applies the idle scheduling/I-O class (or its nice fallback) and
     marks MYLANG_TEST_IDLED=1 so this happens once per process tree."""
     if os.environ.get("MYLANG_TEST_IDLED") == "1" or os.name != "posix":

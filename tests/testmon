@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause
 #
-# A PROGRESS MONITOR FOR A SHELL TOOL (tests/testrun.py's Monitor, served
+# A PROGRESS MONITOR FOR A SHELL TOOL (tests/lib/testrun.py's Monitor, served
 # from outside the process doing the work).
 #
-#   tests/testmon.py NAME TOTAL DIR GLOB --pid PID [--phase P]
+#   tests/testmon NAME TOTAL DIR GLOB --pid PID [--phase P]
 #                    [--heartbeat S]
 #
-# Serves NAME's status socket - so `tests/testctl.py` lists it with its
+# Serves NAME's status socket - so `tests/testctl` lists it with its
 # percentage - where `done` is the number of files in DIR matching GLOB:
 # a tool that writes one result file per finished unit of work (as
-# tests/corpus_diff.sh does) gets progress without knowing Python. It
+# tests/corpus_diff does) gets progress without knowing Python. It
 # exits on its own when PID (the tool) is gone, so a tool killed
 # mid-run leaves no monitor behind; the tool should still kill it when
 # done.
@@ -22,7 +22,8 @@ import signal
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib"))
 from testrun import Monitor  # noqa: E402
 
 

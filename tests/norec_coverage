@@ -4,7 +4,7 @@
 NET 4 - the COVERAGE GATE for the G1 no-record tier's walk and
 reconstruction code (SQLite's 100%-coverage discipline, scoped).
 
-    tests/norec_coverage.py --build-dir build-claude/gcov [--run]
+    tests/norec_coverage --build-dir build-claude/gcov [--run]
 
 WHY SCOPED.  Whole-program 100% coverage is not a goal here and never
 will be.  What this gates is the code the no-record tier ADDED - the
@@ -94,13 +94,13 @@ def run_workload(binary, root, verbose):
     tests = os.path.join(root, "tests")
     steps = [
         ("-rt", [binary, "-rt"], {}),
-        ("corpus_diff", [os.path.join(tests, "corpus_diff.sh"), binary], {}),
+        ("corpus_diff", [os.path.join(tests, "corpus_diff"), binary], {}),
         ("corpus_diff --levers",
-         [os.path.join(tests, "corpus_diff.sh"), binary, "--levers"], {}),
+         [os.path.join(tests, "corpus_diff"), binary, "--levers"], {}),
         # Net 3 and Net 2 both run SHADOW as well as production, which is
         # what reaches norec_walk_chain at all.
         ("norec_enum d2",
-         [sys.executable, os.path.join(tests, "norec_enum.py"), binary,
+         [sys.executable, os.path.join(tests, "norec_enum"), binary,
           "--depth", "2", "--reach", "0"], {}),
         # deep enough to cross the sync depth cap, which is the ONLY
         # thing that drives the -3/switch materializer and its shadow
@@ -112,7 +112,7 @@ def run_workload(binary, root, verbose):
          [binary, os.path.join(root, "tests", "functional",
                                "12_deep_switch.my")], {}),
         ("norec_sweep",
-         [sys.executable, os.path.join(tests, "norec_sweep.py"), binary,
+         [sys.executable, os.path.join(tests, "norec_sweep"), binary,
           "--max-events", "12"], {}),
     ]
     for label, argv, env_extra in steps:

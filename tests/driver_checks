@@ -13,7 +13,7 @@
 # the duplicate-decl check - was silently skipped, and `-nr` exited 0 on a
 # program a plain run refuses (#147). Every prover test passed throughout.
 #
-#   tests/driver_checks.sh ./build/mylang
+#   tests/driver_checks ./build/mylang
 #
 # Exit 0 if every check passes, 1 otherwise. POSIX sh, no dependencies.
 
@@ -452,7 +452,7 @@ if command -v python3 >/dev/null 2>&1 && \
 fi
 
 # ⛔ `-vdj` IS REPRODUCIBLE ACROSS PROCESSES - the property
-# scripts/vdjcmp.sh rests on, and the one -rt structurally CANNOT check
+# scripts/vdjcmp rests on, and the one -rt structurally CANNOT check
 # (it runs in-process, so it can only assert the address-free INVARIANT
 # that implies it; see the `-vdj decodes every emitted form` entry).
 #
@@ -461,7 +461,7 @@ fi
 # the invariant check, correct as it was, enumerated WHERE an address
 # could appear and went blind to a new operand form (#97 step 1a's
 # absolute disp32) - after which the dump was non-reproducible and
-# vdjcmp.sh refused every comparison, unread, because nothing in the
+# vdjcmp refused every comparison, unread, because nothing in the
 # battery ran it.
 # ⛔ AND THE GUARD SAYS WHEN IT SKIPS. The first version tested
 # `grep '^jit 1'` against a `-v` line that is actually indented and
@@ -479,7 +479,7 @@ if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
         pass "-vdj: two processes, byte-identical dumps"
     else
         fail "-vdj is NOT reproducible across processes - a baked address
-      reached the text. Every vdjcmp.sh comparison is void until it is
+      reached the text. Every vdjcmp comparison is void until it is
       fixed; run '$BIN -vdj samples/gcd' twice and diff to see it."
     fi
 else
@@ -679,7 +679,7 @@ fi
 # call that reached it (NotLoweredEx: it lowered a call only on a TYPE
 # proof), while the tree-walker ran the program. A flag is the driver's,
 # and no `-rt` entry runs untyped, so the case lives here too (the corpus
-# lane is tests/corpus_diff.sh's `-nti` pass).
+# lane is tests/corpus_diff's `-nti` pass).
 cat > "$TMP/nti.my" <<'NTIEOF'
 struct P { int x; }
 func f(a) { var r = a[0] + 1; return r; }

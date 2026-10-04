@@ -6,15 +6,15 @@ Nothing here is wired into `make` or CI.
 
 | script | what it answers |
 |---|---|
-| `vdjcmp.sh OLD NEW [-v]` | "Did my JIT change alter the emitted machine code at all?" Compares `-vdj` across bench/my + samples + tests/functional. |
+| `vdjcmp OLD NEW [-v]` | "Did my JIT change alter the emitted machine code at all?" Compares `-vdj` across bench/my + samples + tests/functional. |
 | `sabotage.sh FILE OLD NEW [CHECK]` | "Does my new test actually catch the bug it is for?" Applies a defect, rebuilds, runs the check, always restores. |
 
-## `vdjcmp.sh` — the pure-restructuring oracle
+## `vdjcmp` — the pure-restructuring oracle
 
 ```sh
 make -j BUILD_DIR=build-claude/before OPT=1 ASSERTS=0   # at the old commit
 make -j BUILD_DIR=build-claude/after  OPT=1 ASSERTS=0   # with your change
-scripts/vdjcmp.sh build-claude/before/mylang build-claude/after/mylang
+scripts/vdjcmp build-claude/before/mylang build-claude/after/mylang
 ```
 
 Byte-identical emitted code over the whole corpus proves a refactor

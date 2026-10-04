@@ -21,7 +21,7 @@
 #
 # Every loop sits in a function called three times, so the JIT's warmed
 # and frameless tiers run it, not only the first descent.
-# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff.sh), and the
+# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff), and the
 # asserted totals pin the semantics themselves.
 
 struct P { int x; int y; }

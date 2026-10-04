@@ -25,7 +25,7 @@
 # and `-rt` is still 1925/1925 - because storing a reference without
 # releasing the old one is a refcount error, not a value error, until the
 # freed object is reused. So this file earns its keep only when run under
-# the sanitizers: tests/corpus_diff.sh on a debug build, which is what the
+# the sanitizers: tests/corpus_diff on a debug build, which is what the
 # Nets differential lane does. Running it on a release build proves little.
 
 struct P { int x; }

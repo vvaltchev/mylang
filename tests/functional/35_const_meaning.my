@@ -4,7 +4,7 @@
 # `-nc` turns folding off (an optimization), and until #54 it turned the
 # whole parse-time evaluator off with it: this file then failed to compile
 # ("expression is not const", "'P' is not a type") and a nested POD field
-# was stored boxed. tests/corpus_diff.sh compares default vs -nc (RULE 2),
+# was stored boxed. tests/corpus_diff compares default vs -nc (RULE 2),
 # so every line here is also an assertion about -nc.
 
 const K = 3;

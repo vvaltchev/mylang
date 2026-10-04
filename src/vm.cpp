@@ -10581,7 +10581,7 @@ bool g_norec_audit = false;
  * WHAT IT FORCES. Reconstruction is normally demanded only where an
  * exception happens to fall. `MYLANG_RECON_AT=N` demands it at the Nth
  * CALL EVENT instead - one deterministic point per run - and the sweep
- * driver (tests/norec_sweep.py) walks N over a program's whole event
+ * driver (tests/norec_sweep) walks N over a program's whole event
  * count, so every point at which reconstruction COULD be demanded gets
  * exercised, not just the points a corpus happens to reach.
  *

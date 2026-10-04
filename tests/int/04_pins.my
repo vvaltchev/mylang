@@ -64,7 +64,7 @@ assert(pr == 263073);
 # The run's PIN BUDGET is an enumerated decision too (`pin_budget`, #107
 # P3): one instance per run, keyed `<fn>@<run begin pc>/budget`, whose
 # default is the maximum and whose alternatives are every smaller cap -
-# tests/int_enum.py forces each one. Unforced, every run takes the
+# tests/int_enum forces each one. Unforced, every run takes the
 # default, and `hot`'s run has room for at least the three values above.
 func bfield(e, name) {
     var parts = split(e, " ");

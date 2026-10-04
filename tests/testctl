@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause
 #
-# THE CONTROL CLIENT for long-running test tools (tests/testrun.py).
+# THE CONTROL CLIENT for long-running test tools (tests/lib/testrun.py).
 #
-#   tests/testctl.py [list]                   EVERY running test tool, one
+#   tests/testctl [list]                   EVERY running test tool, one
 #                                             line each: its PERCENTAGE,
 #                                             done/total, phase, elapsed,
 #                                             ETA, failures (the default)
-#   tests/testctl.py watch [SECS]             the same, refreshed (Ctrl-C)
-#   tests/testctl.py status   [RUN]           progress, ETA, resume token,
+#   tests/testctl watch [SECS]             the same, refreshed (Ctrl-C)
+#   tests/testctl status   [RUN]           progress, ETA, resume token,
 #                                             what is running right now
-#   tests/testctl.py failures [RUN]           the failures found so far
-#   tests/testctl.py stop     [RUN]           graceful: finish in-flight,
+#   tests/testctl failures [RUN]           the failures found so far
+#   tests/testctl stop     [RUN]           graceful: finish in-flight,
 #                                             checkpoint, print the token
-#   tests/testctl.py pause | resume [RUN]
-#   tests/testctl.py jobs N   [RUN]           change the parallelism
+#   tests/testctl pause | resume [RUN]
+#   tests/testctl jobs N   [RUN]           change the parallelism
 #
 # RUN is a socket path or a substring of one (`int_enum`, a pid); omitted,
 # it is the only live run, or an error naming the candidates.
 #
 # Every long test tool serves a status socket: a resumable `Run` or a
-# `Monitor` (tests/testrun.py). A Monitor answers `status` only.
+# `Monitor` (tests/lib/testrun.py). A Monitor answers `status` only.
 
 import glob
 import json
@@ -29,7 +29,8 @@ import socket
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib"))
 from testrun import runs_dir, fmt_secs, percent_of  # noqa: E402
 
 
@@ -101,7 +102,7 @@ def table():
 def main():
     act = sys.argv[1] if len(sys.argv) > 1 else "list"
     if act in ("-h", "--help", "help"):
-        print(__doc__ if __doc__ else "usage: testctl.py ACTION [RUN]")
+        print(__doc__ if __doc__ else "usage: testctl ACTION [RUN]")
         return 0
     if act == "list":
         print(table())

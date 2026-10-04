@@ -12,7 +12,7 @@
 #     eligible unconditionally.
 # Depth stays under the unarmed cap of 32.
 #
-# This file exists mainly so tests/norec_sweep.py (Net 2) has a case that
+# This file exists mainly so tests/norec_sweep (Net 2) has a case that
 # actually reconstructs a TALL chain: without it the default corpus tops
 # out at a handful of frames, and a sweep that only ever walks 1-2 levels
 # proves very little.

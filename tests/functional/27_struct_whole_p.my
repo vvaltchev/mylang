@@ -8,7 +8,7 @@
 # corpus_diff matrix).
 #
 # ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL: every line is compared
-# against the tree-walker (tests/corpus_diff.sh).
+# against the tree-walker (tests/corpus_diff).
 
 struct P { int x; int y; }
 

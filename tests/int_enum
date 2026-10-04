@@ -3,7 +3,7 @@
 #
 # THE DECISION ENUMERATOR's DRIVER (#107 P3, plans/intrusive-tests.md 4.2).
 #
-#   tests/int_enum.py BINARY [PROGRAM.my ...] [--programs-file F]
+#   tests/int_enum BINARY [PROGRAM.my ...] [--programs-file F]
 #                     [--jobs N] [--resume TOKEN] [--heartbeat S]
 #                     [--failures-out FILE]
 #
@@ -41,8 +41,8 @@
 # legitimately vanish under a deviation; only the deviated one must stay.
 #
 # LONG-RUNNING by nature (71,583 deviations over tests/functional), so it
-# runs through tests/testrun.py: a heartbeat line every minute, a control
-# socket (tests/testctl.py status | stop | jobs N ...) and RESUME - the
+# runs through tests/lib/testrun.py: a heartbeat line every minute, a control
+# socket (tests/testctl status | stop | jobs N ...) and RESUME - the
 # plan is an ordered list, `--resume <mark>@<fp>` skips what a stopped run
 # had finished, and a different binary or input set refuses the token.
 #
@@ -68,7 +68,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "lib"))
 from testrun import Run, fingerprint, file_digest  # noqa: E402
 
 # every ENUMERATED decision site records `<site> key=... n= dflt= pick=`
@@ -81,7 +81,7 @@ APPLIED = re.compile(r'^choose_applied key="([^"]+)" pick=(\d+)')
 
 def jobs_count():
     try:
-        out = subprocess.run([os.path.join(HERE, "jobs.sh"), "count"],
+        out = subprocess.run([os.path.join(HERE, "jobs"), "count"],
                              capture_output=True, text=True, timeout=30)
         return max(1, int(out.stdout.strip()))
     except (OSError, ValueError, subprocess.SubprocessError):

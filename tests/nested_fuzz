@@ -32,7 +32,7 @@ interpreter bug, not a known semantic difference:
     exact.
 
 Usage:
-    python3 tests/nested_fuzz.py [--count 1000] [--max-depth 15]
+    tests/nested_fuzz [--count 1000] [--max-depth 15]
         [--mylang build/mylang] [--seed 1] [--engines tw,vm,py]
         [--keep-failures DIR] [--check-fallbacks] [-v]
 
@@ -47,8 +47,9 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import testjobs  # noqa: E402  (tests/jobs.sh: worker count + idle class)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib"))
+import testjobs  # noqa: E402  (tests/jobs: worker count + idle class)
 from testrun import Monitor  # noqa: E402
 
 # A SMALL modulus keeps every value 2 digits, so the generated code is readable
@@ -605,7 +606,7 @@ def main():
                     help="with --show, force this exact depth (default random)")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--jobs", type=int, default=0,
-                    help="programs checked at once (default: tests/jobs.sh "
+                    help="programs checked at once (default: tests/jobs "
                          "count); the report is identical for any value")
     args = ap.parse_args()
     testjobs.ensure_idle()
@@ -715,13 +716,13 @@ def main():
         # -nti (#51): the codegen lowers a call only on a TYPE proof, so
         # untyped it once refused every surviving user call. These
         # programs are int-only, so typed and untyped must print the same.
-        # Opt-in: tests/corpus_diff.sh's always-on -nti pass is the net.
+        # Opt-in: tests/corpus_diff's always-on -nti pass is the net.
         if "nti" in engines:
             results["vm-nti"] = run([args.mylang, "-vm", "-nti"], my_path)
             results["tw-nti"] = run([args.mylang, "-tw", "-nti"], my_path)
         return results
 
-    # progress: tests/testctl.py lists this run with its percentage
+    # progress: tests/testctl lists this run with its percentage
     mon = Monitor("nested_fuzz", total=args.count, phase="programs")
     with mon, ThreadPoolExecutor(max_workers=jobs) as pool:
         checked = list(pool.map(check, range(args.count)))

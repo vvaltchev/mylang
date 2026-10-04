@@ -4,7 +4,7 @@
 # make it escape must instead leave the escaped element intact, which is
 # what this program checks: each shape keeps elements from DIFFERENT
 # iterations and prints them afterwards. The oracle is the engine
-# differential (tests/corpus_diff.sh): the tree-walker has always reused
+# differential (tests/corpus_diff): the tree-walker has always reused
 # behind its own COW guard.
 struct P { int x; int y; }
 

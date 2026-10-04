@@ -142,7 +142,7 @@ loop. `-dcs` dumps one row per call site
 (`direct`/`one`/`many`/`top`/`none`/`builtin`) plus one `dcs-esc` per
 escaped function; the `infer: the CALLEE-SET analysis` `-rt` entry
 asserts the set per constraint form and a stated ⊤ per sink, plus a
-`driver_checks.sh` case (a new CLI flag - `-rt` cannot see the driver).
+`driver_checks` case (a new CLI flag - `-rt` cannot see the driver).
 INERTNESS PROVEN: `-vd` byte-identical on all 126 corpus programs
 against a HEAD baseline.
 

@@ -9,7 +9,7 @@
 # `sort(K)` of a const array K is left un-folded (#54's audit, via
 # bench/my/52_cse_dedup).
 #
-# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff.sh), which
+# ⛔ THE ORACLE IS THE ENGINE DIFFERENTIAL (tests/corpus_diff), which
 # also fails a program that crashes on both sides.
 
 var dyn s = sort;

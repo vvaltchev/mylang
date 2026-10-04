@@ -1,6 +1,6 @@
 # The NETS lane - the correctness tools that were never wired into CI.
 #
-# Until now CI ran `-rt`, driver_checks.sh and myv_doc_check.py and
+# Until now CI ran `-rt`, driver_checks and myv_doc_check and
 # nothing else, so the project's differential corpus and all four
 # fuzzers only ever ran when someone remembered to run them by hand.
 # That is not theoretical: corpus_diff caught a JIT abort (a mixed-kind
@@ -39,9 +39,9 @@ jobs:
     # tree-walker vs the default engine over tests/functional + samples
     - name: corpus_diff
       working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang
+      run: $GITHUB_WORKSPACE/tests/corpus_diff ./mylang
 
-    # ⛔ AND IS IT REPRODUCIBLE? vdjcmp.sh's SELF-TEST - one binary
+    # ⛔ AND IS IT REPRODUCIBLE? vdjcmp's SELF-TEST - one binary
     # against ITSELF over the whole corpus - is what makes every
     # "emitted code byte-identical" claim mean anything, and until
     # 2026-08-27 it ran ONLY when someone remembered to. It did not go
@@ -53,7 +53,7 @@ jobs:
     # one is that it fires without being asked.
     - name: "vdjcmp self-test: -vdj is reproducible"
       working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/scripts/vdjcmp.sh ./mylang ./mylang
+      run: $GITHUB_WORKSPACE/scripts/vdjcmp ./mylang ./mylang
 
     # #38 repro B: with inlining ON, every CLI configuration (the JIT
     # levers, the splice off, a .myv image, --no-opt all) must render
@@ -61,21 +61,21 @@ jobs:
     # cannot see a frame the inliner loses: it is lost in every engine.
     - name: "bt_oracle: inlining never changes a backtrace"
       working-directory: ${{github.workspace}}/build
-      run: python3 $GITHUB_WORKSPACE/tests/bt_oracle.py ./mylang
+      run: $GITHUB_WORKSPACE/tests/bt_oracle ./mylang
 
     # Net 3: every program in a bounded shape space, four engines,
     # compared byte-for-byte. Depth 3 here (480 programs); the full
     # depth-4 space (2272) is a manual run.
     - name: "Net 3: small-scope enumeration (depth 3)"
       working-directory: ${{github.workspace}}/build
-      run: python3 $GITHUB_WORKSPACE/tests/norec_enum.py ./mylang
+      run: $GITHUB_WORKSPACE/tests/norec_enum ./mylang
            --depth 3 --reach 0
 
     # Net 2: force a frame reconstruction at the Nth call event, one
     # process per N, in shadow AND production.
     - name: "Net 2: deterministic event sweep"
       working-directory: ${{github.workspace}}/build
-      run: python3 $GITHUB_WORKSPACE/tests/norec_sweep.py ./mylang
+      run: $GITHUB_WORKSPACE/tests/norec_sweep ./mylang
            --max-events 25
 
   # ---------------------------------------------------------------- #
@@ -101,7 +101,7 @@ jobs:
     # the same corpus with each JIT lever forced off, one at a time
     - name: corpus_diff --levers
       working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --levers
+      run: $GITHUB_WORKSPACE/tests/corpus_diff ./mylang --levers
 
     # random deep-nested programs against a CPython twin, all engines.
     # A FRESH SEED PER RUN (the run id; a re-run keeps it): with a fixed
@@ -110,7 +110,7 @@ jobs:
     # with it. All three fuzzers here do this.
     - name: nested_fuzz
       working-directory: ${{github.workspace}}/build
-      run: python3 $GITHUB_WORKSPACE/tests/nested_fuzz.py
+      run: $GITHUB_WORKSPACE/tests/nested_fuzz
            --mylang ./mylang --count 250 --seed ${{github.run_id}}
 
   # ---------------------------------------------------------------- #
@@ -151,7 +151,7 @@ jobs:
 
     - name: "disasm: every emitted instruction agrees with objdump"
       working-directory: ${{github.workspace}}/build
-      run: python3 $GITHUB_WORKSPACE/scripts/disasmcheck.py ./mylang
+      run: $GITHUB_WORKSPACE/scripts/disasmcheck ./mylang
            --matrix --shard ${{matrix.shard}}/3
 
   # ---------------------------------------------------------------- #
@@ -237,11 +237,11 @@ jobs:
     # has no JIT, so this is tw vs the register-form emission
     - name: corpus_diff --nolowmem
       working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --nolowmem
+      run: $GITHUB_WORKSPACE/tests/corpus_diff ./mylang --nolowmem
 
     - name: driver_checks
       working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/driver_checks.sh ./mylang
+      run: $GITHUB_WORKSPACE/tests/driver_checks ./mylang
 
   # ---------------------------------------------------------------- #
   # THE STACK-ALIGNMENT GROUND TRUTH (SP2/SP3). System V requires
@@ -298,11 +298,11 @@ jobs:
 
     - name: corpus_diff --spcheck
       working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/corpus_diff.sh ./mylang --spcheck
+      run: $GITHUB_WORKSPACE/tests/corpus_diff ./mylang --spcheck
 
   # ---------------------------------------------------------------- #
   # THE INTRUSIVE TESTS (#107, plans/intrusive-tests.md). An INT_TESTS
-  # build runs tests/int_run.py (-rt, every tests/int program under both
+  # build runs tests/int_run (-rt, every tests/int program under both
   # engines, and the site census: a site no run reached fails). Plus the
   # NON-PERTURBATION check: the INT build must emit byte-identical
   # bytecode and machine code to a plain TESTS build of the same commit -
@@ -334,14 +334,14 @@ jobs:
         ./build-tests/mylang -v | grep -q '^  int_tests  *0'
 
     - name: "non-perturbation: INT emits what TESTS emits"
-      run: scripts/vdjcmp.sh ./build-tests/mylang ./build-int/mylang
+      run: scripts/vdjcmp ./build-tests/mylang ./build-int/mylang
 
     # The suite, the site census and the coverage universe in ONE pass:
     # every unit must own an element, and the uncovered count may not
     # exceed this compiler's line in tests/int/coverage-floor.txt.
-    - name: tests/int_run.py --gcov
+    - name: tests/int_run --gcov
       run: |
-        tests/int_run.py ./build-int/mylang --gcov --require-floor \
+        tests/int_run ./build-int/mylang --gcov --require-floor \
                          --report int-coverage.txt
     - name: Upload the coverage report
       if: always()
@@ -351,7 +351,7 @@ jobs:
         path: int-coverage.txt
 
     - name: driver_checks
-      run: MYLANG_EXPECT_INT_TESTS=1 sh tests/driver_checks.sh ./build-int/mylang
+      run: MYLANG_EXPECT_INT_TESTS=1 sh tests/driver_checks ./build-int/mylang
 
   # ---------------------------------------------------------------- #
   # The #107 P3 DECISION ENUMERATOR, tier 1: every legal alternative of
@@ -380,9 +380,9 @@ jobs:
     # tests/functional plus samples/ - minus phonebook and shopping
     # (stdin-driven: with no input they reach no decision) and rand_sort
     # (its output is random). bench/ is NOT a correctness corpus.
-    - name: tests/int_enum.py (tier 1, tests/functional + samples)
+    - name: tests/int_enum (tier 1, tests/functional + samples)
       run: |
-        python3 tests/int_enum.py ./build-enum/mylang --heartbeat 60 \
+        tests/int_enum ./build-enum/mylang --heartbeat 60 \
                 --failures-out int-enum-failures.txt \
                 tests/functional/*.my samples/fib samples/gcd samples/loop \
                 samples/primes samples/primes2 samples/strloop
@@ -390,9 +390,9 @@ jobs:
     # scope (one JIT run's choices, one caller's inlining sites) - ~3k
     # runs. Tier 3 (the pairwise covering arrays of the larger scopes,
     # ~110k runs) is on demand: .github/workflows/int-deep.yml.
-    - name: tests/int_enum.py (tier 2, the same corpus)
+    - name: tests/int_enum (tier 2, the same corpus)
       run: |
-        python3 tests/int_enum.py ./build-enum/mylang --tier 2 \
+        tests/int_enum ./build-enum/mylang --tier 2 \
                 --heartbeat 60 --failures-out int-enum-failures-t2.txt \
                 tests/functional/*.my samples/fib samples/gcd samples/loop \
                 samples/primes samples/primes2 samples/strloop
@@ -421,7 +421,7 @@ jobs:
             exit 1
           fi
         done
-        python3 scripts/disasmcheck.py ./build-enum/mylang \
+        scripts/disasmcheck ./build-enum/mylang \
                 --only tests/functional \
                 --env "MYLANG_INT_CHOOSE=$C1" \
                 --env "MYLANG_INT_CHOOSE=$C2" \
@@ -458,7 +458,7 @@ jobs:
 
     - name: myv_fuzz
       working-directory: ${{github.workspace}}/build
-      run: python3 $GITHUB_WORKSPACE/tests/myv_fuzz.py ./mylang -n 400
+      run: $GITHUB_WORKSPACE/tests/myv_fuzz ./mylang -n 400
            --seed ${{github.run_id}} --save $GITHUB_WORKSPACE/myv-fuzz-bad
 
     # a finding cannot be regenerated from a seed - an image embeds its
@@ -492,7 +492,7 @@ jobs:
       run: cmake --build . -j
     - name: repl_fuzz
       working-directory: ${{github.workspace}}/build
-      run: python3 $GITHUB_WORKSPACE/tests/repl_fuzz.py ./mylang -n 400
+      run: $GITHUB_WORKSPACE/tests/repl_fuzz ./mylang -n 400
            --seed ${{github.run_id}} --save $GITHUB_WORKSPACE/repl-fuzz-bad
     - name: Upload findings
       if: failure()
@@ -527,6 +527,6 @@ jobs:
       working-directory: ${{github.workspace}}/build
       run: cmake --build . -j
     - name: "Net 4: no-record coverage ratchet"
-      run: python3 $GITHUB_WORKSPACE/tests/norec_coverage.py
+      run: $GITHUB_WORKSPACE/tests/norec_coverage
            --build-dir ${{github.workspace}}/build --run
            --min-lines 70 --min-branches 55

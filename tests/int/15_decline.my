@@ -4,7 +4,7 @@
 # INT test (#107 P7): every guarded tier's DECLINE is an enumerated
 # decision (`decline_choice`, key `<run>/<guard>@<pc>#<k>`) - pick 1
 # sends that one site to its slow tier for every value, which must
-# change nothing. tests/int_enum.py's tier 1 forces each site of the
+# change nothing. tests/int_enum's tier 1 forces each site of the
 # corpus in turn; this program reads the events and its second
 # configuration forces the boxed element read's bounds decline.
 

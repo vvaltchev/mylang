@@ -163,7 +163,7 @@ rc=0
 build-claude/adm-real/mylang -rt > "$TMP/rt.log" 2>&1 || rc=1
 echo "  -rt         : $(grep -oE 'Tests passed: [0-9/]+ \[ [A-Z]+ \]' "$TMP/rt.log" \
                        || echo 'ABORTED')"
-cd_out=$(tests/corpus_diff.sh build-claude/adm-real/mylang 2>&1 | tail -1)
+cd_out=$(tests/corpus_diff build-claude/adm-real/mylang 2>&1 | tail -1)
 echo "  corpus_diff :$cd_out"
 echo "$cd_out" | grep -q "agree" || rc=1
 echo "$cd_out" | grep -qE "^ *plain +([0-9]+)/\1 agree" || rc=1
