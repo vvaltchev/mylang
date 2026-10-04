@@ -39651,6 +39651,78 @@ static bool jit_mul_strength_check()
  * pin the classifier's rule for an UNKNOWN form (its first operand is
  * written), which is what keeps a new non-writing form loud.
  */
+/*
+ * MYLANG_VDJ_RAW (disasmcheck's operand comparison) renders each operand
+ * the way objdump states it. The expectations are objdump's, for the same
+ * bytes (`objdump -D -b binary -mi386:x86-64 -M intel`), in RAW's spelling
+ * (no `QWORD PTR`, `byte` for a byte memory operand, an explicit +0x0):
+ * the register names at their encoded width, the base/index/scale/disp of
+ * every memory form, an immediate's value, a branch's fragment offset.
+ */
+static bool vdj_raw_rendering()
+{
+    struct Case { const char *hex; const char *want; };
+    static const Case cases[] = {
+        { "4889c8", "mov rax, rcx" },
+        { "89c8", "mov eax, ecx" },
+        { "6689c8", "mov ax, cx" },
+        { "88c8", "mov al, cl" },
+        { "4088f0", "mov al, sil" },
+        { "4488c0", "mov al, r8b" },
+        { "488b4310", "mov rax, [rbx+0x10]" },
+        { "488b43f0", "mov rax, [rbx-0x10]" },
+        { "4a8d0426", "lea rax, [rsi+r12*1+0x0]" },
+        { "488d04c510000000", "lea rax, [rax*8+0x10]" },
+        { "488b042578563412", "mov rax, [0x12345678]" },
+        { "488b0510000000", "mov rax, [rip+0x10]" },
+        { "c60005", "mov byte [rax+0x0], 0x5" },
+        { "4883ec08", "sub rsp, 0x8" },
+        { "48d3e0", "shl rax, cl" },
+        { "f20f10c1", "movsd xmm0, xmm1" },
+        { "f2440f10d9", "movsd xmm11, xmm1" },
+        { "0fb6c1", "movzx eax, cl" },
+        { "480fb600", "movzx rax, byte [rax+0x0]" },
+        { "48c7c0fbffffff", "mov rax, -0x5" },
+        { "e910000000", "jmp 0x15" },
+        { "e800000000", "call 0x5" },
+        { "7405", "je 0x7" },
+        { "b805000000", "mov eax, 0x5" },
+        { "488b4330", "mov rax, [rbx+0x30]" },
+        { "488b4318", "mov rax, [rbx+0x18]" },
+    };
+    const bool saved = g_vdj_raw;
+    g_vdj_raw = true;
+    bool ok = true;
+    for (const Case &c : cases) {
+        std::vector<uint8_t> b;
+        for (const char *h = c.hex; h[0] && h[1]; h += 2)
+            b.push_back(static_cast<uint8_t>(
+                std::stoi(std::string(h, 2), nullptr, 16)));
+        uint32_t p = 0;
+        DecodedIns d;
+        decode_ins(b.data(), static_cast<uint32_t>(b.size()), p, d);
+        const std::string got = render_ins_for_test(d);
+        if (!d.ok || p != b.size() || got != c.want) {
+            std::cout << "  vdj-raw [" << c.hex << "]: got `" << got
+                      << "` (" << p << " of " << b.size()
+                      << " bytes), objdump says `" << c.want << "`\n";
+            ok = false;
+        }
+    }
+    // an operand kind the decoder never produces renders as a marker,
+    // never as an empty string that would line up with objdump by luck
+    DecodedIns none;
+    none.mn = "nop";
+    none.n = 1;
+    if (render_ins_for_test(none) != "nop ?") {
+        std::cout << "  vdj-raw: a None operand rendered `"
+                  << render_ins_for_test(none) << "`\n";
+        ok = false;
+    }
+    g_vdj_raw = saved;
+    return ok;
+}
+
 static bool regtrack_gp_write_classifier()
 {
     enum : uint32_t {
@@ -50648,6 +50720,9 @@ static const std::vector<extra_check> extra_checks =
       jit_reg_model },
     { "jit: REGTRACK's write classifier answers what the ISA says, "
       "for every form it distinguishes", regtrack_gp_write_classifier },
+    { "disasm: MYLANG_VDJ_RAW renders every operand as objdump states it "
+      "(register widths, memory forms, immediates, branch targets)",
+      vdj_raw_rendering },
     { "jit: REGTRACK's failure arms each name a deliberately wrong "
       "emission (recorded, not aborted)", regtrack_failure_arms },
     { "jit: the CALLER-SAVED pin extension r10/r11 - engages on a "

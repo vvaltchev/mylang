@@ -85,8 +85,16 @@ them means anything:**
 - **`-vdj`** (disasm.cpp) - what machine code was emitted. Oracle:
   **`scripts/disasmcheck.py`**, which cross-checks EVERY emitted
   instruction against **objdump** - both the BOUNDARIES (a wrong length
-  desynchronises the rest of the fragment), the mnemonics and the xmm
-  registers; plus the
+  desynchronises the rest of the fragment), the mnemonics, and EVERY
+  OPERAND - register names (GP and xmm) at their encoded width, memory
+  base/index/scale/displacement, immediates, targets - read from a
+  second dump under **`MYLANG_VDJ_RAW=1`**, which renders operands as
+  objdump does (a slot as `[rbx+0x30]`, a temp's real register, digits
+  for baked addresses). That is the TOOL rendering differently, not a
+  regex in the checker; it is non-reproducible by construction like
+  `MYLANG_VDJ_HEX`, and the default dump does not change. Its first run
+  found the SIB arm dropping an r12 INDEX (100b + REX.X) - right
+  mnemonic, wrong address - which every earlier layer passed; plus the
   self-report `DUMP IS UNRELIABLE` and the `-rt` entry
   `jit: -vdj decodes every emitted form, address-free`.
   **⛔ THE SELF-REPORT IS NOT ENOUGH AND CANNOT BE.** It counts `.byte`
@@ -99,13 +107,14 @@ them means anything:**
   claiming a length it had not earned. **Every "I do not know" path in
   `decode_one` must end at the single `undecoded:` label**; adding a
   new one that prints a placeholder re-opens the hole. Current status:
-  13,268,805 instructions over the corpus x both arenas x 16 pin
-  rotations x 5 pin budgets, ZERO disagreements; `--env K=V` adds a
-  configuration (a forced `MYLANG_INT_CHOOSE` pick is the only way to
-  reach the xmm8-15 SSE forms - `pxor` was undecoded there and in the
-  default run alike until 2026-10-02). `MYLANG_VDJ_HEX=1`
-  puts the raw bytes in the dump, which is what makes the check
-  possible.
+  13,268,805 instructions (21,571,485 operands) over the corpus x both
+  arenas x 16 pin rotations x 5 pin budgets, ZERO disagreements;
+  `--env K=V` adds a configuration (a forced `MYLANG_INT_CHOOSE` pick is
+  the only way to reach the xmm8-15 SSE forms - `pxor` was undecoded
+  there and in the default run alike until 2026-10-02; the int-enum CI
+  job runs three such picks, guarded to still land in r8-r15/xmm8-15).
+  `MYLANG_VDJ_HEX=1` puts the raw bytes in the dump, which is what
+  makes the check possible.
   **⛔ THE SAME DECODER IS NOW REGTRACK's GROUND TRUTH (2026-10-02):**
   every ASSERTS build decodes every byte the JIT emits
   (`Emitter::trk_scan_writes`) and aborts on an undecodable byte or
