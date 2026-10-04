@@ -410,8 +410,16 @@ assertions on values.
   leftover: a program's function chunks outlived it in the process-global
   chunk map (keyed by its freed descriptors, holding its constants) -
   `~VmProgram` erases them now. Watched: a frame release skipping
-  closures fails 12_census, 02_splice and 14 corpus runs. The VM STATE
-  CHECKER is next.
+  closures fails 12_census, 02_splice and 14 corpus runs.
+  **The VM STATE CHECKER, first increment (2026-10-03):** every op of
+  every INT run (no switch - a never-taken branch at every dispatch
+  would join the coverage universe) checks the frame: no reference in a
+  slot outside `ref_slots`, a `borrowed` slot holds a non-slice
+  reference. -rt (all five modes), the corpus x 3 engines and all 83,213
+  enumerator deviations pass it. Watched: the #78 catch-bind gap
+  reintroduced aborts at its pc. NOT built yet: the proven-type check
+  (`th` / `proven_type` against the slot's tag), live-slice registration,
+  refcount sanity.
 - **P5 - JIT preserving probe stub** + the per-op register map.
 - **P6 - chunk hook + assembler**; build the three splice-gate tests.
 - **P7 - per-site forcing sweep.**
