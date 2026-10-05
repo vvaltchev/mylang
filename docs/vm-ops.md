@@ -1354,7 +1354,8 @@ then the VM marked the member), and the INC-DEC loc for
 same `incdec_sites` entry). Both cover a
 proven-struct NON-numeric member
 too (`s.name++` on a str field → `TypeError`, `th != i/f` so it isn't the M8
-`StoreMemberV` path). An optional `d?.f++` still falls back (rare).
+`StoreMemberV` path). An optional `d?.f++` never reaches the codegen: the
+parser refuses an optional member as an assignment or inc-dec target.
 
 **Non-tail block-body inline (`InlinedCallExpr`) → native.** A `y = f(args)`
 whose block-bodied `f` inlined with a residual that couldn't collapse to a
