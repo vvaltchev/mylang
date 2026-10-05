@@ -35,15 +35,49 @@ def alive(pid):
         return False
 
 
+DESCRIPTION = """\
+Serve the progress of a SHELL test tool, so tests/testctl lists it with a
+percentage like any Python tool.
+
+A Python tool reports its own progress through tests/lib/testrun.py. A
+shell tool cannot, so it starts testmon beside itself: testmon counts the
+files in DIR that match GLOB - one result file per finished unit of work -
+and serves NAME's status socket with that count as `done` out of TOTAL. It
+exits by itself when the watched process (--pid) is gone; the tool should
+still kill it when it finishes."""
+
+EPILOG = """\
+testmon serves progress; tests/testctl reads it. testctl is the one you
+run by hand (it lists every tool, testmon's included); testmon is started
+by a shell tool, never by a person.
+
+example (from tests/corpus_diff, which leaves one .rc file per unit):
+  tests/testmon corpus_diff "$TOTAL" "$RES" '*.rc' --pid $$ --phase runs &
+  MON=$!
+  ...                              # the work
+  kill $MON"""
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("name")
-    ap.add_argument("total", type=int)
-    ap.add_argument("dir")
-    ap.add_argument("pattern")
-    ap.add_argument("--pid", type=int, required=True)
-    ap.add_argument("--phase", default=None)
-    ap.add_argument("--heartbeat", type=float, default=60.0)
+    ap = argparse.ArgumentParser(
+        prog="testmon", description=DESCRIPTION, epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("name", metavar="NAME",
+                    help="the tool's name, as testctl shows it")
+    ap.add_argument("total", type=int, metavar="TOTAL",
+                    help="how many result files mean 100%%")
+    ap.add_argument("dir", metavar="DIR",
+                    help="the directory the result files appear in")
+    ap.add_argument("pattern", metavar="GLOB",
+                    help="which files in DIR count (quote it: '*.rc')")
+    ap.add_argument("--pid", type=int, required=True,
+                    help="the tool's pid: testctl shows it, and testmon "
+                         "exits when it is gone")
+    ap.add_argument("--phase", default=None,
+                    help="a phase name for testctl's PHASE column")
+    ap.add_argument("--heartbeat", type=float, default=60.0, metavar="S",
+                    help="print a progress line to stderr every S seconds "
+                         "(default 60)")
     args = ap.parse_args()
     # `kill` from the tool must still remove the socket (the with below)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))

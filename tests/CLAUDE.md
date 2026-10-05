@@ -120,6 +120,15 @@ pid, phase, percent, done, total, elapsed_s, eta_s, eta, failures,
 current (+ extras via set_extra). Sockets live in $XDG_RUNTIME_DIR/
 mylang-tests; testctl unlinks stale ones.
 
+testctl is the CLIENT a person runs (list, watch, status, failures,
+stop, pause, resume, jobs N; `tests/testctl -h`); testmon is a SERVER a
+shell tool starts beside itself - a Monitor whose `done` is a count of
+result files (`tests/testmon -h`, with corpus_diff's call as the
+example). testctl's listing sizes every column to its content, wraps
+NOW under itself (or onto its own lines below NOW_MIN free columns),
+drops PID / ELAPSED / DONE on a very narrow terminal, and colors only a
+TTY without NO_COLOR - no line may exceed the terminal width.
+
 **Kill a tool by an ANCHORED pattern** (`ps -eo pid,args | awk '$2 ==
 "python3" && $3 == "tests/x.py"'`): `pkill -f x.py` also matches the
 shell that runs the pkill (exit 144, the command dies with it).

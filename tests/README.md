@@ -387,15 +387,27 @@ any terminal:
 
     $ tests/testctl
 
-prints one line per running tool:
+prints one row per running tool: its percentage, done/total, phase,
+elapsed time, ETA, failures so far, and what it is working on now (NOW):
 
-    TOOL             PID      %  DONE/TOTAL  PHASE   ELAPSED     ETA  FAIL
-    int_run       790151  42.2%       19/45  units     2m10s   2m58s     0
-    corpus_diff   764141  74.7%     361/483  runs      0m03s   0m01s     0
+    TOOL           PID     %    DONE PHASE ELAPSED   ETA FAIL
+    int_run     790151 42.2%   19/45 units   2m10s 2m58s    0
+        tests/int/12_census.my under -nj
+    corpus_diff 764141 74.7% 361/483 runs    0m03s 0m01s    0
+
+Each column is as wide as its content, so the listing fits the terminal.
+On a wide terminal NOW is the last column, its text wrapped beneath
+itself; on a narrow one it moves to lines of its own, as above, and a very
+narrow terminal drops PID, ELAPSED and DONE. On a terminal it is in color
+(NO_COLOR=1 turns that off).
 
 To keep it on screen, refreshed every two seconds:
 
     $ tests/testctl watch
+
+Every command, and what RUN means, is in
+
+    $ tests/testctl -h
 
 The same numbers appear in each tool's own output as a heartbeat line
 every minute, which is also what you see in a CI log.

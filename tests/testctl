@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
 # THE CONTROL CLIENT for long-running test tools (tests/lib/testrun.py).
+# `tests/testctl -h` is the full usage; in short:
 #
 #   tests/testctl [list]                   EVERY running test tool, one
-#                                             line each: its PERCENTAGE,
+#                                             row each: its PERCENTAGE,
 #                                             done/total, phase, elapsed,
-#                                             ETA, failures (the default)
+#                                             ETA, failures, what it is on
+#                                             now (the default)
 #   tests/testctl watch [SECS]             the same, refreshed (Ctrl-C)
 #   tests/testctl status   [RUN]           progress, ETA, resume token,
 #                                             what is running right now
@@ -21,17 +23,71 @@
 #
 # Every long test tool serves a status socket: a resumable `Run` or a
 # `Monitor` (tests/lib/testrun.py). A Monitor answers `status` only.
+#
+# The listing fits the terminal: each column is as wide as its content
+# (PHASE and TOOL capped), the NOW text wraps onto continuation lines
+# under its own column (or onto lines of its own when the terminal leaves
+# it too little room), and a very narrow terminal loses PID, ELAPSED and
+# DONE first. Colors only on a terminal, and never with NO_COLOR set.
 
+import argparse
 import glob
 import json
 import os
+import shutil
 import socket
 import sys
+import textwrap
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "lib"))
 from testrun import runs_dir, fmt_secs, percent_of  # noqa: E402
+
+USAGE = """\
+%(prog)s [list]
+       %(prog)s watch [SECS]
+       %(prog)s status | failures | stop | pause | resume [RUN]
+       %(prog)s jobs N [RUN]"""
+
+DESCRIPTION = """\
+Show and steer the long-running test tools (tests/lib/testrun.py).
+
+Every test tool that can run for more than a minute serves its progress on
+a status socket. With no command, testctl lists them all, one row each:
+the percentage, done/total, the phase, elapsed time, ETA, failures so far
+and what it is working on now."""
+
+EPILOG = """\
+RUN names one tool's socket: a path, or any substring of one - the tool's
+name (int_enum) or its pid. Omitted, it is the only running tool, or an
+error that lists the candidates.
+
+status and failures work on every tool. stop, pause, resume and jobs work
+only on a resumable run (int_enum, int_select's exploration, mutate): a
+stopped run prints a resume token, which the tool takes back with
+--resume. A Monitor (int_run, the fuzzers, tests/run, a shell tool
+watched by tests/testmon) answers status only.
+
+examples:
+  $ tests/testctl                  # one row per running tool
+  $ tests/testctl watch 5          # the same, every 5 seconds
+  $ tests/testctl status int_enum
+  $ tests/testctl jobs 4 int_enum  # newly dispatched items use 4 workers
+  $ tests/testctl stop int_enum    # finish what is in flight, print token
+
+Colors are used on a terminal unless NO_COLOR is set; the listing wraps to
+the terminal's width (or $COLUMNS)."""
+
+# the widest a TOOL or PHASE cell gets before it is cut
+TOOL_CAP = 14
+PHASE_CAP = 10
+# below this many columns the NOW text moves to lines of its own
+NOW_MIN = 30
+# the most lines one row's NOW text may take
+NOW_LINES = 4
+# on a terminal too narrow for every column, these go first, in order
+DROP_ORDER = ("pid", "elapsed", "done")
 
 
 def live_runs():
@@ -72,7 +128,33 @@ def ask(path, req):
     return resp
 
 
-def table():
+def use_color():
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def paint(text, code, on):
+    return "\033[%sm%s\033[0m" % (code, text) if on and code else text
+
+
+def cut(text, width):
+    return text if len(text) <= width else text[:width - 1] + "~"
+
+
+def wrap_now(text, width):
+    """The NOW text as lines of at most `width` columns, NOW_LINES at most
+    (the last one ending in `...` when something was dropped)."""
+    lines = textwrap.wrap(text, width=width, break_on_hyphens=False) or [""]
+    if len(lines) > NOW_LINES:
+        lines = lines[:NOW_LINES]
+        last = lines[-1]
+        lines[-1] = (last[:width - 3] if len(last) > width - 3
+                     else last) + "..."
+    return lines
+
+
+def table(width=None, color=False):
+    if width is None:
+        width = shutil.get_terminal_size((100, 24)).columns
     rows = []
     for r in live_runs():
         try:
@@ -82,49 +164,137 @@ def table():
         rows.append(st)
     if not rows:
         return "no test tool is running"
-    out = ["%-12s %7s %6s %13s  %-14s %9s %9s %5s  %s"
-           % ("TOOL", "PID", "%", "DONE/TOTAL", "PHASE", "ELAPSED",
-              "ETA", "FAIL", "NOW")]
+
+    # the plain text of every cell; the colors go on after padding, so
+    # the escape codes never count toward a width
+    cells = []
     for st in rows:
-        cur = st.get("current") or ", ".join(st.get("running", [])[:2])
-        out.append("%-12s %7d %5.1f%% %13s  %-14s %9s %9s %5d  %s" % (
-            st["name"][:12], st["pid"],
-            st.get("percent", percent_of(st.get("done", 0),
-                                         st.get("total", 0))),
-            "%d/%d" % (st.get("done", 0), st.get("total", 0)),
-            (st.get("phase") or "-")[:14],
-            fmt_secs(st.get("elapsed_s")),
-            st.get("eta") or fmt_secs(st.get("eta_s")),
-            st.get("failures", 0), (cur or "")[:60]))
+        fails = st.get("failures", 0)
+        cells.append({
+            "tool": cut(st["name"], TOOL_CAP),
+            "pid": str(st["pid"]),
+            "pct": "%.1f%%" % st.get("percent", percent_of(
+                st.get("done", 0), st.get("total", 0))),
+            "done": "%d/%d" % (st.get("done", 0), st.get("total", 0)),
+            "phase": cut(st.get("phase") or "-", PHASE_CAP),
+            "elapsed": fmt_secs(st.get("elapsed_s")),
+            "eta": st.get("eta") or fmt_secs(st.get("eta_s")),
+            "fail": str(fails),
+            "fails": fails,
+            "now": (st.get("current")
+                    or ", ".join(st.get("running", [])[:2]) or ""),
+        })
+    # key, header, align (< left, > right), color of a value cell
+    cols = [("tool", "TOOL", "<", "1"), ("pid", "PID", ">", ""),
+            ("pct", "%", ">", "32"), ("done", "DONE", ">", ""),
+            ("phase", "PHASE", "<", "35"), ("elapsed", "ELAPSED", ">", ""),
+            ("eta", "ETA", ">", "36"), ("fail", "FAIL", ">", None)]
+    w = {k: max([len(h)] + [len(c[k]) for c in cells])
+         for k, h, _, _ in cols}
+    sep, now_sep = " ", "  "
+
+    def fixed():
+        return sum(w[k] for k, _, _, _ in cols) + len(sep) * (len(cols) - 1)
+
+    # too narrow for every column: drop the least useful ones first
+    for gone in DROP_ORDER:
+        if fixed() <= width:
+            break
+        cols = [col for col in cols if col[0] != gone]
+    now_at = fixed() + len(now_sep)
+    now_w = width - now_at
+    own_lines = now_w < NOW_MIN     # too narrow: NOW gets lines of its own
+    if own_lines:
+        now_w = max(width - 4, 10)
+
+    def fmt(text, k, align):
+        return ("%-*s" if align == "<" else "%*s") % (w[k], text)
+
+    def fit(line):                  # the last resort: a terminal narrower
+        return line[:width]         # than the fixed columns themselves
+
+    head = sep.join(fmt(h, k, a) for k, h, a, _ in cols)
+    head += "" if own_lines else now_sep + "NOW"
+    out = [paint(fit(head), "1;2", color)]
+    for c in cells:
+        parts = []
+        for k, _, a, code in cols:
+            if code is None:        # FAIL: red when there are failures
+                code = "1;31" if c["fails"] else "2"
+            parts.append((fmt(c[k], k, a), code))
+        plain = sep.join(t for t, _ in parts)
+        if len(plain) > width:      # colors would hide what fit() cuts
+            line = fit(plain)
+        else:
+            line = sep.join(paint(t, code, color) for t, code in parts)
+        now = wrap_now(c["now"], now_w) if c["now"] else []
+        if own_lines:
+            out.append(line)
+            out.extend("    " + n for n in now)
+        else:
+            out.append(line + (now_sep + now[0] if now else ""))
+            out.extend(" " * now_at + n for n in now[1:])
     return "\n".join(out)
 
 
+def parse_args(argv):
+    ap = argparse.ArgumentParser(
+        prog="testctl", usage=USAGE, description=DESCRIPTION, epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND")
+    sub.add_parser("list", help="every running tool, one row each "
+                                "(the default)")
+    p = sub.add_parser("watch", help="the list, refreshed until Ctrl-C")
+    p.add_argument("secs", nargs="?", type=float, default=2.0,
+                   metavar="SECS", help="seconds between refreshes "
+                                        "(default 2)")
+    for name, what in (
+            ("status", "one tool's full status (JSON): progress, ETA, "
+                       "resume token, what runs now"),
+            ("failures", "the failures one tool found so far (JSON)"),
+            ("stop", "stop a resumable run gracefully: finish what is in "
+                     "flight, checkpoint, print the resume token"),
+            ("pause", "pause a resumable run (in-flight items finish)"),
+            ("resume", "resume a paused run")):
+        p = sub.add_parser(name, help=what)
+        p.add_argument("run", nargs="?", metavar="RUN",
+                       help="the tool: a socket path, a name or a pid")
+    p = sub.add_parser("jobs", help="change a resumable run's parallelism")
+    p.add_argument("n", type=int, metavar="N", help="the worker count")
+    p.add_argument("run", nargs="?", metavar="RUN",
+                   help="the tool: a socket path, a name or a pid")
+    return ap.parse_args(argv)
+
+
 def main():
-    act = sys.argv[1] if len(sys.argv) > 1 else "list"
-    if act in ("-h", "--help", "help"):
-        print(__doc__ if __doc__ else "usage: testctl ACTION [RUN]")
-        return 0
+    args = parse_args(sys.argv[1:])
+    act = args.cmd or "list"
     if act == "list":
-        print(table())
+        print(table(color=use_color()))
         return 0
     if act == "watch":
-        secs = float(sys.argv[2]) if len(sys.argv) > 2 else 2.0
         try:
             while True:
-                print("\033[H\033[2J" + time.strftime("%H:%M:%S  ")
-                      + "(Ctrl-C to quit)\n" + table(), flush=True)
-                time.sleep(secs)
+                color = use_color()
+                stamp = time.strftime("%H:%M:%S  ") + "(Ctrl-C to quit)"
+                print("\033[H\033[2J" + paint(stamp, "2", color) + "\n\n"
+                      + table(color=color), flush=True)
+                time.sleep(args.secs)
         except KeyboardInterrupt:
             return 0
+    path = pick(args.run)
+    req = {"action": act}
     if act == "jobs":
-        n = int(sys.argv[2])
-        path = pick(sys.argv[3] if len(sys.argv) > 3 else None)
-        print(json.dumps(ask(path, {"action": "jobs", "n": n}), indent=1))
-        return 0
-    path = pick(sys.argv[2] if len(sys.argv) > 2 else None)
-    print(json.dumps(ask(path, {"action": act}), indent=1))
+        req["n"] = args.n
+    print(json.dumps(ask(path, req), indent=1))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # the reader went away (`testctl watch | head`): not an error, and
+        # no traceback - point stdout at /dev/null so the exit flush is mute
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
