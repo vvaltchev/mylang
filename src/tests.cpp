@@ -964,7 +964,7 @@ static const std::vector<test> tests =
         "}",
         "var c = mk(12);",
         "c(runtime(0));" },
-      &typeid(DivisionByZeroEx), 29, 2, 35, 2 },
+      &typeid(DivisionByZeroEx), 29, 2, 36, 2 },
 
     /*
      * #38 C: A JOINED PARAMETER BINDS LIKE A DECLARED ONE. Inference joins
@@ -1393,6 +1393,23 @@ static const std::vector<test> tests =
     { "err loc: a LITERAL builtin argument's error marks the literal",
       { "float f = float(runtime(2.5));", "var s = str(f, 65);" },
       &typeid(InvalidValueEx), 16, 2, 19, 2 },
+    /* an expression's span ends at its own last part - it ended at the
+     * NEXT token's start, so spaces after `d.zz` were underlined and with
+     * no space (`d.zz+1`) the caret was a column short */
+    /* a string literal spans its QUOTES (the text alone was two columns
+     * short), and a multi-line one ends on its last line */
+    { "err loc: a string literal's span includes its quotes",
+      { "var s = lpad(\"abc\", \"x\"    );" },
+      &typeid(TypeErrorEx), 21, 1, 25, 1 },
+    { "err loc: a multi-line string literal ends on its last line",
+      { "var s = lpad(\"abc\", \"x", "y\"   );" },
+      &typeid(TypeErrorEx), 21, 1, 4, 2 },
+    { "err loc: a member's span stops at its name, not the next token",
+      { "var d = {\"a\": 1};", "var x = d.zz     + 1;" },
+      &typeid(KeyNotFoundEx), 9, 2, 14, 2 },
+    { "err loc: a member's span reaches its name's end with no space after",
+      { "var d = {\"a\": 1};", "var x = d.zz+1;" },
+      &typeid(KeyNotFoundEx), 9, 2, 14, 2 },
     { "err loc: a `true` argument's span is the keyword's, whatever follows",
       { "float f = float(runtime(2.5));", "var s = str(f, true    );" },
       &typeid(TypeErrorEx), 16, 2, 21, 2 },
@@ -5136,12 +5153,12 @@ static const std::vector<test> tests =
     { "err loc: dyn elem ++ on a string marks the whole inc-dec",
       { "func mkd() { var d = {\"a\": \"s\"}; return d; }",
         "var dyn dd = mkd(); dd[\"a\"]++;" },
-      &typeid(TypeErrorEx), 21, 2, 30, 2 },
+      &typeid(TypeErrorEx), 21, 2, 31, 2 },
     /* The member twin: a missing key marks the MEMBER `dd.missing`. */
     { "err loc: dyn member ++ missing key marks the member",
       { "func mkd() { var d = {\"cnt\": 1}; return d; }",
         "var dyn dd = mkd(); dd.missing++;" },
-      &typeid(KeyNotFoundEx), 21, 2, 31, 2 },
+      &typeid(KeyNotFoundEx), 21, 2, 32, 2 },
     /* An UNBOUND global base (`g` read by f before its decl runs - the name
      * IS declared, so this is UnboundSymbolEx, #131): the VM's
      * vm_store_base uses the loc side table — must match the tree-walker's
@@ -5316,7 +5333,7 @@ static const std::vector<test> tests =
      * whole `s = s + v` Expr14 span, byte-identical in both engines. */
     { "err loc: the dyn-narrowing coerce marks the whole assignment",
       { "func acc(v) { var s = 0; s = s + v; return s; }",
-        "acc(runtime(2.5));" }, &typeid(TypeErrorEx), 26, 1, 35, 1 },
+        "acc(runtime(2.5));" }, &typeid(TypeErrorEx), 26, 1, 36, 1 },
     /* A FLOAT accumulator widens a dyn int (float <- int), and a GLOBAL
      * coerces_dyn accumulator (a function reads it) stores through the
      * global table with the same coerce. */
@@ -5394,10 +5411,21 @@ static const std::vector<test> tests =
       { "var s = \"a\"; s++;" }, &typeid(TypeMismatchEx) },
     { "++ on an array is a type error",
       { "var a = [1, 2]; a++;" }, &typeid(TypeMismatchEx) },
+    /* the assignable-shape rule (pRefuseUnassignable): a `++` / `--`
+     * operand that is not a variable, an element or a field is refused by
+     * the PARSER, in every mode (it was the inferencer's TypeMismatchEx -
+     * so under -nti the engines disagreed: a runtime error in the
+     * tree-walker, a compile refusal in the VM) */
+    { "++ on a call result is rejected by its shape",
+      { "func f() { return 1; }", "f()++;" }, &typeid(SyntaxErrorEx) },
+    { "-- on a slice is rejected by its shape",
+      { "var s = [1, 2];", "--s[0:1];" }, &typeid(SyntaxErrorEx) },
+    { "++ on ++ is rejected by its shape",
+      { "var i = 1;", "i++ ++;" }, &typeid(SyntaxErrorEx) },
     { "++ on a non-lvalue expression is rejected",
-      { "var x = 5; var y = (x + 1)++;" }, &typeid(TypeMismatchEx) },
+      { "var x = 5; var y = (x + 1)++;" }, &typeid(SyntaxErrorEx) },
     { "++ on a const is rejected",
-      { "const c = 5; c++;" }, &typeid(TypeMismatchEx) },
+      { "const c = 5; c++;" }, &typeid(SyntaxErrorEx) },
 
     /* optimization interactions */
     { "++/--: a ++'d var is NOT auto-const-promoted",
@@ -7697,12 +7725,12 @@ static const std::vector<test> tests =
       { "struct P { int x; }",
         "var dyn p = runtime(P(1));",
         "p?.x++;" },
-      &typeid(SyntaxErrorEx), 1, 3, 5, 3 },
+      &typeid(SyntaxErrorEx), 1, 3, 6, 3 },
     { "parse: an optional member is not assignable (prefix --)",
       { "struct P { int x; }",
         "var dyn p = runtime(none);",
         "--p?.x;" },
-      &typeid(SyntaxErrorEx), 3, 3, 7, 3 },
+      &typeid(SyntaxErrorEx), 3, 3, 8, 3 },
     { "parse: an optional member is not assignable (=)",
       { "struct P { int x; }",
         "var dyn p = runtime(P(1));",
@@ -10292,7 +10320,7 @@ static const std::vector<test> tests =
             "}",
             "g(runtime(\"oops\"), 2);",
         },
-        &typeid(TypeErrorEx), 5, 4, 8, 4,
+        &typeid(TypeErrorEx), 5, 4, 9, 4,
     },
     {
         /* LoadElemValue deletability: the 2-D general-array read's OOB in

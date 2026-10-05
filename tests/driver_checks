@@ -726,6 +726,34 @@ for prog in 'p?.x++;' '--p?.x;' 'p?.x = 5;' 'p?.x += 1;'; do
     fi
 done
 
+# And a `++` / `--` operand of any other non-location shape - a call
+# result, an arithmetic chain, a slice, another inc-dec - by the same
+# parser rule (pRefuseUnassignable). Under -nti the tree-walker failed at
+# run time and the VM refused to compile (until 2026-10-05).
+for prog in 'f()++;' '(a + 1)++;' 's[0:1]++;' '--f();' 'a++ ++;'; do
+    printf 'func f() { return runtime(1); }
+var dyn a = runtime(1);
+%s
+%s
+' \
+        'var dyn s = runtime([1, 2]);' "$prog" > "$TMP/inc.my"
+    bad=
+    for flags in "-tw" "" "-nti -tw" "-nti"; do
+        # shellcheck disable=SC2086
+        out=$("$BIN" $flags "$TMP/inc.my" 2>&1)
+        got_rc=$?
+        if [ "$got_rc" != 1 ] \
+                || ! printf '%s' "$out" | grep -q 'SyntaxError'; then
+            bad="$bad [$flags] rc=$got_rc $(printf '%s' "$out" | head -1)"
+        fi
+    done
+    if [ -z "$bad" ]; then
+        pass "inc-dec of a non-location refused: $prog"
+    else
+        fail "inc-dec of a non-location refused: $prog:$bad"
+    fi
+done
+
 # ---------------------------------------------------------------------
 # -nc (#54): the flag turns off constant FOLDING, and until #54 it also
 # stopped the parser REGISTERING consts, struct types and pure funcs -
