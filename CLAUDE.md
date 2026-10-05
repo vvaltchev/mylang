@@ -573,6 +573,10 @@ JIT decision (the tree-walker never runs those passes),
 An engine is a name from `ENGINE_FLAGS` (int_run: `default`, `tw`,
 `nj`, `vm`, `nbi`, `noopt` = `--no-opt all`), two joined with `+`
 (`nbi+nj`); the engines of one configuration must print the same stdout.
+A unit whose header says `# INT-SOURCE: ../functional/NAME.my` RUNS that
+program under its own headers: a functional test counted as a coverage
+unit without a second copy (the census pass runs tests/functional too, but
+only units count toward the universe).
 **`tests/int/repl/*.session` are REPL units:** each is fed to `--repl`
 on stdin under a fresh `HOME` and must print exactly its `.expected`, nothing
 on stderr - the interactive front end (input loop, history, the line
