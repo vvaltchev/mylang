@@ -1,0 +1,146 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT test (#107): `++` / `--` on an element or a field nothing proved the
+# type of - the read-modify-write every engine shares (eval.cpp,
+# dyn_incdec_elem / dyn_incdec_member: the tree-walker's IncDecExpr, the
+# VM's IncDecElemCheckedV / IncDecMemberCheckedV and IncDecChainV's dyn
+# tier). Each form a statement (the value dropped), an expression (old or
+# new) and a chain step, and each error README.md names, so every branch of
+# the shared helpers runs in every engine. tests/functional/63_dyn_incdec.my
+# holds the same shapes for corpus_diff's matrices; this unit is what the
+# coverage universe counts. Values come from runtime(): a constant would
+# fold, and a base the inferencer proved would take the typed path.
+
+struct P { int x; float y; bool b; }
+struct B { int x; dyn tag; }
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad = bad + 1;
+    }
+}
+
+func outcome(dyn f) {
+    try {
+        f();
+        return "ok";
+    } catch (NotLValueEx) {
+        return "NotLValueEx";
+    } catch (TypeErrorEx) {
+        return "TypeErrorEx";
+    } catch (OutOfBoundsEx) {
+        return "OutOfBoundsEx";
+    } catch (KeyNotFoundEx) {
+        return "KeyNotFoundEx";
+    } catch (DivisionByZeroEx) {
+        return "DivisionByZeroEx";
+    }
+    return "unreachable";       # (inference does not see the try return)
+}
+
+var dyn z = runtime(0);         # boom() divides by it
+
+# --- a flat int array: statements, expressions, a negative index
+var dyn d = runtime([10, 20, 30]);
+d[0]++;
+--d[1];
+d[-1]--;
+want("d after statements", d, [11, 19, 29]);
+var dyn post = d[0]++;
+var dyn pre = --d[2];
+want("d[0]++ value", post, 11);
+want("--d[2] value", pre, 28);
+want("d after expressions", d, [12, 19, 28]);
+var dyn neg = d[-3]++;
+want("d[-3]++ value", neg, 12);
+
+# --- a flat float array
+var dyn f = runtime([1.5, 2.5]);
+var dyn fpost = f[1]--;
+var dyn fpre = ++f[0];
+want("f[1]-- value", fpost, 2.5);
+want("++f[0] value", fpre, 2.5);
+want("f", f, [2.5, 1.5]);
+
+# --- a chain: a flat row in a general array, a dict of arrays
+var dyn m = runtime([[1, 2], [3, 4]]);
+m[1][0]++;
+var dyn mv = m[0][1]--;
+want("m", m, [[1, 1], [4, 4]]);
+want("m[0][1]-- value", mv, 2);
+var dyn dm = runtime({"r": [5, 6]});
+dm["r"][1]++;
+var dyn dmv = ++dm.r[0];
+want("dm", dm.r, [6, 7]);
+want("++dm.r[0] value", dmv, 6);
+
+# --- struct fields: POD and boxed, statement and expression
+var dyn p = runtime(P(1, 2.5, true));
+p.x++;
+var dyn py = p.y--;
+var dyn px = --p.x;
+want("p.x", p.x, 1);
+want("p.y-- value", py, 2.5);
+want("--p.x value", px, 1);
+var dyn bx = runtime(B(1, "t"));
+bx.x++;
+var dyn bxv = bx.x--;
+want("bx.x", bx.x, 1);
+want("bx.x-- value", bxv, 2);
+
+# --- dicts: by member and by key, a missing key
+var dyn dd = runtime({"k": 1});
+dd.k++;
+var dyn ddv = dd["k"]--;
+want("dd.k", dd.k, 1);
+want("dd[k]-- value", ddv, 2);
+want("missing key", outcome(func [dd] () { dd["nope"]++; }), "KeyNotFoundEx");
+want("missing member key", outcome(func [dd] () { dd.nope++; }),
+     "KeyNotFoundEx");
+
+# --- the errors README.md names
+var dyn bools = runtime([true, false]);
+var dyn strs = runtime(["a", "b"]);
+var dyn pts = runtime([P(1, 2.5, true)]);
+var dyn n = runtime(5);
+const K = [1, 2];
+const KP = P(1, 2.5, true);
+func inc_k(dyn q) { q[0]++; }
+func inc_kp(dyn q) { q.x++; }
+func mkb() { return runtime(B(1, "t")); }
+func boom() { var dyn q = runtime(1) / z; return q; }
+want("bool element", outcome(func [bools] () { bools[0]++; }), "TypeErrorEx");
+want("bool element value", outcome(func [bools] () { var dyn t = bools[1]--; }),
+     "TypeErrorEx");
+want("str element", outcome(func [strs] () { strs[0]++; }), "TypeErrorEx");
+want("struct element", outcome(func [pts] () { pts[0]++; }), "TypeErrorEx");
+want("bool field", outcome(func [p] () { p.b++; }), "TypeErrorEx");
+want("bool field value", outcome(func [p] () { var dyn t = p.b--; }),
+     "TypeErrorEx");
+want("past the end", outcome(func [d] () { d[3]++; }), "OutOfBoundsEx");
+want("before the start", outcome(func [d] () { d[-4]--; }), "OutOfBoundsEx");
+want("value past the end", outcome(func [d] () { var dyn t = d[9]++; }),
+     "OutOfBoundsEx");
+want("non-int key", outcome(func [d] () { d["x"]++; }), "TypeErrorEx");
+want("a throwing key", outcome(func [d] () { d[boom()]++; }),
+     "DivisionByZeroEx");
+want("a throwing base", outcome(func () { boom().x++; }),
+     "DivisionByZeroEx");
+want("const array", outcome(func () { inc_k(K); }), "NotLValueEx");
+want("const struct", outcome(func () { inc_kp(KP); }), "NotLValueEx");
+want("field of an element", outcome(func [pts] () { pts[0].x++; }),
+     "NotLValueEx");
+want("missing field", outcome(func [bx] () { bx.nope++; }), "TypeErrorEx");
+want("missing POD field", outcome(func [p] () { p.nope--; }), "TypeErrorEx");
+want("temporary's field", outcome(func () { mkb().x++; }), "NotLValueEx");
+want("temporary's field value", outcome(func () { var dyn t = mkb().x--; }),
+     "NotLValueEx");
+want("an int's member", outcome(func [n] () { n.x++; }), "TypeErrorEx");
+var dyn pr = runtime(print);
+want("a builtin in a variable", outcome(func [pr] () { pr++; }),
+     "TypeErrorEx");
+
+print("dyn inc-dec: " + str(bad) + " failure(s)");
+assert(bad == 0);

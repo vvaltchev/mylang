@@ -631,7 +631,7 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                           bool tier2, bool is_inc, bool is_prefix,
                           bool allow_flat, bool allow_pod,
                           Loc lstart, Loc lend, Loc kstart, Loc kend,
-                          Loc id_start, Loc id_end);
+                          Loc bstart, Loc bend, Loc id_start, Loc id_end);
 
 /* VM (StoreMemberV): native `s.member = v` / `OP= v` for a STRUCT base (a dict
  * member store goes through DictStore). See eval.cpp. */

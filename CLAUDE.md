@@ -216,6 +216,14 @@ them means anything:**
   **`compile gate`** now - `-nr` per program, reported and failing on
   its own line. Exit CODE would not have done it: `samples/gcd`
   legitimately exits 1 with a usage message when given no arguments.
+  **⛔ AND A THIRD (2026-10-05): A SELF-ASSERTING PROGRAM THAT FAILS IN
+  EVERY ENGINE AGREES TOO.** A failed `assert` prints the same error
+  and exits 1 everywhere: 58_flit_pinned_rcx asserted a sum built on
+  an undefined `int()` and stayed green. A `tests/functional` program
+  must now exit 0 in the tree-walker (`FAIL [..] path`, a `samples/`
+  program is exempt for gcd's reason). Its first run caught
+  `d[0]++` on a dyn int array raising NotLValueEx in every engine
+  (63_dyn_incdec.my).
 - **`MYLANG_NO_LOWMEM=1`** - refuse the low-address arena, so the
   JIT's REGISTER-form type tags (the shipping configuration wherever
   `MAP_32BIT` is unavailable or fails) are reachable by a test.
@@ -5955,8 +5963,15 @@ payoff.
   no `LValue`) it routes the mutation through `handle_single_expr14`
   (`operand += 1`), reusing every store fast path (slot, flat array, COW,
   struct), and **derives `old = new ∓ 1`** for postfix so it never re-reads the
-  operand; a `dyn`/un-hinted operand (always `LValue`-backed) goes through a
-  read-modify-write so the int/float requirement is enforced at runtime. The
+  operand; a `dyn`/un-hinted operand goes through a read-modify-write so the
+  int/float requirement is enforced at runtime - for an element or a field,
+  ONE implementation every engine shares (`dyn_incdec_elem` /
+  `dyn_incdec_member`, eval.cpp: the tree-walker, the VM's
+  IncDecElemCheckedV / IncDecMemberCheckedV and IncDecChainV's tier 3). A
+  flat array's element and a POD field have no `LValue`, so a rooted one
+  is read, checked and stored back as `+= 1` stores it; until 2026-10-05
+  all four copies raised NotLValueEx there, so every `a[i]++` under -nti
+  failed. The
   **inferencer** types it (`type_of` = `operand ± 1`) and the **check pass**
   rejects a non-lvalue, a `const`, or a non-int/float operand (bool included) at
   compile time — `var b=true; b++` is a `TypeMismatchEx`, not a silent int.

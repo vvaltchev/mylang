@@ -1,7 +1,0 @@
-:type a
-:analyze a = 0;
-rethrow;
-b = "";
-i.i;
-if (3.5) {
-:quit
