@@ -1,0 +1,171 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT test (#107, plan 9.1): THE VALUE CLASSES. Every declared boundary of
+# src/intsites.h's ML_INT_VCLASSES - a shift by 63 and by 64, an index of
+# -1 and of len, the most negative int, an empty array - exercised here,
+# each result asserted against what README.md says (the SPEC is the
+# oracle, not the implementation: a shift by 64 and by 63 can take the
+# same C++ branch in a saturating implementation that is wrong at 64).
+# The tree-walker run records the classes; the VM, JIT and no-opt runs
+# must print the same. Operands come from runtime() - a fully constant
+# operation folds at compile time, and a throwing one refuses to compile.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad = bad + 1;
+    }
+}
+
+# the name of the built-in exception f() raises, or "nothing"
+func raised(f) {
+    try {
+        f();
+    } catch (InvalidValueEx) {
+        return "InvalidValueEx";
+    } catch (DivisionByZeroEx) {
+        return "DivisionByZeroEx";
+    } catch (OutOfBoundsEx) {
+        return "OutOfBoundsEx";
+    } catch (InvalidArgumentEx) {
+        return "InvalidArgumentEx";
+    }
+    return "nothing";
+}
+
+func ri(int x) { return int(runtime(x)); }
+
+var one = ri(1);
+var five = ri(5);
+var mn = one << 63;                     # the most negative int
+var mx = ~mn;                           # the largest one
+want("1 << 63", str(mn), "-9223372036854775808");
+want("~(1 << 63)", str(mx), "9223372036854775807");
+
+# --- shifts: a count must be >= 0; >= 64 gives 0 for << and >>>, a full
+# sign fill for >>
+var m1 = ri(-1);
+want("5 << -1", raised(func [five, m1] () => five << m1), "InvalidValueEx");
+want("5 << 0", five << ri(0), 5);
+want("1 << 64", one << ri(64), 0);
+want("1 << 65", one << ri(65), 0);
+want("5 >> -1", raised(func [five, m1] () => five >> m1), "InvalidValueEx");
+want("5 >> 0", five >> ri(0), 5);
+want("INT_MIN >> 63", mn >> ri(63), -1);
+want("5 >> 64", five >> ri(64), 0);
+want("5 >> 100", five >> ri(100), 0);
+want("-5 >> 64", ri(-5) >> ri(64), -1);
+want("-5 >> 70", ri(-5) >> ri(70), -1);
+want("-8 >> 1", ri(-8) >> one, -4);
+want("5 >>> -1", raised(func [five, m1] () => five >>> m1),
+     "InvalidValueEx");
+want("5 >>> 0", five >>> ri(0), 5);
+want("INT_MIN >>> 63", mn >>> ri(63), 1);
+want("-1 >>> 64", m1 >>> ri(64), 0);
+want("-1 >>> 65", m1 >>> ri(65), 0);
+want("-8 >>> 60", ri(-8) >>> ri(60), 15);
+want("-1 >>> 1", m1 >>> one, mx);
+# the same through the boxed (dyn) path
+var dyn d5 = runtime(5);
+var dyn dz = runtime(0);
+want("dyn 5 << 0", d5 << dz, 5);
+want("dyn 5 >> 0", d5 >> dz, 5);
+want("dyn 5 >>> 0", d5 >>> dz, 5);
+
+# --- / and %: zero and INT_MIN / -1 throw; otherwise / truncates toward
+# zero and % takes the dividend's sign
+var seven = ri(7);
+var zero = ri(0);
+want("7 / 0", raised(func [seven, zero] () => seven / zero),
+     "DivisionByZeroEx");
+want("7 % 0", raised(func [seven, zero] () => seven % zero),
+     "DivisionByZeroEx");
+want("INT_MIN / -1", raised(func [mn, m1] () => mn / m1), "InvalidValueEx");
+want("INT_MIN % -1", raised(func [mn, m1] () => mn % m1), "InvalidValueEx");
+want("-7 / 2", ri(-7) / ri(2), -3);
+want("7 / -2", seven / ri(-2), -3);
+want("-7 % 2", ri(-7) % ri(2), -1);
+want("7 % -2", seven % ri(-2), 1);
+want("-7 % -2", ri(-7) % ri(-2), -1);
+var dyn d7 = runtime(-7);
+var dyn d2 = runtime(2);
+want("dyn -7 / 2", d7 / d2, -3);
+want("dyn -7 % 2", d7 % d2, -1);
+want("dyn 7 / 0", raised(func [d2, dz] () => d2 / dz), "DivisionByZeroEx");
+
+# --- wraparound at 64 bits
+want("INT_MAX + 1", mx + one, mn);
+want("INT_MIN - 1", mn - one, mx);
+want("INT_MAX * 2", mx * ri(2), -2);
+want("-INT_MIN", -mn, mn);
+var dyn dmn = runtime(mn);
+var dyn dmx = runtime(mx);
+want("dyn INT_MAX + 1", dmx + 1, mn);
+want("dyn INT_MIN - 1", dmn - 1, mx);
+want("dyn INT_MAX * 2", dmx * 2, -2);
+want("dyn -INT_MIN", -dmn, mn);
+
+# --- a[i]: from 0, a negative index counts from the end; anything below
+# -len(a) or at len(a) and beyond throws OutOfBoundsEx
+var a = [ri(10), ri(20), ri(30)];              # flat array<int>
+want("a[-4]", raised(func [a] () => a[ri(-4)]), "OutOfBoundsEx");
+want("a[-3]", a[ri(-3)], 10);
+want("a[-1]", a[ri(-1)], 30);
+want("a[0]", a[ri(0)], 10);
+want("a[2]", a[ri(2)], 30);
+want("a[3]", raised(func [a] () => a[ri(3)]), "OutOfBoundsEx");
+a[ri(-1)] = 31;
+a[ri(-3)] = 11;
+want("a after stores", a, [11, 20, 31]);
+want("a[3] = 1", raised(func [a] () { a[ri(3)] = 1; }), "OutOfBoundsEx");
+var dyn g = runtime(["x", 2, 3.5]);             # general (boxed)
+want("g[-4]", raised(func [g] () => g[ri(-4)]), "OutOfBoundsEx");
+want("g[-3]", g[ri(-3)], "x");
+want("g[2]", g[ri(2)], 3.5);
+want("g[3]", raised(func [g] () => g[ri(3)]), "OutOfBoundsEx");
+var b = [ri(7)];                                 # len 1: 0 is first and last
+want("b[0]", b[ri(0)], 7);
+want("b[-1]", b[ri(-1)], 7);
+array<int> e = [];
+want("e[0]", raised(func [e] () => e[ri(0)]), "OutOfBoundsEx");
+want("e[-1]", raised(func [e] () => e[ri(-1)]), "OutOfBoundsEx");
+
+# --- s[i]: the one-character string, indexed like an array
+var s = str(runtime("abc"));
+want("s[-4]", raised(func [s] () => s[ri(-4)]), "OutOfBoundsEx");
+want("s[-3]", s[ri(-3)], "a");
+want("s[-1]", s[ri(-1)], "c");
+want("s[0]", s[ri(0)], "a");
+want("s[2]", s[ri(2)], "c");
+want("s[3]", raised(func [s] () => s[ri(3)]), "OutOfBoundsEx");
+var es = str(runtime(""));
+want("\"\"[0]", raised(func [es] () => es[ri(0)]), "OutOfBoundsEx");
+
+# --- builtins at zero and one element
+array<int> ei = [];
+array<float> ef = [];
+want("sum of an empty array<int>", sum(ei), 0);
+want("sum of an empty array<float>", sum(ef), 0.0);
+want("sum([5])", sum([five]), 5);
+var dyn de = runtime([]);
+want("min([])", raised(func [de] () => min(de)), "InvalidArgumentEx");
+want("max([])", raised(func [de] () => max(de)), "InvalidArgumentEx");
+want("min([4])", min([ri(4)]), 4);
+want("max([4])", max([ri(4)]), 4);
+array<int> p0 = [];
+want("pop([])", raised(func [p0] () => pop(p0)), "OutOfBoundsEx");
+var p1 = [ri(9)];
+want("pop([9])", pop(p1), 9);
+want("[9] after pop", len(p1), 0);
+want("top([])", raised(func [p0] () => top(p0)), "OutOfBoundsEx");
+want("top([3])", top([ri(3)]), 3);
+array<str> js = [];
+want("join([], \",\")", join(js, ","), "");
+want("join([\"x\"], \",\")", join([str(runtime("x"))], ","), "x");
+array<int> s0 = [];
+want("sort([])", len(sort(s0)), 0);
+want("sort([1])", sort([one]), [1]);
+
+print("value classes: " + str(bad) + " failure(s)");
+assert(bad == 0);

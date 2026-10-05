@@ -57,6 +57,25 @@ ML_INT_SITES(X)
 #undef X
 #undef F
 
+/* The value classes (intsites.h, ML_INT_VCLASSES): declared boundaries,
+ * counted - never events. */
+enum class IntVc : int {
+#define V(name, desc) name,
+    ML_INT_VCLASSES(V)
+#undef V
+    count_
+};
+void int_vc(IntVc c) noexcept;                      /* one more hit */
+/* Classify an operation's operands and count every class they sit on.
+ * noexcept and allocation-free: each is called (through ML_INT_ONLY) from
+ * hot product code, and a hook that could throw would add an exception
+ * edge to every caller - a branch the coverage universe counts. */
+void int_vc_shift(char op, int64_t v, int64_t n) noexcept; /* 'l' 'r' 'u' */
+void int_vc_divmod(bool mod, int64_t a, int64_t b) noexcept;
+void int_vc_arith(char op, int64_t a, int64_t b) noexcept; /* + - * n(eg) */
+void int_vc_index(bool str, int64_t idx, uint64_t len) noexcept;
+void int_vc_size(IntVc empty, IntVc one, uint64_t n) noexcept;
+
 /* The core (inttest.cpp). */
 void int_record(IntSite s, std::string &&line);
 const char *int_site_name(IntSite s);

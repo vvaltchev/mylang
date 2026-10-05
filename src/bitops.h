@@ -3,6 +3,7 @@
 
 #include "defs.h"
 #include "errors.h"
+#include "inttest.h"
 
 /*
  * Shared integer shift helpers, so the boxed TypeInt path (int.cpp.h) and the
@@ -42,6 +43,7 @@ inline void check_int_div_overflow(int_type a, int_type b,
 
 inline int_type bit_shl(int_type v, int_type n)
 {
+    ML_INT_ONLY(int_vc_shift('l', v, n);)
     if (n < 0)
         throw InvalidValueEx("negative shift count");
     return (n >= INT_TYPE_BITS)
@@ -51,6 +53,7 @@ inline int_type bit_shl(int_type v, int_type n)
 
 inline int_type bit_shr(int_type v, int_type n)   /* signed / arithmetic */
 {
+    ML_INT_ONLY(int_vc_shift('r', v, n);)
     if (n < 0)
         throw InvalidValueEx("negative shift count");
     return (n >= INT_TYPE_BITS) ? (v < 0 ? -1 : 0) : (v >> n);
@@ -58,6 +61,7 @@ inline int_type bit_shr(int_type v, int_type n)   /* signed / arithmetic */
 
 inline int_type bit_ushr(int_type v, int_type n)  /* unsigned / logical */
 {
+    ML_INT_ONLY(int_vc_shift('u', v, n);)
     if (n < 0)
         throw InvalidValueEx("negative shift count");
     return (n >= INT_TYPE_BITS)

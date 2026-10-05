@@ -91,6 +91,8 @@ EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
 
     if (!val_delim.is<SharedStr>())
         throw TypeErrorEx("Expected array", arg_delim->start, arg_delim->end);
+    ML_INT_ONLY(int_vc_size(IntVc::join_empty, IntVc::join_one,
+                            val_arr.get<SharedArrayObj>().size());)
 
     const string_view delim = val_delim.get<SharedStr>().get_view();
     const SharedArrayObj &arr = val_arr.get<SharedArrayObj>();

@@ -147,6 +147,9 @@ template <bool is_max>
 template <bool is_max>
 EvalValue b_min_max_arr(const SharedArrayObj &arr, const ArgLoc *arg)
 {
+    ML_INT_ONLY(int_vc_size(is_max ? IntVc::max_empty : IntVc::min_empty,
+                            is_max ? IntVc::max_one : IntVc::min_one,
+                            arr.size());)
     /* Flat fast path: scan the unboxed int/float vector directly, no promotion
      * and no per-element virtual compare (see plans/archived/typed-arrays.md).
      * strs/structs take the general path below (a LOCAL handle promote -

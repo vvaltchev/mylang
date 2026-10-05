@@ -123,3 +123,86 @@
     /* jit.cpp, jit_int_force_decline (P7, the per-site forcing sweep).  */ \
     X(decline_choice, "a guarded tier's decline (0 as emitted, 1 forced)", \
       F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))
+
+/*
+ * THE VALUE CLASSES (plan section 9.1): each row a declared BOUNDARY of
+ * an operation - a shift by 63 and by 64, an index of -1 and of len, the
+ * most negative int, an empty container. Branch coverage cannot see an
+ * off-by-one there: a shift by 63 and one by 64 can take the same C++
+ * branch in a saturating implementation that is wrong at 64. Declared,
+ * each is a countable element: tests/int_run fails when no test exercises
+ * one, and with --gcov each joins the coverage universe as `vc:<name>`.
+ *
+ * A class is recorded where its operation is DEFINED for the reference
+ * engine: the shared helper when there is one (bitops.h, a builtin), else
+ * the tree-walker's evaluation - the other engines are checked against it,
+ * since a value-class test runs under the tree-walker AND the fast engines
+ * and asserts each result from the README. Counters only, no event: a
+ * recording point sits in hot code, so it costs an increment and throws
+ * nothing (the noexcept int_vc_* classifiers, inttest.cpp).
+ *
+ *     V(name, "the boundary")
+ */
+#define ML_INT_VCLASSES(V)                                                    \
+    /* shifts (bitops.h): the count at each edge of [0, 64) */             \
+    V(shl_neg, "x << n, n < 0: InvalidValueEx")                               \
+    V(shl_zero, "x << 0")                                                     \
+    V(shl_63, "x << 63, the top bit")                                         \
+    V(shl_64, "x << 64, the width: 0")                                        \
+    V(shl_over, "x << n, n > 64: 0")                                          \
+    V(shr_neg, "x >> n, n < 0: InvalidValueEx")                               \
+    V(shr_zero, "x >> 0")                                                     \
+    V(shr_63, "x >> 63")                                                      \
+    V(shr_64, "x >> 64, the width: a full sign fill")                        \
+    V(shr_over, "x >> n, n > 64: a full sign fill")                          \
+    V(shr_fill, "x >> n, x < 0 and n >= 64: -1")                              \
+    V(ushr_neg, "x >>> n, n < 0: InvalidValueEx")                             \
+    V(ushr_zero, "x >>> 0")                                                   \
+    V(ushr_63, "x >>> 63")                                                    \
+    V(ushr_64, "x >>> 64, the width: 0")                                      \
+    V(ushr_over, "x >>> n, n > 64: 0")                                        \
+    V(ushr_negval, "x >>> n, x < 0 and 0 < n < 64: zero-filled")             \
+    /* integer / and % (TypeInt, the M8 typed loop) */                     \
+    V(div_zero, "x / 0: DivisionByZeroEx")                                    \
+    V(mod_zero, "x % 0: DivisionByZeroEx")                                    \
+    V(div_min_neg1, "INT_MIN / -1: InvalidValueEx")                           \
+    V(mod_min_neg1, "INT_MIN % -1: InvalidValueEx")                           \
+    V(div_neg_trunc, "a / b, inexact and negative: truncates toward 0")      \
+    V(mod_neg, "a % b, a < 0 and inexact: a negative remainder")             \
+    V(mod_neg_divisor, "a % b, a > 0, b < 0, inexact: a positive remainder") \
+    /* integer wraparound (TypeInt, the M8 typed loop) */                  \
+    V(add_wrap, "a + b overflows 64 bits: wraps")                             \
+    V(sub_wrap, "a - b overflows 64 bits: wraps")                             \
+    V(mul_wrap, "a * b overflows 64 bits: wraps")                             \
+    V(neg_min, "-INT_MIN: INT_MIN")                                           \
+    /* a[i] / s[i] (the tree-walker's subscript paths): each edge of     */ \
+    /* [-len, len), and any index of an empty container                  */ \
+    V(arr_idx_empty, "a[i] on an empty array: OutOfBoundsEx")                 \
+    V(arr_idx_below, "a[-len-1]: OutOfBoundsEx")                              \
+    V(arr_idx_neg_first, "a[-len]: the first element")                        \
+    V(arr_idx_neg_last, "a[-1]: the last element")                            \
+    V(arr_idx_first, "a[0]")                                                  \
+    V(arr_idx_last, "a[len-1]")                                               \
+    V(arr_idx_len, "a[len]: OutOfBoundsEx")                                   \
+    V(str_idx_empty, "s[i] on an empty string: OutOfBoundsEx")                \
+    V(str_idx_below, "s[-len-1]: OutOfBoundsEx")                              \
+    V(str_idx_neg_first, "s[-len]: the first char")                           \
+    V(str_idx_neg_last, "s[-1]: the last char")                               \
+    V(str_idx_first, "s[0]")                                                  \
+    V(str_idx_last, "s[len-1]")                                               \
+    V(str_idx_len, "s[len]: OutOfBoundsEx")                                   \
+    /* container builtins at zero and one element (shared by all engines) */\
+    V(sum_empty, "sum([]): the additive identity, or InvalidArgumentEx")     \
+    V(sum_one, "sum([x])")                                                    \
+    V(min_empty, "min([]): InvalidArgumentEx")                                \
+    V(min_one, "min([x])")                                                    \
+    V(max_empty, "max([]): InvalidArgumentEx")                                \
+    V(max_one, "max([x])")                                                    \
+    V(pop_empty, "pop([]): OutOfBoundsEx")                                    \
+    V(pop_one, "pop([x]): leaves []")                                         \
+    V(top_empty, "top([]): OutOfBoundsEx")                                    \
+    V(top_one, "top([x])")                                                    \
+    V(join_empty, "join([], d): \"\"")                                        \
+    V(join_one, "join([s], d): s, no delimiter")                              \
+    V(sort_empty, "sort([])")                                                 \
+    V(sort_one, "sort([x])")
