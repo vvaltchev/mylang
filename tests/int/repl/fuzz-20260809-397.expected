@@ -6,9 +6,11 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
     ^^^^^^^^^^^^
 >> Failed to open file '/nonexistent'
 >> Unknown command ':' (try :help)
->> SyntaxError at line 1, col 11
-
-    var v1 = -9223372036854775808;
-              ^^^^^^^^^^^^^^^^^^^^
-Integer literal out of range
+>> Block(
+  VarDecl(
+    Id("v1")
+    Op '='
+    Int(-9223372036854775808)
+  )
+)
 >> 

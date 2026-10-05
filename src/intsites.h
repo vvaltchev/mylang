@@ -248,4 +248,40 @@
     V(fint_neg_zero, "int(-0.0): 0")                                          \
     V(fstr_nan, "a NaN as text: nan")                                         \
     V(fstr_inf, "an infinity as text: inf / -inf")                            \
-    V(fstr_neg_zero, "-0.0 as text: -0.000000")
+    V(fstr_neg_zero, "-0.0 as text: -0.000000")                               \
+    /* range() (builtins/arr.cpp.h): start + k*step strictly before end */    \
+    V(range_step_zero, "range(a, b, 0): InvalidValueEx")                      \
+    V(range_empty, "range() with end on the wrong side: []")                  \
+    V(range_one, "range() of exactly one element")                            \
+    V(range_neg_step, "range(a, b, s), s < 0, non-empty: counts down")        \
+    V(range_end_hit, "range(): end - start a multiple of step (end excluded)") \
+    V(range_end_miss, "range(): end - start not a multiple of step")          \
+    V(range_limit, "range(): the value after the last leaves int")            \
+    /* int(s) / float(s) of a string (builtins/num.cpp.h, numtext.h) */       \
+    V(sint_space, "int(s): surrounding whitespace is ignored")                \
+    V(sint_sign, "int(s): an explicit + or - sign")                           \
+    V(sint_max, "int(s): exactly 2^63 - 1")                                   \
+    V(sint_min, "int(s): exactly -2^63")                                      \
+    V(sint_range, "int(s): an integer outside int: InvalidValueEx")           \
+    V(sint_empty, "int(s): empty or all whitespace: InvalidValueEx")          \
+    V(sint_junk, "int(s): not an integer (junk, a fraction): InvalidValueEx") \
+    V(sflt_space, "float(s): surrounding whitespace is ignored")              \
+    V(sflt_word, "float(s): inf / infinity / nan, any case")                  \
+    V(sflt_exp, "float(s): an exponent, e or E")                              \
+    V(sflt_subnormal, "float(s): a subnormal result, kept")                   \
+    V(sflt_overflow, "float(s) at run time, beyond the range: +-inf")         \
+    V(sflt_underflow, "float(s) at run time, below the range: +-0.0")         \
+    V(sflt_const_range, "float(s) at compile time, out of range: refused")    \
+    V(sflt_junk, "float(s): not a number (junk, hex): InvalidValueEx")        \
+    /* str(f, digits) (builtins/generic.cpp.h) */                             \
+    V(sdig_zero, "str(f, 0): no decimal point")                               \
+    V(sdig_max, "str(f, 64): the most digits")                                \
+    V(sdig_range, "str(f, d), d < 0 or d > 64: InvalidValueEx")               \
+    V(sdig_tie, "str(f, d), f exactly halfway: the even digit")               \
+    /* literals (parser.cpp, lexer.cpp) */                                    \
+    V(lit_int_max, "the literal 9223372036854775807")                         \
+    V(lit_int_min, "the literal -9223372036854775808")                        \
+    V(lit_int_range, "an integer literal outside int: compile error")         \
+    V(lit_flt_exp_upper, "a float literal with an E exponent")                \
+    V(lit_flt_subnormal, "a subnormal float literal, kept")                   \
+    V(lit_flt_range, "a float literal outside the range: compile error")

@@ -312,8 +312,10 @@ lexer_ctx::handle_alphanum()
 
             tok_type = TokType::floatnum;
 
-        } else if (c == 'e') {
+        } else if (c == 'e' || c == 'E') {
 
+            /* `E` too (2026-10-05): float("1E5") read it, the lexer did not -
+             * a literal and float() take the same spellings (numtext.h) */
             tok_type = TokType::floatnum;
             float_exp = true;
             exp_sign_ok = true;
@@ -326,7 +328,7 @@ lexer_ctx::handle_alphanum()
 
     } else if (tok_type == TokType::floatnum) {
 
-        if (c == 'e') {
+        if (c == 'e' || c == 'E') {
 
             if (float_exp)
                 invalid_token(); /* a second 'e' in the same float */

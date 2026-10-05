@@ -1,9 +1,5 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
->> SyntaxError at line 1, col 8
-
-    throw -9223372036854775808;
-           ^^^^^^^^^^^^^^^^^^^^
-Integer literal out of range
+>> TypeMismatchEx: can only throw a struct instance, got 'int'
 >> Unknown trace category: _ (try :help optimizations)
 tracing: off
 >> v1 = 9223372036854775807;

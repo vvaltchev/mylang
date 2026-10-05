@@ -34,8 +34,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
+#include <string_view>
 
 #include "inttest.h"
+#include "numtext.h"
 #include "poolalloc.h"
 
 namespace {
@@ -381,6 +384,109 @@ void int_vc_float_text(double v) noexcept
         int_vc(IntVc::fstr_inf);
     else if (v == 0.0 && std::signbit(v))
         int_vc(IntVc::fstr_neg_zero);
+}
+
+void int_vc_range(int64_t start, int64_t end, int64_t step,
+                  uint64_t count) noexcept
+{
+    if (count == 0) {
+        int_vc(IntVc::range_empty);
+        return;
+    }
+    if (count == 1)
+        int_vc(IntVc::range_one);
+    if (step < 0)
+        int_vc(IntVc::range_neg_step);
+
+    const uint64_t span = step > 0
+        ? static_cast<uint64_t>(end) - static_cast<uint64_t>(start)
+        : static_cast<uint64_t>(start) - static_cast<uint64_t>(end);
+    const uint64_t mag = step > 0
+        ? static_cast<uint64_t>(step)
+        : uint64_t(0) - static_cast<uint64_t>(step);
+    int_vc(span % mag == 0 ? IntVc::range_end_hit : IntVc::range_end_miss);
+
+    const int64_t last = static_cast<int64_t>(
+        static_cast<uint64_t>(start) +
+        (count - 1) * static_cast<uint64_t>(step));
+    const int64_t mx = std::numeric_limits<int64_t>::max();
+    const int64_t mn = std::numeric_limits<int64_t>::min();
+    if (step > 0 ? last > mx - step : last < mn - step)
+        int_vc(IntVc::range_limit);
+}
+
+void int_vc_str_int(const char *s, size_t n, int outcome,
+                    int64_t v) noexcept
+{
+    const std::string_view sv(s, n);
+    const std::string_view t = numtext_trim(sv);
+
+    switch (static_cast<NumText>(outcome)) {
+        case NumText::ok:
+            if (t.size() != sv.size())
+                int_vc(IntVc::sint_space);
+            if (t[0] == '+' || t[0] == '-')
+                int_vc(IntVc::sint_sign);
+            if (v == std::numeric_limits<int64_t>::max())
+                int_vc(IntVc::sint_max);
+            else if (v == std::numeric_limits<int64_t>::min())
+                int_vc(IntVc::sint_min);
+            break;
+        case NumText::overflow:
+            int_vc(IntVc::sint_range);
+            break;
+        default:
+            int_vc(t.empty() ? IntVc::sint_empty : IntVc::sint_junk);
+            break;
+    }
+}
+
+void int_vc_str_float(const char *s, size_t n, int outcome, double v,
+                      bool at_compile) noexcept
+{
+    const std::string_view sv(s, n);
+    const std::string_view t = numtext_trim(sv);
+    const NumText o = static_cast<NumText>(outcome);
+
+    if (o == NumText::bad) {
+        int_vc(IntVc::sflt_junk);
+        return;
+    }
+    if (o != NumText::ok) {
+        int_vc(at_compile ? IntVc::sflt_const_range
+               : o == NumText::overflow ? IntVc::sflt_overflow
+               : IntVc::sflt_underflow);
+        return;
+    }
+    if (t.size() != sv.size())
+        int_vc(IntVc::sflt_space);
+    if (std::isinf(v) || std::isnan(v)) {
+        int_vc(IntVc::sflt_word);           /* only a word reads as one */
+        return;
+    }
+    if (t.find_first_of("eE") != std::string_view::npos)
+        int_vc(IntVc::sflt_exp);
+    if (std::fpclassify(v) == FP_SUBNORMAL)
+        int_vc(IntVc::sflt_subnormal);
+}
+
+void int_vc_str_digits(double v, int64_t digits) noexcept
+{
+    if (digits < 0 || digits > 64) {
+        int_vc(IntVc::sdig_range);
+        return;
+    }
+    if (digits == 0)
+        int_vc(IntVc::sdig_zero);
+    if (digits == 64)
+        int_vc(IntVc::sdig_max);
+
+    /* Exactly halfway at `digits` places: v * 10^d + 1/2 an integer, i.e.
+     * 2 * v * 10^d odd. A double is a / 2^k with a odd, so that is
+     * a * 5^d * 2^(d+1-k) odd - k == d + 1, v * 2^(d+1) an odd integer. */
+    const double t = std::ldexp(v, static_cast<int>(digits) + 1);
+    if (std::isfinite(t) && t == std::trunc(t) && std::fmod(t, 2.0) != 0)
+        int_vc(IntVc::sdig_tie);
 }
 
 namespace {

@@ -12,6 +12,7 @@
 #include "eval.h"
 #include "evaltypes.cpp.h"
 #include "syntax.h"
+#include "numtext.h"
 
 #include <random>
 #include <cmath>
@@ -55,23 +56,21 @@ EvalValue builtin_int(EvalContext *ctx, const ArgLocs *exprList,
 
     } else if (val.is<SharedStr>()) {
 
-        const string &strval = string(val.get<SharedStr>().get_view());
-
-        try {
-
-            if constexpr (sizeof(int_type) == sizeof(int))
-               return static_cast<int_type>(stoi(strval));
-            else if constexpr(sizeof(int_type) == sizeof(long))
-               return static_cast<int_type>(stol(strval));
-            else if constexpr(sizeof(int_type) == sizeof(long long))
-               return static_cast<int_type>(stoll(strval));
-            else
-               assert(0);
-
-        } catch (...) {
-
-            throw TypeErrorEx("The string cannot be converted to integer", arg->start, arg->end);
-        }
+        /* The WHOLE string is the integer (numtext.h): stoll read a prefix,
+         * so int("12abc") was 12 and int("3.7") was 3. A string that is not
+         * one, or does not fit, is a wrong VALUE of the right type. */
+        const std::string_view sv = val.get<SharedStr>().get_view();
+        int_type r = 0;
+        const NumText o = numtext_int(sv, r);
+        ML_INT_ONLY(int_vc_str_int(sv.data(), sv.size(),
+                                   static_cast<int>(o), r);)
+        if (o == NumText::overflow)
+            throw InvalidValueEx("the string's integer does not fit an int",
+                                 arg->start, arg->end);
+        if (o != NumText::ok)
+            throw InvalidValueEx("the string is not an integer",
+                                 arg->start, arg->end);
+        return r;
 
     } else {
 
@@ -102,14 +101,24 @@ EvalValue builtin_float(EvalContext *ctx, const ArgLocs *exprList,
 
     } else if (val.is<SharedStr>()) {
 
-        try {
-
-            return stod(string(val.get<SharedStr>().get_view()));
-
-        } catch (...) {
-
-            throw TypeErrorEx("The string cannot be converted to float", arg->start, arg->end);
-        }
+        /* The WHOLE string is the number (numtext.h). Out of the double
+         * range, it is the maintainer's hybrid (2026-10-05): known at
+         * COMPILE time - a const evaluation, the same moment a literal is
+         * read - it is refused like an out-of-range literal; at run time it
+         * rounds as IEEE does, to an infinity or a signed zero. */
+        const std::string_view sv = val.get<SharedStr>().get_view();
+        float_type r = 0;
+        const NumText o = numtext_float(sv, r);
+        const bool at_compile = ctx->in_const_eval();
+        ML_INT_ONLY(int_vc_str_float(sv.data(), sv.size(),
+                                     static_cast<int>(o), r, at_compile);)
+        if (o == NumText::bad)
+            throw InvalidValueEx("the string is not a number",
+                                 arg->start, arg->end);
+        if (o != NumText::ok && at_compile)
+            throw InvalidValueEx("the string's number is outside the "
+                                 "float range", arg->start, arg->end);
+        return r;
 
     } else {
 

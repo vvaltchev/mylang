@@ -84,6 +84,16 @@ void int_vc_float_neg(double a) noexcept;
 void int_vc_float_cmp(double a, double b) noexcept;
 void int_vc_float_int(double f) noexcept;                   /* int(f) */
 void int_vc_float_text(double v) noexcept;                  /* f as text */
+/* range(start, end, step), step != 0, `count` elements */
+void int_vc_range(int64_t start, int64_t end, int64_t step,
+                  uint64_t count) noexcept;
+/* int(s) / float(s): the string, the NumText outcome (numtext.h) and the
+ * value read; `at_compile` - float() is being const-evaluated */
+void int_vc_str_int(const char *s, size_t n, int outcome,
+                    int64_t v) noexcept;
+void int_vc_str_float(const char *s, size_t n, int outcome, double v,
+                      bool at_compile) noexcept;
+void int_vc_str_digits(double v, int64_t digits) noexcept;  /* str(v, d) */
 
 /* The core (inttest.cpp). */
 void int_record(IntSite s, std::string &&line);

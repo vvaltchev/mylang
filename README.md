@@ -951,10 +951,21 @@ runtime instead.
     always-failing constant expression, a build error when fully constant).
     Otherwise `/` truncates toward zero and `%` takes the sign of the
     dividend, as in C: `-7 / 2 == -3`, `-7 % 2 == -1`, `7 % -2 == 1`.
+    An integer literal is decimal digits, from `0` to `9223372036854775807`
+    (2^63 - 1); the lowest int is written `-9223372036854775808` - a minus
+    directly before the digits 9223372036854775808, which fit no int on
+    their own (as an operand of anything else, `1 - 9223372036854775808` or
+    `-(9223372036854775808)`, they are out of range). A literal outside the
+    range is a compile error.
 
   * **Float**
     A floating-point number (e.g. `1.23`). Internally, it's a C `double`
-    (64-bit IEEE 754), exactly like Python's `float`. Dividing a float by
+    (64-bit IEEE 754), exactly like Python's `float`. A float literal is
+    decimal digits with a `.` and/or an exponent - `1.5`, `.5`, `5.`,
+    `1e5`, `2.5E-1` - and reads as the nearest double; a subnormal is kept
+    (the smallest positive double, `4.9e-324`, is a valid literal), while
+    a literal beyond the range (`1e999`), or so small that it would read
+    as 0 (`1e-400`), is a compile error. Dividing a float by
     zero (`0.0` or `-0.0`) throws `DivisionByZeroEx`, as does `%`; an
     infinity or a NaN comes from an overflow (`1e308 * 10.0`), from the
     `inf` and `nan` constants or from a math builtin, and then follows
@@ -2367,7 +2378,12 @@ Return the number of elements in the given container.
 
 #### `str(value, [decimal_digits])`
 Convert the given value to a string. If `value` is a float, the 2nd parameter
-indicates the desired number of decimal digits in the output string. A string
+indicates the desired number of decimal digits in the output string: an int
+from 0 to 64 (any other int throws `InvalidValueEx`, a non-int `TypeErrorEx`;
+only a float takes it). The value is rounded to the nearest, and one exactly
+halfway goes to the even digit, as C's `printf` and Python's `format` do:
+`str(2.5, 0)` is `"2"`, `str(3.5, 0)` is `"4"`, `str(0.125, 2)` is
+`"0.12"`. A string
 converts to **itself** (unquoted), but a string nested **inside a container**
 (array, dict, or struct) is rendered **quoted and escaped** so the output is
 unambiguous and re-parseable — e.g. `str(["a", 1])` is `[\"a\", 1]` and
@@ -2378,18 +2394,29 @@ echo uses this quoted form for the top-level value too, so a bare string echoes
 as `=> "hello"` (IRB-style).
 
 #### `int(value)`
-Convert the given string to an integer. If the value is a float, it is
+Convert the given value to an integer. If the value is a float, it is
 truncated toward zero (`int(-2.7) == -2`); a NaN, an infinity, or a float
 outside the integer range (`-2^63 <= x < 2^63`) has no integer value and
-throws `InvalidValueEx`. If the value is a string, it will be parsed and
-converted to an integer, if possible. If the value is already an integer,
-it will be returned as-it-is.
+throws `InvalidValueEx`. A string must be an integer as a whole: optional
+surrounding whitespace, an optional `+` or `-`, then decimal digits, as an
+integer literal spells them (`int(" -42 ") == -42`, `int("007") == 7`).
+Anything else - `"12abc"`, `"3.7"`, `"1e3"`, `"0x1A"`, `"1_000"`, an empty
+string - is not an integer, and neither is one outside the integer range;
+both throw `InvalidValueEx`. A bool is `0` or `1`, and an integer is
+returned as-it-is.
 
 #### `float(value)`
 Convert the given value to float. If the value is an integer, it will be
-converted to a floating-point number. If the value is a string, it will parsed
-and converted to float, if possible. If the value is already a float, it will be
-returned as-it-is.
+converted to a floating-point number. A string must be a number as a whole:
+optional surrounding whitespace, an optional `+` or `-`, then either a number
+spelled as a literal spells it (`"2.5"`, `".5"`, `"1e5"`, `"2.5E-1"`, `"7"`)
+or one of the words `inf`, `infinity`, `nan` in any case; anything else
+(`"1.5x"`, `"0x1p3"`, `"nan(1)"`, an empty string) throws `InvalidValueEx`.
+A number beyond the float range, or so small it reads as 0, is refused when
+it is known at COMPILE time, exactly like such a literal (`const F =
+float("1e999");` does not compile); at run time it rounds as IEEE does, to
+`inf` / `-inf` or to `0.0` / `-0.0` (`float(s)` with `s` read from a file).
+If the value is already a float, it will be returned as-it-is.
 
 #### `clone(obj)`
 Clone the given object, **shallowly**: a non-trivial object (array, dictionary,
@@ -2466,10 +2493,16 @@ other builtins like `push()` and `pop()`.
 
 #### `range(n, [end, [step]])`
 When only one parameter is provided, it returns an array with numbers
-from 0 to `n`. When `end` is passed to the function, the array goes from
-`n` to `end-1`. When `step` is passed too, the array goes from `n` to
-`end-step` with each element being `step` bigger than the previous. `step`
-can be negative as well. This is equivalent to `Python 2.x`'s range() function.
+from 0 to `n-1`. When `end` is passed to the function, the array goes from
+`n` to `end-1`. When `step` is passed too, the elements are `n`,
+`n + step`, `n + 2*step`, ... for as long as they lie strictly before `end`
+(below it for a positive step, above it for a negative one):
+`range(0, 10, 3)` is `[0, 3, 6, 9]`, `range(5, 0, -2)` is `[5, 3, 1]`. An
+`end` on the wrong side gives `[]`, and a `step` of 0 throws
+`InvalidValueEx`. The elements are exact even at the ends of int: the value
+after the last one need not be an int (`range(9223372036854775806,
+9223372036854775807, 5)` is `[9223372036854775806]`). This is equivalent to
+`Python 2.x`'s range() function.
 In `Python 3.x`, this is equivalent to: `list(range(...))`. Warning: while
 it might look pretty in foreach loops, that's typically not a good idea
 because it returns a whole array, not a generator object like in `Python 3.x`.

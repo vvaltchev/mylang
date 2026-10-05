@@ -256,5 +256,101 @@ want("dyn -0.0", str(-dfz), "-0.000000");
 want("dyn nan == nan", (dfi - dfi) == (dfi - dfi), false);
 want("dyn -0.0 == 0.0", -dfz == dfz, true);
 
+# --- range(): start + k*step for every k >= 0 strictly before end; a
+# step of 0 throws; the value after the last may lie outside int
+want("range(0, 10, 3)", range(ri(0), 10, 3), [0, 3, 6, 9]);
+want("range(0, 9, 3)", range(ri(0), 9, 3), [0, 3, 6]);
+want("range(5, 0, -2)", range(ri(5), 0, -2), [5, 3, 1]);
+want("range(7, 8)", range(ri(7), 8), [7]);
+want("range(3, 3)", range(ri(3), 3), []);
+want("range(-2)", range(ri(-2)), []);
+want("range(0, 5, -1)", range(ri(0), 5, -1), []);
+var dyn dr = range(ri(1), 7, 2);             # a dyn destination: general
+want("dyn range(1, 7, 2)", dr, [1, 3, 5]);
+want("range(0, 3, 0)", raised(func () => range(ri(0), 3, ri(0))),
+     "InvalidValueEx");
+want("range(max - 1, max, 5)",
+     range(ri(9223372036854775806), 9223372036854775807, 5),
+     [9223372036854775806]);
+want("range(min + 2, min, -5)",
+     range(ri(-9223372036854775806), -9223372036854775808, -5),
+     [-9223372036854775806]);
+want("range(min, max, max)",
+     range(ri(-9223372036854775808), 9223372036854775807,
+           9223372036854775807),
+     [-9223372036854775808, -1, 9223372036854775806]);
+
+# --- int(s) / float(s): the WHOLE string is the number, in a literal's
+# spelling, with optional surrounding whitespace and sign; anything else is
+# InvalidValueEx. float(s) out of range rounds at run time.
+func rs(str s) => str(runtime(s));
+want("int(\" -42\\t\")", int(rs(" -42\t")), -42);
+want("int(\"+7\")", int(rs("+7")), 7);
+want("int(\"007\")", int(rs("007")), 7);
+want("int(max)", int(rs("9223372036854775807")), 9223372036854775807);
+want("int(min)", int(rs("-9223372036854775808")), -9223372036854775808);
+want("int(max + 1)", raised(func () => int(rs("9223372036854775808"))),
+     "InvalidValueEx");
+want("int(\"\")", raised(func () => int(rs(""))), "InvalidValueEx");
+want("int(\"  \")", raised(func () => int(rs("  "))), "InvalidValueEx");
+want("int(\"12abc\")", raised(func () => int(rs("12abc"))),
+     "InvalidValueEx");
+want("int(\"3.7\")", raised(func () => int(rs("3.7"))), "InvalidValueEx");
+want("int(\"1_000\")", raised(func () => int(rs("1_000"))),
+     "InvalidValueEx");
+want("int(\"- 5\")", raised(func () => int(rs("- 5"))), "InvalidValueEx");
+want("int(\"99999999999999999999\")",
+     raised(func () => int(rs("99999999999999999999"))), "InvalidValueEx");
+# every whitespace character: \n \r \v \f around, \t too
+var ws4 = chr(10) + chr(13) + chr(11) + chr(12);
+want("int(ws + \"5\" + ws)", int(rs(ws4 + "5" + ws4)), 5);
+want("float(ws + \"2.5\" + ws)", float(rs(ws4 + "2.5" + ws4)), 2.5);
+want("float(\" 2.5 \")", float(rs(" 2.5 ")), 2.5);
+want("float(\"1E3\")", float(rs("1E3")), 1000.0);
+want("float(\".5e1\")", float(rs(".5e1")), 5.0);
+want("float(\"5.\")", float(rs("5.")), 5.0);
+want("float(\"-INF\")", str(float(rs("-INF"))), "-inf");
+want("float(\"Infinity\")", str(float(rs("Infinity"))), "inf");
+want("float(\"nan\")", str(float(rs("nan"))), "nan");
+want("float(\"4.9e-324\")", float(rs("4.9e-324")), 4.9e-324);
+want("float(\"4.9e-324\") > 0", float(rs("4.9e-324")) > 0.0, true);
+want("float(\"1e999\")", str(float(rs("1e999"))), "inf");
+want("float(\"-1e999\")", str(float(rs("-1e999"))), "-inf");
+want("float(\"1e-400\")", str(float(rs("1e-400"))), "0.000000");
+want("float(\"-1e-400\")", str(float(rs("-1e-400"))), "-0.000000");
+want("float(\"1.5x\")", raised(func () => float(rs("1.5x"))),
+     "InvalidValueEx");
+want("float(\"0x1p3\")", raised(func () => float(rs("0x1p3"))),
+     "InvalidValueEx");
+want("float(\"1e\")", raised(func () => float(rs("1e"))), "InvalidValueEx");
+want("float(\"1e5x\")", raised(func () => float(rs("1e5x"))),
+     "InvalidValueEx");
+want("float(\"+2.5\")", float(rs("+2.5")), 2.5);
+want("float(\"+inf\")", str(float(rs("+inf"))), "inf");
+want("float(\"\")", raised(func () => float(rs(""))), "InvalidValueEx");
+
+# --- str(f, digits): digits in [0, 64], else InvalidValueEx; rounded to
+# nearest, an exact tie to the even digit
+want("str(2.5, 0)", str(float(runtime(2.5)), 0), "2");
+want("str(3.5, 0)", str(float(runtime(3.5)), 0), "4");
+want("str(2.6, 0)", str(float(runtime(2.6)), 0), "3");
+want("str(0.125, 2)", str(float(runtime(0.125)), 2), "0.12");
+want("str(0.375, 2)", str(float(runtime(0.375)), 2), "0.38");
+want("len(str(1.0, 64))", len(str(fone, 64)), 66);
+want("str(1.0, 65)", raised(func [fone] () => str(fone, ri(65))),
+     "InvalidValueEx");
+want("str(1.0, -1)", raised(func [fone] () => str(fone, ri(-1))),
+     "InvalidValueEx");
+
+# --- literals: the ends of int (-2^63 written directly), an E exponent,
+# a subnormal kept (out-of-range literals are -rt's: they refuse to compile)
+want("-9223372036854775808",
+     -9223372036854775808 == ri(-9223372036854775807) - 1, true);
+want("9223372036854775807 + 1", 9223372036854775807 + ri(1),
+     -9223372036854775808);
+want("1E3", 1E3, 1000.0);
+want("2.5E-1", 2.5E-1, 0.25);
+want("4.9e-324 > 0.0", 4.9e-324 > float(runtime(0.0)), true);
+
 print("value classes: " + str(bad) + " failure(s)");
 assert(bad == 0);

@@ -1,9 +1,0 @@
-:help v1
-func print(
-i[-1];
-::
-var v1 = 2_;
-var a = 0x;
-:analyze i = -9223372036854775808;
-var v1 = 0x;
-:quit

@@ -1,0 +1,68 @@
+# Numbers at the edges of their text and of range(), each engine against
+# the tree-walker (corpus_diff) and against README.md (the asserts). All
+# were wrong until 2026-10-05:
+#  - range() stepped `i += step` until it passed end: when the value after
+#    the last one left int it WRAPPED, landed below end again and the loop
+#    never stopped (range(2^63 - 2, 2^63 - 1, 5) grew until memory ran out);
+#  - int(s) / float(s) read a C PREFIX and ignored the rest: int("12abc")
+#    was 12, int("3.7") 3, float("1.5x") 1.5 - the whole string is the
+#    number now, and a string that is not one is InvalidValueEx (it was a
+#    TypeErrorEx, though the type is right);
+#  - the smallest double, 4.9e-324, was refused as a literal (glibc's stod
+#    reports a subnormal as a range error), `1E5` was an invalid token while
+#    float("1E5") read it, and -2^63 could not be written at all.
+# Operands come from runtime(): a constant would fold at compile time.
+
+func rs(str s) => str(runtime(s));
+func ri(int x) => int(runtime(x));
+
+func raises(f) {
+    try {
+        f();
+    } catch (InvalidValueEx) {
+        return true;
+    }
+    return false;
+}
+
+var high = range(ri(9223372036854775806), 9223372036854775807, 5);
+var low = range(ri(-9223372036854775806), -9223372036854775808, -5);
+var whole = range(ri(-9223372036854775808), 9223372036854775807,
+                  9223372036854775807);
+print(high, low, whole);
+assert(high == [9223372036854775806]);
+assert(low == [-9223372036854775806]);
+assert(whole == [-9223372036854775808, -1, 9223372036854775806]);
+var n = 0;
+foreach (v in range(ri(9223372036854775800), 9223372036854775807, 3))
+    n++;
+assert(n == 3);
+assert(range(ri(0), 10, 3) == [0, 3, 6, 9]);
+assert(range(ri(5), 0, -2) == [5, 3, 1]);
+assert(range(ri(-2)) == []);
+assert(raises(func () => range(ri(0), 3, ri(0))));
+
+print(int(rs(" -42\t")), int(rs("+7")), int(rs("-9223372036854775808")));
+assert(int(rs(" -42\t")) == -42);
+assert(int(rs("9223372036854775807")) == 9223372036854775807);
+foreach (bad in ["12abc", "3.7", "1e3", "0x1A", "1_000", "", " ",
+                 "9223372036854775808", "--5"])
+    assert(raises(func [bad] () => int(rs(bad))));
+
+print(float(rs(" 1E5 ")), float(rs("-inf")), float(rs("4.9e-324")) > 0.0);
+assert(float(rs("1E5")) == 1e5);
+assert(float(rs("4.9e-324")) == 4.9e-324);
+assert(str(float(rs("NaN"))) == "nan");
+assert(str(float(rs("1e999"))) == "inf");
+assert(str(float(rs("-1e-400"))) == "-0.000000");
+foreach (bad in ["1.5x", "0x1p3", "1e", ".", "nan(1)", "", "1.5.2"])
+    assert(raises(func [bad] () => float(rs(bad))));
+
+print(-9223372036854775808, 1E3, 4.9e-324 > 0.0);
+assert(-9223372036854775808 == ri(-9223372036854775807) - 1);
+assert(1E3 == 1000.0 && 2.5E-1 == 0.25);
+
+print(str(float(runtime(2.5)), 0), str(float(runtime(0.125)), 2));
+assert(str(float(runtime(2.5)), 0) == "2");
+assert(str(float(runtime(3.5)), 0) == "4");
+assert(raises(func () => str(float(runtime(1.0)), ri(65))));

@@ -647,12 +647,27 @@ boundary it gains the rule first - the spec is the oracle, and a
 boundary it does not state cannot be checked (rules added that way:
 the sign of `/` and `%`, negative indexes, `pop`/`top`/`join` on an empty
 array, slice clamping for arrays, float division by zero, how a NaN and
--0.0 print, `int()` of a float with no int value). The float family's
+-0.0 print, `int()` of a float with no int value, `range()`'s elements,
+what string `int()` / `float()` accept, `str(f, d)`'s digit range and
+tie rounding, the literal limits). The float family's
 first run found three real defects: `-x` of 0.0 was +0.0 in the VM and
 JIT (codegen lowered it to `0.0 - x`; it is `-0.0 - x` now), `int()` of
 NaN / inf / an out-of-range float was an undefined C++ cast (it throws
 `InvalidValueEx` - two tests had asserted the x86 result), and a NaN
-printed `-nan` or `nan` by platform (always `nan` now).
+printed `-nan` or `nan` by platform (always `nan` now). The range /
+text / literal families (2026-10-05, 127 classes) found four more:
+`range()` stepped `i += step` past the end, so a step that carried the
+value past an int limit WRAPPED below the end again and never stopped (it
+counts its elements first now); `int(s)` / `float(s)` read a C PREFIX
+(`int("3.7")` was 3) - the whole string is the number now, InvalidValueEx
+otherwise; glibc's strtod reports a subnormal as a range error, so the
+smallest double was an unwritable literal; and `1E5` was an invalid token
+while `float("1E5")` read it. **`numtext.h` is the ONE reading of a number
+as text** - the parser's literals and `int()` / `float()` share it, so
+the two cannot drift again. Its float range rule is the maintainer's
+hybrid: out of range is a compile error when the value is known at
+compile time (a literal, or `float()` const-evaluated - the builtin asks
+`ctx->in_const_eval()`) and rounds to inf / a signed zero at run time.
 **THE OBJECT CENSUS (P4, 2026-10-03).** Each pooled heap object kind
 (str, arr, dict, struct, func, exc) is counted at its class `operator
 new/delete` in an INT build (`ML_POOL_NEW_DELETE_K`, poolalloc.h - the
@@ -2909,6 +2924,11 @@ nothing to register).
 - `parser.cpp` / `parser.h` — recursive-descent parser, const-folding woven in.
   `pBlock()` is the
   entry point.
+- `numtext.h` — the one reading of a number written as text (header-only):
+  `numtext_int` / `numtext_float` take the WHOLE string in a literal's
+  spelling and report ok / bad / overflow / underflow. The parser's
+  literals and the `int()` / `float()` builtins both call it; README's
+  `int(value)` / `float(value)` are its spec.
 - `funcdesc.h` — **`FuncDescriptor`**, the SERIALIZABLE runtime function
   identity (name/params/captures/frame data/purity/chunk pointer), plus the
   `DeclType`/`SymKind`/`ResolvedSym` enums it needs (moved here from

@@ -7326,10 +7326,14 @@ static const std::vector<test> tests =
       { "defined();" }, &typeid(InvalidNumberOfArgsEx) },
     { "str() with no args is rejected",
       { "str();" }, &typeid(InvalidNumberOfArgsEx) },
-    { "str() of a float with negative precision is a type error",
-      { "str(3.5, -1);" }, &typeid(TypeErrorEx) },
-    { "str() of a float with too-high precision is a type error",
-      { "str(3.5, 99);" }, &typeid(TypeErrorEx) },
+    /* an int digit count of the wrong VALUE (2026-10-05: it was a
+     * TypeErrorEx, though its type is right) */
+    { "str() of a float with negative precision is an invalid value",
+      { "str(3.5, -1);" }, &typeid(InvalidValueEx) },
+    { "str() of a float with too-high precision is an invalid value",
+      { "str(3.5, 99);" }, &typeid(InvalidValueEx) },
+    { "str() of a float with a non-int precision is a type error",
+      { "str(3.5, \"2\");" }, &typeid(TypeErrorEx) },
     { "runtime() with no args is rejected",
       { "runtime();" }, &typeid(InvalidNumberOfArgsEx) },
     {
@@ -7906,14 +7910,58 @@ static const std::vector<test> tests =
             "assert(abs(-2.5) == 2.5);",
         },
     },
-    { "int() of a non-numeric string is a type error",
-      { "int(\"abc\");" }, &typeid(TypeErrorEx) },
+    { "int() of a non-numeric string is an invalid value",
+      { "int(\"abc\");" }, &typeid(InvalidValueEx) },
     { "int() of an unsupported type is a type error",
       { "int([1]);" }, &typeid(TypeErrorEx) },
     { "int() with no args is rejected",
       { "int();" }, &typeid(InvalidNumberOfArgsEx) },
-    { "float() of a non-numeric string is a type error",
-      { "float(\"xyz\");" }, &typeid(TypeErrorEx) },
+    { "float() of a non-numeric string is an invalid value",
+      { "float(\"xyz\");" }, &typeid(InvalidValueEx) },
+    /* README: out of the float range, float(s) is refused when it is known
+     * at COMPILE time - a const, or a value auto-const folds - and rounds
+     * at run time (tests/int/22_value_classes.my) */
+    { "float() of an out-of-range string, const: a compile error",
+      { "const F = float(\"1e999\");" }, &typeid(InvalidValueEx) },
+    { "float() of an underflowing string, folded: a compile error",
+      { "var s = \"1e-400\";", "var f = float(s);", "print(f);" },
+      &typeid(InvalidValueEx) },
+    { "float() of an out-of-range string at run time rounds",
+      { "assert(str(float(str(runtime(\"-1e999\")))) == \"-inf\");",
+        "assert(str(float(str(runtime(\"1e-400\")))) == \"0.000000\");" } },
+    /* literals: the ends of int, an E exponent, a subnormal kept and the
+     * out-of-range ones refused (README, Integer / Float) */
+    { "literal: -9223372036854775808 is the lowest int",
+      { "assert(-9223372036854775808 == -9223372036854775807 - 1);",
+        "assert(- -9223372036854775808 == -9223372036854775808);" } },
+    { "literal: 9223372036854775808 alone is out of range",
+      { "var x = 9223372036854775808;" }, &typeid(SyntaxErrorEx) },
+    { "literal: a binary minus does not make 2^63 the lowest int",
+      { "var x = 1 -9223372036854775808;" }, &typeid(SyntaxErrorEx) },
+    { "literal: a parenthesized 2^63 is out of range",
+      { "var x = -(9223372036854775808);" }, &typeid(SyntaxErrorEx) },
+    { "literal: a postfix makes 2^63 its operand, out of range",
+      { "var x = -9223372036854775808[0];" }, &typeid(SyntaxErrorEx) },
+    { "literal: a call after 2^63 makes it the callee, out of range",
+      { "var x = -9223372036854775808(1);" }, &typeid(SyntaxErrorEx) },
+    { "literal: a member after 2^63 makes it the base, out of range",
+      { "var x = -9223372036854775808 .k;" }, &typeid(SyntaxErrorEx) },
+    { "literal: ?. after 2^63 makes it the base, out of range",
+      { "var x = -9223372036854775808?.k;" }, &typeid(SyntaxErrorEx) },
+    { "literal: ++ after 2^63 makes it the operand, out of range",
+      { "var x = -9223372036854775808++;" }, &typeid(SyntaxErrorEx) },
+    { "literal: -- after 2^63 makes it the operand, out of range",
+      { "var x = -9223372036854775808--;" }, &typeid(SyntaxErrorEx) },
+    { "literal: a negative literal past -2^63 is out of range",
+      { "var x = -99999999999999999999;" }, &typeid(SyntaxErrorEx) },
+    { "literal: an E exponent reads like e",
+      { "assert(1E5 == 1e5 && 2.5E-1 == 0.25);" } },
+    { "literal: a subnormal float is kept",
+      { "assert(4.9e-324 > 0.0);", "assert(4.9e-324 / 4.0 == 0.0);" } },
+    { "literal: a float beyond the range is a compile error",
+      { "var x = 1e999;" }, &typeid(SyntaxErrorEx) },
+    { "literal: a float that would read as 0 is a compile error",
+      { "var x = 1e-400;" }, &typeid(SyntaxErrorEx) },
     { "float() of an unsupported type is a type error",
       { "float([1]);" }, &typeid(TypeErrorEx) },
     { "abs() of an unsupported type is a type error",
@@ -12570,14 +12618,17 @@ static const std::vector<test> tests =
         {
             "int(\"abc\");",
         },
-        &typeid(TypeErrorEx),
+        &typeid(InvalidValueEx),
     },
 
     {
-        "int() builtin trucates in case of float string",
+        /* the WHOLE string is the integer: a C prefix parse read "4.5"
+         * as 4 until 2026-10-05 */
+        "int() of a fraction string is an invalid value",
         {
-            "assert(int(\"4.5\") == 4);",
+            "int(\"4.5\");",
         },
+        &typeid(InvalidValueEx),
     },
 
     {
@@ -12585,7 +12636,7 @@ static const std::vector<test> tests =
         {
             "float(\"abc\");",
         },
-        &typeid(TypeErrorEx),
+        &typeid(InvalidValueEx),
     },
 
     {
