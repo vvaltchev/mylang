@@ -2894,6 +2894,51 @@ void Inferencer::annotate_hints(Construct *n)
             }
         }
         call->callable_arg_mask = cmask;
+
+        /*
+         * Which arguments may bind `none` to a non-opt parameter (RULE 1 -
+         * CallExpr::none_arg_mask)? check_call refuses an opt-ish argument
+         * to a non-opt parameter of a known callee, but a `dyn` argument
+         * is non-opt by TYPE and may still hold none at run time, and an
+         * unknown callee (a function value, a dyn) may have any
+         * parameter non-opt. So a bit is set for a dyn / unresolved /
+         * opt-ish argument, and cleared where the callee is statically
+         * one function whose parameter is declared `opt`
+         * (callee_funcinfo refuses a rebound name, so the parameters
+         * read are the ones every call reaches), or where the argument
+         * names a parameter that is not `opt` and is never written - its
+         * own bind refused a none, so it holds none nowhere.
+         */
+        uint32_t nmask = 0;
+        if (na > 32) {
+            nmask = ~0u;
+        } else {
+            FuncInfo *fi = callee_funcinfo(call->what.get());
+            for (size_t i = 0; i < na; i++) {
+                StaticTypeRef at = static_type_resolve(
+                    type_of(call->args->elems[i].get()));
+                const bool maybe_none = at->opt
+                    || at->kind == StaticTypeKind::Dyn
+                    || at->kind == StaticTypeKind::None
+                    || at->kind == StaticTypeKind::Unknown;
+                if (!maybe_none)
+                    continue;
+                if (fi && i < fi->params.size() && fi->params[i]
+                        && fi->params[i]->opt_decl)
+                    continue;           /* an opt parameter takes none */
+                Construct *ae = call->args->elems[i].get();
+                if (ctag(ae) == ConstructType::id) {
+                    auto it = id_sym.find(static_cast<Identifier *>(ae));
+                    const TypeSym *ps =
+                        it != id_sym.end() ? it->second : nullptr;
+                    if (ps && ps->is_param && !ps->opt_decl
+                            && ps->writes == 0)
+                        continue;       /* a settled parameter: never none */
+                }
+                nmask |= 1u << i;
+            }
+        }
+        call->none_arg_mask = nmask;
         stamp_sum_identity(call);
         /* lever 4b: len(x)'s arg proven a non-opt array/string - the
          * BUILTIN-ness proof is codegen's (DirectBuiltinCallExpr + the

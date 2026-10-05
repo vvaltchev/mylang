@@ -6851,6 +6851,40 @@ extern "C" int jit_check_func(int_type slot) noexcept
     return 1;
 }
 
+/*
+ * RULE 1: the native CheckNoneArgsV - vm_check_none_bind's body with the
+ * caret left to the emitter: a refusal conveys LOC-LESS, carrying the
+ * argument index (Exception::bind_arg), and the op's exc-stamp selects
+ * that argument's span from arg_locs at run time - the stamp a call's own
+ * bind refusal takes. `kind` 0 = the callee is frame slot `callee`, 1 = a
+ * global slot; anything but a function there is the call's error.
+ */
+extern "C" int jit_check_none_args(int_type kind, int_type callee,
+                                   int_type argbase, int_type nargs) noexcept
+{
+    ML_JIT_OP_RAN(CheckNoneArgsV);
+    EvalContext *ctx = g_current_ctx;
+    const EvalValue *cv = nullptr;
+    if (kind == 0)
+        cv = &ctx->frame->at(callee).get();
+    else if (ctx->gfuncs->defined[callee])
+        cv = &ctx->gfuncs->slots[callee].get();
+    if (!cv || !cv->is<intrusive_ptr<FuncObject>>())
+        return 0;
+    try {
+        const LValue *run = nargs ? &ctx->frame->at(argbase) : nullptr;
+        check_none_bind(cv->get_ref<intrusive_ptr<FuncObject>>()->func,
+                        static_cast<size_t>(nargs),
+                        [&](size_t i) -> const EvalValue & {
+                            return run[i].get();
+                        }, /*call_site=*/true);
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /* model-flip (nativize-ops): the native MapFilterV - map/filter over the
  * pre-validated function + container via the SHARED vm_map_filter (the
  * interpreter's exact body; a callback re-enters vm_dispatch through
@@ -6862,17 +6896,22 @@ extern "C" int jit_check_func(int_type slot) noexcept
  * callback's UndefinedVariableEx - no clone()) rides g_vm_jit_eptr. */
 extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
                               int_type dst, int_type is_map,
-                              int_type site) noexcept
+                              int_type site, int_type cend) noexcept
 {
     ML_JIT_OP_RAN(MapFilterV);
     EvalContext *ctx = g_current_ctx;
+    /* the container caret (`site` is its start): carried explicitly, as
+     * the interpreted op passes it, so the only loc-less escape is a
+     * callback's bind - stamped with the argument list at the site */
+    const Loc cs(static_cast<int>(site >> 32),
+                 static_cast<int>(site & 0xffffffff));
+    const Loc ce(static_cast<int>(cend >> 32),
+                 static_cast<int>(cend & 0xffffffff));
     try {
         ctx->frame->at(dst).put(
             vm_map_filter(ctx, ctx->frame->at(fn_slot).get(),
                           ctx->frame->at(cont_slot).get(),
-                          (is_map & 1) != 0, Loc(), Loc(),
-                          Loc(static_cast<int>(site >> 32),
-                              static_cast<int>(site & 0xffffffff)),
+                          (is_map & 1) != 0, cs, ce, cs,
                           static_cast<int>((is_map >> 1) & 3)));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
@@ -7907,6 +7946,11 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
     const size_t nparams = d->params.size();
     if (n > nparams || n < static_cast<size_t>(d->min_args))
         throw InvalidNumberOfArgsEx();
+    /* RULE 1: a callback's argument (a dyn container's element) may be
+     * none - refused before the window is pushed */
+    check_none_bind(d, n, [&](size_t i) -> const EvalValue & {
+                        return argv[i];
+                    }, /*call_site=*/false);
 
     const int_type total =
         d->frame_size + static_cast<int_type>(cck->n_temps);
@@ -8303,6 +8347,11 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
     const size_t nparams = nparams_;
     if (n > nparams || n < min_args_)
         throw InvalidNumberOfArgsEx();
+    /* RULE 1: a boxed callback argument may be none (a general array's
+     * element); the raw-scalar binds (call_scalars) cannot carry one */
+    check_none_bind(d, n, [&](size_t i) -> const EvalValue & {
+                        return argv[i];
+                    }, /*call_site=*/false);
 
     if (fast_bind_) {
         for (size_t i = 0; i < n; i++)
@@ -8640,6 +8689,31 @@ void vm_stamp_setup_caret(Exception &e, const Chunk &chunk, size_t pc)
         return;
     e.loc_start = s;
     e.loc_end = en;
+}
+
+/*
+ * RULE 1: CheckNoneArgsV - a call whose argument may hold none - refuses a
+ * none bound to a parameter not declared `opt` BEFORE the call enters the
+ * callee, with the argument's caret (the op records the call's argument
+ * spans, read through vm_stamp_setup_caret like a call's own) and no callee
+ * frame - exactly where a bind error raises. Shared by the interpreted op
+ * and the JIT's helper (jit_check_none_args), so the two cannot drift.
+ */
+static ML_NOINLINE void
+vm_check_none_bind(const FuncDescriptor *d, EvalContext &ctx,
+                   int_type argbase, int_type nargs, const Chunk &chunk,
+                   size_t pc)
+{
+    try {
+        const LValue *run = nargs ? &ctx.frame->at(argbase) : nullptr;
+        check_none_bind(d, static_cast<size_t>(nargs),
+                        [&](size_t i) -> const EvalValue & {
+                            return run[i].get();
+                        }, /*call_site=*/true);
+    } catch (Exception &e) {
+        vm_stamp_setup_caret(e, chunk, pc);
+        throw;
+    }
 }
 
 /*
@@ -10301,6 +10375,20 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
                 g_vm_jit_eptr = std::current_exception();
                 return 2;
             }
+        }
+        /* RULE 1: none bound to a non-opt parameter - the interpreted op's
+         * check, conveyed with the same args caret */
+        try {
+            check_none_bind(
+                callee.get_ref<intrusive_ptr<FuncObject>>()->func, n,
+                [&](size_t i) -> const EvalValue & {
+                    return ctx.frame->at(argbase
+                        + static_cast<int_type>(i)).get();
+                }, /*call_site=*/true);
+        } catch (RuntimeException &e) {
+            vm_stamp_args_caret(e, al);
+            g_vm_jit_exc.reset(e.clone());
+            return 2;
         }
         /* 4-iv (task #148): the generic emit bakes NO post-call resume
          * stub, so a deeper switch under this call cannot retarget this
@@ -13429,6 +13517,14 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                         ctx.frame->at(argbase).put(RValue(a0_value()));
                     FuncObject &fo =
                         *callee.get_ref<intrusive_ptr<FuncObject>>().get();
+                    /* RULE 1: a dyn callee's parameters are known only
+                     * now - every such call checks (a slow path already);
+                     * the catch below stamps the argument's caret */
+                    check_none_bind(fo.func, nargs,
+                        [&](size_t i) -> const EvalValue & {
+                            return ctx.frame->at(argbase
+                                + static_cast<int_type>(i)).get();
+                        }, /*call_site=*/true);
                     if (!fo.func->vm_chunk_tried) {   /* AOT net */
                         fo.func->vm_chunk = vm_func_chunk(fo.func);
                         fo.func->vm_chunk_tried = true;
@@ -13539,6 +13635,25 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         }
         VM_NEXT;
 
+        VM_CASE(CheckNoneArgsV): {
+            /* RULE 1: the call that follows may hand `none` to a parameter
+             * not declared `opt` (codegen emits this op only where an
+             * argument's static type allows none). Check the RUNTIME
+             * callee's parameters; anything but a function (unbound, a
+             * struct, a non-callable) is the call's own error to raise. */
+            const EvalValue *cv = nullptr;
+            if (in->target == 0)
+                cv = &ctx.frame->at(in->target2).get();
+            else if (ctx.gfuncs->defined[in->target2])
+                cv = &ctx.gfuncs->slots[in->target2].get();
+            if (cv && cv->is<intrusive_ptr<FuncObject>>())
+                vm_check_none_bind(
+                    cv->get_ref<intrusive_ptr<FuncObject>>()->func, ctx,
+                    in->a_lit(), in->b_lit(), *chunk, pc);
+            pc++;
+        }
+            VM_NEXT;
+
         VM_CASE(CheckFuncV):
             /* map/filter's arg0 guard: throw (arg0's caret, from the loc side
              * table) if it isn't a function, BEFORE arg1's code runs - the
@@ -13557,11 +13672,23 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * unsupported-container caret comes from the loc side table. */
             Loc s, en;
             chunk->loc_at(pc, s, en);
-            ctx.frame->at(in->target).put(
-                vm_map_filter(&ctx, ctx.frame->at(in->a_slot()).get(),
-                              ctx.frame->at(in->b_slot()).get(),
-                              (in->target2 & 1) != 0, s, en, s,
-                              static_cast<int>((in->target2 >> 1) & 3)));
+            try {
+                ctx.frame->at(in->target).put(
+                    vm_map_filter(&ctx, ctx.frame->at(in->a_slot()).get(),
+                                  ctx.frame->at(in->b_slot()).get(),
+                                  (in->target2 & 1) != 0, s, en, s,
+                                  static_cast<int>((in->target2 >> 1) & 3)));
+            } catch (Exception &e) {
+                /* a loc-less escape is a callback's BIND refusing an
+                 * element: the argument list's caret (base_locs), the
+                 * tree-walker's builtin-call stamp */
+                Loc bs, be;
+                if (!e.loc_start && chunk->base_loc_at(pc, bs, be)) {
+                    e.loc_start = bs;
+                    e.loc_end = be;
+                }
+                throw;
+            }
             pc++;
         }
         VM_NEXT;

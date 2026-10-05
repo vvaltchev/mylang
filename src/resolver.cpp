@@ -5570,9 +5570,12 @@ private:
             in_repl_tmpl_base = repl_mode && fd->is_template;
             ML_INT_ONLY(const FuncDeclStmt *int_saved = int_caller;
                         int_caller = fd;)
+            const FuncDeclStmt *fn_saved = cur_fn;
+            cur_fn = fd;
             if (fd->body)
                 walk(fd->body, depth,
                      fd->desc->resolved ? &fd->desc->frame_size : nullptr);
+            cur_fn = fn_saved;
             ML_INT_ONLY(int_caller = int_saved;)
             in_repl_tmpl_base = saved;
             return;
@@ -5616,13 +5619,65 @@ private:
         try_specialize(slot);   /* if still a call to a block-bodied func */
     }
 
+    /* the function whose body walk() is in (null: main) */
+    const FuncDeclStmt *cur_fn = nullptr;
+
+    /*
+     * RULE 1: may an argument of `ce` bind `none` to a parameter of `f`
+     * that is not declared `opt`? The CALL's bind refuses that - inlined,
+     * nothing would bind it, and the body would run on a none its
+     * parameter can never hold - so such a call stays a call, in every
+     * engine (the tree is shared). An argument is cleared by its mask bit
+     * (CallExpr::none_arg_mask - the inferencer's type answer), by its
+     * SHAPE (CallExpr::arg_never_none), by `f`'s parameter being `opt`,
+     * or by naming a parameter of the enclosing function that is not
+     * `opt` and is never written: its own bind already refused a none.
+     * The last two need no inference, so an unstamped call (-nti, a
+     * harness running the resolver alone) still inlines `f(n)`.
+     */
+    bool binds_none(const CallExpr *ce, const FuncDeclStmt *f) const
+    {
+        const size_t n = ce->args ? ce->args->elems.size() : 0;
+        const FuncDescriptor *d = f->desc;
+        for (size_t i = 0; i < n; i++) {
+            if (i < 32 && !((ce->none_arg_mask >> i) & 1u))
+                continue;
+            const Construct *a = ce->args->elems[i].get();
+            if (CallExpr::arg_never_none(a))
+                continue;
+            if (i < d->params.size() && d->params[i].opt)
+                continue;
+            if (names_settled_param(a))
+                continue;
+            return true;
+        }
+        return false;
+    }
+
+    /* `a` reads a parameter of cur_fn that is not `opt` and that the body
+     * never writes - a value its bind refused none for (slots below the
+     * parameter count are the parameters; inlining remaps a callee's
+     * locals above the caller's frame, so none lands there) */
+    bool names_settled_param(const Construct *a) const
+    {
+        if (!cur_fn || ctag(a) != ConstructType::id)
+            return false;
+        const auto *id = static_cast<const Identifier *>(a);
+        if (id->sym.kind != SymKind::local || id->sym.slot < 0)
+            return false;
+        const size_t s = static_cast<size_t>(id->sym.slot);
+        const FuncDescriptor *d = cur_fn->desc;
+        return s < d->params.size() && !d->params[s].opt
+               && s < cur_fn->slot_writes.size()
+               && cur_fn->slot_writes[s] == 0;
+    }
+
     void try_inline(unique_ptr<Construct> &slot, int depth, int *fsize,
                     bool no_block = false)
     {
         auto *ce = dynamic_cast<CallExpr *>(slot.get());
         if (!ce)
             return;
-
         /* The callee must be a plain name that is NOT a resolved local (a local
          * could shadow a same-named top-level function). */
         auto *callee = dynamic_cast<Identifier *>(ce->what.get());
@@ -5639,6 +5694,8 @@ private:
         /* Arg count must match, else the runtime arity error must survive. */
         if (ce->args->elems.size() != nparams)
             return;
+        if (binds_none(ce, f))
+            return;                     /* RULE 1: see binds_none */
 
         /* The body EXPRESSION (the splice source): the `=> expr` sugar's
          * inner expr - the Block/Return wrapper is not spliced (it would put
@@ -5970,6 +6027,8 @@ private:
             return;       /* its locals aren't slotted: nothing to remap into */
         if (in_repl_tmpl_base)
             return;       /* see in_repl_tmpl_base */
+        if (binds_none(ce, f))
+            return;       /* RULE 1: see binds_none */
 
         /*
          * A SELF-RECURSIVE callee (block_inlinable_decl admitted it only if it
@@ -6236,6 +6295,8 @@ private:
             ? static_cast<int>(f->params->elems.size()) : 0;
         if (static_cast<int>(ce->args->elems.size()) != nparams)
             return;
+        if (binds_none(ce, f))
+            return;                     /* RULE 1: see binds_none */
 
         const int bsz = node_count(f->body.get());
         if (bsz > max_nodes)
@@ -6888,6 +6949,13 @@ private:
                 continue;          /* unknown or reassigned: don't bind it */
 
             Construct *arg = ce->args->elems[i].get();
+
+            /* RULE 1: a none into a parameter not declared `opt` stays an
+             * argument, for the clone's bind to refuse (folding it in would
+             * bind nothing; -nti is the only way such a call compiles) */
+            if (ctag(arg) == ConstructType::lit_none
+                    && !(i < f->desc->params.size() && f->desc->params[i].opt))
+                continue;
 
             if (dynamic_cast<Literal *>(arg)) {
                 seed[static_cast<int>(i)] = arg->eval(&cctx);

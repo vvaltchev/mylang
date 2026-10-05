@@ -1254,6 +1254,29 @@ enum class OpCode : unsigned char {
     UnpackLenCheck,
 
     /*
+     * RULE 1 (2026-10-05): refuse `none` bound to a parameter not declared
+     * `opt` - emitted IMMEDIATELY BEFORE a user call (CallV / CachedCallV /
+     * CallValueV) whose arguments the inferencer could not prove non-none
+     * (CallExpr::none_arg_mask: a `dyn` is non-opt by type and may still
+     * hold none). `target` = the callee's kind (0 = the frame slot
+     * `target2` holds the callee VALUE, a CallValueV's; 1 = the global
+     * slot `target2`, a CallV's), `a` = the argument run's base, `b` = its
+     * count - the call's own operands. If the callee is a function,
+     * check_none_bind walks the arguments in parameter order and raises the
+     * TypeErrorEx the bind would - after every argument evaluated, before
+     * any callee frame, at the same argument (Exception::bind_arg selects
+     * the op's arg_locs caret; base_locs holds the argument list). Anything
+     * else - a non-function, an unbound global - passes: the call raises
+     * its own error. A separate op, not a check inside the call, so every
+     * native call tier and the bytecode inliner stay as they are: the call
+     * never sees a none, and the inliner pastes its body after this op.
+     * Standing between the run and the call, it also stops the staging
+     * scans (argument fusion, the inliner's step 1) - safely, as both
+     * only fuse adjacent moves.
+     */
+    CheckNoneArgsV,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1305,7 +1328,7 @@ enum class OpCode : unsigned char {
     X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt) X(EnterNative) \
     X(ExitBlock) X(LoadElem2Int) X(LoadElem2Float) X(ArrEpochMark) \
     X(ArrEpochCheck) X(GuardCalleeV) X(LoadCaptureOfV) X(StoreCaptureOfV) \
-    X(UnpackLenCheck)
+    X(UnpackLenCheck) X(CheckNoneArgsV)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin

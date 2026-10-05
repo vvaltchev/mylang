@@ -23,7 +23,9 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 28;   /* v28: IncDecSite gains
+constexpr unsigned MYV_FORMAT_VERSION = 29;   /* v29: the APPENDED
+                                                 CheckNoneArgsV opcode;
+                                                 v28: IncDecSite gains
                                                  bstart / bend; v27:
                                                  IncDecChain loses
                                                  allow_flat / allow_pod;

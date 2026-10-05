@@ -1290,6 +1290,27 @@ slot = "now a string";           # ok, because it's dyn
     to a non-`opt` `dyn` parameter is still a compile error asking for
     `opt dyn`.
 
+    **A `none` the compiler cannot see is refused at the call.** A `dyn`
+    value is non-opt by type, yet at run time it may hold `none` — read from
+    a `dyn` container, returned by `runtime(none)`, or passed through a
+    `dyn` callee the compiler cannot check against. Whatever the path, a
+    parameter that is not `opt` never holds `none`: binding one raises a
+    `TypeErrorEx` naming the parameter (`parameter 'x' is not 'opt' and
+    cannot be none`), at the call, before the function's body runs. Every
+    argument has been evaluated by then, left to right, and the caret marks
+    the offending argument. This holds for every kind of parameter — typed,
+    untyped, `dyn`, a struct or an array — and for a function a builtin
+    calls back (`map`, `filter`, `sort`, `find`, `sum`, `make_dict`), where
+    the caret marks the builtin call's arguments. An `opt` parameter takes
+    `none` as always.
+
+    ```
+    func g(int x) { return x * 2 + 1; }
+    var dyn h = runtime(g);
+    h(none);          # TypeErrorEx: parameter 'x' is not 'opt' and cannot
+                      # be none - g's body never runs
+    ```
+
 #### Null-checks are understood (narrowing)
 
 After you check a nullable value against `none`, it is treated as non-`none` in

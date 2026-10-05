@@ -3460,6 +3460,31 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * RULE 1: a call whose arguments may bind none to a non-opt parameter
+     * (CallExpr::none_arg_mask) gets a CheckNoneArgsV between its argument
+     * run and the call op - every argument evaluated, no frame yet, which
+     * is where a bind refuses. `kind` 0 = the callee value is in frame slot
+     * `callee` (a CallValueV), 1 = global slot `callee` (a CallV). Its
+     * carets are the call's: the argument list (base_locs) and each
+     * argument's span (arg_locs, read off the same node in extract_locs).
+     */
+    void emit_none_args_check(const CallExpr *call, int kind, int callee,
+                              int argbase, std::vector<CgInstr> &ops)
+    {
+        if (!call->may_bind_none())
+            return;
+        CgInstr chk;
+        chk.op = OpCode::CheckNoneArgsV;
+        chk.node_idx = add_ast_node(call);
+        chk.base_node_idx = add_ast_node(call->args.get());
+        chk.target = kind;
+        chk.target2 = callee;
+        chk.set_a(int_lit(argbase));
+        chk.set_b(int_lit(static_cast<int>(call->args->elems.size())));
+        ops.push_back(chk);
+    }
+
     bool try_native_call(const DirectCallExpr *dc, int &out_slot,
                          std::vector<CgInstr> &ops)
     {
@@ -3469,6 +3494,7 @@ struct Codegen {
         int argbase;
         if (!emit_args_range(dc->args->elems, argbase, ops))
             return false;
+        emit_none_args_check(dc, 1, dc->direct_func_slot, argbase, ops);
 
         const int dst = alloc_temp();
         CgInstr cv;
@@ -3691,6 +3717,7 @@ struct Codegen {
             next_temp = save_top;
             return false;
         }
+        emit_none_args_check(call, 0, callee_slot, argbase, ops);
 
         const int dst = alloc_temp();
         CgInstr cv;
@@ -4163,6 +4190,11 @@ struct Codegen {
         CgInstr in;
         in.op = OpCode::MapFilterV;
         in.node_idx = add_ast_node(dc->args->elems[1].get());    /* arg1's caret (container) */
+        /* the ARGUMENT LIST, its second caret (base_locs): a loc-less
+         * escape - a callback's bind refusing an element (a coercion, a
+         * none into a non-opt parameter) - takes the list, as the
+         * tree-walker's builtin-call catch stamps it */
+        in.base_node_idx = add_ast_node(dc->args.get());
         in.target = dst;
         /* bit 0 = is_filter; bits 1-2 = the flat result kind (#97 CB3,
          * map_filter_flat_hint) */
@@ -8785,7 +8817,8 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
              * mean "argument list" by their base node.
              */
             if ((in.op == OpCode::CallV || in.op == OpCode::CachedCallV
-                 || in.op == OpCode::CallValueV)
+                 || in.op == OpCode::CallValueV
+                 || in.op == OpCode::CheckNoneArgsV)
                     && ctag(bn) == ConstructType::expr_list) {
                 const auto *el = static_cast<const ExprList *>(bn);
                 Chunk::ArgLocEntry ae;
@@ -8924,6 +8957,8 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::Rethrow:        /* node = RethrowStmt (rethrow-site loc) */
         case OpCode::CoerceNumV:    /* node = the Expr14 (narrow-throw caret) */
         case OpCode::CheckCallableV: /* node = the callee (NotCallable caret) */
+        case OpCode::CheckNoneArgsV: /* node = the CallExpr (its argument
+                                      * carets ride base_locs / arg_locs) */
         case OpCode::CallValueGenericV: /* node = the CallExpr: the CALL-SITE
                                      * loc (a FuncObject callee's backtrace via
                                      * do_func_call's loc_at); the op is now
@@ -9426,6 +9461,11 @@ static bool visit_use_def(const Instr &in, U u, D d)
         u(in.target2);
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
+    case OpCode::CheckNoneArgsV:   /* reads the callee and the run; no def */
+        if (in.target == 0)
+            u(in.target2);
+        run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
+        return true;
     case OpCode::MakeArrayV:
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
@@ -12068,6 +12108,16 @@ void ChunkVerifier::verify_one(const Instr &in)
         run(in.a_lit(), in.b_lit() & 0xfff);
         pool(in.b_lit() >> 12, ck.call_sites.size(), "call site");
         break;
+    case OpCode::CheckNoneArgsV:
+        /* `target` = the callee's kind: 0 a frame slot, 1 a global slot */
+        if (in.target == 0)
+            reg(in.target2);
+        else if (in.target == 1)
+            gslot(in.target2);
+        else
+            reject("none-check callee kind");
+        run(in.a_lit(), in.b_lit());
+        break;
     case OpCode::CheckFuncV:
     case OpCode::CheckCallableV:
     case OpCode::ReturnV:
@@ -12916,9 +12966,11 @@ bool bc_inline_op_ok(OpCode op)
     case OpCode::ForLoopStep:
     case OpCode::IntAddStep:
     /* the boundary + the nested call (its target2 is a GLOBAL slot, not a
-     * frame slot - the remapper must leave it alone, and does) */
+     * frame slot - the remapper must leave it alone, and does) - and the
+     * none check standing before such a call (RULE 1) */
     case OpCode::ReturnV:
     case OpCode::CallV:
+    case OpCode::CheckNoneArgsV:
     /* #97 increment 2: the flat element READS - base (target2) and
      * index (a) read, dst written; no pool. (The element STORES are
      * admitted by bc_inline_callee_ok, since whether one may run in
@@ -13425,6 +13477,14 @@ static void bc_map_slots(Instr &in, const F &map)
          * alone is the whole reason this is written by hand. `a` is the
          * ARG RUN's base, a frame slot carried as a literal. */
         rt();
+        in.set_a(int_lit(map(static_cast<int>(in.a_lit()))));
+        break;
+    case OpCode::CheckNoneArgsV:
+        /* `target` is the callee's KIND, not a slot; `target2` is a frame
+         * slot only for kind 0 (a global for 1, as CallV's); `a` is the
+         * run's base, a frame slot carried as a literal */
+        if (in.target == 0)
+            in.target2 = map(in.target2);
         in.set_a(int_lit(map(static_cast<int>(in.a_lit()))));
         break;
     /* #97 closure inlining - a VALUE site's body only (the gate admits

@@ -1315,9 +1315,17 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
  * conveys a loc-less TypeErrorEx, stamped at the op pc by the re-raise) and
  * MapFilterV (the shared vm_map_filter body; callback re-enters vm_dispatch). */
 extern "C" int jit_check_func(int_type slot) noexcept;
+
+/* RULE 1: CheckNoneArgsV - refuse a none bound to a parameter not declared
+ * `opt` before the call that follows enters its callee. kind 0 = the
+ * callee is frame slot `callee`, 1 = a global slot. A refusal conveys a
+ * loc-less TypeErrorEx carrying bind_arg (the emitter's stamp selects the
+ * argument's caret) + returns 1. */
+extern "C" int jit_check_none_args(int_type kind, int_type callee,
+                                   int_type argbase, int_type nargs) noexcept;
 extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
                               int_type dst, int_type is_map,
-                              int_type site) noexcept;
+                              int_type site, int_type cend) noexcept;
 
 /* model-flip (nativize-ops): the dyn-callee generic call pair. CheckCallableV
  * (the callable guard - conveys a loc-less NotCallableEx, exc-stamped with

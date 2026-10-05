@@ -17451,3 +17451,70 @@ net that saw a dropped rest-run read or a dropped arg0 read (watched -
 yet). Removing the argfuse gate fails `int_splice_gates` (watched).
 corpus_diff's whole matrix (57 configurations x 69 programs), the
 enumerator's tiers 1 and 2 and int_run are green.
+
+### RULE 1: CheckNoneArgsV - THE BIND REFUSES A NONE (2026-10-05)
+
+`func g(int x) { var y = x * 2; return y + 1; } var dyn h = runtime(g);
+print(h(none));` raised late (at `x * 2`) in the tree-walker, aborted the
+INT VM state checker under `-nj` and PRINTED 1 under the JIT: the static
+check refuses an `opt` argument to a non-opt parameter, but a `dyn` value
+is non-opt by type, so a none reached every bind tier and each did
+something different with it. A direct `g(d)` with a dyn `d` printed 1 too
+(the AST inliner pasted the body, M8 typed it, the JIT read none's
+payload as 0). The defined outcome is now a TypeErrorEx at the bind,
+naming the parameter, with the argument's caret, in every engine.
+
+**The first design was wrong and the reason is worth keeping.** It put a
+flag on the call op and sent a flagged site to the interpreter: the
+emitted push, the frameless sites, REGCALL and the bytecode inliner would
+otherwise each need a check of their own. -rt then failed 19 JIT shape
+tests - flagged sites are rare in bench/ (none) but common in
+tests/functional, where `runtime()` makes values `dyn` on purpose, so
+interpreting them gutted the JIT's own test coverage. The op that
+replaced it leaves every call tier untouched: `CheckNoneArgsV` stands
+between the staged argument run and the call, reads the RUNTIME callee
+(a frame slot, or a global slot as CallV's) and refuses through
+`check_none_bind`, which walks the binds in order and stops where the
+bind would raise first (an arity error, a coercion). The callee then
+never sees a none. Fully native (`jit_check_none_args`, conveys, exc-
+stamped with the argument's span from `arg_locs` - a near jump: the
+per-argument select is longer than a rel8), so a frameless body may hold
+one; the bytecode inliner carries it with the call it guards.
+
+**Reach and cost.** Emitted only where `CallExpr::may_bind_none()`: an
+argument whose static type allows none, whose shape does not rule it out,
+not reaching a parameter known to be `opt`, and not a settled parameter
+of the caller (not `opt`, never written - its own bind refused a none).
+Over bench/ + samples/: ZERO sites, and -vdj is byte-identical to the
+parent commit on 109 of 111 programs; the two others are
+35_map_filter and phonebook, whose MapFilterV gained one `mov r9, imm`
+(the container caret's end, so the interpreted and native ops stamp a
+callback's bind refusal with the same argument-list caret) and a longer
+cold stamp. tests/functional holds 102 sites in 25 programs. A checked
+call pays its staging moves: argfuse and the inliner's step 1 scan back
+over `MoveV`s only, so the op stops them. `jit_frameless_w2_shape` and a
+W2 decline case moved their dyn source onto a settled PARAMETER to keep
+pinning the fused path.
+
+**The tree-walker had a second, older divergence in the same function.**
+`do_func_bind_params` checked the arity first and evaluated each argument
+just before its own bind, while the VM stages the whole run first: an
+arity error or an earlier bind refusal skipped a later argument's side
+effect in the tree-walker alone (`g(note("a"), note("b"))` logged `a`
+where the VM logged `a b`; with inlining on, the AST inliner's
+args-as-locals happened to agree with the tree-walker, which is why no
+corpus program showed it). It evaluates every argument first now.
+
+**Watched failing** (each a sabotaged copy, rebuilt, restored and rebuilt
+inside the restore), on tests/functional/72_none_bind.my and the five
+`-rt` `err loc: a NONE ...` cases: the tree-walker's check removed fails
+`-tw` and the reference run (0/5); codegen never emitting the op aborts
+`-nj` on `read_int_slot`'s state check and lets the JIT accept 7 shapes;
+the JIT helper checking nothing fails the two JIT modes; the callback
+invokers checking nothing fail map/sort/make_dict/find (and abort `-nj`);
+the interpreted dyn-callee check removed aborts `-nj`; the JIT
+generic-call helper's removed fails the dyn-callee case in the JIT modes;
+the AST inliner ignoring `binds_none` fails the two pasted-callee cases
+in every engine (the JIT prints the original bug: a typed parameter read
+as 0) and one -rt case; the tree-walker evaluating lazily again fails
+`argument order` under `-tw`.
