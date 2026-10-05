@@ -833,7 +833,13 @@ visit_use_def, so compute_ref_slots listed EVERY slot of the chunk as
 reference-carrying) every op here has an exact row. MultiUnpackV stays for a
 `dyn` rvalue, an OPT array (a runtime none SPREADS), a compound
 `a, b += arr`, a coercing typed target, or a target that is the rvalue's own
-slot. 73_multi_unpack: 7.19x -> 2.21x of C++. A
+slot. 73_multi_unpack: 7.19x -> 2.21x of C++. Used as a VALUE (`w = a, b
+= arr`, `return a, b = arr` - README: the value is `none`) the multi-assign
+compiles as the statement above, then a `LoadConstV` of none (2026-10-06;
+a NotLoweredEx until then). Every one of these paths requires its targets
+to be resolved LOCALS: a global or a capture target is still a
+NotLoweredEx in the VM while the tree-walker runs it (open). A
+**`return <expr>;`** likewise lowers to a
 **`return <expr>;`** likewise lowers to a
 `ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
 sets flow={ret,value} and stops the chunk. A **ternary VALUE** (`cond ? a : b`)

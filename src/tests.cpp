@@ -679,7 +679,33 @@ static const std::vector<test> tests =
             "var a = 1;",
             "assert((a += 3) == 4);",
             "assert(a == 4);",
+            /* typed through its declaration: the compound's static type */
+            "var z = (a += 3);",
+            "assert(z == 7 && a == 7);",
         },
+    },
+
+    /* A multi-assignment's value is none (README), in every engine: the
+     * VM refused to compile the value form and the inferencer typed it
+     * as the right-hand side, so a typed destination held none. */
+    {
+        "multi-assign as expr is none",
+        {
+            "var a = 0; var b = 0; var dyn w = 1;",
+            "w = a, b = [runtime(5), 6];",
+            "assert(w == none && a == 5 && b == 6);",
+            "w = a, b += [runtime(1), 1];",
+            "assert(w == none && a == 6 && b == 7);",
+        },
+    },
+
+    {
+        "multi-assign value into a typed destination is refused",
+        {
+            "var a = 0; var b = 0; array<int> w;",
+            "w = a, b = [5, 6];",
+        },
+        &typeid(NullabilityEx),
     },
 
     {
