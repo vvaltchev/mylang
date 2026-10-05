@@ -3442,12 +3442,14 @@ bool construct_no_side_effects(const Construct *c)
  * Returns true (and sets `out`) on a store; false ONLY for a compound op on a
  * flat struct array (structs have no `+=`), so the caller defers to the general
  * path. `sub_*` is the subscript's caret (OOB / type errors), `idx_*` the
- * index's (the "Expected integer" error).
+ * index's (the "Expected integer" error). A compound op stores the element
+ * it read in `*old_out` when given - the value a postfix `++` / `--` yields.
  */
 static bool
 flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
                 const EvalValue &rval, Op op, EvalValue &out,
-                Loc sub_start, Loc sub_end, Loc idx_start, Loc idx_end)
+                Loc sub_start, Loc sub_end, Loc idx_start, Loc idx_end,
+                EvalValue *old_out = nullptr)
 {
     /*
      * Flat POD-struct array: `a[i] = <matching POD struct>` stores the value's
@@ -3550,6 +3552,8 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
         newval = r;
     } else {
         newval = arr_elem_boxed(arr, idx);   /* read current element, any kind */
+        if (old_out)
+            *old_out = newval;
         apply_compound_op(newval, r, op);
     }
 
@@ -3651,10 +3655,12 @@ static void stamp_like_eval(const Construct *n, Exception &e)
 }
 
 /* The general tail of a store: the formed reference is an LValue to write,
- * or the target is not a location. */
+ * or the target is not a location. `*old_out`, when given, receives the
+ * value the store replaced (as do the stores below). */
 static EvalValue
 assign_through(EvalContext *ctx, const Construct *lvalue,
-               const EvalValue &lval, const EvalValue &rval, Op op)
+               const EvalValue &lval, const EvalValue &rval, Op op,
+               EvalValue *old_out = nullptr)
 {
     if (!lval.is<LValue *>())
         throw NotLValueEx(lvalue->start, lvalue->end);
@@ -3669,6 +3675,8 @@ assign_through(EvalContext *ctx, const Construct *lvalue,
             throw CannotRebindBuiltinEx(lvalue->start, lvalue->end);
         throw CannotRebindConstEx(lvalue->start, lvalue->end);
     }
+    if (old_out)
+        *old_out = lv->get();
     return doAssign(lval, rval, op);
 }
 
@@ -3692,7 +3700,7 @@ assign_through(EvalContext *ctx, const Construct *lvalue,
  */
 static EvalValue
 subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
-                const EvalValue &rval)
+                const EvalValue &rval, EvalValue *old_out = nullptr)
 {
     EvalValue base, key;
     try {
@@ -3712,7 +3720,7 @@ subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
         EvalValue out;
         if (flat_store_core(base.get<LValue *>(), *arr, key, rval, op, out,
                             sub->start, sub->end,
-                            sub->index->start, sub->index->end))
+                            sub->index->start, sub->index->end, old_out))
             return out;
     }
 
@@ -3726,12 +3734,12 @@ subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
         stamp_like_eval(sub, e);
         throw;
     }
-    return assign_through(ctx, sub, elv, rval, op);
+    return assign_through(ctx, sub, elv, rval, op, old_out);
 }
 
 static EvalValue
 member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
-             const EvalValue &rval)
+             const EvalValue &rval, EvalValue *old_out = nullptr)
 {
     EvalValue base;
     try {
@@ -3758,6 +3766,8 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
                     newval = r;
                 } else {
                     newval = obj.pod_get(slot);
+                    if (old_out)
+                        *old_out = newval;
                     apply_compound_op(newval, r, op);
                 }
                 /* coerce + runtime-validate to the field's scalar type
@@ -3778,7 +3788,7 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
         stamp_like_eval(mem, e);
         throw;
     }
-    return assign_through(ctx, mem, lval, rval, op);
+    return assign_through(ctx, mem, lval, rval, op, old_out);
 }
 
 /*
@@ -4153,10 +4163,11 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
  * tree-walker's rvalue-ness, so the final ref of an rvalue base is an rvalue).
  *
  * Tier 2 (a proven int/float lvalue) == handle_single_expr14(`±= 1`)
- * (subscript_store / member_store) then old = new ∓ 1 (apply_compound_op -
- * so a dyn-laundered non-numeric derives or throws EXACTLY as the
- * tree-walker's derive does). The walk already evaluated every key once,
- * so the final step takes the same stores:
+ * (subscript_store / member_store), each store reporting the value it
+ * replaced, which postfix returns (it was derived as new ∓ 1 until
+ * 2026-10-05: wrong for a float, (0.1 + 1) - 1 != 0.1, and for -0.0). The
+ * walk already evaluated every key once, so the final step takes the same
+ * stores:
  *   - final SUBSCRIPT: a rooted flat array's element through flat_store_core,
  *     else the general subscript(for_write=false) lvalue + slot_rmw (a value
  *     base's element is an RVALUE -> NotLValueEx at the LVALUE caret);
@@ -4186,7 +4197,7 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
 
     if (tier2) {
 
-        EvalValue nv;
+        EvalValue nv, old;
         bool have_nv = false;
 
         if (is_member) {
@@ -4199,7 +4210,12 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                 cval.get<intrusive_ptr<StructObject>>()->is_pod()) {
 
                 /* member_store's case: a rooted POD struct - byte-store the
-                 * field. */
+                 * field (a missing member throws in vm_member_store). */
+                const StructObject &obj =
+                    *cval.get_ref<intrusive_ptr<StructObject>>().get();
+                const int slot = obj.def->slot_of(memUid);
+                if (slot >= 0)
+                    old = obj.pod_get(slot);
                 nv = vm_member_store(cur.get<LValue *>(), memUid, cop, one,
                                      lstart, lend, lstart, lend);
                 have_nv = true;
@@ -4218,6 +4234,7 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                                      lstart, lend, lstart, lend);
                     throw NotLValueEx(lstart, lend);
                 }
+                old = lv->get();
                 nv = slot_rmw(*lv, cop, one);
                 have_nv = true;
             }
@@ -4229,7 +4246,8 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                 if (flat_writable_array(cur.get<LValue *>(), arr)) {
                     EvalValue out;
                     if (flat_store_core(cur.get<LValue *>(), *arr, key, one,
-                                        cop, out, lstart, lend, kstart, kend)) {
+                                        cop, out, lstart, lend, kstart, kend,
+                                        &old)) {
                         nv = out;
                         have_nv = true;
                     }
@@ -4252,17 +4270,13 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                 }
                 if (!elv.is<LValue *>())
                     throw NotLValueEx(lstart, lend);
+                old = elv.get<LValue *>()->get();
                 nv = slot_rmw(*elv.get<LValue *>(), cop, one);
                 have_nv = true;
             }
         }
 
-        if (is_prefix)
-            return nv;
-
-        EvalValue old = nv;     /* old = new -/+ 1 (no operand re-read) */
-        apply_compound_op(old, one, is_inc ? Op::subeq : Op::addeq);
-        return old;
+        return is_prefix ? nv : old;
     }
 
     /* Tier 3 (dyn): the checked read-modify-write every engine shares. */
@@ -4741,12 +4755,19 @@ void vm_struct_elem_into(LValue &dst, const EvalValue &arrv, int_type idx)
     dst.put(vm_struct_elem(arrv, idx));
 }
 
+/*
+ * One assignment to `lvalue`. `old_out`, when given (a compound store only:
+ * IncDecExpr's typed `±= 1`), receives the value the store replaced - read
+ * at the store itself, so postfix `++` / `--` yields it exactly (deriving it
+ * as new -/+ 1 was wrong for a float: (0.1 + 1) - 1 is not 0.1).
+ */
 static EvalValue
 handle_single_expr14(EvalContext *ctx,
                      bool inDecl,
                      Op op,
                      Construct *lvalue,
-                     const EvalValue &rval_in)
+                     const EvalValue &rval_in,
+                     EvalValue *old_out = nullptr)
 {
     /*
      * For a plain `=` to an explicitly-typed scalar variable, coerce a widening
@@ -4829,8 +4850,11 @@ handle_single_expr14(EvalContext *ctx,
 
                 LValue &lv = f->slots[id->sym.slot];
 
-                if (!lv.is_const_var())
+                if (!lv.is_const_var()) {
+                    if (old_out)
+                        *old_out = lv.get();
                     return slot_rmw(lv, op, rval);
+                }
             }
         }
 
@@ -4848,8 +4872,11 @@ handle_single_expr14(EvalContext *ctx,
 
                 LValue &lv = gf->slots[id->sym.slot];
 
-                if (!lv.is_const_var())
+                if (!lv.is_const_var()) {
+                    if (old_out)
+                        *old_out = lv.get();
                     return slot_rmw(lv, op, rval);
+                }
             }
         }
 
@@ -4865,8 +4892,11 @@ handle_single_expr14(EvalContext *ctx,
 
                 LValue &lv = (*ctx->captures)[id->sym.slot];
 
-                if (!lv.is_const_var())
+                if (!lv.is_const_var()) {
+                    if (old_out)
+                        *old_out = lv.get();
                     return slot_rmw(lv, op, rval);
+                }
             }
         }
 
@@ -4877,10 +4907,10 @@ handle_single_expr14(EvalContext *ctx,
     if (!inDecl) {
         if (lvalue->is_subscript())
             return subscript_store(ctx, static_cast<Subscript *>(lvalue),
-                                   op, rval);
+                                   op, rval, old_out);
         if (ctag(lvalue) == ConstructType::member)
             return member_store(ctx, static_cast<MemberExpr *>(lvalue),
-                                op, rval);
+                                op, rval, old_out);
     }
 
     /*
@@ -4955,6 +4985,8 @@ handle_single_expr14(EvalContext *ctx,
             );
 
         } else {
+            if (old_out)
+                *old_out = lval.get<LValue *>()->get();
             return doAssign(lval, rval, op);
         }
 
@@ -5099,8 +5131,8 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
  *    incl. flat-array elements and POD struct fields, which have no LValue):
  *    route the mutation through handle_single_expr14 (`operand += 1`), which
  *    reuses every store fast path (slot, flat array, COW, struct). It returns
- *    the NEW value; postfix derives `old = new -/+ 1` (the delta is exactly 1),
- *    so we never re-read the operand;
+ *    the NEW value and reports the value the store replaced, which postfix
+ *    returns (deriving it as new -/+ 1 was wrong for a float);
  *
  *  - a `dyn` / un-hinted operand (always LValue-backed - a dyn value is never
  *    flat): read-modify-write through the LValue so the int/float requirement
@@ -5178,15 +5210,13 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
 
     if (th == TypeHint::i || th == TypeHint::f) {
 
+        /* The store reports the value it replaced: postfix yields exactly
+         * that (a float's old cannot be derived from new - (0.1 + 1) - 1
+         * is not 0.1, nor -1 + 1 the -0.0 it was). */
+        EvalValue old;
         const EvalValue nv =
-            handle_single_expr14(ctx, false, cop, lvalue.get(), one);
-
-        if (is_prefix)
-            return nv;
-
-        EvalValue old = nv;     /* old = new -/+ 1 (no operand re-read) */
-        apply_compound_op(old, one, is_inc ? Op::subeq : Op::addeq);
-        return old;
+            handle_single_expr14(ctx, false, cop, lvalue.get(), one, &old);
+        return is_prefix ? nv : old;
     }
 
     /*

@@ -5986,10 +5986,16 @@ payoff.
   `i`/`f` — the usual case, incl. flat-array elements and POD fields that have
   no `LValue`) it routes the mutation through `handle_single_expr14`
   (`operand += 1`), reusing every store fast path (slot, flat array, COW,
-  struct), and **derives `old = new ∓ 1`** for postfix so it never re-reads the
-  operand; a `dyn`/un-hinted operand goes through a read-modify-write so the
-  int/float requirement is enforced at runtime - for an element or a field,
-  ONE implementation every engine shares (`dyn_incdec_elem` /
+  struct), the store reporting the value it replaced (`old_out`, through
+  `handle_single_expr14` / `subscript_store` / `member_store` /
+  `flat_store_core`), which postfix returns. ⛔ It used to DERIVE `old = new
+  ∓ 1`, which is exact for an int and not for a float: `(0.1 + 1) - 1` is not
+  0.1, `(1e-20 + 1) - 1` is 0.0, and -0.0 came back +0.0 (the tree-walker for
+  every lvalue but a local, the VM's IncDecChainV for an impure index;
+  `tests/functional/67_incdec_exact_old.my`). A `dyn`/un-hinted operand goes
+  through a read-modify-write so the int/float requirement is enforced at
+  runtime - for an element or a field, ONE implementation every engine
+  shares (`dyn_incdec_elem` /
   `dyn_incdec_member`, eval.cpp: the tree-walker, the VM's
   IncDecElemCheckedV / IncDecMemberCheckedV and IncDecChainV's tier 3). A
   flat array's element and a POD field have no `LValue`, so a rooted one

@@ -1442,9 +1442,10 @@ left the format in v27. The runtime walk is the shared
 StoreLValueChainV intermediate walk (`vm_chain_walk`); the final step
 runs `vm_incdec_final` (eval.cpp) — IncDecExpr::do_eval's EXACT tier
 semantics: tier 2 (proven int/float) = the compound `±= 1`
-(flat_store_core / member-store / general-lvalue slot_rmw) then
-old = new ∓ 1 derived with NO re-read; tier 3 (dyn) = the checked
-read-modify-write. A follow-up closed the LAST real-code emitter: a
+(flat_store_core / member-store / general-lvalue slot_rmw), postfix
+yielding the value the store replaced (derived as new ∓ 1 until
+2026-10-05, which is not the old value of a float); tier 3 (dyn) = the
+checked read-modify-write. A follow-up closed the LAST real-code emitter: a
 **nested named func/struct decl inside a loop/if body** (a scoped
 global) now lowers via the shared `emit_func_decl`/`emit_struct_decl`
 (MakeClosureV/LoadConstV + StoreGlobalV — re-bound each iteration,

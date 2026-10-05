@@ -620,8 +620,7 @@ bool construct_no_side_effects(const Construct *c);
  * exact tier logic and return the expression's value (old for postfix, new
  * for prefix). Tier 2 (`tier2`, a proven int/float lvalue) mirrors
  * handle_single_expr14's compound `±= 1` (the flat / POD / general store of
- * subscript_store / member_store), then derives old = new ∓ 1 with NO
- * re-read;
+ * subscript_store / member_store), old being the value the store replaced;
  * tier 3 (dyn) mirrors the checked read-modify-write (NotLValue / const /
  * TypeError at the INC-DEC caret `id_*`). See eval.cpp. */
 EvalValue vm_incdec_final(EvalValue &cur, bool is_member,

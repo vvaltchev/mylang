@@ -116,11 +116,11 @@ enum class OpCode : unsigned char {
      * IncDecExpr::do_eval's exact tier semantics (vm_incdec_final,
      * eval.cpp): tier 2 (a proven int/float lvalue) = the compound-store
      * `±= 1` (flat_store_core on a flat array, the byte store on a POD
-     * field, else the general subscript/member lvalue + slot_rmw) then
-     * old = new ∓ 1 derived with
-     * NO re-read; tier 3 (dyn) = the checked read-modify-write (NotLValue/
-     * const/TypeError at the INC-DEC caret). `target` = the dst slot
-     * (-1 = statement, value discarded), `aop` = plus/minus (inc/dec).
+     * field, else the general subscript/member lvalue + slot_rmw), postfix
+     * yielding the value the store replaced; tier 3 (dyn) = the checked
+     * read-modify-write (NotLValue/const/TypeError at the INC-DEC caret).
+     * `target` = the dst slot (-1 = statement, value discarded), `aop` =
+     * plus/minus (inc/dec).
      */
     IncDecChainV,
 
