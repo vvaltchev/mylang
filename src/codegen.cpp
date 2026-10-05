@@ -2182,28 +2182,40 @@ struct Codegen {
          * capture/IdList target declines (the readback would need an extra
          * load - rare shapes). */
         if (const Expr14 *e14 = dynamic_cast<const Expr14 *>(e)) {
+            if (e14->lvalue->is_subscript()
+                    || ctag(e14->lvalue.get()) == ConstructType::member)
+                return try_value_store(e14, out_slot, ops);
             const Identifier *lv =
                 dynamic_cast<const Identifier *>(e14->lvalue.get());
-            if (!lv || lv->sym.kind != SymKind::local || lv->is_const)
+            if (!lv || lv->is_const
+                    || (lv->sym.kind != SymKind::local
+                        && lv->sym.kind != SymKind::global
+                        && lv->sym.kind != SymKind::capture))
                 return false;
+            /* A GLOBAL or CAPTURE target (2026-10-05; a NotLoweredEx
+             * compile refusal until then, while the tree-walker ran it):
+             * the same store, then the variable read back - it holds the
+             * stored value, coerced to its declared type as a local's
+             * slot is. */
             const size_t mark = ops.size();
             const int save_top = next_temp;
-            if (compile_int_stmt(e14, ops)) {
+            bool stored = compile_int_stmt(e14, ops);
+            if (!stored) {
+                ops.resize(mark);
+                next_temp = save_top;
+                stored = compile_float_stmt(e14, ops);
+            }
+            if (!stored) {
+                ops.resize(mark);
+                next_temp = save_top;
+                stored = compile_boxed_stmt(e14, ops);
+            }
+            if (stored && lv->sym.kind == SymKind::local) {
                 out_slot = lv->sym.slot;
                 return true;
             }
-            ops.resize(mark);
-            next_temp = save_top;
-            if (compile_float_stmt(e14, ops)) {
-                out_slot = lv->sym.slot;
+            if (stored && compile_boxed_expr(lv, out_slot, ops))
                 return true;
-            }
-            ops.resize(mark);
-            next_temp = save_top;
-            if (compile_boxed_stmt(e14, ops)) {
-                out_slot = lv->sym.slot;
-                return true;
-            }
             ops.resize(mark);
             next_temp = save_top;
             return false;
@@ -5522,6 +5534,126 @@ struct Codegen {
         in.aop = e->op;
         in.op_node_idx = add_op_node(e->op, e);
         ops.push_back(in);
+        return true;
+    }
+
+    /*
+     * A STORE used as a VALUE (`var z = (a[i] += 5)`, `print(d["k"] = 3)`,
+     * `var w = (p.x = 7)`, `100 + (s.f -= 1) * 2`) into an element, a field
+     * or any chain of them - a NotLoweredEx compile refusal until
+     * 2026-10-05, while the tree-walker ran it (RULE 2). Lowered through
+     * the generic StoreLValueChainV whatever the shape (the statement
+     * stores keep their tuned ops; this form is rare): the rvalue first,
+     * then each key into a temp once, inside-out, as try_native_chain_store
+     * does, then the value. A plain `=`'s value is the rvalue converted to
+     * the target's STATIC type (Expr14::val_widen; a dict target's
+     * rv_coerce already widened `vslot`) - the tree-walker's rule, see
+     * Expr14::do_eval. A compound's is the value it stored: read back
+     * through the same base and the same key temps, so nothing is
+     * evaluated twice, and a read of the location a store just wrote
+     * cannot fail. A base that is not a variable (a call's result) declines
+     * as the statement store does.
+     */
+    bool try_value_store(const Expr14 *e, int &out_slot,
+                         std::vector<CgInstr> &ops)
+    {
+        if (e->op != Op::assign
+                && compound_assign_base(e->op) == Op::invalid)
+            return false;
+        std::vector<const Construct *> chain;   /* outermost-first */
+        const Construct *cur = e->lvalue.get();
+        for (;;) {
+            if (ctag(cur) == ConstructType::member) {
+                if (static_cast<const MemberExpr *>(cur)->optional)
+                    return false;   /* compile-refused upstream anyway */
+                chain.push_back(cur);
+                cur = static_cast<const MemberExpr *>(cur)->what.get();
+            } else if (ctag(cur) == ConstructType::subscript) {
+                chain.push_back(cur);
+                cur = static_cast<const Subscript *>(cur)->what.get();
+            } else {
+                break;
+            }
+        }
+        int bslot, bkind;
+        if (chain.empty() || !as_container_base(cur, bslot, bkind))
+            return false;
+
+        const size_t omark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int st = next_temp;
+        auto fail = [&]() {
+            ops.resize(omark);
+            chunk.consts.resize(cmark);
+            next_temp = st;
+            return false;
+        };
+
+        int vslot;
+        if (!compile_rvalue(e, vslot, ops))
+            return fail();
+
+        const int nsteps = static_cast<int>(chain.size());
+        std::vector<Chunk::ChainStep> steps;
+        steps.reserve(static_cast<size_t>(nsteps));
+        for (int i = 0; i < nsteps; i++) {
+            const Construct *c = chain[nsteps - 1 - i];
+            if (ctag(c) == ConstructType::member) {
+                auto *m = static_cast<const MemberExpr *>(c);
+                steps.push_back({true, add_member_key(m), c->start, c->end});
+            } else {
+                int kslot;
+                if (!compile_key(static_cast<const Subscript *>(c), kslot,
+                                 ops))
+                    return fail();
+                steps.push_back({false, kslot, c->start, c->end});
+            }
+        }
+        const std::vector<Chunk::ChainStep> rsteps = steps;
+
+        const int steps_idx = static_cast<int>(chunk.chain_steps.size());
+        chunk.chain_steps.push_back(std::move(steps));
+
+        CgInstr in;
+        in.op = OpCode::StoreLValueChainV;
+        in.node_idx = add_ast_node(e->lvalue.get());   /* outer lvalue loc */
+        in.base_node_idx = add_base_node(bkind, cur);  /* #127: base caret */
+        in.target = vslot;
+        in.target2 = bslot;
+        in.set_a_dual(steps_idx, bkind);
+        in.aop = e->op;
+        in.op_node_idx = add_op_node(e->op, e);
+        ops.push_back(in);
+
+        if (e->op == Op::assign) {
+            out_slot = vslot;
+            emit_widen(e->val_widen, out_slot, e, ops);
+            return true;
+        }
+
+        /* the compound's stored value, read back */
+        int rs;
+        if (!compile_boxed_expr(cur, rs, ops))
+            return fail();
+        for (int i = 0; i < nsteps; i++) {
+            const Construct *c = chain[nsteps - 1 - i];
+            const Chunk::ChainStep &step = rsteps[static_cast<size_t>(i)];
+            const int t = alloc_temp();
+            CgInstr rd;
+            rd.node_idx = add_ast_node(c);
+            rd.target = t;
+            rd.target2 = rs;
+            if (step.is_member) {
+                rd.op = OpCode::MemberV;
+                rd.set_a(int_lit(step.operand));
+            } else {
+                rd.op = OpCode::SubscriptV;
+                rd.set_a(slot_op(step.operand));
+            }
+            ops.push_back(rd);
+            rs = t;
+        }
+        out_slot = rs;
         return true;
     }
 

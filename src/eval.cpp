@@ -5358,7 +5358,19 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
     } else {
 
-        return handle_single_expr14(ctx, inDecl, op, lvalue.get(), rval);
+        EvalValue r = handle_single_expr14(ctx, inDecl, op, lvalue.get(),
+                                           rval);
+        /* A plain store's VALUE into an element or a field is the rvalue
+         * converted to the target's STATIC type (val_widen; a dict's
+         * rv_coerce already widened `rval`) - not whatever conversion the
+         * container ran at run time, which a dyn target cannot predict
+         * statically: `var z = (dp.x = true)` with a dyn `dp` is the bool
+         * the inferencer typed, though the int field stored 1. */
+        if (op == Op::assign && !inDecl
+                && (lvalue->is_subscript()
+                    || ctag(lvalue.get()) == ConstructType::member))
+            return literal_widen(rval, val_widen);
+        return r;
     }
 }
 

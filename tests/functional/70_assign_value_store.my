@@ -1,0 +1,147 @@
+# An assignment used as a VALUE (README: `=` "can be used like in C, inside
+# expressions") whose target is not a local variable - an element, a field,
+# a dict key or member, a chain of them, a global, a capture - was a
+# NotLoweredEx compile refusal in the VM and the JIT until 2026-10-05, while
+# the tree-walker ran it. Its value is the STORED value: the right-hand side
+# converted to the target's static type (an int into a float element or
+# field is a float), and for a compound assignment the value it stored.
+# Values come from runtime(): constants would fold.
+
+struct I { int a; }
+struct P { int x; float y; I inn; }
+struct B { int n; array<int> items; }
+
+func ri(int v) => int(runtime(v));
+func rf(float v) => float(runtime(v));
+
+var events = [];
+func val(v) { append(events, "val"); return v; }
+func key(k) { append(events, "key"); return k; }
+
+func outcome(dyn f) {
+    try {
+        f();
+        return "ok";
+    } catch (OutOfBoundsEx) {
+        return "OutOfBoundsEx";
+    } catch (KeyNotFoundEx) {
+        return "KeyNotFoundEx";
+    } catch (DivisionByZeroEx) {
+        return "DivisionByZeroEx";
+    } catch (NotLValueEx) {
+        return "NotLValueEx";
+    } catch (TypeErrorEx) {
+        return "TypeErrorEx";
+    }
+    return "unreachable";       # (inference does not see the try return)
+}
+
+# flat int / float / bool / str arrays, a general array
+var ia = [1, 2, 3];
+var fa = [1.5, 2.5];
+var ba = [false, false];
+var sa = split("a b", " ");
+var ga = [[1], "x"];
+var z1 = (ia[ri(0)] += 5);
+var z2 = (fa[0] = ri(3));               # an int into array<float>: 3.0
+var z3 = (ba[1] = true);
+var z4 = (sa[1] = "q");
+var z5 = (ga[0] = [7, 8]);
+assert(z1 == 6 && ia[0] == 6);
+assert(z2 == 3.0 && fa[0] == 3.0);
+assert(z3 && ba[1] && z4 == "q" && sa[1] == "q");
+assert(intptr(z5) == intptr(ga[0]));    # the same array, as a store aliases
+var nf = (fa[1] *= rf(2.0)) + 1.0;
+assert(nf == 6.0 && fa[1] == 5.0);
+
+# a flat struct array: a whole element, a field, an inline POD field
+var ps = [P(1, 1.0, I(2)), P(3, 3.0, I(4))];
+var q = P(9, 9.0, I(9));
+var z6 = (ps[1] = q);
+var z7 = (ps[0].x = ri(5));
+var z8 = (ps[0].y = ri(2));             # an int into a float field: 2.0
+var z9 = (ps[ri(1)].inn.a -= 1);
+assert(z6 == q && ps[1].x == 9 && z7 == 5 && ps[0].x == 5);
+assert(z8 == 2.0 && ps[0].y == 2.0);
+assert(z9 == 8 && ps[1].inn.a == 8);
+
+# a POD struct, a boxed struct, a dict key and member
+var p = P(1, 1.0, I(1));
+var w = (p.x = ri(7));
+var wy = (p.y += ri(1));
+var bx = B(1, [1]);
+var wb = (bx.items = [4, 5]);
+var wn = (bx.n *= ri(6));
+var d = {"k": 1, "m": 2};
+var df = {"f": 0.5};
+assert(w == 7 && p.x == 7 && wy == 2.0 && p.y == 2.0);
+assert(intptr(wb) == intptr(bx.items) && wn == 6 && bx.n == 6);
+assert((d["k"] = ri(3)) == 3 && d["k"] == 3);
+assert((d.m += ri(10)) == 12 && d.m == 12);
+assert((d["new"] = ri(4)) == 4 && d["new"] == 4);
+var wf = (df["g"] = ri(2));             # a dict<str, float> widens too
+assert(wf == 2.0 && df["g"] == 2.0);
+
+# the widened values are floats to typed arithmetic, too (the static type
+# of an assignment is the target's: it was the rvalue's, so `z2 * 2` read
+# the float's bits as an int)
+assert(z2 * 2 == 6 && z8 * 2 == 4 && wf * 2 == 4 && wy * 2 == 4);
+
+# inside a larger expression, and a chain
+var s = B(10, [0, 0]);
+var r = 100 + (s.n -= ri(1)) * 2;
+assert(r == 118 && s.n == 9);
+var cd = {"a": [P(0, 0.0, I(0))]};
+assert((cd["a"][0].inn.a = ri(3)) + 1 == 4 && cd.a[0].inn.a == 3);
+assert((cd.a[0].x += ri(2)) == 2 && cd["a"][0].x == 2);
+
+# a dyn target: the value is the right-hand side, typed as the inferencer
+# typed it, though the int field the dyn holds stored 1
+var dyn dp = runtime(P(1, 1.0, I(1)));
+var zb = (dp.x = true);
+assert(zb == true && str(zb) == "true" && typestr(zb) == "bool" && dp.x == 1);
+var dyn da = runtime([1.5]);
+var zi = (da[0] = ri(3));
+assert(zi == 3 && typestr(zi) == "int" && da[0] == 3.0);
+
+# a global and a capture
+var g = 1.5;
+func setg() { var z = (g = ri(3)); return z; }
+var gz = setg();
+assert(gz == 3.0 && gz * 2 == 6 && g == 3.0);
+var gi = 1;
+func addg() { return (gi += ri(4)) * 10; }
+assert(addg() == 50 && gi == 5);
+var c = 2;
+var h = func [c] () { var z = (c += 3); return z * 10 + c; };
+assert(h() == 55 && h() == 88 && c == 2);
+
+# evaluation order (README): the right-hand side, then each key, once each
+var ea = [[1, 2], [3, 4]];
+var ez = (ea[key(1)][key(0)] = val(30));
+var ec = (ea[key(0)][key(1)] += val(5));
+assert(events == ["val", "key", "key", "val", "key", "key"]);
+assert(ez == 30 && ec == 7 && ea[1][0] == 30 && ea[0][1] == 7);
+
+# in a loop (the JIT compiles it)
+var acc = [0, 0, 0];
+var tot = 0;
+for (var i = 0; i < ri(300); i++) {
+    tot += (acc[i % 3] += i);
+    tot -= (ps[i % 2].x = i);
+}
+assert(acc == [14850, 14950, 15050] && tot == 1470150);
+
+# errors: out of range, a missing key, division by zero, a const target,
+# a flat array asked to hold another kind (dyn)
+const K = P(1, 1.0, I(1));
+func setk(dyn t) { return (t.x = 2); }
+assert(outcome(func [ia] () { var t = (ia[ri(3)] = 1); }) == "OutOfBoundsEx");
+assert(outcome(func [d] () { var t = (d["no"] += 1); }) == "KeyNotFoundEx");
+assert(outcome(func [ia] () { var t = (ia[0] /= ri(0)); })
+       == "DivisionByZeroEx");
+assert(outcome(func () { setk(K); }) == "NotLValueEx");
+assert(outcome(func [da] () { var t = (da[0] = "s"); }) == "TypeErrorEx");
+
+print(ia, fa, ba, sa, ps, p, bx, d, df, s, cd, dp, da, g, gi, ea, acc);
+print(z1, z2, z3, z4, z5, z6, z7, z8, z9, w, wy, wb, wn, wf, zb, zi, gz);

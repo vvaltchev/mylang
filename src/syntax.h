@@ -1447,6 +1447,12 @@ public:
      * type is numeric and wider than the rvalue's (#75 follow-up): the
      * rvalue widens to it (i/f) before the store, in every engine. */
     DeclType rv_coerce = DeclType::none;
+    /* An assignment's VALUE (`var z = (a[i] = 3)`) is the stored value: the
+     * right-hand side converted to the target's static type - i/f when an
+     * element or field target is numeric and wider than the rvalue (a dict
+     * target widens its rvalue through rv_coerce instead). Read only where
+     * the value is used: the tree-walker's result, the VM's value form. */
+    DeclType val_widen = DeclType::none;
 
     Expr14()
         : Construct("Expr14", false, ConstructType::expr14)
@@ -1464,6 +1470,7 @@ public:
         c->unpack_rv_array = unpack_rv_array;
         c->unpack_rv_th = unpack_rv_th;
         c->rv_coerce = rv_coerce;
+        c->val_widen = val_widen;
         return c;
     }
 };

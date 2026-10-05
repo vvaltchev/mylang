@@ -4426,6 +4426,18 @@ decisions behind it: `plans/archived/type-inference.md`,
   arrived). A FRESH `var r = 3 + d` (only a dyn contribution) correctly stays
   `dyn` → `DynRequiredEx`; `var dyn r = 3 + d` holds the actual result.
   (`TypeSym::{round_got_dyn,coerces_dyn,decl_id}`.)
+- **AN ASSIGNMENT'S VALUE IS THE STORED VALUE (2026-10-05).** `type_of`
+  of `t = v` is v's type WIDENED to the target's numeric static type
+  (`numeric_widen`: int/bool into float, bool into int), for a variable,
+  an element and a field alike; its runtime half is the variable's own
+  `decl_type` coercion, a dict's `rv_coerce` and, for an element or field,
+  `Expr14::val_widen`, which the tree-walker applies to its result and the
+  VM's value form (`try_value_store`) to its value temp. It was v's type,
+  so `var z = (s.f = 3)` with a float field typed `z` int while it held
+  3.0 - the tree-walker's typed `z + 1` raised TypeErrorEx, and the JIT
+  would have read the float's bits as an int once the VM lowered the
+  form. A `dyn` target converts nothing, statically or at run time: the
+  value is the rvalue as typed, whatever the dyn container stored.
 - **A JOINED parameter binds like a DECLARED one (#38 C,
   `stamp_inferred_param_types`).** A lambda's un-annotated param (and a
   named function's `opt` one) joins every call site's argument, so
