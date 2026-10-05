@@ -7665,9 +7665,11 @@ static const std::vector<test> tests =
         "var arr = [B([1], 5), B([2], 7)];",
         "var u = arr[f() - 5].n++;",
         "assert(u == 7); assert(arr[1].n == 8); assert(i == 5);" } },
-    /* A POD-struct member through an impure index is NOT an lvalue (the
-     * tree-walker's try_pod gate is AST-shape-dependent) - both engines
-     * throw NotLValueEx. */
+    /* `ps` is a FLAT struct array: its element is bytes, not an object,
+     * so its field is not an lvalue in any engine - NotLValueEx. (The
+     * impurity of the index no longer matters: a POD struct held by a
+     * general array or a dict IS stored through, see
+     * tests/functional/68_impure_chain_store.my.) */
     { "vm: impure-index POD member inc-dec throws NotLValue",
       { "struct P { int x; int y; }",
         "var ps = [P(1,2), P(3,4)];",

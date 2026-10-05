@@ -609,10 +609,9 @@ LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
                              Loc mstart, Loc mend);
 
 /* AST-shape purity check (id / scalar-literal / subscript / member / arith
- * chains only) - the gate try_flat_subscript_store / try_pod_struct_store key
- * on. Exported for the codegen's IncDecChainV allow_flat/allow_pod flags,
- * which must encode the tree-walker's OWN compile-shape-dependent semantics.
- * See eval.cpp (no_side_effects). */
+ * chains only): evaluating the node twice is unobservable. Exported for the
+ * codegen (a planned struct ctor's argument reads). See eval.cpp
+ * (no_side_effects). */
 bool construct_no_side_effects(const Construct *c);
 
 /* VM IncDecChainV's FINAL-step semantics: given the walked-to container ref
@@ -620,16 +619,15 @@ bool construct_no_side_effects(const Construct *c);
  * convention) and the final member/subscript step, run IncDecExpr::do_eval's
  * exact tier logic and return the expression's value (old for postfix, new
  * for prefix). Tier 2 (`tier2`, a proven int/float lvalue) mirrors
- * handle_single_expr14's compound `±= 1` - the flat/POD fast stores only when
- * the codegen-proven allow_flat/allow_pod gate holds (try_flat/try_pod's
- * no_side_effects AST gate) - then derives old = new ∓ 1 with NO re-read;
+ * handle_single_expr14's compound `±= 1` (the flat / POD / general store of
+ * subscript_store / member_store), then derives old = new ∓ 1 with NO
+ * re-read;
  * tier 3 (dyn) mirrors the checked read-modify-write (NotLValue / const /
  * TypeError at the INC-DEC caret `id_*`). See eval.cpp. */
 EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                           const EvalValue &memId, const UniqueId *memUid,
                           const EvalValue &key,
                           bool tier2, bool is_inc, bool is_prefix,
-                          bool allow_flat, bool allow_pod,
                           Loc lstart, Loc lend, Loc kstart, Loc kend,
                           Loc bstart, Loc bend, Loc id_start, Loc id_end);
 

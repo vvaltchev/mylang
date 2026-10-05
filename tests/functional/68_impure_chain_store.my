@@ -1,0 +1,84 @@
+# A store through an access chain whose base or key has a SIDE EFFECT
+# (a call). Every engine evaluates the rvalue, then the base, then each key,
+# exactly once, and stores to what they named. Until 2026-10-05 the
+# tree-walker gated its flat-array and POD-field stores on a side-effect-free
+# base and then evaluated the lvalue a second time, so these raised
+# NotLValueEx there while the VM stored them; the VM's value form of
+# `++`/`--` (an inc-dec chain) mirrored that gate and raised it too.
+# corpus_diff also runs this file under -nti (the untyped paths).
+
+var events = [];
+func f(i) { append(events, "f" + str(i)); return runtime(i); }
+func g(v) { append(events, "g" + str(v)); return runtime(v); }
+func k(s) { append(events, s); return runtime(s); }
+
+func expect(str what, dyn got, dyn want) {
+    if (str(got) != str(want)) {
+        print("FAIL", what, got, "want", want);
+        assert(false);
+    }
+}
+
+# Flat rows inside a general array, every store form.
+var a = [[1, 2], [3, 4]];
+a[f(1)][0]++;
+expect("inc", a, [[1, 2], [4, 4]]);
+a[f(1)][1] += g(5);
+expect("compound", a, [[1, 2], [4, 9]]);
+a[f(0)][f(1)] = g(7);
+expect("assign", a, [[1, 7], [4, 9]]);
+var post = a[f(0)][0]--;
+var pre = ++a[f(0)][f(1)];
+expect("values", [post, pre], [1, 8]);
+expect("order 1", events,
+       ["f1", "g5", "f1", "g7", "f0", "f1", "f0", "f0", "f1"]);
+
+# A float row; the compound result is the stored value.
+events = [];
+var fa = [[0.5, 1.5]];
+fa[f(0)][1] *= g(2);
+var fo = fa[f(0)][0]++;
+expect("float", [fa, fo], [[[1.5, 3.0]], 0.5]);
+expect("order 2", events, ["g2", "f0", "f0"]);
+
+# A POD struct held by a dict value and by a general array's element.
+struct P { int x; float y; }
+events = [];
+var ds = {"a": P(1, 2.5), "b": P(3, 4.5)};
+ds[k("a")].x++;
+ds[k("b")].y += g(2);
+ds[k("a")].x = g(9);
+var dx = ds[k("b")].x--;
+var dy = ++ds[k("a")].x;
+var dyn gen = runtime([P(5, 0.5), "s"]);
+gen[f(0)].x++;
+expect("pod", [ds["a"], ds["b"], gen[0], dx, dy],
+       [P(10, 2.5), P(2, 6.5), P(6, 0.5), 3, 10]);
+expect("order 3", events, ["a", "g2", "b", "g9", "a", "b", "a", "f0"]);
+
+# A dict through an impure key: a plain `=` inserts, a compound one reads.
+events = [];
+var dd = [{"k": 1}];
+dd[f(0)][k("new")] = g(4);
+dd[f(0)][k("k")] += g(10);
+expect("dict", dd, [{"k": 11, "new": 4}]);
+expect("order 4", events, ["g4", "f0", "new", "g10", "f0", "k"]);
+
+# The errors are still the element's own: out of range, and a constant.
+func outcome(dyn fn) {
+    try {
+        fn();
+        return "ok";
+    } catch (OutOfBoundsEx) {
+        return "OutOfBoundsEx";
+    } catch (NotLValueEx) {
+        return "NotLValueEx";
+    }
+}
+const K = [[1, 2]];
+func inc_k(array<array<int>> q) { q[f(0)][0]++; }
+assert(outcome(func [a] () { a[f(5)][0]++; }) == "OutOfBoundsEx");
+assert(outcome(func [a] () { a[f(0)][9] += 1; }) == "OutOfBoundsEx");
+assert(outcome(func () { inc_k(K); }) == "NotLValueEx");
+
+print(a, fa, ds, gen, dd);

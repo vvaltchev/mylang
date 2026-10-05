@@ -2053,6 +2053,10 @@ public:
     MemberExpr()
         : Construct("MemberExpr", false, ConstructType::member) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    /* do_eval's access step over an ALREADY-EVALUATED base value: an
+     * assignable field / dict value, or a value read. A store evaluates
+     * the base once and calls this (eval.cpp, member_store). */
+    EvalValue access(const EvalValue &dval, bool for_write) const;
     int_type eval_int(EvalContext *ctx) const override;
     float_type eval_float(EvalContext *ctx) const override;
     void serialize(ostream &s, int level = 0) const override;

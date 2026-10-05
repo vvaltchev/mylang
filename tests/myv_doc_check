@@ -131,7 +131,7 @@ def chunk(r):
     for _ in range(r.u32()): steps()              # 9.7 chain_steps
     for _ in range(r.u32()):                      # 9.7 incdec_chains
         steps()
-        for _ in range(4): r.boolv()
+        for _ in range(2): r.boolv()
         r.loc(); r.loc(); r.loc(); r.loc()
     for _ in range(r.u32()):                      # 9.8 chain_locs
         for _ in range(r.u32()): r.loc(); r.loc()

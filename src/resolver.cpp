@@ -3258,7 +3258,7 @@ static bool fmi_has_tainted_write(
  *
  * ⛔ THIS PASS ONLY ANSWERS THE QUESTION. Wiring the answer to an actual
  * borrow needs ONE more thing, which is NOT here: an element write through
- * a SLICE detaches it in place (`try_flat_subscript_store`'s
+ * a SLICE detaches it in place (`flat_store_core`'s
  * `arr.clone_internal_vec()`, `get_value_for_put`'s
  * `*container = container->clone()`), and that RELEASES the old
  * SharedObject - a reference a borrowed slot never took, so a refcount
