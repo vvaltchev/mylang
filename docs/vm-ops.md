@@ -1345,11 +1345,13 @@ is an lvalue, a rooted writable POD field is stored back through
 `vm_member_store`, a readonly instance / a temporary's field throws
 `NotLValueEx`, a missing member or key the read's own error first
 (`member_read_core`: TypeErrorEx / `KeyNotFoundEx`); then int/float-checks,
-±1. (The site pool holds no BASE caret, so "Expected dict object" marks the
-member here where the tree-walker marks the base.) Same pool-carried
-dual-loc (the MEMBER loc for a `KeyNotFound` vs the
-INC-DEC loc for `NotLValue`/`TypeError`), plus the member key
-(`memId`/`memUid` ride in the same `incdec_sites` entry). Both cover a
+±1. Its carets come from the same pool, three of them: the MEMBER loc
+for a `KeyNotFound`, the BASE loc for "Expected dict object" (a base that
+is neither a struct nor a dict - marked on the base, as the tree-walker's
+member read does; the entry gained `bstart`/`bend` in myv v28, and until
+then the VM marked the member), and the INC-DEC loc for
+`NotLValue`/`TypeError`; plus the member key (`memId`/`memUid` ride in the
+same `incdec_sites` entry). Both cover a
 proven-struct NON-numeric member
 too (`s.name++` on a str field → `TypeError`, `th != i/f` so it isn't the M8
 `StoreMemberV` path). An optional `d?.f++` still falls back (rare).

@@ -6091,7 +6091,8 @@ extern "C" int jit_incdec_member(int_type kind, int_type base_slot,
     }
     try {
         vm_incdec_member(blv, site.memId, site.memUid, is_inc != 0,
-                         site.lstart, site.lend, site.istart, site.iend);
+                         site.lstart, site.lend, site.bstart, site.bend,
+                         site.istart, site.iend);
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -11687,14 +11688,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         VM_CASE(IncDecMemberCheckedV): {
             /* `d.f++` / `d.f--` on a dyn/unproven base: form the member LValue
              * (struct field / dict value), enforce int/float, apply +-1.
-             * AST-FREE: the member key + its TWO carets - the MEMBER loc (a
-             * KeyNotFound) vs the INC-DEC loc (its own NotLValue/const/
-             * TypeError) - come from the incdec_sites pool (`b`). */
+             * AST-FREE: the member key + its THREE carets - the MEMBER loc
+             * (a KeyNotFound), the BASE loc ("Expected dict object") and the
+             * INC-DEC loc (its own NotLValue/const/TypeError) - come from
+             * the incdec_sites pool (`b`). */
             const Chunk::IncDecSite &site = chunk->incdec_sites[in->b_lit()];
             LValue *blv =
                 vm_store_base(ctx, in->target, in->target2, *chunk, pc, nullptr);
             vm_incdec_member(blv, site.memId, site.memUid, in->aop == Op::plus,
-                             site.lstart, site.lend, site.istart, site.iend);
+                             site.lstart, site.lend, site.bstart, site.bend,
+                             site.istart, site.iend);
             pc++;
         }
         VM_NEXT;

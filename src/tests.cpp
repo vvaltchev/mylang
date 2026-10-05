@@ -7683,6 +7683,23 @@ static const std::vector<test> tests =
       { "func mk() { return [9, 8]; }",
         "var dyn z = 0;",
         "z = mk()[0]++;" }, &typeid(NotLValueEx) },
+    /* `b.x++` on a dyn base that is neither a struct nor a dict: the
+     * TypeError ("Expected dict object") carets the BASE, as the
+     * tree-walker's member read does. The VM's statement form carried no
+     * base caret in its site and marked the member until 2026-10-05; the
+     * site pool holds one since myv v28. A statement in a function, and
+     * the top-level form. */
+    { "err loc: dyn member inc-dec on a non-container carets the base",
+      { "func f() {",
+        "    var dyn b = runtime(\"s\");",
+        "    b.x--;",
+        "}",
+        "f();" },
+      &typeid(TypeErrorEx), 5, 3, 7, 3 },
+    { "err loc: top-level dyn member inc-dec carets the base",
+      { "var dyn b = runtime(5);",
+        "b.x++;" },
+      &typeid(TypeErrorEx), 1, 2, 3, 2 },
     /* Postfix `++` / `--` on a FLOAT yields the exact old value. The typed
      * path derived it as new -/+ 1 until 2026-10-05 - the tree-walker for
      * every lvalue but a local, the VM's inc-dec chain for an impure index -

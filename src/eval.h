@@ -576,11 +576,13 @@ void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
 
 /* VM (IncDecMemberCheckedV): `d.f++` / `d.f--` on a dyn/unproven base - forms
  * the member LValue (struct field / dict value), enforces int/float, applies
- * ±1 (statement). Two carets: member loc (KeyNotFound) vs inc-dec loc
- * (NotLValue/TypeError). See eval.cpp. */
+ * ±1 (statement). Three carets: member loc (KeyNotFound), base loc
+ * ("Expected dict object") and inc-dec loc (NotLValue/TypeError). See
+ * eval.cpp. */
 void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
                       const UniqueId *memUid, bool is_inc,
-                      Loc mstart, Loc mend, Loc id_start, Loc id_end);
+                      Loc mstart, Loc mend, Loc bstart, Loc bend,
+                      Loc id_start, Loc id_end);
 
 /* VM (CoerceNumV): the typed-store numeric coerce - the same
  * coerce_to_decl_type the tree-walker's op==assign path runs (widen float <-

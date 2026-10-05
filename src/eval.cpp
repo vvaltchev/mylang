@@ -4147,13 +4147,14 @@ LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
 
 void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
                       const UniqueId *memUid, bool is_inc,
-                      Loc mstart, Loc mend, Loc id_start, Loc id_end)
+                      Loc mstart, Loc mend, Loc bstart, Loc bend,
+                      Loc id_start, Loc id_end)
 {
-    /* The site pool holds no base caret, so "Expected dict object" marks
-     * the member here (the tree-walker marks the base). */
+    /* "Expected dict object" marks the base, as the tree-walker's member
+     * read does (the site pool carries its caret since myv v28). */
     EvalValue old;
     dyn_incdec_member(EvalValue(base_lv), memId, memUid, is_inc, old,
-                      mstart, mend, mstart, mend, id_start, id_end);
+                      mstart, mend, bstart, bend, id_start, id_end);
 }
 
 /*

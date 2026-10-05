@@ -419,7 +419,8 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
               << is.lstart.col << "  incdec@" << is.istart.line << ":"
               << is.istart.col;
             if (is.memUid)
-                s << "  ." << is.memUid->val;
+                s << "  ." << is.memUid->val << "  base@" << is.bstart.line
+                  << ":" << is.bstart.col;
             s << "\n";
         }
     }

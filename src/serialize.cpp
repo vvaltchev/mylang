@@ -1287,6 +1287,7 @@ void write_chunk(Writer &w, const Chunk &c)
     for (const auto &s : c.incdec_sites) {
         w.locv(s.lstart); w.locv(s.lend);
         w.locv(s.istart); w.locv(s.iend);
+        w.locv(s.bstart); w.locv(s.bend);
         write_value(w, s.memId);
         w.uidv(s.memUid);
     }
@@ -1581,6 +1582,7 @@ void read_chunk(Reader &r, Chunk &c)
         Chunk::IncDecSite s;
         s.lstart = r.locv(); s.lend = r.locv();
         s.istart = r.locv(); s.iend = r.locv();
+        s.bstart = r.locv(); s.bend = r.locv();
         s.memId = read_value(r);
         s.memUid = r.uidv();
         c.incdec_sites.push_back(std::move(s));

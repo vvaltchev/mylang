@@ -2567,15 +2567,19 @@ struct Chunk {
      * The dual error carets a one-loc-per-pc side table can't hold: `lstart/
      * lend` = the SUBSCRIPT/MEMBER child's caret (a subscript-internal
      * KeyNotFound/OOB, a member KeyNotFound), `istart/iend` = the INC-DEC
-     * expr's own caret (its NotLValue / const / TypeError). The member form
-     * also carries the member key (`memId` the name as a dict-key value,
-     * `memUid` the interned name; elem leaves them empty/null). Indexed by
+     * expr's own caret (its NotLValue / const / TypeError), `bstart/bend`
+     * = the BASE's caret (the member form's "Expected dict object", which
+     * the tree-walker's member read marks on the base; v28 - it used the
+     * member caret). The member form also carries the member key (`memId`
+     * the name as a dict-key value, `memUid` the interned name; elem leaves
+     * them empty/null). Indexed by
      * `Instr::b` (an immediate) - O(1), no node, fully serializable (Locs +
      * a string key + a re-internable name).
      */
     struct IncDecSite {
         Loc lstart, lend;              /* the subscript/member child's caret */
         Loc istart, iend;              /* the whole inc-dec expr's caret */
+        Loc bstart, bend;              /* the base's caret */
         EvalValue memId;               /* member form: the name as a dict key */
         const UniqueId *memUid = nullptr;   /* member form: interned name */
     };
