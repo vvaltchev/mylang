@@ -780,5 +780,39 @@ if "$BIN" -v 2>/dev/null | grep -q '^  tests  *1'; then
     [ $rt_ok = 1 ] && pass "-rt: --list and --only select the same cases"
 fi
 
+# ---- out of memory (2026-10-05) ------------------------------------- #
+# A refused allocation is the catchable OutOfMemoryEx, never a C++
+# terminate: under a memory cap, a string doubled until the allocator
+# refuses must be caught by the script's catch, and the uncaught second
+# loop must end in a rendered OutOfMemoryEx and exit 1 - in each engine.
+# Not under ASan: its shadow memory cannot live under `ulimit -v`.
+if "$BIN" -v 2>/dev/null | grep -q '^  asan  *0'; then
+    cat > "$TMP/oom.my" <<'MY'
+var s = "xxxxxxxxxxxxxxxx";
+try {
+    while (true)
+        s += s;
+} catch (OutOfMemoryEx) {
+    print("caught");
+}
+var t = "y";
+while (true)
+    t += t;
+MY
+    oom_ok=1
+    for e in "" -nj -tw; do
+        out=$( (ulimit -v 2000000; timeout 60 "$BIN" $e "$TMP/oom.my") 2>&1 )
+        r=$?
+        if [ $r != 1 ] || ! printf '%s' "$out" | grep -q '^caught' ||
+           ! printf '%s' "$out" | grep -q '^OutOfMemoryEx: .*line 10'
+        then
+            oom_ok=0
+            fail "out of memory${e:+ ($e)}: exit $r: $(printf '%s' "$out" |
+                  head -3 | tr '\n' ' ')"
+        fi
+    done
+    [ $oom_ok = 1 ] && pass "out of memory: OutOfMemoryEx, caught and uncaught"
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc

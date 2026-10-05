@@ -1,0 +1,53 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT test (#107): the builtins that build a result of a SIZE the program
+# gives - array(), make_array(), range(), lpad()/rpad() - reserve it
+# before filling it (reserve_or_oom, evaltypes.cpp.h), in each storage
+# kind; a size that cannot be served is OutOfMemoryEx (README), also when
+# raised inside a native loop, where the JIT conveys it. Values from
+# runtime(): a constant call would fold at compile time.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad = bad + 1;
+    }
+}
+func ri(int x) => int(runtime(x));
+
+want("array(3, true)", array(ri(3), true), [true, true, true]);
+want("array(2, false)", array(ri(2), false), [false, false]);
+want("array(2, 1.5)", array(ri(2), 1.5), [1.5, 1.5]);
+want("array(2, \"s\")", array(ri(2), "s"), ["s", "s"]);
+# (an inferred destination: a declared `array<float> hf = make_array(..)`
+# is refused today as `array<?>` - a separate inferencer defect)
+func half(int i) => i * 0.5;
+func even(int i) => i % 2 == 0;
+var hf = make_array(ri(3), half);
+want("make_array -> array<float>", hf, [0.0, 0.5, 1.0]);
+want("its storage", array_storage(hf), "float");
+var hb = make_array(ri(4), even);
+want("make_array -> array<bool>", hb, [true, false, true, false]);
+want("its storage", array_storage(hb), "bool");
+var dyn hg = make_array(ri(3), func (int i) => str(i));
+want("make_array -> general", hg, ["0", "1", "2"]);
+want("lpad", lpad("ab", ri(5), "."), "...ab");
+want("rpad", rpad("ab", ri(4)), "ab  ");
+want("lpad, already long", lpad("abcdef", ri(3)), "abcdef");
+
+# OutOfMemoryEx from a builtin inside a loop the JIT compiles: the native
+# code conveys it, and the loop goes on
+var refused = 0;
+for (var i = 0; i < ri(4); i++) {
+    try {
+        var a = array(ri(576460752303423488), i);
+        print(len(a));
+    } catch (OutOfMemoryEx) {
+        refused++;
+    }
+}
+want("refused in a loop", refused, 4);
+
+print("sized results: " + str(bad) + " failure(s)");
+assert(bad == 0);

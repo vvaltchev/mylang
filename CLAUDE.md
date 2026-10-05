@@ -6517,6 +6517,29 @@ and two macros:
   (`vm_catch_match`, `do_catch`) **before any name comparison**, so the
   parenless catch-all cannot swallow one either. Both halves are
   sabotage-pinned.
+- **`OutOfMemoryEx` (2026-10-05, catchable - the maintainer's choice) IS
+  ALSO A `std::bad_alloc`,** and `main` installs a `new_handler`
+  (`ml_out_of_memory`) that throws it. `operator new` may only throw a
+  bad_alloc, and as a RuntimeException every catch already in place - the
+  VM dispatch, each JIT status helper, a script's `catch` - conveys it, so
+  no site needed a new arm. Two halves: a builtin that builds a result to
+  a SIZE the program gives reserves it whole first (`reserve_or_oom`,
+  evaltypes.cpp.h - a count past `max_size()` or a refused reservation is
+  OutOfMemoryEx at the size argument; `make_array` reserves before its
+  first callback), and growth (`s += s`) raises where the allocation is
+  refused. UNDER ASAN its own throwing `operator new` aborts on a refusal
+  whatever the options say (the sanitizer cannot call the new_handler), so
+  `reserve_or_oom` first asks the NOTHROW form (`ML_RESERVE_PROBE`, ASan
+  builds only), which `allocator_may_return_null=1` - set by
+  `__asan_default_options`, mylang.cpp, the one copy of that hook - makes
+  return null; past ASan's 1 TiB maximum it is not asked at all, since ASan
+  prints a pid-stamped warning before refusing such a request and two
+  engines' stderr could never agree. Growth under ASan still aborts. NOT
+  coverable: a refusal inside a `noexcept` path
+  (terminate) and the OS killing an over-committed process. Nets:
+  `tests/functional/66_out_of_memory.my` (sizes past every machine, so
+  nothing is touched), the `out of memory:` `-rt` cases, and
+  `driver_checks`' growth case under `ulimit -v` (non-ASan builds).
 - `DECL_RUNTIME_EX` — subclasses of `RuntimeException` (adds `clone()` +
   `[[noreturn]] rethrow()`):
   `DivisionByZeroEx`, `TypeErrorEx`, `OutOfBoundsEx`, `KeyNotFoundEx`,

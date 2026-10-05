@@ -315,18 +315,22 @@ generic_pad(EvalContext *ctx, const ArgLocs *exprList,
 
     const size_t n = static_cast<size_t>(n_orig);
 
+    if (str.size() >= n)
+        return strval;
+
+    /* the padded string is reserved before it is built (reserve_or_oom) */
+    string out;
+    reserve_or_oom(out, static_cast<uint64_t>(n), arg1);
+
     if constexpr(leftpad) {
-
-        if (str.size() < n)
-            return SharedStr(string(n - str.size(), pad_char) + string(str));
-
+        out.append(n - str.size(), pad_char);
+        out.append(str);
     } else {
-
-        if (str.size() < n)
-            return SharedStr(string(str) + string(n - str.size(), pad_char));
+        out.append(str);
+        out.append(n - str.size(), pad_char);
     }
 
-    return strval;
+    return SharedStr(std::move(out));
 }
 
 EvalValue builtin_lpad(EvalContext *ctx, const ArgLocs *exprList,

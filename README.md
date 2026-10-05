@@ -2095,6 +2095,7 @@ exceptions that can be caught with `try-catch` blocks is:
   * KeyNotFoundEx
   * CannotOpenFileEx
   * StackOverflowEx
+  * OutOfMemoryEx
   * InvalidArgumentEx (a builtin got a bad argument *value*, e.g. `max` of an
     empty array)
   * InvalidNumberOfArgsEx (a builtin call with the wrong number of arguments —
@@ -2120,6 +2121,19 @@ language: the native-code tier may carve some frames from the machine stack
 and go deeper than the interpreter, so the depth at which `StackOverflowEx`
 is raised can differ between engines and configurations. What does not
 differ is that it IS raised, catchably, rather than the process crashing.
+
+`OutOfMemoryEx` ("Out of memory") is raised, catchably, when the program
+asks for memory the system refuses - in every engine, with the usual caret
+and backtrace. A builtin that builds a result of a size the program gives
+(`range`, `array(n)`, `make_array`, `lpad` / `rpad`) reserves the whole
+result before filling it, so a size that cannot be served raises at the
+size argument and nothing is half-built (`make_array` runs no callback):
+`array(1 << 59)` is an `OutOfMemoryEx`, not a crash. A container or string
+growing until memory runs out (`s += s` in a loop) raises it at the
+operation that asked for more. Like recursion depth, HOW MUCH memory a
+program may use belongs to the environment; one thing no language can
+define is an operating system that over-commits memory and then kills the
+process outright instead of refusing the request.
 It's also possible in `MyLang` to catch ANY exception use a catch-anything
 block:
 
