@@ -2240,7 +2240,9 @@ struct with any `array`/`dict`/`str`/`dyn`/`opt` field is stored as a boxed
 slot array instead, as is a **field-less** struct (it has `size 0`, so there
 are no bytes to lay out and an `array` of it is a general array, never
 zero-stride). This is transparent: it changes only memory layout and speed,
-never behavior.
+never behavior. Writing a field of an element - `a[i].x = v`, `a[i].x += 1`,
+`a[i].x++`, `a[i].inner.y = v` - stores into the array in place either way,
+and so does writing a field of a struct embedded inline (`p.inner.y = v`).
 
 **Recursive structs must use a nullable field.** A *non-opt* struct field whose
 type contains its own struct (directly, `struct N { N next; }`, or through a
