@@ -1335,6 +1335,25 @@ static const std::vector<test> tests =
       { "var dyn a = runtime([[[1, 2]]]);",
         "a[0][0][1][0] = 3;" },
       &typeid(TypeErrorEx), 1, 2, 15, 2 },
+    /* a member of a scalar on the way carets the scalar's expression, mid-
+     * chain and as the final step, and a missing member the member: the
+     * VM's walk marked the whole step mid-chain, and its final step said
+     * NotLValueEx without reading the member, until 2026-10-05 */
+    { "err loc: a chain store through a member of an int, mid-chain",
+      { "struct P { int x; }",
+        "var dyn d = runtime(P(1));",
+        "d.x.y.z = 1;" },
+      &typeid(TypeErrorEx), 1, 3, 5, 3 },
+    { "err loc: a chain store into a member of an int",
+      { "struct P { int x; }",
+        "var dyn d = runtime([P(1)]);",
+        "d[0].x.y = 1;" },
+      &typeid(TypeErrorEx), 1, 3, 8, 3 },
+    { "err loc: a chain store into a missing member of a flat element",
+      { "struct P { int x; }",
+        "var dyn d = runtime([P(1)]);",
+        "d[0].nope += 1;" },
+      &typeid(TypeErrorEx), 1, 3, 11, 3 },
 
     { "err loc: a typed a[i].field OOB marks the SUBSCRIPT, not the field",
       { "struct P { int x; int y; }",
@@ -7788,6 +7807,17 @@ static const std::vector<test> tests =
     { "vm: a store as a value: a compound on a missing key",
       { "var d = {\"a\": 1}; var z = (d[\"no\"] += 1);" },
       &typeid(KeyNotFoundEx) },
+    /* a const or builtin target: the value form runs the statement store,
+     * which throws as the tree-walker's does (a NotLoweredEx compile
+     * refusal in the VM until 2026-10-05) */
+    { "vm: a store into a const as a value",
+      { "const A = [1];",
+        "func f() { var z = (A = [2]); return z; }",
+        "f();" },
+      &typeid(CannotRebindConstEx) },
+    { "vm: a store into a builtin as a value",
+      { "var z = (len = 5);" },
+      &typeid(CannotRebindBuiltinEx) },
     /* A TYPED IdList reassign coerces PER-TARGET (int elements widen into
      * float targets), exactly like the scalar typed store. */
     { "vm: typed IdList destructure coerces per-target",
@@ -19647,6 +19677,12 @@ static const std::vector<repl_test> repl_tests =
       { { "var x = 5", "=> 5" },
         { "var x = 99", "=> 99" },
         { "x", "=> 99" } } },
+
+    /* a store through an element of an undefined name: the REPL's open
+     * world (a script refuses the name at compile time) */
+    { "an undefined base of an element's field store",
+      { { "nosuch[0].x = 5", "Undefined variable 'nosuch'" },
+        { "nosuch2[0].y++", "Undefined variable 'nosuch2'" } } },
 
     { "an undefined-variable error is recoverable",
       { { "z + 1", "Undefined variable 'z'" },

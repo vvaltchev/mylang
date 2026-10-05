@@ -25,6 +25,8 @@ func outcome(dyn f) {
         return "OutOfBoundsEx";
     } catch (DivisionByZeroEx) {
         return "DivisionByZeroEx";
+    } catch (KeyNotFoundEx) {
+        return "KeyNotFoundEx";
     }
     return "unreachable";       # (inference does not see the try return)
 }
@@ -100,13 +102,75 @@ func set_x(dyn arr) { arr[0].x = 2; }
 func inc_a(dyn arr) { arr[0].inner.a++; }
 assert(outcome(func () { set_x(K); }) == "NotLValueEx");
 assert(outcome(func () { inc_a(K); }) == "NotLValueEx");
-assert(K[0].x == 1 && ps[0].x == 5);
+assert(outcome(func () { K[ri(0)].x = 2; }) == "NotLValueEx");
+const CP = P(1, 1.0, true, I(1));
+func set_ia(dyn q) { q.inner.a = 2; }
+func set_cp() { CP.inner.a = 2; }       # a const name, not only its value
+assert(outcome(func () { set_ia(CP); }) == "NotLValueEx");
+assert(outcome(set_cp) == "NotLValueEx");
+assert(K[0].x == 1 && CP.inner.a == 1 && ps[0].x == 5);
+
+# what the bytes cannot take is read as a value from there on (a dyn base
+# is not checked at compile time), and the step, or the store after it,
+# fails as the tree-walker's does: a subscript of a struct, a member of an
+# int, a missing member, `++` of a struct field, a bool field `+= 1`
+assert(outcome(func [dps] () { dps[0][0].x = 1; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0][0].x++; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].x.y = 1; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].x.y.z += 1; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].x.y--; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].nope = 1; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].nope.a = 1; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].inner.nope -= 1; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].nope++; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].inner[0] = 1; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { ++dps[0].inner[0]; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].inner++; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].inner += 1; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].b += 1; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { var dyn z = (dps[0].nope = 1); })
+       == "TypeErrorEx");
+var dyn dp = runtime(p);
+assert(outcome(func [dp] () { dp.x.y = 1; }) == "TypeErrorEx");
+assert(outcome(func [dp] () { dp.nope.a = 1; }) == "TypeErrorEx");
+assert(outcome(func [dp] () { dp.inner.nope = 1; }) == "TypeErrorEx");
+assert(outcome(func [dp] () { dp.x.y.z = 1; }) == "TypeErrorEx");
+assert(ps[0].x == 5 && ps[0].inner.a == 30 && p.inner.a == 10);
+
+# the same rule after any value-walked step: a read-only dict's member is
+# a value, a plain `=` into it reads nothing, a compound reads the key
+const CD = {"a": {"b": 1}};
+func dset(dyn dd) { dd.a.zz = 5; }
+func dadd(dyn dd) { dd.a.zz += 5; }
+func dsub(dyn dd) { dd.a["zz"] = 5; }
+func dsubadd(dyn dd) { dd.a["b"] += 5; }
+assert(outcome(func () { dset(CD); }) == "NotLValueEx");
+assert(outcome(func () { dadd(CD); }) == "KeyNotFoundEx");
+assert(outcome(func () { dsub(CD); }) == "NotLValueEx");
+assert(outcome(func () { dsubadd(CD); }) == "NotLValueEx");
+assert(CD.a.b == 1);
 
 # evaluation order (README): the right-hand side, then the key, once each
 ps[idx()].x = val();
 ps[idx()].inner.a += val();
 assert(events == ["val", "idx", "val", "idx"]);
 assert(ps[0].x == 11 && ps[0].inner.a == 41);
+
+# an inc-dec STATEMENT whose key is a call: the walk, its value discarded
+ps[idx()].x++;
+dps[idx()].x++;
+--dps[idx()].inner.a;
+assert(len(events) == 7 && ps[0].x == 13 && ps[0].inner.a == 40);
+
+# a slice no write to its parent has detached yet: the store detaches the
+# slice itself, and the parent keeps its values
+var ps2 = [P(1, 1.0, false, I(1)), P(2, 2.0, false, I(2))];
+var s2 = ps2[0:1];
+s2[0].x = ri(66);
+var s3 = ps2[1:2];
+s3[0].inner.a++;
+assert(s2[0].x == 66 && s3[0].inner.a == 3);
+assert(ps2[0].x == 1 && ps2[1].inner.a == 2);
 
 # a foreach body storing into the array it walks: `p` is the element as it
 # is when its turn comes, a copy the body's later stores do not reach
@@ -120,4 +184,4 @@ foreach (var k, q in indexed fs) {
 }
 assert(seen == [1, 0, 10, 0] && fs[0].inner.a == 1 && fs[1].x == 100);
 
-print(ps, p, s, fs);
+print(ps, p, s, fs, ps2, s2, s3);

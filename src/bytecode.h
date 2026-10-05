@@ -119,8 +119,8 @@ enum class OpCode : unsigned char {
      * field, else the general subscript/member lvalue + slot_rmw), postfix
      * yielding the value the store replaced; tier 3 (dyn) = the checked
      * read-modify-write (NotLValue/const/TypeError at the INC-DEC caret).
-     * `target` = the dst slot (-1 = statement, value discarded), `aop` =
-     * plus/minus (inc/dec).
+     * `target` = the dst slot (a temp for the statement form too; the
+     * loader requires a frame slot), `aop` = plus/minus (inc/dec).
      */
     IncDecChainV,
 

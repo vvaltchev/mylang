@@ -735,7 +735,8 @@ bool pod_place_step(PodPlace &p, const UniqueId *memUid);
 /* The struct in the place, as a value (a fresh copy). */
 EvalValue pod_place_value(const PodPlace &p);
 /* Store `rval` (`OP= rval`) into the place's field `slot`, coerced to its
- * type; returns the stored value, `*old_out` the one it replaced. */
+ * type; returns the stored value, and a compound's `*old_out` the one it
+ * replaced (a plain `=` leaves it: inc-dec, its one user, is compound). */
 EvalValue pod_place_store(const PodPlace &p, int slot, Op op,
                           const EvalValue &rval, Loc ms, Loc me,
                           EvalValue *old_out = nullptr);

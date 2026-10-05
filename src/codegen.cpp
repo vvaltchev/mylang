@@ -2176,46 +2176,33 @@ struct Codegen {
          * STATEMENT dispatch (int/float/boxed - the same three tiers
          * gen_stmt uses), then the expression's value is the target's stored
          * value: Expr14::do_eval returns the (coerced) rval, and after the
-         * store a LOCAL target's slot holds exactly that - the same handle
-         * for a container, so aliasing (`a = (b = [1,2])`, same intptr) is
-         * identical. Only a resolved-LOCAL identifier target; a global/
-         * capture/IdList target declines (the readback would need an extra
-         * load - rare shapes). */
+         * store the variable holds exactly that - the same handle for a
+         * container, so aliasing (`a = (b = [1,2])`, same intptr) is
+         * identical. A local is its slot; a global or capture is read back
+         * (2026-10-05: those, an element / field target - try_value_store -
+         * and a const or builtin target, whose statement store throws, were
+         * a NotLoweredEx compile refusal until then, while the tree-walker
+         * ran them). An IdList target declines. */
         if (const Expr14 *e14 = dynamic_cast<const Expr14 *>(e)) {
             if (e14->lvalue->is_subscript()
                     || ctag(e14->lvalue.get()) == ConstructType::member)
                 return try_value_store(e14, out_slot, ops);
             const Identifier *lv =
                 dynamic_cast<const Identifier *>(e14->lvalue.get());
-            if (!lv || lv->is_const
-                    || (lv->sym.kind != SymKind::local
-                        && lv->sym.kind != SymKind::global
-                        && lv->sym.kind != SymKind::capture))
+            if (!lv)
                 return false;
-            /* A GLOBAL or CAPTURE target (2026-10-05; a NotLoweredEx
-             * compile refusal until then, while the tree-walker ran it):
-             * the same store, then the variable read back - it holds the
-             * stored value, coerced to its declared type as a local's
-             * slot is. */
             const size_t mark = ops.size();
             const int save_top = next_temp;
-            bool stored = compile_int_stmt(e14, ops);
-            if (!stored) {
-                ops.resize(mark);
-                next_temp = save_top;
-                stored = compile_float_stmt(e14, ops);
-            }
-            if (!stored) {
-                ops.resize(mark);
-                next_temp = save_top;
-                stored = compile_boxed_stmt(e14, ops);
-            }
-            if (stored && lv->sym.kind == SymKind::local) {
-                out_slot = lv->sym.slot;
-                return true;
-            }
-            if (stored && compile_boxed_expr(lv, out_slot, ops))
-                return true;
+            if (compile_int_stmt(e14, ops))
+                return compile_boxed_expr(lv, out_slot, ops);
+            ops.resize(mark);
+            next_temp = save_top;
+            if (compile_float_stmt(e14, ops))
+                return compile_boxed_expr(lv, out_slot, ops);
+            ops.resize(mark);
+            next_temp = save_top;
+            if (compile_boxed_stmt(e14, ops))
+                return compile_boxed_expr(lv, out_slot, ops);
             ops.resize(mark);
             next_temp = save_top;
             return false;
@@ -5459,24 +5446,8 @@ struct Codegen {
      */
     bool try_native_chain_store(const Expr14 *e, std::vector<CgInstr> &ops)
     {
-        if (e->op != Op::assign
-                && compound_assign_base(e->op) == Op::invalid)
-            return false;
-        /* Decompose the lvalue OUTSIDE-IN into member/subscript steps down to a
-         * base. `chain` is outermost-first; reverse for inside-out. */
         std::vector<const Construct *> chain;   /* outermost-first */
-        const Construct *cur = e->lvalue.get();
-        for (;;) {
-            if (ctag(cur) == ConstructType::member) {
-                chain.push_back(cur);
-                cur = static_cast<const MemberExpr *>(cur)->what.get();
-            } else if (ctag(cur) == ConstructType::subscript) {
-                chain.push_back(cur);
-                cur = static_cast<const Subscript *>(cur)->what.get();
-            } else {
-                break;
-            }
-        }
+        const Construct *base = lvalue_chain(e->lvalue.get(), chain);
         const int nsteps = static_cast<int>(chain.size());
         int nmember = 0;
         for (const Construct *c : chain)
@@ -5501,114 +5472,50 @@ struct Codegen {
             if (m1->base_struct || m1->base_dict)
                 return false;
         }
-        /* An OPTIONAL member (`a?.b`) short-circuits a none base - not handled
-         * by the chain walk; leave it to the tree-walker. */
-        for (const Construct *c : chain)
-            if (auto *m = dynamic_cast<const MemberExpr *>(c))
-                if (m->optional)
-                    return false;
-        int bslot, bkind;
-        if (!as_container_base(cur, bslot, bkind))
-            return false;
+        int vslot, bslot, steps_idx;
+        return emit_chain_store(e, chain, base, vslot, bslot, steps_idx, ops);
+    }
 
-        const size_t omark = ops.size();
-        const size_t cmark = chunk.consts.size();
-        const int st = next_temp;
-
-        int vslot;
-        if (!compile_rvalue(e, vslot, ops)) {
-            ops.resize(omark);
-            chunk.consts.resize(cmark);
-            next_temp = st;
-            return false;
-        }
-
-        /* Build the steps INSIDE-OUT (base -> final): chain[nsteps-1-i]. A
-         * subscript step compiles its key into a temp NOW (matching the
-         * tree-walker's key eval order: innermost first); a member step records
-         * its member-key pool index. */
-        std::vector<Chunk::ChainStep> steps;
-        steps.reserve(static_cast<size_t>(nsteps));
-        bool ok = true;
-        for (int i = 0; i < nsteps && ok; i++) {
-            const Construct *c = chain[nsteps - 1 - i];
-            if (ctag(c) == ConstructType::member) {
-                auto *m = static_cast<const MemberExpr *>(c);
-                steps.push_back({true, add_member_key(m), c->start, c->end});
+    /* A store's lvalue decomposed OUTSIDE-IN into its member / subscript
+     * steps (`chain`, outermost first); returns the base under them. */
+    static const Construct *
+    lvalue_chain(const Construct *lv, std::vector<const Construct *> &chain)
+    {
+        for (;;) {
+            if (ctag(lv) == ConstructType::member) {
+                chain.push_back(lv);
+                lv = static_cast<const MemberExpr *>(lv)->what.get();
+            } else if (ctag(lv) == ConstructType::subscript) {
+                chain.push_back(lv);
+                lv = static_cast<const Subscript *>(lv)->what.get();
             } else {
-                const Subscript *sub = static_cast<const Subscript *>(c);
-                int kslot;
-                if (!compile_key(sub, kslot, ops)) {
-                    ok = false;
-                    break;
-                }
-                steps.push_back({false, kslot, c->start, c->end});
+                return lv;
             }
         }
-        if (!ok) {
-            ops.resize(omark);
-            chunk.consts.resize(cmark);
-            next_temp = st;
-            return false;
-        }
-
-        const int steps_idx = static_cast<int>(chunk.chain_steps.size());
-        chunk.chain_steps.push_back(std::move(steps));
-
-        CgInstr in;
-        in.op = OpCode::StoreLValueChainV;
-        in.node_idx = add_ast_node(e->lvalue.get());   /* outer lvalue loc */
-        in.base_node_idx = add_base_node(bkind, cur);  /* #127: base caret */
-        in.target = vslot;                             /* value temp */
-        in.target2 = bslot;                            /* base slot */
-        /* DUAL operand: lo = the chain_steps pool idx, hi = the base kind */
-        in.set_a_dual(steps_idx, bkind);
-        in.aop = e->op;
-        in.op_node_idx = add_op_node(e->op, e);
-        ops.push_back(in);
-        return true;
     }
 
     /*
-     * A STORE used as a VALUE (`var z = (a[i] += 5)`, `print(d["k"] = 3)`,
-     * `var w = (p.x = 7)`, `100 + (s.f -= 1) * 2`) into an element, a field
-     * or any chain of them - a NotLoweredEx compile refusal until
-     * 2026-10-05, while the tree-walker ran it (RULE 2). Lowered through
-     * the generic StoreLValueChainV whatever the shape (the statement
-     * stores keep their tuned ops; this form is rare): the rvalue first,
-     * then each key into a temp once, inside-out, as try_native_chain_store
-     * does, then the value. A plain `=`'s value is the rvalue converted to
-     * the target's STATIC type (Expr14::val_widen; a dict target's
-     * rv_coerce already widened `vslot`) - the tree-walker's rule, see
-     * Expr14::do_eval. A compound's is the value it stored: read back
-     * through the same base and the same key temps, so nothing is
-     * evaluated twice, and a read of the location a store just wrote
-     * cannot fail. A base that is not a variable (a call's result) declines
-     * as the statement store does.
+     * StoreLValueChainV for `e`, its lvalue decomposed into `chain` over
+     * `base`: the rvalue into a temp (`vslot`), then each subscript step's
+     * key into a temp (INSIDE-OUT, matching the tree-walker's chained
+     * lvalue eval), the chain_steps entry (`steps_idx`), the op. False,
+     * nothing emitted, for an OPTIONAL member (`a?.b` short-circuits a none
+     * base - not a step the walk has; compile-refused upstream anyway), a
+     * base that is not a variable, or a part that does not compile. The
+     * runtime walk uses the same Type::subscript / member-lvalue /
+     * vm_member_store / vm_subscript_store the tree-walker's stores do.
      */
-    bool try_value_store(const Expr14 *e, int &out_slot,
-                         std::vector<CgInstr> &ops)
+    bool emit_chain_store(const Expr14 *e,
+                          const std::vector<const Construct *> &chain,
+                          const Construct *base, int &vslot, int &bslot,
+                          int &steps_idx, std::vector<CgInstr> &ops)
     {
-        if (e->op != Op::assign
-                && compound_assign_base(e->op) == Op::invalid)
-            return false;
-        std::vector<const Construct *> chain;   /* outermost-first */
-        const Construct *cur = e->lvalue.get();
-        for (;;) {
-            if (ctag(cur) == ConstructType::member) {
-                if (static_cast<const MemberExpr *>(cur)->optional)
-                    return false;   /* compile-refused upstream anyway */
-                chain.push_back(cur);
-                cur = static_cast<const MemberExpr *>(cur)->what.get();
-            } else if (ctag(cur) == ConstructType::subscript) {
-                chain.push_back(cur);
-                cur = static_cast<const Subscript *>(cur)->what.get();
-            } else {
-                break;
-            }
-        }
-        int bslot, bkind;
-        if (chain.empty() || !as_container_base(cur, bslot, bkind))
+        for (const Construct *c : chain)
+            if (ctag(c) == ConstructType::member &&
+                    static_cast<const MemberExpr *>(c)->optional)
+                return false;
+        int bkind;
+        if (!as_container_base(base, bslot, bkind))
             return false;
 
         const size_t omark = ops.size();
@@ -5621,10 +5528,12 @@ struct Codegen {
             return false;
         };
 
-        int vslot;
         if (!compile_rvalue(e, vslot, ops))
             return fail();
 
+        /* Build the steps INSIDE-OUT (base -> final): chain[nsteps-1-i]. A
+         * subscript step compiles its key into a temp NOW; a member step
+         * records its member-key pool index. */
         const int nsteps = static_cast<int>(chain.size());
         std::vector<Chunk::ChainStep> steps;
         steps.reserve(static_cast<size_t>(nsteps));
@@ -5641,21 +5550,48 @@ struct Codegen {
                 steps.push_back({false, kslot, c->start, c->end});
             }
         }
-        const std::vector<Chunk::ChainStep> rsteps = steps;
 
-        const int steps_idx = static_cast<int>(chunk.chain_steps.size());
+        steps_idx = static_cast<int>(chunk.chain_steps.size());
         chunk.chain_steps.push_back(std::move(steps));
 
         CgInstr in;
         in.op = OpCode::StoreLValueChainV;
         in.node_idx = add_ast_node(e->lvalue.get());   /* outer lvalue loc */
-        in.base_node_idx = add_base_node(bkind, cur);  /* #127: base caret */
-        in.target = vslot;
-        in.target2 = bslot;
+        in.base_node_idx = add_base_node(bkind, base); /* #127: base caret */
+        in.target = vslot;                             /* value temp */
+        in.target2 = bslot;                            /* base slot */
+        /* DUAL operand: lo = the chain_steps pool idx, hi = the base kind */
         in.set_a_dual(steps_idx, bkind);
         in.aop = e->op;
         in.op_node_idx = add_op_node(e->op, e);
         ops.push_back(in);
+        return true;
+    }
+
+    /*
+     * A STORE used as a VALUE (`var z = (a[i] += 5)`, `print(d["k"] = 3)`,
+     * `var w = (p.x = 7)`, `100 + (s.f -= 1) * 2`) into an element, a field
+     * or any chain of them - a NotLoweredEx compile refusal until
+     * 2026-10-05, while the tree-walker ran it (RULE 2). Lowered through
+     * the generic StoreLValueChainV whatever the shape (the statement
+     * stores keep their tuned ops; this form is rare), as
+     * try_native_chain_store emits it, then the value. A plain `=`'s value
+     * is the rvalue converted to the target's STATIC type (Expr14::
+     * val_widen; a dict target's rv_coerce already widened `vslot`) - the
+     * tree-walker's rule, see Expr14::do_eval. A compound's is the value it
+     * stored: read back through the same base and the same key temps, so
+     * nothing is evaluated twice, and a read of the location a store just
+     * wrote cannot fail. A base that is not a variable (a call's result)
+     * declines as the statement store does.
+     */
+    bool try_value_store(const Expr14 *e, int &out_slot,
+                         std::vector<CgInstr> &ops)
+    {
+        std::vector<const Construct *> chain;   /* outermost-first */
+        const Construct *base = lvalue_chain(e->lvalue.get(), chain);
+        int vslot, bslot, steps_idx;
+        if (!emit_chain_store(e, chain, base, vslot, bslot, steps_idx, ops))
+            return false;
 
         if (e->op == Op::assign) {
             out_slot = vslot;
@@ -5663,13 +5599,16 @@ struct Codegen {
             return true;
         }
 
-        /* the compound's stored value, read back */
-        int rs;
-        if (!compile_boxed_expr(cur, rs, ops))
-            return fail();
+        /* the compound's stored value, read back from the base variable (a
+         * local is its slot; a global / capture is loaded) */
+        int rs = bslot;
+        compile_boxed_expr(base, rs, ops);
+        const int nsteps = static_cast<int>(chain.size());
         for (int i = 0; i < nsteps; i++) {
             const Construct *c = chain[nsteps - 1 - i];
-            const Chunk::ChainStep &step = rsteps[static_cast<size_t>(i)];
+            const Chunk::ChainStep step =
+                chunk.chain_steps[static_cast<size_t>(steps_idx)]
+                                 [static_cast<size_t>(i)];
             const int t = alloc_temp();
             CgInstr rd;
             rd.node_idx = add_ast_node(c);

@@ -866,27 +866,24 @@ vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
 static void
 vm_chain_walk(EvalContext &ctx, const Chunk::MemberKey *mkeys, EvalValue &cur,
               const std::vector<Chunk::ChainStep> &steps, size_t upto,
-              PodPlace *place = nullptr)
+              PodPlace &place)
 {
     for (size_t i = 0; i < upto; i++) {
         const Chunk::ChainStep &step = steps[i];
         try {
-            if (place && place->bytes) {
+            if (place.bytes) {
                 if (step.is_member &&
-                    pod_place_step(*place, mkeys[step.operand].memUid))
+                    pod_place_step(place, mkeys[step.operand].memUid))
                     continue;
-                cur = pod_place_value(*place);
-                *place = PodPlace();
+                cur = pod_place_value(place);
+                place = PodPlace();
             }
-            if (place && cur.is<LValue *>() &&
-                (step.is_member
-                 ? pod_place_rooted_field(cur.get<LValue *>(),
-                                          mkeys[step.operand].memUid, *place)
-                 : pod_place_elem(cur.get<LValue *>(),
-                                  ctx.frame->at(step.operand).get(), *place)))
-                continue;
             if (step.is_member) {
                 const Chunk::MemberKey &mk = mkeys[step.operand];
+                if (cur.is<LValue *>() &&
+                    pod_place_rooted_field(cur.get<LValue *>(), mk.memUid,
+                                           place))
+                    continue;
                 const EvalValue cval =
                     cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
                 /* for_write=false: an intermediate member is READ to walk into.
@@ -900,9 +897,12 @@ vm_chain_walk(EvalContext &ctx, const Chunk::MemberKey *mkeys, EvalValue &cur,
                 else
                     cur = member_read_core(cval, mk.memId, mk.memUid,
                         mk.optional, step.lstart, step.lend,
-                        step.lstart, step.lend);
+                        mk.bstart, mk.bend);
             } else {
                 const EvalValue &key = ctx.frame->at(step.operand).get();
+                if (cur.is<LValue *>() &&
+                    pod_place_elem(cur.get<LValue *>(), key, place))
+                    continue;
                 Type *ct = cur.is<LValue *>()
                     ? cur.get<LValue *>()->get().get_type() : cur.get_type();
                 cur = ct->subscript(cur, key, /*for_write=*/false);
@@ -926,7 +926,7 @@ vm_chain_lvalue_store_op(EvalContext &ctx,
     const size_t n = steps.size();
     EvalValue cur = EvalValue(base);
     PodPlace place;
-    vm_chain_walk(ctx, mkeys, cur, steps, n - 1, &place);
+    vm_chain_walk(ctx, mkeys, cur, steps, n - 1, place);
 
     const Chunk::ChainStep &last = steps[n - 1];   /* node = the whole lvalue */
     try {
@@ -943,12 +943,22 @@ vm_chain_lvalue_store_op(EvalContext &ctx,
         }
         /* The final store needs a live lvalue; a VALUE-walked chain (a POD /
          * readonly intermediate) can't be stored into -> NotLValueEx at the
-         * whole-lvalue loc, exactly as the tree-walker's handle_single_expr14. */
-        if (!cur.is<LValue *>())
-            throw NotLValueEx(last.lstart, last.lend);
-        LValue *curlv = cur.get<LValue *>();
+         * whole-lvalue loc, exactly as the tree-walker's member_store /
+         * subscript_store - which first ACCESS the value's member or
+         * element, so a missing member, a base that has none or a bad key
+         * raises its own error (VM and tree-walker disagreed there until
+         * 2026-10-05). A plain `=` reads no dict member: a readonly dict's
+         * missing key is `none` there (MemberExpr::access). */
         if (last.is_member) {
             const Chunk::MemberKey &mk = mkeys[last.operand];
+            if (!cur.is<LValue *>()) {
+                if (op != Op::assign || !cur.is<intrusive_ptr<DictObject>>())
+                    member_read_core(cur, mk.memId, mk.memUid, false,
+                                     last.lstart, last.lend,
+                                     mk.bstart, mk.bend);
+                throw NotLValueEx(last.lstart, last.lend);
+            }
+            LValue *curlv = cur.get<LValue *>();
             /* A DICT member store `d.f = v` IS `d["f"] = v` (auto-vivify on a
              * plain assign; KeyNotFound on a compound of a missing key) - route
              * it through vm_subscript_store with the member name as the key, as
@@ -962,7 +972,12 @@ vm_chain_lvalue_store_op(EvalContext &ctx,
                                 last.lstart, last.lend, last.lstart, last.lend);
         } else {
             const EvalValue &key = ctx.frame->at(last.operand).get();
-            vm_subscript_store(curlv, key, value, op, last.lstart, last.lend);
+            if (!cur.is<LValue *>()) {
+                cur.get_type()->subscript(cur, key, op == Op::assign);
+                throw NotLValueEx(last.lstart, last.lend);
+            }
+            vm_subscript_store(cur.get<LValue *>(), key, value, op,
+                               last.lstart, last.lend);
         }
     } catch (Exception &ex) {
         /* an OPERATION error (op_caret) keeps no lvalue caret: the op's
@@ -975,42 +990,24 @@ vm_chain_lvalue_store_op(EvalContext &ctx,
     }
 }
 
-/* IncDecChainV (the R4 value form): root -> intermediate walk -> the final
- * step's exact IncDecExpr tier semantics (vm_incdec_final, eval.cpp). A kind-3
- * root seeds the walk with a VALUE (a compiled rvalue base keeps its
- * rvalue-ness); the result (old for postfix / new for prefix) lands in `dst`
- * (-1 = statement, discarded). ML_NOINLINE: off vm_run_chunk's recursive
- * frame (the recursion-stack hygiene rule). */
-/* The chain walk + final step over an already-formed root - the SHARED core
- * for the interpreter op below AND jit_incdec_chain (the root forming
- * differs: the interpreter throws UndefinedVariableEx for an undefined
- * global root, the JIT helper BAILS). `mkeys` is the member_keys BUFFER. */
-static void
-vm_incdec_chain_core(EvalContext &ctx, const Chunk::IncDecChain &site,
-                     const Chunk::MemberKey *mkeys, EvalValue cur,
-                     int_type dst, bool is_inc)
+/* The final step of an inc-dec chain over the walked-to ref, value or
+ * place: IncDecExpr::do_eval's exact tier semantics (vm_incdec_final,
+ * eval.cpp) - old for postfix, new for prefix. */
+static EvalValue
+vm_incdec_last(EvalContext &ctx, const Chunk::IncDecChain &site,
+               const Chunk::MemberKey *mkeys, EvalValue &cur,
+               const PodPlace &place, bool is_inc)
 {
-    const std::vector<Chunk::ChainStep> &steps = site.steps;
-    const size_t n = steps.size();
-
-    PodPlace place;
-    vm_chain_walk(ctx, mkeys, cur, steps, n - 1, &place);
-
-    const Chunk::ChainStep &last = steps[n - 1];
+    const Chunk::ChainStep &last = site.steps.back();
 
     /* a field in bytes no LValue covers: the read-modify-write in place */
     if (place.bytes) {
         const int slot = last.is_member
             ? place.def->slot_of(mkeys[last.operand].memUid) : -1;
-        if (slot >= 0) {
-            EvalValue r = pod_place_incdec(place, slot, is_inc,
-                                           site.is_prefix,
-                                           last.lstart, last.lend,
-                                           site.id_start, site.id_end);
-            if (dst >= 0)
-                ctx.frame->at(dst).put(std::move(r));
-            return;
-        }
+        if (slot >= 0)
+            return pod_place_incdec(place, slot, is_inc, site.is_prefix,
+                                    last.lstart, last.lend,
+                                    site.id_start, site.id_end);
         cur = pod_place_value(place);
     }
     EvalValue memId;
@@ -1027,15 +1024,35 @@ vm_incdec_chain_core(EvalContext &ctx, const Chunk::IncDecChain &site,
         key = ctx.frame->at(last.operand).get();
     }
 
-    EvalValue r = vm_incdec_final(cur, last.is_member, memId, memUid, key,
-                                  site.tier2, is_inc,
-                                  site.is_prefix,
-                                  last.lstart, last.lend,
-                                  site.kstart, site.kend,
-                                  bstart, bend,
-                                  site.id_start, site.id_end);
-    if (dst >= 0)
-        ctx.frame->at(dst).put(std::move(r));
+    return vm_incdec_final(cur, last.is_member, memId, memUid, key,
+                           site.tier2, is_inc,
+                           site.is_prefix,
+                           last.lstart, last.lend,
+                           site.kstart, site.kend,
+                           bstart, bend,
+                           site.id_start, site.id_end);
+}
+
+/* IncDecChainV (the R4 value form): root -> intermediate walk -> the final
+ * step (vm_incdec_last). A kind-3 root seeds the walk with a VALUE (a
+ * compiled rvalue base keeps its rvalue-ness); the result (old for postfix
+ * / new for prefix) lands in `dst`, a frame slot (codegen allocates one
+ * for the statement form too; verify_chunk bounds it). ML_NOINLINE (the
+ * op below): off vm_run_chunk's recursive frame (the recursion-stack
+ * hygiene rule). */
+/* The chain walk + final step over an already-formed root - the SHARED core
+ * for the interpreter op below AND jit_incdec_chain (the root forming
+ * differs: the interpreter throws UndefinedVariableEx for an undefined
+ * global root, the JIT helper BAILS). `mkeys` is the member_keys BUFFER. */
+static void
+vm_incdec_chain_core(EvalContext &ctx, const Chunk::IncDecChain &site,
+                     const Chunk::MemberKey *mkeys, EvalValue cur,
+                     int_type dst, bool is_inc)
+{
+    PodPlace place;
+    vm_chain_walk(ctx, mkeys, cur, site.steps, site.steps.size() - 1, place);
+    EvalValue r = vm_incdec_last(ctx, site, mkeys, cur, place, is_inc);
+    ctx.frame->at(dst).put(std::move(r));
 }
 
 static ML_NOINLINE void
