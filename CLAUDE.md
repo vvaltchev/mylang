@@ -430,7 +430,9 @@ make clean
 > benchmark), `build-claude/dbg` (gcc `TESTS=1 OPT=0`, ASan+UBSan),
 > `build-claude/clang` (`CXX=clang++ TESTS=1 OPT=0`),
 > `build-claude/rel-hard` (`TESTS=1 OPT=1 VM_HARDENING=1` — tests only,
-> never benchmarked).
+> never benchmarked). **`tests/run` builds too, and its default root is
+> `build-tests/` (the maintainer's): Claude runs it with
+> `--build-root build-claude`.**
 
 `OPT` defaults to 1 (`-O3`); `OPT=0` drops it. `TESTS=1` adds `-DTESTS`, which
 is what compiles the
@@ -2145,7 +2147,9 @@ lanes compile - int-rel, int-gcov, cmake-gcov); `-a` the manual ones.
 `-l` / `-L` list (`-d` with each test's CASES), `-T` / `-f` / names
 select, `--case REGEX` runs some cases of a test (`mylang -rt --only`,
 `corpus_diff` / `int_run` / `bt_oracle --only`). Builds are made
-incrementally under `--build-root` (default `build-claude/`) and each
+incrementally under `--build-root` (default `build-tests/`, the
+maintainer's - **Claude passes `--build-root build-claude`**, or exports
+`MYLANG_TEST_BUILD_ROOT=build-claude`, under the rule above) and each
 binary's `mylang -v` is CHECKED against its recipe before a test runs on
 it, so a wrong `--bin` or a stale directory is refused, not tested.
 Tests run as a dependency graph over `tests/jobs count` cores with

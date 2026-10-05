@@ -23,11 +23,11 @@ Quick start
     $ tests/run
 
 That builds what it needs (an incremental make of a debug build under
-build-claude/dbg), runs the quick check - every short and medium test,
+build-tests/dbg), runs the quick check - every short and medium test,
 about four minutes on 16 cores - and prints one line per test:
 
     tests/run: 18 test(s), 1 build(s), 21 cores, seed 134701015
-    logs: build-claude/test-logs/20261004-160952
+    logs: build-tests/test-logs/20261004-160952
 
     [ BUILT   ] build dbg                     0.3 s
     [ PASSED  ] cli: driver_checks           41.0 s
@@ -116,16 +116,16 @@ fuzzer's seed:
 
     [ FAILED  ] unit: rt                       2 min 31 s  exit 1
         ...
-        log: build-claude/test-logs/latest/rt.log
+        log: build-tests/test-logs/latest/rt.log
         reproduce: tests/run rt --case '^beta: two$'
-               or: build-claude/dbg/mylang -rt --only '^beta: two$'
+               or: build-tests/dbg/mylang -rt --only '^beta: two$'
 
-Builds live under build-claude/ (--build-root or MYLANG_TEST_BUILD_ROOT
+Builds live under build-tests/ (--build-root or MYLANG_TEST_BUILD_ROOT
 to change it). Before a test runs, its binary's "mylang -v" is checked
 against the build's recipe, so a wrong --bin or a stale directory is
-refused instead of tested. Logs go to build-claude/test-logs/, the newest
+refused instead of tested. Logs go to build-tests/test-logs/, the newest
 run under latest/, and each test's measured time is remembered in
-build-claude/test-times.json for the next run's estimates.
+build-tests/test-times.json for the next run's estimates.
 
 The exit status is 0 when everything passed, 3 when a test failed, 2 when
 a build failed, 4 when nothing matched, 1 for a bad option and 5 when
@@ -243,27 +243,27 @@ machine for you.
 
 Unit suite
 
-    $ build-claude/dbg/mylang -rt
+    $ build-tests/dbg/mylang -rt
 
-    $ build-claude/dbg/mylang -rt -s                 # dump a failing tree
+    $ build-tests/dbg/mylang -rt -s                 # dump a failing tree
 
-    $ build-claude/dbg/mylang -rt --list             # every case's name
+    $ build-tests/dbg/mylang -rt --list             # every case's name
 
-    $ build-claude/dbg/mylang -rt --only '^elem2: '  # only these cases
+    $ build-tests/dbg/mylang -rt --only '^elem2: '  # only these cases
 
 corpus_diff, int_run and bt_oracle take the same --list and --only REGEX.
 
 Engine differentials
 
-    $ tests/corpus_diff build-claude/dbg/mylang
+    $ tests/corpus_diff build-tests/dbg/mylang
 
-    $ tests/corpus_diff build-claude/dbg/mylang --levers --cold --xrot
+    $ tests/corpus_diff build-tests/dbg/mylang --levers --cold --xrot
 
-    $ tests/bt_oracle build-claude/dbg/mylang
+    $ tests/bt_oracle build-tests/dbg/mylang
 
-    $ tests/norec_enum build-claude/dbg/mylang --depth 3
+    $ tests/norec_enum build-tests/dbg/mylang --depth 3
 
-    $ tests/norec_sweep build-claude/dbg/mylang --max-events 25
+    $ tests/norec_sweep build-tests/dbg/mylang --max-events 25
 
 corpus_diff modes can be combined in one run:
 
@@ -278,16 +278,16 @@ corpus_diff modes can be combined in one run:
 
 Fuzzers
 
-    $ tests/nested_fuzz --mylang build-claude/dbg/mylang --count 250
+    $ tests/nested_fuzz --mylang build-tests/dbg/mylang --count 250
 
-    $ tests/myv_fuzz build-claude/dbg/mylang -n 400
+    $ tests/myv_fuzz build-tests/dbg/mylang -n 400
 
-    $ tests/repl_fuzz build-claude/dbg/mylang -n 400
+    $ tests/repl_fuzz build-tests/dbg/mylang -n 400
 
 Each fuzzer prints its seed first. To reproduce a failure, run it again
 with that seed:
 
-    $ tests/nested_fuzz --mylang build-claude/dbg/mylang --seed 1234
+    $ tests/nested_fuzz --mylang build-tests/dbg/mylang --seed 1234
 
 A .myv finding cannot be regenerated from a seed (an image contains its
 source path), so myv_fuzz saves every crashing image instead; run the
@@ -296,41 +296,41 @@ saved file directly.
 Intrusive tests
 
     $ make -j OPT=1 ASSERTS=1 LTO=0 TESTS=1 INT_TESTS=1 \
-          BUILD_DIR=build-claude/int-rel
+          BUILD_DIR=build-tests/int-rel
 
-    $ tests/int_run build-claude/int-rel/mylang
+    $ tests/int_run build-tests/int-rel/mylang
 
-    $ tests/int_enum build-claude/int-rel/mylang --tier 1 tests/functional/*.my
+    $ tests/int_enum build-tests/int-rel/mylang --tier 1 tests/functional/*.my
 
-    $ tests/int_enum build-claude/int-rel/mylang --tier 2 tests/functional/*.my
+    $ tests/int_enum build-tests/int-rel/mylang --tier 2 tests/functional/*.my
 
 With coverage, on a GCOV build:
 
-    $ make -j OPT=0 TESTS=1 INT_TESTS=1 GCOV=1 BUILD_DIR=build-claude/int-gcov
+    $ make -j OPT=0 TESTS=1 INT_TESTS=1 GCOV=1 BUILD_DIR=build-tests/int-gcov
 
-    $ tests/int_run build-claude/int-gcov/mylang --gcov --require-floor
+    $ tests/int_run build-tests/int-gcov/mylang --gcov --require-floor
 
-    $ tests/int_select build-claude/int-gcov/mylang --with-rt
+    $ tests/int_select build-tests/int-gcov/mylang --with-rt
 
 Driver, system, documentation
 
-    $ tests/driver_checks build-claude/dbg/mylang
+    $ tests/driver_checks build-tests/dbg/mylang
 
-    $ tests/system_smoke build-claude/release/mylang
+    $ tests/system_smoke build-tests/release/mylang
 
-    $ build-claude/dbg/mylang -c samples/gcd -o /tmp/gcd.myv
+    $ build-tests/dbg/mylang -c samples/gcd -o /tmp/gcd.myv
     $ tests/myv_doc_check /tmp/gcd.myv
 
 Machine code
 
-    $ scripts/disasmcheck build-claude/dbg/mylang --matrix
+    $ scripts/disasmcheck build-tests/dbg/mylang --matrix
 
     $ scripts/vdjcmp build-old/mylang build-new/mylang
 
 Builds
 ------
 
-tests/run makes these on demand, each under build-claude/NAME:
+tests/run makes these on demand, each under build-tests/NAME:
 
 | Build       | make (or cmake) options                     | Used by        |
 |-------------|---------------------------------------------|----------------|
@@ -442,7 +442,7 @@ engine and every JIT setting automatically.
 A REPL session is the text you would type, one input per line, ending with
 :quit. Its expected output lives next to it in NAME.expected; write it with
 
-    $ tests/int_run build-claude/int-rel/mylang --update-repl
+    $ tests/int_run build-tests/int-rel/mylang --update-repl
 
 and read it before committing: that file is the assertion.
 
