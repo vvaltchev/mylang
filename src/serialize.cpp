@@ -33,6 +33,7 @@
 #include "codegen.h"
 #include "env.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -2025,6 +2026,106 @@ bool myv_is_image(const std::string &path)
     return f.gcount() == 4 && memcmp(m, MYV_MAGIC, 4) == 0;
 }
 
+/*
+ * Every chunk's `ref_slots` (see myv_read), with the ONE input it reads off
+ * an instruction that the code beside it cannot vouch for: a call's
+ * SCALAR-RESULT CLAIM (Instr::ret_scalar, CallV / CachedCallV). The claim
+ * keeps the call's dst out of ref_slots, and the JIT writes a slot outside
+ * ref_slots with two raw stores - so a FALSE claim copies a returned
+ * reference without a retain, and the callee's frame frees it under the
+ * caller: myv_fuzz small-390 (2026-10-06), one byte making `f` return its
+ * struct `p` instead of `p.x + 1`, a double free at teardown. (A wrong
+ * ref_slots is not "only a leak" - the JIT's raw writes rest on it.)
+ *
+ * The claim is a fact about the CALLEE, and a load can check it: honored
+ * only for a WRITE-ONCE global whose function returns, at every ReturnV,
+ * a literal or a slot its own derived ref_slots proves scalar. A least
+ * fixpoint from "no claim": a claim is restored only once justified, and
+ * restoring one can only shrink ref_slots, so a recursive function (fib,
+ * whose return is the sum of its own calls) qualifies through its own
+ * claims. A valid image keeps every claim its compile made (the round
+ * trip stays identical); a false or unprovable one costs the optimization,
+ * never memory.
+ */
+static void myv_derive_ref_slots(VmProgram &prog)
+{
+    std::vector<std::pair<Chunk *, const FuncDescriptor *>> chunks;
+    chunks.push_back({ &prog.root, nullptr });
+    for (const auto &d : prog.funcs)
+        if (d->vm_chunk)
+            chunks.push_back({ static_cast<Chunk *>(
+                                   const_cast<void *>(d->vm_chunk)),
+                               d.get() });
+
+    /* global slot -> the function a write-once slot holds (as the JIT's
+     * own slot map, vm_jit_loaded_image) */
+    std::vector<const Chunk *> callee(prog.global_func_names.size(),
+                                      nullptr);
+    for (size_t s = 0; s < callee.size(); s++) {
+        const UniqueId *nm = prog.global_func_names[s];
+        if (!nm || (s < prog.global_slot_reassigned.size()
+                    && prog.global_slot_reassigned[s]))
+            continue;
+        for (const auto &d : prog.funcs)
+            if (d->name == nm && d->vm_chunk) {
+                callee[s] = static_cast<const Chunk *>(d->vm_chunk);
+                break;
+            }
+    }
+
+    struct Claim { Chunk *ck; size_t pc; const Chunk *callee; };
+    std::vector<Claim> claims;
+    for (auto &c : chunks)
+        for (size_t pc = 0; pc < c.first->code.size(); pc++) {
+            Instr &in = c.first->code[pc];
+            if ((in.op != OpCode::CallV && in.op != OpCode::CachedCallV)
+                    || !in.ret_scalar())
+                continue;
+            in.opflags &= static_cast<uint8_t>(~0x80u);   /* unproven */
+            const int64_t s = in.target2;
+            claims.push_back({ c.first, pc,
+                               s >= 0 && static_cast<size_t>(s)
+                                   < callee.size() ? callee[s] : nullptr });
+        }
+
+    const auto derive = [&](Chunk &ck, const FuncDescriptor *d) {
+        if (!d) {
+            compute_ref_slots(ck, nullptr);
+            return;
+        }
+        std::vector<int32_t> seeds;
+        ref_seeds_of(*d, seeds);
+        compute_ref_slots(ck, &seeds);
+    };
+    for (auto &c : chunks)
+        derive(*c.first, c.second);
+
+    const auto returns_scalar = [](const Chunk &g) {
+        for (const Instr &in : g.code)
+            if (in.op == OpCode::ReturnV && !in.a_is_lit()
+                    && std::binary_search(g.ref_slots.begin(),
+                                          g.ref_slots.end(),
+                                          static_cast<int32_t>(
+                                              in.a_slot())))
+                return false;
+        return true;
+    };
+
+    for (bool grew = true; grew; ) {
+        grew = false;
+        for (Claim &cl : claims) {
+            Instr &in = cl.ck->code[cl.pc];
+            if (in.ret_scalar() || !cl.callee || !returns_scalar(*cl.callee))
+                continue;
+            in.set_ret_scalar();
+            for (auto &c : chunks)
+                if (c.first == cl.ck)
+                    derive(*c.first, c.second);
+            grew = true;
+        }
+    }
+}
+
 VmProgram myv_read(const std::string &path, MyvSource &out_src,
                    const MyvLoadOpts &opts)
 {
@@ -2318,14 +2419,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
      * nonneg_slots: after the verifier bounded every operand the walk
      * reads, before the JIT bakes the list into its release arms.
      */
-    compute_ref_slots(prog.root, nullptr);
-    for (const auto &d : prog.funcs)
-        if (d->vm_chunk) {
-            std::vector<int32_t> seeds;
-            ref_seeds_of(*d, seeds);
-            compute_ref_slots(*static_cast<Chunk *>(
-                                  const_cast<void *>(d->vm_chunk)), &seeds);
-        }
+    myv_derive_ref_slots(prog);
 
     /*
      * #137 tier 2: from here on this process is running UNTRUSTED bytecode.
