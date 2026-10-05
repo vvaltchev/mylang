@@ -414,6 +414,46 @@ static const std::vector<test> tests =
 
     {
         /*
+         * A typed local copied from a LOCAL: the copy's rvalue emits no
+         * op, so the last op is the previous statement's producer of the
+         * source - which compile_int_stmt / compile_float_stmt used to
+         * RETARGET to write the copy, leaving the source unwritten (the
+         * JIT printed `<none>`, -nj aborted; until 2026-10-05). The
+         * retarget now requires an op this rvalue emitted, into a temp.
+         */
+        "codegen: copying a typed local leaves the source written",
+        {
+            "var v = float(runtime(1.5));",
+            "var x = v;",
+            "x = v;",
+            "var iv = int(runtime(7));",
+            "var ix = iv;",
+            "ix = iv;",
+            "var w = v * 2.0;",
+            "var y = w;",
+            "assert(v == 1.5 && x == 1.5 && iv == 7 && ix == 7);",
+            "assert(w == 3.0 && y == 3.0);",
+        },
+    },
+
+    {
+        /* a float slot copy is `r + -0.0`, the IEEE identity: `r + 0.0`
+         * turned -0.0 into +0.0 in the VM and the JIT (RULE 2) */
+        "codegen: a float slot copy keeps the sign of -0.0",
+        {
+            "var nz = -float(runtime(0.0));",
+            "var vals = [nz];",
+            "var a = nz;",
+            "var b = vals[0];",
+            "var c = 1.0;",
+            "c = nz;",
+            "assert(str(a) == \"-0.000000\" && str(b) == \"-0.000000\");",
+            "assert(str(c) == \"-0.000000\");",
+        },
+    },
+
+    {
+        /*
          * #96: a BOOL value WIDENS into flat numeric storage - the
          * promotion chain bool <= int <= float, the rule the decl and
          * struct-field coerces already followed; arrays were the
