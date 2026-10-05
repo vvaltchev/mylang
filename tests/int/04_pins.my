@@ -50,7 +50,7 @@ func press(int n) {
     for (var i = 0; i < n; i++) {
         a += i; b += a; c += b; d += c; e += d; f += e; g += f; h += g;
         k += h;
-        x = x * 1.25 + 0.75;
+        x = x * 0.5 + 0.75;         # -> 1.5, int(x) == 1
         a = a & 65535; b = b & 65535; c = c & 65535; d = d & 65535;
         e = e & 65535; f = f & 65535; g = g & 65535; h = h & 65535;
         k = k & 65535;
@@ -59,7 +59,7 @@ func press(int n) {
 }
 var pr = press(int(runtime(1000)));
 print(pr);
-assert(pr == 263073);
+assert(pr == 263075);
 
 # The run's PIN BUDGET is an enumerated decision too (`pin_budget`, #107
 # P3): one instance per run, keyed `<fn>@<run begin pc>/budget`, whose

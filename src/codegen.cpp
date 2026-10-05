@@ -6336,11 +6336,16 @@ struct Codegen {
             if (!compile_float_expr(t->elems[0].second.get(), op, ops))
                 return false;
             const int tt = alloc_temp();
-            CgInstr in;                    /* tt = 0.0 - op */
+            /* tt = -0.0 - op, which IS IEEE negation for every operand:
+             * `0.0 - op` turned a +0.0 into +0.0, while `-x` (the tree-
+             * walker, TypeFloat::opneg) gives -0.0 - a RULE 2 divergence
+             * printing `0.000000` against `-0.000000`. A NaN keeps its
+             * sign this way, and a NaN's sign is never shown (`nan`). */
+            CgInstr in;
             in.op = OpCode::FloatBin;
             in.node_idx = add_ast_node(e);
             in.target = tt;
-            in.set_a(float_lit(0));
+            in.set_a(float_lit(-0.0));
             in.set_b(op);
             in.aop = Op::minus;
             ops.push_back(in);

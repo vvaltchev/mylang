@@ -50,16 +50,25 @@ inline float_type internal_val_to_float(const EvalValue &b)
 
 void TypeFloat::add(EvalValue &a, const EvalValue &b)
 {
+    ML_INT_ONLY(int_vc_float_op(a.get<float_type>(), internal_val_to_float(b),
+                                a.get<float_type>() +
+                                internal_val_to_float(b));)
     a.get<float_type>() += internal_val_to_float(b);
 }
 
 void TypeFloat::sub(EvalValue &a, const EvalValue &b)
 {
+    ML_INT_ONLY(int_vc_float_op(a.get<float_type>(), internal_val_to_float(b),
+                                a.get<float_type>() -
+                                internal_val_to_float(b));)
     a.get<float_type>() -= internal_val_to_float(b);
 }
 
 void TypeFloat::mul(EvalValue &a, const EvalValue &b)
 {
+    ML_INT_ONLY(int_vc_float_op(a.get<float_type>(), internal_val_to_float(b),
+                                a.get<float_type>() *
+                                internal_val_to_float(b));)
     a.get<float_type>() *= internal_val_to_float(b);
 }
 
@@ -67,9 +76,12 @@ void TypeFloat::div(EvalValue &a, const EvalValue &b)
 {
     float_type rhs = internal_val_to_float(b);
 
+    ML_INT_ONLY(int_vc_float_div0(false, rhs);)
     if (std::fpclassify(rhs) == FP_ZERO)
         throw DivisionByZeroEx();
 
+    ML_INT_ONLY(int_vc_float_op(a.get<float_type>(), rhs,
+                                a.get<float_type>() / rhs);)
     a.get<float_type>() /= rhs;
 }
 
@@ -77,34 +89,48 @@ void TypeFloat::mod(EvalValue &a, const EvalValue &b)
 {
     float_type rhs = internal_val_to_float(b);
 
+    ML_INT_ONLY(int_vc_float_div0(true, rhs);)
     if (std::fpclassify(rhs) == FP_ZERO)
         throw DivisionByZeroEx();
 
+    ML_INT_ONLY(int_vc_float_op(a.get<float_type>(), rhs,
+                                std::fmod(a.get<float_type>(), rhs));)
     a = std::fmod(a.get<float_type>(), rhs);
 }
 
 void TypeFloat::lt(EvalValue &a, const EvalValue &b)
 {
+    ML_INT_ONLY(int_vc_float_cmp(a.get<float_type>(),
+                                 internal_val_to_float(b));)
     a = a.get<float_type>() < internal_val_to_float(b);
 }
 
 void TypeFloat::gt(EvalValue &a, const EvalValue &b)
 {
+    ML_INT_ONLY(int_vc_float_cmp(a.get<float_type>(),
+                                 internal_val_to_float(b));)
     a = a.get<float_type>() > internal_val_to_float(b);
 }
 
 void TypeFloat::le(EvalValue &a, const EvalValue &b)
 {
+    ML_INT_ONLY(int_vc_float_cmp(a.get<float_type>(),
+                                 internal_val_to_float(b));)
     a = a.get<float_type>() <= internal_val_to_float(b);
 }
 
 void TypeFloat::ge(EvalValue &a, const EvalValue &b)
 {
+    ML_INT_ONLY(int_vc_float_cmp(a.get<float_type>(),
+                                 internal_val_to_float(b));)
     a = a.get<float_type>() >= internal_val_to_float(b);
 }
 
 void TypeFloat::eq(EvalValue &a, const EvalValue &b)
 {
+    ML_INT_ONLY(if (b.is<float_type>() || b.is<int_type>())
+                    int_vc_float_cmp(a.get<float_type>(),
+                                     internal_val_to_float(b));)
     if (b.is<float_type>()) {
 
         a = a.get<float_type>() == b.get<float_type>();
@@ -121,6 +147,9 @@ void TypeFloat::eq(EvalValue &a, const EvalValue &b)
 
 void TypeFloat::noteq(EvalValue &a, const EvalValue &b)
 {
+    ML_INT_ONLY(if (b.is<float_type>() || b.is<int_type>())
+                    int_vc_float_cmp(a.get<float_type>(),
+                                     internal_val_to_float(b));)
     if (b.is<float_type>()) {
 
         a = a.get<float_type>() != b.get<float_type>();
@@ -137,6 +166,7 @@ void TypeFloat::noteq(EvalValue &a, const EvalValue &b)
 
 void TypeFloat::opneg(EvalValue &a)
 {
+    ML_INT_ONLY(int_vc_float_neg(a.get<float_type>());)
     a.get<float_type>() = -a.get<float_type>();
 }
 
@@ -145,8 +175,26 @@ bool TypeFloat::is_true(const EvalValue &a)
     return a.get<float_type>() != 0.0;
 }
 
+/* A float as text, `precision` digits after the point (printf's %f, which
+ * std::to_string used: 6). A NaN is `nan` whatever its sign bit - C
+ * prints `-nan` for the x86 default NaN (inf - inf) and `nan` on ARM, and
+ * the language must not depend on the platform. -0.0 and -inf keep their
+ * sign: they are ordinary values. */
+static string float_text(float_type v, int precision)
+{
+    ML_INT_ONLY(int_vc_float_text(v);)
+    if (std::isnan(v))
+        return "nan";
+    const int n = snprintf(nullptr, 0, "%.*f", precision, v);
+    if (n < 1)
+        throw InternalErrorEx();
+    std::vector<char> buf(static_cast<size_t>(n) + 1);
+    snprintf(buf.data(), buf.size(), "%.*f", precision, v);
+    return string(buf.data(), static_cast<size_t>(n));
+}
+
 string TypeFloat::to_string(const EvalValue &a) {
-    return std::to_string(a.get<float_type>());
+    return float_text(a.get<float_type>(), 6);
 }
 
 size_t TypeFloat::hash(const EvalValue &a)

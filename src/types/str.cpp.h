@@ -279,6 +279,19 @@ EvalValue TypeStr::subscript(const EvalValue &what_lval,
     return SharedStr(s, s.offset() + idx, 1);
 }
 
+#ifdef INT_TESTS
+/* a slice's value classes (intsites.h), from its bounds as given - shared
+ * by TypeStr::slice and TypeArr::slice */
+static void int_vc_slice_vals(bool str, const EvalValue &s,
+                              const EvalValue &e, size_t len) noexcept
+{
+    int_vc_slice(str, s.is<int_type>(),
+                 s.is<int_type>() ? s.get_ref<int_type>() : 0,
+                 e.is<int_type>(),
+                 e.is<int_type>() ? e.get_ref<int_type>() : 0, len);
+}
+#endif
+
 EvalValue TypeStr::slice(const EvalValue &what_lval,
                          const EvalValue &start_val,
                          const EvalValue &end_val)
@@ -286,6 +299,7 @@ EvalValue TypeStr::slice(const EvalValue &what_lval,
     const EvalValue &what = RValue(what_lval);
     /* Borrow (get_ref): read-only + the slice ctor retains the StrObj itself. */
     const SharedStr &s = what.get_ref<SharedStr>();
+    ML_INT_ONLY(int_vc_slice_vals(true, start_val, end_val, s.size());)
     int_type start = 0, end = s.size();
 
     if (start_val.is<int_type>()) {

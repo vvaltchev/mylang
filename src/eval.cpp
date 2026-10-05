@@ -3115,13 +3115,20 @@ int_type TypedScalarExpr::eval_int_body(EvalContext *ctx) const
         }
 
         case Cat::cmp:
-            if (kind == TypeHint::f)
-                return typed_cmp<float_type>(elems[1].first,
-                                             elems[0].second->eval_float(ctx),
-                                             elems[1].second->eval_float(ctx));
-            return typed_cmp<int_type>(elems[1].first,
-                                       elems[0].second->eval_int(ctx),
-                                       elems[1].second->eval_int(ctx));
+            /* the operands LEFT TO RIGHT, explicitly: as two arguments of
+             * typed_cmp their order was unspecified, and a GCC build
+             * evaluated the RIGHT one first - `a() < b()` printed b before
+             * a in the tree-walker alone (RULE 2) */
+            if (kind == TypeHint::f) {
+                const float_type x = elems[0].second->eval_float(ctx);
+                const float_type y = elems[1].second->eval_float(ctx);
+                ML_INT_ONLY(int_vc_float_cmp(x, y);)
+                return typed_cmp<float_type>(elems[1].first, x, y);
+            } else {
+                const int_type x = elems[0].second->eval_int(ctx);
+                const int_type y = elems[1].second->eval_int(ctx);
+                return typed_cmp<int_type>(elems[1].first, x, y);
+            }
 
         case Cat::logical: {
             int_type acc = elems[0].second->eval_int(ctx);
@@ -3151,23 +3158,39 @@ float_type TypedScalarExpr::eval_float_body(EvalContext *ctx) const
 {
     switch (cat) {
 
-        case Cat::neg:
-            return -elems[0].second->eval_float(ctx);
+        case Cat::neg: {
+            const float_type v = elems[0].second->eval_float(ctx);
+            ML_INT_ONLY(int_vc_float_neg(v);)
+            return -v;
+        }
 
         case Cat::arith: {
             float_type acc = elems[0].second->eval_float(ctx);
             for (size_t i = 1; i < elems.size(); i++) {
                 const float_type r = elems[i].second->eval_float(ctx);
                 switch (elems[i].first) {
-                    case Op::plus:  acc += r; break;
-                    case Op::minus: acc -= r; break;
-                    case Op::times: acc *= r; break;
+                    case Op::plus:
+                        ML_INT_ONLY(int_vc_float_op(acc, r, acc + r);)
+                        acc += r; break;
+                    case Op::minus:
+                        ML_INT_ONLY(int_vc_float_op(acc, r, acc - r);)
+                        acc -= r; break;
+                    case Op::times:
+                        ML_INT_ONLY(int_vc_float_op(acc, r, acc * r);)
+                        acc *= r; break;
                     case Op::div:
+                        ML_INT_ONLY(int_vc_float_div0(false, r);
+                                    if (r != 0.0)
+                                        int_vc_float_op(acc, r, acc / r);)
                         if (r == 0.0)
                             throw DivisionByZeroEx(elems[i].second->start,
                                                    elems[i].second->end);
                         acc /= r; break;
                     case Op::mod:
+                        ML_INT_ONLY(int_vc_float_div0(true, r);
+                                    if (r != 0.0)
+                                        int_vc_float_op(acc, r,
+                                                        fmod(acc, r));)
                         if (r == 0.0)
                             throw DivisionByZeroEx(elems[i].second->start,
                                                    elems[i].second->end);
@@ -5523,11 +5546,12 @@ EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
         );
     }
 
-    return t->slice(
-        lval,
-        start_idx ? RValue(start_idx->eval(ctx)) : none,
-        end_idx ? RValue(end_idx->eval(ctx)) : none
-    );
+    /* the bounds LEFT TO RIGHT, explicitly: as two arguments of one call
+     * their order was unspecified, and a GCC build evaluated the END first
+     * - `a[f():g()]` called g before f in the tree-walker alone (RULE 2) */
+    const EvalValue start_v = start_idx ? RValue(start_idx->eval(ctx)) : none;
+    const EvalValue end_v = end_idx ? RValue(end_idx->eval(ctx)) : none;
+    return t->slice(lval, start_v, end_v);
 }
 
 static bool

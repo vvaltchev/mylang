@@ -5,7 +5,9 @@
 # --levers runs it) nine hot ints and a float literal made the literal's
 # load overwrite the pinned slot. Found by the #107 P3 decision
 # enumerator. The value is the oracle; a checked build's register
-# tracker also aborts at the clobbering write.
+# tracker also aborts at the clobbering write. (x converges: until
+# 2026-10-05 it grew to ~1e97 and the asserted sum held int(x) of
+# it - undefined, x86's INT_MIN - where int() now throws.)
 func hot(int n) {
     var a = 1; var b = 2; var c = 3; var d = 4; var e = 5;
     var f = 6; var g = 7; var h = 8; var k = 9;
@@ -13,7 +15,7 @@ func hot(int n) {
     for (var i = 0; i < n; i++) {
         a += i; b += a; c += b; d += c; e += d; f += e; g += f; h += g;
         k += h;
-        x = x * 1.25 + 0.75;
+        x = x * 0.5 + 0.75;         # -> 1.5, int(x) == 1
         a = a & 65535; b = b & 65535; c = c & 65535; d = d & 65535;
         e = e & 65535; f = f & 65535; g = g & 65535; h = h & 65535;
         k = k & 65535;
@@ -22,4 +24,4 @@ func hot(int n) {
 }
 var r = hot(int(runtime(1000)));
 print(r);
-assert(r == 263073);
+assert(r == 263075);

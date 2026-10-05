@@ -954,7 +954,15 @@ runtime instead.
 
   * **Float**
     A floating-point number (e.g. `1.23`). Internally, it's a C `double`
-    (64-bit IEEE 754), exactly like Python's `float`.
+    (64-bit IEEE 754), exactly like Python's `float`. Dividing a float by
+    zero (`0.0` or `-0.0`) throws `DivisionByZeroEx`, as does `%`; an
+    infinity or a NaN comes from an overflow (`1e308 * 10.0`), from the
+    `inf` and `nan` constants or from a math builtin, and then follows
+    IEEE: `inf - inf` is a NaN, a NaN compares unequal to everything
+    (itself included), and `-x` of `0.0` is `-0.0`, which equals `0.0`.
+    A float prints with six decimals (`-0.000000` for negative zero),
+    an infinity as `inf` / `-inf`, and a NaN always as `nan` - its sign
+    is never shown.
 
   * **String**
     A string like "hello". Strings are immutable and support slices (e.g.
@@ -977,7 +985,11 @@ runtime instead.
     index counts from the end, so `a[-1]` is the last element and
     `a[-len(a)]` the first. Any other index - below `-len(a)`, or `len(a)`
     and beyond, which is every index of an empty array - throws
-    `OutOfBoundsEx`.
+    `OutOfBoundsEx`. `a[s:e]` is the slice from `s` up to (not including)
+    `e`, with Python's rules: either bound may be omitted, a negative bound
+    counts from the end, a start below `-len(a)` means `0` and an end past
+    `len(a)` means `len(a)`, and an empty or reversed range gives `[]` - a
+    slice never throws for its bounds. Strings slice the same way.
 
   * **Dictionary**
     Dictionaries are hash-maps (O(1) lookup) defined using `Python`'s syntax:
@@ -2366,9 +2378,12 @@ echo uses this quoted form for the top-level value too, so a bare string echoes
 as `=> "hello"` (IRB-style).
 
 #### `int(value)`
-Convert the given string to an integer. If the value is a float, it will be
-trucated. If the value is a string, it will be parsed and converted to an integer,
-if possible. If the value is already an integer, it will be returned as-it-is.
+Convert the given string to an integer. If the value is a float, it is
+truncated toward zero (`int(-2.7) == -2`); a NaN, an infinity, or a float
+outside the integer range (`-2^63 <= x < 2^63`) has no integer value and
+throws `InvalidValueEx`. If the value is a string, it will be parsed and
+converted to an integer, if possible. If the value is already an integer,
+it will be returned as-it-is.
 
 #### `float(value)`
 Convert the given value to float. If the value is an integer, it will be

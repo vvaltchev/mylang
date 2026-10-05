@@ -613,9 +613,34 @@ Two kinds are worth calling out.
   which first had to GAIN three rules to be the oracle: the sign of `/`
   and `%`, negative and out-of-range indexes, and `pop`/`top`/`join` of
   an empty array. Watched: a shift wrong at exactly 64, `a[len]` let
-  through on the boxed path, and a flooring `/` each fail it. Not yet
-  declared: slice bounds, float boundaries (NaN, inf, -0.0, `int()` of
-  them), string/number conversion, `range()` steps, literal limits.
+  through on the boxed path, and a flooring `/` each fail it.
+  **2026-10-05: SLICES and FLOATS (95 classes).** Slices (arrays and
+  strings, each edge of both bounds under Python's clamping) at
+  TypeArr/TypeStr::slice; floats (`/` and `%` by zero, overflow to inf,
+  a NaN made or taken, a -0.0 result, NaN and signed-zero comparisons,
+  `int()` of NaN / inf / out of range / -2^63 / a negative fraction /
+  -0.0, and NaN / inf / -0.0 as text) at TypeFloat, the M8 loop, `int()`
+  and the one float renderer. The README first gained the rules (array
+  slices; float `/` by zero throws; how NaN and -0.0 print; `int()` of a
+  float with no int value). FOUND, all fixed: `-x` of 0.0 printed
+  `0.000000` under the VM and JIT and `-0.000000` in the tree-walker
+  (codegen lowered it to `0.0 - x`; RULE 2); `int()` of NaN / inf / an
+  out-of-range float was an undefined C++ cast, x86 giving INT_MIN - it
+  throws InvalidValueEx (maintainer's choice), and tests/int/04_pins and
+  tests/functional/58_flit_pinned_rcx had ASSERTED that INT_MIN-derived
+  sum; a NaN printed `-nan` on x86 and `nan` on ARM - always `nan` now
+  (maintainer's choice); and, restructuring the comparison hook, a
+  GCC-built tree-walker evaluated `a() < b()` and `x[f():g()]` RIGHT TO
+  LEFT (two operands as arguments of one C++ call) - sequenced now.
+  Watched: a slice end clamped one short, a string slice not normalizing
+  a negative end, `int()` accepting 2^63 - each fails 22_value_classes.
+  FOUND, NOT fixed (a separate change): `d[0]++` on a `dyn` holding a
+  flat int/float array raises NotLValueEx in every engine while
+  `d[0] += 1` works (four implementations reproduce it on purpose); and
+  corpus_diff counted a self-asserting tests/functional program that
+  fails in every engine as agreement (an exit-0 check is ready, and
+  exposes that `++` case under -nti). Not yet declared: string/number
+  conversion, `range()` steps, literal limits.
 
 **MC/DC's one tool limit.** GCC instruments at most 64 conditions per
 decision and has no parameter to raise it. Five decisions in `vm.cpp`

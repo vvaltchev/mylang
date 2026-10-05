@@ -2,7 +2,8 @@
 #
 # INT test (#107, plan 9.1): THE VALUE CLASSES. Every declared boundary of
 # src/intsites.h's ML_INT_VCLASSES - a shift by 63 and by 64, an index of
-# -1 and of len, the most negative int, an empty array - exercised here,
+# -1 and of len, the most negative int, an empty array, a slice bound past
+# the end, a NaN, -0.0 - exercised here,
 # each result asserted against what README.md says (the SPEC is the
 # oracle, not the implementation: a shift by 64 and by 63 can take the
 # same C++ branch in a saturating implementation that is wrong at 64).
@@ -166,6 +167,94 @@ want("join([\"x\"], \",\")", join([str(runtime("x"))], ","), "x");
 array<int> s0 = [];
 want("sort([])", len(sort(s0)), 0);
 want("sort([1])", sort([one]), [1]);
+
+# --- a[s:e] / s[s:e]: Python's rules - a negative bound counts from the
+# end, a start below -len is 0, an end past len is len, an empty or
+# reversed range is empty
+var sa = [ri(1), ri(2), ri(3), ri(4)];          # len 4
+want("sa[:]", sa[:], [1, 2, 3, 4]);
+want("sa[-2:]", sa[ri(-2):], [3, 4]);
+want("sa[-9:]", sa[ri(-9):], [1, 2, 3, 4]);
+want("sa[4:]", sa[ri(4):], []);
+want("sa[:4]", sa[:ri(4)], [1, 2, 3, 4]);
+want("sa[:9]", sa[:ri(9)], [1, 2, 3, 4]);
+want("sa[:-1]", sa[:ri(-1)], [1, 2, 3]);
+want("sa[:-9]", sa[:ri(-9)], []);
+want("sa[2:2]", sa[ri(2):ri(2)], []);
+want("sa[3:1]", sa[ri(3):ri(1)], []);
+want("sa[-1:-3]", sa[ri(-1):ri(-3)], []);
+array<int> se = [];
+want("[][1:3]", se[ri(1):ri(3)], []);
+var dyn sg = runtime(["a", 2, 3.5, true]);      # general (boxed)
+want("sg[-3:-1]", sg[ri(-3):ri(-1)], [2, 3.5]);
+want("sg[-9:9]", sg[ri(-9):ri(9)], ["a", 2, 3.5, true]);
+var ss = str(runtime("abcd"));
+want("ss[:]", ss[:], "abcd");
+want("ss[-2:]", ss[ri(-2):], "cd");
+want("ss[-9:]", ss[ri(-9):], "abcd");
+want("ss[4:]", ss[ri(4):], "");
+want("ss[:4]", ss[:ri(4)], "abcd");
+want("ss[:9]", ss[:ri(9)], "abcd");
+want("ss[:-1]", ss[:ri(-1)], "abc");
+want("ss[:-9]", ss[:ri(-9)], "");
+want("ss[2:2]", ss[ri(2):ri(2)], "");
+want("ss[3:1]", ss[ri(3):ri(1)], "");
+want("\"\"[1:3]", es[ri(1):ri(3)], "");
+
+# --- floats: IEEE, plus how the language defines its edges - / and % by
+# zero throw, a NaN prints `nan`, int() of a value with no int throws
+var fz = float(runtime(0.0));
+var fi = float(runtime(inf));
+var fbig = float(runtime(1e308));
+var fone = float(runtime(1.0));
+want("1.0 / 0.0", raised(func [fone, fz] () => fone / fz),
+     "DivisionByZeroEx");
+want("1.0 / -0.0", raised(func [fone, fz] () => fone / -fz),
+     "DivisionByZeroEx");
+want("1.0 % 0.0", raised(func [fone, fz] () => fone % fz),
+     "DivisionByZeroEx");
+want("1e308 * 10.0", str(fbig * 10.0), "inf");
+want("-1e308 * 10.0", str(-fbig * 10.0), "-inf");
+var fnan = fi - fi;
+want("inf - inf", str(fnan), "nan");
+want("0.0 * inf", str(fz * fi), "nan");
+want("nan + 1.0", str(fnan + fone), "nan");
+want("-0.0", str(-fz), "-0.000000");
+want("0.0 * -1.0", str(fz * -fone), "-0.000000");
+want("-0.0 as str(x, 2)", str(-fz, 2), "-0.00");
+want("nan == nan", fnan == fnan, false);
+want("nan != nan", fnan != fnan, true);
+want("nan < 1.0", fnan < fone, false);
+want("nan >= nan", fnan >= fnan, false);
+want("-0.0 == 0.0", -fz == fz, true);
+want("-0.0 < 0.0", -fz < fz, false);
+func int_of(float f) {
+    try {
+        return str(int(f));
+    } catch (InvalidValueEx) {
+        return "InvalidValueEx";
+    }
+    return "unreachable";       # (inference does not see the try return)
+}
+want("int(nan)", int_of(fnan), "InvalidValueEx");
+want("int(inf)", int_of(fi), "InvalidValueEx");
+want("int(-inf)", int_of(-fi), "InvalidValueEx");
+want("int(1e19)", int_of(float(runtime(1e19))), "InvalidValueEx");
+want("int(2^63)", int_of(float(runtime(9223372036854775807.0))),
+     "InvalidValueEx");
+want("int(-2^63)", int_of(float(runtime(-9223372036854775808.0))),
+     "-9223372036854775808");
+want("int(-2.7)", int_of(float(runtime(-2.7))), "-2");
+want("int(-0.0)", int_of(-fz), "0");
+want("str(inf)", str(fi), "inf");
+var dyn dfz = runtime(0.0);
+var dyn dfi = runtime(inf);
+want("dyn 1.0 / 0.0", raised(func [dfz] () => 1.0 / dfz), "DivisionByZeroEx");
+want("dyn 1.0 % 0.0", raised(func [dfz] () => 1.0 % dfz), "DivisionByZeroEx");
+want("dyn inf - inf", str(dfi - dfi), "nan");
+want("dyn -0.0", str(-dfz), "-0.000000");
+want("dyn nan == nan", (dfi - dfi) == (dfi - dfi), false);
+want("dyn -0.0 == 0.0", -dfz == dfz, true);
 
 print("value classes: " + str(bad) + " failure(s)");
 assert(bad == 0);

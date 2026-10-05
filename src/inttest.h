@@ -75,6 +75,15 @@ void int_vc_divmod(bool mod, int64_t a, int64_t b) noexcept;
 void int_vc_arith(char op, int64_t a, int64_t b) noexcept; /* + - * n(eg) */
 void int_vc_index(bool str, int64_t idx, uint64_t len) noexcept;
 void int_vc_size(IntVc empty, IntVc one, uint64_t n) noexcept;
+/* a[s:e] / s[s:e]: has_* says whether that bound was given */
+void int_vc_slice(bool str, bool has_s, int64_t s, bool has_e, int64_t e,
+                  uint64_t len) noexcept;
+void int_vc_float_div0(bool mod, double b) noexcept;
+void int_vc_float_op(double a, double b, double r) noexcept; /* r = a OP b */
+void int_vc_float_neg(double a) noexcept;
+void int_vc_float_cmp(double a, double b) noexcept;
+void int_vc_float_int(double f) noexcept;                   /* int(f) */
+void int_vc_float_text(double v) noexcept;                  /* f as text */
 
 /* The core (inttest.cpp). */
 void int_record(IntSite s, std::string &&line);

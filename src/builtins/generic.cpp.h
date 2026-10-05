@@ -110,27 +110,9 @@ EvalValue builtin_str(EvalContext *ctx, const ArgLocs *exprList,
                 );
             }
 
-            const int precision = static_cast<int>(p.get<int_type>());
-            const float_type fval = e.get<float_type>();
-
-            /*
-             * Size the buffer to the exact length: a fixed buffer would
-             * silently truncate for large-magnitude values at high precision
-             * (e.g. str(1e30, 64) needs ~96 chars).
-             */
-            const int slen = snprintf(nullptr, 0, "%.*f", precision, fval);
-
-            /* `%f` always writes at least one digit, so a length below 1
-             * is an error like a negative one - and saying so lets GCC
-             * see the buffer below is never the 1-byte one it otherwise
-             * warns (format-truncation) the second call could truncate */
-            if (slen < 1)
-                throw InternalErrorEx(exprList->arg(0)->start,
-                                      exprList->arg(0)->end);
-
-            std::vector<char> buf(static_cast<size_t>(slen) + 1);
-            snprintf(buf.data(), buf.size(), "%.*f", precision, fval);
-            return SharedStr(string(buf.data(), static_cast<size_t>(slen)));
+            /* the same renderer as print / str(x): a NaN is `nan` */
+            return SharedStr(float_text(e.get<float_type>(),
+                                        static_cast<int>(p.get<int_type>())));
         }
 
     } else {

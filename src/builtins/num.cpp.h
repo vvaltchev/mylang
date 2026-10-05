@@ -39,7 +39,19 @@ EvalValue builtin_int(EvalContext *ctx, const ArgLocs *exprList,
 
     } else if (val.is<float_type>()) {
 
-        return static_cast<int_type>(val.get<float_type>());
+        /* RULE 1: a NaN, an infinity or a value outside int's range has
+         * no int, and the C++ cast is UNDEFINED there (x86 happened to
+         * give INT_MIN for all of them, ARM saturates) - it throws.
+         * [-2^63, 2^63) is exactly the doubles whose truncation fits;
+         * a NaN fails both comparisons. */
+        const float_type f = val.get<float_type>();
+        ML_INT_ONLY(int_vc_float_int(f);)
+        const float_type lim = static_cast<float_type>(
+            -static_cast<float_type>(std::numeric_limits<int_type>::min()));
+        if (!(f >= -lim && f < lim))
+            throw InvalidValueEx("float has no int value (NaN, infinite or "
+                                 "out of range)", arg->start, arg->end);
+        return static_cast<int_type>(f);
 
     } else if (val.is<SharedStr>()) {
 
