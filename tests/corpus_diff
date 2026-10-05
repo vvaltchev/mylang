@@ -381,6 +381,18 @@ run_one() {     # $1 = env assignment ("" = plain), $2 = extra engine flags
       echo "CRASH [${1:-plain}${flags:+ $flags}] $f (tw rc=$ra, vm rc=$rb)"
       printf '%s\n' "$b" | tail -4 | sed 's/^/  /'
       bad=$((bad + 1))
+    # ⛔ AND A SELF-ASSERTING PROGRAM THAT FAILS IN EVERY ENGINE "AGREES"
+    # TOO: an assert prints the same error and exits 1 everywhere. Found
+    # 2026-10-05: 58_flit_pinned_rcx asserted a sum built on int() of a
+    # 1e97 float (undefined behaviour, which made int() throw once it was
+    # fixed) and this script stayed green. A tests/functional program
+    # must exit 0 (samples may not: gcd exits 1 with no arguments).
+    elif [ "$ra" -ne 0 ] && case "$f" in tests/functional/*) true ;;
+                               *) false ;; esac; then
+      echo "FAIL [${1:-plain}${flags:+ $flags}] $f (exit $ra in the" \
+           "tree-walker: a self-asserting program must exit 0)"
+      printf '%s\n' "$a" | tail -4 | sed 's/^/  /'
+      bad=$((bad + 1))
     elif [ "$a" != "$b" ]; then
       echo "DIFF [${1:-plain}${flags:+ $flags}] $f"
       diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") \

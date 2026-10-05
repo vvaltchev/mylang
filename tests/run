@@ -452,8 +452,8 @@ def rt_failed(out):
 
 def corpus_failed(out):
     bad = []
-    for m in re.finditer(r"^(?:DIFF|CRASH) \[[^\]]*\] (\S+)|^REFUSED (\S+)",
-                         out, re.M):
+    for m in re.finditer(r"^(?:DIFF|CRASH|FAIL) \[[^\]]*\] (\S+)|"
+                         r"^REFUSED (\S+)", out, re.M):
         p = m.group(1) or m.group(2)
         if p not in bad:
             bad.append(p)

@@ -967,10 +967,13 @@ vm_incdec_chain_core(EvalContext &ctx, const Chunk::IncDecChain &site,
     EvalValue memId;
     const UniqueId *memUid = nullptr;
     EvalValue key;
+    Loc bstart = last.lstart, bend = last.lend;
     if (last.is_member) {
         const Chunk::MemberKey &mk = mkeys[last.operand];
         memId = mk.memId;
         memUid = mk.memUid;
+        bstart = mk.bstart;
+        bend = mk.bend;
     } else {
         key = ctx.frame->at(last.operand).get();
     }
@@ -981,6 +984,7 @@ vm_incdec_chain_core(EvalContext &ctx, const Chunk::IncDecChain &site,
                                   site.allow_flat, site.allow_pod,
                                   last.lstart, last.lend,
                                   site.kstart, site.kend,
+                                  bstart, bend,
                                   site.id_start, site.id_end);
     if (dst >= 0)
         ctx.frame->at(dst).put(std::move(r));

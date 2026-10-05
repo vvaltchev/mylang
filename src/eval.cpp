@@ -1040,6 +1040,7 @@ vm_cached_call(EvalContext *ctx, FuncObject &obj,
 }
 
 static void stamp_operand_loc(const Construct *c, Exception &e);
+static bool is_lvalue_rooted(const Construct *c);
 
 /*
  * Build a struct instance from a (positional, already-desugared) argument list.
@@ -3892,41 +3893,150 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
 }
 
 /*
- * VM IncDecElemCheckedV: `c[k]++` / `c[k]--` on a DYN/unproven base. Mirrors
- * IncDecExpr::do_eval's dyn read-modify-write path: form the element LValue via
- * the runtime subscript(for_write=false) (a general array / dict has a boxed
- * element; a flat scalar element has none -> NotLValueEx, matching the tree-
- * walker), enforce int/float (inc-dec is int/float-ONLY - a string throws
- * rather than concatenating), then apply ±1. The value is discarded (a
- * statement). TWO distinct carets, exactly as the tree-walker: a subscript-
- * internal throw (KeyNotFound/OOB) gets the SUBSCRIPT loc (`sub_*`), while the
- * inc-dec's own checks (NotLValue/const/TypeError) get the INC-DEC loc (`id_*`).
+ * `++` / `--` on an ELEMENT or a MEMBER nothing proved the type of (a `dyn`
+ * base, or any base under -nti): the checked read-modify-write that every
+ * engine's dyn path shares - IncDecExpr::do_eval's, the VM's statement ops
+ * (vm_incdec_elem / vm_incdec_member) and vm_incdec_final's tier 3. Each
+ * sets `old` and returns the new value.
+ *
+ * A general array's element, a dict's value and a ROOTED boxed struct's
+ * field are LValues, changed in place. A FLAT array's element and a POD
+ * field are not: a rooted, writable one is read, checked and stored back
+ * through flat_store_core / vm_member_store - what `+= 1` does
+ * (try_flat_subscript_store, try_pod_struct_store). Until 2026-10-05 every
+ * engine raised NotLValueEx there - for `d[0]++` on a dyn holding an int
+ * array, and for EVERY `a[i]++` on a flat array under -nti - while `+= 1`
+ * worked; the four copies of this logic agreed on the throw.
+ *
+ * Carets: an access error (out of bounds, a non-int index, a missing key or
+ * member) gets the access's (`a*`; "Expected dict object" the base's,
+ * `b*`); the inc-dec's own NotLValue / const / type error gets `id*`.
  */
-void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
-                    Loc sub_start, Loc sub_end, Loc id_start, Loc id_end)
+static EvalValue
+dyn_incdec_finish(LValue *lv, bool is_inc, EvalValue &old,
+                  Loc id_start, Loc id_end)
 {
+    if (lv->is_const_var())
+        throw CannotChangeConstEx(id_start, id_end);
+    old = lv->get();
+    if (!old.is<int_type>() && !old.is<float_type>())
+        throw TypeErrorEx("'++'/'--' requires an int or float",
+                          id_start, id_end);
+    EvalValue nv = old;
+    apply_compound_op(nv, EvalValue(static_cast<int_type>(1)),
+                      is_inc ? Op::addeq : Op::subeq);
+    lv->put(nv);
+    return nv;
+}
+
+static EvalValue
+dyn_incdec_elem(const EvalValue &cur, const EvalValue &key, bool is_inc,
+                EvalValue &old, Loc astart, Loc aend,
+                Loc id_start, Loc id_end)
+{
+    SharedArrayObj *arr;
+
+    if (cur.is<LValue *>() && flat_writable_array(cur.get<LValue *>(), arr)) {
+
+        /* The checks a general array's subscript makes, in its order and
+         * with its caret - then the element's type, before any write. */
+        if (!key.is<int_type>())
+            throw TypeErrorEx("Expected integer as subscript", astart, aend);
+        int_type idx = key.get<int_type>();
+        if (idx < 0)
+            idx += arr->size();
+        if (idx < 0 || static_cast<size_t>(idx) >= arr->size())
+            throw OutOfBoundsEx(astart, aend);
+
+        old = arr_elem_boxed(*arr, static_cast<size_type>(idx));
+        if (!old.is<int_type>() && !old.is<float_type>())
+            throw TypeErrorEx("'++'/'--' requires an int or float",
+                              id_start, id_end);
+
+        /* an int or float element: an ints or floats array, which
+         * flat_store_core always stores */
+        EvalValue nv;
+        if (!flat_store_core(cur.get<LValue *>(), *arr, key,
+                             EvalValue(static_cast<int_type>(1)),
+                             is_inc ? Op::addeq : Op::subeq, nv,
+                             astart, aend, astart, aend))
+            throw InternalErrorEx();
+        return nv;
+    }
+
     EvalValue elv;
     try {
-        elv = base_lv->get().get_type()->subscript(
-            EvalValue(base_lv), key, /*for_write=*/false);
+        Type *ct = cur.is<LValue *>()
+            ? cur.get<LValue *>()->get().get_type()
+            : cur.get_type();
+        elv = ct->subscript(cur, key, /*for_write=*/false);
     } catch (Exception &e) {
-        /* A subscript-internal throw (KeyNotFound/OOB) is loc-less; stamp the
-         * SUBSCRIPT loc (the tree-walker's stamp_operand_loc on the lvalue). */
-        if (!e.loc_start) { e.loc_start = sub_start; e.loc_end = sub_end; }
+        if (!e.loc_start) {
+            e.loc_start = astart;
+            e.loc_end = aend;
+        }
         throw;
     }
     if (!elv.is<LValue *>())
         throw NotLValueEx(id_start, id_end);
-    LValue *lv = elv.get<LValue *>();
-    if (lv->is_const_var())
-        throw CannotChangeConstEx(id_start, id_end);
-    EvalValue old = lv->get();
-    if (!old.is<int_type>() && !old.is<float_type>())
-        throw TypeErrorEx("'++'/'--' requires an int or float",
-                          id_start, id_end);
-    const EvalValue one{static_cast<int_type>(1)};
-    apply_compound_op(old, one, is_inc ? Op::addeq : Op::subeq);
-    lv->put(std::move(old));
+    return dyn_incdec_finish(elv.get<LValue *>(), is_inc, old,
+                             id_start, id_end);
+}
+
+static EvalValue
+dyn_incdec_member(const EvalValue &cur, const EvalValue &memId,
+                  const UniqueId *memUid, bool is_inc, EvalValue &old,
+                  Loc astart, Loc aend, Loc bstart, Loc bend,
+                  Loc id_start, Loc id_end)
+{
+    const bool rooted = cur.is<LValue *>();
+    const EvalValue &cval = rooted ? cur.get<LValue *>()->get() : cur;
+    const bool is_struct = cval.is<intrusive_ptr<StructObject>>();
+
+    if (rooted && is_struct) {
+        const StructObject &obj =
+            *cval.get_ref<intrusive_ptr<StructObject>>().get();
+        const int slot = obj.def->slot_of(memUid);
+        if (obj.is_pod() && slot >= 0 && !obj.is_readonly() &&
+            !cur.get<LValue *>()->is_const_var()) {
+            old = obj.pod_get(slot);
+            if (!old.is<int_type>() && !old.is<float_type>())
+                throw TypeErrorEx("'++'/'--' requires an int or float",
+                                  id_start, id_end);
+            return vm_member_store(cur.get<LValue *>(), memUid,
+                                   is_inc ? Op::addeq : Op::subeq,
+                                   EvalValue(static_cast<int_type>(1)),
+                                   astart, aend, bstart, bend);
+        }
+    }
+
+    /* A field of a temporary struct is a value, as MemberExpr reads it; a
+     * dict's value is an LValue either way. */
+    LValue *lv = rooted || !is_struct
+        ? vm_member_lvalue_ref(cval, memId, memUid, /*for_write=*/false,
+                               astart, aend)
+        : nullptr;
+    if (!lv) {
+        /* the read's own error first (no such member, not a struct or a
+         * dict), as the tree-walker's MemberExpr raises it */
+        member_read_core(cval, memId, memUid, false, astart, aend,
+                         bstart, bend);
+        throw NotLValueEx(id_start, id_end);
+    }
+    return dyn_incdec_finish(lv, is_inc, old, id_start, id_end);
+}
+
+/*
+ * VM IncDecElemCheckedV: `c[k]++` / `c[k]--` on a DYN/unproven base, as a
+ * statement (the value is discarded): dyn_incdec_elem. The subscript caret
+ * (`sub_*`) marks an access error, the inc-dec caret (`id_*`) its own.
+ */
+void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
+                    Loc sub_start, Loc sub_end, Loc id_start, Loc id_end)
+{
+    EvalValue old;
+    dyn_incdec_elem(EvalValue(base_lv), key, is_inc, old, sub_start, sub_end,
+                    id_start, id_end);
 }
 
 /*
@@ -3982,21 +4092,11 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
                       const UniqueId *memUid, bool is_inc,
                       Loc mstart, Loc mend, Loc id_start, Loc id_end)
 {
-    /* inc-dec is a READ-modify-write, so for_write=false (no auto-vivify), and
-     * a POD field / readonly / missing key with no default is not an lvalue. */
-    LValue *lv = vm_member_lvalue_ref(base_lv->get(), memId, memUid,
-                                      /*for_write=*/false, mstart, mend);
-    if (!lv)
-        throw NotLValueEx(id_start, id_end);
-    if (lv->is_const_var())
-        throw CannotChangeConstEx(id_start, id_end);
-    EvalValue old = lv->get();
-    if (!old.is<int_type>() && !old.is<float_type>())
-        throw TypeErrorEx("'++'/'--' requires an int or float",
-                          id_start, id_end);
-    const EvalValue one{static_cast<int_type>(1)};
-    apply_compound_op(old, one, is_inc ? Op::addeq : Op::subeq);
-    lv->put(std::move(old));
+    /* The site pool holds no base caret, so "Expected dict object" marks
+     * the member here (the tree-walker marks the base). */
+    EvalValue old;
+    dyn_incdec_member(EvalValue(base_lv), memId, memUid, is_inc, old,
+                      mstart, mend, mstart, mend, id_start, id_end);
 }
 
 /*
@@ -4018,9 +4118,11 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
  *     lvalue (vm_member_lvalue_ref; a POD/readonly field is a VALUE read -
  *     run member_read_core for its non-container TypeError, then NotLValueEx).
  *
- * Tier 3 (dyn / un-hinted) == the dyn read-modify-write: form the final ref
- * READ-style, then NotLValue / const / non-int-float TypeError at the INC-DEC
- * caret (`id_*`), ±1, return old (postfix) / new (prefix).
+ * Tier 3 (dyn / un-hinted) == dyn_incdec_elem / dyn_incdec_member, the
+ * tree-walker's own: an access error at the access caret (`b*` is a member
+ * step's BASE caret, for "Expected dict object"), NotLValue / const /
+ * non-int-float at the INC-DEC caret (`id_*`); returns old (postfix) / new
+ * (prefix).
  */
 EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                           const EvalValue &memId, const UniqueId *memUid,
@@ -4028,7 +4130,7 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                           bool tier2, bool is_inc, bool is_prefix,
                           bool allow_flat, bool allow_pod,
                           Loc lstart, Loc lend, Loc kstart, Loc kend,
-                          Loc id_start, Loc id_end)
+                          Loc bstart, Loc bend, Loc id_start, Loc id_end)
 {
     const Op cop = is_inc ? Op::addeq : Op::subeq;
     const EvalValue one{static_cast<int_type>(1)};
@@ -4114,48 +4216,14 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
         return old;
     }
 
-    /* Tier 3 (dyn): the checked read-modify-write. */
-    LValue *lv;
-
-    if (is_member) {
-        const EvalValue &cval =
-            cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
-        lv = vm_member_lvalue_ref(cval, memId, memUid, /*for_write=*/false,
-                                  lstart, lend);
-        if (!lv) {
-            member_read_core(cval, memId, memUid, false,
-                             lstart, lend, lstart, lend);
-            throw NotLValueEx(id_start, id_end);
-        }
-    } else {
-        EvalValue elv;
-        try {
-            Type *ct = cur.is<LValue *>()
-                ? cur.get<LValue *>()->get().get_type()
-                : cur.get_type();
-            elv = ct->subscript(cur, key, /*for_write=*/false);
-        } catch (Exception &e) {
-            if (!e.loc_start) { e.loc_start = lstart; e.loc_end = lend; }
-            throw;
-        }
-        if (!elv.is<LValue *>())
-            throw NotLValueEx(id_start, id_end);
-        lv = elv.get<LValue *>();
-    }
-
-    if (lv->is<Builtin>())
-        throw CannotRebindBuiltinEx();
-    if (lv->is_const_var())
-        throw CannotChangeConstEx(id_start, id_end);
-
-    EvalValue old = lv->get();
-    if (!old.is<int_type>() && !old.is<float_type>())
-        throw TypeErrorEx("'++'/'--' requires an int or float",
+    /* Tier 3 (dyn): the checked read-modify-write every engine shares. */
+    EvalValue old;
+    const EvalValue nv = is_member
+        ? dyn_incdec_member(cur, memId, memUid, is_inc, old, lstart, lend,
+                            bstart, bend, id_start, id_end)
+        : dyn_incdec_elem(cur, key, is_inc, old, lstart, lend,
                           id_start, id_end);
-    EvalValue nv = old;
-    apply_compound_op(nv, one, cop);
-    lv->put(std::move(nv));
-    return is_prefix ? lv->get() : old;
+    return is_prefix ? nv : old;
 }
 
 /*
@@ -5078,7 +5146,57 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
         return old;
     }
 
-    /* dyn / un-hinted: read-modify-write through the LValue. */
+    /*
+     * dyn / un-hinted. An element or a member is the read-modify-write the
+     * VM's dyn paths share (dyn_incdec_elem / dyn_incdec_member), with the
+     * base and the key evaluated once, in the order Subscript / MemberExpr
+     * evaluate them. A variable is an LValue.
+     */
+    if (lvalue->is_subscript()) {
+        const Subscript *sub = static_cast<const Subscript *>(lvalue.get());
+        EvalValue cur, key;
+        try {
+            cur = sub->what->eval(ctx);
+            if (cur.is<UndefinedId>())
+                throw UndefinedVariableEx(cur.get<UndefinedId>().id,
+                                          sub->what->start, sub->what->end);
+            key = literal_widen(RValue(sub->index->eval(ctx)),
+                                sub->key_coerce);
+        } catch (Exception &e) {
+            stamp_operand_loc(lvalue.get(), e);
+            throw;
+        }
+        EvalValue old;
+        const EvalValue nv = dyn_incdec_elem(cur, key, is_inc, old,
+                                             sub->start, sub->end,
+                                             start, end);
+        return is_prefix ? nv : old;
+    }
+
+    if (ctag(lvalue.get()) == ConstructType::member &&
+        !static_cast<const MemberExpr *>(lvalue.get())->optional) {
+        const MemberExpr *m = static_cast<const MemberExpr *>(lvalue.get());
+        EvalValue cur;
+        try {
+            cur = m->what->eval(ctx);
+            if (cur.is<UndefinedId>())
+                throw UndefinedVariableEx(cur.get<UndefinedId>().id,
+                                          m->start, m->end);
+        } catch (Exception &e) {
+            stamp_operand_loc(lvalue.get(), e);
+            throw;
+        }
+        /* a temporary base's struct field is a value (MemberExpr's rule) */
+        if (!is_lvalue_rooted(m->what.get()))
+            cur = RValue(cur);
+        EvalValue old;
+        const EvalValue nv = dyn_incdec_member(cur, m->memId, m->memUid,
+                                               is_inc, old, m->start, m->end,
+                                               m->what->start, m->what->end,
+                                               start, end);
+        return is_prefix ? nv : old;
+    }
+
     EvalValue lref;
     try {
         lref = lvalue->eval(ctx);
@@ -5095,7 +5213,9 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
 
     LValue *lv = lref.get<LValue *>();
 
-    if (lv->is<Builtin>())
+    /* the builtin's own name; a variable HOLDING a builtin is a type error
+     * below, as in the VM */
+    if (lv->is<Builtin>() && lv->is_const_var())
         throw CannotRebindBuiltinEx();
 
     if (lv->is_const_var())

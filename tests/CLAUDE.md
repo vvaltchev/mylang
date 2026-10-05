@@ -86,7 +86,8 @@ the INT_TESTS section); read those first.
   (`--only REGEX`) through its tool; `CASES` maps the kind to the list
   command, the selection suffix and a FAILED-CASE PARSER that reads the
   tool's own failure lines (rt: `[ RUN  ]` + `[ FAIL ]`; corpus_diff:
-  `DIFF [..] path`, `CRASH [..] path`, `REFUSED path`; int_run: `  FAIL
+  `DIFF [..] path`, `CRASH [..] path`, `FAIL [..] path` (a functional
+  program that does not exit 0), `REFUSED path`; int_run: `  FAIL
   path`; bt_oracle: `FAIL name`, `VACUOUS name:`). **Changing a tool's
   failure line breaks its reproduce line silently: update the parser in
   the same change.** A fuzzer's reproduce line comes from its printed

@@ -1325,9 +1325,11 @@ concat a string — then ±1), and a **dyn ELEMENT** inc-dec `c[k]++`/`c[k]--` (
 dyn dict / general array / dyn base — anything NOT a proven flat int/float
 element, which `compile_int/float_stmt` already handle) via
 **`IncDecElemCheckedV`**: it forms the element LValue via the runtime
-`subscript(for_write=false)` and does the same int/float-checked ±1, mirroring
-`IncDecExpr::do_eval`'s dyn read-modify-write (a flat scalar element has no
-LValue → `NotLValueEx`, exactly as the tree-walker). It is **AST-FREE**: its
+`subscript(for_write=false)` and does the same int/float-checked ±1 - the
+SAME function as `IncDecExpr::do_eval`'s dyn path and IncDecChainV's tier 3,
+`dyn_incdec_elem` (a rooted, writable flat array's element has no LValue, so
+it is read, checked and stored back through `flat_store_core`; it raised
+`NotLValueEx` until 2026-10-05). It is **AST-FREE**: its
 TWO distinct error carets — the SUBSCRIPT loc for a subscript-internal throw
 (`KeyNotFound`/OOB) vs the INC-DEC loc for its own `NotLValue`/`const`/
 `TypeError` — which a one-loc-per-pc side table can't hold, live in the
@@ -1337,10 +1339,14 @@ the undefined-global-BASE caret comes from the **`base_locs`** side table
 A **dyn MEMBER** inc-dec `d.f++`/`d.f--` (a
 dyn/general base holding a struct or dict) is the exact twin,
 **`IncDecMemberCheckedV`**:
-it forms the member LValue like `MemberExpr::do_eval`'s rooted-base path (a
-mutable boxed STRUCT field or a DICT value is an lvalue; a POD field / readonly
-/ a missing dict key throws `NotLValueEx`/`KeyNotFoundEx`), int/float-checks,
-±1. Same pool-carried dual-loc (the MEMBER loc for a `KeyNotFound` vs the
+it is `dyn_incdec_member` too: a mutable boxed STRUCT field or a DICT value
+is an lvalue, a rooted writable POD field is stored back through
+`vm_member_store`, a readonly instance / a temporary's field throws
+`NotLValueEx`, a missing member or key the read's own error first
+(`member_read_core`: TypeErrorEx / `KeyNotFoundEx`); then int/float-checks,
+±1. (The site pool holds no BASE caret, so "Expected dict object" marks the
+member here where the tree-walker marks the base.) Same pool-carried
+dual-loc (the MEMBER loc for a `KeyNotFound` vs the
 INC-DEC loc for `NotLValue`/`TypeError`), plus the member key
 (`memId`/`memUid` ride in the same `incdec_sites` entry). Both cover a
 proven-struct NON-numeric member

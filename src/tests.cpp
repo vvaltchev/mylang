@@ -4999,11 +4999,17 @@ static const std::vector<test> tests =
     { "++/--: dyn dict element on a missing key throws",
       { "func mkd() { var d = {\"a\": 1}; return d; }",
         "var dyn dd = mkd(); dd[\"z\"]++;" }, &typeid(KeyNotFoundEx) },
-    /* A dyn aliasing a FLAT array: its element has no boxed LValue, so an
-     * element inc-dec is a NotLValue error (byte-identical in both engines). */
-    { "++/--: dyn aliasing a flat array element is not an lvalue",
-      { "var a = [1, 2, 3]; var dyn e = a; e[0]++;" },
-      &typeid(NotLValueEx) },
+    /* A dyn aliasing a FLAT array: its element has no boxed LValue, so the
+     * inc-dec reads, checks and stores it back (dyn_incdec_elem) - it raised
+     * NotLValueEx in every engine until 2026-10-05, while `+= 1` worked. */
+    { "++/--: dyn aliasing a flat array element increments it",
+      { "var a = [1, 2, 3]; var dyn e = a; e[0]++; --e[2];",
+        "var dyn v = e[1]++;",
+        "assert(a[0] == 2 && a[1] == 3 && a[2] == 2 && v == 2);",
+        "var dyn bs = runtime([true]);",
+        "var r = \"\";",
+        "try { bs[0]++; } catch (TypeErrorEx) { r = \"t\"; }",
+        "assert(r == \"t\");" } },
     /* A dyn MEMBER inc-dec `d.f++` (VM: IncDecMemberCheckedV): forms the member
      * LValue (a dict value / a boxed struct field) and is int/float-checked. */
     { "++/--: dyn member is int/float-checked (dict value + boxed field)",
@@ -5022,11 +5028,14 @@ static const std::vector<test> tests =
     { "++/--: dyn dict member on a missing key throws",
       { "func mkd() { var d = {\"cnt\": 1}; return d; }",
         "var dyn dd = mkd(); dd.missing++;" }, &typeid(KeyNotFoundEx) },
-    /* A dyn holding a POD struct: its field has no boxed LValue -> NotLValue. */
-    { "++/--: dyn POD-struct member is not an lvalue",
-      { "struct P { int x; int y; }",
-        "func mkp() { return P(1, 2); }",
-        "var dyn p = mkp(); p.x++;" }, &typeid(NotLValueEx) },
+    /* A dyn holding a POD struct: its field has no boxed LValue, so the
+     * inc-dec stores it back through the byte path (dyn_incdec_member) - a
+     * NotLValueEx in every engine until 2026-10-05. */
+    { "++/--: dyn POD-struct member increments it",
+      { "struct P { int x; float y; }",
+        "func mkp() { return P(1, 2.5); }",
+        "var dyn p = mkp(); p.x++; var dyn w = p.y--;",
+        "assert(p.x == 2 && p.y == 1.5 && w == 2.5);" } },
     /* The checked inc-dec DUAL carets, pinned (they come from the incdec_sites
      * pool under -vm, the node in the tree-walker — must be byte-identical):
      * a subscript-INTERNAL throw (missing key) marks the SUBSCRIPT `dd["z"]`,

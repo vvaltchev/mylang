@@ -1,0 +1,113 @@
+# `++` / `--` on an element or a field nothing proved the type of: a `dyn`
+# base, or any base under -nti (corpus_diff runs that pass too). Every engine
+# shares one read-modify-write for it now (eval.cpp, dyn_incdec_elem /
+# dyn_incdec_member). Until 2026-10-05 a FLAT array's element and a POD
+# struct's field raised NotLValueEx there, in all of them - while `+= 1`
+# worked - so `d[0]++` on a dyn holding an int array failed, and so did every
+# `a[i]++` under -nti. Values come from runtime(): a constant would fold.
+
+struct P { int x; float y; bool b; }
+struct B { int x; dyn tag; }
+
+func outcome(dyn f) {
+    try {
+        f();
+        return "ok";
+    } catch (NotLValueEx) {
+        return "NotLValueEx";
+    } catch (TypeErrorEx) {
+        return "TypeErrorEx";
+    } catch (OutOfBoundsEx) {
+        return "OutOfBoundsEx";
+    }
+}
+
+# A flat int array, every form; the value of the expression too.
+var dyn d = runtime([10, 20, 30]);
+d[0]++;
+++d[1];
+d[2]--;
+--d[0];
+assert(str(d) == "[10, 21, 29]");
+var dyn post = d[1]++;
+var dyn pre = ++d[2];
+assert(post == 21 && pre == 30 && str(d) == "[10, 22, 30]");
+d[-1]++;
+assert(d[2] == 31);
+
+# A flat float array.
+var dyn f = runtime([1.5, 2.5]);
+var dyn fp = f[0]--;
+assert(fp == 1.5 && f[0] == 0.5);
+++f[1];
+assert(f[1] == 3.5);
+
+# A typed array reached through a dyn alias: the write is shared, and a
+# slice taken before it keeps the old element (the array's copy-on-write).
+var a = [1, 2, 3];
+var s = a[0:2];
+var dyn e = a;
+e[0]++;
+assert(a[0] == 2 && s[0] == 1);
+
+# A flat row inside a general array (the chain's last step).
+var dyn m = runtime([[1, 2], [3, 4]]);
+m[1][0]++;
+var dyn mr = m[0][1]--;
+assert(str(m) == "[[1, 1], [4, 4]]" && mr == 2);
+
+# A POD struct's fields, through a dyn.
+var dyn p = runtime(P(1, 2.5, true));
+p.x++;
+var dyn py = p.y--;
+assert(p.x == 2 && py == 2.5 && p.y == 1.5);
+
+# Already LValues before the fix, kept as regressions: a boxed struct's field,
+# a dict's value by member and by key, a general array's element.
+var dyn bx = runtime(B(1, "t"));
+bx.x++;
+var dyn dd = runtime({"k": 1});
+dd.k++;
+dd["k"]++;
+var dyn g = runtime([1, "s", 2.5]);
+g[0]++;
+g[2]--;
+assert(bx.x == 2 && dd.k == 3 && g[0] == 2 && g[2] == 1.5);
+
+# The errors README.md names: an element or field that is not an int or a
+# float is a type error; an index out of range is OutOfBoundsEx; a constant
+# is not an lvalue.
+var dyn bools = runtime([true, false]);
+var dyn strs = runtime(["a", "b"]);
+var dyn pts = runtime([P(1, 2.5, true)]);
+const K = [1, 2];
+const KP = P(1, 2.5, true);
+func inc_k(dyn q) { q[0]++; }
+func inc_kp(dyn q) { q.x++; }
+assert(outcome(func [bools] () { bools[0]++; }) == "TypeErrorEx");
+assert(outcome(func [strs] () { strs[0]++; }) == "TypeErrorEx");
+assert(outcome(func [pts] () { pts[0]++; }) == "TypeErrorEx");
+assert(outcome(func [p] () { p.b++; }) == "TypeErrorEx");
+assert(outcome(func [d] () { d[3]++; }) == "OutOfBoundsEx");
+assert(outcome(func [d] () { d[-4]--; }) == "OutOfBoundsEx");
+assert(outcome(func [d] () { d["x"]++; }) == "TypeErrorEx");
+assert(outcome(func () { inc_k(K); }) == "NotLValueEx");
+assert(outcome(func () { inc_kp(KP); }) == "NotLValueEx");
+assert(outcome(func [pts] () { pts[0].x++; }) == "NotLValueEx");
+assert(str(d) == "[10, 22, 31]" && p.b);
+
+# Two the engines disagreed on before they shared the code: a missing member
+# (the VM's statement form said NotLValueEx, the tree-walker TypeErrorEx),
+# and a field of a TEMPORARY struct, which is a value (the VM incremented the
+# temporary; the tree-walker raised NotLValueEx).
+func mkb() { return runtime(B(1, "t")); }
+assert(outcome(func [bx] () { bx.nope++; }) == "TypeErrorEx");
+assert(outcome(func () { mkb().x++; }) == "NotLValueEx");
+assert(outcome(func () { var dyn t = mkb().x--; }) == "NotLValueEx");
+
+# A variable HOLDING a builtin is a type error (the tree-walker used to say
+# CannotRebindBuiltinEx, which only the builtin's own name earns).
+var dyn pr = runtime(print);
+assert(outcome(func [pr] () { pr++; }) == "TypeErrorEx");
+
+print(d, f, a, m, p, bx, dd, g);
