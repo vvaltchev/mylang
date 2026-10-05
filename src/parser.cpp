@@ -3465,7 +3465,15 @@ pAcceptForeachStmt(ParseContext &c,
     if (pAcceptKeyword(c, Keyword::kw_indexed))
         stmt->indexed = true;
 
-    stmt->container = pExpr01(c, fl);
+    /* An EXPRESSION, so not with the statement's pInStmt: pExpr14 reads that
+     * flag as "a multi-assignment target list may start here", and every
+     * element of an array literal and every call argument in the container
+     * is parsed by pExpr14 - so `foreach (x in [j, -j])` and
+     * `foreach (x in range(j, -j, -1))` took `j ,` for an id list and
+     * refused the `-` (a SyntaxError until 2026-10-05). Every other header
+     * reaches its expressions through pExprTop, whose pExpr14 strips the
+     * flag before the operand; this one starts below it. */
+    stmt->container = pExpr01(c, fl & ~pFlags::pInStmt);
 
     if (!stmt->container)
         noExprError(c);

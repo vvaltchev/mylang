@@ -5036,6 +5036,24 @@ static const std::vector<test> tests =
         "func mkp() { return P(1, 2.5); }",
         "var dyn p = mkp(); p.x++; var dyn w = p.y--;",
         "assert(p.x == 2 && p.y == 1.5 && w == 2.5);" } },
+    /* A foreach CONTAINER is an expression: the statement's pInStmt reached
+     * pExpr14 for every array-literal element and call argument in it, which
+     * read `j ,` as the start of a multi-assignment target list and refused
+     * the next operand - a SyntaxError until 2026-10-05, while the same
+     * literal parsed anywhere else. */
+    { "parse: a foreach container's elements and arguments are expressions",
+      { "var j = int(runtime(2)); var dyn b = runtime(true); var s = 0;",
+        "foreach (x in [j, -j]) s += x;",
+        "foreach (x in [j, +j]) s += x;",
+        "foreach (x in [j, -1]) s += x;",
+        "foreach (x in [b, !b]) if (x) s += 100;",
+        "foreach (x in [[j, -j], [j, ~j]]) s += x[1];",
+        "foreach (x in range(j, -j, -1)) s += x;",
+        "foreach (var i, x in indexed [j, -j]) s += i;",
+        "foreach (k, v in {j: -j}) s += k + v;",
+        "foreach (x in [j, -j][0:1]) s += x;",
+        "for (var i = 0; i < len([j, -j]); i++) s += 1;",
+        "assert(s == 107);" } },
     /* The checked inc-dec DUAL carets, pinned (they come from the incdec_sites
      * pool under -vm, the node in the tree-walker — must be byte-identical):
      * a subscript-INTERNAL throw (missing key) marks the SUBSCRIPT `dd["z"]`,
