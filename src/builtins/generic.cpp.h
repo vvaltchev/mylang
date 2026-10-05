@@ -101,14 +101,16 @@ EvalValue builtin_str(EvalContext *ctx, const ArgLocs *exprList,
             const ArgLoc *arg1 = exprList->arg(1);
             const EvalValue &p = args[1];
 
-            if (!p.is<int_type>() || p.get<int_type>() < 0 || p.get<int_type>() > 64) {
+            if (!p.is<int_type>())
+                throw TypeErrorEx("Expected an integer digit count",
+                                  arg1->start, arg1->end);
 
-                throw TypeErrorEx(
-                    "Expected an integer in the range [0, 64]",
-                    arg1->start,
-                    arg1->end
-                );
-            }
+            ML_INT_ONLY(int_vc_str_digits(e.get<float_type>(),
+                                          p.get<int_type>());)
+            /* an int of the wrong value, not a wrong type */
+            if (p.get<int_type>() < 0 || p.get<int_type>() > 64)
+                throw InvalidValueEx("Expected a digit count in [0, 64]",
+                                     arg1->start, arg1->end);
 
             /* the same renderer as print / str(x): a NaN is `nan` */
             return SharedStr(float_text(e.get<float_type>(),

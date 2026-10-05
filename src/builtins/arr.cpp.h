@@ -736,6 +736,7 @@ EvalValue builtin_range(EvalContext *ctx, const ArgLocs *exprList,
 
             step = val2.get<int_type>();
 
+            ML_INT_ONLY(if (step == 0) int_vc(IntVc::range_step_zero);)
             if (step == 0)
                 throw InvalidValueEx("Expected integer != 0", arg2->start, arg2->end);
         }
@@ -746,6 +747,28 @@ EvalValue builtin_range(EvalContext *ctx, const ArgLocs *exprList,
     }
 
     /*
+     * The elements are start + k*step for every k >= 0 strictly before end -
+     * counted first, in unsigned arithmetic (the span of two ints always
+     * fits). A loop stepping `i += step` until it passed end WRAPPED when the
+     * value after the last one left int, landed back below end and never
+     * stopped: range(2^63 - 2, 2^63 - 1, 5) grew until memory ran out.
+     */
+    typedef uint64_t u64;
+    u64 count = 0;
+
+    if (step > 0 && start < end)
+        count = (u64(end) - u64(start) - 1) / u64(step) + 1;
+    else if (step < 0 && start > end)
+        count = (u64(start) - u64(end) - 1) / (u64(0) - u64(step)) + 1;
+
+    ML_INT_ONLY(int_vc_range(start, end, step, count);)
+
+    /* element k, computed modulo 2^64 - exact, since it fits int */
+    auto elem = [start, step](u64 k) {
+        return static_cast<int_type>(u64(start) + k * u64(step));
+    };
+
+    /*
      * range() is all-int, so flat int by default. If the destination is
      * dynamically typed (arr_hint == general, set by the inferencer), build a
      * general array instead - it is created in its final representation, never
@@ -754,27 +777,15 @@ EvalValue builtin_range(EvalContext *ctx, const ArgLocs *exprList,
     if (exprList->arr_hint == ArrHint::general) {
 
         SharedArrayObj::vec_type vec;
-        if (step > 0)
-            for (int_type i = start; i < end; i += step)
-                vec.emplace_back(EvalValue(i), false);
-        else
-            for (int_type i = start; i > end; i += step)
-                vec.emplace_back(EvalValue(i), false);
+        for (u64 k = 0; k < count; k++)
+            vec.emplace_back(EvalValue(elem(k)), false);
         return SharedArrayObj(std::move(vec));
     }
 
     SharedArrayObj::ivec_type ivec;
 
-    if (step > 0) {
-
-        for (int_type i = start; i < end; i += step)
-            ivec.push_back(i);
-
-    } else {
-
-        for (int_type i = start; i > end; i += step)
-            ivec.push_back(i);
-    }
+    for (u64 k = 0; k < count; k++)
+        ivec.push_back(elem(k));
 
     return SharedArrayObj(std::move(ivec));
 }

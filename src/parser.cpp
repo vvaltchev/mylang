@@ -5,6 +5,8 @@
 #include "syntax.h"
 #include "analyzer.h"
 #include "resolver.h"
+#include "numtext.h"
+#include "inttest.h"
 
 #include <stdexcept>
 #include <string>
@@ -663,27 +665,21 @@ pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
     if (*c == TokType::integer) {
 
         const string s(c.get_str());
-        long long v64 = 0;
+        int_type ival = 0;
 
         /*
-         * stoll, NOT stol: `long` is 32 bits on Windows (LLP64) and 64 on
-         * Linux/macOS, so `stol` REJECTED every literal above 2^31-1 on
-         * Windows only - while `int_type` (intptr_t) holds it fine there, and
-         * the language promises 64-bit wrapping ints (README). Found when a
-         * .myv test with a big literal failed the Windows CI lane alone.
+         * numtext_int, the reader int() uses, against int_type itself - so a
+         * 32-bit target refuses a 64-bit literal instead of truncating it,
+         * and no C `long` is involved (32 bits on Windows: `stol` once
+         * refused every literal above 2^31-1 there alone). -2^63 is written
+         * `-9223372036854775808`: pExpr02 reads that pair as one literal.
          */
-        try {
-            v64 = stoll(s);
-        } catch (const std::out_of_range &) {
+        if (numtext_int(s, ival) != NumText::ok) {
+            ML_INT_ONLY(int_vc(IntVc::lit_int_range);)
             throw SyntaxErrorEx(start, "Integer literal out of range");
         }
-
-        /* and it must still fit int_type - the same error, so a 32-bit
-         * target refuses a 64-bit literal instead of silently truncating */
-        const int_type ival = static_cast<int_type>(v64);
-
-        if (static_cast<long long>(ival) != v64)
-            throw SyntaxErrorEx(start, "Integer literal out of range");
+        ML_INT_ONLY(if (ival == std::numeric_limits<int_type>::max())
+                        int_vc(IntVc::lit_int_max);)
 
         v.reset(new LiteralInt(ival));
         v->start = start;
@@ -717,13 +713,26 @@ pAcceptLiteralFloat(ParseContext &c, unique_ptr<Construct> &v)
     if (*c == TokType::floatnum) {
 
         const string s(c.get_str());
-        float_type fval;
+        float_type fval = 0;
 
-        try {
-            fval = stod(s);
-        } catch (const std::out_of_range &) {
+        /* A literal outside the double range (beyond it, or so small it
+         * would read as 0) is refused - no literal silently becomes inf or
+         * 0. A subnormal is a double and is kept: stod's range error on one
+         * (glibc) made the smallest double, 4.9e-324, unwritable. */
+        const NumText o = numtext_float(s, fval);
+        if (o == NumText::overflow || o == NumText::underflow) {
+            ML_INT_ONLY(int_vc(IntVc::lit_flt_range);)
             throw SyntaxErrorEx(start, "Float literal out of range");
         }
+        /* INT-COV-EXEMPT: the lexer admits only numtext's spellings */
+        if (o != NumText::ok)               /* INT-COV-EXEMPT: see above */
+            throw SyntaxErrorEx(start, "Invalid float literal");
+        ML_INT_ONLY(
+            if (s.find('E') != string::npos)
+                int_vc(IntVc::lit_flt_exp_upper);
+            if (std::fpclassify(fval) == FP_SUBNORMAL)
+                int_vc(IntVc::lit_flt_subnormal);
+        )
 
         v.reset(new LiteralFloat(fval));
         v->start = start;
@@ -1524,6 +1533,29 @@ pExpr02(ParseContext &c, unsigned fl)
      * alias, but that is handled in pFuncParam before any expression is parsed,
      * so the two uses never collide. */
     Op op = AcceptOneOf(c, {Op::plus, Op::minus, Op::lnot, Op::bnot});
+
+    /* -2^63 as a literal (Java's rule): `-` directly before the literal
+     * 9223372036854775808 - which fits no int on its own, as `-` is an
+     * operator - is the lowest int. Only as the minus's whole operand: a
+     * postfix after the digits (`-9223372036854775808[0]`) makes them the
+     * operand of that instead, and they stay out of range. */
+    if (op == Op::minus && *c == TokType::integer) {
+        const Tok &nx = c.peek_tok(1);
+        const bool postfix = nx == Op::parenL || nx == Op::bracketL ||
+            nx == Op::dot || nx == Op::qmdot || nx == Op::inc ||
+            nx == Op::dec;
+        int_type v = 0;
+        const string digits = "-" + string(c.get_str());
+        if (!postfix && numtext_int(digits, v) == NumText::ok &&
+            v == std::numeric_limits<int_type>::min()) {
+            ML_INT_ONLY(int_vc(IntVc::lit_int_min);)
+            auto lit = make_unique<LiteralInt>(v);
+            lit->start = start;
+            lit->end = c.get_loc() + (c.get_str().length() + 1);
+            c++;
+            return lit;
+        }
+    }
 
     if (op != Op::invalid) {
 

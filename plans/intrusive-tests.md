@@ -634,13 +634,35 @@ Two kinds are worth calling out.
   LEFT (two operands as arguments of one C++ call) - sequenced now.
   Watched: a slice end clamped one short, a string slice not normalizing
   a negative end, `int()` accepting 2^63 - each fails 22_value_classes.
-  FOUND, NOT fixed (a separate change): `d[0]++` on a `dyn` holding a
-  flat int/float array raises NotLValueEx in every engine while
-  `d[0] += 1` works (four implementations reproduce it on purpose); and
-  corpus_diff counted a self-asserting tests/functional program that
-  fails in every engine as agreement (an exit-0 check is ready, and
-  exposes that `++` case under -nti). Not yet declared: string/number
-  conversion, `range()` steps, literal limits.
+  FOUND and fixed the same day in their own commits: `d[0]++` on a
+  `dyn` holding a flat int/float array raised NotLValueEx in every
+  engine while `d[0] += 1` worked (four implementations reproduced it on
+  purpose - one shared read-modify-write now), and corpus_diff counted a
+  self-asserting tests/functional program that fails in every engine as
+  agreement (it requires exit 0 now).
+  **2026-10-05: RANGE, NUMBER TEXT, LITERALS (127 classes).** `range()`
+  (a zero step, an empty or one-element result, a negative step, an end
+  hit exactly or not, the value after the last outside int); `int(s)` /
+  `float(s)` (whitespace, a sign, the int limits, out of range, empty,
+  junk; the inf / nan words, an exponent, a subnormal, run-time overflow
+  and underflow, a compile-time refusal); `str(f, d)` (0, 64, out of
+  range, an exact tie); literals (the int limits, -2^63, out of range, an
+  `E` exponent, a subnormal, a float out of range). The maintainer
+  decided the rules the README lacked: the WHOLE string is the number,
+  in a literal's spelling (Python's rule, and the lexer learned `1E5`); a
+  string that is not one, and an out-of-range digit count, is
+  InvalidValueEx (it was TypeErrorEx); a float out of range is a compile
+  error when known at compile time and rounds at run time; `-2^63` is
+  writable as `-9223372036854775808` (Java's rule). FOUND, all fixed:
+  `range()` near an int limit wrapped and never ended; `int("3.7")` was 3
+  and `float("1.5x")` 1.5 (a C prefix parse); the smallest double was an
+  unwritable literal (glibc's stod reports a subnormal as a range error).
+  `numtext.h` is now the one reading of a number as text, for literals
+  and the builtins alike. Watched: the old range loop, a prefix parse, a
+  subnormal refused, no -2^63 literal, no `E`, an out-of-range digit
+  count a TypeErrorEx again - each fails 22_value_classes and
+  64_number_text; float() never refusing at compile time fails its two
+  -rt cases. With this, every family section 9.1 named is declared.
 
 **MC/DC's one tool limit.** GCC instruments at most 64 conditions per
 decision and has no parameter to raise it. Five decisions in `vm.cpp`
