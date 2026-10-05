@@ -2146,7 +2146,8 @@ about 4 minutes); `-t long` adds every other build (clang, rel-hard,
 release, rna, recycle, both non-JIT builds - those from a COPY of the
 tree with jit.h's platform test flipped, never the src/jit.h other
 lanes compile - int-rel, int-gcov, cmake-gcov); `-a` the manual ones.
-`-l` / `-L` list (`-d` with each test's CASES), `-T` / `-f` / names
+`-l` / `-L` list (`-d` with each test's CASES), `-n` prints every build,
+binary check and test command line and runs nothing, `-T` / `-f` / names
 select, `NAME@BUILD` runs a test on another build (`rt@clang`),
 `--case REGEX` runs some cases of a test (`mylang -rt --only`,
 `corpus_diff` / `int_run` / `bt_oracle --only`). **CI runs the same

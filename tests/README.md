@@ -46,6 +46,8 @@ A few more:
 
     $ tests/run -l                     # list what would run
 
+    $ tests/run -n -t long             # every build and command it would run
+
     $ tests/run -t long                # everything but the hours-long tests
 
     $ tests/run rt corpus_diff         # just these tests
@@ -100,6 +102,7 @@ Choosing what runs:
 | -f REGEX     | only tests whose name matches                         |
 | -a           | also the manual tests                                 |
 | -l, -L       | list instead of running (-L: every test)              |
+| -n           | dry run: print every build, check and test command    |
 | -d           | with -l: list each test's cases too                   |
 | --case REGEX | run only the matching cases of the selected tests     |
 | -o           | show each test's whole output, even when it passes    |
