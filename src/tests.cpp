@@ -18787,6 +18787,125 @@ inliner_splices_call()
 }
 
 /*
+ * RULE 1 with NO inference (a resolver-only pipeline, as -nti runs): every
+ * argument may hold none, so the inliner keeps a call a call unless the
+ * argument names a parameter of the caller that is not `opt` and is never
+ * written (Inliner::names_settled_param) - its own bind refused a none.
+ * An `opt` parameter and a reassigned one do not qualify; the third body
+ * passes a settled one and is inlined. And constant specialization leaves
+ * a none literal bound for a parameter that is not `opt`, so the clone's
+ * bind refuses it as the call would.
+ */
+static bool
+inliner_none_bind_unstamped()
+{
+    const std::vector<const char *> src = {
+        "var gk = 1;",
+        "gk = 2;",                          /* runtime: k is not pure */
+        "func k(a) => a + gk;",
+        "func w_opt(opt x) { return k(x); }",
+        "func w_re(x) { x = x + 1; return k(x); }",
+        "func w_ok(x) { return k(x); }",
+        "func sp(a, b) { var t = a * 3 + gk; if (t > 100) { return 0; } "
+        "return t + b; }",
+        "var r = 0;",
+        "try { w_opt(none); } catch (TypeErrorEx) { r = r + 1; }",
+        "try { sp(2, none); } catch (TypeErrorEx) { r = r + 10; }",
+        "assert(r == 11);",
+        "assert(w_re(1) == 4);",
+        "assert(w_ok(1) == 3);",
+        "assert(w_opt(5) == 7);",
+    };
+
+    unique_ptr<Construct> root = parse_lines(src);
+    resolve_names(root.get(), true);
+
+    /* each wrapper's body, by name: does it still call? */
+    std::map<std::string, size_t> calls;
+    auto *blk = dynamic_cast<Block *>(root.get());
+    if (!blk)
+        return false;
+    for (auto &e : blk->elems) {
+        auto *fd = dynamic_cast<FuncDeclStmt *>(e.get());
+        if (fd && fd->id && fd->body)
+            calls[fd->id->uid->val] =
+                count_substr(serialize_tree(fd->body.get()), "CallExpr");
+    }
+    bool ok = calls["w_opt"] == 1 && calls["w_re"] == 1
+              && calls["w_ok"] == 0;
+    if (!ok)
+        cout << "  calls left: w_opt " << calls["w_opt"] << ", w_re "
+             << calls["w_re"] << ", w_ok " << calls["w_ok"]
+             << " (want 1, 1, 0)\n";
+
+    try {
+        root->eval(nullptr);
+    } catch (const Exception &e) {
+        cout << "  threw " << e.name << ": " << (e.msg ? e.msg : "")
+             << "\n";
+        ok = false;
+    }
+    return ok;
+}
+
+/*
+ * RULE 1 + RULE 2 under -nti: with no static check a call may have the
+ * wrong ARITY and a none argument at once, and the arity error comes first
+ * in every engine - the tree-walker checks the count before any bind, so
+ * CheckNoneArgsV (emitted before every call with an identifier argument
+ * when nothing was inferred) must stand aside for the call's own arity
+ * error, too many arguments or too few. Run with inference OFF, as the
+ * `-nti` flag does, under the tree-walker, the VM and the JIT.
+ */
+static bool none_check_arity_nti()
+{
+    const char *src_lines[] = {
+        "var nothing = runtime(none);",
+        "func f(a, b) { return 1; }",
+        "var r = \"\";",
+        "try { f(nothing); } catch (InvalidNumberOfArgsEx) { r = r + \"<\"; }",
+        "catch (TypeErrorEx) { r = r + \"n\"; }",
+        "try { f(nothing, 2, 3); } catch (InvalidNumberOfArgsEx) "
+        "{ r = r + \">\"; } catch (TypeErrorEx) { r = r + \"n\"; }",
+        "try { f(nothing, 2); } catch (InvalidNumberOfArgsEx) "
+        "{ r = r + \"!\"; } catch (TypeErrorEx) { r = r + \"n\"; }",
+        "assert(r == \"<>n\");" };
+    std::string src;
+    for (const char *l : src_lines) { src += l; src += '\n'; }
+    struct Mode { const char *name; ExecEngine eng; bool jit; };
+    const Mode modes[] = { { "tree-walker", ExecEngine::TreeWalk, false },
+                           { "vm", ExecEngine::Vm, false },
+                           { "jit", ExecEngine::Vm, true } };
+    const ExecEngine saved_eng = g_exec_engine;
+    const bool saved_jit = g_jit_enabled;
+    bool ok = true;
+    for (const Mode &m : modes) {
+        g_exec_engine = m.eng;
+        g_jit_enabled = m.jit;
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), /*enable=*/false);
+            run_optimizers(root.get());
+            if (m.eng == ExecEngine::Vm)
+                vm_execute(root.get());
+            else
+                root->eval(nullptr);
+        } catch (Exception &e) {
+            fprintf(stderr, "none_check_arity_nti [%s]: %s: %s\n", m.name,
+                    e.name, e.msg ? e.msg : "");
+            ok = false;
+        }
+    }
+    g_exec_engine = saved_eng;
+    g_jit_enabled = saved_jit;
+    return ok;
+}
+
+/*
  * The invariant that makes inlining acceptable: a runtime error inside an
  * inlined call produces a backtrace IDENTICAL to the non-inlined one (the
  * InlineCtx flush rebuilds the virtual frame).
@@ -28297,6 +28416,104 @@ static bool myv_verify_cross_records()
 }
 
 /*
+ * RULE 1: CheckNoneArgsV's two callee kinds - 1, a global slot (before a
+ * CallV), and 0, a frame slot (before a CallValueV) - as -vd renders them
+ * (`g<n>` vs the slot) and as the image verifier bounds them: a kind other
+ * than 0 or 1, a callee slot outside its table and a run outside the frame
+ * are each refused at load.
+ */
+static bool none_check_op_static()
+{
+    const char *lines_arr[] = {
+        "func g(int x) { return x + 1; }",
+        "func mk(int z) { return func [z] (int x) { return x * z; }; }",
+        "var f = mk(2);",
+        "var dyn d = runtime(3);",
+        "var a = g(d);",
+        "var b = f(d);",
+        "print(a, b);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        const Block *blk = dynamic_cast<const Block *>(root.get());
+        const bool jit_was = g_jit_enabled;   /* the ops, not fragments */
+        g_jit_enabled = false;
+        const std::string dump = blk ? disassemble_program(blk) : "";
+        g_jit_enabled = jit_was;
+        if (dump.find("check.none   g") == std::string::npos
+                || count_substr(dump, "check.none   ")
+                   < count_substr(dump, "check.none   g") + 1) {
+            fprintf(stderr, "none_check_op_static: -vd shows no check of "
+                            "a global callee AND one of a slot:\n%s\n",
+                    dump.c_str());
+            ok = false;
+        }
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        vm_verify_program(prog);                    /* intact: passes */
+        Chunk *mck = &prog.root;
+        size_t at[2] = { SIZE_MAX, SIZE_MAX };      /* kind 0, kind 1 */
+        for (size_t p = 0; p < mck->code.size(); p++)
+            if (mck->code[p].op == OpCode::CheckNoneArgsV
+                    && mck->code[p].target >= 0 && mck->code[p].target < 2)
+                at[mck->code[p].target] = p;
+        if (at[0] == SIZE_MAX || at[1] == SIZE_MAX) {
+            fprintf(stderr, "none_check_op_static: main holds no check "
+                            "of each kind\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        const auto refused = [&](const char *what) -> bool {
+            try {
+                vm_verify_program(prog);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError")
+                    return true;
+                fprintf(stderr, "none_check_op_static [%s]: threw %s, not "
+                                "MyvError\n", what, e.name);
+                return false;
+            }
+            fprintf(stderr, "none_check_op_static [%s]: ACCEPTED\n", what);
+            return false;
+        };
+        for (int kind = 0; kind < 2; kind++) {
+            Instr &in = mck->code[at[kind]];
+            const Instr keep = in;
+            in.target = 2;
+            ok = refused("callee kind 2") && ok;
+            in = keep;
+            in.target2 = 1 << 20;
+            ok = refused(kind ? "global callee slot" : "frame callee slot")
+                 && ok;
+            in = keep;
+            Operand big;                            /* b = a huge count */
+            big.is_lit = true;
+            big.lit_kind = Operand::LitKind::i;
+            big.lit = 1 << 20;
+            in.set_b(big);
+            ok = refused("argument run") && ok;
+            in = keep;
+        }
+        vm_verify_program(prog);                    /* restored: passes */
+    } catch (Exception &e) {
+        fprintf(stderr, "none_check_op_static: threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
  * #137, the HANDLER-STACK BALANCE (myv_fuzz, 2026-09-21; task #26's third
  * loader finding). One mutated opcode byte turned a LoadLiteralObjV into a
  * PopHandler with no PushHandler before it, and the VM's bare pop_back()
@@ -34374,10 +34591,10 @@ static bool opcode_table_census()
           "d1: its helper arm CONVEYS an image's refused operand" },
         { OpCode::UnpackLenCheck,        1,1,1,0,0,0,
           "d1: its cold tier CONVEYS the strict unpack TypeErrorEx" },
-        { OpCode::CheckNoneArgsV,        1,1,1,0,0,1,
+        { OpCode::CheckNoneArgsV,        1,1,1,0,0,0,
           "RULE 1: d1 - a refusal CONVEYS, stamped with the argument's "
-          "caret; b1 - a nested call's check rides the bytecode inlining "
-          "of its caller's callee with the call it guards" },
+          "caret; b0 - a body holding one is not pasted (the CALLER's "
+          "check stays in front of a pasted call)" },
     };
     const size_t nrows = sizeof(rows) / sizeof(rows[0]);
     const Chunk ck;      /* empty - census_instr never makes a shape
@@ -51829,6 +52046,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: #137 - a stored ExitBlock and a slot_count/frame_size "
       "disagreement are refused at load (myv_fuzz, 2026-09-20)",
       myv_verify_cross_records },
+    { "myv: RULE 1 - CheckNoneArgsV's two callee kinds render apart in -vd, "
+      "and a bad kind, callee slot or run is refused at load",
+      none_check_op_static },
     { "myv: #137 - the HANDLER-STACK BALANCE: a PopHandler with nothing "
       "pushed, a join at two depths and a region pushed twice are refused "
       "at load (myv_fuzz fat-486, 2026-09-21)",
@@ -52263,6 +52483,13 @@ static const std::vector<extra_check> extra_checks =
       inliner_builtin_error_backtrace_identical },
     { "inline threshold (-it) gates inlining", inliner_threshold_gates },
     { "inliner re-folds a const subexpression", inliner_refolds_const_subexpr },
+    { "inliner: with no inference a call that may bind none stays a call "
+      "unless its argument is a settled parameter; a none literal is not "
+      "folded into a non-opt parameter (RULE 1)",
+      inliner_none_bind_unstamped },
+    { "nti: an arity error beats a none argument's refusal in every engine "
+      "(too few and too many arguments; RULE 1 + RULE 2)",
+      none_check_arity_nti },
     { "inliner re-folds subscript/len in a splice",
       inliner_refolds_non_multiop },
     { "inliner folds a const-global subscript", inliner_folds_const_global },

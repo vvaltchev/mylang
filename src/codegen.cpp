@@ -12966,11 +12966,12 @@ bool bc_inline_op_ok(OpCode op)
     case OpCode::ForLoopStep:
     case OpCode::IntAddStep:
     /* the boundary + the nested call (its target2 is a GLOBAL slot, not a
-     * frame slot - the remapper must leave it alone, and does) - and the
-     * none check standing before such a call (RULE 1) */
+     * frame slot - the remapper must leave it alone, and does). NOT the
+     * none check that may stand before such a call (CheckNoneArgsV, RULE
+     * 1): a body holding one is not pasted - no corpus body has one, and
+     * the caller's own check stays in front of a pasted call. */
     case OpCode::ReturnV:
     case OpCode::CallV:
-    case OpCode::CheckNoneArgsV:
     /* #97 increment 2: the flat element READS - base (target2) and
      * index (a) read, dst written; no pool. (The element STORES are
      * admitted by bc_inline_callee_ok, since whether one may run in
@@ -13477,14 +13478,6 @@ static void bc_map_slots(Instr &in, const F &map)
          * alone is the whole reason this is written by hand. `a` is the
          * ARG RUN's base, a frame slot carried as a literal. */
         rt();
-        in.set_a(int_lit(map(static_cast<int>(in.a_lit()))));
-        break;
-    case OpCode::CheckNoneArgsV:
-        /* `target` is the callee's KIND, not a slot; `target2` is a frame
-         * slot only for kind 0 (a global for 1, as CallV's); `a` is the
-         * run's base, a frame slot carried as a literal */
-        if (in.target == 0)
-            in.target2 = map(in.target2);
         in.set_a(int_lit(map(static_cast<int>(in.a_lit()))));
         break;
     /* #97 closure inlining - a VALUE site's body only (the gate admits

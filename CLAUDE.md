@@ -5849,7 +5849,7 @@ payoff.
   EVERY ARGUMENT before the arity check and the binds, as the VM's staged
   run always did - it used to evaluate each argument just before its own
   bind, so a refusal skipped a later argument's side effect); the generic
-  dyn-callee op and the callback invoker (`check_none_bind`, eval.h); and
+  dyn-callee op and the callback invoker (`none_bind_fault`, eval.h); and
   for `CallV`/`CachedCallV`/`CallValueV`, whose native tiers bind raw, a
   `CheckNoneArgsV` that codegen emits before the call ONLY where
   `CallExpr::may_bind_none()` holds (docs/vm-ops.md has the rules). The
@@ -5858,7 +5858,7 @@ payoff.
   its body cannot hold none (the inferencer's mask and the inliner clear
   such an argument), and an operator chain or a non-none literal cannot
   evaluate to none (`CallExpr::arg_never_none`). A new bind path must
-  call `check_none_bind` or sit behind the op; a new call op that binds
+  call `none_bind_fault` or sit behind the op; a new call op that binds
   raw must be preceded by it.
 - **⛔ `&&` / `||` SHORT-CIRCUIT — in THREE places that must agree (#138,
   2026-08-09).** The determining operand (false for `&&`, true for `||`) stops

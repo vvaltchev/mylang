@@ -1014,13 +1014,19 @@ public:
         }
     }
 
-    /* some argument may bind none to a non-opt parameter: its mask bit is
-     * set and its shape does not rule none out */
+    /* argument i may hold none: its mask bit is set (past bit 31 there is
+     * none - assume it may) and its shape does not rule none out */
+    bool arg_may_be_none(size_t i) const {
+        return (i >= 32 || ((none_arg_mask >> i) & 1u))
+               && !arg_never_none(args->elems[i].get());
+    }
+
+    /* some argument may bind none to a non-opt parameter (the callee is
+     * not known here: codegen asks it for every call it lowers, and
+     * every such call has an argument list) */
     bool may_bind_none() const {
-        const size_t n = args ? args->elems.size() : 0;
-        for (size_t i = 0; i < n; i++)
-            if ((i >= 32 || ((none_arg_mask >> i) & 1u))
-                    && !arg_never_none(args->elems[i].get()))
+        for (size_t i = 0; i < args->elems.size(); i++)
+            if (arg_may_be_none(i))
                 return true;
         return false;
     }

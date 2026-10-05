@@ -15,6 +15,8 @@ struct P { int x; }
 var bad = 0;
 var ran = 0;                    # bumped by every body the bind lets in
 var trail = [];                 # the argument-order log (below)
+var gk = 0;
+gk = int(runtime(1));           # a runtime global: a reader is not pure
 func want(what, got, exp) {
     if (got != exp) {
         print("FAIL " + what + ": got " + str(got) + ", expected "
@@ -126,6 +128,82 @@ for (var i = 0; i < 4; i++) {
     try { ok = ok + ti(v); } catch (TypeErrorEx) { ok = ok + 100; }
 }
 want("loop", ok, 1 + 3 + 100 + 7);
+
+# --- more than eight arguments (the tree-walker's argument buffer spills
+# past eight), and an arity error through a dyn callee, which every
+# argument is evaluated before
+func nine(a, b, c, d, e, f, g, h, i) { ran = ran + 1; return a + i; }
+want("nine arguments", nine(1, 2, 3, 4, 5, 6, 7, 8, 9), 10);
+want("nine, a none ninth",
+     refused(func () { nine(1, 2, 3, 4, 5, 6, 7, 8, nothing); }), "refused");
+var dyn h9 = runtime(nine);
+trail = [];
+var arity = "accepted";
+try { h9(note("x"), 2); } catch (InvalidNumberOfArgsEx) { arity = "arity"; }
+want("dyn callee arity", arity, "arity");
+arity = "accepted";
+try { h9(1, 2, 3, 4, 5, 6, 7, 8, 9, 10); }
+catch (InvalidNumberOfArgsEx) { arity = "arity"; }
+want("dyn callee, one argument too many", arity, "arity");
+want("dyn callee arity, the arguments first", trail, ["x"]);
+
+# --- a bool widens into a float and an int parameter before the none
+# (the check stops only at a coercion that would throw)
+func fbn(float a, int b, c) { ran = ran + 1; return a + b; }
+var dyn bt = runtime(true);
+want("bool widens, then none", refused(func () { fbn(bt, bt, nothing); }),
+     "refused");
+want("bool widens", fbn(bt, bt, 1), 2.0);
+
+# --- 33 arguments: past the inferencer's 32-bit argument mask
+func many(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14,
+         a15, a16, a17, a18, a19, a20, a21, a22, a23, a24, a25, a26, a27, a28,
+         a29, a30, a31, a32) => a0 + a32 + gk;
+want("33 literal arguments", many(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+     13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+     31, 32), 33);
+var dyn last = runtime(32);
+want("33 arguments, a dyn last", many(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+     12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+     30, 31, last), 33);
+want("33 arguments, a none last",
+     refused(func () { many(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+         15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+         nothing); }), "refused");
+
+# --- an opt parameter passed on through a dyn callee
+func pass_opt(dyn f, x?) { return f(x); }
+func opt1(y?) { ran = ran + 1; return y == none ? -1 : y; }
+func plain1(y) { ran = ran + 1; return y; }
+want("opt passed on to opt", pass_opt(runtime(opt1), nothing), -1);
+want("opt passed on to non-opt",
+     refused(func () { pass_opt(runtime(plain1), nothing); }), "refused");
+
+# --- a function's own dyn LOCAL into a callee the inliner could paste
+func ident(x) => x;
+func via_local(int n) {
+    var dyn v = runtime(n == 2 ? none : n);
+    return ident(v);
+}
+want("a dyn local", refused(func () { via_local(2); }), "refused");
+want("a dyn local, a value", via_local(3), 3);
+
+# --- a call specialized on a none literal for an opt parameter
+func sp(a, opt b) {
+    var t = a * 3 + gk;
+    if (b == none) { return t; }
+    return t + b;
+}
+want("specialized on a none", sp(2, none), 7);
+want("specialized on an int", sp(2, 5), 12);
+
+# --- a callback's own error passes map's argument-list stamp untouched
+var dyn trio = runtime([1, 2, 3]);
+var cb = "none";
+try {
+    var dyn q = map(func (int x) { return 10 / (x - 3); }, trio);
+} catch (DivisionByZeroEx) { cb = "div"; }
+want("a callback's own error", cb, "div");
 
 print("none bind: " + str(bad) + " failure(s)");
 assert(bad == 0);

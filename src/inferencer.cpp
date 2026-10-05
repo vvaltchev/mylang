@@ -2914,6 +2914,9 @@ void Inferencer::annotate_hints(Construct *n)
             nmask = ~0u;
         } else {
             FuncInfo *fi = callee_funcinfo(call->what.get());
+            /* a known callee has a parameter per argument: the check pass
+             * refused a mismatched count before this runs */
+            const size_t np = fi ? fi->params.size() : 0;
             for (size_t i = 0; i < na; i++) {
                 StaticTypeRef at = static_type_resolve(
                     type_of(call->args->elems[i].get()));
@@ -2923,14 +2926,12 @@ void Inferencer::annotate_hints(Construct *n)
                     || at->kind == StaticTypeKind::Unknown;
                 if (!maybe_none)
                     continue;
-                if (fi && i < fi->params.size() && fi->params[i]
-                        && fi->params[i]->opt_decl)
+                if (i < np && fi->params[i]->opt_decl)
                     continue;           /* an opt parameter takes none */
                 Construct *ae = call->args->elems[i].get();
                 if (ctag(ae) == ConstructType::id) {
-                    auto it = id_sym.find(static_cast<Identifier *>(ae));
-                    const TypeSym *ps =
-                        it != id_sym.end() ? it->second : nullptr;
+                    /* every identifier was resolved by walk_struct */
+                    const TypeSym *ps = id_sym[static_cast<Identifier *>(ae)];
                     if (ps && ps->is_param && !ps->opt_decl
                             && ps->writes == 0)
                         continue;       /* a settled parameter: never none */

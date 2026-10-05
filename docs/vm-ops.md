@@ -1609,7 +1609,7 @@ parameter named), before the callee's body runs. The tree-walker's
 `bind_param` checks first thing; the generic dyn-callee op
 (`CallValueGenericV`, interpreted and `jit_call_value_generic`) and the
 callback invoker (`VmInvoker::invoke`, `vm_try_invoke`) call
-`check_none_bind` (eval.h) before their bind. The other call ops -
+`none_bind_fault` (eval.h) before their bind. The other call ops -
 `CallV`, `CachedCallV`, `CallValueV` - are NOT touched: their many native
 tiers (the emitted push, frameless sites, REGCALL, the bytecode inliner's
 paste) bind raw. Instead codegen emits `CheckNoneArgsV` right after the
@@ -1624,15 +1624,19 @@ proven call gets no op and pays nothing. The op reads the RUNTIME callee -
 `target` is its kind (0 = frame slot `target2`, 1 = global slot `target2`,
 as CallV's), `a`/`b` the run's base and count - and refuses the first none
 bound to a non-opt parameter of a FuncObject callee (anything else is the
-call's own error to raise, and an arity mismatch is left to the call too:
-`check_none_bind` walks the binds in order and stops at the first
-coercion that would throw, so the error the call would raise first wins).
-It records the call's three carets (`locs`, `base_locs`, `arg_locs`) and
-stamps through `vm_stamp_setup_caret`; the JIT runs `jit_check_none_args`
-and selects the argument's span at run time (`emit_exc_stamp`'s args form).
-It is fully native (conveys, never bails), so a frameless body may hold
-one, and the bytecode inliner carries it with the call it guards (it
-remaps `a` and a kind-0 `target2`). Its cost is the staging moves: argfuse
+call's own error to raise; the count cannot mismatch - the check pass
+proved it for a `CallV`/`CallValueV`, and a dyn callee takes the generic
+op, which checks the count first): `none_bind_fault_in_range` (eval.h)
+walks the binds in order and stops at the first coercion that would
+throw, so the error the call would raise first wins. Both the
+interpreted op and the JIT's `jit_check_none_args` build
+the refusal from `vm_none_args_fault`; the op records the call's
+three carets (`locs`, `base_locs`, `arg_locs`) and stamps through
+`vm_stamp_setup_caret`, the JIT selects the argument's span at run time
+(`emit_exc_stamp`'s args form). It is fully native (conveys, never
+bails), so a frameless body may hold one. The bytecode inliner does NOT
+paste a body holding one (`bc_inline_op_ok`); a caller's check stays in
+front of the call it pastes. Its cost is the staging moves: argfuse
 and the inliner's step 1 scan back from the call over `MoveV`s only, so a
 checked call stages its arguments in memory. The AST inliner keeps such a
 call a call (`Inliner::binds_none`): pasted, nothing would bind it. myv
