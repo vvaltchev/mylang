@@ -7505,7 +7505,13 @@ corrupt/truncated/incompatible file is a clean `MyvError`.
 **THE LOADER IS HOSTILE-INPUT HARDENED (#137), in THREE layers, and the
 layering is the point** - each bounds a different KIND of field, and the
 first two cannot see what the third checks:
-(1) **`Reader::countv`** - an element count, by the bytes REMAINING;
+(1) **`Reader::countv`** - an element count, by the bytes REMAINING
+    (and **`Reader::uid_req`** beside it: a NAME its record cannot do
+    without - a struct's, a field's, a parameter's - refused in its null
+    form, 0xFFFFFFFF; myv_fuzz fat-259/fat-309, 2026-10-04: a nameless
+    struct loaded cleanly and crashed the `throw` that rendered it. The
+    names that may be null, and the forms that need the rest, are listed
+    in docs/myv-format.txt under `uid`);
 (2) **`Reader::sizev`** - a STANDALONE count that no record array follows
     (a chunk's `slot_count`/`n_temps`, its dict/dyn iterator and try-region
     slices, a descriptor's `frame_size`), by the WHOLE FILE. These had no
