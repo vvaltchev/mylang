@@ -50,6 +50,7 @@ import os
 import signal
 import socket
 import sys
+import tempfile
 import threading
 import time
 
@@ -58,8 +59,14 @@ def runs_dir():
     d = os.environ.get("MYLANG_TEST_RUNS")
     if not d:
         base = os.environ.get("XDG_RUNTIME_DIR")
+        who = (os.getuid() if hasattr(os, "getuid")
+               else os.environ.get("USERNAME", "user"))
         d = (os.path.join(base, "mylang-tests") if base
-             else "/tmp/mylang-tests-%d" % os.getuid())
+             # not $TMPDIR: tests/run gives every step a private one,
+            # and testctl must find the sockets of every step
+            else os.path.join("/tmp" if os.name == "posix"
+                              else tempfile.gettempdir(),
+                              "mylang-tests-%s" % who))
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -99,7 +106,10 @@ def percent_of(done, total):
 def serve_socket(sock_path, handle):
     """Listen on `sock_path`; each request line (JSON) is answered with
     handle(request) (JSON). Returns the listening socket (close it to
-    stop)."""
+    stop), or None where there are no Unix sockets (Windows: no live
+    status there, the heartbeat lines still print)."""
+    if not hasattr(socket, "AF_UNIX"):
+        return None
     try:
         os.unlink(sock_path)
     except OSError:

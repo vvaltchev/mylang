@@ -37,43 +37,37 @@ jobs:
       shell: bash
       run: cmake --build . --config $BUILD_TYPE
 
-    # Enable core dumps into the build dir before running, so a crash (the rare
-    # layout-dependent VM heisenbug) leaves a core we can inspect + download.
+    # The binary stands for one of tests/run's builds - dbg, clang, or
+    # rel-hard for both Release lanes - and is checked against it first.
+    # Three tests on it:
+    #  - rt: the built-in suite;
+    #  - myv_doc_check: docs/myv-format.txt is the .myv SPECIFICATION,
+    #    not a description of it - a third party must be able to write a
+    #    reader from it alone. That tool is that reader, written from the
+    #    DOCUMENT and deliberately not from serialize.cpp, so consuming
+    #    every image to exactly EOF is what proves the doc complete. It
+    #    drifted three versions unnoticed once (v10 while the format was
+    #    at v13);
+    #  - driver_checks: `-rt` runs IN-PROCESS and never goes through the
+    #    CLI's argument handling, so a flag wired to the wrong side of an
+    #    `if` is invisible to every one of its tests. That is how `-nr`
+    #    came to skip run_optimizers - exiting 0 in silence on a program a
+    #    plain run refuses - with the whole suite green (#147).
+    # Core dumps go into the build dir first, so a crash (the rare
+    # layout-dependent VM heisenbug) leaves a core to inspect + download.
     - name: Test
-      working-directory: ${{github.workspace}}/build
       shell: bash
       run: |
+        case "$BUILD_TYPE-$CXX" in
+          Debug-g++) lane=dbg ;;
+          Debug-clang++) lane=clang ;;
+          *) lane=rel-hard ;;
+        esac
         ulimit -c unlimited
         echo "${{github.workspace}}/build/core.%e.%p" \
           | sudo tee /proc/sys/kernel/core_pattern
-        ./mylang -rt
-
-    # docs/myv-format.txt is the .myv SPECIFICATION, not a description of it -
-    # a third party must be able to write a reader from it alone. This script
-    # is that reader: written from the DOCUMENT and deliberately not from
-    # serialize.cpp, so consuming every image to exactly EOF is what proves
-    # the doc complete. It drifted three versions unnoticed once (the doc said
-    # v10 while the format was at v13); running it here is what stops that
-    # recurring. Stdlib-only Python, no deps.
-    - name: Docs - the .myv spec still describes the format
-      working-directory: ${{github.workspace}}/build
-      shell: bash
-      run: |
-        mkdir -p myvdoc
-        for f in $GITHUB_WORKSPACE/samples/* $GITHUB_WORKSPACE/bench/my/*.my; do
-          ./mylang -c "$f" -o "myvdoc/$(basename "$f" .my).myv"
-        done
-        $GITHUB_WORKSPACE/tests/myv_doc_check myvdoc/*.myv
-
-    # `-rt` runs IN-PROCESS: it calls lexer/parser/infer/resolve directly and
-    # never goes through the CLI's argument handling, so a flag wired to the
-    # wrong side of an `if` is invisible to every one of its tests. That is
-    # how `-nr` came to skip run_optimizers - exiting 0 in silence on a
-    # program a plain run refuses - with the whole suite green (#147).
-    - name: Driver - the CLI flags do what they say
-      working-directory: ${{github.workspace}}/build
-      shell: bash
-      run: $GITHUB_WORKSPACE/tests/driver_checks ./mylang
+        tests/run -o --logs test-logs --bin $lane=build/mylang \
+                  rt@$lane myv_doc_check@$lane driver_checks@$lane
 
     # On a crash: print a full backtrace from the core (immediately visible in
     # the log) and upload the core + the exact binary as an artifact, so the
@@ -107,6 +101,14 @@ jobs:
           ${{github.workspace}}/build/mylang
         if-no-files-found: ignore
 
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
+
   # Adversarial allocator lane: forces AST-node address reuse (RECYCLE=ON) so
   # "pointer used as a stable identity" bugs surface deterministically under
   # -rt. Debug build, so it also runs the full sanitizer + assertion net
@@ -131,13 +133,12 @@ jobs:
       run: cmake --build .
 
     - name: Test
-      working-directory: ${{github.workspace}}/build
       shell: bash
       run: |
         ulimit -c unlimited
         echo "${{github.workspace}}/build/core.%e.%p" \
           | sudo tee /proc/sys/kernel/core_pattern
-        ./mylang -rt
+        tests/run -o --logs test-logs --bin recycle=build/mylang rt@recycle
 
     - name: Backtrace on crash
       if: failure()
@@ -168,6 +169,14 @@ jobs:
           ${{github.workspace}}/build/mylang
         if-no-files-found: ignore
 
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
+
   # The RELEASE binaries a USER actually ships have NO -rt suite (it is
   # compiled in only under TESTS=1), so until this NOTHING in CI proved they
   # run correctly - the whole matrix above is TESTS=1. Two configs: the
@@ -183,7 +192,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        asserts: [ON, OFF]
+        include:
+          - asserts: ON
+            lane: release
+          - asserts: OFF
+            lane: ship
     steps:
     - uses: actions/checkout@v4
 
@@ -201,24 +214,22 @@ jobs:
       shell: bash
       run: cmake --build . --config Release
 
-    # Confirm the binary IS the config we meant to test (`-v` reads
-    # compiler-set macros, so it cannot drift): tests=0, and asserts matching
-    # the matrix. A silent misconfigure would make the smoke test vacuous.
-    - name: Confirm the build config
-      working-directory: ${{github.workspace}}/build
-      shell: bash
-      run: |
-        ./mylang -v
-        want=$([ "${{ matrix.asserts }}" = "ON" ] && echo 1 || echo 0)
-        ./mylang -v | grep -q "tests             0" \
-          || { echo "expected tests=0"; exit 1; }
-        ./mylang -v | grep -q "asserts           $want" \
-          || { echo "expected asserts=$want"; exit 1; }
-
+    # tests/run first confirms the binary IS the config we meant to test
+    # (`-v` reads compiler-set macros, so it cannot drift): tests 0, and
+    # asserts 1 for the `release` build, 0 for `ship`. A silent
+    # misconfigure would make the smoke test vacuous.
     - name: System smoke - actual scripts at scale 1
-      working-directory: ${{github.workspace}}/build
       shell: bash
-      run: $GITHUB_WORKSPACE/tests/system_smoke ./mylang
+      run: tests/run -o --logs test-logs
+           --bin ${{ matrix.lane }}=build/mylang
+           system_smoke@${{ matrix.lane }}
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
 
   # ⛔ THE NON-LTO LANE. LTO defaults to OPT, so every optimized build in
   # every other lane - and every local `make -j` - is an LTO build, and
@@ -251,26 +262,16 @@ jobs:
       run: make -j OPT=1 TESTS=1 LTO=0 CXX=${{ matrix.cxx }}
            BUILD_DIR=build-lto0
 
-    # Prove the lane tested what it claims. `-v` reads COMPILER-SET macros,
-    # so it cannot drift from what was compiled - without this check a
-    # future change to the LTO default would leave this job building WITH
-    # LTO and passing while proving nothing.
-    - name: Confirm LTO is actually off
-      shell: bash
-      run: |
-        ./build-lto0/mylang -v
-        ./build-lto0/mylang -v | grep -qE "^  lto +0" \
-          || { echo "FAIL: this lane did not build with LTO off"; exit 1; }
-        ./build-lto0/mylang -v | grep -qE "^  opt +1" \
-          || { echo "FAIL: -Wclobbered needs an optimized build"; exit 1; }
-
+    # tests/run proves the lane tested what it claims before it tests:
+    # the `lto0` build must report `lto 0` and `opt 1` (-Wclobbered needs
+    # an optimized build). `-v` reads COMPILER-SET macros, so it cannot
+    # drift from what was compiled - without this check a future change
+    # to the LTO default would leave this job building WITH LTO and
+    # passing while proving nothing.
     - name: Test
       shell: bash
-      run: ./build-lto0/mylang -rt
-
-    - name: Driver - the CLI flags do what they say
-      shell: bash
-      run: tests/driver_checks ./build-lto0/mylang
+      run: tests/run -o --logs test-logs --bin lto0=build-lto0/mylang
+           rt@lto0 driver_checks@lto0
 
     # A no-TESTS, assert-free build is the shape a user ships, and is also
     # where a declaration that escaped a TESTS guard shows up.
@@ -279,8 +280,8 @@ jobs:
       run: |
         make -j OPT=1 ASSERTS=0 TESTS=0 LTO=0 CXX=${{ matrix.cxx }} \
              BUILD_DIR=build-lto0-ship
-        ./build-lto0-ship/mylang -v
-        tests/system_smoke ./build-lto0-ship/mylang
+        tests/run -o --logs test-logs --bin ship=build-lto0-ship/mylang \
+                  system_smoke@ship
 
     # The other build system has its own LTO knob; a fix to one must not
     # leave the other broken. CMake is also what CI runs everywhere else,
@@ -293,10 +294,16 @@ jobs:
         cmake -DTESTS=1 -DLTO=OFF -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} $GITHUB_WORKSPACE
         cmake --build . --config Release
-        ./mylang -v
-        ./mylang -v | grep -qE "^  lto +0" \
-          || { echo "FAIL: CMake -DLTO=OFF did not disable LTO"; exit 1; }
-        ./mylang -rt
+        cd ..
+        tests/run -o --logs test-logs --bin lto0=cmb-lto0/mylang rt@lto0
+
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
 
   # DEBUG_INFO=1 (2026-08-26): debug info is OFF by default in BOTH build
   # systems (the binary was huge and the info unused in most builds - disk
@@ -326,7 +333,7 @@ jobs:
 
     - name: Test
       shell: bash
-      run: ./build-dbginfo/mylang -rt
+      run: tests/run -o --logs test-logs --bin dbg=build-dbginfo/mylang rt
 
     - name: Confirm the DEFAULT build has NO debug info
       shell: bash
@@ -358,3 +365,11 @@ jobs:
         if readelf -S mylang | grep -q "\.debug_info"; then
           echo "FAIL: the CMake Debug default still injects -g"; exit 1
         fi
+
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore

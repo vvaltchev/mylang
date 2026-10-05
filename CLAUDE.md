@@ -1831,12 +1831,12 @@ collision). Three nets now:
   reintroducing the defect: **debug+ASan/UBSan ABORTS (rc=134)** with a
   located report, **release `ASSERTS=OFF` SEGFAULTS (rc=139)** - the
   raw crash a user gets once the ML_CHECK net is compiled away, in the
-  configuration a shipped program actually runs. It opens with a
-  VACUITY GUARD asserting `mylang -v` reports `lowmem 1` by default and
-  `lowmem 0` under the env, in both directions: a lane that cannot
-  prove it is in the configuration it tests goes green doing nothing
-  the day a default moves (the `lto0` lane's reason for asserting
-  `lto 0` first).
+  configuration a shipped program actually runs. Each of its tests
+  opens with a VACUITY GUARD (`guard_nolowmem` in tests/run) asserting
+  `mylang -v` reports `lowmem 1` by default and `lowmem 0` under the
+  env, in both directions: a lane that cannot prove it is in the
+  configuration it tests goes green doing nothing the day a default
+  moves (the `lto0` lane's reason for asserting `lto 0` first).
 - **`MYLANG_JIT_XROT=N` - ROTATE THE ALLOCATOR'S SCAN** so a different
   one of several EQUALLY-WEIGHTED registers is met first
   (`tests/corpus_diff BIN --xrot` runs the matrix; `g_jit_xrot` is
@@ -2078,8 +2078,10 @@ differential corpus and all four fuzzers only ran when someone
 remembered to, by hand. That gap was not theoretical: `corpus_diff`
 catches a JIT abort (a mixed-kind call chain tripping `jit_ret_audit`)
 that `-rt` passes straight through, and the Net 3 enumeration catches a
-`ref_slots` leak that BOTH miss. Four jobs, in parallel with the fast
-lanes so an `-rt` failure still reports quickly:
+`ref_slots` leak that BOTH miss. Its jobs run in parallel with the fast
+lanes so an `-rt` failure still reports quickly, and like every CI job
+they build with CMake and run their tests through `tests/run --bin` (see
+the `tests/run` paragraph below):
 - **differential** (Debug, ASan+UBSan+hardening): `corpus_diff`,
   `norec_enum --depth 3`, `norec_sweep`, `bt_oracle` (#38:
   inlining never changes a backtrace), the `vdjcmp` self-test;
@@ -2134,8 +2136,8 @@ changes; never locally beyond `--count 2` to check the tool.
 **LONG RUNS GO TO A MANUAL CI WORKFLOW, NOT THE LOCAL MACHINE AND NOT
 EVERY PUSH (maintainer-set, 2026-10-04).**
 
-**LOCALLY, EVERY TEST IS ONE COMMAND: `tests/run` (2026-10-05, after
-Tilck's `run_all_tests`; it replaced `run_battery`).** A catalog of
+**EVERY TEST IS ONE COMMAND: `tests/run` (2026-10-05, after Tilck's
+`run_all_tests`; it replaced `run_battery`) - LOCALLY AND IN CI.** A catalog of
 TESTS - one run of one tool, each with a TYPE (unit, diff, fuzz, int,
 cli, jit, coverage, mutation), a time CLASS (short <= 30 s, med <= 3 min,
 long <= 30 min, manual = hours) and the BUILD it needs. A bare
@@ -2145,8 +2147,14 @@ release, rna, recycle, both non-JIT builds - those from a COPY of the
 tree with jit.h's platform test flipped, never the src/jit.h other
 lanes compile - int-rel, int-gcov, cmake-gcov); `-a` the manual ones.
 `-l` / `-L` list (`-d` with each test's CASES), `-T` / `-f` / names
-select, `--case REGEX` runs some cases of a test (`mylang -rt --only`,
-`corpus_diff` / `int_run` / `bt_oracle --only`). Builds are made
+select, `NAME@BUILD` runs a test on another build (`rt@clang`),
+`--case REGEX` runs some cases of a test (`mylang -rt --only`,
+`corpus_diff` / `int_run` / `bt_oracle --only`). **CI runs the same
+catalog** (2026-10-04): each workflow job builds its binary itself
+(CMake mostly, the only place that build system is exercised) and
+runs `tests/run --bin LANE=PATH NAME@LANE ...`, so a check CI needs is a
+catalog test - with its vacuity guard as a `guards=` entry - never a
+workflow shell step (tests/CLAUDE.md has the job map). Builds are made
 incrementally under `--build-root` (default `build-tests/`, the
 maintainer's - **Claude passes `--build-root build-claude`**, or exports
 `MYLANG_TEST_BUILD_ROOT=build-claude`, under the rule above) and each

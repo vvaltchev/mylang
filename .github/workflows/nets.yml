@@ -10,6 +10,11 @@
 # These are slower than the -rt lanes by design; they run in parallel
 # with them, not in front of them, so a fast `-rt` failure still
 # reports quickly.
+#
+# Every job builds with CMake (CI is where that build system gets
+# exercised) and hands the binary to tests/run with --bin, so the tests
+# are the ones `tests/run` runs locally: same commands, same vacuity
+# guards, same reproduce lines. A failed job uploads its test-logs/.
 name: Nets
 
 on: [pull_request, push, workflow_dispatch]
@@ -25,58 +30,46 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Build (Debug)
+      run: |
+        cmake -S . -B build -DTESTS=1 -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build -j
 
-    - name: Configure
-      run: cmake -E make_directory ${{github.workspace}}/build
-    - name: CMake
-      working-directory: ${{github.workspace}}/build
-      run: cmake -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
-           $GITHUB_WORKSPACE
-    - name: Build
-      working-directory: ${{github.workspace}}/build
-      run: cmake --build . -j
-
-    # tree-walker vs the default engine over tests/functional + samples
-    - name: corpus_diff
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/corpus_diff ./mylang
-
-    # ⛔ AND IS IT REPRODUCIBLE? vdjcmp's SELF-TEST - one binary
+    # corpus_diff: the tree-walker vs the default engine over
+    # tests/functional + samples.
+    #
+    # vdjcmp: ⛔ IS -vdj REPRODUCIBLE? Its SELF-TEST - one binary
     # against ITSELF over the whole corpus - is what makes every
     # "emitted code byte-identical" claim mean anything, and until
     # 2026-08-27 it ran ONLY when someone remembered to. It did not go
     # wrong quietly: from the day #97 step 1a added the absolute-disp32
     # operand (whose raw address reached the text) it FAILED on every
     # invocation and refused to compare. Nobody invoked it.
-    #
     # A SELF-TEST THAT IS NOT IN CI IS NOT A NET. The whole point of
     # one is that it fires without being asked.
-    - name: "vdjcmp self-test: -vdj is reproducible"
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/scripts/vdjcmp ./mylang ./mylang
-
-    # #38 repro B: with inlining ON, every CLI configuration (the JIT
-    # levers, the splice off, a .myv image, --no-opt all) must render
-    # the backtrace and caret `-ni -tw` renders. An engine differential
-    # cannot see a frame the inliner loses: it is lost in every engine.
-    - name: "bt_oracle: inlining never changes a backtrace"
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/bt_oracle ./mylang
-
-    # Net 3: every program in a bounded shape space, four engines,
-    # compared byte-for-byte. Depth 3 here (480 programs); the full
-    # depth-4 space (2272) is a manual run.
-    - name: "Net 3: small-scope enumeration (depth 3)"
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/norec_enum ./mylang
-           --depth 3 --reach 0
-
-    # Net 2: force a frame reconstruction at the Nth call event, one
-    # process per N, in shadow AND production.
-    - name: "Net 2: deterministic event sweep"
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/norec_sweep ./mylang
-           --max-events 25
+    #
+    # bt_oracle (#38 repro B): with inlining ON, every CLI configuration
+    # (the JIT levers, the splice off, a .myv image, --no-opt all) must
+    # render the backtrace and caret `-ni -tw` renders. An engine
+    # differential cannot see a frame the inliner loses: it is lost in
+    # every engine.
+    #
+    # norec_enum (Net 3): every program in a bounded shape space, four
+    # engines, compared byte-for-byte - depth 3 here (480 programs).
+    #
+    # norec_sweep (Net 2): force a frame reconstruction at the Nth call
+    # event, one process per N, in shadow AND production.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --bin dbg=build/mylang
+           corpus_diff vdjcmp bt_oracle norec_enum norec_sweep
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
 
   # ---------------------------------------------------------------- #
   # The two longest steps of `differential`, on the same Debug build in
@@ -87,31 +80,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Build (Debug)
+      run: |
+        cmake -S . -B build -DTESTS=1 -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build -j
 
-    - name: Configure
-      run: cmake -E make_directory ${{github.workspace}}/build
-    - name: CMake
-      working-directory: ${{github.workspace}}/build
-      run: cmake -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
-           $GITHUB_WORKSPACE
-    - name: Build
-      working-directory: ${{github.workspace}}/build
-      run: cmake --build . -j
-
-    # the same corpus with each JIT lever forced off, one at a time
-    - name: corpus_diff --levers
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/corpus_diff ./mylang --levers
-
+    # the corpus with each JIT lever forced off, one at a time; and
     # random deep-nested programs against a CPython twin, all engines.
     # A FRESH SEED PER RUN (the run id; a re-run keeps it): with a fixed
     # seed every push ran the same 250 programs, a regression corpus
     # rather than a fuzzer. The seed is printed; a failure reproduces
     # with it. All three fuzzers here do this.
-    - name: nested_fuzz
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/nested_fuzz
-           --mylang ./mylang --count 250 --seed ${{github.run_id}}
+    - name: tests/run
+      run: tests/run -o --logs test-logs --seed ${{github.run_id}}
+           --bin dbg=build/mylang corpus_diff-levers nested_fuzz
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
 
   # ---------------------------------------------------------------- #
   # ⛔ IS THE DISASSEMBLER TELLING THE TRUTH? Every instruction the JIT
@@ -138,29 +128,23 @@ jobs:
     name: disasmcheck (shard ${{matrix.shard}}/3)
     steps:
     - uses: actions/checkout@v4
-
-    - name: Configure
-      run: cmake -E make_directory ${{github.workspace}}/build
-    - name: CMake
-      working-directory: ${{github.workspace}}/build
-      run: cmake -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
-           $GITHUB_WORKSPACE
-    - name: Build
-      working-directory: ${{github.workspace}}/build
-      run: cmake --build . -j
+    - name: Build (Debug)
+      run: |
+        cmake -S . -B build -DTESTS=1 -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build -j
 
     - name: "disasm: every emitted instruction agrees with objdump"
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/scripts/disasmcheck ./mylang
-           --matrix --shard ${{matrix.shard}}/3
+      run: tests/run -o --logs test-logs --bin dbg=build/mylang
+           disasmcheck-matrix --shard ${{matrix.shard}}/3
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
 
-  # ---------------------------------------------------------------- #
-  # The .myv corruption fuzzer, on BOTH build types on purpose:
-  # CLAUDE.md records that a sanitizer build and an assert-free release
-  # catch DIFFERENT things here - the debug one finds the memory error,
-  # the release one finds the case where a check the debug build relies
-  # on has been compiled away.
-  # ---------------------------------------------------------------- #
   # ---------------------------------------------------------------- #
   # THE NO-ARENA CONFIGURATION - the JIT with its type tags in
   # REGISTERS instead of imm32.
@@ -200,48 +184,38 @@ jobs:
       matrix:
         include:
           - name: debug-sanitized
+            lane: dbg
             cmake: -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
           - name: release-no-asserts
+            lane: rna
             cmake: -DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release
     name: nolowmem (${{matrix.name}})
     steps:
     - uses: actions/checkout@v4
-
-    - name: Configure
-      run: cmake -E make_directory ${{github.workspace}}/build
-    - name: CMake
-      working-directory: ${{github.workspace}}/build
-      run: cmake ${{matrix.cmake}} $GITHUB_WORKSPACE
     - name: Build
-      working-directory: ${{github.workspace}}/build
-      run: cmake --build . -j
-
-    # ⛔ THE VACUITY GUARD, FIRST. A lane that tests a configuration
-    # must PROVE it is in that configuration, or it passes green doing
-    # nothing the day a default moves - which is exactly why the lto0
-    # lane asserts `lto 0` before it tests anything. Both directions, so
-    # neither a stuck-on nor a stuck-off answer gets through.
-    - name: "assert the arena is refused (and reported)"
-      working-directory: ${{github.workspace}}/build
       run: |
-        ./mylang -v | grep -E '^  lowmem +1' \
-          || { echo "expected the arena ON by default"; exit 1; }
-        MYLANG_NO_LOWMEM=1 ./mylang -v | grep -E '^  lowmem +0' \
-          || { echo "MYLANG_NO_LOWMEM=1 did not refuse it"; exit 1; }
+        cmake -S . -B build ${{matrix.cmake}}
+        cmake --build build -j
 
-    - name: "-rt with the arena refused"
-      working-directory: ${{github.workspace}}/build
-      run: MYLANG_NO_LOWMEM=1 ./mylang -rt
-
-    # the engine differential in the same configuration: the tree-walker
-    # has no JIT, so this is tw vs the register-form emission
-    - name: corpus_diff --nolowmem
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/corpus_diff ./mylang --nolowmem
-
-    - name: driver_checks
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/driver_checks ./mylang
+    # ⛔ THE VACUITY GUARD COMES FIRST, inside tests/run (guard_nolowmem):
+    # each of these tests first proves `mylang -v` says `lowmem 1` by
+    # default and `lowmem 0` under MYLANG_NO_LOWMEM=1 - a lane that
+    # tests a configuration must PROVE it is in it, or it passes green
+    # doing nothing the day a default moves (why the lto0 lane asserts
+    # `lto 0` before it tests anything). Then -rt and the engine
+    # differential with the arena refused (the tree-walker has no JIT,
+    # so that is tw vs the register-form emission), and driver_checks.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --bin ${{matrix.lane}}=build/mylang
+           rt-nolowmem@${{matrix.lane}} corpus_diff-nolowmem@${{matrix.lane}}
+           driver_checks@${{matrix.lane}}
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
 
   # ---------------------------------------------------------------- #
   # THE STACK-ALIGNMENT GROUND TRUTH (SP2/SP3). System V requires
@@ -264,41 +238,32 @@ jobs:
       matrix:
         include:
           - name: debug-sanitized
+            lane: dbg
             cmake: -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
           - name: release-no-asserts
+            lane: rna
             cmake: -DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release
     name: spcheck (${{matrix.name}})
     steps:
     - uses: actions/checkout@v4
-    - name: Configure
-      run: cmake -E make_directory ${{github.workspace}}/build
-    - name: CMake
-      working-directory: ${{github.workspace}}/build
-      run: cmake ${{matrix.cmake}} $GITHUB_WORKSPACE
     - name: Build
-      working-directory: ${{github.workspace}}/build
-      run: cmake --build . -j
-
-    # THE VACUITY GUARD: the check is emitted code, so prove it is
-    # THERE. Its instructions only appear under the lever, so the
-    # dump must grow and must carry `test rsp, 15`.
-    - name: "assert the alignment check is emitted"
-      working-directory: ${{github.workspace}}/build
       run: |
-        if ! MYLANG_JIT_SPCHECK=1 ./mylang -vdj \
-               $GITHUB_WORKSPACE/samples/gcd | grep -q 'test rsp, 15'
-        then echo "the lever emitted no check"; exit 1; fi
-        if ./mylang -vdj $GITHUB_WORKSPACE/samples/gcd \
-             | grep -q 'test rsp, 15'
-        then echo "the check is emitted WITHOUT the lever"; exit 1; fi
+        cmake -S . -B build ${{matrix.cmake}}
+        cmake --build build -j
 
-    - name: "-rt with the alignment check"
-      working-directory: ${{github.workspace}}/build
-      run: MYLANG_JIT_SPCHECK=1 ./mylang -rt
-
-    - name: corpus_diff --spcheck
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/corpus_diff ./mylang --spcheck
+    # THE VACUITY GUARD (guard_spcheck, inside tests/run): the check is
+    # emitted code, so each test first proves `test rsp, 15` is in the
+    # dump under the lever and absent without it.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --bin ${{matrix.lane}}=build/mylang
+           rt-spcheck@${{matrix.lane}} corpus_diff-spcheck@${{matrix.lane}}
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
 
   # ---------------------------------------------------------------- #
   # THE INTRUSIVE TESTS (#107, plans/intrusive-tests.md). An INT_TESTS
@@ -318,40 +283,42 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y g++-14
     - name: Build (INT_TESTS + GCOV)
       run: |
-        cmake -S $GITHUB_WORKSPACE -B build-int -DINT_TESTS=ON -DGCOV=ON \
+        cmake -S . -B build-int -DINT_TESTS=ON -DGCOV=ON \
               -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
         cmake --build build-int -j
     - name: Build (TESTS, the reference)
       run: |
-        cmake -S $GITHUB_WORKSPACE -B build-tests -DTESTS=1 \
-              -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
-        cmake --build build-tests -j
+        cmake -S . -B build-ref -DTESTS=1 -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build-ref -j
 
-    # THE VACUITY GUARD: both answers, both directions.
-    - name: "assert -v reports int_tests 1 / 0"
-      run: |
-        ./build-int/mylang -v | grep -q '^  int_tests  *1'
-        ./build-tests/mylang -v | grep -q '^  int_tests  *0'
-
-    - name: "non-perturbation: INT emits what TESTS emits"
-      run: scripts/vdjcmp ./build-tests/mylang ./build-int/mylang
-
-    # The suite, the site census and the coverage universe in ONE pass:
-    # every unit must own an element, and the uncovered count may not
-    # exceed this compiler's line in tests/int/coverage-floor.txt.
-    - name: tests/int_run --gcov
-      run: |
-        tests/int_run ./build-int/mylang --gcov --require-floor \
-                         --report int-coverage.txt
+    # The binaries are checked against their builds first (`int_tests 1`
+    # / `0`, both directions). int-vdjcmp is the NON-PERTURBATION check:
+    # the INT build must emit byte-identical bytecode and machine code to
+    # the plain TESTS build. int_run-gcov is the suite, the site census
+    # and the coverage universe in ONE pass: every unit must own an
+    # element, and the uncovered count may not exceed this compiler's
+    # line in tests/int/coverage-floor.txt (it runs alone on its build:
+    # it clears and reads the gcov counters). driver_checks runs with
+    # MYLANG_EXPECT_INT_TESTS=1, which tests/run sets for an INT build.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --bin int-gcov=build-int/mylang
+           --bin dbg=build-ref/mylang
+           int-vdjcmp int_run-gcov driver_checks@int-gcov
     - name: Upload the coverage report
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: int-coverage
-        path: int-coverage.txt
-
-    - name: driver_checks
-      run: MYLANG_EXPECT_INT_TESTS=1 sh tests/driver_checks ./build-int/mylang
+        path: test-logs/int_run-gcov-report.txt
+        if-no-files-found: ignore
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore
 
   # ---------------------------------------------------------------- #
   # The #107 P3 DECISION ENUMERATOR, tier 1: every legal alternative of
@@ -368,72 +335,43 @@ jobs:
     - uses: actions/checkout@v4
     - name: Build (INT_TESTS, optimized, asserts on)
       run: |
-        cmake -S $GITHUB_WORKSPACE -B build-enum -DINT_TESTS=ON \
+        cmake -S . -B build-enum -DINT_TESTS=ON \
               -DCMAKE_BUILD_TYPE=Release -DASSERTS=ON -DLTO=OFF
         cmake --build build-enum -j
-    # THE VACUITY GUARD: an enumerator run on a build without the hooks
-    # (or without the tracker) would answer "0 failures" doing nothing
-    - name: "assert -v reports int_tests 1, asserts 1"
-      run: |
-        ./build-enum/mylang -v | grep -q '^  int_tests  *1'
-        ./build-enum/mylang -v | grep -q '^  asserts  *1'
-    # tests/functional plus samples/ - minus phonebook and shopping
-    # (stdin-driven: with no input they reach no decision) and rand_sort
-    # (its output is random). bench/ is NOT a correctness corpus.
-    - name: tests/int_enum (tier 1, tests/functional + samples)
-      run: |
-        tests/int_enum ./build-enum/mylang --heartbeat 60 \
-                --failures-out int-enum-failures.txt \
-                tests/functional/*.my samples/fib samples/gcd samples/loop \
-                samples/primes samples/primes2 samples/strloop
-    # tier 2: TWO decisions at once, every combination, in each SMALL
-    # scope (one JIT run's choices, one caller's inlining sites) - ~3k
-    # runs. Tier 3 (the pairwise covering arrays of the larger scopes,
-    # ~110k runs) is on demand: .github/workflows/int-deep.yml.
-    - name: tests/int_enum (tier 2, the same corpus)
-      run: |
-        tests/int_enum ./build-enum/mylang --tier 2 \
-                --heartbeat 60 --failures-out int-enum-failures-t2.txt \
-                tests/functional/*.my samples/fib samples/gcd samples/loop \
-                samples/primes samples/primes2 samples/strloop
-    # disasmcheck (-vdj vs objdump, every operand) in configurations no
-    # matrix axis reaches: forced allocator picks that put a float stage
-    # in xmm8-15 and a GP scratch/pin in r8/r15 - the REX.R/X/B forms a
-    # decoder can drop and still print the right mnemonic. The keys name
-    # 59_float_abi_calls' two runs; the guard first proves each still
-    # lands in r8-r15 / xmm8-15, so a key the program drifted away from
-    # fails here instead of checking the default registers again.
-    - name: disasmcheck, forced picks into the REX registers
-      run: |
-        P=tests/functional/59_float_abi_calls.my
-        C1='main@0/fp#0=11,main@21/fp#0=11'
-        C2='main@0/fp#1=9,main@21/fp#1=9'
-        C3='main@0/gp#5=4,main@21/gp#2=9'
-        for c in "$C1" "$C2" "$C3"; do
-          rm -f pick.txt
-          MYLANG_INT_CHOOSE="$c" MYLANG_INT_DUMP=pick.txt \
-            ./build-enum/mylang $P > /dev/null
-          n=$(grep -E '^choose_reg .* reg=(8|9|1[0-5])$' pick.txt \
-              | grep -o 'key="[^"]*"' | sort -u | wc -l)
-          if [ "$n" -ne 2 ]; then
-            echo "forced picks $c no longer land in r8-r15/xmm8-15:"
-            grep '^choose_' pick.txt
-            exit 1
-          fi
-        done
-        scripts/disasmcheck ./build-enum/mylang \
-                --only tests/functional \
-                --env "MYLANG_INT_CHOOSE=$C1" \
-                --env "MYLANG_INT_CHOOSE=$C2" \
-                --env "MYLANG_INT_CHOOSE=$C3"
-    - name: Upload the failures
+    # The build check comes first (`int_tests 1`, `asserts 1`: an
+    # enumerator run on a build without the hooks, or without the
+    # tracker, would answer "0 failures" doing nothing).
+    #
+    # int_enum-1 / -2: tiers 1 and 2 over tests/functional plus the
+    # samples that need no input (bench/ is NOT a correctness corpus);
+    # tier 2 is TWO decisions at once, every combination, in each SMALL
+    # scope - ~3k runs. Tier 3 (~110k runs) is on demand: int-deep.yml.
+    #
+    # disasmcheck-rex: disasmcheck (-vdj vs objdump, every operand) in
+    # configurations no matrix axis reaches - forced allocator picks
+    # that put a float stage in xmm8-15 and a GP scratch/pin in r8/r15,
+    # the REX.R/X/B forms a decoder can drop and still print the right
+    # mnemonic. Its guard first proves each pick still lands in r8-r15 /
+    # xmm8-15, so a key the program drifted away from fails instead of
+    # checking the default registers again.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --bin int-rel=build-enum/mylang
+           int_enum-1 int_enum-2 disasmcheck-rex
+    - name: Upload the test logs
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: int-enum-failures
-        path: int-enum-failures*.txt
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
         if-no-files-found: ignore
 
+  # ---------------------------------------------------------------- #
+  # The .myv corruption fuzzer, on BOTH build types on purpose:
+  # CLAUDE.md records that a sanitizer build and an assert-free release
+  # catch DIFFERENT things here - the debug one finds the memory error,
+  # the release one finds the case where a check the debug build relies
+  # on has been compiled away.
+  # ---------------------------------------------------------------- #
   myv-fuzz:
     runs-on: ubuntu-latest
     strategy:
@@ -441,34 +379,30 @@ jobs:
       matrix:
         include:
           - name: debug-asan
-            flags: "-DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug"
+            lane: dbg
+            cmake: -DTESTS=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug
           - name: release-noassert
-            flags: "-DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release"
+            lane: rna
+            cmake: -DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release
     name: "myv-fuzz (${{ matrix.name }})"
     steps:
     - uses: actions/checkout@v4
-    - name: Configure
-      run: cmake -E make_directory ${{github.workspace}}/build
-    - name: CMake
-      working-directory: ${{github.workspace}}/build
-      run: cmake ${{ matrix.flags }} $GITHUB_WORKSPACE
     - name: Build
-      working-directory: ${{github.workspace}}/build
-      run: cmake --build . -j
+      run: |
+        cmake -S . -B build ${{matrix.cmake}}
+        cmake --build build -j
 
-    - name: myv_fuzz
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/myv_fuzz ./mylang -n 400
-           --seed ${{github.run_id}} --save $GITHUB_WORKSPACE/myv-fuzz-bad
-
-    # a finding cannot be regenerated from a seed - an image embeds its
-    # source path - so keep it
-    - name: Upload findings
+    # A finding cannot be regenerated from a seed - an image embeds its
+    # source path - so it is saved in test-logs/, uploaded on failure.
+    - name: tests/run
+      run: tests/run -o --logs test-logs --seed ${{github.run_id}}
+           --bin ${{matrix.lane}}=build/mylang myv_fuzz@${{matrix.lane}}
+    - name: Upload the test logs
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: myv-fuzz-bad-${{ matrix.name }}
-        path: myv-fuzz-bad/
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
         if-no-files-found: ignore
 
   # ---------------------------------------------------------------- #
@@ -481,25 +415,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Configure
-      run: cmake -E make_directory ${{github.workspace}}/build
-    - name: CMake
-      working-directory: ${{github.workspace}}/build
-      run: cmake -DTESTS=1 -DRECYCLE=ON -DVM_HARDENING=ON
-           -DCMAKE_BUILD_TYPE=Debug $GITHUB_WORKSPACE
-    - name: Build
-      working-directory: ${{github.workspace}}/build
-      run: cmake --build . -j
-    - name: repl_fuzz
-      working-directory: ${{github.workspace}}/build
-      run: $GITHUB_WORKSPACE/tests/repl_fuzz ./mylang -n 400
-           --seed ${{github.run_id}} --save $GITHUB_WORKSPACE/repl-fuzz-bad
-    - name: Upload findings
+    - name: Build (RECYCLE)
+      run: |
+        cmake -S . -B build -DTESTS=1 -DRECYCLE=ON -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build -j
+    - name: tests/run
+      run: tests/run -o --logs test-logs --seed ${{github.run_id}}
+           --bin recycle=build/mylang repl_fuzz@recycle
+    - name: Upload the test logs
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: repl-fuzz-bad
-        path: repl-fuzz-bad/
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
         if-no-files-found: ignore
 
   # ---------------------------------------------------------------- #
@@ -517,16 +446,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Configure
-      run: cmake -E make_directory ${{github.workspace}}/build
-    - name: CMake
-      working-directory: ${{github.workspace}}/build
-      run: cmake -DTESTS=1 -DGCOV=1 -DVM_HARDENING=ON
-           -DCMAKE_BUILD_TYPE=Debug $GITHUB_WORKSPACE
-    - name: Build
-      working-directory: ${{github.workspace}}/build
-      run: cmake --build . -j
+    - name: Build (GCOV)
+      run: |
+        cmake -S . -B build -DTESTS=1 -DGCOV=1 -DVM_HARDENING=ON \
+              -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build -j
     - name: "Net 4: no-record coverage ratchet"
-      run: $GITHUB_WORKSPACE/tests/norec_coverage
-           --build-dir ${{github.workspace}}/build --run
-           --min-lines 70 --min-branches 55
+      run: tests/run -o --logs test-logs --bin cmake-gcov=build/mylang
+           norec_coverage
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}-${{strategy.job-index}}
+        path: test-logs/
+        if-no-files-found: ignore

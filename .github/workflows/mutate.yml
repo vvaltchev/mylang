@@ -44,9 +44,11 @@ jobs:
       MYLANG_TEST_JOBS: 4
     steps:
     - uses: actions/checkout@v4
-    - name: tests/mutate
-      run: tests/mutate --count ${{inputs.count}}
-           --seed ${{inputs.seed}} --shard ${{matrix.shard}}/8 --jobs 1
+    # the workflow's inputs go to the tool after `--`
+    - name: tests/run mutate
+      run: tests/run -o -a --timeout 20400 --logs test-logs mutate
+           --shard ${{matrix.shard}}/8 --
+           --count ${{inputs.count}} --seed ${{inputs.seed}} --jobs 1
            --files "${{inputs.files}}" --stages "${{inputs.stages}}"
            --heartbeat 600 --out mutate-${{matrix.shard}}.json
     - uses: actions/upload-artifact@v4
