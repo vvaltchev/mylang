@@ -1,9 +1,12 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
->> TypeMismatchEx: can only throw a struct instance, got 'int'
->> TypeErrorEx: Can only throw a struct instance at line 2, col 1:10
+>> TypeMismatchEx: can only throw a struct instance, got 'int' at line 1, col 7:27
+
+    throw -9223372036854775808;
+          ^^^^^^^^^^^^^^^^^^^^
+>> TypeErrorEx: Can only throw a struct instance at line 2, col 7:11
 
     throw none;
-    ^^^^^^^^^
+          ^^^^
 >> MyLang REPL help
 Documentation:
   :help builtins          all builtins, grouped by category

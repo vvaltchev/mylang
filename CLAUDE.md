@@ -3217,7 +3217,11 @@ and it lives *inside the parser*. Mechanics:
 - As soon as the parser finishes a const node, it evaluates it against
   `const_ctx` and calls
   **`MakeConstructFromConstVal()`** to replace the subtree with a literal node.
-  That function inlines
+  **The literal keeps the SPAN of the node it replaces** (and
+  `cse_materialize` gives a baked literal its expression's span) - until
+  2026-10-05 it was span-less, so an error about a folded argument had no
+  location and the call stamped the whole argument list (`str(f, 65)`
+  underlined `f, 65`, in every engine). That function inlines
   `int`/`float`/`none`/`str` unconditionally, and `arr`/`dict` only when
   `process_arrays` is set — in which case it bakes the whole value into **one
   `LiteralObj` node** (`syntax.h`), not one literal per element. (It stores

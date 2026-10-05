@@ -1,6 +1,9 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 >> => 201
->> TypeMismatchEx: can only throw a struct instance, got 'int'
+>> TypeMismatchEx: can only throw a struct instance, got 'int' at line 2, col 7:8
+
+    throw 1;
+          ^
 >> SyntaxError at line 3, col 1
 
     return -9223372036854775808;

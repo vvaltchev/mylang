@@ -1351,20 +1351,31 @@ static const std::vector<test> tests =
         "var r = sort(a, func(int x, int y) { return x < y; });",
         "print(r);" },
       &typeid(TypeErrorEx), 14, 2, 54, 2 },
-    /* a LITERAL argument has no span of its own (const-folding leaves it
-     * loc-less) and only a DYN callee can hand one to a coercing parameter
-     * unchecked - every engine then takes the argument LIST, the
-     * tree-walker's stamp_args_loc and the VM's stamps alike (watched:
-     * the generic op's CallSite carries the empty span, and writing it
-     * left the exception loc-less - no location under -nj, the whole call
-     * under the JIT) */
+    /* a LITERAL argument keeps its span through the parser's constant
+     * folding (MakeConstructFromConstVal), so its coercion marks the
+     * literal in every engine. Until 2026-10-05 the folded literal was
+     * span-less and every engine fell back to the argument LIST - this
+     * case pinned that, as `69, 3, 76, 3`. (Only a DYN callee can hand a
+     * literal to a coercing parameter unchecked.) */
     { "err loc: a LITERAL argument's coercion through a DYN callee marks "
-      "the argument list (it has no span of its own)",
+      "the literal",
       { "func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }",
         "var dyn f2 = 0; f2 = runtime(mk2(1)); var s = 0;",
         "for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); s = s + f2(2.5, i); }",
         "print(s);" },
-      &typeid(TypeErrorEx), 69, 3, 76, 3 },
+      &typeid(TypeErrorEx), 69, 3, 73, 3 },
+    /* the same for a builtin: the folded literal is still where the caret
+     * goes (`str(f, 65)` underlined `f, 65`) */
+    { "err loc: a LITERAL builtin argument's error marks the literal",
+      { "float f = float(runtime(2.5));", "var s = str(f, 65);" },
+      &typeid(InvalidValueEx), 16, 2, 19, 2 },
+    { "err loc: a `true` argument's span is the keyword's, whatever follows",
+      { "float f = float(runtime(2.5));", "var s = str(f, true    );" },
+      &typeid(TypeErrorEx), 16, 2, 21, 2 },
+    { "err loc: a folded CONST argument's error marks the name",
+      { "const K = 65;", "float f = float(runtime(2.5));",
+        "var s = str(f, K);" },
+      &typeid(InvalidValueEx), 16, 3, 18, 3 },
     { "err loc: a runtime ARITY error through a DYN callee marks the argument",
       { "func mk2(int z) { return func [z] (int a, int b) { return a + b + z; }; }",
         "var dyn f2 = 0; f2 = runtime(mk2(1)); var s = 0;",
