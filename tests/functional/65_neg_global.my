@@ -1,0 +1,66 @@
+# Unary minus on a GLOBAL, inside a function. A proven-int/float `-x` is a
+# typed negation, and the typed path has no leaf for a global (a capture and
+# a call result have one), so it falls back to the boxed tier - which knew
+# `!x` but not `-x`. Until 2026-10-05 `func f() { return -g; }` was a
+# NotLoweredEx compile refusal in the default engine, -nj and -ni, while the
+# tree-walker printed the answer (RULE 2). Each shape is asserted against
+# what README.md says, in every engine corpus_diff runs. Values come from
+# runtime(): a constant would fold.
+
+var j = int(runtime(2));
+var x = float(runtime(2.5));
+var z = float(runtime(0.0));
+var lo = int(runtime(-9223372036854775807)) - 1;
+var b = runtime(true) == true;
+var arr = [int(runtime(4))];
+var d = {"k": int(runtime(5))};
+
+func neg_int() { return -j; }
+func neg_float() { return -x; }
+func neg_zero() { return -z; }
+func neg_min() { return -lo; }
+func neg_bool() { return -b; }
+func in_expr() { return -(j * 3) + 1; }
+func in_cmp() { return -j < 0; }
+func in_cond() {
+    if (-j < 0)
+        return 1;
+    return 0;
+}
+func in_compound() {
+    var s = 10;
+    s += -j;
+    return s;
+}
+func in_array() { return [-j, - -j]; }
+func into_dyn() {
+    var dyn k = -j;
+    return k;
+}
+func of_element() { return -arr[0] + -d.k; }
+func of_call() { return -abs(j) + -float(j); }
+func nested() {
+    func inner() { return -j; }
+    return inner();
+}
+var lam = func () { return -x; };
+
+print(neg_int(), neg_float(), neg_zero(), neg_min(), neg_bool());
+print(in_expr(), in_cmp(), in_cond(), in_compound(), in_array());
+print(into_dyn(), of_element(), of_call(), nested(), lam());
+
+assert(neg_int() == -2);
+assert(neg_float() == -2.5);
+assert(str(neg_zero()) == "-0.000000");       # -x of 0.0 is -0.0
+assert(neg_min() == lo);                      # -INT_MIN wraps to itself
+assert(neg_bool() == -1);                     # a bool promotes to int
+assert(in_expr() == -5);
+assert(in_cmp());
+assert(in_cond() == 1);
+assert(in_compound() == 8);
+assert(in_array() == [-2, 2]);
+assert(into_dyn() == -2);
+assert(of_element() == -9);
+assert(of_call() == -4.0);
+assert(nested() == -2);
+assert(lam() == -2.5);

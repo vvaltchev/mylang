@@ -2216,8 +2216,19 @@ struct Codegen {
              * boxed UnaryV (its !is_true == the typed eval's `!= 0` boxing).
              * Was undetected while expr-bodied functions had no chunks
              * (`func neg(bool b) => !b` never compiled); the no-fail contract
-             * flushed it out. */
-            if (t->cat == TypedScalarExpr::Cat::lnot && t->elems.size() == 1) {
+             * flushed it out.
+             * A typed `-x` (Cat::neg) whose operand the unboxed path
+             * declines - a GLOBAL (no typed leaf, unlike a capture or a
+             * call), or anything containing one - is the same boxed UnaryV:
+             * it negates by the value's own type (TypeFloat::opneg gives
+             * -0.0 for 0.0, TypeInt::opneg wraps INT_MIN), exactly what the
+             * typed `-0.0 - x` / `0 - x` compute. Until 2026-10-05 this
+             * returned false, so `func f() { return -g; }` with a global
+             * `g` was a NotLoweredEx compile refusal while the tree-walker
+             * printed the answer (RULE 2). */
+            if ((t->cat == TypedScalarExpr::Cat::lnot
+                    || t->cat == TypedScalarExpr::Cat::neg)
+                    && t->elems.size() == 1) {
                 int oslot;
                 if (!compile_boxed_expr(t->elems[0].second.get(), oslot, ops))
                     return false;
@@ -2227,7 +2238,8 @@ struct Codegen {
                 in.node_idx = add_ast_node(e);
                 in.target = dst;
                 in.set_a(slot_op(oslot));
-                in.aop = Op::lnot;
+                in.aop = t->cat == TypedScalarExpr::Cat::lnot ? Op::lnot
+                                                              : Op::minus;
                 ops.push_back(in);
                 out_slot = dst;
                 return true;
