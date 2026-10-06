@@ -4386,11 +4386,26 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
             return A.array_of(arg(1));
         return A.array_of(A.none_ty());
     }
+    /*
+     * The callback's RETURN type, or bottom while it is not settled - the
+     * defer-on-Unknown invariant, applied to the callback as well as to the
+     * value: `array<?>` is not Unknown at its top level, so a premature one
+     * passed every deferral and failed a declared destination's check -
+     * `array<int> a = make_array(n, f)` was refused as assigning `array<?>`
+     * (until 2026-10-05) while `var a = ...` waited and settled.
+     */
+    auto cb_ret = [&](StaticTypeRef f) -> StaticTypeRef {
+        if (!is_func(f))
+            return A.dyn_ty();
+        return is_unknown(static_type_resolve(f->ret)) ? bottom : f->ret;
+    };
+
     if (n == "make_array") {
         /* make_array(N, gen) -> array of the callback's return type. */
         StaticTypeRef f = static_type_resolve(arg(1));
         if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
-        return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
+        StaticTypeRef r = cb_ret(f);
+        return is_unknown(r) ? bottom : A.array_of(r);
     }
     if (n == "make_dict") {
         /* make_dict(keys, gen) -> dict<K, V>: K = the keys array's element
@@ -4402,7 +4417,8 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
             return bottom;                  /* defer: args not yet known */
         StaticTypeRef k =
             ks->kind == StaticTypeKind::Array ? ks->elem : A.dyn_ty();
-        return A.dict_of(k, is_func(f) ? f->ret : A.dyn_ty());
+        StaticTypeRef v = cb_ret(f);
+        return is_unknown(v) ? bottom : A.dict_of(k, v);
     }
     if (n == "dict") {
         /* dict(default_value) -> dict<dyn, typeof default> (a default dict, so
@@ -4476,7 +4492,8 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         /* map(func, container) -> array of the callback's return type */
         StaticTypeRef f = static_type_resolve(arg(0));
         if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
-        return A.array_of(is_func(f) ? f->ret : A.dyn_ty());
+        StaticTypeRef r = cb_ret(f);
+        return is_unknown(r) ? bottom : A.array_of(r);
     }
     if (n == "filter")              /* filter(func, container) -> container */
         return arg(1);

@@ -20,14 +20,12 @@ want("array(3, true)", array(ri(3), true), [true, true, true]);
 want("array(2, false)", array(ri(2), false), [false, false]);
 want("array(2, 1.5)", array(ri(2), 1.5), [1.5, 1.5]);
 want("array(2, \"s\")", array(ri(2), "s"), ["s", "s"]);
-# (an inferred destination: a declared `array<float> hf = make_array(..)`
-# is refused today as `array<?>` - a separate inferencer defect)
 func half(int i) => i * 0.5;
 func even(int i) => i % 2 == 0;
-var hf = make_array(ri(3), half);
+array<float> hf = make_array(ri(3), half);
 want("make_array -> array<float>", hf, [0.0, 0.5, 1.0]);
 want("its storage", array_storage(hf), "float");
-var hb = make_array(ri(4), even);
+array<bool> hb = make_array(ri(4), even);
 want("make_array -> array<bool>", hb, [true, false, true, false]);
 want("its storage", array_storage(hb), "bool");
 var dyn hg = make_array(ri(3), func (int i) => str(i));

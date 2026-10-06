@@ -8063,6 +8063,18 @@ static const std::vector<test> tests =
      * container can hold - is the catchable OutOfMemoryEx, raised before
      * anything is built; 2^59 elements is past every machine, so nothing
      * is actually touched */
+    /* a DECLARED destination for a callback builder: its result type
+     * waits for the callback's return to settle (it was `array<?>`, and
+     * the declared type's check refused it - `var` worked) */
+    { "typed destination: make_array / make_dict / map with a lambda",
+      { "array<int> a = make_array(int(runtime(3)), func (int i) => i * 2);",
+        "array<float> b =",
+        "    make_array(int(runtime(2)), func (int i) => i * 0.5);",
+        "dict<str, int> d =",
+        "    make_dict([\"x\", \"yy\"], func (str k) => len(k));",
+        "array<str> m = map(func (int x) => str(x), [1, 2]);",
+        "assert(a == [0, 2, 4] && b == [0.0, 0.5] && d[\"yy\"] == 2);",
+        "assert(m == [\"1\", \"2\"] && array_storage(a) == \"int\");" } },
     { "out of memory: array(2^59) is OutOfMemoryEx",
       { "var a = array(runtime(576460752303423488));", "print(len(a));" },
       &typeid(OutOfMemoryEx) },

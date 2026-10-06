@@ -4472,6 +4472,12 @@ decisions behind it: `plans/archived/type-inference.md`,
   pass re-validates genuine errors (`require_nonopt`, not-subscriptable) with
   the final types, so deferring during accumulate hides nothing. **When
   touching the inferencer, audit any new `return A.dyn_ty()` for this.**
+  **And a CALLBACK's return is an operand too (2026-10-05):** `make_array`,
+  `make_dict` and `map` built `array<f->ret>` while `f->ret` was still
+  Unknown - `array<?>` is not Unknown at its top level, so it passed every
+  deferral and failed a DECLARED destination's check (`array<int> a =
+  make_array(n, f)` was refused; `var` waited and settled). They defer
+  through `cb_ret`, as `sum`'s key form already did.
   `-dti` dumps
   every identifier's inferred type + uses to find spurious `dyn`s. The
   invariant also applies to *contributions*, not just return types:
