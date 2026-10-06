@@ -1,0 +1,8 @@
+# INT-SOURCE: ../functional/73_multi_assign_value.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): a multi-assignment's value is none, and its typed and
+# dyn forms take the general unpack. The functional program runs as a
+# coverage unit too, under the engines above, with no second copy
+# (INT-SOURCE); it asserts its own results and every engine must print
+# the same.

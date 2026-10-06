@@ -117,3 +117,13 @@ callback: `sort`'s comparator, `map`/`filter`'s function and a
 `foreach` body over the container each pay a RUN-TIME mutation check
 today (#49, #53) that a compile-time guarantee would delete. Intro and
 open questions: `plans/immutable-views.md`.
+
+## The value of a multi-assignment
+
+**Deferred by the maintainer (2026-10-06).** `w = a, b = [5, 6]` should
+yield a temporary list whose elements are lvalues of the targets; until
+that is built the value is `none` in every engine (README). The open
+questions - above all whether the aliasing outlives the expression,
+which decides between "a fresh array of the stored values" and a new
+reference value kind with a lifetime rule - are in
+`plans/multi-assign-value.md`.

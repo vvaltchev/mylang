@@ -4080,25 +4080,26 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
 
     if (ctag(e) == ConstructType::expr14) {
         auto *e14 = static_cast<const Expr14 *>(e);
+        /* A multi-assignment's value is none (README), whatever it
+         * stored and whichever operator - Expr14::do_eval returns it. */
+        if (e14->lvalue->is_idlist())
+            return A.none_ty();
         if (e14->op == Op::assign) {
             /* The value is the STORED value: the rvalue converted to the
              * target's static type (README *the value of an assignment*) -
              * an int into a float variable, field or array<float> element
              * is a float. Expr14::val_widen / rv_coerce and a typed
-             * variable's own coercion are the runtime half of this. */
+             * variable's own coercion are the runtime half of this. The
+             * target is a variable, an element or a field: the parser
+             * admits no other single target (the assignable-shape rule),
+             * and a multi-assignment returned above. */
             StaticTypeRef rt = type_of(e14->rvalue.get());
-            const Construct *lv = e14->lvalue.get();
-            if (ctag(lv) == ConstructType::id
-                    || ctag(lv) == ConstructType::subscript
-                    || ctag(lv) == ConstructType::member) {
-                const DeclType w = numeric_widen(
-                    type_of(const_cast<Construct *>(lv)), rt);
-                const bool o = static_type_resolve(rt)->opt;
-                if (w == DeclType::f)
-                    return A.float_ty(o);
-                if (w == DeclType::i)
-                    return A.int_ty(o);
-            }
+            const DeclType w = numeric_widen(type_of(e14->lvalue.get()), rt);
+            const bool o = static_type_resolve(rt)->opt;
+            if (w == DeclType::f)
+                return A.float_ty(o);
+            if (w == DeclType::i)
+                return A.int_ty(o);
             return rt;
         }
         return binop_result(compound_binop(e14->op),

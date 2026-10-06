@@ -1,0 +1,102 @@
+# A multi-assignment (`a, b = [5, 6]`) used as a VALUE - `w = a, b = ...`,
+# `return a, b = ...` - evaluates to none (README), whatever form it takes:
+# a destructure, a spread, a compound, a `_` placeholder. The tree-walker
+# gave none while the VM refused to compile it (NotLoweredEx), and the
+# inferencer typed the value as the right-hand side, so a typed destination
+# accepted it statically and then held none (RULE 1). The targets here are
+# locals: a multi-assignment into a global or a capture is a VM compile
+# refusal of its own, open separately. Values come from runtime().
+
+var events = [];
+func val(v) { append(events, "val"); return v; }
+
+func ri(int v) => int(runtime(v));
+
+# the destructure, in a function, returned and stored
+func pair(n) {
+    var a = 0;
+    var b = 0;
+    var r = 1;
+    r = a, b = [n, n + 1];
+    return [r, a, b];
+}
+func ret(n) {
+    var a = 0;
+    var b = 0;
+    return a, b = [n, n * 3];
+}
+assert(pair(ri(5)) == [none, 5, 6]);
+assert(ret(ri(4)) == none);
+
+var a = 1;
+var b = 2;
+var dyn w = 0;
+
+# a spread, a compound, a placeholder
+w = a, b = ri(7);
+assert(w == none && a == 7 && b == 7);
+w = a, b += [ri(10), ri(20)];
+assert(w == none && a == 17 && b == 27);
+w = a, _ = [ri(3), ri(4)];
+assert(w == none && a == 3 && b == 27);
+
+# the right-hand side runs once, before the stores
+w = a, b = val([ri(8), ri(9)]);
+assert(w == none && a == 8 && b == 9 && events == ["val"]);
+
+# in a loop (a JIT-compiled run)
+func loop(n) {
+    var x = 0;
+    var y = 0;
+    var z = 1;
+    for (var i = 0; i < n; i++)
+        z = x, y = [i, i * 2];
+    return [z, x, y];
+}
+assert(loop(ri(5)) == [none, 4, 8]);
+
+# typed targets (the stores coerce, so the fast paths decline to the
+# general unpack), a dyn right-hand side that is a scalar (a run-time
+# spread) or an array, and a float unpacked into an int target
+func typed(n) {
+    int x = 0;
+    float y = 0.0;
+    var dyn v = 1;
+    x, y = [n, n + 1];
+    assert(x == 2 && y == 3.0 && typestr(y) == "float");
+    v = x, y = ri(3);
+    assert(v == none && x == 3 && y == 3.0);
+    v = x, y += [n, n];
+    assert(v == none && x == 5 && y == 5.0);
+    var p = 0;
+    var q = 0;
+    var dyn d = runtime(9);
+    v = p, q = d;
+    assert(v == none && p == 9 && q == 9);
+    var dyn e = [ri(4), ri(5)];
+    v = p, q = e;
+    assert(v == none && p == 4 && q == 5);
+    v = x, _ = [ri(6), ri(7)];
+    assert(v == none && x == 6);
+    var raised = false;
+    try {
+        v = y, x = [ri(1), 2.5];
+    } catch (TypeErrorEx) {
+        raised = true;
+    }
+    assert(raised && y == 1.0 && x == 6);
+    return [x, y, p, q];
+}
+assert(typed(ri(2)) == [6, 1.0, 4, 5]);
+
+# a failing destructure raises before anything is stored
+var c = 5;
+var caught = false;
+try {
+    c = a, b = [ri(1), ri(2), ri(3)];
+} catch (TypeErrorEx) {
+    caught = true;
+}
+assert(caught && c == 5 && a == 8 && b == 9);
+
+print(pair(ri(5)), ret(ri(4)), w, a, b, events, loop(ri(5)), typed(ri(2)));

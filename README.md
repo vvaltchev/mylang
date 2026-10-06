@@ -341,7 +341,11 @@ aspects:
     or into a `float` variable or field, makes `z` the `float` `3.0`; a
     `dyn` target converts nothing), and for a compound assignment the
     result it stored. That holds for every target - a variable, an
-    element, a field, a dict key, a chain of them.
+    element, a field, a dict key, a chain of them. A multi-assignment
+    (`a, b = [5, 6]`, see *array expansion*) is the exception: it
+    stores into each target, and its own value is `none` (`w = a, b =
+    [5, 6]` sets `w` to `none`, so a non-`opt` typed `w` is a compile
+    error).
 
   - MyLang supports both the classic `for` loop and an explicit `foreach` loop.
 

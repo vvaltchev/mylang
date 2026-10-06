@@ -2182,8 +2182,22 @@ struct Codegen {
          * (2026-10-05: those, an element / field target - try_value_store -
          * and a const or builtin target, whose statement store throws, were
          * a NotLoweredEx compile refusal until then, while the tree-walker
-         * ran them). An IdList target declines. */
+         * ran them). A multi-assignment (an IdList target) runs as the
+         * statement and its value is none (README; Expr14::do_eval). */
         if (const Expr14 *e14 = dynamic_cast<const Expr14 *>(e)) {
+            if (e14->lvalue->is_idlist()) {
+                /* a declining IdList lowering (a global or capture
+                 * target) restores ops, temps and consts itself */
+                if (!compile_boxed_stmt(e14, ops))
+                    return false;
+                CgInstr ld;
+                ld.op = OpCode::LoadConstV;
+                ld.target = alloc_temp();
+                ld.target2 = add_const(EvalValue());   /* none */
+                ops.push_back(ld);
+                out_slot = ld.target;
+                return true;
+            }
             if (e14->lvalue->is_subscript()
                     || ctag(e14->lvalue.get()) == ConstructType::member)
                 return try_value_store(e14, out_slot, ops);

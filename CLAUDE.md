@@ -4442,6 +4442,12 @@ decisions behind it: `plans/archived/type-inference.md`,
   would have read the float's bits as an int once the VM lowered the
   form. A `dyn` target converts nothing, statically or at run time: the
   value is the rvalue as typed, whatever the dyn container stored.
+  A MULTI-assignment's value is `none` (type_of answers `none` for an
+  IdList target; codegen compiles the statement, then loads none). Until
+  2026-10-06 it was typed as the rvalue, so `array<int> w; w = a, b =
+  [5, 6]` compiled and held none, and the VM refused the form. The
+  maintainer's eventual semantics - a list whose elements alias the
+  targets - is plans/multi-assign-value.md.
 - **A JOINED parameter binds like a DECLARED one (#38 C,
   `stamp_inferred_param_types`).** A lambda's un-annotated param (and a
   named function's `opt` one) joins every call site's argument, so
