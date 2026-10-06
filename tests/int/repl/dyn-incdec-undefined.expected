@@ -3,14 +3,14 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 
     zz[0]++;
     ^^
->> Undefined variable 'zz' at line 2, col 1:4
+>> Undefined variable 'zz' at line 2, col 1:5
 
     zz.a++;
-    ^^^
->> Undefined variable 'zz' at line 3, col 1:4
+    ^^^^
+>> Undefined variable 'zz' at line 3, col 1:5
 
     zz++;
-    ^^^
+    ^^^^
 >> => [1]
 >> Undefined variable 'zz' at line 5, col 1:6
 

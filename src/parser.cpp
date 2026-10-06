@@ -8,6 +8,7 @@
 #include "numtext.h"
 #include "inttest.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -746,13 +747,31 @@ pAcceptLiteralFloat(ParseContext &c, unique_ptr<Construct> &v)
     return false;
 }
 
+/*
+ * A string literal's span, from its opening quote (the token's loc) through
+ * its closing one - `raw` is the source text between them - so the end is
+ * the closing quote's column + 2; a literal spanning lines ends on its last
+ * line. It used to be start + the text's length + 1: two columns short (no
+ * quotes), and on the wrong line for a multi-line literal.
+ */
+static Loc
+str_literal_end(Loc start, std::string_view raw)
+{
+    const size_t nl = raw.rfind('\n');
+    if (nl == std::string_view::npos)
+        return start + (raw.size() + 3);
+    const int lines = static_cast<int>(std::count(raw.begin(), raw.end(),
+                                                  '\n'));
+    return Loc(start.line + lines, static_cast<int>(raw.size() - nl - 1) + 3);
+}
+
 bool
 pAcceptLiteralStr(ParseContext &c, unique_ptr<Construct> &v)
 {
     if (*c == TokType::str) {
         v.reset(new LiteralStr(c.get_str()));
         v->start = c.get_loc();
-        v->end = c.get_loc() + (c.get_str().length() + 1);
+        v->end = str_literal_end(c.get_loc(), c.get_str());
         c++;
         return true;
     }
@@ -1361,7 +1380,10 @@ pAcceptMember(ParseContext &c,
         throw SyntaxErrorEx(c.get_loc(), "Expected identifier, got", &c.get_tok());
     }
 
-    mem->end = c.get_loc();
+    /* the member name's own end - not the next token's start, which put
+     * the spaces after `d.zz` under its caret (and one column too few
+     * when nothing separated them: `d.zz+1` underlined `d.z`) */
+    mem->end = tmpId->end;
     unique_ptr<Identifier> id(dynamic_cast<Identifier *>(tmpId.release()));
 
     if (!id)
@@ -1393,6 +1415,40 @@ pRefuseOptionalTarget(const Construct *lv)
     SyntaxErrorEx e(lv->start,
                     "Cannot assign to an optional member: `a?.f` is a value "
                     "(none when `a` is none), not an assignable location");
+    e.loc_end = lv->end;
+    throw e;
+}
+
+/*
+ * THE ASSIGNABLE-SHAPE RULE (pExpr14's comment has the history): only four
+ * forms can denote a location - a variable, a destructuring list, an
+ * element `a[i]` and a field `a.f` (an optional one excepted, above). Any
+ * other target - a literal, a call result, an arithmetic chain, a ternary,
+ * a slice - is a value by construction, refused here whatever the types,
+ * so no flag that disables a pass can change the answer. Shared by `=` /
+ * `OP=` and by `++` / `--`, whose operand used to skip it: under -nti
+ * `f()++`, `(a + 1)++` and `s[0:1]++` failed at run time in the
+ * tree-walker while the VM refused to compile them (until 2026-10-05).
+ * A CONST element lands here too - the parser already folded `K[0]` to
+ * its value (#54: under -nc, nc_folds says it would have) - which is
+ * right: writing it IS decidable at compile time; the same const reached
+ * through a PARAMETER keeps its Subscript shape and stays the runtime
+ * NotLValueEx. `what` is the message's verb ("Cannot assign to").
+ */
+static void
+pRefuseUnassignable(const Construct *lv, const char *what)
+{
+    pRefuseOptionalTarget(lv);
+
+    if (!lv->nc_folds
+        && (lv->is_id() || lv->is_idlist()
+            || ctag(lv) == ConstructType::subscript
+            || ctag(lv) == ConstructType::member))
+        return;
+
+    const std::string m = std::string(what) +
+        " this expression: it is not an assignable location";
+    SyntaxErrorEx e(lv->start, intern_msg(m));
     e.loc_end = lv->end;
     throw e;
 }
@@ -1475,11 +1531,13 @@ pExpr01(ParseContext &c, unsigned fl)
     if (main && (*c == Op::inc || *c == Op::dec)) {
         const bool is_inc = (*c == Op::inc);
         const Loc opLoc = c.get_loc();
-        pRefuseOptionalTarget(main.get());
+        pRefuseUnassignable(main.get(), "Cannot increment or decrement");
         c++;
         auto id = make_unique<IncDecExpr>();
         id->start = main->start;
-        id->end = opLoc + 2;       /* span through the ++ / -- */
+        /* span through the ++ / --: its last column is opLoc + 1, and an
+         * end is the last column + 2 (it was + 2, one column short) */
+        id->end = opLoc + 3;
         id->is_prefix = false;
         id->is_inc = is_inc;
         id->lvalue = std::move(main);
@@ -1527,7 +1585,7 @@ pExprGeneric(ParseContext &c,
         return lowerE;
 
     ret->start = start;
-    ret->end = c.get_loc();
+    ret->end = ret->elems.back().second->end;   /* the last operand's */
     ret->is_const = is_const;
     return ret;
 }
@@ -1549,10 +1607,10 @@ pExpr02(ParseContext &c, unsigned fl)
         elem = pExpr02(c, fl);
         if (!elem)
             noExprError(c);
-        pRefuseOptionalTarget(elem.get());
+        pRefuseUnassignable(elem.get(), "Cannot increment or decrement");
         auto id = make_unique<IncDecExpr>();
         id->start = start;
-        id->end = c.get_loc();
+        id->end = elem->end;                    /* the operand's */
         id->is_prefix = true;
         id->is_inc = is_inc;
         id->lvalue = std::move(elem);
@@ -1611,7 +1669,7 @@ pExpr02(ParseContext &c, unsigned fl)
 
     ret.reset(new Expr02);
     ret->start = start;
-    ret->end = c.get_loc();
+    ret->end = elem->end;                       /* the operand's */
     ret->is_const = elem->is_const;
     ret->elems.emplace_back(op, std::move(elem));
     return ret;
@@ -1968,7 +2026,9 @@ pExpr14(ParseContext &c, unsigned fl)
 
     ret->fl = fl & pFlags::pInDecl;
     ret->start = start;
-    ret->end = c.get_loc();
+    /* the last part's end, not the next token's start (see MemberExpr);
+     * every path to here has set the lvalue */
+    ret->end = (ret->rvalue ? ret->rvalue : ret->lvalue)->end;
 
     /*
      * A target whose SHAPE can never denote a location is refused HERE, at
@@ -1994,31 +2054,8 @@ pExpr14(ParseContext &c, unsigned fl)
      * an arithmetic target at all, so the VM raised a NON-catchable
      * InternalErrorEx where the tree-walker raised a catchable NotLValueEx.
      */
-    if (ret->lvalue && !(fl & pFlags::pInDecl)) {
-
-        const Construct *lv = ret->lvalue.get();
-        pRefuseOptionalTarget(lv);
-
-        /* #54: under `-nc` a constant element is left in place, so ask
-         * whether the folding run would have made it a value. */
-        if (lv->nc_folds
-            || (!lv->is_id() && !lv->is_idlist()
-                && !dynamic_cast<const Subscript *>(lv)
-                && !dynamic_cast<const MemberExpr *>(lv))) {
-
-            /* A CONST element/field target lands here too, because the
-             * parser already folded `K[0]` to its literal value - which is
-             * exactly right: `const K = [..]; K[0] = v;` IS decidable at
-             * compile time. The same const reached through a PARAMETER is
-             * not folded, keeps its Subscript shape, and still raises the
-             * runtime NotLValueEx. Hence the shape-neutral wording. */
-            SyntaxErrorEx e(lv->start,
-                            "Cannot assign to this expression: "
-                            "it is not an assignable location");
-            e.loc_end = lv->end;
-            throw e;
-        }
-    }
+    if (!(fl & pFlags::pInDecl))
+        pRefuseUnassignable(ret->lvalue.get(), "Cannot assign to");
 
     /* Propagate a `var opt`/`var dyn` modifier onto the declared identifier(s),
      * so the type inferencer (which reads Identifier::opt_mod/dyn_mod) sees it. */

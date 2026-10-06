@@ -6509,7 +6509,11 @@ and two macros:
   values, so `s[0:1] = v` / `(a+b) = 3` / `f() = 3` are refused at compile
   time. So is an OPTIONAL member `a?.f` (a value - none when `a` is none),
   as the target of `=`, a compound assignment AND `++` / `--`
-  (`pRefuseOptionalTarget`, 2026-10-05): typed code got a NullabilityEx for
+  (`pRefuseOptionalTarget`, 2026-10-05). **ONE helper, `pRefuseUnassignable`,
+  applies the rule to all three** - the `++`/`--` operand skipped the
+  four-form half until 2026-10-05, so typed code got the inferencer's
+  TypeMismatchEx and -nti's `f()++` / `(a+1)++` / `s[0:1]++` failed at
+  run time in the tree-walker and at compile time in the VM. Typed code got a NullabilityEx for
   `++`/`+=` but a plain store for `=` in the tree-walker, which the VM
   refused to compile (NotLoweredEx), and with -nti the tree-walker raised
   NotLValueEx even for a non-none base. A CONST element target lands
@@ -6601,7 +6605,12 @@ and two macros:
   `loc_end.col - 1`). A construct that ends with a closing token sets
   `end = <that token's loc> + 2` (e.g. `CallExpr`/`Subscript`/`Slice` through
   their `)`/`]`, array/dict literals through `]`/`}`). Keep this convention when
-  adding constructs, or carets will be off by one or two.
+  adding constructs, or carets will be off by one or two. **An expression
+  ends at its LAST PART's end** (a chain's last operand, a member's name, a
+  unary or inc-dec operand, an assignment's rvalue) - **never at the next
+  token's start** (`c.get_loc()` after consuming): that is right only when
+  exactly one space follows, so `d.zz     + 1` underlined the spaces and
+  `d.zz+1` one column too few (fixed 2026-10-05; statements still use it).
 - **`Construct::eval`** stamps a node's `start`/`end` onto any escaping
   exception that has no loc yet — so an error gets the loc of the *innermost*
   node whose `eval` it traversed. Because `RValue()` and the type ops throw with

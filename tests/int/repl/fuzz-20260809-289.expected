@@ -1,8 +1,8 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
->> >> TypeErrorEx: Struct 'int' has no member 'int' at line 2, col 1:7
+>> >> TypeErrorEx: Struct 'int' has no member 'int' at line 2, col 1:8
 
     int.int;
-    ^^^^^^
+    ^^^^^^^
 >> Undefined variable 'i' at line 1, col 1:2
 
     i + 1;

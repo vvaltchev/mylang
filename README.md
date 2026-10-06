@@ -811,7 +811,7 @@ Anything else — a literal, a call result, an arithmetic/comparison/logical
 expression, a ternary, a **slice** `a[i:j]`, or an **optional member**
 `a?.f` (it is `none` when `a` is `none`) — is a value, not a place, so
 assigning to it is a **compile error**, and so is a compound assignment or
-`++`/`--` on an optional member:
+`++`/`--` on it - with type inference or without (`-nti`):
 
 ```C#
 0 = 99;             # compile error: not an assignable location
@@ -820,6 +820,7 @@ f() = 3;            # compile error
 s[0:2] = "xy";      # compile error: a slice is a value (there is no
                     # slice-assignment; build a new string instead)
 p?.x = 3;           # compile error, as are `p?.x += 1` and `p?.x++`
+f()++;              # compile error, as are `(a + 1)++` and `--s[0:1]`
 ```
 
 The rule is: when the target cannot possibly be a location *because of its
