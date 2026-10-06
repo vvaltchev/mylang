@@ -974,6 +974,57 @@ public:
      */
     uint32_t callable_arg_mask = ~0u;
 
+    /*
+     * Bit i is set when argument i may hold `none` at run time AND may reach
+     * a parameter not declared `opt` - so the bind must refuse it (RULE 1:
+     * README, "a parameter that is not opt never holds none"). The static
+     * check refuses an `opt` argument to a non-opt parameter, but a `dyn`
+     * one is non-opt by type and may still hold none (`runtime(none)`, a
+     * dyn container's element), so a dyn / unresolved / opt-ish argument
+     * sets its bit unless the callee is statically known and the parameter
+     * is `opt`. Stamped by annotate_hints; args past bit 31 fold into it.
+     * Consumers: codegen, which emits CheckNoneArgsV before such a call
+     * (the call op itself is unchanged), and the AST inliner, which keeps
+     * such a call a real call.
+     *
+     * DEFAULT ~0u ON PURPOSE, like callable_arg_mask: an unstamped call
+     * (-nti, a node a later pass built) reads as "every argument may be
+     * none", the case that keeps the check - narrowed only by the SHAPE
+     * test below, which needs no inference.
+     */
+    uint32_t none_arg_mask = ~0u;
+
+    /* An argument whose SHAPE cannot evaluate to none: a non-none literal,
+     * an operator chain (arithmetic, comparison, logical, bitwise and
+     * unary operators yield a value or throw - never none), a typed
+     * scalar, an inc-dec, a function literal. */
+    static bool arg_never_none(const Construct *e)
+    {
+        const ConstructType c = ctag(e);
+        switch (c) {
+        case ConstructType::lit_int: case ConstructType::lit_bool:
+        case ConstructType::lit_float: case ConstructType::lit_str:
+        case ConstructType::lit_arr: case ConstructType::lit_obj:
+        case ConstructType::lit_dict:
+        case ConstructType::typed_scalar: case ConstructType::incdec:
+        case ConstructType::func_decl:
+            return true;
+        default:
+            return is_multiop_ct(c);
+        }
+    }
+
+    /* some argument may bind none to a non-opt parameter: its mask bit is
+     * set and its shape does not rule none out */
+    bool may_bind_none() const {
+        const size_t n = args ? args->elems.size() : 0;
+        for (size_t i = 0; i < n; i++)
+            if ((i >= 32 || ((none_arg_mask >> i) & 1u))
+                    && !arg_never_none(args->elems[i].get()))
+                return true;
+        return false;
+    }
+
     CallExpr() : Construct("CallExpr", false, ConstructType::call) { }
     explicit CallExpr(const char *name)
         : Construct(name, false, ConstructType::call) { }
@@ -1002,6 +1053,7 @@ public:
         d.vm_dyn_callee = vm_dyn_callee;
         d.tq_folded = tq_folded;
         d.callable_arg_mask = callable_arg_mask;
+        d.none_arg_mask = none_arg_mask;
     }
 
     unique_ptr<Construct> clone() const override {

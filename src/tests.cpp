@@ -1395,6 +1395,58 @@ static const std::vector<test> tests =
         "for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); s = s + f2(z, i); }",
         "print(s);" },
       &typeid(TypeErrorEx), 69, 4, 71, 4 },
+    /*
+     * RULE 1: A NONE INTO A PARAMETER THAT IS NOT `opt` IS REFUSED BY THE
+     * BIND, with that argument's caret - the same call-site stamp as a
+     * coercion (Exception::bind_arg), in every engine and for every call
+     * shape, typed or not. A `dyn` holding none is non-opt by type, so the
+     * static check cannot see it; the VM's call ops are preceded by
+     * CheckNoneArgsV where an argument may hold none, the dyn-callee op and
+     * the callback paths check in C++, and the tree-walker's bind_param
+     * refuses it before any coercion. Warmed, like the cases above, so the
+     * emitted code's exception path is the one exercised under the JIT.
+     */
+    { "err loc: a NONE into a non-opt param of a CLOSURE marks the argument",
+      { "func mk2(int z) { return func [z] (int a, int b) "
+        "{ return a + b + z; }; }",
+        "var f2 = mk2(1);",
+        "var dyn z = 0; z = runtime(none); var s = 0;",
+        "for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); "
+        "s = s + f2(i, z); }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 72, 4, 74, 4 },
+    { "err loc: a NONE into an UNTYPED param of a named function marks the "
+      "argument (the first of two)",
+      { "func fu(a, b) { var t = 0; for (var j = 0; j < 3; j++) "
+        "t = t + j; return t; }",
+        "var dyn x = 0; x = runtime(none); var s = 0;",
+        "for (var i = 0; i < runtime(3); i++) { s = s + fu(i, i); "
+        "s = s + fu(x, i); }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 69, 3, 71, 3 },
+    { "err loc: a NONE through a DYN callee marks the argument",
+      { "func g(int a, b) { return a; }",
+        "var dyn h = runtime(g); var dyn x = 0; x = runtime(none); var s = 0;",
+        "for (var i = 0; i < runtime(3); i++) { s = s + h(i, i); "
+        "s = s + h(i, x); }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 70, 3, 72, 3 },
+    { "err loc: a NONE into a STRUCT param marks the argument",
+      { "struct P { int x; }",
+        "func px(P p) { return p.x; }",
+        "var dyn q = P(1); var s = 0;",
+        "for (var i = 0; i < runtime(3); i++) { s = s + px(q); "
+        "if (i == 1) { q = runtime(none); } }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 51, 4, 53, 4 },
+    /* a callback's none, like its coercion, keeps the builtin call's
+     * argument-list caret */
+    { "err loc: a NONE element into a CALLBACK's non-opt param keeps the "
+      "builtin call's argument-list caret",
+      { "var dyn holes = runtime([3, none, 1]);",
+        "var dyn m = map(func (int x) { return x * 2; }, holes);",
+        "print(m);" },
+      &typeid(TypeErrorEx), 17, 2, 55, 2 },
     /* the coercion's OTHER throw: a declared `float` parameter refusing a
      * non-numeric dyn value (the int/bool widening is the only other arm) */
     { "err loc: a FLOAT parameter's bind coercion marks the failing argument",
@@ -19033,7 +19085,10 @@ inliner_fixpoint_collapses_chain()
         "func g(x) => x + c;",
         "var n = 1;",
         "n = 10;",
-        "assert(h(n) == 19);",             /* ((10+1)*2)-3 = 19 */
+        /* `n + 0`, not `n`: with no inference a bare variable may hold
+         * none, which h's bind refuses (RULE 1) - so the inliner keeps
+         * such a call a call; an operator chain can never be none */
+        "assert(h(n + 0) == 19);",         /* ((10+1)*2)-3 = 19 */
     };
 
     unique_ptr<Construct> on = parse_lines(src);
@@ -19115,7 +19170,10 @@ static bool
 inliner_tail_inlines_block_body()
 {
     const std::vector<const char *> src = {
-        "func helper(a, b) {",
+        /* `opt`: with no inference the caller's locals may hold none,
+         * which a non-opt parameter's bind refuses (RULE 1) - and the
+         * inliner keeps such a call a call */
+        "func helper(opt a, opt b) {",
         "    var t = a + 100;",       /* writes a fresh local */
         "    return t + b;",          /* reads arg b (caller's c2) afterward */
         "}",
@@ -34196,6 +34254,10 @@ static bool opcode_table_census()
           "d1: its helper arm CONVEYS an image's refused operand" },
         { OpCode::UnpackLenCheck,        1,1,1,0,0,0,
           "d1: its cold tier CONVEYS the strict unpack TypeErrorEx" },
+        { OpCode::CheckNoneArgsV,        1,1,1,0,0,1,
+          "RULE 1: d1 - a refusal CONVEYS, stamped with the argument's "
+          "caret; b1 - a nested call's check rides the bytecode inlining "
+          "of its caller's callee with the call it guards" },
     };
     const size_t nrows = sizeof(rows) / sizeof(rows[0]);
     const Chunk ck;      /* empty - census_instr never makes a shape
@@ -35493,14 +35555,22 @@ static bool jit_frameless_w2_shape()
         d2 = native_dump_of({
             "func mk(int z) { return func [z] (int k) { return k * z; }; }",
             "var fi = mk(3);",
+            /* the dyn source is a PARAMETER of the caller, not a local:
+             * a dyn local may hold none, so its call is preceded by
+             * CheckNoneArgsV, which reads the STAGED argument (RULE 1)
+             * and so keeps the staging move this case pins as fused; a
+             * parameter that is not `opt` and never written cannot hold
+             * none (its own bind refused it), so its call needs no check.
+             * Rendered `r0`: the dump names locals, not parameters. */
+            "func run(dyn v, int n) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < n; i++) s = s + fi(v);",
+            "  return s;",
+            "}",
             /* written twice: a write-once `dyn` initialised with a
-             * literal is auto-const-promoted and the argument becomes
-             * a LoadConstV into the run (shape-eater #6) */
+             * literal is auto-const-promoted (shape-eater #6) */
             "var dyn a = 0; a = runtime(5);",
-            "var N = int(runtime(40));",
-            "var s = 0;",
-            "for (var i = 0; i < N; i++) s = s + fi(a);",
-            "print(s);" });
+            "print(run(a, int(runtime(40))));" });
     } catch (Exception &e) {
         fprintf(stderr, "jit_frameless_w2_shape: threw %s: %s\n", e.name,
                 e.msg);
@@ -35694,28 +35764,29 @@ static bool jit_frameless_w2_shape()
                     "call <helper>" }, "W2 site scale_it(i)") && ok;
     }
     {
-        /* fi(a), `a` dyn: the dispatch on the source's own type word */
-        const std::vector<NativeIns> m2 = native_ins_of(d2, "main");
+        /* fi(v), `v` a dyn parameter: the dispatch on the source's own
+         * type word */
+        const std::vector<NativeIns> m2 = native_ins_of(d2, "func run");
         const size_t at = native_find(m2, 0, "sub rsp, 144");
         ok = at != std::string::npos
              && native_expect(m2, at, {
                     "sub rsp, 144",
                     "mov r10, rsp",
-                    "cmp a.type, <int-tag>@r11", /* exact? */
+                    "cmp r0.type, <int-tag>@r11", /* exact? */
                     "je +*",
-                    /* REGCALL 1A: `k` is an int parameter, so `a` goes
+                    /* REGCALL 1A: `k` is an int parameter, so `v` goes
                      * in RDI - an int or a bool (its payload IS the int)
-                     * binds, anything else (none included) declines */
-                    "cmp a.type, <addr>@r11",    /* bool? */
-                    "jne +*" }, "W2 site fi(dyn a)") && ok;
-        if (native_find(m2, 0, "mov rdi, a") == std::string::npos) {
-            fprintf(stderr, "jit_frameless_w2_shape: fi(dyn a) does not "
-                            "load `a` into rdi (REGCALL 1A)\n");
+                     * binds, anything else declines */
+                    "cmp r0.type, <addr>@r11",    /* bool? */
+                    "jne +*" }, "W2 site fi(dyn v)") && ok;
+        if (native_find(m2, 0, "mov rdi, r0") == std::string::npos) {
+            fprintf(stderr, "jit_frameless_w2_shape: fi(dyn v) does not "
+                            "load `v` into rdi (REGCALL 1A)\n");
             ok = false;
         }
-        if (!native_mark_empty(d2, "main", "= a")) {
+        if (!native_mark_empty(d2, "func run", "= r0")) {
             fprintf(stderr, "jit_frameless_w2_shape: the staging move of "
-                            "`a` still emits code\n");
+                            "`v` still emits code\n");
             ok = false;
         }
     }
@@ -37752,17 +37823,23 @@ static bool jit_frameless_call_reach()
          * did exactly that. (A statically typed float into an int
          * parameter is refused at COMPILE time, so the fill's float-pin
          * narrowing arm is unreachable from a program; a `dyn` float is
-         * the runtime shape.) */
+         * the runtime shape. It is a PARAMETER of the caller: a dyn
+         * LOCAL may hold none, so its call carries CheckNoneArgsV, which
+         * reads the staged argument - the move is then not fused and
+         * there is nothing to materialise (RULE 1).) */
         { "W2: a dyn FLOAT into an int param declines the fill's memory "
           "dispatch to the C++ tier, which raises - the run materialised "
           "first (backtrace + message parity; a stale run would bind the "
           "previous iteration's int and not raise)", {
             "func mk(int z) { return func [z] (int k) { return k * z; }; }",
             "var fi = mk(3);",
-            "var dyn t = 0.5; var s = 0;",
-            "for (var i = 0; i < runtime(4); i++) {",
-            "  s = s + fi(i); print(s, s); t = t + 1.0; s = s + fi(t); }",
-            "print(s);" }, "", 1, true },
+            "func go(dyn t) {",
+            "  var s = 0;",
+            "  for (var i = 0; i < runtime(4); i++) {",
+            "    s = s + fi(i); print(s, s); s = s + fi(t); }",
+            "  return s;",
+            "}",
+            "print(go(runtime(0.5)));" }, "", 1, true },
         { "W2: a PINNED int into an UN-ANNOTATED (ref-listed) parameter "
           "binds from the register - the memory path read the pin's "
           "STALE slot (found by corpus_diff on 24_capture_scalar: the "
@@ -49315,6 +49392,21 @@ static bool jit_op_nativized()
             "  return r;",
             "}",
             "assert(f(runtime(5), 3) == 6);" } },
+        /* CheckNoneArgsV's throw (RULE 1): a `dyn` argument holding none
+         * meets a parameter not declared `opt` - the bind refuses it
+         * before the callee runs (script-caught). */
+        { OpCode::CheckNoneArgsV, {
+            "func g(int x) { var y = x * 2; return y + 1; }",
+            "func f(int n) {",
+            "  var dyn v = runtime(none);",
+            "  var r = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    try { var q = g(v); r += 1; }",
+            "    catch (TypeErrorEx) { r += 2; }",
+            "  }",
+            "  return r;",
+            "}",
+            "assert(f(3) == 6);" } },
         /* CheckFuncV's throw: a dyn non-func arg0 raises BEFORE arg1's
          * code runs, with arg0's caret (script-caught). */
         { OpCode::CheckFuncV, {

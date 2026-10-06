@@ -1578,28 +1578,65 @@ fallback, so the generic dyn-callee op, whose `CallSite` carries its own arg
 carets, keeps stamping downstream), and the JIT bakes it in `emit_exc_stamp`'s
 args form on the sync slow tail and the direct-call failure branch.
 
-**`Chunk::arg_locs` + `arg_loc_pool` — the user CALL ops' THIRD caret (RULE
-2 refined, 2026-09-20).** A BIND COERCION carets the FAILING ARGUMENT alone
-(`f2(i, z)` with a string in `z` underlines `z`, not `i, z`): the bind that
-rejected the value recorded the parameter index in `Exception::bind_arg`
-(set only by a CALL-SITE bind — never a builtin callback's, never an
-assignment's coercion), and the site turns it into that argument's own
-span. `locs` holds the whole call and `base_locs` the list, so a third
-pc-keyed table carries one span per argument: `arg_locs` names a run
-`[first, first + n)` of the flat `arg_loc_pool`, recorded by
+**`Chunk::arg_locs` + `arg_loc_pool` — the user CALL ops' THIRD caret
+(RULE 2 refined, 2026-09-20).** A BIND COERCION carets the FAILING
+ARGUMENT alone (`f2(i, z)` with a string in `z` underlines `z`, not `i, z`):
+the bind that rejected the value recorded the parameter index in
+`Exception::bind_arg` (set only by a CALL-SITE bind — never a builtin
+callback's, never an assignment's coercion), and the site turns it into
+that argument's own span. `locs` holds the whole call and `base_locs` the
+list, so a third pc-keyed table carries one span per argument: `arg_locs`
+names a run `[first, first + n)` of the flat `arg_loc_pool`, recorded by
 `extract_locs` off the same ExprList node the list caret comes from, only
-for `CallV`/`CachedCallV`/`CallValueV` (the generic dyn-callee op selects
-from its own `CallSite::args`). An argument with no span of its own (a
-const-folded literal) takes the list's, in every engine. Read by
-`vm_stamp_setup_caret` (`arg_loc_at(pc, bind_arg)` first, then the list)
-and by the JIT's `emit_exc_stamp` args form, which bakes `&pool[first]`
-and SELECTS AT RUN TIME on the exception's `bind_arg` — emitted only
-where the site's callee can coerce (`jit_site_may_coerce`). Rides both
-JIT pc remaps and the splice like the other two; bounded by
-`verify_chunk`; serialized after `base_locs` as myv **v16** (section
-9.21); printed by `-vd` with both ends of every span. An arity error
-(about the list) keeps `base_locs`' span. Record: docs/jit-optimizations.md,
-*RULE 2, refined*.
+for `CallV`/`CachedCallV`/`CallValueV` and the `CheckNoneArgsV` before one
+(the generic dyn-callee op selects from its own `CallSite::args`). An
+argument with no span of its own (a const-folded literal) takes the
+list's, in every engine. Read by `vm_stamp_setup_caret`
+(`arg_loc_at(pc, bind_arg)` first, then the list) and by the JIT's
+`emit_exc_stamp` args form, which bakes `&pool[first]` and SELECTS AT RUN TIME on the
+exception's `bind_arg` — emitted only where the site's callee can coerce
+(`jit_site_may_coerce`). Rides both JIT pc remaps and the splice like the
+other two; bounded by `verify_chunk`; serialized after `base_locs` as myv
+**v16** (section 9.21); printed by `-vd` with both ends of every span. An
+arity error (about the list) keeps `base_locs`' span. Record:
+docs/jit-optimizations.md, *RULE 2, refined*.
+
+**`CheckNoneArgsV kind, callee, run` — a non-opt parameter never holds
+none (RULE 1, 2026-10-05).** The static check refuses an `opt` argument to
+a parameter that is not `opt`, but a `dyn` value is non-opt by type and may
+hold none at run time - so the BIND refuses it (`TypeErrorEx`, the
+parameter named), before the callee's body runs. The tree-walker's
+`bind_param` checks first thing; the generic dyn-callee op
+(`CallValueGenericV`, interpreted and `jit_call_value_generic`) and the
+callback invoker (`VmInvoker::invoke`, `vm_try_invoke`) call
+`check_none_bind` (eval.h) before their bind. The other call ops -
+`CallV`, `CachedCallV`, `CallValueV` - are NOT touched: their many native
+tiers (the emitted push, frameless sites, REGCALL, the bytecode inliner's
+paste) bind raw. Instead codegen emits `CheckNoneArgsV` right after the
+argument run is staged and before the call, ONLY where
+`CallExpr::may_bind_none()` holds: some argument's static type allows none
+(`opt`, `dyn`, unresolved - `CallExpr::none_arg_mask`, stamped by the
+inferencer), its shape does not rule it out (a literal, an operator chain:
+`arg_never_none`), and it does not reach a parameter the inferencer KNOWS
+is `opt`, nor name a parameter of the enclosing function that is not `opt`
+and never written (its own bind already refused a none). A statically
+proven call gets no op and pays nothing. The op reads the RUNTIME callee -
+`target` is its kind (0 = frame slot `target2`, 1 = global slot `target2`,
+as CallV's), `a`/`b` the run's base and count - and refuses the first none
+bound to a non-opt parameter of a FuncObject callee (anything else is the
+call's own error to raise, and an arity mismatch is left to the call too:
+`check_none_bind` walks the binds in order and stops at the first
+coercion that would throw, so the error the call would raise first wins).
+It records the call's three carets (`locs`, `base_locs`, `arg_locs`) and
+stamps through `vm_stamp_setup_caret`; the JIT runs `jit_check_none_args`
+and selects the argument's span at run time (`emit_exc_stamp`'s args form).
+It is fully native (conveys, never bails), so a frameless body may hold
+one, and the bytecode inliner carries it with the call it guards (it
+remaps `a` and a kind-0 `target2`). Its cost is the staging moves: argfuse
+and the inliner's step 1 scan back from the call over `MoveV`s only, so a
+checked call stages its arguments in memory. The AST inliner keeps such a
+call a call (`Inliner::binds_none`): pasted, nothing would bind it. myv
+**v29** (the op is APPENDED).
 
 **`Chunk::op_locs` — a COMPOUND store's OPERATION caret (RULE 2,
 2026-09-25).** `lv OP= rhs` (and `lv++`) fails in two places, and the

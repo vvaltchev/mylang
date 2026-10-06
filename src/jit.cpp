@@ -8022,6 +8022,11 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::CheckFuncV:
     case OpCode::MapFilterV:
         return true;
+    /* RULE 1: CheckNoneArgsV - jit_check_none_args reads the callee and
+     * the argument run; a refusal conveys, exc-stamped with the
+     * argument's caret (arg_locs). No bail -> op_fully_native too. */
+    case OpCode::CheckNoneArgsV:
+        return true;
     /* The dyn-callee generic call pair - the LAST formerly-boxed sequential
      * ops. CheckCallableV conveys a loc-less NotCallableEx (exc-stamped
      * with the callee caret -> deletable); CallValueGenericV runs the full
@@ -18041,6 +18046,14 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
     case OpCode::CheckCallableV:
         v.bad(in.a_slot());            /* a func-value slot - never int */
         break;
+    case OpCode::CheckNoneArgsV:
+        /* the helper reads the argument run (and a kind-0 callee) from
+         * MEMORY, as the call that follows does - the CallV rule */
+        for (int_type k = 0; k < in.b_lit(); k++)
+            v.bad(static_cast<int>(in.a_lit() + k));
+        if (in.target == 0)
+            v.bad(in.target2);
+        break;
     case OpCode::BinOpV:
     case OpCode::CmpV:
     case OpCode::LogV:
@@ -27448,13 +27461,44 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.mov_imm(R8,
                   (static_cast<uint64_t>(static_cast<uint32_t>(mls.line))
                    << 32) | static_cast<uint32_t>(mls.col));
+        e.mov_imm(R9,                        /* the container caret's end */
+                  (static_cast<uint64_t>(static_cast<uint32_t>(mle.line))
+                   << 32) | static_cast<uint32_t>(mle.col));
         e.call_direct(jit_map_filter);
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
         const size_t j_ok_mf = e.j8(0x74);
-            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
+        /* collapse-safe (#56); a loc-less conveyance - a callback's bind -
+         * takes the argument list (base_locs), as the interpreted op does */
+        emit_exc_stamp(e, ck, old_pc, /*args_caret=*/true,
+                       /*arg_select=*/false);
         e.exit_pc(pc);
         e.patch8(j_ok_mf, e.pos());
+        return true;
+    }
+
+    case OpCode::CheckNoneArgsV: {
+        /* RULE 1: jit_check_none_args(kind, callee, argbase, nargs) -
+         * rdi = the callee's kind (target: 0 frame, 1 global), rsi = its
+         * slot (target2), rdx = the run base, rcx = the count. A refusal
+         * conveys a loc-less TypeErrorEx carrying bind_arg -> the stamp
+         * selects that argument's span, as a call's bind refusal does. */
+        emit_call_prologue(e);
+        e.mov_imm(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target)));
+        e.mov_imm(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target2)));
+        e.mov_imm(RDX, static_cast<uint64_t>(in.a_lit()));
+        e.mov_imm(RCX, static_cast<uint64_t>(in.b_lit()));
+        e.call_direct(jit_check_none_args);
+        emit_call_epilogue(e);
+        e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
+        /* near: the per-argument select makes the stamp long */
+        const size_t j_ok_cn = e.j32(0x74);
+        emit_exc_stamp(e, ck, old_pc, /*args_caret=*/true,
+                       /*arg_select=*/true);
+        e.exit_pc(pc);
+        e.patch32_here(j_ok_cn);
         return true;
     }
 
@@ -29563,6 +29607,7 @@ static bool op_fully_native(const Instr &in)
      * bail in any of them. */
     case OpCode::MultiUnpackV:
     case OpCode::CheckFuncV:
+    case OpCode::CheckNoneArgsV:    /* RULE 1: conveys, exc-stamped */
     case OpCode::MapFilterV:
     case OpCode::LoadMemberInt:
     case OpCode::LoadMemberFloat:

@@ -2188,6 +2188,15 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                            static_cast<int>(in.b_lit() & 0xfff))
                 << "   ; runtime dispatch, site [" << (in.b_lit() >> 12) << "]";
             break;
+        case OpCode::CheckNoneArgsV:
+            /* RULE 1: the next call's callee (g<n> = a global slot, as
+             * call.v shows it) and its argument run */
+            row << "check.none   "
+                << (in.target == 0 ? D(in.target2)
+                                   : "g" + std::to_string(in.target2))
+                << arglist(chunk, in.a_lit(), in.b_lit())
+                << "  ; throw if none meets a non-opt parameter";
+            break;
         case OpCode::CheckCallableV:
             row << "check.call   " << RI(in.a(), false)
                 << "  ; throw if not callable";

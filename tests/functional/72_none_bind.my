@@ -1,0 +1,131 @@
+# RULE 1: a parameter that is not `opt` never holds none - the BIND refuses
+# a none with a TypeErrorEx naming the parameter, before the callee's body
+# runs, in every engine. The static check refuses an `opt` argument, but a
+# `dyn` value is non-opt by type and may still hold none at run time (a
+# dyn callee, a dyn container's element, runtime(none)); until 2026-10-05
+# such a none was bound, and `func g(int x) { var y = x * 2; ... }` then
+# raised late at `x * 2` in the tree-walker, aborted the VM's state checker
+# and printed a number under the JIT. Each shape below is a distinct bind
+# path: a direct call, a value call, a dyn callee, a closure, a builtin's
+# callback, a typed / untyped / dyn / struct / array parameter - and an
+# `opt` one, which takes none.
+
+struct P { int x; }
+
+var bad = 0;
+var ran = 0;                    # bumped by every body the bind lets in
+var trail = [];                 # the argument-order log (below)
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad = bad + 1;
+    }
+}
+
+# "refused" when the call raised TypeErrorEx and no body ran
+func refused(dyn f) {
+    var before = ran;
+    try {
+        f();
+    } catch (TypeErrorEx) {
+        return ran == before ? "refused" : "refused late";
+    }
+    return "accepted";
+}
+
+var dyn nothing = runtime(none);
+
+func ti(int x) { ran = ran + 1; var y = x * 2; return y + 1; }
+func tf(float x) { ran = ran + 1; return x * 0.5; }
+func ts(str s) { ran = ran + 1; return s + "!"; }
+func tp(P p) { ran = ran + 1; return p.x; }
+func ta(array<int> a) { ran = ran + 1; return len(a); }
+func tu(a, b) { ran = ran + 1; return 1; }
+func td(dyn d) { ran = ran + 1; return 2; }
+func to(opt int x, opt dyn y, z?) {
+    ran = ran + 1;
+    return x == none && y == none && z == none;
+}
+
+# --- direct calls: the argument is a dyn holding none
+want("int param", refused(func () { ti(nothing); }), "refused");
+want("float param", refused(func () { tf(nothing); }), "refused");
+want("str param", refused(func () { ts(nothing); }), "refused");
+want("struct param", refused(func () { tp(nothing); }), "refused");
+want("array param", refused(func () { ta(nothing); }), "refused");
+want("untyped param", refused(func () { tu(1, nothing); }), "refused");
+want("dyn param", refused(func () { td(nothing); }), "refused");
+
+# --- a callee the AST inliner would paste (a statement of main, which it
+# walks - a lambda's body is not): pasted, nothing would bind the none and
+# the body would ignore it, or read it as 0 - so such a call stays a call
+func k5(x) => 5;
+func twice(int x) => x + x;
+var got = "accepted";
+try { k5(nothing); } catch (TypeErrorEx) { got = "refused"; }
+want("inlinable, unused param", got, "refused");
+got = "accepted";
+try { var t2 = twice(nothing); } catch (TypeErrorEx) { got = "refused"; }
+want("inlinable, typed param", got, "refused");
+
+# --- opt parameters take none, in every spelling
+var r0 = ran;
+want("opt params", to(nothing, nothing, nothing), true);
+want("opt params ran", ran - r0, 1);
+
+# --- a dyn callee (the generic call), and a value call
+var dyn h = runtime(ti);
+want("dyn callee", refused(func [h] () { h(none); }), "refused");
+var fns = [ti, ti];
+want("value call", refused(func [fns] () { fns[int(runtime(1))](nothing); }),
+     "refused");
+
+# --- a closure, and a factory's closure
+var k = 10;
+var addk = func [k] (int x) { ran = ran + 1; return x + k; };
+want("closure", refused(func [addk] () { addk(nothing); }), "refused");
+func mk(int z) { return func [z] (int x) { ran = ran + 1; return x * z; }; }
+var mul3 = mk(3);
+want("factory closure", refused(func [mul3] () { mul3(nothing); }), "refused");
+
+# --- builtin callbacks: an element that is none
+var dyn holes = runtime([3, none, 1]);
+want("map", refused(func [holes] () {
+    var dyn m = map(func (int x) { ran = ran + 1; return x * 2; }, holes); }),
+     "refused late");           # the first element's call ran
+want("filter", refused(func [holes] () {
+    var dyn m = filter(func (x) { ran = ran + 1; return x > 1; }, holes); }),
+     "refused late");
+want("sort", refused(func [holes] () {
+    sort(holes, func (int a, int b) { ran = ran + 1; return a < b; }); }),
+     "refused");                # the first comparison holds the none
+var dyn nkeys = runtime([none]);
+want("make_dict", refused(func [nkeys] () {
+    var dyn d = make_dict(nkeys, func (k) { ran = ran + 1; return 1; }); }),
+     "refused");
+want("sum", refused(func [holes] () {
+    var dyn s = sum(holes, func (int x) { ran = ran + 1; return x; }); }),
+     "refused late");
+want("find", refused(func [holes] () {
+    var dyn i = find(holes, 7, func (int x) { ran = ran + 1; return x; }); }),
+     "refused late");
+
+# --- every argument is evaluated first, left to right; the refusal comes
+# at the bind, after a later argument's side effect (the tree-walker used
+# to evaluate each argument just before its own bind, so `b` never ran)
+func note(str s) { append(trail, s); return runtime(none); }
+want("after the arguments", refused(func () { tu(note("a"), note("b")); }),
+     "refused");
+want("argument order", trail, ["a", "b"]);
+
+# --- a none caught, then the same call with a value: the site still works
+var ok = 0;
+for (var i = 0; i < 4; i++) {
+    var dyn v = runtime(i == 2 ? none : i);
+    try { ok = ok + ti(v); } catch (TypeErrorEx) { ok = ok + 100; }
+}
+want("loop", ok, 1 + 3 + 100 + 7);
+
+print("none bind: " + str(bad) + " failure(s)");
+assert(bad == 0);

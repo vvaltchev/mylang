@@ -2,8 +2,19 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 28.  This document describes the on-disk image exhaustively:
+Format version 29.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v29 changes no encoding: one opcode was APPENDED - CheckNoneArgsV, which
+stands before a call whose argument may hold `none` and refuses a `none`
+bound to a parameter not declared `opt` - so a v28 binary would meet an
+opcode it does not know; see the note on version 10 below.  Its `target`
+is the callee's KIND, not an index: 0 = `target2` is a frame slot, 1 =
+`target2` is a global-table slot (as CallV's); the verifier refuses any
+other kind.  `a` and `b` are literals, the argument run's base slot and
+its count, bounded like a call's run.  Its carets are the call's: a loc
+table entry, a base_locs entry (the argument list) and an arg_locs entry
+(one span per argument).)
 
 (v28 adds two locs to every IncDecSite record (section 9.6): `bstart` and
 `bend`, the caret of the inc-dec's base.  The member form's "Expected dict
@@ -1229,7 +1240,10 @@ An OUT-OF-RANGE one is not harmless, which is what the bound is for.
 A user call op (`CallV`, `CachedCallV`, `CallValueV`) has THREE error
 spans: the whole call (`locs`), its argument list (`base_locs`, for an
 arity error) and, for a BIND COERCION - a declared `int`/`float`
-parameter refusing a `dyn` value - the ONE ARGUMENT that was rejected
+parameter refusing a `dyn` value, or (v29) any parameter not declared
+`opt` refusing a `none`, which a `CheckNoneArgsV` standing before the
+call raises and so records the call's three spans as its own - the ONE
+ARGUMENT that was rejected
 (section 9.20's sibling in shape: pc-keyed, sparse, read only on a throw
 path).  The tree-walker carets that argument's own expression, so the VM
 and the JIT must be able to name it too; the bind records the parameter

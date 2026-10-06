@@ -597,6 +597,59 @@ EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float,
  * (funcdesc.h). Every site that needs either calls this. */
 void compute_bind_flags(const FuncDescriptor *d);
 
+/*
+ * RULE 1 (2026-10-05): a parameter not declared `opt` never holds `none`
+ * (README, "A none the compiler cannot see is refused at the call"), so a
+ * bind REFUSES it - a TypeErrorEx, like a
+ * bind coercion's, naming the argument (`site_arg`: the call-site
+ * argument index, carried as Exception::bind_arg; -1 for a builtin
+ * CALLBACK, whose parameter names no argument of the builtin call).
+ * Static checking covers an `opt` argument; a `dyn` one is non-opt by
+ * type and may still hold none, so the binds a dyn value can reach check
+ * at run time: the tree-walker's bind_param (every bind), CheckNoneArgsV
+ * before the VM's three call ops where codegen could not prove the
+ * arguments (CallExpr::may_bind_none), the generic dyn-callee call and
+ * the callback binds (always - slow paths already).
+ */
+[[noreturn]] void throw_none_bind(const UniqueId *param, int site_arg);
+
+/* would bind_param's numeric coercion throw for `v`? (`none` aside) */
+inline bool bind_coerce_throws(DeclType dt, const EvalValue &v)
+{
+    if (dt == DeclType::f)
+        return !v.is<float_type>() && !v.is<int_type>() && !v.is<bool>();
+    if (dt == DeclType::i)
+        return !v.is<int_type>() && !v.is<bool>();
+    return false;
+}
+
+/*
+ * The VM's pre-bind check: argument i is `arg_at(i)`. Walks the arguments
+ * in PARAMETER order and stops exactly where the bind itself would raise
+ * first - an arity mismatch, or a numeric coercion that throws - so the
+ * error a site raises is the one the tree-walker's bind_param raises at
+ * the same argument, whatever mix of faults the call has.
+ */
+template <class ArgAt>
+inline void check_none_bind(const FuncDescriptor *d, size_t n, ArgAt arg_at,
+                            bool call_site)
+{
+    if (n > d->params.size() || n < static_cast<size_t>(d->min_args))
+        return;                         /* the bind's arity error first */
+    for (size_t i = 0; i < n; i++) {
+        const FuncDescriptor::ParamDesc &p = d->params[i];
+        const EvalValue &v = arg_at(i);
+        if (v.is<NoneVal>()) {
+            if (!p.opt)
+                throw_none_bind(p.name,
+                                call_site ? static_cast<int>(i) : -1);
+            continue;
+        }
+        if (bind_coerce_throws(p.decl_type, v))
+            return;                     /* the bind's coercion error first */
+    }
+}
+
 /* The never-throwing append core (arr.cpp.h) shared by builtin_append and
  * the VM's AppendV: true = appended (flat or general, hash maintained);
  * false = take the full builtin path (errors/odd shapes, proper carets). */

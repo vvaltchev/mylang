@@ -5837,6 +5837,25 @@ payoff.
   to restructure exactly that line; pinned by
   `tests/functional/62_eval_order.my` (an event log - a value assertion
   cannot see a reorder).
+- **⛔ A PARAMETER THAT IS NOT `opt` NEVER HOLDS `none` - THE BIND
+  REFUSES IT (RULE 1, 2026-10-05).** The static check refuses an `opt`
+  argument, but a `dyn` value is non-opt by type and may hold none at run
+  time, so every bind path checks: the tree-walker's `bind_param` (first
+  thing, before the coercion; and `do_func_bind_params` now EVALUATES
+  EVERY ARGUMENT before the arity check and the binds, as the VM's staged
+  run always did - it used to evaluate each argument just before its own
+  bind, so a refusal skipped a later argument's side effect); the generic
+  dyn-callee op and the callback invoker (`check_none_bind`, eval.h); and
+  for `CallV`/`CachedCallV`/`CallValueV`, whose native tiers bind raw, a
+  `CheckNoneArgsV` that codegen emits before the call ONLY where
+  `CallExpr::may_bind_none()` holds (docs/vm-ops.md has the rules). The
+  AST inliner keeps such a call a call (`Inliner::binds_none`). **Two
+  facts other passes may lean on:** a non-opt parameter never written in
+  its body cannot hold none (the inferencer's mask and the inliner clear
+  such an argument), and an operator chain or a non-none literal cannot
+  evaluate to none (`CallExpr::arg_never_none`). A new bind path must
+  call `check_none_bind` or sit behind the op; a new call op that binds
+  raw must be preceded by it.
 - **⛔ `&&` / `||` SHORT-CIRCUIT — in THREE places that must agree (#138,
   2026-08-09).** The determining operand (false for `&&`, true for `||`) stops
   the chain: the rest is not evaluated, so its side effects do not happen and

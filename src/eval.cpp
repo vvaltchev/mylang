@@ -475,6 +475,16 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt,
  * `sort(a, func(int x, int y) ...)` over a dyn string carets sort's whole
  * argument list in every engine, and must keep doing so).
  */
+/* RULE 1: binding none to a parameter not declared `opt` (eval.h) */
+void throw_none_bind(const UniqueId *param, int site_arg)
+{
+    TypeErrorEx ex(intern_msg(
+        "parameter '" + std::string(param ? param->val : "?")
+        + "' is not 'opt' and cannot be none"));
+    ex.bind_arg = site_arg;
+    throw ex;
+}
+
 static inline void
 bind_param(EvalContext *args_ctx,
            Frame *frame,
@@ -484,6 +494,11 @@ bind_param(EvalContext *args_ctx,
            bool is_const,
            int site_arg)
 {
+    /* RULE 1: a non-opt parameter never holds none - refused here, at the
+     * bind, before any coercion (the VM's check_none_bind walks the same
+     * order). An omitted trailing parameter is `opt` by construction. */
+    if (!param.opt && val.is<NoneVal>())
+        throw_none_bind(param.name, site_arg);
     if (param.decl_type == DeclType::f || param.decl_type == DeclType::i)
         val = coerce_to_decl_type(val, param.decl_type, site_arg);
 
@@ -512,8 +527,29 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     Frame *frame,
                     size_t min_args)   /* precomputed: FuncDescriptor::min_args */
 {
+    /*
+     * RULE 2: EVERY argument is evaluated, left to right, before the arity
+     * check and before any bind - the order the VM's call ops have (the
+     * argument run is staged before the call op runs). This loop used to
+     * check the arity first and evaluate each argument just before ITS
+     * bind, so a later argument's side effect was skipped when an arity
+     * error or an earlier bind refused - a difference only the tree-walker
+     * had. The values live in a small inline buffer: no allocation for a
+     * call of up to 8 arguments.
+     */
+    const size_t nargs = args.size();
+    EvalValue small[8];
+    std::vector<EvalValue> big;
+    EvalValue *vals = small;
+    if (nargs > 8) {
+        big.resize(nargs);
+        vals = big.data();
+    }
+    for (size_t i = 0; i < nargs; i++)
+        vals[i] = RValue(args[i]->eval(ctx));
+
     const size_t nparams = funcParams.size();
-    if (args.size() > nparams || args.size() < min_args)
+    if (nargs > nparams || nargs < min_args)
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < nparams; i++) {
@@ -526,7 +562,7 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
         bind_param(
             args_ctx, frame, static_cast<int>(i),
             funcParams[i],
-            i < args.size() ? RValue(args[i]->eval(ctx)) : EvalValue(),
+            i < nargs ? std::move(vals[i]) : EvalValue(),
             funcParams[i].cnst,
             static_cast<int>(i)              /* a call-site bind */
         );
