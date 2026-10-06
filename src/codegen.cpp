@@ -5532,10 +5532,8 @@ struct Codegen {
      * inside-out), pools the steps + tier/flags/carets in `incdec_chains`, and
      * emits ONE IncDecChainV. The runtime walk + final-step semantics
      * (vm_incdec_final) mirror IncDecExpr::do_eval's tiers byte-identically -
-     * including the AST-shape-dependent flat/POD gates (`allow_flat`/
-     * `allow_pod` = no_side_effects(final base), try_flat/try_pod's own gate)
-     * and a compiled RVALUE root's rvalue-ness (kind 3 seeds the walk with a
-     * VALUE, so `mk()[0]++` still throws NotLValueEx).
+     * including a compiled RVALUE root's rvalue-ness (kind 3 seeds the walk
+     * with a VALUE, so `mk()[0]++` still throws NotLValueEx).
      */
     bool try_incdec_chain(const IncDecExpr *inc, int &out_slot,
                           std::vector<CgInstr> &ops)
@@ -5601,19 +5599,15 @@ struct Codegen {
             }
         }
 
-        /* The site: tier + the AST-shape flat/POD gates + carets. */
+        /* The site: tier + carets. */
         Chunk::IncDecChain site;
         const Construct *fin = chain[0];        /* outermost == final step */
         site.tier2 = inc->th == TypeHint::i || inc->th == TypeHint::f;
         site.is_prefix = inc->is_prefix;
         if (ctag(fin) == ConstructType::subscript) {
             auto *fsub = static_cast<const Subscript *>(fin);
-            site.allow_flat = construct_no_side_effects(fsub->what.get());
             site.kstart = fsub->index->start;
             site.kend = fsub->index->end;
-        } else {
-            auto *fmem = static_cast<const MemberExpr *>(fin);
-            site.allow_pod = construct_no_side_effects(fmem->what.get());
         }
         site.id_start = inc->start;
         site.id_end = inc->end;
@@ -6034,7 +6028,7 @@ struct Codegen {
 
             /* UNIVERSAL store (catch-all): ANY container-slot base -> Store
              * ElemValue, whose vm_subscript_store dispatches at runtime (flat /
-             * general / dict, matching the tree-walker's try_flat->general).
+             * general / dict, matching the tree-walker's subscript_store).
              * Covers a proven GENERAL array, a DYN / captured / unproven base,
              * AND a flat int array with a non-int-compilable index (fell through
              * above). EXCLUDES a proven flat FLOAT array (th==f && base_array),
@@ -6371,7 +6365,7 @@ struct Codegen {
     /*
      * The UNIVERSAL element store: any container-slot base -> StoreElemValue,
      * whose vm_subscript_store dispatches at run time (flat / general / dict,
-     * matching the tree-walker's try_flat -> general). compile_int_stmt's
+     * matching the tree-walker's subscript_store). compile_int_stmt's
      * catch-all, and compile_float_stmt's decline: a proven flat FLOAT
      * element whose value compile_float_expr cannot lower unboxed. That
      * never happens after M8 (the value is a typed node), which is why it

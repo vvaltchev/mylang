@@ -115,9 +115,9 @@ enum class OpCode : unsigned char {
      * the StoreLValueChainV intermediate walk; the FINAL step runs
      * IncDecExpr::do_eval's exact tier semantics (vm_incdec_final,
      * eval.cpp): tier 2 (a proven int/float lvalue) = the compound-store
-     * `±= 1` (flat_store_core when the codegen proved the base
-     * side-effect-free, exactly try_flat's gate; else the general
-     * subscript/member lvalue + slot_rmw) then old = new ∓ 1 derived with
+     * `±= 1` (flat_store_core on a flat array, the byte store on a POD
+     * field, else the general subscript/member lvalue + slot_rmw) then
+     * old = new ∓ 1 derived with
      * NO re-read; tier 3 (dyn) = the checked read-modify-write (NotLValue/
      * const/TypeError at the INC-DEC caret). `target` = the dst slot
      * (-1 = statement, value discarded), `aop` = plus/minus (inc/dec).
@@ -370,12 +370,13 @@ enum class OpCode : unsigned char {
      * = the array slot, `a` = the int index operand, `b` = the value operand,
      * `aop` = the store op (`Op::invalid` = plain assign, else a compound arith
      * op: a[i] = a[i] <aop> v). For a FLAT mutable int/float array it
-     * stores/updates the scalar directly, mirroring try_flat_subscript_store
-     * (bounds, negative wrap, div/mod-by-zero checked BEFORE any clone like the
-     * tree-walker, COW: a slice clones, an aliased non-slice clones its live
-     * slices; then invalidate the hash). A flat BOOL array is handled too (P1),
-     * PLAIN-assign only (`aop == invalid`) - bool has no compound - writing the
-     * value operand's 0/1 to bvec. For a const/read-only / general /
+     * stores/updates the scalar directly, mirroring the tree-walker's
+     * subscript_store (bounds, negative wrap, div/mod-by-zero checked
+     * BEFORE any clone like the tree-walker, COW: a slice clones, an aliased
+     * non-slice clones its live slices; then invalidate the hash). A flat
+     * BOOL array is handled too (P1), PLAIN-assign only (`aop == invalid`)
+     * - bool has no compound - writing the value operand's 0/1 to bvec.
+     * For a const/read-only / general /
      * float-in-StoreElemInt / dyn-laundered base, or a compound on a bool array,
      * it BOXES the already-computed index/value operands and dispatches through
      * the UNIVERSAL vm_subscript_store (the same shared store StoreElemValue /
@@ -411,7 +412,7 @@ enum class OpCode : unsigned char {
      * index (`a.lit`, giving memUid + carets), `b` = the VALUE (a boxed temp),
      * `aop` = the Expr14 op. vm_member_store does the store (a POD field: coerce
      * + byte pod_set; a boxed field: the field LValue + slot_rmw), matching the
-     * tree-walker's try_pod_struct_store / boxed-field store. A dict member
+     * tree-walker's member_store (POD byte store / boxed field). A dict member
      * store uses DictStore instead; emitted only for a proven struct base.
      * AST-free: no `node`, carets from the member-key pool.
      */
@@ -2603,10 +2604,7 @@ struct Chunk {
      * a pre-evaluated frame temp, so a side-effecting index runs once), the
      * TIER (`tier2` = the inferencer proved the lvalue int/float, so the
      * compound-store semantics apply; else the dyn checked semantics), the
-     * prefix/postfix flag, the codegen-proven `allow_flat`/`allow_pod` gates
-     * (= no_side_effects(final step's base AST) - the tree-walker's
-     * try_flat_subscript_store / try_pod_struct_store gate, an AST-shape
-     * property, so it is compile-time data), and the carets: `id_*` = the
+     * prefix/postfix flag, and the carets: `id_*` = the
      * whole inc-dec expr (its NotLValue/const/TypeError in tier 3),
      * `k*` = the final subscript's INDEX node (the "Expected integer as
      * subscript" caret in flat_store_core). Fully serializable (Locs, ints,
@@ -2616,8 +2614,6 @@ struct Chunk {
         std::vector<ChainStep> steps;  /* inside-out; >= 1 */
         bool tier2 = false;            /* lvalue proven int/float */
         bool is_prefix = false;
-        bool allow_flat = false;   /* final subscript may take the flat path */
-        bool allow_pod = false;    /* final member may take the POD byte path */
         Loc id_start, id_end;          /* the inc-dec expr's caret */
         Loc kstart, kend;              /* the final subscript index's caret */
     };

@@ -6173,9 +6173,16 @@ are unchanged.
   `writelines`, `TypeArr::{subscript (rvalue read), to_string, eq, add}`,
   `Subscript::eval_int`/`eval_float`, the array-spread reads
   (idlist/`foreach`-tuple, via `arr_elem_boxed`), and the flat subscript-store
-  `try_flat_subscript_store` (`eval.cpp`: `a[i] = v` / `a[i] OP= v` writes the
-  scalar straight into the flat vector — gated on a side-effect-free lvalue
-  *chain* via `no_side_effects`). `arr_elem_at`/`arr_elem_boxed` box a flat bool
+  (`subscript_store` -> `flat_store_core`, `eval.cpp`: `a[i] = v` /
+  `a[i] OP= v` writes the scalar straight into the flat vector). ⛔ A STORE
+  EVALUATES ITS BASE AND KEY ONCE, LEFT TO RIGHT, AND STORES TO WHAT THEY
+  NAMED (2026-10-05): this path was gated on a side-effect-free lvalue chain
+  (`no_side_effects`), and an impure one (`a[f()][0] += 1`) fell to the
+  general path, which evaluated the lvalue AGAIN and found no `LValue` in a
+  flat element - NotLValueEx in the tree-walker while the VM stored it. The
+  VM's inc-dec chain mirrored the gate (`allow_flat`/`allow_pod`, gone in
+  myv v27). `member_store` is the POD-field twin.
+  `arr_elem_at`/`arr_elem_boxed` box a flat bool
   element as a real `bool`; `sum` of an `array<bool>` returns an int (counts the
   trues). `clone_internal_vec`, `make_const_clone`, and
   `clone_to_mutable` are kind-aware so clone/COW/const keep flat. `size()` is
@@ -6341,8 +6348,10 @@ but the per-element `StructObject` allocation is gone (build overhead
 - **`StructObject`** holds EITHER `bytes` (POD: a `def->size` C-laid-out buffer;
   `pod_get`/`pod_set` load/store a typed scalar or an inline nested struct at a
   field offset) OR `fields` (boxed). A POD field WRITE goes through
-  `try_pod_struct_store` (a direct byte store, mirroring
-  `try_flat_subscript_store`); a POD field READ in `MemberExpr` returns a value
+  `member_store` (a direct byte store, the twin of `subscript_store`; a
+  field of a FLAT struct array's element is still not storable - the
+  element is bytes, with no object to write through); a POD field READ in
+  `MemberExpr` returns a value
   (no per-field LValue). `==` is `memcmp` for POD, field-wise for boxed.
 - **Flat `array<PodStruct>`** — `SharedArrayObj::Storage::structs`: a contiguous
   byte buffer + the element `StructTypeDef*` + cached `stride` (so the template

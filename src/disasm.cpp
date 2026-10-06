@@ -433,10 +433,6 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
                   << st.operand << (st.is_member ? ">" : "]");
             s << (ic.tier2 ? "  tier2" : "  dyn")
               << (ic.is_prefix ? " pre" : " post");
-            if (ic.allow_flat)
-                s << " flat-ok";
-            if (ic.allow_pod)
-                s << " pod-ok";
             s << "  incdec@" << ic.id_start.line << ":" << ic.id_start.col
               << "\n";
         }

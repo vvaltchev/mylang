@@ -23,7 +23,9 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 26;   /* v26: the APPENDED
+constexpr unsigned MYV_FORMAT_VERSION = 27;   /* v27: IncDecChain loses
+                                                 allow_flat / allow_pod;
+                                                 v26: the APPENDED
                                                  UnpackLenCheck opcode;
                                                  v25: a spliced
                                                  MakeClosureV's `a` is its

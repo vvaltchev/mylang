@@ -1307,7 +1307,6 @@ void write_chunk(Writer &w, const Chunk &c)
     for (const auto &ch : c.incdec_chains) {
         wsteps(ch.steps);
         w.boolv(ch.tier2); w.boolv(ch.is_prefix);
-        w.boolv(ch.allow_flat); w.boolv(ch.allow_pod);
         w.locv(ch.id_start); w.locv(ch.id_end);
         w.locv(ch.kstart); w.locv(ch.kend);
     }
@@ -1611,7 +1610,6 @@ void read_chunk(Reader &r, Chunk &c)
         Chunk::IncDecChain ch;
         ch.steps = rsteps();
         ch.tier2 = r.boolv(); ch.is_prefix = r.boolv();
-        ch.allow_flat = r.boolv(); ch.allow_pod = r.boolv();
         ch.id_start = r.locv(); ch.id_end = r.locv();
         ch.kstart = r.locv(); ch.kend = r.locv();
         c.incdec_chains.push_back(std::move(ch));

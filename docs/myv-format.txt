@@ -2,8 +2,14 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 26.  This document describes the on-disk image exhaustively:
+Format version 27.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v27 drops two bools from every IncDecChain record (section 9.7):
+`allow_flat` and `allow_pod` said whether the final step's base was free of
+side effects, which gated the flat-array and POD-field stores to mirror the
+tree-walker; both engines now evaluate an access chain's base and keys once
+and always take those stores, so the bits meant nothing.)
 
 (v26 changes no encoding: one opcode was APPENDED - UnpackLenCheck, the
 strict length test of a destructure `a, b = arr` whose rvalue is a proven
@@ -829,8 +835,6 @@ that step reports the same span the tree-walker would.
         StepList steps
         bool  tier2             the operand is a proven int/float
         bool  is_prefix
-        bool  allow_flat
-        bool  allow_pod
         loc   id_start, id_end
         loc   kstart, kend
 

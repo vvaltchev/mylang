@@ -330,7 +330,12 @@ aspects:
     there's no such thing as the comma operator, because of the array-expansion
     feature. The full C set of compound assignments is supported: `+=` `-=`
     `*=` `/=` `%=` and (int-only, like their binary forms) `<<=` `>>=` `>>>=`
-    `&=` `|=` `^=` — each behaves exactly like `x = x OP rhs`.
+    `&=` `|=` `^=` — each behaves exactly like `x = x OP rhs`, except that
+    the target is evaluated only once. Every assignment evaluates its
+    right-hand side first, then the target's container and each key, left
+    to right and once each, and stores to the location they named:
+    `a[f()] += g()` calls `g`, then `f`. `++`/`--` evaluate their operand
+    once too.
 
   - MyLang supports both the classic `for` loop and an explicit `foreach` loop.
 

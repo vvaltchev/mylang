@@ -466,7 +466,8 @@ The POD path exposed a latent VM bug: `a[i] =
 <struct>` into a **flat struct array** has no boxed element LValue, so the
 general `StoreElemValue` path (`subscript(for_write)`) wrongly raised
 `NotLValueEx`; `vm_subscript_store` now byte-stores a flat POD-struct element
-directly (bounds/type-check/COW/`memcpy`), mirroring `try_flat_subscript_store`.
+directly (bounds/type-check/COW/`memcpy`), mirroring the tree-walker's
+`subscript_store`.
 
 **The residual container-STORE family (all now native).** A **struct field
 store** `s.f = v` / `s.f OP= v` → **`StoreMemberV`** (`vm_member_store`: a POD
@@ -497,9 +498,9 @@ global / 2 capture) which the store ops carry in `in.target`, and
 `d[k]=v` / `s.f=v` targeting a top-level container a function reads, or a
 captured one, go native. **`StoreElemValue` is the UNIVERSAL store**:
 `vm_subscript_store` now handles a **flat scalar** base too (via the shared
-`flat_store_core`, factored out of `try_flat_subscript_store` alongside
+`flat_store_core`, shared with the tree-walker's `subscript_store` alongside
 `flat_writable_array`), so it dispatches **flat / general / dict** at runtime
-exactly like the tree-walker's `try_flat`→general. The codegen emits it as the
+exactly like the tree-walker's store. The codegen emits it as the
 **catch-all** for any container-slot base a fast path didn't take — a proven
 GENERAL array, a **DYN / captured / unproven** base, or a flat int array whose
 index isn't int-compilable (the flat `StoreElemInt` path rolls back and falls
@@ -1432,9 +1433,12 @@ seed keeps the tree-walker's rvalue-ness, so `mk()[0]++` still throws
 NotLValueEx) plus member/subscript steps with each KEY compiled into a
 temp ONCE (side effects run exactly once, in source order), pooled in
 the serializable **`Chunk::incdec_chains`** (steps + tier + prefix +
-the `allow_flat`/`allow_pod` gates — `no_side_effects(final base)`,
-the tree-walker's own AST-shape-dependent try_flat/try_pod gate, so it
-is compile-time data — + carets). The runtime walk is the shared
+carets). Until 2026-10-05 it also carried `allow_flat`/`allow_pod`,
+`no_side_effects(final base)` mirroring the tree-walker's old gate on
+the flat-array and POD-field stores, so `var u = a[f()][0]++` raised
+NotLValueEx in both engines; the tree-walker evaluates a store's base
+and key once now (`subscript_store` / `member_store`), and the gates
+left the format in v27. The runtime walk is the shared
 StoreLValueChainV intermediate walk (`vm_chain_walk`); the final step
 runs `vm_incdec_final` (eval.cpp) — IncDecExpr::do_eval's EXACT tier
 semantics: tier 2 (proven int/float) = the compound `±= 1`

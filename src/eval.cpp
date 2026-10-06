@@ -3392,24 +3392,12 @@ slot_rmw(LValue &lv, Op op, const EvalValue &rval)
 }
 
 /*
- * Fast path for `a[i] = v` / `a[i] OP= v` when `a` is a flat (unboxed) int or
- * float array: write the scalar straight into the unboxed vector, with no
- * promotion to vector<LValue> and no element-LValue round-trip. Without this,
- * the first store into a flat array (e.g. filling an array(N, 0)) would promote
- * it and undo the whole specialization.
- *
- * Returns true (and sets `out` to the stored value) when it handled the store;
- * false to fall through to the general lvalue->eval() -> doAssign() path. To
- * keep the fall-through sound it commits to the flat path only after deciding
- * on the BASE alone (which must be a side-effect-free lvalue - an id or a
- * nested subscript/member chain like `a[0][0]`, so re-eval on the general path
- * is harmless); the index is evaluated once, inside. Handling nested bases is
- * essential: a flat array nested in a general one (e.g. `[[1,2],[3,4]]`) has no
- * element LValue, so `a[0][0] = v` can only be written here.
- *
- * A value that doesn't fit the flat kind (a string into an int array, only
- * reachable through `dyn`) promotes the array and stores generally - same
- * result as the un-specialized path, just slower for that one cold write.
+ * True if evaluating `c` can have no side effect (an id, a literal, a
+ * subscript / member / arithmetic chain over those) - so evaluating it twice
+ * is unobservable. Its users read a base a second time for speed
+ * (member_pod_array_scalar), or tell the codegen a base may be read twice.
+ * A STORE does not ask it: an access chain's base is evaluated exactly once
+ * whatever it contains (access_store, below).
  */
 static bool
 no_side_effects(const Construct *c)
@@ -3449,7 +3437,7 @@ bool construct_no_side_effects(const Construct *c)
  * Flat-array element store CORE: `blv` holds a flat (non-general, non-const,
  * non-read-only) SharedArrayObj `arr`; store `rval` (op) at index `idx_v`. The
  * caller has already proven blv is a flat writable array. Shared by the AST
- * path (try_flat_subscript_store, base `a` from the AST) and the VM's NESTED
+ * path (subscript_store, base `a` from the AST) and the VM's NESTED
  * store (vm_nested_subscript_store, base `a[i]` an inner element LValue).
  * Returns true (and sets `out`) on a store; false ONLY for a compound op on a
  * flat struct array (structs have no `+=`), so the caller defers to the general
@@ -3647,91 +3635,150 @@ flat_writable_array(LValue *blv, SharedArrayObj *&arr)
     return true;
 }
 
-static bool
-try_flat_subscript_store(EvalContext *ctx, Construct *lvalue, Op op,
-                         const EvalValue &rval, EvalValue &out)
+/* What Construct::eval does to an exception leaving node `n`: stamp its
+ * span when the exception carries none, and emit its inlined-at frames once.
+ * For code that runs a node's work without going through its eval. */
+static void stamp_like_eval(const Construct *n, Exception &e)
 {
-    if (!lvalue->is_subscript())
-        return false;
+    if (!e.loc_start) {
+        e.loc_start = n->start;
+        e.loc_end = n->end;
+    }
+    if (n->inline_ctx && !e.inline_origin_emitted) {
+        flush_inline_frames(n->inline_ctx, e);
+        e.inline_origin_emitted = true;
+    }
+}
 
-    Subscript *sub = static_cast<Subscript *>(lvalue);
+/* The general tail of a store: the formed reference is an LValue to write,
+ * or the target is not a location. */
+static EvalValue
+assign_through(EvalContext *ctx, const Construct *lvalue,
+               const EvalValue &lval, const EvalValue &rval, Op op)
+{
+    if (!lval.is<LValue *>())
+        throw NotLValueEx(lvalue->start, lvalue->end);
 
-    /* Base must be a side-effect-free lvalue - see the note above. */
-    if (!no_side_effects(sub->what.get()))
-        return false;
+    /* The parser never evaluates an assignment during const evaluation. */
+    if (ctx->const_ctx)
+        throw InternalErrorEx();
 
-    const EvalValue base_lv = sub->what->eval(ctx);
-    if (!base_lv.is<LValue *>())
-        return false;
-
-    SharedArrayObj *arr;
-    if (!flat_writable_array(base_lv.get<LValue *>(), arr))
-        return false;
-
-    /* Committed to the flat path now: evaluate the index exactly once. */
-    const EvalValue idx_v = RValue(sub->index->eval(ctx));
-    return flat_store_core(base_lv.get<LValue *>(), *arr, idx_v, rval, op, out,
-                           sub->start, sub->end,
-                           sub->index->start, sub->index->end);
+    LValue *lv = lval.get<LValue *>();
+    if (lv->is_const_var()) {
+        if (lv->is<Builtin>())
+            throw CannotRebindBuiltinEx(lvalue->start, lvalue->end);
+        throw CannotRebindConstEx(lvalue->start, lvalue->end);
+    }
+    return doAssign(lval, rval, op);
 }
 
 /*
- * Fast path for `s.field = v` / `s.field OP= v` when `s` is a POD struct: a POD
- * field is bytes, not an LValue, so the general lvalue path can't target it -
- * write the (coerced/validated) scalar straight into the byte slot. Returns
- * false (and lets the general path run) for a boxed struct, a const/read-only
- * instance (so the right error fires), a non-field member, or a non-lvalue
- * base. No COW clone: a POD struct aliases like any value (a `var q = p` shares
- * it, and the write is shared - the same as the boxed path and arrays/dicts).
+ * A store THROUGH an access chain - `x[k] = v` / `x[k] OP= v`, `x.f = v` /
+ * `x.f OP= v`, and `++` / `--` on a typed one (IncDecExpr routes `+= 1`
+ * here). The base and the key are evaluated EXACTLY ONCE, left to right,
+ * and the store goes to what they named:
+ *   - a flat (unboxed) array's element is written straight into the vector
+ *     (flat_store_core) - it has no LValue, so no general path can write
+ *     it; a value that does not fit the flat kind promotes or throws there;
+ *   - a POD struct's field is written into its bytes (it has no LValue
+ *     either), coerced to the field's type;
+ *   - anything else forms the element / member reference the way
+ *     Subscript::do_eval / MemberExpr::do_eval would (a plain `=` may
+ *     auto-vivify a dict key) and assigns through it.
+ * Until 2026-10-05 the first two were gated on a side-effect-free base -
+ * the general path then evaluated the whole lvalue a second time - so
+ * `a[f()][0] += 5` raised NotLValueEx in the tree-walker while the VM, which
+ * computes each key into a temp once, stored it (RULE 2).
  */
-static bool
-try_pod_struct_store(EvalContext *ctx, Construct *lvalue, Op op,
-                     const EvalValue &rval, EvalValue &out)
+static EvalValue
+subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
+                const EvalValue &rval)
 {
-    auto *mem = dynamic_cast<MemberExpr *>(lvalue);
-    if (!mem)
-        return false;
-
-    if (!no_side_effects(mem->what.get()))
-        return false;
-
-    const EvalValue base_lv = mem->what->eval(ctx);
-    if (!base_lv.is<LValue *>())
-        return false;                 /* temporary base: general path errors */
-
-    LValue *blv = base_lv.get<LValue *>();
-    if (!blv->is<intrusive_ptr<StructObject>>())
-        return false;
-
-    StructObject &obj = *blv->getval<intrusive_ptr<StructObject>>().get();
-    if (!obj.is_pod())
-        return false;                 /* boxed: general lvalue path handles */
-
-    const int slot = obj.def->slot_of(mem->memUid);
-    if (slot < 0)
-        return false;                 /* a const member etc.: general path */
-
-    if (blv->is_const_var() || obj.is_readonly())
-        return false;                 /* const: defer for the right error/loc */
-
-    const EvalValue r = RValue(rval);
-
-    EvalValue newval;
-    if (op == Op::assign) {
-        newval = r;
-    } else {
-        newval = obj.pod_get(slot);
-        apply_compound_op(newval, r, op);
+    EvalValue base, key;
+    try {
+        base = sub->what->eval(ctx);
+        if (base.is<UndefinedId>())
+            throw UndefinedVariableEx(base.get<UndefinedId>().id,
+                                      sub->what->start, sub->what->end);
+        key = literal_widen(RValue(sub->index->eval(ctx)), sub->key_coerce);
+    } catch (Exception &e) {
+        stamp_like_eval(sub, e);
+        throw;
     }
 
-    /* coerce + runtime-validate to the field's scalar type (throws on mismatch,
-     * e.g. a dyn-laundered wrong type) */
-    newval = coerce_struct_field(obj.def->fields[slot], std::move(newval),
-                                 mem->start, mem->end);
-    obj.pod_set(slot, newval);
+    SharedArrayObj *arr;
+    if (!ctx->const_ctx && base.is<LValue *>()
+            && flat_writable_array(base.get<LValue *>(), arr)) {
+        EvalValue out;
+        if (flat_store_core(base.get<LValue *>(), *arr, key, rval, op, out,
+                            sub->start, sub->end,
+                            sub->index->start, sub->index->end))
+            return out;
+    }
 
-    out = newval;
-    return true;
+    EvalValue elv;
+    try {
+        Type *t = base.is<LValue *>()
+            ? base.get<LValue *>()->get().get_type()
+            : base.get_type();
+        elv = t->subscript(base, key, /*for_write=*/op == Op::assign);
+    } catch (Exception &e) {
+        stamp_like_eval(sub, e);
+        throw;
+    }
+    return assign_through(ctx, sub, elv, rval, op);
+}
+
+static EvalValue
+member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
+             const EvalValue &rval)
+{
+    EvalValue base;
+    try {
+        base = mem->what->eval(ctx);
+    } catch (Exception &e) {
+        stamp_like_eval(mem, e);
+        throw;
+    }
+
+    /* A rooted, writable POD struct's field: its bytes. No COW clone - a
+     * POD struct aliases like any value (`var q = p` shares the write, as a
+     * boxed struct and arrays/dicts do). */
+    if (base.is<LValue *>()) {
+        LValue *blv = base.get<LValue *>();
+        if (blv->is<intrusive_ptr<StructObject>>()) {
+            StructObject &obj =
+                *blv->getval<intrusive_ptr<StructObject>>().get();
+            const int slot = obj.is_pod() ? obj.def->slot_of(mem->memUid)
+                                          : -1;
+            if (slot >= 0 && !blv->is_const_var() && !obj.is_readonly()) {
+                const EvalValue r = RValue(rval);
+                EvalValue newval;
+                if (op == Op::assign) {
+                    newval = r;
+                } else {
+                    newval = obj.pod_get(slot);
+                    apply_compound_op(newval, r, op);
+                }
+                /* coerce + runtime-validate to the field's scalar type
+                 * (throws on a mismatch, e.g. a dyn-laundered wrong type) */
+                newval = coerce_struct_field(obj.def->fields[slot],
+                                             std::move(newval),
+                                             mem->start, mem->end);
+                obj.pod_set(slot, newval);
+                return newval;
+            }
+        }
+    }
+
+    EvalValue lval;
+    try {
+        lval = mem->access(RValue(base), /*for_write=*/op == Op::assign);
+    } catch (Exception &e) {
+        stamp_like_eval(mem, e);
+        throw;
+    }
+    return assign_through(ctx, mem, lval, rval, op);
 }
 
 /*
@@ -3856,7 +3903,7 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
      * scalar/bytes in the flat vector - so the general subscript(for_write) path
      * below would wrongly raise NotLValueEx. Store straight into the flat buffer
      * via the shared flat_store_core (COW + type check + the dyn-launder error),
-     * exactly as the tree-walker's try_flat_subscript_store. This is what makes
+     * exactly as the tree-walker's subscript_store. This is what makes
      * StoreElemValue a UNIVERSAL store (any base: flat / general / dict), so the
      * codegen can emit it for a dyn/unproven base. flat_store_core returns false
      * only for a compound op on a flat STRUCT array (defer to the general path,
@@ -3903,7 +3950,7 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
  * field are LValues, changed in place. A FLAT array's element and a POD
  * field are not: a rooted, writable one is read, checked and stored back
  * through flat_store_core / vm_member_store - what `+= 1` does
- * (try_flat_subscript_store, try_pod_struct_store). Until 2026-10-05 every
+ * (subscript_store, member_store). Until 2026-10-05 every
  * engine raised NotLValueEx there - for `d[0]++` on a dyn holding an int
  * array, and for EVERY `a[i]++` on a flat array under -nti - while `+= 1`
  * worked; the four copies of this logic agreed on the throw.
@@ -4105,18 +4152,21 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
  * plain VALUE (the chain-walk convention: a value-walked chain reproduces the
  * tree-walker's rvalue-ness, so the final ref of an rvalue base is an rvalue).
  *
- * Tier 2 (a proven int/float lvalue) == handle_single_expr14(`±= 1`) then
- * old = new ∓ 1 (apply_compound_op - so a dyn-laundered non-numeric derives
- * or throws EXACTLY as the tree-walker's derive does):
- *   - final SUBSCRIPT: the flat path (flat_store_core) ONLY when the codegen
- *     proved the base AST side-effect-free (`allow_flat` - try_flat's gate);
- *     else the general subscript(for_write=false) lvalue + slot_rmw (a flat
- *     element read through an impure base is an RVALUE -> NotLValueEx at the
- *     LVALUE caret, the tree-walker's doAssign error).
- *   - final MEMBER: the POD byte store (vm_member_store) ONLY under
- *     `allow_pod` (try_pod's gate) for a struct base; else the general member
- *     lvalue (vm_member_lvalue_ref; a POD/readonly field is a VALUE read -
- *     run member_read_core for its non-container TypeError, then NotLValueEx).
+ * Tier 2 (a proven int/float lvalue) == handle_single_expr14(`±= 1`)
+ * (subscript_store / member_store) then old = new ∓ 1 (apply_compound_op -
+ * so a dyn-laundered non-numeric derives or throws EXACTLY as the
+ * tree-walker's derive does). The walk already evaluated every key once,
+ * so the final step takes the same stores:
+ *   - final SUBSCRIPT: a rooted flat array's element through flat_store_core,
+ *     else the general subscript(for_write=false) lvalue + slot_rmw (a value
+ *     base's element is an RVALUE -> NotLValueEx at the LVALUE caret);
+ *   - final MEMBER: a rooted POD struct's field through vm_member_store, else
+ *     the general member lvalue (vm_member_lvalue_ref; a readonly field or a
+ *     value base's is a VALUE read - member_read_core for its non-container
+ *     TypeError, then NotLValueEx).
+ * Until 2026-10-05 the flat and POD stores were gated on a side-effect-free
+ * base AST (`allow_flat` / `allow_pod`, codegen-proven) to mirror the
+ * tree-walker's old gate - so `var u = a[f()][0]++` raised NotLValueEx.
  *
  * Tier 3 (dyn / un-hinted) == dyn_incdec_elem / dyn_incdec_member, the
  * tree-walker's own: an access error at the access caret (`b*` is a member
@@ -4128,7 +4178,6 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                           const EvalValue &memId, const UniqueId *memUid,
                           const EvalValue &key,
                           bool tier2, bool is_inc, bool is_prefix,
-                          bool allow_flat, bool allow_pod,
                           Loc lstart, Loc lend, Loc kstart, Loc kend,
                           Loc bstart, Loc bend, Loc id_start, Loc id_end)
 {
@@ -4145,12 +4194,12 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
             const EvalValue &cval =
                 cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
 
-            if (allow_pod && cur.is<LValue *>() &&
+            if (cur.is<LValue *>() &&
                 cval.is<intrusive_ptr<StructObject>>() &&
                 cval.get<intrusive_ptr<StructObject>>()->is_pod()) {
 
-                /* try_pod_struct_store's case: a rooted POD struct with a
-                 * side-effect-free base - byte-store the field. */
+                /* member_store's case: a rooted POD struct - byte-store the
+                 * field. */
                 nv = vm_member_store(cur.get<LValue *>(), memUid, cop, one,
                                      lstart, lend, lstart, lend);
                 have_nv = true;
@@ -4158,9 +4207,9 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
             } else {
 
                 /* The general path: the member lvalue (boxed field / dict
-                 * value); a VALUE read (POD via impure base, readonly, or a
+                 * value); a VALUE read (readonly, a value base, or a
                  * non-container base's TypeError) fails NotLValue at the
-                 * LVALUE caret, exactly as the tree-walker's doAssign. */
+                 * LVALUE caret, exactly as the tree-walker's member_store. */
                 LValue *lv = vm_member_lvalue_ref(cval, memId, memUid,
                                                   /*for_write=*/false,
                                                   lstart, lend);
@@ -4175,7 +4224,7 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
 
         } else {
 
-            if (allow_flat && cur.is<LValue *>()) {
+            if (cur.is<LValue *>()) {
                 SharedArrayObj *arr;
                 if (flat_writable_array(cur.get<LValue *>(), arr)) {
                     EvalValue out;
@@ -4228,9 +4277,9 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
 
 /*
  * VM StoreMemberV: native `s.member = v` / `s.member OP= v` for a STRUCT base (a
- * dict member store goes through DictStore). Mirrors try_pod_struct_store (a POD
- * field: coerce + byte store) + the boxed-field lvalue store the tree-walker's
- * handle_single_expr14 does, but AST-free: `base_lv` from a slot, the member's
+ * dict member store goes through DictStore). Mirrors the tree-walker's
+ * member_store (a POD field: coerce + byte store; a boxed field: the field
+ * lvalue + slot_rmw), but AST-free: `base_lv` from a slot, the member's
  * uid + carets from the member-key pool. Returns the stored value. A const /
  * read-only struct throws NotLValueEx (the tree-walker's general-path error).
  */
@@ -4821,23 +4870,17 @@ handle_single_expr14(EvalContext *ctx,
             }
         }
 
-        /*
-         * Fast path: `a[i] = v` / `a[i] OP= v` into a flat (unboxed) int/float
-         * array - write the scalar straight into the flat vector, no promotion.
-         */
-        EvalValue flat_out;
-        if (try_flat_subscript_store(ctx, lvalue, op, rval, flat_out))
-            return flat_out;
     }
 
-    /*
-     * Fast path: `s.field = v` / `s.field OP= v` into a POD struct - store the
-     * scalar straight into the struct's byte slot (a POD field has no LValue).
-     */
-    {
-        EvalValue pod_out;
-        if (try_pod_struct_store(ctx, lvalue, op, rval, pod_out))
-            return pod_out;
+    /* A store through an access chain: its base and key once, then the
+     * flat / POD / general store (subscript_store, member_store). */
+    if (!inDecl) {
+        if (lvalue->is_subscript())
+            return subscript_store(ctx, static_cast<Subscript *>(lvalue),
+                                   op, rval);
+        if (ctag(lvalue) == ConstructType::member)
+            return member_store(ctx, static_cast<MemberExpr *>(lvalue),
+                                op, rval);
     }
 
     /*
@@ -6294,8 +6337,11 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
     const bool for_write = ctx->assign_target;
     ctx->assign_target = false;
 
-    EvalValue &&dval = RValue(what->eval(ctx));
+    return access(RValue(what->eval(ctx)), for_write);
+}
 
+EvalValue MemberExpr::access(const EvalValue &dval, bool for_write) const
+{
     /*
      * The assignable-lvalue / auto-vivify paths need `what` (rooting) or the
      * for_write flag; every other case is a VALUE read via member_read (shared
