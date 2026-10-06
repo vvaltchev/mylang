@@ -6501,7 +6501,13 @@ and two macros:
   location: `Identifier`, `IdList`, `Subscript`, `MemberExpr`. A literal, a
   call result, an arith/compare/logical chain, a ternary and a SLICE are
   values, so `s[0:1] = v` / `(a+b) = 3` / `f() = 3` are refused at compile
-  time. A CONST element target lands there too, because the parser already
+  time. So is an OPTIONAL member `a?.f` (a value - none when `a` is none),
+  as the target of `=`, a compound assignment AND `++` / `--`
+  (`pRefuseOptionalTarget`, 2026-10-05): typed code got a NullabilityEx for
+  `++`/`+=` but a plain store for `=` in the tree-walker, which the VM
+  refused to compile (NotLoweredEx), and with -nti the tree-walker raised
+  NotLValueEx even for a non-none base. A CONST element target lands
+  there too, because the parser already
   folded `K[0]` to its literal - which is right: it IS decidable. The same
   const reached through a PARAMETER is not folded, keeps its Subscript shape,
   and still raises the runtime `NotLValueEx`. This closed two divergences: the

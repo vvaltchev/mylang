@@ -701,6 +701,32 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# An optional member `a?.f` is not an assignable location (2026-10-05):
+# the PARSER refuses it as the target of `=`, `+=` and `++` / `--`, so it
+# is the same compile error with type inference off. Under -nti the
+# tree-walker used to raise NotLValueEx at run time and the VM refused
+# with NotLoweredEx (an internal error); -rt runs typed only.
+for prog in 'p?.x++;' '--p?.x;' 'p?.x = 5;' 'p?.x += 1;'; do
+    printf 'struct P { int x; }\nvar dyn p = runtime(none);\n%s\n' \
+        "$prog" > "$TMP/opt.my"
+    bad=
+    for flags in "-tw" "" "-nti -tw" "-nti"; do
+        # shellcheck disable=SC2086
+        out=$("$BIN" $flags "$TMP/opt.my" 2>&1)
+        got_rc=$?
+        if [ "$got_rc" != 1 ] \
+                || ! printf '%s' "$out" | grep -q 'SyntaxError'; then
+            bad="$bad [$flags] rc=$got_rc $(printf '%s' "$out" | head -1)"
+        fi
+    done
+    if [ -z "$bad" ]; then
+        pass "optional member target refused: $prog"
+    else
+        fail "optional member target refused: $prog:$bad"
+    fi
+done
+
+# ---------------------------------------------------------------------
 # -nc (#54): the flag turns off constant FOLDING, and until #54 it also
 # stopped the parser REGISTERING consts, struct types and pure funcs -
 # so this program was refused ("expression is not const", "'P' is not a

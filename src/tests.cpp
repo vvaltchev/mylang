@@ -7683,6 +7683,35 @@ static const std::vector<test> tests =
       { "func mk() { return [9, 8]; }",
         "var dyn z = 0;",
         "z = mk()[0]++;" }, &typeid(NotLValueEx) },
+    /* An OPTIONAL member `a?.f` is a value - none when `a` is none - and
+     * not one of the four forms that denote a location, so assigning to
+     * it, compound-assigning or `++`/`--` on it is a COMPILE error from
+     * the parser, in every mode (2026-10-05). It used to be a NullabilityEx
+     * for `++`/`+=` and an ordinary store for `=` in the tree-walker,
+     * where the VM refused to compile it (NotLoweredEx); under -nti
+     * NotLValueEx in the tree-walker even for a non-none base. The caret
+     * is the optional member (a member's span runs to the next token, so
+     * `p?.x = 5` marks the space before `=` too, as every member error
+     * does). */
+    { "parse: an optional member is not assignable (postfix ++)",
+      { "struct P { int x; }",
+        "var dyn p = runtime(P(1));",
+        "p?.x++;" },
+      &typeid(SyntaxErrorEx), 1, 3, 5, 3 },
+    { "parse: an optional member is not assignable (prefix --)",
+      { "struct P { int x; }",
+        "var dyn p = runtime(none);",
+        "--p?.x;" },
+      &typeid(SyntaxErrorEx), 3, 3, 7, 3 },
+    { "parse: an optional member is not assignable (=)",
+      { "struct P { int x; }",
+        "var dyn p = runtime(P(1));",
+        "p?.x = 5;" },
+      &typeid(SyntaxErrorEx), 1, 3, 6, 3 },
+    { "parse: an optional member is not assignable (+=)",
+      { "var d = {\"a\": 1};",
+        "d?.a += 2;" },
+      &typeid(SyntaxErrorEx), 1, 2, 6, 2 },
     /* `b.x++` on a dyn base that is neither a struct nor a dict: the
      * TypeError ("Expected dict object") carets the BASE, as the
      * tree-walker's member read does. The VM's statement form carried no

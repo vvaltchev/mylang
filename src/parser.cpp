@@ -1373,6 +1373,30 @@ pAcceptMember(ParseContext &c,
     return true;
 }
 
+/*
+ * An OPTIONAL member `a?.f` is a value - `none` when `a` is none - and not
+ * one of the four forms that denote a location (pExpr14's assignable-shape
+ * rule), so it is refused as the target of `=`, of a compound assignment
+ * and of `++` / `--` alike, by its shape (2026-10-05). Before, typed code
+ * got a NullabilityEx for `++` / `+=` and a plain store for `=` in the
+ * tree-walker, where the VM refused to compile it (NotLoweredEx); with
+ * -nti the tree-walker raised NotLValueEx even for a base that was not
+ * none. A plain field AFTER an optional link (`a?.b.c`) is unaffected.
+ */
+static void
+pRefuseOptionalTarget(const Construct *lv)
+{
+    if (ctag(lv) != ConstructType::member
+            || !static_cast<const MemberExpr *>(lv)->optional)
+        return;
+
+    SyntaxErrorEx e(lv->start,
+                    "Cannot assign to an optional member: `a?.f` is a value "
+                    "(none when `a` is none), not an assignable location");
+    e.loc_end = lv->end;
+    throw e;
+}
+
 unique_ptr<Construct>
 pExpr01(ParseContext &c, unsigned fl)
 {
@@ -1451,6 +1475,7 @@ pExpr01(ParseContext &c, unsigned fl)
     if (main && (*c == Op::inc || *c == Op::dec)) {
         const bool is_inc = (*c == Op::inc);
         const Loc opLoc = c.get_loc();
+        pRefuseOptionalTarget(main.get());
         c++;
         auto id = make_unique<IncDecExpr>();
         id->start = main->start;
@@ -1524,6 +1549,7 @@ pExpr02(ParseContext &c, unsigned fl)
         elem = pExpr02(c, fl);
         if (!elem)
             noExprError(c);
+        pRefuseOptionalTarget(elem.get());
         auto id = make_unique<IncDecExpr>();
         id->start = start;
         id->end = c.get_loc();
@@ -1971,6 +1997,7 @@ pExpr14(ParseContext &c, unsigned fl)
     if (ret->lvalue && !(fl & pFlags::pInDecl)) {
 
         const Construct *lv = ret->lvalue.get();
+        pRefuseOptionalTarget(lv);
 
         /* #54: under `-nc` a constant element is left in place, so ask
          * whether the folding run would have made it a value. */
