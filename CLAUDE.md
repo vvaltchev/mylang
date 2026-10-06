@@ -767,7 +767,7 @@ elements; 64 tests cover them all, 83 s of runs against 210 s, and
 `-rt` alone owns 25,962.
 **EVERY TEST TOOL THAT CAN RUN FOR MORE THAN A MINUTE SERVES ITS
 PROGRESS (maintainer-set, 2026-10-04), and `tests/testctl` with no
-arguments lists them all**, one line each: the PERCENTAGE, done/total,
+arguments lists them all**, one row each: the PERCENTAGE, done/total,
 phase, elapsed, ETA, failures, what it is on now (`testctl watch`
 refreshes it; `status [RUN]` is the full JSON, whose `percent` field is
 the obvious one). Two server kinds in `tests/lib/testrun.py`: a `Run`
