@@ -5637,15 +5637,14 @@ private:
      */
     bool binds_none(const CallExpr *ce, const FuncDeclStmt *f) const
     {
-        const size_t n = ce->args ? ce->args->elems.size() : 0;
+        /* every caller checked the argument count against f's parameters */
+        const size_t n = ce->args->elems.size();
         const FuncDescriptor *d = f->desc;
         for (size_t i = 0; i < n; i++) {
-            if (i < 32 && !((ce->none_arg_mask >> i) & 1u))
-                continue;
             const Construct *a = ce->args->elems[i].get();
-            if (CallExpr::arg_never_none(a))
+            if (!ce->arg_may_be_none(i))
                 continue;
-            if (i < d->params.size() && d->params[i].opt)
+            if (d->params[i].opt)
                 continue;
             if (names_settled_param(a))
                 continue;
@@ -5655,21 +5654,19 @@ private:
     }
 
     /* `a` reads a parameter of cur_fn that is not `opt` and that the body
-     * never writes - a value its bind refused none for (slots below the
-     * parameter count are the parameters; inlining remaps a callee's
-     * locals above the caller's frame, so none lands there) */
+     * never writes - a value its bind refused none for. Slots below the
+     * parameter count are the parameters (inlining remaps a callee's
+     * locals above the caller's frame, so none lands there), and a LOCAL
+     * identifier means cur_fn was resolved, so slot_writes covers them. */
     bool names_settled_param(const Construct *a) const
     {
         if (!cur_fn || ctag(a) != ConstructType::id)
             return false;
         const auto *id = static_cast<const Identifier *>(a);
-        if (id->sym.kind != SymKind::local || id->sym.slot < 0)
-            return false;
         const size_t s = static_cast<size_t>(id->sym.slot);
         const FuncDescriptor *d = cur_fn->desc;
-        return s < d->params.size() && !d->params[s].opt
-               && s < cur_fn->slot_writes.size()
-               && cur_fn->slot_writes[s] == 0;
+        return id->sym.kind == SymKind::local && s < d->params.size()
+               && !d->params[s].opt && cur_fn->slot_writes[s] == 0;
     }
 
     void try_inline(unique_ptr<Construct> &slot, int depth, int *fsize,
@@ -6027,6 +6024,11 @@ private:
             return;       /* its locals aren't slotted: nothing to remap into */
         if (in_repl_tmpl_base)
             return;       /* see in_repl_tmpl_base */
+
+        const int nparams = f->params
+            ? static_cast<int>(f->params->elems.size()) : 0;
+        if (static_cast<int>(ce->args->elems.size()) != nparams)
+            return;   /* arity mismatch: let the runtime error survive */
         if (binds_none(ce, f))
             return;       /* RULE 1: see binds_none */
 
@@ -6053,11 +6055,6 @@ private:
                 rec_orig[f] = f->body->clone();
             f->desc->cache_results = true;
         }
-
-        const int nparams = f->params
-            ? static_cast<int>(f->params->elems.size()) : 0;
-        if (static_cast<int>(ce->args->elems.size()) != nparams)
-            return;   /* arity mismatch: let the runtime error survive */
 
         /*
          * Decide each param. A param REASSIGNED in the body can't be inlined (it
@@ -6954,7 +6951,7 @@ private:
              * argument, for the clone's bind to refuse (folding it in would
              * bind nothing; -nti is the only way such a call compiles) */
             if (ctag(arg) == ConstructType::lit_none
-                    && !(i < f->desc->params.size() && f->desc->params[i].opt))
+                    && !f->desc->params[i].opt)
                 continue;
 
             if (dynamic_cast<Literal *>(arg)) {

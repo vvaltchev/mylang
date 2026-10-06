@@ -476,13 +476,19 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt,
  * argument list in every engine, and must keep doing so).
  */
 /* RULE 1: binding none to a parameter not declared `opt` (eval.h) */
+TypeErrorEx none_bind_error(const UniqueId *param, int site_arg)
+{
+    std::string m = "parameter '";
+    m += param->val;
+    m += "' is not 'opt' and cannot be none";
+    TypeErrorEx ex(intern_msg(m));
+    ex.bind_arg = site_arg;
+    return ex;
+}
+
 void throw_none_bind(const UniqueId *param, int site_arg)
 {
-    TypeErrorEx ex(intern_msg(
-        "parameter '" + std::string(param ? param->val : "?")
-        + "' is not 'opt' and cannot be none"));
-    ex.bind_arg = site_arg;
-    throw ex;
+    throw none_bind_error(param, site_arg);
 }
 
 static inline void
@@ -495,7 +501,7 @@ bind_param(EvalContext *args_ctx,
            int site_arg)
 {
     /* RULE 1: a non-opt parameter never holds none - refused here, at the
-     * bind, before any coercion (the VM's check_none_bind walks the same
+     * bind, before any coercion (the VM's none_bind_fault walks the same
      * order). An omitted trailing parameter is `opt` by construction. */
     if (!param.opt && val.is<NoneVal>())
         throw_none_bind(param.name, site_arg);

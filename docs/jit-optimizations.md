@@ -17474,12 +17474,14 @@ interpreting them gutted the JIT's own test coverage. The op that
 replaced it leaves every call tier untouched: `CheckNoneArgsV` stands
 between the staged argument run and the call, reads the RUNTIME callee
 (a frame slot, or a global slot as CallV's) and refuses through
-`check_none_bind`, which walks the binds in order and stops where the
+`none_bind_fault`, which walks the binds in order and stops where the
 bind would raise first (an arity error, a coercion). The callee then
 never sees a none. Fully native (`jit_check_none_args`, conveys, exc-
 stamped with the argument's span from `arg_locs` - a near jump: the
 per-argument select is longer than a rel8), so a frameless body may hold
-one; the bytecode inliner carries it with the call it guards.
+one. (It first rode the bytecode inliner with the call it guards; no
+test ever pasted such a body, and the coverage gate showed it, so a body
+holding one is no longer pasted - the caller's own check is unaffected.)
 
 **Reach and cost.** Emitted only where `CallExpr::may_bind_none()`: an
 argument whose static type allows none, whose shape does not rule it out,

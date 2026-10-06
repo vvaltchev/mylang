@@ -1262,14 +1262,16 @@ enum class OpCode : unsigned char {
      * `target2` holds the callee VALUE, a CallValueV's; 1 = the global
      * slot `target2`, a CallV's), `a` = the argument run's base, `b` = its
      * count - the call's own operands. If the callee is a function,
-     * check_none_bind walks the arguments in parameter order and raises the
-     * TypeErrorEx the bind would - after every argument evaluated, before
-     * any callee frame, at the same argument (Exception::bind_arg selects
-     * the op's arg_locs caret; base_locs holds the argument list). Anything
+     * none_bind_fault walks the arguments in parameter order and the op
+     * raises the TypeErrorEx the bind would - after every argument
+     * evaluated, before any callee frame, at the same argument
+     * (Exception::bind_arg selects the op's arg_locs caret; base_locs
+     * holds the argument list). Anything
      * else - a non-function, an unbound global - passes: the call raises
      * its own error. A separate op, not a check inside the call, so every
      * native call tier and the bytecode inliner stay as they are: the call
-     * never sees a none, and the inliner pastes its body after this op.
+     * never sees a none, and the inliner pastes its body after this op
+     * (it does not paste a body that holds one).
      * Standing between the run and the call, it also stops the staging
      * scans (argument fusion, the inliner's step 1) - safely, as both
      * only fuse adjacent moves.

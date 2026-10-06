@@ -6852,37 +6852,59 @@ extern "C" int jit_check_func(int_type slot) noexcept
 }
 
 /*
- * RULE 1: the native CheckNoneArgsV - vm_check_none_bind's body with the
- * caret left to the emitter: a refusal conveys LOC-LESS, carrying the
- * argument index (Exception::bind_arg), and the op's exc-stamp selects
- * that argument's span from arg_locs at run time - the stamp a call's own
- * bind refusal takes. `kind` 0 = the callee is frame slot `callee`, 1 = a
- * global slot; anything but a function there is the call's error.
+ * RULE 1: CheckNoneArgsV's check, shared by the interpreted op
+ * (vm_check_none_args) and the JIT's helper: the index of the first
+ * argument that is a none bound to a parameter not declared `opt` of the
+ * RUNTIME callee - that parameter's name in `param` - or -1 when the bind
+ * accepts. `kind` 0 = the callee is in frame slot `callee`, 1 = global slot
+ * `callee` (an unbound one holds none); anything but a function there is
+ * the call's own error to raise. Each caller builds the refusal
+ * (none_bind_error) and gives it its caret.
  */
+static int
+vm_none_args_fault(EvalContext &ctx, int_type kind, int_type callee,
+                   int_type argbase, int_type nargs, const UniqueId *&param)
+{
+    /* (the lines marked INT-COV-EXEMPT hold one Frame::at each, whose
+     * bounds assert cannot fail: verify_chunk bounds both operands) */
+    const EvalValue &cv = kind == 0
+        ? ctx.frame->at(callee).get()           /* INT-COV-EXEMPT: at() */
+        : ctx.gfuncs->slots[callee].get();
+    /* INT-COV-EXEMPT: a valid program's call op names a FUNCTION (its
+     * static type is one, and a named function is bound at scope entry) -
+     * only a crafted image reaches the early return */
+    if (!cv.is<intrusive_ptr<FuncObject>>())    /* INT-COV-EXEMPT */
+        return -1;
+    const FuncDescriptor *d = cv.get_ref<intrusive_ptr<FuncObject>>()->func;
+    /* the op stands before a CallV or a CallValueV, whose callee's arity
+     * the check pass proved against this call (a dyn callee takes the
+     * generic op, which checks the count first) - so the count is in
+     * range, and std::min only keeps a crafted image's mismatch in bounds
+     * (it then refuses the none where the call would refuse the count) */
+    const size_t n = std::min(static_cast<size_t>(nargs), d->params.size());
+    const int k = none_bind_fault_in_range(d, n,
+        [&](size_t i) -> const EvalValue & {
+            const int_type s = argbase + static_cast<int_type>(i);
+            return ctx.frame->at(s).get();      /* INT-COV-EXEMPT: at() */
+        });
+    if (k >= 0)
+        param = d->params[static_cast<size_t>(k)].name;
+    return k;
+}
+
+/* RULE 1: the native CheckNoneArgsV - a refusal conveys, and the op's
+ * exc-stamp selects the argument's span from arg_locs at run time */
 extern "C" int jit_check_none_args(int_type kind, int_type callee,
                                    int_type argbase, int_type nargs) noexcept
 {
     ML_JIT_OP_RAN(CheckNoneArgsV);
-    EvalContext *ctx = g_current_ctx;
-    const EvalValue *cv = nullptr;
-    if (kind == 0)
-        cv = &ctx->frame->at(callee).get();
-    else if (ctx->gfuncs->defined[callee])
-        cv = &ctx->gfuncs->slots[callee].get();
-    if (!cv || !cv->is<intrusive_ptr<FuncObject>>())
+    const UniqueId *param = nullptr;
+    const int k = vm_none_args_fault(*g_current_ctx, kind, callee, argbase,
+                                     nargs, param);
+    if (k < 0)
         return 0;
-    try {
-        const LValue *run = nargs ? &ctx->frame->at(argbase) : nullptr;
-        check_none_bind(cv->get_ref<intrusive_ptr<FuncObject>>()->func,
-                        static_cast<size_t>(nargs),
-                        [&](size_t i) -> const EvalValue & {
-                            return run[i].get();
-                        }, /*call_site=*/true);
-    } catch (RuntimeException &e) {
-        g_vm_jit_exc.reset(e.clone());
-        return 1;
-    }
-    return 0;
+    g_vm_jit_exc = std::make_unique<TypeErrorEx>(none_bind_error(param, k));
+    return 1;
 }
 
 /* model-flip (nativize-ops): the native MapFilterV - map/filter over the
@@ -7948,9 +7970,12 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
         throw InvalidNumberOfArgsEx();
     /* RULE 1: a callback's argument (a dyn container's element) may be
      * none - refused before the window is pushed */
-    check_none_bind(d, n, [&](size_t i) -> const EvalValue & {
-                        return argv[i];
-                    }, /*call_site=*/false);
+    const int nk = none_bind_fault_in_range(d, n,
+                       [&](size_t i) -> const EvalValue & {
+                           return argv[i];
+                       });
+    if (nk >= 0)
+        throw_none_bind(d->params[static_cast<size_t>(nk)].name, -1);
 
     const int_type total =
         d->frame_size + static_cast<int_type>(cck->n_temps);
@@ -8349,9 +8374,12 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
         throw InvalidNumberOfArgsEx();
     /* RULE 1: a boxed callback argument may be none (a general array's
      * element); the raw-scalar binds (call_scalars) cannot carry one */
-    check_none_bind(d, n, [&](size_t i) -> const EvalValue & {
-                        return argv[i];
-                    }, /*call_site=*/false);
+    const int nk = none_bind_fault_in_range(d, n,
+                       [&](size_t i) -> const EvalValue & {
+                           return argv[i];
+                       });
+    if (nk >= 0)
+        throw_none_bind(d->params[static_cast<size_t>(nk)].name, -1);
 
     if (fast_bind_) {
         for (size_t i = 0; i < n; i++)
@@ -8692,28 +8720,24 @@ void vm_stamp_setup_caret(Exception &e, const Chunk &chunk, size_t pc)
 }
 
 /*
- * RULE 1: CheckNoneArgsV - a call whose argument may hold none - refuses a
- * none bound to a parameter not declared `opt` BEFORE the call enters the
- * callee, with the argument's caret (the op records the call's argument
- * spans, read through vm_stamp_setup_caret like a call's own) and no callee
- * frame - exactly where a bind error raises. Shared by the interpreted op
- * and the JIT's helper (jit_check_none_args), so the two cannot drift.
+ * RULE 1: the interpreted CheckNoneArgsV - vm_none_args_fault's refusal
+ * takes the op's carets (it records the call's argument spans, read
+ * through vm_stamp_setup_caret like a call's own) and raises before the
+ * call enters its callee: no callee frame, exactly where a bind error
+ * raises. Out of line: the dispatch loop's frame stays small.
  */
 static ML_NOINLINE void
-vm_check_none_bind(const FuncDescriptor *d, EvalContext &ctx,
-                   int_type argbase, int_type nargs, const Chunk &chunk,
+vm_check_none_args(EvalContext &ctx, const Instr &in, const Chunk &chunk,
                    size_t pc)
 {
-    try {
-        const LValue *run = nargs ? &ctx.frame->at(argbase) : nullptr;
-        check_none_bind(d, static_cast<size_t>(nargs),
-                        [&](size_t i) -> const EvalValue & {
-                            return run[i].get();
-                        }, /*call_site=*/true);
-    } catch (Exception &e) {
-        vm_stamp_setup_caret(e, chunk, pc);
-        throw;
-    }
+    const UniqueId *param = nullptr;
+    const int k = vm_none_args_fault(ctx, in.target, in.target2, in.a_lit(),
+                                     in.b_lit(), param);
+    if (k < 0)
+        return;
+    TypeErrorEx e = none_bind_error(param, k);
+    vm_stamp_setup_caret(e, chunk, pc);
+    throw e;
 }
 
 /*
@@ -10378,14 +10402,16 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
         }
         /* RULE 1: none bound to a non-opt parameter - the interpreted op's
          * check, conveyed with the same args caret */
-        try {
-            check_none_bind(
-                callee.get_ref<intrusive_ptr<FuncObject>>()->func, n,
-                [&](size_t i) -> const EvalValue & {
-                    return ctx.frame->at(argbase
-                        + static_cast<int_type>(i)).get();
-                }, /*call_site=*/true);
-        } catch (RuntimeException &e) {
+        const FuncDescriptor *gd =
+            callee.get_ref<intrusive_ptr<FuncObject>>()->func;
+        const int nk = none_bind_fault(gd, n,
+            [&](size_t i) -> const EvalValue & {
+                const int_type s = argbase + static_cast<int_type>(i);
+                return ctx.frame->at(s).get();  /* INT-COV-EXEMPT: at() */
+            });
+        if (nk >= 0) {
+            TypeErrorEx e = none_bind_error(
+                gd->params[static_cast<size_t>(nk)].name, nk);
             vm_stamp_args_caret(e, al);
             g_vm_jit_exc.reset(e.clone());
             return 2;
@@ -13520,11 +13546,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                     /* RULE 1: a dyn callee's parameters are known only
                      * now - every such call checks (a slow path already);
                      * the catch below stamps the argument's caret */
-                    check_none_bind(fo.func, nargs,
+                    /* INT-COV-EXEMPT, the at() line: its bounds assert */
+                    const int nk = none_bind_fault(fo.func, nargs,
                         [&](size_t i) -> const EvalValue & {
-                            return ctx.frame->at(argbase
-                                + static_cast<int_type>(i)).get();
-                        }, /*call_site=*/true);
+                            const int_type s =
+                                argbase + static_cast<int_type>(i);
+                            return ctx.frame->at(s).get(); /* INT-COV-EXEMPT */
+                        });
+                    if (nk >= 0)
+                        throw_none_bind(fo.func->params[
+                            static_cast<size_t>(nk)].name, nk);
                     if (!fo.func->vm_chunk_tried) {   /* AOT net */
                         fo.func->vm_chunk = vm_func_chunk(fo.func);
                         fo.func->vm_chunk_tried = true;
@@ -13641,15 +13672,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * argument's static type allows none). Check the RUNTIME
              * callee's parameters; anything but a function (unbound, a
              * struct, a non-callable) is the call's own error to raise. */
-            const EvalValue *cv = nullptr;
-            if (in->target == 0)
-                cv = &ctx.frame->at(in->target2).get();
-            else if (ctx.gfuncs->defined[in->target2])
-                cv = &ctx.gfuncs->slots[in->target2].get();
-            if (cv && cv->is<intrusive_ptr<FuncObject>>())
-                vm_check_none_bind(
-                    cv->get_ref<intrusive_ptr<FuncObject>>()->func, ctx,
-                    in->a_lit(), in->b_lit(), *chunk, pc);
+            vm_check_none_args(ctx, *in, *chunk, pc);
             pc++;
         }
             VM_NEXT;
@@ -13678,15 +13701,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                                   ctx.frame->at(in->b_slot()).get(),
                                   (in->target2 & 1) != 0, s, en, s,
                                   static_cast<int>((in->target2 >> 1) & 3)));
-            } catch (Exception &e) {
+            } catch (Exception &e) { /* INT-COV-EXEMPT: its type test */
                 /* a loc-less escape is a callback's BIND refusing an
                  * element: the argument list's caret (base_locs), the
                  * tree-walker's builtin-call stamp */
-                Loc bs, be;
-                if (!e.loc_start && chunk->base_loc_at(pc, bs, be)) {
-                    e.loc_start = bs;
-                    e.loc_end = be;
-                }
+                if (!e.loc_start)
+                    chunk->base_loc_at(pc, e.loc_start, e.loc_end);
                 throw;
             }
             pc++;

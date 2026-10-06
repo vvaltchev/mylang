@@ -600,10 +600,10 @@ void compute_bind_flags(const FuncDescriptor *d);
 /*
  * RULE 1 (2026-10-05): a parameter not declared `opt` never holds `none`
  * (README, "A none the compiler cannot see is refused at the call"), so a
- * bind REFUSES it - a TypeErrorEx, like a
- * bind coercion's, naming the argument (`site_arg`: the call-site
- * argument index, carried as Exception::bind_arg; -1 for a builtin
- * CALLBACK, whose parameter names no argument of the builtin call).
+ * bind REFUSES it - a TypeErrorEx, like a bind coercion's, naming the
+ * argument (`site_arg`: the call-site argument index, carried as
+ * Exception::bind_arg; -1 for a builtin CALLBACK, whose parameter names no
+ * argument of the builtin call). none_bind_error builds it, loc-less.
  * Static checking covers an `opt` argument; a `dyn` one is non-opt by
  * type and may still hold none, so the binds a dyn value can reach check
  * at run time: the tree-walker's bind_param (every bind), CheckNoneArgsV
@@ -611,6 +611,7 @@ void compute_bind_flags(const FuncDescriptor *d);
  * arguments (CallExpr::may_bind_none), the generic dyn-callee call and
  * the callback binds (always - slow paths already).
  */
+TypeErrorEx none_bind_error(const UniqueId *param, int site_arg);
 [[noreturn]] void throw_none_bind(const UniqueId *param, int site_arg);
 
 /* would bind_param's numeric coercion throw for `v`? (`none` aside) */
@@ -624,30 +625,41 @@ inline bool bind_coerce_throws(DeclType dt, const EvalValue &v)
 }
 
 /*
- * The VM's pre-bind check: argument i is `arg_at(i)`. Walks the arguments
- * in PARAMETER order and stops exactly where the bind itself would raise
- * first - an arity mismatch, or a numeric coercion that throws - so the
- * error a site raises is the one the tree-walker's bind_param raises at
- * the same argument, whatever mix of faults the call has.
+ * The VM's pre-bind check: argument i is `arg_at(i)`. The index of the
+ * first argument that is a none bound to a parameter not declared `opt`,
+ * or -1 - walked in PARAMETER order, stopping (-1) exactly where the bind
+ * itself would raise first, at a numeric coercion that throws, so a site
+ * raises the error the tree-walker's bind_param raises at the same
+ * argument whatever mix of faults the call has. The caller builds the
+ * refusal (none_bind_error) and gives it its own caret. This form needs
+ * the argument count in range - a caller whose bind checks the arity
+ * AFTER this runs uses none_bind_fault below.
  */
 template <class ArgAt>
-inline void check_none_bind(const FuncDescriptor *d, size_t n, ArgAt arg_at,
-                            bool call_site)
+inline int none_bind_fault_in_range(const FuncDescriptor *d, size_t n,
+                                    ArgAt arg_at)
 {
-    if (n > d->params.size() || n < static_cast<size_t>(d->min_args))
-        return;                         /* the bind's arity error first */
     for (size_t i = 0; i < n; i++) {
         const FuncDescriptor::ParamDesc &p = d->params[i];
         const EvalValue &v = arg_at(i);
         if (v.is<NoneVal>()) {
             if (!p.opt)
-                throw_none_bind(p.name,
-                                call_site ? static_cast<int>(i) : -1);
+                return static_cast<int>(i);
             continue;
         }
         if (bind_coerce_throws(p.decl_type, v))
-            return;                     /* the bind's coercion error first */
+            return -1;                  /* the bind's coercion error first */
     }
+    return -1;
+}
+
+/* the same, for a count not yet checked: the bind's arity error first */
+template <class ArgAt>
+inline int none_bind_fault(const FuncDescriptor *d, size_t n, ArgAt arg_at)
+{
+    if (n > d->params.size() || n < static_cast<size_t>(d->min_args))
+        return -1;
+    return none_bind_fault_in_range(d, n, arg_at);
 }
 
 /* The never-throwing append core (arr.cpp.h) shared by builtin_append and
