@@ -1956,6 +1956,19 @@ pExpr14(ParseContext &c, unsigned fl)
             if (fl & pFlags::pInDecl) {
                 for (const auto &e : idlist->elems)
                     declExprCheckId(c, e.get());
+            } else {
+                /* A target after the first is parsed as a name only, so it
+                 * gets the const marking pAcceptId gives the first one (and
+                 * a single target) here: a const kept at run time stays an
+                 * identifier, marked const, so codegen refuses the store as
+                 * the tree-walker does - it stored into `K` in `a, K = ..`. */
+                for (size_t i = 1; i < idlist->elems.size(); i++) {
+                    Identifier *id = idlist->elems[i].get();
+                    if (c.is_shadowed(id->uid))
+                        continue;
+                    if (id->eval(c.const_ctx).get_type()->t == Type::t_lval)
+                        id->is_const = true;
+                }
             }
 
             lside = std::move(idlist);

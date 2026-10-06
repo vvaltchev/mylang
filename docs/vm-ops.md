@@ -836,9 +836,18 @@ reference-carrying) every op here has an exact row. MultiUnpackV stays for a
 slot. 73_multi_unpack: 7.19x -> 2.21x of C++. Used as a VALUE (`w = a, b
 = arr`, `return a, b = arr` - README: the value is `none`) the multi-assign
 compiles as the statement above, then a `LoadConstV` of none (2026-10-06;
-a NotLoweredEx until then). Every one of these paths requires its targets
-to be resolved LOCALS: a global or a capture target is still a
-NotLoweredEx in the VM while the tree-walker runs it (open). A
+a NotLoweredEx until then). Those paths write frame slots only, so a
+target that is not a plain local - a GLOBAL or a CAPTURE slot, or a const
+or builtin name whose store throws - takes **`emit_multi_via_temps`**
+(2026-10-06; a NotLoweredEx until then, while the tree-walker ran it): the
+lowered unpack or MultiUnpackV into TEMPS (the strict length check and the
+spread first), then each target stored in order - MoveV / CoerceNumV /
+CompoundV for a local, StoreGlobalV / StoreCaptureV (after a CoerceNumV
+for a typed target) for the others, the rebind throw at a const or builtin
+target - so a failing store leaves the targets before it written, as in
+handle_single_expr14. The parser marks a const name past the first target
+const (it used to mark only the first, so the literal fast path stored
+into `K` in `a, K = ..`). A
 **`return <expr>;`** likewise lowers to a
 **`return <expr>;`** likewise lowers to a
 `ReturnV` that compiles the return expression (so `return f(x)` → CallV) then

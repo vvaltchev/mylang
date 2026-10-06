@@ -82,6 +82,6 @@ scripts. A list of such elements would be the first one that escapes:
 - inferencer: `type_of`, the expr14 arm (`is_idlist()` -> none).
 - codegen: `compile_boxed_expr_impl`'s Expr14 arm (the value form) and
   `try_multi_literal_store` / `try_multi_scalar_spread` /
-  `try_multi_unpack` (the statement form, all of which require LOCAL
-  targets - a global or capture target is still a NotLoweredEx, open).
+  `try_multi_unpack` / `emit_multi_via_temps` (the statement form; the
+  last stores a global, capture, const or builtin target).
 - test: tests/functional/73_multi_assign_value.my.

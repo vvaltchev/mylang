@@ -2744,6 +2744,99 @@ struct Codegen {
         ops.push_back(co);
     }
 
+    /*
+     * A multi-assignment one of whose targets is not a plain local - a
+     * GLOBAL or a CAPTURE slot, or a const or builtin name whose store
+     * throws (an undeclared name is a compile error before codegen, and a
+     * const multi-declaration does not parse) - unpacks into TEMPS, the
+     * strict length check (or the spread of a non-array) first, and then
+     * stores each target in order, as handle_single_expr14 does for the
+     * tree-walker: a store that fails (a coercion, a const or builtin
+     * target) leaves the targets before it written. MultiUnpackV and the
+     * lowered unpack write frame slots only, which is why such a target
+     * declined until 2026-10-06: a NotLoweredEx in the VM while the
+     * tree-walker ran the statement.
+     */
+    void emit_multi_via_temps(const Expr14 *e, const IdList *il, int rslot,
+                              Op compound_op, std::vector<CgInstr> &ops)
+    {
+        std::vector<int32_t> temps;
+        temps.reserve(il->elems.size());
+        for (const auto &t : il->elems)
+            temps.push_back(t->is_underscore() ? -1 : alloc_temp());
+        if (e->unpack_rv_array) {
+            emit_lowered_unpack(e, rslot, temps, e->unpack_rv_th,
+                                /*foreach=*/false, ops);
+        } else {
+            CgInstr in;
+            in.op = OpCode::MultiUnpackV;
+            in.node_idx = add_ast_node(e);   /* the strict-length caret */
+            in.set_a(slot_op(rslot));
+            in.target = static_cast<int>(chunk.unpack_targets.size());
+            chunk.unpack_targets.push_back(temps);
+            ops.push_back(in);
+        }
+        for (size_t i = 0; i < temps.size(); i++) {
+            const int src = temps[i];
+            if (src < 0)
+                continue;                   /* `_` */
+            const Identifier *t = il->elems[i].get();
+            /* a builtin name first: the parser marks a const builtin
+             * (`len`) const too, and its error is the builtin one */
+            if (t->sym.kind == SymKind::builtin || t->is_const) {
+                emit_throw(t->sym.kind == SymKind::builtin
+                               ? Chunk::ThrowKind::rebind_builtin
+                               : Chunk::ThrowKind::rebind_const,
+                           t->start, t->end, nullptr, ops);
+                return;                     /* nothing after it runs */
+            }
+            /* a plain store into a typed int/float target coerces (a
+             * compound does not - handle_single_expr14) */
+            const bool coerce = compound_op == Op::invalid
+                                && (t->decl_type == DeclType::i
+                                    || t->decl_type == DeclType::f);
+            CgInstr st;
+            st.target = t->sym.slot;
+            if (t->sym.kind == SymKind::local) {
+                if (compound_op != Op::invalid) {
+                    st.op = OpCode::CompoundV;
+                    st.node_idx = add_ast_node(e);
+                    st.set_b(slot_op(src));
+                    st.aop = compound_op;
+                } else if (coerce) {
+                    st.op = OpCode::CoerceNumV;
+                    st.node_idx = add_ast_node(e);
+                    st.target2 = t->decl_type == DeclType::f ? 1 : 0;
+                    st.set_a(slot_op(src));
+                } else {
+                    st.op = OpCode::MoveV;
+                    st.target2 = src;
+                }
+                ops.push_back(st);
+                continue;
+            }
+            int v = src;
+            if (coerce) {
+                CgInstr co;
+                co.op = OpCode::CoerceNumV;
+                co.node_idx = add_ast_node(e);
+                co.target = alloc_temp();
+                co.target2 = t->decl_type == DeclType::f ? 1 : 0;
+                co.set_a(slot_op(src));
+                ops.push_back(co);
+                v = co.target;
+            }
+            st.op = t->sym.kind == SymKind::global ? OpCode::StoreGlobalV
+                                                   : OpCode::StoreCaptureV;
+            st.set_a(slot_op(v));
+            if (compound_op != Op::invalid) {
+                st.node_idx = add_ast_node(e);   /* the operation's caret */
+                st.aop = compound_op;
+            }
+            ops.push_back(st);
+        }
+    }
+
     bool try_multi_unpack(const Expr14 *e, const IdList *il,
                           std::vector<CgInstr> &ops,
                           Op compound_op = Op::invalid)
@@ -2752,11 +2845,14 @@ struct Codegen {
         if (n == 0)
             return false;
         bool any_coerce = false;
+        bool via_temps = false;
         for (const auto &t : il->elems) {
             if (t->is_underscore())
                 continue;               /* `_` is a skipped slot */
-            if (t->sym.kind != SymKind::local || t->is_const)
-                return false;
+            if (t->sym.kind != SymKind::local || t->is_const) {
+                via_temps = true;           /* emit_multi_via_temps */
+                continue;
+            }
             /* A typed int/float target coerces per stored value on a PLAIN
              * assign (R5); every other declared type is a no-op coerce. A
              * COMPOUND doesn't coerce (op==assign only - measured), so its
@@ -2776,6 +2872,12 @@ struct Codegen {
             next_temp = save_top;
             chunk.consts.resize(cmark);
             return false;
+        }
+
+        if (via_temps) {
+            emit_multi_via_temps(e, il, rslot, compound_op, ops);
+            next_temp = save_top;
+            return true;
         }
 
         std::vector<int32_t> targets;
