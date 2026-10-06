@@ -21,6 +21,7 @@
 #include "inttest.h"
 
 #include <initializer_list>
+#include <new>
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
@@ -682,8 +683,37 @@ parse_args(int argc, char **argv)
 /* anno_code + render_analysis now live in analyzer.cpp (shared with the REPL's
  * :analyze meta-command). */
 
+/*
+ * OUT OF MEMORY is a catchable OutOfMemoryEx (errors.h, README): the
+ * new_handler throws it wherever operator new is refused, and as a
+ * RuntimeException every catch already in place conveys it.
+ */
+[[ noreturn ]] static void ml_out_of_memory()
+{
+    throw OutOfMemoryEx();
+}
+
+/*
+ * The one copy of the ASan hook (a weak symbol ASan reads at start; unused
+ * without it). allocator_may_return_null: a request ASan cannot serve is
+ * REFUSED, as a plain build's allocator refuses it - ASan's default aborts,
+ * so a sanitized run would end where a release raises OutOfMemoryEx. A
+ * RECYCLE build also turns leak detection off: the recycler never frees,
+ * so every recycled block would read as a leak (intentional, bounded).
+ */
+extern "C" const char *__asan_default_options()
+{
+#ifdef RECYCLE_ALLOC
+    return "allocator_may_return_null=1:detect_leaks=0";
+#else
+    return "allocator_may_return_null=1";
+#endif
+}
+
 int main(int argc, char **argv)
 {
+    std::set_new_handler(ml_out_of_memory);
+
     /*
      * An uncaught struct exception's payload references its StructTypeDef (to
      * print field names), and values unwinding out of the run may reference

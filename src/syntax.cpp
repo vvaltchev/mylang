@@ -60,16 +60,8 @@ uint64_t Construct::live_nodes = 0;
 #  define RECYCLE_UNPOISON(p, n) ((void) 0)
 #endif
 
-/*
- * The recycler never frees, so LeakSanitizer would report every recycled block
- * as a leak. Those leaks are intentional and bounded (one short -rt process),
- * so turn leak detection off for a RECYCLE build. (A weak hook ASan reads at
- * start; harmless if ASan isn't linked.)
- */
-extern "C" const char *__asan_default_options()
-{
-    return "detect_leaks=0";
-}
+/* The recycler never frees, so a RECYCLE build turns LeakSanitizer off:
+ * see __asan_default_options (mylang.cpp), the one copy of that hook. */
 
 namespace {
 

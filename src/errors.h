@@ -5,6 +5,7 @@
 #include "poolalloc.h"
 #include "uniqueid.h"
 
+#include <new>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -496,6 +497,47 @@ struct ShadowingEx : public Exception {
 /* Runtime errors */
 DECL_RUNTIME_EX(DivisionByZeroEx, "Division by zero")
 DECL_RUNTIME_EX(StackOverflowEx, "Maximum call depth exceeded")
+
+/*
+ * OUT OF MEMORY (2026-10-05; catchable - the maintainer's choice). It is a
+ * std::bad_alloc too, so it is what the process's new_handler throws
+ * (ml_out_of_memory, mylang.cpp): operator new may only throw a bad_alloc,
+ * and as a RuntimeException every existing catch - the VM's dispatch, each
+ * JIT status helper, a script's `catch` - conveys it unchanged. A builtin
+ * that builds a result of a size the program gives reserves it before
+ * filling it (reserve_or_oom, arr.cpp.h), so a refusal leaves nothing
+ * half-built. Not covered, and not coverable: a refusal inside a noexcept
+ * path (std::terminate), and the OS killing the process under overcommit.
+ */
+struct OutOfMemoryEx : public RuntimeException, public std::bad_alloc {
+
+    OutOfMemoryEx(Loc start = Loc(), Loc end = Loc())
+        : RuntimeException("OutOfMemoryEx", "Out of memory", start, end)
+    { }
+
+    OutOfMemoryEx(const char *custom_msg, Loc s = Loc(), Loc e = Loc())
+        : RuntimeException("OutOfMemoryEx", custom_msg, s, e)
+    { }
+
+    OutOfMemoryEx *clone() const override {
+        return new OutOfMemoryEx(*this);
+    }
+
+    const UniqueId *match_uid() const override {
+        static const UniqueId *u;       /* as DECL_RUNTIME_EX_BASE's */
+        if (!u)
+            u = UniqueId::get("OutOfMemoryEx");
+        return u;
+    }
+
+    [[ noreturn ]] void rethrow() const override {
+        throw *this;
+    }
+
+    const char *what() const noexcept override {
+        return "OutOfMemoryEx";
+    }
+};
 DECL_RUNTIME_EX(AssertionFailureEx, "Assertion failure")
 DECL_RUNTIME_EX(NotLValueEx, "Not an lvalue error")
 DECL_RUNTIME_EX(TypeErrorEx, "Type error")

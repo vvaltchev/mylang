@@ -37,6 +37,16 @@ static const char *const flat_array_violation_msg =
  *                    -> flat int, a float -> flat float, else general. For a
  *                    callback-built array use make_array().
  */
+/* n copies of `x`, reserved first (reserve_or_oom) */
+template <class Vec>
+static Vec filled(int_type n, typename Vec::value_type x, const ArgLoc *at)
+{
+    Vec v;
+    reserve_or_oom(v, static_cast<uint64_t>(n), at);
+    v.assign(static_cast<size_t>(n), x);
+    return v;
+}
+
 EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
                         const EvalValue *args, size_t nargs)
 {
@@ -66,14 +76,15 @@ EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
          * `none`.
          */
         if (hint == ArrHint::flat_i)
-            return SharedArrayObj(SharedArrayObj::ivec_type(n, 0));
+            return SharedArrayObj(filled<SharedArrayObj::ivec_type>(n, 0, arg));
         if (hint == ArrHint::flat_f)
-            return SharedArrayObj(SharedArrayObj::fvec_type(n, 0.0));
+            return SharedArrayObj(
+                filled<SharedArrayObj::fvec_type>(n, 0.0, arg));
         if (hint == ArrHint::flat_b)
-            return SharedArrayObj(SharedArrayObj::bvec_type(n, 0));
+            return SharedArrayObj(filled<SharedArrayObj::bvec_type>(n, 0, arg));
 
         SharedArrayObj::vec_type vec;
-        vec.reserve(n);
+        reserve_or_oom(vec, static_cast<uint64_t>(n), arg);
 
         for (int_type i = 0; i < n; i++)
             vec.emplace_back(none, ctx->const_ctx);
@@ -91,21 +102,21 @@ EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
     if (hint != ArrHint::general) {
 
         if (v.is<int_type>())
-            return SharedArrayObj(
-                SharedArrayObj::ivec_type(n, v.get<int_type>()));
+            return SharedArrayObj(filled<SharedArrayObj::ivec_type>(
+                n, v.get<int_type>(), arg));
 
         if (v.is<float_type>())
-            return SharedArrayObj(
-                SharedArrayObj::fvec_type(n, v.get<float_type>()));
+            return SharedArrayObj(filled<SharedArrayObj::fvec_type>(
+                n, v.get<float_type>(), arg));
 
         if (v.is<bool>())
-            return SharedArrayObj(
-                SharedArrayObj::bvec_type(n, v.get<bool>() ? 1 : 0));
+            return SharedArrayObj(filled<SharedArrayObj::bvec_type>(
+                n, v.get<bool>() ? 1 : 0, arg));
     }
 
     /* General fill: every element is (a copy of) the value. */
     SharedArrayObj::vec_type vec;
-    vec.reserve(n);
+    reserve_or_oom(vec, static_cast<uint64_t>(n), arg);
 
     for (int_type i = 0; i < n; i++)
         vec.emplace_back(v, ctx->const_ctx);
@@ -160,11 +171,28 @@ EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
      * general from the start; otherwise optimistic flat. mode: 0 = empty,
      * 1 = ints, 2 = floats, 4 = bools, 3 = general. */
     int mode = exprList->arr_hint == ArrHint::general ? 3 : 0;
+    const uint64_t un = static_cast<uint64_t>(n);
+
+    /* The result is reserved BEFORE the first call (reserve_or_oom), so a
+     * refused size runs no callback: the storage the destination's type
+     * names, else ints - the likeliest kind, and the probe that the size
+     * can be served at all. A reservation of the wrong kind is released
+     * (`release`) when the elements turn out to be another. */
     if (mode == 3)
-        gvec.reserve(n);
+        reserve_or_oom(gvec, un, arg0);
+    else if (exprList->arr_hint == ArrHint::flat_f)
+        reserve_or_oom(fvec, un, arg0);
+    else if (exprList->arr_hint == ArrHint::flat_b)
+        reserve_or_oom(bvec, un, arg0);
+    else
+        reserve_or_oom(ivec, un, arg0);
+
+    auto release = [](auto &v) {
+        std::remove_reference_t<decltype(v)>().swap(v);
+    };
 
     auto spill_to_general = [&]() {
-        gvec.reserve(n);
+        reserve_or_oom(gvec, un, arg0);
         if (mode == 1)
             for (int_type x : ivec) gvec.emplace_back(EvalValue(x), false);
         else if (mode == 2)
@@ -172,9 +200,9 @@ EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
         else if (mode == 4)
             for (unsigned char x : bvec)
                 gvec.emplace_back(EvalValue(static_cast<bool>(x)), false);
-        ivec.clear();
-        fvec.clear();
-        bvec.clear();
+        release(ivec);
+        release(fvec);
+        release(bvec);
         mode = 3;
     };
 
@@ -186,14 +214,29 @@ EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
         const EvalValue r = inv.call(i);
 
         if (mode == 0) {
+            /* the first element names the storage; release a reservation
+             * made for another kind before reserving this one */
             if (r.is<int_type>()) {
-                mode = 1; ivec.push_back(r.get<int_type>());
+                mode = 1;
+                reserve_or_oom(ivec, un, arg0);
+                ivec.push_back(r.get<int_type>());
             } else if (r.is<float_type>()) {
-                mode = 2; fvec.push_back(r.get<float_type>());
+                mode = 2;
+                release(ivec);
+                reserve_or_oom(fvec, un, arg0);
+                fvec.push_back(r.get<float_type>());
             } else if (r.is<bool>()) {
-                mode = 4; bvec.push_back(r.get<bool>() ? 1 : 0);
+                mode = 4;
+                release(ivec);
+                reserve_or_oom(bvec, un, arg0);
+                bvec.push_back(r.get<bool>() ? 1 : 0);
             } else {
-                mode = 3; gvec.reserve(n); gvec.emplace_back(r, false);
+                mode = 3;
+                release(ivec);
+                release(fvec);
+                release(bvec);
+                reserve_or_oom(gvec, un, arg0);
+                gvec.emplace_back(r, false);
             }
         } else if (mode == 1 && r.is<int_type>()) {
             ivec.push_back(r.get<int_type>());
@@ -774,15 +817,19 @@ EvalValue builtin_range(EvalContext *ctx, const ArgLocs *exprList,
      * general array instead - it is created in its final representation, never
      * promoted later.
      */
+    const ArgLoc *sized = exprList->arg(n == 1 ? 0 : 1);   /* the end */
+
     if (exprList->arr_hint == ArrHint::general) {
 
         SharedArrayObj::vec_type vec;
+        reserve_or_oom(vec, count, sized);
         for (u64 k = 0; k < count; k++)
             vec.emplace_back(EvalValue(elem(k)), false);
         return SharedArrayObj(std::move(vec));
     }
 
     SharedArrayObj::ivec_type ivec;
+    reserve_or_oom(ivec, count, sized);
 
     for (u64 k = 0; k < count; k++)
         ivec.push_back(elem(k));

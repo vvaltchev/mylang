@@ -1,0 +1,40 @@
+# Out of memory is the catchable OutOfMemoryEx (README), in every engine:
+# a builtin that builds a result of a size the program gives - range(),
+# array(), make_array(), lpad() / rpad() - reserves it before filling it,
+# so a size the allocator refuses (or no container can hold) raises at the
+# size argument with nothing half-built. Until 2026-10-05 it ended in a C++
+# terminate and a core dump. 2^59 / 2^62 are past every machine, so nothing
+# is actually allocated here; tests/driver_checks runs the growth case
+# (a string doubled until refused) under a memory cap.
+
+func oom(dyn f) {
+    try {
+        f();
+    } catch (OutOfMemoryEx) {
+        return true;
+    }
+    return false;
+}
+
+var calls = 0;
+func gen(int i) {
+    calls++;
+    return i;
+}
+
+var big = int(runtime(576460752303423488));      # 2^59
+var huge = int(runtime(4611686018427387904));    # 2^62
+assert(oom(func [big] () => array(big)));
+assert(oom(func [big] () => array(big, 0)));
+assert(oom(func [big] () => array(big, 1.5)));
+assert(oom(func [big] () => array(big, "x")));
+assert(oom(func [huge] () => range(0, huge)));
+assert(oom(func [huge] () => range(huge, 0, -1)));
+assert(oom(func [huge] () => lpad("a", huge)));
+assert(oom(func [huge] () => rpad("a", huge, "-")));
+assert(oom(func [big] () => make_array(big, gen)));
+assert(calls == 0);                 # reserved before the first call
+var dyn d = runtime(range(3));      # a dyn destination: general storage
+assert(oom(func [big] () { var dyn g = range(0, big); }));
+print("out of memory: refused, caught, and the program goes on",
+      len(range(int(runtime(5)))), len(d));
