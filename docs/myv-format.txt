@@ -1135,6 +1135,24 @@ implementation free to drift.
                           runs before `vm_jit_loaded_image`.  Derived
                           from the code beside it, the list cannot
                           disagree with that code.
+                          ONE stored input feeds it: a call's
+                          SCALAR-RESULT bit (opflags 0x80 on CallV /
+                          CachedCallV), which keeps the call's dst off
+                          the list - and the JIT writes an unlisted
+                          slot raw, so a false bit copied a returned
+                          reference without a retain (myv_fuzz
+                          small-390, 2026-10-06: a double free).  The
+                          reader therefore HONORS the bit only when it
+                          can justify it: the callee is a write-once
+                          global (`global_func_names`, not
+                          `global_slot_reassigned`) whose every ReturnV
+                          returns a literal or a slot its own derived
+                          `ref_slots` does not list - a least fixpoint
+                          from "no bit", so a recursive callee
+                          qualifies through its own calls.  Any other
+                          bit is CLEARED (never refused: a bit the
+                          compile set is always justified this way, so
+                          a valid image keeps every one).
 
     Chunk::catch_uids     The interned twins of `catch_types`; re-interned
                           inline as the names are read.

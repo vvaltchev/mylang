@@ -28658,6 +28658,126 @@ static bool myv_verify_ctor_minirun()
  * Watched failing: with the record stored (v17) the tampered lists came
  * back verbatim.
  */
+/*
+ * A call's SCALAR-RESULT claim (Instr::ret_scalar) is honored on load only
+ * when the loader can justify it (myv_derive_ref_slots): the claim keeps
+ * the call's dst out of ref_slots, where the JIT writes raw, so a false one
+ * copied a returned reference without a retain and the callee's frame
+ * freed it under the caller (myv_fuzz small-390: a double free). The
+ * finding's exact shape is built here on the in-memory program - `f`'s
+ * return retargeted from `p.x + 1` to the struct `p` - and the loaded
+ * image must drop the claim (main's dst is ref-listed again) and RUN
+ * clean (under ASan the old loader aborts here); the untampered image
+ * keeps the claim, which is what keeps a loaded image's code identical to
+ * a fresh compile's.
+ */
+static bool myv_ret_scalar_justified()
+{
+    const std::string src =
+        "struct P { int x; }\n"
+        "func f(a) { var p = P(a); return p.x + 1; }\n"
+        "var t = f(3);\n"
+        "print(t);\n";
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    std::string tdir = "/tmp";          /* portable, as myv_round_trip */
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-retscalar.myv";
+    /* the claim on main's call, and whether main's dst is ref-listed */
+    const auto main_call = [](const VmProgram &p, bool &claim,
+                              bool &listed) {
+        for (const Instr &in : p.root.code)
+            if (in.op == OpCode::CallV) {
+                claim = in.ret_scalar();
+                listed = std::binary_search(p.root.ref_slots.begin(),
+                                            p.root.ref_slots.end(),
+                                            static_cast<int32_t>(
+                                                in.target));
+                return true;
+            }
+        return false;
+    };
+    try {
+        for (const bool tamper : { false, true }) {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+            bool claim = false, listed = true;
+            Chunk *fck = nullptr;
+            for (const auto &d : prog.funcs)
+                if (d->vm_chunk && d->name && d->name->val == "f$0")
+                    fck = static_cast<Chunk *>(
+                        const_cast<void *>(d->vm_chunk));
+            if (!main_call(prog, claim, listed) || !claim || listed || !fck
+                    || fck->code.empty()
+                    || fck->code[0].op != OpCode::StructCtorV
+                    || fck->code.back().op != OpCode::ReturnV) {
+                fprintf(stderr, "myv_ret_scalar_justified: the program did "
+                                "not compile to the expected shape\n");
+                ok = false;
+                break;
+            }
+            if (tamper)                 /* return the struct `p` itself */
+                fck->code.back().pa = fck->code[0].target;
+            myv_write(prog, path, MyvSourceRef());
+            MyvSource img_src;
+            {
+                /* the claim as loaded, read with the JIT off: the load's
+                 * native tier deletes the ops it compiles (#56), main's
+                 * call among them */
+                const bool sj = g_jit_enabled;
+                g_jit_enabled = false;
+                VmProgram plain = myv_read(path, img_src);
+                g_jit_enabled = sj;
+                claim = !tamper;
+                listed = tamper;
+                if (!main_call(plain, claim, listed)
+                        || claim == tamper || listed != tamper) {
+                    fprintf(stderr, "myv_ret_scalar_justified: %s image: "
+                                    "claim %d, dst ref-listed %d\n",
+                            tamper ? "tampered" : "plain", claim, listed);
+                    ok = false;
+                }
+            }
+            /* and RUN it with the native tier, where the raw write was */
+            VmProgram loaded = myv_read(path, img_src);
+            std::ostringstream cap;
+            std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+            try {
+                vm_run(loaded);
+            } catch (Exception &e) {
+                cap << "EXC " << e.name << "\n";
+            }
+            std::cout.rdbuf(old_buf);
+            const std::string want = tamper ? "P(x: 3) \n" : "4 \n";
+            if (cap.str() != want) {
+                fprintf(stderr, "myv_ret_scalar_justified: %s image printed "
+                                "'%s'\n", tamper ? "tampered" : "plain",
+                        cap.str().c_str());
+                ok = false;
+            }
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_ret_scalar_justified: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    std::remove(path.c_str());
+    g_exec_engine = saved;
+    return ok;
+}
+
 static bool myv_ref_slots_derived()
 {
     const char *lines_arr[] = {
@@ -51720,6 +51840,8 @@ static const std::vector<extra_check> extra_checks =
     { "myv: v18 - ref_slots is DERIVED at load: a tampered stored list "
       "cannot reach the loaded chunk (root and a seeded function chunk)",
       myv_ref_slots_derived },
+    { "myv: a call's scalar-result claim is honored only when justified "
+      "(myv_fuzz small-390)", myv_ret_scalar_justified },
     { "myv: v19 - the root chunk's slot_count and the stored root slot "
       "count must agree, either copy mutated is refused",
       myv_root_slot_count_checked },

@@ -7832,8 +7832,13 @@ a reference in; that a proven slot holds the struct it was proven to hold).
 On bytecode read off a disk that premise simply does not hold, so the
 assertion is not a bug report - it aborts the process over an image the
 loader deliberately accepted. Both now return early when
-`g_untrusted_bytecode`. A wrong `ref_slots` can then only LEAK a reference,
-never index out of range, because verify_chunk bounds each entry.
+`g_untrusted_bytecode`. A wrong `ref_slots` does NOT only leak a reference,
+though (it was believed to, until myv_fuzz small-390, 2026-10-06): the JIT
+writes a slot OFF the list with two raw stores, so a returned reference
+written there takes no retain, and the callee's frame frees it under the
+caller - a double free. `ref_slots` is derived at load, and its one stored
+input, a call's scalar-result bit, is honored only when the loader can
+justify it (`myv_derive_ref_slots`, serialize.cpp; docs/myv-format.txt).
 **The rule:** in a helper the emitter cannot get a status from, a type miss or
 a bad index takes a DEFINED fallback (`none`, `0`), never a throw. The type
 test costs nothing - `get_ref` performs it anyway; only the miss branch
