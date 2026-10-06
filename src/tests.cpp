@@ -19806,6 +19806,28 @@ static bool highlight_disabled_is_identity()
     return ok;
 }
 
+/* A float's exponent is part of the number (2026-10-05: the scan took
+ * digits and dots only, so `2.5E-3` colored `2.5` and left `E-3` plain). */
+static bool highlight_float_exponent()
+{
+    set_highlight_enabled(true);
+    const std::string num = "\033[38;5;215m";
+    const std::string h = highlight_line("x = 2.5E-3 + 1e5 + 7e");
+    /* a signed exponent, an `e` no digit follows, a number and an
+     * exponent's digits that end the line */
+    const std::string h2 = highlight_line("y = 1e+5 + 2ex + 3E7");
+    const std::string h3 = highlight_line("z = 4");
+    return h.find(num + "2.5E-3\033[0m") != std::string::npos &&
+           h.find(num + "1e5\033[0m") != std::string::npos &&
+           h.find(num + "7\033[0m") != std::string::npos &&
+           strip_ansi(h) == "x = 2.5E-3 + 1e5 + 7e" &&
+           h2.find(num + "1e+5\033[0m") != std::string::npos &&
+           h2.find(num + "2\033[0m") != std::string::npos &&
+           h2.find(num + "3E7\033[0m") != std::string::npos &&
+           strip_ansi(h2) == "y = 1e+5 + 2ex + 3E7" &&
+           h3.find(num + "4\033[0m") != std::string::npos;
+}
+
 static bool highlight_tolerates_unterminated_string()
 {
     set_highlight_enabled(true);
@@ -51730,6 +51752,8 @@ static const std::vector<extra_check> extra_checks =
     { "highlight: stripping escapes restores the input",
       highlight_preserves_visible_text },
     { "highlight: disabled is identity", highlight_disabled_is_identity },
+    { "highlight: a float's exponent is part of the number",
+      highlight_float_exponent },
     { "highlight: tolerates an unterminated string",
       highlight_tolerates_unterminated_string },
     { "highlight: a string/comment is colored across lines",

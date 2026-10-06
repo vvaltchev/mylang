@@ -137,6 +137,20 @@ highlight_line(const string &src, int &state)
                    (isdigit(static_cast<unsigned char>(src[i])) ||
                     src[i] == '.'))
                 out += src[i++];
+            /* an exponent, as the lexer reads one: e or E, an optional
+             * sign, digits - `1e` alone (mid-typing) is not one yet */
+            if (i < n && (src[i] == 'e' || src[i] == 'E')) {
+                size_t j = i + 1;
+                if (j < n && (src[j] == '+' || src[j] == '-'))
+                    j++;
+                if (j < n && isdigit(static_cast<unsigned char>(src[j]))) {
+                    while (j < n &&
+                           isdigit(static_cast<unsigned char>(src[j])))
+                        j++;
+                    out.append(src, i, j - i);
+                    i = j;
+                }
+            }
             out += RESET;
             continue;
         }
