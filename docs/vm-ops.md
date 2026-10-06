@@ -1430,7 +1430,17 @@ loop already accumulates left-to-right like the tree-walker);
 int/float/boxed STATEMENT compilers, then use the target's slot as the
 operand — this exposed and fixed a retarget-guard bug where the
 plain-assign retarget could steal an inner store's dst: it now requires
-`rslot >= temp_base`); and the **typed IdList destructure** `fa, fb =
+`rslot >= temp_base`; since 2026-10-05 a GLOBAL or CAPTURE target runs
+the same statement compilers and reads the variable back, and an
+ELEMENT / FIELD / dict key or member / chain target goes through
+`try_value_store` - the generic `StoreLValueChainV` whatever the shape,
+the rvalue first and each key into a temp once, then the value: a plain
+`=`'s is the rvalue converted to the target's STATIC type
+(`Expr14::val_widen`, a CoerceNumV into a fresh temp; a dict target's
+`rv_coerce` already widened it), a compound's is read back through the
+same base and key temps with `SubscriptV` / `MemberV`. Each of those
+was a NotLoweredEx compile refusal while the tree-walker ran it);
+and the **typed IdList destructure** `fa, fb =
 [1, 2]` with int/float-annotated targets (`try_multi_unpack` accepts
 them; a per-target coerce vector rides the serializable
 **`Chunk::unpack_coerce`** pool — parallel to `unpack_targets`,

@@ -335,7 +335,13 @@ aspects:
     right-hand side first, then the target's container and each key, left
     to right and once each, and stores to the location they named:
     `a[f()] += g()` calls `g`, then `f`. `++`/`--` evaluate their operand
-    once too.
+    once too. The value of an assignment is the value it stored: the
+    right-hand side converted to the type the target is declared or
+    inferred to have (`var z = (fa[0] = 3)` with an `array<float>` `fa`,
+    or into a `float` variable or field, makes `z` the `float` `3.0`; a
+    `dyn` target converts nothing), and for a compound assignment the
+    result it stored. That holds for every target - a variable, an
+    element, a field, a dict key, a chain of them.
 
   - MyLang supports both the classic `for` loop and an explicit `foreach` loop.
 

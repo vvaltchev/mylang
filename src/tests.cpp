@@ -7685,6 +7685,57 @@ static const std::vector<test> tests =
         "var dyn p = 0; var dyn q = 0;",
         "p = (q = [1, 2]);",
         "assert(intptr(p) == intptr(q));" } },
+    /* ...and into an ELEMENT, a FIELD, a dict key or member, a chain, a
+     * global or a capture: a NotLoweredEx compile refusal in the VM until
+     * 2026-10-05 (the tree-walker ran it). The value is the STORED value -
+     * the rvalue converted to the target's static type (val_widen), and a
+     * compound's result, read back through the same key temps. More in
+     * tests/functional/70_assign_value_store.my. */
+    { "vm: a store into an element / field / key as a value",
+      { "struct P { int x; float y; } struct I { int a; }",
+        "struct Q { int n; I inn; }",
+        "var a = [1, 2]; var fa = [0.5]; var d = {\"k\": 1};",
+        "var p = P(1, 1.0); var qs = [Q(1, I(2))];",
+        "var z1 = (a[int(runtime(0))] += 5);",
+        "var z2 = (fa[0] = int(runtime(3)));",
+        "var z3 = (d[\"k\"] = int(runtime(4))) + (d.j = 1);",
+        "var z4 = (p.y = int(runtime(2)));",
+        "var z5 = 100 + (qs[0].inn.a *= int(runtime(3))) * 2;",
+        "assert(z1 == 6 && a[0] == 6 && z3 == 5 && d.k == 4 && d.j == 1);",
+        "assert(z2 == 3.0 && typestr(z2) == \"float\" && fa[0] == 3.0);",
+        "assert(z4 == 2.0 && typestr(z4) == \"float\" && p.y == 2.0);",
+        "assert(str(z2) == \"3.000000\" && str(z4) == \"2.000000\");",
+        "assert(z5 == 112 && qs[0].inn.a == 6);" } },
+    { "vm: a store into a global / capture as a value",
+      { "var g = 1.5; var gi = 1;",
+        "func setg() { var z = (g = int(runtime(3))); return z; }",
+        "func addg() { return (gi += int(runtime(4))) * 10; }",
+        "var gz = setg();",
+        "assert(gz == 3.0 && typestr(gz) == \"float\" && g == 3.0);",
+        "assert(str(gz) == \"3.000000\");",
+        "assert(addg() == 50 && gi == 5);",
+        "var c = 2;",
+        "var h = func [c] () { var z = (c += 3); return z * 10 + c; };",
+        "assert(h() == 55 && h() == 88 && c == 2);" } },
+    /* the value is typed by the STATIC target: a dyn target yields the
+     * rvalue as typed, though the int field it holds stored 1 */
+    { "vm: a store into a dyn target as a value keeps the rvalue's type",
+      { "struct P { int x; }",
+        "var dyn dp = runtime(P(1));",
+        "var zb = (dp.x = true);",
+        "assert(zb == true && typestr(zb) == \"bool\" && dp.x == 1);" } },
+    { "vm: a store as a value: the right-hand side, then each key",
+      { "var ev = [];",
+        "func v(x) { append(ev, \"v\"); return x; }",
+        "func k(x) { append(ev, \"k\"); return x; }",
+        "var ea = [[1, 2], [3, 4]];",
+        "var ez = (ea[k(1)][k(0)] = v(30));",
+        "var ec = (ea[k(0)][k(1)] += v(5));",
+        "assert(ev == [\"v\", \"k\", \"k\", \"v\", \"k\", \"k\"]);",
+        "assert(ez == 30 && ec == 7 && ea[1][0] == 30);" } },
+    { "vm: a store as a value: a compound on a missing key",
+      { "var d = {\"a\": 1}; var z = (d[\"no\"] += 1);" },
+      &typeid(KeyNotFoundEx) },
     /* A TYPED IdList reassign coerces PER-TARGET (int elements widen into
      * float targets), exactly like the scalar typed store. */
     { "vm: typed IdList destructure coerces per-target",

@@ -2815,6 +2815,10 @@ void Inferencer::annotate_hints(Construct *n)
             if (bt->kind == StaticTypeKind::Dict)
                 e->rv_coerce = numeric_widen(bt->val,
                                              type_of(e->rvalue.get()));
+            else
+                e->val_widen = numeric_widen(
+                    type_of(const_cast<Construct *>(lv)),
+                    type_of(e->rvalue.get()));
         }
     }
     if (ctag(n) == ConstructType::subscript) {
@@ -4030,8 +4034,27 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
 
     if (ctag(e) == ConstructType::expr14) {
         auto *e14 = static_cast<const Expr14 *>(e);
-        if (e14->op == Op::assign)
-            return type_of(e14->rvalue.get());
+        if (e14->op == Op::assign) {
+            /* The value is the STORED value: the rvalue converted to the
+             * target's static type (README *the value of an assignment*) -
+             * an int into a float variable, field or array<float> element
+             * is a float. Expr14::val_widen / rv_coerce and a typed
+             * variable's own coercion are the runtime half of this. */
+            StaticTypeRef rt = type_of(e14->rvalue.get());
+            const Construct *lv = e14->lvalue.get();
+            if (ctag(lv) == ConstructType::id
+                    || ctag(lv) == ConstructType::subscript
+                    || ctag(lv) == ConstructType::member) {
+                const DeclType w = numeric_widen(
+                    type_of(const_cast<Construct *>(lv)), rt);
+                const bool o = static_type_resolve(rt)->opt;
+                if (w == DeclType::f)
+                    return A.float_ty(o);
+                if (w == DeclType::i)
+                    return A.int_ty(o);
+            }
+            return rt;
+        }
         return binop_result(compound_binop(e14->op),
                             type_of(e14->lvalue.get()),
                             type_of(e14->rvalue.get()));
