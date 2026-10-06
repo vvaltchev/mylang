@@ -1,0 +1,106 @@
+# Postfix `x++` / `x--` yields the value x held BEFORE the change - exactly,
+# for a float too. Until 2026-10-05 the typed path derived it as new -/+ 1,
+# which is not the old value for a float: (0.1 + 1) - 1 is
+# 0.10000000000000009, (1e-20 + 1) - 1 is 0.0, and -0.0 came back as 0.0.
+# The tree-walker did that for every lvalue but a local (an element, a
+# field, a global read in a function, a capture), the VM for an lvalue with
+# an impure index; the others read the old value first. Each shape below
+# runs with every value, both directions.
+
+func same(dyn a, dyn b) => a == b && str(a) == str(b);
+
+func check(str what, dyn got, dyn want) {
+    if (!same(got, want)) {
+        print("FAIL", what, str(got, 20), "want", str(want, 20));
+        assert(false);
+    }
+}
+
+func at(i) { return int(runtime(i)); }
+func key(s) { return str(runtime(s)); }
+
+struct S { float f; }
+struct B { float f; str tag; }
+
+var g = 0.0;
+func g_inc() { var r = g++; return r; }
+func g_dec() { var r = g--; return r; }
+
+func mk_inc(float start) { return func [start] () { var r = start++; return r; }; }
+func mk_dec(float start) { return func [start] () { var r = start--; return r; }; }
+
+var vals = [float(runtime(0.1)), -float(runtime(0.0)),
+            float(runtime(1e-20)), float(runtime(0.3)),
+            float(runtime(1e16))];
+
+# The VM copies a float into a typed float LOCAL as `r + 0.0`, which turns
+# a -0.0 into +0.0 (a separate defect, reported with this change): the
+# expected value is a `dyn` local, and the typed local `x` is written by
+# an arithmetic op, which stores its result straight into x.
+for (var k = 0; k < len(vals); k++) {
+    var dyn v = vals[k];
+    var x = vals[k] * 1.0;
+    check("local++", x++, v);
+    x = vals[k] * 1.0;
+    check("local--", x--, v);
+    x = vals[k] * 1.0;
+    check("++local", ++x, v + 1.0);
+
+    g = vals[k];
+    check("global++", g_inc(), v);
+    check("global after", g, v + 1.0);
+    g = vals[k];
+    check("global--", g_dec(), v);
+
+    var ci = mk_inc(vals[k]);
+    check("capture++", ci(), v);
+    check("capture again", ci(), v + 1.0);
+    var cd = mk_dec(vals[k]);
+    check("capture--", cd(), v);
+
+    var s = S(vals[k]);
+    check("pod field++", s.f++, v);
+    check("pod field after", s.f, v + 1.0);
+    s.f = vals[k];
+    check("pod field--", s.f--, v);
+
+    var b = B(vals[k], "t");
+    check("boxed field++", b.f++, v);
+    b.f = vals[k];
+    check("boxed field--", b.f--, v);
+
+    var a = [vals[k], vals[k]];
+    check("elem++", a[0]++, v);
+    check("elem--", a[1]--, v);
+    check("elem after", a, [v + 1.0, v - 1.0]);
+    a = [vals[k]];
+    check("impure elem++", a[at(0)]++, v);
+    a = [vals[k]];
+    check("impure elem--", a[at(0)]--, v);
+
+    var d = {"k": vals[k]};
+    check("dict value++", d["k"]++, v);
+    d["k"] = vals[k];
+    check("dict member--", d.k--, v);
+    d["k"] = vals[k];
+    check("impure dict value++", d[key("k")]++, v);
+
+    var m = [[0.0, vals[k]]];
+    check("nested++", m[0][1]++, v);
+    m[0][1] = vals[k];
+    check("impure nested--", m[at(0)][1]--, v);
+
+    var ds = {"a": S(vals[k])};
+    check("impure pod field++", ds[key("a")].f++, v);
+    check("impure pod field after", ds["a"].f, v + 1.0);
+}
+
+# An int's old value was exact already (new - 1 wraps back); kept honest.
+var big = 9223372036854775807;
+var was = big++;
+check("int max++", was, 9223372036854775807);
+check("int wrapped", big, -9223372036854775807 - 1);
+var ia = [-9223372036854775807 - 1];
+check("int min--", ia[at(0)]--, -9223372036854775807 - 1);
+
+print("ok");

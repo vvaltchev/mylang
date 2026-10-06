@@ -7683,6 +7683,28 @@ static const std::vector<test> tests =
       { "func mk() { return [9, 8]; }",
         "var dyn z = 0;",
         "z = mk()[0]++;" }, &typeid(NotLValueEx) },
+    /* Postfix `++` / `--` on a FLOAT yields the exact old value. The typed
+     * path derived it as new -/+ 1 until 2026-10-05 - the tree-walker for
+     * every lvalue but a local, the VM's inc-dec chain for an impure index -
+     * and (0.1 + 1) - 1 is not 0.1, (1e-20 + 1) - 1 is 0.0, and -0.0 came
+     * back +0.0. tests/functional/67_incdec_exact_old.my covers every shape
+     * and both directions. */
+    { "incdec: postfix yields the exact old float",
+      { "struct S { float f; }",
+        "func at(i) { return int(runtime(i)); }",
+        "var g = float(runtime(0.1));",
+        "func gi() { var r = g++; return r; }",
+        "assert(gi() == 0.1);",
+        "var s = S(float(runtime(0.1)));",
+        "assert(s.f-- == 0.1);",
+        "var a = [float(runtime(0.1)), float(runtime(0.3))];",
+        "assert(a[0]++ == 0.1);",
+        "assert(a[at(1)]-- == 0.3);",
+        "var d = {\"k\": float(runtime(1e-20))};",
+        "assert(d[\"k\"]++ == 1e-20);",
+        "var z = [-float(runtime(0.0))];",
+        "assert(str(z[at(0)]++) == \"-0.000000\");",
+        "assert(str(z[0]) == \"1.000000\");" } },
     { "v3 recursion: a non-negative-base recursion folds negatives safely",
       { "func fib(n) { if (n < 2) return n; return fib(n-1) + fib(n-2); }",
         "assert(fib(7) == 13);" } },

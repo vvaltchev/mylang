@@ -142,5 +142,26 @@ var dyn pr = runtime(print);
 want("a builtin in a variable", outcome(func [pr] () { pr++; }),
      "TypeErrorEx");
 
+# --- typed postfix on a float yields the EXACT old value (it was derived
+# as new - 1: 0.1++ gave 0.10000000000000009), through every store path
+var gf = float(runtime(0.1));               # a global: rf() reads it
+func rf() { return gf; }
+var gold = gf++;
+want("global gf++ old", gold == 0.1, true);
+want("global gf", rf(), 1.1);
+var capped = func [gf] () { var o = gf--; return o; };
+want("capture gf-- old", capped() == 1.1, true);
+var fd = {"k": float(runtime(1e-20))};
+var fdo = fd.k++;
+want("dict member fd.k++ old", fdo == 1e-20, true);
+var fdo2 = fd["k"]--;
+want("dict key fd[k]-- old", fdo2, 1.0);
+struct Q { int x; float y; }
+var dq = {"a": Q(int(runtime(1)), float(runtime(0.1)))};
+var dqo = dq["a"].y++;
+dq["a"].x++;
+want("dict-held POD field old", dqo == 0.1, true);
+want("dict-held POD field x", dq["a"].x, 2);
+
 print("dyn inc-dec: " + str(bad) + " failure(s)");
 assert(bad == 0);
