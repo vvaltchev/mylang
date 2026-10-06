@@ -1,5 +1,8 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
->> TypeMismatchEx: can only throw a struct instance, got 'int'
+>> TypeMismatchEx: can only throw a struct instance, got 'int' at line 1, col 7:27
+
+    throw -9223372036854775808;
+          ^^^^^^^^^^^^^^^^^^^^
 >> Unknown trace category: _ (try :help optimizations)
 tracing: off
 >> v1 = 9223372036854775807;

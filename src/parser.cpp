@@ -689,16 +689,18 @@ pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 
     } else if (pAcceptKeyword(c, Keyword::kw_true)) {
 
+        /* the keyword's own span: from `start`, not from the next token
+         * (pAcceptKeyword has already moved past it) */
         v.reset(new LiteralBool(true));
         v->start = start;
-        v->end = c.get_loc() + 5;
+        v->end = start + 5;
         return true;
 
     } else if (pAcceptKeyword(c, Keyword::kw_false)) {
 
         v.reset(new LiteralBool(false));
         v->start = start;
-        v->end = c.get_loc() + 6;
+        v->end = start + 6;
         return true;
     }
 
@@ -1390,10 +1392,12 @@ pExpr01(ParseContext &c, unsigned fl)
     } else if (pAcceptKeyword(c, Keyword::kw_none) ||
                pAcceptKeyword(c, Keyword::kw_null)) {
 
-        /* `null` is an alias for `none`. */
+        /* `null` is an alias for `none` - both four letters. The span is the
+         * keyword's own (end = last column + 2), not up to the next token,
+         * which made a caret on it depend on the spacing after it. */
         main.reset(new LiteralNone());
         main->start = start;
-        main->end = c.get_loc();
+        main->end = start + 5;
         return main;     /* Not subscriptable, nor callable */
     }
 
@@ -2994,30 +2998,36 @@ MakeConstructFromConstVal(const EvalValue &v,
                           bool process_arrays,
                           bool immutable)
 {
-    if (v.is<int_type>()) {
-        out = make_unique<LiteralInt>(v.get<int_type>());
+    /*
+     * The literal REPLACES the node in `out` (when there is one), so it
+     * keeps that node's span: a folded `65` or `K` passed to a builtin is
+     * still where its caret goes. A span-less literal made every error
+     * about it loc-less, and the call then stamped the whole ARGUMENT
+     * LIST on it - `str(f, 65)` underlined `f, 65` (until 2026-10-05).
+     */
+    const Loc span_start = out ? out->start : Loc();
+    const Loc span_end = out ? out->end : Loc();
+    auto place = [&](unique_ptr<Construct> n) {
+        n->start = span_start;
+        n->end = span_end;
+        out = std::move(n);
         return true;
-    }
+    };
 
-    if (v.is<bool>()) {
-        out = make_unique<LiteralBool>(v.get<bool>());
-        return true;
-    }
+    if (v.is<int_type>())
+        return place(make_unique<LiteralInt>(v.get<int_type>()));
 
-    if (v.is<float_type>()) {
-        out = make_unique<LiteralFloat>(v.get<float_type>());
-        return true;
-    }
+    if (v.is<bool>())
+        return place(make_unique<LiteralBool>(v.get<bool>()));
 
-    if (v.is<NoneVal>()) {
-        out = make_unique<LiteralNone>();
-        return true;
-    }
+    if (v.is<float_type>())
+        return place(make_unique<LiteralFloat>(v.get<float_type>()));
 
-    if (v.is<SharedStr>()) {
-        out = make_unique<LiteralStr>(v);
-        return true;
-    }
+    if (v.is<NoneVal>())
+        return place(make_unique<LiteralNone>());
+
+    if (v.is<SharedStr>())
+        return place(make_unique<LiteralStr>(v));
 
     if (process_arrays) {
 
@@ -3047,11 +3057,10 @@ MakeConstructFromConstVal(const EvalValue &v,
              */
             const bool ro = immutable || is_readonly_value(v);
 
-            out = make_unique<LiteralObj>(
+            return place(make_unique<LiteralObj>(
                 ro ? make_const_clone(v) : v.clone(),
                 ro
-            );
-            return true;
+            ));
         }
     }
 
@@ -3354,6 +3363,11 @@ cse_materialize(ParseContext &c,
 {
     if (!cse_materialize_core(c, node, out, process_arrays, immutable))
         return false;
+    /* the baked literal stands where `node` stood: its span */
+    if (out && !out->start) {
+        out->start = node->start;
+        out->end = node->end;
+    }
     /* #47: `node` is about to be freed by the caller - keep alive every
      * function literal in it that the baked value still names. */
     if (out && ctag(out.get()) == ConstructType::lit_obj)
