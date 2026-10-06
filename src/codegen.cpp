@@ -6114,13 +6114,20 @@ struct Codegen {
         if (e->op == Op::assign) {
             if (!definitely_int(e->rvalue.get()))
                 return false;
+            const size_t rmark = ops.size();
             Operand r;
             if (!compile_int_expr(e->rvalue.get(), r, ops))
                 return false;
             /* Peephole: if the last op produced `r` in a temp, retarget it to
              * write `dst` directly; a constant -> a clean LoadImmInt; else a
-             * slot-to-slot copy (dst = r + 0). */
-            if (!r.is_lit && !ops.empty() && ops.back().op == OpCode::IntBin
+             * slot-to-slot copy (dst = r + 0). The retarget is sound only
+             * for an op THIS rvalue emitted (ops grew past rmark) writing a
+             * scratch TEMP (r.slot >= temp_base) - compile_to_run_slot's
+             * rule: a bare local `r` emits nothing, so ops.back() is the
+             * PREVIOUS statement's producer of that local, and stealing it
+             * left the local unwritten (`var x = v;` after `v = ...`). */
+            if (!r.is_lit && ops.size() > rmark && r.slot >= temp_base
+                && ops.back().op == OpCode::IntBin
                 && ops.back().target == r.slot) {
                 ops.back().target = dst.slot;
             } else if (r.is_lit) {
@@ -6509,10 +6516,17 @@ struct Codegen {
         const int dslot = dst->sym.slot;
 
         if (e->op == Op::assign) {
+            const size_t rmark = ops.size();
             Operand r;
             if (!compile_float_expr(e->rvalue.get(), r, ops))
                 return false;
-            if (!r.is_lit && !ops.empty() && ops.back().op == OpCode::FloatBin
+            /* Retarget the producer of `r` to write dst - only one THIS
+             * rvalue emitted, into a scratch TEMP (the int twin's rule,
+             * above). `var v = f(); var x = v;` used to rename the previous
+             * statement's `v = r3 + 0.0` to write x: v was never written
+             * (`<none>` under the JIT, an assertion under -nj). */
+            if (!r.is_lit && ops.size() > rmark && r.slot >= temp_base
+                && ops.back().op == OpCode::FloatBin
                 && ops.back().target == r.slot) {
                 ops.back().target = dslot;
             } else if (r.is_lit) {
@@ -6523,12 +6537,16 @@ struct Codegen {
                 in.set_a(r);
                 ops.push_back(in);
             } else {
-                CgInstr in;                /* dst = r + 0.0 (slot copy) */
+                /* dst = r + -0.0, the slot copy: -0.0 is the IEEE identity
+                 * of `+` for EVERY value. `+ 0.0` turned a -0.0 into +0.0,
+                 * so `var b = vals[k]` lost the sign the tree-walker keeps
+                 * (RULE 2; until 2026-10-05). */
+                CgInstr in;
                 in.op = OpCode::FloatBin;
                 in.node_idx = add_ast_node(s);
                 in.target = dslot;
                 in.set_a(r);
-                in.set_b(float_lit(0));
+                in.set_b(float_lit(-0.0));
                 in.aop = Op::plus;
                 ops.push_back(in);
             }

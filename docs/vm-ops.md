@@ -952,7 +952,13 @@ expressions** use scratch temp slots (`compile_int_expr` + a temp register
 allocator above the resolved locals; `Chunk::n_temps` grows the frame).
 **Bool-safety:** a plain assign's rhs must be `definitely_int`
 (arith/neg/int-literal, never a leaf id or comparison — both can be bool), since
-writing an int into a bool slot would corrupt it. **Float** loops compile too
+writing an int into a bool slot would corrupt it. A plain assign RETARGETS
+the op that produced its rvalue to write the destination - only an op the
+rvalue itself emitted, into a scratch temp (`r >= temp_base`, the boxed
+twin's rule): a bare local emits nothing, and stealing the previous
+statement's producer left that local unwritten (`var x = v;`, fixed
+2026-10-05). A slot-to-slot float copy is `dst = r + -0.0`, the IEEE
+identity of `+` (`+ 0.0` turned -0.0 into +0.0). **Float** loops compile too
 (`FloatBin`/`JumpUnlessFloatCmp`, operands promote), as do **mixed** int/float
 loops (each condition/statement dispatched by its own kind) and **counted `for`
 loops** — the last via a **fused `ForLoopStep`** superinstruction (`i += step` +
