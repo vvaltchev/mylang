@@ -108,4 +108,17 @@ func case10(int k, int z) {
 }
 assert(case10(7, int(runtime(0))) == "EE");
 
+# 11. every argument is evaluated before any parameter is bound: a later
+#     argument's side effect runs even when an earlier one's coercion
+#     fails (`a` is int, `d` a float)
+func g11(int a, b) { return a + b; }
+func case11(dyn d) {
+    trail = "";
+    try { var r = g11(d, tick()); trail = trail + "r"; }
+    catch (TypeErrorEx) { trail = trail + "E"; }
+    return trail;
+}
+assert(case11(runtime(2.5)) == "tE");
+assert(case11(runtime(2)) == "tr");
+
 print("ok");

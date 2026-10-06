@@ -1,0 +1,7 @@
+# THE ARGUMENT RULE: a real call evaluates every argument before it binds
+# any, so a later argument's side effect ("tick") runs before an earlier
+# argument's coercion fails - caret on that argument, no frame for g
+func g(int a, b) { return a + b; }
+func tick() { print("tick"); return 1; }
+func h(dyn d) { return g(d, tick()); }
+print(h(runtime(2.5)));
