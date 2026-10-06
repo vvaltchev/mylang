@@ -130,8 +130,9 @@ want("a throwing base", outcome(func () { boom().x++; }),
      "DivisionByZeroEx");
 want("const array", outcome(func () { inc_k(K); }), "NotLValueEx");
 want("const struct", outcome(func () { inc_kp(KP); }), "NotLValueEx");
-want("field of an element", outcome(func [pts] () { pts[0].x++; }),
-     "NotLValueEx");
+# a flat struct array's element: stored in place since 2026-10-05
+want("field of an element", outcome(func [pts] () { pts[0].x++; }), "ok");
+want("its new value", pts[0].x, 2);
 want("missing field", outcome(func [bx] () { bx.nope++; }), "TypeErrorEx");
 want("missing POD field", outcome(func [p] () { p.nope--; }), "TypeErrorEx");
 want("temporary's field", outcome(func () { mkb().x++; }), "NotLValueEx");

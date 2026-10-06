@@ -6360,11 +6360,26 @@ but the per-element `StructObject` allocation is gone (build overhead
 - **`StructObject`** holds EITHER `bytes` (POD: a `def->size` C-laid-out buffer;
   `pod_get`/`pod_set` load/store a typed scalar or an inline nested struct at a
   field offset) OR `fields` (boxed). A POD field WRITE goes through
-  `member_store` (a direct byte store, the twin of `subscript_store`; a
-  field of a FLAT struct array's element is still not storable - the
-  element is bytes, with no object to write through); a POD field READ in
-  `MemberExpr` returns a value
+  `member_store` (a direct byte store, the twin of `subscript_store`); a
+  POD field READ in `MemberExpr` returns a value
   (no per-field LValue). `==` is `memcmp` for POD, field-wise for boxed.
+  **⛔ A STORE THROUGH BYTES NEEDS A PLACE, NOT AN LVALUE (2026-10-05).**
+  A field of a FLAT struct array's element (`ps[i].x = v`) and a field of
+  a POD struct embedded inline (`p.inner.x = v`) live in bytes no
+  `LValue` covers, and a READ of either returns a COPY - so every store
+  path that evaluated the base and wrote the copy raised NotLValueEx, in
+  every engine, while README called the layout transparent. A store
+  walks to a **`PodPlace`** (eval.h: the struct's first byte + its def)
+  instead: `pod_place_elem` enters it at a flat element (bounds, the
+  index's type, readonly and the slice/alias COW, exactly as the element
+  store does), `pod_place_rooted_field` / `pod_place_step` descend inline
+  POD fields, and `pod_place_store` / `pod_place_incdec` write. The
+  tree-walker's `member_target` (member_store, the dyn inc-dec) and the
+  VM/JIT's shared `vm_chain_walk` (StoreLValueChainV, IncDecChainV) both
+  carry one, so the engines cannot drift. A place is entered only from
+  an `LValue` (a variable, a global, a capture, or a chain from one), and
+  the store runs OUTSIDE the walk's caret catch, so a compound op's error
+  keeps the whole-expression caret (`op_caret`).
 - **Flat `array<PodStruct>`** — `SharedArrayObj::Storage::structs`: a contiguous
   byte buffer + the element `StructTypeDef*` + cached `stride` (so the template
   never needs `StructTypeDef` complete). Created value-driven (a literal of

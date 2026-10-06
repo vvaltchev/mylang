@@ -93,8 +93,9 @@ assert(outcome(func [d] () { d[-4]--; }) == "OutOfBoundsEx");
 assert(outcome(func [d] () { d["x"]++; }) == "TypeErrorEx");
 assert(outcome(func () { inc_k(K); }) == "NotLValueEx");
 assert(outcome(func () { inc_kp(KP); }) == "NotLValueEx");
-assert(outcome(func [pts] () { pts[0].x++; }) == "NotLValueEx");
-assert(str(d) == "[10, 22, 31]" && p.b);
+# a field of a flat struct array's element (71_flat_struct_field_store.my)
+assert(outcome(func [pts] () { pts[0].x++; }) == "ok");
+assert(str(d) == "[10, 22, 31]" && p.b && pts[0].x == 2);
 
 # Two the engines disagreed on before they shared the code: a missing member
 # (the VM's statement form said NotLValueEx, the tree-walker TypeErrorEx),

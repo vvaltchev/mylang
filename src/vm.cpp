@@ -858,13 +858,33 @@ vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
  * tree-walker's per-node stamp (an internal throw is loc-less). */
 /* `mkeys` = chunk.member_keys.data() (the buffer, not the whole chunk) - so the
  * JIT can bake it (a stable pool address) instead of a &chunk that dangles. */
+/* `place` (a store's walk): where a step's struct lives in bytes no LValue
+ * covers - a writable flat struct array's element, an inline POD field of a
+ * rooted POD struct - the walk enters them (POD places, eval.h) and keeps
+ * stepping through inline POD members there; a step the bytes cannot take
+ * reads the struct as a value from there on, as the walk always did. */
 static void
 vm_chain_walk(EvalContext &ctx, const Chunk::MemberKey *mkeys, EvalValue &cur,
-              const std::vector<Chunk::ChainStep> &steps, size_t upto)
+              const std::vector<Chunk::ChainStep> &steps, size_t upto,
+              PodPlace *place = nullptr)
 {
     for (size_t i = 0; i < upto; i++) {
         const Chunk::ChainStep &step = steps[i];
         try {
+            if (place && place->bytes) {
+                if (step.is_member &&
+                    pod_place_step(*place, mkeys[step.operand].memUid))
+                    continue;
+                cur = pod_place_value(*place);
+                *place = PodPlace();
+            }
+            if (place && cur.is<LValue *>() &&
+                (step.is_member
+                 ? pod_place_rooted_field(cur.get<LValue *>(),
+                                          mkeys[step.operand].memUid, *place)
+                 : pod_place_elem(cur.get<LValue *>(),
+                                  ctx.frame->at(step.operand).get(), *place)))
+                continue;
             if (step.is_member) {
                 const Chunk::MemberKey &mk = mkeys[step.operand];
                 const EvalValue cval =
@@ -905,10 +925,22 @@ vm_chain_lvalue_store_op(EvalContext &ctx,
 {
     const size_t n = steps.size();
     EvalValue cur = EvalValue(base);
-    vm_chain_walk(ctx, mkeys, cur, steps, n - 1);
+    PodPlace place;
+    vm_chain_walk(ctx, mkeys, cur, steps, n - 1, &place);
 
     const Chunk::ChainStep &last = steps[n - 1];   /* node = the whole lvalue */
     try {
+        /* a field in bytes no LValue covers: stored in place */
+        if (place.bytes) {
+            const int slot = last.is_member
+                ? place.def->slot_of(mkeys[last.operand].memUid) : -1;
+            if (slot >= 0) {
+                pod_place_store(place, slot, op, value,
+                                last.lstart, last.lend);
+                return;
+            }
+            cur = pod_place_value(place);
+        }
         /* The final store needs a live lvalue; a VALUE-walked chain (a POD /
          * readonly intermediate) can't be stored into -> NotLValueEx at the
          * whole-lvalue loc, exactly as the tree-walker's handle_single_expr14. */
@@ -961,9 +993,26 @@ vm_incdec_chain_core(EvalContext &ctx, const Chunk::IncDecChain &site,
     const std::vector<Chunk::ChainStep> &steps = site.steps;
     const size_t n = steps.size();
 
-    vm_chain_walk(ctx, mkeys, cur, steps, n - 1);
+    PodPlace place;
+    vm_chain_walk(ctx, mkeys, cur, steps, n - 1, &place);
 
     const Chunk::ChainStep &last = steps[n - 1];
+
+    /* a field in bytes no LValue covers: the read-modify-write in place */
+    if (place.bytes) {
+        const int slot = last.is_member
+            ? place.def->slot_of(mkeys[last.operand].memUid) : -1;
+        if (slot >= 0) {
+            EvalValue r = pod_place_incdec(place, slot, is_inc,
+                                           site.is_prefix,
+                                           last.lstart, last.lend,
+                                           site.id_start, site.id_end);
+            if (dst >= 0)
+                ctx.frame->at(dst).put(std::move(r));
+            return;
+        }
+        cur = pod_place_value(place);
+    }
     EvalValue memId;
     const UniqueId *memUid = nullptr;
     EvalValue key;

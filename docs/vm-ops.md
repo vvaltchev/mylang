@@ -520,16 +520,24 @@ slotted base + a `Chunk::chain_steps` list — a member is a `member_keys` pool
 index, a subscript a pre-evaluated key temp, each with its own node loc). The
 runtime walk (`vm_chain_lvalue_store_op`) carries `cur` as EITHER an `LValue*`
 ref OR a plain VALUE — exactly the tree-walker's chained `do_eval`, where an
-immutable intermediate (a POD field, a readonly instance) is a value READ
+immutable intermediate (a readonly instance) is a value READ
 (`member_read_core`) the walk continues on, only failing `NotLValueEx` at the
-FINAL store (so `q.p.x` on nested-POD carets the whole lvalue, not the inner
-step). The final step dispatches: a struct → `vm_member_store` (POD byte / boxed
+FINAL store. **A field in BYTES is a third state, a `PodPlace` (eval.h,
+2026-10-05):** a flat struct array's element (`ps[i]`, entered by
+`pod_place_elem` with the element store's bounds, key type, readonly and
+COW) and an inline POD field below one (`p.inner`, `pod_place_step`) have
+no `LValue`, and reading them yields a COPY - so `ps[i].x = v` and
+`p.inner.x = v` raised NotLValueEx in every engine until then. The walk
+carries the place and the final member step writes through it
+(`pod_place_store`; IncDecChainV's `pod_place_incdec`), the SAME functions
+the tree-walker's `member_target` uses. The final step otherwise
+dispatches: a struct → `vm_member_store` (POD byte / boxed
 field), a **DICT member `d.f=v` → `vm_subscript_store(memId)`** (== `d["f"]=v`,
 auto-vivify), a subscript → `vm_subscript_store`. Each step's throw uses ITS
 node's loc (a subscript-only chain keeps the tuned `StoreElem2V`/
 `StoreElemChainV`; a single `s.f`/`a[i]` keeps `StoreMemberV`/`StoreElemValue`).
-So a member-in-the-middle nested store — which WORKS for boxed structs / dict
-values, throws for POD — is native, byte-identical incl. carets. **P8 exceptions
+So a member-in-the-middle nested store - boxed struct, dict value, flat
+element or inline POD - is native, byte-identical incl. carets. **P8 exceptions
 are now fully native** (see
 `plans/archived/vm-exceptions.md`): try/catch/finally + throw + rethrow + all
 flow-crossing-try (incl. nested-finally chaining) are native ops. **G1

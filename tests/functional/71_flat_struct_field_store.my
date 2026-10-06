@@ -1,0 +1,123 @@
+# A field of a FLAT struct array's element - `ps[i].x = v`, `+=`, `++` -
+# and a field of a POD struct embedded inline in another (`p.inner.a = v`)
+# raised NotLValueEx in every engine until 2026-10-05: those fields live in
+# bytes no LValue covers, and every store path needed one. README says a
+# struct's layout changes only memory and speed, so they must store like the
+# same fields of a general array of structs. Values come from runtime():
+# constants would fold.
+
+struct I { int a; }
+struct P { int x; float y; bool b; I inner; }
+struct H { array<P> ps; }
+
+func ri(int v) => int(runtime(v));
+func rf(float v) => float(runtime(v));
+
+func outcome(dyn f) {
+    try {
+        f();
+        return "ok";
+    } catch (NotLValueEx) {
+        return "NotLValueEx";
+    } catch (TypeErrorEx) {
+        return "TypeErrorEx";
+    } catch (OutOfBoundsEx) {
+        return "OutOfBoundsEx";
+    } catch (DivisionByZeroEx) {
+        return "DivisionByZeroEx";
+    }
+    return "unreachable";       # (inference does not see the try return)
+}
+
+var ps = [P(1, 2.5, true, I(3)), P(4, 5.5, false, I(6))];
+var events = [];                    # the evaluation-order log, below
+func idx() { append(events, "idx"); return 0; }
+func val() { append(events, "val"); return 11; }
+assert(array_storage(ps) == "struct");
+var i = ri(1);
+
+# every store form, typed
+ps[i].x = ri(7);
+ps[i].y += rf(1.0);
+ps[i].x *= ri(3);
+ps[i].x -= ri(1);
+ps[i].x /= ri(4);
+ps[i].x %= ri(3);
+ps[i].b = true;
+assert(ps[1].x == 2 && ps[1].y == 6.5 && ps[1].b);
+var post = ps[i].x++;
+var pre = --ps[i].y;
+assert(post == 2 && ps[1].x == 3 && pre == 5.5 && ps[1].y == 5.5);
+var fpost = ps[0].y++;
+assert(fpost == 2.5 && ps[0].y == 3.5);      # the exact old value
+ps[-1].x = ri(40);                           # a negative index
+assert(ps[1].x == 40 && ps[0].x == 1);
+
+# an inline POD field, in the array and in a plain variable
+ps[i].inner.a = ri(9);
+ps[i].inner.a += ri(1);
+var ia = ps[i].inner.a++;
+assert(ia == 10 && ps[1].inner.a == 11);
+ps[0].inner = I(ri(30));
+assert(ps[0].inner.a == 30);
+var p = P(1, 2.0, false, I(3));
+p.inner.a = ri(4);
+++p.inner.a;
+p.inner.a *= ri(2);
+assert(p.inner.a == 10);
+
+# held in a struct field, a dict, a dyn: the array aliases, so all write ps
+var h = H(ps);
+h.ps[i].x = ri(8);
+var d = {"k": ps};
+d["k"][0].y = rf(0.25);
+d.k[0].inner.a--;
+var dyn dps = runtime(ps);
+dps[0].x = 100;
+dps[1].y -= 0.5;
+dps[0].inner.a++;
+assert(ps[1].x == 8 && ps[0].y == 0.25 && ps[0].x == 100);
+assert(ps[1].y == 5.0 && ps[0].inner.a == 30);
+
+# an alias sees the write; a slice taken before does not, and a write
+# through the slice stays in the slice (copy-on-write)
+var q = ps;
+var s = ps[0:2];
+q[0].x = ri(5);
+assert(ps[0].x == 5 && s[0].x == 100);
+s[1].x = ri(77);
+assert(s[1].x == 77 && ps[1].x == 8);
+
+# the errors: out of range, a non-int key (dyn), a bool ++ (dyn), a const
+# array (read-only through an alias), a division by zero
+assert(outcome(func [ps] () { ps[2].x = 1; }) == "OutOfBoundsEx");
+assert(outcome(func [ps] () { ps[-3].y += 1.0; }) == "OutOfBoundsEx");
+assert(outcome(func [dps] () { dps["a"].x = 1; }) == "TypeErrorEx");
+assert(outcome(func [dps] () { dps[0].b++; }) == "TypeErrorEx");
+assert(outcome(func [ps] () { ps[0].x /= 0; }) == "DivisionByZeroEx");
+const K = [P(1, 1.0, true, I(1))];
+func set_x(dyn arr) { arr[0].x = 2; }
+func inc_a(dyn arr) { arr[0].inner.a++; }
+assert(outcome(func () { set_x(K); }) == "NotLValueEx");
+assert(outcome(func () { inc_a(K); }) == "NotLValueEx");
+assert(K[0].x == 1 && ps[0].x == 5);
+
+# evaluation order (README): the right-hand side, then the key, once each
+ps[idx()].x = val();
+ps[idx()].inner.a += val();
+assert(events == ["val", "idx", "val", "idx"]);
+assert(ps[0].x == 11 && ps[0].inner.a == 41);
+
+# a foreach body storing into the array it walks: `p` is the element as it
+# is when its turn comes, a copy the body's later stores do not reach
+var fs = [P(1, 1.0, false, I(0)), P(2, 2.0, false, I(0))];
+var seen = [];
+foreach (var k, q in indexed fs) {
+    fs[1].x = q.x * 10;
+    fs[k].inner.a++;
+    append(seen, q.x);
+    append(seen, q.inner.a);
+}
+assert(seen == [1, 0, 10, 0] && fs[0].inner.a == 1 && fs[1].x == 100);
+
+print(ps, p, s, fs);

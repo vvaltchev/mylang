@@ -4096,11 +4096,14 @@ static const std::vector<test> tests =
             "e.outer.inner += 1; assert(e.outer.inner == 100);", /* compound */
         },
     },
-    /* Error paths (byte-identical carets on both engines): a POD nested field
-     * (no lvalue), an intermediate OOB, an intermediate missing dict key. */
-    { "general lvalue-chain store: POD nested member is not an lvalue",
+    /* A POD struct embedded inline stores in place (it raised NotLValueEx
+     * until 2026-10-05: its bytes have no LValue - see PodPlace, eval.h). */
+    { "general lvalue-chain store: POD nested member stores in place",
       { "struct P { int x; int y; } struct Q { P p; }",   /* both POD */
-        "var q = Q(P(1, 2)); q.p.x = 5;" }, &typeid(NotLValueEx) },
+        "var q = Q(P(1, 2)); q.p.x = int(runtime(5));",
+        "assert(q.p.x == 5 && q.p.y == 2);" } },
+    /* Error paths (byte-identical carets on both engines): an intermediate
+     * OOB, an intermediate missing dict key. */
     { "general lvalue-chain store: intermediate out of bounds",
       { "struct P { int x; array t; } var a = [P(1, [])]; a[9].x = 5;" },
       &typeid(OutOfBoundsEx) },
@@ -7734,16 +7737,17 @@ static const std::vector<test> tests =
         "var u = arr[f() - 5].n++;",
         "assert(u == 7); assert(arr[1].n == 8); assert(i == 5);" } },
     /* `ps` is a FLAT struct array: its element is bytes, not an object,
-     * so its field is not an lvalue in any engine - NotLValueEx. (The
-     * impurity of the index no longer matters: a POD struct held by a
-     * general array or a dict IS stored through, see
-     * tests/functional/68_impure_chain_store.my.) */
-    { "vm: impure-index POD member inc-dec throws NotLValue",
+     * and its field was not an lvalue in any engine until 2026-10-05 -
+     * NotLValueEx. It is a POD place now (eval.h), stored in place with
+     * the index evaluated once (tests/functional/68_impure_chain_store.my,
+     * 71_flat_struct_field_store.my). */
+    { "vm: impure-index POD member inc-dec of a flat element",
       { "struct P { int x; int y; }",
         "var ps = [P(1,2), P(3,4)];",
         "var i = 0;",
         "func f() { i += 1; return i - 1; }",
-        "var u = ps[f()].x++;" }, &typeid(NotLValueEx) },
+        "var u = ps[f()].x++;",
+        "assert(u == 1 && ps[0].x == 2 && ps[1].x == 3 && i == 1);" } },
     /* An RVALUE root (`mk()[0]++`) keeps its rvalue-ness through the
      * compiled chain (a kind-3 VALUE seed) - NotLValueEx, as the
      * tree-walker's non-LValue base subscript. */
@@ -15164,6 +15168,43 @@ static const std::vector<test> tests =
         "  return a; }",
         "var r = mk(); assert(array_storage(r) == \"struct\");",
         "assert(r[1].x == 2);" } },
+    /* A FIELD of a flat element, and of a POD struct embedded inline, is
+     * storable: those bytes have no LValue, so every store path used to
+     * raise NotLValueEx there, in every engine (2026-10-05; the store
+     * goes through a POD place - eval.cpp `pod_place_*`, the VM's chain
+     * walk). tests/functional/71_flat_struct_field_store.my has the rest. */
+    { "struct array: a field of a flat element stores (= += ++ --)",
+      { "struct P { int x; float y; bool b; }",
+        "var a = [P(1, 1.5, false), P(2, 2.5, false)];",
+        "var i = int(runtime(1));",
+        "a[i].x = int(runtime(7)); a[i].x *= int(runtime(3));",
+        "a[0].y += float(runtime(1.0)); a[-1].b = true;",
+        "var o = a[i].x++; var n = --a[0].y;",
+        "assert(o == 21 && a[1].x == 22 && n == 1.5 && a[1].b);",
+        "assert(array_storage(a) == \"struct\");" } },
+    { "struct array: a POD field embedded inline stores",
+      { "struct I { int v; } struct P { int x; I inn; }",
+        "var a = [P(1, I(2))]; var p = P(3, I(4));",
+        "a[0].inn.v += int(runtime(5)); a[0].inn = I(int(runtime(9)) + 1);",
+        "p.inn.v = int(runtime(6)); p.inn.v++;",
+        "assert(a[0].inn.v == 10 && p.inn.v == 7);" } },
+    { "struct array: a field store aliases, a slice taken before does not",
+      { "struct P { int x; }",
+        "var a = [P(1), P(2)]; var b = a; var s = a[0:2];",
+        "b[0].x = int(runtime(9)); s[1].x = int(runtime(8));",
+        "assert(a[0].x == 9 && s[0].x == 1 && s[1].x == 8 && a[1].x == 2);" } },
+    { "struct array: a field store out of range",
+      { "struct P { int x; }",
+        "var a = [P(1)]; a[int(runtime(1))].x = 2;" },
+      &typeid(OutOfBoundsEx) },
+    { "struct array: a field store into a const flat array",
+      { "struct P { int x; } const K = [P(1)];",
+        "func f(dyn q) { q[0].x = 2; } f(K);" },
+      &typeid(NotLValueEx) },
+    { "struct array: ++ of a bool field of a flat element (dyn)",
+      { "struct P { bool b; }",
+        "var dyn a = runtime([P(true)]); a[0].b++;" },
+      &typeid(TypeErrorEx) },
 
     /* ----------- direct (unboxed) POD field access (phase 8) ----------- */
     { "struct fast: typed int/float field reads compute unboxed",

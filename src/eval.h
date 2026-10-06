@@ -641,6 +641,45 @@ EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
                           const StructTypeDef *bake_def = nullptr,
                           int bake_slot = -1);
 
+/*
+ * POD PLACES (2026-10-05): the bytes of a struct that live INSIDE something
+ * - a flat struct array's element, or a POD struct embedded inline in
+ * another. A field there has no LValue to store through, so a store walks
+ * its base into the bytes instead. `ps[i].x = v` and `p.inner.a = v` raised
+ * NotLValueEx in every engine until then, though README says a struct's
+ * layout changes only memory and speed. Shared by the tree-walker's
+ * member_store / dyn inc-dec and the VM's chain walk (StoreLValueChainV,
+ * IncDecChainV - the JIT calls the same cores). See eval.cpp.
+ */
+struct PodPlace {
+    char *bytes = nullptr;              /* the struct's first byte */
+    const StructTypeDef *def = nullptr;
+};
+/* `blv` holds a writable flat struct array: the element `key` names becomes
+ * the place, the array detached first as an element store detaches it. A
+ * bad key or index throws what TypeArr::subscript throws, loc-less. False
+ * when `blv` holds no writable flat struct array. */
+bool pod_place_elem(LValue *blv, const EvalValue &key, PodPlace &out);
+/* `blv` holds a writable POD struct whose `memUid` is an inline POD struct:
+ * that field becomes the place. */
+bool pod_place_rooted_field(LValue *blv, const UniqueId *memUid,
+                            PodPlace &out);
+/* Step into the place's inline POD struct member; false, the place
+ * unchanged, when the member is not one. */
+bool pod_place_step(PodPlace &p, const UniqueId *memUid);
+/* The struct in the place, as a value (a fresh copy). */
+EvalValue pod_place_value(const PodPlace &p);
+/* Store `rval` (`OP= rval`) into the place's field `slot`, coerced to its
+ * type; returns the stored value, `*old_out` the one it replaced. */
+EvalValue pod_place_store(const PodPlace &p, int slot, Op op,
+                          const EvalValue &rval, Loc ms, Loc me,
+                          EvalValue *old_out = nullptr);
+/* `++` / `--` on the place's field `slot` - an int or float, else the
+ * inc-dec TypeErrorEx at `id_*`; returns old for postfix, new for prefix. */
+EvalValue pod_place_incdec(const PodPlace &p, int slot, bool is_inc,
+                           bool is_prefix, Loc ms, Loc me,
+                           Loc id_start, Loc id_end);
+
 /* The boxed field LValue* of `base.member` for a mutating builtin arg0
  * (`append(s.f, x)` — CallBuiltinLVMember). See eval.cpp. */
 LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
