@@ -1,0 +1,7 @@
+# INT-SOURCE: ../functional/71_flat_struct_field_store.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): a field of a flat struct array element stores in place.
+# The functional program runs as a coverage unit too, under the engines
+# above, with no second copy (INT-SOURCE); it asserts its own results and
+# every engine must print the same.

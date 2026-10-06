@@ -76,7 +76,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(HERE, "lib"))
 from testrun import Monitor  # noqa: E402
 from intcov import (CENSUS_SAMPLES, PROBE_LINE, build_config,  # noqa: E402
-                    collect, engine_flags, gcov_tool, int_configs,
+                    collect, engine_flags, gcov_tool, int_configs, int_header,
                     int_engines, run, vdj_mask)
 
 
@@ -114,9 +114,20 @@ def main():
         units.append(("-rt", [[(["-rt"], {}, None)]]))
     progs = sorted(glob.glob(os.path.join(HERE, "int", "*.my")))
     for prog in progs:
+        # `# INT-SOURCE: PATH` (relative to the unit): the unit RUNS that
+        # program - a tests/functional program counted as a coverage unit
+        # with no second copy of it. The unit's own headers pick the runs;
+        # its name is the unit's, so ownership reads as usual.
+        src = int_header(prog, "INT-SOURCE")
+        target = (os.path.normpath(os.path.join(os.path.dirname(prog), src))
+                  if src else prog)
+        if not os.path.isfile(target):
+            print("int_run: %s: INT-SOURCE %s does not exist"
+                  % (os.path.relpath(prog, ROOT), src), file=sys.stderr)
+            return 2
         groups = []          # one per configuration: [(cmd, env-extra)]
         for conf in int_configs(prog):
-            groups.append([(engine_flags(eng) + [prog], conf, None)
+            groups.append([(engine_flags(eng) + [target], conf, None)
                            for eng in int_engines(prog)])
         units.append((os.path.relpath(prog, ROOT), groups))
     # REPL SESSIONS (tests/int/repl/*.session): the interactive front end

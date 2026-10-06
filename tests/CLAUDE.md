@@ -201,6 +201,12 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   `+` joins (`nbi+nj`); engines of one config must print the same stdout,
   so include `tw` when the point is a value check.
 - `# INT-CONFIGS:` `;`-separated env sets.
+- `# INT-SOURCE: ../functional/NAME.my`: the unit RUNS that program (the
+  path is relative to the unit) under its own INT-ENGINES / INT-CONFIGS -
+  a tests/functional program counted as a coverage unit with no second
+  copy (int_run's census already runs tests/functional, but the coverage
+  universe counts only -rt, tests/int and the REPL sessions). The unit is
+  the stub's name, so ownership reads as usual (2026-10-05: 25-28).
 - tests/int/repl/NAME.session + NAME.expected: fed to `--repl` on stdin
   under a FRESH HOME (history file); stdout must equal NAME.expected,
   stderr be empty, rc 0. `--update-repl` rewrites the .expected files -

@@ -1,0 +1,7 @@
+# INT-SOURCE: ../functional/69_float_copy.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): a typed copy keeps its source written, and -0.0.
+# The functional program runs as a coverage unit too, under the engines
+# above, with no second copy (INT-SOURCE); it asserts its own results and
+# every engine must print the same.
