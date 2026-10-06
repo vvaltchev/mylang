@@ -116,6 +116,18 @@ var c = 2;
 var h = func [c] () { var z = (c += 3); return z * 10 + c; };
 assert(h() == 55 && h() == 88 && c == 2);
 
+# a float local, the int / float / boxed store tiers of a variable target
+var fl = 0.5;
+var zf = (fl += rf(2.0));
+assert(zf == 2.5 && fl == 2.5 && typestr(zf) == "float");
+
+# a chain rooted in a global or a capture, compound: its value is read back
+# from that variable (the captured array aliases the global's)
+var gps = [P(1, 1.0, I(1))];
+func addga() { return (gps[0].inn.a += ri(2)); }
+var hx = func [gps] () { return (gps[0].x *= ri(4)); };
+assert(addga() == 3 && hx() == 4 && gps[0].inn.a == 3 && gps[0].x == 4);
+
 # evaluation order (README): the right-hand side, then each key, once each
 var ea = [[1, 2], [3, 4]];
 var ez = (ea[key(1)][key(0)] = val(30));

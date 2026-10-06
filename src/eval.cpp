@@ -1451,28 +1451,23 @@ apply_compound_op(EvalValue &acc, const EvalValue &rhs, Op op);
 static EvalValue pod_load_field(const FieldDef &f, const char *base)
 {
     const char *p = base + f.offset;
-    switch (f.kind) {
-        case FieldKind::f_bool:
-            return EvalValue(static_cast<unsigned char>(*p) != 0);
-        case FieldKind::f_int: {
-            int_type v;
-            std::memcpy(&v, p, sizeof v);
-            return EvalValue(v);
-        }
-        case FieldKind::f_float: {
-            float_type v;
-            std::memcpy(&v, p, sizeof v);
-            return EvalValue(v);
-        }
-        case FieldKind::f_struct: {
-            StructTypeDef *nd = const_cast<StructTypeDef *>(f.struct_def);
-            auto obj = make_intrusive<StructObject>(nd);
-            std::memcpy(obj->bytes.data(), p, nd->size);
-            return intrusive_ptr<StructObject>(obj);
-        }
-        default:
-            throw InternalErrorEx();
+    if (f.kind == FieldKind::f_bool)
+        return EvalValue(static_cast<unsigned char>(*p) != 0);
+    if (f.kind == FieldKind::f_int) {
+        int_type v;
+        std::memcpy(&v, p, sizeof v);
+        return EvalValue(v);
     }
+    if (f.kind == FieldKind::f_float) {
+        float_type v;
+        std::memcpy(&v, p, sizeof v);
+        return EvalValue(v);
+    }
+    /* else an inline POD struct: a POD field is nothing else */
+    StructTypeDef *nd = const_cast<StructTypeDef *>(f.struct_def);
+    auto obj = make_intrusive<StructObject>(nd);
+    std::memcpy(obj->bytes.data(), p, nd->size);
+    return intrusive_ptr<StructObject>(obj);
 }
 
 /*
@@ -1518,9 +1513,9 @@ bool pod_place_step(PodPlace &p, const UniqueId *memUid)
     const int slot = p.def->slot_of(memUid);
     if (slot < 0)
         return false;
+    /* a POD struct's struct field is an inline POD struct (compute_layout) */
     const FieldDef &f = p.def->fields[static_cast<size_t>(slot)];
-    if (f.kind != FieldKind::f_struct || !f.struct_def ||
-        !f.struct_def->is_pod() || f.offset < 0)
+    if (f.kind != FieldKind::f_struct)
         return false;
     p.bytes += f.offset;
     p.def = f.struct_def;
@@ -1560,8 +1555,6 @@ EvalValue pod_place_store(const PodPlace &p, int slot, Op op,
     const EvalValue r = RValue(rval);
     EvalValue newval;
     if (op == Op::assign) {
-        if (old_out)
-            *old_out = pod_load_field(f, p.bytes);
         newval = r;
     } else {
         newval = pod_load_field(f, p.bytes);
@@ -3945,61 +3938,61 @@ struct MemberTarget {
 
 static MemberTarget member_target(EvalContext *ctx, const MemberExpr *mem)
 {
-    /* the plain member steps under `mem`, innermost LAST */
+    /* the member steps under `mem`, innermost LAST (an optional one is read
+     * as its eval reads it: `access` short-circuits a none base) */
     std::vector<const MemberExpr *> steps;
     const Construct *root = mem->what.get();
-    while (ctag(root) == ConstructType::member &&
-           !static_cast<const MemberExpr *>(root)->optional) {
+    while (ctag(root) == ConstructType::member) {
         steps.push_back(static_cast<const MemberExpr *>(root));
         root = steps.back()->what.get();
     }
 
     MemberTarget t;
     EvalValue cur;
-
-    if (ctag(root) == ConstructType::subscript) {
-        /* Subscript::do_eval's work, by hand: a writable flat struct array's
-         * element is entered in place instead of read as a copy */
-        const Subscript *sub = static_cast<const Subscript *>(root);
-        try {
+    /* the node whose work runs: an exception leaving it is stamped as its
+     * eval would stamp it (root->eval stamps its own) */
+    const Construct *at = root;
+    try {
+        if (ctag(root) == ConstructType::subscript) {
+            /* Subscript::do_eval's work, by hand: a writable flat struct
+             * array's element is entered in place, not read as a copy */
+            const Subscript *sub = static_cast<const Subscript *>(root);
             const EvalValue base = sub->what->eval(ctx);
             if (base.is<UndefinedId>())
                 throw UndefinedVariableEx(base.get<UndefinedId>().id,
                                           sub->what->start, sub->what->end);
             const EvalValue key = literal_widen(RValue(sub->index->eval(ctx)),
                                                 sub->key_coerce);
-            if (ctx->const_ctx || !base.is<LValue *>() ||
+            if (!base.is<LValue *>() ||
                 !pod_place_elem(base.get<LValue *>(), key, t.place)) {
                 Type *ty = base.is<LValue *>()
                     ? base.get<LValue *>()->get().get_type()
                     : base.get_type();
                 cur = ty->subscript(base, key, /*for_write=*/false);
             }
-        } catch (Exception &e) {
-            stamp_like_eval(sub, e);
-            throw;
+        } else {
+            cur = root->eval(ctx);
         }
-    } else {
-        cur = root->eval(ctx);
-    }
 
-    for (size_t k = steps.size(); k-- > 0; ) {
-        const MemberExpr *s = steps[k];
-        if (!t.place.bytes && !ctx->const_ctx && cur.is<LValue *>() &&
-            pod_place_rooted_field(cur.get<LValue *>(), s->memUid, t.place))
-            continue;
-        if (t.place.bytes) {
-            if (pod_place_step(t.place, s->memUid))
+        for (size_t k = steps.size(); k-- > 0; ) {
+            const MemberExpr *s = steps[k];
+            at = s;
+            if (t.place.bytes) {
+                if (pod_place_step(t.place, s->memUid))
+                    continue;
+                cur = pod_place_value(t.place);
+                t.place = PodPlace();
+            } else if (cur.is<LValue *>() &&
+                       pod_place_rooted_field(cur.get<LValue *>(), s->memUid,
+                                              t.place)) {
                 continue;
-            cur = pod_place_value(t.place);
-            t.place = PodPlace();
-        }
-        try {
+            }
             cur = s->access(RValue(cur), /*for_write=*/false);
-        } catch (Exception &e) {
-            stamp_like_eval(s, e);
-            throw;
         }
+    } catch (Exception &e) {    /* INT-COV-EXEMPT: its type test fails */
+        /* only for a non-Exception throw (bad_alloc), which no test makes */
+        stamp_like_eval(at, e);
+        throw;
     }
 
     t.base = cur;

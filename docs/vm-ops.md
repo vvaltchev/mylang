@@ -522,10 +522,16 @@ runtime walk (`vm_chain_lvalue_store_op`) carries `cur` as EITHER an `LValue*`
 ref OR a plain VALUE — exactly the tree-walker's chained `do_eval`, where an
 immutable intermediate (a readonly instance) is a value READ
 (`member_read_core`) the walk continues on, only failing `NotLValueEx` at the
-FINAL store. **A field in BYTES is a third state, a `PodPlace` (eval.h,
-2026-10-05):** a flat struct array's element (`ps[i]`, entered by
-`pod_place_elem` with the element store's bounds, key type, readonly and
-COW) and an inline POD field below one (`p.inner`, `pod_place_step`) have
+FINAL store - after ACCESSING the value's member or element there, as the
+tree-walker's `member_store` / `subscript_store` do, so a missing member, a
+base that has none or a bad key raises its own error first (a plain `=`
+reads no dict member: a readonly dict's missing key is `none` there). Until
+2026-10-05 the VM said NotLValueEx at once, and its walk's "Expected dict
+object" marked the whole step instead of the base. **A field in BYTES is a
+third state, a `PodPlace` (eval.h, 2026-10-05):** a flat struct array's
+element (`ps[i]`, entered by `pod_place_elem` with the element store's
+bounds, key type, readonly and COW) and an inline POD field below one
+(`p.inner`, `pod_place_step`) have
 no `LValue`, and reading them yields a COPY - so `ps[i].x = v` and
 `p.inner.x = v` raised NotLValueEx in every engine until then. The walk
 carries the place and the final member step writes through it
@@ -1431,10 +1437,12 @@ int/float/boxed STATEMENT compilers, then use the target's slot as the
 operand — this exposed and fixed a retarget-guard bug where the
 plain-assign retarget could steal an inner store's dst: it now requires
 `rslot >= temp_base`; since 2026-10-05 a GLOBAL or CAPTURE target runs
-the same statement compilers and reads the variable back, and an
+the same statement compilers and reads the variable back (a CONST or
+BUILTIN target too: its statement store throws), and an
 ELEMENT / FIELD / dict key or member / chain target goes through
 `try_value_store` - the generic `StoreLValueChainV` whatever the shape,
-the rvalue first and each key into a temp once, then the value: a plain
+emitted by the statement form's own `emit_chain_store` (the rvalue first
+and each key into a temp once), then the value: a plain
 `=`'s is the rvalue converted to the target's STATIC type
 (`Expr14::val_widen`, a CoerceNumV into a fresh temp; a dict target's
 `rv_coerce` already widened it), a compound's is read back through the
