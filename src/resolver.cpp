@@ -1232,6 +1232,16 @@ private:
              * runtime. Any OTHER exception is a real error in fully-constant
              * code and propagates (a build error), per the auto-const rule.
              */
+            /* cctx holds the const builtins BY NAME, so a call to the
+             * program's own function named like one (`func top()`, `func
+             * abs()`) would run the builtin - registering the function there
+             * fails on the taken name. Such a call is not folded: it raised
+             * the builtin's InvalidNumberOfArgsEx for `top()` in every engine,
+             * and called the builtin under -nti, where no instance renames
+             * the call. */
+            if (all_const && callee && callee->sym.kind != SymKind::builtin
+                    && EvalContext::const_builtins.count(callee->uid))
+                all_const = false;
             if (all_const && callee) {
                 /* Capture callee loc + name before the node may be freed. */
                 const Loc cloc = callee->start;

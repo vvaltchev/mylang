@@ -1,0 +1,28 @@
+# A function the program declares with a const builtin's name wins over the
+# builtin wherever it is called. AutoConst folds a call with constant
+# arguments by evaluating it in a context that holds the const builtins BY
+# NAME, so `func top() {...} top()` ran the builtin `top` (no arguments:
+# InvalidNumberOfArgsEx, in every engine), and under -nti, where no
+# template instance renames the call, `top(1)` did too. Such a call is not
+# folded now. The builtins themselves, unshadowed, still fold.
+
+func top() { return 5; }
+func abs() { return 6; }
+func len(a) { return 40 + a; }
+func max(a, b) { return a; }
+
+assert(top() == 5);
+assert(abs() == 6);
+assert(len(2) == 42);
+assert(max(1, 9) == 1);
+
+func inner() {
+    func min(x) { return x * 100; }
+    return min(3);
+}
+assert(inner() == 300);
+
+func usebuiltins() { return [sqrt(16.0), floor(2.5), str(7)]; }
+assert(usebuiltins() == [4.0, 2.0, "7"]);
+
+print(top(), abs(), len(2), max(1, 9), inner(), usebuiltins());
