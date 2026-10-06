@@ -1463,7 +1463,10 @@ the construct: every statement/expression either lowers or the compiler
 REFUSES loudly; a future gap cannot hide as a silent tree-walk. Flipping
 the nets flushed out + fixed the last REAL gaps, each now native: a
 typed `!x` as a VALUE (`Cat::lnot` → boxed UnaryV — undetected while
-expr bodies had no chunks), EMPTY loop/foreach bodies (the obsolete
+expr bodies had no chunks) and, found 2026-10-05, a typed `-x` whose
+operand has no unboxed lowering (`Cat::neg` → the same boxed UnaryV;
+a GLOBAL operand has no typed leaf, so `func f() { return -g; }` was a
+NotLoweredEx), EMPTY loop/foreach bodies (the obsolete
 "all-fallback body" gate dropped), the loop-body DISCARD tier (any
 expression statement — a discarded `map(...)`, a ctor — compiles into a
 scratch temp; inert leaves skip, an unresolved/global bare id keeps its

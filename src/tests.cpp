@@ -390,6 +390,30 @@ static const std::vector<test> tests =
 
     {
         /*
+         * A typed `-g` whose operand is a GLOBAL has no unboxed lowering
+         * (a capture and a call result have a typed leaf, a global does
+         * not), so it falls back to the boxed tier - which handled `!x`
+         * and not `-x`: until 2026-10-05 every one of these was a
+         * NotLoweredEx compile refusal in the VM while the tree-walker
+         * ran them (RULE 2). All five modes run it.
+         */
+        "codegen: a typed negation of a GLOBAL lowers (not NotLoweredEx)",
+        {
+            "var j = int(runtime(2));",
+            "var x = float(runtime(2.5));",
+            "var z = float(runtime(0.0));",
+            "func ni() { return -j; }",
+            "func nf() { return -x; }",
+            "func nz() { return -z; }",
+            "func ne() { return -(j * 3) + 1; }",
+            "func nc() { return -j < 0; }",
+            "assert(ni() == -2 && nf() == -2.5 && ne() == -5 && nc());",
+            "assert(str(nz()) == \"-0.000000\");",
+        },
+    },
+
+    {
+        /*
          * #96: a BOOL value WIDENS into flat numeric storage - the
          * promotion chain bool <= int <= float, the rule the decl and
          * struct-field coerces already followed; arrays were the
