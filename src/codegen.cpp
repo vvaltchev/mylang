@@ -1240,17 +1240,20 @@ struct Codegen {
         return static_cast<int>(chunk.struct_defs.size()) - 1;
     }
 
-    /* Pool a checked inc-dec's dual carets (+ the member key for the member
-     * form): lvalue-child caret + the whole inc-dec caret. Returns the index
-     * (carried in Instr::b), so the op is AST-free. */
-    int add_incdec_site(const Construct *lchild, const IncDecExpr *inc,
-                        const MemberExpr *m = nullptr)
+    /* Pool a checked inc-dec's carets (+ the member key for the member
+     * form): the lvalue child's, the whole inc-dec's and the base's (`base`,
+     * the child's `what`). Returns the index (carried in Instr::b), so the
+     * op is AST-free. */
+    int add_incdec_site(const Construct *lchild, const Construct *base,
+                        const IncDecExpr *inc, const MemberExpr *m = nullptr)
     {
         Chunk::IncDecSite s;
         s.lstart = lchild->start;
         s.lend = lchild->end;
         s.istart = inc->start;
         s.iend = inc->end;
+        s.bstart = base->start;
+        s.bend = base->end;
         if (m) {
             s.memId = m->memId;
             s.memUid = m->memUid;
@@ -2919,7 +2922,7 @@ struct Codegen {
                 in.target = bkind;               /* base kind: 0 loc/1 gbl/2 cap */
                 in.target2 = bslot;
                 in.set_a(slot_op(kslot));
-                in.set_b(int_lit(add_incdec_site(sub, inc)));   /* dual carets */
+                in.set_b(int_lit(add_incdec_site(sub, sub->what.get(), inc)));
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
                 ops.push_back(in);
                 return true;
@@ -2946,7 +2949,7 @@ struct Codegen {
                 in.node_idx = add_ast_node(m->what.get());
                 in.target = bkind;               /* base kind: 0 loc/1 gbl/2 cap */
                 in.target2 = bslot;
-                in.set_b(int_lit(add_incdec_site(m, inc, m)));  /* key + carets */
+                in.set_b(int_lit(add_incdec_site(m, m->what.get(), inc, m)));
                 in.aop = inc->is_inc ? Op::plus : Op::minus;
                 ops.push_back(in);
                 return true;

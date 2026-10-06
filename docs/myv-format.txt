@@ -2,8 +2,13 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 27.  This document describes the on-disk image exhaustively:
+Format version 28.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v28 adds two locs to every IncDecSite record (section 9.6): `bstart` and
+`bend`, the caret of the inc-dec's base.  The member form's "Expected dict
+object" type error marks the base, as the tree-walker's member read does; it
+marked the member until then.)
 
 (v27 drops two bools from every IncDecChain record (section 9.7):
 `allow_flat` and `allow_pod` said whether the final step's base was free of
@@ -815,12 +820,16 @@ action (0 = raw int, 1 = float via promotion, 2 = bool byte).
 
     loc   lstart, lend      the lvalue's caret
     loc   istart, iend      the inc-dec's own caret
+    loc   bstart, bend      the base's caret (v28)
     value memId             the member name as a dict-key value
     uid   memUid
 
-Two distinct carets because a subscript-internal throw (out of bounds, key not
-found) and the inc-dec's own throw (not an lvalue, const, type error) must
-report different spans - which a single loc-per-pc table cannot express.
+Three distinct carets because a subscript-internal throw (out of bounds, key
+not found), the member form's "Expected dict object" (a base that is neither
+a struct nor a dict - it marks the base) and the inc-dec's own throw (not an
+lvalue, const, type error) must report different spans - which a single
+loc-per-pc table cannot express.  The element form writes the subscript
+base's caret and never reads it.
 
 9.7  Chain steps and inc-dec chains
 

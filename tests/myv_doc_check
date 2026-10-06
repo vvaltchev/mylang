@@ -124,7 +124,8 @@ def chunk(r):
     for _ in range(r.u32()):                      # 9.5 ctor_plans
         for _ in range(r.u32()): r.u32(); r.u32(); r.u8()
     for _ in range(r.u32()):                      # 9.6 incdec_sites
-        r.loc(); r.loc(); r.loc(); r.loc(); value(r); r.uid()
+        for _ in range(6): r.loc()
+        value(r); r.uid()
     def steps():
         for _ in range(r.u32()):
             r.boolv(); r.u32(); r.loc(); r.loc()
