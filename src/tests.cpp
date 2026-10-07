@@ -14871,6 +14871,37 @@ static const std::vector<test> tests =
     },
 
     /*
+     * A DECLARED container type checked against a literal of variables
+     * whose types are not settled yet (2026-10-07): `[p]` is `array<?>` in
+     * the first fixpoint round, and the declared type's check compared it
+     * as it was - `array<P> a = [p];` refused a valid program, while
+     * `var a = [p]` inferred array<P>. It defers on an Unknown anywhere in
+     * the type now, as it did on one at the top.
+     */
+    {
+        "infer: a declared array of a struct variable",
+        {
+            "struct P { int x; }",
+            "P p; p.x = 3;",
+            "array<P> a = [p];",
+            "func f(int q) { var r = P(q); array<P> b = [r, p];",
+            "    return b[0].x + b[1].x; }",
+            "dict<str, array<P>> d = {\"k\": [p]};",
+            "assert(a[0].x == 3 && f(4) == 7 && d[\"k\"][0].x == 3);",
+        }
+    },
+    {
+        "infer: a declared array still refuses a settled mismatch",
+        {
+            "struct P { int x; }",
+            "struct Q { int y; }",
+            "var q = Q(1);",
+            "array<P> a = [q];",
+        },
+        &typeid(TypeMismatchEx)
+    },
+
+    /*
      * Parse-time common-subexpression de-duplication (CSE). Identical const
      * array/dict expressions are evaluated once at parse time and the
      * resulting deep read-only value is shared, asserted here via intptr().

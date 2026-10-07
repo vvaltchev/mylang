@@ -4635,8 +4635,13 @@ decisions behind it: `plans/archived/type-inference.md`,
   contribute `array<?>`, whose **outer** kind isn't `Unknown` so `contribute`'s
   own pinned-symbol guard wouldn't catch it, tripping a PINNED global array's
   cross-input assignability check before a template-instance arg settles
-  (`var g=[1,2,3]; func f(x){append(g,x);} f(3)`). The invariant also covers a
-  **call to a TEMPLATE**: `type_of` of a `CallExpr` whose callee is a template
+  (`var g=[1,2,3]; func f(x){append(g,x);} f(3)`). **That guard reaches
+  inside a type now (`has_unknown`, 2026-10-07)** - a declared or pinned
+  symbol's check defers on an Unknown ANYWHERE in the contribution, since
+  `[p]` is `array<?>` until `p` settles and `array<P> a = [p];` was refused
+  in round 1 (a valid program, with no test until then). The invariant
+  also covers a **call to a TEMPLATE**: `type_of` of a `CallExpr` whose
+  callee is a template
   returns `bottom` (defer), NOT the template's `ret` — a template's `ret`
   finalizes to `dyn` (it is never inferred in isolation), and instantiation is
   about to redirect this call to a concrete clone whose `ret` is the real type.

@@ -557,6 +557,24 @@ private:
     static bool is_unknown(StaticTypeRef t) {
         return static_type_resolve(t)->kind == StaticTypeKind::Unknown;
     }
+    /* an Unknown ANYWHERE in `t` - the defer-on-Unknown invariant reaches
+     * into a container: `[p]` is `array<?>` while p's type is unsettled,
+     * and checking that against a declared `array<P>` refused a valid
+     * program (2026-10-07) */
+    static bool has_unknown(StaticTypeRef t) {
+        t = static_type_resolve(t);
+        if (!t)
+            return false;
+        if (t->kind == StaticTypeKind::Unknown)
+            return true;
+        if (has_unknown(t->elem) || has_unknown(t->key)
+                || has_unknown(t->val) || has_unknown(t->ret))
+            return true;
+        for (StaticTypeRef pt : t->params)
+            if (has_unknown(pt))
+                return true;
+        return false;
+    }
     static bool is_optish(StaticTypeRef t) {
         t = static_type_resolve(t);
         return t->opt || t->kind == StaticTypeKind::None;
@@ -4774,7 +4792,7 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
         if (strict_dyn && !s->is_param) {
             StaticTypeRef rt = static_type_resolve(t);
             StaticTypeRef pt = static_type_resolve(s->type);
-            if (!is_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
+            if (!has_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
                 pt))
                 mismatch("'" + std::string(s->name->val) + "' " +
                              (s->ann != DeclType::none ? "is declared '"
@@ -4800,7 +4818,7 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
     if (StaticTypeRef d = ann_scalar_static_type(s)) {
         if (strict_dyn && !s->is_param) {
             StaticTypeRef rt = static_type_resolve(t);
-            if (!is_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
+            if (!has_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
                 d))
                 mismatch("'" + std::string(s->name->val) +
                              "' is declared '" + static_type_to_string(d) +
