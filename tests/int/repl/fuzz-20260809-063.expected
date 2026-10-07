@@ -88,10 +88,10 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
        ]
      ]
    ]
->> CannotRebindBuiltinEx: Cannot rebind builtin at line 1, col 9
+>> CannotRebindBuiltinEx: Cannot rebind builtin at line 1, col 5:8
 
     var int = [];
-            ^^^^^
+        ^^^
 >> tracing: arrays autoconst autopure fold infer inline specialize template
 >> builtin   (runtime type)
 >> SyntaxError at line 5, col 1

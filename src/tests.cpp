@@ -10565,6 +10565,14 @@ static const std::vector<test> tests =
         { "print = 5;" },
         &typeid(CannotRebindBuiltinEx), 1, 0, 7, 0,
     },
+    /* a DECLARATION of a builtin's or a const's name marks the name (it
+     * marked the next token: `= "";`) */
+    { "err loc: a declaration named like a builtin marks the name",
+      { "var log = \"\";" },
+      &typeid(CannotRebindBuiltinEx), 5, 1, 9, 1 },
+    { "err loc: a declaration named like a const marks the name",
+      { "const K = [1]; { var K = 6; }" },
+      &typeid(CannotRebindConstEx), 22, 1, 24, 1 },
     {
         "err loc: an lvalue-builtin on a literal marks arg0",
         { "append([1, 2], 3);" },

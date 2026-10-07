@@ -1,9 +1,9 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 >> => -1
->> CannotRebindBuiltinEx: Cannot rebind builtin at line 2, col 9
+>> CannotRebindBuiltinEx: Cannot rebind builtin at line 2, col 5:8
 
     var len = len;
-            ^^^^^^
+        ^^^
 >> .. .. .. .. .. SyntaxError at line 4, col 1
 
     var len = len;

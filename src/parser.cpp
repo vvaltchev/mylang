@@ -1837,14 +1837,16 @@ declExprCheckId(ParseContext &c, Construct *id)
 {
     const EvalValue &val = id->eval(c.const_ctx);
 
+    /* the caret is the declared NAME (it was the next token's position,
+     * so `var log = "";` marked `= "";`) */
     if (!val.is<UndefinedId>()) {
 
         if (val.is<LValue *>()) {
             if (val.get<LValue *>()->is<Builtin>())
-                throw CannotRebindBuiltinEx(c.get_loc());
+                throw CannotRebindBuiltinEx(id->start, id->end);
         }
 
-        throw CannotRebindConstEx(c.get_loc());
+        throw CannotRebindConstEx(id->start, id->end);
     }
 }
 
