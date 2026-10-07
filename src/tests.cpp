@@ -732,6 +732,18 @@ static const std::vector<test> tests =
         },
     },
 
+    /* A const SCALAR target is the folded value `K = 6` is - not a
+     * location - in any position of a multi-assignment: first it was a
+     * syntax error at the comma, later an "Undefined variable 'K'". */
+    { "err loc: a const scalar as a later multi-assign target",
+      { "const K = 5; var a = 0;",
+        "a, K = [1, 2];" },
+      &typeid(SyntaxErrorEx), 4, 2, 6, 2 },
+    { "err loc: a const scalar as the first multi-assign target",
+      { "const K = 5; var a = 0;",
+        "K, a = [1, 2];" },
+      &typeid(SyntaxErrorEx), 1, 2, 3, 2 },
+
     {
         "multi-assign into a local const target is refused",
         {
