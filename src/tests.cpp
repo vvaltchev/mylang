@@ -8006,13 +8006,19 @@ static const std::vector<test> tests =
         "func f() { i += 1; return i - 1; }",
         "var u = ps[f()].x++;",
         "assert(u == 1 && ps[0].x == 2 && ps[1].x == 3 && i == 1);" } },
-    /* An RVALUE root (`mk()[0]++`) keeps its rvalue-ness through the
-     * compiled chain (a kind-3 VALUE seed) - NotLValueEx, as the
-     * tree-walker's non-LValue base subscript. */
-    { "vm: rvalue-root inc-dec value throws NotLValue",
-      { "func mk() { return [9, 8]; }",
+    /* A root that is not a variable (`mk()[0]++`) is HELD: the inc-dec
+     * goes into the value it evaluated to, as through a fresh variable
+     * (it raised NotLValueEx until 2026-10-06, an "rvalue root"; the
+     * shapes are tests/functional/75_store_through_value.my's). */
+    { "vm: an inc-dec through a call's result goes into the value returned",
+      { "var g = [9, 8];",
+        "func mk() { return g; }",
         "var dyn z = 0;",
-        "z = mk()[0]++;" }, &typeid(NotLValueEx) },
+        "z = mk()[0]++;",
+        "assert(z == 9 && g[0] == 10);",
+        "func fresh() { return [9, 8]; }",
+        "z = ++fresh()[1];",
+        "assert(z == 9 && g == [10, 8]);" } },
     /* An OPTIONAL member `a?.f` is a value - none when `a` is none - and
      * not one of the four forms that denote a location, so assigning to
      * it, compound-assigning or `++`/`--` on it is a COMPILE error from

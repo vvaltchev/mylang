@@ -839,6 +839,28 @@ at run time — writing through a `const` container, or through a `dyn` that
 happens to hold a read-only one — it stays a catchable `NotLValueEx`, as in
 the example above.
 
+**Storing through a value.** An element or a field of *any* expression is a
+location — `f()[0]`, `(c ? a : b).x`, `[x, y][k]`, `g()[i].y` — and a store
+there goes into the value that expression evaluated to, exactly as if it were
+first bound to a fresh variable: `f()[0] = v` means `{ var t = f(); t[0] =
+v; }`. Arrays, dicts and structs are references, so the write lands in the
+object `f` returned:
+
+```C#
+var scores = [1, 2, 3];
+func pick() => scores;
+pick()[0] = 10;             # scores is [10, 2, 3]
+pick()[1] += 5;             # [10, 7, 3]
+var old = pick()[2]++;      # old is 3, scores is [10, 7, 4]
+clone(scores)[0] = 9;       # allowed: writes into the copy, then gone
+scores[0:2][0] = 0;         # a slice is a copy: scores is unchanged
+```
+
+The usual rules still hold through the value: a `const` refuses the write
+(`NotLValueEx`), a slice detaches (copy on write) as it would in a variable,
+and a string's characters cannot be assigned. The right-hand side is
+evaluated first, then the expression under the access, then each key.
+
 To get a mutable copy you must ask for one explicitly: `clone(x)` makes a
 **shallow** mutable copy (only the top level is copied; nested objects are
 shared, so nested objects of a const stay read-only), while `deepclone(x)` makes

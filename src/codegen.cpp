@@ -5626,28 +5626,67 @@ struct Codegen {
     }
 
     /*
+     * HOLD a store's root that is not a variable - a call's result, a
+     * literal, a ternary (`f()[0]`, `mk().x.y`): compile it into a fresh
+     * temp, which the store then names as a LOCAL base. Every statement
+     * store compiler declines such a root (as_container_base), so the
+     * statement reaches gen_stmt's discarded-expression fallback and with
+     * it try_value_store / try_incdec_chain, the two users of this; a
+     * routing of the statement form straight to them was watched to change
+     * nothing but an unused value. A store through a value goes into it,
+     * as if it were first bound to a fresh variable - `f()[0] = v` is
+     * `{ var t = f(); t[0] = v; }` (README, "Storing through a value");
+     * the tree-walker's twin is hold_store_base (eval.cpp). A FRESH temp,
+     * never a named local the expression left its value in (`(t = g)[0]`):
+     * a COW of a slice base rewrites the hold, and only the hold.
+     */
+    bool hold_store_base(const Construct *root, int &slot,
+                         std::vector<CgInstr> &ops)
+    {
+        const int fresh = next_temp;
+        int s = -1;
+        if (!compile_boxed_expr(root, s, ops))
+            return false;
+        if (s < fresh) {
+            CgInstr mv;
+            mv.op = OpCode::MoveV;
+            mv.target = alloc_temp();
+            mv.target2 = s;
+            ops.push_back(mv);
+            s = mv.target;
+        }
+        slot = s;
+        return true;
+    }
+
+    /*
      * StoreLValueChainV for `e`, its lvalue decomposed into `chain` over
      * `base`: the rvalue into a temp (`vslot`), then each subscript step's
      * key into a temp (INSIDE-OUT, matching the tree-walker's chained
      * lvalue eval), the chain_steps entry (`steps_idx`), the op. False,
      * nothing emitted, for an OPTIONAL member (`a?.b` short-circuits a none
-     * base - not a step the walk has; compile-refused upstream anyway), a
-     * base that is not a variable, or a part that does not compile. The
-     * runtime walk uses the same Type::subscript / member-lvalue /
-     * vm_member_store / vm_subscript_store the tree-walker's stores do.
+     * base - not a step the walk has; compile-refused upstream anyway) or a
+     * part that does not compile. A base that is not a variable is HELD
+     * (hold_store_base) after the rvalue and before the keys: the
+     * tree-walker evaluates the rhs, then the base, then each key.
+     * `held`, when given, says which. The runtime walk uses the same
+     * Type::subscript / member-lvalue / vm_member_store /
+     * vm_subscript_store the tree-walker's stores do.
      */
     bool emit_chain_store(const Expr14 *e,
                           const std::vector<const Construct *> &chain,
                           const Construct *base, int &vslot, int &bslot,
-                          int &steps_idx, std::vector<CgInstr> &ops)
+                          int &steps_idx, std::vector<CgInstr> &ops,
+                          bool *held = nullptr)
     {
         for (const Construct *c : chain)
             if (ctag(c) == ConstructType::member &&
                     static_cast<const MemberExpr *>(c)->optional)
                 return false;
         int bkind;
-        if (!as_container_base(base, bslot, bkind))
-            return false;
+        const bool hold = !as_container_base(base, bslot, bkind);
+        if (held)
+            *held = hold;
 
         const size_t omark = ops.size();
         const size_t cmark = chunk.consts.size();
@@ -5661,6 +5700,11 @@ struct Codegen {
 
         if (!compile_rvalue(e, vslot, ops))
             return fail();
+        if (hold) {
+            if (!hold_store_base(base, bslot, ops))
+                return fail();
+            bkind = 0;
+        }
 
         /* Build the steps INSIDE-OUT (base -> final): chain[nsteps-1-i]. A
          * subscript step compiles its key into a temp NOW; a member step
@@ -5713,7 +5757,7 @@ struct Codegen {
      * stored: read back through the same base and the same key temps, so
      * nothing is evaluated twice, and a read of the location a store just
      * wrote cannot fail. A base that is not a variable (a call's result)
-     * declines as the statement store does.
+     * is the HELD temp, read back as it is, never evaluated again.
      */
     bool try_value_store(const Expr14 *e, int &out_slot,
                          std::vector<CgInstr> &ops)
@@ -5721,7 +5765,9 @@ struct Codegen {
         std::vector<const Construct *> chain;   /* outermost-first */
         const Construct *base = lvalue_chain(e->lvalue.get(), chain);
         int vslot, bslot, steps_idx;
-        if (!emit_chain_store(e, chain, base, vslot, bslot, steps_idx, ops))
+        bool held;
+        if (!emit_chain_store(e, chain, base, vslot, bslot, steps_idx, ops,
+                              &held))
             return false;
 
         if (e->op == Op::assign) {
@@ -5731,9 +5777,11 @@ struct Codegen {
         }
 
         /* the compound's stored value, read back from the base variable (a
-         * local is its slot; a global / capture is loaded) */
+         * local is its slot; a global / capture is loaded; a held value is
+         * its temp) */
         int rs = bslot;
-        compile_boxed_expr(base, rs, ops);
+        if (!held)
+            compile_boxed_expr(base, rs, ops);
         const int nsteps = static_cast<int>(chain.size());
         for (int i = 0; i < nsteps; i++) {
             const Construct *c = chain[nsteps - 1 - i];
@@ -5768,9 +5816,11 @@ struct Codegen {
      * temp ONCE, in the tree-walker's eval order: root first, then keys
      * inside-out), pools the steps + tier/flags/carets in `incdec_chains`, and
      * emits ONE IncDecChainV. The runtime walk + final-step semantics
-     * (vm_incdec_final) mirror IncDecExpr::do_eval's tiers byte-identically -
-     * including a compiled RVALUE root's rvalue-ness (kind 3 seeds the walk
-     * with a VALUE, so `mk()[0]++` still throws NotLValueEx).
+     * (vm_incdec_final) mirror IncDecExpr::do_eval's tiers byte-identically.
+     * A root that is not a variable (`mk()[0]++`) is HELD in a temp and
+     * named as a local, so the inc-dec goes into the value it evaluated to
+     * (it was an rvalue root, "kind 3", raising NotLValueEx, until
+     * 2026-10-06).
      */
     bool try_incdec_chain(const IncDecExpr *inc, int &out_slot,
                           std::vector<CgInstr> &ops)
@@ -5799,19 +5849,18 @@ struct Codegen {
         const size_t cmark = chunk.consts.size();
         const int st = next_temp;
 
-        /* The ROOT: a container slot (kind 0/1/2), else compile the expression
-         * into a temp (kind 3 - an RVALUE root; the walk seeds a VALUE from it,
-         * reproducing the tree-walker's non-lvalue base semantics). Compiled
-         * FIRST, before any key - the tree-walker's eval order. */
+        /* The ROOT: a container slot (kind 0/1/2), else the expression HELD
+         * in a temp (kind 0). Compiled FIRST, before any key - the
+         * tree-walker's eval order. */
         int bslot, bkind;
         if (!as_container_base(root, bslot, bkind)) {
-            if (!compile_boxed_expr(root, bslot, ops)) {
+            if (!hold_store_base(root, bslot, ops)) {
                 ops.resize(omark);
                 chunk.consts.resize(cmark);
                 next_temp = st;
                 return false;
             }
-            bkind = 3;
+            bkind = 0;
         }
 
         /* Steps INSIDE-OUT; a subscript key compiles into a temp NOW (once). */
@@ -5862,7 +5911,7 @@ struct Codegen {
         in.base_node_idx = add_base_node(bkind, root); /* #127: base caret */
         in.target = dst;
         in.target2 = bslot;
-        in.set_a(int_lit(bkind));          /* root kind: 0/1/2, 3 = rvalue temp */
+        in.set_a(int_lit(bkind));          /* root kind: 0 local/1 gbl/2 cap */
         in.set_b(int_lit(site_idx));       /* incdec_chains pool idx */
         in.aop = inc->is_inc ? Op::plus : Op::minus;
         ops.push_back(in);
@@ -12043,12 +12092,11 @@ void ChunkVerifier::verify_one(const Instr &in)
             reject("incdec member with no name");
         break;
     case OpCode::IncDecChainV:
-        /* kind 3 is the fourth form: an rvalue ROOT held in a frame slot. */
+        /* a held root is a frame slot like any local (kind 0); kind 3, the
+         * rvalue root, is gone since v30 - like any kind but 1 and 2 it now
+         * names a local, as vm_store_base reads it */
         reg(in.target);
-        if (in.a_lit() == 3)
-            reg(in.target2);
-        else
-            base(in.a_lit(), in.target2);
+        base(in.a_lit(), in.target2);
         pool(in.b_lit(), ck.incdec_chains.size(), "incdec chain");
         for (const Chunk::ChainStep &st
                  : ck.incdec_chains[in.b_lit()].steps) {

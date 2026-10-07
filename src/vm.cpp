@@ -1061,12 +1061,8 @@ vm_incdec_chain_op(EvalContext &ctx, const Chunk &chunk, const Instr &in,
 {
     const Chunk::IncDecChain &site = chunk.incdec_chains[in.b_lit()];
 
-    EvalValue cur;
-    if (in.a_lit() == 3)
-        cur = ctx.frame->at(in.target2).get();      /* rvalue root: a VALUE */
-    else
-        cur = EvalValue(
-            vm_store_base(ctx, in.a_lit(), in.target2, chunk, pc, nullptr));
+    EvalValue cur = EvalValue(
+        vm_store_base(ctx, in.a_lit(), in.target2, chunk, pc, nullptr));
 
     vm_incdec_chain_core(ctx, site, chunk.member_keys.data(), std::move(cur),
                          in.target, in.aop == Op::plus);
@@ -6176,9 +6172,7 @@ extern "C" int jit_incdec_chain(int_type root_kind, int_type root_slot,
     const Chunk::IncDecChain &site =
         *static_cast<const Chunk::IncDecChain *>(chainv);
     EvalValue cur;
-    if (root_kind == 3) {
-        cur = ctx->frame->at(root_slot).get();   /* rvalue root: a VALUE */
-    } else if (root_kind == 1) {
+    if (root_kind == 1) {
         if (!ctx->gfuncs->defined[root_slot])
             return 1;                       /* bail */
         cur = EvalValue(&ctx->gfuncs->slots[root_slot]);
