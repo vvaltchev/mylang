@@ -1506,7 +1506,9 @@ a few difference from `C` worth pointing out:
     `x` gets the int `12` - although the literal as a value, say stored in a
     variable, would be an `array<float>` holding `12.0`. The same holds for
     a `const` multi-declaration: `const x, y = [12, 2.5];` makes `x` the int
-    `12`.
+    `12`, and its targets may be containers too -
+    `const a, b = [[1], {"k": 2}];` binds two deeply read-only constants,
+    exactly as `const a = [1]; const b = {"k": 2};` would.
 
   - Use `_` as a **placeholder** for a destructured entry you don't want:
     `var a, _, b = [1, 2, 3];` binds `a == 1`, `b == 3` and drops the middle.
