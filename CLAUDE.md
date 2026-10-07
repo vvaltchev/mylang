@@ -3485,9 +3485,12 @@ and it lives *inside the parser*. Mechanics:
   `SymKind::local` or `SymKind::capture` is not folded either (`pure func
   a ..; func f(a) { return a(2); }` ran the OUTER `a`). The cost is a lost
   fold of a captured const CONTAINER's reads, deliberately: the capture is
-  rebindable. Known and left: a param named like a STRUCT shadows the name
-  for values, but `P p;` in that function still resolves P as the struct
-  type (`lookup_struct_type` is not shadow-aware).
+  rebindable. **And in TYPE position too (2026-10-07):** `P p;` inside
+  `func f(P)` resolved the outer struct - `lookup_struct_type` ignored the
+  set; it asks `is_shadowed` now, and the error says why (`not_a_type`:
+  "a parameter ... named 'P' hides the struct"). A per-name check is
+  exact here: the ctor pre-scan adds an entry only for a builtin's name,
+  which no struct can take.
 - **A CLOSURE CAPTURING A CONST SCALAR GETS A SYNTHESIZED `var` (H2,
   2026-10-06).** A const scalar has no run-time symbol (its decl is
   dropped, `ShouldConstSymbolExistAtRuntime`), so `func [K]` snapshot

@@ -623,7 +623,11 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     `p = Other(...)`) is a compile error. The struct name is read as a type only
     in declaration position (`Point(...)` construction and `Point.CONST` keep
     working). It works as a **parameter** type too — `func mag2(Point p) => ...`
-    — where a wrong-struct argument is a compile error.
+    — where a wrong-struct argument is a compile error. Where a parameter, a
+    `foreach` or `catch` variable or a capture is named like the struct, the
+    name means that binding in its scope, so it is not a type there: inside
+    `func f(Point) { ... }`, `Point q;` is a compile error (as in C++).
+    A struct variable in a container literal is fine: `array<Point> a = [p];`.
   * **No initializer** gives the type's zero value: `int x;` → `0`, `float x;` →
     `0.0`, `bool x;` → `false`, `str x;` → `""`, `array x;` → `[]`,
     `dict x;` → `{}`, and a **struct zero-initializes recursively** by the same
