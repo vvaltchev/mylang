@@ -134,9 +134,18 @@ struct NestGuard {
  */
 void ParseContext::shadow_add(const UniqueId *uid)
 {
-    if (uid && EvalContext::const_builtins.count(uid))
+    if (uid && const_binding(uid))
         shadowed.push_back(uid);
 }
+
+LValue *ParseContext::const_binding(const UniqueId *uid) const
+{
+    for (EvalContext *x = const_ctx; x; x = x->parent)
+        if (LValue *lv = x->lookup(uid))
+            return lv;
+    return nullptr;
+}
+
 
 /*
  * ----------------- Recursive Descent Parser -------------------
@@ -2759,6 +2768,11 @@ pAcceptFuncDecl(ParseContext &c,
         for (const auto &pm : func->params->elems)
             if (const auto *pid = dynamic_cast<const Identifier *>(pm.get()))
                 c.shadow_add(pid->uid);
+    /* ...and so does a capture: a closure's own copy, which the body may
+     * rebind (a const scalar's is declared by the capture list above) */
+    if (func->captures)
+        for (const auto &cap : func->captures->elems)
+            c.shadow_add(cap->uid);
     if (is_pure)
         c.pure_depth++;                /* #54: see ParseContext::folding */
 
@@ -3566,8 +3580,14 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             have_catch_anything = true;
         }
 
+        /* the catch variable is its own binding in the body, whatever
+         * const an outer name of it denotes (#133's shadowing) */
+        c.shadow_push();
+        if (asId)
+            c.shadow_add(asId->uid);
         if (!pAcceptBracedBlock(c, body, fl | pFlags::pInCatchBody))
             throw SyntaxErrorEx(c.get_loc(), "Expected { } block, got", &c.get_tok());
+        c.shadow_pop();
 
         stmt->catchStmts.emplace_back(
             AllowedExList{std::move(exList), std::move(asId)},

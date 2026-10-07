@@ -10,6 +10,7 @@
 #include <string_view>
 
 class EvalContext;
+class LValue;
 class UniqueId;
 class Block;
 struct AnalysisInfo;
@@ -120,21 +121,26 @@ public:
     ~ParseContext(); // out-of-line: CseCache is incomplete here (PIMPL)
 
     /*
-     * #133 - THE SHADOWED-CONST-BUILTIN SET. A declaration may name a const
-     * builtin (`func abs(x) { return 42; }`, a param, a foreach var), and the
+     * #133 - THE SHADOWED-CONST SET. A declaration may name a const builtin
+     * (`func abs(x) { return 42; }`, a param, a foreach var), and the
      * parse-time const evaluator used to ignore it completely: `abs(-1)`
      * folded through to the BUILTIN while `abs(runtime(-1))` called the user's
      * function - the same call spelled two ways giving two answers, and a
      * RULE 2 violation (`-nc` disagreed with the default).
      *
+     * The same holds for a USER const (2026-10-06): a parameter, a foreach
+     * or catch variable, or a capture named like an outer `const`, `pure
+     * func` or struct is its own binding, and `const K = 5; func f(K) =>
+     * K + 1;` folded `K` to 5 - a wrong answer in every engine.
+     *
      * So each such name is recorded here for the extent of its scope, and
-     * pAcceptId refuses to resolve it to the const builtin. A flat vector with
-     * per-scope MARKS, not a map: an entry is only ever added for a name that
-     * IS a const builtin, so in every real program the set is EMPTY and
+     * pAcceptId refuses to const-resolve it. A flat vector with per-scope
+     * MARKS, not a map: an entry is only ever added for a name the const
+     * scope binds, so in nearly every program the set is EMPTY and
      * `shadowed.empty()` short-circuits the lookup to one compare.
      *
-     * NOT for a `pure func`: that IS the const evaluator's own binding (it
-     * registers itself in const_ctx and must keep folding).
+     * NOT for a `pure func`'s own name: that IS the const evaluator's own
+     * binding (it registers itself in const_ctx and must keep folding).
      */
     std::vector<const UniqueId *> shadowed;
     std::vector<size_t> shadow_marks;
@@ -146,9 +152,14 @@ public:
         shadowed.resize(shadow_marks.back());
         shadow_marks.pop_back();
     }
-    /* Record `uid` iff it names a const builtin (else a no-op, so the set
-     * stays empty for normal code). Defined out-of-line: const_builtins. */
+    /* Record `uid` iff the const scope binds it - a const builtin, or a
+     * const, pure func or struct in scope (else a no-op, so the set stays
+     * empty for normal code). Defined out-of-line: const_builtins. */
     void shadow_add(const UniqueId *uid);
+    /* The const scope's binding of `uid`, or null - a const builtin
+     * included */
+    LValue *const_binding(const UniqueId *uid) const;
+
     bool is_shadowed(const UniqueId *uid) const
     {
         if (shadowed.empty())

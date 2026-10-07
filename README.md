@@ -830,8 +830,13 @@ if (runtime(false)) { len = 5; }   # compile error: CannotRebindBuiltinEx
 A parameter, a capture, a `foreach` or a `catch` variable is its own binding
 and is never const, whatever outer name it shadows: in
 `const K = [1]; func f(K) { K = [2]; return K; }` the assignment rebinds the
-parameter. (In the REPL, where a top-level name stays redefinable, an
-assignment to a top-level const or builtin is refused when it runs.)
+parameter. Reading it reads that binding, never the outer constant - a read
+of such a name is not folded to the constant's value - so
+`const K = 5; func f(K) => K + 1;` gives `f(10) == 11`, and with
+`pure func a(x) => x + 1;`, a parameter named `a` is called as the function
+passed in, not as the pure function. (In the REPL, where a top-level name
+stays redefinable, an assignment to a top-level const or builtin is refused
+when it runs.)
 
 **What can appear on the left of `=`.** Exactly four forms denote a location:
 a variable, an id list (`a, b = ...`), an element `a[i]`, and a field `a.f`.
