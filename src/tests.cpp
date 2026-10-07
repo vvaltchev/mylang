@@ -14689,6 +14689,78 @@ static const std::vector<test> tests =
     },
 
     /*
+     * H2 (2026-10-06) - A CLOSURE CAPTURING A CONST SCALAR. A const scalar
+     * has no run-time symbol (every read is folded), so the capture
+     * snapshot read nothing: "Undefined variable". The capture list now
+     * declares `var K = <value>` just before the statement, once per block
+     * (ParseContext::cap_const_decls), and the closure gets its own
+     * MUTABLE copy, as with any captured variable.
+     */
+    {
+        "capture: a closure captures a const scalar (H2)",
+        {
+            "const K = 5;",
+            /* two captures in one block: one synthesized var, not two */
+            "var g = func[K]() => K;",
+            "var h = func[K]() { K += 1; return K; };",
+            "assert(g() == 5);",
+            "assert(h() == 6);",
+            "assert(h() == 7);",
+            "assert(g() == 5 && K == 5);",
+        }
+    },
+    {
+        "capture: a captured const scalar of every kind (H2)",
+        {
+            "const S = \"a\"; const F = 1.5; const B = true;",
+            "var g = func[S, F, B]() { S += \"b\"; F *= 2.0; B = !B;",
+            "    return S + str(F) + str(B); };",
+            "assert(g() == \"ab3.000000false\");",
+            "assert(g() == \"abb6.000000true\");",
+            "assert(S == \"a\" && F == 1.5 && B);",
+        }
+    },
+    {
+        "capture: a captured const scalar where the closure sits (H2)",
+        {
+            "const K = 5;",
+            /* in a function body */
+            "func outer() { var g = func[K]() { K *= 2; return K; };",
+            "    return g() + g(); }",
+            "assert(outer() == 30 && outer() == 30);",
+            /* in a loop body: a fresh copy per closure */
+            "var r = [];",
+            "for (var i = 0; i < 2; i++) {",
+            "    var g = func[K, i]() { K += i; return K; };",
+            "    append(r, g()); append(r, g()); }",
+            "assert(r == [5, 5, 6, 7]);",
+            /* in an `if` condition, and in a brace-less body: the
+             * declaration lands before the whole statement */
+            "var y = 0;",
+            "if ((func[K]() => K + 1)() == 6) { y = 1; }",
+            "assert(y == 1);",
+            "if (runtime(true)) y = (func[K]() => K * 3)();",
+            "assert(y == 15);",
+            /* a capture of a capture */
+            "var n = func[K]() { var f2 = func[K]() { K++; return K; };",
+            "    return f2() + f2() + K; };",
+            "assert(n() == 18);",
+        }
+    },
+    {
+        "capture: a struct name is captured as itself (H2)",
+        {
+            /* the name is bound to its descriptor in the const scope, but
+             * is no scalar: it has its own run-time symbol, and no `var`
+             * is declared for it (a null node did, a parser crash) */
+            "struct P { int x; }",
+            "const K = 5;",
+            "var g = func[P, K]() { K++; return P(K).x; };",
+            "assert(g() == 6 && g() == 7);",
+        }
+    },
+
+    /*
      * Parse-time common-subexpression de-duplication (CSE). Identical const
      * array/dict expressions are evaluated once at parse time and the
      * resulting deep read-only value is shared, asserted here via intptr().
@@ -19991,6 +20063,20 @@ static const std::vector<repl_test> repl_tests =
         { "var vv_f = vv_ops[0]", "" },
         { "vv_f(vv_st, 7)", "" },
         { "vv_st[0]", "=> 7" } } },
+
+    /* H1/H2 across inputs: a param named like an earlier input's const is
+     * its own binding, a closure captures the const scalar as its own
+     * copy, and `:globals` still lists the name as the const it is (the
+     * capture's synthesized `var` lives in the run-time map) */
+    { "const: shadowed and captured across inputs (H1, H2)",
+      { { "const KQ = 5", "" },
+        { "func fq(KQ) => KQ + 1", "" },
+        { "fq(10)", "=> 11" },
+        { "var gq = func[KQ]() { KQ++; return KQ; }", "" },
+        { "gq()", "=> 6" },
+        { "gq()", "=> 7" },
+        { "KQ", "=> 5" },
+        { ":globals", ": int   [const]" } } },
 
     /*
      * The RUN-TIME half of UncatchableRuntimeException. The REPL is the only

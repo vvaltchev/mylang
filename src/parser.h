@@ -160,6 +160,15 @@ public:
      * included */
     LValue *const_binding(const UniqueId *uid) const;
 
+    /*
+     * A closure capturing a const SCALAR (`const K = 5; func [K] () ..`)
+     * needs a run-time value to snapshot, and a const scalar has no run-time
+     * symbol. The capture list therefore declares `var K = 5` just before
+     * the statement (through baked_funcs, re-inserted by the enclosing
+     * pBlock), at most once per block: this stack holds, per pBlock in
+     * progress, the names it has declared so.
+     */
+    std::vector<std::vector<const UniqueId *>> cap_const_decls;
     bool is_shadowed(const UniqueId *uid) const
     {
         if (shadowed.empty())

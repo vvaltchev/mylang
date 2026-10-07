@@ -799,25 +799,26 @@ ReplEngine::Impl::cmd_globals()
         return r;
     };
 
+    /* the const context first: a const scalar is folded out of the
+     * run-time scope, and one a closure captured has a run-time `var` of
+     * its name there (the capture's source) - the name is still a const */
+    std::vector<std::pair<const UniqueId *, const LValue *>> csyms;
+    const_ctx->collect_symbols(csyms);
+    for (const auto &kv : csyms) {
+        if (EvalContext::const_builtins.count(kv.first))
+            continue;
+        seen.insert(kv.first);
+        rows.push_back(classify(kv.first, kv.second->get(), true));
+    }
+
     std::vector<std::pair<const UniqueId *, const LValue *>> rsyms;
     runtime_ctx->collect_symbols(rsyms);
     for (const auto &kv : rsyms) {
         if (EvalContext::const_builtins.count(kv.first) ||
-            EvalContext::builtins.count(kv.first))
+            EvalContext::builtins.count(kv.first) || seen.count(kv.first))
             continue;
-        seen.insert(kv.first);
         rows.push_back(classify(kv.first, kv.second->get(),
                                 kv.second->is_const_var()));
-    }
-
-    /* const scalars: present in the const context, folded out of runtime */
-    std::vector<std::pair<const UniqueId *, const LValue *>> csyms;
-    const_ctx->collect_symbols(csyms);
-    for (const auto &kv : csyms) {
-        if (EvalContext::const_builtins.count(kv.first) ||
-            seen.count(kv.first))
-            continue;
-        rows.push_back(classify(kv.first, kv.second->get(), true));
     }
 
     if (rows.empty())

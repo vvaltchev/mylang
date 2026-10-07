@@ -636,6 +636,58 @@ MakeConstructFromConstVal(const EvalValue &v,
                           bool process_arrays = false,
                           bool immutable = false);
 
+/*
+ * A capture list entry naming a const SCALAR (it has no run-time symbol, so
+ * the closure's snapshot would read nothing - "Undefined variable"): declare
+ * `var K = <value>` just before the statement, in the enclosing block, once
+ * per block. The capture is its own binding in the body (shadowed there), so
+ * a write to it changes the closure's copy, as for any captured variable.
+ * A name a parameter or loop variable in scope shadows is a run-time
+ * binding already, and a const builtin has its own run-time slot.
+ */
+static inline bool ShouldConstSymbolExistAtRuntime(const EvalValue &rvalue);
+
+static void
+declare_captured_const_scalars(ParseContext &c, IdList *caps)
+{
+    if (!caps)
+        return;
+    for (const auto &cap : caps->elems) {
+        if (c.is_shadowed(cap->uid)
+                || EvalContext::const_builtins.count(cap->uid))
+            continue;
+        LValue *lv = c.const_binding(cap->uid);
+        if (!lv || ShouldConstSymbolExistAtRuntime(lv->get()))
+            continue;
+        /* only a value that becomes a literal: a struct NAME is bound to
+         * its descriptor here and has a run-time symbol already (its
+         * hoisted global slot) - a capture of it reads that */
+        unique_ptr<Construct> lit;
+        MakeConstructFromConstVal(lv->get(), lit);
+        if (!lit)
+            continue;
+        ML_CHECK(!c.cap_const_decls.empty());
+        auto &done = c.cap_const_decls.back();
+        if (std::find(done.begin(), done.end(), cap->uid) != done.end())
+            continue;
+        done.push_back(cap->uid);
+
+        auto d = make_unique<Expr14>();
+        d->op = Op::assign;
+        d->fl = pFlags::pInDecl;
+        d->start = cap->start;
+        d->end = cap->end;
+        auto lhs = make_unique<Identifier>(cap->uid->val);
+        lhs->start = cap->start;
+        lhs->end = cap->end;
+        d->lvalue = std::move(lhs);
+        lit->start = cap->start;
+        lit->end = cap->end;
+        d->rvalue = std::move(lit);
+        c.baked_funcs.push_back(std::move(d));
+    }
+}
+
 static bool
 cse_materialize(ParseContext &c,
                 Construct *node,
@@ -2421,6 +2473,7 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
         c.const_ctx = &block_const_ctx; // push a new const eval context
     c.cse->push();                  // matching CSE cache scope
     c.shadow_push();                // #133: matching shadowed-builtin scope
+    c.cap_const_decls.emplace_back();
 
     /*
      * #47: a statement of THIS block whose const bake detached a function
@@ -2466,6 +2519,7 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
     }
 
     ret->end = c.get_loc();
+    c.cap_const_decls.pop_back();
     c.shadow_pop();                    // #133
     c.cse->pop();                      // pop the CSE cache scope
     if (push_const_scope)
@@ -2748,6 +2802,7 @@ pAcceptFuncDecl(ParseContext &c,
 
             func->captures = pList<IdList>(c, fl, pIdentifier);
             pExpectOp(c, Op::bracketR);
+            declare_captured_const_scalars(c, func->captures.get());
         }
     }
 

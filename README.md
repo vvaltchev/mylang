@@ -1973,6 +1973,16 @@ c1: 10
 c1: 11
 ```
 
+A capture of a **constant** works the same way: the closure gets its own
+copy of the constant's value, which it may change like any captured
+variable, while the constant itself stays what it is:
+
+```C#
+const K = 5;
+var next = func [K] { K += 1; return K; };
+print(next(), next(), K);   # Will print 6 7 5
+```
+
 ### Calling functions during const-evaluation
 
 Regular user-defined function objects (including lambdas) are not considered
