@@ -14849,6 +14849,28 @@ static const std::vector<test> tests =
     },
 
     /*
+     * A STRUCT TYPE IS A TYPE IN A NESTED BLOCK TOO (2026-10-07). The type
+     * lookup searched only the innermost const scope, so `P p;` - or
+     * `array<P>`, `dict<str, P>` - in any function body or block was
+     * "'P' is not a type"; only the top level and a parameter list (parsed
+     * in the enclosing scope) worked, and no test declared a struct-typed
+     * local anywhere else.
+     */
+    {
+        "struct: a struct type is a type in a nested block",
+        {
+            "struct P { int x; }",
+            "func f() { P p; p.x = 2; return p.x; }",
+            "func g() { array<P> a = [P(1)]; return a[0].x; }",
+            "func h() { dict<str, P> d = {\"k\": P(3)}; return d[\"k\"].x; }",
+            "func k() { func m(P q) => q.x; return m(P(4)); }",
+            "var r = 0;",
+            "if (runtime(true)) { P q; q.x = 5; r = q.x; }",
+            "assert(f() == 2 && g() == 1 && h() == 3 && k() == 4 && r == 5);",
+        }
+    },
+
+    /*
      * Parse-time common-subexpression de-duplication (CSE). Identical const
      * array/dict expressions are evaluated once at parse time and the
      * resulting deep read-only value is shared, asserted here via intptr().

@@ -205,14 +205,19 @@ static DeclType type_keyword(std::string_view s)
 static const StructTypeDef *
 lookup_struct_type(ParseContext &c, std::string_view name)
 {
-    if (!c.const_ctx)
-        return nullptr;
-    Identifier id(name);
-    LValue *lv = c.const_ctx->lookup(&id);
-    if (!lv)
-        return nullptr;
-    const EvalValue &v = lv->get();
-    return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>() : nullptr;
+    const UniqueId *uid = UniqueId::get(name);
+    /* the whole scope chain: EvalContext::lookup is LOCAL, and a struct
+     * declared around a block is in an OUTER scope - looking in the
+     * innermost one alone, `P p;` in any function body or `if` block was
+     * "not a type" (until 2026-10-07) */
+    for (EvalContext *x = c.const_ctx; x; x = x->parent) {
+        LValue *lv = x->lookup(uid);
+        if (!lv)
+            continue;
+        const EvalValue &v = lv->get();
+        return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>() : nullptr;
+    }
+    return nullptr;
 }
 
 /*
