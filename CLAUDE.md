@@ -4474,6 +4474,13 @@ decisions behind it: `plans/archived/type-inference.md`,
   header and always DECLARES a fresh loop-scoped var — the old bare-name
   reuse-an-existing-var path is gone — so `idsVarDecl` is set for both forms).
   Each carries an interned custom message + a `Loc`.
+  **An error about a CONTRIBUTION marks the node it names (H5,
+  2026-10-06):** `contribute` / `contribute_arg` take `loc, loc_end`, and
+  every caller passes the span of the node it names (the assigned
+  identifier, an element/member store's base, an argument, a foreach or
+  idlist target) - `contribute` used to pass `Loc()` as the end, a
+  zero-width caret. The one site with no node is value-template
+  instantiation's phantom signature contribution (`Loc(), Loc()`).
 - **Mandatory `dyn`** (`enforce_concrete_decls`, ON by default via
   `infer_types(strict=true)`, off under `-nti`): a plain `var`/`const` must
   infer a *concrete* type; if its type is `dyn` it throws `DynRequiredEx`
