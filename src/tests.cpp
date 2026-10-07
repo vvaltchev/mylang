@@ -20115,6 +20115,13 @@ static const std::vector<repl_test> repl_tests =
         { "pure func h3a(x) => x + 2", "" },
         { "h3a(1)", "=> 3" } } },
 
+    /* H6: `++` on a captured const container is the closure's own binding
+     * - the error is the operand's type, not "cannot ++ a const" */
+    { "capture: ++ on a captured const container names its type (H6)",
+      { { "const K6 = [1]", "" },
+        { "var g6 = func[K6]() { K6++; return K6; }",
+          "'++'/'--' requires an int or float, got 'array<int>'" } } },
+
     /*
      * The RUN-TIME half of UncatchableRuntimeException. The REPL is the only
      * place a name error is still a RUNTIME error (FIX-1 makes it a compile
