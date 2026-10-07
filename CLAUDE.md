@@ -6663,10 +6663,9 @@ and two macros:
   the codegen-proved arms in vm.cpp; it must RENDER, never abort),
   **`UndefinedVariableEx`** (REPL-only since FIX-1 #130 makes it a compile
   error in a script) and the two REBIND errors, **`CannotRebindConstEx`** /
-  **`CannotRebindBuiltinEx`** (2026-10-06: as plain `Exception`s the VM threw
-  them raw past its frames, so a rebind inside a function printed no
-  backtrace - the tree-walker records frames for ANY exception - and a
-  `finally` ran in no engine; `tests/backtrace/rebind_*.my`). Declared with
+  **`CannotRebindBuiltinEx`** (REPL-only at run time too: a script's rebind
+  is the resolver's compile error below; as plain `Exception`s they once
+  printed no backtrace and ran no `finally`). Declared with
   `DECL_UNCATCHABLE_EX`. **An error a RUN can raise must be one of these
   two kinds - a catchable or an uncatchable `RuntimeException` - never a
   plain `Exception`, which only compile time may throw.**
@@ -6676,6 +6675,21 @@ and two macros:
   (`vm_catch_match`, `do_catch`) **before any name comparison**, so the
   parenless catch-all cannot swallow one either. Both halves are
   sabotage-pinned.
+- **A STORE INTO A BUILTIN OR A CONST NAME IS A COMPILE ERROR, decided by
+  the BINDING (2026-10-06, the resolver's `check_rebind`).** An assignment,
+  compound assignment or inc-dec target (each `IdList` member too) that
+  resolves to a builtin, or to a const binding - a `const` declaration
+  (`FuncState::const_slots`, `const_global_slots`), a struct name, an
+  explicit `pure func` name - is refused with the target's caret, even in
+  code that never runs. A local is answered at the write; a global or a
+  builtin once the escaped uses are stamped (`check_rebinds`). **NOT the
+  parser's `Identifier::is_const`:** that mark says the name was found in
+  the const scope, which a parameter, a capture, a foreach or a catch
+  variable of the same name does not change - codegen deciding stores on
+  it made the VM refuse a rebind of such a binding while the tree-walker
+  stored it. Codegen no longer emits a rebind throw (ThrowKind lost both,
+  myv v31). The REPL keeps its top-level names in the map, so there the
+  store raises when it runs.
 - **`OutOfMemoryEx` (2026-10-05, catchable - the maintainer's choice) IS
   ALSO A `std::bad_alloc`,** and `main` installs a `new_handler`
   (`ml_out_of_memory`) that throws it. `operator new` may only throw a

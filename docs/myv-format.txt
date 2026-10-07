@@ -2,8 +2,13 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 30.  This document describes the on-disk image exhaustively:
+Format version 31.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v31 changes no encoding: a ThrowSite's `kind` loses rebind_builtin (2)
+and rebind_const (3), and bad_args moves from 4 to 2.  Assigning to a
+builtin or a const name is a compile error now, so no image carries such
+a throw; a v30 binary would read a v31 bad_args as rebind_builtin.)
 
 (v30 changes no encoding: IncDecChainV's root kind (`a`) loses the value
 3, "an rvalue root held in a frame slot, read as a value".  A root that
@@ -1202,8 +1207,7 @@ same is true of OpCode and Op, which appear in every instruction.)
         0 dflt  1 general  2 flat_i  3 flat_f  4 flat_b  5 flat_s
 
     ThrowKind (bytecode.h)
-        0 undefined_var  1 not_lvalue  2 rebind_builtin  3 rebind_const
-        4 bad_args
+        0 undefined_var  1 not_lvalue  2 bad_args
 
     CallSite::A0 (bytecode.h)
         0 none  1 slot  2 elem  3 member  4 undef

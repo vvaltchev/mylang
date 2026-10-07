@@ -6769,10 +6769,9 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
 
 /* Re-raise deletability (ThrowRuntimeV): build the POOLED exception
  * natively - `tv` is a baked &chunk.throws[idx] (kind + the exact caret +
- * the name). Every kind is a RuntimeException (UndefinedVariableEx and
- * CannotRebind* are uncatchable ones) and rides g_vm_jit_exc, so the walk
- * records the frames it unwinds - a rebind once rode g_vm_jit_eptr and
- * printed no backtrace. Every kind carries its pooled loc at CONSTRUCTION,
+ * the name). Every kind is a RuntimeException (UndefinedVariableEx an
+ * uncatchable one) and rides g_vm_jit_exc, so the walk records the frames
+ * it unwinds. Every kind carries its pooled loc at CONSTRUCTION,
  * so the caret is pc-independent and the op is deletable. */
 extern "C" int jit_throw_runtime(const void *tv) noexcept
 {
@@ -6792,14 +6791,6 @@ extern "C" int jit_throw_runtime(const void *tv) noexcept
          * UncatchableRuntimeException, conveyed but never handled. */
         g_vm_jit_exc = std::make_unique<UndefinedVariableEx>(
             t.name->val, t.start, t.end);
-        break;
-    case Chunk::ThrowKind::rebind_builtin:
-        g_vm_jit_exc =
-            std::make_unique<CannotRebindBuiltinEx>(t.start, t.end);
-        break;
-    case Chunk::ThrowKind::rebind_const:
-        g_vm_jit_exc =
-            std::make_unique<CannotRebindConstEx>(t.start, t.end);
         break;
     }
     return 1;
@@ -12994,10 +12985,6 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                     throw UndefinedVariableEx(t.name->val, t.start, t.end);
                 case Chunk::ThrowKind::not_lvalue:
                     throw NotLValueEx(t.start, t.end);
-                case Chunk::ThrowKind::rebind_builtin:
-                    throw CannotRebindBuiltinEx(t.start, t.end);
-                case Chunk::ThrowKind::rebind_const:
-                    throw CannotRebindConstEx(t.start, t.end);
                 case Chunk::ThrowKind::bad_args:
                     throw InvalidNumberOfArgsEx(t.start, t.end);
             }
