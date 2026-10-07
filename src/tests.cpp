@@ -6387,12 +6387,32 @@ static const std::vector<test> tests =
     { "uncatchable: `catch (UndefinedVariable)` is a compile error",
       { "try { print(1); } catch (UndefinedVariable) { print(\"no\"); }" },
       &typeid(SyntaxErrorEx) },
+    { "uncatchable: `catch (CannotRebindConstEx)` is a compile error",
+      { "try { print(1); } catch (CannotRebindConstEx) { print(\"no\"); }" },
+      &typeid(SyntaxErrorEx) },
+    { "uncatchable: `catch (CannotRebindBuiltinEx)` is a compile error",
+      { "try { print(1); }",
+        "catch (TypeErrorEx, CannotRebindBuiltinEx) { print(\"no\"); }" },
+      &typeid(SyntaxErrorEx) },
+    /* The RUN-TIME half in a script: a rebind of a builtin or a const name
+     * is raised at run time, and the parenless catch-all must not swallow
+     * it in any engine (the frames it unwinds are tests/backtrace/
+     * rebind_*.my's job - the five modes compare only the type) */
+    { "uncatchable: a catch-all does not swallow a builtin rebind",
+      { "func f(n) { try { len = n; } catch { print(\"SWALLOWED\"); }",
+        "            return n; }",
+        "f(runtime(1));" },
+      &typeid(CannotRebindBuiltinEx) },
+    { "uncatchable: a catch-all does not swallow a const rebind",
+      { "const K = [1];",
+        "func f(n) { try { K = [n]; } catch { print(\"SWALLOWED\"); }",
+        "            return n; }",
+        "f(runtime(1));" },
+      &typeid(CannotRebindConstEx) },
     /* ...and the ordinary catch machinery is untouched: a named clause, the
      * parenless catch-all, a multi-type clause and a user struct exception
-     * all still work. (The RUN-TIME half - is_catchable() defeating the
-     * catch-all - has no script-visible test here because FIX-1 makes the
-     * only uncatchable a script can produce a COMPILE error; it is covered
-     * by the REPL, where the name error is still a runtime one.) */
+     * all still work. (The name-error half of is_catchable() is the REPL's:
+     * FIX-1 makes a name error a COMPILE error in a script.) */
     { "uncatchable: ordinary catches still work",
       { "var out = 0;",
         "try { var a = [1]; print(a[9]); } catch (OutOfBoundsEx) { out = 1; }",

@@ -1340,8 +1340,8 @@ extern "C" int jit_check_callable(int_type slot) noexcept;
 extern "C" void jit_raise_kind_exc(int kind) noexcept;
 
 /* Re-raise deletability: ThrowRuntimeV builds its pooled exception natively
- * (`t` = a baked &chunk.throws[idx]) - Runtime kinds via g_vm_jit_exc,
- * plain kinds via g_vm_jit_eptr, each with its pooled caret. */
+ * (`t` = a baked &chunk.throws[idx]) into g_vm_jit_exc, with its pooled
+ * caret: every kind is a RuntimeException (the rebind ones uncatchable). */
 extern "C" int jit_throw_runtime(const void *t) noexcept;
 extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
                                       int_type nargs, const void *cs,

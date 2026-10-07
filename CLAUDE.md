@@ -6625,9 +6625,16 @@ and two macros:
   (`var c = func[zz]() => zz;`, exit 134).
   Members: **`InternalErrorEx`** (an interpreter-BUG tripwire — `get_vec()`
   on a flat array, `pod_get` field validity, a `default:` over a closed enum,
-  the codegen-proved arms in vm.cpp; it must RENDER, never abort) and
+  the codegen-proved arms in vm.cpp; it must RENDER, never abort),
   **`UndefinedVariableEx`** (REPL-only since FIX-1 #130 makes it a compile
-  error in a script). Declared with `DECL_UNCATCHABLE_EX`.
+  error in a script) and the two REBIND errors, **`CannotRebindConstEx`** /
+  **`CannotRebindBuiltinEx`** (2026-10-06: as plain `Exception`s the VM threw
+  them raw past its frames, so a rebind inside a function printed no
+  backtrace - the tree-walker records frames for ANY exception - and a
+  `finally` ran in no engine; `tests/backtrace/rebind_*.my`). Declared with
+  `DECL_UNCATCHABLE_EX`. **An error a RUN can raise must be one of these
+  two kinds - a catchable or an uncatchable `RuntimeException` - never a
+  plain `Exception`, which only compile time may throw.**
   **Enforcement is BOTH ways**: naming one in a catch clause is a COMPILE
   error (`is_uncatchable_ex_name`, checked in the parser's catch-clause
   parse), and `is_catchable()` is tested by BOTH matchers
