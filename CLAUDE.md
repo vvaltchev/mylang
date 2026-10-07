@@ -344,6 +344,19 @@ case, so an early `set -e` exit or an interrupt cannot skip it. Same
 family as [[stale-build-lane-wrong-subject]] and RULE B1: before asking
 what a measurement means, ask what BINARY produced it.
 
+**⛔ AND A RESTORE THAT KEEPS THE OLD MTIME REBUILDS NOTHING
+(2026-10-06).** Restoring from a copy with `cp -p` / Python's
+`shutil.copy2` puts back the backup's OLD modification time, older than
+the sabotaged object - so `make` sees the object as up to date, the
+"restore rebuild" is a no-op, and the sabotage stays in the binary. Every
+later case then runs on a binary carrying the earlier ones: a 14-case run
+reported 13 caught, and at least three of those verdicts were caused by a
+leftover from a previous case, not their own defect. Restore with a plain
+copy and touch the file. **And give the harness a CONTROL**: after the
+restore rebuild, run the same check again and require it to PASS - that
+is the only proof the restore reached the binary, and it is what exposed
+this one (a tree-walker failure after a codegen-only edit).
+
 **⛔⛔ AND `git checkout -- <file>` IN A HARNESS DESTROYS THE
 UNCOMMITTED WORK IN THAT FILE. COMMIT BEFORE YOU SABOTAGE (2026-08-29,
 the same day, in the same session).** Every such harness restores with
