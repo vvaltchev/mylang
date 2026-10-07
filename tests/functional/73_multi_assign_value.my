@@ -172,6 +172,30 @@ func widen() {
 }
 assert(widen() == 3.5);
 
+# unpacking a LITERAL assigns each element as written: `[ri(12), 2.5]` as a
+# value is an array<float>, but `x, y = [...]` gives x the int 12. The
+# tree-walker widened it to 12.0 while x was typed int (a typed `x == 12`
+# raised), the VM's general unpack (a `_`, a global target) read it as a
+# float too - the JIT then read the float's bits as an int - and a fully
+# constant literal was baked widened, which typed x float
+func asis() {
+    var x = 0;
+    var y = 0.0;
+    x, y = [ri(12), 2.5];
+    var p = 0;
+    p, _ = [ri(7), 2.5];
+    var c = 0;
+    var e = 0.0;
+    c, e = [12, 2.5];
+    var m = 0;
+    var n = [0.0];
+    m, n = [ri(1), [2, 2.5]];
+    return [x == 12, p == 7, c == 12, typestr(c), x + p + c + m, n[0]];
+}
+assert(asis() == [true, true, true, "int", 32, 2.0]);
+ga, gf = [ri(5), 0.5];
+assert(ga == 5 && gf == 0.5 && ga + 1 == 6);
+
 # a failing destructure raises before anything is stored
 var c = 5;
 var caught = false;
