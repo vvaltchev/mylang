@@ -492,8 +492,9 @@ static EvalValue append_tw(EvalContext *ctx, ExprList *exprList)
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
 
-    const EvalValue a0v = arg0->eval(ctx);
-    LValue *target = a0v.is<LValue *>() ? a0v.get<LValue *>() : nullptr;
+    EvalValue a0v = arg0->eval(ctx);
+    LValue hold;
+    LValue *target = lv_builtin_target(a0v, hold);
 
     /* Construct-in-place: only a mutable FLAT struct array + a struct-ctor arg
      * (try_construct_into_struct_array returns false otherwise). Mirrors the

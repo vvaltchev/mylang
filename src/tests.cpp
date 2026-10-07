@@ -4926,11 +4926,13 @@ static const std::vector<test> tests =
     },
 
     {
-        "erase() on a non-lvalue is rejected",
+        "erase() works on a temporary, and on a call's result",
         {
             "erase([1,2,3], 0);",
+            "var b = [1, 2, 3]; func f() { return b; }",
+            "erase(f(), 0);",
+            "assert(b == [2, 3]);",
         },
-        &typeid(NotLValueEx),
     },
 
     {
@@ -4970,11 +4972,13 @@ static const std::vector<test> tests =
     },
 
     {
-        "insert() on a non-lvalue is rejected",
+        "insert() works on a temporary, and on a call's result",
         {
             "insert([1,2,3], 0, 9);",
+            "var b = [1, 2]; func f() { return b; }",
+            "insert(f(), 0, 9);",
+            "assert(b == [9, 1, 2]);",
         },
-        &typeid(NotLValueEx),
     },
 
     {
@@ -8315,8 +8319,9 @@ static const std::vector<test> tests =
       { "ispuredecl(5);" }, &typeid(TypeErrorEx) },
     { "intptr() with no args is rejected",
       { "intptr();" }, &typeid(InvalidNumberOfArgsEx) },
-    { "intptr() of a non-lvalue is rejected",
-      { "intptr(5);" }, &typeid(NotLValueEx) },
+    { "intptr() of a call's result is its object's",
+      { "var b = [1]; func f() { return b; }",
+        "assert(intptr(f()) == intptr(b));" } },
     { "assert(false) fails",
       { "assert(false);" }, &typeid(AssertionFailureEx) },
     { "assert() with no args is rejected",
@@ -8375,9 +8380,10 @@ static const std::vector<test> tests =
     {
         "NotLValueEx can be caught (as), rethrown, and re-caught",
         {
+            "const C = [1, 2]; func h(p) { p[0] = 9; }",
             "var hit = 0;",
             "try {",
-            "   try { append([1,2], 3); }",
+            "   try { h(C); }",
             "   catch (NotLValueEx as e) { hit += 1; rethrow; }",
             "} catch (NotLValueEx) { hit += 1; }",
             "assert(hit == 2);",
@@ -9996,20 +10002,26 @@ static const std::vector<test> tests =
         },
     },
 
+    /* an in-place builtin works on a VALUE first argument held, as
+     * `{ var t = [1, 2, 3]; append(t, 4); }` - it raised NotLValueEx,
+     * while an inlined callee returning a variable appended to it */
     {
-        "Append() does not work on temp objects",
+        "append()/push() work on a temporary, and on a call's result",
         {
-            "append([1,2,3], 4);",
+            "assert(append([1,2,3], 4) == [1, 2, 3, 4]);",
+            "var b = [1]; func f() { return b; }",
+            "push(f(), 2); append(f(), 3);",
+            "assert(b == [1, 2, 3]);",
         },
-        &typeid(NotLValueEx),
     },
 
     {
-        "Pop() does not work on temp objects",
+        "pop() works on a temporary, and on a call's result",
         {
-            "pop([1,2,3]);",
+            "assert(pop([1,2,3]) == 3);",
+            "var b = [1, 2]; func f() { return b; }",
+            "assert(pop(f()) == 2 && b == [1]);",
         },
-        &typeid(NotLValueEx),
     },
 
     {
@@ -10612,9 +10624,9 @@ static const std::vector<test> tests =
       { "const K = [1]; { var K = 6; }" },
       &typeid(CannotRebindConstEx), 22, 1, 24, 1 },
     {
-        "err loc: an lvalue-builtin on a literal marks arg0",
-        { "append([1, 2], 3);" },
-        &typeid(NotLValueEx), 8, 0, 15, 0,
+        "err loc: an in-place builtin on a const value marks arg0",
+        { "const C = [1, 2]; func cf() { return C; } append(cf(), 3);" },
+        &typeid(CannotChangeConstEx), 50, 1, 55, 1,
     },
     {
         "err loc: uncaught user exception points at the throw",
@@ -15170,7 +15182,21 @@ static const std::vector<test> tests =
     { "struct: mutating a const struct's field fails",
       { "struct Bag { array items; } const b = Bag([1, 2]);",
         "append(b.items, 3);" },
-      &typeid(NotLValueEx) },
+      &typeid(CannotChangeConstEx) },
+    /* the element and member forms (CallBuiltinLVElem / LVMember): an
+     * element or a field that is not a location - a read-only array's
+     * element, a flat array's scalar, a POD struct's field - is a value
+     * the builtin works on held, as in the tree-walker (they raised
+     * NotLValueEx, where the tree-walker now holds it) */
+    { "builtins: an element or field that is a value is worked on held",
+      { "const R = [[1], [2]]; var e = \"none\";",
+        "try { append(R[runtime(0)], 3); }",
+        "catch (CannotChangeConstEx) { e = \"c\"; }",
+        "var a = [1, 2]; var e2 = \"none\";",
+        "try { append(a[runtime(0)], 3); } catch (TypeErrorEx) { e2 = \"t\"; }",
+        "struct Pod { int x; } var p = Pod(1); var e3 = \"none\";",
+        "try { pop(p.x); } catch (TypeErrorEx) { e3 = \"t\"; }",
+        "assert(e == \"c\" && e2 == \"t\" && e3 == \"t\");" } },
     { "struct: a struct flowing through a dyn var",
       { "struct Point { int x; int y; } var dyn d = Point(5, 6);",
         /* d is declared dyn, so its STATIC kind is dyn (kindstr is a
@@ -34237,6 +34263,42 @@ static bool use_def_builtin_lv()
                seen_member[0], seen_member[1]);
         return false;
     }
+    /* AppendV (append/push with one value) is in visit_use_def proper:
+     * its `a` is the DUAL (pool index, kind), and the row tested the
+     * whole pair, so a local target at pool index > 0 was not a read -
+     * which dropped the write of a temp holding `append(f(), x)`'s
+     * target. Required: such a site exists here (main's runtime() call
+     * takes index 0). */
+    int seen_append_local = 0;
+    for (const Chunk *ck : chunks)
+        for (size_t p = 0; p < ck->code.size(); p++) {
+            const Instr &in = ck->code[p];
+            if (in.op != OpCode::AppendV)
+                continue;
+            std::vector<int> want, uses, defs;
+            if (in.a_dual_hi() == 0) {
+                want.push_back(static_cast<int>(in.target2));
+                if (in.a_dual_lo() > 0)
+                    seen_append_local++;
+            }
+            want.push_back(static_cast<int>(in.b_lit()));
+            if (!jit_op_slot_refs(in, uses, defs)) {
+                printf("  pc %zu: AppendV is a barrier\n", p);
+                return false;
+            }
+            std::sort(uses.begin(), uses.end());
+            std::sort(want.begin(), want.end());
+            if (uses != want) {
+                printf("  pc %zu: AppendV (kind %d, pool %d) uses %zu vs "
+                       "%zu the VM reads\n", p, in.a_dual_hi(),
+                       in.a_dual_lo(), uses.size(), want.size());
+                return false;
+            }
+        }
+    if (!seen_append_local) {
+        printf("  VACUOUS: no AppendV on a local at pool index > 0\n");
+        return false;
+    }
 #endif
     return true;
 }
@@ -50109,7 +50171,7 @@ static bool jit_op_nativized()
         if (run({ "func f(int n) {",
                   "  var s = 0;",
                   "  for (var i = 0; i < n; i++) s += i;",
-                  "  append(5, s);",     /* provably-non-lvalue arg0 */
+                  "  intptr();",         /* no argument: the arity throw */
                   "  return s;",
                   "}",
                   "f(runtime(3));" })) {

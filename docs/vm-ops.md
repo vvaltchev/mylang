@@ -1261,12 +1261,12 @@ serializable `emplace_sites` pool).**
 **Error-path constructs → native throwing ops (`ThrowRuntimeV`).** The
 always-throwing constructs the tree-walker ran and threw on are now native: an
 UNRESOLVED name in an rvalue/callee position (`var y = foobar` /
-`undefined_fn()` / `undef(5)` / a `_` read), an assignment to a scalar LITERAL
-(`0 = 99`, `true = false`), and a REQUIRES-lvalue builtin
-(`append`/`push`/`pop`/`insert`/`erase`/`intptr`) on a provably-non-lvalue
-arg0 (`append([1,2], 3)` — the only lvalues are id/subscript/member). (A
-rebind of a builtin or a const name used to be one more; it is a compile
-error now, the resolver's `check_rebind`.) New
+`undefined_fn()` / `undef(5)` / a `_` read), and an assignment to a scalar
+LITERAL (`0 = 99`, `true = false`). (A rebind of a builtin or a const name
+used to be one more; it is a compile error now, the resolver's
+`check_rebind`. So was an in-place builtin on a value first argument,
+`append([1,2], 3)`: the builtin works on that value now, held in a fresh
+temp - README, *Storing through a value*.) New
 op **`ThrowRuntimeV`** + a serializable
 `Chunk::throws` pool (`{ThrowKind, Loc, name}`) throws the pooled exception with
 the exact caret
@@ -1274,10 +1274,7 @@ the exact caret
 `compile_boxed_expr` (a CALL with an unresolved callee throws before its args,
 matching `what->eval` first); a bad-lvalue in `compile_boxed_stmt` (rhs compiled
 FIRST for its side effects, then the throw, matching the tree-walker's rhs-then-
-target order); a non-lvalue arg0 in `try_native_mutating_builtin` (gated by
-`builtin_requires_lvalue_arg0`, which EXCLUDES `sort`/`rev_sort`/`reverse` —
-they accept a value arg0 and sort the copy). The bare-LEAF guard keeps a
-discarded `foobar;` a no-op.
+target order). The bare-LEAF guard keeps a discarded `foobar;` a no-op.
 
 **A DYN callee → a generic value-call (`CallValueGenericV`).** An indirect call
 of a `dyn` callee (`var dyn a = len; a("hi")`, `a(1)` on a non-func) is native.

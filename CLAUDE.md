@@ -6637,9 +6637,21 @@ and two macros:
   the codegen's `hold_store_base` compiles it into a FRESH temp, after the
   rvalue and before the keys, named as a local base of `StoreLValueChainV`
   / `IncDecChainV` (the rvalue-root kind 3 is gone, myv v30). **It had to
-  be every base expression, not only a call**: the AST inliner turns
-  `pick(c)[0]` into `(c ? a : b)[0]`, so a narrower rule would change with
-  inlining (RULE 2). **Every STATEMENT store compiler declines a held
+  be every base expression, not only a call** - a ternary, a literal, an
+  element of a value. **And the AST inliner leaves a call at a store root
+  a CALL** (`store_root_call`, resolver.cpp: an assignment or inc-dec
+  target's root, an in-place builtin's first argument): inlined, the
+  body's expression - a name, an element - takes the call's place and the
+  store lands in THAT location, which is not the held copy for a slice
+  view (its copy detaches on a write) or a flat struct element (a read is
+  a copy). **The in-place builtins follow the rule** (`append(f(), x)`):
+  the tree-walker holds a value first argument (`lv_builtin_target`,
+  types.cpp), the VM compiles it into a fresh temp (the path the sort
+  family had), and the element / member forms hold a non-location element
+  or field (`vm_builtin_elem_target`, `vm_member_lvalue`'s `hold`) - they
+  raised NotLValueEx. That temp target exposed a use/def row reading
+  AppendV's DUAL `a` as one literal: a call site at pool index > 0 hid the
+  read, and E1 dropped the call's write. **Every STATEMENT store compiler declines a held
   root** (`as_container_base`), so such a statement reaches gen_stmt's
   discarded-expression fallback and the two value forms above - keep it
   so: the inc-dec value form's read + mutate (`incdec_lvalue_pure`)

@@ -1,6 +1,7 @@
 # A store through a value that is not a variable - a call's result, a
 # literal, a ternary, a slice - goes into that value, as if it were first
-# bound to a fresh variable: `f()[0] = v` is `{ var t = f(); t[0] = v; }`.
+# bound to a fresh variable: `f()[0] = v` is `{ var t = f(); t[0] = v; }`,
+# and an in-place builtin's first argument too (`append(f(), x)`).
 # A container is a reference, so the write lands in the object returned.
 # The tree-walker raised NotLValueEx for an array or a struct (and stored
 # into a dict), the VM refused to compile it, and an inlined `f` made it a
@@ -95,8 +96,9 @@ var w1 = (In(runtime(1)).x = 41);
 var w2 = ([1, spin(runtime(2))][1] += 40);
 assert(gi[0] == 100 && gh == [0, 207] && w1 == 41 && w2 == 42);
 print(gi, gh, w1, w2);
-# a small callee IS inlined: its body - a fresh literal - is the root, and
-# the inc-dec's value comes from the object it wrote, not a second one
+# a small callee at a store root stays a call (the AST inliner leaves
+# it, section 10), and the inc-dec's value comes from the object it wrote,
+# not a second one
 func lit2() { return [9, 8]; }
 var w3 = ++lit2()[1];
 var w4 = lit2()[0]--;
@@ -132,3 +134,51 @@ var cv = fc(runtime(1));
 try { cv[0] = 5; } catch (NotLValueEx) { e2 = "notlvalue"; }
 assert(e1 == e2 && CA == [1, 2]);
 print(e1, e2);
+
+# 9. an in-place builtin works on a value the same way: append(f(), x) is
+#    { var t = f(); append(t, x); } - the value evaluated first
+var gq = [1, 2];
+var gm = {"a": 1, "b": 2};
+func fq(int n) { spin(n); return gq; }
+func fm(int n) { spin(n); return gm; }
+append(fq(runtime(1)), 3);
+push(fq(runtime(1)), 4);
+var p1 = pop(fq(runtime(1)));
+insert(fq(runtime(1)), 0, 0);
+erase(fq(runtime(1)), 1);
+reverse(fq(runtime(1)));
+erase(fm(runtime(1)), "a");
+insert(fm(runtime(1)), "c", 3);
+append(fn(runtime(1))[0], 9);
+trail = "";
+append(fl(runtime(1))[1], t("v", 7));
+var same = intptr(fq(runtime(1))) == intptr(gq);
+append([spin(runtime(1)), 2], 3);
+var p2 = pop([spin(runtime(5)), 6]);
+assert(gq == [3, 2, 0] && p1 == 4 && gm == {"b": 2, "c": 3});
+assert(gn == [[1, 5, 9], [6, 7]] && trail == "fv" && same && p2 == 6);
+print(gq, p1, gn, trail, same, p2);
+var e3 = "none";
+try { append(fc(runtime(1)), 3); } catch (CannotChangeConstEx) { e3 = "c"; }
+var e4 = "none";
+try { append(cv, 3); } catch (CannotChangeConstEx) { e4 = "c"; }
+assert(e3 == "c" && e4 == "c" && CA == [1, 2]);
+print(e3, e4);
+
+# 10. the value is a COPY where a copy and the variable differ: a slice
+#     view's copy detaches on a write, a flat struct element read is a
+#     copy. These callees are small enough to inline, so the AST inliner
+#     must leave a call at a store root a call - inlined, the store would
+#     land in `sv` or `ge[0]` itself.
+var base = [1, 2, 3];
+var sv = base[0:2];
+func gsv() { return sv; }
+gsv()[0] = 9;
+gsv()[1]++;
+append(gsv(), 5);
+var ge = [In(1), In(2)];
+func gel() { return ge[0]; }
+gel().x = 40;
+gel().x += 1;
+assert(sv == [1, 2] && base == [1, 2, 3] && ge[0].x == 1);
+print(sv, base, ge);
