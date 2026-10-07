@@ -11,6 +11,7 @@
 
 class EvalContext;
 class LValue;
+class Construct;
 class UniqueId;
 class Block;
 struct AnalysisInfo;
@@ -178,6 +179,24 @@ public:
                 return true;
         return false;
     }
+
+    /*
+     * A const subscript whose fold raised a MISSING-LOCATION error - a key
+     * the const dict lacks, an index past the const array - is not thrown
+     * at once: the parser cannot yet tell `K["z"] = 1` (a store, refused as
+     * not an assignable location, as `K["k"] = 1` is) from `print(K["z"])`
+     * (a read, whose compile-time KeyNotFoundEx stands). The error waits
+     * here, the node is marked `nc_folds` (so pRefuseUnassignable refuses
+     * it as a target), and pExpr14 rethrows it when the expression holding
+     * it ends - unless refusing the target came first. Each pExpr14 owns
+     * the entries added inside it (a mark), so an index expression parsed
+     * inside `K["z"][i]` cannot rethrow its base's error. Out-of-line
+     * (parser.cpp): RuntimeException is incomplete here.
+     */
+    std::vector<std::pair<const Construct *,
+                          std::unique_ptr<RuntimeException>>> pending_fold;
+    void pending_fold_check(size_t mark);
+    void pending_fold_drop(size_t mark);
 
     /*
      * A declaration's pending explicit-type annotation (e.g. the `int` in

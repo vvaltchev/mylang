@@ -1320,6 +1320,65 @@ pAcceptCallExpr(ParseContext &c,
     return false;
 }
 
+/* the parse-time fold of a const subscript / slice (with -nc: its
+ * evaluation, for the errors and `nc_folds`) */
+static void
+pFoldSubscript(ParseContext &c, unique_ptr<Construct> &ret, bool in_slice,
+               unsigned fl)
+{
+    if (!c.folding() && ret->is_const) {
+
+        if (!in_slice || fl & pFlags::pInConstDecl)
+            nc_eval_const(c, ret.get(), true,
+                          (fl & pFlags::pInConstDecl) != 0);
+
+    } else if (ret->is_const) {
+
+        if (!in_slice || fl & pFlags::pInConstDecl) {
+
+            unique_ptr<Construct> const_construct;
+
+            if (cse_materialize(
+                    c,
+                    ret.get(),
+                    const_construct,
+                    true,
+                    (fl & pFlags::pInConstDecl) != 0))
+            {
+                /* #54: keep the subscript's span, so `K[0] = v` is
+                 * refused WITH a caret - the -nc run refuses the
+                 * un-folded Subscript at the same place. */
+                const_construct->start = ret->start;
+                const_construct->end = ret->end;
+                ret = std::move(const_construct);
+            }
+        }
+    }
+}
+
+/* ParseContext::pending_fold: a const subscript naming no element */
+static void
+pDeferFoldError(ParseContext &c, Construct *node, const RuntimeException &e)
+{
+    node->nc_folds = true;
+    c.pending_fold.emplace_back(node,
+                                unique_ptr<RuntimeException>(e.clone()));
+}
+
+void ParseContext::pending_fold_drop(size_t mark)
+{
+    pending_fold.resize(mark);
+}
+
+void ParseContext::pending_fold_check(size_t mark)
+{
+    if (pending_fold.size() <= mark)
+        return;
+    unique_ptr<RuntimeException> e = std::move(pending_fold[mark].second);
+    pending_fold.resize(mark);
+    e->rethrow();
+}
+
 bool
 pAcceptSubscript(ParseContext &c,
                  unique_ptr<Construct> &what,
@@ -1370,33 +1429,12 @@ pAcceptSubscript(ParseContext &c,
         ret->start = wstart;
         ret->end = c.get_loc() + 2;   /* get_loc() is the ']' */
 
-        if (!c.folding() && ret->is_const) {
-
-            if (!in_slice || fl & pFlags::pInConstDecl)
-                nc_eval_const(c, ret.get(), true,
-                              (fl & pFlags::pInConstDecl) != 0);
-
-        } else if (ret->is_const) {
-
-            if (!in_slice || fl & pFlags::pInConstDecl) {
-
-                unique_ptr<Construct> const_construct;
-
-                if (cse_materialize(
-                        c,
-                        ret.get(),
-                        const_construct,
-                        true,
-                        (fl & pFlags::pInConstDecl) != 0))
-                {
-                    /* #54: keep the subscript's span, so `K[0] = v` is
-                     * refused WITH a caret - the -nc run refuses the
-                     * un-folded Subscript at the same place. */
-                    const_construct->start = ret->start;
-                    const_construct->end = ret->end;
-                    ret = std::move(const_construct);
-                }
-            }
+        try {
+            pFoldSubscript(c, ret, in_slice, fl);
+        } catch (const KeyNotFoundEx &e) {
+            pDeferFoldError(c, ret.get(), e);
+        } catch (const OutOfBoundsEx &e) {
+            pDeferFoldError(c, ret.get(), e);
         }
 
         pExpectOp(c, Op::bracketR);
@@ -1544,10 +1582,15 @@ pRefuseUnassignable(const Construct *lv, const char *what)
 {
     pRefuseOptionalTarget(lv);
 
+    /* a FIELD of a constant (`K.k`, `P.CONST`) is a location no store can
+     * write, decidable here like the element `K["k"]` (folded to its value,
+     * or - naming no element - marked nc_folds): a member is not folded at
+     * parse time, so `K.k = v` used to reach run time as NotLValueEx while
+     * `K["k"] = v` was refused here (2026-10-07) */
     if (!lv->nc_folds
         && (lv->is_id() || lv->is_idlist()
             || ctag(lv) == ConstructType::subscript
-            || ctag(lv) == ConstructType::member))
+            || (ctag(lv) == ConstructType::member && !lv->is_const)))
         return;
 
     const std::string m = std::string(what) +
@@ -1991,8 +2034,8 @@ ShouldConstSymbolExistAtRuntime(const EvalValue& rvalue)
         rvalue.is<intrusive_ptr<FuncObject>>();
 }
 
-unique_ptr<Construct>
-pExpr14(ParseContext &c, unsigned fl)
+static unique_ptr<Construct>
+pExpr14_body(ParseContext &c, unsigned fl)
 {
     static const std::initializer_list<Op> valid_ops = {
         Op::assign, Op::addeq, Op::subeq, Op::muleq, Op::diveq, Op::modeq,
@@ -2378,6 +2421,27 @@ pExpr14(ParseContext &c, unsigned fl)
     }
 
     return ret;
+}
+
+/*
+ * An expression ends here: a const subscript that named no element (a
+ * missing key, an index out of range - ParseContext::pending_fold) and
+ * was not refused as a TARGET was a read, and its error is the compile
+ * error it always was.
+ */
+unique_ptr<Construct>
+pExpr14(ParseContext &c, unsigned fl)
+{
+    const size_t mark = c.pending_fold.size();
+    unique_ptr<Construct> e;
+    try {
+        e = pExpr14_body(c, fl);
+    } catch (...) {
+        c.pending_fold_drop(mark);
+        throw;
+    }
+    c.pending_fold_check(mark);
+    return e;
 }
 
 unique_ptr<Construct>
@@ -3795,7 +3859,17 @@ pAcceptForeachStmt(ParseContext &c,
      * refused the `-` (a SyntaxError until 2026-10-05). Every other header
      * reaches its expressions through pExprTop, whose pExpr14 strips the
      * flag before the operand; this one starts below it. */
-    stmt->container = pExpr01(c, fl & ~pFlags::pInStmt);
+    {
+        /* the one expression not parsed through pExpr14: the same check */
+        const size_t mark = c.pending_fold.size();
+        try {
+            stmt->container = pExpr01(c, fl & ~pFlags::pInStmt);
+        } catch (...) {
+            c.pending_fold_drop(mark);
+            throw;
+        }
+        c.pending_fold_check(mark);
+    }
 
     if (!stmt->container)
         noExprError(c);

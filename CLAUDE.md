@@ -6709,7 +6709,19 @@ and two macros:
   refused to compile (NotLoweredEx), and with -nti the tree-walker raised
   NotLValueEx even for a non-none base. A CONST element target lands
   there too, because the parser already
-  folded `K[0]` to its literal - which is right: it IS decidable. The same
+  folded `K[0]` to its literal - which is right: it IS decidable. **So does
+  every other element or field of a constant (2026-10-07):** a MemberExpr
+  target with `is_const` (`K.k = v`, `P.CONST = v` - a member is not
+  folded, so it reached run time as NotLValueEx), and a subscript whose
+  FOLD fails with KeyNotFoundEx / OutOfBoundsEx (`K["missing"] = v` used to
+  fail with the READ's error). The parser cannot tell a store from a read
+  when it folds the subscript, so that error is DEFERRED
+  (`ParseContext::pending_fold`, the node marked `nc_folds`): a target is
+  refused by `pRefuseUnassignable`, and otherwise `pExpr14` rethrows it when
+  its expression ends - each `pExpr14` owns the entries added inside it, so
+  an index parsed inside `K["z"][i]` cannot rethrow its base's error. The
+  one expression not parsed through `pExpr14`, a foreach container, checks
+  the same way. The same
   const reached through a PARAMETER is not folded, keeps its Subscript shape,
   and still raises the runtime `NotLValueEx`. This closed two divergences: the
   tree-walker reported a slice target as `TypeErrorEx` "does NOT support slice
