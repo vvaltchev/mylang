@@ -3515,6 +3515,11 @@ and it lives *inside the parser*. Mechanics:
   side effects: `-s` / `:show` show the synthetic `var K = 5`, and in the
   REPL it lands in the run-time map, so `cmd_globals` lists the CONST
   scope first and skips a run-time entry of the same name.
+- **An explicit `pure func`'s name is a CONST binding in the REPL (H3,
+  2026-10-06)** - `FuncDeclStmt::do_eval`'s map path emplaces it const
+  (`desc->explicit_pure`), as a struct name already was, so `a = 3` is
+  CannotRebindConstEx at run time there (a script refuses it at compile
+  time, G3). Redefinition still works: `allow_redeclare` erases first.
 - **Early failure:** exceptions raised *during* const-eval propagate immediately
   and are *not*
   catchable by script `try/catch` (the parser never enters a const assignment

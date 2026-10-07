@@ -5916,10 +5916,14 @@ EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
             ctx->erase(id.get());
         }
 
+        /* An explicit `pure func`'s name is a compile-time binding, like a
+         * struct's: in the REPL (whose names stay in this map) `a = 3` is a
+         * CannotRebindConstEx, as the resolver makes it in a script.
+         * Redefining the function is still allowed (erased above). */
         ctx->emplace(
             id.get(),
             std::move(func),
-            ctx->const_ctx
+            ctx->const_ctx || desc->explicit_pure
         );
 
         return none;

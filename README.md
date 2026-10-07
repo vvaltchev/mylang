@@ -835,8 +835,9 @@ of such a name is not folded to the constant's value - so
 `const K = 5; func f(K) => K + 1;` gives `f(10) == 11`, and with
 `pure func a(x) => x + 1;`, a parameter named `a` is called as the function
 passed in, not as the pure function. (In the REPL, where a top-level name
-stays redefinable, an assignment to a top-level const or builtin is refused
-when it runs.)
+stays redefinable, an assignment to a top-level const or builtin - or to a
+`pure func`'s or a struct's name - is refused when it runs; redefining the
+function or the struct with a new declaration is still allowed.)
 
 **What can appear on the left of `=`.** Exactly four forms denote a location:
 a variable, an id list (`a, b = ...`), an element `a[i]`, and a field `a.f`.
