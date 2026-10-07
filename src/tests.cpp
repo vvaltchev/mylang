@@ -14761,6 +14761,23 @@ static const std::vector<test> tests =
     },
 
     /*
+     * H7 (2026-10-06) - A CONST MULTI-DECLARATION IS UNPACKED AS WRITTEN,
+     * like a `var` one (README): the const evaluator built the literal
+     * widened to its joined type, so `x` was the float 12.0
+     * (LiteralArray::unpacked).
+     */
+    {
+        "const: a multi-declaration is unpacked as written (H7)",
+        {
+            "const x, y = [12, 2.5];",
+            "assert(typestr(x) == \"int\" && typestr(y) == \"float\");",
+            "assert(str(x) == \"12\");",
+            "var p, q = [12, 2.5];",
+            "assert(typestr(p) == \"int\" && str(p) == \"12\");",
+        }
+    },
+
+    /*
      * H5 (2026-10-06) - an assignment type error marks the target it
      * names. `contribute` passed no END, so the caret had zero width.
      */

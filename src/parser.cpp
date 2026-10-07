@@ -2208,6 +2208,11 @@ pExpr14(ParseContext &c, unsigned fl)
     if (!ret->rvalue)
         noExprError(c);
 
+    /* a multi-assignment's literal is unpacked AS WRITTEN: even a const
+     * evaluation of it must not widen it (LiteralArray::unpacked) */
+    if (in_idlist && ctag(ret->rvalue.get()) == ConstructType::lit_arr)
+        static_cast<LiteralArray *>(ret->rvalue.get())->unpacked = true;
+
     /*
      * Materialize a const rvalue - unless it is ALREADY a LiteralObj, i.e. a
      * subscript/slice/call result that pAcceptSubscript/pAcceptCallExpr already

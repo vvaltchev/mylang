@@ -569,6 +569,15 @@ public:
      */
     DeclType elem_coerce = DeclType::none;
 
+    /*
+     * The right side of a multi-assignment (`x, y = [12, 2.5]`), unpacked
+     * element by element AS WRITTEN (README): the const evaluator does not
+     * widen it to its joined type either - `const x, y = [12, 2.5]` gave
+     * `x` the float 12.0 where `var x, y = ..` gave the int 12. Stamped by
+     * the parser (pExpr14).
+     */
+    bool unpacked = false;
+
     LiteralArray()
         : MultiElemConstruct<>("LiteralArray",
                                ConstructType::lit_arr) { }
@@ -579,6 +588,7 @@ public:
         copy_base_fields(*c);
         clone_elems_into(*c);
         c->elem_coerce = elem_coerce;
+        c->unpacked = unpacked;
         return c;
     }
 };
