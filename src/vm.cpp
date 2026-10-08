@@ -959,6 +959,16 @@ vm_chain_lvalue_store_op(EvalContext &ctx,
          * missing key is `none` there (MemberExpr::access). */
         if (last.is_member) {
             const Chunk::MemberKey &mk = mkeys[last.operand];
+            if (!cur.is<LValue *>() && is_class_instance(cur)) {
+                /* a CLASS instance read as a value (an element of a flat
+                 * class array) is a reference: its field is the shared
+                 * object's - stored through a holder, as the tree-walker's
+                 * store_rooted lets member_store do */
+                LValue holder(cur, false);
+                vm_member_store(&holder, mk.memUid, op, value,
+                                last.lstart, last.lend, last.lstart, last.lend);
+                return;
+            }
             if (!cur.is<LValue *>()) {
                 if (op != Op::assign || !cur.is<intrusive_ptr<DictObject>>())
                     member_read_core(cur, mk.memId, mk.memUid, false,

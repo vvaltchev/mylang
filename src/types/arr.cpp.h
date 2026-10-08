@@ -29,6 +29,22 @@ static EvalValue struct_elem_at(const SharedArrayObj &arr, size_type i)
     return intrusive_ptr<StructObject>(obj);
 }
 
+/* The flat CLASS storage's counts (sharedarray.h cannot see StructObject) */
+void sobj_retain(StructObject *p) noexcept
+{
+    if (p)
+        ++p->intr_refcount;
+}
+
+void sobj_release(StructObject *p) noexcept
+{
+    if (p) {
+        ML_CHECK(p->intr_refcount > 0);
+        if (--p->intr_refcount == 0)
+            delete p;
+    }
+}
+
 /*
  * A fresh GENERAL array holding this array's elements (this handle's range),
  * leaving the storage every handle shares untouched - for a READ-only walk
@@ -107,6 +123,29 @@ void SharedArrayObjTempl<LValueT>::promote_strs_to_general()
 }
 
 template <class LValueT>
+void SharedArrayObjTempl<LValueT>::promote_objs_to_general()
+{
+    if (shobj->kind != Storage::objs)
+        return;
+
+    if (slice) {
+        *this = general_copy();
+        return;
+    }
+
+    const size_type n = size();
+    vec_type nv;
+    nv.reserve(n);
+    for (size_type i = 0; i < n; i++)
+        nv.emplace_back(obj_elem_value(shobj->ovec[i]), false);
+
+    shobj->ovec.~ovec_type();
+    shobj->kind = Storage::general;
+    new (&shobj->vec) vec_type(std::move(nv));
+    len = n;
+}
+
+template <class LValueT>
 void SharedArrayObjTempl<LValueT>::clone_internal_vec()
 {
     /*
@@ -168,6 +207,11 @@ void SharedArrayObjTempl<LValueT>::clone_internal_vec()
             *this = SharedArrayObjTempl(std::move(nv));
             return;
         }
+
+        case Storage::objs:
+            *this = SharedArrayObjTempl(
+                shobj->ovec.copy_range(offset(), offset() + size()));
+            return;
 
         default:
             break;
@@ -317,6 +361,8 @@ EvalValue TypeArr::intptr(const EvalValue &a)
             return reinterpret_cast<int_type>(&arr.flat_structs());
         case SharedArrayObj::Storage::strs:
             return reinterpret_cast<int_type>(&arr.flat_strs());
+        case SharedArrayObj::Storage::objs:
+            return reinterpret_cast<int_type>(&arr.flat_objs());
         default:
             return reinterpret_cast<int_type>(&arr.get_vec());
     }
@@ -496,6 +542,8 @@ static EvalValue arr_elem_at(const SharedArrayObj &arr, size_type i)
             return struct_elem_at(arr, i);   /* materialize a StructObject */
         case SharedArrayObj::Storage::strs:
             return EvalValue(SharedStr(arr.flat_strs()[at]));
+        case SharedArrayObj::Storage::objs:
+            return obj_elem_value(arr.flat_objs()[at]);
         default:
             return arr.get_vec()[at].get();
     }

@@ -98,7 +98,8 @@ enum class TypeHint : unsigned char { none, i, f };
  * plans/archived/type-driven-specialization.md.
  */
 enum class ArrHint : unsigned char {
-    dflt, general, flat_i, flat_f, flat_b, flat_s
+    dflt, general, flat_i, flat_f, flat_b, flat_s,
+    flat_c      /* array<C> of a class C: references (Storage::objs) */
 };
 
 /* #97 CB3: the flat result kind map/filter may build, from the call's

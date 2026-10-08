@@ -14,6 +14,15 @@
 #include <new>
 
 struct StructTypeDef;   /* a struct type (structtype.h); only a pointer here */
+class StructObject;     /* a struct or class instance (structtype.h) */
+
+/*
+ * The count of a class instance held by the flat CLASS storage below.
+ * StructObject is not complete here, so the count is taken and dropped
+ * out of line (types/struct.cpp.h); a null pointer (`none`) is skipped.
+ */
+void sobj_retain(StructObject *p) noexcept;
+void sobj_release(StructObject *p) noexcept;
 
 
 /*
@@ -64,6 +73,69 @@ public:
     typedef std::vector<SharedStr>    tvec_type;
 
     /*
+     * Flat CLASS storage (plans/class-and-box.md step 2): an array<C> of a
+     * class C holds one 8-byte reference per element (a class instance is
+     * never copied into an array, only referenced) where a general array
+     * holds a 48-byte LValue; a null pointer is `none` (array<opt C>).
+     * Each non-null entry OWNS one count. Any class instance fits, of any
+     * class; anything else stored (a struct, a scalar, a string - only a
+     * `dyn` alias can try) PROMOTES the array to general first, and every
+     * op without a flat case promotes it in place through get_vec(), as a
+     * strs or structs array does. TYPE-driven creation (ArrHint::flat_c).
+     */
+    struct ovec_type {
+        std::vector<StructObject *> v;
+
+        ovec_type() = default;
+        ovec_type(const ovec_type &) = delete;
+        ovec_type &operator=(const ovec_type &) = delete;
+        ovec_type(ovec_type &&o) noexcept : v(std::move(o.v)) { }
+        ovec_type &operator=(ovec_type &&o) noexcept
+        {
+            if (this != &o) {
+                std::vector<StructObject *> old;
+                old.swap(v);
+                v = std::move(o.v);
+                for (StructObject *p : old)
+                    sobj_release(p);
+            }
+            return *this;
+        }
+        ~ovec_type() { for (StructObject *p : v) sobj_release(p); }
+
+        size_t size() const { return v.size(); }
+        StructObject *operator[](size_t i) const { return v[i]; }
+
+        void push(StructObject *p)
+        {
+            v.push_back(p);           /* may throw: retain after it */
+            sobj_retain(p);
+        }
+        void set(size_t i, StructObject *p)
+        {
+            sobj_retain(p);           /* first: p may be v[i] itself */
+            StructObject *old = v[i];
+            v[i] = p;
+            sobj_release(old);
+        }
+        void pop()
+        {
+            StructObject *p = v.back();
+            v.pop_back();
+            sobj_release(p);
+        }
+        /* a copy of the entries [from, to), each one retained */
+        ovec_type copy_range(size_t from, size_t to) const
+        {
+            ovec_type r;
+            r.v.reserve(to - from);
+            for (size_t i = from; i < to; i++)
+                r.push(v[i]);
+            return r;
+        }
+    };
+
+    /*
      * Flat storage for an array of POD structs (plans/archived/structs.md phase 7): the
      * elements laid out contiguously as raw C-struct bytes, `stride`
      * bytes each.
@@ -93,7 +165,7 @@ public:
      * the hot ops branch on the kind and touch the flat vector directly.
      */
     enum class Storage : unsigned char {
-        general, ints, floats, bools, structs, strs
+        general, ints, floats, bools, structs, strs, objs
     };
 
 private:
@@ -118,6 +190,7 @@ private:
             bvec_type bvec;    /* kind == bools */
             svec_type svec;    /* kind == structs */
             tvec_type tvec;    /* kind == strs */
+            ovec_type ovec;    /* kind == objs */
         };
 
         /* Lever 3 inc 1 (2026-07-27): POOLED nodes - the per-slice
@@ -207,6 +280,9 @@ private:
         SharedObject(tvec_type &&a) : kind(Storage::strs) {
             new (&tvec) tvec_type(std::move(a));
         }
+        SharedObject(ovec_type &&a) : kind(Storage::objs) {
+            new (&ovec) ovec_type(std::move(a));
+        }
 
         ~SharedObject() {
             switch (kind) {
@@ -216,6 +292,7 @@ private:
                 case Storage::bools:   bvec.~bvec_type(); break;
                 case Storage::structs: svec.~svec_type(); break;
                 case Storage::strs:    tvec.~tvec_type(); break;
+                case Storage::objs:    ovec.~ovec_type(); break;
             }
         }
 
@@ -284,6 +361,14 @@ public:
         : shobj(make_intrusive<SharedObject>(std::move(arr)))
         , off(0)
         , len(shobj->tvec.size())
+        , slice(false)
+    { }
+
+    /* Flat CLASS storage (plans/class-and-box.md step 2). */
+    SharedArrayObjTempl(ovec_type &&arr)
+        : shobj(make_intrusive<SharedObject>(std::move(arr)))
+        , off(0)
+        , len(static_cast<size_type>(shobj->ovec.size()))
         , slice(false)
     { }
 
@@ -397,6 +482,7 @@ public:
      */
     void promote_structs_to_general();
     void promote_strs_to_general();     /* flat strings (top-10 #7) */
+    void promote_objs_to_general();     /* flat class references */
     /* A fresh general copy of this handle's elements; the shared storage is
      * untouched (for a read-only general walk - see types/arr.cpp.h). */
     SharedArrayObjTempl general_copy() const;
@@ -419,6 +505,8 @@ public:
             promote_structs_to_general();
         if (shobj->kind == Storage::strs)
             promote_strs_to_general();  /* same cold-path model as structs */
+        if (shobj->kind == Storage::objs)
+            promote_objs_to_general();  /* and as strs */
         if (shobj->kind != Storage::general)
             throw InternalErrorEx();
         return shobj->vec;
@@ -498,6 +586,19 @@ public:
                            "flat array storage kind");
         ML_CHECK(shobj && shobj->kind == Storage::strs);
         return shobj->tvec;
+    }
+
+    ovec_type &flat_objs() {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::objs,
+                           "flat array storage kind");
+        ML_CHECK(shobj && shobj->kind == Storage::objs);
+        return shobj->ovec;
+    }
+    const ovec_type &flat_objs() const {
+        ML_UNTRUSTED_CHECK(shobj && shobj->kind == Storage::objs,
+                           "flat array storage kind");
+        ML_CHECK(shobj && shobj->kind == Storage::objs);
+        return shobj->ovec;
     }
 
     int_type use_count() const { return shobj.use_count(); }
@@ -622,6 +723,8 @@ public:
                                              shobj->svec.stride)
                     : 0;
             case Storage::strs:   return shobj->tvec.size();
+            case Storage::objs:
+                return static_cast<size_type>(shobj->ovec.size());
             default:              return shobj->vec.size();
         }
     }

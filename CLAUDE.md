@@ -6380,6 +6380,33 @@ are unchanged.
   must use `general_copy()`, never `get_vec()` on a handle copy - the
   copy shares the storage, so it would promote the caller's array.
 
+- **Flat CLASS storage (`Storage::objs`, plans/class-and-box.md step 2)**
+  - `ovec_type` (sharedarray.h), a vector of `StructObject *`, each
+  non-null entry an OWNED count (null is `none`): 8 bytes per element of
+  an `array<C>` / `array<C?>` of a class. sharedarray.h cannot see
+  `StructObject` complete, so the count moves through the out-of-line
+  `sobj_retain` / `sobj_release` (types/arr.cpp.h); `obj_elem_value` /
+  `obj_elem_ptr` / `is_obj_elem` (structtype.h) convert an element to a
+  value and back. The strs model again: creation is TYPE-driven
+  (`ArrHint::flat_c`, set_array_repr_hint) and VALUE-driven for a
+  literal of class instances (`build_array_from_values` mode 6 - so a
+  constant's array is flat, built before inference); any class instance
+  or `none` fits, anything else PROMOTES in place, and every op without a
+  flat arm promotes through `get_vec()`. Flat arms: arr_elem_at/boxed,
+  flat_store_core, append (arr_push_value), pop, reverse, clone,
+  clone_to_mutable / make_const_clone (each element through the walk, so
+  a constant's instances are frozen in place), the `.myv` array record
+  (v34's `objs` kind) and the cycle guard's `cyc_any_child` (the array
+  itself is not keyed: a cycle through it passes through a keyed class
+  instance). An element is READ as a value (no LValue), so a store
+  THROUGH it (`a[i].v = 5`) is rooted by the instance itself: a class
+  instance read as a value is a location (`store_rooted` in the
+  tree-walker, `vm_member_lvalue_ref` and the chain store's final member
+  step in the VM) - `CannotChangeConstEx` for a constant's. The JIT's
+  element tiers compare the kind byte and decline this one to their
+  helpers (step 4 adds inline tiers). `array_storage()` reports
+  `"class"`.
+
 - **Flat (unboxed) int/float/bool storage.** `SharedObject` carries a `Storage
   kind` (`general`/`ints`/`floats`/`bools`) and an **anonymous union** of `vec`
   (the `vector<LValue>`, 48-byte slots), `ivec` (`vector<int_type>`), `fvec`
@@ -6882,8 +6909,12 @@ but the per-element `StructObject` allocation is gone (build overhead
     reference to it, so identity and hash survive a load. The loader now
     also checks every stored struct value against its def (class or not,
     POD or not, its size or field count).
-  `opt` is allowed on a class-typed field (a null reference) and still not
-  on a struct-typed one; a forward reference is checked by the
+  An `array<C>` holds references, flat (*Flat CLASS storage* above), and
+  a struct or class may name ITSELF in a field's annotation
+  (`array<Tree> kids`, `ParseContext::decl_self`, consulted by
+  `lookup_struct_type` - a type annotation otherwise needs a declared
+  struct). `opt` is allowed on a class-typed field (a null reference) and
+  still not on a struct-typed one; a forward reference is checked by the
   inferencer's `check_opt_struct_fields` (`FieldDef::loc`, compile-only).
   Net: `tests/functional/81_class_reference_semantics.my`, the `class:`
   `-rt` entries, the class `alias:` layer case, the `driver_checks` image

@@ -176,9 +176,9 @@ EvalValue b_min_max_arr(const SharedArrayObj &arr, const ArgLoc *arg)
      * strs/structs take the general path below (a LOCAL handle promote -
      * min/max of strings compares lexically as before; the else-chain here
      * would misread their union member). */
-    if (arr.skind() != SharedArrayObj::Storage::general
-        && arr.skind() != SharedArrayObj::Storage::strs
-        && arr.skind() != SharedArrayObj::Storage::structs) {
+    if (arr.skind() == SharedArrayObj::Storage::ints
+        || arr.skind() == SharedArrayObj::Storage::bools
+        || arr.skind() == SharedArrayObj::Storage::floats) {
 
         const size_type n = arr.size(), off = arr.offset();
 
@@ -217,7 +217,7 @@ EvalValue b_min_max_arr(const SharedArrayObj &arr, const ArgLoc *arg)
         return EvalValue(best);
     }
 
-    /* strs/structs: a general COPY (the caller's array keeps its flat
+    /* any other storage: a general COPY (the caller's array keeps its flat
      * storage - a promotion would be in place on the shared storage, #53b)
      * and the general compare loop. */
     const SharedArrayObj marr =

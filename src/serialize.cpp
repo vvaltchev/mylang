@@ -696,16 +696,20 @@ void write_array(Writer &w, const SharedArrayObj &a)
             w.buf.append(&sv.buf[(a.offset() + i) * sv.stride], sv.stride);
         break;
     }
+    case SharedArrayObj::Storage::objs:       /* class references */
+        for (size_type i = 0; i < n; i++)
+            write_value(w, obj_elem_value(a.flat_objs()[a.offset() + i]));
+        break;
     default:                                  /* general */
         for (size_type i = 0; i < n; i++)
-            write_value(w, a.get_view()[a.offset() + i].get());
+            write_value(w, a.get_view()[i].get());
         break;
     }
 }
 
 EvalValue read_array(Reader &r)
 {
-    const auto kind = r.enumv(SharedArrayObj::Storage::strs,
+    const auto kind = r.enumv(SharedArrayObj::Storage::objs,
                               "corrupt .myv (array storage kind)");
     const bool ro = r.boolv();
     const uint32_t n = r.countv();
@@ -753,6 +757,18 @@ EvalValue read_array(Reader &r)
         r.p += bytes;
         out = SharedArrayObj(SharedArrayObj::svec_type(
             std::move(b), r.structs[di], static_cast<int>(stride)));
+        break;
+    }
+    case SharedArrayObj::Storage::objs: {
+        SharedArrayObj::ovec_type v;
+        v.v.reserve(n);
+        for (uint32_t i = 0; i < n; i++) {
+            const EvalValue e = read_value(r);
+            if (!is_obj_elem(e))
+                bad_image("corrupt .myv (class array element)");
+            v.push(obj_elem_ptr(e));
+        }
+        out = SharedArrayObj(std::move(v));
         break;
     }
     default: {
@@ -1761,7 +1777,7 @@ void read_chunk(Reader &r, Chunk &c)
         Chunk::LiteralObjEntry lo;
         lo.value = read_value(r);
         lo.immutable = r.boolv();
-        lo.arr_hint = r.enumv(ArrHint::flat_s,
+        lo.arr_hint = r.enumv(ArrHint::flat_c,
                               "corrupt .myv (array hint)");
         const uint32_t si = r.idx_opt(r.structs.size(), "corrupt .myv (hint)");
         lo.arr_hint_struct = si == 0xffffffffu ? nullptr : r.structs[si];
@@ -1843,7 +1859,7 @@ void read_chunk(Reader &r, Chunk &c)
         if (!bc.name || !vm_lookup_builtin(bc.name, bc.builtin))
             bad_image("corrupt or incompatible .myv (unknown builtin)");
         bc.start = r.locv(); bc.end = r.locv();
-        bc.arr_hint = r.enumv(ArrHint::flat_s,
+        bc.arr_hint = r.enumv(ArrHint::flat_c,
                               "corrupt .myv (array hint)");
         bc.args = read_arglocs(r);
         bc.member = r.uidv();
@@ -1857,7 +1873,7 @@ void read_chunk(Reader &r, Chunk &c)
         Chunk::CallSite cs;
         cs.start = r.locv(); cs.end = r.locv();
         cs.args = read_arglocs(r);
-        cs.arr_hint = r.enumv(ArrHint::flat_s,
+        cs.arr_hint = r.enumv(ArrHint::flat_c,
                               "corrupt .myv (array hint)");
         cs.a0_form = r.enumv(Chunk::CallSite::A0::chain,
                              "corrupt .myv (call site arg0 form)");
