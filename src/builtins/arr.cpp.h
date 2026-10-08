@@ -1587,13 +1587,15 @@ EvalValue builtin_sum(EvalContext *ctx, const ArgLocs *exprList,
         return val;
     }
 
-    /* A flat-strs array reaches the general path through a general COPY
+    /* Any other storage reaches the general path through a general COPY
      * (the caller's array keeps its storage - a promotion is in place on the
      * shared storage now, #53b): sum of strings concatenates through the
-     * general `+=` loop, as it always did. */
+     * general `+=` loop, as it always did, and a flat struct array's
+     * elements raise the TypeErrorEx their `+` does (get_view() on the
+     * flat storage itself was an InternalErrorEx). */
     const SharedArrayObj marr =
-        arr.skind() == SharedArrayObj::Storage::strs ? arr.general_copy()
-                                                      : arr;
+        arr.skind() != SharedArrayObj::Storage::general ? arr.general_copy()
+                                                         : arr;
     const ArrayConstView &view = marr.get_view();
 
     if (view.size() == 0)
