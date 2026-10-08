@@ -26006,6 +26006,19 @@ static bool hoist_slice_shapes()
             "for (var i = 0; i < 3; i++) {",
             "  var sl = base[i:4];",
             "}" }, false },
+        /* aliasing (FrMut): a write through ANOTHER name may reach the
+         * base; a field of a struct VALUE cannot */
+        { "no hoist: element write through an alias", {
+            "var base = [1, 2, 3, 4, 5]; var al = base;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; al[0] = i;",
+            "}" }, false },
+        { "hoist: a struct value's field write is not an alias", {
+            "struct P { int x; }",
+            "var base = [1, 2, 3, 4, 5]; var p = P(0); var s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; s += sl[0]; p.x = i;",
+            "}" }, true },
     };
     for (const Case &c : cases) {
         std::string s;
@@ -26489,6 +26502,56 @@ static bool opt_layer_equivalence()
             "var k = int(runtime(7)); var z = int(runtime(0));",
             "try { print((k / z) * 0); } catch (DivisionByZeroEx) { }",
             "print(k / z - k / z);" } },
+        /*
+         * ALIASING (2026-10-08). Arrays and dicts are references, so a
+         * write through one name changes what another reads. The loop
+         * transforms decided invariance by NAME, and each case below
+         * gave a different answer with its pass off. Watched failing
+         * with FrMut's alias flags ignored: every case.
+         */
+        { "alias: an element write through another name, for-range", {
+            "var a = [5]; var b = a; var n = 0;",
+            "for (var i = 0; i < a[0]; i++) { b[0] = 2; n++; }",
+            "print(n);" } },
+        { "alias: an append through another name, for-range", {
+            "var c = [1, 2, 3]; var e = c; var m = 0;",
+            "for (var j = 0; j < len(c); j++) {",
+            "  if (j < 3) { append(e, j); } m++; }",
+            "print(m);" } },
+        { "alias: the same array passed twice, for-range", {
+            "func f(x, y) { var k = 0;",
+            "  for (var i = 0; i < len(x); i++) {",
+            "    if (i == 0) { pop(y); } k++; }",
+            "  return k; }",
+            "var g = [1, 2, 3, 4]; print(f(g, g));" } },
+        { "alias: an impure call pops a global alias, for-range", {
+            "var g = [1, 2, 3, 4, 5];",
+            "func h() { pop(g); }",
+            "func run() { var a = g; var n = 0;",
+            "  for (var i = 0; i < len(a); i++) { h(); n++; }",
+            "  return n; }",
+            "print(run());" } },
+        { "alias: a dict member through another name, for-range", {
+            "var d = {\"n\": 4}; var e = d; var n = 0;",
+            "for (var i = 0; i < d.n; i++) { e.n = 1; n++; }",
+            "print(n);" } },
+        { "alias: sort and reverse change their argument, for-range", {
+            "var a = [5, 1, 9]; var n = 0;",
+            "for (var i = 0; i < a[0]; i++) { sort(a); n++; }",
+            "var b = [4, 9, 1, 1, 1]; var m = 0;",
+            "for (var j = 0; j < b[0]; j++) { reverse(b); m++; }",
+            "print(n, m, a, b);" } },
+        { "alias: a write through another name detaches a hoisted slice", {
+            "var base = [1, 2, 3, 4]; var al = base; var t = 0;",
+            "for (var q = 0; q < 3; q++) {",
+            "  var sl = base[0:2]; t += sl[0]; al[0] = 10; }",
+            "print(t);" } },
+        { "alias: a row replaced through another name, LICM", {
+            "func run(m, mm) { var s = 0;",
+            "  for (var k = 0; k < 3; k++) {",
+            "    s += m[0][k]; mm[0] = [7, 8, 9]; }",
+            "  return s; }",
+            "var m = [[1, 2, 3], [4, 5, 6]]; print(run(m, m));" } },
     };
 
     /* every single pass off, plus all of them - each isolates one layer;
@@ -26623,6 +26686,18 @@ static bool hoist_subscript_shapes()
             "var a = [1,2,3]; var arr = [7,8]; var n = len(arr);",
             "var i = 0; var s = 0;",
             "for (var k = 0; k < n; k++) s += a[i] + k;" }, false, false },
+        /* aliasing (FrMut): the row replaced through ANOTHER name */
+        { "no hoist: base element rewritten through an alias", {
+            "var a = [[1,2],[3,4]]; var b = a; var arr = [7,8];",
+            "var n = len(arr); var i = 0; var s = 0;",
+            "for (var k = 0; k < n; k++) { s += a[i][k]; b[i] = [9,9]; }" },
+          false, false },
+        { "hoist: a struct value's field write is not an alias", {
+            "struct P { int x; }",
+            "var a = [[1,2],[3,4]]; var arr = [7,8]; var n = len(arr);",
+            "var i = 0; var s = 0; var p = P(0);",
+            "for (var k = 0; k < n; k++) { s += a[i][k]; p.x = k; }" },
+          true, true },
     };
     for (const Case &c : cases) {
         std::string s;

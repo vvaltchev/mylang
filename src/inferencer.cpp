@@ -2800,12 +2800,55 @@ void Inferencer::stamp_literal_coerce(Construct *n, StaticTypeRef t)
     }
 }
 
+/*
+ * Is a struct of this def a VALUE all the way down (Construct::th_val)?
+ * Its fields are scalars, strings or such structs in turn; an array, dict
+ * or `dyn` field - or a struct field whose def is unknown here (a forward
+ * reference) - reaches storage another name can share. `depth` bounds the
+ * walk: a def nested that deep answers false, the safe direction.
+ */
+static bool struct_def_deep_value(const StructTypeDef *d, int depth)
+{
+    if (!d || depth > 16)
+        return false;
+    for (const FieldDef &f : d->fields) {
+        switch (f.kind) {
+            case FieldKind::f_bool: case FieldKind::f_int:
+            case FieldKind::f_float: case FieldKind::f_str:
+                break;
+            case FieldKind::f_struct:
+                if (!struct_def_deep_value(f.struct_def, depth + 1))
+                    return false;
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool static_type_deep_value(StaticTypeRef t)
+{
+    switch (t->kind) {
+        case StaticTypeKind::None: case StaticTypeKind::Bool:
+        case StaticTypeKind::Int: case StaticTypeKind::Float:
+        case StaticTypeKind::Str:
+            return true;
+        case StaticTypeKind::Struct:
+            return struct_def_deep_value(
+                static_cast<const StructTypeDef *>(t->struct_def), 0);
+        default:
+            return false;
+    }
+}
+
 void Inferencer::annotate_hints(Construct *n)
 {
     if (!n)
         return;
 
     StaticTypeRef t = static_type_resolve(type_of(n));
+    n->th_val = static_type_deep_value(t);
     if (!t->opt) {
         /* bool is evaluated through the int (eval_int) path: it promotes to
          * 0/1, so a typed scalar over bool operands computes unboxed exactly
@@ -6531,23 +6574,89 @@ static bool fr_is_scalar(const Construct *e)
 }
 
 /*
+ * A builtin that changes its first argument IN PLACE. Not the same set as
+ * "not const": sort / rev_sort / reverse are CONST builtins (a constant
+ * argument folds) and still sort the array a variable holds, so a loop
+ * calling one changes it - `for (i; i < a[0]; i++) sort(a);` cached the
+ * bound until 2026-10-08. intptr / refcount take an lvalue and change
+ * nothing.
+ */
+static bool fr_builtin_mutates(const Construct *callee)
+{
+    auto *id = dynamic_cast<const Identifier *>(callee);
+    if (!id || id->sym.kind != SymKind::builtin)
+        return false;
+    const std::string_view n = id->get_str();
+    return n == "append" || n == "push" || n == "pop" || n == "insert"
+        || n == "erase" || n == "sort" || n == "rev_sort" || n == "reverse";
+}
+
+/*
  * The mutations a loop body performs, split so `len(arr)` (depends only on the
  * LENGTH/identity of arr) can stay constant through an element write that does
  * NOT change the length (the common fill pattern `arr[i] = f(i)`):
- *   - `mut_len`     : identifiers whose value or length/identity may change -
- *                     a direct reassign (`x =`, `x++`), or a NON-const-builtin
- *                     call passed the container (append/pop/insert/erase/... or
- *                     any user func, which by reference can do anything to it);
- *   - `mut_content` : identifiers whose ELEMENT/FIELD may change - an
- *                     `arr[i] = v` / `obj.f = v` / `arr[i]++`, PLUS everything
- *                     in mut_len (reassign/impure call changes content too).
+ *   - `len`     : identifiers whose value or length/identity may change -
+ *                 a direct reassign (`x =`, `x++`), or a call that may
+ *                 change the container passed to it (a mutating builtin,
+ *                 any impure user function, which by reference can do
+ *                 anything to it);
+ *   - `content` : identifiers whose ELEMENT/FIELD may change - an
+ *                 `arr[i] = v` / `obj.f = v` / `arr[i]++`, PLUS everything
+ *                 in `len` (reassign/impure call changes content too).
+ *
+ * Those two are by NAME, and a name is not the storage: arrays and dicts
+ * are references, so `b[0] = 9` changes `a[0]` when `b = a`, and an impure
+ * function can pop a global that aliases a local. So two more facts, about
+ * EVERY container rather than one name (2026-10-08 - a for-range bound and
+ * a hoisted slice each gave a different answer from `--no-opt all`):
+ *   - `alias_content` : some write in the loop goes INTO storage another
+ *                       name may share - an element or field store whose
+ *                       chain passes through an array, a dict or a `dyn`
+ *                       (a struct field of a struct VALUE is the struct's
+ *                       own copy and does not count), or a call that may
+ *                       change anything (below);
+ *   - `alias_len`     : some container's LENGTH may change behind a name -
+ *                       a mutating builtin applied to a shared container,
+ *                       or a call that may change anything: an impure user
+ *                       function or function value (it reaches globals), a
+ *                       builtin given a callback.
+ * A read through a shared container is loop-invariant only when the
+ * matching flag is clear (fr_immutable).
+ *
  * NOT descended into nested functions. Reuses the complete for_each_child so no
  * mutating node is ever missed - the immutability proof depends on this.
  */
-static void fr_collect_mutated(
-    Construct *c,
-    std::unordered_set<const UniqueId *> &mut_len,
-    std::unordered_set<const UniqueId *> &mut_content)
+struct FrMut {
+    std::unordered_set<const UniqueId *> len, content;
+    bool alias_len = false;
+    bool alias_content = false;
+
+    void taint(const UniqueId *b) { len.insert(b); content.insert(b); }
+    void taint_all() { alias_len = alias_content = true; }
+};
+
+/* Does a store to the lvalue chain `lv` write into storage another name may
+ * share? Every level whose base is an array, a dict or a `dyn` is such a
+ * store; a member of a struct VALUE is the variable's own copy. */
+static bool fr_store_reaches_shared(const Construct *lv)
+{
+    while (lv) {
+        if (ctag(lv) == ConstructType::subscript)
+            return true;     /* into an array or a dict (a string is never
+                                stored into) */
+        if (ctag(lv) == ConstructType::member) {
+            auto *m = static_cast<const MemberExpr *>(lv);
+            if (!m->base_struct)
+                return true;
+            lv = m->what.get();
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+static void fr_collect_mutated(Construct *c, FrMut &m)
 {
     if (!c || ctag(c) == ConstructType::func_decl)
         return;
@@ -6556,48 +6665,64 @@ static void fr_collect_mutated(
         if (!(e->fl & pFlags::pInDecl)) {
             if (ctag(e->lvalue.get()) == ConstructType::idlist) {
                 auto *il = static_cast<IdList *>(e->lvalue.get());
-                for (auto &p : il->elems) {
-                    mut_len.insert(p->uid);
-                    mut_content.insert(p->uid);
-                }
+                for (auto &p : il->elems)
+                    m.taint(p->uid);
             } else if (dynamic_cast<Identifier *>(e->lvalue.get())) {
-                const UniqueId *b = fr_base_id(e->lvalue.get());
-                mut_len.insert(b);          /* `x = ...` : reassign */
-                mut_content.insert(b);
-            } else if (const UniqueId *b = fr_base_id(e->lvalue.get())) {
-                mut_content.insert(b);      /* `arr[i] =`/`obj.f =` : content */
+                m.taint(fr_base_id(e->lvalue.get()));   /* `x = ...` */
+            } else {
+                if (const UniqueId *b = fr_base_id(e->lvalue.get()))
+                    m.content.insert(b);  /* `arr[i] =`/`obj.f =` */
+                if (fr_store_reaches_shared(e->lvalue.get()))
+                    m.alias_content = true;
             }
         }
     } else if (ctag(c) == ConstructType::incdec) {
         auto *idc = static_cast<IncDecExpr *>(c);
         if (dynamic_cast<Identifier *>(idc->lvalue.get())) {
-            const UniqueId *b = fr_base_id(idc->lvalue.get());
-            mut_len.insert(b);
-            mut_content.insert(b);
-        } else if (const UniqueId *b = fr_base_id(idc->lvalue.get())) {
-            mut_content.insert(b);          /* `arr[i]++` : content */
+            m.taint(fr_base_id(idc->lvalue.get()));
+        } else {
+            if (const UniqueId *b = fr_base_id(idc->lvalue.get()))
+                m.content.insert(b);      /* `arr[i]++` : content */
+            if (fr_store_reaches_shared(idc->lvalue.get()))
+                m.alias_content = true;
         }
     } else if (ctag(c) == ConstructType::call) {
         auto *ce = static_cast<CallExpr *>(c);
-        /* A PURE call (const builtin or pure user func) cannot mutate an
-         * argument - `pure` now forbids writing a reference parameter. Only an
-         * IMPURE call may change a container passed to it (append/pop/`a[i]=v`/
-         * a deeper call), so it taints both the length and the content of every
-         * non-scalar argument (a scalar is by value, never mutated). */
-        if (!fr_is_const_builtin(ce->what.get()) &&
-            !fr_is_pure_func(ce->what.get()) && ce->args) {
+        const Construct *callee = ce->what.get();
+        /* A PURE call (a const builtin that changes nothing, or a pure user
+         * func) cannot mutate an argument - `pure` forbids writing a
+         * reference parameter. Anything else may change a container passed
+         * to it (append/pop/`a[i]=v`/a deeper call), so it taints both the
+         * length and the content of every non-scalar argument (a scalar is
+         * by value, never mutated) - and, through the aliasing above, of
+         * every container. */
+        const bool mutates = fr_builtin_mutates(callee);
+        /* a struct construction runs no program code and changes nothing */
+        const bool pure = !mutates
+            && (fr_is_const_builtin(callee) || fr_is_pure_func(callee)
+                || ce->vm_struct_ctor_def);
+        if (!pure && ce->args)
             for (auto &a : ce->args->elems) {
                 if (fr_is_scalar(a.get()))
                     continue;
-                if (const UniqueId *b = fr_base_id(a.get())) {
-                    mut_len.insert(b);
-                    mut_content.insert(b);
-                }
+                if (const UniqueId *b = fr_base_id(a.get()))
+                    m.taint(b);
+            }
+        if (!pure) {
+            auto *id = dynamic_cast<const Identifier *>(callee);
+            const bool builtin = id && id->sym.kind == SymKind::builtin;
+            if (!builtin || ce->callable_arg_mask != 0) {
+                /* a user function, a function value, or a builtin handed
+                 * something it may call: it may change anything */
+                m.taint_all();
+            } else if (mutates && ce->args && !ce->args->elems.empty()
+                       && !ce->args->elems[0]->th_val) {
+                m.taint_all();      /* append(b, x) with b shared */
             }
         }
     }
     Inferencer::for_each_child(c, [&](Construct *ch) {
-        fr_collect_mutated(ch, mut_len, mut_content);
+        fr_collect_mutated(ch, m);
     });
 }
 
@@ -6605,19 +6730,20 @@ static void fr_collect_mutated(
  * True if `e` is a side-effect-free INT expression whose value cannot change
  * across the loop:
  *   - a literal int, or a SLOTTED-LOCAL identifier (not the loop var, whose
- *     length/identity is stable - not in `mut_len`);
+ *     length/identity is stable - not in `len`);
  *   - an arith/bitwise/unary chain of immutable operands;
  *   - a subscript / member READ whose base + index are immutable AND whose base
- *     has no element/field write (`mut_content`) - the element is then stable;
+ *     has no element/field write (`content`) - the element is then stable.
+ *     A read THROUGH a shared container (an array, a dict, a `dyn` - not a
+ *     string, not a member of a struct value) also needs `alias_content`
+ *     clear: a write through another name would change it;
  *   - a call to a CONST (pure) builtin with all-immutable arguments - e.g.
  *     `len(arr)` when arr's length is stable (an `arr[i] = v` is fine: it does
- *     not change the length).
+ *     not change the length). A shared-container argument needs
+ *     `alias_len` clear for `len`, `alias_content` clear for anything else.
  */
-static bool fr_immutable(
-    const Construct *e,
-    const std::unordered_set<const UniqueId *> &mut_len,
-    const std::unordered_set<const UniqueId *> &mut_content,
-    const UniqueId *i_uid)
+static bool fr_immutable(const Construct *e, const FrMut &m,
+                         const UniqueId *i_uid)
 {
     if (!e)
         return false;
@@ -6625,21 +6751,23 @@ static bool fr_immutable(
         return true;
     if (auto *id = dynamic_cast<const Identifier *>(e))
         return id->sym.kind == SymKind::local && id->uid != i_uid &&
-               mut_len.find(id->uid) == mut_len.end();
+               m.len.find(id->uid) == m.len.end();
     if (auto *sc = dynamic_cast<const SingleChildConstruct *>(e))  /* Expr01 */
-        return fr_immutable(sc->elem.get(), mut_len, mut_content, i_uid);
+        return fr_immutable(sc->elem.get(), m, i_uid);
     if (ctag(e) == ConstructType::subscript) {
         auto *sub = static_cast<const Subscript *>(e);
         const UniqueId *b = fr_base_id(sub->what.get());
-        return b && mut_content.find(b) == mut_content.end() &&
-               fr_immutable(sub->what.get(), mut_len, mut_content, i_uid) &&
-               fr_immutable(sub->index.get(), mut_len, mut_content, i_uid);
+        return b && m.content.find(b) == m.content.end() &&
+               (sub->base_str || !m.alias_content) &&
+               fr_immutable(sub->what.get(), m, i_uid) &&
+               fr_immutable(sub->index.get(), m, i_uid);
     }
     if (ctag(e) == ConstructType::member) {
-        auto *m = static_cast<const MemberExpr *>(e);
-        const UniqueId *b = fr_base_id(m->what.get());
-        return b && mut_content.find(b) == mut_content.end() &&
-               fr_immutable(m->what.get(), mut_len, mut_content, i_uid);
+        auto *mem = static_cast<const MemberExpr *>(e);
+        const UniqueId *b = fr_base_id(mem->what.get());
+        return b && m.content.find(b) == m.content.end() &&
+               (mem->base_struct || !m.alias_content) &&
+               fr_immutable(mem->what.get(), m, i_uid);
     }
     if (ctag(e) == ConstructType::call) {
         auto *ce = static_cast<const CallExpr *>(e);
@@ -6649,14 +6777,23 @@ static bool fr_immutable(
          * parameter (see func_mutates_input in the resolver), so a pure call
          * neither has side effects nor changes its own result between
          * iterations - so even a container arg (`len(arr)`, `compute(arr)`) is
-         * safe to evaluate once. */
-        if (!fr_is_const_builtin(ce->what.get()) &&
-            !fr_is_pure_func(ce->what.get()))
+         * safe to evaluate once, unless a write through another name may
+         * reach that container. */
+        if (fr_builtin_mutates(ce->what.get())
+            || (!fr_is_const_builtin(ce->what.get())
+                && !fr_is_pure_func(ce->what.get())))
             return false;
+        auto *cid = dynamic_cast<const Identifier *>(ce->what.get());
+        const bool is_len = cid && cid->sym.kind == SymKind::builtin
+            && cid->get_str() == "len";
         if (ce->args)
-            for (auto &a : ce->args->elems)
-                if (!fr_immutable(a.get(), mut_len, mut_content, i_uid))
+            for (auto &a : ce->args->elems) {
+                if (!fr_immutable(a.get(), m, i_uid))
                     return false;
+                if (!a->th_val
+                    && (is_len ? m.alias_len : m.alias_content))
+                    return false;
+            }
         return true;
     }
     if (auto *mo = dynamic_cast<const MultiOpConstruct *>(e)) {
@@ -6668,7 +6805,7 @@ static bool fr_immutable(
             dynamic_cast<const Expr12 *>(e))
             return false;
         for (auto &p : mo->elems)
-            if (!fr_immutable(p.second.get(), mut_len, mut_content, i_uid))
+            if (!fr_immutable(p.second.get(), m, i_uid))
                 return false;
         return true;
     }
@@ -6746,11 +6883,11 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n,
         return n;
 
     /* bound and step must be loop-immutable */
-    std::unordered_set<const UniqueId *> mut_len, mut_content;
-    fr_collect_mutated(f->body.get(), mut_len, mut_content);
-    if (!fr_immutable(bound, mut_len, mut_content, i_uid))
+    FrMut mut;
+    fr_collect_mutated(f->body.get(), mut);
+    if (!fr_immutable(bound, mut, i_uid))
         return n;
-    if (step && !fr_immutable(step, mut_len, mut_content, i_uid))
+    if (step && !fr_immutable(step, mut, i_uid))
         return n;
 
     /* Build the ForRangeStmt; specialize the kept sub-trees (the body is the
@@ -6799,18 +6936,20 @@ static bool hoist_refs_uid(Construct *c, const UniqueId *uid)
  * removes it). The decl statement hoists ABOVE the loop when every part
  * is provably iteration-independent AND the transform is unobservable:
  *
- *  - base: a slotted LOCAL, not in mut_len (reassign/impure-call: the
- *    view would rebind per iteration) AND NOT IN mut_content - the
+ *  - base: a slotted LOCAL, not in mut.len (reassign/impure-call: the
+ *    view would rebind per iteration) AND NOT IN mut.content - the
  *    subtle one: an element write to a base with a LIVE slice COWs the
  *    BASE AWAY (clone_aliased_slices), so a hoisted view would keep
  *    reading the detached OLD storage while per-iteration fresh views
- *    see the new one;
+ *    see the new one. The same write through ANOTHER name sharing the
+ *    base does the same, so an array base also needs
+ *    `mut.alias_content` clear (FrMut);
  *  - bounds: absent, or fr_immutable (side-effect-free, loop-stable)
  *    AND int-proven (th == i / an int literal) - with base_sliceable
  *    (a statically non-opt array/str) the slice then CANNOT throw
  *    (pure clamping), so hoisting is safe even for a ZERO-iteration
  *    loop (the throw would otherwise move from "never" to "before");
- *  - sl: written exactly by its decl (not in mut_len/mut_content - no
+ *  - sl: written exactly by its decl (not in mut.len/mut.content - no
  *    reassign, no write-through, no mutating builtin), and not
  *    referenced by the loop's cond/inc (a pre-decl read must keep its
  *    original undefined-read semantics). Escaping READS are fine: a
@@ -6842,8 +6981,8 @@ static unique_ptr<Construct> try_hoist_loop_slices(unique_ptr<Construct> n)
     if (!body)
         return n;
 
-    std::unordered_set<const UniqueId *> mut_len, mut_content;
-    fr_collect_mutated(n.get(), mut_len, mut_content);
+    FrMut mut;
+    fr_collect_mutated(n.get(), mut);
 
     std::vector<unique_ptr<Construct>> hoisted;
     for (size_t i = 0; i < body->elems.size(); ) {
@@ -6864,20 +7003,22 @@ static unique_ptr<Construct> try_hoist_loop_slices(unique_ptr<Construct> n)
              * the COW-detach hazard - see the header comment) */
             && (dynamic_cast<LiteralStr *>(sl->what.get()) != nullptr
                 || (fr_base_id(sl->what.get())
-                    && mut_len.find(fr_base_id(sl->what.get()))
-                           == mut_len.end()
-                    && mut_content.find(fr_base_id(sl->what.get()))
-                           == mut_content.end()
-                    && fr_immutable(sl->what.get(), mut_len, mut_content,
-                                    nullptr)))
-            && mut_len.find(lhs->uid) == mut_len.end()
-            && mut_content.find(lhs->uid) == mut_content.end()
+                    && mut.len.find(fr_base_id(sl->what.get()))
+                           == mut.len.end()
+                    && mut.content.find(fr_base_id(sl->what.get()))
+                           == mut.content.end()
+                    /* a write through ANOTHER name may reach a shared
+                     * base and detach the view just the same */
+                    && (sl->what->th_val || !mut.alias_content)
+                    && fr_immutable(sl->what.get(), mut, nullptr)))
+            && mut.len.find(lhs->uid) == mut.len.end()
+            && mut.content.find(lhs->uid) == mut.content.end()
             && !hoist_refs_uid(cond1, lhs->uid)
             && !hoist_refs_uid(cond2, lhs->uid)) {
             const auto bound_ok = [&](const Construct *b) {
                 if (!b)
                     return true;              /* absent -> clamp */
-                if (!fr_immutable(b, mut_len, mut_content, nullptr))
+                if (!fr_immutable(b, mut, nullptr))
                     return false;
                 return b->th == TypeHint::i
                     || ctag(b) == ConstructType::lit_int;
@@ -7021,8 +7162,10 @@ static bool licm_is_const_builtin(const Construct *callee)
  * A callback that is neither an inline lambda nor a named pure function - a
  * local variable holding one, say - is unprovable here, and refused.
  *
- * try_for_range has the same blind spot and lives with it because it hoists an
- * INT. This pass keeps a live REFERENCE across every iteration, so it checks.
+ * fr_collect_mutated answers the same question for try_for_range by
+ * assuming the worst (FrMut::taint_all on any call that may run program
+ * code). This pass keeps a live REFERENCE across every iteration, so it
+ * refuses the loop outright.
  */
 static bool licm_has_opaque_call(Construct *c)
 {
@@ -7132,8 +7275,7 @@ static bool licm_refs_any(const Construct *e,
 /* Is `sub` worth hoisting, and provably the same value every iteration? */
 static bool licm_candidate(
     const Subscript *sub,
-    const std::unordered_set<const UniqueId *> &mut_len,
-    const std::unordered_set<const UniqueId *> &mut_content,
+    const FrMut &mut,
     const std::unordered_set<const UniqueId *> &body_decls,
     const UniqueId *i_uid)
 {
@@ -7150,11 +7292,11 @@ static bool licm_candidate(
     if (licm_refs_any(sub, body_decls))
         return false;
     /* Loop-invariant: base and index unchanged, and NO element/field write to
-     * the base anywhere in the loop (mut_content, checked inside fr_immutable)
+     * the base anywhere in the loop (mut.content, checked inside fr_immutable)
      * - that is also what rules out the COW-detach hazard the slice hoister
      * documents, since any write reachable to the base taints it. Passing
      * i_uid rejects any use of the loop variable, at any depth. */
-    return fr_immutable(sub, mut_len, mut_content, i_uid);
+    return fr_immutable(sub, mut, i_uid);
 }
 
 /*
@@ -7167,8 +7309,7 @@ static bool licm_candidate(
  */
 static void licm_collect(
     unique_ptr<Construct> &slot,
-    const std::unordered_set<const UniqueId *> &mut_len,
-    const std::unordered_set<const UniqueId *> &mut_content,
+    const FrMut &mut,
     const std::unordered_set<const UniqueId *> &body_decls,
     const UniqueId *i_uid,
     std::vector<unique_ptr<Construct> *> &out)
@@ -7181,12 +7322,12 @@ static void licm_collect(
         || ctag(c) == ConstructType::func_decl || ctag(c) == ConstructType::block)
         return;
     if (auto *sub = dynamic_cast<Subscript *>(c))
-        if (licm_candidate(sub, mut_len, mut_content, body_decls, i_uid)) {
+        if (licm_candidate(sub, mut, body_decls, i_uid)) {
             out.push_back(&slot);
             return;
         }
     for_each_child_slot(c, [&](unique_ptr<Construct> &ch) {
-        licm_collect(ch, mut_len, mut_content, body_decls, i_uid, out);
+        licm_collect(ch, mut, body_decls, i_uid, out);
     });
 }
 
@@ -7272,8 +7413,8 @@ try_hoist_loop_subscripts(unique_ptr<Construct> n, int *fsize)
     if (licm_has_opaque_call(f->body.get()))
         return n;
 
-    std::unordered_set<const UniqueId *> mut_len, mut_content;
-    fr_collect_mutated(n.get(), mut_len, mut_content);
+    FrMut mut;
+    fr_collect_mutated(n.get(), mut);
     std::unordered_set<const UniqueId *> body_decls;
     licm_collect_decls(f->body.get(), body_decls);
 
@@ -7281,8 +7422,8 @@ try_hoist_loop_subscripts(unique_ptr<Construct> n, int *fsize)
      * BEFORE the loop's own init) and free of the loop variable. */
     Construct *bound = cond->elems[1].second.get();
     Construct *init_rv = init->rvalue.get();
-    if (!fr_immutable(bound, mut_len, mut_content, i_uid)
-        || !fr_immutable(init_rv, mut_len, mut_content, i_uid))
+    if (!fr_immutable(bound, mut, i_uid)
+        || !fr_immutable(init_rv, mut, i_uid))
         return n;
 
     /*
@@ -7325,7 +7466,7 @@ try_hoist_loop_subscripts(unique_ptr<Construct> n, int *fsize)
         Construct *s = sp->get();
         if (ctag(s) != ConstructType::expr14 && ctag(s) != ConstructType::incdec)
             break;
-        licm_collect(*sp, mut_len, mut_content, body_decls, i_uid, sites);
+        licm_collect(*sp, mut, body_decls, i_uid, sites);
     }
     if (sites.empty())
         return n;
