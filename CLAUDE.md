@@ -2964,6 +2964,12 @@ nothing to register).
   `DeclType`/`SymKind`/`ResolvedSym` enums it needs (moved here from
   syntax.h). The runtime call model reads ONLY this - see the value-model
   section and plans/archived/vm-ast-free-runtime.md.
+- `cyclewalk.h` — **THE CYCLE GUARD** (header-only, plus
+  `cyc_keep_until_exit` / `cyc_release_kept` in eval.cpp): the container
+  keys, path stacks, pair stack and copy stack every recursive walk over a
+  value graph uses, so a value that contains itself cannot send one into
+  infinite recursion. A new such walk must use it - see the ⛔ bullet in
+  *Copy-on-write containers*.
 - `syntax.h` / `syntax.cpp` — the `Construct` AST node hierarchy, its
   `serialize()` (what `-s` prints), and `clone()` (a deep copy of a subtree,
   used by inlining; pure virtual so every concrete node must provide one — see
@@ -3255,8 +3261,13 @@ and it lives *inside the parser*. Mechanics:
   `int`/`float`/`none`/`str` unconditionally, and `arr`/`dict` only when
   `process_arrays` is set — in which case it bakes the whole value into **one
   `LiteralObj` node** (`syntax.h`), not one literal per element. (It stores
-  `v.clone()` so a small slice of a huge const array doesn't pin the huge
-  buffer.) `LiteralObj` carries an **`immutable`** flag. The materializer sets
+  a self-contained copy - `make_const_clone` for a read-only result,
+  `make_mutable_clone` otherwise - so a small slice of a huge const array
+  doesn't pin the huge buffer. The mutable one was a SHALLOW `v.clone()`
+  until 2026-10-08, which turned a value that contains itself into its
+  one-step unrolling: a folded `var r = mk();` and the same call at run
+  time compared and printed differently, RULE 2.) `LiteralObj` carries an
+  **`immutable`** flag. The materializer sets
   it when **either** the target is a `const` decl (`fl & pInConstDecl`) **or the
   value itself is already read-only** (`is_readonly_value()`). The second case
   is how **const-ness propagates**: a slice/element/result derived from a const
@@ -6466,7 +6477,10 @@ are unchanged.
   compile time. **String hashes are cached** on `StrObj`
   (`mutable hash_cache`/`hash_valid`, computed lazily — strings are immutable),
   so repeated string-key probes don't recompute; a *slice* hashes its sub-view
-  on demand. No cycle guard (matches `==`/`to_string`).
+  on demand. A value that CONTAINS ITSELF hashes too: a back edge hashes as
+  its depth on the walk (`cyc_backedge_hash`), the one choice consistent
+  with `==`'s shape rule - see THE CYCLE GUARD below. A value with no cycle
+  hashes exactly as it did before the guard (pinned by an `-rt` case).
 - **Flat-scalar arrays cache their hash incrementally** (`SharedObject::
   hash_cache`/`hash_valid`). `TypeArr::hash` returns the cache when valid;
   `append` **maintains** it in O(1) (`arr_append_maintain_hash` — an append is
@@ -6540,6 +6554,69 @@ are unchanged.
   obtain a fully mutable version of a const. (`deepclone` is *not* a const
   builtin: it yields a mutable value that must be copied fresh per eval anyway,
   so folding it would only bloat the tree.)
+- **⛔ EVERY RECURSIVE WALK OVER A VALUE GRAPH GOES THROUGH THE CYCLE GUARD,
+  `cyclewalk.h` (2026-10-08; README *Values that contain themselves*;
+  plans/reference-cycles.md Part A).** Arrays, dicts and boxed structs are
+  references, so a value can contain itself (`append(a, a)`), and every
+  recursion over one - printing, `==`, `hash`, the deep copies, freezing a
+  constant or a dict key, the compiler's walks over a constant's value, the
+  `.myv` writer - overflowed the C stack on it (RULE 1: a SIGSEGV in a
+  release build). **A NEW walk over an `EvalValue`'s children uses the same
+  machinery, or it is that crash again.** What it gives you:
+  - `cyc_key(v, k)` names a container that CAN hold a reference (a
+    general-storage array by its storage and window, a dict, a boxed struct
+    object) and answers false for everything else - a flat array, a POD
+    struct, a string, a scalar, and a FUNCTION, which no walk enters (it
+    prints `<function>`, compares by identity, is shared by every copy).
+    Push only what it keys; a missed container is the crash, a keyed flat
+    array is wasted work.
+  - `CycStack` + the RAII `CycGuard` (exception-safe: a throw mid-walk
+    still pops) for a one-value walk; a container met while on the stack is
+    a BACK EDGE, answered without entering it. A STACK, not a memo: a
+    container shared at two places but not on the path is walked at each,
+    as before (so a DAG is still copied twice).
+  - the answers, one per walk kind: rendering writes `[...]` / `{...}` /
+    `Name(...)` (`cyc_render()`); `hash` hashes a back edge as its DEPTH,
+    `cyc_backedge_hash` (`cyc_hash()`); `==` uses the PAIR stack,
+    `cyc_eq()` - a back edge when the lhs is on it as an lhs or the rhs as
+    an rhs, equal iff at the same depth, which is the one rule `hash` can
+    agree with; the deep copies (`clone_to_mutable`,
+    `make_const_clone_rec`) link a back edge to the copy in progress
+    (`CycCopyStack::link`); the compiler's walks (`static_type_from_value`,
+    `keep_in_value`, `cs_eval_value`, `reflect_typeof`, `shape_of`,
+    `collect_value_descs`) answer their TOP (`dyn`, the site's abstract
+    object, `NumShape::other`); the writer throws a MyvError.
+  - the three stacks of the walks that run through `Type`'s virtuals are
+    function-local statics. A walk that asks a NEW question in the middle
+    of one - a dict looking a key up during `==`, hashing a container key
+    during `hash` - must run it under `CycFreshScope`, or the key's own
+    comparison reads the outer walk's stack.
+  - `==`'s identity fast path (`a` compared with itself) answers "equal"
+    without entering only while every pair on the stack is an identity
+    pair, or when the container reaches no cycle
+    (`CycPairStack::identity_ok`, memoized per top-level comparison).
+    Anywhere else the answer would depend on where the walk started, `==`
+    stops being transitive and `hash` cannot agree with it - `clone(a) != a`
+    for a ring `a` is the documented consequence. A dict compares each
+    value under `CycFlip`, keeping the operand ORDER unordered_map's
+    `operator==` always used (other's value on the left), which a builtin
+    exception value's missing `eq` makes observable.
+  **LEAKS.** Reference counting cannot free a cycle, and LeakSanitizer and
+  the INT census report one, which is correct for a cycle the PROGRAM
+  built: a test breaks its cycles before it ends (pop / erase) and says so
+  in its header. A cycle NO program can break - a frozen one (a cyclic
+  constant, a cyclic dict key) and a compile-time bake - is kept by
+  `cyc_keep_until_exit` and emptied by `cyc_release_kept`, which the first
+  keep registers with `atexit`: it runs after `main` and before the census
+  and LeakSanitizer read the heap (LIFO; a keep before the census mark is
+  in its baseline instead). `DictObject::release_at_exit` exists for that
+  drain only. This is a stopgap until plans/reference-cycles.md part B
+  (reclaiming cycles) is designed - never a way to make a test pass.
+  Nets: `tests/functional/81_cyclic_values.my`, the `cycle:` `-rt` cases
+  (one pins a non-cyclic value's hash to the pre-guard binary's numbers),
+  the `repl:` echo case, `myv_cyclic_const_refused` and `driver_checks`;
+  each guard was watched failing with its back-edge check removed (the
+  plan file has the table).
 - The non-const `intptr(symbol)` builtin exposes the underlying object pointer;
   the test suite uses it
   to assert exactly when two slices do/don't share storage. If you change COW

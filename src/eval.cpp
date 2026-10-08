@@ -6,6 +6,7 @@
 #include "lexer.h"
 #include "backtrace.h"
 #include "bitops.h"
+#include "cyclewalk.h"   /* the cycle guard: deep copies reproduce a cycle */
 #include "vm.h"   /* Phase 4: run a function body via the bytecode VM */
 
 #include <cmath>
@@ -457,6 +458,29 @@ static EvalValue coerce_to_decl_type(const EvalValue &v, DeclType dt,
                                      int site_arg = -1);
 
 /*
+ * A function run at COMPILE time (const-eval) may build a value that
+ * contains itself. Nothing it built reaches the program as it is - a
+ * constant is a frozen copy, a folded `var` a fresh copy per evaluation -
+ * so whatever cycle it returns, or leaves in its own locals, is dropped by
+ * the compiler, where no program can break it. Keep each such value until
+ * the program ends (cyclewalk.h, cyc_keep_until_exit), which frees it. Only
+ * a value from which a cycle can be reached is kept.
+ */
+static void const_eval_keep_cycles(const EvalContext &args_ctx,
+                                   const Frame *frame,
+                                   const EvalValue &result)
+{
+    cyc_keep_if_cyclic(result);
+    std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+    args_ctx.collect_symbols(syms);
+    for (const auto &s : syms)
+        cyc_keep_if_cyclic(s.second->get());
+    if (frame)
+        for (int i = 0; i < frame->size; i++)
+            cyc_keep_if_cyclic(frame->slots[i].get());
+}
+
+/*
  * Bind one parameter. When `frame` is set (the function was resolved), the
  * value goes into its fixed slot and the slot is marked live; otherwise it is
  * emplaced into the args context map (the unresolved / const-eval path).
@@ -871,7 +895,10 @@ do_func_call(EvalContext *ctx,
         Construct *eb;
         if (!vm_ck && obj.func->decl
                 && (eb = func_expr_body(obj.func->decl)) != nullptr) {
-            return do_func_return(eb->eval(&args_ctx), eb);
+            EvalValue r = do_func_return(eb->eval(&args_ctx), eb);
+            if (croot && croot->in_const_eval())
+                const_eval_keep_cycles(args_ctx, bindframe, r);
+            return r;
         }
 
         /*
@@ -933,6 +960,10 @@ do_func_call(EvalContext *ctx,
     }
 
     FlowState &fs = *args_ctx.flow;
+
+    if (croot && croot->in_const_eval())
+        const_eval_keep_cycles(args_ctx, bindframe,
+                               fs.type == FlowState::ret ? fs.value : none);
 
     if (fs.type == FlowState::ret)
         return std::move(fs.value);
@@ -2402,9 +2433,17 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
  *     backs deepclone().
  * Scalars and strings are returned as-is. An empty array collapses to the
  * shared empty_arr singleton, matching LiteralArray.
+ *
+ * A value may contain ITSELF (cyclewalk.h): `st` holds each container being
+ * copied with its copy in progress, and a container met again while it is
+ * there is linked to that copy - the copy has the same cycle, instead of
+ * the walk following the original one forever. A container shared at two
+ * places that is not on the current path is copied at each, as always. A
+ * read-only sub-object that is shared rather than copied cannot lead back
+ * here: a frozen value holds only frozen ones.
  */
 static EvalValue
-clone_to_mutable(const EvalValue &v, bool through_readonly)
+clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
 {
     if (v.is<SharedArrayObj>()) {
 
@@ -2474,49 +2513,65 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
             ));
         }
 
+        CycKey k;
+        cyc_key(v, k);                       /* a general array: keyed */
+        if (const EvalValue *c = st.link(k))
+            return *c;
+
         const ArrayConstView &view = arr.get_view();
 
-        SharedArrayObj::vec_type vec;
+        /* the copy exists before its elements, so a back edge can link it */
+        EvalValue res = SharedArrayObj(SharedArrayObj::vec_type());
+        SharedArrayObj::vec_type &vec = res.get<SharedArrayObj>().get_vec();
         vec.reserve(view.size());
+        CycCopyGuard g(st, k, res);
 
         for (unsigned i = 0; i < view.size(); i++) {
             vec.emplace_back(
-                clone_to_mutable(view[i].get(), through_readonly), false
+                clone_to_mutable(view[i].get(), through_readonly, st), false
             );
         }
 
-        return SharedArrayObj(std::move(vec));
+        /* the construction-time length, as building from a full vector set
+         * it (a non-slice reads size() from the vector anyway) */
+        res.get<SharedArrayObj>().len = static_cast<size_type>(vec.size());
+        return res;
     }
 
     if (v.is<intrusive_ptr<DictObject>>()) {
 
-        const auto &obj = v.get<intrusive_ptr<DictObject>>();
+        const auto &obj = v.get_ref<intrusive_ptr<DictObject>>();
 
         if (obj->is_readonly() && !through_readonly)
             return v;   /* share the const sub-object, don't copy it */
 
-        DictObject::inner_type data;
+        const CycKey k = cyc_key_obj(obj.get());
+        if (const EvalValue *c = st.link(k))
+            return *c;
+
+        auto out = make_intrusive<DictObject>();
+        EvalValue res = intrusive_ptr<DictObject>(out);
+        CycCopyGuard g(st, k, res);
 
         for (const auto &p : obj->get_ref()) {
-            data.emplace(
-                p.first,
+            out->build_emplace(
+                EvalValue(p.first),
                 LValue(
-                    clone_to_mutable(p.second.get(), through_readonly),
+                    clone_to_mutable(p.second.get(), through_readonly, st),
                     false
                 )
             );
         }
 
-        auto out = make_intrusive<DictObject>(std::move(data));
         if (obj->get_has_default())   /* preserve the default-dict default */
             out->set_default(
-                clone_to_mutable(obj->get_default(), through_readonly));
-        return intrusive_ptr<DictObject>(out);
+                clone_to_mutable(obj->get_default(), through_readonly, st));
+        return res;
     }
 
     if (v.is<intrusive_ptr<StructObject>>()) {
 
-        const auto &obj = v.get<intrusive_ptr<StructObject>>();
+        const auto &obj = v.get_ref<intrusive_ptr<StructObject>>();
 
         if (obj->is_readonly() && !through_readonly)
             return v;   /* share the const sub-object, don't copy it */
@@ -2528,12 +2583,19 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
             return intrusive_ptr<StructObject>(out);
         }
 
+        const CycKey k = cyc_key_obj(obj.get());
+        if (const EvalValue *c = st.link(k))
+            return *c;
+
         auto out = make_intrusive<StructObject>(obj->def);
+        EvalValue res = intrusive_ptr<StructObject>(out);
+        CycCopyGuard g(st, k, res);
+
         out->fields.reserve(obj->fields.size());
         for (const auto &f : obj->fields)
             out->fields.emplace_back(
-                clone_to_mutable(f.get(), through_readonly), false);
-        return intrusive_ptr<StructObject>(out);
+                clone_to_mutable(f.get(), through_readonly, st), false);
+        return res;
     }
 
     return v;
@@ -2541,12 +2603,14 @@ clone_to_mutable(const EvalValue &v, bool through_readonly)
 
 EvalValue make_mutable_clone(const EvalValue &v)
 {
-    return clone_to_mutable(v, false);
+    CycCopyStack st;
+    return clone_to_mutable(v, false, st);
 }
 
 EvalValue make_deep_mutable_clone(const EvalValue &v)
 {
-    return clone_to_mutable(v, true);
+    CycCopyStack st;
+    return clone_to_mutable(v, true, st);
 }
 
 /*
@@ -2559,9 +2623,14 @@ EvalValue make_deep_mutable_clone(const EvalValue &v)
  * strings are returned as-is (already immutable). An empty array gets its own
  * read-only object (not the shared empty_arr singleton, which must stay
  * mutable).
+ *
+ * A value that contains itself is frozen into a FROZEN CYCLE (cyclewalk.h,
+ * as clone_to_mutable does): each container is flagged read-only once its
+ * own copy is complete, so by the time the whole copy returns, every
+ * container in it - the back-linked ones included - is read-only.
  */
-EvalValue
-make_const_clone(const EvalValue &v, bool key)
+static EvalValue
+make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
 {
     if (v.is<SharedArrayObj>()) {
 
@@ -2632,36 +2701,59 @@ make_const_clone(const EvalValue &v, bool key)
             return arr;
         }
 
+        CycKey k;
+        cyc_key(v, k);                       /* a general array: keyed */
+        if (const EvalValue *c = st.link(k))
+            return *c;
+
         const ArrayConstView &view = src.get_view();
 
-        SharedArrayObj::vec_type vec;
+        EvalValue res = SharedArrayObj(SharedArrayObj::vec_type());
+        SharedArrayObj &arr = res.get<SharedArrayObj>();
+        SharedArrayObj::vec_type &vec = arr.get_vec();
         vec.reserve(view.size());
 
-        for (unsigned i = 0; i < view.size(); i++)
-            vec.emplace_back(make_const_clone(view[i].get(), key), false);
+        {
+            CycCopyGuard g(st, k, res);
+            for (unsigned i = 0; i < view.size(); i++)
+                vec.emplace_back(make_const_clone_rec(view[i].get(), key, st),
+                                 false);
+        }
 
-        SharedArrayObj arr(std::move(vec));
+        arr.len = static_cast<size_type>(vec.size());
         arr.set_readonly();
-        return arr;
+        return res;
     }
 
     if (v.is<intrusive_ptr<DictObject>>()) {
 
         const DictObject &src_obj = *v.get<intrusive_ptr<DictObject>>().get();
-        DictObject::inner_type data;
 
-        for (const auto &p : src_obj.get_ref()) {
-            data.emplace(
-                p.first,
-                LValue(make_const_clone(p.second.get(), key), false)
-            );
+        const CycKey k = cyc_key_obj(&src_obj);
+        if (const EvalValue *c = st.link(k))
+            return *c;
+
+        auto obj = make_intrusive<DictObject>();
+        EvalValue res = intrusive_ptr<DictObject>(obj);
+
+        {
+            CycCopyGuard g(st, k, res);
+
+            for (const auto &p : src_obj.get_ref()) {
+                obj->build_emplace(
+                    EvalValue(p.first),
+                    LValue(make_const_clone_rec(p.second.get(), key, st),
+                           false)
+                );
+            }
+
+            if (src_obj.get_has_default())   /* preserve the default */
+                obj->set_default(
+                    make_const_clone_rec(src_obj.get_default(), key, st));
         }
 
-        auto obj = make_intrusive<DictObject>(std::move(data));
-        if (src_obj.get_has_default())   /* preserve the default-dict default */
-            obj->set_default(make_const_clone(src_obj.get_default(), key));
         obj->set_readonly();
-        return intrusive_ptr<DictObject>(obj);
+        return res;
     }
 
     if (v.is<intrusive_ptr<StructObject>>()) {
@@ -2684,7 +2776,7 @@ make_const_clone(const EvalValue &v, bool key)
             StructObject &o = const_cast<StructObject &>(src);
             o.set_readonly();
             for (auto &f : o.fields)
-                f.put(make_const_clone(f.get(), false));
+                f.put(make_const_clone_rec(f.get(), false, st));
             return v;
         }
 
@@ -2695,15 +2787,94 @@ make_const_clone(const EvalValue &v, bool key)
             return intrusive_ptr<StructObject>(obj);
         }
 
+        const CycKey k = cyc_key_obj(&src);
+        if (const EvalValue *c = st.link(k))
+            return *c;
+
         auto obj = make_intrusive<StructObject>(src.def);
-        obj->fields.reserve(src.fields.size());
-        for (const auto &f : src.fields)
-            obj->fields.emplace_back(make_const_clone(f.get(), key), false);
+        EvalValue res = intrusive_ptr<StructObject>(obj);
+
+        {
+            CycCopyGuard g(st, k, res);
+            obj->fields.reserve(src.fields.size());
+            for (const auto &f : src.fields)
+                obj->fields.emplace_back(
+                    make_const_clone_rec(f.get(), key, st), false);
+        }
+
         obj->set_readonly();
-        return intrusive_ptr<StructObject>(obj);
+        return res;
     }
 
     return v;
+}
+
+EvalValue
+make_const_clone(const EvalValue &v, bool key)
+{
+    CycCopyStack st;
+    EvalValue r = make_const_clone_rec(v, key, st);
+
+    /* A FROZEN CYCLE cannot be broken by the program (every container in
+     * it is read-only), so it would live forever: keep it until the program
+     * ends, which frees it (cyc_keep_until_exit). */
+    if (st.closed)
+        cyc_keep_until_exit(r);
+    return r;
+}
+
+/* The values cyc_keep_until_exit keeps (cyclewalk.h) - counted handles. */
+static std::vector<EvalValue> &cyc_kept()
+{
+    static std::vector<EvalValue> kept;
+    return kept;
+}
+
+void cyc_keep_until_exit(const EvalValue &v)
+{
+    /* the vector is constructed BEFORE the handler is registered, so the
+     * handler runs before the vector's destructor (atexit's ordering) */
+    std::vector<EvalValue> &kept = cyc_kept();
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        std::atexit(cyc_release_kept);
+    }
+    kept.push_back(v);
+}
+
+void cyc_release_kept()
+{
+    std::vector<EvalValue> work;
+    work.swap(cyc_kept());
+
+    /* Every container reachable from a kept value, each held by a counted
+     * handle while the others are emptied - so emptying one frees none of
+     * the rest under the loop. */
+    std::vector<EvalValue> all;
+    std::unordered_set<CycKey, CycKeyHash> seen;
+
+    while (!work.empty()) {
+        EvalValue v = std::move(work.back());
+        work.pop_back();
+        CycKey k;
+        if (!cyc_key(v, k) || !seen.insert(k).second)
+            continue;
+        cyc_any_child(v, [&](const EvalValue &c) {
+            work.push_back(c);
+            return false;
+        });
+        all.push_back(std::move(v));
+    }
+
+    for (EvalValue &v : all) {
+        if (v.is<SharedArrayObj>())
+            v.get<SharedArrayObj>().get_vec().clear();
+        else if (v.is<intrusive_ptr<DictObject>>())
+            v.get<intrusive_ptr<DictObject>>()->release_at_exit();
+        else
+            v.get<intrusive_ptr<StructObject>>()->fields.clear();
+    }
 }
 
 /*
@@ -2814,7 +2985,10 @@ void shape_join(NumShape &a, const NumShape &x)
     }
 }
 
-NumShape shape_of(const EvalValue &v)
+/* `st`: the containers this walk is inside (cyclewalk.h) - a constant may
+ * contain itself, and a back edge's shape is `other`, the dyn its static
+ * type gives it (static_type_from_value). */
+NumShape shape_of(const EvalValue &v, CycStack &st)
 {
     NumShape s;
     if (v.is<NoneVal>())
@@ -2822,12 +2996,19 @@ NumShape shape_of(const EvalValue &v)
     if (v.is<bool>()) { s.k = NumShape::b; return s; }
     if (v.is<int_type>()) { s.k = NumShape::i; return s; }
     if (v.is<float_type>()) { s.k = NumShape::f; return s; }
+    CycKey k;
+    const bool keyed = cyc_key(v, k);
+    if (keyed && st.contains(k)) {
+        s.k = NumShape::other;
+        return s;
+    }
+    CycGuard g(st, k, keyed);
     if (v.is<SharedArrayObj>()) {
         const auto &a = v.get_ref<SharedArrayObj>();
         s.k = NumShape::arr;
         s.sub = std::make_unique<NumShape>();
         for (size_type i = 0; i < a.size(); i++)
-            shape_join(*s.sub, shape_of(arr_elem_boxed(a, i)));
+            shape_join(*s.sub, shape_of(arr_elem_boxed(a, i), st));
         return s;
     }
     if (v.is<intrusive_ptr<DictObject>>()) {
@@ -2835,7 +3016,7 @@ NumShape shape_of(const EvalValue &v)
         s.sub = std::make_unique<NumShape>();
         for (const auto &kv : v.get_ref<intrusive_ptr<DictObject>>()
                                    ->get_ref())
-            shape_join(*s.sub, shape_of(kv.second.get()));
+            shape_join(*s.sub, shape_of(kv.second.get(), st));
         return s;
     }
     s.k = NumShape::other;
@@ -2908,8 +3089,9 @@ static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
                                bool is_const)
 {
     NumShape s;
+    CycStack st;
     for (size_t i = 0; i < n; i++)
-        shape_join(s, shape_of(vals[i * stride]));
+        shape_join(s, shape_of(vals[i * stride], st));
     if (s.k == NumShape::bot || s.k == NumShape::other)
         return;
     for (size_t i = 0; i < n; i++) {

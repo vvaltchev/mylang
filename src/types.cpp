@@ -6,6 +6,7 @@
 #include "vminvoke.h"  /* ...and its inline test() hot path (#84) */
 #include "bitops.h"
 #include "hashing.h"
+#include "cyclewalk.h"   /* the cycle guard: print / == / hash terminate */
 #include "poolalloc.h"
 #include "env.h"      /* env_get - shared by builtins/io.cpp.h (tmpdir) */
 

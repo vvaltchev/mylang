@@ -29,6 +29,7 @@ as well.
     * [Declaring constants](#declaring-constants)
       - [Automatic const promotion](#automatic-const-promotion)
     * [Type system](#type-system)
+      - [Values that contain themselves](#values-that-contain-themselves)
     * [Conditional statements](#conditional-statements)
       - [Const evaluation](#const-evaluation-of-conditional-statements)
     * [Classic loop statements](#classic-loop-statements)
@@ -133,7 +134,9 @@ their data pools (constants, source locations for error carets, struct
 type definitions, function descriptors). It does **not** hold machine
 code: the native compiler runs again when the file is loaded, so an image
 is portable across machines and keeps working as the native tier
-improves.
+improves. One program cannot be stored: a constant that contains itself
+(see [Values that contain themselves](#values-that-contain-themselves)) is
+refused with a `MyvError`, and no file is written.
 
 #### Where the source line in an error comes from
 
@@ -1101,11 +1104,13 @@ runtime instead.
     (by value) arrays, dicts and structs (e.g. `d[[1,2]]`, `d[Point(1,2)]`),
     since `hash()` is total. A container key is **frozen** (snapshotted deeply
     read-only) when inserted, so mutating the original afterwards cannot corrupt
-    the dict. **Perks**: identifier-like string-keys can be accessed with the
-    "member of" syntax: `d.key`. A read of a *missing* key (`d[k]`/`d.key`)
-    raises `KeyNotFoundEx` — non-`opt` access (a value or an exception, never
-    `none`); use `get()` for a nullable lookup, or `dict(default)` for a default
-    value. A write (`d[k] = v`) inserts the key.
+    the dict; a key that contains itself is frozen with its cycle (see
+    *Values that contain themselves* below). **Perks**: identifier-like
+    string-keys can be accessed with the "member of" syntax: `d.key`. A read
+    of a *missing* key (`d[k]`/`d.key`) raises `KeyNotFoundEx` — non-`opt`
+    access (a value or an exception, never `none`); use `get()` for a
+    nullable lookup, or `dict(default)` for a default value. A write
+    (`d[k] = v`) inserts the key.
 
   * **Function**
     Both standalone functions and lambdas have the same object type and can be passed
@@ -1119,6 +1124,70 @@ runtime instead.
     instance and catch it by its type (see *Custom exceptions*). A built-in
     exception bound with `catch (X as e)` surfaces as this type (printable,
     re-throwable), but carries no fields.
+
+#### Values that contain themselves
+
+Arrays and dicts are references (and so is a struct's array, dict or `dyn`
+field), so a value can contain itself: directly (`append(a, a)`), through a
+dict (`d["self"] = d`), through a struct field, or around a longer ring.
+Every operation that walks a value is defined on such a value - none of them
+follows the ring forever:
+
+```C#
+var dyn a = [1];
+append(a, a);
+print(a);                   # [1, [...]]
+var dyn d = {};
+d["self"] = d;
+print(d);                   # {"self": {...}}
+print([a, a]);              # [[1, [...]], [1, [...]]]
+```
+
+  * **Printing** (`print`, `str`, the REPL's `=>` echo): a container that is
+    already being printed further up is written `[...]`, `{...}` or, for a
+    struct, `Name(...)`. A container that appears twice without being inside
+    itself is printed in full both times, as `[a, a]` shows.
+
+  * **`==` and `!=` compare by shape.** Two values are equal when walking
+    them side by side meets equal scalars in the same places, and every step
+    back to a container already being compared further up leads, on both
+    sides, the same number of levels up. So `a == a`; two rings built
+    separately the same way are equal; each node of a ring of two equals the
+    other; but rings of one, two and three nodes all differ, and so do a ring
+    and its one-step unrolling: `clone(a)` is a fresh array whose second
+    element is the ring `a`, so `clone(a) != a` (and it prints as
+    `[1, [1, [...]]]`).
+
+  * **`hash`** agrees with `==` on these values - equal values hash equal -
+    so a value that contains itself can be a dict key. The key is frozen as
+    usual, cycle included: the frozen copy contains itself, not the
+    original. A value that does not contain itself hashes exactly as before.
+
+  * **`deepclone`** copies the cycle: the copy of `a` contains the copy, not
+    `a`. A container that appears twice without being on a cycle is still
+    copied twice, as `deepclone` always did. The read-only snapshot a
+    constant or a dict key takes works the same way.
+
+  * **Ordering** (`<`, `sort`, `min`, `max`) is not defined on arrays, dicts
+    or structs at all (`TypeErrorEx`), so it never walks one.
+
+  * **Constants.** A pure function can build such a value at compile time -
+    with an element store, `r[1] = r`, since `append` is not available there
+    - and a `const` holds it frozen, cycle included. A `var` initialized by
+    the same call gets a mutable value of the same shape, whether the call
+    was evaluated at compile time or at run time. A compiled image
+    ([.myv](#compiled-scripts-myv)) cannot store a constant that contains
+    itself: `mylang -c` refuses it with a `MyvError` saying where the
+    constant is, and writes no file.
+
+  * **A function is never walked into**: a closure that captured the array
+    it is stored in prints as `<function>` and compares by identity.
+
+**Memory.** MyLang frees a value when the last reference to it goes away, so
+a value that contains itself is not freed while the ring exists, even when
+the program can no longer reach it. Break the ring when you are done with it
+(`pop(a)`, `erase(d, "self")`). A ring the program cannot break - inside a
+constant or a dict key, which are read-only - is freed when the program ends.
 
 ### Static type inference
 
@@ -2690,7 +2759,9 @@ Like `clone()`, but produces a **fully mutable, deep copy**: every nested array
 and dictionary is copied too, so the result is completely independent of the
 original and writable at any depth. This is the way to obtain a mutable version
 of a `const` (or of any object you want to change deeply without affecting the
-source). Scalars and strings are returned unchanged.
+source). Scalars and strings are returned unchanged. A value that contains
+itself is copied with its cycle: the copy contains the copy (see
+[Values that contain themselves](#values-that-contain-themselves)).
 
 #### `type(value)`
 Return a **`Type` reflection object** for the value's type — a native composite
@@ -2721,9 +2792,12 @@ any insertion order, since a dict is unordered), two structs of the same type
 with the same fields. The array/struct hash is **order-dependent** (`[1,2]` ≠
 `[2,1]`), the dict hash is **order-independent**. A string's hash is computed
 once and cached (strings are immutable). Because `hash()` is total, **any value
-can be a dictionary key** (see *Dictionaries*). A hash depends only on the
-value - a struct's on its type's name and its fields - never on where anything
-lives in memory, so it is the same in every run and in every engine.
+can be a dictionary key** (see *Dictionaries*) - one that contains itself too,
+hashed consistently with how `==` compares it (see
+[Values that contain themselves](#values-that-contain-themselves)). A hash
+depends only on the value - a struct's on its type's name and its fields, a
+class instance's on its identity - never on where anything lives in memory, so
+it is the same in every run and in every engine.
 
 ### Array builtins
 

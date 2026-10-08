@@ -299,6 +299,17 @@ public:
         data.emplace(std::move(k), std::move(v));
     }
 
+    /* Drop every entry and the default, read-only or not - ONLY for
+     * cyc_release_kept (cyclewalk.h), which empties a cycle no program can
+     * break once the program has ended. STRUCTURAL. */
+    void release_at_exit()
+    {
+        will_restructure();
+        data.clear();
+        has_default = false;
+        default_val = EvalValueT();
+    }
+
     bool is_readonly() const { return readonly; }
     void set_readonly() { readonly = true; }
     void clear_readonly() { readonly = false; }

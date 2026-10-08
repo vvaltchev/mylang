@@ -8,6 +8,7 @@
 #include "analyzer.h"
 #include "evalvalue.h"
 #include "eval.h"
+#include "cyclewalk.h"    /* a constant's value may contain itself */
 #include "trace.h"
 #include "resolver.h"     /* for_each_child_slot (fold_show_calls) */
 #include "coderender.h"   /* render_func_code / render_construct_code */
@@ -417,6 +418,7 @@ private:
     StaticTypeRef unary_result(Op op, StaticTypeRef a);
     StaticTypeRef builtin_result(const UniqueId *name, ExprList *args);
     StaticTypeRef static_type_from_value(const EvalValue &v);
+    StaticTypeRef static_type_from_value(const EvalValue &v, CycStack &st);
     static Op compound_binop(Op op);
 
     /* fixpoint */
@@ -472,6 +474,8 @@ private:
     CsSet cs_eval(Construct *e);
     void cs_eval_value(const EvalValue &v, const Construct *site,
                        CsSet &out);
+    void cs_eval_value(const EvalValue &v, const Construct *site,
+                       CsSet &out, CycStack &st);
     CsSet cs_read_elems(const CsSet &base);
     void cs_write_elems(const CsSet &base, const CsSet &v);
     void cs_escape_set(const CsSet &v);
@@ -1991,10 +1995,23 @@ void Inferencer::infer_one(Block *rootBlock)
          * is walked, not pattern-matched. A flat array (ints/floats/bools/
          * strs/POD structs) cannot hold a function by construction, and
          * get_view() on one would PROMOTE it - so those kinds are skipped,
-         * not viewed.
+         * not viewed. A constant may contain itself: a container (or a
+         * struct type's consts) already on the walk's path is not entered
+         * again (cyclewalk.h) - everything in it is being walked already.
          */
+        CycStack keep_path;
         std::function<void(const EvalValue &)> keep_in_value =
             [&](const EvalValue &v) {
+            CycKey ck;
+            bool keyed = cyc_key(v, ck);
+            if (!keyed && v.get_type()->t == Type::t_structtype) {
+                ck = cyc_key_consts(v.get<StructTypeDef *>());
+                keyed = true;
+            }
+            if (keyed && keep_path.contains(ck))
+                return;
+            CycGuard cg(keep_path, ck, keyed);
+
             switch (v.get_type()->t) {
 
             case Type::t_func: {
@@ -3989,9 +4006,27 @@ StaticTypeRef Inferencer::func_static_type(FuncInfo *fi)
  * homogeneous const array is array<T>, a heterogeneous one array<dyn> (its
  * individual elements are still exact via const-folding of any constant-index
  * access at parse time). Same for dict keys/values.
+ *
+ * A constant may contain ITSELF (cyclewalk.h): a container already on this
+ * walk's path is a back edge and contributes `dyn` - so `const C = mk();`
+ * with `C` a ring holding an int is array<dyn>, which is what its type is
+ * (its element is an int and an array, at once).
  */
 StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v)
 {
+    CycStack st;
+    return static_type_from_value(v, st);
+}
+
+StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
+                                                 CycStack &st)
+{
+    CycKey k;
+    const bool keyed = cyc_key(v, k);
+    if (keyed && st.contains(k))
+        return A.dyn_ty();
+    CycGuard g(st, k, keyed);
+
     Type *t = v.get_type();
     switch (t->t) {
 
@@ -4031,10 +4066,10 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v)
             ArrayConstView view = arr.get_view();
             if (view.size() == 0)
                 return A.array_of(A.none_ty());
-            StaticTypeRef el = static_type_from_value(view[0].get());
+            StaticTypeRef el = static_type_from_value(view[0].get(), st);
             for (size_type i = 1; i < view.size(); i++) {
                 StaticTypeRef j = A.join(el,
-                    static_type_from_value(view[i].get()));
+                    static_type_from_value(view[i].get(), st));
                 el = j ? j : A.dyn_ty();
             }
             return A.array_of(el);
@@ -4044,20 +4079,20 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v)
             const auto &m = v.get<intrusive_ptr<DictObject>>()->get_ref();
             if (m.empty())
                 return A.dict_of(A.none_ty(), A.none_ty());
-            StaticTypeRef k = nullptr, val = nullptr;
+            StaticTypeRef kty = nullptr, val = nullptr;
             for (const auto &kv : m) {
-                StaticTypeRef kt = static_type_from_value(kv.first);
-                StaticTypeRef vt = static_type_from_value(kv.second.get());
-                if (!k) {
-                    k = kt; val = vt;
+                StaticTypeRef kt = static_type_from_value(kv.first, st);
+                StaticTypeRef vt = static_type_from_value(kv.second.get(), st);
+                if (!kty) {
+                    kty = kt; val = vt;
                 } else {
-                    StaticTypeRef jk = A.join(k, kt);
+                    StaticTypeRef jk = A.join(kty, kt);
                     StaticTypeRef jv = A.join(val, vt);
-                    k = jk ? jk : A.dyn_ty();
+                    kty = jk ? jk : A.dyn_ty();
                     val = jv ? jv : A.dyn_ty();
                 }
             }
-            return A.dict_of(k, val);
+            return A.dict_of(kty, val);
         }
 
         default:

@@ -60,3 +60,6 @@ constexpr size_t hash_salt_array  = static_cast<size_t>(0x41525259ULL); /*ARRY*/
 constexpr size_t hash_salt_dict   = static_cast<size_t>(0x44494354ULL); /*DICT*/
 constexpr size_t hash_salt_struct = static_cast<size_t>(0x53545243ULL); /*STRC*/
 constexpr size_t hash_salt_none   = static_cast<size_t>(0x4E4F4E45ULL); /*NONE*/
+/* a BACK EDGE of a value that contains itself (CYCL), combined with its
+ * depth on the walk - cyc_backedge_hash, cyclewalk.h */
+constexpr size_t hash_salt_backedge = static_cast<size_t>(0x4359434CULL);

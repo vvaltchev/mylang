@@ -7781,6 +7781,133 @@ static const std::vector<test> tests =
         "assert(hash(c) == hash(c));",
         "assert(hash(c) == hash([1,2,3]));" } },
 
+    /* ---- values that contain themselves (cyclewalk.h; README, "Values
+     * that contain themselves") ----
+     * Every case BREAKS the cycles it builds before it ends (pop / erase):
+     * reference counting cannot free a cycle, and the suite runs under
+     * LeakSanitizer and the INT census. A FROZEN cycle (a cyclic constant,
+     * a cyclic dict key) cannot be broken by any program; the interpreter
+     * frees those when the process ends (cyc_keep_until_exit). `dynarray`
+     * keeps a ring general under every configuration. */
+    { "cycle: printing marks a container already being printed",
+      { "struct CyN { int v; dyn? next; }",
+        "var dyn a = dynarray([1]); append(a, a);",
+        "assert(str(a) == \"[1, [...]]\");",
+        "assert(str([a, a]) == \"[[1, [...]], [1, [...]]]\");",
+        "assert(str(clone(a)) == \"[1, [1, [...]]]\");",
+        "var dyn d = {}; d[\"s\"] = d;",
+        "assert(str(d) == \"{\\\"s\\\": {...}}\");",
+        "var dyn bx = []; var s = CyN(1, bx); append(bx, s);",
+        "assert(str(s) == \"CyN(v: 1, next: [CyN(...)])\");",
+        "assert(str(bx) == \"[CyN(v: 1, next: [...])]\");",
+        "pop(a); erase(d, \"s\"); pop(bx);",
+        "assert(str(a) == \"[1]\" && str(s) == \"CyN(v: 1, next: [])\");" } },
+    { "cycle: == compares two cyclic values by shape",
+      { "var dyn a = dynarray([1]); append(a, a);",
+        "var dyn b = dynarray([1]); append(b, b);",
+        /* a ring of two and a ring of three, every node [1, next] */
+        "var dyn u = dynarray([1]); var dyn u2 = [1, u]; append(u, u2);",
+        "var dyn x = dynarray([1]); var dyn y = dynarray([1]);",
+        "var dyn z = [1, x]; append(y, z); append(x, y);",
+        "assert(a == a && a == b && !(a != b) && [a] == [b]);",
+        "assert(u == u2 && u2 == u && x == y && y == z && z == x);",
+        /* the same unfolding, a different shape */
+        "assert(a != u && u != a && a != x && u != x);",
+        "assert(clone(a) != a && a != [1, [1, [1]]]);",
+        "var dyn d1 = {}; d1[\"s\"] = d1;",
+        "var dyn d2 = {}; d2[\"s\"] = d2;",
+        "assert(d1 == d2 && {\"r\": a} == {\"r\": b});",
+        "assert(find([u, b], a) == 1);",
+        "pop(a); pop(b); pop(u); pop(x);",
+        "erase(d1, \"s\"); erase(d2, \"s\");" } },
+    { "cycle: equal cyclic values hash equal",
+      { "struct CyN { int v; dyn? next; }",
+        "var dyn a = dynarray([1]); append(a, a);",
+        "var dyn b = dynarray([1]); append(b, b);",
+        "var dyn u = dynarray([1]); var dyn u2 = [1, u]; append(u, u2);",
+        "var dyn x = dynarray([1]); var dyn y = dynarray([1]);",
+        "var dyn z = [1, x]; append(y, z); append(x, y);",
+        "var dyn d1 = {}; d1[\"s\"] = d1;",
+        "var dyn d2 = {}; d2[\"s\"] = d2;",
+        "var dyn ba = []; var sa = CyN(1, ba); append(ba, sa);",
+        "var dyn bb = []; var sb = CyN(1, bb); append(bb, sb);",
+        "assert(sa == sb && ba == bb);",
+        "assert(hash(a) == hash(b) && hash([a]) == hash([b]));",
+        "assert(hash(u) == hash(u2));",
+        "assert(hash(x) == hash(y) && hash(y) == hash(z));",
+        "assert(hash(d1) == hash(d2));",
+        "assert(hash({\"r\": a}) == hash({\"r\": b}));",
+        "assert(hash(sa) == hash(sb) && hash(ba) == hash(bb));",
+        "pop(a); pop(b); pop(u); pop(x); pop(ba); pop(bb);",
+        "erase(d1, \"s\"); erase(d2, \"s\");" } },
+    { "cycle: a cyclic value is a dict key, frozen with its cycle",
+      { "var dyn a = dynarray([1]); append(a, a);",
+        "var dyn b = dynarray([1]); append(b, b);",
+        "var dyn m = {}; m[a] = 1; m[b] = 2;",
+        "assert(len(m) == 1 && m[a] == 2);",
+        "var dyn k = keys(m)[0];",
+        "assert(k == a && str(k) == \"[1, [...]]\");",
+        "var dyn inner = k[1]; var n = 0;",
+        "try { inner[0] = 5; } catch (NotLValueEx) { n += 1; }",
+        "try { append(inner, 5); } catch (CannotChangeConstEx) { n += 1; }",
+        "assert(n == 2);",
+        "pop(a); pop(b);",
+        "assert(len(k) == 2 && m[k] == 2);" } },
+    { "cycle: deepclone reproduces the cycle inside the copy",
+      { "var dyn a = dynarray([1]); append(a, a);",
+        "var dyn c = deepclone(a);",
+        "assert(c == a && intptr(c[1]) == intptr(c));",
+        "assert(intptr(c) != intptr(a));",
+        "c[0] = 9; assert(a[0] == 1 && c[1][0] == 9);",
+        /* shared at two places, not on a cycle: still copied twice */
+        "var dyn s7 = [7]; var dyn dag = [s7, s7];",
+        "var dyn dc = deepclone(dag); dc[0][0] = 8;",
+        "assert(dc[1][0] == 7 && s7[0] == 7);",
+        "var dyn d = {}; d[\"s\"] = d; var dyn dd = deepclone(d);",
+        "assert(dd == d && intptr(dd[\"s\"]) == intptr(dd));",
+        "pop(a); pop(c); erase(d, \"s\"); erase(dd, \"s\");" } },
+    { "cycle: a cyclic constant is frozen, and a var gets a mutable ring",
+      { "pure func mkr(n) { var dyn r = [n, \"x\"]; r[1] = r; return r; }",
+        "var dyn r2 = mkr(1);",
+        "var dyn r3 = mkr(runtime(1));",
+        "const C = mkr(1);",
+        "assert(str(C) == \"[1, [...]]\" && C == r2 && r2 == r3);",
+        "assert(hash(C) == hash(r3) && typestr(C) == \"array<dyn>\");",
+        "assert(intptr(r2[1]) == intptr(r2));",
+        "var dyn cv = C; var n = 0;",
+        "try { cv[1][0] = 5; } catch (NotLValueEx) { n += 1; }",
+        "assert(n == 1);",
+        "r2[0] = 2; assert(r2[1][0] == 2 && C[0] == 1);",
+        "pop(r2); pop(r3);" } },
+    { "cycle: writing into a frozen cyclic key is refused",
+      { "var dyn a = dynarray([1]); append(a, a);",
+        "var dyn m = {}; m[a] = 1;",
+        "var dyn k = keys(m)[0];",
+        "pop(a);",
+        "k[1][1][0] = 5;" }, &typeid(NotLValueEx) },
+    /* a non-cyclic value hashes EXACTLY as before the cycle guard: the
+     * numbers are the pre-guard binary's. They assume an int hashes to
+     * itself (libstdc++ / libc++); elsewhere the block is skipped. */
+    { "cycle: a non-cyclic value's hash is unchanged by the guard",
+      { "if (hash(12345) == 12345) {",
+        "  assert(hash([1,2,3]) == 1021759579670777942);",
+        "  var dyn v = runtime([[1,2],[3,[4,5]]]);",
+        "  assert(hash(v) == 6214266430733002444);",
+        "  v = runtime({1:[1,2],2:{3:4}});",
+        "  assert(hash(v) == -5282781315722935329);",
+        "  v = runtime([[],{},[[]]]);",
+        "  assert(hash(v) == -9127117199651803742);",
+        "  assert(hash(runtime({7:none})) == 7488979548844117480);",
+        "  v = runtime([true,[false,none]]);",
+        "  assert(hash(v) == -7430807536993982057);",
+        "  assert(hash(runtime([[[[[1]]]]])) == -6611927190249792728);",
+        "  assert(hash(runtime([1,[2],{3:[4]}])) == 761509279571227326);",
+        "  var dyn g = runtime([1,[2,[3]]]);",
+        "  assert(hash([g,g,{5:g}]) == -6232764922002804832);",
+        "  var dyn m = runtime({}); m[[1, 2]] = [3]; m[{4: 5}] = {6: [7]};",
+        "  assert(hash(m) == -3843584604690709108);",
+        "}" } },
+
     /* ---- float operators (float.cpp.h) ---- */
     { "float + non-numeric is a type error",
       { "2.5 + \"x\";" }, &typeid(TypeErrorEx) },
@@ -20939,6 +21066,27 @@ static const std::vector<repl_test> repl_tests =
       { { "struct Wide { str alpha; str beta; str gamma; str delta; }", "" },
         { "Wide(\"first value\", \"second value\", \"third value\", \"x\")",
           "Wide(\n     alpha: \"first value\"," } } },
+    /* a value that contains itself echoes its back edge as [...] / {...},
+     * on one line and expanded; the last steps break the cycles (reference
+     * counting cannot free one, and -rt runs under LeakSanitizer) */
+    { "the => echo marks a value that contains itself",
+      { { "var dyn cy = dynarray([1])", "" },
+        { "append(cy, cy)", "" },
+        { "cy", "=> [1, [...]]" },
+        { "[cy, cy]", "=> [[1, [...]], [1, [...]]]" },
+        { "var dyn cd = {}", "" },
+        { "cd[\"self\"] = cd", "" },
+        { "cd", "=> {\"self\": {...}}" },
+        { "var dyn cw = dynarray([\"aaaaaaaaaaaaaaaaaaaaaaaaa\",\n"
+          "  \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"ccccccccccccccccccc\"])",
+          "" },
+        { "append(cw, cw)", "" },
+        { "cw", "     \"ccccccccccccccccccc\",\n     [...]\n   ]" },
+        { "pop(cy)", "" },
+        { "erase(cd, \"self\")", "" },
+        { "pop(cw)", "" },
+        { "cy", "=> [1]" },
+        { "cd", "=> {}" } } },
 
     { "a template defined then called across inputs instantiates per type",
       { { "func tg(a){ var r = a + 1; return r; }", "" },
@@ -31825,6 +31973,124 @@ static bool myv_struct_const_func()
     } catch (Exception &e) {
         fprintf(stderr, "myv-sconst: threw %s: %s\n", e.name,
                 e.msg ? e.msg : "");
+    }
+    remove(path.c_str());
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
+ * A CONSTANT THAT CONTAINS ITSELF CANNOT BE STORED (cyclewalk.h; README,
+ * "Values that contain themselves"). A pure function can build a ring at
+ * compile time, and the constant then holds it - at the top level, in a
+ * struct's const member, or in a function body's folded call. The image's
+ * value codec writes a value as a tree and has no back-reference record, so
+ * the writer REFUSES such a constant with a MyvError naming where it is,
+ * and writes no file (it was a stack overflow in the writer). A control
+ * with the same shape and no cycle must still write, load and run, so the
+ * refusal cannot pass by refusing everything.
+ */
+static bool myv_cyclic_const_refused()
+{
+    static const char *mk =
+        "pure func mkr(n) { var dyn r = [n, \"x\"]; r[1] = r; return r; }";
+    struct Case { const char *src; const char *holder; };
+    const Case cases[] = {
+        { "const C = mkr(1);\nprint(str(C));",
+          "a constant at the top level" },
+        { "struct S { int v; const K = mkr(2); }\nprint(str(S.K));",
+          "the constant 'S.K'" },
+        { "func f() { var dyn t = mkr(3); var s = str(t); pop(t);"
+          " return s; }\nprint(f());",
+          "a constant in function 'f'" },
+        /* the control: no cycle, so it must be stored */
+        { "const C = [1, [2, \"x\"]];\nprint(str(C));", nullptr },
+    };
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-cyclic.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    for (const Case &c : cases) {
+        const std::string src = std::string(mk) + "\n" + c.src;
+        remove(path.c_str());
+        std::string why;
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+            try {
+                myv_write(prog, path, MyvSourceRef());
+            } catch (Exception &e) {
+                why = std::string(e.name) + ": " + (e.msg ? e.msg : "");
+            }
+        } catch (Exception &e) {
+            fprintf(stderr, "myv-cyclic: [%s] did not compile: %s: %s\n",
+                    c.src, e.name, e.msg ? e.msg : "");
+            ok = false;
+            continue;
+        }
+
+        const bool written = std::ifstream(path, std::ios::binary).good();
+
+        if (!c.holder) {
+            if (!why.empty() || !written) {
+                fprintf(stderr, "myv-cyclic: the acyclic control was not "
+                                "stored [%s]\n", why.c_str());
+                ok = false;
+                continue;
+            }
+            /* it loads and prints what the source prints */
+            std::string out;
+            try {
+                MyvSource s;
+                VmProgram img = myv_read(path, s);
+                std::ostringstream cap;
+                std::streambuf *ob = std::cout.rdbuf(cap.rdbuf());
+                try {
+                    vm_run(img);
+                } catch (...) {
+                    std::cout.rdbuf(ob);
+                    throw;
+                }
+                std::cout.rdbuf(ob);
+                out = cap.str();
+            } catch (Exception &e) {
+                out = std::string("threw ") + e.name;
+            }
+            if (out != "[1, [2, \"x\"]] \n") {
+                fprintf(stderr, "myv-cyclic: the control's image printed "
+                                "[%s]\n", out.c_str());
+                ok = false;
+            }
+            continue;
+        }
+
+        const bool named = why.rfind("MyvError: ", 0) == 0
+                           && why.find(c.holder) != std::string::npos
+                           && why.find("reference cycle") != std::string::npos;
+        if (!named || written) {
+            fprintf(stderr, "myv-cyclic: [%s] was %s%s [%s]\n", c.src,
+                    why.empty() ? "STORED" : "refused without naming '",
+                    why.empty() ? "" : (std::string(c.holder) + "'").c_str(),
+                    why.c_str());
+            if (written)
+                fprintf(stderr, "myv-cyclic: ...and a file was left\n");
+            ok = false;
+        }
     }
     remove(path.c_str());
     g_exec_engine = saved;
@@ -53867,6 +54133,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: a function in a struct's const member round-trips, and its "
       "capture check survives the shells (#52, v20)",
       myv_struct_const_func },
+    { "myv: a constant that contains itself is refused by name, no file "
+      "written",
+      myv_cyclic_const_refused },
     { "myv: an UNTRUSTED image's out-of-range field index is caught (#137)",
       myv_untrusted_field_index },
     { "myv: a WRONG-TYPED base does not take the process down (#142)",
