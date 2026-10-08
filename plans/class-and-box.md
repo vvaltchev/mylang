@@ -201,14 +201,28 @@ As designed above, with these decisions:
 - **A class (or struct) may name itself in a field's annotation**:
   `class Tree { array<Tree> kids; }`. Without it the canonical tree did not
   parse ("'Tree' is not a type").
-- **Not built: the hint at a constructor or call argument.** `Tree(v, [],
-  p)` builds its `[]` general - only a declaration's or an assignment's
-  destination type stamps a hint, for every flat kind. Correct either way;
-  extending the hint to typed fields and parameters is a separate
-  (performance) change for all flat kinds.
+- **The hint at a constructor or call argument: built after step 2**, as
+  part of the #46 literal rule (a literal takes the storage of the
+  declared type it lands in, at every level): `Tree(v, [], p)` builds its
+  `[]` flat class storage, and `f([])` for an `array<int>` parameter flat
+  ints.
 - `-nti` has no types, so a type-driven `array<C>` is general there (a
   literal of instances is still flat): the functional test prints those
   storages instead of asserting them, the `-rt` `class:` cases assert.
+
+Watched failing (a sabotage harness, each case rebuilt and checked, the
+source restored by a plain copy and rebuilt, then a control run that must
+pass): the class `struct_own` arm, the chain store's class holder, the
+member-store class arm, `ovec_type`'s destructor, `promote_objs_to_general`,
+value-driven mode 6, the `flat_c` literal arm, the self-named field type,
+`arr_push_value`'s objs case, `flat_store_core`'s objs arm, the `.myv`
+writer's objs records, the `flat_c` hint, and the const-clone /
+mutable-clone objs arms - each fails the functional test, `-rt`'s
+`class:` cases or the image round trip, and each control passes. One is
+unobservable by construction: `ovec_type::set` retains the new element
+before releasing the old (a self-store `a[i] = a[i]` would otherwise free
+it), and its one caller (`flat_store_core`) holds the value it stores, so
+the order never matters today; it stays, as the type's own invariant.
 
 Bugs found and fixed on the way, each its own commit: `+=` on a flat array
 built a fresh array whenever the left side was not general (a flat string
