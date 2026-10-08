@@ -16730,6 +16730,30 @@ static const std::vector<test> tests =
       { "class C { int v; }",
         "const K = [C(1)]; var k = K; k[0].v = 2;" },
       &typeid(CannotChangeConstEx) },
+    /* the per-frame pure-call cache keys a call by its argument VALUES:
+     * one compared by identity (a class instance, a box) stays equal to
+     * itself while its fields change - such a function is not cached
+     * (FuncDeclStmt::args_cache_safe; it returned 8 twice) */
+    { "pure cache: an argument compared by identity is never a stale key",
+      { "class C { int v; }",
+        "func g(c, n) { if (n < 2) return c.v;",
+        "               return g(c, n - 1) + g(c, n - 2); }",
+        "func h(c, k) { var x = g(c, k); c.v = 100; var y = g(c, k);",
+        "               return [x, y]; }",
+        "var r = h(C(1), int(runtime(5)));",
+        "assert(r[0] == 8 && r[1] == 800);",
+        "func gb(b, n) { if (n < 2) return *b;",
+        "                return gb(b, n - 1) + gb(b, n - 2); }",
+        "func hb(b, k) { var x = gb(b, k); *b = 100; var y = gb(b, k);",
+        "                return [x, y]; }",
+        "var s = hb(box(1), int(runtime(5)));",
+        "assert(s[0] == 8 && s[1] == 800);",
+        "func ga(a, n) { if (n < 2) return a[0];",       /* still cached: */
+        "                return ga(a, n - 1) + ga(a, n - 2); }",  /* COW */
+        "func ha(a, k) { var x = ga(a, k); a[0] = 100; var y = ga(a, k);",
+        "                return [x, y]; }",
+        "var t = ha([1], int(runtime(5)));",
+        "assert(t[0] == 8 && t[1] == 800);" } },
     /* ---- box() and unary * (README "Boxes", plans/class-and-box.md) */
     { "box: a copy shares the box; * reads and writes it; == is identity",
       { "var b = box(int(runtime(5))); var c = b; *c = 7;",
@@ -52044,10 +52068,12 @@ static bool jit_op_nativized()
         /* M5 inc 3 (LEAN SYNC ENTER): CachedCallV - the recursion-unroll's
          * frontier calls run sync from the caller's fragment; the cache
          * probe (hit AND miss + record-riding key store) both exercise. */
+        /* (an int argument: a `dyn` parameter is no cache key -
+         * FuncDeclStmt::args_cache_safe) */
         { OpCode::CachedCallV, {
             "func fib(n) => n < 2 ? n : fib(n-1) + fib(n-2);",
             "var s = 0;",
-            "for (var i = 0; i < 3; i++) s += fib(runtime(15));",
+            "for (var i = 0; i < 3; i++) s += fib(int(runtime(15)));",
             "assert(s == 1830);" } },
         /* CachedCallV's throw path: the callee raises deep in the sync
          * NEST (each level a helper+dispatch), the walk stops at each sync
@@ -52058,7 +52084,7 @@ static bool jit_op_nativized()
             "func t(n) => n < 2 ? n / (n - n) : t(n-1) + t(n-2);",
             "var c = 0;",
             "for (var i = 0; i < 3; i++) {",
-            "  try { c += t(runtime(5)); }",
+            "  try { c += t(int(runtime(5))); }",
             "  catch (DivisionByZeroEx) { c += 1; }",
             "}",
             "assert(c == 3);" } },

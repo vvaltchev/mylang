@@ -6263,7 +6263,11 @@ private:
                 return;
             if (!rec_orig.count(f))
                 rec_orig[f] = f->body->clone();
-            f->desc->cache_results = true;
+            /* a cached result is keyed by the argument VALUES: an argument
+             * compared by identity (a class instance, a box) may change
+             * between two calls and still match (args_cache_safe) */
+            if (f->args_cache_safe)
+                f->desc->cache_results = true;
         }
 
         /*

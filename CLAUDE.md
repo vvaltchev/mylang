@@ -4194,7 +4194,14 @@ inliner sets `FuncDeclStmt::cache_results`, the devirt pass turns a call to such
 a func into a **`CachedCallExpr`** (a `DirectCallExpr` subclass — a SEPARATE node
 so the plain `DirectCallExpr` path pays NO per-call cache check), and
 `cached_call` (eval.cpp) checks the caller `Frame`'s lazily-allocated `PureCache`
-(`{func, arg values}` → result): hit → reuse, miss → call + store. **Sound**:
+(`{func, arg values}` → result): hit → reuse, miss → call + store. **Only for
+a function whose every parameter is a cache-safe key type**
+(`FuncDeclStmt::args_cache_safe`, stamped by the inferencer): the key holds
+the argument VALUES, compared with `==` - copy-on-write detaches an array /
+dict / struct key from a later write through the caller's name, but a class
+instance or a box compares by IDENTITY and stays equal to itself while its
+fields change, so a cached result went stale (2026-10-08: `g(c, 5)` returned
+8 before and after `c.v = 100`; `-npc` said 800). **Sound**:
 lazy (only calls actually made are cached → never evaluates a call the program
 wouldn't, so a recursion whose base case misses negatives — `fact(-1)` — can't
 diverge), and frame-scoped (the cache dies with the frame → not global

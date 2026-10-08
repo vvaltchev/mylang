@@ -448,6 +448,8 @@ private:
     StaticTypeRef declared_type_of(Construct *e);
     /* a member-access base's type, a box<P> seen as the P it holds */
     StaticTypeRef member_base(StaticTypeRef t);
+    /* can a value of this type key the pure-call cache? */
+    bool cache_key_safe(StaticTypeRef t, int depth = 0);
     /* the fix a misused box names ("read its value with *b") */
     std::string box_use_hint(StaticTypeRef t, const Construct *e);
     void check_deref(DerefExpr *d);
@@ -3047,8 +3049,16 @@ void Inferencer::annotate_hints(Construct *n)
     if (ctag(n) == ConstructType::func_decl) {
         /* a ReturnStmt below reads its function's return type */
         FuncInfo *prev = hint_func;
-        auto it = func_of_decl.find(static_cast<FuncDeclStmt *>(n));
+        auto *fd = static_cast<FuncDeclStmt *>(n);
+        auto it = func_of_decl.find(fd);
         hint_func = it != func_of_decl.end() ? it->second : nullptr;
+        /* may a call's arguments key the pure-call cache? (see the field) */
+        bool safe = hint_func && !hint_func->is_template;
+        if (safe)
+            for (TypeSym *p : hint_func->params)
+                if (!p || !cache_key_safe(p->type))
+                    safe = false;
+        fd->args_cache_safe = safe;
         for_each_child(n, [&](Construct *c) { annotate_hints(c); });
         hint_func = prev;
         return;
@@ -5852,6 +5862,45 @@ StaticTypeRef Inferencer::declared_type_of(Construct *e)
     }
     default:
         return nullptr;
+    }
+}
+
+/*
+ * Can a value of static type `t` be a per-frame pure-call cache KEY? The
+ * cache compares argument VALUES with ==, and keeps the key alive: a value
+ * compared by value is protected by copy-on-write - a later write through
+ * the caller's name detaches it from the key - but one compared by
+ * IDENTITY (a class instance, a box, a function) stays equal to itself
+ * while its fields change, so a cached result would be stale
+ * (FuncDeclStmt::args_cache_safe). Unknown and `dyn` are not safe.
+ */
+bool Inferencer::cache_key_safe(StaticTypeRef t, int depth)
+{
+    t = static_type_resolve(t);
+    if (!t || depth > 16)
+        return false;
+    switch (t->kind) {
+    case StaticTypeKind::None: case StaticTypeKind::Bool:
+    case StaticTypeKind::Int: case StaticTypeKind::Float:
+    case StaticTypeKind::Str:
+        return true;
+    case StaticTypeKind::Array:
+        return cache_key_safe(t->elem, depth + 1);
+    case StaticTypeKind::Dict:
+        return cache_key_safe(t->key, depth + 1)
+            && cache_key_safe(t->val, depth + 1);
+    case StaticTypeKind::Struct: {
+        const auto *d = static_cast<const StructTypeDef *>(t->struct_def);
+        if (!d || d->is_class)
+            return false;
+        for (const FieldDef &f : d->fields)
+            if (f.kind == FieldKind::f_dyn
+                    || !cache_key_safe(field_static_type(f), depth + 1))
+                return false;
+        return true;
+    }
+    default:
+        return false;
     }
 }
 
