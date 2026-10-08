@@ -224,6 +224,41 @@ semantics (README, *Values that contain themselves*):
   What it needs is an element store: `append` is a run-time builtin and is
   undefined inside a pure function at compile time.
 
+### What it costs (callgrind Ir, OPT=1 ASSERTS=0, -npc, 2026-10-08)
+
+Per scale unit (the scale-3 run minus the scale-1 run, halved, so the
+compile is excluded), the parent commit against this one. No bench in
+bench/my compares, hashes or prints general containers, so p1-p5 are
+probes written for this (each repeats one operation 20,000 times per
+unit); the bench rows are controls.
+
+| program                                     | parent  | this    | delta  |
+|---------------------------------------------|---------|---------|--------|
+| p1: == of nested arrays/dicts/structs       | 656.9M  | 820.4M  | +24.9% |
+| p2: hash + dict lookup by array keys        | 120.4M  | 138.4M  | +14.9% |
+| p3: str() of a nested value                 | 221.8M  | 234.8M  | +5.9%  |
+| p4: == of two arrays SHARING a sub-array    | 59.9M   | 1820.1M | x30.4  |
+| p5: p4 with the sub-array not shared        | 6740.2M | 8185.7M | +21.4% |
+| bench 24_dict_lookup (int keys)             | 228.0M  | 235.0M  | +3.1%  |
+| bench 62_dict_word_count (str keys)         | 1139.8M | 1141.8M | +0.2%  |
+| bench 68_nested                             | 603.3M  | 607.1M  | +0.6%  |
+
+- The walk's own bookkeeping (a key, the back-edge scan, a push and a
+  pop per container pair) is the +15-25% on p1/p2/p5. A flat array, a
+  scalar and a string pay nothing.
+- p4 is the identity fast path under a non-identity pair: the parent
+  skipped the shared 401-container sub-array in O(1); now it must first
+  show that no cycle is reachable from it - 91k Ir per comparison where
+  the parent spent 3k, but a quarter of what comparing the same data
+  UNshared costs (p5). Exactness forces it: without the search
+  `clone(a) == a` for a ring, which the shape rule says is false. The
+  search was 261k Ir before it recorded only shared containers and
+  skipped scalar children.
+- 24_dict_lookup's +7 Ir per lookup is an LTO inlining shift in code
+  this change does not touch: `dict_present_value` is no longer inlined
+  into `jit_dict_load_int`, and `EvalValue::operator==` now is into the
+  hash table's `find`.
+
 ### Watched failing (2026-10-08)
 
 Each guard was removed alone on the debug ASan build (the work
@@ -255,6 +290,9 @@ modes), and `driver_checks` for the writer.
 | .myv writer: refusal                      | -rt (extra check), driver    |
 | keep-until-exit: nothing kept             | functional x2, -rt (LSan)    |
 | bake: shallow clone() of a cyclic value   | functional x2, -rt (values)  |
+
+The array back edge, depth rule and identity rows were run again after
+the cost changes above, with the same result.
 
 (1) `pretty` calls `to_string_repr` first, which answers `[...]` from the
 same render stack. (2) A struct is a value, so a cycle through a boxed
