@@ -1,0 +1,45 @@
+# A store into an element of a slice makes the slice standalone first -
+# a slice is an independent copy of its window, so the array it was taken
+# from never sees the write. Two ways that went wrong until 2026-10-08:
+#   - a compound int store (`s[0] += 1`) into a GENERAL array's slice
+#     changed the array too, in the VM and the JIT (the tree-walker was
+#     right) - the int fast path skipped the detach;
+#   - when the slice was its storage's ONLY owner (the array it came from
+#     died), the detach freed the element being stored through, and the
+#     store went on reading it (a use-after-free in every engine).
+
+# general (boxed) arrays: dynarray() keeps them general
+var a = dynarray([1, 2, 3]);
+var s = a[0:2];
+for (var i = 0; i < 20; i++) { s[i % 2] += 1; }
+assert(a[0] == 1 && a[1] == 2 && s[0] == 11 && s[1] == 12);
+
+var b = dynarray([1, 2, 3]);
+var t = b[0:2];
+for (var i = 0; i < 20; i++) { t[i % 2] = t[i % 2] + 1; }
+assert(b[0] == 1 && b[1] == 2 && t[0] == 11 && t[1] == 12);
+
+var c = dynarray([1, 2, 3]);
+var u = c[1:3];
+u[0] *= 5;
+u[1] -= 1;
+assert(c[1] == 2 && c[2] == 3 && u[0] == 10 && u[1] == 2);
+
+# a slice that outlives the array it was taken from
+func mk() { var big = [[1], [2], [3], [4]]; return big[0:2]; }
+var total = 0;
+for (var k = 0; k < 10; k++) {
+    var v = mk();
+    v[k % 2] = [k];
+    v[1 - k % 2][0] += 1;
+    total += v[0][0] + v[1][0];
+}
+assert(total == 70);
+
+func mk2() { var big = dynarray([10, 20, 30]); return big[1:3]; }
+var w = mk2();
+w[0] += 1;
+w[1] = w[1] * 2;
+assert(w[0] == 21 && w[1] == 60);
+
+print(s, t, u, total, w);

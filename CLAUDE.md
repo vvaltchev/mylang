@@ -6277,7 +6277,7 @@ are unchanged.
   path and freed the memory, so the stale registration became a genuine
   use-after-free — UBSan-caught during an array COW). Writing through an
   array-element `LValue`
-  (`LValue::get_value_for_put` in `eval.cpp`)
+  (`LValue::write_target` in `eval.cpp`)
   triggers COW: if the container is a slice, or is aliased (`use_count > 1` /
   has live slices), it is
   cloned first so the write doesn't bleed across logically-distinct arrays.
@@ -6423,7 +6423,7 @@ are unchanged.
   `append` **maintains** it in O(1) (`arr_append_maintain_hash` — an append is
   one more `hash_combine` step), and every other mutation **invalidates** it
   (`invalidate_hash` at `pop`/`insert`/`erase`/`sort`/`reverse`/`+=`, the flat
-  element store, and `get_value_for_put`). Caching is restricted to a non-slice
+  element store, and `LValue::write_target`). Caching is restricted to a non-slice
   **int/float/bool** array (`hash_cacheable`): its elements are scalars, so the
   only way to change its hash is a mutation OF that array, all of which are
   instrumented. A **general/struct** array is *not* cached — a nested mutation

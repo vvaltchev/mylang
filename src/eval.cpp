@@ -3546,33 +3546,42 @@ as_resolved_capture(const Construct *lvalue)
 static inline EvalValue
 slot_rmw(LValue &lv, Op op, const EvalValue &rval)
 {
+    /*
+     * An ARRAY ELEMENT's write goes through put(), which detaches the array
+     * first (LValue::write_target) - and may leave `lv` stale, or freed,
+     * since a slice's element then lives in new storage. So the result is
+     * never read back from `lv` after a put, and the in-place int fast
+     * path is for a slot that is not an element: on a slice's element it
+     * skipped the detach, so `s[0] += 1` changed the array `s` was sliced
+     * from (the VM and the JIT, until 2026-10-08; the tree-walker's
+     * doAssign put the value).
+     */
     if (op == Op::assign) {
 
-        lv.put(RValue(rval));
-
-    } else {
-
-        const EvalValue r = RValue(rval);
-
-        if (lv.is<int_type>() && r.is<int_type>() &&
-            (op == Op::addeq || op == Op::subeq || op == Op::muleq)) {
-
-            int_type &v = lv.getval<int_type>();
-            const int_type n = r.get<int_type>();
-
-            if (op == Op::addeq)      v += n;
-            else if (op == Op::subeq) v -= n;
-            else                      v *= n;
-
-        } else {
-
-            EvalValue nv = lv.get();
-            apply_compound_op(nv, r, op);
-            lv.put(std::move(nv));
-        }
+        EvalValue v = RValue(rval);
+        lv.put(v);
+        return v;
     }
 
-    return lv.get();
+    const EvalValue r = RValue(rval);
+
+    if (!lv.container && lv.is<int_type>() && r.is<int_type>() &&
+        (op == Op::addeq || op == Op::subeq || op == Op::muleq)) {
+
+        int_type &v = lv.getval<int_type>();
+        const int_type n = r.get<int_type>();
+
+        if (op == Op::addeq)      v += n;
+        else if (op == Op::subeq) v -= n;
+        else                      v *= n;
+
+        return lv.get();
+    }
+
+    EvalValue nv = lv.get();
+    apply_compound_op(nv, r, op);
+    lv.put(nv);
+    return nv;
 }
 
 /*
@@ -3775,7 +3784,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
     }
 
     /*
-     * COW, matching the general element-write semantics (get_value_for_put):
+     * COW, matching the general element write (LValue::write_target):
      * a slice clones itself; a non-slice that is aliased clones any live slices
      * so they don't observe the write, but writes in place otherwise (plain
      * handle aliases share the mutation - MyLang assignment aliases).
@@ -5619,9 +5628,9 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
 
     EvalValue nv = old;
     apply_compound_op(nv, one, cop);
-    lv->put(std::move(nv));
+    lv->put(nv);
 
-    return is_prefix ? lv->get() : old;
+    return is_prefix ? nv : old;
 }
 
 EvalValue IfStmt::do_eval(EvalContext *ctx, bool rec) const
@@ -6242,39 +6251,54 @@ LValue LValue::clone()
     return nl;
 }
 
-EvalValue &LValue::get_value_for_put()
+LValue *LValue::write_target()
 {
     if (!container)
-        return val;
+        return this;
 
-    assert(container->is<SharedArrayObj>());
+    LValue *const cont = container;
+    assert(cont->is<SharedArrayObj>());
 
-    if (container->valtype()->is_slice(container->val)) {
-        const size_type off = container->getval<SharedArrayObj>().offset();
-        *container = container->clone();
-        container_idx -= off;
-        return container->getval<SharedArrayObj>().get_vec()[container_idx].val;
+    if (cont->valtype()->is_slice(cont->val)) {
+        /*
+         * `this` lives in the slice's storage, and making the slice
+         * standalone RELEASES that storage - FREES it, when the slice was
+         * its only owner (a slice returned from a function whose array
+         * died with it). So everything is read from `this` first, and
+         * nothing after: until 2026-10-08 the index was adjusted on
+         * `this` and the type check read `this->val`, both after the free
+         * (an ASan heap-use-after-free in both engines).
+         */
+        const size_type idx =
+            container_idx - cont->getval<SharedArrayObj>().offset();
+        *cont = cont->clone();
+        LValue *el = &cont->getval<SharedArrayObj>().get_vec()[idx];
+        el->container = cont;
+        el->container_idx = idx;
+        return el;
     }
 
-    if (container->valtype()->use_count(container->val) > 1)
-        container->getval<SharedArrayObj>().clone_aliased_slices(container_idx);
+    if (cont->valtype()->use_count(cont->val) > 1)
+        cont->getval<SharedArrayObj>().clone_aliased_slices(container_idx);
 
     /* an in-place element write changes the array's hash (the slice path above
      * returns a fresh clone, which is already hash-invalid). */
-    container->getval<SharedArrayObj>().invalidate_hash();
-    return val;
+    cont->getval<SharedArrayObj>().invalidate_hash();
+    return this;
 }
 
 void LValue::put_slow(const EvalValue &v)
 {
-    get_value_for_put() = v;
-    type_checks();
+    LValue *t = write_target();    /* `this` may be freed (write_target) */
+    t->val = v;
+    t->type_checks();
 }
 
 void LValue::put_slow(EvalValue &&v)
 {
-    get_value_for_put() = std::move(v);
-    type_checks();
+    LValue *t = write_target();
+    t->val = std::move(v);
+    t->type_checks();
 }
 
 /*
