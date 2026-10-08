@@ -143,6 +143,7 @@ struct TypeSym {
      * rather than these. Set during the structural pass. */
     bool in_template = false;
     Loc decl_loc;
+    Loc decl_end;              /* its name's end (an error's caret span) */
     FuncInfo *func = nullptr;  /* non-null when this name is a function */
     /* non-null when this name is a struct TYPE (a `struct` decl): the symbol is
      * a type descriptor, callable (construction) + `.CONST`-accessible. */
@@ -384,7 +385,8 @@ private:
 
     /* helpers */
     Scope *new_scope(Scope *parent);
-    TypeSym *new_sym(const UniqueId *name, Scope *s, Loc loc);
+    TypeSym *new_sym(const UniqueId *name, Scope *s, Loc loc,
+                     Loc end = Loc());
     static TypeSym *lookup(Scope *s, const UniqueId *name);
     static bool resolves_to_capture(Scope *s, const UniqueId *name);
     FuncInfo *callee_funcinfo(Construct *e);   /* named func or inline lambda */
@@ -623,7 +625,8 @@ Scope *Inferencer::new_scope(Scope *parent)
     return s;
 }
 
-TypeSym *Inferencer::new_sym(const UniqueId *name, Scope *s, Loc loc)
+TypeSym *Inferencer::new_sym(const UniqueId *name, Scope *s, Loc loc,
+                             Loc end)
 {
     /*
      * `_` is RESERVED as the destructuring / foreach placeholder - it may only
@@ -645,6 +648,7 @@ TypeSym *Inferencer::new_sym(const UniqueId *name, Scope *s, Loc loc)
     sym->type = bottom;
     sym->acc = bottom;
     sym->decl_loc = loc;
+    sym->decl_end = end ? end : loc;
     sym->in_template = struct_tmpl_depth > 0;
     s->syms[name] = sym;
     return sym;
@@ -2658,7 +2662,7 @@ void Inferencer::enforce_decl_types()
                          (s->ann == DeclType::arr ? "array" : "dict") +
                          "' but has type '" + static_type_to_string(s->type) +
                              "'",
-                     s->decl_loc, s->decl_loc);
+                     s->decl_loc, s->decl_end);
     }
 }
 
@@ -2694,7 +2698,7 @@ void Inferencer::enforce_concrete_decls()
                 "'; declare it 'dyn' (e.g. '" +
                 (s->const_decl ? "const dyn " : "var dyn ") +
                 std::string(s->name->val) + " = ...')"),
-            s->decl_loc, s->decl_loc);
+            s->decl_loc, s->decl_end);
     }
 }
 
@@ -2725,7 +2729,7 @@ void Inferencer::enforce_nonnull_params()
                 "parameter '" + std::string(s->name->val) +
                 "' may be none; declare it '" + kw + "' (e.g. '" + kw + " " +
                 std::string(s->name->val) + "')"),
-            s->decl_loc, s->decl_loc);
+            s->decl_loc, s->decl_end);
     }
 }
 
@@ -3581,7 +3585,8 @@ void Inferencer::declare_structdecl(StructDeclStmt *sd, Scope *s)
         const UniqueId *nm = sd->id->uid;
         auto it = s->syms.find(nm);
         TypeSym *sym = (it != s->syms.end()) ? it->second
-                                             : new_sym(nm, s, sd->start);
+                                             : new_sym(nm, s, sd->start,
+                                                       sd->id->end);
         sym->struct_type = def;
         sym->type = A.dyn_ty();
         id_sym[sd->id.get()] = sym;
@@ -3688,7 +3693,8 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
         const UniqueId *nm = fd->id->uid;
         TypeSym *sym;
         auto it = s->syms.find(nm);
-        sym = (it != s->syms.end()) ? it->second : new_sym(nm, s, fd->start);
+        sym = (it != s->syms.end()) ? it->second
+                                    : new_sym(nm, s, fd->start, fd->id->end);
         sym->func = fi;
         sym->named_func = true;
         id_sym[fd->id.get()] = sym;
@@ -3701,7 +3707,8 @@ void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
         const UniqueId *nm = id->uid;
         auto it = s->syms.find(nm);
         TypeSym *sym = (it != s->syms.end()) ? it->second
-                                             : new_sym(nm, s, id->start);
+                                             : new_sym(nm, s, id->start,
+                                                       id->end);
         sym->opt_decl = sym->opt_decl || id->opt_mod;
         sym->dyn_decl = sym->dyn_decl || id->dyn_mod;
         sym->const_decl = sym->const_decl || is_const;
@@ -3795,7 +3802,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
 
         if (fd->params)
             for (auto &p : fd->params->elems) {
-                TypeSym *psym = new_sym(p->uid, fscope, p->start);
+                TypeSym *psym = new_sym(p->uid, fscope, p->start, p->end);
                 psym->is_param = true;
                 psym->const_param = p->const_param;
                 psym->opt_decl = p->opt_mod;
@@ -3902,7 +3909,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
                             "visible here; write 'var " +
                             std::string(id->uid->val) + "' to shadow it"),
                         id->start, id->end);
-                TypeSym *sym = new_sym(id->uid, inner, id->start);
+                TypeSym *sym = new_sym(id->uid, inner, id->start, id->end);
                 sym->is_loopvar = true;   /* type derived from container */
                 id_sym[id.get()] = sym;
             }
@@ -3917,7 +3924,8 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
             Scope *inner = new_scope(s);
             if (cs.first.asId) {
                 TypeSym *sym = new_sym(cs.first.asId->uid, inner,
-                                       cs.first.asId->start);
+                                       cs.first.asId->start,
+                                       cs.first.asId->end);
                 sym->type = A.exc_ty();
                 sym->dyn_decl = true;   /* exception payload is dynamic */
                 id_sym[cs.first.asId.get()] = sym;
