@@ -1145,8 +1145,9 @@ print([a, a]);              # [[1, [...]], [1, [...]]]
 
   * **Printing** (`print`, `str`, the REPL's `=>` echo): a container that is
     already being printed further up is written `[...]`, `{...}` or, for a
-    struct, `Name(...)`. A container that appears twice without being inside
-    itself is printed in full both times, as `[a, a]` shows.
+    struct, `Name(...)`. A container that appears at two places side by
+    side, neither inside the other, is printed in full at each, as `[a, a]`
+    shows.
 
   * **`==` and `!=` compare by shape.** Two values are equal when walking
     them side by side meets equal scalars in the same places, and every step
@@ -1161,12 +1162,12 @@ print([a, a]);              # [[1, [...]], [1, [...]]]
   * **`hash`** agrees with `==` on these values - equal values hash equal -
     so a value that contains itself can be a dict key. The key is frozen as
     usual, cycle included: the frozen copy contains itself, not the
-    original. A value that does not contain itself hashes exactly as before.
+    original.
 
   * **`deepclone`** copies the cycle: the copy of `a` contains the copy, not
-    `a`. A container that appears twice without being on a cycle is still
-    copied twice, as `deepclone` always did. The read-only snapshot a
-    constant or a dict key takes works the same way.
+    `a`. A container that appears at two places without being on a cycle
+    is copied at each place - `deepclone` does not preserve sharing. The
+    read-only snapshot a constant or a dict key takes works the same way.
 
   * **Ordering** (`<`, `sort`, `min`, `max`) is not defined on arrays, dicts
     or structs at all (`TypeErrorEx`), so it never walks one.
