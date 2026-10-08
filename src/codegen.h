@@ -272,6 +272,27 @@ void jit_next_use(const Chunk &chunk, size_t begin, size_t end,
                   int base, int count, std::vector<int> &dist);
 
 /*
+ * #34: THE SAME HEURISTIC, ASKED ONE (pc, slot) AT A TIME. jit_next_use
+ * fills a (run length x slot count) matrix - quadratic in a long run's
+ * size, and the linear scan reads one entry of it per piece. This keeps
+ * each slot's use pcs (and the pcs of the ops the table does not know,
+ * which use every slot) and answers by binary search. `at` equals the
+ * matrix entry for every pc in [begin, end) and covered slot, and is
+ * JIT_NO_NEXT_USE outside them. The `-rt` check compares the two.
+ */
+class NextUse {
+public:
+    void build(const Chunk &chunk, size_t begin, size_t end, int base,
+               int count);
+    int at(size_t pc, int slot) const;
+private:
+    size_t begin_ = 0, end_ = 0;
+    int base_ = 0, count_ = 0;
+    std::vector<std::vector<uint32_t>> uses_;   /* per slot, sorted */
+    std::vector<uint32_t> barriers_;            /* sorted */
+};
+
+/*
  * C4d (plans/archived/typed-invariant-arrays.md): the per-pc STRUCT-IDENTITY facts
  * a PLANNED StructCtorV establishes, so a baked member read on the same
  * slot can skip the type-tag + def-identity guards it would otherwise

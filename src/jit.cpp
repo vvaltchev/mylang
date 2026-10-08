@@ -46,6 +46,7 @@
 #include "vm.h"         /* the callback-entry counters, for MYLANG_JITSTATS */
 
 #include <algorithm>
+#include <limits>
 #include <unordered_map>
 #include <map>
 #include <set>
@@ -4895,6 +4896,18 @@ struct Emitter {
     struct ExitSite { size_t at; size_t state; int sp; };
     std::vector<ExitSite> exits;
     std::vector<CacheState> exit_states;
+    /* #34: exit_states keyed by the fields the dedup compares - the
+     * lookup was a walk of every state per exit, and trans mode makes a
+     * new state at every register transition, so it was (exits x
+     * states). Cleared with exit_states, always together
+     * (clear_exit_states). */
+    std::map<std::vector<int64_t>, size_t> exit_state_ix;
+    void clear_exit_states()
+    {
+        exits.clear();
+        exit_states.clear();
+        exit_state_ix.clear();
+    }
 
     /* find-or-add the CURRENT state; returns its index in exit_states */
     size_t intern_exit_state()
@@ -4929,12 +4942,43 @@ struct Emitter {
                     return false;
             return true;
         };
-        for (size_t i = 0; i < exit_states.size(); i++)
-            if (same_c(exit_states[i].cache, cache)
-                    && same_c(exit_states[i].fcache, fcache)
-                    && same_t(exit_states[i].tflush, tflush)
-                    && same_s(exit_states[i].scache, scache))
-                return i;
+        (void)same_c;
+        (void)same_t;
+        (void)same_s;
+        /* the key: exactly the fields the three comparisons above read,
+         * each vector length-prefixed so no two states share a key */
+        std::vector<int64_t> key;
+        key.reserve(4 + 4 * (cache.size() + fcache.size() + scache.size())
+                    + 3 * tflush.size());
+        for (const std::vector<CacheEnt> *v : { &cache, &fcache }) {
+            key.push_back(static_cast<int64_t>(v->size()));
+            for (const CacheEnt &c : *v) {
+                key.push_back(c.slot);
+                key.push_back(c.payload);
+                key.push_back(c.type);
+                key.push_back(c.reg);
+            }
+        }
+        key.push_back(static_cast<int64_t>(tflush.size()));
+        for (const TypedEnt &t : tflush) {
+            key.push_back(t.slot);
+            key.push_back(t.type);
+            key.push_back(t.flt);
+        }
+        key.push_back(static_cast<int64_t>(scache.size()));
+        for (const SpillEnt &c : scache) {
+            key.push_back(c.slot);
+            key.push_back(c.payload);
+            key.push_back(c.type);
+            key.push_back(c.k);
+        }
+        ML_CHECK_MSG(exit_state_ix.size() == exit_states.size(),
+                     "exit_states was changed without its index - use "
+                     "clear_exit_states");
+        const auto it = exit_state_ix.find(key);
+        if (it != exit_state_ix.end())
+            return it->second;
+        exit_state_ix.emplace(std::move(key), exit_states.size());
         /* `ra` rides along for the aggregate but is deliberately NOT
          * part of the comparison above: an exit state describes what
          * must be WRITTEN BACK, which is the pin vectors. Two exits
@@ -5032,24 +5076,29 @@ struct Emitter {
                 if (exit_states[i].is_empty() == (pass == 1))
                     order.push_back(i);
 
+        /* the exits of each state, in emission order (#34: a walk of
+         * every exit per state was (states x exits)) */
+        std::vector<std::vector<size_t>> of_state(exit_states.size());
+        for (size_t xi = 0; xi < exits.size(); xi++)
+            of_state[exits[xi].state].push_back(xi);
         for (const size_t st : order) {
             bool used = false;
             int sp = 0;
-            for (const ExitSite &x : exits)
-                if (x.state == st) {
-                    /* ⛔ An epilogue is emitted ONCE and reached from
-                     * every exit that shares its cache state, so those
-                     * exits must agree about the stack: the flush, the
-                     * pre_ret release scan and the relay store all run
-                     * at whatever depth the jump arrived with, and the
-                     * scan makes CALLS. (frag_ret itself is depth-
-                     * agnostic - its lea is rbp-relative - which is
-                     * exactly why this needs saying out loud.) */
-                    ML_CHECK_MSG(!used || sp == x.sp,
-                                 "two pc-exits reach ONE epilogue at "
-                                 "different stack depths");
-                    sp = x.sp; used = true;
-                }
+            for (const size_t xi : of_state[st]) {
+                const ExitSite &x = exits[xi];
+                /* ⛔ An epilogue is emitted ONCE and reached from
+                 * every exit that shares its cache state, so those
+                 * exits must agree about the stack: the flush, the
+                 * pre_ret release scan and the relay store all run
+                 * at whatever depth the jump arrived with, and the
+                 * scan makes CALLS. (frag_ret itself is depth-
+                 * agnostic - its lea is rbp-relative - which is
+                 * exactly why this needs saying out loud.) */
+                ML_CHECK_MSG(!used || sp == x.sp,
+                             "two pc-exits reach ONE epilogue at "
+                             "different stack depths");
+                sp = x.sp; used = true;
+            }
             if (!used)
                 continue;
             sp_adopt({ sp, ((8 - sp) % 16 + 16) % 16, true });
@@ -5080,12 +5129,11 @@ struct Emitter {
             relay_store();
             frag_ret(RetFlush::epilogue);
             pub_offpath--;
-            for (const ExitSite &x : exits)
-                if (x.state == st)
-                    patch32(x.at, static_cast<uint32_t>(at - (x.at + 4)));
+            for (const size_t xi : of_state[st])
+                patch32(exits[xi].at,
+                        static_cast<uint32_t>(at - (exits[xi].at + 4)));
         }
-        exits.clear();
-        exit_states.clear();
+        clear_exit_states();
     }
 
     /* ---- N3 SSE float ---- */
@@ -15676,10 +15724,48 @@ static const uint8_t HOIST_RDATA = 10, HOIST_RCOUNT = 11;
 static const uint32_t HOIST_REGS_MASK =
     (1u << HOIST_RDATA) | (1u << HOIST_RCOUNT);
 
+/*
+ * #34: "does a branch from OUTSIDE [T, L] land inside it?" - asked once
+ * per loop region by the C1 hoist pick, the C5 release pick and the
+ * preheader test, each time by walking EVERY branch of the run:
+ * (regions x run length), quadratic in a long run. Per target pc this
+ * keeps the lowest and highest branch source aiming at it, so the
+ * question walks the region instead.
+ */
+struct BranchInto {
+    size_t begin = 0, end = 0;
+    std::vector<long> lo, hi;            /* per target pc in [begin, end) */
+    BranchInto(const Chunk &ck, size_t b, size_t e)
+        : begin(b), end(e), lo(e - b, std::numeric_limits<long>::max()),
+          hi(e - b, -1)
+    {
+        for (size_t p = b; p < e; p++) {
+            const Instr &in = ck.code[p];
+            if (!op_is_branch(in.op) || in.target < static_cast<int>(b)
+                    || static_cast<size_t>(in.target) >= e)
+                continue;
+            const size_t t = static_cast<size_t>(in.target) - b;
+            lo[t] = std::min(lo[t], static_cast<long>(p));
+            hi[t] = std::max(hi[t], static_cast<long>(p));
+        }
+    }
+    /* T >= begin and L < end, as every region is */
+    bool from_outside(size_t T, size_t L) const
+    {
+        for (size_t t = T; t <= L; t++)
+            if (hi[t - begin] >= 0
+                    && (lo[t - begin] < static_cast<long>(T)
+                        || hi[t - begin] > static_cast<long>(L)))
+                return true;
+        return false;
+    }
+};
+
 static std::vector<HoistRegion>
 jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
                const std::vector<std::pair<size_t, size_t>> &entries)
 {
+    const BranchInto into(chunk, begin, end);
     static const bool dbg = getenv("MYLANG_HOISTDBG") != nullptr;
 
     std::vector<std::pair<size_t, size_t>> regions;   /* (T, L) */
@@ -15697,12 +15783,21 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
               });
 
     std::vector<HoistRegion> out;
+    /* #34: the accepted regions by head - they are pairwise disjoint (no
+     * overlap is ever admitted), so the one with the last head <= L has
+     * the last end too, and it alone decides whether [T, L] overlaps
+     * any (a walk of every accepted region per candidate before) */
+    std::map<size_t, size_t> taken;
+    const auto overlaps = [&](size_t T, size_t L) {
+        auto it = taken.upper_bound(L);
+        if (it == taken.begin())
+            return false;
+        --it;
+        return it->second >= T;
+    };
     for (const auto &rg : regions) {
         const size_t T = rg.first, L = rg.second;
-        bool ok = true;
-        for (const HoistRegion &acc : out)       /* no overlap/nesting */
-            if (T <= acc.L && acc.T <= L)
-                ok = false;
+        bool ok = !overlaps(T, L);               /* no overlap/nesting */
         for (size_t p = T; p <= L && ok; p++)
             if (!jit_hoist_op_ok(chunk.code[p])) {
                 if (dbg) fprintf(stderr,
@@ -15713,14 +15808,8 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
         if (!ok)
             continue;
         /* every jump INTO the region originates inside it */
-        for (size_t p = begin; p < end && ok; p++) {
-            const Instr &in = chunk.code[p];
-            if (op_is_branch(in.op)
-                    && in.target >= static_cast<int>(T)
-                    && in.target <= static_cast<int>(L)
-                    && (p < T || p > L))
-                ok = false;
-        }
+        if (ok && into.from_outside(T, L))
+            ok = false;
         for (const auto &pe : entries)
             if (pe.first >= T && pe.first <= L)
                 ok = false;
@@ -15833,6 +15922,7 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
                 best2_store = kv.second.store;
             }
         }
+        taken[T] = L;
         out.push_back({ T, L, best, best_kind, best_store,
                         best2, best2_kind, best2_store, best2_uses, {} });
         if (dbg) fprintf(stderr,
@@ -15860,10 +15950,7 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
             const size_t T = rg.first, L = rg.second;
             if (T <= begin)
                 continue;
-            bool ok = true;
-            for (const HoistRegion &acc : out)
-                if (T <= acc.L && acc.T <= L)
-                    ok = false;
+            bool ok = !overlaps(T, L);
             if (!ok)
                 continue;
             std::vector<int> defs, uses, tmp_d;
@@ -15878,14 +15965,8 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
                 }
                 defs.insert(defs.end(), tmp_d.begin(), tmp_d.end());
             }
-            for (size_t p = begin; p < end && ok; p++) {
-                const Instr &in = chunk.code[p];
-                if (op_is_branch(in.op)
-                        && in.target >= static_cast<int>(T)
-                        && in.target <= static_cast<int>(L)
-                        && (p < T || p > L))
-                    ok = false;
-            }
+            if (ok && into.from_outside(T, L))
+                ok = false;
             for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
                 for (const Chunk::HandlerClause &cl : hs.clauses)
                     if (cl.body_pc >= static_cast<int>(T)
@@ -15920,6 +16001,7 @@ jit_hoist_pick(const Chunk &chunk, size_t begin, size_t end,
             }
             if (dbg) fprintf(stderr, "hoist[%zu,%zu): GUARD region, "
                              "%zu guard(s)\n", T, L, hr.guards.size());
+            taken[T] = L;
             out.push_back(std::move(hr));
         }
     }
@@ -16716,6 +16798,67 @@ static bool jit_lin_point(const std::vector<std::pair<int, int>> &edges,
     }
     return true;
 }
+
+/*
+ * #34: jit_lin_point for EVERY pc of a run at once. The snap and the
+ * scan's lifetime holes ask it pc by pc while walking a gap, and each
+ * ask walked every branch edge of the run - quadratic in the run (a
+ * 400-loop `main` spent 2.5 G instructions in that one loop). An edge
+ * (a, b) crosses exactly the pcs in (min, max] - a difference array -
+ * except at its own TARGET when it comes from below (the exemption
+ * jit_lin_point makes), counted separately. `next(x)` / `prev(x)` are
+ * the nearest lin points at or after / before a pc, which turns the
+ * callers' gap walks into one lookup.
+ */
+struct LinMap {
+    size_t begin = 0, end = 0;           /* covers [begin, end] */
+    std::vector<char> lin;
+    std::vector<uint32_t> nxt;           /* first lin pc >= x, or end+1 */
+    std::vector<long> prv;               /* last lin pc <= x, or -1 */
+    const std::vector<std::pair<int, int>> *edges = nullptr;
+
+    void build(const std::vector<std::pair<int, int>> &ed, size_t b,
+               size_t e)
+    {
+        edges = &ed;
+        begin = b;
+        end = e;
+        const size_t n = e - b + 1;
+        std::vector<long> diff(n + 1, 0), ex(n, 0);
+        for (const auto &x : ed) {
+            const long lo = std::min(x.first, x.second) + 1L;
+            const long hi = std::max(x.first, x.second);
+            const long a = std::max(lo, static_cast<long>(b));
+            const long z = std::min(hi, static_cast<long>(e));
+            if (a <= z) {
+                diff[static_cast<size_t>(a) - b]++;
+                diff[static_cast<size_t>(z) - b + 1]--;
+            }
+            if (x.first < x.second && x.second >= static_cast<long>(b)
+                    && x.second <= static_cast<long>(e))
+                ex[static_cast<size_t>(x.second) - b]++;
+        }
+        lin.assign(n, 0);
+        long run = 0;
+        for (size_t i = 0; i < n; i++) {
+            run += diff[i];
+            lin[i] = run - ex[i] == 0;
+        }
+        nxt.assign(n + 1, static_cast<uint32_t>(e + 1));
+        for (size_t i = n; i-- > 0; )
+            nxt[i] = lin[i] ? static_cast<uint32_t>(b + i) : nxt[i + 1];
+        prv.assign(n, -1);
+        for (size_t i = 0; i < n; i++)
+            prv[i] = lin[i] ? static_cast<long>(b + i)
+                            : (i ? prv[i - 1] : -1);
+    }
+    bool at(int sp) const
+    {
+        if (sp >= static_cast<long>(begin) && sp <= static_cast<long>(end))
+            return lin[static_cast<size_t>(sp) - begin] != 0;
+        return jit_lin_point(*edges, sp);
+    }
+};
 
 struct ShareSeam {
     size_t pc;                 /* the linearization point (= to.lo) */
@@ -18463,6 +18606,48 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
     return true;
 }
 
+/*
+ * #34: THE C3 TYPE ELISION IS BOUNDED. An elided slot skips the type
+ * store on every WRITE and pays one at every EXIT and every barrier
+ * bracket instead (Emitter::flush_cache), so its cost is (elided slots
+ * x flush points) - and both grow with the run. Unbounded, a fuzzed
+ * `main` with 300 qualifying locals emitted 300 type stores at each of
+ * hundreds of flush points: 210 machine instructions per bytecode op,
+ * quadratic in the program, more stores executed than the elision ever
+ * saved. Like C5's MAX_RELEASED it keeps the slots that pay most - the
+ * most-used, ties to the lower slot - and a run under the bound is
+ * untouched (the corpus peaks at 25).
+ */
+static const size_t MAX_TYPE_ELIDED = 32;
+
+/* keep the `cap` entries of `v` with the highest `use` count (ties to
+ * the lower slot), in their original order */
+static void cap_by_use(std::vector<int> &v,
+                       const std::unordered_map<int, int> &use, size_t cap)
+{
+    if (v.size() <= cap)
+        return;
+    std::vector<std::pair<int, int>> rank;
+    for (const int s : v) {
+        const auto it = use.find(s);
+        rank.push_back({ it == use.end() ? 0 : it->second, s });
+    }
+    std::sort(rank.begin(), rank.end(),
+              [](const std::pair<int, int> &a,
+                 const std::pair<int, int> &b) {
+                  return a.first != b.first ? a.first > b.first
+                                            : a.second < b.second;
+              });
+    std::set<int> keep;
+    for (size_t i = 0; i < cap; i++)
+        keep.insert(rank[i].second);
+    std::vector<int> out;
+    for (const int s : v)
+        if (keep.count(s))
+            out.push_back(s);
+    v.swap(out);
+}
+
 static std::vector<int>
 pick_cached_slots(const Chunk &ck, size_t begin,
                   size_t end, int slot_count,
@@ -18722,6 +18907,7 @@ pick_cached_slots(const Chunk &ck, size_t begin,
                     && std::find(out.begin(), out.end(), kv.first)
                        == out.end())
                 typed_extra->push_back(kv.first);
+        cap_by_use(*typed_extra, use, MAX_TYPE_ELIDED);
     }
 
     /* C2a: the float pool's picks - local, undisqualified, >= 3 uses,
@@ -18750,6 +18936,11 @@ pick_cached_slots(const Chunk &ck, size_t begin,
                         && std::find(fhot->begin(), fhot->end(), kv.first)
                            == fhot->end())
                     typed_extra_f->push_back(kv.first);
+            /* the int side's share comes first (MAX_TYPE_ELIDED) */
+            cap_by_use(*typed_extra_f, use_f,
+                       MAX_TYPE_ELIDED
+                       - std::min(MAX_TYPE_ELIDED,
+                                  typed_extra ? typed_extra->size() : 0));
         }
         /* C4a-i: the READ-dispatch elision set - float-written,
          * undisqualified, not full-value-read; TEMPS INCLUDED (the
@@ -18819,6 +19010,14 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
     std::unordered_map<int, std::vector<size_t>> by_slot;
     for (size_t i = 0; i < iv.size(); i++)
         by_slot[iv[i].slot].push_back(i);
+#ifndef NDEBUG
+    for (const auto &kv : by_slot)
+        for (size_t k = 1; k < kv.second.size(); k++)
+            ML_CHECK_MSG(iv[kv.second[k - 1]].end
+                             <= iv[kv.second[k]].start,
+                         "jit_qualify_intervals: a slot's intervals are "
+                         "not disjoint and start-sorted");
+#endif
 
     struct Vis {
         std::vector<IntervalQual> &out;
@@ -18834,12 +19033,21 @@ bool jit_qualify_intervals(const Chunk &ck, size_t begin, size_t end,
             if (s < 0)
                 return nullptr;          /* "not a slot" - tolerated */
             const auto it = by_slot.find(s);
-            if (it != by_slot.end())
-                for (const size_t idx : it->second) {
-                    const LiveInterval &l = iv[idx];
+            if (it != by_slot.end()) {
+                /* #34: a slot's intervals are disjoint and in start
+                 * order (checked below), so the one with the last start
+                 * <= cur is the only candidate - a temp has thousands,
+                 * and this was a walk of all of them per event */
+                const std::vector<size_t> &v = it->second;
+                const auto u = std::upper_bound(
+                    v.begin(), v.end(), cur,
+                    [&](size_t c, size_t idx) { return c < iv[idx].start; });
+                if (u != v.begin()) {
+                    const LiveInterval &l = iv[*(u - 1)];
                     if (l.start <= cur && cur < l.end)
-                        return &out[idx];
+                        return &out[*(u - 1)];
                 }
+            }
             orphans++;
             return nullptr;
         }
@@ -18999,6 +19207,47 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
         return false;
     std::vector<std::pair<int, int>> edges;
     jit_run_edges(ck, begin, end, edges);
+    /* #34: `legal` = a lin point no C2b region forbids, for every pc of
+     * the run, with the nearest one at-or-after / at-or-before a pc -
+     * the extension walks below were a jit_lin_point (an edge scan)
+     * per pc of the gap */
+    LinMap lm;
+    lm.build(edges, begin, end);
+    const size_t npc = end - begin + 1;
+    std::vector<char> legal(npc, 0);
+    {
+        std::vector<long> nr(npc + 1, 0);
+        if (noreach)
+            for (const auto &r : *noreach) {
+                /* (first, second] */
+                const size_t a = std::max(r.first + 1, begin);
+                const size_t z = std::min(r.second, end);
+                if (a <= z) {
+                    nr[a - begin]++;
+                    nr[z - begin + 1]--;
+                }
+            }
+        long run = 0;
+        for (size_t i = 0; i < npc; i++) {
+            run += nr[i];
+            legal[i] = lm.lin[i] && run == 0;
+        }
+    }
+    std::vector<uint32_t> next_legal(npc + 1,
+                                     static_cast<uint32_t>(end + 1));
+    for (size_t i = npc; i-- > 0; )
+        next_legal[i] = legal[i] ? static_cast<uint32_t>(begin + i)
+                                 : next_legal[i + 1];
+    std::vector<long> prev_legal(npc, -1);
+    for (size_t i = 0; i < npc; i++)
+        prev_legal[i] = legal[i] ? static_cast<long>(begin + i)
+                                 : (i ? prev_legal[i - 1] : -1);
+    const auto legal_at = [&](uint32_t x) {
+        if (x >= begin && x <= end)
+            return legal[x - begin] != 0;
+        return jit_lin_point(edges, static_cast<int>(x))
+            && reach_ok(static_cast<int>(x));
+    };
 
     /*
      * EXTEND-OR-DEMOTE. A boundary that cannot sit on a linearization
@@ -19021,11 +19270,12 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
      * still demotes off a non-lin pc - a data-carrying flush cannot
      * move past its reader.
      */
-    /* processed in GLOBAL start order with bounds computed on demand
-     * from the CURRENT pieces - a reassignment (below) moves a piece
-     * between registers, which maintained per-reg lists would have to
-     * chase; a direct scan cannot go stale. O(n^2) over a run's piece
-     * count, which is small. */
+    /* processed in GLOBAL start order. The neighbour bounds were a
+     * direct scan of every piece per piece - "O(n^2) over a run's
+     * piece count, which is small", until a fuzzed 7,862-op `main`
+     * made it 2 G instructions (#34). They are indexed now, and the
+     * per-register indices CHASE a reassignment (pass 1) and a
+     * demotion (pass 2) - see reg_move. */
     std::vector<size_t> order;
     for (size_t i = 0; i < pieces.size(); i++)
         if (pieces[i].reg >= 0)
@@ -19035,52 +19285,120 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
                    ? pieces[a].start < pieces[b].start
                    : pieces[a].slot < pieces[b].slot;
     });
-    const auto slot_lo = [&](const LsraPiece &p) {
-        uint32_t lo = static_cast<uint32_t>(begin);
-        for (const LsraPiece &q2 : pieces)
-            if (&q2 != &p && q2.slot == p.slot && q2.end <= p.start
-                    && q2.end > lo)
-                lo = q2.end;
-        return lo;
+    /* THE INDICES. (end, piece) per slot: a piece's ends do not move
+     * in pass 1, its slot never does. (end, piece) and (start, piece)
+     * per register: pass 1 moves a piece's start and its register, so
+     * those two follow it (reg_move / the start update). A register's
+     * pieces are DISJOINT - the scan hands a register to one piece at
+     * a time, and every extension and reassignment below keeps it so,
+     * which is what the bounds are FOR - so the piece with the latest
+     * start before a pc also has the latest end, and one neighbour
+     * answers "is the register free over [s, e)". Checked here rather
+     * than trusted. */
+    using PI = std::pair<uint32_t, size_t>;
+    std::map<int, std::vector<PI>> slot_ends, slot_starts;
+    std::vector<std::set<PI>> reg_ends(static_cast<size_t>(K)),
+                              reg_starts(static_cast<size_t>(K));
+    for (size_t i = 0; i < pieces.size(); i++) {
+        const LsraPiece &p = pieces[i];
+        slot_ends[p.slot].push_back({ p.end, i });
+        if (p.reg >= 0 && p.reg < K) {
+            reg_ends[p.reg].insert({ p.end, i });
+            reg_starts[p.reg].insert({ p.start, i });
+        }
+    }
+    for (auto &kv : slot_ends)
+        std::sort(kv.second.begin(), kv.second.end());
+#ifndef NDEBUG
+    for (int r = 0; r < K; r++) {
+        uint32_t prev_end = 0;
+        for (const PI &x : reg_starts[r]) {
+            ML_CHECK_MSG(x.first >= prev_end
+                             && pieces[x.second].start
+                                    < pieces[x.second].end,
+                         "jit_lsra_snap: a register's pieces overlap");
+            prev_end = pieces[x.second].end;
+        }
+    }
+#endif
+    const auto reg_move = [&](size_t pi, int to) {
+        LsraPiece &p = pieces[pi];
+        if (p.reg >= 0 && p.reg < K) {
+            reg_ends[p.reg].erase({ p.end, pi });
+            reg_starts[p.reg].erase({ p.start, pi });
+        }
+        p.reg = to;
+        if (to >= 0 && to < K) {
+            reg_ends[to].insert({ p.end, pi });
+            reg_starts[to].insert({ p.start, pi });
+        }
     };
-    const auto reg_lo = [&](const LsraPiece &p) {
-        uint32_t lo = static_cast<uint32_t>(begin);
-        for (const LsraPiece &q2 : pieces)
-            if (&q2 != &p && q2.reg == p.reg && q2.end <= p.start
-                    && q2.end > lo)
-                lo = q2.end;
-        return lo;
+    /* the largest `end` <= the piece's start among the entries before
+     * `it` (its upper bound), skipping the piece itself; `begin` when
+     * there is none */
+    const auto lo_in = [&](auto first, auto it, size_t self) {
+        while (it != first) {
+            --it;
+            if (it->second != self)
+                return std::max(static_cast<uint32_t>(begin), it->first);
+        }
+        return static_cast<uint32_t>(begin);
+    };
+    const auto slot_lo = [&](size_t pi) {
+        const std::vector<PI> &v = slot_ends[pieces[pi].slot];
+        return lo_in(v.begin(),
+                     std::upper_bound(v.begin(), v.end(),
+                                      PI{ pieces[pi].start, SIZE_MAX }),
+                     pi);
+    };
+    const auto reg_lo = [&](size_t pi) {
+        const std::set<PI> &v = reg_ends[pieces[pi].reg];
+        return lo_in(v.begin(),
+                     v.upper_bound(PI{ pieces[pi].start, SIZE_MAX }), pi);
     };
     const auto latest_legal = [&](uint32_t lo, uint32_t start)
         -> long {
-        for (uint32_t s = start; s-- > lo; )
-            if (s == begin || (jit_lin_point(edges,
-                                             static_cast<int>(s))
-                               && reach_ok(static_cast<int>(s))))
-                return static_cast<long>(s);
-        return -1;
+        if (start <= lo)
+            return -1;
+        /* the largest s in [lo, start) that is legal or the run begin */
+        const long pl = prev_legal[start - 1 - begin];
+        if (pl >= static_cast<long>(lo))
+            return pl;
+        return lo == begin ? static_cast<long>(begin) : -1;
     };
     const auto reg_free_over = [&](int r2, uint32_t s, uint32_t e2,
-                                   const LsraPiece &self) {
-        for (const LsraPiece &q2 : pieces)
-            if (&q2 != &self && q2.reg == r2 && q2.start < e2
-                    && s < q2.end)
-                return false;
+                                   size_t self) {
+        /* the register's piece with the latest start before e2 has the
+         * latest end of all of them (disjoint) */
+        const std::set<PI> &v = reg_starts[r2];
+        auto it = v.lower_bound(PI{ e2, 0 });
+        while (it != v.begin()) {
+            --it;
+            if (it->second == self)
+                continue;
+            return !(s < pieces[it->second].end);
+        }
         return true;
     };
     std::set<int> lin_demoted;           /* the rescue's trigger set */
     /* pass 1: starts */
+    const auto set_start = [&](size_t pi, uint32_t st) {
+        LsraPiece &p = pieces[pi];
+        if (p.reg >= 0 && p.reg < K) {
+            reg_starts[p.reg].erase({ p.start, pi });
+            reg_starts[p.reg].insert({ st, pi });
+        }
+        p.start = st;
+    };
     for (const size_t pi : order) {
         LsraPiece &p = pieces[pi];
-        if (p.reg < 0 || p.start == begin
-                || (jit_lin_point(edges, static_cast<int>(p.start))
-                    && reach_ok(static_cast<int>(p.start))))
+        if (p.reg < 0 || p.start == begin || legal_at(p.start))
             continue;
-        const uint32_t ls = slot_lo(p);
-        const uint32_t lo = std::max(ls, reg_lo(p));
+        const uint32_t ls = slot_lo(pi);
+        const uint32_t lo = std::max(ls, reg_lo(pi));
         long s2 = latest_legal(lo, p.start);
         if (s2 >= 0) {
-            p.start = static_cast<uint32_t>(s2);
+            set_start(pi, static_cast<uint32_t>(s2));
             continue;
         }
         /* the 43_sieve shape: the reg neighbour blocks the extension
@@ -19097,46 +19415,59 @@ bool jit_lsra_snap(const Chunk &ck, size_t begin, size_t end,
                 if (r2 == p.reg)
                     continue;
                 if (reg_free_over(r2, static_cast<uint32_t>(s2),
-                                  p.end, p)) {
-                    p.reg = r2;
-                    p.start = static_cast<uint32_t>(s2);
+                                  p.end, pi)) {
+                    reg_move(pi, r2);
+                    set_start(pi, static_cast<uint32_t>(s2));
                     moved = true;
                 }
             }
         }
         if (!moved) {
-            p.reg = -1;
+            reg_move(pi, -1);
             lin_demoted.insert(p.slot);
         }
     }
-    /* pass 2: ends */
+    /* pass 2: ends. A piece's START no longer moves, and the pieces
+     * a register holds only shrink (a demotion) - so (start, piece)
+     * per slot is static and reg_starts, kept by reg_move, is exact */
+    for (size_t i = 0; i < pieces.size(); i++)
+        slot_starts[pieces[i].slot].push_back({ pieces[i].start, i });
+    for (auto &kv : slot_starts)
+        std::sort(kv.second.begin(), kv.second.end());
+    /* the smallest start from `it` (the lower bound of the piece's
+     * end) on, skipping the piece itself, capped at `hi` */
+    const auto hi_in = [&](auto it, auto last, size_t self, uint32_t hi) {
+        for (; it != last; ++it)
+            if (it->second != self)
+                return std::min(hi, it->first);
+        return hi;
+    };
     for (const size_t pi : order) {
         LsraPiece &p = pieces[pi];
-        if (p.reg < 0 || p.end >= end
-                || (jit_lin_point(edges, static_cast<int>(p.end))
-                    && reach_ok(static_cast<int>(p.end))))
+        if (p.reg < 0 || p.end >= end || legal_at(p.end))
             continue;
         uint32_t hi = static_cast<uint32_t>(end);
-        for (const LsraPiece &q2 : pieces) {
-            if (&q2 == &p)
-                continue;
-            if ((q2.slot == p.slot
-                     || (q2.reg >= 0 && q2.reg == p.reg))
-                    && q2.start >= p.end && q2.start < hi)
-                hi = q2.start;
+        {
+            const std::vector<PI> &v = slot_starts[p.slot];
+            hi = hi_in(std::lower_bound(v.begin(), v.end(),
+                                        PI{ p.end, 0 }),
+                       v.end(), pi, hi);
+            const std::set<PI> &w = reg_starts[p.reg];
+            hi = hi_in(w.lower_bound(PI{ p.end, 0 }), w.end(), pi, hi);
         }
         bool done = false;
-        for (uint32_t s = p.end + 1; s <= hi; s++) {
-            if (s == end
-                    || (jit_lin_point(edges, static_cast<int>(s))
-                        && reach_ok(static_cast<int>(s)))) {
+        if (p.end + 1 <= hi) {
+            /* the first s in [end+1, hi] that is legal or the run end */
+            const uint32_t s = std::min(
+                next_legal[p.end + 1 - begin],
+                static_cast<uint32_t>(end));
+            if (s <= hi) {
                 p.end = s;
                 done = true;
-                break;
             }
         }
         if (!done) {
-            p.reg = -1;
+            reg_move(pi, -1);
             lin_demoted.insert(p.slot);
         }
     }
@@ -19312,6 +19643,63 @@ jit_test_pick_cached_slots(const Chunk &ck, size_t begin, size_t end,
  */
 static bool g_lsra_temps_ok = false;
 
+/*
+ * #34: A PER-SLOT INDEX OVER AN EVENT LIST. The scan asks one question
+ * over and over - "this slot's events with s <= pc < e" - per interval
+ * (the cut), per piece (the evidence, the lifetime holes), per contest
+ * (the density) and per split. Each used to walk the WHOLE event list,
+ * so the scan was quadratic in the run: a 7,862-op `main` (a
+ * nested_fuzz program) spent 6.4 G instructions here, 10x the rest of
+ * the compile and the run together. The entries sorted by (slot, pc)
+ * make each question two binary searches; the answers are the same
+ * events, in pc order.
+ */
+struct LsraSlotIndex {
+    struct Ent {
+        int slot;
+        uint32_t pc;
+        uint32_t idx;                    /* position in the source list */
+    };
+    std::vector<Ent> v;
+    void add(int slot, uint32_t pc, size_t idx)
+    {
+        v.push_back({ slot, pc, static_cast<uint32_t>(idx) });
+    }
+    void seal()
+    {
+        std::sort(v.begin(), v.end(), [](const Ent &a, const Ent &b) {
+            if (a.slot != b.slot)
+                return a.slot < b.slot;
+            return a.pc != b.pc ? a.pc < b.pc : a.idx < b.idx;
+        });
+    }
+    /* [lo, hi) over v: the slot's entries with s <= pc < e (empty when
+     * e <= s) */
+    std::pair<size_t, size_t> range(int slot, uint32_t s, uint32_t e) const
+    {
+        const auto lt = [](const Ent &a, const std::pair<int, uint32_t> &k) {
+            return a.slot != k.first ? a.slot < k.first : a.pc < k.second;
+        };
+        const auto lo = std::lower_bound(v.begin(), v.end(),
+                                         std::make_pair(slot, s), lt);
+        const auto hi = std::lower_bound(lo, v.end(),
+                                         std::make_pair(slot, e), lt);
+        return { static_cast<size_t>(lo - v.begin()),
+                 static_cast<size_t>(hi - v.begin()) };
+    }
+    size_t count(int slot, uint32_t s, uint32_t e) const
+    {
+        const auto r = range(slot, s, e);
+        return r.second - r.first;
+    }
+    /* the first pc in [s, e), or UINT32_MAX */
+    uint32_t first(int slot, uint32_t s, uint32_t e) const
+    {
+        const auto r = range(slot, s, e);
+        return r.first < r.second ? v[r.first].pc : UINT32_MAX;
+    }
+};
+
 bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                      const std::vector<LiveInterval> &iv,
                      const std::vector<IntervalQual> &q,
@@ -19335,6 +19723,31 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
             if (e.kind == FltEvent::mem)
                 fmem.push_back({ e.pc, e.slot, false });
     const std::vector<MemEvent> &cutev = fm ? fmem : mem;
+    /* #34: the per-slot indices every query below reads - `cut_ix` over
+     * the cut stream, `ev_ix` over the USE events (float mode: every
+     * read and write; int mode: int_uses), `rd_ix` / `wr_ix` over the
+     * float reads / writes alone */
+    LsraSlotIndex cut_ix, ev_ix, rd_ix, wr_ix;
+    for (size_t e = 0; e < cutev.size(); e++)
+        cut_ix.add(cutev[e].slot, cutev[e].pc, e);
+    if (fm) {
+        for (size_t e = 0; e < fev->size(); e++) {
+            const FltEvent &f = (*fev)[e];
+            if (f.kind != FltEvent::mem)
+                ev_ix.add(f.slot, f.pc, e);
+            if (f.kind == FltEvent::read)
+                rd_ix.add(f.slot, f.pc, e);
+            if (f.kind == FltEvent::write)
+                wr_ix.add(f.slot, f.pc, e);
+        }
+    } else {
+        for (size_t e = 0; e < int_uses.size(); e++)
+            ev_ix.add(int_uses[e].slot, int_uses[e].pc, e);
+    }
+    cut_ix.seal();
+    ev_ix.seal();
+    rd_ix.seal();
+    wr_ix.seal();
 
     /* THE ADMISSION FLOOR (pick parity): any residency requires the
      * slot's RUN-WIDE int weight >= 3 - exactly the pick's threshold,
@@ -19357,29 +19770,67 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
 
     /* next-use distances, the admission + eviction input (a HEURISTIC
      * - see its codegen.h note; a wrong eviction costs a reload) */
-    std::vector<int> dist;
-    jit_next_use(ck, begin, end, 0, nslots, dist);
-    const size_t span = end - begin;
+    NextUse next_use;
+    next_use.build(ck, begin, end, 0, nslots);
     const auto nu = [&](size_t pc, int slot) -> int {
-        if (pc < begin || pc >= end || slot < 0 || slot >= nslots)
-            return JIT_NO_NEXT_USE;
-        return dist[(pc - begin) * static_cast<size_t>(nslots) + slot];
+        return next_use.at(pc, slot);
     };
-    (void)span;
 
     /* (1) CUT. Events are per (pc, slot); every kind forces the GP
      * side (badi is int-side-only, which IS this side). */
     std::vector<char> used(cutev.size(), 0);
+    /* #34: the two TEMP-admission facts below are properties of the
+     * SLOT and of the INTERVAL, not of a piece - they used to be
+     * recomputed per piece, each a walk of the whole run (the op scan
+     * calling jit_op_slot_refs at every pc). Computed once here: an
+     * op jit_op_slot_refs does not know (`unaudited` - it refuses every
+     * temp), the temps some op outside the specialized int family
+     * touches (`fam_bad`), and a prefix count of the MyLang call ops
+     * (`calls`, over [cl_lo, cl_hi)) so "does [start, end) span a
+     * call" is a subtraction. */
+    bool any_temp = false;
+    uint32_t cl_lo = UINT32_MAX, cl_hi = 0;
+    for (const LiveInterval &l : iv)
+        if (l.slot >= ck.slot_count) {
+            any_temp = true;
+            cl_lo = std::min(cl_lo, l.start);
+            cl_hi = std::max(cl_hi, l.end);
+        }
+    bool unaudited = false;
+    std::set<int> fam_bad;
+    std::vector<uint32_t> calls;
+    if (any_temp) {
+        std::vector<int> tu, td;
+        for (size_t rp = begin; rp < end; rp++) {
+            const OpCode op = ck.code[rp].op;
+            if (!jit_op_slot_refs(ck.code[rp], tu, td)) {
+                unaudited = true;        /* an unaudited op */
+                break;
+            }
+            if (op >= OpCode::IntAddRR && op <= OpCode::IntModRI)
+                continue;
+            fam_bad.insert(tu.begin(), tu.end());
+            fam_bad.insert(td.begin(), td.end());
+        }
+        cl_hi = std::min<uint32_t>(cl_hi,
+                                   static_cast<uint32_t>(ck.code.size()));
+        if (cl_lo < cl_hi) {
+            calls.assign(cl_hi - cl_lo + 1, 0);
+            for (uint32_t cp = cl_lo; cp < cl_hi; cp++)
+                calls[cp - cl_lo + 1] = calls[cp - cl_lo]
+                    + (jit_run_blocks_xcache(ck, cp, cp + 1) ? 1 : 0);
+        }
+    }
     for (size_t k = 0; k < iv.size(); k++) {
         const LiveInterval &l = iv[k];
         std::vector<uint32_t> pcs;
-        for (size_t e = 0; e < cutev.size(); e++)
-            if (cutev[e].slot == l.slot && cutev[e].pc >= l.start
-                    && cutev[e].pc < l.end) {
-                pcs.push_back(cutev[e].pc);
-                used[e] = 1;
+        {
+            const auto r = cut_ix.range(l.slot, l.start, l.end);
+            for (size_t j = r.first; j < r.second; j++) {
+                pcs.push_back(cut_ix.v[j].pc);
+                used[cut_ix.v[j].idx] = 1;
             }
-        std::sort(pcs.begin(), pcs.end());
+        }
         pcs.erase(std::unique(pcs.begin(), pcs.end()), pcs.end());
         const bool fl = fm ? q[k].uses_int > 0
                            : q[k].uses_float > 0 || q[k].wrote_float;
@@ -19404,21 +19855,11 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                  * every write kills the piece (the promote-arm rule -
                  * jit.h's float-mode contract); a same-pc pair is one
                  * dst touch and admissible. */
-                uint32_t fw = UINT32_MAX, fr = UINT32_MAX;
-                for (const FltEvent &e : *fev)
-                    if (e.slot == l.slot && e.pc >= s && e.pc < e2) {
-                        if (e.kind == FltEvent::write && e.pc < fw)
-                            fw = e.pc;
-                        if (e.kind == FltEvent::read && e.pc < fr)
-                            fr = e.pc;
-                    }
+                const uint32_t fw = wr_ix.first(l.slot, s, e2);
+                const uint32_t fr = rd_ix.first(l.slot, s, e2);
                 evid = fw != UINT32_MAX && fr >= fw;
             } else {
-                for (const MemEvent &u : int_uses)
-                    if (u.slot == l.slot && u.pc >= s && u.pc < e2) {
-                        evid = true;
-                        break;
-                    }
+                evid = ev_ix.count(l.slot, s, e2) > 0;
             }
             /* admit only an int-evidenced, float-free piece with a USE
              * inside - a stretch nothing reads gains nothing - of a
@@ -19435,24 +19876,8 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
              * what an expression tree's temps are; anything else - a
              * ReturnV whose arms store the result SLOT, a call's
              * argument staging - keeps the temp in memory. */
-            bool ret_read = false;
-            if (temp) {
-                std::vector<int> tu, td;
-                for (size_t rp = begin; rp < end && !ret_read; rp++) {
-                    const OpCode op = ck.code[rp].op;
-                    if (!jit_op_slot_refs(ck.code[rp], tu, td)) {
-                        ret_read = true;     /* an unaudited op */
-                        break;
-                    }
-                    const bool touches =
-                        std::find(tu.begin(), tu.end(), l.slot) != tu.end()
-                        || std::find(td.begin(), td.end(), l.slot)
-                               != td.end();
-                    if (touches && !(op >= OpCode::IntAddRR
-                                     && op <= OpCode::IntModRI))
-                        ret_read = true;
-                }
-            }
+            const bool ret_read = temp
+                    && (unaudited || fam_bad.count(l.slot) != 0);
             /* and its interval must not span a MyLang CALL: across
              * one it needs a callee-saved register (a push/pop per
              * ENTRY - per call, in a function body) or a write-back
@@ -19460,12 +19885,12 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
              * it saves (09_fib read +5.0% Ir: `fib(n-1) + fib(n-2)`'s
              * partial sum held in r13 across the second call) */
             bool spans_call = false;
-            if (temp)
-                for (uint32_t cp = l.start; cp < l.end && !spans_call;
-                     cp++)
-                    if (cp < ck.code.size()
-                            && jit_run_blocks_xcache(ck, cp, cp + 1))
-                        spans_call = true;
+            if (temp && l.start < l.end) {
+                const uint32_t a2 = std::max(l.start, cl_lo);
+                const uint32_t b2 = std::min(l.end, cl_hi);
+                spans_call = a2 < b2
+                    && calls[b2 - cl_lo] != calls[a2 - cl_lo];
+            }
             const bool temp_ok = temp && !fm && g_lsra_temps_ok
                     && !ret_read && !spans_call
                     && !jit_slot_ref_listed(ck, l.slot);
@@ -19514,23 +19939,48 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
     jit_run_edges(ck, begin, end, hedges);
     const auto evs_in = [&](int slot, uint32_t s, uint32_t e2) {
         std::vector<uint32_t> r;
-        if (fm) {
-            for (const FltEvent &e3 : *fev)
-                if (e3.slot == slot && e3.pc >= s && e3.pc < e2
-                        && e3.kind != FltEvent::mem)
-                    r.push_back(e3.pc);
-        } else {
-            for (const MemEvent &u : int_uses)
-                if (u.slot == slot && u.pc >= s && u.pc < e2)
-                    r.push_back(u.pc);
-        }
-        std::sort(r.begin(), r.end());
-        r.erase(std::unique(r.begin(), r.end()), r.end());
+        const auto rg = ev_ix.range(slot, s, e2);
+        for (size_t j = rg.first; j < rg.second; j++)
+            if (r.empty() || r.back() != ev_ix.v[j].pc)
+                r.push_back(ev_ix.v[j].pc);
         return r;
     };
     const auto lin_at = [&](uint32_t x) {
         return x == begin
                || jit_lin_point(hedges, static_cast<int>(x));
+    };
+    /* #34: the first / last lin point in [a, b) - UINT32_MAX when
+     * none - through the run's table rather than a jit_lin_point per
+     * pc of the gap */
+    LinMap hlm;
+    hlm.build(hedges, begin, end);
+    const auto first_lin = [&](uint32_t a, uint32_t b) -> uint32_t {
+        if (a >= b)
+            return UINT32_MAX;
+        if (a < begin || b - 1 > end) {
+            for (uint32_t x = a; x < b; x++)
+                if (lin_at(x))
+                    return x;
+            return UINT32_MAX;
+        }
+        if (a == begin)
+            return a;
+        const uint32_t y = hlm.nxt[a - begin];
+        return y < b ? y : UINT32_MAX;
+    };
+    const auto last_lin = [&](uint32_t a, uint32_t b) -> uint32_t {
+        if (a >= b)
+            return UINT32_MAX;
+        if (a < begin || b - 1 > end) {
+            for (uint32_t x = b; x-- > a; )
+                if (lin_at(x))
+                    return x;
+            return UINT32_MAX;
+        }
+        const long y = hlm.prv[b - 1 - begin];
+        if (y >= static_cast<long>(a))
+            return static_cast<uint32_t>(y);
+        return a == begin ? a : UINT32_MAX;
     };
     {
         std::vector<std::pair<uint32_t, uint32_t>> bedges;
@@ -19541,6 +19991,20 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                 bedges.push_back({ static_cast<uint32_t>(in.target),
                                    static_cast<uint32_t>(p2) });
         }
+        /* #34: is there a whole loop inside [a, b) - a back edge whose
+         * target is >= a and whose source is < b? The lowest source
+         * among the back edges targeting a pc >= a answers it, kept per
+         * pc (it was a walk of every back edge per gap) */
+        std::vector<uint32_t> min_src(end - begin + 2, UINT32_MAX);
+        for (const auto &be : bedges)
+            if (be.first >= begin)       /* else never inside a gap */
+                min_src[be.first - begin] =
+                    std::min(min_src[be.first - begin], be.second);
+        for (size_t k = end - begin; k-- > 0; )
+            min_src[k] = std::min(min_src[k], min_src[k + 1]);
+        const auto loop_inside = [&](uint32_t a, uint32_t b) {
+            return a >= begin && a <= end && min_src[a - begin] < b;
+        };
         if (!bedges.empty()) {
         const size_t cap = out.pieces.size() * 4 + 16;
         for (size_t i = 0; i < out.pieces.size()
@@ -19570,23 +20034,17 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
             uint32_t g1 = 0, g2 = 0;
             for (const auto &gp : gaps) {
                 const uint32_t a = gp.first, b = gp.second;
-                bool loop_in = false;
-                for (const auto &be : bedges)
-                    if (be.first >= a && be.second < b) {
-                        loop_in = true;
-                        break;
-                    }
-                if (!loop_in)
+                if (!loop_inside(a, b))
                     continue;
                 /* flush pc: the EARLIEST lin point in [a, b);
                  * reload pc: the LATEST lin point in (flush, b) -
                  * both outside every loop by lin-ness, so each
                  * boundary seam runs once per crossing */
-                uint32_t f2 = 0, r2 = 0;
-                for (uint32_t x = a; x < b; x++)
-                    if (lin_at(x)) { f2 = x; break; }
-                for (uint32_t x = b; x-- > a; )
-                    if (lin_at(x)) { r2 = x; break; }
+                uint32_t f2 = first_lin(a, b), r2 = last_lin(a, b);
+                if (f2 == UINT32_MAX)
+                    f2 = 0;
+                if (r2 == UINT32_MAX)
+                    r2 = 0;
                 if (f2 && r2 > f2) { g1 = f2; g2 = r2; break; }
             }
             if (g2 == 0)
@@ -19651,18 +20109,7 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
     };
     const auto uses_rem = [&](int slot, uint32_t from,
                               uint32_t to) -> uint64_t {
-        uint64_t n = 0;
-        if (fm) {
-            for (const FltEvent &e2 : *fev)
-                if (e2.slot == slot && e2.pc >= from && e2.pc < to
-                        && e2.kind != FltEvent::mem)
-                    n++;
-        } else {
-            for (const MemEvent &u : int_uses)
-                if (u.slot == slot && u.pc >= from && u.pc < to)
-                    n++;
-        }
-        return n;
+        return ev_ix.count(slot, from, to);
     };
     struct WEv {
         uint32_t pc;
@@ -19686,14 +20133,14 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
      * shrink with pc) and the piece stays memory for good */
     const auto park = [&](size_t idx, uint32_t from) {
         const LsraPiece &pp = out.pieces[idx];
-        for (uint32_t x = from + 1; x < pp.end; x++)
-            if (lin_at(x)) {
-                if (evs_in(pp.slot, x, pp.end).size() >= 2)
-                    wq.push({ x, 1, idx, pp.slot });
-                return;
-            }
+        const uint32_t x = first_lin(from + 1, pp.end);
+        if (x != UINT32_MAX && evs_in(pp.slot, x, pp.end).size() >= 2)
+            wq.push({ x, 1, idx, pp.slot });
     };
     ML_INT_ONLY(int int_contests = 0;)
+    /* read once: a getenv per contest was a string compare against
+     * the whole environment, thousands of times in a long run */
+    static const bool lsra_dbg2 = getenv("MYLANG_LSRADBG2") != nullptr;
     while (!wq.empty()) {
         const WEv wev = wq.top();
         wq.pop();
@@ -19751,7 +20198,7 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
          * what found the density TIE that hid the first lifetime-
          * hole shape (cu=3/cs=3 vs 4/4 - both 1.0, tie keeps the
          * active) */
-        if (getenv("MYLANG_LSRADBG2") && K == 1)
+        if (lsra_dbg2 && K == 1)
             for (size_t a = 0; a < active.size(); a++) {
                 const LsraPiece &c2 = out.pieces[active[a]];
                 fprintf(stderr, "  ACT pc %u slot %d [%u,%u) "
@@ -19761,7 +20208,7 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
                                                      c2.end),
                         (unsigned long long)(c2.end - here0));
             }
-        if (getenv("MYLANG_LSRADBG2") && K == 1)
+        if (lsra_dbg2 && K == 1)
             fprintf(stderr, "CONTEST pc %u newcomer slot %d "
                     "(u=%llu s=%llu) loser %s slot %d\n",
                     here0, p.slot,
@@ -19798,19 +20245,9 @@ bool jit_lsra_assign(const Chunk &ck, size_t begin, size_t end,
         const size_t li = active[far_i];
         const int freed = out.pieces[li].reg;
         const uint32_t here = at;
-        int kept_uses = 0;
-        if (fm) {
-            for (const FltEvent &e : *fev)
-                if (e.kind == FltEvent::read
-                        && e.slot == out.pieces[li].slot
-                        && e.pc >= out.pieces[li].start && e.pc < here)
-                    kept_uses++;
-        } else {
-            for (const MemEvent &u : int_uses)
-                if (u.slot == out.pieces[li].slot
-                        && u.pc >= out.pieces[li].start && u.pc < here)
-                    kept_uses++;
-        }
+        const size_t kept_uses =
+            (fm ? rd_ix : ev_ix).count(out.pieces[li].slot,
+                                       out.pieces[li].start, here);
         if (out.pieces[li].start < here && kept_uses >= 2) {
             LsraPiece rest = out.pieces[li];
             rest.start = here;
@@ -20251,7 +20688,7 @@ pick_float_lits(Emitter &e, const Chunk &chunk, size_t begin, size_t end)
 static bool region_preheader_reached(
     const Chunk &chunk, size_t begin, size_t end,
     const std::vector<std::pair<size_t, size_t>> &entries,
-    size_t T, size_t L, bool post_call_ok = false)
+    size_t T, size_t L, const BranchInto &into, bool post_call_ok = false)
 {
     /*
      * REGCALL step 3 (C5 only - `post_call_ok`): a POST-CALL resume
@@ -20285,14 +20722,9 @@ static bool region_preheader_reached(
                 && hs.fin_pc <= static_cast<int>(L))
             return false;
     }
-    for (size_t p = begin; p < end; p++) {
-        const Instr &in = chunk.code[p];
-        if (op_is_branch(in.op) && in.target >= static_cast<int>(T)
-                && in.target <= static_cast<int>(L)
-                && (p < T || p > L))
-            return false;
-    }
-    return true;
+    (void)begin;
+    (void)end;
+    return !into.from_outside(T, L);
 }
 
 /*
@@ -20368,20 +20800,24 @@ static void jit_pick_release_slots(
     if (jit_lever_off(JL_RELENT) || !fwd_live_ok || fwd_lin.empty())
         return;
 
+    const BranchInto into(chunk, begin, end);
+    /* the LAST back edge targeting each pc, found in one pass (#34: it
+     * was a scan of the rest of the run per pc - quadratic) */
+    std::vector<size_t> last_back(end - begin, 0);
+    for (size_t p = begin; p < end; p++) {
+        const Instr &in = chunk.code[p];
+        if (op_is_branch(in.op) && in.target >= static_cast<int>(begin)
+                && static_cast<size_t>(in.target) < p)
+            last_back[static_cast<size_t>(in.target) - begin] = p;
+    }
     for (size_t T = begin; T < end; T++) {
         /* the region: T .. the LAST back edge that targets it (so a
          * multi-exit loop body is covered whole) */
-        size_t L = 0;
-        bool found = false;
-        for (size_t p = T; p < end; p++) {
-            const Instr &in = chunk.code[p];
-            if (op_is_branch(in.op) && in.target == static_cast<int>(T)
-                    && p > T)
-                { L = p; found = true; }
-        }
+        const size_t L = last_back[T - begin];
+        const bool found = L != 0;
         if (!found
                 || !region_preheader_reached(chunk, begin, end, entries,
-                                             T, L, deleted_run))
+                                             T, L, into, deleted_run))
             continue;
 
         /* every def in the region, split by whether it keeps the slot
@@ -29424,6 +29860,7 @@ static void jit_pick_ctor_establish(
 {
     static const bool dbg = getenv("MYLANG_ESTDBG") != nullptr;
 
+    const BranchInto into(chunk, begin, end);
     for (size_t L = begin; L < end; L++) {
         const Instr &bi = chunk.code[L];
         if (!op_is_branch(bi.op) || bi.target < static_cast<int>(begin)
@@ -29462,7 +29899,8 @@ static void jit_pick_ctor_establish(
             }
         if (!ok || !op_never_exits(bi))
             continue;
-        if (!region_preheader_reached(chunk, begin, end, entries, T, L))
+        if (!region_preheader_reached(chunk, begin, end, entries, T, L,
+                                      into))
             continue;
 
         /* the candidate ctors, then the per-slot appearance scan */
@@ -31048,6 +31486,11 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * 0 -> 1 once per run, bounding its retry.
      */
     std::vector<char> xcall_lost(runs.size(), 0);
+    /* #34: THE chunk's all-slot liveness - computed ONCE. The bytecode
+     * is not rewritten until every run is emitted (the EnterNative
+     * splice at the end), so the answer is the same for every run and
+     * every re-emission; the D3 scan and REGCALL step 2 recomputed it
+     * per run per attempt - 13 fixpoints over one 7,862-op `main`. */
     SlotLiveness xcall_lsl;
     const bool xcall_lsl_ok = jit_slot_liveness(chunk, xcall_lsl);
     std::vector<char> xcall_in_loop(chunk.code.size(), 0);
@@ -31068,13 +31511,26 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
      * the one reader a straight-line argument would have to model).
      * Computed once: the code does not change across re-emissions.
      */
-    SlotLiveness ret_lsl;
+    const SlotLiveness &ret_lsl = xcall_lsl;
     const bool ret_lsl_ok = g_cur_caller_desc
         && chunk.handler_sites.empty() && !jit_lever_off(JL_RETWB)
-        && jit_slot_liveness(chunk, ret_lsl);
+        && xcall_lsl_ok;
     g_jit_pins_denied = 0;
     ML_INT_ONLY(const std::shared_ptr<JitIntProbeChunk> int_pinfo =
                     jit_int_probe_chunk(chunk);)
+    /* #34: a run's D1 intervals and their qualification are functions
+     * of the bytecode and the liveness alone, so they survive a
+     * re-emission: computed on a run's first attempt, read by the
+     * rest. They record nothing (no INT site, no counter), so the
+     * retry's discard semantics lose nothing by it. */
+    struct RunIv {
+        bool done = false, ok = false;
+        std::vector<LiveInterval> liv;
+        std::vector<IntervalQual> lq;
+        std::vector<MemEvent> lev, liu;
+        std::vector<FltEvent> lfev;
+    };
+    std::vector<RunIv> run_iv(runs.size());
 retry_emission:
     /* Phase A: the one-shot re-emission after a rax-pin conflict. The
      * backward goto DESTROYS everything declared below it (e included)
@@ -31148,8 +31604,7 @@ retry_emission:
          * BAILS never reaches it, and one Emitter serves every run in
          * the chunk - a leaked exit would be patched against the next
          * fragment's epilogue. */
-        e.exits.clear();
-        e.exit_states.clear();
+        e.clear_exit_states();
         e.fread.clear();        /* C4a-i: per-RUN */
         e.flits.clear();        /* C4b: per-RUN (a stale entry would let
                                  * the next fragment read a register it
@@ -31361,7 +31816,6 @@ retry_emission:
         std::vector<LsraTrans> lsra_ftr;
         std::vector<int> lsra_fentry;
         std::vector<int> lsra_faregs;
-        std::vector<FltEvent> lfev;
         /* 2b-iii-b: TRANSITION MODE - the snapped plan's per-pc pieces
          * reach emission. The seam-application loop executes the
          * LsraTrans list, entry stubs replay it, exits and brackets
@@ -31417,18 +31871,23 @@ retry_emission:
          * measuring.
          */
         if (!jit_lever_off(JL_LSRA)) {
-            SlotLiveness lsl;
-            std::vector<LiveInterval> liv;
-            std::vector<IntervalQual> lq;
-            std::vector<MemEvent> lev;
+            RunIv &riv = run_iv[r];
+            if (!riv.done) {
+                riv.done = true;
+                riv.ok = xcall_lsl_ok
+                    && jit_build_intervals(chunk, begin, end, xcall_lsl,
+                                           riv.liv)
+                    && jit_qualify_intervals(chunk, begin, end, riv.liv,
+                                             riv.lq, nullptr, &riv.lev,
+                                             &riv.liu, &riv.lfev);
+            }
+            const std::vector<LiveInterval> &liv = riv.liv;
+            const std::vector<IntervalQual> &lq = riv.lq;
+            const std::vector<MemEvent> &lev = riv.lev;
+            const std::vector<MemEvent> &liu = riv.liu;
+            const std::vector<FltEvent> &lfev = riv.lfev;
             bool tmode_done = false;
-            std::vector<MemEvent> liu;
-            if (jit_slot_liveness(chunk, lsl)
-                    && jit_build_intervals(chunk, begin, end, lsl, liv)
-                    && jit_qualify_intervals(chunk, begin, end, liv, lq,
-                                             nullptr, &lev, &liu,
-                                             &lfev)
-                    && !jit_lever_off(JL_CACHE)) {
+            if (riv.ok && !jit_lever_off(JL_CACHE)) {
                 lsra_facts = true;       /* F4a: liv/lq are valid */
                 LsraOut tp;
                 std::vector<int> entry;
@@ -31598,12 +32057,7 @@ retry_emission:
                     }
                 }
             }
-            if (!tmode_done
-                    && jit_slot_liveness(chunk, lsl)
-                    && jit_build_intervals(chunk, begin, end, lsl, liv)
-                    && jit_qualify_intervals(chunk, begin, end, liv, lq,
-                                             nullptr, &lev, &liu,
-                                             &lfev)) {
+            if (!tmode_done && riv.ok) {
                 lsra_facts = true;       /* F4a: liv/lq are valid */
                 /* the WHOLE-RUN fallback is the pick's contract
                  * restated on the interval facts - NOT a detour
@@ -32591,6 +33045,7 @@ retry_emission:
             e.tflush.push_back({ s, slot_addr(s).type, true });
         for (const int s : e.fread)
             if (!jit_lever_off(JL_TELIDE)
+                    && e.tflush.size() < MAX_TYPE_ELIDED  /* #34 */
                     && s >= chunk.slot_count
                     && !jit_slot_ref_listed(chunk, s)) {
                 e.tflush.push_back({ s, slot_addr(s).type, true });
@@ -32901,6 +33356,12 @@ retry_emission:
         std::vector<std::vector<size_t>> h_cold(hregs.size());
         g_fwd = JitFwd{};
         bool emit_ok = true;
+        /* #34: which pcs are a hoist region's head - asked at every
+         * pc of the emission, it was a walk of every region */
+        std::vector<char> hoist_head(end - begin + 1, 0);
+        for (const HoistRegion &hr : hregs)
+            if (hr.T >= begin && hr.T <= end)
+                hoist_head[hr.T - begin] = 1;
         const auto emit_one = [&](size_t pc, bool in_cold,
                                   size_t cold_end) {
             const Instr &in = chunk.code[pc];
@@ -32952,10 +33413,8 @@ retry_emission:
             g_fwd.fskip_write = false;
             g_fwd.farmed = false;
             int fdst;
-            bool next_is_preheader = false;
-            for (const HoistRegion &hr : hregs)
-                if (pc + 1 == hr.T)
-                    next_is_preheader = true;
+            const bool next_is_preheader =
+                pc + 1 <= end && hoist_head[pc + 1 - begin];
             if (pc + 1 < end
                     && !(!in_cold && next_is_preheader)
                     && !(in_cold && pc + 1 > cold_end)
