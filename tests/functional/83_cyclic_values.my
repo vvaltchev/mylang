@@ -123,6 +123,20 @@ r2[0] = 2;
 r3[0] = 3;
 assert(r2[1][0] == 2 && r3[1][0] == 3 && C[0] == 1);
 
+# 6b. a cycle a compile-time call leaves in a LOCAL is the compiler's to
+#     keep (until exit), like one it returns: unresolved at parse time, the
+#     function's locals live in its body's block scope, which died before
+#     the call's keep scan - LeakSanitizer reported the ring. (A const
+#     initializer is evaluated at parse time in every mode; the same call
+#     left to run time builds a ring the program cannot reach to break.)
+pure func local_ring(n) {
+    var dyn r = [n, "x"];
+    r[1] = r;
+    return len(r);
+}
+const LR = local_ring(2);
+assert(LR == 2);
+
 # 7. a closure captures the array it is stored in: nothing walks into a
 #    function, so the walks see only `<function>`
 var dyn fs = [];

@@ -114,6 +114,15 @@ EvalContext::~EvalContext()
 {
     if (scope_alive)
         *scope_alive = false;
+    /* A compile-time function run (const-eval) keeps a cycle it leaves in
+     * a local until exit (const_eval_keep_cycles) - and a local of a BLOCK
+     * it ran lives here, in a scope that dies before that scan: the
+     * function is unresolved at parse time, so its locals are map entries
+     * of the body's block contexts, and such a cycle leaked. A script's
+     * run-time map is empty, so this costs it one test. */
+    if (!symbols.empty() && !const_ctx && in_const_eval())
+        for (const auto &kv : symbols)
+            cyc_keep_if_cyclic(kv.second.get());
 }
 
 LValue *EvalContext::lookup(const Identifier *id)

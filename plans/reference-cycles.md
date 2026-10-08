@@ -219,6 +219,17 @@ semantics (README, *Values that contain themselves*):
   `collect_value_descs` simply stop. `is_readonly_value`, `value_repr`,
   `cse_key`, `make_general_array_clone` and `join` were checked and are
   not recursive over values.
+- **A cycle a compile-time call leaves in a LOCAL is kept too** (2026-10-08,
+  after this work): an explicit `pure` call folded at parse time runs
+  unresolved, so its locals are map entries of its body's BLOCK scopes,
+  which die before `const_eval_keep_cycles` scans the call -
+  `~EvalContext` keeps a cyclic local of a scope destroyed during
+  const-eval. **Known residual, for part B:** a function folded LATER
+  (AutoConst, resolved, its locals in frame slots) that OVERWRITES a slot
+  holding a cycle - `for (...) { var a = [none]; a[0] = a; }` - drops
+  every ring but the last before the scan sees the frame; LeakSanitizer
+  reports them. Catching it needs a hook on every slot store (or the
+  collector part B builds), so it is left to part B.
 - **A cyclic constant through a pure function compiles and runs in every
   engine** (`-tw`, `-nj`, the JIT, `-nbi`, `-nc`, `--no-opt all`, `-nti`).
   What it needs is an element store: `append` is a run-time builtin and is
