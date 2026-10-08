@@ -34,25 +34,43 @@ using std::string;
  */
 struct CseCache {
 
-    std::vector<std::unordered_map<string, EvalValue>> stack;
+    /*
+     * A baked value, and whether ANY target may share it. A value that was
+     * read-only on its own (derived from a constant) is shared by a `var`
+     * too, as the uncached path shares it; one frozen only because its
+     * target was a CONST (`const X = f(A);`, f returning a fresh array) is
+     * that constant's alone - the same expression bound to a `var` is a
+     * fresh mutable value, as under -nc, where nothing is shared. A `var`
+     * hit on such an entry made the var read-only (RULE 2, 2026-10-08).
+     */
+    struct Entry {
+        EvalValue v;
+        bool any_target;
+    };
+    std::vector<std::unordered_map<string, Entry>> stack;
 
     void push() { stack.emplace_back(); }
     /* push/pop must stay in lockstep with pBlock's const-ctx scopes (CLAUDE.md
      * const-evaluation): an unbalanced pop here is a scope-management bug. */
     void pop() { ML_CHECK(!stack.empty()); stack.pop_back(); }
 
-    const EvalValue *lookup(const string &key) const {
+    /* the entry a target may share (`for_const`: a const target), or null */
+    const EvalValue *lookup(const string &key, bool for_const) const {
         for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
             auto f = it->find(key);
             if (f != it->end())
-                return &f->second;
+                return for_const || f->second.any_target ? &f->second.v
+                                                         : nullptr;
         }
         return nullptr;
     }
 
-    void insert(const string &key, const EvalValue &v) {
-        if (!stack.empty())
-            stack.back().emplace(key, v);
+    void insert(const string &key, const EvalValue &v, bool any_target) {
+        if (stack.empty())
+            return;
+        auto r = stack.back().emplace(key, Entry{v, any_target});
+        if (!r.second && any_target)
+            r.first->second.any_target = true;
     }
 };
 
@@ -3866,7 +3884,7 @@ cse_materialize_core(ParseContext &c,
 
     if (!key.empty()) {
 
-        if (const EvalValue *hit = c.cse->lookup(key)) {
+        if (const EvalValue *hit = c.cse->lookup(key, immutable)) {
             /*
              * An identical const expression already produced this deep
              * read-only value: share it. It is immutable, so aliasing it
@@ -3892,10 +3910,11 @@ cse_materialize_core(ParseContext &c,
             v.is<intrusive_ptr<StructObject>>())
         && (immutable || is_readonly_value(v)))
     {
+        const bool ro = is_readonly_value(v);
         EvalValue baked = make_const_clone(v);
 
         if (!key.empty())
-            c.cse->insert(key, baked);
+            c.cse->insert(key, baked, ro);
 
         out = make_unique<LiteralObj>(std::move(baked), true);
         static_cast<LiteralObj *>(out.get())->from_literal =

@@ -3321,7 +3321,11 @@ and it lives *inside the parser*. Mechanics:
   this is why two identical const exprs report equal `intptr()`. On a miss it
   bakes via `make_const_clone` and caches the value *only when it is read-only*
   (the sole safely-shareable case; mutable `var`-bound literals are never
-  cached/shared). Popping a scope with its block is what stops a freed block's
+  cached/shared). **A value frozen only because its TARGET is a const**
+  (`const X = f(A);`, `f` returning a fresh array) is cached for CONST
+  targets alone (`CseCache::Entry::any_target`): a `var` hitting it got
+  the constant's read-only value, so an earlier identical `const` decided
+  whether `append(y, 3)` worked, and `-nc` disagreed (2026-10-08). Popping a scope with its block is what stops a freed block's
   reused stack addresses from colliding with a live key. `pExpr14` skips
   re-materializing an rvalue that is *already* a `LiteralObj` (a subscript/call
   result baked at its own site), so the de-dup lives at one layer and no double
