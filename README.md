@@ -641,6 +641,10 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     are references, and widening one would change it for every other name
     that holds it. Convert it explicitly
     (`array<float> f = map(func(x) => float(x), a);`).
+    A single value stored into an element - `a[i] = 5`, `append(a, 5)`,
+    `push(a, 5)`, `insert(a, 0, 5)`, a dict key or value - widens to the
+    declared type the same way: `5` stored into an `array<float?>` is
+    `5.0`, `true` into an `array<int>` is `1`.
   * **A `struct` type** pins the variable to that exact type (like a scalar):
     `Point p = Point(3, 4)` is fine, while `Point p = Other(...)` (or a later
     `p = Other(...)`) is a compile error. The struct name is read as a type only

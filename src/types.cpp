@@ -558,7 +558,8 @@ builtin_lv_v_adapter_big(decltype(Builtin::func_lv) flv, EvalContext *ctx,
 {
     std::vector<EvalValue> heapbuf(n_rest);
     for (size_t i = 0; i < n_rest; i++)
-        heapbuf[i] = RValue(exprList->elems[i + 1]->eval(ctx));
+        heapbuf[i] = literal_widen(RValue(exprList->elems[i + 1]->eval(ctx)),
+                                   exprList->widen_of(i + 1));
     std::vector<ArgLoc> locbuf(exprList->elems.size());
     ArgLocs al = build_arglocs(exprList, locbuf.data(), locbuf.size());
     return flv(ctx, &al, target, heapbuf.data(), n_rest);
@@ -588,7 +589,8 @@ EvalValue builtin_lv_v_adapter(EvalContext *ctx, ExprList *exprList)
         return builtin_lv_v_adapter_big(FLV, ctx, exprList, target, n_rest);
     EvalValue stackbuf[8];
     for (size_t i = 0; i < n_rest; i++)
-        stackbuf[i] = RValue(exprList->elems[i + 1]->eval(ctx));
+        stackbuf[i] = literal_widen(RValue(exprList->elems[i + 1]->eval(ctx)),
+                                    exprList->widen_of(i + 1));
     ArgLoc locbuf[8];
     ArgLocs al = build_arglocs(exprList, locbuf, total < 8 ? total : 8);
     return FLV(ctx, &al, target, stackbuf, n_rest);

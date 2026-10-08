@@ -3498,8 +3498,30 @@ struct Codegen {
         return true;
     }
 
+    /* An in-place builtin's argument `i` of `al`, compiled into its run
+     * slot and widened as it will be stored (ExprList::arg_widen) */
+    bool compile_builtin_arg(const ExprList *al, size_t i, int slot,
+                             std::vector<CgInstr> &ops)
+    {
+        if (!compile_to_run_slot(al->elems[i].get(), slot, ops))
+            return false;
+        const DeclType w = al->widen_of(i);
+        if (w == DeclType::i || w == DeclType::f) {
+            CgInstr co;             /* the run slot is this argument's own */
+            co.op = OpCode::CoerceNumV;
+            co.node_idx = add_ast_node(al->elems[i].get());
+            co.target = slot;
+            co.target2 = w == DeclType::f ? 1 : 0;
+            co.set_a(slot_op(slot));
+            ops.push_back(co);
+        }
+        return true;
+    }
+
+    /* `wl`: the builtin call's argument list, whose arg_widen applies */
     bool emit_args_range(const std::vector<unique_ptr<Construct>> &elems,
-                         int &argbase, std::vector<CgInstr> &ops, int start = 0)
+                         int &argbase, std::vector<CgInstr> &ops, int start = 0,
+                         const ExprList *wl = nullptr)
     {
         const size_t mark = ops.size();
         const int save_top = next_temp;
@@ -3511,8 +3533,11 @@ struct Codegen {
             max_temp = next_temp;
 
         for (int i = 0; i < n; i++) {
-            if (!compile_to_run_slot(elems[start + i].get(),
-                                     argbase + i, ops)) {
+            const bool ok = wl
+                ? compile_builtin_arg(wl, start + i, argbase + i, ops)
+                : compile_to_run_slot(elems[start + i].get(), argbase + i,
+                                      ops);
+            if (!ok) {
                 ops.resize(mark);
                 next_temp = save_top;
                 return false;
@@ -4407,8 +4432,7 @@ struct Codegen {
         if (next_temp > max_temp)
             max_temp = next_temp;
         for (int i = 0; i < nvals; i++)
-            if (!compile_to_run_slot(dc->args->elems[1 + i].get(),
-                                     runbase + i, ops))
+            if (!compile_builtin_arg(dc->args.get(), 1 + i, runbase + i, ops))
                 return fail();
         const int dst = alloc_temp();
         CgInstr cv;
@@ -4482,9 +4506,8 @@ struct Codegen {
                     bool ok =
                         compile_key_to_run_slot(sub, runbase, ops);
                     for (int i = 0; ok && i < nvals; i++)
-                        ok = compile_to_run_slot(
-                            dc->args->elems[1 + i].get(),
-                            runbase + 1 + i, ops);
+                        ok = compile_builtin_arg(dc->args.get(), 1 + i,
+                                                 runbase + 1 + i, ops);
                     if (ok) {
                         const int dst = alloc_temp();
                         CgInstr cv;
@@ -4537,7 +4560,7 @@ struct Codegen {
                         max_temp = next_temp;
                     bool ok = true;
                     for (int i = 0; ok && i < nvals; i++)
-                        ok = compile_to_run_slot(dc->args->elems[1 + i].get(),
+                        ok = compile_builtin_arg(dc->args.get(), 1 + i,
                                                  runbase + i, ops);
                     if (ok) {
                         const int dst = alloc_temp();
@@ -4676,7 +4699,8 @@ struct Codegen {
         int restbase = 0;
         bool rest_op = false;
         if (dc->lvalue_rest_native) {
-            if (!emit_args_range(dc->args->elems, restbase, ops, 1))
+            if (!emit_args_range(dc->args->elems, restbase, ops, 1,
+                                 dc->args.get()))
                 return false;   /* a rest arg didn't lower -> fall back */
             rest_op = true;
         } else if (dc->lvalue_rest_capable) {
@@ -4693,7 +4717,8 @@ struct Codegen {
              * the rest run via the checked ctor op: observably identical to
              * append_tw's construct-in-place, incl. the throw-before-append
              * ordering.) */
-            if (!emit_args_range(dc->args->elems, restbase, ops, 1))
+            if (!emit_args_range(dc->args->elems, restbase, ops, 1,
+                                 dc->args.get()))
                 return false;   /* didn't lower -> tree-walker (no self-eval) */
             rest_op = true;
         }

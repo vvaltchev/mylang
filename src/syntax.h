@@ -843,6 +843,20 @@ public:
      */
     std::vector<const UniqueId *> arg_names;
 
+    /*
+     * Per-argument numeric WIDENING (empty == none): an in-place builtin
+     * storing an argument into a typed container - `append(a, 5)` into an
+     * `array<float?>`, insert's dict key and value - stores it converted,
+     * as the element store `a[i] = 5` does (Expr14::rv_coerce). Stamped by
+     * the inferencer; the tree-walker's adapters apply it, the VM a
+     * CoerceNumV on the argument's run slot.
+     */
+    std::vector<DeclType> arg_widen;
+    DeclType widen_of(size_t i) const
+    {
+        return i < arg_widen.size() ? arg_widen[i] : DeclType::none;
+    }
+
     ExprList()
         : MultiElemConstruct<>("ExprList",
                                ConstructType::expr_list) { }
@@ -853,6 +867,7 @@ public:
         copy_base_fields(*c);
         clone_elems_into(*c);
         c->arg_names = arg_names;
+        c->arg_widen = arg_widen;
         return c;
     }
 };

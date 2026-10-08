@@ -1171,6 +1171,11 @@ struct WidenShape {
 };
 EvalValue widen_baked_value(const EvalValue &v, const WidenShape &s);
 
+/* A value's numeric WIDENING to a stored type (a literal's elem_coerce,
+ * a store's rv_coerce, ExprList::arg_widen): int/bool -> float for `f`,
+ * bool -> int for `i`; every other value, none included, as it is. */
+EvalValue literal_widen(EvalValue v, DeclType dt);
+
 /*
  * Mutable copies of an array/dict value (scalars/strings returned as-is):
  *  - make_mutable_clone: fresh mutable top, but read-only (const-backed)
