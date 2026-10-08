@@ -487,16 +487,17 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
      * Two GENERAL arrays may hold references, so the pair may be on a cycle:
      * the comparison runs on the cycle guard's pair stack (cyclewalk.h). A
      * flat side holds only scalars, so it is never on a stack and a cyclic
-     * general side differs from it at some element anyway - the plain loop
-     * below answers that case, as it always did.
+     * general side differs from it at some element anyway - the plain walk
+     * answers that case, as it always did.
      */
-    if (lhs.skind() == SharedArrayObj::Storage::general &&
-        rhs.skind() == SharedArrayObj::Storage::general)
-    {
-        CycKey kl, kr;
+    const bool general = lhs.skind() == SharedArrayObj::Storage::general &&
+                         rhs.skind() == SharedArrayObj::Storage::general;
+    CycPairStack &st = cyc_eq();
+    CycKey kl, kr;
+
+    if (general) {
         cyc_key(a, kl);
         cyc_key(b, kr);
-        CycPairStack &st = cyc_eq();
 
         /*
          * Identity shortcut: the same storage window on both sides covers the
@@ -515,33 +516,24 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
             a = be == 1;
             return;
         }
-
-        bool equal = true;
-        {
-            CycPairGuard g(st, kl, kr);
-            for (size_type i = 0; i < n; i++) {
-                if (arr_elem_at(lhs, i) != arr_elem_at(rhs, i)) {
-                    equal = false;
-                    break;
-                }
-            }
-        }
-        a = equal;
-        return;
     }
 
     /* Element-wise compare, reading each side without promoting (so two flat
      * arrays - or a flat and a general one - compare equal element by element,
-     * with the usual 1 == 1.0 numeric equality via EvalValue::operator!=). */
-    for (size_type i = 0; i < n; i++) {
-
-        if (arr_elem_at(lhs, i) != arr_elem_at(rhs, i)) {
-            a = false;
-            return;
+     * with the usual 1 == 1.0 numeric equality via EvalValue::operator!=).
+     * ONE loop for both cases: a second copy of it cost the inlining of the
+     * element compare (+33% Ir on a walk over nested arrays). */
+    bool equal = true;
+    {
+        CycPairGuard g(st, kl, kr, general);
+        for (size_type i = 0; i < n; i++) {
+            if (arr_elem_at(lhs, i) != arr_elem_at(rhs, i)) {
+                equal = false;
+                break;
+            }
         }
     }
-
-    a = true;
+    a = equal;
 }
 
 void TypeArr::noteq(EvalValue &a, const EvalValue &b)

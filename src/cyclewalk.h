@@ -186,15 +186,25 @@ private:
     const bool on;
 };
 
+/* Is `v` an array, a dict or a struct - a value that may be keyed? */
+inline bool cyc_maybe_container(const EvalValue &v)
+{
+    const Type::TypeE t = v.get_type()->t;
+    return t == Type::t_arr || t == Type::t_dict || t == Type::t_struct;
+}
+
 /*
- * Calls f(child) for each value directly inside `v` - a general array's
- * elements, a dict's keys, values and default, a boxed struct's fields -
- * until one call returns true; returns whether one did. A flat array or a
- * POD struct has no child that can hold a reference, so none is visited.
+ * Calls f(child) for each CONTAINER directly inside `v` - among a general
+ * array's elements, a dict's keys, values and default, a boxed struct's
+ * fields - until one call returns true; returns whether one did. A scalar,
+ * a string or a function child is skipped (no walk keys one), and a flat
+ * array or a POD struct has no child that can hold a reference.
  */
 template <class F>
 bool cyc_any_child(const EvalValue &v, F f)
 {
+    auto g = [&](const EvalValue &c) { return cyc_maybe_container(c) && f(c); };
+
     switch (v.get_type()->t) {
 
     case Type::t_arr: {
@@ -203,7 +213,7 @@ bool cyc_any_child(const EvalValue &v, F f)
             return false;
         const ArrayConstView view = a.get_view();
         for (size_type i = 0; i < view.size(); i++)
-            if (f(view[i].get()))
+            if (g(view[i].get()))
                 return true;
         return false;
     }
@@ -211,9 +221,9 @@ bool cyc_any_child(const EvalValue &v, F f)
     case Type::t_dict: {
         const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
         for (const auto &kv : d.get_ref())
-            if (f(kv.first) || f(kv.second.get()))
+            if (g(kv.first) || g(kv.second.get()))
                 return true;
-        return d.get_has_default() && f(d.get_default());
+        return d.get_has_default() && g(d.get_default());
     }
 
     case Type::t_struct: {
@@ -221,7 +231,7 @@ bool cyc_any_child(const EvalValue &v, F f)
         if (!s.def || s.is_pod())
             return false;
         for (const LValue &fl : s.fields)
-            if (f(fl.get()))
+            if (g(fl.get()))
                 return true;
         return false;
     }
@@ -232,15 +242,40 @@ bool cyc_any_child(const EvalValue &v, F f)
 }
 
 /*
+ * Can more than one reference reach the container `v`? Every reference a
+ * value graph holds - an element, a dict key or value, a field - is
+ * counted (only a frame slot can BORROW, #94), so a container whose count
+ * is 1 is reached through its one holder only.
+ */
+inline bool cyc_shared(const EvalValue &v)
+{
+    switch (v.get_type()->t) {
+    case Type::t_arr:
+        return v.get_ref<SharedArrayObj>().use_count() > 1;
+    case Type::t_dict:
+        return v.get_ref<intrusive_ptr<DictObject>>().use_count() > 1;
+    case Type::t_struct:
+        return v.get_ref<intrusive_ptr<StructObject>>().use_count() > 1;
+    default:
+        return true;
+    }
+}
+
+/*
  * Does a cycle lie on some path from `v`? A depth-first search: `path` is
  * the search's own path, `done` the containers already proven to reach no
- * cycle (so a container shared at many places is searched once).
+ * cycle (so a container shared at many places is searched once). Only a
+ * SHARED container is recorded there: one with a single holder is met only
+ * when that holder is expanded, and every holder is expanded at most once
+ * (a shared one is in `done` after its first search; an unshared one by
+ * the same argument, one level up). The insert was most of the search's
+ * cost on a tree.
  */
 inline bool cyc_reaches_cycle(const EvalValue &v, CycStack &path,
                               std::unordered_set<CycKey, CycKeyHash> &done)
 {
     CycKey k;
-    if (!cyc_key(v, k) || done.count(k))
+    if (!cyc_key(v, k) || (!done.empty() && done.count(k)))
         return false;
     if (path.contains(k))
         return true;
@@ -249,7 +284,8 @@ inline bool cyc_reaches_cycle(const EvalValue &v, CycStack &path,
             return cyc_reaches_cycle(c, path, done);
         }))
         return true;
-    done.insert(k);
+    if (cyc_shared(v))
+        done.insert(k);
     return false;
 }
 
@@ -366,19 +402,26 @@ class CycPairGuard {
 
 public:
 
-    CycPairGuard(CycPairStack &st, const CycKey &l, const CycKey &r)
-        : st(st)
+    CycPairGuard(CycPairStack &st, const CycKey &l, const CycKey &r,
+                 bool on = true)
+        : st(st), on(on)
     {
-        st.push(l, r);
+        if (on)
+            st.push(l, r);
     }
 
-    ~CycPairGuard() { st.pop(); }
+    ~CycPairGuard()
+    {
+        if (on)
+            st.pop();
+    }
 
     CycPairGuard(const CycPairGuard &) = delete;
     CycPairGuard &operator=(const CycPairGuard &) = delete;
 
 private:
     CycPairStack &st;
+    const bool on;
 };
 
 /*
