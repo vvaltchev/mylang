@@ -4721,6 +4721,13 @@ decisions behind it: `plans/archived/type-inference.md`,
   of another element type is still refused. A typed `const` container
   is widened by the PARSER when it binds it (pExpr14), because a read of
   it folded at parse time (`str(F)`) must see the run's value.
+  Its STORAGE follows the destination too, at every nesting level
+  (`stamp_literal_repr`): the ArrHint `array_repr_hint` derives from the
+  type - the one helper `set_array_repr_hint` also uses - on each written
+  literal, and `WidenShape::hint` for a value baked inside one; the
+  parser's `widen_shape_of_annot` is its twin for a typed const (read off
+  the annotation, before inference). Built from its own values, `[1.5]`
+  for an `array<float?>` was flat floats and a later `none` store failed.
   A single value an in-place builtin stores (`append`/`push`/`insert`,
   insert's dict key) widens like an element store's `rv_coerce` (#47):
   `ExprList::arg_widen`, applied by the tree-walker's lvalue adapters and
