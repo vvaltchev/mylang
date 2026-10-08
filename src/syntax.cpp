@@ -515,7 +515,8 @@ void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params)
 void StructDeclStmt::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
-    s << indent << "StructDecl(\"" << def->name->val << "\"";
+    s << indent << (def->is_class ? "ClassDecl(\"" : "StructDecl(\"")
+      << def->name->val << "\"";
 
     for (const auto &f : def->fields)
         s << ", " << f.name->val;

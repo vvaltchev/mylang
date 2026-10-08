@@ -1,0 +1,116 @@
+# A class is a struct with REFERENCE semantics (README "Classes"): a copy
+# shares the one object, a write through any holder is seen by every other,
+# == and hash() go by identity, `const` freezes the whole object.
+#
+# Every holder kind: a variable, a parameter, an array element, a dict
+# value, a struct field, a class field, a foreach variable, a capture. The
+# loops run each store enough times for the JIT's inline field-store tier,
+# whose guards decline a shared, a borrowed or a read-only object - for a
+# class the decline must WRITE THE SHARED OBJECT, never copy it.
+# runtime() keeps values out of const folding.
+
+class Node { int v; opt Node next; }
+class Box { int n; array<int> xs; }
+struct Holder { int x; Node n; }
+
+func ri(int v) => int(runtime(v));
+
+# 1. assignment shares
+var a = Node(ri(1), none);
+var b = a;
+b.v = 7;
+assert(a.v == 7 && a == b);
+assert(a != Node(7, none));         # equal fields, another instance
+
+# 2. a parameter writes the caller's object; a loop of shared writes
+func bump(Node n, int by) { n.v += by; }
+for (var i = 0; i < 200; i++)
+    bump(a, 1);
+assert(a.v == 207 && b.v == 207);
+
+# 3. through an opt field
+var c = Node(ri(2), a);
+var nx = c.next;
+if (nx != none) {
+    nx.v = 9;
+}
+assert(a.v == 9);
+
+# 4. a struct copies the REFERENCE in a class field, its own plain fields
+var s1 = Holder(ri(1), Node(ri(5), none));
+var s2 = s1;
+s2.n.v = 6;
+s2.x = 2;
+assert(s1.x == 1 && s1.n.v == 6 && s2.x == 2);
+s2.n = Node(0, none);
+assert(s1.n.v == 6 && s2.n.v == 0);
+
+# 5. array elements and foreach variables share
+var arr = [a, c, a];
+for (var i = 0; i < 100; i++)
+    arr[0].v += 1;
+assert(a.v == 109 && arr[2].v == 109);
+foreach (var n in arr)
+    n.v++;
+assert(a.v == 111 && c.v == 3);
+
+# 6. a dict keyed by identity: found after its fields change
+var d = {};
+d[a] = "a";
+d[c] = "c";
+a.v = 1234;
+assert(d[a] == "a" && d[c] == "c" && len(d) == 2);
+var k2 = Node(1234, a.next);
+assert(get(d, k2) == none);         # equal fields, not the key
+
+# 7. a dict value and a capture share too
+var dv = {"k": Box(ri(1), [1])};
+var bx = dv["k"];
+bx.n = 50;
+assert(dv["k"].n == 50);
+var inc = func [bx] () { bx.n += 1; return bx.n; };
+inc();
+inc();
+assert(bx.n == 52 && dv["k"].n == 52);
+
+# 8. clone makes a new instance, deepclone copies what it reaches
+var bc = clone(bx);
+bc.n = 1;
+append(bc.xs, 2);                   # shallow: the array is shared
+assert(bx.n == 52 && len(bx.xs) == 2 && bc != bx);
+var bd = deepclone(bx);
+append(bd.xs, 3);
+assert(len(bx.xs) == 2 && len(bd.xs) == 3);
+
+# 9. a constant is read-only through every alias
+const K = Box(1, [1, 2]);
+var ka = K;
+var caught = 0;
+try { ka.n = 5; } catch (CannotChangeConstEx) { caught++; }
+try { append(ka.xs, 3); } catch (CannotChangeConstEx) { caught++; }
+func set_n(Box x) { x.n = 9; }
+try { set_n(K); } catch (CannotChangeConstEx) { caught++; }
+assert(caught == 3 && K.n == 1 && ka == K);
+const K2 = Box(1, [1, 2]);
+assert(K != K2);                    # two declarations, two instances
+const L = [K, K];
+assert(L[0] == L[1] && L[0] == K);
+
+# 10. zero-init builds a fresh instance each time
+Box z1;
+Box z2;
+assert(z1 != z2 && z1.n == 0 && len(z1.xs) == 0);
+
+# 11. a ring (a.next = a) - broken again before the end, so nothing leaks
+var r = Node(ri(1), none);
+r.next = r;
+var rn = r.next;
+if (rn != none)
+    assert(rn == r);
+r.next = none;
+
+# 12. kinds
+assert(kindstr(a) == "class" && typestr(a) == "Node");
+assert(kindstr(s1) == "struct");
+
+print("ok");

@@ -1473,6 +1473,19 @@ static EvalValue pod_load_field(const FieldDef &f, const char *base)
 /* STRUCT VALUE SEMANTICS (eval.h) */
 StructObject &struct_own(LValue *&holder)
 {
+    {
+        /* a CLASS instance is a reference: every holder writes the one
+         * object, whoever else holds it - and a constant's is read-only
+         * through every alias, so the write is refused, as a mutating
+         * builtin on a constant array is */
+        StructObject &o =
+            *holder->get().get_ref<intrusive_ptr<StructObject>>();
+        if (o.def->is_class) {
+            if (o.is_readonly())
+                throw CannotChangeConstEx();
+            return o;
+        }
+    }
     if (holder->is_borrowed()) {
         /* the caller's slot holds the counted reference: a write here
          * would change the caller's struct, whatever the count says */
@@ -1996,10 +2009,20 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
         }
 
         /* Calling a struct type descriptor constructs an instance. By this
-         * point a named call has been desugared to positional. */
-        if (callable.is<StructTypeDef *>())
-            return construct_struct(ctx, callable.get<StructTypeDef *>(),
-                                    node->args.get());
+         * point a named call has been desugared to positional. A CLASS
+         * instance is made at compile time only by a `const` declaration
+         * (CallExpr::in_const_decl): a pure function that constructs one
+         * named after it is refused here, when the call is evaluated, and
+         * one named before it by the parser. */
+        if (callable.is<StructTypeDef *>()) {
+            StructTypeDef *def = callable.get<StructTypeDef *>();
+            if (def->is_class && ctx && ctx->in_const_eval()
+                && !node->in_const_decl)
+                throw SyntaxErrorEx(node->start,
+                    "a pure function cannot construct a class instance "
+                    "(each construction is a new object)");
+            return construct_struct(ctx, def, node->args.get());
+        }
 
     } catch (Exception &e) {
         stamp_args_loc(e, node->args.get());     /* RULE 2: see above */
@@ -2538,7 +2561,7 @@ EvalValue make_deep_mutable_clone(const EvalValue &v)
  * mutable).
  */
 EvalValue
-make_const_clone(const EvalValue &v)
+make_const_clone(const EvalValue &v, bool key)
 {
     if (v.is<SharedArrayObj>()) {
 
@@ -2615,7 +2638,7 @@ make_const_clone(const EvalValue &v)
         vec.reserve(view.size());
 
         for (unsigned i = 0; i < view.size(); i++)
-            vec.emplace_back(make_const_clone(view[i].get()), false);
+            vec.emplace_back(make_const_clone(view[i].get(), key), false);
 
         SharedArrayObj arr(std::move(vec));
         arr.set_readonly();
@@ -2630,13 +2653,13 @@ make_const_clone(const EvalValue &v)
         for (const auto &p : src_obj.get_ref()) {
             data.emplace(
                 p.first,
-                LValue(make_const_clone(p.second.get()), false)
+                LValue(make_const_clone(p.second.get(), key), false)
             );
         }
 
         auto obj = make_intrusive<DictObject>(std::move(data));
         if (src_obj.get_has_default())   /* preserve the default-dict default */
-            obj->set_default(make_const_clone(src_obj.get_default()));
+            obj->set_default(make_const_clone(src_obj.get_default(), key));
         obj->set_readonly();
         return intrusive_ptr<DictObject>(obj);
     }
@@ -2644,6 +2667,26 @@ make_const_clone(const EvalValue &v)
     if (v.is<intrusive_ptr<StructObject>>()) {
 
         const StructObject &src = *v.get<intrusive_ptr<StructObject>>().get();
+
+        /*
+         * A CLASS instance keeps its identity: it is never copied here. As
+         * (part of) a dict KEY it is not frozen either - its hash is its
+         * identity, which no field write changes, and freezing it would
+         * make the program's own object read-only. As a CONSTANT it is
+         * frozen IN PLACE: a constant's class objects are made by its
+         * declaration at compile time (a class construction is never
+         * folded anywhere else), so nothing else holds them yet - and
+         * freezing in place keeps two references to one of them one object.
+         */
+        if (src.def->is_class) {
+            if (key || src.is_readonly())
+                return v;
+            StructObject &o = const_cast<StructObject &>(src);
+            o.set_readonly();
+            for (auto &f : o.fields)
+                f.put(make_const_clone(f.get(), false));
+            return v;
+        }
 
         /* POD: bytes hold no references, so a byte copy is a deep copy. */
         if (src.is_pod()) {
@@ -2655,7 +2698,7 @@ make_const_clone(const EvalValue &v)
         auto obj = make_intrusive<StructObject>(src.def);
         obj->fields.reserve(src.fields.size());
         for (const auto &f : src.fields)
-            obj->fields.emplace_back(make_const_clone(f.get()), false);
+            obj->fields.emplace_back(make_const_clone(f.get(), key), false);
         obj->set_readonly();
         return intrusive_ptr<StructObject>(obj);
     }
@@ -5941,6 +5984,11 @@ EvalValue Block::do_eval(EvalContext *ctx, bool rec) const
      */
     unique_ptr<Frame> root_frame;
 
+    /* the program starts: number its class instances from the base every
+     * engine uses (g_class_ident - vm_run does the same) */
+    if (!ctx)
+        class_ident_reset(CLASS_IDENT_RUN_BASE);
+
     if (!ctx && slot_count) {
         root_frame = make_unique<Frame>();
         root_frame->init(slot_count);
@@ -6714,7 +6762,7 @@ EvalValue build_dict_from_pairs(const EvalValue *pairs, size_t npairs,
     DictObject::inner_type data;
     data.reserve(npairs);   /* profile #5: kill the insert rehash chain */
     for (size_t i = 0; i < npairs; i++)
-        data.emplace(make_const_clone(pairs[2 * i]),
+        data.emplace(make_const_clone(pairs[2 * i], true),
                      LValue(pairs[2 * i + 1], is_const));
     return intrusive_ptr<DictObject>(make_intrusive<DictObject>(std::move(data)));
 }

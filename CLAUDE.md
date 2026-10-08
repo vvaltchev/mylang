@@ -6754,6 +6754,57 @@ but the per-element `StructObject` allocation is gone (build overhead
   all work and are pinned by the `struct:` empty-struct tests. The useful
   case is a payload-less exception marker type.
 
+- **⛔ A CLASS IS A STRUCT WITH REFERENCE SEMANTICS
+  (`StructTypeDef::is_class`, plans/class-and-box.md, step 1 2026-10-08).**
+  `class Name { ... }` parses as a struct declaration (`kw_class`,
+  `pAcceptStructDecl`) and its instances are the same `StructObject` with
+  the same `t_struct` tag - EVERY difference is decided by
+  `def->is_class`, never by a second type tag. Six rules, each the place a
+  new struct-handling site must ask:
+  - **`struct_own` hands back the object itself** (never a copy, never
+    `write_target`), and throws `CannotChangeConstEx` for a read-only one.
+    Every write path already funnels through it, so the JIT's inline
+    field-store tier stays sound by declining (`memberv_shared` etc.) to
+    the helper - correct, and slow for a shared instance (step 4).
+  - **A class is never POD** (`compute_layout` returns boxed): POD is what
+    may be embedded BY VALUE - inline in a struct, flat in an array - so
+    every `is_pod()` consumer treats a class as a pointer with no change.
+  - **`==` and `hash` are identity.** `hash` uses `StructObject::ident`, a
+    number from `g_class_ident` (structtype.h) - NOT the address, which
+    would make a class-keyed dict's iteration order differ between runs,
+    engines and a `.myv` load. The counter restarts at 0 in the
+    ParseContext ctor (a program's constants) and at
+    `CLASS_IDENT_RUN_BASE` where a run starts (`vm_run`, the root
+    `Block::do_eval`), so every engine numbers its instances alike; a
+    copy (`clone`) is a new number. A collision costs a probe: `==` is the
+    pointer compare.
+  - **Identity must not be duplicated or merged by a compile-time pass.**
+    So a class instance is made at compile time ONLY by a `const`
+    declaration's initializer (`CallExpr::in_const_decl`, also set for a
+    struct's const member); a pure function cannot construct one (the
+    parser refuses a class it can name, the construct dispatch one named
+    later); `Identifier::names_class` makes a function impure
+    (`func_body_is_pure`), so no fold, CSE or unroll merges two
+    constructions; and `cse_key_rec` refuses a class construction, so two
+    `const` declarations are two objects. `make_const_clone` keeps a class
+    instance's identity: a dict KEY's is left alone (`key` true - its hash
+    does not change with its fields), a constant's is frozen IN PLACE.
+  - **The loop transforms treat a class field as shared storage**
+    (`fr_member_of_value` is false for a class base; `th_val` is false for
+    a class) - `y.n = 1` may change `x.n` when they are one instance.
+  - **`.myv` v33**: a StructDef's `is_class`, and the `cls` value record -
+    an instance written once with its number, later occurrences as a
+    reference to it, so identity and hash survive a load. The loader now
+    also checks every stored struct value against its def (class or not,
+    POD or not, its size or field count).
+  `opt` is allowed on a class-typed field (a null reference) and still not
+  on a struct-typed one; a forward reference is checked by the
+  inferencer's `check_opt_struct_fields` (`FieldDef::loc`, compile-only).
+  Net: `tests/functional/81_class_reference_semantics.my`, the `class:`
+  `-rt` entries, the class `alias:` layer case, the `driver_checks` image
+  case.
+
+## Error model
 ## Error model
 
 `errors.h` defines an `Exception` base (`name`, `msg`, `loc_start`, `loc_end`)

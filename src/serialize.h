@@ -23,7 +23,12 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 32;   /* v32: BuiltinCall and
+constexpr unsigned MYV_FORMAT_VERSION = 33;   /* v33: a StructDef
+                                                 record's is_class flag,
+                                                 the `cls` value record
+                                                 (a class instance and
+                                                 its identity);
+                                                 v32: BuiltinCall and
                                                  CallSite gain a step
                                                  list (the chain forms
                                                  of #32), CallSite's

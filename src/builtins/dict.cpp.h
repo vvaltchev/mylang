@@ -95,7 +95,8 @@ builtin_insert_dict(LValue *lval, const EvalValue &key, const EvalValue &val)
      * hash and strand the entry in the wrong bucket, findable by NO key. */
     if (dictObj.get_ref().count(key))
         return false;
-    return dictObj.insert_if_absent(make_const_clone(key), LValue(val, false));
+    return dictObj.insert_if_absent(make_const_clone(key, true),
+                                    LValue(val, false));
 }
 
 /*
@@ -303,7 +304,7 @@ builtin_dict(EvalContext *ctx, const ArgLocs *exprList,
          * mutated later and corrupt the dict.
          */
         data.insert_or_assign(
-            make_const_clone(arr_elem_at(pair, 0)),
+            make_const_clone(arr_elem_at(pair, 0), true),
             LValue(arr_elem_at(pair, 1), false)
         );
     }
@@ -360,7 +361,7 @@ EvalValue builtin_make_dict(EvalContext *ctx, const ArgLocs *exprList,
         const EvalValue k = arr_elem_at(keys, i);
         const EvalValue v = inv.call(k);
 
-        data.insert_or_assign(make_const_clone(k), LValue(v, false));
+        data.insert_or_assign(make_const_clone(k, true), LValue(v, false));
     }
 
     return intrusive_ptr<DictObject>(make_intrusive<DictObject>(std::move(data)));

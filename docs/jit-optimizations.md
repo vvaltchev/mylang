@@ -17693,3 +17693,28 @@ list from the start per region (it records INT pin events per replayed
 transition, so restructuring it changes the intrusive-test record). And
 the FRONT END grows superlinearly on the same probes with the JIT off
 (`Resolver::walk` 3.8x per doubling) - not this entry.
+
+## A CLASS instance's field store stays inline when shared (2026-10-08)
+
+`class` (plans/class-and-box.md, step 1) is a struct with reference
+semantics: `struct_own` hands a class instance back as it is - shared,
+borrowed or not - and only refuses a read-only one. The #97 increment 4
+inline field-store tier (StoreMemberV) guards that its object is what
+`struct_own` would hand back UNCHANGED, which for a struct means "the
+slot's alone": count one (`memberv_shared`), slot not borrowed
+(`memberv_borrowed`). For a class instance two names share - the normal
+case - both guards declined, so every store went to the helper.
+
+The member key's baked def is a compile-time fact the def guard makes
+true at run time, so for a CLASS def the emitter now leaves out those two
+guards and keeps the read-only one. Nothing else changes: a class def is
+never POD (`compute_layout`), so only the boxed form is ever emitted for
+one.
+
+Reach, from emitted code: `jit_memberv_native`'s class case stores to an
+instance two variables share and through a (borrowed) parameter, and
+requires `g_jit_memberv_fast` to count at least 20 inline stores; with the
+guards kept (sabotage: `cls` forced false) it counts 0 and the case fails.
+No corpus program declares a class yet, so the emitted code of every
+existing program is unchanged by construction (the branch is on
+`is_class`). Not measured in Ir: nothing in bench/ uses a class.

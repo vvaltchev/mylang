@@ -4059,8 +4059,9 @@ func_body_is_pure(const Construct *c,
         return true;
 
     if (auto *id = dynamic_cast<const Identifier *>(c))
-        return id->sym.kind == SymKind::local || id->is_const ||
-               pure_names.count(id->uid) != 0;
+        return !id->names_class &&        /* a construction: a new object */
+               (id->sym.kind == SymKind::local || id->is_const ||
+                pure_names.count(id->uid) != 0);
 
     if (ctag(c) == ConstructType::func_decl)
         return false;   /* a nested function: be conservative */

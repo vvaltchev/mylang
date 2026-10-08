@@ -2982,6 +2982,9 @@ vm_run(VmProgram &prog)
 {
     ExecGuard exec_guard;
     EvalContext ctx(nullptr, /*const_ctx=*/false);
+    /* a run numbers its class instances from one base, in every engine
+     * (g_class_ident: the hash of a class instance) */
+    class_ident_reset(CLASS_IDENT_RUN_BASE);
 
     /* Main's frame - the resolved locals plus the register machine's scratch
      * temps [slot_count, slot_count + n_temps) - is the activation's FIRST

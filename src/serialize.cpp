@@ -30,6 +30,8 @@
 #include "vm.h"
 #include "eval.h"
 #include "jit.h"
+#include <unordered_map>
+#include <unordered_set>
 #include "codegen.h"
 #include "env.h"
 
@@ -250,6 +252,10 @@ struct Writer {
     /* index maps for the cross-referenced tables */
     std::map<const StructTypeDef *, uint32_t> struct_ids;
     std::map<const FuncDescriptor *, uint32_t> desc_ids;
+    /* the class instances already written (by identity number): a later
+     * occurrence is written as a reference, so two references to one
+     * instance load as one */
+    std::unordered_set<uint64_t> classes_written;
 
     /*
      * True while writing the STRUCT table's folded `const` members, which
@@ -384,6 +390,34 @@ struct Reader {
      * capture-free check the wiring phase runs once they are filled. */
     bool descs_filled = false;
     std::vector<const FuncDescriptor *> deferred_funcs;
+    /* the class instances read so far, by identity number (a `cls`
+     * reference names one) */
+    std::unordered_map<uint64_t, intrusive_ptr<StructObject>> classes;
+    /* A struct value must match its def: a class instance (`cls`) a class
+     * def, a `strct` record a struct def of the same layout and size. A
+     * value read while the struct records are still being read (a const
+     * member) is checked once every layout is computed. */
+    bool layouts_done = false;
+    struct StructValCheck {
+        const StructTypeDef *def;
+        bool cls, pod;
+        size_t n;            /* bytes (pod) or fields */
+    };
+    std::vector<StructValCheck> deferred_struct_vals;
+
+    void check_struct_val(const StructTypeDef *def, bool cls, bool pod,
+                          size_t n)
+    {
+        if (!layouts_done) {
+            deferred_struct_vals.push_back({ def, cls, pod, n });
+            return;
+        }
+        if (def->is_class != cls || def->is_pod() != pod
+            || n != (pod ? static_cast<size_t>(def->size)
+                         : def->fields.size()))
+            bad_image("corrupt .myv (a struct value does not match its "
+                      "struct)");
+    }
 
     explicit Reader(const std::string &b) : buf(b) { }
 
@@ -606,7 +640,8 @@ struct Reader {
 /* ------------------------------------------------------------------ */
 
 enum class VTag : uint8_t {
-    none = 0, boolean, integer, flt, str, arr, dict, strct, structtype, func
+    none = 0, boolean, integer, flt, str, arr, dict, strct, structtype, func,
+    cls
 };
 
 void write_value(Writer &w, const EvalValue &v);
@@ -755,6 +790,28 @@ void write_value(Writer &w, const EvalValue &v)
             write_value(w, kv.first);
             write_value(w, kv.second.get());
         }
+    } else if (v.is<intrusive_ptr<StructObject>>()
+               && v.get_ref<intrusive_ptr<StructObject>>()->def->is_class) {
+        /* a CLASS instance: its identity is part of its value - written
+         * once, then referred to by number (a constant's class instances
+         * keep the numbers the compile gave them, so their hashes, and a
+         * dict keyed by them, are the same in the source run) */
+        w.u8v(static_cast<uint8_t>(VTag::cls));
+        const StructObject &so = *v.get_ref<intrusive_ptr<StructObject>>();
+        auto it = w.struct_ids.find(so.def);
+        if (it == w.struct_ids.end())
+            bad_image("unserializable value (class def)");
+        w.u32v(it->second);
+        w.i64v(static_cast<int64_t>(so.ident));
+        if (!w.classes_written.insert(so.ident).second) {
+            w.u8v(0);                               /* a reference */
+        } else {
+            w.u8v(1);                               /* the instance */
+            w.boolv(so.is_readonly());
+            w.u32v(static_cast<uint32_t>(so.fields.size()));
+            for (const LValue &f : so.fields)
+                write_value(w, f.get());
+        }
     } else if (v.is<intrusive_ptr<StructObject>>()) {
         w.u8v(static_cast<uint8_t>(VTag::strct));
         const StructObject &so = *v.get<intrusive_ptr<StructObject>>();
@@ -840,6 +897,34 @@ EvalValue read_value(Reader &r)
         }
         if (ro)
             so->set_readonly();
+        r.check_struct_val(so->def, false, pod,
+                           pod ? so->bytes.size() : so->fields.size());
+        return EvalValue(std::move(so));
+    }
+    case VTag::cls: {
+        const uint32_t di = r.idx(r.structs.size(), "corrupt .myv (class)");
+        const uint64_t ident = static_cast<uint64_t>(r.i64v());
+        if (r.u8v() == 0) {
+            auto it = r.classes.find(ident);
+            if (it == r.classes.end() || it->second->def != r.structs[di])
+                bad_image("corrupt .myv (a class reference names no "
+                          "instance)");
+            return EvalValue(it->second);
+        }
+        auto so = make_intrusive<StructObject>();
+        so->def = r.structs[di];
+        so->ident = ident;
+        /* registered BEFORE its fields: a field may refer back to it */
+        if (!r.classes.emplace(ident, so).second)
+            bad_image("corrupt .myv (two class instances share a number)");
+        const bool ro = r.boolv();
+        const uint32_t n = r.countv();
+        so->fields.reserve(n);
+        for (uint32_t i = 0; i < n; i++)
+            so->fields.emplace_back(read_value(r), false);
+        if (ro)
+            so->set_readonly();
+        r.check_struct_val(so->def, true, false, so->fields.size());
         return EvalValue(std::move(so));
     }
     case VTag::structtype: {
@@ -1853,6 +1938,7 @@ void myv_write(const VmProgram &prog, const std::string &path,
     /* structs (the count is in the table of contents) */
     for (const auto &sd : prog.structs) {
         w.uidv(sd->name);
+        w.boolv(sd->is_class);                                  /* v33 */
         w.u32v(static_cast<uint32_t>(sd->fields.size()));
         for (const FieldDef &f : sd->fields) {
             w.uidv(f.name);
@@ -2212,6 +2298,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
     for (uint32_t i = 0; i < n; i++) {
         StructTypeDef &sd = *prog.structs[i];
         sd.name = r.uid_req("corrupt .myv (struct with no name)");
+        sd.is_class = r.boolv();                                /* v33 */
         const uint32_t nf = r.countv();
         sd.fields.reserve(nf);
         for (uint32_t j = 0; j < nf; j++) {
@@ -2291,6 +2378,10 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
      */
     for (auto &sdp : prog.structs)
         sdp->compute_layout();
+    r.layouts_done = true;
+    for (const auto &c : r.deferred_struct_vals)
+        r.check_struct_val(c.def, c.cls, c.pod, c.n);
+    r.deferred_struct_vals.clear();
 
     /* The pool closures read while the descriptors were shells: the
      * capture-free rule (read_value's `func` case) on the real record. */

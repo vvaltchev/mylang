@@ -782,7 +782,8 @@ ReplEngine::Impl::cmd_globals()
             r.kind = "func";
             r.type = reflect_func_sig(v.get<intrusive_ptr<FuncObject>>()->func);
         } else if (v.is<StructTypeDef *>()) {
-            r.kind = "struct type";
+            r.kind = v.get<StructTypeDef *>()->is_class ? "class type"
+                                                        : "struct type";
             r.type = reflect_struct_ctor(v.get<StructTypeDef *>());
         } else if (v.is<intrusive_ptr<StructObject>>()) {
             r.kind = is_const ? "const" : "var";

@@ -24738,6 +24738,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * the slot's alone - its count one, the slot not borrowed (#94),
          * the object not read-only. Any of those failing declines to the
          * helper, whose vm_member_store makes it the slot's own first.
+         * A CLASS instance is a reference: struct_own hands it back
+         * shared or borrowed, so for a class def (a compile-time fact -
+         * the def guard makes it true at run time) only the read-only
+         * guard is emitted, and a store to an instance two names share
+         * stays inline instead of declining on every iteration.
          */
         const Chunk::MemberKey &mk = ck.member_keys[in.a_lit()];
         const JitLayout &Lm = jit_layout();
@@ -24783,9 +24788,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * parameter's field store is refused at compile time when its
              * type is known, and is the call's own copy at run time) */
             /* the slot is not BORROWED (#94): the caller's slot holds the
-             * counted reference, so the struct is the caller's too */
-            e.cmp_byte_slot(base.type + (L.lv_borrowed_off - L.off_type), 0);
-            decl_ne(JD_memberv_borrowed);
+             * counted reference, so the struct is the caller's too - and
+             * for a class the caller's is the one to write */
+            const bool cls = mk.bake_def->is_class;
+            if (!cls) {
+                e.cmp_byte_slot(base.type
+                                + (L.lv_borrowed_off - L.off_type), 0);
+                decl_ne(JD_memberv_borrowed);
+            }
             e.load(acc.r, base.payload);                 /* StructObject* */
             e.movabs(s1, reinterpret_cast<uint64_t>(mk.bake_def));
             e.cmp_base_reg(acc.r, static_cast<int32_t>(L.sobj_def), s1);
@@ -24796,8 +24806,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
              * struct is a VALUE, and a second holder - another variable,
              * an element, a capture - must not see this write. Else the
              * helper makes it the slot's own first (struct_own). */
-            e.cmp_dword_base_imm8(acc.r, static_cast<int32_t>(L.sobj_rc), 1);
-            decl_ne(JD_memberv_shared);
+            if (!cls) {
+                e.cmp_dword_base_imm8(acc.r,
+                                      static_cast<int32_t>(L.sobj_rc), 1);
+                decl_ne(JD_memberv_shared);
+            }
             if (pod_form) {
                 /* the value must ALREADY be the field's exact scalar
                  * kind (field_exact_scalar): anything else is a real
