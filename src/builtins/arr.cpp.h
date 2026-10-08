@@ -16,21 +16,6 @@
 #include <algorithm>
 
 /*
- * A flat (unboxed) array<int>/array<float> holds exactly one scalar kind, fixed
- * at creation from the proven static type. Storing a different type would need
- * an in-place flat->general conversion (promotion), which mylang deliberately
- * does NOT do - that is what type-driven representation buys (no GC-like
- * latency spikes; the representation is decided once, at creation). This is
- * reachable only by laundering a typed array through `dyn` and then mutating it
- * (`var dyn d = int_array; append(d, "x")`): the shared storage stays int-typed
- * even through the dyn alias, and an alias-affecting write can't change it.
- * Declare the array `dyn` from the start for a (general) polymorphic array.
- */
-static const char *const flat_array_violation_msg =
-    "Cannot store a value of a different type in a flat (typed) array; "
-    "declare the array dyn for a polymorphic array";
-
-/*
  * array(N)        -> N elements of `none` (general storage).
  * array(N, value) -> N elements all equal to `value`. The fill value drives the
  *                    storage (value-driven, see plans/archived/typed-arrays.md): an int
@@ -356,6 +341,9 @@ static void arr_append_maintain_hash(SharedArrayObj &arr, const EvalValue &elem)
  * `is_const` is the general-path element flag (ctx->const_ctx from the
  * builtin; false from the VM's runtime op).
  */
+static bool arr_push_value(SharedArrayObj &arr, const EvalValue &elem,
+                           bool is_const);
+
 bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
 {
     if (!lval || !lval->is<SharedArrayObj>() || lval->is_const_var())
@@ -365,6 +353,62 @@ bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
 
     if (arr.is_readonly() || arr.is_slice())
         return false;
+
+    return arr_push_value(arr, elem, is_const);
+}
+
+/*
+ * Does `elem` fit the storage of `arr`? The SAME rules arr_push_value
+ * applies (the push is the authority - an ASSERTS build checks the two
+ * agree on every push): a flat scalar kind takes its own scalar and the
+ * ones that widen into it, a flat POD-struct array a POD instance of its
+ * def, and the general and string kinds anything (a string array
+ * promotes).
+ */
+static bool arr_elem_fits(const SharedArrayObj &arr, const EvalValue &elem)
+{
+    switch (arr.skind()) {
+    case SharedArrayObj::Storage::ints:
+        return elem.is<int_type>() || elem.is<bool>();
+    case SharedArrayObj::Storage::floats:
+        return elem.is<float_type>() || elem.is<int_type>() ||
+               elem.is<bool>();
+    case SharedArrayObj::Storage::bools:
+        return elem.is<bool>();
+    case SharedArrayObj::Storage::structs: {
+        if (!elem.is<intrusive_ptr<StructObject>>())
+            return false;
+        const StructObject &o = *elem.get<intrusive_ptr<StructObject>>();
+        return o.is_pod() && o.def == arr.flat_structs().def;
+    }
+    default:
+        return true;
+    }
+}
+
+/* arr_push_value's refusal - which arr_elem_fits must agree with */
+#ifndef NDEBUG
+static bool arr_push_refused(bool fits)
+{
+    ML_CHECK(!fits);
+    return false;
+}
+#else
+#define arr_push_refused(fits) false
+#endif
+
+/*
+ * Append `elem` to a MUTABLE, NON-SLICE array in place, keeping its
+ * storage when the element fits; false (and the array untouched) for a
+ * flat-storage mismatch - the dyn-launder error, which the caller raises.
+ */
+static bool arr_push_value(SharedArrayObj &arr, const EvalValue &elem,
+                           bool is_const)
+{
+    ML_CHECK(!arr.is_readonly() && !arr.is_slice());
+#ifndef NDEBUG
+    const bool fits = arr_elem_fits(arr, elem);
+#endif
 
     switch (arr.skind()) {
     case SharedArrayObj::Storage::ints:
@@ -376,7 +420,7 @@ bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
         else if (elem.is<bool>())
             arr.flat_ints().push_back(elem.get<bool>() ? 1 : 0);
         else
-            return false;
+            return arr_push_refused(fits);
         break;
     case SharedArrayObj::Storage::floats:
         if (elem.is<float_type>())
@@ -387,20 +431,20 @@ bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
         else if (elem.is<bool>())
             arr.flat_floats().push_back(elem.get<bool>() ? 1.0 : 0.0);
         else
-            return false;
+            return arr_push_refused(fits);
         break;
     case SharedArrayObj::Storage::bools:
         if (!elem.is<bool>())
-            return false;
+            return arr_push_refused(fits);
         arr.flat_bools().push_back(elem.get<bool>() ? 1 : 0);
         break;
     case SharedArrayObj::Storage::structs: {
         if (!elem.is<intrusive_ptr<StructObject>>())
-            return false;
+            return arr_push_refused(fits);
         const StructObject &o = *elem.get<intrusive_ptr<StructObject>>().get();
         auto &sv = arr.flat_structs();
         if (!o.is_pod() || o.def != sv.def)
-            return false;
+            return arr_push_refused(fits);
         const size_t at = sv.buf.size();
         sv.buf.resize(at + sv.stride);
         std::memcpy(sv.buf.data() + at, o.bytes.data(), sv.stride);
@@ -423,6 +467,7 @@ bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const)
         break;
     }
 
+    ML_CHECK(fits);
     arr_append_maintain_hash(arr, elem);
     return true;
 }

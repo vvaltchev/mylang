@@ -3333,8 +3333,10 @@ and a `float` global keeps a float when a function assigns it an int.
 Because the representation is fixed, the *only* way to ask a flat
 (statically-typed) array to hold a value of a different type is to launder it
 through a `dyn` alias and mutate that (e.g. `var dyn d = int_array;
-append(d, "x")`). The array's shared storage stays int-typed, so this raises a
-`TypeError` rather than promoting.
+append(d, "x")`, or `d += ["x"]`). The array's shared storage stays
+int-typed, so this raises a `TypeError` rather than promoting, and leaves the
+array unchanged. (`a += b` grows `a` in place, like a run of `append`s, so
+every alias of `a` sees the new elements.)
 
 To get a polymorphic (general) array on purpose:
 

@@ -223,6 +223,26 @@ void SharedArrayObjTempl<LValueT>::clone_aliased_slices(size_type index)
     shobj->has_slices = !shobj->slices.empty();
 }
 
+/*
+ * A flat (unboxed) array<int>/array<float> holds exactly one scalar kind, fixed
+ * at creation from the proven static type. Storing a different type would need
+ * an in-place flat->general conversion (promotion), which mylang deliberately
+ * does NOT do - that is what type-driven representation buys (no GC-like
+ * latency spikes; the representation is decided once, at creation). This is
+ * reachable only by laundering a typed array through `dyn` and then mutating it
+ * (`var dyn d = int_array; append(d, "x")`): the shared storage stays int-typed
+ * even through the dyn alias, and an alias-affecting write can't change it.
+ * Declare the array `dyn` from the start for a (general) polymorphic array.
+ */
+static const char *const flat_array_violation_msg =
+    "Cannot store a value of a different type in a flat (typed) array; "
+    "declare the array dyn for a polymorphic array";
+
+/* builtins/arr.cpp.h: the append core TypeArr::add shares */
+static bool arr_elem_fits(const SharedArrayObj &arr, const EvalValue &elem);
+static bool arr_push_value(SharedArrayObj &arr, const EvalValue &elem,
+                           bool is_const);
+
 /* Read element `i` (slice-relative) as a boxed EvalValue WITHOUT promoting flat
  * storage (defined below). */
 static EvalValue arr_elem_at(const SharedArrayObj &arr, size_type i);
@@ -415,31 +435,45 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
     }
 
     /*
-     * Mixed / general concat. The result is a general array. If lhs is already
-     * a general non-slice, append rhs's elements in place; otherwise build a
-     * fresh general array. Either way both operands are read via arr_elem_at,
-     * so a flat operand is read directly (its representation is never promoted).
+     * Every other pairing appends ELEMENT BY ELEMENT. A non-slice lhs grows
+     * IN PLACE, through the storage every alias shares - `var t = s; t +=
+     * x` grows `s` too, whatever the storage kind (it used to build a fresh
+     * array whenever the lhs was not general, so a flat string or struct
+     * array lost its aliases). The elements are read first (`a += a`
+     * reads the array it grows), and each must fit the lhs storage before
+     * any is appended: a flat array through a `dyn` alias refuses a value
+     * of another type, as append does, and the array is left unchanged.
+     * A slice lhs is a view with copy semantics: it gets a fresh array.
      */
     const size_type rn = rhs.size();
 
-    if (lval.skind() == SharedArrayObj::Storage::general && !lval.is_slice()) {
+    if (!lval.is_slice()) {
 
-        auto &v = lval.get_vec();   /* general: get_vec() doesn't promote */
-        v.reserve(lval.size() + rn);
+        std::vector<EvalValue> items;
+        items.reserve(rn);
         for (size_type i = 0; i < rn; i++)
-            v.emplace_back(arr_elem_at(rhs, i), false);
+            items.push_back(arr_elem_at(rhs, i));
 
-    } else {
+        for (const EvalValue &e : items)
+            if (!arr_elem_fits(lval, e))
+                throw TypeErrorEx(flat_array_violation_msg);
 
-        const size_type ln = lval.size();
-        SharedArrayObj::vec_type new_arr;
-        new_arr.reserve(ln + rn);
-        for (size_type i = 0; i < ln; i++)
-            new_arr.emplace_back(arr_elem_at(lval, i), false);
-        for (size_type i = 0; i < rn; i++)
-            new_arr.emplace_back(arr_elem_at(rhs, i), false);
-        lval = SharedArrayObj(std::move(new_arr));
+        for (const EvalValue &e : items) {
+            const bool ok = arr_push_value(lval, e, false);
+            ML_CHECK(ok);
+            (void)ok;
+        }
+        return;
     }
+
+    const size_type ln = lval.size();
+    SharedArrayObj::vec_type new_arr;
+    new_arr.reserve(ln + rn);
+    for (size_type i = 0; i < ln; i++)
+        new_arr.emplace_back(arr_elem_at(lval, i), false);
+    for (size_type i = 0; i < rn; i++)
+        new_arr.emplace_back(arr_elem_at(rhs, i), false);
+    lval = SharedArrayObj(std::move(new_arr));
 }
 
 /*
