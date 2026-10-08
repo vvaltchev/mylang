@@ -17054,6 +17054,20 @@ static const std::vector<test> tests =
         "append(m[0], none);",
         "assert(str(m) == \"[[2.000000, <none>]]\");",
         "var w = [[1]]; w[0][0] = 2; assert(w[0][0] == 2);" } },
+    /* a pure function folded at PARSE time runs before inference: its
+     * annotated literals take their declared storage and widening from
+     * the parser (`[n]` was built flat and refused `a[0] = "s"`, which the
+     * same call at run time accepts) */
+    { "array<T>: a parse-time pure call builds annotated literals as a run",
+      { "pure func mk(int n) { array<dyn> a = [n]; a[0] = \"s\"; return a; }",
+        "assert(mk(1) == mk(runtime(1)) && mk(1)[0] == \"s\");",
+        "pure func mo(int n) {",
+        "  array<array<float?>> m = [[n]]; m[0][0] = none; return m; }",
+        "assert(mo(1)[0][0] == none);",
+        "pure func md(int n) { dict<str, float> d = {\"a\": n}; return d; }",
+        "assert(str(md(1)) == str(md(runtime(1))));",
+        "pure func mv(int n) { var dyn a = [n]; a[0] = \"s\"; return a; }",
+        "assert(mv(1) == [\"s\"]);" } },
     { "array<T> reject: a VARIABLE of another element type does not convert",
       { "var a = [1]; array<float> f = a;" }, &typeid(TypeMismatchEx) },
     { "array<T> reject: a named const of another element type",
@@ -26715,6 +26729,13 @@ static bool const_fold_equivalence()
             "const array<array<float?>> C = [[1]];",
             "var c = C[0];",
             "print(c, array_storage(c));" } },
+        { "a pure call folded at parse time builds annotated literals", {
+            "pure func mk(int n) {",
+            "  array<dyn> a = [n]; a[0] = \"s\"; return a; }",
+            "pure func md(int n) {",
+            "  dict<str, float> d = {\"a\": n}; array<float> f = [n];",
+            "  return [d, f]; }",
+            "print(mk(1), mk(runtime(1)), md(2), md(runtime(2)));" } },
         { "an identical const expression does not freeze a var", {
             "pure func mk() => [1, 2];",
             "const X = mk(); var y = mk(); append(y, 3);",

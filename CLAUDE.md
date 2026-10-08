@@ -4732,9 +4732,14 @@ decisions behind it: `plans/archived/type-inference.md`,
   Its STORAGE follows the destination too, at every nesting level
   (`stamp_literal_repr`): the ArrHint `array_repr_hint` derives from the
   type - the one helper `set_array_repr_hint` also uses - on each written
-  literal, and `WidenShape::hint` for a value baked inside one; the
-  parser's `widen_shape_of_annot` is its twin for a typed const (read off
-  the annotation, before inference). Built from its own values, `[1.5]`
+  literal, and `WidenShape::hint` for a value baked inside one. The
+  PARSER applies the same rule to a literal a declaration annotates
+  (`stamp_literal_annot`, read off the `TypeAnnot` / `dyn` - its
+  `annot_arr_hint` is `array_repr_hint`'s twin), because a typed const is
+  bound, and an explicit `pure` call with constant arguments RUNS, before
+  inference: `pure func mk(int n) { array<dyn> a = [n]; a[0] = "s"; ...}`
+  failed when folded and worked at run time. A local whose type only
+  INFERENCE widens still differs there (an open design question). Built from its own values, `[1.5]`
   for an `array<float?>` was flat floats and a later `none` store failed.
   **A store into a DECLARED place is checked against it (#48):**
   `declared_type_of` answers the declared type of a location - a fixed
