@@ -1367,17 +1367,25 @@ extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
 
 /* model-flip (nativize-ops): CallBuiltinLVElem / CallBuiltinLVMember - a mutating
  * lvalue builtin whose arg0 is a SUBSCRIPT (`append(a[i], x)`) or struct-MEMBER
- * (`append(s.f, x)`) target. Form the base by kind + base_slot, derive the
- * element/field LValue*, then func_lv. `run_base` = the value-args run (for
- * elem, run[0] is the index + run[1..] the values; for member, run[0..] the
- * values). All throws are RuntimeExceptions -> g_vm_jit_exc + return 1.
- * `bc` = &chunk.builtin_calls[idx]. */
+ * (`append(s.f, x)`, or the #32 chain form `append(o.i.a, x)`) target. Form
+ * the base by kind + base_slot, derive the element/field LValue*, then
+ * func_lv. `run_base` = the value-args run (for elem, run[0] is the index +
+ * run[1..] the values; for member, run[0..] the values). All throws are
+ * RuntimeExceptions -> g_vm_jit_exc + return 1. `bc` =
+ * &chunk.builtin_calls[idx], `mkeys` = chunk.member_keys.data() (the chain
+ * form's member steps).
+ *
+ * These two, jit_append, jit_call_builtin_lv and jit_emplace_struct
+ * return 2 for an UNBOUND GLOBAL base (#32): g_vm_jit_exc then holds a
+ * loc-less UnboundSymbolEx, which the emitted code stamps with the base's
+ * caret (base_locs) before the op's own. */
 extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
                                         int_type dst_slot, int_type run_base,
                                         const void *bc) noexcept;
 extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
                                           int_type dst_slot, int_type run_base,
-                                          const void *bc) noexcept;
+                                          const void *bc,
+                                          const void *mkeys) noexcept;
 
 /* model-flip (nativize-ops): PER-OP runtime coverage - g_jit_op_run[op] is
  * bumped by that op's nativized helper (jit_move/jit_subscript/...), PROVING

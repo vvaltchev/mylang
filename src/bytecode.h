@@ -2775,6 +2775,13 @@ struct Chunk {
         std::vector<ArgLoc> args;     /* per-arg carets, [0, n) */
         const UniqueId *member = nullptr;  /* CallBuiltinLVMember: arg0's field
                                             * name `append(s.f, x)` (else null) */
+        /* #32: CallBuiltinLVMember's CHAIN form (`member` null): arg0 is
+         * the base walked through these steps to the location the builtin
+         * works on (vm_chain_walk, each struct it enters owned) - a chain
+         * deeper than one step, or a member of a base not proven a struct.
+         * A subscript step's key is a frame temp; a member step indexes
+         * member_keys. */
+        std::vector<ChainStep> steps;
     };
     std::vector<BuiltinCall> builtin_calls;
 
@@ -2821,12 +2828,17 @@ struct Chunk {
         Loc start, end;                  /* the whole-args caret */
         std::vector<ArgLoc> args;        /* per-arg carets */
         ArrHint arr_hint = ArrHint::dflt;
-        enum class A0 : unsigned char { none, slot, elem, member, undef };
+        /* `chain` (#32): a deeper access chain rooted at a variable -
+         * `o.i.a`, `m[0][1]` - re-derived through a0_steps (its keys are
+         * frame temps the arg0 compile filled) */
+        enum class A0 : unsigned char { none, slot, elem, member, undef,
+                                        chain };
         A0 a0_form = A0::none;
         unsigned char a0_kind = 0;       /* 0 loc / 1 gbl / 2 cap / 3 builtin */
         int32_t a0_slot = -1;            /* the id/base slot */
         int32_t a0_operand = -1;         /* elem: index temp; member: key idx */
         const UniqueId *a0_name = nullptr;   /* undef: the name */
+        std::vector<ChainStep> a0_steps; /* chain: base -> arg0 */
     };
     std::vector<CallSite> call_sites;
 

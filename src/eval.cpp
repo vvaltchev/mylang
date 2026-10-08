@@ -1890,6 +1890,39 @@ static inline void stamp_args_loc(Exception &e, const ExprList *args)
  * AND the VM's generic value-call op (CallValueGenericV: &chunk, pc,
  * as_signal=true) so the two engines dispatch byte-identically.
  */
+/*
+ * #32: arg0 of an INDIRECT call to an in-place (lvalue) builtin, by
+ * reference: an access chain rooted at a variable that steps into a
+ * member is walked as a STORE base (store_base_value - each struct it
+ * enters owned), so the builtin works on this variable's struct and not
+ * on one a copy still shares, as the direct call's adapter does and the
+ * VM's arg0 descriptors do; anything else is read as before (a value
+ * stays a value - the builtin's "not an lvalue"). An optional member is
+ * not a step a store walk has.
+ */
+static EvalValue indirect_lv_arg0(EvalContext *ctx, const Construct *e,
+                                  LValue &hold)
+{
+    bool member = false;
+    const Construct *r = e;
+    for (;;) {
+        if (ctag(r) == ConstructType::member) {
+            auto *m = static_cast<const MemberExpr *>(r);
+            if (m->optional)
+                return e->eval(ctx);
+            member = true;
+            r = m->what.get();
+        } else if (ctag(r) == ConstructType::subscript) {
+            r = static_cast<const Subscript *>(r)->what.get();
+        } else {
+            break;
+        }
+    }
+    if (!member || ctag(r) != ConstructType::id)
+        return e->eval(ctx);
+    return store_base_value(ctx, e, hold);
+}
+
 EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                               const CallExpr *node, const Chunk *ck,
                               size_t pc, bool as_signal)
@@ -1931,8 +1964,12 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                     argv = vheap.data();
                     locs = lheap.data();
                 }
+                LValue hold0;   /* indirect_lv_arg0's (a variable root:
+                                 * never filled) */
                 for (size_t i = 0; i < n; i++) {
-                    argv[i] = ael->elems[i]->eval(ctx);
+                    argv[i] = i == 0 && b.kind == Builtin::Kind::lvalue
+                        ? indirect_lv_arg0(ctx, ael->elems[0].get(), hold0)
+                        : ael->elems[i]->eval(ctx);
                     locs[i] = ArgLoc{ael->elems[i]->start,
                                      ael->elems[i]->end};
                 }

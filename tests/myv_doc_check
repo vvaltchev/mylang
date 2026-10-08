@@ -149,9 +149,11 @@ def chunk(r):
     for _ in range(r.u32()): r.nx(r.u8)           # 9.14 unpack_coerce
     for _ in range(r.u32()):                      # 9.15 builtin_calls
         r.uid(); r.loc(); r.loc(); r.u8(); r.arglocs(); r.uid()
+        steps()                                   # v32
     for _ in range(r.u32()):                      # 9.16 call_sites
         r.loc(); r.loc(); r.arglocs()
         r.u8(); r.u8(); r.u32(); r.u32(); r.u32(); r.uid()
+        steps()                                   # v32
     r.nx(r.sid)                                   # 9.17 slot_names
 
 def main(path):

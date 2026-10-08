@@ -46,6 +46,9 @@ assert(s1.a == [1, 2] && s2.a == [7, 2] && big == [1, 2, 3, 4]);
 var s3 = s1;
 s3.a[1] += 5;
 assert(s1.a == [1, 2] && s3.a == [1, 7]);
+var s4 = s1;
+append(s4.a, 9);
+assert(s1.a == [1, 2] && s4.a == [1, 2, 9] && big == [1, 2, 3, 4]);
 
 # 3. elements: a read copies, a store through the element writes it
 var pa = [P(ri(1), 1), P(2, 2)];

@@ -5552,6 +5552,54 @@ static const std::vector<test> tests =
       { "func f() { g[0][1]++; }", "if (runtime(1) > 0) { f(); }", "var g = [[1, 2]];" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     /*
+     * #32: an IN-PLACE BUILTIN's first argument rooted at an unbound global
+     * carets the base too - every op the builtin can lower to (AppendV,
+     * CallBuiltinLV with and without value args, the Elem / Member forms,
+     * the Member op's CHAIN form, EmplaceStruct, and the indirect call).
+     * The VM handed the builtin a null target until 2026-10-08: a
+     * NotLValueEx at the whole call, and a SEGV in sort.
+     */
+    { "err loc: unbound global base - append (AppendV)",
+      { "func f() { append(g, 1); }", "if (runtime(1) > 0) { f(); }",
+        "var g = [1];" },
+      &typeid(UnboundSymbolEx), 19, 1, 21, 1 },
+    { "err loc: unbound global base - pop (no value args)",
+      { "func f() { pop(g); }", "if (runtime(1) > 0) { f(); }",
+        "var g = [1];" },
+      &typeid(UnboundSymbolEx), 16, 1, 18, 1 },
+    { "err loc: unbound global base - sort (a const builtin)",
+      { "func f() { sort(g); }", "if (runtime(1) > 0) { f(); }",
+        "var g = [2, 1];" },
+      &typeid(UnboundSymbolEx), 17, 1, 19, 1 },
+    { "err loc: unbound global base - insert (value args)",
+      { "func f() { insert(g, 0, 1); }", "if (runtime(1) > 0) { f(); }",
+        "var g = [1];" },
+      &typeid(UnboundSymbolEx), 19, 1, 21, 1 },
+    { "err loc: unbound global base - append to an element",
+      { "func f() { append(g[0], 1); }", "if (runtime(1) > 0) { f(); }",
+        "var g = [[1]];" },
+      &typeid(UnboundSymbolEx), 19, 1, 21, 1 },
+    { "err loc: unbound global base - append to a field",
+      { "struct B { int x; array<int> a; }",
+        "func f() { append(g.a, 1); }", "if (runtime(1) > 0) { f(); }",
+        "var g = B(1, []);" },
+      &typeid(UnboundSymbolEx), 19, 2, 21, 2 },
+    { "err loc: unbound global base - append through a chain",
+      { "struct B { int x; array<int> a; } struct O { B i; int z; }",
+        "func f() { append(g.i.a, 1); }", "if (runtime(1) > 0) { f(); }",
+        "var g = O(B(1, []), 0);" },
+      &typeid(UnboundSymbolEx), 19, 2, 21, 2 },
+    { "err loc: unbound global base - append a constructed struct",
+      { "struct P { int x; int y; }",
+        "func f() { append(g, P(int(runtime(3)), 4)); }",
+        "if (runtime(1) > 0) { f(); }", "var g = [P(1, 2)];" },
+      &typeid(UnboundSymbolEx), 19, 2, 21, 2 },
+    { "err loc: unbound global base - an indirect in-place builtin",
+      { "struct B { int x; array<int> a; } struct O { B i; int z; }",
+        "func f() { var dyn h = runtime(append); h(g.i.a, 1); }",
+        "if (runtime(1) > 0) { f(); }", "var g = O(B(1, []), 0);" },
+      &typeid(UnboundSymbolEx), 43, 2, 45, 2 },
+    /*
      * The OTHER half of the split, and the reason base_locs cannot simply
      * REPLACE the `locs` entry: with the base BOUND, an out-of-bounds store
      * still carets the whole `a[n]` (cols 12-15 -> the 12/17 span).
@@ -31055,6 +31103,157 @@ static bool myv_root_slot_count_checked()
 }
 
 /*
+ * #32 (2026-10-08): an INDIRECT call's arg0 DESCRIPTOR (CallSite::A0 -
+ * its kind, slot, key temp, member key, and the new chain form's steps)
+ * and an in-place builtin's CHAIN steps (BuiltinCall::steps) are read by
+ * the dispatch as slots and pool indices, so a loaded image must have them
+ * bounded: verify_chunk bounded none of the descriptor before v32. This
+ * mutates each field in the writer-side program and requires a refusal by
+ * the verifier, then loads and runs the intact image.
+ */
+static bool myv_call_site_a0_bounded()
+{
+    const char *lines_arr[] = {
+        "struct B { int x; array<int> a; } struct O { B i; int z; }",
+        "var a = [1]; var m = [[1]]; var s = B(1, [1]);",
+        "var o = O(B(1, [1]), 0);",
+        "var dyn f = runtime(append);",
+        "f(a, 1); f(m[0], 2); f(s.a, 3); f(o.i.a, 4);",
+        "append(o.i.a, 5);",
+        "print(len(a) + len(m[0]) + len(s.a) + len(o.i.a));" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        using A0 = Chunk::CallSite::A0;
+        Chunk &ck = prog.root;
+        const auto site = [&](A0 form) -> Chunk::CallSite * {
+            for (Chunk::CallSite &cs : ck.call_sites)
+                if (cs.a0_form == form)
+                    return &cs;
+            return nullptr;
+        };
+        Chunk::BuiltinCall *chain_bc = nullptr;
+        for (Chunk::BuiltinCall &bc : ck.builtin_calls)
+            if (!bc.steps.empty())
+                chain_bc = &bc;
+        Chunk::CallSite *s_slot = site(A0::slot), *s_elem = site(A0::elem),
+                        *s_mem = site(A0::member), *s_chain = site(A0::chain);
+        if (!s_slot || !s_elem || !s_mem || !s_chain || !chain_bc
+                || s_chain->a0_steps.size() != 2) {
+            fprintf(stderr, "myv_call_site_a0_bounded: the program no "
+                            "longer compiles to every form (VACUOUS)\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        std::string tdir = "/tmp";
+        for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+            const std::optional<std::string> e = env_get(var);
+            if (e && !e->empty()) { tdir = *e; break; }
+        }
+        while (tdir.size() > 1
+               && (tdir.back() == '/' || tdir.back() == '\\'))
+            tdir.pop_back();
+        const std::string path = tdir + "/mylang-myv-a0desc.myv";
+        const auto refused = [&](const char *what) -> bool {
+            myv_write(prog, path, MyvSourceRef());
+            try {
+                MyvSource img_src;
+                VmProgram loaded = myv_read(path, img_src);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError" && e.msg
+                        && strstr(e.msg, "corrupt .myv"))
+                    return true;
+                fprintf(stderr, "myv_call_site_a0_bounded [%s]: threw "
+                                "%s: %s\n", what, e.name,
+                        e.msg ? e.msg : "");
+                return false;
+            }
+            fprintf(stderr, "myv_call_site_a0_bounded [%s]: ACCEPTED\n",
+                    what);
+            return false;
+        };
+        const int32_t big = 1 << 20;
+        {
+            const int32_t keep = s_slot->a0_slot;
+            s_slot->a0_slot = big;
+            ok = refused("slot form: its slot") && ok;
+            s_slot->a0_slot = keep;
+        }
+        {
+            const int32_t keep = s_elem->a0_operand;
+            s_elem->a0_operand = big;
+            ok = refused("elem form: its key temp") && ok;
+            s_elem->a0_operand = keep;
+            const int32_t kslot = s_elem->a0_slot;
+            s_elem->a0_slot = big;
+            ok = refused("elem form: its base") && ok;
+            s_elem->a0_slot = kslot;
+        }
+        {
+            const int32_t keep = s_mem->a0_operand;
+            s_mem->a0_operand = big;
+            ok = refused("member form: its member key") && ok;
+            s_mem->a0_operand = keep;
+            s_mem->a0_steps = s_chain->a0_steps;
+            ok = refused("member form: carrying steps") && ok;
+            s_mem->a0_steps.clear();
+        }
+        {
+            const int32_t keep = s_chain->a0_steps[1].operand;
+            s_chain->a0_steps[1].operand = big;
+            ok = refused("chain form: a step") && ok;
+            s_chain->a0_steps[1].operand = keep;
+            const std::vector<Chunk::ChainStep> st = s_chain->a0_steps;
+            s_chain->a0_steps.clear();
+            ok = refused("chain form: no steps") && ok;
+            s_chain->a0_steps = st;
+        }
+        {
+            const int32_t keep = chain_bc->steps[0].operand;
+            chain_bc->steps[0].operand = big;
+            ok = refused("builtin chain: a step") && ok;
+            chain_bc->steps[0].operand = keep;
+            chain_bc->member = UniqueId::get("a");
+            ok = refused("builtin chain: a member name too") && ok;
+            chain_bc->member = nullptr;
+        }
+        myv_write(prog, path, MyvSourceRef());   /* intact: loads + runs */
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(loaded);
+        } catch (Exception &) {
+        }
+        std::cout.rdbuf(old_buf);
+        if (cap.str().find("9") == std::string::npos) {
+            fprintf(stderr, "myv_call_site_a0_bounded: ran to \"%s\"\n",
+                    cap.str().c_str());
+            ok = false;
+        }
+        std::remove(path.c_str());
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_call_site_a0_bounded: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
  * myv_fuzz fat-259 / fat-309 (2026-10-04): a uid's null form (0xFFFFFFFF)
  * written over a STRUCT's name loaded cleanly, and the `throw` naming the
  * struct dereferenced it (UBSan in a debug build, SIGSEGV in a release
@@ -53100,6 +53299,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: v19 - the root chunk's slot_count and the stored root slot "
       "count must agree, either copy mutated is refused",
       myv_root_slot_count_checked },
+    { "myv: an indirect call's arg0 descriptor and an in-place builtin's "
+      "chain steps are bounded at load (#32)",
+      myv_call_site_a0_bounded },
     { "myv: a name its record cannot do without (a struct's, a field's, "
       "a parameter's... - myv_fuzz fat-259/fat-309) is refused when null, "
       "and the form-dependent ones in that form",

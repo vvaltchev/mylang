@@ -6374,10 +6374,40 @@ extern "C" int_type jit_struct_field_add_int(int_type base_slot, int_type idx,
     return vm_struct_field_int(f->at(base_slot).get(), idx, fidx);
 }
 
+/* #32: an in-place builtin's base, for its JIT helper - the interpreted
+ * op's vm_store_base, CONVEYED: an unbound global sets a loc-less
+ * UnboundSymbolEx and gives null, and the helper returns status 2, on
+ * which the emitted code stamps the BASE's caret (base_locs) - the
+ * tree-walker reads arg0's root identifier and raises there. */
+static ML_COLD void
+jit_lv_unbound(EvalContext *ctx, int_type slot)
+{
+    g_vm_jit_exc = std::make_unique<UnboundSymbolEx>(
+        intern_msg("'" + std::string(ctx->gfuncs->names[slot]->val)
+                   + "' is not bound yet"), Loc(), Loc());
+}
+
+/* the bound path inlines into each helper: the message building lives
+ * out of line (it cost 58_structs +3.4% Ir as one function) */
+static inline LValue *
+jit_lv_base(EvalContext *ctx, int_type kind, int_type slot)
+{
+    if (kind == 1) {
+        if (!ctx->gfuncs->defined[slot]) {
+            jit_lv_unbound(ctx, slot);
+            return nullptr;
+        }
+        return &ctx->gfuncs->slots[slot];
+    }
+    if (kind == 2)
+        return &(*ctx->captures)[slot];
+    return &ctx->frame->at(slot);
+}
+
 /* model-flip (nativize-ops): the native EmplaceStruct body - append(struct_arr,
  * Ctor(args)) with the ctor's field VALUES in the run at run_base. Forms
- * arg0's LValue* by kind EXACTLY like the interpreter handler (an undefined
- * GLOBAL passes nullptr - vm_do_emplace's own error), runs the shared
+ * arg0's LValue* by kind EXACTLY like the interpreter handler (an unbound
+ * GLOBAL returns status 2 - jit_lv_base), runs the shared
  * vm_do_emplace, writes dst. A throw (coerce / const / non-lvalue) rides
  * g_vm_jit_exc; a LOC-LESS one gets this pc's side-table caret at the
  * re-raise == the interpreted handler's vm_stamp_loc; one carrying a pooled
@@ -6391,13 +6421,9 @@ extern "C" int jit_emplace_struct(int_type dst, int_type base_slot,
     EvalContext *ctx = g_current_ctx;
     const Chunk::EmplaceSite &site =
         *static_cast<const Chunk::EmplaceSite *>(sitev);
-    LValue *target;
-    switch (kind) {
-    case 0:  target = &ctx->frame->at(base_slot); break;
-    case 1:  target = ctx->gfuncs->defined[base_slot]
-                 ? &ctx->gfuncs->slots[base_slot] : nullptr; break;
-    default: target = &(*ctx->captures)[base_slot]; break;
-    }
+    LValue *target = jit_lv_base(ctx, kind, base_slot);
+    if (!target)
+        return 2;
     try {
         ctx->frame->at(dst).put(vm_do_emplace(*ctx, site, target, run_base));
     } catch (RuntimeException &e) {
@@ -6958,8 +6984,8 @@ extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
 /*
  * model-flip (nativize-ops): the native AppendV `append(a, x)` / `push(a, x)` -
  * the interpreter's D1 fast op. Forms arg0's LValue* from `kind` (0 local / 1
- * global / 2 capture) + `arg0_slot` (an undefined global -> null target, handled
- * by the fallback's NotLValueEx), then runs arr_append_fast (the shared
+ * global / 2 capture) + `arg0_slot` (an unbound global -> status 2,
+ * jit_lv_base), then runs arr_append_fast (the shared
  * NEVER-THROWING append core - flat/general, hash upkeep) inline. Any decline
  * (const/readonly/non-array/slice/flat-mismatch/null) falls back to the FULL
  * vm_call_builtin_lv_rest (builtin_append), which CAN throw - all
@@ -6976,15 +7002,11 @@ extern "C" int jit_append(int_type kind, int_type arg0_slot, int_type val_slot,
     const Chunk::BuiltinCall *bc =
         static_cast<const Chunk::BuiltinCall *>(bcv);
     EvalContext *ctx = g_current_ctx;
-    LValue *target;
-    switch (kind) {
-    case 0:  target = &ctx->frame->at(arg0_slot); break;
-    case 1:  target = ctx->gfuncs->defined[arg0_slot]
-                          ? &ctx->gfuncs->slots[arg0_slot] : nullptr; break;
-    default: target = &(*ctx->captures)[arg0_slot]; break;
-    }
+    LValue *target = jit_lv_base(ctx, kind, arg0_slot);
+    if (!target)
+        return 2;
     const EvalValue &elem = ctx->frame->at(val_slot).get();
-    if (target && arr_append_fast(target, elem, false)) {
+    if (arr_append_fast(target, elem, false)) {
         if (dst_slot >= 0)
             ctx->frame->at(dst_slot).put(target->get());
         return 0;
@@ -7009,8 +7031,8 @@ extern "C" int jit_append(int_type kind, int_type arg0_slot, int_type val_slot,
  * model-flip (nativize-ops): the native CallBuiltinLV - a mutating (lvalue-ABI)
  * builtin call `pop(a)`/`insert(a,i,v)`/`erase(a,i)`/`sort(a[,cmp])`/`reverse(a)`
  * /`intptr(a)`, the interpreter's exact CallBuiltinLV. Forms arg0's LValue* from
- * `kind` (0 local / 1 global / 2 capture) + arg0_slot (an undefined global ->
- * null target -> the builtin's NotLValueEx). `rest_base` >= 0 -> a REST-NATIVE
+ * `kind` (0 local / 1 global / 2 capture) + arg0_slot (an unbound global ->
+ * status 2, jit_lv_base). `rest_base` >= 0 -> a REST-NATIVE
  * op (its value args are the register run [rest_base, +n_rest); via
  * vm_call_builtin_lv_rest); `rest_base` == -1 -> a NO-value-arg op (pop/intptr/
  * sort-no-cmp -> func_lv with an empty rest). Every reachable throw is a
@@ -7026,13 +7048,9 @@ extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
     const Chunk::BuiltinCall *bc =
         static_cast<const Chunk::BuiltinCall *>(bcv);
     EvalContext *ctx = g_current_ctx;
-    LValue *target;
-    switch (kind) {
-    case 0:  target = &ctx->frame->at(arg0_slot); break;
-    case 1:  target = ctx->gfuncs->defined[arg0_slot]
-                          ? &ctx->gfuncs->slots[arg0_slot] : nullptr; break;
-    default: target = &(*ctx->captures)[arg0_slot]; break;
-    }
+    LValue *target = jit_lv_base(ctx, kind, arg0_slot);
+    if (!target)
+        return 2;
     try {
         EvalValue res;
         if (rest_base >= 0) {
@@ -7071,16 +7089,66 @@ extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
  * interpreter's exact CallBuiltinLVElem; every throw is a RuntimeException ->
  * g_vm_jit_exc (arg0's caret if loc-less) + re-raise. NOT op_fully_native.
  */
-/* The target of a mutating builtin whose arg0 is an element `a[i]`: the
- * element's LValue, or `hold` holding its value when the subscript gave a
- * value (a flat array's scalar, a read-only container's element) - the
- * builtin works on it held, as the tree-walker's (lv_builtin_target) */
-static inline LValue *vm_builtin_elem_target(EvalValue &sub, LValue &hold)
+/* The target of a mutating builtin whose arg0 is an element `a[i]` of the
+ * base `base`: the element's LValue, or `hold` holding its value when the
+ * subscript gave a value (a flat array's scalar, a read-only container's
+ * element) - the builtin works on it held, as the tree-walker's
+ * (lv_builtin_target). `sub` keeps the subscript's result alive. */
+static inline LValue *
+vm_builtin_elem_target(LValue *base, const EvalValue &idx, EvalValue &sub,
+                       LValue &hold)
 {
+    sub = base->get().get_type()->subscript(EvalValue(base), idx,
+                                            /*for_write=*/false);
     if (sub.is<LValue *>())
         return sub.get<LValue *>();
     hold = LValue(std::move(sub), false);
     return &hold;
+}
+
+/* The target of a mutating builtin whose arg0 is a MEMBER access
+ * (CallBuiltinLVMember): the one-step form `s.f` is the boxed field's
+ * LValue (vm_member_lvalue: the struct owned, a POD or read-only field's
+ * value held); the CHAIN form (#32, `bc.steps`: `o.i.a`, `m[0].a`, a
+ * member of a base not proven a struct) walks the base through every
+ * step (vm_chain_walk - each struct it enters owned, as the tree-walker's
+ * store_walk) and works on what the walk reached: its LValue, or its
+ * value held. */
+static LValue *
+vm_lv_member_target(EvalContext &ctx, const Chunk::MemberKey *mkeys,
+                    const Chunk::BuiltinCall &bc, LValue *base, LValue &hold)
+{
+    if (bc.steps.empty())
+        return vm_member_lvalue(base, bc.member,
+                                bc.args[0].start, bc.args[0].end,
+                                bc.args[0].start, bc.args[0].end, hold);
+    EvalValue cur(base);
+    PodPlace place;
+    vm_chain_walk(ctx, mkeys, cur, bc.steps, bc.steps.size(), place);
+    if (place.bytes)
+        cur = pod_place_value(place);
+    if (cur.is<LValue *>())
+        return cur.get<LValue *>();
+    hold = LValue(std::move(cur), false);
+    return &hold;
+}
+
+/* An INDIRECT call's arg0 in its #32 CHAIN form (CallSite::A0::chain),
+ * for a func_lv callee: the base walked through every step (each struct
+ * it enters owned) - its LValue, or null when the walk ends at a value
+ * (a POD field, a value's element), which the builtin then sees as
+ * arg0's value, as the tree-walker's by-ref arg0. `keep` holds what the
+ * walk reached alive across the call. */
+static LValue *
+vm_a0_chain_lvalue(EvalContext &ctx, const Chunk::MemberKey *mkeys,
+                   const Chunk::CallSite &cs, LValue *base, EvalValue &keep)
+{
+    keep = EvalValue(base);
+    PodPlace place;
+    vm_chain_walk(ctx, mkeys, keep, cs.a0_steps, cs.a0_steps.size(), place);
+    if (place.bytes || !keep.is<LValue *>())
+        return nullptr;
+    return keep.get<LValue *>();
 }
 
 extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
@@ -7091,24 +7159,15 @@ extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
     const Chunk::BuiltinCall *bc =
         static_cast<const Chunk::BuiltinCall *>(bcv);
     EvalContext *ctx = g_current_ctx;
-    LValue *base;
-    switch (kind) {
-    case 0:  base = &ctx->frame->at(base_slot); break;
-    case 1:  base = ctx->gfuncs->defined[base_slot]
-                        ? &ctx->gfuncs->slots[base_slot] : nullptr; break;
-    default: base = &(*ctx->captures)[base_slot]; break;
-    }
+    LValue *base = jit_lv_base(ctx, kind, base_slot);
+    if (!base)
+        return 2;
     const int_type n_rest = static_cast<int_type>(bc->args.size()) - 1;
     try {
         EvalValue holder;   /* keeps the subscript result alive */
         LValue hold;
-        LValue *elem = nullptr;
-        if (base) {
-            const EvalValue &idx = ctx->frame->at(run_base).get();
-            holder = base->get().get_type()->subscript(
-                EvalValue(base), idx, /*for_write=*/false);
-            elem = vm_builtin_elem_target(holder, hold);
-        }
+        LValue *elem = vm_builtin_elem_target(
+            base, ctx->frame->at(run_base).get(), holder, hold);
         SmallArgs<8> restbuf;   /* n_rest small (append 1, pop 0); B1 */
         for (int_type i = 0; i < n_rest; i++)
             restbuf.push(ctx->frame->at(run_base + 1 + i).get());
@@ -7150,28 +7209,21 @@ extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
  */
 extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
                                           int_type dst_slot, int_type run_base,
-                                          const void *bcv) noexcept
+                                          const void *bcv,
+                                          const void *mkeysv) noexcept
 {
     ML_JIT_OP_RAN(CallBuiltinLVMember);
     const Chunk::BuiltinCall *bc =
         static_cast<const Chunk::BuiltinCall *>(bcv);
     EvalContext *ctx = g_current_ctx;
-    LValue *base;
-    switch (kind) {
-    case 0:  base = &ctx->frame->at(base_slot); break;
-    case 1:  base = ctx->gfuncs->defined[base_slot]
-                        ? &ctx->gfuncs->slots[base_slot] : nullptr; break;
-    default: base = &(*ctx->captures)[base_slot]; break;
-    }
+    LValue *base = jit_lv_base(ctx, kind, base_slot);
+    if (!base)
+        return 2;
     const int_type n_rest = static_cast<int_type>(bc->args.size()) - 1;
     try {
-        LValue *field = nullptr;
         LValue hold;
-        if (base)
-            field = vm_member_lvalue(base, bc->member,
-                                     bc->args[0].start, bc->args[0].end,
-                                     bc->args[0].start, bc->args[0].end,
-                                     hold);
+        LValue *field = vm_lv_member_target(*ctx,
+            static_cast<const Chunk::MemberKey *>(mkeysv), *bc, base, hold);
         SmallArgs<8> restbuf;   /* append/push 1 value arg; #97 B1 */
         for (int_type i = 0; i < n_rest; i++)
             restbuf.push(ctx->frame->at(run_base + i).get());
@@ -10543,6 +10595,12 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
                                         /*for_write=*/false,
                                         mk.mstart, mk.mend);
         }
+        case Chunk::CallSite::A0::chain: {
+            LValue *base = a0_base();
+            if (!base)
+                return nullptr;
+            return vm_a0_chain_lvalue(ctx, mkeys, cs, base, holder);
+        }
         default:
             return nullptr;
         }
@@ -13116,19 +13174,14 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             /* D1: `append(a, x)` / `push(a, x)` - the CallBuiltinLV shape
              * with the marshaling deleted. arr_append_fast appends a fitting
              * element in place (flat or general, hash maintained); any other
-             * shape (const/readonly/slice/non-array/flat mismatch/undefined
-             * global -> null target) falls back to the FULL builtin via the
-             * pooled carets - byte-identical errors and result. */
-            LValue *target;
-            switch (in->a_dual_hi()) {
-            case 0:  target = &ctx.frame->at(in->target2); break;
-            case 1:  target = ctx.gfuncs->defined[in->target2]
-                                  ? &ctx.gfuncs->slots[in->target2]
-                                  : nullptr;                     break;
-            default: target = &(*ctx.captures)[in->target2];    break;
-            }
+             * shape (const/readonly/slice/non-array/flat mismatch) falls
+             * back to the FULL builtin via the pooled carets - byte-identical
+             * errors and result. An unbound global arg0 raises
+             * UnboundSymbolEx at its own caret, as reading it does (#32). */
+            LValue *target = vm_store_base(ctx, in->a_dual_hi(),
+                                           in->target2, *chunk, pc, nullptr);
             const EvalValue &elem = ctx.frame->at(in->b_lit()).get();
-            if (target && arr_append_fast(target, elem, false)) {
+            if (arr_append_fast(target, elem, false)) {
                 /* Call-cluster #4: a DISCARDED result (`append(a, x);` as a
                  * statement - the peephole proved the dst temp dead and set
                  * it to -1) skips materializing the array handle: one
@@ -13161,22 +13214,11 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * builtin_calls pool (a.slot). A REST-NATIVE op (`b` set) gets its
              * value args from the register run at `b`; a `b`-unset op (pop/intptr
              * - no value args) gets an empty rest. Mirrors Identifier::do_eval
-             * for each kind: a not-yet-defined global -> null target ->
-             * NotLValueEx, like the tree-walker. */
+             * for each kind: a not-yet-bound global raises UnboundSymbolEx at
+             * its own caret (base_locs), as the tree-walker's read does. */
             const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a_dual_lo()];
-            LValue *target;
-            switch (in->a_dual_hi()) {
-            case 0:   /* local */
-                target = &ctx.frame->at(in->target2);
-                break;
-            case 1:   /* global */
-                target = ctx.gfuncs->defined[in->target2]
-                             ? &ctx.gfuncs->slots[in->target2] : nullptr;
-                break;
-            default:  /* capture */
-                target = &(*ctx.captures)[in->target2];
-                break;
-            }
+            LValue *target = vm_store_base(ctx, in->a_dual_hi(), in->target2,
+                                           *chunk, pc, nullptr);
             try {
                 if (in->b_is_lit()) {
                     ctx.frame->at(in->target).put(
@@ -13210,13 +13252,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * kind | idx << 2); the whole-args caret from the loc table. */
             const Chunk::EmplaceSite &site =
                 chunk->emplace_sites[in->a_lit() >> 2];
-            LValue *target;
-            switch (in->a_lit() & 3) {
-            case 0:  target = &ctx.frame->at(in->target2); break;
-            case 1:  target = ctx.gfuncs->defined[in->target2]
-                         ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
-            default: target = &(*ctx.captures)[in->target2]; break;
-            }
+            LValue *target = vm_store_base(ctx, in->a_lit() & 3, in->target2,
+                                           *chunk, pc, nullptr);
             try {
                 ctx.frame->at(in->target).put(
                     vm_do_emplace(ctx, site, target, in->b_lit()));
@@ -13239,26 +13276,17 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * non-lvalue element (a flat scalar, a read-only container's) is
              * a value the builtin works on held, like the tree-walker (a
              * missing dict key throws). AST-FREE: Builtin + carets from the
-             * pool (a.slot). */
+             * pool (a.slot). An unbound global base raises UnboundSymbolEx
+             * at its own caret (base_locs, #32). */
             const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a_dual_lo()];
-            LValue *base;
-            switch (in->a_dual_hi()) {
-            case 0:  base = &ctx.frame->at(in->target2); break;
-            case 1:  base = ctx.gfuncs->defined[in->target2]
-                         ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
-            default: base = &(*ctx.captures)[in->target2]; break;
-            }
+            LValue *base = vm_store_base(ctx, in->a_dual_hi(), in->target2,
+                                         *chunk, pc, nullptr);
             const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
             try {
                 EvalValue holder;   /* keeps the subscript result alive */
                 LValue hold;
-                LValue *elem = nullptr;
-                if (base) {
-                    const EvalValue &idx = ctx.frame->at(in->b_lit()).get();
-                    holder = base->get().get_type()->subscript(
-                        EvalValue(base), idx, /*for_write=*/false);
-                    elem = vm_builtin_elem_target(holder, hold);
-                }
+                LValue *elem = vm_builtin_elem_target(
+                    base, ctx.frame->at(in->b_lit()).get(), holder, hold);
                 SmallArgs<8> restbuf;   /* n_rest small (append 1, pop 0) */
                 for (int_type i = 0; i < n_rest; i++)
                     restbuf.push(ctx.frame->at(in->b_lit() + 1 + i).get());
@@ -13286,24 +13314,17 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * vm_member_lvalue (same checks as the tree-walker's MemberExpr),
              * then call func_lv REST-NATIVE. `b` = the rest run (values, NO
              * index — unlike LVElem). AST-free: Builtin + carets + field name
-             * from the pool (a.slot). */
+             * from the pool (a.slot). The CHAIN form (#32, `bc.steps`) walks
+             * the base to the location instead. An unbound global base raises
+             * UnboundSymbolEx at its own caret (base_locs). */
             const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a_dual_lo()];
-            LValue *base;
-            switch (in->a_dual_hi()) {
-            case 0:  base = &ctx.frame->at(in->target2); break;
-            case 1:  base = ctx.gfuncs->defined[in->target2]
-                         ? &ctx.gfuncs->slots[in->target2] : nullptr; break;
-            default: base = &(*ctx.captures)[in->target2]; break;
-            }
+            LValue *base = vm_store_base(ctx, in->a_dual_hi(), in->target2,
+                                         *chunk, pc, nullptr);
             const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
             try {
-                LValue *field = nullptr;
                 LValue hold;
-                if (base)
-                    field = vm_member_lvalue(base, bc.member,
-                                             bc.args[0].start, bc.args[0].end,
-                                             bc.args[0].start, bc.args[0].end,
-                                             hold);
+                LValue *field = vm_lv_member_target(
+                    ctx, chunk->member_keys.data(), bc, base, hold);
                 SmallArgs<8> restbuf;   /* append/push 1 value arg */
                 for (int_type i = 0; i < n_rest; i++)
                     restbuf.push(ctx.frame->at(in->b_lit() + i).get());
@@ -13549,6 +13570,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                     return vm_member_lvalue_ref(cur, mk.memId, mk.memUid,
                                                 /*for_write=*/false,
                                                 mk.mstart, mk.mend);
+                }
+                case Chunk::CallSite::A0::chain: {
+                    LValue *base = vm_store_base(ctx, cs.a0_kind, cs.a0_slot,
+                                                 *chunk, pc, nullptr);
+                    return vm_a0_chain_lvalue(ctx, chunk->member_keys.data(),
+                                              cs, base, holder);
                 }
                 default:
                     return nullptr;

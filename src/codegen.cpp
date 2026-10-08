@@ -3676,6 +3676,73 @@ struct Codegen {
                 }
             }
         }
+        /* #32: a DEEPER access chain rooted at a variable (`o.i.a`,
+         * `m[0][1]`). Its value is read step by step into `dst` - each key
+         * into a temp at its turn, Subscript::do_eval's order - and the
+         * steps are kept (a0_steps), so the dispatch re-walks them for a
+         * func_lv callee: each struct it enters owned, as the tree-walker
+         * walks a variable-rooted chain for an in-place builtin. It was
+         * held as a VALUE here, so `f(m[0][1], 9)` with `f` holding
+         * append raised NotLValueEx while the tree-walker appended. An
+         * optional member (`a?.b`) is not a step the walk has. */
+        if (ctag(e) == ConstructType::member
+                || ctag(e) == ConstructType::subscript) {
+            std::vector<const Construct *> chain;   /* outermost-first */
+            const Construct *base = lvalue_chain(e, chain);
+            bool optional = false;
+            for (const Construct *c : chain)
+                if (ctag(c) == ConstructType::member
+                        && static_cast<const MemberExpr *>(c)->optional)
+                    optional = true;
+            int bslot, bkind;
+            if (chain.size() >= 2 && !optional
+                    && as_container_base(base, bslot, bkind)) {
+                const size_t omark = ops.size();
+                const size_t cmark = chunk.consts.size();
+                const int st = next_temp;
+                std::vector<Chunk::ChainStep> steps;
+                int cur;
+                bool ok = compile_boxed_expr(base, cur, ops);
+                const size_t n = chain.size();
+                for (size_t i = 0; ok && i < n; i++) {
+                    const Construct *c = chain[n - 1 - i];
+                    const int out = i + 1 == n ? dst : alloc_temp();
+                    CgInstr in;
+                    in.target = out;
+                    in.target2 = cur;
+                    if (ctag(c) == ConstructType::member) {
+                        const int mk = add_member_key(
+                            static_cast<const MemberExpr *>(c));
+                        in.op = OpCode::MemberV;
+                        in.set_a(int_lit(mk));
+                        steps.push_back({true, mk, c->start, c->end});
+                    } else {
+                        auto *sub = static_cast<const Subscript *>(c);
+                        int kslot;
+                        if (!compile_key(sub, kslot, ops)) {
+                            ok = false;
+                            break;
+                        }
+                        in.op = OpCode::SubscriptV;
+                        in.node_idx = add_ast_node(sub);  /* its caret */
+                        in.set_a(slot_op(kslot));
+                        steps.push_back({false, kslot, c->start, c->end});
+                    }
+                    ops.push_back(in);
+                    cur = out;
+                }
+                if (ok) {
+                    cs.a0_form = Chunk::CallSite::A0::chain;
+                    cs.a0_kind = static_cast<unsigned char>(bkind);
+                    cs.a0_slot = bslot;
+                    cs.a0_steps = std::move(steps);
+                    return true;
+                }
+                ops.resize(omark);
+                chunk.consts.resize(cmark);
+                next_temp = st;
+            }
+        }
         cs.a0_form = Chunk::CallSite::A0::none;
         return compile_to_run_slot(e, dst, ops);
     }
@@ -4268,6 +4335,97 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * #32: CallBuiltinLVMember's CHAIN form for an in-place builtin whose
+     * arg0 is an access chain - see the call site. The tree-walker's
+     * store_base_value decides what is a location, and this follows it
+     * exactly: a chain with a member step is walked from its root, a root
+     * that is not a variable held first (hold_store_base); a chain of
+     * subscripts only is a location only when its root is a variable (else
+     * its value is held by the caller below, as Subscript::do_eval of a
+     * temporary's element gives a value). An optional member (`a?.b`) is
+     * not a step the walk has: declined, as the store chains decline it.
+     * Evaluation order: the root, each key inside-out, then the values -
+     * the tree-walker evaluates arg0 whole before the other arguments.
+     */
+    bool emit_builtin_chain_target(const DirectBuiltinCallExpr *dc,
+                                   const Construct *a0, int &out_slot,
+                                   std::vector<CgInstr> &ops)
+    {
+        if (ctag(a0) != ConstructType::member
+                && ctag(a0) != ConstructType::subscript)
+            return false;
+        std::vector<const Construct *> chain;    /* outermost-first */
+        const Construct *base = lvalue_chain(a0, chain);
+        bool has_member = false;
+        for (const Construct *c : chain) {
+            if (ctag(c) != ConstructType::member)
+                continue;
+            if (static_cast<const MemberExpr *>(c)->optional)
+                return false;
+            has_member = true;
+        }
+        int bslot, bkind;
+        const bool hold = !as_container_base(base, bslot, bkind);
+        if (hold && !has_member)
+            return false;
+
+        const size_t omark = ops.size();
+        const size_t cmark = chunk.consts.size();
+        const int st = next_temp;
+        auto fail = [&]() {
+            ops.resize(omark);
+            chunk.consts.resize(cmark);
+            next_temp = st;
+            return false;
+        };
+        if (hold) {
+            if (!hold_store_base(base, bslot, ops))
+                return fail();
+            bkind = 0;
+        }
+        const int nsteps = static_cast<int>(chain.size());
+        std::vector<Chunk::ChainStep> steps;
+        steps.reserve(static_cast<size_t>(nsteps));
+        for (int i = 0; i < nsteps; i++) {
+            const Construct *c = chain[nsteps - 1 - i];
+            if (ctag(c) == ConstructType::member) {
+                auto *m = static_cast<const MemberExpr *>(c);
+                steps.push_back({true, add_member_key(m), c->start, c->end});
+            } else {
+                int kslot;
+                if (!compile_key(static_cast<const Subscript *>(c), kslot,
+                                 ops))
+                    return fail();
+                steps.push_back({false, kslot, c->start, c->end});
+            }
+        }
+        /* the value args into a run, as the one-member form's */
+        const int nvals = static_cast<int>(dc->args->elems.size()) - 1;
+        const int runbase = next_temp;
+        next_temp += nvals;
+        if (next_temp > max_temp)
+            max_temp = next_temp;
+        for (int i = 0; i < nvals; i++)
+            if (!compile_to_run_slot(dc->args->elems[1 + i].get(),
+                                     runbase + i, ops))
+                return fail();
+        const int dst = alloc_temp();
+        CgInstr cv;
+        cv.op = OpCode::CallBuiltinLVMember;
+        cv.base_node_idx = add_base_node(bkind, base);
+        cv.target = dst;
+        cv.target2 = bslot;
+        const int bc = add_builtin_call(dc);
+        cv.set_a_dual(bc, bkind);
+        note_builtin_inline(cv, dc);
+        chunk.builtin_calls[bc].steps = std::move(steps);
+        cv.set_b(int_lit(runbase));
+        ops.push_back(cv);
+        out_slot = dst;
+        return true;
+    }
+
     /* Native mutating-builtin call -> CallBuiltinLV, but ONLY when arg0 is a
      * slotted identifier (local/global/capture) - the common `append(a, x)`
      * form. The value args are NOT compiled here: func_lv self-evaluates them,
@@ -4333,6 +4491,7 @@ struct Codegen {
                         cv.op = OpCode::CallBuiltinLVElem;
                         /* AST-free: builtin + carets in the pool (a.slot); a.lit
                          * = the base slot kind, b = the run base. */
+                        cv.base_node_idx = add_base_node(bkind, base);
                         cv.target = dst;
                         cv.target2 =
                             static_cast<const Identifier *>(base)->sym.slot;
@@ -4384,6 +4543,7 @@ struct Codegen {
                         const int dst = alloc_temp();
                         CgInstr cv;
                         cv.op = OpCode::CallBuiltinLVMember;
+                        cv.base_node_idx = add_base_node(bkind, base);
                         cv.target = dst;
                         cv.target2 =
                             static_cast<const Identifier *>(base)->sym.slot;
@@ -4399,6 +4559,23 @@ struct Codegen {
                     ops.resize(mark);
                     next_temp = save_top;
                 }
+            }
+        }
+
+        /* #32: any other ACCESS CHAIN arg0 that is a location - deeper
+         * than one step (`append(o.i.a, x)`, `append(m[0][1], x)`), a
+         * member of a base not proven a struct (`append(dv.a, x)`), any
+         * chain with a member step - is walked at run time to the
+         * location, the way a store's base is (vm_chain_walk: each struct
+         * it steps into owned), and the builtin works THERE, as the
+         * tree-walker's store_base_value. Held as a value (below) it
+         * worked on a COPY of the handle: a slice's detach, which reseats
+         * the handle, was lost (2026-10-08). */
+        if (!a0->is_id()) {
+            int cslot;
+            if (emit_builtin_chain_target(dc, a0, cslot, ops)) {
+                out_slot = cslot;
+                return true;
             }
         }
 
@@ -4465,9 +4642,13 @@ struct Codegen {
                     CgInstr cv;
                     cv.op = OpCode::EmplaceStruct;
                     cv.node_idx = add_ast_node(dc);
+                    cv.base_node_idx = add_base_node(kind, a0);
                     cv.target = dst;
-                    cv.target2 =
-                        static_cast<const Identifier *>(a0)->sym.slot;
+                    /* arg0's slot: the variable's, or the temp holding
+                     * a value arg0 (`append(f(), P(1, 2))`) - read off
+                     * a0 itself until 2026-10-08, a cast of a call node
+                     * to an Identifier (UBSan; a wild slot in release) */
+                    cv.target2 = a0slot;
                     cv.set_a(int_lit(kind | (sidx << 2)));
                     cv.set_b(int_lit(fieldbase));
                     ops.push_back(cv);
@@ -4537,7 +4718,10 @@ struct Codegen {
             }
         }
         /* AST-free: the Builtin + arg carets live in the builtin_calls pool
-         * (index in a.slot; a.lit carries the arg0 slot kind). */
+         * (index in a.slot; a.lit carries the arg0 slot kind). An unbound
+         * global arg0 raises UnboundSymbolEx at its own caret, as reading
+         * it does (base_locs). */
+        cv.base_node_idx = add_base_node(kind, a0);
         cv.target = dst;
         cv.target2 = a0slot;
         cv.set_a_dual(add_builtin_call(dc), kind);
@@ -9625,6 +9809,11 @@ static bool visit_use_def_pooled(const Instr &in, U u, D d,
         static_cast<size_t>(in.a_dual_lo())].args.size();
     if (in.a_dual_hi() == 0)
         u(in.target2);
+    /* #32: the Member form's chain - each subscript step's key temp */
+    for (const Chunk::ChainStep &st : pools->builtin_calls[
+             static_cast<size_t>(in.a_dual_lo())].steps)
+        if (!st.is_member)
+            u(st.operand);
     /* the run at `b`: Elem's holds the INDEX first, then the values */
     if (in.b_is_lit()) {
         const size_t nrun = in.op == OpCode::CallBuiltinLVElem ? na
@@ -11553,6 +11742,17 @@ struct ChunkVerifier {
         else
             reg(slot);
     }
+    /* A chain's steps (vm_chain_walk walks them): a member step indexes
+     * member_keys, a subscript step's key is a frame temp. */
+    void steps(const std::vector<Chunk::ChainStep> &st) const
+    {
+        for (const Chunk::ChainStep &s : st) {
+            if (s.is_member)
+                pool(s.operand, ck.member_keys.size(), "member key");
+            else
+                reg(s.operand);
+        }
+    }
     /* A branch destination. */
     void target_pc(int_type p) const
     {
@@ -12082,10 +12282,19 @@ void ChunkVerifier::verify_one(const Instr &in)
          * the pool entry's ArgLoc list gives (arg0 is not in the run). */
         reg(in.target);
         pool(in.a_dual_lo(), ck.builtin_calls.size(), "builtin call");
-        /* `append(s.f, x)`: vm_member_lvalue reads the entry's member */
-        if (in.op == OpCode::CallBuiltinLVMember
-            && !ck.builtin_calls[in.a_dual_lo()].member)
-            reject("builtin member with no name");
+        {
+            /* `append(s.f, x)`: vm_member_lvalue reads the entry's member;
+             * the #32 chain form (`steps`, member null) walks its steps -
+             * which only the Member op reads */
+            const Chunk::BuiltinCall &bc = ck.builtin_calls[in.a_dual_lo()];
+            if (in.op != OpCode::CallBuiltinLVMember) {
+                if (!bc.steps.empty())
+                    reject("builtin chain on a non-member op");
+            } else if (bc.steps.empty() ? !bc.member : bc.member != nullptr) {
+                reject("builtin member with no name");
+            }
+            steps(bc.steps);
+        }
         base(in.a_dual_hi(), in.target2);
         if (in.b_is_lit()) {
             const size_t nargs =
@@ -12101,6 +12310,8 @@ void ChunkVerifier::verify_one(const Instr &in)
          * value slot and a -1 dst means the result is discarded. */
         reg_opt(in.target);
         pool(in.a_dual_lo(), ck.builtin_calls.size(), "builtin call");
+        if (!ck.builtin_calls[in.a_dual_lo()].steps.empty())
+            reject("builtin chain on a non-member op");
         base(in.a_dual_hi(), in.target2);
         reg(in.b_lit());
         break;
@@ -12138,6 +12349,45 @@ void ChunkVerifier::verify_one(const Instr &in)
         reg(in.target2);
         run(in.a_lit(), in.b_lit() & 0xfff);
         pool(in.b_lit() >> 12, ck.call_sites.size(), "call site");
+        {
+            /* arg0's DESCRIPTOR, which the dispatch reads as slots: the
+             * slot form by kind (3 a builtin), the elem / member / chain
+             * forms a base of vm_store_base's kinds plus their key temp,
+             * member key or steps (2026-10-08: none of it was bounded) */
+            const Chunk::CallSite &cs = ck.call_sites[in.b_lit() >> 12];
+            using A0 = Chunk::CallSite::A0;
+            if (cs.a0_form != A0::chain && !cs.a0_steps.empty())
+                reject("call site steps");
+            switch (cs.a0_form) {
+            case A0::none:
+            case A0::undef:
+                break;
+            case A0::slot:
+                if (cs.a0_kind == 0)
+                    reg(cs.a0_slot);
+                else if (cs.a0_kind == 1)
+                    gslot(cs.a0_slot);
+                else if (cs.a0_kind == 2)
+                    cslot(cs.a0_slot);
+                else
+                    builtin(cs.a0_slot);
+                break;
+            case A0::elem:
+                base(cs.a0_kind, cs.a0_slot);
+                reg(cs.a0_operand);
+                break;
+            case A0::member:
+                base(cs.a0_kind, cs.a0_slot);
+                pool(cs.a0_operand, ck.member_keys.size(), "member key");
+                break;
+            case A0::chain:
+                base(cs.a0_kind, cs.a0_slot);
+                if (cs.a0_steps.empty())
+                    reject("call site chain");
+                steps(cs.a0_steps);
+                break;
+            }
+        }
         break;
     case OpCode::CheckNoneArgsV:
         /* `target` = the callee's kind: 0 a frame slot, 1 a global slot */

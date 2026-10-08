@@ -9635,6 +9635,27 @@ into the struct a copy still shared (fixed: `sort_arr` / `reverse_arr`
 take it as a store base). A one-line `tail` of the earlier manual check
 had hidden the failing summary line.
 
+**#32 (2026-10-08): THE IN-PLACE BUILTINS' BASE.** `jit_append`,
+`jit_call_builtin_lv` (`_elem`, `_member`) and `jit_emplace_struct` form
+arg0's base through `jit_lv_base`: an unbound GLOBAL base returns status
+2 with a loc-less `UnboundSymbolEx` in `g_vm_jit_exc` (they handed the
+builtin a null target - `NotLValueEx` at the whole call, a SEGV in
+`sort`). These ops are `op_fully_native` (deleted originals), so a bail
+was not an option; the emitter's `emit_lv_exc_exit` stamps the base
+caret (`base_locs`) on status 2 before the op's own stamp. Only a
+GLOBAL-kind op (an emit-time fact) gets the extra `cmp` + stamp, and it
+outgrows a rel8 skip - REGTRACK's range check caught exactly that on
+the first run - so its skip is a rel32; a local or capture op's bytes
+are unchanged. `jit_call_builtin_lv_member` takes a sixth argument, the
+chunk's `member_keys` (r9), for the op's CHAIN form (docs/vm-ops.md).
+MEASURED: 58_structs (an `append(pts, Point(..))` loop, EmplaceStruct)
+read **+3.4% Ir** per scale unit with `jit_lv_base` one function - GCC
+kept it out of line for its exception-building code (26 Ir a call) and
+split `jit_emplace_struct` hot/cold. With the unbound path its own
+`ML_COLD` function (`jit_lv_unbound`) the base read inlines: **+0.50%**,
++5 Ir per append. SABOTAGE: 11 cases (each tier of the fix, the
+verifier bounds, the #33 typing), all caught, control passes.
+
 ## #97 step 2a - THE CAPTURE STORE-TO-LOAD FORWARD (a BYTECODE
 ## peephole, so both engines get it), 2026-08-26
 

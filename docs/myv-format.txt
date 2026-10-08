@@ -2,8 +2,12 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 31.  This document describes the on-disk image exhaustively:
+Format version 32.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v32: a BuiltinCall (9.15) and a CallSite (9.16) each END with a StepList
+(9.7) - the chain forms of an in-place builtin's first argument, empty
+when the record has none - and CallSite::A0 gains `5 chain`.)
 
 (v31 changes no encoding: a ThrowSite's `kind` loses rebind_builtin (2)
 and rebind_const (3), and bad_args moves from 4 to 2.  Assigning to a
@@ -922,6 +926,10 @@ interned twins (`catch_uids`) are DERIVED - re-interned at load, not stored
     u8       arr_hint       ArrHint, section 13
     arglocs  args           per-argument carets
     uid      member         arg0's field name for `append(s.f, x)`, else null
+    StepList steps          (9.7) CallBuiltinLVMember's chain form: arg0
+                            is the base walked through these steps
+                            (`append(o.i.a, x)`), `member` then null;
+                            empty for every other record
 
 A builtin is stored BY NAME, never as a function pointer.  The loader
 re-resolves it through `vm_lookup_builtin`; an unknown name is refused.
@@ -936,6 +944,7 @@ re-resolves it through `vm_lookup_builtin`; an unknown name is refused.
     u32      a0_slot        (signed)
     u32      a0_operand     (signed) elem: index temp; member: key index
     uid      a0_name        undef form only
+    StepList a0_steps       (9.7) chain form only: the base -> arg0 steps
 
 9.18  HandlerSite - the per-region catch table
 
@@ -1210,7 +1219,7 @@ same is true of OpCode and Op, which appear in every instruction.)
         0 undefined_var  1 not_lvalue  2 bad_args
 
     CallSite::A0 (bytecode.h)
-        0 none  1 slot  2 elem  3 member  4 undef
+        0 none  1 slot  2 elem  3 member  4 undef  5 chain
 
     VTag (serialize.cpp, section 11)
         0 none  1 boolean  2 integer  3 flt  4 str  5 arr  6 dict
