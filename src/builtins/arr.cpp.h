@@ -492,8 +492,8 @@ static EvalValue append_tw(EvalContext *ctx, ExprList *exprList)
     Construct *arg0 = exprList->elems[0].get();
     Construct *arg1 = exprList->elems[1].get();
 
-    EvalValue a0v = arg0->eval(ctx);
     LValue hold;
+    EvalValue a0v = store_base_value(ctx, arg0, hold);
     LValue *target = lv_builtin_target(a0v, hold);
 
     /* Construct-in-place: only a mutable FLAT struct array + a struct-ctor arg
@@ -1240,16 +1240,21 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
     return arr;
 }
 
-/* `func` entry (tree-walker / const-eval): eval arg0 - an lvalue or a value -
+/* `func` entry (tree-walker / const-eval): arg0 - an lvalue or a value -
  * and PRE-EVAL the cmp arg (sort_core is now AST-free: it takes ArgLocs + the
- * cmp via rest, never a node). */
+ * cmp via rest, never a node). arg0 is a STORE base (store_base_value): a
+ * struct a member step enters is owned first, so `sort(s.a)` on a copy
+ * sorts that copy's field (a plain read handed the field of the struct
+ * the copy still shared, 2026-10-08); a value is held. */
 static EvalValue
 sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
 {
     const size_t n = exprList->elems.size();
     if (n == 0)
         throw InvalidArgumentEx(exprList->start, exprList->end);
-    const EvalValue val0_lval = exprList->elems[0]->eval(ctx);
+    LValue hold;
+    const EvalValue val0_lval =
+        store_base_value(ctx, exprList->elems[0].get(), hold);
     LValue *lval = val0_lval.is<LValue *>() ? val0_lval.get<LValue *>()
                                             : nullptr;
     EvalValue cmp;   /* pre-evaluated cmp arg (sort(a, cmp)) */
@@ -1368,13 +1373,16 @@ reverse_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0,
     return arr;
 }
 
-/* `func` entry: eval arg0 (lvalue or value); build ArgLocs for the core. */
+/* `func` entry: arg0 (lvalue or value) as sort_arr's - a store base;
+ * build ArgLocs for the core. */
 static EvalValue
 reverse_arr(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidArgumentEx(exprList->start, exprList->end);
-    const EvalValue val0_lval = exprList->elems[0]->eval(ctx);
+    LValue hold;
+    const EvalValue val0_lval =
+        store_base_value(ctx, exprList->elems[0].get(), hold);
     LValue *lval = val0_lval.is<LValue *>() ? val0_lval.get<LValue *>()
                                             : nullptr;
     ArgLoc locbuf[1];

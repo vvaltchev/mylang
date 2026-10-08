@@ -84,6 +84,7 @@ struct TypeSym {
      * the full type (kind AND element types), exactly like a scalar pin. */
     std::shared_ptr<TypeAnnot> ann_annot;
     bool is_param = false;
+    bool const_param = false;  /* a `const` parameter */
     bool const_decl = false;   /* declared `const` (vs `var`) */
     bool is_loopvar = false;   /* a foreach loop variable (type is derived) */
     /*
@@ -488,6 +489,7 @@ private:
 
     /* check pass */
     void check(Construct *n);
+    void check_const_param_store(const Construct *target);
     void check_if(IfStmt *i);
     TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
@@ -3563,6 +3565,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
             for (auto &p : fd->params->elems) {
                 TypeSym *psym = new_sym(p->uid, fscope, p->start);
                 psym->is_param = true;
+                psym->const_param = p->const_param;
                 psym->opt_decl = p->opt_mod;
                 psym->dyn_decl = p->dyn_mod;
                 psym->ann = p->decl_type;
@@ -5630,6 +5633,41 @@ bool Inferencer::fold_type_query(CallExpr *call)
     return true;
 }
 
+/*
+ * A store INTO the struct a `const` PARAMETER holds - its target reached
+ * from the parameter through member steps whose bases are all structs
+ * (`c.x = v`, `c.inner.x += 1`, `c.x++`). A struct is a value, and a
+ * `const` parameter's value does not change - C#'s `in`. A step into an
+ * array or a dict (`c.a[0] = v`, `c.d.k = v`) writes into that container,
+ * a reference, and is allowed; so is a mutating builtin on a field
+ * (`append(c.a, x)`). A `dyn` or unknown base decides nothing: at run
+ * time a const parameter is the call's copy like any other, in every
+ * engine, so only a known struct is refused.
+ */
+void Inferencer::check_const_param_store(const Construct *target)
+{
+    const Construct *t = target;
+    bool through_member = false;
+    while (ctag(t) == ConstructType::member) {
+        const Construct *base = static_cast<const MemberExpr *>(t)->what.get();
+        StaticTypeRef bt = static_type_resolve(type_of(base));
+        if (!bt || bt->kind != StaticTypeKind::Struct)
+            return;
+        through_member = true;
+        t = base;
+    }
+    if (!through_member || ctag(t) != ConstructType::id
+            || capture_uses.count(t))
+        return;
+    auto it = id_sym.find(t);
+    if (it == id_sym.end() || !it->second || !it->second->const_param)
+        return;
+    mismatch("cannot change a field of '" +
+                 std::string(static_cast<const Identifier *>(t)->uid->val) +
+                 "': a const parameter's struct is read-only",
+             target->start, target->end);
+}
+
 void Inferencer::check(Construct *n)
 {
     if (!n)
@@ -5838,6 +5876,8 @@ void Inferencer::check(Construct *n)
             return;
         }
 
+        check_const_param_store(opnd);
+
         /* not a const target (when the const survived as a symbol) - a
          * capture of one is the closure's own binding */
         if (id && !capture_uses.count(id)) {
@@ -5864,8 +5904,15 @@ void Inferencer::check(Construct *n)
     if (ctag(n) == ConstructType::expr14) {
         auto *e14 = static_cast<Expr14 *>(n);
         check(e14->rvalue.get());
-        if (!(e14->fl & pFlags::pInDecl))
+        if (!(e14->fl & pFlags::pInDecl)) {
             check(e14->lvalue.get());
+            if (ctag(e14->lvalue.get()) == ConstructType::idlist) {
+                for (auto &t : static_cast<IdList *>(e14->lvalue.get())->elems)
+                    check_const_param_store(t.get());
+            } else {
+                check_const_param_store(e14->lvalue.get());
+            }
+        }
 
         /* An explicitly-typed NON-opt variable must never become none: reject
          * `int a = none`, a later `a = none`, or assigning any nullable value

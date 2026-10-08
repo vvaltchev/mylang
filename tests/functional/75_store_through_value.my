@@ -51,7 +51,11 @@ fd(runtime(1)).k++;
 assert(gd["k"] == 7 && gd["new"] == 9);
 print(gd["k"], gd["new"]);
 
-# 3. structs: a POD one, a boxed one, inline and boxed nested fields
+# 3. structs: a POD one, a boxed one, inline and boxed nested fields. A
+#    struct is a VALUE: `fp()` returns a copy of gp, so a store into its
+#    fields lands in that copy (`{ var t = fp(); t.a = 10; }`) and is gone
+#    with it - gp keeps its fields. An array field is a reference: the
+#    copy's `arr` is gx's array, so a store into it is seen through gx.
 struct In { int x; }
 struct Pod { int a; In sub; }
 struct Box { str s; In sub; array<int> arr; }
@@ -67,8 +71,8 @@ fx(runtime(1)).sub.x = 30;
 fx(runtime(1)).arr[1] = 50;
 fx(runtime(1)).arr[0] += 1;
 var v6 = (fp(runtime(1)).sub.x = 8);
-assert(gp.a == 11 && gp.sub.x == 8 && v6 == 8);
-assert(gx.s == "t" && gx.sub.x == 30 && gx.arr == [5, 50]);
+assert(gp.a == 1 && gp.sub.x == 2 && v6 == 8);
+assert(gx.s == "s" && gx.sub.x == 3 && gx.arr == [5, 50]);
 print(gp, gx);
 
 # 4. nested arrays, and a flat struct array's element

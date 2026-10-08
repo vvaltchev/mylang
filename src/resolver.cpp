@@ -3201,11 +3201,48 @@ static const Identifier *lvalue_chain_root(const Construct *c)
  * A complete walk (fmi_children); a nested function body is not entered
  * (the inliners refuse a callee that nests one).
  */
+/* The identifier at the root of a WRITE-THROUGH chain whose first step is
+ * a MEMBER (`p.f = v`, `p.f[i] += v`, `p.f.g++`, `append(p.f, x)`): a write
+ * into the struct `p` holds - or into the dict, which is a reference, but
+ * the chain's shape cannot tell them apart. Null for any other target. */
+static const Identifier *member_write_root(const Construct *c)
+{
+    const Construct *above = nullptr;
+    for (;;) {
+        switch (ctag(c)) {
+        case ConstructType::id:
+            return ctag(above) == ConstructType::member
+                ? static_cast<const Identifier *>(c) : nullptr;
+        case ConstructType::subscript:
+            above = c;
+            c = static_cast<const Subscript *>(c)->what.get();
+            break;
+        case ConstructType::member:
+            above = c;
+            c = static_cast<const MemberExpr *>(c)->what.get();
+            break;
+        default:
+            return nullptr;
+        }
+    }
+}
+
+/*
+ * `member_only`: count only a write whose first step on the identifier is
+ * a MEMBER (member_write_root) - a write INTO a struct the identifier
+ * holds. A struct is a VALUE: a parameter holding one is the call's own
+ * copy, so a write into it must not reach the caller's variable, which
+ * substituting even a NAME for the parameter would do.
+ */
 static bool writes_through(const Construct *body,
                            const std::function<bool(const Identifier *)>
-                               &is_param)
+                               &is_param,
+                           bool member_only = false)
 {
     bool found = false;
+    const auto root_of = [&](const Construct *t) {
+        return member_only ? member_write_root(t) : lvalue_chain_root(t);
+    };
     std::function<void(const Construct *)> go = [&](const Construct *c) {
         if (!c || found)
             return;
@@ -3215,7 +3252,7 @@ static bool writes_through(const Construct *body,
             target = static_cast<const Expr14 *>(c)->lvalue.get();
             if (ctag(target) == ConstructType::idlist) {
                 for (auto &e : static_cast<const IdList *>(target)->elems) {
-                    const Identifier *r = lvalue_chain_root(e.get());
+                    const Identifier *r = root_of(e.get());
                     if (r && is_param(r))
                         found = true;
                 }
@@ -3237,7 +3274,7 @@ static bool writes_through(const Construct *body,
             break;
         }
         if (target) {
-            const Identifier *r = lvalue_chain_root(target);
+            const Identifier *r = root_of(target);
             if (r && is_param(r))
                 found = true;
         }
@@ -5025,10 +5062,12 @@ private:
              * `x += ...` where the target is the param itself - can't be
              * inlined: the param is a by-value copy, so the call leaves the
              * caller's variable untouched, but substituting the arg would
-             * mutate it. (A mutation THROUGH a param - `p.f++`, `p[i]++` - is
-             * NOT blocked: that already mutates the caller's object by
-             * reference, so inlining gives the same effect. Tail-inline rejects
-             * a reassigned param; specialization never seeds a written one.) */
+             * mutate it. (A mutation THROUGH a param - `p[i]++` - is NOT
+             * blocked: an array or a dict is a reference, so inlining
+             * gives the same effect. A write into a STRUCT param - `p.f++`
+             * - makes arg_substitutable refuse the argument, which is then
+             * temp-bound: the struct is a value. Tail-inline rejects a
+             * reassigned param; specialization never seeds a written one.) */
             && !mutates_a_param(fd);
     }
 
@@ -5104,9 +5143,12 @@ private:
         if (!c)
             return 0;
         int n = 0;
+        /* the slot itself, or the root of a chain written THROUGH: a
+         * write into the struct a local holds changes its value (a struct
+         * is a value), and one into a slice's element detaches the slice -
+         * either way a copy of it taken before no longer reads the same */
         auto is_slot = [&](const Construct *x) {
-            auto *id = ctag(x) == ConstructType::id
-                ? static_cast<const Identifier *>(x) : nullptr;
+            const Identifier *id = lvalue_chain_root(x);
             return id && id->sym.kind == SymKind::local
                 && id->sym.slot == slot;
         };
@@ -5131,9 +5173,16 @@ private:
                     n++;
         } else if (ctag(c) == ConstructType::incdec) {
             auto *inc = static_cast<IncDecExpr *>(c);
-            if (auto *id = dynamic_cast<Identifier *>(inc->lvalue.get()))
-                if (id->sym.kind == SymKind::local && id->sym.slot == slot)
-                    n++;
+            if (is_slot(inc->lvalue.get()))
+                n++;
+        } else if (ctag(c) == ConstructType::call) {
+            /* a mutating builtin's first argument (`append(t, x)`) */
+            auto *ce = static_cast<CallExpr *>(c);
+            auto *callee = dynamic_cast<const Identifier *>(ce->what.get());
+            if (callee && ce->args && !ce->args->elems.empty()
+                    && is_lvalue_arg_builtin(callee->get_str())
+                    && is_slot(ce->args->elems[0].get()))
+                n++;
         }
         for_each_child_slot(c,
             [&](unique_ptr<Construct> &ch) { n += count_slot_writes(ch.get(),
@@ -6506,7 +6555,8 @@ private:
                     || !bind_is_identity(f, static_cast<size_t>(i), arg)
                     || (ctag(arg) != ConstructType::id
                         && param_written_through(f,
-                               static_cast<size_t>(i))))
+                               static_cast<size_t>(i)))
+                    || param_member_written(f, static_cast<size_t>(i)))
                 return;
         }
 
@@ -6745,6 +6795,21 @@ private:
         });
     }
 
+    /* Does f's body write INTO the struct parameter i may hold (writes_
+     * through, member_only)? Then the parameter is the call's own copy of
+     * a value, and no argument - not even a name - may stand for it: the
+     * write would reach the caller's variable. It is bound to a temp,
+     * which the write then makes its own (struct_own). */
+    static bool param_member_written(const FuncDeclStmt *f, size_t i)
+    {
+        if (!f->params || i >= f->params->elems.size())
+            return false;
+        const UniqueId *puid = f->params->elems[i]->uid;
+        return writes_through(f->body.get(), [&](const Identifier *id) {
+            return id->uid == puid;
+        }, /*member_only=*/true);
+    }
+
     bool arg_substitutable(const FuncDeclStmt *f, size_t i,
                            const Construct *arg, int uses) const
     {
@@ -6752,6 +6817,9 @@ private:
             return false;
         /* a write position needs an lvalue: only a NAME may fill it */
         if (ctag(arg) != ConstructType::id && param_written_through(f, i))
+            return false;
+        /* ...and a write into a struct needs the call's own copy */
+        if (param_member_written(f, i))
             return false;
         if (arg_is_inert(arg))
             return true;

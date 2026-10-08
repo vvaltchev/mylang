@@ -104,11 +104,13 @@ assert(outcome(func () { set_x(K); }) == "NotLValueEx");
 assert(outcome(func () { inc_a(K); }) == "NotLValueEx");
 assert(outcome(func () { K[ri(0)].x = 2; }) == "NotLValueEx");
 const CP = P(1, 1.0, true, I(1));
-func set_ia(dyn q) { q.inner.a = 2; }
+func set_ia(dyn q) { q.inner.a = 2; return q.inner.a; }
 # (written through the const NAME itself, `CP.inner.a = 2` is a compile
 # error - a field of a constant is not an assignable location - so it
-# cannot appear in this program; -rt's "const store:" cases hold it)
-assert(outcome(func () { set_ia(CP); }) == "NotLValueEx");
+# cannot appear in this program; -rt's "const store:" cases hold it).
+# Passed to a parameter, the constant is COPIED - a struct is a value -
+# and the copy is the call's to change.
+assert(set_ia(CP) == 2);
 assert(K[0].x == 1 && CP.inner.a == 1 && ps[0].x == 5);
 
 # what the bytes cannot take is read as a value from there on (a dyn base

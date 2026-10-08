@@ -1,9 +1,12 @@
-# a const struct's field written through an inlined parameter (#38 C)
+# a field of a const array's struct, written through an inlined parameter
+# (#38 C): the array is a reference to the constant's read-only array, so
+# its element is not a location. (A struct passed itself is a COPY - a
+# struct is a value - and a store into the copy is no error.)
 struct P { int x; int y; }
-const C = P(1, 2);
-func g(p) { p.x = 5; }
+const C = [P(1, 2)];
+func g(p) { p[0].x = 5; }
 func drive(int n) {
-    var m = P(runtime(3), 4);
+    var m = [P(runtime(3), 4)];
     for (var i = 0; i < n; i++) { if (i == 2) g(C); else g(m); }
     return n;
 }

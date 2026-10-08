@@ -9585,7 +9585,55 @@ shows it):** every VALUE use of a **bool struct field** renders as int
 bool on both sides. Suspected cause: a bool node is stamped `th == i`,
 and the member-read lowering's "bool -> 0/1 int" form writes an INT
 into the dst, losing the type. Tracked separately; the test here uses
-the comparison spelling, with a note saying why.
+the comparison spelling, with a note saying why. (FIXED since by
+`Construct::th_bool`, 2026-08-26 - every engine renders `true`/`false`;
+rechecked 2026-10-08.)
+
+**SUPERSEDED IN PART - A STRUCT IS A VALUE (2026-10-08,
+plans/struct-value-semantics.md).** "No clone on either path" was the
+semantics while a struct aliased; it no longer is. A copy is made at the
+WRITE (`struct_own`, eval.h): a write into an object another holder can
+see makes the slot's own clone first. The in-place store is therefore
+guarded to be exactly the case `struct_own` hands back unchanged - two
+guards added, one removed:
+ - **`memberv_shared`**: `cmp dword [obj + sobj_rc], 1` - the slot is
+   the object's only holder;
+ - **`memberv_borrowed`**: the base slot's `borrowed` byte is 0 - a #94
+   borrowed parameter is counted by the CALLER's slot, so a count of one
+   proves nothing there;
+ - `memberv_base_const` is GONE: a const binding no longer stops a field
+   write at run time (a `const` parameter's struct is refused at compile
+   time when its type is known; the VM never enforced it), so the guard
+   would have declined to a helper doing the same store.
+`readonly` stays and now declines to a helper that CLONES rather than
+throws (a copy of a constant is writable). All six declines are asserted
+taken in `jit_memberv_native`, the fast path too; the first write after
+a copy declines (`shared`) and every later one is in place, which is the
+whole cost of value semantics on this tier. `tests/functional/
+78_struct_value_semantics.my` section 14 is the loop shape.
+
+MEASURED (callgrind Ir, `OPT=1 ASSERTS=0`, `-npc`, against e3e935c8, the
+scale-3-minus-scale-1 delta so compile time is excluded): 90_struct_
+field_store **+4.6% per scale unit**, +4.8M Ir over 2.4M field stores -
+the +2 instructions per store of the guard change, nothing else;
+42_exceptions, 64_struct_create, 65_struct_field_sum,
+77_struct_array_lit flat to the instruction, 69_exc_crossframe +0.11%.
+SABOTAGE (15 cases, each restored by plain copy + touch and rebuilt
+inside the restore, then a control run): all caught - but only after
+the harness had found three holes in its own checks. S6 (the tail
+inliner substitutes a member-written parameter) and S7
+(`collapse_locals` ignores a write through a local) were NOT caught at
+first: test 78's shapes never reached either path - a call the block
+inliner can take is block-inlined first (children are walked first),
+and no body under the block inliner's weight gate can hold a
+declaration plus a member write, so `collapse_locals` is reached only by
+a pure tree recursion's unrolled copies. 78 sections 15 and 16 now
+reach both. And the first CONTROL run failed: the `-rt` case `struct:
+an in-place builtin on a copy's slice field` failed in the tree-walker
+at HEAD - `sort` / `reverse` read their first argument plainly and wrote
+into the struct a copy still shared (fixed: `sort_arr` / `reverse_arr`
+take it as a store base). A one-line `tail` of the earlier manual check
+had hidden the failing summary line.
 
 ## #97 step 2a - THE CAPTURE STORE-TO-LOAD FORWARD (a BYTECODE
 ## peephole, so both engines get it), 2026-08-26

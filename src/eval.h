@@ -667,11 +667,41 @@ inline int none_bind_fault(const FuncDescriptor *d, size_t n, ArgAt arg_at)
  * false = take the full builtin path (errors/odd shapes, proper carets). */
 bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const);
 
-/* Form the member LValue* of `dval.member` for a ROOTED base (a mutable boxed
- * struct field / a dict value); nullptr for a POD field / readonly / non-
- * struct-non-dict (a value read). Shared by vm_incdec_member and the VM's
- * StoreLValueChainV walk. See eval.cpp. */
-LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
+/*
+ * STRUCT VALUE SEMANTICS (plans/struct-value-semantics.md). A struct is a
+ * VALUE: every copy is independent. The copy is made at the WRITE, not at
+ * the move: a struct object may be shared by any number of holders (frame
+ * slots, elements, fields, captures), and a write INTO it first makes it
+ * its holder's own. struct_own returns the object `holder` may write in
+ * place - the one it holds, when no other holder can see it, else a
+ * shallow mutable clone put into the holder first. Another holder can see
+ * it when its count is above one, when `holder` is BORROWED (#94: the
+ * caller's slot holds the counted reference), or when it is read-only (a
+ * constant's, which a copy may change and the constant may not). An array
+ * element is detached from its array first (LValue::write_target), so
+ * `holder` is updated to the live slot. `holder` must hold a struct.
+ * ⛔ OWN BEFORE DERIVING ANY POINTER INTO THE OBJECT: a pointer taken
+ * earlier points into the object the holder no longer holds.
+ */
+StructObject &struct_own(LValue *&holder);
+/* struct_own when `holder` holds a struct; `holder` is updated as
+ * struct_own updates it. */
+void struct_own_if(LValue *&holder);
+
+/* The base of a store `<e>[k] = v` / the target of a mutating builtin
+ * `append(<e>, v)`, evaluated once, for writing: a member step into a
+ * struct OWNS it (struct_own); a value is held in `hold`, the caller's,
+ * as a store through a value holds its root. See eval.cpp. */
+EvalValue store_base_value(EvalContext *ctx, const Construct *e,
+                           LValue &hold);
+
+/* Form the member LValue* of `cur.member` for a store: a boxed field of the
+ * struct a writable slot holds (OWNED first - struct_own - so `cur` is
+ * updated to the live slot), or a dict value; nullptr for a POD field, a
+ * value base or a non-struct-non-dict (a value read).
+ * Shared by the VM's member stores and inc-decs, its chain walk and the
+ * mutating builtins' member argument. See eval.cpp. */
+LValue *vm_member_lvalue_ref(EvalValue &cur, const EvalValue &memId,
                              const UniqueId *memUid, bool for_write,
                              Loc mstart, Loc mend);
 
