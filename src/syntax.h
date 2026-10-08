@@ -644,6 +644,12 @@ class LiteralObj final: public Construct {
 
 public:
 
+    /* It replaced a container literal written in the source (`[1, 2]`),
+     * not a folded call or name: a FRESH value, which a declared container
+     * type may give its element type (the inferencer's literal_into) as
+     * the unfolded LiteralArray / LiteralDict gets it under -nc. */
+    bool from_literal = false;
+
     LiteralObj(const EvalValue &v, bool immutable = false)
         : Construct("LiteralObj", true, ConstructType::lit_obj)
         , value(v)
@@ -659,6 +665,9 @@ public:
     /* The baked const value (read-only). Used by the type inferencer to derive
      * the static type of a folded const array/dict literal. */
     const EvalValue &literal_value() const { return value; }
+    /* The inferencer's one rewrite of it: a literal stored into a declared
+     * container type it fits widens to that type (widen_baked_value) */
+    void set_literal_value(EvalValue v) { value = std::move(v); }
 
     /* Whether do_eval shares the value (const target) vs a mutable clone (var).
      * Read by the VM codegen to bake a LoadLiteralObjV pool entry. */
@@ -667,6 +676,7 @@ public:
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<LiteralObj>(value, immutable);
         copy_base_fields(*c);
+        c->from_literal = from_literal;
         return c;
     }
 };

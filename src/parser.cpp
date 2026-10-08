@@ -672,6 +672,39 @@ pAcceptForStmt(ParseContext &c,
                unique_ptr<Construct> &ret,
                unsigned fl);
 
+/* A container literal written in the source (LiteralObj::from_literal) */
+static bool is_container_literal(const Construct *n)
+{
+    return n && (ctag(n) == ConstructType::lit_arr
+                 || ctag(n) == ConstructType::lit_dict);
+}
+
+/* A parsed container annotation's numeric shape (widen_baked_value) */
+static void widen_shape_of_annot(const TypeAnnot *a, WidenShape &w)
+{
+    w.k = 0;
+    if (!a)
+        return;
+    switch (a->kind) {
+    case DeclType::f: w.k = 'f'; return;
+    case DeclType::i: w.k = 'i'; return;
+    case DeclType::arr:
+        w.k = 'a';
+        w.sub = make_unique<WidenShape>();
+        widen_shape_of_annot(a->elem.get(), *w.sub);
+        return;
+    case DeclType::dict:
+        w.k = 'd';
+        w.sub = make_unique<WidenShape>();
+        widen_shape_of_annot(a->val.get(), *w.sub);
+        w.key = make_unique<WidenShape>();
+        widen_shape_of_annot(a->key.get(), *w.key);
+        return;
+    default:
+        return;
+    }
+}
+
 bool
 MakeConstructFromConstVal(const EvalValue &v,
                           unique_ptr<Construct> &out,
@@ -2394,6 +2427,28 @@ pExpr14_body(ParseContext &c, unsigned fl)
         }
 
         /*
+         * A typed const CONTAINER written as a literal holds its declared
+         * element type (`const array<float> F = [1, 2];` holds 1.0, 2.0):
+         * the inferencer widens it for the run (literal_into), and a read
+         * folded at parse time - `str(F)`, `F[0]` - must see that value,
+         * not the literal's own ints. A const's initializer is always
+         * baked (under -nc too), and the binding is made from the node.
+         */
+        WidenShape cont_shape;
+        if (auto *cid = dynamic_cast<Identifier *>(ret->lvalue.get())) {
+            const TypeAnnot *an = cid->decl_annot.get();
+            if (an && (an->kind == DeclType::arr
+                       || an->kind == DeclType::dict))
+                widen_shape_of_annot(an, cont_shape);
+        }
+        if (cont_shape.k && ctag(ret->rvalue.get()) == ConstructType::lit_obj) {
+            auto *lo = static_cast<LiteralObj *>(ret->rvalue.get());
+            if (lo->from_literal)
+                lo->set_literal_value(
+                    widen_baked_value(lo->literal_value(), cont_shape));
+        }
+
+        /*
          * Save the const declaration by evaluating the assignment
          * in our special `const_ctx` EvalContext.
          */
@@ -3797,6 +3852,8 @@ cse_materialize_core(ParseContext &c,
              * across const symbols is safe (and is the whole point).
              */
             out = make_unique<LiteralObj>(*hit, true);
+            static_cast<LiteralObj *>(out.get())->from_literal =
+                is_container_literal(node);
             return true;
         }
     }
@@ -3820,6 +3877,8 @@ cse_materialize_core(ParseContext &c,
             c.cse->insert(key, baked);
 
         out = make_unique<LiteralObj>(std::move(baked), true);
+        static_cast<LiteralObj *>(out.get())->from_literal =
+            is_container_literal(node);
         return true;
     }
 
@@ -3827,7 +3886,12 @@ cse_materialize_core(ParseContext &c,
      * Everything else (scalars, strings, mutable arrays, non-materializable):
      * identical to the non-cached path.
      */
-    return MakeConstructFromConstVal(v, out, process_arrays, immutable);
+    if (!MakeConstructFromConstVal(v, out, process_arrays, immutable))
+        return false;
+    if (out && ctag(out.get()) == ConstructType::lit_obj
+            && is_container_literal(node))
+        static_cast<LiteralObj *>(out.get())->from_literal = true;
+    return true;
 }
 
 static bool

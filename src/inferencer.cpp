@@ -432,6 +432,19 @@ private:
     void contribute_ret(StaticTypeRef t);
     void accumulate_assign(Expr14 *e);
     void contribute_to_lvalue(Construct *lv, StaticTypeRef ct);
+    /* A symbol whose type is FIXED - checked, not joined - see the def */
+    StaticTypeRef fixed_type(const TypeSym *s);
+    void contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
+                         Loc loc_end);
+    bool literal_fits(Construct *lit, StaticTypeRef d);
+    bool type_fits(StaticTypeRef t, StaticTypeRef d);
+    StaticTypeRef literal_dest_type(Expr14 *e);
+    StaticTypeRef literal_into(Construct *rv, StaticTypeRef dest);
+    void stamp_literal_into(Construct *rv, StaticTypeRef dest);
+    StaticTypeRef fixed_elem_dest(Construct *base, bool key);
+    std::vector<TypeSym *> *known_params(CallExpr *call);
+    StaticTypeRef arg_type(Construct *arg, TypeSym *param);
+    void stamp_literal_args(CallExpr *call);
     void accumulate_call(CallExpr *call);
     void accumulate_foreach(ForeachStmt *fe);
     void spread_idlist(IdList *idl, Construct *rvalue, Op op);
@@ -2788,6 +2801,41 @@ void Inferencer::stamp_untyped_calls(Construct *n)
     for_each_child(n, [&](Construct *c) { stamp_untyped_calls(c); });
 }
 
+/* The base of a plain element store `a[k] = v` (null for anything else):
+ * where literal_into looks for a FIXED container's element type */
+static Construct *store_base_of(Expr14 *e)
+{
+    if (e->op != Op::assign
+        || ctag(e->lvalue.get()) != ConstructType::subscript)
+        return nullptr;
+    return static_cast<Subscript *>(e->lvalue.get())->what.get();
+}
+
+/* A destination type's numeric shape, for widen_baked_value */
+static void widen_shape_of(StaticTypeRef t, WidenShape &w)
+{
+    t = static_type_resolve(t);
+    switch (t->kind) {
+    case StaticTypeKind::Float: w.k = 'f'; return;
+    case StaticTypeKind::Int:   w.k = 'i'; return;
+    case StaticTypeKind::Array:
+        w.k = 'a';
+        w.sub = std::make_unique<WidenShape>();
+        widen_shape_of(t->elem, *w.sub);
+        return;
+    case StaticTypeKind::Dict:
+        w.k = 'd';
+        w.sub = std::make_unique<WidenShape>();
+        widen_shape_of(t->val, *w.sub);
+        w.key = std::make_unique<WidenShape>();
+        widen_shape_of(t->key, *w.key);
+        return;
+    default:
+        w.k = 0;
+        return;
+    }
+}
+
 /* The widening a value of static type `val` needs to be stored where the
  * static type is `target` (#75 follow-up): f for an int or bool into a
  * float, i for a bool into an int, else none. Opt-ness is ignored on both
@@ -2960,7 +3008,23 @@ void Inferencer::annotate_hints(Construct *n)
                 e->val_widen = numeric_widen(
                     type_of(const_cast<Construct *>(lv)),
                     type_of(e->rvalue.get()));
+            /* an ARRAY element widens too, as a dict's value does: a
+             * general array<float?> stored an int where its static type
+             * says float (a flat float array converts on its own) */
+            if (ctag(lv) == ConstructType::subscript
+                && bt->kind == StaticTypeKind::Array)
+                e->rv_coerce = numeric_widen(bt->elem,
+                                             type_of(e->rvalue.get()));
         }
+        /* a container literal stored into a FIXED array / dict type it
+         * fits has that type (literal_dest_type): its elements widen to
+         * the declared element, not to the literal's own join */
+        StaticTypeRef d = literal_dest_type(e);
+        if (!d)
+            d = literal_into(e->rvalue.get(),
+                             fixed_elem_dest(store_base_of(e), false));
+        if (d)
+            stamp_literal_into(e->rvalue.get(), d);
     }
     if (ctag(n) == ConstructType::subscript) {
         auto *sub = static_cast<Subscript *>(n);
@@ -3009,6 +3073,25 @@ void Inferencer::annotate_hints(Construct *n)
         auto *call = static_cast<CallExpr *>(n);
         StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
         call->vm_direct_func = ct->kind == StaticTypeKind::Func;
+
+        /* append / push / insert of a container LITERAL into a FIXED
+         * array: the literal has the element type (literal_into) */
+        if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+            auto sit = id_sym.find(cid);
+            const bool builtin =
+                (sit == id_sym.end() || !sit->second) && is_builtin(cid->uid);
+            const std::string_view nm = cid->uid->val;
+            const size_t vi = nm == "insert" ? 2 : 1;
+            if (builtin && call->args && call->args->elems.size() > vi
+                && (nm == "append" || nm == "push" || nm == "insert")) {
+                Construct *v = call->args->elems[vi].get();
+                if (StaticTypeRef d = literal_into(
+                        v, fixed_elem_dest(call->args->elems[0].get(), false)))
+                    stamp_literal_into(v, d);
+            }
+        }
+        /* ...and one passed for a declared parameter or a struct field */
+        stamp_literal_args(call);
 
         /*
          * Which arguments could the call INVOKE? Bit i is set when argument
@@ -5114,7 +5197,8 @@ void Inferencer::accumulate_call(CallExpr *call)
             return;   /* a template call: handled by instantiation (redirect) */
         size_t n = std::min(fi->params.size(), args->elems.size());
         for (size_t i = 0; i < n; i++)
-            contribute_arg(fi->params[i], type_of(args->elems[i].get()),
+            contribute_arg(fi->params[i],
+                           arg_type(args->elems[i].get(), fi->params[i]),
                            args->elems[i]->start, args->elems[i]->end);
         return;
     }
@@ -5156,7 +5240,7 @@ void Inferencer::accumulate_call(CallExpr *call)
             size_t n = std::min(ifi->params.size(), args->elems.size());
             for (size_t i = 0; i < n; i++)
                 contribute_arg(ifi->params[i],
-                               type_of(args->elems[i].get()),
+                               arg_type(args->elems[i].get(), ifi->params[i]),
                                args->elems[i]->start, args->elems[i]->end);
             return;
         }
@@ -5185,7 +5269,10 @@ void Inferencer::accumulate_call(CallExpr *call)
         TypeSym *bs = (bit != id_sym.end()) ? bit->second : nullptr;
         if (!bs)
             return;
-        StaticTypeRef vt = type_of(args->elems[val_i].get());
+        StaticTypeRef vt = literal_into(args->elems[val_i].get(),
+                                        fixed_elem_dest(bid, false));
+        if (!vt)
+            vt = type_of(args->elems[val_i].get());
         StaticTypeRef bt = static_type_resolve(bs->type);
         /* Defer if the element type isn't settled yet (the defer-on-Unknown
          * invariant): contributing `array<?>` to a PINNED global array would
@@ -5201,9 +5288,9 @@ void Inferencer::accumulate_call(CallExpr *call)
                             ? type_of(args->elems[key_i].get()) : A.dyn_ty();
             if (is_unknown(static_type_resolve(kt)))
                 return;
-            contribute(bs, A.dict_of(kt, vt), bid->start, bid->end);
+            contribute_elem(bs, A.dict_of(kt, vt), bid->start, bid->end);
         } else if (bt->kind == StaticTypeKind::Array) {
-            contribute(bs, A.array_of(vt), bid->start, bid->end);
+            contribute_elem(bs, A.array_of(vt), bid->start, bid->end);
         }
         /* unknown/other base kind: skip (don't guess) */
     };
@@ -5353,7 +5440,12 @@ void Inferencer::accumulate_assign(Expr14 *e)
 
     StaticTypeRef ct;
     if (e->op == Op::assign) {
-        ct = type_of(e->rvalue.get());
+        ct = literal_dest_type(e);
+        if (!ct)
+            ct = literal_into(e->rvalue.get(),
+                              fixed_elem_dest(store_base_of(e), false));
+        if (!ct)
+            ct = type_of(e->rvalue.get());
     } else {
         StaticTypeRef l = type_of(e->lvalue.get());
         StaticTypeRef r = type_of(e->rvalue.get());
@@ -5374,6 +5466,253 @@ void Inferencer::accumulate_assign(Expr14 *e)
     }
 
     contribute_to_lvalue(lv, ct);
+}
+
+/*
+ * A symbol whose type is FIXED: a committed REPL global, or one an
+ * annotation pins (a scalar, a struct, a parameterized container -
+ * ann_scalar_static_type). A contribution to it is CHECKED against that
+ * type, never joined into it (contribute). Null otherwise.
+ */
+StaticTypeRef Inferencer::fixed_type(const TypeSym *s)
+{
+    if (!s || s->func)
+        return nullptr;
+    if (s->pinned)
+        return static_type_resolve(s->type);
+    if (StaticTypeRef d = ann_scalar_static_type(s))
+        return static_type_resolve(d);
+    return nullptr;
+}
+
+/*
+ * An ELEMENT contribution to a container symbol - an element or dict
+ * store, an append / push / insert - given as the container type it
+ * implies (`array<V>`, `dict<K, V>`). To a FIXED container type it is
+ * checked element by element: `a[0] = 5` and `append(a, 5)` into an
+ * `array<int?>`, or an int into an `array<float>`, are a value fitting
+ * the declared element, while the implied `array<int>` is not assignable
+ * to the declared array (arrays are invariant, for an alias's sake - and
+ * an element store is no alias). A misfit is checked whole, as before,
+ * for the same message.
+ */
+void Inferencer::contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
+                                 Loc loc_end)
+{
+    const StaticTypeRef d = fixed_type(s);
+    const StaticTypeRef c = static_type_resolve(cont);
+    if (d && c->kind == d->kind) {
+        const auto fits = [&](StaticTypeRef v, StaticTypeRef into) {
+            const StaticTypeRef r = static_type_resolve(v);
+            return has_unknown(r) ||
+                   static_type_assignable(r, static_type_resolve(into));
+        };
+        const bool ok =
+            d->kind == StaticTypeKind::Array ? fits(c->elem, d->elem)
+            : d->kind == StaticTypeKind::Dict
+                ? fits(c->key, d->key) && fits(c->val, d->val)
+                : false;
+        if (ok) {
+            contribute(s, d, loc, loc_end);
+            return;
+        }
+    }
+    contribute(s, cont, loc, loc_end);
+}
+
+/*
+ * Does a container LITERAL fit the type `d`, element by element (and its
+ * nested literals likewise)? A literal is a fresh value nothing else
+ * holds, so `[1, 2]` may be an `array<float>` and `[5]` an
+ * `array<int?>` - the invariance that refuses an array VARIABLE of
+ * another element type protects an alias, which a literal has none of.
+ */
+bool Inferencer::literal_fits(Construct *lit, StaticTypeRef d)
+{
+    d = static_type_resolve(d);
+    if (ctag(lit) == ConstructType::lit_arr) {
+        if (d->kind != StaticTypeKind::Array)
+            return false;
+        for (auto &el : static_cast<LiteralArray *>(lit)->elems)
+            if (!literal_fits(el.get(), d->elem))
+                return false;
+        return true;
+    }
+    if (ctag(lit) == ConstructType::lit_dict) {
+        if (d->kind != StaticTypeKind::Dict)
+            return false;
+        for (auto &kv : static_cast<LiteralDict *>(lit)->elems)
+            if (!literal_fits(kv->key.get(), d->key) ||
+                !literal_fits(kv->value.get(), d->val))
+                return false;
+        return true;
+    }
+    /* a baked constant literal (LiteralObj) fits by its value's type,
+     * element by element (annotate_hints widens the value) */
+    if (ctag(lit) == ConstructType::lit_obj)
+        return static_cast<LiteralObj *>(lit)->from_literal
+            && type_fits(type_of(lit), d);
+    const StaticTypeRef t = static_type_resolve(type_of(lit));
+    return has_unknown(t) || static_type_assignable(t, d);
+}
+
+/* literal_fits for a TYPE - a baked literal's: element by element, an
+ * empty container (a `none` element type) fitting any */
+bool Inferencer::type_fits(StaticTypeRef t, StaticTypeRef d)
+{
+    t = static_type_resolve(t);
+    d = static_type_resolve(d);
+    if (has_unknown(t))
+        return true;
+    if (t->opt && !d->opt)
+        return static_type_assignable(t, d);
+    if (t->kind == StaticTypeKind::Array && d->kind == StaticTypeKind::Array) {
+        const StaticTypeRef te = static_type_resolve(t->elem);
+        return te->kind == StaticTypeKind::None || type_fits(te, d->elem);
+    }
+    if (t->kind == StaticTypeKind::Dict && d->kind == StaticTypeKind::Dict) {
+        const StaticTypeRef tk = static_type_resolve(t->key);
+        if (tk->kind == StaticTypeKind::None)
+            return true;
+        return static_type_assignable(tk, d->key)
+            && type_fits(t->val, d->val);
+    }
+    return static_type_assignable(t, d);
+}
+
+/*
+ * A container LITERAL (a LiteralArray, a LiteralDict, or one baked at
+ * parse time - a LiteralObj) landing in a place whose static type `dest`
+ * it fits (literal_fits): it HAS that type there - its elements are stored
+ * at it (stamp_literal_into), and the contribution is `dest` itself.
+ * Null for anything else, or a literal that does not fit.
+ */
+StaticTypeRef Inferencer::literal_into(Construct *rv, StaticTypeRef dest)
+{
+    if (!rv || !dest)
+        return nullptr;
+    const ConstructType t = ctag(rv);
+    if (t != ConstructType::lit_arr && t != ConstructType::lit_dict
+        && t != ConstructType::lit_obj)
+        return nullptr;
+    dest = static_type_resolve(dest);
+    if (dest->kind != StaticTypeKind::Array
+        && dest->kind != StaticTypeKind::Dict)
+        return nullptr;
+    return literal_fits(rv, dest) ? dest : nullptr;
+}
+
+/* The runtime half of literal_into: the literal's elements widen to
+ * `dest`'s - stamped on a LiteralArray / LiteralDict (their own type's
+ * stamp then leaves them alone), applied once to a baked value. */
+void Inferencer::stamp_literal_into(Construct *rv, StaticTypeRef dest)
+{
+    if (ctag(rv) == ConstructType::lit_obj) {
+        WidenShape w;
+        widen_shape_of(dest, w);
+        auto *lo = static_cast<LiteralObj *>(rv);
+        lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
+        return;
+    }
+    lit_coerce_by_parent.insert(rv);
+    stamp_literal_coerce(rv, dest);
+}
+
+/*
+ * The element (or, `key`, the dict key) type of the FIXED container a
+ * store or an append writes into: `base` an identifier whose symbol has a
+ * fixed array / dict type (fixed_type). Null otherwise.
+ */
+StaticTypeRef Inferencer::fixed_elem_dest(Construct *base, bool key)
+{
+    if (!base || ctag(base) != ConstructType::id)
+        return nullptr;
+    auto it = id_sym.find(static_cast<Identifier *>(base));
+    if (it == id_sym.end())
+        return nullptr;
+    const StaticTypeRef d = fixed_type(it->second);
+    if (!d)
+        return nullptr;
+    if (d->kind == StaticTypeKind::Array)
+        return key ? nullptr : d->elem;
+    if (d->kind == StaticTypeKind::Dict)
+        return key ? d->key : d->val;
+    return nullptr;
+}
+
+/*
+ * The parameter symbols of the function a call names - a named function,
+ * a func-var bound to a lambda, an inline lambda, or #115's one indirect
+ * callee - or null (anything else, or a template: each instance checks).
+ */
+std::vector<TypeSym *> *Inferencer::known_params(CallExpr *call)
+{
+    FuncInfo *fi = callee_funcinfo(call->what.get());
+    if (!fi) {
+        auto ic = indirect_callee.find(call);
+        if (ic != indirect_callee.end())
+            fi = ic->second;
+    }
+    if (!fi && ctag(call->what.get()) == ConstructType::id) {
+        auto it = id_sym.find(static_cast<Identifier *>(call->what.get()));
+        if (it != id_sym.end() && it->second)
+            fi = it->second->func;
+    }
+    return fi && !fi->is_template ? &fi->params : nullptr;
+}
+
+/* An argument's type for `param`: a container literal for a declared
+ * container parameter has the parameter's type (literal_into) */
+StaticTypeRef Inferencer::arg_type(Construct *arg, TypeSym *param)
+{
+    if (StaticTypeRef d = literal_into(arg, fixed_type(param)))
+        return d;
+    return type_of(arg);
+}
+
+/* The runtime half of arg_type, and its twin for a struct construction's
+ * field values: each such literal's elements widen to the declared type */
+void Inferencer::stamp_literal_args(CallExpr *call)
+{
+    ExprList *args = call->args.get();
+    if (!args)
+        return;
+    if (ctag(call->what.get()) == ConstructType::id) {
+        auto it = id_sym.find(static_cast<Identifier *>(call->what.get()));
+        if (it != id_sym.end() && it->second && it->second->struct_type) {
+            const StructTypeDef *def = it->second->struct_type;
+            const size_t n = std::min(args->elems.size(), def->fields.size());
+            for (size_t i = 0; i < n; i++) {
+                const FieldDef &fd = def->fields[i];
+                if (fd.kind == FieldKind::f_dyn)
+                    continue;
+                Construct *a = args->elems[i].get();
+                if (StaticTypeRef d = literal_into(a, field_static_type(fd)))
+                    stamp_literal_into(a, d);
+            }
+            return;
+        }
+    }
+    std::vector<TypeSym *> *ps = known_params(call);
+    if (!ps)
+        return;
+    const size_t n = std::min(args->elems.size(), ps->size());
+    for (size_t i = 0; i < n; i++) {
+        Construct *a = args->elems[i].get();
+        if (StaticTypeRef d = literal_into(a, fixed_type((*ps)[i])))
+            stamp_literal_into(a, d);
+    }
+}
+
+/* `x = <literal>` (literal_into) into the FIXED type of `x`'s symbol */
+StaticTypeRef Inferencer::literal_dest_type(Expr14 *e)
+{
+    if (e->op != Op::assign || ctag(e->lvalue.get()) != ConstructType::id)
+        return nullptr;
+    auto it = id_sym.find(static_cast<Identifier *>(e->lvalue.get()));
+    if (it == id_sym.end())
+        return nullptr;
+    return literal_into(e->rvalue.get(), fixed_type(it->second));
 }
 
 /*
@@ -5403,12 +5742,12 @@ void Inferencer::contribute_to_lvalue(Construct *lv, StaticTypeRef ct)
             if (it != id_sym.end() && it->second) {
                 StaticTypeRef bt = static_type_resolve(it->second->type);
                 if (bt->kind == StaticTypeKind::Dict)
-                    contribute(it->second,
-                               A.dict_of(type_of(sub->index.get()), ct),
-                               bid->start, bid->end);
+                    contribute_elem(it->second,
+                                    A.dict_of(type_of(sub->index.get()), ct),
+                                    bid->start, bid->end);
                 else if (bt->kind == StaticTypeKind::Array)
-                    contribute(it->second, A.array_of(ct), bid->start,
-                               bid->end);
+                    contribute_elem(it->second, A.array_of(ct), bid->start,
+                                    bid->end);
             }
         }
         return;
@@ -6174,7 +6513,10 @@ void Inferencer::check_struct_construction(CallExpr *call,
 
     for (size_t i = 0; i < nargs && i < nfields; i++) {
         const FieldDef &fd = def->fields[i];
-        StaticTypeRef at = type_of(args->elems[i].get());
+        StaticTypeRef at = fd.kind == FieldKind::f_dyn ? nullptr
+            : literal_into(args->elems[i].get(), field_static_type(fd));
+        if (!at)
+            at = type_of(args->elems[i].get());
 
         if (!fd.is_opt && is_optish(at))
             nullability("field '" + std::string(fd.name->val) +
@@ -6295,9 +6637,11 @@ void Inferencer::check_call(CallExpr *call)
     if (template_call)
         return;   /* per-argument checking happens in each instantiation */
 
+    std::vector<TypeSym *> *kp = known_params(call);
     for (size_t i = 0; i < nargs && i < nparams; i++) {
         Construct *anode = args->elems[i].get();
-        StaticTypeRef at = type_of(anode);
+        StaticTypeRef at = kp && i < kp->size() ? arg_type(anode, (*kp)[i])
+                                                : type_of(anode);
 
         bool p_dyn, p_opt;
         StaticTypeRef ptype;

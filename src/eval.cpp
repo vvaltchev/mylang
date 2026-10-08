@@ -3203,6 +3203,84 @@ EvalValue shape_widen(const EvalValue &v, const NumShape &s, bool is_const,
 }
 } // namespace
 
+/* widen_baked_value's walk; `st` the containers it is inside (a baked
+ * value may contain itself - a back edge is left as it is) */
+static EvalValue widen_baked_rec(const EvalValue &v, const WidenShape &w,
+                                 CycStack &st, bool &changed)
+{
+    changed = false;
+    if (w.k == 'f' && (v.is<int_type>() || v.is<bool>())) {
+        changed = true;
+        return EvalValue(static_cast<float_type>(
+            v.is<bool>() ? (v.get<bool>() ? 1 : 0) : v.get<int_type>()));
+    }
+    if (w.k == 'i' && v.is<bool>()) {
+        changed = true;
+        return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+    }
+    if ((w.k != 'a' || !v.is<SharedArrayObj>())
+        && (w.k != 'd' || !v.is<intrusive_ptr<DictObject>>()))
+        return v;
+    CycKey ck;
+    const bool keyed = cyc_key(v, ck);
+    if (keyed && st.contains(ck))
+        return v;
+    CycGuard g(st, ck, keyed);
+    if (w.k == 'a') {
+        const auto &a = v.get_ref<SharedArrayObj>();
+        std::vector<EvalValue> buf(a.size());
+        bool any = false;
+        for (size_type i = 0; i < a.size(); i++) {
+            bool c = false;
+            buf[i] = w.sub ? widen_baked_rec(arr_elem_boxed(a, i), *w.sub,
+                                             st, c)
+                           : arr_elem_boxed(a, i);
+            any |= c;
+        }
+        if (!any)
+            return v;
+        changed = true;
+        EvalValue r = build_array_from_values(buf.data(), buf.size(),
+                                              ArrHint::dflt, nullptr, false);
+        if (a.is_readonly())
+            r = make_const_clone(r);
+        return r;
+    }
+    const auto &d = *v.get_ref<intrusive_ptr<DictObject>>();
+    std::vector<EvalValue> buf;
+    buf.reserve(2 * d.get_ref().size());
+    bool any = false;
+    for (const auto &kv : d.get_ref()) {
+        bool ck2 = false, cv = false;
+        buf.push_back(w.key ? widen_baked_rec(kv.first, *w.key, st, ck2)
+                            : kv.first);
+        buf.push_back(w.sub ? widen_baked_rec(kv.second.get(), *w.sub, st, cv)
+                            : kv.second.get());
+        any |= ck2 || cv;
+    }
+    EvalValue dflt;
+    bool cdef = false;
+    if (d.get_has_default() && w.sub)
+        dflt = widen_baked_rec(d.get_default(), *w.sub, st, cdef);
+    if (!any && !cdef)
+        return v;
+    changed = true;
+    EvalValue r = build_dict_from_pairs(buf.data(), buf.size() / 2, false);
+    if (d.get_has_default())
+        r.get<intrusive_ptr<DictObject>>()->set_default(
+            cdef ? dflt : d.get_default());
+    if (d.is_readonly())
+        r = make_const_clone(r);
+    return r;
+}
+
+EvalValue widen_baked_value(const EvalValue &v, const WidenShape &w)
+{
+    CycStack st;
+    bool changed;
+    return widen_baked_rec(v, w, st, changed);
+}
+
 static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
                                bool is_const)
 {

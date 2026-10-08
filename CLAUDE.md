@@ -4703,6 +4703,24 @@ decisions behind it: `plans/archived/type-inference.md`,
   (then), `if (x == none) ... else` (else), and the guard clause
   `if (x == none) return/throw; ...` (rest of the block). Sound (the branch
   guarantees non-none). Not flow-narrowed elsewhere.
+- **A container LITERAL takes a FIXED destination's type (#46,
+  2026-10-08).** A FIXED symbol is one whose type is checked, never
+  joined: annotated or a committed REPL global (`fixed_type`). An
+  element contribution to one (a store, `append`/`push`/`insert`) is
+  checked against the declared ELEMENT (`contribute_elem`) - the implied
+  `array<int>` is not assignable to an `array<int?>`, arrays being
+  invariant, but an element store is no alias. A container literal
+  landing in a fixed place - a variable, an element, an append, an
+  annotated PARAMETER (`known_params` / `arg_type`), a struct field -
+  HAS that type there when it fits element by element (`literal_into`),
+  and `stamp_literal_into` makes its elements widen at run time (the
+  `lit_coerce_by_parent` stamp on a LiteralArray / LiteralDict; for a
+  literal baked at parse time, `widen_baked_value` rewrites the
+  LiteralObj once). Only a WRITTEN literal: `LiteralObj::from_literal`
+  marks a bake of `[...]` / `{...}`, so a folded call or a named const
+  of another element type is still refused. A typed `const` container
+  is widened by the PARSER when it binds it (pExpr14), because a read of
+  it folded at parse time (`str(F)`) must see the run's value.
 - **Const-container types are exact** (`static_type_from_value` recurses): a
   folded
   const array/dict is typed `array<T>`/`dict<K,V>` from its actual elements
