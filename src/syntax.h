@@ -2195,6 +2195,12 @@ public:
      * inferencer (-1 = not a field / unproven). Runtime uses it behind a
      * def-identity check, so no name scan runs on a proven member access. */
     int field_slot = -1;
+    /* class step 4: the proven base is a non-opt `box<P>` - the same
+     * StructObject as a P (base_struct / base_struct_def describe P), but
+     * a REFERENCE: two names share it, so a pass that treats a member of
+     * a struct VALUE as the variable's own (fr_member_of_value) or reads
+     * it out of a flat struct array must not apply. */
+    bool base_boxed = false;
 
     MemberExpr()
         : Construct("MemberExpr", false, ConstructType::member) { }
@@ -2222,6 +2228,7 @@ public:
         c->base_struct = base_struct;
         c->base_struct_def = base_struct_def;
         c->field_slot = field_slot;
+        c->base_boxed = base_boxed;
         return c;
     }
 };

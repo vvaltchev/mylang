@@ -6472,9 +6472,10 @@ are unchanged.
   instance read as a value is a location (`store_rooted` in the
   tree-walker, `vm_member_lvalue_ref` and the chain store's final member
   step in the VM) - `CannotChangeConstEx` for a constant's. The JIT's
-  element tiers compare the kind byte and decline this one to their
-  helpers (step 4 adds inline tiers). `array_storage()` reports
-  `"class"`.
+  boxed-element READ tier has an arm for it (class step 4: retain the
+  object, store the pointer and the `t_struct` tag; a null entry
+  declines); the other element tiers decline the kind to their helpers.
+  `array_storage()` reports `"class"`.
 
 - **Flat (unboxed) int/float/bool storage.** `SharedObject` carries a `Storage
   kind` (`general`/`ints`/`floats`/`bools`) and an **anonymous union** of `vec`
@@ -6944,9 +6945,10 @@ but the per-element `StructObject` allocation is gone (build overhead
   new struct-handling site must ask:
   - **`struct_own` hands back the object itself** (never a copy, never
     `write_target`), and throws `CannotChangeConstEx` for a read-only one.
-    Every write path already funnels through it, so the JIT's inline
-    field-store tier stays sound by declining (`memberv_shared` etc.) to
-    the helper - correct, and slow for a shared instance (step 4).
+    Every write path already funnels through it. The JIT's inline
+    field-store tier leaves out its two VALUE guards (`memberv_shared`,
+    `memberv_borrowed`) for a class def at compile time, and for a
+    `boxed` instance at run time (a `box<P>`'s def is the struct's).
   - **A class is never POD** (`compute_layout` returns boxed): POD is what
     may be embedded BY VALUE - inline in a struct, flat in an array - so
     every `is_pod()` consumer treats a class as a pointer with no change.
@@ -7004,8 +7006,11 @@ but the per-element `StructObject` allocation is gone (build overhead
     inferencer proved (`DerefExpr::want`, the VM's LoadBoxV `b`): a box a
     `dyn` laundered into a `box<int>` place raises at the `*`, so a typed
     consumer of the result never reads a misfit. `box_store` checks the
-    box's own element kind. The VM ops (LoadBoxV / StoreBoxV) are
-    INTERPRETED in step 3 - not JIT-eligible; the tier is step 4.
+    box's own element kind. The JIT (class step 4) reads or writes an
+    int / float box IN PLACE behind the box tag and the BoxObj's kind
+    byte - the kind compare IS the want check, so an arm that skips it
+    reads a misfit's raw payload - and calls the same helpers for every
+    other shape.
   - **A `box<P>` of a POD struct is a reference that is POD** - the one
     such object (a class is never POD). A store path that meets a
     reference instance as a VALUE (an element of a flat reference array,
@@ -9059,6 +9064,11 @@ overriding the
 needed virtuals in `src/types/xxx.cpp.h` (extend `TypeImpl<T>` for non-trivial
 types to inherit the
 type-erased lifecycle ops). Then `#include` the new `.cpp.h` in `types.cpp`.
+**A non-trivial type whose payload is a pointer to a `RefCounted` object
+joins `elemv_inline_ok`'s list in jit.cpp** (the RefCounted offset must
+be 0): every inline JIT tier copying a reference retains it by
+`inc [pointee]` whatever its type, and BoxObj met those tiers unverified
+from class step 3 to step 4.
 
 ### Adding an operator or keyword
 Add to the `Op`/`Keyword` enum and the matching `OpString`/`KwString` array

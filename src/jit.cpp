@@ -145,6 +145,12 @@ unsigned long g_jit_storev_fast = 0;   /* #97: inline boxed-element stores
                                         * (bumped from EMITTED code) */
 unsigned long g_jit_memberv_fast = 0;  /* #97: inline struct-field stores
                                         * (bumped from EMITTED code) */
+unsigned long g_jit_box_fast = 0;      /* class step 4: inline `*b` reads
+                                        * and stores (EMITTED code) */
+unsigned long g_jit_member_bfast = 0;  /* class step 4: inline BOXED-field
+                                        * reads (EMITTED code) */
+unsigned long g_jit_elemo_fast = 0;    /* class step 4: inline array<C>
+                                        * element reads (EMITTED code) */
 unsigned long g_jit_closure_fast = 0;  /* #97: inline closure STORE after
                                         * the construct-only helper */
 /* #97 inc 2: the DECLINE LEDGER - one counter per guard, bumped from
@@ -830,9 +836,9 @@ struct JitLayout {
     int t_none_val, t_int_val, t_float_val, t_bool_val;
     /* #97: the boxed-element inline tier's REFERENCE lifecycle. Every
      * pointee it retains/releases inline (StrObj, SharedObject,
-     * DictObject, FuncObject, StructObject) inherits RefCounted as its
-     * FIRST base with no vtable, so intr_refcount sits at offset 0 in
-     * all five - verified at build; a layout where any differs turns
+     * DictObject, FuncObject, StructObject, BoxObj) inherits RefCounted
+     * as its FIRST base with no vtable, so intr_refcount sits at offset
+     * 0 in all six - verified at build; a layout where any differs turns
      * the tier off (elemv_inline_ok) instead of emitting a wrong
      * offset. ExceptionObject is a RuntimeException (vtable), so t_ex
      * values DECLINE - t_ex_val is that compare. t_arr_val gates the
@@ -878,7 +884,22 @@ struct JitLayout {
     int sobj_fields;      /* StructObject::fields (the BOXED slot vector;
                            * data ptr at +0, same probe) */
     int sobj_rc;          /* RefCounted::intr_refcount offset (H1 use_count) */
+    int sobj_boxed;       /* StructObject::boxed (class step 4: a box<P> is
+                           * a reference, its field store stays in place) */
     bool sobj_ok;         /* the vector-data-at-+0 probe held */
+    /* class step 4: the flat array<C> storage (Storage::objs) - a vector
+     * of owned StructObject pointers at the union base, verified against
+     * a live array (objs_ok) */
+    unsigned char kind_objs;
+    bool objs_ok;
+    /* class step 4: the scalar box the `*b` inline arm reads and writes
+     * in place (a BoxObj; a box<P> is a StructObject and takes the
+     * helper) */
+    const void *t_box;    /* the box Type singleton */
+    int box_kind;         /* BoxObj::kind ('i', 'f', 'b', 's') */
+    int box_ro;           /* BoxObj::readonly */
+    int box_v_payload;    /* BoxObj::v's payload (ival / fval) */
+    bool box_ok;          /* the probe read a live box's payload back */
 };
 
 /*
@@ -1152,8 +1173,11 @@ static const JitLayout &jit_layout()
         {
             /* #97: the RefCounted base offset per retained pointee, via
              * the compiler's own base conversion on a fake pointer (the
-             * offsetof idiom for a non-standard-layout class). All five
-             * must be 0 for inc/dec_dword_base's disp-0 form. */
+             * offsetof idiom for a non-standard-layout class). All six
+             * must be 0 for inc/dec_dword_base's disp-0 form - BoxObj
+             * (class step 3's t_box) since class step 4: every inline
+             * tier retaining a reference by `inc [pointee]` met boxes
+             * from the day they existed, unverified. */
             const auto rc_off = [](auto *tp) -> long {
                 using T = std::remove_pointer_t<decltype(tp)>;
                 T *p = reinterpret_cast<T *>(
@@ -1163,7 +1187,7 @@ static const JitLayout &jit_layout()
             };
             /* StrObj / SharedObject are PRIVATE nested types - their
              * offsets come from live probes (arr/sref are the builder's
-             * existing probe objects); the accessible three use the
+             * existing probe objects); the accessible four use the
              * fake-pointer idiom directly. */
             const SharedStr::JitProbe sp2 =
                 SharedStr(std::string("x")).jit_probe();
@@ -1173,7 +1197,8 @@ static const JitLayout &jit_layout()
                     - static_cast<const char *>(jp.shobj)) == 0
                 && rc_off(static_cast<DictObject *>(nullptr)) == 0
                 && rc_off(static_cast<FuncObject *>(nullptr)) == 0
-                && rc_off(static_cast<StructObject *>(nullptr)) == 0;
+                && rc_off(static_cast<StructObject *>(nullptr)) == 0
+                && rc_off(static_cast<BoxObj *>(nullptr)) == 0;
             ML_CHECK_MSG(l.elemv_inline_ok,
                          "a RefCounted base moved off offset 0 - the "
                          "boxed-element inline tier is disabled");
@@ -1236,8 +1261,57 @@ static const JitLayout &jit_layout()
                 reinterpret_cast<const char *>(&sp->fields) - sb);
             l.sobj_rc = static_cast<int>(
                 reinterpret_cast<const char *>(&sp->intr_refcount) - sb);
+            l.sobj_boxed = static_cast<int>(
+                reinterpret_cast<const char *>(&sp->boxed) - sb);
             std::vector<char> vp(3, 'x');
             l.sobj_ok = *reinterpret_cast<char *const *>(&vp) == vp.data();
+        }
+        /* class step 4: the objs storage - one live array of one class
+         * instance, its element read back through the offsets the arm
+         * bakes (the vector's _M_start at the union base, like every
+         * other kind) */
+        {
+            l.kind_objs = static_cast<unsigned char>(
+                SharedArrayObj::Storage::objs);
+            auto op = make_intrusive<StructObject>();
+            SharedArrayObj::ovec_type ov;
+            ov.push(op.get());
+            SharedArrayObj oarr(std::move(ov));
+            const SharedArrayObj::JitProbe jo = oarr.jit_probe();
+            const char *so = static_cast<const char *>(jo.shobj);
+            StructObject *const *data =
+                *reinterpret_cast<StructObject *const *const *>(
+                    so + l.data_off);
+            l.objs_ok = l.elemv_inline_ok && l.sobj_ok
+                        && *static_cast<const unsigned char *>(jo.kind)
+                           == l.kind_objs
+                        && data && data[0] == op.get();
+            ML_CHECK_MSG(l.objs_ok, "the array<C> storage probe failed - "
+                                    "its inline element read is disabled");
+        }
+        /* class step 4: the BoxObj layout, from a live box - and its
+         * payload read back through the offsets, so a layout the arm
+         * cannot address turns the arm off (box_ok) instead of reading
+         * a wrong word */
+        {
+            auto bp = make_intrusive<BoxObj>(
+                EvalValue(static_cast<int_type>(0x5a5a1234)), 'i');
+            LValue blv(EvalValue(intrusive_ptr<BoxObj>(bp)), false);
+            l.t_box = blv.get().get_type();
+            const char *bb = reinterpret_cast<const char *>(bp.get());
+            l.box_kind = static_cast<int>(
+                reinterpret_cast<const char *>(&bp->kind) - bb);
+            l.box_ro = static_cast<int>(
+                reinterpret_cast<const char *>(&bp->readonly) - bb);
+            l.box_v_payload = static_cast<int>(
+                reinterpret_cast<const char *>(&bp->v) - bb
+                + static_cast<long>(EvalValue::jit_payload_off()));
+            int_type got;
+            memcpy(&got, bb + l.box_v_payload, sizeof(got));
+            l.box_ok = got == static_cast<int_type>(0x5a5a1234)
+                       && bb[l.box_kind] == 'i';
+            ML_CHECK_MSG(l.box_ok, "the BoxObj probe failed - the `*b` "
+                                   "inline arm is disabled");
         }
         return l;
     }();
@@ -8072,6 +8146,14 @@ static bool jit_op_eligible(const Instr &in)
      * the argument run; a refusal conveys, exc-stamped with the
      * argument's caret (arg_locs). No bail -> op_fully_native too. */
     case OpCode::CheckNoneArgsV:
+        return true;
+    /* class step 4: `*b` - LoadBoxV / StoreBoxV. An inline arm for an int
+     * or float box (the payload read / written in place), the shared
+     * box_load_want / box_store behind jit_load_box / jit_store_box for
+     * everything else; a raise conveys, exc-stamped with the `*b` caret.
+     * No bail -> op_fully_native too. */
+    case OpCode::LoadBoxV:
+    case OpCode::StoreBoxV:
         return true;
     /* The dyn-callee generic call pair - the LAST formerly-boxed sequential
      * ops. CheckCallableV conveys a loc-less NotCallableEx (exc-stamped
@@ -16169,6 +16251,9 @@ void jit_stats_report()
         { "unpackv_fast",     &g_jit_unpackv_fast },
         { "storev_fast",      &g_jit_storev_fast },
         { "memberv_fast",     &g_jit_memberv_fast },
+        { "box_fast",         &g_jit_box_fast },
+        { "member_bfast",     &g_jit_member_bfast },
+        { "elemo_fast",       &g_jit_elemo_fast },
         { "closure_fast",     &g_jit_closure_fast },
         { "peep_depbrk",      &g_jit_peep_depbrk },
         { "rax_retries",      &g_jit_rax_retries },
@@ -18217,6 +18302,17 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
     case OpCode::CheckFuncV:
     case OpCode::CheckCallableV:
         v.bad(in.a_slot());            /* a func-value slot - never int */
+        break;
+    case OpCode::LoadBoxV:
+        /* the box is read from MEMORY (a reference - never an int), and
+         * the dst is written there by the inline arm and the helper alike
+         * (a want-0/4/5 dst holds a reference) */
+        v.bad(in.a_slot()); v.bad(in.target);
+        break;
+    case OpCode::StoreBoxV:
+        /* the inline arm and the helper read the box and the value from
+         * MEMORY (the value's tag decides the arm) */
+        v.bad(in.a_slot()); v.bad(in.b_slot());
         break;
     case OpCode::CheckNoneArgsV:
         /* the helper reads the argument run (and a kind-0 callee) from
@@ -24742,7 +24838,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * shared or borrowed, so for a class def (a compile-time fact -
          * the def guard makes it true at run time) only the read-only
          * guard is emitted, and a store to an instance two names share
-         * stays inline instead of declining on every iteration.
+         * stays inline instead of declining on every iteration. A box<P>
+         * (class step 4) is a reference too, but its def is the struct's,
+         * so the instance's `boxed` byte skips the two value guards at
+         * run time.
          */
         const Chunk::MemberKey &mk = ck.member_keys[in.a_lit()];
         const JitLayout &Lm = jit_layout();
@@ -24787,29 +24886,36 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             /* (a const binding's struct needs no guard: a `const`
              * parameter's field store is refused at compile time when its
              * type is known, and is the call's own copy at run time) */
-            /* the slot is not BORROWED (#94): the caller's slot holds the
-             * counted reference, so the struct is the caller's too - and
-             * for a class the caller's is the one to write */
             const bool cls = mk.bake_def->is_class;
-            if (!cls) {
-                e.cmp_byte_slot(base.type
-                                + (L.lv_borrowed_off - L.off_type), 0);
-                decl_ne(JD_memberv_borrowed);
-            }
             e.load(acc.r, base.payload);                 /* StructObject* */
             e.movabs(s1, reinterpret_cast<uint64_t>(mk.bake_def));
             e.cmp_base_reg(acc.r, static_cast<int32_t>(L.sobj_def), s1);
             decl_ne(JD_memberv_def);
             e.cmp_byte_base(acc.r, static_cast<int32_t>(L.sobj_ro), 0);
             decl_ne(JD_memberv_readonly);
-            /* the slot is its struct's only holder (use_count == 1): a
-             * struct is a VALUE, and a second holder - another variable,
-             * an element, a capture - must not see this write. Else the
-             * helper makes it the slot's own first (struct_own). */
             if (!cls) {
+                /* class step 4: a box<P> is a reference too - struct_own
+                 * hands it back shared or borrowed - so a BOXED instance
+                 * (StructObject::boxed, a run-time fact here: the def is
+                 * the struct's) skips the two value guards below */
+                e.cmp_byte_base(acc.r, static_cast<int32_t>(L.sobj_boxed),
+                                0);
+                const size_t j_ref = e.j32(0x75);
+                /* the slot is not BORROWED (#94): the caller's slot holds
+                 * the counted reference, so the struct is the caller's
+                 * too - and a value must not be written there */
+                e.cmp_byte_slot(base.type
+                                + (L.lv_borrowed_off - L.off_type), 0);
+                decl_ne(JD_memberv_borrowed);
+                /* the slot is its struct's only holder (use_count == 1):
+                 * a struct is a VALUE, and a second holder - another
+                 * variable, an element, a capture - must not see this
+                 * write. Else the helper makes it the slot's own first
+                 * (struct_own). */
                 e.cmp_dword_base_imm8(acc.r,
                                       static_cast<int32_t>(L.sobj_rc), 1);
                 decl_ne(JD_memberv_shared);
+                e.patch32_here(j_ref);
             }
             if (pod_form) {
                 /* the value must ALREADY be the field's exact scalar
@@ -27103,6 +27209,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         DeclineJumps lev_slows;
         size_t lev_done = SIZE_MAX;
         size_t lev_done2 = SIZE_MAX;       /* the flat-strs arm's join */
+        size_t lev_done3 = SIZE_MAX;       /* the array<C> arm's join */
         const int lev_s1 = in.op == OpCode::LoadElemValue
                                && in.target != in.target2
                                && jit_layout().elemv_inline_ok
@@ -27133,6 +27240,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             if (L.str_elem_ok) {
                 e.cmp_byte_base(s1, L.kind_off, L.kind_strs);
                 j_strs = e.j32(0x74);               /* -> the strs arm */
+            }
+            size_t j_objs = SIZE_MAX;
+            if (L.objs_ok) {
+                e.cmp_byte_base(s1, L.kind_off, L.kind_objs);
+                j_objs = e.j32(0x74);            /* -> the array<C> arm */
             }
             e.cmp_byte_base(s1, L.kind_off, L.kind_general);
             decline_ne(JD_elemv_base_kind);
@@ -27271,6 +27383,39 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 #endif
                 lev_done2 = e.j32(0xEB);
             }
+            if (j_objs != SIZE_MAX) {
+                /*
+                 * class step 4: THE array<C> ARM (Storage::objs, a vector
+                 * of owned StructObject pointers - a class instance or a
+                 * box<P> each). The element IS a struct value's payload:
+                 * retain the object, release dst's old value, store the
+                 * pointer and the t_struct tag. A null entry (`none` in
+                 * an array<C?>) declines to the helper, which writes it.
+                 */
+                e.patch32_here(j_objs);
+                load_operand(e, acc.r, in.a_is_lit(), in.a_lit(),
+                             in.a_slot());                /* the index */
+                e.imul_rr_imm8(acc.r, acc.r,
+                               static_cast<uint8_t>(sizeof(void *)));
+                decline_jump(e, lev_slows, 0x70, JD_elemv_scale_wrap);
+                e.load_base(s2, s1, L.data_off + 8);      /* end */
+                e.load_base(s1, s1, L.data_off);          /* data */
+                e.sub_rr(s2, s1);
+                e.cmp_rr(acc.r, s2);
+                decline_jump(e, lev_slows, 0x73, JD_elemv_bounds);
+                e.add_rr(acc.r, s1);                      /* &entry */
+                e.load_base(acc.r, acc.r, 0);             /* StructObject* */
+                e.test_rr(acc.r, acc.r);
+                decline_jump(e, lev_slows, 0x74, JD_elemv_obj_null);
+                e.inc_dword_base(acc.r);                  /* RETAIN */
+                release_old();
+                e.store(acc.r, dst.payload);
+                e.store_type_tag_via(dst.type, L.t_struct, s1);
+#ifdef TESTS
+                e.bump_counter(&g_jit_elemo_fast);
+#endif
+                lev_done3 = e.j32(0xEB);
+            }
             decline_land(e, lev_slows);
             e.free_scratch(s2);
             e.free_scratch(s1);
@@ -27379,6 +27524,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         }
         if (lev_done2 != SIZE_MAX)
             e.patch32_here(lev_done2);
+        if (lev_done3 != SIZE_MAX)
+            e.patch32_here(lev_done3);
         if (lev_done != SIZE_MAX)
             e.patch32_here(lev_done);         /* #97: the fast tier joins
                                                * past the helper + status */
@@ -27988,6 +28135,124 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::LoadBoxV:
+    case OpCode::StoreBoxV: {
+        /*
+         * class step 4 (plans/class-and-box.md): `*b`.
+         *
+         * THE INLINE ARM - an int or a float box, read or written IN
+         * PLACE. A BoxObj's `kind` is the element kind it was made with,
+         * and box_store keeps its value that kind (an int stored into a
+         * box<float> is converted there), so a box whose kind byte says
+         * 'i' HOLDS an int: the read is its payload, and storing an int
+         * value is a payload write - the value's Type word is already
+         * t_int.
+         *  - LoadBoxV: only for the want the codegen PROVED (b: 1 int,
+         *    2 float). The kind compare IS the want check: a dyn can
+         *    carry a box of another kind into a box<int> place, and a
+         *    typed consumer reads the raw payload.
+         *  - StoreBoxV: the VALUE's kind picks the arm at run time (an
+         *    int into an 'i' box, a float into an 'f' one). Every
+         *    conversion, a bool / str box and a CONSTANT box decline.
+         * Every decline - a non-box, another kind, a box<P> - takes
+         * jit_load_box / jit_store_box, the shared box_load_want /
+         * box_store, whose raise conveys with the `*b` caret.
+         * Scratch is GRANT-ONLY (the elemv rule): a refused ask skips
+         * the arm, so the decline jumps need no release choreography.
+         */
+        const JitLayout &L = jit_layout();
+        const bool load = in.op == OpCode::LoadBoxV;
+        const int want = load ? static_cast<int>(in.b_lit()) : 0;
+        DeclineJumps bx_slows;
+        size_t bx_done = SIZE_MAX;
+        const int bx_s1 = L.box_ok && (!load || want == 1 || want == 2)
+                          ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                            /*transient=*/true) : -1;
+        const int bx_s2 = bx_s1 >= 0
+                          ? e.alloc_scratch(CAP_MEM_BASE, 0, 0,
+                                            /*transient=*/true) : -1;
+        if (bx_s1 >= 0 && bx_s2 < 0)
+            e.free_scratch(static_cast<uint8_t>(bx_s1));
+        if (bx_s1 >= 0 && bx_s2 >= 0) {
+            const uint8_t s1 = static_cast<uint8_t>(bx_s1);
+            const uint8_t s2 = static_cast<uint8_t>(bx_s2);
+            const SlotAddr b = slot_addr(in.a_slot());
+            e.load(s1, b.type);
+            e.cmp_reg_tag_via(s1, L.t_box, s2);
+            decline_jump(e, bx_slows, 0x75, JD_box_not_box);
+            e.load(s1, b.payload);                       /* BoxObj * */
+            if (load) {
+                e.cmp_byte_base(s1, L.box_kind, want == 1 ? 'i' : 'f');
+                decline_jump(e, bx_slows, 0x75, JD_box_kind);
+#ifdef TESTS
+                e.bump_counter(&g_jit_box_fast);
+#endif
+                if (want == 1) {
+                    e.load_base(s1, s1, L.box_v_payload);
+                    store_dst(e, ck, s1, in.target, pc);
+                } else {
+                    e.fload_base(e.fsa(), s1, L.box_v_payload);
+                    emit_float_store(e, ck, e.fsa(), in.target, pc);
+                }
+            } else {
+                e.cmp_byte_base(s1, L.box_ro, 0);
+                decline_jump(e, bx_slows, 0x75, JD_box_readonly);
+                const SlotAddr v = slot_addr(in.b_slot());
+                e.load(s2, v.type);
+                e.load32_base(s2, s2, L.type_t_off);
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_int_val));
+                const size_t j_nint = e.j8(0x75);
+                e.cmp_byte_base(s1, L.box_kind, 'i');
+                decline_jump(e, bx_slows, 0x75, JD_box_kind);
+                const size_t j_st = e.j8(0xEB);
+                e.patch8(j_nint, e.pos());
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_float_val));
+                decline_jump(e, bx_slows, 0x75, JD_box_val_kind);
+                e.cmp_byte_base(s1, L.box_kind, 'f');
+                decline_jump(e, bx_slows, 0x75, JD_box_kind);
+                e.patch8(j_st, e.pos());
+#ifdef TESTS
+                e.bump_counter(&g_jit_box_fast);
+#endif
+                e.load(s2, v.payload);
+                e.store_base(s2, s1, L.box_v_payload);
+            }
+            bx_done = e.j32(0xEB);
+            decline_land(e, bx_slows);
+            e.free_scratch(s2);
+            e.free_scratch(s1);
+        }
+        /* the helper tier: rdi = the box slot, rsi = the dst (load) or
+         * the value slot (store), rdx = the want, rcx = the box<P>'s def */
+        emit_call_prologue(e);
+        e.mov_imm(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        if (load) {
+            e.mov_imm(RSI, static_cast<uint64_t>(
+                              static_cast<int_type>(in.target)));
+            e.mov_imm(RDX, static_cast<uint64_t>(want));
+            e.movabs(RCX, reinterpret_cast<uint64_t>(
+                              want == 5 && in.target2 >= 0
+                                  ? ck.struct_defs[static_cast<size_t>(
+                                        in.target2)]
+                                  : nullptr));
+            e.call_direct(jit_load_box);
+        } else {
+            e.mov_imm(RSI, static_cast<uint64_t>(
+                              static_cast<int_type>(in.b_slot())));
+            e.call_direct(jit_store_box);
+        }
+        emit_call_epilogue(e);
+        e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
+        const size_t j_ok_bx = e.j8(0x74);
+        emit_exc_stamp(e, ck, old_pc);       /* the `*b` caret */
+        e.exit_pc(pc);
+        e.patch8(j_ok_bx, e.pos());
+        if (bx_done != SIZE_MAX)
+            e.patch32_here(bx_done);
+        return true;
+    }
+
     case OpCode::CheckCallableV: {
         /* jit_check_callable(slot) - rdi = a_slot. A non-callable conveys a
          * loc-less NotCallableEx -> exc-stamp (the callee caret) + exit. */
@@ -28535,6 +28800,104 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             j_done = e.j32(0xEB);
             e.patch32_here(js1);
             e.patch32_here(js2);
+        }
+        /*
+         * class step 4: THE BOXED-FIELD FORM - a class instance (never
+         * POD), a non-POD box<P> and any struct with a reference field
+         * keep their fields as LValues, so the POD byte read above never
+         * applies and every `c.v` took the helper's name scan. The member
+         * key carries the field's slot (bake_def / bake_slot, resolved at
+         * compile time), so the read is the same def-identity guard, then
+         * the field LValue at fields.data() + slot, its TAG checked (a
+         * declared int / float / bool field holds exactly that kind -
+         * coerce_struct_field's rule - and the check keeps a crafted
+         * image honest), then its payload. Any miss -> the helper.
+         */
+        else if (L.sobj_ok) {
+            const Chunk::MemberKey &mk = ck.member_keys[in.a_lit()];
+            const FieldDef *fd =
+                mk.bake_def && !mk.bake_def->is_pod() && mk.bake_slot >= 0
+                    && static_cast<size_t>(mk.bake_slot)
+                       < mk.bake_def->fields.size()
+                    ? &mk.bake_def->fields[
+                          static_cast<size_t>(mk.bake_slot)]
+                    : nullptr;
+            /* the read FORM, as the POD one: 0 int, 1 float, 2 bool as
+             * 0/1, 3 int read as float; -1 = no inline form */
+            int bform = -1;
+            if (fd && in.op == OpCode::LoadMemberInt)
+                bform = fd->kind == FieldKind::f_int ? 0
+                      : fd->kind == FieldKind::f_bool ? 2 : -1;
+            else if (fd)
+                bform = fd->kind == FieldKind::f_float ? 1
+                      : fd->kind == FieldKind::f_int ? 3 : -1;
+            if (bform >= 0) {
+                have_fast = true;
+                const SlotAddr b = slot_addr(in.target2);
+                const int32_t fo = static_cast<int32_t>(
+                    mk.bake_slot * static_cast<int>(sizeof(LValue)));
+                e.load(acc.r, b.type);
+                {
+                    RefScratch rt(e, RCX);
+                    e.cmp_reg_tag_via(acc.r, L.t_struct, rt.sc);
+                    rt.release();
+                }
+                const size_t jb1 = e.j32(0x75);
+                e.load(acc.r, b.payload);        /* rax = StructObject* */
+                {
+                    RefScratch rd(e, RCX);
+                    e.movabs(rd.sc,
+                             reinterpret_cast<uint64_t>(mk.bake_def));
+                    e.cmp_base_reg(acc.r, static_cast<int32_t>(L.sobj_def),
+                                   rd.sc);
+                    rd.release();
+                }
+                const size_t jb2 = e.j32(0x75);
+                /* the field LValue array (vector _M_start at +0) */
+                e.load_base(acc.r, acc.r,
+                            static_cast<int32_t>(L.sobj_fields));
+                {
+                    RefScratch rk(e, RCX);
+                    e.load_base(rk.sc, acc.r,
+                                fo + static_cast<int32_t>(L.off_type));
+                    e.load32_base(rk.sc, rk.sc, L.type_t_off);
+                    e.cmp_reg32_imm32(rk.sc, static_cast<uint32_t>(
+                        bform == 1 ? L.t_float_val
+                        : bform == 2 ? L.t_bool_val : L.t_int_val));
+                    rk.release();
+                }
+                const size_t jb3 = e.j32(0x75);
+#ifdef TESTS
+                e.bump_counter(&g_jit_member_bfast);
+#endif
+                const int32_t po = fo + static_cast<int32_t>(L.off_payload);
+                switch (bform) {
+                case 0:
+                    e.load_base(acc.r, acc.r, po);
+                    store_dst(e, ck, acc.r, in.target, pc);
+                    break;
+                case 1:
+                    e.fload_base(e.fsa(), acc.r, po);
+                    emit_float_store(e, ck, e.fsa(), in.target, pc);
+                    break;
+                case 2:
+                    e.movzx_r32_byte_base(acc.r, acc.r, po);
+                    e.test32_rr(acc.r, acc.r);
+                    e.setcc_lo8(0x5, acc.r);
+                    e.movzx_r32_lo8(acc.r, acc.r);
+                    store_dst(e, ck, acc.r, in.target, pc);
+                    break;
+                default:
+                    e.load_base(acc.r, acc.r, po);
+                    e.cvt_reg(e.fsa(), acc.r);
+                    emit_float_store(e, ck, e.fsa(), in.target, pc);
+                    break;
+                }
+                j_done = e.j32(0xEB);
+                e.patch32_here(jb1);
+                e.patch32_here(jb2);
+                e.patch32_here(jb3);
+            }
         }
         /* the generic helper (slot_of + kind dispatch + member_read_core
          * fallback) - now the COLD path */
@@ -30085,6 +30448,8 @@ static bool op_fully_native(const Instr &in)
     case OpCode::MultiUnpackV:
     case OpCode::CheckFuncV:
     case OpCode::CheckNoneArgsV:    /* RULE 1: conveys, exc-stamped */
+    case OpCode::LoadBoxV:          /* class step 4: conveys, exc-stamped */
+    case OpCode::StoreBoxV:
     case OpCode::MapFilterV:
     case OpCode::LoadMemberInt:
     case OpCode::LoadMemberFloat:

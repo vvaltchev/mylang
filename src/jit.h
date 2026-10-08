@@ -1327,6 +1327,16 @@ extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
                               int_type dst, int_type is_map,
                               int_type site, int_type cend) noexcept;
 
+/* class step 4: the native LoadBoxV / StoreBoxV - the interpreted ops'
+ * box_load_want / box_store (plans/class-and-box.md). A raise (`*` of a
+ * non-box, the want check, a misfit store, a constant box) conveys a
+ * loc-less TypeErrorEx / CannotChangeConstEx, stamped with the `*b` caret
+ * at the op pc, and returns 1. `def` is the box<P>'s struct for want 5,
+ * else null. */
+extern "C" int jit_load_box(int_type box_slot, int_type dst, int_type want,
+                            const void *def) noexcept;
+extern "C" int jit_store_box(int_type box_slot, int_type val_slot) noexcept;
+
 /* model-flip (nativize-ops): the dyn-callee generic call pair. CheckCallableV
  * (the callable guard - conveys a loc-less NotCallableEx, exc-stamped with
  * the callee caret) and CallValueGenericV (the full by-Kind dispatch over
@@ -1423,7 +1433,7 @@ extern unsigned long g_jit_op_run[];
 #define ML_FOR_EACH_JIT_DECLINE(X) \
     X(elemv_base_not_arr) X(elemv_base_slice) X(elemv_base_kind) \
     X(elemv_scale_wrap) X(elemv_bounds) X(elemv_elem_ex) \
-    X(elemv_elem_slice) X(elemv_str_null) \
+    X(elemv_elem_slice) X(elemv_str_null) X(elemv_obj_null) \
     X(storev_base_not_arr) X(storev_base_const) X(storev_base_slice) \
     X(storev_readonly) X(storev_base_kind) X(storev_has_slices) \
     X(storev_scale_wrap) X(storev_bounds) X(storev_elem_const) \
@@ -1440,7 +1450,8 @@ extern unsigned long g_jit_op_run[];
     X(unpackv_base_not_arr) X(unpackv_base_slice) X(unpackv_base_kind) \
     X(unpackv_scale_wrap) X(unpackv_bounds) X(unpackv_row_not_arr) \
     X(unpackv_row_slice) X(unpackv_row_kind) X(unpackv_len) \
-    X(unpackv_elem_ex) X(unpackv_elem_slice)
+    X(unpackv_elem_ex) X(unpackv_elem_slice) \
+    X(box_not_box) X(box_kind) X(box_readonly) X(box_val_kind)
 
 enum JitDecline {
 #define ML_JD_ENUM(n) JD_##n,
@@ -1579,6 +1590,15 @@ extern "C" unsigned long g_jit_storev_fast;
  * field written straight to its baked byte offset, or a boxed field's
  * LValue with the reference lifecycle. Bumped from the EMITTED code. */
 extern "C" unsigned long g_jit_memberv_fast;
+/* class step 4: the inline `*b` arm (LoadBoxV / StoreBoxV) - an int or
+ * float box read or written in place. Bumped from the EMITTED code. */
+extern "C" unsigned long g_jit_box_fast;
+/* class step 4: the baked member read's BOXED-field form (a class
+ * instance's field, a non-POD struct's) ran. Bumped from EMITTED code. */
+extern "C" unsigned long g_jit_member_bfast;
+/* class step 4: the boxed-element tier's array<C> arm (Storage::objs)
+ * ran. Bumped from EMITTED code. */
+extern "C" unsigned long g_jit_elemo_fast;
 /* #97 step 3: the inline closure STORE ran (the construct-only helper
  * handed the pointer over and emitted code stored it). */
 extern "C" unsigned long g_jit_closure_fast;

@@ -6966,6 +6966,40 @@ extern "C" int jit_check_none_args(int_type kind, int_type callee,
     return 1;
 }
 
+/* class step 4: the native LoadBoxV / StoreBoxV (jit.h) - the shared
+ * box_load_want / box_store every engine calls; every raise is a
+ * RuntimeException built loc-less, stamped with the `*b` caret by the
+ * op's exc-stamp, as the interpreted op stamps it from the loc table */
+extern "C" int jit_load_box(int_type box_slot, int_type dst, int_type want,
+                            const void *def) noexcept
+{
+    ML_JIT_OP_RAN(LoadBoxV);
+    Frame *f = g_current_ctx->frame;
+    try {
+        EvalValue v = box_load_want(
+            f->at(box_slot).get(), static_cast<int>(want),
+            static_cast<const StructTypeDef *>(def));
+        f->at(dst).put(std::move(v));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int jit_store_box(int_type box_slot, int_type val_slot) noexcept
+{
+    ML_JIT_OP_RAN(StoreBoxV);
+    Frame *f = g_current_ctx->frame;
+    try {
+        box_store(f->at(box_slot).get(), f->at(val_slot).get());
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 /* model-flip (nativize-ops): the native MapFilterV - map/filter over the
  * pre-validated function + container via the SHARED vm_map_filter (the
  * interpreter's exact body; a callback re-enters vm_dispatch through

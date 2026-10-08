@@ -3163,10 +3163,22 @@ void Inferencer::annotate_hints(Construct *n)
         auto *mem = static_cast<MemberExpr *>(n);
         StaticTypeRef bt = static_type_resolve(type_of(mem->what.get()));
         mem->base_dict = bt->kind == StaticTypeKind::Dict;
-        /* a non-opt struct instance base -> native field store (StoreMemberV) */
-        mem->base_struct = bt->kind == StaticTypeKind::Struct && !bt->opt;
+        /* a non-opt struct instance base -> native field store (StoreMemberV)
+         * - and a non-opt box<P> (class step 4): the same StructObject, its
+         * def P's, so every def-guarded fast path serves it; base_boxed
+         * marks it a reference */
+        StaticTypeRef sbt = bt;
+        mem->base_boxed = false;
+        if (bt->kind == StaticTypeKind::Box && !bt->opt && bt->elem) {
+            StaticTypeRef el = static_type_resolve(bt->elem);
+            if (el->kind == StaticTypeKind::Struct && el->struct_def) {
+                sbt = el;
+                mem->base_boxed = true;
+            }
+        }
+        mem->base_struct = sbt->kind == StaticTypeKind::Struct && !bt->opt;
         mem->base_struct_def = mem->base_struct
-            ? static_cast<const StructTypeDef *>(bt->struct_def) : nullptr;
+            ? static_cast<const StructTypeDef *>(sbt->struct_def) : nullptr;
         mem->field_slot = mem->base_struct_def && mem->memUid
             ? mem->base_struct_def->slot_of(mem->memUid) : -1;
     }
@@ -3346,6 +3358,16 @@ void Inferencer::annotate_hints(Construct *n)
                      * EvalValue into the loop var via LoadElemValue - box-free.
                      * Flat bool arrays are intentionally NOT here: their raw
                      * bool byte needs a scalar read, not LoadElemValue. */
+                    fe->container_is_array = true;
+                } else if (el->kind == StaticTypeKind::Box
+                           || (el->kind == StaticTypeKind::Struct
+                               && el->struct_def
+                               && static_cast<const StructTypeDef *>(
+                                      el->struct_def)->is_class)) {
+                    /* class step 4: a class instance or a box, `none`
+                     * allowed - a REFERENCE, bound by LoadElemValue (whose
+                     * objs arm reads an array<C> in place); the universal
+                     * dyn foreach served them before */
                     fe->container_is_array = true;
                 } else if (single && el->kind == StaticTypeKind::Struct
                            && el->struct_def) {
@@ -7574,11 +7596,12 @@ struct FrMut {
 };
 
 /* A member read or store through a struct VALUE - not a dict, not a
- * `dyn`, not a CLASS instance, each of which another name may share. */
+ * `dyn`, not a CLASS instance or a box<P>, each of which another name may
+ * share. */
 static bool fr_member_of_value(const MemberExpr *m)
 {
     return m->base_struct && m->base_struct_def
-        && !m->base_struct_def->is_class;
+        && !m->base_struct_def->is_class && !m->base_boxed;
 }
 
 /* Does a store to the lvalue chain `lv` write into storage another name may

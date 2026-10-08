@@ -5244,7 +5244,9 @@ struct Codegen {
     bool try_struct_elem_field(const MemberExpr *m, Operand &out,
                                std::vector<CgInstr> &ops, OpCode op)
     {
-        if (m->optional || !m->base_struct)
+        /* an element that is a box<P> is a reference in an array<C>-style
+         * vector, never the struct's bytes in a flat array */
+        if (m->optional || !m->base_struct || m->base_boxed)
             return false;
         const Subscript *sub =
             dynamic_cast<const Subscript *>(m->what.get());
