@@ -3262,12 +3262,15 @@ and it lives *inside the parser*. Mechanics:
   `process_arrays` is set — in which case it bakes the whole value into **one
   `LiteralObj` node** (`syntax.h`), not one literal per element. (It stores
   a self-contained copy - `make_const_clone` for a read-only result,
-  `make_mutable_clone` otherwise - so a small slice of a huge const array
-  doesn't pin the huge buffer. The mutable one was a SHALLOW `v.clone()`
-  until 2026-10-08, which turned a value that contains itself into its
-  one-step unrolling: a folded `var r = mk();` and the same call at run
-  time compared and printed differently, RULE 2.) `LiteralObj` carries an
-  **`immutable`** flag. The materializer sets
+  `v.clone()` otherwise - so a small slice of a huge const array doesn't pin
+  the huge buffer. A value that CONTAINS ITSELF is the exception: `clone()`
+  of a ring is its one-step unrolling, so a folded `var r = mk();` and the
+  same call at run time compared and printed differently (RULE 2); it is
+  baked by `make_mutable_bake`, a cycle-preserving deep copy whose dicts
+  keep their iteration order as `clone()` does - a plain deep copy rebuilds
+  each map, and `corpus_diff`'s `-nc vs default` pass caught the reordered
+  print of an ordinary folded dict when the bake was one.) `LiteralObj`
+  carries an **`immutable`** flag. The materializer sets
   it when **either** the target is a `const` decl (`fl & pInConstDecl`) **or the
   value itself is already read-only** (`is_readonly_value()`). The second case
   is how **const-ness propagates**: a slice/element/result derived from a const

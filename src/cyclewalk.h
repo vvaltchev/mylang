@@ -456,16 +456,19 @@ private:
 void cyc_keep_until_exit(const EvalValue &v);
 void cyc_release_kept();
 
+/* Can a cycle be reached from `v`? */
+inline bool cyc_value_reaches_cycle(const EvalValue &v)
+{
+    CycStack path;
+    std::unordered_set<CycKey, CycKeyHash> done;
+    return cyc_reaches_cycle(v, path, done);
+}
+
 /* Keep `v` until exit when it is a container from which a cycle can be
  * reached (a compile-time value the compiler is about to drop). */
 inline void cyc_keep_if_cyclic(const EvalValue &v)
 {
-    CycKey k;
-    if (!cyc_key(v, k))
-        return;
-    CycStack path;
-    std::unordered_set<CycKey, CycKeyHash> done;
-    if (cyc_reaches_cycle(v, path, done))
+    if (cyc_value_reaches_cycle(v))
         cyc_keep_until_exit(v);
 }
 
