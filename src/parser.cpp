@@ -207,6 +207,16 @@ bool pAcceptKeyword(ParseContext &c, Keyword exp);   /* defined below */
 bool pAcceptOp(ParseContext &c, Op exp);             /* defined below */
 void pExpectOp(ParseContext &c, Op exp);             /* defined below */
 
+/* The parameterized type keywords - `array<T>`, `dict<K, V>`, `box<T>` -
+ * read as a type only when a `<` follows (a bare `box` is no type) */
+static DeclType container_keyword(std::string_view s)
+{
+    if (s == "array") return DeclType::arr;
+    if (s == "dict")  return DeclType::dict;
+    if (s == "box")   return DeclType::box;
+    return DeclType::none;
+}
+
 static DeclType type_keyword(std::string_view s)
 {
     if (s == "int")   return DeclType::i;
@@ -340,7 +350,30 @@ static std::shared_ptr<TypeAnnot> pTypeAnnot(ParseContext &c)
         const std::string_view name = c.get_str();
         const DeclType k = type_keyword(name);
 
-        if (k == DeclType::arr) {
+        if (container_keyword(name) == DeclType::box
+                && c.peek_tok(1) == Op::lt) {
+            c.next();                                  /* 'box' */
+            c.next();                                  /* '<' */
+            ta->kind = DeclType::box;
+            const Loc eloc = c.get_loc();
+            ta->elem = pTypeAnnot(c);
+            if (!pAcceptCloseAngle(c))
+                throw SyntaxErrorEx(c.get_loc(),
+                    "expected '>' to close 'box<...>'", &c.get_tok());
+            /* box() passes a reference through and boxes no `none`, so
+             * a box holds a non-opt scalar, string or struct value */
+            const TypeAnnot *e = ta->elem.get();
+            if (e->opt || e->kind == DeclType::arr
+                    || e->kind == DeclType::dict || e->kind == DeclType::box
+                    || e->kind == DeclType::dyn
+                    || (e->kind == DeclType::strct && e->strct
+                        && e->strct->is_class))
+                throw SyntaxErrorEx(eloc, intern_msg(
+                    "not a box type: a box holds a bool, int, float, str "
+                    "or struct value (an array, a dict, a class instance "
+                    "or a box is a reference already, which box() "
+                    "returns as it is)"));
+        } else if (k == DeclType::arr) {
             c.next();                                  /* 'array' */
             ta->kind = DeclType::arr;
             if (pAcceptOp(c, Op::lt)) {                /* array<ELEM> */
@@ -473,8 +506,7 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
         } else if (t == Keyword::kw_opt || t == Op::questionmark) {
             f |= pFlags::pInDecl | pFlags::pInOptDecl; k++;
         } else if (dt == DeclType::none && t == TokType::id &&
-                   (type_keyword(t.value) == DeclType::arr ||
-                    type_keyword(t.value) == DeclType::dict) &&
+                   container_keyword(t.value) != DeclType::none &&
                    c.peek_tok(k + 1) == Op::lt) {
             /* A parameterized container `array<...>` / `dict<...>`: a container
              * keyword + `<`, a balanced `<...>`, then the name (after optional
@@ -491,7 +523,7 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
                 break;
             if (saw_q && !is_decl_terminator(c.peek_tok(n + 1)))
                 break;   /* `array<...> ? a : b` ternary, not a decl */
-            dt = type_keyword(t.value);
+            dt = container_keyword(t.value);
             parameterized = true;
             f |= pFlags::pInDecl; starter = true;
             break;
@@ -584,6 +616,35 @@ static unique_ptr<Construct> zero_value_literal(DeclType dt)
     }
 }
 
+static unique_ptr<Construct>
+build_zero_struct_init(const StructTypeDef *def, Loc loc);
+
+/* The zero value of a `box<T>` (`box<int> n;` is `box(0)`): a FRESH box of
+ * T's zero value, built per evaluation like a struct's zero */
+static unique_ptr<Construct> zero_box_init(const TypeAnnot *a, Loc loc)
+{
+    const TypeAnnot *e = a ? a->elem.get() : nullptr;
+    unique_ptr<Construct> z =
+        !e ? unique_ptr<Construct>(new LiteralNone())
+        : e->kind == DeclType::strct && e->strct
+            ? build_zero_struct_init(e->strct, loc)
+            : zero_value_literal(e->kind);
+    z->start = loc;
+    z->end = loc;
+    auto args = make_unique<ExprList>();
+    args->elems.push_back(std::move(z));
+    auto callee = make_unique<Identifier>("box");
+    callee->builtin_only = true;        /* a program's own `box` is not it */
+    callee->start = loc;
+    callee->end = loc;
+    auto call = make_unique<CallExpr>();
+    call->what = std::move(callee);
+    call->args = std::move(args);
+    call->start = loc;
+    call->end = loc;
+    return call;
+}
+
 /*
  * Zero-initialize a struct (for `A obj;`): build the constructor call
  * `A(<zero per field>)`, applying the same zero-value rules as every other type
@@ -619,6 +680,9 @@ build_zero_struct_init(const StructTypeDef *def, Loc loc)
                     a = fd.struct_def
                         ? build_zero_struct_init(fd.struct_def, loc)
                         : make_unique<LiteralNone>();
+                    break;
+                case FieldKind::f_box:
+                    a = zero_box_init(fd.annot.get(), loc);
                     break;
                 default:                 a = make_unique<LiteralNone>();
                                          break;
@@ -1196,19 +1260,18 @@ pFuncParam(ParseContext &c, unsigned fl)
     const StructTypeDef *sdef = nullptr;
     std::shared_ptr<TypeAnnot> annot;
     if (!is_dyn && *c == TokType::id) {
-        const DeclType ck = type_keyword(c.get_str());
         const bool q1 = c.peek_tok(1) == Op::questionmark;
         const bool name_follows =
             c.peek_tok(1) == TokType::id ||
             (q1 && c.peek_tok(2) == TokType::id);
 
-        if ((ck == DeclType::arr || ck == DeclType::dict) &&
+        if (container_keyword(c.get_str()) != DeclType::none &&
             c.peek_tok(1) == Op::lt) {
             /* a parameterized container param: `array<int> xs`, `dict<str,P> m`
              * (a param is never an expression, so the `<` is unambiguous here -
              * no balanced-skip needed). pTypeAnnot eats the `<...>` + `?`. */
             annot = pTypeAnnot(c);
-            dt = ck;
+            dt = annot->kind;
             if (annot->opt)
                 is_opt = true;
         } else if (name_follows) {
@@ -1757,6 +1820,7 @@ pRefuseUnassignable(const Construct *lv, const char *what)
     if (!lv->nc_folds
         && (lv->is_id() || lv->is_idlist()
             || ctag(lv) == ConstructType::subscript
+            || ctag(lv) == ConstructType::deref
             || (ctag(lv) == ConstructType::member && !lv->is_const)))
         return;
 
@@ -1929,6 +1993,21 @@ pExpr02(ParseContext &c, unsigned fl)
         id->is_inc = is_inc;
         id->lvalue = std::move(elem);
         return id;
+    }
+
+    /* unary `*` - the value a box holds (DerefExpr), a location. A prefix
+     * operator like the others, so `*b++` is `*(b++)`. A slash directly
+     * followed by `*b` opens a block comment, as in C: write `a / *b`. */
+    if (*c == Op::times) {
+        c++;
+        elem = pExpr02(c, fl);
+        if (!elem)
+            noExprError(c);
+        auto d = make_unique<DerefExpr>();
+        d->start = start;
+        d->end = elem->end;
+        d->elem = std::move(elem);
+        return d;
     }
 
     /* `~` (Op::bnot) is bitwise NOT here; in a PARAM position it is the `dyn`
@@ -2342,6 +2421,8 @@ pExpr14_body(ParseContext &c, unsigned fl)
                     ? unique_ptr<Construct>(new LiteralNone())
                     : (c.pending_decl_type == DeclType::strct
                          ? build_zero_struct_init(c.pending_decl_struct, start)
+                         : c.pending_decl_type == DeclType::box
+                         ? zero_box_init(c.pending_decl_annot.get(), start)
                          : zero_value_literal(c.pending_decl_type));
 
         } else if (in_idlist) {
@@ -3221,7 +3302,7 @@ static FieldKind decltype_to_fieldkind(DeclType dt)
 static bool fieldkind_allows_opt(FieldKind k)
 {
     return k == FieldKind::f_dyn || k == FieldKind::f_array ||
-           k == FieldKind::f_dict;
+           k == FieldKind::f_dict || k == FieldKind::f_box;
 }
 
 /*
@@ -3235,7 +3316,7 @@ static bool fieldkind_allows_opt(FieldKind k)
  * (Inferencer::check_opt_struct_fields).
  */
 static const char *const opt_field_msg =
-    "'opt' is only allowed on dyn/array/dict and class-typed fields";
+    "'opt' is only allowed on dyn/array/dict/box and class-typed fields";
 
 static bool opt_struct_field_ok(const FieldDef &fd, const StructTypeDef &def)
 {
@@ -3457,8 +3538,7 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         if (pAcceptKeyword(c, Keyword::kw_dyn)) {
             fd.kind = FieldKind::f_dyn;
         } else if (*c == TokType::id &&
-                   (type_keyword(c.get_str()) == DeclType::arr ||
-                    type_keyword(c.get_str()) == DeclType::dict) &&
+                   container_keyword(c.get_str()) != DeclType::none &&
                    c.peek_tok(1) == Op::lt) {
             /* a parameterized container field: `array<int> xs;`,
              * `dict<str, Point> m;` - pTypeAnnot consumes `<...>` + `?`. The
@@ -3466,7 +3546,8 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
              * the element type for the inferencer. */
             std::shared_ptr<TypeAnnot> annot = pTypeAnnot(c);
             fd.kind = annot->kind == DeclType::arr ? FieldKind::f_array
-                                                   : FieldKind::f_dict;
+                    : annot->kind == DeclType::dict ? FieldKind::f_dict
+                                                    : FieldKind::f_box;
             fd.annot = annot;
             if (annot->opt)
                 fd.is_opt = true;

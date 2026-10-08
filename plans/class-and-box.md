@@ -101,9 +101,12 @@ deliberately not designed yet.
 1. The shared heap object + `class` (declaration, construction, member
    read/write through the reference, identity `==` / hash, const), every
    engine, `.myv`. **DONE 2026-10-08** - see *Step 1 as built* below.
-2. `array<C>` flat pointer storage, `opt C` as null.
-3. `box()` over structs (reuses 1), then scalar boxes with `*`.
-4. The JIT's inline tiers for member access through a reference.
+2. `array<C>` flat pointer storage, `opt C` as null. **DONE 2026-10-08.**
+3. `box()` over structs (reuses 1), then scalar boxes with `*`. **DONE
+   2026-10-08** - see *Step 3 as built*.
+4. The JIT's inline tiers for member access through a reference - and
+   the JIT tier of the box ops (LoadBoxV / StoreBoxV, interpreted after
+   step 3).
 
 ## Step 1 as built (2026-10-08)
 
@@ -292,6 +295,63 @@ visible): the loop transforms (a store through a box, or into a
 set); the escape analysis and the inliner's write-through rule (`*p = v`
 writes THROUGH `p`); the cycle walks (a `t_box` has one child); the
 constant-identity rules (`box()` is not const).
+
+## Step 3 as built (2026-10-08)
+
+As designed above, with these decisions and findings:
+
+- **The box ops run interpreted.** LoadBoxV / StoreBoxV are not
+  JIT-eligible yet: the helper tier moves to step 4, with the inline one.
+  Correctness does not depend on it (every engine goes through
+  `box_load_want` / `box_store`); a loop's other ops stay native around
+  them.
+- **`*b` checks the box it was proven to read** (`DerefExpr::want`, the
+  VM's LoadBoxV `b`). A `dyn` can carry a box of another element into a
+  `box<int>` place - a parameter, a field, an element (the #49 class) -
+  and a typed consumer of `*b` (an IntBin) reads the raw payload. The
+  check at the load closes that for every place at once; a store needs
+  none (`box_store` checks the box's own kind).
+- **A `box<P>` of a POD struct is the one reference instance that is
+  POD.** Its fields live in bytes, which the class store paths never met:
+  a store into one reached as a value (`bps[1].x = 50`, an element of the
+  flat reference array) was NotLValueEx in the tree-walker and a vector
+  index abort in the VM. Those paths hold the reference (a local
+  `LValue`, so `struct_own` hands back the object) or enter its bytes as
+  a place (`pod_place_ref`), in both engines.
+- **A value copy consumes no identity number**
+  (`StructObject(o, value_copy_t)`): `*bp` reads one per evaluation, and
+  the copy constructor of a reference instance would have drawn a number,
+  so the count of reads an engine makes would have moved every later
+  hash.
+- **`box<T> n;`'s zero value calls the builtin** whatever the program
+  names `box` (`Identifier::builtin_only`): the corpus has `var box =
+  [1, 2, 3]`, and the declaration then called the array.
+- **`deepclone` of a box is a new box**, and a non-POD `box<P>` stays
+  boxed through it (`clone_to_mutable` built a plain struct).
+- `signature()` prints a `box<T>` parameter as `box` (a parameter's
+  record keeps its kind, not its annotation - as `array` / `dict`).
+- An explicit `pure func` that calls `box()` fails when it is evaluated
+  at compile time ("Undefined variable 'box' while evaluating a PURE
+  function"), as one calling `print` does; a plain function that boxes
+  is not inferred pure.
+
+Watched failing (each sabotage rebuilt and run against the `box`, layer
+and `pure cache` `-rt` cases, restored by a plain copy and rebuilt, then
+a control that passes): the member store's reference holder, the VM
+chain walk's and the tree-walker's POD place for a reference read as a
+value, `vm_incdec_final`'s holder, `vm_member_lvalue_ref`'s POD guard
+(an abort - the `fields` vector is empty), the tree-walker's `*` check,
+the VM's (an abort in the hardened interpreter, a garbage sum from the
+JIT's native add - the debug suite sees the abort), `builtin_only` in the
+resolver and in the inferencer, `deepclone` of a box and of a boxed
+struct, the typed store check, `box_store`'s kind check,
+`fr_store_reaches_shared`'s `*` arm and the cache's `args_cache_safe`
+gate. The harness first counted only the FAIL summary lines and so read
+the two aborts as passes; it reports the exit code now.
+
+Found on the way, fixed in its own commit: the per-frame pure-call cache
+kept a stale result for an argument compared by identity - a class
+instance, a box - whose fields changed between two calls in one frame.
 
 ## Corrections to plans/struct-value-semantics.md
 

@@ -77,8 +77,9 @@ static bool struct_equal(const StructObject &x, const StructObject &y)
     if (x.def != y.def)
         return false;
 
-    /* a CLASS instance is equal to itself only: == is identity */
-    if (x.def->is_class)
+    /* a CLASS instance - or a box - is equal to itself only: == is
+     * identity */
+    if (x.is_ref() || y.is_ref())
         return &x == &y;
 
     /* POD: same def -> same layout, so a raw byte compare is exact. */
@@ -150,7 +151,7 @@ size_t TypeStruct::hash(const EvalValue &a)
      * number, never its address (see g_class_ident) - so its hash does not
      * change when its fields do, and it can be a dict key unfrozen. Its
      * fields are never walked, so no cycle can pass through it here. */
-    if (def.is_class) {
+    if (o.is_ref()) {
         hash_combine(seed, std::hash<uint64_t>()(o.ident));
         return seed;
     }
@@ -177,7 +178,9 @@ string TypeStruct::to_string(const EvalValue &a)
     const StructObject &o = *a.get_ref<intrusive_ptr<StructObject>>().get();
     const StructTypeDef &def = *o.def;
 
-    string res = string(def.name->val);
+    /* a box<P> prints as `box(P(...))` */
+    string res = o.boxed ? "box(" + string(def.name->val)
+                         : string(def.name->val);
 
     /* a boxed struct already being printed further up: `Name(...)` */
     CycKey k;
@@ -199,7 +202,7 @@ string TypeStruct::to_string(const EvalValue &a)
             res += ", ";
     }
 
-    res += ")";
+    res += o.boxed ? "))" : ")";
     return res;
 }
 
@@ -219,7 +222,8 @@ string TypeStruct::pretty(const EvalValue &a, int indent, int width)
         return flat;
 
     CycGuard g(cyc_render(), k, keyed);   /* a field leading back: Name(...) */
-    string res = string(def.name->val);
+    string res = o.boxed ? "box(" + string(def.name->val)
+                         : string(def.name->val);
     res += "(\n";
     const string pad(indent + 2, ' ');
     for (size_t i = 0; i < def.fields.size(); i++) {
@@ -236,7 +240,7 @@ string TypeStruct::pretty(const EvalValue &a, int indent, int width)
         res += "\n";
     }
     res += string(indent, ' ');
-    res += ")";
+    res += o.boxed ? "))" : ")";
     return res;
 }
 

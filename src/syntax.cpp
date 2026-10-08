@@ -352,6 +352,15 @@ void LiteralDictKVPair::serialize(ostream &s, int level) const
     s << ")";
 }
 
+void DerefExpr::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent << "Deref(\n";
+    elem->serialize(s, level + 1);
+    s << endl << indent << ")";
+}
+
 void IncDecExpr::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');

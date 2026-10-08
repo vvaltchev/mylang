@@ -239,6 +239,31 @@ EvalValue builtin_deepclone(EvalContext *ctx, const ArgLocs *exprList,
     return make_deep_mutable_clone(args[0]);
 }
 
+/*
+ * box(v) (plans/class-and-box.md, step 3): a box of an int / float / bool /
+ * str, or a boxed copy of a struct value - a REFERENCE, shared by every
+ * copy, read and written with `*b`. An array, a dict, a function, a class
+ * instance or a box is a reference already and is returned as it is. A
+ * run-time (non-const) builtin, so no compile-time pass can duplicate or
+ * merge a box's identity.
+ */
+EvalValue builtin_box(EvalContext *ctx, const ArgLocs *exprList,
+                      const EvalValue *args, size_t n)
+{
+    if (n != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+    try {
+        return box_make(args[0]);
+    } catch (Exception &e) {
+        if (!e.loc_start) {
+            const ArgLoc *arg = exprList->arg(0);
+            e.loc_start = arg->start;
+            e.loc_end = arg->end;
+        }
+        throw;
+    }
+}
+
 EvalValue builtin_intptr(EvalContext *ctx, const ArgLocs *exprList,
                          LValue *target, const EvalValue *rest, size_t n_rest)
 {

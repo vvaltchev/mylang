@@ -889,6 +889,16 @@ vm_chain_walk(EvalContext &ctx, const Chunk::MemberKey *mkeys, EvalValue &cur,
                     cur = EvalValue(h);
                     if (pod_place_rooted_field(h, mk.memUid, place))
                         continue;
+                } else {
+                    /* a box<P> of a POD struct read as a value: its inline
+                     * POD field is a place in the shared bytes (`cur`
+                     * keeps the object alive) */
+                    PodPlace rp;
+                    if (pod_place_ref(cur, rp)
+                            && pod_place_step(rp, mk.memUid)) {
+                        place = rp;
+                        continue;
+                    }
                 }
                 /* for_write=false: an intermediate member is READ to walk into.
                  * A slot's boxed field / a dict value -> an lvalue REF; else
@@ -8810,6 +8820,40 @@ void vm_stamp_setup_caret(Exception &e, const Chunk &chunk, size_t pc)
 }
 
 /*
+ * LoadBoxV / StoreBoxV (bytecode.h): `*b`, through the box_load_want /
+ * box_store every engine shares; a raise takes the `*b` caret from the loc
+ * side table. Out of line: the dispatch loop's frame stays small.
+ */
+static ML_NOINLINE void
+vm_load_box(EvalContext &ctx, const Instr &in, const Chunk &chunk, size_t pc)
+{
+    const int want = static_cast<int>(in.b_lit());
+    const StructTypeDef *def = want == 5
+        ? chunk.struct_defs[static_cast<size_t>(in.target2)] : nullptr;
+    try {
+        EvalValue v = box_load_want(ctx.frame->at(in.a_slot()).get(), want,
+                                    def);
+        ctx.frame->at(in.target).put(std::move(v));
+    } catch (Exception &e) {
+        vm_stamp_loc(chunk, pc, e);
+        throw;
+    }
+}
+
+static ML_NOINLINE void
+vm_store_box(EvalContext &ctx, const Instr &in, const Chunk &chunk,
+             size_t pc)
+{
+    try {
+        box_store(ctx.frame->at(in.a_slot()).get(),
+                  ctx.frame->at(in.b_slot()).get());
+    } catch (Exception &e) {
+        vm_stamp_loc(chunk, pc, e);
+        throw;
+    }
+}
+
+/*
  * RULE 1: the interpreted CheckNoneArgsV - vm_none_args_fault's refusal
  * takes the op's carets (it records the call's argument spans, read
  * through vm_stamp_setup_caret like a call's own) and raises before the
@@ -13743,6 +13787,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             vm_check_none_args(ctx, *in, *chunk, pc);
             pc++;
         }
+            VM_NEXT;
+
+        VM_CASE(LoadBoxV):
+            vm_load_box(ctx, *in, *chunk, pc);
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(StoreBoxV):
+            vm_store_box(ctx, *in, *chunk, pc);
+            pc++;
             VM_NEXT;
 
         VM_CASE(CheckFuncV):

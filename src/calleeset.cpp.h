@@ -256,6 +256,7 @@ bool Inferencer::cs_type_can_hold_func(StaticTypeRef t,
         return true;
 
     case StaticTypeKind::Array:
+    case StaticTypeKind::Box:
         return cs_type_can_hold_func(t->elem, seen);
     case StaticTypeKind::Dict:
         return cs_type_can_hold_func(t->key, seen) ||
@@ -303,6 +304,7 @@ bool Inferencer::cs_struct_can_hold_func(const StructTypeDef *def,
             return true;                  /* may hold anything */
         case FieldKind::f_array:
         case FieldKind::f_dict:
+        case FieldKind::f_box:
             /* a GENERIC `array`/`dict` field carries no element type,
              * so it may hold one */
             if (!f.annot || cs_annot_can_hold_func(f.annot.get(), seen))
@@ -344,6 +346,7 @@ bool Inferencer::cs_annot_can_hold_func(const TypeAnnot *a,
     case DeclType::dyn:
         return true;
     case DeclType::arr:
+    case DeclType::box:
         return !a->elem || cs_annot_can_hold_func(a->elem.get(), seen);
     case DeclType::dict:
         return (!a->key || cs_annot_can_hold_func(a->key.get(), seen)) ||
@@ -674,6 +677,10 @@ CsSet Inferencer::cs_eval(Construct *e)
 
     case ConstructType::member:
         return cs_read_elems(cs_eval(static_cast<MemberExpr *>(e)->what.get()));
+
+    case ConstructType::deref:
+        /* a box is an object whose one element is the boxed value */
+        return cs_read_elems(cs_eval(static_cast<DerefExpr *>(e)->elem.get()));
 
     case ConstructType::slice:
         /* A slice is a VIEW: it denotes the parent's storage, so it
@@ -1076,6 +1083,10 @@ void Inferencer::cs_bind_target(Construct *lv, const CsSet &v)
 
     case ConstructType::member:
         cs_write_elems(cs_eval(static_cast<MemberExpr *>(lv)->what.get()), v);
+        return;
+
+    case ConstructType::deref:
+        cs_write_elems(cs_eval(static_cast<DerefExpr *>(lv)->elem.get()), v);
         return;
 
     case ConstructType::idlist: {

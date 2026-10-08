@@ -1279,6 +1279,30 @@ enum class OpCode : unsigned char {
     CheckNoneArgsV,
 
     /*
+     * BOXES (plans/class-and-box.md, step 3) - `*b`, the value a box
+     * holds, shared by every engine through box_load_want / box_store
+     * (eval.cpp).
+     *
+     * LoadBoxV   slot[target] = *slot[a]: the box's value (a COPY of a
+     *            box<P>'s struct). `b` (an int literal) = the box the
+     *            inferencer proved (DerefExpr::want: 0 any, 1 int, 2 float,
+     *            3 bool, 4 str, 5 a struct); for 5, `target2` = the
+     *            Chunk::struct_defs index of the struct, else -1. A value
+     *            that is not a box, or a box of another element, raises a
+     *            TypeErrorEx - caret: the loc side table (the `*b`).
+     * StoreBoxV  *slot[a] = slot[b]: box_store - an int into a box<float>
+     *            widens, a misfit or a read-only box raises (caret: the
+     *            `*b`); a box<P> takes the struct's fields in place,
+     *            keeping its identity. Writes no frame slot.
+     *
+     * `*b OP= v` and `(*b)++` lower to LoadBoxV, the operator (CompoundV
+     * / IncDecCheckedV on the temp) and StoreBoxV, the box held in one
+     * slot; the rvalue of a store is evaluated before the box.
+     */
+    LoadBoxV,
+    StoreBoxV,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1330,7 +1354,7 @@ enum class OpCode : unsigned char {
     X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt) X(EnterNative) \
     X(ExitBlock) X(LoadElem2Int) X(LoadElem2Float) X(ArrEpochMark) \
     X(ArrEpochCheck) X(GuardCalleeV) X(LoadCaptureOfV) X(StoreCaptureOfV) \
-    X(UnpackLenCheck) X(CheckNoneArgsV)
+    X(UnpackLenCheck) X(CheckNoneArgsV) X(LoadBoxV) X(StoreBoxV)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin

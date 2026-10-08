@@ -877,6 +877,128 @@ struct Codegen {
         return true;
     }
 
+    /*
+     * BOXES (plans/class-and-box.md, step 3): `*b` - LoadBoxV / StoreBoxV.
+     * A load checks the box the inferencer proved (DerefExpr::want), so a
+     * typed consumer of its result reads what it was told it reads.
+     */
+    CgInstr box_load_instr(const DerefExpr *d, int dst, int bslot)
+    {
+        CgInstr in;
+        in.op = OpCode::LoadBoxV;
+        in.node_idx = add_ast_node(d);
+        in.target = dst;
+        in.set_a(slot_op(bslot));
+        in.set_b(int_lit(d->want));
+        in.target2 = d->want == 5 ? add_struct_def(d->want_def) : -1;
+        return in;
+    }
+
+    bool compile_box_load(const DerefExpr *d, int &out,
+                          std::vector<CgInstr> &ops)
+    {
+        int bslot;
+        if (!compile_boxed_expr(d->elem.get(), bslot, ops))
+            return false;
+        const int t = alloc_temp();
+        ops.push_back(box_load_instr(d, t, bslot));
+        out = t;
+        return true;
+    }
+
+    /* `*b = v` / `*b OP= v`: the rvalue first, then the box once (a fresh
+     * temp holds the rvalue when evaluating the box could change the
+     * variable it was read from); a compound loads, applies the operator
+     * (its error carets the whole expression) and stores back. `out`: the
+     * value form - the box's value after the store. */
+    bool compile_deref_store(const Expr14 *e, std::vector<CgInstr> &ops,
+                             int *out)
+    {
+        const DerefExpr *d = static_cast<const DerefExpr *>(e->lvalue.get());
+        const bool is_assign = e->op == Op::assign;
+        const Op cbase = compound_base_op(e->op);
+        if (!is_assign && cbase == Op::invalid)
+            return false;
+        int rslot;
+        if (construct_no_side_effects(d->elem.get())) {
+            if (!compile_boxed_expr(e->rvalue.get(), rslot, ops))
+                return false;
+        } else {
+            rslot = alloc_temp();
+            if (!compile_to_run_slot(e->rvalue.get(), rslot, ops))
+                return false;
+        }
+        int bslot;
+        if (!compile_boxed_expr(d->elem.get(), bslot, ops))
+            return false;
+        int vslot = rslot;
+        if (!is_assign) {
+            const int t = alloc_temp();
+            ops.push_back(box_load_instr(d, t, bslot));
+            CgInstr c;
+            c.op = OpCode::CompoundV;
+            c.node_idx = add_ast_node(e);
+            c.target = t;
+            c.set_b(slot_op(rslot));
+            c.aop = cbase;
+            ops.push_back(c);
+            vslot = t;
+        }
+        CgInstr st;
+        st.op = OpCode::StoreBoxV;
+        st.node_idx = add_ast_node(d);
+        st.set_a(slot_op(bslot));
+        st.set_b(slot_op(vslot));
+        ops.push_back(st);
+        if (out) {
+            const int t = alloc_temp();
+            ops.push_back(box_load_instr(d, t, bslot));
+            *out = t;
+        }
+        return true;
+    }
+
+    /* `(*b)++` / `--*b`: the box once, its value loaded into a temp, the
+     * CHECKED inc-dec there (int/float only, caret: the inc-dec), stored
+     * back. `out`: the value form - the old value (postfix) or the new. */
+    bool compile_deref_incdec(const IncDecExpr *inc,
+                              std::vector<CgInstr> &ops, int *out)
+    {
+        const DerefExpr *d =
+            static_cast<const DerefExpr *>(inc->lvalue.get());
+        int bslot;
+        if (!compile_boxed_expr(d->elem.get(), bslot, ops))
+            return false;
+        const int t = alloc_temp();
+        ops.push_back(box_load_instr(d, t, bslot));
+        int old = -1;
+        if (out && !inc->is_prefix) {
+            old = alloc_temp();
+            CgInstr mv;
+            mv.op = OpCode::MoveV;
+            mv.node_idx = add_ast_node(inc);
+            mv.target = old;
+            mv.target2 = t;
+            ops.push_back(mv);
+        }
+        CgInstr in;
+        in.op = OpCode::IncDecCheckedV;
+        in.node_idx = add_ast_node(inc);
+        in.target = t;
+        in.target2 = 0;                     /* a frame slot */
+        in.set_a(int_lit(inc->is_inc ? 1 : 0));
+        ops.push_back(in);
+        CgInstr st;
+        st.op = OpCode::StoreBoxV;
+        st.node_idx = add_ast_node(d);
+        st.set_a(slot_op(bslot));
+        st.set_b(slot_op(t));
+        ops.push_back(st);
+        if (out)
+            *out = inc->is_prefix ? t : old;
+        return true;
+    }
+
     bool compile_boxed_stmt(const Construct *s, std::vector<CgInstr> &ops)
     {
         const size_t mark = ops.size();
@@ -1366,6 +1488,21 @@ struct Codegen {
                             bool allow_typed = true,
                             bool truthy_only = false)
     {
+        /* `*b`, and a store through a box used as a value */
+        if (ctag(e) == ConstructType::deref)
+            return compile_box_load(static_cast<const DerefExpr *>(e),
+                                    out_slot, ops);
+        if (ctag(e) == ConstructType::expr14
+                && ctag(static_cast<const Expr14 *>(e)->lvalue.get())
+                       == ConstructType::deref)
+            return compile_deref_store(static_cast<const Expr14 *>(e), ops,
+                                       &out_slot);
+        if (ctag(e) == ConstructType::incdec
+                && ctag(static_cast<const IncDecExpr *>(e)->lvalue.get())
+                       == ConstructType::deref)
+            return compile_deref_incdec(static_cast<const IncDecExpr *>(e),
+                                        ops, &out_slot);
+
         /*
          * Typed-arg lowering: a th==i/f node computes its int/float value via
          * the UNBOXED typed path (IntBin/FloatBin/CallV/LoadElem...), which
@@ -2925,6 +3062,18 @@ struct Codegen {
     bool compile_boxed_stmt_impl(const Construct *s,
                                  std::vector<CgInstr> &ops)
     {
+        /* a store through a box (`*b = v`, `(*b)++`) */
+        if (ctag(s) == ConstructType::expr14
+                && ctag(static_cast<const Expr14 *>(s)->lvalue.get())
+                       == ConstructType::deref)
+            return compile_deref_store(static_cast<const Expr14 *>(s), ops,
+                                       nullptr);
+        if (ctag(s) == ConstructType::incdec
+                && ctag(static_cast<const IncDecExpr *>(s)->lvalue.get())
+                       == ConstructType::deref)
+            return compile_deref_incdec(static_cast<const IncDecExpr *>(s),
+                                        ops, nullptr);
+
         /* A global `g++`/`g--` or closure-capture `cap++`/`cap--` statement ->
          * a compound StoreGlobalV/StoreCaptureV (x += 1 / x -= 1). A LOCAL
          * inc-dec is handled earlier (compile_int/float_stmt); a subscript one
@@ -5528,6 +5677,17 @@ struct Codegen {
         if (e->th == TypeHint::i && try_typed_ternary(e, out, ops, false))
             return true;
 
+        /* `*b` of a proven box<int>: the load checks the element */
+        if (e->th == TypeHint::i && !e->th_bool
+                && ctag(e) == ConstructType::deref
+                && static_cast<const DerefExpr *>(e)->want == 1) {
+            int t;
+            if (!compile_box_load(static_cast<const DerefExpr *>(e), t, ops))
+                return false;
+            out = slot_op(t);
+            return true;
+        }
+
         if (e->th == TypeHint::i)
             if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
                 if (try_sfe_field(m, out, ops, OpCode::LoadStructFieldInt))
@@ -6606,6 +6766,16 @@ struct Codegen {
 
         if (e->th == TypeHint::f && try_typed_ternary(e, out, ops, true))
             return true;
+
+        /* `*b` of a proven box<float>: the load checks the element */
+        if (e->th == TypeHint::f && ctag(e) == ConstructType::deref
+                && static_cast<const DerefExpr *>(e)->want == 2) {
+            int t;
+            if (!compile_box_load(static_cast<const DerefExpr *>(e), t, ops))
+                return false;
+            out = slot_op(t);
+            return true;
+        }
 
         if (e->th == TypeHint::f)
             if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
@@ -9196,6 +9366,8 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::CheckCallableV: /* node = the callee (NotCallable caret) */
         case OpCode::CheckNoneArgsV: /* node = the CallExpr (its argument
                                       * carets ride base_locs / arg_locs) */
+        case OpCode::LoadBoxV:       /* node = the `*b` (its TypeErrorEx) */
+        case OpCode::StoreBoxV:      /* node = the `*b` (a misfit, const) */
         case OpCode::CallValueGenericV: /* node = the CallExpr: the CALL-SITE
                                      * loc (a FuncObject callee's backtrace via
                                      * do_func_call's loc_at); the op is now
@@ -9703,6 +9875,11 @@ static bool visit_use_def(const Instr &in, U u, D d)
             u(in.target2);
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         return true;
+    case OpCode::LoadBoxV:         /* dst = *box */
+        u(in.a_slot()); d(in.target); return true;
+    case OpCode::StoreBoxV:        /* *box = value: the box OBJECT changes,
+                                    * no frame slot does */
+        u(in.a_slot()); u(in.b_slot()); return true;
     case OpCode::MakeArrayV:
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
@@ -12520,6 +12697,23 @@ void ChunkVerifier::verify_one(const Instr &in)
                 break;
             }
         }
+        break;
+    case OpCode::LoadBoxV:
+        /* `b` = the proven box (0..5), `target2` its struct for 5 */
+        reg(in.target);
+        a_slot_only(in);
+        if (!in.b_is_lit() || in.b_lit() < 0 || in.b_lit() > 5)
+            reject("box element kind");
+        if (in.b_lit() == 5) {
+            pool(in.target2, ck.struct_defs.size(), "struct def");
+            defined_ptr(ck.struct_defs[in.target2], "struct def");
+        } else if (in.target2 != -1) {
+            reject("box element def");
+        }
+        break;
+    case OpCode::StoreBoxV:
+        a_slot_only(in);
+        b_slot_only(in);
         break;
     case OpCode::CheckNoneArgsV:
         /* `target` = the callee's kind: 0 a frame slot, 1 a global slot */

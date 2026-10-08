@@ -22,6 +22,7 @@
 #include "types/float.cpp.h"
 #include "types/dict.cpp.h"
 #include "types/struct.cpp.h"
+#include "types/box.cpp.h"
 
 /* Build the AST-free ArgLocs a func_v/func_lv takes, from an ExprList. Defined
  * below (after the type tables), forward-declared here so a builtin's custom
@@ -74,7 +75,14 @@ static const std::array<SharedStr, Type::t_count> TypeNames =
     string("exception"),
     string("dict"),
     string("struct"),
+    string("box"),
 };
+
+/* The run-time type name of a value (`int`, `array`, ...) - eval.h */
+std::string runtime_type_name(const EvalValue &v)
+{
+    return std::string(TypeNames[v.get_type()->t].get_view());
+}
 
 EvalValue builtin_exit(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
@@ -103,9 +111,13 @@ EvalValue builtin_exit(EvalContext *ctx, const ArgLocs *exprList,
  * the inferencer's fold gives it (static_type_kind_string). */
 static EvalValue runtime_kind_name(const EvalValue &v)
 {
-    if (v.is<intrusive_ptr<StructObject>>()
-        && v.get_ref<intrusive_ptr<StructObject>>()->def->is_class)
-        return EvalValue(SharedStr(std::string("class")));
+    if (v.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+        if (o.boxed)
+            return EvalValue(SharedStr(std::string("box")));
+        if (o.def->is_class)
+            return EvalValue(SharedStr(std::string("class")));
+    }
     return EvalValue(TypeNames[v.get_type()->t]);
 }
 
@@ -244,6 +256,7 @@ const std::array<Type *, Type::t_count> AllTypes =
     ml_lowmem_new<TypeException>(),
     ml_lowmem_new<TypeDict>(),
     ml_lowmem_new<TypeStruct>(),
+    ml_lowmem_new<TypeBox>(),
 };
 
 
@@ -801,6 +814,7 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_lv_v<builtin_erase>("erase"),
     make_builtin_lv_v<builtin_insert>("insert"),
     make_builtin_v<builtin_deepclone>("deepclone"), /* deep mutable copy */
+    make_builtin_v<builtin_box>("box"),     /* a reference to a value */
 
     /* Numeric builtins */
     make_builtin_v<builtin_rand>("rand"),

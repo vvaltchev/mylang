@@ -1,0 +1,183 @@
+# box(v) and unary * (README "Boxes"): a box is a REFERENCE to one value -
+# every copy of the box shares it, `*b` reads it, `*b = v` writes it, ==
+# and hash() go by identity. box() of a struct VALUE is a box<P>, which
+# behaves as a class instance does; box() of a reference (an array, a dict,
+# a function, a class instance, a box) is that reference itself.
+#
+# Every holder kind: a variable, a parameter, an array element, a dict
+# key, a struct field, a class field, a capture. The loops run each store
+# enough times for the JIT's runs around the box ops. runtime() keeps
+# values out of const folding.
+
+struct P { int x; float y; }
+struct I { int a; int b; }
+struct O { I inn; int z; }
+struct Q { str s; array<int> xs; }
+class C { int n; box<O> o; }
+struct H { box<int> k; opt box<P> p; }
+
+func ri(int v) => int(runtime(v));
+
+# 1. a copy shares the box; *b reads and writes it
+var b = box(ri(5));
+var c = b;
+*c = 7;
+assert(*b == 7 && b == c);
+assert(b != box(7));                # an equal value, another box
+
+# 2. typed arithmetic through a box, in loops
+var acc = box(0);
+for (var i = 0; i < 200; i++)
+    *acc += i;
+assert(*acc == 19900);
+var fb = box(0.5);
+for (var i = 0; i < 4; i++)
+    *fb = *fb * 2;
+assert(*fb == 8.0);
+
+# 3. the value of a store is the stored value (an int into a box<float>
+#    is a float), postfix the old one, prefix the new
+var v1 = (*b = 7);
+var v2 = (*b += 1);
+var v3 = (*b)++;
+var v4 = ++*b;
+assert(v1 == 7 && v2 == 8 && v3 == 8 && v4 == 10 && *b == 10);
+box<float> f = box(1.0);
+var w = (*f = ri(2));
+assert(typestr(w) == "float" && w == 2.0 && *f == 2.0);
+
+# 4. a parameter writes the caller's box
+func bump(box<int> n, int k) { *n += k; return *n; }
+for (var i = 0; i < 100; i++)
+    bump(b, 1);
+assert(*b == 110 && *c == 110);
+
+# 5. box<P>: the struct is shared; *bp reads a COPY; *bp = q keeps the box
+var bp = box(P(x: ri(1), y: 2.0));
+var bq = bp;
+bq.x += 5;
+bq.y *= 3;
+bq.x++;
+assert(bp.x == 7 && bp.y == 6.0);
+var q = *bp;
+q.x = 100;
+assert(bp.x == 7);
+*bp = P(x: ri(5), y: 6.5);
+assert(bq.x == 5 && bq.y == 6.5 && bq == bp);
+func setx(box<P> p, int v) { p.x = v; }
+setx(bp, 42);
+assert(bq.x == 42);
+
+# 6. arrays of boxes: an element is the box (no copy)
+array<box<int>> cells = [box(ri(1)), box(ri(2)), box(ri(3))];
+var keep = cells[1];
+foreach (cl in cells)
+    *cl *= 10;
+assert(*cells[0] == 10 && *keep == 20 && *cells[2] == 30);
+var bps = [box(P(x: ri(1), y: 1.0)), box(P(x: ri(2), y: 2.0))];
+for (var i = 0; i < 50; i++)
+    bps[i % 2].x += 1;
+bps[1].x = 500;
+bps[0].x++;
+assert(bps[0].x == 27 && bps[1].x == 500);
+foreach (p in bps)
+    p.y = 0.5;
+assert(bps[0].y == 0.5 && bps[1].y == 0.5);
+
+# 7. an inline POD field of a box<P> reached through an element or a field
+var bo = [box(O(inn: I(a: ri(1), b: 2), z: 3))];
+bo[0].inn.a = 10;
+bo[0].inn.b += 5;
+bo[0].z++;
+--bo[0].inn.a;
+assert(bo[0].inn.a == 9 && bo[0].inn.b == 7 && bo[0].z == 4);
+var k = C(n: 0, o: box(O(inn: I(a: 0, b: 0), z: 0)));
+var ko = k.o;
+k.o.inn.a = 7;
+k.o.z += 1;
+assert(ko.inn.a == 7 && ko.z == 1);
+
+# 8. strings and bools
+var s = box("a");
+for (var i = 0; i < 3; i++)
+    *s += "b";
+assert(*s == "abbb" && len(*s) == 4 && (*s)[1] == "b");
+var t = box(true);
+*t = !*t;
+assert(*t == false);
+
+# 9. pass-through: a reference is not boxed again
+var arr = [1];
+var ba = box(arr);
+append(ba, 2);
+assert(len(arr) == 2 && box(b) == b && box(k) == k);
+
+# 10. clone / deepclone make a new box; == is identity
+var c1 = clone(b);
+*c1 = 0;
+var c2 = deepclone(bp);
+c2.x = -1;
+assert(*b == 110 && *c1 == 0 && bp.x == 42 && c2.x == -1);
+assert(c1 != b && c2 != bp);
+var bq2 = box(Q(s: "x", xs: [1]));
+var cq = deepclone(bq2);
+append(cq.xs, 2);
+assert(len(bq2.xs) == 1 && len(cq.xs) == 2);
+
+# 11. a dict keyed by boxes: by identity
+var d = {};
+d[b] = "b";
+d[c1] = "c1";
+d[c] = "c";
+assert(len(d) == 2 && d[b] == "c" && d[c1] == "c1");
+
+# 12. fields of box type: zero-initialized, shared by struct copies
+H h;
+*h.k += 2;
+var h2 = h;
+*h2.k += 10;
+assert(*h.k == 12 && h.p == none);
+h.p = box(P(x: 3, y: 0.0));
+var hp = h.p;                       # narrowing applies to a variable
+if (hp)
+    hp.x += 1;
+assert(h.p?.x == 4);
+
+# 13. a capture shares the box
+var cnt = box(0);
+var inc = func [cnt] () { *cnt += 1; return *cnt; };
+for (var i = 0; i < 30; i++)
+    inc();
+assert(*cnt == 30);
+
+# 14. an opt box is narrowed before `*`
+opt box<int> ob;
+assert(ob == none);
+ob = box(ri(9));
+if (ob)
+    *ob += 1;
+if (ob)
+    assert(*ob == 10);
+
+# 15. a program's own `box` does not change a box<T> zero value
+func shadowed() { var box = 3; box<float> m; *m += box; return *m; }
+assert(shadowed() == 3.0);
+
+# 16. errors are defined: `*` of a non-box, a misfit store, a const box
+var dyn notbox = ri(5);
+var got = "";
+try { print(*notbox); } catch (TypeErrorEx as e) { got = "nb"; }
+assert(got == "nb");
+var dyn sb = box("s");
+got = "";
+try { *sb = 5; } catch (TypeErrorEx as e) { got = "misfit"; }
+assert(got == "misfit" && *sb == "s");
+got = "";
+try { (*sb)++; } catch (TypeErrorEx as e) { got = "incdec"; }
+assert(got == "incdec");
+func wantint(box<int> x) { int r = *x; return r; }
+got = "";
+try { wantint(sb); } catch (TypeErrorEx as e) { got = "want"; }
+assert(got == "want");
+
+print("ok");

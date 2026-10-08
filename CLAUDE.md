@@ -357,6 +357,14 @@ restore rebuild, run the same check again and require it to PASS - that
 is the only proof the restore reached the binary, and it is what exposed
 this one (a tree-walker failure after a codegen-only edit).
 
+**⛔ AND AN ABORT IS A FAILURE THE SUMMARY LINES NEVER PRINT
+(2026-10-08).** A harness that decides "caught" by counting the suite's
+`FAIL` summary lines reads a sabotage that ABORTS the run (an
+`ML_CHECK`, an `ML_VM_CHECK`, a SIGSEGV) as zero failures - the suite
+never reached its summary. Two of a step-3 run's sabotages were
+reported "not caught" that way while both aborted with rc 134. Record
+the EXIT CODE beside the count, and treat a non-zero one as caught.
+
 **⛔⛔ AND `git checkout -- <file>` IN A HARNESS DESTROYS THE
 UNCOMMITTED WORK IN THAT FILE. COMMIT BEFORE YOU SABOTAGE (2026-08-29,
 the same day, in the same session).** Every such harness restores with
@@ -686,7 +694,7 @@ hybrid: out of range is a compile error when the value is known at
 compile time (a literal, or `float()` const-evaluated - the builtin asks
 `ctx->in_const_eval()`) and rounds to inf / a signed zero at run time.
 **THE OBJECT CENSUS (P4, 2026-10-03).** Each pooled heap object kind
-(str, arr, dict, struct, func, exc) is counted at its class `operator
+(str, arr, dict, struct, func, exc, box) is counted at its class `operator
 new/delete` in an INT build (`ML_POOL_NEW_DELETE_K`, poolalloc.h - the
 plain macro elsewhere); `int_live(kind)` reads a count, and with
 `MYLANG_INT_CENSUS=1` a process prints `census LEAK <kind> base B end E`
@@ -5712,7 +5720,8 @@ payoff.
 - **The trivial / non-trivial boundary is `t_str`.** `TypeE` order matters:
   `t_none, t_lval, t_undefid, t_int, t_builtin, t_float, t_bool` (`< t_str`,
   trivial, stored inline,
-  bit-copyable) then `t_str, t_func, t_arr, t_ex, t_dict` (`>= t_str`,
+  bit-copyable) then `t_str, t_func, t_arr, t_ex, t_dict, t_struct, t_box`
+  (`>= t_str`,
   non-trivial, need the
   type-erased lifecycle ops). Hot paths branch on `type->t < Type::t_str` /
   `>= Type::t_str` (e.g.
@@ -6973,6 +6982,45 @@ but the per-element `StructObject` allocation is gone (build overhead
   `-rt` entries, the class `alias:` layer case, the `driver_checks` image
   case.
 
+- **⛔ A BOX IS A REFERENCE TO ONE VALUE - TWO REPRESENTATIONS, ONE SET
+  OF HELPERS (plans/class-and-box.md, step 3, 2026-10-08; README
+  *Boxes*).** `box(v)` (a run-time builtin, never folded) and the prefix
+  `*` (`DerefExpr`, `ConstructType::deref`, a LOCATION). A `box<P>` of a
+  struct is a `StructObject` with `boxed` set - every class rule above is
+  asked of the OBJECT through `StructObject::is_ref()` (class def or
+  boxed), so a new site that asks `def->is_class` about an instance is
+  wrong for boxes; a box of a scalar or a string is the `t_box` value kind
+  (`BoxObj`, structtype.h; `src/types/box.cpp.h`). Rules a new site must
+  keep:
+  - **Every engine goes through `box_make` / `box_load_want` /
+    `box_store` (eval.h).** `*b` checks the box against the one the
+    inferencer proved (`DerefExpr::want`, the VM's LoadBoxV `b`): a box a
+    `dyn` laundered into a `box<int>` place raises at the `*`, so a typed
+    consumer of the result never reads a misfit. `box_store` checks the
+    box's own element kind. The VM ops (LoadBoxV / StoreBoxV) are
+    INTERPRETED in step 3 - not JIT-eligible; the tier is step 4.
+  - **A `box<P>` of a POD struct is a reference that is POD** - the one
+    such object (a class is never POD). A store path that meets a
+    reference instance as a VALUE (an element of a flat reference array,
+    a field) holds it (a local `LValue`, then struct_own hands back the
+    object itself) or enters its bytes as a place (`pod_place_ref`);
+    `vm_member_lvalue_ref` returns null for its POD field rather than
+    index the empty `fields`. Watched: without it `bps[1].x = 50` was
+    NotLValueEx in the tree-walker and a vector-index abort in the VM.
+  - **A copy that is a VALUE consumes no identity number**
+    (`StructObject(o, value_copy_t)`): `*bp` reads one, `box()` copies a
+    struct in with one - so how many copies an engine makes cannot move
+    the identity numbers a hash depends on.
+  - **A store through `*` writes shared storage**: `lvalue_chain_root`,
+    `fmi_base_id`, `fr_base_id` and `fr_store_reaches_shared` walk through
+    a `DerefExpr`, and `fr_immutable` never treats `*b` as invariant.
+  - **The zero value of `box<T> n;` calls the BUILTIN** -
+    `Identifier::builtin_only`, which the inferencer and the resolver bind
+    to the builtin table whatever a scope declares (a program may have its
+    own `box`).
+  Net: `tests/functional/84_boxes.my`, the `box:` / `box ti:` `-rt`
+  entries, the `box:` layer cases, the `repl: box` case.
+
 ## Error model
 ## Error model
 
@@ -6993,8 +7041,9 @@ and two macros:
   not-an-lvalue is decidable from the target's SHAPE, it is a COMPILE failure
   (`SyntaxErrorEx`, from `pExpr14` in the PARSER - so it needs no type
   information and no pass a flag can disable); when it depends on a runtime
-  VALUE it stays the catchable `NotLValueEx`. Exactly four forms can denote a
-  location: `Identifier`, `IdList`, `Subscript`, `MemberExpr`. A literal, a
+  VALUE it stays the catchable `NotLValueEx`. Exactly five forms can denote a
+  location: `Identifier`, `IdList`, `Subscript`, `MemberExpr`, `DerefExpr`
+  (`*b`, a box's value). A literal, a
   call result, an arith/compare/logical chain, a ternary and a SLICE are
   values, so `s[0:1] = v` / `(a+b) = 3` / `f() = 3` are refused at compile
   time. So is an OPTIONAL member `a?.f` (a value - none when `a` is none),

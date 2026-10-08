@@ -67,6 +67,15 @@ StaticTypeRef StaticTypeArena::array_of(StaticTypeRef elem, bool opt)
     return t;
 }
 
+StaticTypeRef StaticTypeArena::box_of(StaticTypeRef elem, bool opt)
+{
+    ML_CHECK(elem != nullptr);
+    StaticTypeRef t = alloc(StaticTypeKind::Box);
+    t->elem = elem;
+    t->opt = opt;
+    return t;
+}
+
 StaticTypeRef StaticTypeArena::dict_of(StaticTypeRef key, StaticTypeRef val,
     bool opt)
 {
@@ -185,6 +194,7 @@ bool static_type_equal(StaticTypeRef a, StaticTypeRef b)
             return false;                 /* distinct unbound variables */
 
         case StaticTypeKind::Array:
+        case StaticTypeKind::Box:
             return static_type_equal(a->elem, b->elem);
 
         case StaticTypeKind::Dict:
@@ -220,6 +230,7 @@ static bool static_type_occurs(StaticTypeRef var, StaticTypeRef t)
 
     switch (t->kind) {
         case StaticTypeKind::Array:
+        case StaticTypeKind::Box:
             return static_type_occurs(var, t->elem);
         case StaticTypeKind::Dict:
             return static_type_occurs(var, t->key) || static_type_occurs(var,
@@ -264,6 +275,7 @@ bool static_type_unify(StaticTypeRef a, StaticTypeRef b)
     switch (a->kind) {
 
         case StaticTypeKind::Array:
+        case StaticTypeKind::Box:
             return static_type_unify(a->elem, b->elem);
 
         case StaticTypeKind::Dict:
@@ -341,6 +353,12 @@ static bool static_type_same_underlying(StaticTypeRef a, StaticTypeRef b)
 
         case StaticTypeKind::Array:
             return static_type_elem_compat(a->elem, b->elem);
+
+        case StaticTypeKind::Box:
+            /* invariant, as a reference must be (a box<int> stored where a
+             * box<float> is expected would hold an int a float reader
+             * finds); an unsettled element defers */
+            return static_type_sig_compat(a->elem, b->elem);
 
         case StaticTypeKind::Dict:
             return static_type_elem_compat(a->key, b->key) &&
@@ -556,6 +574,19 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
             return func_of(ps, popt, rj ? rj : g_dyn[0], anyopt);
         }
 
+        case StaticTypeKind::Box: {
+            /* invariant: no numeric climb inside a box; an unsettled
+             * element takes the other's */
+            const StaticTypeRef ea = static_type_resolve(a->elem);
+            const StaticTypeRef eb = static_type_resolve(b->elem);
+            if (ea->kind == StaticTypeKind::Unknown)
+                return box_of(eb, anyopt);
+            if (eb->kind == StaticTypeKind::Unknown
+                || static_type_equal(ea, eb))
+                return box_of(ea, anyopt);
+            return nullptr;
+        }
+
         default:
             return nullptr;
     }
@@ -597,6 +628,9 @@ std::string static_type_to_string(StaticTypeRef t)
 
         case StaticTypeKind::Array:
             return "array<" + static_type_to_string(t->elem) + ">" + q;
+
+        case StaticTypeKind::Box:
+            return "box<" + static_type_to_string(t->elem) + ">" + q;
 
         case StaticTypeKind::Dict:
             return "dict<" + static_type_to_string(t->key) + "," +

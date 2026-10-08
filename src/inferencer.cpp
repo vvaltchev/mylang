@@ -446,6 +446,12 @@ private:
     void stamp_literal_repr(Construct *lit, StaticTypeRef dest);
     StaticTypeRef fixed_elem_dest(Construct *base, bool key);
     StaticTypeRef declared_type_of(Construct *e);
+    /* a member-access base's type, a box<P> seen as the P it holds */
+    StaticTypeRef member_base(StaticTypeRef t);
+    /* the fix a misused box names ("read its value with *b") */
+    std::string box_use_hint(StaticTypeRef t, const Construct *e);
+    void check_deref(DerefExpr *d);
+    void check_box_call(CallExpr *call);
     void check_value_into(StaticTypeRef dest, StaticTypeRef vt,
                           const std::string &field, Construct *at);
     void check_declared_store(Expr14 *e);
@@ -821,6 +827,9 @@ void Inferencer::for_each_child(Construct *n,
     }
     case ConstructType::incdec: {
         fn(static_cast<IncDecExpr *>(n)->lvalue.get()); return;
+    }
+    case ConstructType::deref: {
+        fn(static_cast<DerefExpr *>(n)->elem.get()); return;
     }
     case ConstructType::ternary: {
         auto *te = static_cast<TernaryExpr *>(n);
@@ -2849,9 +2858,12 @@ static bool array_repr_hint(StaticTypeRef ty, ArrHint &hint,
          * `[]` start flat); a boxed-struct array stays general. */
         hint = ArrHint::flat_s;
         sdef = sd;
-    } else if (el->kind == StaticTypeKind::Struct && sd && sd->is_class)
-        /* array<C> / array<opt C> of a class: the flat CLASS storage,
-         * one reference per element (null for none) */
+    } else if ((el->kind == StaticTypeKind::Struct && sd && sd->is_class)
+               || (el->kind == StaticTypeKind::Box && el->elem
+                   && static_type_resolve(el->elem)->kind
+                          == StaticTypeKind::Struct))
+        /* array<C> / array<opt C> of a class, or of a box<P>: the flat
+         * reference storage, one object per element (null for none) */
         hint = ArrHint::flat_c;
     else if (!el->opt && el->kind == StaticTypeKind::Str)
         /* array<str> (top-10 #7): NO hint - the value keeps its natural
@@ -3108,6 +3120,31 @@ void Inferencer::annotate_hints(Construct *n)
         sl->base_sliceable = !bt->opt
             && (bt->kind == StaticTypeKind::Array
                 || bt->kind == StaticTypeKind::Str);
+    }
+
+    /* `*b`: the box element the read checks (DerefExpr::want) */
+    if (ctag(n) == ConstructType::deref) {
+        auto *d = static_cast<DerefExpr *>(n);
+        StaticTypeRef bt = strip(static_type_resolve(type_of(d->elem.get())));
+        d->want = 0;
+        d->want_def = nullptr;
+        if (bt->kind == StaticTypeKind::Box && bt->elem) {
+            StaticTypeRef el = static_type_resolve(bt->elem);
+            switch (el->kind) {
+            case StaticTypeKind::Int:   d->want = 1; break;
+            case StaticTypeKind::Float: d->want = 2; break;
+            case StaticTypeKind::Bool:  d->want = 3; break;
+            case StaticTypeKind::Str:   d->want = 4; break;
+            case StaticTypeKind::Struct:
+                if (el->struct_def) {
+                    d->want = 5;
+                    d->want_def =
+                        static_cast<const StructTypeDef *>(el->struct_def);
+                }
+                break;
+            default: break;
+            }
+        }
     }
 
     /* Mark `d.k` whose base is statically a DICT (vs a struct), so the VM
@@ -3620,6 +3657,9 @@ StaticTypeRef Inferencer::annot_to_static_type(const TypeAnnot *ta)
             base = A.dict_of(annot_to_static_type(ta->key.get()),
                              annot_to_static_type(ta->val.get()));
             break;
+        case DeclType::box:
+            base = A.box_of(annot_to_static_type(ta->elem.get()));
+            break;
         default: base = A.dyn_ty();
     }
     return A.with_opt(base, ta->opt);
@@ -3632,7 +3672,8 @@ StaticTypeRef Inferencer::field_static_type(const FieldDef &fd)
     /* A parameterized container field (`array<int> xs`) carries its element
      * type in `annot`; a generic `array`/`dict` field leaves it `dyn`. */
     if (fd.annot &&
-        (fd.kind == FieldKind::f_array || fd.kind == FieldKind::f_dict)) {
+        (fd.kind == FieldKind::f_array || fd.kind == FieldKind::f_dict
+         || fd.kind == FieldKind::f_box)) {
         base = annot_to_static_type(fd.annot.get());
         return fd.is_opt ? A.with_opt(base, true) : base;
     }
@@ -3871,7 +3912,9 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
          * be called stays monomorphizable. Args are value uses. */
         if (ctag(call->what.get()) == ConstructType::id) {
             auto *cid = static_cast<Identifier *>(call->what.get());
-            id_sym[cid] = lookup(s, cid->uid);   /* always - see Identifier */
+            /* always - see Identifier; a builtin_only callee is the
+             * builtin's, whatever a scope declares */
+            id_sym[cid] = cid->builtin_only ? nullptr : lookup(s, cid->uid);
         } else {
             walk_struct(call->what.get(), s);
         }
@@ -4185,10 +4228,18 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
         case Type::t_none:  return A.none_ty();
 
         case Type::t_struct: {
-            const StructTypeDef *def =
-                v.get<intrusive_ptr<StructObject>>()->def;
-            return A.struct_ty(def, def->name);
+            const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+            StaticTypeRef st = A.struct_ty(o.def, o.def->name);
+            return o.boxed ? A.box_of(st) : st;
         }
+
+        case Type::t_box:
+            switch (v.get_ref<intrusive_ptr<BoxObj>>()->kind) {
+            case 'i': return A.box_of(A.int_ty());
+            case 'f': return A.box_of(A.float_ty());
+            case 'b': return A.box_of(A.bool_ty());
+            default:  return A.box_of(A.str_ty());
+            }
 
         case Type::t_arr: {
             const SharedArrayObj &arr = v.get<SharedArrayObj>();
@@ -4504,6 +4555,16 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
         return A.dyn_ty();
     }
 
+    /* `*b`: the value a box<T> holds, a T (a box holds no none) */
+    if (ctag(e) == ConstructType::deref) {
+        auto *d = static_cast<const DerefExpr *>(e);
+        StaticTypeRef bt = static_type_resolve(type_of(d->elem.get()));
+        if (is_unknown(bt) || is_none(bt)) return bottom;   /* defer */
+        if (bt->kind == StaticTypeKind::Box)
+            return bt->elem ? static_type_resolve(bt->elem) : A.dyn_ty();
+        return A.dyn_ty();       /* dyn, or a misuse the check pass reports */
+    }
+
     if (ctag(e) == ConstructType::slice) {
         auto *sl = static_cast<const Slice *>(e);
         StaticTypeRef w = static_type_resolve(type_of(sl->what.get()));
@@ -4528,7 +4589,8 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
             }
         }
 
-        StaticTypeRef w = static_type_resolve(type_of(mem->what.get()));
+        StaticTypeRef w =
+            member_base(static_type_resolve(type_of(mem->what.get())));
         if (is_unknown(w) || is_none(w)) return bottom;   /* defer */
 
         StaticTypeRef mt;   /* the member's type, before optionality */
@@ -4857,6 +4919,27 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
 
     if (n == "abs" || n == "clone" || n == "deepclone")
         return arg(0);
+    /* box(v) (plans/class-and-box.md, step 3): a box<T> of a bool, an
+     * int, a float, a str or a struct value; a reference - an array, a
+     * dict, a function, a class instance, a box - is returned as it is.
+     * A possibly-none argument is the check pass's error (check_box_call). */
+    if (n == "box") {
+        StaticTypeRef t = static_type_resolve(arg(0));
+        if (is_unknown(t) || is_none(t)) return bottom;     /* defer */
+        if (is_dyn(t)) return A.dyn_ty();
+        StaticTypeRef s = strip(t);
+        switch (s->kind) {
+        case StaticTypeKind::Bool: case StaticTypeKind::Int:
+        case StaticTypeKind::Float: case StaticTypeKind::Str:
+            return A.box_of(s);
+        case StaticTypeKind::Struct: {
+            const auto *d = static_cast<const StructTypeDef *>(s->struct_def);
+            return d && d->is_class ? s : A.box_of(s);
+        }
+        default:
+            return s;
+        }
+    }
     /* dynarray(a) -> array<dyn>: a polymorphic (general) copy. Typed array<dyn>
      * (not bare dyn) so plain `var d = dynarray(a)` is accepted under the
      * tolerant-array rule and d is built/typed general. */
@@ -5479,7 +5562,9 @@ void Inferencer::check_compound_op(Op op, StaticTypeRef l, StaticTypeRef r,
     if (!is_dyn(ls) && !is_dyn(rs) && is_dyn(res))
         mismatch("operator does not apply to '" +
             static_type_to_string(l) +
-                     "' and '" + static_type_to_string(r) + "'",
+                     "' and '" + static_type_to_string(r) + "'" +
+                     (rs->kind == StaticTypeKind::Box ? box_use_hint(r, rv)
+                                                      : box_use_hint(l, lv)),
                  at->start, at->end);
 }
 
@@ -5737,7 +5822,7 @@ StaticTypeRef Inferencer::declared_type_of(Construct *e)
     case ConstructType::member: {
         auto *m = static_cast<MemberExpr *>(e);
         const StaticTypeRef bt =
-            strip(static_type_resolve(type_of(m->what.get())));
+            strip(member_base(static_type_resolve(type_of(m->what.get()))));
         if (bt->kind != StaticTypeKind::Struct || !bt->struct_def)
             return nullptr;
         const auto *def = static_cast<const StructTypeDef *>(bt->struct_def);
@@ -5756,9 +5841,65 @@ StaticTypeRef Inferencer::declared_type_of(Construct *e)
             return static_type_resolve(d->val);
         return nullptr;
     }
+    case ConstructType::deref: {
+        /* a box's element type is fixed when the box is made */
+        const StaticTypeRef bt = strip(static_type_resolve(
+            type_of(static_cast<DerefExpr *>(e)->elem.get())));
+        if (bt->kind != StaticTypeKind::Box || !bt->elem)
+            return nullptr;
+        const StaticTypeRef el = static_type_resolve(bt->elem);
+        return is_dyn(el) ? nullptr : el;
+    }
     default:
         return nullptr;
     }
+}
+
+StaticTypeRef Inferencer::member_base(StaticTypeRef t)
+{
+    if (!t || t->kind != StaticTypeKind::Box || !t->elem)
+        return t;
+    const StaticTypeRef el = static_type_resolve(t->elem);
+    return el->kind == StaticTypeKind::Struct ? A.with_opt(el, t->opt) : t;
+}
+
+std::string Inferencer::box_use_hint(StaticTypeRef t, const Construct *e)
+{
+    t = strip(static_type_resolve(t));
+    if (!t || t->kind != StaticTypeKind::Box)
+        return "";
+    if (e && e->is_id()) {
+        const std::string nm(static_cast<const Identifier *>(e)->uid->val);
+        return " ('" + nm + "' is a box: read its value with *" + nm + ")";
+    }
+    return " (a box: read its value with '*')";
+}
+
+/* `*b`: the base must be a non-opt box (or a dyn, checked at run time) */
+void Inferencer::check_deref(DerefExpr *d)
+{
+    check(d->elem.get());
+    StaticTypeRef t = type_of(d->elem.get());
+    require_nonopt(t, d->elem->start, d->elem->end, "with '*'");
+    StaticTypeRef s = strip(static_type_resolve(t));
+    if (!is_dyn(s) && !is_unknown(s) && s->kind != StaticTypeKind::Box)
+        mismatch("'*' needs a box, not '" + static_type_to_string(t) +
+                     "' (box(v) makes one)",
+                 d->start, d->end);
+}
+
+/* box(v): `v` may not be none - box the value it holds */
+void Inferencer::check_box_call(CallExpr *call)
+{
+    ExprList *al = call->args.get();
+    if (!al || al->elems.size() != 1)
+        return;                         /* the arity is a run-time error */
+    Construct *a = al->elems[0].get();
+    if (is_optish(type_of(a)))
+        nullability("box() of a possibly-none value (type '" +
+                        static_type_to_string(type_of(a)) +
+                        "'): box the value it holds",
+                    a->start, a->end);
 }
 
 /*
@@ -5892,6 +6033,29 @@ void Inferencer::check_declared_store(Expr14 *e)
 {
     Construct *lv = e->lvalue.get();
     std::string field;
+    if (ctag(lv) == ConstructType::deref) {
+        /* `*b = v` / `*b OP= v`: v must fit the box's element type */
+        const StaticTypeRef dest = declared_type_of(lv);
+        if (!dest)
+            return;
+        StaticTypeRef vt = e->op == Op::assign
+            ? type_of(e->rvalue.get())
+            : binop_result(compound_binop(e->op), type_of(lv),
+                           type_of(e->rvalue.get()));
+        vt = static_type_resolve(vt);
+        if (is_dyn(vt) || has_unknown(vt))
+            return;
+        const std::string what =
+            "a box<" + static_type_to_string(dest) + ">";
+        if (is_optish(vt))
+            nullability(what + " cannot hold none", e->rvalue->start,
+                        e->rvalue->end);
+        if (!static_type_assignable(strip(vt), dest))
+            mismatch(what + " cannot hold '" + static_type_to_string(vt) +
+                         "'" + box_use_hint(vt, e->rvalue.get()),
+                     e->rvalue->start, e->rvalue->end);
+        return;
+    }
     if (ctag(lv) == ConstructType::member)
         field = static_cast<MemberExpr *>(lv)->memUid->val;
     else if (ctag(lv) != ConstructType::subscript
@@ -6152,7 +6316,12 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
                 /* binop_result returns dyn for an invalid combination */
                 mismatch("operator does not apply to '" +
                     static_type_to_string(left) +
-                             "' and '" + static_type_to_string(right) + "'",
+                             "' and '" + static_type_to_string(right) + "'" +
+                             (r->kind == StaticTypeKind::Box
+                                  ? box_use_hint(r, rnode)
+                                  : box_use_hint(l, i == 1
+                                        ? mo->elems[0].second.get()
+                                        : nullptr)),
                          mo->start, rnode->end);
             }
         }
@@ -6253,6 +6422,7 @@ static const char *static_type_kind_string(StaticTypeRef t)
                 static_type_resolve(t)->struct_def);
             return d && d->is_class ? "class" : "struct";
         }
+        case StaticTypeKind::Box:       return "box";
         default:                 return "dyn";   /* Dyn / Unknown */
     }
 }
@@ -6368,14 +6538,27 @@ bool Inferencer::fold_type_query(CallExpr *call)
 void Inferencer::check_const_param_store(const Construct *target)
 {
     const Construct *t = target;
-    bool through_member = false;
-    while (ctag(t) == ConstructType::member) {
-        const Construct *base = static_cast<const MemberExpr *>(t)->what.get();
-        StaticTypeRef bt = static_type_resolve(type_of(base));
-        if (!bt || bt->kind != StaticTypeKind::Struct)
-            return;
-        through_member = true;
-        t = base;
+    bool through_member = false, through_box = false;
+    for (;;) {
+        if (ctag(t) == ConstructType::member) {
+            const Construct *base =
+                static_cast<const MemberExpr *>(t)->what.get();
+            StaticTypeRef bt = static_type_resolve(type_of(base));
+            through_box = bt && bt->kind == StaticTypeKind::Box;
+            bt = member_base(bt);
+            if (!bt || bt->kind != StaticTypeKind::Struct)
+                return;
+            through_member = true;
+            t = base;
+            continue;
+        }
+        if (ctag(t) == ConstructType::deref) {
+            /* `*b = v`: the box a const parameter holds */
+            through_member = through_box = true;
+            t = static_cast<const DerefExpr *>(t)->elem.get();
+            continue;
+        }
+        break;
     }
     if (!through_member || ctag(t) != ConstructType::id
             || capture_uses.count(t))
@@ -6383,9 +6566,14 @@ void Inferencer::check_const_param_store(const Construct *target)
     auto it = id_sym.find(t);
     if (it == id_sym.end() || !it->second || !it->second->const_param)
         return;
-    mismatch("cannot change a field of '" +
-                 std::string(static_cast<const Identifier *>(t)->uid->val) +
-                 "': a const parameter's struct is read-only",
+    const std::string nm(static_cast<const Identifier *>(t)->uid->val);
+    if (ctag(target) == ConstructType::deref
+            && t == static_cast<const DerefExpr *>(target)->elem.get())
+        mismatch("cannot change the value of '" + nm +
+                     "': a const parameter's box is read-only",
+                 target->start, target->end);
+    mismatch("cannot change a field of '" + nm + "': a const parameter's " +
+                 (through_box ? "box" : "struct") + " is read-only",
              target->start, target->end);
 }
 
@@ -6470,8 +6658,9 @@ void Inferencer::check(Construct *n)
             StaticTypeRef u = strip(static_type_resolve(t));
             if (!is_dyn(u) && !is_unknown(u) && !is_num(u))
                 mismatch("unary +/- needs a number, got '" +
-                    static_type_to_string(t) +
-                             "'", n->start, n->end);
+                    static_type_to_string(t) + "'" +
+                    box_use_hint(t, e2->elems[0].second.get()),
+                    n->start, n->end);
         } else if (op == Op::bnot) {
             StaticTypeRef t = type_of(e2->elems[0].second.get());
             require_nonopt(t, n->start, n->end, "with a unary ~");
@@ -6551,7 +6740,7 @@ void Inferencer::check(Construct *n)
         if (!mem->optional)
             require_nonopt(w, mem->what->start, mem->what->end,
                            "as a member-access base");
-        StaticTypeRef wr = strip(static_type_resolve(w));
+        StaticTypeRef wr = strip(member_base(static_type_resolve(w)));
 
         /* struct instance base: validate the field/const exists. */
         if (wr->kind == StaticTypeKind::Struct) {
@@ -6582,16 +6771,23 @@ void Inferencer::check(Construct *n)
         return;
     }
 
+    if (ctag(n) == ConstructType::deref) {
+        check_deref(static_cast<DerefExpr *>(n));
+        return;
+    }
+
     if (ctag(n) == ConstructType::incdec) {
         auto *idc = static_cast<IncDecExpr *>(n);
         check(idc->lvalue.get());
         Construct *opnd = idc->lvalue.get();
 
-        /* the operand must be an lvalue: a variable, an array element, or a
-         * struct field (not a literal, an expression, or a call result). */
+        /* the operand must be an lvalue: a variable, an array element, a
+         * struct field or a box's value (not a literal, an expression, or
+         * a call result). */
         auto *id = dynamic_cast<Identifier *>(opnd);
         if (!id && ctag(opnd) != ConstructType::subscript
-                && ctag(opnd) != ConstructType::member) {
+                && ctag(opnd) != ConstructType::member
+                && ctag(opnd) != ConstructType::deref) {
             mismatch("'++'/'--' needs a variable, array element, or field",
                      idc->start, idc->end);
             return;
@@ -6617,7 +6813,14 @@ void Inferencer::check(Construct *n)
                 && ts->kind != StaticTypeKind::Int && ts->kind !=
                     StaticTypeKind::Float)
             mismatch("'++'/'--' requires an int or float, got '" +
-                         static_type_to_string(t) + "'",
+                         static_type_to_string(t) + "'" +
+                         (ts->kind == StaticTypeKind::Box && opnd->is_id()
+                              ? " (write (*" + std::string(
+                                    static_cast<Identifier *>(opnd)
+                                        ->uid->val) + ")" +
+                                    (idc->is_inc ? "++" : "--") +
+                                    " for its value)"
+                              : std::string()),
                      opnd->start, opnd->end);
         return;
     }
@@ -6810,6 +7013,8 @@ void Inferencer::check_call(CallExpr *call)
             return;                       /* dyn callee: no checks */
         } else if (!s && is_builtin(cid->uid)) {
             check_builtin_store(call);
+            if (cid->uid->val == std::string_view("box"))
+                check_box_call(call);
             return;                       /* builtin arity checked at runtime */
         } else if (s) {
             mismatch("'" + std::string(cid->uid->val) +
@@ -6913,7 +7118,8 @@ void Inferencer::check_call(CallExpr *call)
             mismatch("argument " + std::to_string(i + 1) + " has type '" +
                          static_type_to_string(at) +
                              "' but the parameter is '" +
-                         static_type_to_string(ptype) + "'",
+                         static_type_to_string(ptype) + "'" +
+                         box_use_hint(at, anode),
                      anode->start, anode->end);
     }
 }
@@ -7068,6 +7274,11 @@ static void specialize_children(Construct *n, int *fsize)
         m->what = specialize(std::move(m->what), fsize);
         return;
     }
+    if (ctag(n) == ConstructType::deref) {
+        auto *d = static_cast<DerefExpr *>(n);
+        d->elem = specialize(std::move(d->elem), fsize);
+        return;
+    }
     if (ctag(n) == ConstructType::subscript) {
         auto *s = static_cast<Subscript *>(n);
         s->what = specialize(std::move(s->what), fsize);
@@ -7198,6 +7409,9 @@ static const UniqueId *fr_base_id(const Construct *lv)
             auto *m = static_cast<const MemberExpr *>(lv);
             lv = m->what.get(); continue;
         }
+        if (ctag(lv) == ConstructType::deref) {
+            lv = static_cast<const DerefExpr *>(lv)->elem.get(); continue;
+        }
         return nullptr;
     }
     return nullptr;
@@ -7325,9 +7539,10 @@ static bool fr_member_of_value(const MemberExpr *m)
 static bool fr_store_reaches_shared(const Construct *lv)
 {
     while (lv) {
-        if (ctag(lv) == ConstructType::subscript)
+        if (ctag(lv) == ConstructType::subscript
+                || ctag(lv) == ConstructType::deref)
             return true;     /* into an array or a dict (a string is never
-                                stored into) */
+                                stored into), or into a box */
         if (ctag(lv) == ConstructType::member) {
             auto *m = static_cast<const MemberExpr *>(lv);
             if (!fr_member_of_value(m))

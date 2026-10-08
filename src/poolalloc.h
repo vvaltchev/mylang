@@ -111,7 +111,7 @@ inline void pool_free_one(void *p, size_t size) noexcept
  * can. Outside INT_TESTS the counted form IS the plain one.
  */
 enum IntObjKind { IOK_STR, IOK_ARR, IOK_DICT, IOK_STRUCT, IOK_FUNC, IOK_EXC,
-                  IOK_N };
+                  IOK_BOX, IOK_N };
 #ifdef INT_TESTS
 extern long long g_int_live[IOK_N];
 #define ML_POOL_NEW_DELETE_K(kind)                                             \
