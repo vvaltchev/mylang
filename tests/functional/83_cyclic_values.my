@@ -1,6 +1,6 @@
 # Values that contain themselves (README, *Values that contain
-# themselves*; plans/reference-cycles.md, Part A). Arrays, dicts and boxed
-# structs are references, so `append(a, a)` builds an array that holds
+# themselves*; plans/reference-cycles.md, Part A). Arrays, dicts and class
+# instances are references, so `append(a, a)` builds an array that holds
 # itself, and every walk over such a value must terminate - printing,
 # `==`, `hash`, a dict key, a deep copy, a constant's value. Each of them
 # overflowed the C stack before (a SIGSEGV in a release build).
@@ -137,9 +137,30 @@ var refused = 0;
 try { sort([a, b]); } catch (TypeErrorEx) { refused += 1; }
 assert(refused == 1);
 
+# 9. a CLASS ring: a class's fields are printed and deep-copied through
+#    the same guard; == and hash are its identity, never a walk
+class CNode { int v; opt CNode next; array kids; }
+var cr = CNode(int(runtime(1)), none, []);
+cr.next = cr;
+append(cr.kids, cr);
+assert(str(cr) == "CNode(v: 1, next: CNode(...), kids: [CNode(...)])");
+assert(str([cr]) == "[CNode(v: 1, next: CNode(...), kids: [CNode(...)])]");
+var cd = deepclone(cr);
+var cdn = cd.next;
+if (cdn != none)
+    assert(cdn == cd && cd != cr && cd.kids[0] == cd);
+assert(cr == cr && hash(cr) == hash(cr));
+var cm = {};
+cm[cr] = 1;
+assert(cm[cr] == 1 && len(cm) == 1);
+
 print("ok");
 
 # break every cycle the program built (see LEAKS above)
+cr.next = none;
+pop(cr.kids);
+cd.next = none;
+pop(cd.kids);
 pop(a);
 pop(b);
 pop(u);

@@ -265,7 +265,7 @@ Each guard was removed alone on the debug ASan build (the work
 committed first; the file copied aside, restored by a plain copy and a
 touch, rebuilt inside the restore), and the same checks were run again
 afterwards as a CONTROL - every control passed. The checks:
-`81_cyclic_values.my` under `-tw` and the default engine, the `-rt`
+`83_cyclic_values.my` under `-tw` and the default engine, the `-rt`
 cases matching `cycle|contains itself|myv: a constant` (in all five
 modes), and `driver_checks` for the writer.
 

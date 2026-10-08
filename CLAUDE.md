@@ -6559,8 +6559,9 @@ are unchanged.
   so folding it would only bloat the tree.)
 - **⛔ EVERY RECURSIVE WALK OVER A VALUE GRAPH GOES THROUGH THE CYCLE GUARD,
   `cyclewalk.h` (2026-10-08; README *Values that contain themselves*;
-  plans/reference-cycles.md Part A).** Arrays, dicts and boxed structs are
-  references, so a value can contain itself (`append(a, a)`), and every
+  plans/reference-cycles.md Part A).** Arrays, dicts and class instances
+  are references (and a struct's field may hold one), so a value can
+  contain itself (`append(a, a)`, `n.next = n`), and every
   recursion over one - printing, `==`, `hash`, the deep copies, freezing a
   constant or a dict key, the compiler's walks over a constant's value, the
   `.myv` writer - overflowed the C stack on it (RULE 1: a SIGSEGV in a
@@ -6580,7 +6581,9 @@ are unchanged.
     as before (so a DAG is still copied twice).
   - the answers, one per walk kind: rendering writes `[...]` / `{...}` /
     `Name(...)` (`cyc_render()`); `hash` hashes a back edge as its DEPTH,
-    `cyc_backedge_hash` (`cyc_hash()`); `==` uses the PAIR stack,
+    `cyc_backedge_hash` (`cyc_hash()`) - a CLASS instance hashes and
+    compares by identity before any guard, entering no field, so no
+    cycle passes through one there; `==` uses the PAIR stack,
     `cyc_eq()` - a back edge when the lhs is on it as an lhs or the rhs as
     an rhs, equal iff at the same depth, which is the one rule `hash` can
     agree with; the deep copies (`clone_to_mutable`,
@@ -6617,7 +6620,7 @@ are unchanged.
   in its baseline instead). `DictObject::release_at_exit` exists for that
   drain only. This is a stopgap until plans/reference-cycles.md part B
   (reclaiming cycles) is designed - never a way to make a test pass.
-  Nets: `tests/functional/81_cyclic_values.my`, the `cycle:` `-rt` cases
+  Nets: `tests/functional/83_cyclic_values.my`, the `cycle:` `-rt` cases
   (one pins a non-cyclic value's hash to the pre-guard binary's numbers),
   the `repl:` echo case, `myv_cyclic_const_refused` and `driver_checks`;
   each guard was watched failing with its back-edge check removed (the
