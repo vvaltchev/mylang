@@ -3337,7 +3337,9 @@ Return the active trace categories as a sorted `array<str>`.
 ### Non-const array builtins
 
 #### `append(array, value)`
-Append `value` to the given array.
+Append `value` to the given array, and return the array - an `array<T>`
+like its first argument (`var r = append(a, 4);` then `r[0]` reads `a`'s
+first element: the two name one array).
 
 #### `push(array, value)`
 An alias for `append()`. Useful for symmetry when used with `pop()`.

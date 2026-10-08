@@ -1,0 +1,29 @@
+# The in-place builtins return what they worked on, or whether they did
+# (README): append / push the array, insert / erase a bool - false for a
+# dict key already there / not there. Inference typed all four `none`
+# until 2026-10-08 while the run time held the array or the bool, so
+# typestr(erase(d, k)) read "none" (and "bool" under -nti), and indexing
+# append's result was a bogus NullabilityEx.
+
+var a = [1];
+var r1 = append(a, 2);
+var r2 = push(a, 3);
+assert(typestr(r1) == "array<int>" && typestr(r2) == "array<int>");
+assert(r1 == [1, 2, 3] && r1[2] == 3 && len(r2) == 3);
+
+var d = {"k": 1};
+var e1 = erase(d, "k");
+var e2 = erase(d, "k");
+var i1 = insert(d, "j", 2);
+var i2 = insert(d, "j", 3);
+var i3 = insert(a, 0, 9);
+var e3 = erase(a, 0);
+assert(typestr(e1) == "bool" && typestr(i1) == "bool");
+assert(typestr(i3) == "bool" && typestr(e3) == "bool");
+assert(e1 && !e2 && i1 && !i2 && i3 && e3 && d["j"] == 2);
+
+var dyn da = runtime([1.5]);
+var dyn r3 = append(da, 2.5);
+assert(len(r3) == 2 && r3[1] == 2.5);
+
+print(r1, r2, e1, e2, i1, i2, i3, e3, r3, d);
