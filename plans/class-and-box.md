@@ -232,6 +232,67 @@ InternalErrorEx. Fixed in this step's own commit: the `.myv` writer's
 general-array arm applied a slice's offset twice (latent - no slice
 reaches the writer).
 
+## Step 3 design - `box()` and unary `*`
+
+**Static types.** `box<T>` is a new static kind (`StaticTypeKind::Box`,
+its `elem` the boxed type), written as an annotation like `array<T>`
+(`box<int> b;`, `opt box<P> q;`, a field `box<int> n;`). It is invariant
+(`box<int>` is not a `box<float>`), and a box is never `none` unless
+`opt`. `typestr` / `kindstr`: `box<int>` / `box`.
+
+**`box(v)`** is a run-time builtin - never const-folded, so a compile-time
+pass can neither duplicate nor merge a box's identity, and no box reaches
+a `.myv` constant pool. By the argument's STATIC type:
+- an array, a dict, a function, a class instance or a box: `v` itself
+  (the static type is unchanged);
+- a struct `P`: a `box<P>`;
+- `int` / `float` / `bool` / `str`: a `box<int>` ... `box<str>`;
+- `dyn`: decided by the run-time value the same way, typed `dyn`;
+- a possibly-`none` argument is a compile error (box what it holds).
+
+**Representation.** Two, each reusing what exists:
+- `box<P>` is a `StructObject` flagged `boxed` - a copy of the struct in
+  the one heap object kind classes use. Every reference rule a class has
+  is asked of the OBJECT (`is_ref()`: the def is a class, or it is
+  boxed): `struct_own` writes it in place, `==` and `hash` are identity
+  (an identity number, as for a class), copying a `box<P>` copies the
+  reference, and member access needs nothing new (`b.x`, `b.x = 5`,
+  `b.inner.y++`, `append(b.a, 1)` already work on a `StructObject`).
+  `*b` reads a COPY - an unboxed clone; `*b = q` overwrites the box's
+  fields in place, keeping its identity.
+- `box<int>` / `box<float>` / `box<bool>` / `box<str>` is a new value
+  kind `t_box` (`BoxObj`: a cell, the element kind it was made with, the
+  read-only bit, an identity number). A store through a `dyn` alias is
+  checked against the element kind at run time (an int into a
+  `box<float>` widens, a string into a `box<int>` is a TypeErrorEx), so
+  no typed reader can find a misfit.
+- `print(b)`: `box(5)`, `box(P(x: 1))`. `clone(b)` / `deepclone(b)`: a new
+  box (a new identity) holding a copy.
+
+**Unary `*`** (`DerefExpr`, a location): `*b` reads the boxed value,
+`*b = v` / `*b OP= v` / `(*b)++` / `--*b` write it. The ASSIGNABLE-SHAPE
+rule gains it as a fifth location form. `*` on a non-box static type is a
+compile error; on a `dyn` a run-time check. A box used as its value
+(`b + 1`, `f(b)` into an `int` parameter) is a compile error naming the
+fix ("b is a box<int>; read it with *b"). Precedence: a prefix operator
+(pExpr02), so `*b++` is `*(b++)` - refused on a box with a message naming
+`(*b)++`; `a/*b` opens a block comment exactly as in C.
+
+**Engines.** The tree-walker evaluates `DerefExpr`; the VM has
+`LoadBoxV` (dst = *box) and `StoreBoxV` (*box = value, the value widened
+by the store's `rv_coerce`), and lowers a compound or inc-dec to a load,
+the op and a store with the box held in one temp. The JIT runs the two
+ops as helper calls (inline tiers are step 4). `.myv`: the two opcodes
+are appended (version bump); no value record changes, since no box is
+ever a constant.
+
+**Analyses that must learn it** (each a place a box's sharing is
+visible): the loop transforms (a store through a box, or into a
+`box<P>`'s field, is shared storage - `th_val` false, `alias_content`
+set); the escape analysis and the inliner's write-through rule (`*p = v`
+writes THROUGH `p`); the cycle walks (a `t_box` has one child); the
+constant-identity rules (`box()` is not const).
+
 ## Corrections to plans/struct-value-semantics.md
 
 Its phase-2 paragraph said a class is "never flat in an array" - decided
