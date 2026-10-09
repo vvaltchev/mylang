@@ -8717,6 +8717,15 @@ instrumentation (see `plans/archived/function-templates.md`).
   the bug — and sampling the wrong lane turned a five-minute fix into a long,
   wrong "unreproducible heisenbug" hunt. Grep the FULL log for
   `AddressSanitizer`/`runtime error`/`Assertion`/backtrace frames, per job.
+  **Where the log cannot be fetched** (a cloud session's proxy refuses the
+  log and artifact hosts), read the job's ANNOTATIONS instead:
+  `gh api repos/{owner}/{repo}/check-runs/<job id>/annotations`. Every job
+  adds `.github/problem-matchers.json` after its checkout, so a compiler
+  error or warning (gcc, clang, MSVC, the linker), a sanitizer report and a
+  failed assertion become annotations, and `tests/run` prints an `::error`
+  annotation with the end of each failed test's log (`gh_annotate`). Until
+  2026-10-09 they held only "exit code 1": a Windows build stayed red for
+  five pushes with no way to read why.
 
 - **DO NOT BE LAZY. Do all the work, check everything, do not give up.** Every
   failing lane, every log, the exact SHA, the actual reproduction — not a

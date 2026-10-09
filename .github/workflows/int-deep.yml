@@ -35,6 +35,8 @@ jobs:
     timeout-minutes: 300
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (INT_TESTS, optimized, asserts on)
       run: |
         cmake -S $GITHUB_WORKSPACE -B build-enum -DINT_TESTS=ON \
@@ -61,6 +63,8 @@ jobs:
       CXX: g++-14        # MC/DC (-fcondition-coverage) needs GCC >= 14
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Install GCC 14
       run: sudo apt-get update && sudo apt-get install -y g++-14
     # The Makefile build: int_select reads the objects and their notes

@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (Debug)
       run: |
         cmake -S . -B build -DTESTS=1 -DVM_HARDENING=ON \
@@ -80,6 +82,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (Debug)
       run: |
         cmake -S . -B build -DTESTS=1 -DVM_HARDENING=ON \
@@ -128,6 +132,8 @@ jobs:
     name: disasmcheck (shard ${{matrix.shard}}/3)
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (Debug)
       run: |
         cmake -S . -B build -DTESTS=1 -DVM_HARDENING=ON \
@@ -192,6 +198,8 @@ jobs:
     name: nolowmem (${{matrix.name}})
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build
       run: |
         cmake -S . -B build ${{matrix.cmake}}
@@ -246,6 +254,8 @@ jobs:
     name: spcheck (${{matrix.name}})
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build
       run: |
         cmake -S . -B build ${{matrix.cmake}}
@@ -279,6 +289,8 @@ jobs:
       CXX: g++-14        # MC/DC (-fcondition-coverage) needs GCC >= 14
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Install GCC 14
       run: sudo apt-get update && sudo apt-get install -y g++-14
     - name: Build (INT_TESTS + GCOV)
@@ -333,6 +345,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (INT_TESTS, optimized, asserts on)
       run: |
         cmake -S . -B build-enum -DINT_TESTS=ON \
@@ -387,6 +401,8 @@ jobs:
     name: "myv-fuzz (${{ matrix.name }})"
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build
       run: |
         cmake -S . -B build ${{matrix.cmake}}
@@ -415,6 +431,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (RECYCLE)
       run: |
         cmake -S . -B build -DTESTS=1 -DRECYCLE=ON -DVM_HARDENING=ON \
@@ -446,6 +464,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (GCOV)
       run: |
         cmake -S . -B build -DTESTS=1 -DGCOV=1 -DVM_HARDENING=ON \

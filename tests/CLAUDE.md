@@ -76,6 +76,13 @@ the INT_TESTS section); read those first.
   the single selected test's tool (the Mutation workflow's inputs).
 - The heartbeat line carries each running test's latest output line:
   in a CI log that is the only live view of a long tool.
+- Under GitHub Actions (`GITHUB_ACTIONS=true`) a failed test also prints
+  an `::error` annotation holding the last 30 lines of its log
+  (`gh_annotate`), and every workflow job adds
+  .github/problem-matchers.json, so compiler, sanitizer and assertion
+  lines become annotations too. They are readable through the API
+  (`check-runs/<job id>/annotations`) where the log is not. A new
+  workflow job adds the matcher step right after its checkout.
 - BUILDS are `LANES`: a make or cmake recipe plus an `expect` dict that
   the binary's `mylang -v` must match. Add the expectation that would
   catch the wrong binary (int_tests 1 for an INT lane, ...), never an

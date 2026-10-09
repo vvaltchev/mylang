@@ -880,8 +880,10 @@ def report_step(s, out, show_output):
     out.line("%s %-26s %8s  %s" % (out.c("31", "[ FAILED  ]"), s.label,
                                     took, s.why))
     if s.proc is None:          # failed before it ran: the reason is all
+        gh_annotate(out, s, [s.why])
         return
     body = tail_lines(s.logfile, 10 ** 6 if show_output else 40)
+    gh_annotate(out, s, body)
     out.line()
     for l in body:
         out.line("    " + l)
@@ -895,6 +897,43 @@ def report_step(s, out, show_output):
             out.line("    %s %s" % ("reproduce:" if i == 0 else
                                     "       or:", r))
     out.line()
+
+
+# what marks a failure in a tool's log: the annotation quotes these lines
+# (with the lines just above, where -rt names its case), since the end of a
+# log is often a summary written well after the case that failed
+FAIL_MARK = re.compile(r"\[ FAIL|\bFAIL\b|FAILED|DIFF |CRASH |REFUSED |"
+                       r"Assertion|runtime error:|ERROR: |terminate called|"
+                       r"census LEAK|Segmentation fault|Aborted|uncovered "
+                       r"elements|owns no element")
+
+
+def gh_annotate(out, s, body):
+    """Under GitHub Actions, a failure is also an `::error` annotation: it
+    shows on the run's summary page and through the API (check-run
+    annotations), which is readable where the run's log is not. It quotes
+    every failure-marked line of the log with two lines of context, then
+    the log's last lines."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    def esc(t, prop=False):
+        t = t.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        return t.replace(":", "%3A").replace(",", "%2C") if prop else t
+    log = tail_lines(s.logfile, 10 ** 6) if s.logfile else []
+    keep = []
+    for i, l in enumerate(log):
+        if FAIL_MARK.search(l):
+            keep.extend(range(max(0, i - 2), i + 1))
+    marked, seen = [], set()
+    for i in keep:
+        if i not in seen and len(marked) < 40:
+            seen.add(i)
+            marked.append(log[i][:300])
+    tail = [l[:300] for l in body if l.strip()][-15:]
+    text = "\n".join(marked + (["..."] if marked else []) + tail)
+    out.line("::error title=%s::%s" % (esc("tests/run: %s failed" % s.label,
+                                           True),
+                                       esc(text or s.why)))
 
 
 # ------------------------------------------------------------ the CLI --

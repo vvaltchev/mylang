@@ -1,0 +1,98 @@
+{
+  "problemMatcher": [
+    {
+      "owner": "mylang-msvc",
+      "pattern": [
+        {
+          "regexp": "^\\s*(?:\\d+>)?([^\\s(][^(]*?)\\((\\d+)(?:,(\\d+))?\\)\\s*:\\s*(?:fatal\\s+)?(error|warning)\\s+([A-Za-z]+\\d+)\\s*:\\s*(.*?)(?:\\s+\\[[^\\]]+\\])?$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "code": 5,
+          "message": 6
+        }
+      ]
+    },
+    {
+      "owner": "mylang-msvc-link",
+      "pattern": [
+        {
+          "regexp": "^\\s*(?:\\d+>)?(\\S+\\s*:\\s*(?:fatal\\s+)?error\\s+LNK\\d+\\s*:.*?)(?:\\s+\\[[^\\]]+\\])?$",
+          "message": 1
+        }
+      ],
+      "severity": "error"
+    },
+    {
+      "owner": "mylang-gcc",
+      "pattern": [
+        {
+          "regexp": "^\\s*([^\\s:][^:]*):(\\d+):(\\d+):\\s+(?:fatal\\s+)?(error|warning):\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      ]
+    },
+    {
+      "owner": "mylang-ld",
+      "severity": "error",
+      "pattern": [
+        {
+          "regexp": "^\\s*(\\S*\\bld(?:\\.\\w+)?:\\s.*(?:undefined reference|cannot find|multiple definition|undefined symbol).*)$",
+          "message": 1
+        }
+      ]
+    },
+    {
+      "owner": "mylang-ubsan",
+      "severity": "error",
+      "pattern": [
+        {
+          "regexp": "^\\s*([^\\s:][^:]*):(\\d+):(\\d+):\\s+runtime error:\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "message": 4
+        }
+      ]
+    },
+    {
+      "owner": "mylang-asan",
+      "severity": "error",
+      "pattern": [
+        {
+          "regexp": "^\\s*==\\d+==\\s*ERROR:\\s+(\\w+Sanitizer:.*)$",
+          "message": 1
+        }
+      ]
+    },
+    {
+      "owner": "mylang-assert",
+      "severity": "error",
+      "pattern": [
+        {
+          "regexp": "^\\s*\\S+:\\s+([^\\s:][^:]*):(\\d+):\\s+(.*Assertion .* failed\\.)$",
+          "file": 1,
+          "line": 2,
+          "message": 3
+        }
+      ]
+    },
+    {
+      "owner": "mylang-msvc-assert",
+      "severity": "error",
+      "pattern": [
+        {
+          "regexp": "^\\s*(Assertion failed:.*), file (.+), line (\\d+)\\s*$",
+          "message": 1,
+          "file": 2,
+          "line": 3
+        }
+      ]
+    }
+  ]
+}
