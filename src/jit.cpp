@@ -21298,10 +21298,17 @@ static void emit_reg_shift(Emitter &e, const Chunk &ck, Op aop, uint8_t val,
     }
     const size_t jdone = e.jmp32();
     e.patch32_here(js);
-    emit_raise_convey(e, ck, JR_NEG_SHIFT, pc, old_pc);  /* negative count:
-                                                          * CONVEY InvalidValue
-                                                          * with the op's own
-                                                          * caret (deletable) */
+    {
+        /* negative count: CONVEY InvalidValue with the op's own caret
+         * (deletable). The raise arm leaves the op, so it first ends
+         * any borrow open on this path, as raise_convey_unless does:
+         * the generic IntBin's count BORROWS a pinned rcx (hold with
+         * CAP_SHIFT_CNT), and a helper call with that borrow open saved
+         * the COUNT as the pinned local, which the exit flush then
+         * wrote into the local's slot. */
+        Emitter::BorrowSuspend bs(e);
+        emit_raise_convey(e, ck, JR_NEG_SHIFT, pc, old_pc);
+    }
     e.patch32_here(jl);
     /* shl/sar/shr val,cl */
     e.wrote(val);
