@@ -21352,6 +21352,21 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* "read its value with *b" only where reading it fixes the error:
+     * a box<int> passed for a box<float> or a box<str> for an int is not
+     * fixed by `*` (the message said so); a box<int> for an int is */
+    { "box: the '*' hint only where the box's value fits",
+      { { "func bfl(box<float> b) { return *b; }", "" },
+        { "bfl(box(1))", "the parameter is 'box<float>' at line" },
+        { "func bin(int n) { return n; }", "" },
+        { "var bb = box(2)", "" },
+        { "bin(bb)",
+          "'int' ('bb' is a box: read its value with *bb) at line" },
+        { "var bs = box(\"s\")", "" },
+        { "bin(bs)", "the parameter is 'int' at line" },
+        { "var bf = box(1.5)", "" },
+        { "*bb = bf", "a box<int> cannot hold 'box<float>' at line" } } },
+
     /* a box across inputs: a later input writes the box an earlier one
      * made, `*` reads it, :type names its type, a box<P> echoes as one */
     { "box: across inputs",
