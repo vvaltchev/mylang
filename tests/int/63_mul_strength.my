@@ -1,0 +1,12 @@
+# INT-SOURCE: ../functional/19_mul_strength.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/19_mul_strength.my:
+# The constant-MULTIPLIER strength reduction (#100, div_magic's sibling): `x
+# * 2^k` becomes IntShlRI at the BYTECODE level (specialize_arith_ops), and
+# the JIT emits lea / shl+neg / mov+shl+add/sub for the other planned forms
+# (mul_plan, jit.cpp).
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

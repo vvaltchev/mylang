@@ -1,0 +1,11 @@
+# INT-SOURCE: ../functional/51_struct_foreach_reuse.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/51_struct_foreach_reuse.my:
+# #110: the VM's whole-`p` foreach bind (LoadStructElemV) REUSES the loop
+# variable's StructObject - it copies the next element's bytes over it -
+# whenever nothing but the loop variable holds it.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

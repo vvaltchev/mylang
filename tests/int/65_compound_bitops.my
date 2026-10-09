@@ -1,0 +1,10 @@
+# INT-SOURCE: ../functional/12_compound_bitops.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/12_compound_bitops.my:
+# The compound shift/bitwise assignments (<<= >>= >>>= &= |= ^=) are
+# byte-identical sugar for `x = x OP rhs`.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

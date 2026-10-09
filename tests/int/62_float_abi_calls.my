@@ -1,0 +1,11 @@
+# INT-SOURCE: ../functional/59_float_abi_calls.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/59_float_abi_calls.my:
+# Float ops that CALL C++ or libm with a float argument, in runs that pin
+# float locals: fmod (`%`), pow/sqrt/exp, a compound element `%=` (the store
+# helper takes its value in xmm0) and `/=`.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

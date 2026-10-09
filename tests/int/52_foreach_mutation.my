@@ -1,0 +1,9 @@
+# INT-SOURCE: ../functional/30_foreach_mutation.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/30_foreach_mutation.my:
+# #53: a foreach whose BODY mutates the container it walks.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.
