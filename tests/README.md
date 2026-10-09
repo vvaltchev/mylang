@@ -308,9 +308,11 @@ with that seed:
 
     $ tests/nested_fuzz --mylang build-tests/dbg/mylang --seed 1234
 
-A .myv finding cannot be regenerated from a seed (an image contains its
-source path), so myv_fuzz saves every crashing image instead; run the
-saved file directly.
+An image contains its source path, so myv_fuzz saves every crashing
+image; run the saved file directly. A seed still replays a finding when
+tests/run runs the fuzzer (with TMPDIR unset) on a build of the same
+commit: the temporary paths then have the same length, so every mutation
+lands at the same offset.
 
 Intrusive tests
 

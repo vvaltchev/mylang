@@ -341,7 +341,8 @@ def catalog():
         desc="a forced frame rebuild at each call changes nothing")
 
     # fuzz: a fresh seed every run, printed in the reproduce line; a
-    # finding is saved beside the logs (a .myv one cannot be regenerated)
+    # finding is saved beside the logs (a .myv one replays from its seed
+    # only here, on a build of the same commit: the temp paths' lengths)
     add("nested_fuzz", "fuzz", "med", "dbg", 90,
         lambda c: [T("nested_fuzz"), "--mylang", c.b, "--count", "250",
                    "--seed", str(c.seed), "--jobs", str(c.share)],

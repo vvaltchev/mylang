@@ -408,8 +408,9 @@ jobs:
         cmake -S . -B build ${{matrix.cmake}}
         cmake --build build -j
 
-    # A finding cannot be regenerated from a seed - an image embeds its
-    # source path - so it is saved in test-logs/, uploaded on failure.
+    # A finding is saved in test-logs/, uploaded on failure: an image
+    # embeds its source path. The seed replays it too, through tests/run
+    # on a build of the same commit (tests/CLAUDE.md says how).
     - name: tests/run
       run: tests/run -o --logs test-logs --seed ${{github.run_id}}
            --bin ${{matrix.lane}}=build/mylang myv_fuzz@${{matrix.lane}}

@@ -91,6 +91,11 @@ struct MyvSourceRef {
     uint64_t size = 0;   /* the source's byte size (a free pre-check) */
 };
 
+/* Read a whole file into `out`; false if it cannot be opened OR read (a
+ * directory opens on POSIX and then fails every read). The script driver
+ * reads its script through it too. */
+bool read_file(const std::string &path, std::string &out);
+
 /* Build the reference for `path` (reads the file to CRC it). A missing /
  * unreadable file yields an EMPTY reference (`abs` empty) - the caller has
  * already read the source, so this cannot normally fail. */
