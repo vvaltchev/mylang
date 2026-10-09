@@ -1,0 +1,361 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): struct and class values at run time (README.md's
+# "Value semantics" and "Classes"): construction from dyn arguments and
+# a bool that widens into a numeric field, a literal of structs rebuilt
+# in a loop over a slot holding a const, a slice or another length, the
+# construct-in-place append `append(arr, P(...))` (vm_emplace_struct) into
+# every kind of holder, stores, compound stores and ++ / -- through
+# access chains of POD and boxed structs, classes, flat struct arrays and
+# dicts - typed and through `dyn` - with the errors README names, a store
+# through a value, a dict with a default, a constant class instance, and
+# reading the fields of a struct array that an insert promoted to general
+# storage (general_struct_field), with foreach bodies of every shape the
+# direct field read must accept or refuse.
+
+struct P { int x; float y; }
+struct F { int i; float f; bool b; }
+struct Box { array<P> ps; array<int> xs; dyn tag; }
+struct Holder { Box box; int n; }
+struct In { int a; float b; }
+struct Out { In in1; int k; }
+struct Row { array<Out> outs; dict<str, int> d; }
+struct A { int x; float y; bool b; }
+class C { int v; array<int> xs; }
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad = bad + 1;
+    }
+}
+
+func outcome(dyn f) {
+    try {
+        f();
+        return "ok";
+    } catch (NotLValueEx) {
+        return "NotLValueEx";
+    } catch (TypeErrorEx) {
+        return "TypeErrorEx";
+    } catch (OutOfBoundsEx) {
+        return "OutOfBoundsEx";
+    } catch (CannotChangeConstEx) {
+        return "CannotChangeConstEx";
+    } catch (KeyNotFoundEx) {
+        return "KeyNotFoundEx";
+    } catch (InvalidArgumentEx) {
+        return "InvalidArgumentEx";
+    }
+    return "unreachable";
+}
+
+var dyn d1 = runtime(1);
+var dyn d2 = runtime(2.5);
+var dyn dt = runtime(true);
+var dyn dstr = runtime("s");
+
+# --- construction: dyn arguments, a loop that rebuilds the same slot, a
+# bool widening into an int and a float field
+var acc = 0.0;
+for (var i = 0; i < 3; i++) {
+    var p = P(d1, d2);
+    p.x += i;
+    acc += p.x + p.y;
+}
+want("ctor loop", acc, 13.5);
+var fb = F(dt, dt, dt);
+want("ctor bool widen", [fb.i, fb.f, fb.b], [1, 1.0, true]);
+var fb2 = F(true, false, true);
+want("ctor bool typed", [fb2.i, fb2.f, fb2.b], [1, 0.0, true]);
+want("ctor pod misfit", outcome(func [dstr] () { var q = P(dstr, 1.0); }),
+     "TypeErrorEx");
+
+# --- an array literal of struct values rebuilt in a loop: the slot it
+# replaces may hold a const, a slice or an array of another length
+const KPS = [P(9, 9.0), P(9, 9.0)];
+var big = [P(5, 5.0), P(6, 6.0), P(7, 7.0)];
+var lsum = 0.0;
+var lit = KPS;
+var lsl = big[0:2];
+var lone = [P(0, 0.0)];
+for (var i = 0; i < 3; i++) {
+    lit = [P(i, d2), P(d1, 0.5)];
+    lsl = [P(i, d2), P(d1, 0.5)];
+    lone = [P(i, d2), P(d1, 0.5)];
+    lsum += lit[0].x + lsl[1].y + lone[0].y + lone[1].x;
+}
+want("literal rebuilt", [lsum, len(lone), KPS[0].x, big[0].x],
+     [15.0, 2, 9, 5]);
+var many = [P(d1, d2), P(d1, d2), P(d1, d2), P(d1, d2), P(d1, d2),
+            P(d1, d2), P(d1, d2), P(d1, d2), P(d1, d2), P(d1, d2),
+            P(d1, d2), P(d1, d2), P(d1, d2), P(d1, d2), P(d1, d2),
+            P(d1, d2), P(2, d2)];
+want("literal of 17 structs", [len(many), many[16].x, many[3].y],
+     [17, 2, 2.5]);
+
+# --- append(arr, P(...)): built in place into a flat array of P; any
+# other holder takes the value, or refuses it
+var ps = [P(0, 0.0)];
+append(ps, P(d1, d2));
+want("emplace flat", [len(ps), ps[1].x, ps[1].y], [2, 1, 2.5]);
+var dyn dps = ps;
+append(dps, P(2, 3.5));
+want("emplace dyn alias", [len(ps), ps[2].x], [3, 2]);
+var dyn psl = ps[0:2];
+append(psl, P(9, 9.5));
+want("emplace slice", [len(psl), psl[2].x, len(ps)], [3, 9, 3]);
+var dyn gen = runtime([]);
+append(gen, P(4, 4.5));
+want("emplace general", gen[0].x, 4);
+var sarr = split("a", " ");
+var dyn dsarr = sarr;
+append(dsarr, P(5, 5.5));
+want("emplace strs", [array_storage(sarr), dsarr[1].x], ["general", 5]);
+var carr = [C(1, [])];
+var dyn dcarr = carr;
+append(dcarr, P(6, 6.5));
+want("emplace class", [array_storage(carr), dcarr[1].x], ["general", 6]);
+var iarr = [1];
+var dyn diarr = iarr;
+want("emplace ints", outcome(func [diarr] () { append(diarr, P(7, 7.5)); }),
+     "TypeErrorEx");
+var dyn dnum = runtime(5);
+want("emplace non-array", outcome(func [dnum] () { append(dnum, P(7, 7.5)); }),
+     "TypeErrorEx");
+const KP = [P(1, 1.5)];
+var dyn dkp = runtime(KP);
+want("emplace const", outcome(func [dkp] () { append(dkp, P(7, 7.5)); }),
+     "CannotChangeConstEx");
+want("emplace misfit",
+     outcome(func [dps, dstr] () { append(dps, P(dstr, 1.0)); }),
+     "TypeErrorEx");
+want("emplace misfit left it", len(ps), 3);
+var bx = Box([P(1, 1.0)], [1], d1);
+append(bx.ps, P(2, 2.0));
+var hd = Holder(bx, 0);
+append(hd.box.ps, P(3, 3.0));
+want("emplace chain", [len(bx.ps), len(hd.box.ps)], [3, 3]);
+var pss = [[P(1, 1.0)], [P(2, 2.0)]];
+append(pss[1], P(3, 3.0));
+want("emplace element", [len(pss[0]), len(pss[1]), pss[1][1].x], [1, 2, 3]);
+func same(dyn a) => a;
+append(same(ps), P(8, 8.5));
+want("emplace through a value", [len(ps), ps[3].x], [4, 8]);
+
+# --- stores through chains: each step a member of a POD / boxed struct, a
+# class, an element of a flat struct array, a general array or a dict;
+# then =, OP=, ++ / -- and an in-place builtin at the end
+var o = Out(In(1, 1.5), 2);
+o.in1.a = 5;
+o.in1.b += 1;
+o.in1.a++;
+--o.k;
+want("pod chain", [o.in1.a, o.in1.b, o.k], [6, 2.5, 1]);
+var outs = [Out(In(1, 0.5), 1), Out(In(2, 0.5), 2)];
+outs[1].in1.a += 10;
+outs[0].in1.b++;
+var oo = outs[1].in1.a--;
+want("flat chain", [outs[0].in1.b, outs[1].in1.a, oo], [1.5, 11, 12]);
+var row = Row(outs, {"k": 1});
+row.outs[0].k = 7;
+row.d.k += 2;
+row.d["k"]++;
+want("boxed chain", [outs[0].k, row.d.k], [7, 4]);
+var dyn drow = row;
+drow.outs[1].in1.b = 9;
+drow.outs[1].in1.a++;
+--drow.outs[0].in1.a;
+drow.d.n = 3;
+drow.d.n *= 2;
+want("dyn chain", [outs[1].in1.b, outs[1].in1.a, outs[0].in1.a, row.d.n],
+     [9.0, 12, 0, 6]);
+func geto() => Out(In(1, 1.0), 1);
+var dyn dout = runtime(Out(In(1, 1.0), 1));
+dout.in1.a += 4;
+dout.in1.b--;
+var dyn dold = dout.in1.a++;
+want("dyn pod chain", [dout.in1.a, dout.in1.b, dold], [6, 0.0, 5]);
+want("dyn pod missing", outcome(func [dout] () { dout.in1.zz = 1; }),
+     "TypeErrorEx");
+want("dyn pod missing inc", outcome(func [dout] () { dout.in1.zz++; }),
+     "TypeErrorEx");
+want("dyn pod subscript", outcome(func [dout] () { dout.in1[0] = 1; }),
+     "TypeErrorEx");
+want("dyn pod misfit", outcome(func [dout, dstr] () { dout.in1.a = dstr; }),
+     "TypeErrorEx");
+want("dyn not a struct", outcome(func [d1] () { d1.x = 1; }), "TypeErrorEx");
+want("dyn not a struct inc", outcome(func [d1] () { d1.x++; }),
+     "TypeErrorEx");
+want("dyn chain oob", outcome(func [drow] () { drow.outs[5].k = 1; }),
+     "OutOfBoundsEx");
+want("dyn chain key", outcome(func [drow, dstr] () { drow.outs[dstr].k++; }),
+     "TypeErrorEx");
+want("append to a pod field",
+     outcome(func [dout] () { append(dout.in1.a, 5); }),
+     "TypeErrorEx");
+want("append to a pod elem field",
+     outcome(func [drow] () { append(drow.outs[0].k, 5); }), "TypeErrorEx");
+var dyn apd = append;
+# (through a dyn callee an int field is refused too; the error class
+# differs from the direct call's - reported separately)
+want("dyn append to a pod field",
+     outcome(func [dout, apd] () { apd(dout.in1.a, 5); }) != "ok", true);
+want("dyn append to a value field",
+     outcome(func [apd] () { apd(geto().in1.a, 5); }) != "ok", true);
+var mrows = [[1], []];
+want("append to a missing row",
+     outcome(func [mrows] () { append(mrows[9], 1); }),
+     "OutOfBoundsEx");
+want("pop an empty row", outcome(func [mrows] () { pop(mrows[1]); }),
+     "OutOfBoundsEx");
+want("sort a missing row", outcome(func [mrows] () { sort(mrows[-3]); }),
+     "OutOfBoundsEx");
+want("dyn chain dict miss", outcome(func [drow] () { drow.d.zz++; }),
+     "KeyNotFoundEx");
+var cl = C(1, [1]);
+var dyn dcl = cl;
+dcl.v++;
+dcl.v += 2;
+append(dcl.xs, 2);
+dcl.xs[0]--;
+want("dyn class", [cl.v, cl.xs], [4, [0, 2]]);
+var cls = [C(1, []), C(2, [])];
+cls[1].v++;
+append(cls[0].xs, 5);
+var dyn dcls = cls;
+dcls[0].v *= 10;
+dcls[1].xs += [7];
+want("class array chain", [cls[0].v, cls[1].v, cls[0].xs, cls[1].xs],
+     [10, 3, [5], [7]]);
+func getc(dyn c) => c;
+getc(cl).v = 40;
+getc(cl).v++;
+append(getc(cl).xs, 3);
+want("class through a value", [cl.v, len(cl.xs)], [41, 3]);
+geto().in1.a = 5;
+geto().in1.a++;
+want("struct through a value", geto().in1.a, 1);
+
+# --- reading the fields of a struct array: flat, and promoted to general
+# storage by an insert (README: storage never changes behavior); a foreach
+# body of each shape (the direct field read is taken only when the body
+# cannot see the loop variable whole or change the array)
+func fsum(dyn arr) {
+    var tot = 0.0;
+    var n = 0;
+    foreach (var p in arr) {
+        tot += p.y;
+        tot += p.x;
+        if (p.b) {
+            n++;
+        }
+    }
+    return [tot, n];
+}
+var fl = [A(1, 0.5, true), A(2, 1.5, false), A(3, 2.5, true)];
+var pr = [A(1, 0.5, true), A(2, 1.5, false), A(3, 2.5, true)];
+insert(pr, 0, A(0, 0.0, false));
+want("storages", [array_storage(fl), array_storage(pr)],
+     ["struct", "general"]);
+want("foreach flat", fsum(fl), [10.5, 2]);
+want("foreach promoted", fsum(pr), [10.5, 2]);
+var ti = 0;
+var tf = 0.0;
+var tb = 0;
+foreach (var p in pr) {
+    ti += p.x;
+    tf += p.y + p.x;
+    if (p.b) { tb++; }
+}
+want("foreach promoted typed", [ti, tf, tb], [6, 10.5, 2]);
+var fi = 0;
+var ff = 0.0;
+var fbn = 0;
+foreach (var p in fl) {
+    fi += p.x;
+    ff += p.y;
+    if (p.b) { fbn++; }
+}
+want("foreach flat typed", [fi, ff, fbn], [6, 4.5, 2]);
+want("subscript reads", [pr[-1].y + 1.0, pr[1].x + pr[2].y, fl[-3].x],
+     [3.5, 2.5, 1.0]);
+want("subscript oob", outcome(func [pr] () { var t = pr[9].x + 1; }),
+     "OutOfBoundsEx");
+want("subscript oob flat", outcome(func [fl] () { var t = fl[-9].y * 2.0; }),
+     "OutOfBoundsEx");
+var shapes = [];
+var k = 0;
+foreach (var p in fl) { var dyn whole = p; k += whole.x; }   # p whole
+append(shapes, k);
+k = 0;
+foreach (var p in fl) { var q = p; q.x++; k += q.x; }   # a copy, written
+append(shapes, k);
+k = 0;
+foreach (var p in fl) {                                 # nested loops
+    var j = 0;
+    while (j < p.x) { j++; }
+    for (var m = 0; m < p.x; m++) { k += 1; }
+    foreach (var e in [p.x]) { k += e; }
+    k += j;
+}
+append(shapes, k);
+k = 0;
+foreach (var p in fl) {                                 # selections
+    k += p.b ? p.x : 0;
+    var opt_v = p.b ? none : p.x;
+    k += opt_v ?? 10;
+}
+append(shapes, k);
+k = 0;
+var arr3 = [5, 6, 7, 8];
+foreach (var p in fl) {                                 # a subscript, a call
+    k += arr3[p.x];
+    k += int(sqrt(float(p.x * p.x)));
+    k += abs(-p.x);
+}
+append(shapes, k);
+k = 0;
+var grown = [];
+foreach (var p in fl) {                                 # mutating builtins
+    append(grown, p.x);
+    arr3[0] += p.x;
+}
+append(shapes, len(grown) + arr3[0]);
+func first_big(dyn arr) {
+    foreach (var p in arr) {
+        if (p.x > 1) { return p.x; }
+    }
+    return -1;
+}
+append(shapes, first_big(fl));
+func sumx(dyn arr) { var t = 0; foreach (var p in arr) { t += p.x; } return t; }
+foreach (var p in fl) { k += sumx(fl); }
+append(shapes, k);
+want("foreach shapes", shapes, [6, 9, 18, 26, 33, 14, 2, 18]);
+
+# --- a dict with a default value: ++ / -- and OP= on a missing key start
+# from the default; a constant class instance refuses every field write
+var dyn cnt = dict(0);
+cnt.a++;
+cnt.b += 2;
+cnt["c"]--;
+--cnt.a;
+want("dict default", [cnt.a, cnt.b, cnt.c], [0, 2, -1]);
+const KCC = C(7, []);
+var dyn dkc = KCC;
+want("const class inc", outcome(func [dkc] () { dkc.v++; }),
+     "CannotChangeConstEx");
+want("const class store", outcome(func [dkc] () { dkc.v = 1; }),
+     "CannotChangeConstEx");
+var kcs = [KCC];
+var dyn dkcs = kcs;
+want("const class element inc", outcome(func [dkcs] () { dkcs[0].v--; }),
+     "CannotChangeConstEx");
+want("const class append", outcome(func [dkc] () { append(dkc.xs, 1); }),
+     "CannotChangeConstEx");
+want("const class intact", [KCC.v, len(KCC.xs)], [7, 0]);
+
+print("struct values: " + str(bad) + " failure(s)");
+assert(bad == 0);
