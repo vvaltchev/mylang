@@ -1,0 +1,47 @@
+# A counted loop whose literal STEP does not fit an imm32. ForLoopStep's
+# pinned-counter arm emitted `add pin, imm32` for a literal step and, for
+# any other literal, fell into its SLOT arm - reading the frame at the
+# step value times the slot size (`add r11, [rbx + ...]`): a SEGV in every
+# build. Each direction, a step exactly one past the imm32 range, and a
+# loop with a dozen live ints, whose counter the allocator puts in rax.
+# corpus_diff --levers runs the program with the `cache` lever off too:
+# the memory-counter arm, which stages a wide literal in a register.
+
+func up(int n) {
+    var c = 0;
+    for (var k = 0; k < 50000000000; k += 7000000000) c += n;
+    return c;
+}
+
+func down(int n) {
+    var c = 0;
+    for (var k = 0; k > -50000000000; k -= 7000000000) c += n;
+    return c;
+}
+
+func edge(int n) {
+    var c = 0;
+    for (var k = 0; k < 10000000000; k += 2147483648) c += n;
+    return c;
+}
+
+func pressed(int n) {
+    var a = 1; var b = 2; var c = 3; var d = 4; var e = 5; var f = 6;
+    var g = 7; var h = 8; var p = 9; var q = 10; var r = 11; var s = 12;
+    for (var k = 0; k < 50000000000; k += 7000000000) {
+        a += n; b += a; c += b; d += c; e += d; f += e;
+        g += f; h += g; p += h; q += p; r += q; s += r;
+    }
+    return a + b + c + d + e + f + g + h + p + q + r + s;
+}
+
+var n = int(runtime(10));
+var u = up(n);
+var w = down(n);
+var x = edge(n);
+var y = pressed(n);
+print(u, w, x, y);
+assert(u == 80);
+assert(w == 80);
+assert(x == 50);
+assert(y == 1612406);

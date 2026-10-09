@@ -17792,3 +17792,30 @@ each reachable decline must be TAKEN, and a shared box<P>'s stores must
 take NO value guard. No corpus program but tests/functional/81, 82 and 84
 uses a class or a box, so every other program's emitted code is unchanged
 by construction; not measured in Ir (nothing in bench/ uses either).
+
+## ForLoopStep: a WIDE literal step on a pinned counter (2026-10-09)
+
+**The bug.** #96 increment 3's pinned-counter arm stepped the pin with
+`inc`/`dec` for a step of 1, `add pin, imm32` for any other literal that
+fits an imm32 - and fell into its SLOT arm for every other literal,
+reading `in.b_slot()` off an operand that is a literal. A loop like
+`for (var k = 0; k < 50000000000; k += 7000000000)` in a function
+emitted `add r11, [rbx + 7000000000 * 48]` (`-vdj` printed it as
+`add r11, r20678144`): a SEGV in every build, debug and release. The
+memory-counter arm stages any literal through `tmp_operand` and was
+right; so are the sibling arms of `emit_branch` (JumpUnlessIntCmp's and
+ForLoopStep's bound, IntAddStep's accumulate and bound - each stages a
+wide literal through `tmp_lit` - and IntAddStep's counter and
+ForStepElemInt, which step by 1).
+
+**The fix.** A literal with no imm32 form is staged through `tmp_lit`,
+and the `PinMach` wraps only the `add`/`sub` that writes the pin -
+IntAddStep's rule, never the staging.
+
+**Nets.** `tests/functional/85_wide_literal_step.my` (both directions, a
+step one past the imm32 range, a counter the allocator puts in rax; the
+`--levers` matrix runs it with `cache` off, the memory arm) and the
+`jit: a counted loop's literal step that does not fit an imm32 ...`
+extra_check, which also requires `g_jit_step_imm` to move - the counter
+the emitted code of the PINNED arms bumps, so an answer from the memory
+arm or the interpreter fails it too.

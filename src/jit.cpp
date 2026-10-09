@@ -29325,7 +29325,18 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
 #ifdef TESTS
             e.bump_counter(&g_jit_step_imm);
 #endif
-            {
+            if (in.b_is_lit() && !lit_step) {
+                /* a literal step with no imm32 form - staged through
+                 * tmp, and the PinMach wraps only the op that writes
+                 * the pin (IntAddStep's rule: never the staging). It
+                 * used to fall into the slot arm below, which read the
+                 * literal as a frame slot - `add r11, [rbx + 7e9 *
+                 * 48]`, a SEGV in every build. */
+                tmp_lit(static_cast<uint64_t>(in.b_lit()),
+                        [&]() { Emitter::PinMach pm(e);
+                                e.op_rr2(up ? Op::plus : Op::minus, r,
+                                         tmp); });
+            } else {
                 /* two-address pin update: the counter steps IN its pin */
                 Emitter::PinMach pm(e);
                 if (lit_step && (in.b_lit() == 1 || in.b_lit() == -1)) {
