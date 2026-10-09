@@ -1,0 +1,9 @@
+# INT-SOURCE: ../functional/82_class_arrays.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): an array<C> holds one reference per element (the
+# flat `class` storage), none a null reference, every op without a flat
+# arm promoting it in place.
+# The functional program runs as a coverage unit too, under the engines
+# above, with no second copy (INT-SOURCE); it asserts its own results and
+# every engine must print the same.

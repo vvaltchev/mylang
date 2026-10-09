@@ -1,0 +1,9 @@
+# INT-SOURCE: ../functional/84_boxes.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): box(v) and unary * - a box of a struct (a
+# box<P>) and of a scalar or string, every holder kind, the JIT runs
+# around the box ops.
+# The functional program runs as a coverage unit too, under the engines
+# above, with no second copy (INT-SOURCE); it asserts its own results and
+# every engine must print the same.
