@@ -30329,6 +30329,74 @@ static bool myv_verify_cross_records()
 }
 
 /*
+ * THE DUMPS OF A CLASS, A BOX AND AN ARGUMENT CHAIN: `-s` renders `*b` as
+ * Deref, and `-vd` names a class def, a box-typed field, `*b` with the box
+ * it was proven to read (each scalar kind, and a box<P>), a store through
+ * `*`, an in-place builtin's chain argument and an indirect call's chain
+ * argument (#32). A dump is an instrument: a row it cannot render is a row
+ * nobody can read.
+ */
+static bool class_box_dumps()
+{
+    const std::string src =
+        "struct P { int x; float y; }\n"
+        "struct In { array<int> xs; }\n"
+        "struct Out { In i; box<int> bb; }\n"
+        "class C { int v; }\n"
+        "var bi = box(1);\n"
+        "var bf = box(1.5);\n"
+        "var bb = box(true);\n"
+        "var bs = box(\"s\");\n"
+        "var bp = box(P(runtime(1), 2.0));\n"
+        "*bi = *bi + 1; *bf = *bf + 0.5; *bb = !*bb; *bs = *bs + \"t\";\n"
+        "*bp = P(3, 4.0);\n"
+        "var o = Out(In([runtime(1)]), box(5));\n"
+        "append(o.i.xs, 2);\n"
+        "var dyn ap = append;\n"
+        "ap(o.i.xs, 3);\n"
+        "var c = C(runtime(1));\n"
+        "print(*bi, *bf, *bb, *bs, (*bp).x, len(o.i.xs), *o.bb, c.v);\n";
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+
+        std::ostringstream ss;
+        root->serialize(ss, 0);
+        if (ss.str().find("Deref(") == std::string::npos) {
+            fprintf(stderr, "class_box_dumps: -s shows no Deref\n");
+            ok = false;
+        }
+
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        const Block *blk = dynamic_cast<const Block *>(root.get());
+        const bool jit_was = g_jit_enabled;
+        g_jit_enabled = false;
+        const std::string dump = blk ? disassemble_program(blk) : "";
+        g_jit_enabled = jit_was;
+        for (const char *need : { "; class C", "box", "load.box",
+                                  "; box<int>", "; box<float>",
+                                  "; box<bool>", "; box<str>", "; box<P>",
+                                  "store.box", "a0 chain of" })
+            if (dump.find(need) == std::string::npos) {
+                fprintf(stderr, "class_box_dumps: -vd has no '%s':\n%s\n",
+                        need, dump.c_str());
+                ok = false;
+                break;
+            }
+    } catch (Exception &e) {
+        fprintf(stderr, "class_box_dumps: threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    return ok;
+}
+
+/*
  * RULE 1: CheckNoneArgsV's two callee kinds - 1, a global slot (before a
  * CallV), and 0, a frame slot (before a CallValueV) - as -vd renders them
  * (`g<n>` vs the slot) and as the image verifier bounds them: a kind other
@@ -32633,6 +32701,155 @@ static bool myv_cyclic_const_refused()
     }
     remove(path.c_str());
     g_exec_engine = saved;
+    return ok;
+}
+
+/*
+ * Compile `src` (the VM, JIT on), and either run it straight or store it as
+ * an image, load the image and run that: the program's stdout, or "threw
+ * <name>". The two runs are separate compiles - vm_compile MOVES the
+ * descriptors out of the tree.
+ */
+static std::string myv_test_stdout(const std::string &src,
+                                   const std::string *image_path)
+{
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    std::string out;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        VmProgram img;
+        VmProgram *run = &prog;
+        if (image_path) {
+            myv_write(prog, *image_path, MyvSourceRef());
+            MyvSource s;
+            img = myv_read(*image_path, s);
+            run = &img;
+        } else {
+            vm_jit_loaded_image(prog);
+        }
+        std::ostringstream cap;
+        std::streambuf *ob = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(*run);
+        } catch (...) {
+            std::cout.rdbuf(ob);
+            throw;
+        }
+        std::cout.rdbuf(ob);
+        out = cap.str();
+    } catch (Exception &e) {
+        out = std::string("threw ") + e.name + ": " + (e.msg ? e.msg : "");
+    }
+    g_exec_engine = saved;
+    return out;
+}
+
+/*
+ * EVERY VALUE KIND A CONSTANT CAN HOLD, through an image (docs/myv-
+ * format.txt, the value records): bools and floats inside a general
+ * array, a flat bool / float / string / struct / class array, a dict with
+ * and without a default, a POD and a boxed struct, a class instance stored
+ * ONCE and referenced after (its identity, and so `==`, survives the
+ * load), a class reached through another's field, and a struct's const
+ * members (read while the struct defs are still shells, so their check
+ * is deferred); and the code the loader's verifier checks for them: an
+ * in-place builtin's and an indirect call's chain argument, `*b` and a
+ * store through it. The image must print what the source prints, and
+ * both what this test says.
+ */
+static bool myv_value_kinds_round_trip()
+{
+    const char *lines_arr[] = {
+        "struct P { int x; float y; bool b; }",
+        "struct Q { int a; array<int> xs; }",
+        "class C { int v; opt C next; }",
+        "struct S { int k; const Z = P(9, 9.5, true);",
+        "           const ZQ = Q(1, [2]); }",
+        "const KB = [true, false, true];",
+        "const KF = [1.5, 2.25];",
+        "const KS = split(\"a b c\", \" \");",
+        "const KD = {\"a\": 1, \"b\": 2};",
+        "const KDD = dict(7);",
+        "const KP = P(1, 2.5, true);",
+        "const KQ = Q(3, [4, 5]);",
+        "const KC = C(7, none);",
+        "const KC2 = C(8, KC);",
+        "const KCC = [KC, KC2, KC];",
+        "const KPS = [P(1, 1.0, true), P(2, 2.0, false)];",
+        "const KMIX = [1, \"x\", 2.5, true, none, [1.5], {\"k\": false}];",
+        "const KQS = [Q(1, [1]), Q(2, [2])];",
+        "print(str(runtime(KB)), str(runtime(KF)), str(runtime(KS)),",
+        "      array_storage(runtime(KS)));",
+        /* a dict's order is unspecified (a loaded one is rebuilt) */
+        "var dyn kd = runtime(KD);",
+        "print(len(kd), kd[\"a\"], kd[\"b\"], runtime(KDD)[\"zz\"]);",
+        "print(str(runtime(KP)), str(runtime(KQ)), str(S.Z), str(S.ZQ));",
+        "var dyn cc = runtime(KCC);",
+        "print(cc[0].v, cc[1].next.v, cc[0] == cc[2], cc[0] == cc[1],",
+        "      cc[1].next == cc[0], array_storage(cc));",
+        "print(str(runtime(KPS)), array_storage(runtime(KPS)));",
+        "print(str(runtime(KMIX)), str(runtime(KQS)));",
+        /* the loader's verifier: an in-place builtin's and an indirect
+         * call's chain argument, and the box ops */
+        "struct In { array<int> xs; }",
+        "struct Out { In i; }",
+        "var o = Out(In([runtime(1)]));",
+        "append(o.i.xs, 2);",
+        "var dyn ap = append;",
+        "ap(o.i.xs, 3);",
+        "var bx = box(1);",
+        "*bx = *bx + 1;",
+        "var bpp = box(KP);",
+        "*bpp = P(5, 5.0, false);",
+        "print(len(o.i.xs), *bx, (*bpp).x);" };
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+    const std::string want =
+        "[true, false, true] [1.500000, 2.250000] [\"a\", \"b\", \"c\"] str \n"
+        "2 1 2 7 \n"
+        "P(x: 1, y: 2.500000, b: true) Q(a: 3, xs: [4, 5]) "
+        "P(x: 9, y: 9.500000, b: true) Q(a: 1, xs: [2]) \n"
+        "7 7 true false true class \n"
+        "[P(x: 1, y: 1.000000, b: true), P(x: 2, y: 2.000000, b: false)] "
+        "struct \n"
+        "[1, \"x\", 2.500000, true, <none>, [1.500000], {\"k\": false}] "
+        "[Q(a: 1, xs: [1]), Q(a: 2, xs: [2])] \n"
+        "3 2 5 \n";
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-kinds.myv";
+
+    const std::string from_src = myv_test_stdout(src, nullptr);
+    const std::string from_img = myv_test_stdout(src, &path);
+    remove(path.c_str());
+    bool ok = true;
+    if (from_src != want) {
+        fprintf(stderr, "myv-kinds: the source printed\n%s\nwanted\n%s\n",
+                from_src.c_str(), want.c_str());
+        ok = false;
+    }
+    if (from_img != from_src) {
+        fprintf(stderr, "myv-kinds: the image printed\n%s\n",
+                from_img.c_str());
+        ok = false;
+    }
     return ok;
 }
 
@@ -54881,6 +55098,8 @@ static const std::vector<extra_check> extra_checks =
     { "myv: RULE 1 - CheckNoneArgsV's two callee kinds render apart in -vd, "
       "and a bad kind, callee slot or run is refused at load",
       none_check_op_static },
+    { "-s / -vd: a class, a box, *b and an argument chain render",
+      class_box_dumps },
     { "myv: #137 - the HANDLER-STACK BALANCE: a PopHandler with nothing "
       "pushed, a join at two depths and a region pushed twice are refused "
       "at load (myv_fuzz fat-486, 2026-09-21)",
@@ -55102,6 +55321,8 @@ static const std::vector<extra_check> extra_checks =
       myv_cyclic_const_refused },
     { "myv: a source path naming a directory is no source, not a crash",
       myv_source_ref_directory },
+    { "myv: every value kind a constant holds survives an image",
+      myv_value_kinds_round_trip },
     { "myv: an UNTRUSTED image's out-of-range field index is caught (#137)",
       myv_untrusted_field_index },
     { "myv: a WRONG-TYPED base does not take the process down (#142)",
