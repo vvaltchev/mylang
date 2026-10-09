@@ -1332,8 +1332,20 @@ sort_arr(EvalContext *ctx, ExprList *exprList, bool reverse)
     return sort_core(ctx, &al, RValue(val0_lval), lval, reverse, rest);
 }
 
-/* `func_lv` entry (VM CallBuiltinLV): arg0's slot LValue* is handed in (never
- * null - CallBuiltinLV fires only for a slotted-id arg0). sort is REST-NATIVE-
+/* arg0's VALUE for a func_lv entry. The target is null exactly when there
+ * is no arg0: an INDIRECT call with no arguments (`var dyn f = sort;
+ * f();` - dispatch_builtin_values and the VM's two dyn-callee sites pass
+ * a null target then, as every func_lv is told to expect). The core's own
+ * arity check then raises the direct call's error; reading the null
+ * target was a null LValue member call (UBSan/ASan, every engine). */
+static inline EvalValue lv_arg0_value(LValue *target)
+{
+    return target ? RValue(EvalValue(target)) : EvalValue();
+}
+
+/* `func_lv` entry (VM CallBuiltinLV, and an indirect call's values
+ * dispatch): arg0's LValue* is handed in - null for an indirect call with
+ * no arguments (lv_arg0_value). sort is REST-NATIVE-
  * CAPABLE: the cmp arg is pre-evaluated in `rest[0]` (n_rest == 1) so sort_core
  * does zero node->eval; a `sort(a)` with no cmp has an empty rest run (n_rest ==
  * 0), which sort_core's no-cmp branch never reads. */
@@ -1341,7 +1353,7 @@ static EvalValue
 sort_lv(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
         const EvalValue *rest, size_t n_rest, bool reverse)
 {
-    return sort_core(ctx, exprList, RValue(EvalValue(target)), target,
+    return sort_core(ctx, exprList, lv_arg0_value(target), target,
                      reverse, rest);
 }
 
@@ -1464,11 +1476,12 @@ EvalValue builtin_reverse(EvalContext *ctx, ExprList *exprList)
     return reverse_arr(ctx, exprList);
 }
 
-/* `func_lv` entry (VM CallBuiltinLV): arg0's slot LValue* handed in. */
+/* `func_lv` entry (VM CallBuiltinLV, an indirect call): arg0's LValue*
+ * handed in, null when there is no arg0 (lv_arg0_value). */
 EvalValue builtin_reverse_lv(EvalContext *ctx, const ArgLocs *exprList,
                              LValue *target, const EvalValue *rest, size_t n)
 {
-    return reverse_core(ctx, exprList, RValue(EvalValue(target)), target);
+    return reverse_core(ctx, exprList, lv_arg0_value(target), target);
 }
 
 /*
