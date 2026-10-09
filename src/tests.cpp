@@ -867,6 +867,22 @@ static const std::vector<test> tests =
       { "func f(n) { const L = [1]; if (n > 5) L = [n]; return L; }",
         "print(f(runtime(1)));" },
       &typeid(CannotRebindConstEx), 39, 1, 41, 1 },
+    /* `++`/`--` of a const container is the rebind error README states,
+     * at the name - as -nti (the resolver) reports it; the inferencer
+     * raised a TypeMismatchEx over the whole `A++` first. A const
+     * SCALAR's name is its value: not an assignable location. */
+    { "rebind: ++ of a const array is refused at the name",
+      { "const A = [1]; A++;" },
+      &typeid(CannotRebindConstEx), 16, 1, 18, 1 },
+    { "rebind: -- of a const dict in a function is refused at the name",
+      { "const D = {\"a\": 1};", "func f() { --D; return 1; }", "f();" },
+      &typeid(CannotRebindConstEx), 14, 2, 16, 2 },
+    { "rebind: ++ of a const scalar is not an assignable location",
+      { "const N = 5; N++;" },
+      &typeid(SyntaxErrorEx), 14, 1 },
+    { "rebind: a compound into a const scalar is not an assignable location",
+      { "const N = 5; func f() { N += 1; }" },
+      &typeid(SyntaxErrorEx), 25, 1 },
     { "rebind: a struct name is refused",
       { "struct P { int x; }", "if (runtime(false)) P = 5;" },
       &typeid(CannotRebindConstEx), 21, 2, 23, 2 },

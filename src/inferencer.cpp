@@ -6867,11 +6867,16 @@ void Inferencer::check(Construct *n)
         check_const_param_store(opnd);
 
         /* not a const target (when the const survived as a symbol) - a
-         * capture of one is the closure's own binding */
+         * capture of one is the closure's own binding. It is the rebind
+         * error README states and the resolver's check_rebind raises
+         * (what -nti reports), with its caret - the target name; it was
+         * a TypeMismatchEx over the whole `K++` here, before the resolver
+         * could answer. (A const SCALAR never gets here: its name folds
+         * to its value, which is not an assignable location.) */
         if (id && !capture_uses.count(id)) {
             auto it = id_sym.find(id);
             if (it != id_sym.end() && it->second && it->second->const_decl)
-                mismatch("cannot '++'/'--' a const", idc->start, idc->end);
+                throw CannotRebindConstEx(id->start, id->end);
         }
 
         StaticTypeRef t = type_of(opnd);
