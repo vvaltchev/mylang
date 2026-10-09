@@ -6855,6 +6855,18 @@ static const std::vector<test> tests =
     { "ternary: basic true / false branches",
       { "assert((1 > 0 ? 10 : 20) == 10);",
         "assert((1 < 0 ? 10 : 20) == 20);" } },
+    /* a lambda literal in the ELSE arm and on the right of `??`, as in
+     * the middle arm - both were "Expected expression, got 'func'" */
+    { "ternary / coalesce: a lambda in every arm",
+      { "var c = runtime(1) == 1;",
+        "var f = c ? func (x) => x + 1 : func (x) => x * 2;",
+        "var g = !c ? func (x) => x + 1 : func (x) => x * 2;",
+        "assert(f(5) == 6 && g(5) == 10);",
+        "var m = c ? none : f;",
+        "var k = m ?? func (x) => x * 3;",
+        "var p = c ? pure func (x) => x - 1 : pure func (x) => x;",
+        "assert(k(5) == 15 && p(5) == 4);",
+        "var n = c ? 1 : !c ? 2 : 3; assert(n == 1);" } },
     { "ternary: right-associative chain",
       { "var x = 2;",
         "assert((x == 1 ? \"a\" : x == 2 ? \"b\" : \"c\") == \"b\");",

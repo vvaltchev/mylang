@@ -2166,7 +2166,11 @@ pExprCoalesce(ParseContext &c, unsigned fl)
     unique_ptr<CoalesceExpr> co(new CoalesceExpr);
     co->start = lhs->start;
     co->lhs = std::move(lhs);
-    co->rhs = pExprCoalesce(c, fl);          /* right-associative */
+    /* the right side may be a lambda, as the ternary's arms may (a lambda
+     * literal is a whole expression: pExpr14 takes it before any operator
+     * level, and its `=> body` extends as far as an expression can) */
+    if (!pAcceptFuncDecl(c, co->rhs, fl & ~pFlags::pInStmt))
+        co->rhs = pExprCoalesce(c, fl);      /* right-associative */
     if (!co->rhs)
         noExprError(c);
     co->end = co->rhs->end;
@@ -2200,7 +2204,11 @@ pExpr13(ParseContext &c, unsigned fl)
     if (!t->thenExpr)
         noExprError(c);
     pExpectOp(c, Op::colon);
-    t->elseExpr = pExpr13(c, bfl);           /* right-associative */
+    /* a lambda in the else arm too, as in the middle one (pExpr14 accepts
+     * it there): `c ? func(x) => x + 1 : func(x) => x * 2` was "Expected
+     * expression" at the second `func` */
+    if (!pAcceptFuncDecl(c, t->elseExpr, bfl))
+        t->elseExpr = pExpr13(c, bfl);       /* right-associative */
     if (!t->elseExpr)
         noExprError(c);
     t->end = t->elseExpr->end;
