@@ -855,16 +855,23 @@ s = [9, 9];       # OK: rebinding the name s is allowed
 ```
 
 **Rebinding a const or a builtin name is a compile error.** An assignment, a
-compound assignment or a `++`/`--` whose target is a `const` - or a struct's
-name, or a `pure func`'s - raises `CannotRebindConstEx`, and one whose target
-is a builtin's name `CannotRebindBuiltinEx`, when the program compiles, even
-in code that never runs:
+compound assignment or a `++`/`--` whose target is a `const` holding an
+array, a dict, a struct or a function - or a struct's name, or a `pure
+func`'s - raises `CannotRebindConstEx`, and one whose target is a builtin's
+name `CannotRebindBuiltinEx`, when the program compiles, even in code that
+never runs:
 
 ```C#
 const K = [1];
 func never() { K = [2]; }          # compile error: CannotRebindConstEx
 if (runtime(false)) { len = 5; }   # compile error: CannotRebindBuiltinEx
 ```
+
+A `const` holding a **scalar** - a number, a bool, a string or `none` - has
+no run-time variable at all: its name stands for its value everywhere (see
+above), so `N = 6`, `N += 1` or `N++` with `const N = 5;` is the compile error
+for a target that is not an assignable location (a `SyntaxError`, as `5 = 6`
+is - see *What can appear on the left of `=`*).
 
 A parameter, a capture, a `foreach` or a `catch` variable is its own binding
 and is never const, whatever outer name it shadows: in
