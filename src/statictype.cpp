@@ -574,6 +574,16 @@ StaticTypeRef StaticTypeArena::join(StaticTypeRef a, StaticTypeRef b)
             return func_of(ps, popt, rj ? rj : g_dyn[0], anyopt);
         }
 
+        case StaticTypeKind::Struct:
+            /* nominal: the same struct or class joins to itself, with
+             * either side's nullability (`c ? P(1) : mp` with a `P?` mp
+             * is a `P?`, as `c ? 1 : mi` is an `int?`) - two equal types
+             * returned above, so here they differ in `opt` alone. Two
+             * different structs are a conflict. */
+            if (a->struct_def != b->struct_def)
+                return nullptr;
+            return struct_ty(a->struct_def, a->struct_name, anyopt);
+
         case StaticTypeKind::Box: {
             /* invariant: no numeric climb inside a box; an unsettled
              * element takes the other's */
