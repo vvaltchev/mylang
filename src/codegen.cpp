@@ -1757,23 +1757,24 @@ struct Codegen {
         }
 
         /* A standalone POD struct construction `P(x, y)` -> StructCtorV:
-         * the field args into a register run, then coerce them into the POD
          * compile the field args into a register run, then coerce them into
          * the POD bytes. Gated on a POD ctor (vm_struct_ctor_def), nargs ==
-         * nfields (no
-         * skipped-opt fill - POD has no opt fields), a small field count, and
-         * EVERY arg a typed scalar (th==i/f). The typed-arg gate is what keeps
+         * nfields (no skipped-opt fill - POD has no opt fields), and EVERY
+         * arg a typed scalar (th==i/f). The typed-arg gate is what keeps
          * coerce from throwing (the inferencer already rejected a non-fitting
          * typed arg), so no per-arg loc is needed; a nested-struct-field arg (a
-         * `Q(..)`, th==none) or a dyn arg fails the gate and falls back to the
-         * tree-walker, which reports the exact arg loc. The append-fused
-         * ctor is
-         * EmplaceStruct. */
+         * `Q(..)`, th==none) or a dyn arg fails the gate and takes the checked
+         * constructor below, which reports the exact arg loc. The
+         * append-fused ctor is EmplaceStruct.
+         * NO field-count cap: every helper behind these ops takes any count
+         * (a heap buffer past its 16-value stack one). A `<= 16` here and on
+         * the checked/boxed ctor below made a 17-field construction a
+         * NotLoweredEx compile refusal in the VM while the tree-walker built
+         * it (2026-10-09). */
         if (const CallExpr *ce = dynamic_cast<const CallExpr *>(e)) {
             const StructTypeDef *sdef = ce->vm_struct_ctor_def;
             if (sdef && ce->args
-                && ce->args->elems.size() == sdef->fields.size()
-                && ce->args->elems.size() <= 16) {
+                && ce->args->elems.size() == sdef->fields.size()) {
                 /* Every arg must be one coerce can't throw on
                  * (pod_ctor_arg_safe): a typed scalar for a scalar field, OR a
                  * NESTED POD-struct construction of the exact field type for an
@@ -1928,7 +1929,7 @@ struct Codegen {
                        && ce->args->elems.size()
                               == ce->vm_struct_ctor_def->fields.size()
                        ? ce->vm_struct_ctor_def : nullptr);
-            if (bdef && ce->args && ce->args->elems.size() <= 16) {
+            if (bdef && ce->args) {
                 const size_t cmark = chunk.consts.size();
                 int base;
                 if (!emit_args_range(ce->args->elems, base, ops)) {
