@@ -24712,6 +24712,83 @@ static bool jit_ret_ref_native()
             "    if (k == 39) rc2 = refcount(kf);",
             "}",
             "assert(n == 360 && rc1 == rc2);" }, true },
+        /* A DISCARDED result (`gs(k);`, a `call.v _ = ...`): no dst to
+         * move the reference into, so the window's result slot still
+         * owns it when the frame dies - the frameless arm must release
+         * it, where it skips a MOVED result. A frameless window is the
+         * native stack: nothing scans it again, so the reference stayed
+         * until a later call overwrote the slot (the LAST call's leaked;
+         * a raw write leaked every one - the 40 closures below). Here
+         * the object is made, and its count read, by functions whose
+         * frames are gone by the next read - a temp of main would hold
+         * it too - and the calls run in a function body: the count after
+         * the calls must be the count before them, for a local and a
+         * temp argument alike. */
+        { "discarded string result", {
+            "var keep = \"\";",
+            "func init() { keep = \"ab\" + str(runtime(7)); }",
+            "func rc() { return refcount(keep); }",
+            "func gs(int i) { var t = keep;",
+            "    for (var j = 0; j < i % 2; j++) { t = keep; } return t; }",
+            "func h() { for (var k = 0; k < 40; k++) { gs(k); } }",
+            "init();",
+            "var rc0 = rc();",
+            "h();",
+            "assert(rc() == rc0);" }, true },
+        { "discarded result, temp arg", {
+            "var keep = \"\";",
+            "func init() { keep = \"ab\" + str(runtime(7)); }",
+            "func rc() { return refcount(keep); }",
+            "func gs(int i) { var t = keep;",
+            "    for (var j = 0; j < i % 2; j++) { t = keep; } return t; }",
+            "func h() {",
+            "    for (var k = 0; k < 40; k++) { gs(int(runtime(k))); }",
+            "}",
+            "init();",
+            "var rc0 = rc();",
+            "h();",
+            "assert(rc() == rc0);" }, true },
+        { "discarded dict result", {
+            "var kd = {};",
+            "func init() { kd = {\"k\": runtime(4)}; }",
+            "func rc() { return refcount(kd); }",
+            "func gd(int i) { var t = kd;",
+            "    for (var j = 0; j < i % 2; j++) { t = kd; } return t; }",
+            "func h() { for (var k = 0; k < 40; k++) { gd(k); } }",
+            "init();",
+            "var rc0 = rc();",
+            "h();",
+            "assert(rc() == rc0);" }, true },
+        { "discarded struct result", {
+            "struct P { int x; str tag; }",
+            "var kp = P(0, \"\");",
+            "func init() { kp = P(runtime(3), \"t\"); }",
+            "func rc() { return refcount(kp); }",
+            "func gp(int i) { var t = kp;",
+            "    for (var j = 0; j < i % 2; j++) { t = kp; } return t; }",
+            "func h() { for (var k = 0; k < 40; k++) { gp(k); } }",
+            "init();",
+            "var rc0 = rc();",
+            "h();",
+            "assert(rc() == rc0);" }, true },
+        { "discarded box result", {
+            "var kb = box(0);",
+            "func init() { kb = box(int(runtime(3))); }",
+            "func rc() { return refcount(kb); }",
+            "func gb(int i) { var t = kb;",
+            "    for (var j = 0; j < i % 2; j++) { t = kb; } return t; }",
+            "func h() { for (var k = 0; k < 40; k++) { gb(k); } }",
+            "init();",
+            "var rc0 = rc();",
+            "h();",
+            "assert(rc() == rc0 && *kb == 3);" }, true },
+        { "discarded closure result", {
+            "func mkc(int i) {",
+            "    var b = i * 2;",
+            "    var q = b + 1;",
+            "    return func [q] () { return q; };",
+            "}",
+            "for (var k = 0; k < 40; k++) { mkc(k); }" }, true },
         /* DECLINE: a SLICE result, then a write to its parent - which
          * walks the parent's slices set. A moved slice leaves the set
          * naming the dead window slot (ASan, or a wrong detach). */
