@@ -124,7 +124,14 @@ which the direct-read design never writes - so the VM threw `Expected dict
 object` where the tree-walker printed the sum
 (`tests/functional/27_struct_whole_p.my` case 4; a RULE 2 divergence that
 no corpus program had reached). `try_sfe_field` now matches the base slot
-against every active entry. The
+against every active entry. **And a field read qualifies only when its own
+hint sends it down the typed path in every context** (2026-10-09): an int
+field read stamped `th == i` (not a bool), a float field read `th == f`.
+The direct read lives in `compile_int/float_expr` alone, so a read the
+boxed path compiles - `p.x` pasted from an inlined body whose parameter is
+`dyn` (no hint), or a BOOL field used as a value (a bool lowers boxed; only
+a condition takes the typed path) - read the never-written slot and threw
+the same `Expected dict object`. Such a body binds `p` whole. The
 **STRICT-UNPACK**
 `foreach (x, y in
 pairs)` over a proven `array<array<int>>` / `array<array<float>>` (flat
