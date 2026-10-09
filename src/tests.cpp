@@ -16183,6 +16183,27 @@ static const std::vector<test> tests =
         "func f(const Out c) { c.a[0] = 9; append(c.a, 3); c.d.k = 4; }",
         "var o = Out(1, [1], {\"k\": 1}); f(o);",
         "assert(o.a == [9, 3] && o.d.k == 4);" } },
+    /* ...and so are its box and class fields: a write through one goes
+     * into the object it reaches (it was refused as a field write - the
+     * box case with "a const parameter's struct is read-only", the member
+     * step having overwritten the box flag) */
+    { "struct: a const parameter's box and class fields are references",
+      { "class C { int n; } struct P { int x; }",
+        "struct H { box<int> i; C c; box<P> bp; }",
+        "func g(const H h) {",
+        "    *h.i = 1; h.c.n = 5; h.bp.x = 7; (*h.i)++; h.c.n++;",
+        "}",
+        "var h = H(box(5), C(1), box(P(2)));",
+        "g(h);",
+        "assert(*h.i == 2 && h.c.n == 6 && h.bp.x == 7);" } },
+    { "struct err: a const parameter's box field is not replaceable",
+      { "struct H { box<int> i; }",
+        "func g(const H h) { h.i = box(3); }" },
+      &typeid(TypeMismatchEx), 21, 2, 25, 2 },
+    { "struct err: a const class parameter's field stays read-only",
+      { "class C { int n; }",
+        "func g(const C c) { c.n = 5; }" },
+      &typeid(TypeMismatchEx), 21, 2, 25, 2 },
     { "struct err: unknown member access (compile-time)",
       { "struct Point { int x; } var p = Point(1); var z = p.bogus;" },
       &typeid(TypeMismatchEx) },
