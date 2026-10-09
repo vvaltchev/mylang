@@ -1,0 +1,55 @@
+# The generic IntBin shift - any `>>>`, and a shift whose VALUE is a
+# literal (`1 << c`) - takes its count in rcx, and when a local is pinned
+# there it BORROWS rcx (push / pop around the shift). Its negative-count
+# raise arm called the raising helper with that borrow open: the call
+# bracket saved the COUNT as the pinned local, and the exit flush wrote it
+# into the local's slot. A checked build's register tracker aborted at the
+# call - for every program with the shape, the raise taken or not.
+# ushr() is the reported shape: the emission attempt that pinned rcx
+# aborted, though the code that runs is a later attempt (the pin bet
+# lost to the raise's call) that leaves rcx free. caught() keeps rcx
+# pinned in the code that runs - the loop counter, borrowed by both
+# shifts - and catches negative counts, so a counter corrupted by the
+# raise shows in the values.
+
+func ushr(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var x = i * 3;
+        s += x >>> 1;
+        s += x >>> 2;
+    }
+    return s;
+}
+
+func litshl(int n) {
+    var s = 0; var t = 7;
+    for (var c = 0; c < n; c++) {
+        s += 1 << c;
+        t = t * 3 % 1000;
+    }
+    return s * 1000 + t;
+}
+
+func caught(int n) {
+    var a = 3; var b = 5; var c = 7; var d = 11; var s = 0; var bad = 0;
+    for (var i = 0; i < n; i++) {
+        a += i; b += a; c += b; d += c;
+        try {
+            s += (a + b) >>> (i - 2);
+        } catch (InvalidValueEx) {
+            bad += 1;
+        }
+        s += 1 << (i % 5);
+    }
+    return [a, b, c, d, s, bad];
+}
+
+var n = int(runtime(5));
+var u = ushr(n);
+var l = litshl(n);
+var k = caught(n);
+print(u, l, k);
+assert(u == 20);
+assert(l == 31701);
+assert(k == [13, 40, 112, 282, 86, 2]);

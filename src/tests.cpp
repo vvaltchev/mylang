@@ -2406,6 +2406,32 @@ static const std::vector<test> tests =
     },
 
     {
+        /* The generic IntBin shift (`>>>`, or a literal shifted value,
+         * `1 << c`) BORROWS a pinned rcx for its count, and its
+         * negative-count raise arm called the raising helper with the
+         * borrow open: the call bracket saved the COUNT as the pinned
+         * local - the loop counter `i` here - and the exit flush wrote
+         * it into i's slot, so the caught raise restarted the loop at
+         * i - 2. A checked build's register tracker aborted at the
+         * call. */
+        "jit: a shift's negative-count raise keeps a local pinned in rcx",
+        {
+            "func caught(int n) {",
+            "    var a = 3; var b = 5; var c = 7; var d = 11;",
+            "    var s = 0; var bad = 0;",
+            "    for (var i = 0; i < n; i++) {",
+            "        a += i; b += a; c += b; d += c;",
+            "        try { s += (a + b) >>> (i - 2); }",
+            "        catch (InvalidValueEx) { bad += 1; }",
+            "        s += 1 << (i % 5);",
+            "    }",
+            "    return [a, b, c, d, s, bad];",
+            "}",
+            "assert(caught(runtime(5)) == [13, 40, 112, 282, 86, 2]);",
+        },
+    },
+
+    {
         /* APPROACH A - container-store helper ops
          * (plans/archived/native-aot.md): a
          * flat-array element STORE `a[i] = v` / `a[i] OP= v` inside a JIT run
