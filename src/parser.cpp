@@ -3348,13 +3348,27 @@ struct_check_name_free(const StructTypeDef &def, const UniqueId *n, Loc loc)
  * declared (a self/forward reference to it), else a lookup of the field's type
  * name in `const_ctx` (a forward reference to a struct declared in between -
  * its `struct_def` was null when the field was parsed but it is in scope now).
+ * A non-opt `box<S>` field points at S too: a box always holds a value (it
+ * is never none unless `opt`), so constructing one needs an S - `struct T
+ * { box<T> me; }` can never be constructed either, and zero-initializing
+ * it (`T t;`, zero_box_init <-> build_zero_struct_init) recursed until the
+ * parser's stack overflowed. The element is resolved already (a box's
+ * annotation names a declared struct or, through decl_self, the one being
+ * declared) and is never opt (pTypeAnnot refuses `box<S?>`).
  * Returns null for an opt/non-struct field or a genuinely undeclared type.
  */
 static const StructTypeDef *
 struct_field_target(const FieldDef &f, const StructTypeDef *root,
                     EvalContext *const_ctx)
 {
-    if (f.kind != FieldKind::f_struct || f.is_opt)
+    if (f.is_opt)
+        return nullptr;
+    if (f.kind == FieldKind::f_box) {
+        const TypeAnnot *e = f.annot ? f.annot->elem.get() : nullptr;
+        return e && e->kind == DeclType::strct && !e->opt ? e->strct
+                                                          : nullptr;
+    }
+    if (f.kind != FieldKind::f_struct)
         return nullptr;
     if (f.struct_def)
         return f.struct_def;
@@ -3398,7 +3412,8 @@ struct_reaches_root(const StructTypeDef *cur, const StructTypeDef *root,
  * to box the back-edge by making it nullable; v1 boxes via `dyn`, so the
  * message points the user at `dyn? <field>`. A self/mutual cycle is detected at
  * the declaration that closes it. An `opt` field breaks the cycle (it can
- * terminate with `none`), so it is not followed.
+ * terminate with `none`), so it is not followed. A non-opt `box<S>` field
+ * is followed like an S field (struct_field_target): the box needs an S.
  */
 static void
 check_struct_no_recursion(const StructTypeDef *def,
@@ -3412,6 +3427,12 @@ check_struct_no_recursion(const StructTypeDef *def,
             continue;
         std::set<const StructTypeDef *> seen{def};
         if (t == def || struct_reaches_root(t, def, seen, cctx)) {
+            if (def->fields[i].kind == FieldKind::f_box)
+                throw SyntaxErrorEx(field_locs[i],
+                    "recursive box field: a non-opt box always holds a "
+                    "value, and a value of this struct would need a box "
+                    "holding another - it can never be constructed. Make "
+                    "it nullable - e.g. 'opt box<...> <name>'");
             if (def->is_class)
                 throw SyntaxErrorEx(field_locs[i],
                     "recursive class field: a non-opt field whose type "
