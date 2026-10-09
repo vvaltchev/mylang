@@ -6926,7 +6926,10 @@ but the per-element `StructObject` allocation is gone (build overhead
   whitelist admits no store-through op. A field of a VALUE is not a
   location (`member_store_step` passes `rooted` only for a slot). A
   `const` PARAMETER's struct is read-only at compile time when its type is
-  known (`check_const_param_store`); no engine enforces const on a
+  known (`check_const_param_store`): its walk follows struct-VALUE member
+  steps only, and stops at a step into a reference (a box's value, a field
+  of a box<P> or a class instance) - refused only when that reference IS
+  the parameter; no engine enforces const on a
   parameter at run time. `StructObject::readonly` still backs a deep
   `const`. `==`
   is structural between same-`def` instances (`TypeStruct::eq`); `hash`
