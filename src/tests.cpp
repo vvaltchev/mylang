@@ -17547,6 +17547,25 @@ static const std::vector<test> tests =
       { "func f(opt x) => x + 1; f(3);" }, &typeid(NullabilityEx) },
 
     /* ---- function templates (monomorphization) ---- */
+    /* A struct or class type joins with its nullable form as int does
+     * with int? - the join had no Struct arm, so a ternary's arms were
+     * irreconcilable (dyn: DynRequiredEx) and a reassignment of a P var
+     * with a P? was refused */
+    { "infer: a struct joins with its opt form, like int with int?",
+      { "struct P { int x; } P? mp = none;",
+        "var r = runtime(true) == true ? P(1) : mp;",
+        "var r2 = P(2); r2 = mp;",
+        "class C { int x; } C? mc = none;",
+        "var rc = runtime(false) ? C(1) : mc;",
+        "var rc2 = C(2); rc2 = runtime(true) ? mc : rc2;",
+        "assert(typestr(r) == \"P?\" && typestr(r2) == \"P?\");",
+        "assert(typestr(rc) == \"C?\" && typestr(rc2) == \"C?\");",
+        "assert(r?.x == 1 && r2 == none && rc == none && rc2 == none);" } },
+    { "infer: two different struct types do not join",
+      { "struct P { int x; } struct Q { int x; }",
+        "var q = runtime(true) ? P(1) : Q(1);" },
+      &typeid(DynRequiredEx) },
+
     { "template: a generic helper, no dyn needed (the user's case)",
       { "func f(x, y){ var t = x + y; t += 2; return t; }",
         "assert(f(3, 4) == 9); assert(f(1.5, 2.5) == 6.0);" } },
