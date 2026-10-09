@@ -178,9 +178,20 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
             const FieldDef *f = def->field_of(m->memUid);
             if (!f || f->offset < 0)
                 return false;
-            return f->kind == FieldKind::f_int
-                || f->kind == FieldKind::f_float
-                || f->kind == FieldKind::f_bool;
+            /* The direct read is emitted ONLY where the read compiles
+             * through the typed int / float path (try_sfe_field), so the
+             * node's own hint must send it there in EVERY context. A read
+             * with no scalar hint - `p.x` pasted from an inlined body
+             * whose parameter is `dyn` - and a BOOL field, which a value
+             * use lowers boxed (only a condition takes the typed path),
+             * compiled to a member read of the never-bound loop variable:
+             * "Expected dict object" in the VM where the tree-walker
+             * printed the field. Such a read binds `p` whole. */
+            if (f->kind == FieldKind::f_int)
+                return m->th == TypeHint::i && !m->th_bool;
+            if (f->kind == FieldKind::f_float)
+                return m->th == TypeHint::f;
+            return false;
         }
         return struct_fe_body_ok(m->what.get(), loop_slot, def, false);
     }
