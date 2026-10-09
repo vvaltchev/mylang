@@ -1,0 +1,121 @@
+struct P { int x; float y; }
+struct Q { str s; array<int> xs; }
+class C { int n; }
+var b = box(5)
+var bf = box(1.5)
+var bb = box(false)
+var bs = box("x")
+var bp = box(P(1, 2.0))
+var arr = [box(1), box(2)]
+func takes_int(int a) { return a; }
+func takes_f(box<float> x) { return *x; }
+b + 1
+1 + b
+b * 2.5
+b += 1
+-b
+-arr[0]
+arr[0] + 1
+takes_int(b)
+takes_int(arr[0])
+box<float> f2 = box(1);
+box<int> i2 = box(1.5);
+*b = "s"
+*b = 2.5
+*bf = "s"
+*bb = 1
+*bs = 1
+*bp = Q("a", [])
+*bp = 5
+*bp = bp
+*bp = none
+*b++
+arr[0]++
+var n = 5
+*n
+*5
+*bp.x
+var s = "s"
+-s
+takes_int(s)
+opt int oi = none
+box(oi)
+const k = box(1)
+box<array<int>> ba;
+box<dict<str, int>> bd;
+box<box<int>> bbx;
+box<dyn> bdy;
+box<int?> bo;
+box<C> bc;
+func f(box<int x) { return 1; }
+struct S { box<int x; }
+func g(const box<int> c) { *c = 1; }
+func g1(const box<int> c) { (*c)++; }
+func g2(const box<P> c) { c.x = 1; }
+func g4(const box<int> c) { return *c + 1; }
+func call_g4() { return g4(b); }
+call_g4()
+opt box<int> ob
+*ob
+ob = box(3)
+if (ob) *ob += 1
+ob
+box()
+box(1, 2)
+var dyn sb = box("s")
+*sb = 5
+*sb = 1.5
+*sb = true
+*sb = [1]
+*sb = {}
+*sb = P(1, 2.0)
+*sb = bp
+*sb = b
+*sb = print
+(*sb)++
+--*sb
+*sb += 1
+var dyn dp = box(P(1, 2.0))
+*dp = Q("a", [])
+*dp = 5
+*dp += 1
+var dyn dn = runtime(none)
+*dn
+*sb = dn
+*dp = dn
+box(dn)
+var dyn pv = P(3, 4.0)
+*pv
+*pv = P(1, 1.0)
+var dyn iv = 7
+*iv
+*iv = 8
+var dyn av = [1]
+*av
+func wi(box<int> x) { int r = *x; return r; }
+func wp(box<P> x) { P r = *x; return r.x; }
+wi(sb)
+wi(dp)
+wp(sb)
+wp(pv)
+wp(dp)
+struct H { box<int> i; box<P> p; }
+var dyn hi = sb
+H(hi, bp)
+var h = H(b, bp)
+*h.i
+h.p.x
+:tree *b
+:tree (*b)++
+:tree *b += 2
+func uses(box<int> x, box<P> y) {
+    var t = *x * 2; *x = t; --*x; y.x = *x; return *y;
+}
+:show uses
+uses(box(4), box(P(0, 0.0)))
+var wide = box(Q("a string long enough to push the echo past the width",
+                 [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]))
+wide.xs
+print(b, bf, bb, bs, bp)
+typestr(arr)
+kindstr(bp)

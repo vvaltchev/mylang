@@ -1,0 +1,281 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): the ERROR side of box(v) and unary * (README "Boxes"):
+# "a value that does not fit the box is ... a TypeErrorEx at the *b when it
+# is not [known] (a dyn)", "`*` of something that is not a box is ... a
+# TypeErrorEx for a dyn", and "reading a box of another element than its
+# static type says (one a dyn passed in) raises at the `*` too". Every
+# element kind a typed `*` checks (box<int> .. box<str>, box<P>) is handed
+# every misfit a `dyn` can launder into it - a box of another kind, a box<P>
+# of another struct, a struct VALUE, a scalar, none - and every box kind
+# is stored every value that does not fit it, by `=`, by a compound and by
+# `++`/`--`; a struct field of box type rejects a misfit at construction;
+# box() of none and box() with the wrong arity raise. Each error path is
+# also run warm, inside a loop the JIT compiles, so the native box ops'
+# raise (jit_load_box / jit_store_box) and the VM's (LoadBoxV / StoreBoxV,
+# under -nj) convey it - and a fitting value still works after each one.
+# The shared helpers are box_load_want / box_store (eval.cpp); the message
+# texts are pinned by tests/int/repl/box-errors.session.
+
+struct P { int x; float y; }
+struct Q { str s; array<int> xs; }
+struct H { box<int> i; box<P> p; }
+class C { int n; }
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad = bad + 1;
+    }
+}
+
+func outcome(dyn f) {
+    try {
+        f();
+        return "ok";
+    } catch (TypeErrorEx) {
+        return "TypeErrorEx";
+    } catch (OutOfBoundsEx) {
+        return "OutOfBoundsEx";
+    } catch (InvalidNumberOfArgsEx) {
+        return "InvalidNumberOfArgsEx";
+    } catch (DivisionByZeroEx) {
+        return "DivisionByZeroEx";
+    }
+    return "unreachable";
+}
+
+func ri(int v) => int(runtime(v));
+func rf(float v) => float(runtime(v));
+func rs(str v) => str(runtime(v));
+
+# The laundered values: a dyn can hold any of them.
+var dyn d_int = box(ri(1));
+var dyn d_flt = box(rf(1.5));
+var dyn d_bool = box(ri(1) == 1);
+var dyn d_str = box(rs("s"));
+var dyn d_p = box(P(x: ri(1), y: 2.0));
+var dyn d_q = box(Q(s: rs("q"), xs: [1]));
+var dyn d_pval = P(x: ri(3), y: 4.0);       # a struct VALUE, not a box
+var dyn d_c = C(n: ri(5));                  # a class instance
+var dyn d_n = ri(7);
+var dyn d_none = runtime(none);
+var dyn d_arr = runtime([1, 2]);
+var launder = [d_int, d_flt, d_bool, d_str, d_p, d_q, d_pval, d_c, d_n,
+               d_none, d_arr];
+
+# --- 1. a typed reader meets each laundered value: only its own fits
+func read_i(box<int> b) { int r = *b; return str(r); }
+func read_f(box<float> b) { float r = *b; return str(r); }
+func read_b(box<bool> b) { bool r = *b; return str(r); }
+func read_s(box<str> b) { str r = *b; return r; }
+func read_p(box<P> b) { P r = *b; return str(r.x); }
+func try_read(int k, opt dyn v) {
+    if (v == none)
+        return "n";
+    try {
+        if (k == 0) return read_i(v);
+        if (k == 1) return read_f(v);
+        if (k == 2) return read_b(v);
+        if (k == 3) return read_s(v);
+        return read_p(v);
+    } catch (TypeErrorEx) {
+        return "-";
+    }
+    return "unreachable";
+}
+var readers = ["", "", "", "", ""];
+for (var k = 0; k < 5; k++)
+    foreach (v in launder)
+        readers[k] += try_read(k, v) + "|";
+want("read_i", readers[0], "1|-|-|-|-|-|-|-|-|n|-|");
+want("read_f", readers[1], "-|1.500000|-|-|-|-|-|-|-|n|-|");
+want("read_b", readers[2], "-|-|true|-|-|-|-|-|-|n|-|");
+want("read_s", readers[3], "-|-|-|s|-|-|-|-|-|n|-|");
+want("read_p", readers[4], "-|-|-|-|1|-|-|-|-|n|-|");
+
+# --- 2. the same in a hot function: the JIT's box ops raise, then recover
+func hot_i(box<int> b, int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++)
+        s += *b;
+    return s;
+}
+func hot_f(box<float> b, int n) {
+    var s = 0.0;
+    for (var i = 0; i < n; i++)
+        s += *b;
+    return s;
+}
+func hot_store(box<int> b, dyn v, int n) {
+    for (var i = 0; i < n; i++)
+        *b = v;
+    return *b;
+}
+func hot_fstore(box<float> b, dyn v, int n) {
+    for (var i = 0; i < n; i++)
+        *b += v;
+    return *b;
+}
+var good_i = box(ri(2));
+var good_f = box(rf(0.25));
+var hot = "";
+for (var rnd = 0; rnd < 3; rnd++) {
+    hot += str(hot_i(good_i, 50)) + ",";
+    hot += outcome(func [d_str] () { hot_i(d_str, 50); }) + ",";
+    hot += outcome(func [d_p] () { hot_i(d_p, 50); }) + ",";
+    hot += str(hot_f(good_f, 40)) + ",";
+    hot += outcome(func [d_int] () { hot_f(d_int, 40); }) + ",";
+    hot += str(hot_store(good_i, ri(9), 30)) + ",";
+    hot += outcome(func [good_i] () { hot_store(good_i, "x", 30); }) + ",";
+    hot += outcome(func [good_i] () { hot_store(good_i, 1.5, 30); }) + ",";
+    hot += str(hot_fstore(good_f, ri(1), 4)) + ",";
+    hot += outcome(func [good_f] () { hot_fstore(good_f, "x", 4); }) + ";";
+}
+want("hot", hot,
+     "100,TypeErrorEx,TypeErrorEx,10.000000,TypeErrorEx,9,TypeErrorEx,"
+     + "TypeErrorEx,4.250000,TypeErrorEx;"
+     + "450,TypeErrorEx,TypeErrorEx,170.000000,TypeErrorEx,9,TypeErrorEx,"
+     + "TypeErrorEx,8.250000,TypeErrorEx;"
+     + "450,TypeErrorEx,TypeErrorEx,330.000000,TypeErrorEx,9,TypeErrorEx,"
+     + "TypeErrorEx,12.250000,TypeErrorEx;");
+
+# --- 3. every box kind stored every misfit, through a dyn box
+func store_eq(dyn b, opt dyn v) { *b = v; }
+func store_add(dyn b, dyn v) { *b += v; }
+func store_inc(dyn b) { (*b)++; }
+func store_dec(dyn b) { --*b; }
+var targets = [d_int, d_flt, d_bool, d_str, d_p];
+var vals = [ri(4), rf(0.5), ri(1) == 2, rs("t"), P(x: ri(8), y: 0.0),
+              Q(s: rs("w"), xs: []), d_p, d_c, d_none, d_arr];
+var store_tab = [];
+foreach (t in targets) {
+    var row = "";
+    foreach (v in vals)
+        row += (outcome(func [t, v] () { store_eq(t, v); }) == "ok"
+                ? "y" : ".");
+    append(store_tab, row);
+}
+# box<int> takes an int (and a bool); box<float> an int or a float (or a
+# bool); box<bool> a bool; box<str> a str; box<P> a P value only
+want("store table", store_tab,
+     ["y.y.......", "yyy.......", "..y.......", "...y......",
+      "....y....."]);
+want("stored values", [str(*d_int), str(*d_flt), str(*d_bool), *d_str,
+                       str(d_p.x)],
+     ["0", "0.000000", "false", "t", "8"]);
+var cmp_tab = [];
+foreach (t in targets) {
+    var row = "";
+    foreach (v in [ri(2), rf(0.5), rs("u")])
+        row += (outcome(func [t, v] () { store_add(t, v); }) == "ok"
+                ? "y" : ".");
+    row += outcome(func [t] () { store_inc(t); }) == "ok" ? "+" : ".";
+    row += outcome(func [t] () { store_dec(t); }) == "ok" ? "-" : ".";
+    append(cmp_tab, row);
+}
+want("compound table", cmp_tab, ["y..+-", "yy.+-", ".....", "yyy..",
+                                 "....."]);
+want("compound values", [str(*d_int), str(*d_flt), *d_str],
+     ["2", "2.500000", "t20.500000u"]);
+*d_int = ri(10);
+want("integer compound ops", outcome(func [d_int] () {
+         *d_int <<= 2; *d_int |= 1; *d_int ^= 3; *d_int &= 255;
+         *d_int >>= 1; *d_int %= 7; *d_int /= 2; *d_int -= 1;
+         *d_int >>>= 0; }) + str(*d_int), "ok-1");
+want("divide a box by zero", outcome(func [d_int] () { *d_int /= 0; }),
+     "DivisionByZeroEx");
+
+# --- 4. `*` of a value that is not a box, by every form
+func deref(dyn v) { return *v; }
+var nb = "";
+foreach (v in [d_n, d_pval, d_c, d_arr, rs("s")])
+    nb += outcome(func [v] () { deref(v); }) + " ";
+nb += outcome(func [d_none] () { var dyn y = *d_none; }) + " ";
+nb += outcome(func [d_pval] () { *d_pval = P(x: 1, y: 1.0); }) + " ";
+nb += outcome(func [d_n] () { *d_n += 1; }) + " ";
+nb += outcome(func [d_c] () { (*d_c)++; }) + " ";
+nb += outcome(func [d_none] () { var dyn x = (*d_none)--; });
+want("not a box", nb, "TypeErrorEx TypeErrorEx TypeErrorEx TypeErrorEx "
+     + "TypeErrorEx TypeErrorEx TypeErrorEx TypeErrorEx TypeErrorEx "
+     + "TypeErrorEx");
+
+# --- 5. a typed box whose value came through a dyn, written by compound and
+# ++: the load checks the kind first (a misfit raises before the store)
+func bump_i(box<int> b) { *b += 1; return *b; }
+func incr_i(box<int> b) { var o = (*b)++; return o; }
+func decr_f(box<float> b) { --*b; return *b; }
+func set_p(box<P> b, int x) { *b = P(x: x, y: 0.5); return b.x; }
+var typed = "";
+typed += outcome(func [d_str] () { bump_i(d_str); }) + " ";
+typed += outcome(func [d_flt] () { incr_i(d_flt); }) + " ";
+typed += outcome(func [d_int] () { decr_f(d_int); }) + " ";
+typed += outcome(func [d_q] () { set_p(d_q, 1); }) + " ";
+typed += outcome(func [d_pval] () { set_p(d_pval, 1); }) + " ";
+typed += str(bump_i(good_i)) + " " + str(incr_i(good_i)) + " "
+         + str(decr_f(good_f)) + " " + str(set_p(d_p, 42));
+want("typed via dyn", typed, "TypeErrorEx TypeErrorEx TypeErrorEx "
+     + "TypeErrorEx TypeErrorEx 10 10 11.250000 42");
+want("misfits unchanged", [*d_str, str(*d_flt), str(d_q.s)],
+     ["t20.500000u", "2.500000", "q"]);
+
+# --- 6. the box expression raises before any store (tree-walker deref_store)
+var pool = [box(ri(1))];
+var stores = "";
+stores += outcome(func [pool] () { *pool[ri(5)] = 1; }) + " ";
+stores += outcome(func [pool] () { *pool[ri(-9)] += 1; }) + " ";
+stores += outcome(func [pool] () { (*pool[ri(3)])++; }) + " ";
+stores += outcome(func [pool] () { var v = *pool[ri(2)]; }) + " ";
+var dyn dpool = runtime([box(ri(1)), 5]);
+stores += outcome(func [dpool] () { *dpool[1] -= 1; }) + " ";
+stores += outcome(func [dpool] () { *dpool[0] = "s"; }) + " ";
+stores += outcome(func [dpool] () { *dpool[0] *= 3; }) + str(*dpool[0]);
+want("box expression raises", stores, "OutOfBoundsEx OutOfBoundsEx "
+     + "OutOfBoundsEx OutOfBoundsEx TypeErrorEx TypeErrorEx ok3");
+
+# --- 7. a box-typed struct field takes only a fitting box
+func mk_h(dyn i, dyn p) { var h = H(i: i, p: p); return str(*h.i); }
+var fields = "";
+foreach (pair in [[d_int, d_p], [d_flt, d_p], [d_int, d_q],
+                  [d_int, d_pval], [d_n, d_p], [d_int, d_int],
+                  [d_p, d_p], [d_int, d_none]])
+    fields += outcome(func [pair] () { return mk_h(pair[0], pair[1]); })
+              + " ";
+fields += outcome(func [d_int, d_none] () { var h = H(i: d_int, p: d_none);
+                                            h.p.x = 1; });
+want("box fields", fields, "ok TypeErrorEx TypeErrorEx TypeErrorEx "
+     + "TypeErrorEx TypeErrorEx TypeErrorEx TypeErrorEx TypeErrorEx");
+
+# --- 8. box() of none, and the wrong number of arguments
+var dyn bx = runtime(box);
+var bargs = "";
+bargs += outcome(func [d_none] () { box(d_none); }) + " ";
+bargs += outcome(func [bx] () { bx(); }) + " ";
+bargs += outcome(func [bx] () { bx(1, 2); }) + " ";
+bargs += outcome(func [bx, d_none] () { bx(d_none); }) + " ";
+bargs += outcome(func () { box(); }) + " ";
+bargs += outcome(func () { var dyn x = box(ri(1), ri(2)); }) + " ";
+var dyn made = bx(ri(6));
+bargs += typestr(made) + str(*made);
+want("box() errors", bargs, "TypeErrorEx InvalidNumberOfArgsEx "
+     + "InvalidNumberOfArgsEx TypeErrorEx InvalidNumberOfArgsEx "
+     + "InvalidNumberOfArgsEx dyn6");
+
+# --- 9. == and != between every pair of the laundered values: a box is
+# equal to itself only (a box<P> is not its struct's value, nor a box<Q>)
+var eqs = "";
+var neqs = "";
+var expect_eq = "";
+for (var i = 0; i < len(launder); i++)
+    for (var j = 0; j < len(launder); j++) {
+        eqs += launder[i] == launder[j] ? "=" : ".";
+        neqs += launder[i] != launder[j] ? "." : "=";
+        expect_eq += i == j ? "=" : ".";
+    }
+want("box == others", eqs, expect_eq);
+want("box != others", neqs, expect_eq);
+
+print("box misfits: " + str(bad) + " failure(s)");
+assert(bad == 0);
