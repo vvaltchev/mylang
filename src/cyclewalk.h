@@ -6,23 +6,26 @@
  * THE CYCLE GUARD (plans/reference-cycles.md, Part A; README *Values that
  * contain themselves*).
  *
- * Arrays, dicts and boxed structs are references, so a value can contain
- * itself (`append(a, a)`, `d["self"] = d`). Every recursive walk over a
- * value graph - printing, `==`, `hash`, the deep copies, the compiler's
- * walks over a constant's value, the .myv writer - must terminate on one.
- * They all do it the same way, through this header: a stack of the
- * containers the walk is currently INSIDE (its path from the root), and a
- * container met again while it is on that stack is a BACK EDGE, which the
- * walk answers without entering it again. A new walk over a value graph
- * uses these types too; CLAUDE.md makes that a rule.
+ * Arrays, dicts, class instances and boxes are references, so a value can
+ * contain itself (`append(a, a)`, `d["self"] = d`). Every recursive walk over
+ * a value graph - printing, `==`, `hash`, the deep copies, the compiler's
+ * walks over a constant's value, the .myv writer - must terminate on one. They
+ * all do it the same way, through this header: a stack of the containers the
+ * walk is currently INSIDE (its path from the root), and a container met again
+ * while it is on that stack is a BACK EDGE, which the walk answers without
+ * entering it again. A new walk over a value graph uses these types too;
+ * CLAUDE.md makes that a rule.
  *
  * Only a container that CAN hold a reference is pushed: a general-storage
- * array, a dict, a boxed struct. A flat array (int/float/bool/str/POD
- * struct storage), a POD struct, a string and a scalar hold none, so they
- * can never be on a cycle and pay nothing. A function value is never
- * walked into by any of these walks (it prints as `<function>`, compares
- * by identity, has no hash, and every copy shares it), so a closure's
- * captures need no key either.
+ * array, a dict, a class instance or box<P> with reference fields. A flat
+ * array (int/float/bool/str/POD struct storage), a POD struct, a string and a
+ * scalar hold none, so they can never be on a cycle and pay nothing. A struct
+ * VALUE is walked through but never pushed: no cycle passes through a value
+ * alone, and its address is not its identity (copy-on-write may share one
+ * object between two independent copies). A function value is never walked
+ * into by any of these walks (it prints as `<function>`, compares by identity,
+ * has no hash, and every copy shares it), so a closure's captures need no key
+ * either.
  *
  * A stack is not a memo: a container shared at two places that is NOT on
  * the current path is walked (printed, copied) at each place, exactly as
@@ -45,12 +48,12 @@
 #include <vector>
 
 /*
- * A container's identity on a walk. Dicts and boxed structs are their
- * object. An array is the window it shows of its shared storage: a
+ * A container's identity on a walk. A dict, a class instance and a box<P> are
+ * their object. An array is the window it shows of its shared storage: a
  * non-slice is the whole storage, a slice its [off, off + len) - so a slice
  * (which behaves as an independent copy) is a different container from the
- * array it was taken from, unless it shows exactly the same elements,
- * which is also when TypeArr::eq's identity fast path calls the two equal.
+ * array it was taken from, unless it shows exactly the same elements, which is
+ * also when TypeArr::eq's identity fast path calls the two equal.
  */
 struct CycKey {
     const void *obj = nullptr;
@@ -100,8 +103,15 @@ inline bool cyc_key(const EvalValue &v, CycKey &k)
         return true;
 
     case Type::t_struct: {
+        /* a REFERENCE that can hold one (a class instance, a box<P> of a
+         * non-POD struct). A struct VALUE is never keyed: its copies are
+         * independent, and copy-on-write may still share one object
+         * between two of them - keyed by that address, two equal copies
+         * printed, compared and hashed differently until a write split
+         * them. No cycle passes through a value alone: it must pass
+         * through the array, dict, class or box holding it. */
         const StructObject *s = v.get_ref<intrusive_ptr<StructObject>>().get();
-        if (!s->def || s->is_pod())
+        if (!s->def || s->is_pod() || !s->is_ref())
             return false;
         k.obj = s;
         k.off = k.len = 0;
@@ -113,7 +123,7 @@ inline bool cyc_key(const EvalValue &v, CycKey &k)
     }
 }
 
-/* The key of a dict or a boxed struct, from the object itself. */
+/* The key of a dict or a reference struct, from the object itself. */
 inline CycKey cyc_key_obj(const void *obj)
 {
     CycKey k;
@@ -285,7 +295,13 @@ inline bool cyc_reaches_cycle(const EvalValue &v, CycStack &path,
                               std::unordered_set<CycKey, CycKeyHash> &done)
 {
     CycKey k;
-    if (!cyc_key(v, k) || (!done.empty() && done.count(k)))
+    if (!cyc_key(v, k))
+        /* a struct value is not keyed, but a cycle may lie beyond it */
+        return v.get_type()->t == Type::t_struct
+               && cyc_any_child(v, [&](const EvalValue &c) {
+                      return cyc_reaches_cycle(c, path, done);
+                  });
+    if (!done.empty() && done.count(k))
         return false;
     if (path.contains(k))
         return true;

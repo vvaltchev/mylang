@@ -7809,10 +7809,26 @@ static const std::vector<test> tests =
         "var dyn d = {}; d[\"s\"] = d;",
         "assert(str(d) == \"{\\\"s\\\": {...}}\");",
         "var dyn bx = []; var s = CyN(1, bx); append(bx, s);",
-        "assert(str(s) == \"CyN(v: 1, next: [CyN(...)])\");",
+        /* a struct is a VALUE: bx holds a copy of s, printed in full */
+        "assert(str(s) == \"CyN(v: 1, next: [CyN(v: 1, next: [...])])\");",
         "assert(str(bx) == \"[CyN(v: 1, next: [...])]\");",
         "pop(a); erase(d, \"s\"); pop(bx);",
         "assert(str(a) == \"[1]\" && str(s) == \"CyN(v: 1, next: [])\");" } },
+    /* Two equal struct VALUES print, compare and hash alike whether or not
+     * copy-on-write still shares one object between them: the guard keyed
+     * a struct value by its address, so a write that changed nothing
+     * decided ==. And a box<P> back edge prints box(Name(...)). */
+    { "cycle: a struct value is walked by value, a box<P> by reference",
+      { "struct CyS { int v; dyn? next; }",
+        "var dyn ra = dynarray([0]); ra[0] = CyS(1, ra);",
+        "var dyn r1 = clone(ra); var dyn r2 = clone(ra);",
+        "r2[0].v = 1;",
+        "assert(str(r1) == str(r2) && r1 == r2 && hash(r1) == hash(r2));",
+        "assert(str(r1) == \"[CyS(v: 1, next: [CyS(v: 1, next: [...])])]\");",
+        "struct CyB { opt box<CyB> next; int v; }",
+        "box<CyB> bn; bn.v = int(runtime(1)); bn.next = bn;",
+        "assert(str(bn) == \"box(CyB(next: box(CyB(...)), v: 1))\");",
+        "pop(ra); bn.next = none;" } },
     { "cycle: == compares two cyclic values by shape",
       { "var dyn a = dynarray([1]); append(a, a);",
         "var dyn b = dynarray([1]); append(b, b);",

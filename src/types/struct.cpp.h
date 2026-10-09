@@ -86,16 +86,12 @@ static bool struct_equal(const StructObject &x, const StructObject &y)
     if (x.is_pod())
         return x.bytes == y.bytes;
 
-    /* boxed: field-wise EvalValue equality (recurses for nested structs),
-     * on the cycle guard's pair stack - a field may lead back here through
-     * an array or a dict (cyclewalk.h) */
-    const CycKey kx = cyc_key_obj(&x), ky = cyc_key_obj(&y);
-    CycPairStack &st = cyc_eq();
-    const int be = st.back_edge(kx, ky);
-    if (be >= 0)
-        return be == 1;
-    CycPairGuard g(st, kx, ky);
-
+    /* boxed: field-wise EvalValue equality (recurses for nested structs).
+     * A struct VALUE takes no place on the cycle guard's pair stack: a
+     * field leading back here passes through an array or a dict, which
+     * does - and copy-on-write may share one object between this side
+     * and a copy reached on the other, which read as a one-sided back
+     * edge and made two equal copies unequal (cyclewalk.h, cyc_key). */
     for (size_t i = 0; i < x.fields.size(); i++)
         if (!(x.fields[i].get() == y.fields[i].get()))
             return false;
@@ -156,16 +152,8 @@ size_t TypeStruct::hash(const EvalValue &a)
         return seed;
     }
 
-    /* a boxed struct may be on a cycle: a back edge hashes as its depth */
-    CycKey k;
-    const bool keyed = cyc_key(a, k);
-    if (keyed) {
-        const int d = cyc_hash().depth(k);
-        if (d >= 0)
-            return cyc_backedge_hash(d);
-    }
-    CycGuard g(cyc_hash(), k, keyed);
-
+    /* a struct VALUE is never a back edge (cyclewalk.h, cyc_key): a cycle
+     * through it is answered by the array or dict holding it */
     for (size_t i = 0; i < def.fields.size(); i++)
         hash_combine(seed, (o.is_pod() ? o.pod_get(static_cast<int>(i))
                                        : o.fields[i].get()).hash());
@@ -182,11 +170,12 @@ string TypeStruct::to_string(const EvalValue &a)
     string res = o.boxed ? "box(" + string(def.name->val)
                          : string(def.name->val);
 
-    /* a boxed struct already being printed further up: `Name(...)` */
+    /* a class instance or box<P> already being printed further up:
+     * `Name(...)`, or `box(Name(...))` */
     CycKey k;
     const bool keyed = cyc_key(a, k);
     if (keyed && cyc_render().contains(k))
-        return res + "(...)";
+        return res + (o.boxed ? "(...))" : "(...)");
     CycGuard g(cyc_render(), k, keyed);
 
     res += "(";
@@ -214,7 +203,8 @@ string TypeStruct::pretty(const EvalValue &a, int indent, int width)
     CycKey k;
     const bool keyed = cyc_key(a, k);
     if (keyed && cyc_render().contains(k))
-        return string(def.name->val) + "(...)";
+        return o.boxed ? "box(" + string(def.name->val) + "(...))"
+                       : string(def.name->val) + "(...)";
 
     const string flat = to_string_repr(a);
 

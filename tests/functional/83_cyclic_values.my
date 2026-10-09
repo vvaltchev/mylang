@@ -20,7 +20,8 @@ append(a, a);
 
 # 1. printing: a container already being printed further up is [...],
 #    {...} or Name(...); one shared at two places, not on the path, is
-#    printed at each
+#    printed at each. A struct is a VALUE: box holds a copy of s, printed
+#    in full, and the back edge is the array
 assert(str(a) == "[1, [...]]");
 assert(str([a, a]) == "[[1, [...]], [1, [...]]]");
 assert(str(clone(a)) == "[1, [1, [...]]]");    # a fresh top, then the ring
@@ -30,7 +31,7 @@ assert(str(d1) == "{\"self\": {...}}");
 var dyn box = [];
 var s = Node(1, box);
 append(box, s);          # box -> s's object -> box
-assert(str(s) == "Node(v: 1, next: [Node(...)])");
+assert(str(s) == "Node(v: 1, next: [Node(v: 1, next: [...])])");
 assert(str(box) == "[Node(v: 1, next: [...])]");
 
 # 2. == compares by SHAPE: a back edge must lead to the same depth on both
@@ -168,9 +169,53 @@ var cm = {};
 cm[cr] = 1;
 assert(cm[cr] == 1 && len(cm) == 1);
 
+# 10. a FROZEN cycle that reaches a STRUCT: kept until exit, then
+#     emptied - after the program's struct defs are gone, so that release
+#     must read none (it read one: a heap-use-after-free at exit under
+#     ASan, in every engine)
+struct SN { int v; dyn? next; }
+pure func mk_sring(n) {
+    var dyn r = [n];
+    r[0] = SN(n, r);
+    return r;
+}
+const SR = mk_sring(2);
+assert(str(SR) == "[SN(v: 2, next: [...])]");
+var dyn sk = dynarray([0]);
+sk[0] = SN(1, none);
+append(sk, sk);
+var dyn skd = {};
+skd[sk] = 1;                         # a frozen copy: kept until exit
+assert(len(skd) == 1);
+pop(sk);
+
+# 11. a struct is a VALUE: two equal copies print, compare and hash alike,
+#     whether or not copy-on-write still shares one object between them
+#     (the cycle guard keyed a struct value by its address, so a write
+#     that changed nothing decided ==)
+var dyn ra = dynarray([0]);
+ra[0] = SN(1, ra);
+var dyn rc1 = clone(ra);
+var dyn rc2 = clone(ra);
+rc2[0].v = 1;                        # splits the copy, changes no value
+assert(str(rc1) == str(rc2) && rc1 == rc2 && hash(rc1) == hash(rc2));
+assert(str(rc1) == "[SN(v: 1, next: [SN(v: 1, next: [...])])]");
+
+# 12. a ring through a box<P>: its back edge prints box(Name(...)) (the
+#     declaration's zero value calls the builtin box(), which a variable
+#     above shadows)
+struct BN { opt box<BN> next; int v; }
+box<BN> bn;
+bn.v = int(runtime(1));
+bn.next = bn;
+assert(str(bn) == "box(BN(next: box(BN(...)), v: 1))");
+assert(str([bn]) == "[box(BN(next: box(BN(...)), v: 1))]");
+
 print("ok");
 
 # break every cycle the program built (see LEAKS above)
+pop(ra);
+bn.next = none;
 cr.next = none;
 pop(cr.kids);
 cd.next = none;

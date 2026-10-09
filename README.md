@@ -1178,8 +1178,11 @@ print([a, a]);              # [[1, [...]], [1, [...]]]
 
   * **Printing** (`print`, `str`, the REPL's `=>` echo): a container that is
     already being printed further up is written `[...]`, `{...}` or, for a
-    struct, `Name(...)`. A container that appears at two places side by
-    side, neither inside the other, is printed in full at each, as `[a, a]`
+    class instance, `Name(...)` (`box(Name(...))` for a `box<P>`). A struct
+    value is always printed in full: a cycle through one passes through the
+    array, dict, class instance or box holding it, and that is where the
+    `...` appears. A container that appears at two places side by side,
+    neither inside the other, is printed in full at each, as `[a, a]`
     shows.
 
   * **`==` and `!=` compare by shape.** Two values are equal when walking
