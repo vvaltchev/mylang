@@ -17876,3 +17876,36 @@ and a compare used as a value; `corpus_diff --nolowmem` runs it off the
 arena) and the `-rt` entry `jit: a boxed compare's bool tag store does
 not borrow rcx twice`, which reaches the nesting under the nolowmem
 lane's `MYLANG_NO_LOWMEM=1 mylang -rt`.
+
+## #97 R1 follow-up - A DISCARDED REFERENCE RESULT IS RELEASED (2026-10-09)
+
+The R1 arms skip the result slot in their release scan, because a moved
+result was stamped `t_none` and its reference now lives in the dst. A
+DISCARDED result (`mk(x);`, `call.v _ = ...`, the dst word 0 / bare 1)
+moves nowhere: the result slot still owns the reference, and the scan
+skipped it anyway.
+
+- **The frameless arm LEAKED it.** The window is the native stack, which
+  nothing scans again: the reference stayed until a later call wrote
+  that slot - a counted store dropped it then (only the LAST call's
+  leaked), a raw write (`make.closure` into a temp) dropped it uncounted
+  (every call's: 40 closures for 40 calls). `func mk(int i) { return
+  str(i); } func g() { mk(int(runtime(1))); }` was a LeakSanitizer
+  report and a `census LEAK str`; dict, struct, box and closure results
+  alike (an ARRAY result declines to `jit_ret_norec`, which was right).
+  `MYLANG_JIT_OFF=norec` / `bakecallee` hid it by taking the site off
+  the frameless tier.
+- **The record-less arm DEFERRED it**: the dead segment window kept the
+  reference until a later push reused that window. No leak, but the
+  object outlived its last use, and a `refcount()` read between showed it.
+
+Both arms now release the result slot on the NO-WRITE path only (a
+`jmp` over it on the write path, so a moved result pays one jump and
+nothing else).
+
+Net: five new `jit_ret_ref_native` cases (string, dict, struct, box, and
+a temp argument), each making the object and reading its count in
+functions whose frames are gone by the next read - a temp of main holds
+a reference too and made the first version of the test pass vacuously -
+plus a discarded closure result counted through `g_live_funcobjs`. Both
+arms (frameless, and the `frameless` lever off).

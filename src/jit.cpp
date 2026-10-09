@@ -14663,7 +14663,27 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                     e.zero_reg32(RAX);            /* xor eax, eax */
                     st(RDX, 0, RAX);
                 }
+                /* a DISCARDED result (no dst: `f(x);`) was not moved
+                 * anywhere, so the result slot still OWNS its reference
+                 * - and the scan below skips that slot, which is right
+                 * only for a MOVED result. Release it on the no-write
+                 * path alone: a frameless window is the native stack,
+                 * which nothing scans again, so it leaked (a temp, the
+                 * next call's raw write, dropped it uncounted) */
+                const size_t j_fwrote = res_listed ? e.j32(0xEB) : 0;
                 e.patch32_here(j_fnw);                 /* no_write: */
+                if (res_listed) {
+                    const int32_t d = static_cast<int32_t>(
+                        res_slot * static_cast<int32_t>(sizeof(LValue)));
+                    ld(RAX, RBX, d + static_cast<int32_t>(L.off_type));
+                    cmp_d_imm8(RAX, L.type_t_off,
+                               static_cast<int8_t>(L.t_str_val));
+                    const size_t j_rtr = e.j32(0x7C);  /* jl: trivial */
+                    e.lea_rdi(d);                      /* reg:abi */
+                    e.call_direct_framefree(jit_release_slot);
+                    e.patch32_here(j_rtr);
+                    e.patch32_here(j_fwrote);
+                }
                 }                                      /* !ret_regs */
                 /* the release scan - the window dies with this frame,
                  * so every ref-listed slot but the moved result is
@@ -14868,7 +14888,29 @@ static void emit_ret_native(Emitter &e, const Chunk &ck, int res_slot,
                 for (int32_t o = 0; o < 24; o += 8)
                     st(RDX, o, RAX);
             }
+            /* a DISCARDED result still owns its reference in the result
+             * slot (the frameless arm's rule above): released on the
+             * no-write path alone - the scan skips that slot. Without
+             * it the reference outlived the frame, in a dead segment
+             * window, until a later push reused that window */
+            const size_t j_wrote = res_listed ? e.j32(0xEB) : 0;
             e.patch32_here(j_nw);                  /* no_write: */
+            if (res_listed) {
+                const int32_t d = static_cast<int32_t>(
+                    res_slot * static_cast<int32_t>(sizeof(LValue)));
+                ld(RAX, RBX, d + static_cast<int32_t>(L.off_type));
+                cmp_d_imm8(RAX, L.type_t_off,
+                           static_cast<int8_t>(L.t_str_val));
+                const size_t j_rtr = e.j32(0x7C);   /* jl: trivial */
+                e.push_reg(R8R);
+                e.push_reg(R10);
+                e.lea_rdi(d);                       /* reg:abi */
+                e.call_direct(jit_release_slot);
+                e.pop_reg(R10);
+                e.pop_reg(R8R);
+                e.patch32_here(j_rtr);
+                e.patch32_here(j_wrote);
+            }
             /* the release scan - the record-ful path's exact shape */
             for (const int32_t sl : ck.ref_slots) {
                 if (res_listed && sl == res_slot)
