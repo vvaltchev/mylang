@@ -1,0 +1,256 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#46/#47/#48): a container literal takes the type of the FIXED
+# place it lands in, element by element and at every nesting level - a
+# declared variable, an element, an append / push / insert, a typed
+# parameter, a struct field, a typed const, a box - so its numbers widen
+# to the declared type (bool -> int -> float) and its storage follows the
+# declared type (array<T?> general, array<float> flat, array<P> structs,
+# array<C> classes). Also literals baked at parse time (a constant
+# literal, a folded pure call building a typed container) and a store
+# into a declared field / nested element / box. Every value is asserted
+# as its string, which shows a float as a float; values come from
+# runtime() where a constant would fold away.
+
+struct P { int x; float y; }
+class C { int v; }
+struct S { array<float> a; dict<str, float> d; array<array<float?>> m;
+           float f; int i; opt array<int> o; dyn any; }
+struct T { S s; array<P> ps; }
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + got + ", expected " + exp);
+        bad = bad + 1;
+    }
+}
+
+var one = int(runtime(1));
+var two = int(runtime(2));
+var yes = one > 0;
+var half = float(runtime(0.5));
+
+# --- baked literals widen into the declared type, element by element
+array<int> ai = [true, false, 3];
+want("ai", str(ai), "[1, 0, 3]");
+want("ai storage", array_storage(ai), "int");
+array<float> af = [true];
+want("af", str(af), "[1.000000]");
+want("af storage", array_storage(af), "float");
+array<array<int>?> an = [none, [1]];
+want("an", str(an), "[<none>, [1]]");
+array<dict<str, float>?> dn = [none, {"a": 1}];
+want("dn", str(dn), "[<none>, {\"a\": 1.000000}]");
+dict<float, int> dk = {1: true, 2: 3};
+want("dk", str(dk[1]) + str(dk[2]) + str(keys(dk)[0] * 0),
+     "130.000000");
+dict<str, array<float>> dv = {"x": [1, 2], "y": []};
+want("dv", str(dv["x"]) + str(dv["y"]), "[1.000000, 2.000000][]");
+want("dv storage", array_storage(dv["x"]), "float");
+array<array<bool>> ab = [[true], []];
+want("ab storage", array_storage(ab[0]), "bool");
+array<dyn> ady = [[1], {"a": 1}, 2];
+ady[0] = "s";
+want("ady", str(ady), "[\"s\", {\"a\": 1}, 2]");
+# a default dict folded inside the literal is empty, so it fits; its
+# default is read as the declared float
+array<dict<str, float>> add = [dict(1)];
+want("add default", str(add[0]["q"]), "1.000000");
+dict<str, dict<int, float>> ddd = {"k": {1: 2}};
+want("ddd", str(ddd), "{\"k\": {1: 2.000000}}");
+
+# --- written (run-time) literals: the same, built in place
+array<float> f1 = [one, 2];
+want("f1", str(f1), "[1.000000, 2.000000]");
+want("f1 storage", array_storage(f1), "float");
+array<int> i1 = [yes, two];
+want("i1", str(i1), "[1, 2]");
+array<array<float?>> m1 = [[one], [none, two]];
+m1[0][0] = none;
+want("m1", str(m1), "[[<none>], [<none>, 2.000000]]");
+want("m1 storage", array_storage(m1[1]), "general");
+dict<str, array<float?>> dm = {"a": [one], "b": [half]};
+dm["a"][0] = none;
+want("dm", str(dm["a"]) + str(dm["b"]), "[<none>][0.500000]");
+dict<float, float> dff = {one: two};
+want("dff", str(dff), "{1.000000: 2.000000}");
+array<P> ap = [P(1, 2), P(one, 3)];
+want("ap", str(ap), "[P(x: 1, y: 2.000000), P(x: 1, y: 3.000000)]");
+want("ap storage", array_storage(ap), "struct");
+array<P?> apo = [none, P(one, 2)];
+want("apo storage", array_storage(apo), "general");
+apo[0] = P(2, 3);
+want("apo", str(apo[0]?.y), "3.000000");
+array<C> ac = [C(1), C(two)];
+want("ac", str(ac[1].v), "2");
+want("ac storage", array_storage(ac), "class");
+array<array<P>> app = [[P(one, 1)], []];
+append(app[1], P(2, 2));
+want("app", str(app[1][0].y), "2.000000");
+
+# --- typed constants: widened by the parser when it binds them
+const array<float> KF = [1, 2];
+want("KF", str(KF), "[1.000000, 2.000000]");
+const array<array<float?>> KN = [[1], [none]];
+var kn = KN[0];
+want("KN storage", array_storage(kn), "general");
+want("KN", str(KN), "[[1.000000], [<none>]]");
+const dict<str, float> KD = {"a": 1};
+want("KD", str(KD), "{\"a\": 1.000000}");
+const dict<float, array<float>> KDA = {1: [2]};
+want("KDA", str(KDA), "{1.000000: [2.000000]}");
+const array<int> KI = [true, 2];
+want("KI", str(KI), "[1, 2]");
+want("KI read", str(KI[0] + 1), "2");
+
+# constant expressions over typed constants, de-duplicated by key (a
+# slice with an absent / negative bound, a const builtin's call, a call
+# through a const array of functions)
+const KA2 = [1, 2, 3, 4];
+const ks1 = KA2[:2];
+const ks2 = KA2[1:];
+const ks3 = KA2[-3:-1];
+want("const slices", str(ks1) + str(ks2) + str(ks3), "[1, 2][2, 3, 4][2, 3]");
+const ksort = rev_sort(KA2);
+want("const call", str(ksort), "[4, 3, 2, 1]");
+pure func dup(v) => [v, v];
+const KFN = [dup];
+const kd1 = KFN[0](2);
+const kd2 = KFN[0](2);
+want("const call through an array", str(kd1) + str(kd2), "[2, 2][2, 2]");
+
+# --- a folded pure call builds its typed containers as a run does
+pure func mkf(int n) { array<float?> a = [n]; a[0] = none; return a; }
+want("mkf folded", str(mkf(1)), "[<none>]");
+want("mkf run", str(mkf(one)), "[<none>]");
+pure func mkd(int n) {
+    dict<str, array<float>> d = {"a": [n]};
+    d["a"][0] = n + 2;
+    return d;
+}
+want("mkd folded", str(mkd(1)), "{\"a\": [3.000000]}");
+want("mkd run", str(mkd(one)), str(mkd(1)));
+pure func mkv(int n) { var dyn a = [n]; a[0] = "s"; return a; }
+want("mkv", str(mkv(1)), "[\"s\"]");
+pure func mkp(int n) { array<P> a = [P(n, n)]; return a; }
+want("mkp", str(mkp(2)), "[P(x: 2, y: 2.000000)]");
+want("mkp storage", array_storage(mkp(2)), "struct");
+pure func mke(int n) { array<P> a = []; return len(a) + n; }
+want("mke", str(mke(1)), "1");
+pure func mki(int n) { array<int> a = [true, n]; return a; }
+want("mki", str(mki(2)), "[1, 2]");
+pure func mkb(int n) { array<bool> a = [n > 0]; return a; }
+want("mkb storage", array_storage(mkb(1)), "bool");
+pure func mkdd(int n) {
+    dict<float, float> d = {n: n};
+    return d;
+}
+want("mkdd", str(mkdd(1)), "{1.000000: 1.000000}");
+
+# a folded call's GENERAL array of class instances bound to an array<C>
+# takes the flat class storage (the instances are the constant's own)
+const KC = C(5);
+pure func mkc() { var dyn a = [KC]; return a; }
+array<C> acf = mkc();
+want("acf", str(acf) + array_storage(acf), "[C(v: 5)]class");
+pure func mkcd() { array<dyn> a = [KC, KC]; return a; }
+array<C> acf2 = mkcd();
+want("acf2", str(len(acf2)) + array_storage(acf2), "2class");
+
+# --- stores into a declared field / nested element / box widen
+var s = S([1], {"a": 1}, [[none]], 1, 1, none, 1);
+s.a = [one, 2];
+want("s.a", str(s.a), "[1.000000, 2.000000]");
+s.d = {"x": one};
+want("s.d", str(s.d), "{\"x\": 1.000000}");
+s.d["y"] = two;
+want("s.d y", str(s.d["y"]), "2.000000");
+s.m[0] = [one];
+s.m[0][0] = two;
+want("s.m", str(s.m), "[[2.000000]]");
+s.m[0][0] = none;
+want("s.m none", str(s.m), "[[<none>]]");
+s.o = [one];
+want("s.o", str(s.o), "[1]");
+s.o = none;
+want("s.o none", str(s.o), "<none>");
+s.any = "x";
+want("s.any", str(s.any), "x");
+s.a[0] = yes;
+want("s.a[0]", str(s.a[0]), "1.000000");
+
+# --- append / push / insert into a declared container widen the value
+append(s.a, one);
+push(s.a, yes);
+insert(s.a, 0, two);
+want("s.a grown", str(s.a),
+     "[2.000000, 1.000000, 2.000000, 1.000000, 1.000000]");
+insert(s.d, "z", one);
+want("s.d z", str(s.d["z"]), "1.000000");
+append(s.m, [one]);
+push(s.m, [none]);
+insert(s.m, 0, [two, none]);
+want("s.m grown", str(s.m),
+     "[[2.000000, <none>], [<none>], [1.000000], [<none>]]");
+append(s.m[1], one);
+want("s.m[1]", str(s.m[1]), "[<none>, 1.000000]");
+var t = T(S([], {}, [], 0, 0, none, 0), [P(1, 1)]);
+append(t.s.a, one);
+insert(t.s.d, "k", two);
+append(t.ps, P(two, 1));
+want("t", str(t.s.a) + str(t.s.d) + str(t.ps[1]),
+     "[1.000000]{\"k\": 2.000000}P(x: 2, y: 1.000000)");
+dict<float, float> dfl = {};
+insert(dfl, one, two);
+want("dfl", str(dfl), "{1.000000: 2.000000}");
+array<array<float>> mm = [[1]];
+append(mm[0], two);
+insert(mm, 0, [one]);
+mm[1][0] = yes;
+want("mm", str(mm), "[[1.000000], [1.000000, 2.000000]]");
+dict<str, array<int?>> dai = {"a": [none]};
+append(dai["a"], one);
+insert(dai["a"], 0, yes);
+dai["a"][1] = two;
+want("dai", str(dai), "{\"a\": [1, 2, 1]}");
+
+# --- an element store of a template's result, a dict value store
+func tf(v) => v + 1;
+array<int> ta = [0];
+ta[0] = tf(one);
+want("ta", str(ta), "[2]");
+dict<str, float> dvar = {};
+dvar["a"] = one;
+want("dvar", str(dvar), "{\"a\": 1.000000}");
+array<array<str>> xs = [[str(one)]];
+append(xs[0], "b");
+want("xs", str(xs), "[[\"1\", \"b\"]]");
+
+# --- a box holds its own element type
+var bf = box(1.5);
+*bf = two;
+want("bf", str(*bf), "2.000000");
+*bf += yes;
+want("bf +", str(*bf), "3.000000");
+var bi = box(3);
+*bi += yes;
+want("bi", str(*bi), "4");
+var bp = box(P(1, 2));
+bp.y = one;
+want("bp", str(bp.y), "1.000000");
+
+# --- a literal argument for a typed parameter
+func avg(array<float> xs) => sum(xs) / len(xs);
+want("avg", str(avg([one, 2])), "1.500000");
+func firstn(array<array<float?>> xs) { xs[0][0] = none; return xs; }
+want("firstn", str(firstn([[1.5], [two]])), "[[<none>], [2.000000]]");
+func dsum(dict<str, float> d) => d["a"] + d["b"];
+want("dsum", str(dsum({"a": one, "b": 2})), "3.000000");
+var lam = func(array<float?> xs) { append(xs, none); return xs; };
+want("lam", str(lam([one])), "[1.000000, <none>]");
+
+if (bad == 0)
+    print("all ok");
+else
+    print(str(bad) + " failure(s)");

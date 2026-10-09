@@ -1,0 +1,232 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> .. >> >> => S(a: [1.500000], d: {"a": 1.000000}, m: [[<none>]], any: 1)
+>> => 5
+>> => box(2)
+>> => "abc"
+>> => 1.500000
+>> TypeMismatchEx: unary +/- needs a number, got 'str' at line 10, col 1:4
+
+    -st;
+    ^^^
+>> => -5
+>> TypeMismatchEx: unary ~ needs an int, got 'float' at line 12, col 1:4
+
+    ~fl;
+    ^^^
+>> => -6
+>> TypeMismatchEx: '++'/'--' requires an int or float, got 'box<int>' (write (*bx)++ for its value) at line 14, col 1:3
+
+    bx++;
+    ^^
+>> TypeMismatchEx: '++'/'--' requires an int or float, got 'box<int>' (write (*bx)-- for its value) at line 15, col 1:3
+
+    bx--;
+    ^^
+>> TypeMismatchEx: '++'/'--' requires an int or float, got 'str' at line 16, col 1:3
+
+    st++;
+    ^^
+>> TypeMismatchEx: can only throw a struct instance, got 'int' at line 17, col 7:8
+
+    throw 5;
+          ^
+>> TypeMismatchEx: can only throw a struct instance, got 'str' at line 18, col 7:9
+
+    throw st;
+          ^^
+>> Undefined variable 'nosuch' at line 19, col 1:12
+
+    throw nosuch;
+    ^^^^^^^^^^^
+>> .. .. >> => 5
+>> .. .. .. >> => 5
+>> => 0
+>> TypeErrorEx: Struct 'P' has no member 'nope' at line 30, col 14:20
+
+    func g1() => P.nope;
+                 ^^^^^^
+>> TypeErrorEx: Field 'x' needs an instance at line 31, col 14:17
+
+    func g2() => P.x;
+                 ^^^
+>> TypeMismatchEx: operator does not apply to 'int' and 'box<int>' ('bx' is a box: read its value with *bx) at line 32, col 1:7
+
+    1 + bx;
+    ^^^^^^
+>> TypeMismatchEx: operator does not apply to 'box<int>' and 'int' ('bx' is a box: read its value with *bx) at line 33, col 1:7
+
+    bx * 2;
+    ^^^^^^
+>> => 1
+>> TypeMismatchEx: operator does not apply to 'int' and 'box<int>' ('bx' is a box: read its value with *bx) at line 35, col 1:8
+
+    q += bx;
+    ^^^^^^^
+>> TypeMismatchEx: cannot compare 'str' with 'int' at line 36, col 1:7
+
+    st < 1;
+    ^^^^^^
+>> => true
+>> TypeMismatchEx: cannot compare 'int' with 'str' at line 38, col 1:7
+
+    1 < st;
+    ^^^^^^
+>> => true
+>> NullabilityEx: a box<int> cannot hold none at line 40, col 7:11
+
+    *bx = none;
+          ^^^^
+>> TypeMismatchEx: a box<int> cannot hold 'float' at line 41, col 7:10
+
+    *bx = 2.5;
+          ^^^
+>> TypeMismatchEx: a box<int> cannot hold 'float' at line 42, col 8:11
+
+    *bx += 1.5;
+           ^^^
+>> TypeMismatchEx: a box<int> cannot hold 'str' at line 43, col 7:9
+
+    *bx = st;
+          ^^
+>> => 5
+>> => 10
+>> TypeMismatchEx: a box<int> cannot hold 'box<int>' ('bx' is a box: read its value with *bx) at line 46, col 7:9
+
+    *bx = bx;
+          ^^
+>> => 10
+>> TypeMismatchEx: an element of type 'float' cannot hold 'str' at line 48, col 10:13
+
+    s.a[0] = "x";
+             ^^^
+>> >> >> TypeMismatchEx: an element of type 'float?' cannot hold 'str' at line 51, col 13:16
+
+    s.m[0][0] = "x";
+                ^^^
+>> TypeMismatchEx: field 'a' expects 'array<float>' but got 'array<str>' at line 52, col 7:11
+
+    s.a = [st];
+          ^^^^
+>> TypeMismatchEx: field 'a' expects 'array<float>' but got 'array<str>' at line 53, col 7:12
+
+    s.a = ["x"];
+          ^^^^^
+>> TypeMismatchEx: an element of type 'float' cannot hold 'str' at line 54, col 12:15
+
+    s.d["k"] = "v";
+               ^^^
+>> TypeMismatchEx: an element of type 'float' cannot hold 'str' at line 55, col 13:16
+
+    append(s.a, "x");
+                ^^^
+>> TypeMismatchEx: an element of type 'float' cannot hold 'str' at line 56, col 11:14
+
+    push(s.a, "x");
+              ^^^
+>> TypeMismatchEx: an element of type 'float' cannot hold 'str' at line 57, col 16:19
+
+    insert(s.a, 0, "x");
+                   ^^^
+>> TypeMismatchEx: an element of type 'float' cannot hold 'str' at line 58, col 18:21
+
+    insert(s.d, "k", "v");
+                     ^^^
+>> TypeMismatchEx: an element of type 'str' cannot hold 'int' at line 59, col 13:14
+
+    insert(s.d, 1, 2.5);
+                ^
+>> TypeMismatchEx: an element of type 'array<float?>' cannot hold 'array<str>' at line 60, col 13:18
+
+    append(s.m, ["x"]);
+                ^^^^^
+>> => [[<none>], [<none>, 1.000000]]
+>> TypeMismatchEx: an element of type 'array<float?>' cannot hold 'array<str>' at line 62, col 16:20
+
+    insert(s.m, 0, [st]);
+                   ^^^^
+>> => [[<none>], [<none>, 1.000000], []]
+>> => [[<none>], [<none>, 1.000000], []]
+>> TypeMismatchEx: cannot change a field of 'p': a const parameter's struct is read-only at line 65, col 22:25
+
+    func cp(const P p) { p.x = 1; return p; };
+                         ^^^
+>> TypeMismatchEx: cannot change the value of 'b': a const parameter's box is read-only at line 66, col 30:32
+
+    func cpb(const box<int> b) { *b = 1; };
+                                 ^^
+>> TypeMismatchEx: cannot change a field of 'b': a const parameter's box is read-only at line 67, col 29:32
+
+    func cpbp(const box<P> b) { b.x = 1; };
+                                ^^^
+>> >> => 2.000000
+>> >> => [3.000000]
+>> => [1, 2]
+>> TypeMismatchEx: cannot '++'/'--' a const at line 73, col 1:5
+
+    C2++;
+    ^^^^
+>> Undefined variable 'nosuch' at line 74, col 2:8
+
+    -nosuch;
+     ^^^^^^
+>> Undefined variable 'nosuch' at line 75, col 2:8
+
+    ~nosuch;
+     ^^^^^^
+>> => true
+>> => -2
+>> => H(b: box(1), p: P(x: 1, y: 2.000000))
+>> TypeMismatchEx: '++'/'--' requires an int or float, got 'box<int>' at line 79, col 1:5
+
+    hh.b++;
+    ^^^^
+>> TypeMismatchEx: operator does not apply to 'str' and 'int' at line 80, col 1:11
+
+    st + 1 - 2;
+    ^^^^^^^^^^
+>> TypeErrorEx: Expected array at line 81, col 8:11
+
+    append(s.d, 1);
+           ^^^
+>> Undefined variable 'nosuch' at line 82, col 10:16
+
+    s.a[0] = nosuch();
+             ^^^^^^
+>> Undefined variable 'nosuch' at line 83, col 1:9
+
+    nosuch.x = 1;
+    ^^^^^^^^
+>> TypeMismatchEx: type 'box<int>' has no members (only a struct or dict does) at line 84, col 1:3
+
+    bx.foo;
+    ^^
+>> >> => 2
+>> TypeMismatchEx: 'xa' is declared 'array<array<int>>' but is assigned 'array<dict<str,str>>' at line 87, col 19:21
+
+    array<array<int>> xa = [{"a": st}];
+                      ^^
+>> TypeMismatchEx: 'xb' is declared 'array<dict<str,int>>' but is assigned 'array<array<str>>' at line 88, col 23:25
+
+    array<dict<str, int>> xb = [[st]];
+                          ^^
+>> => {"abc": 1.000000}
+>> => {"abc": 1.000000}
+>> TypeMismatchEx: 'xd' is declared 'dict<str,float>' but is assigned 'dict<float,int>' at line 91, col 18:20
+
+    dict<str, float> xd = {fl: 1};
+                     ^^
+>> TypeMismatchEx: 'xe' is declared 'dict<str,float>' but is assigned 'dict<str,str>' at line 92, col 18:20
+
+    dict<str, float> xe = {"a": st};
+                     ^^
+>> => {"a": [1]}
+>> >> => {"b": [2]}
+>> => [[1]]
+>> => [[3]]
+>> => [[3]]
+>> .. SyntaxError at line 99, col 13
+
+    struct A1 { opt B1 u; opt B1 w; } struct A2 {
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+'opt' is only allowed on dyn/array/dict and class-typed fields
+>> 
