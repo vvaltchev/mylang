@@ -17848,3 +17848,31 @@ and caught negative counts with the counter in rcx) and the `-rt` entry
 `jit: a shift's negative-count raise keeps a local pinned in rcx`. Both
 were checked to reach the borrow (`push rcx` before the count load in
 `-vdj`).
+
+## The tag seams do not borrow a register the caller borrowed (2026-10-09)
+
+**The bug.** Off the low-address arena (`MYLANG_NO_LOWMEM=1`) a tag is
+no imm32, so `store_type_tag_via` and `cmp_mem_tag` BUILD it in a
+scratch register, pushing that register first when it is occupied. Their
+sibling `cmp_reg_tag_via` had learned (56_xcall_pins) that a register the
+CALLER already borrowed must not be pushed again - its pin is saved and
+the caller's pop restores it - but the other two had not. `store_dst_bool`
+takes its scratch through a `RefScratch`, which borrows a pinned rcx when
+the allocator refuses a grant (every caller-saved register holding a
+pin), so a boxed compare's bool store - a `dyn` loop condition under
+seven pinned ints - pushed rcx twice: REGTRACK aborted ("NESTED borrow of
+the same register", opcode CmpV). The emitted code was correct (two
+pushes, two pops), so an unchecked build printed the right answer; the
+tracker's model of it was not, and a nested borrow's inner pop ending the
+outer borrow is exactly what it exists to catch.
+
+**The fix.** Both seams skip the push (and the `scratch()` assert) for a
+register in `trk_borrowed` - `cmp_reg_tag_via`'s rule, now on all three
+members of the family. `cmp_mem_tag` was not observed nesting; it is
+fixed because it is the same enumeration.
+
+**Nets.** `tests/functional/87_bool_tag_borrow.my` (the loop condition
+and a compare used as a value; `corpus_diff --nolowmem` runs it off the
+arena) and the `-rt` entry `jit: a boxed compare's bool tag store does
+not borrow rcx twice`, which reaches the nesting under the nolowmem
+lane's `MYLANG_NO_LOWMEM=1 mylang -rt`.
