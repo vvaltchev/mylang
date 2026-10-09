@@ -43616,6 +43616,68 @@ static bool jit_two_address()
 #endif
 }
 
+/*
+ * ForLoopStep's PINNED-counter arm with a literal step that does not fit
+ * an imm32. The arm stepped the pin by an imm32 for a literal in range
+ * and fell into its SLOT arm for every other literal, reading the frame
+ * at the step value times the slot size (`add r11, [rbx + 7e9*48]`) - a
+ * SEGV in every build. The value and the arm: g_jit_step_imm is bumped
+ * by the emitted code of the pinned arms only, so a run that answers
+ * right from the memory arm (or the interpreter) fails here too.
+ */
+static bool jit_wide_literal_step()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const std::vector<const char *> src = {
+        "func up(int n) { var c = 0;",
+        "    for (var k = 0; k < 50000000000; k += 7000000000) c += n;",
+        "    return c; }",
+        "func down(int n) { var c = 0;",
+        "    for (var k = 0; k > -50000000000; k -= 7000000000) c += n;",
+        "    return c; }",
+        "func edge(int n) { var c = 0;",
+        "    for (var k = 0; k < 10000000000; k += 2147483648) c += n;",
+        "    return c; }",
+        "var n = int(runtime(10));",
+        "print(up(n) + down(n) * 1000 + edge(n) * 1000000);",
+    };
+    const unsigned long s0 = g_jit_step_imm;
+    std::ostringstream cap;
+    std::streambuf *old = cout.rdbuf(cap.rdbuf());
+    try {
+        std::string joined;
+        for (const char *l : src) { joined += l; joined += "\n"; }
+        std::vector<Tok> toks;
+        lexer(joined, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        vm_execute(root.get());
+    } catch (...) { }
+    cout.rdbuf(old);
+    const unsigned long steps = g_jit_step_imm - s0;
+    std::string got = cap.str();
+    while (!got.empty() && (got.back() == '\n' || got.back() == ' '))
+        got.pop_back();
+    bool ok = true;
+    if (got != "50080080") {
+        cout << "  wide step: got \"" << got << "\", want \"50080080\"\n";
+        ok = false;
+    }
+    if (steps == 0) {
+        cout << "  wide step: the PINNED counter arm never ran\n";
+        ok = false;
+    }
+    return ok;
+#else
+    return true;
+#endif
+}
+
 
 /*
  * #101 (the peephole, levels 1-2): the VALUE-immediate short forms and
@@ -55579,6 +55641,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: two-address arithmetic `<op> [slot], reg` for dst = dst OP b "
       "- engages per MR-encodable op, declines for imul (#96)",
       jit_two_address },
+    { "jit: a counted loop's literal step that does not fit an imm32 "
+      "steps a PINNED counter right (no slot read)",
+      jit_wide_literal_step },
     { "jit: #100 mul strength reduction - bytecode shl rewrite, planned "
       "lea/shl forms execute, values match the tree-walker",
       jit_mul_strength_check },
