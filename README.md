@@ -1111,6 +1111,13 @@ runtime instead.
     A float prints with six decimals (`-0.000000` for negative zero),
     an infinity as `inf` / `-inf`, and a NaN always as `nan` - its sign
     is never shown.
+    An int meets a float only at an operator with a float operand, where
+    the int converts to a float: an operator between two ints is an int
+    operator even inside an expression that also holds a float, and the
+    operators of one precedence level apply left to right. So with
+    `var i = 7;`, `i / 2 * 1.0` is `3.0` (the int division first), while
+    `1.0 * i / 2` is `3.5`; and `i * 4611686018427387904 * 0.5` wraps
+    before it halves.
 
   * **String**
     A string like "hello". Strings are immutable and support slices (e.g.

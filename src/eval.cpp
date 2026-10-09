@@ -4187,6 +4187,14 @@ int_type TypedScalarExpr::eval_int_body(EvalContext *ctx) const
 
 float_type TypedScalarExpr::eval_float_body(EvalContext *ctx) const
 {
+    /* An INT node asked for a float (an operand of a float operator, a
+     * float comparison, a float destination) computes in int and
+     * converts the RESULT: its operators are int operators - `j / 2` is
+     * 3 whatever reads it, and `mx + 1` wraps. Reading its operands as
+     * floats instead turned `(j / 2) * 1.0` into 3.5. */
+    if (kind == TypeHint::i && (cat == Cat::arith || cat == Cat::neg))
+        return static_cast<float_type>(eval_int_body(ctx));
+
     switch (cat) {
 
         case Cat::neg: {

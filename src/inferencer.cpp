@@ -7381,6 +7381,41 @@ make_typed(TypedScalarExpr::Cat cat, TypeHint kind, TypeHint result_th,
     return t;
 }
 
+/*
+ * A FLOAT arithmetic chain whose LEADING operands are ints: the operators
+ * between them are INT operators. The operators apply left to right, so
+ * `i / 3 * 0.5` divides two ints (truncating) and only then meets the
+ * float, and `big * 4 * 0.5` wraps before it halves - the boxed ladder
+ * (num_bin_op) computes exactly that. A typed float chain reads every
+ * operand as a float, so it computed 2.0 / 3.0. The int prefix becomes an
+ * int TypedScalarExpr, the chain's first operand; the float loop then
+ * starts at the first float operand, and an int operand AFTER it converts
+ * as num_bin_op converts it (float OP int is float OP float(int)).
+ */
+static void split_int_prefix(MultiOpConstruct *mo)
+{
+    size_t k = 0;
+    while (k < mo->elems.size()
+           && operand_th(mo->elems[k].second.get()) != TypeHint::f)
+        k++;
+    if (k < 2)
+        return;             /* no int operator before the first float */
+    auto pre = std::make_unique<TypedScalarExpr>(
+        TypedScalarExpr::Cat::arith, TypeHint::i);
+    mo->copy_base_fields(*pre);
+    pre->th = TypeHint::i;
+    pre->th_bool = false;            /* arithmetic yields an int */
+    pre->start = mo->elems[0].second->start;
+    pre->end = mo->elems[k - 1].second->end;
+    for (size_t x = 0; x < k; x++)
+        pre->elems.push_back(std::move(mo->elems[x]));
+    mo->elems.erase(mo->elems.begin(),
+                    mo->elems.begin() + static_cast<std::ptrdiff_t>(k));
+    mo->elems.insert(mo->elems.begin(),
+                     std::make_pair(Op::invalid,
+                                    unique_ptr<Construct>(std::move(pre))));
+}
+
 /* Rewrite a single node into a TypedScalarExpr when its operands are statically
  * int/float; else return it unchanged. Children are already specialized. */
 static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
@@ -7396,9 +7431,11 @@ static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
         if (n->th == TypeHint::i && ops_scalar(mo, false))
             return make_typed(TypedScalarExpr::Cat::arith, TypeHint::i,
                               TypeHint::i, mo);
-        if (n->th == TypeHint::f && ops_scalar(mo, true))
+        if (n->th == TypeHint::f && ops_scalar(mo, true)) {
+            split_int_prefix(mo);
             return make_typed(TypedScalarExpr::Cat::arith, TypeHint::f,
                               TypeHint::f, mo);
+        }
         return n;
     }
 
