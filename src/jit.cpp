@@ -3714,8 +3714,15 @@ struct Emitter {
          * this path (and only this path) writes the register, so every
          * caller is covered at once and the on-arena form still emits
          * neither push nor pop (found by the tracker's OFF-ARENA run:
-         * store_dst_bool passed a pinnable rcx here). */
-        const bool sp = reg_is_occupied(scratch);
+         * store_dst_bool passed a pinnable rcx here).
+         * ⛔ Unless the CALLER already borrowed it - cmp_reg_tag_via's
+         * rule, which this seam lacked: store_dst_bool's RefScratch
+         * pushes a pinned rcx when the allocator refuses a grant, and
+         * a second push here was a NESTED borrow (REGTRACK aborts on
+         * it: a boxed compare in a loop with seven pinned ints, under
+         * MYLANG_NO_LOWMEM=1). The caller's pop restores the pin. */
+        const bool sp = reg_is_occupied(scratch)
+                        && !(trk_borrowed & (1u << scratch));
         if (sp)
             push_reg(scratch);
         movabs(scratch, reinterpret_cast<uint64_t>(tag));
@@ -6366,11 +6373,14 @@ struct Emitter {
             return;
         }
         /* the clobber is declared where it happens (cmp_reg_tag_via's
-         * rule), and `pop` preserves the flags the caller's jcc reads */
-        const bool sp = reg_is_occupied(sc);
+         * rule), and `pop` preserves the flags the caller's jcc reads.
+         * A register the CALLER already borrowed is not borrowed again
+         * (cmp_reg_tag_via's other rule - a nested borrow) */
+        const bool sp = reg_is_occupied(sc)
+                        && !(trk_borrowed & (1u << sc));
         if (sp)
             push_reg(sc);
-        else
+        else if (!(trk_borrowed & (1u << sc)))
             scratch(sc);
         movabs(sc, static_cast<uint64_t>(
                        reinterpret_cast<uintptr_t>(tag)));

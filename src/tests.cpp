@@ -2432,6 +2432,31 @@ static const std::vector<test> tests =
     },
 
     {
+        /* Off the low-address arena (MYLANG_NO_LOWMEM=1, the -rt
+         * nolowmem lane) a bool store's type tag is built in a scratch
+         * register by store_type_tag_via. With the caller-saved half
+         * full of pins, store_dst_bool's RefScratch borrows a pinned
+         * rcx, and the seam pushed it a second time - a NESTED borrow
+         * the checked build's register tracker aborts on. A boxed
+         * compare (a dyn loop condition) under seven pinned ints. */
+        "jit: a boxed compare's bool tag store does not borrow rcx twice",
+        {
+            "func f(int n) {",
+            "    var p = 11; var q = 12; var r = 13; var s = 14;",
+            "    var t = 15; var u = 16; var v = 17;",
+            "    var dyn d = runtime(0);",
+            "    while (d < n) {",
+            "        p &= 1023; q &= 1023; r &= 1023; s &= 1023;",
+            "        t &= 1023; u &= 1023; v &= 1023;",
+            "        d = d + 1;",
+            "    }",
+            "    return p + q + r + s + t + u + v;",
+            "}",
+            "assert(f(runtime(5)) == 98);",
+        },
+    },
+
+    {
         /* APPROACH A - container-store helper ops
          * (plans/archived/native-aot.md): a
          * flat-array element STORE `a[i] = v` / `a[i] OP= v` inside a JIT run
