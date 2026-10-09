@@ -1,0 +1,86 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> => [1, 2, 3]
+>> => {"x": 1}
+>> => 5
+>> >> => P(x: 1, y: 2)
+>> usage: :show <function-or-expression>
+>> 14
+>> 14
+>> (nothing to show)
+>> nan
+>> -inf
+>> 0.5 * dd
+>> "q\"b\\s\n\t\r"
+>> {"k": dd, "j": 2}
+>> dd > 2 ? "big" : "small"
+>> dy ?? 4
+>> opt_p?.x
+>> opt_p.y + 1
+>> -dd
+>> !(dd > 2) || dd == 3 && dd != 4
+>> -(dd + 1) * 2
+>> (dd + 1) * (dd - 1) / (dd % 3)
+>> dd - (dd - 1)
+>> a[1:] + a[:dd] + a[0:dd]
+>> a[dd - 4]
+>> d["x"]
+>> len(a) + 1
+>> runtime()
+>> dd++
+>> --dd
+>> dd++ * 2
+>> --dd * 2
+>> dd += 3
+>> dd = dd * 2
+>> [1.5, 2.5, true, none]
+>> if (dd > 3) {
+    print(1);
+} else {
+    print(2);
+}
+
+>> while (dd > 100) {
+    dd--;
+}
+
+>> for (int i = 0; i < 3; i++) {
+    print(i);
+}
+
+>> foreach (var v in a) {
+    print(v);
+}
+
+>> {
+    print(1);
+    print(2);
+}
+
+>> /* pure */ func q(x, y) => x * y;
+
+>> try {
+    print(1);
+} catch (TypeErrorEx as e) {
+    print(2);
+}
+
+>> print(1)
+print(2)
+>> SyntaxError at line 1, col 4
+
+    1 +;
+       ^
+Expected expression, got ';'
+>> SyntaxError at line 1, col 3
+
+    (1;
+      ^
+Expected operator ')', got: ';'
+>> => 5
+>> => [1, 2, 3]
+>> >> => 3
+>> /* pure */ func sh(x) => x + 1;
+ 
+>> dd * 2 + 4 
+>> => "a"
+>> 

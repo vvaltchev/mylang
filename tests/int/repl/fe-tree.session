@@ -1,0 +1,39 @@
+# :tree CODE dumps the (parse-time folded) syntax tree without committing.
+struct P { int x; int y; }
+var p = P(1, 2)
+var b = box(3)
+:tree
+:tree "a\"b\\c\rd\ne\tf\v\a\b"
+:tree var d = {"k": 1, "j": p.x}
+:tree *b = *b + 1
+:tree p.x++
+:tree --p.y
+:tree var q = p?.x ?? 0
+:tree P(y: 5, x: 6)
+:tree struct S { int a; const k = 2; }
+:tree class K { str s; }
+:tree var f = func [p] (z) => z + 1
+:tree func noparams { return 1; }
+:tree var s1 = "abc"[runtime(1):]
+:tree var s2 = "abc"[:runtime(2)]
+:tree try { print(1); } catch (TypeErrorEx, OutOfBoundsEx as e) { print(e); }
+:tree try { print(1); } catch { rethrow; }
+:tree foreach (var k, v in [[5, 6]]) { print(k, v); }
+:tree for (;;) { break; }
+:tree while (p.x > 9) { continue; }
+:tree if (p.x > 0) { print(1); }
+:tree if (true) { print(1); } else { print(2); }
+:tree var x, y = [1, 2]
+:tree -p.x
+:tree p.x > 1 ? 1 : 2
+:tree throw P(1, 2)
+:tree try { print(1); } catch (TypeErrorEx) { print(2); }
+:tree while (runtime(false));
+:tree for (;;);
+:tree foreach (v in [1]);
+:tree if (runtime(true));
+:tree func r() { return; }
+:tree P(1, y: 2)
+:s 1;
+:tree 2 +
+p

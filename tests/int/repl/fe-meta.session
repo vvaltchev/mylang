@@ -1,0 +1,79 @@
+# The inspection and session commands: :globals, :type, :undef, :trace,
+# :source (a path relative to the repo root, int_run's cwd), unknown ones.
+:globals
+:type
+:type ;
+:undef
+:undef nothing_here
+:frob
+struct P { int x; int y; }
+class K { int v; }
+const CK = 7
+const CA = [1, 2]
+const CP = P(3, 4)
+var pv = P(1, 2)
+var kv = K(5)
+var xs = [1.5, 2.5]
+var opt_i = runtime(true) ? 3 : none
+func f(a, int b) => a * b
+:globals
+f(2, 3)
+:type xs
+:type opt_i
+:type f
+:type pv
+:t xs[0] + 1;
+:type var t = 3; t * 2.0
+:type [pv, pv]
+:type ({"k": [1]})
+:type 1 +
+t
+:undef xs
+:type xs
+xs = "now a string"
+:type xs
+:undef CK
+:undef f$0
+:g
+struct In { int a; }
+struct S {
+    bool b; str s; array<int> xs; dict<str,float> m; box<int> bx;
+    In inner; opt array<In> ys; float f;
+}
+func df(dyn x, opt y) => 1
+:globals
+:type none
+:type true
+:type [true, false]
+:type ["a", "b"]
+:type []
+:type [1, "a"]
+:type ({"a": [1]})
+:type In(1)
+:type [df]
+trace("fold", true)
+tracing()
+trace("bogus", true)
+trace(1, true)
+traceoff(1)
+traceoff()
+tracing()
+:trace
+:trace bogus infer
+:trace bogus1 bogus2 off
+:trace fold inline on
+:trace
+:trace inline off
+:trace
+:trace none
+:trace infer
+var tr = 2 * 21
+:trace off
+var tr2 = 1
+:source
+:source tests/functional/no_such_unit.my
+:load tests/functional/07_exceptions.my
+hist
+risky(4)
+:q
+print("never reached")

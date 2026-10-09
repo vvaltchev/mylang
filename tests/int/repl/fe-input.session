@@ -1,0 +1,63 @@
+# Multi-line inputs, auto-inserted semicolons, strings and comments that
+# span lines, and how lex / parse / type / runtime errors are reported.
+var s = "one
+two \" still
+three"
+s
+var c = 1 /* an inline comment */ + 2 /* and
+a block comment over
+two lines */ + 3
+c
+var t = c +
+    10
+t
+var h = t /
+    2 /* a * b */ + 1
+h
+t +=
+    5
+t
+var arr = [
+    1,
+    2
+]
+arr
+var d = {
+    "k": 1,
+    "j": [2, 3]
+}
+d
+func f(x) {
+    # a comment line inside a block
+    var y = x * 2
+    return y
+}
+f(4)
+var e = "esc \\ back\tslash \"q\" end"
+e
+none
+null
+struct Q { opt dyn v; }
+var qn = Q(none)
+qn.v
+var an = [none, 1]
+an[0]
+arr[0]
+d.k
+d["j"]
+var wide = [["alpha", "beta", "gamma", "delta"],
+    ["epsilon", "zeta", "eta", "theta", "iota"], [1000000, 2000000]]
+2_
+}
+var q = )
+f(1, 2)
+var ty = 1
+ty = "str"
+arr[10]
+func g(n) {
+    return arr[n]
+}
+g(7)
+var big = 9223372036854775807 + int(runtime(1))
+var bad = "unterminated
+at the end of the input

@@ -1,0 +1,55 @@
+# :show EXPR renders a non-committed expression or statement after name
+# resolution and parse-time folding; nothing it shows is committed.
+struct P { int x; int y; }
+var a = [1, 2, 3]
+var d = {"x": 1}
+var dd = int(runtime(5))
+var dyn dy = runtime(none)
+var opt_p = P(1, 2)
+:show
+:show 2 + 3 * 4
+:show 2 + 3 * 4;
+:show ;
+:show nan
+:show -inf
+:show 0.5 * dd
+:show "q\"b\\s\n\t\r"
+:show ({"k": dd, "j": 2})
+:show (dd > 2) ? "big" : "small"
+:show dy ?? 4
+:show opt_p?.x
+:show opt_p.y + 1
+:show -dd
+:show !(dd > 2) || dd == 3 && dd != 4
+:show -(dd + 1) * 2
+:show (dd + 1) * (dd - 1) / (dd % 3)
+:show dd - (dd - 1)
+:show a[1:] + a[:dd] + a[0:dd]
+:show a[dd - 4]
+:show d["x"]
+:show len(a) + 1
+:show runtime()
+:show dd++
+:show --dd
+:show (dd++) * 2
+:show (--dd) * 2
+:show dd += 3
+:show dd = dd * 2
+:show [1.5, 2.5, true, none]
+:show if (dd > 3) { print(1); } else { print(2); }
+:show while (dd > 100) { dd--; }
+:show for (var i = 0; i < 3; i++) { print(i); }
+:show foreach (var v in a) { print(v); }
+:show { print(1); print(2); }
+:show func q(x, y) => x * y
+:show try { print(1); } catch (TypeErrorEx as e) { print(2); }
+:show print(1); print(2)
+:show 1 +
+:show (1
+dd
+a
+func sh(x) => x + 1
+sh(2)
+print(show(sh))
+print(show(dd * 2 + sh(3)))
+show(a)

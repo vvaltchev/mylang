@@ -1,0 +1,82 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> REPL commands  (:help <command> for one; the leading ':' is optional)
+
+  :help [topic]
+      Open this reference.
+  :trace [<cat>...] on|off
+      Toggle the diagnostic tracer that narrates the compiler's reasoning.
+  :globals
+      A table of every global (vars, consts, funcs, structs) with its type.
+  :type <expr>
+      Show a type without committing anything.
+  :show <function-or-expression>
+      Render a function (or expression) optimized AST back into MyLang code.
+  :tree <code>
+      Print the const-folded syntax tree of <code> (non-committing).
+  :analyze <code>
+      Reprint <code> colored by which optimizations fired (non-committing).
+  :source <file>
+      Evaluate a file as if it were typed at the prompt, one unit at a time.
+  :undef <name>
+      Remove a global symbol so it can be redeclared (even with a new type).
+  :quit
+      Exit the REPL (also Ctrl-D at the prompt).
+>> :undef <name>
+    Remove a global symbol so it can be redeclared (even with a new type).
+    A REPL-only convenience: a script's symbols are fixed slots at compile time, so there is no `undef` builtin - a script re-defines a name.
+    [REPL command]
+>> rand(lo, hi)
+    A random int in [lo, hi] inclusive (raises if lo > hi).
+    [Random numbers; runtime (never const-folded)]
+>> array(n, [fill])
+    A new array of n elements (flat 0/0.0/false, or all = fill).
+    Non-const, so array(N) is always a runtime call and a huge array isn't baked into the tree. Storage is type-driven.
+    [Arrays; runtime (never const-folded)]
+>> append(a, x)
+    Append x to array a (mutates a).
+    [Arrays; runtime (never const-folded)]
+>> push(a, x)
+    An alias for append() (symmetry with pop()).
+    [Arrays; runtime (never const-folded)]
+>> pop(a)
+    Remove and return the last element of a.
+    [Arrays; runtime (never const-folded)]
+>> insert(c, i, x)
+    Insert x at index/key i in array/dict c.
+    [Arrays; runtime (never const-folded)]
+>> erase(c, i)
+    Erase the element at index/key i from array/dict c.
+    [Arrays; runtime (never const-folded)]
+>> dynarray(a)
+    A fresh general (polymorphic, array<dyn>) copy of a - the manual promotion.
+    There is no automatic runtime promotion; storage is fixed at creation. clone()/deepclone() preserve the layout.
+    [Arrays; runtime (never const-folded)]
+>> deepclone(x)
+    A fully-mutable deep copy at every level - the way to mutate a const value.
+    [Type conversion & values; runtime (never const-folded)]
+>> clone(x)
+    A shallow (one-level) copy; nested const objects stay shared/read-only.
+    [Type conversion & values; const (folds with const arguments)]
+>> globals()
+    Sorted names bound in the global scope (vars/funcs/structs), excluding builtins.
+    A const scalar is folded away and absent here (:globals adds it); a script's top-level vars are slots, so a script lists only map-resident names.
+    [Reflection & introspection; runtime (never const-folded)]
+    (also a REPL command - :help :globals)
+>> Unknown builtin category 'nosuch'. Try :help builtins
+>> No help for ':nosuch'. Try :help, :help builtins, :help language, or :help commands
+>> No help for 'nosuch'. Try :help, :help builtins, :help language, or :help commands
+>> Random numbers
+
+  rand(lo, hi)
+      A random int in [lo, hi] inclusive (raises if lo > hi).
+  randf(lo, hi)
+      A random float in [lo, hi] (raises if lo > hi or not finite).
+>> Slices (copy-on-write)
+
+var s = a[1:3];
+
+A slice is a cheap VIEW until written: reading it shares the parent's storage, and a write clones first so logically-distinct arrays never bleed into each other. intptr(x) reveals when two values share storage.
+>> Exceptions
+
+  Exceptions  [trycatch]
+>> 

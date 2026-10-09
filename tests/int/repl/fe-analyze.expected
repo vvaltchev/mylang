@@ -1,0 +1,23 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> usage: :analyze <code>
+>> var zz = 1;
+>> Undefined variable 'zz' at line 4, col 1:3
+
+    zz;
+    ^^
+>> func sq(x) => x * x; var a = [1, 2]; print(sq(a[0]));
+>> if (false) { print(1); } else { print(2); };
+>> func k(n) { if (n > 0) { return 1; } return 2; } print(k(3));
+>> func z(a) { var s = 0.0; foreach (v in a) { s += v; } return s; };
+>> var d = [1, "a"]; const c = 3; var e = c * 2; var f = [true];
+>> func w(n) { try { return 10 / n; } catch { return 0; } } w(0);
+>> func ct(n) { var s = 0; for (var i = 0; i < n; i++) { s++; } };
+>> func bg(n) { var t = 0; for (var i = 0; i < 9; i++) { t += n; } };
+>> func ac(x) { var y = x; return y + 1; } func us(q) => ac(q);
+>> SyntaxError at line 1, col 9
+
+    var x = ;
+            ^
+Expected expression, got ';'
+>> 1 + 2;
+>> 
