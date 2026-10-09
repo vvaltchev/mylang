@@ -1,0 +1,612 @@
+# INT-ENGINES: tw default nj noopt
+# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra ; MYLANG_JIT_XROT=5 ;
+#   MYLANG_JIT_OFF=norec,xcall ; MYLANG_JIT_OFF=all ; MYLANG_NO_LOWMEM=1 ;
+#   MYLANG_BCINLINE_VALUE=0 ; MYLANG_BCINLINE_SRA=0 ;
+#   MYLANG_BCINLINE_STEP1=0 MYLANG_BCINLINE_SRAC=0
+#
+# INT test (#107): the JIT's CALL and OBJECT emitters and the compiler
+# passes in front of them, reached from hot loops - class field
+# reads/writes and array<C> elements (class step 4's tiers), POD and
+# boxed struct value copies, boxes, closures (built in a loop, over a
+# global, nested, scalar-replaced, typed parameters of an inlined one),
+# value calls through a function array (the inline-cache guards),
+# recursion past the sync depth cap, exceptions thrown deep and caught
+# higher up, calls with many int/float arguments (the register argument
+# tiers and the frameless window's widening bind), the AST inliner's
+# gates (unrolled recursion, inert arguments, parameter writes, the
+# int-algebra fold), the struct-foreach body analysis, and destructuring.
+# Every expected value was derived independently (a Python model of the
+# loop, or by hand); the tree-walker is the oracle in the runs, and every
+# engine of every configuration (the legacy register pick, a rotated
+# pool, the call tier that writes a record per call, every JIT lever off,
+# the register-form type tags, the bytecode inliner's value-call
+# inlining, closure scalar replacement and staging-move elision each off)
+# must print the same.
+
+var bad = 0;
+var gg = 10;              # a global a function reads (the closure section)
+func read_gg() { return gg; }
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad = bad + 1;
+    }
+}
+
+# --- classes: field reads/writes of every scalar kind in a hot loop
+class Acc { int n; float f; bool on; opt Acc next; }
+
+func class_loop(int n) {
+    var a = Acc(0, 0.0, false, none);
+    var b = Acc(1, 0.5, true, a);
+    for (var i = 0; i < n; i++) {
+        a.n += i;
+        a.f += 0.25;
+        a.on = !a.on;
+        if (b.on) b.n = b.n * 3 % 1000003;
+        b.f = b.f * 1.5 - a.f;
+        var nx = b.next;
+        if (nx != none) nx.n -= 1;
+        if (a.on && i % 7 == 0) b.on = false;
+        else if (i % 11 == 0) b.on = true;
+    }
+    return str(a.n) + "/" + str(a.f, 2) + "/" + str(a.on) + "/"
+           + str(b.n) + "/" + str(b.on);
+}
+want("class fields", class_loop(int(runtime(300))),
+     "44550/75.00/false/105279/true");
+
+# array<C>: element reads and writes, a shared instance seen twice
+func class_array(int n) {
+    var xs = [Acc(0, 0.0, false, none), Acc(1, 1.0, true, none),
+              Acc(2, 2.0, false, none)];
+    append(xs, xs[0]);
+    var s = 0;
+    var fs = 0.0;
+    for (var i = 0; i < n; i++) {
+        var k = i % len(xs);
+        xs[k].n += k + 1;
+        xs[k].f *= 1.0625;
+        s += xs[k].n;
+        fs += xs[k].f;
+        var c = xs[(k + 1) % len(xs)];
+        c.on = c.n % 2 == 0;
+    }
+    var on = 0;
+    foreach (c in xs) if (c.on) on++;
+    return str(s) + "/" + str(fs, 3) + "/" + str(xs[0].n) + "/"
+           + str(on);
+}
+want("class array", class_array(int(runtime(200))),
+     "19075/1005.859/250/2");
+
+# --- POD structs: value copies, element field stores, nested PODs
+struct V2 { float x; float y; }
+struct Seg { V2 a; V2 b; int tag; }
+
+func struct_loop(int n) {
+    var pts = [V2(0.0, 1.0), V2(2.0, 3.0), V2(4.0, 5.0)];
+    var seg = Seg(V2(0.0, 0.0), V2(1.0, 1.0), 0);
+    var acc = 0.0;
+    for (var i = 0; i < n; i++) {
+        var p = pts[i % 3];
+        p.x += 1.0;
+        pts[(i + 1) % 3].y += 0.5;
+        seg.a.x += p.x * 0.125;
+        seg.b.y -= 0.0625;
+        seg.tag += i % 3;
+        var copy = seg;
+        copy.a.x = -1.0;
+        acc += copy.a.x + seg.a.x + pts[i % 3].x + pts[i % 3].y;
+    }
+    return str(acc, 4) + "/" + str(seg.a.x, 4) + "/" + str(seg.b.y, 4)
+           + "/" + str(seg.tag) + "/" + str(pts[2].y, 2);
+}
+want("POD structs", struct_loop(int(runtime(240))),
+     "16585.0000/90.0000/-14.0000/240/45.00");
+
+# a boxed (non-POD) struct: a str field and an array field
+struct Rec { str name; array<int> xs; int k; }
+func boxed_struct(int n) {
+    var r = Rec("r", [1, 2, 3], 0);
+    var total = 0;
+    for (var i = 0; i < n; i++) {
+        var q = r;
+        q.k += i;
+        r.k += 1;
+        q.xs[i % 3] += 1;
+        total += q.k + r.k + len(q.name);
+        if (i % 50 == 0) r.name = r.name + "x";
+    }
+    return str(total) + "/" + str(r.k) + "/" + str(r.xs) + "/" + r.name;
+}
+want("boxed struct", boxed_struct(int(runtime(150))),
+     "34122/150/[51, 52, 53]/rxxx");
+
+# --- boxes: scalar and struct boxes written through in a loop
+func box_loop(int n) {
+    var bi = box(0);
+    var bf = box(0.5);
+    var bp = box(V2(1.0, 2.0));
+    var many = [box(1), box(2), box(3)];
+    var alias = bi;
+    for (var i = 0; i < n; i++) {
+        *bi += i;
+        (*alias)++;
+        *bf = *bf * 1.25 + 0.125;
+        if (*bf > 100.0) *bf = 0.5;
+        bp.x += 1.0;
+        bp.y = bp.x * 0.5;
+        *many[i % 3] += *bi % 5;
+    }
+    var p = *bp;
+    p.x = 0.0;
+    return str(*bi) + "/" + str(*bf, 4) + "/" + str(bp.x) + "/"
+           + str(p.x) + "/" + str(*many[0] + *many[1] + *many[2]);
+}
+want("boxes", box_loop(int(runtime(200))),
+     "20100/11.1415/201.000000/0.000000/206");
+
+# --- closures built in a loop, kept, and called later
+func make_adder(int k) {
+    var base = k * 10;
+    return func [base] (x) { return base + x; };
+}
+func closures(int n) {
+    var fs = [];
+    for (var i = 0; i < n; i++) {
+        var j = i;
+        append(fs, func [j] (x) { return x * j; });
+    }
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var f = fs[i];
+        s += f(i + 1);
+        var add = make_adder(i);
+        s += add(i);
+    }
+    var count = 0;
+    var tick = func [count] () { count++; return count; };
+    for (var i = 0; i < n; i++) s += tick();
+    return s;
+}
+want("closures", closures(int(runtime(60))), 93280);
+
+# --- value calls through a function array: mono- and polymorphic sites
+func op_add(int a, int b) { return a + b; }
+func op_sub(int a, int b) { return a - b; }
+func op_mul(int a, int b) { return a * b % 100003; }
+func op_mix(int a, int b) { return (a ^ b) & 65535; }
+func dispatch(int n) {
+    var ops = [op_add, op_sub, op_mul, op_mix];
+    var s = 1;
+    for (var i = 0; i < n; i++) {
+        var f = ops[i % 4];
+        s = f(s, i) % 1000000007;
+        var g = ops[0];
+        s = g(s, 1);
+    }
+    var h = op_add;
+    for (var i = 0; i < n; i++) {
+        s = h(s, i);
+        if (i == n / 2) h = op_sub;
+    }
+    return s;
+}
+want("function array dispatch", dispatch(int(runtime(400))), -31190);
+
+# --- recursion past the sync depth cap, plain and mutual
+func depth(int n) {
+    if (n == 0) return 0;
+    var r = depth(n - 1);
+    return r + n % 7;
+}
+func ev(int n) { if (n == 0) return true; return od(n - 1); }
+func od(int n) { if (n == 0) return false; return ev(n - 1); }
+func fdepth(float x, int n) {
+    if (n == 0) return x;
+    var r = fdepth(x * 1.0001, n - 1);
+    return r + 0.5;
+}
+want("deep recursion", depth(int(runtime(1000))), 3003);
+want("mutual recursion", ev(int(runtime(1001))), false);
+want("float recursion", str(fdepth(1.0, int(runtime(1000))), 4),
+     "501.1052");
+
+# --- exceptions thrown deep, caught higher up
+struct Boom { int at; str why; }
+func dive(int n, int fail_at) {
+    if (n == fail_at) throw Boom(n, "boom");
+    if (n == 0) return 1;
+    var r = dive(n - 1, fail_at);
+    return r + 1;
+}
+func div_at(int n, int z) {
+    if (n == 0) return 10 / z;
+    return div_at(n - 1, z) + 1;
+}
+func exc_loop(int n) {
+    var caught = 0;
+    var total = 0;
+    var note = "";
+    for (var i = 0; i < n; i++) {
+        try {
+            total += dive(40, i % 50);
+        } catch (Boom as b) {
+            caught++;
+            total += b.at;
+            if (caught == 1) note += str(b.why);
+        }
+        try {
+            total += div_at(30, i % 3);
+        } catch (DivisionByZeroEx) {
+            caught += 10;
+        } finally {
+            total += 1;
+        }
+    }
+    return str(total) + "/" + str(caught) + "/" + note;
+}
+want("exceptions", exc_loop(int(runtime(120))), "5688/502/boom");
+
+func rethrower(int n) {
+    try {
+        return dive(n, 3);
+    } catch (Boom as b) {
+        rethrow;
+    }
+    return -1;
+}
+var rt = "";
+for (var k = 0; k < 4; k++) {
+    try { rt = str(rethrower(int(runtime(10)))); }
+    catch (Boom as b) { rt = "rethrown " + str(b.at); }
+}
+want("rethrow", rt, "rethrown 3");
+
+# --- many arguments: int and float parameters, frameless leaves
+func lots(int a, int b, int c, int d, int e, int f) {
+    return a * 1 + b * 2 + c * 3 + d * 4 + e * 5 + f * 6;
+}
+func flots(float a, float b, float c, float d, int k) {
+    return (a + b) * (c - d) + k;
+}
+func args_loop(int n) {
+    var s = 0;
+    var fs = 0.0;
+    for (var i = 0; i < n; i++) {
+        s += lots(i, i + 1, i + 2, i - 3, i * 2, 7);
+        fs += flots(i * 0.5, 1.5, 2.25, i * 0.125, i % 4);
+    }
+    return str(s) + "/" + str(fs, 3);
+}
+want("many arguments", args_loop(int(runtime(300))),
+     "908400/-516181.250");
+
+# --- callbacks: sort with a comparator, map, filter over a hot array
+func cb_loop(int n) {
+    var xs = [];
+    for (var i = 0; i < n; i++) append(xs, (i * 7919) % 1009);
+    var ys = sort(xs, func (a, b) => a > b);
+    var zs = map(func (v) => v * 2 + 1, ys);
+    var ws = filter(func (v) => v % 3 == 0, zs);
+    return str(ys[0]) + "/" + str(ys[n - 1]) + "/" + str(len(ws)) + "/"
+           + str(sum(ws));
+}
+want("callbacks", cb_loop(int(runtime(500))), "1006/0/170/172584");
+
+# --- the AST inliner's gates: a pure tree recursion unrolled into its
+# caller, whose body also writes locals through a foreach, a
+# destructure and a catch binding (write-once copy propagation must
+# see every one of them), and arguments of every inert shape
+func tr_fe(int n) {
+    if (n < 2) return n;
+    var t = n - 1;
+    var s = 0;
+    foreach (v in [1, 2]) s += v;
+    return tr_fe(t) + tr_fe(n - 2) + s;
+}
+func tr_un(int n) {
+    if (n < 2) return n;
+    var t = n - 1;
+    var s = 0;
+    var a, b = [t, n - 2];
+    s += a - b;
+    return tr_un(t) + tr_un(n - 2) + s;
+}
+func tr_ca(int n) {
+    if (n < 2) return n;
+    var t = n - 1;
+    var s = 0;
+    try { s += 1; } catch (TypeErrorEx as e) { s += 2; }
+    return tr_ca(t) + tr_ca(n - 2) + s;
+}
+want("unrolled recursions",
+     str(tr_fe(int(runtime(12)))) + "/" + str(tr_un(int(runtime(12))))
+     + "/" + str(tr_ca(int(runtime(12)))), "840/376/376");
+
+func g1(int x) { return x * 2 + 1; }
+func h1(float x) { return x * 2.0; }
+var q = int(runtime(5));
+var fq = float(runtime(1.5));
+var bq = q > 3;
+want("inert int arguments",
+     [g1(-q), g1(+q), g1(~q), g1(int(!bq)), g1(q / 2), g1(q % 3),
+      g1(q & 6), g1(q / -2)], [-9, 11, -11, 1, 5, 5, 9, -3]);
+want("inert float arguments",
+     str(h1(fq / 2.0)) + "/" + str(h1(-fq)) + "/" + str(h1(fq * 3.0 / 1.5)),
+     "1.500000/-3.000000/6.000000");
+
+# --- a frameless leaf taking a FLOAT parameter, called with a pinned
+# int (the window bind widens it) and with a float
+func scale(float x) {
+    var r = 0.0;
+    for (var k = 0; k < 2; k++) r += x * 0.5;
+    return r;
+}
+func widen_loop(int n) {
+    var s = 0.0;
+    var f = 0.25;
+    for (var i = 0; i < n; i++) {
+        s += scale(i);
+        s += scale(f);
+        f += 0.5;
+    }
+    return s;
+}
+want("int argument into a float parameter",
+     str(widen_loop(int(runtime(100))), 3), "7450.000");
+
+# --- foreach over a flat POD struct array: the body analysis that
+# decides between reading `p.x` straight from the array bytes and
+# binding `p` whole, over bodies of every statement kind
+struct Pt { int x; float y; bool on; }
+struct Pq { Pt a; int k; }
+func helper_pt(int v) {
+    var r = 0;
+    for (var k = 0; k < 2; k++) r += v;
+    return r;
+}
+func fe_bodies(int n) {
+    var pts = [];
+    var qs = [];
+    for (var i = 0; i < n; i++) {
+        append(pts, Pt(i, i * 0.5, i % 2 == 0));
+        append(qs, Pq(Pt(i, 1.0, true), i * 2));
+    }
+    var s = 0;
+    var f = 0.0;
+    var other = [0, 0, 0];
+    var other_s = Pt(0, 0.0, false);
+    var seen = [];
+    foreach (p in pts) {
+        var j = 0;
+        while (j < 2) { s += p.x; j++; }
+        for (var k = 0; k < 2; k++) f += p.y;
+        foreach (v in [1, 2]) s += v * p.x;
+        s += p.on ? 1 : 0;
+        var o = p.x > 5 ? p.x : -1;
+        s += o;
+        if (p.x % 3 == 0) s += 3; else s -= 1;
+        s += abs(p.x - 4) + min(p.x, 2) + int(p.y);
+    }
+    foreach (p in pts) {
+        other[p.x % 3] += p.x;        # a store through a subscript
+        other_s.x += p.x;             # a store through a member
+        s += len(str(p.x));
+    }
+    foreach (p in pts) {
+        var cp = p;                   # a whole-p use
+        cp.x = 100;
+        s += cp.x + p.x;
+        s += helper_pt(p.x);          # a user call
+    }
+    foreach (p in pts) {
+        p.x = p.x + 1;                # a write to the copy
+        s += p.x;
+        seen += [p.x];                # an in-place append
+    }
+    foreach (pq in qs) {
+        var a = pq.a;                 # a non-scalar (struct) field
+        s += a.x + pq.k + pq.a.x;
+    }
+    var pcount = 0;
+    foreach (p in pts) {
+        if (p.on) pcount++;
+        append(seen, p.x);
+    }
+    return str(s) + "/" + str(f, 2) + "/" + str(other) + "/"
+           + str(other_s.x) + "/" + str(len(seen)) + "/" + str(pcount)
+           + "/" + str(pts[3].x);
+}
+want("struct foreach bodies", fe_bodies(int(runtime(20))),
+     "4964/190.00/[63, 70, 57]/190/40/10/3");
+
+func fe_find(array<Pt> pts, int target, dict<int, int> d) {
+    var s = 0;
+    foreach (p in pts) {
+        s += get(d, p.x) ?? 0;
+        if (p.x < 0) throw Boom(p.x, "negative");
+        if (p.x == target) return s * 100 + p.x;
+    }
+    return -s;
+}
+var fpts = [Pt(1, 0.0, true), Pt(2, 0.0, true), Pt(3, 0.0, false)];
+var fd = {1: 10, 3: 30};
+want("struct foreach early exits",
+     [fe_find(fpts, int(runtime(3)), fd), fe_find(fpts, int(runtime(9)), fd)],
+     [4003, -40]);
+var fthrown = "";
+append(fpts, Pt(-5, 0.0, true));
+try { fe_find(fpts, int(runtime(9)), fd); }
+catch (Boom as b) { fthrown = str(b.at) + " " + str(b.why); }
+want("struct foreach throw", fthrown, "-5 negative");
+
+# --- closures: one capturing a GLOBAL (built in main's loop), one built
+# inside another closure from its captures, typed parameters bound by
+# an inlined closure (int into float, float into float, int into int),
+# and closure construction under register pressure
+var gtot = 0;
+for (var i = 0; i < 20; i++) {
+    var c = func [gg, i] (x) { return x + gg + i; };
+    gtot += c(1);
+}
+want("closure over a global", str(gtot) + "/" + str(read_gg()), "410/10");
+func nested_cl(int n) {
+    var base = n * 2;
+    var mk = func [base] (y) {
+        var inner = func [base, y] () { return base + y; };
+        return inner();
+    };
+    var s = 0;
+    for (var i = 0; i < n; i++) s += mk(i);
+    return s;
+}
+want("closure in a closure", nested_cl(int(runtime(10))), 245);
+func coerce_cl(int n) {
+    var k = int(runtime(3));
+    var addk = func [k] (float x) { return x + k; };
+    var mulk = func [k] (int x) { return x * k; };
+    var s = 0.0;
+    var f = 0.5;
+    var t = 0;
+    for (var i = 0; i < n; i++) {
+        s += addk(i);
+        s += addk(f);
+        t += mulk(i);
+        f += 0.25;
+    }
+    return str(s, 2) + "/" + str(t);
+}
+want("typed closure parameters", coerce_cl(int(runtime(40))),
+     "1235.00/2340");
+func pressure_cl(int n) {
+    var a = 1; var b = 2; var c = 3; var d = 4; var e = 5; var f = 6;
+    var g = 7; var h = 8; var k = 9; var m = 10; var p = 11; var q = 12;
+    var r = 13; var s = 14;
+    var acc = 0;
+    for (var i = 0; i < n; i++) {
+        a += i; b += a; c += b; d += c; e += d; f += e; g += f;
+        h += g; k += h; m += k; p += m; q += p; r += q; s += r;
+        var cl = func [a, s] (x) { return x + a - s; };
+        acc += cl(i) % 1000;
+        a &= 1023; b &= 1023; c &= 1023; d &= 1023; e &= 1023;
+        f &= 1023; g &= 1023; h &= 1023; k &= 1023; m &= 1023;
+        p &= 1023; q &= 1023; r &= 1023; s &= 1023;
+    }
+    return acc + a + b + c + d + e + f + g + h + k + m + p + q + r + s;
+}
+want("closures under pressure", pressure_cl(int(runtime(100))), -39860);
+
+# --- closures built in a loop that never escape (scalar replacement):
+# one of two closures picked per iteration, a capture holding an array,
+# a closure writing its scalar capture, one rebinding an array capture
+func sra(int n) {
+    var s = 0;
+    var arr = [1, 2, 3];
+    for (var i = 0; i < n; i++) {
+        var f = i % 2 == 0 ? (func [i] (x) { return x + i; })
+                           : (func [i] (x) { return x * i; });
+        s += f(3);
+        var g = func [arr, i] (x) { return arr[i % 3] + x; };
+        s += g(i);
+        var c = 0;
+        var h = func [c] () { c = c + 1; return c; };
+        s += h() + h();
+        var lst = [i];
+        var k = func [lst] () { lst = [lst[0] + 1]; return lst[0]; };
+        s += k();
+    }
+    return s;
+}
+want("scalar-replaced closures", sra(int(runtime(20))), 919);
+
+# --- element reads by a descending counter, a body that pops the
+# array under the loop (OutOfBoundsEx), destructuring with a typed
+# target list, a compound multi-assignment, foreach unpacks of int and
+# float rows and of split() strings, a caught builtin exception bound
+func desc_elem(int n) {
+    var a = [];
+    var b = [];
+    for (var i = 0; i < n; i++) { append(a, i * 3); append(b, i % 2 == 0); }
+    var s = 0;
+    for (var i = n - 1; i >= 0; i--) s += a[i];
+    for (var i = n - 1; i > 0; i--) if (b[i]) s += 1;
+    var oob = 0;
+    try {
+        for (var i = 0; i < n; i++) {
+            s += a[i];
+            if (i == 3) { pop(a); pop(a); pop(a); pop(a); pop(a); pop(a); }
+        }
+    } catch (OutOfBoundsEx) { oob = 1; }
+    return str(s) + "/" + str(oob);
+}
+want("descending element reads", desc_elem(int(runtime(10))), "157/1");
+func unpacks(int n) {
+    var s = 0.0;
+    var t = 0;
+    var rows = [[1, 2], [3, 4], [5, 6]];
+    var frows = [[1.5, 2.5], [3.5, 4.5]];
+    for (var k = 0; k < n; k++) {
+        float x, y = rows[k % 3];
+        s += x / 2.0 + y;
+        var a, b = rows[(k + 1) % 3];
+        a, b += [k, 2 * k];
+        t += a * b;
+        foreach (var p, q in rows) t += p - q;
+        foreach (var p, q in frows) s += p * q;
+        var w1, w2 = split("ab,cd", ",");
+        t += len(w1) + len(w2);
+    }
+    return str(s, 2) + "/" + str(t);
+}
+want("unpacks", unpacks(int(runtime(6))), "150.00/342");
+func catch_builtin(int n) {
+    var msgs = 0;
+    var last = "";
+    for (var i = 0; i < n; i++) {
+        try {
+            var z = i - i;
+            var qq = 10 / z;
+            msgs += qq;
+        } catch (DivisionByZeroEx as e) {
+            msgs++;
+            last = str(e);
+        }
+    }
+    return str(msgs) + "/" + str(find(last, "DivisionByZeroEx") != none);
+}
+want("caught builtin exception", catch_builtin(int(runtime(4))), "4/true");
+
+# --- functions that reassign a parameter (never inlined by
+# substitution), the int-algebra fold over a spliced body (like terms,
+# constant factors), and a constant `false ||` dropped before operands
+# of every bool-producing shape
+func m1(int x) { x++; return x; }
+func m2(int x) { x += 2; return x * 3; }
+func m3(int x, array<int> a) { a[0] = x; return a[0]; }
+func m4(int x) { var y = x; y++; return y; }
+var marr = [0];
+var mt = 0;
+for (var i = 0; i < 5; i++) mt += m1(i) + m2(i) + m3(i, marr) + m4(i);
+want("parameter writes", mt, 100);
+func addself(int a, int b) { return a + a + b - b + 3 * a; }
+func mulc(int x) { return x * 2 * 3 + x * 1 - x * 0; }
+var mu = 0;
+for (var i = 0; i < 5; i++) mu += addself(i, i + 1) + mulc(i);
+want("algebra folds", mu, 120);
+var kq = int(runtime(3));
+var NOPE = false;
+var c1 = NOPE || (kq > 2);
+var c2 = NOPE || !(kq > 5);
+var c3 = NOPE || (kq > 1 && kq < 9);
+var c4 = NOPE || (kq < 0 || kq > 2);
+var c5 = NOPE || kq;
+var c6 = NOPE || (kq < 0);
+want("false || x", [c1, c2, c3, c4, c5, c6],
+     [true, true, true, true, true, false]);
+
+if (bad == 0) print("49: all passed");
+else print("49: " + str(bad) + " failure(s)");
+assert(bad == 0);
