@@ -1,0 +1,317 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): values that contain themselves THROUGH every kind of
+# container the cycle guard (src/cyclewalk.h) walks into - a dict's keys,
+# values and default, a struct's fields, a class instance, a flat
+# array<C> and a slice - beyond tests/functional/83_cyclic_values.my
+# (unit 38), whose rings run through arrays and one struct only.
+# README *Values that contain themselves*: printing writes a container
+# already being printed further up as [...] / {...} / Name(...); `==`
+# compares by shape (a back edge must lead the same number of levels up
+# on both sides); `hash` agrees with `==`; deepclone copies the cycle; a
+# constant or a dict key holds a frozen copy, cycle included.
+#
+# The `==` identity shortcut (the same container on both sides) may skip
+# the walk only when no cycle is reachable from that container
+# (CycPairStack::identity_ok -> cyc_reaches_cycle): each arm of that
+# search - a struct field, a dict key / value / default - leads to a ring
+# here, and `clone(r) != r` (the README's one-step unrolling) is the
+# answer that a missed cycle would turn into `==`.
+#
+# Sections 6-8 cover the values the COMPILER walks or bakes: constants
+# holding struct types, builtins and struct instances (static type,
+# callee-set and function-name walks), a struct type and a box compared
+# by identity, and a folded flat array bound to a `dyn` variable, which
+# is general from the start.
+#
+# Every ring the program builds is BROKEN at the end (pop / erase), or
+# the object census reports a leak; the frozen ones (constants, dict
+# keys) are freed by the interpreter when the program ends. None of the
+# frozen rings here holds a struct: a struct reachable from a ring kept
+# until exit is read after its type is freed (reported, not tested).
+
+struct N { int v; dyn? next; }
+class C { int v; array<C> kids; dyn? extra; }
+struct Q { int x; const K = 5; }               # POD, with a const member
+struct NK { int v; dyn? next; const TAG = "nk"; }   # boxed, likewise
+
+var bad = 0;
+func want(str what, dyn got, dyn exp) {
+    if (str(got) != str(exp)) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " +
+              str(exp));
+        bad += 1;
+    }
+}
+func yes(str what, bool ok) {
+    if (!ok) {
+        print("FAIL " + what);
+        bad += 1;
+    }
+}
+
+# 1. rings through a struct field, a dict value, a dict default and a
+#    class instance: printed, compared with their one-step unrolling
+#    (clone), hashed, deep-copied
+
+# a -> struct N -> a
+var dyn ra = dynarray([0]);
+ra[0] = N(int(runtime(1)), ra);
+want("struct ring str", str(ra), "[N(v: 1, next: [...])]");
+yes("struct ring != its clone", clone(ra) != ra);
+yes("struct ring == itself", ra == ra && !(ra != ra));
+var dyn rb = dynarray([0]);
+rb[0] = N(int(runtime(1)), rb);
+yes("two struct rings alike", ra == rb && hash(ra) == hash(rb));
+var dyn ra_c = deepclone(ra);
+yes("struct ring deepclone", ra_c == ra && intptr(ra_c[0].next) ==
+    intptr(ra_c) && intptr(ra_c) != intptr(ra));
+
+# a -> dict -> a
+var dyn da = {};
+var dyn rd = [da];
+da["r"] = rd;
+want("dict ring str", str(rd), "[{\"r\": [...]}]");
+want("dict ring dict str", str(da), "{\"r\": [{...}]}");
+yes("dict ring != its clone", clone(rd) != rd);
+var dyn db = {};
+var dyn rd2 = [db];
+db["r"] = rd2;
+yes("two dict rings alike", rd == rd2 && da == db &&
+    hash(rd) == hash(rd2) && hash(da) == hash(db));
+var dyn dd_c = deepclone(da);
+yes("dict ring deepclone", dd_c == da &&
+    intptr(dd_c["r"][0]) == intptr(dd_c));
+
+# a ring of two dicts differs from a ring of one, though both unfold
+# to the same infinite tree of {"r": ...}
+var dyn d1 = {};
+d1["r"] = d1;
+var dyn e1 = {};
+var dyn e2 = {};
+e1["r"] = e2;
+e2["r"] = e1;
+yes("dict ring of 1 vs 2", d1 != e1 && e1 == e2 && !(e1 != e2));
+yes("dict ring of 2 hash", hash(e1) == hash(e2));
+yes("dict ring shapes differ", [d1] != [e1] && {"k": d1} != {"k": e1});
+
+# a -> default dict (its default holds a) -> a; == compares entries,
+# so only the cycle search walks the default
+var dyn rdef = dynarray([0]);
+var dyn ddef = dict(N(int(runtime(7)), rdef));
+rdef[0] = ddef;
+want("default-dict ring str", str(rdef), "[{}]");
+var dyn dmiss = ddef["miss"];          # a missing key reads the default
+yes("default value", dmiss.v == 7 && intptr(dmiss.next) == intptr(rdef) &&
+    len(ddef) == 1);
+erase(ddef, "miss");
+
+# a -> class instance -> a: the instance compares by identity, so the
+# walk stops there; the search still sees the ring through it
+var c1 = C(int(runtime(1)), [], none);
+var dyn rc = [c1];
+c1.extra = rc;
+append(c1.kids, c1);
+want("class ring str", str(rc),
+     "[C(v: 1, kids: [C(...)], extra: [...])]");
+yes("class ring vs clone", clone(rc) == rc);
+var cc = deepclone(c1);
+yes("class ring deepclone", cc != c1 && cc.kids[0] == cc);
+want("class ring deepclone str", str(cc),
+     "C(v: 1, kids: [C(...)], extra: [C(...)])");
+
+# 2. identity inside a comparison of two different containers: the same
+#    container X on both sides is equal to itself; the search that
+#    allows skipping it walks X's dicts (keys, values, default) and
+#    structs, and a container shared at two places only once
+var dyn x = dynarray([0]);
+var dyn y = dynarray([0]);
+var dyn sh = dynarray([5, "s"]);
+var dyn kd = dict(N(0, dynarray([8, "t"])));
+kd[dynarray([1, "k"])] = dynarray([2, "v"]);
+var dyn X0 = [[1, 2], N(3, dynarray([4, "n"])), kd, sh, sh, [true],
+              "str"];
+yes("no ring: identity", [x, X0] == [y, X0] && [x, X0, X0] == [y, X0, X0]);
+yes("no ring: a shallow copy", !([x, X0] != [y, clone(X0)]));
+var dyn X1 = [N(9, ra)];               # a ring through a struct field
+yes("struct-field ring", [x, X1] == [y, X1] && [x, X1, X1] == [y, X1, X1]);
+var dyn X2 = [dict(N(0, ra))];          # through a dict default
+yes("default ring", [x, X2] == [y, X2]);
+var dyn kr = {};
+kr[rd] = 1;                            # through a dict key (frozen ring)
+var dyn X3 = [kr];
+yes("key ring", [x, X3] == [y, X3]);
+var dyn X4 = [{"v": ra}];               # through a dict value
+yes("value ring", [x, X4] == [y, X4]);
+var dyn X5 = [{"s": "x"}, dict(5), N(1, none), rd];
+yes("late ring", [x, X5] == [y, X5]);
+yes("differs after identity", [x, X1, 1] != [y, X1, 2]);
+
+# 3. a dict compared with a dict: a container key is looked up on its
+#    own (a fresh comparison); a missing one makes the dicts differ
+var dyn ka = {};
+ka[dynarray([1, "a"])] = 1;
+var dyn kb = {};
+kb[dynarray([1, "a"])] = 1;
+var dyn kc = {};
+kc[dynarray([2, "a"])] = 1;
+yes("container keys", ka == kb && ka != kc && !(ka == kc));
+var dyn ke = {};
+ke[d1] = "ring key";                   # a ring as a key, frozen
+var dyn kf = {};
+kf[d1] = "ring key";
+yes("ring keys", ke == kf && hash(ke) == hash(kf) && ke[d1] == "ring key");
+want("ring key str", str(ke), "{{\"r\": {...}}: \"ring key\"}");
+
+# 4. a slice is its own container: it shares its array's storage but
+#    shows another window (a shorter one, or one further along), so a
+#    ring through it is not mistaken for the array it was taken from
+var dyn base = dynarray([0, 0, 2]);
+var dyn sd = {};
+var dyn sd2 = {};
+base[0] = sd;
+base[1] = sd2;
+var dyn head = base[0:2];              # [sd, sd2]: same storage, len 2
+var dyn tail = base[1:3];              # [sd2, 2]: same storage, offset 1
+sd["h"] = head;
+sd2["t"] = tail;
+want("slice ring", str(base),
+     "[{\"h\": [{...}, {\"t\": [{...}, 2]}]}, {\"t\": [{...}, 2]}, 2]");
+var dyn base_c = deepclone(base);
+yes("slice ring copy", hash(base) == hash(base_c) && base == base_c &&
+    str(base_c) == str(base));
+
+# 5. a constant that contains itself through a dict with a default,
+#    built at compile time; a var gets a mutable ring of the same shape,
+#    whether the call was folded or ran
+pure func mk_d(n) {
+    var dyn d = dict({"z": n});
+    d["me"] = d;
+    d["n"] = n;
+    return d;
+}
+const D = mk_d(1);
+var dyn dv = mk_d(1);
+var dyn dr = mk_d(runtime(1));
+want("const dict ring", str(D["me"]["me"]["n"]), "1");
+yes("const == var", D == dv && dv == dr && hash(D) == hash(dr));
+want("const dict typestr", typestr(D), "dict<str,dyn>");
+want("var ring str", str(dv["me"]["n"]) + " " + str(len(dv)), "1 2");
+yes("var ring is its own", intptr(dv["me"]) == intptr(dv) &&
+    intptr(dv) != intptr(D));
+dv["n"] = 2;
+yes("var ring mutable", dv["me"]["n"] == 2 && D["n"] == 1);
+want("var default", str(dv["new"]), "{\"z\": 1}");
+erase(dv, "new");
+want("const default read", str(D["nokey"]) + " " + str(len(D)),
+     "{\"z\": 1} 2");                  # read-only: nothing is inserted
+var dfrozen = 0;
+try { var dyn dc = D; dc["me"]["n"] = 5; } catch (NotLValueEx) {
+    dfrozen += 1;
+}
+want("const ring frozen, cycle included", dfrozen, 1);
+const W = [D, 1.5, 2];
+want("const holding a ring", str(W[0]["me"]["n"]) + " " + str(W[2]), "1 2");
+var dyn Dc = deepclone(D);
+yes("deepclone of a const ring", Dc == D && intptr(Dc["me"]) == intptr(Dc));
+Dc["n"] = 3;
+yes("deepclone mutable", Dc["me"]["n"] == 3);
+var dyn km = {};
+km[dr] = "k";                          # a ring dict as a key, frozen
+yes("ring dict key", km[D] == "k" && get(km, dv) == none && len(km) == 1);
+
+# 6. constants the compiler walks as VALUES (their static type, the
+#    functions they name, the callee-set analysis): struct types,
+#    builtins, POD and boxed struct instances whose types carry const
+#    members, keys of two kinds, and a ring with a flat array inside
+#    frozen as a dict key (freed when the program ends)
+const TY = [Q, NK];
+const BL = [len, str];
+const QQ = Q(3);
+const NKC = NK(4, [Q(1)]);
+const MIX = {1: "one", "two": 2};
+const PQ = [Q(1), "x"];                # a POD instance in a general array
+var dyn pq = PQ;
+want("struct types in a constant", str(TY), "[Q, NK]");
+want("builtins in a constant", BL[0]([1, 2, 3]) + 10 * len(BL), 23);
+want("POD constant's member", QQ.K + QQ.x + TY[0].K, 13);
+want("boxed constant", str(NKC) + " " + NKC.TAG + " " + TY[1].TAG,
+     "NK(v: 4, next: [Q(x: 1)]) nk nk");
+want("mixed-key constant", typestr(MIX) + " " + str(MIX[1]) + " " +
+     str(MIX["two"]), "dict<dyn,dyn> one 2");
+want("POD instance in a constant", str(pq) + " " + str(pq[0].K),
+     "[Q(x: 1), \"x\"] 5");
+var dyn NKm = deepclone(NKC);          # a mutable copy of a frozen struct
+NKm.next[0] = Q(7);
+want("deepclone of a constant struct", str(NKm) + " " + str(NKC),
+     "NK(v: 4, next: [Q(x: 7)]) NK(v: 4, next: [Q(x: 1)])");
+var dyn fl = dynarray([0]);
+fl[0] = [1, 2];                        # a flat array inside the ring
+append(fl, fl);
+var dyn kfl = {};
+kfl[fl] = "flat";
+yes("ring with a flat child as a key", kfl[fl] == "flat" &&
+    str(keys(kfl)[0]) == "[[1, 2], [...]]");
+
+# 7. a struct compared with a box of the same struct: a box goes by
+#    identity, so it equals only itself; so does a struct TYPE
+var dyn sv = Q(int(runtime(1)));
+var dyn bx = box(Q(int(runtime(1))));
+yes("struct vs box", sv != bx && bx != sv && bx == bx && !(sv == bx));
+var dyn b1 = box(int(runtime(1)));
+var dyn b2 = box(int(runtime(1)));
+yes("two boxes of one value", b1 != b2 && !(b1 == b2) && b1 == b1 &&
+    b1 != 1 && !(b1 == 1));
+var dyn t0 = TY[0];
+var dyn t1 = TY[1];
+yes("struct types compare by identity", t0 == t0 && t0 != t1 &&
+    !(t0 == t1) && !(t0 != t0) && t0 != 5 && !(t0 == "Q"));
+
+# 8. a value folded at compile time and bound to a `dyn` variable is a
+#    GENERAL array from the start (README: declaring `dyn` builds a
+#    polymorphic array), whatever flat storage the folded value had -
+#    strings, POD structs, bools, floats - so a write of another type
+#    just works
+pure func mk_s(str t) => split(t, " ");
+pure func mk_p(n) => [Q(n), Q(n + 1)];
+pure func mk_b(n) => [n > 0, n > 1];
+pure func mk_f(n) => [n * 1.5, 2.5];
+var dyn vs = mk_s("a b c");
+var dyn vp = mk_p(1);
+var dyn vb = mk_b(1);
+var dyn vf = mk_f(1);
+want("folded dyn storage", [array_storage(vs), array_storage(vp),
+                            array_storage(vb), array_storage(vf)],
+     ["general", "general", "general", "general"]);
+vs[0] = 5;
+vp[0] = "p";
+vb[1] = none;
+vf[0] = "f";
+want("folded dyn writes", [vs, vp, vb, vf],
+     [[5, "b", "c"], ["p", Q(2)], [true, none], ["f", 2.5]]);
+
+print(str(bad) + " failure(s)");
+
+# break every ring the program built
+pop(ra);
+pop(rb);
+pop(ra_c);
+erase(da, "r");
+erase(db, "r");
+erase(dd_c, "r");
+erase(d1, "r");
+erase(e1, "r");
+pop(rdef);
+c1.extra = none;
+pop(c1.kids);
+cc.extra = none;
+pop(cc.kids);
+erase(sd, "h");
+erase(sd2, "t");
+erase(base_c[0]["h"][1], "t");
+erase(base_c[0], "h");
+erase(base_c[1], "t");
+erase(dv, "me");
+erase(dr, "me");
+erase(Dc, "me");
+pop(fl);

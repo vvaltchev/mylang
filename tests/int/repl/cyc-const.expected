@@ -1,0 +1,24 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> >> >> => 2
+>> => 11
+>> >> => [1, [...]]
+>> => [1, [...]]
+>> => true
+>> array<dyn>   (runtime type)
+>> => [2, [...]]
+>> => 2
+>> >> => {"me": {...}}
+>> => true
+>> => {"me": {...}}
+>> => true
+>> C   : array<dyn>   [const]
+D   : dict<str,dyn>   [const]
+OPS : array<dyn>   [const]
+dv  : dyn   [var]
+m   : dyn   [var]
+mk  : pure func mk(n)   [func]
+mkd : pure func mkd(n)   [func]
+sq  : pure func sq(x)   [func]
+>> => [2]
+>> => true
+>> 

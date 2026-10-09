@@ -1,0 +1,45 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> >> >> >> >> >> array<bool>   (runtime type)
+>> array<int>   (runtime type)
+>> array<float>   (runtime type)
+>> array<str>   (runtime type)
+>> array<str>   (runtime type)
+>> array<P>   (runtime type)
+>> array<N>   (runtime type)
+>> array<dyn>   (runtime type)
+>> array<dyn>   (runtime type)
+>> array<dyn>   (runtime type)
+>> array<array<int>>   (runtime type)
+>> dict   (runtime type)
+>> dict<str,array<float>>   (runtime type)
+>> dict<int,dict<str,bool>>   (runtime type)
+>> none   (runtime type)
+>> float   (runtime type)
+>> bool   (runtime type)
+>> str   (runtime type)
+>> builtin   (runtime type)
+>> type P   (runtime type)
+>> C   (runtime type)
+>> N   (runtime type)
+>> func <lambda>(x)   (runtime type)
+>> pure func <lambda>(int a, opt str b)   (runtime type)
+>> >> >> exception   (runtime type)
+>> => [1]
+>> => [1, [...]]
+>> array<dyn>   (runtime type)
+>> array<array<dyn>>   (runtime type)
+>> => []
+>> => [[...]]
+>> array<dyn>   (runtime type)
+>> => {}
+>> => {"me": {...}}
+>> dict<str,dyn>   (runtime type)
+>> array<dict<str,dyn>>   (runtime type)
+>> => [0]
+>> => {"back": [{...}]}
+>> array<dict<str,dyn>>   (runtime type)
+>> => [1]
+>> => []
+>> => true
+>> => 0
+>> 
