@@ -805,11 +805,14 @@ void TryCatchStmt::serialize(ostream &s, int level) const
     }
 
     if (finallyBody) {
+        /* laid out like a Catch: the body on its own lines, the closing
+         * paren at the clause's own indent */
         s << string((level + 1) * 2, ' ');
-        s << "Finally( ";
+        s << "Finally(\n";
 
         finallyBody->serialize(s, level+2);
         s << endl;
+        s << string((level + 1) * 2, ' ');
         s << ")\n";
     }
 
@@ -822,7 +825,8 @@ void ForeachStmt::serialize(ostream &s, int level) const
     string indent(level * 2, ' ');
 
     s << indent;
-    s << name << "(\n";
+    /* `indexed` changes what the variables bind: the header says so */
+    s << name << (indexed ? "(indexed\n" : "(\n");
 
     ids->serialize(s, level + 1);
     s << endl;

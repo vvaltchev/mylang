@@ -22112,6 +22112,18 @@ static const std::vector<repl_test> repl_tests =
     { ":tree shows the const-folded syntax tree",
       { { ":tree 2 + 3 * 4", "Int(14)" } } },
 
+    /* the dump said nothing of `indexed` (an indexed foreach dumped like
+     * the plain one), and a finally body was dumped on the `Finally(` line
+     * with its closing paren at column 0 */
+    { ":tree shows indexed and an indented finally body",
+      { { "var ta = [1, 2]", "" },
+        { ":tree foreach (var k, v in indexed ta) { print(k); }",
+          "ForeachStmt(indexed\n" },
+        { ":tree try { print(1); } finally { print(3); }",
+          "\n    Finally(\n      Block(\n" },
+        { ":tree try { print(1); } finally { print(3); }",
+          "      )\n    )\n  )\n)" } } },
+
     { ":tree does not commit its declarations",
       { { ":tree var wq = 5", "Int(5)" },
         { "wq", "Undefined variable 'wq'" } } },
