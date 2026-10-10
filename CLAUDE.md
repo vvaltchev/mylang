@@ -7560,7 +7560,13 @@ headless-testable behind a thin terminal shell:
     unterminated token). A multi-line string that **closes** at the start of a
     line is itself a value, so the statement can be terminated there even with
     no following code token (`closed_string`); a line that **opens** one that
-    continues gets no `;` (`open_at_end`).
+    continues gets no `;` (`open_at_end`). **The `;` goes where the CODE
+    ends**, after its last character and before a trailing `#` comment
+    (appended to the line it was INSIDE the comment, so the statement ran on
+    into the next line), and **a block `}` right after a value** (the
+    `open_value` state, which spans lines) gets that statement's `;` in
+    front of it - `if (c) { print(3) }` had no `;` before its `}`, since
+    only line ends were terminated.
   - **`EvalContext::allow_redeclare`** (set only on the REPL global scope) makes
     a re-declaration rebind the global instead of throwing `AlreadyDefinedEx`
     (the script rule is unchanged — the resolver still catches same-scope dups
