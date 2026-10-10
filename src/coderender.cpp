@@ -523,14 +523,49 @@ struct Renderer {
         }
     }
 
+    static size_t chain_len(const InlineCtx *c)
+    {
+        size_t n = 0;
+        for (; c; c = c->parent)
+            n++;
+        return n;
+    }
+
+    /* The frame of the callee an inlined block body came from. The inliner
+     * tags the BODY's statements with the callee's frame, whose parent is
+     * the call site's chain; the InlinedCallExpr, its Block and the
+     * argument-temp stores keep the call site's own chain (resolver.cpp,
+     * try_inline_block). So the callee is the element of a statement's
+     * chain just inside the call site's - found by LENGTH, not by pointer:
+     * when the enclosing function is itself inlined, every node's chain is
+     * re-rooted into a fresh copy (tag_inline / rebase), and the copies do
+     * not share their parents. */
+    static const InlineCtx *callee_frame(const InlinedCallExpr *e)
+    {
+        auto *b = dynamic_cast<const Block *>(e->elem.get());
+        if (!b)
+            return nullptr;
+        const size_t n = chain_len(e->inline_ctx);
+        for (const auto &s : b->elems) {
+            const size_t m = chain_len(s->inline_ctx);
+            if (m <= n)
+                continue;           /* an argument temp: the call site's */
+            const InlineCtx *c = s->inline_ctx;
+            for (size_t i = 0; i + n + 1 < m; i++)
+                c = c->parent;
+            return c;
+        }
+        return nullptr;
+    }
+
     /* An inlined block body in expression position (the non-expressible
      * form, used when the body is not a temp-free guard chain - a guard body
      * is inlined as a real ternary instead). Label it once, then render the
      * single-return body as its value, else the block. */
     void inlined_call(const InlinedCallExpr *e)
     {
-        const char *nm = (e->elem && e->elem->inline_ctx)
-            ? e->elem->inline_ctx->callee_name.c_str() : "?";
+        const InlineCtx *fr = callee_frame(e);
+        const char *nm = fr ? fr->callee_name.c_str() : "?";
         auto *b = dynamic_cast<const Block *>(e->elem.get());
         const ReturnStmt *r = (b && b->elems.size() == 1)
             ? dynamic_cast<const ReturnStmt *>(b->elems[0].get()) : nullptr;

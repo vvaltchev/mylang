@@ -18393,6 +18393,17 @@ static const std::vector<test> tests =
         "assert(find(s, \"    var dyn a, b = [d, k];\\n\") != none);" } },
     { "reflect: specializations of a plain function is empty",
       { "func f(int a) => a + 1; assert(len(specializations(f)) == 0);" } },
+    /* the label of an inlined block body read the chain of the CALL SITE
+     * (the caller's, here none), not the callee's frame. The argument is
+     * a call, so it is bound to a temp and the body stays a block (an
+     * inert one is substituted and the body folds to `n * 4`) */
+    { "coderender: an inlined block body is labelled with its callee",
+      { "func h2(int x) { var y = x * 2; return y; }",
+        "func user4(int n) { var r = h2(int(runtime(n))); return r; }",
+        "assert(user4(3) == 6);",
+        "var dyn s = show(user4);",
+        "assert(find(s, \"    int r = /* inlined h2 */ {\\n\") != none);",
+        "assert(find(s, \"inlined ?\") == none);" } },
     { "reflect: specializations rejects a non-function",
       { "specializations(42);" }, &typeid(TypeErrorEx) },
     { "reflect: show() renders a function as code",
