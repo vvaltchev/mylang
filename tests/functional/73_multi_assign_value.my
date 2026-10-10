@@ -3,9 +3,10 @@
 # a destructure, a spread, a compound, a `_` placeholder. The tree-walker
 # gave none while the VM refused to compile it (NotLoweredEx), and the
 # inferencer typed the value as the right-hand side, so a typed destination
-# accepted it statically and then held none (RULE 1). The targets here are
-# locals: a multi-assignment into a global or a capture is a VM compile
-# refusal of its own, open separately. Values come from runtime().
+# accepted it statically and then held none (RULE 1). The VM also refused
+# any multi-assignment into a global or a closure's capture (NotLoweredEx,
+# even as a statement); those targets are below. Values come from
+# runtime().
 
 var events = [];
 func val(v) { append(events, "val"); return v; }
@@ -89,6 +90,81 @@ func typed(n) {
 }
 assert(typed(ri(2)) == [6, 1.0, 4, 5]);
 
+# targets that are not plain locals: globals (a function reads them) and a
+# closure's captures; a typed global whose coercion fails leaves the target
+# before it stored, as each target is stored in order
+var ga = 0;
+var gb = 0;
+int gi = 0;
+float gf = 0.0;
+var gs = "s";
+func globals() { return [ga, gb, gi, gf, gs]; }
+ga, gb = [ri(1), ri(2)];
+assert(globals() == [1, 2, 0, 0.0, "s"]);
+gb, ga = [ga, gb];
+assert(ga == 2 && gb == 1);
+gi, gf = [ri(3), ri(4)];
+assert(gi == 3 && gf == 4.0);
+ga, gs += [ri(1), ri(2)];
+assert(ga == 3 && gs == "s2");
+var dyn gd = runtime(7);
+ga, gb = gd;
+assert(ga == 7 && gb == 7);
+var dyn ge = [ri(8), ri(9)];
+ga, gb = ge;
+assert(ga == 8 && gb == 9);
+gb, _ = [ri(5), ri(6)];
+assert(gb == 5);
+w = ga, gb = [ri(10), ri(11)];
+assert(w == none && ga == 10 && gb == 11);
+var graised = false;
+var dyn half = runtime(2.5);
+try {
+    ga, gi = [ri(12), half];
+} catch (TypeErrorEx) {
+    graised = true;
+}
+assert(graised && ga == 12 && gi == 3);
+# a local beside a global in one multi-assignment: a plain store, a typed
+# local (int, and a float that widens) and a compound
+var lx = 0;
+int li = 0;
+float lf = 0.0;
+lx, ga = [ri(21), ri(22)];
+assert(lx == 21 && ga == 22);
+li, lf, ga = [ri(23), ri(24), ri(25)];
+assert(li == 23 && lf == 24.0 && ga == 25);
+lx, ga += [ri(1), ri(2)];
+assert(lx == 22 && ga == 27);
+ga = 12;
+
+# a parameter named after a builtin is a plain local target, not the
+# builtin's const binding
+func sh(abs) {
+    var q = 0;
+    q, abs = [ri(1), ri(2)];
+    return [q, abs];
+}
+assert(sh(ri(0)) == [1, 2]);
+
+var gx, gy = [ri(13), ri(14)];
+func gxy() { return [gx, gy]; }
+assert(gxy() == [13, 14]);
+for (var i = 0; i < 3; i++)
+    ga, gb = [i, i * 10];
+assert(globals() == [2, 20, 3, 4.0, "s2"]);
+
+func counter() {
+    var x = 0;
+    var y = 0;
+    return func [x, y] (n) {
+        x, y = [x + n, y + 2 * n];
+        return [x, y];
+    };
+}
+var cf = counter();
+assert(cf(ri(1)) == [1, 2] && cf(ri(2)) == [3, 6]);
+
 # a failing destructure raises before anything is stored
 var c = 5;
 var caught = false;
@@ -99,4 +175,5 @@ try {
 }
 assert(caught && c == 5 && a == 8 && b == 9);
 
-print(pair(ri(5)), ret(ri(4)), w, a, b, events, loop(ri(5)), typed(ri(2)));
+print(pair(ri(5)), ret(ri(4)), w, a, b, events, loop(ri(5)), typed(ri(2)),
+      globals(), gxy(), cf(ri(1)));

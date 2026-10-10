@@ -708,6 +708,36 @@ static const std::vector<test> tests =
         &typeid(NullabilityEx),
     },
 
+    /* A const or builtin target refuses the store in every engine: the
+     * VM refused to compile a non-local target, and stored into a local
+     * const (`K` past the first target was not marked const). */
+    {
+        "multi-assign into a local const target is refused",
+        {
+            "var a = 0; const K = [1];",
+            "a, K = [runtime(5), [2]];",
+        },
+        &typeid(CannotRebindConstEx),
+    },
+
+    {
+        "multi-assign into a global const target is refused",
+        {
+            "var a = 0; const K = [1]; func k() { return K; }",
+            "a, K = [runtime(5), [2]];",
+        },
+        &typeid(CannotRebindConstEx),
+    },
+
+    {
+        "multi-assign into a builtin name is refused",
+        {
+            "var a = 0;",
+            "a, len = [runtime(5), 2];",
+        },
+        &typeid(CannotRebindBuiltinEx),
+    },
+
     {
         "while stmt",
         {
