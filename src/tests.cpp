@@ -21966,6 +21966,27 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* a call to a function that returns nothing is silent at the prompt;
+     * it folds to a `none` literal (the optimizers, or the parser for a
+     * pure func), which the echo took for a written `none` and showed */
+    { "echo: a void call is silent, a looked-up none is shown",
+      { { "func w6() { }", "" },
+        { "w6()", "", "=> <none>" },
+        { "pure func pw6() { }", "" },
+        { "pw6()", "", "=> <none>" },
+        { "func g6() => none", "" },
+        { "g6()", "", "=> <none>" },
+        { "print(1)", "1", "=> <none>" },
+        { "var n6 = none", "", "=> <none>" },
+        { "n6", "=> <none>" },
+        { "(n6)", "=> <none>" },
+        { "none", "=> <none>" },
+        { "null", "=> <none>" },
+        { "var d6 = {\"k\": none}", "" },
+        { "d6.k", "=> <none>" },
+        { "d6[\"k\"]", "=> <none>" },
+        { "[none][0]", "=> <none>" } } },
+
     /* the REPL's automatic `;`: it went AFTER a trailing `#` comment - into
      * the comment, so the statement ran on into the next line - and a block
      * closed on its last statement's line (`{ print(3) }`) got none before

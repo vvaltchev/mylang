@@ -53,21 +53,114 @@ repl_out_is_tty()
 /* Syntax-highlight a (possibly multi-line) rendered block (defined below). */
 static string show_colorize(const string &s, bool color);
 
+/* Past the bracket that closes the one at toks[i] (end if unbalanced). */
+static size_t
+repl_skip_bracket(const std::vector<Tok> &toks, size_t i, size_t end)
+{
+    int depth = 0;
+    for (; i < end; i++) {
+        const Tok &t = toks[i];
+        if (t == Op::parenL || t == Op::bracketL || t == Op::braceL)
+            depth++;
+        else if (t == Op::parenR || t == Op::bracketR || t == Op::braceR)
+            if (--depth == 0)
+                return i + 1;
+    }
+    return end;
+}
+
+/*
+ * Is the statement WRITTEN as toks[i, end) a plain VALUE LOOKUP - a bare
+ * variable, the `none`/`null` literal, or a member/subscript access (`a.b`,
+ * `a?.b`, `f()[0]`)? Decided on the tokens, i.e. on what the user typed:
+ * the tree has been folded by then, and a call folded to a literal (`w()`
+ * of a void `func w() { }`, by the optimizers or by the parser's const
+ * evaluation) reads exactly like a written `none`.
+ */
+static bool
+repl_value_lookup(const std::vector<Tok> &toks, size_t i, size_t end)
+{
+    if (i >= end)
+        return false;
+
+    /* a parenthesized whole: what is inside it */
+    if (toks[i] == Op::parenL && repl_skip_bracket(toks, i, end) == end)
+        return repl_value_lookup(toks, i + 1, end - 1);
+
+    /* the primary: a name, none / null, or a bracketed literal */
+    const Tok &first = toks[i];
+    size_t k;
+    if (first == TokType::id || first == Keyword::kw_none
+            || first == Keyword::kw_null)
+        k = i + 1;
+    else if (first == Op::bracketL || first == Op::braceL)
+        k = repl_skip_bracket(toks, i, end);
+    else
+        return false;
+    const bool bare = (first == TokType::id || first == Keyword::kw_none
+                       || first == Keyword::kw_null);
+
+    /* then postfix steps; the LAST one decides (a call is not a lookup) */
+    bool last_is_access = false;
+    while (k < end) {
+        if ((toks[k] == Op::dot || toks[k] == Op::qmdot) && k + 1 < end
+                && toks[k + 1] == TokType::id) {
+            k += 2;
+            last_is_access = true;
+        } else if (toks[k] == Op::bracketL) {
+            k = repl_skip_bracket(toks, k, end);
+            last_is_access = true;
+        } else if (toks[k] == Op::parenL) {
+            k = repl_skip_bracket(toks, k, end);
+            last_is_access = false;
+        } else {
+            return false;                /* an operator: not a lookup */
+        }
+    }
+    return k == i + 1 ? bare : last_is_access;
+}
+
 /*
  * Should a `none`-valued result be echoed? A `none` is normally suppressed (a
  * func/struct decl, a `print`, an `if`/loop, a void call all yield it - echoing
  * `=> none` for them would be noise). But when the last statement is a plain
- * VALUE LOOKUP - a bare variable, a member/subscript access, or the `none`/
- * `null` literal - the user asked to SEE that value, so show `=> none`.
+ * VALUE LOOKUP (repl_value_lookup) the user asked to SEE that value, so show
+ * `=> none`. `last` is the last top-level statement, after the optimizers -
+ * only its START is used, to find its tokens.
  */
 static bool
-repl_echo_none(const Construct *c)
+repl_echo_none(const Construct *last, const std::vector<Tok> &toks)
 {
-    return c &&
-           (c->is_id() ||                                /* a bare variable */
-            dynamic_cast<const MemberExpr *>(c) ||        /* obj.field */
-            dynamic_cast<const Subscript *>(c) ||         /* a[i] */
-            dynamic_cast<const LiteralNone *>(c));        /* none / null */
+    /* the node is a lookup or a literal (never a declaration, whose node
+     * starts at the declared NAME), and its tokens are a lookup */
+    if (!last || !last->start
+            || !(last->is_id() || dynamic_cast<const MemberExpr *>(last)
+                 || dynamic_cast<const Subscript *>(last)
+                 || dynamic_cast<const LiteralNone *>(last)))
+        return false;
+    const Loc s = last->start;
+    size_t i = 0;
+    while (i < toks.size()
+           && (toks[i].loc.line < s.line
+               || (toks[i].loc.line == s.line && toks[i].loc.col < s.col)))
+        i++;
+    /* a parenthesized statement's node starts INSIDE its parentheses (a
+     * `(` before a top-level statement's start can only be its own) */
+    while (i > 0 && toks[i - 1] == Op::parenL)
+        i--;
+    /* the statement ends at the first `;` outside brackets */
+    size_t end = i;
+    int depth = 0;
+    for (; end < toks.size(); end++) {
+        const Tok &t = toks[end];
+        if (t == Op::parenL || t == Op::bracketL || t == Op::braceL)
+            depth++;
+        else if (t == Op::parenR || t == Op::bracketR || t == Op::braceR)
+            depth--;
+        else if (t == Op::semicolon && depth <= 0)
+            break;
+    }
+    return repl_value_lookup(toks, i, end);
 }
 
 /* The global names a top-level statement binds when it runs: a function or
@@ -709,7 +802,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
      *    is not echoed, so the prompt stays uncluttered. */
     if (echo) {
         const EvalValue r = RValue(last);
-        if (!r.is<NoneVal>() || repl_echo_none(last_elem)) {
+        if (!r.is<NoneVal>() || repl_echo_none(last_elem, tokens)) {
             /* Pretty-print: a container too wide for one line expands across
              * lines, indented (structs/dicts/arrays, recursively). Colored
              * line-by-line via the highlighter when color is on. */
