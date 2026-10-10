@@ -3453,6 +3453,12 @@ and it lives *inside the parser*. Mechanics:
   shadow. **A `var`/`const` of that name is still refused outright**
   (`CannotRebindBuiltinEx`, `declExprCheckId`); this rule is for the forms
   that were always allowed.
+  **AutoConst's call fold had the same hole (2026-10-06):** it evaluates a
+  constant-argument call in `cctx`, which holds the const builtins BY NAME,
+  and the program's own function cannot be registered under a taken name -
+  so `func top() {...} top()` ran the builtin (InvalidNumberOfArgsEx in
+  every engine), as did `top(1)` under `-nti`. A call whose callee resolved
+  to a user symbol named like a const builtin is not folded now.
 - **Early failure:** exceptions raised *during* const-eval propagate immediately
   and are *not*
   catchable by script `try/catch` (the parser never enters a const assignment
