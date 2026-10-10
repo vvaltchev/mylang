@@ -24913,7 +24913,11 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                               && (fd->kind == FieldKind::f_int
                                   || fd->kind == FieldKind::f_float
                                   || fd->kind == FieldKind::f_bool);
-        const bool boxed_form = fd && !mk.bake_def->is_pod();
+        /* a struct- or box-typed field takes the helper: its fit is a def
+         * compare (coerce_struct_field), not one tag */
+        const bool boxed_form = fd && !mk.bake_def->is_pod()
+                                && fd->kind != FieldKind::f_struct
+                                && fd->kind != FieldKind::f_box;
         DeclineJumps mv_slows;
         size_t mv_done = SIZE_MAX;
         const bool mv_ok = in.target == 0            /* a LOCAL base */
@@ -25004,6 +25008,39 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                     mk.bake_slot * static_cast<int>(sizeof(LValue)));
                 e.load(s2, src.type);
                 e.load32_base(s2, s2, L.type_t_off);
+                /* the value must be what coerce_struct_field hands back
+                 * unchanged - the field's own kind (`none` too, into an
+                 * opt field; anything but `none` into a non-opt dyn one).
+                 * A conversion (an int into a float field) or a refusal
+                 * is the helper's: a plain copy stored an int there */
+                {
+                    int want = -1;
+                    switch (fd->kind) {
+                    case FieldKind::f_int:   want = Type::t_int;   break;
+                    case FieldKind::f_float: want = Type::t_float; break;
+                    case FieldKind::f_bool:  want = Type::t_bool;  break;
+                    case FieldKind::f_str:   want = Type::t_str;   break;
+                    case FieldKind::f_array: want = Type::t_arr;   break;
+                    case FieldKind::f_dict:  want = Type::t_dict;  break;
+                    default:                 break;      /* f_dyn */
+                    }
+                    size_t j_nok = SIZE_MAX;
+                    if (fd->is_opt && want >= 0) {
+                        e.cmp_reg32_imm32(s2, static_cast<uint32_t>(
+                                              Type::t_none));
+                        j_nok = e.j8(0x74);              /* je: none */
+                    }
+                    if (want >= 0) {
+                        e.cmp_reg32_imm32(s2, static_cast<uint32_t>(want));
+                        decl_ne(JD_memberv_val_kind);
+                    } else if (!fd->is_opt) {
+                        e.cmp_reg32_imm32(s2, static_cast<uint32_t>(
+                                              Type::t_none));
+                        decline_jump(e, mv_slows, 0x74, JD_memberv_val_kind);
+                    }
+                    if (j_nok != SIZE_MAX)
+                        e.patch8(j_nok, e.pos());
+                }
                 e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_str_val));
                 const size_t v_triv = e.j8(0x72);        /* jb: trivial */
                 e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_ex_val));
