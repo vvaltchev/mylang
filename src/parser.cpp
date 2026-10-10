@@ -5,6 +5,7 @@
 #include "syntax.h"
 #include "analyzer.h"
 #include "resolver.h"
+#include "inferencer.h"   /* for_each_child_of */
 #include "numtext.h"
 #include "inttest.h"
 #include "cyclewalk.h"   /* a constant's value may contain itself */
@@ -3163,6 +3164,183 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     return true;
 }
 
+/*
+ * An explicit `pure` function RUNS at parse time when its arguments are
+ * constant (a fold, a const's initializer) - before inference stamps how a
+ * store converts its value. So a store into an element or a field of a
+ * place the body DECLARED (`array<float?> a = [none]; a[0] = n;`) kept the
+ * int `mk(1)` was folded to, while the run-time call `mk(int(runtime(1)))`
+ * stored 1.0 (RULE 2). Stamp such a store from the declarations here, as
+ * the inferencer later does from the static types (which it overwrites
+ * these with): Expr14::rv_coerce for an array element or a dict value, the
+ * assignment's value (val_widen), and the type a container literal stored
+ * there has (stamp_literal_annot). Each place's type is read off its own
+ * declaration - a parameter's or a declared local's annotation, a struct
+ * field's - so only what the body states is used.
+ */
+typedef std::unordered_map<const UniqueId *, const TypeAnnot *> PureAnnots;
+
+/* the annotated type of the place `lv` names (`cont`: the container its
+ * last step is in), or null when no declaration states it */
+static const TypeAnnot *
+pure_place_annot(const Construct *lv, const PureAnnots &m,
+                 std::vector<unique_ptr<TypeAnnot>> &tmp,
+                 const TypeAnnot **cont)
+{
+    *cont = nullptr;
+    if (!lv)
+        return nullptr;
+    if (ctag(lv) == ConstructType::id) {
+        auto it = m.find(static_cast<const Identifier *>(lv)->uid);
+        return it != m.end() ? it->second : nullptr;
+    }
+    const TypeAnnot *dummy;
+    if (ctag(lv) == ConstructType::subscript) {
+        const TypeAnnot *b = pure_place_annot(
+            static_cast<const Subscript *>(lv)->what.get(), m, tmp, &dummy);
+        *cont = b;
+        if (b && b->kind == DeclType::arr)
+            return b->elem.get();
+        if (b && b->kind == DeclType::dict)
+            return b->val.get();
+        return nullptr;
+    }
+    if (ctag(lv) != ConstructType::member)
+        return nullptr;
+    auto *me = static_cast<const MemberExpr *>(lv);
+    const TypeAnnot *b = pure_place_annot(me->what.get(), m, tmp, &dummy);
+    *cont = b;
+    if (!b || me->optional)
+        return nullptr;
+    if (b->kind == DeclType::dict)
+        return b->val.get();
+    if (b->kind != DeclType::strct || !b->strct)
+        return nullptr;
+    const FieldDef *fd = b->strct->field_of(me->memUid);
+    if (!fd)
+        return nullptr;
+    if (fd->annot)
+        return fd->annot.get();
+    auto t = make_unique<TypeAnnot>();
+    if (fd->kind == FieldKind::f_float)
+        t->kind = DeclType::f;
+    else if (fd->kind == FieldKind::f_int)
+        t->kind = DeclType::i;
+    else if (fd->kind == FieldKind::f_struct && fd->struct_def) {
+        t->kind = DeclType::strct;
+        t->strct = fd->struct_def;
+    } else
+        return nullptr;
+    tmp.push_back(std::move(t));
+    return tmp.back().get();
+}
+
+/* a declared identifier's annotated type (a struct-typed one has only
+ * decl_struct) */
+static const TypeAnnot *
+pure_decl_annot(const Identifier *id, std::vector<unique_ptr<TypeAnnot>> &tmp)
+{
+    if (id->decl_annot)
+        return id->decl_annot.get();
+    if (id->decl_type != DeclType::strct || !id->decl_struct)
+        return nullptr;
+    auto t = make_unique<TypeAnnot>();
+    t->kind = DeclType::strct;
+    t->strct = id->decl_struct;
+    tmp.push_back(std::move(t));
+    return tmp.back().get();
+}
+
+static void
+pure_stamp_stores(Construct *n, PureAnnots &m,
+                  std::vector<unique_ptr<TypeAnnot>> &tmp)
+{
+    if (!n || ctag(n) == ConstructType::func_decl)
+        return;     /* a nested pure function is stamped by its own parse */
+    if (ctag(n) == ConstructType::block) {
+        PureAnnots inner = m;          /* its declarations end with it */
+        for (auto &st : static_cast<Block *>(n)->elems)
+            pure_stamp_stores(st.get(), inner, tmp);
+        return;
+    }
+    /* the constructs that declare a name for a sibling part: the name
+     * shadows the outer one there, and nowhere else */
+    if (ctag(n) == ConstructType::for_stmt) {
+        auto *f = static_cast<ForStmt *>(n);
+        PureAnnots inner = m;          /* the init's declaration */
+        pure_stamp_stores(f->init.get(), inner, tmp);
+        for (Construct *ch : {f->cond.get(), f->inc.get(), f->body.get()}) {
+            PureAnnots part = inner;
+            pure_stamp_stores(ch, part, tmp);
+        }
+        return;
+    }
+    if (ctag(n) == ConstructType::foreach_stmt) {
+        auto *f = static_cast<ForeachStmt *>(n);
+        PureAnnots outer = m;
+        pure_stamp_stores(f->container.get(), outer, tmp);
+        PureAnnots inner = m;
+        if (f->ids)
+            for (auto &el : f->ids->elems)
+                inner[el->uid] = pure_decl_annot(el.get(), tmp);
+        pure_stamp_stores(f->body.get(), inner, tmp);
+        return;
+    }
+    if (ctag(n) == ConstructType::try_catch) {
+        auto *t = static_cast<TryCatchStmt *>(n);
+        PureAnnots part = m;
+        pure_stamp_stores(t->tryBody.get(), part, tmp);
+        for (auto &cs : t->catchStmts) {
+            part = m;
+            if (cs.first.asId)
+                part[cs.first.asId->uid] = nullptr;
+            pure_stamp_stores(cs.second.get(), part, tmp);
+        }
+        part = m;
+        pure_stamp_stores(t->finallyBody.get(), part, tmp);
+        return;
+    }
+    if (ctag(n) != ConstructType::expr14) {
+        for_each_child_of(n, [&](Construct *ch) {
+            PureAnnots inner = m;
+            pure_stamp_stores(ch, inner, tmp);
+        });
+        return;
+    }
+    auto *e = static_cast<Expr14 *>(n);
+    {
+        PureAnnots inner = m;
+        pure_stamp_stores(e->rvalue.get(), inner, tmp);
+        inner = m;
+        pure_stamp_stores(e->lvalue.get(), inner, tmp);
+    }
+    if (e->fl & pFlags::pInDecl) {
+        const Construct *lv = e->lvalue.get();
+        if (lv && ctag(lv) == ConstructType::id) {
+            auto *id = static_cast<const Identifier *>(lv);
+            m[id->uid] = pure_decl_annot(id, tmp);
+        } else if (lv && ctag(lv) == ConstructType::idlist) {
+            for (auto &el : static_cast<const IdList *>(lv)->elems)
+                m[el->uid] = pure_decl_annot(el.get(), tmp);
+        }
+        return;
+    }
+    const Construct *lv = e->lvalue.get();
+    if (e->op != Op::assign || !lv
+        || (ctag(lv) != ConstructType::subscript
+            && ctag(lv) != ConstructType::member))
+        return;
+    const TypeAnnot *cont = nullptr;
+    const TypeAnnot *t = pure_place_annot(lv, m, tmp, &cont);
+    if (!t || !cont)
+        return;
+    if (cont->kind == DeclType::arr || cont->kind == DeclType::dict)
+        e->rv_coerce = annot_num(t);
+    if (cont->kind != DeclType::dict)
+        e->val_widen = annot_num(t);
+    stamp_literal_annot(e->rvalue.get(), t, false);
+}
+
 bool
 pAcceptFuncDecl(ParseContext &c,
                 unique_ptr<Construct> &ret,
@@ -3273,8 +3451,18 @@ pAcceptFuncDecl(ParseContext &c,
         );
     }
     c.shadow_pop();                    /* #133: the params' scope */
-    if (is_pure)
+    if (is_pure) {
         c.pure_depth--;
+        PureAnnots m;
+        std::vector<unique_ptr<TypeAnnot>> tmp;
+        if (func->params)
+            for (const auto &pm : func->params->elems)
+                if (ctag(pm.get()) == ConstructType::id) {
+                    auto *pid = static_cast<const Identifier *>(pm.get());
+                    m[pid->uid] = pure_decl_annot(pid, tmp);
+                }
+        pure_stamp_stores(func->body.get(), m, tmp);
+    }
 
     func->end = c.get_loc() + 1;
 

@@ -115,6 +115,38 @@ struct test {
 
 static const std::vector<test> tests =
 {
+    /* RULE 2: a pure call folded at parse time ran its element stores
+     * before inference stamped their widening - `mk3(1)` gave `[1]` and
+     * `mk3(int(runtime(1)))` `[1.000000]` */
+    { "a pure call folded at parse time widens an element store as the "
+      "run-time call does", {
+        "pure func mk3(int n) { array<float?> a = [none]; a[0] = n;",
+        "    return a; }",
+        "assert(str(mk3(1)) == \"[1.000000]\");",
+        "assert(str(mk3(int(runtime(1)))) == \"[1.000000]\");",
+        "pure func mk4(int n) { array<array<float>> a = [[0.5]];",
+        "    a[0] = [n]; return a; }",
+        "assert(str(mk4(1)) == str(mk4(int(runtime(1)))));",
+        "pure func mk6(int n) { dict<str, float> d = {}; d[\"k\"] = n;",
+        "    return d; }",
+        "assert(str(mk6(1)) == str(mk6(int(runtime(1)))));",
+        "pure func mk8(int n) { array<float?> a = [none];",
+        "    var z = (a[0] = n); return [z]; }",
+        "assert(str(mk8(1)) == str(mk8(int(runtime(1)))));",
+        "struct Q { float f; array<float?> g; }",
+        "pure func mk9(int n) { Q q = Q(0.5, [none]);",
+        "    var z = (q.f = n); q.g[0] = n; return [z, q.g[0]]; }",
+        "assert(str(mk9(1)) == str(mk9(int(runtime(1)))));",
+        "assert(str(mk9(1)) == \"[1.000000, 1.000000]\");",
+        /* a loop's own `a` is not the body's declared one */
+        "pure func ps(int n) { array<int?> r = [none];",
+        "    array<float?> a = [none];",
+        "    for (array<int?> a = [none]; r[0] == none; ) {",
+        "        a[0] = n; r[0] = a[0]; }",
+        "    foreach (var a in [[0]]) { a[0] = n; r[0] = a[0] * 2; }",
+        "    return r; }",
+        "assert(str(ps(1)) == str(ps(int(runtime(1)))));" } },
+
     /* README: the value of an assignment is the value it stored - from a
      * `dyn` right-hand side too (the target is typed, so it converts) */
     { "an assignment's value is the value it stored, from a dyn rvalue", {

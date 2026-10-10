@@ -4781,8 +4781,18 @@ decisions behind it: `plans/archived/type-inference.md`,
   `annot_arr_hint` is `array_repr_hint`'s twin), because a typed const is
   bound, and an explicit `pure` call with constant arguments RUNS, before
   inference: `pure func mk(int n) { array<dyn> a = [n]; a[0] = "s"; ...}`
-  failed when folded and worked at run time. A local whose type only
-  INFERENCE widens still differs there (an open design question). Built from its own values, `[1.5]`
+  failed when folded and worked at run time. An explicit `pure` body's
+  STORES get the same treatment (`pure_stamp_stores`, parser.cpp): a
+  store into an element / field of a place the body declared - a
+  parameter, a declared local, a struct field of one - is stamped
+  rv_coerce / val_widen and its literal stamp_literal_annot'ed from the
+  declarations, scoped as the language scopes them (a block, a `for`'s
+  init, a foreach / catch variable); inference overwrites them later, and
+  the tree-walker applies rv_coerce CHECKED (coerce_to_decl_type, the
+  whole assignment's caret), as CoerceNumV does, so a stamp that meets
+  a misfit (-nti) is the same error in both engines. A local whose type
+  only INFERENCE widens still differs there (an open design question).
+  Built from its own values, `[1.5]`
   for an `array<float?>` was flat floats and a later `none` store failed.
   **A store into a DECLARED place is checked against it (#48):**
   `declared_type_of` answers the declared type of a location - a fixed
