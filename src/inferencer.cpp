@@ -1857,9 +1857,12 @@ void Inferencer::check_opt_struct_fields()
                         && f.loc.col < bad->loc.col)))
                 bad = &f;
         }
+    /* the parser's message (opt_field_msg) for the same rule: it named no
+     * box here, where the forward-reference case is decided */
     if (bad)
         throw SyntaxErrorEx(bad->loc,
-            "'opt' is only allowed on dyn/array/dict and class-typed fields");
+            "'opt' is only allowed on dyn/array/dict/box and class-typed "
+            "fields");
 }
 
 void Inferencer::infer_one(Block *rootBlock)
