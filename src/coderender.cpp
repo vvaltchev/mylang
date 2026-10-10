@@ -493,7 +493,9 @@ struct Renderer {
                 return prefix + at;
             if (auto *lo = dynamic_cast<const LiteralObj *>(rv))
                 return prefix + reflect_typeof(lo->literal_value());
-            if (rv->th == TypeHint::i) return prefix + "int";
+            /* th == i is ALSO a bool's hint (Construct::th_bool) */
+            if (rv->th == TypeHint::i)
+                return prefix + (rv->th_bool ? "bool" : "int");
             if (rv->th == TypeHint::f) return prefix + "float";
             if (dynamic_cast<const LiteralInt *>(rv))   return prefix + "int";
             if (dynamic_cast<const LiteralFloat *>(rv)) return prefix + "float";
