@@ -6557,11 +6557,16 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
      * itself, not at the whole `lhs = rhs` assignment. */
     EvalValue rval_storage;
     try {
-        rval_storage = literal_widen(RValue(rvalue->eval(ctx)), rv_coerce);
+        rval_storage = RValue(rvalue->eval(ctx));
     } catch (Exception &e) {
         stamp_operand_loc(rvalue.get(), e);
         throw;
     }
+    /* converted CHECKED, the whole assignment's caret on a value that does
+     * not fit - the VM's CoerceNumV (a statically typed rvalue always fits;
+     * a parse-time stamp of a pure body may meet one that does not) */
+    if (rv_coerce != DeclType::none)
+        rval_storage = coerce_to_decl_type(rval_storage, rv_coerce);
     const EvalValue &rval = rval_storage;
     IdList *idlist = nullptr;
 
