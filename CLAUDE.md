@@ -3039,7 +3039,7 @@ code, put it in the matching `.cpp.h` and rely on it being pulled into
 compile standalone, and there is nothing to add to the Makefile.
 `builtins/reflect.cpp.h` holds the **runtime reflection** builtins
 (`globals`/`typestr`/`kindstr`/`signature`/`layout`/`specializations`) and the
-shared `reflect_*` rendering helpers (signature/type/layout strings) the REPL's
+shared `reflect_*` rendering helpers (signature/type strings) the REPL's
 introspection commands reuse; it is `#include`d last (after the other builtins)
 so it can call `arr_elem_at`. See `plans/archived/repl-introspection.md`.
 **`reflect_decl_annot` is the ONE rendering of a declared annotation** (`P p`,
