@@ -3227,7 +3227,9 @@ A callback must be a function: passing a builtin (`find(a, 3, len)`) is a
 Return the absolute value of the given number.
 
 #### `min(a, b, [c, [...]])`
-Return the smallest value among the ones passed to it.
+Return the smallest value among the ones passed to it. Numbers of different
+kinds give a result of their common kind (the promotion chain
+`bool <= int <= float`): `min(1, 2.5)` is `1.0`, `max(true, 0)` is `1`.
 
 #### `min(array)`
 Return the smallest value among the ones in the given array. The result has
@@ -3235,7 +3237,8 @@ the array's element type; an **empty** array has no smallest value, so it
 raises `InvalidArgumentEx` (a compile-time error when the array is a `const`).
 
 #### `max(a, b, [c, [...]])`
-Return the largest value among the ones passed to it.
+Return the largest value among the ones passed to it, of the arguments'
+common kind like `min()`: `max(3, 2.5)` is `3.0`.
 
 #### `max(array)`
 Return the largest value among the ones in the given array. Like `min()`, an
