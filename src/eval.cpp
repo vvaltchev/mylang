@@ -2444,6 +2444,36 @@ EvalValue InlinedCallExpr::do_eval(EvalContext *ctx, bool rec) const
  * node re-eval on the VM side. The only context it needs is `is_const` (whether
  * the elements' LValues are read-only, i.e. we are in a const-eval context).
  */
+EvalValue flat_hint_value(const EvalValue &v, ArrHint hint)
+{
+    switch (hint) {
+    case ArrHint::flat_i:
+        if (v.is<int_type>())
+            return v;
+        if (v.is<bool>())
+            return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+        break;
+    case ArrHint::flat_f:
+        if (v.is<float_type>())
+            return v;
+        if (v.is<int_type>())
+            return EvalValue(static_cast<float_type>(v.get<int_type>()));
+        if (v.is<bool>())
+            return EvalValue(static_cast<float_type>(v.get<bool>() ? 1 : 0));
+        break;
+    case ArrHint::flat_b:
+        if (v.is<bool>())
+            return v;
+        break;
+    default:
+        return v;
+    }
+    /* the message the flat arrays raise for a dyn-laundered misfit */
+    throw TypeErrorEx(
+        "Cannot store a value of a different type in a flat (typed) array; "
+        "declare the array dyn for a polymorphic array");
+}
+
 EvalValue build_array_from_values(const EvalValue *vals, size_t n,
                                   ArrHint hint,
                                   const StructTypeDef *hint_struct,
@@ -2493,6 +2523,49 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
     }
 
     /*
+     * A destination proven array<int> / <float> / <bool> (the flat hints):
+     * the elements widen to its element type (bool -> int, int / bool ->
+     * float) and the array is born flat - a literal with a `dyn` element
+     * holding a bool or an int stayed a GENERAL array holding them, a bool
+     * in an array<int>. A literal is built by an op that never fails, so
+     * an element that does not fit at all (a dyn string) still builds
+     * general below.
+     */
+    if (hint == ArrHint::flat_i || hint == ArrHint::flat_f
+            || hint == ArrHint::flat_b) {
+        bool fit = true;
+        for (size_t i = 0; i < n && fit; i++) {
+            const EvalValue &v = vals[i];
+            fit = hint == ArrHint::flat_b ? v.is<bool>()
+                : hint == ArrHint::flat_i ? v.is<int_type>() || v.is<bool>()
+                : v.is<float_type>() || v.is<int_type>() || v.is<bool>();
+        }
+        if (fit) {
+            if (hint == ArrHint::flat_i) {
+                SharedArrayObj::ivec_type iv;
+                iv.reserve(n);
+                for (size_t i = 0; i < n; i++)
+                    iv.push_back(
+                        flat_hint_value(vals[i], hint).get<int_type>());
+                return SharedArrayObj(std::move(iv));
+            }
+            if (hint == ArrHint::flat_f) {
+                SharedArrayObj::fvec_type fv;
+                fv.reserve(n);
+                for (size_t i = 0; i < n; i++)
+                    fv.push_back(
+                        flat_hint_value(vals[i], hint).get<float_type>());
+                return SharedArrayObj(std::move(fv));
+            }
+            SharedArrayObj::bvec_type bv;
+            bv.reserve(n);
+            for (size_t i = 0; i < n; i++)
+                bv.push_back(vals[i].get<bool>() ? 1 : 0);
+            return SharedArrayObj(std::move(bv));
+        }
+    }
+
+    /*
      * Build flat (unboxed) int/float storage when every element is that one
      * scalar kind - a literal's element types ARE its type, so this
      * value-driven check yields exactly the type-driven representation (plans/
@@ -2527,9 +2600,9 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
      * references, 3 = general. Type-driven: a
      * literal bound to a dynamically-typed destination (arr_hint general, set by
      * the inferencer) is built general from the start, so a later mixed write to
-     * it never has to promote. (The flat_i/flat_f/flat_b hints need no special
-     * case - the value-driven scan already produces flat for an all-one-kind
-     * literal, which is exactly when those hints are set.)
+     * it never has to promote. (The flat_i/flat_f/flat_b hints were served
+     * above whenever every element fits; reaching here with one, an
+     * element does not fit - a `dyn` misfit, built general.)
      */
     int mode = hint == ArrHint::general ? 3 : 0;
     if (mode == 3)

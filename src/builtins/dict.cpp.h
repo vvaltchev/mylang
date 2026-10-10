@@ -116,31 +116,31 @@ dict_extract(const DictObject::inner_type &data, ArrHint hint)
     /* KEYS picks the pair's key, else its value (an LValue -> EvalValue). */
     #define DICT_ELEM(e) (KEYS ? (e).first : (e).second.get())
 
+    /* each key/value through flat_hint_value: a `dyn` dict's bool widens
+     * into an array<int>, a misfit raises the flat arrays' TypeErrorEx (a
+     * getter's bare "Type error" until 2026-10-09) */
     if (hint == ArrHint::flat_i) {
         SharedArrayObj::ivec_type v;
         v.reserve(data.size());
-        for (auto const &e : data) {
-            const EvalValue &kv = DICT_ELEM(e);
-            v.push_back(kv.get<int_type>());
-        }
+        for (auto const &e : data)
+            v.push_back(flat_hint_value(DICT_ELEM(e), hint)
+                            .get<int_type>());
         return SharedArrayObj(std::move(v));
     }
     if (hint == ArrHint::flat_f) {
         SharedArrayObj::fvec_type v;
         v.reserve(data.size());
-        for (auto const &e : data) {
-            const EvalValue &kv = DICT_ELEM(e);
-            v.push_back(kv.get<float_type>());
-        }
+        for (auto const &e : data)
+            v.push_back(flat_hint_value(DICT_ELEM(e), hint)
+                            .get<float_type>());
         return SharedArrayObj(std::move(v));
     }
     if (hint == ArrHint::flat_b) {
         SharedArrayObj::bvec_type v;
         v.reserve(data.size());
-        for (auto const &e : data) {
-            const EvalValue &kv = DICT_ELEM(e);
-            v.push_back(kv.get<bool>() ? 1 : 0);
-        }
+        for (auto const &e : data)
+            v.push_back(flat_hint_value(DICT_ELEM(e), hint)
+                            .get<bool>() ? 1 : 0);
         return SharedArrayObj(std::move(v));
     }
 

@@ -881,6 +881,15 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
                                   const StructTypeDef *hint_struct,
                                   bool is_const);
 
+/* An element built for a destination PROVEN array<int> / <float> / <bool>
+ * (`hint` flat_i / flat_f / flat_b): `v` widened to that element type
+ * (bool -> int, int / bool -> float), a value that does not fit - only a
+ * `dyn` source can produce one - a TypeErrorEx; any other hint returns
+ * `v`. The builders a callback or a fill value feeds (map, filter,
+ * make_array, array, keys, values) pass each element through it, so a
+ * typed destination never holds a misfit. See eval.cpp. */
+EvalValue flat_hint_value(const EvalValue &v, ArrHint hint);
+
 /* The value a baked const array/dict/struct LiteralObj materializes (immutable
  * share vs mutable clone, plus the general/flat_s arr_hint cases). Shared by
  * tree-walker (LiteralObj::do_eval) and the VM's LoadLiteralObjV op, so both
