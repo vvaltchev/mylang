@@ -7831,7 +7831,13 @@ locals all happen and are inspectable (`:analyze`).
   persistent global (never slotted into "main", never auto-const-promoted — the
   open-world soundness point); nested function locals slot/inline/specialize
   normally. `eval` runs the input's elems directly in the persistent global
-  scope, so globals persist and nested calls build their own frames.
+  scope, so globals persist and nested calls build their own frames. **The
+  top level still gets a FRAME when the inliner gave it slots**: a call
+  spliced into a top-level statement takes its argument temps (`$a0`) and
+  its callee's locals as new slots of main's frame (`root->slot_count`),
+  which a script's root `Block::do_eval` builds - so `do_eval` builds one
+  for the input's run (until 2026-10-10 it did not, and such a call read
+  "Undefined variable '$a0'").
 - **`render_analysis`/`anno_code`** moved from `mylang.cpp` to `analyzer.cpp`
   (an `ostream` param) so `-a` and `:analyze` share one renderer.
 
