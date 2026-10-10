@@ -2995,6 +2995,25 @@ static DeclType numeric_widen(StaticTypeRef target, StaticTypeRef val)
     return DeclType::none;
 }
 
+/* The conversion that makes an assignment's VALUE what README says it is -
+ * the right-hand side converted to the target's type - when the right-hand
+ * side is `dyn`: i/f for a numeric target, checked at run time as a
+ * concrete variable receiving a `dyn` is (a value that does not fit is a
+ * TypeErrorEx). numeric_widen answers the statically typed rvalues. */
+static DeclType assign_value_widen(StaticTypeRef target, StaticTypeRef val)
+{
+    if (!target || !val)
+        return DeclType::none;
+    if (static_type_resolve(val)->kind != StaticTypeKind::Dyn)
+        return numeric_widen(target, val);
+    target = static_type_resolve(target);
+    if (target->kind == StaticTypeKind::Float)
+        return DeclType::f;
+    if (target->kind == StaticTypeKind::Int)
+        return DeclType::i;
+    return DeclType::none;
+}
+
 /* Stamp a container literal's numeric widening from the type it has IN
  * CONTEXT, and push that type down into the literals nested directly in
  * it: `[[1, 2.5], [3, 4]]` is array<array<float>>, so the inner `[3, 4]`
@@ -3148,20 +3167,26 @@ void Inferencer::annotate_hints(Construct *n)
                     : static_cast<const MemberExpr *>(lv)->what.get();
             StaticTypeRef bt = static_type_resolve(
                 type_of(const_cast<Construct *>(base)));
+            StaticTypeRef rt = type_of(e->rvalue.get());
+            /* a dict's value converts before the store - a `dyn` one
+             * CHECKED, as a typed variable receiving one does (RULE 1: a
+             * dict<_, float> held the int, or the string, it was given) */
             if (bt->kind == StaticTypeKind::Dict)
-                e->rv_coerce = numeric_widen(bt->val,
-                                             type_of(e->rvalue.get()));
+                e->rv_coerce = assign_value_widen(bt->val, rt);
+            /* the store's VALUE: the right-hand side converted to the
+             * target's type (a dict's was, before the store) */
             else
-                e->val_widen = numeric_widen(
-                    type_of(const_cast<Construct *>(lv)),
-                    type_of(e->rvalue.get()));
-            /* an ARRAY element widens too, as a dict's value does: a
-             * general array<float?> stored an int where its static type
-             * says float (a flat float array converts on its own) */
+                e->val_widen = assign_value_widen(
+                    type_of(const_cast<Construct *>(lv)), rt);
+            /* an ARRAY element converts before the store too, as a dict's
+             * value does: a general array<float?> stored an int, or a
+             * `dyn` string, where its static type says float. (So the
+             * value's conversion above never throws after a store: the
+             * tree-walker makes it in statement position too, the VM in
+             * its value form only.) */
             if (ctag(lv) == ConstructType::subscript
                 && bt->kind == StaticTypeKind::Array)
-                e->rv_coerce = numeric_widen(bt->elem,
-                                             type_of(e->rvalue.get()));
+                e->rv_coerce = assign_value_widen(bt->elem, rt);
         }
         /* a container literal stored into a FIXED array / dict type it
          * fits has that type (literal_dest_type): its elements widen to
