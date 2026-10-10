@@ -3836,6 +3836,11 @@ Block); in a loop condition (`no_block`) it declines instead. The temp
 stores carry the CALL SITE's chain and the argument's span, and are
 inserted after the body's statements are tagged (the Block keeps the call
 site's chain too), so an argument error renders exactly what `-ni` does.
+A coercing temp (an int/float parameter) with another temp-bound argument
+after it stores its argument UNTYPED and is coerced in place (`$a = $a`)
+once every argument is evaluated - a real call binds after evaluating all
+of them, so `g(d, tick())` with a float `d` into `int a` must still run
+`tick()` before the TypeErrorEx (it did not, inlined, until 2026-10-06).
 The same property had three more homes, fixed with it: the old "cheap
 arg to a PURE callee" substitution (the callee's purity says nothing about
 the ARGUMENT), `collapse_locals` (a `var q = a / b; return 1;` body lost

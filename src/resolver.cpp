@@ -6200,24 +6200,75 @@ private:
              * the arg's span, which is where a real call's bind carets a
              * failed coercion (bind_arg). A param declared int/float
              * coerces: the temp carries its decl_type, so the store runs
-             * the same coerce_to_decl_type the bind runs. */
+             * the same coerce_to_decl_type the bind runs.
+             *
+             * A real call evaluates EVERY argument before it binds any, so
+             * a coercion that throws must not skip a later argument's
+             * evaluation (`g(d, tick())` with a float `d` into `int a`
+             * printed nothing inlined, `tick` with -ni). A coercing temp
+             * with another temp-bound argument after it therefore takes the
+             * argument as is, untyped, and is coerced in place once all of
+             * them are evaluated (`$a = $a`, with the argument's span). */
+            const auto coerces = [&](int i) {
+                const DeclType dt = param_decl_type(f, static_cast<size_t>(i));
+                return dt == DeclType::i || dt == DeclType::f;
+            };
+            const auto temp_id = [&](int slot, const Construct *arg) {
+                auto id = make_unique<Identifier>("$a" + std::to_string(slot));
+                id->sym = ResolvedSym{ SymKind::local, slot };
+                id->start = arg->start;
+                id->end = arg->end;
+                id->inline_ctx = ce->inline_ctx;
+                return id;
+            };
+            /* the deferred coercions first: each insert goes to the front,
+             * so they end up after every evaluation below. Both loops walk
+             * the parameters BACKWARDS, so `later` - "a temp-bound
+             * argument follows this one" - is a running flag. */
             int tt = ntemps;
+            bool later = false;
+            for (int i = nparams - 1; i >= 0; i--) {
+                if (!needs_temp[i])
+                    continue;
+                tt--;
+                const bool defer = coerces(i) && later;
+                later = true;
+                if (!defer)
+                    continue;
+                const size_t pi = static_cast<size_t>(i);
+                const Construct *arg = ce->args->elems[pi].get();
+                auto asn = make_unique<Expr14>();
+                asn->op = Op::assign;
+                auto lv = temp_id(temp_base + tt, arg);
+                lv->th = temp_hint(f, pi, arg);
+                lv->decl_type = param_decl_type(f, pi);
+                asn->start = arg->start;
+                asn->end = arg->end;
+                asn->inline_ctx = ce->inline_ctx;
+                asn->lvalue = std::move(lv);
+                asn->rvalue = temp_id(temp_base + tt, arg);  /* untyped */
+                blk->elems.insert(blk->elems.begin(), std::move(asn));
+            }
+            tt = ntemps;
+            later = false;
             for (int i = nparams - 1; i >= 0; i--) {
                 if (!needs_temp[i])
                     continue;
                 tt--;
                 const size_t pi = static_cast<size_t>(i);
                 const Construct *arg = ce->args->elems[pi].get();
+                const bool deferred = coerces(i) && later;
+                later = true;
                 auto asn = make_unique<Expr14>();
                 asn->op = Op::assign;
-                auto lv = make_unique<Identifier>(
-                    "$a" + std::to_string(temp_base + tt));
-                lv->sym = ResolvedSym{ SymKind::local, temp_base + tt };
-                lv->th = temp_hint(f, pi, arg);
-                lv->decl_type = param_decl_type(f, pi);
-                lv->start = asn->start = arg->start;
-                lv->end = asn->end = arg->end;
-                lv->inline_ctx = asn->inline_ctx = ce->inline_ctx;
+                auto lv = temp_id(temp_base + tt, arg);
+                if (!deferred) {
+                    lv->th = temp_hint(f, pi, arg);
+                    lv->decl_type = param_decl_type(f, pi);
+                }
+                asn->start = arg->start;
+                asn->end = arg->end;
+                asn->inline_ctx = ce->inline_ctx;
                 asn->lvalue = std::move(lv);
                 asn->rvalue = arg->clone();
                 blk->elems.insert(blk->elems.begin(), std::move(asn));
