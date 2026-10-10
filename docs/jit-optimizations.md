@@ -17909,3 +17909,20 @@ functions whose frames are gone by the next read - a temp of main holds
 a reference too and made the first version of the test pass vacuously -
 plus a discarded closure result counted through `g_live_funcobjs`. Both
 arms (frameless, and the `frameless` lever off).
+
+## The inline boxed field store checks the value's KIND (2026-10-09)
+
+The #97 inc 4 StoreMemberV tier's BOXED form copied any value into the
+field's LValue: the POD form required `field_exact_scalar`, the boxed one
+nothing. A field of a non-POD struct therefore held whatever it was given
+- `s.f = 2` the int 2 in a `float` field - which every engine did then
+(the shared `vm_member_store` / tree-walker `member_store` were plain slot
+writes too; both now go through `boxed_field_rmw`, coerce_struct_field
+like a POD field and the constructor). The inline tier now requires the
+value to be what coerce_struct_field hands back unchanged: the field's own
+tag (t_int / t_float / t_bool / t_str / t_arr / t_dict), `none` into an
+opt field, anything but `none` into a non-opt dyn one; everything else
+declines (`memberv_val_kind`, the POD form's reason) to the helper, which
+converts or raises. A struct- or box-typed field takes the helper always:
+its fit is a def compare, not one tag. Store reach is unchanged on the
+shapes the tier exists for (an exact-kind value).
