@@ -6015,6 +6015,23 @@ static const std::vector<test> tests =
       { "assert(false);",
         "var c = func[zz]() => zz;",
         "var dyn r = c();" }, &typeid(UndefinedVariableEx) },
+    /* A local assigned only an undefined name's value has no knowable
+     * type: it finalized `none`, and the inferencer - which runs before
+     * the resolver - refused `y + 1` with "type 'none'", hiding the real
+     * error. It is an untyped `dyn` now, and the name is reported. */
+    { "FIX-1: a local fed by an undefined callee reports the callee",
+      { "assert(false);",
+        "var y = nosuch(1); print(y + 1);" },
+      &typeid(UndefinedVariableEx), 9, 2, 16, 2 },
+    { "FIX-1: a chain of locals fed by an undefined name reports the name",
+      { "assert(false);",
+        "func f() { var a = zq; var b = a; return -b; }",
+        "print(f());" },
+      &typeid(UndefinedVariableEx), 20, 2, 23, 2 },
+    { "FIX-1: `bool(x)` is not a builtin: the name, not a none local",
+      { "assert(false);",
+        "var yes = bool(runtime(true)); print(!yes, yes < 1);" },
+      &typeid(UndefinedVariableEx), 11, 2, 16, 2 },
     /*
      * ...and what FIX-1 must NOT reject. A name declared BELOW its use is
      * not "declared nowhere" - that is step 3's TDZ, a different error. A
@@ -6138,9 +6155,18 @@ static const std::vector<test> tests =
       { "if (defined(x) && defined(y)) { print(x, y); }",
         "assert(1 == 1);" } },
     { "guard: a later conjunct of the same && chain is covered",
-      { /* isbound is deliberately NOT FIX-1-exempt, so without this the
-         * idiom for a maybe-absent name would not compile */
+      { /* (isbound is FIX-1-exempt since 2026-08-09, so the conjunct
+         * itself compiles either way; the guard covers the branch) */
         "if (defined(x) && isbound(x)) { print(x); }",
+        "assert(1 == 1);" } },
+    /* ...whatever the branch does with it: an ordering comparison was
+     * "cannot compare '?' with 'int'" (the arithmetic and unary checks
+     * already deferred on the untyped operand), and a local fed by it
+     * finalized `none` (a NullabilityEx on `w + 1`) */
+    { "guard: a guarded name may be compared and copied to a local",
+      { "if (defined(nosuch)) { var z = nosuch > 0; print(z); }",
+        "if (isbound(nq) && nq > 0) { print(nq); }",
+        "if (defined(nw)) { var w = nw; print(w + 1, -w, w < 2, w == 1); }",
         "assert(1 == 1);" } },
     /*
      * The POLARITY cases - each must STILL be refused, or the narrowing has
@@ -17668,6 +17694,11 @@ static const std::vector<test> tests =
     { "template: a value-used lambda stays the join model (map)",
       { "var f = func(x) => x*2;",
         "assert(sum(map(f, [1,2,3])) == 12);" } },
+    /* a local copying a parameter no call site feeds is as untyped as the
+     * parameter (it finalized `none`, so `y + 1` was a NullabilityEx) */
+    { "infer: a never-called lambda's copy of its parameter is untyped",
+      { "var fs = [func(x) { var y = x; return y + 1; }];",
+        "assert(len(fs) == 1);" } },
     { "template: a capturing lambda stays the join model",
       { "var b = 10; var add = func(n) => n + b;",
         "assert(add(5) == 15);" } },
@@ -21400,6 +21431,13 @@ static const std::vector<repl_test> repl_tests =
         { "bin(bs)", "the parameter is 'int' at line" },
         { "var bf = box(1.5)", "" },
         { "*bb = bf", "a box<int> cannot hold 'box<float>' at line" } } },
+
+    /* the REPL's undefined name is a run-time error, and a local fed by
+     * one is untyped: it was refused at compile time over `y5 + 1`
+     * ("type 'none'") */
+    { "undefined: a local fed by an undefined callee runs to the name",
+      { { "var y5 = nosuch5(1); print(y5 + 1)",
+          "Undefined variable 'nosuch5'" } } },
 
     /* a box across inputs: a later input writes the box an earlier one
      * made, `*` reads it, :type names its type, a box<P> echoes as one */

@@ -504,7 +504,8 @@ Either query guards — `isbound(x)` is the usual one, `defined(x)` works too.
 Only the checked name, and only in the branch the check proves: the `else` arm,
 a negated guard, an `||` chain, and anything after the `if` are unaffected.
 When `x` really does not exist the guarded code is also *deleted* — the guard
-folds to `false` and the dead branch is dropped.
+folds to `false` and the dead branch is dropped — so the branch may use `x`
+any way it likes: compare it, copy it into a local, pass it on.
 
 **Nesting is bounded.** Expressions and blocks may nest up to 256 levels; past
 that the program is refused with a syntax error. The limit is far above
@@ -520,14 +521,16 @@ var total = scaled * heigth;    # ERROR at compile time: undefined variable
 print(total);                   #        'heigth'
 ```
 
+That is the error reported whatever the program does with the value next:
+`var y = nosuch(1); print(y + 1);` names `nosuch`, not `y`.
+
 This costs nothing: a script resolves every name it can reach, so such a name
 was guaranteed to fail at run time anyway. A name declared *later* is a
 different matter and is still accepted (a function may read a global declared
-below it). Some query builtins are exempt - `defined(x)`, `isconst(x)` and
-`isconstdecl(x)` never evaluate their argument, so asking about a name that
-exists nowhere is legal and answers `false`. **`isbound(x)` is deliberately
-NOT exempt**: asking whether something that can never exist has been *bound*
-is the same mistake as reading it, so it stays a compile error.
+below it). The query builtins are exempt - `defined(x)`, `isbound(x)`,
+`isconst(x)` and `isconstdecl(x)` never evaluate their argument, so asking
+about a name that exists nowhere is legal and answers `false` (which is what
+makes `if (isbound(x)) { ... }` the feature test - see `isbound(name)`).
 
 **Top-level variables have an implicit `var`.** At the outermost scope (a
 statement directly in the program/REPL, not inside any block or function), a

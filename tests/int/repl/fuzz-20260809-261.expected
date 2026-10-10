@@ -12,7 +12,7 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 
     print = "x";
     ^^^^^^^^^^^
->> NullabilityEx: possibly-none value used as a member-access base (type 'dyn?') at line 3, col 1:6
+>> TypeErrorEx: Expected dict object at line 3, col 1:6
 
     print.print;
     ^^^^^

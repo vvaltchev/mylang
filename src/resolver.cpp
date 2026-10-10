@@ -1484,9 +1484,8 @@ private:
      *
      * POLARITY, and it is the whole correctness question: the guard holds for
      * the THEN branch and for the REST of its own `&&` chain (so
-     * `if (defined(x) && isbound(x))` works - `isbound` is deliberately not
-     * FIX-1-exempt). It does NOT hold for the ELSE branch, and `!defined(x)`
-     * establishes nothing.
+     * `if (defined(x) && x > 0)` works). It does NOT hold for the ELSE
+     * branch, and `!defined(x)` establishes nothing.
      */
     void collect_defined_guards(const Construct *cond,
                                 std::vector<const UniqueId *> &out)
