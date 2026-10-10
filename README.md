@@ -232,6 +232,11 @@ running keeps what its statements defined before the error, and the
 declarations after it define nothing (`var a = 1; var b = xs[9]; var c = 2`
 with a one-element `xs` defines `a` only).
 
+A name declared nowhere is not refused at the prompt, since a later input may
+declare it: it is reported when the input runs, as an undefined variable
+marked at the name, wherever the name stands - read, assigned into
+(`zz[0] = 1`) or handed to an in-place builtin (`append(zz, 1)`).
+
 The line editor is hand-rolled (no `readline`/`reline` dependency, in keeping
 with the no-dependencies rule): live syntax highlighting, command history
 (Up/Down, persisted to `~/.mylang_history`), the usual Emacs-style editing keys

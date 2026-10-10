@@ -2062,7 +2062,13 @@ EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
     case Builtin::Kind::lvalue: {
         /* The lvalue adapters' exact behavior: arg0's LValue* if it IS one
          * (else null -> the builtin throws NotLValueEx / its arity error),
-         * the rest RValued by value. */
+         * the rest RValued by value. An UNDEFINED name (the REPL's open
+         * world) is the name's error at the argument, as the direct
+         * adapter reports it (lv_builtin_target, types.cpp). */
+        if (n && args[0].is<UndefinedId>())
+            throw UndefinedVariableEx(args[0].get<UndefinedId>().id,
+                                      al->args ? al->args[0].start : al->start,
+                                      al->args ? al->args[0].end : al->end);
         LValue tmp;
         LValue *target = n
             ? builtin_lv_target(b, args[0].is<LValue *>()
