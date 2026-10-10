@@ -4559,40 +4559,49 @@ bool construct_no_side_effects(const Construct *c)
  * caller has already proven blv is a flat writable array. Shared by the AST
  * path (subscript_store, base `a` from the AST) and the VM's NESTED
  * store (vm_nested_subscript_store, base `a[i]` an inner element LValue).
- * Returns true (and sets `out`) on a store; false ONLY for a compound op on a
- * flat struct array (structs have no `+=`), so the caller defers to the general
- * path. `sub_*` is the subscript's caret (OOB / type errors), `idx_*` the
- * index's (the "Expected integer" error). A compound op stores the element
- * it read in `*old_out` when given - the value a postfix `++` / `--` yields.
+ * Returns true (and sets `out`) on a store; false when a flat string or
+ * class array PROMOTED to general for a value or an op it cannot hold, so
+ * the caller defers to the general path. `sub_*` is the subscript's caret
+ * (OOB / type errors - "Expected integer" too, as the general array's
+ * store and every read report it). A compound op stores the element it
+ * read in `*old_out` when given - the value a postfix `++` / `--` yields.
  */
 static bool
 flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
                 const EvalValue &rval, Op op, EvalValue &out,
-                Loc sub_start, Loc sub_end, Loc idx_start, Loc idx_end,
-                EvalValue *old_out = nullptr)
+                Loc sub_start, Loc sub_end, EvalValue *old_out = nullptr)
 {
     /*
      * Flat POD-struct array: `a[i] = <matching POD struct>` stores the value's
-     * bytes (a compound op defers; structs have no `+=`). A non-matching value
-     * is the dyn-launder case (errors like the scalar kinds).
+     * bytes. A compound op reads the element and applies the operator, as a
+     * general array of the same structs does - a struct has none, so it is
+     * that array's TypeErrorEx (README: storage never changes behaviour; it
+     * deferred to the general path, which has no LValue for a flat element
+     * and raised NotLValueEx). A non-matching value is the dyn-launder case
+     * (errors like the scalar kinds).
      */
     if (arr.skind() == SharedArrayObj::Storage::structs) {
 
-        if (op != Op::assign)
-            return false;
-
-        const EvalValue r = RValue(rval);
+        const EvalValue r0 = RValue(rval);
         const auto &sv0 = arr.flat_structs();
 
         if (!idx_v.is<int_type>())
             throw TypeErrorEx("Expected integer as subscript",
-                              idx_start, idx_end);
+                              sub_start, sub_end);
         int_type idx = idx_v.get<int_type>();
         ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
         if (idx < 0)
             idx += arr.size();
         if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
             throw OutOfBoundsEx(sub_start, sub_end);
+
+        EvalValue r = r0;
+        if (op != Op::assign) {
+            r = arr_elem_boxed(arr, static_cast<size_type>(idx));
+            if (old_out)
+                *old_out = r;
+            apply_compound_op(r, r0, op);
+        }
 
         if (!r.is<intrusive_ptr<StructObject>>() ||
             !r.get<intrusive_ptr<StructObject>>()->is_pod() ||
@@ -4631,7 +4640,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
 
         if (!idx_v.is<int_type>())
             throw TypeErrorEx("Expected integer as subscript",
-                              idx_start, idx_end);
+                              sub_start, sub_end);
         int_type idx = idx_v.get<int_type>();
         ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
         if (idx < 0)
@@ -4665,7 +4674,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
 
         if (!idx_v.is<int_type>())
             throw TypeErrorEx("Expected integer as subscript",
-                              idx_start, idx_end);
+                              sub_start, sub_end);
         int_type idx = idx_v.get<int_type>();
         ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
         if (idx < 0)
@@ -4688,7 +4697,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
 
     if (!idx_v.is<int_type>())
         throw TypeErrorEx("Expected integer as subscript",
-                          idx_start, idx_end);
+                          sub_start, sub_end);
 
     int_type idx = idx_v.get<int_type>();
     ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
@@ -4896,8 +4905,7 @@ subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
             && flat_writable_array(base.get<LValue *>(), arr)) {
         EvalValue out;
         if (flat_store_core(base.get<LValue *>(), *arr, key, rval, op, out,
-                            sub->start, sub->end,
-                            sub->index->start, sub->index->end, old_out))
+                            sub->start, sub->end, old_out))
             return out;
     }
 
@@ -5323,14 +5331,14 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
      * exactly as the tree-walker's subscript_store. This is what makes
      * StoreElemValue a UNIVERSAL store (any base: flat / general / dict), so the
      * codegen can emit it for a dyn/unproven base. flat_store_core returns false
-     * only for a compound op on a flat STRUCT array (defer to the general path,
-     * which raises the same error). */
+     * only when a flat string / class array promoted to general (defer to
+     * the general path, which then holds the element's LValue). */
     if (base_lv->is<SharedArrayObj>()) {
         SharedArrayObj *arr;
         if (flat_writable_array(base_lv, arr)) {
             EvalValue out;
             if (flat_store_core(base_lv, *arr, key, value, op, out,
-                                lstart, lend, lstart, lend))
+                                lstart, lend))
                 return out;
         }
     }
@@ -5423,7 +5431,7 @@ dyn_incdec_elem(const EvalValue &cur, const EvalValue &key, bool is_inc,
         if (!flat_store_core(cur.get<LValue *>(), *arr, key,
                              EvalValue(static_cast<int_type>(1)),
                              is_inc ? Op::addeq : Op::subeq, nv,
-                             astart, aend, astart, aend))
+                             astart, aend))
             throw InternalErrorEx();
         return nv;
     }
@@ -5622,7 +5630,9 @@ void vm_incdec_member(LValue *base_lv, const EvalValue &memId,
  * tree-walker's own: an access error at the access caret (`b*` is a member
  * step's BASE caret, for "Expected dict object"), NotLValue / const /
  * non-int-float at the INC-DEC caret (`id_*`); returns old (postfix) / new
- * (prefix).
+ * (prefix). `k*` (the index's caret) is read by nothing since a flat
+ * store's "Expected integer" took the subscript's caret, as every other
+ * store and read has; the image still carries it.
  */
 EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                           const EvalValue &memId, const UniqueId *memUid,
@@ -5693,8 +5703,7 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                 if (flat_writable_array(cur.get<LValue *>(), arr)) {
                     EvalValue out;
                     if (flat_store_core(cur.get<LValue *>(), *arr, key, one,
-                                        cop, out, lstart, lend, kstart, kend,
-                                        &old)) {
+                                        cop, out, lstart, lend, &old)) {
                         nv = out;
                         have_nv = true;
                     }
@@ -5860,11 +5869,9 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
         if (flat_writable_array(inner.get<LValue *>(), arr)) {
             EvalValue fout;
             if (flat_store_core(inner.get<LValue *>(), *arr, key2, value, op,
-                                fout, locs[1].first, locs[1].second,
-                                locs[1].first, locs[1].second))
+                                fout, locs[1].first, locs[1].second))
                 return fout;
-            /* a compound op on a flat struct array: defer to the general path
-             * below, which raises the same error as the tree-walker. */
+            /* a string / class array promoted: the general path below */
         }
     }
 
@@ -5942,7 +5949,7 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
     if (inner && flat_writable_array(inner, arr)) {
         EvalValue fout;
         if (flat_store_core(inner, *arr, keys[nkeys - 1], value, op,
-                            fout, fs, fe, fs, fe))
+                            fout, fs, fe))
             return fout;
     }
     /* The FINAL store's throws (subscript OOB/KeyNotFound, slot_rmw type) are

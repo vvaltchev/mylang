@@ -115,6 +115,35 @@ struct test {
 
 static const std::vector<test> tests =
 {
+    /* README: an array's storage changes only speed, never behavior. A
+     * compound store into an element of a FLAT struct array raised
+     * NotLValueEx where a general array of the same structs raises the
+     * TypeErrorEx of `struct + int` (every engine) */
+    { "a compound store into a flat struct array's element: the general "
+      "array's TypeErrorEx, caret and all", {
+        "struct P { int x; }",
+        "var pts = [P(1)];",
+        "var dyn dp = pts;",
+        "dp[0] += 1;" },
+      &typeid(TypeErrorEx), 1, 4, 12, 4 },
+    { "a compound store into a flat struct array nested in a general one: "
+      "the general array's TypeErrorEx", {
+        "struct P { int x; }",
+        "var pts = [P(1)];",
+        "var nested = [pts, pts];",
+        "var dyn dn = nested;",
+        "dn[0][0] *= 2;" },
+      &typeid(TypeErrorEx), 1, 5, 15, 5 },
+    /* ...and a non-int index of a store into a FLAT array carets the whole
+     * subscript, as a general array's store and every read do: the
+     * tree-walker's flat store marked the index alone */
+    { "err loc: a non-int index storing into a flat array: the subscript", {
+        "var b = [1, 2];",
+        "var dyn a = b;",
+        "var dyn k = \"x\";",
+        "a[k] = 3;" },
+      &typeid(TypeErrorEx), 1, 4, 6, 4 },
+
     /* RULE 2: a pure call folded at parse time ran its element stores
      * before inference stamped their widening - `mk3(1)` gave `[1]` and
      * `mk3(int(runtime(1)))` `[1.000000]` */
