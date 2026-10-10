@@ -480,10 +480,26 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
     /* The SAME optimizer pipeline the script driver runs (run_optimizers), so
      * the REPL's tree transformation is on par with a script's - just with
      * repl_mode (top-level decls stay map globals) and the prior-input scope
-     * seeded for cross-input fold / inline / specialize. */
-    run_optimizers(root.get(), /*enable_inline=*/true, /*inline_threshold=*/24,
-                   /*enable_specialize=*/true, /*repl_mode=*/true,
-                   /*prior_scope=*/runtime_ctx.get());
+     * seeded for cross-input fold / inline / specialize.
+     *
+     * It can RAISE: a constant call is evaluated here (`h(0)` with
+     * `func h(x) => 10 / x` folds to a division by zero - a script's
+     * compile error). That refuses the input like a type error does:
+     * report it, and take back what the check above committed (its
+     * globals, its template instances), since nothing of it ran. Uncaught,
+     * it ended the session - and, for a thrown struct, was rendered by
+     * main() after ~ReplEngine had freed the struct's definition (a
+     * use-after-free). */
+    try {
+        run_optimizers(root.get(), /*enable_inline=*/true,
+                       /*inline_threshold=*/24, /*enable_specialize=*/true,
+                       /*repl_mode=*/true,
+                       /*prior_scope=*/runtime_ctx.get());
+    } catch (const Exception &e) {
+        infer.reject_input();
+        retained.push_back(std::move(root));   /* keep the AST alive */
+        return out.str() + format_error(e);
+    }
 
     /* 3. Evaluate each top-level statement directly in the persistent global
      *    scope, capturing print() output and the last statement's value. */

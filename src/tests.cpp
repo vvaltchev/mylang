@@ -21938,6 +21938,7 @@ static bool static_type_to_string_basic()
 struct repl_step {
     const char *input;
     const char *expect;     /* substring that must appear in the output */
+    const char *absent = nullptr;   /* if set, must NOT appear in it */
 };
 
 struct repl_test {
@@ -21947,6 +21948,24 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* an error raised while COMPILING an input (the optimizers fold a
+     * constant call: h(0) divides by zero) refuses that input as a type
+     * error does, and the session goes on - it escaped the engine and
+     * ended the REPL. Nothing of the refused input is committed: not its
+     * global (hq's type), not its template instance (a later h(5) reused
+     * the never-bound h$0 by name) */
+    { "an error raised while optimizing an input refuses only that input",
+      { { "func h(x) => 10 / x", "" },
+        { "h(0)", "DivisionByZeroEx" },
+        { "print(\"after\")", "after" },
+        { "h(5)", "=> 2" },
+        { "func h2(x) => x[5]", "" },
+        { "var hq = h2([1])", "OutOfBoundsEx" },
+        { "hq = \"s\"", "=> \"s\"" },
+        { "var lf = func (x) => x[5]", "" },
+        { "lf([1])", "OutOfBoundsEx" },
+        { "lf([1, 2, 3, 4, 5, 6])", "=> 6" } } },
+
     /* "read its value with *b" only where reading it fixes the error:
      * a box<int> passed for a box<float> or a box<str> for an int is not
      * fixed by `*` (the message said so); a box<int> for an int is */
@@ -22548,11 +22567,24 @@ static bool run_one_repl_test(const repl_test &t)
 
     for (const auto &s : t.steps) {
 
-        const std::string out = engine.eval_input(s.input);
+        /* an exception escaping the engine ENDS a real session (run_repl
+         * lets it through) - a failure of this step, not of the suite */
+        std::string out;
+        try {
+            out = engine.eval_input(s.input);
+        } catch (const Exception &e) {
+            cout << "  step input : " << s.input << "\n";
+            cout << "  escaped    : " << e.name << ": "
+                 << (e.msg ? e.msg : "") << "\n";
+            return false;
+        }
 
-        if (out.find(s.expect) == std::string::npos) {
+        if (out.find(s.expect) == std::string::npos
+                || (s.absent && out.find(s.absent) != std::string::npos)) {
             cout << "  step input : " << s.input << "\n";
             cout << "  expected   : " << s.expect << "\n";
+            if (s.absent)
+                cout << "  and not    : " << s.absent << "\n";
             cout << "  got        : " << out << "\n";
             return false;
         }

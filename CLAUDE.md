@@ -7802,9 +7802,18 @@ locals all happen and are inspectable (`:analyze`).
   inferred commit vs "is declared" for an annotated one). All `pinned` branches
   are no-ops in the one-shot path, so scripts/tests are byte-identical. A
   rejected input rolls back (`infer_input` restores the global scope + pins the
-  half-built syms). **An uninitialized `var a;` commits as `dyn?`, not `none`**
-  (`pin_new`): a script infers a plain `var`'s type from later uses
-  (`var a; a = 3` → `int?`; a conflicting `a = "x"` is an error), but the REPL
+  half-built syms). **So does one a LATER stage refuses:** the optimizers can
+  RAISE (a constant call folded at compile time - `h(0)` dividing by zero is a
+  script's compile error), and `do_eval` catches that, reports it and calls
+  `ReplInfer::reject_input()`, which restores the same snapshot
+  (`Inferencer::last_input`: the global scope and the template-instance
+  cache, so a later input cannot reuse an instance like `h$0` by name that
+  was never bound). It escaped `do_eval` until 2026-10-10 and ended the
+  session - and `main` rendered a thrown struct after `~ReplEngine` freed its
+  definition (a use-after-free). **An uninitialized `var a;` commits as
+  `dyn?`, not `none`** (`pin_new`): a script infers a plain `var`'s type from
+  later uses (`var a; a = 3` → `int?`; a conflicting `a = "x"` is an error),
+  but the REPL
   commits each input before seeing the next and so cannot defer — a `none`
   commitment would reject *every* later assignment (`a = 1`), so an
   unconstrained, un-annotated, non-`dyn`/non-param var is committed `opt dyn`

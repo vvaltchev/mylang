@@ -1,0 +1,11 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> Uncaught exception 'E', data: E() at line 2, col 13:21
+
+    func th() { throw E(); };
+                ^^^^^^^^
+
+Backtrace (most recent call first):
+  [0] th()   at line 2
+  [1] main() at line 3
+>> after 
+>> 
