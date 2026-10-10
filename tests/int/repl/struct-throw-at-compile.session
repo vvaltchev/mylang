@@ -1,4 +1,0 @@
-struct E {}
-func th() { throw E(); }
-th()
-print("after")
