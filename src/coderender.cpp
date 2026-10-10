@@ -979,25 +979,52 @@ string render_func_code(const FuncDeclStmt *fn,
     return o.str();
 }
 
+/* Is `c` rendered as a STATEMENT (stmt) rather than an expression: a
+ * statement kind, a NAMED function (a lambda is an expression) and a
+ * declaration (`var q = 5` is not the expression `q = 5`). */
+static bool renders_as_statement(const Construct *c)
+{
+    switch (ctag(c)) {
+    case ConstructType::nop:
+    case ConstructType::block:
+    case ConstructType::if_stmt:
+    case ConstructType::while_stmt:
+    case ConstructType::for_stmt:
+    case ConstructType::for_range:
+    case ConstructType::foreach_stmt:
+    case ConstructType::ret:
+    case ConstructType::try_catch:
+    case ConstructType::struct_decl:
+    case ConstructType::brk:
+    case ConstructType::cont:
+    case ConstructType::rethrow:
+    case ConstructType::throw_stmt:
+        return true;
+    case ConstructType::func_decl:
+        return static_cast<const FuncDeclStmt *>(c)->id != nullptr;
+    case ConstructType::expr14:
+        return (static_cast<const Expr14 *>(c)->fl & pFlags::pInDecl) != 0;
+    default:
+        return false;
+    }
+}
+
 string render_construct_code(const Construct *c)
 {
     if (!c)
         return "";
     std::ostringstream o;
     Renderer r(o);
-    /* a lambda is an expression; a NAMED function is a declaration */
-    const auto *fd = dynamic_cast<const FuncDeclStmt *>(c);
-    if (dynamic_cast<const Block *>(c) ||
-        dynamic_cast<const IfStmt *>(c) ||
-        dynamic_cast<const WhileStmt *>(c) ||
-        dynamic_cast<const ForStmt *>(c) ||
-        dynamic_cast<const ForRangeStmt *>(c) ||
-        dynamic_cast<const ForeachStmt *>(c) ||
-        dynamic_cast<const ReturnStmt *>(c) ||
-        (fd && fd->id) ||
-        dynamic_cast<const TryCatchStmt *>(c))
-        r.stmt(c, 0);
-    else
+    if (!renders_as_statement(c)) {
         r.expr(c, 0);
-    return o.str();
+        return o.str();
+    }
+    /* a statement ends where it does: stmt() writes its newline, and a
+     * caller (:show) adds its own line break, as for an expression - two
+     * made a blank line after every if / while / block / try / func */
+    r.stmt(c, 0);
+    string s = o.str();
+    if (!s.empty() && s.back() == '\n')
+        s.pop_back();
+    return s;
 }

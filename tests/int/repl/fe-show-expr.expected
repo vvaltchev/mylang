@@ -38,32 +38,25 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 } else {
     print(2);
 }
-
 >> while (dd > 100) {
     dd--;
 }
-
 >> for (int i = 0; i < 3; i++) {
     print(i);
 }
-
 >> foreach (var v in a) {
     print(v);
 }
-
 >> {
     print(1);
     print(2);
 }
-
 >> /* pure */ func q(x, y) => x * y;
-
 >> try {
     print(1);
 } catch (TypeErrorEx as e) {
     print(2);
 }
-
 >> print(1)
 print(2)
 >> SyntaxError at line 1, col 4

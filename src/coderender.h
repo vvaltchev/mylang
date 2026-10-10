@@ -33,5 +33,7 @@ std::string render_func_code(const FuncDeclStmt *fn,
                              const std::string &ret_type = "");
 
 /* Render an arbitrary construct (a statement or expression) - used by the
- * above and by the unit tests. */
+ * above and by the unit tests. The text has NO trailing newline, whether a
+ * statement (a declaration included: `int q = 5;`) or an expression
+ * (`14`); a caller breaks the line itself. */
 std::string render_construct_code(const Construct *c);

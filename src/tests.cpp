@@ -23339,6 +23339,44 @@ static bool coderender_highlight()
     return ok;
 }
 
+/*
+ * :show of a STATEMENT prints it and ends there: the decompiler handed back
+ * a statement WITH its newline and :show added one more, so every if /
+ * while / for / foreach / block / try / func was followed by a blank line.
+ * And a declaration keeps its keyword (`:show var q = 5` printed `q = 5`).
+ * Exact outputs - a substring step cannot see a blank line too many.
+ */
+static bool coderender_show_statement_exact()
+{
+    static const struct { const char *in, *out; } cases[] = {
+        { ":show if (runtime(1)) { print(2); }",
+          "if (runtime(1)) {\n    print(2);\n}\n" },
+        { ":show while (runtime(false)) { print(2); }",
+          "while (runtime(false)) {\n    print(2);\n}\n" },
+        { ":show func q(x, y) => x * y",
+          "/* pure */ func q(x, y) => x * y;\n" },
+        { ":show var q = 5", "int q = 5;\n" },
+        { ":show 2 + 3 * 4", "14\n" },
+        { ":show struct S9 { int a; const k = 2; }",
+          "struct S9 {\n    int a;\n    const k = 2;\n}\n" },
+        { ":show try { print(1); } catch { rethrow; }",
+          "try {\n    print(1);\n} catch {\n    rethrow;\n}\n" },
+    };
+
+    ReplEngine engine;
+    bool ok = true;
+    for (const auto &c : cases) {
+        const std::string got = engine.eval_input(c.in);
+        if (got != c.out) {
+            cout << "  input   : " << c.in << "\n"
+                 << "  expected: [" << c.out << "]\n"
+                 << "  got     : [" << got << "]\n";
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 static bool replhelp_unknown_and_topics()
 {
     if (!help_has("no_such_thing", "No help for"))   return false;
@@ -56432,6 +56470,8 @@ static const std::vector<extra_check> extra_checks =
       inline_unroll_shape },
     { "coderender: :show highlighting (block comment + $ id)",
       coderender_highlight },
+    { "coderender: :show of a statement adds no blank line",
+      coderender_show_statement_exact },
     { "repl: completion (globals/builtins/keywords)",
       repl_completion_globals_builtins_keywords },
     { "repl: completion (struct members)", repl_completion_struct_members },
