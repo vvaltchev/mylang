@@ -85,8 +85,12 @@ ifeq ($(UBSAN),1)
 	# diagnose-and-continue, so a real UB failure can't slip through CI's
 	# exit-code check (the default recovers and would still exit 0).
 	BASE_FLAGS += -fsanitize=undefined -fno-sanitize=signed-integer-overflow \
-	              -fno-sanitize-recover=undefined
+	              -fno-sanitize-recover=undefined -DML_UBSAN=1
+else
+	BASE_FLAGS += -DML_UBSAN=0
 endif
+# ML_UBSAN tells `mylang -v` (as ML_LTO does): GCC defines no macro for
+# -fsanitize=undefined, so the binary cannot learn it from the compiler.
 
 ifneq (,$(filter 1,$(ASAN) $(UBSAN)))
 	BASE_FLAGS += -fno-omit-frame-pointer

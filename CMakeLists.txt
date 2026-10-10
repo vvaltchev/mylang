@@ -223,6 +223,15 @@ if (NOT MSVC)
    endif()
 endif()
 
+# Tell `-v` whether UBSan is on, as ML_LTO below does for LTO: GCC defines
+# no macro for -fsanitize=undefined, so the binary cannot ask the compiler.
+# MSVC has no UBSan (the option has no effect there).
+if (UBSAN AND NOT MSVC)
+   target_compile_definitions(mylang PRIVATE ML_UBSAN=1)
+else()
+   target_compile_definitions(mylang PRIVATE ML_UBSAN=0)
+endif()
+
 # Whole-program (link-time) optimization for optimized configs, on by default:
 # ~7% smaller binary and ~8-9% faster on the bench suite. Configure with
 # -DLTO=OFF to disable. INTERPROCEDURAL_OPTIMIZATION abstracts over GCC/Clang
