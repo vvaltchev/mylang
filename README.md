@@ -3474,7 +3474,13 @@ language (the promotion chain `bool <= int <= float`, the same rule as
 `int x = true;` or a struct's int field): storing, appending, or inserting a
 bool into an `array<int>` writes `0`/`1`, into an `array<float>` `0.0`/`1.0`.
 The reverse (an int into an `array<bool>`) stays a `TypeError` — that would be
-a narrowing, which the language never does implicitly.
+a narrowing, which the language never does implicitly. The elements of an
+array **built** for a destination of a known element type widen the same
+way when a `dyn` source supplies them - a `dyn` callback's results in
+`array<int> r = map(f, xs)`, `make_array`, `filter`, the fill value of
+`array(n, v)`, the keys or values of a `dyn` dict - and a value that is not
+of that type at all (a string for an `array<int>`) raises `TypeErrorEx`
+there, rather than leaving a misfit in the array.
 
 The same widening applies to the values a **literal** or a **selection**
 produces, wherever it is written: a container literal holds its values at its

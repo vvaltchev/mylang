@@ -77,7 +77,10 @@ EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
         return SharedArrayObj(std::move(vec));
     }
 
-    const EvalValue &v = args[1];
+    /* a destination proven array<int> / <float> / <bool> holds that element
+     * type: a `dyn` fill value widens or is refused (a bool filled an
+     * array<int> as bools, a string as a general array) */
+    const EvalValue v = flat_hint_value(args[1], hint);
 
     /*
      * Flat storage for a scalar fill value, unless the destination is
@@ -196,7 +199,11 @@ EvalValue builtin_make_array(EvalContext *ctx, const ArgLocs *exprList,
 
     for (int_type i = 0; i < n; i++) {
 
-        const EvalValue r = inv.call(i);
+        /* a destination proven array<int> / <float> / <bool> holds that
+         * element type: a `dyn` callback's bool widens, a misfit raises
+         * (it built a general array holding it) */
+        const EvalValue r = flat_hint_value(inv.call(i),
+                                            exprList->arr_hint);
 
         if (mode == 0) {
             /* the first element names the storage; release a reservation

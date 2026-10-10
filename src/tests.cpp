@@ -211,6 +211,42 @@ static const std::vector<test> tests =
         "assert(str(min(a, b)) == \"1.000000\");",
         "assert(str(min(\"b\", \"a\")) == \"a\");" } },
 
+    /* A builder whose destination is a proven array<int>/<float>/<bool>
+     * (map, make_array, array(), keys/values, a literal) holds that
+     * element type: a bool or an int from a `dyn` source widens - it was
+     * stored as it was, a bool in an array<int> (RULE 1) - and map,
+     * make_array, array() and keys/values refuse anything else */
+    { "a builder for a proven array<int> widens a dyn bool", {
+        "var dyn f = runtime(func(x) { if (x == 3) return true; return x; });",
+        "array<int> r = map(f, [1, 2, 3]);",
+        "assert(str(r) == \"[1, 2, 1]\" && array_storage(r) == \"int\");",
+        "array<int> m = make_array(4, f);",
+        "assert(str(m) == \"[0, 1, 2, 1]\" && array_storage(m) == \"int\");",
+        "array<float> mf = map(f, [1, 3]);",
+        "assert(str(mf) == \"[1.000000, 1.000000]\");",
+        "var dyn bt = runtime(true);",
+        "array<float> l = [1.5, bt];",
+        "assert(str(l) == \"[1.500000, 1.000000]\");",
+        "assert(array_storage(l) == \"float\");",
+        "array<int> a = array(2, bt);",
+        "assert(str(a) == \"[1, 1]\" && array_storage(a) == \"int\");",
+        "var dyn dd = runtime({\"k\": true});",
+        "array<int> v = values(dd);",
+        "assert(str(v) == \"[1]\");" } },
+    { "a builder for a proven array<int> refuses a dyn string (map)", {
+        "var dyn f = runtime(func(x) { if (x == 2) return \"s\"; return x; });",
+        "array<int> r = map(f, [1, 2, 3]);" },
+      &typeid(TypeErrorEx), 20, 2, 33, 2 },
+    { "a builder for a proven array<int> refuses a dyn string "
+      "(make_array)", {
+        "var dyn f = runtime(func(x) { if (x == 2) return \"s\"; return x; });",
+        "array<int> r = make_array(3, f);" },
+      &typeid(TypeErrorEx), 27, 2, 32, 2 },
+    { "a builder for a proven array<int> refuses a dyn string (array)", {
+        "var dyn s = runtime(\"s\");",
+        "array<int> r = array(3, s);" },
+      &typeid(TypeErrorEx), 22, 2, 27, 2 },
+
     /*
      * #97 R2/R2b: a closure whose captures are all frame locals is built
      * by the lean constructor, which copies an int/float/bool capture by
