@@ -22,8 +22,11 @@ class FuncDeclStmt;
  *     valid script syntax); explicit annotations and proven typed-scalar hints
  *     surface as the variable's type.
  *
- * It is best-effort, not a round-trippable pretty-printer: an unhandled node
- * falls back to a comment placeholder rather than failing.
+ * It is best-effort, not a round-trippable pretty-printer, but every node
+ * kind renders as code: the expression renderer switches over ConstructType
+ * with no `default`, so a new kind does not compile until it is rendered.
+ * A function with no name (a lambda) renders as the expression
+ * `func [captures] (params) ...`.
  */
 std::string render_func_code(const FuncDeclStmt *fn,
                              const std::vector<std::string> &param_types = {},

@@ -18313,6 +18313,16 @@ static const std::vector<test> tests =
         "assert(typestr(\"s\") == \"str\");" } },
     { "reflect: typestr of the none literal is none",
       { "assert(typestr(none) == \"none\");" } },
+    /* a function VALUE with no name rendered as `func <lambda>(x) ...`,
+     * which is not code: a lambda is the expression
+     * `func [captures] (params) ...` */
+    { "coderender: show() of a lambda renders the lambda expression",
+      { "var k = int(runtime(2));",
+        "assert(show(func (int x) => x + 1)"
+        " == \"/* pure */ func (int x) => x + 1\");",
+        "assert(show(func [k] (int x) { var y = x * k; return y; }) =="
+        " \"func [k] (int x) {\\n    int y = x * k;\\n"
+        "    return y;\\n}\");" } },
     { "reflect: typestr of a dyn variable holding none is its static type",
       { "var dyn n = none; assert(typestr(n) == \"dyn?\");" } },
     { "reflect: typeof a struct instance is its name",
@@ -18368,6 +18378,37 @@ static const std::vector<test> tests =
        * marker), then the signature */
       { "func sf(int x) => x + 1;",
         "assert(startswith(show(sf), \"/* pure */ func sf(int x)\"));" } },
+    /* these printed a comment naming the node instead of the code: the
+     * statements as `BreakStmt` / `ContinueStmt` / `ThrowStmt` /
+     * `RethrowStmt`, a lambda value as `FuncDeclStmt`, a multi-assignment
+     * target as `IdList` */
+    { "coderender: break, continue, throw, rethrow, a lambda and a "
+      "multi-assignment render as code",
+      { "struct E1 { int c; }",
+        "func lp(int n) { var s = 0; for (var i = 0; i < n; i++) {"
+        " if (i == 5) { break; } if (i == 2) { continue; } s += i; }"
+        " return s; }",
+        "func th(int n) { try { if (n > 3) { throw E1(n); } }"
+        " catch (E1 as e) { rethrow; } return n; }",
+        "func lf(int n) { var f = func [n] (int x) => x * n;"
+        " var a, b = [n, 2]; a, b = [b, a]; return f(a) + b; }",
+        "assert(lp(9) == 8 && th(2) == 2 && lf(3) == 9);",
+        "var dyn s1 = show(lp); var dyn s2 = show(th);"
+        " var dyn s3 = show(lf);",
+        "assert(find(s1, \"            break;\\n\") != none);",
+        "assert(find(s1, \"            continue;\\n\") != none);",
+        "assert(find(s2, \"            throw E1(n);\\n\") != none);",
+        "assert(find(s2, \"        rethrow;\\n\") != none);",
+        "assert(find(s3, \"    var f = func [n] (int x) => x * n;\\n\")"
+        " != none);",
+        "assert(find(s3, \"    var a, b = [n, 2];\\n\") != none);",
+        "assert(find(s3, \"    a, b = [b, a];\\n\") != none);",
+        "foreach (var s in [s1, s2, s3])",
+        "    assert(find(s, \"Stmt */\") == none"
+        " && find(s, \"IdList\") == none);",
+        /* an assignment as an operand keeps its parentheses */
+        "var u = 1;",
+        "assert(show(u = (u = 3) + 1) == \"u = (u = 3) + 1\");" } },
     { "reflect: show() renders an expression (folded)",
       { "assert(show(2 + 3 * 4) == \"14\");" } },
     { "reflect: show() renders an expression tree",
@@ -22220,6 +22261,18 @@ static const std::vector<repl_test> repl_tests =
 
     { ":show of an expression renders its optimized (folded) form",
       { { ":show 2 + 3 * 4", "14" } } },
+
+    /* :show of a lambda VARIABLE rendered the header `func <lambda>(x)` */
+    { ":show of a lambda variable renders the lambda expression",
+      { { "var lam = func (x) => x + 1", "" },
+        { "lam(2)", "=> 3" },
+        { ":show lam", "func (x) => x + 1" } } },
+    /* :show EXPR renders a tree the inferencer has not desugared: the
+     * labels of named arguments were dropped (`P(5, 6)`, which gives x
+     * the 5) */
+    { ":show keeps a named argument's label",
+      { { "struct PN { int x; int y; }", "" },
+        { ":show PN(y: 5, x: 6)", "PN(y: 5, x: 6)" } } },
 
     /* a counted for-loop specializes to a ForRangeStmt (shown "counted") */
     { ":show shows a counted for-loop specialized (ForRangeStmt)",
