@@ -482,7 +482,7 @@ EvalValue builtin_layout(EvalContext *ctx, const ArgLocs *exprList,
 }
 
 /*
- * specializations(f): the synthetic global names ($specN / $tmplN) of every
+ * specializations(f): the synthetic global names (name$sN / name$N) of every
  * specialization / template-instantiation clone derived from function `f`, as
  * an array<str> (empty when none). The clones are real globals (a clone is
  * inserted at the root block and binds its synthetic name), so this is purely
@@ -518,7 +518,7 @@ EvalValue builtin_specializations(EvalContext *ctx, const ArgLocs *exprList,
         const FuncDescriptor *g = v.get<intrusive_ptr<FuncObject>>()->func;
         if (g == f || g->display_name != name)
             continue;
-        /* a clone has a synthetic id ($specN/$tmplN) + the original name in
+        /* a clone has a synthetic id (name$sN / name$N) + the original name in
          * display_name; the original itself has an empty display_name so it is
          * skipped by the display_name test above. */
         out.push_back(std::string(g->name->val));

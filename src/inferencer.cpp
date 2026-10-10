@@ -1069,7 +1069,7 @@ std::string Inferencer::template_sig_key(FuncInfo *tmpl,
 }
 
 /*
- * Build a concrete clone of a template for one signature: a fresh `$tmplN` name
+ * Build a concrete clone of a template for one signature: a fresh `name$N` name
  * (display_name keeps the original for backtraces), structurally walked so it
  * has its own FuncInfo + param/local syms, marked non-template, and inserted at
  * the root block's front. Its params are NOT seeded - the redirected call (the

@@ -27,7 +27,7 @@ enum class AnnoKind : unsigned char {
     flat_array,    /* green:   array<int>/<float>/<bool> (unboxed storage) */
     dyn_array,     /* red:     array<dyn> (dynamic, unoptimizable) */
     inlined,       /* blue:    call spliced inline at its call-site */
-    specialized,   /* cyan:    call redirected to a $specN clone */
+    specialized,   /* cyan:    call redirected to a name$sN clone */
     folded,        /* magenta: call evaluated at compile time -> literal */
     counted_for,   /* green:   `for` specialized to a counted ForRangeStmt */
 };
