@@ -190,6 +190,27 @@ static const std::vector<test> tests =
         "q.inner.f = 11;",
         "assert(str(q.inner.f) == \"11.000000\");" } },
 
+    /* min/max of mixed numeric arguments: the result has their common
+     * type (bool <= int <= float), as inference types it. It was the
+     * untouched argument - an int in a float slot - and the engines
+     * disagreed on what a later read made of it */
+    { "min/max of mixed numeric arguments return their common type", {
+        "var one = int(runtime(1));",
+        "var x = 0.5;",
+        "var m = max(one, 2, x);",
+        "assert(str(m) == \"2.000000\");",
+        "var arr = [max(one, x), 0.5];",
+        "assert(str(arr) == \"[1.000000, 0.500000]\");",
+        "assert(array_storage(arr) == \"float\");",
+        "assert(str(max(1.5, 2)) == \"2.000000\");",
+        "assert(str(max(true, 0)) == \"1\");",
+        "assert(str(max(true, false)) == \"true\");",
+        "assert(str(min(one, 3)) == \"1\");",
+        "var dyn a = runtime(1);",
+        "var dyn b = runtime(2.5);",
+        "assert(str(min(a, b)) == \"1.000000\");",
+        "assert(str(min(\"b\", \"a\")) == \"a\");" } },
+
     /*
      * #97 R2/R2b: a closure whose captures are all frame locals is built
      * by the lean constructor, which copies an int/float/bool capture by
@@ -329,7 +350,7 @@ static const std::vector<test> tests =
         "  assert(str(inl(a)) == str(a - 1 >= 0 ? a - 1 : 1 - a));",
         "  assert(keep(inl(b)) == (b - 1 >= 0 ? b - 1 : 1 - b));",
         "}",
-        "assert(typestr(min(true, 5)) == \"bool\");",
+        "assert(typestr(min(true, 5)) == \"int\");",
         "assert(min(2, 2.5) == 2 && max(1.5, 1) == 1.5 && abs(-2.5) == 2.5);" } },
     /*
      * FALL OFF THE END: a body whose last statement is a conditional

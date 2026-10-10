@@ -288,6 +288,29 @@ EvalValue b_min_max(EvalContext *ctx, const ArgLocs *exprList,
         }
     }
 
+    /*
+     * Numbers of different kinds give a result of their COMMON kind, the
+     * promotion chain bool <= int <= float - exactly the type inference
+     * gives the call (`max(one, 2, 0.5)` is a float). The selected value
+     * itself was returned untouched: an int in a slot proven float, which
+     * one engine printed as `2` and another as `2.000000` (RULE 1). A
+     * non-number among the arguments converts nothing.
+     */
+    bool any_f = false, any_i = false;
+    for (size_t i = 0; i < n; i++) {
+        if (args[i].is<float_type>())
+            any_f = true;
+        else if (args[i].is<int_type>())
+            any_i = true;
+        else if (!args[i].is<bool>())
+            return val;
+    }
+    if (any_f && !val.is<float_type>())
+        return EvalValue(val.is<int_type>()
+                             ? static_cast<float_type>(val.get<int_type>())
+                             : (val.get<bool>() ? 1.0 : 0.0));
+    if (!any_f && any_i && val.is<bool>())
+        return EvalValue(static_cast<int_type>(val.get<bool>() ? 1 : 0));
     return val;
 }
 
