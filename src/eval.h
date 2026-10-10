@@ -746,11 +746,13 @@ EvalValue pod_place_incdec(const PodPlace &p, int slot, bool is_inc,
                            bool is_prefix, Loc ms, Loc me,
                            Loc id_start, Loc id_end);
 
-/* The boxed field LValue* of `base.member` for a mutating builtin arg0
- * (`append(s.f, x)` — CallBuiltinLVMember). See eval.cpp. */
+/* The target of a mutating builtin whose arg0 is `base.member`
+ * (`append(s.f, x)` — CallBuiltinLVMember): the boxed field's LValue, or
+ * `hold` holding the field's value when it is not a location. See
+ * eval.cpp. */
 LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
                          const Loc &mstart, const Loc &mend,
-                         const Loc &bstart, const Loc &bend);
+                         const Loc &bstart, const Loc &bend, LValue &hold);
 
 /* VM (StoreElem2V): native NESTED store `a[i][j] = v` / `OP= v`. `locs[0]`/
  * `locs[1]` are the inner/outer subscript carets (deref only on a throw). See

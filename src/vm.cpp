@@ -7063,6 +7063,18 @@ extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
  * interpreter's exact CallBuiltinLVElem; every throw is a RuntimeException ->
  * g_vm_jit_exc (arg0's caret if loc-less) + re-raise. NOT op_fully_native.
  */
+/* The target of a mutating builtin whose arg0 is an element `a[i]`: the
+ * element's LValue, or `hold` holding its value when the subscript gave a
+ * value (a flat array's scalar, a read-only container's element) - the
+ * builtin works on it held, as the tree-walker's (lv_builtin_target) */
+static inline LValue *vm_builtin_elem_target(EvalValue &sub, LValue &hold)
+{
+    if (sub.is<LValue *>())
+        return sub.get<LValue *>();
+    hold = LValue(std::move(sub), false);
+    return &hold;
+}
+
 extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
                                         int_type dst_slot, int_type run_base,
                                         const void *bcv) noexcept
@@ -7081,13 +7093,13 @@ extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
     const int_type n_rest = static_cast<int_type>(bc->args.size()) - 1;
     try {
         EvalValue holder;   /* keeps the subscript result alive */
+        LValue hold;
         LValue *elem = nullptr;
         if (base) {
             const EvalValue &idx = ctx->frame->at(run_base).get();
             holder = base->get().get_type()->subscript(
                 EvalValue(base), idx, /*for_write=*/false);
-            if (holder.is<LValue *>())
-                elem = holder.get<LValue *>();
+            elem = vm_builtin_elem_target(holder, hold);
         }
         SmallArgs<8> restbuf;   /* n_rest small (append 1, pop 0); B1 */
         for (int_type i = 0; i < n_rest; i++)
@@ -7122,7 +7134,8 @@ extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
  * model-flip (nativize-ops): the native CallBuiltinLVMember - a mutating lvalue
  * builtin whose arg0 is a struct-MEMBER target `append(s.f, x)`. Forms the base's
  * LValue* (by kind), the boxed FIELD LValue* via vm_member_lvalue (the SAME check
- * MemberExpr does; a POD/readonly/missing field throws), then func_lv. The run at
+ * MemberExpr does; a POD/readonly field's value is held, a missing one throws),
+ * then func_lv. The run at
  * `run_base` holds ONLY the value args (NO index, unlike LVElem). The
  * interpreter's exact CallBuiltinLVMember; every throw is a RuntimeException ->
  * g_vm_jit_exc (arg0's caret if loc-less) + re-raise. NOT op_fully_native.
@@ -7145,10 +7158,12 @@ extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
     const int_type n_rest = static_cast<int_type>(bc->args.size()) - 1;
     try {
         LValue *field = nullptr;
+        LValue hold;
         if (base)
             field = vm_member_lvalue(base, bc->member,
                                      bc->args[0].start, bc->args[0].end,
-                                     bc->args[0].start, bc->args[0].end);
+                                     bc->args[0].start, bc->args[0].end,
+                                     hold);
         SmallArgs<8> restbuf;   /* append/push 1 value arg; #97 B1 */
         for (int_type i = 0; i < n_rest; i++)
             restbuf.push(ctx->frame->at(run_base + i).get());
@@ -13212,9 +13227,10 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * Subscript::do_eval uses, given the identical base LValue* - and
              * call func_lv REST-NATIVE. `b` = the run base: run[0] = the index,
              * run[1..] = the pre-evaluated value args (append/push 1, pop 0). A
-             * non-lvalue element (a flat scalar / read-only / missing dict key,
-             * which throws) gives a null target -> NotLValueEx, like the
-             * tree-walker. AST-FREE: Builtin + carets from the pool (a.slot). */
+             * non-lvalue element (a flat scalar, a read-only container's) is
+             * a value the builtin works on held, like the tree-walker (a
+             * missing dict key throws). AST-FREE: Builtin + carets from the
+             * pool (a.slot). */
             const Chunk::BuiltinCall &bc = chunk->builtin_calls[in->a_dual_lo()];
             LValue *base;
             switch (in->a_dual_hi()) {
@@ -13226,13 +13242,13 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
             try {
                 EvalValue holder;   /* keeps the subscript result alive */
+                LValue hold;
                 LValue *elem = nullptr;
                 if (base) {
                     const EvalValue &idx = ctx.frame->at(in->b_lit()).get();
                     holder = base->get().get_type()->subscript(
                         EvalValue(base), idx, /*for_write=*/false);
-                    if (holder.is<LValue *>())
-                        elem = holder.get<LValue *>();
+                    elem = vm_builtin_elem_target(holder, hold);
                 }
                 SmallArgs<8> restbuf;   /* n_rest small (append 1, pop 0) */
                 for (int_type i = 0; i < n_rest; i++)
@@ -13273,10 +13289,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             const int_type n_rest = static_cast<int_type>(bc.args.size()) - 1;
             try {
                 LValue *field = nullptr;
+                LValue hold;
                 if (base)
                     field = vm_member_lvalue(base, bc.member,
                                              bc.args[0].start, bc.args[0].end,
-                                             bc.args[0].start, bc.args[0].end);
+                                             bc.args[0].start, bc.args[0].end,
+                                             hold);
                 SmallArgs<8> restbuf;   /* append/push 1 value arg */
                 for (int_type i = 0; i < n_rest; i++)
                     restbuf.push(ctx.frame->at(in->b_lit() + i).get());

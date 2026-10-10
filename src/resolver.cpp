@@ -3241,6 +3241,44 @@ static bool writes_through(const Construct *body,
     return found;
 }
 
+/*
+ * The CALL at the root of `c`'s store target, if any: `f()` in
+ * `f()[0] = v`, `f().x++`, `append(f(), v)`, `pop(f()[k])`. A store there
+ * goes into the VALUE the call returns (held, `{ var t = f(); t[0] = v; }`);
+ * inlining the body would put its expression - a name, an element - in
+ * the call's place, and the store would land in THAT location: a slice
+ * view's copy detaches on a write where the variable's own view does not,
+ * and a flat struct element read is a copy. So no inliner splices it.
+ */
+static const Construct *store_root_call(const Construct *c)
+{
+    const Construct *target = nullptr;
+    switch (ctag(c)) {
+    case ConstructType::expr14:
+        target = static_cast<const Expr14 *>(c)->lvalue.get();
+        break;
+    case ConstructType::incdec:
+        target = static_cast<const IncDecExpr *>(c)->lvalue.get();
+        break;
+    case ConstructType::call: {
+        auto *ce = static_cast<const CallExpr *>(c);
+        auto *callee = dynamic_cast<const Identifier *>(ce->what.get());
+        if (callee && ce->args && !ce->args->elems.empty()
+                && is_lvalue_arg_builtin(callee->get_str()))
+            target = ce->args->elems[0].get();
+        break;
+    }
+    default:
+        return nullptr;
+    }
+    while (target && (ctag(target) == ConstructType::subscript
+                      || ctag(target) == ConstructType::member))
+        target = ctag(target) == ConstructType::subscript
+                     ? static_cast<const Subscript *>(target)->what.get()
+                     : static_cast<const MemberExpr *>(target)->what.get();
+    return ctag(target) == ConstructType::call ? target : nullptr;
+}
+
 /* `e`'s subtree reads some tainted id (over-approximates "may alias one"). */
 static bool fmi_mentions(const Construct *e,
                          const std::unordered_set<const UniqueId *> &t)
@@ -5679,9 +5717,15 @@ private:
             return;
         }
 
-        /* Recurse into children at the same splice depth. */
+        /* Recurse into children at the same splice depth; a call at the
+         * root of this node's store target stays a call (store_root_call) */
+        const Construct *held = store_root_call(slot.get());
+        if (held)
+            held_roots.insert(held);
         for_each_child_slot(slot.get(),
             [&](unique_ptr<Construct> &ch) { walk(ch, depth, fsize, no_block); });
+        if (held)
+            held_roots.erase(held);
 
         /* re-scans its splice (depth + 1) */
         try_inline(slot, depth, fsize, no_block);
@@ -5693,6 +5737,9 @@ private:
 
     /* the function whose body walk() is in (null: main) */
     const FuncDeclStmt *cur_fn = nullptr;
+
+    /* the calls at a store root inside the node walk() is under */
+    std::unordered_set<const Construct *> held_roots;
 
     /*
      * RULE 1: may an argument of `ce` bind `none` to a parameter of `f`
@@ -5752,6 +5799,8 @@ private:
         auto *callee = dynamic_cast<Identifier *>(ce->what.get());
         if (!callee || callee->sym.kind == SymKind::local)
             return;
+        if (held_roots.count(ce))
+            return;                     /* a store root: store_root_call */
 
         auto it = funcs.find(callee->uid);
         if (it == funcs.end() || !it->second)
@@ -6073,6 +6122,8 @@ private:
         auto *callee = dynamic_cast<Identifier *>(ce->what.get());
         if (!callee || callee->sym.kind == SymKind::local)
             return;
+        if (held_roots.count(ce))
+            return;                     /* a store root: store_root_call */
 
         auto it = block_funcs.find(callee->uid);
         if (it == block_funcs.end() || !it->second)

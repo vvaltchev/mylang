@@ -535,18 +535,6 @@ bool as_int_operand(const Construct *e, Operand &out)
  * scalar (local/global/capture; the slot itself), or a flat int/float subscript
  * whose index is an `as_int_operand` leaf (a local slot or int literal, so the
  * two evals agree). A dict/member/complex-index inc-dec-as-value falls back. */
-/* A mutating builtin that REQUIRES its arg0 to be an lvalue and throws
- * NotLValueEx on a value — append/push/pop/insert/erase/intptr. EXCLUDES
- * sort/rev_sort/reverse (also lvalue-arg builtins, but they ACCEPT a value arg0
- * — a const's copy — so a non-lvalue arg0 there is not an error). Used to decide
- * whether a provably-non-lvalue arg0 is an always-throw (ThrowRuntimeV). */
-bool builtin_requires_lvalue_arg0(std::string_view name)
-{
-    return name == "append" || name == "push" || name == "pop"
-        || name == "insert" || name == "erase" || name == "intptr"
-        || name == "refcount";
-}
-
 bool incdec_lvalue_pure(const Construct *lv)
 {
     if (const Identifier *id = dynamic_cast<const Identifier *>(lv))
@@ -4417,52 +4405,18 @@ struct Codegen {
         int kind = -1;
         int a0slot = -1;
         if (!a0->is_id()) {
-            /* arg0 is not a slotted id. A SUBSCRIPT/MEMBER target was handled
-             * above; anything ELSE (a literal, a call/arith result — the
-             * only lvalues in MyLang are id / subscript / member) is PROVABLY
-             * not an lvalue, so a REQUIRES-lvalue builtin always throws
-             * NotLValueEx(arg0 loc) after evaluating its args -> a native
-             * ThrowRuntimeV; the sort family (value-arg0-accepting) instead
-             * materializes arg0 into a temp below. */
-            const Identifier *cid =
-                dynamic_cast<const Identifier *>(dc->what.get());
-            if (cid && builtin_requires_lvalue_arg0(cid->get_str())
-                && ctag(a0) != ConstructType::subscript
-                && ctag(a0) != ConstructType::member) {
-                const size_t om = ops.size();
-                const size_t cm = chunk.consts.size();
-                const int st = next_temp;
-                bool ok = true;
-                for (const auto &a : dc->args->elems) {   /* side effects */
-                    int tmp;
-                    if (!compile_boxed_expr(a.get(), tmp, ops)) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (ok) {
-                    emit_throw(Chunk::ThrowKind::not_lvalue,
-                               a0->start, a0->end, nullptr, ops);
-                    out_slot = alloc_temp();   /* dead: always throws */
-                    return true;
-                }
-                ops.resize(om);
-                chunk.consts.resize(cm);
-                next_temp = st;
+            /* arg0 is not a slotted id, and a SUBSCRIPT/MEMBER target was
+             * not handled above: a VALUE (a call result, a literal, an
+             * element of one). The builtin works on that value, as
+             * `{ var t = f(); append(t, x); }` does (README, *Storing
+             * through a value*): it is held in a FRESH temp - the temp IS
+             * the target (kind 0), evaluated before the other arguments as
+             * the tree-walker evaluates arg0 first. */
+            int vslot;
+            if (!hold_store_base(a0, vslot, ops))
                 return false;
-            }
-            /* sort/rev_sort/reverse ACCEPT a VALUE arg0 (a fresh clone / a
-             * call result: the tree-walker sorts that unaliased value in
-             * place and returns it). Materialize it into a TEMP slot - the
-             * temp IS the "lvalue" (kind 0), invisible to the script, so
-             * func_lv sorts the same fresh value the tree-walker does. */
-            {
-                int vslot;
-                if (!compile_boxed_expr(a0, vslot, ops))
-                    return false;
-                kind = 0;
-                a0slot = vslot;
-            }
+            kind = 0;
+            a0slot = vslot;
         } else {
             switch (static_cast<const Identifier *>(a0)->sym.kind) {
             case SymKind::local:   kind = 0; break;
@@ -9559,7 +9513,11 @@ static bool visit_use_def(const Instr &in, U u, D d)
         run(static_cast<int>(in.a_lit()), 2 * static_cast<int>(in.b_lit()));
         d(in.target); return true;
     case OpCode::AppendV:
-        if (in.a_lit() == 0)             /* arg0 kind 0 = a frame slot */
+        /* arg0 kind 0 = a frame slot; `a` is the DUAL (pool index, kind) -
+         * an a_lit() test read the pair, so a call site at pool index > 0
+         * hid the read, and a temp holding the target (`append(f(), x)`)
+         * looked dead and lost its producer's write */
+        if (in.a_dual_hi() == 0)
             u(in.target2);
         u(static_cast<int>(in.b_lit())); /* the value's SLOT (lit-encoded) */
         d(in.target); return true;

@@ -28,6 +28,22 @@
  * to the shared, now-ArgLocs core. */
 static inline ArgLocs build_arglocs(ExprList *exprList, ArgLoc *locbuf, size_t n);
 
+/* The target of an in-place builtin (append, pop, insert, sort, ...): its
+ * first argument's LValue - or, when that argument is a VALUE (a call
+ * result, a literal), `hold` holding it, so the builtin works on the value
+ * as `{ var t = f(); append(t, x); }` does (README, *Storing through a
+ * value*; the VM holds it in a temp). An undefined name stays a null
+ * target, which the builtin refuses. */
+static inline LValue *lv_builtin_target(EvalValue &a0, LValue &hold)
+{
+    if (a0.is<LValue *>())
+        return a0.get<LValue *>();
+    if (a0.is<UndefinedId>())
+        return nullptr;
+    hold = LValue(std::move(a0), false);
+    return &hold;
+}
+
 #include "builtins/str.cpp.h"
 #include "builtins/io.cpp.h"
 #include "builtins/num.cpp.h"
@@ -502,18 +518,18 @@ inline auto make_int_builtin(const char *name)
  * to an lvalue (NOT RValue - keep the LValue* the builtin needs to mutate the
  * caller's storage) and hand it over; the builtin self-evaluates its remaining
  * args. Registered as `func`, so the tree-walker + const-eval reach the same
- * impl as the VM's CallBuiltinLV. A non-lvalue arg0 (or none) passes a null
- * target, and the builtin throws NotLValueEx / the arity error, matching the
- * pre-migration behavior byte-for-byte.
+ * impl as the VM's CallBuiltinLV. A VALUE arg0 is held (lv_builtin_target);
+ * an undefined one passes a null target, and the builtin throws NotLValueEx
+ * (no arg0: the arity error).
  */
 template <decltype(Builtin::func_lv) FLV>
 EvalValue builtin_lv_adapter(EvalContext *ctx, ExprList *exprList)
 {
     LValue *target = nullptr;
+    LValue hold;
     if (!exprList->elems.empty()) {
         EvalValue a0 = exprList->elems[0]->eval(ctx);
-        if (a0.is<LValue *>())
-            target = a0.get<LValue *>();
+        target = lv_builtin_target(a0, hold);
     }
     /* NO-VALUE-ARG form (pop/intptr - both 1-arg): no rest; the builtin uses
      * arg0 (target) + the ArgLocs carets/arity only (no self-eval of a node). */
@@ -549,10 +565,10 @@ template <decltype(Builtin::func_lv) FLV>
 EvalValue builtin_lv_v_adapter(EvalContext *ctx, ExprList *exprList)
 {
     LValue *target = nullptr;
+    LValue hold;
     if (!exprList->elems.empty()) {
         EvalValue a0 = exprList->elems[0]->eval(ctx);
-        if (a0.is<LValue *>())
-            target = a0.get<LValue *>();
+        target = lv_builtin_target(a0, hold);
     }
     const size_t total = exprList->elems.size();
     const size_t n_rest = total ? total - 1 : 0;

@@ -4607,7 +4607,7 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
  * vm_member_store's boxed branch. */
 LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
                          const Loc &mstart, const Loc &mend,
-                         const Loc &bstart, const Loc &bend)
+                         const Loc &bstart, const Loc &bend, LValue &hold)
 {
     const EvalValue &dval = base_lv->get();
     if (!dval.is<intrusive_ptr<StructObject>>())
@@ -4619,8 +4619,14 @@ LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
             intern_msg("Struct '" + string(obj.def->name->val) +
                        "' has no member '" + string(memUid->val) + "'"),
             mstart, mend);
-    if (base_lv->is_const_var() || obj.is_readonly() || obj.is_pod())
-        throw NotLValueEx(mstart, mend);
+    /* a read-only struct's field, a POD struct's: not a location - the
+     * member read gives a VALUE, and the builtin works on it held, as
+     * the tree-walker's (lv_builtin_target) */
+    if (base_lv->is_const_var() || obj.is_readonly() || obj.is_pod()) {
+        hold = LValue(obj.is_pod() ? obj.pod_get(slot) : obj.fields[slot].get(),
+                      false);
+        return &hold;
+    }
     return &obj.fields[slot];
 }
 

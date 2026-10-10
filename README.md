@@ -879,6 +879,21 @@ The usual rules still hold through the value: a `const` refuses the write
 and a string's characters cannot be assigned. The right-hand side is
 evaluated first, then the expression under the access, then each key.
 
+The first argument of an in-place builtin (`append`, `push`, `pop`,
+`insert`, `erase`, `sort`, `rev_sort`, `reverse`, `intptr`) follows the same
+rule: given a value rather than a variable, the builtin works on that value,
+evaluated before the other arguments - `append(f(), x)` means
+`{ var t = f(); append(t, x); }`, so it appends to the array `f` returned,
+and `append([1, 2], 3)` to a fresh array nobody keeps. A `const` value
+refuses it (`CannotChangeConstEx`), as through a variable.
+
+```C#
+var queue = [1, 2];
+func q() => queue;
+append(q(), 3);             # queue is [1, 2, 3]
+print(pop(q()));            # 3
+```
+
 To get a mutable copy you must ask for one explicitly: `clone(x)` makes a
 **shallow** mutable copy (only the top level is copied; nested objects are
 shared, so nested objects of a const stay read-only), while `deepclone(x)` makes
