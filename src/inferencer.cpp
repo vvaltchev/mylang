@@ -484,7 +484,7 @@ private:
                                   const std::vector<StaticTypeRef> &sig);
     void collect_calls(Construct *n,
                        std::vector<std::pair<CallExpr *, bool>> &out,
-                       bool in_func = false);
+                       bool in_func = false, bool skip_templates = false);
 
     /* ---- the callee-set analysis (#116; calleeset.cpp.h) ---- */
     std::vector<CsSet> cs_pts;                 /* loc id -> points-to */
@@ -979,18 +979,29 @@ void Inferencer::run_fixpoint(Block *rootBlock)
     }
 }
 
-/* Every CallExpr in the subtree (complete traversal). */
+/* Every CallExpr in the subtree (complete traversal) - with
+ * `skip_templates`, none inside a template BASE's body (see
+ * instantiate_round). */
 void Inferencer::collect_calls(Construct *n,
                                std::vector<std::pair<CallExpr *, bool>> &out,
-                               bool in_func)
+                               bool in_func, bool skip_templates)
 {
     if (!n)
         return;
     if (auto *c = dynamic_cast<CallExpr *>(n))
         out.push_back({ c, in_func });
     /* a call below a FuncDeclStmt is inside a function body (a live use) */
-    const bool inside = in_func || (dynamic_cast<FuncDeclStmt *>(n) != nullptr);
-    for_each_child(n, [&](Construct *c) { collect_calls(c, out, inside); });
+    const bool is_fd = ctag(n) == ConstructType::func_decl;
+    if (is_fd && skip_templates) {
+        auto it = func_of_decl.find(static_cast<FuncDeclStmt *>(n));
+        if (it != func_of_decl.end() && it->second
+                && it->second->is_template)
+            return;
+    }
+    const bool inside = in_func || is_fd;
+    for_each_child(n, [&](Construct *c) {
+        collect_calls(c, out, inside, skip_templates);
+    });
 }
 
 /* Dedup key for an instantiation: the template identity + the signature. */
@@ -1091,9 +1102,20 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
  */
 bool Inferencer::instantiate_round(Block *rootBlock)
 {
+    /*
+     * Not from a call inside a template BASE's body: the fixpoint and
+     * the check pass skip that body, so the instance such a call made
+     * was fed by no call site - its parameters stayed unconstrained and
+     * it was checked anyway (`func use(q) { var b = ac(2); ... }` with
+     * `use` never called refused `ac`'s body over a `none` local). The
+     * calls are instantiated where they are live: in each instance of
+     * the enclosing template, a fresh copy of the body. A kept base
+     * (one used as a value) runs its body as written, calling the other
+     * template's base - which its closure keeps compiled.
+     */
     std::vector<std::pair<CallExpr *, bool>> calls;
     for (auto &e : rootBlock->elems)
-        collect_calls(e.get(), calls);
+        collect_calls(e.get(), calls, false, true);
 
     bool progress = false;
     for (const auto &call_pair : calls) {

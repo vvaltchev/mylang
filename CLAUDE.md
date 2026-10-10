@@ -5437,6 +5437,14 @@ monotonic counter, so it is readable AND inspectable, `typeof(f$0)`; with
 **redirects** the call to it, and re-runs the fixpoint; the clone's params
 accumulate their one signature through the concrete path. Arity is still checked
 for a template call; per-arg type/nullability is checked inside each clone.
+**⛔ Only a LIVE call instantiates (2026-10-09): `instantiate_round` skips the
+calls inside a template BASE's body** (`collect_calls`' `skip_templates`).
+The fixpoint skips that body, so an instance such a call made was fed by no
+call site and was checked with unconstrained parameters - a never-called
+`func use(q) { var b = ac(2); ... }` refused `ac`'s body. Each instance of
+the enclosing template is a fresh copy whose calls instantiate normally, and
+a KEPT base (value-used) calls the other template's base, which #149's
+closure keeps.
 **The `(template, signature)` cache (`tmpl_cache`) is SESSION-persistent, NOT
 cleared per input** — a signature already instantiated by a prior input
 **reuses** that instance instead of building a duplicate (`f(2,3)` then `f(2,3)`
