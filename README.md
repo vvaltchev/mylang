@@ -2088,17 +2088,19 @@ during the const-evaluation, the error will be reported directly, bypassing any
 exception handling logic. The reason for that is to enforce *early failure*.
 
 **Some errors cannot be caught.** A few exceptions report a condition the
-script must not handle - `InternalErrorEx` (a bug in the interpreter itself)
-and `UndefinedVariable`. Naming one in a `catch` clause is a compile error,
-and a bare `catch { }` will not swallow one either:
+script must not handle - `InternalErrorEx` (a bug in the interpreter itself),
+`UndefinedVariable`, and `CannotRebindConstEx` / `CannotRebindBuiltinEx`
+(an assignment to a const or to a builtin's name). Naming one in a `catch`
+clause is a compile error, and a bare `catch { }` will not swallow one
+either:
 
 ```C#
 try { ... } catch (InternalErrorEx) { ... }   # ERROR at compile time
-try { ... } catch { ... }                     # never handles those two
+try { ... } catch { ... }                     # never handles those
 ```
 
 They are still *reported* like any other runtime error - same message, caret
-and backtrace.
+and backtrace - and a `finally` on the way out still runs.
 
 Multiple `catch` statements are allowed as well:
 

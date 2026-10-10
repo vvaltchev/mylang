@@ -1,0 +1,18 @@
+# a rebind of a builtin name raised at run time travels the conveyance like
+# any runtime error: every engine renders the frames below it, and the
+# `finally` on the way out runs (it ran in no engine before: the VM threw
+# it raw past its frames, the tree-walker's finally caught only runtime
+# exceptions)
+func f(n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        s += i * 2;
+        if (i == 70) {
+            try { len = s; } catch { print("caught"); }
+            finally { print("fin"); }
+        }
+    }
+    return s;
+}
+func g(n) { var r = f(n); return r; }
+print(g(runtime(100)));

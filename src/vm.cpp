@@ -6775,11 +6775,11 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
 
 /* Re-raise deletability (ThrowRuntimeV): build the POOLED exception
  * natively - `tv` is a baked &chunk.throws[idx] (kind + the exact caret +
- * the name). The two RUNTIME kinds ride g_vm_jit_exc; the three PLAIN
- * kinds (UndefinedVariableEx / CannotRebind*) ride g_vm_jit_eptr - the
- * channel that did not exist when the op's old unconditional-exit
- * (re-run-to-throw) form was chosen. Every kind carries its pooled loc at
- * CONSTRUCTION, so the caret is pc-independent and the op is deletable. */
+ * the name). Every kind is a RuntimeException (UndefinedVariableEx and
+ * CannotRebind* are uncatchable ones) and rides g_vm_jit_exc, so the walk
+ * records the frames it unwinds - a rebind once rode g_vm_jit_eptr and
+ * printed no backtrace. Every kind carries its pooled loc at CONSTRUCTION,
+ * so the caret is pc-independent and the op is deletable. */
 extern "C" int jit_throw_runtime(const void *tv) noexcept
 {
     ML_JIT_OP_RAN(ThrowRuntimeV);
@@ -6800,12 +6800,12 @@ extern "C" int jit_throw_runtime(const void *tv) noexcept
             t.name->val, t.start, t.end);
         break;
     case Chunk::ThrowKind::rebind_builtin:
-        g_vm_jit_eptr = std::make_exception_ptr(
-            CannotRebindBuiltinEx(t.start, t.end));
+        g_vm_jit_exc =
+            std::make_unique<CannotRebindBuiltinEx>(t.start, t.end);
         break;
     case Chunk::ThrowKind::rebind_const:
-        g_vm_jit_eptr = std::make_exception_ptr(
-            CannotRebindConstEx(t.start, t.end));
+        g_vm_jit_exc =
+            std::make_unique<CannotRebindConstEx>(t.start, t.end);
         break;
     }
     return 1;
@@ -9333,7 +9333,10 @@ extern "C" int jit_frameless_postexit(size_t r, int_type site_packed,
         }
         return 0;
     }
-    if (g_vm_jit_eptr)
+    /* (a plain C++ exception: since 2026-10-06 nothing a script raises at
+     * run time is one - the rebind errors were the last - so only a C++
+     * library failure reaches this) */
+    if (g_vm_jit_eptr)         /* INT-COV-EXEMPT: no test makes one */
         return 2;              /* fatal (uncatchable) - conveyed as-is */
     const auto *d = static_cast<const FuncDescriptor *>(g_norec_exit_desc);
     const Chunk *ck =

@@ -316,14 +316,30 @@ struct UncatchableRuntimeException : public RuntimeException {
     };
 
 /* Same shape as DECL_RUNTIME_EX but NOT script-catchable - see
- * UncatchableRuntimeException. */
+ * UncatchableRuntimeException. No match_uid(): both catch matchers ask
+ * is_catchable() first, so nothing ever asks an uncatchable exception
+ * which clause it matches (its lazy uid init was code no run reached). */
 #define DECL_UNCATCHABLE_EX(name, msg)                              \
-    DECL_RUNTIME_EX_BASE(name, msg, UncatchableRuntimeException)
+    DECL_RUNTIME_EX_BASE(name, msg, UncatchableRuntimeException, )
 
 #define DECL_RUNTIME_EX(name, msg)                                  \
-    DECL_RUNTIME_EX_BASE(name, msg, RuntimeException)
+    DECL_RUNTIME_EX_BASE(name, msg, RuntimeException,               \
+                         DECL_EX_MATCH_UID(name))
 
-#define DECL_RUNTIME_EX_BASE(name, msg, base)             \
+/* the catch matchers' interned-name fast path (#74 inc 3) */
+#define DECL_EX_MATCH_UID(name)                           \
+        const UniqueId *match_uid() const override {      \
+            /* hand-rolled lazy init: a plain zero-init   \
+             * pointer, no __cxa_guard acquire (the       \
+             * interpreter is single-threaded; the guard  \
+             * measured 18 Ir per catch on 70_exc) */     \
+            static const UniqueId *u;                     \
+            if (!u)                                       \
+                u = UniqueId::get(#name);                 \
+            return u;                                     \
+        }
+
+#define DECL_RUNTIME_EX_BASE(name, msg, base, match_uid_decl) \
                                                           \
     struct name : public base {                           \
                                                           \
@@ -340,16 +356,7 @@ struct UncatchableRuntimeException : public RuntimeException {
             return new name(*this);                       \
         }                                                 \
                                                           \
-        const UniqueId *match_uid() const override {      \
-            /* hand-rolled lazy init: a plain zero-init   \
-             * pointer, no __cxa_guard acquire (the       \
-             * interpreter is single-threaded; the guard  \
-             * measured 18 Ir per catch on 70_exc) */     \
-            static const UniqueId *u;                     \
-            if (!u)                                       \
-                u = UniqueId::get(#name);                 \
-            return u;                                     \
-        }                                                 \
+        match_uid_decl                                    \
                                                           \
         [[ noreturn ]] void rethrow() const override {    \
             throw *this;                                  \
@@ -377,8 +384,13 @@ struct InvalidTokenEx : public Exception {
  * (message, caret, frames) instead of aborting when one fires inside a JIT
  * fragment, which is why it is a RuntimeException. Still unhandleable. */
 DECL_UNCATCHABLE_EX(InternalErrorEx, "Internal error")
-DECL_SIMPLE_EX(CannotRebindConstEx, "Cannot rebind const")
-DECL_SIMPLE_EX(CannotRebindBuiltinEx, "Cannot rebind builtin")
+/* Rebinding a const or a builtin name. Raised at compile time when the
+ * target is a declaration, at run time for an assignment - and then it must
+ * travel the VM/JIT conveyance like any runtime error, or the VM printed it
+ * with no backtrace (the tree-walker records every frame for any exception).
+ * Never handled by a script. */
+DECL_UNCATCHABLE_EX(CannotRebindConstEx, "Cannot rebind const")
+DECL_UNCATCHABLE_EX(CannotRebindBuiltinEx, "Cannot rebind builtin")
 DECL_SIMPLE_EX(ExpressionIsNotConstEx, "The expression is not const")
 DECL_SIMPLE_EX(AlreadyDefinedEx, "Already defined error")
 /* All three are RUNTIME (script-catchable) exceptions - builtins throw them at
@@ -584,7 +596,8 @@ struct UndefinedVariableEx : public UncatchableRuntimeException {
 inline bool is_uncatchable_ex_name(const std::string_view &n)
 {
     return n == "InternalErrorEx" || n == "UndefinedVariable"
-        || n == "UndefinedVariableEx";
+        || n == "UndefinedVariableEx" || n == "CannotRebindConstEx"
+        || n == "CannotRebindBuiltinEx";
 }
 
 struct SyntaxErrorEx : public Exception {
