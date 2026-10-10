@@ -57,8 +57,9 @@ func loop(n) {
 assert(loop(ri(5)) == [none, 4, 8]);
 
 # typed targets (the stores coerce, so the fast paths decline to the
-# general unpack), a dyn right-hand side that is a scalar (a run-time
-# spread) or an array, and a float unpacked into an int target
+# general unpack), and a dyn right-hand side that is a scalar (a run-time
+# spread) or an array. (A failing coercion is a -rt case: with no
+# inference, -nti, a plain `var` is not typed and does not coerce.)
 func typed(n) {
     int x = 0;
     float y = 0.0;
@@ -79,20 +80,14 @@ func typed(n) {
     assert(v == none && p == 4 && q == 5);
     v = x, _ = [ri(6), ri(7)];
     assert(v == none && x == 6);
-    var raised = false;
-    try {
-        v = y, x = [ri(1), 2.5];
-    } catch (TypeErrorEx) {
-        raised = true;
-    }
-    assert(raised && y == 1.0 && x == 6);
+    v = y, x = [ri(1), ri(6)];
+    assert(v == none && y == 1.0 && x == 6);
     return [x, y, p, q];
 }
 assert(typed(ri(2)) == [6, 1.0, 4, 5]);
 
 # targets that are not plain locals: globals (a function reads them) and a
-# closure's captures; a typed global whose coercion fails leaves the target
-# before it stored, as each target is stored in order
+# closure's captures
 var ga = 0;
 var gb = 0;
 int gi = 0;
@@ -117,14 +112,7 @@ gb, _ = [ri(5), ri(6)];
 assert(gb == 5);
 w = ga, gb = [ri(10), ri(11)];
 assert(w == none && ga == 10 && gb == 11);
-var graised = false;
-var dyn half = runtime(2.5);
-try {
-    ga, gi = [ri(12), half];
-} catch (TypeErrorEx) {
-    graised = true;
-}
-assert(graised && ga == 12 && gi == 3);
+ga = 12;
 # a local beside a global in one multi-assignment: a plain store, a typed
 # local (int, and a float that widens) and a compound
 var lx = 0;
@@ -164,6 +152,25 @@ func counter() {
 }
 var cf = counter();
 assert(cf(ri(1)) == [1, 2] && cf(ri(2)) == [3, 6]);
+
+# a multi-assignment is a write to each target for inference too: a
+# function name rebound through one calls the new function (every engine
+# still ran the declared body), and a target's type takes the stored
+# element's (`mx` held 2.5 typed int, so a typed `mx + 1` raised)
+func sq(x) { return x * x; }
+func neg(x) { return 0 - x; }
+func callsq(v) { return sq(v); }
+var sq_was = callsq(ri(3));
+var mq = 0;
+mq, sq = [ri(1), neg];
+assert(sq_was == 9 && callsq(ri(3)) == -3 && mq == 1);
+func widen() {
+    var mx = 0;
+    var my = 0;
+    mx, my = [2.5, ri(1)];
+    return mx + 1;
+}
+assert(widen() == 3.5);
 
 # a failing destructure raises before anything is stored
 var c = 5;

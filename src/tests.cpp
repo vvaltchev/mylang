@@ -711,6 +711,27 @@ static const std::vector<test> tests =
     /* A const or builtin target refuses the store in every engine: the
      * VM refused to compile a non-local target, and stored into a local
      * const (`K` past the first target was not marked const). */
+    /* Each target is stored in order: a store that fails (a dyn float
+     * into a target typed int by the dyn-into-numeric coercion) leaves
+     * the targets before it written - a global and a local alike. */
+    {
+        "multi-assign: a failing store leaves the earlier targets written",
+        {
+            "var ga = 0; var gc = 3; func k() { return [ga, gc]; }",
+            "var dyn half = runtime(2.5); var raised = false;",
+            "try { ga, gc = [runtime(12), half]; }",
+            "catch (TypeErrorEx) { raised = true; }",
+            "assert(raised && k() == [12, 3]);",
+            "func f() {",
+            "  var la = 0; var lc = 6; var r = false;",
+            "  try { la, lc = [runtime(1), half]; }",
+            "  catch (TypeErrorEx) { r = true; }",
+            "  return [r, la, lc];",
+            "}",
+            "assert(f() == [true, 1, 6]);",
+        },
+    },
+
     {
         "multi-assign into a local const target is refused",
         {
@@ -7898,9 +7919,12 @@ static const std::vector<test> tests =
         "ic, fd = [3, 4];",
         "assert(ic == 3); assert(fd == 4.0);" } },
     /* ...and a dyn-laundered float into an int target THROWS (never
-     * truncates) - the same TypeErrorEx + caret from both engines. */
+     * truncates) - the same TypeErrorEx + caret from both engines. The
+     * targets are plain `var`s typed int by the dyn-into-numeric
+     * coercion: an annotated `int ix` refuses a dyn value at compile
+     * time, as `ix = da[0]` does. */
     { "vm: typed IdList coerce error (float into int target)",
-      { "int ix = 0; int iy = 0;",
+      { "var ix = 0; var iy = 0;",
         "var dyn da = [1.5, 2];",
         "ix, iy = da;" }, &typeid(TypeErrorEx) },
     /* An impure-lvalue inc-dec VALUE in a loop condition - the R4 value
@@ -26158,7 +26182,7 @@ static bool unpack_fast_bind_shapes()
          * reaches this op's arms. */
         { "multi-unpack str destructure", {
             "var p = [\"mm\", \"nn\"]; append(p, \"oo\");",
-            "var a = \"\"; var b = \"\"; var c = \"\";",
+            "var dyn a = \"\"; var dyn b = \"\"; var dyn c = \"\";",
             "for (var i = 0; i < 3; i++) { a, b, c = runtime(p); }",
             "assert(a == \"mm\" && b == \"nn\" && c == \"oo\");" },
           4, false },
@@ -26168,7 +26192,7 @@ static bool unpack_fast_bind_shapes()
          * case destructures a whole array, whose offset is 0. */
         { "multi-unpack over a str slice", {
             "var src = split(\"zz aa bbb\", \" \");",
-            "var a = \"\"; var b = \"\";",
+            "var dyn a = \"\"; var dyn b = \"\";",
             "for (var i = 0; i < 3; i++) { a, b = runtime(src[1:3]); }",
             "assert(a == \"aa\" && b == \"bbb\");" }, 3, false },
         /* MultiUnpackV: the scalar string SPREAD */
@@ -49597,12 +49621,15 @@ static bool jit_op_nativized()
             "}",
             "assert(f(runtime([[1, 9, 2], [3, 9, 4]])) == 10);" } },
         /* typed targets (the unpack_coerce pool path): a dyn rvalue
-         * destructured into int locals per iteration. (Bare `var a, b = p`
-         * with a dyn rvalue is a compile-time DynRequiredEx.) */
+         * destructured into int locals per iteration - plain `var`s, typed
+         * int by the dyn-into-numeric coercion (an annotated `int a`
+         * refuses a dyn value at compile time, as `a = p` does). (Bare
+         * `var a, b = p` with a dyn rvalue is a compile-time
+         * DynRequiredEx.) */
         { OpCode::MultiUnpackV, {
             "func f(dyn p, int n) {",
             "  var s = 0;",
-            "  int a = 0; int b = 0;",
+            "  var a = 0; var b = 0;",
             "  for (var i = 0; i < n; i++) {",
             "    a, b = p;",
             "    s += a + b;",
@@ -49614,7 +49641,7 @@ static bool jit_op_nativized()
         { OpCode::MultiUnpackV, {
             "func f(dyn p) {",
             "  var r = 0;",
-            "  int a = 0; int b = 0;",
+            "  var a = 0; var b = 0;",
             "  try { a, b = p; r = a + b; }",
             "  catch (TypeErrorEx) { r = 42; }",
             "  return r;",

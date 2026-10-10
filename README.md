@@ -1451,7 +1451,9 @@ a few difference from `C` worth pointing out:
     compile error.
 
   - To increase the value of multiple variables use the syntax:
-    `a, b += [1, 2]`. In the extremely rare and complex cases when in the
+    `a, b += [1, 2]` - each target gets `target + element`, and an operator
+    that cannot apply to a target and its element is a compile error, as
+    for a single `a += 1`. In the extremely rare and complex cases when in the
     *increment* statement of the for-loop we need to assign to each variable
     a new variable using different expressions, take advantage of the
     expansion syntax in assignment: `i, j = [i+2, my_next(i, j*3)]`.

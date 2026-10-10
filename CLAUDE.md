@@ -4459,6 +4459,19 @@ decisions behind it: `plans/archived/type-inference.md`,
   [5, 6]` compiled and held none, and the VM refused the form. The
   maintainer's eventual semantics - a list whose elements alias the
   targets - is plans/multi-assign-value.md.
+- **A MULTI-ASSIGNMENT'S TARGETS ARE WRITES LIKE ANY OTHER (2026-10-06).**
+  `for_each_child` treats an IdList as a leaf, so walk_struct resolves
+  each target of a non-declaring multi-assignment explicitly - until then
+  they stayed out of `id_sym`, the write to each was never counted (a
+  function name rebound by `q, sq = [1, seven]` kept running the declared
+  body, in every engine) and spread_idlist contributed to a null symbol
+  (`x, y = ["s", 2]` kept `x` typed int while it held "s"). A compound
+  `a, b OP= rhs` contributes `target OP element` per target, and the check
+  pass validates each such op as it validates a single compound
+  (`check_compound_op`; `idlist_elem_types` is the one answer to "what
+  does each target receive", shared with spread_idlist). The same
+  rules as a single target now apply: an annotated `int a` refuses a dyn
+  element at compile time, as `a = d` does.
 - **A JOINED parameter binds like a DECLARED one (#38 C,
   `stamp_inferred_param_types`).** A lambda's un-annotated param (and a
   named function's `opt` one) joins every call site's argument, so

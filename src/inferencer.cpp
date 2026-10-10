@@ -418,7 +418,11 @@ private:
     void contribute_to_lvalue(Construct *lv, StaticTypeRef ct, Loc loc);
     void accumulate_call(CallExpr *call);
     void accumulate_foreach(ForeachStmt *fe);
-    void spread_idlist(IdList *idl, Construct *rvalue);
+    void spread_idlist(IdList *idl, Construct *rvalue, Op op);
+    std::vector<StaticTypeRef> idlist_elem_types(IdList *idl,
+                                                 Construct *rvalue);
+    void check_compound_op(Op op, StaticTypeRef l, StaticTypeRef r,
+                           Construct *lv, Construct *rv, Construct *at);
 
     /* monomorphization (templates - see plans/archived/function-templates.md) */
     void mark_lambda_templates();   /* safe var-bound lambdas -> templates */
@@ -3550,6 +3554,15 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
                 if (sym && !sym->func)
                     sym->func = func_of_decl[fd];
             }
+        } else if (ctag(e14->lvalue.get()) == ConstructType::idlist) {
+            /* An IdList is a leaf to for_each_child, so resolve each target
+             * as a single target is resolved: unresolved, the write to it
+             * was not counted (`q, sq = [1, seven]` left `sq` "never
+             * rebound", so every call still ran the declared body) and
+             * spread_idlist's contributions went to a null symbol (`x, y
+             * = ["s", 2]` kept `x` typed int while it held "s"). */
+            for (auto &up : static_cast<IdList *>(e14->lvalue.get())->elems)
+                walk_struct(up.get(), s);
         } else {
             walk_struct(e14->lvalue.get(), s);
         }
@@ -5059,23 +5072,65 @@ void Inferencer::accumulate_call(CallExpr *call)
     }
 }
 
-void Inferencer::spread_idlist(IdList *idl, Construct *rvalue)
+void Inferencer::spread_idlist(IdList *idl, Construct *rvalue, Op op)
 {
-    StaticTypeRef rt = static_type_resolve(type_of(rvalue));
+    /* each target receives its element - or, for a compound `a, b OP= rhs`,
+     * the result of `target OP element`, as a single compound target does
+     * (accumulate_assign), invalid-op rule included */
+    const auto give = [&](Identifier *t, StaticTypeRef el) {
+        StaticTypeRef ct = el;
+        if (op != Op::assign) {
+            StaticTypeRef l = type_of(t);
+            ct = binop_result(compound_binop(op), l, el);
+            if (is_dyn(ct) && !is_dyn(strip(l)) && !is_dyn(strip(el)))
+                ct = l;
+        }
+        contribute(id_sym[t], ct, t->start);
+    };
 
+    const std::vector<StaticTypeRef> els = idlist_elem_types(idl, rvalue);
+    for (size_t i = 0; i < idl->elems.size(); i++)
+        give(idl->elems[i].get(), els[i]);
+}
+
+/* What each target of `a, b, ... = rvalue` receives: a literal of the
+ * same length element by element, as written; else an array's element
+ * type, the same for every target; else the scalar itself, spread. The
+ * fixpoint (spread_idlist) and the check pass agree through this. */
+std::vector<StaticTypeRef>
+Inferencer::idlist_elem_types(IdList *idl, Construct *rvalue)
+{
+    const size_t n = idl->elems.size();
     if (ctag(rvalue) == ConstructType::lit_arr) {
         auto *la = static_cast<LiteralArray *>(rvalue);
-        if (la->elems.size() == idl->elems.size()) {
-            for (size_t i = 0; i < idl->elems.size(); i++)
-                contribute(id_sym[idl->elems[i].get()],
-                           type_of(la->elems[i].get()), idl->elems[i]->start);
-            return;
+        if (la->elems.size() == n) {
+            std::vector<StaticTypeRef> out;
+            for (size_t i = 0; i < n; i++)
+                out.push_back(type_of(la->elems[i].get()));
+            return out;
         }
     }
+    StaticTypeRef rt = static_type_resolve(type_of(rvalue));
+    return std::vector<StaticTypeRef>(
+        n, rt->kind == StaticTypeKind::Array ? rt->elem : rt);
+}
 
-    StaticTypeRef each = rt->kind == StaticTypeKind::Array ? rt->elem : rt;
-    for (auto &id : idl->elems)
-        contribute(id_sym[id.get()], each, id->start);
+/* A compound assignment's implied binary op, validated: `l OP= r` with
+ * neither side dyn and no result is a compile error, as `l OP r` is. */
+void Inferencer::check_compound_op(Op op, StaticTypeRef l, StaticTypeRef r,
+                                   Construct *lv, Construct *rv,
+                                   Construct *at)
+{
+    require_nonopt(l, lv->start, lv->end, "in a compound assignment");
+    require_nonopt(r, rv->start, rv->end, "in a compound assignment");
+    StaticTypeRef res = binop_result(compound_binop(op), l, r);
+    StaticTypeRef ls = strip(static_type_resolve(l)), rs =
+        strip(static_type_resolve(r));
+    if (!is_dyn(ls) && !is_dyn(rs) && is_dyn(res))
+        mismatch("operator does not apply to '" +
+            static_type_to_string(l) +
+                     "' and '" + static_type_to_string(r) + "'",
+                 at->start, at->end);
 }
 
 void Inferencer::accumulate_assign(Expr14 *e)
@@ -5102,7 +5157,7 @@ void Inferencer::accumulate_assign(Expr14 *e)
 
     if (ctag(lv) == ConstructType::idlist) {
         auto *idl = static_cast<IdList *>(lv);
-        spread_idlist(idl, e->rvalue.get());
+        spread_idlist(idl, e->rvalue.get(), e->op);
         return;
     }
 
@@ -5777,21 +5832,25 @@ void Inferencer::check(Construct *n)
         }
 
         if (e14->op != Op::assign) {
-            /* compound assign: validate the implied binary op */
-            StaticTypeRef l = type_of(e14->lvalue.get());
-            StaticTypeRef r = type_of(e14->rvalue.get());
-            require_nonopt(l, e14->lvalue->start, e14->lvalue->end,
-                           "in a compound assignment");
-            require_nonopt(r, e14->rvalue->start, e14->rvalue->end,
-                           "in a compound assignment");
-            StaticTypeRef res = binop_result(compound_binop(e14->op), l, r);
-            StaticTypeRef ls = strip(static_type_resolve(l)), rs =
-                strip(static_type_resolve(r));
-            if (!is_dyn(ls) && !is_dyn(rs) && is_dyn(res))
-                mismatch("operator does not apply to '" +
-                    static_type_to_string(l) +
-                             "' and '" + static_type_to_string(r) + "'",
-                         e14->start, e14->end);
+            /* compound assign: validate the implied binary op - for each
+             * target of `a, b OP= rhs` against what it receives, as a
+             * single compound target is (it was a run-time TypeErrorEx
+             * until 2026-10-06 where `a OP= v` is refused here) */
+            if (ctag(e14->lvalue.get()) == ConstructType::idlist) {
+                auto *idl = static_cast<IdList *>(e14->lvalue.get());
+                const std::vector<StaticTypeRef> els =
+                    idlist_elem_types(idl, e14->rvalue.get());
+                for (size_t i = 0; i < idl->elems.size(); i++)
+                    check_compound_op(e14->op,
+                                      type_of(idl->elems[i].get()), els[i],
+                                      idl->elems[i].get(),
+                                      e14->rvalue.get(), e14);
+            } else {
+                check_compound_op(e14->op, type_of(e14->lvalue.get()),
+                                  type_of(e14->rvalue.get()),
+                                  e14->lvalue.get(), e14->rvalue.get(),
+                                  e14);
+            }
         }
         return;
     }
