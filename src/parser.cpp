@@ -1435,6 +1435,17 @@ pRefuseOptionalTarget(const Construct *lv)
  * through a PARAMETER keeps its Subscript shape and stays the runtime
  * NotLValueEx. `what` is the message's verb ("Cannot assign to").
  */
+/* the assignable-shape error for a target that is a folded constant */
+[[noreturn]] static void
+pRefuseFoldedTarget(Loc start, Loc end)
+{
+    SyntaxErrorEx e(start, intern_msg(
+        "Cannot assign to this expression: it is not an assignable "
+        "location"));
+    e.loc_end = end;
+    throw e;
+}
+
 static void
 pRefuseUnassignable(const Construct *lv, const char *what)
 {
@@ -1939,6 +1950,13 @@ pExpr14(ParseContext &c, unsigned fl)
 
         Identifier *first_id = dynamic_cast<Identifier *>(lside.get());
 
+        /* `K, a = ..` with a const scalar K: the name folded to its value,
+         * so no IdList forms - refuse it as the single target `K = 6` is
+         * (it was a syntax error at the comma) */
+        if (!first_id && *c == Op::comma
+                && dynamic_cast<const Literal *>(lside.get()))
+            pRefuseFoldedTarget(lside->start, lside->end);
+
         if (first_id && pAcceptOp(c, Op::comma)) {
 
             unique_ptr<IdList> idlist(new IdList);
@@ -1966,8 +1984,19 @@ pExpr14(ParseContext &c, unsigned fl)
                     Identifier *id = idlist->elems[i].get();
                     if (c.is_shadowed(id->uid))
                         continue;
-                    if (id->eval(c.const_ctx).get_type()->t == Type::t_lval)
-                        id->is_const = true;
+                    const EvalValue cv = id->eval(c.const_ctx);
+                    if (cv.get_type()->t != Type::t_lval)
+                        continue;
+                    /* a const SCALAR has no run-time symbol: as a single
+                     * target it folds to its value, which is not a location
+                     * (pRefuseUnassignable) - the same error here, where it
+                     * read as an undefined name */
+                    const Type::TypeE k = RValue(cv).get_type()->t;
+                    if (k == Type::t_int || k == Type::t_float
+                            || k == Type::t_bool || k == Type::t_none
+                            || k == Type::t_str)
+                        pRefuseFoldedTarget(id->start, id->end);
+                    id->is_const = true;
                 }
             }
 
