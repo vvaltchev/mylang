@@ -3102,13 +3102,23 @@ void Inferencer::annotate_hints(Construct *n)
     if (ctag(n) == ConstructType::expr14) {
         auto *e14 = static_cast<Expr14 *>(n);
         if (ctag(e14->lvalue.get()) == ConstructType::idlist) {
+            /* A LITERAL unpacked here gives each target its element AS
+             * WRITTEN (README; spread_idlist types the targets that way):
+             * it is not widened to its joined type, and its elements are
+             * read untyped, since `[ri(12), 2.5]` holds an int beside a
+             * float. Its own element literals still widen, by their own
+             * types. */
+            const bool lit =
+                ctag(e14->rvalue.get()) == ConstructType::lit_arr;
+            if (lit)
+                lit_coerce_by_parent.insert(e14->rvalue.get());
             StaticTypeRef r = static_type_resolve(
                 type_of(e14->rvalue.get()));
             if (!r->opt && r->kind == StaticTypeKind::Array) {
                 StaticTypeRef el = static_type_resolve(r->elem);
                 e14->unpack_rv_array = true;
                 e14->unpack_rv_th =
-                    el->opt ? TypeHint::none
+                    el->opt || lit ? TypeHint::none
                     : el->kind == StaticTypeKind::Int ? TypeHint::i
                     : el->kind == StaticTypeKind::Float ? TypeHint::f
                     : TypeHint::none;

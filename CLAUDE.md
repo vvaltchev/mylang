@@ -4471,7 +4471,13 @@ decisions behind it: `plans/archived/type-inference.md`,
   (`check_compound_op`; `idlist_elem_types` is the one answer to "what
   does each target receive", shared with spread_idlist). The same
   rules as a single target now apply: an annotated `int a` refuses a dyn
-  element at compile time, as `a = d` does.
+  element at compile time, as `a = d` does. **An array LITERAL on the
+  right is unpacked AS WRITTEN** (maintainer, 2026-10-06; README): the
+  parser does not bake it (pExpr14, `in_idlist`), annotate_hints does not
+  stamp its `elem_coerce` (it joins `lit_coerce_by_parent`) and its
+  unpack reads untyped (`unpack_rv_th` none) - `x, y = [ri(12), 2.5]`
+  gave `x` 12.0 in the tree-walker and the VM's general unpack while
+  spread_idlist typed it int, and the JIT read the float as an int.
 - **A JOINED parameter binds like a DECLARED one (#38 C,
   `stamp_inferred_param_types`).** A lambda's un-annotated param (and a
   named function's `opt` one) joins every call site's argument, so

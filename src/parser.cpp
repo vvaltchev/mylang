@@ -2131,8 +2131,14 @@ pExpr14(ParseContext &c, unsigned fl)
     {
         nc_eval_const(c, ret->rvalue.get(), true, false);
     }
+    /* A multi-assignment unpacks its literal element by element, each AS
+     * WRITTEN (`x, y = [12, 2.5]` gives x the int 12 - README): baking the
+     * literal would widen it to its joined type first, so it stays a
+     * literal (its elements are folded already). */
     else if (ret->rvalue->is_const
-        && !dynamic_cast<LiteralObj *>(ret->rvalue.get()))
+        && !dynamic_cast<LiteralObj *>(ret->rvalue.get())
+        && !(in_idlist
+             && ctag(ret->rvalue.get()) == ConstructType::lit_arr))
     {
         unique_ptr<Construct> cc;
 

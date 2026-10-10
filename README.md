@@ -1440,6 +1440,10 @@ a few difference from `C` worth pointing out:
     **strictly** — it must have exactly as many elements as there are targets
     (`var a, b, c = [1, 2];` is an error, as is `var a, b = [1, 2, 3];`). A
     **non-array** value is spread to every target (the `var a,b = 0` case).
+    An array **literal** on the right is unpacked element by element, each
+    **as written**: `x, y = [12, 2.5]` means `x = 12; y = 2.5` (at once), so
+    `x` gets the int `12` - although the literal as a value, say stored in a
+    variable, would be an `array<float>` holding `12.0`.
 
   - Use `_` as a **placeholder** for a destructured entry you don't want:
     `var a, _, b = [1, 2, 3];` binds `a == 1`, `b == 3` and drops the middle.
