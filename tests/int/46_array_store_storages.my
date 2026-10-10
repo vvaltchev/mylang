@@ -570,8 +570,7 @@ want("dyn callee not an array", outcome(func [so_, ki] () { so_(ki); }),
      "TypeErrorEx");
 want("dyn callee reverse non-array",
      outcome(func [rv_, ki] () { rv_(ki); }), "TypeErrorEx");
-want("dyn callee value", outcome(func [ap] () { ap([1], 2); }),
-     "NotLValueEx");
+want("dyn callee value", outcome(func [ap] () { ap([1], 2); }), "ok");
 want("dyn callee chain oob", outcome(func [ap, go] () { ap(go.ins[3].xs, 1); }),
      "OutOfBoundsEx");
 want("dyn callee left them", [gxs, len(go.ins)], [[0, 1, 2], 1]);

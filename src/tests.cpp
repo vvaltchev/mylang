@@ -115,6 +115,25 @@ struct test {
 
 static const std::vector<test> tests =
 {
+    /* README *Storing through a value*: an in-place builtin works on a
+     * value - through a `dyn` callee too, which raised NotLValueEx */
+    { "an in-place builtin called through a dyn works on a value", {
+        "var dyn ap = append;",
+        "var dyn r = ap([1], 2);",
+        "assert(str(r) == \"[1, 2]\");",
+        "var dyn pp = pop;",
+        "assert(pp([5, 6]) == 6);",
+        "var dyn ins = insert;",
+        "assert(ins([1, 3], 1, 2) == insert([1, 3], 1, 2));" } },
+    { "an in-place builtin through a dyn on a POD field: the direct "
+      "call's TypeErrorEx", {
+        "struct In { int a; }",
+        "struct Out { In in1; }",
+        "var dyn dout = runtime(Out(In(1)));",
+        "var dyn apd = append;",
+        "apd(dout.in1.a, 5);" },
+      &typeid(TypeErrorEx), 5, 5, 16, 5 },
+
     /* README: an array's storage changes only speed, never behavior. A
      * compound store into an element of a FLAT struct array raised
      * NotLValueEx where a general array of the same structs raises the
@@ -2286,9 +2305,10 @@ static const std::vector<test> tests =
         },
     },
     {
-        "dyn callee by-ref: a literal arg0 to a mutating builtin throws",
-        { "var dyn f = append; f([1, 2], 3);" },
-        &typeid(NotLValueEx),
+        /* README *Storing through a value*: it works on the value */
+        "dyn callee by-ref: a literal arg0 to a mutating builtin is held",
+        { "var dyn f = append; var dyn r = f([1, 2], 3);",
+          "assert(str(r) == \"[1, 2, 3]\");" },
     },
     {
         "dyn callee by-ref: a const arg0 to a mutating builtin throws",
