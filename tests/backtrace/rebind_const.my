@@ -1,6 +1,0 @@
-# a rebind of a const - here through a multi-assignment - reports the frames
-# it unwinds in every engine, not only in the tree-walker
-const K = [1];
-func g(n) { var a = 0; a, K = [n, [n]]; return a; }
-func f(n) { var r = g(n) + 1; return r; }
-print(f(runtime(3)));

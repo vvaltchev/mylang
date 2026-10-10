@@ -549,14 +549,10 @@ bool builtin_requires_lvalue_arg0(std::string_view name)
 
 bool incdec_lvalue_pure(const Construct *lv)
 {
-    /* (a builtin name too: its read is the builtin's value and its
-     * mutation the rebind throw, compile_boxed_stmt's inc-dec arm) */
     if (const Identifier *id = dynamic_cast<const Identifier *>(lv))
-        return id->sym.kind == SymKind::builtin
-            || (!id->is_const
-                && (id->sym.kind == SymKind::local
-                    || id->sym.kind == SymKind::global
-                    || id->sym.kind == SymKind::capture));
+        return id->sym.kind == SymKind::local
+            || id->sym.kind == SymKind::global
+            || id->sym.kind == SymKind::capture;
     if (const Subscript *sub = dynamic_cast<const Subscript *>(lv)) {
         Operand idx;
         /* A flat `a[i]` (slot base + immediate index), OR a NESTED `a[i][j]`
@@ -2538,7 +2534,6 @@ struct Codegen {
             return false;
         for (const auto &t : il->elems) {
             if (t->is_underscore() || t->sym.kind != SymKind::local
-                || t->is_const
                 || (t->decl_type != DeclType::none
                     && t->decl_type != DeclType::dyn))
                 return false;
@@ -2594,7 +2589,6 @@ struct Codegen {
             return false;
         for (const auto &t : il->elems) {
             if (t->is_underscore() || t->sym.kind != SymKind::local
-                || t->is_const
                 || (t->decl_type != DeclType::none
                     && t->decl_type != DeclType::dyn))
                 return false;
@@ -2783,16 +2777,10 @@ struct Codegen {
             const int src = temps[i];
             if (src < 0)
                 continue;                   /* `_` */
+            /* (a builtin or const target is a compile error, the
+             * resolver's check_rebind; a name the parser marked const and
+             * a parameter, capture or loop variable shadows is stored) */
             const Identifier *t = il->elems[i].get();
-            /* a builtin name first: the parser marks a const builtin
-             * (`len`) const too, and its error is the builtin one */
-            if (t->sym.kind == SymKind::builtin || t->is_const) {
-                emit_throw(t->sym.kind == SymKind::builtin
-                               ? Chunk::ThrowKind::rebind_builtin
-                               : Chunk::ThrowKind::rebind_const,
-                           t->start, t->end, nullptr, ops);
-                return;                     /* nothing after it runs */
-            }
             /* a plain store into a typed int/float target coerces (a
              * compound does not - handle_single_expr14) */
             const bool coerce = compound_op == Op::invalid
@@ -2852,7 +2840,7 @@ struct Codegen {
         for (const auto &t : il->elems) {
             if (t->is_underscore())
                 continue;               /* `_` is a skipped slot */
-            if (t->sym.kind != SymKind::local || t->is_const) {
+            if (t->sym.kind != SymKind::local) {
                 via_temps = true;           /* emit_multi_via_temps */
                 continue;
             }
@@ -2952,21 +2940,12 @@ struct Codegen {
         /* A global `g++`/`g--` or closure-capture `cap++`/`cap--` statement ->
          * a compound StoreGlobalV/StoreCaptureV (x += 1 / x -= 1). A LOCAL
          * inc-dec is handled earlier (compile_int/float_stmt); a subscript one
-         * in the store codegen; a global/capture id reaches here. A typed /
-         * const operand falls back. */
+         * in the store codegen; a global/capture id reaches here. A typed
+         * operand falls back. */
         if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
             const Identifier *id =
                 dynamic_cast<const Identifier *>(inc->lvalue.get());
-            /* A builtin name refuses the store (`len++`): the tree-walker's
-             * CannotRebindBuiltinEx, loc-less there and so stamped with the
-             * whole inc-dec's span (a NotLoweredEx until 2026-10-06). The
-             * value form compiles this statement for its mutation. */
-            if (id && id->sym.kind == SymKind::builtin) {
-                emit_throw(Chunk::ThrowKind::rebind_builtin, inc->start,
-                           inc->end, nullptr, ops);
-                return true;
-            }
-            if (id && !id->is_const
+            if (id
                 && (id->decl_type == DeclType::none
                     || id->decl_type == DeclType::dyn)) {
                 const bool numeric = inc->th == TypeHint::i
@@ -3120,24 +3099,18 @@ struct Codegen {
         /* An assignment whose TARGET is not an lvalue always throws (the tree-
          * walker evaluates the rhs first, then handle_single_expr14 rejects the
          * target): a scalar LITERAL target (`0 = 99`, `true = false`, or a
-         * const-inlined `K = 6`) -> NotLValueEx(lvalue loc); a BUILTIN-name
-         * target (`print = 5`) -> CannotRebindBuiltinEx(lvalue loc). Compile the
-         * rhs for its side effects (+ its own throw), THEN throw. A builtin
-         * target refuses a compound too (`len += 1` - a NotLoweredEx until
-         * 2026-10-06); any other compound takes the compound store path. */
-        const Identifier *tid =
-            dynamic_cast<const Identifier *>(e->lvalue.get());
-        if (is_assign || (tid && tid->sym.kind == SymKind::builtin)) {
+         * const-inlined `K = 6`) -> NotLValueEx(lvalue loc). Compile the
+         * rhs for its side effects (+ its own throw), THEN throw. (A builtin
+         * or const name as the target is a compile error, the resolver's
+         * check_rebind.) */
+        if (is_assign) {
             Chunk::ThrowKind tk = Chunk::ThrowKind::not_lvalue;
             const UniqueId *tname = nullptr;
             Loc tstart = e->lvalue->start, tend = e->lvalue->end;
             bool bad = dynamic_cast<const Literal *>(e->lvalue.get()) != nullptr;
             if (const Identifier *bl =
                     dynamic_cast<const Identifier *>(e->lvalue.get())) {
-                if (bl->sym.kind == SymKind::builtin) {
-                    tk = Chunk::ThrowKind::rebind_builtin;
-                    bad = true;
-                } else if (bl->sym.kind == SymKind::unresolved) {
+                if (bl->sym.kind == SymKind::unresolved) {
                     /* An assignment to an UNDECLARED name in a FUNCTION (a
                      * top-level one is an implicit-global DECL and never
                      * unresolved): the tree-walker evaluates the rhs FIRST
@@ -3214,29 +3187,11 @@ struct Codegen {
             next_temp = st;
         }
 
-        /* A reassignment (plain OR compound) of a CONST runtime symbol (a
-         * func/array/dict kept in a slot; a const SCALAR is inlined + its
-         * reassign hits the bad-lvalue throw above) must throw
-         * CannotRebindConstEx. The tree-walker evaluates the RHS first, THEN
-         * throws, so compile the rhs (for its side effects + its own throw) and
-         * emit a native ThrowRuntimeV with the lvalue's caret - byte-identical.
-         * A `const` DECL (pInConstDecl) was already handled above (DeclConstV);
-         * this is only a REBIND. */
-        if (lv->is_const) {
-            const size_t om = ops.size();
-            const size_t cm = chunk.consts.size();
-            const int st = next_temp;
-            int rslot;
-            if (compile_rvalue(e, rslot, ops)) {
-                emit_throw(Chunk::ThrowKind::rebind_const,
-                           e->lvalue->start, e->lvalue->end, nullptr, ops);
-                return true;
-            }
-            ops.resize(om);
-            chunk.consts.resize(cm);
-            next_temp = st;
-            return false;
-        }
+        /* (A reassignment of a CONST binding is a compile error, the
+         * resolver's check_rebind. `is_const` is the PARSER's mark - the
+         * name found in the const scope - which a parameter, a capture or
+         * a loop variable of the same name does not change, so it decides
+         * nothing about a store.) */
 
         const size_t omark = ops.size();
         const size_t cmark = chunk.consts.size();
@@ -5362,7 +5317,7 @@ struct Codegen {
      */
     bool typed_capture_update_ok(const Identifier *id, Op base) const
     {
-        return id && !id->is_const
+        return id
             && id->sym.kind == SymKind::capture
             && (base == Op::plus || base == Op::minus || base == Op::times);
     }

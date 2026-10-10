@@ -81,8 +81,6 @@ static const char *throw_kind_name(Chunk::ThrowKind k)
     switch (k) {
     case Chunk::ThrowKind::undefined_var:  return "undefined_var";
     case Chunk::ThrowKind::not_lvalue:     return "not_lvalue";
-    case Chunk::ThrowKind::rebind_builtin: return "rebind_builtin";
-    case Chunk::ThrowKind::rebind_const:   return "rebind_const";
     case Chunk::ThrowKind::bad_args:       return "bad_args";
     }
     return "?";

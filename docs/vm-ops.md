@@ -431,12 +431,10 @@ A **`const` DECL of an arr/dict/func kept as a runtime symbol** (`const x =
 <LiteralObj>`; const SCALARS are inlined, so never here) goes native via
 **`DeclConstV`**: materialize the rvalue then BIND the slot as a **const
 `LValue`** (`LValue(v, true)`) — a LOCAL (`target2==0`) or GLOBAL (`==1`) slot.
-Binding const (not a plain `put`) is what keeps a later rebind throwing
-`CannotRebindConstEx` (a rebind, having no `pInConstDecl`, stays `EvalStmt` and
-throws via the tree-walker). The codegen (`compile_boxed_stmt`) recognizes it by
-`Expr14::fl & pInConstDecl` — which distinguishes a DECL from a REASSIGN (a
-const reassign is a RUNTIME error, not caught at compile time, so the codegen
-does see it and must leave it to the tree-walker).
+Binding const (not a plain `put`) is what makes an in-place builtin refuse the
+value (`CannotChangeConstEx`); a REBIND of a const name is a compile error (the
+resolver's `check_rebind`), so codegen never sees one. The codegen
+(`compile_boxed_stmt`) recognizes the decl by `Expr14::fl & pInConstDecl`.
 A **`struct P {..}` decl** binds the same way — `gen_stmt` bakes the type
 descriptor (a trivial `t_structtype` value holding the program-lifetime
 `StructTypeDef*`) into the const pool -> **`LoadConstV` + `StoreGlobalV`**.
@@ -855,17 +853,15 @@ slot. 73_multi_unpack: 7.19x -> 2.21x of C++. Used as a VALUE (`w = a, b
 = arr`, `return a, b = arr` - README: the value is `none`) the multi-assign
 compiles as the statement above, then a `LoadConstV` of none (2026-10-06;
 a NotLoweredEx until then). Those paths write frame slots only, so a
-target that is not a plain local - a GLOBAL or a CAPTURE slot, or a const
-or builtin name whose store throws - takes **`emit_multi_via_temps`**
+target that is not a plain local - a GLOBAL or a CAPTURE slot - takes
+**`emit_multi_via_temps`**
 (2026-10-06; a NotLoweredEx until then, while the tree-walker ran it): the
 lowered unpack or MultiUnpackV into TEMPS (the strict length check and the
 spread first), then each target stored in order - MoveV / CoerceNumV /
 CompoundV for a local, StoreGlobalV / StoreCaptureV (after a CoerceNumV
-for a typed target) for the others, the rebind throw at a const or builtin
-target - so a failing store leaves the targets before it written, as in
-handle_single_expr14. The parser marks a const name past the first target
-const (it used to mark only the first, so the literal fast path stored
-into `K` in `a, K = ..`). A
+for a typed target) for the others - so a failing store leaves the targets
+before it written, as in handle_single_expr14. (A const or builtin target
+is a compile error, the resolver's `check_rebind`.) A
 **`return <expr>;`** likewise lowers to a
 **`return <expr>;`** likewise lowers to a
 `ReturnV` that compiles the return expression (so `return f(x)` → CallV) then
@@ -1266,12 +1262,11 @@ serializable `emplace_sites` pool).**
 always-throwing constructs the tree-walker ran and threw on are now native: an
 UNRESOLVED name in an rvalue/callee position (`var y = foobar` /
 `undefined_fn()` / `undef(5)` / a `_` read), an assignment to a scalar LITERAL
-(`0 = 99`, `true = false`, a const-inlined `K = 6`) or a BUILTIN (`print = 5`),
-and a REQUIRES-lvalue builtin (`append`/`push`/`pop`/`insert`/`erase`/`intptr`)
-on a provably-non-lvalue arg0 (`append([1,2], 3)` — the only lvalues are
-id/subscript/member), and a **REBIND of a runtime `const`** (`const c = [..]; c
-= x` / `c += x`, a func/array/dict kept in a slot → `CannotRebindConstEx`; a
-const *scalar* is inlined, so its rebind hits the bad-lvalue throw instead). New
+(`0 = 99`, `true = false`), and a REQUIRES-lvalue builtin
+(`append`/`push`/`pop`/`insert`/`erase`/`intptr`) on a provably-non-lvalue
+arg0 (`append([1,2], 3)` — the only lvalues are id/subscript/member). (A
+rebind of a builtin or a const name used to be one more; it is a compile
+error now, the resolver's `check_rebind`.) New
 op **`ThrowRuntimeV`** + a serializable
 `Chunk::throws` pool (`{ThrowKind, Loc, name}`) throws the pooled exception with
 the exact caret
@@ -1279,9 +1274,7 @@ the exact caret
 `compile_boxed_expr` (a CALL with an unresolved callee throws before its args,
 matching `what->eval` first); a bad-lvalue in `compile_boxed_stmt` (rhs compiled
 FIRST for its side effects, then the throw, matching the tree-walker's rhs-then-
-target order); the same rhs-first + throw for a `const` rebind (the rhs's side
-effects run before `CannotRebindConstEx`, for both a plain and a compound
-rebind); a non-lvalue arg0 in `try_native_mutating_builtin` (gated by
+target order); a non-lvalue arg0 in `try_native_mutating_builtin` (gated by
 `builtin_requires_lvalue_arg0`, which EXCLUDES `sort`/`rev_sort`/`reverse` —
 they accept a value arg0 and sort the copy). The bare-LEAF guard keeps a
 discarded `foobar;` a no-op.
@@ -1578,8 +1571,8 @@ None appear in `bench/` or `samples/` (both stay 100% native). The `_`-in-unpack
 member/subscript lvalue-chain store** (`a[i].f=v` / `q.p.x=v` / `d.a[0].f=v`),
 the dyn scalar/element/member inc-dec, `append` to a struct member, the common
 `InlinedCallExpr`, typed NON-scalar decls, EVERY `defined` form (fold /
-`DefinedGlobalV` / the non-identifier arg / wrong arity), and a
-runtime-`const` rebind are all now native (above).
+`DefinedGlobalV` / the non-identifier arg / wrong arity) are all now native
+(above).
 
 **WHERE AN OP'S DATA COMES FROM (all of it serializable).** The builtin-call
 ops read the `builtin_calls` pool, `EmplaceStruct` the `emplace_sites` pool

@@ -146,6 +146,7 @@ struct FuncState {
     int next_slot = 0;
     std::vector<Scope> scopes;
     std::vector<int> writes;        /* per slot -> fd->slot_writes */
+    std::unordered_set<int> const_slots; /* the slots a `const` declared */
 };
 
 /*
@@ -1411,6 +1412,8 @@ public:
                 fix1_undefined(id);
         }
 
+        check_rebinds();
+
         /* Now that escaped globals have their slots, RE-SNAPSHOT every
          * capture list: the in-walk snapshot above ran before this stamp. */
         for (FuncDeclStmt *fd : capture_funcs)
@@ -2357,6 +2360,12 @@ private:
     std::unordered_map<const UniqueId *, int> global_func_slots;
     std::vector<const UniqueId *> global_names;
 
+    /* The global slots that are const bindings (a top-level `const` a
+     * function reads, a struct name, an explicit `pure func` name), and
+     * every assignment target check_rebinds still has to answer */
+    std::unordered_set<int> const_global_slots;
+    std::vector<const Identifier *> rebind_targets;
+
     /* Append a name to the global table, returning its slot. */
     int add_global_slot(const UniqueId *uid)
     {
@@ -2457,6 +2466,51 @@ private:
             if (global_func_slots.count(id->uid))
                 throw AlreadyDefinedEx(id->start, id->end);
             id->sym = ResolvedSym{ SymKind::global, add_global_slot(id->uid) };
+            note_const_decl(e.get(), id->sym.slot);
+        }
+    }
+
+    /* A struct name and an explicit `pure func` name are compile-time
+     * bindings: an assignment to either is CannotRebindConstEx (a plain
+     * func name is a variable, and may be rebound) */
+    void note_const_decl(Construct *decl, int gslot)
+    {
+        if (ctag(decl) == ConstructType::struct_decl
+                || (ctag(decl) == ConstructType::func_decl
+                    && static_cast<FuncDeclStmt *>(decl)->desc->explicit_pure))
+            const_global_slots.insert(gslot);
+    }
+
+    /*
+     * An assignment, compound assignment or inc-dec whose target names a
+     * builtin or a `const` binding is decidable here, so it is a COMPILE
+     * error (it was raised when the store ran). A parameter, a capture, a
+     * foreach or catch variable is its own binding, never const, whatever
+     * an outer name it shadows is. A local is answered at once; a global
+     * or a builtin after the escaped uses are stamped (check_rebinds).
+     * Not in the REPL, where a top-level name stays in the map and the
+     * store raises when it runs.
+     */
+    void check_rebind(FuncState *cur, Identifier *id)
+    {
+        if (!cur || id->is_underscore())
+            return;
+        if (id->sym.kind == SymKind::local) {
+            if (cur->const_slots.count(id->sym.slot))
+                throw CannotRebindConstEx(id->start, id->end);
+        } else if (id->sym.kind != SymKind::capture) {
+            rebind_targets.push_back(id);
+        }
+    }
+
+    void check_rebinds() const
+    {
+        for (const Identifier *id : rebind_targets) {
+            if (id->sym.kind == SymKind::builtin)
+                throw CannotRebindBuiltinEx(id->start, id->end);
+            if (id->sym.kind == SymKind::global
+                    && const_global_slots.count(id->sym.slot))
+                throw CannotRebindConstEx(id->start, id->end);
         }
     }
 
@@ -2466,7 +2520,7 @@ private:
      * exhausted the name is added as a masking entry (resolves to the map) so
      * shadowing still works. No-op when the function isn't slottable.
      */
-    void declare(FuncState *cur, Identifier *id)
+    void declare(FuncState *cur, Identifier *id, bool cnst = false)
     {
         if (!cur || !cur->slottable || !id)
             return;
@@ -2504,6 +2558,8 @@ private:
                 { id->uid, gslot, SymKind::global, id->decl_type });
             id->sym = ResolvedSym{ SymKind::global, gslot };
             global_decl_types[id->uid] = id->decl_type;
+            if (cnst)
+                const_global_slots.insert(gslot);
             return;
         }
 
@@ -2520,6 +2576,8 @@ private:
             { id->uid, slot, SymKind::local, id->decl_type });
         cur->writes.push_back(1);   /* the declaration is write #1 */
         id->sym = ResolvedSym{ SymKind::local, slot };
+        if (cnst)
+            cur->const_slots.insert(slot);
     }
 
     /*
@@ -2578,6 +2636,7 @@ private:
             cur->scopes.back().decls.push_back(
                 { id->uid, slot, SymKind::global, id->decl_type });
             id->sym = ResolvedSym{ SymKind::global, slot };
+            note_const_decl(e.get(), slot);
         }
     }
 
@@ -2834,26 +2893,28 @@ private:
         if (ctag(lvalue) == ConstructType::id) {
             auto *id = static_cast<Identifier *>(lvalue);
             note(id);
+            check_rebind(cur, id);
         } else if (ctag(lvalue) == ConstructType::idlist) {
             auto *il = static_cast<IdList *>(lvalue);
             for (auto &id : il->elems) {
                 note(id.get());
+                check_rebind(cur, id.get());
             }
         }
     }
 
     /* Declare the name(s) a declaration's lvalue introduces (Id/IdList). */
-    void declare_lvalue(FuncState *cur, Construct *lvalue)
+    void declare_lvalue(FuncState *cur, Construct *lvalue, bool cnst = false)
     {
         if (ctag(lvalue) == ConstructType::id) {
             auto *id = static_cast<Identifier *>(lvalue);
-            declare(cur, id);
+            declare(cur, id, cnst);
         } else if (ctag(lvalue) == ConstructType::idlist) {
             auto *il = static_cast<IdList *>(lvalue);
             for (auto &id : il->elems) {
                 if (id->is_underscore())
                     continue;   /* `_` placeholder: not declared */
-                declare(cur, id.get());
+                declare(cur, id.get(), cnst);
             }
         }
     }
@@ -4177,7 +4238,8 @@ Resolver::walk(Construct *c, FuncState *cur)
         walk(e->rvalue.get(), cur);
 
         if (e->fl & pFlags::pInDecl) {
-            declare_lvalue(cur, e->lvalue.get());
+            declare_lvalue(cur, e->lvalue.get(),
+                           (e->fl & pFlags::pInConstDecl) != 0);
         } else {
             walk(e->lvalue.get(), cur);     /* assignment: resolve the target */
             count_write(cur, e->lvalue.get());

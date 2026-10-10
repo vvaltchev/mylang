@@ -815,6 +815,24 @@ s[0] = 9;         # error: NotLValueEx
 s = [9, 9];       # OK: rebinding the name s is allowed
 ```
 
+**Rebinding a const or a builtin name is a compile error.** An assignment, a
+compound assignment or a `++`/`--` whose target is a `const` - or a struct's
+name, or a `pure func`'s - raises `CannotRebindConstEx`, and one whose target
+is a builtin's name `CannotRebindBuiltinEx`, when the program compiles, even
+in code that never runs:
+
+```C#
+const K = [1];
+func never() { K = [2]; }          # compile error: CannotRebindConstEx
+if (runtime(false)) { len = 5; }   # compile error: CannotRebindBuiltinEx
+```
+
+A parameter, a capture, a `foreach` or a `catch` variable is its own binding
+and is never const, whatever outer name it shadows: in
+`const K = [1]; func f(K) { K = [2]; return K; }` the assignment rebinds the
+parameter. (In the REPL, where a top-level name stays redefinable, an
+assignment to a top-level const or builtin is refused when it runs.)
+
 **What can appear on the left of `=`.** Exactly four forms denote a location:
 a variable, an id list (`a, b = ...`), an element `a[i]`, and a field `a.f`.
 Anything else — a literal, a call result, an arithmetic/comparison/logical
@@ -1692,8 +1710,8 @@ print(sq(3), use(2));      # -3 -1
 ```
 
 The exception is a `pure func` (see [Pure functions](#pure-functions)): its name
-is a compile-time binding, like a `const`, so reassigning it raises
-`CannotRebindConstEx`.
+is a compile-time binding, like a `const`, so reassigning it is a compile-time
+`CannotRebindConstEx` (and so is reassigning a struct's name).
 
 **Function scope is lexical, like a variable's.** A named function (or struct)
 declared inside a block — an `if`/`for`/`{ }` body, or another function's body —
@@ -2112,7 +2130,8 @@ exception handling logic. The reason for that is to enforce *early failure*.
 **Some errors cannot be caught.** A few exceptions report a condition the
 script must not handle - `InternalErrorEx` (a bug in the interpreter itself),
 `UndefinedVariable`, and `CannotRebindConstEx` / `CannotRebindBuiltinEx`
-(an assignment to a const or to a builtin's name). Naming one in a `catch`
+(an assignment to a const or to a builtin's name - a compile error in a
+script, raised when it runs in the REPL). Naming one in a `catch`
 clause is a compile error, and a bare `catch { }` will not swallow one
 either:
 

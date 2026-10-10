@@ -23,7 +23,11 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 30;   /* v30: IncDecChainV's
+constexpr unsigned MYV_FORMAT_VERSION = 31;   /* v31: ThrowKind loses
+                                                 rebind_builtin and
+                                                 rebind_const (bad_args
+                                                 is 2);
+                                                 v30: IncDecChainV's
                                                  root kind 3 (an rvalue
                                                  root) is gone;
                                                  v29: the APPENDED

@@ -827,18 +827,69 @@ static const std::vector<test> tests =
         "var dyn z = KN[ix()][0]++;" },
       &typeid(NotLValueEx) },
 
-    /* A compound or an inc-dec of a builtin name refuses the store in
-     * every engine (the VM refused to compile both): the compound carets
-     * the target, an inc-dec the whole expression - the tree-walker's. */
-    { "err loc: a compound into a builtin name refuses the store",
+    /* A store into a builtin or a const name - plain, compound, inc-dec,
+     * a multi-assignment target, an assignment as a value - is a COMPILE
+     * error, the target name's caret (the resolver's check_rebind; it was
+     * raised when the store ran, and the VM refused to compile some) */
+    { "err loc: a compound into a builtin name is refused",
       { "len += runtime(1);" },
       &typeid(CannotRebindBuiltinEx), 1, 1, 5, 1 },
-    { "err loc: an inc-dec of a builtin name refuses the store",
+    { "err loc: an inc-dec of a builtin name is refused",
       { "len++;" },
-      &typeid(CannotRebindBuiltinEx), 1, 1, 7, 1 },
-    { "err loc: an inc-dec value of a builtin name refuses the store",
+      &typeid(CannotRebindBuiltinEx), 1, 1, 5, 1 },
+    { "err loc: an inc-dec value of a builtin name is refused",
       { "var dyn z = --len;" },
-      &typeid(CannotRebindBuiltinEx), 13, 1, 19, 1 },
+      &typeid(CannotRebindBuiltinEx), 15, 1, 19, 1 },
+    { "rebind: a builtin store that never runs is still refused",
+      { "if (runtime(false)) { print = 5; }" },
+      &typeid(CannotRebindBuiltinEx), 23, 1, 29, 1 },
+    { "rebind: a builtin store in a function never called is refused",
+      { "func never(n) { var a = 0; a, len = [n, n]; return a; }",
+        "print(1);" },
+      &typeid(CannotRebindBuiltinEx), 31, 1, 35, 1 },
+    { "rebind: a const store in a function never called is refused",
+      { "const K = [1];",
+        "func never() { K += [2]; return K; }",
+        "print(1);" },
+      &typeid(CannotRebindConstEx), 16, 2, 18, 2 },
+    { "rebind: a function-local const store that never runs is refused",
+      { "func f(n) { const L = [1]; if (n > 5) L = [n]; return L; }",
+        "print(f(runtime(1)));" },
+      &typeid(CannotRebindConstEx), 39, 1, 41, 1 },
+    { "rebind: a struct name is refused",
+      { "struct P { int x; }", "if (runtime(false)) P = 5;" },
+      &typeid(CannotRebindConstEx), 21, 2, 23, 2 },
+    { "rebind: a block-scoped pure func name is refused",
+      { "func f() { pure func sq(x) => x * x; sq = sq; return 1; }",
+        "print(1);" },
+      &typeid(CannotRebindConstEx) },
+    /* A parameter, a capture, a foreach or a catch variable is its own
+     * binding, never const, whatever the outer name it shadows is: every
+     * engine stores (the VM refused, from the parser's const mark). The
+     * values are read whole (`return K`, `append(got, K)`): the parser
+     * folds `K[0]` or `len(K)` to the OUTER const's value even where K
+     * names the inner binding - a separate defect */
+    { "rebind: a parameter named like a const is a variable",
+      { "const K = [1];",
+        "func f(K) { K = [2]; K += [3]; return K; }",
+        "func g(dyn K) { K++; return K; }",
+        "var b = 0;",
+        "func h(K) { K, b = [[5], 6]; return K; }",
+        "assert(f([9]) == [2, 3] && g(runtime(4)) == 5);",
+        "assert(h([1]) == [5] && b == 6);" } },
+    { "rebind: a capture, a loop and a catch variable named like a const",
+      { "const K = [1];",
+        "var c = func[K]() { K = [2]; return K; };",
+        "assert(c() == [2]);",
+        "var got = [];",
+        "foreach (var K in [[5], [6]]) { K = [7]; append(got, K); }",
+        "struct E { int x; }",
+        "try { throw E(1); } catch (E as K) { K = [3]; append(got, K); }",
+        "assert(got == [[7], [7], [3]]);",
+        "func f() { const L = [1];",
+        "           var g = func(L) { L = [2]; return L; };",
+        "           return g([3]); }",
+        "assert(f() == [2]);" } },
 
     {
         "multi-assign into a builtin name is refused",
@@ -6459,21 +6510,8 @@ static const std::vector<test> tests =
       { "try { print(1); }",
         "catch (TypeErrorEx, CannotRebindBuiltinEx) { print(\"no\"); }" },
       &typeid(SyntaxErrorEx) },
-    /* The RUN-TIME half in a script: a rebind of a builtin or a const name
-     * is raised at run time, and the parenless catch-all must not swallow
-     * it in any engine (the frames it unwinds are tests/backtrace/
-     * rebind_*.my's job - the five modes compare only the type) */
-    { "uncatchable: a catch-all does not swallow a builtin rebind",
-      { "func f(n) { try { len = n; } catch { print(\"SWALLOWED\"); }",
-        "            return n; }",
-        "f(runtime(1));" },
-      &typeid(CannotRebindBuiltinEx) },
-    { "uncatchable: a catch-all does not swallow a const rebind",
-      { "const K = [1];",
-        "func f(n) { try { K = [n]; } catch { print(\"SWALLOWED\"); }",
-        "            return n; }",
-        "f(runtime(1));" },
-      &typeid(CannotRebindConstEx) },
+    /* (a builtin or const rebind is a compile error in a script; its
+     * run-time half, the REPL's, is the `repl:` uncatchable tests) */
     /* ...and the ordinary catch machinery is untouched: a named clause, the
      * parenless catch-all, a multi-type clause and a user struct exception
      * all still work. (The name-error half of is_catchable() is the REPL's:
@@ -19835,6 +19873,19 @@ static const std::vector<repl_test> repl_tests =
           "Undefined variable 'zzz_nope'" },
         { "func ur() { var dyn r = zzz_nope2(); return r; }", "" },
         { "var dyn urt = ur()", "[0] ur()" } } },
+    /* A rebind of a top-level builtin or const name is a run-time error
+     * in the REPL (a top-level name stays in the open-world map; in a
+     * script it is a compile error): the catch-all does not swallow it,
+     * the `finally` on the way out runs, and the frames survive */
+    { "uncatchable: a builtin or const rebind at run time",
+      { { "func rf(n) { try { len = n; } catch { print(\"SWALLOWED\"); }"
+          " finally { print(\"fin\"); } return n; }", "" },
+        { "rf(runtime(1))", "fin" },
+        { "rf(runtime(1))", "[0] rf(n)" },
+        { "const RK = [1]", "" },
+        { "func rg() { try { RK = [7]; } catch { print(\"SWALLOWED\"); }"
+          " return 1; }", "" },
+        { "rg()", "Cannot rebind const" } } },
 
     { "a var persists across inputs",
       { { "var x = 5", "=> 5" },

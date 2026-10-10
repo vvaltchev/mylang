@@ -762,8 +762,8 @@ enum class OpCode : unsigned char {
      * <LiteralObj>`). Materialize the rvalue (`a`) then BIND the slot as a
      * CONST LValue - `target` = the slot, `target2` = 0 (a main-frame LOCAL
      * slot) or 1 (a GLOBAL slot). Binding CONST (not a plain put) is what makes
-     * a later rebind still throw CannotRebindConstEx (a rebind lowers to the
-     * pooled rebind_const throw).
+     * an in-place builtin refuse it (CannotChangeConstEx); a rebind is a
+     * compile error (the resolver's check_rebind).
      * Only a DECL reaches here (Expr14 with pInConstDecl); a const reassign
      * never does. Const SCALARS are inlined, so they never appear.
      */
@@ -2729,8 +2729,6 @@ struct Chunk {
     enum class ThrowKind : unsigned char {
         undefined_var,      /* UndefinedVariableEx(name, loc) */
         not_lvalue,         /* NotLValueEx(loc) */
-        rebind_builtin,     /* CannotRebindBuiltinEx(loc) */
-        rebind_const,       /* CannotRebindConstEx(loc) */
         bad_args,           /* InvalidNumberOfArgsEx(loc) - a wrong-arity
                              * AST-builtin call that throws BEFORE its args
                              * evaluate (defined(a,b)) */

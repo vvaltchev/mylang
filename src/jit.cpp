@@ -7823,10 +7823,8 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::Rethrow:
         return true;
     /* model-flip (nativize-ops): an ALWAYS-THROWING construct - the helper
-     * builds the POOLED exception natively (Runtime kinds via g_vm_jit_exc,
-     * plain kinds - UndefinedVariableEx/CannotRebind* - via the M5
-     * g_vm_jit_eptr channel, which postdates the op's old re-run-to-throw
-     * exit form) with its pooled caret. Conveys, never re-executes ->
+     * builds the POOLED exception natively (every kind a RuntimeException,
+     * via g_vm_jit_exc) with its pooled caret. Conveys, never re-executes ->
      * op_fully_native (deletable); never leaf-safe (it always exits). */
     case OpCode::ThrowRuntimeV:
         return true;
