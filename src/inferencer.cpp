@@ -2701,6 +2701,11 @@ std::string Inferencer::global_type_str(const UniqueId *name)
     if (it == global->syms.end() || !it->second)
         return "";
     TypeSym *s = it->second;
+    /* a struct or class TYPE name has no inferred type: its symbol's `dyn`
+     * is a placeholder (its constructor and `.CONST` uses are typed before
+     * it is read), which `:type P` reported as `P : dyn?` */
+    if (s->struct_type)
+        return "";
     StaticTypeRef ty = s->func ? func_static_type(s->func) : s->type;
     return static_type_to_string(ty);
 }

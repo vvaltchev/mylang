@@ -21966,6 +21966,18 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* `:type` of a struct or class TYPE name reported its symbol's
+     * placeholder static type (`P : dyn?`) - it is a type */
+    { ":type of a struct or class type name names the type",
+      { { "struct P8 { int x; }", "" },
+        { "class C8 { int v; }", "" },
+        { ":type P8", "type P8   (runtime type)", "dyn" },
+        { ":type C8", "type C8   (runtime type)", "dyn" },
+        { ":type P8(1)", "P8   (runtime type)" },
+        { "var p8 = P8(3)", "" },
+        { ":type p8", "p8 : P8   (inferred static type)" },
+        { ":globals", "P8 : P8(int x)   [struct type]" } } },
+
     /* a call to a function that returns nothing is silent at the prompt;
      * it folds to a `none` literal (the optimizers, or the parser for a
      * pure func), which the echo took for a written `none` and showed */
