@@ -2120,8 +2120,12 @@ public:
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
     /* do_eval's access step over an ALREADY-EVALUATED base value: an
      * assignable field / dict value, or a value read. A store evaluates
-     * the base once and calls this (eval.cpp, member_store). */
-    EvalValue access(const EvalValue &dval, bool for_write) const;
+     * the base once and calls this (eval.cpp, member_store). `rooted`: the
+     * base outlives this evaluation - a variable, or a store's HELD value
+     * (hold_store_base) - so a boxed field may be handed out as an lvalue;
+     * a field of a temporary is a value, its object freed after the read. */
+    EvalValue access(const EvalValue &dval, bool for_write,
+                     bool rooted) const;
     int_type eval_int(EvalContext *ctx) const override;
     float_type eval_float(EvalContext *ctx) const override;
     void serialize(ostream &s, int level = 0) const override;

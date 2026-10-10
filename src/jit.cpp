@@ -26181,7 +26181,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 
     case OpCode::IncDecChainV: {
         /* jit_incdec_chain(root_kind, root_slot, dst, is_inc, &chain,
-         * member_keys buffer) - layout: a_lit = root kind (3 = rvalue),
+         * member_keys buffer) - layout: a_lit = root kind (0/1/2),
          * target2 = root slot, target = dst (-1 = statement), aop = +/-,
          * b = the incdec_chains index. r9 carries the 6th arg (not a
          * persistent tag reg, the nested-chain-store precedent). */
@@ -29536,8 +29536,7 @@ static bool op_fully_native(const Instr &in)
      * loc-less TypeError gets the cold-side exc-stamp - all
      * pc-independent. Only an undefined-GLOBAL base/root BAILS, so the
      * global kind stays non-deletable (kind rides target2 for the scalar,
-     * target for elem/member, a_lit for the chain; chain kind 3 is an
-     * RVALUE root - no bail). */
+     * target for elem/member, a_lit for the chain). */
     case OpCode::IncDecCheckedV:
         return in.target2 != 1;
     case OpCode::IncDecElemCheckedV:

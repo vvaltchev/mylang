@@ -135,9 +135,11 @@ want("field of an element", outcome(func [pts] () { pts[0].x++; }), "ok");
 want("its new value", pts[0].x, 2);
 want("missing field", outcome(func [bx] () { bx.nope++; }), "TypeErrorEx");
 want("missing POD field", outcome(func [p] () { p.nope--; }), "TypeErrorEx");
-want("temporary's field", outcome(func () { mkb().x++; }), "NotLValueEx");
+# a temporary's field: a store through a value goes into it, as through a
+# fresh variable (NotLValueEx until 2026-10-06; 75_store_through_value.my)
+want("temporary's field", outcome(func () { mkb().x++; }), "ok");
 want("temporary's field value", outcome(func () { var dyn t = mkb().x--; }),
-     "NotLValueEx");
+     "ok");
 want("an int's member", outcome(func [n] () { n.x++; }), "TypeErrorEx");
 var dyn pr = runtime(print);
 want("a builtin in a variable", outcome(func [pr] () { pr++; }),

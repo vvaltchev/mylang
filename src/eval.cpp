@@ -3838,6 +3838,28 @@ static void stamp_like_eval(const Construct *n, Exception &e)
     }
 }
 
+/*
+ * A store through a value that is not a variable - a call's result, a
+ * literal, a ternary, a slice (`f()[0] = v`, `(c ? a : b).x += 1`) - goes
+ * into that value, as if it were first bound to a fresh variable:
+ * `f()[0] = v` is `{ var t = f(); t[0] = v; }`. `hold` is that variable,
+ * the caller's, alive for the whole store. A container is a reference, so
+ * the write lands in the object f() returned; a slice detaches the hold
+ * (copy on write) exactly as it would a variable; a string or a scalar
+ * meets the error a variable of it meets. Until 2026-10-06 the tree-walker
+ * stored through such a value into a dict only, raised NotLValueEx for an
+ * array or a struct, and the VM refused to compile it - while an inlined
+ * `f` turned the same store into one through a variable (RULE 2). The VM's
+ * twin is the codegen's hold_store_base.
+ */
+static EvalValue hold_store_base(const EvalValue &base, LValue &hold)
+{
+    if (base.is<LValue *>() || base.is<UndefinedId>())
+        return base;
+    hold = LValue(base, false);
+    return EvalValue(&hold);
+}
+
 /* The general tail of a store: the formed reference is an LValue to write,
  * or the target is not a location. `*old_out`, when given, receives the
  * value the store replaced (as do the stores below). */
@@ -3887,8 +3909,9 @@ subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
                 const EvalValue &rval, EvalValue *old_out = nullptr)
 {
     EvalValue base, key;
+    LValue hold;
     try {
-        base = sub->what->eval(ctx);
+        base = hold_store_base(sub->what->eval(ctx), hold);
         if (base.is<UndefinedId>())
             throw UndefinedVariableEx(base.get<UndefinedId>().id,
                                       sub->what->start, sub->what->end);
@@ -3936,7 +3959,8 @@ struct MemberTarget {
     PodPlace place;
 };
 
-static MemberTarget member_target(EvalContext *ctx, const MemberExpr *mem)
+static MemberTarget member_target(EvalContext *ctx, const MemberExpr *mem,
+                                  LValue &hold)
 {
     /* the member steps under `mem`, innermost LAST (an optional one is read
      * as its eval reads it: `access` short-circuits a none base) */
@@ -3957,7 +3981,8 @@ static MemberTarget member_target(EvalContext *ctx, const MemberExpr *mem)
             /* Subscript::do_eval's work, by hand: a writable flat struct
              * array's element is entered in place, not read as a copy */
             const Subscript *sub = static_cast<const Subscript *>(root);
-            const EvalValue base = sub->what->eval(ctx);
+            const EvalValue base = hold_store_base(sub->what->eval(ctx),
+                                                   hold);
             if (base.is<UndefinedId>())
                 throw UndefinedVariableEx(base.get<UndefinedId>().id,
                                           sub->what->start, sub->what->end);
@@ -3971,9 +3996,10 @@ static MemberTarget member_target(EvalContext *ctx, const MemberExpr *mem)
                 cur = ty->subscript(base, key, /*for_write=*/false);
             }
         } else {
-            cur = root->eval(ctx);
+            cur = hold_store_base(root->eval(ctx), hold);
         }
 
+        /* every step is rooted: at a variable, or at the held root */
         for (size_t k = steps.size(); k-- > 0; ) {
             const MemberExpr *s = steps[k];
             at = s;
@@ -3987,7 +4013,8 @@ static MemberTarget member_target(EvalContext *ctx, const MemberExpr *mem)
                                               t.place)) {
                 continue;
             }
-            cur = s->access(RValue(cur), /*for_write=*/false);
+            cur = s->access(RValue(cur), /*for_write=*/false,
+                            /*rooted=*/true);
         }
     } catch (Exception &e) {    /* INT-COV-EXEMPT: its type test fails */
         /* only for a non-Exception throw (bad_alloc), which no test makes */
@@ -4004,8 +4031,9 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
              const EvalValue &rval, EvalValue *old_out = nullptr)
 {
     MemberTarget t;
+    LValue hold;
     try {
-        t = member_target(ctx, mem);
+        t = member_target(ctx, mem, hold);
     } catch (Exception &e) {
         stamp_like_eval(mem, e);
         throw;
@@ -4056,7 +4084,8 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
 
     EvalValue lval;
     try {
-        lval = mem->access(RValue(base), /*for_write=*/op == Op::assign);
+        lval = mem->access(RValue(base), /*for_write=*/op == Op::assign,
+                           /*rooted=*/true);
     } catch (Exception &e) {
         stamp_like_eval(mem, e);
         throw;
@@ -5514,8 +5543,9 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
     if (lvalue->is_subscript()) {
         const Subscript *sub = static_cast<const Subscript *>(lvalue.get());
         EvalValue cur, key;
+        LValue hold;
         try {
-            cur = sub->what->eval(ctx);
+            cur = hold_store_base(sub->what->eval(ctx), hold);
             if (cur.is<UndefinedId>())
                 throw UndefinedVariableEx(cur.get<UndefinedId>().id,
                                           sub->what->start, sub->what->end);
@@ -5536,8 +5566,9 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
         !static_cast<const MemberExpr *>(lvalue.get())->optional) {
         const MemberExpr *m = static_cast<const MemberExpr *>(lvalue.get());
         MemberTarget t;
+        LValue hold;
         try {
-            t = member_target(ctx, m);
+            t = member_target(ctx, m, hold);
             if (!t.place.bytes && t.base.is<UndefinedId>())
                 throw UndefinedVariableEx(t.base.get<UndefinedId>().id,
                                           m->start, m->end);
@@ -5555,9 +5586,6 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
             t.base = pod_place_value(t.place);
         }
         EvalValue cur = t.base;
-        /* a temporary base's struct field is a value (MemberExpr's rule) */
-        if (!is_lvalue_rooted(m->what.get()))
-            cur = RValue(cur);
         EvalValue old;
         const EvalValue nv = dyn_incdec_member(cur, m->memId, m->memUid,
                                                is_inc, old, m->start, m->end,
@@ -6663,10 +6691,12 @@ EvalValue MemberExpr::do_eval(EvalContext *ctx, bool rec) const
     const bool for_write = ctx->assign_target;
     ctx->assign_target = false;
 
-    return access(RValue(what->eval(ctx)), for_write);
+    return access(RValue(what->eval(ctx)), for_write,
+                  is_lvalue_rooted(what.get()));
 }
 
-EvalValue MemberExpr::access(const EvalValue &dval, bool for_write) const
+EvalValue MemberExpr::access(const EvalValue &dval, bool for_write,
+                             bool rooted) const
 {
     /*
      * The assignable-lvalue / auto-vivify paths need `what` (rooting) or the
@@ -6683,11 +6713,11 @@ EvalValue MemberExpr::access(const EvalValue &dval, bool for_write) const
         /*
          * A rooted, mutable, boxed field -> an assignable field lvalue (so
          * `s.f = v` / `s.f += v` work). A POD field (bytes, no per-field
-         * LValue), a read-only instance, or a temporary base (`Point(1,2).x`)
-         * is a value read - member_read handles those.
+         * LValue), a read-only instance, or a temporary base (`Point(1,2).x`
+         * read, not stored: a store HOLDS its base) is a value read -
+         * member_read handles those.
          */
-        if (slot >= 0 && !obj->is_pod() && !obj->is_readonly()
-            && is_lvalue_rooted(what.get()))
+        if (slot >= 0 && !obj->is_pod() && !obj->is_readonly() && rooted)
             return &obj->fields[slot];
 
     } else if (dval.is<intrusive_ptr<DictObject>>()) {

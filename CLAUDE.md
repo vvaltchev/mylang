@@ -6612,6 +6612,28 @@ and two macros:
   location), and the no-fail codegen could lower neither a slice nor an
   arithmetic target, so the VM raised a NON-catchable `InternalErrorEx` where
   the tree-walker raised a catchable `NotLValueEx`.
+- **A STORE THROUGH A VALUE HOLDS ITS ROOT (maintainer's call,
+  2026-10-06).** An element or field of ANY expression is a location, and
+  `f()[0] = v` is `{ var t = f(); t[0] = v; }` (README, *Storing through a
+  value*). The tree-walker raised NotLValueEx for an array or struct (and
+  stored into a dict), the VM refused to compile it, and an inlined `f`
+  made it a store through a variable. Both engines now HOLD the root:
+  eval.cpp's `hold_store_base` wraps a non-`LValue` root in a caller-owned
+  `LValue` (and `MemberExpr::access` takes `rooted`, true for every store,
+  so a boxed field of a held struct is an lvalue for the store's length);
+  the codegen's `hold_store_base` compiles it into a FRESH temp, after the
+  rvalue and before the keys, named as a local base of `StoreLValueChainV`
+  / `IncDecChainV` (the rvalue-root kind 3 is gone, myv v30). **It had to
+  be every base expression, not only a call**: the AST inliner turns
+  `pick(c)[0]` into `(c ? a : b)[0]`, so a narrower rule would change with
+  inlining (RULE 2). **Every STATEMENT store compiler declines a held
+  root** (`as_container_base`), so such a statement reaches gen_stmt's
+  discarded-expression fallback and the two value forms above - keep it
+  so: the inc-dec value form's read + mutate (`incdec_lvalue_pure`)
+  evaluates the lvalue TWICE, and a held root is a fresh object at each
+  evaluation. A routing of the statement form straight to the chain op
+  made an inlined `++fresh()[1]` read 8 from a second `[9, 8]`. Pinned by
+  `tests/functional/75_store_through_value.my`.
 - **`UncatchableRuntimeException` (2026-08-08) — a RUNTIME exception a
   script may NEVER handle.** `RuntimeException` used to conflate two
   unrelated things: *"travels the VM/JIT conveyance, so it gets frames and a

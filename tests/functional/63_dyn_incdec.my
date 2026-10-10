@@ -99,12 +99,15 @@ assert(str(d) == "[10, 22, 31]" && p.b && pts[0].x == 2);
 
 # Two the engines disagreed on before they shared the code: a missing member
 # (the VM's statement form said NotLValueEx, the tree-walker TypeErrorEx),
-# and a field of a TEMPORARY struct, which is a value (the VM incremented the
-# temporary; the tree-walker raised NotLValueEx).
+# and a field of a TEMPORARY struct. That was a value (NotLValueEx) until
+# 2026-10-06; a store through a value now goes into it, as if it were bound
+# to a fresh variable first (75_store_through_value.my), so the temporary is
+# incremented and the inc-dec's value is the field's.
 func mkb() { return runtime(B(1, "t")); }
+var mkx = 0;
 assert(outcome(func [bx] () { bx.nope++; }) == "TypeErrorEx");
-assert(outcome(func () { mkb().x++; }) == "NotLValueEx");
-assert(outcome(func () { var dyn t = mkb().x--; }) == "NotLValueEx");
+assert(outcome(func () { mkb().x++; }) == "ok");
+assert(outcome(func [mkx] () { var dyn t = mkb().x--; mkx = t; }) == "ok");
 
 # A variable HOLDING a builtin is a type error (the tree-walker used to say
 # CannotRebindBuiltinEx, which only the builtin's own name earns).

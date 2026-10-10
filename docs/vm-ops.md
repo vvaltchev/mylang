@@ -542,6 +542,24 @@ field), a **DICT member `d.f=v` → `vm_subscript_store(memId)`** (== `d["f"]=v`
 auto-vivify), a subscript → `vm_subscript_store`. Each step's throw uses ITS
 node's loc (a subscript-only chain keeps the tuned `StoreElem2V`/
 `StoreElemChainV`; a single `s.f`/`a[i]` keeps `StoreMemberV`/`StoreElemValue`).
+**Storing through a value (2026-10-06).** A store whose root is not a
+variable - a call's result, a literal, a ternary, a slice: `f()[0] = v`,
+`(c ? a : b).x += 1`, `mk().arr[i]++` - takes `StoreLValueChainV` (or
+`IncDecChainV`) WHATEVER its shape - the value forms' lowering, which a
+statement reaches through gen_stmt's discarded-expression fallback, since
+every statement store declines such a root: `hold_store_base` compiles the root
+into a FRESH temp (a `MoveV` copy when the expression left its value in
+a named local, so a slice's COW rewrites only the hold), after the
+rvalue and before the keys - the tree-walker's order, rhs, base, keys -
+and the op names the temp as a local base. That is the language rule
+(README, *Storing through a value*): the store goes into the value, as
+if it were first bound to a fresh variable. The tree-walker's twin holds
+the root in a caller-owned `LValue` (eval.cpp's `hold_store_base`) and
+passes `rooted` to `MemberExpr::access`, so a boxed field of a held
+struct is an lvalue for the length of the store. No statement store
+accepts a held root, and that is load-bearing: the inc-dec value form's
+read + mutate path evaluates the lvalue twice, and a held root (an
+inlined `++fresh()[1]`) is a fresh object each time.
 So a member-in-the-middle nested store - boxed struct, dict value, flat
 element or inline POD - is native, byte-identical incl. carets. **P8 exceptions
 are now fully native** (see
@@ -1478,9 +1496,10 @@ failure → a whole-if `EvalStmt` in `gen_stmt`) — never a per-op node
 fallback. **R4 is now NATIVE too — `IncDecChainV`** (the impure-lvalue
 inc-dec VALUE form, `y = a[f()]++` / `++d[kf()]` / `a[f()][g()]++` /
 `a[f()].x++` / `mk()[0]++`): the codegen decomposes the lvalue into a
-root (a container slot, or a compiled RVALUE temp — kind 3, whose VALUE
-seed keeps the tree-walker's rvalue-ness, so `mk()[0]++` still throws
-NotLValueEx) plus member/subscript steps with each KEY compiled into a
+root (a container slot, or a root that is not a variable HELD in a temp
+and named as a local, kind 0 - `hold_store_base`, see *Storing through a
+value* below; it was an rvalue root, kind 3, raising NotLValueEx, until
+v30) plus member/subscript steps with each KEY compiled into a
 temp ONCE (side effects run exactly once, in source order), pooled in
 the serializable **`Chunk::incdec_chains`** (steps + tier + prefix +
 carets). Until 2026-10-05 it also carried `allow_flat`/`allow_pod`,

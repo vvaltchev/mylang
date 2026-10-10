@@ -2,8 +2,16 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 29.  This document describes the on-disk image exhaustively:
+Format version 30.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v30 changes no encoding: IncDecChainV's root kind (`a`) loses the value
+3, "an rvalue root held in a frame slot, read as a value".  A root that
+is not a variable - `f()[0]++` - is now held in a temp and named as a
+local, kind 0, so the inc-dec goes into the value it evaluated to; like
+every kind but 1 (global) and 2 (capture), a 3 now names a local frame
+slot, `target2`, and the verifier bounds it as one.  A v29 binary would
+read such a root as a value and raise NotLValueEx.)
 
 (v29 changes no encoding: one opcode was APPENDED - CheckNoneArgsV, which
 stands before a call whose argument may hold `none` and refuses a `none`
