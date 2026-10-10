@@ -729,6 +729,19 @@ static const std::vector<test> tests =
         &typeid(CannotRebindConstEx),
     },
 
+    /* A compound or an inc-dec of a builtin name refuses the store in
+     * every engine (the VM refused to compile both): the compound carets
+     * the target, an inc-dec the whole expression - the tree-walker's. */
+    { "err loc: a compound into a builtin name refuses the store",
+      { "len += runtime(1);" },
+      &typeid(CannotRebindBuiltinEx), 1, 1, 5, 1 },
+    { "err loc: an inc-dec of a builtin name refuses the store",
+      { "len++;" },
+      &typeid(CannotRebindBuiltinEx), 1, 1, 7, 1 },
+    { "err loc: an inc-dec value of a builtin name refuses the store",
+      { "var dyn z = --len;" },
+      &typeid(CannotRebindBuiltinEx), 13, 1, 19, 1 },
+
     {
         "multi-assign into a builtin name is refused",
         {

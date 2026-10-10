@@ -549,11 +549,14 @@ bool builtin_requires_lvalue_arg0(std::string_view name)
 
 bool incdec_lvalue_pure(const Construct *lv)
 {
+    /* (a builtin name too: its read is the builtin's value and its
+     * mutation the rebind throw, compile_boxed_stmt's inc-dec arm) */
     if (const Identifier *id = dynamic_cast<const Identifier *>(lv))
-        return !id->is_const
-            && (id->sym.kind == SymKind::local
-                || id->sym.kind == SymKind::global
-                || id->sym.kind == SymKind::capture);
+        return id->sym.kind == SymKind::builtin
+            || (!id->is_const
+                && (id->sym.kind == SymKind::local
+                    || id->sym.kind == SymKind::global
+                    || id->sym.kind == SymKind::capture));
     if (const Subscript *sub = dynamic_cast<const Subscript *>(lv)) {
         Operand idx;
         /* A flat `a[i]` (slot base + immediate index), OR a NESTED `a[i][j]`
@@ -2954,6 +2957,15 @@ struct Codegen {
         if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
             const Identifier *id =
                 dynamic_cast<const Identifier *>(inc->lvalue.get());
+            /* A builtin name refuses the store (`len++`): the tree-walker's
+             * CannotRebindBuiltinEx, loc-less there and so stamped with the
+             * whole inc-dec's span (a NotLoweredEx until 2026-10-06). The
+             * value form compiles this statement for its mutation. */
+            if (id && id->sym.kind == SymKind::builtin) {
+                emit_throw(Chunk::ThrowKind::rebind_builtin, inc->start,
+                           inc->end, nullptr, ops);
+                return true;
+            }
             if (id && !id->is_const
                 && (id->decl_type == DeclType::none
                     || id->decl_type == DeclType::dyn)) {
@@ -3110,9 +3122,12 @@ struct Codegen {
          * target): a scalar LITERAL target (`0 = 99`, `true = false`, or a
          * const-inlined `K = 6`) -> NotLValueEx(lvalue loc); a BUILTIN-name
          * target (`print = 5`) -> CannotRebindBuiltinEx(lvalue loc). Compile the
-         * rhs for its side effects (+ its own throw), THEN throw. Plain assign
-         * only; a compound rhs takes the compound store path. */
-        if (is_assign) {
+         * rhs for its side effects (+ its own throw), THEN throw. A builtin
+         * target refuses a compound too (`len += 1` - a NotLoweredEx until
+         * 2026-10-06); any other compound takes the compound store path. */
+        const Identifier *tid =
+            dynamic_cast<const Identifier *>(e->lvalue.get());
+        if (is_assign || (tid && tid->sym.kind == SymKind::builtin)) {
             Chunk::ThrowKind tk = Chunk::ThrowKind::not_lvalue;
             const UniqueId *tname = nullptr;
             Loc tstart = e->lvalue->start, tend = e->lvalue->end;
