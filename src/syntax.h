@@ -1811,6 +1811,17 @@ public:
      */
     bool args_cache_safe = false;
 
+    /*
+     * A const-argument SPECIALIZATION (`name$sN`, the inliner's
+     * build_specialization): what each parameter was bound to, as a value
+     * repr (`1`, `[1, 2]`), or "" for one left a parameter - so the REPL's
+     * `:globals` and the `specialize` trace can say what the clone is FOR.
+     * Empty for every other function. COMPILE-only, display only.
+     */
+    std::vector<std::string> spec_args;
+    /* spec_args rendered, " with mode = 1, k = [1, 2]" ("" if none) */
+    std::string spec_args_str() const;
+
     FuncDeclStmt()
         : Construct("FuncDeclStmt", false, ConstructType::func_decl)
         , desc_owner(make_unique<FuncDescriptor>())

@@ -7280,7 +7280,7 @@ private:
 
         TRACE(specialize, 0, std::string(callee->get_str()) +
               "  const arg(s) folded -> " +
-              std::string(clone->id->get_str()));
+              std::string(clone->id->get_str()) + clone->spec_args_str());
 
         /* Redirect to the clone (same args; the const ones are now ignored).
          * Carry the clone's resolved sym onto the new callee so the call reads
@@ -7332,6 +7332,18 @@ private:
 
         if (count_all_nodes(fc->body.get()) >= before)
             return nullptr;        /* folding didn't shrink it: not worth it */
+
+        /* what each bound parameter holds, for `:globals` and the trace */
+        const size_t np = fc->params ? fc->params->elems.size() : 0;
+        fc->spec_args.assign(np, std::string());
+        for (const auto &kv : seed) {
+            if (kv.first < 0 || static_cast<size_t>(kv.first) >= np)
+                continue;
+            std::string r = kv.second.to_string_repr();
+            if (r.size() > 40)
+                r = r.substr(0, 37) + "...";
+            fc->spec_args[static_cast<size_t>(kv.first)] = r;
+        }
 
         /*
          * Give the clone's name a GLOBAL-table slot (script mode), so its decl

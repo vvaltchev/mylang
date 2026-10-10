@@ -1069,13 +1069,46 @@ ReplEngine::Impl::cmd_globals()
     std::vector<Row> rows;
     std::set<const UniqueId *> seen;
 
+    /*
+     * A function's row: its declared signature - except for a CLONE, whose
+     * row says what it is FOR (README: `:globals` shows what each clone
+     * specializes on): a TEMPLATE INSTANCE (`f$0`) each parameter with its
+     * inferred type, and the return type; a const-argument SPECIALIZATION
+     * (`f$s0`) the values it was built for (`with mode = 1`). Both printed
+     * the base's generic signature, `f$0 : func f(a, int b)`.
+     */
+    auto func_row = [&](const FuncDescriptor *d) -> string {
+        const FuncDeclStmt *decl = d->decl;   /* the REPL retains its ASTs */
+        if (decl && !decl->spec_args.empty())
+            return reflect_func_sig(d) + decl->spec_args_str();
+        const std::vector<string> pt =
+            !d->display_name.empty() && decl ? infer.func_param_types(decl)
+                                             : std::vector<string>();
+        if (pt.size() != d->params.size() || pt.empty())
+            return reflect_func_sig(d);
+        string s = d->explicit_pure ? "pure func " : "func ";
+        s += d->display_name + "(";
+        for (size_t i = 0; i < pt.size(); i++) {
+            if (i)
+                s += ", ";
+            if (d->params[i].cnst)
+                s += "const ";
+            s += pt[i] + " " + string(d->params[i].name->val);
+        }
+        s += ")";
+        const string ret = infer.func_return_type(decl);
+        if (!ret.empty())
+            s += " -> " + ret;
+        return s;
+    };
+
     auto classify = [&](const UniqueId *uid, const EvalValue &v,
                         bool is_const) -> Row {
         Row r;
         r.name = string(uid->val);
         if (v.is<intrusive_ptr<FuncObject>>()) {
             r.kind = "func";
-            r.type = reflect_func_sig(v.get<intrusive_ptr<FuncObject>>()->func);
+            r.type = func_row(v.get<intrusive_ptr<FuncObject>>()->func);
         } else if (v.is<StructTypeDef *>()) {
             r.kind = v.get<StructTypeDef *>()->is_class ? "class type"
                                                         : "struct type";
