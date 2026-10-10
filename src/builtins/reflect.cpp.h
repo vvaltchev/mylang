@@ -178,6 +178,38 @@ std::string reflect_struct_ctor(const StructTypeDef *def)
 
 static std::string reflect_typeof_rec(const EvalValue &e, CycStack &st);
 
+/* Do two array elements have one type, as far as an array's element type
+ * goes: the same value kind - and, for a struct, class or box<P>, the
+ * same type and the same box-ness; for a box of a scalar or a string, the
+ * same element kind (a box<int> and a box<float> are two types). */
+static bool reflect_same_kind(const EvalValue &a, const EvalValue &b)
+{
+    const int t = a.get_type()->t;
+    if (t != b.get_type()->t)
+        return false;
+    if (t == Type::t_struct) {
+        const StructObject &x = *a.get_ref<intrusive_ptr<StructObject>>();
+        const StructObject &y = *b.get_ref<intrusive_ptr<StructObject>>();
+        return x.def == y.def && x.boxed == y.boxed;
+    }
+    if (t == Type::t_box)
+        return a.get_ref<intrusive_ptr<BoxObj>>()->kind
+            == b.get_ref<intrusive_ptr<BoxObj>>()->kind;
+    return true;
+}
+
+/* The element type of a box of a scalar or a string, by its kind. */
+static const char *reflect_box_elem(char kind)
+{
+    switch (kind) {
+        case 'i': return "int";
+        case 'f': return "float";
+        case 'b': return "bool";
+        case 's': return "str";
+        default:  return "?";
+    }
+}
+
 /* The structural type of an array value, from its storage kind (probing a
  * general array's elements for a homogeneous element type). */
 static std::string reflect_array_type(const SharedArrayObj &a, CycStack &st)
@@ -199,9 +231,8 @@ static std::string reflect_array_type(const SharedArrayObj &a, CycStack &st)
         return "array<dyn>";
 
     const EvalValue e0 = arr_elem_at(a, 0);
-    const int t0 = e0.get_type()->t;
     for (size_type i = 1; i < n; i++)
-        if (arr_elem_at(a, i).get_type()->t != t0)
+        if (!reflect_same_kind(arr_elem_at(a, i), e0))
             return "array<dyn>";                      /* heterogeneous */
     return std::string("array<") + reflect_typeof_rec(e0, st) + ">";
 }
@@ -247,9 +278,16 @@ static std::string reflect_typeof_rec(const EvalValue &e, CycStack &st)
         case Type::t_structtype:
             return std::string("type ") +
                    std::string(e.get<StructTypeDef *>()->name->val);
-        case Type::t_struct:
-            return std::string(
-                e.get<intrusive_ptr<StructObject>>()->def->name->val);
+        case Type::t_struct: {
+            /* a box<P> is a StructObject too (`boxed`), README: box<P> */
+            const StructObject &o = *e.get_ref<intrusive_ptr<StructObject>>();
+            const std::string name(o.def->name->val);
+            return o.boxed ? "box<" + name + ">" : name;
+        }
+        case Type::t_box:
+            return std::string("box<") +
+                   reflect_box_elem(e.get_ref<intrusive_ptr<BoxObj>>()->kind) +
+                   ">";
         case Type::t_arr:
             return reflect_array_type(e.get_ref<SharedArrayObj>(), st);
         case Type::t_dict:

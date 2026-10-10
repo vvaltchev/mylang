@@ -787,8 +787,8 @@ ReplEngine::Impl::cmd_globals()
             r.type = reflect_struct_ctor(v.get<StructTypeDef *>());
         } else if (v.is<intrusive_ptr<StructObject>>()) {
             r.kind = is_const ? "const" : "var";
-            r.type = string(
-                v.get<intrusive_ptr<StructObject>>()->def->name->val);
+            /* the struct's or class's name - or box<P> for a box */
+            r.type = reflect_typeof(v);
         } else {
             r.kind = is_const ? "const" : "var";
             /* the inferred/declared static type (richer than the runtime kind:
