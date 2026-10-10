@@ -87,7 +87,7 @@ static std::string reflect_annot_str(const TypeAnnot *ta)
     return s;
 }
 
-static std::string reflect_field_type(const FieldDef &f)
+std::string reflect_field_type(const FieldDef &f)
 {
     /* a parameterized container (`array<int>`, `dict<str,P>`): the annot
      * carries the full element type (with its own `?` for nullability). */
