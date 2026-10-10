@@ -350,6 +350,34 @@ static bool func_is_cacheable_recursive(const FuncDeclStmt *fd)
 static void fmi_children(Construct *c,
                          const std::function<void(Construct *)> &fn);
 
+/* The names a program ASSIGNS anywhere (`sq = ng;`, at any depth, a
+ * declaration excluded) - by NAME. The resolver's rebound_names; the REPL's
+ * cross-input seeding asks it too: a prior input's function bound to a name
+ * THIS input assigns is not what a call through the name reaches. */
+static void collect_rebound_names(
+    Construct *c, std::unordered_set<const UniqueId *> &out)
+{
+    if (!c)
+        return;
+    if (ctag(c) == ConstructType::expr14) {
+        auto *e = static_cast<Expr14 *>(c);
+        if (!(e->fl & pFlags::pInDecl)) {
+            Construct *lv = e->lvalue.get();
+            if (ctag(lv) == ConstructType::id)
+                out.insert(static_cast<Identifier *>(lv)->uid);
+            else if (ctag(lv) == ConstructType::idlist)
+                for (auto &x : static_cast<IdList *>(lv)->elems)
+                    out.insert(x->uid);
+        }
+    }
+    if (ctag(c) == ConstructType::func_decl)
+        collect_rebound_names(
+            static_cast<FuncDeclStmt *>(c)->body.get(), out);
+    fmi_children(c, [&](Construct *ch) {
+        collect_rebound_names(ch, out);
+    });
+}
+
 /* Is `id` a global-table name the program ASSIGNS somewhere (`sq = ng;`)?
  * The resolver publishes the reassigned slots on the root block
  * (global_slot_reassigned); a function bound to such a name is a VALUE the
@@ -373,7 +401,9 @@ class AutoConst {
 public:
 
     explicit AutoConst(AnalysisInfo *a = nullptr,
-                       EvalContext *prior_pure = nullptr, bool repl = false)
+                       EvalContext *prior_pure = nullptr, bool repl = false,
+                       const std::unordered_set<const UniqueId *> *rebound =
+                           nullptr)
         : cctx(nullptr, true), analysis(a), repl_mode(repl)
     {
         /* REPL: seed the fold context with the prior inputs' effectively-pure
@@ -383,11 +413,16 @@ public:
          * its body still resolves its callees against the runtime scope. Only
          * pure FUNCTIONS are seeded (never a runtime var), so folding stays
          * sound; a current-input redefinition redirects to its own (new)
-         * instance, so a stale prior instance here is never used. */
+         * instance, so a stale prior instance here is never used. A name
+         * this input ASSIGNS (`rebound`) is not seeded: the value it holds
+         * when a call through it runs is not the one it holds now -
+         * `gf = func(y) => y * 2; gf(3)` folded to the OLD lambda's 4. */
         if (prior_pure) {
             std::vector<std::pair<const UniqueId *, const LValue *>> syms;
             prior_pure->collect_symbols(syms);
             for (const auto &kv : syms) {
+                if (rebound && rebound->count(kv.first))
+                    continue;
                 const EvalValue &v = kv.second->get();
                 if (v.is<intrusive_ptr<FuncObject>>() &&
                     v.get<intrusive_ptr<FuncObject>>()->func->effective_pure &&
@@ -1357,11 +1392,15 @@ public:
 
         /* REPL: a function from an earlier input that is effectively pure lets
          * a NEW function calling it is recognized pure too (cross-input
-         * auto-pure propagation - see func_body_is_pure / pure_func_names). */
+         * auto-pure propagation - see func_body_is_pure / pure_func_names).
+         * Not a name this input assigns: what a call through it reaches is
+         * no longer the function it holds now. */
         if (prior_pure) {
             std::vector<std::pair<const UniqueId *, const LValue *>> syms;
             prior_pure->collect_symbols(syms);
             for (const auto &kv : syms) {
+                if (rebound_names.count(kv.first))
+                    continue;
                 const EvalValue &v = kv.second->get();
                 if (v.is<intrusive_ptr<FuncObject>>() &&
                     v.get<intrusive_ptr<FuncObject>>()->func->effective_pure)
@@ -1461,7 +1500,8 @@ public:
          * counts just collected; the top-level frame's in main_st.writes).
          * prior_pure seeds the fold context so cross-input pure calls fold. */
         if (auto *rb = dynamic_cast<Block *>(root))
-            AutoConst(analysis, prior_pure, repl_mode).run(rb, main_st.writes);
+            AutoConst(analysis, prior_pure, repl_mode, &rebound_names)
+                .run(rb, main_st.writes);
     }
 
 private:
@@ -2412,30 +2452,6 @@ private:
      * auto-purity nor any fold may assume the declared body. By NAME, so a
      * same-named local costs a missed optimization, never an answer. */
     std::unordered_set<const UniqueId *> rebound_names;
-
-    static void collect_rebound_names(
-        Construct *c, std::unordered_set<const UniqueId *> &out)
-    {
-        if (!c)
-            return;
-        if (ctag(c) == ConstructType::expr14) {
-            auto *e = static_cast<Expr14 *>(c);
-            if (!(e->fl & pFlags::pInDecl)) {
-                Construct *lv = e->lvalue.get();
-                if (ctag(lv) == ConstructType::id)
-                    out.insert(static_cast<Identifier *>(lv)->uid);
-                else if (ctag(lv) == ConstructType::idlist)
-                    for (auto &x : static_cast<IdList *>(lv)->elems)
-                        out.insert(x->uid);
-            }
-        }
-        if (ctag(c) == ConstructType::func_decl)
-            collect_rebound_names(
-                static_cast<FuncDeclStmt *>(c)->body.get(), out);
-        fmi_children(c, [&](Construct *ch) {
-            collect_rebound_names(ch, out);
-        });
-    }
 
     /* Pass 2: function bodies are already resolved, so don't re-enter them. */
     bool top_level_only = false;
@@ -4987,10 +5003,15 @@ public:
          * define, so a current redefinition wins (and a redirected call already
          * points at the current input's own instance). */
         if (prior_scope) {
+            /* nor for a name this input ASSIGNS: a call through it reaches
+             * whatever it holds by then, not the prior function */
+            std::unordered_set<const UniqueId *> assigned;
+            collect_rebound_names(root, assigned);
             std::vector<std::pair<const UniqueId *, const LValue *>> syms;
             prior_scope->collect_symbols(syms);
             for (const auto &kv : syms) {
-                if (funcs.count(kv.first) || spec_funcs.count(kv.first))
+                if (funcs.count(kv.first) || spec_funcs.count(kv.first)
+                        || assigned.count(kv.first))
                     continue;
                 const EvalValue &v = kv.second->get();
                 if (!v.is<intrusive_ptr<FuncObject>>())

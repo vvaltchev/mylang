@@ -21966,6 +21966,31 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* a lambda variable reassigned in a LATER input: the callee-set
+     * analysis answered the declared lambda alone (the rebinding writes
+     * were an earlier input's), and the REPL instantiated and folded it */
+    { "a lambda variable reassigned across inputs calls what it holds",
+      { { "var gf13 = func(x) => x + 1", "" },
+        { "gf13 = func(y) => y * 2", "" },
+        { "gf13(3)", "=> 6" },
+        { "print(gf13(3))", "6" },
+        { "var gh13 = func(x) => x + 1", "" },
+        { "gh13 = func(y) => y * 3; gh13(3)", "=> 9" },
+        { "gh13(2)", "=> 6" },
+        /* a NAMED function's name rebound by the input that calls it:
+         * the inliner registered the prior function by name */
+        { "func fn13(x) => x + 1", "" },
+        { "fn13 = func(y) => y * 5; fn13(3)", "=> 15" },
+        { "func ca13() => fn13(2)", "" },
+        { "ca13()", "=> 10" },
+        /* nor is a function calling it pure on the prior value's word:
+         * cb13 would be folded - run at compile time - and its call's
+         * output printed outside the input's run */
+        { "func pf13(x) => x + 1", "" },
+        { "pf13 = func(y) { print(\"side\"); return y; };"
+          " func cb13() => pf13(1)", "" },
+        { "cb13()", "side \n=> 1" } } },
+
     /* `:globals` shows what each template instance is FOR - its inferred
      * parameter and return types; every instance used to print the
      * base's generic signature */

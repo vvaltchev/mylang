@@ -3872,7 +3872,14 @@ writes mutable global state that may differ at the new site (and its result
 isn't compile-time-known anyway), so it is left a runtime call. Only pure
 *functions* are seeded (never a runtime var); registration skips any name the
 current input defines, so a redefinition wins and a redirected call already
-points at the current input's own instance. **A prior input's body is
+points at the current input's own instance - **and any name the current
+input ASSIGNS** (`collect_rebound_names`, now file-scope, asked by all three
+seeding sites): the name holds the prior function only until the input
+rebinds it, so `gf = func(y) => y * 2; gf(3)` folded to the OLD lambda's
+answer. The callee-set analysis has the same open-world rule for a rebound
+NAME: a pinned symbol's points-to set is the current input's only, so a
+rebound pinned name is ⊤ (it answered the declared lambda, and the
+inferencer instantiated it). **A prior input's body is
 POST-specialization** (it already ran `specialize_types`, so it can hold M8
 `TypedScalarExpr` nodes — which the inliner never sees in a normal single
 compilation, since it runs *before* `specialize_types`). So
