@@ -255,6 +255,8 @@ public:
     void setup();                  /* once: bottom + global scope */
     void infer_input(Block *root); /* REPL: one input, commit+pin its globals */
     void reject_input();           /* REPL: take the last input back */
+    /* REPL: forget what a part-run input's unreached decls committed */
+    void forget_unbound(const std::function<bool (const UniqueId *)> &ran);
     void undef_global(const UniqueId *name);  /* REPL undef(x) */
     void dump_debug_ti(std::ostream &os);   /* --debug-ti */
     void dump_callee_sets(std::ostream &os); /* -dcs (see calleeset.cpp.h) */
@@ -2647,6 +2649,39 @@ void Inferencer::reject_input()
 {
     if (global)
         restore_last_input();
+}
+
+/*
+ * REPL: an input infer_input accepted RAN and failed part-way. The
+ * statements after the failing one - and the failing one, when it was a
+ * declaration whose value threw - never bound their names at run time,
+ * yet their types were committed: `var dyn? q5 = nope()` failed, and a
+ * later `q5.v` was refused as a possibly-none member base where the
+ * program deserved "Undefined variable 'q5'". Each global the input
+ * (re)bound in the scope and `ran` denies goes back to its binding before
+ * the input. The statements that completed keep theirs, as their run-time
+ * bindings stay.
+ */
+void Inferencer::forget_unbound(
+    const std::function<bool (const UniqueId *)> &ran)
+{
+    if (!global)
+        return;
+    std::vector<const UniqueId *> forget;
+    for (const auto &kv : global->syms) {
+        const auto it = last_input.globals.find(kv.first);
+        const bool bound_here =
+            it == last_input.globals.end() || it->second != kv.second;
+        if (bound_here && !ran(kv.first))
+            forget.push_back(kv.first);
+    }
+    for (const UniqueId *name : forget) {
+        const auto it = last_input.globals.find(name);
+        if (it == last_input.globals.end())
+            global->syms.erase(name);
+        else
+            global->syms[name] = it->second;
+    }
 }
 
 /* REPL `undef(x)`: drop a global from the committed set so a later `var x` of a
@@ -9116,6 +9151,14 @@ void ReplInfer::reject_input()
 {
     if (impl->can_reject)
         impl->inf.reject_input();
+    impl->can_reject = false;
+}
+
+void ReplInfer::forget_unbound(
+    const std::function<bool (const UniqueId *)> &ran)
+{
+    if (impl->can_reject)
+        impl->inf.forget_unbound(ran);
     impl->can_reject = false;
 }
 

@@ -169,6 +169,13 @@ public:
      * typed. */
     void reject_input();
 
+    /* An input check_input accepted that then FAILED WHILE RUNNING: the
+     * declarations it never reached bound nothing, so each global it
+     * committed and `ran(name)` denies goes back to what it was before
+     * the input (unbound, or its earlier binding) - its committed type
+     * must not stand for a name the run never defined. */
+    void forget_unbound(const std::function<bool (const UniqueId *)> &ran);
+
     /* The inferred static type string of a committed global (or "" if the name
      * is not a committed inferred symbol - e.g. a const scalar folded away).
      * Backs the REPL :globals enrichment. */

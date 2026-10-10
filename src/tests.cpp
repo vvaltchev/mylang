@@ -21948,6 +21948,21 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* an input that fails WHILE RUNNING keeps what its completed statements
+     * defined, and nothing of the declarations it never reached: their
+     * committed types stood for names the run never defined, so a later
+     * use was refused over a type ('dyn?') instead of reporting the
+     * undefined name */
+    { "a part-run input commits no type for a declaration it never ran",
+      { { "var dyn? q5 = nope5()", "Undefined variable 'nope5'" },
+        { "q5.v", "Undefined variable 'q5'" },
+        { "var ra7 = [1]", "" },
+        { "var q6 = 1; var q7 = ra7[3]; var q8 = 3", "OutOfBoundsEx" },
+        { "q6", "=> 1" },
+        { "q6 = \"x\"", "TypeMismatchEx" },
+        { "q7 = \"t\"", "=> \"t\"" },
+        { "q8 = \"s\"", "=> \"s\"" } } },
+
     /* a REFUSED input commits nothing - not its struct declarations (the
      * opt-field check re-checks every declared struct on every input, so
      * one left behind refused every later input with its error), not a
