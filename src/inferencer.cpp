@@ -373,6 +373,9 @@ private:
         std::unordered_map<const UniqueId *, TypeSym *> globals;
         std::unordered_map<std::string, const UniqueId *> tmpl_cache;
         std::unordered_map<FuncInfo *, int> tmpl_inst_count;
+        std::unordered_map<const UniqueId *, const StructTypeDef *>
+            struct_by_name;
+        std::unordered_set<const StructTypeDef *> declared_structs;
     } last_input;
     void restore_last_input();
     /* Value-instantiated clones' uniform signatures - seeded into the
@@ -666,6 +669,22 @@ Scope *Inferencer::new_scope(Scope *parent)
     Scope *s = all_scopes.back().get();
     s->parent = parent;
     return s;
+}
+
+/*
+ * A REPL input that REDEFINES a function or a struct over a committed
+ * (pinned) global binds a FRESH symbol, never rewrites the pinned one in
+ * place. The rewrite (`sym->func = fi`) outlived the input's rejection -
+ * restoring the global scope puts back the same, already rewritten
+ * object - so a REFUSED redefinition stayed in force: after
+ * `func f(x) => "s"; int bad = "x"` was refused, `f(1)` ran its body. A
+ * script never pins, so this is the REPL's alone. (A `var` redeclaration
+ * keeps the pinned symbol on purpose: it is checked against the committed
+ * type.)
+ */
+static bool redeclare_fresh(const TypeSym *s)
+{
+    return s && s->pinned;
 }
 
 TypeSym *Inferencer::new_sym(const UniqueId *name, Scope *s, Loc loc,
@@ -2542,6 +2561,11 @@ void Inferencer::infer_input(Block *rootBlock)
      */
     last_input.tmpl_cache = tmpl_cache;
     last_input.tmpl_inst_count = tmpl_inst_count;
+    /* the struct tables too: check_opt_struct_fields re-checks EVERY
+     * declared struct on every input, so a refused one left behind made
+     * the whole session refuse each later input with its error */
+    last_input.struct_by_name = struct_by_name;
+    last_input.declared_structs = declared_structs;
 
     /*
      * SCOPE THE NODE-KEYED MAPS TO ONE INPUT. id_sym / func_of_decl are keyed
@@ -2606,6 +2630,8 @@ void Inferencer::restore_last_input()
     global->syms = last_input.globals;
     tmpl_cache = last_input.tmpl_cache;
     tmpl_inst_count = last_input.tmpl_inst_count;
+    struct_by_name = last_input.struct_by_name;
+    declared_structs = last_input.declared_structs;
 }
 
 /*
@@ -3784,9 +3810,10 @@ void Inferencer::declare_structdecl(StructDeclStmt *sd, Scope *s)
     if (sd->id) {
         const UniqueId *nm = sd->id->uid;
         auto it = s->syms.find(nm);
-        TypeSym *sym = (it != s->syms.end()) ? it->second
-                                             : new_sym(nm, s, sd->start,
-                                                       sd->id->end);
+        /* a REPL redefinition binds a fresh symbol (redeclare_fresh) */
+        TypeSym *sym = (it != s->syms.end() && !redeclare_fresh(it->second))
+                           ? it->second
+                           : new_sym(nm, s, sd->start, sd->id->end);
         sym->struct_type = def;
         sym->type = A.dyn_ty();
         id_sym[sd->id.get()] = sym;
@@ -3897,8 +3924,10 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
         const UniqueId *nm = fd->id->uid;
         TypeSym *sym;
         auto it = s->syms.find(nm);
-        sym = (it != s->syms.end()) ? it->second
-                                    : new_sym(nm, s, fd->start, fd->id->end);
+        /* a REPL redefinition binds a fresh symbol (redeclare_fresh) */
+        sym = (it != s->syms.end() && !redeclare_fresh(it->second))
+                  ? it->second
+                  : new_sym(nm, s, fd->start, fd->id->end);
         sym->func = fi;
         sym->named_func = true;
         id_sym[fd->id.get()] = sym;

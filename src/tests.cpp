@@ -21948,6 +21948,33 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* a REFUSED input commits nothing - not its struct declarations (the
+     * opt-field check re-checks every declared struct on every input, so
+     * one left behind refused every later input with its error), not a
+     * function's redefinition (it rewrote the committed symbol, so the
+     * refused body ran from then on), and not what the PARSER bound in
+     * the const context (a refused const, struct or pure func stayed what
+     * a later input folded or resolved) */
+    { "a refused input leaves no struct and no redefinition behind",
+      { { "struct A1 { opt B1 u; } struct B1 { int x; }",
+          "'opt' is only allowed" },
+        { "var z1 = 1", "=> 1" },
+        { "struct B1 { int x; }", "" },
+        { "B1(4).x", "=> 4" },
+        { "func f1(x) => 1", "" },
+        { "func f1(x) => \"s\"; int bad1 = \"x\"", "TypeMismatchEx" },
+        { "f1(1)", "=> 1" },
+        { "func f1(x) => 2", "" },
+        { "f1(1)", "=> 2" },
+        { "struct S1 { int x; }", "" },
+        { "struct S1 { str x; } int bad2 = \"x\"", "TypeMismatchEx" },
+        { "S1 sp1 = S1(5)", "=> S1(x: 5)" },
+        { "pure func pf1() => 1", "" },
+        { "pure func pf1() => 2; int bad3 = \"x\"", "TypeMismatchEx" },
+        { "pf1()", "=> 1" },
+        { "const K1 = 5; int bad4 = \"x\"", "TypeMismatchEx" },
+        { "K1", "Undefined variable 'K1'" } } },
+
     /* a call the AST inliner splices into a TOP-LEVEL statement takes new
      * slots of main's frame - its argument temps (`$a0 = kk`) and its
      * callee's locals - and the REPL ran its top level with no frame:
