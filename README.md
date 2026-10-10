@@ -328,6 +328,9 @@ aspects:
     is explicitly re-declared using `var`, in a nested block.
 
   - All expression statements must end with `;` like in `C`, `C++`, and `Java`.
+    An extra `;` is an empty statement and does nothing, wherever a statement
+    may start: `{ f(); };`, `x = 1;;` and a block that begins with `;` are
+    all fine.
 
   - `true` and `false` are the two values of a real `bool` type (so
     `type(true) == "bool"`, distinct from `int`). `bool` sits at the bottom of

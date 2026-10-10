@@ -393,6 +393,24 @@ static const std::vector<test> tests =
       &typeid(TypeErrorEx), 22, 2, 27, 2 },
 
     /*
+     * An extra `;` is an empty statement wherever a statement may start:
+     * first in a block (a leading `;`, or one right after a leading braced
+     * block) as well as after a statement - the first two were syntax
+     * errors while the third was not.
+     */
+    { "empty statement: a ';' first in a block or after a block is skipped", {
+        "var n = 0;",
+        "{ n = n + 1; };",
+        "if (runtime(true)) { { n = n + 10; }; n = n + 100; }",
+        "; n = n + 1000;",
+        "if (runtime(true)) { ; n = n + 10000; ;; }",
+        "func f(int k) { ; { k = k + 1; }; return k; }",
+        "while (n < 0) { ; }",
+        "assert(n == 11111);",
+        "assert(f(runtime(5)) == 6);",
+      } },
+
+    /*
      * #97 R2/R2b: a closure whose captures are all frame locals is built
      * by the lean constructor, which copies an int/float/bool capture by
      * its payload WORD and anything else by the ordinary value copy.
