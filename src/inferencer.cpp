@@ -102,6 +102,21 @@ struct TypeSym {
      */
     bool round_got_dyn = false;
     bool coerces_dyn = false;
+    /*
+     * A contribution whose type the fixpoint could not settle (Unknown at
+     * the top): this round, and as of the last committed round. A local
+     * that ends Unknown having received one is NOT unconstrained - it was
+     * assigned values of an unknowable type (an undefined name, a call to
+     * one, a parameter no call site feeds) - so it finalizes `dyn`, not
+     * `none`, and `untyped_dyn` exempts it from the mandatory-dyn rule:
+     * an undefined name is the resolver's error to report (the inferencer
+     * runs first, and its "type 'none'" NullabilityEx hid "Undefined
+     * variable"), and a `defined()`-guarded branch reading one is
+     * deleted, never run.
+     */
+    bool round_got_unknown = false;
+    bool got_unknown = false;
+    bool untyped_dyn = false;
     /* A PARAMETER's contributed scalar kinds (bit per ArgKind), per round
      * and as of the last committed round: what stamp_inferred_param_types
      * reads to stamp a decl_type only where a bind can actually CONVERT
@@ -1983,12 +1998,18 @@ void Inferencer::infer_one(Block *rootBlock)
                              (!s->is_param && is_optish(s->type));
             s->type = A.with_opt(A.dyn_ty(), opt);
         } else {
-            if (is_unknown(s->type))
+            if (is_unknown(s->type)) {
                 /* An unconstrained PARAM (never concretely called) or foreach
                  * loop var (container was Unknown/dyn) is `dyn` - it could be
-                 * anything. A plain unconstrained local is `none`. */
-                s->type = (s->is_param || s->is_loopvar) ? A.dyn_ty()
-                                                         : A.none_ty();
+                 * anything. A plain unconstrained local is `none` - but one
+                 * ASSIGNED only values of an unknowable type is `dyn` too,
+                 * untyped (see TypeSym::got_unknown). */
+                const bool untyped =
+                    !s->is_param && !s->is_loopvar && s->got_unknown;
+                s->type = (s->is_param || s->is_loopvar || untyped)
+                              ? A.dyn_ty() : A.none_ty();
+                s->untyped_dyn = untyped;
+            }
             if (s->opt_decl)
                 s->type = A.with_opt(s->type, true);
         }
@@ -2720,9 +2741,11 @@ void Inferencer::enforce_concrete_decls()
          * descriptor, not a value), params (a never-called func's param is
          * legitimately `dyn` and has no `var` to annotate), foreach loop vars
          * (their type is derived from the container, which carries any `dyn`),
-         * and builtins (no decl loc). */
+         * builtins (no decl loc), and a local assigned only values of an
+         * unknowable type (untyped_dyn: its `dyn` is not the program's
+         * choice - see TypeSym::got_unknown). */
         if (s->dyn_decl || s->func || s->struct_type || s->is_param ||
-            s->is_loopvar || s->pinned || !s->decl_loc)
+            s->is_loopvar || s->pinned || !s->decl_loc || s->untyped_dyn)
             continue;
 
         if (!type_has_dyn(s->type, strict_deep))
@@ -5121,6 +5144,7 @@ void Inferencer::reset_round()
         if (s->func || s->pinned)   /* pinned: a prior input's fixed type */
             continue;
         s->round_got_dyn = false;   /* dyn-into-concrete coercion tracking */
+        s->round_got_unknown = false;
         s->round_arg_kinds = 0;
         /* A scalar annotation pins the type: seed the accumulator with the
          * declared type so it stays fixed (contribute() keeps it and checks
@@ -5142,6 +5166,7 @@ void Inferencer::commit_round()
         if (s->func || s->pinned)
             continue;
         s->arg_kinds = s->round_arg_kinds;
+        s->got_unknown = s->round_got_unknown;
         /*
          * dyn-into-concrete coercion decision (see contribute): a dyn value was
          * assigned to this plain `var`. If the NON-dyn contributions gave a
@@ -5200,6 +5225,8 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
         /* which scalar kinds reach the symbol (see TypeSym::arg_kinds): a
          * param's decides its bind coercion, a local's its store one */
         const StaticTypeRef k = static_type_resolve(t);
+        if (k && k->kind == StaticTypeKind::Unknown)
+            s->round_got_unknown = true;    /* see TypeSym::got_unknown */
         if (k && k->kind == StaticTypeKind::Bool)
             s->round_arg_kinds |= ARGK_BOOL;
         else if (k && k->kind == StaticTypeKind::Int)
@@ -6398,7 +6425,13 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
                                "in a comparison");
                 StaticTypeRef l = strip(static_type_resolve(left));
                 StaticTypeRef r = strip(static_type_resolve(right));
-                if (!is_dyn(l) && !is_dyn(r)) {
+                /* an operand the fixpoint could not type (an undefined
+                 * name - the resolver's error, or a `defined()`-guarded
+                 * one whose branch is deleted) decides nothing, as in the
+                 * arithmetic and unary checks: "cannot compare '?'" was
+                 * reported first */
+                if (!is_dyn(l) && !is_dyn(r)
+                        && !is_unknown(l) && !is_unknown(r)) {
                     bool ok = (is_num(l) && is_num(r)) ||
                               (l->kind == StaticTypeKind::Str &&
                                r->kind == StaticTypeKind::Str);
