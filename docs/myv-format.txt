@@ -2,8 +2,13 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 35.  This document describes the on-disk image exhaustively:
+Format version 36.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v36: a Param (8) ENDS with a uid, `sig_type` - the parameter's annotation
+as signature() renders it (`P p`, `array<int> a`, `dict<str,P>? d`, `box<int>
+b`), null when its DeclType keyword says it all.  It is display text only:
+nothing binds, checks or dispatches on it.)
 
 (v35: FieldKind (section 13) gains `8 f_box` and DeclType `9 box` - a
 `box<T>` field and parameter (plans/class-and-box.md, step 3) - and two
@@ -336,8 +341,9 @@ Notation used throughout this document:
                   field), a ThrowSite's name (except an undefined_var one),
                   a BuiltinCall's member (except one a CallBuiltinLVMember
                   op uses), an IncDecSite's memUid (except one an
-                  IncDecMemberCheckedV op uses) and a CallSite's a0_name
-                  (except in the `undef` form).  Every other uid - a
+                  IncDecMemberCheckedV op uses), a CallSite's a0_name
+                  (except in the `undef` form) and a Param's sig_type.
+                  Every other uid - a
                   struct's, field's, const's, parameter's or capture's name,
                   a member key, an emplace callee, a builtin's name, a
                   global slot's name - is refused when null.
@@ -619,6 +625,11 @@ whole call model reads it, never an AST node.
                                     opposed to the one the source DECLARED
                                     (decl_type): the JIT elides a bind-time
                                     type store when the two agree (C3).
+        uid   sig_type              v36 - the annotation as the source
+                                    wrote it, `[opt] TYPE`, when decl_type
+                                    alone cannot say it: a struct, a
+                                    parameterized container, a box.  May be
+                                    null.  Read by signature() only.
 
     Capture:
         uid   name

@@ -3583,7 +3583,10 @@ compiler's error messages.
 #### `signature(f)`
 Return a function's declared signature as a string, e.g.
 `"pure func hypot(float a, float b)"` — reflecting `pure`, `const`/`opt`/`dyn`
-modifiers and type annotations on each parameter. Given a **struct type** (or a
+modifiers and type annotations on each parameter, written as declared
+(`"func f(Point p, array<int> a, dict<str,Point>? d, box<int> b)"`; an
+annotated container or box takes the `?` suffix, any other type the `opt`
+prefix, as in a struct's signature). Given a **struct type** (or a
 struct **instance**) it returns the constructor form, e.g. `"Point(int x, int
 y)"`.
 

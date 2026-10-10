@@ -120,12 +120,40 @@ std::string reflect_field_type(const FieldDef &f)
     return s;
 }
 
+std::string reflect_decl_annot(DeclType dt, const StructTypeDef *strct,
+                               const TypeAnnot *annot, bool opt)
+{
+    if (annot && (dt == DeclType::arr || dt == DeclType::dict ||
+                  dt == DeclType::box)) {
+        std::string t = reflect_annot_str(annot);
+        if (opt && (t.empty() || t.back() != '?'))
+            t += "?";
+        return t;
+    }
+    const std::string o = opt ? "opt " : "";
+    if (dt == DeclType::strct)
+        return o + (strct ? std::string(strct->name->val)
+                          : std::string("struct"));
+    if (const char *kw = reflect_decl_type_kw(dt))
+        return o + kw;
+    if (dt == DeclType::dyn)
+        return o + "dyn";
+    return "";
+}
+
 /* One parameter's "[const] [opt] [TYPE|dyn] name" declared form. */
 static std::string reflect_param_str(const FuncDescriptor::ParamDesc &p)
 {
     std::string s;
     if (p.cnst)
         s += "const ";
+    if (p.sig_type) {
+        /* an annotation its keyword cannot say: `P p`, `array<int> a` */
+        s += p.sig_type->val;
+        s += " ";
+        s += std::string(p.name->val);
+        return s;
+    }
     if (p.opt)
         s += "opt ";
     if (const char *t = reflect_decl_type_kw(p.decl_type)) {

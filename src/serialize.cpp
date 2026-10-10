@@ -2049,6 +2049,7 @@ void myv_write(const VmProgram &prog, const std::string &path,
             w.boolv(p.opt); w.boolv(p.cnst); w.boolv(p.dyn_mod);
             w.u8v(static_cast<uint8_t>(p.decl_type));
             w.u8v(static_cast<uint8_t>(p.proven_type));   /* C3, v11 */
+            w.uidv(p.sig_type);                  /* v36, may be null */
         }
         w.u32v(static_cast<uint32_t>(d->captures.size()));
         for (const auto &cp : d->captures) {
@@ -2423,6 +2424,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
                                   "corrupt .myv (param type)");
             p.proven_type = r.enumv(DeclType::box,   /* C3, v11 */
                                     "corrupt .myv (param type)");
+            p.sig_type = r.uidv();               /* v36, may be null */
             d.params.push_back(p);
         }
         const uint32_t ncp = r.countv();

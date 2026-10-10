@@ -125,7 +125,7 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 }
 >> >> >> .. .. .. .. .. .. .. .. .. .. .. >> => 16
 >> int func arrs(int n) {
-    array<struct> ps = [P(n, 1), P(2, n)];
+    array<P> ps = [P(n, 1), P(2, n)];
     array<class> cs = [C(n), C(n + 1)];
     int t = 0;
     foreach (var p in ps) {

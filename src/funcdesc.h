@@ -109,6 +109,16 @@ struct FuncDescriptor {
         DeclType proven_type = DeclType::none;
 
         /*
+         * The parameter's annotation as written, `[opt] TYPE`, when its
+         * DeclType keyword alone cannot say it: a struct (`P p`), a
+         * parameterized container (`array<int> a`, `dict<str,P>? d`) or a
+         * box (`box<int> b`). Null otherwise. Read by signature() only
+         * (reflect_param_str); set by sync_params from the Identifier's
+         * decl_struct / decl_annot, stored in a .myv (v36).
+         */
+        const UniqueId *sig_type = nullptr;
+
+        /*
          * "This param slot can never hold a REFERENCE" - an annotated i/f
          * (bind_param's coercion guarantees it) or an inference-proven one
          * (C3, above). TWO consumers must agree on this or one of them is

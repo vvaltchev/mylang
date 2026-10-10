@@ -77,20 +77,6 @@ string escape_string(const std::string_view &sv)
     return out;
 }
 
-/* A var/const/param declared-type keyword for a DeclType, or "" if none. */
-const char *decl_type_kw(DeclType d)
-{
-    switch (d) {
-        case DeclType::b:    return "bool";
-        case DeclType::i:    return "int";
-        case DeclType::f:    return "float";
-        case DeclType::s:    return "str";
-        case DeclType::arr:  return "array";
-        case DeclType::dict: return "dict";
-        default:             return "";
-    }
-}
-
 /* The flat-array element type a hint implies (informative; `array<int>` is not
  * valid script syntax but conveys the specialized storage). */
 const char *arr_hint_type(ArrHint h)
@@ -627,8 +613,13 @@ struct Renderer {
         const string prefix = string(is_const ? "const " : "") +
                               (lv->opt_mod ? "opt " : "");
         if (lv->decl_type != DeclType::none)        /* explicit annotation */
-            return prefix + decl_type_kw(lv->decl_type);
+            return string(is_const ? "const " : "") +
+                   reflect_decl_annot(lv->decl_type, lv->decl_struct,
+                                      lv->decl_annot.get(), lv->opt_mod);
         if (rv) {                                   /* best-effort inference */
+            if (rv->arr_hint == ArrHint::flat_s && rv->arr_hint_struct)
+                return prefix + "array<" +
+                       string(rv->arr_hint_struct->name->val) + ">";
             if (const char *at = arr_hint_type(rv->arr_hint))
                 return prefix + at;
             if (auto *lo = dynamic_cast<const LiteralObj *>(rv))
@@ -945,16 +936,20 @@ struct Renderer {
         return s;
     }
 
+    /* `[const] ANNOTATION name` - the annotation as declared, in the form
+     * signature() gives it (`P p`, `array<int>? a`, `opt int o`) - or
+     * `[const] [opt] [dyn] name` for an un-annotated parameter */
     string param_str(const Identifier *p)
     {
         string s;
         if (p->const_param) s += "const ";
-        if (p->opt_mod) s += "opt ";
-        if (const char *t = decl_type_kw(p->decl_type)) {
-            if (*t) { s += t; s += " "; }
-            else if (p->dyn_mod) s += "dyn ";
-        } else if (p->dyn_mod) {
-            s += "dyn ";
+        if (p->decl_type != DeclType::none) {
+            s += reflect_decl_annot(p->decl_type, p->decl_struct,
+                                    p->decl_annot.get(), p->opt_mod);
+            s += " ";
+        } else {
+            if (p->opt_mod) s += "opt ";
+            if (p->dyn_mod) s += "dyn ";
         }
         s += string(p->get_str());
         return s;
