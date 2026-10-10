@@ -17699,6 +17699,17 @@ static const std::vector<test> tests =
     { "infer: a never-called lambda's copy of its parameter is untyped",
       { "var fs = [func(x) { var y = x; return y + 1; }];",
         "assert(len(fs) == 1);" } },
+    /* ...and a NUMERIC local that also receives it coerces it at the
+     * store, as from any dyn: the float an unattributed call passed sat
+     * in an `int` slot (the JIT printed its bits, the VM aborted, the
+     * tree-walker threw) */
+    { "infer: an untyped value stored into a numeric local is coerced",
+      { "var fs = [func(x) { var y = x; if (runtime(false)) { y = 1; }",
+        "                    return y + 1; }];",
+        "var dyn g = runtime(fs[0]);",
+        "assert(g(7) == 8);",
+        "g(2.5);" },
+      &typeid(TypeErrorEx), 25, 1, 31, 1 },
     { "template: a capturing lambda stays the join model",
       { "var b = 10; var add = func(n) => n + b;",
         "assert(add(5) == 15);" } },

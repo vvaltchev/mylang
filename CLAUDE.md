@@ -4731,6 +4731,12 @@ decisions behind it: `plans/archived/type-inference.md`,
   the undefined name. The CHECK PASS must defer on an Unknown operand the
   same way (the arithmetic and unary checks did, the ordering comparison did
   not: "cannot compare '?'" inside a `defined()`-guarded branch, #135).
+  **And a NUMERIC local that received such a value besides its typed ones
+  sets `coerces_dyn`**: the value is a `dyn` at run time (the parameter
+  finalizes `dyn` after the fixpoint, so the coercion rule never saw it),
+  and without the store's coercion an unattributed indirect call left a
+  float in an `int` slot - the JIT printed its bits, the VM aborted, the
+  tree-walker threw (RULE 1 and RULE 2 at once).
 - **Null narrowing** (`check_if`/`narrow_target`, check pass only): inside a
   proven branch a nullable var reads as non-opt — `if (x != none)` / `if (x)`
   (then), `if (x == none) ... else` (else), and the guard clause
