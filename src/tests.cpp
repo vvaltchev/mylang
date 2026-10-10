@@ -762,6 +762,71 @@ static const std::vector<test> tests =
         &typeid(CannotRebindConstEx),
     },
 
+    /* Every kind of const scalar folds to its value, so each is the same
+     * compile error as the int K above; a const ARRAY has a run-time
+     * symbol and its store is refused when it runs - also with a literal
+     * rvalue and a function-local const, where the literal unpack fast
+     * path must decline the const target */
+    { "parse: a const float as a later multi-assign target",
+      { "const KF = 1.5; var a = 0;", "a, KF = [1, 2];" },
+      &typeid(SyntaxErrorEx) },
+    { "parse: a const bool as a later multi-assign target",
+      { "const KB = true; var a = 0;", "a, KB = [1, 2];" },
+      &typeid(SyntaxErrorEx) },
+    { "parse: a const str as a later multi-assign target",
+      { "const KS = \"s\"; var a = 0;", "a, KS = [1, 2];" },
+      &typeid(SyntaxErrorEx) },
+    { "parse: a const none as a later multi-assign target",
+      { "const KZ = none; var a = 0;", "a, KZ = [1, 2];" },
+      &typeid(SyntaxErrorEx) },
+    { "multi-assign of a literal into a const array target is refused",
+      { "const KA = [1]; var a = 0;", "a, KA = [1, [2]];" },
+      &typeid(CannotRebindConstEx) },
+    { "multi-assign of a literal into a function's const target is refused",
+      { "func k() { const KL = [1]; var a = 0; a, KL = [1, [2]];",
+        "           return a; }",
+        "k();" },
+      &typeid(CannotRebindConstEx) },
+    /* an element before the comma is not a multi-assignment target (an id
+     * list holds names only) - nor a folded const */
+    { "parse: an element as a multi-assign target is a syntax error",
+      { "var a = [0]; var b = 0;", "a[0], b = [1, 2];" },
+      &typeid(SyntaxErrorEx) },
+    /* `a, b OP= rhs` validates each `target OP element` at compile time,
+     * as `a OP= v` is validated - it was a run-time TypeErrorEx */
+    { "infer: a compound multi-assignment's operator must apply",
+      { "var s = \"a\"; var u = \"b\";", "s, u -= [1, 2];" },
+      &typeid(TypeMismatchEx), 1, 2, 16, 2 },
+    /* an assignment to a name declared nowhere, in a function body: the
+     * callee-set analysis meets the unresolved target before the resolver
+     * refuses it */
+    { "resolve: an assignment to an undeclared name in a function",
+      { "func f() { zzq = 5; }", "f();" },
+      &typeid(UndefinedVariableEx) },
+    /* The inliner's argument temps: a coercing parameter whose argument
+     * is followed by a temp-bound one is coerced after it (h), and not
+     * when nothing temp-bound follows (h2's b, h3's a); a parameter that
+     * does not coerce is never deferred (h2's a) */
+    { "inline: a parameter's coercion waits for every later argument",
+      { "var trail = \"\";",
+        "func g(int a, b) { return a + b; }",
+        "func g2(a, int b) { return a + b; }",
+        "func tick() { trail += \"t\"; return 1; }",
+        "func h(dyn d) { return g(d, tick()); }",
+        "func h2(dyn d) { return g2(tick(), d); }",
+        "func h3(dyn d) { return g(d, 5); }",
+        "assert(h(runtime(2)) == 3 && h2(runtime(4)) == 5);",
+        "assert(h3(runtime(1)) == 6 && trail == \"tt\");" } },
+    /* an inc-dec whose walk reaches a const element through an impure
+     * index: the final step's base is a VALUE (a read-only container
+     * reads out as one), so the store is NotLValueEx */
+    { "vm: an inc-dec through a read-only element walked to is NotLValueEx",
+      { "const KN = [[1, 2], [3, 4]];",
+        "func spin(int n) { var k = n; while (k > 100) k -= 1; return k; }",
+        "func ix() { return spin(runtime(0)); }",
+        "var dyn z = KN[ix()][0]++;" },
+      &typeid(NotLValueEx) },
+
     /* A compound or an inc-dec of a builtin name refuses the store in
      * every engine (the VM refused to compile both): the compound carets
      * the target, an inc-dec the whole expression - the tree-walker's. */

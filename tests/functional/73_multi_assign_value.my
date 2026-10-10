@@ -208,3 +208,23 @@ assert(caught && c == 5 && a == 8 && b == 9);
 
 print(pair(ri(5)), ret(ri(4)), w, a, b, events, loop(ri(5)), typed(ri(2)),
       globals(), gxy(), cf(ri(1)));
+
+# a compound multi-assignment into a dyn target, and of a dyn element into
+# an int target (the dyn-into-numeric coercion keeps it int)
+var dyn dd = runtime(1);
+var dw = 0;
+dd, dw += [1, 2];
+var di = 1;
+var dj = 2;
+di, dj += runtime([3, 4]);
+assert(dd == 2 && dw == 2 && di == 4 && dj == 6);
+# typed locals take a literal unpack element by element, each coerced to
+# its target's type as a single store would be
+func typed_lit(int n) {
+    int ta = 0;
+    float tb = 0.0;
+    ta, tb = [n, n];
+    return str(ta) + " " + str(tb);
+}
+assert(typed_lit(runtime(3)) == "3 3.000000");
+print(dd, dw, di, dj, typed_lit(runtime(3)));
