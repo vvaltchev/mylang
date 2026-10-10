@@ -346,8 +346,10 @@ aspects:
     right-hand side converted to the type the target is declared or
     inferred to have (`var z = (fa[0] = 3)` with an `array<float>` `fa`,
     or into a `float` variable or field, makes `z` the `float` `3.0`; a
-    `dyn` target converts nothing), and for a compound assignment the
-    result it stored. That holds for every target - a variable, an
+    `dyn` right-hand side is converted too, a `TypeError` when it does
+    not fit, as for a typed variable receiving one; a `dyn` target
+    converts nothing), and for a compound assignment the result it
+    stored. That holds for every target - a variable, an
     element, a field, a dict key, a chain of them. A multi-assignment
     (`a, b = [5, 6]`, see *array expansion*) is the exception: it
     stores into each target, and its own value is `none` (`w = a, b =
@@ -655,7 +657,10 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     A single value stored into an element - `a[i] = 5`, `append(a, 5)`,
     `push(a, 5)`, `insert(a, 0, 5)`, a dict key or value - widens to the
     declared type the same way: `5` stored into an `array<float?>` is
-    `5.0`, `true` into an `array<int>` is `1`.
+    `5.0`, `true` into an `array<int>` is `1`. A `dyn` value assigned
+    (`=`) to an element or a dict value of type `int` or `float` converts
+    as it would into a typed variable, a `TypeError` when it does not fit
+    (`ga[0] = runtime("s")` into an `array<float?>`).
   * **A `struct` type** pins the variable to that exact type (like a scalar):
     `Point p = Point(3, 4)` is fine, while `Point p = Other(...)` (or a later
     `p = Other(...)`) is a compile error. The struct name is read as a type only

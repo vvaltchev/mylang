@@ -4611,7 +4611,19 @@ decisions behind it: `plans/archived/type-inference.md`,
   3.0 - the tree-walker's typed `z + 1` raised TypeErrorEx, and the JIT
   would have read the float's bits as an int once the VM lowered the
   form. A `dyn` target converts nothing, statically or at run time: the
-  value is the rvalue as typed, whatever the dyn container stored.
+  value is the rvalue as typed, whatever the dyn container stored. A
+  `dyn` RVALUE into a numeric element, field or dict value converts
+  too (`assign_value_widen` stamps val_widen; the static type stays
+  dyn), CHECKED in both engines - `coerce_to_decl_type` in the
+  tree-walker, CoerceNumV in the VM - so a misfit is the same
+  TypeErrorEx everywhere (an int stored into a float element made the
+  value the int 5 while the element held 5.0). ⛔ The tree-walker
+  converts the value in STATEMENT position too (it cannot tell), the
+  VM only in its value form, so the conversion must never throw after
+  a store succeeded: an array element and a dict value convert the dyn
+  rvalue BEFORE the store (rv_coerce, checked - which also keeps a
+  misfit out of a general array<float?> or a dict, RULE 1); a struct
+  field refuses a misfit in the store itself.
   A MULTI-assignment's value is `none` (type_of answers `none` for an
   IdList target; codegen compiles the statement, then loads none). Until
   2026-10-06 it was typed as the rvalue, so `array<int> w; w = a, b =
