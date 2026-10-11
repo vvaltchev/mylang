@@ -6600,7 +6600,9 @@ are unchanged.
     (`CycPairStack::identity_ok`, memoized per top-level comparison).
     Anywhere else the answer would depend on where the walk started, `==`
     stops being transitive and `hash` cannot agree with it - `clone(a) != a`
-    for a ring `a` is the documented consequence. A dict compares each
+    for a ring `a` is the documented consequence. The search is the one
+    real cost of the guard (two arrays sharing a 401-container sub-array:
+    3k -> 91k Ir per `==`); the plan file's cost table has the rest. A dict compares each
     value under `CycFlip`, keeping the operand ORDER unordered_map's
     `operator==` always used (other's value on the left), which a builtin
     exception value's missing `eq` makes observable.
