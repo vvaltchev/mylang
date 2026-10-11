@@ -4811,7 +4811,10 @@ COW-DETACH hazard: an element write to a base with a LIVE slice clones
 the base away (clone_aliased_slices), so a hoisted view would keep
 reading the detached OLD storage while per-iteration fresh views see
 the new one (pinned by the "base content write keeps per-iteration
-views" test); bounds are absent or fr_immutable AND int-proven; and
+views" test) - and the same write through ANOTHER name does the same,
+so an array base also needs `FrMut::alias_content` clear (see the
+for-range paragraph's aliasing rule); bounds are absent or
+fr_immutable AND int-proven; and
 with `Slice::base_sliceable` (a new inferencer stamp: statically
 non-opt array/str) the slice CANNOT throw (pure clamping), so hoisting
 is safe even for a ZERO-iteration loop. The slice var itself must be
@@ -4857,7 +4860,9 @@ Gates on the candidate: `base_array` (not a dict/string), a CONTAINER
 result (`th` neither i nor f - a scalar element is already a raw slot
 read), `fr_immutable` with the loop var's uid (which also requires the
 base absent from `mut_content`, so an element write anywhere in the loop
-disqualifies it - that is what rules out the COW-detach hazard), no
+disqualifies it - that is what rules out the COW-detach hazard - and
+`FrMut::alias_content` clear, since the row can be replaced through
+another name, `b[i] = [..]` with `b = a`), no
 reference to anything DECLARED INSIDE the body (`licm_collect_decls`:
 above the loop such a slot is stale - `fr_collect_mutated` deliberately
 SKIPS a pInDecl assignment, so a body-local `var m = map(..)` taints
@@ -5011,7 +5016,29 @@ needs length-stability (`∉ mut_len`) — so the common fill
 `for(i;i<len(a);i++) a[i]=…` still specializes (an element write doesn't change
 the length); a subscript READ `arr[k]` additionally needs `∉ mut_content`. A
 *pure* call taints nothing (it can't mutate its args); an *impure* call taints
-the length and content of each non-scalar arg. `ForRangeStmt::do_eval`
+the length and content of each non-scalar arg.
+**⛔ THOSE SETS ARE BY NAME, AND A NAME IS NOT THE STORAGE (2026-10-08).**
+Arrays and dicts are references: `b[0] = 9` changes `a[0]` when `b = a`,
+and an impure function can `pop` a global a local aliases. The for-range
+bound, the slice hoist and LICM each gave a different answer from
+`--no-opt all` on such a loop. So `FrMut` (the sets' bundle) carries two
+facts about EVERY container: `alias_content` (a store whose chain passes
+through an array, a dict or a `dyn`, or a call that may run program
+code) and `alias_len` (a mutating builtin on a shared container, or such
+a call - an impure user function, a function value, a builtin given a
+callback). A read THROUGH a shared container needs the matching flag
+clear; "shared" comes from **`Construct::th_val`**, stamped in
+`annotate_hints`: true for a static type that is a value ALL THE WAY DOWN
+(a scalar, a string, a struct whose fields are such values) - a struct
+with an array field is not, since a callee reading through it reaches
+shared storage. A member store into a struct VALUE is the variable's own
+copy and sets nothing. And "const builtin" does not mean "changes
+nothing": `sort`/`rev_sort`/`reverse` fold on a constant and sort a
+variable's array in place - `fr_builtin_mutates` names the in-place
+builtins. Nets: the `alias:` cases of `opt_layer_equivalence` and the
+alias rows of both hoist shape tests (watched failing with the flags
+ignored). Blast radius: 1 of 194 corpus programs (a loop calling an
+impure function no longer caches `len(vals)`), no bench. `ForRangeStmt::do_eval`
 evaluates `bound`/`step` **once** (cached as raw `int_type`), then the
 per-iteration condition test and increment are plain C on the slot's
 `int_type` — no expression eval, no `num_bin_op`, no `TypedScalarExpr` dispatch

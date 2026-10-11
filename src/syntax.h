@@ -192,6 +192,20 @@ public:
     bool th_bool = false;
 
     /*
+     * Set by the inferencer when this expression's static type is a VALUE
+     * all the way down: a scalar, a string, `none`, or a struct whose
+     * fields are values in turn. No other name can change what such a
+     * value denotes - an array, a dict, a function and a `dyn` can each be
+     * reached through a second name, and a write there is a write here.
+     * The loop transforms (try_for_range, the slice hoist, LICM) read it
+     * to decide whether a write through an UNRELATED name may change an
+     * expression they want to evaluate once. Default false, the
+     * conservative answer for a node nothing stamped. Copied by
+     * copy_base_fields().
+     */
+    bool th_val = false;
+
+    /*
      * #54, `-nc` only: the parser would have REPLACED this constant node by
      * a literal here, had folding been on (set by nc_eval_const). Read by
      * pExpr14's assignable-shape rule, so `const A = [1]; A[0] = 2;` is the
@@ -285,6 +299,7 @@ public:
         d.inline_ctx = inline_ctx;
         d.th = th;
         d.th_bool = th_bool;
+        d.th_val = th_val;
         d.arr_hint = arr_hint;
         d.arr_hint_struct = arr_hint_struct;
     }
