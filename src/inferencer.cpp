@@ -4676,9 +4676,22 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     if (n == "exception" || n == "ex")
         return A.exc_ty();
 
-    if (n == "print" || n == "writeln" || n == "assert" || n == "append" ||
-        n == "push" || n == "insert" || n == "exit" || n == "write" ||
-        n == "writelines" || n == "erase")
+    /* The in-place builtins return what they worked on - append / push
+     * the array - or whether they did - insert / erase a bool (false: a
+     * dict key already there / not there). They were typed `none` until
+     * 2026-10-08, while the run time held the array or the bool:
+     * typestr(erase(d, k)) read "none", and "bool" under -nti. */
+    if (n == "append" || n == "push") {
+        const StaticTypeRef c = static_type_resolve(arg(0));
+        if (is_unknown(c) || is_none(c))
+            return bottom;                  /* defer */
+        return A.with_opt(c, false);
+    }
+    if (n == "insert" || n == "erase")
+        return A.bool_ty();
+
+    if (n == "print" || n == "writeln" || n == "assert" || n == "exit" ||
+        n == "write" || n == "writelines")
         return A.none_ty();
 
     return A.dyn_ty();
