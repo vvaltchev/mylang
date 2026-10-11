@@ -80,3 +80,11 @@ private:
  * process exit code. Launched by mylang.cpp when there is no FILE/-e argument.
  */
 int run_repl();
+
+/* The history file (~/.mylang_history): one input per entry, an entry that
+ * spans lines written on one line with its newlines escaped. Loading a
+ * file of the old format (one entry per line) works too. */
+void repl_load_history(const std::string &path,
+                       std::vector<std::string> &history);
+void repl_save_history(const std::string &path,
+                       const std::vector<std::string> &history);

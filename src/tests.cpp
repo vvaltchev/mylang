@@ -23000,6 +23000,81 @@ static bool lineedit_joiner_keeps_chain_open()
     return lines(e7, { "while (x) {", "f()", "}" }) == A::submit;
 }
 
+/*
+ * The REPL history file (repl_load_history / repl_save_history): one INPUT
+ * per entry, an entry spanning lines written on one line with `\n` for its
+ * newlines and `\\` for its backslashes, under a header naming the format;
+ * a file with no header (the old format) loads one entry per line. Written
+ * raw, a multi-line block came back after a restart as one entry per line.
+ */
+static bool repl_history_file()
+{
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    const std::string path = tdir + "/mylang-history-test";
+    const auto write = [&](const std::string &text) {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f << text;
+    };
+    const auto read = [&]() {
+        std::ifstream f(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(f),
+                           std::istreambuf_iterator<char>());
+    };
+
+    /* a round trip: newlines, backslashes, an empty line inside an entry */
+    const std::vector<std::string> h0 = {
+        "var s = \"a\\\\b\"", "if (x) {\n  f()\n\n}\nelse {\n}", "1" };
+    repl_save_history(path, h0);
+    if (read() != "#mylang-history 2\nvar s = \"a\\\\\\\\b\"\n"
+                  "if (x) {\\n  f()\\n\\n}\\nelse {\\n}\n1\n")
+        return false;
+    std::vector<std::string> h1;
+    repl_load_history(path, h1);
+    if (h1 != h0)
+        return false;
+
+    /* an escape the writer never makes reads as its character, and a
+     * trailing backslash as itself; empty lines are skipped */
+    write("#mylang-history 2\n\na\\xb\nc\\\n");
+    std::vector<std::string> h2;
+    repl_load_history(path, h2);
+    if (h2 != std::vector<std::string>{ "axb", "c\\" })
+        return false;
+
+    /* the old format: one entry per line, the first one too */
+    write("print(1)\n\nx = 2\n");
+    std::vector<std::string> h3;
+    repl_load_history(path, h3);
+    if (h3 != std::vector<std::string>{ "print(1)", "x = 2" })
+        return false;
+    write("\nprint(1)\n");
+    std::vector<std::string> h4;
+    repl_load_history(path, h4);
+    if (h4 != std::vector<std::string>{ "print(1)" })
+        return false;
+
+    /* the newest 2000 entries are kept */
+    std::string big = "#mylang-history 2\n";
+    for (int i = 0; i < 2005; i++)
+        big += std::to_string(i) + "\n";
+    write(big);
+    std::vector<std::string> h5;
+    repl_load_history(path, h5);
+    if (h5.size() != 2000 || h5.front() != "5" || h5.back() != "2004")
+        return false;
+
+    /* a missing file loads nothing; an unwritable path saves nothing */
+    std::remove(path.c_str());
+    std::vector<std::string> h6;
+    repl_load_history(path, h6);
+    repl_save_history(tdir + "/no-such-dir/mylang-history", h0);
+    return h6.empty();
+}
+
 static bool lineedit_multiline_cursor_and_nav()
 {
     LineEditor ed;
@@ -56938,6 +57013,8 @@ static const std::vector<extra_check> extra_checks =
       lineedit_multiline_enter_inserts_newline },
     { "lineedit: the REPL keeps an if/try chain open for an else on the "
       "next line", lineedit_joiner_keeps_chain_open },
+    { "repl: the history file round-trips a multi-line entry",
+      repl_history_file },
     { "lineedit: 2-D cursor + within-block Up/Down",
       lineedit_multiline_cursor_and_nav },
     { "lineedit: line-relative Home/End/kill in a block",
