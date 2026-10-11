@@ -17589,3 +17589,107 @@ the AST inliner ignoring `binds_none` fails the two pasted-callee cases
 in every engine (the JIT prints the original bug: a typed parameter read
 as 0) and one -rt case; the tree-walker evaluating lazily again fails
 `argument order` under `-tw`.
+
+## #34 - JIT COMPILE TIME AND C3'S OUTPUT WERE QUADRATIC IN A RUN (2026-10-08)
+
+**Found by `tests/nested_fuzz` timing out** (seed 885376594, a 1,866-line
+depth-15 program): every engine agreed, but the JIT took 32 s in the
+debug lane against 2.7 s with `-nj`. Its `main` is one 7,862-op run with
+274 slots - a size no corpus program comes near, which is why nothing
+else had noticed. Callgrind (OPT=1 ASSERTS=0) put 90% of the process in
+`jit_compile_chunk` for that one chunk: **8.9 G instructions**, against
+1.0 G for the whole `-nj` run.
+
+**THE ANALYSES.** The register allocator's passes each answered a
+per-item question by walking a whole list, so each was (items x run):
+
+ - `jit_lsra_assign` asked "this slot's events in [s, e)" per interval
+   (the cut), per piece (the evidence, the lifetime holes), per contest
+   (the density) and per split, each over EVERY event - 6.4 G alone. A
+   per-slot index sorted by (slot, pc) answers with two binary searches
+   (`LsraSlotIndex`). Its temp-admission facts (an unaudited op in the
+   run, an op outside the specialized family touching the temp, a call
+   inside the interval) were recomputed per PIECE, the first by walking
+   the run calling `jit_op_slot_refs` at every pc; they are per-slot /
+   per-interval facts, computed once. The dense (run x slots)
+   `jit_next_use` matrix became `NextUse`, a per-slot use list.
+ - `jit_lin_point` walked every branch edge, and the snap and the
+   lifetime holes called it per pc while walking a gap: `LinMap` builds
+   it for the whole run once (a difference array over each edge's
+   crossed range, minus the targeted pc's exemption), with
+   nearest-lin-point arrays. The snap's neighbour bounds were a scan of
+   every piece per piece ("O(n^2) over a run's piece count, which is
+   small" - the comment); they are per-slot and per-register indices
+   now, the register ones following a reassignment or a demotion.
+ - `jit_build_intervals` walked (slots x pcs); it works a 64-slot word
+   at a time, touching only the bits that change.
+ - `jit_pick_release_slots` searched the rest of the run for each pc's
+   last back edge; `jit_hoist_pick` and `region_preheader_reached`
+   walked every branch of the run per loop region (`BranchInto`: the
+   lowest and highest source per target), the hoist pick checked each
+   candidate against every accepted region, the emitter scanned every
+   hoist region at every pc, `jit_qualify_intervals` found a slot's
+   covering interval by a linear walk (a temp has thousands), the
+   exit-state interning compared against every state and the epilogues
+   walked every exit per state, the codegen peephole's E1 predecessor
+   test walked the whole chunk per candidate move, and a `getenv` sat in
+   the contest loop.
+ - **The chunk's liveness was computed 13 times** - per run, per
+   re-emission attempt - over bytecode that does not change until the
+   EnterNative splice at the very end. Once now; a run's intervals and
+   their qualification are memoized across attempts too (they record no
+   INT site and no counter, so the retry's discard semantics lose
+   nothing).
+
+**THE OUTPUT - THE NASTY HALF.** C3's type elision (inc 2/3) had no
+bound: every qualified-but-unpinned slot skips its type store on each
+write and pays one at EVERY exit and EVERY barrier bracket instead. That
+cost is (elided slots x flush points), both growing with the run: a
+synthetic `main` of K independent loop blocks emitted 54 k native
+instructions at K = 50 and 2.1 M at K = 400 - **210 machine instructions
+per bytecode op**, quadratic, and at run time more type stores executed
+than the elision ever saved. The fuzz program's `main` flushed `r250`'s
+type word 1,045 times. `MAX_TYPE_ELIDED = 32` bounds it, keeping the
+most-used slots (`cap_by_use`) - the shape of C5's `MAX_RELEASED`. The
+corpus peaks at 25 (55_regcall's float temps), so no corpus program's
+code changes; the probe's code is now exactly linear (60 k lines at
+K = 100, 120 k at 200, 240 k at 400).
+
+**VERIFIED AS A RESTRUCTURING.** `scripts/vdjcmp` against the parent
+commit: **194 / 194 identical** (bytecode and native). The fuzz
+program's code changes only where its runs exceed the new bound. Its
+times (OPT=1 ASSERTS=0): 1.38 s -> 0.26 s (`-nj` 0.16 s); debug lane
+32 s -> 11 s (`-nj` 3.2 s). The K-block probe's JIT-only instructions
+now grow 2.2-2.4x per doubling, from 4x.
+
+**THE NETS.** `jit: #34 - the emitted code grows linearly` (`-rt`) builds
+the 24- and 48-block programs and requires the native instruction count
+to roughly double (2.86x before the bound), with a vacuity guard: the
+decoded code (`g_jit_decode_sink` - a store whose destination is a
+slot's type word, so the low-arena imm32 and the `MYLANG_NO_LOWMEM`
+register form count alike; a first version matched the dump's text and
+went vacuous in the nolowmem lane) must show a flush of a large elided
+set, or the elision never engaged (`MYLANG_JIT_OFF=telide` makes it
+report VACUOUS). `jit_slot_liveness_check` compares `NextUse` with the matrix at
+every (pc, slot) and outside the range; the interval spec check gained a
+150-slot case and requires an interval in the third bitset word. Debug
+builds `ML_CHECK` the two invariants the indices rest on: a register's
+pieces are disjoint at the snap, and a slot's intervals are disjoint and
+start-sorted at the qualification.
+
+**Watched failing** (each a sabotaged copy on the `sab` lane, rebuilt,
+restored by plain copy + touch and rebuilt, then a passing control):
+`NextUse::at` off by one fails the liveness check at its first pc; the
+interval builder ignoring bitset words past the second fails ONLY the
+new 150-slot case (`slot 152 active=1 covered=0`); the elision bound
+removed fails the size check at 2.68x. And the restructuring oracle
+sees the analyses: `LinMap` without its target exemption changes the
+emitted code of 34 of 39 sampled corpus programs (0 of 39 restored).
+
+**NOT DONE, measured:** the all-slot liveness itself is a dense bitset
+fixpoint, (pcs x slots / 64) per pass - the largest JIT term left at
+K = 1600 (a 20 k-op `main`). The C2b cold copy replays the transition
+list from the start per region (it records INT pin events per replayed
+transition, so restructuring it changes the intrusive-test record). And
+the FRONT END grows superlinearly on the same probes with the JIT off
+(`Resolver::walk` 3.8x per doubling) - not this entry.

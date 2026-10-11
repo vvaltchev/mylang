@@ -10027,6 +10027,21 @@ bool jit_slot_liveness(const Chunk &chunk, SlotLiveness &out)
     return true;
 }
 
+/* the index of the lowest set bit of a non-zero word (portable: MSVC
+ * has no __builtin_ctzll) */
+static inline int lowest_bit64(uint64_t x)
+{
+    int n = 0;
+    if (!(x & 0xffffffffu)) { n += 32; x >>= 32; }
+    if (!(x & 0xffffu)) { n += 16; x >>= 16; }
+    if (!(x & 0xffu)) { n += 8; x >>= 8; }
+    if (!(x & 0xfu)) { n += 4; x >>= 4; }
+    if (!(x & 0x3u)) { n += 2; x >>= 2; }
+    if (!(x & 0x1u))
+        n += 1;
+    return n;
+}
+
 bool jit_build_intervals(const Chunk &chunk, size_t begin, size_t end,
                          const SlotLiveness &sl,
                          std::vector<LiveInterval> &out)
@@ -10035,44 +10050,72 @@ bool jit_build_intervals(const Chunk &chunk, size_t begin, size_t end,
     if (!sl.ok || begin >= end || end > chunk.code.size())
         return false;
     const int count = sl.count;
-    /* per-pc defs/uses, per slot - one pass over the ops */
-    const size_t n = end - begin;
-    std::vector<uint8_t> defbit(n * static_cast<size_t>(count), 0);
-    std::vector<uint8_t> usebit(n * static_cast<size_t>(count), 0);
-    std::vector<int> uses, defs;
+    const size_t words = sl.words;
+    /* #34: a word of slots at a time. A slot is ACTIVE at pc iff it is
+     * live-in there or defined there (the header's spec); an interval
+     * opens where a slot turns active and closes where it stops. The
+     * per-slot walk over every pc this replaced was (run length x slot
+     * count) - quadratic in a long run, 2.7 G instructions for a
+     * 400-block `main`. Only the bits that CHANGE, and the slots the op
+     * touches, cost anything per pc now. */
+    std::vector<uint64_t> prev(words, 0), act(words, 0), def(words, 0);
+    std::vector<int> open(static_cast<size_t>(count), -1);
+    std::vector<size_t> touched_at(static_cast<size_t>(count), SIZE_MAX);
+    std::vector<int> uses, defs, touched;
+    const auto in_range = [&](int s) {
+        return s >= sl.base && s < sl.base + count;
+    };
     for (size_t p = begin; p < end; p++) {
         jit_op_slot_refs(chunk.code[p], uses, defs);
+        std::fill(def.begin(), def.end(), 0);
+        touched.clear();
         for (const int s : defs)
-            if (s >= sl.base && s < sl.base + count)
-                defbit[(p - begin) * count + (s - sl.base)] = 1;
+            if (in_range(s)) {
+                const int b = s - sl.base;
+                def[b / 64] |= uint64_t(1) << (b % 64);
+                if (touched_at[b] != p) {
+                    touched_at[b] = p;
+                    touched.push_back(b);
+                }
+            }
         for (const int s : uses)
-            if (s >= sl.base && s < sl.base + count)
-                usebit[(p - begin) * count + (s - sl.base)] = 1;
-    }
-    for (int s = 0; s < count; s++) {
-        const int slot = sl.base + s;
-        bool open = false;
-        LiveInterval cur{ slot, 0, 0, 0 };
-        for (size_t p = begin; p < end; p++) {
-            const size_t k = (p - begin) * count + s;
-            const bool active = sl.live_in(p, slot) || defbit[k];
-            if (active && !open) {
-                open = true;
-                cur = { slot, static_cast<uint32_t>(p), 0, 0 };
+            if (in_range(s)) {
+                const int b = s - sl.base;
+                if (touched_at[b] != p) {
+                    touched_at[b] = p;
+                    touched.push_back(b);
+                }
             }
-            if (active && (defbit[k] || usebit[k]))
-                cur.weight++;
-            if (!active && open) {
-                open = false;
-                cur.end = static_cast<uint32_t>(p);
-                out.push_back(cur);
+        for (size_t w = 0; w < words; w++) {
+            act[w] = sl.livein[p * words + w] | def[w];
+            uint64_t closed = prev[w] & ~act[w];
+            while (closed) {
+                const int b = static_cast<int>(w * 64)
+                              + lowest_bit64(closed);
+                closed &= closed - 1;
+                out[static_cast<size_t>(open[b])].end =
+                    static_cast<uint32_t>(p);
+                open[b] = -1;
+            }
+            uint64_t opened = act[w] & ~prev[w];
+            while (opened) {
+                const int b = static_cast<int>(w * 64)
+                              + lowest_bit64(opened);
+                opened &= opened - 1;
+                open[b] = static_cast<int>(out.size());
+                out.push_back({ sl.base + b, static_cast<uint32_t>(p),
+                                0, 0 });
             }
         }
-        if (open) {
-            cur.end = static_cast<uint32_t>(end);
-            out.push_back(cur);
-        }
+        for (const int b : touched)
+            if ((act[b / 64] >> (b % 64)) & 1)
+                out[static_cast<size_t>(open[b])].weight++;
+        prev.swap(act);
     }
+    for (int b = 0; b < count; b++)
+        if (open[b] >= 0)
+            out[static_cast<size_t>(open[b])].end =
+                static_cast<uint32_t>(end);
     /* by start pc - the order a linear scan consumes */
     std::sort(out.begin(), out.end(),
               [](const LiveInterval &a, const LiveInterval &b) {
@@ -10112,6 +10155,47 @@ void jit_next_use(const Chunk &chunk, size_t begin, size_t end,
         std::copy(cur.begin(), cur.end(),
                   dist.begin() + (p - begin) * static_cast<size_t>(count));
     }
+}
+
+void NextUse::build(const Chunk &chunk, size_t begin, size_t end,
+                    int base, int count)
+{
+    begin_ = begin;
+    end_ = end > begin ? end : begin;
+    base_ = base;
+    count_ = count > 0 ? count : 0;
+    uses_.assign(static_cast<size_t>(count_), {});
+    barriers_.clear();
+    for (size_t p = begin_; p < end_; p++) {
+        Instr &in = const_cast<Instr &>(chunk.code[p]);
+        const bool known = visit_use_def(in,
+            [&](int s) {
+                if (s >= base_ && s < base_ + count_) {
+                    std::vector<uint32_t> &v = uses_[s - base_];
+                    if (v.empty() || v.back() != p)
+                        v.push_back(static_cast<uint32_t>(p));
+                }
+            },
+            [](int) {});
+        if (!known)
+            barriers_.push_back(static_cast<uint32_t>(p));
+    }
+}
+
+int NextUse::at(size_t pc, int slot) const
+{
+    if (pc < begin_ || pc >= end_ || slot < base_ || slot >= base_ + count_)
+        return JIT_NO_NEXT_USE;
+    uint32_t q = UINT32_MAX;
+    const std::vector<uint32_t> &v = uses_[slot - base_];
+    const auto it = std::lower_bound(v.begin(), v.end(), pc);
+    if (it != v.end())
+        q = *it;
+    const auto bt = std::lower_bound(barriers_.begin(), barriers_.end(), pc);
+    if (bt != barriers_.end() && *bt < q)
+        q = *bt;
+    return q == UINT32_MAX ? static_cast<int>(JIT_NO_NEXT_USE)
+                           : static_cast<int>(q - pc);
 }
 
 /*
@@ -10614,6 +10698,22 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
              * not - hence this guard.) */
             std::vector<char> retargeted(n, 0);
 
+            /* #34: the branch sources aiming at each pc. The predecessor
+             * test below walked the WHOLE chunk per candidate move -
+             * quadratic in a long chunk. An entry is re-verified where
+             * it is read (the rewrites below change instructions), and a
+             * rewritten instruction is indexed again, so a NEW edge is
+             * never missed. */
+            std::vector<std::vector<size_t>> into(n);
+            const auto index_pcs = [&](size_t j) {
+                visit_pc_fields(code[j], [&](int &t) {
+                    if (t >= 0 && static_cast<size_t>(t) < n)
+                        into[static_cast<size_t>(t)].push_back(j);
+                });
+            };
+            for (size_t j = 0; j < n; j++)
+                index_pcs(j);
+
             for (size_t q = 0; q < n; q++) {
                 CgInstr &m = code[q];
                 if (m.op != OpCode::MoveV || m.target == m.target2)
@@ -10639,7 +10739,12 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
                  * (`prod; jmp Lq` / `prod` fall-through + one move at Lq). */
                 std::vector<size_t> prods;
                 bool ok = true;
-                for (size_t j = 0; j < n && ok; j++) {
+                std::vector<size_t> &cand = into[q];
+                std::sort(cand.begin(), cand.end());
+                cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+                for (const size_t j : cand) {
+                    if (!ok)
+                        break;
                     if (j == q)
                         continue;
                     bool hits = false;
@@ -10674,9 +10779,11 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
                 for (size_t p : prods) { /* produce straight into d */
                     code[p].target = m.target;
                     retargeted[p] = 1;   /* live_in now stale for this pc */
+                    index_pcs(p);
                 }
                 m.op = OpCode::Jump;     /* neutralize: jump-to-next... */
                 m.target = static_cast<int>(q) + 1;  /* ...deleted below */
+                index_pcs(q);
                 changed = true;
             }
 

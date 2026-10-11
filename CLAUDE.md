@@ -2072,6 +2072,19 @@ expectations, and 43_sieve raised OutOfBounds; it needs per-CALL-SITE
 opt-in plus a bounded lane (forcing every scalar store through a helper
 took `-rt` from 2.6s to over 10 minutes).
 
+**⛔ A JIT PASS OVER A RUN NEVER ANSWERS A PER-ITEM QUESTION BY WALKING
+A WHOLE LIST, AND A SET PAID FOR AT EVERY EXIT IS BOUNDED (#34,
+2026-10-08).** "O(n^2) over a run's piece count, which is small" was a
+comment in the snap; the corpus's largest run is a few hundred ops and
+a `nested_fuzz` `main` is 7,862, so the scan, the snap, the region
+tests and the interning together took 32 s to JIT one program. Index
+the list (per slot, per register, per target pc - docs/jit-optimizations.md,
+#34). And every member of `tflush` cost a type store at every exit and
+barrier with no `MAX_*`, unlike every other per-exit family (the pins,
+C5's releases, the share seams): 210 machine instructions per bytecode
+op. **A `nested_fuzz` TIMEOUT whose engines agree is a finding, not
+noise** - this one hid both.
+
 **⛔ THE GUARD-ELISION FAMILY IS AN INSTRUCTION-COUNT WIN WITH A
 WALL-CLOCK CEILING NEAR ZERO (measured 2026-08-05).** The
 specialized-family table fix above is the controlled experiment: it

@@ -35470,6 +35470,26 @@ static bool jit_slot_liveness_check()
                         return false;
                     }
             }
+            /* (6) #34: the per-query NextUse the linear scan reads gives
+             * the matrix's answer at every (pc, slot) - and outside the
+             * covered range, none */
+            NextUse nxu;
+            nxu.build(*ck, 0, n, 0, sl.count);
+            for (size_t p = 0; p < n; p++)
+                for (int s = -1; s <= sl.count; s++) {
+                    const int want = s >= 0 && s < sl.count
+                        ? dist[p * sl.count + s] : JIT_NO_NEXT_USE;
+                    if (nxu.at(p, s) != want) {
+                        printf("  %s: pc %zu slot %d: NextUse %d, "
+                               "matrix %d\n", c.name, p, s,
+                               nxu.at(p, s), want);
+                        return false;
+                    }
+                }
+            if (nxu.at(n, 0) != JIT_NO_NEXT_USE) {
+                printf("  %s: NextUse answers past the run\n", c.name);
+                return false;
+            }
         }
     }
     if (!saw_wide) {
@@ -35911,8 +35931,25 @@ static bool jit_intervals_check()
           "var arr = array(lim);\n"
           "for (var i = 0; i < lim; i++) { arr[i] = h(i); }\n"
           "print(sum(arr));\n" },
+        /* #34: the builder works a 64-slot WORD at a time - this chunk
+         * has three words, intervals opening and closing in each */
+        { "past one bitset word", [] {
+              std::string src;
+              for (int k = 0; k < 150; k++)
+                  src += "var v" + std::to_string(k) + " = int(runtime("
+                       + std::to_string(k) + "));\n";
+              for (int k = 0; k < 150; k++)
+                  src += "v" + std::to_string(k) + " = v"
+                       + std::to_string(k) + " + v"
+                       + std::to_string((k * 7) % 150) + ";\n";
+              src += "var acc = 0;\n";
+              for (int k = 0; k < 150; k += 3)
+                  src += "acc = acc + v" + std::to_string(k) + ";\n";
+              src += "print(acc);\n";
+              return src;
+          }() },
     };
-    bool ok = true, saw_hole = false;
+    bool ok = true, saw_hole = false, saw_wide = false;
     for (const Case &c : cases) {
         std::vector<Tok> toks;
         lexer(c.src, 1, toks);
@@ -35996,12 +36033,20 @@ static bool jit_intervals_check()
                 }
                 if (nseen[sN] >= 2)
                     saw_hole = true;
+                if (sN >= 128 && nseen[sN] >= 1)
+                    saw_wide = true;
             }
         }
     }
     if (!saw_hole) {
         printf("  intervals: no slot ever produced two intervals - the "
                "hole half of the representation is untested\n");
+        ok = false;
+    }
+    if (!saw_wide) {
+        printf("  intervals: no interval in a third bitset word - the "
+               "word-at-a-time builder's carry across words is "
+               "untested\n");
         ok = false;
     }
     return ok;
@@ -36712,6 +36757,119 @@ static bool jit_frameless_entry_emitted()
  * (`; vm op N: call.val ...`), where every mark used to read
  * `enter.nat`.
  */
+/*
+ * #34: THE EMITTED CODE GROWS LINEARLY WITH THE PROGRAM. A nested_fuzz
+ * `main` of 7,862 ops took 9 s to JIT, and part of the reason was the
+ * OUTPUT: C3's type elision had no bound, so every exit and helper
+ * bracket re-stored the type word of every elided slot in the run -
+ * (elided slots x flush points), both growing with the program; 10k
+ * ops became 2.1 M machine instructions. This builds one `main` of K
+ * and of 2K independent blocks (three elidable ints each) and requires
+ * the native instruction count to double, not quadruple. VACUITY: the
+ * larger program must hold more elidable locals than the bound, or the
+ * check could not tell a bounded set from an unbounded one.
+ */
+static bool jit_code_size_linear()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    const bool ann_was = g_jit_annotate;
+    g_jit_annotate = true;
+    struct AnnRestore {
+        bool v; ~AnnRestore() { g_jit_annotate = v; }
+    } ann_restore{ ann_was };
+    const auto program = [](int blocks) {
+        std::string src;
+        for (int k = 0; k < blocks; k++) {
+            const std::string n = std::to_string(k);
+            src += "var a" + n + " = int(runtime(" + n + ")); var b" + n
+                 + " = 0; var c" + n + " = [1, 2, 3];\n"
+                 "for (var i" + n + " = 0; i" + n + " < 3; i" + n
+                 + "++) {\n"
+                 "  b" + n + " += a" + n + " * i" + n + " + c" + n + "[i"
+                 + n + " % 3];\n"
+                 "  if (b" + n + " % 2 == 0) { a" + n + " = a" + n
+                 + " + 1; } else { b" + n + " -= 1; }\n"
+                 "  var t" + n + " = b" + n + " * 3 + a" + n + ";\n"
+                 "  while (t" + n + " > 100) { t" + n + " = t" + n
+                 + " - 50; }\n"
+                 "  b" + n + " = b" + n + " + t" + n + ";\n"
+                 "}\nprint(b" + n + ");\n";
+        }
+        return src;
+    };
+    long max_tags = 0;                   /* longest run of type stores */
+    const auto native_lines = [&](int blocks, long &out) {
+        const std::string src = program(blocks);
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            const Block *b = dynamic_cast<const Block *>(root.get());
+            if (!b)
+                return false;
+            /* counted on the DECODED instructions (the sink), not the
+             * dump's text: a type store is a `mov` whose destination is
+             * a slot's type word, however the tag is spelled (an imm32
+             * with the low arena, a register without it) */
+            std::vector<DecodedFrag> frags;
+            std::vector<DecodedFrag> *sink_was = g_jit_decode_sink;
+            g_jit_decode_sink = &frags;
+            struct SinkRestore {
+                std::vector<DecodedFrag> *v;
+                ~SinkRestore() { g_jit_decode_sink = v; }
+            } sink_restore{ sink_was };
+            (void)disassemble_program(b);
+            out = 0;
+            for (const DecodedFrag &f : frags) {
+                long run = 0;
+                for (const DecodedIns &in : f.ins) {
+                    out++;
+                    if (in.ok && in.mn == "mov" && in.n >= 1
+                            && in.ops[0].kind == DecOp::Slot
+                            && in.ops[0].slot_type)
+                        max_tags = std::max(max_tags, ++run);
+                    else
+                        run = 0;
+                }
+            }
+        } catch (Exception &e) {
+            fprintf(stderr, "jit_code_size_linear: threw %s: %s\n", e.name,
+                    e.msg);
+            return false;
+        }
+        return true;
+    };
+    long small = 0, big = 0;
+    if (!native_lines(24, small) || !native_lines(48, big))
+        return false;
+    /* three elidable ints per block, 144 in the larger program: a flush
+     * of a LARGE elided set must be in the dump (unbounded, it is all
+     * 144 in a row), or the elision never engaged and the ratio below
+     * proves nothing */
+    if (max_tags < 16) {
+        fprintf(stderr, "jit_code_size_linear: VACUOUS - the longest run "
+                        "of type stores is %ld; the C3 elision did not "
+                        "engage\n", max_tags);
+        return false;
+    }
+    if (big * 100 > small * 230) {
+        fprintf(stderr, "jit_code_size_linear: 24 blocks emit %ld native "
+                        "instructions, 48 emit %ld - %.2fx for twice the "
+                        "program (want ~2x; a per-exit set grows with the "
+                        "run)\n", small, big,
+                static_cast<double>(big) / static_cast<double>(small));
+        return false;
+    }
+#endif
+    return true;
+}
+
 static bool vm_disasm_driver_jit_parity()
 {
     TypedInlineOff tio;   /* a protocol test (see the struct) */
@@ -53244,6 +53402,9 @@ static const std::vector<extra_check> extra_checks =
     { "jit: D1 - live INTERVALS agree with the liveness fixpoint at "
       "every pc, per-slot holes observed (the allocator's input)",
       jit_intervals_check },
+    { "jit: #34 - the emitted code grows linearly with the program "
+      "(the C3 type elision is bounded)",
+      jit_code_size_linear },
     { "jit: D3.b - per-interval qualification implies the pick's "
       "run-wide answer; the payoff interval observed (step 2a)",
       jit_interval_qual_check },
