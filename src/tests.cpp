@@ -14902,6 +14902,66 @@ static const std::vector<test> tests =
     },
 
     /*
+     * A TYPE NAME A BINDING HIDES IS NOT A TYPE (2026-10-07). Inside a
+     * function whose parameter is named `P` - or a foreach or catch
+     * variable, or a capture - `P` is that binding, so `P p;` declares no
+     * `P`, as in C++: the type lookup used to ignore the shadowing (H1)
+     * and resolve the outer struct. Every type position: a declaration,
+     * a container's element type, a lambda's typed parameter.
+     */
+    {
+        "struct: a parameter named like the struct hides the type",
+        {
+            "struct P { int x; }",
+            "func f(P) { P p; return 1; }",
+        },
+        &typeid(SyntaxErrorEx), 13, 2, 15, 2
+    },
+    {
+        "struct: a foreach variable named like the struct hides the type",
+        {
+            "struct P { int x; }",
+            "foreach (var P in [1]) { P p; }",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "struct: a capture of the struct's name hides the type",
+        {
+            "struct P { int x; }",
+            "var g = func[P]() { P p; return 1; };",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "struct: a hidden struct is not an element type either",
+        {
+            "struct P { int x; }",
+            "func g(P) { array<P> a; return 1; }",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "struct: a hidden struct is not a parameter type either",
+        {
+            "struct P { int x; }",
+            "func g(P) { var h = func(P q) => 1; return 1; }",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "struct: the type is visible wherever no binding hides it",
+        {
+            "struct P { int x; }",
+            "func f(int q) { P p; p.x = q; array<P> a = [p]; return a[0].x; }",
+            "func g(P) { return P + 1; }",
+            "func h(Q) { P p; p.x = Q; return p.x; }",
+            "P z; z.x = 9;",
+            "assert(f(3) == 3 && g(1) == 2 && h(4) == 4 && z.x == 9);",
+        }
+    },
+
+    /*
      * Parse-time common-subexpression de-duplication (CSE). Identical const
      * array/dict expressions are evaluated once at parse time and the
      * resulting deep read-only value is shared, asserted here via intptr().
@@ -25854,6 +25914,9 @@ static bool const_fold_equivalence()
             "const a, b, c = [3, [4], 2.5];",
             "var m = func[a, b]() { a++; return a + b[0]; };",
             "print(h(), h(), K, m(), m(), a, b, c, typestr(a));" } },
+        { "a type name a parameter hides", {
+            "struct P { int x; }",
+            "func f(P) { P p; return 1; }" } },
     };
 
     bool ok = true;

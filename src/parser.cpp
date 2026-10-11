@@ -202,8 +202,17 @@ static DeclType type_keyword(std::string_view s)
  * Structs register their descriptor in the const ctx at parse time - with or
  * without `-nc`, which turns off folding, not the registration (#54).
  */
+/*
+ * A parameter, a foreach or catch variable or a capture named like the
+ * struct is the name in its scope (#133's shadowed set): there `P p;` is
+ * not a declaration of a `P`, as in C++ - the struct was found while the
+ * name denoted the binding (`*hidden`), an error for the caller. (The
+ * ctor pre-scan's entries never hide a struct here: they are added only
+ * for a builtin's name, which a struct cannot take.)
+ */
 static const StructTypeDef *
-lookup_struct_type(ParseContext &c, std::string_view name)
+lookup_struct_type(ParseContext &c, std::string_view name,
+                   bool *hidden = nullptr)
 {
     const UniqueId *uid = UniqueId::get(name);
     /* the whole scope chain: EvalContext::lookup is LOCAL, and a struct
@@ -215,9 +224,32 @@ lookup_struct_type(ParseContext &c, std::string_view name)
         if (!lv)
             continue;
         const EvalValue &v = lv->get();
-        return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>() : nullptr;
+        if (!v.is<StructTypeDef *>())
+            return nullptr;
+        if (c.is_shadowed(uid)) {
+            if (hidden)
+                *hidden = true;
+            return nullptr;
+        }
+        return v.get<StructTypeDef *>();
     }
     return nullptr;
+}
+
+/* the error for a name in type position that is not a struct type */
+[[noreturn]] static void
+not_a_type(ParseContext &c, std::string_view name, Loc loc)
+{
+    bool hidden = false;
+    lookup_struct_type(c, name, &hidden);
+    const std::string n(name);
+    SyntaxErrorEx e(loc, intern_msg(hidden
+        ? "'" + n + "' is not a type here: a parameter, a loop or catch "
+          "variable or a capture named '" + n + "' hides the struct"
+        : "'" + n + "' is not a type"));
+    /* the name's own span (an end is its last column + 2) */
+    e.loc_end = loc + static_cast<int>(n.size() + 1);
+    throw e;
 }
 
 /*
@@ -308,8 +340,7 @@ static std::shared_ptr<TypeAnnot> pTypeAnnot(ParseContext &c)
         } else {                                       /* a user struct name */
             const StructTypeDef *sdef = lookup_struct_type(c, name);
             if (!sdef)
-                throw SyntaxErrorEx(loc,
-                    intern_msg("'" + std::string(name) + "' is not a type"));
+                not_a_type(c, name, loc);
             c.next();
             ta->kind = DeclType::strct;
             ta->strct = sdef;
@@ -476,9 +507,7 @@ static void pAcceptDeclPrefix(ParseContext &c, unsigned &fl)
                 break;
             sdef = lookup_struct_type(c, t.value);
             if (!sdef)
-                throw SyntaxErrorEx(t.loc,
-                    intern_msg("'" + std::string(t.value) +
-                               "' is not a type"));
+                not_a_type(c, t.value, t.loc);
             dt = DeclType::strct;
             f |= pFlags::pInDecl; starter = true; k++;
         } else {
@@ -1041,9 +1070,7 @@ pFuncParam(ParseContext &c, unsigned fl)
             } else {
                 sdef = lookup_struct_type(c, c.get_str());
                 if (!sdef)
-                    throw SyntaxErrorEx(c.get_loc(),
-                        intern_msg("'" + std::string(c.get_str()) +
-                                   "' is not a type"));
+                    not_a_type(c, c.get_str(), c.get_loc());
                 dt = DeclType::strct;
             }
             c.next();                          /* consume the type name */
