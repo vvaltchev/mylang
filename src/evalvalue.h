@@ -765,7 +765,6 @@ private:
     bool borrowed;
 
     LValue clone();
-    EvalValue &get_value_for_put();
     void put_slow(const EvalValue &v);   /* container-backed (COW) put */
     void put_slow(EvalValue &&v);
 
@@ -811,7 +810,7 @@ public:
 
     /* The overwhelmingly common put is a plain slot write (no container
      * back-pointer - frame slots, dict values, globals, captures): keep THAT
-     * inline (H2: the out-of-line get_value_for_put call showed up on every
+     * inline (H2: the out-of-line element-write call showed up on every
      * VM slot write); an ARRAY-ELEMENT put (container set - the COW path)
      * takes the out-of-line slow put. */
     void put(const EvalValue &v) {
@@ -907,6 +906,17 @@ public:
         type_checks();
     }
     bool is_borrowed() const { return borrowed; }
+
+    /*
+     * The slot a write into this one lands in. For an ARRAY ELEMENT (the
+     * container back-pointer TypeArr::subscript sets) the array is detached
+     * first: a slice is made standalone, an alias's live slices covering
+     * the element are cloned. The standalone copy is NEW storage, so the
+     * result is then its element - and `this` may be FREED by then (the
+     * slice was its storage's only owner): a caller uses the result and
+     * never `this` again. Any other slot is its own target.
+     */
+    LValue *write_target();
 
     /*
      * THE ONE PLACE A DYING FRAME'S SLOT IS RELEASED. Every release scan

@@ -3375,7 +3375,7 @@ static bool fmi_has_tainted_write(
  * ⛔ THIS PASS ONLY ANSWERS THE QUESTION. Wiring the answer to an actual
  * borrow needs ONE more thing, which is NOT here: an element write through
  * a SLICE detaches it in place (`flat_store_core`'s
- * `arr.clone_internal_vec()`, `get_value_for_put`'s
+ * `arr.clone_internal_vec()`, `LValue::write_target`'s
  * `*container = container->clone()`), and that RELEASES the old
  * SharedObject - a reference a borrowed slot never took, so a refcount
  * underflow. Sliceness is a RUNTIME property, so the bind has to decide

@@ -24031,7 +24031,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * tier's twin. `a[i] = v` into a GENERAL array paid the whole
          * helper round trip: jit_store_elem_value -> vm_subscript_store
          * -> TypeArr::subscript(for_write) -> LValue::put ->
-         * get_value_for_put, i.e. a virtual subscript dispatch, an
+         * LValue::write_target, i.e. a virtual subscript dispatch, an
          * element-LValue round trip with its container back-pointer,
          * and a type-erased 32-byte assignment. Inline it is the
          * navigation, the COW guards that put would run, the reference
@@ -24189,7 +24189,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.store_base(s2, acc.r, static_cast<int32_t>(L.off_type));
             /*
              * ⛔ NO HASH INVALIDATION HERE, and that is a PROOF, not an
-             * omission. `get_value_for_put` calls invalidate_hash()
+             * omission. `LValue::write_target` calls invalidate_hash()
              * unconditionally, so the obvious twin is a byte store -
              * but deleting it was watched and caught NOTHING, which
              * sent me to the rule: `hash_is_cached()` is

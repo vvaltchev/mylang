@@ -6662,6 +6662,28 @@ static const std::vector<test> tests =
         "  out = out + str(sl[0]) + \",\";",
         "}",
         "assert(out == \"10,0,100,\");" } },
+    /* A store into a slice's element detaches the slice first: a compound
+     * int store skipped it in the VM / JIT (the parent saw the write), and
+     * a slice that is its storage's only owner freed the element mid-store
+     * (an ASan use-after-free in every engine). Until 2026-10-08. */
+    { "slice element store: a compound int store detaches the slice",
+      { "var a = dynarray([1, 2, 3]);",
+        "var s = a[0:2];",
+        "for (var i = 0; i < 6; i++) { s[i % 2] += 1; }",
+        "assert(a[0] == 1 && a[1] == 2 && s[0] == 4 && s[1] == 5);",
+        "var u = dynarray([1, 2, 3])[1:3];",
+        "u[0] *= 5;",
+        "assert(u[0] == 10 && u[1] == 3);" } },
+    { "slice element store: the slice owns its storage alone",
+      { "func mk() { var big = [[1], [2], [3]]; return big[0:2]; }",
+        "var t = 0;",
+        "for (var k = 0; k < 6; k++) {",
+        "  var v = mk();",
+        "  v[k % 2] = [k];",
+        "  v[1 - k % 2][0] += 1;",
+        "  t += v[0][0] + v[1][0];",
+        "}",
+        "assert(t == 30);" } },
     { "slice hoist: zero-iteration loop stays throw-free",
       { "var base = [1, 2, 3];",
         "var zarr = [];",
