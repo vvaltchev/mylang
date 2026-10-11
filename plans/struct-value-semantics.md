@@ -148,6 +148,10 @@ is allowed. At run time no engine enforces const on a parameter, so a
 
 ## Phase 2: `class`
 
+**Superseded by plans/class-and-box.md** (2026-10-08): the decided class
+design, the `box()` proposal and the open points. The paragraph below is
+the original note, kept for the record.
+
 `class Name { ... }`: the declaration grammar of a struct; reference
 semantics (never owned/cloned - a write goes into the shared object);
 never flat in an array and never embedded inline (always boxed); a
