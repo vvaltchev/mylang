@@ -3515,6 +3515,12 @@ and it lives *inside the parser*. Mechanics:
   side effects: `-s` / `:show` show the synthetic `var K = 5`, and in the
   REPL it lands in the run-time map, so `cmd_globals` lists the CONST
   scope first and skips a run-time entry of the same name.
+- **A CONST MULTI-DECLARATION IS UNPACKED AS WRITTEN (H7, 2026-10-06).**
+  **`LiteralArray::unpacked`** (syntax.h, stamped by `pExpr14` on an
+  IdList's literal rvalue, `var` or `const`) stops the parse-time
+  `const_values_widen`: `const x, y = [12, 2.5]` gave `x` the float 12.0
+  where the `var` form gave 12 (the run-time paths were right already -
+  the inferencer's `lit_coerce_by_parent`).
 - **An explicit `pure func`'s name is a CONST binding in the REPL (H3,
   2026-10-06)** - `FuncDeclStmt::do_eval`'s map path emplaces it const
   (`desc->explicit_pure`), as a struct name already was, so `a = 3` is

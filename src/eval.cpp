@@ -2266,7 +2266,7 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
         if (elem_coerce != DeclType::none) {
             for (size_t i = 0; i < n; i++)
                 buf[i] = literal_widen(std::move(buf[i]), elem_coerce);
-        } else if (is_const && ctx->in_const_eval()) {
+        } else if (is_const && !unpacked && ctx->in_const_eval()) {
             /* only the PARSE-TIME build: at run time an unstamped literal
              * means no inference ran (-nti), so no typed reader trusts
              * a type, and the VM builds it unwidened too */
