@@ -219,6 +219,10 @@ struct CsLocKey {
 struct Scope {
     std::unordered_map<const UniqueId *, TypeSym *> syms;
     Scope *parent = nullptr;
+    /* the names in `syms` that are a closure's CAPTURES: each is bound to
+     * the outer symbol (a capture has its type), but is its own binding -
+     * never the outer `const` */
+    std::unordered_set<const UniqueId *> capture_names;
 };
 
 class Inferencer {
@@ -280,6 +284,9 @@ private:
     std::vector<std::unique_ptr<Scope>> all_scopes;
 
     std::unordered_map<const Construct *, TypeSym *> id_sym;
+    /* the identifiers id_sym bound through a capture (Scope::capture_names),
+     * re-decided at every resolution exactly like id_sym */
+    std::unordered_set<const Construct *> capture_uses;
     std::unordered_map<const Construct *, FuncInfo *> func_of_decl;
     /*
      * Subtrees a pass CUT OUT of the tree while the node-keyed maps
@@ -374,6 +381,7 @@ private:
     Scope *new_scope(Scope *parent);
     TypeSym *new_sym(const UniqueId *name, Scope *s, Loc loc);
     static TypeSym *lookup(Scope *s, const UniqueId *name);
+    static bool resolves_to_capture(Scope *s, const UniqueId *name);
     FuncInfo *callee_funcinfo(Construct *e);   /* named func or inline lambda */
     static bool is_builtin(const UniqueId *name);
     static bool always_exits(const Construct *n);
@@ -603,6 +611,15 @@ TypeSym *Inferencer::lookup(Scope *s, const UniqueId *name)
             return it->second;
     }
     return nullptr;
+}
+
+/* `name` in scope `s` binds a closure's capture */
+bool Inferencer::resolves_to_capture(Scope *s, const UniqueId *name)
+{
+    for (; s; s = s->parent)
+        if (s->syms.count(name))
+            return s->capture_names.count(name) != 0;
+    return false;
 }
 
 /* The FuncInfo a callee expression denotes, if statically a specific function:
@@ -3517,8 +3534,10 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         if (fd->captures)
             for (auto &cap : fd->captures->elems) {
                 TypeSym *outer = lookup(s, cap->uid);
-                if (outer)
+                if (outer) {
                     fscope->syms[cap->uid] = outer;
+                    fscope->capture_names.insert(cap->uid);
+                }
                 id_sym[cap.get()] = outer;
             }
 
@@ -3670,6 +3689,10 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
          * kept (keeping it bound a callee to a prior clone -> the bug).
          * walk_struct visits each node once, so this never double-resolves. */
         id_sym[id] = lookup(s, id->uid);
+        if (resolves_to_capture(s, id->uid))
+            capture_uses.insert(id);
+        else
+            capture_uses.erase(id);
         /* reached for every reference EXCEPT a call callee (handled above): a
          * value (non-callee) use. */
         if (TypeSym *sym = id_sym[id])
@@ -5797,8 +5820,9 @@ void Inferencer::check(Construct *n)
             return;
         }
 
-        /* not a const target (when the const survived as a symbol). */
-        if (id) {
+        /* not a const target (when the const survived as a symbol) - a
+         * capture of one is the closure's own binding */
+        if (id && !capture_uses.count(id)) {
             auto it = id_sym.find(id);
             if (it != id_sym.end() && it->second && it->second->const_decl)
                 mismatch("cannot '++'/'--' a const", idc->start, idc->end);

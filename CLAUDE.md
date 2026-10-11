@@ -4481,6 +4481,13 @@ decisions behind it: `plans/archived/type-inference.md`,
   idlist target) - `contribute` used to pass `Loc()` as the end, a
   zero-width caret. The one site with no node is value-template
   instantiation's phantom signature contribution (`Loc(), Loc()`).
+  **A CAPTURE'S INNER NAME IS BOUND TO THE OUTER `TypeSym` (it shares the
+  outer's static type, by design) BUT IS ITS OWN BINDING (H6):**
+  `Scope::capture_names` marks those aliases and `capture_uses` records
+  each identifier resolved through one - inserted OR ERASED at every
+  resolution, exactly as `id_sym` is overwritten, so a reused node address
+  keeps no stale entry. A const check on a target (the `++`/`--` "cannot
+  ++ a const") skips them.
 - **Mandatory `dyn`** (`enforce_concrete_decls`, ON by default via
   `infer_types(strict=true)`, off under `-nti`): a plain `var`/`const` must
   infer a *concrete* type; if its type is `dyn` it throws `DynRequiredEx`
