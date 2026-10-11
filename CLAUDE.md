@@ -481,8 +481,16 @@ same lane passes a relative one, and a `.d` whose target string differs
 from the object make is asked for matches nothing - every header change
 was silently ignored for that lane, and a stale `serialize.o` kept the
 old opcode count and refused every image holding a new opcode as
-"corrupt". After a header change, a surprising result from a lane
-`tests/run` also builds is a reason to `make clean` that lane first.
+"corrupt". **And the Makefile makes `BUILD_DIR` absolute before using
+it (2026-10-10):** "relative to the repo" means relative to make's
+CURDIR, so a `.d` written by a build run from ANOTHER directory (a copy
+of the tree building into this lane) held only absolute spellings, and
+the next relative build missed every header again - a stale
+`backtrace.o` against a grown `ParamDesc`, an ASan heap-buffer-overflow
+in every compile. Every target is now requested by its absolute name,
+which every `.d` holds. After a header change, a surprising result from
+a lane `tests/run` also builds is still a reason to `make clean` that
+lane first.
 
 **⛔ DEBUG INFO IS OFF BY DEFAULT — `DEBUG_INFO` (default 0, EVERY build
 type, both build systems; maintainer-set 2026-08-26).** The `-ggdb` that

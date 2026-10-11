@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 BUILD_DIR ?= build
+# Every object is named by its ABSOLUTE path, however BUILD_DIR was given:
+# the .d files name it that way (DEPFLAGS below), so a header change
+# rebuilds it whichever spelling the next build uses. See DEPFLAGS.
+override BUILD_DIR := $(abspath $(BUILD_DIR))
 PROJ_ROOT:=$(shell pwd)
 
 OPT ?= 1
@@ -220,6 +224,14 @@ DEPDIR := $(BUILD_DIR)/.d
 # stale vm.o compiled against the old Chunk layout (an ASan stack
 # overflow in vm_compile). The third is the path relative to the
 # Makefile's directory, whichever spelling the build was given.
+# AND THE SPELLINGS WERE STILL NOT ENOUGH (2026-10-10): the relative one
+# is relative to make's CURDIR, so a .d written by a build run from
+# ANOTHER directory (a copy of the tree, building into this lane) named
+# the absolute path three times, and a later relative build missed every
+# header again - a stale backtrace.o against a grown ParamDesc, an ASan
+# heap-buffer-overflow in every compile. BUILD_DIR is made absolute at
+# the top of this file now, so make always asks for the absolute target,
+# which every .d names.
 DEP_REL = $(patsubst $(CURDIR)/%,%,$(abspath $@))
 DEPFLAGS = -MT $@ -MT $(abspath $@) -MT $(DEP_REL) -MMD -MP \
            -MF $(DEPDIR)/$*.Td
