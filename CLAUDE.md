@@ -3267,7 +3267,11 @@ A `fl` bitmask of `pFlags` (`pInDecl`, `pInConstDecl`, `pInLoop`, `pInStmt`,
 under `pInLoop`, `return` only under `pInFuncBody`, `rethrow` only under
 `pInCatchBody`, and
 `var`/`const` set `pInDecl`/`pInConstDecl` so `pExpr14` knows to *declare*
-rather than *assign*.
+rather than *assign*. **A function literal's body starts from none of
+them** (`body_fl` in `pAcceptFuncDecl`, 2026-10-11): inherited, a `break`
+in a lambda inside a loop and a `rethrow` in one inside a catch body
+parsed (the codegen then refused them, NotLoweredEx), and a lambda in a
+`const` declaration's rvalue took its own `var t` for a const.
 
 ### Const-evaluation — the central design feature
 

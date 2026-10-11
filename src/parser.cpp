@@ -3530,6 +3530,20 @@ pAcceptFuncDecl(ParseContext &c,
     if (is_pure)
         c.pure_depth++;                /* #54: see ParseContext::folding */
 
+    /*
+     * The body is a new context: nothing of the statement the function
+     * literal stands in carries into it. Inherited, a `break` in a lambda
+     * inside a loop and a `rethrow` in one inside a catch body parsed, and
+     * the codegen then refused them (NotLoweredEx); and a lambda in a
+     * `const` declaration's rvalue parsed its own `var t = a;` as a const
+     * declaration (ExpressionIsNotConstEx) and `t = a` as a store into
+     * the folded constant.
+     */
+    const unsigned body_fl = fl & ~(pFlags::pInDecl | pFlags::pInConstDecl
+                                    | pFlags::pInLoop | pFlags::pInCatchBody
+                                    | pFlags::pInOptDecl
+                                    | pFlags::pInDynDecl);
+
     if (pAcceptOp(c, Op::arrow)) {
 
         /*
@@ -3540,7 +3554,7 @@ pAcceptFuncDecl(ParseContext &c,
          * via func_expr_body (syntax.h); the synthetic nodes carry the
          * expression's locs so carets/backtraces are unchanged.
          */
-        unique_ptr<Construct> ex = pExpr14(c, fl);
+        unique_ptr<Construct> ex = pExpr14(c, body_fl);
         auto rs = make_unique<ReturnStmt>();
         rs->start = ex->start;
         rs->end = ex->end;
@@ -3551,7 +3565,8 @@ pAcceptFuncDecl(ParseContext &c,
         blk->elems.push_back(std::move(rs));
         func->body = std::move(blk);
 
-    } else if (!pAcceptBracedBlock(c, func->body, fl | pFlags::pInFuncBody)) {
+    } else if (!pAcceptBracedBlock(c, func->body,
+                                   body_fl | pFlags::pInFuncBody)) {
 
         throw SyntaxErrorEx(
             c.get_loc(),
