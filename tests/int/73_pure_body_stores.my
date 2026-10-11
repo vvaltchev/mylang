@@ -1,0 +1,72 @@
+# INT-ENGINES: tw default nj noopt
+#
+# An explicit `pure` function RUNS at parse time when its arguments are
+# constant - before inference stamps how a store converts its value - so
+# the parser stamps the body's stores from its declarations
+# (pure_stamp_stores, parser.cpp). Every scoping form (a try body, a catch
+# with and without a variable, a finally, a multi-declaration) and every
+# store form (a declared numeric variable, an element, a field, a compound
+# store, a store into a container no declaration types) must give the
+# folded call exactly the run-time call's answer (RULE 2).
+struct V { float f; array<float?> a; }
+
+pure func p_try(int n) {
+    array<float?> a = [none, none, none];
+    try {
+        a[0] = n;
+    } catch (TypeErrorEx as e) {
+        a[0] = 7;
+    } catch (KeyNotFoundEx) {
+        a[0] = 8;
+    } finally {
+        a[1] = n;
+    }
+    try {
+        var t = [1][n];
+        a[2] = t;
+    } catch (OutOfBoundsEx as a) {
+        a = 3;
+    }
+    return a;
+}
+assert(str(p_try(1)) == str(p_try(int(runtime(1)))));
+assert(str(p_try(1)) == "[1.000000, 1.000000, <none>]");
+
+pure func p_multi(int n) {
+    float x, y = [0.5, 0.5];
+    x = n;
+    y = n + 1;
+    var z = 0;
+    z = n;
+    int i, j = [1, 2];
+    i = n;
+    return str(x) + " " + str(y) + " " + str(z) + " " + str(i) + " "
+        + str(j);
+}
+assert(p_multi(2) == p_multi(int(runtime(2))));
+assert(p_multi(2) == "2.000000 3.000000 2 2 2");
+
+pure func p_stores(int n) {
+    V v = V(0.5, [none]);
+    v.f = n;
+    v.f += n;
+    v.a[0] = n;
+    var u = [0.5];
+    u[0] = n;
+    var dyn w = [none];
+    w[0] = n;
+    array<float> fa = [0.5];
+    fa[0] += n;
+    dict<str, float> d = {"k": 0.5};
+    d["k"] = n;
+    d.k += n;
+    return str(v.f) + " " + str(v.a[0]) + " " + str(w[0]) + " "
+        + str(fa[0]) + " " + str(d["k"]) + " " + str(len(u));
+}
+assert(p_stores(3) == p_stores(int(runtime(3))));
+assert(p_stores(3) == "6.000000 3.000000 3 3.500000 6.000000 1");
+
+const FOLDED = [str(p_try(4)), p_multi(4), p_stores(4)];
+assert(FOLDED == [str(p_try(int(runtime(4)))), p_multi(int(runtime(4))),
+                  p_stores(int(runtime(4)))]);
+print("ok");
