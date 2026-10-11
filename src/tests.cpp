@@ -14761,6 +14761,32 @@ static const std::vector<test> tests =
     },
 
     /*
+     * H5 (2026-10-06) - an assignment type error marks the target it
+     * names. `contribute` passed no END, so the caret had zero width.
+     */
+    {
+        "err loc: an assignment type error marks its target (H5)",
+        {
+            "var a = 1; a = \"s\";",
+        },
+        &typeid(TypeMismatchEx), 12, 1, 14, 1
+    },
+    {
+        "err loc: an element store type error marks the base (H5)",
+        {
+            "array<int> a = [1]; a[0] = \"s\";",
+        },
+        &typeid(TypeMismatchEx), 21, 1, 23, 1
+    },
+    {
+        "err loc: a multi-assignment type error marks the target (H5)",
+        {
+            "var x = 1; var y = 2; x, y = [\"s\", 2];",
+        },
+        &typeid(TypeMismatchEx), 23, 1, 25, 1
+    },
+
+    /*
      * Parse-time common-subexpression de-duplication (CSE). Identical const
      * array/dict expressions are evaluated once at parse time and the
      * resulting deep read-only value is shared, asserted here via intptr().

@@ -411,11 +411,13 @@ private:
     void reset_round();
     void commit_round();
     void accumulate(Construct *n);
-    void contribute(TypeSym *s, StaticTypeRef t, Loc loc);
-    void contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc);
+    /* `loc`..`loc_end`: the span an error about the contribution marks */
+    void contribute(TypeSym *s, StaticTypeRef t, Loc loc, Loc loc_end);
+    void contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc,
+                        Loc loc_end);
     void contribute_ret(StaticTypeRef t);
     void accumulate_assign(Expr14 *e);
-    void contribute_to_lvalue(Construct *lv, StaticTypeRef ct, Loc loc);
+    void contribute_to_lvalue(Construct *lv, StaticTypeRef ct);
     void accumulate_call(CallExpr *call);
     void accumulate_foreach(ForeachStmt *fe);
     void spread_idlist(IdList *idl, Construct *rvalue, Op op);
@@ -882,7 +884,7 @@ void Inferencer::run_fixpoint(Block *rootBlock)
                 if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
                     continue;
                 if (k < sig.size())
-                    contribute(p, sig[k], Loc());
+                    contribute(p, sig[k], Loc(), Loc());
                 k++;
             }
         }
@@ -4709,7 +4711,8 @@ void Inferencer::commit_round()
     }
 }
 
-void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
+void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
+                             Loc loc_end)
 {
     /*
      * func-name syms derive their type from func_static_type(); never
@@ -4755,7 +4758,7 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
                                                        : "has type '") +
                              static_type_to_string(pt) + "' but is assigned '" +
                              static_type_to_string(t) + "'",
-                         loc, Loc());
+                         loc, loc_end);
         }
         return;
     }
@@ -4780,7 +4783,7 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
                              "' is declared '" + static_type_to_string(d) +
                              "' but is assigned '" + static_type_to_string(t)
                                  + "'",
-                         loc, Loc());
+                         loc, loc_end);
         }
         s->acc = d;                  /* pinned: never widens */
         return;
@@ -4808,11 +4811,12 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc)
         mismatch("'" + std::string(s->name->val) + "' has type '" +
                      static_type_to_string(s->acc) + "' but is assigned '" +
                      static_type_to_string(t) + "'",
-                 loc, Loc());
+                 loc, loc_end);
     s->acc = nw;
 }
 
-void Inferencer::contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc)
+void Inferencer::contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc,
+                                Loc loc_end)
 {
     if (!param || param->dyn_decl)
         return;
@@ -4822,7 +4826,7 @@ void Inferencer::contribute_arg(TypeSym *param, StaticTypeRef argT, Loc loc)
             return;                  /* none->non-opt: flagged in check */
         argT = strip(argT);
     }
-    contribute(param, argT, loc);
+    contribute(param, argT, loc, loc_end);
 }
 
 void Inferencer::contribute_ret(StaticTypeRef t)
@@ -4873,7 +4877,7 @@ void Inferencer::accumulate(Construct *n)
          * "++ requires int/float" check, which must still reject `b++`. */
         Construct *lv = idc->lvalue.get();
         if (ctag(lv) == ConstructType::subscript || ctag(lv) == ConstructType::member)
-            contribute_to_lvalue(lv, type_of(idc), idc->start);
+            contribute_to_lvalue(lv, type_of(idc));
         return;
     }
 
@@ -4915,7 +4919,7 @@ void Inferencer::accumulate_call(CallExpr *call)
         size_t n = std::min(fi->params.size(), args->elems.size());
         for (size_t i = 0; i < n; i++)
             contribute_arg(fi->params[i], type_of(args->elems[i].get()),
-                           args->elems[i]->start);
+                           args->elems[i]->start, args->elems[i]->end);
         return;
     }
 
@@ -4957,7 +4961,7 @@ void Inferencer::accumulate_call(CallExpr *call)
             for (size_t i = 0; i < n; i++)
                 contribute_arg(ifi->params[i],
                                type_of(args->elems[i].get()),
-                               args->elems[i]->start);
+                               args->elems[i]->start, args->elems[i]->end);
             return;
         }
     }
@@ -5001,9 +5005,9 @@ void Inferencer::accumulate_call(CallExpr *call)
                             ? type_of(args->elems[key_i].get()) : A.dyn_ty();
             if (is_unknown(static_type_resolve(kt)))
                 return;
-            contribute(bs, A.dict_of(kt, vt), bid->start);
+            contribute(bs, A.dict_of(kt, vt), bid->start, bid->end);
         } else if (bt->kind == StaticTypeKind::Array) {
-            contribute(bs, A.array_of(vt), bid->start);
+            contribute(bs, A.array_of(vt), bid->start, bid->end);
         }
         /* unknown/other base kind: skip (don't guess) */
     };
@@ -5031,7 +5035,8 @@ void Inferencer::accumulate_call(CallExpr *call)
                 FuncInfo *cb = callee_funcinfo(args->elems[1].get());
                 if (cb && !cb->params.empty())
                     contribute_arg(cb->params[0], A.int_ty(),
-                                   args->elems[1]->start);
+                                   args->elems[1]->start,
+                                   args->elems[1]->end);
             }
             return;
         } else if (nm == "make_dict") {
@@ -5073,12 +5078,13 @@ void Inferencer::accumulate_call(CallExpr *call)
             return;
         StaticTypeRef el = ct->kind == StaticTypeKind::Array ? ct->elem
                   : ct->kind == StaticTypeKind::Dict  ? ct->key : A.dyn_ty();
-        Loc fl = args->elems[func_i]->start;
+        const Loc fl = args->elems[func_i]->start;
+        const Loc fle = args->elems[func_i]->end;
         auto &ps = cb->params;
         if (!ps.empty())
-            contribute_arg(ps[0], el, fl);
+            contribute_arg(ps[0], el, fl, fle);
         if (comparator && ps.size() >= 2)
-            contribute_arg(ps[1], el, fl);
+            contribute_arg(ps[1], el, fl, fle);
     }
 }
 
@@ -5095,7 +5101,7 @@ void Inferencer::spread_idlist(IdList *idl, Construct *rvalue, Op op)
             if (is_dyn(ct) && !is_dyn(strip(l)) && !is_dyn(strip(el)))
                 ct = l;
         }
-        contribute(id_sym[t], ct, t->start);
+        contribute(id_sym[t], ct, t->start, t->end);
     };
 
     const std::vector<StaticTypeRef> els = idlist_elem_types(idl, rvalue);
@@ -5171,7 +5177,7 @@ void Inferencer::accumulate_assign(Expr14 *e)
         return;
     }
 
-    contribute_to_lvalue(lv, ct, e->start);
+    contribute_to_lvalue(lv, ct);
 }
 
 /*
@@ -5183,13 +5189,13 @@ void Inferencer::accumulate_assign(Expr14 *e)
  * (a struct field leaves the struct's fixed type alone). An IdList spread is
  * caller-specific (only assignment has one).
  */
-void Inferencer::contribute_to_lvalue(Construct *lv, StaticTypeRef ct, Loc loc)
+void Inferencer::contribute_to_lvalue(Construct *lv, StaticTypeRef ct)
 {
     if (ctag(lv) == ConstructType::id) {
         auto *id = static_cast<Identifier *>(lv);
         auto it = id_sym.find(id);
         if (it != id_sym.end())
-            contribute(it->second, ct, loc);
+            contribute(it->second, ct, id->start, id->end);
         return;
     }
 
@@ -5203,9 +5209,10 @@ void Inferencer::contribute_to_lvalue(Construct *lv, StaticTypeRef ct, Loc loc)
                 if (bt->kind == StaticTypeKind::Dict)
                     contribute(it->second,
                                A.dict_of(type_of(sub->index.get()), ct),
-                               bid->start);
+                               bid->start, bid->end);
                 else if (bt->kind == StaticTypeKind::Array)
-                    contribute(it->second, A.array_of(ct), bid->start);
+                    contribute(it->second, A.array_of(ct), bid->start,
+                               bid->end);
             }
         }
         return;
@@ -5219,7 +5226,8 @@ void Inferencer::contribute_to_lvalue(Construct *lv, StaticTypeRef ct, Loc loc)
             if (it != id_sym.end() && it->second &&
                 static_type_resolve(it->second->type)->kind ==
                     StaticTypeKind::Dict)
-                contribute(it->second, A.dict_of(A.str_ty(), ct), bid->start);
+                contribute(it->second, A.dict_of(A.str_ty(), ct), bid->start,
+                           bid->end);
         }
         return;
     }
@@ -5255,7 +5263,7 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
          * matching do_iter (id_start=1 then the same tuple-unpack the
          * non-indexed 2+-var path does). Types the vars as the sub-array's
          * ELEMENT type, not the sub-array itself. */
-        contribute(sym_of(0), A.int_ty(), ids[0]->start);
+        contribute(sym_of(0), A.int_ty(), ids[0]->start, ids[0]->end);
         if (c->kind == StaticTypeKind::Dict) {
             /* A dict's "element" is the (key, value) PAIR - do_iter binds
              * ids[1]=key, ids[2]=value (count==2), NOT a destructured single
@@ -5263,9 +5271,9 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
              * both the key. (Fixing a latent front-end mis-typing the
              * tree-walker hid because it binds dynamically at runtime.) */
             if (ids.size() >= 2)
-                contribute(sym_of(1), c->key, ids[1]->start);
+                contribute(sym_of(1), c->key, ids[1]->start, ids[1]->end);
             if (ids.size() >= 3)
-                contribute(sym_of(2), c->val, ids[2]->start);
+                contribute(sym_of(2), c->val, ids[2]->start, ids[2]->end);
             return;
         }
         StaticTypeRef el = c->kind == StaticTypeKind::Array ? c->elem
@@ -5277,13 +5285,13 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
             bind = re->kind == StaticTypeKind::Array ? re->elem : el;
         }
         for (size_t i = 1; i < ids.size(); i++)
-            contribute(sym_of(i), bind, ids[i]->start);
+            contribute(sym_of(i), bind, ids[i]->start, ids[i]->end);
         return;
     }
 
     if (c->kind == StaticTypeKind::Dict && ids.size() >= 2) {
-        contribute(sym_of(0), c->key, ids[0]->start);
-        contribute(sym_of(1), c->val, ids[1]->start);
+        contribute(sym_of(0), c->key, ids[0]->start, ids[0]->end);
+        contribute(sym_of(1), c->val, ids[1]->start, ids[1]->end);
         return;
     }
 
@@ -5292,14 +5300,14 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
                 : c->kind == StaticTypeKind::Dict ? c->key : A.dyn_ty();
 
     if (ids.size() == 1) {
-        contribute(sym_of(0), el, ids[0]->start);
+        contribute(sym_of(0), el, ids[0]->start, ids[0]->end);
     } else {
         /* tuple-unpack each element (an array) into the ids */
         StaticTypeRef inner = static_type_resolve(el)->kind ==
             StaticTypeKind::Array
                            ? static_type_resolve(el)->elem : el;
         for (size_t i = 0; i < ids.size(); i++)
-            contribute(sym_of(i), inner, ids[i]->start);
+            contribute(sym_of(i), inner, ids[i]->start, ids[i]->end);
     }
 }
 
