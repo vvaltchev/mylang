@@ -8006,14 +8006,19 @@ EvalValue MemberExpr::access(const EvalValue &dval, bool for_write,
          * (an lvalue when mutable, so `d.k = v` / `d.k += v` work); missing ->
          * the default (default dict), else auto-vivify on a plain-assignment
          * target, else throw. A readonly dict's read (present / default /
-         * missing) is member_read's job.
+         * missing) is member_read's job. A read through a handle no
+         * variable holds (`[{"k": 1}][0].k`) gets the VALUE: the dict may
+         * die when the read ends, and a pointer into its entry dangled
+         * (TypeDict::subscript).
          */
         if (!obj->is_readonly()) {
             if (present)
-                return &it->second;
-            if (obj->get_has_default())      /* a new key (Cursor) */
-                return obj->insert_new(EvalValue(memId),
-                                       LValue(obj->get_default(), false));
+                return rooted ? EvalValue(&it->second) : it->second.get();
+            if (obj->get_has_default()) {    /* a new key (Cursor) */
+                LValue *lv = obj->insert_new(
+                    EvalValue(memId), LValue(obj->get_default(), false));
+                return rooted ? EvalValue(lv) : lv->get();
+            }
             if (for_write)
                 return obj->insert_new(EvalValue(memId),
                                        LValue(none, false));
