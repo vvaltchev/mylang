@@ -196,12 +196,17 @@ semantics (README, *Values that contain themselves*):
   kept by `cyc_keep_until_exit` and emptied by an atexit drain that runs
   before both detectors read the heap. A cycle the PROGRAM built is never
   kept: it is reported, and tests break theirs. Part B replaces this.
-- **The mutable bake of a folded value is a deep copy now.**
-  `MakeConstructFromConstVal` baked a `var`-bound folded container with a
-  SHALLOW `clone()`, which turned a ring into its one-step unrolling (a
+- **The mutable bake of a folded CYCLIC value is a deep copy.**
+  `MakeConstructFromConstVal` bakes a `var`-bound folded container with a
+  SHALLOW `clone()`, which turns a ring into its one-step unrolling (a
   fresh top in front of the original): a folded `var r = mk();` and the
   same call at run time then compared and printed differently (RULE 2).
-  It is `make_mutable_clone`, which reproduces the cycle.
+  A value from which a cycle can be reached is baked by
+  `make_mutable_bake`, a cycle-preserving deep copy whose dicts keep their
+  iteration order; every other value keeps the `clone()` bake. (The first
+  version deep-copied every bake with `make_mutable_clone`, which rebuilds
+  each map: `corpus_diff`'s `-nc vs default` pass caught a folded dict in
+  70_assign_value_store printing its keys in another order.)
 - **The `.myv` refusal names where the constant is, not its name**: "a
   constant at the top level", "a constant in function 'f'", "a constant in
   a lambda", "the constant 'S.K'". A chunk's constant pool has no names; a

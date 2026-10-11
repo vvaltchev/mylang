@@ -3461,20 +3461,28 @@ MakeConstructFromConstVal(const EvalValue &v,
              * the baked value is self-contained, so a small slice of a huge
              * const array doesn't pin the huge buffer.
              *
-             * A value that contains itself keeps its shape either way: both
-             * copies reproduce the cycle (cyclewalk.h). The mutable bake was
-             * a SHALLOW clone, which turned a ring into its one-step
-             * unrolling - a fresh top in front of the original ring - so a
-             * folded `var r = mk();` and the same call left to run time
-             * printed, and compared, differently. The compiler holds the
-             * bake, so a cycle in it is kept until the program ends
-             * (cyc_keep_until_exit); a frozen one already is.
+             * The mutable bake is clone(): a fresh top over v's own
+             * sub-objects, which nothing else holds - EXCEPT for a value that
+             * contains itself (cyclewalk.h). clone() of a ring is its
+             * one-step unrolling, a fresh top in front of the original ring,
+             * so a folded `var r = mk();` and the same call left to run time
+             * compared and printed differently (RULE 2). That value is
+             * copied with its cycle, each dict keeping its order as clone()
+             * keeps it (make_mutable_bake - a plain deep copy would rebuild
+             * the maps and change how a folded dict iterates), and kept until
+             * the program ends (cyc_keep_until_exit): the compiler holds it,
+             * so no program can break it. A frozen one is kept already.
              */
             const bool ro = immutable || is_readonly_value(v);
-            EvalValue baked = ro ? make_const_clone(v) : make_mutable_clone(v);
-
-            if (!ro)
-                cyc_keep_if_cyclic(baked);
+            EvalValue baked;
+            if (ro) {
+                baked = make_const_clone(v);
+            } else if (cyc_value_reaches_cycle(v)) {
+                baked = make_mutable_bake(v);
+                cyc_keep_until_exit(baked);
+            } else {
+                baked = v.clone();
+            }
 
             return place(make_unique<LiteralObj>(std::move(baked), ro));
         }

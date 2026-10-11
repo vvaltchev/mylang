@@ -2441,9 +2441,14 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
  * places that is not on the current path is copied at each, as always. A
  * read-only sub-object that is shared rather than copied cannot lead back
  * here: a frozen value holds only frozen ones.
+ *
+ * `keep_order` (make_mutable_bake): a dict copy keeps its source's
+ * iteration order - copy-constructed, then each value replaced - where the
+ * default rebuilds the map, whose order is the hash map's own.
  */
 static EvalValue
-clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
+clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st,
+                 bool keep_order = false)
 {
     if (v.is<SharedArrayObj>()) {
 
@@ -2528,7 +2533,9 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
 
         for (unsigned i = 0; i < view.size(); i++) {
             vec.emplace_back(
-                clone_to_mutable(view[i].get(), through_readonly, st), false
+                clone_to_mutable(view[i].get(), through_readonly, st,
+                                 keep_order),
+                false
             );
         }
 
@@ -2548,6 +2555,23 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
         const CycKey k = cyc_key_obj(obj.get());
         if (const EvalValue *c = st.link(k))
             return *c;
+
+        if (keep_order) {
+            /* the copy constructor keeps the source's iteration order, as
+             * clone() does; then each value is replaced by its copy (a
+             * value store: the keys, and so the order, stay) */
+            auto out = make_intrusive<DictObject>(*obj);
+            out->clear_readonly();
+            EvalValue res = intrusive_ptr<DictObject>(out);
+            CycCopyGuard g(st, k, res);
+            for (const auto &p : out->get_ref())
+                out->find_mut(p.first)->second.put(clone_to_mutable(
+                    p.second.get(), through_readonly, st, true));
+            if (out->get_has_default())
+                out->set_default(clone_to_mutable(
+                    obj->get_default(), through_readonly, st, true));
+            return res;
+        }
 
         auto out = make_intrusive<DictObject>();
         EvalValue res = intrusive_ptr<DictObject>(out);
@@ -2594,7 +2618,8 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
         out->fields.reserve(obj->fields.size());
         for (const auto &f : obj->fields)
             out->fields.emplace_back(
-                clone_to_mutable(f.get(), through_readonly, st), false);
+                clone_to_mutable(f.get(), through_readonly, st, keep_order),
+                false);
         return res;
     }
 
@@ -2611,6 +2636,12 @@ EvalValue make_deep_mutable_clone(const EvalValue &v)
 {
     CycCopyStack st;
     return clone_to_mutable(v, true, st);
+}
+
+EvalValue make_mutable_bake(const EvalValue &v)
+{
+    CycCopyStack st;
+    return clone_to_mutable(v, false, st, true);
 }
 
 /*
