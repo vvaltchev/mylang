@@ -223,3 +223,43 @@ semantics (README, *Values that contain themselves*):
   engine** (`-tw`, `-nj`, the JIT, `-nbi`, `-nc`, `--no-opt all`, `-nti`).
   What it needs is an element store: `append` is a run-time builtin and is
   undefined inside a pure function at compile time.
+
+### Watched failing (2026-10-08)
+
+Each guard was removed alone on the debug ASan build (the work
+committed first; the file copied aside, restored by a plain copy and a
+touch, rebuilt inside the restore), and the same checks were run again
+afterwards as a CONTROL - every control passed. The checks:
+`81_cyclic_values.my` under `-tw` and the default engine, the `-rt`
+cases matching `cycle|contains itself|myv: a constant` (in all five
+modes), and `driver_checks` for the writer.
+
+| sabotage                                  | caught by                    |
+|-------------------------------------------|------------------------------|
+| print: array `[...]` check                | functional x2, -rt           |
+| print: dict `{...}` check                 | functional x2, -rt           |
+| print: struct `Name(...)` check           | functional x2, -rt (output)  |
+| REPL pretty: array push before expanding  | -rt (the `repl:` echo case)  |
+| REPL pretty: array early `[...]` check    | nothing - redundant (1)      |
+| ==: array back edge                       | functional x2, -rt           |
+| ==: dict back edge                        | functional x2, -rt           |
+| ==: struct back edge                      | nothing - redundant (2)      |
+| ==: depth rule (back edge always equal)   | functional x2, -rt           |
+| ==: identity shortcut unrestricted        | functional x2, -rt           |
+| hash: array back edge                     | functional x2, -rt           |
+| hash: dict back edge                      | functional x2, -rt           |
+| hash: back edge by identity, not depth    | functional x2, -rt           |
+| deepclone: array link to the copy         | functional x2, -rt           |
+| freeze (make_const_clone): array link     | functional x2, -rt           |
+| static type: back edge                    | functional x2, -rt           |
+| .myv writer: refusal                      | -rt (extra check), driver    |
+| keep-until-exit: nothing kept             | functional x2, -rt (LSan)    |
+| bake: shallow clone() of a cyclic value   | functional x2, -rt (values)  |
+
+(1) `pretty` calls `to_string_repr` first, which answers `[...]` from the
+same render stack. (2) A struct is a value, so a cycle through a boxed
+struct always passes through an array or a dict, whose guard ends the
+walk; the struct's `==` back-edge check is defence in depth, not
+observable (its `hash` twin by the same argument - that one was not
+run). Its PRINT check is observable - one level of unrolling more - and
+is pinned.
