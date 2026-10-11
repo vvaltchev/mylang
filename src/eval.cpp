@@ -3668,17 +3668,12 @@ static EvalValue widen_baked_rec(const EvalValue &v, const WidenShape &w,
                             : kv.second.get());
         any |= ck2 || cv;
     }
-    EvalValue dflt;
-    bool cdef = false;
-    if (d.get_has_default() && w.sub)
-        dflt = widen_baked_rec(d.get_default(), *w.sub, st, cdef);
-    if (!any && !cdef)
+    /* (no default to widen: a default dict is `dict(v)`'s value, which a
+     * written literal - the only value this widens - cannot hold) */
+    if (!any)
         return v;
     changed = true;
     EvalValue r = build_dict_from_pairs(buf.data(), buf.size() / 2, false);
-    if (d.get_has_default())
-        r.get<intrusive_ptr<DictObject>>()->set_default(
-            cdef ? dflt : d.get_default());
     if (d.is_readonly())
         r = make_const_clone(r);
     return r;

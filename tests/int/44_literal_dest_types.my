@@ -155,6 +155,15 @@ const KC = C(5);
 pure func mkc() { var dyn a = [KC]; return a; }
 array<C> acf = mkc();
 want("acf", str(acf) + array_storage(acf), "[C(v: 5)]class");
+# ...and one bound to a `dyn` variable is made general (any value fits)
+pure func mkcg() { var a = [KC, KC]; return a; }
+var dyn dkg = mkcg();
+dkg[0] = "s";
+want("dkg", str(dkg), "[\"s\", C(v: 5)]");
+pure func mkpg() { var a = [P(1, 2.5)]; return a; }
+var dyn dpg = mkpg();
+dpg[0] = 3;
+want("dpg", str(dpg), "[3]");
 pure func mkcd() { array<dyn> a = [KC, KC]; return a; }
 array<C> acf2 = mkcd();
 want("acf2", str(len(acf2)) + array_storage(acf2), "2class");
