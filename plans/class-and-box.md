@@ -142,6 +142,44 @@ references, and a struct's hash was salted with its def's address. A third
 was fixed in this step: a struct's `const` member could not hold a struct
 construction (its initializer was not parsed as a constant's).
 
+## Step 2 design - `array<C>` as a flat vector of references
+
+A new `SharedObject::Storage::objs`: a vector of `StructObject *`, each
+an owned reference (sharedarray.h cannot see `StructObject` complete, so
+the retain and the release are out-of-line functions), 8 bytes per
+element against a general array's 48-byte `LValue`, a null pointer for
+`none` (`array<opt C>`). It follows the
+`strs` model (top-10 #7), not the scalar one:
+
+- CREATION is type-driven: an `ArrHint::flat_c` (with `arr_hint_struct`
+  naming the class) on an array whose destination is `array<C>` /
+  `array<opt C>`, stamped by `set_array_repr_hint` exactly where `flat_s`
+  is for a POD struct. A literal, an empty `[]`, `array(n)` and
+  `make_array` honour it; anything else stays general.
+- HOT PATHS read and write the handles directly: element read (boxing a
+  handle is a retain), element store of an instance of that class or
+  `none` (anything else PROMOTES - `dyn` laundering), append, pop, len,
+  foreach, slices (offset/len, as every flat kind), ==, hash, printing,
+  clone (a handle copy), const freezing (each instance frozen in place),
+  the `.myv` array record (a new storage kind, its elements `cls`
+  records).
+- EVERY OTHER op promotes IN PLACE through `get_vec()` (insert, erase,
+  sort, reverse, map, filter, ...), as a strs or structs array does - so
+  a missing fast path costs speed, never an answer.
+- A STORE THROUGH AN ELEMENT (`a[i].v = 5`) needs no location: the
+  element is a reference, so the walk reads the handle and stores into
+  the instance (a temporary holder for `struct_own`, which hands a class
+  instance back as it is). The tree-walker's store walk and the VM's
+  `vm_chain_walk` each get that one step; the JIT's element tiers decline
+  a non-general storage to their helpers today, which stays correct.
+- `array_storage()` reports `"class"`.
+
+Nets to build with it: the functional test's arrays of classes under
+every engine and lever, `array_storage` checks that the flat kind is
+really chosen (else the test is vacuous), promotion by every cold op,
+a `dyn` alias storing a non-instance, and a `.myv` round trip of a
+constant `array<C>`.
+
 ## Corrections to plans/struct-value-semantics.md
 
 Its phase-2 paragraph said a class is "never flat in an array" - decided
