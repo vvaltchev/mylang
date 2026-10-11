@@ -100,6 +100,11 @@ LANES = {l.name: l for l in [
     Lane("rel-hard", "TESTS=1 OPT=1 VM_HARDENING=1",
          "optimized, asserts and VM hardening on",
          expect={"tests": "1", "vm_hardening": "1"}),
+    # VM_HARDENING's audits with no TESTS poison behind them, and the
+    # native stack on (ASan turns it off): no other lane builds this
+    Lane("dbg-nt", "OPT=0 ASAN=0 UBSAN=0",
+         "debug, no -rt suite, no sanitizers",
+         expect={"tests": "0", "vm_hardening": "1", "asan": "0"}),
     Lane("release", "OPT=1", "the shipping build, no -rt suite",
          expect={"tests": "0", "asserts": "1"}),
     Lane("ship", "OPT=1 ASSERTS=0", "the shipping build without asserts",
@@ -314,9 +319,10 @@ def catalog():
 
     # diff: the engines against each other
     cd = T("corpus_diff")
-    add("corpus_diff", "diff", "short", "dbg", 15, lambda c: [cd, c.b],
-        wide=True, cases="corpus",
-        desc="every engine agrees with the tree-walker")
+    t = add("corpus_diff", "diff", "short", "dbg", 15, lambda c: [cd, c.b],
+            wide=True, cases="corpus",
+            desc="every engine agrees with the tree-walker")
+    on(t, "dbg-nt", 15)
     for mode, cls, est, guards, lanes in (
             ("levers", "med", 90, [], ["release"]),
             ("cold", "med", 30, [], ["release"]),
@@ -378,7 +384,8 @@ def catalog():
     t = add("driver_checks", "cli", "short", "dbg", 30,
             lambda c: [T("driver_checks"), c.b],
             desc="the command-line flags do what they say")
-    for lane in ("clang", "rel-hard", "release", "rna", "int-gcov"):
+    for lane in ("clang", "rel-hard", "release", "rna", "int-gcov",
+                 "dbg-nt"):
         on(t, lane, 30)
     t = add("myv_doc_check", "cli", "short", "dbg", 20, myv_doc,
             desc="docs/myv-format.txt reads every image")

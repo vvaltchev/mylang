@@ -155,6 +155,8 @@ catalog tests.
 | Linux lto0 x2            | make + cmake       | rt@lto0, driver_checks@   |
 |                          | (lto0, ship)       | lto0, system_smoke@ship   |
 | Linux dbginfo x2         | make (dbg)         | rt                        |
+| Linux debug-notests      | make (dbg-nt)      | corpus_diff@dbg-nt,       |
+|                          |                    | driver_checks@dbg-nt      |
 | macOS                    | cmake (clang)      | rt@clang                  |
 | Windows x2               | cmake MSVC (dbg,   | rt @lane                  |
 |                          | rel-hard)          |                           |

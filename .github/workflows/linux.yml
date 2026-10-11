@@ -191,6 +191,36 @@ jobs:
   # job; this only answers "does the shipped binary work at all". A plain
   # no-TESTS build ALSO catches a declaration that escaped a TESTS guard -
   # exactly the bug that broke `make` with no flags once (the norec decls).
+  # A DEBUG build with no -rt suite and no sanitizers (tests/run's dbg-nt
+  # lane): VM_HARDENING's audits run there with no TESTS poison behind
+  # them and with the native stack on (ASan turns it off) - a pairing no
+  # other lane has. jit_ret_audit read a frameless window's raw stack
+  # slots and SEGFAULTED on it until 2026-10-11.
+  debug-notests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
+
+    - name: Build (make OPT=0 ASAN=0 UBSAN=0)
+      run: make -j OPT=0 ASAN=0 UBSAN=0 BUILD_DIR=build-dbg-nt
+
+    # tests/run checks the binary is that lane (tests 0, vm_hardening 1,
+    # asan 0) before it runs anything
+    - name: corpus_diff and driver_checks
+      shell: bash
+      run: tests/run -o --logs test-logs
+           --bin dbg-nt=build-dbg-nt/mylang
+           corpus_diff@dbg-nt driver_checks@dbg-nt
+    - name: Upload the test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{github.job}}
+        path: test-logs/
+        if-no-files-found: ignore
+
   release-smoke:
     runs-on: ubuntu-latest
     strategy:

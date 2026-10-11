@@ -358,6 +358,8 @@ tests/run makes these on demand, each under build-tests/NAME:
 | dbg         | TESTS=1 OPT=0                               | the quick run  |
 | clang       | CXX=clang++ TESTS=1 OPT=0                   | rt@clang       |
 | rel-hard    | TESTS=1 OPT=1 VM_HARDENING=1                | rt@rel-hard    |
+| dbg-nt      | OPT=0 ASAN=0 UBSAN=0 (no -rt suite)         | corpus_diff,   |
+|             |                                             | driver_checks  |
 | release     | OPT=1                                       | system_smoke   |
 | ship        | OPT=1 ASSERTS=0                             | CI only        |
 | rna         | OPT=1 ASSERTS=0 TESTS=1                     | no-assert runs |
