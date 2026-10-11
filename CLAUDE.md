@@ -4364,7 +4364,11 @@ decisions behind it: `plans/archived/type-inference.md`,
   ctx - structs register their descriptor there at parse time, with or without
   `-nc`, which turns off folding only (#54)): a name that doesn't resolve
   to a struct type is a clear `SyntaxErrorEx` ("'foo' is not a type"), not
-  a silent fall-through.
+  a silent fall-through. **It walks the WHOLE const scope chain:**
+  `EvalContext::lookup` is local, and asking the innermost scope alone made
+  `P p;` in every function body and block "not a type" - unnoticed until
+  2026-10-07, because no test declared a struct-typed local below the top
+  level.
   **Decl-vs-ternary:** a `T ? name` run is ambiguous with a ternary
   (`flag ? a : b`), so when a `?` was seen the scanner requires the token after
   `name` to be a decl terminator (`is_decl_terminator`: `;` `=` `,` `}` EOF) —
