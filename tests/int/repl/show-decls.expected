@@ -1,5 +1,5 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
->> >> >> >> >> >> >> >> >> >> >> >> => "Q(bool b, int i, float f, str s, array a, dict d, dyn y, box<int> bx, P p, opt dyn od, opt array oa, opt dict odc, array<int>? ai, dict<str,int> di, box<float>? bf, opt K ok)"
+>> >> >> >> >> >> >> >> >> >> >> >> >> => "Q(bool b, int i, float f, str s, array a, dict d, dyn y, box<int> bx, P p, opt dyn od, opt array oa, opt dict odc, array<int>? ai, dict<str,int> di, box<float>? bf, opt K ok)"
 >> b: bool 
 i: int 
 f: float 
@@ -67,7 +67,7 @@ ok: opt K
 >> => [inf, -inf, nan, 3.141593]
 >> => {"a": 1}
 >> => {"b": [2.500000], "c": 3}
->> .. .. .. .. .. .. .. .. .. .. >> => [1, 1, 2, 1, 1, 1, 2, 1]
+>> >> .. .. .. .. .. .. .. .. .. .. >> => [1, 1, 2, 1, 1, 1, 2, 1]
 >> /* pure */ array<int> func vals() {
     array<array<dyn>> r = [[1, [...]]];
     array<dict<str,dyn>> e = [{"me": {...}}];

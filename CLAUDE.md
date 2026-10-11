@@ -4805,7 +4805,13 @@ decisions behind it: `plans/archived/type-inference.md`,
   literal baked at parse time, `widen_baked_value` rewrites the
   LiteralObj once). Only a WRITTEN literal: `LiteralObj::from_literal`
   marks a bake of `[...]` / `{...}`, so a folded call or a named const
-  of another element type is still refused. A typed `const` container
+  of another element type is still refused - and only a literal whose
+  every element is written too (`is_container_literal`, parser.cpp): an
+  element that is a call's value or a named constant (`[f()]`, `[K]`,
+  `[dict(1)]`) is checked as that value, so such a literal is not baked
+  for a `var` (a const's bake is checked whole). It was baked and given
+  the widening at every level, so `array<array<float>> m = [f()];`
+  compiled and was refused under -nc (#74). A typed `const` container
   is widened by the PARSER when it binds it (pExpr14), because a read of
   it folded at parse time (`str(F)`) must see the run's value.
   Its STORAGE follows the destination too, at every nesting level

@@ -755,11 +755,56 @@ pAcceptForStmt(ParseContext &c,
                unique_ptr<Construct> &ret,
                unsigned fl);
 
-/* A container literal written in the source (LiteralObj::from_literal) */
+static bool is_container_literal(const Construct *n);
+
+/* An element of a written container literal that is written too: a
+ * scalar literal, a container literal (recursively), or one baked from
+ * such a literal already */
+static bool is_written_elem(const Construct *n)
+{
+    switch (ctag(n)) {
+    case ConstructType::lit_int:
+    case ConstructType::lit_bool:
+    case ConstructType::lit_float:
+    case ConstructType::lit_none:
+    case ConstructType::lit_str:
+        return true;
+    case ConstructType::lit_arr:
+    case ConstructType::lit_dict:
+        return is_container_literal(n);
+    case ConstructType::lit_obj:
+        return static_cast<const LiteralObj *>(n)->from_literal;
+    default:
+        return false;
+    }
+}
+
+/*
+ * A container literal written in the source (LiteralObj::from_literal):
+ * `[...]` / `{...}` whose every element - key and value - is written too.
+ * One holding a call's result or a named constant (`[f()]`, `[K]`,
+ * `[dict(1)]`) is not: that element is checked as the value it is, which
+ * takes no declared type (README) - as the unfolded literal's element is
+ * under -nc.
+ */
 static bool is_container_literal(const Construct *n)
 {
-    return n && (ctag(n) == ConstructType::lit_arr
-                 || ctag(n) == ConstructType::lit_dict);
+    if (!n)
+        return false;
+    if (ctag(n) == ConstructType::lit_arr) {
+        for (const auto &el : static_cast<const LiteralArray *>(n)->elems)
+            if (!is_written_elem(el.get()))
+                return false;
+        return true;
+    }
+    if (ctag(n) == ConstructType::lit_dict) {
+        for (const auto &kv : static_cast<const LiteralDict *>(n)->elems)
+            if (!is_written_elem(kv->key.get())
+                || !is_written_elem(kv->value.get()))
+                return false;
+        return true;
+    }
+    return false;
 }
 
 /* The storage a parsed `array<...>` annotation gives an array - the
@@ -2564,10 +2609,21 @@ pExpr14_body(ParseContext &c, unsigned fl)
      * WRITTEN (`x, y = [12, 2.5]` gives x the int 12 - README): baking the
      * literal would widen it to its joined type first, so it stays a
      * literal (its elements are folded already). */
+    /* Nor is a container literal holding a call's result or a named
+     * constant baked for a `var`: a declared type checks each element of
+     * a literal (the inferencer's literal_fits), the written ones widening
+     * and those as the values they are; baked whole, the value would be
+     * checked as if all of it were written (`array<array<float>> m =
+     * [f()];` compiled, and was refused under -nc). A const's bake is
+     * what the const IS, so it stays, checked as a whole. */
     else if (ret->rvalue->is_const
         && !dynamic_cast<LiteralObj *>(ret->rvalue.get())
         && !(in_idlist
-             && ctag(ret->rvalue.get()) == ConstructType::lit_arr))
+             && ctag(ret->rvalue.get()) == ConstructType::lit_arr)
+        && ((fl & pFlags::pInConstDecl)
+            || !(ctag(ret->rvalue.get()) == ConstructType::lit_arr
+                 || ctag(ret->rvalue.get()) == ConstructType::lit_dict)
+            || is_container_literal(ret->rvalue.get())))
     {
         unique_ptr<Construct> cc;
 

@@ -2,9 +2,10 @@
 # parameter, a local, a multi-declaration - and every field type of a
 # struct declared in a body (reflect_field_type); signature() and layout()
 # read the same renderings. Constants a body names are BAKED values the
-# decompiler writes back as code: floats that read back as the same
-# double, arrays, dicts, POD and slot structs, class instances, and
-# cyclic constants, whose back edge renders as the print form does.
+# decompiler writes back as code - through a folded call, since a literal
+# holding a named constant is not baked (#74): floats that read back as
+# the same double, arrays, dicts, POD and slot structs, class instances,
+# and cyclic constants, whose back edge renders as the print form does.
 struct P { int x; int y; }
 struct N { str n; int v; }
 class K { int v; }
@@ -55,15 +56,16 @@ const FL = [1.5, 0.1, 1e300, -0.0, 2.0]
 const FX = [inf, -inf, nan, math_pi]
 const DD = {"a": 1}
 const D2 = {"b": [2.5], "c": 3}
+pure func keep(v) => v
 func vals() {
-    var r = [RING]
-    var e = [DR]
-    var s = [PP, PP]
-    var n = [NN]
-    var k = [KK]
-    var f = [FL]
-    var x = [FX]
-    var d = [DD, D2]
+    var r = keep([RING])
+    var e = keep([DR])
+    var s = keep([PP, PP])
+    var n = keep([NN])
+    var k = keep([KK])
+    var f = keep([FL])
+    var x = keep([FX])
+    var d = keep([DD, D2])
     return [len(r), len(e), len(s), len(n), len(k), len(f), len(d), len(x)]
 }
 vals()

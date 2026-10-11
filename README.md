@@ -676,7 +676,11 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     type is a compile error (`var a = [1]; array<float> f = a;`) - arrays
     are references, and widening one would change it for every other name
     that holds it. Convert it explicitly
-    (`array<float> f = map(func(x) => float(x), a);`).
+    (`array<float> f = map(func(x) => float(x), a);`). The same holds for
+    such a value written as an ELEMENT of a literal: in
+    `array<array<float>> m = [[1], f()];` the `[1]` widens, while `f()`
+    must already be an `array<float>`; `[dict(1)]` is not an
+    `array<dict<str, float>>` (`dict(1)` is a call, a `dict<dyn, int>`).
     A single value stored into an element - `a[i] = 5`, `append(a, 5)`,
     `push(a, 5)`, `insert(a, 0, 5)`, a dict key or value - widens to the
     declared type the same way: `5` stored into an `array<float?>` is
