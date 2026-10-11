@@ -9624,6 +9624,37 @@ static void emit_exc_stamp(Emitter &e, const Chunk &ck, size_t old_pc,
 }
 
 /*
+ * The failure exit of an in-place builtin op (AppendV, CallBuiltinLV,
+ * CallBuiltinLVElem / LVMember, EmplaceStruct), after its helper's
+ * `test eax, eax`: stamp + exit on a nonzero status. #32: when the base is
+ * a GLOBAL - an emit-time fact (the op's kind operand) - the helper
+ * returns 2 for an UNBOUND one, with a loc-less UnboundSymbolEx in
+ * g_vm_jit_exc, which is stamped with the BASE's caret (base_locs, as the
+ * interpreted op's vm_store_base) before the op's own stamp, which then
+ * leaves it alone; the two stamps outgrow a rel8 skip. A local or capture
+ * base is always bound, and its op's bytes are unchanged.
+ */
+static void emit_lv_exc_exit(Emitter &e, const Chunk &ck, size_t old_pc,
+                             uint32_t pc, int_type kind)
+{
+    if (kind != 1) {
+        const size_t j_ok = e.j8(0x74);
+        emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56) */
+        e.exit_pc(pc);
+        e.patch8(j_ok, e.pos());
+        return;
+    }
+    const size_t j_ok = e.j32(0x74);
+    e.cmp_reg32_imm8(RAX, 2);                /* reg:abi */
+    const size_t j_bound = e.j8(0x75);       /* jne: not unbound */
+    emit_exc_stamp(e, ck, old_pc, /*args_caret=*/true, /*arg_select=*/false);
+    e.patch8(j_bound, e.pos());
+    emit_exc_stamp(e, ck, old_pc);
+    e.exit_pc(pc);
+    e.patch32_here(j_ok);
+}
+
+/*
  * #38 repro B: stamp ONLY the op's inlined-at chain (Exception::
  * jit_inline_frame) - for a conveying op whose helper already stamped
  * its own caret from a pool entry (the boxed family, LogV), so a
@@ -25628,12 +25659,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.call_direct(jit_emplace_struct);
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
-        {
-            const size_t j_ok = e.j8(0x74);
-            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe (#56) */
-            e.exit_pc(pc);
-            e.patch8(j_ok, e.pos());
-        }
+        emit_lv_exc_exit(e, ck, old_pc, pc, in.a_lit() & 3);
         return true;
 
     case OpCode::StructCtorV: {
@@ -27577,12 +27603,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.call_direct(jit_append);
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
-        {
-            const size_t j_ok = e.j8(0x74);
-            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56) */
-            e.exit_pc(pc);
-            e.patch8(j_ok, e.pos());
-        }
+        emit_lv_exc_exit(e, ck, old_pc, pc, in.a_dual_hi());
         return true;
 
     case OpCode::CallBuiltinLV:
@@ -27603,20 +27624,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.call_direct(jit_call_builtin_lv);
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
-        {
-            const size_t j_ok = e.j8(0x74);
-            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56) */
-            e.exit_pc(pc);
-            e.patch8(j_ok, e.pos());
-        }
+        emit_lv_exc_exit(e, ck, old_pc, pc, in.a_dual_hi());
         return true;
 
     case OpCode::CallBuiltinLVElem:
     case OpCode::CallBuiltinLVMember:
         /* jit_call_builtin_lv_{elem,member}(kind=a_dual_hi, base_slot=target2,
-         * dst_slot=target, run_base=b_lit, bc=&ck.builtin_calls[a_dual_lo]).
-         * `b` is always a lit here (the value-args run). Throws -> test eax +
-         * exit_pc (re-raise). */
+         * dst_slot=target, run_base=b_lit, bc=&ck.builtin_calls[a_dual_lo]
+         * [, member: mkeys=ck.member_keys.data(), the #32 chain form's
+         * member steps]). `b` is always a lit here (the value-args run).
+         * Throws -> test eax + exit_pc (re-raise). */
         emit_call_prologue(e);
         e.mov_imm(RDI, static_cast<uint64_t>(
                           static_cast<int_type>(in.a_dual_hi())));
@@ -27625,16 +27642,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.mov_imm(RCX, static_cast<uint64_t>(static_cast<int_type>(in.b_lit())));
         e.movabs(R8, 
             reinterpret_cast<uint64_t>(&ck.builtin_calls[in.a_dual_lo()]));
-        e.call_direct(
-            in.op == OpCode::CallBuiltinLVElem ? jit_call_builtin_lv_elem : jit_call_builtin_lv_member);
+        if (in.op == OpCode::CallBuiltinLVElem) {
+            e.call_direct(jit_call_builtin_lv_elem);
+        } else {
+            e.movabs(R9, reinterpret_cast<uint64_t>(ck.member_keys.data()));
+            e.call_direct(jit_call_builtin_lv_member);
+        }
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
-        {
-            const size_t j_ok = e.j8(0x74);
-            emit_exc_stamp(e, ck, old_pc);    /* collapse-safe caret (#56) */
-            e.exit_pc(pc);
-            e.patch8(j_ok, e.pos());
-        }
+        emit_lv_exc_exit(e, ck, old_pc, pc, in.a_dual_hi());
         return true;
 
     case OpCode::StoreGlobalV:

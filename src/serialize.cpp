@@ -1395,6 +1395,7 @@ void write_chunk(Writer &w, const Chunk &c)
         w.u8v(static_cast<uint8_t>(bc.arr_hint));
         write_arglocs(w, bc.args);
         w.uidv(bc.member);
+        wsteps(bc.steps);                /* v32 */
     }
 
     w.u32v(static_cast<uint32_t>(c.call_sites.size()));
@@ -1407,6 +1408,7 @@ void write_chunk(Writer &w, const Chunk &c)
         w.u32v(static_cast<uint32_t>(cs.a0_slot));
         w.u32v(static_cast<uint32_t>(cs.a0_operand));
         w.uidv(cs.a0_name);
+        wsteps(cs.a0_steps);             /* v32 */
     }
 
     ct("  builtin+callsites");
@@ -1739,6 +1741,7 @@ void read_chunk(Reader &r, Chunk &c)
                               "corrupt .myv (array hint)");
         bc.args = read_arglocs(r);
         bc.member = r.uidv();
+        bc.steps = rsteps();
         c.builtin_calls.push_back(std::move(bc));
     }
 
@@ -1750,12 +1753,13 @@ void read_chunk(Reader &r, Chunk &c)
         cs.args = read_arglocs(r);
         cs.arr_hint = r.enumv(ArrHint::flat_s,
                               "corrupt .myv (array hint)");
-        cs.a0_form = r.enumv(Chunk::CallSite::A0::undef,
+        cs.a0_form = r.enumv(Chunk::CallSite::A0::chain,
                              "corrupt .myv (call site arg0 form)");
         cs.a0_kind = static_cast<unsigned char>(r.u32v());
         cs.a0_slot = static_cast<int32_t>(r.u32v());
         cs.a0_operand = static_cast<int32_t>(r.u32v());
         cs.a0_name = r.uidv();
+        cs.a0_steps = rsteps();
         if (cs.a0_form == Chunk::CallSite::A0::undef && !cs.a0_name)
             bad_image("corrupt .myv (undefined call argument with no name)");
         c.call_sites.push_back(std::move(cs));

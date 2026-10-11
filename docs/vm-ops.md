@@ -963,9 +963,24 @@ operand, inherently node-based).
 (Phase 2c, `CallBuiltinLVElem`)**: the codegen compiles the index and records
 the base slot; the handler forms the element `LValue*` by calling the runtime
 `Type::subscript(base, idx, for_write=false)` directly — the SAME COW the
-tree-walker's `Subscript::do_eval` uses — then `func_lv`. Still fallbacks: a
-MEMBER target (`append(s.f, x)`), `insert`/`erase` with a subscript target, a
-NESTED base (`a[i][j]`), and struct construction. **THE DEFAULT
+tree-walker's `Subscript::do_eval` uses — then `func_lv`. A MEMBER target
+`append(s.f, x)` is **`CallBuiltinLVMember`** (the boxed field's `LValue*` from
+`vm_member_lvalue`, the struct OWNED first - a struct is a value). **Any other
+ACCESS CHAIN - deeper than one step (`append(o.i.a, x)`, `pop(m[0][1])`), or a
+member of a base not proven a struct (`append(dv.a, x)`, `dv` dyn) - is that
+op's CHAIN FORM (#32, 2026-10-08)**: `BuiltinCall::steps` (with `member` null)
+is walked by `vm_chain_walk`, each struct it enters owned, and the builtin works
+on what the walk reached - its `LValue*`, or its value held. A root that is not
+a variable is held in a fresh temp first (`hold_store_base`). That is the
+tree-walker's `store_base_value`, step for step (`vm_lv_member_target`). Such
+an arg0 used to be compiled as a VALUE - a copy of the handle - so the detach a
+slice field makes (it reseats the handle) never reached the field. In every
+form an UNBOUND GLOBAL base raises `UnboundSymbolEx` at the base's own caret
+(`base_locs`), as the tree-walker's read does: the interpreted ops through
+`vm_store_base`, the JIT helpers by returning status 2 with the exception
+conveyed loc-less, which `emit_lv_exc_exit` stamps with the base caret. They
+handed the builtin a null target until then - a `NotLValueEx` at the whole
+call, and a SEGV in `sort`. **THE DEFAULT
 FLIPPED 2026-07-18**: a script/`-e` run executes on the VM (both documented
 conditions long met — full parity + the VM ~2.2x the tree-walker on the
 bench geomean, suite 5.0x CPython); `-tw` selects the tree-walker, `-vm` is
@@ -1632,6 +1647,22 @@ other two; bounded by `verify_chunk`; serialized after `base_locs` as myv
 **v16** (section 9.21); printed by `-vd` with both ends of every span. An
 arity error (about the list) keeps `base_locs`' span. Record:
 docs/jit-optimizations.md, *RULE 2, refined*.
+
+**A `CallValueGenericV` arg0 is a DESCRIPTOR (`Chunk::CallSite::A0`)**, so a
+`func_lv` callee (a `dyn` holding `append`) gets the true `LValue*` while any
+other callee gets the value: `slot` (a variable, by kind), `elem` / `member`
+(one step from a variable: the value read into run[0] by `SubscriptV` /
+`MemberV`, the location re-derived at dispatch), `undef`, and **`chain`** (#32,
+2026-10-08): a deeper chain rooted at a variable - its value read step by step
+into run[0], each key into a temp at its turn (`Subscript::do_eval`'s order),
+and the steps kept in `a0_steps`, which the dispatch re-walks for a `func_lv`
+callee, owning each struct (`vm_a0_chain_lvalue`). Before it such an arg0 was
+a plain value and `f(m[0][1], 9)` raised `NotLValueEx` where the tree-walker
+appended. The tree-walker's eager path walks a variable-rooted chain with a
+member step as a store base for an lvalue callee (`indirect_lv_arg0`) - it
+wrote into a struct a copy still shared. `verify_chunk` bounds the whole
+descriptor (kind, slot, key temp, member key, steps), which it did not before
+v32.
 
 **`CheckNoneArgsV kind, callee, run` — a non-opt parameter never holds
 none (RULE 1, 2026-10-05).** The static check refuses an `opt` argument to

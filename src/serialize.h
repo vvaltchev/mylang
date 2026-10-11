@@ -23,7 +23,12 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 31;   /* v31: ThrowKind loses
+constexpr unsigned MYV_FORMAT_VERSION = 32;   /* v32: BuiltinCall and
+                                                 CallSite gain a step
+                                                 list (the chain forms
+                                                 of #32), CallSite's
+                                                 arg0 form `chain`;
+                                                 v31: ThrowKind loses
                                                  rebind_builtin and
                                                  rebind_const (bad_args
                                                  is 2);

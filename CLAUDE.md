@@ -6670,8 +6670,11 @@ but the per-element `StructObject` allocation is gone (build overhead
   write INTO a struct goes through it, holder by holder down the chain:
   the tree-walker's `store_walk` (member_store, subscript_store's base,
   the dyn inc-dec, a mutating builtin's first argument -
-  `store_base_value`), the VM's `vm_member_store` / `vm_member_lvalue(_ref)`
-  / `vm_chain_walk`, and the JIT's inline field store, which declines on
+  `store_base_value`, `sort` / `reverse` and an indirect call's
+  `indirect_lv_arg0` included), the VM's `vm_member_store` /
+  `vm_member_lvalue(_ref)` / `vm_chain_walk` (which an in-place builtin's
+  CHAIN form and an indirect call's `A0::chain` walk too, #32), and the
+  JIT's inline field store, which declines on
   `memberv_shared` / `memberv_borrowed` / `memberv_readonly`. Three rules
   a new write path must obey: **own the holder BEFORE deriving any pointer
   into the object** (a pointer taken earlier points into the object the

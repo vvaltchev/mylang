@@ -381,7 +381,10 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         for (size_t i = 0; i < ch.builtin_calls.size(); i++) {
             const auto &bc = ch.builtin_calls[i];
             s << ";   [" << i << "]" << "  " << (bc.name ? bc.name->val : "?")
-              << "  (" << bc.args.size() << " args)\n";
+              << "  (" << bc.args.size() << " args)";
+            if (!bc.steps.empty())      /* #32: the chain form's arg0 */
+                s << "  a0 chain of " << bc.steps.size();
+            s << "\n";
         }
     }
     if (!ch.emplace_sites.empty()) {
@@ -396,16 +399,21 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
     }
     if (!ch.call_sites.empty()) {
         s << "; -- call_sites (" << ch.call_sites.size() << ") --\n";
-        static const char *fm[] = {"none", "slot", "elem", "member", "undef"};
+        static const char *fm[] = {"none", "slot", "elem", "member", "undef",
+                                   "chain"};
         for (size_t i = 0; i < ch.call_sites.size(); i++) {
             const auto &cs = ch.call_sites[i];
             s << ";   [" << i << "]" << "  " << cs.args.size() << " args, a0="
               << fm[static_cast<int>(cs.a0_form)];
             if (cs.a0_form == Chunk::CallSite::A0::slot
                 || cs.a0_form == Chunk::CallSite::A0::elem
-                || cs.a0_form == Chunk::CallSite::A0::member)
+                || cs.a0_form == Chunk::CallSite::A0::member
+                || cs.a0_form == Chunk::CallSite::A0::chain)
                 s << " k" << static_cast<int>(cs.a0_kind)
                   << "[" << cs.a0_slot << "]";
+            for (const Chunk::ChainStep &st : cs.a0_steps)
+                s << (st.is_member ? ".<m#" : "[r")
+                  << st.operand << (st.is_member ? ">" : "]");
             s << "\n";
         }
     }
@@ -2152,8 +2160,12 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             const int nvals = static_cast<int>(bc.args.size()) - 1;
             row << "call.blt.lvm " << D(in.target) << " = "
                 << builtin_call_name(chunk, bcidx) << "("
-                << lval_ref(in.a_dual_hi(), in.target2) << "."
-                << (bc.member ? bc.member->val : "?");
+                << lval_ref(in.a_dual_hi(), in.target2);
+            if (bc.steps.empty())       /* #32: else the chain form */
+                row << "." << (bc.member ? bc.member->val : "?");
+            for (const Chunk::ChainStep &st : bc.steps)
+                row << (st.is_member ? ".<m#" : "[r")
+                    << st.operand << (st.is_member ? ">" : "]");
             for (int i = 0; i < nvals; i++)
                 row << ", " << reg(chunk, in.b_lit() + i);
             row << ")";
