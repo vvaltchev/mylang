@@ -34,6 +34,7 @@
 #include <unordered_set>
 #include "codegen.h"
 #include "env.h"
+#include "cyclewalk.h"   /* the value codec refuses a value with a cycle */
 
 #include <algorithm>
 #include <cerrno>
@@ -273,6 +274,16 @@ struct Writer {
      * plans/myv-table-ordering.md; until then this is a clean
      * compile-time refusal, not a broken file.
      */
+
+    /*
+     * The containers the value codec is inside (cyclewalk.h). A constant
+     * may contain itself, and the format has no back reference - a value
+     * is stored as a tree - so a container met again on its own path is
+     * REFUSED (write_value), never followed forever. `holder` says which
+     * constant, for the message.
+     */
+    CycStack cyc;
+    std::string holder = "a constant";
 
     void u8v(uint8_t v) { buf.push_back(static_cast<char>(v)); }
     void u32v(uint32_t v)
@@ -760,6 +771,16 @@ EvalValue read_array(Reader &r)
 
 void write_value(Writer &w, const EvalValue &v)
 {
+    /* a value that contains itself: the format cannot say "the container
+     * N levels up" (no back reference), so the image is refused */
+    CycKey k;
+    const bool keyed = cyc_key(v, k);
+    if (keyed && w.cyc.contains(k))
+        throw Exception("MyvError", intern_msg(
+            w.holder + " holds a reference cycle (a value that contains "
+            "itself), which a .myv image cannot store"));
+    CycGuard g(w.cyc, k, keyed);
+
     if (v.get_type()->t == Type::t_none) {
         w.u8v(static_cast<uint8_t>(VTag::none));
     }
@@ -1953,6 +1974,10 @@ void myv_write(const VmProgram &prog, const std::string &path,
         w.u32v(static_cast<uint32_t>(sd->consts.size()));
         for (const auto &kv : sd->consts) {
             w.uidv(kv.first);
+            w.holder = "the constant '"
+                       + (sd->name ? sd->name->val : std::string("?"))
+                       + "." + (kv.first ? kv.first->val : std::string("?"))
+                       + "'";
             write_value(w, kv.second);
         }
     }
@@ -1999,10 +2024,17 @@ void myv_write(const VmProgram &prog, const std::string &path,
     tick("descriptors");
 
     /* chunks: the root, then one per descriptor that has one */
+    w.holder = "a constant at the top level";
     write_chunk(w, prog.root);
     tick("chunk:root");
     for (const auto &d : prog.funcs)
         if (d->vm_chunk) {
+            const std::string fn = !d->display_name.empty()
+                                       ? d->display_name
+                                       : d->name ? d->name->val
+                                                 : std::string();
+            w.holder = fn.empty() ? std::string("a constant in a lambda")
+                                  : "a constant in function '" + fn + "'";
             write_chunk(w, *static_cast<const Chunk *>(d->vm_chunk));
             tick("chunk:func");
         }

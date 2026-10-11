@@ -48,6 +48,65 @@ int_type TypeDict::len(const EvalValue &a)
     return a.get_ref<intrusive_ptr<DictObject>>().get()->get_ref().size();
 }
 
+/*
+ * Two dicts are equal when they hold the same keys, each mapped to equal
+ * values - what unordered_map's operator== computed, spelled out so the
+ * walk runs on the cycle guard's pair stack (cyclewalk.h): a dict may hold
+ * itself (`d["self"] = d`). A key is looked up by ITS OWN equality, with
+ * fresh stacks (CycFreshScope) - the map's key_equal does not depend on
+ * where the dict sits; a value is compared inside this walk, `b`'s value
+ * on the left as the std operator== had it (CycFlip keeps the stack's
+ * sides straight) - a builtin or an exception object has no `==`, so the
+ * operand order is observable.
+ */
+static bool dict_equal(const EvalValue &a, const EvalValue &b)
+{
+    const DictObject::inner_type &dataA
+        = a.get_ref<intrusive_ptr<DictObject>>()->get_ref();
+    const DictObject::inner_type &dataB
+        = b.get_ref<intrusive_ptr<DictObject>>()->get_ref();
+
+    if (dataA.size() != dataB.size())
+        return false;
+
+    CycKey kl, kr;
+    cyc_key(a, kl);
+    cyc_key(b, kr);
+    CycPairStack &st = cyc_eq();
+
+    const int be = st.back_edge(kl, kr);
+    if (be >= 0)
+        return be == 1;
+
+    CycPairGuard g(st, kl, kr);
+
+    for (const auto &kv : dataA) {
+
+        CycKey kk;
+        DictObject::inner_type::const_iterator it;
+
+        if (cyc_key(kv.first, kk)) {
+            CycFreshScope fresh;
+            it = dataB.find(kv.first);
+        } else {
+            it = dataB.find(kv.first);
+        }
+
+        if (it == dataB.end())
+            return false;
+
+        bool same;
+        {
+            CycFlip flip(st);
+            same = it->second.get() == kv.second.get();
+        }
+        if (!same)
+            return false;
+    }
+
+    return true;
+}
+
 void TypeDict::eq(EvalValue &a, const EvalValue &b)
 {
     if (!b.is<intrusive_ptr<DictObject>>()) {
@@ -55,13 +114,8 @@ void TypeDict::eq(EvalValue &a, const EvalValue &b)
         return;
     }
 
-    const DictObject::inner_type &dataA
-        = a.get<intrusive_ptr<DictObject>>()->get_ref();
-
-    const DictObject::inner_type &dataB
-        = b.get_ref<intrusive_ptr<DictObject>>()->get_ref();
-
-    a = dataA == dataB;
+    const bool e = dict_equal(a, b);
+    a = e;
 }
 
 void TypeDict::noteq(EvalValue &a, const EvalValue &b)
@@ -71,13 +125,8 @@ void TypeDict::noteq(EvalValue &a, const EvalValue &b)
         return;
     }
 
-    const DictObject::inner_type &dataA
-        = a.get<intrusive_ptr<DictObject>>()->get_ref();
-
-    const DictObject::inner_type &dataB
-        = b.get_ref<intrusive_ptr<DictObject>>()->get_ref();
-
-    a = dataA != dataB;
+    const bool e = dict_equal(a, b);
+    a = !e;
 }
 
 /*
@@ -93,9 +142,27 @@ size_t TypeDict::hash(const EvalValue &a)
         = a.get_ref<intrusive_ptr<DictObject>>()->get_ref();
     size_t acc = hash_salt_dict;
 
+    /* A dict may hold itself: met again inside its own hash, it hashes as a
+     * back edge at its depth (cyclewalk.h). A KEY hashes by itself, with
+     * fresh stacks, as dict equality matches it (dict_equal). */
+    CycKey dk;
+    cyc_key(a, dk);
+    const int d = cyc_hash().depth(dk);
+    if (d >= 0)
+        return cyc_backedge_hash(d);
+    CycGuard g(cyc_hash(), dk);
+
     for (const auto &[k, v] : data) {
         size_t pair = hash_salt_dict;
-        hash_combine(pair, k.hash());
+        CycKey kk;
+        size_t kh;
+        if (cyc_key(k, kk)) {
+            CycFreshScope fresh;
+            kh = k.hash();
+        } else {
+            kh = k.hash();
+        }
+        hash_combine(pair, kh);
         hash_combine(pair, v.get().hash());
         hash_unordered(acc, pair);
     }
@@ -167,6 +234,12 @@ string TypeDict::to_string(const EvalValue &a)
     const DictObject &obj = *a.get_ref<intrusive_ptr<DictObject>>().get();
     const DictObject::inner_type &data = obj.get_ref();
 
+    /* already being printed further up this walk: `{...}` (cyclewalk.h) */
+    const CycKey k = cyc_key_obj(&obj);
+    if (cyc_render().contains(k))
+        return "{...}";
+    CycGuard g(cyc_render(), k);
+
     string res;
     size_type i = 0;
 
@@ -191,13 +264,18 @@ string TypeDict::to_string(const EvalValue &a)
 
 string TypeDict::pretty(const EvalValue &a, int indent, int width)
 {
-    const string flat = to_string_repr(a);
     const DictObject &obj = *a.get_ref<intrusive_ptr<DictObject>>().get();
+    const CycKey k = cyc_key_obj(&obj);
+    if (cyc_render().contains(k))
+        return "{...}";
+
+    const string flat = to_string_repr(a);
     const DictObject::inner_type &data = obj.get_ref();
 
     if (data.empty() || indent + static_cast<int>(flat.size()) <= width)
         return flat;
 
+    CycGuard g(cyc_render(), k);   /* a value leading back here: {...} */
     string res = "{\n";
     const string pad(indent + 2, ' ');
     size_type i = 0;

@@ -603,6 +603,11 @@ public:
     }
     size_type offset() const { return slice ? off : 0; }
 
+    /* The shared storage, as an IDENTITY: two handles that alias one array
+     * (or slice it) answer the same address. The cycle guard
+     * (cyclewalk.h) keys a container on it. */
+    const void *storage_id() const { return shobj.get(); }
+
     /* Element count without promoting (kind-aware). */
     size_type size() const {
         if (slice)

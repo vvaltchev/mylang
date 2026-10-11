@@ -7,6 +7,7 @@
 #include "resolver.h"
 #include "numtext.h"
 #include "inttest.h"
+#include "cyclewalk.h"   /* a constant's value may contain itself */
 
 #include <algorithm>
 #include <stdexcept>
@@ -3456,16 +3457,26 @@ MakeConstructFromConstVal(const EvalValue &v,
              * For a read-only result we bake a deep read-only value: do_eval
              * then *shares* it (it can't be mutated), so the symbol and this
              * node hold one buffer, not two. For a mutable result we bake a
-             * standalone clone (do_eval copies it per eval). Either way the
-             * baked value is self-contained, so a small slice of a huge const
-             * array doesn't pin the huge buffer.
+             * standalone deep copy (do_eval copies it per eval). Either way
+             * the baked value is self-contained, so a small slice of a huge
+             * const array doesn't pin the huge buffer.
+             *
+             * A value that contains itself keeps its shape either way: both
+             * copies reproduce the cycle (cyclewalk.h). The mutable bake was
+             * a SHALLOW clone, which turned a ring into its one-step
+             * unrolling - a fresh top in front of the original ring - so a
+             * folded `var r = mk();` and the same call left to run time
+             * printed, and compared, differently. The compiler holds the
+             * bake, so a cycle in it is kept until the program ends
+             * (cyc_keep_until_exit); a frozen one already is.
              */
             const bool ro = immutable || is_readonly_value(v);
+            EvalValue baked = ro ? make_const_clone(v) : make_mutable_clone(v);
 
-            return place(make_unique<LiteralObj>(
-                ro ? make_const_clone(v) : v.clone(),
-                ro
-            ));
+            if (!ro)
+                cyc_keep_if_cyclic(baked);
+
+            return place(make_unique<LiteralObj>(std::move(baked), ro));
         }
     }
 
@@ -3614,12 +3625,25 @@ cse_key(ParseContext &c, const Construct *node)
  * it, through general arrays, dicts (keys too), boxed struct fields and a
  * struct type's const members. A flat array (ints/floats/bools/strs/POD
  * structs) cannot hold a function, and get_view() on one would PROMOTE it,
- * so those kinds are skipped rather than viewed.
+ * so those kinds are skipped rather than viewed. The value may contain
+ * itself: a container (or a struct type's consts) already on this walk's
+ * path is not entered again (cyclewalk.h).
  */
 static void
 collect_value_descs(const EvalValue &v,
-                    std::unordered_set<const FuncDescriptor *> &out)
+                    std::unordered_set<const FuncDescriptor *> &out,
+                    CycStack &st)
 {
+    CycKey k;
+    bool keyed = cyc_key(v, k);
+    if (!keyed && v.get_type()->t == Type::t_structtype) {
+        k = cyc_key_consts(v.get<StructTypeDef *>());
+        keyed = true;
+    }
+    if (keyed && st.contains(k))
+        return;
+    CycGuard g(st, k, keyed);
+
     switch (v.get_type()->t) {
 
     case Type::t_func:
@@ -3632,32 +3656,40 @@ collect_value_descs(const EvalValue &v,
             break;
         ArrayConstView view = arr.get_view();
         for (size_type i = 0; i < view.size(); i++)
-            collect_value_descs(view[i].get(), out);
+            collect_value_descs(view[i].get(), out, st);
         break;
     }
 
     case Type::t_dict:
         for (const auto &kv :
                  v.get_ref<intrusive_ptr<DictObject>>()->get_ref()) {
-            collect_value_descs(kv.first, out);
-            collect_value_descs(kv.second.get(), out);
+            collect_value_descs(kv.first, out, st);
+            collect_value_descs(kv.second.get(), out, st);
         }
         break;
 
     case Type::t_struct:
         for (const LValue &f :
                  v.get_ref<intrusive_ptr<StructObject>>()->fields)
-            collect_value_descs(f.get(), out);   /* POD holds no func */
+            collect_value_descs(f.get(), out, st);   /* POD holds no func */
         break;
 
     case Type::t_structtype:
         for (const auto &cm : v.get<StructTypeDef *>()->consts)
-            collect_value_descs(cm.second, out);
+            collect_value_descs(cm.second, out, st);
         break;
 
     default:
         break;
     }
+}
+
+static void
+collect_value_descs(const EvalValue &v,
+                    std::unordered_set<const FuncDescriptor *> &out)
+{
+    CycStack st;
+    collect_value_descs(v, out, st);
 }
 
 /*

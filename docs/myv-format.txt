@@ -1047,6 +1047,16 @@ keys and values, and recursively by itself.
 The writer ABORTS on any other type - "unserializable value type in a chunk
 pool".  An image is never silently lossy.
 
+A VALUE IS A TREE.  The codec has no back-reference record: a container
+shared at two places is written twice and loads back as two copies (as
+the compiler's own bake already holds it: the deep copies that bake a
+constant keep no sharing that is not on a cycle), and a value that
+CONTAINS ITSELF cannot be written at all.  The writer refuses one
+with "<where> holds a reference cycle (a value that contains itself),
+which a .myv image cannot store" - <where> is "a constant at the top
+level", "a constant in function 'f'", "a constant in a lambda" or "the
+constant 'S.K'" - and writes no file.  A reader therefore never meets one.
+
 11.1  arr
 
     u8    storage kind      Storage, section 13

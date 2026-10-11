@@ -766,10 +766,32 @@ CsSet Inferencer::cs_eval(Construct *e)
  * back-pointer, which is still live here (inference runs long before
  * the `-vm` teardown nulls it). Anything else - a value kind this
  * function does not know - is ⊤.
+ *
+ * The value may contain ITSELF (cyclewalk.h). Every container of one
+ * baked value is the SAME abstract object (the site's), so a container
+ * already on this walk's path - a back edge - contributes that object and
+ * nothing more: its elements are being walked into the object's element
+ * location already. A struct type's consts are pushed the same way, since
+ * every instance walks its def's consts.
  */
 void Inferencer::cs_eval_value(const EvalValue &v, const Construct *site,
                                CsSet &out)
 {
+    CycStack st;
+    cs_eval_value(v, site, out, st);
+}
+
+void Inferencer::cs_eval_value(const EvalValue &v, const Construct *site,
+                               CsSet &out, CycStack &st)
+{
+    CycKey ck;
+    const bool keyed = cyc_key(v, ck);
+    if (keyed && st.contains(ck)) {
+        out.add_obj(cs_obj_for(site));
+        return;
+    }
+    CycGuard cg(st, ck, keyed);
+
     Type *t = v.get_type();
     switch (t->t) {
 
@@ -810,7 +832,7 @@ void Inferencer::cs_eval_value(const EvalValue &v, const Construct *site,
         ArrayConstView view = arr.get_view();
         CsSet elems;
         for (size_type i = 0; i < view.size(); i++)
-            cs_eval_value(view[i].get(), site, elems);
+            cs_eval_value(view[i].get(), site, elems, st);
         cs_write(cs_loc(CsLocKind::elem, nullptr, o), elems);
         return;
     }
@@ -821,8 +843,8 @@ void Inferencer::cs_eval_value(const EvalValue &v, const Construct *site,
         out.add_obj(o);
         CsSet elems;
         for (const auto &kv : m) {
-            cs_eval_value(kv.first, site, elems);
-            cs_eval_value(kv.second.get(), site, elems);
+            cs_eval_value(kv.first, site, elems, st);
+            cs_eval_value(kv.second.get(), site, elems, st);
         }
         cs_write(cs_loc(CsLocKind::elem, nullptr, o), elems);
         return;
@@ -843,9 +865,13 @@ void Inferencer::cs_eval_value(const EvalValue &v, const Construct *site,
         CsSet elems;
         if (def->layout != StructTypeDef::Layout::pod)
             for (const LValue &f : so->fields)
-                cs_eval_value(f.get(), site, elems);
-        for (const auto &kv : def->consts)
-            cs_eval_value(kv.second, site, elems);
+                cs_eval_value(f.get(), site, elems, st);
+        const CycKey dk = cyc_key_consts(def);
+        if (!st.contains(dk)) {
+            CycGuard dg(st, dk);
+            for (const auto &kv : def->consts)
+                cs_eval_value(kv.second, site, elems, st);
+        }
         cs_write(cs_loc(CsLocKind::elem, nullptr, o), elems);
         return;
     }

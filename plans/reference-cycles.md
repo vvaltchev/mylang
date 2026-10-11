@@ -135,7 +135,11 @@ that each frees everything. That corpus is the oracle for whichever
 option is chosen. Recommendation, not a decision: option 2, invisible to
 programs, with option 1 left open as a later expressiveness feature.
 
-## Part A - the traversal fix (2026-10-08)
+## Part A - the traversal fix (2026-10-08) - DONE
+
+**Status: DONE (2026-10-08).** Every walk below goes through
+`src/cyclewalk.h`; CLAUDE.md makes that a rule for new walks. The
+deviations from the text below, and why, follow it.
 
 Every recursive walk over a value graph terminates on a cycle. The
 semantics (README, *Values that contain themselves*):
@@ -160,3 +164,57 @@ semantics (README, *Values that contain themselves*):
 - a `.myv` image cannot store a constant that holds a cycle: `-c`
   refuses it with a compile error naming the constant (the format has no
   back reference; adding one is part of B's design, not A's).
+
+### As built - and where it differs
+
+- **`==`'s rule, precisely.** A pair stack of the (lhs, rhs) containers
+  being compared. A pair is a back edge when its lhs is on the stack as an
+  lhs (depth i) or its rhs as an rhs (depth j); the two are equal iff
+  i == j (a side not on the stack counts as -1). Consequences, all pinned:
+  each node of a ring of two equals the other; rings of one, two and three
+  nodes all differ; `clone(a) != a` for a ring `a`.
+- **The identity fast path is restricted.** `x == x` without entering `x`
+  stays for the top level (every pair on the stack an identity pair) and
+  for a container that reaches no cycle; anywhere else the shortcut would
+  make the answer depend on where the walk started - `[a] == [clone(a)]`
+  could then be true while `a == clone(a)` is false - and `==` would not
+  be transitive, and no hash could agree with it. Every acyclic comparison
+  keeps the shortcut exactly - NaN included: with `n = [nan, "x"]`,
+  `n == n`, `[n] == [n]` and `[n, 1] == [n, 1]` are still true and
+  `n == clone(n)` still false, old and new binaries alike - at the price
+  of one memoized reachability search per container per comparison once a
+  non-identity pair is on the stack.
+- **A dict compares values in the old operand order** (`CycFlip`): libstdc++'s
+  `unordered_map::operator==` compared the OTHER dict's value on the left,
+  and a builtin exception value has no `eq`, so the order is observable.
+- **Ordering does not apply**: arrays, dicts and structs have no `<`
+  (`TypeErrorEx`), so nothing recursive needed a rule.
+- **Frozen cycles are freed at exit (an extension A needed).** A cyclic
+  constant, a cyclic dict key, and a cyclic value the compiler bakes or
+  drops while folding can be broken by no program, so LeakSanitizer and
+  the INT census would report every program that builds one. They are
+  kept by `cyc_keep_until_exit` and emptied by an atexit drain that runs
+  before both detectors read the heap. A cycle the PROGRAM built is never
+  kept: it is reported, and tests break theirs. Part B replaces this.
+- **The mutable bake of a folded value is a deep copy now.**
+  `MakeConstructFromConstVal` baked a `var`-bound folded container with a
+  SHALLOW `clone()`, which turned a ring into its one-step unrolling (a
+  fresh top in front of the original): a folded `var r = mk();` and the
+  same call at run time then compared and printed differently (RULE 2).
+  It is `make_mutable_clone`, which reproduces the cycle.
+- **The `.myv` refusal names where the constant is, not its name**: "a
+  constant at the top level", "a constant in function 'f'", "a constant in
+  a lambda", "the constant 'S.K'". A chunk's constant pool has no names; a
+  struct's const members do. The format is unchanged (no back-reference
+  record); docs/myv-format.txt section 11 says a value is a tree.
+- **The compiler's walks** answer a back edge with their TOP:
+  `static_type_from_value` / `reflect_typeof` -> `dyn`, `cs_eval_value` ->
+  the allocation site's abstract object (whose contents it already
+  models), `shape_of` -> `NumShape::other`; `keep_in_value` and
+  `collect_value_descs` simply stop. `is_readonly_value`, `value_repr`,
+  `cse_key`, `make_general_array_clone` and `join` were checked and are
+  not recursive over values.
+- **A cyclic constant through a pure function compiles and runs in every
+  engine** (`-tw`, `-nj`, the JIT, `-nbi`, `-nc`, `--no-opt all`, `-nti`).
+  What it needs is an element store: `append` is a run-time builtin and is
+  undefined inside a pure function at compile time.

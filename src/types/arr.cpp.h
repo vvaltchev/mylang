@@ -475,7 +475,7 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
     }
 
     const SharedArrayObj &lhs = a.get<SharedArrayObj>();
-    const SharedArrayObj &rhs = b.get<SharedArrayObj>();
+    const SharedArrayObj &rhs = b.get_ref<SharedArrayObj>();
     const size_type n = lhs.size();
 
     if (n != rhs.size()) {
@@ -484,16 +484,49 @@ void TypeArr::eq(EvalValue &a, const EvalValue &b)
     }
 
     /*
-     * Identity shortcut: only safe (and only worth it) when both are general -
-     * the same vector AND same offset means the two views cover the exact same
-     * region, hence equal. Reading get_vec() here doesn't promote a general
-     * array. Flat arrays skip this and use the element loop below.
+     * Two GENERAL arrays may hold references, so the pair may be on a cycle:
+     * the comparison runs on the cycle guard's pair stack (cyclewalk.h). A
+     * flat side holds only scalars, so it is never on a stack and a cyclic
+     * general side differs from it at some element anyway - the plain loop
+     * below answers that case, as it always did.
      */
     if (lhs.skind() == SharedArrayObj::Storage::general &&
-        rhs.skind() == SharedArrayObj::Storage::general &&
-        &lhs.get_vec() == &rhs.get_vec() && lhs.offset() == rhs.offset())
+        rhs.skind() == SharedArrayObj::Storage::general)
     {
-        a = true;
+        CycKey kl, kr;
+        cyc_key(a, kl);
+        cyc_key(b, kr);
+        CycPairStack &st = cyc_eq();
+
+        /*
+         * Identity shortcut: the same storage window on both sides covers the
+         * exact same elements, hence equal - when the guard says skipping the
+         * walk cannot change the answer (always at the top level; inside a
+         * comparison of two different containers, unless this one is on a
+         * cycle - see CycPairStack::identity_ok).
+         */
+        if (kl == kr && st.identity_ok(a, kl)) {
+            a = true;
+            return;
+        }
+
+        const int be = st.back_edge(kl, kr);
+        if (be >= 0) {
+            a = be == 1;
+            return;
+        }
+
+        bool equal = true;
+        {
+            CycPairGuard g(st, kl, kr);
+            for (size_type i = 0; i < n; i++) {
+                if (arr_elem_at(lhs, i) != arr_elem_at(rhs, i)) {
+                    equal = false;
+                    break;
+                }
+            }
+        }
+        a = equal;
         return;
     }
 
@@ -525,13 +558,25 @@ void TypeArr::noteq(EvalValue &a, const EvalValue &b)
  */
 size_t TypeArr::hash(const EvalValue &a)
 {
-    const SharedArrayObj &arr = a.get<SharedArrayObj>();
+    const SharedArrayObj &arr = a.get_ref<SharedArrayObj>();
 
     if (arr.hash_is_cached())          /* a non-slice with a valid cache */
         return arr.get_cached_hash();
 
     const size_type n = arr.size();
     size_t seed = hash_salt_array;
+
+    /* A general array may be on a cycle: met again inside its own hash, it
+     * hashes as a back edge at its depth (cyclewalk.h). Never cached - only
+     * a flat array caches, and its hash does not depend on a walk. */
+    CycKey k;
+    const bool keyed = cyc_key(a, k);
+    if (keyed) {
+        const int d = cyc_hash().depth(k);
+        if (d >= 0)
+            return cyc_backedge_hash(d);
+    }
+    CycGuard g(cyc_hash(), k, keyed);
 
     for (size_type i = 0; i < n; i++)
         hash_combine(seed, arr_elem_at(arr, i).hash());
@@ -542,15 +587,15 @@ size_t TypeArr::hash(const EvalValue &a)
 
 string TypeArr::to_string(const EvalValue &a)
 {
-    const SharedArrayObj &arr = a.get<SharedArrayObj>();
+    const SharedArrayObj &arr = a.get_ref<SharedArrayObj>();
     const size_type n = arr.size();
     string res;
 
-    res.reserve(n * 32);
-    res += "[";
-
     /* Flat fast path: stringify the unboxed vector directly, no promotion. */
     if (arr.skind() != SharedArrayObj::Storage::general) {
+
+        res.reserve(n * 32);
+        res += "[";
 
         for (size_type i = 0; i < n; i++) {
             res += arr_elem_at(arr, i).to_string_repr();
@@ -561,6 +606,17 @@ string TypeArr::to_string(const EvalValue &a)
         res += "]";
         return res;
     }
+
+    /* A general array already being printed further up this walk is shown
+     * as `[...]` (cyclewalk.h, README *Values that contain themselves*). */
+    CycKey k;
+    cyc_key(a, k);
+    if (cyc_render().contains(k))
+        return "[...]";
+    CycGuard g(cyc_render(), k);
+
+    res.reserve(n * 32);
+    res += "[";
 
     const ArrayConstView &arr_view = arr.get_view();
 
@@ -579,15 +635,23 @@ string TypeArr::to_string(const EvalValue &a)
 
 string TypeArr::pretty(const EvalValue &a, int indent, int width)
 {
+    /* already being printed further up: `[...]`, like to_string */
+    CycKey k;
+    const bool keyed = cyc_key(a, k);
+    if (keyed && cyc_render().contains(k))
+        return "[...]";
+
     const string flat = to_string_repr(a);
-    const SharedArrayObj &arr = a.get<SharedArrayObj>();
+    const SharedArrayObj &arr = a.get_ref<SharedArrayObj>();
     const size_type n = arr.size();
 
     /* fits on one line (or empty) -> single line */
     if (n == 0 || indent + static_cast<int>(flat.size()) <= width)
         return flat;
 
-    /* otherwise expand one element per line, indented */
+    /* otherwise expand one element per line, indented - on the render
+     * stack, so an element that leads back here prints as `[...]` */
+    CycGuard g(cyc_render(), k, keyed);
     string res = "[\n";
     const string pad(indent + 2, ' ');
     for (size_type i = 0; i < n; i++) {

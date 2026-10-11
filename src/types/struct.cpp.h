@@ -50,9 +50,10 @@ void TypeStructType::noteq(EvalValue &a, const EvalValue &b)
 }
 
 /*
- * A struct INSTANCE (t_struct). COW value semantics like arrays/dicts. `==` is
- * structural field-wise between same-type instances (different types -> not
- * equal); not hashable (v1).
+ * A struct INSTANCE (t_struct): a value (copied at the write, struct_own).
+ * `==` is structural field-wise between same-type instances (different types
+ * -> not equal), and `hash` agrees with it; both, and printing, stop at a
+ * boxed instance already on the walk (cyclewalk.h).
  */
 class TypeStruct : public TypeImpl<intrusive_ptr<StructObject>> {
 
@@ -84,7 +85,16 @@ static bool struct_equal(const StructObject &x, const StructObject &y)
     if (x.is_pod())
         return x.bytes == y.bytes;
 
-    /* boxed: field-wise EvalValue equality (recurses for nested structs) */
+    /* boxed: field-wise EvalValue equality (recurses for nested structs),
+     * on the cycle guard's pair stack - a field may lead back here through
+     * an array or a dict (cyclewalk.h) */
+    const CycKey kx = cyc_key_obj(&x), ky = cyc_key_obj(&y);
+    CycPairStack &st = cyc_eq();
+    const int be = st.back_edge(kx, ky);
+    if (be >= 0)
+        return be == 1;
+    CycPairGuard g(st, kx, ky);
+
     for (size_t i = 0; i < x.fields.size(); i++)
         if (!(x.fields[i].get() == y.fields[i].get()))
             return false;
@@ -130,7 +140,7 @@ void TypeStruct::noteq(EvalValue &a, const EvalValue &b)
  */
 size_t TypeStruct::hash(const EvalValue &a)
 {
-    const StructObject &o = *a.get<intrusive_ptr<StructObject>>().get();
+    const StructObject &o = *a.get_ref<intrusive_ptr<StructObject>>().get();
     const StructTypeDef &def = *o.def;
 
     size_t seed = hash_salt_struct;
@@ -138,11 +148,22 @@ size_t TypeStruct::hash(const EvalValue &a)
 
     /* a CLASS instance hashes by IDENTITY, consistent with its == - its
      * number, never its address (see g_class_ident) - so its hash does not
-     * change when its fields do, and it can be a dict key unfrozen */
+     * change when its fields do, and it can be a dict key unfrozen. Its
+     * fields are never walked, so no cycle can pass through it here. */
     if (def.is_class) {
         hash_combine(seed, std::hash<uint64_t>()(o.ident));
         return seed;
     }
+
+    /* a boxed struct may be on a cycle: a back edge hashes as its depth */
+    CycKey k;
+    const bool keyed = cyc_key(a, k);
+    if (keyed) {
+        const int d = cyc_hash().depth(k);
+        if (d >= 0)
+            return cyc_backedge_hash(d);
+    }
+    CycGuard g(cyc_hash(), k, keyed);
 
     for (size_t i = 0; i < def.fields.size(); i++)
         hash_combine(seed, (o.is_pod() ? o.pod_get(static_cast<int>(i))
@@ -153,10 +174,18 @@ size_t TypeStruct::hash(const EvalValue &a)
 
 string TypeStruct::to_string(const EvalValue &a)
 {
-    const StructObject &o = *a.get<intrusive_ptr<StructObject>>().get();
+    const StructObject &o = *a.get_ref<intrusive_ptr<StructObject>>().get();
     const StructTypeDef &def = *o.def;
 
     string res = string(def.name->val);
+
+    /* a boxed struct already being printed further up: `Name(...)` */
+    CycKey k;
+    const bool keyed = cyc_key(a, k);
+    if (keyed && cyc_render().contains(k))
+        return res + "(...)";
+    CycGuard g(cyc_render(), k, keyed);
+
     res += "(";
 
     for (size_t i = 0; i < def.fields.size(); i++) {
@@ -176,13 +205,20 @@ string TypeStruct::to_string(const EvalValue &a)
 
 string TypeStruct::pretty(const EvalValue &a, int indent, int width)
 {
-    const string flat = to_string_repr(a);
-    const StructObject &o = *a.get<intrusive_ptr<StructObject>>().get();
+    const StructObject &o = *a.get_ref<intrusive_ptr<StructObject>>().get();
     const StructTypeDef &def = *o.def;
+
+    CycKey k;
+    const bool keyed = cyc_key(a, k);
+    if (keyed && cyc_render().contains(k))
+        return string(def.name->val) + "(...)";
+
+    const string flat = to_string_repr(a);
 
     if (def.fields.empty() || indent + static_cast<int>(flat.size()) <= width)
         return flat;
 
+    CycGuard g(cyc_render(), k, keyed);   /* a field leading back: Name(...) */
     string res = string(def.name->val);
     res += "(\n";
     const string pad(indent + 2, ' ');

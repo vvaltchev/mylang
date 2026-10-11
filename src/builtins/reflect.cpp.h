@@ -170,9 +170,11 @@ std::string reflect_struct_ctor(const StructTypeDef *def)
     return s;
 }
 
+static std::string reflect_typeof_rec(const EvalValue &e, CycStack &st);
+
 /* The structural type of an array value, from its storage kind (probing a
  * general array's elements for a homogeneous element type). */
-static std::string reflect_array_type(const SharedArrayObj &a)
+static std::string reflect_array_type(const SharedArrayObj &a, CycStack &st)
 {
     switch (a.skind()) {
         case SharedArrayObj::Storage::ints:    return "array<int>";
@@ -195,22 +197,37 @@ static std::string reflect_array_type(const SharedArrayObj &a)
     for (size_type i = 1; i < n; i++)
         if (arr_elem_at(a, i).get_type()->t != t0)
             return "array<dyn>";                      /* heterogeneous */
-    return std::string("array<") + reflect_typeof(e0) + ">";
+    return std::string("array<") + reflect_typeof_rec(e0, st) + ">";
 }
 
 /* The structural type of a dict value, probing one entry for key/value. */
-static std::string reflect_dict_type(const DictObject &d)
+static std::string reflect_dict_type(const DictObject &d, CycStack &st)
 {
     const DictObject::inner_type &m = d.get_ref();
     if (m.empty())
         return "dict";
     const auto &kv = *m.begin();
-    return std::string("dict<") + reflect_typeof(kv.first) + "," +
-           reflect_typeof(kv.second.get()) + ">";
+    return std::string("dict<") + reflect_typeof_rec(kv.first, st) + "," +
+           reflect_typeof_rec(kv.second.get(), st) + ">";
 }
 
 std::string reflect_typeof(const EvalValue &e)
 {
+    CycStack st;
+    return reflect_typeof_rec(e, st);
+}
+
+/* A value may contain itself: a container already being described further
+ * up is a back edge, and its type is `dyn` - as the static type of such a
+ * constant is (cyclewalk.h). */
+static std::string reflect_typeof_rec(const EvalValue &e, CycStack &st)
+{
+    CycKey k;
+    const bool keyed = cyc_key(e, k);
+    if (keyed && st.contains(k))
+        return "dyn";
+    CycGuard g(st, k, keyed);
+
     switch (e.get_type()->t) {
         case Type::t_none:    return "none";
         case Type::t_int:     return "int";
@@ -228,9 +245,10 @@ std::string reflect_typeof(const EvalValue &e)
             return std::string(
                 e.get<intrusive_ptr<StructObject>>()->def->name->val);
         case Type::t_arr:
-            return reflect_array_type(e.get<SharedArrayObj>());
+            return reflect_array_type(e.get_ref<SharedArrayObj>(), st);
         case Type::t_dict:
-            return reflect_dict_type(*e.get<intrusive_ptr<DictObject>>());
+            return reflect_dict_type(*e.get_ref<intrusive_ptr<DictObject>>(),
+                                     st);
         default:
             /* the remaining TypeE values (t_lval/t_undefid) are internal
              * pseudo-types never seen on an RValue. */

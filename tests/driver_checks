@@ -469,6 +469,32 @@ else
     fail "myv: -c refused the deep-recursion program"
 fi
 
+# A CONSTANT THAT CONTAINS ITSELF (README, "Values that contain
+# themselves"): a pure function builds a ring at compile time. The program
+# runs, but a .myv image stores a value as a tree, so `-c` must REFUSE it -
+# exit 1, a MyvError naming the constant, and no file. It used to overflow
+# the C stack in the writer (a SIGSEGV in a release build). -rt checks the
+# writer in-process; this is the only net for the driver's exit code and
+# for the file it would leave.
+cat > "$TMP/cyc.my" <<'PROG'
+pure func mkr(n) { var dyn r = [n, "x"]; r[1] = r; return r; }
+const C = mkr(1);
+print(str(C));
+PROG
+src_out=$("$BIN" "$TMP/cyc.my" 2>&1)
+src_rc=$?
+c_out=$("$BIN" -c "$TMP/cyc.my" -o "$TMP/cyc.myv" 2>&1)
+c_rc=$?
+if [ "$src_rc" = 0 ] && [ "$src_out" = "[1, [...]] " ] && \
+   [ "$c_rc" = 1 ] && [ ! -e "$TMP/cyc.myv" ] && \
+   printf '%s' "$c_out" | \
+       grep -q '^MyvError: a constant .*holds a reference cycle'; then
+    pass "myv: -c refuses a constant that contains itself, writes nothing"
+else
+    c_head=$(printf '%s' "$c_out" | head -2 | tr '\n' ' ')
+    fail "myv: cyclic constant: src $src_rc [$src_out] -c $c_rc [$c_head]"
+fi
+
 # #96: the hardcoded-register RATCHET (scripts/regcensus.py header has
 # the rule). A source-analysis check, not a binary one - it lives here
 # because every CI lane and the local battery already run this script.
