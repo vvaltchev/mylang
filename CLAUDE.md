@@ -7602,7 +7602,18 @@ headless-testable behind a thin terminal shell:
     into the next line), and **a block `}` right after a value** (the
     `open_value` state, which spans lines) gets that statement's `;` in
     front of it - `if (c) { print(3) }` had no `;` before its `}`, since
-    only line ends were terminated.
+    only line ends were terminated. **And no `;` follows a block `}`
+    whose next code line starts with `else` / `catch` / `finally`**
+    (`next_continues`): a chain written `}` / `else {` on two lines, as
+    a script may.
+  - **A chain the next line may continue stays open (the Joiner,
+    lineedit.h):** `ReplEngine::may_continue` - the input ends with the
+    `}` of a top-level `if` / `else if` / `try` / `catch` block that
+    spans lines - keeps the editor open, a new line at the END of the
+    buffer; an empty line submits (run_repl trims it). The cooked reader
+    reads ONE line ahead instead and keeps it (`carry`) for the next
+    input when `continues_chain` says it is not an `else` / `catch` /
+    `finally`, so piped input groups exactly as before otherwise.
   - **`EvalContext::allow_redeclare`** (set only on the REPL global scope) makes
     a re-declaration rebind the global instead of throwing `AlreadyDefinedEx`
     (the script rule is unchanged — the resolver still catches same-scope dups

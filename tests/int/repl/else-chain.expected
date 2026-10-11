@@ -1,0 +1,19 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> >> >> => 7
+>> .. .. .. .. .. .. .. .. big 
+>> >> .. .. .. .. .. .. .. .. .. .. .. caught 7 
+finally 
+>> .. .. >> >> SyntaxError at line 33, col 1
+
+    else { print("refused: an empty line ended the chain"); };
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Unexpected token at the end 'else'
+>> .. .. >> a separate input 
+>> one line 
+>> SyntaxError at line 39, col 1
+
+    else { print("refused: the if closed on its line"); };
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Unexpected token at the end 'else'
+>> => 7
+>> 

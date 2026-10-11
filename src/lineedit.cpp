@@ -102,6 +102,20 @@ void LineEditor::newline()
     }
 }
 
+/* The last line of the buffer holds only whitespace (Enter there submits
+ * an input the Joiner keeps open) */
+bool LineEditor::last_line_blank() const
+{
+    for (size_t i = buf.size(); i > 0; i--) {
+        const char c = buf[i - 1];
+        if (c == '\n')
+            return true;
+        if (c != ' ' && c != '\t' && c != '\r')
+            return false;
+    }
+    return true;
+}
+
 /*
  * Insert a bracketed paste as inert text: never as editor commands (no submit
  * on a newline, no Tab/Ctrl interpretation). The block is RE-INDENTED to the
@@ -433,8 +447,17 @@ LineEditor::Action LineEditor::feed(unsigned char c)
         case 9:   complete();              return Action::none;  /* Tab */
         case 13:
         case 10:                                                 /* Enter */
-            if (!submitter || submitter(buf))
+            if (!submitter || submitter(buf)) {
+                /* complete - but a chain an `else` may still continue
+                 * stays open, a new line at the END (wherever the cursor
+                 * is); Enter on that empty line submits */
+                if (joiner && !last_line_blank() && joiner(buf, nullptr)) {
+                    pos = buf.size();
+                    newline();
+                    return Action::none;
+                }
                 return Action::submit;
+            }
             newline();                     return Action::none;
         case 3:                            return Action::cancel; /* Ctrl-C */
         case 4:                                                   /* Ctrl-D */
@@ -741,16 +764,43 @@ bool unicode_ok()
  */
 ReadLineResult
 read_line_cooked(const string &prompt, const string &cont_prompt,
-                 const LineEditor::Submitter &submitter)
+                 const LineEditor::Submitter &submitter,
+                 const LineEditor::Joiner &joiner)
 {
+    /* a line read ahead (below) that did not continue the input before:
+     * the first line of the next one */
+    static string carry;
+    static bool have_carry = false;
+    const auto next = [](string &l) {
+        if (have_carry) {
+            l = std::move(carry);
+            have_carry = false;
+            return true;
+        }
+        return static_cast<bool>(std::getline(std::cin, l));
+    };
+
     ReadLineResult res;
     std::cout << prompt << std::flush;
     string acc, line;
-    while (std::getline(std::cin, line)) {
+    while (next(line)) {
         if (!acc.empty())
             acc += "\n";
         acc += line;
         if (!submitter || submitter(acc)) {
+            /* complete - unless the Joiner keeps it open and the next line
+             * continues it (an `else` after an `if` block): read one line
+             * ahead, and keep it for the next input when it does not */
+            string ahead;
+            if (joiner && joiner(acc, nullptr) && next(ahead)) {
+                const bool join = joiner(acc, &ahead);
+                carry = std::move(ahead);
+                have_carry = true;
+                if (join) {
+                    std::cout << cont_prompt << std::flush;
+                    continue;
+                }
+            }
             res.line = acc;
             return res;
         }
@@ -783,7 +833,8 @@ ReadLineResult
 read_line(const string &prompt, const string &cont_prompt,
           std::vector<string> &history,
           string (*highlight)(const string &, int &),
-          LineEditor::Completer completer, LineEditor::Submitter submitter)
+          LineEditor::Completer completer, LineEditor::Submitter submitter,
+          LineEditor::Joiner joiner)
 {
     ReadLineResult res;
 
@@ -792,10 +843,10 @@ read_line(const string &prompt, const string &cont_prompt,
      * harness), there is no raw-mode editor - read in cooked mode.
      */
 #ifdef _WIN32
-    return read_line_cooked(prompt, cont_prompt, submitter);
+    return read_line_cooked(prompt, cont_prompt, submitter, joiner);
 #else
     if (!isatty(STDIN_FILENO))
-        return read_line_cooked(prompt, cont_prompt, submitter);
+        return read_line_cooked(prompt, cont_prompt, submitter, joiner);
 
     RawMode raw;
     LineEditor ed;
@@ -804,6 +855,8 @@ read_line(const string &prompt, const string &cont_prompt,
         ed.set_completer(completer);     /* a copy: Tab + suggester use it */
     if (submitter)
         ed.set_submitter(std::move(submitter));
+    if (joiner)
+        ed.set_joiner(std::move(joiner));
 
     /*
      * Inline autosuggestion (gray ghost text) from the COMPLETER - i.e. the

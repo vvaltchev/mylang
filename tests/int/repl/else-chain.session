@@ -1,0 +1,41 @@
+# An `if` / `try` chain whose block closes on its own line goes on when
+# the next line starts with `else`, `catch` or `finally`, as in a script:
+# the REPL reads a line ahead (ReplEngine::may_continue / continues_chain)
+# and leaves the block's `}` without its `;` (repl_auto_terminate). Any
+# other next line is the next input, an empty one included; a chain
+# closed on one line is complete at once.
+var n = 7
+if (n < 3) {
+  print("small")
+}
+else if (n < 5) {
+  print("mid")
+}
+else {
+  print("big")
+}
+struct E { int code; }
+try {
+  throw E(n)
+}
+catch (TypeErrorEx) {
+  print("type")
+}
+catch (E as e) {
+  print("caught", e.code)
+}
+finally {
+  print("finally")
+}
+if (n > 100) {
+  print("huge")
+}
+
+else { print("refused: an empty line ended the chain") }
+if (n > 100) {
+  print("huge")
+}
+print("a separate input")
+if (n > 0) { print("one line") }
+else { print("refused: the if closed on its line") }
+n

@@ -72,6 +72,22 @@ public:
     void set_submitter(Submitter s) { submitter = std::move(s); }
 
     /*
+     * A COMPLETE input that may still go on: called with the buffer and
+     * a null line, true keeps it open - Enter then adds a line at the end
+     * instead of submitting, and Enter on an empty last line submits.
+     * (The cooked reader, which reads ahead, also calls it with the next
+     * physical line: true takes that line into the input.) The REPL's: an
+     * `if` / `try` chain whose last block just closed over several lines,
+     * which `else` / `catch` / `finally` on the next line continues.
+     */
+    using Joiner =
+        std::function<bool(const std::string &, const std::string *)>;
+    void set_joiner(Joiner j) { joiner = std::move(j); }
+
+    /* The buffer's last line holds only whitespace */
+    bool last_line_blank() const;
+
+    /*
      * Tab completion. The callback is given (buffer, cursor) and returns the
      * candidate full words that could replace the identifier ending at the
      * cursor (each already matching that prefix). On Tab the editor completes a
@@ -123,6 +139,7 @@ private:
     std::string saved_live;               /* live line, saved entering hist */
     Completer completer;
     Submitter submitter;
+    Joiner joiner;
     Suggester suggester;
     std::vector<std::string> comp_list;   /* candidates pending display */
     bool is_pasting = false;              /* between ESC[200~ and ESC[201~ */
@@ -246,4 +263,5 @@ read_line(const std::string &prompt, const std::string &cont_prompt,
           std::vector<std::string> &history,
           std::string (*highlight)(const std::string &, int &) = nullptr,
           LineEditor::Completer completer = {},
-          LineEditor::Submitter submitter = {});
+          LineEditor::Submitter submitter = {},
+          LineEditor::Joiner joiner = {});
