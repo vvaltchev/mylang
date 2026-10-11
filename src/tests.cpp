@@ -14761,6 +14761,51 @@ static const std::vector<test> tests =
     },
 
     /*
+     * H4 (2026-10-06) - A CONST MULTI-DECLARATION BINDING A CONTAINER. The
+     * declaration was dropped (a multi-assignment's value is none, so it
+     * looked like a scalar const), and reading `a` was an undefined name.
+     * It is kept now when any target is a container; a scalar target
+     * becomes a `_` placeholder (a const scalar has no run-time symbol -
+     * a run-time `c` collided with the `var c` a capture of it declares,
+     * AlreadyDefinedEx), and each container ELEMENT is baked deep
+     * read-only, as `const a = <element>` would bind it (the VM appended
+     * to a fresh mutable array where the tree-walker refused).
+     */
+    {
+        "const: a multi-declaration binding containers (H4)",
+        {
+            "const a, b = [[1], [2]];",
+            "assert(a == [1] && b == [2]);",
+            "func f() { return a[0] + b[0]; }",
+            "assert(f() == 3);",
+            "const c, d = [3, [4]];",
+            "assert(c + 1 == 4 && d == [4]);",
+            "var g = func[c, d]() { c++; return c + d[0]; };",
+            "assert(g() == 8 && g() == 9 && c == 3);",
+            "const e, _, h = [{\"k\": 1}, 2, \"s\"];",
+            "assert(e[\"k\"] == 1 && h == \"s\");",
+            "func k() { const m, n = [[1], 2]; return len(m) + n; }",
+            "assert(k() == 3);",
+        }
+    },
+    {
+        "const: a multi-declared container cannot be rebound (H4)",
+        {
+            "const a, b = [[1], [2]];",
+            "a = [5];",
+        },
+        &typeid(CannotRebindConstEx)
+    },
+    {
+        "const: a multi-declared container cannot be mutated (H4)",
+        {
+            "const a, b = [[1], [2]];",
+            "append(a, 3);",
+        },
+        &typeid(CannotChangeConstEx)
+    },
+
+    /*
      * H7 (2026-10-06) - A CONST MULTI-DECLARATION IS UNPACKED AS WRITTEN,
      * like a `var` one (README): the const evaluator built the literal
      * widened to its joined type, so `x` was the float 12.0
@@ -25748,6 +25793,14 @@ static bool const_fold_equivalence()
             "try { throw E(7); } catch (E as L) { print(L.x); }",
             "foreach (var K in [8]) { print(K); }",
             "print(f(10), g(func(y) => y * 10), a(2), K, L);" } },
+        /* H2, H4, H7: a captured const scalar, a const
+         * multi-declaration */
+        { "a captured const scalar, and a const multi-declaration", {
+            "const K = 5;",
+            "var h = func[K]() { K += 1; return K; };",
+            "const a, b, c = [3, [4], 2.5];",
+            "var m = func[a, b]() { a++; return a + b[0]; };",
+            "print(h(), h(), K, m(), m(), a, b, c, typestr(a));" } },
     };
 
     bool ok = true;

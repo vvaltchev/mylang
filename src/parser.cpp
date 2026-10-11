@@ -2249,6 +2249,24 @@ pExpr14(ParseContext &c, unsigned fl)
             ret->rvalue = std::move(cc);
         }
     }
+    /* ...and a CONST multi-declaration's literal stays one too, but each
+     * ELEMENT is what `const a = <element>` would bind: baked deep
+     * read-only. Left as written, a container element was a fresh MUTABLE
+     * array at run time - `const a, b = [[1], [2]]; append(a, 3);` was
+     * refused by the tree-walker (a const binding) and appended in the VM. */
+    else if (in_idlist && (fl & pFlags::pInConstDecl)
+             && ret->rvalue->is_const
+             && ctag(ret->rvalue.get()) == ConstructType::lit_arr)
+    {
+        for (auto &el :
+                static_cast<LiteralArray *>(ret->rvalue.get())->elems) {
+            if (dynamic_cast<LiteralObj *>(el.get()))
+                continue;
+            unique_ptr<Construct> cc;
+            if (cse_materialize(c, el.get(), cc, true, true))
+                el = std::move(cc);
+        }
+    }
 
     if (fl & pFlags::pInConstDecl) {
 
@@ -2278,8 +2296,40 @@ pExpr14(ParseContext &c, unsigned fl)
          */
 
         const EvalValue &rvalue = ret->eval(c.const_ctx);
+        bool keep = ShouldConstSymbolExistAtRuntime(rvalue);
 
-        if (!ShouldConstSymbolExistAtRuntime(rvalue)) {
+        /* `const a, b = [[1], [2]]`: the assignment's value is none, so ask
+         * each target - one bound to a container needs its run-time symbol
+         * (it was dropped, and reading `a` was an undefined name) */
+        if (auto *il = dynamic_cast<IdList *>(ret->lvalue.get())) {
+            keep = false;
+            for (const auto &id : il->elems) {
+                if (id->is_underscore())
+                    continue;
+                if (LValue *lv = c.const_binding(id->uid))
+                    keep = keep || ShouldConstSymbolExistAtRuntime(lv->get());
+            }
+            /* ...and a SCALAR target of a kept declaration becomes a `_`
+             * placeholder: a const scalar has no run-time symbol, like
+             * `const a = 3` (every read of it is folded, and a closure
+             * capturing it declares its own `var a`, which a run-time `a`
+             * here would collide with - AlreadyDefinedEx) */
+            for (auto &id : il->elems) {
+                if (!keep || id->is_underscore())
+                    continue;
+                LValue *lv = c.const_binding(id->uid);
+                if (lv && !ShouldConstSymbolExistAtRuntime(lv->get())) {
+                    auto ph = make_unique<Identifier>("_");
+                    ph->start = id->start;
+                    ph->end = id->end;
+                    id = std::move(ph);
+                } else {
+                    id->is_const = true;
+                }
+            }
+        }
+
+        if (!keep) {
 
             /*
              * In this case, the const symbol is supposed to not exist at all

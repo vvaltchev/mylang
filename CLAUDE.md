@@ -3515,6 +3515,18 @@ and it lives *inside the parser*. Mechanics:
   side effects: `-s` / `:show` show the synthetic `var K = 5`, and in the
   REPL it lands in the run-time map, so `cmd_globals` lists the CONST
   scope first and skips a run-time entry of the same name.
+- **A CONST MULTI-DECLARATION BINDING A CONTAINER (H4, 2026-10-06).**
+  `const a, b = [[1], [2]]` was DROPPED: the assignment's value is none,
+  so the scalar test said "no run-time symbol" and reading `a` was an
+  undefined name. The
+  decl is kept now when ANY target is bound to a container, and in a kept
+  one each SCALAR target becomes a `_` placeholder - the invariant **a
+  const scalar never has a run-time symbol** must hold here too, or a
+  capture of it (H2's `var c`) collides with the kept `c`
+  (AlreadyDefinedEx). The rvalue literal stays a literal (unpacked as
+  written, F6), but each ELEMENT is baked deep read-only with
+  `cse_materialize`, as `const a = <element>` would bind it - the VM
+  appended to a fresh mutable array where the tree-walker refused.
 - **A CONST MULTI-DECLARATION IS UNPACKED AS WRITTEN (H7, 2026-10-06).**
   **`LiteralArray::unpacked`** (syntax.h, stamped by `pExpr14` on an
   IdList's literal rvalue, `var` or `const`) stops the parse-time
