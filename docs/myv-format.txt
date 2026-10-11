@@ -2,8 +2,12 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 32.  This document describes the on-disk image exhaustively:
+Format version 33.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v33: a StructDef (7.1) gains `is_class` after its name, and the value codec
+a tenth tag, `cls` (11.4) - a class instance, written once and then referred
+to by its identity number.)
 
 (v32: a BuiltinCall (9.15) and a CallSite (9.16) each END with a StepList
 (9.7) - the chain forms of an in-place builtin's first argument, empty
@@ -502,6 +506,8 @@ counts ("corrupt .myv (table of contents exceeds the file)").
 
     StructDef:
         uid   name
+        bool  is_class      v33: a `class` (reference semantics); a class
+                            def is never POD (compute_layout)
         M x Field
         K x Const
 
@@ -1022,7 +1028,7 @@ keys and values, and recursively by itself.
     4  str          str
     5  arr          see 11.1
     6  dict         see 11.2
-    7  strct        see 11.3
+    7  strct        see 11.3 - a STRUCT instance (never a class's)
     8  structtype   sref
     9  func         dref     (a FuncObject.  Legal in a struct's const
                               members since v20 - the descriptor is a
@@ -1036,6 +1042,7 @@ keys and values, and recursively by itself.
                               gets no capture_root - it has no
                               context to root at - and runs under
                               its caller's root.)
+    10 cls          see 11.4 - a CLASS instance (v33)
 
 The writer ABORTS on any other type - "unserializable value type in a chunk
 pool".  An image is never silently lossy.
@@ -1082,6 +1089,12 @@ image's `-vd` dump can differ from a fresh compile's (2 of 86 corpus files).
     if pod:      u32 nbytes;  then nbytes RAW BYTES
     else:        u32 nfields; then nfields x value
 
+VALIDATION (v33): the def must be a STRUCT (not a class), `pod` must equal
+the def's computed layout, and the count must be the def's - nbytes its size,
+nfields its field count - else "corrupt .myv (a struct value does not match
+its struct)".  A value read inside the struct table (a const member) is
+checked in the wiring phase, once every layout is computed.
+
 PORTABILITY NOTE.  A POD instance's bytes are written as laid out by the
 writing host, and a flat struct array's element bytes likewise.  The layout
 rules (pod_field_size / pod_field_align, structtype.h) depend only on
@@ -1089,6 +1102,30 @@ sizeof(int_type), and the endianness marker already refuses a differently-
 ordered host - so an image with POD struct constants is portable between hosts
 that agree on int_type's width, which is every 64-bit target MyLang builds
 for.  A 32-bit host would need its own image.
+
+11.4  cls (v33)
+
+    sref  def               a CLASS def
+    i64   ident             the instance's identity number
+    u8    form              1 = the instance, 0 = a reference to it
+    if form == 1:
+        bool  readonly
+        u32   nfields;  then nfields x value
+
+A class instance has IDENTITY: two references to one instance are one object,
+and its hash is its identity number (StructObject::ident, structtype.h), which
+a dict keyed by class instances iterates by.  So the FIRST occurrence of an
+instance in the file (in file order) is written whole, with its number, and
+every later one as a reference (form 0) - the loader keeps the instances it
+has read by number and hands the same object back.  The number is the one the
+compile gave the instance, so its hash is the source run's.
+
+VALIDATION: a reference to a number not read yet, or to an instance of another
+def, is "corrupt .myv (a class reference names no instance)"; two instances
+with one number, "corrupt .myv (two class instances share a number)".  The
+instance is registered BEFORE its fields are read, so a field may refer back
+to it.  As for strct (11.3), the def must be a class and nfields its field
+count, checked in the wiring phase for a value read inside the struct table.
 
 --------------------------------------------------------------------------------
 12.  DERIVED DATA - PRESENT IN MEMORY, ABSENT FROM THE FILE
@@ -1223,7 +1260,7 @@ same is true of OpCode and Op, which appear in every instruction.)
 
     VTag (serialize.cpp, section 11)
         0 none  1 boolean  2 integer  3 flt  4 str  5 arr  6 dict
-        7 strct  8 structtype  9 func
+        7 strct  8 structtype  9 func  10 cls
 
 Version 9 is exactly such a change: deleting the CatchTest and Reraise
 opcodes renumbered every OpCode after them.

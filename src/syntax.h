@@ -778,6 +778,15 @@ public:
      * form, whose element type stays inferred. */
     std::shared_ptr<TypeAnnot> decl_annot;
 
+    /*
+     * The parser resolved this name to a CLASS descriptor. A use of one -
+     * in practice a construction - makes a function impure: each
+     * construction is a new object with its own identity, so folding or
+     * de-duplicating the call would merge objects the program can tell
+     * apart (func_body_is_pure).
+     */
+    bool names_class = false;
+
     Identifier(const std::string_view &str)
         : Construct("Id", false, ConstructType::id)
         , uid(UniqueId::get(str))
@@ -801,6 +810,7 @@ public:
         c->decl_type = decl_type;
         c->decl_struct = decl_struct;
         c->decl_annot = decl_annot;   /* shared: TypeAnnot is immutable */
+        c->names_class = names_class;
         return c;
     }
 };
@@ -1019,6 +1029,15 @@ public:
      */
     uint32_t none_arg_mask = ~0u;
 
+    /*
+     * Parsed inside a `const` declaration's initializer: the one place a
+     * CLASS instance may be made at compile time (plans/class-and-box.md -
+     * anywhere else, folding or de-duplicating the construction would merge
+     * objects the program can tell apart). Read where a construction is
+     * evaluated in a const context (CallExpr::do_eval's dispatch).
+     */
+    bool in_const_decl = false;
+
     /* An argument whose SHAPE cannot evaluate to none: a non-none literal,
      * an operator chain (arithmetic, comparison, logical, bitwise and
      * unary operators yield a value or throw - never none), a typed
@@ -1085,6 +1104,7 @@ public:
         d.tq_folded = tq_folded;
         d.callable_arg_mask = callable_arg_mask;
         d.none_arg_mask = none_arg_mask;
+        d.in_const_decl = in_const_decl;
     }
 
     unique_ptr<Construct> clone() const override {
@@ -1117,14 +1137,9 @@ public:
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<DirectCallExpr>();
         copy_base_fields(*c);
+        copy_call_fields(*c);
         c->what = clone_as(what);
         c->args = clone_as(args);
-        c->direct_func_slot = direct_func_slot;
-        c->vm_direct_func = vm_direct_func;
-        c->vm_struct_ctor_def = vm_struct_ctor_def;
-        c->vm_len_kind = vm_len_kind;
-        c->vm_struct_boxed_def = vm_struct_boxed_def;
-        c->vm_dyn_callee = vm_dyn_callee;
         return c;
     }
 };
@@ -1145,14 +1160,9 @@ public:
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<CachedCallExpr>();
         copy_base_fields(*c);
+        copy_call_fields(*c);
         c->what = clone_as(what);
         c->args = clone_as(args);
-        c->direct_func_slot = direct_func_slot;
-        c->vm_direct_func = vm_direct_func;
-        c->vm_struct_ctor_def = vm_struct_ctor_def;
-        c->vm_len_kind = vm_len_kind;
-        c->vm_struct_boxed_def = vm_struct_boxed_def;
-        c->vm_dyn_callee = vm_dyn_callee;
         return c;
     }
 };
@@ -1206,6 +1216,7 @@ public:
     unique_ptr<Construct> clone() const override {
         auto c = make_unique<DirectBuiltinCallExpr>();
         copy_base_fields(*c);
+        copy_call_fields(*c);
         c->what = clone_as(what);
         c->args = clone_as(args);
         c->builtin = builtin;
@@ -1213,7 +1224,6 @@ public:
         c->lvalue_rest_native = lvalue_rest_native;
         c->lvalue_rest_capable = lvalue_rest_capable;
         c->map_filter_kind = map_filter_kind;
-        c->tq_folded = tq_folded;
         return c;
     }
 };

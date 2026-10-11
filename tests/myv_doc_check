@@ -79,6 +79,12 @@ def value(r):
         return '<struct>'
     if t == 8: return ('structtype', r.sref())
     if t == 9: return ('func', r.dref())
+    if t == 10:                                   # cls (11.4, v33)
+        r.sref(); r.i64()
+        if r.u8() == 1:                           # the instance itself
+            r.boolv()
+            for _ in range(r.u32()): value(r)
+        return '<class>'
     raise ValueError('bad value tag %d at %d' % (t, r.p))
 
 # ---- section 9: a chunk -------------------------------------------------
@@ -168,7 +174,7 @@ def main(path):
     nstructs = r.u32()                            # 7.0 table of contents
     ndesc = r.u32()                               #     (v20)
     for _ in range(nstructs):                     # section 7
-        r.uid()
+        r.uid(); r.boolv()                        # name, is_class (v33)
         for _ in range(r.u32()):                  # fields
             r.uid(); r.u8(); r.uid(); r.sref(); r.boolv(); r.u32()
         for _ in range(r.u32()): r.uid(); value(r)     # consts

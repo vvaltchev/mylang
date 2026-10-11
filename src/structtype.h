@@ -68,6 +68,10 @@ struct FieldDef {
     std::shared_ptr<TypeAnnot> annot;
     int slot = -1;        /* boxed: index into StructObject::fields */
     int offset = -1;      /* POD: byte offset into the bytes buffer; else -1 */
+    /* Where the field is declared - for a compile-time error about it
+     * (an `opt` on a field whose type turns out to be a struct). Not
+     * stored in a .myv image. */
+    Loc loc;
 };
 
 /*
@@ -137,6 +141,15 @@ struct StructTypeDef {
     enum class Layout : unsigned char { boxed, pod };
 
     const UniqueId *name = nullptr;
+    /*
+     * A `class` (plans/class-and-box.md): the same declaration with
+     * REFERENCE semantics. An instance is shared, never copied on write
+     * (struct_own hands back the object itself), compares and hashes by
+     * IDENTITY, and is never embedded by value - its layout is always
+     * boxed, so a field of a class type is a pointer, an array<C> holds
+     * references and nothing copies its bytes.
+     */
+    bool is_class = false;
     std::vector<FieldDef> fields;                      /* declaration order */
     std::vector<std::pair<const UniqueId *, EvalValue>> consts;
     Layout layout = Layout::boxed;
@@ -201,7 +214,9 @@ struct StructTypeDef {
         size = 0;
         align = 1;
 
-        if (fields.empty())
+        /* a class is never POD: a POD def is what may be embedded BY
+         * VALUE (inline in another struct, flat in an array) */
+        if (fields.empty() || is_class)
             return;
 
         /* Initialized because the SECOND loop ignores the return value:
@@ -234,10 +249,29 @@ struct StructTypeDef {
 };
 
 /*
- * A struct instance. COW value semantics like arrays/dicts (RefCounted; a
- * shared instance is cloned before a mutation; a const instance is deep
- * read-only). v1 storage is `fields` (a boxed LValue slot array); the POD byte
- * buffer is added later.
+ * A class instance's IDENTITY, for its hash (TypeStruct::hash). An
+ * address would do for == but not for hash: a dict keyed by class
+ * instances iterates in bucket order, and an address-based order would
+ * differ between engines and between runs (RULE 2). So every class
+ * instance is numbered when it is made, from one counter every engine
+ * advances in the same program order; equality stays the pointer
+ * compare, so two numbers that collide cost a probe, never an answer.
+ * class_ident_reset() restarts the count where a program starts.
+ */
+inline uint64_t g_class_ident = 0;
+inline uint64_t class_ident_next() { return ++g_class_ident; }
+inline void class_ident_reset(uint64_t base) { g_class_ident = base; }
+/* The base a RUN restarts from: far above any count compile time can
+ * reach, so a constant's number never meets a run's. */
+static const uint64_t CLASS_IDENT_RUN_BASE = uint64_t(1) << 40;
+
+/*
+ * A struct instance. VALUE semantics (eval.h, struct_own): a shared
+ * instance is copied by the holder that writes it; a const instance is
+ * deep read-only. A CLASS instance (def->is_class) is the same object
+ * with reference semantics: never copied on write, compared by identity.
+ * Storage is `fields` (a boxed LValue slot array) or, for a POD struct,
+ * the `bytes` buffer.
  */
 class StructObject : public RefCounted {
 
@@ -248,6 +282,9 @@ public:
 
     StructTypeDef *def = nullptr;
     bool readonly = false;
+    /* a class instance's identity number (0 for a struct): see
+     * g_class_ident. A copy is a NEW instance, so it gets a new one. */
+    uint64_t ident = 0;
     /*
      * Exactly one is used, per def->layout: `fields` (a boxed LValue slot
      * array) for a boxed struct, `bytes` (a C-laid-out buffer of def->size
@@ -261,8 +298,18 @@ public:
     explicit StructObject(StructTypeDef *d) : def(d) {
         if (d->is_pod())
             bytes.resize(static_cast<size_t>(d->size));
+        if (d->is_class)
+            ident = class_ident_next();
     }
-    StructObject(const StructObject &) = default;
+    /* RefCounted() names the base: a copy owns a fresh count */
+    StructObject(const StructObject &o)
+        : RefCounted()
+        , def(o.def)
+        , readonly(o.readonly)
+        , ident(o.def && o.def->is_class ? class_ident_next() : 0)
+        , fields(o.fields)
+        , bytes(o.bytes)
+    { }
     StructObject(StructObject &&) = default;
 
     bool is_pod() const { return def->is_pod(); }

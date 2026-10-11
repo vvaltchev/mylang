@@ -97,7 +97,8 @@ const BuiltinDoc builtin_docs[] = {
   "A compile-time type QUERY (the arg is unevaluated): folds to a string "
   "literal of x's static type. Replaces the old typeof()." },
 { "kindstr", "reflect", "kindstr(x)",
-  "Just x's kind as a string (\"array\", \"int\", \"struct\", ...).",
+  "Just x's kind as a string (\"array\", \"int\", \"struct\", \"class\", "
+  "...).",
   "Like typestr but the bare kind; also a compile-time fold." },
 { "globals", "reflect", "globals()",
   "Sorted names bound in the global scope (vars/funcs/structs), excluding "
@@ -565,11 +566,22 @@ const LangFeature lang_features[] = {
   "struct Point { int x; int y; const ORIGIN = 0; }\n"
   "var p = Point(3, 4);    p.x    Point.ORIGIN",
   "A user value type with explicitly-typed fields and optional const members. "
-  "Construction is a call (Point(...)); fields are accessed with `.`. Structs "
-  "have COW value semantics. An all-scalar struct is POD (a native C byte "
-  "layout - see layout()); a ref/opt field makes it boxed. A self-reference "
-  "must be `opt` (dyn? next) to break the cycle - that is how you write a "
-  "list/tree." },
+  "Construction is a call (Point(...)); fields are accessed with `.`. A struct "
+  "is a VALUE: every copy (an assignment, an argument, an element read) is "
+  "independent, and `==` compares the fields. An all-scalar struct is POD (a "
+  "native C byte layout - see layout()); a ref/opt field makes it boxed. A "
+  "self-reference must be nullable (dyn? next) to break the cycle; for a "
+  "linked structure use a class (:help class)." },
+{ "classdecl", "structs", "class",
+  "class Node { int v; opt Node next; }\n"
+  "var a = Node(1, none);    var b = a;    b.v = 2;    // a.v is 2",
+  "A struct with REFERENCE semantics: a copy shares the one object, a write "
+  "through any holder is seen by all, `==` and hash() go by IDENTITY (two "
+  "instances with equal fields differ; an instance is a dict key by "
+  "identity). A field of the class's own type must be `opt`. `const c = "
+  "C(...)` makes the whole object read-only through every alias "
+  "(CannotChangeConstEx). A pure function cannot construct one - each "
+  "construction is a new object." },
 
 /* ---- exceptions ---- */
 { "trycatch", "exceptions", "Exceptions",

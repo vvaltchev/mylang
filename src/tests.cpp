@@ -16397,6 +16397,71 @@ static const std::vector<test> tests =
         "func g() { var pad = [1, 2, 3]; struct P { int x; }",
         "           return hash(P(1)) + len(pad) - 3; }",
         "assert(f() == g());" } },
+    /* A const member is a constant's initializer: a construction there is
+     * a constant expression, as at the top level (refused as "not const"
+     * until 2026-10-08) */
+    { "struct: a const member may hold a struct instance",
+      { "struct P { int x; int y; }",
+        "struct S { const O = P(1, 2); const A = [P(3, 4)]; }",
+        "var q = S.O; q.x = 9;",
+        "assert(S.O.x == 1 && q.x == 9 && S.A[0].y == 4);" } },
+    /* ---- class: a struct with REFERENCE semantics (README "Classes") */
+    { "class: a copy shares the object; == and hash go by identity",
+      { "class C { int v; }",
+        "var a = C(int(runtime(1))); var b = a; b.v = 2;",
+        "assert(a.v == 2 && a == b && hash(a) == hash(b));",
+        "assert(a != C(2));",
+        "func set(C c, int v) { c.v = v; }",
+        "for (var i = 0; i < 50; i++) set(b, i);",
+        "assert(a.v == 49);" } },
+    { "class: a class instance is a dict key by identity, unfrozen",
+      { "class C { int v; }",
+        "var a = C(1); var d = {}; d[a] = 5; a.v = 99;",
+        "assert(d[a] == 5 && get(d, C(99)) == none);",
+        "a.v = 3; assert(a.v == 3);" } },
+    { "class: a struct field of class type is a shared reference",
+      { "class C { int v; } struct S { int x; C c; }",
+        "var s1 = S(1, C(2)); var s2 = s1;",
+        "s2.c.v = 7; s2.x = 5;",
+        "assert(s1.c.v == 7 && s1.x == 1 && s1.c == s2.c);" } },
+    { "class: a constant is read-only through an alias",
+      { "class C { int v; }",
+        "const K = C(1); var a = K; a.v = 2;" },
+      &typeid(CannotChangeConstEx) },
+    { "class: a constant's array field is read-only through an alias",
+      { "class C { array<int> xs; }",
+        "const K = C([1]); var a = K; append(a.xs, 2);" },
+      &typeid(CannotChangeConstEx) },
+    { "class: each const declaration is its own instance",
+      { "class C { int v; }",
+        "const A = C(1); const B = C(1); const L = [A, A];",
+        "assert(A != B && L[0] == L[1] && L[1] == A);" } },
+    { "class: a pure function cannot construct one",
+      { "class C { int v; }",
+        "pure func mk(int i) => C(i);" },
+      &typeid(SyntaxErrorEx) },
+    { "class: ... nor one declared after it, once called at compile time",
+      { "pure func mk(int i) => C(i);",
+        "class C { int v; }",
+        "var x = mk(1);" },
+      &typeid(SyntaxErrorEx) },
+    { "class: a function that constructs one is not inferred pure",
+      { "class C { int v; }",
+        "func mk(int i) => C(i);",
+        "assert(!ispure(mk) && mk(1) != mk(1));" } },
+    { "class: a non-opt field of its own type is refused",
+      { "class N { int v; N next; }" },
+      &typeid(SyntaxErrorEx) },
+    { "class: opt on a struct-typed field is refused (forward reference)",
+      { "class X { opt Y y; }",
+        "struct Y { int v; }" },
+      &typeid(SyntaxErrorEx) },
+    { "class: kindstr is class, a ring prints and compares",
+      { "class N { int v; opt N next; }",
+        "var r = N(1, none); r.next = r;",
+        "assert(kindstr(r) == \"class\" && typestr(r) == \"N\");",
+        "var q = r.next; assert(q == r);",
+        "r.next = none;" } },
     { "struct: a field-less struct is a payload-less exception type",
       { "struct Timeout {} var hit = 0;",
         "try { throw Timeout(); } catch (Timeout) { hit = 1; }",
@@ -21028,6 +21093,14 @@ static const std::vector<repl_test> repl_tests =
       { { "var gv = 7", "=> 7" },
         { "func gfn(int a) => a", "" },
         { ":globals", "gfn : func gfn(int a)" } } },
+
+    { ":globals names a class type, :type an instance",
+      { { "class Rc { int v; }", "" },
+        { "var rc = Rc(1)", "=> Rc(v: 1)" },
+        { "var rd = rc", "" },
+        { "rd.v = 5", "" },
+        { "rc.v", "=> 5" },
+        { ":globals", "Rc(int v)   [class type]" } } },
 
     { ":globals shows a const scalar (folded, from the const ctx)",
       { { "const KC = 42", "" },
@@ -26555,6 +26628,30 @@ static bool opt_layer_equivalence()
             "for (var q = 0; q < 3; q++) {",
             "  var sl = base[0:2]; t += sl[0]; al[0] = 10; }",
             "print(t);" } },
+        { "alias: a class field written through another name, for-range", {
+            "class B { int n; }",
+            "func g(B x, B y) { var k = 0;",
+            "  for (var i = 0; i < x.n; i++) { y.n = 1; k++; }",
+            "  return k; }",
+            "var r = B(4); print(g(r, r));" } },
+        /* a class instance's hash is its identity NUMBER, restarted
+         * where each program is parsed and run (g_class_ident): every
+         * configuration here runs in one process, one after another */
+        { "class: a dict keyed by instances iterates alike in every run", {
+            "class C { int v; }",
+            "const K = C(100);",
+            "var d = {K: 0};",
+            "for (var i = 0; i < 9; i++) { d[C(i)] = i; }",
+            "foreach (k, v in d) { print(k.v); }" } },
+        /* ...and one keyed by CONSTANTS only, whose numbers come from the
+         * parse (with the parse's restart removed, the first configuration
+         * inherits the previous program's count: watched failing) */
+        { "class: a dict keyed by constant instances iterates alike", {
+            "class C { int v; }",
+            "const A = C(1); const B = C(2); const D = C(3);",
+            "const E = C(4); const F = C(5); const G = C(6);",
+            "var d = {A: 1, B: 2, D: 3, E: 4, F: 5, G: 6};",
+            "foreach (k, v in d) { print(k.v); }" } },
         { "alias: a row replaced through another name, LICM", {
             "func run(m, mm) { var s = 0;",
             "  for (var k = 0; k < 3; k++) {",
@@ -48191,6 +48288,32 @@ static bool jit_memberv_native()
         fprintf(stderr,
                 "jit_memberv_native: the POD form DID NOT RUN\n");
         return false;
+    }
+    /* A CLASS instance two names share: struct_own would hand it back
+     * as it is, so the inline form must run (no memberv_shared /
+     * memberv_borrowed decline) and both names see every store. */
+    {
+        const unsigned long mvc = g_jit_memberv_fast;
+        if (!run({
+                "class C { int x; array<int> a; }",
+                "var p = C(0, []); var q = p;",
+                "func set(C c, int v) { for (var i = 0; i < 8; i++)",
+                "  c.x = v + i; }",
+                "for (var i = 0; i < 20; i++) { q.x = i; q.a = [i]; }",
+                "assert(p.x == 19 && p.a[0] == 19);",
+                "set(p, 100);",
+                "assert(q.x == 107);",
+                "const K = C(1, [1]); var r = K; var hit = 0;",
+                "for (var i = 0; i < 4; i++) {",
+                "  try { r.x = i; } catch (CannotChangeConstEx) { hit++; } }",
+                "assert(hit == 4 && K.x == 1);" }))
+            return false;
+        if (g_jit_memberv_fast < mvc + 20) {
+            fprintf(stderr, "jit_memberv_native: a SHARED class instance "
+                    "did not take the inline form (%lu)\n",
+                    g_jit_memberv_fast - mvc);
+            return false;
+        }
     }
     /* THE BOXED FORM: a reference into a boxed field - retain-new,
      * release-old (the cold arm destroys when it was the last one). */

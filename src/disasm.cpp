@@ -214,7 +214,8 @@ const char *field_kind_str(FieldKind k)
 void dump_struct_type(const StructTypeDef *def, std::ostringstream &s)
 {
     const bool pod = def->layout == StructTypeDef::Layout::pod;
-    s << "; struct " << def->name->val << "  [" << (pod ? "pod" : "boxed");
+    s << (def->is_class ? "; class " : "; struct ") << def->name->val
+      << "  [" << (pod ? "pod" : "boxed");
     if (pod)
         s << " size=" << def->size << " align=" << def->align;
     s << "]\n";

@@ -153,11 +153,11 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
      * immutable already, so make_const_clone returns it as-is (cheap).
      */
     if (obj.get_has_default())            /* a new key: see Cursor */
-        return obj.insert_new(make_const_clone(key),
+        return obj.insert_new(make_const_clone(key, true),
                               LValue(obj.get_default(), false));
 
     if (for_write)
-        return obj.insert_new(make_const_clone(key), LValue(none, false));
+        return obj.insert_new(make_const_clone(key, true), LValue(none, false));
 
     throw KeyNotFoundEx();
 }

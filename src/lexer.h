@@ -112,8 +112,9 @@ enum class Keyword : int {
     kw_dyn      = 25,
     kw_null     = 26,   // alias for `none`
     kw_struct   = 27,
+    kw_class    = 28,
 
-    kw_count    = 28,
+    kw_count    = 29,
 };
 
 static const std::array<std::string, (int)Keyword::kw_count> KwString =
@@ -147,6 +148,7 @@ static const std::array<std::string, (int)Keyword::kw_count> KwString =
     "dyn",
     "null",
     "struct",
+    "class",
 };
 
 std::ostream &operator<<(std::ostream &s, TokType t);

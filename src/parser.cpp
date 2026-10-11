@@ -62,6 +62,9 @@ ParseContext::ParseContext(const TokenStream &ts, bool fold)
     , const_ctx(const_ctx_owner.get())
     , cse(new CseCache)
 {
+    /* a program's constants number their class instances from 1, in the
+     * order they are declared (g_class_ident) - the same in every engine */
+    class_ident_reset(0);
     pending_decl_type = DeclType::none;
 
     /*
@@ -91,7 +94,8 @@ ParseContext::ParseContext(const TokenStream &ts, bool fold)
 
         const Tok &t = scan.get();
 
-        if ((t == Keyword::kw_func || t == Keyword::kw_struct) && !prev_pure) {
+        if ((t == Keyword::kw_func || t == Keyword::kw_struct
+             || t == Keyword::kw_class) && !prev_pure) {
             const Tok &nm = scan.peek(1);
             if (nm == TokType::id)
                 shadow_add(UniqueId::get(nm.value));
@@ -911,8 +915,13 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
 
             if (const_value.get_type()->t == Type::t_lval) {
 
-                MakeConstructFromConstVal(RValue(const_value), v);
+                const EvalValue &cv = RValue(const_value);
+                const bool cls = cv.is<StructTypeDef *>()
+                    && cv.get<StructTypeDef *>()->is_class;
+                MakeConstructFromConstVal(cv, v);
                 v->is_const = true;
+                if (cls)
+                    static_cast<Identifier *>(v.get())->names_class = true;
 
             } else if (const_value.is<intrusive_ptr<FuncObject>>()) {
 
@@ -1264,6 +1273,21 @@ pAcceptCallExpr(ParseContext &c,
         expr->start = what->start;
         expr->what = std::move(what);
         expr->args = pArgList(c, fl);
+
+        /* A pure function makes no class instance: each construction is
+         * a new object, so a fold or a de-duplicated call would merge
+         * objects the program can tell apart (a class named before the
+         * function; one declared after it is refused when the call is
+         * evaluated at compile time - construct_struct's caller) */
+        if (c.pure_depth > 0
+            && ctag(expr->what.get()) == ConstructType::id
+            && static_cast<Identifier *>(expr->what.get())->names_class)
+            throw SyntaxErrorEx(expr->what->start,
+                "a pure function cannot construct a class instance (each "
+                "construction is a new object)");
+
+        /* the one place a class instance may be made at compile time */
+        expr->in_const_decl = (fl & pFlags::pInConstDecl) != 0;
 
         /* A named call can't bind/fold until its labels are mapped to
          * positions; do it now if the callee is a parse-time pure func. */
@@ -3052,6 +3076,30 @@ static bool fieldkind_allows_opt(FieldKind k)
            k == FieldKind::f_dict;
 }
 
+/*
+ * `opt` on a struct-typed field is allowed when the type is a CLASS: the
+ * field holds a reference, and `none` is a null one - the linked-list
+ * spelling `opt Node next;` (plans/class-and-box.md). On a STRUCT it is
+ * not (a struct field is a value; an opt one is deferred with the opt
+ * scalar fields). The type is known here when it is the declaration
+ * being parsed or one declared above it; a forward reference is accepted
+ * and checked by the inferencer once every declaration is known
+ * (Inferencer::check_opt_struct_fields).
+ */
+static const char *const opt_field_msg =
+    "'opt' is only allowed on dyn/array/dict and class-typed fields";
+
+static bool opt_struct_field_ok(const FieldDef &fd, const StructTypeDef &def)
+{
+    if (fd.kind != FieldKind::f_struct)
+        return false;
+    if (fd.struct_def)
+        return fd.struct_def->is_class;
+    if (fd.struct_ty == def.name)
+        return def.is_class;
+    return true;              /* a forward reference: the inferencer checks */
+}
+
 /* Reject a field/const name already used by a field or const in this struct
  * (struct members share one namespace). */
 static void
@@ -3134,12 +3182,20 @@ check_struct_no_recursion(const StructTypeDef *def,
         if (!t)
             continue;
         std::set<const StructTypeDef *> seen{def};
-        if (t == def || struct_reaches_root(t, def, seen, cctx))
+        if (t == def || struct_reaches_root(t, def, seen, cctx)) {
+            if (def->is_class)
+                throw SyntaxErrorEx(field_locs[i],
+                    "recursive class field: a non-opt field whose type "
+                    "contains its own class can never be constructed (the "
+                    "first instance would need an existing one). Make it "
+                    "nullable - e.g. 'opt <type> <name>' or '<type>? "
+                    "<name>'");
             throw SyntaxErrorEx(field_locs[i],
                 "recursive struct field: a non-opt struct field whose type "
                 "contains its own struct can never be constructed (it would "
                 "nest forever). Box it by making it nullable - e.g. "
                 "'dyn? <name>' or 'opt dyn <name>'");
+        }
     }
 }
 
@@ -3155,7 +3211,12 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 {
     const Loc start = c.get_loc();
 
-    if (!pAcceptKeyword(c, Keyword::kw_struct))
+    /* `class` is the same declaration with reference semantics
+     * (StructTypeDef::is_class, plans/class-and-box.md) */
+    bool is_class = false;
+    if (pAcceptKeyword(c, Keyword::kw_class))
+        is_class = true;
+    else if (!pAcceptKeyword(c, Keyword::kw_struct))
         return false;
 
     auto stmt = make_unique<StructDeclStmt>();
@@ -3163,11 +3224,14 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     stmt->id = pIdentifier(c, fl & ~pFlags::pInStmt);
 
     if (!stmt->id)
-        throw SyntaxErrorEx(c.get_loc(), "Expected struct name, got",
+        throw SyntaxErrorEx(c.get_loc(), is_class
+                                ? "Expected class name, got"
+                                : "Expected struct name, got",
                             &c.get_tok());
 
     stmt->set_def(make_unique<StructTypeDef>());
     stmt->def->name = stmt->id->uid;
+    stmt->def->is_class = is_class;
 
     pExpectOp(c, Op::braceL);
 
@@ -3192,9 +3256,15 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             pExpectOp(c, Op::assign);
 
             /* The rvalue is a plain (const) expression, not a declaration: no
-             * pInDecl. make_const_clone below makes the stored value deep
-             * read-only regardless. */
-            unique_ptr<Construct> rv = pExpr14(c, fl & ~pFlags::pInStmt);
+             * pInDecl - but it IS a constant's initializer, parsed as a
+             * `const` declaration parses its own (pInConstDecl): a struct or
+             * class construction there is a constant expression. Without
+             * it `const Z = P(1);` was "not const" in a struct while the
+             * same line at the top level worked. make_const_clone below
+             * makes the stored value deep read-only regardless. */
+            unique_ptr<Construct> rv = pExpr14(c,
+                (fl & ~(pFlags::pInStmt | pFlags::pInDecl))
+                | pFlags::pInConstDecl);
             if (!rv)
                 noExprError(c);
             if (!rv->is_const)
@@ -3282,9 +3352,10 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         fd.name = static_cast<Identifier *>(nameId.get())->uid;
         struct_check_name_free(*stmt->def, fd.name, mloc);
 
-        if (fd.is_opt && !fieldkind_allows_opt(fd.kind))
-            throw SyntaxErrorEx(mloc,
-                "'opt' is only allowed on dyn/array/dict fields (v1)");
+        fd.loc = mloc;
+        if (fd.is_opt && !fieldkind_allows_opt(fd.kind)
+            && !opt_struct_field_ok(fd, *stmt->def))
+            throw SyntaxErrorEx(mloc, opt_field_msg);
 
         pExpectOp(c, Op::semicolon);
 
@@ -3452,6 +3523,18 @@ cse_key_rec(ParseContext &c, const Construct *node, string &out)
     }
 
     if (const CallExpr *ce = dynamic_cast<const CallExpr *>(node)) {
+        /* a CLASS construction makes a new object each time it is
+         * evaluated: two `const a = C(1); const b = C(1);` are two
+         * instances, and sharing one baked value would make a == b */
+        if (dynamic_cast<const Identifier *>(ce->what.get())) {
+            const EvalValue cv = ce->what->eval(c.const_ctx);
+            if (cv.is<LValue *>()) {
+                const EvalValue &d = cv.get<LValue *>()->get();
+                if (d.is<StructTypeDef *>()
+                    && d.get<StructTypeDef *>()->is_class)
+                    return false;
+            }
+        }
         out += "C(";
         if (!cse_key_rec(c, ce->what.get(), out))
             return false;

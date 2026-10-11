@@ -308,6 +308,9 @@ private:
     std::vector<std::unique_ptr<Construct>> retired;
     /* struct types by name (for resolving a struct-typed field/annotation). */
     std::unordered_map<const UniqueId *, const StructTypeDef *> struct_by_name;
+    /* the program's own struct/class declarations (struct_by_name also
+     * holds the native reflection types, which follow other rules) */
+    std::unordered_set<const StructTypeDef *> declared_structs;
 
     Scope *global = nullptr;
     bool changed = false;
@@ -493,6 +496,7 @@ private:
     void check_if(IfStmt *i);
     TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
+    void check_opt_struct_fields();      /* `opt` names a class (parser) */
     void stamp_literal_coerce(Construct *n, StaticTypeRef t);
     FuncInfo *hint_func = nullptr;   /* annotate_hints: the enclosing func */
     /* literals whose widening an enclosing literal stamped (#75) */
@@ -1752,11 +1756,38 @@ void Inferencer::setup()
  * fixpoint reads but never recomputes them). All passes operate on this root's
  * elems only; the persistent global scope / arena carry cross-input state.
  */
+/*
+ * `opt` on a struct-typed field is for a CLASS-typed one (a null
+ * reference). The parser decides it when the field's type is already
+ * declared; a forward reference is decided here, once every declaration
+ * is known. A syntactic rule, so it runs under -nti too.
+ */
+void Inferencer::check_opt_struct_fields()
+{
+    /* the first in SOURCE order: the map's own order follows pointers */
+    const FieldDef *bad = nullptr;
+    for (const StructTypeDef *d : declared_structs)
+        for (const FieldDef &f : d->fields) {
+            if (!f.is_opt || f.kind != FieldKind::f_struct)
+                continue;
+            auto it = struct_by_name.find(f.struct_ty);
+            if (it != struct_by_name.end() && !it->second->is_class
+                && (!bad || f.loc.line < bad->loc.line
+                    || (f.loc.line == bad->loc.line
+                        && f.loc.col < bad->loc.col)))
+                bad = &f;
+        }
+    if (bad)
+        throw SyntaxErrorEx(bad->loc,
+            "'opt' is only allowed on dyn/array/dict and class-typed fields");
+}
+
 void Inferencer::infer_one(Block *rootBlock)
 {
     hoist_globals(rootBlock);
     for (auto &e : rootBlock->elems)
         walk_struct(e.get(), global);
+    check_opt_struct_fields();
 
     /*
      * Desugar named-argument calls into positional ones BEFORE anything else
@@ -2809,7 +2840,7 @@ void Inferencer::stamp_literal_coerce(Construct *n, StaticTypeRef t)
  */
 static bool struct_def_deep_value(const StructTypeDef *d, int depth)
 {
-    if (!d || depth > 16)
+    if (!d || d->is_class || depth > 16)      /* a class is a reference */
         return false;
     for (const FieldDef &f : d->fields) {
         switch (f.kind) {
@@ -3387,6 +3418,7 @@ void Inferencer::declare_structdecl(StructDeclStmt *sd, Scope *s)
 {
     StructTypeDef *def = sd->def;
     struct_by_name[def->name] = def;
+    declared_structs.insert(def);
 
     if (sd->id) {
         const UniqueId *nm = sd->id->uid;
@@ -5587,7 +5619,11 @@ static const char *static_type_kind_string(StaticTypeRef t)
         case StaticTypeKind::Dict:      return "dict";
         case StaticTypeKind::Func:      return "func";
         case StaticTypeKind::Exception: return "exception";
-        case StaticTypeKind::Struct:    return "struct";
+        case StaticTypeKind::Struct: {
+            auto *d = static_cast<const StructTypeDef *>(
+                static_type_resolve(t)->struct_def);
+            return d && d->is_class ? "class" : "struct";
+        }
         default:                 return "dyn";   /* Dyn / Unknown */
     }
 }
@@ -6611,7 +6647,8 @@ static bool fr_builtin_mutates(const Construct *callee)
  * a hoisted slice each gave a different answer from `--no-opt all`):
  *   - `alias_content` : some write in the loop goes INTO storage another
  *                       name may share - an element or field store whose
- *                       chain passes through an array, a dict or a `dyn`
+ *                       chain passes through an array, a dict, a class
+ *                       instance or a `dyn`
  *                       (a struct field of a struct VALUE is the struct's
  *                       own copy and does not count), or a call that may
  *                       change anything (below);
@@ -6635,9 +6672,18 @@ struct FrMut {
     void taint_all() { alias_len = alias_content = true; }
 };
 
+/* A member read or store through a struct VALUE - not a dict, not a
+ * `dyn`, not a CLASS instance, each of which another name may share. */
+static bool fr_member_of_value(const MemberExpr *m)
+{
+    return m->base_struct && m->base_struct_def
+        && !m->base_struct_def->is_class;
+}
+
 /* Does a store to the lvalue chain `lv` write into storage another name may
- * share? Every level whose base is an array, a dict or a `dyn` is such a
- * store; a member of a struct VALUE is the variable's own copy. */
+ * share? Every level whose base is an array, a dict, a class instance or a
+ * `dyn` is such a store; a member of a struct VALUE is the variable's own
+ * copy. */
 static bool fr_store_reaches_shared(const Construct *lv)
 {
     while (lv) {
@@ -6646,7 +6692,7 @@ static bool fr_store_reaches_shared(const Construct *lv)
                                 stored into) */
         if (ctag(lv) == ConstructType::member) {
             auto *m = static_cast<const MemberExpr *>(lv);
-            if (!m->base_struct)
+            if (!fr_member_of_value(m))
                 return true;
             lv = m->what.get();
             continue;
@@ -6734,8 +6780,9 @@ static void fr_collect_mutated(Construct *c, FrMut &m)
  *   - an arith/bitwise/unary chain of immutable operands;
  *   - a subscript / member READ whose base + index are immutable AND whose base
  *     has no element/field write (`content`) - the element is then stable.
- *     A read THROUGH a shared container (an array, a dict, a `dyn` - not a
- *     string, not a member of a struct value) also needs `alias_content`
+ *     A read THROUGH a shared container (an array, a dict, a class
+ *     instance, a `dyn` - not a string, not a member of a struct value)
+ *     also needs `alias_content`
  *     clear: a write through another name would change it;
  *   - a call to a CONST (pure) builtin with all-immutable arguments - e.g.
  *     `len(arr)` when arr's length is stable (an `arr[i] = v` is fine: it does
@@ -6766,7 +6813,7 @@ static bool fr_immutable(const Construct *e, const FrMut &m,
         auto *mem = static_cast<const MemberExpr *>(e);
         const UniqueId *b = fr_base_id(mem->what.get());
         return b && m.content.find(b) == m.content.end() &&
-               (mem->base_struct || !m.alias_content) &&
+               (fr_member_of_value(mem) || !m.alias_content) &&
                fr_immutable(mem->what.get(), m, i_uid);
     }
     if (ctag(e) == ConstructType::call) {

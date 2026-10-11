@@ -400,6 +400,38 @@ else
     fail "myv: -c refused a function in a struct's const member"
 fi
 
+# A CLASS instance has identity, and its hash is its identity NUMBER
+# (v33's `cls` record): an image must keep two references to one constant
+# instance one object, keep two declarations two objects, and give each
+# instance the number the compile gave it - a dict keyed by constant
+# instances then iterates in the source run's order. Its struct const
+# members are read while the struct table is still being filled.
+cat > "$TMP/clsimg.my" <<'PROG'
+class C { int v; }
+struct S { const Z = C(9); }
+const A = C(1);
+const B = C(1);
+const L = [A, A, B, S.Z];
+var d = {};
+foreach (var k in L) { d[k] = k.v; }
+var e = C(7); d[e] = 7;
+foreach (k, v in d) { print(k.v, v); }
+print(L[0] == L[1], L[0] == L[2], A == B, len(d), S.Z == L[3]);
+PROG
+src_out=$("$BIN" "$TMP/clsimg.my" 2>&1)
+if "$BIN" -c "$TMP/clsimg.my" -o "$TMP/clsimg.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/clsimg.myv" 2>&1)
+    got_rc=$?
+    if [ "$got_rc" = 0 ] && [ "$img_out" = "$src_out" ] && \
+       printf '%s' "$src_out" | grep -q '^true false false 4 true'; then
+        pass "myv: class instances keep their identity and hash in an image"
+    else
+        fail "myv: class identity: rc=$got_rc src=[$src_out] img=[$img_out]"
+    fi
+else
+    fail "myv: -c refused a program with constant class instances"
+fi
+
 # A LOADED image whose main takes a SWITCHED call (recursion past the
 # JIT's sync depth cap, an exception across a call) must run exactly like
 # its source. The script driver moves the VmProgram it loads out of

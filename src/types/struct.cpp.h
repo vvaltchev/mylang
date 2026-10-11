@@ -76,6 +76,10 @@ static bool struct_equal(const StructObject &x, const StructObject &y)
     if (x.def != y.def)
         return false;
 
+    /* a CLASS instance is equal to itself only: == is identity */
+    if (x.def->is_class)
+        return &x == &y;
+
     /* POD: same def -> same layout, so a raw byte compare is exact. */
     if (x.is_pod())
         return x.bytes == y.bytes;
@@ -131,6 +135,14 @@ size_t TypeStruct::hash(const EvalValue &a)
 
     size_t seed = hash_salt_struct;
     hash_combine(seed, std::hash<std::string_view>()(def.name->val));
+
+    /* a CLASS instance hashes by IDENTITY, consistent with its == - its
+     * number, never its address (see g_class_ident) - so its hash does not
+     * change when its fields do, and it can be a dict key unfrozen */
+    if (def.is_class) {
+        hash_combine(seed, std::hash<uint64_t>()(o.ident));
+        return seed;
+    }
 
     for (size_t i = 0; i < def.fields.size(); i++)
         hash_combine(seed, (o.is_pod() ? o.pod_get(static_cast<int>(i))

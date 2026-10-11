@@ -100,10 +100,47 @@ deliberately not designed yet.
 
 1. The shared heap object + `class` (declaration, construction, member
    read/write through the reference, identity `==` / hash, const), every
-   engine, `.myv`.
+   engine, `.myv`. **DONE 2026-10-08** - see *Step 1 as built* below.
 2. `array<C>` flat pointer storage, `opt C` as null.
 3. `box()` over structs (reuses 1), then scalar boxes with `*`.
 4. The JIT's inline tiers for member access through a reference.
+
+## Step 1 as built (2026-10-08)
+
+The representation is the decided one: a class is a `StructTypeDef` with
+`is_class`, its instances `StructObject`s with the `t_struct` tag, every
+difference decided by the def (CLAUDE.md, *A CLASS IS A STRUCT WITH
+REFERENCE SEMANTICS*). Decisions taken on the way, for review:
+
+- **A write through an alias of a constant instance raises
+  `CannotChangeConstEx`** - for a field (`d.v = 5`) and for a mutating
+  builtin on an array it holds (`append(d.xs, 1)`) alike. (An element
+  store into a constant ARRAY through an alias raises `NotLValueEx`; one
+  exception for the whole object read better than two.)
+- **The hash of an instance is an identity NUMBER**, not its address:
+  `g_class_ident`, restarted where a program's constants are parsed and
+  where a run starts, so a dict keyed by instances iterates in the same
+  order in every engine, every run and a `.myv` load. The `.myv` stores
+  each constant instance's number.
+- **A pure function cannot construct an instance** (a compile error): a
+  construction is a new identity, so a folded, cached or de-duplicated call
+  would merge objects the program can tell apart. A plain function that
+  constructs one is never inferred pure. An instance is made at compile
+  time only by a `const` declaration's initializer.
+- **`opt` on a class-typed field** is allowed (`opt Node next`); on a
+  struct-typed field it stays refused.
+- `kindstr(c)` is `"class"`, `:globals` says `class type`, `-vd` prints
+  `; class NAME`.
+- `deepclone` copies every class instance it reaches once per REFERENCE,
+  like everything else it copies - two references to one instance become two
+  copies. Whether it should keep sharing (Python's `deepcopy` does) is
+  open, and waits on the cycle-safe walk (plans/reference-cycles.md, A).
+
+Two pre-existing bugs found and fixed on the way, each its own commit: the
+loop transforms decided invariance by name while arrays and dicts are
+references, and a struct's hash was salted with its def's address. A third
+was fixed in this step: a struct's `const` member could not hold a struct
+construction (its initializer was not parsed as a constant's).
 
 ## Corrections to plans/struct-value-semantics.md
 

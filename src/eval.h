@@ -682,6 +682,9 @@ bool arr_append_fast(LValue *lval, const EvalValue &elem, bool is_const);
  * `holder` is updated to the live slot. `holder` must hold a struct.
  * ⛔ OWN BEFORE DERIVING ANY POINTER INTO THE OBJECT: a pointer taken
  * earlier points into the object the holder no longer holds.
+ * A CLASS instance (def->is_class) is a reference: struct_own returns the
+ * object itself, shared or borrowed, and leaves `holder` alone - or
+ * throws CannotChangeConstEx when it is read-only (a constant's).
  */
 StructObject &struct_own(LValue *&holder);
 /* struct_own when `holder` holds a struct; `holder` is updated as
@@ -1149,9 +1152,12 @@ extern "C" unsigned long g_live_funcobjs;
 /*
  * Deep, read-only copy of a const-evaluated array/dict value (see eval.cpp).
  * Used by the parser to bake a `const`-decl target into a LiteralObj that can
- * be shared (it can't be mutated) instead of deep-copied on every evaluation.
+ * be shared (it can't be mutated) instead of deep-copied on every evaluation,
+ * and by every dict insert to freeze a KEY (`key` true). A class instance
+ * keeps its identity either way: a key's is left alone, a constant's is
+ * frozen in place.
  */
-EvalValue make_const_clone(const EvalValue &v);
+EvalValue make_const_clone(const EvalValue &v, bool key = false);
 
 /*
  * Mutable copies of an array/dict value (scalars/strings returned as-is):

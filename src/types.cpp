@@ -97,11 +97,22 @@ EvalValue builtin_exit(EvalContext *ctx, const ArgLocs *exprList,
  * the -nti fallback for type()/decltype() (no inference, so no static type to
  * bake; the normal path folds a recursive Type at compile time instead).
  */
+/* The bare kind of a runtime value (kindstr, Type.kind): its TypeE name,
+ * except that a CLASS instance is a "class", not a "struct" - the name
+ * the inferencer's fold gives it (static_type_kind_string). */
+static EvalValue runtime_kind_name(const EvalValue &v)
+{
+    if (v.is<intrusive_ptr<StructObject>>()
+        && v.get_ref<intrusive_ptr<StructObject>>()->def->is_class)
+        return EvalValue(SharedStr(std::string("class")));
+    return EvalValue(TypeNames[v.get_type()->t]);
+}
+
 static EvalValue make_runtime_type_value(const EvalValue &v)
 {
     StructTypeDef *td = const_cast<StructTypeDef *>(native_struct_type_def());
     auto obj = make_intrusive<StructObject>(td);
-    obj->fields.emplace_back(EvalValue(TypeNames[v.get_type()->t]), false);
+    obj->fields.emplace_back(runtime_kind_name(v), false);
     obj->fields.emplace_back(EvalValue(SharedStr(reflect_typeof(v))), false);
     obj->fields.emplace_back(EvalValue(false), false);   /* nullable */
     obj->fields.emplace_back(EvalValue(), false);         /* elem (none) */
@@ -161,7 +172,7 @@ EvalValue builtin_kindstr(EvalContext *ctx, ExprList *exprList)
 {
     if (exprList->elems.size() != 1)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-    return TypeNames[RValue(exprList->elems[0]->eval(ctx)).get_type()->t];
+    return runtime_kind_name(RValue(exprList->elems[0]->eval(ctx)));
 }
 
 /*
@@ -199,7 +210,7 @@ EvalValue builtin_kindstr_v(EvalContext *, const ArgLocs *el, const EvalValue *a
 {
     if (n != 1)
         throw InvalidNumberOfArgsEx(el->start, el->end);
-    return TypeNames[args[0].get_type()->t];
+    return runtime_kind_name(args[0]);
 }
 
 /*

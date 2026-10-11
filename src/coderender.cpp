@@ -367,7 +367,8 @@ struct Renderer {
             func(f, level);
             o << "\n";
         } else if (auto *s = dynamic_cast<const StructDeclStmt *>(c)) {
-            o << "struct " << s->def->name->val << " { ... }\n";
+            o << (s->def->is_class ? "class " : "struct ")
+              << s->def->name->val << " { ... }\n";
         } else if (auto *i = dynamic_cast<const IfStmt *>(c)) {
             o << "if (";
             expr(i->condExpr.get(), 0);

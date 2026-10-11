@@ -2322,8 +2322,9 @@ error.
 **Fields take the same explicit types as variables** — `bool`, `int`, `float`,
 `str`, `array`, `dict`, another struct type, or `dyn`. v1 restrictions (to be
 lifted later): a field must have an explicit type (no `var`), and `opt` is
-allowed only on a `dyn`/`array`/`dict` field (a non-opt field is guaranteed
-never `none`). An uninitialised field-less use isn't possible — every field is
+allowed only on a `dyn`/`array`/`dict` field or a field of a class type (see
+*Classes*; a non-opt field is guaranteed never `none`). An uninitialised
+field-less use isn't possible — every field is
 supplied at construction (or defaulted to `none` when an omitted optional).
 
 **A struct may have no fields.** `struct Unit {}` is legal, and so is one
@@ -2345,7 +2346,10 @@ try {
 ```
 
 **Access.** `obj.field` reads/writes a field; `obj.CONST` / `Type.CONST` reads a
-const member. `.` means *field access* on a struct and *key access* on a dict —
+const member. A const member's initializer is a constant expression exactly as
+a `const` declaration's is, so it may hold any constant value - a struct or
+class instance included (`const ORIGIN = Point(0, 0);`). `.` means *field
+access* on a struct and *key access* on a dict —
 resolved by the base's type. Reading a field that doesn't exist is a compile
 error (for a statically-typed base).
 
@@ -2430,6 +2434,67 @@ Structs may be declared anywhere a statement is allowed, **including inside a
 function** (lexically scoped like a nested function). A struct's fields and
 consts live in the struct's own namespace, so a struct `const PI` never clashes
 with a global `const PI`.
+
+### Classes
+
+`class` declares a struct with **reference semantics**. Its declaration is a
+struct's - typed fields, `const` members, positional / named construction,
+zero-initialization (`Node n;`) - and so are field reads and writes. What
+differs is what a copy means:
+
+```C#
+class Node {
+    int val;
+    opt Node next;      # a field of the class's own type must be opt
+}
+
+var a = Node(1, none);
+var b = a;              # b and a are ONE object
+b.val = 2;              # a.val is 2 as well
+var list = Node(1, Node(2, Node(3, none)));
+
+func bump(Node n) { n.val += 100; }
+bump(a);                # a.val is 102: the function wrote the caller's object
+```
+
+- **A copy shares the object.** Assigning a class instance, passing it,
+  returning it, storing it in an array, a dict or a field, or binding it as a
+  `foreach` variable never copies it: a write through any holder (`b.val = 2`,
+  `arr[0].val = 2`, `n.val += 100`) is seen through every other one.
+  `clone(c)` makes a new instance with the same fields (shallow), and
+  `deepclone(c)` copies everything reachable from it.
+- **`==` and `!=` compare identity.** Two instances are equal only when they
+  are the same instance; equal fields do not make them equal. `hash(c)` goes
+  by identity too, so a class instance is a dict key by **identity**: it is
+  not frozen when it is inserted (its hash does not depend on its fields), and
+  changing its fields afterwards leaves it findable. The hash of an instance is
+  the same in every run and every engine.
+- **A struct holding a class field copies the reference.** `var s2 = s1;` gives
+  `s2` its own copy of every plain field, and the same object in a class field:
+  `s2.n.val = 7` is seen through `s1`, `s2.n = Node(0, none)` rebinds `s2`'s
+  field only. A struct field inside a class lives in the class object.
+- **`const` freezes the whole object.** `const c = Node(1, none)` is built at
+  compile time and is deep read-only: writing one of its fields through any
+  alias (`var d = c; d.val = 5`, or a function parameter bound to it) raises
+  `CannotChangeConstEx`, and so does a mutating builtin on an array it holds.
+  Each `const` declaration makes its own instances: `const a = Node(1, none);
+  const b = Node(1, none);` are two objects (`a == b` is false).
+- **A field of the class's own type must be `opt`** - a non-`opt` one could
+  never be constructed (the first instance would need an existing one), and is
+  a compile error. `opt` is allowed on a class-typed field (`opt Node next`, or
+  `Node? next`), which holds `none` or an instance; it is not allowed on a
+  struct-typed field.
+- **A pure function cannot construct a class instance**: each construction is
+  a new object, so the call cannot be folded or shared. `pure func mk() =>
+  Node(1, none);` is a compile error, and a plain function that constructs one
+  is never inferred pure.
+- `kindstr(c)` is `"class"`; `typestr(c)` is the class's name.
+
+A class instance can refer to itself, directly or through others
+(`a.next = a`). Printing, comparing and copying such a value terminate (see
+*Values that contain themselves*), but the memory of a ring that nothing else
+refers to is not reclaimed yet - the open design question is recorded in
+`plans/reference-cycles.md`.
 
 ### Custom exceptions
 
@@ -3228,8 +3293,9 @@ REPL every global is map-resident, so all of them appear.
 #### `typestr(x)` / `kindstr(x)`
 Two **compile-time type queries**: `typestr` gives `x`'s full **structural**
 type as a string (`"array<int>"`, `"dict<str,int>"`, `"array<dict<str,int>>"`,
-`"int?"`, a struct name `"Point"`), and `kindstr` gives just the **kind**
-(`"array"`, `"int"`, `"struct"`, …). They are richer / coarser views of the same
+`"int?"`, a struct or class name `"Point"`), and `kindstr` gives just the
+**kind** (`"array"`, `"int"`, `"struct"`, `"class"`, …). They are richer /
+coarser views of the same
 thing — use `kindstr` for a quick category check, `typestr` for the exact type.
 
 Both have an **unevaluated operand** (like C++ `decltype`/`sizeof`): the arg
