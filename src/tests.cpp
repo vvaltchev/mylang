@@ -20078,6 +20078,17 @@ static const std::vector<repl_test> repl_tests =
         { "KQ", "=> 5" },
         { ":globals", ": int   [const]" } } },
 
+    /* H3: an explicit `pure func`'s name is a const binding, as a struct's
+     * is - a store into it is refused (a script refuses it at compile
+     * time), and redefining the function still works */
+    { "pure func: its name is const in the REPL, and redefinable (H3)",
+      { { "pure func h3a(x) => x + 1", "" },
+        { "h3a = 3", "CannotRebindConstEx" },
+        { "var h3a = 5", "CannotRebindConstEx" },
+        { "h3a(1)", "=> 2" },
+        { "pure func h3a(x) => x + 2", "" },
+        { "h3a(1)", "=> 3" } } },
+
     /*
      * The RUN-TIME half of UncatchableRuntimeException. The REPL is the only
      * place a name error is still a RUNTIME error (FIX-1 makes it a compile
