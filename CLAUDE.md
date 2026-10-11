@@ -3488,6 +3488,33 @@ and it lives *inside the parser*. Mechanics:
   rebindable. Known and left: a param named like a STRUCT shadows the name
   for values, but `P p;` in that function still resolves P as the struct
   type (`lookup_struct_type` is not shadow-aware).
+- **A CLOSURE CAPTURING A CONST SCALAR GETS A SYNTHESIZED `var` (H2,
+  2026-10-06).** A const scalar has no run-time symbol (its decl is
+  dropped, `ShouldConstSymbolExistAtRuntime`), so `func [K]` snapshot
+  nothing - "Undefined variable". `declare_captured_const_scalars`
+  (parser.cpp, run right after the capture list is parsed) pushes
+  `var K = <value>` - SAME name - into `ParseContext::baked_funcs`, and the
+  innermost `pBlock` re-inserts it before the statement holding the
+  closure (the #47 mechanism), so a closure in an `if` condition or a
+  brace-less body lands before that whole statement.
+  **`ParseContext::cap_const_decls`** (one vector per `pBlock` in
+  progress) dedupes per block - two captures of one const in one block
+  would otherwise be AlreadyDefinedEx. Every OTHER read of K is still
+  folded by the parser, so the synthetic var is read only by capture
+  snapshots; AutoConst cannot promote and drop it (it is captured,
+  `prescan_blocked`); the capture is shadowed in the body (H1), so `K++`
+  changes the closure's copy. Skipped for a shadowed name (a param or loop
+  variable is a run-time binding already), a const builtin (it has a
+  builtin slot) and a value no literal can hold - a struct NAME, whose
+  hoisted global slot is its run-time symbol (a null rvalue there crashed
+  the parser). Rejected designs, both for their blast radius: a
+  "constant" capture KIND (capture kinds are branched on in ~12 places
+  including the JIT's lean closure paths and the bytecode inliner, plus a
+  `.myv` change), and a hidden-named outer var with a "capture source"
+  field (every consumer of a capture's outer name would need it). Visible
+  side effects: `-s` / `:show` show the synthetic `var K = 5`, and in the
+  REPL it lands in the run-time map, so `cmd_globals` lists the CONST
+  scope first and skips a run-time entry of the same name.
 - **Early failure:** exceptions raised *during* const-eval propagate immediately
   and are *not*
   catchable by script `try/catch` (the parser never enters a const assignment
