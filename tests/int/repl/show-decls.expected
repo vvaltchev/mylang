@@ -1,0 +1,80 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> >> >> >> >> >> >> >> => "Q(bool b, int i, float f, str s, array a, dict d, dyn y, box<int> bx, P p, opt dyn od, opt array oa, opt dict odc, array<int>? ai, dict<str,int> di, box<float>? bf, opt K ok)"
+>> b: bool 
+i: int 
+f: float 
+s: str 
+a: array 
+d: dict 
+y: dyn 
+bx: box<int> 
+p: P 
+od: opt dyn 
+oa: opt array 
+odc: opt dict 
+ai: array<int>? 
+di: dict<str,int> 
+bf: box<float>? 
+ok: opt K 
+>> >> => 4
+>> /* pure */ int func pa(P p, P? q, array<int> a, array<int>? b, dict<str,P> d, box<int> bx, int? o, dyn x, dyn? y, bool bb, str s, float f, K? k) => a[0] + p.x;
+>> => "func pa(P p, opt P q, array<int> a, array<int>? b, dict<str,P> d, box<int> bx, opt int o, dyn x, opt dyn y, bool bb, str s, float f, opt K k)"
+>> .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. >> => [4, 1, 4, 1, 4, 5, 4, 4, 1, 4, 1, 4]
+>> array<dyn> func locs(int n) {
+    P p = P(n, 2);
+    opt P q = n > 9 ? p : none;
+    array<int>? b = n > 9 ? [n] : none;
+    array<P> ps = [p];
+    dict<str,int> d = {"k": n};
+    box<float> bx = box(1.5);
+    box<int>? bn = n > 9 ? box(n) : none;
+    opt int o = n > 9 ? n : none;
+    var dyn t = n;
+    var opt dyn u = n > 9 ? n : none;
+    bool bb = n > 1;
+    str s = str(n);
+    float fl = n;
+    K k = K(n);
+    opt K ok = n > 9 ? k : none;
+    var a1, a2 = [n, 2];
+    int i1, i2 = [n, 3];
+    a1, a2 = [a2, a1];
+    a1 += i2;
+    struct L {
+        int a;
+        opt dyn z;
+        array<float> fs;
+        box<int>? bi;
+        P p;
+        K k;
+    }
+    var l = L(1, none, [1.5], none, p, k);
+    bool nn = q == none && b == none && bn == none && o == none && u == none && ok == none && bb && len(s) == 1;
+    return [p.x, len(ps), d["k"], int(*bx), t, a1, a2, i1, l.a, k.v, nn ? 1 : 0, int(fl)];
+}
+>> >> => [1, [...]]
+>> >> => {"me": {...}}
+>> => P(x: 5, y: 6)
+>> => N(n: "a", v: 7)
+>> => K(v: 8)
+>> => [
+     1.500000,
+     0.100000,
+     1000000000000000052504760255204420248704468581108159154915854115511802457988908195786371375080447864043704443832883878176942523235360430575644792184786706982848387200926575803737830233794788090059368953234970799945081119038967640880074652742780142494579258788820056842838115669472196386865459400540160.000000,
+     -0.000000,
+     2.000000
+   ]
+>> => {"a": 1}
+>> => {"b": [2.500000], "c": 3}
+>> .. .. .. .. .. .. .. .. .. >> => [1, 1, 2, 1, 1, 1, 2]
+>> /* pure */ array<int> func vals() {
+    array<array<dyn>> r = [[1, [...]]];
+    array<dict<str,dyn>> e = [{"me": {...}}];
+    array<P> s = [P(x: 5, y: 6), P(x: 5, y: 6)];
+    array<N> n = [N(n: "a", v: 7)];
+    array<K> k = [K(v: 8)];
+    array<array<float>> f = [[1.5, 0.1, 1e+300, -0.0, 2.0]];
+    array<dict<str,int>> d = [{"a": 1}, {"b": [2.5], "c": 3}];
+    return [len(r), len(e), len(s), len(n), len(k), len(f), len(d)];
+}
+>> 
