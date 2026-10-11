@@ -52,6 +52,7 @@ const PP = P(5, 6)
 const NN = N("a", 7)
 const KK = K(8)
 const FL = [1.5, 0.1, 1e300, -0.0, 2.0]
+const FX = [inf, -inf, nan, math_pi]
 const DD = {"a": 1}
 const D2 = {"b": [2.5], "c": 3}
 func vals() {
@@ -61,8 +62,9 @@ func vals() {
     var n = [NN]
     var k = [KK]
     var f = [FL]
+    var x = [FX]
     var d = [DD, D2]
-    return [len(r), len(e), len(s), len(n), len(k), len(f), len(d)]
+    return [len(r), len(e), len(s), len(n), len(k), len(f), len(d), len(x)]
 }
 vals()
 :show vals
