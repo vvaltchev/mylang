@@ -4856,7 +4856,10 @@ decisions behind it: `plans/archived/type-inference.md`,
   (`join_elem`) so `array(N)`-then-fill stays `array<int>`, not opt-element;
   an empty `[]` (`array<none>`) or a `dyn`-element container fits any
   `array<T>` (`static_type_elem_compat` — invariance relaxed at the bottom/top
-  element).
+  element). A DEFAULT dict's reads also yield its default, so its type
+  joins the default's: an empty one is `dict<dyn, T>`, the type the
+  unfolded `dict(v)` call has (it was `dict<none,none>`, and a folded
+  `dict(0)`'s `d.a + 1` a NullabilityEx `-nc` did not raise).
 - **Interaction**: const scalars are already inlined to literals before this
   pass runs, so it never sees them as symbols. A statically-known type error
   that used to surface as a runtime `TypeErrorEx`/`NotCallableEx` is now a

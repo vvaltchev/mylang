@@ -4522,15 +4522,27 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
         }
 
         case Type::t_dict: {
-            const auto &m = v.get<intrusive_ptr<DictObject>>()->get_ref();
+            const DictObject &dobj = *v.get<intrusive_ptr<DictObject>>();
+            const auto &m = dobj.get_ref();
+            /* a DEFAULT dict's reads also yield its default: an empty one
+             * is what `dict(v)` is typed unfolded (builtin_result:
+             * dict<dyn, T>), a non-empty one joins T into its values. It
+             * was typed by its entries alone, so a folded `dict(0)` was
+             * dict<none,none> and `d.a + 1` a NullabilityEx that -nc
+             * did not raise (RULE 2). */
+            StaticTypeRef dft = dobj.get_has_default()
+                ? static_type_from_value(dobj.get_default(), st) : nullptr;
             if (m.empty())
-                return A.dict_of(A.none_ty(), A.none_ty());
+                return dft ? A.dict_of(A.dyn_ty(), dft)
+                           : A.dict_of(A.none_ty(), A.none_ty());
             StaticTypeRef kty = nullptr, val = nullptr;
             for (const auto &kv : m) {
                 StaticTypeRef kt = static_type_from_value(kv.first, st);
                 StaticTypeRef vt = static_type_from_value(kv.second.get(), st);
                 if (!kty) {
-                    kty = kt; val = vt;
+                    StaticTypeRef jv = dft ? A.join(dft, vt) : vt;
+                    kty = kt;
+                    val = jv ? jv : A.dyn_ty();
                 } else {
                     StaticTypeRef jk = A.join(kty, kt);
                     StaticTypeRef jv = A.join(val, vt);
@@ -5946,7 +5958,11 @@ bool Inferencer::type_fits(StaticTypeRef t, StaticTypeRef d)
         const StaticTypeRef tk = static_type_resolve(t->key);
         if (tk->kind == StaticTypeKind::None)
             return true;
-        return static_type_assignable(tk, d->key)
+        /* a `dyn` key - an empty default dict, dict<dyn, T> - fits any
+         * key type, as the container rule of static_type_assignable has
+         * it (the unfolded `[dict(1)]` is checked by that rule) */
+        return (tk->kind == StaticTypeKind::Dyn
+                || static_type_assignable(tk, d->key))
             && type_fits(t->val, d->val);
     }
     return static_type_assignable(t, d);
