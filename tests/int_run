@@ -166,6 +166,18 @@ def main():
               "to %s)" % binary, file=sys.stderr)
         return 2
 
+    # The universe's MC/DC conditions (gcov --conditions) exist from GCC
+    # 14 on: an older gcc's gcov refused the option with a usage dump,
+    # after the whole -rt run (tests/run's int-gcov lane builds with the
+    # default g++, which is older on some machines)
+    comp = cfg.get("compiler", "")
+    if args.gcov and comp.startswith("gcc ") and \
+            int(comp.split()[1].split(".")[0]) < 14:
+        print("int_run: --gcov needs GCC 14 or later (MC/DC conditions); "
+              "%s is %s - build it with CXX=g++-14 (from clean)"
+              % (binary, comp), file=sys.stderr)
+        return 2
+
     tool = gcov_tool(cfg) if args.gcov else None
     if tool:
         print("  gcov: %s" % tool)

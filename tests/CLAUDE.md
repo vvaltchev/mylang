@@ -235,6 +235,10 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   --gcov each is a `vc:` element. 22_value_classes.my asserts every one
   against README.md - extend it with each new class, and give the
   README the rule first if it does not state the boundary.
+- `--gcov` needs a GCC 14 build (MC/DC conditions; an older gcov refuses
+  `--conditions`, and int_run now says so before running anything). The
+  int-gcov lane builds with the default g++; where that is older, build
+  a GCOV INT lane with CXX=g++-14 (the CI int job's compiler).
 - With --gcov every unit must OWN an element no other unit covers, and
   uncovered must stay <= tests/int/coverage-floor.txt for the compiler.
   Lower the floor when a change covers more (the note says by how much);
