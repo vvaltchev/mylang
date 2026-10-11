@@ -3554,7 +3554,12 @@ and it lives *inside the parser*. Mechanics:
   set; it asks `is_shadowed` now, and the error says why (`not_a_type`:
   "a parameter ... named 'P' hides the struct"). A per-name check is
   exact here: the ctor pre-scan adds an entry only for a builtin's name,
-  which no struct can take.
+  which no struct can take. **And ACROSS REPL INPUTS (2026-10-11):** the
+  pre-scan sees only the input being parsed, so after `func abs(x) =>
+  42` a later input's `abs(-3)` folded to the builtin's 3 while
+  `abs(runtime(-3))` gave 42. Every REPL parse goes through
+  `ReplEngine::Impl::bind_parser`, which also feeds the set each
+  run-time global an earlier input bound under a const builtin's name.
 - **A CLOSURE CAPTURING A CONST SCALAR GETS A SYNTHESIZED `var` (H2,
   2026-10-06).** A const scalar has no run-time symbol (its decl is
   dropped, `ShouldConstSymbolExistAtRuntime`), so `func [K]` snapshot

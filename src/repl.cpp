@@ -277,6 +277,28 @@ struct ReplEngine::Impl {
         return o.str();
     }
 
+    /* Point an input's parser at the persistent const scope, and tell it
+     * which const builtins' names an EARLIER input gave the program's own
+     * function (or struct): the parser learns that from `func NAME` in its
+     * token stream (ParseContext::shadowed, #133), which a later input's
+     * stream does not hold - after `func abs(x) => 42`, a later `abs(-3)`
+     * folded to the builtin's 3 while `abs(runtime(-3))` gave 42. */
+    void bind_parser(ParseContext &pc) const {
+        pc.const_ctx = const_ctx.get();
+        std::vector<std::pair<const UniqueId *, const LValue *>> s;
+        runtime_ctx->collect_symbols(s);
+        /* the program's own binding is a function or a struct (a const
+         * builtin cannot be rebound to anything else); a builtin's own
+         * entry is a Builtin or a value - `inf`, `math_pi` */
+        for (const auto &kv : s) {
+            const EvalValue &v = kv.second->get();
+            if (EvalContext::const_builtins.count(kv.first)
+                    && (v.is<intrusive_ptr<FuncObject>>()
+                        || v.is<StructTypeDef *>()))
+                pc.shadow_add(kv.first);
+        }
+    }
+
     /* The interned names currently bound in the global scope (sorted), used to
      * detect what an input's undef() removed. */
     std::vector<const UniqueId *> global_names() const {
@@ -669,7 +691,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
             return "";
 
         ParseContext pc(TokenStream(tokens), true);
-        pc.const_ctx = const_ctx.get();
+        bind_parser(pc);
         root = pBlock(pc, 0, /*push_const_scope=*/false);
         if (!pc.eoi())
             throw SyntaxErrorEx(Loc(pc.get_tok().loc),
@@ -913,7 +935,7 @@ ReplEngine::Impl::cmd_tree(const string &code)
     try {
         lexer(source, 1, toks);   /* one pass; views point into `source` */
         ParseContext pc(TokenStream(toks), true);
-        pc.const_ctx = const_ctx.get();
+        bind_parser(pc);
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
         std::ostringstream o;
         o << *root << "\n";
@@ -950,7 +972,7 @@ ReplEngine::Impl::cmd_analyze(const string &code)
         lex_stable(source, local_lines, toks);
         AnalysisInfo info;
         ParseContext pc(TokenStream(toks), true);
-        pc.const_ctx = const_ctx.get();
+        bind_parser(pc);
         pc.analysis = &info;        /* record parse-time folds / dead code */
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
 
@@ -1221,7 +1243,7 @@ ReplEngine::Impl::cmd_type(const string &code)
     try {
         lex_stable(source, local_lines, toks);
         ParseContext pc(TokenStream(toks), true);
-        pc.const_ctx = const_ctx.get();
+        bind_parser(pc);
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
         Block *blk = dynamic_cast<Block *>(root.get());
         if (!blk || blk->elems.empty())
@@ -1337,7 +1359,7 @@ ReplEngine::Impl::cmd_show(const string &arg)
     try {
         lex_stable(source, local_lines, toks);
         ParseContext pc(TokenStream(toks), true);
-        pc.const_ctx = const_ctx.get();
+        bind_parser(pc);
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
         resolve_names(root.get(), /*inline=*/true, 24, nullptr, /*repl=*/true);
 

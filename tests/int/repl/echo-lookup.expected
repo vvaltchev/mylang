@@ -105,4 +105,24 @@ w2     : int   [var]
 w3     : int   [var]
 z      : int   [var]
 z2     : int   [var]
+>> => [inf, nan, 3.141593]
+>> => [inf, nan, 3.141593]
+>> >> >> >> >> >> >> >> >> => 5
+>> => <function>
+>> => 2
+>> >> /* pure */ int func c1() => 3;
+>> >> /* pure */ int func c2() => 3;
+>> >> /* pure */ int func c3() => 55;
+>> => 55
+>> >> int func c5() => addp$s0(1, 2);
+>> >> /* pure */ int func c6() => 42;
+>> => 42
+>> => 6
+>> => 6
+>> >> => 11
+>> CannotRebindConstEx: Cannot rebind const at line 109, col 1:4
+
+    add = func(a, b) => a - b; add(5, 1);
+    ^^^
+>> => 6
 >> 
