@@ -3472,6 +3472,22 @@ and it lives *inside the parser*. Mechanics:
   so `func top() {...} top()` ran the builtin (InvalidNumberOfArgsEx in
   every engine), as did `top(1)` under `-nti`. A call whose callee resolved
   to a user symbol named like a const builtin is not folded now.
+  **AND A USER CONST IS SHADOWED THE SAME WAY (H1, 2026-10-06).** The set
+  took only CONST BUILTIN names, so `const K = 5; func f(K) => K + 1;`
+  folded the param's reads to 5 - a wrong answer in EVERY engine. The
+  feeder `shadow_add` now records any name the const scope binds
+  (**`ParseContext::const_binding(uid)`** walks the `const_ctx` chain: a
+  const builtin in the root, a user const, a pure func, a struct name), and
+  two more sites feed it: a **catch variable** (a `shadow_push`/`pop` around
+  the catch body) and a closure's **captures** (added with the params - the
+  capture-list identifiers themselves are parsed by `pIdentifier`, which
+  never const-resolves). AutoConst's twin: a callee resolved to
+  `SymKind::local` or `SymKind::capture` is not folded either (`pure func
+  a ..; func f(a) { return a(2); }` ran the OUTER `a`). The cost is a lost
+  fold of a captured const CONTAINER's reads, deliberately: the capture is
+  rebindable. Known and left: a param named like a STRUCT shadows the name
+  for values, but `P p;` in that function still resolves P as the struct
+  type (`lookup_struct_type` is not shadow-aware).
 - **Early failure:** exceptions raised *during* const-eval propagate immediately
   and are *not*
   catchable by script `try/catch` (the parser never enters a const assignment

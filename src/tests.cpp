@@ -14584,6 +14584,111 @@ static const std::vector<test> tests =
     },
 
     /*
+     * H1 (2026-10-06) - #133 FOR A USER CONST. A parameter, a foreach or
+     * catch variable, or a capture named like an outer `const` / `pure
+     * func` is its own binding, and the parser folded reads of it to the
+     * OUTER value (`const K = 5; func f(K) => K + 1; f(10)` gave 6, in
+     * every engine). Two halves, each a separate sabotage: the parser's
+     * shadowed set (ParseContext::const_binding), and AutoConst's call
+     * fold, which evaluates a const-argument call BY NAME in its context
+     * - a call through a parameter named like a pure func ran the pure
+     * func. Every case asserts a value the outer const cannot produce.
+     */
+    {
+        "shadow: a PARAM beats an outer const scalar (H1)",
+        {
+            "const K = 5;",
+            "func f(K) { return K + 1; }",
+            "assert(f(10) == 11);",
+            "assert(f(runtime(10)) == 11);",
+            "assert(K == 5);",
+        }
+    },
+    {
+        "shadow: a PARAM beats an outer const container (H1)",
+        {
+            "const K = [1, 2];",
+            "func f(K) { return len(K) + K[0]; }",
+            "assert(f([7]) == 8);",
+            "assert(len(K) == 2);",
+        }
+    },
+    {
+        "shadow: an => body PARAM beats an outer const (H1)",
+        {
+            "const K = 5;",
+            "func f(K) => K * 2;",
+            "assert(f(7) == 14);",
+        }
+    },
+    {
+        "shadow: foreach variables beat an outer const (H1)",
+        {
+            "const K = [1];",
+            "var s = 0;",
+            "foreach (var K in [[5], [6]]) { s += K[0]; }",
+            "assert(s == 11);",
+            "const J = 5;",
+            "var t = 0;",
+            "foreach (var J, j in [[1, 2], [3, 4]]) { t += J * j; }",
+            "assert(t == 14);",
+            "var u = 0;",
+            "foreach (var J, v in indexed [9, 8]) { u += J * 100 + v; }",
+            "assert(u == 117);",
+            "assert(J == 5 && K[0] == 1);",
+        }
+    },
+    {
+        "shadow: a catch variable beats an outer const (H1)",
+        {
+            "const K = [1];",
+            "struct E { int x; }",
+            "var r = 0;",
+            "try { throw E(7); } catch (E as K) { r = K.x; }",
+            "assert(r == 7 && K[0] == 1);",
+        }
+    },
+    {
+        "shadow: a capture beats an outer const container (H1)",
+        {
+            "const K = [1, 2];",
+            "var g = func[K]() { K = [9]; return K[0]; };",
+            "assert(g() == 9);",
+            "assert(K[0] == 1);",
+        }
+    },
+    {
+        "shadow: a lambda PARAM beats a function's local const (H1)",
+        {
+            "func f() { const L = [1];",
+            "    var g = func(L) { return L[0]; }; return g([3]); }",
+            "assert(f() == 3);",
+        }
+    },
+    {
+        "shadow: a call through a PARAM named like a pure func (H1)",
+        {
+            /* the AutoConst half: `a(2)` has const args, and its fold
+             * looked `a` up BY NAME - the outer pure func, giving 3 */
+            "pure func a(x) => x + 1;",
+            "func f(a) { return a(2); }",
+            "assert(f(func(y) => y * 10) == 20);",
+            "assert(a(2) == 3);",
+        }
+    },
+    {
+        "shadow: a pure func's PARAM beats an outer const (H1)",
+        {
+            /* evaluated at compile time too (`const Q = p(4)`) */
+            "const K = 5;",
+            "pure func p(K) => K * 2;",
+            "const Q = p(4);",
+            "assert(Q == 8);",
+            "assert(p(runtime(3)) == 6);",
+        }
+    },
+
+    /*
      * Parse-time common-subexpression de-duplication (CSE). Identical const
      * array/dict expressions are evaluated once at parse time and the
      * resulting deep read-only value is shared, asserted here via intptr().
@@ -25487,6 +25592,15 @@ static bool const_fold_equivalence()
             "print(DEBUG ? missing : 4);",
             "while (false) { gone(); }",
             "print(1);" } },
+        /* H1: bindings named like a const */
+        { "a param, loop and catch variable named like a const", {
+            "const K = 5; const L = [1];",
+            "func f(K) => K + 1;",
+            "pure func a(x) => x + 1; func g(a) { return a(2); }",
+            "struct E { int x; }",
+            "try { throw E(7); } catch (E as L) { print(L.x); }",
+            "foreach (var K in [8]) { print(K); }",
+            "print(f(10), g(func(y) => y * 10), a(2), K, L);" } },
     };
 
     bool ok = true;

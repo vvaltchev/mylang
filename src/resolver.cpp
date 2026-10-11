@@ -1243,6 +1243,13 @@ private:
             if (all_const && callee && callee->sym.kind != SymKind::builtin
                     && EvalContext::const_builtins.count(callee->uid))
                 all_const = false;
+            /* ...and a callee that is a parameter, a local or a capture is
+             * not the pure function cctx holds under that name (`pure func
+             * a ..; func f(a) { return a(2); }` called the outer `a`) */
+            if (all_const && callee
+                    && (callee->sym.kind == SymKind::local
+                        || callee->sym.kind == SymKind::capture))
+                all_const = false;
             if (all_const && callee) {
                 /* Capture callee loc + name before the node may be freed. */
                 const Loc cloc = callee->start;
