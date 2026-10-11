@@ -1577,6 +1577,44 @@ history_path()
 
 static const size_t HISTORY_CAP = 2000;
 
+/*
+ * An entry is one INPUT, which may span lines (a block, a paste): written
+ * one per line, its newlines as `\n` and its backslashes as `\\`. Written
+ * raw, a block came back after a restart as one entry per line (Up
+ * recalled a lone `}`), and an empty line inside it was lost.
+ */
+static const char *const HISTORY_HEADER = "#mylang-history 2";
+
+static string
+history_encode(const string &e)
+{
+    string out;
+    for (const char c : e) {
+        if (c == '\\')
+            out += "\\\\";
+        else if (c == '\n')
+            out += "\\n";
+        else
+            out += c;
+    }
+    return out;
+}
+
+static string
+history_decode(const string &l)
+{
+    string out;
+    for (size_t i = 0; i < l.size(); i++) {
+        if (l[i] == '\\' && i + 1 < l.size()) {
+            i++;
+            out += l[i] == 'n' ? '\n' : l[i];
+        } else {
+            out += l[i];
+        }
+    }
+    return out;
+}
+
 static void
 load_history(std::vector<string> &history)
 {
@@ -1585,9 +1623,18 @@ load_history(std::vector<string> &history)
         return;
     std::ifstream f(path);
     string line;
+    /* the first line names the format: a file written before entries were
+     * escaped (save_history) has one entry per line, as written */
+    bool escaped = false;
+    if (std::getline(f, line)) {
+        if (line == HISTORY_HEADER)
+            escaped = true;
+        else if (!line.empty())
+            history.push_back(line);
+    }
     while (std::getline(f, line))
         if (!line.empty())
-            history.push_back(line);
+            history.push_back(escaped ? history_decode(line) : line);
     if (history.size() > HISTORY_CAP)
         history.erase(history.begin(), history.end() - HISTORY_CAP);
 }
@@ -1603,8 +1650,9 @@ save_history(const std::vector<string> &history)
         return;
     const size_t from =
         history.size() > HISTORY_CAP ? history.size() - HISTORY_CAP : 0;
+    f << HISTORY_HEADER << "\n";
     for (size_t i = from; i < history.size(); i++)
-        f << history[i] << "\n";
+        f << history_encode(history[i]) << "\n";
 }
 
 int

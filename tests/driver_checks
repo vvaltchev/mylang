@@ -1040,5 +1040,39 @@ else
           300 "$TMP/repl.err")"
 fi
 
+# The history file holds one INPUT per line, its newlines and backslashes
+# escaped: a block came back after a restart as one entry per line (Up
+# recalled a lone `}`). A run re-saves what it loaded, so a second run
+# leaves the entry as it was - the decode undoes the encode. A file of the
+# old format (no header line) loads one entry per line.
+rm -rf "$TMP/home"
+repl_run 'if (1 > 0) {
+  print("a\\b")
+}
+else {
+  print(0)
+}
+'
+hist="$TMP/home/.mylang_history"
+want_blk='if (1 > 0) {\n  print("a\\\\b")\n}\nelse {\n  print(0)\n}'
+hist_ok=1
+[ "$(sed -n 1p "$hist")" = '#mylang-history 2' ] &&
+    [ "$(sed -n 2p "$hist")" = "$want_blk" ] && [ "$(wc -l < "$hist")" = 2 ] ||
+    hist_ok=0
+repl_run '1
+'
+[ "$(sed -n 2p "$hist")" = "$want_blk" ] && [ "$(sed -n 3p "$hist")" = 1 ] ||
+    hist_ok=0
+printf 'print(1)\nx = 2\n' > "$hist"
+repl_run '3
+'
+[ "$(cat "$hist")" = "$(printf '#mylang-history 2\nprint(1)\nx = 2\n3')" ] ||
+    hist_ok=0
+if [ $hist_ok = 1 ]; then
+    pass "repl: a multi-line input is one history entry, across restarts"
+else
+    fail "repl: the history file: $(head -c 300 "$hist")"
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc
