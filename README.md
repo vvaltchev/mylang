@@ -862,10 +862,15 @@ f()++;              # compile error, as are `(a + 1)++` and `--s[0:1]`
 ```
 
 The rule is: when the target cannot possibly be a location *because of its
-shape*, the compiler rejects it. When assignability depends on the **value**
-at run time — writing through a `const` container, or through a `dyn` that
-happens to hold a read-only one — it stays a catchable `NotLValueEx`, as in
-the example above.
+shape*, the compiler rejects it - and so is an element or a field of a
+**constant** written directly, whatever the key: `K[0] = v`, `K["k"] = v`
+(present or not), `K.k = v`, `P.CONST = v` and `++K[5]` are all compile
+errors, since no store can ever write a constant. (A *read* of a missing key
+or index of a constant stays the compile-time `KeyNotFoundEx` /
+`OutOfBoundsEx` it is.) When assignability depends on the **value** at run
+time — writing through a `const` container reached through another name, or
+through a `dyn` that happens to hold a read-only one — it stays a catchable
+`NotLValueEx`, as in the example above.
 
 **Storing through a value.** An element or a field of *any* expression is a
 location — `f()[0]`, `(c ? a : b).x`, `[x, y][k]`, `g()[i].y` — and a store

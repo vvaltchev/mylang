@@ -14962,6 +14962,171 @@ static const std::vector<test> tests =
     },
 
     /*
+     * A STORE INTO A CONSTANT'S ELEMENT OR FIELD IS NOT AN ASSIGNABLE
+     * LOCATION, whatever the key (2026-10-07). `K["k"] = v` was refused so
+     * (the subscript folds to its value), but a key the const dict lacks
+     * or an index past the const array failed the FOLD first, with the
+     * read's KeyNotFoundEx / OutOfBoundsEx; and a field `K.k = v` (a member
+     * is not folded) reached run time as NotLValueEx. A READ of a missing
+     * key or index stays the compile-time error it was
+     * (ParseContext::pending_fold).
+     */
+    {
+        "const store: a missing key is not an assignable location",
+        {
+            "const b = {\"k\": 2}; b[\"z\"] = 1;",
+        },
+        &typeid(SyntaxErrorEx), 21, 1, 28, 1
+    },
+    {
+        "const store: a compound store into a missing key",
+        {
+            "const b = {\"k\": 2}; b[\"z\"] += 1;",
+        },
+        &typeid(SyntaxErrorEx), 21, 1, 28, 1
+    },
+    {
+        "const store: ++ on a missing key, postfix",
+        {
+            "const b = {\"k\": 2}; b[\"z\"]++;",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "const store: ++ on a missing key, prefix",
+        {
+            "const b = {\"k\": 2}; ++b[\"z\"];",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "const store: an index past a const array",
+        {
+            "const A = [1, 2, 3]; A[5] = 1;",
+        },
+        &typeid(SyntaxErrorEx), 22, 1, 27, 1
+    },
+    {
+        "const store: ++ on an index past a const array",
+        {
+            "const A = [1, 2, 3]; A[5]++;",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "const store: a nested missing key",
+        {
+            "const b = {\"k\": {\"q\": 1}}; b[\"z\"][\"w\"] = 1;",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "const store: a nested index past a const array",
+        {
+            "const A = [[1]]; A[3][0] = 1;",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "const store: a field of a const dict, present",
+        {
+            "const b = {\"k\": 2}; b.k = 1;",
+        },
+        &typeid(SyntaxErrorEx), 21, 1, 25, 1
+    },
+    {
+        "const store: a field of a const dict, missing",
+        {
+            "const b = {\"k\": 2}; b.z = 1;",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "const store: a field of a const struct instance",
+        {
+            "struct P { int x; }",
+            "const p = P(1); p.x = 2;",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "const store: a struct's const member",
+        {
+            "struct P { int x; const C = 1; }",
+            "P.C = 2;",
+        },
+        &typeid(SyntaxErrorEx)
+    },
+    {
+        "const store: a READ of a missing key stays KeyNotFoundEx",
+        {
+            /* a compile error: the catch cannot take it (a run-time
+             * KeyNotFoundEx would be caught, and fail the test) */
+            "const b = {\"k\": 2};",
+            "try { print(b[\"z\"]); } catch (KeyNotFoundEx) { }",
+        },
+        &typeid(KeyNotFoundEx)
+    },
+    {
+        "const store: a READ of a missing field stays KeyNotFoundEx",
+        {
+            "const b = {\"k\": 2};",
+            "try { print(b.z); } catch (KeyNotFoundEx) { }",
+        },
+        &typeid(KeyNotFoundEx)
+    },
+    {
+        "const store: a READ past a const array stays OutOfBoundsEx",
+        {
+            "const A = [1, 2, 3];",
+            "try { var y = A[5] + 1; } catch (OutOfBoundsEx) { }",
+        },
+        &typeid(OutOfBoundsEx)
+    },
+    {
+        "const store: a foreach over a missing element stays OutOfBoundsEx",
+        {
+            /* the one container not parsed through pExpr14 - and not a
+             * constant as a whole (the foreach's dead-loop check evaluates
+             * a constant one, and would raise the error by itself) */
+            "const A = [[1], [2]];",
+            "var i = runtime(0);",
+            "try { foreach (var q in A[7][i]) { print(q); } }",
+            "catch (OutOfBoundsEx) { }",
+        },
+        &typeid(OutOfBoundsEx)
+    },
+    {
+        "const store: a missing key READ as a store's base",
+        {
+            /* `b["z"]` is read to reach the element `[i]` */
+            "const b = {\"k\": [1]};",
+            "var i = runtime(0);",
+            "try { b[\"z\"][i] = 1; } catch (KeyNotFoundEx) { }",
+        },
+        &typeid(KeyNotFoundEx)
+    },
+    {
+        "const store: a missing key READ inside a call argument",
+        {
+            "const b = {\"k\": [1]};",
+            "func f(int i) { return i; }",
+            "try { print(f(b[\"z\"][0])); } catch (KeyNotFoundEx) { }",
+        },
+        &typeid(KeyNotFoundEx)
+    },
+    {
+        "const store: a const reached through a parameter stays NotLValueEx",
+        {
+            /* a run-time value: not decidable at compile time */
+            "func g(p) { p[\"z\"] = 1; }",
+            "const b = {\"k\": 2};",
+            "g(b);",
+        },
+        &typeid(NotLValueEx)
+    },
+
+    /*
      * Parse-time common-subexpression de-duplication (CSE). Identical const
      * array/dict expressions are evaluated once at parse time and the
      * resulting deep read-only value is shared, asserted here via intptr().
@@ -15587,8 +15752,15 @@ static const std::vector<test> tests =
       { "struct Point { int x; int y; }",
         "const A = [Point(1, 2), Point(3, 4)];",
         "assert(A[0].x == 1); assert(A[1].y == 4);" } },
+    /* written directly it is a compile error, like `K[0] = v` (a member
+     * target of a constant, 2026-10-07: it was a run-time NotLValueEx);
+     * through another name the value decides, at run time */
     { "struct err: writing a const struct's field fails",
       { "struct Point { int x; } const P = Point(1); P.x = 9;" },
+      &typeid(SyntaxErrorEx) },
+    { "struct err: writing a const struct's field through an alias fails",
+      { "struct Point { int x; } const P = Point(1);",
+        "var q = P; q.x = 9;" },
       &typeid(NotLValueEx) },
     { "struct err: unknown member access (compile-time)",
       { "struct Point { int x; } var p = Point(1); var z = p.bogus;" },
@@ -15761,6 +15933,10 @@ static const std::vector<test> tests =
         "const C = P(5, 6); assert(C.x == 5);" } },
     { "struct POD err: writing a const POD field fails",
       { "struct P { int x; } const C = P(1); C.x = 9;" },
+      &typeid(SyntaxErrorEx) },
+    { "struct POD err: writing a const POD field through an alias fails",
+      { "struct P { int x; } const C = P(1);",
+        "var q = C; q.x = 9;" },
       &typeid(NotLValueEx) },
     { "struct POD: an array of POD structs reads back correctly",
       { "struct P { int x; int y; }",
@@ -25914,6 +26090,17 @@ static bool const_fold_equivalence()
             "const a, b, c = [3, [4], 2.5];",
             "var m = func[a, b]() { a++; return a + b[0]; };",
             "print(h(), h(), K, m(), m(), a, b, c, typestr(a));" } },
+        /* a store into a constant's element or field, and a read of a
+         * missing one: the same compile error with folding off */
+        { "a store into a const dict's missing key", {
+            "const b = {\"k\": 2};",
+            "b[\"z\"] = 1;" } },
+        { "a store into a const dict's field", {
+            "const b = {\"k\": 2};",
+            "b.k = 1;" } },
+        { "a read of a const dict's missing key", {
+            "const b = {\"k\": 2};",
+            "print(b[\"z\"]);" } },
         { "a type name a parameter hides", {
             "struct P { int x; }",
             "func f(P) { P p; return 1; }" } },
