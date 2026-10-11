@@ -76,14 +76,15 @@ assert(bx.x == 2 && dd.k == 3 && g[0] == 2 && g[2] == 1.5);
 
 # The errors README.md names: an element or field that is not an int or a
 # float is a type error; an index out of range is OutOfBoundsEx; a constant
-# is not an lvalue.
+# array is not an lvalue - but a constant STRUCT passed to a parameter is
+# copied, and the copy is writable (a struct is a value).
 var dyn bools = runtime([true, false]);
 var dyn strs = runtime(["a", "b"]);
 var dyn pts = runtime([P(1, 2.5, true)]);
 const K = [1, 2];
 const KP = P(1, 2.5, true);
 func inc_k(dyn q) { q[0]++; }
-func inc_kp(dyn q) { q.x++; }
+func inc_kp(dyn q) { q.x++; return q.x; }
 assert(outcome(func [bools] () { bools[0]++; }) == "TypeErrorEx");
 assert(outcome(func [strs] () { strs[0]++; }) == "TypeErrorEx");
 assert(outcome(func [pts] () { pts[0]++; }) == "TypeErrorEx");
@@ -92,7 +93,7 @@ assert(outcome(func [d] () { d[3]++; }) == "OutOfBoundsEx");
 assert(outcome(func [d] () { d[-4]--; }) == "OutOfBoundsEx");
 assert(outcome(func [d] () { d["x"]++; }) == "TypeErrorEx");
 assert(outcome(func () { inc_k(K); }) == "NotLValueEx");
-assert(outcome(func () { inc_kp(KP); }) == "NotLValueEx");
+assert(inc_kp(KP) == 2 && KP.x == 1);
 # a field of a flat struct array's element (71_flat_struct_field_store.my)
 assert(outcome(func [pts] () { pts[0].x++; }) == "ok");
 assert(str(d) == "[10, 22, 31]" && p.b && pts[0].x == 2);

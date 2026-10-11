@@ -144,15 +144,16 @@ for (var i = 0; i < ri(300); i++) {
 }
 assert(acc == [14850, 14950, 15050] && tot == 1470150);
 
-# errors: out of range, a missing key, division by zero, a const target,
-# a flat array asked to hold another kind (dyn)
+# errors: out of range, a missing key, division by zero, a flat array
+# asked to hold another kind (dyn); a constant struct passed to a parameter
+# is the call's copy, so a store into it is no error (a struct is a value)
 const K = P(1, 1.0, I(1));
 func setk(dyn t) { return (t.x = 2); }
 assert(outcome(func [ia] () { var t = (ia[ri(3)] = 1); }) == "OutOfBoundsEx");
 assert(outcome(func [d] () { var t = (d["no"] += 1); }) == "KeyNotFoundEx");
 assert(outcome(func [ia] () { var t = (ia[0] /= ri(0)); })
        == "DivisionByZeroEx");
-assert(outcome(func () { setk(K); }) == "NotLValueEx");
+assert(setk(K) == 2 && K.x == 1);
 assert(outcome(func [da] () { var t = (da[0] = "s"); }) == "TypeErrorEx");
 
 print(ia, fa, ba, sa, ps, p, bx, d, df, s, cd, dp, da, g, gi, ea, acc);

@@ -15712,9 +15712,12 @@ static const std::vector<test> tests =
         "func mkw(x, str t) { return W(x, t); }",
         "var w = mkw([1, 2], \"hi\");",
         "assert(w.tag == [1, 2]); assert(w.s == \"hi\");" } },
-    { "struct: assignment aliases (mutation is shared, Python-like)",
+    /* a struct is a VALUE (plans/struct-value-semantics.md): until
+     * 2026-10-08 an assignment aliased, and this asserted q.x == 9 */
+    { "struct: assignment copies (a struct is a value)",
       { "struct Point { int x; int y; } var p = Point(1, 2); var q = p;",
-        "p.x = 9; assert(q.x == 9);" } },
+        "p.x = 9; assert(q.x == 1 && p.x == 9);",
+        "q.y = 7; assert(p.y == 2);" } },
     { "struct: clone() makes an independent copy",
       { "struct Point { int x; int y; } var p = Point(1, 2);",
         "var q = clone(p); p.x = 9; assert(q.x == 1);" } },
@@ -15780,10 +15783,41 @@ static const std::vector<test> tests =
     { "struct err: writing a const struct's field fails",
       { "struct Point { int x; } const P = Point(1); P.x = 9;" },
       &typeid(SyntaxErrorEx) },
-    { "struct err: writing a const struct's field through an alias fails",
+    /* an in-place builtin on a copy's SLICE field detaches that copy's
+     * slice, not the other copy's view (the field is owned first) */
+    { "struct: an in-place builtin on a copy's slice field",
+      { "struct B { int x; array<int> a; }",
+        "var big = [1, 2, 3, 4];",
+        "var s1 = B(int(runtime(0)), big[0:2]);",
+        "var s2 = s1;",
+        "append(s2.a, 9);",
+        "assert(s1.a == [1, 2] && s2.a == [1, 2, 9] && len(big) == 4);",
+        "var s3 = s1; sort(s3.a); pop(s3.a);",
+        "assert(s1.a == [1, 2] && s3.a == [1]);" } },
+    /* a COPY of a constant is an ordinary value (it raised NotLValueEx
+     * while an assignment aliased); a const BINDING is still refused at
+     * run time when the compiler cannot see it - a `const` parameter */
+    { "struct: a copy of a const struct is writable",
       { "struct Point { int x; } const P = Point(1);",
-        "var q = P; q.x = 9;" },
-      &typeid(NotLValueEx) },
+        "var q = P; q.x = 9; assert(q.x == 9 && P.x == 1);" } },
+    /* a `const` parameter's struct is read-only (C#'s `in`): refused
+     * at compile time when its type is known; a write into an array or
+     * a dict it holds is a write into that reference, allowed */
+    { "struct err: a const parameter's field is not writable",
+      { "struct Point { int x; } var p = Point(1);",
+        "func f(const Point c) { c.x = 9; }",
+        "f(p);" },
+      &typeid(TypeMismatchEx) },
+    { "struct err: a const parameter's nested field is not writable",
+      { "struct In { int v; } struct Out { In i; array a; }",
+        "func f(const Out c) { c.i.v++; }",
+        "f(Out(In(1), [1]));" },
+      &typeid(TypeMismatchEx) },
+    { "struct: a const parameter's array field is a reference",
+      { "struct Out { int v; array a; dict d; }",
+        "func f(const Out c) { c.a[0] = 9; append(c.a, 3); c.d.k = 4; }",
+        "var o = Out(1, [1], {\"k\": 1}); f(o);",
+        "assert(o.a == [9, 3] && o.d.k == 4);" } },
     { "struct err: unknown member access (compile-time)",
       { "struct Point { int x; } var p = Point(1); var z = p.bogus;" },
       &typeid(TypeMismatchEx) },
@@ -15948,18 +15982,22 @@ static const std::vector<test> tests =
         "assert(P(-1, 0) == P(-1, 0));",
         "assert(P(-1, 0) != P(1, 0));",
         "assert(P(0, 0) != P(0, -1));" } },
-    { "struct POD: alias shares, clone is independent, const immutable",
+    { "struct POD: assignment and clone copy, const immutable",
       { "struct P { int x; int y; }",
-        "var p = P(1, 2); var q = p; p.x = 9; assert(q.x == 9);",
+        "var p = P(1, 2); var q = p; p.x = 9; assert(q.x == 1);",
         "var r = clone(p); p.x = 100; assert(r.x == 9);",
         "const C = P(5, 6); assert(C.x == 5);" } },
     { "struct POD err: writing a const POD field fails",
       { "struct P { int x; } const C = P(1); C.x = 9;" },
       &typeid(SyntaxErrorEx) },
-    { "struct POD err: writing a const POD field through an alias fails",
+    { "struct POD: a copy of a const POD struct is writable",
       { "struct P { int x; } const C = P(1);",
-        "var q = C; q.x = 9;" },
-      &typeid(NotLValueEx) },
+        "var q = C; q.x = 9; assert(q.x == 9 && C.x == 1);" } },
+    { "struct POD err: a const parameter's field is not writable",
+      { "struct P { int x; } var p = P(1);",
+        "func f(const P c) { c.x += 9; }",
+        "f(p);" },
+      &typeid(TypeMismatchEx) },
     { "struct POD: an array of POD structs reads back correctly",
       { "struct P { int x; int y; }",
         "var a = [P(1, 2), P(3, 4), P(5, 6)];",
@@ -18830,7 +18868,10 @@ compound_store_caret_parity()
         { "dynstr", "var dyn ds = [\"s\", 1];", "ds[I]" },
         { "constp", "", "cp[I]" },
         { "constdp", "", "cd[K]" },
-        { "constsp", "", "cs.x" },
+        /* a const array's struct element: the array is a reference to
+         * the constant's read-only one (a struct passed itself would be
+         * the call's COPY - a struct is a value - and writable) */
+        { "constsp", "", "cs[0].x" },
     };
     /* the error kinds: which placeholder carries the failing operand
      * (`@` = the variable one) and which operators raise it */
@@ -18942,9 +18983,9 @@ compound_store_caret_parity()
                             if (is_const) {
                                 src += "const CA = [1, 2];\n"
                                        "const CD = {\"k\": 5};\n"
-                                       "const CS = P(5, 6);\n";
+                                       "const CS = [P(5, 6)];\n";
                                 params = "array<int> cp, dict<str, int> cd, "
-                                         "P cs";
+                                         "array<P> cs";
                                 call = "go(CA, CD, CS)";
                             }
                             src += "func go(" + params + ") {\n    "
@@ -19317,10 +19358,10 @@ func drive(int n) {
 }
 print(drive(runtime(4)));)",
         R"(struct P { int x; int y; }
-const C = P(1, 2);
-func g(p) { p.x = 5; }
+const C = [P(1, 2)];
+func g(p) { p[0].x = 5; }
 func drive(int n) {
-    var m = P(runtime(3), 4);
+    var m = [P(runtime(3), 4)];
     for (var i = 0; i < n; i++) { if (i == 2) g(C); else g(m); }
     return n;
 }
@@ -47697,18 +47738,13 @@ static bool jit_memberv_native()
             "}",
             "assert(p.x == 19);",
             "assert(p.f == 9.5);",
-            /* `p.b == false`, NOT print/str of it: a bool struct FIELD
-             * renders as int 0/1 under the VM and true/false under the
-             * tree-walker - a PRE-EXISTING RULE 2 divergence (`-nj`
-             * shows it too), tracked separately. The comparison is the
-             * one spelling both engines agree on. */
             "assert(p.b == false);",
-            /* a struct assignment ALIASES, so the write is visible
-             * through the other name - no clone on this path, matching
-             * the interpreter */
+            /* a struct is a VALUE: `q` shares `p`'s object until the
+             * first write, which declines (memberv_shared) to the helper
+             * that makes it q's own - the later ones are in place */
             "var q = p;",
             "for (var i = 0; i < 8; i++) q.x = 77;",
-            "assert(p.x == 77);" }))
+            "assert(p.x == 19 && q.x == 77);" }))
         return false;
     if (g_jit_memberv_fast <= mv0) {
         fprintf(stderr,
@@ -47778,24 +47814,28 @@ static bool jit_memberv_native()
             "try { var q = [1]; q[9] = 1; }",
             "catch (OutOfBoundsEx as e) { ex = e; }",
             "for (var i = 0; i < 6; i++) bx.a = ex;",
-            /* base_const: a const struct bound to a parameter keeps the
-             * const flag on its slot */
+            /* readonly: a COPY of a constant is an ordinary value - its
+             * slot is not const, but the object it shares with the
+             * constant is read-only, so the store declines to the helper,
+             * which makes it the slot's own (struct_own) */
             "const RO = P(1, 1.0, true);",
-            "func poke(s, val) { s.x = val; }",
-            "for (var i = 0; i < 6; i++) {",
-            "  try { poke(RO, i); } catch (NotLValueEx) { n += 1; }",
-            "}",
-            "assert(n == 6);",
-            /* readonly: the same const object reached through a plain
-             * local - a struct assignment ALIASES, so the slot is not
-             * const but the OBJECT still is, and base_const no longer
-             * shadows the readonly guard */
             "var m = 0;",
-            "func poke2(s, val) { var t = s; t.x = val; }",
+            "func poke2(s, val) { var t = s; t.x = val; return t.x; }",
+            "for (var i = 0; i < 6; i++) m += poke2(RO, i);",
+            "assert(m == 15 && RO.x == 1);",
+            /* shared: a second holder of the object */
+            "var sh = 0;",
             "for (var i = 0; i < 6; i++) {",
-            "  try { poke2(RO, i); } catch (NotLValueEx) { m += 1; }",
+            "  var c = p; c.x = i; sh += c.x - p.x;",
             "}",
-            "assert(m == 6);" }))
+            "assert(sh == 15 && p.x == 0);",
+            /* borrowed (#94): a non-escaping parameter at a frameless
+             * site is bound with no retain - the caller's slot holds the
+             * count, so a write there would be the caller's */
+            "func pb(P s, int v) { s.x = v; return s.x + int(s.b); }",
+            "var bt = 0;",
+            "for (var i = 0; i < 6; i++) bt += pb(p, i);",
+            "assert(bt == 15 && p.x == 0);" }))
         return false;
     if (g_jit_op_run[static_cast<size_t>(OpCode::StoreMemberV)] <= hv0) {
         fprintf(stderr, "jit_memberv_native: nothing DECLINED to the "
@@ -47810,8 +47850,8 @@ static bool jit_memberv_native()
      * proven-fact guards do: a `.myv` image's operands are bounded by
      * verify_chunk but never type-checked. */
     static const int want[] = {
-        JD_memberv_base_const, JD_memberv_readonly, JD_memberv_val_kind,
-        JD_memberv_val_ex, JD_memberv_val_slice,
+        JD_memberv_readonly, JD_memberv_val_kind, JD_memberv_val_ex,
+        JD_memberv_val_slice, JD_memberv_shared, JD_memberv_borrowed,
     };
     for (const int r : want) {
         if (g_jit_decline[r] > d0[r])

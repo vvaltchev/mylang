@@ -3634,10 +3634,13 @@ explicitly.
 **Pure functions: no observable side effects.** A function is pure iff it has
 no side effects: it reads only consts + its params (+ calls pure functions),
 nests no function, **and does not mutate a reference parameter.** The last
-clause matters because mylang passes arrays/dicts/structs **by reference**, so
-`a[i] = v` / `a.f = v` / `append(a, …)` on a param *is* observable by the
-caller — such a function is NOT pure (mutating a **scalar** param is fine, it is
-a copy; mutating a **fresh local** container is fine, it never escaped).
+clause matters because mylang passes arrays/dicts **by reference**, so
+`a[i] = v` / `d.k = v` / `append(a, …)` on a param *is* observable by the
+caller — such a function is NOT pure (a struct is a VALUE since 2026-10-08,
+so `p.f = v` on a struct param is the callee's copy - but the analysis
+cannot tell `p.f` from a dict's `d.k` and still counts it, which only costs
+a fold; mutating a **scalar** param is fine, it is a copy; mutating a
+**fresh local** container is fine, it never escaped).
 `func_mutates_input` (`resolver.cpp`) proves this with a small taint analysis:
 a non-scalar param is tainted, an *identifier-lvalue* assignment from a tainted
 value (`var b = a`, `var r = [a]`) taints the lhs, a `foreach` var over a
@@ -4028,7 +4031,12 @@ argument - `p[0] = v`, `p.x += v`, `append(p, v)`). The parameter slot is
 an lvalue; an inert literal put there is a store to a temporary - the
 tree-walker raised NotLValueEx for `h([1, 2, 3])` and the VM refused to
 compile it (NotLoweredEx) while `-ni` ran it. `arg_substitutable` and the
-tail inliner refuse it, so it is temp-bound. The size
+tail inliner refuse it, so it is temp-bound. **And a parameter the
+body writes INTO THROUGH A MEMBER (`p.x = v`, `p.f[i] += v`, `p.x++` -
+`param_member_written`) takes NO argument directly, not even a name:** a
+struct is a value, so the parameter is the call's own copy and the write
+must not reach the caller's variable; the temp is that copy (the write
+makes it its own, struct_own). The size
 gate is the **cost model**: `body_weight` (a weighted
 node sum, weights from `--weights`/`run_weight_bench`: a CALL is ~21x an arith
 op, assign 11, if 7, return 3) must be **below `CALL_WEIGHT` (21)**. **Bodies WITH
@@ -6190,10 +6198,11 @@ payoff.
   The **resolver** counts it as a write (`count_write`), so a `++`'d var is not
   auto-const-promoted; the **inliner** refuses to inline an expression body that
   reassigns a SCALAR param (`func f(x)=>x++` — `mutates_a_param`), since the
-  param is a by-value copy (a mutation *through* a param — `p.x++`, `a[i]++` —
-  is allowed: that already has reference semantics, so inlining matches the
-  call). Lexing is maximal-munch, so `--1` is decrement-of-`1` (a compile error,
-  like C), not `-(-1)`.
+  param is a by-value copy (a mutation *through* a param — `a[i]++` — is
+  allowed: an array is a reference, so inlining matches the call; through a
+  struct param - `p.x++` - the argument is temp-bound instead, since a
+  struct is a value). Lexing is maximal-munch, so `--1` is
+  decrement-of-`1` (a compile error, like C), not `-(-1)`.
 - **Dict access: throw-on-missing-read, insert-on-write, or default.**
   `TypeDict::subscript(what, key, for_write)` and `MemberExpr::do_eval` (which
   share the logic) handle a missing key by: returning the dict's default (a
@@ -6649,9 +6658,36 @@ but the per-element `StructObject` allocation is gone (build overhead
   `static_type_from_value` all
   handle a struct value. Outside a `const` decl, construction is left a runtime
   `CallExpr` so the inferencer gives the precise field errors.
-- **Value semantics**: COW like arrays/dicts (`StructObject::readonly` backs a
-  deep `const`; plain assignment aliases; `clone()` shallow, `deepclone()`
-  deep). `==`
+- **⛔ A STRUCT IS A VALUE (maintainer, 2026-10-08;
+  plans/struct-value-semantics.md).** Every copy is independent and SHALLOW
+  (an array / dict field stays a shared reference); until then an
+  assignment ALIASED a boxed struct while a flat array's element read was a
+  copy. The copy is made at the WRITE, never at the move:
+  **`struct_own(LValue *&holder)`** (eval.h) returns the object the holder
+  may write in place, cloning it (shallow, mutable) into the holder first
+  when its count is above one, the holder is BORROWED (#94: the caller's
+  slot holds the count) or the object is read-only (a constant's). Every
+  write INTO a struct goes through it, holder by holder down the chain:
+  the tree-walker's `store_walk` (member_store, subscript_store's base,
+  the dyn inc-dec, a mutating builtin's first argument -
+  `store_base_value`), the VM's `vm_member_store` / `vm_member_lvalue(_ref)`
+  / `vm_chain_walk`, and the JIT's inline field store, which declines on
+  `memberv_shared` / `memberv_borrowed` / `memberv_readonly`. Three rules
+  a new write path must obey: **own the holder BEFORE deriving any pointer
+  into the object** (a pointer taken earlier points into the object the
+  holder no longer holds); **use the holder struct_own hands back**, never
+  the one passed in (an array element is detached first,
+  `LValue::write_target`, and may then live in new storage); and **a pass
+  must never make two names one slot** where one is written through a
+  member - the AST inliner temp-binds such a parameter
+  (`param_member_written`), and `collapse_locals` counts a write THROUGH a
+  local as a write of it. The bytecode inliner is safe only because its op
+  whitelist admits no store-through op. A field of a VALUE is not a
+  location (`member_store_step` passes `rooted` only for a slot). A
+  `const` PARAMETER's struct is read-only at compile time when its type is
+  known (`check_const_param_store`); no engine enforces const on a
+  parameter at run time. `StructObject::readonly` still backs a deep
+  `const`. `==`
   is structural between same-`def` instances (`TypeStruct::eq`); `hash`
   combines the field hashes (see *Universal `hash()`* above), so a struct can be
   a dict key. **Deferred** (plans/language-deferred.md): `var` fields

@@ -1470,12 +1470,46 @@ static EvalValue pod_load_field(const FieldDef &f, const char *base)
     return intrusive_ptr<StructObject>(obj);
 }
 
+/* STRUCT VALUE SEMANTICS (eval.h) */
+StructObject &struct_own(LValue *&holder)
+{
+    if (holder->is_borrowed()) {
+        /* the caller's slot holds the counted reference: a write here
+         * would change the caller's struct, whatever the count says */
+        intrusive_ptr<StructObject> c = make_intrusive<StructObject>(
+            *holder->get().get_ref<intrusive_ptr<StructObject>>());
+        c->clear_readonly();
+        StructObject &r = *c;
+        holder->frame_release();                /* abandons the borrow */
+        holder->put(EvalValue(std::move(c)));
+        return r;
+    }
+    holder = holder->write_target();
+    intrusive_ptr<StructObject> &p =
+        holder->getval<intrusive_ptr<StructObject>>();
+    if (p.use_count() == 1 && !p->is_readonly())
+        return *p;
+    /* shallow: the fields are copied, a nested struct shares its object
+     * until a write owns it too, an array or a dict stays shared - they
+     * are references - and keeps its own read-only flag */
+    intrusive_ptr<StructObject> c = make_intrusive<StructObject>(*p);
+    c->clear_readonly();
+    p = std::move(c);
+    return *p;
+}
+
+void struct_own_if(LValue *&holder)
+{
+    if (holder->is<intrusive_ptr<StructObject>>())
+        struct_own(holder);
+}
+
 /*
  * POD PLACES (eval.h). The walk only ever enters bytes it will STORE into,
  * so the flat array is detached on the way in (a slice made standalone, an
  * alias's slices cloned), exactly as flat_store_core detaches it for a
- * whole-element store; a struct aliases like any value, so a rooted POD
- * instance is written in place, as member_store writes its own fields.
+ * whole-element store; a rooted POD instance is entered only after its
+ * holder OWNS it (struct_own), so the bytes are its alone.
  */
 bool pod_place_elem(LValue *blv, const EvalValue &key, PodPlace &out)
 {
@@ -1525,9 +1559,10 @@ bool pod_place_step(PodPlace &p, const UniqueId *memUid)
 bool pod_place_rooted_field(LValue *blv, const UniqueId *memUid,
                             PodPlace &out)
 {
-    if (!blv->is<intrusive_ptr<StructObject>>() || blv->is_const_var())
+    if (!blv->is<intrusive_ptr<StructObject>>())
         return false;
     StructObject &obj = *blv->getval<intrusive_ptr<StructObject>>().get();
+    /* read-only: not yet the slot's own (struct_own comes first) */
     if (!obj.is_pod() || obj.is_readonly())
         return false;
     PodPlace p;
@@ -3920,7 +3955,7 @@ subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
     EvalValue base, key;
     LValue hold;
     try {
-        base = hold_store_base(sub->what->eval(ctx), hold);
+        base = store_base_value(ctx, sub->what.get(), hold);
         if (base.is<UndefinedId>())
             throw UndefinedVariableEx(base.get<UndefinedId>().id,
                                       sub->what->start, sub->what->end);
@@ -3954,85 +3989,142 @@ subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
 }
 
 /*
- * The target of a member store `... .f = v`, its base walked ONCE: the root
- * evaluated, each inner member step read as MemberExpr::do_eval reads it
- * (for_write false). Where the struct holding a step lives in bytes no
- * LValue covers - a flat struct array's element, an inline POD field - the
- * walk continues INSIDE them (`place`, eval.h's POD places); a step the
- * bytes cannot take (not an inline POD struct) reads the struct as a value
- * from there on, which is all the old walk ever did. Else `base` is the
- * value or reference the store's own access starts from.
+ * The BASE of a store, evaluated ONCE, for writing: `x` in `x.f = v`,
+ * `x[k] = v`, `x.f++`, `append(x.f, v)`. A member step into a struct OWNS
+ * the struct first (struct_own): the store below writes into it, and a
+ * struct is a value - its other holders must not see the write. An access
+ * chain with no member step is evaluated as a read evaluates it. Where the
+ * struct a step enters lives in bytes no LValue covers - a flat struct
+ * array's element, an inline POD field - the walk continues INSIDE them
+ * (`place`, eval.h's POD places); a step the bytes cannot take (not an
+ * inline POD struct) reads the struct as a value from there on. Else
+ * `base` is the slot or the value the store's own access starts from.
  */
 struct MemberTarget {
     EvalValue base;
     PodPlace place;
 };
 
+static bool chain_has_member(const Construct *e)
+{
+    for (;;) {
+        if (ctag(e) == ConstructType::member)
+            return true;
+        if (ctag(e) != ConstructType::subscript)
+            return false;
+        e = static_cast<const Subscript *>(e)->what.get();
+    }
+}
+
+/* One member step of a store walk (MemberExpr::do_eval's work, for_write
+ * false, the struct owned first). The caller stamps a throw. */
+static void member_store_step(MemberTarget &t, const MemberExpr *s)
+{
+    if (t.place.bytes) {
+        if (pod_place_step(t.place, s->memUid))
+            return;
+        t.base = pod_place_value(t.place);
+        t.place = PodPlace();
+    }
+    if (t.base.is<LValue *>()) {
+        LValue *h = t.base.get<LValue *>();
+        struct_own_if(h);
+        t.base = EvalValue(h);
+        if (pod_place_rooted_field(h, s->memUid, t.place))
+            return;
+    }
+    /* a field of a VALUE is not a location: only a slot's struct gives
+     * its field's LValue (a store through a value holds it first) */
+    const bool rooted = t.base.is<LValue *>();
+    t.base = s->access(RValue(t.base), /*for_write=*/false, rooted);
+}
+
+static void store_walk(EvalContext *ctx, const Construct *e, LValue &hold,
+                       MemberTarget &t)
+{
+    if (ctag(e) == ConstructType::member) {
+        const MemberExpr *s = static_cast<const MemberExpr *>(e);
+        store_walk(ctx, s->what.get(), hold, t);
+        try {
+            member_store_step(t, s);
+        } catch (Exception &ex) {   /* INT-COV-EXEMPT: its type test fails */
+            stamp_like_eval(s, ex);
+            throw;
+        }
+        return;
+    }
+    if (ctag(e) == ConstructType::subscript) {
+        /* Subscript::do_eval's work, by hand: a writable flat struct
+         * array's element is entered in place, not read as a copy, and a
+         * member step in its base owns what it enters */
+        const Subscript *sub = static_cast<const Subscript *>(e);
+        if (chain_has_member(sub->what.get())) {
+            store_walk(ctx, sub->what.get(), hold, t);
+            if (t.place.bytes) {
+                t.base = pod_place_value(t.place);
+                t.place = PodPlace();
+            }
+        } else {
+            try {
+                t.base = hold_store_base(sub->what->eval(ctx), hold);
+            } catch (Exception &ex) {
+                stamp_like_eval(sub, ex);
+                throw;
+            }
+        }
+        try {
+            if (t.base.is<UndefinedId>())
+                throw UndefinedVariableEx(t.base.get<UndefinedId>().id,
+                                          sub->what->start, sub->what->end);
+            const EvalValue key = literal_widen(
+                RValue(sub->index->eval(ctx)), sub->key_coerce);
+            if (!t.base.is<LValue *>() ||
+                !pod_place_elem(t.base.get<LValue *>(), key, t.place)) {
+                Type *ty = t.base.is<LValue *>()
+                    ? t.base.get<LValue *>()->get().get_type()
+                    : t.base.get_type();
+                t.base = ty->subscript(t.base, key, /*for_write=*/false);
+            }
+        } catch (Exception &ex) {
+            stamp_like_eval(sub, ex);
+            throw;
+        }
+        return;
+    }
+    t.base = hold_store_base(e->eval(ctx), hold);
+}
+
+/* The base of a store `<e>.f` / `<e>[k]`: store_walk for a chain that
+ * steps into a member, else `e` evaluated as a read, a value held. */
+static MemberTarget store_base(EvalContext *ctx, const Construct *e,
+                               LValue &hold)
+{
+    MemberTarget t;
+    if (chain_has_member(e))
+        store_walk(ctx, e, hold, t);
+    else
+        t.base = hold_store_base(e->eval(ctx), hold);
+    return t;
+}
+
+/* The base of a member store `... .f = v`: store_walk over `mem->what`. */
 static MemberTarget member_target(EvalContext *ctx, const MemberExpr *mem,
                                   LValue &hold)
 {
-    /* the member steps under `mem`, innermost LAST (an optional one is read
-     * as its eval reads it: `access` short-circuits a none base) */
-    std::vector<const MemberExpr *> steps;
-    const Construct *root = mem->what.get();
-    while (ctag(root) == ConstructType::member) {
-        steps.push_back(static_cast<const MemberExpr *>(root));
-        root = steps.back()->what.get();
-    }
-
     MemberTarget t;
-    EvalValue cur;
-    /* the node whose work runs: an exception leaving it is stamped as its
-     * eval would stamp it (root->eval stamps its own) */
-    const Construct *at = root;
-    try {
-        if (ctag(root) == ConstructType::subscript) {
-            /* Subscript::do_eval's work, by hand: a writable flat struct
-             * array's element is entered in place, not read as a copy */
-            const Subscript *sub = static_cast<const Subscript *>(root);
-            const EvalValue base = hold_store_base(sub->what->eval(ctx),
-                                                   hold);
-            if (base.is<UndefinedId>())
-                throw UndefinedVariableEx(base.get<UndefinedId>().id,
-                                          sub->what->start, sub->what->end);
-            const EvalValue key = literal_widen(RValue(sub->index->eval(ctx)),
-                                                sub->key_coerce);
-            if (!base.is<LValue *>() ||
-                !pod_place_elem(base.get<LValue *>(), key, t.place)) {
-                Type *ty = base.is<LValue *>()
-                    ? base.get<LValue *>()->get().get_type()
-                    : base.get_type();
-                cur = ty->subscript(base, key, /*for_write=*/false);
-            }
-        } else {
-            cur = hold_store_base(root->eval(ctx), hold);
-        }
-
-        /* every step is rooted: at a variable, or at the held root */
-        for (size_t k = steps.size(); k-- > 0; ) {
-            const MemberExpr *s = steps[k];
-            at = s;
-            if (t.place.bytes) {
-                if (pod_place_step(t.place, s->memUid))
-                    continue;
-                cur = pod_place_value(t.place);
-                t.place = PodPlace();
-            } else if (cur.is<LValue *>() &&
-                       pod_place_rooted_field(cur.get<LValue *>(), s->memUid,
-                                              t.place)) {
-                continue;
-            }
-            cur = s->access(RValue(cur), /*for_write=*/false,
-                            /*rooted=*/true);
-        }
-    } catch (Exception &e) {    /* INT-COV-EXEMPT: its type test fails */
-        /* only for a non-Exception throw (bad_alloc), which no test makes */
-        stamp_like_eval(at, e);
-        throw;
-    }
-
-    t.base = cur;
+    store_walk(ctx, mem->what.get(), hold, t);
     return t;
+}
+
+/* The value-or-slot form of a store base (store_base, its POD place read
+ * as a value): the base of `<e>[k] = v`, the target of a mutating builtin.
+ * Exported (eval.h) for the tree-walker's builtin adapters. */
+EvalValue store_base_value(EvalContext *ctx, const Construct *e, LValue &hold)
+{
+    MemberTarget t = store_base(ctx, e, hold);
+    if (t.place.bytes)
+        return pod_place_value(t.place);
+    return t.base;
 }
 
 static EvalValue
@@ -4057,19 +4149,22 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
                                    mem->start, mem->end, old_out);
         t.base = pod_place_value(t.place);
     }
-    const EvalValue base = t.base;
+    EvalValue base = t.base;
 
-    /* A rooted, writable POD struct's field: its bytes. No COW clone - a
-     * POD struct aliases like any value (`var q = p` shares the write, as a
-     * boxed struct and arrays/dicts do). */
-    if (base.is<LValue *>()) {
+    /* A struct in a slot: OWNED first (struct_own - its other holders must
+     * not see the write), then a POD field is stored into its bytes. (A
+     * `const` parameter's struct is refused at compile time when its type
+     * is known; at run time the parameter is the call's copy, as in every
+     * engine.) */
+    const bool rooted = base.is<LValue *>();
+    if (rooted) {
         LValue *blv = base.get<LValue *>();
         if (blv->is<intrusive_ptr<StructObject>>()) {
-            StructObject &obj =
-                *blv->getval<intrusive_ptr<StructObject>>().get();
-            const int slot = obj.is_pod() ? obj.def->slot_of(mem->memUid)
-                                          : -1;
-            if (slot >= 0 && !blv->is_const_var() && !obj.is_readonly()) {
+            StructObject &obj = struct_own(blv);
+            base = EvalValue(blv);
+            const int slot = obj.is_pod()
+                ? obj.def->slot_of(mem->memUid) : -1;
+            if (slot >= 0) {
                 const EvalValue r = RValue(rval);
                 EvalValue newval;
                 if (op == Op::assign) {
@@ -4081,7 +4176,8 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
                     apply_compound_op(newval, r, op);
                 }
                 /* coerce + runtime-validate to the field's scalar type
-                 * (throws on a mismatch, e.g. a dyn-laundered wrong type) */
+                 * (throws on a mismatch, e.g. a dyn-laundered wrong
+                 * type) */
                 newval = coerce_struct_field(obj.def->fields[slot],
                                              std::move(newval),
                                              mem->start, mem->end);
@@ -4094,7 +4190,7 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
     EvalValue lval;
     try {
         lval = mem->access(RValue(base), /*for_write=*/op == Op::assign,
-                           /*rooted=*/true);
+                           rooted);
     } catch (Exception &e) {
         stamp_like_eval(mem, e);
         throw;
@@ -4352,25 +4448,25 @@ dyn_incdec_elem(const EvalValue &cur, const EvalValue &key, bool is_inc,
 }
 
 static EvalValue
-dyn_incdec_member(const EvalValue &cur, const EvalValue &memId,
+dyn_incdec_member(const EvalValue &base, const EvalValue &memId,
                   const UniqueId *memUid, bool is_inc, EvalValue &old,
                   Loc astart, Loc aend, Loc bstart, Loc bend,
                   Loc id_start, Loc id_end)
 {
+    EvalValue cur = base;
     const bool rooted = cur.is<LValue *>();
     const EvalValue &cval = rooted ? cur.get<LValue *>()->get() : cur;
-    const bool is_struct = cval.is<intrusive_ptr<StructObject>>();
 
-    if (rooted && is_struct) {
+    if (rooted && cval.is<intrusive_ptr<StructObject>>()) {
         const StructObject &obj =
             *cval.get_ref<intrusive_ptr<StructObject>>().get();
         const int slot = obj.def->slot_of(memUid);
-        if (obj.is_pod() && slot >= 0 && !obj.is_readonly() &&
-            !cur.get<LValue *>()->is_const_var()) {
+        if (obj.is_pod() && slot >= 0) {
             old = obj.pod_get(slot);
             if (!old.is<int_type>() && !old.is<float_type>())
                 throw TypeErrorEx("'++'/'--' requires an int or float",
                                   id_start, id_end);
+            /* the store owns the struct (struct_own) */
             return vm_member_store(cur.get<LValue *>(), memUid,
                                    is_inc ? Op::addeq : Op::subeq,
                                    EvalValue(static_cast<int_type>(1)),
@@ -4378,16 +4474,16 @@ dyn_incdec_member(const EvalValue &cur, const EvalValue &memId,
         }
     }
 
-    /* A field of a temporary struct is a value, as MemberExpr reads it; a
+    /* A field of a value's struct is a value, as MemberExpr reads it; a
      * dict's value is an LValue either way. */
-    LValue *lv = rooted || !is_struct
-        ? vm_member_lvalue_ref(cval, memId, memUid, /*for_write=*/false,
-                               astart, aend)
-        : nullptr;
+    LValue *lv = vm_member_lvalue_ref(cur, memId, memUid,
+                                      /*for_write=*/false, astart, aend);
     if (!lv) {
         /* the read's own error first (no such member, not a struct or a
          * dict), as the tree-walker's MemberExpr raises it */
-        member_read_core(cval, memId, memUid, false, astart, aend,
+        const EvalValue &v =
+            cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
+        member_read_core(v, memId, memUid, false, astart, aend,
                          bstart, bend);
         throw NotLValueEx(id_start, id_end);
     }
@@ -4427,16 +4523,26 @@ void vm_incdec_elem(LValue *base_lv, const EvalValue &key, bool is_inc,
  * a readonly instance, a non-struct-non-dict base) - the caller turns that into
  * NotLValueEx. Shared by vm_incdec_member and vm_lvalue_chain_store.
  */
-LValue *vm_member_lvalue_ref(const EvalValue &dval, const EvalValue &memId,
+LValue *vm_member_lvalue_ref(EvalValue &cur, const EvalValue &memId,
                              const UniqueId *memUid, bool for_write,
                              Loc mstart, Loc mend)
 {
+    const EvalValue &dval =
+        cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
     if (dval.is<intrusive_ptr<StructObject>>()) {
-        const auto &obj = dval.get<intrusive_ptr<StructObject>>();
-        const int slot = obj->def->slot_of(memUid);
-        if (slot >= 0 && !obj->is_pod() && !obj->is_readonly())
-            return &obj->fields[slot];
-        return nullptr;
+        /* a struct's field is a location only in a writable slot's
+         * struct - owned before the field is handed out */
+        if (!cur.is<LValue *>())
+            return nullptr;
+        LValue *h = cur.get<LValue *>();
+        const StructObject &obj =
+            *dval.get_ref<intrusive_ptr<StructObject>>().get();
+        const int slot = obj.def->slot_of(memUid);
+        if (slot < 0 || obj.is_pod())
+            return nullptr;
+        StructObject &own = struct_own(h);
+        cur = EvalValue(h);
+        return &own.fields[slot];
     }
     if (dval.is<intrusive_ptr<DictObject>>()) {
         const auto &obj = dval.get<intrusive_ptr<DictObject>>();
@@ -4538,11 +4644,13 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
                  * value); a VALUE read (readonly, a value base, or a
                  * non-container base's TypeError) fails NotLValue at the
                  * LVALUE caret, exactly as the tree-walker's member_store. */
-                LValue *lv = vm_member_lvalue_ref(cval, memId, memUid,
+                LValue *lv = vm_member_lvalue_ref(cur, memId, memUid,
                                                   /*for_write=*/false,
                                                   lstart, lend);
                 if (!lv) {
-                    member_read_core(cval, memId, memUid, false,
+                    const EvalValue &v = cur.is<LValue *>()
+                        ? cur.get<LValue *>()->get() : cur;
+                    member_read_core(v, memId, memUid, false,
                                      lstart, lend, lstart, lend);
                     throw NotLValueEx(lstart, lend);
                 }
@@ -4628,15 +4736,17 @@ LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
             intern_msg("Struct '" + string(obj.def->name->val) +
                        "' has no member '" + string(memUid->val) + "'"),
             mstart, mend);
-    /* a read-only struct's field, a POD struct's: not a location - the
-     * member read gives a VALUE, and the builtin works on it held, as
-     * the tree-walker's (lv_builtin_target) */
-    if (base_lv->is_const_var() || obj.is_readonly() || obj.is_pod()) {
+    /* a POD struct's field: not a location - the member read gives a
+     * VALUE, and the builtin works on it held, as the tree-walker's
+     * (lv_builtin_target) */
+    if (obj.is_pod()) {
         hold = LValue(obj.is_pod() ? obj.pod_get(slot) : obj.fields[slot].get(),
                       false);
         return &hold;
     }
-    return &obj.fields[slot];
+    /* the builtin may change the field (a slice detached, a value put):
+     * the struct is the slot's own first (struct_own) */
+    return &struct_own(base_lv).fields[slot];
 }
 
 EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
@@ -4660,25 +4770,27 @@ EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
                        "' has no member '" + string(memUid->val) + "'"),
             mstart, mend);
 
-    if (base_lv->is_const_var() || obj.is_readonly())
-        throw NotLValueEx(mstart, mend);
+    /* the struct is the slot's own before the write (struct_own): a copy
+     * of it elsewhere - another variable, an element, a parameter's
+     * caller - must not see the write */
+    StructObject &own = struct_own(base_lv);
 
-    if (obj.is_pod()) {
+    if (own.is_pod()) {
         const EvalValue r = RValue(value);
         EvalValue newval;
         if (op == Op::assign) {
             newval = r;
         } else {
-            newval = obj.pod_get(slot);
+            newval = own.pod_get(slot);
             apply_compound_op(newval, r, op);
         }
-        newval = coerce_struct_field(obj.def->fields[slot], std::move(newval),
+        newval = coerce_struct_field(own.def->fields[slot], std::move(newval),
                                      mstart, mend);
-        obj.pod_set(slot, newval);
+        own.pod_set(slot, newval);
         return newval;
     }
 
-    return slot_rmw(obj.fields[slot], op, value);   /* boxed field lvalue */
+    return slot_rmw(own.fields[slot], op, value);   /* boxed field lvalue */
 }
 
 /*
@@ -5548,7 +5660,7 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
         EvalValue cur, key;
         LValue hold;
         try {
-            cur = hold_store_base(sub->what->eval(ctx), hold);
+            cur = store_base_value(ctx, sub->what.get(), hold);
             if (cur.is<UndefinedId>())
                 throw UndefinedVariableEx(cur.get<UndefinedId>().id,
                                           sub->what->start, sub->what->end);

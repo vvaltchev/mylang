@@ -24265,10 +24265,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          *    lifecycle without any COW: retain-new, release-old (cold
          *    arm), copy 24 + the tag.
          *
-         * NO CLONE ON EITHER PATH, and that is the interpreter's
-         * semantics, not an omission: a struct assignment ALIASES
-         * (`var b = a; b.x = 5` is visible through `a`), so
-         * vm_member_store writes in place too.
+         * THE STORE IS IN PLACE, so it is guarded to be what
+         * struct_own would hand out unchanged: a struct is a VALUE
+         * (`var b = a; b.x = 5` leaves `a` alone), so the object must be
+         * the slot's alone - its count one, the slot not borrowed (#94),
+         * the object not read-only. Any of those failing declines to the
+         * helper, whose vm_member_store makes it the slot's own first.
          */
         const Chunk::MemberKey &mk = ck.member_keys[in.a_lit()];
         const JitLayout &Lm = jit_layout();
@@ -24310,14 +24312,25 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             e.load(acc.r, base.type);
             e.cmp_reg_tag_via(acc.r, L.t_struct, s1);
             decl_ne(JD_memberv_base_not_struct);
-            e.cmp_byte_slot(base.type + (L.lv_const_off - L.off_type), 0);
-            decl_ne(JD_memberv_base_const);
+            /* (a const binding's struct needs no guard: a `const`
+             * parameter's field store is refused at compile time when its
+             * type is known, and is the call's own copy at run time) */
+            /* the slot is not BORROWED (#94): the caller's slot holds the
+             * counted reference, so the struct is the caller's too */
+            e.cmp_byte_slot(base.type + (L.lv_borrowed_off - L.off_type), 0);
+            decl_ne(JD_memberv_borrowed);
             e.load(acc.r, base.payload);                 /* StructObject* */
             e.movabs(s1, reinterpret_cast<uint64_t>(mk.bake_def));
             e.cmp_base_reg(acc.r, static_cast<int32_t>(L.sobj_def), s1);
             decl_ne(JD_memberv_def);
             e.cmp_byte_base(acc.r, static_cast<int32_t>(L.sobj_ro), 0);
             decl_ne(JD_memberv_readonly);
+            /* the slot is its struct's only holder (use_count == 1): a
+             * struct is a VALUE, and a second holder - another variable,
+             * an element, a capture - must not see this write. Else the
+             * helper makes it the slot's own first (struct_own). */
+            e.cmp_dword_base_imm8(acc.r, static_cast<int32_t>(L.sobj_rc), 1);
+            decl_ne(JD_memberv_shared);
             if (pod_form) {
                 /* the value must ALREADY be the field's exact scalar
                  * kind (field_exact_scalar): anything else is a real

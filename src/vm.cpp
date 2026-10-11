@@ -880,24 +880,32 @@ vm_chain_walk(EvalContext &ctx, const Chunk::MemberKey *mkeys, EvalValue &cur,
             }
             if (step.is_member) {
                 const Chunk::MemberKey &mk = mkeys[step.operand];
-                if (cur.is<LValue *>() &&
-                    pod_place_rooted_field(cur.get<LValue *>(), mk.memUid,
-                                           place))
-                    continue;
-                const EvalValue cval =
-                    cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
+                if (cur.is<LValue *>()) {
+                    /* the store writes into the struct this step enters:
+                     * the slot's own first (struct_own, the tree-walker's
+                     * member_store_step) */
+                    LValue *h = cur.get<LValue *>();
+                    struct_own_if(h);
+                    cur = EvalValue(h);
+                    if (pod_place_rooted_field(h, mk.memUid, place))
+                        continue;
+                }
                 /* for_write=false: an intermediate member is READ to walk into.
-                 * A mutable boxed field / dict value -> an lvalue REF; else the
-                 * tree-walker reads a VALUE (member_read: a POD/readonly copy,
-                 * or a TypeError for a non-struct/dict base) and continues. */
-                LValue *next = vm_member_lvalue_ref(cval, mk.memId, mk.memUid,
+                 * A slot's boxed field / a dict value -> an lvalue REF; else
+                 * the tree-walker reads a VALUE (member_read: a POD copy, a
+                 * value's field, or a TypeError for a non-struct/dict base)
+                 * and continues. */
+                LValue *next = vm_member_lvalue_ref(cur, mk.memId, mk.memUid,
                     /*for_write=*/false, step.lstart, step.lend);
-                if (next)
+                if (next) {
                     cur = EvalValue(next);
-                else
+                } else {
+                    const EvalValue cval =
+                        cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
                     cur = member_read_core(cval, mk.memId, mk.memUid,
                         mk.optional, step.lstart, step.lend,
                         mk.bstart, mk.bend);
+                }
             } else {
                 const EvalValue &key = ctx.frame->at(step.operand).get();
                 if (cur.is<LValue *>() &&
@@ -10530,7 +10538,8 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
             if (!base)
                 return nullptr;
             const Chunk::MemberKey &mk = mkeys[cs.a0_operand];
-            return vm_member_lvalue_ref(base->get(), mk.memId, mk.memUid,
+            EvalValue cur(base);
+            return vm_member_lvalue_ref(cur, mk.memId, mk.memUid,
                                         /*for_write=*/false,
                                         mk.mstart, mk.mend);
         }
@@ -13536,8 +13545,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                         chunk->member_keys[cs.a0_operand];
                     LValue *base = vm_store_base(ctx, cs.a0_kind, cs.a0_slot,
                                                  *chunk, pc, nullptr);
-                    return vm_member_lvalue_ref(base->get(), mk.memId,
-                                                mk.memUid,
+                    EvalValue cur(base);
+                    return vm_member_lvalue_ref(cur, mk.memId, mk.memUid,
                                                 /*for_write=*/false,
                                                 mk.mstart, mk.mend);
                 }

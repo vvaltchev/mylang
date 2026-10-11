@@ -876,8 +876,10 @@ through a `dyn` that happens to hold a read-only one — it stays a catchable
 location — `f()[0]`, `(c ? a : b).x`, `[x, y][k]`, `g()[i].y` — and a store
 there goes into the value that expression evaluated to, exactly as if it were
 first bound to a fresh variable: `f()[0] = v` means `{ var t = f(); t[0] =
-v; }`. Arrays, dicts and structs are references, so the write lands in the
-object `f` returned:
+v; }`. Arrays and dicts are references, so the write lands in the object `f`
+returned; a struct is a value, so `f().x = v` writes `t`'s copy, which is then
+gone (a write *into* an array or dict field, `f().a[0] = v`, still lands in
+that array):
 
 ```C#
 var scores = [1, 2, 3];
@@ -1845,11 +1847,12 @@ func f(const x, y) {
 }
 ```
 
-Reassigning a `const` parameter is a compile-time error. A non-const parameter
-stays mutable, and - since parameters are passed by value - a function (even a
-`pure` one) may freely reassign its own non-const parameters without affecting
-the caller. A plain parameter that is never reassigned anywhere in the body is
-treated as *effectively const* automatically.
+Reassigning a `const` parameter is a compile-time error, and so is writing a
+field of the struct it holds (a struct is a value - see *Structs*). A non-const
+parameter stays mutable, and - since parameters are passed by value - a
+function (even a `pure` one) may freely reassign its own non-const parameters
+without affecting the caller. A plain parameter that is never reassigned
+anywhere in the body is treated as *effectively const* automatically.
 
 #### Typed parameters
 
@@ -2037,10 +2040,14 @@ functions - and it holds when the call is itself const-evaluated:
 For example, to generate `sorted_people` during const evaluation it's enough to
 write:
 
-A pure function must have **no observable side effects**. Because arrays, dicts
-and structs are passed **by reference**, *modifying one that was passed in*
-(`a[i] = v`, `a.field = v`, `append(a, x)`, ...) is a side effect visible to the
-caller — so a function that does it is **not** pure. A pure function may still:
+A pure function must have **no observable side effects**. Because arrays and
+dicts are passed **by reference**, *modifying one that was passed in*
+(`a[i] = v`, `d.key = v`, `append(a, x)`, ...) is a side effect visible to the
+caller — so a function that does it is **not** pure. (A struct is a value: a
+function changing a field of a struct parameter changes its own copy, which the
+caller never sees. The purity check does not yet tell a struct's field from a
+dict's key, so `p.field = v` on a parameter still makes a function impure.) A
+pure function may still:
 modify a **scalar** parameter (`int`/`float`/`bool` are passed by copy), and
 freely build and modify **fresh local** containers (a `var r = [...]` declared
 inside the function and returned). So `func mk(n) { var r = [0,0]; r[0] = n;
@@ -2342,18 +2349,54 @@ const member. `.` means *field access* on a struct and *key access* on a dict �
 resolved by the base's type. Reading a field that doesn't exist is a compile
 error (for a statically-typed base).
 
-**Value semantics.** A struct is a value, with the same COW semantics as
-arrays/dicts: plain assignment **aliases** (`var q = p; p.x = 9` makes `q.x` 9
-too, like Python objects), while `clone()` makes an independent (shallow) copy
-and `deepclone()` a deep one. `==` is structural and field-wise between
-**same-type** instances (different struct types are never equal); structs are
-**hashable** (`hash()` combines the field hashes, so a struct can be a dict key).
-`print(p)` shows `Point(x: 1, y: 2)`.
+**Value semantics.** A struct is a **value**, like a C struct or a C#
+`struct`: every copy is independent. A copy is made wherever a struct moves to
+a new home — an assignment or declaration (`var q = p`), an argument, a return
+value, a `foreach` variable, a capture, an element or a field read
+(`var e = a[0]`) — so after `var q = p; q.x = 9`, `p.x` is unchanged, and a
+function changing a field of its parameter changes its own copy. The copy is
+**shallow**: the plain fields and the nested structs are copied, while an
+`array` or `dict` field is a reference (as everywhere in MyLang), so both copies
+see a change made *inside* it (`q.a[0] = 5`, `append(q.a, 5)`) and only the one
+copy sees it *replaced* (`q.a = [5]`). A store through a **location** writes the
+struct stored there: `a[i].x = v`, `d["k"].x += 1`, `p.inner.x = v` and
+`a[i].x++` change the element, the entry and the field in place. A store
+through a *value* writes that value's copy, which is then gone:
+`f().x = 1` changes nothing `f` can see (see *Storing through a value*).
+
+```C#
+struct Point { int x; int y; }
+var p = Point(1, 2);
+var q = p;            # a copy
+q.x = 9;              # p.x is still 1
+var pts = [p, q];     # each element a copy
+pts[0].x = 5;         # writes the element: pts[0].x is 5, p.x is still 1
+var e = pts[1];       # a copy of the element
+e.y = 0;              # pts[1].y is still 2
+```
+
+A copy costs nothing until something writes it: the implementation shares a
+struct between its copies and duplicates it on the first write through a copy
+that is not its only holder (copy on write), so passing a struct to a function
+that only reads it never copies it. `clone(p)` is the same shallow copy;
+`deepclone(p)` also copies the arrays and dicts inside. `==` is structural and
+field-wise between **same-type** instances (different struct types are never
+equal); structs are **hashable** (`hash()` combines the field hashes, so a
+struct can be a dict key). `print(p)` shows `Point(x: 1, y: 2)`.
 
 **`const` works fully.** A struct holds state only in instances, not in the
 type, so `const P = Point(1, 2)` is computed at compile time and is **deep
-read-only** — mutating a const instance's field is an error. `Type.CONST` folds
-at parse time. An `array` of a struct type infers as `array<Struct>`
+read-only** — writing a field of `P` is a compile error. A **copy** of a
+constant is an ordinary value: `var q = P; q.x = 5` changes `q` only (an array
+or dict field is still the constant's, read-only, so `q.a[0] = 1` raises
+`NotLValueEx`), and so is a constant passed to a parameter. A **`const`
+parameter**'s struct cannot be changed (C#'s `in`): writing a field of it —
+through struct fields only, `c.x = v`, `c.inner.x += 1`, `c.x++` — is a
+compile error when its type is known to be a struct; a write *into* an array or
+a dict it holds (`c.a[0] = v`, `append(c.a, v)`, `c.d.k = v`) is a write into
+that reference and is allowed. (A `dyn` const parameter is not checked: like
+any parameter it holds the call's own copy.) `Type.CONST` folds at parse time.
+An `array` of a struct type infers as `array<Struct>`
 (`var a = [Point(1,2), Point(3,4)]`).
 
 **Layout.** A struct whose fields are all `bool`/`int`/`float` (or other such

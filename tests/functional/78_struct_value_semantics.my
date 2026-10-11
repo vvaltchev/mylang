@@ -1,0 +1,206 @@
+# A struct is a VALUE (README "Value semantics"): every copy is independent.
+# A copy is made wherever a struct moves - an assignment, an argument, a
+# return, a foreach variable, a capture, an element or field read - and is
+# SHALLOW: an array or a dict inside it is a reference both copies share.
+# A store through a location (`a[i].x = v`, `d["k"].x = v`, `p.in.x = v`)
+# writes the struct stored there. Until 2026-10-08 a boxed struct ALIASED
+# on assignment while a flat array's element read was a copy - the answer
+# depended on which storage the optimizer picked.
+#
+# Every shape twice: a POD struct (bytes, stored flat in an array) and a
+# boxed one (an array field). runtime() keeps values out of const folding;
+# the loops run each store enough times for the JIT's inline field-store
+# tier, whose guards decline a shared, a borrowed or a read-only object.
+
+struct P { int x; int y; }
+struct B { int x; array<int> a; }
+struct O { P p; int z; }
+struct OB { B b; str s; }
+
+func ri(int v) => int(runtime(v));
+
+# 1. assignment
+var p = P(ri(1), 2);
+var p2 = p;
+p2.x = 5;
+assert(p.x == 1 && p2.x == 5);
+var b = B(ri(1), [1]);
+var b2 = b;
+b2.x = 9;
+assert(b.x == 1 && b2.x == 9);
+
+# 2. shallow: an array field is shared, replacing it is not
+b2.a[0] = 42;
+assert(b.a[0] == 42);
+append(b2.a, 7);
+assert(len(b.a) == 2);
+b2.a = [0];
+assert(len(b.a) == 2 && len(b2.a) == 1);
+# ...but a SLICE field is a copy of its window: a store into it detaches
+# the slice of the copy written through - the other copy keeps its view
+var big = [1, 2, 3, 4];
+var s1 = B(ri(0), big[0:2]);
+var s2 = s1;
+s2.a[0] = 7;
+assert(s1.a == [1, 2] && s2.a == [7, 2] && big == [1, 2, 3, 4]);
+var s3 = s1;
+s3.a[1] += 5;
+assert(s1.a == [1, 2] && s3.a == [1, 7]);
+
+# 3. elements: a read copies, a store through the element writes it
+var pa = [P(ri(1), 1), P(2, 2)];
+var pe = pa[0];
+pe.x = 77;
+assert(pa[0].x == 1);
+pa[1].x = 99;
+pa[1].y += 1;
+pa[0].x++;
+assert(pa[0].x == 2 && pa[1].x == 99 && pa[1].y == 3);
+var ba = [B(ri(1), [1]), B(2, [2])];
+var be = ba[0];
+be.x = 77;
+assert(ba[0].x == 1);
+ba[1].x = 99;
+ba[0].x++;
+assert(ba[0].x == 2 && ba[1].x == 99 && be.x == 77);
+
+# 4. arguments: the callee's copy; a write into an array field is shared
+func setp(P v, int n) { v.x = n; return v.x; }
+func setb(B v, int n) { v.x = n; v.a[0] = n; return v.x; }
+func setd(dyn v, int n) { v.x = n; return v.x; }
+assert(setp(p, 1000) == 1000 && p.x == 1);
+assert(setb(b, 1000) == 1000 && b.x == 1 && b.a[0] == 1000);
+assert(setd(p, 7) == 7 && setd(b, 8) == 8 && p.x == 1 && b.x == 1);
+var tot = 0;
+for (var i = 0; i < 40; i++)
+    tot += setp(p, i) + setb(b, i);
+assert(tot == 1560 && p.x == 1 && b.x == 1);
+
+# 5. return: a copy of the global
+var gp = P(ri(3), 4);
+func getgp() { return gp; }
+var r = getgp();
+r.x = 33;
+getgp().y = 44;
+assert(gp.x == 3 && gp.y == 4 && r.x == 33);
+
+# 6. nested structs: inline (POD) and boxed
+var o = O(P(ri(1), 2), 3);
+var o2 = o;
+o2.p.x = 50;
+o2.p.y++;
+assert(o.p.x == 1 && o.p.y == 2 && o2.p.x == 50 && o2.p.y == 3);
+var ob = OB(B(ri(1), [1]), "s");
+var ob2 = ob;
+ob2.b.x = 60;
+ob2.b.a[0] = 61;
+assert(ob.b.x == 1 && ob2.b.x == 60 && ob.b.a[0] == 61);
+var inner = ob.b;
+inner.x = -1;
+assert(ob.b.x == 1);
+
+# 7. foreach: the loop variable is a copy
+var s7 = 0;
+foreach (var it in pa) { it.x = -1; s7 += it.x; }
+foreach (var it in ba) { it.x = -1; s7 += it.x; }
+assert(s7 == -4 && pa[0].x == 2 && ba[1].x == 99);
+
+# 8. capture: the closure's own copy, kept across calls
+var cb = B(ri(5), [5]);
+var bump = func [cb] () { cb.x++; return cb.x; };
+assert(bump() == 6 && bump() == 7 && cb.x == 5);
+
+# 9. a dict value: a read copies, a store through the entry writes it
+var d = {"k": B(ri(1), [1])};
+var dq = {"q": P(1, 1)};
+var dv = d["k"];
+dv.x = 3;
+var dqv = dq.q;
+dqv.y = 9;
+assert(d["k"].x == 1 && dq.q.y == 1);
+d["k"].x = 4;
+dq["q"].y += 5;
+dq.q.x++;
+assert(d["k"].x == 4 && dq["q"].y == 6 && dq.q.x == 2);
+
+# 10. a copy of a constant is an ordinary value (its array stays the
+#     constant's, read-only)
+const CP = P(1, 2);
+const CB = B(1, [1]);
+var cp = CP;
+cp.x = 8;
+var cq = CB;
+cq.x = 8;
+assert(cp.x == 8 && cq.x == 8 && CP.x == 1 && CB.x == 1);
+func touch(v) { v.x = 11; return v.x; }
+assert(touch(CP) == 11 && touch(CB) == 11 && CP.x == 1 && CB.x == 1);
+var e10 = "none";
+try { cq.a[0] = 5; } catch (NotLValueEx) { e10 = "ro"; }
+assert(e10 == "ro");
+
+# 11. a slice of a struct array is a copy of its window
+var whole = [B(ri(0), [0]), B(1, [1]), B(2, [2])];
+var sl = whole[0:2];
+sl[0].x = 50;
+whole[1].x = 60;
+assert(whole[0].x == 0 && sl[0].x == 50 && sl[1].x == 1);
+
+# 12. clone and deepclone
+var c1 = clone(b);
+c1.x = -5;
+c1.a[0] = -6;
+var c2 = deepclone(b);
+c2.a[0] = -7;
+assert(b.x == 1 && b.a[0] == -6 && c2.a[0] == -7);
+
+# 13. a field store through a value is the value's copy
+func mk() => B(ri(1), [1]);
+mk().x = 9;
+var w13 = (mk().x = 41);
+assert(w13 == 41);
+
+# 14. the JIT tier: an unshared object is written in place, a shared one
+#     is made the slot's own first, every time it is shared again
+var hp = P(ri(0), 0);
+for (var i = 0; i < 50; i++) hp.x = i;
+var keep = hp;
+for (var i = 0; i < 50; i++) hp.x = i + 100;
+assert(keep.x == 49 && hp.x == 149);
+var hist = [];
+for (var i = 0; i < 20; i++) { hp.y = i; append(hist, hp); }
+assert(hist[0].y == 0 && hist[19].y == 19 && hp.y == 19);
+var hb = B(ri(0), [0]);
+var hs = 0;
+for (var i = 0; i < 20; i++) { var t = hb; t.x = i; hs += t.x - hb.x; }
+assert(hs == 190 && hb.x == 0);
+
+# 15. one variable passed for two parameters: two copies - the AST
+#     inliners must not let either name stand for the other. `wr` is
+#     small enough for the block inliner; `wrt` is not, so the TAIL
+#     inliner is what meets `return wrt(q, q)` (the guard keeps
+#     tail_wr itself from being inlined into its caller first)
+func wr(P a, P b) { a.x = 5; return b.x; }
+func wrt(P a, P b) { a.x = 5; a.y = 6; return b.x + b.y; }
+func tail_wr(P q) { if (q.y < -100) return 0; return wrt(q, q); }
+var px = p.x;
+assert(wr(p, p) == px && tail_wr(p) == px + p.y && p.x == px);
+
+# 16. a local copy written through: copy propagation must not fold the
+#     copy into what it copied. A pure tree recursion is unrolled by the
+#     block inliner, whose copies of the body run collapse_locals (no
+#     other body that small can hold a declaration and a member write)
+func cl(P a) { var t = a; t.x = 9; return a.x; }
+func clb(B a) { var t = a; t.x = 9; return a.x + t.x; }
+var p16 = P(ri(1), 2);
+var b16 = B(ri(1), [1]);
+assert(cl(p16) == 1 && p16.x == 1 && clb(b16) == 10 && b16.x == 1);
+func rf(int n) {
+    if (n < 2) return n;
+    var t = P(1, 0);
+    var u = t;
+    t.x++;
+    return u.x - 1 + rf(n - 1) + rf(n - 2);
+}
+assert(rf(ri(12)) == 144);
+
+print(p, b, pa, ba, gp, o2, ob2, d, dq, cp, cq, sl, c1, hp, hb);

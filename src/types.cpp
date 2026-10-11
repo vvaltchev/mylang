@@ -528,7 +528,7 @@ EvalValue builtin_lv_adapter(EvalContext *ctx, ExprList *exprList)
     LValue *target = nullptr;
     LValue hold;
     if (!exprList->elems.empty()) {
-        EvalValue a0 = exprList->elems[0]->eval(ctx);
+        EvalValue a0 = store_base_value(ctx, exprList->elems[0].get(), hold);
         target = lv_builtin_target(a0, hold);
     }
     /* NO-VALUE-ARG form (pop/intptr - both 1-arg): no rest; the builtin uses
@@ -567,7 +567,7 @@ EvalValue builtin_lv_v_adapter(EvalContext *ctx, ExprList *exprList)
     LValue *target = nullptr;
     LValue hold;
     if (!exprList->elems.empty()) {
-        EvalValue a0 = exprList->elems[0]->eval(ctx);
+        EvalValue a0 = store_base_value(ctx, exprList->elems[0].get(), hold);
         target = lv_builtin_target(a0, hold);
     }
     const size_t total = exprList->elems.size();
