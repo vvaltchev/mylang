@@ -2656,7 +2656,9 @@ any insertion order, since a dict is unordered), two structs of the same type
 with the same fields. The array/struct hash is **order-dependent** (`[1,2]` ≠
 `[2,1]`), the dict hash is **order-independent**. A string's hash is computed
 once and cached (strings are immutable). Because `hash()` is total, **any value
-can be a dictionary key** (see *Dictionaries*).
+can be a dictionary key** (see *Dictionaries*). A hash depends only on the
+value - a struct's on its type's name and its fields - never on where anything
+lives in memory, so it is the same in every run and in every engine.
 
 ### Array builtins
 

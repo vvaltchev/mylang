@@ -16388,6 +16388,15 @@ static const std::vector<test> tests =
       { "struct Unit {} var d = {}; d[Unit()] = \"hi\";",
         "assert(hash(Unit()) == hash(Unit()));",
         "assert(d[Unit()] == \"hi\");" } },
+    /* The hash is a function of the VALUE: it was salted with the def's
+     * ADDRESS until 2026-10-08, so hash(P(1)) and the iteration order of
+     * a dict keyed by structs changed from run to run. Two defs of one
+     * name live at two addresses - the in-process form of two runs. */
+    { "struct: the hash depends on the type's name, not its address",
+      { "func f() { struct P { int x; } return hash(P(1)); }",
+        "func g() { var pad = [1, 2, 3]; struct P { int x; }",
+        "           return hash(P(1)) + len(pad) - 3; }",
+        "assert(f() == g());" } },
     { "struct: a field-less struct is a payload-less exception type",
       { "struct Timeout {} var hit = 0;",
         "try { throw Timeout(); } catch (Timeout) { hit = 1; }",

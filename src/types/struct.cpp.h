@@ -114,12 +114,15 @@ void TypeStruct::noteq(EvalValue &a, const EvalValue &b)
 
 /*
  * Deep hash of a struct: combine the field hashes in declaration order (a
- * struct is a fixed sequence of fields), salted with the struct's def identity
- * so two different struct types with equal field values hash differently -
- * matching eq(), which only compares instances of the SAME def. Field-wise
- * (via pod_get / fields[i]) keeps it consistent with eq for both POD (a==b =>
- * equal field values => equal hash) and boxed instances, and avoids hashing
- * POD padding bytes.
+ * struct is a fixed sequence of fields), salted with the struct type's NAME
+ * so two struct types with equal field values usually hash differently -
+ * eq() only compares instances of the SAME def, so a collision between two
+ * types is a probe, never a wrong answer. NOT the def's address: a hash is
+ * observable (`hash()`, a dict's iteration order), and an address differs
+ * between runs, engines and a .myv load (it did until 2026-10-08).
+ * Field-wise (via pod_get / fields[i]) keeps it consistent with eq for both
+ * POD (a==b => equal field values => equal hash) and boxed instances, and
+ * avoids hashing POD padding bytes.
  */
 size_t TypeStruct::hash(const EvalValue &a)
 {
@@ -127,7 +130,7 @@ size_t TypeStruct::hash(const EvalValue &a)
     const StructTypeDef &def = *o.def;
 
     size_t seed = hash_salt_struct;
-    hash_combine(seed, std::hash<const void *>()(o.def));
+    hash_combine(seed, std::hash<std::string_view>()(def.name->val));
 
     for (size_t i = 0; i < def.fields.size(); i++)
         hash_combine(seed, (o.is_pod() ? o.pod_get(static_cast<int>(i))
