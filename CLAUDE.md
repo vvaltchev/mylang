@@ -7480,7 +7480,11 @@ and two macros:
   `get_data()` via `to_string`). The payload struct references its
   `StructTypeDef` (owned by the AST), so `main` (`mylang.cpp`) declares the
   `root` AST **outside** the `try` — unwinding must not free the def before the
-  catch handler renders the value.
+  catch handler renders the value. **A struct thrown during the PARSE** (a
+  folded `pure` call) has no `root` to keep it: the statements parsed so far
+  die as it unwinds, so `pBlock` replaces the payload by its rendering
+  (`freeze_exception_payload`) while every enclosing block is alive - it
+  was a heap-use-after-free in main's render (2026-10-11).
 - **Backtrace frames are LAZY (2026-07-18 profile #3).** A captured
   `BacktraceFrame` holds `{const FuncDescriptor *desc, Loc call_site}` — NO
   strings; `format_backtrace` stringifies from the program-lifetime

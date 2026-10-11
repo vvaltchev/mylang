@@ -990,6 +990,30 @@ if [ $r != 1 ] || [ -e "$TMP/adir.myv" ]; then
 fi
 [ $dir_ok = 1 ] && pass "a directory is not a script: refused, no crash"
 
+# A struct a `pure` call throws while it is folded at PARSE time is a
+# compile error, rendered by main() with its payload - after the parse has
+# unwound, freeing the struct's definition with the statements parsed so
+# far: the payload read a freed def (ASan: heap-use-after-free; a SIGSEGV
+# in a release build). pBlock renders it while the definition is alive.
+cat > "$TMP/pthrow.my" <<'EOF'
+struct Neg { int x; }
+pure func f(int x) {
+    if (x < 0) { throw Neg(x); }
+    return x * 2;
+}
+try { print(f(-1)); } catch (Neg) { print("never: a compile error"); }
+EOF
+out=$("$BIN" "$TMP/pthrow.my" 2>&1)
+r=$?
+if [ $r = 1 ] &&
+   printf '%s' "$out" | grep -q "Uncaught exception 'Neg', data: Neg(x: -1)" &&
+   ! printf '%s' "$out" | grep -q never; then
+    pass "a struct thrown by a parse-time pure call renders its payload"
+else
+    fail "a struct thrown at parse time (rc $r): $(printf '%s' "$out" |
+          head -c 300)"
+fi
+
 # THE REPL FRONT END - run_repl, which -rt's `repl:` cases never reach
 # (they drive ReplEngine directly). A session is fed on stdin, HOME
 # pointing at a scratch directory (the history file). Kept HERE rather
