@@ -47,75 +47,56 @@ runtime-typed value, as everywhere else).
   tag says "reference" where `t_struct` says "value"); `box<int>` /
   `box<float>` / `box<bool>` are a scalar cell.
 
-## Proposed - open for the maintainer
+### Unary `*` - reading and writing a box (decided 2026-10-08)
 
-### O1. How a scalar box is read and written
+Explicit `*`, as C and Rust, and NO implicit conversions. Monomorphization
+already gives a template called with a `box<int>` its own instance, so a
+box is always a proven static type; the reason for `*` is that three
+contexts would otherwise have two meanings each (`b = 5`: store or
+rebind? `b == c`: identity or value? `f(b)` into `f(int n)`: copy or
+reference?).
 
-Auto-unboxing CAN be decided entirely at compile time: a function template
-called with a `box<int>` already gets its own instance (monomorphization
-keys on the argument types), so inside it the box is a proven static type
-and no runtime test is needed - no template duplication beyond what
-already happens. The hard part is not the implementation, it is that three
-contexts have two meanings each once a box reads as its value:
-
-- `b = 5` - store into the cell, or rebind `b`? (If assignment writes
-  through, a box variable can never be rebound, and `a[0] = box(9)` writes
-  into the box `a[0]` holds instead of replacing it.)
-- `b == c` with two boxes - identity (class semantics) or value? With
-  unboxing on reads, `b == 5` is a value test and `b == c` an identity
-  test, side by side.
-- `f(b)` where `f(int n)` - a silent copy of the value, while `g(b)` where
-  `g` is a template passes the reference.
-
-**Recommendation: explicit `*`, as C and Rust, and no implicit
-conversions.** `*b` is an lvalue of type `T`: `*b = 6`, `*b += 1`,
-`(*b)++`, `print(*b)`, `f(*b)`. `b = box(7)` rebinds. `b == c` is
-identity, `*b == *c` compares values. A member access dereferences by
-itself (`b.x` for a `box<P>`, as for a class) - that is the one form with
-no second meaning. A missing `*` is a compile error naming the fix
-(`b + 1`: "b is a box<int>; read it with *b"). Implicit read-unboxing can
-be added later as sugar if it proves worth its ambiguity; taking it away
-later would break programs.
-
-### O2. `box(str)`
-
-A MyLang string is a VALUE: `var b = a; a += "!"` leaves `b` unchanged (the
-window model, README). A pass-through `box(s)` would therefore give no
-sharing at all - `*b += "x"` through one holder would not be seen by
-another. **Recommendation: a string is boxed like a scalar (`box<str>`).**
-
-### O3. Syntax notes for unary `*`
-
-- `a/*b` begins a block comment, exactly as in C (the lexer rule stays;
-  CLAUDE.md's "there is no unary `*`" justification changes). Write
-  `a / *b`.
-- Unary `*` binds like the other prefix operators, so `*b++` is
-  `*(b++)` - a compile error on a box, whose message suggests `(*b)++`.
-- `*` on a non-box static type is a compile error; on a `dyn` it is a run
-  time check (the one runtime-typed value).
-- `box<T>` is a type annotation like `array<T>` (`box<int> b = box(5);`),
-  `opt box<int>` a nullable box; `*` on an `opt` box needs a narrowing, as
+- `*b` is an lvalue of type `T`: `*b = 6`, `*b += 1`, `(*b)++`,
+  `print(*b)`, `f(*b)`. `b = box(7)` rebinds. `b == c` is identity,
+  `*b == *c` compares values.
+- A member access dereferences by itself (`b.x` for a `box<P>`, as for a
+  class) - the one form with no second meaning.
+- A missing `*` is a compile error naming the fix (`b + 1`: "b is a
+  box<int>; read it with *b"). Implicit read-unboxing may be added later
+  as sugar; taking it away later would break programs.
+- Syntax: `a/*b` begins a block comment, exactly as in C (the lexer rule
+  stays; CLAUDE.md's "there is no unary `*`" justification changes) -
+  write `a / *b`. Unary `*` binds like the other prefix operators, so
+  `*b++` is `*(b++)`, a compile error on a box whose message suggests
+  `(*b)++`. `*` on a non-box static type is a compile error; on a `dyn`
+  it is a run-time check. `box<T>` is a type annotation like `array<T>`;
+  `opt box<int>` is a nullable box, and `*` on one needs a narrowing, as
   a member read on an `opt` struct does.
 
-### O4. Reference cycles
+### `box(str)` is a real box (decided 2026-10-08)
 
-Refcounting cannot free a cycle, and classes make cycles the ordinary way
-to write a parent pointer or a doubly linked list. Phase 2 can ship
-without an answer (the INT object census reports such a leak), but the
-language needs one before classes are finished: a `weak` field modifier,
-or a cycle collector over class objects. Not proposed yet.
+A MyLang string is a VALUE (the window model, README): a pass-through
+`box(s)` would give no sharing at all. So `box(s)` is a `box<str>`, boxed
+like a scalar. The pass-through set is arrays, dicts, class instances,
+functions and boxes.
 
-### O5. A field of the class's own type
+### A field of the class's own type is `opt` (decided 2026-10-08)
 
-The struct plan said a class field may name its own class "without
-`dyn?`, since a reference cannot recurse infinitely". The STORAGE cannot,
-but a non-`opt` `Node next` field can never be constructed: the first
-`Node` would need an existing one. **Recommendation:** such a field must
-be `opt` (`opt Node next`), and `Node? next` / `Node next = none` read as
-the linked-list spelling; the recursive-struct check keeps refusing the
-non-`opt` form, with a message naming `opt`.
+A non-`opt` `Node next` field can never be constructed - the first `Node`
+would need an existing one. Such a field must be `opt` (`opt Node next`,
+`Node? next`); the recursive-struct check keeps refusing the non-`opt`
+form, with a message naming `opt`.
 
-### O6. Order
+### Reference cycles - plans/reference-cycles.md
+
+Refcounting cannot free a cycle, and classes make cycles the ordinary
+way to write a parent pointer or a doubly linked list. Classes can ship
+before the answer (cycles already exist through arrays and dicts), but
+the language needs one before classes are finished. The problem, the
+measured facts and the options are in plans/reference-cycles.md; it is
+deliberately not designed yet.
+
+## Order of work
 
 1. The shared heap object + `class` (declaration, construction, member
    read/write through the reference, identity `==` / hash, const), every
