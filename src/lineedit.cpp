@@ -456,6 +456,13 @@ LineEditor::Action LineEditor::feed(unsigned char c)
                     newline();
                     return Action::none;
                 }
+                /* the empty line that ran a chain kept open ends it: not
+                 * part of the input (nor of its history entry) */
+                if (joiner && buf.find('\n') != std::string::npos
+                    && last_line_blank()) {
+                    buf.erase(buf.rfind('\n'));
+                    pos = buf.size();
+                }
                 return Action::submit;
             }
             newline();                     return Action::none;

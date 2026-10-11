@@ -1699,7 +1699,7 @@ repl_load_history(const string &path, std::vector<string> &history)
     std::ifstream f(path);
     string line;
     /* the first line names the format: a file written before entries were
-     * escaped (save_history) has one entry per line, as written */
+     * escaped (repl_save_history) has one entry per line, as written */
     bool escaped = false;
     if (std::getline(f, line)) {
         if (line == HISTORY_HEADER)
@@ -1786,14 +1786,9 @@ run_repl()
         if (r.cancelled)
             continue;                       /* Ctrl-C drops the input */
 
-        string input = r.line;              /* may span multiple lines */
+        const string &input = r.line;       /* may span multiple lines */
         if (input.find_first_not_of(" \t\r\n") == string::npos)
             continue;                       /* blank */
-        /* drop the empty line that ran a chain kept open (the Joiner) */
-        for (size_t nl; (nl = input.rfind('\n')) != string::npos
-                 && input.find_first_not_of(" \t\r", nl + 1)
-                        == string::npos;)
-            input.erase(nl);
 
         /* A leading ':' meta-command (`:quit` exits; others run via eval_input,
          * which dispatches them). The whole input is one history entry. */
