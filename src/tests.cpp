@@ -9022,6 +9022,21 @@ static const std::vector<test> tests =
     },
 
     {
+        /* sum() of a flat POD-struct array read it through get_view(),
+         * which is general-only: an InternalErrorEx where a general array
+         * of the same structs raises the TypeErrorEx its `+` does. */
+        "sum of a flat struct array is the elements' TypeErrorEx",
+        {
+            "struct P { int x; }",
+            "var a = [P(int(runtime(1))), P(2)];",
+            "assert(array_storage(a) == \"struct\");",
+            "var caught = 0;",
+            "try { sum(a); } catch (TypeErrorEx) { caught++; }",
+            "assert(caught == 1 && array_storage(a) == \"struct\");",
+        },
+    },
+
+    {
         /* insert(d, k, v) stored a container key UNFROZEN - every other
          * insert site freezes it (make_const_clone) - so mutating the key
          * afterwards changed its hash under the map: the entry printed
