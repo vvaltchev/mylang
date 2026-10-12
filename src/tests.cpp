@@ -34594,6 +34594,138 @@ static bool myv_value_kinds_round_trip()
 }
 
 /*
+ * #49's CHECKS THROUGH AN IMAGE (docs/myv-format.txt, v37): a parameter's
+ * fit annotation of every kind (bool, str, a struct, a class, an array
+ * and a dict with and without element types, nested, a box of a scalar
+ * and of a struct, `opt`, a `dyn` element), a CheckFitV at every place (a
+ * declared variable, a field, an element, a dict value, a dict key), and
+ * a constructor that checks a field. The image must refuse and accept
+ * what the source does, and the bytecode dump must show the five places.
+ */
+static bool myv_fit_round_trip()
+{
+    const char *lines_arr[] = {
+        "struct P { int x; }",
+        "class C { int n; }",
+        "struct W { array<int> v; dict<str, array<P>> m; box<int> bi; }",
+        "func takes(bool b, str s, array<int> a, dict<str, array<P>> d,",
+        "           P p, C c, box<int> bi, box<P> bp, opt array<str> oa,",
+        "           array<dyn> ad, dict<int, dyn> dd, array a2, dict d2) {",
+        "    return len(a) + len(d) + p.x + c.n + *bi + (*bp).x + len(ad)",
+        "           + len(dd) + len(a2) + len(d2);",
+        "}",
+        "func call_it(dyn b, dyn s, dyn a, dyn d, dyn p, dyn c, dyn bi,",
+        "             dyn bp, opt dyn oa, dyn ad, dyn dd, dyn a2, dyn d2) {",
+        "    return takes(b, s, a, d, p, c, bi, bp, oa, ad, dd, a2, d2);",
+        "}",
+        "print(call_it(runtime(true), runtime(\"s\"), runtime([1, 2]),",
+        "              runtime({\"k\": [P(1)]}), runtime(P(3)),",
+        "              runtime(C(4)), runtime(box(5)), runtime(box(P(6))),",
+        "              runtime(none), runtime([1]), runtime({1: 2}),",
+        "              runtime([0]), runtime({})));",
+        /* each annotation's CONTENT must survive: a wrong struct, a box
+         * of one, one nested in a dict, an opt array's element */
+        "struct Q { int x; }",
+        "func probe(dyn s, dyn p, dyn bp, dyn d, opt dyn oa) {",
+        "    try { return call_it(true, s, [1], d, p, C(1), box(1), bp,",
+        "                         oa, [], {}, [], {}); }",
+        "    catch (TypeErrorEx) { return -1; }",
+        "}",
+        "print(probe(\"s\", P(1), box(P(1)), {}, none),",
+        "      probe(1, P(1), box(P(1)), {}, none),",
+        "      probe(\"s\", Q(1), box(P(1)), {}, none),",
+        "      probe(\"s\", P(1), box(Q(1)), {}, none),",
+        "      probe(\"s\", P(1), box(P(1)), {\"k\": [Q(1)]}, none),",
+        "      probe(\"s\", P(1), box(P(1)), {}, [\"a\"]),",
+        "      probe(\"s\", P(1), box(P(1)), {}, [1]));",
+        "func rows(dyn x) { array<dyn> r = [x]; return r; }",
+        "func stores(dyn d, dyn k) {",
+        "    var out = [];",
+        "    array<int> v = [1];",
+        "    try { v = rows(d); } catch (TypeErrorEx) { append(out, 1); }",
+        "    W w = W([1], {}, box(1));",
+        "    try { w.v = d; } catch (TypeErrorEx) { append(out, 2); }",
+        "    array<array<int>> aa = [[1]];",
+        "    try { aa[0] = d; } catch (TypeErrorEx) { append(out, 3); }",
+        "    dict<str, array<int>> m = {};",
+        "    try { m[\"k\"] = d; } catch (TypeErrorEx) { append(out, 4); }",
+        "    dict<str, int> kd = {};",
+        "    try { kd[k] = 1; } catch (TypeErrorEx) { append(out, 5); }",
+        "    try { var w2 = W(d, {}, box(1)); print(w2); }",
+        "    catch (TypeErrorEx) { append(out, 6); }",
+        "    return out;",
+        "}",
+        "print(stores(runtime([\"s\"]), runtime(5)));",
+        "print(stores(runtime([2]), runtime(\"q\")));" };
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+    const std::string want =
+        "24 \n5 -1 -1 -1 -1 5 -1 \n[1, 2, 3, 4, 5, 6] \n"
+        "W(v: [2], m: {}, bi: box(1)) \n[1] \n";
+
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-fit.myv";
+
+    const std::string from_src = myv_test_stdout(src, nullptr);
+    const std::string from_img = myv_test_stdout(src, &path);
+    remove(path.c_str());
+    bool ok = true;
+    if (from_src != want) {
+        fprintf(stderr, "myv-fit: the source printed\n%s\nwanted\n%s\n",
+                from_src.c_str(), want.c_str());
+        ok = false;
+    }
+    if (from_img != from_src) {
+        fprintf(stderr, "myv-fit: the image printed\n%s\n",
+                from_img.c_str());
+        ok = false;
+    }
+
+    /* the dump (JIT off, so no op is deleted into a fragment) */
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        const Block *blk = dynamic_cast<const Block *>(root.get());
+        const bool jit_was = g_jit_enabled;
+        g_jit_enabled = false;
+        const std::string dump = blk ? disassemble_program(blk) : "";
+        g_jit_enabled = jit_was;
+        for (const char *need : { "; -- fit_specs (5) --",
+                                  "variable 'v'  array<int>",
+                                  "field 'v'  array<int>",
+                                  "element  array<int>",
+                                  "dict value  array<int>",
+                                  "dict key  str", "check.fit",
+                                  "W  (3 args, fit)" })
+            if (dump.find(need) == std::string::npos) {
+                fprintf(stderr, "myv-fit: -vd has no '%s':\n%s\n", need,
+                        dump.c_str());
+                ok = false;
+                break;
+            }
+    } catch (Exception &e) {
+        fprintf(stderr, "myv-fit: threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    return ok;
+}
+
+/*
  * A SOURCE PATH THAT NAMES A DIRECTORY. A directory opens fine on POSIX
  * and then fails every read with EISDIR - and libstdc++'s filebuf THROWS
  * from underflow when read(2) fails, past every istream's error state,
@@ -57142,6 +57274,9 @@ static const std::vector<extra_check> extra_checks =
       myv_source_ref_directory },
     { "myv: every value kind a constant holds survives an image",
       myv_value_kinds_round_trip },
+    { "myv: #49's fit checks of every annotation and place survive an "
+      "image (v37)",
+      myv_fit_round_trip },
     { "myv: an UNTRUSTED image's out-of-range field index is caught (#137)",
       myv_untrusted_field_index },
     { "myv: a WRONG-TYPED base does not take the process down (#142)",

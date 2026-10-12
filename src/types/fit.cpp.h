@@ -38,7 +38,8 @@ struct FitWalk {
         const TypeAnnot *a;
         bool operator==(const Key &o) const
         {
-            return id == o.id && off == o.off && len == o.len && a == o.a;
+            return std::tie(id, off, len, a)
+                   == std::tie(o.id, o.off, o.len, o.a);
         }
     };
     struct KeyHash {
@@ -66,10 +67,12 @@ std::string fit_kind_text(const EvalValue &v)
     if (v.is<NoneVal>())
         return "none";
     if (v.is<intrusive_ptr<StructObject>>()) {
+        /* a struct always has a def, and a def a name (the loader
+         * refuses a nameless one) */
         const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
-        const std::string n = o.def && o.def->name ? o.def->name->val
-                                                   : "struct";
-        return o.boxed ? "box<" + n + ">" : n;
+        if (o.boxed)
+            return "box<" + o.def->name->val + ">";
+        return o.def->name->val;
     }
     if (v.is<intrusive_ptr<BoxObj>>()) {
         switch (v.get_ref<intrusive_ptr<BoxObj>>()->kind) {
@@ -84,106 +87,109 @@ std::string fit_kind_text(const EvalValue &v)
 }
 
 /* a misfit at the current level: what is there */
-bool fit_miss(const EvalValue &v, FitMisfit *why)
+bool fit_miss(const EvalValue &v, FitMisfit &why)
 {
-    if (why) {
-        why->where.clear();
-        why->got = fit_kind_text(v);
-    }
-    return false;
-}
-
-/* a misfit at the current level, of a FLAT array's elements: what their
- * storage holds, at element 0 */
-bool fit_miss_flat(const std::string &kind, FitMisfit *why)
-{
-    if (why) {
-        why->where = "[0]";
-        why->got = kind;
-    }
+    why.where.clear();
+    why.got = fit_kind_text(v);
     return false;
 }
 
 bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
-          FitMisfit *why);
+          FitMisfit &why);
 
 /* does every element of `arr` fit `ea`? */
 bool fits_elems(const SharedArrayObj &arr, const TypeAnnot *ea, FitWalk &w,
-                FitMisfit *why)
+                FitMisfit &why)
 {
     using St = SharedArrayObj::Storage;
     const size_type n = arr.size();
     if (!ea || ea->kind == DeclType::dyn || n == 0)
         return true;
+    /* a FLAT array is decided by its storage kind: a misfit names what
+     * that storage holds, at element 0 */
+    const char *flat = nullptr;
     switch (arr.skind()) {
     case St::ints:
-        return ea->kind == DeclType::i || fit_miss_flat("int", why);
+        flat = ea->kind == DeclType::i ? nullptr : "int";
+        break;
     case St::floats:
-        return ea->kind == DeclType::f || fit_miss_flat("float", why);
+        flat = ea->kind == DeclType::f ? nullptr : "float";
+        break;
     case St::bools:
-        return ea->kind == DeclType::b || fit_miss_flat("bool", why);
+        flat = ea->kind == DeclType::b ? nullptr : "bool";
+        break;
     case St::strs:
-        return ea->kind == DeclType::s || fit_miss_flat("str", why);
+        flat = ea->kind == DeclType::s ? nullptr : "str";
+        break;
     case St::structs: {
         const StructTypeDef *sd = arr.flat_structs().def;
-        return (ea->kind == DeclType::strct && ea->strct == sd)
-            || fit_miss_flat(sd && sd->name ? sd->name->val
-                                            : std::string("struct"), why);
+        if (ea->kind != DeclType::strct || ea->strct != sd)
+            flat = sd->name->val.c_str();
+        break;
     }
     case St::objs:
     case St::general:
-        break;
-    }
-    if (!w.visit(arr.storage_id(), arr.offset(), n, ea))
-        return true;
-    for (size_type i = 0; i < n; i++) {
-        if (!fits(arr_elem_at(arr, i), ea, w, why)) {
-            if (why)
-                why->where = "[" + std::to_string(i) + "]" + why->where;
-            return false;
+        if (!w.visit(arr.storage_id(), arr.offset(), n, ea))
+            return true;
+        for (size_type i = 0; i < n; i++) {
+            if (!fits(arr_elem_at(arr, i), ea, w, why)) {
+                why.where = "[" + std::to_string(i) + "]" + why.where;
+                return false;
+            }
         }
+        return true;
     }
-    return true;
+    if (!flat)
+        return true;
+    why.where = "[0]";
+    why.got = flat;
+    return false;
+}
+
+/* "key K [0]" / "default [0]": a key or the default names itself, then
+ * what is inside it */
+void fit_prefix(FitMisfit &why, std::string head)
+{
+    if (!why.where.empty()) {
+        head += ' ';
+        head += why.where;
+    }
+    why.where = std::move(head);
 }
 
 bool fits_dict(const DictObject &d, const TypeAnnot *ka,
-               const TypeAnnot *va, FitWalk &w, FitMisfit *why)
+               const TypeAnnot *va, FitWalk &w, FitMisfit &why)
 {
+    /* a dict annotation has both a key and a value annotation, or
+     * neither (a plain `dict`) */
     const bool keys = ka && ka->kind != DeclType::dyn;
     const bool vals = va && va->kind != DeclType::dyn;
     if (!keys && !vals)
         return true;
     /* one key per dict annotation: a key node always comes with the
      * same value node (a copied annotation shares both) */
-    if (!w.visit(&d, 0, 0, ka ? ka : va))
+    if (!w.visit(&d, 0, 0, ka))
         return true;
     for (const auto &kv : d.get_ref()) {
         if (keys && !fits(kv.first, ka, w, why)) {
-            if (why)
-                why->where = "key " + kv.first.to_string_repr()
-                             + (why->where.empty() ? "" : " " + why->where);
+            fit_prefix(why, "key " + kv.first.to_string_repr());
             return false;
         }
         if (vals && !fits(kv.second.get(), va, w, why)) {
-            if (why)
-                why->where = "[" + kv.first.to_string_repr() + "]"
-                             + why->where;
+            why.where = "[" + kv.first.to_string_repr() + "]" + why.where;
             return false;
         }
     }
     if (vals && d.get_has_default()
         && !fits(d.get_default(), va, w, why)) {
-        if (why)
-            why->where = "default" + (why->where.empty()
-                                          ? std::string()
-                                          : " " + why->where);
+        fit_prefix(why, "default");
         return false;
     }
     return true;
 }
 
 bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
-          FitMisfit *why)
+          FitMisfit &why)
 {
     if (!a || a->kind == DeclType::dyn || a->kind == DeclType::none)
         return true;
@@ -227,7 +233,7 @@ std::string fit_got_phrase(const std::string &got)
 {
     if (got == "none")
         return "none";
-    const char c = got.empty() ? 'x' : got[0];
+    const char c = got[0];          /* '\0' for an empty string */
     const bool an = c == 'a' || c == 'e' || c == 'i' || c == 'o'
                     || c == 'u';
     return std::string(an ? "an '" : "a '") + got + "'";
@@ -253,7 +259,7 @@ std::string fit_annot_text(const TypeAnnot &a)
 
 } // namespace
 
-bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit *why)
+bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit &why)
 {
     FitWalk w;
     return fits(v, &a, w, why);
@@ -273,13 +279,16 @@ TypeErrorEx param_fit_error(const UniqueId *param, const TypeAnnot &a,
 
 TypeErrorEx fit_error(const FitSpec &spec, const FitMisfit &m)
 {
+    /* a var or field spec is named by the compile; an image's may not
+     * be (the loader does not require it) */
+    const std::string nm = spec.name ? spec.name->val : "?";
     std::string s;
     switch (spec.place) {
     case FitSpec::Place::var:
-        s = "'" + std::string(spec.name ? spec.name->val : "?") + "'";
+        s = "'" + nm + "'";
         break;
     case FitSpec::Place::field:
-        s = "field '" + std::string(spec.name ? spec.name->val : "?") + "'";
+        s = "field '" + nm + "'";
         break;
     case FitSpec::Place::elem:     s = "the element";    break;
     case FitSpec::Place::dict_val: s = "the dict value"; break;
@@ -294,14 +303,14 @@ TypeErrorEx fit_error(const FitSpec &spec, const FitMisfit &m)
 void check_fit(const EvalValue &v, const FitSpec &spec)
 {
     FitMisfit m;
-    if (!value_fits(v, *spec.annot, &m))
+    if (!value_fits(v, *spec.annot, m))
         throw fit_error(spec, m);
 }
 
 void check_fit_loc(const EvalValue &v, const FitSpec &spec, Loc s, Loc e)
 {
     FitMisfit m;
-    if (value_fits(v, *spec.annot, &m))
+    if (value_fits(v, *spec.annot, m))
         return;
     TypeErrorEx ex = fit_error(spec, m);
     ex.loc_start = s;

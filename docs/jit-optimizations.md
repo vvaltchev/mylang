@@ -17962,7 +17962,7 @@ the value enters, naming the place and what is there ("parameter 'a' is
 declared 'array<int>' but the argument's [0] is a 'float'"), before
 anything is stored, with the value's caret - the same in every engine.
 
-**One function decides.** `value_fits(v, TypeAnnot, FitMisfit *)`
+**One function decides.** `value_fits(v, TypeAnnot, FitMisfit &)`
 (types/fit.cpp.h) is the only answer to "does this value fit that
 declared type", and `fit_error` the only rendering, so the engines
 cannot disagree about either. Its walk is bounded by the ANNOTATION:

@@ -1,0 +1,7 @@
+# INT-SOURCE: ../functional/94_struct_reuse_boxed.my
+# INT-ENGINES: tw default nj
+#
+# INT unit: a struct constructor never rebuilds a box<P> in place (the
+# planned and unplanned ctors, the JIT's inline guard and its loop
+# establish). The functional program runs as a coverage unit, with no
+# second copy (INT-SOURCE); every engine must print the same.
