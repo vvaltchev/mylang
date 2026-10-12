@@ -1,0 +1,73 @@
+# A struct construction may rebuild the object its destination slot
+# already holds, in place, when nothing else holds it (the H1 reuse,
+# vm.cpp's vm_struct_ctor). A box<P> has P's def, so a slot that last
+# held one - a `dyn` variable reassigned, a reused temp - must not be
+# rebuilt: the struct came out a box, printed as one, compared unequal
+# and failed a parameter's type check. Every engine prints what the
+# tree-walker does.
+struct P { int x; float y; }
+struct R { P p; int k; }
+var seen = [];
+func note(dyn v) { append(seen, str(v)); }
+
+# the planned constructor (every argument typed) into a dyn variable
+var dyn v = box(P(6, 0.5));
+v = P(1, 2.5);
+note(v);
+assert(v == P(1, 2.5));
+
+# the unplanned one (a nested struct field)
+var dyn z = box(R(P(1, 1.0), 1));
+z = R(P(2, 2.0), 3);
+note(z);
+assert(z == R(P(2, 2.0), 3));
+
+# in a function body
+func rebuild(int n) {
+    var dyn r = box(P(n, 1.0));
+    r = P(n + 1, 2.0);
+    return str(r);
+}
+append(seen, rebuild(runtime(3)));
+
+# in a loop that rebinds the slot to a box (the JIT's guarded inline
+# constructor) ...
+func loop(int n) {
+    var dyn r = box(P(0, 0.0));
+    var out = [];
+    for (var i = 0; i < n; i++) {
+        r = P(i, 0.5);
+        append(out, str(r));
+        r = box(P(i, 0.25));
+    }
+    return out;
+}
+append(seen, str(loop(runtime(3))));
+
+# ... and in one that only constructs (its preheader readies the slot)
+func est(int n) {
+    var dyn r = box(P(0, 0.0));
+    var t = 0;
+    for (var i = 0; i < n; i++) {
+        r = P(i, 0.5);
+        t += i;
+    }
+    return str(r) + " " + str(t);
+}
+append(seen, est(runtime(4)));
+
+# a parameter's type check sees the struct the program built
+func takes(P p) => p.x;
+func pass(dyn d) => takes(d);
+var dyn t = box(P(5, 5.0));
+t = P(7, 7.0);
+append(seen, str(pass(t)));
+
+foreach (var s in seen)
+    print(s);
+assert(seen == ["P(x: 1, y: 2.500000)",
+                "R(p: P(x: 2, y: 2.000000), k: 3)",
+                "P(x: 4, y: 2.000000)",
+                "[\"P(x: 0, y: 0.500000)\", \"P(x: 1, y: 0.500000)\", "
+                + "\"P(x: 2, y: 0.500000)\"]",
+                "P(x: 3, y: 0.500000) 6", "7"]);

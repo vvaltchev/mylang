@@ -26408,7 +26408,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
 
             /*
              * C4e: a loop preheader ran jit_struct_ctor_establish on this
-             * slot, so the four H1 guards are already true and stay true
+             * slot, so the five H1 guards are already true and stay true
              * for the whole region (jit_pick_ctor_establish proved nothing
              * in it can rebind the slot or retain the instance). Two
              * instructions, and no slow tier - the guards were the only
@@ -26450,6 +26450,12 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 /* cmp byte [rax + sobj_ro], 0  (not readonly) */
                 e.cmp_byte_base(acc.r, static_cast<int32_t>(L.sobj_ro), 0);
                 const size_t js4 = e.j32(0x75);
+                /* cmp byte [rax + sobj_boxed], 0: a box<P> has P's def,
+                 * and rebuilt in place it would stay a box (vm.cpp,
+                 * vm_struct_ctor's note) */
+                e.cmp_byte_base(acc.r, static_cast<int32_t>(L.sobj_boxed),
+                                0);
+                const size_t js5 = e.j32(0x75);
 #ifdef TESTS
                 e.bump_counter(&g_jit_ctor_fast);
 #endif
@@ -26461,6 +26467,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.patch32_here(js2);
                 e.patch32_here(js3);
                 e.patch32_here(js4);
+                e.patch32_here(js5);
             }
             /* slow: jit_struct_ctor_planned(def, plan, dst) - the
              * interpreter's planned body (fresh alloc / aliased dst),

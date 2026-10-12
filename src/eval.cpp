@@ -6265,6 +6265,8 @@ void vm_struct_elem_into(LValue &dst, const EvalValue &arrv, int_type idx)
         const auto &sv = arr.flat_structs();
         const intrusive_ptr<StructObject> &o =
             dst.get().get_ref<intrusive_ptr<StructObject>>();
+        /* (no `boxed` test, unlike the constructors' reuse: the loop
+         * variable is typed P, so no program can leave a box<P> in it) */
         if (o.use_count() == 1 && o->def == sv.def && !o->readonly
             && o->bytes.size() == static_cast<size_t>(sv.stride)) {
             std::memcpy(o->bytes.data(),

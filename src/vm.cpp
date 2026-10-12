@@ -685,7 +685,12 @@ vm_make_dict(EvalContext &ctx, int_type base, int_type npairs)
  * construction - the same overwrite-in-place + COW-guard trick the flat-
  * struct-array foreach uses (do_iter). An aliased (`var q = p;`), captured,
  * const, other-def, or non-struct dst takes the fresh-allocation path, so a
- * held instance is never mutated. The fields are coerced into a stack
+ * held instance is never mutated. Nor is a BOXED one (a box<P> has P's
+ * def): a temp that last held `box(P(..))` would come out a box<P>, and
+ * every check of the value - `==`, a fit, a print - would see a box where
+ * the program built a struct. Every constructor's reuse asks `boxed` (the
+ * planned ctor, the C4e establish, the JIT's inline guard).
+ * The fields are coerced into a stack
  * buffer BEFORE dst is touched (a defensive coerce throw leaves the old
  * value intact - construct_struct_from_values orders the same way). */
 static ML_NOINLINE void
@@ -703,7 +708,8 @@ vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base,
              * container-literal H1 (below) already uses get_ref. */
             const intrusive_ptr<StructObject> &so =
                 cur.get_ref<intrusive_ptr<StructObject>>();
-            if (so->def == def && !so->readonly && so.use_count() == 1) {
+            if (so->def == def && !so->readonly && !so->boxed
+                && so.use_count() == 1) {
                 char *bytes = so->bytes.data();
                 for (int_type i = 0; i < nf; i++)
                     pod_store_field(def->fields[static_cast<size_t>(i)],
@@ -756,7 +762,8 @@ vm_struct_ctor_planned(EvalContext &ctx, StructTypeDef *def,
     if (cur.is<intrusive_ptr<StructObject>>()) {
         const intrusive_ptr<StructObject> &so =
             cur.get_ref<intrusive_ptr<StructObject>>();
-        if (so->def == def && !so->readonly && so.use_count() == 1)
+        if (so->def == def && !so->readonly && !so->boxed
+            && so.use_count() == 1)
             o = so.get();
     }
     intrusive_ptr<StructObject> fresh;
@@ -5366,7 +5373,8 @@ extern "C" void jit_struct_ctor_establish(const void *defv,
     if (cur.is<intrusive_ptr<StructObject>>()) {
         const intrusive_ptr<StructObject> &so =
             cur.get_ref<intrusive_ptr<StructObject>>();
-        if (so->def == def && !so->readonly && so.use_count() == 1)
+        if (so->def == def && !so->readonly && !so->boxed
+            && so.use_count() == 1)
             return;                          /* already reusable */
     }
     d.put(EvalValue(make_intrusive<StructObject>(def)));
