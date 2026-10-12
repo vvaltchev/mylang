@@ -370,6 +370,42 @@ public:
 };
 
 /*
+ * The flat CLASS storage of an array (SharedArrayObj::ovec_type) holds
+ * class references, a null pointer standing for `none`. These convert
+ * between an element and a value: is_obj_elem(v) - does the storage hold
+ * `v` as it is (a class instance, or none)? obj_elem_ptr(v) - the
+ * reference it stores for one; obj_elem_value(p) - the value an element
+ * reads as (a retain).
+ */
+inline bool is_class_instance(const EvalValue &v)
+{
+    return v.is<intrusive_ptr<StructObject>>() &&
+           v.get_ref<intrusive_ptr<StructObject>>()->def->is_class;
+}
+
+inline bool is_obj_elem(const EvalValue &v)
+{
+    if (v.is<NoneVal>())
+        return true;
+    return v.is<intrusive_ptr<StructObject>>() &&
+           v.get_ref<intrusive_ptr<StructObject>>()->def->is_class;
+}
+
+inline StructObject *obj_elem_ptr(const EvalValue &v)
+{
+    if (v.is<NoneVal>())
+        return nullptr;
+    return v.get_ref<intrusive_ptr<StructObject>>().get();
+}
+
+inline EvalValue obj_elem_value(StructObject *p)
+{
+    if (!p)
+        return EvalValue();
+    return EvalValue(intrusive_ptr<StructObject>(p));
+}
+
+/*
  * G3: does this value ALREADY hold exactly the field's declared scalar
  * kind, so coerce_struct_field would hand it straight back?
  *

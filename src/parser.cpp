@@ -220,6 +220,9 @@ lookup_struct_type(ParseContext &c, std::string_view name,
                    bool *hidden = nullptr)
 {
     const UniqueId *uid = UniqueId::get(name);
+    /* the struct being declared, named in its own field's annotation */
+    if (c.decl_self && c.decl_self->name == uid)
+        return c.decl_self;
     /* the whole scope chain: EvalContext::lookup is LOCAL, and a struct
      * declared around a block is in an OUTER scope - looking in the
      * innermost one alone, `P p;` in any function body or `if` block was
@@ -3239,6 +3242,15 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
     int next_slot = 0;
     std::vector<Loc> field_locs;     /* parallel to def->fields, for errors */
 
+    /* its own name is a type in its fields' annotations (lookup_struct_type) */
+    struct SelfScope {
+        ParseContext &c;
+        const StructTypeDef *saved;
+        SelfScope(ParseContext &c, const StructTypeDef *d)
+            : c(c), saved(c.decl_self) { c.decl_self = d; }
+        ~SelfScope() { c.decl_self = saved; }
+    } self_scope(c, stmt->def);
+
     while (!pAcceptOp(c, Op::braceR)) {
 
         const Loc mloc = c.get_loc();
@@ -3660,6 +3672,13 @@ collect_value_descs(const EvalValue &v,
 
     case Type::t_arr: {
         const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
+        if (arr.skind() == SharedArrayObj::Storage::objs) {
+            /* class instances: their fields may name one */
+            for (size_type i = 0; i < arr.size(); i++)
+                collect_value_descs(obj_elem_value(
+                    arr.flat_objs()[arr.offset() + i]), out);
+            break;
+        }
         if (arr.skind() != SharedArrayObj::Storage::general)
             break;
         ArrayConstView view = arr.get_view();

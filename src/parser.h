@@ -211,6 +211,10 @@ public:
     /* When pending_decl_type == strct, the struct type of the pending decl
      * (`A obj`); nullptr otherwise. Transient, like pending_decl_type. */
     const StructTypeDef *pending_decl_struct = nullptr;
+    /* The struct or class whose fields are being parsed: a field's type
+     * annotation may name it (`class Tree { array<Tree> kids; }`) though
+     * its descriptor is bound only when the declaration ends. */
+    const StructTypeDef *decl_self = nullptr;
 
     /* When the pending decl is a PARAMETERIZED container (`array<int>`,
      * `dict<str, Point>`), its recursive element/key/value type; nullptr for a

@@ -1790,7 +1790,10 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
         const size_t at = sv.buf.size();
         sv.buf.resize(at + sv.stride);
         std::memcpy(sv.buf.data() + at, obj->bytes.data(), sv.stride);
-    } else if (arr.skind() == SharedArrayObj::Storage::general) {
+    } else if (arr.skind() == SharedArrayObj::Storage::general ||
+               arr.skind() == SharedArrayObj::Storage::strs ||
+               arr.skind() == SharedArrayObj::Storage::objs) {
+        /* a strs or objs array promotes (get_vec), as append's core does */
         arr.get_vec().emplace_back(elem, ctx->const_ctx);
     } else {
         throw TypeErrorEx("Cannot append a struct to this array",
@@ -2236,11 +2239,31 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
             return SharedArrayObj(SharedArrayObj::fvec_type{});
         if (hint == ArrHint::flat_b)
             return SharedArrayObj(SharedArrayObj::bvec_type{});
+        if (hint == ArrHint::flat_c)
+            return SharedArrayObj(SharedArrayObj::ovec_type{});
         /* A general empty `[]` must be a FRESH MUTABLE array, not the shared
          * read-only empty_arr singleton (like the flat hints above) - else a
          * later append() COW-clones instead of mutating in place (a function
          * appending to a passed-in `[]` wouldn't grow the caller). */
         return SharedArrayObj(SharedArrayObj::vec_type{});
+    }
+
+    /*
+     * An array<C> of a class C (flat_c): the flat CLASS storage, when every
+     * element is a class instance or none - type-driven, so a value that is
+     * not (the destination is `dyn` somewhere) leaves it general below.
+     */
+    if (hint == ArrHint::flat_c) {
+        bool all = true;
+        for (size_t i = 0; i < n && all; i++)
+            all = is_obj_elem(vals[i]);
+        if (all) {
+            SharedArrayObj::ovec_type ov;
+            ov.v.reserve(n);
+            for (size_t i = 0; i < n; i++)
+                ov.push(obj_elem_ptr(vals[i]));
+            return SharedArrayObj(std::move(ov));
+        }
     }
 
     /*
@@ -2255,6 +2278,8 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
     SharedArrayObj::fvec_type fvec;
     SharedArrayObj::bvec_type bvec;
     SharedArrayObj::vec_type  gvec;
+    /* mode 6: class references (the flat CLASS storage) */
+    SharedArrayObj::ovec_type ovec;
     /* mode 5: a flat array of same-type POD structs (their bytes packed) */
     std::vector<char> svecbuf;
     StructTypeDef *sdef = nullptr;
@@ -2272,7 +2297,8 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
         std::memcpy(svecbuf.data() + at, o.bytes.data(), sstride);
     };
     /*
-     * 0 = empty, 1 = ints, 2 = floats, 4 = bools, 3 = general. Type-driven: a
+     * 0 = empty, 1 = ints, 2 = floats, 4 = bools, 5 = POD structs, 6 = class
+     * references, 3 = general. Type-driven: a
      * literal bound to a dynamically-typed destination (arr_hint general, set by
      * the inferencer) is built general from the start, so a later mixed write to
      * it never has to promote. (The flat_i/flat_f/flat_b hints need no special
@@ -2294,7 +2320,10 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
         else if (mode == 4)
             for (unsigned char x : bvec)
                 gvec.emplace_back(EvalValue(static_cast<bool>(x)), is_const);
-        else if (mode == 5) {
+        else if (mode == 6) {
+            for (size_t i = 0; i < ovec.size(); i++)
+                gvec.emplace_back(obj_elem_value(ovec[i]), is_const);
+        } else if (mode == 5) {
             const size_t cnt = sstride ? svecbuf.size() / sstride : 0;
             for (size_t i = 0; i < cnt; i++) {
                 auto o = make_intrusive<StructObject>(sdef);
@@ -2308,6 +2337,7 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
         fvec.clear();
         bvec.clear();
         svecbuf.clear();
+        ovec = SharedArrayObj::ovec_type();
         mode = 3;
     };
 
@@ -2322,6 +2352,13 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
                 mode = 2; fvec.push_back(v.get<float_type>());
             } else if (v.is<bool>()) {
                 mode = 4; bvec.push_back(v.get<bool>() ? 1 : 0);
+            } else if (is_class_instance(v)) {
+                /* class instances: their references, value-driven like
+                 * the POD structs below (a constant's literal is built
+                 * before inference, so no hint can reach it) */
+                mode = 6;
+                ovec.v.reserve(n);
+                ovec.push(obj_elem_ptr(v));
             } else if (is_pod_struct_of(v, nullptr)) {
                 mode = 5;
                 sdef = v.get<intrusive_ptr<StructObject>>()->def;
@@ -2340,6 +2377,8 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
             bvec.push_back(v.get<bool>() ? 1 : 0);
         } else if (mode == 5 && is_pod_struct_of(v, sdef)) {
             append_struct_bytes(v);
+        } else if (mode == 6 && is_obj_elem(v)) {
+            ovec.push(obj_elem_ptr(v));
         } else {
             if (mode != 3)
                 spill_to_general();
@@ -2353,6 +2392,8 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
     if (mode == 5)
         return SharedArrayObj(
             SharedArrayObj::svec_type(std::move(svecbuf), sdef, sstride));
+    if (mode == 6)
+        return SharedArrayObj(std::move(ovec));
     return SharedArrayObj(std::move(gvec));
 }
 
@@ -2516,6 +2557,24 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st,
                 tv.cbegin() + arr.offset(),
                 tv.cbegin() + arr.offset() + arr.size()
             ));
+        }
+
+        /* Flat CLASS array: each element as the general path below treats
+         * it (a clone of a class instance is a class instance, so the
+         * copy stays flat). The array cannot be on a cycle without a
+         * class instance on it too, which the copy stack links. */
+        if (arr.skind() == SharedArrayObj::Storage::objs) {
+            const auto &ov = arr.flat_objs();
+            SharedArrayObj::ovec_type nv;
+            nv.v.reserve(arr.size());
+            for (size_type i = 0; i < arr.size(); i++) {
+                const EvalValue c = clone_to_mutable(
+                    obj_elem_value(ov[arr.offset() + i]), through_readonly,
+                    st, keep_order);
+                ML_CHECK(is_obj_elem(c));
+                nv.push(obj_elem_ptr(c));
+            }
+            return SharedArrayObj(std::move(nv));
         }
 
         CycKey k;
@@ -2732,6 +2791,23 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
             return arr;
         }
 
+        /* Flat CLASS array: the same references (a class instance keeps
+         * its identity - frozen in place for a constant, below), read-only */
+        if (src.skind() == SharedArrayObj::Storage::objs) {
+            const auto &ov = src.flat_objs();
+            SharedArrayObj::ovec_type nv;
+            nv.v.reserve(src.size());
+            for (size_type i = 0; i < src.size(); i++) {
+                const EvalValue c = make_const_clone_rec(
+                    obj_elem_value(ov[src.offset() + i]), key, st);
+                ML_CHECK(is_obj_elem(c));
+                nv.push(obj_elem_ptr(c));
+            }
+            SharedArrayObj arr(std::move(nv));
+            arr.set_readonly();
+            return arr;
+        }
+
         CycKey k;
         cyc_key(v, k);                       /* a general array: keyed */
         if (const EvalValue *c = st.link(k))
@@ -2916,6 +2992,8 @@ void cyc_release_kept()
  * never has to promote. Only a flat source reaches here - an already-general
  * baked value is handled by make_mutable_clone, which keeps it general.
  */
+static EvalValue arr_elem_boxed(const SharedArrayObj &a, size_type i);
+
 static EvalValue
 make_general_array_clone(const SharedArrayObj &src)
 {
@@ -2936,6 +3014,13 @@ make_general_array_clone(const SharedArrayObj &src)
         for (size_type i = 0; i < m; i++)
             gv.emplace_back(EvalValue(SharedStr(tv[src.offset() + i])),
                             false);
+    } else if (src.skind() == SharedArrayObj::Storage::objs) {
+        const auto &ov = src.flat_objs();
+        for (size_type i = 0; i < m; i++)
+            gv.emplace_back(obj_elem_value(ov[src.offset() + i]), false);
+    } else if (src.skind() != SharedArrayObj::Storage::bools) {
+        for (size_type i = 0; i < m; i++)      /* a flat struct array */
+            gv.emplace_back(arr_elem_boxed(src, i), false);
     } else {
         const auto &bv = src.flat_bools();
         for (size_type i = 0; i < m; i++)
@@ -2972,6 +3057,8 @@ arr_elem_boxed(const SharedArrayObj &a, size_type i)
         }
         case SharedArrayObj::Storage::strs:
             return EvalValue(SharedStr(a.flat_strs()[a.offset() + i]));
+        case SharedArrayObj::Storage::objs:
+            return obj_elem_value(a.flat_objs()[a.offset() + i]);
         default:
             return a.get_view()[i].get();
     }
@@ -3185,6 +3272,32 @@ EvalValue eval_literal_obj(const EvalValue &value, bool immutable,
             return SharedArrayObj(SharedArrayObj::fvec_type{});
         if (arr_hint == ArrHint::flat_b)
             return SharedArrayObj(SharedArrayObj::bvec_type{});
+        if (arr_hint == ArrHint::flat_c)
+            return SharedArrayObj(SharedArrayObj::ovec_type{});
+    }
+
+    /* An array<C> of a class: a baked GENERAL array of class instances (a
+     * constant's, frozen) becomes the flat CLASS storage, as a literal
+     * evaluated at run time does (build_array_from_values) - the copy of
+     * each element make_mutable_clone would make is the element itself,
+     * a frozen instance being shared. */
+    if (!immutable && arr_hint == ArrHint::flat_c &&
+        value.is<SharedArrayObj>() &&
+        value.get_ref<SharedArrayObj>().skind()
+            == SharedArrayObj::Storage::general) {
+        const EvalValue m = make_mutable_clone(value);
+        const SharedArrayObj &ma = m.get_ref<SharedArrayObj>();
+        const size_type n = ma.size();
+        bool all = true;
+        for (size_type i = 0; i < n && all; i++)
+            all = is_obj_elem(ma.get_vec()[ma.offset() + i].get());
+        if (!all)
+            return m;
+        SharedArrayObj::ovec_type ov;
+        ov.v.reserve(n);
+        for (size_type i = 0; i < n; i++)
+            ov.push(obj_elem_ptr(ma.get_vec()[ma.offset() + i].get()));
+        return SharedArrayObj(std::move(ov));
     }
 
     return immutable ? value : make_mutable_clone(value);
@@ -4017,6 +4130,40 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
     }
 
     /*
+     * Flat CLASS array (plans/class-and-box.md step 2), the strs model: a
+     * plain store of a class instance or `none` keeps it flat; anything
+     * else (another value through a `dyn` alias, a compound op - which a
+     * class instance has none of) PROMOTES to general and defers.
+     */
+    if (arr.skind() == SharedArrayObj::Storage::objs) {
+
+        const EvalValue r0 = RValue(rval);
+        if (op != Op::assign || !is_obj_elem(r0)) {
+            arr.promote_objs_to_general();
+            return false;                 /* general path handles it */
+        }
+
+        if (!idx_v.is<int_type>())
+            throw TypeErrorEx("Expected integer as subscript",
+                              idx_start, idx_end);
+        int_type idx = idx_v.get<int_type>();
+        ML_INT_ONLY(int_vc_index(false, idx, arr.size());)
+        if (idx < 0)
+            idx += arr.size();
+        if (idx < 0 || static_cast<size_t>(idx) >= arr.size())
+            throw OutOfBoundsEx(sub_start, sub_end);
+
+        if (arr.is_slice())
+            arr.clone_internal_vec();
+        else if (arr.use_count() > 1)
+            arr.clone_aliased_slices(arr.offset() + idx);
+
+        arr.flat_objs().set(arr.offset() + idx, obj_elem_ptr(r0));
+        out = r0;
+        return true;
+    }
+
+    /*
      * Flat STRING array (top-10 #7, the value-driven model): a plain store
      * of a STRING keeps it flat; ANYTHING else (a non-string value, a
      * compound op) PROMOTES to general and defers to the general path -
@@ -4309,6 +4456,28 @@ static bool chain_has_member(const Construct *e)
     }
 }
 
+/*
+ * May a store write through `base` - a slot (an LValue), or a CLASS
+ * instance read as a value (an element of a flat class array has no
+ * LValue)? A class instance is a reference wherever it came from, so its
+ * field is the shared object's - unless it is a constant's, which no
+ * alias may write (struct_own's rule). A field of any other VALUE is not
+ * a location: a store through a value holds it first.
+ */
+static bool store_rooted(const EvalValue &base)
+{
+    if (base.is<LValue *>())
+        return true;
+    if (!base.is<intrusive_ptr<StructObject>>())
+        return false;
+    const StructObject &o = *base.get_ref<intrusive_ptr<StructObject>>();
+    if (!o.def->is_class)
+        return false;
+    if (o.is_readonly())
+        throw CannotChangeConstEx();
+    return true;
+}
+
 /* One member step of a store walk (MemberExpr::do_eval's work, for_write
  * false, the struct owned first). The caller stamps a throw. */
 static void member_store_step(MemberTarget &t, const MemberExpr *s)
@@ -4326,9 +4495,7 @@ static void member_store_step(MemberTarget &t, const MemberExpr *s)
         if (pod_place_rooted_field(h, s->memUid, t.place))
             return;
     }
-    /* a field of a VALUE is not a location: only a slot's struct gives
-     * its field's LValue (a store through a value holds it first) */
-    const bool rooted = t.base.is<LValue *>();
+    const bool rooted = store_rooted(t.base);
     t.base = s->access(RValue(t.base), /*for_write=*/false, rooted);
 }
 
@@ -4449,8 +4616,8 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
      * `const` parameter's struct is refused at compile time when its type
      * is known; at run time the parameter is the call's copy, as in every
      * engine.) */
-    const bool rooted = base.is<LValue *>();
-    if (rooted) {
+    const bool rooted = store_rooted(base);
+    if (base.is<LValue *>()) {
         LValue *blv = base.get<LValue *>();
         if (blv->is<intrusive_ptr<StructObject>>()) {
             StructObject &obj = struct_own(blv);
@@ -4824,9 +4991,21 @@ LValue *vm_member_lvalue_ref(EvalValue &cur, const EvalValue &memId,
         cur.is<LValue *>() ? cur.get<LValue *>()->get() : cur;
     if (dval.is<intrusive_ptr<StructObject>>()) {
         /* a struct's field is a location only in a writable slot's
-         * struct - owned before the field is handed out */
-        if (!cur.is<LValue *>())
-            return nullptr;
+         * struct - owned before the field is handed out - or in a CLASS
+         * instance, a reference wherever it was read from (an element of
+         * a flat class array has no LValue; store_rooted's rule) */
+        if (!cur.is<LValue *>()) {
+            const StructObject &o =
+                *dval.get_ref<intrusive_ptr<StructObject>>().get();
+            if (!o.def->is_class)
+                return nullptr;
+            if (o.is_readonly())
+                throw CannotChangeConstEx(mstart, mend);
+            const int slot = o.def->slot_of(memUid);
+            if (slot < 0)
+                return nullptr;
+            return &const_cast<StructObject &>(o).fields[slot];
+        }
         LValue *h = cur.get<LValue *>();
         const StructObject &obj =
             *dval.get_ref<intrusive_ptr<StructObject>>().get();

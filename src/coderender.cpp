@@ -88,6 +88,7 @@ const char *arr_hint_type(ArrHint h)
         case ArrHint::flat_f: return "array<float>";
         case ArrHint::flat_b: return "array<bool>";
         case ArrHint::flat_s: return "array<struct>";
+        case ArrHint::flat_c: return "array<class>";
         default:              return nullptr;
     }
 }

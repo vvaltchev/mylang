@@ -273,6 +273,8 @@ EvalValue builtin_array_storage(EvalContext *ctx, const ArgLocs *exprList,
             return SharedStr(string("struct"));
         case SharedArrayObj::Storage::strs:
             return SharedStr(string("str"));
+        case SharedArrayObj::Storage::objs:
+            return SharedStr(string("class"));
         default:
             return SharedStr(string("general"));
     }
@@ -381,7 +383,7 @@ static bool arr_elem_fits(const SharedArrayObj &arr, const EvalValue &elem)
         const StructObject &o = *elem.get<intrusive_ptr<StructObject>>();
         return o.is_pod() && o.def == arr.flat_structs().def;
     }
-    default:
+    default:                /* general; strs and objs promote */
         return true;
     }
 }
@@ -459,6 +461,16 @@ static bool arr_push_value(SharedArrayObj &arr, const EvalValue &elem,
             arr.flat_strs().push_back(SharedStr(elem.get<SharedStr>()));
         } else {
             arr.promote_strs_to_general();
+            arr.get_vec().emplace_back(elem, is_const);
+        }
+        break;
+    case SharedArrayObj::Storage::objs:
+        /* the strs model again: a class instance or none stays flat, any
+         * other value (through a `dyn` alias) promotes */
+        if (is_obj_elem(elem)) {
+            arr.flat_objs().push(obj_elem_ptr(elem));
+        } else {
+            arr.promote_objs_to_general();
             arr.get_vec().emplace_back(elem, is_const);
         }
         break;
@@ -608,6 +620,9 @@ EvalValue builtin_pop(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
         case SharedArrayObj::Storage::bools:
             last = EvalValue(static_cast<bool>(arr.flat_bools()[last_i]));
             break;
+        case SharedArrayObj::Storage::objs:
+            last = obj_elem_value(arr.flat_objs()[last_i]);
+            break;
         default:
             last = arr.get_vec()[last_i].get();          break;
     }
@@ -627,6 +642,8 @@ EvalValue builtin_pop(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
                 arr.flat_floats().pop_back(); break;
             case SharedArrayObj::Storage::bools:
                 arr.flat_bools().pop_back();  break;
+            case SharedArrayObj::Storage::objs:
+                arr.flat_objs().pop();        break;
             default:
                 arr.get_vec().pop_back();     break;
         }
@@ -781,7 +798,8 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
      * included, so `insert(split(s, " "), 1, "x")` was a TypeErrorEx. */
     if (arr.skind() != SharedArrayObj::Storage::general &&
         arr.skind() != SharedArrayObj::Storage::structs &&
-        arr.skind() != SharedArrayObj::Storage::strs)
+        arr.skind() != SharedArrayObj::Storage::strs &&
+        arr.skind() != SharedArrayObj::Storage::objs)
         throw TypeErrorEx(flat_array_violation_msg);
 
     auto &v = arr.get_vec();
@@ -1397,6 +1415,11 @@ reverse_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0,
         }
         case SharedArrayObj::Storage::strs: {
             auto &v = arr.flat_strs();
+            reverse(v.begin(), v.end());
+            break;
+        }
+        case SharedArrayObj::Storage::objs: {
+            auto &v = arr.flat_objs().v;    /* a reorder: no count moves */
             reverse(v.begin(), v.end());
             break;
         }

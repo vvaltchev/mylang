@@ -65,6 +65,9 @@ def value(r):
         if kind == 5: return [r.raw() for _ in range(n)]
         if kind == 4:                             # structs: def, stride, bytes
             r.sref(); stride = r.u32(); r.p += n * stride; return '<structarr>'
+        if kind == 6:                             # objs (v34): cls / none
+            return [value(r) for _ in range(n)]
+        assert kind == 0, 'bad array storage kind %d' % kind
         return [value(r) for _ in range(n)]       # 0 general
     if t == 6:                                    # dict
         r.boolv()

@@ -209,6 +209,16 @@ bool cyc_any_child(const EvalValue &v, F f)
 
     case Type::t_arr: {
         const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+        if (a.skind() == SharedArrayObj::Storage::objs) {
+            /* the flat class storage: its class instances (not keyed
+             * itself - a cycle through it passes through one of them) */
+            const auto &ov = a.flat_objs();
+            for (size_type i = 0; i < a.size(); i++)
+                if (StructObject *p = ov[a.offset() + i])
+                    if (g(obj_elem_value(p)))
+                        return true;
+            return false;
+        }
         if (a.skind() != SharedArrayObj::Storage::general)
             return false;
         const ArrayConstView view = a.get_view();

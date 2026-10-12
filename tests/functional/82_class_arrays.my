@@ -1,0 +1,193 @@
+# An array<C> of a class C stores one REFERENCE per element (README
+# "Classes", array_storage "class"): reading an element gives the instance
+# itself, so a write through it is seen by every holder; `none` is a null
+# reference in an array<opt C>. The flat storage is TYPE-driven (the
+# destination's static type), and every operation without a flat case
+# turns it into a general array in place - which must change no answer.
+# The loops run long enough for the JIT's element tiers, which decline
+# this storage to their helpers. runtime() keeps values out of folding.
+
+class Node { int v; opt Node next; }
+class Leaf { str name; }
+struct P { int x; }
+
+func ri(int v) => int(runtime(v));
+
+# 1. a literal of class instances is flat by its VALUES; an empty `[]`
+#    and an annotated declaration by the destination's TYPE (so not under
+#    -nti, which has no types - printed, not asserted; the -rt `class:`
+#    cases assert them)
+var a = [Node(ri(1), none), Node(ri(2), none), Node(ri(3), none)];
+var e = [];
+append(e, a[0]);
+array<Node> d = [];
+array<Node?> o = [none, a[1]];
+assert(array_storage(a) == "class");
+print(array_storage(e), array_storage(d), array_storage(o));
+
+# 2. an element is the instance: writes through it are shared
+var x = a[0];
+x.v = 10;
+assert(a[0].v == 10 && e[0].v == 10 && e[0] == a[0]);
+for (var i = 0; i < 200; i++)
+    a[i % 3].v += 1;
+assert(a[0].v == 77 && a[1].v == 69 && a[2].v == 69);
+a[2].next = a[0];
+var nn = a[2].next;
+if (nn != none)
+    assert(nn == a[0] && nn.v == 77);
+
+# 3. element stores, append, pop, len, foreach, indexed foreach
+a[1] = Node(ri(5), none);
+assert(a[1].v == 5 && o[1]?.v == 69);       # o still holds the old one
+var tot = 0;
+foreach (var n in a)
+    tot += n.v;
+assert(tot == 77 + 5 + 69);
+foreach (var n in a)
+    n.v = n.v * 2;
+assert(a[0].v == 154 && e[0].v == 154);
+foreach (var k, n in indexed a)
+    assert(n == a[k]);
+for (var i = 0; i < 50; i++)
+    append(d, Node(ri(i), none));
+assert(len(d) == 50 && d[49].v == 49);
+var last = pop(d);
+assert(last.v == 49 && len(d) == 49);
+
+# 3b. a store through an element's class-typed field, an inc-dec, and
+#     an element stored over itself (its only reference)
+class Wrap { Node n; }
+var ws = [Wrap(Node(ri(1), none)), Wrap(Node(ri(2), none))];
+for (var i = 0; i < 100; i++)
+    ws[i % 2].n.v += 2;
+ws[0].n.v++;
+++ws[1].n.v;
+assert(ws[0].n.v == 102 && ws[1].n.v == 103);
+var ln = [Node(ri(4), none)];
+for (var i = 0; i < 100; i++) {
+    ln[0] = ln[0];
+    ln[0].v++;
+}
+assert(ln[0].v == 104);
+
+# 4. null references
+o[0] = none;
+assert(o[0] == none && o[1] != none);
+var cnt = 0;
+foreach (var m in o)
+    if (m == none)
+        cnt++;
+assert(cnt == 1);
+append(o, none);
+assert(len(o) == 3 && o[2] == none);
+
+# 5. aliasing, ==, hash, a dict keyed by identity, printing
+var b = a;
+append(b, Node(ri(4), none));
+assert(len(a) == 4 && b == a);
+assert(a != [Node(154, none), a[1], a[2], a[3]]);   # equal fields, not ==
+var dd = {};
+dd[a[0]] = "first";
+a[0].v = -1;
+assert(dd[a[0]] == "first");
+assert(hash(a) == hash(b));
+assert(str([Leaf("p"), none]) == "[Leaf(name: \"p\"), <none>]");
+
+# 6. slices share the instances; a write to the array detaches the view
+var s = a[1:3];
+assert(len(s) == 2 && s[0] == a[1]);
+s[0].v = 500;
+assert(a[1].v == 500);
+a[1] = Node(ri(7), none);
+assert(s[0].v == 500 && a[1].v == 7);
+
+# 7. cold ops promote in place - the aliases keep seeing one array
+var c = [Node(ri(3), none), Node(ri(1), none), Node(ri(2), none)];
+var c2 = c;
+sort(c, func (p, q) => p.v < q.v);
+assert(c2[0].v == 1 && c2[2].v == 3);
+insert(c, 1, Node(ri(9), none));
+erase(c2, 0);
+assert(len(c) == 3 && c[0].v == 9 && c2 == c);
+reverse(c);
+assert(c[0].v == 3 && c2[0].v == 3);
+var f = filter(func (q) => q.v > 2, c);
+assert(len(f) == 2 && f[0] == c[0]);
+var mp = map(func (q) => q.v, c);
+assert(mp == [3, 2, 9]);
+assert(find(c, c[1]) == 1);
+
+# 8. a value that is not a class instance, through `dyn`, promotes
+var g = [Node(ri(1), none)];
+var dyn dg = g;
+append(dg, 5);
+assert(len(g) == 2 && g[1] == 5 && array_storage(g) == "general");
+var h = [Leaf("a")];
+var dyn dh = h;
+dh[0] = P(1);
+assert(h[0] == P(1) && array_storage(h) == "general");
+
+# 9. clone shares the instances, deepclone copies them
+var cl = clone(a);
+append(cl, Node(0, none));
+assert(len(a) == 4 && len(cl) == 5 && cl[0] == a[0]);
+var dc = deepclone(a);
+assert(dc[0] != a[0] && dc[0].v == a[0].v && array_storage(dc) == "class");
+
+# 12. a class may hold an array of itself: a tree, its parent references
+#     broken before the end (reference counting cannot free a cycle)
+class Tree { int v; array<Tree> kids; opt Tree parent; }
+func add(Tree t, int v) {
+    var k = Tree(v, [], t);
+    append(t.kids, k);
+    return k;
+}
+var root = Tree(ri(0), [], none);
+for (var i = 1; i <= 3; i++)
+    add(add(root, i), i * 10);
+var tsum = 0;
+foreach (var k in root.kids) {
+    tsum += k.v;
+    foreach (var g in k.kids) {
+        tsum += g.v;
+        var gp = g.parent;
+        if (gp != none)
+            assert(gp == k);
+    }
+}
+assert(tsum == 66 && len(root.kids[2].kids) == 1);
+foreach (var k in root.kids) {
+    k.parent = none;
+    foreach (var g in k.kids)
+        g.parent = none;
+}
+
+# 10. a constant array of classes is read-only, its instances too
+const K = [Node(1, none), Node(2, none)];
+var caught = 0;
+var ka = K;
+try { ka[0].v = 5; } catch (CannotChangeConstEx) { caught++; }
+var k1 = ka[1];
+try { k1.v = 5; } catch (CannotChangeConstEx) { caught++; }
+try { append(ka, Node(3, none)); } catch (CannotChangeConstEx) { caught++; }
+assert(caught == 3 && K[0].v == 1 && len(K) == 2);
+var mk = [K[0], K[1]];
+assert(array_storage(mk) == "class" && mk[0] == K[0]);
+
+# 11. an array of classes in a struct, a dict, a capture
+struct Holder { array<Node> ns; }
+var hd = Holder([Node(ri(1), none)]);
+var hd2 = hd;
+hd2.ns[0].v = 42;
+assert(hd.ns[0].v == 42);
+var dv = {"k": [Node(ri(1), none)]};
+dv["k"][0].v = 8;
+assert(dv["k"][0].v == 8);
+var cap = [Node(ri(1), none)];
+var bump = func [cap] () { cap[0].v += 1; };
+bump();
+bump();
+assert(cap[0].v == 3);
+
+print("ok");

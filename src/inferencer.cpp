@@ -2024,6 +2024,13 @@ void Inferencer::infer_one(Block *rootBlock)
 
             case Type::t_arr: {
                 const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
+                if (arr.skind() == SharedArrayObj::Storage::objs) {
+                    /* class instances: their fields may hold one */
+                    for (size_type i = 0; i < arr.size(); i++)
+                        keep_in_value(obj_elem_value(
+                            arr.flat_objs()[arr.offset() + i]));
+                    break;
+                }
                 if (arr.skind() != SharedArrayObj::Storage::general)
                     break;
                 ArrayConstView view = arr.get_view();
@@ -3344,6 +3351,12 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
             /* array<POD struct>: flat storage (the def lets even an empty
              * `[]` start flat); a boxed-struct array stays general. */
             hint = ArrHint::flat_s;
+        else if (el->kind == StaticTypeKind::Struct &&
+                 static_cast<const StructTypeDef *>(el->struct_def) &&
+                 static_cast<const StructTypeDef *>(el->struct_def)->is_class)
+            /* array<C> / array<opt C> of a class: the flat CLASS storage,
+             * one reference per element (null for none) */
+            hint = ArrHint::flat_c;
         else if (!el->opt && el->kind == StaticTypeKind::Str)
             /* array<str> (top-10 #7): NO hint - the value keeps its natural
              * storage (a split()/keys() result stays FLAT strs; a plain
@@ -3365,6 +3378,7 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
                        : hint == ArrHint::flat_f ? "flat (floats)"
                        : hint == ArrHint::flat_b ? "flat (bools)"
                        : hint == ArrHint::flat_s ? "flat (structs)"
+                       : hint == ArrHint::flat_c ? "flat (classes)"
                                                  : "general";
         TRACE(arrays, 0, std::string(id->get_str()) + "  dest " +
               static_type_to_string(ty) + " -> " + hn);
@@ -4062,6 +4076,21 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
             }
             if (arr.skind() == SharedArrayObj::Storage::strs)
                 return A.array_of(A.str_ty());
+            if (arr.skind() == SharedArrayObj::Storage::objs) {
+                /* class references: the join of the elements' types */
+                const size_type n = arr.size();
+                if (n == 0)
+                    return A.array_of(A.none_ty());
+                const auto &ov = arr.flat_objs();
+                StaticTypeRef el = static_type_from_value(
+                    obj_elem_value(ov[arr.offset()]));
+                for (size_type i = 1; i < n; i++) {
+                    StaticTypeRef j = A.join(el, static_type_from_value(
+                        obj_elem_value(ov[arr.offset() + i])));
+                    el = j ? j : A.dyn_ty();
+                }
+                return A.array_of(el);
+            }
 
             ArrayConstView view = arr.get_view();
             if (view.size() == 0)

@@ -133,8 +133,10 @@ REFERENCE SEMANTICS*). Decisions taken on the way, for review:
   `; class NAME`.
 - `deepclone` copies every class instance it reaches once per REFERENCE,
   like everything else it copies - two references to one instance become two
-  copies. Whether it should keep sharing (Python's `deepcopy` does) is
-  open, and waits on the cycle-safe walk (plans/reference-cycles.md, A).
+  copies - except along a cycle, whose back edge the cycle guard
+  (plans/reference-cycles.md, part A, landed 2026-10-08) links to the copy
+  in progress, so a ring copies to a ring. Whether it should keep sharing
+  everywhere (Python's `deepcopy` does) is still open.
 
 Two pre-existing bugs found and fixed on the way, each its own commit: the
 loop transforms decided invariance by name while arrays and dicts are
@@ -142,7 +144,7 @@ references, and a struct's hash was salted with its def's address. A third
 was fixed in this step: a struct's `const` member could not hold a struct
 construction (its initializer was not parsed as a constant's).
 
-## Step 2 design - `array<C>` as a flat vector of references
+## Step 2 design - `array<C>` as a flat vector of references (DONE)
 
 A new `SharedObject::Storage::objs`: a vector of `StructObject *`, each
 an owned reference (sharedarray.h cannot see `StructObject` complete, so
@@ -179,6 +181,42 @@ every engine and lever, `array_storage` checks that the flat kind is
 really chosen (else the test is vacuous), promotion by every cold op,
 a `dyn` alias storing a non-instance, and a `.myv` round trip of a
 constant `array<C>`.
+
+## Step 2 as built (2026-10-08)
+
+As designed above, with these decisions:
+
+- **Any class instance fits, of any class.** The storage holds references,
+  so it needs no element def; an element reads back as the instance with
+  its own def. Only a value that is not a class instance or `none` (through
+  a `dyn` alias) promotes.
+- **A literal of class instances is flat by its VALUES too** (mode 6 of
+  `build_array_from_values`), as a literal of POD structs is: a constant's
+  array literal is built before inference, so only its values can make it
+  flat, and that is what puts the `objs` record into a `.myv` image.
+- **A store through an element needs no LValue**: a class instance read as
+  a value is a location (`store_rooted`, `vm_member_lvalue_ref`, the chain
+  store's final member step), refused with `CannotChangeConstEx` for a
+  constant's - so `a[i].v = 5` works for any array, flat or not.
+- **A class (or struct) may name itself in a field's annotation**:
+  `class Tree { array<Tree> kids; }`. Without it the canonical tree did not
+  parse ("'Tree' is not a type").
+- **Not built: the hint at a constructor or call argument.** `Tree(v, [],
+  p)` builds its `[]` general - only a declaration's or an assignment's
+  destination type stamps a hint, for every flat kind. Correct either way;
+  extending the hint to typed fields and parameters is a separate
+  (performance) change for all flat kinds.
+- `-nti` has no types, so a type-driven `array<C>` is general there (a
+  literal of instances is still flat): the functional test prints those
+  storages instead of asserting them, the `-rt` `class:` cases assert.
+
+Bugs found and fixed on the way, each its own commit: `+=` on a flat array
+built a fresh array whenever the left side was not general (a flat string
+or struct array lost its aliases; a flat scalar array through `dyn` took a
+value it cannot hold); `sum()` of a flat struct array was an
+InternalErrorEx. Fixed in this step's own commit: the `.myv` writer's
+general-array arm applied a slice's offset twice (latent - no slice
+reaches the writer).
 
 ## Corrections to plans/struct-value-semantics.md
 

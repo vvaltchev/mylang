@@ -2,8 +2,12 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 33.  This document describes the on-disk image exhaustively:
+Format version 34.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v34: an array's storage kind (11.1, section 13) gains `6 objs` - the flat
+CLASS storage, one class reference per element - and ArrHint gains
+`6 flat_c`.)
 
 (v33: a StructDef (7.1) gains `is_class` after its name, and the value codec
 a tenth tag, `cls` (11.4) - a class instance, written once and then referred
@@ -1068,6 +1072,8 @@ constant 'S.K'" - and writes no file.  A reader therefore never meets one.
         bools     n x bool
         strs      n x str
         structs   sref def; u32 stride; then n*stride RAW BYTES
+        objs      n x value (v34), each a `cls` record (11.4) or `none`,
+                  else "corrupt .myv (class array element)"
         general   n x value
 
 The STORAGE KIND round-trips, because `array_storage()` is script-observable:
@@ -1248,6 +1254,7 @@ same is true of OpCode and Op, which appear in every instruction.)
 
     Storage (sharedarray.h)
         0 general   1 ints   2 floats   3 bools   4 structs   5 strs
+        6 objs (v34)
 
     FieldKind (structtype.h)
         0 f_bool  1 f_int  2 f_float  3 f_str  4 f_array  5 f_dict
@@ -1261,6 +1268,7 @@ same is true of OpCode and Op, which appear in every instruction.)
 
     ArrHint (syntax.h)
         0 dflt  1 general  2 flat_i  3 flat_f  4 flat_b  5 flat_s
+        6 flat_c (v34)
 
     ThrowKind (bytecode.h)
         0 undefined_var  1 not_lvalue  2 bad_args

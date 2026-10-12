@@ -2558,6 +2558,15 @@ bump(a);                # a.val is 102: the function wrote the caller's object
   a new object, so the call cannot be folded or shared. `pure func mk() =>
   Node(1, none);` is a compile error, and a plain function that constructs one
   is never inferred pure.
+- **An array of class instances holds references.** An `array<Node>` (or
+  `array<Node?>`, whose elements may be `none`) stores one reference per
+  element, not a copy, so `arr[i].val = 2` writes the instance every other
+  holder sees, and `var x = arr[i]` is that instance too. A class may hold an
+  array of itself: `class Tree { int v; array<Tree> kids; opt Tree parent; }`
+  (the class's own name is a type inside its declaration). Such an array is
+  stored compactly (`array_storage` reports `"class"`); storing anything else
+  in it through a `dyn` alias turns it into an ordinary array first - no
+  behavior changes.
 - `kindstr(c)` is `"class"`; `typestr(c)` is the class's name.
 
 A class instance can refer to itself, directly or through others
@@ -3281,10 +3290,11 @@ copies, so a forgotten release changes no value).
 
 #### `array_storage(array)`
 Return the array's internal storage, named by the element type: `"int"`,
-`"float"`, `"bool"`, `"struct"`, or `"str"` for a compact *flat* (unboxed)
-array (8 bytes per element for int/float, **one byte** per element for bool,
-packed C structs for `struct`, 24-byte shared string handles for `"str"`), or
-`"general"` for the boxed representation otherwise. This is purely an
+`"float"`, `"bool"`, `"struct"`, `"str"` or `"class"` for a compact *flat*
+(unboxed) array (8 bytes per element for int/float, **one byte** per element
+for bool, packed C structs for `struct`, 24-byte shared string handles for
+`"str"`, one 8-byte reference per class instance for `"class"` - `none` is a
+null reference), or `"general"` for the boxed representation otherwise. This is purely an
 introspection aid (mainly for tests) — flat and general arrays behave
 identically; the only observable difference is speed and memory.
 
@@ -3293,6 +3303,12 @@ string dict's `keys()`/`values()` produce them. Unlike the type-driven flat
 scalars, a flat string array never rejects a mutation — writing a non-string
 element (or any operation without a flat fast path) silently converts it to
 the `"general"` representation first (the same model as `"struct"` arrays).
+A **class** array (`"class"`) follows the same model: an `array<C>` of a
+class `C` is born flat from its type (or from a literal of class instances),
+and a value that is neither a class instance nor `none`, or an operation
+without a flat fast path (`sort`, `insert`, `erase`, ...), converts it to
+`"general"` first. A conversion happens in place, so every alias of the array
+sees the same array afterwards.
 
 An array's storage is **decided once, at creation, from its proven static
 type** — it is never converted afterward (no runtime "promotion", so no
