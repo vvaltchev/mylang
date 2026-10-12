@@ -7,8 +7,11 @@
 # values, each walked). The parameters are reached through a dyn callee
 # (the generic call op checks every bind) and directly; the verdicts are
 # asserted, so a check that lets a misfit through, or refuses a value
-# that fits, fails the unit. README, "A dyn value entering a typed
-# place".
+# that fits, fails the unit. Then the places #49 leaves to `*` (a box
+# stored through a dyn alias), which calls the inferencer marks for a
+# check (a construction, a builtin, a function value, a dyn callee), and
+# a store into each annotation kind. README, "A dyn value entering a
+# typed place".
 struct P { int x; }
 struct Q { int x; }
 struct Egg { int x; }
@@ -221,3 +224,110 @@ foreach (var t in trail)
     if (endswith(t, " no"))
         nos++;
 print(len(trail), nos);
+
+# a box reached through a dyn alias of a typed array is not checked where
+# it is stored (README: a container reached through a dyn NAME is not a
+# typed place) - so `*` checks the box it reads: an int box, a float, a
+# bool, a str and a struct one, each given every other kind
+array<box<int>> bxi = [box(1)];
+array<box<float>> bxf = [box(1.5)];
+array<box<bool>> bxb = [box(true)];
+array<box<str>> bxs = [box("s")];
+array<box<P>> bxp = [box(P(1))];
+var dyn dxi = bxi;
+var dyn dxf = bxf;
+var dyn dxb = bxb;
+var dyn dxs = bxs;
+var dyn dxp = bxp;
+var derefs = [];
+func deref(dyn f) {
+    try { append(derefs, str(f())); }
+    catch (TypeErrorEx) { append(derefs, "no"); }
+}
+var kinds = [box(7), box(2.5), box(false), box("t"), box(P(4)),
+             box(Q(5)), P(6), 8];
+foreach (var k in kinds) {
+    dxi[0] = k;
+    deref(func () => *bxi[0]);
+    dxf[0] = k;
+    deref(func () => *bxf[0]);
+    dxb[0] = k;
+    deref(func () => *bxb[0]);
+    dxs[0] = k;
+    deref(func () => *bxs[0]);
+    dxp[0] = k;
+    deref(func () => (*bxp[0]).x);
+}
+assert(derefs == ["7", "no", "no", "no", "no", "no", "2.500000", "no",
+    "no", "no", "no", "no", "false", "no", "no", "no", "no", "no", "t", "no",
+    "no", "no", "no", "no", "4", "no", "no", "no", "no", "no", "no", "no",
+    "no", "no", "no", "no", "no", "no", "no", "no"]);
+print(derefs);
+
+# which calls need a check (CallExpr::fit_args): a construction, a
+# builtin, a function VALUE of a known type, a dyn callee
+struct S { array<int> v; dyn any; dict<str, int> m; }
+func fa(array<int> a) => len(a);
+func fd(dict<str, dyn> d) => len(d);
+func fk(dict<dyn, int> d) => len(d);
+func fy(dyn x) => 1;
+var calls = [];
+func run(str name, dyn f) {
+    try { append(calls, name + "=" + str(f())); }
+    catch (TypeErrorEx) { append(calls, name + "=no"); }
+}
+func probes(dyn d, dyn k) {
+    run("s-dyn", func [d] () => len(S(d, 1, {}).v));
+    run("s-typed", func () => len(S([1, 2], 1, {"a": 1}).v));
+    run("s-dynm", func [d] () => len(S([1], 1, d).m));
+    run("len", func [d] () => len(d));
+    var fs = [fa];
+    run("fv-dyn", func [fs, d] () => fs[0](d));
+    run("fv-typed", func [fs] () => fs[0]([1, 2, 3]));
+    var gs = [fd];
+    run("fv-dict", func [gs, k] () => gs[0](k));
+    var ks = [fk];
+    run("fv-dkey", func [ks, k] () => ks[0](k));
+    var hs = [fy];
+    run("fv-anyp", func [hs, d] () => hs[0](d));
+    var dyn hh = fa;
+    run("dyncallee", func [hh, d] () => hh(d));
+    dict<str, int> si = {"a": 1};
+    dict<dyn, int> dk = {k: 1};
+    dict<str, dyn> dv = {"a": d};
+    run("dk-into", func [dk] () => fk(dk));
+    run("dv-into", func [dv] () => fd(dv));
+    run("si-into", func [si] () => fd(si));
+}
+probes(runtime(["s"]), runtime({"a": 1}));
+probes(runtime([5]), runtime(5));
+assert(calls == ["s-dyn=no", "s-typed=2", "s-dynm=no", "len=1",
+    "fv-dyn=no", "fv-typed=3", "fv-dict=1", "fv-dkey=1", "fv-anyp=1",
+    "dyncallee=no", "dk-into=1", "dv-into=1", "si-into=1", "s-dyn=1",
+    "s-typed=2", "s-dynm=no", "len=1", "fv-dyn=1", "fv-typed=3",
+    "fv-dict=no", "fv-dkey=no", "fv-anyp=1", "dyncallee=1", "dk-into=1",
+    "dv-into=1", "si-into=1"]);
+print(calls);
+
+# a store into an element or a dict value of each annotation kind
+func store_kinds(dyn d) {
+    var r = [];
+    array<array<float>> af2 = [[1.5]];
+    try { af2[0] = d; append(r, "f"); } catch (TypeErrorEx) { }
+    array<array<bool>> ab2 = [[true]];
+    try { ab2[0] = d; append(r, "b"); } catch (TypeErrorEx) { }
+    dict<str, P> mp = {};
+    try { mp["k"] = d; append(r, "p"); } catch (TypeErrorEx) { }
+    array<box<int>> abx = [box(1)];
+    try { abx[0] = d; append(r, "x"); } catch (TypeErrorEx) { }
+    array<box<P>> abp = [box(P(1))];
+    try { abp[0] = d; append(r, "q"); } catch (TypeErrorEx) { }
+    array<array<dyn>> ad2 = [[1]];
+    try { ad2[0] = d; append(r, "d"); } catch (TypeErrorEx) { }
+    return r;
+}
+var sk = [store_kinds(runtime([1.5])), store_kinds(runtime([true])),
+          store_kinds(runtime(P(1))), store_kinds(runtime(box(1))),
+          store_kinds(runtime(box(P(2)))), store_kinds(runtime(5))];
+assert(sk == [["f", "d"], ["b", "d"], ["p"], ["x"], ["q"], []]);
+print(sk);

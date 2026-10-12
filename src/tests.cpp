@@ -34726,6 +34726,226 @@ static bool myv_fit_round_trip()
 }
 
 /*
+ * THE -vd DUMP OF EVERY OPCODE FAMILY A PROGRAM REACHES (JIT off, so no
+ * op is deleted into a fragment): float and fused int arithmetic, try /
+ * catch / rethrow / finally, the dict and dyn iterators, the unpacks, a
+ * struct element bind, slices, the store and inc-dec chains, member
+ * stores, the in-place builtin forms, the #49 checks, closures and
+ * captures, boxes, `defined`, a const declaration. The rows were never
+ * printed by any test - the dump is the instrument a reader trusts for
+ * what codegen emitted, so each must at least render. The program's
+ * output is checked too (every engine agrees on it).
+ */
+static bool disasm_opcode_families()
+{
+    const char *lines_arr[] = {
+        "struct P { int x; float y; }",
+        "struct In { array<int> xs; P p; }",
+        "struct Out { In i; array<In> ins; }",
+        "class C { int n; }",
+        "func fl(float a, float b) {",
+        "    var s = a * b + a / b - a;",
+        "    if (s < 1.5) s = s + 1.0;",
+        "    return s;",
+        "}",
+        "func ints(int a, int b) {",
+        "    var r = (a + b) % 7;",
+        "    var t = a;",
+        "    t += 3;",
+        "    return r + t;",
+        "}",
+        "func tries(int k) {",
+        "    var out = 0;",
+        "    try {",
+        "        try { if (k > 1) throw P(k, 1.0); out = 1; }",
+        "        catch (P as e) { out = e.x; rethrow; }",
+        "        finally { out += 100; }",
+        "    } catch (P) { out += 1000; }",
+        "    return out;",
+        "}",
+        "func dicts(dict<str, int> d) {",
+        "    var s = 0;",
+        "    foreach (var k, v in d) s += v;",
+        "    foreach (var k in d) s += len(k);",
+        "    return s;",
+        "}",
+        "func dyns(dyn x) {",
+        "    var s = 0;",
+        "    foreach (var e in x) s += 1;",
+        "    foreach (var a, b in runtime([[1, 2], [3, 4]])) s += a + b;",
+        "    return s;",
+        "}",
+        "func strs(str s) {",
+        "    var n = 0;",
+        "    for (var i = 0; i < len(s); i++)",
+        "        if (s[i] == \"a\") n++;",
+        "    return n + len(s[1:3]) + len(s[runtime(1):])",
+        "           + len(s[:runtime(2)]);",
+        "}",
+        "func flags(array<bool> b) {",
+        "    var n = 0;",
+        "    for (var i = 0; i < len(b); i++)",
+        "        if (b[i]) n++;",
+        "    return n;",
+        "}",
+        "func structs(array<P> ps) {",
+        "    var t = 0.0;",
+        "    foreach (var p in ps) { var q = p; t += q.y; }",
+        "    var m = [P(1, 1.0), P(2, 2.0)];",
+        "    m[0].x = 5;",
+        "    m[1].x++;",
+        "    return t + m[0].x + m[1].x;",
+        "}",
+        "func stores(Out o, dyn d) {",
+        "    o.i.xs[0] = 7;",
+        "    o.i.p.x += 2;",
+        "    o.ins[0].xs[0]++;",
+        "    o.i.xs[0]--;",
+        "    var aa = [[1, 2], [3, 4]];",
+        "    aa[1][0] = 9;",
+        "    aa[0][1] += 1;",
+        "    d[0] = 1;",
+        "    d[1]++;",
+        "    var dd = {\"a\": {\"b\": 1}};",
+        "    dd[\"a\"][\"b\"] += 2;",
+        "    sort(o.i.xs);",
+        "    append(o.ins[0].xs, 3);",
+        "    return aa[1][0] + o.i.xs[0] + dd[\"a\"][\"b\"];",
+        "}",
+        "func multi(dyn v) {",
+        "    var dyn a, b = v;",
+        "    var c, d = [1, 2];",
+        "    c, d = [d, c];",
+        "    return a + b + c + d;",
+        "}",
+        "func caps(int n) {",
+        "    var k = n;",
+        "    var f = func [k] () { k += 1; return k; };",
+        "    f();",
+        "    return f();",
+        "}",
+        "func logic(dyn a, dyn b) {",
+        "    var x = a && b || !a;",
+        "    var dyn y = a ?? b;",
+        "    var dyn z = runtime(none);",
+        "    var dyn w = z?.x;",
+        "    return [x, y, w];",
+        "}",
+        "func checks(dyn f) => f(1);",
+        "var gg = 1;",
+        "func defs() => defined(gg) && isbound(gg);",
+        "const K = [1, 2];",
+        "func cons() { const L = K; return len(L); }",
+        "func throws() { throw P(1, 2.0); }",
+        "func arrs(int n) {",
+        "    var ps = [P(n, 1.0), P(n + 1, 2.0)];",
+        "    var a = [n, n + 1];",
+        "    var b = [1.5, 2.5];",
+        "    var ds = {\"k\": n};",
+        "    var bx = box(n);",
+        "    *bx = *bx + 1;",
+        "    return len(ps) + len(a) + len(b) + len(ds) + *bx;",
+        "}",
+        "print(fl(2.0, 3.0), ints(3, 4), tries(1), tries(2),",
+        "      dicts({\"a\": 1}));",
+        "print(dyns(runtime([1, 2])), strs(\"abca\"),",
+        "      flags([true, false, true]));",
+        "print(structs([P(1, 1.5)]));",
+        "print(stores(Out(In([1], P(1, 1.0)), [In([5], P(2, 2.0))]),",
+        "             runtime([0, 0])));",
+        "print(multi(runtime([1, 2])), caps(3),",
+        "      logic(runtime(true), runtime(1)));",
+        "print(checks(runtime(func(x) => x + 1)), defs(), cons(), arrs(2));",
+        "try { throws(); } catch (P) { print(\"p\"); }",
+        "func rows(dyn x) { array<dyn> r = [x]; return r; }",
+        "func more(dyn d, dyn f, str s, array<bool> bs) {",
+        "    array<int> v = [1];",
+        "    try { v = rows(d); } catch (TypeErrorEx) { }",
+        "    array<array<int>> aa = [[1, 2], [3, 4]];",
+        "    try { aa[0] = d; } catch (TypeErrorEx) { }",
+        "    var p = P(1, 1.0);",
+        "    p.x = 3;",
+        "    var dyn dp = runtime(P(1, 1.0));",
+        "    dp.x++;",
+        "    var dyn dv = runtime([1, 2]);",
+        "    dv[0]++;",
+        "    var a3 = [[[1, 2]], [[3, 4]]];",
+        "    a3[1][0][1] = 5;",
+        "    a3[0][0][0] += 1;",
+        "    var n = 0;",
+        "    foreach (var e in aa[1]) { n += e + len(rows(e)); }",
+        "    var pairs = [[1, 2], [3, 4]];",
+        "    foreach (var x, y in pairs) n += x * y;",
+        "    var c = s[1];",
+        "    var bb = bs[0];",
+        "    append(aa[0], 5);",
+        "    var m = map(f, [1, 2]);",
+        "    return [len(v), p.x, dp.x, dv[0], a3[1][0][1], n, c, bb,",
+        "            len(aa[0]), m];",
+        "}",
+        "print(more(runtime([5]), runtime(func(x) => x + 1), \"abc\",",
+        "           [true, false]));"
+    };
+    std::string src;
+    for (const char *l : lines_arr) {
+        if (!src.empty()) src += '\n';
+        src += l;
+    }
+    const std::string want =
+        "4.666667 6 101 1102 2 \n12 9 2 \n9.500000 \n18 \n"
+        "6 5 [true, true, <none>] \n2 true 2 10 \np \n"
+        "[1, 3, 2, 2, 5, 23, \"b\", true, 2, [2, 3]] \n";
+    bool ok = true;
+    const std::string got = myv_test_stdout(src, nullptr);
+    if (got != want) {
+        fprintf(stderr, "disasm-families: the program printed\n%s\n",
+                got.c_str());
+        ok = false;
+    }
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        const Block *blk = dynamic_cast<const Block *>(root.get());
+        const bool jit_was = g_jit_enabled;
+        g_jit_enabled = false;
+        const std::string dump = blk ? disassemble_program(blk) : "";
+        g_jit_enabled = jit_was;
+        for (const char *need : {
+                 " i.bin ", " f.bin ", " f.jmp.ifnot ", " i.addmod ",
+                 " try.push ", " try.pop\n", " set.pend ", " end.finally ",
+                 " rethrow ", " throw ", " dict.iter.i ", " dict.iter.n ",
+                 " fe.dyn.init ", " fe.dyn.next ", " multi.unpack ",
+                 " unpack.elem.i ", " load.selem ", " slice.v ",
+                 " store.lvchain ", " store.elem2 ", " store.chain ",
+                 " incdec.chain ", " incdec.elem ", " incdec.membr ",
+                 " member.store ", " call.blt.lve ", " call.blt.lvm ",
+                 " check.fit ", " check.func ", " check.call ",
+                 " check.none ", " make.dict ", " make.structarr ",
+                 " compound.v ", " log.v ", " jmp.notnone ",
+                 " defined.g ", " decl.const ", " store.cap ",
+                 " load.capture ", " make.closure ", " call.val.dyn ",
+                 " store.box ", " load.box ", " jmp.ifnotel ",
+                 " coerce.num " })
+            if (dump.find(need) == std::string::npos) {
+                fprintf(stderr, "disasm-families: -vd has no '%s':\n%s\n",
+                        need, dump.c_str());
+                ok = false;
+                break;
+            }
+    } catch (Exception &e) {
+        fprintf(stderr, "disasm-families: threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    return ok;
+}
+
+/*
  * A SOURCE PATH THAT NAMES A DIRECTORY. A directory opens fine on POSIX
  * and then fails every read with EISDIR - and libstdc++'s filebuf THROWS
  * from underflow when read(2) fails, past every istream's error state,
@@ -57279,6 +57499,8 @@ static const std::vector<extra_check> extra_checks =
     { "myv: #49's fit checks of every annotation and place survive an "
       "image (v37)",
       myv_fit_round_trip },
+    { "disasm: the -vd dump renders every opcode family a program reaches",
+      disasm_opcode_families },
     { "myv: an UNTRUSTED image's out-of-range field index is caught (#137)",
       myv_untrusted_field_index },
     { "myv: a WRONG-TYPED base does not take the process down (#142)",

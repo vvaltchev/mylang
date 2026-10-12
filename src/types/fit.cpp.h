@@ -75,12 +75,12 @@ std::string fit_kind_text(const EvalValue &v)
         return o.def->name->val;
     }
     if (v.is<intrusive_ptr<BoxObj>>()) {
+        /* a scalar box holds one of four kinds (box_make) */
         switch (v.get_ref<intrusive_ptr<BoxObj>>()->kind) {
         case 'i': return "box<int>";
         case 'f': return "box<float>";
         case 'b': return "box<bool>";
-        case 's': return "box<str>";
-        default:  return "box";
+        default:  return "box<str>";
         }
     }
     return runtime_type_name(v);
@@ -128,7 +128,7 @@ bool fits_elems(const SharedArrayObj &arr, const TypeAnnot *ea, FitWalk &w,
         break;
     }
     case St::objs:
-    case St::general:
+    default:                            /* general */
         if (!w.visit(arr.storage_id(), arr.offset(), n, ea))
             return true;
         for (size_type i = 0; i < n; i++) {
@@ -188,31 +188,47 @@ bool fits_dict(const DictObject &d, const TypeAnnot *ka,
     return true;
 }
 
+/*
+ * `a` is never null: a caller passes a whole annotation, and a container
+ * annotation's elem / key / val are walked only when present (fits_elems,
+ * fits_dict). Each kind tests its value and REPORTS a miss - never
+ * `test || fit_miss(..)`: fit_miss returns false, so its true arm would
+ * be a branch no input takes.
+ */
 bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
           FitMisfit &why)
 {
-    if (!a || a->kind == DeclType::dyn || a->kind == DeclType::none)
+    if (a->kind == DeclType::dyn)
         return true;
-    if (v.is<NoneVal>())
-        return a->opt || fit_miss(v, why);
+    if (v.is<NoneVal>()) {
+        if (a->opt)
+            return true;
+        return fit_miss(v, why);
+    }
+    bool ok;
     switch (a->kind) {
     case DeclType::i:
-        return v.is<int_type>() || fit_miss(v, why);
+        ok = v.is<int_type>();
+        break;
     case DeclType::f:
-        return v.is<float_type>() || fit_miss(v, why);
+        ok = v.is<float_type>();
+        break;
     case DeclType::b:
-        return v.is<bool>() || fit_miss(v, why);
+        ok = v.is<bool>();
+        break;
     case DeclType::s:
-        return v.is<SharedStr>() || fit_miss(v, why);
-    case DeclType::strct: {
-        if (!v.is<intrusive_ptr<StructObject>>())
-            return fit_miss(v, why);
-        const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
-        return (!o.boxed && (!a->strct || o.def == a->strct))
-            || fit_miss(v, why);
-    }
+        ok = v.is<SharedStr>();
+        break;
+    case DeclType::strct:
+        /* the def identity of a struct VALUE (a box<P> has P's def); an
+         * image's annotation with no def fits no struct */
+        ok = v.is<intrusive_ptr<StructObject>>()
+             && !v.get_ref<intrusive_ptr<StructObject>>()->boxed
+             && v.get_ref<intrusive_ptr<StructObject>>()->def == a->strct;
+        break;
     case DeclType::box:
-        return box_fits_annot(v, a) || fit_miss(v, why);
+        ok = box_fits_annot(v, a);
+        break;
     case DeclType::arr:
         if (!v.is<SharedArrayObj>())
             return fit_miss(v, why);
@@ -223,9 +239,12 @@ bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
             return fit_miss(v, why);
         return fits_dict(*v.get_ref<intrusive_ptr<DictObject>>(),
                          a->key.get(), a->val.get(), w, why);
-    default:
+    default:                /* `none`: an image's annotation, no check */
         return true;
     }
+    if (ok)
+        return true;
+    return fit_miss(v, why);
 }
 
 /* "an 'int'" / "a 'str'" / "none" */
@@ -233,9 +252,9 @@ std::string fit_got_phrase(const std::string &got)
 {
     if (got == "none")
         return "none";
-    const char c = got[0];          /* '\0' for an empty string */
-    const bool an = c == 'a' || c == 'e' || c == 'i' || c == 'o'
-                    || c == 'u';
+    /* `got` is a kind's name, never empty; a struct's may be capitalized
+     * ("an 'Egg'") */
+    const bool an = std::strchr("aeiouAEIOU", got[0]) != nullptr;
     return std::string(an ? "an '" : "a '") + got + "'";
 }
 
@@ -281,18 +300,22 @@ TypeErrorEx fit_error(const FitSpec &spec, const FitMisfit &m)
 {
     /* a var or field spec is named by the compile; an image's may not
      * be (the loader does not require it) */
-    const std::string nm = spec.name ? spec.name->val : "?";
+    const char *nm = spec.name ? spec.name->val.c_str() : "?";
     std::string s;
     switch (spec.place) {
     case FitSpec::Place::var:
-        s = "'" + nm + "'";
+        s = "'";
+        s += nm;
+        s += "'";
         break;
     case FitSpec::Place::field:
-        s = "field '" + nm + "'";
+        s = "field '";
+        s += nm;
+        s += "'";
         break;
     case FitSpec::Place::elem:     s = "the element";    break;
     case FitSpec::Place::dict_val: s = "the dict value"; break;
-    case FitSpec::Place::dict_key: s = "the dict key";   break;
+    default:                       s = "the dict key";   break;
     }
     s += " is declared '" + fit_annot_text(*spec.annot) + "' but ";
     s += fit_subject_text(spec.place == FitSpec::Place::dict_key
