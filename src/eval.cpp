@@ -2401,7 +2401,7 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
  * LiteralDict::val_coerce): int/bool -> float, bool -> int; every other
  * value (none included) as it is. The VM applies the same rule with
  * CoerceNumV on the element's run slot. */
-static EvalValue literal_widen(EvalValue v, DeclType dt)
+EvalValue literal_widen(EvalValue v, DeclType dt)
 {
     if (dt == DeclType::f) {
         if (v.is<int_type>())

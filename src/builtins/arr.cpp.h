@@ -571,7 +571,8 @@ static EvalValue append_tw(EvalContext *ctx, ExprList *exprList)
 
     /* Any other value: self-eval it and delegate to the rest-native core (which
      * takes an AST-free ArgLocs - build it from the ExprList). */
-    const EvalValue val = RValue(arg1->eval(ctx));
+    const EvalValue val = literal_widen(RValue(arg1->eval(ctx)),
+                                        exprList->widen_of(1));
     ArgLoc locbuf[2];
     ArgLocs al = build_arglocs(exprList, locbuf, 2);
     return builtin_append(ctx, &al, target, &val, 1);

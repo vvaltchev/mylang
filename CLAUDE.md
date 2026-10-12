@@ -4721,6 +4721,11 @@ decisions behind it: `plans/archived/type-inference.md`,
   of another element type is still refused. A typed `const` container
   is widened by the PARSER when it binds it (pExpr14), because a read of
   it folded at parse time (`str(F)`) must see the run's value.
+  A single value an in-place builtin stores (`append`/`push`/`insert`,
+  insert's dict key) widens like an element store's `rv_coerce` (#47):
+  `ExprList::arg_widen`, applied by the tree-walker's lvalue adapters and
+  by a CoerceNumV on the argument's run slot in the VM
+  (`compile_builtin_arg` - every in-place builtin path goes through it).
 - **Const-container types are exact** (`static_type_from_value` recurses): a
   folded
   const array/dict is typed `array<T>`/`dict<K,V>` from its actual elements

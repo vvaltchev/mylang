@@ -3084,10 +3084,32 @@ void Inferencer::annotate_hints(Construct *n)
             const size_t vi = nm == "insert" ? 2 : 1;
             if (builtin && call->args && call->args->elems.size() > vi
                 && (nm == "append" || nm == "push" || nm == "insert")) {
-                Construct *v = call->args->elems[vi].get();
+                ExprList *al = call->args.get();
+                Construct *v = al->elems[vi].get();
                 if (StaticTypeRef d = literal_into(
-                        v, fixed_elem_dest(call->args->elems[0].get(), false)))
+                        v, fixed_elem_dest(al->elems[0].get(), false)))
                     stamp_literal_into(v, d);
+                /* the value (and an inserted dict key) is STORED: it
+                 * widens to the container's element type as `a[i] = v`
+                 * does (rv_coerce) - a general array<float?> appended an
+                 * int where its static type says float (#47) */
+                const StaticTypeRef bt =
+                    static_type_resolve(type_of(al->elems[0].get()));
+                const auto widen = [&](size_t i, StaticTypeRef to) {
+                    const DeclType w =
+                        numeric_widen(to, type_of(al->elems[i].get()));
+                    if (w == DeclType::none)
+                        return;
+                    if (al->arg_widen.size() <= i)
+                        al->arg_widen.resize(i + 1, DeclType::none);
+                    al->arg_widen[i] = w;
+                };
+                if (bt->kind == StaticTypeKind::Array)
+                    widen(vi, bt->elem);
+                else if (bt->kind == StaticTypeKind::Dict && vi == 2) {
+                    widen(1, bt->key);
+                    widen(2, bt->val);
+                }
             }
         }
         /* ...and one passed for a declared parameter or a struct field */
