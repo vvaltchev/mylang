@@ -441,6 +441,7 @@ private:
     StaticTypeRef literal_dest_type(Expr14 *e);
     StaticTypeRef literal_into(Construct *rv, StaticTypeRef dest);
     void stamp_literal_into(Construct *rv, StaticTypeRef dest);
+    void stamp_literal_repr(Construct *lit, StaticTypeRef dest);
     StaticTypeRef fixed_elem_dest(Construct *base, bool key);
     std::vector<TypeSym *> *known_params(CallExpr *call);
     StaticTypeRef arg_type(Construct *arg, TypeSym *param);
@@ -2811,7 +2812,53 @@ static Construct *store_base_of(Expr14 *e)
     return static_cast<Subscript *>(e->lvalue.get())->what.get();
 }
 
-/* A destination type's numeric shape, for widen_baked_value */
+/*
+ * The storage an array of static type `ty` is built in (README, *flat
+ * storage*): flat int / float / bool for a non-opt such element, flat
+ * structs for a non-opt POD struct, the flat class references for a class
+ * (opt or not), and general for anything else - except array<str>, which
+ * keeps a value's own storage (false: no hint).
+ */
+static bool array_repr_hint(StaticTypeRef ty, ArrHint &hint,
+                            const StructTypeDef *&sdef)
+{
+    sdef = nullptr;
+    ty = static_type_resolve(ty);
+    if (ty->kind != StaticTypeKind::Array)
+        return false;
+    const StaticTypeRef el = static_type_resolve(ty->elem);
+    const auto *sd = static_cast<const StructTypeDef *>(el->struct_def);
+    if (!el->opt && el->kind == StaticTypeKind::Int)
+        hint = ArrHint::flat_i;
+    else if (!el->opt && el->kind == StaticTypeKind::Float)
+        hint = ArrHint::flat_f;
+    else if (!el->opt && el->kind == StaticTypeKind::Bool)
+        hint = ArrHint::flat_b;
+    else if (!el->opt && el->kind == StaticTypeKind::Struct && sd
+             && sd->is_pod()) {
+        /* array<POD struct>: flat storage (the def lets even an empty
+         * `[]` start flat); a boxed-struct array stays general. */
+        hint = ArrHint::flat_s;
+        sdef = sd;
+    } else if (el->kind == StaticTypeKind::Struct && sd && sd->is_class)
+        /* array<C> / array<opt C> of a class: the flat CLASS storage,
+         * one reference per element (null for none) */
+        hint = ArrHint::flat_c;
+    else if (!el->opt && el->kind == StaticTypeKind::Str)
+        /* array<str> (top-10 #7): NO hint - the value keeps its natural
+         * storage (a split()/keys() result stays FLAT strs; a plain
+         * general literal stays general). Forcing `general` here used
+         * to general-ify a baked flat-strs literal; the strs promote-
+         * on-write model makes a later non-string element write safe
+         * without it. */
+        return false;
+    else
+        hint = ArrHint::general;
+    return true;
+}
+
+/* A destination type's shape, for widen_baked_value: its numbers and the
+ * storage of each array in it */
 static void widen_shape_of(StaticTypeRef t, WidenShape &w)
 {
     t = static_type_resolve(t);
@@ -2820,6 +2867,8 @@ static void widen_shape_of(StaticTypeRef t, WidenShape &w)
     case StaticTypeKind::Int:   w.k = 'i'; return;
     case StaticTypeKind::Array:
         w.k = 'a';
+        if (!array_repr_hint(t, w.hint, w.hint_struct))
+            w.hint = ArrHint::dflt;
         w.sub = std::make_unique<WidenShape>();
         widen_shape_of(t->elem, *w.sub);
         return;
@@ -3442,36 +3491,10 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
      * Anything that is neither an array nor `dyn` has no array repr to pick.
      */
     ArrHint hint;
+    const StructTypeDef *sdef = nullptr;
     if (ty->kind == StaticTypeKind::Array) {
-        StaticTypeRef el = static_type_resolve(ty->elem);
-        if (!el->opt && el->kind == StaticTypeKind::Int)
-            hint = ArrHint::flat_i;
-        else if (!el->opt && el->kind == StaticTypeKind::Float)
-            hint = ArrHint::flat_f;
-        else if (!el->opt && el->kind == StaticTypeKind::Bool)
-            hint = ArrHint::flat_b;
-        else if (!el->opt && el->kind == StaticTypeKind::Struct &&
-                 static_cast<const StructTypeDef *>(el->struct_def) &&
-                 static_cast<const StructTypeDef *>(el->struct_def)->is_pod())
-            /* array<POD struct>: flat storage (the def lets even an empty
-             * `[]` start flat); a boxed-struct array stays general. */
-            hint = ArrHint::flat_s;
-        else if (el->kind == StaticTypeKind::Struct &&
-                 static_cast<const StructTypeDef *>(el->struct_def) &&
-                 static_cast<const StructTypeDef *>(el->struct_def)->is_class)
-            /* array<C> / array<opt C> of a class: the flat CLASS storage,
-             * one reference per element (null for none) */
-            hint = ArrHint::flat_c;
-        else if (!el->opt && el->kind == StaticTypeKind::Str)
-            /* array<str> (top-10 #7): NO hint - the value keeps its natural
-             * storage (a split()/keys() result stays FLAT strs; a plain
-             * general literal stays general). Forcing `general` here used
-             * to general-ify a baked flat-strs literal; the strs promote-
-             * on-write model makes a later non-string element write safe
-             * without it. */
+        if (!array_repr_hint(ty, hint, sdef))
             return;
-        else
-            hint = ArrHint::general;
     } else if (ty->kind == StaticTypeKind::Dyn) {
         hint = ArrHint::general;
     } else {
@@ -3488,13 +3511,6 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
         TRACE(arrays, 0, std::string(id->get_str()) + "  dest " +
               static_type_to_string(ty) + " -> " + hn);
     }
-
-    /* the element struct type, needed by an empty flat_s array literal */
-    const StructTypeDef *sdef =
-        hint == ArrHint::flat_s
-            ? static_cast<const StructTypeDef *>(
-                  static_type_resolve(ty->elem)->struct_def)
-            : nullptr;
 
     Construct *rv = e->rvalue.get();
 
@@ -5630,14 +5646,61 @@ StaticTypeRef Inferencer::literal_into(Construct *rv, StaticTypeRef dest)
 void Inferencer::stamp_literal_into(Construct *rv, StaticTypeRef dest)
 {
     if (ctag(rv) == ConstructType::lit_obj) {
-        WidenShape w;
-        widen_shape_of(dest, w);
-        auto *lo = static_cast<LiteralObj *>(rv);
-        lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
+        stamp_literal_repr(rv, dest);    /* the value rebuilt, once */
         return;
     }
     lit_coerce_by_parent.insert(rv);
     stamp_literal_coerce(rv, dest);
+    stamp_literal_repr(rv, dest);
+}
+
+/*
+ * The STORAGE half of stamp_literal_into: a written array literal is built
+ * in the storage its destination type gives it (array_repr_hint), at every
+ * level - `[1.5]` landing in an `array<float?>` is general, so a later
+ * `none` element fits, where its own values would make it flat floats. A
+ * literal baked inside one is rebuilt (widen_baked_value). Only for a
+ * literal literal_fits accepted: each element fits the type it is given.
+ */
+void Inferencer::stamp_literal_repr(Construct *lit, StaticTypeRef dest)
+{
+    if (!lit)
+        return;
+    dest = static_type_resolve(dest);
+    switch (ctag(lit)) {
+    case ConstructType::lit_arr:
+        if (dest->kind == StaticTypeKind::Array) {
+            ArrHint h;
+            const StructTypeDef *sd;
+            if (array_repr_hint(dest, h, sd)) {
+                lit->arr_hint = h;
+                lit->arr_hint_struct = sd;
+            }
+            for (auto &el : static_cast<LiteralArray *>(lit)->elems)
+                stamp_literal_repr(el.get(), dest->elem);
+        }
+        return;
+    case ConstructType::lit_dict:
+        if (dest->kind == StaticTypeKind::Dict)
+            for (auto &kv : static_cast<LiteralDict *>(lit)->elems)
+                stamp_literal_repr(kv->value.get(), dest->val);
+        return;
+    case ConstructType::lit_obj: {
+        auto *lo = static_cast<LiteralObj *>(lit);
+        if (!lo->from_literal)
+            return;
+        WidenShape w;
+        widen_shape_of(dest, w);
+        lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
+        if (w.k == 'a' && w.hint != ArrHint::dflt) {
+            lo->arr_hint = w.hint;
+            lo->arr_hint_struct = w.hint_struct;
+        }
+        return;
+    }
+    default:
+        return;
+    }
 }
 
 /*

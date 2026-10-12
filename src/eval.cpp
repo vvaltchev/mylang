@@ -3237,11 +3237,21 @@ static EvalValue widen_baked_rec(const EvalValue &v, const WidenShape &w,
                            : arr_elem_boxed(a, i);
             any |= c;
         }
-        if (!any)
+        /* ...and the storage its type gives it: [1.5] for an
+         * array<float?> is GENERAL, so a later `none` element fits */
+        using K = SharedArrayObj::Storage;
+        const K want = w.hint == ArrHint::general ? K::general
+                     : w.hint == ArrHint::flat_i ? K::ints
+                     : w.hint == ArrHint::flat_f ? K::floats
+                     : w.hint == ArrHint::flat_b ? K::bools
+                     : w.hint == ArrHint::flat_s ? K::structs
+                     : w.hint == ArrHint::flat_c ? K::objs
+                                                 : a.skind();
+        if (!any && want == a.skind())
             return v;
         changed = true;
         EvalValue r = build_array_from_values(buf.data(), buf.size(),
-                                              ArrHint::dflt, nullptr, false);
+                                              w.hint, w.hint_struct, false);
         if (a.is_readonly())
             r = make_const_clone(r);
         return r;

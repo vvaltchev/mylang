@@ -635,6 +635,10 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     avg([1, 2]);                      # the literal is an array<float>
     const array<float> K = [1, 2];    # a const holds 1.0, 2.0 too
     ```
+    Its **storage** follows the declared type too, at every level: `[1.5]`
+    passed for an `array<float?>` parameter is a general array, so a
+    later `xs[0] = none` fits (built from its own values it would be a
+    flat float array, which holds floats only).
     That is only for a **literal** (a fresh value, written in place): an
     array VARIABLE, a named const or a call's result of another element
     type is a compile error (`var a = [1]; array<float> f = a;`) - arrays

@@ -679,7 +679,9 @@ static bool is_container_literal(const Construct *n)
                  || ctag(n) == ConstructType::lit_dict);
 }
 
-/* A parsed container annotation's numeric shape (widen_baked_value) */
+/* A parsed container annotation's shape (widen_baked_value): its numbers
+ * and the storage of each array in it - the inferencer's array_repr_hint,
+ * read off the annotation (a typed const is bound before inference) */
 static void widen_shape_of_annot(const TypeAnnot *a, WidenShape &w)
 {
     w.k = 0;
@@ -688,11 +690,30 @@ static void widen_shape_of_annot(const TypeAnnot *a, WidenShape &w)
     switch (a->kind) {
     case DeclType::f: w.k = 'f'; return;
     case DeclType::i: w.k = 'i'; return;
-    case DeclType::arr:
+    case DeclType::arr: {
         w.k = 'a';
+        const TypeAnnot *e = a->elem.get();
+        const StructTypeDef *sd =
+            e && e->kind == DeclType::strct ? e->strct : nullptr;
+        if (!e || (!e->opt && e->kind == DeclType::s))
+            w.hint = ArrHint::dflt;          /* a value keeps its own */
+        else if (!e->opt && e->kind == DeclType::i)
+            w.hint = ArrHint::flat_i;
+        else if (!e->opt && e->kind == DeclType::f)
+            w.hint = ArrHint::flat_f;
+        else if (!e->opt && e->kind == DeclType::b)
+            w.hint = ArrHint::flat_b;
+        else if (!e->opt && sd && sd->is_pod()) {
+            w.hint = ArrHint::flat_s;
+            w.hint_struct = sd;
+        } else if (sd && sd->is_class)
+            w.hint = ArrHint::flat_c;
+        else
+            w.hint = ArrHint::general;
         w.sub = make_unique<WidenShape>();
-        widen_shape_of_annot(a->elem.get(), *w.sub);
+        widen_shape_of_annot(e, *w.sub);
         return;
+    }
     case DeclType::dict:
         w.k = 'd';
         w.sub = make_unique<WidenShape>();
