@@ -17166,6 +17166,40 @@ static const std::vector<test> tests =
         "struct S { const O = P(1, 2); const A = [P(3, 4)]; }",
         "var q = S.O; q.x = 9;",
         "assert(S.O.x == 1 && q.x == 9 && S.A[0].y == 4);" } },
+    /* a chain deeper than DESTROY_MAX_DEPTH is freed through the queue
+     * (intrusiveptr.h); tests/functional/92 is the 60000-long version */
+    { "release: a chain deeper than the nesting bound is freed",
+      { "class N { int v; N? next; }",
+        "var h = N(0, none);",
+        "for (var i = 1; i < 200; i++) { h = N(i, h); }",
+        "assert(h.v == 199 && h.next?.v == 198);",
+        "h = N(-1, none);",
+        "var a = []; var d = {};",
+        "for (var i = 0; i < 200; i++) { a = [a]; d = {\"n\": d}; }",
+        "assert(len(a) == 1 && len(d) == 1);",
+        "a = []; d = {};",
+        "assert(h.v == -1 && len(a) == 0 && len(d) == 0);" } },
+    /* the dict's map (orderedmap.h) off its common paths: an erase from
+     * inside a bucket chain, in both orders, keeps the insertion order;
+     * a NaN key equals no key, itself included (README: a NaN compares
+     * unequal to everything), so each store adds one and no read finds
+     * it; a copy keeps every entry */
+    { "dict: erase inside a bucket chain keeps the insertion order",
+      { "var d = {};",
+        "for (var i = 0; i < 300; i++) d[i] = i * 2;",
+        "for (var i = 0; i < 300; i += 2) erase(d, i);",
+        "assert(len(d) == 150 && keys(d)[0] == 1 && keys(d)[149] == 299);",
+        "for (var i = 299; i > 0; i -= 4) erase(d, i);",
+        "var k = keys(d);",
+        "assert(len(k) == 75 && k[0] == 1 && k[1] == 5 && d[5] == 10);",
+        "d[1000] = 7; assert(keys(d)[75] == 1000);" } },
+    { "dict: a NaN key equals no key, itself included",
+      { "var e = {}; e[nan] = 1; e[nan] = 2; e[1.5] = 3;",
+        "assert(len(e) == 3 && str(e) == \"{nan: 1, nan: 2, 1.500000: 3}\");",
+        "var got = 0;",
+        "try { var x = e[nan]; print(x); } catch (KeyNotFoundEx) { got = 1; }",
+        "var c = clone(e); c[nan] = 4;",
+        "assert(got == 1 && len(c) == 4 && len(e) == 3);" } },
     /* ---- class: a struct with REFERENCE semantics (README "Classes") */
     { "class: a copy shares the object; == and hash go by identity",
       { "class C { int v; }",
