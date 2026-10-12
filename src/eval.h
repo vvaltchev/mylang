@@ -1159,6 +1159,18 @@ extern "C" unsigned long g_live_funcobjs;
  */
 EvalValue make_const_clone(const EvalValue &v, bool key = false);
 
+/* A baked constant value widened to a DESTINATION's static type, given as
+ * its numeric shape: `k` 'f' / 'i' a leaf an int or bool widens to, 'a' an
+ * array (its element in `sub`) and 'd' a dict (its value in `sub`, its key
+ * in `key`), 0 anything else. The value is rebuilt where it changes, never
+ * edited (it may be shared). */
+struct WidenShape {
+    char k = 0;
+    std::unique_ptr<WidenShape> sub;
+    std::unique_ptr<WidenShape> key;
+};
+EvalValue widen_baked_value(const EvalValue &v, const WidenShape &s);
+
 /*
  * Mutable copies of an array/dict value (scalars/strings returned as-is):
  *  - make_mutable_clone: fresh mutable top, but read-only (const-backed)

@@ -621,6 +621,26 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     `array<int>` (likewise `array<float>` / `array<bool>` / `array<PodStruct>`),
     so a subsequent `append` stays unboxed. Nesting uses ordinary `<...>` (a
     closing `>>` is split automatically, as in modern C++).
+
+    **A container literal takes the declared type of the place it lands
+    in** - a variable, an element, an `append`/`push`/`insert`, a
+    parameter or a struct field - element by element, so its numbers widen
+    to the declared element type and an element may be `none` where it is
+    `opt`:
+    ```C#
+    array<float> f = [1, 2];          # holds 1.0 and 2.0
+    array<int?> slots = [none, 3];
+    slots[0] = 5; append(slots, 6);   # an int fits an int?
+    func avg(array<float> xs) => sum(xs) / len(xs);
+    avg([1, 2]);                      # the literal is an array<float>
+    const array<float> K = [1, 2];    # a const holds 1.0, 2.0 too
+    ```
+    That is only for a **literal** (a fresh value, written in place): an
+    array VARIABLE, a named const or a call's result of another element
+    type is a compile error (`var a = [1]; array<float> f = a;`) - arrays
+    are references, and widening one would change it for every other name
+    that holds it. Convert it explicitly
+    (`array<float> f = map(func(x) => float(x), a);`).
   * **A `struct` type** pins the variable to that exact type (like a scalar):
     `Point p = Point(3, 4)` is fine, while `Point p = Other(...)` (or a later
     `p = Other(...)`) is a compile error. The struct name is read as a type only
