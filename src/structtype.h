@@ -55,6 +55,29 @@ struct TypeAnnot {
     std::shared_ptr<TypeAnnot> key, val;        /* kind == dict */
 };
 
+/*
+ * #49: a value entering a place whose type is fixed - a parameter, a
+ * declared variable, an element, a field, a dict value or key - from a
+ * `dyn` (or from a container whose element is `dyn`) is checked at run
+ * time against the place's type: what the check compares the value
+ * against (`annot`, the place's type as a run-time annotation - see
+ * value_fits, eval.h), and which place it is, for the message. Built by
+ * the inferencer (Expr14::rv_fit, ExprList::arg_fit) and pooled by
+ * codegen (Chunk::fit_specs); immutable once built, so freely shared.
+ */
+struct FitSpec {
+    enum class Place : unsigned char {
+        var,            /* a declared variable: `name` */
+        field,          /* a struct field: `name` */
+        elem,           /* an array element (a store or an append) */
+        dict_val,       /* a dict value */
+        dict_key,       /* a dict key */
+    };
+    std::shared_ptr<const TypeAnnot> annot;
+    Place place = Place::elem;
+    const UniqueId *name = nullptr;
+};
+
 struct FieldDef {
     const UniqueId *name = nullptr;
     FieldKind kind = FieldKind::f_dyn;

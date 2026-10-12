@@ -541,7 +541,8 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
 /* Coerce + runtime-validate one struct field value (eval.cpp; shared with the
  * VM's pre-coercing vm_struct_ctor - H1). */
 struct FieldDef;
-EvalValue coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e);
+EvalValue coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e,
+                              bool check_fit = false);
 
 intrusive_ptr<StructObject>
 construct_struct_from_values(StructTypeDef *def,
@@ -554,7 +555,8 @@ construct_struct_from_values(StructTypeDef *def,
  * none. See eval.cpp. */
 intrusive_ptr<StructObject>
 construct_struct_boxed_from_values(StructTypeDef *def, const EvalValue *vals,
-                                  size_t nargs, const ArgLoc *locs);
+                                  size_t nargs, const ArgLoc *locs,
+                                  bool check_fit);
 
 /* VM MakeStructArrayV: build a FLAT array<PodStruct> literal from N structs'
  * field VALUES (interleaved: struct i's field j at vals[i*M + j], M =
@@ -603,6 +605,35 @@ EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float,
 void compute_bind_flags(const FuncDescriptor *d);
 
 /*
+ * #49: does a run-time value fit a place's declared type (types/fit.cpp.h)?
+ * The check a `dyn` value - or a container holding one - meets where it
+ * enters a parameter, a declared variable, an element, a field or a dict,
+ * shared by every engine so they refuse the same values with the same
+ * message. On a misfit `why` (when given) names WHERE inside the value
+ * the misfit is ("" for the value itself, "[1]", "[\"k\"]", "key 3",
+ * "default") and what is there ("int", "none", "P").
+ */
+struct FitSpec;
+struct FitMisfit {
+    std::string where;
+    std::string got;
+};
+bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit *why);
+
+/* the misfit errors, loc-less: a parameter's (`site_arg`: the call-site
+ * argument index, as none_bind_error's) and a store's */
+TypeErrorEx param_fit_error(const UniqueId *param, const TypeAnnot &a,
+                            const FitMisfit &m, int site_arg);
+TypeErrorEx fit_error(const FitSpec &spec, const FitMisfit &m);
+
+/* throw fit_error unless `v` fits `spec` */
+void check_fit(const EvalValue &v, const FitSpec &spec);
+/* the same, the error carrying the value's caret [s, e) - the
+ * tree-walker's stores (Expr14::rv_fit, Subscript::key_fit,
+ * ExprList::arg_fit) */
+void check_fit_loc(const EvalValue &v, const FitSpec &spec, Loc s, Loc e);
+
+/*
  * RULE 1 (2026-10-05): a parameter not declared `opt` never holds `none`
  * (README, "A none the compiler cannot see is refused at the call"), so a
  * bind REFUSES it - a TypeErrorEx, like a bind coercion's, naming the
@@ -630,41 +661,65 @@ inline bool bind_coerce_throws(DeclType dt, const EvalValue &v)
 }
 
 /*
- * The VM's pre-bind check: argument i is `arg_at(i)`. The index of the
- * first argument that is a none bound to a parameter not declared `opt`,
- * or -1 - walked in PARAMETER order, stopping (-1) exactly where the bind
- * itself would raise first, at a numeric coercion that throws, so a site
- * raises the error the tree-walker's bind_param raises at the same
- * argument whatever mix of faults the call has. The caller builds the
- * refusal (none_bind_error) and gives it its own caret. This form needs
- * the argument count in range - a caller whose bind checks the arity
- * AFTER this runs uses none_bind_fault below.
+ * The VM's pre-bind check: argument i is `arg_at(i)`. The first argument
+ * the bind would REFUSE - a none bound to a parameter not declared `opt`,
+ * or (#49) a value that misfits a parameter's ParamDesc::fit - or idx -1
+ * when the bind accepts. Walked in PARAMETER order, stopping (-1) exactly
+ * where the bind itself would raise first, at a numeric coercion that
+ * throws, so a site raises the error the tree-walker's bind_param raises
+ * at the same argument whatever mix of faults the call has. The caller
+ * builds the refusal (bind_fault_error) and gives it its own caret. This
+ * form needs the argument count in range - a caller whose bind checks the
+ * arity AFTER this runs uses bind_fault below.
  */
+struct BindFault {
+    int idx = -1;               /* the refused argument; -1: accepted */
+    bool fit = false;           /* a misfit (#49), else a none */
+    FitMisfit m;                /* the misfit's place and kind */
+};
+
 template <class ArgAt>
-inline int none_bind_fault_in_range(const FuncDescriptor *d, size_t n,
-                                    ArgAt arg_at)
+inline BindFault bind_fault_in_range(const FuncDescriptor *d, size_t n,
+                                     ArgAt arg_at)
 {
+    BindFault f;
     for (size_t i = 0; i < n; i++) {
         const FuncDescriptor::ParamDesc &p = d->params[i];
         const EvalValue &v = arg_at(i);
         if (v.is<NoneVal>()) {
-            if (!p.opt)
-                return static_cast<int>(i);
-            continue;
+            if (p.opt)
+                continue;
+            f.idx = static_cast<int>(i);
+            return f;
         }
         if (bind_coerce_throws(p.decl_type, v))
-            return -1;                  /* the bind's coercion error first */
+            return f;                   /* the bind's coercion error first */
+        if (p.fit && !value_fits(v, *p.fit, &f.m)) {
+            f.idx = static_cast<int>(i);
+            f.fit = true;
+            return f;
+        }
     }
-    return -1;
+    return f;
 }
 
 /* the same, for a count not yet checked: the bind's arity error first */
 template <class ArgAt>
-inline int none_bind_fault(const FuncDescriptor *d, size_t n, ArgAt arg_at)
+inline BindFault bind_fault(const FuncDescriptor *d, size_t n, ArgAt arg_at)
 {
     if (n > d->params.size() || n < static_cast<size_t>(d->min_args))
-        return -1;
-    return none_bind_fault_in_range(d, n, arg_at);
+        return BindFault();
+    return bind_fault_in_range(d, n, arg_at);
+}
+
+/* the refusal a fault names, loc-less (`site_arg` as none_bind_error's) */
+inline TypeErrorEx bind_fault_error(const FuncDescriptor *d,
+                                    const BindFault &f, int site_arg)
+{
+    const FuncDescriptor::ParamDesc &p =
+        d->params[static_cast<size_t>(f.idx)];
+    return f.fit ? param_fit_error(p.name, *p.fit, f.m, site_arg)
+                 : none_bind_error(p.name, site_arg);
 }
 
 /* The never-throwing append core (arr.cpp.h) shared by builtin_append and

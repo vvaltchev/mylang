@@ -5,6 +5,7 @@
 #include "defs.h"
 #include "uniqueid.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,7 @@ struct ResolvedSym {
 };
 
 class FuncDeclStmt;
+struct TypeAnnot;
 
 struct FuncDescriptor {
 
@@ -117,6 +119,19 @@ struct FuncDescriptor {
          * decl_struct / decl_annot, stored in a .myv (v36).
          */
         const UniqueId *sig_type = nullptr;
+
+        /*
+         * #49: the parameter's declared type as a run-time annotation,
+         * when an argument a `dyn` passed must be checked against it -
+         * a `bool`, `str`, struct, container or box parameter (`opt`
+         * when the parameter is). Null for an untyped, `dyn`, `int` or
+         * `float` one (the last two convert, bind_param). The check runs
+         * at a call whose arguments may not fit (CallExpr::fit_args) and
+         * at every call no compile-time proof covers (a dyn callee, a
+         * builtin's callback) - value_fits, eval.h. Set by sync_params,
+         * stored in a .myv (v37).
+         */
+        std::shared_ptr<const TypeAnnot> fit = nullptr;
 
         /*
          * "This param slot can never hold a REFERENCE" - an annotated i/f
@@ -217,6 +232,13 @@ struct FuncDescriptor {
      * the recomputed flag against the stored one.
      */
     mutable std::vector<const void *> bind_req;
+
+    /*
+     * #49: some parameter has a `fit` (ParamDesc::fit) - so a builtin's
+     * callback cannot bind it a raw scalar unchecked (VmInvoker's raw
+     * path declines). DERIVED with fast_bind by compute_bind_flags.
+     */
+    mutable bool fit_any = false;
 
     /*
      * COMPILE-TIME / tree-walker back-pointer to the owning decl (body eval,

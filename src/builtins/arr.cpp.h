@@ -580,6 +580,10 @@ static EvalValue append_tw(EvalContext *ctx, ExprList *exprList)
      * takes an AST-free ArgLocs - build it from the ExprList). */
     const EvalValue val = literal_widen(RValue(arg1->eval(ctx)),
                                         exprList->widen_of(1));
+    /* #49: checked against the declared element type where it may misfit
+     * (ExprList::arg_fit) - the VM's CheckFitV on the argument */
+    if (const FitSpec *f = exprList->fit_of(1))
+        check_fit_loc(val, *f, arg1->start, arg1->end);
     ArgLoc locbuf[2];
     ArgLocs al = build_arglocs(exprList, locbuf, 2);
     return builtin_append(ctx, &al, target, &val, 1);

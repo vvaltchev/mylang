@@ -1337,6 +1337,12 @@ extern "C" int jit_load_box(int_type box_slot, int_type dst, int_type want,
                             const void *def) noexcept;
 extern "C" int jit_store_box(int_type box_slot, int_type val_slot) noexcept;
 
+/* #49: the native CheckFitV - check_fit of slot `slot` against the
+ * Chunk::fit_specs entry `spec` (baked). A misfit conveys a loc-less
+ * TypeErrorEx, stamped with the value's caret at the op pc, and returns
+ * 1. */
+extern "C" int jit_check_fit(int_type slot, const void *spec) noexcept;
+
 /* model-flip (nativize-ops): the dyn-callee generic call pair. CheckCallableV
  * (the callable guard - conveys a loc-less NotCallableEx, exc-stamped with
  * the callee caret) and CallValueGenericV (the full by-Kind dispatch over

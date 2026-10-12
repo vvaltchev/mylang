@@ -17926,3 +17926,192 @@ declines (`memberv_val_kind`, the POD form's reason) to the helper, which
 converts or raises. A struct- or box-typed field takes the helper always:
 its fit is a def compare, not one tag. Store reach is unchanged on the
 shapes the tier exists for (an exact-kind value).
+
+## #49 - A `dyn` VALUE ENTERING A TYPED PLACE IS CHECKED (2026-10-12)
+
+A `dyn` value is accepted wherever a typed value is expected - that is
+what `dyn` is for - and nothing checked it against the place it entered.
+Every typed consumer downstream (M8, the VM's typed ops, every unboxed
+JIT tier) trusts the declared type, so a misfit got in and each engine
+did something different with it. Two reproductions, on the parent
+commit:
+
+    func f(array<int> a) { var s = 0; foreach (x in a) { s += x; }
+                           return s; }
+    print(f(runtime([1.5, 2.5])));     # -tw: TypeErrorEx inside f
+                                       # -nj, JIT: InternalErrorEx
+    struct S { array<int> v; }
+    var dyn d = runtime(["x"]); var s = S(d);
+    print(s.v[0] + 1);                 # -tw: TypeErrorEx
+                                       # -nj, JIT: prints x1
+
+RULE 1 and RULE 2 at once. The defined outcome now: a TypeErrorEx where
+the value enters, naming the place and what is there ("parameter 'a' is
+declared 'array<int>' but the argument's [0] is a 'float'"), before
+anything is stored, with the value's caret - the same in every engine.
+
+**One function decides.** `value_fits(v, TypeAnnot, FitMisfit *)`
+(types/fit.cpp.h) is the only answer to "does this value fit that
+declared type", and `fit_error` the only rendering, so the engines
+cannot disagree about either. Its walk is bounded by the ANNOTATION:
+a struct or class is a def identity test, a flat array is decided by
+its storage kind, a `dyn` element stops the walk - no cycle guard is
+needed, and an array is walked element by element only when its storage
+holds references (general, or a flat class array). A container met
+twice at one annotation is walked once - an array keyed by its WINDOW,
+as the cycle guard keys it, because two slices of one storage hold
+different elements (the first version keyed the storage alone, and a
+dict holding `mixed[0:1]` and `mixed[1:2]` passed a check the second
+slice fails).
+
+**Where it is checked is decided statically**, by
+`fit_needed(value_type, place_type, top)`: a value statically known to
+fit is never checked, and at the TOP level an int / float place is the
+numeric coercion's job, which already refuses a misfit. Per place:
+
+    place                  stamp                    checked by
+    call argument          ParamDesc::fit,          TW bind_param; VM/JIT
+                           CallExpr::fit_args       CheckNoneArgsV (mask:
+                                                    check_args()),
+                                                    bind_fault
+    struct ctor field      BoxedCtor.fit            coerce_struct_field
+                                                    (every engine)
+    element / dict value   Expr14::rv_fit           TW Expr14::do_eval;
+    / field store                                   VM/JIT CheckFitV
+    dict key               Subscript::key_fit       TW subscript_store;
+                                                    VM/JIT CheckFitV
+    declared variable      Expr14::rv_fit           as a field store
+                           (Place::var)
+    multi-assignment       IdList::fits             TW per target; VM/JIT
+    target                                          CheckFitV on the
+                                                    unpack temp
+    append / push /        ExprList::arg_fit        TW builtin_append,
+    insert                                          lv_arg_fit; VM/JIT
+                                                    CheckFitV on the slot
+
+`CheckFitV` is fully native (`jit_check_fit`, a status helper that
+conveys a loc-less TypeErrorEx; the op's exc-stamp gives it the value's
+caret), its spec in `Chunk::fit_specs` (myv v37). The bytecode inliner
+pastes no body holding one - the op's index names the callee's pool.
+
+**A COMPOUND store cannot be checked, so it is refused** when its
+result may misfit (`a[0] += d`, `d` a dyn, into an
+`array<array<int>>`; a declared variable's `v += r`; each declared
+target of `a, b += rows`): the value is computed inside the store, past
+any point a check can stand (`refuse_compound_misfit`). The message
+says to write `x = x OP v`, which is checked. The variable and
+multi-assignment forms were missed at first: `v += r` with `v` an
+`array<array<int>>` and `r` an `array<dyn>` stored `["x"]` into `v` in
+every engine.
+
+**The gap left on purpose:** a container reached through a `dyn` NAME
+is not a typed place, so `var dyn d = rows; d[0] = v` stores unchecked
+- the alias's static type is `dyn`, and no place is declared there.
+
+**Under `-nti`** the bind and constructor checks still run - the
+declaration decides them, and every untyped call takes the generic op,
+which always checks, the none check's rule - while no store is checked:
+its spec is an inference stamp. corpus_diff's `-nti` pass found the
+consequence: an un-widened literal (`half([fi, 2.5])` into an
+`array<float>` parameter) is refused there, so a functional program
+that relies on inference gates that line on a typed run
+(`typestr(runtime(0)) == "dyn"`), and 93 asserts its store refusals in
+a typed run only.
+
+**A declared VARIABLE is a place too.** An annotated variable refuses
+a value whose type is `dyn` at compile time, but accepts an
+`array<dyn>` where it declares `array<int>` (a dyn element fits any
+element type statically) - the parameter rule exactly, where the bind
+then checks it. The first version checked parameters and not
+variables, so `array<int> v = mk();` with `mk()` returning an
+`array<dyn>` holding a string let the misfit in, and the engines then
+disagreed about the caret of the later typed read (one rendered none).
+A variable's store now takes `rv_fit` with `Place::var`, checked before
+the store in every engine (the VM's local store falls to a MoveV: the
+retarget whitelist does not hold CheckFitV).
+
+**And so is each target of a multi-assignment**, found by probing the
+first fix's neighbours: `a, b = src` with `src` an
+`array<array<dyn>>` stored `["x"]` into an `array<int> b` in every
+engine, and `b[0] + 1` then raised its TypeErrorEx with a different
+caret in each (`-nj` with none). `IdList::fits` holds one spec per
+declared target, built from `idlist_elem_types` (what each target
+receives: a literal's element as written, an array's element type, or
+the whole value, spread); each is checked just before its own target's
+store, so a refusal leaves the targets before it written and the rest
+as they were - the order a failing conversion already had. The VM
+stores such a statement through temps (`emit_multi_via_temps`, which
+the unpack lowerings would otherwise skip for local targets) so the
+check stands between the unpack and the store.
+
+**A precision finding on the way.** `call_fit_args` first answered
+"check" for ANY dyn argument to a function value, which kept a staging
+move `jit_frameless_w2_shape` pins as fused. It now asks
+`fit_needed` per settled parameter of the callee's function type: an
+int / float parameter is the coercion's, a `dyn` or `none` one cannot
+be named, so only a container or struct parameter needs the check.
+
+**Reach and cost.** Over bench/ + samples/: ZERO `check.fit`, and one
+more `check.none` (samples/phonebook, a dyn argument to a typed
+parameter). Over the whole corpus (207 programs) `check.fit` 0 -> 25,
+`check.none` 192 -> 224, all but that one in tests/functional.
+**Emitted code** (`scripts/vdjcmp` against the parent, 207 programs):
+169 byte-identical; 31 differ in one constant only - the byte length
+an arity check compares a descriptor's `params` against, since
+`ParamDesc` grew from 24 to 40 bytes with its `fit` annotation (three
+of them benches: 10_recursion_deep, 69_exc_crossframe,
+100_funcval_dispatch4); the other 7 gained check ops (samples/phonebook
+and six tests/functional programs).
+
+**Watched failing** (each a sabotaged copy, rebuilt, restored with a
+plain copy + touch and rebuilt inside the restore, then a control run),
+on the `-rt` #49 cases and tests/functional/93_dyn_fit.my under -tw,
+-nj, the default engine and -nbi:
+    sabotage
+      what it removes                        -rt  -tw  -nj  jit  -nbi
+    fit_true
+      value_fits answers "fits"              F    F    F    F    F
+    tw_rv_fit
+      the tree-walker's store check          F    F    .    .    .
+    emit_fit_noop
+      codegen emits no CheckFitV             F    .    F    F    F
+    jit_check_fit_accepts
+      the native CheckFitV accepts all       F    .    .    F    F
+    bind_fault_no_fit
+      the VM bind ignores ParamDesc::fit     F    .    F    F    F
+    tw_bind_no_fit
+      the tree-walker bind ignores it        F    F    .    .    .
+    append_no_fit
+      the tree-walker append's check         F    F    .    .    .
+    lv_arg_no_fit
+      the in-place builtin adapters' check   F    F    .    .    .
+    call_fit_args_false
+      no call is ever checked                F    F    F    F    F
+    no_key_fit
+      a dict key's spec                      F    F    F    F    F
+    no_compound_refusal
+      the element/field compound refusal     F    .    .    .    .
+    window_key_dropped
+      an array walk keyed by storage alone   .    F    F    F    F
+    var_rv_fit_dropped
+      a declared variable's spec             F    F    F    F    F
+    idlist_tw_no_fit
+      the TW multi-assignment check          F    F    .    .    .
+    idlist_vm_no_fit
+      the VM's check on the unpack temp      F    .    F    F    F
+    idlist_via_temps_off
+      the via-temps routing                  F    .    F    F    F
+    idlist_fits_unstamped
+      the multi-assignment specs             F    F    F    F    F
+    compound_var_unrefused
+      a declared variable's refusal          F    .    .    .    .
+    compound_idlist_unrefused
+      the multi-assignment refusal           F    .    .    .    .
+
+(F: that check failed - the sabotage was caught; `.`: it passed. The
+last four columns are tests/functional/93_dyn_fit.my under each engine.)
+
+Every control (the restore rebuilt, the same checks run) was clean. The
+`-rt` cases pin what 93 cannot: a compound refusal is a compile error,
+which a self-asserting program cannot catch; the slice-window key is
+the one only 93 sees.

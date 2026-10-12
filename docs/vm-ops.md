@@ -1680,7 +1680,7 @@ parameter named), before the callee's body runs. The tree-walker's
 `bind_param` checks first thing; the generic dyn-callee op
 (`CallValueGenericV`, interpreted and `jit_call_value_generic`) and the
 callback invoker (`VmInvoker::invoke`, `vm_try_invoke`) call
-`none_bind_fault` (eval.h) before their bind. The other call ops -
+`bind_fault` (eval.h) before their bind. The other call ops -
 `CallV`, `CachedCallV`, `CallValueV` - are NOT touched: their many native
 tiers (the emitted push, frameless sites, REGCALL, the bytecode inliner's
 paste) bind raw. Instead codegen emits `CheckNoneArgsV` right after the
@@ -1697,7 +1697,7 @@ as CallV's), `a`/`b` the run's base and count - and refuses the first none
 bound to a non-opt parameter of a FuncObject callee (anything else is the
 call's own error to raise; the count cannot mismatch - the check pass
 proved it for a `CallV`/`CallValueV`, and a dyn callee takes the generic
-op, which checks the count first): `none_bind_fault_in_range` (eval.h)
+op, which checks the count first): `bind_fault_in_range` (eval.h)
 walks the binds in order and stops at the first coercion that would
 throw, so the error the call would raise first wins. Both the
 interpreted op and the JIT's `jit_check_none_args` build
@@ -1712,6 +1712,33 @@ and the inliner's step 1 scan back from the call over `MoveV`s only, so a
 checked call stages its arguments in memory. The AST inliner keeps such a
 call a call (`Inliner::binds_none`): pasted, nothing would bind it. myv
 **v29** (the op is APPENDED).
+
+The same op refuses a `dyn` argument that does not fit a typed parameter
+(#49): `ParamDesc::fit` holds the parameter's annotation when a check can
+fail, `CallExpr::fit_args` marks the arguments that may misfit, and
+`check_args()` - `fit_args || may_bind_none()` - is the emission gate.
+`bind_fault_in_range` asks `value_fits` beside the none test, in
+bind order, so the first fault a bind would meet is the one raised.
+
+**`CheckFitV slot, spec` — a value entering a typed place fits it (#49,
+2026-10-12).** Emitted right before a store or an in-place builtin's
+call, on the slot holding the value: an element / field / dict-value
+store's rvalue (`Expr14::rv_fit`, after its widening), a dict key
+(`Subscript::key_fit`), and an `append` / `push` / `insert` argument
+(`ExprList::arg_fit`), by `emit_fit` from `compile_rvalue`,
+`compile_key`, `compile_key_to_run_slot` and `compile_builtin_arg`. `a`
+is the slot, `target2` an index into `Chunk::fit_specs` (a `FitSpec`:
+the place's `TypeAnnot`, its kind - variable, field, element, dict
+value, dict key - and its name, for the message). It writes no slot and
+has no def. A misfit raises `TypeErrorEx` (`fit_error`, the same text
+the tree-walker's `check_fit_loc` builds) with the VALUE's caret, from
+the op's own `locs` entry (`node_idx` = the value), before the store
+runs, so the place keeps its old value. Fully native
+(`jit_check_fit`, conveys, exc-stamped); the bytecode inliner does not
+paste a body holding one (its `target2` indexes the callee's pool).
+Bounded by `verify_chunk` (`target2 < fit_specs.size()`); the pool is
+myv **v37** (section 9.11a), and `-vd` prints `check.fit <slot> ; fit
+[k]` plus the pool.
 
 **`LoadBoxV dst = *box` and `StoreBoxV *box = value` — boxes (class step
 3, plans/class-and-box.md).** `*b` reads and writes the value a box holds

@@ -14,6 +14,7 @@
 #include "structtype.h"   /* StructTypeDef / FieldDef (the custom-type dump) */
 #include "errors.h"       /* InlineCtx (the inline_ctxs pool dump) */
 #include "lexer.h"        /* OpString */
+#include "reflect.h"      /* reflect_decl_annot (the fit_specs dump) */
 
 #include <sstream>
 #include <iomanip>
@@ -360,11 +361,30 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             s << ";   [" << i << "]" << "  " << ch.struct_defs[i]->name->val
               << "\n";
     }
+    if (!ch.fit_specs.empty()) {
+        static const char *const places[] = {
+            "variable", "field", "element", "dict value", "dict key" };
+        s << "; -- fit_specs (" << ch.fit_specs.size() << ") --\n";
+        for (size_t i = 0; i < ch.fit_specs.size(); i++) {
+            const FitSpec &f = ch.fit_specs[i];
+            s << ";   [" << i << "]  "
+              << places[static_cast<int>(f.place)];
+            if (f.name)
+                s << " '" << f.name->val << "'";
+            if (f.annot)
+                s << "  " << reflect_decl_annot(f.annot->kind,
+                                                f.annot->strct,
+                                                f.annot.get(),
+                                                f.annot->opt);
+            s << "\n";
+        }
+    }
     if (!ch.boxed_ctors.empty()) {
         s << "; -- boxed_ctors (" << ch.boxed_ctors.size() << ") --\n";
         for (size_t i = 0; i < ch.boxed_ctors.size(); i++)
             s << ";   [" << i << "]" << "  " << ch.boxed_ctors[i].def->name->val
-              << "  (" << ch.boxed_ctors[i].arg_locs.size() << " args)\n";
+              << "  (" << ch.boxed_ctors[i].arg_locs.size() << " args"
+              << (ch.boxed_ctors[i].fit ? ", fit" : "") << ")\n";
     }
     if (!ch.throws.empty()) {
         s << "; -- throws (" << ch.throws.size() << ") --\n";
@@ -2232,6 +2252,11 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::StoreBoxV:
             row << "store.box    *" << RI(in.a(), false) << " = "
                 << RI(in.b(), false);
+            break;
+        case OpCode::CheckFitV:
+            /* #49: the value a store is about to put into a typed place */
+            row << "check.fit    " << RI(in.a(), false) << "  ; fit ["
+                << in.target2 << "]";
             break;
         case OpCode::CheckFuncV:
             row << "check.func   " << RI(in.a(), false)

@@ -2,8 +2,19 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 36.  This document describes the on-disk image exhaustively:
+Format version 37.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v37: a Field (7.1) and a Param (8) each END with an `annot` (2.2), a
+TypeAnnot record - the field's declared type, the parameter's run-time FIT
+check (#49: the type a `dyn` argument must fit at that parameter, absent
+when the bind already checks it).  The loader derives a descriptor's
+`fit_any` from the params' records (section 12).  A BoxedCtor (9.11) ends
+with a bool `fit`, and a chunk gains a pool after boxed_ctors, fit_specs
+(9.11a), which one APPENDED opcode reads - CheckFitV, the check of a value
+a store or an in-place builtin is about to put into a typed place: its `a`
+must be a slot and its `target2` must index fit_specs, at an entry whose
+annot is present - the verifier refuses anything else.)
 
 (v36: a Param (8) ENDS with a uid, `sig_type` - the parameter's annotation
 as signature() renders it (`P p`, `array<int> a`, `dict<str,P>? d`, `box<int>
@@ -381,6 +392,25 @@ Locs, widest line 206, widest column 77, so nothing escapes in practice.
 
 Every pool in section 9 writes its Locs through this one encoding.
 
+2.2  annot - a TypeAnnot record (v37)
+
+A declared type, as the parser built it (`array<P?>`, `dict<str, int>`,
+`box<float>`), possibly absent:
+
+    u8    kind      DeclType, section 13; 255 (0xFF) = NO annotation, and
+                    then nothing else follows
+    bool  opt       the `?` / `opt` of this level
+    u32   struct    a struct table index (section 7), 0xFFFFFFFF = none;
+                    only a `strct` kind may name one (it may name ANY
+                    struct, a later one or its own - `array<Tree> kids`)
+    [annot elem]    present for an `arr` or a `box` kind: the element type
+    [annot key]     present for a `dict` kind: the key type,
+    [annot val]       then the value type
+
+A child may itself be absent (its kind byte 0xFF).  The reader REFUSES a kind
+above `box`, a struct index on another kind or past the table, and a nesting
+deeper than 256 levels ("corrupt .myv (annot ...)").
+
 --------------------------------------------------------------------------------
 3.  TOP-LEVEL LAYOUT
 --------------------------------------------------------------------------------
@@ -539,6 +569,8 @@ counts ("corrupt .myv (table of contents exceeds the file)").
         sref  struct_def    the resolved struct type, or null
         bool  is_opt
         u32   slot          (signed) the boxed-layout slot index
+        annot annot         v37 - the field's declared type (2.2); absent
+                            for a field whose kind says it all
 
     Const:
         uid   name
@@ -630,6 +662,11 @@ whole call model reads it, never an AST node.
                                     alone cannot say it: a struct, a
                                     parameterized container, a box.  May be
                                     null.  Read by signature() only.
+        annot fit                   v37 - #49: the type a `dyn` argument
+                                    must FIT at this parameter (2.2),
+                                    checked at run time; absent when the
+                                    bind's own coercion already decides
+                                    it (a plain int/float/none check).
 
     Capture:
         uid   name
@@ -713,6 +750,7 @@ Each chunk is:
     N x dref closure_defs
     N x sref struct_defs
     N x BoxedCtor boxed_ctors       9.11
+    N x FitSpec fit_specs           9.11a   (v37)
     N x EmplaceSite emplace_sites   9.12
     N x ThrowSite throws            9.13
     N x SlotList unpack_targets     9.14
@@ -932,6 +970,20 @@ interned twins (`catch_uids`) are DERIVED - re-interned at load, not stored
 
     sref     def
     arglocs  arg_locs       per-field carets for a boxed construction
+    bool     fit            v37 - #49: check the container and box fields'
+                            declared element types (an argument may be a
+                            `dyn` the static check let through)
+
+9.11a FitSpec - a CheckFitV's place (v37)
+
+    annot    annot          the place's type (2.2), the type the value must
+                            fit; must be present for an entry a CheckFitV
+                            names
+    u8       place          0 variable, 1 field, 2 element, 3 dict value,
+                            4 dict key (the error message's subject); the
+                            reader refuses a larger one
+    uid      name           the field's or variable's name; null (0xFFFFFFFF)
+                            for an element, a dict value or a key
 
 9.12  EmplaceSite - a construct-in-place append
 
@@ -1202,6 +1254,14 @@ implementation free to drift.
                           may read only chunk data - the parameter seeds
                           `compute_ref_slots` receives are a
                           DESCRIPTOR's, rebuilt from it (below).
+
+    FuncDescriptor::fit_any
+                          (v37) Whether any parameter carries a `fit`
+                          annot (section 8) - what makes a callback's
+                          raw-scalar bind tier decline.  Recomputed with
+                          `fast_bind` by `compute_bind_flags` from the
+                          params just read, so it cannot disagree with
+                          them.
 
     Chunk::ref_slots      (v18) The frame slots that can hold a
                           REFERENCE: what a frame pop RELEASES, what the

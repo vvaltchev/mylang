@@ -250,8 +250,10 @@ static const std::vector<test> tests =
       "converted or refused before the store", {
         "array<float?> ga = [none];",
         "dict<str, int> di = {};",
-        "var dyn q = runtime(\"q\");",
-        "array<int> gl = [1, q];",
+        /* a general-storage array<int> whose values fit (#49 refuses
+         * the misfit a dyn element used to launder in) */
+        "array<int> gl = dynarray([1, 2]);",
+        "assert(array_storage(gl) == \"general\");",
         "var n = 0;",
         "try { ga[0] = runtime(\"s\"); } catch (TypeErrorEx) { n += 1; }",
         "try { di[\"k\"] = runtime(2.5); } catch (TypeErrorEx) { n += 1; }",
@@ -2006,6 +2008,107 @@ static const std::vector<test> tests =
         "var dyn m = map(func (int x) { return x * 2; }, holes);",
         "print(m);" },
       &typeid(TypeErrorEx), 17, 2, 55, 2 },
+    /*
+     * #49: a `dyn` value entering a typed place - a parameter, an element,
+     * a dict value or key, a field, an append / insert, a constructor's
+     * field - is checked there, and the caret marks the VALUE. Warmed (the
+     * misfit arrives on the third iteration), so the JIT's CheckFitV and
+     * the bind check run their emitted exception paths.
+     */
+    { "err loc: a DYN argument that misfits a typed param marks the "
+      "argument (#49)",
+      { "func ln(array<int> a) { var t = 0; for (var j = 0; j < 2; j++) "
+        "t = t + j; return t + len(a); }",
+        "var dyn d = runtime([1]); var s = 0;",
+        "for (var i = 0; i < runtime(3); i++) { "
+        "s = s + ln(d); if (i == 1) { d = runtime([\"x\"]); } }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 51, 3, 53, 3 },
+    { "err loc: a DYN value that misfits an element marks the value (#49)",
+      { "array<str> a = [\"x\"]; var dyn d = runtime(\"y\");",
+        "for (var i = 0; i < runtime(3); i++) { "
+        "a[0] = d; if (i == 1) { d = runtime(5); } }",
+        "print(a);" },
+      &typeid(TypeErrorEx), 47, 2, 49, 2 },
+    { "err loc: a DYN value that misfits a declared variable marks the "
+      "value (#49)",
+      { "array<int> v = [1]; var dyn d = runtime(1);",
+        "for (var i = 0; i < runtime(3); i++) { array<dyn> r = [d]; "
+        "v = r; if (i == 1) { d = runtime(\"s\"); } }",
+        "print(v);" },
+      &typeid(TypeErrorEx), 64, 2, 66, 2 },
+    { "err loc: a DYN value that misfits a dict value marks the value "
+      "(#49)",
+      { "dict<str, array<int>> m = {}; var dyn d = runtime([1]);",
+        "for (var i = 0; i < runtime(3); i++) { "
+        "m[\"k\"] = d; if (i == 1) { d = runtime([\"s\"]); } }",
+        "print(m);" },
+      &typeid(TypeErrorEx), 49, 2, 51, 2 },
+    { "err loc: a DYN key that misfits a dict key marks the key (#49)",
+      { "dict<str, int> k = {}; var dyn d = runtime(\"a\");",
+        "for (var i = 0; i < runtime(3); i++) { "
+        "k[d] = i; if (i == 1) { d = runtime(5); } }",
+        "print(k);" },
+      &typeid(TypeErrorEx), 42, 2, 44, 2 },
+    { "err loc: a DYN value that misfits a container field marks the "
+      "value (#49)",
+      { "struct S { array<int> v; }",
+        "S s = S([1]); var dyn d = runtime([2]);",
+        "for (var i = 0; i < runtime(3); i++) { "
+        "s.v = d; if (i == 1) { d = runtime([[3]]); } }",
+        "print(s);" },
+      &typeid(TypeErrorEx), 46, 3, 48, 3 },
+    { "err loc: a DYN value appended to a typed array marks the value "
+      "(#49)",
+      { "array<array<int>> aa = []; var dyn d = runtime([1]);",
+        "for (var i = 0; i < runtime(3); i++) { "
+        "append(aa, d); if (i == 1) { d = runtime([\"z\"]); } }",
+        "print(aa);" },
+      &typeid(TypeErrorEx), 51, 2, 53, 2 },
+    { "err loc: a DYN constructor argument that misfits a field marks "
+      "the argument (#49)",
+      { "struct S { array<int> v; }",
+        "var dyn d = runtime([1]); var n = 0;",
+        "for (var i = 0; i < runtime(3); i++) { "
+        "var s = S(d); n = n + len(s.v); "
+        "if (i == 1) { d = runtime([2.5]); } }",
+        "print(n);" },
+      &typeid(TypeErrorEx), 50, 3, 52, 3 },
+    /* a compound store computes its value inside the store, where no
+     * fit check can stand: one whose result may misfit is refused */
+    { "check: a compound store whose result may misfit is refused (#49)",
+      { "array<array<int>> aa = [[1]];",
+        "var dyn d = runtime([2]);",
+        "aa[0] += d;",
+        "print(aa);" },
+      &typeid(TypeMismatchEx), 1, 3, 12, 3 },
+    { "check: a compound store into a declared variable whose result "
+      "may misfit is refused (#49)",
+      { "array<array<int>> v = [[1]];",
+        "array<dyn> r = [runtime([2])];",
+        "v += r;",
+        "print(v);" },
+      &typeid(TypeMismatchEx), 1, 3, 8, 3 },
+    { "check: a compound multi-assignment whose result may misfit a "
+      "declared target is refused (#49)",
+      { "array<array<int>> a = [[1]]; array<array<int>> b = [[2]];",
+        "array<array<dyn>> src = [[runtime([3])], [[4]]];",
+        "a, b += src;",
+        "print(a, b);" },
+      &typeid(TypeMismatchEx), 1, 3, 13, 3 },
+    { "err loc: a DYN value that misfits a multi-assignment target "
+      "marks the value (#49)",
+      { "array<int> v = [1]; array<int> w = [2]; var dyn d = runtime(1);",
+        "for (var i = 0; i < runtime(3); i++) { array<array<dyn>> r = "
+        "[[d], [d]]; v, w = r; if (i == 1) { d = runtime(\"s\"); } }",
+        "print(v, w);" },
+      &typeid(TypeErrorEx), 81, 2, 83, 2 },
+    { "err loc: a DYN key inserted into a typed dict marks the key (#49)",
+      { "dict<str, int> k = {}; var dyn d = runtime(\"a\");",
+        "for (var i = 0; i < runtime(3); i++) { "
+        "insert(k, d, i); if (i == 1) { d = runtime(true); } }",
+        "print(k);" },
+      &typeid(TypeErrorEx), 50, 2, 52, 2 },
     /* the coercion's OTHER throw: a declared `float` parameter refusing a
      * non-numeric dyn value (the int/bool widening is the only other arm) */
     { "err loc: a FLOAT parameter's bind coercion marks the failing argument",
@@ -17422,9 +17525,18 @@ static const std::vector<test> tests =
       { "var dyn d = box(\"s\");",
         "*d = 5;" },
       &typeid(TypeErrorEx), 1, 2, 4, 2 },
-    { "box: `*` checks the box it was proven to read",
+    /* #49: a dyn box of another kind is refused where it enters the
+     * typed parameter - at the argument */
+    { "box: a dyn box of another kind is refused at the bind (#49)",
       { "func f(box<int> b) { return *b + 1; }",
         "var dyn d = box(\"s\"); print(f(d));" },
+      &typeid(TypeErrorEx), 31, 2, 33, 2 },
+    /* ...so a misfit reaches a typed `*` only through a container a dyn
+     * NAME writes (README: the one place left unchecked) */
+    { "box: `*` checks the box it was proven to read",
+      { "func f(box<int> b) { return *b + 1; }",
+        "array<box<int>> bs = [box(1)]; var dyn d = runtime(bs);",
+        "d[0] = box(\"s\"); print(f(bs[0]));" },
       &typeid(TypeErrorEx), 29, 1, 32, 1 },
     /* ... in a loop the JIT compiles: its native int add reads the load's
      * result raw, so only the load's own check can refuse the misfit */
@@ -17433,7 +17545,8 @@ static const std::vector<test> tests =
         "  for (var i = 0; i < 300; i++) s += *b + i;",
         "  return s; }",
         "var g = box(1); assert(f(g) == 300 + 44850);",
-        "var dyn d = box(\"s\"); var r = f(d);",
+        "array<box<int>> bs = [g]; var dyn d = runtime(bs);",
+        "d[0] = box(\"s\"); var r = f(bs[0]);",
         "print(r);" },
       &typeid(TypeErrorEx), 38, 2, 41, 2 },
     { "box: ++ on a box of a str is a TypeErrorEx at the inc-dec",
@@ -28187,10 +28300,13 @@ static std::string nc_run(const std::string &src, ExecEngine eng, bool fold)
     std::ostringstream cap;
     std::streambuf *saved_buf = cout.rdbuf(cap.rdbuf());
     std::string err;
+    /* outside the try, as main() keeps it: a tree-walker backtrace names
+     * descriptors the tree owns, and the catch renders it */
+    unique_ptr<Construct> root;
     try {
         lexer(src, 1, toks);
         ParseContext pc(TokenStream(toks), fold);
-        unique_ptr<Construct> root = pBlock(pc);
+        root = pBlock(pc);
         mark_implicit_globals(root.get(), {});
         infer_types(root.get());
         run_optimizers(root.get());
@@ -28390,6 +28506,116 @@ static bool const_fold_equivalence()
                     ok = false;
                 }
             }
+    }
+    return ok;
+}
+
+/*
+ * #49: A `dyn` VALUE ENTERING A TYPED PLACE - the messages. Each misfit
+ * must name its place and the first part of the value that does not fit,
+ * and render byte for byte the same - message, caret, backtrace - in the
+ * tree-walker and the VM with the JIT on and off (the `err loc: a DYN`
+ * entries pin the carets in all five modes; this pins the TEXT). The
+ * fitting runs must print the same values everywhere too.
+ */
+struct FitMsgCase {
+    const char *name;
+    std::vector<const char *> lines;
+    const char *want;           /* a substring of the rendering */
+};
+
+static bool dyn_fit_messages()
+{
+    const std::vector<FitMsgCase> cases = {
+        { "a parameter, through a call chain (the backtrace)", {
+            "func ln(array<int> a) => len(a);",
+            "func outer(dyn d) { var r = ln(d); return r; }",
+            "print(outer(runtime([1, 2])));",
+            "print(outer(runtime([1, \"x\"])));" },
+          "parameter 'a' is declared 'array<int>' but the argument's [1] "
+          "is a 'str'" },
+        { "a struct parameter given another struct", {
+            "struct P { int x; } struct Q { int x; }",
+            "func px(P p) => p.x;",
+            "var dyn q = runtime(Q(1)); print(px(q));" },
+          "parameter 'p' is declared 'P' but the argument is a 'Q'" },
+        { "a nested dict value", {
+            "dict<str, array<int>> m = {};",
+            "m[\"k\"] = runtime([1, 2.5]);" },
+          /* the literal is a flat float array: 1 is stored 1.0 */
+          "the dict value is declared 'array<int>' but the value's [0] "
+          "is a 'float'" },
+        { "a dict key", {
+            "dict<str, int> k = {};",
+            "insert(k, runtime(5), 1);" },
+          "the dict key is declared 'str' but the key is an 'int'" },
+        { "a none into a non-opt element", {
+            "array<str> n = [\"x\"];",
+            "n[0] = runtime(none);" },
+          "the element is declared 'str' but the value is none" },
+        { "a box parameter given a box of another kind", {
+            "func tb(box<int> b) => *b;",
+            "print(tb(runtime(box(2.5))));" },
+          "parameter 'b' is declared 'box<int>' but the argument is a "
+          "'box<float>'" },
+        { "a declared variable given a container with a dyn inside", {
+            "func rows(dyn x) { array<dyn> r = [x]; return r; }",
+            "array<int> v = rows(runtime(\"s\"));" },
+          "'v' is declared 'array<int>' but the value's [0] is a 'str'" },
+        { "a multi-assignment target given a container with a dyn "
+          "inside", {
+            "func rows(dyn x) {",
+            "    array<array<dyn>> r = [[1], [x]]; return r; }",
+            "array<int> a = [0]; array<int> b = [0];",
+            "a, b = rows(runtime(\"s\"));" },
+          "'b' is declared 'array<int>' but the value's [0] is a 'str'" },
+        { "a field at construction", {
+            "struct S { array<int> v; }",
+            "var s = S(runtime([[1]]));" },
+          "field 'v' is declared 'array<int>' but the value's [0] is an "
+          "'array'" },
+        { "a compound whose operator does not apply keeps the "
+          "operator's message (no dyn: nothing for a check to miss)", {
+            "box<int> b = box(1);",
+            "b += 1;" },
+          "operator does not apply to 'box<int>' and 'int' ('b' is a "
+          "box: read its value with *b)" },
+        { "fitting values are stored as they are", {
+            "struct S { array<int> v; }",
+            "array<str?> o = [\"x\"]; o[0] = runtime(none);",
+            "dict<str, array<int>> m = {}; m[\"k\"] = runtime([7]);",
+            "S s = S([0]); s.v = runtime([8, 9]);",
+            "array<array<int>> aa = []; append(aa, runtime([1]));",
+            "print(o, m, s, aa);" },
+          "[<none>] {\"k\": [7]} S(v: [8, 9]) [[1]]" },
+    };
+
+    bool ok = true;
+    const bool saved_jit = g_jit_enabled;
+    for (const FitMsgCase &c : cases) {
+        std::string src;
+        for (size_t i = 0; i < c.lines.size(); i++) {
+            if (i)
+                src += '\n';
+            src += c.lines[i];
+        }
+        const std::string ref = nc_run(src, ExecEngine::TreeWalk, true);
+        if (ref.find(c.want) == std::string::npos) {
+            fprintf(stderr, "dyn_fit_messages: '%s'\n  want: %s\n  got:  "
+                    "%s\n", c.name, c.want, ref.c_str());
+            ok = false;
+        }
+        for (bool jit : { false, true }) {
+            g_jit_enabled = jit;
+            const std::string got = nc_run(src, ExecEngine::Vm, true);
+            if (got != ref) {
+                fprintf(stderr, "dyn_fit_messages: '%s' (vm, jit %s)\n  "
+                        "want: %s\n  got:  %s\n", c.name, jit ? "on" : "off",
+                        ref.c_str(), got.c_str());
+                ok = false;
+            }
+        }
+        g_jit_enabled = saved_jit;
     }
     return ok;
 }
@@ -38651,6 +38877,10 @@ static bool opcode_table_census()
         { OpCode::StoreBoxV,             1,1,1,0,0,0,
           "class step 4: an inline int/float arm, box_store behind "
           "jit_store_box" },
+        { OpCode::CheckFitV,             1,1,1,0,0,0,
+          "#49: d1 - a misfit CONVEYS, stamped with the value's caret; "
+          "b0 - a body holding one is not pasted (no remap of its "
+          "fit_specs index)" },
     };
     const size_t nrows = sizeof(rows) / sizeof(rows[0]);
     const Chunk ck;      /* empty - census_instr never makes a shape
@@ -51194,26 +51424,26 @@ static bool jit_box_native()
             "var bb = box(false);",
             "for (var i = 0; i < 6; i++) *bb = i % 2 == 0;",
             "assert(*bb == false);",
-            /* a dyn carries another box, or no box, into a box<int>
-             * place: the read's kind check and its tag check - the
-             * helper raises the defined TypeErrorEx (box_kind,
-             * box_not_box), and the store's tag check the same */
+            /* another box, or no box, in a box<int> place: the read's
+             * kind check and its tag check - the helper raises the
+             * defined TypeErrorEx (box_kind, box_not_box), and the
+             * store's tag check the same. A dyn ARGUMENT is refused at
+             * the bind since #49, so the misfits arrive the one way
+             * left: stored through a dyn name of an array<box<int>> */
             "func wantint(box<int> x) {",
             "  var r = 0;",
             "  for (var k = 0; k < 3; k++) r += *x;",
             "  return r; }",
             "func setint(box<int> x, int v) {",
             "  for (var k = 0; k < 3; k++) *x = v + k; }",
-            /* runtime(): a constant `nb` would make wantint(5) a pure
-             * call with a constant argument, folded - and its throw a
-             * compile error no `try` catches */
-            "var dyn sb = box(\"s\");",
-            "var dyn nb = runtime(5);",
+            "array<box<int>> bs = [box(1), box(2)];",
+            "var dyn dbs = runtime(bs);",
+            "dbs[0] = box(\"s\"); dbs[1] = runtime(5);",
             "var got = 0;",
             "for (var i = 0; i < 4; i++) {",
-            "  try { wantint(sb); } catch (TypeErrorEx) { got++; }",
-            "  try { wantint(nb); } catch (TypeErrorEx) { got++; }",
-            "  try { setint(nb, i); } catch (TypeErrorEx) { got++; }",
+            "  try { wantint(bs[0]); } catch (TypeErrorEx) { got++; }",
+            "  try { wantint(bs[1]); } catch (TypeErrorEx) { got++; }",
+            "  try { setint(bs[1], i); } catch (TypeErrorEx) { got++; }",
             "}",
             "assert(got == 12);",
             /* a string into a float box (through a dyn): the value's
@@ -51332,14 +51562,17 @@ static bool jit_class_native()
             "  if (e) m += e.n;",
             "}",
             "assert(m == 25);",
-            /* a dyn carries a D into a C parameter: the field's slot is
-             * C's, so only the def guard keeps the read off D's `m` */
+            /* a D in a C parameter: the field's slot is C's, so only
+             * the def guard keeps the read off D's `m`. A dyn ARGUMENT
+             * is refused at the bind since #49, so the D arrives the one
+             * way left: stored through a dyn name of an array<C> */
             "class D { int m; int n; }",
             "func getn(C c) { var r = 0;",
             "  for (var k = 0; k < 3; k++) r += c.n; return r; }",
-            "var dyn dd = D(7, 9);",
+            "array<C> cd = [C(0)]; var dyn dcd = runtime(cd);",
+            "dcd[0] = D(7, 9);",
             "var rn = 0;",
-            "for (var i = 0; i < 4; i++) rn += getn(dd);",
+            "for (var i = 0; i < 4; i++) rn += getn(cd[0]);",
             "assert(rn == 108);",
             /* an array of box<P>: a reference vector, never a flat struct
              * array - its element's field is read through the reference */
@@ -56988,6 +57221,8 @@ static const std::vector<extra_check> extra_checks =
       opt_layer_equivalence },
     { "parse: -nc turns off folding, not the program's meaning (#54)",
       const_fold_equivalence },
+    { "check: a dyn value entering a typed place - the messages (#49)",
+      dyn_fit_messages },
     { "opt: loop-invariant container-subscript hoisting shapes (LICM)",
       hoist_subscript_shapes },
     { "opt: loop-invariant slice hoisting shapes (lever 3)",

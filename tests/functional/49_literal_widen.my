@@ -18,7 +18,11 @@ var d = {"x": fi, "y": 0.5};
 var key = str(runtime("x"));
 print(d[key], d[key] / 2);
 func half(array<float> v) { var t = v[0]; return t / 2; }
-print(half([fi, 2.5]));
+# without inference (-nti) no literal is widened, so `[fi, 2.5]` holds an
+# int, which the parameter's check refuses (README, "A dyn value entering
+# a typed place"): only a typed run passes it as written
+var typed = typestr(runtime(0)) == "dyn";
+print(typed ? half([fi, 2.5]) : half([float(fi), 2.5]));
 var m = [[1, 2.5], [fi, 4]];
 print(m[i + 1][1], m[i + 1][0] / 2, typestr(m));
 var dm = {"p": [fi, 1.5], "q": [7]};

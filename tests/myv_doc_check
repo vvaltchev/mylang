@@ -90,6 +90,18 @@ def value(r):
         return '<class>'
     raise ValueError('bad value tag %d at %d' % (t, r.p))
 
+# ---- section 2.2: a TypeAnnot record (v37) -----------------------------
+def annot(r, depth=0):
+    assert depth <= 256, 'annot nested past 256 levels'
+    kind = r.u8()
+    if kind == 0xff: return None                  # no annotation
+    assert kind <= 9, 'bad annot kind %d' % kind  # DeclType, up to box
+    r.boolv(); r.u32()                            # opt, struct index
+    if kind in (5, 9): annot(r, depth + 1)        # arr / box: elem
+    elif kind == 6:                               # dict: key, val
+        annot(r, depth + 1); annot(r, depth + 1)
+    return kind
+
 # ---- section 9: a chunk -------------------------------------------------
 def chunk(r):
     ncode = r.u32()
@@ -150,7 +162,10 @@ def chunk(r):
         value(r); r.boolv(); r.u8(); r.sref()
     r.nx(r.dref)                                  # closure_defs
     r.nx(r.sref)                                  # struct_defs
-    for _ in range(r.u32()): r.sref(); r.arglocs()          # 9.11 boxed_ctors
+    for _ in range(r.u32()):                                # 9.11 boxed_ctors
+        r.sref(); r.arglocs(); r.boolv()                    # v37: fit
+    for _ in range(r.u32()):                                # 9.11a fit_specs
+        annot(r); r.u8(); r.uid()                           # (v37)
     for _ in range(r.u32()):                                # 9.12 emplace
         r.sref(); r.uid(); r.loc(); r.loc(); r.arglocs()
     for _ in range(r.u32()): r.u8(); r.loc(); r.loc(); r.uid()   # 9.13 throws
@@ -180,6 +195,7 @@ def main(path):
         r.uid(); r.boolv()                        # name, is_class (v33)
         for _ in range(r.u32()):                  # fields
             r.uid(); r.u8(); r.uid(); r.sref(); r.boolv(); r.u32()
+            annot(r)                              # annot (v37)
         for _ in range(r.u32()): r.uid(); value(r)     # consts
     has_chunk = []                                # section 8
     for _ in range(ndesc):
@@ -188,6 +204,7 @@ def main(path):
             r.uid(); r.boolv(); r.boolv(); r.boolv()
             r.u8(); r.u8()                        # decl_type, proven_type
             r.uid()                               # sig_type (v36)
+            annot(r)                              # fit (v37)
         for _ in range(r.u32()):                  # captures
             r.uid(); r.u8(); r.u32(); r.loc(); r.loc()
         r.boolv(); r.u32(); r.u32()
