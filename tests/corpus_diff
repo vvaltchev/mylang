@@ -164,6 +164,15 @@ if [ -n "$ONLY" ] && [ -z "$(progs)" ]; then
   echo "corpus_diff: --only '$ONLY' matches no program" >&2
   exit 2
 fi
+# ⛔ THE PROGRAM LIST IS READ ONCE. The runs below and the report after
+# them each walked the directory, so a program added while the runs went
+# (2026-10-12: a new tests/functional file, minutes into --levers) was in
+# the report and not in the runs - and every comparison row counted it
+# as agreeing, from result files that did not exist. Only the compile
+# gate, which compares an exit code with 0, noticed. The list is a
+# snapshot now, and a unit with no result is a failure (MISSING).
+PROGS_SNAP=$(progs)
+progs() { printf '%s\n' "$PROGS_SNAP"; }
 if [ ! -x "$BIN" ]; then
     echo "corpus_diff: '$_bin_arg' is not an executable ($BIN)." >&2
     echo "  This script cd's to the repo root, so a relative path is" >&2
@@ -318,6 +327,13 @@ fi
 # the saved output / exit status of unit $1
 out_of() { cat "$RES/$1.out"; }
 rc_of()  { cat "$RES/$1.rc"; }
+# true when any unit named has NO result: it never ran, which is a
+# failure to report, never a silent agreement
+missing() {
+  local u
+  for u; do [ -f "$RES/$u.rc" ] || return 0; done
+  return 1
+}
 
 # ---- the report: the serial loops, reading the saved results ------- #
 
@@ -341,7 +357,10 @@ compiles_all() {
   local bad=0 n=0 out
   for f in $(progs); do
     n=$((n + 1))
-    if [ "$(rc_of "nr.$n")" != 0 ]; then
+    if missing "nr.$n"; then
+      echo "MISSING [compile gate] $f (no result: the run did not happen)"
+      bad=$((bad + 1))
+    elif [ "$(rc_of "nr.$n")" != 0 ]; then
       out=$(out_of "nr.$n")
       echo "REFUSED $f"
       printf '%s\n' "$out" | head -4 | sed 's/^/  /'
@@ -366,6 +385,12 @@ run_one() {     # $1 = env assignment ("" = plain), $2 = extra engine flags
     # which is what the diff below does instead: compare everything,
     # print the first few DIFFERING lines (more useful than the tail).
     n=$((n + 1))
+    if missing "tw.$fk.$n" "vm.$ek.$fk.$n"; then
+      echo "MISSING [${1:-plain}${flags:+ $flags}] $f (no result: the" \
+           "run did not happen)"
+      bad=$((bad + 1))
+      continue
+    fi
     a=$(out_of "tw.$fk.$n")
     ra=$(rc_of "tw.$fk.$n")
     b=$(out_of "vm.$ek.$fk.$n")
@@ -419,6 +444,11 @@ fold_same() {
   local bad=0 n=0 a b ra rb
   for f in $(progs); do
     n=$((n + 1))
+    if missing "vm.p.p.$n" "vm.p.$(key -nc).$n"; then
+      echo "MISSING [-nc vs default] $f (no result: the run did not happen)"
+      bad=$((bad + 1))
+      continue
+    fi
     a=$(out_of "vm.p.p.$n")
     ra=$(rc_of "vm.p.p.$n")
     b=$(out_of "vm.p.$(key -nc).$n")

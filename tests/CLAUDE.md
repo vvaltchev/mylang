@@ -94,11 +94,12 @@ the INT_TESTS section); read those first.
   command, the selection suffix and a FAILED-CASE PARSER that reads the
   tool's own failure lines (rt: `[ RUN  ]` + `[ FAIL ]`; corpus_diff:
   `DIFF [..] path`, `CRASH [..] path`, `FAIL [..] path` (a functional
-  program that does not exit 0), `REFUSED path`; int_run: `  FAIL
-  path`; bt_oracle: `FAIL name`, `VACUOUS name:`). **Changing a tool's
-  failure line breaks its reproduce line silently: update the parser in
-  the same change.** A fuzzer's reproduce line comes from its printed
-  seed (nested_fuzz: `seed=N`).
+  program that does not exit 0), `MISSING [..] path` (a unit with no
+  result), `REFUSED path`; int_run: `  FAIL path`; bt_oracle: `FAIL
+  name`, `VACUOUS name:`). **Changing a tool's failure line breaks its
+  reproduce line silently: update the parser in the same change.** A
+  fuzzer's reproduce line comes from its printed seed (nested_fuzz:
+  `seed=N`).
 - --case regexes go through `rx_exact`, which escapes only what is
   special in all three dialects the tools speak (ECMAScript for -rt,
   Python, POSIX ERE for corpus_diff's grep -E).
