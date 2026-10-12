@@ -1274,8 +1274,8 @@ struct Codegen {
      * function boundary (innermost last). A break/continue/return crossing them
      * must pop each handler + run each finally. `to_fin` collects the Jumps
      * that a return in this try routes to its finally (backpatched to Lfin);
-     * `in_catch` = we're compiling a catch body (this try's handler was already
-     * popped by the exception dispatch, so a return must NOT pop it again). */
+     * `in_catch` = we're compiling a catch body (a `rethrow` there re-raises
+     * this try's exception). */
     struct TryFrame {
         bool has_finally;
         std::vector<size_t> *to_fin;   /* normal/reraise exits -> shared Lfin */
@@ -1286,6 +1286,11 @@ struct Codegen {
         /* #78: this try's chunk-static REGION ID - baked into its exception
          * ops; keys the per-frame {exc, pend} slot (Chunk::n_trys). */
         int region = 0;
+        /* does this try have a handler on the stack here - one a flow op
+         * crossing it must pop? Its own in the try body; in a catch body
+         * (the dispatch popped that one) only the catch GUARD of a try with
+         * a finally (compile_native_try). */
+        bool handler_live = true;
     };
     std::vector<TryFrame> trys;
     /* #78: the monotonic try-region allocator (nested/sequential trys get
@@ -4978,9 +4983,12 @@ struct Codegen {
         for (size_t j = 0; j < crossed; j++) {
             const size_t ti = total - 1 - j;        /* innermost first */
             const TryFrame &tf = saved[ti];
-            /* pop this try's handler, unless the flow op is in the INNERMOST
-             * try's catch body (the dispatch already popped it there). */
-            if (!(j == 0 && tf.in_catch)) {
+            /* pop this try's live handler - none in a catch body of a try
+             * with no finally (the dispatch popped it), at ANY depth: a
+             * flow op in a try nested in a catch body crosses the outer
+             * try too, and popping there took a handler the frame did
+             * not own (codegen's handler-balance check refused it) */
+            if (tf.handler_live) {
                 CgInstr ph;
                 ph.op = OpCode::PopHandler;
                 code.push_back(ph);
@@ -7830,6 +7838,8 @@ struct Codegen {
          * finally, every exit path sets the pending action + jumps to Lfin
          * (EndFinally resumes it); without, exits jump straight to Lend. */
         std::vector<size_t> to_fin, to_end;
+        /* the catch bodies' GUARD region (below), or -1 */
+        int guard = -1;
         /*
          * #78 step D: the only remaining exit kind is a NORMAL one (the try
          * body ran to the end, a catch body finished). The "no clause
@@ -7854,6 +7864,8 @@ struct Codegen {
              * reclaimed - a hole costs one unused table + pends slot) */
             if (static_cast<size_t>(region) < chunk.handler_sites.size())
                 chunk.handler_sites[region] = Chunk::HandlerSite();
+            if (guard >= 0)
+                chunk.handler_sites[guard] = Chunk::HandlerSite();
             return false;
         };
 
@@ -7877,10 +7889,14 @@ struct Codegen {
          * emitted, so the catch bodies follow the try body directly. */
         if (static_cast<size_t>(region) >= chunk.handler_sites.size())
             chunk.handler_sites.resize(static_cast<size_t>(region) + 1);
-        Chunk::HandlerSite &site = chunk.handler_sites[region];
-        site.clauses.clear();
-        site.fin_pc = -1;
-        site.has_rethrow = has_rethrow_in_catches(t);
+        /* (indexed, never held by reference: a try nested in a catch body
+         * grows handler_sites while this one is being filled) */
+        auto site = [&]() -> Chunk::HandlerSite & {
+            return chunk.handler_sites[static_cast<size_t>(region)];
+        };
+        site().clauses.clear();
+        site().fin_pc = -1;
+        site().has_rethrow = has_rethrow_in_catches(t);
 
         for (const auto &cs : t->catchStmts) {
             int types_idx = -1;
@@ -7896,19 +7912,41 @@ struct Codegen {
                 chunk.catch_uids.push_back(std::move(uids));
             }
             const Identifier *asId = cs.first.asId.get();
-            site.clauses.push_back({ types_idx,
-                                     asId ? asId->sym.slot : -1,
-                                     -1 });        /* body_pc patched below */
+            site().clauses.push_back({ types_idx,
+                                       asId ? asId->sym.slot : -1,
+                                       -1 });      /* body_pc patched below */
         }
 
-        /* Catch bodies run with THIS try's handler already popped (the
-         * dispatch popped it), so a return here must not re-pop it. */
+        /*
+         * Catch bodies run with THIS try's handler already popped (the
+         * dispatch popped it). With a finally they run under a GUARD: a
+         * second region with no clause, whose fin_pc is a copy of the
+         * finally - so an exception leaving a catch body (a rethrow, a
+         * throw, an error) runs the finally before it propagates, as the
+         * tree-walker's scope guard does. Without it the VM skipped the
+         * finally there. A flow op out of a catch body pops the guard and
+         * inlines the finally once (handler_live).
+         */
+        if (has_fin && !t->catchStmts.empty()) {
+            guard = next_try_region++;
+            if (static_cast<size_t>(guard) >= chunk.handler_sites.size())
+                chunk.handler_sites.resize(static_cast<size_t>(guard) + 1);
+            chunk.handler_sites[static_cast<size_t>(guard)] =
+                Chunk::HandlerSite();
+        }
         trys.back().in_catch = true;
+        trys.back().handler_live = guard >= 0;
         size_t ci = 0;
         for (const auto &cs : t->catchStmts) {
-            site.clauses[ci].body_pc = static_cast<int32_t>(here());
+            site().clauses[ci].body_pc = static_cast<int32_t>(here());
+            if (guard >= 0) {
+                const size_t gp = emit(OpCode::PushHandler);
+                code[gp].set_a(int_lit(guard));
+            }
             if (!compile_scalar_body(body_stmts(cs.second.get()), false))
                 return bail();
+            if (guard >= 0)
+                emit(OpCode::PopHandler);
             exit_to();                                 /* catch body done */
             ci++;
         }
@@ -7918,13 +7956,27 @@ struct Codegen {
             /* The SHARED finally block, reached by the NORMAL and RERAISE exits
              * only (flow ops inline their own copy - Inc 2c). */
             const int lfin = static_cast<int>(here());
-            site.fin_pc = static_cast<int32_t>(lfin);
+            site().fin_pc = static_cast<int32_t>(lfin);
             for (size_t j : to_fin)
                 code[j].target = lfin;
             if (!compile_scalar_body(body_stmts(t->finallyBody.get()), false))
                 return bail();
             const size_t ef = emit(OpCode::EndFinally);
             code[ef].set_a(int_lit(region));           /* #78: whose pend */
+            if (guard >= 0) {
+                /* the guard's copy: entered only by the dispatch, with a
+                 * re-raise parked - the shared one falls through to here
+                 * on a normal exit, so it jumps over */
+                to_end.push_back(emit(OpCode::Jump));
+                const int lg = static_cast<int>(here());
+                chunk.handler_sites[static_cast<size_t>(guard)].fin_pc =
+                    static_cast<int32_t>(lg);
+                if (!compile_scalar_body(body_stmts(t->finallyBody.get()),
+                                         false))
+                    return bail();
+                const size_t eg = emit(OpCode::EndFinally);
+                code[eg].set_a(int_lit(guard));
+            }
         }
 
         const int lend = static_cast<int>(here());

@@ -2955,6 +2955,11 @@ try {
 }
 ```
 
+The `finally` block runs however the `try` or a `catch` block is left:
+at its end, by a `return`, `break` or `continue`, or by an exception -
+one no clause caught, or one a `catch` block raises itself (a `rethrow`
+too). In the last case the exception goes on after the `finally` has run.
+
 It's worth noting that `try-finally` constructs (without any `catch` clause) are
 allowed as well.
 
