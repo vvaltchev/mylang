@@ -4109,19 +4109,23 @@ global, a multi-use side-effecting arg, or a throwing arg the body reads
 conditionally all stay sound; it also lets `f(a+b)`, `f(g())`, `f(global)`
 inline. The recursion unroll's self-call args (`n-1` on an int `n`) are inert,
 so they stay substituted.
-**⛔ A parameter the body WRITES THROUGH takes only a NAME directly**
-(`writes_through` / `param_written_through`, resolver.cpp: the root of an
-assignment target, an inc-dec operand, or an lvalue builtin's first
-argument - `p[0] = v`, `p.x += v`, `append(p, v)`). The parameter slot is
-an lvalue; an inert literal put there is a store to a temporary - the
+**⛔ A parameter the body WRITES THROUGH takes NO argument directly, not
+even a NAME** (`writes_through` / `param_written_through`, resolver.cpp:
+the root of an assignment target, an inc-dec operand, or an lvalue
+builtin's first argument - `p[0] = v`, `p.x += v`, `append(p, v)`); it is
+temp-bound, as the call binds it. Two reasons, each a RULE 2 bug before:
+an inert literal put in the lvalue position is a store to a temporary (the
 tree-walker raised NotLValueEx for `h([1, 2, 3])` and the VM refused to
-compile it (NotLoweredEx) while `-ni` ran it. `arg_substitutable` and the
-tail inliner refuse it, so it is temp-bound. **And a parameter the
-body writes INTO THROUGH A MEMBER (`p.x = v`, `p.f[i] += v`, `p.x++` -
-`param_member_written`) takes NO argument directly, not even a name:** a
-struct is a value, so the parameter is the call's own copy and the write
-must not reach the caller's variable; the temp is that copy (the write
-makes it its own, struct_own). The size
+compile it, NotLoweredEx, while `-ni` ran it); and a NAME holding a SLICE
+is not the parameter - the call's copy of a slice handle is its own view,
+which detaches on the write, so pasting the name made `x[0] = 77` change
+the caller's slice inlined and leave it alone under `-ni` (2026-10-12;
+nothing at compile time tells a slice from an array). The same goes for a
+parameter the body writes INTO THROUGH A MEMBER (`p.x = v`, `p.f[i] += v`,
+`p.x++` - `param_member_written`): a struct is a value, so the parameter
+is the call's own copy and the write must not reach the caller's
+variable; the temp is that copy (the write makes it its own,
+struct_own). The size
 gate is the **cost model**: `body_weight` (a weighted
 node sum, weights from `--weights`/`run_weight_bench`: a CALL is ~21x an arith
 op, assign 11, if 7, return 3) must be **below `CALL_WEIGHT` (21)**. **Bodies WITH

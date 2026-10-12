@@ -28589,6 +28589,25 @@ static bool opt_layer_equivalence()
             "try { print((k / z) * 0); } catch (DivisionByZeroEx) { }",
             "print(k / z - k / z);" } },
         /*
+         * A NAME holding a SLICE, passed to a parameter the body writes
+         * through: the call's copy of the handle is its own view, which
+         * detaches on the write, so the caller's slice is unchanged; a
+         * plain array's copy shares the storage, so the write reaches
+         * it. The inliner pasted the name and wrote the caller's slice
+         * (2026-10-12). Watched failing with the name pasted: this case.
+         */
+        { "inline: a slice argument written through by the body", {
+            "var a = [1, 2, 3, 4];",
+            "func blk(x) { x[0] = 77; return x[1]; }",
+            "func ex(x) => pop(x);",
+            "func w(x) { append(x, 9); return 1; }",
+            "func tl(y) { return w(y); }",
+            "var u = a[0:2]; var r1 = blk(u);",
+            "var v = a[1:3]; var r2 = ex(v);",
+            "var s = a[2:4]; var r3 = tl(s);",
+            "var b = [5, 6]; var r4 = blk(b);",
+            "print(a, u, v, s, b, r1, r2, r3, r4);" } },
+        /*
          * ALIASING (2026-10-08). Arrays and dicts are references, so a
          * write through one name changes what another reads. The loop
          * transforms decided invariance by NAME, and each case below
@@ -50789,8 +50808,9 @@ static bool jit_storev_native()
             "var dyn dd = {0: \"a\", 1: \"b\"};",
             "for (var i = 0; i < 6; i++) dd[i % 2] = \"z\";",
             "assert(dd[0] == \"z\");",
-            /* base_const: a const array bound to a (non-const-declared)
-             * parameter still carries the const flag on its slot */
+            /* a const array bound to a parameter the body stores
+             * through: the bind copies it into the call's own slot, so
+             * the store meets the READ-ONLY array (the readonly guard) */
             "const RO = [[1], [2]];",
             "func poke(a, v) { a[0] = v; }",
             "for (var i = 0; i < 6; i++) {",
@@ -50815,10 +50835,16 @@ static bool jit_storev_native()
     /* storev_elem_const is deliberately absent: an array element's
      * LValue is always constructed non-const (a const CONTAINER is
      * readonly, which the guard above catches), so no program can
-     * reach it. It stays for the same reason elemv_base_not_arr does -
-     * a `.myv` image's operands are bounded but not type-checked. */
+     * reach it. So is storev_base_const since 2026-10-12: a store's
+     * base slot is const only for a const binding, which a store
+     * through it names at compile time (refused) - the AST inliner
+     * reached one by pasting a const NAME into a parameter the body
+     * writes through, the bug fixed that day (a write-through
+     * parameter takes no argument directly). Both stay for the same
+     * reason elemv_base_not_arr does - a `.myv` image's operands are
+     * bounded but not type-checked. */
     static const int want[] = {
-        JD_storev_base_not_arr, JD_storev_base_const,
+        JD_storev_base_not_arr,
         JD_storev_base_slice, JD_storev_readonly, JD_storev_base_kind,
         JD_storev_has_slices, JD_storev_scale_wrap, JD_storev_bounds,
         JD_storev_val_ex, JD_storev_val_slice,
