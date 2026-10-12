@@ -1657,9 +1657,13 @@ static const size_t HISTORY_CAP = 2000;
 
 /*
  * An entry is one INPUT, which may span lines (a block, a paste): written
- * one per line, its newlines as `\n` and its backslashes as `\\`. Written
- * raw, a block came back after a restart as one entry per line (Up
- * recalled a lone `}`), and an empty line inside it was lost.
+ * one per line, its newlines as `\n`, its carriage returns as `\r` and its
+ * backslashes as `\\`. Written raw, a block came back after a restart as
+ * one entry per line (Up recalled a lone `}`), and an empty line inside it
+ * was lost. The file is written in BINARY, so it holds the same bytes on
+ * every platform (Windows' text mode wrote each line end as CRLF), and a
+ * line read back drops a trailing CR, so a file an editor saved with CRLF
+ * line ends still loads - no entry ends in a raw CR, since it is escaped.
  */
 static const char *const HISTORY_HEADER = "#mylang-history 2";
 
@@ -1672,6 +1676,8 @@ history_encode(const string &e)
             out += "\\\\";
         else if (c == '\n')
             out += "\\n";
+        else if (c == '\r')
+            out += "\\r";
         else
             out += c;
     }
@@ -1685,7 +1691,7 @@ history_decode(const string &l)
     for (size_t i = 0; i < l.size(); i++) {
         if (l[i] == '\\' && i + 1 < l.size()) {
             i++;
-            out += l[i] == 'n' ? '\n' : l[i];
+            out += l[i] == 'n' ? '\n' : l[i] == 'r' ? '\r' : l[i];
         } else {
             out += l[i];
         }
@@ -1696,18 +1702,25 @@ history_decode(const string &l)
 void
 repl_load_history(const string &path, std::vector<string> &history)
 {
-    std::ifstream f(path);
+    std::ifstream f(path, std::ios::binary);
     string line;
+    const auto next_line = [&]() {
+        if (!std::getline(f, line))
+            return false;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        return true;
+    };
     /* the first line names the format: a file written before entries were
      * escaped (repl_save_history) has one entry per line, as written */
     bool escaped = false;
-    if (std::getline(f, line)) {
+    if (next_line()) {
         if (line == HISTORY_HEADER)
             escaped = true;
         else if (!line.empty())
             history.push_back(line);
     }
-    while (std::getline(f, line))
+    while (next_line())
         if (!line.empty())
             history.push_back(escaped ? history_decode(line) : line);
     if (history.size() > HISTORY_CAP)
@@ -1717,7 +1730,7 @@ repl_load_history(const string &path, std::vector<string> &history)
 void
 repl_save_history(const string &path, const std::vector<string> &history)
 {
-    std::ofstream f(path, std::ios::trunc);
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f.is_open())
         return;
     const size_t from =
