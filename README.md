@@ -2449,7 +2449,12 @@ a `const` declaration's is, so it may hold any constant value - a struct or
 class instance included (`const ORIGIN = Point(0, 0);`). `.` means *field
 access* on a struct and *key access* on a dict —
 resolved by the base's type. Reading a field that doesn't exist is a compile
-error (for a statically-typed base).
+error (for a statically-typed base). A field WRITE is checked like a
+construction's field value - `p.x = "s"`, `p.x += 1.5` into an `int` field,
+or `none` into a non-`opt` one is a compile error - and so is a write into an
+element reached through a field or another element (`s.a[0] = v`,
+`append(s.a, v)`, `m[0][0] = v`), against the element type its declaration
+gives it.
 
 **Value semantics.** A struct is a **value**, like a C struct or a C#
 `struct`: every copy is independent. A copy is made wherever a struct moves to

@@ -443,6 +443,11 @@ private:
     void stamp_literal_into(Construct *rv, StaticTypeRef dest);
     void stamp_literal_repr(Construct *lit, StaticTypeRef dest);
     StaticTypeRef fixed_elem_dest(Construct *base, bool key);
+    StaticTypeRef declared_type_of(Construct *e);
+    void check_value_into(StaticTypeRef dest, StaticTypeRef vt,
+                          const std::string &field, Construct *at);
+    void check_declared_store(Expr14 *e);
+    void check_builtin_store(CallExpr *call);
     std::vector<TypeSym *> *known_params(CallExpr *call);
     StaticTypeRef arg_type(Construct *arg, TypeSym *param);
     void stamp_literal_args(CallExpr *call);
@@ -5704,18 +5709,58 @@ void Inferencer::stamp_literal_repr(Construct *lit, StaticTypeRef dest)
 }
 
 /*
- * The element (or, `key`, the dict key) type of the FIXED container a
- * store or an append writes into: `base` an identifier whose symbol has a
- * fixed array / dict type (fixed_type). Null otherwise.
+ * The DECLARED static type of a location (#48), or null: an identifier
+ * whose type is fixed (fixed_type), a field of a struct value (its
+ * declared type; a `dyn` field has none), and an element or dict value of
+ * a location whose container type is declared. A store into such a place
+ * is CHECKED against it, whatever path reaches the place - where an
+ * inferred type is only joined, and a nested path (`m[0][0] = v`,
+ * `s.a = v`) contributed to nothing and was checked by nothing.
+ */
+StaticTypeRef Inferencer::declared_type_of(Construct *e)
+{
+    if (!e)
+        return nullptr;
+    switch (ctag(e)) {
+    case ConstructType::id: {
+        auto it = id_sym.find(static_cast<Identifier *>(e));
+        return it != id_sym.end() ? fixed_type(it->second) : nullptr;
+    }
+    case ConstructType::member: {
+        auto *m = static_cast<MemberExpr *>(e);
+        const StaticTypeRef bt =
+            strip(static_type_resolve(type_of(m->what.get())));
+        if (bt->kind != StaticTypeKind::Struct || !bt->struct_def)
+            return nullptr;
+        const auto *def = static_cast<const StructTypeDef *>(bt->struct_def);
+        for (const FieldDef &fd : def->fields)
+            if (fd.name == m->memUid)
+                return fd.kind == FieldKind::f_dyn
+                    ? nullptr : static_type_resolve(field_static_type(fd));
+        return nullptr;
+    }
+    case ConstructType::subscript: {
+        const StaticTypeRef d =
+            declared_type_of(static_cast<Subscript *>(e)->what.get());
+        if (d && d->kind == StaticTypeKind::Array)
+            return static_type_resolve(d->elem);
+        if (d && d->kind == StaticTypeKind::Dict)
+            return static_type_resolve(d->val);
+        return nullptr;
+    }
+    default:
+        return nullptr;
+    }
+}
+
+/*
+ * The element (or, `key`, the dict key) type of the DECLARED container a
+ * store or an append writes into (declared_type_of `base`): an array or a
+ * dict. Null otherwise.
  */
 StaticTypeRef Inferencer::fixed_elem_dest(Construct *base, bool key)
 {
-    if (!base || ctag(base) != ConstructType::id)
-        return nullptr;
-    auto it = id_sym.find(static_cast<Identifier *>(base));
-    if (it == id_sym.end())
-        return nullptr;
-    const StaticTypeRef d = fixed_type(it->second);
+    const StaticTypeRef d = declared_type_of(base);
     if (!d)
         return nullptr;
     if (d->kind == StaticTypeKind::Array)
@@ -5789,15 +5834,103 @@ void Inferencer::stamp_literal_args(CallExpr *call)
     }
 }
 
-/* `x = <literal>` (literal_into) into the FIXED type of `x`'s symbol */
+/* `x = <literal>` / `s.f = <literal>` (literal_into) into the DECLARED
+ * type of the variable or the field */
 StaticTypeRef Inferencer::literal_dest_type(Expr14 *e)
 {
-    if (e->op != Op::assign || ctag(e->lvalue.get()) != ConstructType::id)
+    const ConstructType lt = ctag(e->lvalue.get());
+    if (e->op != Op::assign
+        || (lt != ConstructType::id && lt != ConstructType::member))
         return nullptr;
-    auto it = id_sym.find(static_cast<Identifier *>(e->lvalue.get()));
-    if (it == id_sym.end())
-        return nullptr;
-    return literal_into(e->rvalue.get(), fixed_type(it->second));
+    return literal_into(e->rvalue.get(), declared_type_of(e->lvalue.get()));
+}
+
+/*
+ * A value of static type `vt` stored where the type is DECLARED `dest`
+ * (#48): it must fit, as a construction's field value must. `field` names
+ * a struct field for the message, else it is an element. A `dyn` value is
+ * not checked here (plans: a dyn into a typed container).
+ */
+void Inferencer::check_value_into(StaticTypeRef dest, StaticTypeRef vt,
+                                  const std::string &field, Construct *at)
+{
+    dest = static_type_resolve(dest);
+    vt = static_type_resolve(vt);
+    if (is_dyn(dest) || is_dyn(vt) || has_unknown(vt))
+        return;
+    const std::string what = field.empty()
+        ? "an element of type '" + static_type_to_string(dest) + "'"
+        : "field '" + field + "'";
+    if (!dest->opt && is_optish(vt))
+        nullability(what + " is not 'opt' but the value may be none",
+                    at->start, at->end);
+    if (!static_type_assignable(dest->opt ? vt : strip(vt), dest))
+        mismatch(field.empty()
+                     ? what + " cannot hold '" +
+                           static_type_to_string(vt) + "'"
+                     : what + " expects '" + static_type_to_string(dest) +
+                           "' but got '" + static_type_to_string(vt) + "'",
+                 at->start, at->end);
+}
+
+/*
+ * A store into a struct field, or into an element reached through
+ * something other than a plain variable (`m[0][0] = v`, `s.a[0] = v`),
+ * checked against the declared type of the place (declared_type_of). A
+ * store whose container is a plain variable is its contribution's to
+ * check (contribute_elem), as before.
+ */
+void Inferencer::check_declared_store(Expr14 *e)
+{
+    Construct *lv = e->lvalue.get();
+    std::string field;
+    if (ctag(lv) == ConstructType::member)
+        field = static_cast<MemberExpr *>(lv)->memUid->val;
+    else if (ctag(lv) != ConstructType::subscript
+             || ctag(static_cast<Subscript *>(lv)->what.get())
+                    == ConstructType::id)
+        return;
+    const StaticTypeRef dest = declared_type_of(lv);
+    if (!dest)
+        return;
+    StaticTypeRef vt;
+    if (e->op == Op::assign) {
+        vt = literal_into(e->rvalue.get(), dest);
+        if (!vt)
+            vt = type_of(e->rvalue.get());
+    } else {
+        vt = binop_result(compound_binop(e->op), type_of(lv),
+                          type_of(e->rvalue.get()));
+    }
+    check_value_into(dest, vt, field, e->rvalue.get());
+}
+
+/* check_declared_store's twin for append / push / insert into a container
+ * reached through a field or an element (`append(s.a, v)`) */
+void Inferencer::check_builtin_store(CallExpr *call)
+{
+    auto *cid = static_cast<Identifier *>(call->what.get());
+    const std::string_view nm = cid->uid->val;
+    ExprList *al = call->args.get();
+    const size_t vi = nm == "insert" ? 2 : 1;
+    if ((nm != "append" && nm != "push" && nm != "insert")
+        || !al || al->elems.size() <= vi
+        || ctag(al->elems[0].get()) == ConstructType::id)
+        return;
+    const StaticTypeRef d = declared_type_of(al->elems[0].get());
+    if (!d)
+        return;
+    const auto value = [&](size_t i, StaticTypeRef into) {
+        Construct *v = al->elems[i].get();
+        StaticTypeRef vt = literal_into(v, into);
+        check_value_into(into, vt ? vt : type_of(v), "", v);
+    };
+    if (d->kind == StaticTypeKind::Array)
+        value(vi, d->elem);
+    else if (d->kind == StaticTypeKind::Dict && vi == 2) {
+        value(1, d->key);
+        value(2, d->val);
+    }
 }
 
 /*
@@ -6518,6 +6651,9 @@ void Inferencer::check(Construct *n)
             }
         }
 
+        if (!(e14->fl & pFlags::pInDecl))
+            check_declared_store(e14);
+
         if (e14->op != Op::assign) {
             /* compound assign: validate the implied binary op - for each
              * target of `a, b OP= rhs` against what it receives, as a
@@ -6665,6 +6801,7 @@ void Inferencer::check_call(CallExpr *call)
         } else if (s && is_dyn(s->type)) {
             return;                       /* dyn callee: no checks */
         } else if (!s && is_builtin(cid->uid)) {
+            check_builtin_store(call);
             return;                       /* builtin arity checked at runtime */
         } else if (s) {
             mismatch("'" + std::string(cid->uid->val) +

@@ -4728,6 +4728,16 @@ decisions behind it: `plans/archived/type-inference.md`,
   parser's `widen_shape_of_annot` is its twin for a typed const (read off
   the annotation, before inference). Built from its own values, `[1.5]`
   for an `array<float?>` was flat floats and a later `none` store failed.
+  **A store into a DECLARED place is checked against it (#48):**
+  `declared_type_of` answers the declared type of a location - a fixed
+  identifier, a struct FIELD (always declared), an element / dict value
+  of a declared container - and `check_declared_store` /
+  `check_builtin_store` check a field store, a nested element store and
+  an append through a field or an element (`s.a = v`, `m[0][0] = v`,
+  `append(s.a, v)`), which contributed to nothing and so were checked by
+  nothing. A store whose container is a plain variable stays the
+  contribution's to check (contribute_elem). A `dyn` value is not
+  checked there (an open design question, like a dyn argument).
   A single value an in-place builtin stores (`append`/`push`/`insert`,
   insert's dict key) widens like an element store's `rv_coerce` (#47):
   `ExprList::arg_widen`, applied by the tree-walker's lvalue adapters and
