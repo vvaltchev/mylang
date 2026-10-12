@@ -697,9 +697,46 @@ static bool is_container_literal(const Construct *n)
                  || ctag(n) == ConstructType::lit_dict);
 }
 
+/* The storage a parsed `array<...>` annotation gives an array - the
+ * inferencer's array_repr_hint, read off the annotation (a typed const is
+ * bound, and a pure function may run, before inference): dflt keeps a
+ * value's own (array<str>, a generic `array`); `sd` the POD struct a
+ * flat_s array needs */
+static ArrHint annot_arr_hint(const TypeAnnot *a, const StructTypeDef *&sd)
+{
+    sd = nullptr;
+    const TypeAnnot *e = a ? a->elem.get() : nullptr;
+    const StructTypeDef *esd =
+        e && e->kind == DeclType::strct ? e->strct : nullptr;
+    if (!e || (!e->opt && e->kind == DeclType::s))
+        return ArrHint::dflt;
+    if (!e->opt && e->kind == DeclType::i)
+        return ArrHint::flat_i;
+    if (!e->opt && e->kind == DeclType::f)
+        return ArrHint::flat_f;
+    if (!e->opt && e->kind == DeclType::b)
+        return ArrHint::flat_b;
+    if (!e->opt && esd && esd->is_pod()) {
+        sd = esd;
+        return ArrHint::flat_s;
+    }
+    if (esd && esd->is_class)
+        return ArrHint::flat_c;
+    return ArrHint::general;
+}
+
+/* The numeric widening an element of annotated type `e` gets
+ * (LiteralArray::elem_coerce, the inferencer's stamp_literal_coerce) */
+static DeclType annot_num(const TypeAnnot *e)
+{
+    return !e ? DeclType::none
+         : e->kind == DeclType::f ? DeclType::f
+         : e->kind == DeclType::i ? DeclType::i
+         : DeclType::none;
+}
+
 /* A parsed container annotation's shape (widen_baked_value): its numbers
- * and the storage of each array in it - the inferencer's array_repr_hint,
- * read off the annotation (a typed const is bound before inference) */
+ * and the storage of each array in it */
 static void widen_shape_of_annot(const TypeAnnot *a, WidenShape &w)
 {
     w.k = 0;
@@ -708,30 +745,12 @@ static void widen_shape_of_annot(const TypeAnnot *a, WidenShape &w)
     switch (a->kind) {
     case DeclType::f: w.k = 'f'; return;
     case DeclType::i: w.k = 'i'; return;
-    case DeclType::arr: {
+    case DeclType::arr:
         w.k = 'a';
-        const TypeAnnot *e = a->elem.get();
-        const StructTypeDef *sd =
-            e && e->kind == DeclType::strct ? e->strct : nullptr;
-        if (!e || (!e->opt && e->kind == DeclType::s))
-            w.hint = ArrHint::dflt;          /* a value keeps its own */
-        else if (!e->opt && e->kind == DeclType::i)
-            w.hint = ArrHint::flat_i;
-        else if (!e->opt && e->kind == DeclType::f)
-            w.hint = ArrHint::flat_f;
-        else if (!e->opt && e->kind == DeclType::b)
-            w.hint = ArrHint::flat_b;
-        else if (!e->opt && sd && sd->is_pod()) {
-            w.hint = ArrHint::flat_s;
-            w.hint_struct = sd;
-        } else if (sd && sd->is_class)
-            w.hint = ArrHint::flat_c;
-        else
-            w.hint = ArrHint::general;
+        w.hint = annot_arr_hint(a, w.hint_struct);
         w.sub = make_unique<WidenShape>();
-        widen_shape_of_annot(e, *w.sub);
+        widen_shape_of_annot(a->elem.get(), *w.sub);
         return;
-    }
     case DeclType::dict:
         w.k = 'd';
         w.sub = make_unique<WidenShape>();
@@ -741,6 +760,54 @@ static void widen_shape_of_annot(const TypeAnnot *a, WidenShape &w)
         return;
     default:
         return;
+    }
+}
+
+/*
+ * A literal a DECLARATION annotates (`array<dyn> a = [n];`, `var dyn d =
+ * [1, 2];`, `const array<float> F = [1, 2];`) is built in the annotated
+ * type's storage, its numbers widened to it, from the parse on - the
+ * inferencer stamps the same later (literal_into, set_array_repr_hint),
+ * but a pure function evaluated at parse time, and a typed const bound
+ * then, run before it: `[n]` was built flat and refused the `a[0] = "s"`
+ * the same function's run-time call accepts (RULE 2).
+ */
+static void stamp_literal_annot(Construct *lit, const TypeAnnot *a, bool dyn)
+{
+    if (!lit)
+        return;
+    const ConstructType t = ctag(lit);
+    if (!a) {
+        /* `var dyn d = [...]`: a polymorphic array */
+        if (dyn && (t == ConstructType::lit_arr
+                    || t == ConstructType::lit_obj))
+            lit->arr_hint = ArrHint::general;
+        return;
+    }
+    if (t == ConstructType::lit_arr && a->kind == DeclType::arr) {
+        auto *la = static_cast<LiteralArray *>(lit);
+        la->arr_hint = annot_arr_hint(a, la->arr_hint_struct);
+        la->elem_coerce = annot_num(a->elem.get());
+        for (auto &el : la->elems)
+            stamp_literal_annot(el.get(), a->elem.get(), false);
+    } else if (t == ConstructType::lit_dict && a->kind == DeclType::dict) {
+        auto *ld = static_cast<LiteralDict *>(lit);
+        ld->key_coerce = annot_num(a->key.get());
+        ld->val_coerce = annot_num(a->val.get());
+        for (auto &kv : ld->elems)
+            stamp_literal_annot(kv->value.get(), a->val.get(), false);
+    } else if (t == ConstructType::lit_obj
+               && (a->kind == DeclType::arr || a->kind == DeclType::dict)) {
+        auto *lo = static_cast<LiteralObj *>(lit);
+        if (!lo->from_literal)
+            return;
+        WidenShape w;
+        widen_shape_of_annot(a, w);
+        lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
+        if (w.k == 'a' && w.hint != ArrHint::dflt) {
+            lo->arr_hint = w.hint;
+            lo->arr_hint_struct = w.hint_struct;
+        }
     }
 }
 
@@ -2443,6 +2510,11 @@ pExpr14_body(ParseContext &c, unsigned fl)
         }
     }
 
+    if ((fl & pFlags::pInDecl) && !in_idlist)
+        if (auto *did = dynamic_cast<Identifier *>(ret->lvalue.get()))
+            stamp_literal_annot(ret->rvalue.get(), did->decl_annot.get(),
+                                did->dyn_mod);
+
     if (fl & pFlags::pInConstDecl) {
 
         if (!ret->rvalue->is_const)
@@ -2463,28 +2535,6 @@ pExpr14_body(ParseContext &c, unsigned fl)
                     ret->rvalue->start, ret->rvalue->end);
                 MakeConstructFromConstVal(cv, ret->rvalue);
             }
-        }
-
-        /*
-         * A typed const CONTAINER written as a literal holds its declared
-         * element type (`const array<float> F = [1, 2];` holds 1.0, 2.0):
-         * the inferencer widens it for the run (literal_into), and a read
-         * folded at parse time - `str(F)`, `F[0]` - must see that value,
-         * not the literal's own ints. A const's initializer is always
-         * baked (under -nc too), and the binding is made from the node.
-         */
-        WidenShape cont_shape;
-        if (auto *cid = dynamic_cast<Identifier *>(ret->lvalue.get())) {
-            const TypeAnnot *an = cid->decl_annot.get();
-            if (an && (an->kind == DeclType::arr
-                       || an->kind == DeclType::dict))
-                widen_shape_of_annot(an, cont_shape);
-        }
-        if (cont_shape.k && ctag(ret->rvalue.get()) == ConstructType::lit_obj) {
-            auto *lo = static_cast<LiteralObj *>(ret->rvalue.get());
-            if (lo->from_literal)
-                lo->set_literal_value(
-                    widen_baked_value(lo->literal_value(), cont_shape));
         }
 
         /*
