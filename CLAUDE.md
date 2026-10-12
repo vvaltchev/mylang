@@ -7460,7 +7460,11 @@ and two macros:
   stating the invariant at the one line that would form the bad address) and
   by `ParseContext::MAX_NEST`, a scoped depth cap in `pExpr01`, `pStmt` **and
   `pBlock`** — a bare `{ ... }` reaches `pBlock` from its own loop and never
-  through `pStmt`, so the statement guard alone left `{{{...}}}` unbounded.
+  through `pStmt`, so the statement guard alone left `{{{...}}}` unbounded —
+  **and `pTypeAnnot`** (a type annotation recurses on its own,
+  `array<array<...>>`; unguarded until 2026-10-12, a 20000-deep one
+  overflowed the stack). A new recursive parse function takes a
+  `NestGuard`.
   **The oracle is the debug+ASan+UBSan lane; a release build hides all of
   this.** When you add a runtime path, ask what it does with a program that has
   no statements, no slots, or absurd depth.
