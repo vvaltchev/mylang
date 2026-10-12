@@ -1214,6 +1214,25 @@ runtime instead.
     nullable lookup, or `dict(default)` for a default value. A write
     (`d[k] = v`) inserts the key.
 
+    **A dictionary keeps INSERTION ORDER**, as Python's does: printing it,
+    `foreach`, `keys()`/`values()`/`kvpairs()`, `map`/`filter` and every
+    copy visit the keys in the order they were added. Storing over a key
+    that is already there keeps its place; a key that was erased and is
+    inserted again goes last. A dict literal, `dict(pairs)` and
+    `make_dict()` insert in the order they are written or given. Two dicts
+    holding the same pairs in different orders are still `==` and hash
+    equal - the order is never part of a dict's value.
+
+    ```C#
+    var d = {"z": 1, "a": 2};
+    d["m"] = 3;
+    d["z"] = 0;              # an existing key keeps its place
+    print(keys(d));          # ["z", "a", "m"]
+    erase(d, "z");
+    d["z"] = 5;              # inserted again: last
+    print(d);                # {"a": 2, "m": 3, "z": 5}
+    ```
+
   * **Function**
     Both standalone functions and lambdas have the same object type and can be passed
     around like any other object (see below). But, only lambdas can have a capture list.
@@ -1791,7 +1810,8 @@ result is defined, and identical in every engine:
     independent copy, so changing the array it was taken from never
     affects it.
   * **A dictionary** loop visits each key the dictionary held when the loop
-    started, once, **if the key is still there when its turn comes**, with
+    started, once, in the dictionary's order, **if the key is still there
+    when its turn comes**, with
     its value at that moment. Keys the body inserts are not visited, keys it
     erases before their turn are skipped.
   * Reassigning the loop's container **variable** does not affect the loop:
@@ -2993,7 +3013,7 @@ Return the integer hash used by dictionaries internally when `value` is a key.
 It works on **any** value — `bool`/`int`/`float`/`str`/`none` and, **deeply
 and by value**, `array`/`dict`/`struct`. Equal values hash equal: `true`/`1`,
 `1`/`1.0`, two arrays with the same elements, two dicts with the same pairs (in
-any insertion order, since a dict is unordered), two structs of the same type
+any insertion order: `==` ignores a dict's order), two structs of the same type
 with the same fields. The array/struct hash is **order-dependent** (`[1,2]` ≠
 `[2,1]`), the dict hash is **order-independent**. A string's hash is computed
 once and cached (strings are immutable). Because `hash()` is total, **any value
@@ -3104,18 +3124,21 @@ print(sum(none_yet, func(int x) => x * 0.5)); # 0.000000
 ### Dictionary builtins
 
 #### `keys(dictionary)`
-Return an array containing all the keys of the given dictionary.
+Return an array containing all the keys of the given dictionary, in its
+(insertion) order.
 
 #### `values(dictionary)`
-Return an array containing all the values of the given dictionary.
+Return an array containing all the values of the given dictionary, in its
+(insertion) order.
 
 #### `kvpairs(dictionary)`
 Return the contents of the given dictionary, in the form of an array of
-[key, value] arrays.
+[key, value] arrays, in its (insertion) order.
 
 #### `dict(array)` / `dict(default_value)`
 With an **array** argument, build a dictionary from an array of [key, value]
-arrays (the counterpart of `kvpairs()`). With any other (non-array, non-`none`)
+arrays (the counterpart of `kvpairs()`), in the array's order; on a
+duplicate key the later value wins, at the place of the first. With any other (non-array, non-`none`)
 argument, build an empty **default dict**: reading a missing key returns (and
 inserts) that default value instead of throwing, so accumulation works directly:
 
@@ -3130,7 +3153,8 @@ Return `{ keys[0]: gen_func(keys[0]), ..., keys[N-1]: gen_func(keys[N-1]) }` —
 the dictionary analogue of `make_array()` (a value-callback comprehension).
 `keys` is an array; `gen_func` is called once per key and returns that key's
 value. The result type is `dict<K, V>` with `K` the keys' element type and `V`
-the callback's return type. On a duplicate key the later one wins (as with
+the callback's return type. The keys go in the order of `keys`; on a
+duplicate key the later value wins, at the place of the first (as with
 `dict()`), and each key is frozen on insert. Example:
 
 ```C#

@@ -1113,11 +1113,11 @@ const pool holds a self-contained value.
     u32   n
     n x { value key; value value }
 
-MyLang dicts are UNORDERED by specification, and the pair order here is the
-writer's hash-map iteration order.  A rebuilt map may therefore iterate
-differently than the map that was written.  That is legitimate and observable
-only in the ORDER a const dict prints - the one respect in which a loaded
-image's `-vd` dump can differ from a fresh compile's (2 of 86 corpus files).
+The pairs are in the dict's ORDER, which MyLang specifies as insertion order
+(README, Dictionary): a reader inserts them in file order, and the loaded dict
+iterates exactly as the written one did.  (Until 2026-10-12 dicts were
+unordered and this was the writer's hash-map order, which a rebuilt map did
+not keep; the bytes did not change, only what their order means.)
 
 11.3  strct
 

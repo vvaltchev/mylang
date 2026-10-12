@@ -2129,7 +2129,7 @@ public:
      * exactly like the general-array path. */
     bool container_is_str = false;
     /* Set by the inferencer for a non-indexed 1- or 2-var loop over a proven
-     * DICT: the VM iterates it natively with a LIVE unordered_map iterator
+     * DICT: the VM iterates it natively with a LIVE map iterator
      * (DictIterInit/DictIterNext), binding the key (1-var) or key+value (2-var)
      * box-free. A dict has no O(1) index, so this is a separate loop shape from
      * the counted array foreach. */

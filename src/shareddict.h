@@ -5,8 +5,7 @@
 #include "defs.h"
 #include "flatval.h"
 #include "intrusiveptr.h"
-#include <unordered_map>
-#include "poolalloc.h"
+#include "orderedmap.h"
 
 template <class EvalValueT, class LValueT>
 class DictObjectTempl : public RefCounted {
@@ -14,15 +13,12 @@ class DictObjectTempl : public RefCounted {
 public:
 
     ML_POOL_NEW_DELETE_K(IOK_DICT)
-    /* H2 v2: the NODE-POOLED map (poolalloc.h) - a chained unordered_map
-     * heap-allocated a ~96-byte node per insert; the pool serves those
-     * from program-lifetime free lists. Node-pointer stability (what the
-     * held-LValue* runtime paths rely on) is untouched - rehash moves
-     * only the bucket array. */
-    typedef std::unordered_map<
-        EvalValueT, LValueT,
-        std::hash<EvalValueT>, std::equal_to<EvalValueT>,
-        PoolAlloc<std::pair<const EvalValueT, LValueT>>> inner_type;
+    /* #50: an INSERTION-ORDERED hash map (orderedmap.h) - every walk over
+     * a dict visits its keys in the order they were added. Its nodes are
+     * pooled (poolalloc.h) and never move until erased, which is what the
+     * held-LValue* runtime paths rely on. */
+    typedef OrderedHashMap<EvalValueT, LValueT, std::hash<EvalValueT>,
+                           std::equal_to<EvalValueT>> inner_type;
 
 private:
     inner_type data;
@@ -48,10 +44,11 @@ public:
 
     /*
      * #53: a FOREACH over a dict walks it through a Cursor, and the body may
-     * insert or erase keys of that same dict. A live unordered_map iterator
-     * does not survive either (an insert may rehash; an erase frees the
-     * node the iterator points at - both were use-after-frees, and the
-     * engines visited different sequences). The DEFINED semantics:
+     * insert or erase keys of that same dict. A live iterator does not
+     * survive an erase (it frees the node the iterator points at - a
+     * use-after-free, and the engines visited different sequences), and
+     * a walk of the live order would visit the keys the body appends.
+     * The DEFINED semantics:
      *
      *   the loop visits each key the dict held when the loop STARTED, once,
      *   in the dict's order, if the key is still present when its turn

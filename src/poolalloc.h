@@ -6,11 +6,13 @@
 #include <new>
 
 /*
- * A single-threaded NODE POOL allocator for std::unordered_map (H2 v2,
- * plans/archived/vm-performance-roadmap.md - the maintainer-approved alternative to
- * a flat open-addressing map, which was REJECTED: it would break the
- * element-pointer stability the runtime relies on - dict values are LValues
- * written through held LValue* - for a modest lookup win).
+ * A single-threaded NODE POOL allocator for the node-based std containers
+ * (H2 v2, plans/archived/vm-performance-roadmap.md - the maintainer-approved
+ * alternative to a flat open-addressing map, which was REJECTED: it would
+ * break the element-pointer stability the runtime relies on - dict values
+ * are LValues written through held LValue* - for a modest lookup win). The
+ * dict's own map (orderedmap.h, #50) pools its nodes through
+ * ML_POOL_NEW_DELETE, the same free lists.
  *
  * The measured cost it removes: a chained unordered_map heap-allocates a
  * ~96-byte node PER INSERT (hash + the 32-byte EvalValue key + 48-byte

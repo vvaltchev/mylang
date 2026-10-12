@@ -2695,8 +2695,8 @@ slices act like independent copies (MyLang via lazy copy-on-write, so read-only
 slicing is far cheaper),
 `clone()` makes a shallow copy and `deepclone()` a deep one — with the
 divergences (64-bit wrapping vs bignum,
-truncating vs flooring division, unordered vs insertion-ordered dicts)
-enumerated there. (Floats match: both are 64-bit IEEE `double`.)
+truncating vs flooring division) enumerated there - both languages keep
+a dict's insertion order (#50). (Floats match: both are 64-bit IEEE `double`.)
 `bench/verify_semantics.{my,py}` assert that equivalence and must both print the
 same line.
 
@@ -2992,6 +2992,10 @@ nothing to register).
   `DeclType`/`SymKind`/`ResolvedSym` enums it needs (moved here from
   syntax.h). The runtime call model reads ONLY this - see the value-model
   section and plans/archived/vm-ast-free-runtime.md.
+- `orderedmap.h` — **`OrderedHashMap`**, the dict's map (#50): a chained
+  hash table whose entries also form an INSERTION-ORDER list, which is what
+  every walk over a dict follows. See the `DictObject` bullet under
+  *Copy-on-write containers*.
 - `cyclewalk.h` — **THE CYCLE GUARD** (header-only, plus
   `cyc_keep_until_exit` / `cyc_release_kept` in eval.cpp): the container
   keys, path stacks, pair stack and copy stack every recursive walk over a
@@ -3303,10 +3307,11 @@ and it lives *inside the parser*. Mechanics:
   the huge buffer. A value that CONTAINS ITSELF is the exception: `clone()`
   of a ring is its one-step unrolling, so a folded `var r = mk();` and the
   same call at run time compared and printed differently (RULE 2); it is
-  baked by `make_mutable_bake`, a cycle-preserving deep copy whose dicts
-  keep their iteration order as `clone()` does - a plain deep copy rebuilds
-  each map, and `corpus_diff`'s `-nc vs default` pass caught the reordered
-  print of an ordinary folded dict when the bake was one.) `LiteralObj`
+  baked by `make_mutable_clone`, a cycle-preserving deep copy - which
+  keeps every dict's order, since a dict iterates in insertion order and a
+  copy inserts in that order (#50; a hash-ordered rebuild once reordered
+  the print of a folded dict, which `corpus_diff`'s `-nc vs default` pass
+  caught).) `LiteralObj`
   carries an **`immutable`** flag. The materializer sets
   it when **either** the target is a `const` decl (`fl & pInConstDecl`) **or the
   value itself is already read-only** (`is_readonly_value()`). The second case
@@ -6669,10 +6674,22 @@ are unchanged.
   `plans/archived/typed-arrays.md` (approach B) and
   `plans/archived/type-driven-specialization.md`.
 - **`DictObject`** (`shareddict.h`): the value handle is
-  `intrusive_ptr<DictObject>` (the object inherits `RefCounted`); the map is a
-  **`std::unordered_map<EvalValue, LValue>`** inside it — an O(1) hashmap (NOT a
-  sorted tree), keyed by `std::hash<EvalValue>` (→ `EvalValue::hash()` →
-  `Type::hash`) and `EvalValue::operator==`.
+  `intrusive_ptr<DictObject>` (the object inherits `RefCounted`); the map is
+  an **`OrderedHashMap<EvalValue, LValue>`** (`orderedmap.h`) inside it — an
+  O(1) chained hashmap keyed by `std::hash<EvalValue>` (→
+  `EvalValue::hash()` → `Type::hash`) and `EvalValue::operator==`, whose
+  entries also form a list in **INSERTION ORDER** (#50, maintainer
+  2026-10-12): every walk over a dict - foreach, `keys`, printing, a copy,
+  the `.myv` writer - visits that list, so the order is the PROGRAM's,
+  identical in every engine, standard library and image (a
+  `std::unordered_map`'s order was libstdc++'s or libc++'s, and a rebuilt
+  map - a deep copy, a load - came out differently, so a folded dict and
+  the same dict built at run time printed in two orders). A store over an
+  existing key keeps its place; an erased key inserted again goes last; `==`
+  and `hash` ignore the order. The node never moves until erased (held
+  `LValue*`s rely on it), its hash is cached (a copy hashes nothing), and
+  the equality test keeps libstdc++'s argument order (the looked-up key on
+  the left).
 - **Universal `hash()` (deep, by value).** `Type::hash` returns `size_t`; the
   base throws, the leaves (`int`/`bool`/`float`/`str`) hash directly, and
   `none` + the containers/structs hash deeply (`hashing.h` combiners,
@@ -8699,11 +8716,10 @@ passes that hold state ACROSS inputs. Run it under **RECYCLE=1 + ASan** -
 the REPL retains ASTs, so it is where a stale-node identity bug would
 live, and that is the detector CLAUDE.md already names for the class. Verified:
 83/84 of bench/ + samples/ run identically from an image (the one
-exception, rand_sort, calls `rand()`), 84/86 also dump byte-identically
-(the 2
-residuals differ ONLY in the printed ORDER of a const dict's entries -
-MyLang dicts are unordered by spec, and a rebuilt hash map's iteration
-order legitimately differs). Sizes vs the source (after v3's compact
+exception, rand_sort, calls `rand()`), and since dicts keep insertion
+order (#50) a loaded image's dicts iterate exactly as the written ones
+(the order a const dict printed in used to be the one difference between
+a loaded image's `-vd` and a fresh compile's). Sizes vs the source (after v3's compact
 instructions, v4's dropped derived pool, v5's delta locs, v6's narrow
 pool Locs): fib 2.26x, shopping 1.60x, gcd 0.87x - SMALLER than its
 source (v1 was 4.7x / 4.76x / 2.72x). The REPL is out of scope

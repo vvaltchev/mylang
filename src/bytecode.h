@@ -279,7 +279,7 @@ enum class OpCode : unsigned char {
     LoadStructElemV,
 
     /*
-     * Native dict `foreach` via a LIVE unordered_map iterator (a dict has no
+     * Native dict `foreach` via a LIVE map iterator (a dict has no
      * O(1) index, so it can't use the counted-loop machine). The per-loop
      * iterator STATE lives in a `vm_run_chunk`-local vector sized by
      * `Chunk::n_dict_iters`, indexed by a codegen-assigned `iter_id`.
