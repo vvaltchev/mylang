@@ -6489,6 +6489,23 @@ the atomic-refcount churn from copy-heavy array/dict code. **Gotcha:**
 fresh count, never the original's (else it would never be freed). `use_count()`
 keeps shared_ptr's meaning (handles sharing the pointee), so the `> 1` COW tests
 are unchanged.
+**⛔ A COUNTED OBJECT IS FREED THROUGH `destroy_counted`, NEVER A BARE
+`delete` (2026-10-12).** Freeing an object releases what it holds, so a
+CHAIN - a linked list of class nodes, arrays or dicts nested 100k deep,
+a `box` of a struct holding the next box - was freed by RECURSION, a few
+C++ frames per link: a 20000-node list overflowed a debug build's stack
+and a 1M-deep one a release build's (RULE 1: a SIGSEGV), wherever its
+head was dropped, program exit included. `intrusive_ptr::destroy` and
+`sobj_release` (the flat class array's raw counts) call
+`destroy_counted` (intrusiveptr.h): up to `DESTROY_MAX_DEPTH` (32)
+deletions nest as before, a deeper one is QUEUED, and the outermost one
+empties the queue before it returns - the recursion is bounded, the
+order of destruction changes, and nothing else does (no destructor runs
+program code). A new place that drops a count to 0 by hand must call it
+too. Net: `tests/functional/92_long_chain_release.my` (watched failing:
+ASan stack-overflow with `destroy` back to `delete`). The VALUE walks
+(print, `==`, hash, the deep copies, the `.myv` codec) still recurse
+per level of a deep value - a separate open item.
 
 - **`SharedStr`** (`sharedstr.h`): an `intrusive_ptr<StrObj{string}>` plus an
   `off`/`len` WINDOW (StrObj just wraps the string so it can carry the count).

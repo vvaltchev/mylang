@@ -1,0 +1,56 @@
+# A long CHAIN of values is freed without the release running out of
+# stack (2026-10-12). Freeing an object releases what it holds, so a
+# linked list was freed by recursion, one level per node: a 20000-node
+# list overflowed a debug build's stack (a 1M-deep one a release build's)
+# wherever its head was dropped - at the end of the program too. Each
+# shape below is built 60000 long, dropped, and the program goes on; the
+# last one is still alive when the program ends.
+
+class N { int v; N? next; }
+class M { int v; array<M> kids; }
+struct S { int v; dyn? next; }
+
+func class_list(int n) {
+    var h = N(0, none);
+    for (var i = 1; i < n; i++) { h = N(i, h); }
+    return h;
+}
+
+const LEN = 60000;
+
+# a linked list of class nodes
+var h = class_list(LEN);
+assert(h.v == LEN - 1);
+h = N(-1, none);
+print("class list dropped");
+
+# arrays nested inside arrays
+var a = [];
+for (var i = 0; i < LEN; i++) { a = [a]; }
+assert(len(a) == 1);
+a = [];
+print("nested arrays dropped");
+
+# dicts nested inside dicts
+var d = {};
+for (var i = 0; i < LEN; i++) { d = {"n": d}; }
+assert(len(d) == 1);
+d = {};
+print("nested dicts dropped");
+
+# struct values chained through a dyn field
+var dyn? s = S(0, none);
+for (var i = 1; i < LEN; i++) { s = S(i, s); }
+s = none;
+print("struct chain dropped");
+
+# class instances inside a flat class array, nested
+var m = M(0, []);
+for (var i = 1; i < LEN; i++) { m = M(i, [m]); }
+assert(m.v == LEN - 1);
+m = M(-1, []);
+print("class array chain dropped");
+
+# ... and one chain alive when the program ends
+var keep = class_list(LEN);
+print(keep.v);
