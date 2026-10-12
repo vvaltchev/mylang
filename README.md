@@ -1103,8 +1103,8 @@ runtime instead.
     `s[i]` is the one-character string at `i`, indexed like an array (below).
     Immutability holds through aliases, exactly as in Python: after
     `var b = a; a += "!"`, `b` is unchanged. `s += x` is still amortized
-    O(n) for the usual accumulator loop - it appends in place when it can
-    do so unobservably (see *Copy-on-write* below).
+    O(n) for the usual accumulator loop - it appends in place when no other
+    string can see the change.
     A `"..."` literal **may span multiple lines**, and the line breaks are kept
     as `\n` in the value (Ruby-style); the usual escapes (`\n`, `\t`, `\"`,
     `\\`, …) work too. An unterminated string (no closing `"` before
