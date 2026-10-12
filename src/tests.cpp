@@ -15454,6 +15454,22 @@ static const std::vector<test> tests =
         },
     },
 
+    /* a const's bake of a FRESH value (frozen because its target is a
+     * constant) is not shared with a `var` of the same expression: the
+     * var got the constant's read-only value, so an earlier identical
+     * const decided whether `append(y, 3)` worked (-nc disagreed) */
+    {
+        "CSE: a const's frozen result is not shared with a var",
+        {
+            "pure func mk() => [1, 2];",
+            "const X = mk(); var y = mk(); append(y, 3);",
+            "assert(len(y) == 3 && len(X) == 2);",
+            "const Z = mk(); assert(intptr(X) == intptr(Z));",
+            "const A = [3, 1, 2]; const S = sort(A);",
+            "var t = sort(A); append(t, 4); assert(len(t) == 4);",
+        },
+    },
+
     {
         "CSE: different slice bounds do NOT share",
         {
@@ -26699,6 +26715,12 @@ static bool const_fold_equivalence()
             "const array<array<float?>> C = [[1]];",
             "var c = C[0];",
             "print(c, array_storage(c));" } },
+        { "an identical const expression does not freeze a var", {
+            "pure func mk() => [1, 2];",
+            "const X = mk(); var y = mk(); append(y, 3);",
+            "const A = [3, 1, 2]; const S = sort(A);",
+            "var t = sort(A); append(t, 4);",
+            "print(X, y, S, t);" } },
         { "an empty [] into array<PodStruct> starts flat", {
             "struct P { int x; }",
             "var pts = [];",
