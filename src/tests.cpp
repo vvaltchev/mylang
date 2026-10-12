@@ -8980,6 +8980,48 @@ static const std::vector<test> tests =
     },
 
     {
+        /* `+=` on an array grows it IN PLACE, so every alias sees it - it
+         * built a FRESH array whenever the left side was not general (or
+         * the same flat scalar kind as the right), which made a flat
+         * strs or struct array lose its aliases, and let a flat array
+         * through a `dyn` alias take a value its storage cannot hold (a
+         * fresh general array, where append raises TypeErrorEx). */
+        "+= on a flat array keeps aliases and refuses a misfit",
+        {
+            "struct P { int x; }",
+            "func grow(a) { a += [P(int(runtime(9)))]; }",
+            "var s = split(\"a b\", str(runtime(\" \")));",
+            "var t = s;",
+            "t += [\"c\"];",
+            "assert(len(s) == 3 && t == s && array_storage(s) == \"str\");",
+            "t += [1];",
+            "assert(len(s) == 4 && s[3] == 1);",
+            "var aa = split(\"x y\", str(runtime(\" \")));",
+            "aa += aa;",
+            "assert(aa == [\"x\", \"y\", \"x\", \"y\"]);",
+            "var ps = [P(int(runtime(1))), P(2)];",
+            "var qs = ps;",
+            "qs += [P(3)];",
+            "grow(ps);",
+            "assert(len(ps) == 4 && ps[3].x == 9 && qs == ps);",
+            "assert(array_storage(ps) == \"struct\");",
+            "var k = [1, 2];",
+            "var dyn d = k;",
+            "var caught = 0;",
+            "try { d += [1.5]; } catch (TypeErrorEx) { caught++; }",
+            "try { d += [3, \"s\"]; } catch (TypeErrorEx) { caught++; }",
+            "assert(caught == 2 && k == [1, 2] && d == k);",
+            "var f = [1.5];",
+            "var dyn df = f;",
+            "df += [2, true];",
+            "assert(f == [1.5, 2.0, 1.0] && array_storage(f) == \"float\");",
+            "var sl = s[0:1];",
+            "sl += [\"z\"];",
+            "assert(sl == [\"a\", \"z\"] && len(s) == 4);",
+        },
+    },
+
+    {
         /* insert(d, k, v) stored a container key UNFROZEN - every other
          * insert site freezes it (make_const_clone) - so mutating the key
          * afterwards changed its hash under the map: the entry printed
