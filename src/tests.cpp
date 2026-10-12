@@ -735,6 +735,17 @@ static const std::vector<test> tests =
     /* A const SCALAR target is the folded value `K = 6` is - not a
      * location - in any position of a multi-assignment: first it was a
      * syntax error at the comma, later an "Undefined variable 'K'". */
+    /* #45: a declaration-site type error marks the declared NAME (it was
+     * a zero-width span, "col 5:4", one column left of the name) */
+    { "err loc: DynRequiredEx marks the variable's name",
+      { "var xyz = runtime(1);" },
+      &typeid(DynRequiredEx), 5, 1, 9, 1 },
+    { "err loc: OptRequiredEx marks the parameter's name",
+      { "func h(abc) => abc; h(none); h(1);" },
+      &typeid(OptRequiredEx), 8, 1, 12, 1 },
+    { "err loc: a generic container annotation's mismatch marks the name",
+      { "func g() { array arr2 = {}; }" },
+      &typeid(TypeMismatchEx), 18, 1, 23, 1 },
     { "err loc: a const scalar as a later multi-assign target",
       { "const K = 5; var a = 0;",
         "a, K = [1, 2];" },

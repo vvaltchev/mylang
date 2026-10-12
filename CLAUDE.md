@@ -4541,6 +4541,10 @@ decisions behind it: `plans/archived/type-inference.md`,
   idlist target) - `contribute` used to pass `Loc()` as the end, a
   zero-width caret. The one site with no node is value-template
   instantiation's phantom signature contribution (`Loc(), Loc()`).
+  A DECLARATION-site error (DynRequiredEx, OptRequiredEx, a generic
+  `array`/`dict` annotation's mismatch) marks the declared name:
+  `TypeSym::decl_end` beside `decl_loc` (#45 - it was the zero-width
+  span `decl_loc, decl_loc`, printed "col 5:4").
   **A CAPTURE'S INNER NAME IS BOUND TO THE OUTER `TypeSym` (it shares the
   outer's static type, by design) BUT IS ITS OWN BINDING (H6):**
   `Scope::capture_names` marks those aliases and `capture_uses` records
