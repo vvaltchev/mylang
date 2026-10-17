@@ -1264,6 +1264,9 @@ Key rules:
   * A variable's type is the **join** of everything assigned to it. Assigning an
     incompatible type on any path is an error. `int` automatically widens to
     `float` (so `var x = 1; x = 2.5;` is fine, and `x` becomes a `float`).
+    A type and its nullable form join to the nullable one, a struct or
+    class type included: `var p = P(1); p = maybe_p;` with a `P?` makes
+    `p` a `P?`, as `c ? P(1) : maybe_p` is.
   * **A function value's type is its whole signature, not just its arity.** A
     variable holding a function may only be assigned functions with the *same*
     parameter and return types, so the signature a call site sees is one the
