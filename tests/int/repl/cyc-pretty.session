@@ -1,0 +1,35 @@
+# The `=>` echo pretty-prints a container wider than the line: one
+# element / entry / field per line, recursively, a value under its key
+# (README, the REPL echo). Structs (POD and boxed), a field-less struct,
+# a box of a struct, nested dicts, and values that contain themselves -
+# a dict through an array, a class instance through its own field -
+# whose back edges print as {...} / [...] / Name(...). The rings are
+# broken at the end.
+struct P { int x; int y; }
+struct Big { int a; int b; int c; int d; int e; int f; }
+struct W { str name; array<int> vals; dict<str,int> m; }
+struct Unit {}
+class CN { str tag; opt CN next; }
+Unit()
+[Unit(), Unit()]
+Big(1000000001, 1000000002, 1000000003, 1000000004, 1000000005, 1000000006)
+W("a fairly long name to make the line wide", [1, 2, 3, 4, 5, 6, 7], {"k": 1})
+box(Big(1000000001, 1000000002, 1000000003, 1000000004, 1000000005, 1))
+box(P(1, 2))
+var dyn nest = {"outer": {"middle": {"inner": [100000001, 100000002,
+    100000003, 100000004]}}}
+[nest]
+var dyn two = {"first": [100000001, 100000002, 100000003],
+    "second": [200000001, 200000002, 200000003]}
+var dyn cd = {}
+cd["self"] = [
+  "a long payload string to push this dict well past the width", cd]
+cd
+[cd]
+var cn = CN(
+  "a long tag string so that the class instance is wider than 80", none)
+cn.next = cn
+cn
+[cn]
+erase(cd, "self")
+cn.next = none

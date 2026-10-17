@@ -1,0 +1,23 @@
+# Constants built at compile time, across REPL inputs: a constant array
+# naming a pure function from an EARLIER input and a builtin, cyclic
+# constants (an array ring and a default-dict ring) echoed, compared
+# with run-time rings, typed by :type and listed by :globals. The rings
+# the session builds as vars are broken at the end.
+pure func sq(x) => x * x
+const OPS = [sq, len]; len(OPS)
+OPS[0](3) + OPS[1]("ab")
+pure func mk(n) { var dyn r = [n, "x"]; r[1] = r; return r; }
+const C = mk(1)
+C
+C == mk(1)
+:type 0; C
+var dyn m = mk(2)
+m[1][1][0]
+pure func mkd(n) { var dyn d = dict({"z": n}); d["me"] = d; return d; }
+const D = mkd(3)
+D["me"]["me"] == D && len(D) == 1
+var dyn dv = mkd(3)
+dv == D
+:globals
+pop(m)
+erase(dv, "me")

@@ -1,0 +1,149 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): the reflection builtins' rendering of DECLARED types
+# (src/builtins/reflect.cpp.h: reflect_struct_ctor, reflect_field_type,
+# reflect_annot_str, reflect_param_str, reflect_func_sig) for every kind
+# of struct field and parameter - plain keywords, `opt` forms, nested
+# parameterized containers, boxes of each element kind, struct and class
+# fields - through signature(), layout() and the StructField records.
+# README *signature(f)* / *layout(struct_or_type)*: a struct's signature
+# is its constructor form, a field's type its declared form, with the
+# `?` nullability suffix of decltype (README *decltype*) for an annotated
+# container. So the oracle for every annotated field is decltype of a
+# variable declared with the SAME annotation - a second, independent
+# rendering (the inferencer's static_type_to_string) that must agree.
+# The POD offsets follow README's own layout example (natural alignment,
+# 8-byte int/float).
+
+struct P { int x; int y; }
+struct All { bool b; int i; float f; str s; array a; dict d; dyn y;
+             box<int> bi; P p; array<int> ai; array<float?> af;
+             dict<str,P> dsp; dict<int, array<bool>> dia; box<P> bp;
+             opt array<str> oas; array<dyn> ad; opt dict od;
+             opt array oa; array<array<int>?> aai; opt dyn ody;
+             opt box<int> obi; box<str> bs; box<float> bf; box<bool> bb;
+             dict<str, dyn?> dd; }
+class K { int v; opt K next; array<K> kids; opt box<P> ob; }
+struct Pod { bool b; int i; float f; P p; const Z = 1; }
+struct Qm { array<int>? q; opt array<int>? r; opt dict<str,int>? s;
+            dyn? dq; box<P>? bq; }
+
+var bad = 0;
+func want(str what, dyn got, dyn exp) {
+    if (str(got) != str(exp)) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " +
+              str(exp));
+        bad += 1;
+    }
+}
+
+# 1. the constructor form lists every field in its declared form
+want("All signature", signature(All),
+     "All(bool b, int i, float f, str s, array a, dict d, dyn y, " +
+     "box<int> bi, P p, array<int> ai, array<float?> af, " +
+     "dict<str,P> dsp, dict<int,array<bool>> dia, box<P> bp, " +
+     "array<str>? oas, array<dyn> ad, opt dict od, opt array oa, " +
+     "array<array<int>?> aai, opt dyn ody, box<int>? obi, box<str> bs, " +
+     "box<float> bf, box<bool> bb, dict<str,dyn?> dd)");
+want("class signature", signature(K),
+     "K(int v, opt K next, array<K> kids, box<P>? ob)");
+want("instance signature", signature(P(int(runtime(1)), 2)),
+     "P(int x, int y)");
+
+# 2. an annotated field's type is what decltype says of a variable
+#    declared the same way
+array<int> t_ai;
+array<float?> t_af;
+dict<str,P> t_dsp;
+dict<int, array<bool>> t_dia;
+box<P> t_bp = box(P(1, 2));
+opt array<str> t_oas;
+array<dyn> t_ad;
+array<array<int>?> t_aai;
+box<int> t_bi = box(1);
+opt box<int> t_obi;
+box<str> t_bs = box("s");
+box<float> t_bf = box(1.5);
+box<bool> t_bb = box(true);
+dict<str, dyn?> t_dd;
+var dyn annotated = {
+    "ai": decltype(t_ai).name, "af": decltype(t_af).name,
+    "dsp": decltype(t_dsp).name, "dia": decltype(t_dia).name,
+    "bp": decltype(t_bp).name, "oas": decltype(t_oas).name,
+    "ad": decltype(t_ad).name, "aai": decltype(t_aai).name,
+    "bi": decltype(t_bi).name, "obi": decltype(t_obi).name,
+    "bs": decltype(t_bs).name, "bf": decltype(t_bf).name,
+    "bb": decltype(t_bb).name, "dd": decltype(t_dd).name
+};
+var dyn plain = {
+    "b": "bool", "i": "int", "f": "float", "s": "str", "a": "array",
+    "d": "dict", "y": "dyn", "p": "P", "od": "opt dict",
+    "oa": "opt array", "ody": "opt dyn"
+};
+var dyn plain_pod = {"b": 1, "i": 1, "f": 1, "p": 1};
+var lay = layout(All);
+var seen = 0;
+foreach (var fd in lay.fields) {
+    var dyn ty = get(annotated, fd.name) ?? get!(plain, fd.name);
+    want("All." + fd.name, fd.type, ty);
+    # no byte layout: a boxed struct's fields have no offset, and a
+    # field that is not a POD scalar or POD struct has no size either
+    # (what size a POD-able field of a BOXED struct reports is not
+    # pinned here: README says -1, the builtin reports its POD size)
+    want("All." + fd.name + " has no offset", fd.offset, -1);
+    if (get(plain_pod, fd.name) == none)
+        want("All." + fd.name + " is boxed", [fd.size, fd.align], [-1, -1]);
+    seen += 1;
+}
+want("All field count", seen, len(annotated) + len(plain));
+want("All is boxed", [lay.pod, lay.size, lay.name], [false, 0, "All"]);
+
+# 2b. the `?` suffix and `opt` together say it once
+array<int>? t_q;
+opt dict<str,int>? t_s;
+box<P>? t_bq;
+want("Qm signature", signature(Qm),
+     "Qm(" + decltype(t_q).name + " q, " + decltype(t_q).name + " r, " +
+     decltype(t_s).name + " s, opt dyn dq, " + decltype(t_bq).name +
+     " bq)");
+want("Qm decltypes", [decltype(t_q).name, decltype(t_s).name,
+                      decltype(t_bq).name],
+     ["array<int>?", "dict<str,int>?", "box<P>?"]);
+
+# 3. a class: never POD, its own type as an `opt` field and as an
+#    array element type
+var kl = layout(K);
+var ktypes = [];
+foreach (var fd in kl.fields)
+    append(ktypes, fd.name + ":" + fd.type);
+want("K fields", ktypes, ["v:int", "next:opt K", "kids:array<K>",
+                          "ob:box<P>?"]);
+want("K layout", [kl.pod, kl.name], [false, "K"]);
+
+# 4. a POD struct: offsets, sizes and alignments by natural alignment,
+#    a nested POD struct inline; its const member is not a field
+var pl = layout(Pod(true, 2, 3.5, P(4, 5)));
+var prow = [];
+foreach (var fd in pl.fields)
+    append(prow, [fd.name, fd.type, fd.offset, fd.size, fd.align]);
+want("Pod fields", prow, [["b", "bool", 0, 1, 1], ["i", "int", 8, 8, 8],
+                          ["f", "float", 16, 8, 8], ["p", "P", 24, 16, 8]]);
+want("Pod layout", [pl.pod, pl.size, pl.align, len(pl.fields)],
+     [true, 40, 8, 4]);
+
+# 5. function signatures: modifiers, typed and dyn parameters, a lambda
+pure func hyp(float a, const int b, opt str c, dyn d) => a;
+func kw(bool b, array a, const dict d, opt int o) => len(a) + len(d);
+func plainf(a, ~b, opt dyn c) => a;
+var lam = func (x, y) => x;
+want("pure signature", signature(hyp),
+     "pure func hyp(float a, const int b, opt str c, dyn d)");
+want("dyn signature", signature(plainf),
+     "func plainf(a, dyn b, opt dyn c)");
+want("lambda signature", signature(lam), "func <lambda>(x, y)");
+want("keyword signature", signature(kw),
+     "func kw(bool b, array a, const dict d, opt int o)");
+want("calls", [hyp(1.5, 2, none, 3), plainf(4, 5), lam(6, 7),
+               kw(true, [1], {"k": 2})], [1.5, 4, 6, 2]);
+
+print(str(bad) + " failure(s)");
