@@ -1,0 +1,9 @@
+# INT-SOURCE: ../functional/79_inplace_builtin_targets.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): an in-place builtin works on the location its
+# first argument names: every struct the chain enters is the variable's
+# own, and a slice found there detaches in place.
+# The functional program runs as a coverage unit too, under the engines
+# above, with no second copy (INT-SOURCE); it asserts its own results and
+# every engine must print the same.
