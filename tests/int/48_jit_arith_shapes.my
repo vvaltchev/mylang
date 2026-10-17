@@ -1,0 +1,660 @@
+# INT-ENGINES: tw default nj noopt
+# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra ; MYLANG_JIT_XROT=3 ;
+#   MYLANG_JIT_OFF=all
+#
+# INT test (#107): the x86-64 JIT's ARITHMETIC emitters, reached from hot
+# loops (emit_op's int/float/bool/dyn arms, emit_div_magic, the mul
+# plans, the shift-count edges, 64-bit literals past imm32, the float
+# literal pool, the compare-and-branch fusion and the counted-loop steps
+# in emit_branch), the peephole's fused loop ops (each also interpreted
+# under -nj), AutoConst's folds, and the register allocators' pressure
+# paths (many live locals: spills, reloads, rotated pools). Operands come
+# from runtime() so nothing folds unless a case is about folding. The
+# div/mul/shift cases compare against the same sums by a runtime operand;
+# every other expected value was derived independently (a Python model of
+# the loop, or by hand). The tree-walker is the oracle in the runs, and
+# every engine must print the same.
+# The other configs re-run the program under the legacy register pick, a
+# rotated pool and every JIT lever off. (Not under MYLANG_NO_LOWMEM=1:
+# the register-form type tags abort a checked build's JIT register
+# tracker on a boxed compare in a loop with many pinned locals - the
+# pressure case under --no-opt all - a bug reported separately.)
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad = bad + 1;
+    }
+}
+
+# --- division / modulo by constants: the magic reciprocal, the power-of-
+# two arm, the big powers past k = 31, negative divisors, 1 and -1
+func divs(int n) {
+    var s = 0;
+    for (var i = -n; i < n; i++) {
+        var x = i * 7919 + 13;
+        s += x / 3 + x % 3;
+        s += x / 7 + x % 7;
+        s += x / -5 + x % -5;
+        s += x / 8 + x % 8;
+        s += x / -16 + x % -16;
+        s += x / 1024 + x % 1024;
+        s += x / 4294967296 + x % 4294967296;
+        s += x / 1 + x % 1;
+        s += x / -1 + x % -1;
+        s += x / 1000000007 + x % 1000000007;
+        s += x / 641 + x % 641;
+        s &= 281474976710655;
+    }
+    return s;
+}
+
+func divs_oracle(int n) {
+    # the same sums, through a runtime divisor (no constant to reduce)
+    var ds = [3, 7, -5, 8, -16, 1024, 4294967296, 1, -1, 1000000007,
+              641];
+    var s = 0;
+    for (var i = -n; i < n; i++) {
+        var x = i * 7919 + 13;
+        foreach (d in ds) s += x / d + x % d;
+        s &= 281474976710655;
+    }
+    return s;
+}
+want("div by constants", divs(int(runtime(100))),
+     divs_oracle(int(runtime(100))));
+
+# INT64_MIN / -1 and % -1 by a constant divisor must still raise
+func min_div(int x) { return x / -1; }
+func min_mod(int x) { return x % -1; }
+var lo = int(runtime(-9223372036854775807)) - 1;
+var got = "";
+for (var k = 0; k < 3; k++) {
+    try { got = str(min_div(lo)); } catch (InvalidValueEx) { got = "ovf"; }
+}
+want("INT64_MIN / -1", got, "ovf");
+got = "";
+for (var k = 0; k < 3; k++) {
+    try { got = str(min_mod(lo)); } catch (InvalidValueEx) { got = "ovf"; }
+}
+want("INT64_MIN % -1", got, "ovf");
+want("5 / -1", min_div(int(runtime(5))), -5);
+want("5 % -1", min_mod(int(runtime(5))), 0);
+
+func div_zero(int x, int d) { return x / d; }
+var dz = "";
+for (var k = 0; k < 3; k++) {
+    try { dz = str(div_zero(7, int(runtime(0)))); }
+    catch (DivisionByZeroEx) { dz = "dz"; }
+}
+want("x / 0", dz, "dz");
+
+# --- multiplication by constants: shl, lea (x3 x5 x9), shl+add, shl-sub,
+# lea+shl, negated forms, a constant past imm32, and the generic imul
+func muls(int n) {
+    var s = 0;
+    for (var i = -n; i < n; i++) {
+        var x = i + 12345;
+        s += x * 0 + x * 1 + x * -1 + x * 2 + x * 64;
+        s += x * 3 + x * 5 + x * 9 + x * -3 + x * -9 + x * -8;
+        s += x * 17 + x * 33 + x * 7 + x * 15 + x * 31;
+        s += x * 6 + x * 40 + x * 72 + x * 11 + x * -7 + x * 1000;
+        s += x * 8589934592 + x * 12884901891;
+        s = s ^ (s >> 13);
+    }
+    return s;
+}
+func muls_oracle(int n) {
+    var ms = [0, 1, -1, 2, 64, 3, 5, 9, -3, -9, -8, 17, 33, 7, 15, 31,
+              6, 40, 72, 11, -7, 1000, 8589934592, 12884901891];
+    var s = 0;
+    for (var i = -n; i < n; i++) {
+        var x = i + 12345;
+        var t = 0;
+        var j = 0;
+        foreach (m in ms) {
+            t += x * m;
+            j++;
+            if (j == 5 || j == 11 || j == 16 || j == 22) { s += t; t = 0; }
+        }
+        s += t;
+        s = s ^ (s >> 13);
+    }
+    return s;
+}
+want("mul by constants", muls(int(runtime(80))),
+     muls_oracle(int(runtime(80))));
+
+# --- shifts: counts 0, 1, 63, 64, 70 by constant and by variable.
+# (No `>>>` and no literal shifted VALUE in a loop: those lower to the
+# generic IntBin shift, whose negative-count raise is emitted while the
+# count borrows rcx - with a local pinned there, a checked build's JIT
+# register tracker aborts. A bug reported separately.)
+func shifts(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var x = i * 1234567 - 99999;
+        s += (x << 0) + (x << 1) + (x << 63) + (x << 64) + (x << 70);
+        s += (x >> 0) + (x >> 1) + (x >> 63) + (x >> 64) + (x >> 70);
+        s = s & 140737488355327;
+    }
+    return s;
+}
+func shifts_var(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var x = i * 1234567 - 99999;
+        var c = i % 72;
+        s += (x << c) ^ (x >> c);
+        s = s & 140737488355327;
+    }
+    return s;
+}
+func shifts_oracle(int n, bool lit) {
+    var cs = [0, 1, 63, 64, 70];
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var x = i * 1234567 - 99999;
+        if (lit) {
+            foreach (c in cs) s += x << c;
+            foreach (c in cs) s += x >> c;
+        } else {
+            var c = i % 72;
+            var t = x << c;
+            t ^= x >> c;
+            s += t;
+        }
+        s = s & 140737488355327;
+    }
+    return s;
+}
+want("shifts by literal", shifts(int(runtime(80))),
+     shifts_oracle(int(runtime(80)), true));
+want("shifts by variable", shifts_var(int(runtime(80))),
+     shifts_oracle(int(runtime(80)), false));
+var neg_shift = "";
+func shl_by(int x, int c) { return x << c; }
+var one = int(runtime(1));
+for (var k = 0; k < 3; k++) {
+    try { neg_shift = str(shl_by(one, int(runtime(-1)))); }
+    catch (InvalidValueEx) { neg_shift = "neg"; }
+}
+want("negative shift count", neg_shift, "neg");
+
+# --- bitwise and unary int ops, compound assignment forms
+func bits(int n) {
+    var a = int(runtime(21845));
+    var b = int(runtime(13107));
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        a = (a * 31 + i) & 1048575;
+        b = (b ^ (a << 3)) | (i & 7);
+        s += ~a & b;
+        s ^= -a;
+        s += (a | b) - (a & b);
+        var t = a;
+        t <<= 2; t >>= 1; t >>= 1; t |= 1; t &= 65535; t ^= 3855;
+        t *= 3; t -= 7; t += 11; t %= 1001; t /= 3;
+        s += t;
+        s = s & 1099511627775;
+    }
+    return s;
+}
+want("bit ops", bits(int(runtime(200))), 2970984);
+
+# --- int compares in every form, fused into branches and as values
+func cmps(int n) {
+    var c = 0;
+    var lim = int(runtime(37));
+    for (var i = -n; i < n; i++) {
+        var j = (i * 13) % 50;
+        if (i < j) c += 1;
+        if (i <= j) c += 2;
+        if (i > j) c += 4;
+        if (i >= j) c += 8;
+        if (i == j) c += 16;
+        if (i != j) c += 32;
+        if (i < 5) c += 1;
+        if (i <= -5) c += 1;
+        if (i > lim) c += 1;
+        if (i >= 0) c += 1;
+        if (i == 7) c += 1;
+        if (i != -7) c += 1;
+        if (3 < i) c += 1;
+        if (-3 >= i) c += 1;
+        var b1 = i < j;
+        var b2 = i == lim;
+        var b3 = j >= i;
+        c += int(b1) + int(b2) * 100 + int(b3);
+        if (b1 && !b3) c += 1000;
+        if (b1 || b2) c += 1;
+        if (!(i < j) && j > 3) c += 1;
+    }
+    return c;
+}
+want("int compares", cmps(int(runtime(150))), 13627);
+
+# --- float arithmetic: literal pools, mixed int/float, compares, unary
+func fl(int n) {
+    var acc = 0.0;
+    var x = float(runtime(0.5));
+    var y = float(runtime(-1.25));
+    for (var i = 0; i < n; i++) {
+        var f = i * 0.001 + x;
+        acc += f * 1.5 - y / 2.5 + 3.25;
+        acc -= f / 7.0;
+        acc += -f * 0.125 + i;
+        acc = acc * 0.999;
+        if (f < 0.75) acc += 0.0625;
+        if (f >= 1.0) acc -= 0.03125;
+        if (f == 0.5) acc += 100.0;
+        if (f != 0.5) acc += 0.5;
+        if (f > y) acc += 0.25;
+        if (f <= 0.6) acc += 0.1;
+        var m = f % 0.3;
+        acc += m;
+        var q = (f + 1.0) * (f - 1.0) / (f + 2.0);
+        acc += q;
+        # (an int quotient in its own variable: `(i / 3) * 0.5` written
+        # as one expression is computed in float by the typed pass -
+        # a bug reported separately)
+        var iq = i / 3;
+        acc += float(i % 3) + iq * 0.5;
+    }
+    return acc;
+}
+var flr = fl(int(runtime(300)));
+want("float loop", str(flr, 4), "49120.4003");
+
+func fl_cmp(int n) {
+    var c = 0;
+    var t = float(runtime(0.3));
+    for (var i = 0; i < n; i++) {
+        var f = i * 0.01;
+        var b = f < t;
+        if (b) c += 1;
+        if (f > t && f < 2.0 * t) c += 10;
+        if (f == 0.0 || f >= 0.99) c += 100;
+        c += int(f != t);
+    }
+    return c;
+}
+want("float compares", fl_cmp(int(runtime(100))), 619);
+
+# float division by zero raises in a hot loop
+func fdiv(float a, float b) { return a / b; }
+var fz = "";
+for (var k = 0; k < 3; k++) {
+    try { fz = str(fdiv(1.0, float(runtime(0.0)))); }
+    catch (DivisionByZeroEx) { fz = "dz"; }
+}
+want("float / 0.0", fz, "dz");
+func fmod0(float a, float b) { return a % b; }
+fz = "";
+for (var k = 0; k < 3; k++) {
+    try { fz = str(fmod0(1.0, float(runtime(-0.0)))); }
+    catch (DivisionByZeroEx) { fz = "dz"; }
+}
+want("float % -0.0", fz, "dz");
+
+# --- bool arithmetic (bool promotes to int) and logic
+func bools(int n) {
+    var s = 0;
+    var t = int(runtime(1)) == 1;
+    for (var i = 0; i < n; i++) {
+        var p = i % 3 == 0;
+        var q = i % 5 == 0;
+        s += p + q;
+        s += p * 10;
+        s += (p && q) + (p || q) * 2;
+        s += !p;
+        if (p == q) s += 1000;
+        if (p != t) s += 7;
+        var r = p ^ q;
+        s += r;
+        s -= q - p;
+    }
+    return s;
+}
+want("bool ops", bools(int(runtime(120))), 73288);
+
+# --- dyn operands: the generic arms
+func dyns(int n) {
+    var dyn a = runtime(3);
+    var dyn b = runtime(2.5);
+    var dyn c = runtime(true);
+    var dyn s = runtime(0);
+    for (var i = 0; i < n; i++) {
+        s = s + a * i - b;
+        s = s + c;
+        if (s > 1000.0) s = s - 999;
+        if (a < b) s = s + 1;
+        s = s + (a == 3) + (b != 2.5);
+        var dyn d = i % 2 == 0 ? a : b;
+        s = s + d / 2 + -d;
+        var dyn e = i;
+        s = s + e % 7 + e / 3 + (e << 1) + (e >> 1) + (e & 6) + (e | 1)
+            + (e ^ 5) + ~e;
+    }
+    return s;
+}
+want("dyn ops", str(dyns(int(runtime(80))), 3), "832.000");
+
+# --- many live locals across a loop: register pressure and spills, int
+# and float together, a value call in the middle (spill around a call)
+func helper(int a) { return a * 2 + 1; }
+func pressure(int n) {
+    var a = 1; var b = 2; var c = 3; var d = 4; var e = 5; var f = 6;
+    var g = 7; var h = 8; var k = 9; var m = 10; var p = 11; var q = 12;
+    var r = 13; var s = 14; var t = 15; var u = 16; var v = 17;
+    var fa = 0.5; var fb = 1.5; var fc = 2.5; var fd = 3.5;
+    var fe = 4.5; var ff = 5.5; var fg = 6.5; var fh = 7.5;
+    var fi = 8.5; var fj = 9.5; var fk = 10.5; var fl = 11.5;
+    var fm = 12.5; var fn = 13.5; var fo = 14.5; var fp = 15.5;
+    var fq = 16.5; var fr = 17.5;
+    for (var i = 0; i < n; i++) {
+        a += i; b += a; c += b; d += c; e += d; f += e; g += f; h += g;
+        k += h; m += k; p += m; q += p; r += q; s += r; t += s; u += t;
+        v += u;
+        if (i % 4 == 0) v += helper(a);
+        a &= 1023; b &= 1023; c &= 1023; d &= 1023; e &= 1023;
+        f &= 1023; g &= 1023; h &= 1023; k &= 1023; m &= 1023;
+        p &= 1023; q &= 1023; r &= 1023; s &= 1023; t &= 1023;
+        u &= 1023; v &= 1023;
+        fa += 0.25; fb += fa; fc += fb; fd += fc; fe += fd; ff += fe;
+        fg += ff; fh += fg; fi += fh; fj += fi; fk += fj; fl += fk;
+        fm += fl; fn += fm; fo += fn; fp += fo; fq += fp; fr += fq;
+        fa *= 0.5; fb *= 0.5; fc *= 0.5; fd *= 0.5; fe *= 0.5; ff *= 0.5;
+        fg *= 0.5; fh *= 0.5; fi *= 0.5; fj *= 0.5; fk *= 0.5;
+        fl *= 0.5; fm *= 0.5; fn *= 0.5; fo *= 0.5; fp *= 0.5;
+        fq *= 0.5; fr *= 0.5;
+    }
+    var si = a + b + c + d + e + f + g + h + k + m + p + q + r + s + t
+             + u + v;
+    var sf = fa + fb + fc + fd + fe + ff + fg + fh + fi + fj + fk + fl
+             + fm + fn + fo + fp + fq + fr;
+    return str(si) + "/" + str(sf, 3);
+}
+want("pressure", pressure(int(runtime(300))), "8236/65535.750");
+
+# --- int <-> float conversions and mixed compares in a loop
+func mixed(int n) {
+    var s = 0.0;
+    var c = 0;
+    for (var i = 0; i < n; i++) {
+        var f = i / 4.0;
+        var k = int(f);
+        s += k + f;
+        if (k < f) c += 1;
+        if (f == k) c += 2;
+        if (i > f) c += 4;
+        s += float(k) * 2;
+    }
+    return str(s, 2) + "/" + str(c);
+}
+want("mixed int/float", mixed(int(runtime(150))), "11007.75/784");
+
+# --- integer wraparound
+func wrap(int n) {
+    var x = int(runtime(9223372036854775000));
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        x += 100;
+        s ^= x;
+        x = x * 3;
+    }
+    return s;
+}
+want("wraparound", wrap(int(runtime(40))), -9043485664653484864);
+
+# --- 64-bit literals (past imm32) as operands, steps, bounds, compares
+func wide(int n) {
+    var s = 0;
+    var x = int(runtime(3));
+    for (var i = 0; i < n; i++) {
+        x = x + 5000000000;
+        s ^= x * 6000000007;
+        s += x & 4294967296;
+        s += (x | 8589934592) - x;
+        if (x < 30000000000) s += 1;
+        if (x > 12000000000) s += 2;
+        var y = x - 7000000000;
+        s += y;
+    }
+    # (the steps come from runtime(): a counted loop whose LITERAL step
+    # is past imm32 crashes the JIT - a bug reported separately)
+    var c = 0;
+    var up = int(runtime(7000000000));
+    var down = int(runtime(9000000000));
+    for (var k = 0; k < 50000000000; k += up) c++;
+    for (var k = 50000000000; k > 0; k -= down) c += 10;
+    return str(s) + "/" + str(c);
+}
+want("64-bit literals", wide(int(runtime(20))),
+     "-8649103084226461657/68");
+
+# --- counted loops with a VARIABLE step, up and down, and a
+# descending literal step; three-address adds and shifts into a
+# different destination (the lea and the non-in-place shift arms)
+func steps(int n, int st) {
+    var s = 0;
+    var t = 0;
+    for (var i = 0; i < n; i += st) s += i;
+    for (var i = n; i > 0; i -= st) s += i * 2;
+    for (var i = n; i >= -n; i -= 3) t += i;
+    for (var i = 0; i <= n; i += st + 1) t ^= i;
+    var a = int(runtime(11));
+    var b = int(runtime(13));
+    for (var i = 0; i < n; i++) {
+        var d = a + 7;
+        var e = a - 9;
+        var f = a + b;
+        var g = d << 64;
+        var h = e >> 70;
+        var m = f << 3;
+        var q = f >> 2;
+        s += d + e + f + g + h + m + q;
+        a = (a + i) % 1000;
+        b = (b * 3 + 1) % 1013;
+    }
+    return str(s) + "/" + str(t);
+}
+want("loop steps", steps(int(runtime(100)), int(runtime(7))),
+     "926164/35");
+
+# --- the fused loop ops (peephole): an element read by the counter
+# right after the step, a branch on an element, (a + b) % k, an add and
+# a step in one op - each interpreted under -nj, native otherwise -
+# plus element reads of bool arrays, string characters, dict floats
+# and the unary ops on dyn values
+func fused(int n) {
+    var ia = [];
+    var ba = [];
+    for (var i = 0; i < n; i++) {
+        append(ia, i % 5);
+        append(ba, i % 3 == 0);
+    }
+    var s = 0;
+    var cnt = 0;
+    for (var i = 0; i < n; i++) {
+        s += ia[i];
+        if (ia[i]) cnt += 1;
+        if (ba[i]) cnt += 2;
+        if (ia[-1 - i]) cnt += 4;
+        var b = ba[n - 1 - i];
+        if (b) cnt += 8;
+        s = (s + i) % 1000003;
+    }
+    var t = 0;
+    var k = int(runtime(3));
+    for (var i = 0; i < n; i++) t += k;
+    var str_s = "hello, world";
+    var ch = 0;
+    for (var i = 0; i < len(str_s); i++) {
+        if (str_s[i] == "o") ch += 1;
+        if (str_s[-1 - i] == "l") ch += 10;
+    }
+    var d = {"a": 1.5, "b": -2.25};
+    var fsum = 0.0;
+    for (var i = 0; i < n; i++) fsum += d["a"] * 2.0 + d["b"];
+    var dyn dv = runtime(7);
+    var dyn df = runtime(2.5);
+    var dyn db = runtime(true);
+    var u = 0;
+    for (var i = 0; i < n; i++) {
+        var dyn x = -dv;
+        var dyn y = ~dv;
+        var dyn z = !db;
+        var dyn w = -df;
+        var dyn p = +dv;
+        u += x + y + p;
+        if (z) u += 1000;
+        if (w < 0.0) u += 1;
+    }
+    return str(s) + "/" + str(cnt) + "/" + str(t) + "/" + str(ch) + "/"
+           + str(fsum, 2) + "/" + str(u);
+}
+want("fused loop ops", fused(int(runtime(80))),
+     "3320/590/240/32/60.00/-560");
+
+# --- an array literal of 70 computed elements (more temps than the
+# peephole's 64-bit live sets track, and past the array builder's
+# on-stack buffer), `continue` through a `finally`, and mods
+func big_lit(int x) {
+    var a = [x + 0, x + 1, x + 2, x + 3, x + 4, x + 5, x + 6,
+             x + 7, x + 8, x + 9, x + 10, x + 11, x + 12, x + 13,
+             x + 14, x + 15, x + 16, x + 17, x + 18, x + 19, x + 20,
+             x + 21, x + 22, x + 23, x + 24, x + 25, x + 26, x + 27,
+             x + 28, x + 29, x + 30, x + 31, x + 32, x + 33, x + 34,
+             x + 35, x + 36, x + 37, x + 38, x + 39, x + 40, x + 41,
+             x + 42, x + 43, x + 44, x + 45, x + 46, x + 47, x + 48,
+             x + 49, x + 50, x + 51, x + 52, x + 53, x + 54, x + 55,
+             x + 56, x + 57, x + 58, x + 59, x + 60, x + 61, x + 62,
+             x + 63, x + 64, x + 65, x + 66, x + 67, x + 68, x + 69];
+    var s = 0;
+    foreach (v in a) s += v;
+    return s;
+}
+want("70-element literal", big_lit(int(runtime(3))), 2625);
+func fin_cont(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        try {
+            if (i % 3 == 0) continue;
+            s += i;
+        } finally {
+            s += 1;
+        }
+    }
+    return s;
+}
+want("continue through finally", fin_cont(int(runtime(10))), 37);
+func mods(int n) {
+    var s = 0;
+    var a = int(runtime(5));
+    for (var i = 0; i < n; i++) {
+        var t = a + i;
+        s += t % 4294967296;
+        var u = a + i;
+        s += u % 7;
+    }
+    return s;
+}
+want("add-then-mod", mods(int(runtime(10))), 127);
+
+# --- AutoConst: write-once locals folded into conditions, brace-less
+# bodies that fold away to nothing, short-circuit chains with constant
+# operands, isconst / defined on locals
+func folds(int n) {
+    var DBG = false;
+    var ON = true;
+    var s = 0;
+    for (var i = 0; i < n; i++) if (DBG) s += 100;
+    foreach (v in [1, 2]) if (DBG) s += v;
+    var w = 0;
+    while (w < 3) if (DBG) w = 10; else w++;
+    if (n > 0) if (DBG) s += 1000; else s += 1;
+    if (n > 5) { if (DBG) s += 1; } else if (DBG) s += 2;
+    while (DBG) s++;
+    var j = 0;
+    for (var step = 2; j < n; j += step) s += j;
+    while (ON) { s += 5; break; }
+    var x = int(runtime(4));
+    if (DBG || x > 3) s += 7;
+    if (ON && x > 3) s += 11;
+    if (DBG || ON || x > 100) s += 13;
+    if (ON && DBG && x > 0) s += 17;
+    var b1 = DBG || (x > 1);
+    var b2 = ON && (x < 1);
+    if (b1) s += 19;
+    if (b2) s += 23;
+    if (isconst(DBG)) s += 29;
+    if (isconst(x)) s += 31;
+    if (defined(x)) s += 37;
+    return s + w;
+}
+want("constant folds", folds(int(runtime(10))), 145);
+
+# --- unary ops on dyn bools (promoted to int) and on a dyn string (a
+# TypeErrorEx caught in a loop), through the JIT's unary helper
+func unary_dyn(int n) {
+    var dyn db = runtime(true);
+    var dyn dz = runtime(false);
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var dyn a = -db;
+        var dyn b = +db;
+        var dyn c = ~dz;
+        var dyn d = -dz;
+        s = s + a + b + c + d;
+    }
+    var dyn str_v = runtime("x");
+    var caught = 0;
+    for (var i = 0; i < 3; i++) {
+        try { var dyn bad_v = -str_v; s = s + bad_v; }
+        catch (TypeErrorEx) { caught++; }
+    }
+    return str(s) + "/" + str(caught);
+}
+want("unary on dyn", unary_dyn(int(runtime(10))), "-10/3");
+
+# --- the counted step fused with the element read that opens the body
+# (up, down, a bool array, and past the end - OutOfBoundsEx)
+func elem_steps(int n) {
+    var a = [];
+    var b = [];
+    for (var i = 0; i < n; i++) {
+        append(a, i * 3 - 7);
+        append(b, i % 3 == 0);
+    }
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var v = a[i];
+        s += v * 3;
+        s = s ^ v;
+    }
+    for (var i = n - 1; i >= 0; i--) {
+        var v = a[i];
+        s = s * 7 + v;
+        s &= 65535;
+    }
+    for (var i = 0; i < n; i++) {
+        var w = b[i];
+        if (w) s += 1;
+    }
+    var oob = 0;
+    try {
+        for (var i = 0; i < n + 2; i++) {
+            var v = a[i];
+            s += v;
+        }
+    } catch (OutOfBoundsEx) { oob = 1; }
+    return str(s) + "/" + str(oob);
+}
+want("element steps", elem_steps(int(runtime(20))), "9235/1");
+
+if (bad == 0) print("48: all passed");
+else print("48: " + str(bad) + " failure(s)");
+assert(bad == 0);
