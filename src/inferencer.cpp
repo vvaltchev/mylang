@@ -450,8 +450,10 @@ private:
     StaticTypeRef member_base(StaticTypeRef t);
     /* can a value of this type key the pure-call cache? */
     bool cache_key_safe(StaticTypeRef t, int depth = 0);
-    /* the fix a misused box names ("read its value with *b") */
-    std::string box_use_hint(StaticTypeRef t, const Construct *e);
+    /* the fix a misused box names ("read its value with *b"); with
+     * `want`, only when the box's value fits it */
+    std::string box_use_hint(StaticTypeRef t, const Construct *e,
+                             StaticTypeRef want = nullptr);
     void check_deref(DerefExpr *d);
     void check_box_call(CallExpr *call);
     void check_value_into(StaticTypeRef dest, StaticTypeRef vt,
@@ -5934,10 +5936,18 @@ StaticTypeRef Inferencer::member_base(StaticTypeRef t)
     return el->kind == StaticTypeKind::Struct ? A.with_opt(el, t->opt) : t;
 }
 
-std::string Inferencer::box_use_hint(StaticTypeRef t, const Construct *e)
+std::string Inferencer::box_use_hint(StaticTypeRef t, const Construct *e,
+                                     StaticTypeRef want)
 {
     t = strip(static_type_resolve(t));
     if (!t || t->kind != StaticTypeKind::Box)
+        return "";
+    /* With a destination type, `*e` must be what fixes it: the box's
+     * value has to fit there. A box<int> handed to a box<float>
+     * parameter is not fixed by reading it (it said so) */
+    if (want && !(t->elem
+                  && static_type_assignable(static_type_resolve(t->elem),
+                                            static_type_resolve(want))))
         return "";
     if (e && e->is_id()) {
         const std::string nm(static_cast<const Identifier *>(e)->uid->val);
@@ -6123,7 +6133,7 @@ void Inferencer::check_declared_store(Expr14 *e)
                         e->rvalue->end);
         if (!static_type_assignable(strip(vt), dest))
             mismatch(what + " cannot hold '" + static_type_to_string(vt) +
-                         "'" + box_use_hint(vt, e->rvalue.get()),
+                         "'" + box_use_hint(vt, e->rvalue.get(), dest),
                      e->rvalue->start, e->rvalue->end);
         return;
     }
@@ -7195,7 +7205,7 @@ void Inferencer::check_call(CallExpr *call)
                          static_type_to_string(at) +
                              "' but the parameter is '" +
                          static_type_to_string(ptype) + "'" +
-                         box_use_hint(at, anode),
+                         box_use_hint(at, anode, ptype),
                      anode->start, anode->end);
     }
 }
