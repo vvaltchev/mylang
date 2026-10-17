@@ -1,0 +1,680 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): run-time stores into arrays, for every flat storage
+# README.md's array_storage() names - int, float, bool, str, struct, class
+# - and the general one: an element store (flat_store_core), append / push
+# / += (arr_push_value, arr_elem_fits), insert (builtin_insert_arr),
+# erase, pop, sort / rev_sort (with and without a comparator) and reverse,
+# each on a slice, next to a live slice and through a `dyn` alias, where
+# the static type proves nothing and the run-time checks decide: a bool
+# widens into numeric storage, a misfit refuses and leaves the array
+# alone, an index out of range is OutOfBoundsEx, a constant refuses the
+# change. Then the same builtins called through a `dyn` callee
+# (`var dyn ap = append; ap(s.inner.xs, 1)`), whose first argument is
+# still the location it names, the builtins' own argument checks reached
+# that way, a folded literal bound to a dyn variable (born general), and
+# arrays built at run time (a long literal, make_array, a mixed literal).
+# Values come from runtime() or a dyn alias: a constant would fold and a
+# proven type would take the typed path.
+
+struct P { int x; float y; }
+struct Q { int x; float y; }
+struct R { str s; }
+struct In { array<int> xs; }
+struct Out { In inner; array<In> ins; }
+class C { int v; }
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad = bad + 1;
+    }
+}
+
+func outcome(dyn f) {
+    try {
+        f();
+        return "ok";
+    } catch (NotLValueEx) {
+        return "NotLValueEx";
+    } catch (TypeErrorEx) {
+        return "TypeErrorEx";
+    } catch (OutOfBoundsEx) {
+        return "OutOfBoundsEx";
+    } catch (CannotChangeConstEx) {
+        return "CannotChangeConstEx";
+    } catch (KeyNotFoundEx) {
+        return "KeyNotFoundEx";
+    } catch (InvalidArgumentEx) {
+        return "InvalidArgumentEx";
+    } catch (InvalidNumberOfArgsEx) {
+        return "InvalidNumberOfArgsEx";
+    } catch (InvalidValueEx) {
+        return "InvalidValueEx";
+    }
+    return "unreachable";
+}
+
+# (globals a function reads below - bound before any call can reach it)
+var gxs = [1];
+var gm = [[3, 1], [2]];
+var go = Out(In([4, 2]), [In([9])]);
+
+# --- a flat POD-struct array, stored through a dyn alias
+var pts = [P(1, 1.5), P(2, 2.5), P(3, 3.5)];
+want("pts storage", array_storage(pts), "struct");
+var dyn dp = pts;
+dp[0] = P(10, 10.5);
+dp[-1] = P(30, 30.5);
+want("dp stores", pts[0].x + pts[2].x, 40);
+var dyn ki = runtime(1);
+var dyn ks = runtime("1");
+want("struct misfit int", outcome(func [dp] () { dp[0] = 5; }),
+     "TypeErrorEx");
+want("struct misfit def", outcome(func [dp] () { dp[0] = Q(1, 2.0); }),
+     "TypeErrorEx");
+want("struct misfit non-POD", outcome(func [dp] () { dp[0] = R("r"); }),
+     "TypeErrorEx");
+want("struct non-int key", outcome(func [dp, ks] () { dp[ks] = P(0, 0.0); }),
+     "TypeErrorEx");
+want("struct past end", outcome(func [dp] () { dp[3] = P(0, 0.0); }),
+     "OutOfBoundsEx");
+want("struct before start", outcome(func [dp] () { dp[-4] = P(0, 0.0); }),
+     "OutOfBoundsEx");
+# (a compound store has no meaning on a struct: it must refuse and leave
+# the element alone - the error class is reported separately)
+want("struct compound refused",
+     outcome(func [dp] () { dp[0] += 1; }) != "ok", true);
+want("struct compound left it", pts[0].x, 10);
+want("struct storage kept", array_storage(pts), "struct");
+var dyn dpsl = pts[0:2];
+dpsl[ki] = P(7, 7.5);
+want("struct slice store", dpsl[1].x, 7);
+want("struct slice source", pts[1].x, 2);
+var psl2 = pts[1:3];
+dp[ki] = P(8, 8.5);
+want("struct aliased slice", psl2[0].x, 2);
+want("struct aliased base", pts[1].x, 8);
+
+# --- a flat class array
+var cs = [C(1), C(2), C(3)];
+want("cs storage", array_storage(cs), "class");
+var dyn dc = cs;
+var c9 = C(9);
+dc[-1] = c9;
+want("class neg store", cs[2].v, 9);
+want("class non-int key", outcome(func [dc, ks] () { dc[ks] = C(0); }),
+     "TypeErrorEx");
+want("class past end", outcome(func [dc] () { dc[3] = C(0); }),
+     "OutOfBoundsEx");
+want("class before start", outcome(func [dc] () { dc[-4] = C(0); }),
+     "OutOfBoundsEx");
+var dyn dcsl = cs[0:2];
+dcsl[0] = c9;
+want("class slice store", dcsl[0] == c9, true);
+want("class slice source", cs[0].v, 1);
+var csl2 = cs[0:2];
+dc[0] = C(5);
+want("class aliased slice", csl2[0].v, 1);
+want("class aliased base", cs[0].v, 5);
+var cs2 = [C(1), C(2)];
+var dyn dc2 = cs2;
+dc2[0] = "s";
+want("class promoted", array_storage(cs2), "general");
+want("class promoted value", dc2[0], "s");
+var cs3 = [C(1), C(2)];
+var dyn dc3 = cs3;
+want("class compound", outcome(func [dc3] () { dc3[1] += 1; }),
+     "TypeErrorEx");
+want("class compound promoted", array_storage(cs3), "general");
+var cs4 = [C(1), C(2), C(3)];
+var dyn dc4s = cs4[1:3];
+dc4s[0] = 5;
+want("class slice promoted", dc4s, [5, cs4[2]]);
+want("class slice promoted base", array_storage(cs4), "class");
+
+# --- a flat string array
+var ss = split("a b c", " ");
+want("ss storage", array_storage(ss), "str");
+var dyn ds = ss;
+ds[-1] = "z";
+want("str neg store", ss, ["a", "b", "z"]);
+want("str non-int key", outcome(func [ds, ks] () { ds[ks] = "q"; }),
+     "TypeErrorEx");
+want("str past end", outcome(func [ds] () { ds[3] = "q"; }),
+     "OutOfBoundsEx");
+want("str before start", outcome(func [ds] () { ds[-4] = "q"; }),
+     "OutOfBoundsEx");
+var dyn dssl = ss[0:2];
+dssl[0] = "y";
+want("str slice store", dssl, ["y", "b"]);
+want("str slice source", ss[0], "a");
+var ssl2 = ss[0:2];
+ds[ki] = "w";
+want("str aliased slice", ssl2, ["a", "b"]);
+want("str aliased base", ss, ["a", "w", "z"]);
+
+var ss2 = split("p q", " ");
+var dyn ds2 = ss2;
+ds2[1] += "!";
+want("str compound", ss2, ["p", "q!"]);
+want("str compound promoted", array_storage(ss2), "general");
+
+# --- flat scalars: a bool widens, a narrowing or another type refuses
+var ints = [1, 2, 3];
+var dyn di = ints;
+var dyn bt = runtime(true);
+var dyn bf = runtime(false);
+di[0] = bt;
+di[1] = bf;
+want("int bool widen", ints, [1, 0, 3]);
+di[2] += bt;
+want("int compound bool", ints, [1, 0, 4]);
+var flts = [1.5, 2.5, 3.5];
+var dyn df = flts;
+df[0] = bt;
+df[1] = bf;
+df[2] = ki;
+want("float widen", flts, [1.0, 0.0, 1.0]);
+var bls = [true, false];
+var dyn db = bls;
+db[0] = bf;
+want("bool store", bls, [false, false]);
+want("bool narrowing", outcome(func [db] () { db[0] = 1; }), "TypeErrorEx");
+want("int before start", outcome(func [di] () { di[-4] = 1; }),
+     "OutOfBoundsEx");
+want("float past end", outcome(func [df] () { df[3] = 1.0; }),
+     "OutOfBoundsEx");
+want("int misfit", outcome(func [di] () { di[0] = "s"; }), "TypeErrorEx");
+want("float misfit", outcome(func [df] () { df[0] = "s"; }), "TypeErrorEx");
+
+# --- append / push / += through a dyn alias: a bool or an int widens into
+# numeric storage, anything else refuses and leaves the array alone
+var ai = [1];
+var dyn dai = ai;
+append(dai, bt);
+push(dai, bf);
+dai += [bt];
+want("int append widen", ai, [1, 1, 0, 1]);
+var af = [0.5];
+var dyn daf = af;
+append(daf, ki);
+push(daf, bt);
+daf += [bf, ki, 2.5];
+want("float append widen", af, [0.5, 1.0, 1.0, 0.0, 1.0, 2.5]);
+var ab = [true];
+var dyn dab = ab;
+append(dab, bf);
+dab += [bt];
+want("bool append", ab, [true, false, true]);
+var dyn ds_ = runtime("s");
+want("int append misfit", outcome(func [dai, ds_] () { append(dai, ds_); }),
+     "TypeErrorEx");
+want("float append misfit", outcome(func [daf, ds_] () { push(daf, ds_); }),
+     "TypeErrorEx");
+want("bool append narrowing", outcome(func [dab, ki] () { append(dab, ki); }),
+     "TypeErrorEx");
+want("int += misfit", outcome(func [dai] () { dai += [2, "s"]; }),
+     "TypeErrorEx");
+want("float += misfit", outcome(func [daf] () { daf += [none]; }),
+     "TypeErrorEx");
+want("misfits left them", [len(ai), len(af), len(ab)], [4, 6, 3]);
+var pa = [P(1, 1.5)];
+var dyn dpa = pa;
+var p2 = P(2, 2.5);
+append(dpa, p2);
+dpa += [P(3, 3.5)];
+want("struct append", [pa[1].x, pa[2].x, len(pa)], [2, 3, 3]);
+want("struct append storage", array_storage(pa), "struct");
+var q1 = Q(1, 1.0);
+var r1 = R("r");
+want("struct append int", outcome(func [dpa, ki] () { append(dpa, ki); }),
+     "TypeErrorEx");
+want("struct append def", outcome(func [dpa, q1] () { append(dpa, q1); }),
+     "TypeErrorEx");
+want("struct append non-POD",
+     outcome(func [dpa, r1] () { append(dpa, r1); }), "TypeErrorEx");
+want("struct += int", outcome(func [dpa] () { dpa += [7]; }), "TypeErrorEx");
+want("struct += def", outcome(func [dpa, q1] () { dpa += [q1]; }),
+     "TypeErrorEx");
+want("struct += non-POD", outcome(func [dpa, r1] () { dpa += [r1]; }),
+     "TypeErrorEx");
+want("struct misfits left it", len(pa), 3);
+
+# --- insert through a dyn alias
+var ii = [1, 2];
+var dyn dii = ii;
+insert(dii, 0, bt);
+insert(dii, 3, 9);
+insert(dii, 2, bf);
+want("int insert", ii, [1, 1, 0, 2, 9]);
+want("int insert negative", outcome(func [dii] () { insert(dii, -1, 0); }),
+     "OutOfBoundsEx");
+want("int insert past end", outcome(func [dii] () { insert(dii, 6, 0); }),
+     "OutOfBoundsEx");
+want("int insert misfit", outcome(func [dii, ds_] () { insert(dii, 0, ds_); }),
+     "TypeErrorEx");
+want("int insert key", outcome(func [dii, ds_] () { insert(dii, ds_, 0); }),
+     "TypeErrorEx");
+var fi = [1.5];
+var dyn dfi = fi;
+insert(dfi, 0, ki);
+insert(dfi, 2, bt);
+insert(dfi, 1, bf);
+insert(dfi, 4, 0.25);
+want("float insert", fi, [1.0, 0.0, 1.5, 1.0, 0.25]);
+want("float insert misfit",
+     outcome(func [dfi, ds_] () { insert(dfi, 0, ds_); }),
+     "TypeErrorEx");
+var bi = [false];
+var dyn dbi = bi;
+insert(dbi, 1, bt);
+insert(dbi, 0, bt);
+want("bool insert", bi, [true, false, true]);
+want("bool insert narrowing", outcome(func [dbi] () { insert(dbi, 0, 1); }),
+     "TypeErrorEx");
+var si = split("a c", " ");
+var dyn dsi = si;
+insert(dsi, 1, "b");
+want("str insert", si, ["a", "b", "c"]);
+var ci = [C(1), C(3)];
+var dyn dci = ci;
+insert(dci, 1, C(2));
+want("class insert", [ci[0].v, ci[1].v, ci[2].v], [1, 2, 3]);
+want("class insert storage", array_storage(ci), "general");
+var pi = [P(1, 1.0), P(3, 3.0)];
+var dyn dpi = pi;
+insert(dpi, 1, P(2, 2.0));
+insert(dpi, 3, P(4, 4.0));
+want("struct insert", [pi[0].x, pi[1].x, pi[2].x, pi[3].x], [1, 2, 3, 4]);
+# a slice detaches; an insert in the middle detaches the live slices
+var base = [1, 2, 3, 4];
+var dyn sl = base[1:3];
+insert(sl, 1, 7);
+want("insert into a slice", sl, [2, 7, 3]);
+want("insert slice source", base, [1, 2, 3, 4]);
+var live = base[0:2];
+insert(base, 1, 8);
+want("insert live slice", live, [1, 2]);
+want("insert live base", base, [1, 8, 2, 3, 4]);
+
+# --- erase / pop on every storage, a slice, a live slice
+func erase_all(dyn a, dyn front, dyn mid) {
+    erase(a, len(a) - 1);
+    erase(a, mid);
+    erase(a, front);
+    return a;
+}
+want("erase ints", erase_all([1, 2, 3, 4], 0, 1), [3]);
+want("erase floats", erase_all([1.5, 2.5, 3.5, 4.5], 0, 1), [3.5]);
+want("erase bools", erase_all([true, false, false, true], 0, 1), [false]);
+var dyn es = erase_all(split("a b c d", " "), 0, 1);
+want("erase strs", es, ["c"]);
+var dyn ec = erase_all([C(1), C(2), C(3), C(4)], 0, 1);
+want("erase class", ec[0].v, 3);
+var dyn ep = erase_all([P(1, 1.0), P(2, 2.0), P(3, 3.0), P(4, 4.0)], 0, 1);
+want("erase struct", ep[0].x, 3);
+var eb = [1, 2, 3, 4, 5];
+var dyn esl = eb[0:5];
+erase(esl, 0);
+erase(esl, 3);
+erase(esl, 1);
+want("erase slice", esl, [2, 4]);
+want("erase slice source", eb, [1, 2, 3, 4, 5]);
+var elive = eb[3:5];
+erase(eb, 4);
+want("erase last live", [elive, eb], [[4, 5], [1, 2, 3, 4]]);
+var elive2 = eb[1:3];
+erase(eb, 0);
+want("erase front live", [elive2, eb], [[2, 3], [2, 3, 4]]);
+var empty = [];
+var dyn dempty = empty;
+want("erase empty", outcome(func [dempty] () { erase(dempty, 0); }),
+     "OutOfBoundsEx");
+want("erase negative", outcome(func [eb] () { erase(eb, -1); }),
+     "OutOfBoundsEx");
+want("erase past end", outcome(func [eb] () { erase(eb, 3); }),
+     "OutOfBoundsEx");
+want("erase key", outcome(func [eb, ds_] () { erase(eb, ds_); }),
+     "TypeErrorEx");
+
+func pop2(dyn a) {
+    var dyn x = pop(a);
+    var dyn y = pop(a);
+    return [x, y, len(a)];
+}
+want("pop ints", pop2([1, 2, 3]), [3, 2, 1]);
+want("pop floats", pop2([1.5, 2.5, 3.5]), [3.5, 2.5, 1]);
+want("pop bools", pop2([true, false, true]), [true, false, 1]);
+want("pop strs", pop2(split("a b c", " ")), ["c", "b", 1]);
+var pc = [C(1), none, C(3)];
+var dyn dpc = pc;
+want("pop class", pop(dpc).v, 3);
+want("pop class none", pop(dpc) == none, true);
+want("pop class left", [len(pc), pc[0].v], [1, 1]);
+var pp = [P(1, 1.0), P(2, 2.0)];
+var dyn dpp = pp;
+want("pop struct", pop(dpp).x, 2);
+var pb = [1, 2, 3, 4];
+var dyn psp = pb[1:4];
+want("pop slice", [pop(psp), pop(psp), psp, pb], [4, 3, [2], [1, 2, 3, 4]]);
+var plive = pb[2:4];
+want("pop live", [pop(pb), plive, pb], [4, [3, 4], [1, 2, 3]]);
+want("pop empty", outcome(func [dempty] () { pop(dempty); }), "OutOfBoundsEx");
+const KA = [1, 2];
+var dyn dka = runtime(KA);
+want("pop const", outcome(func [dka] () { pop(dka); }),
+     "CannotChangeConstEx");
+want("erase const", outcome(func [dka] () { erase(dka, 0); }),
+     "CannotChangeConstEx");
+want("insert const", outcome(func [dka] () { insert(dka, 0, 1); }),
+     "CannotChangeConstEx");
+want("append const", outcome(func [dka] () { append(dka, 1); }),
+     "CannotChangeConstEx");
+want("store const", outcome(func [dka] () { dka[0] = 1; }), "NotLValueEx");
+want("const intact", dka, [1, 2]);
+
+# --- sort / rev_sort / reverse on every storage, with and without a
+# comparator, on a slice and on a value
+func lt(dyn a, dyn b) => a < b;
+func plt(dyn a, dyn b) => a.x < b.x;
+func clt(dyn a, dyn b) => a.v < b.v;
+var so = [3, 1, 2];
+rev_sort(so);
+want("rev_sort ints", so, [3, 2, 1]);
+sort(so, lt);
+want("sort ints cmp", so, [1, 2, 3]);
+rev_sort(so, lt);
+want("rev_sort ints cmp", so, [3, 2, 1]);
+var dyn dso = so;
+sort(dso);
+rev_sort(dso);
+sort(dso, lt);
+rev_sort(dso, lt);
+want("dyn sort ints", so, [3, 2, 1]);
+var sf = [1.5, 3.5, 2.5];
+rev_sort(sf);
+want("rev_sort floats", sf, [3.5, 2.5, 1.5]);
+rev_sort(sf, lt);
+want("rev_sort floats cmp", sf, [3.5, 2.5, 1.5]);
+sort(sf, lt);
+want("sort floats cmp", sf, [1.5, 2.5, 3.5]);
+var dyn dsf = sf;
+rev_sort(dsf);
+sort(dsf);
+rev_sort(dsf, lt);
+want("dyn sort floats", sf, [3.5, 2.5, 1.5]);
+var sb = [true, false, true, false];
+rev_sort(sb);
+want("rev_sort bools", sb, [true, true, false, false]);
+sort(sb, lt);
+want("sort bools cmp", sb, [false, false, true, true]);
+rev_sort(sb, lt);
+want("rev_sort bools cmp", sb, [true, true, false, false]);
+sort(sb);
+want("sort bools", sb, [false, false, true, true]);
+var dyn dsb = sb;
+rev_sort(dsb, lt);
+want("dyn rev_sort bools cmp", sb, [true, true, false, false]);
+sort(dsb, lt);
+rev_sort(dsb);
+sort(dsb);
+want("dyn sort bools", sb, [false, false, true, true]);
+var sst = split("b c a", " ");
+rev_sort(sst, lt);
+want("rev_sort strs cmp", sst, ["c", "b", "a"]);
+rev_sort(sst);
+want("rev_sort strs", sst, ["c", "b", "a"]);
+var dyn dsst = sst;
+sort(dsst, lt);
+rev_sort(dsst, lt);
+sort(dsst);
+want("dyn sort strs", sst, ["a", "b", "c"]);
+var dyn sg = [3, "x", 1];
+erase(sg, 1);
+rev_sort(sg);
+want("rev_sort general", sg, [3, 1]);
+sort(sg, lt);
+rev_sort(sg, lt);
+want("rev_sort general cmp", sg, [3, 1]);
+var sp = [P(2, 0.0), P(3, 0.0), P(1, 0.0)];
+var dyn dsp = sp;
+sort(dsp, plt);
+want("sort struct cmp", [sp[0].x, sp[1].x, sp[2].x], [1, 2, 3]);
+rev_sort(dsp, plt);
+want("rev_sort struct cmp", [sp[0].x, sp[1].x, sp[2].x], [3, 2, 1]);
+func mkp() => [P(2, 0.0), P(3, 0.0), P(1, 0.0)];
+var srt = sort(mkp(), plt);
+want("sort struct value", [srt[0].x, srt[2].x], [1, 3]);
+var rvv = reverse(mkp());
+want("reverse struct value", [rvv[0].x, rvv[2].x], [1, 2]);
+var scs = [C(2), C(1)];
+var dyn dscs = scs;
+sort(dscs, clt);
+want("sort class cmp", [scs[0].v, scs[1].v], [1, 2]);
+reverse(dscs);
+want("reverse class", [scs[0].v, scs[1].v], [2, 1]);
+var rcs = [C(1), none, C(3)];
+reverse(rcs);
+want("reverse class none", [rcs[0].v, rcs[1] == none], [3, true]);
+var rbs = [true, false, false];
+reverse(rbs);
+want("reverse bools", rbs, [false, false, true]);
+var rss = split("x y z", " ");
+reverse(rss);
+want("reverse strs", rss, ["z", "y", "x"]);
+var rps = [P(1, 1.0), P(2, 2.0)];
+var dyn drps = rps;
+reverse(drps);
+want("reverse struct", [rps[0].x, rps[1].x], [2, 1]);
+var rbase = [5, 4, 3, 2, 1];
+var dyn rsl = rbase[1:4];
+reverse(rsl);
+want("reverse slice", [rsl, rbase], [[2, 3, 4], [5, 4, 3, 2, 1]]);
+sort(rsl, lt);
+rev_sort(rsl);
+want("sort slice", [rsl, rbase], [[4, 3, 2], [5, 4, 3, 2, 1]]);
+var dyn ssl = rbase[0:3];
+sort(ssl, lt);
+want("sort slice cmp", [ssl, rbase], [[3, 4, 5], [5, 4, 3, 2, 1]]);
+want("sort a slice value", sort(rbase[1:4]), [2, 3, 4]);
+want("reverse a slice value", reverse(rbase[0:2]), [4, 5]);
+want("rbase intact", rbase, [5, 4, 3, 2, 1]);
+const KS = [3, 1, 2];
+var dyn dks = runtime(KS);
+want("sort const copy", [sort(dks), rev_sort(dks, lt), dks],
+     [[1, 2, 3], [3, 2, 1], [3, 1, 2]]);
+# a comparator that changes the length of the array it sorts
+var grow = [3, 1, 2];
+var badcmp = func [grow] (a, b) {
+    append(grow, 0);
+    return a < b;
+};
+want("sort grow", outcome(func [grow, badcmp] () { sort(grow, badcmp); }),
+     "InvalidArgumentEx");
+var fgrow = [3.5, 1.5];
+var fbadcmp = func [fgrow] (a, b) {
+    pop(fgrow);
+    return a < b;
+};
+want("sort shrink",
+     outcome(func [fgrow, fbadcmp] () { sort(fgrow, fbadcmp); }),
+     "InvalidArgumentEx");
+
+# --- an in-place builtin called through a `dyn` callee: its first
+# argument is still the location it names - a variable (local, global,
+# capture), an element, a member, an access chain
+var dyn ap = append;
+var dyn pu = push;
+var dyn po = pop;
+var dyn ins_ = insert;
+var dyn er = erase;
+var dyn so_ = sort;
+var dyn rs_ = rev_sort;
+var dyn rv_ = reverse;
+var dyn mk = P;
+ap(gxs, 2);
+pu(gxs, 3);
+ins_(gxs, 0, 0);
+want("dyn callee global", [po(gxs), gxs], [3, [0, 1, 2]]);
+ap(gm[1], 5);
+so_(gm[0]);
+er(gm[1], 0);
+want("dyn callee element", gm, [[1, 3], [5]]);
+ap(go.inner.xs, 7);
+rs_(go.inner.xs);
+ap(go.ins[0].xs, 8);
+rv_(go.ins[0].xs);
+want("dyn callee chain", [go.inner.xs, go.ins[0].xs], [[7, 4, 2], [8, 9]]);
+func local_calls(dyn ap2) {
+    var xs = [1];
+    var o = Out(In([1]), [In([])]);
+    var m = [[1], [2]];
+    ap2(xs, 2);
+    ap2(o.inner.xs, 3);
+    ap2(o.ins[0].xs, 4);
+    ap2(m[0], 5);
+    return [xs, o.inner.xs, o.ins[0].xs, m];
+}
+want("dyn callee locals", local_calls(ap),
+     [[1, 2], [1, 3], [4], [[1, 5], [2]]]);
+var cap = [1];
+var co = Out(In([]), []);
+var cm = [[0]];
+var capf = func [cap, co, cm, ap, po] () {
+    ap(cap, 9);
+    ap(co.inner.xs, 8);
+    ap(cm[0], 7);
+    return po(cap);
+};
+want("dyn callee captures", [capf(), cap, co.inner.xs, cm], [9, [1], [8],
+     [[0, 7]]]);
+var dyn cp = mk(ki, 2.5);
+want("dyn callee struct type", [cp.x, cp.y], [1, 2.5]);
+var dyn fdyn = runtime(func (a, b) => a + b);
+want("dyn callee arity", outcome(func [fdyn] () { fdyn(1); }),
+     "InvalidNumberOfArgsEx");
+want("dyn callee builtin arity",
+     outcome(func [ap, gxs] () { ap(gxs, 1, 2, 3, 4, 5, 6, 7, 8, 9); }),
+     "InvalidNumberOfArgsEx");
+want("dyn callee pop arity", outcome(func [po, gxs] () { po(gxs, 1); }),
+     "InvalidNumberOfArgsEx");
+want("dyn callee reverse arity", outcome(func [rv_, gxs] () { rv_(gxs, 1); }),
+     "InvalidArgumentEx");
+want("dyn callee erase arity", outcome(func [er, gxs] () { er(gxs); }),
+     "InvalidNumberOfArgsEx");
+want("dyn callee insert arity", outcome(func [ins_, gxs] () { ins_(gxs, 1); }),
+     "InvalidNumberOfArgsEx");
+want("dyn callee not an array", outcome(func [so_, ki] () { so_(ki); }),
+     "TypeErrorEx");
+want("dyn callee reverse non-array",
+     outcome(func [rv_, ki] () { rv_(ki); }), "TypeErrorEx");
+want("dyn callee value", outcome(func [ap] () { ap([1], 2); }),
+     "NotLValueEx");
+want("dyn callee chain oob", outcome(func [ap, go] () { ap(go.ins[3].xs, 1); }),
+     "OutOfBoundsEx");
+want("dyn callee left them", [gxs, len(go.ins)], [[0, 1, 2], 1]);
+want("dyn callee no args", outcome(func [ap] () { ap(); }),
+     "InvalidNumberOfArgsEx");
+want("dyn callee pop no args", outcome(func [po] () { po(); }),
+     "InvalidNumberOfArgsEx");
+want("dyn callee a builtin", outcome(func [so_] () { so_(len); }),
+     "TypeErrorEx");
+want("dyn callee append a builtin", outcome(func [ap] () { ap(len, 1); }),
+     "TypeErrorEx");
+# the same calls on globals a function also reads (each a global slot)
+func peek() => [gxs, gm, go];
+ap(gxs, 4);
+ap(gm[0], 6);
+ap(go.inner.xs, 1);
+ap(go.ins[0].xs, 0);
+want("dyn callee global slots", peek(),
+     [[0, 1, 2, 4], [[1, 3, 6], [5]], go]);
+want("dyn callee global values", [go.inner.xs, go.ins[0].xs],
+     [[7, 4, 2, 1], [8, 9, 0]]);
+
+# --- a literal folded at compile time and bound to a dyn variable is born
+# general (README: the destination's type decides), whatever its storage
+const KC1 = C(7);
+var dyn fss = split("a b", " ");
+append(fss, 1);
+var dyn fps = [P(1, 1.0), P(2, 2.0)];
+append(fps, "x");
+var dyn fcs = [KC1, KC1];
+append(fcs, 2);
+var dyn fbs = [true, false];
+append(fbs, "b");
+want("born general", [array_storage(fss), array_storage(fps),
+                      array_storage(fcs), array_storage(fbs)],
+     ["general", "general", "general", "general"]);
+want("born general values", [fss, len(fps), fps[1].x, fcs[1].v, fbs],
+     [["a", "b", 1], 3, 2, 7, [true, false, "b"]]);
+
+# --- arrays built at run time: a literal of more than 16 values, a
+# make_array whose generator changes kind half way, a sum that meets a
+# float after ints, and the builtins' own checks through a dyn callee
+var lit17 = [ki, ki, ki, ki, ki, ki, ki, ki, ki, ki, ki, ki, ki, ki, ki, ki,
+             2];
+want("literal of 17", [len(lit17), lit17[16], sum(lit17)], [17, 2, 18]);
+func gen_i(i) { if (i == 2) { return "x"; } return i; }
+func gen_f(i) { if (i == 2) { return none; } return i + 0.5; }
+func gen_b(i) { if (i == 2) { return 7; } return i == 0; }
+want("make_array spills", [len(make_array(3, gen_i)),
+     make_array(3, gen_f)[1], make_array(3, gen_b)[2]], [3, 1.5, 7]);
+want("make_array spill values", str(make_array(3, gen_i)), "[0, 1, \"x\"]");
+var dyn mix = [1, 2, "x"];
+pop(mix);
+append(mix, 2.5);
+want("sum ints then a float", sum(mix), 5.5);
+var dyn ma = make_array;
+var dyn ar = array;
+var dyn sm = sum;
+var dyn rg = range;
+want("make_array arity", outcome(func [ma] () { ma(1); }),
+     "InvalidNumberOfArgsEx");
+want("make_array size", outcome(func [ma] () { ma("x", gen_i); }),
+     "TypeErrorEx");
+want("make_array negative", outcome(func [ma] () { ma(-1, gen_i); }),
+     "InvalidValueEx");
+want("make_array gen", outcome(func [ma] () { ma(2, 5); }), "TypeErrorEx");
+want("array arity", outcome(func [ar] () { ar(); }),
+     "InvalidNumberOfArgsEx");
+want("array size", outcome(func [ar] () { ar("x"); }), "TypeErrorEx");
+want("array negative", outcome(func [ar] () { ar(-1); }),
+     "InvalidValueEx");
+want("sum arity", outcome(func [sm] () { sm(); }), "InvalidArgumentEx");
+want("sum non-array", outcome(func [sm] () { sm(5); }), "TypeErrorEx");
+want("range arity", outcome(func [rg] () { rg(); }),
+     "InvalidNumberOfArgsEx");
+want("range type", outcome(func [rg] () { rg("x"); }), "TypeErrorEx");
+want("range end type", outcome(func [rg] () { rg(1, "x"); }), "TypeErrorEx");
+want("range step type", outcome(func [rg] () { rg(1, 5, "x"); }),
+     "TypeErrorEx");
+
+# --- a literal of mixed values starts flat on its first element and turns
+# general at the first one that does not fit
+var cmix = C(4);
+var lm1 = [P(1, 1.0), 5];
+var lm2 = [cmix, 5];
+var lm3 = [cmix, none, P(2, 1.0)];
+want("mixed literals", [lm1[1], lm2[0].v, lm2[1], lm3[1] == none, lm3[2].x],
+     [5, 4, 5, true, 2]);
+want("mixed literal storages", [array_storage(lm1), array_storage(lm2),
+     array_storage(lm3)], ["general", "general", "general"]);
+# a comparator that turns the string array it sorts into a general one
+var ks2 = split("b a c", " ");
+var dyn dks2 = ks2;
+var kcmp = func [dks2] (a, b) { dks2[0] = 1; return a < b; };
+want("sort storage change", outcome(func [ks2, kcmp] () { sort(ks2, kcmp); }),
+     "InvalidArgumentEx");
+# one element, no comparator: nothing to compare, the array is unchanged
+var one_p = [P(1, 1.0)];
+sort(one_p);
+rev_sort(one_p);
+var one_c = [C(3)];
+sort(one_c);
+want("sort one", [one_p[0].x, len(one_p), one_c[0].v], [1, 1, 3]);
+
+print("array stores: " + str(bad) + " failure(s)");
+assert(bad == 0);
