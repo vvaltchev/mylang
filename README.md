@@ -1386,12 +1386,16 @@ Key rules:
     `a ? b : c ? d : e` is `a ? b : (c ? d : e)`. A const condition folds to the
     taken branch at compile time. It is looser than every operator above and
     tighter than `=`; a ternary used as a slice bound needs parens
-    (`a[(c?x:y):h]`, like Python).
+    (`a[(c?x:y):h]`, like Python). Either arm may be a lambda
+    (`c ? func(x) => x + 1 : func(x) => x * 2`); a lambda's `=> body`
+    extends as far as an expression can, so one in the last arm ends the
+    ternary.
   * **Null-coalescing** `a ?? b` — `a` unless it is `none`, otherwise `b` (which
     is evaluated only then). It turns an `opt T` into a non-`opt` when `b`
     is non-`opt` (`var n = maybe ?? 0;` makes `n` a plain `int`).
     Right-associative (`a ?? b ?? c`), binds tighter than `?:` and looser than
-    `||` (matching C#: `|| > ?? > ?: > =`).
+    `||` (matching C#: `|| > ?? > ?: > =`). `b` may be a lambda
+    (`maybe_f ?? func(x) => x`).
   * **Optional member access** `a?.b` — `none` if `a` is `none`, otherwise `a.b`
     (the member is not looked up when `a` is `none`). Unlike a plain `a.b`
     (which
