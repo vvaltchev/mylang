@@ -1799,6 +1799,17 @@ public:
      */
     bool is_template = false;
 
+    /*
+     * Set by the inferencer when every parameter's static type can be a
+     * per-frame pure-call cache KEY (PureCacheKey compares argument values
+     * with ==): a scalar, a string, a struct of such, or an array / dict of
+     * such - a value compared by IDENTITY (a class instance, a box, a
+     * function) or a `dyn` can change while it stays equal to itself, so a
+     * cached result would outlive it. The inliner marks `cache_results`
+     * only on such a function. COMPILE-only; false without inference.
+     */
+    bool args_cache_safe = false;
+
     FuncDeclStmt()
         : Construct("FuncDeclStmt", false, ConstructType::func_decl)
         , desc_owner(make_unique<FuncDescriptor>())
@@ -1842,6 +1853,7 @@ public:
         c->params = clone_as(params);
         c->body = clone_as(body);
         c->slot_writes = slot_writes;
+        c->args_cache_safe = args_cache_safe;
         /* A fresh descriptor for the clone (its own runtime identity): copy
          * the compile results, re-snapshot the params from the cloned
          * Identifiers, leave the chunk unset (the clone has its own body).
