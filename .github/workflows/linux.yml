@@ -17,6 +17,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
 
     - name: Create Build Environment
       run: cmake -E make_directory ${{github.workspace}}/build
@@ -117,6 +119,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
 
     - name: Create Build Environment
       run: cmake -E make_directory ${{github.workspace}}/build
@@ -199,6 +203,8 @@ jobs:
             lane: ship
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
 
     - name: Create Build Environment
       run: cmake -E make_directory ${{github.workspace}}/build
@@ -256,6 +262,8 @@ jobs:
         cxx: [g++, clang++]
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
 
     - name: Build (Makefile, OPT=1 TESTS=1 LTO=0)
       shell: bash
@@ -319,6 +327,8 @@ jobs:
         cxx: [g++, clang++]
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
 
     - name: Build (Makefile, DEBUG_INFO=1 TESTS=1 OPT=0)
       shell: bash

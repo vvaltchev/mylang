@@ -44,6 +44,8 @@ jobs:
       MYLANG_TEST_JOBS: 4
     steps:
     - uses: actions/checkout@v4
+    - name: Compiler and test diagnostics as annotations
+      run: echo "::add-matcher::.github/problem-matchers.json"
     # the workflow's inputs go to the tool after `--`
     - name: tests/run mutate
       run: tests/run -o -a --timeout 20400 --logs test-logs mutate
