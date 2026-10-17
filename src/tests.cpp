@@ -36833,11 +36833,13 @@ static bool opcode_table_census()
           "RULE 1: d1 - a refusal CONVEYS, stamped with the argument's "
           "caret; b0 - a body holding one is not pasted (the CALLER's "
           "check stays in front of a pasted call)" },
-        { OpCode::LoadBoxV,              0,0,0,0,0,0,
-          "class step 3: `*b` runs interpreted (box_load_want) - its "
-          "JIT tier is step 4 (plans/class-and-box.md)" },
-        { OpCode::StoreBoxV,             0,0,0,0,0,0,
-          "class step 3: interpreted (box_store); the JIT tier is step 4" },
+        { OpCode::LoadBoxV,              1,1,1,0,0,0,
+          "class step 4: an inline int/float arm, box_load_want behind "
+          "jit_load_box; b0 - a want-5 op names a struct_defs entry of "
+          "its own chunk, which the splice does not remap" },
+        { OpCode::StoreBoxV,             1,1,1,0,0,0,
+          "class step 4: an inline int/float arm, box_store behind "
+          "jit_store_box" },
     };
     const size_t nrows = sizeof(rows) / sizeof(rows[0]);
     const Chunk ck;      /* empty - census_instr never makes a shape
@@ -49242,6 +49244,309 @@ static bool jit_memberv_native()
 }
 
 /*
+ * class step 4: THE INLINE `*b` ARM (LoadBoxV / StoreBoxV) - an int or
+ * float box read and written in place, every other shape through the
+ * shared box_load_want / box_store helper. g_jit_box_fast is bumped by
+ * the EMITTED arm (the helper bumps g_jit_op_run), so each half is
+ * proven to run separately, and every reachable decline is proven TAKEN.
+ */
+static bool jit_box_native()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    /* THE ARM: an int and a float box, each read and written in a loop */
+    const unsigned long bf0 = g_jit_box_fast;
+    if (!run({
+            "var acc = box(0);",
+            "for (var i = 0; i < 50; i++) *acc += i;",
+            "assert(*acc == 1225);",
+            "var fb = box(0.5);",
+            "for (var i = 0; i < 4; i++) *fb = *fb * 2.0;",
+            "assert(*fb == 8.0);",
+            /* a shared box: every name sees the in-place write */
+            "var a2 = acc;",
+            "for (var i = 0; i < 5; i++) *a2 -= 1;",
+            "assert(*acc == 1220);" }))
+        return false;
+    if (g_jit_box_fast <= bf0) {
+        fprintf(stderr, "jit_box_native: the inline arm DID NOT RUN\n");
+        return false;
+    }
+    /* DECLINES + the per-guard proof */
+    unsigned long d0[JD_COUNT];
+    for (int r = 0; r < JD_COUNT; r++)
+        d0[r] = g_jit_decline[r];
+    const unsigned long ld0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::LoadBoxV)];
+    const unsigned long st0 =
+        g_jit_op_run[static_cast<size_t>(OpCode::StoreBoxV)];
+    if (!run({
+            /* an int stored into a box<float>: a conversion (box_kind) */
+            "var fi = box(0.0);",
+            "for (var i = 0; i < 10; i++) *fi = i;",
+            "assert(*fi == 9.0 && typestr(*fi) == \"float\");",
+            /* a bool value: no arm for it (box_val_kind) */
+            "var bb = box(false);",
+            "for (var i = 0; i < 6; i++) *bb = i % 2 == 0;",
+            "assert(*bb == false);",
+            /* a dyn carries another box, or no box, into a box<int>
+             * place: the read's kind check and its tag check - the
+             * helper raises the defined TypeErrorEx (box_kind,
+             * box_not_box), and the store's tag check the same */
+            "func wantint(box<int> x) {",
+            "  var r = 0;",
+            "  for (var k = 0; k < 3; k++) r += *x;",
+            "  return r; }",
+            "func setint(box<int> x, int v) {",
+            "  for (var k = 0; k < 3; k++) *x = v + k; }",
+            /* runtime(): a constant `nb` would make wantint(5) a pure
+             * call with a constant argument, folded - and its throw a
+             * compile error no `try` catches */
+            "var dyn sb = box(\"s\");",
+            "var dyn nb = runtime(5);",
+            "var got = 0;",
+            "for (var i = 0; i < 4; i++) {",
+            "  try { wantint(sb); } catch (TypeErrorEx) { got++; }",
+            "  try { wantint(nb); } catch (TypeErrorEx) { got++; }",
+            "  try { setint(nb, i); } catch (TypeErrorEx) { got++; }",
+            "}",
+            "assert(got == 12);",
+            /* a string into a float box (through a dyn): the value's
+             * float tag check (box_val_kind) is what keeps the 'f' kind
+             * byte from admitting it */
+            "var dyn df = box(1.5);",
+            "var gf = 0;",
+            "for (var i = 0; i < 6; i++) {",
+            "  try { *df = \"s\"; } catch (TypeErrorEx) { gf++; } }",
+            "assert(gf == 6 && *df == 1.5);" }))
+        return false;
+    if (g_jit_op_run[static_cast<size_t>(OpCode::LoadBoxV)] <= ld0
+            || g_jit_op_run[static_cast<size_t>(OpCode::StoreBoxV)] <= st0) {
+        fprintf(stderr, "jit_box_native: nothing DECLINED to the helper "
+                        "- the decline cases are vacuous\n");
+        return false;
+    }
+    /* box_readonly is deliberately absent: nothing makes a BoxObj
+     * read-only today - box() is never a constant, and freezing a dict
+     * key or a constant leaves a box as it is (its hash is its identity).
+     * The guard stays because box_store checks the same flag. */
+    static const int want[] = {
+        JD_box_not_box, JD_box_kind, JD_box_val_kind,
+    };
+    for (const int r : want) {
+        if (g_jit_decline[r] > d0[r])
+            continue;
+        fprintf(stderr, "jit_box_native: the guard `%s` was never TAKEN - "
+                        "its case is vacuous\n", jit_decline_name(r));
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
+ * class step 4: THE REFERENCE TIERS - a class instance's (boxed) field
+ * read in place (LoadMemberInt / LoadMemberFloat's boxed-field form), an
+ * array<C> element read in place (the boxed-element tier's objs arm), and
+ * a box<P> two names share written in place (the field store's `boxed`
+ * test). Each counter is bumped by the EMITTED code, so each proves its
+ * own form ran; the shared-box store proves the value guards were NOT
+ * taken (a decline would also give the right answer, through the helper).
+ */
+static bool jit_class_native()
+{
+#if ML_JIT_SUPPORTED
+    if (!g_jit_enabled)
+        return true;
+    auto run = [](const std::vector<const char *> &lines) -> bool {
+        std::string src;
+        std::vector<Tok> toks;
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (i) src += '\n';
+            src += lines[i];
+        }
+        lexer(src, 1, toks);
+        const ExecEngine saved = g_exec_engine;
+        g_exec_engine = ExecEngine::Vm;
+        bool ok = true;
+        try {
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            vm_execute(root.get());
+        } catch (...) {
+            ok = false;
+        }
+        g_exec_engine = saved;
+        return ok;
+    };
+    /* 1. a class instance's fields, every read form: int, float, bool
+     *    (as 0/1 in arithmetic), int read as a float */
+    const unsigned long mb0 = g_jit_member_bfast;
+    if (!run({
+            "class C { int n; float f; bool b; array<int> a; }",
+            "var c = C(3, 0.5, true, [1]);",
+            "var s = 0; var t = 0.0; var k = 0; var u = 0.0;",
+            "for (var i = 0; i < 20; i++) {",
+            "  s += c.n;",
+            "  t += c.f;",
+            "  if (c.b) k += 1;",
+            "  u += c.n * 0.5;",
+            "}",
+            "assert(s == 60 && t == 10.0 && k == 20 && u == 30.0);" }))
+        return false;
+    if (g_jit_member_bfast <= mb0) {
+        fprintf(stderr, "jit_class_native: the BOXED-field read DID NOT "
+                        "RUN\n");
+        return false;
+    }
+    /* 2. array<C> elements, and a none in an array<C?> (elemv_obj_null) */
+    unsigned long d0[JD_COUNT];
+    for (int r = 0; r < JD_COUNT; r++)
+        d0[r] = g_jit_decline[r];
+    const unsigned long eo0 = g_jit_elemo_fast;
+    if (!run({
+            "class C { int n; }",
+            "var cs = [C(1), C(2), C(3)];",
+            "assert(array_storage(cs) == \"class\");",
+            "var s = 0;",
+            "for (var i = 0; i < 30; i++) {",
+            "  var x = cs[i % 3];",
+            "  s += x.n;",
+            "  x.n += 0;",
+            "}",
+            "assert(s == 60);",
+            "array<C?> ns = [C(5), none];",
+            "var m = 0;",
+            "for (var i = 0; i < 10; i++) {",
+            "  var e = ns[i % 2];",
+            "  if (e) m += e.n;",
+            "}",
+            "assert(m == 25);",
+            /* a dyn carries a D into a C parameter: the field's slot is
+             * C's, so only the def guard keeps the read off D's `m` */
+            "class D { int m; int n; }",
+            "func getn(C c) { var r = 0;",
+            "  for (var k = 0; k < 3; k++) r += c.n; return r; }",
+            "var dyn dd = D(7, 9);",
+            "var rn = 0;",
+            "for (var i = 0; i < 4; i++) rn += getn(dd);",
+            "assert(rn == 108);",
+            /* an array of box<P>: a reference vector, never a flat struct
+             * array - its element's field is read through the reference */
+            "struct P { int x; float y; }",
+            "var bps = [box(P(1, 1.0)), box(P(2, 2.0))];",
+            "assert(array_storage(bps) == \"class\");",
+            "var sp = 0;",
+            "for (var i = 0; i < 20; i++) sp += bps[i % 2].x;",
+            "assert(sp == 30);" }))
+        return false;
+    if (g_jit_elemo_fast <= eo0) {
+        fprintf(stderr, "jit_class_native: the array<C> element read DID "
+                        "NOT RUN\n");
+        return false;
+    }
+    if (g_jit_decline[JD_elemv_obj_null] <= d0[JD_elemv_obj_null]) {
+        fprintf(stderr, "jit_class_native: the guard `elemv_obj_null` was "
+                        "never TAKEN - its case is vacuous\n");
+        return false;
+    }
+    /* 2b. a foreach over an array<C> / an array of boxes is the ARRAY
+     *     foreach (LoadElemValue, the objs arm for array<C>) - it was the
+     *     universal dyn foreach, which no counter here sees: 30 class
+     *     elements must take the objs arm, 20 boxes the general one */
+    const unsigned long eo1 = g_jit_elemo_fast;
+    const unsigned long ev1 = g_jit_elemv_fast;
+    if (!run({
+            "class C { int n; }",
+            "var cs = [C(1), C(2), C(3)];",
+            "var s = 0;",
+            "for (var i = 0; i < 10; i++) { foreach (c in cs) s += c.n; }",
+            "assert(s == 60);",
+            "var bs = [box(1), box(2)];",
+            "var t = 0;",
+            "for (var i = 0; i < 10; i++) { foreach (b in bs) t += *b; }",
+            "assert(t == 30);",
+            "array<C?> ns = [C(4), none];",
+            "var u = 0;",
+            "foreach (e in ns) if (e) u += e.n;",
+            "assert(u == 4);" }))
+        return false;
+    if (g_jit_elemo_fast < eo1 + 30 || g_jit_elemv_fast < ev1 + 20) {
+        fprintf(stderr, "jit_class_native: a foreach over array<C> / boxes "
+                        "did not take the element tier (objs %lu, general "
+                        "%lu)\n", g_jit_elemo_fast - eo1,
+                g_jit_elemv_fast - ev1);
+        return false;
+    }
+    /* 3. a box<P> two names share - POD and boxed layouts - is written in
+     *    place: no memberv_shared / memberv_borrowed decline */
+    for (int r = 0; r < JD_COUNT; r++)
+        d0[r] = g_jit_decline[r];
+    const unsigned long mv0 = g_jit_memberv_fast;
+    if (!run({
+            "struct P { int x; float y; }",
+            "struct Q { int x; array<int> a; }",
+            "var bp = box(P(1, 2.0)); var bq = bp;",
+            "var cp = box(Q(1, [])); var cq = cp;",
+            "for (var i = 0; i < 20; i++) { bq.x = i; cq.x = i + 1; }",
+            "assert(bp.x == 19 && cp.x == 20);",
+            "func setx(box<P> b, int v) {",
+            "  for (var k = 0; k < 4; k++) b.x = v + k; }",
+            "setx(bp, 100);",
+            "assert(bq.x == 103);" }))
+        return false;
+    if (g_jit_memberv_fast <= mv0) {
+        fprintf(stderr, "jit_class_native: the box<P> field store DID NOT "
+                        "RUN inline\n");
+        return false;
+    }
+    if (g_jit_decline[JD_memberv_shared] != d0[JD_memberv_shared]
+            || g_jit_decline[JD_memberv_borrowed]
+               != d0[JD_memberv_borrowed]) {
+        fprintf(stderr, "jit_class_native: a box<P> store took a VALUE "
+                        "guard (shared %lu, borrowed %lu)\n",
+                g_jit_decline[JD_memberv_shared] - d0[JD_memberv_shared],
+                g_jit_decline[JD_memberv_borrowed]
+                    - d0[JD_memberv_borrowed]);
+        return false;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+/*
  * #97 step 3: THE INLINE CLOSURE STORE RELEASES WHAT IT OVERWRITES.
  *
  * ⛔ WHY A COUNT AND NOT JUST LeakSanitizer. FuncObject carries
@@ -51710,11 +52015,13 @@ static bool jit_op_nativized()
          * (a local `p`, not a foreach-array element - that is
          * LoadStructFieldInt's shape). The body avoids `s += p.x` (the
          * StructFieldAddInt fusion) via a non-accumulator use. */
-        /* LoadMemberInt/Float: a BOXED struct (the array field) keeps the
-         * baked offset unavailable (b_dual_lo == -1), so the read runs the
-         * generic HELPER - the path this counter proves. The baked POD fast
-         * path is proven separately by jit_struct_baked (g_jit_member_fast,
-         * bumped by the emitted inline code). */
+        /* LoadMemberInt/Float: a BOXED struct (the array field) has no
+         * baked byte offset (b_dual_lo == -1). Since class step 4 its
+         * field is read by the emitted BOXED-FIELD form (the member key's
+         * baked slot, g_jit_member_bfast) and the helper starves - the
+         * inline_ok clause below. The baked POD fast path is proven by
+         * jit_struct_baked (g_jit_member_fast), and the helper by
+         * jit_class_native's def-guard decline. */
         { OpCode::LoadMemberInt, {
             "struct M { int x; float y; array a; }",
             "func f(int n) {",
@@ -52176,6 +52483,7 @@ static bool jit_op_nativized()
         const unsigned long ce = g_jit_ctor_est;
         const unsigned long ev = g_jit_elemv_fast;
         const unsigned long mv = g_jit_memberv_fast;
+        const unsigned long mb = g_jit_member_bfast;
         if (!run(c.src)) {
             fprintf(stderr, "jit_op_nativized: op %d WRONG RESULT\n",
                     (int)c.op);
@@ -52208,7 +52516,12 @@ static bool jit_op_nativized()
             /* #97: a struct-field store on a def-proven base is served
              * by the emitted tier (the baked field offset), so the
              * helper legitimately starves. */
-            || (c.op == OpCode::StoreMemberV && g_jit_memberv_fast > mv);
+            || (c.op == OpCode::StoreMemberV && g_jit_memberv_fast > mv)
+            /* class step 4: a boxed struct's field read is served by the
+             * emitted boxed-field form (the baked slot) */
+            || ((c.op == OpCode::LoadMemberInt
+                 || c.op == OpCode::LoadMemberFloat)
+                && g_jit_member_bfast > mb);
         if (g_jit_op_run[static_cast<size_t>(c.op)] <= b && !inline_ok) {
             fprintf(stderr, "jit_op_nativized: op %d DID NOT RUN\n",
                     (int)c.op);
@@ -54350,6 +54663,13 @@ static const std::vector<extra_check> extra_checks =
     { "jit: #97 the inline struct-FIELD store tier (POD byte + boxed "
       "reference forms), DECLINES const/readonly/coercion/ex/slice",
       jit_memberv_native },
+    { "jit: class step 4 the inline `*b` arm (an int / float box read and "
+      "written in place), DECLINES another kind / a non-box / a conversion",
+      jit_box_native },
+    { "jit: class step 4 the reference tiers - a class instance's field "
+      "read, an array<C> element read and a shared box<P>'s field store, "
+      "in place",
+      jit_class_native },
     { "jit: #97 the inline closure store RELEASES what it overwrites "
       "(a leaked POOLED object is invisible to LeakSanitizer)",
       jit_closure_store_releases },

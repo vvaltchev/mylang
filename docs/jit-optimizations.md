@@ -17718,3 +17718,77 @@ guards kept (sabotage: `cls` forced false) it counts 0 and the case fails.
 No corpus program declares a class yet, so the emitted code of every
 existing program is unchanged by construction (the branch is on
 `is_class`). Not measured in Ir: nothing in bench/ uses a class.
+
+## class step 4 - the reference tiers: `*b`, a class field, `array<C>` (2026-10-08)
+
+plans/class-and-box.md step 4. Classes and boxes (steps 1-3) ran
+correctly in every engine and almost entirely through C++ helpers in the
+JIT: a class is never POD, so the baked member read's byte form never
+applied; the boxed-element read tier declined the `objs` storage; the
+field store declined a `box<P>` two names share; and LoadBoxV / StoreBoxV
+were not JIT-eligible at all (an interpreted island per `*b`). Four
+changes, each behind def / tag guards that make a compile-time fact true
+at run time, each with its decline arms on the ledger:
+
+- **`*b` (LoadBoxV / StoreBoxV).** JIT-eligible and op_fully_native: an
+  INLINE arm for an int or float box - the box tag, the BoxObj's `kind`
+  byte, then its payload read or written in place - and
+  `jit_load_box` / `jit_store_box` (the shared box_load_want / box_store)
+  for everything else, a raise conveying with the `*b` caret. The kind
+  compare on a read IS the want check (a `dyn` can carry a box of another
+  kind into a `box<int>` place); a store's arm is picked by the VALUE's
+  tag (an int into an 'i' box, a float into an 'f' one), so every
+  conversion, a bool / str box and a read-only box decline. The payload
+  write needs no type store: box_store keeps a box's value its kind, so
+  an 'i' box's Type word is already t_int. The `JitLayout` reads BoxObj's
+  offsets off a live box and reads its payload back (`box_ok`). Declines:
+  `box_not_box`, `box_kind`, `box_val_kind`, `box_readonly` - the last
+  unreachable from a program (nothing makes a BoxObj read-only: box() is
+  never a constant, and freezing a key or a constant leaves a box as it
+  is), kept because box_store checks the same flag.
+- **A boxed field read** (LoadMemberInt / LoadMemberFloat). The member key
+  already carried the field's slot (`bake_def` / `bake_slot`, the
+  StoreMemberV tier's input), so a non-POD def - a class, a non-POD
+  `box<P>`, any struct with a reference field - reads the field LValue at
+  `fields.data() + slot`: the same def guard as the POD form, then the
+  field's TAG (int / float / bool, or an int read as a float), then the
+  payload. The tag check cannot fail for a compiled program
+  (coerce_struct_field keeps a declared scalar field its kind) and keeps
+  an image honest. `g_jit_member_bfast`.
+- **An `array<C>` element read** (LoadElemValue's `objs` arm, beside the
+  flat-strs one): the entry is a StructObject pointer - retain it, release
+  dst's old value, store the pointer and the t_struct tag. A null entry
+  (`none` in an `array<C?>`) declines (`elemv_obj_null`). The layout is a
+  live probe (`objs_ok`): an objs array of one instance, read back through
+  `data_off`. `g_jit_elemo_fast`. A `foreach` over an `array<C>` (or an
+  array of boxes) now reaches it: the inferencer proves the container an
+  array for a class or box element, where it took the universal dyn
+  foreach.
+- **A `box<P>`'s field store.** The StoreMemberV tier left out its two
+  VALUE guards (`memberv_shared`, `memberv_borrowed`) for a class def; a
+  `box<P>`'s def is the struct's, so the instance's `boxed` byte now skips
+  them at run time. For that to reach the tier at all, the inferencer
+  stamps a non-opt `box<P>` member base as a struct base
+  (`MemberExpr::base_struct` / `base_struct_def` = P) and sets
+  `base_boxed`, which the two consumers that assume a VALUE check: the
+  loop passes' `fr_member_of_value` (a box<P> member is shared storage)
+  and `try_struct_elem_field` (an `array<box<P>>` is a reference vector,
+  never a flat struct array). Until this, every `box<P>` member access
+  went through MemberV / the generic store helper.
+
+⛔ **BoxObj's refcount offset was never verified.** Every inline tier
+that retains a reference does `inc [pointee]`, and `elemv_inline_ok`
+proved `intr_refcount` at offset 0 for StrObj, SharedObject, DictObject,
+FuncObject and StructObject - the pointee classes that existed when it
+was written. Step 3's `t_box` values reached those tiers from the day
+they existed (a box in a general array, a box field) with the sixth
+pointee unchecked; it is in the list now. **A new reference value kind
+joins `elemv_inline_ok`'s list.**
+
+Reach, from emitted code (`jit_box_native`, `jit_class_native`): each
+form's counter (`g_jit_box_fast`, `g_jit_member_bfast`,
+`g_jit_elemo_fast`, `g_jit_memberv_fast` for a shared box<P>) must move,
+each reachable decline must be TAKEN, and a shared box<P>'s stores must
+take NO value guard. No corpus program but tests/functional/81, 82 and 84
+uses a class or a box, so every other program's emitted code is unchanged
+by construction; not measured in Ir (nothing in bench/ uses either).

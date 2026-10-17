@@ -106,7 +106,7 @@ deliberately not designed yet.
    2026-10-08** - see *Step 3 as built*.
 4. The JIT's inline tiers for member access through a reference - and
    the JIT tier of the box ops (LoadBoxV / StoreBoxV, interpreted after
-   step 3).
+   step 3). **DONE 2026-10-08** - see *Step 4 as built*.
 
 ## Step 1 as built (2026-10-08)
 
@@ -352,6 +352,54 @@ the two aborts as passes; it reports the exit code now.
 Found on the way, fixed in its own commit: the per-frame pure-call cache
 kept a stale result for an argument compared by identity - a class
 instance, a box - whose fields changed between two calls in one frame.
+
+## Step 4 as built (2026-10-08)
+
+The record of each tier is docs/jit-optimizations.md, *class step 4*.
+What it covers, as a map of the cases:
+
+| access                         | before step 4          | now                    |
+|--------------------------------|------------------------|------------------------|
+| `*b`, an int / float box       | interpreted island     | inline, in place       |
+| `*b`, any other box            | interpreted island     | jit_load/store_box     |
+| `c.n` (class / non-POD field)  | helper (name scan)     | inline (baked slot)    |
+| `c.n = v` (class)              | inline (step 1)        | unchanged              |
+| `bp.x`, `bp.x = v` (`box<P>`)  | generic MemberV helper | inline, as a struct's  |
+| `cs[i]` (`array<C>`)           | helper                 | inline (objs arm)      |
+| `foreach (c in cs)`            | universal dyn foreach  | the array foreach      |
+| `cs[i] = c` (`array<C>`)       | helper                 | helper (not built)     |
+| `c.a` (a non-scalar field)     | helper                 | helper (not built)     |
+| a global / captured base       | helper                 | helper (not built)     |
+
+Decisions and findings:
+
+- **A `box<P>` member base is a struct base** (`MemberExpr::base_struct`,
+  with `base_boxed`): every def-guarded fast path serves it, since its
+  StructObject's def is P. Two consumers assume a VALUE and check
+  `base_boxed`: the loop passes' `fr_member_of_value` (the existing
+  `box: a box<P> field written through another name` layer case now
+  guards it) and `try_struct_elem_field` (an `array<box<P>>` is a
+  reference vector).
+- **A foreach over an `array<C>` or an array of boxes** is the array
+  foreach now; the inferencer proved only the older element kinds.
+  (A function element and a non-POD struct element still take the
+  universal dyn foreach - correct, and not in this step.)
+- **BoxObj's refcount offset was never verified.** The inline element
+  tiers retain any reference pointee by `inc [pointee]`, and the layout
+  check (`elemv_inline_ok`) proved offset 0 for five pointee classes;
+  t_box values met those tiers from step 3 on. BoxObj is the sixth.
+- `box_readonly` is unreachable today: nothing makes a BoxObj read-only.
+
+Watched failing (the step-3 harness, each case rebuilt, run against the
+`class step 4`, `box`, layer and field-store `-rt` cases, restored by a
+plain copy and rebuilt, then a control that passes): the box read's kind
+compare, its tag check (an ASan abort - the payload 5 dereferenced), the
+store's int-arm kind check, its float value-tag check, the boxed-field
+read's def guard (a `dyn` carries a D into a C parameter), the `array<C>`
+arm's null check and its retain (both aborts), the field store's `boxed`
+test inverted (a struct VALUE then skips its guards), `base_boxed` in the
+loop passes and in `try_struct_elem_field`, the inferencer's `box<P>`
+base stamp, and the foreach's class / box element.
 
 ## Corrections to plans/struct-value-semantics.md
 

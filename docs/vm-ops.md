@@ -1723,9 +1723,12 @@ is LoadBoxV + `CompoundV` on the temp (caret: the whole expression) +
 StoreBoxV; `(*b)++` is LoadBoxV + `IncDecCheckedV` on the temp + StoreBoxV
 (a postfix value is a `MoveV` of the old). Use/def: LoadBoxV reads the
 box slot and defines its dst; StoreBoxV reads both and defines nothing -
-the box OBJECT changes, no frame slot does. Not JIT-eligible in step 3
-(interpreted islands; the helper and inline tiers are step 4), not
-bytecode-inlined. myv **v35** (both APPENDED).
+the box OBJECT changes, no frame slot does. JIT (class step 4): an int
+or float box is read or written IN PLACE (the box tag, the BoxObj's kind
+byte - which is the want check - and, for a store, its read-only byte and
+the value's tag; docs/jit-optimizations.md), every other shape calls
+`jit_load_box` / `jit_store_box`, the same helpers, whose raise conveys
+with the `*b` caret. Not bytecode-inlined. myv **v35** (both APPENDED).
 
 **`Chunk::op_locs` — a COMPOUND store's OPERATION caret (RULE 2,
 2026-09-25).** `lv OP= rhs` (and `lv++`) fails in two places, and the
