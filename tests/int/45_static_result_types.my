@@ -1,0 +1,308 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit: the static types inference gives the values a program builds -
+# a builtin's result (builtin_result, with run-time arguments so nothing
+# folds), the join of a ternary's / `??`'s arms and of a container
+# literal's elements (bool / int / float climb, mixed kinds become dyn,
+# functions and boxes join by signature), the loop-var binding each
+# `foreach` form gets from its container's static type (annotate_hints),
+# an array literal built from values of mixed kinds (classes, POD structs
+# of two types) and a loop-invariant `var sl = base[a:b]` hoisted above
+# its loop (try_hoist_loop_slices) - or not, when the loop changes its
+# base, its bounds or the slice. Every value is asserted as a string, so
+# an int where a float belongs (or the reverse) is a failure.
+
+struct P { int x; float y; }
+struct Q { int k; }
+struct R { array<int> a; }
+class C { int v; }
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + got + ", expected " + exp);
+        bad = bad + 1;
+    }
+}
+
+var one = int(runtime(1));
+var two = int(runtime(2));
+var x = float(runtime(0.25));
+var yes = one > 0;
+var no = one > 5;
+var text = str(runtime("a\nb"));
+var dyn dd = runtime({"a": 1});
+var dyn da = runtime([3, 1, 2]);
+var dyn dn = runtime(5);
+var gbase = [4, 5, 6];
+
+# --- builtin results
+want("preds", str([isnormal(x), isnan(x), isinf(x), isfinite(x)]),
+     "[true, false, false, true]");
+want("exp", str(exp(x) > 1.28 && exp(x) < 1.29), "true");
+want("log/sqrt/cbrt/pow",
+     str([log(x * 4), sqrt(x), cbrt(x * 32), pow(x, 2)]),
+     "[0.000000, 0.500000, 2.000000, 0.062500]");
+want("trig", str(sin(x) < x && cos(x) < 1.0 && tan(x) > x), "true");
+want("arc", str(asin(x) > x && acos(x) > 1.0 && atan(x) < x), "true");
+want("rounding", str([ceil(x), floor(x), trunc(x), round(x + 0.5)]),
+     "[1.000000, 0.000000, 0.000000, 1.000000]");
+want("starts/ends", str([startswith(text, "a"), endswith(text, "c")]),
+     "[true, false]");
+want("splitlines", str(splitlines(text)), "[\"a\", \"b\"]");
+want("dict(pairs)", str(dict(runtime([["k", 1]]))), "{\"k\": 1}");
+want("get on dyn", str([get(dd, "a"), get!(dd, "a"), get(dd, "z")]),
+     "[1, 1, <none>]");
+var dyn bd = box(dn);
+want("box(dyn)", str(*bd), "5");
+var cc = C(one);
+var bc = box(cc);
+bc.v = 7;
+want("box(class)", str(cc.v) + str(bc == cc), "7true");
+want("keys/values/kvpairs of dyn",
+     str(keys(dd)) + str(values(dd)) + str(kvpairs(dd)),
+     "[\"a\"][1][[\"a\", 1]]");
+want("find", str([find(dd, "a"), find(da, 2), find(text, "b")]),
+     "[1, 2, 2]");
+want("min/max/top/sum of dyn",
+     str([min(da), max(da), top(da), sum(da)]), "[1, 3, 2, 6]");
+var caught = 0;
+dict<str, int> dsk = {"b": one};
+try { var ms = min(text); print(ms); } catch (TypeErrorEx) { caught++; }
+try { var md = max(dsk); print(md); } catch (TypeErrorEx) { caught++; }
+want("min/max of a str / dict raise", str(caught), "2");
+var unfilled = array(two);
+want("top of array(n)", str(top(unfilled)), "<none>");
+want("min/max ints", str([min(one, two), max(one, two, 0)]), "[1, 2]");
+want("min floats", str(min(x, 0.5)), "0.250000");
+want("make_array", str(make_array(2, func(i) => i * x)),
+     "[0.000000, 0.250000]");
+want("make_dict", str(make_dict(["a"], func(k) => k + "!")),
+     "{\"a\": \"a!\"}");
+want("argv", str(len(argv)), "0");
+
+# --- joins of arms and elements
+var dmix = {one: 1, "a": 2};
+want("mixed keys", str(dmix[1] + dmix["a"]), "3");
+var dyn tern = yes ? [1] : 7;
+want("ternary dyn", str(tern), "[1]");
+int? maybe = no ? 3 : none;
+var dyn co = maybe ?? "s";
+want("coalesce dyn", str(co), "s");
+bool? mb = no ? true : none;
+var bj = yes ? false : mb;
+want("bool join", str(bj), "false");
+var nj = yes ? true : 2;
+want("bool/int join", str(nj + 1), "2");
+var fj = no ? one : x;
+want("int/float join", str(fj), "0.250000");
+var dj = yes ? {1: 1} : {"a": 2};
+want("dict join", str(len(dj)), "1");
+func ar1(int a) => a + 1;
+func ar2(int a, int b) => a + b;
+var dyn fsel = yes ? ar1 : ar2;
+want("func arity join", str(fsel(1)), "2");
+func op1(a, b?) => a + (b ?? 0);
+func op2(a?, b) => (a ?? 1) * b;
+var osel = yes ? op1 : op2;
+want("func opt join", str(osel(3, 4)), "7");
+var bsel = yes ? box(one) : box(two);
+*bsel += 10;
+want("box join", str(*bsel), "11");
+opt box<int> ob = no ? box(3) : none;
+var rb = yes ? box(one) : ob;
+want("opt box join", str(rb), "box(1)");
+var rb2 = box(two);
+rb2 = ob;
+want("opt box reassigned", str(rb2), "<none>");
+array<int>? oa = no ? [1] : none;
+var dyn tq = yes ? oa : 7;
+want("opt/int ternary", str(tq), "<none>");
+var ts = yes ? "x" : str(two);
+want("str join", ts, "x");
+
+# --- foreach: the loop var's binding by the container's static type
+var acc = "";
+array<int?> aio = [1, none];
+foreach (var e in aio) acc += str(e) + ",";
+array<float?> afo = [0.5, none];
+foreach (var e in afo) acc += str(e) + ",";
+array<bool?> abo = [true, none];
+foreach (var e in abo) acc += str(e) + ",";
+want("opt elems", acc, "1,<none>,0.500000,<none>,true,<none>,");
+acc = "";
+foreach (var r in [[one], [two, 3]]) acc += str(len(r));
+foreach (var d in [{"a": one}]) acc += str(d["a"]);
+foreach (var i, r in indexed [[one], [two]]) acc += str(i + r[0]);
+want("array/dict elems", acc, "12113");
+acc = "";
+array<box<int>> abx = [box(one), box(two)];
+foreach (var b in abx) *b += 1;
+foreach (var b in abx) acc += str(*b);
+array<C> acl = [C(one), C(two)];
+foreach (var c in acl) c.v *= 10;
+foreach (var i, c in indexed acl) acc += str(i) + str(c.v);
+want("boxes/classes", acc, "23010120");
+acc = "";
+array<P> aps = [P(one, 0.5), P(two, 1.5)];
+foreach (var p in aps) acc += str(p.x) + str(p.y);
+foreach (var i, p in indexed aps) acc += str(i * p.x);
+array<R> ars = [R([one]), R([two, 3])];
+foreach (var r in ars) acc += str(len(r.a));
+want("structs", acc, "10.50000021.50000002" + "12");
+acc = "";
+foreach (var i, ch in indexed text) acc += str(i) + ch;
+dict<str, int> dsi = {"k": one};
+foreach (var i, k, v in indexed dsi) acc += str(i) + k + str(v);
+foreach (var k in dsi) acc += k;
+want("str/dict", acc, "0a1\n2b0k1k");
+acc = "";
+foreach (var e in da) acc += str(e);
+foreach (var k, v in dd) acc += k + str(v);
+foreach (var i, e in indexed da) acc += str(i);
+want("dyn containers", acc, "312a1012");
+acc = "";
+foreach (var a, b in [[one, 2], [3, two]]) acc += str(a * b);
+foreach (var a, b in [[x, 1.5]]) acc += str(a + b);
+foreach (var i, a, b in indexed [[one, 2]]) acc += str(i + a + b);
+array<array<int?>> aao = [[one, none]];
+foreach (var a, b in aao) acc += str(a) + str(b);
+array<array<int>?> aoa = [[one, two]];
+foreach (var a, b in aoa) acc += str(a + b);
+want("unpack", acc, "261.75000031<none>3");
+
+# --- array literals of mixed run-time kinds
+var dyn mixs = [P(one, 1), Q(two)];
+want("two POD structs", str(mixs), "[P(x: 1, y: 1.000000), Q(k: 2)]");
+want("two POD structs storage", array_storage(mixs), "general");
+var dyn mixc = [C(one), 5];
+want("class then int", str(mixc), "[C(v: 1), 5]");
+var dyn mixp = [P(one, 1), R([one])];
+want("pod then non-pod", str(len(mixp)), "2");
+array<C> acd = [C(one), dn];
+want("array<C> with a dyn int", str(acd[1]), "5");
+
+# --- a loop-invariant slice of a LOCAL is hoisted above its loop (or not,
+# when the loop changes the base, a bound or the slice) - the values are
+# the same either way
+func hoists(int n, dyn dk) {
+    var base = [1, 2, 3, 4, 5];
+    var txt = "abcdef";
+    var out = [];
+    var tot = 0;
+    for (var i = 0; i < 3; i++) {
+        var sl = base[1:3];
+        var s2 = base[:n];
+        var s3 = base[n:];
+        var s4 = txt[1:4];
+        var s5 = base[0:dk];
+        tot += sl[0] + len(s2) + len(s3) + len(s4) + len(s5);
+    }
+    append(out, tot);
+    tot = 0;
+    var j = 0;
+    while (j < 3) {
+        var sl = base[0:j];
+        var s2 = base[1:3];
+        tot += len(sl) + s2[1];
+        j++;
+    }
+    append(out, tot);
+    tot = 0;
+    for (var i = 0; i < 3; i++) {
+        var sl = base[1:3];
+        base[1] = base[1] + 1;
+        tot += sl[0];
+    }
+    append(out, tot);
+    tot = 0;
+    var other = base;
+    for (var i = 0; i < 2; i++) {
+        var sl = base[0:2];
+        other[0] = other[0] + 10;
+        tot += sl[0];
+    }
+    append(out, tot);
+    tot = 0;
+    for (var i = 0; i < 2; i++) {
+        var sl = base[0:2];
+        append(base, i);
+        tot += len(base) - len(sl);
+    }
+    append(out, tot);
+    tot = 0;
+    for (var i = 0; i < 2; i++) {
+        var sl = base[0:2];
+        sl[0] = 100;
+        var s2 = base[0:1];
+        s2 = [7];
+        var s3 = base[i:i + 1];
+        tot += sl[0] + s2[0] + s3[0];
+    }
+    append(out, tot);
+    tot = 0;
+    for (var sl = [0]; len(sl) < 3; sl = sl + [1]) {
+        var s2 = base[0:1];
+        tot += s2[0];
+    }
+    append(out, tot);
+    tot = 0;
+    var k = 0;
+    for (var s2 = base[0:1]; k < 2; k += len(s2)) {
+        var s3 = base[0:1];
+        tot += s3[0];
+    }
+    append(out, tot);
+    tot = 0;
+    var t2 = txt + str(n);
+    for (var i = 0; i < 2; i++) {
+        var s1 = range(n + 3)[1:3];
+        var s3 = t2[0:2];
+        var s4 = base[0:1];
+        s4 = [3];
+        other[1] = i;
+        tot += s1[1] + len(s3) + s4[0];
+    }
+    append(out, tot);
+    tot = 0;
+    var s5 = [1, 1];
+    k = 0;
+    while (k < len(s5)) {
+        var s5 = base[1:2];
+        tot += s5[0];
+        k++;
+    }
+    for (var i = 0; i < 4; i += len(s5)) {
+        var s5 = base[1:2];
+        tot += s5[0];
+    }
+    for (var i = 0; i < 2; i++) {
+        var s6 = base[2:3];
+        s6 = s6 + [1];
+        tot += len(s6);
+    }
+    append(out, tot);
+    return out;
+}
+want("hoists", str(hoists(two, dn)),
+     "[45, 12, 9, 12, 9, 240, 42, 42, 14, 8]");
+var gsum = 0;
+for (var i = 0; i < 2; i++) {
+    var gsl = gbase[1:3];
+    gsum += gsl[1];
+}
+want("global slice", str(gsum), "12");
+func gslices() {
+    var tot = 0;
+    for (var i = 0; i < 2; i++) {
+        var sl = gbase[0:2];
+        tot += sl[1];
+    }
+    return tot;
+}
+want("global base", str(gslices()), "10");
+
+if (bad == 0)
+    print("all ok");
+else
+    print(str(bad) + " failure(s)");

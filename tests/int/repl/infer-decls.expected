@@ -1,0 +1,224 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> SyntaxError at line 3, col 7
+
+    array<5> a1;
+          ^^^^^^
+expected a type '5'
+>> SyntaxError at line 4, col 19
+
+    func fa(array<int x) => 1;
+                      ^^^^^^^^
+expected '>' to close 'array<...>' 'x'
+>> SyntaxError at line 5, col 23
+
+    func fd(dict<str, int x) => 1;
+                          ^^^^^^^^
+expected '>' to close 'dict<...>' 'x'
+>> SyntaxError at line 6, col 10
+
+    dict<str int> d1;
+             ^^^^^^^^
+Expected operator ',', got: 'int'
+>> SyntaxError at line 7, col 21
+
+    struct Q1 { box<int b; };
+                        ^^^^^
+expected '>' to close 'box<...>' 'b'
+>> SyntaxError at line 8, col 5
+
+    box<int?> b2;
+        ^^^^^^^^^
+not a box type: a box holds a bool, int, float, str or struct value (an array, a dict, a class instance or a box is a reference already, which box() returns as it is)
+>> SyntaxError at line 9, col 5
+
+    box<array<int>> b3;
+        ^^^^^^^^^^^^^^^
+not a box type: a box holds a bool, int, float, str or struct value (an array, a dict, a class instance or a box is a reference already, which box() returns as it is)
+>> SyntaxError at line 10, col 5
+
+    box<dict<str, int>> b4;
+        ^^^^^^^^^^^^^^^^^^^
+not a box type: a box holds a bool, int, float, str or struct value (an array, a dict, a class instance or a box is a reference already, which box() returns as it is)
+>> SyntaxError at line 11, col 5
+
+    box<box<int>> b5;
+        ^^^^^^^^^^^^^
+not a box type: a box holds a bool, int, float, str or struct value (an array, a dict, a class instance or a box is a reference already, which box() returns as it is)
+>> SyntaxError at line 12, col 5
+
+    box<dyn> b6;
+        ^^^^^^^^
+not a box type: a box holds a bool, int, float, str or struct value (an array, a dict, a class instance or a box is a reference already, which box() returns as it is)
+>> SyntaxError at line 13, col 5
+
+    box<C> b7;
+        ^^^^^^
+not a box type: a box holds a bool, int, float, str or struct value (an array, a dict, a class instance or a box is a reference already, which box() returns as it is)
+>> => box(P(x: 0, y: 0.000000))
+>> => box(P(x: 0, y: 0.000000))
+>> => [[1], ["s"]]
+>> => [[1], ["s"]]
+>> => [{"a": 1}]
+>> => [{"a": 1}]
+>> SyntaxError at line 20, col 9:12
+
+    func pf(box b) => 1;
+            ^^^
+'box' is not a type
+>> >> => 2
+>> >> => 1
+>> >> => F1(bf: box(1.500000), a: [1], d: {"k": 2})
+>> SyntaxError at line 27, col 11
+
+    var x1 += 1;
+              ^^
+Operator '=' is required when declaring a variable or a constant
+>> >> >> => <none>
+>> => box(0)
+>> => box(0)
+>> => P(x: 0, y: 0.000000)
+>> => P(x: 0, y: 0.000000)
+>> >> => 1
+>> => <none>
+>> >> => "s"
+>> >> => 2
+>> >> => 2.000000
+>> >> >> >> => 1.000000
+>> >> => 1
+>> >> => [1]
+>> >> => [4]
+>> >> => 6
+>> => [1.000000, 2.000000]
+>> TypeMismatchEx: 'af' is declared 'array<float>' but is assigned 'array<str>' at line 57, col 1:3
+
+    af = ["x"];
+    ^^
+>> => [1.000000, 2.000000]
+>> => [1.000000, 2.000000]
+>> TypeMismatchEx: 'aa' is declared 'array<array<int>>' but is assigned 'array<array<dyn>>' at line 60, col 19:21
+
+    array<array<int>> aa = [[1], ["x"]];
+                      ^^
+>> TypeMismatchEx: 'df' is declared 'dict<str,float>' but is assigned 'dict<str,str>' at line 61, col 18:20
+
+    dict<str, float> df = {"a": "b"};
+                     ^^
+>> TypeMismatchEx: 'df2' is declared 'dict<str,float>' but is assigned 'dict<int,float>' at line 62, col 18:21
+
+    dict<str, float> df2 = {1: 2};
+                     ^^^
+>> TypeMismatchEx: 'ab' is declared 'array<array<int>>' but is assigned 'array<array<int>?>' at line 63, col 19:21
+
+    array<array<int>> ab = [[1], none];
+                      ^^
+>> TypeMismatchEx: 'ai' is declared 'array<int>' but is assigned 'dict<str,int>' at line 64, col 12:14
+
+    array<int> ai = {"a": 1};
+               ^^
+>> TypeMismatchEx: 'ac' is declared 'array<array<int>>' but is assigned 'array<dict<str,int>>' at line 65, col 19:21
+
+    array<array<int>> ac = [{"a": 1}];
+                      ^^
+>> TypeMismatchEx: 'dq' is declared 'dict<str,array<int>>' but is assigned 'dict<str,dict<str,int>>' at line 66, col 23:25
+
+    dict<str, array<int>> dq = {"a": {"b": 1}};
+                          ^^
+>> TypeMismatchEx: 'dr' is declared 'dict<str,dict<str,int>>' but is assigned 'dict<str,array<int>>' at line 67, col 27:29
+
+    dict<str, dict<str, int>> dr = {"a": [1]};
+                              ^^
+>> => [[1], {"a": 2}]
+>> => [[1], {"a": 2}]
+>> => [<none>, [1]]
+>> => [<none>, [1]]
+>> => [{}, {"k": 1.000000}]
+>> => [{}, {"k": 1.000000}]
+>> => {"a": []}
+>> => {"a": []}
+>> => [<none>, C(v: 1)]
+>> => [<none>, C(v: 1)]
+>> => [C(v: 1), C(v: 2)]
+>> => "class"
+>> => []
+>> => "struct"
+>> => [[], [P(x: 1, y: 2.000000)]]
+>> => "struct"
+>> => ["a"]
+>> => "general"
+>> => ["a", <none>]
+>> => ["a", <none>]
+>> SyntaxError at line 88, col 12
+
+    var b9 = ++;
+               ^
+Expected expression, got ';'
+>> SyntaxError at line 89, col 11
+
+    var c9 = *;
+              ^
+Expected expression, got ';'
+>> SyntaxError at line 90, col 11
+
+    var d9 = -;
+              ^
+Expected expression, got ';'
+>> SyntaxError at line 91, col 11
+
+    var e9 = !);
+              ^^
+Expected expression, got ')'
+>> => "abc"
+>> => C(v: 5)
+>> tracing: arrays
+>> arrays     akc  dest array<C> -> flat (classes)
+=> [C(v: 5), C(v: 5)]
+>> arrays     akn  dest array<C?> -> flat (classes)
+=> [<none>, C(v: 5)]
+>> arrays     xs  dest array<array<str>> -> general
+=> [["abc"]]
+>> arrays     abl  dest array<bool> -> flat (bools)
+=> [true]
+>> arrays     afl  dest array<float> -> flat (floats)
+=> [1.000000, 2.000000]
+>> arrays     apl  dest array<P> -> flat (structs)
+=> [P(x: 1, y: 2.000000)]
+>> arrays     dyl  dest dyn -> general
+=> [1]
+>> arrays     aio  dest array<int?> -> general
+=> [1, <none>]
+>> tracing: off
+>> => "class"
+>> => [<none>, C(v: 5)]
+>> => {}
+>> => 1.000000
+>> => {"a": 1.000000}
+>> >> SyntaxError at line 108, col 1:3
+
+    K9, zz = [1, 2];
+    ^^
+Cannot assign to this expression: it is not an assignable location
+>> SyntaxError at line 109, col 7
+
+    y1, y2;
+          ^
+Operator '=' is required when the left side is an ID list
+>> SyntaxError at line 110, col 10
+
+    var x0 = ;
+             ^
+Expected expression, got ';'
+>> SyntaxError at line 111, col 6
+
+    y1 = ;
+         ^
+Expected expression, got ';'
+>> ExpressionIsNotConstEx: The expression is not const at line 112, col 16:23
+
+    const q1, q2 = [st, 2];
+                   ^^^^^^^
+>> => [1, 2]
+>> >> => 2
+>> >> => [1, 2]
+>> => [3]
+>> >> => [2]
+>> 

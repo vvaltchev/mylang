@@ -1,0 +1,100 @@
+struct P { int x; float y; const K = 3; }
+struct S { array<float> a; dict<str, float> d;
+  array<array<float?>> m; dyn any; }
+struct H { box<int> b; P p; }
+var s = S([1.5], {"a": 1}, [[none]], 1)
+var dyn dd = runtime(5)
+var bx = box(2)
+var st = str(runtime("abc"))
+var fl = float(runtime(1.5))
+-st
+-dd
+~fl
+~dd
+bx++
+bx--
+st++
+throw 5
+throw st
+throw nosuch
+func rt(int d) {
+  try { return 10 / d; } catch (DivisionByZeroEx as e) { throw e; }
+}
+rt(2)
+func gn(int? x) {
+  if (x == none) return 0;
+  if (x == none) return 1;
+  return x + 1; }
+gn(4)
+gn(none)
+func g1() => P.nope
+func g2() => P.x
+1 + bx
+bx * 2
+var q = 1
+q += bx
+st < 1
+st < "b"
+1 < st
+fl >= 1
+*bx = none
+*bx = 2.5
+*bx += 1.5
+*bx = st
+*bx = dd
+*bx += dd
+*bx = bx
+*bx
+s.a[0] = "x"
+func w1() { s.a[0] = dd; s.d["k"] = dd; s.m[0][0] = dd; }
+s.m[0][0] = none
+s.m[0][0] = "x"
+s.a = [st]
+s.a = ["x"]
+s.d["k"] = "v"
+append(s.a, "x")
+push(s.a, "x")
+insert(s.a, 0, "x")
+insert(s.d, "k", "v")
+insert(s.d, 1, 2.5)
+append(s.m, ["x"])
+append(s.m, [none, 1])
+insert(s.m, 0, [st])
+push(s.m, [])
+s.m
+func cp(const P p) { p.x = 1; return p; }
+func cpb(const box<int> b) { *b = 1; }
+func cpbp(const box<P> b) { b.x = 1; }
+func cpd(const S c) { c.d.k = 2; return c; }
+cpd(s).d["k"]
+func cpm(const S c) { c.m[0] = [3]; append(c.a, 4); return c.m[0]; }
+cpm(s)
+const C2 = [1, 2]
+C2++
+-nosuch
+~nosuch
+var yb = st == "abc"
+~yb
+var hh = H(box(1), P(1, 2))
+hh.b++
+st + 1 - 2
+append(s.d, 1)
+s.a[0] = nosuch()
+nosuch.x = 1
+bx.foo
+func fdy(dyn a) => len(a)
+fdy([1, 2])
+array<array<int>> xa = [{"a": st}]
+array<dict<str, int>> xb = [[st]]
+dict<str, float> xc = {st: 1}
+xc
+dict<str, float> xd = {fl: 1}
+dict<str, float> xe = {"a": st}
+var gd = {"a": [1]}
+func tf(v) => [v]
+gd = {"b": tf(2)}
+var ga = [[1]]
+ga = [tf(3)]
+ga
+struct A1 { opt B1 u; opt B1 w; } struct A2 {
+  opt B1 v; } struct B1 { int x; }

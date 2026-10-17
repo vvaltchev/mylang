@@ -1,0 +1,122 @@
+struct P { int x; float y; }
+class C { int v; }
+array<5> a1;
+func fa(array<int x) => 1;
+func fd(dict<str, int x) => 1;
+dict<str int> d1;
+struct Q1 { box<int b; }
+box<int?> b2;
+box<array<int>> b3;
+box<dict<str, int>> b4;
+box<box<int>> b5;
+box<dyn> b6;
+box<C> b7;
+box<P> b8;
+b8
+array<array> g1 = [[1], ["s"]]
+g1
+array<dict> g2 = [{"a": 1}]
+g2
+func pf(box b) => 1;
+func f4(array<array> x) => len(x);
+f4([[1], ["s"]])
+func f5(dict<str, dict> x) => len(x);
+f5({"a": {}})
+struct F1 { box<float> bf; array a; dict d; }
+F1(box(1.5), [1], {"k": 2})
+var x1 += 1
+var y1, y2
+int? o1
+o1
+box<int> zb
+zb
+P zp
+zp
+var? m1, m2 = [1, none]
+m1
+m2
+var dyn n1, n2 = [1, "s"]
+n2
+int i1, i2 = [1, 2]
+i2
+float f1, f2 = [1, 2]
+f2
+const bool CB = true
+const str CS = "s"
+const float CF = 1
+CF
+const int CI = true
+CI
+const ca, cb = [[1], [2]]
+ca
+const cc, cd = [3, [4]]
+cd
+const int ce, cf = [5, 6]
+cf
+array<float> af = [1, 2]
+af = ["x"]
+af = [true, 2]
+af
+array<array<int>> aa = [[1], ["x"]]
+dict<str, float> df = {"a": "b"}
+dict<str, float> df2 = {1: 2}
+array<array<int>> ab = [[1], none]
+array<int> ai = {"a": 1}
+array<array<int>> ac = [{"a": 1}]
+dict<str, array<int>> dq = {"a": {"b": 1}}
+dict<str, dict<str, int>> dr = {"a": [1]}
+array<dyn> ad = [[1], {"a": 2}]
+ad
+array<array<int>?> ao = [none, [1]]
+ao
+array<dict<str, float>> ae = [{}, {"k": 1}]
+ae
+dict<str, array<float>> dg = {"a": []}
+dg
+array<C?> acn = [none, C(1)]
+acn
+array<C> acc = [C(1), C(2)]
+array_storage(acc)
+array<P> app = []
+array_storage(app)
+array<array<P>> apn = [[], [P(1, 2)]]
+array_storage(apn[0])
+array<str> as1 = ["a"]
+array_storage(as1)
+array<str?> as2 = ["a", none]
+as2
+var b9 = ++;
+var c9 = *;
+var d9 = -;
+var e9 = !)
+var st = str(runtime("abc"))
+const KC = C(5)
+:trace arrays on
+array<C> akc = [KC, KC]
+array<C?> akn = [none, KC]
+array<array<str>> xs = [[st]]
+array<bool> abl = [st == "abc"]
+array<float> afl = [1, 2]
+array<P> apl = [P(1, 2)]
+var dyn dyl = [1]
+array<int?> aio = [1, none]
+:trace off
+array_storage(akc)
+akn
+dict<str, float> dvar = {}
+dvar["a"] = 1
+dvar
+const K9 = 3
+K9, zz = [1, 2]
+y1, y2
+var x0 = ;
+y1 = ;
+const q1, q2 = [st, 2]
+const KARR = [1, 2]
+const q3, q4 = KARR
+q4
+const q5, q6 = [KARR, [3]]
+q5
+q6
+const _, q7 = [[1], [2]]
+q7
