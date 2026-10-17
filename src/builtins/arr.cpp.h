@@ -1075,12 +1075,15 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
     /*
      * Sorting a `const` (a read-only value, or a const-declared variable)
      * sorts a fresh copy and returns it, leaving the original untouched -
-     * rather than mutating it in place. clone() yields a mutable copy.
+     * rather than mutating it in place. clone() yields a mutable copy -
+     * which is never stored back: the promotion write-back below put the
+     * sorted COPY of a flat struct array into the variable holding the
+     * constant (`var k = K; sort(k, cmp);` sorted k).
      */
-    if (val0.get<SharedArrayObj>().is_readonly()) {
+    if (val0.get<SharedArrayObj>().is_readonly()
+            || (lval && lval->is_const_var())) {
         val0 = val0.clone();
-    } else if (lval && lval->is_const_var()) {
-        val0 = val0.clone();
+        lval = nullptr;
     }
 
     SharedArrayObj &arr = val0.get<SharedArrayObj>();
@@ -1379,8 +1382,7 @@ EvalValue builtin_rev_sort_lv(EvalContext *ctx, const ArgLocs *exprList,
     return sort_lv(ctx, exprList, target, rest, n, true);
 }
 
-/* reverse core - `lval` (or null) as in sort_core (slice write-back). Preserves
- * the original reverse (no const-copy: reverse has no 'const' contract). */
+/* reverse core - `lval` (or null) as in sort_core (slice write-back). */
 static EvalValue
 reverse_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0,
              LValue *lval)
@@ -1392,6 +1394,19 @@ reverse_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0,
 
     if (!val0.is<SharedArrayObj>())
         throw TypeErrorEx("Expected array", arg0->start, arg0->end);
+
+    /*
+     * README `reverse(array)`: like sort(), a const argument (a read-only
+     * value, or a const-declared variable) is cloned and the CLONE is
+     * reversed and returned - the original is left untouched. It used to
+     * reverse in place, so `var k = K; reverse(k);` reversed the constant
+     * K itself, seen through every other name holding it.
+     */
+    if (val0.get<SharedArrayObj>().is_readonly()
+            || (lval && lval->is_const_var())) {
+        val0 = val0.clone();
+        lval = nullptr;      /* the clone is returned, never stored back */
+    }
 
     SharedArrayObj &arr = val0.get<SharedArrayObj>();
 

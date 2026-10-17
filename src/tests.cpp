@@ -12015,6 +12015,38 @@ static const std::vector<test> tests =
         },
     },
 
+    /* README `reverse(array)`: like sort(), a const argument is cloned
+     * before reversing - the clone is returned and the constant is left
+     * alone, through any name holding it (it was reversed in place) */
+    {
+        "Reverse a const through a var: the constant is untouched",
+        {
+            "const K = [1, 2, 3];",
+            "func kf() { return K; }",
+            "var k = K; var k2 = K;",
+            "var r = reverse(k);",
+            "assert(r == [3, 2, 1]);",
+            "assert(k == [1, 2, 3] && k2 == [1, 2, 3] && kf() == [1, 2, 3]);",
+            "assert(reverse(K) == [3, 2, 1] && kf() == [1, 2, 3]);",
+            "const F = [1.5, 2.5]; var f = F; reverse(f);",
+            "const S = [\"a\", \"b\"]; var s = S; reverse(s);",
+            "assert(f == [1.5, 2.5] && s == [\"a\", \"b\"]);",
+            "const R = reverse(K); assert(R == [3, 2, 1]);",
+        },
+    },
+    {
+        "Reverse a const struct array through a var: the var is untouched",
+        {
+            "struct P { int x; }",
+            "const K = [P(1), P(2)];",
+            "var k = K;",
+            "var r = reverse(k);",
+            "assert(r[0].x == 2 && k[0].x == 1 && K[0].x == 1);",
+            "var r2 = sort(k, func(a, b) => a.x > b.x);",
+            "assert(r2[0].x == 2 && k[0].x == 1);",
+        },
+    },
+
     {
         "Builtin sum()",
         {
