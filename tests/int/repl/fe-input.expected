@@ -1,0 +1,75 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> .. .. => "one\ntwo \" still\nthree"
+>> => "one\ntwo \" still\nthree"
+>> .. .. => 6
+>> => 6
+>> .. => 16
+>> => 16
+>> .. => 9
+>> => 9
+>> .. => 21
+>> => 21
+>> .. .. .. => [1, 2]
+>> => [1, 2]
+>> .. .. .. => {"k": 1, "j": [2, 3]}
+>> => {"k": 1, "j": [2, 3]}
+>> .. .. .. .. >> => 8
+>> => "esc \\ back\tslash \"q\" end"
+>> => "esc \\ back\tslash \"q\" end"
+>> => <none>
+>> => <none>
+>> >> => Q(v: <none>)
+>> => <none>
+>> => [<none>, 1]
+>> => <none>
+>> => 1
+>> => 1
+>> => [2, 3]
+>> .. => [
+     ["alpha", "beta", "gamma", "delta"],
+     ["epsilon", "zeta", "eta", "theta", "iota"],
+     [1000000, 2000000]
+   ]
+>> Invalid token: 2_ at line 50, col 1:3
+
+    2_
+    ^^
+>> SyntaxError at line 51, col 1
+
+    };
+    ^^
+Unexpected token at the end '}'
+>> SyntaxError at line 52, col 9
+
+    var q = );
+            ^^
+Expected expression, got ')'
+>> WrongArgCountEx: function expects 1 argument(s), got 2 at line 53, col 1:8
+
+    f(1, 2);
+    ^^^^^^^
+>> => 1
+>> TypeMismatchEx: 'ty' has type 'int' but is assigned 'str' at line 55, col 1:3
+
+    ty = "str";
+    ^^
+>> OutOfBoundsEx: Out of bounds error at line 56, col 1:8
+
+    arr[10];
+    ^^^^^^^
+>> .. .. >> OutOfBoundsEx: Out of bounds error at line 58, col 12:18
+
+        return arr[n];
+               ^^^^^^
+
+Backtrace (most recent call first):
+  [0] g(n)   at line 58
+  [1] main() at line 60
+>> => -9223372036854775808
+>> .. .. Invalid token: "unterminated
+at the end of the input
+ at line 62, col 11
+
+    var bad = "unterminated
+              ^^^^^^^^^^^^^
+>> 

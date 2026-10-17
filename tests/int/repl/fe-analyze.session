@@ -1,0 +1,17 @@
+# :analyze CODE runs the analysis passes (array storage, inlining,
+# folding, dead code, counted loops) on a non-committed parse of CODE and
+# reprints it; with no color (stdout is not a tty) the text comes back as is.
+:analyze
+:analyze var zz = 1
+zz
+:analyze func sq(x) => x * x; var a = [1, 2]; print(sq(a[0]));
+:analyze if (false) { print(1); } else { print(2); }
+:analyze func k(n) { if (n > 0) { return 1; } return 2; } print(k(3));
+:analyze func z(a) { var s = 0.0; foreach (v in a) { s += v; } return s; }
+:analyze var d = [1, "a"]; const c = 3; var e = c * 2; var f = [true];
+:analyze func w(n) { try { return 10 / n; } catch { return 0; } } w(0);
+:analyze func ct(n) { var s = 0; for (var i = 0; i < n; i++) { s++; } }
+:analyze func bg(n) { var t = 0; for (var i = 0; i < 9; i++) { t += n; } }
+:analyze func ac(x) { var y = x; return y + 1; } func us(q) => ac(q);
+:analyze var x = ;
+:analyze 1 + 2;

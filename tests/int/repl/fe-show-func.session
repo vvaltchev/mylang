@@ -1,0 +1,221 @@
+# :show NAME decompiles a committed function's optimized AST, with its
+# template instances (name$N) and their inferred parameter/return types.
+func loops(n) {
+    var s = 0
+    var i = 0
+    while (i < n) {
+        i++
+        s += i
+    }
+    for (var j = n; j > 0; j--) {
+        s -= j
+    }
+    for (var k = 0; k < n; k += 2) {
+        s *= 1
+    }
+    for (var k = 10; k >= 0; k -= 3) {
+        s += k
+    }
+    for (var k = 0; k <= 2; k++) {
+        s++
+    }
+    return s
+}
+loops(4)
+:show loops
+func each(arr) {
+    var t = 0
+    foreach (var v in arr) {
+        t += v
+    }
+    foreach (var i, v in indexed arr) {
+        t += i * v
+    }
+    foreach (_ in arr) {
+        t--
+    }
+    return t
+}
+each([1, 2, 3])
+:show each
+func pairs(arr) {
+    var t = 0
+    foreach (var a, b in arr) {
+        t += a * b
+    }
+    return t
+}
+pairs([[1, 2], [3, 4]])
+:show pairs
+func spin(int n) {
+    var i = 0
+    for (;;) {
+        i++
+        if (i >= n) {
+            return i
+        }
+    }
+}
+spin(runtime(3))
+:show spin
+func ret0() {
+    print("r")
+    return
+}
+ret0()
+:show ret0
+func noargs { return 5; }
+noargs()
+:show noargs
+pure func pu(x) => x + 1
+pu(2)
+:show pu
+func prm(const int a, opt b, dyn c, float d, opt int e) => a + d
+prm(1, 2, 3, 4.0, none)
+:show prm
+func tf(int n) {
+    bool b = n > 1
+    float f = n
+    str s = "v" + str(n)
+    array ar = [n]
+    dict dc = {"n": n}
+    const k = 3
+    var fl = [1.5, 2.5 * n]
+    var bl = [true, n > 2]
+    var neg = -n
+    var nf = -f
+    var lit = [1, 2, 3]
+    var tern = b ? n : -n
+    return [len(s), len(ar), len(dc), k, len(fl), len(bl), neg, int(nf),
+            len(lit), tern]
+}
+tf(runtime(4))
+:show tf
+struct P { int x; int y; }
+class C { int v; }
+func arrs(int n) {
+    var ps = [P(n, 1), P(2, n)]
+    var cs = [C(n), C(n + 1)]
+    var t = 0
+    foreach (var p in ps) {
+        t += p.x * p.y
+    }
+    foreach (var c in cs) {
+        t += c.v
+    }
+    return t
+}
+arrs(runtime(3))
+:show arrs
+func ex(opt int o, const array<int> a, opt P q) {
+    var u = o ?? -1
+    var p = P(1, 2)
+    p.x += 3
+    var arr = a[1:]
+    var arr2 = a[:2]
+    var arr3 = a[1:2]
+    var w = ++u
+    var z = --u
+    var m = {"k": u, "q\n\t\"\\\r": w}
+    var b = box(5)
+    *b += 1
+    (*b)++
+    var c = C(9)
+    c.v -= 2
+    var f = 1.5 * u - 2.0 / 4
+    var qx = q?.x ?? 0
+    var neg = -(u + 1) * (z - 1)
+    return [u, p.x, len(arr) + len(arr2) + len(arr3), w, z, len(m), *b, c.v,
+            int(f), qx, neg]
+}
+ex(3, [1, 2, 3], P(7, 8))
+ex(none, [4], none)
+:show ex
+func nest(int n) {
+    func inner(int k) {
+        return k * 3
+    }
+    var t = n
+    {
+        var u = inner(t)
+        t = u + 1
+    }
+    return t
+}
+nest(runtime(2))
+:show nest
+func tc(int n) {
+    var r = 0
+    try {
+        r = 10 / n
+    } catch (DivisionByZeroEx, TypeErrorEx as e) {
+        r = -1
+    } catch (OutOfBoundsEx) {
+        r = -2
+    } finally {
+        r += 100
+    }
+    try {
+        r++
+    } finally {
+        r++
+    }
+    return r
+}
+tc(runtime(0))
+tc(runtime(5))
+:show tc
+func sq(x) => x * x
+sq(3)
+sq(1.5)
+func both(a, b) => sq(a) + sq(b)
+both(2, 3)
+both(0.5, 2)
+:show both
+func sq(x) => x * x * x; var cube2 = sq(2)
+cube2
+:show sq
+func bodies(int n) {
+    var s = "a"
+    bool bb = true
+    var t = 0
+    if (n > 1) t += 2; else t -= 1;
+    while (t < 5) t++;
+    foreach (v in [1, 2]) t += v;
+    for (var i = 0; i < 2; i++) t += i;
+    s = "b"
+    bb = !bb
+    const ca = [1, 2]
+    const cd = {"k": 1}
+    var u = 0
+    var w = 0
+    u = w = 3
+    var bx = box(4)
+    *bx += 1
+    if (n <= 2 && t >= 1 || n % 2 == 0) {
+        t += *bx
+    }
+    if (false) {
+        t = 0
+    }
+    return [t, len(s), bb ? 1 : 0, len(ca), len(cd), u, w]
+}
+bodies(runtime(3))
+:show bodies
+func flags(bool b) {
+    bool nb = !b
+    var x = 1.5
+    x = 2.5
+    return nb
+}
+flags(true)
+:show flags
+func prm2(const a, opt b, dyn c, int d, opt int e) => d
+print(show(prm2))
+struct R { int a; }
+func mkr() => R(1)
+mkr()
+struct R { int a; int b; }
+func mkr() => R(1, 2)
+mkr()
+:show mkr

@@ -1,0 +1,413 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> => P(x: 1, y: 2)
+>> => box(3)
+>> usage: :tree <code>
+>> Block(
+  "a\"b\\c\rd\ne\tf\v\a\b"
+)
+>> Block(
+  VarDecl(
+    Id("d")
+    Op '='
+    LiteralDict(
+      KVPair(
+        "k"
+        Int(1)
+      )
+      KVPair(
+        "j"
+        MemberExpr(
+          Id("p")
+          Id("x")
+        )
+      )
+    )
+  )
+)
+>> Block(
+  Expr14(
+    Deref(
+      Id("b")
+    )
+    Op '='
+    Expr04(
+      Deref(
+        Id("b")
+      )
+      Op '+'
+      Int(1)
+    )
+  )
+)
+>> Block(
+  IncDecExpr(postfix ++
+    MemberExpr(
+      Id("p")
+      Id("x")
+    )
+  )
+)
+>> Block(
+  IncDecExpr(prefix --
+    MemberExpr(
+      Id("p")
+      Id("y")
+    )
+  )
+)
+>> Block(
+  VarDecl(
+    Id("q")
+    Op '='
+    CoalesceExpr(
+      MemberExpr(?.
+        Id("p")
+        Id("x")
+      )
+      Int(0)
+    )
+  )
+)
+>> Block(
+  CallExpr(
+    Id("P")
+    ExprList(
+      y:
+      Int(5)
+      x:
+      Int(6)
+    )
+  )
+)
+>> Block(
+  StructDecl("S", a, const k)
+)
+>> Block(
+  ClassDecl("K", s)
+)
+>> Block(
+  VarDecl(
+    Id("f")
+    Op '='
+    FuncDeclStmt(
+      <NoName>
+      IdList(
+        Id("p")
+      )
+      IdList(
+        Id("z")
+      )
+      Block(
+        ReturnStmt(
+          Expr04(
+            Id("z")
+            Op '+'
+            Int(1)
+          )
+        )
+      )
+    )
+  )
+)
+>> Block(
+  FuncDeclStmt(
+    Id("noparams")
+    <NoCaptures>
+    <NoParams>
+    Block(
+      ReturnStmt(Int(1))
+    )
+  )
+)
+>> Block(
+  VarDecl(
+    Id("s1")
+    Op '='
+    Slice(
+      "abc"
+      CallExpr(
+        Id("runtime")
+        ExprList(
+          Int(1)
+        )
+      )
+      <NoEndIndex>
+    )
+  )
+)
+>> Block(
+  VarDecl(
+    Id("s2")
+    Op '='
+    Slice(
+      "abc"
+      <NoStartIndex>
+      CallExpr(
+        Id("runtime")
+        ExprList(
+          Int(2)
+        )
+      )
+    )
+  )
+)
+>> Block(
+  TryCatchStmt(
+    Block(
+      CallExpr(
+        Id("print")
+        ExprList(
+          Int(1)
+        )
+      )
+    )
+    Catch( TypeErrorEx OutOfBoundsEx as e ) (
+      Block(
+        CallExpr(
+          Id("print")
+          ExprList(
+            Id("e")
+          )
+        )
+      )
+    )
+  )
+)
+>> Block(
+  TryCatchStmt(
+    Block(
+      CallExpr(
+        Id("print")
+        ExprList(
+          Int(1)
+        )
+      )
+    )
+    Catch( <anything>) (
+      Block(
+        RethrowStmt
+      )
+    )
+  )
+)
+>> Block(
+  ForeachStmt(
+    IdList(
+      Id("k")
+      Id("v")
+    )
+    LiteralArray(
+      LiteralArray(
+        Int(5)
+        Int(6)
+      )
+    )
+    Block(
+      CallExpr(
+        Id("print")
+        ExprList(
+          Id("k")
+          Id("v")
+        )
+      )
+    )
+  )
+)
+>> Block(
+  ForStmt(
+    <NoInit>
+    <NoCond>
+    <NoInc>
+    Block(
+      BreakStmt
+    )
+  )
+)
+>> Block(
+  WhileStmt(
+    Expr06(
+      MemberExpr(
+        Id("p")
+        Id("x")
+      )
+      Op '>'
+      Int(9)
+    )
+    Block(
+      ContinueStmt
+    )
+  )
+)
+>> Block(
+  IfStmt(
+    Expr06(
+      MemberExpr(
+        Id("p")
+        Id("x")
+      )
+      Op '>'
+      Int(0)
+    )
+    Block(
+      CallExpr(
+        Id("print")
+        ExprList(
+          Int(1)
+        )
+      )
+    )
+    <NoElseBlock>
+  )
+)
+>> Block(
+  Block(
+    CallExpr(
+      Id("print")
+      ExprList(
+        Int(1)
+      )
+    )
+  )
+)
+>> Block(
+  VarDecl(
+    IdList(
+      Id("x")
+      Id("y")
+    )
+    Op '='
+    LiteralArray(
+      Int(1)
+      Int(2)
+    )
+  )
+)
+>> Block(
+  Expr02(
+    Op '-'
+    MemberExpr(
+      Id("p")
+      Id("x")
+    )
+  )
+)
+>> Block(
+  TernaryExpr(
+    Expr06(
+      MemberExpr(
+        Id("p")
+        Id("x")
+      )
+      Op '>'
+      Int(1)
+    )
+    Int(1)
+    Int(2)
+  )
+)
+>> Block(
+  ThrowStmt(
+    CallExpr(
+      Id("P")
+      ExprList(
+        Int(1)
+        Int(2)
+      )
+    )
+  )
+)
+>> Block(
+  TryCatchStmt(
+    Block(
+      CallExpr(
+        Id("print")
+        ExprList(
+          Int(1)
+        )
+      )
+    )
+    Catch( TypeErrorEx ) (
+      Block(
+        CallExpr(
+          Id("print")
+          ExprList(
+            Int(2)
+          )
+        )
+      )
+    )
+  )
+)
+>> Block(
+  WhileStmt(
+    CallExpr(
+      Id("runtime")
+      ExprList(
+        Bool(false)
+      )
+    )
+    <NoBody>
+  )
+)
+>> Block(
+  ForStmt(
+    <NoInit>
+    <NoCond>
+    <NoInc>
+    <NoBody>
+  )
+)
+>> Block(
+  ForeachStmt(
+    IdList(
+      Id("v")
+    )
+    LiteralArray(
+      Int(1)
+    )
+    <NoBody>
+  )
+)
+>> Block(
+  IfStmt(
+    CallExpr(
+      Id("runtime")
+      ExprList(
+        Bool(true)
+      )
+    )
+    <NoThenBlock>
+    <NoElseBlock>
+  )
+)
+>> Block(
+  FuncDeclStmt(
+    Id("r")
+    <NoCaptures>
+    IdList(
+    )
+    Block(
+      ReturnStmt(<NoElem>)
+    )
+  )
+)
+>> Block(
+  CallExpr(
+    Id("P")
+    ExprList(
+      Int(1)
+      y:
+      Int(2)
+    )
+  )
+)
+>> Block(
+  Int(1)
+)
+>> SyntaxError at line 1, col 4
+
+    2 +;
+       ^
+Expected expression, got ';'
+>> => P(x: 1, y: 2)
+>> 

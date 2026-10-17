@@ -1,0 +1,21 @@
+# :help topics: the ':'-prefixed command form, builtins whose kind note is
+# "runtime" by category (random) or by name, and the unknown-topic replies.
+:help :
+:help   :   undef
+:help rand
+:help array
+:help append
+:help push
+:help pop
+:help insert
+:help erase
+:help dynarray
+:help deepclone
+:help clone
+:help globals
+:help builtins nosuch
+:help :nosuch
+:help nosuch
+:h builtins random
+:help slices
+:help exceptions

@@ -1,0 +1,113 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> (no globals defined yet)
+>> usage: :type <expr>
+>> (empty)
+>> usage: :undef <name>
+>> no global named 'nothing_here'
+>> Unknown command ':frob' (try :help)
+>> >> >> >> => [1, 2]
+>> => P(x: 3, y: 4)
+>> => P(x: 1, y: 2)
+>> => K(v: 5)
+>> => [1.500000, 2.500000]
+>> => 3
+>> >> CA    : array<int>   [const]
+CK    : int   [const]
+CP    : P   [const]
+K     : K(int v)   [class type]
+P     : P(int x, int y)   [struct type]
+f     : func f(a, int b)   [func]
+kv    : K   [var]
+opt_i : int?   [var]
+pv    : P   [var]
+xs    : array<float>   [var]
+>> => 6
+>> xs : array<float>   (inferred static type)
+>> opt_i : int?   (inferred static type)
+>> f : func(dyn,int)->dyn   (inferred static type)
+>> pv : P   (inferred static type)
+>> float   (runtime type)
+>> float   (runtime type)
+>> array<P>   (runtime type)
+>> dict<str,array<int>>   (runtime type)
+>> SyntaxError at line 1, col 4
+
+    1 +;
+       ^
+Expected expression, got ';'
+>> Undefined variable 't' at line 14, col 1:2
+
+    t;
+    ^
+>> undefined 'xs'
+>> Undefined variable 'xs'
+>> => "now a string"
+>> xs : str   (inferred static type)
+>> undefined 'CK'
+>> undefined 'f$0'
+>> CA    : array<int>   [const]
+CP    : P   [const]
+K     : K(int v)   [class type]
+P     : P(int x, int y)   [struct type]
+f     : func f(a, int b)   [func]
+kv    : K   [var]
+opt_i : int?   [var]
+pv    : P   [var]
+xs    : str   [var]
+>> >> .. .. .. >> >> CA    : array<int>   [const]
+CP    : P   [const]
+In    : In(int a)   [struct type]
+K     : K(int v)   [class type]
+P     : P(int x, int y)   [struct type]
+S     : S(bool b, str s, array<int> xs, dict<str,float> m, box<int> bx, In inner, array<In>? ys, float f)   [struct type]
+df    : func df(dyn x, opt y)   [func]
+f     : func f(a, int b)   [func]
+kv    : K   [var]
+opt_i : int?   [var]
+pv    : P   [var]
+xs    : str   [var]
+>> none   (runtime type)
+>> bool   (runtime type)
+>> array<bool>   (runtime type)
+>> array<str>   (runtime type)
+>> array<dyn>   (runtime type)
+>> array<dyn>   (runtime type)
+>> dict<str,array<int>>   (runtime type)
+>> In   (runtime type)
+>> array<func df(dyn x, opt y)>   (runtime type)
+>> >> => ["fold"]
+>> InvalidValueEx: Unknown trace category at line 24, col 7:14
+
+    trace("bogus", true);
+          ^^^^^^^
+>> TypeErrorEx: Expected a category string at line 25, col 7:8
+
+    trace(1, true);
+          ^
+>> InvalidNumberOfArgsEx: Invalid number of arguments error at line 26, col 10:11
+
+    traceoff(1);
+             ^
+>> >> => []
+>> tracing: off
+>> Unknown trace category: bogus (try :help optimizations)
+tracing: infer
+>> Unknown trace category: bogus1, bogus2 (try :help optimizations)
+tracing: infer
+>> tracing: fold infer inline
+>> tracing: fold infer inline
+>> tracing: fold infer
+>> tracing: fold infer
+>> tracing: off
+>> tracing: infer
+>>   infer      tr  ? -> int
+infer      var tr : int  (final)
+=> 42
+>> tracing: off
+>> => 1
+>> usage: :source <file>
+>> Failed to open file 'tests/functional/no_such_unit.my'
+>> exc: d.v100.btwo.v33. 
+>> => "d.v100.btwo.v33."
+>> => 25
+>> 
