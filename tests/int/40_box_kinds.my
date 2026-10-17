@@ -1,0 +1,358 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): box(v) and unary * (README "Boxes") over EVERY box kind -
+# box<int>, box<float>, box<bool>, box<str>, a box<P> of a POD struct and a
+# box<Q> of a struct with a str / array field - read and written through
+# `*` in an expression, a statement, a compound assignment and `++`/`--`
+# (both directions, prefix and postfix, value used and dropped), with a
+# box expression that has side effects (`*f() = v`, `*a[i++] += v`: the box
+# is evaluated ONCE, after the rvalue). Then the holders (arrays, dicts,
+# struct and class fields, a box as a dict key), clone / deepclone, == and
+# hash() by identity, typestr / kindstr / print of each kind, and the zero
+# value of every `box<T>` declaration (a variable, a global, a field), box()
+# of a reference (returned as it is), `*bp` as a store root (a copy), the
+# boxes of a const array parameter, kindstr at run time and an opt box
+# joined with a box. The shared box_load_want / box_store (eval.cpp), the
+# VM's LoadBoxV / StoreBoxV and the JIT's jit_load_box / jit_store_box run
+# every kind; 41_box_misfits.my holds the error side. Values come from
+# runtime() so nothing folds.
+
+struct P { int x; float y; }
+struct Q { str s; array<int> xs; }
+struct H { box<int> i; box<float> f; box<bool> b; box<str> s; box<P> p;
+           box<Q> q; }
+class C { box<str> name; box<P> at; }
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad = bad + 1;
+    }
+}
+
+func ri(int v) => int(runtime(v));
+func rf(float v) => float(runtime(v));
+func rb(bool v) => ri(v ? 1 : 0) == 1;
+func rs(str v) => str(runtime(v));
+
+# --- 1. every kind: read, store, the store's value, print / typestr
+var bi = box(ri(4));
+var bf = box(rf(0.5));
+var bb = box(rb(false));
+var bs = box(rs("ab"));
+var bp = box(P(x: ri(1), y: rf(2.5)));
+var bq = box(Q(s: rs("q"), xs: [ri(1), 2]));
+want("print int", str(bi), "box(4)");
+want("print float", str(bf), "box(0.500000)");
+want("print bool", str(bb), "box(false)");
+want("print str", str(bs), "box(\"ab\")");
+want("print P", str(bp), "box(P(x: 1, y: 2.500000))");
+want("print Q", str(bq), "box(Q(s: \"q\", xs: [1, 2]))");
+want("typestr int", typestr(bi), "box<int>");
+want("typestr float", typestr(bf), "box<float>");
+want("typestr bool", typestr(bb), "box<bool>");
+want("typestr str", typestr(bs), "box<str>");
+want("typestr P", typestr(bp), "box<P>");
+want("typestr Q", typestr(bq), "box<Q>");
+foreach (k in [kindstr(bi), kindstr(bf), kindstr(bb), kindstr(bs),
+               kindstr(bp), kindstr(bq)])
+    want("kindstr", k, "box");
+
+want("*bi", *bi * 2, 8);
+want("*bf", *bf + 1, 1.5);
+want("*bb", !*bb, true);
+want("*bs", *bs + "c", "abc");
+want("*bp", (*bp).x + 1, 2);
+want("*bq", len((*bq).xs), 2);
+
+var v1 = (*bi = ri(9));
+var v2 = (*bf = ri(3));             # an int into a box<float>: a float
+var v3 = (*bb = rb(true));
+var v4 = (*bs = rs("z"));
+var v5 = (*bp = P(x: ri(7), y: 1.0));
+var v6 = (*bq = Q(s: rs("r"), xs: [ri(5)]));
+want("v1", v1, 9);
+want("v2 type", typestr(v2), "float");
+want("v2", v2, 3.0);
+want("v3", v3, true);
+want("v4", v4, "z");
+want("v5", v5.x, 7);
+want("v6", v6.xs, [5]);
+want("bp after", bp.x, 7);
+want("bq after", bq.s + str(bq.xs), "r[5]");
+*bi = rb(true);                     # a bool into a box<int>: 1
+*bf = rb(true);                     # a bool into a box<float>: 1.0
+want("bool into box<int>", *bi, 1);
+want("bool into box<float>", typestr(*bf) + str(*bf), "float1.000000");
+
+# --- 2. compound assignment of every operator kind, value and statement
+*bi = ri(10);
+*bi -= 3;
+*bi *= 4;
+*bi /= 2;
+*bi %= 5;
+want("int compound", *bi, 4);
+var cv = (*bi += ri(6));
+want("int compound value", cv, 10);
+*bf = rf(1.5);
+*bf *= 4;
+*bf -= rf(0.5);
+var fv = (*bf /= 2);
+want("float compound", *bf, 2.75);
+want("float compound value", fv, 2.75);
+*bs += rs("y");
+var sv = (*bs += "x");
+want("str compound", *bs, "zyx");
+want("str compound value", sv, "zyx");
+
+# --- 3. ++ / -- both ways, prefix and postfix, statement and value
+*bi = ri(5);
+(*bi)++;
+(*bi)--;
+--*bi;
+++*bi;
+--*bi;
+want("int incdec statements", *bi, 4);
+var a1 = (*bi)--;
+var a2 = --*bi;
+var a3 = (*bi)++;
+var a4 = ++*bi;
+want("int incdec values", [a1, a2, a3, a4, *bi], [4, 2, 2, 4, 4]);
+*bf = rf(0.25);
+(*bf)--;
+--*bf;
+(*bf)++;
+var f1 = (*bf)--;
+var f2 = --*bf;
+want("float incdec", [f1, f2, *bf], [-0.75, -2.75, -2.75]);
+
+# --- 4. the box expression has side effects: evaluated once, after the
+# right-hand side (README: "Every assignment evaluates its right-hand side
+# first, then the target's container and each key")
+var order = "";
+var pool = [box(ri(0)), box(ri(100))];
+func pick(int i) { order += "b"; return pool[i]; }
+func rv(int v) { order += "r"; return ri(v); }
+*pick(0) = rv(5);
+*pick(0) += rv(5);
+var pv = (*pick(1) -= rv(1));
+(*pick(1))--;
+var pv2 = --*pick(0);
+var pv3 = (*pick(0))++;
+want("pick order", order, "rbrbrbbbb");
+want("pick values", [*pool[0], *pool[1], pv, pv2, pv3], [10, 98, 99, 9, 9]);
+var i = 0;
+*pool[i++] = ri(1);
+*pool[i++] += ri(1);
+want("index side effect", [i, *pool[0], *pool[1]], [2, 1, 99]);
+i = 0;
+var iv = (*pool[i++] = *pool[1]);
+want("value form, side effect", [i, iv, *pool[0]], [1, 99, 99]);
+
+# --- 5. holders: arrays, dicts, struct and class fields, captures
+array<box<float>> fs = [box(rf(1.0)), box(rf(2.0))];
+var fsum = 0.0;
+for (var k = 0; k < 60; k++) {
+    *fs[k % 2] += 0.5;
+    fsum += *fs[0];
+}
+want("float box array", [*fs[0], *fs[1]], [16.0, 17.0]);
+want("float box sum", fsum, 525.0);
+array<box<bool>> flags = [box(rb(false)), box(rb(true))];
+foreach (fl in flags)
+    *fl = !*fl;
+want("bool box array", [*flags[0], *flags[1]], [true, false]);
+var sd = {"a": box(rs("x")), "b": box(rs("y"))};
+*sd["a"] += "1";
+*sd.b = *sd.a + "2";
+want("str boxes in a dict", [*sd["a"], *sd["b"]], ["x1", "x12"]);
+var qs = [box(Q(s: rs("a"), xs: [])), box(Q(s: rs("b"), xs: [1]))];
+for (var k = 0; k < 40; k++)
+    append(qs[k % 2].xs, k);
+qs[0].s += "!";
+want("non-POD boxes in an array", [len(qs[0].xs), len(qs[1].xs), qs[0].s],
+     [20, 21, "a!"]);
+
+H h;
+*h.i += ri(2);
+*h.f += rf(0.5);
+*h.b = !*h.b;
+*h.s += rs("s");
+h.p.x = ri(3);
+append(h.q.xs, ri(7));
+want("H zero + writes", [str(*h.i), str(*h.f), str(*h.b), *h.s, str(h.p.x),
+                         str(h.q.xs)],
+     ["2", "0.500000", "true", "s", "3", "[7]"]);
+var h2 = h;                         # a struct copy shares the boxes
+*h2.i = ri(40);
+h2.p.y = rf(9.5);
+want("H copy shares", [*h.i, h.p.y], [40, 9.5]);
+var c = C(name: box(rs("n")), at: box(P(x: ri(1), y: 0.0)));
+var cn = c.name;
+*c.name += "m";
+c.at.x++;
+--c.at.x;
+c.at.y += 2;
+want("class fields", [*cn, str(c.at.x), str(c.at.y)], ["nm", "1", "2.000000"]);
+var counter = box(rs(""));
+var addc = func [counter] (str t) { *counter += t; return len(*counter); };
+for (var k = 0; k < 25; k++)
+    addc("a");
+want("captured str box", len(*counter), 25);
+
+# --- 6. a box as a dict key, == and hash() by identity
+var b1 = box(ri(1));
+var b2 = box(ri(1));
+var b3 = b1;
+want("== identity", [b1 == b3, b1 == b2, b1 != b2, b1 != b3],
+     [true, false, true, false]);
+want("hash identity", [hash(b1) == hash(b3), hash(b1) == hash(b2)],
+     [true, false]);
+var pb1 = box(P(x: ri(1), y: 1.0));
+var pb2 = box(P(x: ri(1), y: 1.0));
+want("box<P> identity", [pb1 == pb1, pb1 == pb2, hash(pb1) == hash(pb2)],
+     [true, false, false]);
+var bkeys = {};
+bkeys[b1] = "one";
+bkeys[b2] = "two";
+bkeys[b3] = "three";
+bkeys[pb1] = "p1";
+bkeys[pb2] = "p2";
+want("box keys", [len(bkeys), bkeys[b1], bkeys[b2], bkeys[pb2]],
+     [4, "three", "two", "p2"]);
+*b1 = ri(50);                       # the key's hash does not change
+want("key after write", bkeys[b3], "three");
+var dyn db = b1;
+var dyn dn = ri(50);
+want("box == a non-box", [db == dn, db != dn, db == none],
+     [false, true, false]);
+var dyn sbx = box(rs("k"));
+want("box<str> vs box<int>", sbx == db, false);
+
+# --- 7. clone / deepclone of every kind: a NEW box, a copy of the value
+var cb = [clone(bi), clone(bf), clone(bb), clone(bs)];
+var dcb = [deepclone(bi), deepclone(bf), deepclone(bb), deepclone(bs)];
+*cb[0] += 1;
+*dcb[3] += "!";
+want("clone is new", [cb[0] == bi, dcb[3] == bs, *cb[0] == *bi + 1,
+                      *dcb[3] == *bs + "!"], [false, false, true, true]);
+var cf = clone(bf);
+var dcbb = deepclone(bb);
+*cf += 1;
+*dcbb = !*dcbb;
+want("clone keeps kind", [typestr(cf), typestr(dcbb), str(*cf - *bf),
+                          str(*dcbb != *bb)],
+     ["box<float>", "box<bool>", "1.000000", "true"]);
+var cq = clone(bq);
+var dq = deepclone(bq);
+append(cq.xs, 1);                   # a shallow clone shares the array
+append(dq.xs, 2);
+want("clone Q", [str(bq.xs), str(cq.xs), str(dq.xs)],
+     ["[5, 1]", "[5, 1]", "[5, 2]"]);
+want("clone Q identity", [cq == bq, dq == bq, cq.s == bq.s],
+     [false, false, true]);
+var cp = clone(bp);
+cp.x = 1000;
+want("clone P", [bp.x, cp.x], [7, 1000]);
+var nested = [b1, b1];
+var sn = clone(nested);             # a shallow array clone: the same box
+var dn2 = deepclone(nested);        # a new box at each place (README)
+*sn[0] += 1;
+*dn2[0] = ri(-1);
+want("clone of an array of boxes", [*b1, *sn[1], *dn2[0], *dn2[1]],
+     [51, 51, -1, 50]);
+want("deepclone copies per place", [dn2[0] == dn2[1], sn[1] == b1],
+     [false, true]);
+
+# --- 8. zero-initialised box declarations (a fresh box each time)
+box<int> zi;
+box<float> zf;
+box<bool> zb;
+box<str> zs;
+box<P> zp;
+box<Q> zq;
+want("zero values", [str(zi), str(zf), str(zb), str(zs), str(zp), str(zq)],
+     ["box(0)", "box(0.000000)", "box(false)", "box(\"\")",
+      "box(P(x: 0, y: 0.000000))", "box(Q(s: \"\", xs: []))"]);
+func fresh() {
+    box<P> p;
+    box<bool> f;
+    box<Q> q;
+    p.x++;
+    *f = !*f;
+    append(q.xs, 1);
+    return [p, f, q];
+}
+var fr1 = fresh();
+var fr2 = fresh();
+want("fresh each call", [fr1[0] == fr2[0], fr1[1] == fr2[1],
+                         fr1[2] == fr2[2]], [false, false, false]);
+want("fresh values", [fr1[0].x, fr2[0].x, *fr2[1], len(fr2[2].xs)],
+     [1, 1, true, 1]);
+var hs = [];
+for (var k = 0; k < 3; k++) {
+    H hh;
+    *hh.s = str(k);
+    append(hs, hh);
+}
+want("H zero per iteration", *hs[0].s + *hs[1].s + *hs[2].s, "012");
+want("H boxes distinct", hs[0].p == hs[1].p, false);
+
+# --- 9. a reference is not boxed again; *bp is a COPY even as a store root;
+# a const array parameter's boxes are references (a write into them is
+# allowed, README "Const parameters"); bool boxes in int contexts
+var cc = C(name: box(rs("c")), at: box(P(x: ri(1), y: 1.0)));
+var bcc = box(cc);
+bcc.at.x = 77;
+var arr2 = [ri(1)];
+var dd = {"k": ri(1)};
+want("box() of references", [bcc == cc, typestr(bcc), str(cc.at.x),
+                             str(box(arr2) == arr2), str(box(dd) == dd),
+                             typestr(box(dd))],
+     [true, "C", "77", "true", "true", "dict<str,int>"]);
+var bp9 = box(P(x: ri(1), y: 2.0));
+(*bp9).x = 9;                       # stores into the read copy only
+var dyn dp9 = bp9;
+(*dp9).x = 10;
+want("copy root", [bp9.x, dp9.x], [1, 1]);
+func set_first(const array<box<int>> cs, int v) {
+    *cs[0] = v;
+    (*cs[1])++;
+    return *cs[0] + *cs[1];
+}
+var cells9 = [box(ri(1)), box(ri(2))];
+want("const array of boxes", [set_first(cells9, 7), *cells9[0], *cells9[1]],
+     [10, 7, 3]);
+var bt = box(ri(1) == 1);
+var bf9 = box(ri(1) == 2);
+var bsum = 0;
+for (var k = 0; k < 40; k++) {
+    if (*bt)
+        bsum += *bt + 1;
+    if (*bf9)
+        bsum += 100;
+    bsum += *bf9 ? 1000 : 0;
+}
+want("bool boxes as ints", bsum, 80);
+func pick_box(bool first, box<int> a) => first ? a : box(ri(-1));
+func kind_of(x) { return kindstr(x); }
+var dyn kof = runtime(kind_of);        # the base runs: kindstr at run time
+want("run-time kindstr", [kof(box(P(x: ri(1), y: 0.0))), kof(box(ri(3))),
+                          kof(box(rs("s"))), kof(ri(3)),
+                          kof(P(x: ri(1), y: 0.0)), kof(cc)],
+     ["box", "box", "box", "int", "struct", "class"]);
+var mb = none;                         # a box<int>? joined with a box<int>
+if (ri(1) == 1)
+    mb = box(ri(5));
+mb = box(ri(6));
+var mbv = 0;
+if (mb)
+    mbv = *mb;
+want("opt box joined", [typestr(mb), str(mbv)], ["box<int>?", "6"]);
+want("ternary of boxes", [*pick_box(ri(1) == 1, b1),
+                          *pick_box(ri(1) == 2, b1)], [51, -1]);
+
+print("box kinds: " + str(bad) + " failure(s)");
+assert(bad == 0);
