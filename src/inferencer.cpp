@@ -528,6 +528,9 @@ private:
     /* check pass */
     void check(Construct *n);
     void check_const_param_store(const Construct *target);
+    bool is_const_param(const Construct *e);
+    void const_param_ref_store(const Construct *ref,
+                               const Construct *target, bool box);
     void check_if(IfStmt *i);
     TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
@@ -6618,43 +6621,83 @@ bool Inferencer::fold_type_query(CallExpr *call)
  */
 void Inferencer::check_const_param_store(const Construct *target)
 {
+    /*
+     * The walk goes from the target toward its root while every step
+     * stays INSIDE a struct VALUE. A step into a REFERENCE - a box's
+     * value (`*b`), a field of a box<P> or of a class instance - writes
+     * the object that reference reaches, not the struct's own value: it
+     * is refused only when that reference IS the const parameter (README:
+     * a const parameter's box is read-only), and allowed when the struct
+     * merely holds it (`*c.b = v`, `c.k.n = v` - README: "through struct
+     * fields only"; a box or a class instance is a reference, like the
+     * struct's arrays and dicts). The member step used to follow a box or
+     * a class field as a struct field, and refused both.
+     */
     const Construct *t = target;
-    bool through_member = false, through_box = false;
+    bool through_member = false;
     for (;;) {
         if (ctag(t) == ConstructType::member) {
             const Construct *base =
                 static_cast<const MemberExpr *>(t)->what.get();
             StaticTypeRef bt = static_type_resolve(type_of(base));
-            through_box = bt && bt->kind == StaticTypeKind::Box;
+            const bool box = bt && bt->kind == StaticTypeKind::Box;
             bt = member_base(bt);
             if (!bt || bt->kind != StaticTypeKind::Struct)
                 return;
+            const auto *def =
+                static_cast<const StructTypeDef *>(bt->struct_def);
+            if (box || (def && def->is_class)) {
+                /* a field of the object a reference reaches */
+                const_param_ref_store(base, target, box);
+                return;
+            }
             through_member = true;
             t = base;
             continue;
         }
         if (ctag(t) == ConstructType::deref) {
-            /* `*b = v`: the box a const parameter holds */
-            through_member = through_box = true;
-            t = static_cast<const DerefExpr *>(t)->elem.get();
-            continue;
+            /* `*b = v`: the value of the box `b` reaches */
+            const_param_ref_store(
+                static_cast<const DerefExpr *>(t)->elem.get(), target, true);
+            return;
         }
         break;
     }
-    if (!through_member || ctag(t) != ConstructType::id
-            || capture_uses.count(t))
-        return;
-    auto it = id_sym.find(t);
-    if (it == id_sym.end() || !it->second || !it->second->const_param)
+    if (!through_member || !is_const_param(t))
         return;
     const std::string nm(static_cast<const Identifier *>(t)->uid->val);
+    mismatch("cannot change a field of '" + nm +
+                 "': a const parameter's struct is read-only",
+             target->start, target->end);
+}
+
+/* `e` names a const parameter (a capture of one is the closure's own
+ * binding, never const) */
+bool Inferencer::is_const_param(const Construct *e)
+{
+    if (ctag(e) != ConstructType::id || capture_uses.count(e))
+        return false;
+    auto it = id_sym.find(e);
+    return it != id_sym.end() && it->second && it->second->const_param;
+}
+
+/* A store into the object the reference `ref` reaches (a box's value, a
+ * field of a box<P> or of a class instance): refused when `ref` is a
+ * const parameter itself - its box (or instance) is read-only - and a
+ * write into a reference otherwise. */
+void Inferencer::const_param_ref_store(const Construct *ref,
+                                       const Construct *target, bool box)
+{
+    if (!is_const_param(ref))
+        return;
+    const std::string nm(static_cast<const Identifier *>(ref)->uid->val);
     if (ctag(target) == ConstructType::deref
-            && t == static_cast<const DerefExpr *>(target)->elem.get())
+            && ref == static_cast<const DerefExpr *>(target)->elem.get())
         mismatch("cannot change the value of '" + nm +
                      "': a const parameter's box is read-only",
                  target->start, target->end);
     mismatch("cannot change a field of '" + nm + "': a const parameter's " +
-                 (through_box ? "box" : "struct") + " is read-only",
+                 (box ? "box" : "struct") + " is read-only",
              target->start, target->end);
 }
 

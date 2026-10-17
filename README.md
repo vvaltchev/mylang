@@ -2521,9 +2521,11 @@ or dict field is still the constant's, read-only, so `q.a[0] = 1` raises
 `NotLValueEx`), and so is a constant passed to a parameter. A **`const`
 parameter**'s struct cannot be changed (C#'s `in`): writing a field of it —
 through struct fields only, `c.x = v`, `c.inner.x += 1`, `c.x++` — is a
-compile error when its type is known to be a struct; a write *into* an array or
-a dict it holds (`c.a[0] = v`, `append(c.a, v)`, `c.d.k = v`) is a write into
-that reference and is allowed. (A `dyn` const parameter is not checked: like
+compile error when its type is known to be a struct; a write *into* an array,
+a dict, a box or a class instance it holds (`c.a[0] = v`, `append(c.a, v)`,
+`c.d.k = v`, `*c.b = v`, `c.node.val = v`) is a write into that reference and
+is allowed - replacing such a field (`c.b = box(1)`) is not. (A `dyn` const
+parameter is not checked: like
 any parameter it holds the call's own copy.) `Type.CONST` folds at parse time.
 An `array` of a struct type infers as `array<Struct>`
 (`var a = [Point(1,2), Point(3,4)]`).
