@@ -928,5 +928,22 @@ MY
     [ $oom_ok = 1 ] && pass "out of memory: OutOfMemoryEx, caught and uncaught"
 fi
 
+# A path naming a DIRECTORY opens fine on POSIX and then fails every read
+# (EISDIR), and libstdc++'s filebuf THROWS when read(2) fails: `-c DIR`
+# ended in std::terminate (rc 134), and a plain run read zero lines and ran
+# an EMPTY program, exit 0. Both must refuse the path. (An image whose
+# source reference names a directory is -rt's myv_source_ref_directory.)
+mkdir -p "$TMP/adir"
+dir_ok=1
+out=$("$BIN" "$TMP/adir" 2>&1); r=$?
+if [ $r != 1 ] || ! printf '%s' "$out" | grep -q 'Failed to open file'; then
+    dir_ok=0; fail "a directory as the script: exit $r: $out"
+fi
+out=$("$BIN" -c "$TMP/adir" -o "$TMP/adir.myv" 2>&1); r=$?
+if [ $r != 1 ] || [ -e "$TMP/adir.myv" ]; then
+    dir_ok=0; fail "-c of a directory: exit $r: $out"
+fi
+[ $dir_ok = 1 ] && pass "a directory is not a script: refused, no crash"
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc

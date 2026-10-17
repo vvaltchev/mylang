@@ -182,8 +182,13 @@ catalog tests.
 
 The CI fuzzers take `--seed ${{github.run_id}}` (a re-run keeps it): a
 fixed seed made them a regression corpus. A finding reproduces from the
-printed seed; a .myv finding only from the saved image (it embeds its
-source path).
+printed seed. A .myv finding does too, through tests/run on a build of
+the SAME COMMIT with TMPDIR unset (`tests/run --seed N --bin dbg=BIN
+myv_fuzz`): an image embeds its source path, but the temp directories'
+random suffixes have a fixed length, so the image's layout - and every
+mutation offset - repeats (CI seed 37801504667 was replayed that way,
+2026-10-09). The saved image (the job's artifact) is the direct
+reproducer.
 
 ## Reach is not checking
 

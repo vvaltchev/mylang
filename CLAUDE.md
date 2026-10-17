@@ -2180,8 +2180,9 @@ the `tests/run` paragraph below):
 - **myv-fuzz** on BOTH a Debug/ASan and an `ASSERTS=OFF` Release build,
   because those catch different things (a memory error vs. a check the
   debug build was relying on being compiled away). Findings are
-  uploaded as artifacts — a `.myv` finding cannot be regenerated from
-  a seed, since an image embeds its source path;
+  uploaded as artifacts — an image embeds its source path, so a `.myv`
+  finding replays from its seed only through `tests/run` on a build of
+  the same commit (tests/CLAUDE.md);
 - **repl-fuzz** under `RECYCLE=ON` + ASan, the combination this file
   names for the REPL's retained-AST/stale-node class;
 - **coverage-gate** — Net 4's ratchet (below).
@@ -8478,8 +8479,9 @@ loads cleanly) from a hang in the LOADER (a bug). **Run it after any
 format or loader change**, against BOTH a debug (ASan+UBSan) and an
 `OPT=1 ASSERTS=0` build - they catch different things, and it found the
 tier-2 throw-through-noexcept and the codegen-audit false alarm below
-within minutes of being checked in. A finding is SAVED, because it cannot
-be regenerated from the seed: an image embeds its SOURCE PATH. Its sibling
+within minutes of being checked in. A finding is SAVED, because an image
+embeds its SOURCE PATH (its seed replays it only through `tests/run`, on a
+build of the same commit - tests/CLAUDE.md). Its sibling
 **`tests/repl_fuzz BINARY`** does the same for the REPL - a THIRD front
 end that shares almost none of the script path (its own incremental
 inferencer with cross-input type commitment, retained per-input ASTs, an

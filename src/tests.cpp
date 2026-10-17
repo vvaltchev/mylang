@@ -32637,6 +32637,104 @@ static bool myv_cyclic_const_refused()
 }
 
 /*
+ * A SOURCE PATH THAT NAMES A DIRECTORY. A directory opens fine on POSIX
+ * and then fails every read with EISDIR - and libstdc++'s filebuf THROWS
+ * from underflow when read(2) fails, past every istream's error state,
+ * since an istreambuf_iterator calls the buffer directly. So an image
+ * whose source reference named a directory ended the process in
+ * std::terminate (tests/myv_fuzz, a mutated path, CI seed 37801504667),
+ * and so did `myv_source_ref` - i.e. `mylang -c DIR`; libc++ (macOS) read
+ * the directory as an EMPTY file instead. Both must read it as "no
+ * source": the reference is empty, the image loads with no text and no
+ * warning, and the program runs. A read error past a successful open is
+ * "cannot read" too (Linux only: /proc/self/mem). (The script driver's
+ * half, `mylang DIR`, is a driver_checks case: -rt cannot reach
+ * read_script.)
+ */
+static bool myv_source_ref_directory()
+{
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-srcdir.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    std::string out;
+    try {
+        const MyvSourceRef none = myv_source_ref(tdir);
+        if (!none.abs.empty() || !none.rel.empty() || none.size) {
+            fprintf(stderr, "myv-srcdir: a directory got a source "
+                            "reference ('%s')\n", none.abs.c_str());
+            ok = false;
+        }
+#ifdef __linux__
+        /* a READ error past a successful open: page 0 is never mapped,
+         * so reading /proc/self/mem from its start fails with EIO */
+        std::string text;
+        if (read_file("/proc/self/mem", text) || !text.empty()) {
+            fprintf(stderr, "myv-srcdir: a read error read as %zu bytes\n",
+                    text.size());
+            ok = false;
+        }
+#endif
+
+        std::vector<Tok> toks;
+        lexer("var dyn x = runtime(6);\nprint(x + 1);", 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+
+        /* every candidate the loader tries is the directory */
+        MyvSourceRef ref;
+        ref.root = tdir;
+        ref.rel = ".";
+        ref.abs = tdir;
+        ref.crc = 1;
+        ref.size = 1;
+        myv_write(prog, path, ref);
+
+        MyvSource src;
+        VmProgram img = myv_read(path, src);
+        if (!src.lines.empty() || !src.warning.empty()) {
+            fprintf(stderr, "myv-srcdir: %zu source line(s), warning "
+                            "[%s]\n", src.lines.size(), src.warning.c_str());
+            ok = false;
+        }
+        std::ostringstream cap;
+        std::streambuf *ob = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(img);
+        } catch (...) {
+            std::cout.rdbuf(ob);
+            throw;
+        }
+        std::cout.rdbuf(ob);
+        out = cap.str();
+    } catch (Exception &e) {
+        out = std::string("threw ") + e.name;
+    } catch (const std::exception &e) {
+        /* the defect: an iostream exception out of the loader */
+        out = std::string("threw std::exception: ") + e.what();
+    }
+    if (out != "7 \n") {
+        fprintf(stderr, "myv-srcdir: the image printed [%s]\n", out.c_str());
+        ok = false;
+    }
+    remove(path.c_str());
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
  * #122: A CALLABLE DESCRIPTOR WITH NO CHUNK - both tiers, one shape.
  *
  * A FuncDescriptor may legitimately have no chunk: a DEAD BASE TEMPLATE is
@@ -55002,6 +55100,8 @@ static const std::vector<extra_check> extra_checks =
     { "myv: a constant that contains itself is refused by name, no file "
       "written",
       myv_cyclic_const_refused },
+    { "myv: a source path naming a directory is no source, not a crash",
+      myv_source_ref_directory },
     { "myv: an UNTRUSTED image's out-of-range field index is caught (#137)",
       myv_untrusted_field_index },
     { "myv: a WRONG-TYPED base does not take the process down (#142)",

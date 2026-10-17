@@ -318,22 +318,26 @@ void help()
 void
 read_script(const char *filename)
 {
-    {
-        string line;
-        std::ifstream filestream(filename);
+    /* read_file refuses a READ error too (a directory opens on POSIX and
+     * then fails every read): not an empty program. The lines split as
+     * getline splits them - a trailing newline adds no empty line, a CR
+     * stays - so carets are unchanged. */
+    string text;
 
-        if (filestream.is_open()) {
+    if (!read_file(filename, text)) {
+        cout << "Failed to open file '" << filename << "'\n";
+        exit(1);
+    }
 
-            while (getline(filestream, line)) {
-                lines.push_back(std::move(line));
-                line.clear(); /* Put the string is a known state */
-            }
-
-        } else {
-
-            cout << "Failed to open file '" << filename << "'\n";
-            exit(1);
+    size_t b = 0;
+    while (b < text.size()) {
+        const size_t e = text.find('\n', b);
+        if (e == string::npos) {
+            lines.push_back(text.substr(b));
+            break;
         }
+        lines.push_back(text.substr(b, e - b));
+        b = e + 1;
     }
 
     lex_all();

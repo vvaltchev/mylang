@@ -29,10 +29,13 @@ USAGE
 The seed is printed first. CI passes a fresh one per run, so each push
 tries new mutations; the default is fixed, so a bare run is repeatable.
 
-A finding is SAVED (--save, default ./myv-fuzz-bad) because it cannot be
-regenerated from the seed alone: an image embeds its SOURCE PATH, so the
-same seed over a corpus written to a different directory produces different
-bytes. Re-run a saved image directly - it is the whole reproducer.
+A finding is SAVED (--save, default ./myv-fuzz-bad): an image embeds its
+SOURCE PATH, so the same seed over a corpus written to a directory of a
+different LENGTH mutates different offsets. Re-run a saved image directly -
+it is the whole reproducer. A CI seed can still be replayed: run tests/run
+(TMPDIR unset, so both temp directories have CI's fixed-length names) with
+`--seed N` on a build of the CI commit - the images are byte-for-byte the
+same layout, so every mutation lands where it did.
 
 Run it against a DEBUG (ASan + UBSan) build for detection, and against
 `OPT=1 ASSERTS=0` for what actually ships - they catch different things: the

@@ -41,6 +41,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <new>
+#include <sys/stat.h>
 #include <map>
 #include <string>
 #include <vector>
@@ -87,19 +89,6 @@ uint32_t crc32_of(const std::string &data)
     }
 
     return ~c;
-}
-
-/* Read a whole file; false if it cannot be opened. */
-bool read_file(const std::string &path, std::string &out)
-{
-    std::ifstream f(path, std::ios::binary);
-
-    if (!f)
-        return false;
-
-    out.assign((std::istreambuf_iterator<char>(f)),
-               std::istreambuf_iterator<char>());
-    return true;
 }
 
 /* '/' is accepted as a separator by both platforms; Windows also takes '\'. */
@@ -1910,6 +1899,51 @@ void read_chunk(Reader &r, Chunk &c)
 
 }  /* anon namespace */
 
+/*
+ * Read a whole file; false if it cannot be opened OR read. A DIRECTORY is
+ * refused up front: it opens fine on POSIX and then fails every read with
+ * EISDIR, and the two C++ libraries disagree about what that means -
+ * libstdc++'s filebuf THROWS from underflow (past every istream's error
+ * state, since an istreambuf_iterator calls the buffer directly), libc++'s
+ * just reports end of file, an EMPTY file. An image whose source reference
+ * named a directory (myv_fuzz, a mutated path) and `mylang -c DIR` ended
+ * in std::terminate on Linux, while macOS read the directory as an empty
+ * script. A read error past the open still answers "cannot read"; out of
+ * memory is still out of memory.
+ */
+static bool is_directory(const std::string &path)
+{
+#ifdef _WIN32
+    struct _stat64 st;
+    return _stat64(path.c_str(), &st) == 0 && (st.st_mode & _S_IFDIR);
+#else
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+bool read_file(const std::string &path, std::string &out)
+{
+    if (is_directory(path))
+        return false;
+
+    std::ifstream f(path, std::ios::binary);
+
+    if (!f)
+        return false;
+
+    try {
+        out.assign((std::istreambuf_iterator<char>(f)),
+                   std::istreambuf_iterator<char>());
+    } catch (const std::bad_alloc &) {
+        throw;
+    } catch (const std::exception &) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ */
 /* The whole image                                                      */
 /* ------------------------------------------------------------------ */
@@ -2271,11 +2305,9 @@ static void myv_derive_ref_slots(VmProgram &prog)
 VmProgram myv_read(const std::string &path, MyvSource &out_src,
                    const MyvLoadOpts &opts)
 {
-    std::ifstream f(path, std::ios::binary);
-    if (!f)
+    std::string data;
+    if (!read_file(path, data))
         throw Exception("MyvError", "cannot open the .myv file");
-    std::string data((std::istreambuf_iterator<char>(f)),
-                     std::istreambuf_iterator<char>());
     Reader r(data);
 
     r.need(4);
