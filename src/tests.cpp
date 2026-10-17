@@ -17624,6 +17624,19 @@ static const std::vector<test> tests =
     { "template: a never-called template is not checked (no error)",
       { "func unused(a){ var r = a + 1; r += 2; return r; }",
         "assert(true);" } },
+    /* ...nor is a template only it calls: a call in a template BASE's
+     * body made an instance no call site fed, then checked it with its
+     * parameter unconstrained (a NullabilityEx over a `none` local) */
+    { "template: a template only a never-called template calls",
+      { "func ac(x) { var y = x; return y + 1; }",
+        "func use(q) { var a = ac(q); var b = ac(2); return 0; }",
+        "func use2(q) { return ac(2) + ac(2.5); }",
+        "assert(true);" } },
+    { "template: ...and the same calls once the caller is instantiated",
+      { "func ac(x) { var y = x; return y + 1; }",
+        "func use(q) { var a = ac(q); var b = ac(2); return a + b; }",
+        "assert(use(1) == 5 && use(1.5) == 5.5);",
+        "var dyn u = runtime(use); assert(u(2) == 6);" } },
     { "template: a derived local needs no `var dyn`",
       { "func g(a){ var r = a + 1; return r; }",
         "assert(g(41) == 42); assert(g(2.5) == 3.5);" } },
@@ -28605,6 +28618,83 @@ static bool template_value_arg_instantiation()
         }
         if (got != c.want) {
             cout << "  tmpl-arg [" << c.what << "]: instance '" << c.inst
+                 << "' " << (got ? "EXISTS" : "is absent") << ", wanted "
+                 << (c.want ? "it" : "no instance") << "\n";
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+/*
+ * ONLY A LIVE CALL INSTANTIATES A TEMPLATE (2026-10-09) - the instance
+ * set again, read out of the compiled tree. A call inside a template
+ * BASE's body used to make an instance that no call site fed (the
+ * fixpoint skips that body), which was then checked with its parameter
+ * unconstrained. The NullabilityEx it raised is gone since an untyped
+ * local is `dyn` (TypeSym::got_unknown), so only the instance set can
+ * still see the defect.
+ */
+static bool template_live_call_instantiation()
+{
+    struct Case {
+        const char *what;
+        const char *src;
+        const char *inst;   /* the instance that must (not) exist */
+        bool want;
+    };
+
+    static const std::vector<Case> cases = {
+        { "a call in a never-called template makes no instance",
+          "func ac(x) { var y = x; return y + 1; }\n"
+          "func use(q) { var b = ac(2); return 0; }\n"
+          "print(1);", "ac$0", false },
+        { "...nor in a template kept only as a value",
+          "func ac(x) { var y = x; return y + 1; }\n"
+          "func use(q) { var b = ac(2); return b; }\n"
+          "var dyn u = runtime(use); print(u(1));", "ac$0", false },
+        { "...and the caller's instance instantiates the call",
+          "func ac(x) { var y = x; return y + 1; }\n"
+          "func use(q) { var b = ac(2); return b; }\n"
+          "print(use(1));", "ac$0", true },
+    };
+
+    std::function<bool(Construct *, const char *)> has =
+        [&](Construct *c, const char *name) -> bool {
+        if (!c)
+            return false;
+        if (auto *fd = dynamic_cast<FuncDeclStmt *>(c))
+            if (fd->id && fd->id->get_str() == name)
+                return true;
+        bool found = false;
+        if (auto *b = dynamic_cast<Block *>(c))
+            for (auto &e : b->elems)
+                if (!found)
+                    found = has(e.get(), name);
+        return found;
+    };
+
+    bool ok = true;
+    for (const Case &c : cases) {
+        std::string src(c.src);
+        std::vector<Tok> toks;
+        bool got = false;
+        try {
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            got = has(root.get(), c.inst);
+        } catch (Exception &e) {
+            cout << "  tmpl-live [" << c.what << "]: threw " << e.name
+                 << "\n";
+            ok = false;
+            continue;
+        }
+        if (got != c.want) {
+            cout << "  tmpl-live [" << c.what << "]: instance '" << c.inst
                  << "' " << (got ? "EXISTS" : "is absent") << ", wanted "
                  << (c.want ? "it" : "no instance") << "\n";
             ok = false;
@@ -55595,6 +55685,8 @@ static const std::vector<extra_check> extra_checks =
       invoker_call_tiers },
     { "infer: a template used as a value-ARGUMENT is instantiated "
       "(#116 follow-up)", template_value_arg_instantiation },
+    { "infer: only a live call instantiates a template",
+      template_live_call_instantiation },
     { "resolve: which parameters cannot outlive the call (#93)",
       param_escape_analysis },
     { "opt: every AST transform is behaviour-preserving (layer equivalence)",
