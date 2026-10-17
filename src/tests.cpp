@@ -2037,6 +2037,36 @@ static const std::vector<test> tests =
         { "const K = [5]; var dyn f = append; f(K, 6);" },
         &typeid(CannotChangeConstEx),
     },
+    /* An indirect call with NO argument hands a mutating builtin a null
+     * target: each raises the direct call's arity error at the argument
+     * list (sort/rev_sort/reverse read the null target first - a null
+     * LValue member call, every engine) */
+    {
+        "dyn callee: sort() with no argument is its arity error",
+        { "var dyn so = runtime(sort); so();" },
+        &typeid(InvalidArgumentEx), 32, 1, 33, 1,
+    },
+    {
+        "dyn callee: rev_sort() with no argument is its arity error",
+        { "var dyn so = runtime(rev_sort); so();" },
+        &typeid(InvalidArgumentEx), 36, 1, 37, 1,
+    },
+    {
+        "dyn callee: reverse() with no argument is its arity error",
+        { "func call0(dyn f) { return f(); }",
+          "print(call0(runtime(reverse)));" },
+        &typeid(InvalidArgumentEx), 30, 1, 31, 1,
+    },
+    {
+        "dyn callee: every other mutating builtin with no argument",
+        { "var hits = 0;",
+          "var fs = [runtime(append), runtime(push), runtime(pop),",
+          "          runtime(insert), runtime(erase), runtime(intptr)];",
+          "foreach (var f in fs) {",
+          "    try { f(); } catch (InvalidNumberOfArgsEx) { hits++; }",
+          "}",
+          "assert(hits == 6);" },
+    },
     /* F1 step 2, the EAGER-ARGS language rule: an INDIRECT builtin call
      * evaluates its args before the builtin's own checks - `m(42, se())`
      * with a dyn `m = map` runs se() then throws; the DIRECT call keeps the

@@ -131,6 +131,10 @@ struct Builtin {
      * (builtin_lv_target, eval.h) - a null target was dereferenced (a
      * SEGV on `var dyn s = sort; s([2, 1]);`). For every other lvalue
      * builtin a null target is the "not an lvalue" answer it throws on.
+     * And for EVERY lvalue builtin a null target is also what an indirect
+     * call with NO argument hands over (`s();`): a func_lv checks its
+     * arity before it reads the target (sort/reverse read it first and
+     * crashed - lv_arg0_value, builtins/arr.cpp.h).
      * In the padding after `kind`: Builtin does not grow.
      */
     bool arg0_value_ok = false;
