@@ -6775,7 +6775,11 @@ but the per-element `StructObject` allocation is gone (build overhead
   fields (`struct_field_target` resolves each edge by `struct_def`, the
   root's own name, or a `const_ctx` lookup for an intermediate forward ref). An
   **`opt`** field (e.g. `dyn? next`) breaks the cycle (it can terminate with
-  `none`) and is allowed — the way to write a linked list / tree.
+  `none`) and is allowed — the way to write a linked list / tree. **A non-opt
+  `box<S>` field is an edge to S too** (a box always holds a value): `struct
+  T { box<T> me; }` used to be accepted, and its zero value (`T t;` -
+  `zero_box_init` <-> `build_zero_struct_init`) recursed until the parser's
+  stack overflowed, even in a function never called.
 - **`StructObject`** holds EITHER `bytes` (POD: a `def->size` C-laid-out buffer;
   `pod_get`/`pod_set` load/store a typed scalar or an inline nested struct at a
   field offset) OR `fields` (boxed). A POD field WRITE goes through

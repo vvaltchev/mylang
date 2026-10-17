@@ -16937,6 +16937,28 @@ static const std::vector<test> tests =
     { "box ti: a const parameter's box<P> fields are read-only",
       { "struct P { int x; } func f(const box<P> b) { b.x = 2; }" },
       &typeid(TypeMismatchEx) },
+    /* A non-opt box always holds a value, so a struct with a non-opt
+     * box of itself can never be constructed - refused like a non-opt
+     * struct field of itself (zero-initializing one recursed between
+     * the box's zero and the struct's until the parser's stack blew,
+     * even in a function never called) */
+    { "box err: a non-opt box of its own struct is refused",
+      { "struct T { box<T> me; } T t;" },
+      &typeid(SyntaxErrorEx), 12, 1 },
+    { "box err: a box of its own struct, zeroed in a function never called",
+      { "struct T { int v; box<T> me; }",
+        "func f() { T t; return t.v; }",
+        "print(1);" },
+      &typeid(SyntaxErrorEx), 19, 1 },
+    { "box err: a box closing a cycle through a forward struct field",
+      { "struct A { B b; } struct B { box<A> a; } print(1);" },
+      &typeid(SyntaxErrorEx), 30, 1 },
+    { "box: a box of another struct, an opt box or an array of boxes of "
+      "itself zero-initialize",
+      { "struct P { int x; } struct T { box<P> b; }",
+        "struct U { opt box<U> me; } struct V { int v; array<box<V>> kids; }",
+        "T t; U u; V w;",
+        "assert(t.b.x == 0 && u.me == none && len(w.kids) == 0);" } },
     { "box ti: box() is not a constant",
       { "const K = box(1);" },
       &typeid(ExpressionIsNotConstEx) },

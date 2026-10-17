@@ -2529,9 +2529,11 @@ and so does writing a field of a struct embedded inline (`p.inner.y = v`).
 **Recursive structs must use a nullable field.** A *non-opt* struct field whose
 type contains its own struct (directly, `struct N { N next; }`, or through a
 cycle of non-opt struct fields) is a **compile error** — such a value could
-never be constructed (it would nest forever). Make the back-edge **nullable** so
-it can terminate with `none`: write `dyn? next` (or `opt dyn next`). That is how
-you build a linked list or tree:
+never be constructed (it would nest forever). A non-opt **box** of such a
+struct counts too (`struct N { box<N> me; }`): a box always holds a value.
+Make the back-edge **nullable** so
+it can terminate with `none`: write `dyn? next` (or `opt dyn next`, or
+`opt box<N> me`). That is how you build a linked list or tree:
 
 ```
 struct Node {
