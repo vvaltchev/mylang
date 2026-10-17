@@ -203,6 +203,7 @@ const char *field_kind_str(FieldKind k)
     case FieldKind::f_array:  return "array";
     case FieldKind::f_dict:   return "dict";
     case FieldKind::f_dyn:    return "dyn";
+    case FieldKind::f_box:    return "box";
     case FieldKind::f_struct: return "struct";
     }
     return "?";
@@ -2211,6 +2212,26 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::CheckCallableV:
             row << "check.call   " << RI(in.a(), false)
                 << "  ; throw if not callable";
+            break;
+        case OpCode::LoadBoxV: {
+            /* `*b`: the box's value, checked against the proven box */
+            static const char *const wants[] = {
+                nullptr, "int", "float", "bool", "str" };
+            const int_type w = in.b_lit();
+            row << "load.box     " << D(in.target) << " = *"
+                << RI(in.a(), false);
+            if (w >= 1 && w <= 4)
+                row << "  ; box<" << wants[w] << ">";
+            else if (w == 5 && in.target2 >= 0
+                     && static_cast<size_t>(in.target2)
+                            < chunk.struct_defs.size())
+                row << "  ; box<"
+                    << chunk.struct_defs[in.target2]->name->val << ">";
+            break;
+        }
+        case OpCode::StoreBoxV:
+            row << "store.box    *" << RI(in.a(), false) << " = "
+                << RI(in.b(), false);
             break;
         case OpCode::CheckFuncV:
             row << "check.func   " << RI(in.a(), false)

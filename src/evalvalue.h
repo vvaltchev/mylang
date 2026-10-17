@@ -30,6 +30,7 @@ class EvalContext;
 class FuncObject;
 struct StructTypeDef;   /* a struct type descriptor (structtype.h) */
 class StructObject;     /* a struct instance (structtype.h) */
+class BoxObj;           /* a box of a scalar or a string (structtype.h) */
 enum class ArrHint : unsigned char;   /* defined in syntax.h */
 
 /*
@@ -178,6 +179,7 @@ template <> struct TypeToEnum<intrusive_ptr<ExceptionObject>> { enum { val = Typ
 template <> struct TypeToEnum<intrusive_ptr<DictObject>> { enum { val = Type::t_dict }; };
 template <> struct TypeToEnum<StructTypeDef *> { enum { val = Type::t_structtype }; };
 template <> struct TypeToEnum<intrusive_ptr<StructObject>> { enum { val = Type::t_struct }; };
+template <> struct TypeToEnum<intrusive_ptr<BoxObj>> { enum { val = Type::t_box }; };
 
 /*
  * Binary-operation dispatch with int -> float promotion.
@@ -221,6 +223,7 @@ class EvalValue final {
         FlatVal<intrusive_ptr<ExceptionObject>> ex;
         FlatVal<intrusive_ptr<DictObject>> dict;
         FlatVal<intrusive_ptr<StructObject>> struct_;   /* t_struct */
+        FlatVal<intrusive_ptr<BoxObj>> box;             /* t_box */
 
         ValueU() : ival(0) { }
         ValueU(LValue *val) : lval(val) { }

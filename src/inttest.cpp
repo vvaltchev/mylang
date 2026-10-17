@@ -82,7 +82,7 @@ static long long g_int_live_base[IOK_N] = {};
 static bool g_int_census_marked = false;
 
 static const char *const g_iok_names[IOK_N] = {
-    "str", "arr", "dict", "struct", "func", "exc" };
+    "str", "arr", "dict", "struct", "func", "exc", "box" };
 
 /* runs after main's locals are destroyed (a return from main) and BEFORE
  * any static destructor - registered from main, so it is the LAST handler

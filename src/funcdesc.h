@@ -50,6 +50,7 @@ enum class DeclType : unsigned char {
     none, b, i, f, s, arr, dict,
     strct,   /* a user struct type; the exact type is in `decl_struct` */
     dyn,     /* `dyn` as a type (used inside a TypeAnnot, e.g. `array<dyn>`) */
+    box,     /* `box<T>` (a TypeAnnot; the boxed type in its `elem`) */
 };
 
 /*

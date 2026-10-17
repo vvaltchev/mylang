@@ -23,7 +23,11 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 34;   /* v34: the array
+constexpr unsigned MYV_FORMAT_VERSION = 35;   /* v35: FieldKind
+                                                 f_box, DeclType box and
+                                                 two appended opcodes
+                                                 (LoadBoxV, StoreBoxV);
+                                                 v34: the array
                                                  storage kind objs (the
                                                  flat class storage) and
                                                  ArrHint flat_c;

@@ -1705,6 +1705,28 @@ checked call stages its arguments in memory. The AST inliner keeps such a
 call a call (`Inliner::binds_none`): pasted, nothing would bind it. myv
 **v29** (the op is APPENDED).
 
+**`LoadBoxV dst = *box` and `StoreBoxV *box = value` — boxes (class step
+3, plans/class-and-box.md).** `*b` reads and writes the value a box holds
+through the helpers every engine shares (`box_load_want`, `box_store`,
+eval.h). LoadBoxV's `b` is the box the inferencer proved
+(`DerefExpr::want`: 0 unknown, 1 int, 2 float, 3 bool, 4 str, 5 a struct
+whose `struct_defs` index rides `target2`) and is CHECKED: a box a `dyn`
+laundered into a `box<int>` place raises `'*' expected a box<int>` there,
+so the typed leaf `compile_int_expr` / `compile_float_expr` build on a
+proven `*b` (want 1 / 2) is sound. StoreBoxV checks the box's own
+element kind (an int into a `box<float>` widens) and gives a `box<P>` the
+struct's fields in place. Both carets are the `*b` (the loc table). A
+store `*b = v` evaluates the rvalue FIRST (into a fresh temp when the box
+expression may change the variable it was read from), then the box once;
+its value form re-reads the box (the stored, widened value). `*b OP= v`
+is LoadBoxV + `CompoundV` on the temp (caret: the whole expression) +
+StoreBoxV; `(*b)++` is LoadBoxV + `IncDecCheckedV` on the temp + StoreBoxV
+(a postfix value is a `MoveV` of the old). Use/def: LoadBoxV reads the
+box slot and defines its dst; StoreBoxV reads both and defines nothing -
+the box OBJECT changes, no frame slot does. Not JIT-eligible in step 3
+(interpreted islands; the helper and inline tiers are step 4), not
+bytecode-inlined. myv **v35** (both APPENDED).
+
 **`Chunk::op_locs` — a COMPOUND store's OPERATION caret (RULE 2,
 2026-09-25).** `lv OP= rhs` (and `lv++`) fails in two places, and the
 tree-walker carets them differently: REACHING the element (an OOB index, a

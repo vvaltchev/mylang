@@ -2,8 +2,19 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 34.  This document describes the on-disk image exhaustively:
+Format version 35.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v35: FieldKind (section 13) gains `8 f_box` and DeclType `9 box` - a
+`box<T>` field and parameter (plans/class-and-box.md, step 3) - and two
+opcodes are APPENDED, LoadBoxV and StoreBoxV (`*b` read and written), so a
+v34 binary would meet an opcode it does not know; see the note on version
+10 below.  LoadBoxV's `b` must be an int literal from 0 to 5 (the box the
+compile proved: 0 any, 1 int, 2 float, 3 bool, 4 str, 5 a struct), and for
+5 `target2` must index the chunk's struct_defs, else be -1; its `a` and
+StoreBoxV's `a` and `b` must be slots - the verifier refuses anything
+else.  No value record changes: box() is a run-time builtin, so no
+constant holds a box, and the writer refuses one.)
 
 (v34: an array's storage kind (11.1, section 13) gains `6 objs` - the flat
 CLASS storage, one class reference per element - and ArrHint gains
@@ -1258,10 +1269,11 @@ same is true of OpCode and Op, which appear in every instruction.)
 
     FieldKind (structtype.h)
         0 f_bool  1 f_int  2 f_float  3 f_str  4 f_array  5 f_dict
-        6 f_dyn   7 f_struct
+        6 f_dyn   7 f_struct  8 f_box (v35)
 
     DeclType (funcdesc.h)
         0 none  1 b  2 i  3 f  4 s  5 arr  6 dict  7 strct  8 dyn
+        9 box (v35)
 
     SymKind (funcdesc.h)
         0 unresolved  1 local  2 global  3 capture  4 builtin

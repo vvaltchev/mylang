@@ -24,7 +24,8 @@
 
 /* The static kind of a field, derived from its explicit type annotation. */
 enum class FieldKind : unsigned char {
-    f_bool, f_int, f_float, f_str, f_array, f_dict, f_dyn, f_struct
+    f_bool, f_int, f_float, f_str, f_array, f_dict, f_dyn, f_struct,
+    f_box        /* `box<T> f;` - a reference (its annot gives the T) */
 };
 
 struct StructTypeDef;
@@ -282,7 +283,10 @@ public:
 
     StructTypeDef *def = nullptr;
     bool readonly = false;
-    /* a class instance's identity number (0 for a struct): see
+    /* a `box<P>` (plans/class-and-box.md, step 3): a struct VALUE boxed
+     * into a reference - it behaves as a class instance does (is_ref) */
+    bool boxed = false;
+    /* a reference instance's identity number (0 for a struct value): see
      * g_class_ident. A copy is a NEW instance, so it gets a new one. */
     uint64_t ident = 0;
     /*
@@ -306,11 +310,27 @@ public:
         : RefCounted()
         , def(o.def)
         , readonly(o.readonly)
-        , ident(o.def && o.def->is_class ? class_ident_next() : 0)
+        , boxed(o.boxed)
+        , ident(o.is_ref() ? class_ident_next() : 0)
         , fields(o.fields)
         , bytes(o.bytes)
     { }
     StructObject(StructObject &&) = default;
+    /* A VALUE copy - not boxed, no identity, mutable: what `*b` reads out
+     * of a box<P>, and the struct box() copies in. It consumes no identity
+     * number (a copy-ctor copy of a reference instance would), so how many
+     * such copies an engine makes is unobservable. */
+    struct value_copy_t { };
+    StructObject(const StructObject &o, value_copy_t)
+        : RefCounted()
+        , def(o.def)
+        , fields(o.fields)
+        , bytes(o.bytes)
+    { }
+
+    /* REFERENCE semantics - a class instance or a boxed struct: written in
+     * place by every holder (struct_own), compared and hashed by identity */
+    bool is_ref() const { return boxed || (def && def->is_class); }
 
     bool is_pod() const { return def->is_pod(); }
     bool is_readonly() const { return readonly; }
@@ -380,7 +400,7 @@ public:
 inline bool is_class_instance(const EvalValue &v)
 {
     return v.is<intrusive_ptr<StructObject>>() &&
-           v.get_ref<intrusive_ptr<StructObject>>()->def->is_class;
+           v.get_ref<intrusive_ptr<StructObject>>()->is_ref();
 }
 
 inline bool is_obj_elem(const EvalValue &v)
@@ -388,7 +408,7 @@ inline bool is_obj_elem(const EvalValue &v)
     if (v.is<NoneVal>())
         return true;
     return v.is<intrusive_ptr<StructObject>>() &&
-           v.get_ref<intrusive_ptr<StructObject>>()->def->is_class;
+           v.get_ref<intrusive_ptr<StructObject>>()->is_ref();
 }
 
 inline StructObject *obj_elem_ptr(const EvalValue &v)
@@ -404,6 +424,50 @@ inline EvalValue obj_elem_value(StructObject *p)
         return EvalValue();
     return EvalValue(intrusive_ptr<StructObject>(p));
 }
+
+/*
+ * A box of a scalar or a string - `box<int>`, `box<float>`, `box<bool>`,
+ * `box<str>` (plans/class-and-box.md, step 3): one cell, a reference to
+ * it shared by every copy of the box. `kind` is the element kind it was
+ * made with ('i', 'f', 'b', 's'): a store reached through a `dyn` alias is
+ * checked against it (box_store), so a typed reader never finds a misfit.
+ * Identity, like a class instance's: `==` is the object, `hash` its number.
+ * (A box of a struct is a StructObject with `boxed` set, not one of these.)
+ */
+class BoxObj : public RefCounted {
+
+public:
+
+    ML_POOL_NEW_DELETE_K(IOK_BOX)
+
+    EvalValue v;
+    char kind;
+    bool readonly = false;
+    uint64_t ident;
+
+    BoxObj(EvalValue val, char k)
+        : v(std::move(val)), kind(k), ident(class_ident_next()) { }
+    /* a copy (clone) is a NEW box: a fresh count, a fresh identity */
+    BoxObj(const BoxObj &o)
+        : RefCounted(), v(o.v), kind(o.kind), readonly(o.readonly)
+        , ident(class_ident_next()) { }
+};
+
+/* A box value of either representation: a BoxObj, or a boxed struct */
+inline bool is_box_value(const EvalValue &v)
+{
+    return v.is<intrusive_ptr<BoxObj>>()
+        || (v.is<intrusive_ptr<StructObject>>()
+            && v.get_ref<intrusive_ptr<StructObject>>()->boxed);
+}
+
+/* The BoxObj element kind of a declared box element type ('i', 'f', 'b',
+ * 's'), or 0 for a struct (or no) element (eval.cpp) */
+char box_kind_of(DeclType k);
+/* Does `v` hold a box of the declared `box<T>` (`a`, its kind box; null
+ * for no element type)? A run-time check for a value a `dyn` laundered
+ * (eval.cpp). */
+bool box_fits_annot(const EvalValue &v, const TypeAnnot *a);
 
 /*
  * G3: does this value ALREADY hold exactly the field's declared scalar

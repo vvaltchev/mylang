@@ -828,6 +828,10 @@ void write_value(Writer &w, const EvalValue &v)
             write_value(w, kv.second.get());
         }
     } else if (v.is<intrusive_ptr<StructObject>>()
+               && v.get_ref<intrusive_ptr<StructObject>>()->boxed) {
+        /* box() is a run-time builtin, so no constant holds a box */
+        bad_image("unserializable value (a box)");
+    } else if (v.is<intrusive_ptr<StructObject>>()
                && v.get_ref<intrusive_ptr<StructObject>>()->def->is_class) {
         /* a CLASS instance: its identity is part of its value - written
          * once, then referred to by number (a constant's class instances
@@ -2352,7 +2356,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
         for (uint32_t j = 0; j < nf; j++) {
             FieldDef fd;
             fd.name = r.uid_req("corrupt .myv (field with no name)");
-            fd.kind = r.enumv(FieldKind::f_struct,
+            fd.kind = r.enumv(FieldKind::f_box,                 /* v35 */
                               "corrupt .myv (field kind)");
             fd.struct_ty = r.uidv();
             const uint32_t si = r.idx_opt(n, "corrupt .myv (field struct)");
@@ -2383,9 +2387,9 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             FuncDescriptor::ParamDesc p;
             p.name = r.uid_req("corrupt .myv (parameter with no name)");
             p.opt = r.boolv(); p.cnst = r.boolv(); p.dyn_mod = r.boolv();
-            p.decl_type = r.enumv(DeclType::dyn,
+            p.decl_type = r.enumv(DeclType::box,                /* v35 */
                                   "corrupt .myv (param type)");
-            p.proven_type = r.enumv(DeclType::dyn,   /* C3, v11 */
+            p.proven_type = r.enumv(DeclType::box,   /* C3, v11 */
                                     "corrupt .myv (param type)");
             d.params.push_back(p);
         }

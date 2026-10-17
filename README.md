@@ -45,6 +45,8 @@ as well.
       - [Pure functions](#pure-functions)
       - [Automatic pure promotion](#automatic-pure-promotion)
     * [Structs](#structs)
+    * [Classes](#classes)
+    * [Boxes](#boxes)
     * [Exceptions](#exceptions)
       - [Custom exceptions](#custom-exceptions)
       - [Re-throwing an exception](#re-throwing-an-exception)
@@ -293,7 +295,9 @@ documentation below.
 
 **Comments.** A `#` starts a line comment (to end of line). A `/* ... */` is a
 block comment that **may span multiple lines**. (Both are also recognized by the
-syntax highlighter, across lines.)
+syntax highlighter, across lines.) As in C, a `/` directly followed by `*`
+opens a block comment even where the `*` was meant as the box operator
+(see *Boxes*): write `a / *b`, not `a/*b`.
 
 ### Core concepts
 
@@ -874,8 +878,9 @@ stays redefinable, an assignment to a top-level const or builtin - or to a
 `pure func`'s or a struct's name - is refused when it runs; redefining the
 function or the struct with a new declaration is still allowed.)
 
-**What can appear on the left of `=`.** Exactly four forms denote a location:
-a variable, an id list (`a, b = ...`), an element `a[i]`, and a field `a.f`.
+**What can appear on the left of `=`.** Exactly five forms denote a location:
+a variable, an id list (`a, b = ...`), an element `a[i]`, a field `a.f`, and
+the value a box holds, `*b` (see *Boxes*).
 Anything else — a literal, a call result, an arithmetic/comparison/logical
 expression, a ternary, a **slice** `a[i:j]`, or an **optional member**
 `a?.f` (it is `none` when `a` is `none`) — is a value, not a place, so
@@ -2608,6 +2613,70 @@ A class instance can refer to itself, directly or through others
 refers to is not reclaimed yet - the open design question is recorded in
 `plans/reference-cycles.md`.
 
+### Boxes
+
+A **box** is a reference to one value: `box(v)` makes one, and the prefix
+operator `*` reads and writes the value it holds. Every copy of a box - a
+variable, a parameter, an array element, a field, a capture - is the SAME
+box, so a write through one is seen through all of them:
+
+```C#
+var b = box(5);         # a box<int>
+var c = b;              # the same box
+*c = 7;                 # *b is 7 as well
+*b += 1;  (*b)++;       # 9
+
+func bump(box<int> n) { *n += 1; }
+bump(b);                # *b is 10: the function wrote the caller's box
+
+struct P { int x; int y; }
+var bp = box(P(1, 2));  # a box<P>: the struct, shared
+bp.x = 5;               # fields are read and written directly
+var q = *bp;            # a COPY of the struct, a value
+*bp = P(3, 4);          # the box takes new fields - it stays the same box
+```
+
+- **What `box(v)` makes depends on `v`.** An `int`, a `float`, a `bool` or a
+  `str` gives a `box<int>` ... `box<str>`; a struct value gives a `box<P>`
+  holding a copy of it. A value that is a reference already - an array, a
+  dict, a function, a class instance, a box - is returned **as it is**, so
+  `box(arr) == arr`. A possibly-`none` argument is a compile error (box the
+  value it holds); a `dyn` holding `none` raises `TypeErrorEx`. `box()` is an
+  ordinary run-time builtin - it is never folded, so `const k = box(1)` is a
+  compile error, and a function that calls it is never inferred pure.
+- **`box<T>` is a type** - in a declaration (`box<int> n;`, whose zero value
+  is a fresh `box(0)`), a parameter, a struct field, an array element
+  (`array<box<int>>`). `T` is a `bool`, `int`, `float`, `str` or struct
+  type; `box<array<int>>` is a compile error (an array is a reference
+  already). A `box<int>` is not a `box<float>`, in either direction, and a box
+  is never `none` unless it is `opt` (`opt box<int> b;`, narrowed as usual
+  before `*b`).
+- **`*b` is a value and a location.** `*b` reads the value (a copy, for a
+  `box<P>`); `*b = v`, `*b OP= v`, `(*b)++` and `--*b` write it. A value that
+  does not fit the box is a compile error when its type is known (`*b = "s"`
+  into a `box<int>`), and a `TypeErrorEx` at the `*b` when it is not (a
+  `dyn`); an `int` stored into a `box<float>` becomes a float, and the value
+  of `*b = v` is the stored value. `*` of something that is not a box is a
+  compile error, or a `TypeErrorEx` for a `dyn`; reading a box of another
+  element than its static type says (one a `dyn` passed in) raises at the
+  `*` too, so a typed reader never meets a misfit. `*` is a prefix operator
+  like `-`: `*b++` is `*(b++)`, which `++` on a box refuses - write `(*b)++`.
+- **A box used as its value is a compile error naming the fix**: `b + 1`, or
+  `b` passed for an `int` parameter, says *`'b' is a box: read its value with
+  *b`*.
+- **A `box<P>` behaves as a class instance does** (see *Classes*): its fields
+  are read and written directly (`bp.x += 1`, `bp.inner.y++`,
+  `append(bp.xs, 3)`) in the one shared struct, `==` and `hash()` go by
+  identity, and an `array<box<P>>` holds references (`array_storage` reports
+  `"class"`).
+- **`==` and `hash()` go by identity** for every box, so a box is a dict key by
+  identity, and `box(1) == box(1)` is false. `clone(b)` and `deepclone(b)`
+  make a NEW box holding a copy of the value.
+- A `const` parameter's box is read-only in the function: `*b = v` and
+  `b.x = v` on it are compile errors.
+- `print(b)` shows `box(5)` / `box(P(x: 1, y: 2))`; `kindstr(b)` is `"box"`;
+  `typestr(b)` is `box<int>` / `box<P>`.
+
 ### Custom exceptions
 
 A custom exception is just a **struct** (see *Structs* above): you `throw` a
@@ -3234,6 +3303,12 @@ Check `expr` and throw AssertionFailureEx if it's false.
 
 #### `exit(code)`
 Exit the program with the given numeric code
+
+#### `box(value)`
+A **box**: a reference to `value` that every copy shares, read and written
+with the prefix `*` (see [Boxes](#boxes)). A value that is a reference
+already - an array, a dict, a function, a class instance, a box - is
+returned as it is.
 
 #### `runtime(expr)`
 An *optimization barrier*. Returns the value of its single argument unchanged at

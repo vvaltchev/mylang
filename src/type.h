@@ -41,6 +41,7 @@ public:
         t_ex,
         t_dict,
         t_struct,       /* a struct INSTANCE (intrusive_ptr<StructObject>) */
+        t_box,          /* a box of a scalar / str (intrusive_ptr<BoxObj>) */
 
         /* Number of types */
         t_count,

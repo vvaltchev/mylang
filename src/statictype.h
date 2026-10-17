@@ -45,6 +45,7 @@ enum class StaticTypeKind {
     Func,         /* uses `params`, `param_opt`, `ret` */
     Exception,
     Struct,       /* uses `struct_def` (future; see plans/archived/structs.md) */
+    Box,          /* `box<T>`, a reference to a boxed value: uses `elem` */
     Dyn,          /* explicit dynamic top */
 };
 
@@ -58,7 +59,7 @@ struct StaticType {
     /* Unknown only: union-find link. Non-null => this var is bound to *link. */
     StaticTypeRef link = nullptr;
 
-    StaticTypeRef elem = nullptr;             /* Array */
+    StaticTypeRef elem = nullptr;             /* Array, Box */
     StaticTypeRef key = nullptr;              /* Dict */
     StaticTypeRef val = nullptr;              /* Dict */
     std::vector<StaticTypeRef> params;        /* Func */
@@ -97,6 +98,7 @@ public:
         false);
     StaticTypeRef struct_ty(const void *def, const UniqueId *name, bool opt =
         false);
+    StaticTypeRef box_of(StaticTypeRef elem, bool opt = false);
     StaticTypeRef func_of(std::vector<StaticTypeRef> params,
                    std::vector<bool> param_opt,
                    StaticTypeRef ret,

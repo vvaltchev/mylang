@@ -691,6 +691,29 @@ StructObject &struct_own(LValue *&holder);
  * struct_own updates it. */
 void struct_own_if(LValue *&holder);
 
+/*
+ * BOXES (plans/class-and-box.md, step 3), shared by every engine.
+ * box_make is the box() builtin's work: an int / float / bool / str
+ * becomes a BoxObj, a struct VALUE a boxed copy, and every reference (an
+ * array, a dict, a function, a class instance, a box) is returned as it
+ * is; `none` is a TypeErrorEx. box_load is `*b` - a box's value (a COPY
+ * for a box<P>); box_store is `*b = v`, checked against the box's element
+ * kind (an int into a box<float> widens) and storing a box<P>'s fields in
+ * place, keeping its identity. Both raise a loc-less TypeErrorEx for a
+ * value that is not a box, and box_store a CannotChangeConstEx for a
+ * read-only box. The caller stamps the caret.
+ */
+EvalValue box_make(const EvalValue &v);
+/* the run-time type name of a value: `int`, `array`, ... (types.cpp) */
+std::string runtime_type_name(const EvalValue &v);
+EvalValue box_load(const EvalValue &b);
+/* box_load checking the box against the one the inferencer proved
+ * (DerefExpr::want: 0 any, 1 int, 2 float, 3 bool, 4 str, 5 the struct
+ * `def`): a box of another element is a loc-less TypeErrorEx */
+EvalValue box_load_want(const EvalValue &b, int want,
+                        const StructTypeDef *def);
+void box_store(const EvalValue &b, const EvalValue &v);
+
 /* The base of a store `<e>[k] = v` / the target of a mutating builtin
  * `append(<e>, v)`, evaluated once, for writing: a member step into a
  * struct OWNS it (struct_own); a value is held in `hold`, the caller's,
@@ -762,6 +785,11 @@ bool pod_place_elem(LValue *blv, const EvalValue &key, PodPlace &out);
  * that field becomes the place. */
 bool pod_place_rooted_field(LValue *blv, const UniqueId *memUid,
                             PodPlace &out);
+/* `v` is a REFERENCE instance of a POD struct (a box<P>) read as a VALUE -
+ * an element of a flat reference array, a field: it is still a location,
+ * its bytes the place; CannotChangeConstEx when it is read-only. False for
+ * anything else. */
+bool pod_place_ref(const EvalValue &v, PodPlace &out);
 /* Step into the place's inline POD struct member; false, the place
  * unchanged, when the member is not one. */
 bool pod_place_step(PodPlace &p, const UniqueId *memUid);

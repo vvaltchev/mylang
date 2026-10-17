@@ -776,6 +776,8 @@ private:
             auto *me = static_cast<MemberExpr *>(c);
             if (block_subscript_bases)
                 block(me->what.get());
+        } else if (ctag(c) == ConstructType::deref) {
+            block(static_cast<DerefExpr *>(c)->elem.get());
         } else if (ctag(c) == ConstructType::foreach_stmt) {
             auto *fe = static_cast<ForeachStmt *>(c);
             if (fe->ids)
@@ -2767,6 +2769,16 @@ private:
         if (!cur || !id)
             return;
 
+        /* a compiler-made reference to a builtin (Identifier::builtin_only):
+         * the builtin table's slot, whatever a scope declares - in the REPL
+         * too, whose map would otherwise find a program's own name */
+        if (id->builtin_only) {
+            const int bi = builtin_slot_index(id->uid);
+            if (bi >= 0)
+                id->sym = ResolvedSym{ SymKind::builtin, bi };
+            return;
+        }
+
         if (cur->slottable) {
             for (auto s = cur->scopes.rbegin(); s != cur->scopes.rend(); ++s) {
                 for (const auto &d : s->decls) {
@@ -2977,6 +2989,10 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
         fn(static_cast<IncDecExpr *>(c)->lvalue.get());
         break;
     }
+    case ConstructType::deref: {
+        fn(static_cast<DerefExpr *>(c)->elem.get());
+        break;
+    }
     case ConstructType::ternary: {
         auto *n = static_cast<TernaryExpr *>(c);
         fn(n->condExpr.get());
@@ -3120,6 +3136,9 @@ static const UniqueId *fmi_base_id(const Construct *lv)
             auto *m = static_cast<const MemberExpr *>(lv);
             lv = m->what.get(); continue;
         }
+        if (ctag(lv) == ConstructType::deref) {
+            lv = static_cast<const DerefExpr *>(lv)->elem.get(); continue;
+        }
         return nullptr;
     }
     return nullptr;
@@ -3168,8 +3187,8 @@ static void fmi_children(Construct *c,
     }
 }
 
-/* The identifier at the ROOT of an lvalue chain (`p`, `p[i]`, `p.f[j]`),
- * or null when the chain is rooted at anything else. */
+/* The identifier at the ROOT of an lvalue chain (`p`, `p[i]`, `p.f[j]`,
+ * `*p`), or null when the chain is rooted at anything else. */
 static const Identifier *lvalue_chain_root(const Construct *c)
 {
     for (;;) {
@@ -3181,6 +3200,9 @@ static const Identifier *lvalue_chain_root(const Construct *c)
             break;
         case ConstructType::member:
             c = static_cast<const MemberExpr *>(c)->what.get();
+            break;
+        case ConstructType::deref:
+            c = static_cast<const DerefExpr *>(c)->elem.get();
             break;
         default:
             return nullptr;
@@ -3316,10 +3338,13 @@ static const Construct *store_root_call(const Construct *c)
         return nullptr;
     }
     while (target && (ctag(target) == ConstructType::subscript
-                      || ctag(target) == ConstructType::member))
+                      || ctag(target) == ConstructType::member
+                      || ctag(target) == ConstructType::deref))
         target = ctag(target) == ConstructType::subscript
                      ? static_cast<const Subscript *>(target)->what.get()
-                     : static_cast<const MemberExpr *>(target)->what.get();
+                 : ctag(target) == ConstructType::member
+                     ? static_cast<const MemberExpr *>(target)->what.get()
+                     : static_cast<const DerefExpr *>(target)->elem.get();
     return ctag(target) == ConstructType::call ? target : nullptr;
 }
 
@@ -3387,7 +3412,8 @@ static bool fmi_has_tainted_write(
     else if (auto *idc = dynamic_cast<const IncDecExpr *>(c))
         lv = idc->lvalue.get();
     if (lv && (dynamic_cast<const Subscript *>(lv) ||
-               dynamic_cast<const MemberExpr *>(lv))) {
+               dynamic_cast<const MemberExpr *>(lv) ||
+               ctag(lv) == ConstructType::deref)) {
         const UniqueId *b = fmi_base_id(lv);
         if (b && t.count(b))
             return true;
@@ -4612,6 +4638,10 @@ for_each_child_slot(Construct *c,
     }
     case ConstructType::incdec: {
         fn(static_cast<IncDecExpr *>(c)->lvalue);
+        break;
+    }
+    case ConstructType::deref: {
+        fn(static_cast<DerefExpr *>(c)->elem);
         break;
     }
     case ConstructType::call: {

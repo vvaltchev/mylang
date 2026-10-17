@@ -1132,6 +1132,34 @@ static bool is_lvalue_rooted(const Construct *c);
  * the arguments against the field types (for a statically-known callee), so
  * this is the construction, not the validation.
  */
+/* The BoxObj element kind of a declared box element type ('i', 'f', 'b',
+ * 's'), or 0 for a struct (or no) element */
+char box_kind_of(DeclType k)
+{
+    switch (k) {
+    case DeclType::i: return 'i';
+    case DeclType::f: return 'f';
+    case DeclType::b: return 'b';
+    case DeclType::s: return 's';
+    default:          return 0;
+    }
+}
+
+/* Does `v` hold a box of the declared `box<T>` (`a`, its kind box; null
+ * for no element type)? A run-time check for a value a `dyn` laundered. */
+bool box_fits_annot(const EvalValue &v, const TypeAnnot *a)
+{
+    const TypeAnnot *e = a ? a->elem.get() : nullptr;
+    if (v.is<intrusive_ptr<BoxObj>>())
+        return !e || box_kind_of(e->kind) ==
+                     v.get_ref<intrusive_ptr<BoxObj>>()->kind;
+    if (!v.is<intrusive_ptr<StructObject>>())
+        return false;
+    const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+    return o.boxed && (!e || (e->kind == DeclType::strct
+                              && (!e->strct || e->strct == o.def)));
+}
+
 /* Coerce + runtime-validate one field value. The inferencer already checks a
  * statically-known construction, but this guards a `dyn`-laundered value and
  * makes a parse-time (const) construction type-safe (so it can fold).
@@ -1176,6 +1204,10 @@ coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e)
         case FieldKind::f_struct:
             if (v.is<intrusive_ptr<StructObject>>() &&
                 v.get<intrusive_ptr<StructObject>>()->def->name == fd.struct_ty)
+                return v;
+            break;
+        case FieldKind::f_box:
+            if (box_fits_annot(v, fd.annot.get()))
                 return v;
             break;
     }
@@ -1514,13 +1546,13 @@ static EvalValue pod_load_field(const FieldDef &f, const char *base)
 StructObject &struct_own(LValue *&holder)
 {
     {
-        /* a CLASS instance is a reference: every holder writes the one
-         * object, whoever else holds it - and a constant's is read-only
-         * through every alias, so the write is refused, as a mutating
-         * builtin on a constant array is */
+        /* a CLASS instance (or a boxed struct) is a reference: every
+         * holder writes the one object, whoever else holds it - and a
+         * constant's is read-only through every alias, so the write is
+         * refused, as a mutating builtin on a constant array is */
         StructObject &o =
             *holder->get().get_ref<intrusive_ptr<StructObject>>();
-        if (o.def->is_class) {
+        if (o.is_ref()) {
             if (o.is_readonly())
                 throw CannotChangeConstEx();
             return o;
@@ -1555,6 +1587,176 @@ void struct_own_if(LValue *&holder)
 {
     if (holder->is<intrusive_ptr<StructObject>>())
         struct_own(holder);
+}
+
+/* BOXES (eval.h) */
+
+static const char *box_kind_name(char k)
+{
+    switch (k) {
+    case 'i': return "int";
+    case 'f': return "float";
+    case 'b': return "bool";
+    default:  return "str";
+    }
+}
+
+/* the name a run-time value gives an error message about a box */
+static std::string box_value_name(const EvalValue &v)
+{
+    if (v.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+        if (o.boxed)
+            return std::string("box<") + o.def->name->val + ">";
+        return o.def->name->val;
+    }
+    if (v.is<intrusive_ptr<BoxObj>>())
+        return std::string("box<") +
+               box_kind_name(v.get_ref<intrusive_ptr<BoxObj>>()->kind) + ">";
+    return runtime_type_name(v);
+}
+
+/* "a str", "an int", "none" - a value named in a box error message */
+static std::string box_value_phrase(const EvalValue &v)
+{
+    if (v.is<NoneVal>())
+        return "none";
+    const std::string n = box_value_name(v);
+    const bool vowel = !n.empty()
+        && std::string("aeiouAEIOU").find(n[0]) != std::string::npos;
+    return (vowel ? "an " : "a ") + n;
+}
+
+[[noreturn]] static void box_not_a_box(const EvalValue &v)
+{
+    throw TypeErrorEx(intern_msg("'*' needs a box, not " +
+                                 box_value_phrase(v)));
+}
+
+EvalValue box_make(const EvalValue &v)
+{
+    switch (v.get_type()->t) {
+    case Type::t_int:
+        return EvalValue(make_intrusive<BoxObj>(v, 'i'));
+    case Type::t_float:
+        return EvalValue(make_intrusive<BoxObj>(v, 'f'));
+    case Type::t_bool:
+        return EvalValue(make_intrusive<BoxObj>(v, 'b'));
+    case Type::t_str:
+        return EvalValue(make_intrusive<BoxObj>(v, 's'));
+    case Type::t_none:
+        throw TypeErrorEx("box() of none: box the value it holds");
+    case Type::t_struct: {
+        const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+        if (o.is_ref())
+            return v;                   /* a class instance or a box */
+        auto b = make_intrusive<StructObject>(o,
+                                              StructObject::value_copy_t());
+        b->boxed = true;
+        b->ident = class_ident_next();
+        return EvalValue(std::move(b));
+    }
+    default:
+        return v;                       /* a reference passes through */
+    }
+}
+
+EvalValue box_load(const EvalValue &b)
+{
+    if (b.is<intrusive_ptr<BoxObj>>())
+        return b.get_ref<intrusive_ptr<BoxObj>>()->v;
+    if (b.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &o = *b.get_ref<intrusive_ptr<StructObject>>();
+        if (o.boxed)
+            return EvalValue(make_intrusive<StructObject>(
+                o, StructObject::value_copy_t()));
+    }
+    box_not_a_box(b);
+}
+
+EvalValue box_load_want(const EvalValue &b, int want,
+                        const StructTypeDef *def)
+{
+    if (want == 0)
+        return box_load(b);
+    static const char kinds[] = { 0, 'i', 'f', 'b', 's' };
+    bool ok;
+    if (b.is<intrusive_ptr<BoxObj>>())
+        ok = want < 5 && b.get_ref<intrusive_ptr<BoxObj>>()->kind
+                         == kinds[want];
+    else if (b.is<intrusive_ptr<StructObject>>()) {
+        const StructObject &o = *b.get_ref<intrusive_ptr<StructObject>>();
+        ok = want == 5 && o.boxed && o.def == def;
+    } else {
+        box_not_a_box(b);
+    }
+    if (!ok) {
+        const std::string expect = want == 5
+            ? std::string(def->name->val) : box_kind_name(kinds[want]);
+        throw TypeErrorEx(intern_msg("'*' expected a box<" + expect +
+                                     ">, got " + box_value_phrase(b)));
+    }
+    return box_load(b);
+}
+
+void box_store(const EvalValue &b, const EvalValue &v)
+{
+    if (b.is<intrusive_ptr<BoxObj>>()) {
+        BoxObj &o = *b.get_ref<intrusive_ptr<BoxObj>>();
+        if (o.readonly)
+            throw CannotChangeConstEx();
+        switch (o.kind) {
+        case 'i':
+            if (v.is<int_type>() || v.is<bool>()) {
+                o.v = coerce_to_decl_type(v, DeclType::i);
+                return;
+            }
+            break;
+        case 'f':
+            if (v.is<float_type>() || v.is<int_type>() || v.is<bool>()) {
+                o.v = coerce_to_decl_type(v, DeclType::f);
+                return;
+            }
+            break;
+        case 'b':
+            if (v.is<bool>()) {
+                o.v = v;
+                return;
+            }
+            break;
+        default:
+            if (v.is<SharedStr>()) {
+                o.v = v;
+                return;
+            }
+            break;
+        }
+        throw TypeErrorEx(intern_msg(std::string("a box<") +
+            box_kind_name(o.kind) + "> cannot hold " +
+            box_value_phrase(v)));
+    }
+    if (b.is<intrusive_ptr<StructObject>>()) {
+        StructObject &o = *b.get_ref<intrusive_ptr<StructObject>>();
+        if (o.boxed) {
+            if (o.readonly)
+                throw CannotChangeConstEx();
+            if (v.is<intrusive_ptr<StructObject>>()) {
+                const StructObject &src =
+                    *v.get_ref<intrusive_ptr<StructObject>>();
+                if (src.def == o.def && !src.is_ref()) {
+                    if (&src != &o) {
+                        o.fields = src.fields;
+                        o.bytes = src.bytes;
+                    }
+                    return;
+                }
+            }
+            throw TypeErrorEx(intern_msg(std::string("a box<") +
+                o.def->name->val + "> cannot hold " +
+                box_value_phrase(v)));
+        }
+    }
+    box_not_a_box(b);
 }
 
 /*
@@ -1624,6 +1826,21 @@ bool pod_place_rooted_field(LValue *blv, const UniqueId *memUid,
     if (!pod_place_step(p, memUid))
         return false;
     out = p;
+    return true;
+}
+
+bool pod_place_ref(const EvalValue &v, PodPlace &out)
+{
+    if (!v.is<intrusive_ptr<StructObject>>())
+        return false;
+    StructObject &o =
+        const_cast<StructObject &>(*v.get_ref<intrusive_ptr<StructObject>>());
+    if (!o.is_ref() || !o.is_pod())
+        return false;
+    if (o.is_readonly())
+        throw CannotChangeConstEx();
+    out.bytes = o.bytes.data();
+    out.def = o.def;
     return true;
 }
 
@@ -2661,6 +2878,17 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st,
         return res;
     }
 
+    if (v.is<intrusive_ptr<BoxObj>>()) {
+        /* a box of a scalar / str: a NEW box (a new identity) holding the
+         * same value - which needs no copy of its own */
+        const BoxObj &b = *v.get_ref<intrusive_ptr<BoxObj>>();
+        if (b.readonly && !through_readonly)
+            return v;
+        auto out = make_intrusive<BoxObj>(b);
+        out->readonly = false;
+        return EvalValue(std::move(out));
+    }
+
     if (v.is<intrusive_ptr<StructObject>>()) {
 
         const auto &obj = v.get_ref<intrusive_ptr<StructObject>>();
@@ -2680,6 +2908,10 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st,
             return *c;
 
         auto out = make_intrusive<StructObject>(obj->def);
+        if (obj->boxed) {               /* a box<P>: a new box */
+            out->boxed = true;
+            out->ident = class_ident_next();
+        }
         EvalValue res = intrusive_ptr<StructObject>(out);
         CycCopyGuard g(st, k, res);
 
@@ -2886,7 +3118,7 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
          * folded anywhere else), so nothing else holds them yet - and
          * freezing in place keeps two references to one of them one object.
          */
-        if (src.def->is_class) {
+        if (src.is_ref()) {
             if (key || src.is_readonly())
                 return v;
             StructObject &o = const_cast<StructObject &>(src);
@@ -4568,7 +4800,7 @@ static bool store_rooted(const EvalValue &base)
     if (!base.is<intrusive_ptr<StructObject>>())
         return false;
     const StructObject &o = *base.get_ref<intrusive_ptr<StructObject>>();
-    if (!o.def->is_class)
+    if (!o.is_ref())
         return false;
     if (o.is_readonly())
         throw CannotChangeConstEx();
@@ -4591,6 +4823,14 @@ static void member_store_step(MemberTarget &t, const MemberExpr *s)
         t.base = EvalValue(h);
         if (pod_place_rooted_field(h, s->memUid, t.place))
             return;
+    } else {
+        /* a box<P> of a POD struct read as a value: its inline POD field
+         * is a place in the shared object's bytes (t.base keeps it alive) */
+        PodPlace rp;
+        if (pod_place_ref(t.base, rp) && pod_place_step(rp, s->memUid)) {
+            t.place = rp;
+            return;
+        }
     }
     const bool rooted = store_rooted(t.base);
     t.base = s->access(RValue(t.base), /*for_write=*/false, rooted);
@@ -4707,6 +4947,15 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
         t.base = pod_place_value(t.place);
     }
     EvalValue base = t.base;
+    /* A REFERENCE instance read as a value (an element of a flat reference
+     * array, a field) is still the one shared object: held here, it takes
+     * the slot path below - struct_own hands back the object itself, and a
+     * box<P> of a POD struct is stored into its bytes */
+    LValue ref_hold;
+    if (!base.is<LValue *>() && is_class_instance(base)) {
+        ref_hold = LValue(base, false);
+        base = EvalValue(&ref_hold);
+    }
 
     /* A struct in a slot: OWNED first (struct_own - its other holders must
      * not see the write), then a POD field is stored into its bytes. (A
@@ -5011,6 +5260,13 @@ dyn_incdec_member(const EvalValue &base, const EvalValue &memId,
                   Loc id_start, Loc id_end)
 {
     EvalValue cur = base;
+    /* a reference instance read as a value: held, it is rooted
+     * (member_store) */
+    LValue ref_hold;
+    if (!cur.is<LValue *>() && is_class_instance(cur)) {
+        ref_hold = LValue(cur, false);
+        cur = EvalValue(&ref_hold);
+    }
     const bool rooted = cur.is<LValue *>();
     const EvalValue &cval = rooted ? cur.get<LValue *>()->get() : cur;
 
@@ -5094,12 +5350,14 @@ LValue *vm_member_lvalue_ref(EvalValue &cur, const EvalValue &memId,
         if (!cur.is<LValue *>()) {
             const StructObject &o =
                 *dval.get_ref<intrusive_ptr<StructObject>>().get();
-            if (!o.def->is_class)
+            if (!o.is_ref())
                 return nullptr;
             if (o.is_readonly())
                 throw CannotChangeConstEx(mstart, mend);
             const int slot = o.def->slot_of(memUid);
-            if (slot < 0)
+            /* a POD box's field is in its bytes: no LValue (the callers
+             * hold a reference first, or enter it as a place) */
+            if (slot < 0 || o.is_pod())
                 return nullptr;
             return &const_cast<StructObject &>(o).fields[slot];
         }
@@ -5181,6 +5439,12 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
 {
     const Op cop = is_inc ? Op::addeq : Op::subeq;
     const EvalValue one{static_cast<int_type>(1)};
+    /* a reference instance read as a value: held, it is rooted */
+    LValue ref_hold;
+    if (is_member && !cur.is<LValue *>() && is_class_instance(cur)) {
+        ref_hold = LValue(cur, false);
+        cur = EvalValue(&ref_hold);
+    }
 
     if (tier2) {
 
@@ -5755,6 +6019,57 @@ void vm_struct_elem_into(LValue &dst, const EvalValue &arrv, int_type idx)
 }
 
 /*
+ * `*b`: the value the box holds (box_load). A box<P> reads a COPY of its
+ * struct, a value. The caret of a misuse (not a box, none) is the `*b`.
+ */
+EvalValue DerefExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    const EvalValue b = RValue(elem->eval(ctx));
+    return box_load_want(b, want, want_def);
+}
+
+/*
+ * `*b = v` / `*b OP= v` (and `++` / `--` through IncDecExpr's typed path):
+ * the rvalue was evaluated first (Expr14::do_eval), then the box once; a
+ * compound reads the box, applies the operator - its error carets the
+ * whole expression, as every compound store's does - and stores back. The
+ * value is the box's value after the store (widened to its element kind).
+ */
+static EvalValue
+deref_store(EvalContext *ctx, const DerefExpr *d, Op op,
+            const EvalValue &rval, EvalValue *old_out = nullptr)
+{
+    EvalValue box;
+    try {
+        box = RValue(d->elem->eval(ctx));
+    } catch (Exception &e) {
+        stamp_like_eval(d, e);
+        throw;
+    }
+    EvalValue v;
+    if (op == Op::assign) {
+        v = RValue(rval);
+    } else {
+        try {
+            v = box_load_want(box, d->want, d->want_def);
+        } catch (Exception &e) {
+            stamp_like_eval(d, e);
+            throw;
+        }
+        if (old_out)
+            *old_out = v;
+        apply_compound_op(v, RValue(rval), op);
+    }
+    try {
+        box_store(box, v);
+        return box_load(box);
+    } catch (Exception &e) {
+        stamp_like_eval(d, e);
+        throw;
+    }
+}
+
+/*
  * One assignment to `lvalue`. `old_out`, when given (a compound store only:
  * IncDecExpr's typed `±= 1`), receives the value the store replaced - read
  * at the store itself, so postfix `++` / `--` yields it exactly (deriving it
@@ -5892,6 +6207,9 @@ handle_single_expr14(EvalContext *ctx,
     /* A store through an access chain: its base and key once, then the
      * flat / POD / general store (subscript_store, member_store). */
     if (!inDecl) {
+        if (ctag(lvalue) == ConstructType::deref)
+            return deref_store(ctx, static_cast<DerefExpr *>(lvalue), op,
+                               rval, old_out);
         if (lvalue->is_subscript())
             return subscript_store(ctx, static_cast<Subscript *>(lvalue),
                                    op, rval, old_out);
@@ -6243,6 +6561,31 @@ EvalValue IncDecExpr::do_eval(EvalContext *ctx, bool rec) const
         const EvalValue nv = dyn_incdec_elem(cur, key, is_inc, old,
                                              sub->start, sub->end,
                                              start, end);
+        return is_prefix ? nv : old;
+    }
+
+    if (ctag(lvalue.get()) == ConstructType::deref) {
+        /* `(*b)++` on a dyn box: the box once, its value checked */
+        const DerefExpr *d = static_cast<const DerefExpr *>(lvalue.get());
+        EvalValue box, old;
+        try {
+            box = RValue(d->elem->eval(ctx));
+            old = box_load_want(box, d->want, d->want_def);
+        } catch (Exception &e) {
+            stamp_like_eval(d, e);
+            throw;
+        }
+        if (!old.is<int_type>() && !old.is<float_type>())
+            throw TypeErrorEx("'++'/'--' requires an int or float",
+                              start, end);
+        EvalValue nv = old;
+        apply_compound_op(nv, one, cop);
+        try {
+            box_store(box, nv);
+        } catch (Exception &e) {
+            stamp_like_eval(d, e);
+            throw;
+        }
         return is_prefix ? nv : old;
     }
 

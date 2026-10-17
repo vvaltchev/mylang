@@ -48,6 +48,7 @@ static const char *reflect_decl_type_kw(DeclType d)
         case DeclType::s:    return "str";
         case DeclType::arr:  return "array";
         case DeclType::dict: return "dict";
+        case DeclType::box:  return "box";
         default:             return nullptr;
     }
 }
@@ -76,6 +77,9 @@ static std::string reflect_annot_str(const TypeAnnot *ta)
             s = "dict<" + reflect_annot_str(ta->key.get()) + "," +
                 reflect_annot_str(ta->val.get()) + ">";
             break;
+        case DeclType::box:
+            s = "box<" + reflect_annot_str(ta->elem.get()) + ">";
+            break;
         default: s = "dyn";
     }
     if (ta->opt)
@@ -88,7 +92,8 @@ static std::string reflect_field_type(const FieldDef &f)
     /* a parameterized container (`array<int>`, `dict<str,P>`): the annot
      * carries the full element type (with its own `?` for nullability). */
     if (f.annot && (f.kind == FieldKind::f_array ||
-                    f.kind == FieldKind::f_dict)) {
+                    f.kind == FieldKind::f_dict ||
+                    f.kind == FieldKind::f_box)) {
         std::string t = reflect_annot_str(f.annot.get());
         if (f.is_opt && (t.empty() || t.back() != '?'))
             t += "?";
@@ -106,6 +111,7 @@ static std::string reflect_field_type(const FieldDef &f)
         case FieldKind::f_array:  s += "array"; break;
         case FieldKind::f_dict:   s += "dict";  break;
         case FieldKind::f_dyn:    s += "dyn";   break;
+        case FieldKind::f_box:    s += "box";   break;
         case FieldKind::f_struct:
             s += f.struct_ty ? std::string(f.struct_ty->val)
                              : std::string("struct");

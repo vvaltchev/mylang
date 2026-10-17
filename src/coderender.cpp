@@ -160,6 +160,8 @@ struct Renderer {
             return PREC_POSTFIX;
         if (auto *e = dynamic_cast<const IncDecExpr *>(c))
             return e->is_prefix ? 8 : PREC_POSTFIX;
+        if (ctag(c) == ConstructType::deref)
+            return 8;                       /* a prefix operator */
         /* ternary / ?? are the loosest expressions (just above assignment) */
         if (dynamic_cast<const TernaryExpr *>(c) ||
             dynamic_cast<const CoalesceExpr *>(c))
@@ -261,6 +263,11 @@ struct Renderer {
             const char *op = e->is_inc ? "++" : "--";
             if (e->is_prefix) { o << op; expr(e->lvalue.get(), 8); }
             else { expr(e->lvalue.get(), PREC_POSTFIX); o << op; }
+            return;
+        }
+        if (ctag(c) == ConstructType::deref) {
+            o << "*";
+            expr(static_cast<const DerefExpr *>(c)->elem.get(), 8);
             return;
         }
         if (auto *e = dynamic_cast<const TernaryExpr *>(c)) {

@@ -58,6 +58,7 @@ enum class ConstructType {
     typed_scalar, expr14, if_stmt, ret, while_stmt, func_decl,
     struct_decl, subscript, slice, try_catch, foreach_stmt, member,
     incdec, ternary, coalesce, for_stmt, for_range,
+    deref,      /* `*b`: the value a box holds (DerefExpr) */
 };
 
 /* Null-safe tag read: null -> `other`, which no real node carries
@@ -743,6 +744,12 @@ public:
      * other position. */
     bool is_underscore() const { return uid->val == "_"; }
 
+    /* A compiler-made reference to the BUILTIN of this name, which no user
+     * name shadows: the `box(...)` a `box<T> n;` declaration's zero value
+     * calls (a program may well have its own `box`). The inferencer and the
+     * resolver bind it to the builtin table only. */
+    bool builtin_only = false;
+
     /*
      * Only meaningful when this Identifier is a function parameter (an element
      * of FuncDeclStmt::params). `const_param` is set by the parser for a param
@@ -822,6 +829,7 @@ public:
         c->decl_struct = decl_struct;
         c->decl_annot = decl_annot;   /* shared: TypeAnnot is immutable */
         c->names_class = names_class;
+        c->builtin_only = builtin_only;
         return c;
     }
 };
@@ -2232,6 +2240,38 @@ public:
         c->lvalue = clone_as(lvalue);
         c->is_prefix = is_prefix;
         c->is_inc = is_inc;
+        return c;
+    }
+};
+
+/*
+ * `*b` - the value the box `b` holds (plans/class-and-box.md, step 3): an
+ * rvalue that reads it, and a LOCATION - `*b = v`, `*b += v`, `(*b)++`
+ * write the box, never the variable `b`. For a `box<P>` the read is a copy
+ * (P is a value); a store overwrites the box's fields in place.
+ */
+class DerefExpr final: public Construct {
+
+public:
+
+    unique_ptr<Construct> elem;     /* the box expression */
+    /* The box the inferencer proved `elem` holds (box_load_want's code):
+     * 0 = unknown (a dyn), 1 int, 2 float, 3 bool, 4 str, 5 the struct
+     * `want_def`. A read checks it, so a typed consumer never finds a
+     * misfit a `dyn` laundered into a box<T> place. */
+    int want = 0;
+    const StructTypeDef *want_def = nullptr;
+
+    DerefExpr() : Construct("DerefExpr", false, ConstructType::deref) { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<DerefExpr>();
+        copy_base_fields(*c);
+        c->elem = clone_as(elem);
+        c->want = want;
+        c->want_def = want_def;
         return c;
     }
 };
