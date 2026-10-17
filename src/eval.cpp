@@ -3191,6 +3191,77 @@ void cyc_keep_until_exit(const EvalValue &v)
     kept.push_back(v);
 }
 
+/*
+ * The walk of cyc_release_kept, which runs AFTER main returns - when a
+ * VmProgram or an AST has already freed the struct defs its values point
+ * to. So it reads no def (cyc_key and cyc_any_child do, through
+ * is_pod/is_ref: a heap-use-after-free at exit for any frozen cycle that
+ * reached a struct): a struct object is visited by its address and its
+ * children are its `fields` (a POD struct's are empty), an array by its
+ * storage (general or flat class), a dict by its object.
+ */
+static bool exit_key(const EvalValue &v, CycKey &k)
+{
+    switch (v.get_type()->t) {
+    case Type::t_arr: {
+        const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+        if (a.skind() != SharedArrayObj::Storage::general
+                && a.skind() != SharedArrayObj::Storage::objs)
+            return false;
+        k.obj = a.storage_id();
+        k.off = a.offset();
+        k.len = a.size();
+        return true;
+    }
+    case Type::t_dict:
+        k = cyc_key_obj(v.get_ref<intrusive_ptr<DictObject>>().get());
+        return true;
+    case Type::t_struct:
+        k = cyc_key_obj(v.get_ref<intrusive_ptr<StructObject>>().get());
+        return true;
+    default:
+        return false;
+    }
+}
+
+template <class F>
+static void exit_children(const EvalValue &v, F f)
+{
+    switch (v.get_type()->t) {
+    case Type::t_arr: {
+        const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+        if (a.skind() == SharedArrayObj::Storage::objs) {
+            const auto &ov = a.flat_objs();
+            for (size_type i = 0; i < a.size(); i++)
+                if (StructObject *p = ov[a.offset() + i])
+                    f(obj_elem_value(p));
+        } else if (a.skind() == SharedArrayObj::Storage::general) {
+            const ArrayConstView view = a.get_view();
+            for (size_type i = 0; i < view.size(); i++)
+                f(view[i].get());
+        }
+        return;
+    }
+    case Type::t_dict: {
+        const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        for (const auto &kv : d.get_ref()) {
+            f(kv.first);
+            f(kv.second.get());
+        }
+        if (d.get_has_default())
+            f(d.get_default());
+        return;
+    }
+    case Type::t_struct:
+        for (const LValue &fl :
+                 v.get_ref<intrusive_ptr<StructObject>>()->fields)
+            f(fl.get());
+        return;
+    default:
+        return;
+    }
+}
+
 void cyc_release_kept()
 {
     std::vector<EvalValue> work;
@@ -3206,19 +3277,24 @@ void cyc_release_kept()
         EvalValue v = std::move(work.back());
         work.pop_back();
         CycKey k;
-        if (!cyc_key(v, k) || !seen.insert(k).second)
+        if (!exit_key(v, k) || !seen.insert(k).second)
             continue;
-        cyc_any_child(v, [&](const EvalValue &c) {
-            work.push_back(c);
-            return false;
-        });
+        exit_children(v, [&](const EvalValue &c) { work.push_back(c); });
         all.push_back(std::move(v));
     }
 
     for (EvalValue &v : all) {
-        if (v.is<SharedArrayObj>())
-            v.get<SharedArrayObj>().get_vec().clear();
-        else if (v.is<intrusive_ptr<DictObject>>())
+        if (v.is<SharedArrayObj>()) {
+            SharedArrayObj &a = v.get<SharedArrayObj>();
+            if (a.skind() == SharedArrayObj::Storage::objs) {
+                /* in place: get_vec() would detach a slice's window */
+                auto &ov = a.flat_objs();
+                for (size_t i = 0; i < ov.size(); i++)
+                    ov.set(i, nullptr);
+            } else {
+                a.get_vec().clear();
+            }
+        } else if (v.is<intrusive_ptr<DictObject>>())
             v.get<intrusive_ptr<DictObject>>()->release_at_exit();
         else
             v.get<intrusive_ptr<StructObject>>()->fields.clear();

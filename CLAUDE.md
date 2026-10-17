@@ -6666,22 +6666,29 @@ are unchanged.
   release build). **A NEW walk over an `EvalValue`'s children uses the same
   machinery, or it is that crash again.** What it gives you:
   - `cyc_key(v, k)` names a container that CAN hold a reference (a
-    general-storage array by its storage and window, a dict, a boxed struct
-    object) and answers false for everything else - a flat array, a POD
-    struct, a string, a scalar, and a FUNCTION, which no walk enters (it
-    prints `<function>`, compares by identity, is shared by every copy).
-    Push only what it keys; a missed container is the crash, a keyed flat
-    array is wasted work.
+    general-storage array by its storage and window, a dict, a class
+    instance or box<P> with reference fields) and answers false for
+    everything else - a flat array, a POD struct, a string, a scalar, a
+    FUNCTION, which no walk enters (it prints `<function>`, compares by
+    identity, is shared by every copy), and a struct VALUE. A value is
+    walked THROUGH, never pushed: copy-on-write may share one object
+    between two independent copies, so keyed by its address two equal
+    copies printed, compared and hashed differently until a write split
+    them (2026-10-09), and no cycle passes through a value alone. A walk
+    that treats "not keyed" as "a leaf" must still descend into a struct
+    value (`cyc_reaches_cycle` does). Push only what it keys; a missed
+    container is the crash, a keyed flat array is wasted work.
   - `CycStack` + the RAII `CycGuard` (exception-safe: a throw mid-walk
     still pops) for a one-value walk; a container met while on the stack is
     a BACK EDGE, answered without entering it. A STACK, not a memo: a
     container shared at two places but not on the path is walked at each,
     as before (so a DAG is still copied twice).
   - the answers, one per walk kind: rendering writes `[...]` / `{...}` /
-    `Name(...)` (`cyc_render()`); `hash` hashes a back edge as its DEPTH,
-    `cyc_backedge_hash` (`cyc_hash()`) - a CLASS instance hashes and
-    compares by identity before any guard, entering no field, so no
-    cycle passes through one there; `==` uses the PAIR stack,
+    `Name(...)` / `box(Name(...))` (`cyc_render()`); `hash` hashes a back
+    edge as its DEPTH, `cyc_backedge_hash` (`cyc_hash()`) - a CLASS
+    instance hashes and compares by identity before any guard, entering
+    no field, so no cycle passes through one there; `==` uses the PAIR
+    stack,
     `cyc_eq()` - a back edge when the lhs is on it as an lhs or the rhs as
     an rhs, equal iff at the same depth, which is the one rule `hash` can
     agree with; the deep copies (`clone_to_mutable`,
@@ -6715,7 +6722,11 @@ are unchanged.
   `cyc_keep_until_exit` and emptied by `cyc_release_kept`, which the first
   keep registers with `atexit`: it runs after `main` and before the census
   and LeakSanitizer read the heap (LIFO; a keep before the census mark is
-  in its baseline instead). `DictObject::release_at_exit` exists for that
+  in its baseline instead). **It runs after the VmProgram or the AST has
+  freed every struct DEF**, so its walk (`exit_key` / `exit_children`)
+  reads no def: through `cyc_key` it read `is_pod()` of freed memory for
+  any kept cycle reaching a struct - a heap-use-after-free at exit in
+  every engine (2026-10-09). `DictObject::release_at_exit` exists for that
   drain only. This is a stopgap until plans/reference-cycles.md part B
   (reclaiming cycles) is designed - never a way to make a test pass.
   Nets: `tests/functional/83_cyclic_values.my`, the `cycle:` `-rt` cases
