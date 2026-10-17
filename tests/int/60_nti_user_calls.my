@@ -1,0 +1,13 @@
+# INT-SOURCE: ../functional/29_nti_user_calls.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/29_nti_user_calls.my:
+# #51: under -nti (no type inference) the VM codegen lowered a call ONLY on
+# a type proof - a user function (CallV), a struct constructor, or a `dyn`
+# callee - so with no types EVERY user call that survived the inliner and
+# the folder was a NotLoweredEx compile refusal, while the tree-walker ran
+# it:
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

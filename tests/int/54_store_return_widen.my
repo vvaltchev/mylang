@@ -1,0 +1,13 @@
+# INT-SOURCE: ../functional/50_store_return_widen.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/50_store_return_widen.my:
+# A value stored where the static type is wider holds the WIDER type (the
+# #75 follow-up): a function returning `float` returns its int paths as
+# floats, a dict<float, _> stores an int key as a float key, a dict<_,
+# float> element or member stored from an int holds a float, a `var` joined
+# to float stores its int contributions as ...
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

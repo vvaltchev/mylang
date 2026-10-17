@@ -1,0 +1,12 @@
+# INT-SOURCE: ../functional/65_neg_global.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/65_neg_global.my:
+# Unary minus on a GLOBAL, inside a function. A proven-int/float `-x` is a
+# typed negation, and the typed path has no leaf for a global (a capture and
+# a call result have one), so it falls back to the boxed tier - which knew
+# `!x` but not `-x`.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

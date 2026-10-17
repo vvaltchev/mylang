@@ -1,0 +1,9 @@
+# INT-SOURCE: ../functional/20_bool_value_reads.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/20_bool_value_reads.my:
+# A BOOL READ IN A VALUE POSITION IS A BOOL, IN EVERY ENGINE.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

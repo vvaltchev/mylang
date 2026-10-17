@@ -1,0 +1,11 @@
+# INT-SOURCE: ../functional/56_xcall_pins.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/56_xcall_pins.my:
+# #124(b): a run that CALLS may pin in caller-saved registers too. The call
+# op is emitted with every caller-saved pin (and every float pin) written
+# back and out of the register view, and reloaded where its paths rejoin.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

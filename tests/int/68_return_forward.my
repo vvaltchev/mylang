@@ -1,0 +1,12 @@
+# INT-SOURCE: ../functional/52_return_forward.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/52_return_forward.my:
+# #71: a function whose last op computes its result (`return a < b`, `return
+# n + k`) hands the result to its return in a REGISTER; the slot store is
+# skipped and each return arm that reads the slot writes it back. Every arm
+# is reached here, with the result checked:
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

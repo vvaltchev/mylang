@@ -1,0 +1,13 @@
+# INT-SOURCE: ../functional/49_literal_widen.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/49_literal_widen.my:
+# A container literal or a value-selecting expression holds values of its
+# STATIC numeric type (#75): an array<float> literal stores its ints as
+# floats, an array<int> one its bools as ints, and so on through dict
+# values, nested literals, constant (parse-time baked) literals, the ternary
+# and `??`.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

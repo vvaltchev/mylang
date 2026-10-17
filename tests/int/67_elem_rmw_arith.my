@@ -1,0 +1,11 @@
+# INT-SOURCE: ../functional/15_elem_rmw_arith.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/15_elem_rmw_arith.my:
+# The COMPOUND element store's ARITHMETIC arm (#95's read-modify-write
+# tail): `a[i] OP= v` on a flat int array, inside a JIT'd run, for all five
+# operators.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

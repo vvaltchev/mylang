@@ -1,0 +1,10 @@
+# INT-SOURCE: ../functional/33_struct_foreach_promoted.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/33_struct_foreach_promoted.my:
+# The struct-FOREACH direct field read (LoadStructFieldInt/Float and the
+# fused StructFieldAddInt) over an array<PodStruct> that is NOT flat.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.
