@@ -18367,6 +18367,17 @@ static const std::vector<test> tests =
         "var g = G([1, 2]); var lay = layout(g);",
         "assert(lay.name == \"G\");",
         "assert(lay.fields[0].type == \"array<int>\");" } },
+    /* a bool local carries the int type hint (th == i also means bool),
+     * and rendered as `int b = t > 1;` */
+    { "coderender: a bool local renders as bool, not int",
+      { "func bo(int t) { var b = t > 1; var c = !b; var d = b && t < 9;"
+        " return c || d; }",
+        "assert(bo(5) == true && bo(0) == true && bo(10) == false);",
+        "var dyn s = show(bo);",
+        "assert(find(s, \"    bool b = t > 1;\\n\") != none);",
+        "assert(find(s, \"    bool c = !b;\\n\") != none);",
+        "assert(find(s, \"    bool d = b && t < 9;\\n\") != none);",
+        "assert(find(s, \"int b\") == none);" } },
     { "reflect: layout rejects a non-struct",
       { "layout(42);" }, &typeid(TypeErrorEx) },
     { "reflect: specializations of a plain function is empty",
