@@ -17819,3 +17819,32 @@ step one past the imm32 range, a counter the allocator puts in rax; the
 extra_check, which also requires `g_jit_step_imm` to move - the counter
 the emitted code of the PINNED arms bumps, so an answer from the memory
 arm or the interpreter fails it too.
+
+## emit_reg_shift: the negative-count raise ends the count's borrow (2026-10-09)
+
+**The bug.** The generic IntBin shift - every `>>>` (there is no
+specialized unsigned shift) and a shift whose VALUE is a literal (`1 <<
+c`, which stays generic) - takes its count in rcx through `hold(
+CAP_SHIFT_CNT)`, and when a local is pinned in rcx that is a BORROW
+(push / pop around the shift). `emit_reg_shift`'s negative-count arm
+called `emit_raise_convey` with the borrow still open, unlike the div /
+mod arms of the same op, which go through `raise_convey_unless` and its
+`BorrowSuspend`. A checked build's REGTRACK aborted at the helper's call
+prologue ("call prologue reached with a BORROW open") for every program
+with the shape, whether or not a count was ever negative - including
+attempts the pin bet later re-emitted. An `ASSERTS=0` build emitted the
+arm as `mov i, rcx; call jit_raise_kind_exc` with rcx holding the COUNT:
+the bracket saved the count as the pinned local and the exit flush wrote
+it into the local's slot, so a negative count caught in the same
+function (`try { s += v >>> (i - 2); } catch (InvalidValueEx) {}` with
+the loop counter `i` pinned in rcx) restarted the loop at `i - 2`.
+
+**The fix.** The raise arm opens a `BorrowSuspend`, as
+`raise_convey_unless` does: the arm pops the borrow (restoring the pin)
+before the bracket, and the hot path keeps it.
+
+**Nets.** `tests/functional/86_shift_borrow_raise.my` (`>>>`, `1 << c`,
+and caught negative counts with the counter in rcx) and the `-rt` entry
+`jit: a shift's negative-count raise keeps a local pinned in rcx`. Both
+were checked to reach the borrow (`push rcx` before the count load in
+`-vdj`).
