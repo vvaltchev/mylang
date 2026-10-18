@@ -7696,8 +7696,16 @@ headless-testable behind a thin terminal shell:
   code gone, folded consts as literals, inlined call bodies spliced in
   (annotated `inlined f`), flat-array element types as `array<int>`,
   typed-scalar/annotation hints as the var's type. A precedence-aware
-  expression printer + statement walker, with a comment fallback for any
-  unhandled node (best-effort, NOT round-trippable). Backs the `show(f)` builtin
+  expression printer + statement walker (best-effort, NOT round-trippable).
+  **Its expression renderer is an EXHAUSTIVE switch over `ConstructType`
+  with no `default`**, so a new node kind is a build error
+  (`-Werror=switch`) until it is given a rendering - the dynamic_cast ladder
+  it replaced ended in a comment naming the node, which is how `break`,
+  `continue`, `throw`, `rethrow`, a lambda value and a multi-assignment
+  target rendered as `/* BreakStmt */` and friends. Only a statement kind in
+  an operand position (which no tree builds) keeps that comment. A function
+  with no name renders as the lambda expression `func [caps] (params) ...`,
+  wherever it appears. Backs the `show(f)` builtin
   (a **dev-only** builtin — see the reflection-builtins note below; reserved in
   scripts) and the REPL `:show <name>` (which also renders the `<name>$N`
   clones). It

@@ -142,6 +142,14 @@ struct Renderer {
 
     int expr_prec(const Construct *c)
     {
+        /* an assignment is the loosest expression of all: as an operand
+         * it needs its parentheses (`(u = 3) + 1`) */
+        if (ctag(c) == ConstructType::expr14)
+            return 0;
+        /* a lambda's `=>` body would swallow what follows it, and a call
+         * of one must not read as a call of its body */
+        if (ctag(c) == ConstructType::func_decl)
+            return 1;
         if (auto *e = dynamic_cast<const TypedScalarExpr *>(c)) {
             if (e->cat == TypedScalarExpr::Cat::neg ||
                 e->cat == TypedScalarExpr::Cat::lnot)
@@ -187,90 +195,147 @@ struct Renderer {
         }
     }
 
+    /* Render `c` as code. EXHAUSTIVE over ConstructType, with no `default`:
+     * -Werror=switch makes a new node kind a build error until it is given
+     * a rendering here. (A dynamic_cast ladder ending in a placeholder used
+     * to print a comment naming any node it had no arm for - a lambda value
+     * as `FuncDeclStmt`, a multi-assignment target as `IdList`.) */
     void expr_inner(const Construct *c)
     {
-        if (auto *e = dynamic_cast<const LiteralInt *>(c)) {
-            o << e->ival(); return;
-        }
-        if (auto *e = dynamic_cast<const LiteralFloat *>(c)) {
-            o << fmt_float(e->fval()); return;
-        }
-        if (auto *e = dynamic_cast<const LiteralBool *>(c)) {
-            o << (e->bval() ? "true" : "false"); return;
-        }
-        if (dynamic_cast<const LiteralNone *>(c)) {
-            o << "none"; return;
-        }
-        if (auto *e = dynamic_cast<const LiteralStr *>(c)) {
-            o << escape_string(e->strval().get<SharedStr>().get_view());
+        switch (ctag(c)) {
+
+        case ConstructType::lit_int:
+            o << static_cast<const LiteralInt *>(c)->ival();
+            return;
+
+        case ConstructType::lit_float:
+            o << fmt_float(static_cast<const LiteralFloat *>(c)->fval());
+            return;
+
+        case ConstructType::lit_bool:
+            o << (static_cast<const LiteralBool *>(c)->bval()
+                      ? "true" : "false");
+            return;
+
+        case ConstructType::lit_none:
+            o << "none";
+            return;
+
+        case ConstructType::lit_str:
+            o << escape_string(static_cast<const LiteralStr *>(c)
+                                   ->strval().get<SharedStr>().get_view());
+            return;
+
+        case ConstructType::lit_obj: {
+            /* a baked const array/dict/struct - its to_string is code-like */
+            const EvalValue &v =
+                static_cast<const LiteralObj *>(c)->literal_value();
+            o << v.get_type()->to_string(v);
             return;
         }
-        if (auto *e = dynamic_cast<const LiteralObj *>(c)) {
-            /* a baked const array/dict/struct - its to_string is code-like */
-            const EvalValue &v = e->literal_value();
-            o << v.get_type()->to_string(v); return;
+
+        case ConstructType::id:
+            o << static_cast<const Identifier *>(c)->get_str();
+            return;
+
+        case ConstructType::idlist: {
+            /* a multi-assignment's targets: `a, b = ...` */
+            const auto *l = static_cast<const IdList *>(c);
+            for (size_t i = 0; i < l->elems.size(); i++) {
+                if (i) o << ", ";
+                o << l->elems[i]->get_str();
+            }
+            return;
         }
-        if (auto *e = dynamic_cast<const Identifier *>(c)) {
-            o << e->get_str(); return;
-        }
-        if (auto *e = dynamic_cast<const LiteralArray *>(c)) {
+
+        case ConstructType::expr_list:
+            args(static_cast<const ExprList *>(c));
+            return;
+
+        case ConstructType::lit_arr: {
+            const auto *e = static_cast<const LiteralArray *>(c);
             o << "[";
             for (size_t i = 0; i < e->elems.size(); i++) {
                 if (i) o << ", ";
                 expr(e->elems[i].get(), 0);
             }
-            o << "]"; return;
+            o << "]";
+            return;
         }
-        if (auto *e = dynamic_cast<const LiteralDict *>(c)) {
+
+        case ConstructType::lit_dict: {
+            const auto *e = static_cast<const LiteralDict *>(c);
             o << "{";
             for (size_t i = 0; i < e->elems.size(); i++) {
                 if (i) o << ", ";
-                expr(e->elems[i]->key.get(), 0);
-                o << ": ";
-                expr(e->elems[i]->value.get(), 0);
+                expr_inner(e->elems[i].get());
             }
-            o << "}"; return;
+            o << "}";
+            return;
         }
-        if (auto *e = dynamic_cast<const MemberExpr *>(c)) {
+
+        case ConstructType::lit_dict_kv: {
+            const auto *kv = static_cast<const LiteralDictKVPair *>(c);
+            expr(kv->key.get(), 0);
+            o << ": ";
+            expr(kv->value.get(), 0);
+            return;
+        }
+
+        case ConstructType::member: {
+            const auto *e = static_cast<const MemberExpr *>(c);
             expr(e->what.get(), PREC_POSTFIX);
-            o << (e->optional ? "?." : ".") << e->memId; return;
+            o << (e->optional ? "?." : ".") << e->memId;
+            return;
         }
-        if (auto *e = dynamic_cast<const Subscript *>(c)) {
+
+        case ConstructType::subscript: {
+            const auto *e = static_cast<const Subscript *>(c);
             expr(e->what.get(), PREC_POSTFIX);
             o << "[";
             expr(e->index.get(), 0);
-            o << "]"; return;
+            o << "]";
+            return;
         }
-        if (auto *e = dynamic_cast<const Slice *>(c)) {
+
+        case ConstructType::slice: {
+            const auto *e = static_cast<const Slice *>(c);
             expr(e->what.get(), PREC_POSTFIX);
             o << "[";
             if (e->start_idx) expr(e->start_idx.get(), 0);
             o << ":";
             if (e->end_idx) expr(e->end_idx.get(), 0);
-            o << "]"; return;
+            o << "]";
+            return;
         }
-        if (auto *e = dynamic_cast<const CallExpr *>(c)) {
+
+        case ConstructType::call: {
+            /* the whole CallExpr family (Direct/Cached/DirectBuiltin share
+             * the tag and the layout) */
+            const auto *e = static_cast<const CallExpr *>(c);
             expr(e->what.get(), PREC_POSTFIX);
             o << "(";
             if (e->args)
-                for (size_t i = 0; i < e->args->elems.size(); i++) {
-                    if (i) o << ", ";
-                    expr(e->args->elems[i].get(), 0);
-                }
-            o << ")"; return;
+                args(e->args.get());
+            o << ")";
+            return;
         }
-        if (auto *e = dynamic_cast<const IncDecExpr *>(c)) {
+
+        case ConstructType::incdec: {
+            const auto *e = static_cast<const IncDecExpr *>(c);
             const char *op = e->is_inc ? "++" : "--";
             if (e->is_prefix) { o << op; expr(e->lvalue.get(), 8); }
             else { expr(e->lvalue.get(), PREC_POSTFIX); o << op; }
             return;
         }
-        if (ctag(c) == ConstructType::deref) {
+
+        case ConstructType::deref:
             o << "*";
             expr(static_cast<const DerefExpr *>(c)->elem.get(), 8);
             return;
-        }
-        if (auto *e = dynamic_cast<const TernaryExpr *>(c)) {
+
+        case ConstructType::ternary: {
+            const auto *e = static_cast<const TernaryExpr *>(c);
             expr(e->condExpr.get(), 2);
             o << " ? ";
             expr(e->thenExpr.get(), 2);
@@ -278,52 +343,139 @@ struct Renderer {
             expr(e->elseExpr.get(), 1);     /* right-assoc */
             return;
         }
-        if (auto *e = dynamic_cast<const CoalesceExpr *>(c)) {
+
+        case ConstructType::coalesce: {
+            const auto *e = static_cast<const CoalesceExpr *>(c);
             expr(e->lhs.get(), 2);
             o << " ?? ";
             expr(e->rhs.get(), 1);          /* right-assoc */
             return;
         }
-        if (auto *e = dynamic_cast<const TypedScalarExpr *>(c)) {
-            op_chain(e->elems, expr_prec(c)); return;
-        }
-        if (auto *e = dynamic_cast<const Expr01 *>(c)) {
+
+        case ConstructType::typed_scalar:
+            op_chain(static_cast<const TypedScalarExpr *>(c)->elems,
+                     expr_prec(c));
+            return;
+
+        case ConstructType::expr01: {
+            const auto *e = static_cast<const Expr01 *>(c);
             if (e->elem) expr_inner(e->elem.get());
             return;
         }
-        if (auto *e = dynamic_cast<const MultiOpConstruct *>(c)) {
-            op_chain(e->elems, expr_prec(c)); return;
-        }
-        if (auto *e = dynamic_cast<const Expr14 *>(c)) {
-            expr(e->lvalue.get(), 0);
-            o << " " << OpString[(int)e->op] << " ";
-            expr(e->rvalue.get(), 0); return;
-        }
-        if (auto *e = dynamic_cast<const InlinedCallExpr *>(c)) {
-            /* An inlined block body in expression position (the non-expressible
-             * form, used when the body is not a temp-free guard chain - a guard
-             * body is inlined as a real ternary instead). Label it once, then
-             * render the single-return body as its value, else the block. */
-            const char *nm = (e->elem && e->elem->inline_ctx)
-                ? e->elem->inline_ctx->callee_name.c_str() : "?";
-            auto *b = dynamic_cast<const Block *>(e->elem.get());
-            const ReturnStmt *r = (b && b->elems.size() == 1)
-                ? dynamic_cast<const ReturnStmt *>(b->elems[0].get()) : nullptr;
-            if (r) {
-                o << "/* inlined " << nm << " */ (";
-                if (r->elem) expr(r->elem.get(), 0); else o << "none";
-                o << ")";
-            } else if (e->elem) {
-                /* a multi-statement inlined body: render it as a brace block so
-                 * the expansion is visible. Best-effort - a block in expression
-                 * position is not valid MyLang, but :show is a decompiler. */
-                o << "/* inlined " << nm << " */ ";
-                inline_block(e->elem.get(), cur_level);
-            }
+
+        case ConstructType::expr02: case ConstructType::expr03:
+        case ConstructType::expr04: case ConstructType::expr05:
+        case ConstructType::expr06: case ConstructType::expr07:
+        case ConstructType::expr08: case ConstructType::expr09:
+        case ConstructType::expr10: case ConstructType::expr11:
+        case ConstructType::expr12:
+            op_chain(static_cast<const MultiOpConstruct *>(c)->elems,
+                     expr_prec(c));
+            return;
+
+        case ConstructType::expr14:
+            assignment(static_cast<const Expr14 *>(c));
+            return;
+
+        case ConstructType::func_decl:
+            /* a function VALUE (a lambda); a named function is a
+             * statement and never an operand */
+            func(static_cast<const FuncDeclStmt *>(c), cur_level);
+            return;
+
+        case ConstructType::inlined_call:
+            inlined_call(static_cast<const InlinedCallExpr *>(c));
+            return;
+
+        /* statements: never an operand in a tree the parser and the
+         * passes build (an inlined body is a Block the inlined_call arm
+         * renders itself) - a statement position goes through stmt() */
+        case ConstructType::other:
+        case ConstructType::nop:
+        case ConstructType::brk:
+        case ConstructType::cont:
+        case ConstructType::rethrow:
+        case ConstructType::throw_stmt:
+        case ConstructType::block:
+        case ConstructType::if_stmt:
+        case ConstructType::ret:
+        case ConstructType::while_stmt:
+        case ConstructType::struct_decl:
+        case ConstructType::try_catch:
+        case ConstructType::foreach_stmt:
+        case ConstructType::for_stmt:
+        case ConstructType::for_range:
+            o << "/* " << c->name << " */";
             return;
         }
-        /* fallback for an unhandled expression node */
-        o << "/* " << c->name << " */";
+    }
+
+    /* a call's arguments, with a named argument's label: the REPL's
+     * `:show EXPR` renders a tree the inferencer has not desugared, where
+     * dropping `y:` from `P(y: 5, x: 6)` would change which field gets
+     * which value */
+    void args(const ExprList *l)
+    {
+        for (size_t i = 0; i < l->elems.size(); i++) {
+            if (i) o << ", ";
+            if (i < l->arg_names.size() && l->arg_names[i])
+                o << l->arg_names[i]->val << ": ";
+            expr(l->elems[i].get(), 0);
+        }
+    }
+
+    /* An inlined block body in expression position (the non-expressible
+     * form, used when the body is not a temp-free guard chain - a guard body
+     * is inlined as a real ternary instead). Label it once, then render the
+     * single-return body as its value, else the block. */
+    void inlined_call(const InlinedCallExpr *e)
+    {
+        const char *nm = (e->elem && e->elem->inline_ctx)
+            ? e->elem->inline_ctx->callee_name.c_str() : "?";
+        auto *b = dynamic_cast<const Block *>(e->elem.get());
+        const ReturnStmt *r = (b && b->elems.size() == 1)
+            ? dynamic_cast<const ReturnStmt *>(b->elems[0].get()) : nullptr;
+        if (r) {
+            o << "/* inlined " << nm << " */ (";
+            if (r->elem) expr(r->elem.get(), 0); else o << "none";
+            o << ")";
+        } else if (e->elem) {
+            /* a multi-statement inlined body: render it as a brace block so
+             * the expansion is visible. Best-effort - a block in expression
+             * position is not valid MyLang, but :show is a decompiler. */
+            o << "/* inlined " << nm << " */ ";
+            const int lvl = cur_level;
+            inline_block(e->elem.get(), lvl);
+            cur_level = lvl;
+        }
+    }
+
+    /* `a = v`, `a += v`, `a, b = v`, and a declaration `var a = v` */
+    void assignment(const Expr14 *e14)
+    {
+        if (e14->fl & pFlags::pInDecl) {
+            const bool is_const = e14->fl & pFlags::pInConstDecl;
+            if (auto *lv = dynamic_cast<const Identifier *>(e14->lvalue.get()))
+                o << decl_kw(lv, e14->rvalue.get(), is_const) << " "
+                  << lv->get_str();
+            else if (auto *l = dynamic_cast<const IdList *>(
+                         e14->lvalue.get())) {
+                /* `var a, b = ...`: the keyword of the first target (the
+                 * annotation and the modifiers apply to all of them) */
+                o << (l->elems.empty()
+                          ? string(is_const ? "const" : "var")
+                          : decl_kw(l->elems[0].get(), nullptr, is_const))
+                  << " ";
+                expr_inner(l);
+            } else
+                expr(e14->lvalue.get(), 0);
+            o << " = ";
+            expr(e14->rvalue.get(), 0);
+            return;
+        }
+        expr(e14->lvalue.get(), 0);
+        o << " " << OpString[(int)e14->op] << " ";
+        expr(e14->rvalue.get(), 0);
     }
 
     /* ------------------------------ statements ------------------------ */
@@ -356,28 +508,40 @@ struct Renderer {
 
     void stmt(const Construct *c, int level)
     {
-        if (!c || dynamic_cast<const NopConstruct *>(c))
+        if (!c || ctag(c) == ConstructType::nop)
             return;
 
         cur_level = level;
         const InlineCtx *saved;
         const bool tagged = enter_inline(c, saved);
 
-        if (auto *b = dynamic_cast<const Block *>(c)) {
-            block(b, level);
+        if (ctag(c) == ConstructType::block) {
+            block(static_cast<const Block *>(c), level);
             if (tagged) leave_inline(saved);
             return;
         }
 
         o << ind(level);
 
-        if (auto *f = dynamic_cast<const FuncDeclStmt *>(c)) {
+        switch (ctag(c)) {
+
+        case ConstructType::func_decl: {
+            auto *f = static_cast<const FuncDeclStmt *>(c);
             func(f, level);
-            o << "\n";
-        } else if (auto *s = dynamic_cast<const StructDeclStmt *>(c)) {
+            /* a lambda standing as a statement is an expression statement */
+            o << (f->id ? "\n" : ";\n");
+            break;
+        }
+
+        case ConstructType::struct_decl: {
+            auto *s = static_cast<const StructDeclStmt *>(c);
             o << (s->def->is_class ? "class " : "struct ")
               << s->def->name->val << " { ... }\n";
-        } else if (auto *i = dynamic_cast<const IfStmt *>(c)) {
+            break;
+        }
+
+        case ConstructType::if_stmt: {
+            auto *i = static_cast<const IfStmt *>(c);
             o << "if (";
             expr(i->condExpr.get(), 0);
             o << ") ";
@@ -387,13 +551,21 @@ struct Renderer {
                 inline_block(i->elseBlock.get(), level);
             }
             o << "\n";
-        } else if (auto *w = dynamic_cast<const WhileStmt *>(c)) {
+            break;
+        }
+
+        case ConstructType::while_stmt: {
+            auto *w = static_cast<const WhileStmt *>(c);
             o << "while (";
             expr(w->condExpr.get(), 0);
             o << ") ";
             inline_block(w->body.get(), level);
             o << "\n";
-        } else if (auto *f = dynamic_cast<const ForStmt *>(c)) {
+            break;
+        }
+
+        case ConstructType::for_stmt: {
+            auto *f = static_cast<const ForStmt *>(c);
             o << "for (";
             if (f->init) stmt_oneline(f->init.get());
             o << "; ";
@@ -403,9 +575,13 @@ struct Renderer {
             o << ") ";
             inline_block(f->body.get(), level);
             o << "\n";
-        } else if (auto *fr = dynamic_cast<const ForRangeStmt *>(c)) {
-            /* the specialized counted loop - shown as the equivalent for() with
-             * a "counted" marker so the optimization is visible. */
+            break;
+        }
+
+        case ConstructType::for_range: {
+            /* the specialized counted loop - shown as the equivalent for()
+             * with a "counted" marker so the optimization is visible. */
+            auto *fr = static_cast<const ForRangeStmt *>(c);
             const Construct *ivar = nullptr;
             if (auto *e14 = dynamic_cast<const Expr14 *>(fr->init.get()))
                 ivar = e14->lvalue.get();
@@ -427,7 +603,11 @@ struct Renderer {
             o << ") /* counted */ ";
             inline_block(fr->body.get(), level);
             o << "\n";
-        } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+            break;
+        }
+
+        case ConstructType::foreach_stmt: {
+            auto *fe = static_cast<const ForeachStmt *>(c);
             o << "foreach (";
             if (fe->idsVarDecl) o << "var ";
             for (size_t i = 0; i < fe->ids->elems.size(); i++) {
@@ -440,17 +620,26 @@ struct Renderer {
             o << ") ";
             inline_block(fe->body.get(), level);
             o << "\n";
-        } else if (auto *r = dynamic_cast<const ReturnStmt *>(c)) {
+            break;
+        }
+
+        case ConstructType::ret: {
+            auto *r = static_cast<const ReturnStmt *>(c);
             o << "return";
             if (r->elem) { o << " "; expr(r->elem.get(), 0); }
             o << ";\n";
-        } else if (auto *t = dynamic_cast<const TryCatchStmt *>(c)) {
+            break;
+        }
+
+        case ConstructType::try_catch: {
+            auto *t = static_cast<const TryCatchStmt *>(c);
             o << "try ";
             inline_block(t->tryBody.get(), level);
             for (const auto &cs : t->catchStmts) {
                 o << " catch (";
                 if (cs.first.exList)
-                    for (size_t i = 0; i < cs.first.exList->elems.size(); i++) {
+                    for (size_t i = 0; i < cs.first.exList->elems.size();
+                         i++) {
                         if (i) o << ", ";
                         o << cs.first.exList->elems[i]->get_str();
                     }
@@ -463,10 +652,34 @@ struct Renderer {
                 inline_block(t->finallyBody.get(), level);
             }
             o << "\n";
-        } else {
-            /* an expression statement (call, assignment, ...) */
+            break;
+        }
+
+        case ConstructType::brk:
+            o << "break;\n";
+            break;
+
+        case ConstructType::cont:
+            o << "continue;\n";
+            break;
+
+        case ConstructType::rethrow:
+            o << "rethrow;\n";
+            break;
+
+        case ConstructType::throw_stmt:
+            o << "throw ";
+            expr(static_cast<const ThrowStmt *>(c)->elem.get(), 0);
+            o << ";\n";
+            break;
+
+        default:
+            /* an expression statement (call, assignment, declaration...):
+             * every other kind is an expression, which expr_inner's
+             * exhaustive switch renders */
             stmt_oneline(c);
             o << ";\n";
+            break;
         }
 
         if (tagged) leave_inline(saved);
@@ -475,24 +688,6 @@ struct Renderer {
     /* a one-line statement body without trailing ';' or newline (for/decl) */
     void stmt_oneline(const Construct *c)
     {
-        if (auto *e14 = dynamic_cast<const Expr14 *>(c)) {
-            if (e14->fl & pFlags::pInDecl) {
-                auto *lv = dynamic_cast<const Identifier *>(e14->lvalue.get());
-                const bool is_const = e14->fl & pFlags::pInConstDecl;
-                if (lv)
-                    o << decl_kw(lv, e14->rvalue.get(), is_const) << " "
-                      << lv->get_str();
-                else
-                    expr(e14->lvalue.get(), 0);
-                o << " = ";
-                expr(e14->rvalue.get(), 0);
-                return;
-            }
-            expr(e14->lvalue.get(), 0);
-            o << " " << OpString[(int)e14->op] << " ";
-            expr(e14->rvalue.get(), 0);
-            return;
-        }
         expr(c, 0);
     }
 
@@ -521,7 +716,9 @@ struct Renderer {
     }
 
     /* a function header `[pure] func NAME(params)` using its REAL id (so a
-     * clone shows `func f$0(...)`), then its body. */
+     * clone shows `func f$0(...)`), then its body. A function VALUE with no
+     * name (a lambda) is the expression `func [captures] (params) ...`,
+     * whose `=> expr` body takes no `;` (the statement holding it does). */
     void func(const FuncDeclStmt *f, int level)
     {
         if (f->desc->explicit_pure || f->desc->effective_pure)
@@ -529,7 +726,15 @@ struct Renderer {
         if (!ret_type.empty())                       /* inferred return type */
             o << ret_type << " ";
         o << "func ";
-        o << (f->id ? string(f->id->get_str()) : string("<lambda>"));
+        if (f->id) {
+            o << f->id->get_str();
+        } else {
+            if (f->captures && !f->captures->elems.empty()) {
+                o << "[";
+                expr_inner(f->captures.get());
+                o << "] ";
+            }
+        }
         o << "(";
         if (f->params)
             for (size_t i = 0; i < f->params->elems.size(); i++) {
@@ -549,11 +754,14 @@ struct Renderer {
 
         /* A single-return body - the `=> expr` sugar's parsed form (or its
          * hand-written twin) - renders back as `=> expr;`, the idiomatic
-         * spelling. */
+         * spelling. The body's statements move cur_level; a lambda is
+         * part of an enclosing statement, which goes on at its own. */
+        const int outer_level = cur_level;
         if (const Construct *eb = func_expr_body(f)) {
             o << "=> ";
             expr(eb, 0);
-            o << ";";
+            if (f->id)
+                o << ";";
         } else if (auto *b = dynamic_cast<const Block *>(f->body.get())) {
             o << "{\n";
             for (const auto &e : b->elems)
@@ -562,6 +770,7 @@ struct Renderer {
         } else {
             o << "{ }";
         }
+        cur_level = outer_level;
     }
 
     /* `[const ]<inferred-type> name` - the inferred-type string already carries
@@ -615,6 +824,8 @@ string render_construct_code(const Construct *c)
         return "";
     std::ostringstream o;
     Renderer r(o);
+    /* a lambda is an expression; a NAMED function is a declaration */
+    const auto *fd = dynamic_cast<const FuncDeclStmt *>(c);
     if (dynamic_cast<const Block *>(c) ||
         dynamic_cast<const IfStmt *>(c) ||
         dynamic_cast<const WhileStmt *>(c) ||
@@ -622,7 +833,7 @@ string render_construct_code(const Construct *c)
         dynamic_cast<const ForRangeStmt *>(c) ||
         dynamic_cast<const ForeachStmt *>(c) ||
         dynamic_cast<const ReturnStmt *>(c) ||
-        dynamic_cast<const FuncDeclStmt *>(c) ||
+        (fd && fd->id) ||
         dynamic_cast<const TryCatchStmt *>(c))
         r.stmt(c, 0);
     else
