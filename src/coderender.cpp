@@ -636,15 +636,16 @@ struct Renderer {
             o << "try ";
             inline_block(t->tryBody.get(), level);
             for (const auto &cs : t->catchStmts) {
-                o << " catch (";
-                if (cs.first.exList)
-                    for (size_t i = 0; i < cs.first.exList->elems.size();
-                         i++) {
-                        if (i) o << ", ";
-                        o << cs.first.exList->elems[i]->get_str();
-                    }
-                if (cs.first.asId) o << " as " << cs.first.asId->get_str();
-                o << ") ";
+                o << " catch ";
+                /* a catch-anything has no list - and no parentheses:
+                 * `catch () {` does not parse */
+                if (cs.first.exList) {
+                    o << "(";
+                    expr_inner(cs.first.exList.get());
+                    if (cs.first.asId)
+                        o << " as " << cs.first.asId->get_str();
+                    o << ") ";
+                }
                 inline_block(cs.second.get(), level);
             }
             if (t->finallyBody) {

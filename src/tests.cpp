@@ -18413,6 +18413,14 @@ static const std::vector<test> tests =
       { "assert(show(2 + 3 * 4) == \"14\");" } },
     { "reflect: show() renders an expression tree",
       { "assert(show([1, 2, 3]) == \"[1, 2, 3]\");" } },
+    /* a bare `catch { }` rendered as `catch () {`, which does not parse */
+    { "coderender: a bare catch renders as catch {",
+      { "func ca(int n) { var r = 0; try { r = 10 / n; } catch { r = -1; }"
+        " return r; }",
+        "assert(ca(0) == -1 && ca(5) == 2);",
+        "var dyn s = show(ca);",
+        "assert(find(s, \"    } catch {\\n\") != none);",
+        "assert(find(s, \"catch (\") == none);" } },
 
     /* ---- diagnostic tracing builtins (trace.h) ---- */
     { "trace: tracing() is empty by default",
