@@ -952,8 +952,10 @@ The first argument of an in-place builtin (`append`, `push`, `pop`,
 rule: given a value rather than a variable, the builtin works on that value,
 evaluated before the other arguments - `append(f(), x)` means
 `{ var t = f(); append(t, x); }`, so it appends to the array `f` returned,
-and `append([1, 2], 3)` to a fresh array nobody keeps. A `const` value
-refuses it (`CannotChangeConstEx`), as through a variable.
+and `append([1, 2], 3)` to a fresh array nobody keeps - called directly
+or through a `dyn` holding the builtin (`var dyn ap = append; ap([1],
+2)`). A `const` value refuses it (`CannotChangeConstEx`), as through a
+variable.
 
 ```C#
 var queue = [1, 2];

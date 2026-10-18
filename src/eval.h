@@ -499,17 +499,22 @@ EvalValue dispatch_builtin_values(EvalContext *ctx, const Builtin &b,
                                   size_t n);
 
 /* The arg0 TARGET an INDIRECT call hands an `lvalue` builtin's func_lv:
- * `lv` when arg0 is an lvalue; else, for a builtin that also takes a value
- * (Builtin::arg0_value_ok - sort/rev_sort/reverse), `tmp` loaded with arg0's
- * value; else null (the builtin's own "not an lvalue" error). For the
- * former an UNDEFINED arg0 throws UndefinedVariableEx, as reading it would:
- * the compile-time folder relies on that to leave a call it cannot evaluate
- * (#54: `sort(K)` with a const array K under -nc reached it that way). */
+ * `lv` when arg0 is an lvalue; else `tmp` loaded with arg0's VALUE - README
+ * *Storing through a value*: an in-place builtin works on a value, held
+ * for the call's length, as the direct call's adapter (lv_builtin_target,
+ * types.cpp) holds it. An UNDEFINED arg0 is null (the builtin's own
+ * error, as the direct call's) - except for a builtin that also takes a
+ * value (Builtin::arg0_value_ok - sort/rev_sort/reverse), where it throws
+ * UndefinedVariableEx, as reading it would: the compile-time folder
+ * relies on that to leave a call it cannot evaluate (#54: `sort(K)` with
+ * a const array K under -nc reached it that way). */
 inline LValue *builtin_lv_target(const Builtin &b, LValue *lv,
                                  const EvalValue &arg0, LValue &tmp)
 {
-    if (lv || !b.arg0_value_ok)
+    if (lv)
         return lv;
+    if (!b.arg0_value_ok && arg0.is<UndefinedId>())
+        return nullptr;
     tmp.put(RValue(arg0));
     return &tmp;
 }
