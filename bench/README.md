@@ -182,12 +182,14 @@ Python slices semantically — they just don't copy eagerly.**
 - **Array slices.** `a[i:j]` in Python eagerly copies the `j-i` elements into a
   brand-new list. In MyLang it returns an **O(1) view** that shares storage
   with `a` via a reference count plus a registered "slice" record. The copy is
-  deferred: the moment you *write* through either the slice or the original, the
-  affected storage is cloned (`get_value_for_put` → `clone_aliased_slices` /
-  `clone_internal_vec`) so the write never bleeds across the two. **The net
-  effect a script can observe is identical to Python's** — writing to a slice
-  never changes the parent and vice-versa (verified in
-  `verify_semantics.my`). Only the performance differs:
+  deferred: the moment you *write* through the slice (by any name holding it)
+  or through the original, the affected storage is cloned
+  (`materialize_slice` / `clone_aliased_slices`) so the write never bleeds
+  across the two. **The net effect a script can observe is identical to
+  Python's** — writing to a slice never changes the parent and vice-versa,
+  and, as in Python, a slice once taken is an ordinary array: assigning it or
+  passing it to a function shares it rather than copying it again (both
+  verified in `verify_semantics.my`). Only the performance differs:
   - `15_array_slice_readonly` — take a slice and only read it. MyLang does O(1)
     work, Python pays the full O(k) copy every time. **MyLang wins big here**,
     and it's not because it's a faster interpreter — it's doing asymptotically

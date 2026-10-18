@@ -1,17 +1,17 @@
 # An in-place builtin (append, push, pop, insert, erase, sort, reverse)
 # works on the location its first argument names - for an access chain,
 # the place a store through that chain would write: every struct the
-# chain enters is the variable's OWN (a struct is a value), and a slice
-# found there detaches in place. Until 2026-10-08 the VM held a chain
-# deeper than one step, or a member of a base not proven a struct, as a
-# VALUE (a copy of the handle - a slice's detach was lost), an indirect
-# call (a `dyn` callee holding the builtin) refused a deeper chain, and
-# the tree-walker's sort / reverse and indirect calls wrote into a struct
-# a copy still shared.
+# chain enters is the variable's OWN (a struct is a value). Until
+# 2026-10-08 the VM held a chain deeper than one step, or a member of a
+# base not proven a struct, as a VALUE (a copy of the handle), an
+# indirect call (a `dyn` callee holding the builtin) refused a deeper
+# chain, and the tree-walker's sort / reverse and indirect calls wrote
+# into a struct a copy still shared.
 #
-# Slice fields make the difference visible: an array field is shared by
-# a struct's copies, but appending to a slice detaches it - into the
-# copy written through, never the other.
+# The fields here are SLICES of `big`: a struct copy is shallow, and a
+# copy of a slice is the same slice (question 3, Python's rule), so every
+# copy of a struct sees what a builtin did through any of them - and
+# `big`, the array the slices were taken from, never changes.
 
 struct P { int x; int y; }
 struct B { int x; array<int> a; }
@@ -20,27 +20,28 @@ struct O { B i; int z; }
 func ri(int v) => int(runtime(v));
 var big = [1, 2, 3, 4];
 
-# 1. a deep chain: the copy's slice field detaches, the original keeps
-#    its view and `big` is untouched
+# 1. a deep chain: the builtin reaches the slice every copy shares, and
+#    `big` is untouched
 var o1 = O(B(ri(0), big[0:2]), 1);
 var o2 = o1;
 append(o2.i.a, 9);
-assert(o1.i.a == [1, 2] && o2.i.a == [1, 2, 9] && big == [1, 2, 3, 4]);
+assert(o1.i.a == [1, 2, 9] && o2.i.a == [1, 2, 9] && big == [1, 2, 3, 4]);
 var o3 = o1;
 sort(o3.i.a);
 pop(o3.i.a);
+assert(o1.i.a == [1, 2] && o3.i.a == [1, 2]);
 var o4 = o1;
 reverse(o4.i.a);
 insert(o4.i.a, 0, 7);
 erase(o4.i.a, 1);
-assert(o1.i.a == [1, 2] && o3.i.a == [1] && o4.i.a == [7, 1]);
+assert(o1.i.a == [7, 1] && o3.i.a == [7, 1] && o4.i.a == [7, 1]);
 
 # 2. a member of a `dyn` base (no proven struct type)
 var dyn dv = B(ri(0), big[1:3]);
 var dyn dv2 = dv;
 append(dv2.a, 7);
 sort(dv2.a);
-assert(dv.a == [2, 3] && dv2.a == [2, 3, 7]);
+assert(dv.a == [2, 3, 7] && dv2.a == [2, 3, 7]);
 
 # 3. subscripts only: the element is the location
 var m = [[big[0:2]]];
@@ -57,7 +58,7 @@ var s3 = s1;
 rev_sort(s3.a);
 reverse(s3.a);
 push(s3.a, 3);
-assert(s1.a == [1, 2] && s2.a == [1] && s3.a == [1, 2, 3]);
+assert(s1.a == [1, 3] && s2.a == [1, 3] && s3.a == [1, 3]);
 
 # 5. indirect: a `dyn` callee holding the builtin
 var dyn f = runtime(append);
@@ -69,8 +70,8 @@ f(s4.a, 6);
 g(s4.a);
 var m2 = [[big[0:2]]];
 f(m2[0][0], 4);
-assert(o1.i.a == [1, 2] && o5.i.a == [1, 2, 8] && s1.a == [1, 2]
-       && s4.a == [1, 2, 6] && m2 == [[[1, 2, 4]]] && big == [1, 2, 3, 4]);
+assert(o1.i.a == [7, 1, 8] && o5.i.a == [7, 1, 8] && s1.a == [1, 3, 6]
+       && s4.a == [1, 3, 6] && m2 == [[[1, 2, 4]]] && big == [1, 2, 3, 4]);
 
 # 6. a chain rooted at a value: the builtin works on the held value
 func mko() => O(B(ri(0), [5]), 0);
@@ -93,8 +94,12 @@ for (var i = 0; i < 40; i++) {
     tot += len(c.i.a) + len(d.a) + len(dd.a) + len(o1.i.a) + len(s1.a)
          + len(dv.a);
 }
-assert(tot == 40 * (4 + 3 + 3 + 2 + 2 + 2));
-assert(o1.i.a == [1, 2] && s1.a == [1, 2] && dv.a == [2, 3]);
+# per iteration i: c and o1 share one slice (3 + 2 (i + 1) long), d and
+# s1 another, dd and dv a third (3 + (i + 1) each)
+assert(tot == 26 * 40 + 8 * (39 * 40 / 2));
+assert(len(o1.i.a) == 83 && o1.i.a[0:3] == [7, 1, 8] && o1.i.a[82] == 39);
+assert(len(s1.a) == 43 && s1.a[0] == 0 && s1.a[42] == 39);
+assert(len(dv.a) == 43 && dv.a[3] == 0 && dv.a[42] == 39);
 assert(big == [1, 2, 3, 4]);
 
 print(o1, o2, o3, o4, dv2, m, s2, s3, o5, s4, m2, r6, tot);

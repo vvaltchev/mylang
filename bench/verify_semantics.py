@@ -1,6 +1,6 @@
 # Python mirror of verify_semantics.my: every assertion below is identical to
 # the MyLang one, demonstrating that the two languages agree on container
-# semantics (aliasing, slice independence, clone, by-reference arguments,
+# semantics (aliasing, slices, clone, by-reference arguments,
 # immutable-string slices, shared inner arrays). Run:
 #     python3 bench/verify_semantics.py
 # Must print "all semantics checks passed", same as the .my version.
@@ -15,7 +15,7 @@ assert y == [99, 2, 3]
 y.append(7)
 assert x == [99, 2, 3, 7]
 
-# --- a SLICE behaves like an independent copy ------------------------------
+# --- a SLICE is a new list ------------------------------------------------
 a = [1, 2, 3, 4, 5]
 s = a[1:4]
 assert s == [2, 3, 4]
@@ -34,6 +34,17 @@ g = f[0:3]
 g[0] = 99
 assert f == [1, 2, 3]
 assert g == [99, 2, 3]
+
+a3 = [1, 2, 3, 4, 5]
+s3 = a3[1:4]
+t3 = s3
+t3[0] = 99
+assert s3 == [99, 3, 4]
+assert a3 == [1, 2, 3, 4, 5]
+def setz(arr):
+    arr[1] = 0
+setz(s3)
+assert t3 == [99, 0, 4]
 
 # --- explicit copy ---------------------------------------------------------
 c1 = [1, 2, 3]

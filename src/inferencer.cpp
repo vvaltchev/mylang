@@ -8186,12 +8186,19 @@ static bool fr_is_scalar(const Construct *e)
  * bound until 2026-10-08. intptr / refcount take an lvalue and change
  * nothing.
  */
-static bool fr_builtin_mutates(const Construct *callee)
+/* the name of the builtin `callee` calls; empty for anything else (a
+ * user function, a value, a name a program declared over a builtin's) */
+static std::string_view fr_builtin_name(const Construct *callee)
 {
     auto *id = dynamic_cast<const Identifier *>(callee);
     if (!id || id->sym.kind != SymKind::builtin)
-        return false;
-    const std::string_view n = id->get_str();
+        return {};
+    return id->get_str();
+}
+
+static bool fr_builtin_mutates(const Construct *callee)
+{
+    const std::string_view n = fr_builtin_name(callee);
     return n == "append" || n == "push" || n == "pop" || n == "insert"
         || n == "erase" || n == "sort" || n == "rev_sort" || n == "reverse";
 }
@@ -8401,9 +8408,7 @@ static bool fr_immutable(const Construct *e, const FrMut &m,
             || (!fr_is_const_builtin(ce->what.get())
                 && !fr_is_pure_func(ce->what.get())))
             return false;
-        auto *cid = dynamic_cast<const Identifier *>(ce->what.get());
-        const bool is_len = cid && cid->sym.kind == SymKind::builtin
-            && cid->get_str() == "len";
+        const bool is_len = fr_builtin_name(ce->what.get()) == "len";
         if (ce->args)
             for (auto &a : ce->args->elems) {
                 if (!fr_immutable(a.get(), m, i_uid))
@@ -8547,6 +8552,58 @@ static bool hoist_refs_uid(Construct *c, const UniqueId *uid)
 }
 
 /*
+ * Is every use of the slice variable `uid` in `c` one that cannot let the
+ * slice ESCAPE - an element read `sl[i]`, a slice of it `sl[a:b]`,
+ * `len(sl)`, or the container of a foreach? Question 3 (Python's rule)
+ * made a slice's IDENTITY observable: a copy of it - stored, passed,
+ * assigned, captured, returned - is the SAME array, so a hoisted slice
+ * would be one array shared by every iteration where the loop wrote a
+ * fresh one each time, and a later write through any copy would show in
+ * all of them. Any other use refuses the hoist. Complete via
+ * for_each_child: the bare name is a contained use only in a PLACE - a
+ * subscript, slice or foreach base, or an argument of len(), which keeps
+ * and returns none of them - and everything below a place is checked
+ * like any other child.
+ */
+static bool hoist_slice_contained(Construct *c, const UniqueId *uid)
+{
+    if (!c)
+        return true;
+    const Construct *place = nullptr;
+    bool every = false;                 /* every child is a place */
+    switch (ctag(c)) {
+    case ConstructType::id:
+        return static_cast<Identifier *>(c)->uid != uid;
+    case ConstructType::subscript:
+        place = static_cast<Subscript *>(c)->what.get();
+        break;
+    case ConstructType::slice:
+        place = static_cast<Slice *>(c)->what.get();
+        break;
+    case ConstructType::foreach_stmt:
+        place = static_cast<ForeachStmt *>(c)->container.get();
+        break;
+    case ConstructType::call: {
+        auto *ce = static_cast<CallExpr *>(c);
+        if (fr_builtin_name(ce->what.get()) == "len") {
+            c = ce->args.get();
+            every = true;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    bool ok = true;
+    Inferencer::for_each_child(c, [&](Construct *ch) {
+        const bool at_place = every || ch == place;
+        ok &= (at_place && ctag(ch) == ConstructType::id)
+            || hoist_slice_contained(ch, uid);
+    });
+    return ok;
+}
+
+/*
  * LEVER 3 increment 2 (plans/archived/native-gap-roadmap.md) - LOOP-INVARIANT
  * SLICE HOISTING. `for (...) { var sl = base[a:b]; ...reads... }`
  * evaluates an identical slice VIEW every iteration - the registration/
@@ -8570,15 +8627,29 @@ static bool hoist_refs_uid(Construct *c, const UniqueId *uid)
  *  - sl: written exactly by its decl (not in mut.len/mut.content - no
  *    reassign, no write-through, no mutating builtin), and not
  *    referenced by the loop's cond/inc (a pre-decl read must keep its
- *    original undefined-read semantics). Escaping READS are fine: a
- *    slice view's identity is unobservable (intptr shows the SHARED
- *    storage) and copies register independently.
+ *    original undefined-read semantics);
+ *  - and an ARRAY slice must not ESCAPE (hoist_slice_contained): since
+ *    question 3 (Python's rule) a copy of a slice is the same array, so
+ *    one hoisted slice stored by every iteration would be ONE array
+ *    where the loop stored a fresh one each time. A STRING slice may
+ *    escape: a string is immutable, its identity unobservable.
  *
  * The transform: Block{decl..., loop} with scope_free (the decl's slot
  * is function-frame-wide; resolution already happened). Both engines
  * benefit (the VM compiles the block as decl-then-loop). Only DIRECT
  * body statements are considered (no try-crossing, no nested blocks).
  */
+/* every body statement but the declaration `skip` keeps the slice
+ * `uid` contained (hoist_slice_contained) */
+static bool hoist_slice_uses_contained(Block *body, size_t skip,
+                                       const UniqueId *uid)
+{
+    for (size_t k = 0; k < body->elems.size(); k++)
+        if (k != skip && !hoist_slice_contained(body->elems[k].get(), uid))
+            return false;
+    return true;
+}
+
 static unique_ptr<Construct> try_hoist_loop_slices(unique_ptr<Construct> n)
 {
     Construct *body_c = nullptr;
@@ -8632,7 +8703,11 @@ static unique_ptr<Construct> try_hoist_loop_slices(unique_ptr<Construct> n)
             && mut.len.find(lhs->uid) == mut.len.end()
             && mut.content.find(lhs->uid) == mut.content.end()
             && !hoist_refs_uid(cond1, lhs->uid)
-            && !hoist_refs_uid(cond2, lhs->uid)) {
+            && !hoist_refs_uid(cond2, lhs->uid)
+            /* a STRING slice (a value) may escape - see the header
+             * comment */
+            && (sl->th_val
+                || hoist_slice_uses_contained(body, i, lhs->uid))) {
             const auto bound_ok = [&](const Construct *b) {
                 if (!b)
                     return true;              /* absent -> clamp */

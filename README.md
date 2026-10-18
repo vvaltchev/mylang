@@ -344,7 +344,9 @@ and you're willing to use `{ }` braces, you'll be automatically able to use it.
 No surprises. Strings are immutable like in `Python`, arrays can be defined using
 `[ ]` like in `Python`, and dictionaries can be defined using `{ }`, as well.
 The language also supports array-slices using the same `[start:end]` syntax used
-by `Python`.
+by `Python`, with Python's rule: a slice is a new array, and once you have it,
+assigning it or passing it shares it like any other array (see **Array**
+below).
 
 Said that, `MyLang` differs from `Python` and other scripting languages in several
 aspects:
@@ -985,7 +987,7 @@ pick()[0] = 10;             # scores is [10, 2, 3]
 pick()[1] += 5;             # [10, 7, 3]
 var old = pick()[2]++;      # old is 3, scores is [10, 7, 4]
 clone(scores)[0] = 9;       # allowed: writes into the copy, then gone
-scores[0:2][0] = 0;         # a slice is a copy: scores is unchanged
+scores[0:2][0] = 0;         # a slice is a new array: scores is unchanged
 ```
 
 The usual rules still hold through the value: a `const` refuses the write
@@ -1187,8 +1189,25 @@ runtime instead.
 
   * **Array**
     A mutable type for arrays and tuples (e.g. `[1,2,3]`). It can contain items
-    of different type and it supports writable slices. Array slices behave like
-    copies while, under the hood, they use copy-on-write techniques.
+    of different type and it supports writable slices. A **slice** `a[s:e]`
+    is a new array, separate from `a`: writing to either never changes the
+    other. Once taken, a slice is an array like any other, so assigning it,
+    passing it to a function or storing it in a container SHARES it - it is
+    not copied again (Python's rule):
+
+    ```C#
+    var a = [1, 2, 3, 4];
+    var s = a[1:3];          # [2, 3], a new array
+    var t = s;               # t is another name for the same slice
+    t[0] = 9;                # s is [9, 3]; a is still [1, 2, 3, 4]
+    func setz(x) { x[0] = 0; }
+    setz(s);                 # s is [0, 3]: the callee wrote the caller's slice
+    ```
+
+    Under the hood a slice is a copy-on-write view of `a`'s storage, so
+    taking one is cheap: nothing is copied until something writes to the
+    slice (through any name holding it) or to `a`. Two slice expressions
+    are two arrays, even with the same bounds, and so are two empty slices.
     `a[i]` reads or writes the element at `i`, counting from 0; a negative
     index counts from the end, so `a[-1]` is the last element and
     `a[-len(a)]` the first. Any other index - below `-len(a)`, or `len(a)`
@@ -1869,9 +1888,10 @@ result is defined, and identical in every engine:
     raises `OutOfBoundsEx` (at the container) when its next step comes,
     even if the length is back where it was. Moving elements under the loop
     would otherwise make it silently skip one element or visit another
-    twice. A loop over a **slice** walks a view that behaves as an
-    independent copy, so changing the array it was taken from never
-    affects it.
+    twice. A loop over a **slice** walks that slice: changing the array the
+    slice was taken from never affects it, while a change made through
+    another name holding the same slice is seen like any change to the
+    array being walked (a removed or moved element raises as above).
   * **A dictionary** loop visits each key the dictionary held when the loop
     started, once, in the dictionary's order, **if the key is still there
     when its turn comes**, with

@@ -3452,10 +3452,9 @@ static bool fmi_has_tainted_write(
  *
  * ⛔ THIS PASS ONLY ANSWERS THE QUESTION. Wiring the answer to an actual
  * borrow needs ONE more thing, which is NOT here: an element write through
- * a SLICE detaches it in place (`flat_store_core`'s
- * `arr.clone_internal_vec()`, `LValue::write_target`'s
- * `*container = container->clone()`), and that RELEASES the old
- * SharedObject - a reference a borrowed slot never took, so a refcount
+ * a SLICE materializes it in place (`flat_store_core`'s
+ * `arr.materialize_slice()`, `LValue::write_target`), and that RELEASES the
+ * old SharedObject - a reference a borrowed slot never took, so a refcount
  * underflow. Sliceness is a RUNTIME property, so the bind has to decide
  * per call and record it: a borrow mask on the window record, which
  * `pop_window` then consults, with a slice argument falling back to a real
@@ -6879,14 +6878,12 @@ private:
          * even a NAME. A write position needs an lvalue, and the write must
          * go where the call's would: through the parameter's own copy of
          * the handle. For an array that copy shares the storage, so the
-         * write reaches the caller's array either way - unless the caller's
-         * name holds a SLICE, whose copy is its own view and detaches on
-         * the write (README, slices). Pasted, the write landed in the
-         * caller's slice: `f(u)` with `x[0] = 77` changed u inlined and
-         * left it alone under -ni (RULE 2). Nothing at compile time tells
-         * a slice from an array, so every such argument is bound; a write
-         * INTO a struct the parameter holds needs the call's own copy for
-         * the same reason (a struct is a value).
+         * write reaches the caller's array either way. A SLICE's copy used
+         * to be its own view (2026-10-12: pasted, `f(u)` with `x[0] = 77`
+         * changed u inlined and left it alone under -ni); since question 3
+         * (Python's rule) it is the same slice, so for a name the rule is
+         * only conservative now. A write INTO a struct the parameter holds
+         * needs the call's own copy (a struct is a value).
          */
         if (param_written_through(f, i))
             return false;
