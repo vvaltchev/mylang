@@ -480,12 +480,18 @@ struct Renderer {
 
     /* ------------------------------ statements ------------------------ */
 
-    /* The declared type for a `var`/`const` decl: an explicit annotation,
-     * else best-effort from the rvalue's hints (typed-scalar / flat-array /
-     * literal), else "var". */
+    /* The keywords of a `var`/`const` decl, `[const] [opt] TYPE`: TYPE is an
+     * explicit annotation, else best-effort from the rvalue's hints
+     * (typed-scalar / flat-array / literal), else "var". A `dyn` or `opt`
+     * modifier is part of the declaration: `var dyn t = d ?? 7` without
+     * its `dyn` does not compile. */
     string decl_kw(const Identifier *lv, const Construct *rv, bool is_const)
     {
-        const string prefix = is_const ? "const " : "";
+        if (lv->dyn_mod)            /* var dyn / var opt dyn / const dyn */
+            return string(is_const ? "const " : "var ") +
+                   (lv->opt_mod ? "opt " : "") + "dyn";
+        const string prefix = string(is_const ? "const " : "") +
+                              (lv->opt_mod ? "opt " : "");
         if (lv->decl_type != DeclType::none)        /* explicit annotation */
             return prefix + decl_type_kw(lv->decl_type);
         if (rv) {                                   /* best-effort inference */
@@ -502,7 +508,8 @@ struct Renderer {
             if (dynamic_cast<const LiteralBool *>(rv))  return prefix + "bool";
             if (dynamic_cast<const LiteralStr *>(rv))   return prefix + "str";
         }
-        return is_const ? "const" : "var";
+        return string(is_const ? "const" : "var") +
+               (lv->opt_mod ? " opt" : "");
     }
 
     int cur_level = 0;   /* the enclosing statement's indent, for an inlined

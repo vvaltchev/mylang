@@ -18380,6 +18380,17 @@ static const std::vector<test> tests =
         "assert(find(s, \"int b\") == none);" } },
     { "reflect: layout rejects a non-struct",
       { "layout(42);" }, &typeid(TypeErrorEx) },
+    /* `var dyn t = ...` rendered as `var t = ...`, which would not
+     * compile (a dyn initializer needs the dyn) */
+    { "coderender: a dyn / opt declaration keeps its modifier",
+      { "func dd(dyn d, int k) { var dyn t = d ?? 7;"
+        " var opt u = k > 0 ? k : none; var dyn a, b = [d, k];"
+        " return u ?? t; }",
+        "assert(dd(3, 0) == 3 && dd(3, 4) == 4);",
+        "var dyn s = show(dd);",
+        "assert(find(s, \"    var dyn t = d ?? 7;\\n\") != none);",
+        "assert(find(s, \"    var opt u = k > 0 ? k : none;\\n\") != none);",
+        "assert(find(s, \"    var dyn a, b = [d, k];\\n\") != none);" } },
     { "reflect: specializations of a plain function is empty",
       { "func f(int a) => a + 1; assert(len(specializations(f)) == 0);" } },
     { "reflect: specializations rejects a non-function",
