@@ -18433,6 +18433,26 @@ static const std::vector<test> tests =
         "assert(show(u = (u = 3) + 1) == \"u = (u = 3) + 1\");" } },
     { "reflect: show() renders an expression (folded)",
       { "assert(show(2 + 3 * 4) == \"14\");" } },
+    /* a float literal printed with %g: six significant digits, so it read
+     * back as another number (1234567.0 as 1.23457e+06) */
+    { "coderender: a float literal renders every digit, as a float",
+      { "assert(show(1234567.0) == \"1234567.0\");",
+        "assert(show(2.0 / 3) == \"0.6666666666666666\");",
+        "assert(float(show(2.0 / 3)) == 2.0 / 3);",
+        "assert(show(0.1) == \"0.1\");",
+        "assert(show(3.0) == \"3.0\");",
+        "assert(show(-2.5) == \"-2.5\");",
+        "assert(show(1e300) == \"1e+300\");",
+        "assert(show(5e-324) == \"5e-324\");",
+        "assert(float(show(math_pi * 1.0)) == math_pi);",
+        /* a float inside a baked constant: the print form kept six
+         * decimals (`[0.333333, 2.500000]`) */
+        "func bk() { const A = [1.0 / 3, 2.5]; const D = {\"k\": 0.1};"
+        " return A[runtime(0)] + D[\"k\"]; }",
+        "assert(bk() == 1.0 / 3 + 0.1);",
+        "var dyn s = show(bk);",
+        "assert(find(s, \"[0.3333333333333333, 2.5];\") != none);",
+        "assert(find(s, \"{\\\"k\\\": 0.1};\") != none);" } },
     { "reflect: show() renders an expression tree",
       { "assert(show([1, 2, 3]) == \"[1, 2, 3]\");" } },
     /* a bare `catch { }` rendered as `catch () {`, which does not parse */

@@ -7,12 +7,14 @@
 #include "eval.h"
 #include "evalvalue.h"
 #include "structtype.h"
+#include "cyclewalk.h"      /* a baked value that contains itself */
 #include "reflect.h"        /* reflect_typeof for LiteralObj element types */
 
 #include <cmath>
 #include <sstream>
 #include <string>
 #include <cstdio>
+#include <cstdlib>
 
 using std::string;
 
@@ -35,15 +37,25 @@ int op_prec(Op op)
 const int PREC_POSTFIX = 9;    /* call / subscript / member */
 const int PREC_PRIMARY = 10;   /* literal / id / parenthesized */
 
-/* A readable float literal: %g, with ".0" when it would otherwise look int. */
+/* A float literal that reads back as the SAME double, and as a float: the
+ * fewest significant digits (%.*g, 1 to 17 - 17 always round-trips a
+ * double) whose strtod is the value, with ".0" when the text would read as
+ * an int. `%g` alone kept six digits: 1234567.0 printed as 1.23457e+06. */
 string fmt_float(float_type v)
 {
     if (std::isnan(v))
         return "nan";                  /* never C's sign-bit `-nan` */
+    if (std::isinf(v))
+        return v < 0 ? "-inf" : "inf";
+    const double d = static_cast<double>(v);
     char buf[64];
-    snprintf(buf, sizeof buf, "%g", static_cast<double>(v));
+    for (int prec = 1; prec <= 17; prec++) {
+        snprintf(buf, sizeof buf, "%.*g", prec, d);
+        if (std::strtod(buf, nullptr) == d)
+            break;
+    }
     string s(buf);
-    if (s.find_first_of(".eEni") == string::npos)   /* no '.', exp, inf, nan */
+    if (s.find_first_of(".e") == string::npos)   /* no '.', no exponent */
         s += ".0";
     return s;
 }
@@ -227,10 +239,9 @@ struct Renderer {
             return;
 
         case ConstructType::lit_obj: {
-            /* a baked const array/dict/struct - its to_string is code-like */
-            const EvalValue &v =
-                static_cast<const LiteralObj *>(c)->literal_value();
-            o << v.get_type()->to_string(v);
+            /* a baked const array/dict/struct */
+            CycStack st;
+            value(static_cast<const LiteralObj *>(c)->literal_value(), st);
             return;
         }
 
@@ -406,6 +417,94 @@ struct Renderer {
         case ConstructType::for_stmt:
         case ConstructType::for_range:
             o << "/* " << c->name << " */";
+            return;
+        }
+    }
+
+    /* A baked constant's VALUE as code: its print form - which is code
+     * already (`[1, 2]`, `{"k": 1}`, `P(x: 1, y: 2)`, `box(5)`) - except
+     * that a float is written to read back as the same double (fmt_float);
+     * the print form keeps six decimals (`[0.333333]`). A value that
+     * contains itself renders its back edge as the print form does,
+     * `[...]` / `{...}` / `Name(...)` (cyclewalk.h). */
+    void value(const EvalValue &v, CycStack &st)
+    {
+        switch (v.get_type()->t) {
+
+        case Type::t_float:
+            o << fmt_float(v.get<float_type>());
+            return;
+
+        case Type::t_arr: {
+            const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+            CycKey k;
+            const bool keyed = cyc_key(v, k);
+            if (keyed && st.contains(k)) {
+                o << "[...]";
+                return;
+            }
+            CycGuard g(st, k, keyed);
+            o << "[";
+            for (size_type i = 0; i < a.size(); i++) {
+                if (i) o << ", ";
+                value(vm_arr_elem(a, i), st);
+            }
+            o << "]";
+            return;
+        }
+
+        case Type::t_dict: {
+            const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+            const CycKey k = cyc_key_obj(&d);
+            if (st.contains(k)) {
+                o << "{...}";
+                return;
+            }
+            CycGuard g(st, k);
+            o << "{";
+            bool first = true;
+            for (const auto &kv : d.get_ref()) {
+                if (!first) o << ", ";
+                first = false;
+                value(kv.first, st);
+                o << ": ";
+                value(kv.second.get(), st);
+            }
+            o << "}";
+            return;
+        }
+
+        case Type::t_struct: {
+            const StructObject &s = *v.get_ref<intrusive_ptr<StructObject>>();
+            const StructTypeDef &def = *s.def;
+            if (s.boxed) o << "box(";
+            o << def.name->val;
+            CycKey k;
+            const bool keyed = cyc_key(v, k);
+            if (keyed && st.contains(k)) {
+                o << (s.boxed ? "(...))" : "(...)");
+                return;
+            }
+            CycGuard g(st, k, keyed);
+            o << "(";
+            for (size_t i = 0; i < def.fields.size(); i++) {
+                if (i) o << ", ";
+                o << def.fields[i].name->val << ": ";
+                value(s.is_pod() ? s.pod_get(static_cast<int>(i))
+                                 : s.fields[i].get(), st);
+            }
+            o << (s.boxed ? "))" : ")");
+            return;
+        }
+
+        case Type::t_box:
+            o << "box(";
+            value(v.get_ref<intrusive_ptr<BoxObj>>()->v, st);
+            o << ")";
+            return;
+
+        default:
+            o << v.to_string_repr();
             return;
         }
     }

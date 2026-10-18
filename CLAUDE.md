@@ -6742,7 +6742,9 @@ are unchanged.
     container shared at two places but not on the path is walked at each,
     as before (so a DAG is still copied twice).
   - the answers, one per walk kind: rendering writes `[...]` / `{...}` /
-    `Name(...)` / `box(Name(...))` (`cyc_render()`); `hash` hashes a back
+    `Name(...)` / `box(Name(...))` (`cyc_render()`, and the decompiler's
+    own `Renderer::value`, coderender.cpp, with a local stack); `hash`
+    hashes a back
     edge as its DEPTH, `cyc_backedge_hash` (`cyc_hash()`) - a CLASS
     instance hashes and compares by identity before any guard, entering
     no field, so no cycle passes through one there; `==` uses the PAIR
@@ -7705,7 +7707,10 @@ headless-testable behind a thin terminal shell:
   target rendered as `/* BreakStmt */` and friends. Only a statement kind in
   an operand position (which no tree builds) keeps that comment. A function
   with no name renders as the lambda expression `func [caps] (params) ...`,
-  wherever it appears. Backs the `show(f)` builtin
+  wherever it appears. A float renders with the fewest digits that read
+  back as the same double (`fmt_float`; `%g` kept six), inside a baked
+  constant too: `Renderer::value` writes a LiteralObj's value in its print
+  form but for the floats. Backs the `show(f)` builtin
   (a **dev-only** builtin — see the reflection-builtins note below; reserved in
   scripts) and the REPL `:show <name>` (which also renders the `<name>$N`
   clones). It

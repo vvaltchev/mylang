@@ -3619,7 +3619,9 @@ folded), inlined call bodies spliced in and annotated, and a flat array's
 element type shown as `array<int>`. Best-effort and not round-trippable, but
 every statement and expression renders as code: a lambda as
 `func [captures] (params) => ...`, a multi-assignment as `a, b = ...`, a
-named argument with its label. Passing **any other
+named argument with its label, a float with every digit it needs to read
+back as the same number (`0.6666666666666666`, not `0.666667`). Passing
+**any other
 argument** treats it as an **expression** and renders its optimized tree —
 `show(2 + 3 * 4)` is `"14"`. In the REPL, `:show <name>` prints this for a
 function **and** its `name$N` template-instance / specialization clones, with
