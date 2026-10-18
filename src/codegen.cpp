@@ -4232,8 +4232,10 @@ struct Codegen {
      *   min(a, b) = b < a ? b : a         (the FIRST argument wins a tie)
      *   max(a, b) = b > a ? b : a
      * Each argument is compiled ONCE, in order, before the branch. "Proven
-     * int" is `th == i && !th_bool`: a bool is stamped `i` too, and
-     * `min(true, 5)` must return the BOOL. Any other shape - a float, a
+     * int" is `th == i && !th_bool`: a bool is stamped `i` too, and the
+     * builtin converts a selected bool to the int 0/1 when an int is among
+     * the arguments (`min(true, 5)` is 1) - the arms below would store the
+     * bool as it is. Any other shape - a float, a
      * dyn, one array argument, three arguments - keeps the generic call
      * and its throws. The tree-walker still calls the builtin, so the
      * engine differential is this lowering's oracle.
