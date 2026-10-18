@@ -5832,6 +5832,36 @@ static const std::vector<test> tests =
         "assert(lt(1.5, 2.5) && !lt(2.5, 1.5));",
         "assert(eq(2.0, 2.0) && !eq(2.0, 3.0));",
         "assert(lt(1, 2) && eq(2, 2.0));" } },   /* int arg promotes */
+    /*
+     * M8: an int operation inside a FLOAT expression computes in int.
+     * The operators apply left to right, so `i / 3 * 0.5` is (i / 3) *
+     * 0.5 - a truncating division, then the float multiply - and `big *
+     * 4 * 0.5` wraps before it multiplies by 0.5, exactly as the boxed
+     * path (--no-opt all, -nti) computes them. The typed float chain
+     * read every operand as a float first, and a typed INT node asked
+     * for a float value (`(i / 3) * 0.5`, `j / 2 < 3.5`, `float f = j /
+     * 2`) computed its own operators in float too.
+     */
+    { "typed: an int operation inside a float expression computes in int",
+      { "var i = int(runtime(2)); var j = int(runtime(7));",
+        "var big = int(runtime(4611686018427387904));",
+        "var mx = int(runtime(9223372036854775807));",
+        "var mn = int(runtime(-9223372036854775807)) - 1;",
+        "assert(i / 3 * 0.5 == 0.0);",
+        "assert((i / 3) * 0.5 == 0.0);",
+        "assert(1.0 * (j / 2) == 3.0);",
+        "assert(big * 4 * 0.5 == 0.0);",
+        "assert(mx + 1 + 0.5 == -9223372036854775808.0);",
+        "assert(-mn * 0.5 == -4611686018427387904.0);",
+        "assert(j % 4 / 2 * 1.5 == 1.5);",
+        "assert(j / 2 * 2 * 0.25 == 1.5);",
+        "assert(j * 0.5 / 2 == 1.75);",
+        "assert(j / 2 < 3.5);",
+        "float f = j / 2; assert(f == 3.0);",
+        "var acc = 0.5; acc += j / 2; assert(acc == 3.5);",
+        "func g(float x) => x * 2.0;",
+        "assert(g(j / 2) == 6.0);",
+        "var a = [7, 9]; assert(a[0] / 2 * 1.0 == 3.0);" } },
     { "a >2-operand comparison chain stays boxed and correct",
       /* a == b == c is (a==b)==c: ch(1,1,1) = (true)==1 = true;
        * ch(2,2,0) = (true)==0 = false. */

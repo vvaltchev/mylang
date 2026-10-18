@@ -4888,6 +4888,16 @@ float-heavy reductions; the once-slower-than-Python primes benchmark is now
 faster. `th` is copied by `copy_base_fields` (clones/inliner preserve it), and
 the typed eval's `get<int_type>()` throws `TypeError` if inference were ever
 wrong (a safety net, not silent corruption). See `plans/archived/type-inference.md` M8.
+**⛔ A FLOAT CHAIN'S INT PREFIX IS AN INT NODE (2026-10-09).** A chain
+typed `f` may begin with int operands, and the operators between them
+are INT operators (`i / 3 * 0.5` divides ints, `big * 4 * 0.5` wraps
+first) - the float loop reads every operand as a float, so
+`split_int_prefix` moves the leading int operands into their own
+`Cat::arith` / `i` node, the chain's first operand. And a `kind == i`
+arith/neg node asked for `eval_float` computes in int and converts the
+RESULT. Both were wrong in every typed engine (RULE 2 against
+`--no-opt all`); pinned by the `typed: an int operation inside a float
+expression` `-rt` entry.
 **A base template's body is NOT specialized** (`FuncDeclStmt::is_template`,
 skipped in `specialize_types`): it is a monomorphization shell, cloned per
 signature (each clone specialized separately) and run boxed for indirect
