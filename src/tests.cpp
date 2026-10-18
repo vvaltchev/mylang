@@ -18331,6 +18331,27 @@ static const std::vector<test> tests =
     { "reflect: typeof a flat struct array",
       { "struct Pt { int x; int y; }",
         "assert(typestr([Pt(1, 2), Pt(3, 4)]) == \"array<Pt>\");" } },
+    /* the RUNTIME type of a box (a typestr the compiler cannot fold: a
+     * template base called through a dyn value) rendered as `?` for a
+     * box of a scalar and as the struct's name for a box<P> */
+    { "reflect: the runtime type of a box is box<T>",
+      { "struct P11 { int x; float y; }",
+        "func t11(x) { return typestr(x); }",
+        "func k11(x) { return kindstr(x); }",
+        "var dyn f = runtime(t11);",
+        "var dyn g = runtime(k11);",
+        "assert(f(box(3)) == \"box<int>\");",
+        "assert(f(box(1.5)) == \"box<float>\");",
+        "assert(f(box(true)) == \"box<bool>\");",
+        "assert(f(box(\"s\")) == \"box<str>\");",
+        "assert(f(box(P11(x: 1, y: 2.0))) == \"box<P11>\");",
+        "assert(f([box(2)]) == \"array<box<int>>\");",
+        /* a box<int> and a box<float> are two types, as are two structs */
+        "assert(f([box(2), box(2.5)]) == \"array<dyn>\");",
+        "struct Q11 { int x; }",
+        "assert(f([P11(1, 2.0), Q11(3)]) == \"array<dyn>\");",
+        "assert(f(P11(1, 2.0)) == \"P11\");",
+        "assert(g(box(3)) == \"box\" && g(box(P11(1, 2.0))) == \"box\");" } },
     { "reflect: signature of a function",
       { "func f(int a, float b) => a + b;",
         "assert(signature(f) == \"func f(int a, float b)\");" } },
@@ -22127,6 +22148,14 @@ static const std::vector<repl_test> repl_tests =
     { ":tree does not commit its declarations",
       { { ":tree var wq = 5", "Int(5)" },
         { "wq", "Undefined variable 'wq'" } } },
+
+    /* the runtime type of a box (:type of an expression, a dyn global's
+     * row in :globals) rendered as `?` and as the boxed struct's name */
+    { ":type and :globals give a box's type as box<T>",
+      { { ":type box(1)", "box<int>" },
+        { "struct PB { int x; }", "" },
+        { "var dyn gb = box(PB(1))", "" },
+        { ":globals", "gb : box<PB>" } } },
 
     { ":help and an unknown command",
       { { ":help", ":source" },
