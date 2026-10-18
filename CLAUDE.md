@@ -4790,7 +4790,10 @@ decisions behind it: `plans/archived/type-inference.md`,
   init, a foreach / catch variable); inference overwrites them later, and
   the tree-walker applies rv_coerce CHECKED (coerce_to_decl_type, the
   whole assignment's caret), as CoerceNumV does, so a stamp that meets
-  a misfit (-nti) is the same error in both engines. A local whose type
+  a misfit (-nti) is the same error in both engines. A store into a
+  DECLARED numeric variable (`float x; x = n`) gets its use's
+  decl_type there too - the one resolve_names carries from the
+  declaration, later. A local whose type
   only INFERENCE widens still differs there (an open design question).
   Built from its own values, `[1.5]`
   for an `array<float?>` was flat floats and a later `none` store failed.

@@ -3235,18 +3235,20 @@ pure_place_annot(const Construct *lv, const PureAnnots &m,
     return tmp.back().get();
 }
 
-/* a declared identifier's annotated type (a struct-typed one has only
- * decl_struct) */
+/* a declared identifier's annotated type (a struct-typed or a numeric
+ * one has only decl_type / decl_struct) */
 static const TypeAnnot *
 pure_decl_annot(const Identifier *id, std::vector<unique_ptr<TypeAnnot>> &tmp)
 {
     if (id->decl_annot)
         return id->decl_annot.get();
-    if (id->decl_type != DeclType::strct || !id->decl_struct)
+    const bool num =
+        id->decl_type == DeclType::i || id->decl_type == DeclType::f;
+    if (!num && (id->decl_type != DeclType::strct || !id->decl_struct))
         return nullptr;
     auto t = make_unique<TypeAnnot>();
-    t->kind = DeclType::strct;
-    t->strct = id->decl_struct;
+    t->kind = id->decl_type;
+    t->strct = num ? nullptr : id->decl_struct;
     tmp.push_back(std::move(t));
     return tmp.back().get();
 }
@@ -3326,6 +3328,18 @@ pure_stamp_stores(Construct *n, PureAnnots &m,
         return;
     }
     const Construct *lv = e->lvalue.get();
+    /* a declared numeric variable: the store coerces by the use's
+     * decl_type, which resolve_names carries from the declaration - later,
+     * so a folded call stored an int into a `float x` */
+    if (e->op == Op::assign && lv && ctag(lv) == ConstructType::id) {
+        auto *id = static_cast<Identifier *>(e->lvalue.get());
+        auto it = m.find(id->uid);
+        const DeclType k =
+            it != m.end() ? annot_num(it->second) : DeclType::none;
+        if (k != DeclType::none && id->decl_type == DeclType::none)
+            id->decl_type = k;
+        return;
+    }
     if (e->op != Op::assign || !lv
         || (ctag(lv) != ConstructType::subscript
             && ctag(lv) != ConstructType::member))

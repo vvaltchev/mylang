@@ -115,6 +115,22 @@ struct test {
 
 static const std::vector<test> tests =
 {
+    /* RULE 2: a pure call folded at parse time stored an int into a
+     * DECLARED `float x` - its use's decl_type, which the store coerces
+     * by, came from resolve_names, after the fold: `fv(1)` gave `1` and
+     * `fv(int(runtime(1)))` `1.000000` */
+    { "a pure call folded at parse time widens a typed variable's store "
+      "as the run-time call does", {
+        "pure func fv(int n) { float x = 0.5; x = n; return x; }",
+        "assert(str(fv(1)) == \"1.000000\");",
+        "assert(str(fv(1)) == str(fv(int(runtime(1)))));",
+        "pure func fb(bool b) { int y = 0; var z = (y = b); return [y, z]; }",
+        "assert(str(fb(true)) == str(fb(runtime(1) == 1)));",
+        "pure func fs(int n) { float x = 0.5; var r = 0;",
+        "    for (int x = 0; x < 1; x++) { x = n; r = x; }",
+        "    x = n; return str(x) + \"/\" + str(r); }",
+        "assert(str(fs(1)) == str(fs(int(runtime(1)))));" } },
+
     /* README *Storing through a value*: an in-place builtin works on a
      * value - through a `dyn` callee too, which raised NotLValueEx */
     { "an in-place builtin called through a dyn works on a value", {
