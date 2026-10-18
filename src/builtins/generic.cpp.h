@@ -527,10 +527,18 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
          * whose general elements carry the const flag.
          */
         int fmode = ctx->const_ctx ? 0 : flat_hint;
+        /* ...and every element HAS the hinted type: a `dyn` callback's
+         * bool widens and a misfit raises (flat_hint_value) - it spilled
+         * the array to general, a string in an array<int> (RULE 1) */
+        const ArrHint fit = fmode == 1 ? ArrHint::flat_i
+                          : fmode == 2 ? ArrHint::flat_f
+                          : fmode == 3 ? ArrHint::flat_b
+                          : ArrHint::dflt;
         SharedArrayObj::ivec_type fi;
         SharedArrayObj::fvec_type ff;
         SharedArrayObj::bvec_type fb;
-        auto push_res = [&](EvalValue &&v) {
+        auto push_res = [&](EvalValue &&v0) {
+            EvalValue v = flat_hint_value(v0, fit);
             if (fmode == 1 && v.is<int_type>()) {
                 fi.push_back(v.get<int_type>());
                 return;
@@ -633,10 +641,17 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
 
         if (!is_filter) {
 
+            /* a typed destination's element type, as for an array */
+            const int fh = ctx->const_ctx ? 0 : flat_hint;
+            const ArrHint fit = fh == 1 ? ArrHint::flat_i
+                              : fh == 2 ? ArrHint::flat_f
+                              : fh == 3 ? ArrHint::flat_b
+                              : ArrHint::dflt;
             SharedArrayObj::vec_type result;
             for (auto const &e : snap)
-                result.emplace_back(inv.call(e.first, e.second.get()),
-                                    ctx->const_ctx);
+                result.emplace_back(
+                    flat_hint_value(inv.call(e.first, e.second.get()), fit),
+                    ctx->const_ctx);
             return SharedArrayObj(std::move(result));
         }
 
