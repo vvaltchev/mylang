@@ -18406,6 +18406,15 @@ static const std::vector<test> tests =
         "assert(find(s, \"inlined ?\") == none);" } },
     { "reflect: specializations rejects a non-function",
       { "specializations(42);" }, &typeid(TypeErrorEx) },
+    /* a struct declared in a function body rendered as `struct P8 { ... }`,
+     * its fields and const members dropped */
+    { "coderender: a struct declared in a function body shows its fields",
+      { "func sp(int n) { struct P8 { int x; float y; array<int> a;"
+        " const K = 2; } var p = P8(n, 1.5, [n]); return p.x + P8.K; }",
+        "assert(sp(3) == 5);",
+        "assert(find(show(sp), \"    struct P8 {\\n        int x;\\n"
+        "        float y;\\n        array<int> a;\\n"
+        "        const K = 2;\\n    }\\n\") != none);" } },
     { "reflect: show() renders a function as code",
       /* sf reads only its param, so it is auto-pure (rendered with a pure
        * marker), then the signature */

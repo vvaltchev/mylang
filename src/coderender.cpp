@@ -677,9 +677,26 @@ struct Renderer {
         }
 
         case ConstructType::struct_decl: {
-            auto *s = static_cast<const StructDeclStmt *>(c);
-            o << (s->def->is_class ? "class " : "struct ")
-              << s->def->name->val << " { ... }\n";
+            /* the declaration as written: each field with its declared
+             * type, then the const members (folded to their values) */
+            const StructTypeDef *def =
+                static_cast<const StructDeclStmt *>(c)->def;
+            o << (def->is_class ? "class " : "struct ") << def->name->val;
+            if (def->fields.empty() && def->consts.empty()) {
+                o << " {}\n";
+                break;
+            }
+            o << " {\n";
+            for (const FieldDef &f : def->fields)
+                o << ind(level + 1) << reflect_field_type(f) << " "
+                  << f.name->val << ";\n";
+            for (const auto &k : def->consts) {
+                o << ind(level + 1) << "const " << k.first->val << " = ";
+                CycStack st;
+                value(k.second, st);
+                o << ";\n";
+            }
+            o << ind(level) << "}\n";
             break;
         }
 

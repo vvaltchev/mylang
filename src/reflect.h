@@ -12,6 +12,7 @@
 
 class EvalValue;
 class FuncDeclStmt;
+struct FieldDef;
 struct FuncDescriptor;
 struct StructTypeDef;
 
@@ -24,6 +25,11 @@ std::string reflect_func_sig(const FuncDescriptor *f);
 
 /* A struct type's constructor signature ("Point(int x, int y)"). */
 std::string reflect_struct_ctor(const StructTypeDef *def);
+
+/* A struct field's declared type, as its declaration writes it ("int",
+ * "opt dict", "array<int>?", "P") - also what the decompiler renders a
+ * struct declaration's fields with. */
+std::string reflect_field_type(const FieldDef &f);
 
 /* A struct's in-memory layout (POD offsets/size, or boxed slots). */
 std::string reflect_layout(const StructTypeDef *def);
