@@ -4720,8 +4720,17 @@ decisions behind it: `plans/archived/type-inference.md`,
   unconstrained inputs, e.g. a func only ever passed as a value); a func with no
   value-returning path → `none` (it contributed `none` to `ret_acc`). An
   unresolved identifier / callee defers to Unknown (so the enclosing var isn't
-  forced to `dyn`, and the runtime `UndefinedVariableEx` surfaces); a *builtin*
-  used as a value is genuinely `dyn`.
+  forced to `dyn`, and the resolver's FIX-1 `UndefinedVariableEx` surfaces); a
+  *builtin* used as a value is genuinely `dyn`.
+  **⛔ A LOCAL THAT RECEIVED VALUES IS NOT UNCONSTRAINED (2026-10-09).** One
+  whose every contribution stayed Unknown - `var y = nosuch(1)`, a copy of a
+  parameter no call site feeds - finalizes `dyn`, not `none`, and is
+  `untyped_dyn`: exempt from the mandatory-dyn rule (`TypeSym::got_unknown`,
+  set in `contribute`). As `none` it made the inferencer, which runs before
+  the resolver, refuse `y + 1` with "possibly-none (type 'none')" and hide
+  the undefined name. The CHECK PASS must defer on an Unknown operand the
+  same way (the arithmetic and unary checks did, the ordering comparison did
+  not: "cannot compare '?'" inside a `defined()`-guarded branch, #135).
 - **Null narrowing** (`check_if`/`narrow_target`, check pass only): inside a
   proven branch a nullable var reads as non-opt — `if (x != none)` / `if (x)`
   (then), `if (x == none) ... else` (else), and the guard clause
