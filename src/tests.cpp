@@ -116,6 +116,31 @@ struct test {
 static const std::vector<test> tests =
 {
     /*
+     * The struct-foreach DIRECT read (each `p.x` a byte read of the array
+     * element, `p` never bound) serves only a field read that compiles
+     * through the typed int/float path. A read with no such hint - `p.x`
+     * from an inlined body whose parameter is `dyn`, a bool field used as
+     * a value (a bool takes the boxed path) - read the unbound slot: the
+     * VM raised "Expected dict object" where the tree-walker printed 3.
+     */
+    { "struct foreach: a field read the direct path cannot serve binds the "
+      "loop variable whole (an inlined dyn body, a bool field as a value)", {
+        "struct A { int x; }",
+        "func use(dyn p) => p.x;",
+        "var fl = [A(1), A(2)];",
+        "var k = 0;",
+        "foreach (var p in fl) { k += use(p); }",
+        "assert(k == 3);",
+        "struct B { bool b; int n; }",
+        "var bl = [B(true, 1), B(false, 2)];",
+        "var s = \"\";",
+        "foreach (var q in bl) { s += str(q.b) + str(q.n) + \" \"; }",
+        "assert(s == \"true1 false2 \");",
+        "var c = 0;",
+        "foreach (var q in bl) { if (q.b) c += q.n; }",
+        "assert(c == 1);" } },
+
+    /*
      * #97 R2/R2b: a closure whose captures are all frame locals is built
      * by the lean constructor, which copies an int/float/bool capture by
      * its payload WORD and anything else by the ordinary value copy.
