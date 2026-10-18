@@ -140,6 +140,33 @@ static const std::vector<test> tests =
         "foreach (var q in bl) { if (q.b) c += q.n; }",
         "assert(c == 1);" } },
 
+    /* A construction with more than 16 arguments was refused by the VM's
+     * codegen (NotLoweredEx: "construct not lowered natively") - the POD,
+     * the planned, the checked and the boxed constructor alike - while the
+     * tree-walker built it */
+    { "struct: a construction with more than 16 fields, POD and boxed", {
+        "struct W { int a1; int a2; int a3; int a4; int a5; int a6; int a7;",
+        "  int a8; int a9; int a10; int a11; int a12; int a13; int a14;",
+        "  int a15; int a16; int a17; }",
+        "var w = W(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17);",
+        "assert(w.a17 == 17 && w.a1 == 1 && w.a9 == 9);",
+        "var r = int(runtime(17));",
+        "var w2 = W(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, r);",
+        "assert(w2.a17 == 17);",
+        "var dyn d = runtime(5);",
+        "var w3 = W(1, 2, 3, 4, d, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, r);",
+        "assert(w3.a5 == 5 && w3.a17 == 17);",
+        "var ws = [W(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, r)];",
+        "append(ws, W(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,",
+        "             r + 1));",
+        "assert(ws[1].a17 == 18 && array_storage(ws) == \"struct\");",
+        "struct V { int a1; int a2; int a3; int a4; int a5; int a6; int a7;",
+        "  int a8; int a9; int a10; int a11; int a12; int a13; int a14;",
+        "  int a15; int a16; str s; }",
+        "var v = V(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,",
+        "          str(r));",
+        "assert(v.s == \"17\" && v.a16 == 16);" } },
+
     /*
      * #97 R2/R2b: a closure whose captures are all frame locals is built
      * by the lean constructor, which copies an int/float/bool capture by
