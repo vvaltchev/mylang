@@ -21443,6 +21443,12 @@ static const std::vector<repl_test> repl_tests =
         { "var bf = box(1.5)", "" },
         { "*bb = bf", "a box<int> cannot hold 'box<float>' at line" } } },
 
+    /* the forward-reference half of the opt-field rule says what the
+     * parser's half says (it left out `box`) */
+    { "struct: an opt forward struct field names every opt-able kind",
+      { { "struct Fw7 { opt Gw7 g; } struct Gw7 { int v; }",
+          "'opt' is only allowed on dyn/array/dict/box and class-typed" } } },
+
     /* the REPL's undefined name is a run-time error, and a local fed by
      * one is untyped: it was refused at compile time over `y5 + 1`
      * ("type 'none'") */

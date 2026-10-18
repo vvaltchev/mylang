@@ -228,5 +228,5 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 
     struct A1 { opt B1 u; opt B1 w; } struct A2 {
                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-'opt' is only allowed on dyn/array/dict and class-typed fields
+'opt' is only allowed on dyn/array/dict/box and class-typed fields
 >> 
