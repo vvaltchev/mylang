@@ -2009,6 +2009,20 @@ void Inferencer::infer_one(Block *rootBlock)
                 s->type = (s->is_param || s->is_loopvar || untyped)
                               ? A.dyn_ty() : A.none_ty();
                 s->untyped_dyn = untyped;
+            } else if (s->got_unknown && !s->is_param && !s->is_loopvar) {
+                /* A NUMERIC local that also received an untyped value -
+                 * `var y = x; if (c) y = 1;` with `x` a parameter no call
+                 * site feeds - keeps its type, and the untyped value is
+                 * a `dyn` coerced at the store (README: a concrete var
+                 * receiving a dyn), as the parameter's `dyn` would have
+                 * been had it been known in the fixpoint. Without the
+                 * store's check an indirect call passing 2.5 left a float
+                 * in an `int` slot: the JIT printed its bits as an int,
+                 * the VM aborted, the tree-walker threw. */
+                const StaticTypeRef ty = static_type_resolve(s->type);
+                if (ty->kind == StaticTypeKind::Int
+                        || ty->kind == StaticTypeKind::Float)
+                    s->coerces_dyn = true;
             }
             if (s->opt_decl)
                 s->type = A.with_opt(s->type, true);
