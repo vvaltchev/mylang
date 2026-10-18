@@ -18,22 +18,35 @@ at run time (#49).
 
 ## 3. Does a slice alias like any other array once assigned?
 
-**Python's rule.** A name, a list element and a parameter hold a
-REFERENCE to an object. Assigning, passing an argument and storing into
-a list never copy: they share the object. A new list is made only by an
-explicit operation - a slice `a[i:j]` (always a fresh shallow copy),
-`list(a)`, `a.copy()`, `a + b`. So the slice EXPRESSION copies, and its
-result is an ordinary list from then on.
+**The two rules, side by side** (`var s = a[1:3];` throughout):
 
-**MyLang's rule today.** An array is shared exactly as in Python. A
-slice expression gives an array whose writes never reach the source,
-and the reverse - as in Python. But an UNWRITTEN slice stays a view (a
-window over the source's storage, copy-on-write), and EVERY copy of a
-view - an assignment, an argument, an element stored or read back -
-is again a separate array. The first write or append gives the slice
-its own storage; from then on it is an ordinary array and IS shared.
-So whether `t = s` shares depends on where `s`'s value came from and on
-whether anything wrote to it yet.
+- **Taking the slice.** In Python, `a[1:3]` builds a NEW list holding
+  copies of the two elements. In MyLang, `a[1:3]` builds no new array:
+  `s` is a VIEW, a window onto `a`'s storage. Either way a later write
+  to `a` does not show in `s` (MyLang copies the window out first).
+- **Assigning it, `var t = s;`.** In Python, `t` is a second name for
+  the SAME list, so `t[0] = 9` makes `s` read `[9, 3]` too. In MyLang,
+  `t` is a second, INDEPENDENT view of the window; `t[0] = 9` first
+  copies the window into a new array that only `t` holds, then writes
+  there, so `s` still reads `[2, 3]`.
+- **Passing it, `f(s)`.** In Python, the parameter is the SAME list,
+  so a write inside `f` is seen by the caller. In MyLang, the parameter
+  is another independent view; a write inside `f` goes into a private
+  copy that is thrown away when `f` returns, so the caller's `s` is
+  unchanged.
+- **Storing it, `var box = [s];`.** In Python, `box[0]` is the SAME
+  list as `s`. In MyLang, `box[0]` is another independent view, and
+  every read of it gives yet another.
+- **After `s` itself is written.** In MyLang, the first write or
+  append to `s` (`s[0] = 9`, `append(s, 5)`, ...) copies the window into
+  a new array that `s` holds; `s` is then an ordinary array, and from
+  then on `t = s`, `f(s)` and `[s]` SHARE it, as in Python. In Python
+  nothing changes at that point: `s` was an ordinary list all along.
+
+In short: Python copies ONCE, when the slice is taken, and the result is
+an ordinary list from then on. MyLang copies at every assignment,
+argument and store for as long as `s` has never been written, and
+behaves like Python once it has.
 
 Measured on 8078768c (`build-claude/dbg`, the same in `-tw`, `-nj` and
 the default engine) against python3:
