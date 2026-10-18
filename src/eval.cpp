@@ -6627,11 +6627,13 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
          * rv_coerce already widened `rval`) - not whatever conversion the
          * container ran at run time, which a dyn target cannot predict
          * statically: `var z = (dp.x = true)` with a dyn `dp` is the bool
-         * the inferencer typed, though the int field stored 1. */
+         * the inferencer typed, though the int field stored 1. A `dyn`
+         * rvalue converts CHECKED, as a typed variable receiving one does
+         * - the VM's CoerceNumV; a statically typed one always fits. */
         if (op == Op::assign && !inDecl
                 && (lvalue->is_subscript()
                     || ctag(lvalue.get()) == ConstructType::member))
-            return literal_widen(rval, val_widen);
+            return coerce_to_decl_type(rval, val_widen);
         return r;
     }
 }

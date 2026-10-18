@@ -115,6 +115,55 @@ struct test {
 
 static const std::vector<test> tests =
 {
+    /* README: the value of an assignment is the value it stored - from a
+     * `dyn` right-hand side too (the target is typed, so it converts) */
+    { "an assignment's value is the value it stored, from a dyn rvalue", {
+        "array<float> fa = [1.5];",
+        "var dyn dd = runtime(5);",
+        "var dyn z = (fa[0] = dd);",
+        "assert(str(z) == \"5.000000\" && str(fa[0]) == \"5.000000\");",
+        "struct P { float f; int i; }",
+        "var p = P(1.5, 2);",
+        "var dyn z2 = (p.f = dd);",
+        "assert(str(z2) == \"5.000000\");",
+        "var dyn bb = runtime(true);",
+        "var dyn z3 = (p.i = bb);",
+        "assert(str(z3) == \"1\" && str(p.i) == \"1\");",
+        "array<int> ia = [7];",
+        "var dyn z4 = (ia[0] = bb);",
+        "assert(str(z4) == \"1\");",
+        "dict<str, float> df = {};",
+        "var dyn z5 = (df[\"k\"] = dd);",
+        "assert(str(z5) == \"5.000000\" && str(df[\"k\"]) == \"5.000000\");",
+        "array<float?> ga = [none];",
+        "var dyn z6 = (ga[0] = dd);",
+        "assert(str(z6) == \"5.000000\" && str(ga[0]) == \"5.000000\");" } },
+    /* ...converted CHECKED, as a typed variable receiving a `dyn` is */
+    { "an assignment's value from a dyn rvalue that does not fit the "
+      "target's type", {
+        "array<float?> ga = [none];",
+        "var dyn ds = runtime(\"s\");",
+        "var dyn z = (ga[0] = ds);" },
+      &typeid(TypeErrorEx), 14, 3, 25, 3 },
+    /* RULE 1: a dict value and a general array's element took a dyn
+     * value as it came - an int, or a string, where the static type says
+     * float; it is converted, or refused, before the store (a flat array
+     * refused it in the store; a statement's value must not be what
+     * refuses it - the tree-walker converts it there, the VM does not) */
+    { "a dyn value assigned to a numeric element or dict value is "
+      "converted or refused before the store", {
+        "array<float?> ga = [none];",
+        "dict<str, int> di = {};",
+        "var dyn q = runtime(\"q\");",
+        "array<int> gl = [1, q];",
+        "var n = 0;",
+        "try { ga[0] = runtime(\"s\"); } catch (TypeErrorEx) { n += 1; }",
+        "try { di[\"k\"] = runtime(2.5); } catch (TypeErrorEx) { n += 1; }",
+        "try { gl[0] = runtime(\"s\"); } catch (TypeErrorEx) { n += 1; }",
+        "assert(n == 3 && ga[0] == none && len(di) == 0 && gl[0] == 1);",
+        "di[\"k\"] = runtime(true);",
+        "assert(str(di) == \"{\\\"k\\\": 1}\");" } },
+
     /*
      * The struct-foreach DIRECT read (each `p.x` a byte read of the array
      * element, `p` never bound) serves only a field read that compiles
