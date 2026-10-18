@@ -167,6 +167,29 @@ static const std::vector<test> tests =
         "          str(r));",
         "assert(v.s == \"17\" && v.a16 == 16);" } },
 
+    /* A field of a NON-POD struct holds what its declaration says, as a
+     * POD struct's does: the tree-walker stored `s.f = 2` as the int 2 and
+     * `s.i = true` as a bool (every engine stored a dyn misfit as it was;
+     * the VM's typed field reads only hid the int) */
+    { "a store into a non-POD struct's field converts and checks it", {
+        "struct S { array<int> a; float f; int i; }",
+        "var s = S([1], 1.5, 2);",
+        "s.f = 2;",
+        "s.i = true;",
+        "assert(str(s) == \"S(a: [1], f: 2.000000, i: 1)\");",
+        "var dyn d = runtime(3);",
+        "s.f = d;",
+        "s.f += 1;",
+        "assert(str(s.f) == \"4.000000\");",
+        "var dyn ss = runtime(\"x\");",
+        "var ok = false;",
+        "try { s.f = ss; } catch (TypeErrorEx) { ok = true; }",
+        "assert(ok && str(s) == \"S(a: [1], f: 4.000000, i: 1)\");",
+        "struct Q { S inner; str tag; }",
+        "var q = Q(S([2], 0.5, 1), \"t\");",
+        "q.inner.f = 11;",
+        "assert(str(q.inner.f) == \"11.000000\");" } },
+
     /*
      * #97 R2/R2b: a closure whose captures are all frame locals is built
      * by the lean constructor, which copies an int/float/bool capture by

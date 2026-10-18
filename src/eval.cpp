@@ -5008,6 +5008,37 @@ EvalValue store_base_value(EvalContext *ctx, const Construct *e, LValue &hold)
     return t.base;
 }
 
+/*
+ * A store into a field of a BOXED (non-POD) struct the caller owns
+ * (struct_own): the value is converted and checked exactly as a POD
+ * field's is (coerce_struct_field - an int into a `float` field is a
+ * float, a bool into an `int` one an int, a `dyn` misfit a TypeErrorEx
+ * at the member) - and as the constructor's is. It used to be a plain
+ * slot write, so `s.f = 2` held the int 2 in a float field (the VM's
+ * typed field reads hid it, `print(s)` showed it) and a dyn string
+ * landed in an int field: storage layout changed what a field holds.
+ * Shared by the tree-walker's member_store and the VM's vm_member_store.
+ */
+static EvalValue
+boxed_field_rmw(StructObject &own, int slot, Op op, const EvalValue &value,
+                Loc mstart, Loc mend, EvalValue *old_out = nullptr)
+{
+    LValue &lv = own.fields[static_cast<size_t>(slot)];
+    if (old_out)
+        *old_out = lv.get();
+    EvalValue nv;
+    if (op == Op::assign) {
+        nv = RValue(value);
+    } else {
+        nv = lv.get();
+        apply_compound_op(nv, RValue(value), op);
+    }
+    nv = coerce_struct_field(own.def->fields[static_cast<size_t>(slot)],
+                             std::move(nv), mstart, mend);
+    lv.put(nv);
+    return nv;
+}
+
 static EvalValue
 member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
              const EvalValue &rval, EvalValue *old_out = nullptr)
@@ -5074,6 +5105,12 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
                 obj.pod_set(slot, newval);
                 return newval;
             }
+            /* a boxed struct's field: converted and checked the same way */
+            const int bslot = obj.is_pod()
+                ? -1 : obj.def->slot_of(mem->memUid);
+            if (bslot >= 0)
+                return boxed_field_rmw(obj, bslot, op, rval,
+                                       mem->start, mem->end, old_out);
         }
     }
 
@@ -5629,9 +5666,10 @@ EvalValue vm_incdec_final(EvalValue &cur, bool is_member,
 /*
  * VM StoreMemberV: native `s.member = v` / `s.member OP= v` for a STRUCT base (a
  * dict member store goes through DictStore). Mirrors the tree-walker's
- * member_store (a POD field: coerce + byte store; a boxed field: the field
- * lvalue + slot_rmw), but AST-free: `base_lv` from a slot, the member's
- * uid + carets from the member-key pool. Returns the stored value. A const /
+ * member_store (a POD field: coerce + byte store; a boxed field: coerce +
+ * the field's LValue, boxed_field_rmw), but AST-free: `base_lv` from a
+ * slot, the member's uid + carets from the member-key pool. Returns the
+ * stored value. A const /
  * read-only struct throws NotLValueEx (the tree-walker's general-path error).
  */
 /* The boxed field LValue* of `base.member` for a MUTATING builtin arg0
@@ -5707,7 +5745,8 @@ EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
         return newval;
     }
 
-    return slot_rmw(own.fields[slot], op, value);   /* boxed field lvalue */
+    /* a boxed field: converted and checked as a POD one (boxed_field_rmw) */
+    return boxed_field_rmw(own, slot, op, value, mstart, mend);
 }
 
 /*
