@@ -7810,7 +7810,22 @@ locals all happen and are inspectable (`:analyze`).
   cache, so a later input cannot reuse an instance like `h$0` by name that
   was never bound). It escaped `do_eval` until 2026-10-10 and ended the
   session - and `main` rendered a thrown struct after `~ReplEngine` freed its
-  definition (a use-after-free). **An uninitialized `var a;` commits as
+  definition (a use-after-free). **A refused input must leave NOTHING
+  behind, and three places used to keep part of it:** the struct tables
+  (`struct_by_name` / `declared_structs` are in the snapshot -
+  `check_opt_struct_fields` re-checks every declared struct per input, so
+  one refused struct refused every later input); the committed SYMBOL of a
+  redefined function or struct (`declare_funcdecl` / `declare_structdecl`
+  bind a FRESH `TypeSym` over a pinned one, `redeclare_fresh` - rewriting
+  the pinned object in place survived the scope restore, so a refused
+  `func f` ran from then on); and the PARSER's commits to the persistent
+  const context (`ConstSnapshot` in repl.cpp, restored on a parse, type or
+  optimizer refusal - a refused `pure func`, const or struct stayed what a
+  later input folded or resolved). It restores every saved binding's VALUE
+  in place: telling a rebound slot by its map node's ADDRESS passed in the
+  debug build and failed in an optimized one, whose allocator handed the
+  erased node straight back to the redefinition. **An uninitialized
+  `var a;` commits as
   `dyn?`, not `none`** (`pin_new`): a script infers a plain `var`'s type from
   later uses (`var a; a = 3` → `int?`; a conflicting `a = "x"` is an error),
   but the REPL

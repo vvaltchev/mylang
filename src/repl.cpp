@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map>
 #include <algorithm>
 #include <iterator>
 #include <cctype>
@@ -71,6 +72,50 @@ repl_echo_none(const Construct *c)
 /* Width budget for the `=>` echo's pretty-printer: a value whose single-line
  * form is wider than this is expanded across lines. */
 static const int REPL_PRETTY_WIDTH = 80;
+
+/*
+ * The persistent CONST context as it was before an input was parsed. The
+ * parser commits to it while it parses - a const's value, a struct's
+ * descriptor, a `pure func` - so an input REFUSED before it runs (a
+ * syntax, type or optimizer error) must give those back, or the refused
+ * declaration stays in force: a refused `pure func pf() => 2` was what a
+ * later `pf()` folded to, a refused struct redefinition what a later
+ * `S1 p` resolved as its type. A name the input bound is erased, and
+ * every saved binding gets its saved value back IN PLACE, rebound or
+ * not. Telling a rebound slot by its ADDRESS (the first version) failed
+ * in an optimized build: a redefinition erases and re-binds the name,
+ * and the allocator handed the freed map node straight back, so the
+ * refused struct looked untouched ("'sp1' is declared 'S1' but is
+ * assigned 'S1'" - rel-hard only; the debug build's ASan quarantine
+ * never reuses an address that soon).
+ */
+struct ConstSnapshot {
+    std::map<const UniqueId *, LValue> entries;
+
+    explicit ConstSnapshot(const EvalContext &c) {
+        std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+        c.collect_symbols(syms);
+        for (const auto &kv : syms)
+            entries.emplace(kv.first, *kv.second);
+    }
+
+    void restore(EvalContext &c) const {
+        std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+        c.collect_symbols(syms);
+        for (const auto &kv : syms)
+            if (!entries.count(kv.first)) {
+                Identifier id(kv.first->val);   /* bound by the input */
+                c.erase(&id);
+            }
+        for (const auto &kv : entries) {
+            if (LValue *cur = c.lookup(kv.first))
+                *cur = kv.second;
+            else
+                c.emplace(kv.first, EvalValue(kv.second.get()),
+                          kv.second.is_const_var());
+        }
+    }
+};
 
 /*
  * Persistent interpreter state for the REPL. The const context and the runtime
@@ -425,6 +470,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
      *    line is number base + 1, continuing across inputs. */
     std::vector<Tok> tokens;
     unique_ptr<Construct> root;
+    const ConstSnapshot const_before(*const_ctx);
     try {
         lexer(source, static_cast<int>(base + 1), tokens);
 
@@ -438,6 +484,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
             throw SyntaxErrorEx(Loc(pc.get_tok().loc),
                                 "Unexpected token at the end", &pc.get_tok());
     } catch (const Exception &e) {
+        const_before.restore(*const_ctx);
         return format_error(e);
     }
 
@@ -467,6 +514,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
     try {
         infer.check_input(root.get());
     } catch (const Exception &e) {
+        const_before.restore(*const_ctx);
         retained.push_back(std::move(root));   /* keep the AST alive (id_sym refs) */
         /* keep any trace lines emitted before the error (the reasoning that
          * led up to it), then the error itself. */
@@ -497,6 +545,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
                        /*prior_scope=*/runtime_ctx.get());
     } catch (const Exception &e) {
         infer.reject_input();
+        const_before.restore(*const_ctx);
         retained.push_back(std::move(root));   /* keep the AST alive */
         return out.str() + format_error(e);
     }
