@@ -162,6 +162,13 @@ public:
     void check_input(Construct *input);
     void undef_global(const UniqueId *name);
 
+    /* An input check_input ACCEPTED and a later stage then refused (the
+     * optimizers raised while compiling it): take back everything its
+     * check committed - its globals and its template instances - as a
+     * rejected check does, so the session goes on as if it was never
+     * typed. */
+    void reject_input();
+
     /* The inferred static type string of a committed global (or "" if the name
      * is not a committed inferred symbol - e.g. a const scalar folded away).
      * Backs the REPL :globals enrichment. */

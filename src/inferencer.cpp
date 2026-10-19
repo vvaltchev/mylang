@@ -254,6 +254,7 @@ public:
     void stamp_inferred_param_types(Construct *rootn);
     void setup();                  /* once: bottom + global scope */
     void infer_input(Block *root); /* REPL: one input, commit+pin its globals */
+    void reject_input();           /* REPL: take the last input back */
     void undef_global(const UniqueId *name);  /* REPL undef(x) */
     void dump_debug_ti(std::ostream &os);   /* --debug-ti */
     void dump_callee_sets(std::ostream &os); /* -dcs (see calleeset.cpp.h) */
@@ -360,6 +361,20 @@ private:
      * past MAX_TMPL_INSTANCES distinct signatures, further calls run
      * dynamically (no clone) - a backstop for runaway polymorphism (D4). */
     std::unordered_map<FuncInfo *, int> tmpl_inst_count;
+    /*
+     * REPL: the state the last infer_input started from. A rejected
+     * input restores it - infer_input itself when the check refuses it,
+     * reject_input() when a LATER stage does (the optimizers raised while
+     * compiling it) - so a refused input commits nothing: no global, and
+     * no instance a later input would reuse by name while it was never
+     * bound at run time.
+     */
+    struct InputSnapshot {
+        std::unordered_map<const UniqueId *, TypeSym *> globals;
+        std::unordered_map<std::string, const UniqueId *> tmpl_cache;
+        std::unordered_map<FuncInfo *, int> tmpl_inst_count;
+    } last_input;
+    void restore_last_input();
     /* Value-instantiated clones' uniform signatures - seeded into the
      * clone's params each fixpoint round (no direct call feeds them). */
     std::map<FuncInfo *, std::vector<StaticTypeRef>> value_inst_sigs;
@@ -2521,9 +2536,12 @@ void Inferencer::infer_input(Block *rootBlock)
      * snapshotted here so a REJECTED input - whose clone bindings are rolled
      * back below - drops its cache entries too (self-heal would otherwise
      * rebuild on the next use; the snapshot makes it exact). The clone-name
-     * counter stays monotonic, so names never collide.
+     * counter stays monotonic, so names never collide. The snapshot is
+     * KEPT (last_input): an input the check accepts may still be refused
+     * by a later stage, and reject_input() restores the same state.
      */
-    auto tmpl_cache_snapshot = tmpl_cache;
+    last_input.tmpl_cache = tmpl_cache;
+    last_input.tmpl_inst_count = tmpl_inst_count;
 
     /*
      * SCOPE THE NODE-KEYED MAPS TO ONE INPUT. id_sym / func_of_decl are keyed
@@ -2543,7 +2561,7 @@ void Inferencer::infer_input(Block *rootBlock)
     const size_t sym_base = all_syms.size();
     const size_t func_base = all_funcs.size();
     /* snapshot the global bindings so a rejected input commits nothing */
-    auto global_snapshot = global->syms;
+    last_input.globals = global->syms;
 
     auto pin_new = [&]() {
         for (size_t i = sym_base; i < all_syms.size(); i++) {
@@ -2575,13 +2593,34 @@ void Inferencer::infer_input(Block *rootBlock)
          * the instantiation cache (drop any clone this input registered), then
          * `pin` (i.e. skip henceforth) the half-built symbols so no later input
          * re-finalizes/re-enforces them. They stay in all_syms but inert. */
-        global->syms = std::move(global_snapshot);
-        tmpl_cache = std::move(tmpl_cache_snapshot);
+        restore_last_input();
         pin_new();
         throw;
     }
 
     pin_new();     /* success: commit this input's new globals */
+}
+
+void Inferencer::restore_last_input()
+{
+    global->syms = last_input.globals;
+    tmpl_cache = last_input.tmpl_cache;
+    tmpl_inst_count = last_input.tmpl_inst_count;
+}
+
+/*
+ * REPL: an input infer_input ACCEPTED was refused by a later stage (the
+ * optimizers raised while compiling it - `h(0)` folded to a division by
+ * zero) and never ran. Take back what its check committed, exactly as a
+ * refused check does: its globals are unbound again, and its template
+ * instances leave the cache - a later input reusing `h$0` by name would
+ * otherwise call a function that was never bound. Its symbols stay
+ * pinned, inert.
+ */
+void Inferencer::reject_input()
+{
+    if (global)
+        restore_last_input();
 }
 
 /* REPL `undef(x)`: drop a global from the committed set so a later `var x` of a
@@ -9011,6 +9050,9 @@ void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
 struct ReplInfer::Impl {
     Inferencer inf;            /* root == nullptr; fed one input at a time */
     bool did_setup = false;
+    /* the last check_input accepted its input, which reject_input may
+     * still take back (never an earlier one: its snapshot is gone) */
+    bool can_reject = false;
 
     Impl() {
         inf.strict_dyn = true;     /* faithful: the real strict checks */
@@ -9023,6 +9065,7 @@ ReplInfer::~ReplInfer() = default;
 
 void ReplInfer::check_input(Construct *input)
 {
+    impl->can_reject = false;
     auto *blk = dynamic_cast<Block *>(input);
     if (!blk)
         return;
@@ -9032,11 +9075,19 @@ void ReplInfer::check_input(Construct *input)
         impl->did_setup = true;
     }
     impl->inf.infer_input(blk);
+    impl->can_reject = true;
 }
 
 void ReplInfer::undef_global(const UniqueId *name)
 {
     impl->inf.undef_global(name);
+}
+
+void ReplInfer::reject_input()
+{
+    if (impl->can_reject)
+        impl->inf.reject_input();
+    impl->can_reject = false;
 }
 
 std::string ReplInfer::global_type(const UniqueId *name)
