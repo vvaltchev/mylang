@@ -21966,6 +21966,26 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* the REPL's automatic `;`: it went AFTER a trailing `#` comment - into
+     * the comment, so the statement ran on into the next line - and a block
+     * closed on its last statement's line (`{ print(3) }`) got none before
+     * its `}`. An error at the end of an input had no location. */
+    { "auto-terminate: before a # comment, and before a same-line '}'",
+      { { "var y3 = 2   # trailing", "=> 2", "Error" },
+        { "y3", "=> 2", "Error" },
+        { "func f3(x) {\n  var z = x  # c\n  return z  # r\n}", "",
+          "Error" },
+        { "f3(3)", "=> 3", "Error" },
+        { "if (true) { print(33) }", "33", "Error" },
+        { "func w3() { return 1 }; w3() + 1", "=> 2", "Error" },
+        { "var d3 = { \"a\": 1 }  # a dict", "=> {\"a\": 1}", "Error" },
+        { "{ print(34) }", "34", "Error" },
+        { "struct P3 { int x; int y }", "", "Error" },
+        { "try { throw P3(1, 2) } catch (P3 as e) { print(e.y) }", "2",
+          "Error" },
+        { "if (true) { print(f3(\n  35)) }", "35", "Error" },
+        { "print(1", "SyntaxError at line" } } },
+
     /* an input that fails WHILE RUNNING keeps what its completed statements
      * defined, and nothing of the declarations it never reached: their
      * committed types stood for names the run never defined, so a later

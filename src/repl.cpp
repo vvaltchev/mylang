@@ -284,7 +284,10 @@ repl_continuation_op(Op op)
  * (a binary operator, comma, an open bracket, ...). Inside a `{}` block, each
  * statement line is terminated, so a multi-line func/if body works without
  * typing `;`. A `;` after a `}` is a harmless empty statement (and is needed
- * after a dict literal), so it is added.
+ * after a dict literal), so it is added. The `;` goes where the line's CODE
+ * ends - before a trailing `#` comment - and a block closed on the line of
+ * its last statement (`if (c) { print(3) }`) gets that statement's `;`
+ * before its `}`.
  */
 /*
  * Find the "code" span [begin, end) of one physical line, given the running
@@ -367,6 +370,10 @@ repl_auto_terminate(const string &src)
      */
     std::vector<char> stack;
     bool expects_value = false;       /* statement position at the start */
+    /* the last code token ENDS a value no `;` terminates yet - so a block's
+     * `}` right after it needs one (across lines too: a value on a line
+     * that got no `;`, e.g. the end of a call spanning lines) */
+    bool open_value = false;
     bool in_string = false;           /* a string spanning physical lines */
     bool in_comment = false;          /* a block comment spanning lines */
 
@@ -403,45 +410,87 @@ repl_auto_terminate(const string &src)
             continue;
         }
 
+        /* Where a `;` goes in front of position `pos` of the line: right
+         * after the last code character before it, so a `#` comment or the
+         * spaces that follow the statement stay after its `;`. */
+        const auto semi_before = [&](size_t pos) {
+            while (pos > code_begin
+                   && isspace(static_cast<unsigned char>(line[pos - 1])))
+                pos--;
+            return pos;
+        };
+        std::vector<size_t> semis;        /* `;` positions, left to right */
+
+        if (closed_string)
+            open_value = true;
+
         const Tok *last = nullptr;
         for (const auto &t : toks) {
             if (t == Op::braceL) {
                 const char kind = expects_value ? 'D' : 'B';
                 stack.push_back(kind);
                 expects_value = (kind == 'D');
+                open_value = false;
             } else if (t == Op::parenL) {
                 stack.push_back('(');
                 expects_value = true;
+                open_value = false;
             } else if (t == Op::bracketL) {
                 stack.push_back('[');
                 expects_value = true;
-            } else if (t == Op::parenR || t == Op::bracketR ||
-                       t == Op::braceR) {
+                open_value = false;
+            } else if (t == Op::braceR) {
+                /* a block closing right after a statement on the SAME line
+                 * (`if (c) { print(3) }`): that statement's `;` goes before
+                 * the `}`, since no line end follows it */
+                const char kind = stack.empty() ? 'B' : stack.back();
+                if (kind == 'B' && open_value)
+                    semis.push_back(semi_before(
+                        code_begin + static_cast<size_t>(t.loc.col - 1)));
                 if (!stack.empty())
                     stack.pop_back();
                 expects_value = false;
+                open_value = (kind == 'D');   /* a dict literal is a value */
+            } else if (t == Op::parenR || t == Op::bracketR) {
+                if (!stack.empty())
+                    stack.pop_back();
+                expects_value = false;
+                open_value = true;
             } else if (t == Keyword::kw_return) {
                 expects_value = true;
+                open_value = true;            /* a bare `return` ends too */
             } else {
                 /* an operator that takes a RHS keeps us in value position */
                 expects_value =
                     t.op != Op::invalid && repl_continuation_op(t.op);
+                open_value = !expects_value;
             }
             last = &t;
         }
-
-        out += line;
 
         const char ctx = stack.empty() ? 'B' : stack.back();
         const bool stmt_ctx = (ctx == 'B');     /* not 'D'/'('/'[' */
         /* The line ends in a value (so a `;` terminates the statement) when its
          * last code token isn't a continuation, or - with no code token - when
          * a multi-line string just closed here. No `;` when the line instead
-         * opens a string/comment that continues onto the next line. */
+         * opens a string/comment that continues onto the next line. The `;`
+         * goes at the end of the CODE, never after a trailing `#` comment
+         * (where it was part of the comment, and the statement went on into
+         * the next line). */
         const bool ends_in_value =
             last ? !repl_continuation_op(last->op) : closed_string;
-        if (!open_at_end && stmt_ctx && ends_in_value)
+        if (!open_at_end && stmt_ctx && ends_in_value) {
+            semis.push_back(semi_before(code_end));
+            open_value = false;
+        }
+
+        size_t from = 0;
+        for (const size_t at : semis) {
+            out.append(line, from, at - from);
             out += ';';
+            from = at;
+        }
+        out.append(line, from, string::npos);
         out += '\n';
     }
 
@@ -509,6 +558,17 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
         if (!pc.eoi())
             throw SyntaxErrorEx(Loc(pc.get_tok().loc),
                                 "Unexpected token at the end", &pc.get_tok());
+    } catch (const SyntaxErrorEx &caught) {
+        const_before.restore(*const_ctx);
+        /* An error at the END of the input carries the EOF sentinel, which
+         * has no location: point it past the last token, as main() does
+         * for a script. (It rendered "SyntaxError" with no line at all.) */
+        SyntaxErrorEx e = caught;
+        if (e.tok == &invalid_tok && !tokens.empty()) {
+            e.loc_start = tokens.back().loc + 1;
+            e.loc_end = tokens.back().loc + 2;
+        }
+        return format_error(e);
     } catch (const Exception &e) {
         const_before.restore(*const_ctx);
         return format_error(e);

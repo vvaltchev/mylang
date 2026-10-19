@@ -209,8 +209,10 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 Definitions — variables, constants, functions, structs — **persist across
 inputs** (the global scope is expandable), and const-folding done in one input
 still applies in the next; each input is otherwise evaluated by the real
-interpreter. You don't type semicolons (they're inserted automatically), and a
-multi-line block stays open until it's balanced, auto-indented as you go:
+interpreter. You don't type semicolons (they're inserted automatically - at
+the end of each statement's line, before a trailing `#` comment, and before
+the `}` of a block closed on the same line, as in `if (c) { print(x) }`), and
+a multi-line block stays open until it's balanced, auto-indented as you go:
 
 ```
 >> func fib(n) {
