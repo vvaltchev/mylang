@@ -269,6 +269,8 @@ struct ReplEngine::Impl {
          * `var`'s TYPE still sticks - the inferencer's job, not this.) */
         runtime_ctx->allow_redeclare = true;
         const_ctx->allow_redeclare = true;
+        /* a pure call the parser runs is type-inferred first (question 5) */
+        const_ctx->parse_typed = true;
     }
 
     string format_error(const Exception &e) const {

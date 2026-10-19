@@ -22236,6 +22236,48 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* question 5: a function the parser runs runs typed, in a later input
+     * too - the copy is inferred with the earlier input's function and
+     * consts - and a redefinition is what the next constant call runs */
+    { "a parse-time call runs typed across inputs",
+      { { "pure func f5(int n) {"
+          " var x = n; var r = str(x); x = 2.5; return r; }", "" },
+        { "f5(3)", "=> \"3.000000\"" },
+        { "f5(int(runtime(3)))", "=> \"3.000000\"" },
+        { "const K5 = f5(4)", "" },
+        { "K5", "=> \"4.000000\"" },
+        { "pure func g5(v) => f5(v) + str(K5)", "" },
+        { "g5(1)", "=> \"1.0000004.000000\"" },
+        { "pure func f5(int n) { return str(n); }", "" },
+        { "f5(3)", "=> \"3\"" },
+        { "g5(1)", "=> \"14.000000\"" },
+        /* a builtin under another name: declared as that name (the
+         * run-time half of this is task #94) */
+        { "const L5 = len", "" },
+        { "pure func h5(a) {"
+          " var x = L5(a); var r = str(x); x = 0.5; return r; }", "" },
+        { "h5([1, 2])", "=> \"2.000000\"" },
+        /* an earlier input's const read unfolded: the REPL keeps its
+         * consts in the parser's root, and the copy declares its own */
+        { "const A5 = [1, 2]", "" },
+        { "pure func k5(int i) {"
+          " var x = A5[i]; var r = str(x); x = 0.5; return r; }", "" },
+        { "k5(1)", "=> \"2.000000\"", "Error" },
+        { "k5(int(runtime(1)))", "=> \"2.000000\"" },
+        /* an earlier input's function (resolved: its parameters bind
+         * into a frame) called through a value by a copy */
+        { "pure func f6(int n) { var x = 0.5; x = n; return str(x); }",
+          "" },
+        { "const OPS6 = [f6]", "" },
+        { "pure func u6(int k) => OPS6[k](3)", "" },
+        { "u6(0)", "=> \"3.000000\"" },
+        { "u6(int(runtime(0)))", "=> \"3.000000\"" },
+        /* a const name rebound to a function: the note of its old
+         * initializer is stale, and the function is what a copy declares */
+        { "const Q6 = f6", "" },
+        { "pure func Q6(int n) { return str(n) + \"!\"; }", "" },
+        { "Q6(2)", "=> \"2!\"" } } },
+
     /* an in-place builtin on an UNDEFINED name (the REPL's open world)
      * reports the name, at the argument, as `zz[0] = 1` does - it raised
      * NotLValueEx about a value that does not exist */
@@ -28696,6 +28738,341 @@ static bool const_fold_equivalence()
                     ok = false;
                 }
             }
+    }
+    return ok;
+}
+
+/*
+ * QUESTION 5 (decision A): A USER FUNCTION THE PARSER RUNS, RUNS TYPED.
+ * Each program calls a pure function both at parse time (a constant call,
+ * a const initializer, a callback a const builtin calls) and at run time
+ * (`runtime()` in an argument), and the body is one inference types
+ * differently from its values: a local joined with a float, a return
+ * joined with one, an array literal stored into as floats. Every run -
+ * both engines, the JIT on and off, folding on and off - must print the
+ * same, and that is the run-time answer. The counters prove the typed
+ * copy RAN at parse time (a program whose constant call simply failed to
+ * fold would agree vacuously), and that a call the rule declines runs
+ * untyped. Watched failing with the interception removed.
+ */
+struct PtCase {
+    const char *name;
+    std::vector<const char *> lines;
+    const char *want;           /* stdout, or a substring of the error */
+    bool runs;                  /* a typed copy runs at parse time */
+    bool untyped;               /* ...and one call is declined */
+};
+
+static bool parse_time_typed_runs()
+{
+    const std::vector<PtCase> cases = {
+        { "a local joined with a float", {
+            "pure func f(int n) {",
+            "  var x = n; var r = str(x); x = 2.5; return r; }",
+            "print(f(3), f(int(runtime(3))));" },
+          "3.000000 3.000000 \n", true, false },
+        { "a return joined with a float", {
+            "pure func g(int n) { if (n > 0) { return 1; } return 2.5; }",
+            "print(g(1), g(int(runtime(1))));" },
+          "1.000000 1.000000 \n", true, false },
+        { "an array literal stored into as floats", {
+            "pure func h(int n) {",
+            "  var a = [n]; a[0] = 0.5; a[0] = n; return str(a); }",
+            "print(h(int(runtime(3))));",
+            "print(h(3));" },
+          "[3.000000] \n[3.000000] \n", true, false },
+        { "a declared numeric local given a parameter", {
+            "pure func k(int n) { var x = 0.5; x = n; return str(x); }",
+            "print(k(3), k(int(runtime(3))));" },
+          "3.000000 3.000000 \n", true, false },
+        { "a template, recursive, reading a const array", {
+            "const W = [1, 2, 3];",
+            "pure func show(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }",
+            "pure func walk(i) =>",
+            "  i == 0 ? show(W[0]) : walk(i - 1) + show(W[i]);",
+            "const T = walk(2);",
+            "print(T, walk(int(runtime(2))));" },
+          "1.0000002.0000003.000000 1.0000002.0000003.000000 \n",
+          true, false },
+        { "a lambda a const builtin calls", {
+            "const M = map(pure func(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }, [1, 2]);",
+            "print(M, map(pure func(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; },",
+            "  [int(runtime(1)), 2]));" },
+          "[\"1.000000\", \"2.000000\"] [\"1.000000\", \"2.000000\"] \n",
+          true, false },
+        { "a function passed as an argument", {
+            "pure func show(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }",
+            "pure func apply(f, x) => f(x);",
+            "print(apply(show, 2), apply(show, int(runtime(2))));" },
+          "2.000000 2.000000 \n", true, false },
+        /* one copy per argument signature, as one template instance */
+        { "a template called with two argument types", {
+            "pure func ty(v) { var w = v; return typestr(w); }",
+            "print(ty(2), ty(2.5), ty(\"s\"));",
+            "print(ty(int(runtime(2))), ty(float(runtime(2.5))),",
+            "      ty(str(runtime(\"s\"))));" },
+          "int float str \nint float str \n", true, false },
+        /* a builtin argument goes by its name, as the program passes it:
+         * the copy declined it and ran untyped ("2") */
+        { "a builtin passed as an argument", {
+            "pure func ap(fn, a) {",
+            "  var x = fn(a); var r = str(x); x = 0.5; return r; }",
+            "print(ap(len, [1, 2]), ap(len, runtime([1, 2])));" },
+          "2.000000 2.000000 \n", true, false },
+        /* the same, by value: a function a running function calls through
+         * a const container is given the builtin `len`, which its copy
+         * calls by its name */
+        { "a builtin passed through a value", {
+            "const OPB = [pure func(f) {",
+            "  var x = f([1, 2]); var r = str(x); x = 0.5; return r; }];",
+            "pure func ap2(int k) => OPB[k](len);",
+            "print(ap2(0), ap2(int(runtime(0))));" },
+          "2.000000 2.000000 \n", true, false },
+        /* a builtin the parser calls with a function runs as written: the
+         * callback's parameter takes the container's element type, int?,
+         * not each value's own (by value the first gave "float") */
+        { "a callback's parameter takes the element type", {
+            "const C = [1, none];",
+            "var c = [1, none];",
+            "const O = map(pure func(opt v) {",
+            "  var w = v; w = 0.5; return typestr(w); }, C);",
+            "print(O, map(pure func(opt v) {",
+            "  var w = v; w = 0.5; return typestr(w); }, c));" },
+          "[\"float?\", \"float?\"] [\"float?\", \"float?\"] \n",
+          true, false },
+        /* a struct TYPE argument: the template is not instantiated for it,
+         * here as at run time, so its body runs untyped (task #95: the VM
+         * cannot make that call, so no run-time half here) */
+        { "a struct type passed as an argument", {
+            "struct P { float x; }",
+            "pure func mk(t, int n) {",
+            "  var x = n; var r = str(x); x = 0.5;",
+            "  return r + str(t(n).x); }",
+            "const Z = mk(P, 3);",
+            "print(Z);" },
+          "33.000000 \n", true, false },
+        /* by value too: a struct type cannot be typed in a copy (task #95:
+         * inference types a struct name used as a value `none`), so the
+         * call runs untyped - the known gap, "33.000000" where the run-time
+         * call gives "3.0000003.000000" */
+        { "a struct type passed through a value", {
+            "struct P { float x; }",
+            "const OPT = [pure func(t, int n) {",
+            "  var x = n; var r = str(x); x = 0.5;",
+            "  return r + str(t(n).x); }];",
+            "pure func mk2(int k) => OPT[k](P, 3);",
+            "const Z = mk2(0);",
+            "print(Z);" },
+          "33.000000 \n", true, true },
+        /* a function a running function passes through a value, by its
+         * name: its copy is the instance the program makes */
+        { "a function passed through a value", {
+            "pure func show(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }",
+            "const OPF = [pure func(fn, x) => fn(x)];",
+            "pure func ap3(int k) => OPF[k](show, k + 2);",
+            "print(ap3(0), ap3(int(runtime(0))));" },
+          "2.000000 2.000000 \n", true, false },
+        /* one function through a value, given two argument types: one copy
+         * per type. Its `opt` parameter is JOINED in the program (float?,
+         * so the run-time call gives "float?float?"): the known limit, each
+         * call typed alone */
+        { "one function through a value with two argument types", {
+            "const OL = [pure func(opt v) { return typestr(v); }];",
+            "pure func ol(int k) => OL[k](1) + OL[k](2.5);",
+            "const R = ol(0);",
+            "print(R);" },
+          "int?float? \n", true, false },
+        /* a lambda a running function passes through a value: its copy
+         * declares it under a name of its own */
+        { "a lambda passed through a value", {
+            "const OPF = [pure func(fn, x) => fn(x)];",
+            "pure func ap4(int k) => OPF[k](pure func(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }, k + 2);",
+            "print(ap4(0), ap4(int(runtime(0))));" },
+          "2.000000 2.000000 \n", true, false },
+        /* two of them: each under a name of its own */
+        { "two lambdas passed through a value", {
+            "const OP2 = [pure func(f, g, x) => f(x) + g(x)];",
+            "pure func ap5(int k) => OP2[k](pure func(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; },",
+            "  pure func(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s + \"!\"; },",
+            "  k + 2);",
+            "print(ap5(0), ap5(int(runtime(0))));" },
+          "2.0000002.000000! 2.0000002.000000! \n", true, false },
+        /* a builtin call returning functions of its copy runs untyped (the
+         * copy's descriptors die with it) */
+        { "a builtin call returning functions", {
+            "const MK = map(pure func(x) => pure func(y) => y * 2, [1]);",
+            "print(MK[0](2), MK[int(runtime(0))](2));" },
+          "4 4 \n", true, true },
+        /* a const multi-declaration notes no initializer: each name is
+         * another name for the function, declared after it */
+        { "a const multi-declaration naming functions", {
+            "pure func show(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }",
+            "pure func k2(int n) { var x = 0.5; x = n; return str(x); }",
+            "const FA, FB = [show, k2];",
+            "print(FA(4), FA(int(runtime(4))), FB(3),",
+            "  FB(int(runtime(3))));",
+            "pure func both(f, g, x) => f(x) + g(x);",
+            "print(both(show, FA, 4), both(show, FA, int(runtime(4))));" },
+          "4.000000 4.000000 3.000000 3.000000 \n"
+          "4.0000004.000000 4.0000004.000000 \n", true, false },
+        { "a lambda passed as an argument", {
+            "pure func apply(fn, x) => fn(x);",
+            "print(apply(pure func(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }, 2),",
+            "  apply(pure func(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; },",
+            "  int(runtime(2))));" },
+          "2.000000 2.000000 \n", true, false },
+        /* a const holding a function is declared by its initializer, so
+         * the function arrives as in the program: through a name bound to
+         * it (an instance), a call returning one, a const container (no
+         * instance - the program cannot redirect a baked value) */
+        { "a const naming a function, read in a body", {
+            "pure func show(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }",
+            "const G = show;",
+            "const dyn H = show;",
+            "const K9 = [1];",
+            "pure func useg(int n) => G(n) + show(n) + str(len(K9));",
+            "pure func useh(int n) => show(n) + H(n);",
+            "print(G(5), G(int(runtime(5))), useg(6),",
+            "  useg(int(runtime(6))), useh(7), useh(int(runtime(7))));" },
+          "5.000000 5.000000 6.0000006.0000001 6.0000006.0000001 "
+          "7.0000007.000000 7.0000007.000000 \n", true, false },
+        { "a function out of a const container, through a const", {
+            "pure func show(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }",
+            "const OPS = [show];",
+            "pure func first() => OPS[0];",
+            "pure func apply(fn, x) => fn(x);",
+            "const dyn F1 = first();",
+            "pure func usef(int n) => F1(n);",
+            "print(F1(4), F1(int(runtime(4))), apply(F1, 4),",
+            "  apply(F1, int(runtime(4))), usef(4), usef(int(runtime(4))));" },
+          "4 4 4 4 4 4 \n", true, false },
+        /* a function made by a running function has no const scope */
+        { "a function a running function made", {
+            "pure func mkf() { return pure func(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }; }",
+            "const MF = mkf();",
+            "print(MF(3), MF(int(runtime(3))));" },
+          "3.000000 3.000000 \n", true, true },
+        /* a call through a value, by a running function: typed unless
+         * the function is a template */
+        { "typed, dyn, opt and no parameters through a const array", {
+            "pure func k2(int n) { var x = 0.5; x = n; return str(x); }",
+            "pure func d2(dyn v) { var x = 0.5; x = v; return str(x); }",
+            "pure func o2(opt v) { var x = 0.5; x = v ?? 1; return str(x); }",
+            "pure func z2 { var x = 0.5; x = 7; return str(x); }",
+            "const T2 = [k2, d2, o2, z2];",
+            "print(T2[0](3), T2[int(runtime(0))](3), T2[1](3),",
+            "  T2[int(runtime(1))](3), T2[2](3), T2[int(runtime(2))](3),",
+            "  T2[3](), T2[int(runtime(3))]());" },
+          "3.000000 3.000000 3.000000 3.000000 3.000000 3.000000 "
+          "7.000000 7.000000 \n", true, false },
+        /* a throw in a typed copy is the program's compile error, with
+         * the program's caret and backtrace */
+        { "a throwing named function", {
+            "pure func dv(int x) { var y = x; y = 10 / x; return y; }",
+            "const Z = dv(0);" },
+          "DivisionByZeroEx: Division by zero", false, false },
+        { "a throwing lambda a const builtin calls", {
+            "const M = map(pure func(int v) { return 10 / v; }, [0]);" },
+          "DivisionByZeroEx: Division by zero", false, false },
+        { "a struct field read into a local", {
+            "struct P { float x; }",
+            "pure func mk(int n) {",
+            "  var p = P(n); var y = p.x; var s = str(y); return s; }",
+            "print(mk(3), mk(int(runtime(3))));" },
+          "3.000000 3.000000 \n", true, false },
+        /* a template reached through a VALUE runs untyped, as the program
+         * runs it (the call runs as written; no instance inside it) */
+        { "a template called through a const array", {
+            "pure func show(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }",
+            "const OPS = [show];",
+            "print(OPS[0](4), OPS[int(runtime(0))](4));" },
+          "4 4 \n", true, false },
+        /* a result holding a function value is the one the program names,
+         * so that call runs untyped; the call through it by name is typed */
+        { "a function returned by a parse-time call", {
+            "pure func show(v) {",
+            "  var w = v; var s = str(w); w = 0.5; return s; }",
+            "pure func pick(k) {",
+            "  var u = show(k) + str(len([k]));",
+            "  if (k) { return show; } return show; }",
+            "const F = pick(true);",
+            "print(F(5), F(int(runtime(5))));" },
+          "5.000000 5.000000 \n", true, true },
+        /* the typed copy's own type error is the program's compile error,
+         * with the program's caret */
+        { "a type error in the body is a compile error", {
+            "pure func bad(x) { var y = x; y = \"s\"; return 1; }",
+            "const Z = bad(3);",
+            "print(Z);" },
+          "TypeMismatchEx: 'y' has type 'int' but is assigned 'str'",
+          false, false },
+    };
+
+    bool ok = true;
+    const bool saved_jit = g_jit_enabled;
+    for (const PtCase &c : cases) {
+        std::string src;
+        for (size_t i = 0; i < c.lines.size(); i++) {
+            if (i)
+                src += '\n';
+            src += c.lines[i];
+        }
+        const unsigned long runs0 = g_pt_runs, untyped0 = g_pt_untyped;
+        const std::string ref = nc_run(src, ExecEngine::TreeWalk, true);
+        const bool ran = g_pt_runs > runs0;
+        const bool declined = g_pt_untyped > untyped0;
+        const std::string want = c.want;
+        const bool is_err = want.rfind("TypeMismatchEx", 0) == 0
+            || want.rfind("DivisionByZeroEx", 0) == 0;
+        if (is_err ? ref.find(want) == std::string::npos
+                   : ref != want + "|") {
+            fprintf(stderr, "parse_time_typed_runs: '%s'\n  want: %s\n  "
+                    "got:  %s\n", c.name, c.want, ref.c_str());
+            ok = false;
+        }
+        if (ran != c.runs || declined != c.untyped) {
+            fprintf(stderr, "parse_time_typed_runs: '%s': typed runs %s "
+                    "(want %s), declined %s (want %s)\n", c.name,
+                    ran ? "yes" : "no", c.runs ? "yes" : "no",
+                    declined ? "yes" : "no", c.untyped ? "yes" : "no");
+            ok = false;
+        }
+        for (bool fold : { true, false }) {
+            const std::string tw = nc_run(src, ExecEngine::TreeWalk, fold);
+            if (tw != ref) {
+                fprintf(stderr, "parse_time_typed_runs: '%s' (tw, fold "
+                        "%s)\n  want: %s\n  got:  %s\n", c.name,
+                        fold ? "on" : "OFF", ref.c_str(), tw.c_str());
+                ok = false;
+            }
+            for (bool jit : { false, true }) {
+                g_jit_enabled = jit;
+                const std::string got = nc_run(src, ExecEngine::Vm, fold);
+                if (got != ref) {
+                    fprintf(stderr, "parse_time_typed_runs: '%s' (vm, jit "
+                            "%s, fold %s)\n  want: %s\n  got:  %s\n",
+                            c.name, jit ? "on" : "off", fold ? "on" : "OFF",
+                            ref.c_str(), got.c_str());
+                    ok = false;
+                }
+            }
+            g_jit_enabled = saved_jit;
+        }
     }
     return ok;
 }
@@ -57864,6 +58241,8 @@ static const std::vector<extra_check> extra_checks =
       opt_layer_equivalence },
     { "parse: -nc turns off folding, not the program's meaning (#54)",
       const_fold_equivalence },
+    { "parse: a function the parser runs runs typed (question 5)",
+      parse_time_typed_runs },
     { "check: a dyn value entering a typed place - the messages (#49)",
       dyn_fit_messages },
     { "opt: loop-invariant container-subscript hoisting shapes (LICM)",

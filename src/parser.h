@@ -7,6 +7,7 @@
 #include "lexer.h"
 #include <vector>
 #include <memory>
+#include <unordered_map>
 #include <string_view>
 
 class EvalContext;
@@ -244,6 +245,11 @@ public:
      * rather than tuned to the measured Linux threshold.
      */
     int nest_depth = 0;
+    /* pBlocks being parsed: the outermost one's exit empties the typed
+     * parse-time runs (pt_cache_clear) - nothing runs at parse time after
+     * it, and their programs must not outlive the parse (the -vm teardown
+     * proves no AST node is left) */
+    int block_depth = 0;
     static const int MAX_NEST = 256;
 
     /*
@@ -285,3 +291,50 @@ public:
  */
 unique_ptr<Construct>
 pBlock(ParseContext &c, unsigned fl = 0, bool push_const_scope = true);
+
+/*
+ * Question 5 (plans/open-language-questions.md, decision A): a user
+ * function run at PARSE time runs a copy of itself type-inferred for its
+ * argument types - do_func_call calls this for a function no inference has
+ * typed (FuncDescriptor::parse_typed) when the call happens under the
+ * parser's const scope (EvalContext::parse_typed). `vals` are the bound
+ * argument values. False: no typed copy can be built (an unsupported
+ * binding, a function value in the result) - the call runs untyped, as
+ * before. The copies are cached per (function, argument types) until the
+ * outermost pBlock ends or the ParseContext dies (pt_cache_clear): they are
+ * AST, and the -vm teardown proves none is left.
+ */
+class FuncObject;
+class EvalValue;
+class CallExpr;
+class Identifier;
+struct FuncDescriptor;
+/* a call the parser makes, as written (its callee and argument
+ * expressions, the consts they read) */
+bool pt_typed_written(EvalContext *ctx, const CallExpr *call, EvalValue &out);
+/* do the arguments of a builtin call the parser makes name a user function
+ * (a function literal, a name bound to a function)? Such a call runs as
+ * written, so the builtin calls it as the program's inference types it */
+bool pt_args_name_function(EvalContext *ctx, Construct *args);
+/* a call a running function makes, by value */
+bool pt_typed_value(FuncObject &obj, const std::vector<EvalValue> &vals,
+                    Loc call_site, EvalValue &out);
+/* what a const scope noted about a const it declared holding a function
+ * (pt_note_const): its initializer, which a typed copy declares it by, so
+ * the function arrives as it does in the program; whether it is `dyn` */
+struct PtConstInit {
+    std::unique_ptr<Construct> expr;
+    bool dyn = false;
+    const FuncDescriptor *fn = nullptr;
+};
+struct PtConstInits {
+    std::unordered_map<const UniqueId *, PtConstInit> m;
+};
+void pt_note_const(EvalContext *scope, const Identifier *id,
+                   const Construct *init);
+void pt_cache_clear();
+#ifdef TESTS
+/* typed parse-time runs made, synthetic programs inferred for them, and
+ * calls that fell back to an untyped run - the proof a test reached them */
+extern unsigned long g_pt_runs, g_pt_builds, g_pt_untyped;
+#endif

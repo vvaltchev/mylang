@@ -32,6 +32,18 @@ struct AnalysisInfo;
 void infer_types(Construct *root, bool enable = true, bool strict = true);
 
 /*
+ * Question 5: type the synthetic program of a PARSE-TIME call
+ * (pt_typed_call, parser.cpp) - inference as a compile runs it, then each
+ * declaration's decl_type carried to its uses (the resolver's job in a
+ * compile; a parse-time run does not resolve). `static_type_key` renders
+ * the static type inference gives a constant value: the cache key of a
+ * typed parse-time run.
+ */
+void infer_parse_time(Construct *root);
+class EvalValue;
+std::string static_type_key(const EvalValue &v);
+
+/*
  * --debug-ti: run inference (non-strict) and dump every declared identifier's
  * inferred type + use sites (machine-readable, tab-separated) to `os`. Used to
  * audit the corpus for spurious `dyn`s. See

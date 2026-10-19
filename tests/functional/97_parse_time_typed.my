@@ -1,0 +1,82 @@
+# A user function the PARSER runs - a constant call, a const initializer,
+# a callback a const builtin calls - runs TYPED: inferred for its argument
+# types first, so it computes what the same call computes at run time
+# (README, Const evaluation; question 5 in plans/open-language-questions.md,
+# decision A). Each pair below is one call folded and the same call at run
+# time, and the two must agree. Each body is one inference types
+# differently from its values, so an untyped constant run would disagree.
+# With inference on both are the typed answer, asserted when `typed`;
+# under -nti both run untyped and still agree.
+
+var typed = typestr(runtime(0)) == "dyn";
+
+# a local joined with a float: `x` is a float from its declaration on
+pure func f(int n) { var x = n; var r = str(x); x = 2.5; return r; }
+const F3 = f(3);
+assert(F3 == f(int(runtime(3))));
+assert(!typed || F3 == "3.000000");
+
+# a return joined with a float: every return is a float
+pure func g(int n) { if (n > 0) { return 1; } return 2.5; }
+assert(str(g(1)) == str(g(int(runtime(1)))));
+assert(!typed || str(g(1)) == "1.000000");
+
+# a local declared a float, given an int parameter
+pure func k(int n) { var x = 0.5; x = n; return str(x); }
+assert(k(3) == k(int(runtime(3))));
+assert(!typed || k(3) == "3.000000");
+
+# a template, recursive, reading a const array
+const W = [1, 2, 3];
+pure func show(v) { var w = v; var s = str(w); w = 0.5; return s; }
+const OPS = [show];
+pure func walk(i) => i == 0 ? show(W[0]) : walk(i - 1) + show(W[i]);
+const T = walk(2);
+assert(T == walk(int(runtime(2))));
+assert(!typed || T == "1.0000002.0000003.000000");
+
+# a lambda a const builtin calls
+const M = map(pure func(v) { var w = v; var s = str(w); w = 0.5; return s; },
+              [1, 2]);
+var mr = map(pure func(v) { var w = v; var s = str(w); w = 0.5; return s; },
+             [int(runtime(1)), 2]);
+assert(M == mr);
+assert(!typed || M == ["1.000000", "2.000000"]);
+
+# a function passed as an argument
+pure func apply(fn, x) => fn(x);
+const A2 = apply(show, 2);
+assert(A2 == apply(show, int(runtime(2))));
+assert(!typed || A2 == "2.000000");
+
+# a struct field read into a local
+struct P { float x; }
+pure func mk(int n) { var p = P(n); var y = p.x; var s = str(y); return s; }
+assert(mk(3) == mk(int(runtime(3))));
+assert(mk(3) == "3.000000");
+
+# a template read out of a const container runs untyped, folded or not, as
+# the program runs it: a baked value cannot be redirected to an instance
+assert(OPS[0](4) == OPS[int(runtime(0))](4));
+assert(OPS[0](4) == "4");
+
+# a function a parse-time call returns is the program's own, and a call
+# to it by name is typed
+pure func pick(b) { if (b) { return show; } return show; }
+const PF = pick(true);
+assert(PF(5) == PF(int(runtime(5))));
+assert(!typed || PF(5) == "5.000000");
+
+# a const holding a function reaches it as the program does: through a name
+# bound to it the program makes an instance, out of a const container it
+# cannot (a baked value), so that one runs untyped, folded or not
+const G = show;
+assert(G(5) == G(int(runtime(5))));
+assert(!typed || G(5) == "5.000000");
+pure func firstop() => OPS[0];
+const dyn F1 = firstop();
+assert(F1(4) == F1(int(runtime(4))));
+assert(apply(F1, 4) == apply(F1, int(runtime(4))));
+assert(F1(4) == "4");
+
+print("ok");
