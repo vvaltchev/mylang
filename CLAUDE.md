@@ -7533,7 +7533,11 @@ headless-testable behind a thin terminal shell:
   is normally suppressed (a decl, `print`, `if`/loop, void call), **except** when
   the last statement is a plain VALUE LOOKUP - a bare variable, a member/
   subscript access, or the `none`/`null` literal (`repl_echo_none`) - so
-  `nn`/`none` echo `=> <none>` while `print(x)`/`func f(){}` stay quiet. Errors
+  `nn`/`none` echo `=> <none>` while `print(x)`/`func f(){}` stay quiet.
+  **The shape is read off the input's TOKENS** (`repl_value_lookup`), the
+  node only locating the statement: by echo time the tree is folded, and a
+  void call `w()` folded to a `none` literal looked exactly like a written
+  `none` (it echoed `=> <none>` until 2026-10-10). Errors
   are caught per input and the loop
   continues — **including a lexer error**: the lexer can throw
   (`InvalidTokenEx`, e.g. `2_`, or an unterminated single-line string), so every
