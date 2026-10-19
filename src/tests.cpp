@@ -21948,6 +21948,22 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* a call the AST inliner splices into a TOP-LEVEL statement takes new
+     * slots of main's frame - its argument temps (`$a0 = kk`) and its
+     * callee's locals - and the REPL ran its top level with no frame:
+     * "Undefined variable '$a0'" (a script printed the answer) */
+    { "an inlined top-level call has a frame for its temps and locals",
+      { { "func k1(opt int q) => q ?? 0", "" },
+        { "k1(runtime(3))", "=> 3" },
+        { "func rt1(int d) { return d + 1; }", "" },
+        { "var kk1 = 5", "" },
+        { "rt1(kk1)", "=> 6" },
+        { "struct P1 { int x; int y; }", "" },
+        { "func g1(P1 q) => q.x + q.y", "" },
+        { "g1(P1(4, 5))", "=> 9" },
+        { "func g8(int c) { var t = c * 2; return t + 1; }", "" },
+        { "print(g8(kk1)); g8(kk1) + 1", "11 \n=> 12" } } },
+
     /* an error raised while COMPILING an input (the optimizers fold a
      * constant call: h(0) divides by zero) refuses that input as a type
      * error does, and the session goes on - it escaped the engine and
