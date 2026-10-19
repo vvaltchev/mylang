@@ -40,6 +40,3 @@ std::string reflect_field_type(const FieldDef &f);
  * `opt ` prefix ("opt P", "opt int"). Empty for DeclType::none. */
 std::string reflect_decl_annot(DeclType dt, const StructTypeDef *strct,
                                const TypeAnnot *annot, bool opt);
-
-/* A struct's in-memory layout (POD offsets/size, or boxed slots). */
-std::string reflect_layout(const StructTypeDef *def);

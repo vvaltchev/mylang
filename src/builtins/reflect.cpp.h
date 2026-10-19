@@ -328,33 +328,6 @@ static std::string reflect_typeof_rec(const EvalValue &e, CycStack &st)
     }
 }
 
-/* A struct type's full in-memory layout (POD offsets/sizes or boxed slots). */
-std::string reflect_layout(const StructTypeDef *def)
-{
-    std::string s(def->name ? std::string(def->name->val) : std::string("?"));
-    if (def->is_pod()) {
-        s += " - POD, size=" + std::to_string(def->size) +
-             " bytes, align=" + std::to_string(def->align) + "\n";
-        for (const auto &f : def->fields) {
-            int sz = 0, al = 0;
-            StructTypeDef::pod_field_metrics(f, sz, al);
-            s += "  " + std::string(f.name->val) + ": " +
-                 reflect_field_type(f) + " @" + std::to_string(f.offset) +
-                 " (" + std::to_string(sz) + " bytes)\n";
-        }
-    } else {
-        s += " - boxed, " + std::to_string(def->fields.size()) + " slot(s)\n";
-        for (const auto &f : def->fields)
-            s += "  " + std::string(f.name->val) + ": " +
-                 reflect_field_type(f) + " [slot " +
-                 std::to_string(f.slot) + "]\n";
-    }
-    for (const auto &c : def->consts)
-        s += "  const " + std::string(c.first->val) + " = " +
-             c.second.to_string() + "\n";
-    return s;
-}
-
 /* ------------------------------- builtins -------------------------------- */
 
 /*
@@ -488,8 +461,7 @@ static EvalValue reflect_make_layout(const StructTypeDef *qdef)
  * layout(S): a struct's in-memory layout as a structured `StructLayout` value -
  * `.name`, `.size`, `.align`, `.pod`, and `.fields` (an array<StructField> of
  * {name, type, offset, size, align}). Accepts a struct type descriptor or a
- * struct instance. (The legacy `reflect_layout` string renderer is kept for the
- * REPL `:layout`-style introspection.)
+ * struct instance.
  */
 EvalValue builtin_layout(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
