@@ -7824,8 +7824,14 @@ locals all happen and are inspectable (`:analyze`).
   later input folded or resolved). It restores every saved binding's VALUE
   in place: telling a rebound slot by its map node's ADDRESS passed in the
   debug build and failed in an optimized one, whose allocator handed the
-  erased node straight back to the redefinition. **An uninitialized
-  `var a;` commits as
+  erased node straight back to the redefinition. **An input that FAILS
+  WHILE RUNNING is half-committed on purpose** - the statements that
+  completed keep their run-time bindings - so the type side must match:
+  `ReplInfer::forget_unbound` gives back each global the input (re)bound
+  that no COMPLETED top-level statement declared (`repl_declared_names`),
+  or a committed type stood for a name the run never defined (`var dyn? q
+  = nope()` failed, and `q.v` was refused as a possibly-none base instead
+  of "Undefined variable 'q'"). **An uninitialized `var a;` commits as
   `dyn?`, not `none`** (`pin_new`): a script infers a plain `var`'s type from
   later uses (`var a; a = 3` → `int?`; a conflicting `a = "x"` is an error),
   but the REPL

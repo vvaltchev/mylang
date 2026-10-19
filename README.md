@@ -225,7 +225,10 @@ An input that fails prints its error, and the session goes on. An input
 refused before it runs defines nothing: a syntax or type error, or an error
 raised while it is compiled - a constant call such as `h(0)` is evaluated
 then, as in a script, so `func h(x) => 10 / x` makes `h(0)` a division by
-zero reported before anything of that input runs.
+zero reported before anything of that input runs. An input that fails while
+running keeps what its statements defined before the error, and the
+declarations after it define nothing (`var a = 1; var b = xs[9]; var c = 2`
+with a one-element `xs` defines `a` only).
 
 The line editor is hand-rolled (no `readline`/`reline` dependency, in keeping
 with the no-dependencies rule): live syntax highlighting, command history

@@ -26,6 +26,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <unordered_set>
 #include <algorithm>
 #include <iterator>
 #include <cctype>
@@ -67,6 +68,31 @@ repl_echo_none(const Construct *c)
             dynamic_cast<const MemberExpr *>(c) ||        /* obj.field */
             dynamic_cast<const Subscript *>(c) ||         /* a[i] */
             dynamic_cast<const LiteralNone *>(c));        /* none / null */
+}
+
+/* The global names a top-level statement binds when it runs: a function or
+ * struct declaration's name, a `var`/`const` declaration's targets. */
+static void
+repl_declared_names(const Construct *c,
+                    std::unordered_set<const UniqueId *> &out)
+{
+    if (const auto *fd = dynamic_cast<const FuncDeclStmt *>(c)) {
+        if (fd->id)
+            out.insert(fd->id->uid);
+    } else if (const auto *sd = dynamic_cast<const StructDeclStmt *>(c)) {
+        if (sd->id)
+            out.insert(sd->id->uid);
+    } else if (const auto *e = dynamic_cast<const Expr14 *>(c)) {
+        if (!(e->fl & pFlags::pInDecl))
+            return;
+        if (const auto *id = dynamic_cast<const Identifier *>(
+                e->lvalue.get()))
+            out.insert(id->uid);
+        else if (const auto *il = dynamic_cast<const IdList *>(
+                     e->lvalue.get()))
+            for (const auto &x : il->elems)
+                out.insert(x->uid);
+    }
 }
 
 /* Width budget for the `=>` echo's pretty-printer: a value whose single-line
@@ -555,6 +581,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
     Block *blk = dynamic_cast<Block *>(root.get());
     EvalValue last;
     const Construct *last_elem = nullptr;   /* the last top-level statement */
+    size_t ran = 0;                         /* statements that completed */
     const std::vector<const UniqueId *> names_before = global_names();
     std::streambuf *old_cout = std::cout.rdbuf(out.rdbuf());
 
@@ -585,11 +612,21 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
                         v.get<UndefinedId>().id, e->start, e->end);
                 last = std::move(v);
                 last_elem = e.get();
+                ran++;
             }
         }
     } catch (const Exception &e) {
         runtime_ctx->frame = prev_frame;
         std::cout.rdbuf(old_cout);
+        /* the statements that completed keep what they defined; the
+         * declarations the run never reached bound nothing, so their
+         * committed types go back */
+        std::unordered_set<const UniqueId *> bound;
+        for (size_t i = 0; i < ran; i++)
+            repl_declared_names(blk->elems[i].get(), bound);
+        infer.forget_unbound([&bound](const UniqueId *n) {
+            return bound.count(n) != 0;
+        });
         retained.push_back(std::move(root));   /* keep partial defs alive */
         out << format_error(e);
         return out.str();
