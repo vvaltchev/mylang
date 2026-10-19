@@ -434,6 +434,32 @@ else
     fail "myv: -c refused a program with constant class instances"
 fi
 
+# signature() renders each parameter's annotation as declared - from the
+# descriptor, since a loaded image has no AST: a struct, a parameterized
+# container or a box parameter's text rides in the image (v36's
+# `sig_type`). Without it an image would print `func f(p, array a, ...)`
+# where its source prints the annotations.
+cat > "$TMP/sigimg.my" <<'PROG'
+struct P { int x; }
+func f(P p, array<int> ai, dict<str,P>? dp, box<int> bx, opt int oi) => 1;
+print(signature(f));
+print(f(P(1), [2], none, box(3), none));
+PROG
+src_out=$("$BIN" "$TMP/sigimg.my" 2>&1)
+if "$BIN" -c "$TMP/sigimg.my" -o "$TMP/sigimg.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/sigimg.myv" 2>&1)
+    got_rc=$?
+    want='func f(P p, array<int> ai, dict<str,P>? dp, box<int> bx, opt int oi)'
+    if [ "$got_rc" = 0 ] && [ "$img_out" = "$src_out" ] && \
+       printf '%s' "$src_out" | grep -qF "$want"; then
+        pass "myv: signature() gives a parameter's annotation in an image"
+    else
+        fail "myv: signature: rc=$got_rc src=[$src_out] img=[$img_out]"
+    fi
+else
+    fail "myv: -c refused the annotated-parameter program"
+fi
+
 # A LOADED image whose main takes a SWITCHED call (recursion past the
 # JIT's sync depth cap, an exception across a call) must run exactly like
 # its source. The script driver moves the VmProgram it loads out of

@@ -15,6 +15,8 @@ class FuncDeclStmt;
 struct FieldDef;
 struct FuncDescriptor;
 struct StructTypeDef;
+struct TypeAnnot;
+enum class DeclType : unsigned char;
 
 /* The runtime STRUCTURAL type of a value ("array<int>", "dict<K,V>", a struct
  * name, a function signature, ...) - richer than the bare type() kind. */
@@ -30,6 +32,14 @@ std::string reflect_struct_ctor(const StructTypeDef *def);
  * "opt dict", "array<int>?", "P") - also what the decompiler renders a
  * struct declaration's fields with. */
 std::string reflect_field_type(const FieldDef &f);
+
+/* A declaration's ANNOTATION - a variable's or a parameter's - in the
+ * form reflect_field_type gives a field: a parameterized container or a
+ * box with its element types and a `?` suffix when it is `opt`
+ * ("array<int>?", "box<P>"), a struct by its name and a keyword with an
+ * `opt ` prefix ("opt P", "opt int"). Empty for DeclType::none. */
+std::string reflect_decl_annot(DeclType dt, const StructTypeDef *strct,
+                               const TypeAnnot *annot, bool opt);
 
 /* A struct's in-memory layout (POD offsets/size, or boxed slots). */
 std::string reflect_layout(const StructTypeDef *def);

@@ -187,6 +187,7 @@ def main(path):
         for _ in range(r.u32()):                  # params
             r.uid(); r.boolv(); r.boolv(); r.boolv()
             r.u8(); r.u8()                        # decl_type, proven_type
+            r.uid()                               # sig_type (v36)
         for _ in range(r.u32()):                  # captures
             r.uid(); r.u8(); r.u32(); r.loc(); r.loc()
         r.boolv(); r.u32(); r.u32()

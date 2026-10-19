@@ -18364,6 +18364,20 @@ static const std::vector<test> tests =
     { "reflect: signature of a struct instance (its ctor)",
       { "struct Pt { int x; int y; }",
         "var p = Pt(1, 2); assert(signature(p) == \"Pt(int x, int y)\");" } },
+    /* a parameter's annotation was read from its DeclType keyword alone:
+     * a struct parameter rendered with no type, `array<int>` as `array`,
+     * `dict<str,P>` as `dict`, `box<int>` as `box` */
+    { "reflect: signature and show() give each parameter's annotation",
+      { "struct P12 { int x; }",
+        "func f12(P12 p, array<int> ai, dict<str,P12> dp, box<int> bx,"
+        " opt int oi, array<int>? oa, opt P12 op) => 1;",
+        "assert(signature(f12) == \"func f12(P12 p, array<int> ai, "
+        "dict<str,P12> dp, box<int> bx, opt int oi, array<int>? oa, "
+        "opt P12 op)\");",
+        "assert(find(show(f12), \"func f12(P12 p, array<int> ai, "
+        "dict<str,P12> dp, box<int> bx, opt int oi, array<int>? oa, "
+        "opt P12 op)\") != none);",
+        "assert(f12(P12(1), [1], {}, box(1), none, none, none) == 1);" } },
     { "reflect: signature rejects a non-function",
       { "signature(42);" }, &typeid(TypeErrorEx) },
     { "reflect: layout() returns a structured StructLayout (POD)",

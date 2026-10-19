@@ -3042,6 +3042,11 @@ compile standalone, and there is nothing to add to the Makefile.
 shared `reflect_*` rendering helpers (signature/type/layout strings) the REPL's
 introspection commands reuse; it is `#include`d last (after the other builtins)
 so it can call `arr_elem_at`. See `plans/archived/repl-introspection.md`.
+**`reflect_decl_annot` is the ONE rendering of a declared annotation** (`P p`,
+`array<int>? a`, `opt int o`): `signature()` reads it through
+`ParamDesc::sig_type` - set by `sync_params`, stored in a `.myv` (v36), since
+a loaded image has no AST to render from - and the decompiler (`:show`'s
+parameters and declarations) calls it directly, so the two cannot drift.
 **`layout(S)` returns a structured value, not a string** — a **native composite
 type** (`StructLayout`, holding an `array<StructField>`), the first of the
 reflection objects. The two native `StructTypeDef`s are built in C++

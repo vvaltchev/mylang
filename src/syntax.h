@@ -8,6 +8,7 @@
 #include "uniqueid.h"
 #include "structtype.h"
 #include "funcdesc.h"
+#include "reflect.h"        /* reflect_decl_annot (sync_params) */
 
 enum pFlags : unsigned {
 
@@ -1836,6 +1837,13 @@ public:
                 const Identifier *p = params->elems[i].get();
                 desc->params.push_back({p->uid, p->opt_mod, p->const_param,
                                         p->dyn_mod, p->decl_type});
+                /* signature()'s text for an annotation the DeclType
+                 * keyword cannot say (a struct, array<T>, box<T>, ...) */
+                if (p->decl_type == DeclType::strct || p->decl_annot)
+                    desc->params.back().sig_type = UniqueId::get(
+                        reflect_decl_annot(p->decl_type, p->decl_struct,
+                                           p->decl_annot.get(),
+                                           p->opt_mod));
                 if (!p->opt_mod)
                     desc->min_args = static_cast<int>(i) + 1;
             }
