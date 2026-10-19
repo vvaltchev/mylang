@@ -1002,5 +1002,24 @@ print(\"not reached\")
 done
 [ $quit_ok = 1 ] && pass "repl: :quit / :q exit with trailing whitespace"
 
+# A struct thrown while an input is COMPILED (the optimizers fold `th()`)
+# is reported and the session goes on. It escaped run_repl, and main()
+# rendered it after ~ReplEngine had freed the struct's definition: an
+# ASan heap-use-after-free (a sanitized build), the REPL gone (any build).
+repl_run 'struct E {}
+func th() { throw E(); }
+th()
+print("after")
+'
+r=$?
+if [ $r = 0 ] && [ ! -s "$TMP/repl.err" ] &&
+   grep -q "Uncaught exception 'E', data: E()" "$TMP/repl.out" &&
+   grep -q '>> after' "$TMP/repl.out"; then
+    pass "repl: a struct thrown while compiling an input, then the next one"
+else
+    fail "repl: a struct thrown while compiling an input (rc $r): $(head -c \
+          300 "$TMP/repl.err")"
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc
