@@ -12,7 +12,7 @@ at run time (#49).
 | #  | question                                        | status     |
 |----|-------------------------------------------------|------------|
 | 3  | does a slice alias like any other array?        | decided: B |
-| 5  | a parse-time pure call runs before inference    | open       |
+| 5  | a parse-time pure call runs before inference    | decided: A |
 | 6  | a throwing constant expression inside a `try`   | open       |
 | 7  | duplicate keys in a dict literal                | open       |
 
@@ -200,6 +200,12 @@ try { print(half(0)); } catch (DivisionByZeroEx) { print("caught"); }
 This does not compile. `10 / 0` written directly behaves the same, and
 so does a plain `func half` (it is auto-pure). `runtime(0)` is the only
 workaround.
+
+Measured on a74901bd (default, `-nc` and `-tw` alike): the same holds in
+a branch that can never run - `if (runtime(false)) { print(half(0)); }`
+does not compile - and for a constant container read, `const A = [1, 2];
+try { print(A[5]); } catch (OutOfBoundsEx) { ... }` is a compile-time
+OutOfBoundsEx. `half(runtime(0))` prints "caught".
 
 - **A.** Keep it; the error message suggests `runtime()`.
 - **B.** Inside a `try` that has a `catch`, leave a throwing constant
