@@ -2909,6 +2909,21 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
 
             added_elem = false;
 
+            /*
+             * An extra `;` is an EMPTY statement wherever a statement may
+             * start - first in a block, or right after a braced block -
+             * as it is after any other statement (the skip below). This
+             * leading pAcceptBracedBlock left a `;` behind it unparsed, so
+             * `{ { a(); }; b(); }` and a block's leading `;` were syntax
+             * errors while the same `;` later in the block was not; the
+             * REPL's terminator appends one after every `}`, so a
+             * top-level `{ ... }` typed at the prompt always failed.
+             */
+            while (*c == Op::semicolon) {
+                c++;
+                added_elem = true;
+            }
+
             if (pAcceptBracedBlock(c, tmp, fl)) {
                 take_baked();
                 ret->elems.emplace_back(std::move(tmp));
