@@ -334,6 +334,27 @@ ReplEngine::set_color(bool on)
     impl->color = on;
 }
 
+/*
+ * The command word of a `:` meta-command input (`quit` for ":quit  "), or
+ * "" when the input is not one. The ONE reading of it: run_repl's exit
+ * test and meta_command's dispatch both ask, so an input cannot run as
+ * `:quit` and fail the exit test - the loop compared the whole input with
+ * ":quit", so `:quit ` (a trailing space) neither exited nor did anything.
+ */
+static string
+repl_meta_word(const string &input)
+{
+    const size_t s = input.find_first_not_of(" \t\r\n");
+    if (s == string::npos || input[s] != ':')
+        return "";
+    string word;
+    for (size_t i = s + 1;
+         i < input.size() && !isspace(static_cast<unsigned char>(input[i]));
+         i++)
+        word += input[i];
+    return word;
+}
+
 string
 ReplEngine::eval_input(const string &src)
 {
@@ -821,11 +842,10 @@ string
 ReplEngine::Impl::meta_command(const string &src)
 {
     /* Split into the command word and the rest (the argument). */
-    string cmd, arg;
+    const string cmd = repl_meta_word(src);
+    string arg;
     {
-        size_t i = 1;                       /* skip the ':' */
-        while (i < src.size() && !isspace(static_cast<unsigned char>(src[i])))
-            cmd += src[i++];
+        size_t i = 1 + cmd.size();          /* past the ':' and the word */
         while (i < src.size() && isspace(static_cast<unsigned char>(src[i])))
             i++;
         arg = src.substr(i);
@@ -1579,13 +1599,11 @@ run_repl()
 
         /* A leading ':' meta-command (`:quit` exits; others run via eval_input,
          * which dispatches them). The whole input is one history entry. */
-        const size_t s = input.find_first_not_of(" \t");
-        const bool is_meta = (s != string::npos && input[s] == ':');
-        if (is_meta && (input.substr(s) == ":quit" || input.substr(s) == ":q"))
+        const string word = repl_meta_word(input);
+        if (word == "quit" || word == "q")
             break;
 
-        if (input != ":quit" && input != ":q")
-            history.push_back(input);
+        history.push_back(input);
 
         std::cout << engine.eval_input(input);
     }

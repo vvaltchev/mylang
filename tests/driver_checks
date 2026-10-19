@@ -971,5 +971,36 @@ if [ $r != 1 ] || [ -e "$TMP/adir.myv" ]; then
 fi
 [ $dir_ok = 1 ] && pass "a directory is not a script: refused, no crash"
 
+# THE REPL FRONT END - run_repl, which -rt's `repl:` cases never reach
+# (they drive ReplEngine directly). A session is fed on stdin, HOME
+# pointing at a scratch directory (the history file). Kept HERE rather
+# than as a tests/int/repl session when it adds no coverage of its own:
+# a session is a coverage unit, and one that owns no element fails
+# int_run --gcov as redundant.
+repl_run() {
+    mkdir -p "$TMP/home"
+    printf '%s' "$1" > "$TMP/repl.in"
+    HOME="$TMP/home" "$BIN" --repl < "$TMP/repl.in" > "$TMP/repl.out" \
+        2> "$TMP/repl.err"
+}
+
+# `:quit` / `:q` exit with trailing whitespace too: the loop compared the
+# whole input with ":quit", so `:quit ` neither exited nor did anything.
+quit_ok=1
+for q in ':quit ' "$(printf ':q\t')"; do
+    repl_run "print(1)
+$q
+print(\"not reached\")
+"
+    r=$?
+    if [ $r != 0 ] || [ -s "$TMP/repl.err" ] ||
+       grep -q 'not reached' "$TMP/repl.out"; then
+        quit_ok=0
+        fail "repl: '$q' did not exit (rc $r): $(tr '\n' ' ' \
+              < "$TMP/repl.out")"
+    fi
+done
+[ $quit_ok = 1 ] && pass "repl: :quit / :q exit with trailing whitespace"
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc

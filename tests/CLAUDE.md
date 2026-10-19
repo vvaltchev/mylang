@@ -223,7 +223,10 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   under a FRESH HOME (history file); stdout must equal NAME.expected,
   stderr be empty, rc 0. `--update-repl` rewrites the .expected files -
   READ the diff, it is the assertion. (Not .out: .gitignore drops *.out,
-  which is how the first push lost all 24 of them.)
+  which is how the first push lost all 24 of them.) A session is a
+  coverage UNIT, so it must own an element (below): a front-end
+  regression check over paths other units already reach (`:quit ` with a
+  trailing space) goes in tests/driver_checks (`repl_run`) instead.
 - VALUE CLASSES (src/intsites.h, ML_INT_VCLASSES): declared operation
   boundaries, counted at the operation (`vc <class> <hits>` lines in the
   MYLANG_INT_OUT census). A class no run exercises fails int_run; with
