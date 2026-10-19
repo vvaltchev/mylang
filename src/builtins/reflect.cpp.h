@@ -450,8 +450,12 @@ static EvalValue reflect_make_layout(const StructTypeDef *qdef)
 
     SharedArrayObj::vec_type fieldvec;
     for (const FieldDef &f : qdef->fields) {
+        /* a field of a BOXED struct is a slot, with no byte layout
+         * whatever its kind - an int or a POD struct included (README:
+         * its offset, size and align are -1) */
         int sz = 0, al = 0;
-        const bool pod = StructTypeDef::pod_field_metrics(f, sz, al);
+        const bool pod = qdef->is_pod()
+                         && StructTypeDef::pod_field_metrics(f, sz, al);
         auto fo = make_intrusive<StructObject>(sf);
         fo->fields.emplace_back(
             EvalValue(SharedStr(std::string(f.name->val))), false);

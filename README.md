@@ -3595,8 +3595,9 @@ Return a struct's **in-memory layout** as a structured **`StructLayout`** value
 (a *native composite type* — an actual struct you can read programmatically),
 with `.name`, `.size` (POD bytes, 0 for boxed), `.align`, `.pod` (bool), and
 `.fields` — an `array<StructField>`, each `{ str name; str type; int offset;
-int size; int align; }`. For a boxed field, `offset`/`size`/`align` are `-1`
-(it has no byte layout).
+int size; int align; }`. A boxed struct's fields have no byte layout: their
+`offset`/`size`/`align` are `-1`, whatever their type (an `int` field of a
+struct that also holds a `str` included).
 ```C#
 struct Point { int x; int y; }
 var lay = layout(Point);

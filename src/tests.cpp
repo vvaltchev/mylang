@@ -18397,6 +18397,20 @@ static const std::vector<test> tests =
         "assert(len(lay.fields) == 2);",
         "assert(lay.fields[1].name == \"next\");",
         "assert(lay.fields[0].offset == -1);" } },
+    /* README: a boxed field has no byte layout - its offset, size and
+     * align are all -1. A POD-able field (an int, a POD struct) of a boxed
+     * struct reported its POD size and align */
+    { "reflect: layout() of a boxed struct gives every field -1 offset, "
+      "size and align",
+      { "struct Q13 { int a; float b; }",
+        "struct S13 { int i; str s; float f; bool b; Q13 q; }",
+        "var lay = layout(S13);",
+        "assert(lay.pod == false && len(lay.fields) == 5);",
+        "foreach (var fd in lay.fields)",
+        "    assert([fd.offset, fd.size, fd.align] == [-1, -1, -1]);",
+        "var pl = layout(Q13);",
+        "assert([pl.fields[1].offset, pl.fields[1].size,"
+        " pl.fields[1].align] == [8, 8, 8]);" } },
     { "reflect: layout() on a struct instance and field types",
       { "struct G { array<int> xs; }",
         "var g = G([1, 2]); var lay = layout(g);",
