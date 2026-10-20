@@ -384,7 +384,8 @@ folded literal has no `th`) lowers too. So a per-iteration array literal
 `EvalStmt`. A **dict LITERAL** `{k0: v0, ..}` is the twin **`MakeDictV`**: the
 key/value pairs compile INTERLEAVED into the run (`[k0,v0,k1,v1,..]`, key at
 even/value at odd), and the op builds via the shared **`build_dict_from_pairs`**
-(which freezes each key). Both share **`compile_to_run_slot`** (factored out of
+(which freezes each key, and stores a repeated key's LAST value at its first
+place - question 7). Both share **`compile_to_run_slot`** (factored out of
 `emit_args_range`) to place each element in its run slot. Dict-literal loops
 (`25_dict_member` 0.63x, `62_dict_word_count` 0.69x vs the tree-walker) go
 native. **The run is WIDENED before the build (#75):** an element (a dict

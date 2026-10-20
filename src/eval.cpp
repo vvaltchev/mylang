@@ -7959,9 +7959,12 @@ EvalValue build_dict_from_pairs(const EvalValue *pairs, size_t npairs,
 {
     DictObject::inner_type data;
     data.reserve(npairs);   /* profile #5: kill the insert rehash chain */
+    /* insert_or_assign, as dict(pairs) does: a repeated key takes the
+     * LAST value and keeps the place of its first occurrence - the
+     * literal is built like successive stores (question 7) */
     for (size_t i = 0; i < npairs; i++)
-        data.emplace(make_const_clone(pairs[2 * i], true),
-                     LValue(pairs[2 * i + 1], is_const));
+        data.insert_or_assign(make_const_clone(pairs[2 * i], true),
+                              LValue(pairs[2 * i + 1], is_const));
     return intrusive_ptr<DictObject>(make_intrusive<DictObject>(std::move(data)));
 }
 

@@ -551,10 +551,12 @@ const LangFeature lang_features[] = {
 { "dictlit", "dicts", "Dictionaries",
   "var d = {\"k\": 1};    d[\"k\"]    d.k    get(d, k)    get!(d, k)\n"
   "var dd = dict(0);   // a default dict",
-  "Keys may be any hashable scalar. A missing-key READ throws KeyNotFoundEx "
+  "Keys may be any hashable value. A missing-key READ throws KeyNotFoundEx "
   "(the read is non-opt) unless the dict has a default (dict(default_value)); "
   "a plain-assignment to a missing key inserts it. get(d,k) is the nullable "
-  "lookup (opt V), get!(d,k) is value-or-throw." },
+  "lookup (opt V), get!(d,k) is value-or-throw. A literal is built like "
+  "successive stores: a key written twice keeps the LAST value, at the "
+  "place of its first occurrence." },
 
 /* ---- strings ---- */
 { "strtype", "strings", "Strings",
