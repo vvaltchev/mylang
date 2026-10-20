@@ -19372,6 +19372,36 @@ bt_frame_lines(const std::string &s)
 }
 
 /*
+ * Question 6 (decision A): the note a compile-time constant expression's
+ * error carries. Only a catchable run-time kind gets it, and only while
+ * compiling: the driver passes its `compiling` flag (false once the program
+ * runs), the REPL true for an input's compile phase. driver_checks pins the
+ * driver's wiring; this pins the rule itself, in-process.
+ */
+static bool
+const_eval_note_rule()
+{
+    auto note = [](const Exception &e, bool compiling) {
+        std::ostringstream o;
+        format_const_eval_note(o, e, compiling);
+        return o.str();
+    };
+    const DivisionByZeroEx dz;
+    const InternalErrorEx ie;
+    const AlreadyDefinedEx ad;
+    const std::string with = note(dz, true);
+    bool ok = with.rfind("note: a constant expression is evaluated while "
+                         "compiling", 0) == 0
+        && with.find("runtime()") != std::string::npos;
+    ok = ok && note(dz, false).empty();     /* the program had started */
+    ok = ok && note(ie, true).empty();      /* no script may catch it */
+    ok = ok && note(ad, true).empty();      /* a plain compile error */
+    if (!ok)
+        fprintf(stderr, "const_eval_note_rule: [%s]\n", with.c_str());
+    return ok;
+}
+
+/*
  * Backtrace formatting: param names shown, most-recent on top with "main" at
  * the bottom, single-digit [N] frame numbers, line attribution (error site for
  * the top frame, call site otherwise), and the "at line" column aligned.
@@ -22277,6 +22307,17 @@ static const std::vector<repl_test> repl_tests =
         { "const Q6 = f6", "" },
         { "pure func Q6(int n) { return str(n) + \"!\"; }", "" },
         { "Q6(2)", "=> \"2!\"" } } },
+
+    /* question 6: a throwing constant expression is a compile error, and
+     * its message says so and names runtime(); a run-time error, a type
+     * error and an undefined name carry no such note */
+    { "a throwing constant expression says it is a compile error",
+      { { "10 / 0", "note: a constant expression is evaluated while "
+          "compiling" },
+        { "10 / runtime(0)", "DivisionByZeroEx", "note:" },
+        { "var q6 = 1", "" },
+        { "q6 = \"s\"", "TypeMismatchEx", "note:" },
+        { "nosuch6 + 1", "Undefined variable 'nosuch6'", "note:" } } },
 
     /* an in-place builtin on an UNDEFINED name (the REPL's open world)
      * reports the name, at the argument, as `zz[0] = 1` does - it raised
@@ -58401,6 +58442,8 @@ static const std::vector<extra_check> extra_checks =
       inliner_tail_inlines_block_body },
     { "tail-inlined block backtrace == non-inlined",
       inliner_tail_block_backtrace },
+    { "errfmt: a constant expression's compile error says so",
+      const_eval_note_rule },
     { "backtrace: basic format & alignment", backtrace_format_basic },
     { "backtrace: zero-padding for >9 frames", backtrace_zero_padding },
     { "backtrace: long-frame truncation", backtrace_truncation },

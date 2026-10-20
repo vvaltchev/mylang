@@ -945,6 +945,67 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# Question 6 (decision A): a constant expression that throws is a compile
+# error, inside a `try` too, and the message says so and names runtime()
+# as the way to raise it when the program runs. Only the DRIVER knows the
+# program has not started (-rt compiles in-process), so the note is checked
+# here: every compiling mode prints it, a run-time error (from source or
+# from an image) does not.
+cat > "$TMP/ce.my" <<'CEEOF'
+pure func half(int x) => 10 / x;
+try { print(half(0)); } catch (DivisionByZeroEx) { print("caught"); }
+CEEOF
+cat > "$TMP/rte.my" <<'RTEOF'
+pure func half(int x) => 10 / x;
+try { print(half(runtime(0))); } catch (DivisionByZeroEx) { print("ok"); }
+print(half(runtime(0)));
+RTEOF
+note='^note: a constant expression is evaluated while compiling'
+ce_ok=1
+for fl in "" -nc -tw -nr -nti; do
+    out=$("$BIN" $fl "$TMP/ce.my" 2>&1)
+    got_rc=$?
+    if [ "$got_rc" != 1 ] || ! printf '%s\n' "$out" | grep -q "$note" \
+            || ! printf '%s\n' "$out" | grep -q 'DivisionByZeroEx'; then
+        ce_ok=0
+        ce_bad="$fl: rc=$got_rc [$out]"
+    fi
+done
+out=$("$BIN" -c "$TMP/ce.my" -o "$TMP/ce.myv" 2>&1)
+if ! printf '%s\n' "$out" | grep -q "$note"; then
+    ce_ok=0
+    ce_bad="-c: [$out]"
+fi
+out=$(printf 'var x = 1;\nx = "s";\n' > "$TMP/te.my"; "$BIN" "$TMP/te.my" 2>&1)
+if printf '%s\n' "$out" | grep -q "$note" \
+        || ! printf '%s\n' "$out" | grep -q 'TypeMismatchEx'; then
+    ce_ok=0
+    ce_bad="a type error: [$out]"
+fi
+out=$("$BIN" -e 'print(nosuchname7);' 2>&1)
+if printf '%s\n' "$out" | grep -q "$note" \
+        || ! printf '%s\n' "$out" | grep -q "nosuchname7"; then
+    ce_ok=0
+    ce_bad="an undefined name: [$out]"
+fi
+r1=$("$BIN" "$TMP/rte.my" 2>&1)
+"$BIN" -c "$TMP/rte.my" -o "$TMP/rte.myv" >/dev/null 2>&1
+r2=$("$BIN" "$TMP/rte.myv" 2>&1)
+for r in "$r1" "$r2"; do
+    if printf '%s\n' "$r" | grep -q "$note" \
+            || ! printf '%s\n' "$r" | grep -q '^ok' \
+            || ! printf '%s\n' "$r" | grep -q 'DivisionByZeroEx'; then
+        ce_ok=0
+        ce_bad="run-time error: [$r]"
+    fi
+done
+if [ "$ce_ok" = 1 ]; then
+    pass "a throwing constant expression is a compile error that says so"
+else
+    fail "constant-expression note: $ce_bad"
+fi
+
+# ---------------------------------------------------------------------
 # readln() at END OF INPUT is none (typed `opt str`), so a script can
 # tell it from an empty line - both used to read as "", and
 # samples/shopping busy-looped forever on a closed stdin. A last line

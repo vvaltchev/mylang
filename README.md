@@ -1099,19 +1099,24 @@ like a `const`:
 
 ```
 $ ./build/mylang -e 'var a = 6; var b = 0; print(a / b);'
-DivisionByZeroEx: Division by zero at line 1, col 30:32
+DivisionByZeroEx: Division by zero at line 1, col 33:34
 
     var a = 6; var b = 0; print(a / b);
-                                ^^^^^
+                                    ^
+note: a constant expression is evaluated while compiling, so its error is a
+compile error, which no try/catch handles; to raise it when the program runs
+instead, pass one of its values through runtime(), as in 10 / runtime(0)
 ```
 
 This is intentional: a value we can fully compute at compile time that can never
 succeed is a program that can never run correctly, so it is a build error, not a
 runtime exception. `try`/`catch` is for *runtime* exceptions and does **not**
-catch these. If you want such an expression to stay a (catchable) runtime error
-— for tests, or to opt out of folding — wrap the runtime-varying part in
-[`runtime()`](#runtimeexpr): `a / runtime(b)` throws `DivisionByZeroEx` at
-runtime instead.
+catch these, and neither does a branch that never runs: `if (runtime(false))
+{ print(a / b); }` is the same compile error. If you want such an expression to
+stay a (catchable) runtime error — for tests, or to opt out of folding — wrap
+the runtime-varying part in [`runtime()`](#runtimeexpr): `a / runtime(b)`
+throws `DivisionByZeroEx` at runtime instead. The compiler's message says so,
+with the note shown above.
 
 ### Type system
 

@@ -279,6 +279,14 @@ struct ReplEngine::Impl {
         return o.str();
     }
 
+    /* an error raised while an input is compiled: one a constant
+     * expression raised says so (question 6) */
+    string format_compile_error(const Exception &e) const {
+        std::ostringstream o;
+        format_exception(o, e, lines, std::string(), /*compiling=*/true);
+        return o.str();
+    }
+
     /* Point an input's parser at the persistent const scope, and tell it
      * which const builtins' names an EARLIER input gave the program's own
      * function (or struct): the parser learns that from `func NAME` in its
@@ -734,7 +742,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
         return format_error(e);
     } catch (const Exception &e) {
         const_before.restore(*const_ctx);
-        return format_error(e);
+        return format_compile_error(e);
     }
 
     /* 2a-bis. Implicit top-level `var`: a bare `name = expr` to a name not
@@ -767,7 +775,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
         retained.push_back(std::move(root));   /* keep the AST alive (id_sym refs) */
         /* keep any trace lines emitted before the error (the reasoning that
          * led up to it), then the error itself. */
-        return out.str() + format_error(e);
+        return out.str() + format_compile_error(e);
     }
 
     /* 2c. Run the real optimizers so the REPL is the true interpreter (and the
@@ -796,7 +804,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
         infer.reject_input();
         const_before.restore(*const_ctx);
         retained.push_back(std::move(root));   /* keep the AST alive */
-        return out.str() + format_error(e);
+        return out.str() + format_compile_error(e);
     }
 
     /* 3. Evaluate each top-level statement directly in the persistent global

@@ -83,9 +83,10 @@ dump_loc_in_error(ostream &o, const Exception &e,
     }
 }
 
-void
-format_exception(ostream &o, const Exception &e,
-                 const std::vector<string> &lines, const string &src_name)
+static void
+format_exception_body(ostream &o, const Exception &e,
+                      const std::vector<string> &lines,
+                      const string &src_name)
 {
     if (auto *se = dynamic_cast<const SyntaxErrorEx *>(&e)) {
 
@@ -145,4 +146,25 @@ format_exception(ostream &o, const Exception &e,
     o << e.name << ": " << (e.msg ? e.msg : "");
     dump_loc_in_error(o, e, lines, src_name);
     o << format_backtrace(e);
+}
+
+void
+format_exception(ostream &o, const Exception &e,
+                 const std::vector<string> &lines, const string &src_name,
+                 bool compiling)
+{
+    format_exception_body(o, e, lines, src_name);
+    format_const_eval_note(o, e, compiling);
+}
+
+void format_const_eval_note(ostream &o, const Exception &e, bool compiling)
+{
+    if (!compiling || !e.is_catchable())
+        return;
+    o << "note: a constant expression is evaluated while compiling, so its "
+         "error is a\n"
+         "compile error, which no try/catch handles; to raise it when the "
+         "program runs\n"
+         "instead, pass one of its values through runtime(), as in "
+         "10 / runtime(0)\n";
 }

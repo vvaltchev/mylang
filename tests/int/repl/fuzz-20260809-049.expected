@@ -9,5 +9,8 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 
     len(-1);
         ^^
+note: a constant expression is evaluated while compiling, so its error is a
+compile error, which no try/catch handles; to raise it when the program runs
+instead, pass one of its values through runtime(), as in 10 / runtime(0)
 >> >> tracing: off
 >> 
