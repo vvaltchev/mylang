@@ -5736,7 +5736,13 @@ void Inferencer::commit_round()
 {
     for (auto &up : all_syms) {
         TypeSym *s = up.get();
-        if (s->func || s->pinned)
+        /* A struct or class NAME is a value nothing assigns: its type is
+         * the `dyn` its declaration gives it (declare_structdecl), which
+         * the finalize loop keeps. Committed here, it took the round's
+         * empty accumulator and finalized as `none` (#95): a `dyn`
+         * parameter refused it, and a template given it was never
+         * instantiated */
+        if (s->func || s->pinned || s->struct_type)
             continue;
         s->arg_kinds = s->round_arg_kinds;
         s->got_unknown = s->round_got_unknown;

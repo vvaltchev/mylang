@@ -4814,11 +4814,13 @@ unique_ptr<PtEntry> pt_build_value(FuncObject &obj,
                 break;
             }
             arg = pt_id(n, call_site);
+        } else if (v.is<StructTypeDef *>()) {
+            /* a struct TYPE by its name, declared in the copy (a `dyn`
+             * value there, as in the program - #95) */
+            const UniqueId *n = v.get<StructTypeDef *>()->name;
+            pt_bind(b, n, v, nullptr, nullptr);
+            arg = pt_id(n, call_site);
         } else {
-            /* a struct TYPE is no literal, and inference types one used as
-             * a value as `none` (task #95: a lambda given one is "may be
-             * none"), so a copy cannot type its callee: the call runs
-             * untyped */
             if (!MakeConstructFromConstVal(v, arg, true,
                                            is_readonly_value(v))) {
                 b.failed = true;

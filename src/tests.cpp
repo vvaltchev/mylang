@@ -1095,6 +1095,22 @@ static const std::vector<test> tests =
         "           return a; }",
         "k();" },
       &typeid(CannotRebindConstEx) },
+    /* #95: a struct's name used as a value is a `dyn`, as a builtin's
+     * is - it was `none`: a `dyn` parameter refused it, and a template or
+     * a lambda given one was never instantiated (the VM aborted) */
+    { "a struct name used as a value is a dyn",
+      { "struct P95 { int x; }",
+        "func ap(dyn mk) { return mk(3).x; }",
+        "assert(ap(P95) == 3);",
+        "func tm(mk) { return mk(4).x; }",
+        "assert(tm(P95) == 4 && tm(P95) == tm(P95));",
+        "var f = func(mk) => mk(5).x;",
+        "assert(f(P95) == 5);",
+        "var dyn t = P95;",
+        "assert(t(6).x == 6 && typestr(P95) == \"dyn\");" } },
+    { "a struct name used as a value needs a dyn variable",
+      { "struct P95 { int x; }", "var t = P95;" },
+      &typeid(DynRequiredEx), 5, 2, 7, 2 },
     /* #94: a const bound to a BUILTIN has no run-time symbol either -
      * its read is a reference to the builtin - and a store into it is a
      * store into the const, every form of it */
@@ -29096,21 +29112,17 @@ static bool parse_time_typed_runs()
             "  var w = v; w = 0.5; return typestr(w); }, c));" },
           "[\"float?\", \"float?\"] [\"float?\", \"float?\"] \n",
           true, false },
-        /* a struct TYPE argument: the template is not instantiated for it,
-         * here as at run time, so its body runs untyped (task #95: the VM
-         * cannot make that call, so no run-time half here) */
+        /* a struct TYPE argument: a `dyn` value (#95), for which the
+         * template is instantiated, here as at run time */
         { "a struct type passed as an argument", {
             "struct P { float x; }",
             "pure func mk(t, int n) {",
             "  var x = n; var r = str(x); x = 0.5;",
             "  return r + str(t(n).x); }",
             "const Z = mk(P, 3);",
-            "print(Z);" },
-          "33.000000 \n", true, false },
-        /* by value too: a struct type cannot be typed in a copy (task #95:
-         * inference types a struct name used as a value `none`), so the
-         * call runs untyped - the known gap, "33.000000" where the run-time
-         * call gives "3.0000003.000000" */
+            "print(Z, mk(P, int(runtime(3))));" },
+          "3.0000003.000000 3.0000003.000000 \n", true, false },
+        /* by value too: the copy declares the struct by its name */
         { "a struct type passed through a value", {
             "struct P { float x; }",
             "const OPT = [pure func(t, int n) {",
@@ -29118,8 +29130,8 @@ static bool parse_time_typed_runs()
             "  return r + str(t(n).x); }];",
             "pure func mk2(int k) => OPT[k](P, 3);",
             "const Z = mk2(0);",
-            "print(Z);" },
-          "33.000000 \n", true, true },
+            "print(Z, mk2(int(runtime(0))));" },
+          "3.0000003.000000 3.0000003.000000 \n", true, false },
         /* a function a running function passes through a value, by its
          * name: its copy is the instance the program makes */
         { "a function passed through a value", {

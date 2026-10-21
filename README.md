@@ -2688,6 +2688,16 @@ call and reuses the same argument rules — positional, named (`x: v`), and mixe
 wrong-typed, missing, extra, reordered, or unknown-named field is a compile
 error.
 
+The type's name can also be used as a **value** - a constructor passed
+around. Like a builtin used as a value it is a `dyn`, so a variable holding
+it is declared `dyn`, and a call through it is checked when it runs:
+
+```C#
+func build(dyn mk, int n) => mk(n, n * 10);
+var dyn ctor = Point;
+print(build(Point, 1).y, ctor(2, 3).x);   # 10 2
+```
+
 **Fields take the same explicit types as variables** — `bool`, `int`, `float`,
 `str`, `array`, `dict`, another struct type, or `dyn`. v1 restrictions (to be
 lifted later): a field must have an explicit type (no `var`), and `opt` is

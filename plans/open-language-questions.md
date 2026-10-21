@@ -171,16 +171,23 @@ Known limit: a type the program joins over the whole program (an
 un-annotated `opt` parameter, a lambda's unless it is written as a
 builtin's argument, a template's instance through a value, which the
 program makes only when every call through it agrees) is decided by the
-compile-time call alone.
+compile-time call alone. Narrowed on 2026-10-21 by #96: a constant call
+inside an expression is folded only once the program is typed, and runs
+when the program types it otherwise; the limit remains where the value
+is needed while compiling (a const initializer, a decided condition, a
+struct's const member) and for a join the call reaches only inside the
+function it calls.
 
-Found on the way (pre-existing, tasks #94-#96): a const bound to a
-builtin is undefined inside a function body; a struct name used as a
-value is typed `none` - a `dyn` parameter given one is refused, the VM
-aborts calling a template given one, and a typed copy cannot type a call
-a running function makes with one (it runs untyped, the one divergence
-left: `OPT[k](P, 3)` through a const array); a compile warning's location -
-and a compile error's - moves with folding (a folded call's site is
-gone from the program inference sees).
+Found on the way (pre-existing, tasks #94-#96), all three fixed on
+2026-10-21: a const bound to a builtin was undefined inside a function
+body (a read of it is now that builtin); a struct name used as a value
+was typed `none` - a `dyn` parameter given one was refused, the VM
+aborted calling a template given one, and a typed copy could not type a
+call a running function made with one (it is a `dyn` now, passed by its
+name in a copy); a compile warning's location - and a compile error's,
+and a joined parameter's type - moved with folding (a folded call's site
+was gone from the program inference saw; such a call is now folded
+after inference).
 
 Tests: `parse_time_typed_runs` (`-rt`, every engine, folding on and
 off, with counters proving the copy ran), the `repl:` cross-input case,
