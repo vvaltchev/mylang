@@ -948,6 +948,30 @@ MakeConstructFromConstVal(const EvalValue &v,
  * binding already, and a const builtin has its own run-time slot.
  */
 static inline bool ShouldConstSymbolExistAtRuntime(const EvalValue &rvalue);
+namespace { const UniqueId *pt_builtin_name(const Builtin &bi); }
+
+/*
+ * #94: a const bound to a BUILTIN (`const L = len;`) has no run-time
+ * symbol - a builtin is a trivial value, so its declaration is dropped
+ * like a scalar's - and a read of it becomes a reference to that builtin,
+ * as a scalar's becomes its value: `L(a)` is `len(a)`, typed, folded and
+ * called like it. The reference is builtin_only, so a program's own name
+ * `len` cannot take it. Null: not a builtin value, or the builtin's own
+ * name already.
+ */
+static unique_ptr<Identifier>
+builtin_ref(const EvalValue &v, const UniqueId *name)
+{
+    if (!v.is<Builtin>())
+        return nullptr;
+    const UniqueId *bn = pt_builtin_name(v.get_ref<Builtin>());
+    if (!bn || bn == name) /* INT-COV-EXEMPT: a const builtin always has one */
+        return nullptr;
+    auto r = make_unique<Identifier>(bn->val);
+    r->builtin_only = true;
+    r->is_const = true;
+    return r;
+}
 
 static void
 declare_captured_const_scalars(ParseContext &c, IdList *caps)
@@ -964,8 +988,10 @@ declare_captured_const_scalars(ParseContext &c, IdList *caps)
         /* only a value that becomes a literal: a struct NAME is bound to
          * its descriptor here and has a run-time symbol already (its
          * hoisted global slot) - a capture of it reads that */
-        unique_ptr<Construct> lit;
-        MakeConstructFromConstVal(lv->get(), lit);
+        unique_ptr<Construct> lit = builtin_ref(lv->get(), cap->uid);
+        const bool is_fn = lit != nullptr;   /* a builtin: a `dyn` value */
+        if (!lit)
+            MakeConstructFromConstVal(lv->get(), lit);
         if (!lit)
             continue;
         ML_CHECK(!c.cap_const_decls.empty());
@@ -982,6 +1008,7 @@ declare_captured_const_scalars(ParseContext &c, IdList *caps)
         auto lhs = make_unique<Identifier>(cap->uid->val);
         lhs->start = cap->start;
         lhs->end = cap->end;
+        lhs->dyn_mod = is_fn;
         d->lvalue = std::move(lhs);
         lit->start = cap->start;
         lit->end = cap->end;
@@ -1182,6 +1209,9 @@ pAcceptId(ParseContext &c, unique_ptr<Construct> &v, bool resolve_const = true)
                 const EvalValue &cv = RValue(const_value);
                 const bool cls = cv.is<StructTypeDef *>()
                     && cv.get<StructTypeDef *>()->is_class;
+                if (auto ref = builtin_ref(
+                        cv, static_cast<Identifier *>(v.get())->uid))
+                    v = std::move(ref);
                 MakeConstructFromConstVal(cv, v);
                 v->is_const = true;
                 if (cls)
@@ -1869,6 +1899,15 @@ pRefuseUnassignable(const Construct *lv, const char *what)
 {
     pRefuseOptionalTarget(lv);
 
+    /* #94: a const bound to a builtin reads as a reference to it
+     * (builtin_ref) - a store there is a store into the const */
+    if (lv->is_id() && static_cast<const Identifier *>(lv)->builtin_only)
+        throw CannotRebindConstEx(lv->start, lv->end);
+    if (lv->is_idlist())
+        for (const auto &t : static_cast<const IdList *>(lv)->elems)
+            if (t->builtin_only)
+                throw CannotRebindConstEx(t->start, t->end);
+
     /* a FIELD of a constant (`K.k`, `P.CONST`) is a location no store can
      * write, decidable here like the element `K["k"]` (folded to its value,
      * or - naming no element - marked nc_folds): a member is not folded at
@@ -2445,6 +2484,10 @@ pExpr14_body(ParseContext &c, unsigned fl)
                             || k == Type::t_bool || k == Type::t_none
                             || k == Type::t_str)
                         pRefuseFoldedTarget(id->start, id->end);
+                    /* a const bound to a builtin (#94): a store into the
+                     * const, as for the first target */
+                    if (builtin_ref(RValue(cv), id->uid))
+                        throw CannotRebindConstEx(id->start, id->end);
                     id->is_const = true;
                 }
             }
@@ -4542,14 +4585,11 @@ void pt_bind(PtBuild &b, const UniqueId *uid, const EvalValue &v,
     if (!pt_bind_new(b, uid, ident))
         return;
 
-    if (bname) {
-        /* another name for a builtin: `const dyn L = len;` (a builtin
-         * value is a `dyn` one) */
-        if (bname != uid)
-            b.decls.push_back(pt_decl(uid, pt_id(bname, b.at), true, b.at,
-                                      true));
+    /* a builtin is bound under its own name only - a read of a const
+     * bound to one is the builtin's name (#94) - and the copy's root
+     * holds the builtins */
+    if (bname)
         return;
-    }
 
     if (v.is<StructTypeDef *>()) {
         /* the struct's own descriptor, not a copy: the decl does not own

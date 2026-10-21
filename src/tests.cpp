@@ -1095,6 +1095,57 @@ static const std::vector<test> tests =
         "           return a; }",
         "k();" },
       &typeid(CannotRebindConstEx) },
+    /* #94: a const bound to a BUILTIN has no run-time symbol either -
+     * its read is a reference to the builtin - and a store into it is a
+     * store into the const, every form of it */
+    { "a const bound to a builtin: an assignment to it is refused",
+      { "const LB = len;", "LB = 3;" },
+      &typeid(CannotRebindConstEx), 1, 2, 4, 2 },
+    { "a const bound to a builtin: ++ on it is refused",
+      { "const LB = len;", "func f() { LB++; }" },
+      &typeid(CannotRebindConstEx), 12, 2, 15, 2 },
+    { "a const bound to a builtin: a multi-assign target is refused",
+      { "const LB = len; var a = 0;", "a, LB = [1, 2];" },
+      &typeid(CannotRebindConstEx), 4, 2, 7, 2 },
+    { "a const bound to a builtin: the first multi-assign target too",
+      { "const LB = len; var a = 0;", "LB, a = [1, 2];" },
+      &typeid(CannotRebindConstEx), 1, 2, 4, 2 },
+    /* ... and every read of it is the builtin: called folded and at run
+     * time, from a function, a pure function, a closure that captures it,
+     * another const, a container, and under its own name's shadow */
+    { "a const bound to a builtin reads as that builtin",
+      { "const L = len;",
+        "assert(L([1, 2]) == 2 && L(runtime(\"abc\")) == 3);",
+        "func g(a) { return L(a) + 1; }",
+        "assert(g(runtime([1, 2, 3])) == 4);",
+        "pure func f(a) => L(a) * 10;",
+        "const F = f([1]);",
+        "assert(F == 10 && f(runtime([1, 2])) == 20);",
+        "var c = func [L] (x) { return L(x) - 1; };",
+        "assert(c(runtime(\"abcd\")) == 3);",
+        "const M = L;",
+        "assert(M(runtime([0])) == 1);",
+        "const OPS = [L, abs];",
+        "assert(OPS[int(runtime(0))]([7, 7]) == 2 && OPS[1](-3) == 3);",
+        "var dyn h = L;",
+        "assert(h(runtime([5])) == 1 && typestr(h) == typestr(len));",
+        "func q(L) { return L + 1; }",
+        "assert(q(runtime(41)) == 42);",
+        "func fl(len) { return L(len) + len[0]; }",
+        "assert(fl(runtime([10, 2])) == 12);",
+        /* inlined, its argument pasted for the parameter - not for the
+         * reference that names the builtin */
+        "var z = [5, 6, 7];",
+        "func g3(len) => L(len) + 1;",
+        "assert(g3(z) == 4);",
+        /* run at compile time, where the parameter is a binding too */
+        "pure func f3(len) => L(len) + 1;",
+        "const Z3 = f3([1, 2]);",
+        "assert(Z3 == 3 && f3(runtime([1, 2, 3])) == 4);",
+        "func kt(len) { return typestr(L) + \"/\" + typestr(len); }",
+        "assert(kt(\"s\") == \"dyn/str\");",
+        "var n = L(runtime([1, 2]));",
+        "assert(typestr(n) == \"int\");" } },
     /* an element before the comma is not a multi-assignment target (an id
      * list holds names only) - nor a folded const */
     { "parse: an element as a multi-assign target is a syntax error",
@@ -22315,8 +22366,8 @@ static const std::vector<repl_test> repl_tests =
         { "pure func f5(int n) { return str(n); }", "" },
         { "f5(3)", "=> \"3\"" },
         { "g5(1)", "=> \"14.000000\"" },
-        /* a builtin under another name: declared as that name (the
-         * run-time half of this is task #94) */
+        /* a builtin under another name: its read is the builtin's own
+         * name (#94) */
         { "const L5 = len", "" },
         { "pure func h5(a) {"
           " var x = L5(a); var r = str(x); x = 0.5; return r; }", "" },
@@ -22352,6 +22403,16 @@ static const std::vector<repl_test> repl_tests =
         { "var q6 = 1", "" },
         { "q6 = \"s\"", "TypeMismatchEx", "note:" },
         { "nosuch6 + 1", "Undefined variable 'nosuch6'", "note:" } } },
+
+    /* #94: a const bound to a builtin, read in a LATER input - it has no
+     * run-time symbol, and the read is the builtin itself */
+    { "a const bound to a builtin is the builtin in a later input",
+      { { "const L94 = len", "" },
+        { "func g94(a) { return L94(a) + 1; }", "" },
+        { "g94(runtime([1, 2, 3]))", "=> 4", "Undefined" },
+        { "var c94 = func [L94] (x) => L94(x)", "" },
+        { "c94(\"abcd\")", "=> 4", "Undefined" },
+        { "L94 = 2", "CannotRebindConstEx" } } },
 
     /* an in-place builtin on an UNDEFINED name (the REPL's open world)
      * reports the name, at the argument, as `zz[0] = 1` does - it raised

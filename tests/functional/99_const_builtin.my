@@ -1,0 +1,57 @@
+# A const bound to a builtin is that builtin (README, Constants): it has no
+# run-time symbol - a builtin is a trivial value, so its declaration is
+# dropped like a scalar's - and every read of it is a reference to the
+# builtin, as a scalar's read is its value. It was "Undefined variable"
+# wherever a read was not folded away (task #94).
+
+const L = len;
+print(L([1, 2]), L(runtime("abc")));
+assert(L(runtime([1, 2, 3])) == 3);
+
+# from a function, a pure function (folded and called at run time) and a
+# closure that captures it
+func g(a) { return L(a) + 1; }
+pure func f(a) => L(a) * 10;
+const F = f([1]);
+var c = func [L] (x) { return L(x) - 1; };
+print(g(runtime([1, 2, 3])), F, f(runtime([1, 2])), c(runtime("abcd")));
+assert(g(runtime([1, 2, 3])) == 4 && F == 10 && c(runtime("abcd")) == 3);
+
+# through another const and a container
+const M = L;
+const OPS = [L, abs];
+print(M(runtime([0])), OPS[int(runtime(0))]([7, 7]), OPS[1](-3));
+assert(M(runtime([0])) == 1 && OPS[1](-3) == 3);
+
+# its result is typed as the builtin's; a value use is a dyn, as len's is
+var n = L(runtime([1, 2]));
+var dyn h = L;
+print(typestr(n), h(runtime([5])));
+assert(typestr(n) == "int" && typestr(h) == typestr(len));
+
+# a parameter of the same name is the parameter
+func q(L) { return L + 1; }
+print(q(runtime(41)));
+assert(q(runtime(41)) == 42);
+
+# a parameter named like the builtin does not take the const's reads
+func fl(len) { return L(len) + len[0]; }
+print(fl(runtime([10, 2])));
+assert(fl(runtime([10, 2])) == 12);
+
+# inlined, the argument is pasted for the parameter, not for the reference
+# that names the builtin; run at compile time, the parameter is a binding
+# there too
+var z = [5, 6, 7];
+func g3(len) => L(len) + 1;
+pure func f3(len) => L(len) + 1;
+const Z3 = f3([1, 2]);
+print(g3(z), Z3, f3(runtime([1, 2, 3])));
+assert(g3(z) == 4 && Z3 == 3 && f3(runtime([1, 2, 3])) == 4);
+
+# the static type of the reference is the builtin's, not the parameter's;
+# untyped (-nti), typestr answers from the value
+var typed = typestr(runtime(0)) == "dyn";
+func kt(len) { return typestr(L) + "/" + typestr(len); }
+print(kt("s"));
+assert(kt("s") == (typed ? "dyn/str" : "builtin/str"));

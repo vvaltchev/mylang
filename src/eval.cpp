@@ -363,6 +363,17 @@ EvalValue Identifier::do_eval(EvalContext *ctx, bool rec) const
         return EvalValue(&builtin_slot(sym.slot));
     }
 
+    if (builtin_only) {
+        /* before the resolver gives it the builtin table's slot: the
+         * parser's constant evaluation of a const bound to a builtin (#94),
+         * in a pure function whose parameter may have the builtin's name -
+         * the builtin, not that binding. Not a const builtin (`box`): the
+         * lookup below, which a const scope cannot answer either. */
+        const auto it = EvalContext::const_builtins.find(uid);
+        if (it != EvalContext::const_builtins.end())
+            return it->second.get();
+    }
+
     while (ctx) {
 
         LValue *lval = ctx->lookup(this);

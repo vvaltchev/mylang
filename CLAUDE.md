@@ -3348,6 +3348,19 @@ and it lives *inside the parser*. Mechanics:
   at every use site would be wasteful; operations on them like `arr[2]` or
   `len(arr)` still get
   const-folded to literals though.
+  **A const bound to a BUILTIN (`const L = len;`) is dropped like a scalar
+  (#94)**, so its read must be something that stands at run time:
+  `pAcceptId` replaces it by `builtin_ref` (parser.cpp), an Identifier
+  naming the builtin with `Identifier::builtin_only` set. A parameter may
+  share the builtin's name (`func f(len) => L(len)`), so EVERY pass that
+  resolves a name must ask the flag first: the resolver binds it to the
+  builtin table's slot, the inferencer to no user symbol,
+  `Identifier::do_eval` (parse time, a pure function run then) to
+  `const_builtins`, and the inliner's `substitute` never pastes an
+  argument for it. A capture of it
+  gets the synthesized `var dyn L = len` (H2), and a store into it is
+  CannotRebindConstEx (`pRefuseUnassignable`, the multi-assign target
+  check). It was "Undefined variable" wherever a read was not folded.
 - **Const-expression de-duplication (CSE).** The three sites that bake an
   array/dict (`pAcceptCallExpr`, `pAcceptSubscript`, the `pExpr14` decl-rvalue)
   go through **`cse_materialize()`** (`parser.cpp`) instead of calling

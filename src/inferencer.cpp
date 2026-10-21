@@ -4518,8 +4518,10 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
          * a freed node's address, so a stale entry must be OVERWRITTEN, not
          * kept (keeping it bound a callee to a prior clone -> the bug).
          * walk_struct visits each node once, so this never double-resolves. */
-        id_sym[id] = lookup(s, id->uid);
-        if (resolves_to_capture(s, id->uid))
+        /* a builtin_only reference is the builtin's (#94), whatever a
+         * scope declares */
+        id_sym[id] = id->builtin_only ? nullptr : lookup(s, id->uid);
+        if (!id->builtin_only && resolves_to_capture(s, id->uid))
             capture_uses.insert(id);
         else
             capture_uses.erase(id);
