@@ -34606,6 +34606,98 @@ static bool myv_root_slot_count_checked()
 }
 
 /*
+ * 2026-10-21 (myv_fuzz fat-258): a PushHandler naming an EMPTY handler
+ * site - no catch clause, no finally - is refused at load. Codegen leaves
+ * an empty site only as a hole no PushHandler names; one a mutated image
+ * names passed the loader and aborted the JIT's remap check
+ * (verify_handler_sites) in an ASSERTS build. Both halves are pinned: the
+ * tampered image is refused by name, the intact one loads and runs.
+ */
+static bool myv_empty_handler_refused()
+{
+    const char *lines_arr[] = {
+        "var s = 0;",
+        "try { s = 10 / runtime(0); } catch (DivisionByZeroEx) { s = 7; }",
+        "print(s);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        int region = -1;
+        for (const Instr &in : prog.root.code)
+            if (in.op == OpCode::PushHandler)
+                region = static_cast<int>(in.a_lit());
+        if (region < 0) {
+            fprintf(stderr, "myv_empty_handler_refused: no PushHandler - "
+                            "the case is vacuous\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        std::string tdir = "/tmp";
+        for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+            const std::optional<std::string> e = env_get(var);
+            if (e && !e->empty()) { tdir = *e; break; }
+        }
+        while (tdir.size() > 1
+               && (tdir.back() == '/' || tdir.back() == '\\'))
+            tdir.pop_back();
+        const std::string path = tdir + "/mylang-myv-emptyhandler.myv";
+        Chunk::HandlerSite &site =
+            prog.root.handler_sites[static_cast<size_t>(region)];
+        const Chunk::HandlerSite pristine = site;
+        site.clauses.clear();
+        site.fin_pc = -1;
+        myv_write(prog, path, MyvSourceRef());
+        try {
+            MyvSource img_src;
+            VmProgram loaded = myv_read(path, img_src);
+            fprintf(stderr, "myv_empty_handler_refused: ACCEPTED\n");
+            ok = false;
+        } catch (Exception &e) {
+            if (std::string(e.name) != "MyvError" || !e.msg
+                    || !strstr(e.msg, "empty handler region")) {
+                fprintf(stderr, "myv_empty_handler_refused: threw %s: %s\n",
+                        e.name, e.msg ? e.msg : "");
+                ok = false;
+            }
+        }
+        site = pristine;
+        myv_write(prog, path, MyvSourceRef());   /* intact: loads + runs */
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(loaded);
+        } catch (Exception &) {
+        }
+        std::cout.rdbuf(old_buf);
+        if (cap.str().find("7") == std::string::npos) {
+            fprintf(stderr, "myv_empty_handler_refused: ran to \"%s\"\n",
+                    cap.str().c_str());
+            ok = false;
+        }
+        std::remove(path.c_str());
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_empty_handler_refused: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
  * #32 (2026-10-08): an INDIRECT call's arg0 DESCRIPTOR (CallSite::A0 -
  * its kind, slot, key temp, member key, and the new chain form's steps)
  * and an in-place builtin's CHAIN steps (BuiltinCall::steps) are read by
@@ -58193,6 +58285,8 @@ static const std::vector<extra_check> extra_checks =
     { "myv: v19 - the root chunk's slot_count and the stored root slot "
       "count must agree, either copy mutated is refused",
       myv_root_slot_count_checked },
+    { "myv: a PushHandler naming an empty handler site is refused "
+      "(myv_fuzz fat-258)", myv_empty_handler_refused },
     { "myv: an indirect call's arg0 descriptor and an in-place builtin's "
       "chain steps are bounded at load (#32)",
       myv_call_site_a0_bounded },

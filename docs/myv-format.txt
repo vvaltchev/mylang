@@ -1047,7 +1047,9 @@ re-resolves it through `vm_lookup_builtin`; an unknown name is refused.
 
 Indexed by TRY REGION ID - the same id the exception ops carry - so entry
 i describes region i.  A try whose native lowering bailed leaves an EMPTY
-entry (zero clauses, fin_pc -1): a hole in the id space, harmless.
+entry (zero clauses, fin_pc -1): a hole in the id space, harmless.  No
+PushHandler names a hole: the loader refuses an image whose PushHandler
+names an empty entry (2026-10-21, myv_fuzz).
 
 This is PRIMARY data, not derived: it IS what the raise path matches
 against.  The interpreted CatchTest/Reraise chain that used to mirror it
