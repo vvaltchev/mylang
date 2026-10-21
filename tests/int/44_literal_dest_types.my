@@ -149,24 +149,35 @@ pure func mkdd(int n) {
 }
 want("mkdd", str(mkdd(1)), "{1.000000: 1.000000}");
 
-# a folded call's GENERAL array of class instances bound to an array<C>
-# takes the flat class storage (the instances are the constant's own)
+# a folded BUILTIN call's GENERAL array of class instances bound to an
+# array<C> takes the flat class storage (the instances are the
+# constant's own), and a flat one bound to a `dyn` variable is made
+# general (any value fits). Folded only: under -nc the call keeps map's
+# general array, a difference README calls unobservable for a class
+# array (array_storage)
 const KC = C(5);
-pure func mkc() { var dyn a = [KC]; return a; }
-array<C> acf = mkc();
-want("acf", str(acf) + array_storage(acf), "[C(v: 5)]class");
-# ...and one bound to a `dyn` variable is made general (any value fits)
+const KCS = [KC, KC];
+array<C> acf = map(pure func(c) => c, KCS);
+want("acf", str(acf) + array_storage(acf), "[C(v: 5), C(v: 5)]class");
+var dyn dkc = clone(KCS);
+dkc[0] = "s";
+want("dkc", str(dkc), "[\"s\", C(v: 5)]");
+# a USER function's call is folded only after inference, so its value
+# keeps the storage the function built, as at run time (#96): a class
+# array converts itself on a write of another kind, a flat struct array
+# refuses one, and a general array stays general in an array<C>
 pure func mkcg() { var a = [KC, KC]; return a; }
 var dyn dkg = mkcg();
 dkg[0] = "s";
 want("dkg", str(dkg), "[\"s\", C(v: 5)]");
 pure func mkpg() { var a = [P(1, 2.5)]; return a; }
 var dyn dpg = mkpg();
-dpg[0] = 3;
-want("dpg", str(dpg), "[3]");
+var dpg_refused = 0;
+try { dpg[0] = 3; } catch (TypeErrorEx) { dpg_refused = 1; }
+want("dpg", str(dpg_refused) + str(dpg), "1[P(x: 1, y: 2.500000)]");
 pure func mkcd() { array<dyn> a = [KC, KC]; return a; }
 array<C> acf2 = mkcd();
-want("acf2", str(len(acf2)) + array_storage(acf2), "2class");
+want("acf2", str(len(acf2)) + array_storage(acf2), "2general");
 
 # --- stores into a declared field / nested element / box widen
 var s = S([1], {"a": 1}, [[none]], 1, 1, none, 1);

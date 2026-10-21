@@ -217,6 +217,21 @@ public:
     bool nc_folds = false;
 
     /*
+     * #96: a constant expression holding a call to a USER function, which a
+     * folding parse evaluates but does not replace while parsing - type
+     * inference must see the call, as it does under `-nc`, or a parameter
+     * the program joins over its call sites misses this one (and every
+     * diagnostic about the call moves). `late_fold` is the literal the
+     * parse computed; Inferencer::apply_late_folds swaps it in once the
+     * program is typed, when its type is the one inference gave the node.
+     * Null: no literal can stand for it, and the node runs. Parse and
+     * inference time only; a clone carries both (a template instance
+     * cloned from a body during inference folds the same way).
+     */
+    bool defer_fold = false;
+    std::unique_ptr<Construct> late_fold;
+
+    /*
      * Representation hint for an array-producing node, set by the inferencer
      * from the destination type so the array is built in its final
      * representation (type-driven creation, no promotion). On a CallExpr's args
@@ -305,6 +320,8 @@ public:
         d.th_val = th_val;
         d.arr_hint = arr_hint;
         d.arr_hint_struct = arr_hint_struct;
+        d.defer_fold = defer_fold;
+        d.late_fold = late_fold ? late_fold->clone() : nullptr;
     }
 };
 

@@ -3724,6 +3724,32 @@ and it lives *inside the parser*. Mechanics:
   `errfmt:` `-rt` check.
 - A const decl in `pInConstDecl` whose rvalue isn't actually const throws
   `ExpressionIsNotConstEx`.
+- **⛔ A CONSTANT CALL TO A USER FUNCTION IS FOLDED AFTER INFERENCE, NOT
+  WHILE PARSING (#96, 2026-10-21).** Folded while parsing, the call was gone
+  from the program inference typed, while `-nc` kept it: a parameter the
+  program JOINS over its call sites (an `opt` one, a lambda's) missed its
+  argument - `pure func o(opt v) => str(v); o(2.5); o(int(runtime(2)))`
+  printed `2` where -nc printed `2.000000` - and a type error or a warning
+  about the call landed on another call (RULE 2 in all three). So a folding
+  parse, outside a const declaration and a pure function's body (where both
+  runs fold or bake), leaves an expression holding such a call in place
+  (`pDeferFold`, parser.cpp, at the five fold sites - the call, the
+  subscript, the operator chain, the declaration's rvalue, `pExprTop`):
+  EVALUATED, for its errors and its value, with `Construct::defer_fold`
+  set and the literal in `Construct::late_fold`. `Inferencer::
+  apply_late_folds`, the last step of `infer_one` (and of its `-nti` early
+  return), swaps the literal in for each outermost such node when
+  `late_fold_fits`: the literal's type is the node's, for a call each
+  argument fits its parameter as is (a converting bind runs the body with
+  another type than the parse did), EVERY deferred node inside it fits
+  too (its value was computed from theirs: `str(id(2) + 1) == "3.0"`),
+  and no function literal is written inside it (inference may name it
+  from elsewhere - a callee stamp - so it stays; no test can see that
+  rule today). Otherwise the node runs, as under -nc; AutoConst may
+  still fold it, with the program's types. The replaced subtree is
+  RETIRED. `-s`'s first dump (before inference) shows such a call
+  unfolded. Net: `const_fold_equivalence` (`-rt`, which compares the
+  warnings now too) and `tests/functional/100_fold_after_inference.my`.
 
 `-s` (with vs. without `-nc`) is the way to *see* all of the above happening.
 
@@ -7676,7 +7702,11 @@ and two macros:
   **and `pTypeAnnot`** (a type annotation recurses on its own,
   `array<array<...>>`; unguarded until 2026-10-12, a 20000-deep one
   overflowed the stack). A new recursive parse function takes a
-  `NestGuard`.
+  `NestGuard`. **And what a function on the recursion path keeps on
+  the stack is paid once per level, up to MAX_NEST:** under ASan every
+  local has its own slot, so `pExpr14_body` at ~6 KB made 256 levels of
+  `[[[...]]]` overflow macOS's 8 MB stack (2026-10-21). Work done after
+  the recursive call lives in a noinline helper (`pExpr14_tail`).
   **The oracle is the debug+ASan+UBSan lane; a release build hides all of
   this.** When you add a runtime path, ask what it does with a program that has
   no statements, no slots, or absurd depth.
