@@ -600,8 +600,9 @@ program's header picks its runs: `# INT-ENGINES: default` for a codegen or
 JIT decision (the tree-walker never runs those passes),
 `# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra` for several environments.
 An engine is a name from `ENGINE_FLAGS` (int_run: `default`, `tw`,
-`nj`, `vm`, `nbi`, `noopt` = `--no-opt all`), two joined with `+`
-(`nbi+nj`); the engines of one configuration must print the same stdout.
+`nj`, `vm`, `nbi`, `noopt` = `--no-opt all`, `nc` = `-nc`), two joined
+with `+` (`nbi+nj`); the engines of one configuration must print the
+same stdout.
 A unit whose header says `# INT-SOURCE: ../functional/NAME.my` RUNS that
 program under its own headers: a functional test counted as a coverage
 unit without a second copy (the census pass runs tests/functional too, but

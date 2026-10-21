@@ -212,9 +212,10 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
 
 ## int_run units (tests/int)
 
-- `# INT-ENGINES:` names from ENGINE_FLAGS (default tw nj vm nbi noopt),
-  `+` joins (`nbi+nj`); engines of one config must print the same stdout,
-  so include `tw` when the point is a value check.
+- `# INT-ENGINES:` names from ENGINE_FLAGS (default tw nj vm nbi noopt
+  nc), `+` joins (`nbi+nj`); engines of one config must print the same
+  stdout, so include `tw` when the point is a value check, and `nc` when
+  it is what folding must not change (78_fold_after_inference.my).
 - `# INT-CONFIGS:` `;`-separated env sets.
 - `# INT-SOURCE: ../functional/NAME.my`: the unit RUNS that program (the
   path is relative to the unit) under its own INT-ENGINES / INT-CONFIGS -
@@ -240,6 +241,9 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   `--conditions`, and int_run now says so before running anything). The
   int-gcov lane builds with the default g++; where that is older, build
   a GCOV INT lane with CXX=g++-14 (the CI int job's compiler).
+- `--gcov --only REGEX --report F` writes what each unit run covered:
+  compared with a whole run's uncovered list it says what a new unit
+  adds, in minutes instead of the whole run's ~50.
 - With --gcov every unit must OWN an element no other unit covers, and
   uncovered must stay <= tests/int/coverage-floor.txt for the compiler.
   Lower the floor when a change covers more (the note says by how much);

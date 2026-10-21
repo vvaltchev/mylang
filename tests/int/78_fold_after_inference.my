@@ -1,0 +1,158 @@
+# INT-ENGINES: default tw nc tw+nc noopt
+#
+# INT unit (#94, #95, #96): a constant expression holding a call to a user
+# function is evaluated while parsing but folded only once the program is
+# typed, and only when the program types it as the parse-time run did
+# (late_fold_fits); a const bound to a builtin; a struct name used as a
+# value, through a parse-time typed call. Every engine of the unit - with
+# and without folding (-nc) - must print the same: that is the RULE 2
+# property #96 restores.
+
+# the constants the functions below read, declared before any call
+const OPS = [pure func(int v) => v * 2, pure func(int v) => v + 100];
+const A = [10, 20, 30, 40];
+const L = len;
+struct S95 { int x; }
+const OPT95 = [pure func(t, int n) => t(n).x];
+const FS = [pure func(f, int n) => f(n)];
+const HS = [pure func(e) => 7];
+class C78 { int v; }
+const KC = C78(5);
+const KCS = [KC, KC];
+
+var bad = 0;
+func want(str what, opt dyn got, dyn exp) {
+    if (str(got) != str(exp)) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " +
+              str(exp));
+        bad += 1;
+    }
+}
+
+# 1. a deferred call holding a function literal is not folded (a literal
+#    inference may name from elsewhere stays in the tree): it runs
+pure func twice(f, x) => f(f(x));
+want("lambda argument", twice(pure func(v) => v + 1, 2), 4);
+var t1 = twice(pure func(v) => v * 2, 3);
+want("lambda argument, var", t1, 12);
+
+# 2. a callee named only by the callee-set analysis: a constant's element
+var dyn o1 = OPS[0](3);
+want("constant element callee", o1 + OPS[1](1), 107);
+
+# 3. arguments that fit their parameter as they are: none into an `opt`
+#    one, a value into its nullable type, anything into a `dyn` one
+pure func ov(opt v) => v == none ? -1 : v;
+want("opt none", ov(none), -1);
+want("opt value", ov(5), 5);
+pure func dv(dyn v) => v;
+want("dyn parameter", dv(7) + 1, 8);
+
+# 4. a call whose value names a function keeps running
+pure func sq(int x) => x * x;
+pure func ng(int x) => 0 - x;
+pure func pick(int k) => k == 0 ? sq : ng;
+var pf = pick(0);
+want("function value", pf(3) + pick(1)(3), 6);
+
+# 5. a subscript and a slice whose index or bound is a deferred call
+pure func id(int x) => x;
+want("slice bounds", A[id(1):id(3)], [20, 30]);
+var sl = A[0:id(2)];
+want("slice, var", sl, [10, 20]);
+want("subscript", A[id(2)], 30);
+var sx = A[id(3)] + id(1);
+want("subscript, var", sx, 41);
+
+# 6. a deferred call inside another: the outer one folds only when the
+#    inner one fits too
+pure func jo(opt v) => str(v);
+want("nested", jo(id(2)), "2.000000");
+want("nested, joined", jo(2.5), "2.500000");
+
+# 7. a loop with break and continue, copied for the parse-time typed run
+pure func lp(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        if (i == 1)
+            continue;
+        if (i == 4)
+            break;
+        s += i;
+    }
+    return s;
+}
+const LP = lp(6);
+want("loop", LP + lp(6) + lp(int(runtime(6))), 15);
+
+# 8. #94: a const bound to a builtin, read where it is not folded
+func g94(len) => L(len);
+want("builtin const", g94([1, 2, 3]), 3);
+pure func p94(a) => L(a) + 1;
+const P94 = p94([1, 2]);
+want("builtin const, pure", P94 + p94(runtime([1])), 5);
+
+# 9. #95: a struct name used as a value, through a parse-time typed call:
+#    as written, and by value (the copy declares the struct by its name)
+pure func mk95(t, int n) => t(n).x;
+const M95 = mk95(S95, 4);
+want("struct name, written", M95 + mk95(S95, int(runtime(5))), 9);
+pure func by95(int k) => OPT95[k](S95, 6);
+const B95 = by95(0);
+want("struct name, by value", B95 + by95(int(runtime(0))), 12);
+
+# 10. functions passed by value to a parse-time typed call: a literal and
+#     a named function
+pure func vb(int k) => FS[k](pure func(int y) => y + 1, 2);
+const VB = vb(0);
+pure func named(int y) => y * 3;
+pure func vc(int k) => FS[k](named, 2);
+const VC = vc(0);
+want("functions by value", [VB, VC, vb(int(runtime(0))),
+                            vc(int(runtime(0)))], [3, 6, 3, 6]);
+
+# 11. a value no literal can hold (a caught exception object) passed by
+#     value: the typed copy cannot be built, so the call runs untyped
+pure func ex(int i) {
+    var a = [1];
+    try {
+        return a[i];
+    } catch (OutOfBoundsEx as e) {
+        return HS[0](e);
+    }
+}
+const EX = ex(5);
+var dyn exr = ex(int(runtime(5)));
+want("exception object by value", [EX, exr, ex(0)], [7, 7, 1]);
+
+# 12. a value holding functions (an array of them) keeps the call: it runs
+pure func pk2() => [sq, ng];
+var fa = pk2();
+want("functions in a value", fa[0](3) + fa[1](3), 6);
+
+# 13. a deferred call inside a slice with an absent bound, inside a
+#     builtin's call
+want("slice in a call", len(A[:id(2)]) + len(A[id(1):]), 5);
+
+# 14. a struct declared, and a const declared as a brace-less body,
+#     inside a function the parse runs typed (its copy clones them)
+pure func sdf(int n) {
+    struct L78 { int v; }
+    return L78(n).v;
+}
+pure func nf(int n) {
+    if (n > 0)
+        const K78 = 2;
+    return n;
+}
+const SD = sdf(3);
+const NF = nf(3);
+want("copied declarations", [SD, sdf(int(runtime(4))), NF,
+                             nf(int(runtime(1)))], [3, 4, 3, 1]);
+
+# 15. a folded builtin call's flat class array bound to an array<C> as it is
+array<C78> a15 = clone(KCS);
+want("flat class array", str(a15), "[C78(v: 5), C78(v: 5)]");
+
+print(str(bad) + " failure(s)");
+assert(bad == 0);
