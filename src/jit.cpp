@@ -7863,11 +7863,10 @@ static bool jit_op_eligible(const Instr &in)
     case OpCode::StructFieldAddInt:
         return true;
     /* model-flip (nativize-ops): the #9 back-edge fusion `for i: ... a[i]` -
-     * step + test + the element load, emitted inline (emit_branch). The
-     * BASE GATE (array/non-slice/ints-or-bools) runs BEFORE the counter
-     * step, because a bail re-runs the WHOLE op and a post-step bail would
-     * double-step; an OOB RAISES (JR_OOB, this pc's caret). NOT
-     * op_fully_native (gate bail + raise). */
+     * step + test + the element load, emitted inline (emit_branch). Every
+     * decline after the step (the base gate, a kind, a wrap, an OOB) runs
+     * the slow tier on the stepped counter; a throw conveys with this pc's
+     * caret. */
     case OpCode::ForStepElemInt:
         return true;
     /* model-flip (nativize-ops): append(struct_arr, Ctor(args)) via
@@ -29886,14 +29885,13 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         AccScratch acc(e);
         fr.obj = acc.r;
         /* #9 back-edge fusion: step + test + the a[i] element load in one op.
-         * ORDER MATTERS: the base GATE (array / non-slice / ints-or-bools,
-         * every check that can BAIL) runs FIRST - a bail re-runs the WHOLE
-         * op, so a post-step bail would DOUBLE-STEP the counter. Then step
-         * (cache-aware), test vs the bound; NOT-go falls through with no
-         * load (the counter is out of range there, matching the
-         * interpreter); GO reads a[counter] via the shared flat tails
-         * (negative wraps, OOB raises with this pc's caret) into the elem
-         * slot and jumps to target. */
+         * Step (cache-aware), test vs the bound; NOT-go falls through with
+         * no load (the counter is out of range there, matching the
+         * interpreter); GO checks the base (array / non-slice /
+         * ints-or-bools) and reads a[counter] via the shared flat tails
+         * into the elem slot, then jumps to target. Nothing after the step
+         * bails - every decline goes to SLOW A below - so the op is never
+         * re-run and the counter is stepped exactly once. */
         const JitLayout &L = jit_layout();
         const bool up = in.aop == Op::lt || in.aop == Op::le;
         const SlotAddr base = slot_addr(in.b_dual_lo());
@@ -29901,30 +29899,33 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             return static_cast<int32_t>(static_cast<long>(slot)
                                         * static_cast<long>(sizeof(LValue)));
         };
-        /* #56: TWO slow tiers, because the gate must precede the step (a
-         * re-run would double-step): a GATE decline runs the FULL op in
-         * jit_for_step_elem (step + test + read, the interpreted body), a
-         * post-step READ decline (wrap/OOB/kind) runs jit_elem_int_value
-         * on the already-stepped counter. Neither bails -> deletable. */
-        std::vector<size_t> gate_slows, read_slows;
+        /* #56: ONE slow tier. The counter is stepped and tested FIRST,
+         * through the cache-aware read_slot/write_slot (pick_visit_op lets
+         * it live in a register), and only a taken branch checks the
+         * base: a GATE decline and a READ decline (wrap/OOB/kind) both run
+         * jit_elem_int_value on the stepped counter. No tier bails, so
+         * nothing re-runs the op and the step cannot double. (A second,
+         * full-op tier took the gate decline BEFORE the step and stepped
+         * the counter through its frame SLOT - stale whenever it was
+         * pinned: `for (...) { var e = a[i]; ... }` over a slice aborted
+         * with a TypeErrorEx through a noexcept helper, 2026-10-21.) */
+        std::vector<size_t> read_slows;
         e.bump_op(OpCode::ForStepElemInt);   /* before any loads (rax!) */
         /* C1d: in a hoisted region the preheader already proved the base
-         * and its ONE kind - no gate (so no SLOW B and no double-step
-         * hazard: nothing bail-able precedes the step) and no per-element
-         * kind dispatch; the read is bounds-vs-r11 + a read off r10, with
-         * the post-step value tier (SLOW A) serving negative/OOB exactly
-         * as before. */
+         * and its ONE kind - no gate and no per-element kind dispatch; the
+         * read is bounds-vs-r11 + a read off r10, with the value tier
+         * (SLOW A) serving negative/OOB exactly as before. */
         const JitHoist *H =
             hoist_match(in.b_dual_lo(), in.elem_bool_hint() ? 3 : 0);
         const bool hoisted = H != nullptr;
-        if (!hoisted)
-            emit_elem_base_gate(e, ir, acc.r, in.b_dual_lo(), pc, &gate_slows);
         read_slot(e, acc.r, in.target2);
         e.incdec_reg(acc.r, up);
         write_slot(e, ck, acc.r, in.target2, pc);
         tmp_operand(in.a_is_lit(), in.a_lit(), in.a_slot(),
                     [&]() { e.cmp_rr(acc.r, tmp); });
         const size_t j_fall = e.j32(cc_for(cc_negate(in.aop)).short_op);
+        if (!hoisted)
+            emit_elem_base_gate(e, ir, acc.r, in.b_dual_lo(), pc, &read_slows);
         if (hoisted) {
             load_slot_idx(e, ir, in.target2);      /* the stepped counter */
             e.cmp_rr(ir, H->rcount);
@@ -29947,7 +29948,6 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
         e.patch32_here(j_done);
         }
         write_slot(e, ck, acc.r, in.b_dual_hi(), pc);
-        std::vector<size_t> j_takens;
         {
             const size_t tgt = static_cast<size_t>(in.target);
             if (tgt >= begin && tgt < end) {
@@ -29958,7 +29958,7 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
                 e.exit_pc(static_cast<uint32_t>(remap[in.target]));
             }
         }
-        /* SLOW A - the post-step READ decline: the counter is already
+        /* SLOW A - a GATE or READ decline: the counter is already
          * stepped and the branch is taken; read via the interpreter core,
          * write the elem slot, then take the same branch. */
         if (!read_slows.empty()) {
@@ -29989,47 +29989,6 @@ static void emit_branch(Emitter &e, const Chunk &ck, const Instr &in,
             } else {
                 e.exit_pc(static_cast<uint32_t>(remap[in.target]));
             }
-        }
-        /* SLOW B - the GATE decline (nothing stepped yet): the FULL op in
-         * jit_for_step_elem. 0 = fell through, 1 = taken (elem written),
-         * 2 = threw. */
-        if (!gate_slows.empty()) {
-            for (const size_t j : gate_slows)
-                e.patch32_here(j);
-            load_operand(e, acc.r, in.a_is_lit(), in.a_lit(), in.a_slot());
-            emit_call_prologue(e);
-            e.mov_rr(RSI, acc.r);                      /* the bound VALUE */
-            e.mov_imm(RDI, static_cast<uint64_t>(
-                              static_cast<int_type>(in.target2)));
-            e.mov_imm(RDX, static_cast<uint64_t>(static_cast<int>(in.aop)));
-            e.mov_imm(RCX, static_cast<uint64_t>(
-                              static_cast<int_type>(in.b_dual_lo())));
-            e.mov_imm(R8, static_cast<uint64_t>(
-                            static_cast<int_type>(in.b_dual_hi())));
-            e.call_direct(jit_for_step_elem);
-            emit_call_epilogue(e);
-            e.cmp_reg32_imm8(RAX, 2);   /* reg:abi */
-            {
-                const size_t j_nothrow = e.j8(0x75);
-                emit_exc_stamp(e, ck, old_pc);
-                e.exit_pc(pc);
-                e.patch8(j_nothrow, e.pos());
-            }
-            e.test32_rr(RAX, RAX);                  /* test eax, eax; reg:abi */
-            j_takens.push_back(e.j32(0x75));         /* jnz -> taken */
-            const size_t j_ff = e.j32(0xEB);         /* jmp fall-through */
-            for (const size_t j : j_takens) {
-                e.patch32_here(j);
-                const size_t tgt = static_cast<size_t>(in.target);
-                if (tgt >= begin && tgt < end) {
-                    e.u8(0xE9);
-                    fixups.push_back({ e.pos(), tgt });
-                    e.u32(0);
-                } else {
-                    e.exit_pc(static_cast<uint32_t>(remap[in.target]));
-                }
-            }
-            e.patch32_here(j_ff);
         }
         e.patch32_here(j_fall);
         return;
@@ -30613,9 +30572,9 @@ static bool op_fully_native(const Instr &in)
         return true;
     /* #56: the #9 fusions - both keep their inline flat fast paths and
      * route EVERY decline (base gate, kind, negative wrap, OOB) to a slow
-     * tier running the interpreter core (jit_elem_int_value; the gate
-     * decline of ForStepElemInt to the full-op jit_for_step_elem, since
-     * the gate precedes the step). Throws convey exc-stamped; no bail. */
+     * tier running the interpreter core (jit_elem_int_value; for
+     * ForStepElemInt on the counter it has already stepped). Throws convey
+     * exc-stamped; no bail. */
     case OpCode::JumpUnlessElemInt:
     case OpCode::ForStepElemInt:
         return true;

@@ -4551,47 +4551,6 @@ extern "C" int jit_elem_int_value(LValue *base_lv, int_type idx,
     return 0;
 }
 
-/* #56: the FULL-OP slow tier for ForStepElemInt, used when the base GATE
- * declines BEFORE the counter is stepped (the gate must precede the step -
- * a bail would double-step). Runs the interpreted op's exact body: step,
- * test, and on a taken branch the element read into `elem_slot`.
- * Returns 0 = not taken (fall through), 1 = taken (elem written),
- * 2 = threw (conveyed). */
-extern "C" int jit_for_step_elem(int_type i_slot, int_type bound, int aop_i,
-                                 int_type base_slot,
-                                 int_type elem_slot) noexcept
-{
-    EvalContext *ctx = g_current_ctx;
-    const Op aop = static_cast<Op>(aop_i);
-    LValue &ilv = ctx->frame->at(i_slot);
-    int_type i = ilv.getval<int_type>();
-    i = (aop == Op::lt || aop == Op::le) ? i + 1 : i - 1;
-    ilv.getval<int_type>() = i;
-
-    bool go;
-    switch (aop) {
-    case Op::lt: go = i <  bound; break;
-    case Op::le: go = i <= bound; break;
-    case Op::ge: go = i >= bound; break;
-    default:     go = i >  bound; break;   /* gt */
-    }
-    if (!go)
-        return 0;
-
-    try {
-        const int_type v = vm_load_elem_int_core(
-            ctx->frame->at(base_slot).get(), i, nullptr, 0);
-        write_int_slot(ctx, elem_slot, v);
-    } catch (RuntimeException &e) {
-        g_vm_jit_exc.reset(e.clone());
-        return 2;
-    } catch (...) {
-        g_vm_jit_eptr = std::current_exception();
-        return 2;
-    }
-    return 1;
-}
-
 extern "C" int jit_load_elem_int(LValue *base_lv, int_type idx,
                                  LValue *dst) noexcept
 {
