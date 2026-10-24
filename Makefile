@@ -36,6 +36,13 @@ endif
 
 FL_OTHER ?= -fwrapv
 FL_INC = -I$(PROJ_ROOT)/src
+
+# macOS: a 16 MB main-thread stack, as CMake gives it - see CMakeLists.txt
+# (the compile passes recurse once per level of nesting, and an ASan build's
+# frames on arm64 outgrow the default 8 MB at the 256-level limit, #98)
+ifeq ($(shell uname -s),Darwin)
+	LDFLAGS += -Wl,-stack_size,0x1000000
+endif
 BASE_FLAGS ?= $(FL_INC) $(FL_LANG) $(FL_DBG) $(FL_WARN) $(FL_OTHER)
 
 ifdef OPT

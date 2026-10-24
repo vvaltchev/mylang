@@ -554,7 +554,12 @@ any way it likes: compare it, copy it into a local, pass it on.
 
 **Nesting is bounded.** Expressions, blocks and type annotations
 (`array<array<int>>`) may nest up to 256 levels; past that the program is
-refused with a syntax error. The limit is far above
+refused with a syntax error. Every link of a chain counts as a level: a
+unary operator (`!!x`, `- -x`), a `?:` in the else arm of another, a `??`
+or an `=` on the right of another, a lambda whose body is another lambda
+(two levels for `func() => ...`: the `{ return ...; }` it stands for),
+and each call, subscript, slice or member access in a postfix chain
+(`f()()`, `a[0][0]`, `a.b.c`). The limit is far above
 anything written or generated in practice, and exists so that a pathological
 input is *refused* rather than crashing the interpreter.
 

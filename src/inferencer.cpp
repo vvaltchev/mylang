@@ -539,6 +539,29 @@ private:
     bool cs_changed = false;
     bool cs_ran = false;      /* false => every query answers ⊤ */
     int cs_top_callee_sites = 0;
+    /* cs_can_hold_func's answer per node, for ONE cs_run (types do not
+     * change while it runs; cleared at both ends, so no node address
+     * outlives it): each level of a deep chain asked type_of of its
+     * whole subtree again, every round - 2 billion instructions for a
+     * 120-deep call chain (#98) */
+    std::unordered_map<const Construct *, bool> cs_hold_memo;
+    bool cs_hold_memo_on = false;
+    /* the memo, live for a window in which no type changes: one cs_run,
+     * the indirect-callee snapshot, the callee stamp and the hint stamp
+     * (each reads types and changes none) */
+    struct CsHoldMemoScope {
+        Inferencer &in;
+        explicit CsHoldMemoScope(Inferencer &i) : in(i)
+        {
+            in.cs_hold_memo.clear();
+            in.cs_hold_memo_on = true;
+        }
+        ~CsHoldMemoScope()
+        {
+            in.cs_hold_memo_on = false;
+            in.cs_hold_memo.clear();
+        }
+    };
 
     void cs_run(Block *root);            /* the fixpoint */
     void cs_visit(Construct *n, FuncInfo *fn);
@@ -2011,7 +2034,10 @@ void Inferencer::infer_one(Block *rootBlock)
      */
     cs_run(rootBlock);
 
-    snapshot_indirect_callees(rootBlock);
+    {
+        CsHoldMemoScope memo(*this);    /* it only reads (#98) */
+        snapshot_indirect_callees(rootBlock);
+    }
     if (!indirect_callee.empty()) {
         run_fixpoint(rootBlock);
         instantiate_to_fixpoint();
@@ -2024,7 +2050,10 @@ void Inferencer::infer_one(Block *rootBlock)
      * re-runs `cs_run` per round for exactly that reason, so only now is
      * the tree final and the analysis current for it.
      */
-    stamp_callee_fn(rootBlock);
+    {
+        CsHoldMemoScope memo(*this);
+        stamp_callee_fn(rootBlock);
+    }
 
     /* finalize. An unconstrained value is `none` for a local ("only-none /
      * doesn't matter") but `dyn` for a PARAMETER: a never-(concretely-)called
@@ -2402,8 +2431,11 @@ void Inferencer::infer_one(Block *rootBlock)
     stamp_inferred_param_types(rootBlock);
 
     /* Stamp TypeHints (int/float) for the M8 specializer + typed conditions. */
-    for (auto &e : rootBlock->elems)
-        annotate_hints(e.get());
+    {
+        CsHoldMemoScope memo(*this);
+        for (auto &e : rootBlock->elems)
+            annotate_hints(e.get());
+    }
 
     apply_late_folds(rootBlock);
 }
