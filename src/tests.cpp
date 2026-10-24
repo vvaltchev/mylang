@@ -21966,6 +21966,13 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* the trace categories' help names a clone as it is really named
+     * (`dot$s0`, `dot$0`) - it said `$specN` / `$tmplN` */
+    { "trace help names the clones as they are named",
+      { { ":trace help", "a name$sN clone", "$spec" },
+        { ":trace help", "monomorphized to name$N per", "$tmpl" },
+        { ":help :trace", "a name$sN clone", "$tmpl" } } },
+
     /* `:type` of a struct or class TYPE name reported its symbol's
      * placeholder static type (`P : dyn?`) - it is a type */
     { ":type of a struct or class type name names the type",

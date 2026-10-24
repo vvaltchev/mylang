@@ -26,9 +26,9 @@ const CatName cat_names[] = {
     { "inline",     TraceCat::inlining,   "\x1b[34m",     /* blue */
       "calls spliced in place" },
     { "specialize", TraceCat::specialize, "\x1b[35m",     /* magenta */
-      "const-arg calls redirected to a $specN clone" },
+      "const-arg calls redirected to a name$sN clone" },
     { "template",   TraceCat::templ,      "\x1b[32m",     /* green */
-      "a template monomorphized to $tmplN per signature" },
+      "a template monomorphized to name$N per signature" },
     { "autoconst",  TraceCat::autoconst,  "\x1b[33m",     /* yellow */
       "a write-once scalar var folded to a constant" },
     { "autopure",   TraceCat::autopure,   "\x1b[93m",     /* bright yellow */
