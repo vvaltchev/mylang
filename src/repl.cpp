@@ -87,13 +87,15 @@ repl_value_lookup(const std::vector<Tok> &toks, size_t i, size_t end)
     if (toks[i] == Op::parenL && repl_skip_bracket(toks, i, end) == end)
         return repl_value_lookup(toks, i + 1, end - 1);
 
-    /* the primary: a name, none / null, or a bracketed literal */
+    /* the primary: a name, none / null, a bracketed literal, or a
+     * parenthesized expression a step follows (`(d)["k"]`) */
     const Tok &first = toks[i];
     size_t k;
     if (first == TokType::id || first == Keyword::kw_none
             || first == Keyword::kw_null)
         k = i + 1;
-    else if (first == Op::bracketL || first == Op::braceL)
+    else if (first == Op::bracketL || first == Op::braceL
+             || first == Op::parenL)
         k = repl_skip_bracket(toks, i, end);
     else
         return false;

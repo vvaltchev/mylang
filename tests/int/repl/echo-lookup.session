@@ -1,0 +1,85 @@
+# Which results the REPL echoes: a `none` is shown only when the statement
+# AS TYPED is a value lookup (a name, none / null, a member or subscript
+# step last, the whole of it parenthesized) and hidden for a call, an
+# operator, a declaration. An input that fails while it runs keeps the
+# bindings its completed statements made and gives back the rest; one
+# refused before it runs gives back everything it declared, in both
+# scopes. :globals names what each clone is for.
+var nn = none
+nn
+(nn)
+((nn))
+none
+null
+(none)
+var arr = [none, 1]
+arr[0]
+(arr[0])
+[none][0]
+[none, 2][0]
+[{"k": none}][0]["k"]
+var d = {"k": none}
+d["k"]
+d.k
+(d)["k"]
+(arr)[0]
+((d))["k"]
+var dj = {"j": [none]}
+dj.j[0]
+class C { opt dyn v; }
+var c = C(none)
+c.v
+c?.v
+var dyn oc = runtime(none)
+oc?.v
+func w() { }
+w()
+func mk() => C(none)
+mk().v
+mk()?.v
+(mk()).v
+func ar() => [none]
+ar()[0]
+nn ?? none
+arr[0] ?? none
+-1
+var z = 1; nn
+nn; var z2 = 2
+func g1() { }; struct S9 { int a; }; var w1 = 1; const c1 = [1]; var w2, w3 = [1, 2]; var dyn q = nope()
+w1
+w2 + w3
+c1
+S9(4)
+g1
+q
+pure func pf() => 2; const K1 = 5; struct S8 { int a; }; int bad = "s"
+pf
+K1
+S8
+const K2 = 3
+struct S7 { int a; }
+pure func pg() => 4
+struct S7 { int a; int b; }; pure func pg() => 8; const K3 = 1; int bad2 = "s"
+K2
+K3
+S7(1)
+pg()
+func sp(int a, int mode) {
+    var t = a * 2
+    if (mode > 0) {
+        return t + mode
+    }
+    return t - mode
+}
+func usesp(int n) {
+    return sp(n, 3) + sp(n, -1)
+}
+usesp(runtime(5))
+func tmpl(a, b) => a + b
+tmpl(1, 2)
+tmpl(1.5, 2)
+func tc(const a, b) => a * b
+tc(2, 3)
+func tv(a) { print(a); }
+tv(7)
+:globals
