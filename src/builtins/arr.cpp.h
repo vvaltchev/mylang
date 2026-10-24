@@ -558,7 +558,7 @@ static EvalValue append_tw(EvalContext *ctx, ExprList *exprList)
 
     LValue hold;
     EvalValue a0v = store_base_value(ctx, arg0, hold);
-    LValue *target = lv_builtin_target(a0v, hold);
+    LValue *target = lv_builtin_target(a0v, hold, arg0);
 
     /* Construct-in-place: only a mutable FLAT struct array + a struct-ctor arg
      * (try_construct_into_struct_array returns false otherwise). Mirrors the

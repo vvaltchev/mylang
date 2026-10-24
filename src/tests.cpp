@@ -21966,6 +21966,18 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* an in-place builtin on an UNDEFINED name (the REPL's open world)
+     * reports the name, at the argument, as `zz[0] = 1` does - it raised
+     * NotLValueEx about a value that does not exist */
+    { "an in-place builtin on an undefined name reports the name",
+      { { "append(zz15, 1)",
+          "Undefined variable 'zz15' at line 1, col 8:12", "NotLValue" },
+        { "pop(zz15)", "Undefined variable 'zz15'", "NotLValue" },
+        { "insert(zz15, 0, 1)", "Undefined variable 'zz15'", "NotLValue" },
+        { "erase(zz15, 0)", "Undefined variable 'zz15'", "NotLValue" },
+        { "sort(zz15)", "Undefined variable 'zz15'", "NotLValue" },
+        { "zz15[0] = 1", "Undefined variable 'zz15'" } } },
+
     /* a lambda variable reassigned in a LATER input: the callee-set
      * analysis answered the declared lambda alone (the rebinding writes
      * were an earlier input's), and the REPL instantiated and folded it */
