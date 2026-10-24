@@ -83,3 +83,34 @@ tc(2, 3)
 func tv(a) { print(a); }
 tv(7)
 :globals
+const KX = [inf, nan, math_pi]
+KX
+# folding across inputs: an earlier pure, auto-pure, recursive pure and
+# impure function called with constants in a later input, a rebound
+# function variable, and a const builtin's name given to a function
+pure func add(a, b) => a + b
+func addf(a, b) => a + b
+func addp(a, b) { print("p"); return a + b; }
+pure func fibr(n) => n < 2 ? n : fibr(n - 1) + fibr(n - 2)
+func abs(x) => x * 0 + 42
+var gv = 5
+var gf = func(y) => y + 1
+gf(1)
+func c1() => add(1, 2)
+:show c1
+func c2() => addf(1, 2)
+:show c2
+func c3() => fibr(10)
+:show c3
+c3()
+func c5() => addp(1, 2)
+:show c5
+func c6() => abs(-3)
+:show c6
+c6()
+gf = func(y) => y * 2; gf(3)
+gf(3)
+func c4() => gf(3) + gv
+c4()
+add = func(a, b) => a - b; add(5, 1)
+add(5, 1)
