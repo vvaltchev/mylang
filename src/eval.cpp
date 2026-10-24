@@ -7941,8 +7941,16 @@ EvalValue member_read_core(const EvalValue &dval, const EvalValue &memId,
 
     if (it != data.end())            /* present key -> the value */
         return it->second.get();
-    if (obj->get_has_default())      /* a default dict -> its default */
+    if (obj->get_has_default()) {
+        /* a default dict: its default, INSERTED (README) as `d[k]` and
+         * the tree-walker's lvalue path insert it - the VM's `d.k` read
+         * comes here, and left len(d) one short. A read-only dict cannot
+         * take the key. */
+        if (!obj->is_readonly())
+            obj->insert_new(EvalValue(memId),
+                            LValue(obj->get_default(), false));
         return obj->get_default();
+    }
     throw KeyNotFoundEx(mstart, mend);   /* missing -> throw */
 }
 
