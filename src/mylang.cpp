@@ -132,8 +132,13 @@ static void show_build_config()
     const char *asan = "0";
 #endif
 
-#if defined(__SANITIZE_UNDEFINED__)
-    const char *ubsan = "1";
+    /* UBSan is the one fact the compiler does not tell: GCC defines no
+     * macro for -fsanitize=undefined (13.3 said `ubsan 0` for a build with
+     * every check compiled in), so the build system passes ML_UBSAN, as
+     * it passes ML_LTO. Clang's __has_feature answers when it is absent;
+     * with neither, the answer is not known. */
+#if defined(ML_UBSAN)
+    const char *ubsan = ML_UBSAN ? "1" : "0";
 #elif defined(__has_feature)
 #  if __has_feature(undefined_behavior_sanitizer)
     const char *ubsan = "1";
@@ -141,7 +146,7 @@ static void show_build_config()
     const char *ubsan = "0";
 #  endif
 #else
-    const char *ubsan = "0";
+    const char *ubsan = "unknown";
 #endif
 
 #ifdef ML_LTO

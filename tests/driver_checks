@@ -301,6 +301,25 @@ else
     fail "-v: expected 'int_tests $want_int' [$out]"
 fi
 
+# -v REPORTS THE SANITIZERS THE BINARY CARRIES, checked against the binary
+# itself: an ASan build calls __asan_init (each instrumented module's
+# constructor does), a UBSan build calls its __ubsan_handle_* runtime. -v
+# read only the compiler's own macros, and GCC defines none for
+# -fsanitize=undefined (13.3 has __SANITIZE_ADDRESS__ alone), so a gcc
+# debug build said `ubsan 0` with every UBSan check compiled in. Both
+# directions, so neither a stuck-on nor a stuck-off answer passes.
+out=$("$BIN" -v 2>&1)
+for san in asan:__asan_init ubsan:__ubsan_handle_; do
+    key=${san%%:*} sym=${san#*:}
+    if grep -q "$sym" "$BIN"; then want=1; else want=0; fi
+    got=$(printf '%s\n' "$out" | awk -v k="$key" '$1 == k { print $2 }')
+    if [ "$got" = "$want" ]; then
+        pass "-v: reports $key $want, as the binary's $sym says"
+    else
+        fail "-v: '$key $got', but the binary's $sym says $want"
+    fi
+done
+
 # A .myv whose chunk pool holds a FUNCTION value must LOAD. #137 bounds
 # every operand an image CONTAINS, but nothing bounded a constructor the
 # LOADER ITSELF calls: read_value built FuncObject(desc, nullptr), and the

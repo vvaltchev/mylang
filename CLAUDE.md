@@ -2341,8 +2341,15 @@ Running scripts:
                                  # `key value` line each, read from
                                  # COMPILER-SET macros (`__OPTIMIZE__`,
                                  # `NDEBUG`, ...) so it cannot drift from
-                                 # what was compiled. bench/run.py parses
-                                 # it; see the ASSERTS=0 rule below
+                                 # what was compiled. Where the compiler
+                                 # says nothing, both build systems pass
+                                 # one: ML_LTO, and ML_UBSAN (GCC defines
+                                 # no macro for -fsanitize=undefined, and
+                                 # a gcc debug build said `ubsan 0`;
+                                 # driver_checks now checks asan/ubsan
+                                 # against the binary's runtime symbols).
+                                 # bench/run.py parses it; see the
+                                 # ASSERTS=0 rule below
 ./build/mylang -nr FILE          # COMPILE and validate, don't run: lex,
                                  # parse, infer, AND run_optimizers (#147,
                                  # 2026-08-09 - it used to stop before the
