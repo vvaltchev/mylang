@@ -66,3 +66,7 @@ func vals() {
 }
 vals()
 :show vals
+func h1(int a) { var t = a; t++; return t; }
+func u1(int n) => h1(n) * 2
+u1(runtime(3))
+:show u1

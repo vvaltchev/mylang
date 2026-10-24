@@ -77,4 +77,10 @@ ok: opt K
     array<dict<str,int>> d = [{"a": 1}, {"b": [2.5], "c": 3}];
     return [len(r), len(e), len(s), len(n), len(k), len(f), len(d)];
 }
+>> >> >> => 8
+>> /* pure */ int func u1(int n) => /* inlined h1 */ {
+    int t = n;
+    t++;
+    return t;
+} * 2;
 >> 
