@@ -558,7 +558,18 @@ CsSet Inferencer::cs_eval(Construct *e)
              * declaration alone was a wrong MUST answer - `sq(3)` named
              * `sq` for a site that reaches `ng` - and the #93 escape
              * analysis reads it (a false "safe" is a use-after-free).
+             *
+             * A rebound COMMITTED (pinned) global is ⊤, the open world
+             * below: the points-to set is this input's, and the writes
+             * that rebound it were made by EARLIER inputs this pass cannot
+             * see - so `{declared}` was a wrong MUST answer, and the REPL
+             * instantiated the FIRST lambda for `gf(3)` after
+             * `gf = func(y) => y * 2` (`=> 4` where it is 6).
              */
+            if (s->pinned) {
+                out.set_top();
+                return out;
+            }
             out = cs_pts[cs_loc(CsLocKind::sym, s, 0)];
             out.add_func(s->func);
             return out;
