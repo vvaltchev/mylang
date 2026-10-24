@@ -7806,6 +7806,8 @@ extern "C" void jit_ret_audit() noexcept
         const int_type total = static_cast<int_type>(my_ck->slot_count)
                                + my_ck->n_temps;
         for (int_type i = 0; i < total; i++) {
+            const bool init_free = i < 64
+                && (my_ck->frameless_init_free >> i & 1);
 #ifdef TESTS
             /* #97 inc 3 W3: a frameless SITE poisons the window slots it
              * proved nothing reads (jit_poison_type, a non-trivial `t`,
@@ -7818,10 +7820,19 @@ extern "C" void jit_ret_audit() noexcept
                  * holding it that the chunk does not claim means a
                  * capture was copied in through ctx->captures - which
                  * is how the epilogue's capbase refresh was caught) */
-                ML_VM_CHECK(i < 64
-                            && (my_ck->frameless_init_free >> i & 1));
+                ML_VM_CHECK(init_free);
                 continue;
             }
+#else
+            /* Without TESTS the site does not poison such a slot: it is
+             * RAW STACK until an op writes it, and its type word may
+             * point anywhere - reading it SEGFAULTED this audit on a
+             * hardened build with no test suite (2026-10-11: any
+             * frameless call returning before the write, e.g. a
+             * recursion's base case). The TESTS poison above is the
+             * check for these slots; here they are skipped unread. */
+            if (init_free)
+                continue;
 #endif
             /* REGCALL step 2: a register-resident value this return
              * did not write back (Chunk::ret_unflushed) - its slot may

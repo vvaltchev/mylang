@@ -1710,7 +1710,11 @@ collision). Three nets now:
   ref-listed and written ONLY by ops in `jit_instr_stores_dst_raw` -
   a per-INSTRUCTION whitelist an op joins only when EVERY tier of its
   emission stores the dst raw; a TESTS build poisons such a slot with
-  `jit_poison_type`, so a wrong row aborts by name. ⛔ AND "written
+  `jit_poison_type`, so a wrong row aborts by name. Without TESTS the
+  slot is raw stack, so a whole-window scan must skip it UNREAD:
+  `jit_ret_audit` (VM_HARDENING) read one and SEGFAULTED on a debug
+  build with no test suite until 2026-10-11 - the `dbg-nt` lane, in
+  CI now, is the configuration that sees it. ⛔ AND "written
   only by raw ops" is VACUOUSLY true of a slot NO op writes
   (2026-09-22, myv_fuzz small-60 on a v18 image): a mutated ctor dst
   left `p` unwritten, the site left it uninitialised, `p.x` read stale
