@@ -762,12 +762,12 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
     /*
      * The input's "main" FRAME. The REPL's own globals live in the map, so
      * the top level declares no slot - but the inliner may give it some: a
-     * call spliced into a top-level statement takes its callee's locals and
+     * call inlined into a top-level statement takes its callee's locals and
      * its argument temps (`$a0 = k` for `rt(k)`) as new slots of main's
      * frame (root->slot_count), exactly as in a script, whose root
      * Block::do_eval builds that frame. The statements below run straight in
      * the persistent scope, so build it here, for this input's run only.
-     * Without it a spliced call read "Undefined variable '$a0'".
+     * Without it such a call read "Undefined variable '$a0'".
      */
     std::unique_ptr<Frame> frame;
     Frame *const prev_frame = runtime_ctx->frame;

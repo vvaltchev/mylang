@@ -22129,7 +22129,7 @@ static const std::vector<repl_test> repl_tests =
         { "const K1 = 5; int bad4 = \"x\"", "TypeMismatchEx" },
         { "K1", "Undefined variable 'K1'" } } },
 
-    /* a call the AST inliner splices into a TOP-LEVEL statement takes new
+    /* a call the AST inliner expands in a TOP-LEVEL statement takes new
      * slots of main's frame - its argument temps (`$a0 = kk`) and its
      * callee's locals - and the REPL ran its top level with no frame:
      * "Undefined variable '$a0'" (a script printed the answer) */
