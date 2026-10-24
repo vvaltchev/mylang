@@ -77,16 +77,17 @@ string escape_string(const std::string_view &sv)
     return out;
 }
 
-/* The flat-array element type a hint implies (informative; `array<int>` is not
- * valid script syntax but conveys the specialized storage). */
+/* The array type a hint implies, for a declaration's keyword. A struct or
+ * class array's hint does not say WHICH type (flat_c may also be an
+ * array<C?> or an array<box<P>>), and `array<class>` is not a type: the
+ * caller names a flat_s array from its def, and anything else falls back
+ * to another source or to `var`. */
 const char *arr_hint_type(ArrHint h)
 {
     switch (h) {
         case ArrHint::flat_i: return "array<int>";
         case ArrHint::flat_f: return "array<float>";
         case ArrHint::flat_b: return "array<bool>";
-        case ArrHint::flat_s: return "array<struct>";
-        case ArrHint::flat_c: return "array<class>";
         default:              return nullptr;
     }
 }
