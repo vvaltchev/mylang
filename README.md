@@ -271,8 +271,12 @@ inspecting the language and its compiler:
   one (`:help :trace`, `:help globals`, …) — the leading `:` is optional.
 - **Reflection** — `:globals` prints a table of every global (variables,
   consts — *including* folded const scalars — functions with their signatures,
-  and structs) with its inferred/declared type; `:type <expr>` shows a global's
-  inferred static type, or any expression's runtime type without committing it.
+  and structs) with its inferred/declared type; a template instance shows
+  the types it was made for (`f$0 : func f(int a, int b) -> int`), a
+  specialization the constants
+  (`f$s0 : func f(int x, int mode) with mode = 1`). `:type <expr>` shows a
+  global's inferred static type, or any expression's runtime type without
+  committing it.
   `:show <function>` "decompiles" a function's final optimized AST back into
   code (folded consts, inlined bodies, dead code gone), and its `name$N` clones
   too. (These build on the reflection *builtins* `globals()`, `typestr()` /

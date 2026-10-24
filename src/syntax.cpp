@@ -663,6 +663,18 @@ void WhileStmt::serialize(ostream &s, int level) const
     s << ")";
 }
 
+string FuncDeclStmt::spec_args_str() const
+{
+    string s;
+    for (size_t i = 0; i < spec_args.size(); i++) {
+        if (spec_args[i].empty() || !params || i >= params->elems.size())
+            continue;
+        s += s.empty() ? " with " : ", ";
+        s += string(params->elems[i]->get_str()) + " = " + spec_args[i];
+    }
+    return s;
+}
+
 void FuncDeclStmt::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');

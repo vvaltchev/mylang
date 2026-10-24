@@ -21966,6 +21966,30 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* `:globals` shows what each template instance is FOR - its inferred
+     * parameter and return types; every instance used to print the
+     * base's generic signature */
+    { ":globals shows the signature each template instance is for",
+      { { "func tw(a, int b) => a + b", "" },
+        { "tw(1, 2)", "=> 3" },
+        { "tw(1.5, 2)", "=> 3.5" },
+        { ":globals", "tw$0 : func tw(int a, int b) -> int   [func]" },
+        { ":globals", "tw$1 : func tw(float a, int b) -> float   [func]" },
+        { ":globals", "tw   : func tw(a, int b)   [func]" },
+        /* a const-argument specialization: the values it is built for,
+         * in `:globals` and in the `specialize` trace */
+        { "var yy10 = 5", "" },
+        { ":trace specialize on", "" },
+        { "func bg10(int x, int mode) { var r = 0;"
+          " if (mode == 1) { r = x + 1; r = r * 3; r = r - 2; r = r * r; }"
+          " else { r = x * 2; r = r + 7; r = r * r; r = r - 1; }"
+          " var k = 0; while (k < 3) { r = r + k; k++; } return r; }"
+          " print(bg10(yy10, 1))",
+          "-> bg10$s0 with mode = 1" },
+        { ":trace off", "" },
+        { ":globals",
+          "bg10$s0 : func bg10(int x, int mode) with mode = 1   [func]" } } },
+
     /* the trace categories' help names a clone as it is really named
      * (`dot$s0`, `dot$0`) - it said `$specN` / `$tmplN` */
     { "trace help names the clones as they are named",

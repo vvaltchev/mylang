@@ -7588,7 +7588,11 @@ headless-testable behind a thin terminal shell:
     `replhelp.cpp`), `:trace [<cat>...] on|off` (toggle the diagnostic
     tracer), `:globals` (a table of every global — vars/consts/funcs/structs —
     with its inferred/declared type, merging the runtime scope with the const
-    context so folded const SCALARS still appear), `:type <expr>` (a committed
+    context so folded const SCALARS still appear; a CLONE's row says what it
+    is for - a template instance its inferred parameter and return types, a
+    `name$sN` specialization the values in `FuncDeclStmt::spec_args`, which
+    `build_specialization` records and the `specialize` trace prints too),
+    `:type <expr>` (a committed
     global's inferred static type via `ReplInfer::global_type`, else the
     runtime structural type of the expression evaluated in a throwaway child
     scope), `:show <function>` (the optimized-AST decompiler, `coderender.cpp`
