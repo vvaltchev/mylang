@@ -3769,9 +3769,15 @@ every alias of `a` sees the new elements.)
 To get a polymorphic (general) array on purpose:
 
   * **Declare it `dyn`.** `var dyn a = [1, 2, 3];` builds a general array from
-    the start, so `a[0] = "x";` just works. (`runtime()` does **not** do this —
-    it only changes the array's *static type* as the compiler sees it, not how
-    it is stored, so the value stays flat and a mixed write still throws.)
+    the start, so `a[0] = "x";` just works. So do the builtins that build
+    their array for the place it is bound to - `range()`, `array()`,
+    `make_array()`, `map()`, `filter()`, `keys()` and `values()`. Any other
+    value keeps the storage it already has: `var dyn d = clone(a);` (or
+    `sort(a)`, or `a + b`) of a flat `a` is flat, whether or not the
+    compiler evaluates the call ahead of time. (`runtime()` does **not**
+    make an array general either — it only changes the array's *static
+    type* as the compiler sees it, not how it is stored, so the value stays
+    flat and a mixed write still throws.)
   * **Promote an existing array with `dynarray()`** (below) — `clone()` /
     `deepclone()` deliberately preserve the layout, so a clone of a flat array
     is still flat.

@@ -1,6 +1,6 @@
 # INT-ENGINES: default tw nc tw+nc noopt
 #
-# INT unit (#94, #95, #96): a constant expression holding a call to a user
+# INT unit (#94, #95, #96, #97): a constant expression holding a call to a user
 # function is evaluated while parsing but folded only once the program is
 # typed, and only when the program types it as the parse-time run did
 # (late_fold_fits); a const bound to a builtin; a struct name used as a
@@ -153,6 +153,41 @@ want("copied declarations", [SD, sdf(int(runtime(4))), NF,
 # 15. a folded builtin call's flat class array bound to an array<C> as it is
 array<C78> a15 = clone(KCS);
 want("flat class array", str(a15), "[C78(v: 5), C78(v: 5)]");
+
+# 16. (#97) a folded value bound to a `dyn` variable takes the storage the
+#     unfolded node builds: a written literal and the builtins that build
+#     to their destination (range, map, keys, ...) a general array, every
+#     other value its own - a clone or a sort of a flat array is flat, so
+#     a write of another type is refused folded as it is under -nc
+const QS = [1, 2, 3];
+pure func dbl(x) => x * 2;
+var dyn c16 = clone(QS);
+var dyn s16 = sort(QS);
+var dyn r16 = rev_sort(QS);
+var dyn j16 = [1, 2] + [3];
+var dyn p16 = split("a b", " ");
+var dyn g16 = range(3);
+var dyn m16 = map(dbl, QS);
+var dyn k16 = keys({1: 2, 3: 4});
+var dyn l16 = [1, 2, 3];
+var dyn e16 = [0];
+e16 = clone(QS);
+want("dyn storage", [array_storage(c16), array_storage(s16),
+                     array_storage(r16), array_storage(j16),
+                     array_storage(p16), array_storage(g16),
+                     array_storage(m16), array_storage(k16),
+                     array_storage(l16), array_storage(e16)],
+     ["int", "int", "int", "int", "str", "general", "general",
+      "general", "general", "int"]);
+var refused16 = 0;
+try { c16[0] = "x"; } catch (TypeErrorEx) { refused16 += 1; }
+try { j16[0] = "x"; } catch (TypeErrorEx) { refused16 += 1; }
+try { e16[0] = "x"; } catch (TypeErrorEx) { refused16 += 1; }
+g16[0] = "x";
+l16[0] = "x";
+p16[0] = 5;
+want("dyn writes", [refused16, g16, l16, p16],
+     [3, ["x", 1, 2], ["x", 2, 3], [5, "b"]]);
 
 print(str(bad) + " failure(s)");
 assert(bad == 0);

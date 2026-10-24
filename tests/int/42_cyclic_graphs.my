@@ -268,12 +268,12 @@ yes("struct types compare by identity", t0 == t0 && t0 != t1 &&
     !(t0 == t1) && !(t0 != t0) && t0 != 5 && !(t0 == "Q"));
 
 # 8. a value folded at compile time and bound to a `dyn` variable: a
-#    written literal or a BUILTIN call's value is a GENERAL array from
-#    the start (README: declaring `dyn` builds a polymorphic array),
-#    whatever flat storage the folded value had, so a write of another
-#    type just works. A USER function's call keeps the storage its
-#    function built, folded or not, as at run time (#96): a string array
-#    converts itself, the type-driven flat ones refuse the write
+#    written literal is a GENERAL array from the start (README: declaring
+#    `dyn` builds a polymorphic array), whatever flat storage the folded
+#    value had, so a write of another type just works. Any other value
+#    keeps the storage it was built with, folded or not, as at run time
+#    (#96, #97): `split`'s and `mk_s`'s string arrays convert themselves
+#    on such a write, the type-driven flat ones refuse it
 var dyn ls = split("a b c", " ");
 var dyn lb = [1 > 0, 1 > 1];
 var dyn lf = [1 * 1.5, 2.5];
