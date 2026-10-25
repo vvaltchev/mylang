@@ -1,0 +1,122 @@
+# `rethrow` raises the exception its catch body handles again, AT the
+# `rethrow`: a `try` around it inside that catch body catches it, as in
+# Python (`raise`) and C# (`throw;`) - README, Re-throwing an exception;
+# question 8 in plans/open-language-questions.md, decision A. The
+# tree-walker used to send it past that `try`, to the catch's enclosing
+# handler, while the VM caught it inside.
+
+struct E { int v; }
+struct F { int v; }
+
+var seen = [];
+
+# 1. the inner try catches the rethrown exception
+func one() {
+    try {
+        throw E(1);
+    } catch (E as e) {
+        try {
+            rethrow;
+        } catch (E as e2) {
+            append(seen, "1 inner " + str(e2.v));
+        }
+        append(seen, "1 after");
+    }
+}
+try { one(); } catch (E) { append(seen, "1 outer"); }
+
+# 2. an inner catch for another exception: rethrow raises THAT one, and
+#    after it the outer catch body's rethrow raises E again
+func two() {
+    try {
+        throw E(2);
+    } catch (E as e) {
+        try {
+            try {
+                throw F(20);
+            } catch (F as f) {
+                rethrow;
+            }
+        } catch (F as f2) {
+            append(seen, "2 F " + str(f2.v));
+        }
+        rethrow;
+    }
+}
+try { two(); } catch (E as e) { append(seen, "2 outer E " + str(e.v)); }
+
+# 3. an inner catch that does not match: the rethrow goes on outward
+func three() {
+    try {
+        throw E(3);
+    } catch (E as e) {
+        try {
+            rethrow;
+        } catch (F) {
+            append(seen, "3 wrong");
+        }
+        append(seen, "3 not here");
+    }
+}
+try { three(); } catch (E as e) { append(seen, "3 outer " + str(e.v)); }
+
+# 4. a try/finally around it: the finally runs, the exception goes on
+func four() {
+    try {
+        throw E(4);
+    } catch (E as e) {
+        try {
+            rethrow;
+        } finally {
+            append(seen, "4 finally");
+        }
+    }
+}
+try { four(); } catch (E as e) { append(seen, "4 outer " + str(e.v)); }
+
+# 5. a catch-all, and a built-in exception
+func five() {
+    try {
+        var z = int(runtime(0));
+        print(1 / z);
+    } catch {
+        try {
+            rethrow;
+        } catch (DivisionByZeroEx) {
+            append(seen, "5 inner");
+        }
+    }
+}
+five();
+
+# 6. a function called from a catch body has its own rethrow scope
+func handler() {
+    try {
+        throw F(6);
+    } catch (F as f) {
+        try {
+            rethrow;
+        } catch (F as f2) {
+            append(seen, "6 callee " + str(f2.v));
+        }
+    }
+}
+func six() {
+    try {
+        throw E(60);
+    } catch (E as e) {
+        handler();
+        try {
+            rethrow;
+        } catch (E as e2) {
+            append(seen, "6 caller " + str(e2.v));
+        }
+    }
+}
+six();
+
+foreach (line in seen)
+    print(line);
+assert(seen == ["1 inner 1", "1 after", "2 F 20", "2 outer E 2",
+               "3 outer 3", "4 finally", "4 outer 4", "5 inner",
+               "6 callee 6", "6 caller 60"]);

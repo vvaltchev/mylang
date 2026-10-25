@@ -15,7 +15,7 @@ at run time (#49).
 | 5  | a parse-time pure call runs before inference    | decided: A |
 | 6  | a throwing constant expression inside a `try`   | decided: A |
 | 7  | duplicate keys in a dict literal                | decided: A |
-| 8  | `rethrow` inside a `try` nested in a `catch`    | open       |
+| 8  | `rethrow` inside a `try` nested in a `catch`    | decided: A |
 | 9  | the element type of an empty container          | open       |
 | 10 | `deepclone` and shared instances                | open       |
 | 11 | the value of a multi-assignment                 | open       |
@@ -326,6 +326,16 @@ print. `-tw`: `outer caught 1` - the rethrow skips the inner `try`.
   Python and C# (recommended).
 - **B.** `rethrow` always leaves the `catch` it belongs to, skipping any
   `try` nested inside it.
+
+Decision (maintainer, 2026-10-25): **A.** Done the same day: the
+tree-walker's `rethrow` raises the exception the innermost running catch
+body of its invocation handles (`FlowState::handling`, set by
+`do_catch`), where it used to throw a private `RethrowEx` that only that
+catch's own `do_catch` converted. README states the rule. Tests:
+`tests/functional/102_rethrow_inner_try.my` (an inner catch, a nested
+catch of another exception, a non-matching inner catch, a finally, a
+catch-all with a built-in exception, a called function's own catch) and
+an `-rt` case.
 
 ## 9. The element type of an empty container
 

@@ -14446,8 +14446,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
 
         VM_CASE(Rethrow):
             /* `rethrow` in a catch body: re-raise the being-handled vm_exc with
-             * the rethrow-site loc (like do_catch's RethrowEx handling), to the
-             * OUTER handler (native) or C++-propagate. */
+             * the rethrow-site loc (like RethrowStmt::do_eval), to the nearest
+             * enclosing handler (native) or C++-propagate. */
             {
                 /* #78: a = the ENCLOSING catch's region id (baked by the
                  * codegen: the innermost try whose catch body lexically
