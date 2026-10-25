@@ -7251,6 +7251,12 @@ but the per-element `StructObject` allocation is gone (build overhead
     (`StructObject(o, value_copy_t)`): `*bp` reads one, `box()` copies a
     struct in with one - so how many copies an engine makes cannot move
     the identity numbers a hash depends on.
+  - **A rebuild in place must ask `boxed`.** The constructors' H1 reuse
+    (`vm_struct_ctor`, the planned ctor, the C4e establish, the JIT's
+    inline guard) overwrites the object its destination slot holds when
+    the def matches - and a box<P> has P's def. Without the test a `dyn`
+    variable or a temp that last held `box(P(..))` turned the next
+    `P(..)` into a box (`tests/functional/94_struct_reuse_boxed.my`).
   - **A store through `*` writes shared storage**: `lvalue_chain_root`,
     `fmi_base_id`, `fr_base_id` and `fr_store_reaches_shared` walk through
     a `DerefExpr`, and `fr_immutable` never treats `*b` as invariant.

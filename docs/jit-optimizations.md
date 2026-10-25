@@ -1512,6 +1512,18 @@ BinOpV precedent. Measured (callgrind Ir/scale, OPT=1 ASSERTS=0):
 **64_struct_create 194 -> 170 Ir/iteration (-12.4%)**, cumulative with
 C4d **234 -> 170 (-27.4%)**; 58/01 byte-flat, 46 +3 instructions
 whole-program (the picker running at compile time).
+**THE FIFTH GUARD - NOT BOXED (2026-10-12).** class step 3 made a
+`box<P>` a StructObject with P's def and `boxed` set, so "same def" no
+longer meant "a P": a `dyn` variable or a temp that last held
+`box(P(..))` was rebuilt in place by the next `P(..)` and stayed a box
+(printed as one, compared unequal, failed a parameter's fit check) - in
+the VM, the planned and unplanned ctors, the establish and this inline
+tier alike. The inline guard is one more `cmp byte [rax+boxed], 0; jne`
+before the stores (`readonly` and `boxed` are adjacent bytes, but a word
+compare would be a new emitted form); the established path needs
+nothing, since `jit_struct_ctor_establish` now refuses a boxed instance
+and nothing in a region can box one in place (`box()` always copies).
+Net: `tests/functional/94_struct_reuse_boxed.my`, one shape per path.
 
 **C3 inc 3 - TEMPS JOIN THE FLOAT TYPE-STORE ELISION (2026-08-04).**
 inc 2's producer was gated `< slot_count`, LOCALS ONLY, so every float
