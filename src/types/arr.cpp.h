@@ -41,7 +41,7 @@ void sobj_release(StructObject *p) noexcept
     if (p) {
         ML_CHECK(p->intr_refcount > 0);
         if (--p->intr_refcount == 0)
-            delete p;
+            destroy_counted(p);         /* bounded: intrusiveptr.h */
     }
 }
 

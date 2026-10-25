@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <utility>
 #include <cstddef>
+#include <vector>
 
 /*
  * A minimal intrusive, NON-atomic reference-counted smart pointer.
@@ -42,6 +43,62 @@ struct RefCounted {
     RefCounted &operator=(RefCounted &&) { return *this; }
 };
 
+/*
+ * BOUNDED DESTRUCTION (2026-10-12). Freeing an object releases what it
+ * holds, so a CHAIN of values - a linked list of class nodes, arrays or
+ * dicts nested 100k deep - is freed by recursion, several C++ frames per
+ * link: a 20000-node list overflowed the stack of a debug build and a
+ * 1M-deep one a release build, wherever its head was dropped (program
+ * exit included). Every last release comes here: up to DESTROY_MAX_DEPTH
+ * deletions run nested as before, a deeper one is QUEUED, and the
+ * outermost deletion empties the queue before it returns. The recursion
+ * is bounded, everything is still freed before the release that started
+ * it returns, and only the ORDER of destruction changes - no destructor
+ * here runs program code or has an observable effect.
+ */
+struct DeferredDestroy {
+    void *obj;
+    void (*del)(void *) noexcept;
+};
+
+constexpr int DESTROY_MAX_DEPTH = 32;
+inline int g_destroy_depth = 0;
+
+/* never destroyed: a release during static destruction may still queue */
+inline std::vector<DeferredDestroy> &destroy_queue()
+{
+    static auto *q = new std::vector<DeferredDestroy>();
+    return *q;
+}
+
+ML_NOINLINE inline void destroy_drain() noexcept
+{
+    std::vector<DeferredDestroy> &q = destroy_queue();
+    while (!q.empty()) {
+        const DeferredDestroy d = q.back();
+        q.pop_back();
+        ++g_destroy_depth;
+        d.del(d.obj);
+        --g_destroy_depth;
+    }
+}
+
+/* delete a counted object whose count reached 0 (see above) */
+template <class T>
+void destroy_counted(T *p) noexcept
+{
+    if (g_destroy_depth >= DESTROY_MAX_DEPTH) {
+        destroy_queue().push_back(
+            {p, [](void *o) noexcept { delete static_cast<T *>(o); }});
+        return;
+    }
+    ++g_destroy_depth;
+    delete p;
+    --g_destroy_depth;
+    if (g_destroy_depth == 0 && !destroy_queue().empty())
+        destroy_drain();
+}
+
 template <class T>
 class intrusive_ptr final {
 
@@ -64,7 +121,7 @@ class intrusive_ptr final {
      * ML_CHECK stays in the INLINE half: it is the over-release tripwire and
      * must fire at the exact point the balance breaks, not one frame away.
      */
-    ML_NOINLINE void destroy() { delete ptr; }
+    ML_NOINLINE void destroy() { destroy_counted(ptr); }
 
     void release()
     {

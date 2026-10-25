@@ -2652,6 +2652,9 @@ struct Node {
 var list = Node(1, Node(2, Node(3, none)));
 ```
 
+A chain may be any length: dropping the head of a million-node list frees
+it without running out of stack, in every engine.
+
 Structs may be declared anywhere a statement is allowed, **including inside a
 function** (lexically scoped like a nested function). A struct's fields and
 consts live in the struct's own namespace, so a struct `const PI` never clashes
