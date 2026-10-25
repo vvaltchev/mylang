@@ -67,7 +67,9 @@ inline int g_destroy_depth = 0;
 /* never destroyed: a release during static destruction may still queue */
 inline std::vector<DeferredDestroy> &destroy_queue()
 {
-    static auto *q = new std::vector<DeferredDestroy>();
+    /* its branches are the static's initialization guard (INT-COV-EXEMPT
+     * on the line): the C++ runtime's, taken once per process */
+    static auto *q = new std::vector<DeferredDestroy>(); /* INT-COV-EXEMPT */
     return *q;
 }
 
@@ -83,20 +85,38 @@ ML_NOINLINE inline void destroy_drain() noexcept
     }
 }
 
+/* the one typed step: run or queued, by destroy_any */
+template <class T>
+void destroy_delete(void *o) noexcept
+{
+    delete static_cast<T *>(o);    /* INT-COV-EXEMPT: the null test */
+}
+
+/*
+ * The depth rule lives in ONE function, not in the template: a branch in
+ * destroy_counted<T> is a separate coverage element per counted type, and
+ * the queue arm of most of them is reached by no program (a chain of
+ * strings does not exist). Inlined into destroy_counted<T>, `del` is a
+ * constant, so an optimized build calls the typed delete directly.
+ */
+inline void destroy_any(void *p, void (*del)(void *) noexcept) noexcept
+{
+    if (g_destroy_depth >= DESTROY_MAX_DEPTH) {
+        destroy_queue().push_back({p, del});
+        return;
+    }
+    ++g_destroy_depth;
+    del(p);
+    --g_destroy_depth;
+    if (g_destroy_depth == 0 && !destroy_queue().empty())
+        destroy_drain();
+}
+
 /* delete a counted object whose count reached 0 (see above) */
 template <class T>
 void destroy_counted(T *p) noexcept
 {
-    if (g_destroy_depth >= DESTROY_MAX_DEPTH) {
-        destroy_queue().push_back(
-            {p, [](void *o) noexcept { delete static_cast<T *>(o); }});
-        return;
-    }
-    ++g_destroy_depth;
-    delete p;
-    --g_destroy_depth;
-    if (g_destroy_depth == 0 && !destroy_queue().empty())
-        destroy_drain();
+    destroy_any(p, &destroy_delete<T>);
 }
 
 template <class T>

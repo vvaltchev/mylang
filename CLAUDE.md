@@ -6502,7 +6502,11 @@ deletions nest as before, a deeper one is QUEUED, and the outermost one
 empties the queue before it returns - the recursion is bounded, the
 order of destruction changes, and nothing else does (no destructor runs
 program code). A new place that drops a count to 0 by hand must call it
-too. Net: `tests/functional/92_long_chain_release.my` (watched failing:
+too. The depth rule is ONE non-template function (`destroy_any`, fed a
+typed `destroy_delete<T>`): a branch in the template is a coverage
+element per counted type, and no program queues a string. Nets: the
+`release:` `-rt` case (200 deep, the coverage unit) and
+`tests/functional/92_long_chain_release.my` (watched failing:
 ASan stack-overflow with `destroy` back to `delete`). The VALUE walks
 (print, `==`, hash, the deep copies, the `.myv` codec) still recurse
 per level of a deep value - a separate open item.
