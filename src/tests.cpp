@@ -11408,6 +11408,26 @@ static const std::vector<test> tests =
         { "rethrow;" },
         &typeid(SyntaxErrorEx), 1, 0, 0, 0,
     },
+    /* a function literal's body is a new context: the loop or catch
+     * body the literal stands in does not carry into it (the codegen
+     * refused what the parser let through, NotLoweredEx) */
+    {
+        "err loc: break in a lambda inside a loop is a parse error",
+        { "for (var i = 0; i < 2; i++) {",
+          "    var f = func() { break; return 1; };",
+          "    print(f());",
+          "}" },
+        &typeid(SyntaxErrorEx), 22, 2, 0, 0,
+    },
+    {
+        "err loc: rethrow in a lambda inside a catch is a parse error",
+        { "struct E {}",
+          "try { throw E(); } catch (E) {",
+          "    var f = func() { rethrow; };",
+          "    f();",
+          "}" },
+        &typeid(SyntaxErrorEx), 22, 3, 0, 0,
+    },
     {
         /* the dyn-foreach non-container throw carets the CONTAINER (both
          * engines; under the VM the JIT's loc-less re-raise stamps the same
