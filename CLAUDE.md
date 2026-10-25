@@ -7622,7 +7622,7 @@ headless-testable behind a thin terminal shell:
     lineedit.h):** `ReplEngine::may_continue` - the input ends with the
     `}` of a top-level `if` / `else if` / `try` / `catch` block that
     spans lines - keeps the editor open, a new line at the END of the
-    buffer; an empty line submits (run_repl trims it). The cooked reader
+    buffer; an empty line submits (the editor drops it). The cooked reader
     reads ONE line ahead instead and keeps it (`carry`) for the next
     input when `continues_chain` says it is not an `else` / `catch` /
     `finally`, so piped input groups exactly as before otherwise.

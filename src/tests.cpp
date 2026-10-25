@@ -22968,8 +22968,19 @@ static bool lineedit_joiner_keeps_chain_open()
     LineEditor e2;
     setup(e2);
     if (lines(e2, { "if (x) {", "f()", "}" }) != A::none
-        || e2.feed(13) != A::submit)
-        return false;                    /* an empty line submits */
+        || e2.feed(13) != A::submit || e2.buffer() != "if (x) {\n  f()\n  }")
+        return false;                    /* an empty line submits, and is */
+                                         /* not part of the input */
+    LineEditor eb;
+    eb.set_buffer(" \t\r");
+    if (!eb.last_line_blank())
+        return false;                    /* blank, with no newline */
+    eb.set_buffer("x\n \t");
+    if (!eb.last_line_blank())
+        return false;
+    eb.set_buffer("x\n y");
+    if (eb.last_line_blank())
+        return false;
 
     LineEditor e3;
     setup(e3);
