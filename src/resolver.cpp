@@ -6608,9 +6608,7 @@ private:
             const Construct *arg = ce->args->elems[i].get();
             if (!tail_arg_ok(uses, arg)
                     || !bind_is_identity(f, static_cast<size_t>(i), arg)
-                    || (ctag(arg) != ConstructType::id
-                        && param_written_through(f,
-                               static_cast<size_t>(i)))
+                    || param_written_through(f, static_cast<size_t>(i))
                     || param_member_written(f, static_cast<size_t>(i)))
                 return;
         }
@@ -6870,10 +6868,22 @@ private:
     {
         if (!bind_is_identity(f, i, arg))
             return false;
-        /* a write position needs an lvalue: only a NAME may fill it */
-        if (ctag(arg) != ConstructType::id && param_written_through(f, i))
+        /*
+         * A parameter the body writes through is bound, never pasted - not
+         * even a NAME. A write position needs an lvalue, and the write must
+         * go where the call's would: through the parameter's own copy of
+         * the handle. For an array that copy shares the storage, so the
+         * write reaches the caller's array either way - unless the caller's
+         * name holds a SLICE, whose copy is its own view and detaches on
+         * the write (README, slices). Pasted, the write landed in the
+         * caller's slice: `f(u)` with `x[0] = 77` changed u inlined and
+         * left it alone under -ni (RULE 2). Nothing at compile time tells
+         * a slice from an array, so every such argument is bound; a write
+         * INTO a struct the parameter holds needs the call's own copy for
+         * the same reason (a struct is a value).
+         */
+        if (param_written_through(f, i))
             return false;
-        /* ...and a write into a struct needs the call's own copy */
         if (param_member_written(f, i))
             return false;
         if (arg_is_inert(arg))
