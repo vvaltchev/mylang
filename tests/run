@@ -460,7 +460,7 @@ def rt_failed(out):
 
 def corpus_failed(out):
     bad = []
-    for m in re.finditer(r"^(?:DIFF|CRASH|FAIL) \[[^\]]*\] (\S+)|"
+    for m in re.finditer(r"^(?:DIFF|CRASH|FAIL|MISSING) \[[^\]]*\] (\S+)|"
                          r"^REFUSED (\S+)", out, re.M):
         p = m.group(1) or m.group(2)
         if p not in bad:
@@ -911,6 +911,7 @@ def report_step(s, out, show_output):
 # (with the lines just above, where -rt names its case), since the end of a
 # log is often a summary written well after the case that failed
 FAIL_MARK = re.compile(r"\[ FAIL|\bFAIL\b|FAILED|DIFF |CRASH |REFUSED |"
+                       r"MISSING |"
                        r"Assertion|runtime error:|ERROR: |terminate called|"
                        r"census LEAK|Segmentation fault|Aborted|uncovered "
                        r"elements|owns no element")
