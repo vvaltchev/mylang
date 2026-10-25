@@ -5068,6 +5068,28 @@ static const std::vector<test> tests =
         },
     },
 
+    {
+        /* question 10, decision B (Python's deepcopy): a container shared
+         * at two places is one container in the copy - it was copied at
+         * each place unless the sharing was a cycle */
+        "deepclone() keeps sharing: a container met twice is copied once",
+        {
+            "class C { int v; }",
+            "var inner = [1, 2];",
+            "var a = deepclone([inner, inner]);",
+            "a[0][0] = 9; assert(a[1][0] == 9 && inner[0] == 1);",
+            "var k = C(1);",
+            "var c = deepclone({\"x\": k, \"y\": [k]});",
+            "c[\"x\"].v = 5; assert(c[\"y\"][0].v == 5 && k.v == 1);",
+            "var b = box(1); var d = deepclone([b, b]);",
+            "*d[0] = 3; assert(*d[1] == 3 && *b == 1);",
+            /* one slice held twice is one array; two slices are two */
+            "var a2 = [1, 2, 3]; var s = a2[0:2];",
+            "var e = deepclone([s, s, a2[0:2]]); e[0][0] = 9;",
+            "assert(e[1][0] == 9 && e[2][0] == 1 && a2[0] == 1);",
+        },
+    },
+
     /* More read-only / clone / deepclone coverage. */
     {
         "Const array: pop through a param is rejected",
@@ -8520,10 +8542,10 @@ static const std::vector<test> tests =
         "assert(c == a && intptr(c[1]) == intptr(c));",
         "assert(intptr(c) != intptr(a));",
         "c[0] = 9; assert(a[0] == 1 && c[1][0] == 9);",
-        /* shared at two places, not on a cycle: still copied twice */
+        /* shared at two places, not on a cycle: one copy too */
         "var dyn s7 = [7]; var dyn dag = [s7, s7];",
         "var dyn dc = deepclone(dag); dc[0][0] = 8;",
-        "assert(dc[1][0] == 7 && s7[0] == 7);",
+        "assert(dc[1][0] == 8 && s7[0] == 7);",    /* question 10 */
         "var dyn d = {}; d[\"s\"] = d; var dyn dd = deepclone(d);",
         "assert(dd == d && intptr(dd[\"s\"]) == intptr(dd));",
         "pop(a); pop(c); erase(d, \"s\"); erase(dd, \"s\");" } },

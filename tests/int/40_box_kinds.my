@@ -258,13 +258,13 @@ cp.x = 1000;
 want("clone P", [bp.x, cp.x], [7, 1000]);
 var nested = [b1, b1];
 var sn = clone(nested);             # a shallow array clone: the same box
-var dn2 = deepclone(nested);        # a new box at each place (README)
-*sn[0] += 1;
+var dn2 = deepclone(nested);        # ONE new box, held at both places
+*sn[0] += 1;                        # (question 10: Python's deepcopy rule)
 *dn2[0] = ri(-1);
 want("clone of an array of boxes", [*b1, *sn[1], *dn2[0], *dn2[1]],
-     [51, 51, -1, 50]);
-want("deepclone copies per place", [dn2[0] == dn2[1], sn[1] == b1],
-     [false, true]);
+     [51, 51, -1, -1]);
+want("deepclone keeps sharing", [dn2[0] == dn2[1], sn[1] == b1,
+                                 dn2[0] == b1], [true, true, false]);
 
 # --- 8. zero-initialised box declarations (a fresh box each time)
 box<int> zi;

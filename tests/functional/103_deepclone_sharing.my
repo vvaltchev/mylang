@@ -1,0 +1,87 @@
+# deepclone keeps the source's SHAPE, as Python's copy.deepcopy does: each
+# array, dict, class instance and box reachable from it is copied once,
+# and every place that held it holds that one copy - README, deepclone;
+# question 10 in plans/open-language-questions.md, decision B. It used to
+# copy a container shared at two places twice, unless the sharing was a
+# cycle. A struct value stays a value: its copies are independent.
+
+class C { int v; }
+struct P { int x; }
+struct Q { int x; array<int> a; }
+
+var seen = [];
+
+# 1. a flat int array stored twice
+var inner = [1, 2];
+var c1 = deepclone([inner, inner]);
+c1[0][0] = 9;
+append(seen, c1[1][0]);                    # 9
+
+# 2. one class instance twice, and its array of instances
+var k = C(1);
+var c2 = deepclone([k, k]);
+c2[0].v = 9;
+append(seen, c2[1].v);                     # 9
+array<C> ks = [k, k];
+var c2b = deepclone(ks);
+c2b[1].v = 7;
+append(seen, c2b[0].v);                    # 7
+
+# 3. one array under two dict keys, and across kinds
+var sh = [0];
+var c3 = deepclone({"a": sh, "b": sh});
+c3["a"][0] = 9;
+append(seen, c3["b"][0]);                  # 9
+var c3b = deepclone([sh, {"k": sh}]);
+c3b[0][0] = 8;
+append(seen, c3b[1]["k"][0]);              # 8
+
+# 4. one box twice
+var b = box(1);
+var c4 = deepclone([b, b]);
+*c4[0] = 9;
+append(seen, *c4[1]);                      # 9
+
+# 5. one slice twice is one array; two slices are two
+var a = [1, 2, 3];
+var s = a[0:2];
+var c5 = deepclone([s, s]);
+c5[0][0] = 9;
+append(seen, c5[1][0]);                    # 9
+var c5b = deepclone([a[0:2], a[0:2]]);
+c5b[0][0] = 9;
+append(seen, c5b[1][0]);                   # 1
+
+# 6. struct values stay independent; an array they share stays shared
+var p = P(1);
+var c6 = deepclone([p, p]);
+c6[0].x = 9;
+append(seen, c6[1].x);                     # 1
+var q = Q(1, [5]);
+var c6b = deepclone([q, q]);
+c6b[0].a[0] = 9;
+c6b[0].x = 9;
+append(seen, c6b[1].a[0]);                 # 9: the field array is shared
+append(seen, c6b[1].x);                    # 1
+
+# 7. a constant's shared parts
+const A = [1, 2];
+const K = [A, A];
+var c7 = deepclone(K);
+c7[0][0] = 9;
+append(seen, c7[1][0]);                    # 9
+
+# 8. a cycle, still reproduced; the original is untouched by all of it
+var dyn cyc = dynarray([1]);
+append(cyc, cyc);
+var dyn c8 = deepclone(cyc);
+c8[0] = 9;
+append(seen, c8[1][0]);                    # 9
+append(seen, cyc[0]);                      # 1
+pop(cyc);
+pop(c8);
+
+print(seen);
+assert(seen == [9, 9, 7, 9, 8, 9, 9, 1, 1, 9, 1, 9, 9, 1]);
+assert(inner == [1, 2] && k.v == 1 && sh == [0] && *b == 1 && a == [1, 2, 3]);
+assert(p.x == 1 && q.a == [5] && A == [1, 2]);
