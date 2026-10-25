@@ -9,6 +9,7 @@
 # store, a store into a container no declaration types) must give the
 # folded call exactly the run-time call's answer (RULE 2).
 struct V { float f; array<float?> a; }
+struct W { int i; V v; str s; }
 
 pure func p_try(int n) {
     array<float?> a = [none, none, none];
@@ -65,6 +66,23 @@ pure func p_stores(int n) {
 }
 assert(p_stores(3) == p_stores(int(runtime(3))));
 assert(p_stores(3) == "6.000000 3.000000 3 3.500000 6.000000 1");
+
+pure func p_members(int n) {
+    W w = W(0, V(0.5, [none]), "x");
+    w.i = n;
+    w.v.f = n;
+    w.s = "y";
+    dict<str, float> d = {};
+    d.k = n;
+    var u = V(0.5, [none]);
+    u.f = n;
+    str t = "ab";
+    var c = t[0];
+    return str(w.i) + " " + str(w.v.f) + " " + w.s + " " + str(d.k)
+        + " " + str(len(u.a)) + " " + c;
+}
+assert(p_members(2) == p_members(int(runtime(2))));
+assert(p_members(2) == "2 2.000000 y 2.000000 1 a");
 
 const FOLDED = [str(p_try(4)), p_multi(4), p_stores(4)];
 assert(FOLDED == [str(p_try(int(runtime(4)))), p_multi(int(runtime(4))),

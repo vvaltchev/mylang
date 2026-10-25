@@ -64,9 +64,10 @@ ok: opt K
      -0.000000,
      2.000000
    ]
+>> => [inf, -inf, nan, 3.141593]
 >> => {"a": 1}
 >> => {"b": [2.500000], "c": 3}
->> .. .. .. .. .. .. .. .. .. >> => [1, 1, 2, 1, 1, 1, 2]
+>> .. .. .. .. .. .. .. .. .. .. >> => [1, 1, 2, 1, 1, 1, 2, 1]
 >> /* pure */ array<int> func vals() {
     array<array<dyn>> r = [[1, [...]]];
     array<dict<str,dyn>> e = [{"me": {...}}];
@@ -74,8 +75,9 @@ ok: opt K
     array<N> n = [N(n: "a", v: 7)];
     array<K> k = [K(v: 8)];
     array<array<float>> f = [[1.5, 0.1, 1e+300, -0.0, 2.0]];
+    array<array<float>> x = [[inf, -inf, nan, 3.141592653589793]];
     array<dict<str,int>> d = [{"a": 1}, {"b": [2.5], "c": 3}];
-    return [len(r), len(e), len(s), len(n), len(k), len(f), len(d)];
+    return [len(r), len(e), len(s), len(n), len(k), len(f), len(d), len(x)];
 }
 >> >> >> => 8
 >> /* pure */ int func u1(int n) => /* inlined h1 */ {
