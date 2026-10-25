@@ -110,6 +110,15 @@ public:
     /* Least upper bound; nullptr on an irreconcilable type conflict. */
     StaticTypeRef join(StaticTypeRef a, StaticTypeRef b);
 
+    /*
+     * `t` with every UNFILLED container component - an array's element,
+     * a dict's key or value typed `none`, which is what `[]`, `{}` and
+     * array(N) give and nothing typed ever replaced (join_elem absorbs
+     * it) - made `dyn`, at every depth (question 9: an empty container
+     * is the most generic one). `t` itself when there is none.
+     */
+    StaticTypeRef fill_unfilled(StaticTypeRef t);
+
 
 private:
 

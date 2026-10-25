@@ -5058,7 +5058,16 @@ decisions behind it: `plans/archived/type-inference.md`,
   (`join_elem`) so `array(N)`-then-fill stays `array<int>`, not opt-element;
   an empty `[]` (`array<none>`) or a `dyn`-element container fits any
   `array<T>` (`static_type_elem_compat` — invariance relaxed at the bottom/top
-  element). A DEFAULT dict's reads also yield its default, so its type
+  element). **A `none` component is UNFILLED, never "an element typed
+  none" (question 9, 2026-10-25):** a read of it (`component_read`: an
+  element, a key, a value, a foreach variable) is `bottom` during the
+  fixpoint, so a later round's fill types it, and a reader nothing ever
+  fills finalizes `dyn`; every type string spells the component `dyn`,
+  and a folded `type()` / `decltype()` builds its reflection object from
+  the filled type (`fill_unfilled`). So iterating an empty container is
+  never a compile error, while `var a = []; append(a, 1)` stays
+  `array<int>`.
+  A DEFAULT dict's reads also yield its default, so its type
   joins the default's: an empty one is `dict<dyn, T>`, the type the
   unfolded `dict(v)` call has (it was `dict<none,none>`, and a folded
   `dict(0)`'s `d.a + 1` a NullabilityEx `-nc` did not raise).
@@ -5484,7 +5493,8 @@ a callee filling it through its reference param contributes to the PARAM's
 symbol, never back to the caller's). That case is not merely useless but
 HARMFUL: the clone's params are seeded from the signature, so a body that
 only READS the container types every element `none` and an ordinary use of
-one (`k + ":"`) becomes a spurious `NullabilityEx` — even though the
+one (`k + ":"`) became a spurious `NullabilityEx` (until question 9 made
+such a read `dyn`; the clone is still uninformative) — even though the
 container is non-empty at runtime, filled by a SIBLING function
 (`samples/phonebook`: `cmd_add` fills `data`, `cmd_view` iterates it; a
 WRITER body repairs its param type by contribution, a reader cannot). The

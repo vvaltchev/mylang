@@ -16,7 +16,7 @@ at run time (#49).
 | 6  | a throwing constant expression inside a `try`   | decided: A |
 | 7  | duplicate keys in a dict literal                | decided: A |
 | 8  | `rethrow` inside a `try` nested in a `catch`    | decided: A |
-| 9  | the element type of an empty container          | open       |
+| 9  | the element type of an empty container          | decided: C |
 | 10 | `deepclone` and shared instances                | open       |
 | 11 | the value of a multi-assignment                 | open       |
 | 12 | exception chaining                              | open       |
@@ -359,6 +359,24 @@ show({});` is refused too (the join makes `k` a `str?`), while
   `show({"a": 1}); show({})` types `k` as `str`; alone it is `dyn`
   (recommended).
 - **C.** An empty literal's element type is `dyn` everywhere.
+
+Decision (maintainer, 2026-10-25): **C**, refined: an empty literal takes
+the element type of what is put into it (`var a = []; append(a, 1)` stays
+`array<int>`); one nothing typed is ever put into is `array<dyn>` /
+`dict<dyn,dyn>`, the most generic form. "We cannot prevent at compile
+time iteration over empty arrays or dicts: that would be wrong."
+
+Done the same day. The inferencer keeps `none` as an empty container's
+component while it runs (joins absorb it, so a fill still types it), but
+a READ of such a component - an element, a key, a value, a foreach
+variable - waits for a later round instead of typing the reader `none`,
+and a reader nothing fills finalizes `dyn`; the settled container types
+and `typestr` make the component itself `dyn`, and every type string
+spells it so. `show({"a": 1}); show({});`, `show({})` alone, `total([])`
+and a foreach over `[]` / `{}` all compile and run. Tests: three `ti:`
+`-rt` cases (the types, iteration in every caller, reading an element
+nothing fills) and a `repl:` case (a committed empty array filled by a
+later input, an error message).
 
 ## 10. `deepclone` and shared instances
 

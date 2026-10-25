@@ -1454,6 +1454,19 @@ Key rules:
   * Arrays and dicts are typed by their contents (`[1,2,3]` is an array of int).
     A genuinely mixed container is allowed — its element type just becomes `dyn`
     (see below), so you don't get the speed/safety benefits but it still works.
+    An empty `[]` or `{}` (and `array(n)`) takes the type of what the program
+    puts into it: `var a = []; append(a, 1);` is an `array<int>`. One nothing
+    typed is ever put into is the most generic container, `array<dyn>` /
+    `dict<dyn,dyn>`, so iterating or reading it always compiles:
+
+    ```C#
+    func show(d) {
+        foreach (k, v in d)
+            print(k + ": " + str(v));
+    }
+    show({"a": 1});     # this instance: d is a dict<str,int>
+    show({});           # this one: a dict<dyn,dyn> - prints nothing
+    ```
   * **Null safety.** A plain value is *non-nullable*: passing `none` where a
     non-`none` value is required — an arithmetic operand, a subscript base — is
     a compile error. A local that might be `none` (e.g. `var x;`, or assigned
