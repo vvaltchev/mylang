@@ -3241,16 +3241,22 @@ static bool param_has_fit(const TypeSym *p)
  */
 static bool fit_needed(StaticTypeRef v, StaticTypeRef p, bool top = true)
 {
-    p = p ? static_type_resolve(p) : nullptr;
-    if (!p || p->kind == StaticTypeKind::Dyn
+    /* (a null type cannot reach here: every caller passes one, and a
+     * component is never null - StaticTypeArena::array_of) */
+    p = static_type_resolve(p);
+    if (!p)                             /* INT-COV-EXEMPT: see above */
+        return false;
+    if (p->kind == StaticTypeKind::Dyn
             || p->kind == StaticTypeKind::Unknown
             || p->kind == StaticTypeKind::None)
         return false;
     if (top && (p->kind == StaticTypeKind::Int
                 || p->kind == StaticTypeKind::Float))
         return false;
-    v = v ? static_type_resolve(v) : nullptr;
-    if (!v || v->kind == StaticTypeKind::Dyn
+    v = static_type_resolve(v);
+    if (!v)                             /* INT-COV-EXEMPT: see above */
+        return true;
+    if (v->kind == StaticTypeKind::Dyn
             || v->kind == StaticTypeKind::Unknown)
         return true;
     switch (p->kind) {
@@ -3270,13 +3276,14 @@ static bool fit_needed(StaticTypeRef v, StaticTypeRef p, bool top = true)
  * against. `dyn` (and anything value_fits has no rule for - a function,
  * an exception) checks nothing; so does a box's unknown element (null).
  */
-static std::shared_ptr<TypeAnnot> fit_annot_of(StaticTypeRef t,
-                                               int depth = 0)
+static std::shared_ptr<TypeAnnot> fit_annot_of(StaticTypeRef t)
 {
     auto a = std::make_shared<TypeAnnot>();
     a->kind = DeclType::dyn;
-    t = t ? static_type_resolve(t) : nullptr;
-    if (!t || depth > 64)
+    /* a static type is as deep as the source that wrote it, and never
+     * null (fit_needed's note) */
+    t = static_type_resolve(t);
+    if (!t)                             /* INT-COV-EXEMPT: fit_needed's */
         return a;
     a->opt = t->opt;
     switch (t->kind) {
@@ -3286,12 +3293,12 @@ static std::shared_ptr<TypeAnnot> fit_annot_of(StaticTypeRef t,
     case StaticTypeKind::Str:   a->kind = DeclType::s; break;
     case StaticTypeKind::Array:
         a->kind = DeclType::arr;
-        a->elem = fit_annot_of(t->elem, depth + 1);
+        a->elem = fit_annot_of(t->elem);
         break;
     case StaticTypeKind::Dict:
         a->kind = DeclType::dict;
-        a->key = fit_annot_of(t->key, depth + 1);
-        a->val = fit_annot_of(t->val, depth + 1);
+        a->key = fit_annot_of(t->key);
+        a->val = fit_annot_of(t->val);
         break;
     case StaticTypeKind::Struct:
         a->kind = DeclType::strct;
@@ -3299,7 +3306,7 @@ static std::shared_ptr<TypeAnnot> fit_annot_of(StaticTypeRef t,
         break;
     case StaticTypeKind::Box:
         a->kind = DeclType::box;
-        a->elem = fit_annot_of(t->elem, depth + 1);
+        a->elem = fit_annot_of(t->elem);
         if (a->elem->kind == DeclType::dyn)
             a->elem = nullptr;          /* any box */
         break;
@@ -3326,20 +3333,18 @@ store_fit(StaticTypeRef p, StaticTypeRef v, FitSpec::Place where,
 }
 
 /* #49: a dyn or unsettled type anywhere in `t` */
-static bool fit_has_dyn(StaticTypeRef t, int depth = 0)
+static bool fit_has_dyn(StaticTypeRef t)
 {
-    t = t ? static_type_resolve(t) : nullptr;
-    if (!t || t->kind == StaticTypeKind::Dyn
-            || t->kind == StaticTypeKind::Unknown)
-        return true;
-    if (depth > 64)
+    t = static_type_resolve(t);
+    if (!t)                             /* INT-COV-EXEMPT: fit_needed's */
         return true;
     switch (t->kind) {
+    case StaticTypeKind::Dyn: case StaticTypeKind::Unknown:
+        return true;
     case StaticTypeKind::Array: case StaticTypeKind::Box:
-        return fit_has_dyn(t->elem, depth + 1);
+        return fit_has_dyn(t->elem);
     case StaticTypeKind::Dict:
-        return fit_has_dyn(t->key, depth + 1)
-               || fit_has_dyn(t->val, depth + 1);
+        return fit_has_dyn(t->key) || fit_has_dyn(t->val);
     default:
         return false;
     }
@@ -3356,12 +3361,13 @@ static bool fit_has_dyn(StaticTypeRef t, int depth = 0)
  */
 bool Inferencer::call_fit_args(CallExpr *call)
 {
-    ExprList *args = call->args.get();
-    const size_t na = args ? args->elems.size() : 0;
+    ExprList *args = call->args.get();     /* a call always has a list */
+    const size_t na = args->elems.size();
     if (na == 0)
         return false;
     if (const StructTypeDef *def = cs_struct_callee(call->what.get())) {
-        for (size_t i = 0; i < na && i < def->fields.size(); i++) {
+        const size_t nf = std::min(na, def->fields.size());
+        for (size_t i = 0; i < nf; i++) {
             const FieldDef &fd = def->fields[i];
             if (fd.kind != FieldKind::f_dyn
                     && fit_needed(type_of(args->elems[i].get()),
@@ -3371,21 +3377,18 @@ bool Inferencer::call_fit_args(CallExpr *call)
         return false;
     }
     if (FuncInfo *fi = callee_funcinfo(call->what.get())) {
-        for (size_t i = 0; i < na && i < fi->params.size(); i++)
+        const size_t np = std::min(na, fi->params.size());
+        for (size_t i = 0; i < np; i++)
             if (param_has_fit(fi->params[i])
                     && fit_needed(type_of(args->elems[i].get()),
                                   fi->params[i]->type))
                 return true;
         return false;
     }
-    if (ctag(call->what.get()) == ConstructType::id) {
-        auto *cid = static_cast<Identifier *>(call->what.get());
-        auto it = id_sym.find(cid);
-        if ((it == id_sym.end() || !it->second) && is_builtin(cid->uid))
-            return false;
-    }
+    if (cs_callee_is_builtin(call->what.get()))
+        return false;
     StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
-    if (ct->kind != StaticTypeKind::Func || na > ct->params.size())
+    if (ct->kind != StaticTypeKind::Func)
         return true;
     /* a dyn (or unsettled) position in the callee's type: the function
      * the value holds may declare anything there */
@@ -3395,8 +3398,10 @@ bool Inferencer::call_fit_args(CallExpr *call)
             return true;
     /* every position settled: the function declares that type there, so
      * an argument is checked as against a known parameter - and an int
-     * or float one is the bind's coercion's */
-    for (size_t i = 0; i < na; i++)
+     * or float one is the bind's coercion's (the arity was checked;
+     * min keeps a non-strict pass in range) */
+    const size_t np = std::min(na, ct->params.size());
+    for (size_t i = 0; i < np; i++)
         if (fit_needed(type_of(args->elems[i].get()), ct->params[i]))
             return true;
     return false;
@@ -3506,17 +3511,15 @@ void Inferencer::annotate_hints(Construct *n)
                 }
             } else if (bt->kind == StaticTypeKind::Struct
                        && ctag(lv) == ConstructType::member) {
+                /* (only a container field - an array, a dict, a box -
+                 * carries an annotation: pAcceptStructDecl) */
                 const auto *def =
                     static_cast<const StructTypeDef *>(bt->struct_def);
                 const auto *mem = static_cast<const MemberExpr *>(lv);
-                const int fs = def && mem->memUid
-                    ? def->slot_of(mem->memUid) : -1;
+                const int fs = def ? def->slot_of(mem->memUid) : -1;
                 const FieldDef *fd = fs >= 0
                     ? &def->fields[static_cast<size_t>(fs)] : nullptr;
                 if (fd && fd->annot
-                        && (fd->kind == FieldKind::f_array
-                            || fd->kind == FieldKind::f_dict
-                            || fd->kind == FieldKind::f_box)
                         && fit_needed(rt, field_static_type(*fd))) {
                     auto f = std::make_shared<FitSpec>();
                     f->annot = fd->annot;
@@ -3660,9 +3663,7 @@ void Inferencer::annotate_hints(Construct *n)
         /* append / push / insert of a container LITERAL into a FIXED
          * array: the literal has the element type (literal_into) */
         if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
-            auto sit = id_sym.find(cid);
-            const bool builtin =
-                (sit == id_sym.end() || !sit->second) && is_builtin(cid->uid);
+            const bool builtin = cs_callee_is_builtin(cid);
             const std::string_view nm = cid->uid->val;
             const size_t vi = nm == "insert" ? 2 : 1;
             if (builtin && call->args && call->args->elems.size() > vi
