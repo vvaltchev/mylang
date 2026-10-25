@@ -1693,12 +1693,9 @@ history_decode(const string &l)
     return out;
 }
 
-static void
-load_history(std::vector<string> &history)
+void
+repl_load_history(const string &path, std::vector<string> &history)
 {
-    const string path = history_path();
-    if (path.empty())
-        return;
     std::ifstream f(path);
     string line;
     /* the first line names the format: a file written before entries were
@@ -1717,12 +1714,9 @@ load_history(std::vector<string> &history)
         history.erase(history.begin(), history.end() - HISTORY_CAP);
 }
 
-static void
-save_history(const std::vector<string> &history)
+void
+repl_save_history(const string &path, const std::vector<string> &history)
 {
-    const string path = history_path();
-    if (path.empty())
-        return;
     std::ofstream f(path, std::ios::trunc);
     if (!f.is_open())
         return;
@@ -1738,7 +1732,9 @@ run_repl()
 {
     ReplEngine engine;
     std::vector<string> history;
-    load_history(history);
+    const string hpath = history_path();
+    if (!hpath.empty())
+        repl_load_history(hpath, history);
 
     /* Colors on a TTY unless NO_COLOR is set (https://no-color.org). */
     const bool color = repl_out_is_tty() && !env_get("NO_COLOR");
@@ -1810,6 +1806,7 @@ run_repl()
         std::cout << engine.eval_input(input);
     }
 
-    save_history(history);
+    if (!hpath.empty())
+        repl_save_history(hpath, history);
     return 0;
 }
