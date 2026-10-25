@@ -83,8 +83,11 @@ if [ "${1:-}" = __unit ]; then
     # bash ("Segmentation fault ...") on the report's stderr - the serial
     # script ran each program in a $(...), where bash stays silent.
     exec 2>/dev/null
+    # The limit catches a HANG, so it is far above the slowest honest
+    # run: samples/loop under -tw -nti takes 47 s on an idle ASan debug
+    # build, and 60 s timed it out on a loaded one (2026-10-12).
     # shellcheck disable=SC2086
-    env $_e timeout 60 "$CORPUS_DIFF_BIN" $_fl "$_f" \
+    env $_e timeout 180 "$CORPUS_DIFF_BIN" $_fl "$_f" \
         >"$_d/$_id.out" 2>&1 </dev/null
     echo $? >"$_d/$_id.rc"
     exit 0
