@@ -1,0 +1,44 @@
+# Reading an entry of a dict no variable holds - a call's result, a
+# literal, an element read as a value - gets the entry's value. The
+# tree-walker (and the parser's constant fold, which uses it) handed out
+# a pointer into the dict, which died before the read: a heap
+# use-after-free under ASan in every engine for a folded shape, silent
+# garbage in a release build. A default dict reached through such a
+# handle may still be shared, so its new key is still inserted; and a
+# default dict's `d.k` read inserts the default in every engine (README),
+# where the VM's member read only returned it.
+func mk() => {"k": 1, "n": none};
+func mkd(v) => dict(v);
+
+assert([{"k": 1}][0]["k"] == 1);
+assert([{"k": 2}][0].k == 2);
+assert({"a": {"k": 3}}["a"]["k"] == 3);
+assert({"a": {"k": 4}}["a"].k == 4);
+assert({"a": 5}["a"] == 5);
+assert([{"k": none}][0]["k"] == none);
+assert(mk()["k"] == 1 && mk().k == 1 && mk()["n"] == none);
+assert([{"k": 6}][runtime(0)]["k"] == 6);
+assert([{"k": 7}][runtime(0)].k == 7);
+assert(mkd(8)["x"] == 8 && mkd(9).y == 9);
+
+# a handle through a temporary array is one more alias of a live dict
+var d = dict(7);
+assert([d][0]["z"] == 7 && [d][0].w == 7);
+assert(len(d) == 2 && d["z"] == 7 && d["w"] == 7);
+
+# a default dict's member read inserts the default, in every engine
+var e = dict(0);
+var t = e.a + e.b;
+assert(t == 0 && len(e) == 2);
+var dyn de = dict(3);
+assert(de.q == 3 && len(de) == 1);
+const C = dict(5);
+assert(C.z == 5 && len(C) == 0);      # a constant cannot take the key
+
+# a store through an element still reaches the shared dict
+var s = {"k": 1};
+var arr = [s];
+arr[0]["k"] = 5;
+arr[0].j = 6;
+assert(s["k"] == 5 && s.j == 6);
+print("ok");

@@ -200,10 +200,23 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
         throw KeyNotFoundEx();
     }
 
+    /*
+     * A READ through a handle no variable holds (a call's result, a literal,
+     * an element read as a value) gets the entry's VALUE: the dict may die
+     * when the read ends, and a pointer into its entry dangled -
+     * `[{"k": 1}][0]["k"]` read freed memory, at parse time too, where the
+     * fold evaluates it. Everything else is as for a held dict - the handle
+     * may be one more alias of a live dict (`[d][0]["z"]`), so a default
+     * dict's new key is still inserted. A store holds its base, so it
+     * always arrives with an LValue (TypeArr::subscript makes the same
+     * test).
+     */
+    const bool held = what_lval.is<LValue *>();
+
     /* Present key: hand out the lvalue (a read RValue()s it; a compound assign
      * reads-and-writes it). */
     if (present)
-        return &it->second;
+        return held ? EvalValue(&it->second) : it->second.get();
 
     /*
      * Missing key. A default dict inserts+returns its default (so `d[k]` is
@@ -219,9 +232,11 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
      * (the entry would sit in the wrong bucket). A scalar/string key is
      * immutable already, so make_const_clone returns it as-is (cheap).
      */
-    if (obj.get_has_default())            /* a new key: see Cursor */
-        return obj.insert_new(make_const_clone(key, true),
-                              LValue(obj.get_default(), false));
+    if (obj.get_has_default()) {          /* a new key: see Cursor */
+        LValue *lv = obj.insert_new(make_const_clone(key, true),
+                                    LValue(obj.get_default(), false));
+        return held ? EvalValue(lv) : lv->get();
+    }
 
     if (for_write)
         return obj.insert_new(make_const_clone(key, true), LValue(none, false));
