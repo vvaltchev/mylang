@@ -4651,7 +4651,7 @@ decisions behind it: `plans/archived/type-inference.md`,
   (`TypeSym::{round_got_dyn,coerces_dyn,decl_id}`.)
 - **⛔ A `dyn` VALUE ENTERING A TYPED PLACE IS CHECKED AT RUN TIME, BY
   ONE FUNCTION (#49, 2026-10-12; README *A `dyn` value entering a typed
-  place*).** `value_fits(v, annot, FitMisfit *)` (types/fit.cpp.h) is
+  place*).** `value_fits(v, annot, FitMisfit &)` (types/fit.cpp.h) is
   the only answer to "does this value fit that declared type"; every
   engine calls it, so the refusals and their messages agree
   (`fit_error` renders one). Its walk is bounded by the ANNOTATION, not

@@ -1,0 +1,223 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#49): value_fits (types/fit.cpp.h) walks a value against a
+# declared type - every annotation kind and every array storage, each
+# once fitting and once not, the dict keys, values and default, a
+# container met twice (walked once) and two slices of one storage (two
+# values, each walked). The parameters are reached through a dyn callee
+# (the generic call op checks every bind) and directly; the verdicts are
+# asserted, so a check that lets a misfit through, or refuses a value
+# that fits, fails the unit. README, "A dyn value entering a typed
+# place".
+struct P { int x; }
+struct Q { int x; }
+struct Egg { int x; }
+struct Owl { int x; }
+struct Urn { int x; }
+class C { int n; }
+class D { int n; }
+
+var trail = [];
+func check(str name, dyn f, opt dyn v) {
+    try { f(v); append(trail, name + " ok"); }
+    catch (TypeErrorEx) { append(trail, name + " no"); }
+}
+
+func ai(array<int> a) => len(a);
+func af(array<float> a) => len(a);
+func ab(array<bool> a) => len(a);
+func astr(array<str> a) => len(a);
+func ap(array<P> a) => len(a);
+func ac(array<C> a) => len(a);
+func aoi(array<int?> a) => len(a);
+func aai(array<array<int>> a) => len(a);
+func adi(array<dict<str, int>> a) => len(a);
+func dsi(dict<str, int> d) => len(d);
+func dai(dict<array<int>, int> d) => len(d);
+func dsa(dict<str, array<int>> d) => len(d);
+func dsp(dict<str, P> d) => len(d);
+func dvi(dict<dyn, int> d) => len(d);
+func dki(dict<int, dyn> d) => len(d);
+func ddd(dict<dyn, dyn> d) => len(d);
+func sp(P p) => p.x;
+func osp(P? p) { if (p == none) return -1; return p.x; }
+func bi(box<int> b) => *b;
+func bp(box<P> b) => (*b).x;
+func sstr(str s) => len(s);
+func sbool(bool b) => b ? 1 : 0;
+func sc(C c) => c.n;
+func garr(array a) => len(a);
+func gdict(dict d) => len(d);
+func adyn(array<dyn> a) => len(a);
+func abox(array<box<int>> a) => len(a);
+
+# flat storage is decided by its kind alone
+check("ai ints", ai, runtime([1, 2]));
+check("af ints", af, runtime([1, 2]));
+check("ab ints", ab, runtime([1, 2]));
+check("astr ints", astr, runtime([1, 2]));
+check("ap ints", ap, runtime([1, 2]));
+check("af floats", af, runtime([1.5]));
+check("ai floats", ai, runtime([1.5]));
+check("ab bools", ab, runtime([true]));
+check("ai bools", ai, runtime([true]));
+check("astr strs", astr, runtime(split("a b", " ")));
+check("ai strs", ai, runtime(split("a b", " ")));
+check("ap structs", ap, runtime([P(1), P(2)]));
+check("ap other", ap, runtime([Q(1)]));
+check("ai structs", ai, runtime([P(1)]));
+check("ai empty", ai, runtime([]));
+# a general array is walked element by element
+check("ai general", ai, runtime(dynarray([1, 2])));
+check("ai general bad", ai, runtime(dynarray([1, "x"])));
+check("aoi none", aoi, runtime(dynarray([1, none])));
+check("ai none", ai, runtime(dynarray([1, none])));
+check("ac objs", ac, runtime([C(1), C(2)]));
+check("ac objs bad", ac, runtime([C(1), D(2)]));
+# one inner array twice is walked once; two windows of one storage are
+# two values
+var inner = dynarray([1, 2]);
+check("aai shared", aai, runtime([inner, inner]));
+var st = dynarray([1, 2, "x"]);
+check("aai windows", aai, runtime([st[0:2], st[1:3]]));
+check("aai window ok", aai, runtime([st[0:2], st[0:2]]));
+# dicts: keys, values, both, neither, a default, a shared dict
+check("dsi ok", dsi, runtime({"a": 1}));
+check("dsi value", dsi, runtime({"a": "s"}));
+check("dsi key", dsi, runtime({1: 1}));
+check("dai ok", dai, runtime({[1]: 1}));
+check("dai key", dai, runtime({["x"]: 1}));
+check("dsa ok", dsa, runtime({"k": [1]}));
+check("dsa value", dsa, runtime({"k": ["x"]}));
+check("dsi default ok", dsi, runtime(dict(5)));
+check("dsi default", dsi, runtime(dict("s")));
+check("dsp default ok", dsp, runtime(dict(P(1))));
+check("dsp default", dsp, runtime(dict(Q(1))));
+check("dvi ok", dvi, runtime({"a": 1}));
+check("dvi value", dvi, runtime({1: "s"}));
+check("dki ok", dki, runtime({1: "s"}));
+check("dki key", dki, runtime({"a": 1}));
+check("ddd any", ddd, runtime({"a": [1, "x"]}));
+var dd = {"a": 1};
+check("adi shared", adi, runtime([dd, dd]));
+check("adi bad", adi, runtime([dd, {"b": "s"}]));
+# structs, boxes, strings, bools, classes
+check("sp ok", sp, runtime(P(1)));
+check("sp other", sp, runtime(Q(1)));
+check("sp int", sp, runtime(5));
+check("sp boxed", sp, runtime(box(P(1))));
+check("sp egg", sp, runtime(Egg(1)));
+check("sp owl", sp, runtime(Owl(1)));
+check("sp urn", sp, runtime(Urn(1)));
+check("osp none", osp, runtime(none));
+check("bi ok", bi, runtime(box(1)));
+check("bi float", bi, runtime(box(1.5)));
+check("bi bool", bi, runtime(box(true)));
+check("bi str", bi, runtime(box("s")));
+check("bi struct", bi, runtime(box(P(1))));
+check("bi int", bi, runtime(1));
+check("bp ok", bp, runtime(box(P(1))));
+check("bp struct", bp, runtime(P(1)));
+check("bp int", bp, runtime(box(1)));
+check("sstr ok", sstr, runtime("a"));
+check("sstr int", sstr, runtime(5));
+check("sstr arr", sstr, runtime([1]));
+check("sstr dict", sstr, runtime({"a": 1}));
+check("sbool ok", sbool, runtime(true));
+check("sbool int", sbool, runtime(1));
+check("sc ok", sc, runtime(C(1)));
+check("sc other", sc, runtime(D(1)));
+check("sc int", sc, runtime(5));
+
+# inside a general array each element is checked as a value
+check("af elems", af, runtime(dynarray([1.5])));
+check("af elems bad", af, runtime(dynarray([1])));
+check("ab elems", ab, runtime(dynarray([true])));
+check("ab elems bad", ab, runtime(dynarray([1])));
+check("astr elems", astr, runtime(dynarray(["a"])));
+check("astr elems bad", astr, runtime(dynarray([1])));
+check("ap elems", ap, runtime(dynarray([P(1)])));
+check("ap elems other", ap, runtime(dynarray([Q(1)])));
+check("ap elems boxed", ap, runtime(dynarray([box(P(1))])));
+check("abox elems", abox, runtime(dynarray([box(1)])));
+check("abox elems bad", abox, runtime(dynarray([box(1.5)])));
+check("aai elems bad", aai, runtime(dynarray([5])));
+check("adi elems bad", adi, runtime(dynarray([5])));
+# not a container at all; a container with no element type
+check("ai int", ai, runtime(5));
+check("dsi int", dsi, runtime(5));
+check("garr any", garr, runtime(dynarray([1, "x"])));
+check("gdict any", gdict, runtime({1: "x"}));
+check("adyn any", adyn, runtime([1, "x"]));
+
+# a struct's dyn field takes anything; a typed one is checked
+struct W { dyn x; array<int> v; }
+func mkw(dyn x, dyn v) => W(x, v);
+try { mkw(runtime("s"), runtime([1])); append(trail, "W ok"); }
+catch (TypeErrorEx) { append(trail, "W no"); }
+try { mkw(runtime("s"), runtime(["x"])); append(trail, "W bad ok"); }
+catch (TypeErrorEx) { append(trail, "W bad no"); }
+
+# through a function VALUE whose type is known: its parameters are
+# checked as at a direct call
+func via_value(dyn x) {
+    var f = ai;
+    var g = sp;
+    var got = [];
+    try { f(x); append(got, "f ok"); } catch (TypeErrorEx) {
+        append(got, "f no"); }
+    try { g(x); append(got, "g ok"); } catch (TypeErrorEx) {
+        append(got, "g no"); }
+    return got;
+}
+assert(via_value(runtime([1])) == ["f ok", "g no"]);
+assert(via_value(runtime(P(1))) == ["f no", "g ok"]);
+
+# the same checks at a direct call
+func direct(dyn ints, dyn strs, dyn bools, dyn floats) {
+    var got = [];
+    try { ai(strs); append(got, "s ok"); } catch (TypeErrorEx) {
+        append(got, "s no"); }
+    try { ab(ints); append(got, "i ok"); } catch (TypeErrorEx) {
+        append(got, "i no"); }
+    try { af(bools); append(got, "b ok"); } catch (TypeErrorEx) {
+        append(got, "b no"); }
+    try { astr(floats); append(got, "f ok"); } catch (TypeErrorEx) {
+        append(got, "f no"); }
+    try { af(floats); append(got, "ff ok"); } catch (TypeErrorEx) {
+        append(got, "ff no"); }
+    return got;
+}
+var dgot = direct(runtime([1]), runtime(split("a", " ")),
+                  runtime([false]), runtime([2.5]));
+assert(dgot == ["s no", "i no", "b no", "f no", "ff ok"]);
+
+var want = ["ai ints ok", "af ints no", "ab ints no", "astr ints no",
+    "ap ints no", "af floats ok", "ai floats no", "ab bools ok",
+    "ai bools no", "astr strs ok", "ai strs no", "ap structs ok",
+    "ap other no", "ai structs no", "ai empty ok", "ai general ok",
+    "ai general bad no", "aoi none ok", "ai none no", "ac objs ok",
+    "ac objs bad no", "aai shared ok", "aai windows no", "aai window ok ok",
+    "dsi ok ok", "dsi value no", "dsi key no", "dai ok ok", "dai key no",
+    "dsa ok ok", "dsa value no", "dsi default ok ok", "dsi default no",
+    "dsp default ok ok", "dsp default no", "dvi ok ok", "dvi value no",
+    "dki ok ok", "dki key no", "ddd any ok", "adi shared ok", "adi bad no",
+    "sp ok ok", "sp other no", "sp int no", "sp boxed no", "sp egg no",
+    "sp owl no", "sp urn no", "osp none ok", "bi ok ok", "bi float no",
+    "bi bool no", "bi str no", "bi struct no", "bi int no", "bp ok ok",
+    "bp struct no", "bp int no", "sstr ok ok", "sstr int no", "sstr arr no",
+    "sstr dict no", "sbool ok ok", "sbool int no", "sc ok ok", "sc other no",
+    "sc int no", "af elems ok", "af elems bad no", "ab elems ok",
+    "ab elems bad no", "astr elems ok", "astr elems bad no", "ap elems ok",
+    "ap elems other no", "ap elems boxed no", "abox elems ok",
+    "abox elems bad no", "aai elems bad no", "adi elems bad no", "ai int no",
+    "dsi int no", "garr any ok", "gdict any ok", "adyn any ok", "W ok",
+    "W bad no"];
+assert(trail == want);
+foreach (var t in trail)
+    print(t);
+var nos = 0;
+foreach (var t in trail)
+    if (endswith(t, " no"))
+        nos++;
+print(len(trail), nos);

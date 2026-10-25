@@ -557,7 +557,7 @@ bind_param(EvalContext *args_ctx,
      * CallExpr::check_args at a call site; every callback bind) */
     else if (check_fit && param.fit && !val.is<NoneVal>()) {
         FitMisfit m;
-        if (!value_fits(val, *param.fit, &m))
+        if (!value_fits(val, *param.fit, m))
             throw param_fit_error(param.name, *param.fit, m, site_arg);
     }
 
@@ -1197,7 +1197,7 @@ static void
 field_fit_check(const FieldDef &fd, const EvalValue &v, Loc s, Loc e)
 {
     FitMisfit m;
-    if (!fd.annot || value_fits(v, *fd.annot, &m))
+    if (!fd.annot || value_fits(v, *fd.annot, m))
         return;
     FitSpec spec;
     spec.annot = fd.annot;

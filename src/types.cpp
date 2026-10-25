@@ -10,6 +10,7 @@
 #include "poolalloc.h"
 #include "env.h"      /* env_get - shared by builtins/io.cpp.h (tmpdir) */
 
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>

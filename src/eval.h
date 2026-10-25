@@ -609,16 +609,16 @@ void compute_bind_flags(const FuncDescriptor *d);
  * The check a `dyn` value - or a container holding one - meets where it
  * enters a parameter, a declared variable, an element, a field or a dict,
  * shared by every engine so they refuse the same values with the same
- * message. On a misfit `why` (when given) names WHERE inside the value
- * the misfit is ("" for the value itself, "[1]", "[\"k\"]", "key 3",
- * "default") and what is there ("int", "none", "P").
+ * message. On a misfit `why` names WHERE inside the value the misfit
+ * is ("" for the value itself, "[1]", "[\"k\"]", "key 3", "default")
+ * and what is there ("int", "none", "P").
  */
 struct FitSpec;
 struct FitMisfit {
     std::string where;
     std::string got;
 };
-bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit *why);
+bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit &why);
 
 /* the misfit errors, loc-less: a parameter's (`site_arg`: the call-site
  * argument index, as none_bind_error's) and a store's */
@@ -694,7 +694,7 @@ inline BindFault bind_fault_in_range(const FuncDescriptor *d, size_t n,
         }
         if (bind_coerce_throws(p.decl_type, v))
             return f;                   /* the bind's coercion error first */
-        if (p.fit && !value_fits(v, *p.fit, &f.m)) {
+        if (p.fit && !value_fits(v, *p.fit, f.m)) {
             f.idx = static_cast<int>(i);
             f.fit = true;
             return f;
