@@ -53,10 +53,11 @@ want("ab storage", array_storage(ab[0]), "bool");
 array<dyn> ady = [[1], {"a": 1}, 2];
 ady[0] = "s";
 want("ady", str(ady), "[\"s\", {\"a\": 1}, 2]");
-# a default dict folded inside the literal is empty, so it fits; its
-# default is read as the declared float
-array<dict<str, float>> add = [dict(1)];
-want("add default", str(add[0]["q"]), "1.000000");
+# a default dict inside the literal is a CALL's value, not a written
+# literal: it is checked as its own type, dict<dyn, float> (a `dyn` key
+# fits any), folded or not - `[dict(1)]` is a compile error
+array<dict<str, float>> add = [dict(1.5)];
+want("add default", str(add[0]["q"]), "1.500000");
 dict<str, dict<int, float>> ddd = {"k": {1: 2}};
 want("ddd", str(ddd), "{\"k\": {1: 2.000000}}");
 

@@ -28114,6 +28114,27 @@ static bool const_fold_equivalence()
         { "a type name a parameter hides", {
             "struct P { int x; }",
             "func f(P) { P p; return 1; }" } },
+        /* #74: an element of a literal that is a call's value or a named
+         * constant is checked as that value - folded into the literal's
+         * bake, it was given the literal's widening */
+        { "a default dict in a literal is a call's value", {
+            "array<dict<str, float>> a = [dict(1)];",
+            "print(a);" } },
+        { "a pure call's array in a literal", {
+            "pure func f() => [1];",
+            "array<array<float>> a = [f()];",
+            "print(a);" } },
+        { "a named const array in a literal", {
+            "const K = [1];",
+            "array<array<float>> a = [K];",
+            "print(a);" } },
+        { "a written literal beside a call's value", {
+            "pure func g() => [1.5];",
+            "array<array<float>> a = [[1], g()];",
+            "dict<str, array<float>> d = {\"x\": [1], \"y\": g()};",
+            "const array<array<float>> C = [[1], g()];",
+            "array<dict<str, float>> e = [dict(1.5), {\"k\": 2}];",
+            "print(a, d, C, e, e[0][\"q\"]);" } },
     };
 
     bool ok = true;

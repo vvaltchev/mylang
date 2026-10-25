@@ -5958,11 +5958,9 @@ bool Inferencer::type_fits(StaticTypeRef t, StaticTypeRef d)
         const StaticTypeRef tk = static_type_resolve(t->key);
         if (tk->kind == StaticTypeKind::None)
             return true;
-        /* a `dyn` key - an empty default dict, dict<dyn, T> - fits any
-         * key type, as the container rule of static_type_assignable has
-         * it (the unfolded `[dict(1)]` is checked by that rule) */
-        return (tk->kind == StaticTypeKind::Dyn
-                || static_type_assignable(tk, d->key))
+        /* (a default dict, dict<dyn, T>, is never a written literal:
+         * `dict(v)` is a call, checked as its value) */
+        return static_type_assignable(tk, d->key)
             && type_fits(t->val, d->val);
     }
     return static_type_assignable(t, d);
