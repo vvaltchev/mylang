@@ -23195,6 +23195,24 @@ static bool repl_history_file()
     if (h1 != h0)
         return false;
 
+    /* a carriage return inside an entry is escaped, so the file's bytes
+     * are the same on every platform (it is written in binary) */
+    const std::vector<std::string> hr = { "a\rb", "c\r" };
+    repl_save_history(path, hr);
+    if (read() != "#mylang-history 2\na\\rb\nc\\r\n")
+        return false;
+    std::vector<std::string> hr1;
+    repl_load_history(path, hr1);
+    if (hr1 != hr)
+        return false;
+
+    /* a file saved with CRLF line ends (an editor) loads as if LF */
+    write("#mylang-history 2\r\nx = 1\r\n\r\nf(\\n)\r\n");
+    std::vector<std::string> hc;
+    repl_load_history(path, hc);
+    if (hc != std::vector<std::string>{ "x = 1", "f(\n)" })
+        return false;
+
     /* an escape the writer never makes reads as its character, and a
      * trailing backslash as itself; empty lines are skipped */
     write("#mylang-history 2\n\na\\xb\nc\\\n");
