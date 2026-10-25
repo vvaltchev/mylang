@@ -186,7 +186,8 @@ keeps UnpackElemInt/Float/Targets: lowering it measured -2% on
 dict iterator** — a dict has no O(1) index, so it is NOT the counted-loop
 but a while-shaped loop over two ops: **`DictIterInit`** pins the dict
 (an `intrusive_ptr` copy → alive for the loop, matching the tree-walker's
-lifetime-extended `cval`) and sets the `unordered_map` iterator to `begin()`;
+lifetime-extended `cval`) and starts the map's iterator at `begin()` (the
+first key in insertion order);
 **`DictIterNext`** tests it (→ end_pc on end), binds the key (and value,
 `.put(it->first)`/`.put(it->second.get())` — like the array general case), and
 `++`s. The per-loop iterator STATE lives in a **`vm_run_chunk`-local

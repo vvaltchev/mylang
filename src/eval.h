@@ -1228,12 +1228,7 @@ EvalValue literal_widen(EvalValue v, DeclType dt);
  *    materialized value needs, and keeps clone() shallow w.r.t. consts.
  *  - make_deep_mutable_clone: every level copied and made mutable (read-only
  *    dropped) - a fully independent writable value. Backs deepclone().
- *  - make_mutable_bake: make_mutable_clone, except that each dict copy
- *    keeps its source's iteration order (as clone() does). Only for the
- *    parser's bake of a folded value that contains itself (the one bake a
- *    shallow clone() cannot make), so a folded dict iterates in the order
- *    it always did.
+ * A dict copy keeps its source's order (insertion order, #50).
  */
 EvalValue make_mutable_clone(const EvalValue &v);
 EvalValue make_deep_mutable_clone(const EvalValue &v);
-EvalValue make_mutable_bake(const EvalValue &v);

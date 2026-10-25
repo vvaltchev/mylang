@@ -13000,10 +13000,10 @@ static const std::vector<test> tests =
 
     {
         /* Indexed dict foreach, 2-var (index + key) and a `_` value slot.
-         * Dicts are UNORDERED (std::unordered_map - the iteration order
-         * differs across libstdc++ / libc++ / MSVC STL), so every assert must
-         * be order-INDEPENDENT: sums over the whole iteration, never an
-         * index-value pairing (an `i * v` product broke macOS/Windows CI). */
+         * Written when dicts were unordered (std::unordered_map, whose order
+         * differed across libstdc++ / libc++ / MSVC STL), so its asserts are
+         * order-independent sums; dicts keep insertion order since #50
+         * (tests/functional/90_dict_insertion_order.my pins the order). */
         "Indexed dict foreach: index+key, and underscore value",
         {
             "var d = {1: 100, 2: 200};",

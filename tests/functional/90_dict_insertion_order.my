@@ -1,0 +1,110 @@
+# A dict keeps INSERTION ORDER (README, Dictionary): every walk over it -
+# printing, foreach, keys/values/kvpairs, map/filter, a copy - visits the
+# keys in the order they were added. A store over an existing key keeps its
+# place, an erased key inserted again goes last, and == / hash ignore the
+# order. The order used to be the hash map's own, so a dict folded at
+# compile time (rebuilt key by key) printed in another order than the same
+# dict built at run time, and -nc disagreed with the default (RULE 2).
+
+func shape(d) {
+    var s = "";
+    foreach (k, v in d)
+        s += str(k) + "=" + str(v) + ";";
+    return s;
+}
+
+var d = {"z": 1, "a": 2, "m": 3};
+d["b"] = 4;
+d["a"] = 9;
+assert(keys(d) == ["z", "a", "m", "b"]);
+assert(values(d) == [1, 9, 3, 4]);
+assert(kvpairs(d) == [["z", 1], ["a", 9], ["m", 3], ["b", 4]]);
+assert(str(d) == "{\"z\": 1, \"a\": 9, \"m\": 3, \"b\": 4}");
+assert(shape(d) == "z=1;a=9;m=3;b=4;");
+
+# erased, then inserted again: last
+erase(d, "z");
+d["z"] = 0;
+assert(keys(d) == ["a", "m", "b", "z"]);
+
+# a copy keeps the order, shallow or deep
+assert(keys(clone(d)) == ["a", "m", "b", "z"]);
+assert(keys(deepclone(d)) == ["a", "m", "b", "z"]);
+
+# int keys inserted descending stay descending (the hash of an int is the
+# int, so a hash-ordered walk would not)
+var e = {};
+for (var i = 100; i > 90; i--)
+    e[i] = i * 2;
+assert(keys(e) == [100, 99, 98, 97, 96, 95, 94, 93, 92, 91]);
+
+# many keys: growing the table keeps the order
+var big = {};
+var want = [];
+for (var i = 0; i < 1000; i++) {
+    var k = (i * 7919) % 1000;
+    big[k] = i;
+    append(want, k);
+}
+assert(keys(big) == want);
+
+# == and hash ignore the order
+assert({"b": 1, "a": 2} == {"a": 2, "b": 1});
+assert(hash({"b": 1, "a": 2}) == hash({"a": 2, "b": 1}));
+
+# dict(pairs): a repeated key keeps its first place, the later value wins
+var f = dict([["x", 1], ["y", 2], ["x", 3]]);
+assert(keys(f) == ["x", "y"] && f["x"] == 3);
+
+# make_dict: the order of its keys
+var g = make_dict(["q", "w", "e"], func(k) => k + "!");
+assert(keys(g) == ["q", "w", "e"]);
+
+# a default dict inserts a missing key it reads, at the end
+var h = dict(0);
+h["k3"] += 1;
+h["k1"] += 1;
+h["k3"] += 1;
+assert(keys(h) == ["k3", "k1"] && h["k3"] == 2);
+
+# map / filter walk the order too
+assert(map(func(k, v) => k, d) == ["a", "m", "b", "z"]);
+assert(keys(filter(func(k, v) => v > 3, d)) == ["a", "b"]);
+
+# a constant, folded at compile time, and the same dict built at run time
+const CD = {"y": 1, "c": 2, "x": 3, "a": 4};
+var rd = {};
+rd[runtime("y")] = 1;
+rd[runtime("c")] = 2;
+rd[runtime("x")] = 3;
+rd[runtime("a")] = 4;
+assert(str(CD) == str(rd));
+assert(keys(CD) == ["y", "c", "x", "a"]);
+
+# a pure function's dict, folded (constant arguments) and called at run
+# time
+pure func mk(int n) {
+    var r = {};
+    for (var i = n; i > 0; i--)
+        r["k" + str(i)] = i;
+    return r;
+}
+var folded = mk(4);
+var called = mk(runtime(4));
+assert(str(folded) == str(called));
+assert(keys(called) == ["k4", "k3", "k2", "k1"]);
+
+# a foreach that erases a later key skips it, in order
+var walk = {"p": 1, "q": 2, "r": 3, "s": 4};
+var seen = "";
+foreach (k, v in walk) {
+    seen += k;
+    if (k == "p")
+        erase(walk, "r");
+    if (k == "q")
+        walk["t"] = 5;
+}
+assert(seen == "pqs");
+assert(keys(walk) == ["p", "q", "s", "t"]);
+
+print(d, e[91], CD, folded, walk);

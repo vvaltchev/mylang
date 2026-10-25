@@ -4045,10 +4045,9 @@ MakeConstructFromConstVal(const EvalValue &v,
              * one-step unrolling, a fresh top in front of the original ring,
              * so a folded `var r = mk();` and the same call left to run time
              * compared and printed differently (RULE 2). That value is
-             * copied with its cycle, each dict keeping its order as clone()
-             * keeps it (make_mutable_bake - a plain deep copy would rebuild
-             * the maps and change how a folded dict iterates), and kept until
-             * the program ends (cyc_keep_until_exit): the compiler holds it,
+             * copied with its cycle (make_mutable_clone; every dict keeps
+             * its insertion order through a copy), and kept until the
+             * program ends (cyc_keep_until_exit): the compiler holds it,
              * so no program can break it. A frozen one is kept already.
              */
             const bool ro = immutable || is_readonly_value(v);
@@ -4056,7 +4055,7 @@ MakeConstructFromConstVal(const EvalValue &v,
             if (ro) {
                 baked = make_const_clone(v);
             } else if (cyc_value_reaches_cycle(v)) {
-                baked = make_mutable_bake(v);
+                baked = make_mutable_clone(v);
                 cyc_keep_until_exit(baked);
             } else {
                 baked = v.clone();

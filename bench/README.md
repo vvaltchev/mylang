@@ -264,9 +264,10 @@ both languages on the inputs used. These are straight speed comparisons.
   aliased; the always-safe, idiomatic fast path in both languages is
   "collect parts in an array, then `join`" — that's `32_str_build_join`.
 
-- **Dictionary ordering.** MyLang dicts are `unordered_map` (no defined order);
-  Python dicts preserve insertion order. The dict-iteration benchmarks use
-  order-independent checksums (sum of values) so the results still match.
+- **Dictionary ordering.** Both languages keep a dict's insertion order
+  (MyLang since 2026-10-12; it used to be the hash map's own order). The
+  dict-iteration benchmarks still use order-independent checksums (sum of
+  values), which they adopted when the orders differed.
 - **Nullable dict reads.** A MyLang dict read (`d[k]` / `d.k`) is statically
   *nullable* (`opt V`, since the key might be absent), so the dict-lookup /
   member benchmarks narrow each read (`var v = d[k]; if (v != none) ...`) before
@@ -392,7 +393,7 @@ blow-out is per-iteration *genuine* exceptions (`42` ~22×).
 - **`15_array_slice_readonly` (0.37×), `39_find_builtin` (0.52×),
   `26_dict_iterate` (0.74×):** MyLang does less or tighter work — an O(1)
   copy-on-write view instead of an O(k) list copy; a C++ `std::find`/`==` scan
-  and `unordered_map` walk instead of per-element Python object dispatch.
+  and hash-map walk instead of per-element Python object dispatch.
 - **Exceptions (`42`, `69`–`72`) — the remaining weak spot, measured as a full
   suite so the cost picture is complete (not just one case):**
   - `42_exceptions` (~24×): a **same-frame** `throw`/`catch` per iteration.

@@ -50,7 +50,8 @@ int_type TypeDict::len(const EvalValue &a)
 
 /*
  * Two dicts are equal when they hold the same keys, each mapped to equal
- * values - what unordered_map's operator== computed, spelled out so the
+ * values, in ANY order (#50: a dict keeps insertion order, and == ignores
+ * it, as Python's does) - spelled out so the
  * walk runs on the cycle guard's pair stack (cyclewalk.h): a dict may hold
  * itself (`d["self"] = d`). A key is looked up by ITS OWN equality, with
  * fresh stacks (CycFreshScope) - the map's key_equal does not depend on
@@ -130,8 +131,9 @@ void TypeDict::noteq(EvalValue &a, const EvalValue &b)
 }
 
 /*
- * Deep, ORDER-INDEPENDENT hash of a dict. A dict is unordered, so two equal
- * dicts (same pairs, any insertion order) MUST hash equal. Each (k, v) pair is
+ * Deep, ORDER-INDEPENDENT hash of a dict. Two dicts that hold the same
+ * pairs in a different insertion order are == (dict_equal ignores the
+ * order), so they MUST hash equal. Each (k, v) pair is
  * hashed with the order-dependent combine (k before v), then the pair hashes
  * are accumulated commutatively (hash_unordered) so the dict's iteration order
  * does not matter.

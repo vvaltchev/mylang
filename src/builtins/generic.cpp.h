@@ -626,8 +626,8 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
         /*
          * #49: iterate a SNAPSHOT of the pairs, taken before the first
          * call. The callback is arbitrary script code and may insert into
-         * or erase from this very dict; walking the live unordered_map
-         * then used an iterator the mutation had invalidated (ASan:
+         * or erase from this very dict; walking the live map then used
+         * an iterator the mutation had invalidated (ASan:
          * heap-use-after-free on an erase, an unbounded walk on inserts).
          * The callback sees the pairs that were there when the call
          * began, with the values they had then (README).

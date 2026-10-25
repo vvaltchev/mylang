@@ -419,6 +419,40 @@ else
     fail "myv: -c refused a function in a struct's const member"
 fi
 
+# A dict keeps INSERTION ORDER (#50), and an image writes a constant dict's
+# pairs in that order and loads them in file order - so a loaded image
+# prints a dict as the source run does. With the hash map's own order a
+# rebuilt dict iterated differently, the one way a loaded image's output
+# could differ from a fresh compile's.
+cat > "$TMP/dord.my" <<'PROG'
+const CD = {"y": 1, "c": 2, "x": 3, "a": 4};
+pure func mk(int n) {
+    var r = {};
+    for (var i = n; i > 0; i--)
+        r["k" + str(i)] = i;
+    return r;
+}
+var folded = mk(3);
+var e = {};
+for (var i = 9; i > 6; i--)
+    e[i] = runtime(i);
+print(CD, folded, e, keys(CD));
+PROG
+src_out=$("$BIN" "$TMP/dord.my" 2>&1)
+want='{"y": 1, "c": 2, "x": 3, "a": 4} {"k3": 3, "k2": 2, "k1": 1} {9: 9, 8: 8, 7: 7} ["y", "c", "x", "a"] '
+if "$BIN" -c "$TMP/dord.my" -o "$TMP/dord.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/dord.myv" 2>&1)
+    got_rc=$?
+    if [ "$got_rc" = 0 ] && [ "$img_out" = "$src_out" ] && \
+       [ "$src_out" = "$want" ]; then
+        pass "myv: a dict keeps its insertion order through an image"
+    else
+        fail "myv: dict order: rc=$got_rc src=[$src_out] img=[$img_out]"
+    fi
+else
+    fail "myv: -c refused the dict-order program"
+fi
+
 # A CLASS instance has identity, and its hash is its identity NUMBER
 # (v33's `cls` record): an image must keep two references to one constant
 # instance one object, keep two declarations two objects, and give each
