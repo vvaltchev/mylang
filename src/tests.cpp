@@ -36150,11 +36150,13 @@ static bool vm_handler_table()
         { { "var c = 0;",
             "try { c += 1; } finally { c += 2; }" },
           1, { 0 }, { true }, { false } },
-        /* clauses AND a finally */
+        /* clauses AND a finally: the try's region, then its catch
+         * bodies' GUARD - no clause, a copy of the finally - so an
+         * exception leaving a catch body still runs it */
         { { "struct A { int v; }",
             "var r = 0;",
             "try { throw A(1); } catch (A) { r = 1; } finally { r += 10; }" },
-          1, { 1 }, { true }, { false } },
+          2, { 1, 0 }, { true, true }, { false, false } },
         /* A rethrow in the catch body sets the flag - on the INNER try's
          * region. Region ids follow COMPILE order, and compile_native_try
          * allocates the outer try's id before descending into its body, so

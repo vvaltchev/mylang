@@ -1,0 +1,108 @@
+# A try's `finally` runs however its CATCH body ends (README, try /
+# catch / finally): normally, by a return, a break or a continue - and by
+# an exception leaving it, a rethrow, a new throw or a runtime error. The
+# VM ran no finally in the last three. And a flow op out of a try nested
+# in a catch body crosses the outer try without popping a handler it
+# does not own (codegen refused that program). Every engine prints what
+# the tree-walker does; each line is an event log, since a value cannot
+# show a finally that did not run.
+struct P { int x; }
+struct Q { int x; }
+
+func leave(int mode) {
+    var t = "";
+    try {
+        try { throw P(1); }
+        catch (P) {
+            t += "c";
+            if (mode == 0) rethrow;
+            if (mode == 1) throw Q(2);
+            if (mode == 2) { int z = int(runtime(0)); t += str(1 / z); }
+            if (mode == 3) return t + "r";
+        }
+        finally { t += "f"; }
+    } catch (P) { t += "p"; }
+    catch (Q) { t += "q"; }
+    catch (DivisionByZeroEx) { t += "d"; }
+    return t;
+}
+assert([leave(0), leave(1), leave(2), leave(3), leave(4)]
+       == ["cfp", "cfq", "cfd", "cr", "cf"]);
+
+# out of a function: the finally runs before the caller's catch
+var trail = [];
+func inner(int k) {
+    try { throw P(k); }
+    catch (P as e) { append(trail, "c" + str(e.x)); rethrow; }
+    finally { append(trail, "f" + str(k)); }
+}
+for (var i = 0; i < 3; i++) {
+    try { inner(i); } catch (P as e) { append(trail, "o" + str(e.x)); }
+}
+assert(trail == ["c0", "f0", "o0", "c1", "f1", "o1", "c2", "f2", "o2"]);
+
+# break and continue out of a catch body run the finally once
+func loops() {
+    var t = "";
+    for (var i = 0; i < 4; i++) {
+        try {
+            if (i % 2 == 0) throw P(i);
+            t += "b";
+        }
+        catch (P) {
+            t += "c";
+            if (i == 2) break;
+            continue;
+        }
+        finally { t += "f"; }
+        t += "e";
+    }
+    return t;
+}
+assert(loops() == "cfbfecf");
+
+# a throw in the finally that runs for an escaping exception replaces it
+func replaced() {
+    try {
+        try { throw P(1); }
+        catch (P) { rethrow; }
+        finally { throw Q(9); }
+    } catch (P) { return "p"; }
+    catch (Q as q) { return "q" + str(q.x); }
+    return "none";
+}
+assert(replaced() == "q9");
+
+# a try nested in a catch body: a return crosses both trys, running the
+# inner finally and the outer one; an exception from it runs both too
+func nested(int mode) {
+    var t = "";
+    try {
+        try { throw P(1); }
+        catch (P) {
+            try {
+                t += "i";
+                if (mode == 0) return t + "R";
+                throw Q(1);
+            }
+            finally { t += "g"; }
+        }
+        finally { t += "f"; }
+    } catch (Q) { t += "q"; }
+    return t;
+}
+assert(nested(0) == "iR");
+assert(nested(1) == "igfq");
+
+# a catch-all clause, then the finally, with the exception escaping
+func all() {
+    var t = "";
+    try {
+        try { throw P(5); }
+        catch { t += "a"; throw Q(6); }
+        finally { t += "f"; }
+    } catch (Q as q) { t += str(q.x); }
+    return t;
+}
+assert(all() == "af6");
+print(leave(0), trail, loops(), replaced(), nested(1), all());

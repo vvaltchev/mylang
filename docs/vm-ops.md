@@ -760,7 +760,26 @@ check (tw == vm, and the position must be the `rethrow` line): a wrong
 bake would leave behavior correct and only move the error position,
 which nothing else would catch. With this, EVERY exception construct -
 `throw`, runtime errors, `try`/`catch` entry+matching, `finally`,
-`rethrow` - is native. Two fixes landed from measurement:
+`rethrow` - is native. **THE CATCH GUARD (2026-10-12):** a catch body
+runs with its try's handler already popped by the dispatch, so an
+exception LEAVING a catch body (a `rethrow`, a `throw`, an error) found
+the enclosing handler and the try's `finally` never ran - every VM
+configuration, while the tree-walker's scope guard ran it.
+`compile_native_try` now gives a try with a finally AND catch clauses a
+second region with NO clause (the guard): each catch body opens with
+PushHandler(guard) and closes with PopHandler before its normal exit,
+and the guard's `fin_pc` is a SECOND copy of the finally ending in
+EndFinally(guard) - the dispatch's no-clause path parks the re-raise
+there exactly as for an uncaught try-body exception (the shared finally
+jumps over the copy). A `rethrow` still names the try's own region
+(emit_rethrow's innermost `in_catch` entry). A flow op crossing a try
+now pops a handler only when `TryFrame::handler_live` - the try body's
+own, or a catch body's guard - at ANY depth: the old rule (skip the pop
+only for the innermost in-catch try) popped a handler the frame did
+not own when a `return` left a try nested in a catch body, which
+codegen's handler-balance check refused (a compile abort). Pinned by
+`tests/functional/95_catch_finally.my`. Two fixes landed from
+measurement:
 **the FAST REJECT** - the frame WALK calls the dispatch once per POPPED
 frame and almost none of those frames have a live try; pre-#78 the
 dispatch inlined so the reject was free, and paying a call frame per
