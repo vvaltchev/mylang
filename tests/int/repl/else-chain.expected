@@ -1,19 +1,53 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
->> >> >> >> >> >> >> => 7
+>> >> >> >> >> >> >> >> >> => 7
 >> .. .. .. .. .. .. .. .. big 
 >> >> .. .. .. .. .. .. .. .. .. .. .. caught 7 
 finally 
->> .. .. >> >> SyntaxError at line 33, col 1
+>> .. .. >> >> SyntaxError at line 35, col 1
 
     else { print("refused: an empty line ended the chain"); };
     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Unexpected token at the end 'else'
 >> .. .. >> a separate input 
 >> one line 
->> SyntaxError at line 39, col 1
+>> SyntaxError at line 41, col 1
 
     else { print("refused: the if closed on its line"); };
     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Unexpected token at the end 'else'
 >> => 7
+>> .. .. .. .. .. .. .. .. caught all 
+finally 2 
+>> .. .. a bare block 
+>> after it 
+>> .. .. .. .. .. .. .. .. .. inner 
+>> Invalid token: 2_ at line 66, col 9:11
+
+    var w = 2_
+            ^^
+>> .. .. .. >> Uncaught exception 'E', data: E(code: -3) at line 68, col 16:25
+
+      if (x < 0) { throw E(x); };
+                   ^^^^^^^^^
+
+Backtrace (most recent call first):
+  [0] neg(x) at line 68
+  [1] main() at line 71
+>> Uncaught exception 'E', data: E(code: -4) at line 68, col 16:25
+
+      if (x < 0) { throw E(x); };
+                   ^^^^^^^^^
+
+Backtrace (most recent call first):
+  [0] neg(x) at line 68
+  [1] main() at line 72
+>> .. .. .. >> Uncaught exception 'OutOfBoundsEx' at line 74, col 56:62
+
+      try { var t = [1][i]; } catch (OutOfBoundsEx as e) { throw e; };
+                                                           ^^^^^^
+
+Backtrace (most recent call first):
+  [0] oob(i) at line 74
+  [1] main() at line 77
+>> .. .. the last chain, at the end of the input 
 >> 

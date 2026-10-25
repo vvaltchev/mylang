@@ -3,7 +3,9 @@
 # the REPL reads a line ahead (ReplEngine::may_continue / continues_chain)
 # and leaves the block's `}` without its `;` (repl_auto_terminate). Any
 # other next line is the next input, an empty one included; a chain
-# closed on one line is complete at once.
+# closed on one line is complete at once. Last, a struct a folded pure call
+# throws while an input is PARSED is rendered with its payload, which
+# pBlock froze while the struct's definition was alive.
 var n = 7
 if (n < 3) {
   print("small")
@@ -39,3 +41,41 @@ print("a separate input")
 if (n > 0) { print("one line") }
 else { print("refused: the if closed on its line") }
 n
+try {
+  throw E(1)
+}
+catch {
+  print("caught all")
+}
+finally {
+  print("finally 2")
+}
+{
+  print("a bare block")
+}
+print("after it")
+if (n > 0) {
+  if (n > 1) {
+    print("inner")
+  }
+
+  # a comment line, then the else of the inner if
+  else {
+    print("not inner")
+  }
+}
+var w = 2_
+pure func neg(int x) {
+  if (x < 0) { throw E(x); }
+  return x;
+}
+neg(-3)
+if (true) { print(neg(-4)); }
+pure func oob(int i) {
+  try { var t = [1][i]; } catch (OutOfBoundsEx as e) { throw e; }
+  return 0;
+}
+oob(5)
+if (n > 0) {
+  print("the last chain, at the end of the input")
+}
