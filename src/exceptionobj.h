@@ -56,6 +56,12 @@ public:
         return data;
     };
 
+    /* The parser replaces an escaping payload by its rendering
+     * (freeze_exception_payload, parser.cpp) */
+    void set_data(EvalValueT d) {
+        data = std::move(d);
+    }
+
     ExceptionObjectTempl *clone() const override {
         return new ExceptionObjectTempl(*this);
     }

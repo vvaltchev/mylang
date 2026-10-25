@@ -2916,6 +2916,15 @@ pStmt(ParseContext &c, unsigned fl)
     }
 }
 
+/* An escaping user exception's payload, rendered while the definitions
+ * it names are alive (pBlock) - to the text the driver prints for it */
+static void freeze_exception_payload(ExceptionObject &e)
+{
+    const EvalValue &d = e.get_data();
+    if (!d.is<NoneVal>() && !d.is<SharedStr>())
+        e.set_data(EvalValue(SharedStr(d.get_type()->to_string(d))));
+}
+
 unique_ptr<Construct>
 pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
 {
@@ -2959,47 +2968,62 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
         c.baked_funcs.resize(baked_base);
     };
 
-    if (!c.eoi()) {
+    /*
+     * A user exception a constant evaluation raised while this block was
+     * parsed (a folded `pure` call that throws a struct) leaves the parse,
+     * and the statements parsed so far die as it unwinds - the struct's
+     * definition among them. The driver renders the payload after that
+     * (`Uncaught exception 'E', data: ...`), so it is rendered HERE, while
+     * every enclosing block is still alive: a freed def was a heap
+     * use-after-free in every build (a SIGSEGV in a release).
+     */
+    try {
+        if (!c.eoi()) {
 
-        do {
+            do {
 
-            added_elem = false;
+                added_elem = false;
 
-            /*
-             * An extra `;` is an EMPTY statement wherever a statement may
-             * start - first in a block, or right after a braced block -
-             * as it is after any other statement (the skip below). This
-             * leading pAcceptBracedBlock left a `;` behind it unparsed, so
-             * `{ { a(); }; b(); }` and a block's leading `;` were syntax
-             * errors while the same `;` later in the block was not; the
-             * REPL's terminator appends one after every `}`, so a
-             * top-level `{ ... }` typed at the prompt always failed.
-             */
-            while (*c == Op::semicolon) {
-                c++;
-                added_elem = true;
-            }
+                /*
+                 * An extra `;` is an EMPTY statement wherever a statement may
+                 * start - first in a block, or right after a braced block -
+                 * as it is after any other statement (the skip below). This
+                 * leading pAcceptBracedBlock left a `;` behind it unparsed, so
+                 * `{ { a(); }; b(); }` and a block's leading `;` were syntax
+                 * errors while the same `;` later in the block was not; the
+                 * REPL's terminator appends one after every `}`, so a
+                 * top-level `{ ... }` typed at the prompt always failed.
+                 */
+                while (*c == Op::semicolon) {
+                    c++;
+                    added_elem = true;
+                }
 
-            if (pAcceptBracedBlock(c, tmp, fl)) {
-                take_baked();
-                ret->elems.emplace_back(std::move(tmp));
-                added_elem = true;
-            }
+                if (pAcceptBracedBlock(c, tmp, fl)) {
+                    take_baked();
+                    ret->elems.emplace_back(std::move(tmp));
+                    added_elem = true;
+                }
 
-            while ((stmt = pStmt(c, fl))) {
+                while ((stmt = pStmt(c, fl))) {
 
-                take_baked();
+                    take_baked();
 
-                if (!stmt->is_nop())
-                    ret->elems.emplace_back(std::move(stmt));
+                    if (!stmt->is_nop())
+                        ret->elems.emplace_back(std::move(stmt));
 
-                added_elem = true;
+                    added_elem = true;
 
-                while (*c == Op::semicolon)
-                    c++;    /* skip multiple ';' */
-            }
+                    while (*c == Op::semicolon)
+                        c++;    /* skip multiple ';' */
+                }
 
-        } while (added_elem);
+            } while (added_elem);
+        }
+
+    } catch (ExceptionObject &e) {
+        freeze_exception_payload(e);
+        throw;
     }
 
     ret->end = c.get_loc();
