@@ -6357,13 +6357,17 @@ payoff.
   tail-inliner / specializer all bail on an arg-count ≠ nparams mismatch, so an
   under-arity call simply runs through `do_func_call` at runtime (correct).
 - **Const parameters.** A param declared `const` (`func f(const x, y)`, parsed
-  by `pFuncParam`, flagged `Identifier::const_param`) is bound as a const
-  `LValue`, so reassigning it throws — caught at compile time by the resolver
-  (a `const` param with a nonzero body write count → `CannotRebindConstEx`) and,
-  as a fallback, at runtime. Params are otherwise bound **mutable** — even
-  during const-eval — so a (pure) function may reassign its own by-value params;
-  binding const-ness is keyed off `const_param`, *not* `ctx->const_ctx`. A plain
-  param the resolver finds is never reassigned (`slot_writes == 0`) is tagged
+  by `pFuncParam`, flagged `Identifier::const_param`) may not be REASSIGNED -
+  a compile error from the resolver (a `const` param with a nonzero body
+  write count → `CannotRebindConstEx`); a struct, box or class it holds is
+  read-only by the inferencer's `check_const_param_store`. **Every parameter
+  is BOUND mutable at run time** (`bind_param`), in every engine and during
+  const-eval too: the binding's const-ness used to reach the tree-walker's
+  in-place builtins, which refused `append(a, 9)` through a `const a` (and
+  sorted a copy) where the VM changed the caller's array, and a callback a
+  builtin ran at compile time could not reassign its own parameter (2026-10-11,
+  RULE 2). A deeper `const` is plans/immutable-views.md. A plain param the
+  resolver finds is never reassigned (`slot_writes == 0`) is tagged
   `auto_const_param` (effectively const; used by `isconst()`).
 - **`clone()` semantics differ by capture.** A non-capturing `FuncObject` clones
   to *itself* (shared

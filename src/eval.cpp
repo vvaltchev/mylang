@@ -524,13 +524,24 @@ void throw_none_bind(const UniqueId *param, int site_arg)
     throw none_bind_error(param, site_arg);
 }
 
+/*
+ * A parameter's binding is never const at run time: a `const` parameter
+ * is one the body may not REASSIGN, which the resolver refuses at compile
+ * time, and the value it holds is the caller's (an array a `const a` is
+ * bound to is the caller's mutable array, as in the VM, whose binds know
+ * no const). Bound const, the tree-walker's in-place builtins refused it -
+ * `append(a, 9)` raised CannotChangeConstEx and `sort(a)` sorted a copy,
+ * where the VM changed the caller's array (RULE 2) - and a builtin
+ * callback evaluated at compile time could not reassign its own
+ * parameters, which it may at run time. (What a deeper `const` should
+ * protect is plans/immutable-views.md.)
+ */
 static inline void
 bind_param(EvalContext *args_ctx,
            Frame *frame,
            int idx,
            const FuncDescriptor::ParamDesc &param,
            EvalValue val,
-           bool is_const,
            int site_arg)
 {
     /* RULE 1: a non-opt parameter never holds none - refused here, at the
@@ -542,9 +553,9 @@ bind_param(EvalContext *args_ctx,
         val = coerce_to_decl_type(val, param.decl_type, site_arg);
 
     if (frame) {
-        frame->at(idx) = LValue(std::move(val), is_const);
+        frame->at(idx) = LValue(std::move(val), false);
     } else {
-        args_ctx->emplace(param.name, std::move(val), is_const);
+        args_ctx->emplace(param.name, std::move(val), false);
     }
 }
 
@@ -592,17 +603,10 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
         throw InvalidNumberOfArgsEx();
 
     for (size_t i = 0; i < nparams; i++) {
-        /*
-         * A param's binding is const iff it was declared `const` - NOT merely
-         * because we are const-evaluating. This lets a (pure) function reassign
-         * its own by-value parameters during const-eval, while a `const` param
-         * stays immutable everywhere.
-         */
         bind_param(
             args_ctx, frame, static_cast<int>(i),
             funcParams[i],
             i < nargs ? std::move(vals[i]) : EvalValue(),
-            funcParams[i].cnst,
             static_cast<int>(i)              /* a call-site bind */
         );
     }
@@ -624,7 +628,7 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
         bind_param(
             args_ctx, frame, static_cast<int>(i),
             funcParams[i],
-            i < args.size() ? args[i] : EvalValue(), ctx->const_ctx,
+            i < args.size() ? args[i] : EvalValue(),
             /*site_arg=*/-1                  /* a callback's bind */
         );
     }
@@ -659,12 +663,12 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
         if (i < args.size())
             bind_param(args_ctx, frame, static_cast<int>(i),
                        funcParams[i],
-                       args[i], ctx->const_ctx,
+                       args[i],
                        static_cast<int>(i)); /* a call-site bind */
         else
             bind_param(args_ctx, frame, static_cast<int>(i),
                        funcParams[i],
-                       EvalValue(), ctx->const_ctx, /*site_arg=*/-1);
+                       EvalValue(), /*site_arg=*/-1);
     }
 }
 
@@ -683,7 +687,7 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
     for (size_t i = 0; i < nparams; i++)
         bind_param(args_ctx, frame, static_cast<int>(i),
                    funcParams[i],
-                   i == 0 ? arg : EvalValue(), ctx->const_ctx,
+                   i == 0 ? arg : EvalValue(),
                    /*site_arg=*/-1);            /* a callback's bind */
 }
 
@@ -704,7 +708,7 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
         bind_param(args_ctx, frame, static_cast<int>(i),
                    funcParams[i],
                    i == 0 ? args.first : i == 1 ? args.second : EvalValue(),
-                   ctx->const_ctx, /*site_arg=*/-1); /* a callback's bind */
+                   /*site_arg=*/-1);                /* a callback's bind */
 }
 
 /*

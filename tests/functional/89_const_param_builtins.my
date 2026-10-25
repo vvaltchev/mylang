@@ -1,0 +1,41 @@
+# A `const` parameter may not be REASSIGNED; the array it holds is the
+# caller's, and an in-place builtin changes it as an element store does
+# (README, Const parameters). The tree-walker bound the parameter const and
+# its in-place builtins refused it - append / push / pop / insert / erase
+# raised CannotChangeConstEx and sort / reverse sorted a copy - where the
+# VM changed the caller's array (RULE 2).
+func ap(const a) { append(a, 9); return len(a); }
+func pu(const a) { push(a, 8); return len(a); }
+func po(const a) { return pop(a); }
+func ins(const a) { insert(a, 0, 7); return a[0]; }
+func er(const a) { erase(a, 0); return len(a); }
+func so(const a) { sort(a); return a[0]; }
+func rv(const a) { reverse(a); return a[0]; }
+func st(const array<int> a) { a[0] = 6; a[1] += 1; return a[0]; }
+
+var x = [3, 1, 2];
+assert(ap(x) == 4 && x == [3, 1, 2, 9]);
+assert(pu(x) == 5 && x == [3, 1, 2, 9, 8]);
+assert(po(x) == 8 && x == [3, 1, 2, 9]);
+assert(ins(x) == 7 && x == [7, 3, 1, 2, 9]);
+assert(er(x) == 4 && x == [3, 1, 2, 9]);
+assert(so(x) == 1 && x == [1, 2, 3, 9]);
+assert(rv(x) == 9 && x == [9, 3, 2, 1]);
+var y = [1, 2];
+assert(st(y) == 6 && y == [6, 3]);
+
+# a constant is still read-only, through a const parameter too
+const K = [5, 4];
+var raised = false;
+try { ap(K); } catch (CannotChangeConstEx) { raised = true; }
+assert(raised && K == [5, 4]);
+assert(so(K) == 5 && K == [5, 4]);    # sort of a constant sorts a copy
+
+# a builtin callback evaluated at compile time reassigns its parameter, as
+# at run time; and a function literal in a const declaration parses its
+# own body as a body (its `var t` was taken for a const declaration)
+pure func lt(a, b) { a = a * 1; return a < b; }
+const S = sort([3, 1, 2], lt);
+const T = sort([3, 1, 2], pure func(a, b) { var t = 0; t = a; return t < b; });
+assert(S == [1, 2, 3] && T == S && sort([3, 1, int(runtime(2))], lt) == S);
+print(x, y, S, T);

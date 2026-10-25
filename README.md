@@ -2034,7 +2034,10 @@ func f(const x, y) {
 ```
 
 Reassigning a `const` parameter is a compile-time error, and so is writing a
-field of the struct it holds (a struct is a value - see *Structs*). A non-const
+field of the struct it holds (a struct is a value - see *Structs*). It protects
+the parameter, not an array or dict it holds, which is the caller's: through
+`const a`, `a[0] = 9` and `append(a, 9)` change the caller's array (a
+constant passed in stays read-only, as everywhere). A non-const
 parameter stays mutable, and - since parameters are passed by value - a
 function (even a `pure` one) may freely reassign its own non-const parameters
 without affecting the caller. A plain parameter that is never reassigned
