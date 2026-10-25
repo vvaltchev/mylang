@@ -635,6 +635,65 @@ struct Reader {
     }
 };
 
+/*
+ * v37: a TypeAnnot record (a FieldDef's annot, a parameter's fit check,
+ * a store's fit spec, a boxed ctor's field checks). u8 kind (0xFF: no
+ * annotation), bool opt, u32 struct index (0xFFFFFFFF: none), then the
+ * children: elem for an array or a box, key then val for a dict.
+ */
+static void write_annot(Writer &w, const TypeAnnot *a)
+{
+    if (!a) {
+        w.u8v(0xFF);
+        return;
+    }
+    w.u8v(static_cast<uint8_t>(a->kind));
+    w.boolv(a->opt);
+    uint32_t si = 0xffffffffu;
+    if (a->strct) {
+        auto it = w.struct_ids.find(a->strct);
+        if (it == w.struct_ids.end())
+            bad_image("unserializable image (annot struct)");
+        si = it->second;
+    }
+    w.u32v(si);
+    if (a->kind == DeclType::arr || a->kind == DeclType::box)
+        write_annot(w, a->elem.get());
+    else if (a->kind == DeclType::dict) {
+        write_annot(w, a->key.get());
+        write_annot(w, a->val.get());
+    }
+}
+
+static constexpr int MYV_ANNOT_MAX_DEPTH = 256;
+
+static std::shared_ptr<TypeAnnot> read_annot(Reader &r, int depth)
+{
+    if (depth > MYV_ANNOT_MAX_DEPTH)
+        bad_image("corrupt .myv (annot depth)");
+    const uint8_t k = r.u8v();
+    if (k == 0xFF)
+        return nullptr;
+    if (k > static_cast<uint8_t>(DeclType::box))
+        bad_image("corrupt .myv (annot kind)");
+    auto a = std::make_shared<TypeAnnot>();
+    a->kind = static_cast<DeclType>(k);
+    a->opt = r.boolv();
+    const uint32_t si = r.u32v();
+    if (si != 0xffffffffu) {
+        if (a->kind != DeclType::strct || si >= r.structs.size())
+            bad_image("corrupt .myv (annot struct)");
+        a->strct = r.structs[si];
+    }
+    if (a->kind == DeclType::arr || a->kind == DeclType::box)
+        a->elem = read_annot(r, depth + 1);
+    else if (a->kind == DeclType::dict) {
+        a->key = read_annot(r, depth + 1);
+        a->val = read_annot(r, depth + 1);
+    }
+    return a;
+}
+
 /* ------------------------------------------------------------------ */
 /* The VALUE codec (recursive; consts, literal_objs, struct consts)     */
 /* ------------------------------------------------------------------ */
@@ -1471,6 +1530,15 @@ void write_chunk(Writer &w, const Chunk &c)
         auto it = w.struct_ids.find(bc.def);
         w.u32v(it != w.struct_ids.end() ? it->second : 0xffffffffu);
         write_arglocs(w, bc.arg_locs);
+        w.boolv(bc.fit);                     /* v37 */
+    }
+
+    /* v37: CheckFitV's pool - the place's annotation, kind and name */
+    w.u32v(static_cast<uint32_t>(c.fit_specs.size()));
+    for (const auto &f : c.fit_specs) {
+        write_annot(w, f.annot.get());
+        w.u8v(static_cast<uint8_t>(f.place));
+        w.uidv(f.name);
     }
 
     w.u32v(static_cast<uint32_t>(c.emplace_sites.size()));
@@ -1795,7 +1863,21 @@ void read_chunk(Reader &r, Chunk &c)
         const uint32_t di = r.idx_opt(r.structs.size(), "corrupt .myv (ctor)");
         bc.def = di == 0xffffffffu ? nullptr : r.structs[di];
         bc.arg_locs = read_arglocs(r);
+        bc.fit = r.boolv();                  /* v37 */
         c.boxed_ctors.push_back(std::move(bc));
+    }
+
+    n = r.countv();                          /* v37: fit_specs */
+    c.fit_specs.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        FitSpec f;
+        f.annot = read_annot(r, 0);
+        const uint8_t pl = r.u8v();
+        if (pl > static_cast<uint8_t>(FitSpec::Place::dict_key))
+            bad_image("corrupt .myv (fit place)");
+        f.place = static_cast<FitSpec::Place>(pl);
+        f.name = r.uidv();
+        c.fit_specs.push_back(std::move(f));
     }
 
     n = r.countv();
@@ -2024,6 +2106,7 @@ void myv_write(const VmProgram &prog, const std::string &path,
                                                             : 0xffffffffu);
             w.boolv(f.is_opt);
             w.u32v(static_cast<uint32_t>(f.slot));
+            write_annot(w, f.annot.get());       /* v37 */
         }
         w.u32v(static_cast<uint32_t>(sd->consts.size()));
         for (const auto &kv : sd->consts) {
@@ -2050,6 +2133,7 @@ void myv_write(const VmProgram &prog, const std::string &path,
             w.u8v(static_cast<uint8_t>(p.decl_type));
             w.u8v(static_cast<uint8_t>(p.proven_type));   /* C3, v11 */
             w.uidv(p.sig_type);                  /* v36, may be null */
+            write_annot(w, p.fit.get());         /* v37 */
         }
         w.u32v(static_cast<uint32_t>(d->captures.size()));
         for (const auto &cp : d->captures) {
@@ -2396,6 +2480,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             fd.struct_def = si == 0xffffffffu ? nullptr : r.structs[si];
             fd.is_opt = r.boolv();
             fd.slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
+            fd.annot = read_annot(r, 0);         /* v37 */
             sd.fields.push_back(std::move(fd));
         }
         const uint32_t nc = r.countv();
@@ -2425,6 +2510,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             p.proven_type = r.enumv(DeclType::box,   /* C3, v11 */
                                     "corrupt .myv (param type)");
             p.sig_type = r.uidv();               /* v36, may be null */
+            p.fit = read_annot(r, 0);            /* v37 */
             d.params.push_back(p);
         }
         const uint32_t ncp = r.countv();

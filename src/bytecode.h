@@ -1255,14 +1255,17 @@ enum class OpCode : unsigned char {
 
     /*
      * RULE 1 (2026-10-05): refuse `none` bound to a parameter not declared
-     * `opt` - emitted IMMEDIATELY BEFORE a user call (CallV / CachedCallV /
-     * CallValueV) whose arguments the inferencer could not prove non-none
-     * (CallExpr::none_arg_mask: a `dyn` is non-opt by type and may still
-     * hold none). `target` = the callee's kind (0 = the frame slot
+     * `opt` - and, since #49, a value that does not fit a parameter's
+     * declared type (ParamDesc::fit) - emitted IMMEDIATELY BEFORE a user
+     * call (CallV / CachedCallV / CallValueV) whose arguments the
+     * inferencer could not prove safe (CallExpr::check_args(): the
+     * none_arg_mask - a `dyn` is non-opt by type and may still hold none -
+     * or fit_args, a `dyn` value bound to a typed parameter). `target` =
+     * the callee's kind (0 = the frame slot
      * `target2` holds the callee VALUE, a CallValueV's; 1 = the global
      * slot `target2`, a CallV's), `a` = the argument run's base, `b` = its
      * count - the call's own operands. If the callee is a function,
-     * none_bind_fault walks the arguments in parameter order and the op
+     * bind_fault walks the arguments in parameter order and the op
      * raises the TypeErrorEx the bind would - after every argument
      * evaluated, before any callee frame, at the same argument
      * (Exception::bind_arg selects the op's arg_locs caret; base_locs
@@ -1301,6 +1304,18 @@ enum class OpCode : unsigned char {
      */
     LoadBoxV,
     StoreBoxV,
+
+    /*
+     * #49: CheckFitV - a value a store, or an in-place builtin, is about
+     * to put into a place whose type is fixed: slot[a] is checked against
+     * Chunk::fit_specs[target2] (value_fits) and a misfit raises a
+     * TypeErrorEx naming the place (fit_error) - caret: the loc side table
+     * (the value's span). Emitted after the value's numeric widening and
+     * before the store, only where the inferencer saw the value may misfit
+     * (Expr14::rv_fit, Subscript::key_fit, ExprList::arg_fit). Writes no
+     * frame slot. The bytecode inliner pastes no body that holds one.
+     */
+    CheckFitV,
 
     /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
@@ -1354,7 +1369,8 @@ enum class OpCode : unsigned char {
     X(IntAddStep) X(ForStepElemInt) X(StructFieldAddInt) X(EnterNative) \
     X(ExitBlock) X(LoadElem2Int) X(LoadElem2Float) X(ArrEpochMark) \
     X(ArrEpochCheck) X(GuardCalleeV) X(LoadCaptureOfV) X(StoreCaptureOfV) \
-    X(UnpackLenCheck) X(CheckNoneArgsV) X(LoadBoxV) X(StoreBoxV)
+    X(UnpackLenCheck) X(CheckNoneArgsV) X(LoadBoxV) X(StoreBoxV) \
+    X(CheckFitV)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin
@@ -2727,8 +2743,17 @@ struct Chunk {
     struct BoxedCtor {
         const StructTypeDef *def;
         std::vector<ArgLoc> arg_locs;   /* provided args [0, nargs) */
+        /* #49: an argument may misfit a container / box field's declared
+         * element types (CallExpr::fit_args) - the fields are checked */
+        bool fit = true;
     };
     std::vector<BoxedCtor> boxed_ctors;
+
+    /* #49: the FIT-CHECK pool for CheckFitV (target2): each entry the
+     * place's type as a run-time annotation, which place it is and its
+     * name, for the message. Pure data (myv: the TypeAnnot codec). The JIT
+     * bakes an entry's address, so nothing appends after codegen. */
+    std::vector<FitSpec> fit_specs;
 
     /* EMPLACE-STRUCT SITE POOL (EmplaceStruct: `append(struct_arr, Ctor(..))`).
      * Everything vm_emplace_struct needed from the node: the ctor's POD def

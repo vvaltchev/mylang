@@ -179,8 +179,12 @@ var dyn mixc = [C(one), 5];
 want("class then int", str(mixc), "[C(v: 1), 5]");
 var dyn mixp = [P(one, 1), R([one])];
 want("pod then non-pod", str(len(mixp)), "2");
-array<C> acd = [C(one), dn];
-want("array<C> with a dyn int", str(acd[1]), "5");
+# ... and a dyn int does not fit an array<C> variable: refused before the
+# store (#49, README "A dyn value entering a typed place")
+var acd_got = "stored";
+try { array<C> acd = [C(one), dn]; acd_got = str(acd[1]); }
+catch (TypeErrorEx) { acd_got = "refused"; }
+want("array<C> with a dyn int", acd_got, "refused");
 
 # --- a loop-invariant slice of a LOCAL is hoisted above its loop (or not,
 # when the loop changes the base, a bound or the slice) - the values are

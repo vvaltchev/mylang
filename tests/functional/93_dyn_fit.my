@@ -1,0 +1,172 @@
+# #49: a `dyn` value entering a typed place is checked against the place's
+# declared type - a parameter, a struct field (at construction and at a
+# store), an array element, a dict value or key, and append / push /
+# insert. A misfit raises a TypeErrorEx BEFORE anything is stored, in
+# every engine (README, "A dyn value entering a typed place"); a value
+# that fits passes unchanged. Without inference (-nti) the parameter and
+# constructor checks still run - they need only the declaration - but a
+# store is checked only where inference found the place's declared type,
+# so the store sections assert their refusals in a typed run only.
+struct P { int x; }
+struct Q { int x; }
+struct S { array<int> v; }
+class C { int n; }
+class D { int n; }
+
+var refused = 0;
+var typed = typestr(runtime(0)) == "dyn";
+
+func takes_arr(array<int> a) => len(a);
+func takes_p(P p) => p.x;
+func takes_dict(dict<str, int> d) => len(d);
+func takes_str(str s) => len(s);
+func takes_box(box<int> b) => *b;
+func takes_c(C c) => c.n;
+
+func call_checks(dyn bad_arr, dyn bad_p, dyn bad_dict, dyn bad_s,
+                 dyn bad_box, dyn bad_c) {
+    try { takes_arr(bad_arr); } catch (TypeErrorEx) { refused++; }
+    try { takes_p(bad_p); } catch (TypeErrorEx) { refused++; }
+    try { takes_dict(bad_dict); } catch (TypeErrorEx) { refused++; }
+    try { takes_str(bad_s); } catch (TypeErrorEx) { refused++; }
+    try { takes_box(bad_box); } catch (TypeErrorEx) { refused++; }
+    try { takes_c(bad_c); } catch (TypeErrorEx) { refused++; }
+}
+call_checks(runtime(["s"]), runtime(Q(1)), runtime({"k": "v"}),
+            runtime(5), runtime(box(2.5)), runtime(D(1)));
+assert(refused == 6);
+
+# the same values, fitting, pass
+func call_fits(dyn a, dyn p, dyn d, dyn s, dyn b, dyn c) {
+    return takes_arr(a) + takes_p(p) + takes_dict(d) + takes_str(s)
+           + takes_box(b) + takes_c(c);
+}
+assert(call_fits(runtime([1, 2]), runtime(P(10)), runtime({"k": 1}),
+                 runtime("abc"), runtime(box(100)), runtime(C(1000)))
+       == 2 + 10 + 1 + 3 + 100 + 1000);
+
+# a struct construction checks a container field's elements
+refused = 0;
+func ctor(dyn d) {
+    try { var s = S(d); print("not refused", s); } catch (TypeErrorEx) {
+        refused++;
+    }
+}
+ctor(runtime(["s"]));
+ctor(runtime([[1]]));
+assert(refused == 2);
+
+# stores: the target keeps its old value
+func stores(dyn d) {
+    refused = 0;
+    array<str> a = ["x"];
+    try { a[0] = d; } catch (TypeErrorEx) { refused++; }
+    assert(!typed || a == ["x"]);
+
+    dict<str, array<int>> m = {"k": [1]};
+    try { m["k"] = d; } catch (TypeErrorEx) { refused++; }
+    assert(!typed || m == {"k": [1]});
+
+    S s = S([1]);
+    try { s.v = d; } catch (TypeErrorEx) { refused++; }
+    assert(!typed || s.v == [1]);
+
+    array<array<int>> aa = [[1]];
+    try { append(aa, d); } catch (TypeErrorEx) { refused++; }
+    try { push(aa, d); } catch (TypeErrorEx) { refused++; }
+    try { insert(aa, 0, d); } catch (TypeErrorEx) { refused++; }
+    assert(!typed || aa == [[1]]);
+
+    dict<str, int> k = {};
+    try { k[d] = 1; } catch (TypeErrorEx) { refused++; }
+    try { insert(k, d, 1); } catch (TypeErrorEx) { refused++; }
+    assert(!typed || len(k) == 0);
+    return refused;
+}
+var r5 = stores(runtime(5));
+var rs = stores(runtime(["s"]));
+assert(!typed || (r5 == 8 && rs == 8));
+
+# a compound store whose result may misfit is a compile error; its plain
+# form is checked, so it stores what fits and refuses the rest
+func plain_compound(dyn d) {
+    array<array<int>> aa = [[1]];
+    aa[0] = aa[0] + d;
+    return aa;
+}
+assert(plain_compound(runtime([2])) == [[1, 2]]);
+refused = 0;
+try { plain_compound(runtime(["s"])); } catch (TypeErrorEx) { refused++; }
+assert(!typed || refused == 1);
+
+# none fits only an `opt` element
+func store_none(opt dyn d) {
+    array<str?> o = ["x"];
+    o[0] = d;
+    array<str> n = ["x"];
+    try { n[0] = d; return false; } catch (TypeErrorEx) { }
+    return o[0] == none && n == ["x"];
+}
+assert(store_none(runtime(none)) == typed);
+
+# fitting values are stored as they are
+func fits(dyn s, dyn arr, dyn key) {
+    array<str> a = ["x"];
+    a[0] = s;
+    dict<str, array<int>> m = {};
+    m["k"] = arr;
+    S st = S([0]);
+    st.v = arr;
+    array<array<int>> aa = [];
+    append(aa, arr);
+    insert(aa, 0, arr);
+    dict<str, int> k = {};
+    k[key] = 1;
+    insert(k, key + "2", 2);
+    return [a[0], str(m), str(st.v), str(aa), str(k)];
+}
+assert(fits(runtime("y"), runtime([7, 8]), runtime("q"))
+       == ["y", "{\"k\": [7, 8]}", "[7, 8]", "[[7, 8], [7, 8]]",
+           "{\"q\": 1, \"q2\": 2}"]);
+# two slices of one storage are two values: each one is walked
+func takes_rows(dict<str, array<int>> d) => len(d);
+func slices(dyn mixed) {
+    var dyn rows = {"a": mixed[0:1], "b": mixed[1:2]};
+    try { takes_rows(rows); return false; } catch (TypeErrorEx) { }
+    return true;
+}
+assert(slices(runtime([1, "x"])));
+# a declared variable takes a container with a dyn inside, checked as
+# a parameter is - the variable keeps its value on a refusal
+func dyn_rows(dyn x) { array<dyn> r = [x]; return r; }
+func var_store(dyn x) {
+    array<int> v = [1];
+    try { v = dyn_rows(x); return false; } catch (TypeErrorEx) { }
+    return v == [1];
+}
+assert(var_store(runtime("s")) == typed);
+array<int> vv = dyn_rows(runtime(5));
+assert(vv == [5]);
+# a multi-assignment checks what each declared target receives, in
+# order: a refusal leaves the targets before it written and the rest as
+# they were, as a failing coercion does
+func multi(dyn x) {
+    array<array<dyn>> src = [[1], [x]];
+    array<int> a = [0];
+    array<int> b = [0];
+    try { a, b = src; } catch (TypeErrorEx) { return [a, b]; }
+    return [a, b, [9]];
+}
+assert(!typed || multi(runtime("s")) == [[1], [0]]);
+assert(multi(runtime(2)) == [[1], [2], [9]]);
+# ... and a non-array value, spread to each target
+func spread(dyn x) {
+    dict<str, dyn> d = {"k": x};
+    dict<str, int> p = {};
+    dict<str, int> q = {"z": 0};
+    try { p, q = d; } catch (TypeErrorEx) { return [p, q]; }
+    return [p, q, {"ok": 1}];
+}
+assert(!typed || spread(runtime("s")) == [{}, {"z": 0}]);
+assert(spread(runtime(4)) == [{"k": 4}, {"k": 4}, {"ok": 1}]);
+print("ok");

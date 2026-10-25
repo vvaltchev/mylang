@@ -5860,6 +5860,10 @@ private:
      * `opt` and is never written: its own bind already refused a none.
      * The last two need no inference, so an unstamped call (-nti, a
      * harness running the resolver alone) still inlines `f(n)`.
+     * #49: the same holds for a MISFIT - an argument that may not fit a
+     * parameter's declared type (CallExpr::fit_args, a parameter with a
+     * ParamDesc::fit) is refused by the bind, so that call stays a call
+     * too.
      */
     bool binds_none(const CallExpr *ce, const FuncDeclStmt *f) const
     {
@@ -5867,6 +5871,8 @@ private:
         const size_t n = ce->args->elems.size();
         const FuncDescriptor *d = f->desc;
         for (size_t i = 0; i < n; i++) {
+            if (ce->fit_args && d->params[i].fit)
+                return true;
             const Construct *a = ce->args->elems[i].get();
             if (!ce->arg_may_be_none(i))
                 continue;

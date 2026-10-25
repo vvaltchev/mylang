@@ -335,7 +335,8 @@ private:
 
     bool ready_ = false;
     bool fast_bind_ = false;
-    /* ready_ && fast_bind_, the raw bind's one gate (#97 CB6) */
+    /* ready_ && fast_bind_ && no fit check (#49), the raw bind's one
+     * gate (#97 CB6) */
     bool raw_ok_ = false;
     Loc site_;                 /* the builtin call's site (#44) */
     VmActivation *act_ = nullptr;

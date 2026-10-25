@@ -23,7 +23,10 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 36;   /* v36: a Param's
+constexpr unsigned MYV_FORMAT_VERSION = 37;   /* v37: a Field's annot
+                                                 and a Param's fit (a
+                                                 TypeAnnot record);
+                                                 v36: a Param's
                                                  sig_type (signature()'s
                                                  annotation text);
                                                  v35: FieldKind

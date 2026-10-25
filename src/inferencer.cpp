@@ -494,6 +494,8 @@ private:
     void check_value_into(StaticTypeRef dest, StaticTypeRef vt,
                           const std::string &field, Construct *at);
     void check_declared_store(Expr14 *e);
+    void refuse_compound_misfit(Op op, StaticTypeRef place,
+                                StaticTypeRef v, Construct *at);
     void check_builtin_store(CallExpr *call);
     std::vector<TypeSym *> *known_params(CallExpr *call);
     StaticTypeRef arg_type(Construct *arg, TypeSym *param);
@@ -569,6 +571,7 @@ private:
     void check_if(IfStmt *i);
     TypeSym *narrow_target(Construct *cond, bool &in_then);
     void annotate_hints(Construct *n);   /* stamp TypeHints for specializer */
+    bool call_fit_args(CallExpr *call);  /* #49: CallExpr::fit_args */
     void check_opt_struct_fields();      /* `opt` names a class (parser) */
     void stamp_literal_coerce(Construct *n, StaticTypeRef t);
     FuncInfo *hint_func = nullptr;   /* annotate_hints: the enclosing func */
@@ -3208,6 +3211,197 @@ static bool static_type_deep_value(StaticTypeRef t)
     }
 }
 
+/*
+ * #49: a parameter that carries a run-time fit check (ParamDesc::fit) -
+ * the rule param_fit_annot (syntax.h) applies to the declaration: a
+ * `bool`, `str`, struct, container or box annotation, not `dyn`.
+ */
+static bool param_has_fit(const TypeSym *p)
+{
+    if (p->dyn_decl)
+        return false;
+    switch (p->ann) {
+    case DeclType::b: case DeclType::s: case DeclType::arr:
+    case DeclType::dict: case DeclType::box:
+        return true;
+    case DeclType::strct:
+        return p->ann_struct != nullptr;
+    default:
+        return false;
+    }
+}
+
+/*
+ * #49: can a value of static type `v` misfit a place of static type `p`
+ * at run time? Only where the static check let a `dyn` through: `v`, or
+ * an element / key / value of it, is dyn (or not settled) where `p` has a
+ * type. At the TOP level an int / float place is the coercion's
+ * (it converts what fits and refuses the rest, without this check); an
+ * element of one is not converted, so there it counts.
+ */
+static bool fit_needed(StaticTypeRef v, StaticTypeRef p, bool top = true)
+{
+    p = p ? static_type_resolve(p) : nullptr;
+    if (!p || p->kind == StaticTypeKind::Dyn
+            || p->kind == StaticTypeKind::Unknown
+            || p->kind == StaticTypeKind::None)
+        return false;
+    if (top && (p->kind == StaticTypeKind::Int
+                || p->kind == StaticTypeKind::Float))
+        return false;
+    v = v ? static_type_resolve(v) : nullptr;
+    if (!v || v->kind == StaticTypeKind::Dyn
+            || v->kind == StaticTypeKind::Unknown)
+        return true;
+    switch (p->kind) {
+    case StaticTypeKind::Array: case StaticTypeKind::Box:
+        return v->kind == p->kind && fit_needed(v->elem, p->elem, false);
+    case StaticTypeKind::Dict:
+        return v->kind == StaticTypeKind::Dict
+               && (fit_needed(v->key, p->key, false)
+                   || fit_needed(v->val, p->val, false));
+    default:
+        return false;
+    }
+}
+
+/*
+ * #49: a static type as the run-time annotation value_fits checks a value
+ * against. `dyn` (and anything value_fits has no rule for - a function,
+ * an exception) checks nothing; so does a box's unknown element (null).
+ */
+static std::shared_ptr<TypeAnnot> fit_annot_of(StaticTypeRef t,
+                                               int depth = 0)
+{
+    auto a = std::make_shared<TypeAnnot>();
+    a->kind = DeclType::dyn;
+    t = t ? static_type_resolve(t) : nullptr;
+    if (!t || depth > 64)
+        return a;
+    a->opt = t->opt;
+    switch (t->kind) {
+    case StaticTypeKind::Bool:  a->kind = DeclType::b; break;
+    case StaticTypeKind::Int:   a->kind = DeclType::i; break;
+    case StaticTypeKind::Float: a->kind = DeclType::f; break;
+    case StaticTypeKind::Str:   a->kind = DeclType::s; break;
+    case StaticTypeKind::Array:
+        a->kind = DeclType::arr;
+        a->elem = fit_annot_of(t->elem, depth + 1);
+        break;
+    case StaticTypeKind::Dict:
+        a->kind = DeclType::dict;
+        a->key = fit_annot_of(t->key, depth + 1);
+        a->val = fit_annot_of(t->val, depth + 1);
+        break;
+    case StaticTypeKind::Struct:
+        a->kind = DeclType::strct;
+        a->strct = static_cast<const StructTypeDef *>(t->struct_def);
+        break;
+    case StaticTypeKind::Box:
+        a->kind = DeclType::box;
+        a->elem = fit_annot_of(t->elem, depth + 1);
+        if (a->elem->kind == DeclType::dyn)
+            a->elem = nullptr;          /* any box */
+        break;
+    default:
+        a->opt = false;                 /* dyn: no check */
+        break;
+    }
+    return a;
+}
+
+/* #49: the check a value of static type `v` needs entering a place of
+ * static type `p` (a stored element, dict value or key), or null */
+static std::shared_ptr<const FitSpec>
+store_fit(StaticTypeRef p, StaticTypeRef v, FitSpec::Place where,
+          const UniqueId *name = nullptr)
+{
+    if (!fit_needed(v, p))
+        return nullptr;
+    auto f = std::make_shared<FitSpec>();
+    f->annot = fit_annot_of(p);
+    f->place = where;
+    f->name = name;
+    return f;
+}
+
+/* #49: a dyn or unsettled type anywhere in `t` */
+static bool fit_has_dyn(StaticTypeRef t, int depth = 0)
+{
+    t = t ? static_type_resolve(t) : nullptr;
+    if (!t || t->kind == StaticTypeKind::Dyn
+            || t->kind == StaticTypeKind::Unknown)
+        return true;
+    if (depth > 64)
+        return true;
+    switch (t->kind) {
+    case StaticTypeKind::Array: case StaticTypeKind::Box:
+        return fit_has_dyn(t->elem, depth + 1);
+    case StaticTypeKind::Dict:
+        return fit_has_dyn(t->key, depth + 1)
+               || fit_has_dyn(t->val, depth + 1);
+    default:
+        return false;
+    }
+}
+
+/*
+ * #49: may an argument of this call misfit its parameter's declared type
+ * at run time (CallExpr::fit_args)? A known callee: some argument whose
+ * parameter has a fit check and whose static type can misfit it. A
+ * struct construction: the same over the fields. A function VALUE of a
+ * known Func type: its arguments were checked against that type, so a
+ * dyn in an argument or in the type's parameters keeps the check. A
+ * builtin checks its own arguments; any other callee (a dyn) keeps it.
+ */
+bool Inferencer::call_fit_args(CallExpr *call)
+{
+    ExprList *args = call->args.get();
+    const size_t na = args ? args->elems.size() : 0;
+    if (na == 0)
+        return false;
+    if (const StructTypeDef *def = cs_struct_callee(call->what.get())) {
+        for (size_t i = 0; i < na && i < def->fields.size(); i++) {
+            const FieldDef &fd = def->fields[i];
+            if (fd.kind != FieldKind::f_dyn
+                    && fit_needed(type_of(args->elems[i].get()),
+                                  field_static_type(fd)))
+                return true;
+        }
+        return false;
+    }
+    if (FuncInfo *fi = callee_funcinfo(call->what.get())) {
+        for (size_t i = 0; i < na && i < fi->params.size(); i++)
+            if (param_has_fit(fi->params[i])
+                    && fit_needed(type_of(args->elems[i].get()),
+                                  fi->params[i]->type))
+                return true;
+        return false;
+    }
+    if (ctag(call->what.get()) == ConstructType::id) {
+        auto *cid = static_cast<Identifier *>(call->what.get());
+        auto it = id_sym.find(cid);
+        if ((it == id_sym.end() || !it->second) && is_builtin(cid->uid))
+            return false;
+    }
+    StaticTypeRef ct = static_type_resolve(type_of(call->what.get()));
+    if (ct->kind != StaticTypeKind::Func || na > ct->params.size())
+        return true;
+    /* a dyn (or unsettled) position in the callee's type: the function
+     * the value holds may declare anything there */
+    for (StaticTypeRef pt : ct->params)
+        if (fit_has_dyn(pt)
+                || static_type_resolve(pt)->kind == StaticTypeKind::None)
+            return true;
+    /* every position settled: the function declares that type there, so
+     * an argument is checked as against a known parameter - and an int
+     * or float one is the bind's coercion's */
+    for (size_t i = 0; i < na; i++)
+        if (fit_needed(type_of(args->elems[i].get()), ct->params[i]))
+            return true;
+    return false;
+}
+
 void Inferencer::annotate_hints(Construct *n)
 {
     if (!n)
@@ -3292,6 +3486,81 @@ void Inferencer::annotate_hints(Construct *n)
             if (ctag(lv) == ConstructType::subscript
                 && bt->kind == StaticTypeKind::Array)
                 e->rv_coerce = assign_value_widen(bt->elem, rt);
+            /* #49: and is CHECKED where it may misfit the place's declared
+             * type (a `dyn`, or a container with a `dyn` element): an
+             * element, a dict value and key, a container / box field. A
+             * struct / scalar field's own store refuses a misfit already
+             * (coerce_struct_field). */
+            e->rv_fit = nullptr;
+            if (bt->kind == StaticTypeKind::Array)
+                e->rv_fit = store_fit(bt->elem, rt, FitSpec::Place::elem);
+            else if (bt->kind == StaticTypeKind::Dict) {
+                e->rv_fit = store_fit(bt->val, rt,
+                                      FitSpec::Place::dict_val);
+                if (ctag(lv) == ConstructType::subscript) {
+                    auto *sub = static_cast<Subscript *>(
+                        const_cast<Construct *>(lv));
+                    sub->key_fit = store_fit(bt->key,
+                                             type_of(sub->index.get()),
+                                             FitSpec::Place::dict_key);
+                }
+            } else if (bt->kind == StaticTypeKind::Struct
+                       && ctag(lv) == ConstructType::member) {
+                const auto *def =
+                    static_cast<const StructTypeDef *>(bt->struct_def);
+                const auto *mem = static_cast<const MemberExpr *>(lv);
+                const int fs = def && mem->memUid
+                    ? def->slot_of(mem->memUid) : -1;
+                const FieldDef *fd = fs >= 0
+                    ? &def->fields[static_cast<size_t>(fs)] : nullptr;
+                if (fd && fd->annot
+                        && (fd->kind == FieldKind::f_array
+                            || fd->kind == FieldKind::f_dict
+                            || fd->kind == FieldKind::f_box)
+                        && fit_needed(rt, field_static_type(*fd))) {
+                    auto f = std::make_shared<FitSpec>();
+                    f->annot = fd->annot;
+                    f->place = FitSpec::Place::field;
+                    f->name = fd->name;
+                    e->rv_fit = f;
+                }
+            }
+        }
+        /* #49: a variable whose type is DECLARED (an annotation, or a
+         * committed REPL global) given a value with a `dyn` INSIDE where
+         * the declaration has a type - an array<dyn> into an array<int>:
+         * the check pass accepts it (a dyn element fits any element
+         * type), so it is checked at run time, as a parameter is at its
+         * bind. A value that is a `dyn` itself is refused at compile
+         * time there, and an int / float variable converts its value. */
+        if (e->op == Op::assign && lv && ctag(lv) == ConstructType::id) {
+            auto *id = static_cast<Identifier *>(const_cast<Construct *>(lv));
+            e->rv_fit = nullptr;
+            if (StaticTypeRef d = declared_type_of(id))
+                e->rv_fit = store_fit(d, type_of(e->rvalue.get()),
+                                      FitSpec::Place::var, id->uid);
+        }
+        /* ... and each declared target of a multi-assignment, given what
+         * it receives (idlist_elem_types) */
+        if (e->op == Op::assign && lv && ctag(lv) == ConstructType::idlist) {
+            auto *idl = static_cast<IdList *>(const_cast<Construct *>(lv));
+            idl->fits.clear();
+            const std::vector<StaticTypeRef> els =
+                idlist_elem_types(idl, e->rvalue.get());
+            std::vector<std::shared_ptr<const FitSpec>> fits(
+                idl->elems.size());
+            bool any = false;
+            for (size_t i = 0; i < idl->elems.size(); i++) {
+                Identifier *t = idl->elems[i].get();
+                if (t->is_underscore())
+                    continue;
+                if (StaticTypeRef d = declared_type_of(t))
+                    fits[i] = store_fit(d, els[i], FitSpec::Place::var,
+                                        t->uid);
+                any = any || fits[i];
+            }
+            if (any)
+                idl->fits = std::move(fits);
         }
         /* a container literal stored into a FIXED array / dict type it
          * fits has that type (literal_dest_type): its elements widen to
@@ -3424,6 +3693,25 @@ void Inferencer::annotate_hints(Construct *n)
                     widen(1, bt->key);
                     widen(2, bt->val);
                 }
+                /* #49: and CHECKED where it may misfit the declared
+                 * element / key / value type */
+                const auto fit = [&](size_t i, StaticTypeRef to,
+                                     FitSpec::Place where) {
+                    auto f = store_fit(to, type_of(al->elems[i].get()),
+                                       where);
+                    if (!f)
+                        return;
+                    if (al->arg_fit.size() <= i)
+                        al->arg_fit.resize(i + 1);
+                    al->arg_fit[i] = f;
+                };
+                al->arg_fit.clear();
+                if (bt->kind == StaticTypeKind::Array)
+                    fit(vi, bt->elem, FitSpec::Place::elem);
+                else if (bt->kind == StaticTypeKind::Dict && vi == 2) {
+                    fit(1, bt->key, FitSpec::Place::dict_key);
+                    fit(2, bt->val, FitSpec::Place::dict_val);
+                }
             }
         }
         /* ...and one passed for a declared parameter or a struct field */
@@ -3500,6 +3788,7 @@ void Inferencer::annotate_hints(Construct *n)
             }
         }
         call->none_arg_mask = nmask;
+        call->fit_args = call_fit_args(call);
         stamp_sum_identity(call);
         /* lever 4b: len(x)'s arg proven a non-opt array/string - the
          * BUILTIN-ness proof is codegen's (DirectBuiltinCallExpr + the
@@ -6319,6 +6608,26 @@ void Inferencer::check_value_into(StaticTypeRef dest, StaticTypeRef vt,
                  at->start, at->end);
 }
 
+/* #49: `place OP= v` whose result may misfit the place's type (null: no
+ * declared type) - the value is computed inside the store, past any
+ * point a run-time check could stand, so it is refused */
+void Inferencer::refuse_compound_misfit(Op op, StaticTypeRef place,
+                                        StaticTypeRef v, Construct *at)
+{
+    /* only a dyn makes the result's type unknown here: with none in
+     * either operand, a dyn result means the operator does not apply,
+     * which the operator check reports in its own words */
+    if (!place || (!fit_has_dyn(place) && !fit_has_dyn(v)))
+        return;
+    const StaticTypeRef res = binop_result(compound_binop(op), place, v);
+    if (fit_needed(res, place))
+        mismatch("a compound assignment's value may not fit '" +
+                     static_type_to_string(place) +
+                     "' and cannot be checked: write it as a plain "
+                     "'=' (x = x OP v), which is checked",
+                 at->start, at->end);
+}
+
 /*
  * A store into a struct field, or into an element reached through
  * something other than a plain variable (`m[0][0] = v`, `s.a[0] = v`),
@@ -6330,6 +6639,20 @@ void Inferencer::check_declared_store(Expr14 *e)
 {
     Construct *lv = e->lvalue.get();
     std::string field;
+    /* #49: a COMPOUND store computes its value inside the store, where no
+     * fit check (CheckFitV) can stand - a value that may misfit the
+     * place's type (`a[0] += d`, `d` a dyn, into an array<array<int>>; a
+     * declared variable's `v += r`) is refused here. A plain `=` is
+     * checked at run time. */
+    if (e->op != Op::assign) {
+        if (ctag(lv) == ConstructType::subscript
+                || ctag(lv) == ConstructType::member)
+            refuse_compound_misfit(e->op, type_of(lv),
+                                   type_of(e->rvalue.get()), e);
+        else if (ctag(lv) == ConstructType::id)
+            refuse_compound_misfit(e->op, declared_type_of(lv),
+                                   type_of(e->rvalue.get()), e);
+    }
     if (ctag(lv) == ConstructType::deref) {
         /* `*b = v` / `*b OP= v`: v must fit the box's element type */
         const StaticTypeRef dest = declared_type_of(lv);
@@ -7225,11 +7548,16 @@ void Inferencer::check(Construct *n)
                 auto *idl = static_cast<IdList *>(e14->lvalue.get());
                 const std::vector<StaticTypeRef> els =
                     idlist_elem_types(idl, e14->rvalue.get());
-                for (size_t i = 0; i < idl->elems.size(); i++)
+                for (size_t i = 0; i < idl->elems.size(); i++) {
                     check_compound_op(e14->op,
                                       type_of(idl->elems[i].get()), els[i],
                                       idl->elems[i].get(),
                                       e14->rvalue.get(), e14);
+                    if (!idl->elems[i]->is_underscore())
+                        refuse_compound_misfit(
+                            e14->op, declared_type_of(idl->elems[i].get()),
+                            els[i], e14);
+                }
             } else {
                 check_compound_op(e14->op, type_of(e14->lvalue.get()),
                                   type_of(e14->rvalue.get()),

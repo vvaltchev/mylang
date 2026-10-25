@@ -542,15 +542,24 @@ bind_param(EvalContext *args_ctx,
            int idx,
            const FuncDescriptor::ParamDesc &param,
            EvalValue val,
-           int site_arg)
+           int site_arg,
+           bool check_fit)
 {
     /* RULE 1: a non-opt parameter never holds none - refused here, at the
-     * bind, before any coercion (the VM's none_bind_fault walks the same
+     * bind, before any coercion (the VM's bind_fault walks the same
      * order). An omitted trailing parameter is `opt` by construction. */
     if (!param.opt && val.is<NoneVal>())
         throw_none_bind(param.name, site_arg);
     if (param.decl_type == DeclType::f || param.decl_type == DeclType::i)
         val = coerce_to_decl_type(val, param.decl_type, site_arg);
+    /* #49: a value the static check let through (a dyn) misfits a typed
+     * parameter - checked where the call may carry one (`check_fit`:
+     * CallExpr::check_args at a call site; every callback bind) */
+    else if (check_fit && param.fit && !val.is<NoneVal>()) {
+        FitMisfit m;
+        if (!value_fits(val, *param.fit, &m))
+            throw param_fit_error(param.name, *param.fit, m, site_arg);
+    }
 
     if (frame) {
         frame->at(idx) = LValue(std::move(val), false);
@@ -575,7 +584,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
                     Frame *frame,
-                    size_t min_args)   /* precomputed: FuncDescriptor::min_args */
+                    size_t min_args,   /* precomputed: FuncDescriptor::min_args */
+                    bool check_fit)
 {
     /*
      * RULE 2: EVERY argument is evaluated, left to right, before the arity
@@ -607,8 +617,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
             args_ctx, frame, static_cast<int>(i),
             funcParams[i],
             i < nargs ? std::move(vals[i]) : EvalValue(),
-            static_cast<int>(i)              /* a call-site bind */
-        );
+            static_cast<int>(i),             /* a call-site bind */
+            check_fit);
     }
 }
 
@@ -618,7 +628,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
                     Frame *frame,
-                    size_t min_args)
+                    size_t min_args,
+                    bool check_fit)
 {
     const size_t nparams = funcParams.size();
     if (args.size() > nparams || args.size() < min_args)
@@ -629,8 +640,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
             args_ctx, frame, static_cast<int>(i),
             funcParams[i],
             i < args.size() ? args[i] : EvalValue(),
-            /*site_arg=*/-1                  /* a callback's bind */
-        );
+            /*site_arg=*/-1,                 /* a callback's bind */
+            check_fit);
     }
 }
 
@@ -653,7 +664,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
                     Frame *frame,
-                    size_t min_args)
+                    size_t min_args,
+                    bool check_fit)
 {
     const size_t nparams = funcParams.size();
     if (args.size() > nparams || args.size() < min_args)
@@ -664,11 +676,12 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
             bind_param(args_ctx, frame, static_cast<int>(i),
                        funcParams[i],
                        args[i],
-                       static_cast<int>(i)); /* a call-site bind */
+                       static_cast<int>(i),     /* a call-site bind */
+                       check_fit);
         else
             bind_param(args_ctx, frame, static_cast<int>(i),
                        funcParams[i],
-                       EvalValue(), /*site_arg=*/-1);
+                       EvalValue(), /*site_arg=*/-1, check_fit);
     }
 }
 
@@ -678,7 +691,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
                     Frame *frame,
-                    size_t min_args)
+                    size_t min_args,
+                    bool check_fit)
 {
     const size_t nparams = funcParams.size();
     if (nparams < 1 || min_args > 1)
@@ -688,7 +702,7 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
         bind_param(args_ctx, frame, static_cast<int>(i),
                    funcParams[i],
                    i == 0 ? arg : EvalValue(),
-                   /*site_arg=*/-1);            /* a callback's bind */
+                   /*site_arg=*/-1, check_fit);  /* a callback's bind */
 }
 
 
@@ -698,7 +712,8 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
                     EvalContext *ctx,
                     EvalContext *args_ctx,
                     Frame *frame,
-                    size_t min_args)
+                    size_t min_args,
+                    bool check_fit)
 {
     const size_t nparams = funcParams.size();
     if (nparams < 2 || min_args > 2)
@@ -708,7 +723,7 @@ do_func_bind_params(const std::vector<FuncDescriptor::ParamDesc> &funcParams,
         bind_param(args_ctx, frame, static_cast<int>(i),
                    funcParams[i],
                    i == 0 ? args.first : i == 1 ? args.second : EvalValue(),
-                   /*site_arg=*/-1);                /* a callback's bind */
+                   /*site_arg=*/-1, check_fit);  /* a callback's bind */
 }
 
 /*
@@ -787,7 +802,8 @@ do_func_call(EvalContext *ctx,
              const InlineCtx *call_site_inl = nullptr,
              const Chunk *call_ck = nullptr,
              size_t call_pc = 0,
-             bool as_signal = false)
+             bool as_signal = false,
+             bool check_fit = true)
 {
     /* func_ctx == true gives this call its own FlowState (see eval.h).
      * The parent is the closure's captured ROOT (G2): the empty link context
@@ -893,7 +909,8 @@ do_func_call(EvalContext *ctx,
         do_func_bind_params(
             obj.func->params, args, ctx, &args_ctx,
             bindframe,
-            static_cast<size_t>(obj.func->min_args)
+            static_cast<size_t>(obj.func->min_args),
+            check_fit
         );
     }
 
@@ -1006,8 +1023,10 @@ EvalValue vm_call_func(EvalContext *ctx,
                        const Chunk *ck, size_t pc)
 {
     try {
+        /* the bind's fit check (#49) is CheckNoneArgsV's, in front of the
+         * call op where the call may need one: not repeated here */
         return do_func_call(ctx, obj, VmArgs{argslots, n}, Loc(), nullptr,
-                            ck, pc, /*as_signal=*/true);
+                            ck, pc, /*as_signal=*/true, /*check_fit=*/false);
     } catch (Exception &e) {
         /* the bind runs BEFORE do_func_call's try, so its throw escapes
          * loc-less: the argument list's caret, as the tree-walker's
@@ -1069,7 +1088,7 @@ pure_cache_call(EvalContext *ctx, FuncObject &obj,
                 const vector<EvalValue> &vals, Loc call_site,
                 const InlineCtx *inl,
                 const Chunk *ck = nullptr, size_t pc = 0,
-                bool as_signal = false)
+                bool as_signal = false, bool check_fit = true)
 {
     PureCache &cache = ctx->frame->ensure_pure_cache();
     PureCacheKey key{ obj.func, vals };
@@ -1078,7 +1097,7 @@ pure_cache_call(EvalContext *ctx, FuncObject &obj,
         return it->second;
 
     EvalValue r = do_func_call(ctx, obj, vals, call_site, inl, ck, pc,
-                               as_signal);
+                               as_signal, check_fit);
     /* Inc v2: a signaled (cross-frame unwinding) call must NOT be cached - its
      * result is a sentinel. Only reachable with as_signal (a VM caller); the
      * tree-walker's cached_call passes false, so do_func_call C++-throws and
@@ -1093,17 +1112,19 @@ pure_cache_call(EvalContext *ctx, FuncObject &obj,
 static EvalValue
 cached_call(EvalContext *ctx, FuncObject &obj,
             const vector<unique_ptr<Construct>> &args,
-            Loc call_site, const InlineCtx *inl)
+            Loc call_site, const InlineCtx *inl, bool check_fit)
 {
     if (!ctx->frame || !g_pure_cache_enabled)
-        return do_func_call(ctx, obj, args, call_site, inl);
+        return do_func_call(ctx, obj, args, call_site, inl, nullptr, 0,
+                            false, check_fit);
 
     vector<EvalValue> vals;
     vals.reserve(args.size());
     for (const auto &a : args)
         vals.push_back(RValue(a->eval(ctx)));
 
-    return pure_cache_call(ctx, obj, vals, call_site, inl);
+    return pure_cache_call(ctx, obj, vals, call_site, inl, nullptr, 0,
+                           false, check_fit);
 }
 
 /* The VM's CachedCallV: cached_call but the args are already evaluated into the
@@ -1114,7 +1135,8 @@ vm_cached_call(EvalContext *ctx, FuncObject &obj,
 {
     if (!ctx->frame || !g_pure_cache_enabled)
         return do_func_call(ctx, obj, VmArgs{argslots, n},
-                            Loc(), nullptr, ck, pc, /*as_signal=*/true);
+                            Loc(), nullptr, ck, pc, /*as_signal=*/true,
+                            /*check_fit=*/false);  /* CheckNoneArgsV's */
 
     vector<EvalValue> vals;
     vals.reserve(n);
@@ -1122,7 +1144,7 @@ vm_cached_call(EvalContext *ctx, FuncObject &obj,
         vals.push_back(argslots[i].get());
 
     return pure_cache_call(ctx, obj, vals, Loc(), nullptr, ck, pc,
-                           /*as_signal=*/true);
+                           /*as_signal=*/true, /*check_fit=*/false);
 }
 
 static void stamp_operand_loc(const Construct *c, Exception &e);
@@ -1167,9 +1189,29 @@ bool box_fits_annot(const EvalValue &v, const TypeAnnot *a)
 /* Coerce + runtime-validate one field value. The inferencer already checks a
  * statically-known construction, but this guards a `dyn`-laundered value and
  * makes a parse-time (const) construction type-safe (so it can fold).
- * Non-static: the VM's vm_struct_ctor (vm.cpp) pre-coerces with it (H1). */
+ * Non-static: the VM's vm_struct_ctor (vm.cpp) pre-coerces with it (H1).
+ * `check_fit` (#49): a container or box field's declared element types are
+ * checked too (value_fits) - asked where the construction may carry a
+ * misfit (CallExpr::fit_args, BoxedCtor::fit) and by the generic ctor. */
+static void
+field_fit_check(const FieldDef &fd, const EvalValue &v, Loc s, Loc e)
+{
+    FitMisfit m;
+    if (!fd.annot || value_fits(v, *fd.annot, &m))
+        return;
+    FitSpec spec;
+    spec.annot = fd.annot;
+    spec.place = FitSpec::Place::field;
+    spec.name = fd.name;
+    TypeErrorEx ex = fit_error(spec, m);
+    ex.loc_start = s;
+    ex.loc_end = e;
+    throw ex;
+}
+
 EvalValue
-coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e)
+coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e,
+                    bool check_fit)
 {
     if (v.is<NoneVal>()) {
         if (fd.is_opt)
@@ -1198,21 +1240,36 @@ coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e)
                 return v;
             break;
         case FieldKind::f_array:
-            if (v.is<SharedArrayObj>())
+            if (v.is<SharedArrayObj>()) {
+                if (check_fit)
+                    field_fit_check(fd, v, s, e);
                 return v;
+            }
             break;
         case FieldKind::f_dict:
-            if (v.is<intrusive_ptr<DictObject>>())
+            if (v.is<intrusive_ptr<DictObject>>()) {
+                if (check_fit)
+                    field_fit_check(fd, v, s, e);
                 return v;
+            }
             break;
         case FieldKind::f_struct:
-            if (v.is<intrusive_ptr<StructObject>>() &&
-                v.get<intrusive_ptr<StructObject>>()->def->name == fd.struct_ty)
-                return v;
+            /* the declared struct, by identity where the def is known; a
+             * box<P> is a reference, never a P value (#49) */
+            if (v.is<intrusive_ptr<StructObject>>()) {
+                const StructObject &o =
+                    *v.get_ref<intrusive_ptr<StructObject>>();
+                if (!o.boxed && (fd.struct_def ? o.def == fd.struct_def
+                                               : o.def->name == fd.struct_ty))
+                    return v;
+            }
             break;
         case FieldKind::f_box:
-            if (box_fits_annot(v, fd.annot.get()))
+            if (box_fits_annot(v, fd.annot.get())) {
+                if (check_fit)
+                    field_fit_check(fd, v, s, e);
                 return v;
+            }
             break;
     }
 
@@ -1343,7 +1400,8 @@ construct_struct_from_values(StructTypeDef *def,
 
 intrusive_ptr<StructObject>
 construct_struct_boxed_from_values(StructTypeDef *def, const EvalValue *vals,
-                                  size_t nargs, const ArgLoc *locs)
+                                  size_t nargs, const ArgLoc *locs,
+                                  bool check_fit)
 {
     const size_t nfields = def->fields.size();
     auto obj = make_intrusive<StructObject>(def);
@@ -1372,7 +1430,8 @@ construct_struct_boxed_from_values(StructTypeDef *def, const EvalValue *vals,
         const Loc e = (i < nargs && locs) ? locs[i].end : Loc();
         /* an omitted trailing opt field binds to none */
         EvalValue v = i < nargs ? vals[i] : EvalValue();
-        obj->fields.emplace_back(coerce_struct_field(fd, std::move(v), s, e), false);
+        obj->fields.emplace_back(
+            coerce_struct_field(fd, std::move(v), s, e, check_fit), false);
     }
     return intrusive_ptr<StructObject>(obj);
 }
@@ -1399,7 +1458,8 @@ EvalValue vm_make_struct_array(StructTypeDef *def, size_t n,
 }
 
 static EvalValue
-construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
+construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args,
+                 bool check_fit)
 {
     const size_t nfields = def->fields.size();
     const size_t nargs = args->elems.size();
@@ -1437,7 +1497,8 @@ construct_struct(EvalContext *ctx, StructTypeDef *def, ExprList *args)
         /* an omitted trailing opt field binds to none */
         EvalValue v = i < nargs ? RValue(args->elems[i]->eval(ctx))
                                 : EvalValue();
-        obj->fields.emplace_back(coerce_struct_field(fd, std::move(v), s, e), false);
+        obj->fields.emplace_back(
+            coerce_struct_field(fd, std::move(v), s, e, check_fit), false);
     }
 
     return intrusive_ptr<StructObject>(obj);
@@ -1485,8 +1546,10 @@ EvalValue construct_struct_v(StructTypeDef *def, const ArgLocs *al,
         const Loc e = i < nargs ? al->arg(i)->end : al->end;
         /* an omitted trailing opt field binds to none */
         EvalValue v = i < nargs ? RValue(args[i]) : EvalValue();
-        obj->fields.emplace_back(coerce_struct_field(fd, std::move(v), s, e),
-                                 false);
+        /* a dyn callee: nothing was checked at compile time (#49) */
+        obj->fields.emplace_back(
+            coerce_struct_field(fd, std::move(v), s, e, /*check_fit=*/true),
+            false);
     }
 
     return EvalValue(intrusive_ptr<StructObject>(obj));
@@ -2274,7 +2337,8 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                 node->args->elems,
                 node->start,     /* call site = the CallExpr's location */
                 node->inline_ctx,/* virtual frames if this call is inlined */
-                ck, pc, as_signal
+                ck, pc, as_signal,
+                node->check_args()
             );
         }
 
@@ -2291,7 +2355,8 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                 throw SyntaxErrorEx(node->start,
                     "a pure function cannot construct a class instance "
                     "(each construction is a new object)");
-            return construct_struct(ctx, def, node->args.get());
+            return construct_struct(ctx, def, node->args.get(),
+                                    node->fit_args);
         }
 
     } catch (Exception &e) {
@@ -2349,7 +2414,9 @@ EvalValue DirectCallExpr::do_eval(EvalContext *ctx, bool rec) const
                     *fv.get<intrusive_ptr<FuncObject>>().get(),
                     args->elems,
                     start,
-                    inline_ctx
+                    inline_ctx,
+                    nullptr, 0, false,
+                    check_args()
                 );
             } catch (Exception &e) {
                 stamp_args_loc(e, args.get());
@@ -2380,7 +2447,8 @@ EvalValue CachedCallExpr::do_eval(EvalContext *ctx, bool rec) const
                     *fv.get<intrusive_ptr<FuncObject>>().get(),
                     args->elems,
                     start,
-                    inline_ctx
+                    inline_ctx,
+                    check_args()
                 );
             } catch (Exception &e) {
                 stamp_args_loc(e, args.get());   /* RULE 2: see above */
@@ -4876,6 +4944,11 @@ subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
         stamp_like_eval(sub, e);
         throw;
     }
+    /* #49: a store target's dict key that may misfit the declared key
+     * type - the key's caret, as the VM's CheckFitV */
+    if (sub->key_fit)
+        check_fit_loc(key, *sub->key_fit, sub->index->start,
+                      sub->index->end);
 
     SharedArrayObj *arr;
     if (!ctx->const_ctx && base.is<LValue *>()
@@ -5262,12 +5335,17 @@ EvalValue vm_coerce_decl_num(const EvalValue &v, bool is_float,
 void compute_bind_flags(const FuncDescriptor *d)
 {
     bool fast = true;
+    bool fit = false;
 
-    for (const auto &p : d->params)
+    for (const auto &p : d->params) {
         if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
             fast = false;
+        if (p.fit)
+            fit = true;
+    }
 
     d->fast_bind = fast;
+    d->fit_any = fit;
     d->bind_req.clear();
 
     if (fast)
@@ -6551,6 +6629,10 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
      * a parse-time stamp of a pure body may meet one that does not) */
     if (rv_coerce != DeclType::none)
         rval_storage = coerce_to_decl_type(rval_storage, rv_coerce);
+    /* #49: checked against the place's declared type where it may misfit
+     * - the value's caret, as the VM's CheckFitV */
+    if (rv_fit)
+        check_fit_loc(rval_storage, *rv_fit, rvalue->start, rvalue->end);
     const EvalValue &rval = rval_storage;
     IdList *idlist = nullptr;
 
@@ -6561,11 +6643,15 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
         if (!rval.is<SharedArrayObj>()) {
 
-            for (const auto &e: idlist->elems) {
-                if (e->is_id()
-                    && static_cast<Identifier *>(e.get())->is_underscore())
+            for (size_t i = 0; i < idlist->elems.size(); i++) {
+                Identifier *t = idlist->elems[i].get();
+                if (t->is_underscore())
                     continue;   /* `_` placeholder: skip */
-                handle_single_expr14(ctx, inDecl, op, e.get(), rval);
+                /* #49: what the target receives, checked before its
+                 * store - the value's caret, as the VM's CheckFitV */
+                if (const auto &f = idlist->fit_of(i))
+                    check_fit_loc(rval, *f, rvalue->start, rvalue->end);
+                handle_single_expr14(ctx, inDecl, op, t, rval);
             }
 
         } else {
@@ -6590,18 +6676,14 @@ EvalValue Expr14::do_eval(EvalContext *ctx, bool rec) const
 
             for (size_type i = 0; i < idlist->elems.size(); i++) {
 
-                if (idlist->elems[i]->is_id()
-                    && static_cast<Identifier *>(idlist->elems[i].get())
-                           ->is_underscore())
+                if (idlist->elems[i]->is_underscore())
                     continue;   /* `_` placeholder: skip this array slot */
 
-                handle_single_expr14(
-                    ctx,
-                    inDecl,
-                    op,
-                    idlist->elems[i].get(),
-                    arr_elem_boxed(arr, i)
-                );
+                const EvalValue elem = arr_elem_boxed(arr, i);
+                if (const auto &f = idlist->fit_of(i))
+                    check_fit_loc(elem, *f, rvalue->start, rvalue->end);
+                handle_single_expr14(ctx, inDecl, op,
+                                     idlist->elems[i].get(), elem);
             }
         }
 

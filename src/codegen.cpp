@@ -852,14 +852,33 @@ struct Codegen {
         slot = co.target;
     }
 
+    /* #49: a CheckFitV of `slot` against `spec` (null: none) - a stored
+     * value that may misfit its place's declared type, checked after its
+     * widening and before the store; `node` is the value (the caret) */
+    void emit_fit(const std::shared_ptr<const FitSpec> &spec, int slot,
+                  const Construct *node, std::vector<CgInstr> &ops)
+    {
+        if (!spec)
+            return;
+        CgInstr ck;
+        ck.op = OpCode::CheckFitV;
+        ck.node_idx = add_ast_node(node);
+        ck.target2 = static_cast<int>(chunk.fit_specs.size());
+        ck.set_a(slot_op(slot));
+        chunk.fit_specs.push_back(*spec);
+        ops.push_back(ck);
+    }
+
     /* A container store's KEY (a dict<float, _> stores an int key as a
-     * float - Subscript::key_coerce) and its VALUE (Expr14::rv_coerce). */
+     * float - Subscript::key_coerce) and its VALUE (Expr14::rv_coerce),
+     * each checked where it may misfit (#49: key_fit / rv_fit). */
     bool compile_key(const Subscript *sub, int &slot,
                      std::vector<CgInstr> &ops)
     {
         if (!compile_boxed_expr(sub->index.get(), slot, ops))
             return false;
         emit_widen(sub->key_coerce, slot, sub, ops);
+        emit_fit(sub->key_fit, slot, sub->index.get(), ops);
         return true;
     }
     bool compile_rvalue(const Expr14 *e, int &slot,
@@ -868,6 +887,7 @@ struct Codegen {
         if (!compile_boxed_expr(e->rvalue.get(), slot, ops))
             return false;
         emit_widen(e->rv_coerce, slot, e, ops);
+        emit_fit(e->rv_fit, slot, e->rvalue.get(), ops);
         return true;
     }
     bool compile_key_to_run_slot(const Subscript *sub, int dst,
@@ -885,6 +905,7 @@ struct Codegen {
             co.set_a(slot_op(dst));
             ops.push_back(co);
         }
+        emit_fit(sub->key_fit, dst, sub->index.get(), ops);
         return true;
     }
 
@@ -1938,6 +1959,7 @@ struct Codegen {
                 }
                 Chunk::BoxedCtor bc;
                 bc.def = bdef;
+                bc.fit = ce->fit_args;
                 for (const auto &a : ce->args->elems)
                     bc.arg_locs.push_back({ a->start, a->end });
                 const int dst = alloc_temp();
@@ -2664,7 +2686,7 @@ struct Codegen {
     {
         const LiteralArray *la =
             dynamic_cast<const LiteralArray *>(e->rvalue.get());
-        if (!la)
+        if (!la || !il->fits.empty())   /* a checked target (#49) */
             return false;
         const int n = static_cast<int>(il->elems.size());
         if (n == 0 || static_cast<int>(la->elems.size()) != n)
@@ -2719,7 +2741,7 @@ struct Codegen {
         const Construct *rv = e->rvalue.get();
         const bool scalar = rv->th == TypeHint::i || rv->th == TypeHint::f
                             || dynamic_cast<const Literal *>(rv);
-        if (!scalar)
+        if (!scalar || !il->fits.empty())   /* a checked target (#49) */
             return false;
         const int n = static_cast<int>(il->elems.size());
         if (n == 0)
@@ -2923,6 +2945,9 @@ struct Codegen {
             const bool coerce = compound_op == Op::invalid
                                 && (t->decl_type == DeclType::i
                                     || t->decl_type == DeclType::f);
+            /* #49: what the target receives may misfit its declared type
+             * - checked before its store, the targets before it written */
+            emit_fit(il->fit_of(i), src, e->rvalue.get(), ops);
             CgInstr st;
             st.target = t->sym.slot;
             if (t->sym.kind == SymKind::local) {
@@ -2973,7 +2998,9 @@ struct Codegen {
         if (n == 0)
             return false;
         bool any_coerce = false;
-        bool via_temps = false;
+        /* a target whose value is fit-checked (#49) stores through a temp
+         * too, so the check stands between the unpack and its store */
+        bool via_temps = !il->fits.empty();
         for (const auto &t : il->elems) {
             if (t->is_underscore())
                 continue;               /* `_` is a skipped slot */
@@ -3676,6 +3703,8 @@ struct Codegen {
             co.set_a(slot_op(slot));
             ops.push_back(co);
         }
+        emit_fit(i < al->arg_fit.size() ? al->arg_fit[i] : nullptr, slot,
+                 al->elems[i].get(), ops);
         return true;
     }
 
@@ -3709,7 +3738,8 @@ struct Codegen {
 
     /*
      * RULE 1: a call whose arguments may bind none to a non-opt parameter
-     * (CallExpr::none_arg_mask) gets a CheckNoneArgsV between its argument
+     * (CallExpr::none_arg_mask), or may misfit a typed one (#49,
+     * CallExpr::fit_args), gets a CheckNoneArgsV between its argument
      * run and the call op - every argument evaluated, no frame yet, which
      * is where a bind refuses. `kind` 0 = the callee value is in frame slot
      * `callee` (a CallValueV), 1 = global slot `callee` (a CallV). Its
@@ -3719,7 +3749,7 @@ struct Codegen {
     void emit_none_args_check(const CallExpr *call, int kind, int callee,
                               int argbase, std::vector<CgInstr> &ops)
     {
-        if (!call->may_bind_none())
+        if (!call->check_args())
             return;
         CgInstr chk;
         chk.op = OpCode::CheckNoneArgsV;
@@ -9384,6 +9414,7 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
                                       * carets ride base_locs / arg_locs) */
         case OpCode::LoadBoxV:       /* node = the `*b` (its TypeErrorEx) */
         case OpCode::StoreBoxV:      /* node = the `*b` (a misfit, const) */
+        case OpCode::CheckFitV:      /* node = the stored value (#49) */
         case OpCode::CallValueGenericV: /* node = the CallExpr: the CALL-SITE
                                      * loc (a FuncObject callee's backtrace via
                                      * do_func_call's loc_at); the op is now
@@ -9896,6 +9927,8 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::StoreBoxV:        /* *box = value: the box OBJECT changes,
                                     * no frame slot does */
         u(in.a_slot()); u(in.b_slot()); return true;
+    case OpCode::CheckFitV:        /* reads the value; no def (#49) */
+        u(in.a_slot()); return true;
     case OpCode::MakeArrayV:
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
@@ -12730,6 +12763,13 @@ void ChunkVerifier::verify_one(const Instr &in)
     case OpCode::StoreBoxV:
         a_slot_only(in);
         b_slot_only(in);
+        break;
+    case OpCode::CheckFitV:
+        /* #49: `a` the value's slot, `target2` its fit_specs entry */
+        a_slot_only(in);
+        pool(in.target2, ck.fit_specs.size(), "fit spec");
+        if (!ck.fit_specs[static_cast<size_t>(in.target2)].annot)
+            reject("fit spec annotation");
         break;
     case OpCode::CheckNoneArgsV:
         /* `target` = the callee's kind: 0 a frame slot, 1 a global slot */

@@ -801,20 +801,20 @@ vm_struct_ctor_planned(EvalContext &ctx, StructTypeDef *def,
  * reports the offending arg's caret (byte-identical to construct_struct). */
 static ML_NOINLINE EvalValue
 vm_struct_ctor_boxed(EvalContext &ctx, StructTypeDef *def, int_type base,
-                     int_type nargs, const ArgLoc *locs)
+                     int_type nargs, const ArgLoc *locs, bool check_fit)
 {
     if (nargs <= 16) {
         EvalValue vals[16];
         for (int_type i = 0; i < nargs; i++)
             vals[i] = ctx.frame->at(base + i).get();
         return EvalValue(construct_struct_boxed_from_values(
-            def, vals, static_cast<size_t>(nargs), locs));
+            def, vals, static_cast<size_t>(nargs), locs, check_fit));
     }
     std::vector<EvalValue> heapbuf(static_cast<size_t>(nargs));
     for (int_type i = 0; i < nargs; i++)
         heapbuf[i] = ctx.frame->at(base + i).get();
     return EvalValue(construct_struct_boxed_from_values(
-        def, heapbuf.data(), static_cast<size_t>(nargs), locs));
+        def, heapbuf.data(), static_cast<size_t>(nargs), locs, check_fit));
 }
 
 /* GENERIC N-level nested store (StoreElemChainV): gather the `nkeys` key values
@@ -5393,7 +5393,7 @@ extern "C" int jit_struct_ctor_boxed(int_type dst, int_type base,
     try {
         EvalValue v = vm_struct_ctor_boxed(
             *ctx, def, base, static_cast<int_type>(bc->arg_locs.size()),
-            bc->arg_locs.data());
+            bc->arg_locs.data(), bc->fit);
         ctx->frame->at(dst).put(std::move(v));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
@@ -6920,9 +6920,10 @@ extern "C" int jit_check_func(int_type slot) noexcept
  * the call's own error to raise. Each caller builds the refusal
  * (none_bind_error) and gives it its caret.
  */
-static int
+static BindFault
 vm_none_args_fault(EvalContext &ctx, int_type kind, int_type callee,
-                   int_type argbase, int_type nargs, const UniqueId *&param)
+                   int_type argbase, int_type nargs,
+                   const FuncDescriptor *&desc)
 {
     /* (the lines marked INT-COV-EXEMPT hold one Frame::at each, whose
      * bounds assert cannot fail: verify_chunk bounds both operands) */
@@ -6933,22 +6934,20 @@ vm_none_args_fault(EvalContext &ctx, int_type kind, int_type callee,
      * static type is one, and a named function is bound at scope entry) -
      * only a crafted image reaches the early return */
     if (!cv.is<intrusive_ptr<FuncObject>>())    /* INT-COV-EXEMPT */
-        return -1;
+        return BindFault();
     const FuncDescriptor *d = cv.get_ref<intrusive_ptr<FuncObject>>()->func;
+    desc = d;
     /* the op stands before a CallV or a CallValueV, whose callee's arity
      * the check pass proved against this call (a dyn callee takes the
      * generic op, which checks the count first) - so the count is in
      * range, and std::min only keeps a crafted image's mismatch in bounds
      * (it then refuses the none where the call would refuse the count) */
     const size_t n = std::min(static_cast<size_t>(nargs), d->params.size());
-    const int k = none_bind_fault_in_range(d, n,
+    return bind_fault_in_range(d, n,
         [&](size_t i) -> const EvalValue & {
             const int_type s = argbase + static_cast<int_type>(i);
             return ctx.frame->at(s).get();      /* INT-COV-EXEMPT: at() */
         });
-    if (k >= 0)
-        param = d->params[static_cast<size_t>(k)].name;
-    return k;
 }
 
 /* RULE 1: the native CheckNoneArgsV - a refusal conveys, and the op's
@@ -6957,12 +6956,13 @@ extern "C" int jit_check_none_args(int_type kind, int_type callee,
                                    int_type argbase, int_type nargs) noexcept
 {
     ML_JIT_OP_RAN(CheckNoneArgsV);
-    const UniqueId *param = nullptr;
-    const int k = vm_none_args_fault(*g_current_ctx, kind, callee, argbase,
-                                     nargs, param);
-    if (k < 0)
+    const FuncDescriptor *d = nullptr;
+    const BindFault f = vm_none_args_fault(*g_current_ctx, kind, callee,
+                                           argbase, nargs, d);
+    if (f.idx < 0)
         return 0;
-    g_vm_jit_exc = std::make_unique<TypeErrorEx>(none_bind_error(param, k));
+    g_vm_jit_exc = std::make_unique<TypeErrorEx>(
+        bind_fault_error(d, f, f.idx));
     return 1;
 }
 
@@ -6980,6 +6980,21 @@ extern "C" int jit_load_box(int_type box_slot, int_type dst, int_type want,
             f->at(box_slot).get(), static_cast<int>(want),
             static_cast<const StructTypeDef *>(def));
         f->at(dst).put(std::move(v));
+    } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* #49: the native CheckFitV - a misfit conveys a loc-less TypeErrorEx,
+ * stamped with the value's caret by the op's exc-stamp */
+extern "C" int jit_check_fit(int_type slot, const void *spec) noexcept
+{
+    ML_JIT_OP_RAN(CheckFitV);
+    try {
+        check_fit(g_current_ctx->frame->at(slot).get(),
+                  *static_cast<const FitSpec *>(spec));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -8114,13 +8129,14 @@ bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
     if (n > nparams || n < static_cast<size_t>(d->min_args))
         throw InvalidNumberOfArgsEx();
     /* RULE 1: a callback's argument (a dyn container's element) may be
-     * none - refused before the window is pushed */
-    const int nk = none_bind_fault_in_range(d, n,
+     * none, or (#49) misfit a typed parameter - refused before the window
+     * is pushed */
+    const BindFault nf = bind_fault_in_range(d, n,
                        [&](size_t i) -> const EvalValue & {
                            return argv[i];
                        });
-    if (nk >= 0)
-        throw_none_bind(d->params[static_cast<size_t>(nk)].name, -1);
+    if (nf.idx >= 0)
+        throw bind_fault_error(d, nf, -1);
 
     const int_type total =
         d->frame_size + static_cast<int_type>(cck->n_temps);
@@ -8288,7 +8304,9 @@ VmInvoker::VmInvoker(EvalContext *ctx, FuncObject &obj, Loc site)
     saved_gctx_ = g_current_ctx;
     g_current_ctx = c_;
     ready_ = true;
-    raw_ok_ = fast_bind_;
+    /* #49: a raw scalar bind checks nothing, so a callee with a fit check
+     * (a `str s` comparator fed a dyn array's ints) takes the boxed one */
+    raw_ok_ = fast_bind_ && !desc_->fit_any;
 }
 
 VmInvoker::~VmInvoker()
@@ -8518,13 +8536,15 @@ EvalValue VmInvoker::invoke(const EvalValue *argv, size_t n)
     if (n > nparams || n < min_args_)
         throw InvalidNumberOfArgsEx();
     /* RULE 1: a boxed callback argument may be none (a general array's
-     * element); the raw-scalar binds (call_scalars) cannot carry one */
-    const int nk = none_bind_fault_in_range(d, n,
+     * element), or (#49) misfit a typed parameter; the raw-scalar binds
+     * (call_scalars) cannot carry either - raw_ok_ excludes a callee
+     * with a fit check */
+    const BindFault nf = bind_fault_in_range(d, n,
                        [&](size_t i) -> const EvalValue & {
                            return argv[i];
                        });
-    if (nk >= 0)
-        throw_none_bind(d->params[static_cast<size_t>(nk)].name, -1);
+    if (nf.idx >= 0)
+        throw bind_fault_error(d, nf, -1);
 
     if (fast_bind_) {
         for (size_t i = 0; i < n; i++)
@@ -8885,6 +8905,22 @@ vm_load_box(EvalContext &ctx, const Instr &in, const Chunk &chunk, size_t pc)
     }
 }
 
+/* #49: the interpreted CheckFitV - check_fit's refusal takes the op's
+ * caret (the stored value, from the loc side table). Out of line: the
+ * dispatch loop's frame stays small. */
+static ML_NOINLINE void
+vm_check_fit_op(EvalContext &ctx, const Instr &in, const Chunk &chunk,
+                size_t pc)
+{
+    try {
+        check_fit(ctx.frame->at(in.a_slot()).get(),
+                  chunk.fit_specs[static_cast<size_t>(in.target2)]);
+    } catch (Exception &e) {
+        vm_stamp_loc(chunk, pc, e);
+        throw;
+    }
+}
+
 static ML_NOINLINE void
 vm_store_box(EvalContext &ctx, const Instr &in, const Chunk &chunk,
              size_t pc)
@@ -8909,12 +8945,12 @@ static ML_NOINLINE void
 vm_check_none_args(EvalContext &ctx, const Instr &in, const Chunk &chunk,
                    size_t pc)
 {
-    const UniqueId *param = nullptr;
-    const int k = vm_none_args_fault(ctx, in.target, in.target2, in.a_lit(),
-                                     in.b_lit(), param);
-    if (k < 0)
+    const FuncDescriptor *d = nullptr;
+    const BindFault f = vm_none_args_fault(ctx, in.target, in.target2,
+                                           in.a_lit(), in.b_lit(), d);
+    if (f.idx < 0)
         return;
-    TypeErrorEx e = none_bind_error(param, k);
+    TypeErrorEx e = bind_fault_error(d, f, f.idx);
     vm_stamp_setup_caret(e, chunk, pc);
     throw e;
 }
@@ -10586,14 +10622,13 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
          * check, conveyed with the same args caret */
         const FuncDescriptor *gd =
             callee.get_ref<intrusive_ptr<FuncObject>>()->func;
-        const int nk = none_bind_fault(gd, n,
+        const BindFault nf = bind_fault(gd, n,
             [&](size_t i) -> const EvalValue & {
                 const int_type s = argbase + static_cast<int_type>(i);
                 return ctx.frame->at(s).get();  /* INT-COV-EXEMPT: at() */
             });
-        if (nk >= 0) {
-            TypeErrorEx e = none_bind_error(
-                gd->params[static_cast<size_t>(nk)].name, nk);
+        if (nf.idx >= 0) {
+            TypeErrorEx e = bind_fault_error(gd, nf, nf.idx);
             vm_stamp_args_caret(e, al);
             g_vm_jit_exc.reset(e.clone());
             return 2;
@@ -13185,7 +13220,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             ctx.frame->at(in->target).put(vm_struct_ctor_boxed(
                 ctx, def, in->a_lit(),
                 static_cast<int_type>(bc.arg_locs.size()),
-                bc.arg_locs.data()));
+                bc.arg_locs.data(), bc.fit));
             pc++;
         }
         VM_NEXT;
@@ -13704,15 +13739,14 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                      * now - every such call checks (a slow path already);
                      * the catch below stamps the argument's caret */
                     /* INT-COV-EXEMPT, the at() line: its bounds assert */
-                    const int nk = none_bind_fault(fo.func, nargs,
+                    const BindFault nf = bind_fault(fo.func, nargs,
                         [&](size_t i) -> const EvalValue & {
                             const int_type s =
                                 argbase + static_cast<int_type>(i);
                             return ctx.frame->at(s).get(); /* INT-COV-EXEMPT */
                         });
-                    if (nk >= 0)
-                        throw_none_bind(fo.func->params[
-                            static_cast<size_t>(nk)].name, nk);
+                    if (nf.idx >= 0)
+                        throw bind_fault_error(fo.func, nf, nf.idx);
                     if (!fo.func->vm_chunk_tried) {   /* AOT net */
                         fo.func->vm_chunk = vm_func_chunk(fo.func);
                         fo.func->vm_chunk_tried = true;
@@ -13836,6 +13870,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
 
         VM_CASE(LoadBoxV):
             vm_load_box(ctx, *in, *chunk, pc);
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(CheckFitV):
+            /* #49: a stored value that may misfit its place's type */
+            vm_check_fit_op(ctx, *in, *chunk, pc);
             pc++;
             VM_NEXT;
 

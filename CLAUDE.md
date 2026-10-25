@@ -4649,6 +4649,59 @@ decisions behind it: `plans/archived/type-inference.md`,
   arrived). A FRESH `var r = 3 + d` (only a dyn contribution) correctly stays
   `dyn` → `DynRequiredEx`; `var dyn r = 3 + d` holds the actual result.
   (`TypeSym::{round_got_dyn,coerces_dyn,decl_id}`.)
+- **⛔ A `dyn` VALUE ENTERING A TYPED PLACE IS CHECKED AT RUN TIME, BY
+  ONE FUNCTION (#49, 2026-10-12; README *A `dyn` value entering a typed
+  place*).** `value_fits(v, annot, FitMisfit *)` (types/fit.cpp.h) is
+  the only answer to "does this value fit that declared type"; every
+  engine calls it, so the refusals and their messages agree
+  (`fit_error` renders one). Its walk is bounded by the ANNOTATION, not
+  the value - a struct or class is a def identity test, a flat array is
+  its storage kind, a `dyn` element stops it - so it needs no cycle
+  guard; a container met twice at one annotation is walked once (an
+  array keyed by its WINDOW, as the cycle guard keys it: two slices of
+  one storage are two values). **Whether a site checks is decided statically, by
+  `fit_needed(value_type, place_type, top)`** (inferencer.cpp): at the
+  top level an int / float place is the numeric coercion's job, below
+  it a `dyn` or unknown element counts. The homes, one per place:
+  a call's bind (`ParamDesc::fit`, gated per call by
+  `CallExpr::fit_args`, which `check_args()` folds into the
+  CheckNoneArgsV mask - so a fit failure is a BIND fault like the none
+  one), a struct constructor's field (`BoxedCtor.fit`), an element /
+  field / dict-value store and a store into a variable whose type is
+  declared (`Expr14::rv_fit` - a variable's only for a value with a
+  `dyn` INSIDE, `Place::var`: a `dyn` itself is refused statically),
+  each declared target of a multi-assignment (`IdList::fits`, checked
+  just before that target's store - the VM unpacks such a statement
+  into temps, `emit_multi_via_temps`), a
+  dict key (`Subscript::key_fit`) and an in-place builtin's stored
+  argument
+  (`ExprList::arg_fit` / `fit_of(i)`), each a `FitSpec` (structtype.h:
+  the annotation, the place, its name). The tree-walker calls
+  `check_fit_loc` where the store or bind happens (the append path in
+  builtins/arr.cpp.h too - it evaluates its own argument); the VM emits
+  **`CheckFitV`** on the value's slot (`emit_fit`, its spec in
+  `Chunk::fit_specs`, `.myv` v37), whose native form is
+  `jit_check_fit`, conveying and exc-stamped. A COMPOUND store whose
+  result may misfit is refused at compile time
+  (`refuse_compound_misfit`, for an element, a field, a declared
+  variable and each declared multi-assignment target): the result is
+  computed in the store, past any point a check could stand. **A new
+  place a value can enter - a new store form, a new in-place builtin, a
+  new bind path - takes a FitSpec and a check through `value_fits`**,
+  or a `dyn` launders a wrong value into it. The bytecode inliner does
+  not paste a body holding CheckFitV (its index names the callee's
+  pool). The gap left on purpose: a container reached through a `dyn`
+  NAME is not a typed place, so `var dyn d = rows; d[0] = v` is
+  unchecked. **Under `-nti` the BIND and CONSTRUCTOR checks still run**
+  (`ParamDesc::fit` and `FieldDef::annot` are the declaration's, an
+  unstamped call keeps `fit_args`, and every `-nti` call takes the
+  generic op, which always checks - the none check's rule), **while no
+  store is checked** (rv_fit / key_fit / arg_fit / IdList::fits are
+  inference's stamps). A functional program must exit 0 under -nti
+  too, so one asserting a STORE refusal gates it on a typed run (93's
+  `typed`, `typestr(runtime(0)) == "dyn"`). Net:
+  `tests/functional/93_dyn_fit.my` (every place, refused and fitting,
+  old value kept).
 - **AN ASSIGNMENT'S VALUE IS THE STORED VALUE (2026-10-05).** `type_of`
   of `t = v` is v's type WIDENED to the target's numeric static type
   (`numeric_widen`: int/bool into float, bool into int), for a variable,
@@ -6238,16 +6291,17 @@ payoff.
   EVERY ARGUMENT before the arity check and the binds, as the VM's staged
   run always did - it used to evaluate each argument just before its own
   bind, so a refusal skipped a later argument's side effect); the generic
-  dyn-callee op and the callback invoker (`none_bind_fault`, eval.h); and
+  dyn-callee op and the callback invoker (`bind_fault`, eval.h); and
   for `CallV`/`CachedCallV`/`CallValueV`, whose native tiers bind raw, a
   `CheckNoneArgsV` that codegen emits before the call ONLY where
-  `CallExpr::may_bind_none()` holds (docs/vm-ops.md has the rules). The
+  `CallExpr::check_args()` holds - a none, or (#49) a misfit, may reach
+  the bind (docs/vm-ops.md has the rules). The
   AST inliner keeps such a call a call (`Inliner::binds_none`). **Two
   facts other passes may lean on:** a non-opt parameter never written in
   its body cannot hold none (the inferencer's mask and the inliner clear
   such an argument), and an operator chain or a non-none literal cannot
   evaluate to none (`CallExpr::arg_never_none`). A new bind path must
-  call `none_bind_fault` or sit behind the op; a new call op that binds
+  call `bind_fault` or sit behind the op; a new call op that binds
   raw must be preceded by it.
 - **⛔ `&&` / `||` SHORT-CIRCUIT — in THREE places that must agree (#138,
   2026-08-09).** The determining operand (false for `&&`, true for `||`) stops

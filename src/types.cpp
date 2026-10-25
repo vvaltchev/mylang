@@ -11,6 +11,7 @@
 #include "env.h"      /* env_get - shared by builtins/io.cpp.h (tmpdir) */
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "evaltypes.cpp.h"
 #include "types/int.cpp.h"
@@ -87,6 +88,8 @@ std::string runtime_type_name(const EvalValue &v)
 {
     return std::string(TypeNames[v.get_type()->t].get_view());
 }
+
+#include "types/fit.cpp.h"
 
 EvalValue builtin_exit(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
@@ -568,15 +571,27 @@ EvalValue builtin_lv_adapter(EvalContext *ctx, ExprList *exprList)
     return FLV(ctx, &al, target, nullptr, 0);
 }
 
+/* #49: an argument an in-place builtin stores (append's value, insert's
+ * key and value) checked against the container's declared type where it
+ * may misfit (ExprList::arg_fit) - the VM's CheckFitV on its run slot */
+static inline void lv_arg_fit(const ExprList *el, size_t i,
+                              const EvalValue &v)
+{
+    if (const FitSpec *f = el->fit_of(i))
+        check_fit_loc(v, *f, el->elems[i]->start, el->elems[i]->end);
+}
+
 /* Cold >8-rest path for the REST-NATIVE lvalue adapter (heap arg buffer). */
 static ML_NOINLINE EvalValue
 builtin_lv_v_adapter_big(decltype(Builtin::func_lv) flv, EvalContext *ctx,
                          ExprList *exprList, LValue *target, size_t n_rest)
 {
     std::vector<EvalValue> heapbuf(n_rest);
-    for (size_t i = 0; i < n_rest; i++)
+    for (size_t i = 0; i < n_rest; i++) {
         heapbuf[i] = literal_widen(RValue(exprList->elems[i + 1]->eval(ctx)),
                                    exprList->widen_of(i + 1));
+        lv_arg_fit(exprList, i + 1, heapbuf[i]);
+    }
     std::vector<ArgLoc> locbuf(exprList->elems.size());
     ArgLocs al = build_arglocs(exprList, locbuf.data(), locbuf.size());
     return flv(ctx, &al, target, heapbuf.data(), n_rest);
@@ -605,9 +620,11 @@ EvalValue builtin_lv_v_adapter(EvalContext *ctx, ExprList *exprList)
     if (n_rest > 8)
         return builtin_lv_v_adapter_big(FLV, ctx, exprList, target, n_rest);
     EvalValue stackbuf[8];
-    for (size_t i = 0; i < n_rest; i++)
+    for (size_t i = 0; i < n_rest; i++) {
         stackbuf[i] = literal_widen(RValue(exprList->elems[i + 1]->eval(ctx)),
                                     exprList->widen_of(i + 1));
+        lv_arg_fit(exprList, i + 1, stackbuf[i]);
+    }
     ArgLoc locbuf[8];
     ArgLocs al = build_arglocs(exprList, locbuf, total < 8 ? total : 8);
     return FLV(ctx, &al, target, stackbuf, n_rest);

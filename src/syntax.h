@@ -865,6 +865,15 @@ public:
     {
         return i < arg_widen.size() ? arg_widen[i] : DeclType::none;
     }
+    /* #49: per argument (empty == none), the same builtins' STORED value
+     * that may misfit the container's declared element / key / value type
+     * - checked after arg_widen, before the builtin runs (the tree-walker's
+     * adapters, the VM's CheckFitV on the argument's run slot). */
+    std::vector<std::shared_ptr<const FitSpec>> arg_fit;
+    const FitSpec *fit_of(size_t i) const
+    {
+        return i < arg_fit.size() ? arg_fit[i].get() : nullptr;
+    }
 
     ExprList()
         : MultiElemConstruct<>("ExprList",
@@ -877,6 +886,7 @@ public:
         clone_elems_into(*c);
         c->arg_names = arg_names;
         c->arg_widen = arg_widen;
+        c->arg_fit = arg_fit;
         return c;
     }
 };
@@ -884,6 +894,20 @@ public:
 class IdList final: public MultiElemConstruct<Identifier> {
 
 public:
+
+    /* #49: per target of a multi-assignment (empty == none), what it
+     * receives may misfit its DECLARED type - an array<dyn> element into
+     * an array<int> variable. Checked (value_fits) just before that
+     * target's store, so a refusal leaves it and the targets after it
+     * unwritten, as a failing coercion does: the tree-walker's
+     * handle_single_expr14, the VM's CheckFitV on the unpack temp.
+     * Stamped by annotate_hints (Inferencer::store_fit). */
+    std::vector<std::shared_ptr<const FitSpec>> fits;
+    const std::shared_ptr<const FitSpec> &fit_of(size_t i) const
+    {
+        static const std::shared_ptr<const FitSpec> none;
+        return i < fits.size() ? fits[i] : none;
+    }
 
     IdList()
         : MultiElemConstruct<Identifier>("IdList", ConstructType::idlist)
@@ -893,6 +917,7 @@ public:
         auto c = make_unique<IdList>();
         copy_base_fields(*c);
         clone_elems_into(*c);
+        c->fits = fits;
         return c;
     }
 };
@@ -1065,6 +1090,19 @@ public:
     uint32_t none_arg_mask = ~0u;
 
     /*
+     * #49: some argument may MISFIT its parameter's declared type at run
+     * time - a `dyn` value (or a container with a `dyn` element) reaching
+     * a parameter whose ParamDesc::fit the bind must check (value_fits).
+     * Stamped by annotate_hints (Inferencer::call_fit_args). The same
+     * consumers as none_arg_mask: the tree-walker's bind checks fits only
+     * at such a call, codegen emits CheckNoneArgsV before it (which checks
+     * fits too), and the AST inliner keeps it a call. DEFAULT TRUE for the
+     * same reason that mask defaults to every bit: an unstamped call keeps
+     * the check.
+     */
+    bool fit_args = true;
+
+    /*
      * Parsed inside a `const` declaration's initializer: the one place a
      * CLASS instance may be made at compile time (plans/class-and-box.md -
      * anywhere else, folding or de-duplicating the construction would merge
@@ -1110,6 +1148,10 @@ public:
         return false;
     }
 
+    /* the bind must check its arguments: a none for a non-opt parameter
+     * or a misfit for a typed one (#49) */
+    bool check_args() const { return fit_args || may_bind_none(); }
+
     CallExpr() : Construct("CallExpr", false, ConstructType::call) { }
     explicit CallExpr(const char *name)
         : Construct(name, false, ConstructType::call) { }
@@ -1139,6 +1181,7 @@ public:
         d.tq_folded = tq_folded;
         d.callable_arg_mask = callable_arg_mask;
         d.none_arg_mask = none_arg_mask;
+        d.fit_args = fit_args;
         d.in_const_decl = in_const_decl;
     }
 
@@ -1581,6 +1624,13 @@ public:
      * target widens its rvalue through rv_coerce instead). Read only where
      * the value is used: the tree-walker's result, the VM's value form. */
     DeclType val_widen = DeclType::none;
+    /* #49: the store's VALUE may misfit its place's declared type - a
+     * `dyn` (or a container with a `dyn` element) stored into an element,
+     * a dict value or a container / box field whose type is fixed. Checked
+     * (value_fits) after rv_coerce and before the store, with the value's
+     * caret: the tree-walker's handle_single_expr14, the VM's CheckFitV.
+     * Stamped by annotate_hints (Inferencer::store_fit); null: no check. */
+    std::shared_ptr<const FitSpec> rv_fit;
 
     Expr14()
         : Construct("Expr14", false, ConstructType::expr14)
@@ -1599,6 +1649,7 @@ public:
         c->unpack_rv_th = unpack_rv_th;
         c->rv_coerce = rv_coerce;
         c->val_widen = val_widen;
+        c->rv_fit = rv_fit;
         return c;
     }
 };
@@ -1755,6 +1806,45 @@ public:
     }
 };
 
+/*
+ * #49: a parameter's ParamDesc::fit - its declared type as a run-time
+ * annotation, for a declaration a `dyn` argument can misfit: `bool`,
+ * `str`, a struct, a container (generic or parameterized) or a box. Null
+ * for an untyped or `dyn` parameter and for `int` / `float`, whose bind
+ * converts (and refuses what it cannot).
+ */
+inline std::shared_ptr<const TypeAnnot> param_fit_annot(const Identifier *p)
+{
+    if (p->dyn_mod)
+        return nullptr;
+    std::shared_ptr<TypeAnnot> t;
+    switch (p->decl_type) {
+    case DeclType::b: case DeclType::s:
+        t = std::make_shared<TypeAnnot>();
+        t->kind = p->decl_type;
+        break;
+    case DeclType::strct:
+        if (!p->decl_struct)
+            return nullptr;
+        t = std::make_shared<TypeAnnot>();
+        t->kind = DeclType::strct;
+        t->strct = p->decl_struct;
+        break;
+    case DeclType::arr: case DeclType::dict: case DeclType::box:
+        if (p->decl_annot)
+            t = std::make_shared<TypeAnnot>(*p->decl_annot);
+        else {
+            t = std::make_shared<TypeAnnot>();
+            t->kind = p->decl_type;
+        }
+        break;
+    default:
+        return nullptr;
+    }
+    t->opt = p->opt_mod;
+    return t;
+}
+
 class FuncDeclStmt final: public Construct {
 
 public:
@@ -1855,6 +1945,7 @@ public:
                         reflect_decl_annot(p->decl_type, p->decl_struct,
                                            p->decl_annot.get(),
                                            p->opt_mod));
+                desc->params.back().fit = param_fit_annot(p);
                 if (!p->opt_mod)
                     desc->min_args = static_cast<int>(i) + 1;
             }
@@ -1973,6 +2064,11 @@ public:
      * index's: the key widens to it (i/f) - so an int stored under a
      * dict<float, _> is a float key, as its type says (#75 follow-up). */
     DeclType key_coerce = DeclType::none;
+    /* #49: the store TARGET's dict key may misfit the dict's declared key
+     * type (a `dyn` key into a dict<str, _>) - checked after key_coerce,
+     * before the store (subscript_store, the VM's CheckFitV after the
+     * key). Stamped only on a store target; null: no check. */
+    std::shared_ptr<const FitSpec> key_fit;
 
     Subscript() : Construct("Subscript", false, ConstructType::subscript) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -1990,6 +2086,7 @@ public:
         c->base_dict = base_dict;
         c->elem_bool = elem_bool;
         c->key_coerce = key_coerce;
+        c->key_fit = key_fit;
         return c;
     }
 };

@@ -1593,6 +1593,68 @@ slot = "now a string";           # ok, because it's dyn
                       # be none - g's body never runs
     ```
 
+    **A `dyn` value entering a typed place is checked.** The same holds
+    for every type, not only for `none`: when a `dyn` value - or a
+    container whose element type is `dyn` - goes where a type was
+    declared, the value is checked against that type when it gets
+    there, and a value that does not fit raises a `TypeErrorEx` before
+    anything is stored or bound. The places are:
+
+      * an argument bound to a typed parameter (`array<int> a`, `P p`,
+        `str s`, `box<int> b`, a class);
+      * a field given to a struct or class constructor;
+      * a store into an element (`a[i] = d`), a dict value (`m[k] = d`)
+        or a dict key (`m[d] = v`), and a store into a container field
+        (`s.v = d` for an `array<int> v` field);
+      * a value given to `append`, `push` or `insert`, which store it
+        into the array or dict;
+      * a value assigned to a variable declared with a type, when the
+        value's type has a `dyn` inside (an `array<dyn>` into an
+        `array<int> v`) - a value whose type is `dyn` itself is refused
+        at compile time there. A multi-assignment checks what each
+        declared target receives, just before that target is stored:
+        `a, b = rows` with `rows[1]` not fitting `b` stores `a` and
+        leaves `b` as it was, as a failing conversion does.
+
+    The check goes as deep as the declared type does: an `array<int>`
+    checks each element of the array, a `dict<str, array<int>>` each
+    key, each value and each value's elements. A struct or class is
+    checked by its type alone (its fields were checked when they were
+    stored), and a `dyn` element type stops the check. The message
+    names the place and the first part that does not fit, and the caret
+    marks the value:
+
+    ```
+    func takes(array<int> a) => len(a);
+    var dyn d = runtime(["x"]);
+    takes(d);         # TypeErrorEx: parameter 'a' is declared
+                      # 'array<int>' but the argument's [0] is a 'str'
+    array<str> names = ["ann"];
+    names[0] = runtime(5);    # TypeErrorEx: the element is declared
+                              # 'str' but the value is an 'int'
+    ```
+
+    `none` fits only an `opt` place (`array<str?>`). A value that fits
+    is stored as it is, and an `int` or `float` place converts a `dyn`
+    number as described above.
+
+    A compound assignment into an element, a field or a variable
+    declared with a type (`a[i] += d`, `v += r`, `a, b += rows`) is
+    refused at compile time when its result may not fit the place:
+    the operation's result cannot be checked before the store, so the
+    compiler asks for the plain form, `a[i] = a[i] + d`, which is
+    checked. The check is made where a value ENTERS a typed place, so
+    one gap remains: a container reached through a `dyn` name is not a
+    typed place, and `var dyn d = rows; d[0] = ["x"]` stores into the
+    `array<array<int>>` that `rows` names without a check.
+
+    With type inference disabled (`-nti`) the parameter and constructor
+    checks still run - the declaration alone decides them, as it does
+    the `none` check - but no store is checked, since inference is what
+    finds the place's declared type. A literal is not converted to its
+    place either, so `half([1, 2.5])` into an `array<float>` parameter
+    is refused there: its first element is an `int`.
+
 #### Null-checks are understood (narrowing)
 
 After you check a nullable value against `none`, it is treated as non-`none` in

@@ -288,38 +288,22 @@ expected '>' to close 'box<...>' 'x'
 
     *av;
     ^^^
->> >> >> TypeErrorEx: '*' expected a box<int>, got a box<str> at line 95, col 31:33
+>> >> >> TypeErrorEx: parameter 'x' is declared 'box<int>' but the argument is a 'box<str>' at line 97, col 4:6
 
-    func wi(box<int> x) { int r = *x; return r; };
-                                  ^^
+    wi(sb);
+       ^^
+>> TypeErrorEx: parameter 'x' is declared 'box<int>' but the argument is a 'box<P>' at line 98, col 4:6
 
-Backtrace (most recent call first):
-  [0] wi(x)  at line 95
-  [1] main() at line 97
->> TypeErrorEx: '*' expected a box<int>, got a box<P> at line 95, col 31:33
+    wi(dp);
+       ^^
+>> TypeErrorEx: parameter 'x' is declared 'box<P>' but the argument is a 'box<str>' at line 99, col 4:6
 
-    func wi(box<int> x) { int r = *x; return r; };
-                                  ^^
+    wp(sb);
+       ^^
+>> TypeErrorEx: parameter 'x' is declared 'box<P>' but the argument is a 'P' at line 100, col 4:6
 
-Backtrace (most recent call first):
-  [0] wi(x)  at line 95
-  [1] main() at line 98
->> TypeErrorEx: '*' expected a box<P>, got a box<str> at line 96, col 27:29
-
-    func wp(box<P> x) { P r = *x; return r.x; };
-                              ^^
-
-Backtrace (most recent call first):
-  [0] wp(x)  at line 96
-  [1] main() at line 99
->> TypeErrorEx: '*' expected a box<P>, got a P at line 96, col 27:29
-
-    func wp(box<P> x) { P r = *x; return r.x; };
-                              ^^
-
-Backtrace (most recent call first):
-  [0] wp(x)  at line 96
-  [1] main() at line 100
+    wp(pv);
+       ^^
 >> => 1
 >> >> => box("s1")
 >> TypeErrorEx: struct field 'i' got a value of the wrong type at line 104, col 3:5
