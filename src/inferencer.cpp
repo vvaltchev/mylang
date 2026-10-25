@@ -6447,11 +6447,14 @@ void Inferencer::contribute_to_lvalue(Construct *lv, StaticTypeRef ct)
         if (ctag(mem->what.get()) == ConstructType::id) {
             auto *bid = static_cast<Identifier *>(mem->what.get());
             auto it = id_sym.find(bid);
+            /* an element store, as `d["k"] = v` is (contribute_elem): a
+             * plain contribution refused `d.k = 1` into a declared
+             * dict<str, float> as "assigned dict<str,int>" */
             if (it != id_sym.end() && it->second &&
                 static_type_resolve(it->second->type)->kind ==
                     StaticTypeKind::Dict)
-                contribute(it->second, A.dict_of(A.str_ty(), ct), bid->start,
-                           bid->end);
+                contribute_elem(it->second, A.dict_of(A.str_ty(), ct),
+                                bid->start, bid->end);
         }
         return;
     }

@@ -6,7 +6,9 @@
 # garbage in a release build. A default dict reached through such a
 # handle may still be shared, so its new key is still inserted; and a
 # default dict's `d.k` read inserts the default in every engine (README),
-# where the VM's member read only returned it.
+# where the VM's member read only returned it. And `d.k = v` into a
+# declared dict is an element store like `d["k"] = v`: it widens, where
+# it was refused as a store of the whole dict<str,int>.
 func mk() => {"k": 1, "n": none};
 func mkd(v) => dict(v);
 
@@ -41,4 +43,10 @@ var arr = [s];
 arr[0]["k"] = 5;
 arr[0].j = 6;
 assert(s["k"] == 5 && s.j == 6);
+# a member store into a declared dict: an element store that widens
+dict<str, float> df = {};
+df.k = 1;
+df.k += 2;
+df.j = true;
+assert(df.k == 3 && df["j"] == 1);
 print("ok");
