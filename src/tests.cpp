@@ -22907,6 +22907,79 @@ static bool lineedit_multiline_enter_inserts_newline()
     return ed.feed(13) == LineEditor::Action::submit;
 }
 
+/*
+ * The REPL's Joiner (run_repl): a COMPLETE input ending with an `if` /
+ * `try` chain whose last block closed over several lines stays open for
+ * an `else` / `catch` / `finally` on the next line, as in a script - Enter
+ * on the `}` adds a line at the END of the buffer (wherever the cursor
+ * is), an empty line there submits, and a chain closed on one line, a
+ * bare `else` or a `finally` submit at once.
+ */
+static bool lineedit_joiner_keeps_chain_open()
+{
+    const auto setup = [](LineEditor &ed) {
+        ed.set_submitter([](const std::string &s) {
+            return !ReplEngine::is_incomplete(s);
+        });
+        ed.set_joiner([](const std::string &s, const std::string *n) {
+            return n ? ReplEngine::continues_chain(*n)
+                     : ReplEngine::may_continue(s, true);
+        });
+    };
+    const auto lines = [](LineEditor &ed,
+                          std::initializer_list<const char *> ls) {
+        LineEditor::Action a = LineEditor::Action::none;
+        for (const char *l : ls) {
+            le_feed(ed, l);
+            a = ed.feed(13);
+        }
+        return a;
+    };
+    using A = LineEditor::Action;
+
+    LineEditor e1;
+    setup(e1);
+    if (lines(e1, { "if (x) {", "f()", "}" }) != A::none
+        || !e1.last_line_blank())
+        return false;                    /* kept open, a new empty line */
+    if (lines(e1, { "else {", "g()", "}" }) != A::submit)
+        return false;                    /* a bare else ends the chain */
+
+    LineEditor e2;
+    setup(e2);
+    if (lines(e2, { "if (x) {", "f()", "}" }) != A::none
+        || e2.feed(13) != A::submit)
+        return false;                    /* an empty line submits */
+
+    LineEditor e3;
+    setup(e3);
+    if (lines(e3, { "if (x) { f() }" }) != A::submit)
+        return false;                    /* closed on one line: at once */
+
+    LineEditor e4;
+    setup(e4);
+    e4.set_buffer("if (x) {\n  f()\n}");
+    e4.feed(16);                         /* Ctrl-P: the cursor on line 1 */
+    if (e4.feed(13) != A::none || e4.buffer() != "if (x) {\n  f()\n}\n")
+        return false;                    /* the line goes at the END */
+
+    LineEditor e5;
+    setup(e5);
+    if (lines(e5, { "try {", "f()", "}" }) != A::none
+        || lines(e5, { "catch (E as e) {", "g()", "}" }) != A::none
+        || lines(e5, { "finally {", "h()", "}" }) != A::submit)
+        return false;                    /* try, catch open; finally ends */
+
+    LineEditor e6;
+    setup(e6);
+    if (lines(e6, { "func f(a) {", "if (a) {", "return 1", "}", "}" })
+            != A::submit)
+        return false;                    /* the last block is a body */
+    LineEditor e7;
+    setup(e7);
+    return lines(e7, { "while (x) {", "f()", "}" }) == A::submit;
+}
+
 static bool lineedit_multiline_cursor_and_nav()
 {
     LineEditor ed;
@@ -56843,6 +56916,8 @@ static const std::vector<extra_check> extra_checks =
     { "lineedit: Up/Down history navigation", lineedit_history_nav },
     { "lineedit: Enter inserts a newline until complete (multi-line)",
       lineedit_multiline_enter_inserts_newline },
+    { "lineedit: the REPL keeps an if/try chain open for an else on the "
+      "next line", lineedit_joiner_keeps_chain_open },
     { "lineedit: 2-D cursor + within-block Up/Down",
       lineedit_multiline_cursor_and_nav },
     { "lineedit: line-relative Home/End/kill in a block",

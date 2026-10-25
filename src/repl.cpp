@@ -515,7 +515,26 @@ repl_auto_terminate(const string &src)
     bool in_string = false;           /* a string spanning physical lines */
     bool in_comment = false;          /* a block comment spanning lines */
 
-    for (const string &line : phys) {
+    /* the next line holding code starts with `else` / `catch` / `finally`:
+     * the block a line closes is then not the statement's end (`}` on one
+     * line, `else {` on the next, as a script may have it) */
+    const auto next_continues = [&](size_t i) {
+        for (size_t j = i + 1; j < phys.size(); j++) {
+            std::vector<Tok> t;
+            try {
+                lexer(phys[j], 1, t);
+            } catch (...) {
+                return false;
+            }
+            if (!t.empty())
+                return t[0] == Keyword::kw_else || t[0] == Keyword::kw_catch
+                    || t[0] == Keyword::kw_finally;
+        }
+        return false;
+    };
+
+    for (size_t li = 0; li < phys.size(); li++) {
+        const string &line = phys[li];
 
         /* A line wholly inside a multi-line string / comment is passed through
          * verbatim - never lex it (it is not code) or terminate it. */
@@ -563,6 +582,7 @@ repl_auto_terminate(const string &src)
             open_value = true;
 
         const Tok *last = nullptr;
+        bool closed_block = false;        /* the last `}` closed a block */
         for (const auto &t : toks) {
             if (t == Op::braceL) {
                 const char kind = expects_value ? 'D' : 'B';
@@ -589,6 +609,7 @@ repl_auto_terminate(const string &src)
                     stack.pop_back();
                 expects_value = false;
                 open_value = (kind == 'D');   /* a dict literal is a value */
+                closed_block = (kind == 'B');
             } else if (t == Op::parenR || t == Op::bracketR) {
                 if (!stack.empty())
                     stack.pop_back();
@@ -617,7 +638,9 @@ repl_auto_terminate(const string &src)
          * the next line). */
         const bool ends_in_value =
             last ? !repl_continuation_op(last->op) : closed_string;
-        if (!open_at_end && stmt_ctx && ends_in_value) {
+        const bool chain_goes_on = last && *last == Op::braceR
+            && closed_block && next_continues(li);
+        if (!open_at_end && stmt_ctx && ends_in_value && !chain_goes_on) {
             semis.push_back(semi_before(code_end));
             open_value = false;
         }
@@ -1563,6 +1586,61 @@ ReplEngine::is_incomplete(const string &src)
     }
 }
 
+bool
+ReplEngine::continues_chain(const string &line)
+{
+    std::vector<Tok> toks;
+    try {
+        lexer(line, 1, toks);
+    } catch (const Exception &) {
+        return false;
+    }
+    return !toks.empty()
+        && (toks[0] == Keyword::kw_else || toks[0] == Keyword::kw_catch
+            || toks[0] == Keyword::kw_finally);
+}
+
+bool
+ReplEngine::may_continue(const string &src, bool multiline_only)
+{
+    std::vector<Tok> toks;
+    try {
+        lexer(src, 1, toks);
+    } catch (const Exception &) {
+        return false;
+    }
+    if (toks.empty() || !(toks.back() == Op::braceR))
+        return false;
+
+    /* the `{` the final `}` closes, and what stands before it */
+    const auto open_of = [&](size_t close, Op l, Op r) -> size_t {
+        int depth = 0;
+        for (size_t i = close + 1; i-- > 0;) {
+            if (toks[i] == r)
+                depth++;
+            else if (toks[i] == l && --depth == 0)
+                return i;
+        }
+        return string::npos;
+    };
+    const size_t ob = open_of(toks.size() - 1, Op::braceL, Op::braceR);
+    if (ob == string::npos || ob == 0)
+        return false;
+    if (multiline_only && toks[ob].loc.line == toks.back().loc.line)
+        return false;
+
+    const Tok &before = toks[ob - 1];
+    if (before == Keyword::kw_try || before == Keyword::kw_catch)
+        return true;                        /* `try {` / `catch {` */
+    if (!(before == Op::parenR))
+        return false;                       /* `else {`, `finally {`, ... */
+    const size_t op = open_of(ob - 1, Op::parenL, Op::parenR);
+    if (op == string::npos || op == 0)
+        return false;
+    return toks[op - 1] == Keyword::kw_if          /* if / else if */
+        || toks[op - 1] == Keyword::kw_catch;      /* catch (T as e) */
+}
+
 /* ------------------------------------------------------------------ */
 /* The interactive loop (raw-mode line editor; see lineedit.cpp).       */
 /* ------------------------------------------------------------------ */
@@ -1686,21 +1764,40 @@ run_repl()
         return !ReplEngine::is_incomplete(s);
     };
 
+    /* An `if` / `try` chain whose last block closes over several lines
+     * stays open for an `else` / `catch` / `finally` on the next line, as
+     * in a script: an empty line (Enter) runs it, and so does any other
+     * line, which then runs with it (Python's REPL asks the same blank
+     * line after a block). A chain closed on one line runs at once. */
+    LineEditor::Joiner joiner = [](const string &s, const string *next) {
+        const size_t i = s.find_first_not_of(" \t\r\n");
+        if (i != string::npos && s[i] == ':')
+            return false;
+        if (!next)
+            return ReplEngine::may_continue(s, true);
+        return ReplEngine::continues_chain(*next);
+    };
+
     std::cout << "MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.\n";
 
     while (true) {
 
-        ReadLineResult r =
-            read_line(">> ", ".. ", history, hl, completer, submitter);
+        ReadLineResult r = read_line(">> ", ".. ", history, hl, completer,
+                                     submitter, joiner);
 
         if (r.eof)
             break;                          /* Ctrl-D at the prompt exits */
         if (r.cancelled)
             continue;                       /* Ctrl-C drops the input */
 
-        const string &input = r.line;       /* may span multiple lines */
+        string input = r.line;              /* may span multiple lines */
         if (input.find_first_not_of(" \t\r\n") == string::npos)
             continue;                       /* blank */
+        /* drop the empty line that ran a chain kept open (the Joiner) */
+        for (size_t nl; (nl = input.rfind('\n')) != string::npos
+                 && input.find_first_not_of(" \t\r", nl + 1)
+                        == string::npos;)
+            input.erase(nl);
 
         /* A leading ':' meta-command (`:quit` exits; others run via eval_input,
          * which dispatches them). The whole input is one history entry. */

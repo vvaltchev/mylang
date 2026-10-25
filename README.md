@@ -223,6 +223,24 @@ a multi-line block stays open until it's balanced, auto-indented as you go:
 => 55
 ```
 
+An `if` (or a `try`) whose block closes on a line of its own may still go
+on with an `else` (`catch`, `finally`) on the next line, as in a script, so
+the input stays open there: type the `else`, or press Enter on the empty
+line to run it - any other line runs with it (Python's REPL asks the same
+empty line after a block). One closed on the line where it started (`if (c)
+{ print(x) }`) runs at once, and a chain that ends with a plain `else` or a
+`finally` cannot go on, so it runs at once too:
+
+```
+>> if (n < 0) {
+..   print("negative")
+.. }
+.. else {
+..   print("not negative")
+.. }
+not negative
+```
+
 An input that fails prints its error, and the session goes on. An input
 refused before it runs defines nothing: a syntax or type error, or an error
 raised while it is compiled - a constant call such as `h(0)` is evaluated
