@@ -10823,14 +10823,112 @@ static const std::vector<test> tests =
     {
         "Builtin pop(), slices",
         {
+            /* question 3 (Python's rule): popping a slice pops the slice
+             * every name holding it shares, which then has its own
+             * storage; the array it was taken from is untouched */
             "var arr = [1,2,3];",
             "var s = arr[1:];",
+            "var t = s;",
             "assert(intptr(arr) == intptr(s));",
             "assert(pop(s) == 3);",
-            "assert(s == [2]);",
-            "assert(intptr(arr) == intptr(s));", // The slice still shares the same data
+            "assert(s == [2] && t == [2]);",
+            "assert(intptr(arr) != intptr(s));",
+            "assert(intptr(s) == intptr(t));",
             "assert(arr == [1,2,3]);",
         },
+    },
+
+    /* question 3 (Python's rule): a slice is separate when TAKEN, and
+     * every copy of it is the same array */
+    {
+        "slice: an assigned slice is one array (Python's rule)",
+        {
+            "var a = [1, 2, 3, 4];",
+            "var s = a[1:3]; var t = s;",
+            "t[0] = 9;",
+            "assert(s == [9, 3] && a == [1, 2, 3, 4]);",
+            "var u = s; u[1] += 5;",
+            "assert(t == [9, 8] && intptr(s) == intptr(u));",
+        },
+    },
+    {
+        "slice: a callee writes the caller's slice (Python's rule)",
+        {
+            "func setz(x) { x[0] = 0; append(x, 7); }",
+            "var a = [1, 2, 3, 4];",
+            "var s = a[1:3];",
+            "setz(s);",
+            "assert(s == [0, 3, 7] && a == [1, 2, 3, 4]);",
+        },
+    },
+    {
+        "slice: two empty slices are two arrays",
+        {
+            "var a = [1, 2];",
+            "var e = a[5:9]; var f = a[1:0];",
+            "append(e, 3);",
+            "assert(e == [3] && f == [] && a[3:4] == []);",
+        },
+    },
+    {
+        "slice: a source write materializes the slice once for all names",
+        {
+            "var a = [1, 2, 3, 4];",
+            "var p = a[0:2]; var q = p;",
+            "a[0] = 9; q[1] = 7;",
+            "assert(p == [1, 7] && q == [1, 7] && a == [9, 2, 3, 4]);",
+        },
+    },
+    {
+        "slice: += on a slice grows the slice its names share",
+        {
+            "var a = [1, 2, 3];",
+            "var s = a[0:2]; var t = s;",
+            "t += [5]; s += s;",
+            "assert(s == [1, 2, 5, 1, 2, 5] && t == s && a == [1, 2, 3]);",
+            "var g = [\"x\", \"y\", \"z\"][0:2]; var h = g; h += [\"w\"];",
+            "assert(g == [\"x\", \"y\", \"w\"]);",
+        },
+    },
+    {
+        "slice: a loop over a slice sees a write made through another name",
+        {
+            "var a = [1, 2, 3, 4];",
+            "var s = a[0:3]; var u = s; var seen = [];",
+            "foreach (var v in s) { u[2] = 30; append(seen, v); }",
+            "assert(seen == [1, 2, 30] && a == [1, 2, 3, 4]);",
+        },
+    },
+    /* a store of another kind PROMOTES a flat string / class slice: the
+     * slice is materialized first, so every name holding it sees the
+     * promoted array, and the source keeps its storage (a flat struct
+     * array refuses such a store instead) */
+    {
+        "slice: promoting a string or class slice (all its names)",
+        {
+            "var w = split(\"a b c\", \" \");",
+            "var dyn s = w[0:2]; var dyn t = s;",
+            "s[0] = 5;",
+            "assert(t[0] == 5 && t[1] == \"b\");",
+            "assert(w == [\"a\", \"b\", \"c\"]);",
+            "assert(array_storage(w) == \"str\");",
+            "class C { int v; }",
+            "var cs = [C(1), C(2), C(3)];",
+            "var dyn cl = cs[1:3]; var dyn cm = cl;",
+            "cl[0] = 7;",
+            "assert(cm[0] == 7 && cs[1].v == 2);",
+            "assert(array_storage(cs) == \"class\");",
+        },
+    },
+
+    {
+        "slice: a loop over a slice raises when another name shifts it",
+        {
+            "var a = [1, 2, 3, 4, 5];",
+            "var s = a[1:4]; var u = s; var n = 0;",
+            "foreach (var v in s) { n++; pop(u); }",
+        },
+        &typeid(OutOfBoundsEx),
     },
 
     {
@@ -12327,11 +12425,12 @@ static const std::vector<test> tests =
         {
             "var a = [1,2,3,4,5];",
             "var s = a[1:4];",
+            "var t = s;",
             "assert(s == [2,3,4]);",
             "assert(intptr(a) == intptr(s));",
             "erase(s, 0);",
-            "assert(intptr(a) == intptr(s));",
-            "assert(s == [3,4]);",
+            "assert(intptr(a) != intptr(s));",
+            "assert(s == [3,4] && t == [3,4]);",
             "assert(a == [1,2,3,4,5]);",
         },
     },
@@ -12341,11 +12440,12 @@ static const std::vector<test> tests =
         {
             "var a = [1,2,3,4,5];",
             "var s = a[1:4];",
+            "var t = s;",
             "assert(s == [2,3,4]);",
             "assert(intptr(a) == intptr(s));",
             "erase(s, len(s) - 1);",
-            "assert(intptr(a) == intptr(s));",
-            "assert(s == [2,3]);",
+            "assert(intptr(a) != intptr(s));",
+            "assert(s == [2,3] && t == [2,3]);",
             "assert(a == [1,2,3,4,5]);",
         },
     },
@@ -16674,17 +16774,20 @@ static const std::vector<test> tests =
     { "struct err: writing a const struct's field fails",
       { "struct Point { int x; } const P = Point(1); P.x = 9;" },
       &typeid(SyntaxErrorEx) },
-    /* an in-place builtin on a copy's SLICE field detaches that copy's
-     * slice, not the other copy's view (the field is owned first) */
+    /* an in-place builtin on a copy's SLICE field acts on the slice both
+     * copies share - a struct copy is shallow, and a copy of a slice is
+     * the same array (question 3, Python's rule) - and never on the
+     * array the slice was taken from */
     { "struct: an in-place builtin on a copy's slice field",
       { "struct B { int x; array<int> a; }",
         "var big = [1, 2, 3, 4];",
         "var s1 = B(int(runtime(0)), big[0:2]);",
         "var s2 = s1;",
         "append(s2.a, 9);",
-        "assert(s1.a == [1, 2] && s2.a == [1, 2, 9] && len(big) == 4);",
+        "assert(s1.a == [1, 2, 9] && s2.a == [1, 2, 9]);",
+        "assert(big == [1, 2, 3, 4]);",
         "var s3 = s1; sort(s3.a); pop(s3.a);",
-        "assert(s1.a == [1, 2] && s3.a == [1]);" } },
+        "assert(s1.a == [1, 2] && s3.a == [1, 2]);" } },
     /* a COPY of a constant is an ordinary value (it raised NotLValueEx
      * while an assignment aliased); a const BINDING is still refused at
      * run time when the compiler cannot see it - a `const` parameter */
@@ -28237,6 +28340,75 @@ static bool hoist_slice_shapes()
             "for (var i = 0; i < 3; i++) {",
             "  var sl = base[1:4]; s += sl[0]; p.x = i;",
             "}" }, true },
+        /* question 3 (Python's rule): a copy of a slice is the SAME
+         * array, so an array slice that escapes - stored, assigned,
+         * passed, returned - would be one array for every iteration once
+         * hoisted. The contained reads (element, slice of it, len,
+         * foreach) still hoist; a string slice may escape. */
+        { "hoist: element, len, sub-slice and foreach reads", {
+            "var base = [1, 2, 3, 4, 5]; var s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4];",
+            "  s += sl[0] + len(sl) + len(sl[0:1]);",
+            "  foreach (var x in sl) s += x;",
+            "}" }, true },
+        { "no hoist: an array slice stored in a container", {
+            "var base = [1, 2, 3, 4, 5]; var keep = [];",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; append(keep, sl);",
+            "}" }, false },
+        { "no hoist: an array slice assigned to another name", {
+            "var base = [1, 2, 3, 4, 5]; var t = [0];",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; t = sl;",
+            "}" }, false },
+        { "no hoist: an array slice passed to a function", {
+            "func g(a) { return a; }",
+            "var base = [1, 2, 3, 4, 5]; var keep = [];",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; keep = g(sl);",
+            "}" }, false },
+        { "hoist: the slice in its own index, bound and loop body", {
+            "var base = [1, 2, 3, 4, 5]; var s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4];",
+            "  s += sl[sl[0] % 3] + len(sl[0:len(sl)]);",
+            "  foreach (var x in sl) s += sl[0] + x;",
+            "}" }, true },
+        /* g is pure and too big to inline: only the escape check sees
+         * the slice handed to it */
+        { "no hoist: the slice escapes inside its own index", {
+            "func g(a) { var n = 0; for (var k = 0; k < 2; k++) n += k; "
+            "return n; }",
+            "var base = [1, 2, 3, 4, 5]; var s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; s += sl[g(sl)];",
+            "}" }, false },
+        { "no hoist: the slice escapes inside a sub-slice bound", {
+            "func g(a) { var n = 0; for (var k = 0; k < 2; k++) n += k; "
+            "return n; }",
+            "var base = [1, 2, 3, 4, 5]; var s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; s += len(sl[0:g(sl)]);",
+            "}" }, false },
+        { "no hoist: the slice escapes from a foreach over it", {
+            "var base = [1, 2, 3, 4, 5]; var keep = [0];",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4];",
+            "  foreach (var x in sl) keep = sl;",
+            "}" }, false },
+        { "no hoist: a callee that is no name, and len with two arguments", {
+            "var fs = [func(a) => 0];",
+            "var base = [1, 2, 3, 4, 5]; var s = 0;",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sl = base[1:4]; s += fs[0](sl);",
+            "  try { s += len(sl, 1); } catch (InvalidNumberOfArgsEx) { }",
+            "}" }, false },
+        { "hoist: a string slice may escape", {
+            "var base = \"0123456789\"; var last = \"\";",
+            "for (var i = 0; i < 3; i++) {",
+            "  var sub = base[1:9]; last = sub;",
+            "}" }, true },
     };
     for (const Case &c : cases) {
         std::string s;
@@ -28949,6 +29121,20 @@ static bool opt_layer_equivalence()
             "for (var q = 0; q < 3; q++) {",
             "  var sl = base[0:2]; t += sl[0]; al[0] = 10; }",
             "print(t);" } },
+        /* question 3 (Python's rule): a copy of a slice is the same
+         * array, so a slice that escapes the loop body - stored,
+         * assigned, passed - must be a fresh array per iteration;
+         * hoisted it would be one, and a later write through any copy
+         * would show in all. Watched failing with the escape check
+         * removed. */
+        { "slice: an escaping slice is fresh per iteration (slice hoist)", {
+            "var base = [1, 2, 3, 4]; var keep = []; var last = [0];",
+            "func pass(x) { return x; }",
+            "for (var q = 0; q < 3; q++) {",
+            "  var sl = base[0:2]; append(keep, sl);",
+            "  var s2 = base[1:3]; last = pass(s2); }",
+            "keep[0][0] = 9; last[0] = 8;",
+            "print(keep, last, base);" } },
         { "alias: a class field written through another name, for-range", {
             "class B { int n; }",
             "func g(B x, B y) { var k = 0;",
@@ -43157,8 +43343,9 @@ static bool jit_frameless_call_reach()
             "}",
             "print(s, base[1]);" }, "1560 210 \n", 20, false },
         { "W5: an element write THROUGH a slice parameter at a frameless "
-          "site - the COW clone releases the retained copy's count, the "
-          "caller's view and the base are intact", {
+          "site - it materializes the slice the caller shares (question "
+          "3, Python's rule: the caller sees every write) and the base "
+          "is intact", {
             "func mk(int d) { return func [d] (a, int k) {",
             "  a[0] = a[0] + k; return a[0] + d; }; }",
             "var f = mk(1);",
@@ -43166,7 +43353,7 @@ static bool jit_frameless_call_reach()
             "var sl = base[1:4];",
             "var s = 0;",
             "for (var i = 0; i < runtime(20); i++) { s = s + f(sl, i); }",
-            "print(s, sl[0], base[1]);" }, "610 20 20 \n", 20, false },
+            "print(s, sl[0], base[1]);" }, "1750 210 20 \n", 20, false },
         { "W2: a pinned int sibling next to a dyn STRING into an int "
           "param - the decline trampoline materialises BOTH into the run "
           "(the pin from its register) before the C++ tier raises", {
@@ -52132,6 +52319,59 @@ static bool jit_closure_store_releases()
 }
 
 /*
+ * Question 3 (Python's rule) - a slice's GROUP is its identity among the
+ * views of one storage: every handle copy keeps it, a new slice takes a
+ * fresh one, and a write through any handle materializes the whole group
+ * at once. The group counter is renumbered densely before it would wrap
+ * (a group must never be handed out twice while a view holding it is
+ * alive) - a path four billion slices away, reached here by lowering the
+ * renumbering point (g_slice_group_limit) so a small program crosses it
+ * several times. Every write must still reach exactly the names of its
+ * own slice: two groups merged by a renumbering would show one slice's
+ * write through the other, a group split would hide it from an alias.
+ * Run by the tree-walker and the VM, JIT off and on.
+ */
+static bool slice_group_identity()
+{
+    struct Limit {
+        uint32_t saved = g_slice_group_limit;
+        Limit() { g_slice_group_limit = 3; }
+        ~Limit() { g_slice_group_limit = saved; }
+    } lim;
+    const std::string src =
+        "var a = [1, 2, 3, 4, 5, 6];\n"
+        "var s1 = a[0:2]; var t1 = s1;\n"
+        "var s2 = a[1:3]; var t2 = s2; var u2 = s2; var v2 = s2;\n"
+        "var s3 = a[2:4];\n"
+        "var s4 = a[3:5];\n"
+        "var s5 = a[4:6];\n"
+        "var s6 = a[0:3];\n"
+        "t2 = [0];\n"                       /* members leave a group */
+        "v2 = [0];\n"
+        "t1[0] = 9;\n"                      /* s1's group, both names */
+        "u2[1] = 8;\n"                      /* s2's group, both names */
+        "a[3] = 7;\n"                       /* detaches s3 and s4 */
+        "print(s1, t1, s2, u2, s3, s4, s5, s6, a);\n";
+    const std::string want =
+        "[9, 2] [9, 2] [2, 8] [2, 8] [3, 4] [4, 5] [5, 6] [1, 2, 3] "
+        "[1, 2, 3, 7, 5, 6] \n|";
+    const bool saved_jit = g_jit_enabled;
+    bool ok = true;
+    for (int mode = 0; mode < 3; mode++) {
+        g_jit_enabled = mode == 2;
+        const std::string got =
+            nc_run(src, mode ? ExecEngine::Vm : ExecEngine::TreeWalk, true);
+        if (got != want) {
+            fprintf(stderr, "slice_group_identity: mode %d printed\n%s\n",
+                    mode, got.c_str());
+            ok = false;
+        }
+    }
+    g_jit_enabled = saved_jit;
+    return ok;
+}
+
+/*
  * #53 option 1 - THE FOREACH SHIFT GUARD, both halves of its contract:
  *
  *  1. SHAPE: a body that PROVABLY cannot move an element (the bench
@@ -52207,7 +52447,30 @@ static bool foreach_shift_guard()
         "}\n"
         "var t = 0;\n"
         "for (var k = 0; k < 3; k++) t += run(int(runtime(20)));\n"
-        "assert(t == 3 * 1015);";
+        "assert(t == 3 * 1015);\n"
+        /* question 3 (Python's rule): a loop over a SLICE marks -1 (a
+         * view never shifts) - but another name holding the same slice
+         * can materialize it under the loop, and the loop's handle moves
+         * with it. A write through it is then seen by the loop's later
+         * elements, and a pop shifts it: the native check must send that
+         * case to the helper, which raises. The array the slice was
+         * taken from never changes. */
+        "func run2(n, bool shift) {\n"
+        "    var a = range(n);\n"
+        "    var sl = a[0:n];\n"
+        "    var al = sl;\n"
+        "    var s = 0;\n"
+        "    try { foreach (e in sl) {\n"
+        "        s += e;\n"
+        "        if (e == 5) { if (shift) pop(al); else al[n - 1] = 100; }\n"
+        "    } } catch (OutOfBoundsEx) { s += 1000; }\n"
+        "    return s + len(a) + a[n - 1];\n"
+        "}\n"
+        "var t2 = 0;\n"
+        "for (var k = 0; k < 3; k++)\n"
+        "    t2 += run2(int(runtime(20)), runtime(true))\n"
+        "        + run2(int(runtime(20)), runtime(false));\n"
+        "assert(t2 == 3 * ((15 + 1000 + 20 + 19) + (171 + 100 + 20 + 19)));";
     lexer(src, 1, toks);
     const ExecEngine saved = g_exec_engine;
     g_exec_engine = ExecEngine::Vm;
@@ -57125,6 +57388,9 @@ static const std::vector<extra_check> extra_checks =
       jit_ord_char_inline },
     { "jit: native len() + fused ord(s[i]) run natively (lever 4b)",
       jit_len_ord },
+    { "slice: a slice's group - copies share it, renumbered before it "
+      "wraps, materialized together (question 3)",
+      slice_group_identity },
     { "foreach: the shift guard - absent on a provably inert body, "
       "native and taken on a shifting one (#53 option 1)",
       foreach_shift_guard },

@@ -519,7 +519,7 @@ vm_store_elem_int_body(LValue &alv, int_type idx, int_type rhs, Op aop,
                     && rhs < 0)
                 vm_store_throw_negshift(chunk, pc);
             if (arr.is_slice())
-                arr.clone_internal_vec();
+                arr.materialize_slice();
             else if (arr.use_count() > 1)
                 arr.clone_aliased_slices(arr.offset() + idx);
             if (is_bool) {
@@ -574,7 +574,7 @@ vm_store_elem_float_body(LValue &alv, int_type idx, float_type rhs, Op aop,
             if ((aop == Op::div || aop == Op::mod) && rhs == 0.0)
                 vm_store_throw_div0(chunk, pc);
             if (arr.is_slice())
-                arr.clone_internal_vec();
+                arr.materialize_slice();
             else if (arr.use_count() > 1)
                 arr.clone_aliased_slices(arr.offset() + idx);
             float_type &el = arr.flat_floats()[arr.offset() + idx];
@@ -3792,7 +3792,7 @@ extern "C" int jit_store_elem_prep(LValue *base, int_type idx) noexcept
         return 1;
     try {
         if (arr.is_slice())
-            arr.clone_internal_vec();
+            arr.materialize_slice();
         else
             arr.clone_aliased_slices(
                 arr.offset() + static_cast<size_type>(idx));
@@ -4206,12 +4206,13 @@ extern "C" void jit_stage_args(const int32_t *pairs, int_type n) noexcept
  * ⛔ ONE runtime exclusion, and dropping it is a use-after-free, not a leak:
  * a SLICE registers itself in its parent's live-slices set when it is COPIED,
  * and an element write to the parent then DETACHES every registered slice in
- * place (clone_aliased_slices). A borrowed slice is not in that set, so such a
- * write would leave it pointing at storage that has just been handed to
- * somebody else - and freed outright, if the caller's slot held the last
- * reference. Every OTHER reference type's copy is a plain retain with no
- * registration, which is exactly what makes the bit-copy symmetric with
- * LValue::frame_release()'s abandon.
+ * place (clone_aliased_slices), as a write through any handle of the slice
+ * moves all of them (materialize_slice, question 3). A borrowed slice is not
+ * in that set, so such a write would leave it pointing at storage that has
+ * just been handed to somebody else - and freed outright, if the caller's
+ * slot held the last reference. Every OTHER reference type's copy is a plain
+ * retain with no registration, which is exactly what makes the bit-copy
+ * symmetric with LValue::frame_release()'s abandon.
  *
  * `can_borrow` is the callee descriptor's bit for THIS parameter. It is read
  * at run time on both paths, not baked at emit time, because the emitted push

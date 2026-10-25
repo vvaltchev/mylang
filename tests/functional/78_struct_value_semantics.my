@@ -36,19 +36,20 @@ append(b2.a, 7);
 assert(len(b.a) == 2);
 b2.a = [0];
 assert(len(b.a) == 2 && len(b2.a) == 1);
-# ...but a SLICE field is a copy of its window: a store into it detaches
-# the slice of the copy written through - the other copy keeps its view
+# ...and so is a SLICE field: a copy of a slice is the same slice
+# (question 3, Python's rule), so the copies share it like any array
+# field - and the array the slice was taken from never changes
 var big = [1, 2, 3, 4];
 var s1 = B(ri(0), big[0:2]);
 var s2 = s1;
 s2.a[0] = 7;
-assert(s1.a == [1, 2] && s2.a == [7, 2] && big == [1, 2, 3, 4]);
+assert(s1.a == [7, 2] && s2.a == [7, 2] && big == [1, 2, 3, 4]);
 var s3 = s1;
 s3.a[1] += 5;
-assert(s1.a == [1, 2] && s3.a == [1, 7]);
+assert(s1.a == [7, 7] && s3.a == [7, 7]);
 var s4 = s1;
 append(s4.a, 9);
-assert(s1.a == [1, 2] && s4.a == [1, 2, 9] && big == [1, 2, 3, 4]);
+assert(s1.a == [7, 7, 9] && s4.a == [7, 7, 9] && big == [1, 2, 3, 4]);
 
 # 3. elements: a read copies, a store through the element writes it
 var pa = [P(ri(1), 1), P(2, 2)];

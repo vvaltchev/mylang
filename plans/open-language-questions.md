@@ -11,7 +11,7 @@ at run time (#49).
 
 | #  | question                                        | status     |
 |----|-------------------------------------------------|------------|
-| 3  | does a slice alias like any other array?        | discussing |
+| 3  | does a slice alias like any other array?        | decided: B |
 | 5  | a parse-time pure call runs before inference    | open       |
 | 6  | a throwing constant expression inside a `try`   | open       |
 | 7  | duplicate keys in a dict literal                | open       |
@@ -90,7 +90,31 @@ Options:
 
 Recommendation: B, if the slice benches (15, 16, 29) stay flat.
 
-Decision: pending.
+**Decision (maintainer, 2026-10-18): B, Python's rule, keeping the
+copy-on-write view internally.** Implemented the same day:
+
+- every slice handle carries a GROUP (its identity among the views of its
+  storage); a handle copy keeps it, a slice expression takes a fresh one.
+  The storage's registry of views is keyed by group;
+- a write through any handle of a slice (`materialize_slice`) gives the
+  whole group ONE fresh copy of the window, so every name holding the
+  slice sees it; a write to the source (`clone_aliased_slices`)
+  materializes each overlapping slice once. `pop`/`erase` no longer narrow
+  one handle's window, and an empty slice is a fresh array (it used to be
+  the shared `empty_arr`, which would have made every empty slice ONE
+  array);
+- a foreach over a slice checks for a shift once the slice was
+  materialized under it (C++ `fe_shifted`, the JIT's inline
+  ArrEpochCheck);
+- the loop slice hoister refuses an ARRAY slice that escapes the body
+  (identity is now observable); string slices are unaffected.
+
+Tests: `tests/functional/96_slice_alias.my` (every case of the table
+above, all engines), the `slice:` `-rt` cases, `slice_group_identity`,
+the hoister's shape and layer-equivalence cases, and the old-rule tests
+rewritten (pop/erase on a slice, the struct slice field, W5,
+91_inline_slice_param). Each new piece was watched failing with the old
+behaviour put back.
 
 ## 5. A parse-time `pure` call runs before type inference
 

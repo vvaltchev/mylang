@@ -75,7 +75,7 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 
 var s = a[1:3];
 
-A slice is a cheap VIEW until written: reading it shares the parent's storage, and a write clones first so logically-distinct arrays never bleed into each other. intptr(x) reveals when two values share storage.
+A slice is a new array, separate from the one it was taken from - and, like any array, shared once you have it: assigning or passing it does not copy it again (Python's rule). Internally it is a cheap VIEW until written: a write through any name holding it copies the window once, for all of them. intptr(x) reveals when two values share storage.
 >> Exceptions
 
   Exceptions  [trycatch]

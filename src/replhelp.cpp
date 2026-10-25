@@ -529,14 +529,16 @@ const LangFeature lang_features[] = {
 /* ---- arrays ---- */
 { "arraylit", "arrays", "Array literals & access",
   "var a = [1, 2, 3];    a[0]    a[1:3]    len(a)    a += [4];",
-  "Arrays are 0-indexed, growable, and have value semantics (copy-on-write). "
-  "Indexing reads/writes an element; slicing yields an independent (lazily "
-  "copied) sub-array." },
+  "Arrays are 0-indexed and growable, and assignment SHARES them (a second "
+  "name for the same array; clone() copies). Indexing reads/writes an "
+  "element; slicing yields a new (lazily copied) sub-array." },
 { "slices", "arrays", "Slices (copy-on-write)",
   "var s = a[1:3];",
-  "A slice is a cheap VIEW until written: reading it shares the parent's "
-  "storage, and a write clones first so logically-distinct arrays never bleed "
-  "into each other. intptr(x) reveals when two values share storage." },
+  "A slice is a new array, separate from the one it was taken from - and, "
+  "like any array, shared once you have it: assigning or passing it does not "
+  "copy it again (Python's rule). Internally it is a cheap VIEW until "
+  "written: a write through any name holding it copies the window once, for "
+  "all of them. intptr(x) reveals when two values share storage." },
 { "flatstorage", "arrays", "Flat (unboxed) arrays",
   "array_storage(a)    dynarray(a)",
   "A homogeneous array<int>/<float>/<bool> (and array<PodStruct>) is stored "

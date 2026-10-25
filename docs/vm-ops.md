@@ -84,7 +84,10 @@ not at the end - each bumps `SharedObject::shift_epoch`) raises that same
 `OutOfBoundsEx` at the next step even when the length is unchanged.
 **`ArrEpochMark m = c`** (once, after the loop's `ArrLen`; `arr.mark` in
 `-vd`) records the container temp's `fe_mark()` - the storage's epoch, or
--1 for a slice view, which can never shift - and **`ArrEpochCheck c, m`**
+-1 for a slice view, which can never shift while it is one (once another
+name materializes the slice under the loop - question 3, Python's rule -
+the loop's handle moves with it, and the fresh storage's epoch is read
+against 0) - and **`ArrEpochCheck c, m`**
 (`arr.check`, at the loop head BEFORE the element load, so a moved element
 is never bound first; the container's caret in `locs`) raises on a change.
 Both are emitted only when `struct_fe_body_inert(body, shift_only)` cannot
@@ -92,8 +95,8 @@ prove the body free of pop/erase/insert and user calls - never for a bench
 body - so a proven loop pays nothing; the counted, struct whole-`p` and
 unpack forms carry it, and `ForeachDynNext` checks the same epoch in
 `DynIterState::mark`. The JIT emits the check inline (a tag guard and one
-epoch compare, the -1 test out of line) with `jit_arr_epoch_check` as its
-conveying cold tier. The struct
+epoch compare; for -1, the handle's slice byte) with
+`jit_arr_epoch_check` as its conveying cold tier. The struct
 DIRECT read (`p.x` off the array bytes at every use) is taken only for a body
 `struct_fe_body_inert` proves cannot change any array or run program code. A
 **foreach over a

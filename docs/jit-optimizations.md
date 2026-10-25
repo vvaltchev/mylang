@@ -15006,8 +15006,11 @@ length came back. The fact lives on the SHARED storage,
 shifting site in builtins/arr.cpp.h AFTER the slice detach; a handle
 reads it through `fe_mark()` (-1 for a slice: a view never shifts - the
 parent's shifting ops detach the overlapping views first, and an op
-through a view reseats or clones the view's own handle) and
-`fe_shifted(mark)`.
+through a view materializes it) and `fe_shifted(mark)`. **Since question
+3 (2026-10-18, Python's rule) a slice's handles are one array**, so a
+write through ANOTHER name can materialize the slice under the loop and
+the loop's handle moves with it: `fe_shifted(-1)` then answers whether
+the FRESH storage's epoch left 0.
 
 Two new opcodes, APPENDED (myv v21): `ArrEpochMark` (once per loop, a
 helper call `jit_arr_epoch_mark`, never exits) and `ArrEpochCheck` (per
@@ -15015,7 +15018,8 @@ iteration, at the loop head BEFORE the element load). Its emitted form:
 
     mov  rax, c.type ; cmp rax, <array-tag> ; jne cold    (image guard)
     mov  rax, c ; mov rax, [rax + epoch] ; cmp rax, m ; je done
-    mov  rax, m ; cmp rax, -1 ; je done                   (a slice)
+    mov  rax, m ; cmp rax, -1 ; jne cold                  (a real mark)
+    cmp  byte c.slice, 0 ; jne done                       (still a view)
   cold:
     call jit_arr_epoch_check ; test eax ; jz done ; <exc-stamp> ; exit
 
@@ -15024,8 +15028,9 @@ caret, so the check is `op_fully_native` (deletable) but not
 `op_never_exits`. `m` is a loop temp read from memory (`pick_visit_op`
 marks both operands `bad` - nothing to gain by pinning it), and the
 verifier refuses a literal `a` since the inline compare reads it as a
-slot. The -1 test sits after the hot compare so a slice loop pays two
-predicted branches, not a helper call per element.
+slot. The -1 test sits after the hot compare so a slice loop pays three
+predicted branches, not a helper call per element; only a slice that was
+materialized under the loop (question 3) reaches the helper each step.
 
 **Zero cost where it cannot matter:** codegen emits neither op when
 `struct_fe_body_inert(body, /*shift_only=*/true)` proves the body cannot

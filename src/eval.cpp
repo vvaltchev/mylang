@@ -1853,7 +1853,7 @@ bool pod_place_elem(LValue *blv, const EvalValue &key, PodPlace &out)
         throw OutOfBoundsEx();
 
     if (arr.is_slice())
-        arr.clone_internal_vec();
+        arr.materialize_slice();
     else if (arr.use_count() > 1)
         arr.clone_aliased_slices(arr.offset() + idx);
     arr.invalidate_hash();
@@ -2042,7 +2042,7 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
     if (arr.is_readonly())
         throw CannotChangeConstEx(a0s, a0e);
     if (arr.is_slice())
-        arr.clone_internal_vec();
+        arr.materialize_slice();
 
     StructTypeDef *def = const_cast<StructTypeDef *>(cdef);
     ML_CHECK(def && def->is_pod() && n == def->fields.size());
@@ -4657,7 +4657,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
                 sub_start, sub_end);
 
         if (arr.is_slice())
-            arr.clone_internal_vec();
+            arr.materialize_slice();
         else if (arr.use_count() > 1)
             arr.clone_aliased_slices(arr.offset() + idx);
 
@@ -4694,7 +4694,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
             throw OutOfBoundsEx(sub_start, sub_end);
 
         if (arr.is_slice())
-            arr.clone_internal_vec();
+            arr.materialize_slice();
         else if (arr.use_count() > 1)
             arr.clone_aliased_slices(arr.offset() + idx);
 
@@ -4728,7 +4728,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
             throw OutOfBoundsEx(sub_start, sub_end);
 
         if (arr.is_slice())
-            arr.clone_internal_vec();
+            arr.materialize_slice();
         else if (arr.use_count() > 1)
             arr.clone_aliased_slices(arr.offset() + idx);
 
@@ -4805,7 +4805,7 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
      * handle aliases share the mutation - MyLang assignment aliases).
      */
     if (arr.is_slice())
-        arr.clone_internal_vec();            /* keep-flat; now standalone */
+        arr.materialize_slice();
     else if (arr.use_count() > 1)
         arr.clone_aliased_slices(at0);
 
@@ -7543,14 +7543,6 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
     return none; /* Make compilers unaware of [[noreturn]] happy */
 }
 
-LValue LValue::clone()
-{
-    LValue nl(valtype()->clone(val), is_const);
-    nl.container = container;
-    nl.container_idx = container_idx;
-    return nl;
-}
-
 LValue *LValue::write_target()
 {
     if (!container)
@@ -7561,17 +7553,18 @@ LValue *LValue::write_target()
 
     if (cont->valtype()->is_slice(cont->val)) {
         /*
-         * `this` lives in the slice's storage, and making the slice
-         * standalone RELEASES that storage - FREES it, when the slice was
-         * its only owner (a slice returned from a function whose array
-         * died with it). So everything is read from `this` first, and
-         * nothing after: until 2026-10-08 the index was adjusted on
-         * `this` and the type check read `this->val`, both after the free
-         * (an ASan heap-use-after-free in both engines).
+         * `this` lives in the slice's storage, and materializing the
+         * slice (every handle of it - question 3, Python's rule) RELEASES
+         * that storage - FREES it, when the slice was its only owner (a
+         * slice returned from a function whose array died with it). So
+         * everything is read from `this` first, and nothing after: until
+         * 2026-10-08 the index was adjusted on `this` and the type check
+         * read `this->val`, both after the free (an ASan
+         * heap-use-after-free in both engines).
          */
         const size_type idx =
             container_idx - cont->getval<SharedArrayObj>().offset();
-        *cont = cont->clone();
+        cont->getval<SharedArrayObj>().materialize_slice();
         LValue *el = &cont->getval<SharedArrayObj>().get_vec()[idx];
         el->container = cont;
         el->container_idx = idx;
@@ -7745,7 +7738,9 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
          * not at the end, through any alias - the loop raises
          * OutOfBoundsEx at the container at its next step (option 1: the
          * storage's shift epoch, recorded here; a slice view never shifts,
-         * so fe_mark answers -1 for one and nothing is checked). Without
+         * so fe_mark answers -1 for one - until another name holding the
+         * same slice materializes it, question 3, when the loop's handle
+         * moves with it and fe_shifted reads the fresh storage). Without
          * it, removing an element already visited silently SKIPPED the
          * next one. The length test stays as the memory-safety net.
          *

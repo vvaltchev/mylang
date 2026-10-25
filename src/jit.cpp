@@ -25856,13 +25856,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          *     mov  acc, [c.payload]          ; the SharedObject
          *     mov  acc, [acc + epoch]
          *     cmp  acc, [m.payload] ; je done
-         *     mov  acc, [m.payload] ; cmp acc, -1 ; je done  ; a slice
+         *     mov  acc, [m.payload] ; cmp acc, -1 ; jne cold
+         *     cmp  byte [c.slice], 0 ; jne done   ; still a slice view
          *   cold:
          *     call jit_arr_epoch_check ; test eax ; jz done
          *     <exc-stamp the container caret> ; exit
          *
-         * The -1 test is inline because a foreach over a SLICE marks -1
-         * and would otherwise call the helper every iteration.
+         * A foreach over a SLICE marks -1, and the view test is inline
+         * because such a loop would otherwise call the helper every
+         * iteration. A view never shifts; once a write through another
+         * name materialized the slice (question 3 - the loop's handle
+         * moves with it) the helper decides, against the fresh storage's
+         * epoch (SharedArrayObj::fe_shifted).
          */
         const JitLayout &L = jit_layout();
         const SlotAddr base = slot_addr(in.target2);
@@ -25887,7 +25892,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             j_ok = e.j32(0x74);                       /* unchanged */
             e.load(acc.r, mk.payload);
             e.cmp_reg_imm(acc.r, -1);
-            j_slice = e.j32(0x74);                    /* a slice: -1 */
+            decline_jump(e, slows, 0x75, JD_epoch_shifted);
+            e.cmp_byte_slot(base.payload + L.slice_off, 0);
+            j_slice = e.j32(0x75);                    /* a view: -1 */
             decline_jump(e, slows, 0xEB, JD_epoch_shifted);
             decline_land(e, slows);
         }

@@ -15,7 +15,7 @@ assert(y == [99, 2, 3]);
 push(y, 7);
 assert(x == [99, 2, 3, 7]);     # append through the alias is visible on x
 
-# --- a SLICE behaves like an independent copy (copy-on-write under the hood) -
+# --- a SLICE is a new array (copy-on-write under the hood) -----------------
 var a = [1, 2, 3, 4, 5];
 var s = a[1:4];                 # O(1) view in MyLang, but observably a copy
 assert(s == [2, 3, 4]);
@@ -36,6 +36,18 @@ var g = f[0:3];
 g[0] = 99;
 assert(f == [1, 2, 3]);
 assert(g == [99, 2, 3]);
+
+# once taken, a slice is an ordinary array: assigning it or passing it
+# SHARES it (Python's rule) - the lazy view is invisible
+var a3 = [1, 2, 3, 4, 5];
+var s3 = a3[1:4];
+var t3 = s3;                    # the same slice, not another copy
+t3[0] = 99;
+assert(s3 == [99, 3, 4]);
+assert(a3 == [1, 2, 3, 4, 5]);
+func setz(arr) { arr[1] = 0; }
+setz(s3);                       # the callee writes the caller's slice
+assert(t3 == [99, 0, 4]);
 
 # --- clone() is an explicit deep copy --------------------------------------
 var c1 = [1, 2, 3];

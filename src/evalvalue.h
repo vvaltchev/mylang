@@ -771,7 +771,6 @@ private:
      */
     bool borrowed;
 
-    LValue clone();
     void put_slow(const EvalValue &v);   /* container-backed (COW) put */
     void put_slow(EvalValue &&v);
 

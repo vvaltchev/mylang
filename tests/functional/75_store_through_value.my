@@ -109,14 +109,16 @@ var w4 = lit2()[0]--;
 assert(w3 == 9 && w4 == 9);
 print(w3, w4);
 
-# 6. a copy is a copy: a slice detaches, clone() made a new array, and a
-#    slice held in a named local is not the one written
+# 6. a copy is a copy: a slice is a new array, clone() made a new array -
+#    and a slice held in a named local IS the one written through the
+#    assignment's value (a copy of a slice is the same slice, question 3:
+#    Python's rule)
 gi = [1, 2, 3];
 gi[0:runtime(2)][0] = 99;
 clone(gi)[1] = 99;
 var sl = [0];
 (sl = gi[0:2])[0] = 77;
-assert(gi == [1, 2, 3] && sl == [1, 2]);
+assert(gi == [1, 2, 3] && sl == [77, 2]);
 print(gi, sl);
 
 # 7. the order: the rhs, then the base, then each key
@@ -169,11 +171,13 @@ try { append(cv, 3); } catch (CannotChangeConstEx) { e4 = "c"; }
 assert(e3 == "c" && e4 == "c" && CA == [1, 2]);
 print(e3, e4);
 
-# 10. the value is a COPY where a copy and the variable differ: a slice
-#     view's copy detaches on a write, a flat struct element read is a
-#     copy. These callees are small enough to inline, so the AST inliner
-#     must leave a call at a store root a call - inlined, the store would
-#     land in `sv` or `ge[0]` itself.
+# 10. the value is a COPY where a copy and the variable differ - a flat
+#     struct element read is a copy - and the SAME array where it is one:
+#     a slice's copy is the slice (question 3, Python's rule), so the
+#     writes through gsv() land in `sv`, never in `base`. These callees
+#     are small enough to inline; the AST inliner leaves a call at a
+#     store root a call - inlined, the store would land in `ge[0]`
+#     itself.
 var base = [1, 2, 3];
 var sv = base[0:2];
 func gsv() { return sv; }
@@ -184,5 +188,5 @@ var ge = [In(1), In(2)];
 func gel() { return ge[0]; }
 gel().x = 40;
 gel().x += 1;
-assert(sv == [1, 2] && base == [1, 2, 3] && ge[0].x == 1);
+assert(sv == [9, 3, 5] && base == [1, 2, 3] && ge[0].x == 1);
 print(sv, base, ge);

@@ -2691,8 +2691,8 @@ first argv. It is *not* wired into `make`/CI and has no third-party deps.
 `bench/README.md` is also the
 written answer to "do MyLang and Python behave the same?": they do *observably*
 — assignment aliases,
-slices act like independent copies (MyLang via lazy copy-on-write, so read-only
-slicing is far cheaper),
+a slice is a new array when taken and is shared like any array after that
+(MyLang via lazy copy-on-write, so read-only slicing is far cheaper),
 `clone()` makes a shallow copy and `deepclone()` a deep one — with the
 divergences (64-bit wrapping vs bignum,
 truncating vs flooring division) enumerated there - both languages keep
@@ -3809,11 +3809,12 @@ Four things a future editor must not soften, each watched failing:
   holds an int.
 - **Never a SLICE.** A slice registers itself in its parent's live-slices set
   when COPIED, and an element write to the parent detaches every registered
-  view in place (`clone_aliased_slices`); a borrowed view is in no such set,
-  so the write leaves it reading storage the detach just gave away — and
-  freed, if the caller's slot held the last reference. Every other reference
-  type's copy is a plain retain, which is what makes the bit-copy symmetric
-  with the abandon.
+  view in place (`clone_aliased_slices`), as a write through any sibling
+  handle moves the whole slice (`materialize_slice`); a borrowed view is in
+  no such set, so the write leaves it reading storage the detach just gave
+  away — and freed, if the caller's slot held the last reference. Every
+  other reference type's copy is a plain retain, which is what makes the
+  bit-copy symmetric with the abandon.
 - **`LValue::frame_release()` IS THE ONE RELEASE POINT.** Seven scans used to
   open-code `lv = LValue()`; a borrow makes the decision PER SLOT, and a scan
   that forgets it decrements a count the slot never took.
@@ -4117,10 +4118,10 @@ temp-bound, as the call binds it. Two reasons, each a RULE 2 bug before:
 an inert literal put in the lvalue position is a store to a temporary (the
 tree-walker raised NotLValueEx for `h([1, 2, 3])` and the VM refused to
 compile it, NotLoweredEx, while `-ni` ran it); and a NAME holding a SLICE
-is not the parameter - the call's copy of a slice handle is its own view,
-which detaches on the write, so pasting the name made `x[0] = 77` change
-the caller's slice inlined and leave it alone under `-ni` (2026-10-12;
-nothing at compile time tells a slice from an array). The same goes for a
+was not the parameter - the call's copy of a slice handle was its own view
+(2026-10-12). Since question 3 (2026-10-18) a copy of a slice IS the same
+array, so that half no longer holds and the name rule is only conservative
+now (a missed paste, never a wrong answer). The same goes for a
 parameter the body writes INTO THROUGH A MEMBER (`p.x = v`, `p.f[i] += v`,
 `p.x++` - `param_member_written`): a struct is a value, so the parameter
 is the call's own copy and the write must not reach the caller's
@@ -5064,8 +5065,12 @@ non-opt array/str) the slice CANNOT throw (pure clamping), so hoisting
 is safe even for a ZERO-iteration loop. The slice var itself must be
 written only by its decl (no write-through/mutating builtin - those
 would COW the view privately, diverging from fresh-view-per-iteration)
-and unreferenced by cond/inc. Escaping READS are fine (a view's
-identity is unobservable - intptr shows the SHARED storage). Runs in
+and unreferenced by cond/inc. **⛔ And an ARRAY slice must not ESCAPE
+(`hoist_slice_contained`, question 3):** a copy of a slice is the same
+array, so one hoisted slice stored by every iteration would be ONE array
+where the loop stored a fresh one each time. Its uses must be an element
+read, a slice of it, `len`, or a foreach container; a STRING slice may
+escape (immutable, identity unobservable). Runs in
 `specialize()` BEFORE try_for_range (the wrapper block's children then
 specialize individually, so the loop still becomes a ForRangeStmt).
 Measured with the pooled slices set (inc 1): 15_array_slice_readonly
@@ -6593,9 +6598,35 @@ per level of a deep value - a separate open item.
   the count is never 1 and every append rebuilds — 28_str_concat **+18268%
   Ir**, O(n²).
 - **`SharedArrayObj`** (`sharedarray.h`):
-  `intrusive_ptr<SharedObject{ vec, set<live slices> }>` +
-  `off`/`len`/`slice`. A slice registers itself in the parent's `slices` set
-  (and unregisters on
+  `intrusive_ptr<SharedObject{ vec, registry of live slice handles }>` +
+  `off`/`len`/`slice`/`group`. **⛔ A SLICE FOLLOWS PYTHON'S RULE
+  (question 3, plans/open-language-questions.md, 2026-10-18): it is a NEW
+  array when TAKEN, and every later copy of it - an assignment, an
+  argument, an element stored or read back, a capture, a struct field - is
+  the SAME array.** Internally it stays a lazy copy-on-write VIEW: every
+  handle carries the window, and `group` names WHICH slice it is among the
+  views of its storage (the copy constructor keeps it; a slice expression
+  takes a fresh one, `new_slice_group`, renumbered densely before the
+  per-storage counter would wrap). The storage's registry is keyed by
+  group, so a write through ANY handle - `materialize_slice()` - finds its
+  siblings and reseats the whole group onto ONE fresh copy, and a write to
+  the storage - `clone_aliased_slices(idx)` - materializes each
+  overlapping group once. Four rules a new site must keep: **a write
+  through a slice calls `materialize_slice()`, never
+  `clone_internal_vec()`** (that one copies THIS handle only - `clone()`
+  and building a fresh array from a handle; used for a write it gives the
+  writer a private copy, the pre-2026-10-18 rule); **an op that changes a
+  slice's window acts on the whole group** (pop/erase used to narrow one
+  handle's window - they materialize now); **an empty slice is a fresh
+  group** (`arr_empty_slice`), never the shared `empty_arr`, whose copies
+  would all be ONE array; and **a raw bit-copy of a slice handle is
+  forbidden** (#94's borrow declines it) - an unregistered handle is not
+  moved by a materialization. A foreach over a slice marks -1 and checks
+  for a shift only once the slice was materialized under it
+  (`fe_shifted`; the JIT's inline ArrEpochCheck tests the slice byte).
+  Net: `tests/functional/96_slice_alias.my`, the `slice:` `-rt` cases and
+  `slice_group_identity`. A slice registers itself in its storage's
+  registry (and unregisters on
   move/destroy — **and on `operator=`**: a copy/move *assign* into a
   slice-holding value must first `slices.erase(this)` from its OLD `shobj`, or
   that set keeps a **dangling pointer** to a value that now holds a different
@@ -6640,8 +6671,9 @@ per level of a deep value - a separate open item.
   2026-09-25).** It used to RESEAT the handle it ran on, so a cold op
   through one variable left every alias on the old storage: `var f =
   e; pop(f)` shrank f and not e, breaking "assignment aliases" for
-  exactly the two flat kinds that promote. A SLICE handle still
-  reseats (a view detaches on write anyway). A READ-only general walk
+  exactly the two flat kinds that promote. A SLICE handle is
+  materialized first (every handle of the slice), then promoted in
+  place like any array. A READ-only general walk
   must use `general_copy()`, never `get_vec()` on a handle copy - the
   copy shares the storage, so it would promote the caller's array.
 
@@ -7340,9 +7372,10 @@ and two macros:
   a CALL** (`store_root_call`, resolver.cpp: an assignment or inc-dec
   target's root, an in-place builtin's first argument): inlined, the
   body's expression - a name, an element - takes the call's place and the
-  store lands in THAT location, which is not the held copy for a slice
-  view (its copy detaches on a write) or a flat struct element (a read is
-  a copy). **The in-place builtins follow the rule** (`append(f(), x)`):
+  store lands in THAT location, which is not the held copy for a flat
+  struct element (a read is a copy; a slice view's copy is the same slice
+  since question 3, so that case is now only conservative). **The
+  in-place builtins follow the rule** (`append(f(), x)`):
   the tree-walker holds a value first argument (`lv_builtin_target`,
   types.cpp), the VM compiles it into a fresh temp (the path the sort
   family had), and the element / member forms hold a non-location element
@@ -9342,7 +9375,10 @@ PLACE must call `SharedArrayObj::note_shift()`** after its slice detach
 (today: `builtin_pop`, `builtin_erase_arr`, `builtin_insert_arr`); a
 new shifting op that forgets it lets a loop skip an element silently,
 since only the SHIFT EPOCH sees a shift that restores the length. The
-loop records `fe_mark()` (-1 for a slice view, which never shifts) and
+loop records `fe_mark()` (-1 for a slice view, which never shifts while
+it is one; once another name materialized the slice under the loop, the
+loop's handle moved with it and `fe_shifted` reads the fresh storage's
+epoch) and
 tests it per step - in C++ for the tree-walker and ForeachDynNext, as
 `ArrEpochMark`/`ArrEpochCheck` in the VM and JIT, emitted only when
 `struct_fe_body_inert(body, shift_only)` cannot prove the body

@@ -517,7 +517,7 @@ EvalValue builtin_append(EvalContext *ctx, const ArgLocs *exprList,
         throw CannotChangeConstEx(arg0->start, arg0->end);
 
     if (arr.is_slice())
-        arr.clone_internal_vec();
+        arr.materialize_slice();
 
     /* The element to append is the pre-evaluated `rest[0]` - append is now
      * REST-NATIVE (no node->eval): the tree-walker via append_tw (which delegates
@@ -568,7 +568,7 @@ static EvalValue append_tw(EvalContext *ctx, ExprList *exprList)
         if (!arr.is_readonly() &&
             arr.skind() == SharedArrayObj::Storage::structs) {
             if (arr.is_slice())
-                arr.clone_internal_vec();
+                arr.materialize_slice();
             if (try_construct_into_struct_array(ctx, arr, arg1)) {
                 arr.invalidate_hash();   /* built in-place; nothing to fold in */
                 return target->get();
@@ -619,6 +619,11 @@ EvalValue builtin_pop(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
     if (!n)
         throw OutOfBoundsEx(arg->start, arg->end);
 
+    /* popping a slice pops the slice every name holding it shares
+     * (question 3): it becomes an ordinary array first. It used to
+     * narrow THIS handle's window only. */
+    arr.materialize_slice();
+
     arr.invalidate_hash();   /* pop removes the last element */
 
     /* Read the last element without promoting flat storage. */
@@ -639,28 +644,20 @@ EvalValue builtin_pop(EvalContext *ctx, const ArgLocs *exprList, LValue *target,
             last = arr.get_vec()[last_i].get();          break;
     }
 
-    if (arr.is_slice()) {
-
-        /* Shrink the view by one (shares the parent storage, stays flat). */
-        lval->put(SharedArrayObj(arr, arr.offset(), arr.size() - 1));
-
-    } else {
-
-        arr.clone_aliased_slices(last_i);
-        switch (arr.skind()) {
-            case SharedArrayObj::Storage::ints:
-                arr.flat_ints().pop_back();   break;
-            case SharedArrayObj::Storage::floats:
-                arr.flat_floats().pop_back(); break;
-            case SharedArrayObj::Storage::bools:
-                arr.flat_bools().pop_back();  break;
-            case SharedArrayObj::Storage::objs:
-                arr.flat_objs().pop();        break;
-            default:
-                arr.get_vec().pop_back();     break;
-        }
-        arr.note_shift();   /* #53: a foreach over it raises next step */
+    arr.clone_aliased_slices(last_i);
+    switch (arr.skind()) {
+        case SharedArrayObj::Storage::ints:
+            arr.flat_ints().pop_back();   break;
+        case SharedArrayObj::Storage::floats:
+            arr.flat_floats().pop_back(); break;
+        case SharedArrayObj::Storage::bools:
+            arr.flat_bools().pop_back();  break;
+        case SharedArrayObj::Storage::objs:
+            arr.flat_objs().pop();        break;
+        default:
+            arr.get_vec().pop_back();     break;
     }
+    arr.note_shift();   /* #53: a foreach over it raises next step */
 
     return last;
 }
@@ -697,20 +694,12 @@ EvalValue builtin_erase_arr(LValue *lval, int_type index)
 
     arr.invalidate_hash();   /* any erase changes the array's hash */
 
-    if (arr.is_slice()) {
+    /* erasing from a slice erases from the slice every name holding it
+     * shares (question 3): it becomes an ordinary array first. It used
+     * to narrow THIS handle's window for a first or last element. */
+    arr.materialize_slice();
 
-        /* Erasing the first/last element of a slice is just a narrower view. */
-        if (index == 0) {
-            lval->put(SharedArrayObj(arr, arr.offset() + 1, n - 1));
-            return true;
-        }
-        if (static_cast<size_type>(index) == n - 1) {
-            lval->put(SharedArrayObj(arr, arr.offset(), n - 1));
-            return true;
-        }
-        arr.clone_internal_vec();   /* middle: own the data, keep-flat */
-
-    } else if (static_cast<size_type>(index) == n - 1) {
+    if (static_cast<size_type>(index) == n - 1) {
 
         /*
          * Erasing the LAST element shifts nothing: only a slice that actually
@@ -760,7 +749,7 @@ EvalValue builtin_insert_arr(LValue *lval, int_type index, const EvalValue &val)
     arr.invalidate_hash();   /* any insert changes the array's hash */
 
     if (arr.is_slice())
-        arr.clone_internal_vec();          /* keep-flat; standalone, off=0 */
+        arr.materialize_slice();
     else if (static_cast<size_type>(index) != n)
         arr.clone_all_slices();
 
@@ -1099,17 +1088,13 @@ sort_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0, LValue *lva
 
     SharedArrayObj &arr = val0.get<SharedArrayObj>();
 
-    if (arr.is_slice()) {
-
-        arr.clone_internal_vec();
-
-        if (lval)
-            lval->put(arr);
-
-    } else {
-
+    /* a slice is sorted / reversed as the array every name holding it
+     * shares (question 3): `arr` is a handle of it, so materializing
+     * moves the variable's handle too */
+    if (arr.is_slice())
+        arr.materialize_slice();
+    else
         arr.clone_all_slices();
-    }
 
     arr.invalidate_hash();   /* sort reorders -> order-dependent hash changes */
 
@@ -1421,17 +1406,13 @@ reverse_core(EvalContext *ctx, const ArgLocs *exprList, EvalValue val0,
 
     SharedArrayObj &arr = val0.get<SharedArrayObj>();
 
-    if (arr.is_slice()) {
-
-        arr.clone_internal_vec();
-
-        if (lval)
-            lval->put(arr);
-
-    } else {
-
+    /* a slice is sorted / reversed as the array every name holding it
+     * shares (question 3): `arr` is a handle of it, so materializing
+     * moves the variable's handle too */
+    if (arr.is_slice())
+        arr.materialize_slice();
+    else
         arr.clone_all_slices();
-    }
 
     arr.invalidate_hash();   /* reverse changes the order-dependent hash */
 

@@ -9,7 +9,9 @@
 #include "intrusiveptr.h"
 #include "errors.h"
 #include <vector>
-#include <unordered_set>
+#include <unordered_map>
+#include <utility>
+#include <cstdint>
 #include <cassert>
 #include <new>
 
@@ -55,6 +57,23 @@ public:
         return len;
     }
 };
+
+#ifdef TESTS
+/* the group counter's renumbering point, lowered by a test that must
+ * reach the renumbering without four billion slices (types.cpp) */
+extern uint32_t g_slice_group_limit;
+#endif
+
+/* where SharedArrayObjTempl::new_slice_group renumbers its storage's
+ * slice groups: before the counter could wrap */
+inline uint32_t slice_group_limit()
+{
+#ifdef TESTS
+    return g_slice_group_limit;
+#else
+    return UINT32_MAX;
+#endif
+}
 
 template <class LValueT>
 class SharedArrayObjTempl final {
@@ -193,16 +212,29 @@ private:
             ovec_type ovec;    /* kind == objs */
         };
 
-        /* Lever 3 inc 1 (2026-07-27): POOLED nodes - the per-slice
+        /*
+         * Every live handle of a slice VIEW over this storage, keyed by the
+         * slice's GROUP (its identity - see SharedArrayObjTempl::group):
+         * all handles of one slice share a key, so a write through any of
+         * them finds its siblings in O(group size), and a write to this
+         * storage finds every view it would show through.
+         *
+         * Lever 3 inc 1 (2026-07-27): POOLED nodes - the per-slice
          * register/unregister was ~27% malloc/free on the slice-loop
          * bench (a hashtable node per insert). Same drop-in as the dict's
          * inner_type (H2 v2): node-POINTER stability untouched, ASan
          * pass-through via the pool itself. Elements are raw pointers -
-         * no held-node invariants beyond the container's own. */
-        std::unordered_set<SharedArrayObjTempl *,
-                           std::hash<SharedArrayObjTempl *>,
-                           std::equal_to<SharedArrayObjTempl *>,
-                           PoolAlloc<SharedArrayObjTempl *>> slices;
+         * no held-node invariants beyond the container's own.
+         */
+        std::unordered_multimap<
+            uint32_t, SharedArrayObjTempl *,
+            std::hash<uint32_t>, std::equal_to<uint32_t>,
+            PoolAlloc<std::pair<const uint32_t, SharedArrayObjTempl *>>>
+            slices;
+
+        /* the last group number handed out for a view over this storage
+         * (new_slice_group; renumbered densely before it would wrap) */
+        uint32_t slice_groups = 0;
 
         /*
          * MIRROR of `!slices.empty()`, maintained by slices_add/slices_del
@@ -254,10 +286,11 @@ private:
          * in-place strs/structs promotion do NOT bump it - they move no
          * element to another position the loop has not reached. A slice
          * view never shifts: every shifting op on its parent detaches the
-         * overlapping views first, and an op through the view reseats or
-         * clones the VIEW's own handle - so a foreach over a slice does
-         * not check (fe_mark answers -1). An int_type so the JIT can
-         * compare it against a frame slot's payload in one instruction.
+         * overlapping views first, and an op through the view materializes
+         * it - so a foreach over a slice marks -1 and checks only once the
+         * slice was materialized under it (fe_shifted). An int_type so the
+         * JIT can compare it against a frame slot's payload in one
+         * instruction.
          */
         int_type shift_epoch = 0;
 
@@ -311,6 +344,22 @@ public:
     size_type len;
     bool slice;
 
+    /*
+     * THE SLICE'S IDENTITY (question 3, plans/open-language-questions.md:
+     * Python's rule, 2026-10-18). A slice is a separate array the moment
+     * it is TAKEN, and every later copy of it - an assignment, an
+     * argument, an element stored or read back - is the SAME array, as
+     * any array is. Internally it stays a lazy VIEW (copy-on-write): each
+     * handle carries the window, and `group` names the slice it belongs
+     * to among the views of its storage. Every handle copy keeps it, a new
+     * slice expression takes a fresh one (new_slice_group), and a write
+     * through ANY handle of the slice turns the whole group into one
+     * ordinary array at once (materialize_slice), so every name holding
+     * the slice sees the write. Meaningful only while `slice` is set; it
+     * sits in the handle's tail padding, so the handle did not grow.
+     */
+    uint32_t group;
+
     /* Special constructors */
 
     SharedArrayObjTempl(const vec_type &arr) = delete;
@@ -320,6 +369,7 @@ public:
         , off(0)
         , len(shobj->vec.size())
         , slice(false)
+        , group(0)
     { }
 
     /* Flat (unboxed) int/float storage - see plans/archived/typed-arrays.md. */
@@ -328,6 +378,7 @@ public:
         , off(0)
         , len(shobj->ivec.size())
         , slice(false)
+        , group(0)
     { }
 
     SharedArrayObjTempl(fvec_type &&arr)
@@ -335,6 +386,7 @@ public:
         , off(0)
         , len(shobj->fvec.size())
         , slice(false)
+        , group(0)
     { }
 
     SharedArrayObjTempl(bvec_type &&arr)
@@ -342,6 +394,7 @@ public:
         , off(0)
         , len(shobj->bvec.size())
         , slice(false)
+        , group(0)
     { }
 
     /* Flat POD-struct storage (plans/archived/structs.md phase 7). `len` is the element
@@ -354,6 +407,7 @@ public:
                                            shobj->svec.stride)
                   : 0)
         , slice(false)
+        , group(0)
     { }
 
     /* Flat STRING storage (top-10 #7). */
@@ -362,6 +416,7 @@ public:
         , off(0)
         , len(shobj->tvec.size())
         , slice(false)
+        , group(0)
     { }
 
     /* Flat CLASS storage (plans/class-and-box.md step 2). */
@@ -370,39 +425,73 @@ public:
         , off(0)
         , len(static_cast<size_type>(shobj->ovec.size()))
         , slice(false)
+        , group(0)
     { }
 
-    /* THE ONLY two places shobj->slices is mutated from this class - see
-     * SharedObject::has_slices for why the mirror must not drift. */
+    /* THE ONLY places shobj->slices is mutated from this class (besides
+     * materialize_slice and the renumbering, which go through the same
+     * map) - see SharedObject::has_slices for why the mirror must not
+     * drift. Each handle `p` is entered under its own group. */
     void slices_add(SharedArrayObjTempl *p)
     {
-        shobj->slices.insert(p);
+        shobj->slices.emplace(p->group, p);
         shobj->has_slices = true;
     }
     void slices_del(SharedArrayObjTempl *p)
     {
-        shobj->slices.erase(p);
+        shobj->slices.erase(slices_entry(p));
         shobj->has_slices = !shobj->slices.empty();
     }
+    /* a moved handle: the registry entry follows it to its new address */
+    void slices_move(SharedArrayObjTempl *from, SharedArrayObjTempl *to)
+    {
+        slices_entry(from)->second = to;
+    }
+    /* `p`'s entry - every slice handle has one, among the adjacent
+     * entries of its group */
+    auto slices_entry(SharedArrayObjTempl *p)
+    {
+        const auto r = shobj->slices.equal_range(p->group);
+        auto it = r.first;
+        while (it->second != p) {
+            ++it;
+            ML_CHECK(it != r.second); /* INT-COV-EXEMPT: p is registered */
+        }
+        return it;
+    }
 
+    /* a group number no live view of this storage has (see `group`) */
+    uint32_t new_slice_group()
+    {
+        if (shobj->slice_groups >= slice_group_limit())
+            renumber_slice_groups();
+        return ++shobj->slice_groups;
+    }
+    void renumber_slice_groups();
+
+    /* A NEW slice - a separate array, with its own group - of `obj`'s
+     * storage. A copy of an existing slice is the copy constructor. */
     SharedArrayObjTempl(const SharedArrayObjTempl &obj, size_type off, size_type len)
         : shobj(obj.shobj)
         , off(off)
         , len(len)
         , slice(true)
+        , group(0)
     {
+        group = new_slice_group();
         slices_add(this);
     }
 
     /* Regular constructors */
 
-    SharedArrayObjTempl() : off(0), len(0), slice(false) { }
+    SharedArrayObjTempl() : off(0), len(0), slice(false), group(0) { }
 
     SharedArrayObjTempl(const SharedArrayObjTempl &obj)
         : shobj(obj.shobj)
         , off(obj.off)
         , len(obj.len)
         , slice(obj.slice)
+        , group(obj.group)
     {
         if (slice)
             slices_add(this);
@@ -413,10 +502,10 @@ public:
         , off(obj.off)
         , len(obj.len)
         , slice(obj.slice)
+        , group(obj.group)
     {
         if (slice) {
-            slices_del(&obj);
-            slices_add(this);
+            slices_move(&obj, this);
             obj.slice = false;
         }
     }
@@ -436,6 +525,7 @@ public:
         off = obj.off;
         len = obj.len;
         slice = obj.slice;
+        group = obj.group;
 
         if (slice)
             slices_add(this);
@@ -452,10 +542,10 @@ public:
         off = obj.off;
         len = obj.len;
         slice = obj.slice;
+        group = obj.group;
 
         if (slice) {
-            slices_del(&obj);
-            slices_add(this);
+            slices_move(&obj, this);
             obj.slice = false;
         }
 
@@ -468,7 +558,24 @@ public:
             slices_del(this);
     }
 
+    /* THIS handle only gets its own copy of its range (clone(), and
+     * building a fresh array from a handle) - never what a WRITE through
+     * a slice does: that is materialize_slice, which moves every handle
+     * of the slice. */
     void clone_internal_vec();
+
+    /*
+     * A write through a slice: the slice - EVERY handle of its group -
+     * becomes one ordinary array holding a copy of the window, so all the
+     * names that share the slice see the write and the storage it was
+     * taken from does not. A no-op on a non-slice. A read-only view stays
+     * read-only (materializing is invisible to a program).
+     */
+    void materialize_slice();
+
+    /* A write to this (non-slice) storage at `index` (or anywhere, for
+     * all_slices): every slice whose window it would show through is
+     * materialized first, one copy per slice. */
     void clone_aliased_slices(size_type index);
     void clone_all_slices() { clone_aliased_slices(all_slices); }
 
@@ -653,13 +760,24 @@ public:
     bool is_slice() const { return slice; }
 
     /* #53 option 1 - see SharedObject::shift_epoch. `fe_mark` is what a
-     * foreach records at its start (-1 == never check: a slice view, or
-     * no storage); `fe_shifted(mark)` is its per-step test; `note_shift`
-     * is called by every op that moves elements in place. */
+     * foreach records at its start; `fe_shifted(mark)` is its per-step
+     * test; `note_shift` is called by every op that moves elements in
+     * place. A mark of -1 means a SLICE view (or no storage): a view
+     * never shifts - every shifting op on its storage materializes the
+     * overlapping views first, and any op through the view materializes
+     * it - so it is not shifted while the handle is still a view. Once
+     * the slice was materialized (the loop's handle is one of its group,
+     * so it moved with it) it is an ordinary array on FRESH storage,
+     * whose epoch starts at 0: shifted iff that epoch moved. */
     int_type fe_mark() const
     { return (slice || !shobj) ? -1 : shobj->shift_epoch; }
-    bool fe_shifted(int_type mark) const   /* mark != -1: shobj is set */
-    { return mark != -1 && shobj->shift_epoch != mark; }
+    bool fe_shifted(int_type mark) const   /* a loop's container has
+                                              * storage: size() reads it */
+    {
+        if (mark == -1)
+            return !slice && shobj->shift_epoch != 0;
+        return shobj->shift_epoch != mark;
+    }
     void note_shift() { shobj->shift_epoch++; }
 
     /*
@@ -755,13 +873,26 @@ public:
             return nullptr;
         if (o->has_slices != !o->slices.empty())
             return "the storage's has_slices mirror disagrees with its set";
-        for (const SharedArrayObjTempl *p : o->slices)
-            if (p->shobj.get() != o || !p->slice)
+        for (const auto &e : o->slices) {
+            const SharedArrayObjTempl *p = e.second;
+            if (p->shobj.get() != o || !p->slice || p->group != e.first)
                 return "the storage's slice set names a view that is not "
                        "a slice of it";
+            if (e.first > o->slice_groups)
+                return "a slice's group was never handed out";
+        }
         if (!slice)
             return nullptr;
-        if (!o->slices.count(const_cast<SharedArrayObjTempl *>(this)))
+        bool found = false;
+        auto r = o->slices.equal_range(group);
+        for (auto it = r.first; it != r.second; ++it) {
+            const SharedArrayObjTempl *p = it->second;
+            if (p == this)
+                found = true;
+            else if (p->off != off || p->len != len)
+                return "two handles of one slice disagree on its window";
+        }
+        if (!found)
             return "a slice is not registered in its storage's set";
         SharedArrayObjTempl whole;
         whole.shobj = shobj;
