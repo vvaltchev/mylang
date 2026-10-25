@@ -130,10 +130,11 @@ ParseContext::~ParseContext() = default;
 /*
  * #137: one level of source nesting = one level of C recursion, so the depth
  * is counted and capped (see ParseContext::MAX_NEST). Scoped, so SIBLINGS do
- * not accumulate - only nesting does. Guards the two recursion points that
+ * not accumulate - only nesting does. Guards the recursion points that
  * can nest without bound: the expression primary (parens, array/dict
- * literals, call arguments) and the statement (a block, or a brace-less
- * if/loop body, which is why the guard is in pStmt and not pBlock).
+ * literals, call arguments), the statement (a block, or a brace-less
+ * if/loop body, which is why the guard is in pStmt and not pBlock) and a
+ * type annotation (`array<array<...>>`, pTypeAnnot).
  */
 namespace {
 struct NestGuard {
@@ -342,6 +343,7 @@ static int skip_angle_balanced(ParseContext &c, int start)
  */
 static std::shared_ptr<TypeAnnot> pTypeAnnot(ParseContext &c)
 {
+    NestGuard ng(c);           /* `array<array<...>>` recurses here (#137) */
     auto ta = std::make_shared<TypeAnnot>();
     const Loc loc = c.get_loc();
 

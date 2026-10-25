@@ -23981,16 +23981,18 @@ static void count_chunk_ops(const Chunk &chunk, VmOpCounts &c);
  * DEADLYSIGNAL in debug. Built here rather than as a `tests` entry because a
  * 300-deep source is generated, not written.
  *
- * Both recursion points are covered: the expression primary (parens, array
- * literals) and the block/statement chain - a bare `{ ... }` reaches pBlock
+ * Every recursion point is covered: the expression primary (parens, array
+ * literals), the block/statement chain - a bare `{ ... }` reaches pBlock
  * from its own loop, never through pStmt, so the statement guard alone left
- * `{{{...}}}` unbounded (watched: it crashed at 5000).
+ * `{{{...}}}` unbounded (watched: it crashed at 5000) - and a type
+ * annotation, in a declaration and in a parameter (pTypeAnnot had no guard
+ * until 2026-10-12: `array<` 20000 deep was an ASan stack-overflow).
  */
 static bool deep_nesting_refused()
 {
     struct Case { const char *what; std::string src; };
 
-    std::string parens, arrays, blocks, ifs;
+    std::string parens, arrays, blocks, ifs, annots, pannots;
     for (int i = 0; i < 400; i++) { parens += '('; arrays += '['; }
     parens += '1';
     arrays += '1';
@@ -24000,12 +24002,24 @@ static bool deep_nesting_refused()
     for (int i = 0; i < 400; i++) { blocks += '{'; ifs += "if (1) "; }
     for (int i = 0; i < 400; i++) blocks += '}';
     ifs += "print(1);";
+    pannots = "func f(";
+    for (int i = 0; i < 400; i++) {
+        annots += "array<";
+        pannots += "dict<str, ";
+    }
+    annots += "int";
+    pannots += "int";
+    for (int i = 0; i < 400; i++) { annots += "> "; pannots += "> "; }
+    annots += "a;";
+    pannots += "d) { return 1; }";
 
     const Case cases[] = {
         { "nested parens",  parens },
         { "nested arrays",  arrays },
         { "nested blocks",  blocks },
         { "nested ifs",     ifs    },
+        { "nested type annotations", annots },
+        { "nested parameter annotations", pannots },
     };
 
     bool ok = true;
@@ -24031,20 +24045,26 @@ static bool deep_nesting_refused()
 
     /* ... and the depth just BELOW the cap still parses, so the guard is a
      * bound and not a blanket refusal */
-    std::string shallow;
+    std::string shallow, shallow_annot;
     for (int i = 0; i < 100; i++) shallow += '(';
     shallow += '1';
     for (int i = 0; i < 100; i++) shallow += ')';
     shallow += ';';
-    try {
-        std::vector<Tok> toks;
-        lexer(shallow, 1, toks);
-        ParseContext pc(TokenStream(toks), true);
-        unique_ptr<Construct> root = pBlock(pc);
-    } catch (const Exception &e) {
-        fprintf(stderr, "deep_nesting: 100 levels REFUSED (%s) - the cap is "
-                        "too low\n", e.name);
-        ok = false;
+    for (int i = 0; i < 100; i++) shallow_annot += "array<";
+    shallow_annot += "int";
+    for (int i = 0; i < 100; i++) shallow_annot += "> ";
+    shallow_annot += "a;";
+    for (const std::string *src : {&shallow, &shallow_annot}) {
+        try {
+            std::vector<Tok> toks;
+            lexer(*src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+        } catch (const Exception &e) {
+            fprintf(stderr, "deep_nesting: 100 levels REFUSED (%s) - the "
+                            "cap is too low\n", e.name);
+            ok = false;
+        }
     }
 
     return ok;

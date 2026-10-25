@@ -550,8 +550,9 @@ When `x` really does not exist the guarded code is also *deleted* — the guard
 folds to `false` and the dead branch is dropped — so the branch may use `x`
 any way it likes: compare it, copy it into a local, pass it on.
 
-**Nesting is bounded.** Expressions and blocks may nest up to 256 levels; past
-that the program is refused with a syntax error. The limit is far above
+**Nesting is bounded.** Expressions, blocks and type annotations
+(`array<array<int>>`) may nest up to 256 levels; past that the program is
+refused with a syntax error. The limit is far above
 anything written or generated in practice, and exists so that a pathological
 input is *refused* rather than crashing the interpreter.
 
