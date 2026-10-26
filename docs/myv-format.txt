@@ -2,8 +2,16 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 37.  This document describes the on-disk image exhaustively:
+Format version 38.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v38: a HandlerSite (9.18) ends with `chain` in place of `has_rethrow` -
+question 12, implicit exception chaining.  A region may now be a CHAIN
+MARKER: no clause and no finally, only a chain.  The dispatch parks every
+caught exception, so the old flag had nothing left to say.  SetPend's
+`target2` gains a meaning: 1 frees the exception parked in its region (a
+catch body's exit emits it), anything else must be -1 - the verifier
+refuses another value.)
 
 (v37: a Field (7.1) and a Param (8) each END with an `annot` (2.2), a
 TypeAnnot record - the field's declared type, the parameter's run-time FIT
@@ -1041,15 +1049,28 @@ re-resolves it through `vm_lookup_builtin`; an unknown name is refused.
     u32   fin_pc                    (signed) the shared finally, or -1 when
                                     the try has none (a no-match then
                                     re-raises to the next handler out)
-    bool  has_rethrow               any catch/finally body may `rethrow`,
-                                    so the dispatch must PARK the caught
-                                    exception in the region's slot
+    u32   chain                     (signed, v38) the region whose parked
+                                    exception an exception leaving this
+                                    region's body remembers as its context,
+                                    or -1
 
 Indexed by TRY REGION ID - the same id the exception ops carry - so entry
 i describes region i.  A try whose native lowering bailed leaves an EMPTY
-entry (zero clauses, fin_pc -1): a hole in the id space, harmless.  No
-PushHandler names a hole: the loader refuses an image whose PushHandler
-names an empty entry (2026-10-21, myv_fuzz).
+entry (zero clauses, fin_pc -1, chain -1): a hole in the id space,
+harmless.  No PushHandler names a hole: the loader refuses an image whose
+PushHandler names an empty entry (2026-10-21, myv_fuzz).
+
+A CHAIN MARKER (v38, question 12 - implicit exception chaining) is a
+region with a chain.  Codegen runs a try's catch bodies under one region
+chaining to the try's own (it gets a finally copy as its fin_pc when the
+try has a finally), and each RERAISE copy of a finally - the copy a
+fin_pc names, entered only by the dispatch - under a marker with no
+clause and no finally whose chain is the region that parked the
+propagating exception (a normal exit runs its own copy, under no marker).
+The dispatch reads a marker as it pops it, before its clauses: when the
+chain region's slot holds an exception, the in-flight exception remembers
+it.  The loader refuses a pushed marker whose chain is
+not below the chunk's try region count (the {exc, pend} slice it indexes).
 
 This is PRIMARY data, not derived: it IS what the raise path matches
 against.  The interpreted CatchTest/Reraise chain that used to mirror it

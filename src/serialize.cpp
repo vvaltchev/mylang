@@ -1373,7 +1373,7 @@ void write_chunk(Writer &w, const Chunk &c)
             w.u32v(static_cast<uint32_t>(cl.body_pc));
         }
         w.u32v(static_cast<uint32_t>(hs.fin_pc));
-        w.boolv(hs.has_rethrow);
+        w.u32v(static_cast<uint32_t>(hs.chain));       /* v38 */
     }
 
     /* `ref_slots` is NOT written (v18): the loader derives it from the
@@ -1678,7 +1678,7 @@ void read_chunk(Reader &r, Chunk &c)
                 hs.clauses[j].body_pc = static_cast<int32_t>(r.u32v());
             }
             hs.fin_pc = static_cast<int32_t>(r.u32v());
-            hs.has_rethrow = r.boolv();
+            hs.chain = static_cast<int32_t>(r.u32v());
         }
     }
 

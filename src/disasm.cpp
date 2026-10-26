@@ -312,7 +312,7 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         for (size_t i = 0; i < ch.handler_sites.size(); i++) {
             const auto &hs = ch.handler_sites[i];
             s << ";   [" << i << "]  ";
-            if (hs.clauses.empty() && hs.fin_pc < 0) {
+            if (hs.clauses.empty() && hs.fin_pc < 0 && hs.chain < 0) {
                 s << "(none)\n";
                 continue;
             }
@@ -333,8 +333,9 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             if (hs.fin_pc >= 0)
                 s << (hs.clauses.empty() ? "" : "  ")
                   << "finally L" << hs.fin_pc;
-            if (hs.has_rethrow)
-                s << "  [rethrow]";
+            if (hs.chain >= 0)
+                s << (hs.clauses.empty() && hs.fin_pc < 0 ? "" : "  ")
+                  << "chain [" << hs.chain << "]";
             s << "\n";
         }
     }
@@ -1756,7 +1757,8 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
              * inlines its own finally, so it never sets a pending action). */
             row << "set.pend     "
                 << (in.target == 0 ? "normal" : "reraise")
-                << "  region=" << in.a_lit();
+                << "  region=" << in.a_lit()
+                << (in.target2 == 1 ? "  drop" : "");
             break;
         case OpCode::EndFinally:
             row << "end.finally  region=" << in.a_lit();

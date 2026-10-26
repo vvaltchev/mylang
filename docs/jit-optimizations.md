@@ -18148,3 +18148,60 @@ Every control (the restore rebuilt, the same checks run) was clean. The
 `-rt` cases pin what 93 cannot: a compound refusal is a compile error,
 which a self-asserting program cannot catch; the slice-window key is
 the one only 93 sees.
+
+## Question 12 - THE CHAIN MARKERS AND WHAT THEY COST (2026-10-27)
+
+Implicit exception chaining (CLAUDE.md, *IMPLICIT EXCEPTION CHAINING*)
+needs the VM to know, as an exception unwinds, which catch bodies and
+which re-raising finallys it leaves. That is a DYNAMIC fact - a callee
+can raise, and the JIT's deleted runs collapse their pcs - so it is a
+handler region, a CHAIN MARKER the dispatch reads as it pops it, not a
+pc range. Every catch body runs under a guard region (the #91 guard,
+now pushed with or without a finally), and the dispatch parks every
+caught exception (`has_rethrow` is gone).
+
+The first shape ran the ONE shared finally under a marker, telling the
+normal entry from the re-raise one by the pend. The marker's push and
+pop then ran on the path that throws nothing. Ir, `OPT=1 ASSERTS=0
+LTO=0`, scale 1, against the Q11 tip:
+
+    bench                   one shared copy   split   + free at exit
+    42_exceptions                 +2.96%     +3.04%       +4.43%
+    69_exc_crossframe             +3.12%     +3.07%       +2.85%
+    70_exc_runtime_error          +8.45%     +8.71%      +12.85%
+    71_exc_no_throw               +0.06%     +0.06%       +0.25%
+    72_exc_finally               +21.26%     +1.92%       +2.04%
+
+So the finally is split: the normal exits run their own copy under no
+marker, and each fin_pc names a RERAISE copy under one - which made the
+pend test (`chain_fin`) redundant. 72's remaining +2% is one jump per
+try/finally, over the re-raise copy, which a linear layout cannot avoid
+without a cold section. The throw/catch cost of the split shape, about
+33 Ir per caught exception on 70 (callgrind, per function): the guard's
+push and pop in the fragment +12, the larger exception record's
+construction and destruction +16 (the serial, the context pointer and
+its release loop), the park and the marker test in vm_raise +8.
+
+The last column is the shipped one. Parking left the last caught
+exception alive until its try ran again or its frame returned, which
+the object census sees: `tests/int/12_census.my` failed under the VM
+and passed under the tree-walker, which frees its copy as the catch
+ends. So a catch body's exits now free it - a `SetPend` flagged with
+`target2 = 1`, whose JIT form calls `jit_drop_caught` with the slot the
+inline store just addressed (passing the region instead and letting the
+helper find the slot cost 6 Ir more) - and the dispatch frees a
+marker's exception once it has chained it. That is about 17 Ir more per
+caught exception on 70, the call around a free that vm_raise used to do
+inline. Not done: a catch body that provably cannot raise (70's is
+`caught++`) needs no guard, no park and no free.
+
+Sabotaged (each restored with a plain copy + touch, rebuilt inside the
+restore, a control after the set): the tree-walker's catch or finally
+hook, the dispatch's marker read, the free at a catch exit and the
+dispatch's free (each fails the census unit), a move instead of a clone in the
+Rethrow op and in jit_rethrow, no guard without a finally, the normal
+finally copy under a marker, the re-raise copy without one, the serial
+identity, the walk bound, the chain not stored in an image, the loader's
+chain check, a chain frozen at its head only, a bound value copied, and
+an "Uncaught" header on every chain entry. Every one failed a check;
+the image one fails bt_oracle's `.myv` configuration, the rest -rt.

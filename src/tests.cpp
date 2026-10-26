@@ -12448,6 +12448,26 @@ static const std::vector<test> tests =
     },
 
     {
+        /* question 12: the first rethrow MOVED the caught exception out
+         * of its slot in the VM, and the second aborted */
+        "a second rethrow, after a try in the catch body caught the first",
+        {
+            "struct E { int v; }",
+            "var got = \"\";",
+            "func f() {",
+            "   try {",
+            "       throw E(1);",
+            "   } catch (E as e) {",
+            "       try { rethrow; } catch (E as e2) { got += str(e2.v); }",
+            "       rethrow;",
+            "   }",
+            "}",
+            "try { f(); } catch (E as e3) { got += \" outer\" + str(e3.v); }",
+            "assert(got == \"1 outer1\");",
+        },
+    },
+
+    {
         "Two struct exception types, the right catch fires",
         {
             "struct A { int x; }",
@@ -28957,6 +28977,267 @@ static std::string nc_run(const std::string &src, ExecEngine eng, bool fold)
 }
 
 /*
+ * Question 12, implicit exception chaining: the uncaught report names the
+ * exceptions the uncaught one was raised while handling, oldest first -
+ * the README's rules, one program each, pinned as the report's header
+ * lines (each names the exception, its data and its caret) in the
+ * tree-walker and the VM, folded and not. One report is pinned whole.
+ */
+static bool exc_chain_report()
+{
+    struct Case {
+        const char *what;
+        std::vector<const char *> src;
+        std::vector<std::string> heads;
+        const char *whole = nullptr;         /* the report, pinned whole */
+    };
+    std::vector<Case> cases = {
+        { "a throw in a catch body", {
+            "struct A { int v; } struct B { int v; }",
+            "try { throw A(1); } catch (A) { throw B(2); }" }, {
+            "Exception 'A', data: A(v: 1) at line 2, col 7:16",
+            "Uncaught exception 'B', data: B(v: 2) at line 2, col 33:42" } },
+        { "a throw in a finally while another propagates", {
+            "struct A { int v; } struct B { int v; }",
+            "try { throw A(1); } finally { throw B(2); }" }, {
+            "Exception 'A', data: A(v: 1) at line 2, col 7:16",
+            "Uncaught exception 'B', data: B(v: 2) at line 2, col 31:40" } },
+        { "a finally reached normally handles nothing", {
+            "struct B { int v; }",
+            "try { print(1); } finally { throw B(2); }" }, {
+            "Uncaught exception 'B', data: B(v: 2) at line 2, col 29:38" } },
+        { "nested handling: the chain is oldest first", {
+            "struct A { int v; } struct B { int v; } struct C { int v; }",
+            "try { throw A(1); } catch (A) {",
+            "  try { throw B(2); } catch (B) { throw C(3); }",
+            "}" }, {
+            "Exception 'A', data: A(v: 1) at line 2, col 7:16",
+            "Exception 'B', data: B(v: 2) at line 3, col 9:18",
+            "Uncaught exception 'C', data: C(v: 3) at line 3, col 35:44" } },
+        { "a rethrow does not remember itself", {
+            "struct A { int v; }",
+            "try { throw A(1); } catch (A) { rethrow; }" }, {
+            "Uncaught exception 'A', data: A(v: 1) at line 2, col 33:39" } },
+        { "a function called from a catch body", {
+            "struct A { int v; } struct B { int v; }",
+            "func g(int x) { throw B(x); }",
+            "try { throw A(1); } catch (A) { g(2); }" }, {
+            "Exception 'A', data: A(v: 1) at line 3, col 7:16",
+            "Uncaught exception 'B', data: B(v: 2) at line 2, col 17:26" } },
+        { "a callback a builtin calls from a catch body", {
+            "struct A { int v; } struct B { int v; }",
+            "func cmp(int a, int b) { if (a == 3) throw B(a); return a < b; }",
+            "try { throw A(1); } catch (A) { var r = [5, 3, 1];",
+            "  sort(r, cmp); }" }, {
+            "Exception 'A', data: A(v: 1) at line 3, col 7:16",
+            "Uncaught exception 'B', data: B(v: 3) at line 2, col 38:47" } },
+        { "`throw e` of the caught value is the caught exception", {
+            "struct A { int v; } struct B { int v; }",
+            "try { throw B(0); } catch (B) {",
+            "  try { throw A(1); } catch (A as e) { throw e; }",
+            "}" }, {
+            "Exception 'B', data: B(v: 0) at line 2, col 7:16",
+            "Uncaught exception 'A', data: A(v: 1) at line 3, col 40:46" } },
+        { "a runtime error in a catch body", {
+            "struct A { int v; }",
+            "try { throw A(1); } catch (A) { print(10 / runtime(0)); }" }, {
+            "Exception 'A', data: A(v: 1) at line 2, col 7:16",
+            "DivisionByZeroEx: Division by zero at line 2, col 44:54" } },
+        { "`throw e` of a caught built-in is the caught exception", {
+            "try { print(10 / runtime(0)); }",
+            "catch (DivisionByZeroEx as e) { throw e; }" }, {
+            "Uncaught exception 'DivisionByZeroEx' at line 2, col 33:39" } },
+        /* the chain is on the RAISED exception: the bound value holds
+         * none, so one kept and thrown later starts afresh (the bind
+         * drops it - a class payload holding the value could otherwise
+         * close a reference cycle through its own wrapper). The caught
+         * exception is a re-thrown built-in that left A's catch body, so
+         * it HAS a chain the bind could copy */
+        { "a caught value thrown later, outside its catch, has no chain", {
+            "struct A { int v; }",
+            "var dyn saved = none;",
+            "try { try { throw A(1); } catch (A) {",
+            "    try { print(1 / runtime(0)); }",
+            "    catch (DivisionByZeroEx as e) { throw e; } } }",
+            "catch (DivisionByZeroEx as e2) { saved = e2; }",
+            "throw saved;" }, {
+            "Uncaught exception 'DivisionByZeroEx' at line 7, col 1:11" } },
+        /* ...and its caret and frames are its own raise's: they were the
+         * first raise's caret with that raise's frames spliced under the
+         * new ones (`again(e)` "called from" `later()`) */
+        { "a caught value thrown later carets and frames its own raise", {
+            "func boom(int x) { return 10 / x; }",
+            "func again(e) { throw e; }",
+            "var dyn saved = none;",
+            "try { try { boom(runtime(0)); }",
+            "      catch (DivisionByZeroEx as e) { again(e); } }",
+            "catch (DivisionByZeroEx as e2) { saved = e2; }",
+            "func later() { throw saved; }",
+            "later();" }, {
+            "Uncaught exception 'DivisionByZeroEx' at line 7, col 16:26" },
+          "Uncaught exception 'DivisionByZeroEx' at line 7, col 16:26\n"
+          "\n"
+          "    func later() { throw saved; }\n"
+          "                   ^^^^^^^^^^\n"
+          "\n"
+          "Backtrace (most recent call first):\n"
+          "  [0] later() at line 7\n"
+          "  [1] main()  at line 8\n" },
+        { "code after a catch body left by break handles nothing", {
+            "struct A { int v; } struct B { int v; }",
+            "for (var i = 0; i < 3; i++) {",
+            "  try { throw A(i); } catch (A) { break; }",
+            "}",
+            "throw B(9);" }, {
+            "Uncaught exception 'B', data: B(v: 9) at line 5, col 1:10" } },
+        { "a finally after a catch body completed handles nothing", {
+            "struct A { int v; } struct B { int v; }",
+            "try { throw A(1); } catch (A) { } finally { throw B(2); }" }, {
+            "Uncaught exception 'B', data: B(v: 2) at line 2, col 45:54" } },
+        { "an exception caught inside a catch body is not remembered", {
+            "struct A { int v; } struct B { int v; } struct C { int v; }",
+            "try { throw A(1); } catch (A) {",
+            "  try { throw B(2); } catch (B) { } }",
+            "throw C(3);" }, {
+            "Uncaught exception 'C', data: C(v: 3) at line 4, col 1:10" } },
+        { "a finally inside a catch body, with both pending", {
+            "struct A { int v; } struct B { int v; } struct C { int v; }",
+            "try { throw A(1); } catch (A) {",
+            "  try { throw B(2); } finally { throw C(3); }",
+            "}" }, {
+            "Exception 'A', data: A(v: 1) at line 2, col 7:16",
+            "Exception 'B', data: B(v: 2) at line 3, col 9:18",
+            "Uncaught exception 'C', data: C(v: 3) at line 3, col 33:42" } },
+        { "a catch body's throw, then its try's finally throws", {
+            "struct A { int v; } struct B { int v; } struct C { int v; }",
+            "try { throw A(1); } catch (A) { throw B(2); }",
+            "finally { throw C(3); }" }, {
+            "Exception 'A', data: A(v: 1) at line 2, col 7:16",
+            "Exception 'B', data: B(v: 2) at line 2, col 33:42",
+            "Uncaught exception 'C', data: C(v: 3) at line 3, col 11:20" } },
+        /* the parser's run unwinds the tree holding A's def before the
+         * report renders, so every payload in the chain is frozen to
+         * text first (freeze_exception_chain) - else a use after free */
+        { "a chain out of a function the parser runs", {
+            "struct A { int v; } struct B { int v; }",
+            "pure func f(int n) {",
+            "  try { throw A(n); } catch (A) { throw B(n + 1); }",
+            "  return 0; }",
+            "func g() { const x = f(1); return x; }",
+            "print(g());" }, {
+            "Exception 'A', data: A(v: 1) at line 3, col 9:18",
+            "Uncaught exception 'B', data: B(v: 2) at line 3, col 35:48" } },
+        { "a second rethrow, after a try caught the first", {
+            "struct A { int v; } struct B { int v; }",
+            "try { throw A(1); } catch (A) {",
+            "  try { rethrow; } catch (A) { }",
+            "  rethrow; }" }, {
+            "Uncaught exception 'A', data: A(v: 1) at line 4, col 3:9" } },
+        { "after a second rethrow is caught, a throw remembers it", {
+            "struct A { int v; } struct B { int v; }",
+            "try { throw A(1); } catch (A) {",
+            "  try { rethrow; } catch (A) { }",
+            "  try { rethrow; } catch (A) { }",
+            "  throw B(2); }" }, {
+            "Exception 'A', data: A(v: 1) at line 2, col 7:16",
+            "Uncaught exception 'B', data: B(v: 2) at line 5, col 3:12" } },
+    };
+    /* a recursion through 20 catch bodies: the 16 most recent */
+    {
+        Case cap { "at most 16 earlier exceptions, and a note", {
+            "struct A { int v; } struct B { int v; }",
+            "func f(int n) {",
+            "  if (n == 0) throw B(0);",
+            "  try { throw A(n); } catch (A) { f(n - 1); }",
+            "}",
+            "f(20);" }, { "(older exceptions are not shown)" } };
+        for (int v = 16; v >= 1; v--)
+            cap.heads.push_back("Exception 'A', data: A(v: "
+                                + std::to_string(v)
+                                + ") at line 4, col 9:18");
+        cap.heads.push_back(
+            "Uncaught exception 'B', data: B(v: 0) at line 3, col 15:24");
+        cases.push_back(cap);
+    }
+    /* the whole first report: the format, separator included */
+    const std::string whole =
+        "Exception 'A', data: A(v: 1) at line 2, col 7:16\n"
+        "\n"
+        "    try { throw A(1); } catch (A) { throw B(2); }\n"
+        "          ^^^^^^^^^\n"
+        "\n"
+        "During handling of the above exception, another exception "
+        "occurred:\n"
+        "\n"
+        "Uncaught exception 'B', data: B(v: 2) at line 2, col 33:42\n"
+        "\n"
+        "    try { throw A(1); } catch (A) { throw B(2); }\n"
+        "                                    ^^^^^^^^^\n";
+
+    bool ok = true;
+
+    /*
+     * The WALK's bound, which no report shows (the printer keeps the same
+     * number): an escape attaches nothing to a chain already
+     * EXC_CONTEXT_MAX deep - it records the cut and stops, so a recursion
+     * through catch bodies never walks further than that per escape - and
+     * one level shallower still attaches.
+     */
+    for (const int deep : { EXC_CONTEXT_MAX, EXC_CONTEXT_MAX - 1 }) {
+        DivisionByZeroEx e;
+        RuntimeException *tail = &e;
+        for (int i = 0; i < deep; i++) {
+            tail->context.reset(new DivisionByZeroEx());
+            tail = tail->context.get();
+        }
+        exc_note_context(e, DivisionByZeroEx());
+        int n = 0;
+        for (const RuntimeException *c = e.context.get(); c;
+             c = c->context.get())
+            n++;
+        const bool full = deep == EXC_CONTEXT_MAX;
+        if (n != EXC_CONTEXT_MAX || e.context_cut != full) {
+            fprintf(stderr, "exc_chain_report: a chain %d deep became %d "
+                            "deep, cut %d\n", deep, n, e.context_cut);
+            ok = false;
+        }
+    }
+
+    for (size_t ci = 0; ci < cases.size(); ci++) {
+        const Case &cs = cases[ci];
+        std::string src;
+        for (const char *l : cs.src) {
+            src += l;
+            src += '\n';
+        }
+        for (const ExecEngine eng : { ExecEngine::TreeWalk, ExecEngine::Vm })
+            for (const bool fold : { true, false }) {
+                const std::string got = nc_run(src, eng, fold);
+                const std::string err = got.substr(got.find('|') + 1);
+                std::vector<std::string> heads;
+                std::istringstream in(err);
+                for (std::string ln; std::getline(in, ln); )
+                    if (ln.rfind("Exception '", 0) == 0
+                        || ln.rfind("Uncaught exception '", 0) == 0
+                        || ln.rfind("(older", 0) == 0
+                        || ln.rfind("DivisionByZeroEx:", 0) == 0)
+                        heads.push_back(ln);
+                const bool same = heads == cs.heads
+                                  && (ci != 0 || err == whole)
+                                  && (!cs.whole || err == cs.whole);
+                if (!same) {
+                    fprintf(stderr, "exc_chain_report: %s (%s%s):\n%s\n",
+                            cs.what,
+                            eng == ExecEngine::Vm ? "vm" : "tw",
+                            fold ? "" : ", -nc", err.c_str());
+                    ok = false;
+                }
+            }
+    }
+    return ok;
+}
+
+/*
  * #96: the shape half of the late fold - an equivalence test passes for a
  * late fold that never replaces anything (the kept call computes the same
  * value). After inference, a constant call the program types as the
@@ -34848,11 +35129,13 @@ static bool myv_root_slot_count_checked()
 
 /*
  * 2026-10-21 (myv_fuzz fat-258): a PushHandler naming an EMPTY handler
- * site - no catch clause, no finally - is refused at load. Codegen leaves
- * an empty site only as a hole no PushHandler names; one a mutated image
- * names passed the loader and aborted the JIT's remap check
- * (verify_handler_sites) in an ASSERTS build. Both halves are pinned: the
- * tampered image is refused by name, the intact one loads and runs.
+ * site - no catch clause, no finally, no chain - is refused at load.
+ * Codegen leaves an empty site only as a hole no PushHandler names; one a
+ * mutated image names passed the loader and aborted the JIT's remap check
+ * (verify_handler_sites) in an ASSERTS build. So is a chain marker whose
+ * chain region is past the {exc, pend} slice (question 12). Both halves
+ * are pinned: the tampered image is refused by name, the intact one loads
+ * and runs.
  */
 static bool myv_empty_handler_refused()
 {
@@ -34896,22 +35179,41 @@ static bool myv_empty_handler_refused()
         Chunk::HandlerSite &site =
             prog.root.handler_sites[static_cast<size_t>(region)];
         const Chunk::HandlerSite pristine = site;
+        /* the tampered image is refused, naming `why` */
+        const auto refused = [&](const char *why) {
+            myv_write(prog, path, MyvSourceRef());
+            try {
+                MyvSource img_src;
+                VmProgram loaded = myv_read(path, img_src);
+                fprintf(stderr, "myv_empty_handler_refused: ACCEPTED (%s)\n",
+                        why);
+                ok = false;
+            } catch (Exception &e) {
+                if (std::string(e.name) != "MyvError" || !e.msg
+                        || !strstr(e.msg, why)) {
+                    fprintf(stderr,
+                            "myv_empty_handler_refused: threw %s: %s\n",
+                            e.name, e.msg ? e.msg : "");
+                    ok = false;
+                }
+            }
+        };
+        /* the last PushHandler is the catch body's GUARD, a chain marker
+         * (question 12): empty means no clause, no finally AND no chain */
+        if (pristine.chain < 0) {
+            fprintf(stderr, "myv_empty_handler_refused: the last region "
+                            "is not a chain marker\n");
+            ok = false;
+        }
         site.clauses.clear();
         site.fin_pc = -1;
-        myv_write(prog, path, MyvSourceRef());
-        try {
-            MyvSource img_src;
-            VmProgram loaded = myv_read(path, img_src);
-            fprintf(stderr, "myv_empty_handler_refused: ACCEPTED\n");
-            ok = false;
-        } catch (Exception &e) {
-            if (std::string(e.name) != "MyvError" || !e.msg
-                    || !strstr(e.msg, "empty handler region")) {
-                fprintf(stderr, "myv_empty_handler_refused: threw %s: %s\n",
-                        e.name, e.msg ? e.msg : "");
-                ok = false;
-            }
-        }
+        site.chain = -1;
+        refused("empty handler region");
+        /* a marker's chain indexes the {exc, pend} slice the dispatch
+         * reads, so one past it is refused too */
+        site = pristine;
+        site.chain = prog.root.n_trys;
+        refused("chain region");
         site = pristine;
         myv_write(prog, path, MyvSourceRef());   /* intact: loads + runs */
         MyvSource img_src;
@@ -37495,11 +37797,12 @@ static bool myv_loc_escapes()
 
 /*
  * #78 step B: the HANDLER TABLE describes each try region exactly - clause
- * order, per-clause type/bind/body, the shared finally, and the has_rethrow
- * flag that lets the dispatch skip parking the exception. The table is
- * PRIMARY data (step D deletes the chain), so this pins its CONTENT; the
- * ASSERTS-build verify_handler_sites separately pins that it still agrees
- * with the chain after every pc remap.
+ * order, per-clause type/bind/body, the shared finally, and (question 12)
+ * the CHAIN MARKERS: each try's catch bodies run under a guard region
+ * chaining to the try, and each finally body under a marker chaining to the
+ * region that parked the propagating exception. The table is PRIMARY data
+ * (step D deleted the chain), so this pins its CONTENT; the ASSERTS-build
+ * verify_handler_sites separately pins that its pcs survive every remap.
  */
 #ifdef TESTS
 extern unsigned long g_vm_table_dispatch;   /* #78 step C coverage */
@@ -37516,43 +37819,48 @@ static bool vm_handler_table()
         size_t regions;
         std::vector<size_t> clause_counts;   /* per region */
         std::vector<bool> has_fin;
-        std::vector<bool> rethrow;
+        std::vector<int> chain;              /* -1: not a marker */
     };
+    /* Region ids follow COMPILE order: a try's own id, then the regions of
+     * its body's trys, then its catch GUARD, then the marker of the
+     * finally's RERAISE copy, then the guard's copy's marker. */
     const std::vector<Case> cases = {
-        /* one region, three clauses, no finally, no rethrow */
+        /* one try, three clauses, no finally: the try and its guard */
         { { "struct A { int v; } struct B { int v; }",
             "var r = 0;",
             "try { throw A(1); }",
             "catch (A) { r = 1; } catch (B as e) { r = e.v; }",
             "catch { r = 3; }" },
-          1, { 3 }, { false }, { false } },
-        /* try/finally with NO clauses */
+          2, { 3, 0 }, { false, false }, { -1, 0 } },
+        /* try/finally with NO clauses: the try and the marker of its
+         * finally's reraise copy (the normal copy runs under none) */
         { { "var c = 0;",
             "try { c += 1; } finally { c += 2; }" },
-          1, { 0 }, { true }, { false } },
-        /* clauses AND a finally: the try's region, then its catch
-         * bodies' GUARD - no clause, a copy of the finally - so an
-         * exception leaving a catch body still runs it */
+          2, { 0, 0 }, { true, false }, { -1, 0 } },
+        /* clauses AND a finally: the try, its catch bodies' GUARD - no
+         * clause, a reraise copy of the finally - so an exception leaving
+         * a catch body still runs it, then a marker per reraise copy */
         { { "struct A { int v; }",
             "var r = 0;",
             "try { throw A(1); } catch (A) { r = 1; } finally { r += 10; }" },
-          2, { 1, 0 }, { true, true }, { false, false } },
-        /* A rethrow in the catch body sets the flag - on the INNER try's
-         * region. Region ids follow COMPILE order, and compile_native_try
-         * allocates the outer try's id before descending into its body, so
-         * region 0 is the OUTER try and region 1 the inner one. */
+          4, { 1, 0, 0, 0 }, { true, true, false, false },
+          { -1, 0, 0, 1 } },
+        /* nested: the outer try (0), the inner one in its body (1) and
+         * the inner guard (2), then the outer guard (3) */
         { { "struct A { int v; }",
             "var r = 0;",
             "try {",
             "  try { throw A(1); } catch (A) { r = 1; rethrow; }",
             "} catch (A) { r = 2; }" },
-          2, { 1, 1 }, { false, false }, { false, true } },
-        /* two SEQUENTIAL trys -> two regions, neither rethrows */
+          4, { 1, 1, 0, 0 }, { false, false, false, false },
+          { -1, -1, 1, 0 } },
+        /* two SEQUENTIAL trys -> each with its guard */
         { { "struct A { int v; } struct B { int v; }",
             "var r = 0;",
             "try { throw A(1); } catch (A) { r = 1; }",
             "try { throw B(2); } catch (B) { r = 2; }" },
-          2, { 1, 1 }, { false, false }, { false, false } },
+          4, { 1, 0, 1, 0 }, { false, false, false, false },
+          { -1, 0, -1, 2 } },
     };
 
     const bool jit_was = g_jit_enabled;
@@ -37589,7 +37897,7 @@ static bool vm_handler_table()
             const auto &hs = chunk.handler_sites[r];
             ok = hs.clauses.size() == cs.clause_counts[r]
                  && (hs.fin_pc >= 0) == cs.has_fin[r]
-                 && hs.has_rethrow == cs.rethrow[r];
+                 && hs.chain == cs.chain[r];
             /* every body pc must be a real, in-range instruction */
             for (const auto &cl : hs.clauses)
                 ok = ok && cl.body_pc >= 0
@@ -37605,7 +37913,7 @@ static bool vm_handler_table()
                 cout << "    [" << r << "] clauses "
                      << chunk.handler_sites[r].clauses.size()
                      << " fin " << chunk.handler_sites[r].fin_pc
-                     << " rethrow " << chunk.handler_sites[r].has_rethrow
+                     << " chain " << chunk.handler_sites[r].chain
                      << "\n";
             g_jit_enabled = jit_was;
             return false;
@@ -56876,16 +57184,20 @@ static bool vm_codegen_shapes()
         }, tc))
         return false;
     /* P8 Inc 1: the `throw` is now a native Throw op (not an EvalStmt); the
-     * whole try/catch loop has ZERO fallback. */
+     * whole try/catch loop has ZERO fallback. Question 12: the catch body
+     * runs under its GUARD region, a second push and a clause-less site. */
     const bool try_native_ok =
-        tc.pushhandler == 1 && tc.flstep == 1 && tc.throwop == 1
-        && tc.handler_sites == 1 && tc.handler_clauses == 1;
+        tc.pushhandler == 2 && tc.flstep == 1 && tc.throwop == 1
+        && tc.handler_sites == 2 && tc.handler_clauses == 1;
 
     /* P8 Inc 2b: try/finally lowers natively - a handler region + SetPend on
      * each exit + one EndFinally, zero fallback. #78 step D: the "no clause
      * matched" exit (SetPend(reraise) + Jump Lfin) is GONE from the
      * bytecode - vm_dispatch_exc parks the reraise and resumes at the
-     * table's fin_pc itself - so the plain shape now has ONE SetPend. */
+     * table's fin_pc itself - so the plain shape now has ONE SetPend.
+     * Question 12: the finally is split - the normal exits' copy, and the
+     * RERAISE copy the table's fin_pc names, under a chain MARKER (the
+     * second push) - so two EndFinally. */
     VmOpCounts tf;
     if (!codegen_counts({
             "var c = 0;",
@@ -56894,7 +57206,7 @@ static bool vm_codegen_shapes()
         }, tf))
         return false;
     const bool try_finally_native_ok =
-        tf.pushhandler == 1 && tf.endfinally == 1 && tf.setpend == 1
+        tf.pushhandler == 2 && tf.endfinally == 2 && tf.setpend == 1
        ;
 
     /* P8 Inc 2c: a `return` crossing a finally is native - it INLINES the
@@ -56915,9 +57227,11 @@ static bool vm_codegen_shapes()
      * jmp) is unreachable and the peephole deletes it - and #78 step D
      * removed the handler entry's `set.pend reraise` (the dispatch parks
      * the reraise itself). Only the shared finally block remains, reached
-     * from the handler table's fin_pc. */
+     * from the handler table's fin_pc - the RERAISE copy, under its chain
+     * marker (question 12), the second push; the normal exits' copy is
+     * unreachable and goes with the fall-out path. */
     const bool ret_finally_native_ok =
-        fr.pushhandler == 1 && fr.endfinally == 1 && fr.setpend == 0
+        fr.pushhandler == 2 && fr.endfinally == 1 && fr.setpend == 0
        ;
 
     /* A `break` crossing a finally likewise INLINES the finally at the break
@@ -56938,14 +57252,19 @@ static bool vm_codegen_shapes()
         return false;
     /* ONE SetPend (#78 step D): the normal try exit's. The "no clause
      * matched" reraise exit is gone; the break INLINES the finally rather
-     * than setting a pend. */
+     * than setting a pend. Question 12: the finally's normal and RERAISE
+     * copies have an EndFinally each, the second under a chain marker -
+     * the second push. */
     const bool break_finally_native_ok =
-        bf.pushhandler == 1 && bf.endfinally == 1 && bf.setpend == 1
+        bf.pushhandler == 2 && bf.endfinally == 2 && bf.setpend == 1
         && bf.intbin >= 3;
 
     /* Chaining: a return crossing TWO nested finallys is native - each is
-     * inlined at the return (innermost first), so ZERO fallback. Two trys ->
-     * pushhandler==2 + two shared finallys endfinally==2. */
+     * inlined at the return (innermost first), so ZERO fallback. Two trys,
+     * pushhandler==4 - each finally's RERAISE copy runs under a chain
+     * marker (question 12) - and endfinally==3: both reraise copies, and
+     * the outer normal copy (the inner try's body always returns, so its
+     * normal copy goes with the fall-out path). */
     VmOpCounts cf;
     if (!codegen_func_counts({
             "func f(int n) {",
@@ -56958,7 +57277,7 @@ static bool vm_codegen_shapes()
         }, cf))
         return false;
     const bool chain_finally_native_ok =
-        cf.pushhandler == 2 && cf.endfinally == 2;
+        cf.pushhandler == 4 && cf.endfinally == 3;
 
     /* boxed UNARY `!` in a condition: `if (!x)` (x dyn) -> a UnaryV (the
      * boxed unary) feeding a JumpUnlessTrueV branch, no fallback. */
@@ -58842,6 +59161,9 @@ static const std::vector<extra_check> extra_checks =
       const_fold_equivalence },
     { "parse: a constant call is folded once the program is typed (#96)",
       late_fold_shape },
+    { "exceptions: the uncaught report names the exceptions it was raised "
+      "while handling (question 12)",
+      exc_chain_report },
     { "parse: a function the parser runs runs typed (question 5)",
       parse_time_typed_runs },
     { "check: a dyn value entering a typed place - the messages (#49)",

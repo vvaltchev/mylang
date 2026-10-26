@@ -7920,8 +7920,9 @@ static bool jit_op_eligible(const Instr &in)
      * protocol exceeded the dispatch it replaced for a 4-byte vector
      * push/pop). PushHandler = a capacity check + store + bump (the cold
      * grow falls to jit_push_handler_grow); PopHandler = `finish -= 4`;
-     * SetPend = a byte store into the try region's pend slot. None can
-     * throw -> op_fully_native. (#78 step D: PushHandler carries only the
+     * SetPend = a byte store into the try region's pend slot (a catch
+     * body's exit also frees the parked exception, through the noexcept
+     * jit_drop_caught - question 12). None can throw -> op_fully_native. (#78 step D: PushHandler carries only the
      * region id now, so it emits from emit_op like any other non-branch
      * op.) The raise-side ops need the dynamic-resume design and stay
      * interpreted. */
@@ -27015,6 +27016,15 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.store_byte_base_imm(
             acc.r, static_cast<int32_t>(L.pend_state_pend),
             static_cast<uint8_t>(in.target));
+        if (in.target2 == 1) {
+            /* a catch body's exit (question 12): free the exception the
+             * dispatch parked for it - only at that exit, so the hot
+             * normal exit of a try body pays nothing */
+            emit_call_prologue(e);         /* spills pins, keeps acc.r */
+            e.mov_rr(RDI, acc.r);          /* &pends[base + region] */
+            e.call_direct(jit_drop_caught);
+            emit_call_epilogue(e);
+        }
         return true;
     }
 

@@ -86,7 +86,7 @@ dump_loc_in_error(ostream &o, const Exception &e,
 static void
 format_exception_body(ostream &o, const Exception &e,
                       const std::vector<string> &lines,
-                      const string &src_name)
+                      const string &src_name, bool uncaught)
 {
     if (auto *se = dynamic_cast<const SyntaxErrorEx *>(&e)) {
 
@@ -127,7 +127,8 @@ format_exception_body(ostream &o, const Exception &e,
 
     if (auto *xo = dynamic_cast<const ExceptionObject *>(&e)) {
 
-        o << "Uncaught exception '" << xo->get_name() << "'";
+        o << (uncaught ? "Uncaught exception '" : "Exception '")
+          << xo->get_name() << "'";
         const EvalValue &data = xo->get_data();
         if (!data.is<NoneVal>())
             o << ", data: " << data.get_type()->to_string(data);
@@ -148,12 +149,48 @@ format_exception_body(ostream &o, const Exception &e,
     o << format_backtrace(e);
 }
 
+/*
+ * Question 12: the exceptions `e` was raised while handling, OLDEST first,
+ * each followed by Python's separator - so the report ends with `e` itself.
+ * A chain node is a clone without a backtrace (exc_note_context), so each
+ * prints its header and caret only. At most EXC_CONTEXT_MAX, the youngest;
+ * a note says when older ones were left out, here or when they escaped.
+ */
+static void
+format_exception_context(ostream &o, const Exception &e,
+                         const std::vector<string> &lines,
+                         const string &src_name)
+{
+    const auto *re = dynamic_cast<const RuntimeException *>(&e);
+    if (!re || !re->context)
+        return;
+    std::vector<const RuntimeException *> chain;      /* youngest first */
+    bool cut = re->context_cut;
+    for (const RuntimeException *c = re->context.get(); c;
+         c = c->context.get()) {
+        if (chain.size() == static_cast<size_t>(EXC_CONTEXT_MAX)) {
+            cut = true;
+            break;
+        }
+        chain.push_back(c);
+        cut = cut || c->context_cut;
+    }
+    if (cut)
+        o << "(older exceptions are not shown)\n\n";
+    for (size_t i = chain.size(); i-- > 0; ) {
+        format_exception_body(o, *chain[i], lines, src_name, false);
+        o << "\nDuring handling of the above exception, another exception "
+             "occurred:\n\n";
+    }
+}
+
 void
 format_exception(ostream &o, const Exception &e,
                  const std::vector<string> &lines, const string &src_name,
                  bool compiling)
 {
-    format_exception_body(o, e, lines, src_name);
+    format_exception_context(o, e, lines, src_name);
+    format_exception_body(o, e, lines, src_name, true);
     format_const_eval_note(o, e, compiling);
 }
 

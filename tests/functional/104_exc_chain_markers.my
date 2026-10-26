@@ -1,0 +1,110 @@
+# Question 12: every catch body runs under a guard region and every finally
+# body under a chain marker, so a flow op leaving one must pop it - a
+# break, continue or return out of a finally (entered normally and by a
+# propagating exception), out of a catch body, and a second rethrow after
+# a try in the same catch body caught the first. Warm loops, so the JIT
+# runs them too.
+struct E { int v; }
+struct F { int v; }
+
+func fin_flow(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        try {
+            if (i % 3 == 0)
+                throw E(i);
+            s += 1;
+        } finally {
+            if (i == 9)
+                break;              # entered by E(9), dropped
+            if (i % 3 == 0)
+                continue;           # entered by an E, dropped
+            if (i % 4 == 1)
+                continue;           # entered normally
+            s += 10;
+        }
+        s += 100;
+    }
+    return s;
+}
+
+func fin_return(int x) {
+    try {
+        if (x > 2)
+            throw E(x);
+    } finally {
+        return x * 2;               # drops a propagating E
+    }
+    return -1;
+}
+
+func catch_flow(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        try {
+            throw E(i);
+        } catch (E as e) {
+            if (e.v % 2 == 0)
+                continue;
+            if (e.v == 7)
+                break;
+            s += e.v;
+        } finally {
+            s += 1000;
+        }
+    }
+    return s;
+}
+
+func rethrow_twice(int x) {
+    var got = 0;
+    try {
+        try {
+            throw E(x);
+        } catch (E as e) {
+            try { rethrow; } catch (E as e2) { got += e2.v; }
+            try { rethrow; } catch (E as e3) { got += e3.v * 10; }
+            rethrow;
+        }
+    } catch (E as e4) {
+        got += e4.v * 100;
+    }
+    return got;
+}
+
+func nested_in_finally(int x) {
+    var s = 0;
+    try {
+        try {
+            throw E(x);
+        } finally {
+            try {
+                throw F(x + 1);
+            } catch (F as f) {
+                s += f.v;
+            } finally {
+                s += 1;
+            }
+        }
+    } catch (E as e) {
+        s += e.v * 100;
+    }
+    return s;
+}
+
+var t = 0;
+for (var k = 0; k < 300; k++) {
+    t += fin_flow(12);
+    t += fin_return(k % 5);
+    t += catch_flow(10);
+    t += rethrow_twice(k % 4);
+    t += nested_in_finally(k % 3);
+}
+print(fin_flow(12), fin_return(4), catch_flow(10), rethrow_twice(3),
+      nested_in_finally(2));
+assert(fin_flow(12) == 446);
+assert(fin_return(4) == 8 && fin_return(1) == 2);
+assert(catch_flow(10) == 8009);
+assert(rethrow_twice(3) == 333);
+assert(nested_in_finally(2) == 204);
+print(t);

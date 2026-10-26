@@ -7119,11 +7119,15 @@ EvalValue RethrowStmt::do_eval(EvalContext *ctx, bool rec) const
 {
     /* the parser accepts `rethrow` only inside a catch body of this same
      * function, and do_catch sets `handling` for as long as one runs */
-    RuntimeException *ex = ctx->flow->handling;
+    const RuntimeException *ex = ctx->flow->handling;
     ML_CHECK(ex);
-    ex->loc_start = start;
-    ex->loc_end = end;
-    ex->rethrow();
+    /* a COPY carries the rethrow site's caret: the handled exception stays
+     * as it was caught, for a later rethrow and for the chain (question 12)
+     * - the VM keeps it parked the same way */
+    std::unique_ptr<RuntimeException> c(ex->clone());
+    c->loc_start = start;
+    c->loc_end = end;
+    c->rethrow();
     return none; /* Make compilers unaware of [[noreturn]] happy */
 }
 
@@ -7536,6 +7540,66 @@ EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
 }
 
 /*
+ * Question 12: is `a` the exception `h` itself - a rethrow of it (a clone
+ * keeps the serial), or a `throw` of its caught value (the same struct
+ * instance; a built-in's bound exception object keeps the serial)?
+ */
+static bool exc_same(const RuntimeException &a, const RuntimeException &h)
+{
+    if (a.serial == h.serial)
+        return true;
+    if (!a.is_exception_object() || !h.is_exception_object())
+        return false;
+    const EvalValue &da = static_cast<const ExceptionObject &>(a).get_data();
+    const EvalValue &dh = static_cast<const ExceptionObject &>(h).get_data();
+    return da.is<intrusive_ptr<StructObject>>()
+           && dh.is<intrusive_ptr<StructObject>>()
+           && da.get_ref<intrusive_ptr<StructObject>>().get()
+                  == dh.get_ref<intrusive_ptr<StructObject>>().get();
+}
+
+/* Declared in errors.h - see the contract there. */
+void exc_note_context(RuntimeException &e, const RuntimeException &handled)
+{
+    if (exc_same(e, handled)) {
+        if (!e.context) {
+            e.context = handled.context;
+            e.context_cut = handled.context_cut;
+        }
+        return;
+    }
+    RuntimeException *tail = &e;
+    int depth = 0;
+    while (tail->context) {
+        tail = tail->context.get();
+        if (exc_same(*tail, handled))
+            return;
+        if (++depth == EXC_CONTEXT_MAX) {
+            e.context_cut = true;
+            return;
+        }
+    }
+    RuntimeException *c = handled.clone();
+    c->backtrace.clear();
+    c->backtrace.shrink_to_fit();
+    tail->context.reset(c);
+}
+
+/* Question 12: run a body that handles `handled` (a catch body, or a
+ * finally while `handled` propagates); an exception leaving it remembers
+ * `handled`. The VM does the same with a marker region (codegen). */
+template <class F>
+static void run_handling_body(const RuntimeException &handled, F &&body)
+{
+    try {
+        body();
+    } catch (RuntimeException &e) {
+        exc_note_context(e, handled);
+        throw;
+    }
+}
+
+/*
  * Runs a catch body with `saved_ex` as the exception a `rethrow` in it
  * raises - restoring the enclosing catch body's on any exit, since a
  * catch body may hold a try whose own catch handles another exception.
@@ -7570,7 +7634,7 @@ do_catch(EvalContext *ctx,
 
         /* Catch-anything block */
         HandlingScope hs(*ctx->flow, saved_ex);
-        catchBody->eval(ctx);
+        run_handling_body(*saved_ex, [&] { catchBody->eval(ctx); });
         return true;
     }
 
@@ -7597,14 +7661,25 @@ do_catch(EvalContext *ctx,
                  * works). A payload-less built-in exception binds to a small
                  * exception object instead (printable, re-throwable).
                  */
-                EvalValue bind_val =
-                    (exObj && exObj->get_data()
-                                  .is<intrusive_ptr<StructObject>>())
-                        ? exObj->get_data()
-                        : EvalValue(make_intrusive<ExceptionObject>(
-                              exObj
-                                  ? *exObj
-                                  : ExceptionObject(saved_ex->name)));
+                EvalValue bind_val;
+                if (exObj && exObj->get_data()
+                                 .is<intrusive_ptr<StructObject>>()) {
+                    bind_val = exObj->get_data();
+                } else {
+                    /* a FRESH object, the caught exception's VALUE -
+                     * its name and data, not where it was raised (a
+                     * later `throw e` carets and frames its own raise)
+                     * nor its chain (question 12: a class payload
+                     * holding it could close a cycle). The serial says
+                     * it IS the caught exception, for a `throw e` in
+                     * this catch body. */
+                    auto xo = make_intrusive<ExceptionObject>(
+                        exObj ? std::string(exObj->get_name())
+                              : std::string(saved_ex->name),
+                        exObj ? exObj->get_data() : EvalValue());
+                    xo->serial = saved_ex->serial;
+                    bind_val = EvalValue(std::move(xo));
+                }
 
                 if (asId->sym.kind == SymKind::local && catch_ctx.frame) {
 
@@ -7624,7 +7699,8 @@ do_catch(EvalContext *ctx,
             }
 
             HandlingScope hs(*catch_ctx.flow, saved_ex);
-            catchBody->eval(&catch_ctx);
+            run_handling_body(*saved_ex,
+                              [&] { catchBody->eval(&catch_ctx); });
         }
 
         return true;
@@ -7693,7 +7769,12 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
     EvalValue saved_val = std::move(fs.value);
     fs.type = FlowState::none;
 
-    finallyBody->eval(ctx);                /* may throw / set its own flow */
+    /* may throw / set its own flow; an exception it throws while one is
+     * pending remembers that one (question 12) */
+    if (pending)
+        run_handling_body(*pending, [&] { finallyBody->eval(ctx); });
+    else
+        finallyBody->eval(ctx);
 
     if (fs.type == FlowState::none) {
         fs.type = saved_type;              /* resume the suspended signal */

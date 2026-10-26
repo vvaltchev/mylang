@@ -7641,9 +7641,49 @@ and two macros:
   exception carries one, else to a fresh `ExceptionObject` wrapper (the
   payload-less built-in case — printable/re-throwable). The catch variable is
   typed `dyn` by the inferencer (member access resolved at runtime). `finally`
-  runs via a scope guard; `rethrow` re-throws the saved exception with the
-  rethrow site's `Loc`. (The old `exception()`/`ex()`/`exdata()` builtins were
-  removed once structs existed — a struct field IS the payload.)
+  runs via a scope guard; `rethrow` re-throws a COPY of the saved exception
+  with the rethrow site's `Loc` (the saved one stays as caught, for a second
+  `rethrow` and for the chain below). (The old `exception()`/`ex()`/`exdata()`
+  builtins were removed once structs existed — a struct field IS the
+  payload.)
+- **IMPLICIT EXCEPTION CHAINING (question 12, Python's `__context__`).** An
+  exception LEAVING a catch body, or a `finally` that runs while one
+  propagates, remembers the exception that body handled:
+  `RuntimeException::context`, set by the ONE shared rule
+  `exc_note_context` (eval.cpp) - a clone of the handled exception, its
+  backtrace dropped, attached at the chain's TAIL (escapes run innermost
+  first, so each outer handled exception is older than everything already
+  in the chain); not when the leaving exception IS the handled one
+  (`serial`, copied by clone, or the same struct payload); at most
+  `EXC_CONTEXT_MAX` deep (`context_cut` records the refusal), so a
+  recursion through catch bodies costs no walk per escape beyond that.
+  `format_exception` prints the chain oldest first. The tree-walker calls
+  the rule from `run_handling_body` around each catch body and each
+  pending-exception finally. The VM calls it from `vm_dispatch_exc_body`
+  as it POPS a **chain marker** (`HandlerSite::chain`): codegen runs every
+  catch body under a guard region chaining to its try (with a finally the
+  guard was already there, #91), and splits the finally: the NORMAL exits
+  run one copy under no marker - the path that throws nothing pays nothing
+  (it measured +21% Ir on 72_exc_finally when the one shared copy pushed a
+  marker) - and each fin_pc names a RERAISE copy, entered only by the
+  dispatch, under a marker chaining to the region that parked the
+  propagating exception. For that the
+  dispatch now PARKS EVERY caught exception (`has_rethrow` is gone, myv
+  v38), and `Rethrow` / `jit_rethrow` raise a CLONE and leave it parked -
+  moving it out made a second `rethrow`, after an inner `try` caught the
+  first, abort the VM. **It is freed when the tree-walker frees its copy**
+  (the object census, `tests/int/12_census.my`, compares the engines):
+  a catch body's normal exit and every flow op leaving one emit
+  `SetPend` with `target2 = 1` (the JIT calls `jit_drop_caught`), and the
+  dispatch frees a marker's exception once it has chained it - the body
+  that handled it is over, or a new exception superseded it. A flow op's INLINED finally copy gets no marker: it
+  runs with nothing propagating. The value a `catch (T as e)` binds for a
+  payload-less exception is a FRESH `ExceptionObject` (name, data, serial):
+  no chain (a class payload holding it could close a reference cycle), and
+  no caret or frames - a COPY used to carry both, so a `throw` of it later
+  carets the old raise and spliced its frames under the new ones. `throw
+  e` inside the catch is still the handled exception, by serial, and
+  takes its chain from there.
 - Always pass `Loc start, end` to thrown exceptions where you can, so
   `mylang.cpp` can render the caret.
 

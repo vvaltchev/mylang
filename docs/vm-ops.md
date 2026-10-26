@@ -688,7 +688,10 @@ re-deciding at runtime what the compiler already knew) is replaced by
 COMPILE-TIME data: **`Chunk::handler_sites`**, one entry per try REGION
 holding its clause list (`HandlerClause {types_idx, bind_slot,
 body_pc}`), the shared `fin_pc` (-1 = none), and a **`has_rethrow`**
-flag (does any catch body of this try contain a `rethrow`?). PRIMARY
+flag (does any catch body of this try contain a `rethrow`?; replaced by
+the CHAIN MARKER field `chain` in myv v38 - question 12,
+CLAUDE.md's *IMPLICIT EXCEPTION CHAINING* - since every caught exception
+is parked now). PRIMARY
 data - step D deletes the chain it could be derived from - so it is
 SERIALIZED (myv v8) and REMAPPED at every pc-moving transformation (the
 peephole's threading + branch-target map + compaction prefix-sum, and
@@ -705,7 +708,8 @@ same-frame decision - pop the handler, index `handler_sites[region]`,
 run the shared `vm_catch_match` (step A, ML_ALWAYS_INLINE - left
 out-of-line it cost +40 Ir per throw) over the clauses, bind, **park the
 exception ONLY IF `has_rethrow`** (the park is an owning move + a later
-free, and the overwhelmingly common catch does not rethrow), resume at
+free, and the overwhelmingly common catch does not rethrow; ALWAYS since
+question 12 - the chain reads it), resume at
 the winning `body_pc`; no match with a `fin_pc` parks a `reraise` and
 resumes in the finally; else it keeps walking OUT to the next enclosing
 handler before returning false to the frame walk. CatchTest/Reraise are
@@ -754,7 +758,9 @@ whole try region interpreted (measured: the same program is 24 ops / 4
 fragments with a `rethrow`, 3 / 3 without). `jit_rethrow` is
 jit_end_finally's shape plus the site caret restamp: take the caught
 exception out of the ENCLOSING catch's region slot (guaranteed parked -
-that is exactly what `has_rethrow` gates), stamp the RETHROW SITE's
+that is exactly what `has_rethrow` gated; since question 12 every catch
+parks, and the rethrow takes a CLONE, leaving it there), stamp the
+RETHROW SITE's
 caret, `vm_raise`; 0 dispatched / 1 boundary / 2 conveyed, never falls
 through. Both the LocEntry and the inlined-at chain are BAKED at compile
 time, since the interpreted op reads them via `loc_at(pc)` /

@@ -4981,6 +4981,10 @@ struct Codegen {
                 ph.op = OpCode::PopHandler;
                 code.push_back(ph);
             }
+            /* leaving a catch body: free the exception it caught, as its
+             * normal exit does (question 12) */
+            if (tf.in_catch)
+                emit_setpend(tf.region, Pend::normal, true);
             if (tf.finally_body) {
                 trys.resize(ti);                    /* active trys = [0, T_i) */
                 const bool ok =
@@ -7757,51 +7761,19 @@ struct Codegen {
      *   Lend:
      */
     /* Emit SetPend <p> (Inc 2b): the pending action a following finally
-     * runs, in try region `region`'s slot (#78). */
-    void emit_setpend(int region, Pend p)
+     * runs, in try region `region`'s slot (#78). `drop` (target2 = 1):
+     * also free the exception the dispatch parked there - a catch body is
+     * done with it (question 12: it is parked for as long as the body
+     * runs, and freed when the tree-walker frees its copy). */
+    void emit_setpend(int region, Pend p, bool drop = false)
     {
         CgInstr in;
         in.op = OpCode::SetPend;
         in.set_a(int_lit(region));
         in.target = static_cast<int>(p);
+        if (drop)
+            in.target2 = 1;
         code.push_back(in);
-    }
-
-    /*
-     * #78 step B: does any CATCH BODY of this try contain a `rethrow`? Only
-     * then must the dispatch PARK the caught exception in the region slot
-     * (the common site never rethrows, so the park - a unique_ptr move plus
-     * the eventual free - is skippable there). Conservative and CHEAP: a
-     * complete walk (for_each_child_of, the walker whose hand-rolled
-     * predecessor once missed try bodies), NOT descending into a nested
-     * FUNCTION (its `rethrow` belongs to its own frame's regions) and not
-     * into a nested try's CATCH bodies (they have their own region and
-     * park independently) - though counting those would only be
-     * pessimistic, never wrong.
-     */
-    static bool subtree_has_rethrow(const Construct *c)
-    {
-        if (!c)
-            return false;
-        if (ctag(c) == ConstructType::rethrow)
-            return true;
-        if (ctag(c) == ConstructType::func_decl)
-            return false;                     /* another frame's regions */
-        bool found = false;
-        for_each_child_of(const_cast<Construct *>(c), [&](Construct *ch) {
-            if (!found && subtree_has_rethrow(ch))
-                found = true;
-        });
-        return found;
-    }
-    static bool has_rethrow_in_catches(const TryCatchStmt *t)
-    {
-        for (const auto &cs : t->catchStmts)
-            if (subtree_has_rethrow(cs.second.get()))
-                return true;
-        /* a `rethrow` in the FINALLY body re-raises the region's exception
-         * too (it runs with the pend live), so it counts as well */
-        return subtree_has_rethrow(t->finallyBody.get());
     }
 
     bool compile_native_try(const TryCatchStmt *t)
@@ -7828,6 +7800,9 @@ struct Codegen {
         std::vector<size_t> to_fin, to_end;
         /* the catch bodies' GUARD region (below), or -1 */
         int guard = -1;
+        /* the guard and the finally MARKERS - regions this try adds beyond
+         * its own, reset by bail() */
+        std::vector<int> extra;
         /*
          * #78 step D: the only remaining exit kind is a NORMAL one (the try
          * body ran to the end, a catch body finished). The "no clause
@@ -7835,11 +7810,14 @@ struct Codegen {
          * that decision off the handler table - it parks a `reraise` and
          * resumes at fin_pc itself, or returns false to the frame walk.
          */
-        auto exit_to = [&]() {
+        /* `drop`: a catch body's exit, which frees the parked exception */
+        auto exit_to = [&](bool drop) {
             if (has_fin) {
-                emit_setpend(region, Pend::normal);
+                emit_setpend(region, Pend::normal, drop);
                 to_fin.push_back(emit(OpCode::Jump));
             } else {
+                if (drop)
+                    emit_setpend(region, Pend::normal, true);
                 to_end.push_back(emit(OpCode::Jump));
             }
         };
@@ -7852,9 +7830,52 @@ struct Codegen {
              * reclaimed - a hole costs one unused table + pends slot) */
             if (static_cast<size_t>(region) < chunk.handler_sites.size())
                 chunk.handler_sites[region] = Chunk::HandlerSite();
-            if (guard >= 0)
-                chunk.handler_sites[guard] = Chunk::HandlerSite();
+            for (const int r : extra)
+                chunk.handler_sites[static_cast<size_t>(r)] =
+                    Chunk::HandlerSite();
             return false;
+        };
+        /*
+         * Question 12: a region whose body HANDLES the exception parked in
+         * region `chain` - an exception leaving that body remembers it
+         * (Chunk::HandlerSite::chain). No clause and, unless the caller
+         * adds one, no finally: the dispatch only reads it as it pops it.
+         */
+        auto new_marker = [&](int chain) {
+            const int r = next_try_region++;
+            if (static_cast<size_t>(r) >= chunk.handler_sites.size())
+                chunk.handler_sites.resize(static_cast<size_t>(r) + 1);
+            Chunk::HandlerSite &ms =
+                chunk.handler_sites[static_cast<size_t>(r)];
+            ms = Chunk::HandlerSite();
+            ms.chain = chain;
+            extra.push_back(r);
+            return r;
+        };
+        /*
+         * The RERAISE copy of the finally - the one the dispatch enters,
+         * with the exception it propagates parked in region `parked` - and
+         * its EndFinally. It runs under a marker chaining there, so an
+         * exception the finally throws remembers the propagating one. The
+         * marker is a try frame of its own for the flow ops (it is pushed:
+         * a break/continue/return leaving the finally pops it). Returns
+         * the copy's pc, or -1 when the body fails to compile.
+         */
+        auto compile_reraise_finally = [&](int parked) -> int {
+            const int at = static_cast<int>(here());
+            const int m = new_marker(parked);
+            const size_t mp = emit(OpCode::PushHandler);
+            code[mp].set_a(int_lit(m));
+            trys.push_back({ false, nullptr, false, nullptr, m, true });
+            const bool ok =
+                compile_scalar_body(body_stmts(t->finallyBody.get()), false);
+            trys.pop_back();
+            if (!ok)
+                return -1;
+            emit(OpCode::PopHandler);
+            const size_t ef = emit(OpCode::EndFinally);
+            code[ef].set_a(int_lit(parked));           /* #78: whose pend */
+            return at;
         };
 
         /* #78 step D: PushHandler carries ONLY the region id - the pushed
@@ -7871,7 +7892,7 @@ struct Codegen {
         if (!compile_scalar_body(body_stmts(t->tryBody.get()), false))
             return bail();
         emit(OpCode::PopHandler);
-        exit_to();                                     /* normal try exit */
+        exit_to(false);                                /* normal try exit */
 
         /* #78 step D: the site IS the dispatch data now - no chain is
          * emitted, so the catch bodies follow the try body directly. */
@@ -7884,7 +7905,6 @@ struct Codegen {
         };
         site().clauses.clear();
         site().fin_pc = -1;
-        site().has_rethrow = has_rethrow_in_catches(t);
 
         for (const auto &cs : t->catchStmts) {
             int types_idx = -1;
@@ -7907,21 +7927,16 @@ struct Codegen {
 
         /*
          * Catch bodies run with THIS try's handler already popped (the
-         * dispatch popped it). With a finally they run under a GUARD: a
-         * second region with no clause, whose fin_pc is a copy of the
-         * finally - so an exception leaving a catch body (a rethrow, a
-         * throw, an error) runs the finally before it propagates, as the
-         * tree-walker's scope guard does. Without it the VM skipped the
-         * finally there. A flow op out of a catch body pops the guard and
-         * inlines the finally once (handler_live).
+         * dispatch popped it), under a GUARD: a second region with no
+         * clause, chaining to this one (question 12) - so an exception
+         * leaving a catch body (a rethrow, a throw, an error) remembers the
+         * caught one. With a finally the guard's fin_pc is a copy of it,
+         * so that exception runs the finally before it propagates, as the
+         * tree-walker's scope guard does. A flow op out of a catch body
+         * pops the guard and inlines the finally once (handler_live).
          */
-        if (has_fin && !t->catchStmts.empty()) {
-            guard = next_try_region++;
-            if (static_cast<size_t>(guard) >= chunk.handler_sites.size())
-                chunk.handler_sites.resize(static_cast<size_t>(guard) + 1);
-            chunk.handler_sites[static_cast<size_t>(guard)] =
-                Chunk::HandlerSite();
-        }
+        if (!t->catchStmts.empty())
+            guard = new_marker(region);
         trys.back().in_catch = true;
         trys.back().handler_live = guard >= 0;
         size_t ci = 0;
@@ -7935,35 +7950,44 @@ struct Codegen {
                 return bail();
             if (guard >= 0)
                 emit(OpCode::PopHandler);
-            exit_to();                                 /* catch body done */
+            exit_to(true);                             /* catch body done */
             ci++;
         }
         trys.pop_back();                               /* body + catches done */
 
         if (has_fin) {
-            /* The SHARED finally block, reached by the NORMAL and RERAISE exits
-             * only (flow ops inline their own copy - Inc 2c). */
-            const int lfin = static_cast<int>(here());
-            site().fin_pc = static_cast<int32_t>(lfin);
-            for (size_t j : to_fin)
-                code[j].target = lfin;
-            if (!compile_scalar_body(body_stmts(t->finallyBody.get()), false))
-                return bail();
-            const size_t ef = emit(OpCode::EndFinally);
-            code[ef].set_a(int_lit(region));           /* #78: whose pend */
-            if (guard >= 0) {
-                /* the guard's copy: entered only by the dispatch, with a
-                 * re-raise parked - the shared one falls through to here
-                 * on a normal exit, so it jumps over */
-                to_end.push_back(emit(OpCode::Jump));
-                const int lg = static_cast<int>(here());
-                chunk.handler_sites[static_cast<size_t>(guard)].fin_pc =
-                    static_cast<int32_t>(lg);
+            /* The NORMAL finally block, reached by the normal exits only
+             * (flow ops inline their own copy - Inc 2c): nothing propagates
+             * there, so it runs under no marker, and the path that throws
+             * nothing pays nothing for the chain (question 12). With no
+             * normal exit (the body always returns) it is not emitted. */
+            if (!to_fin.empty()) {
+                const int lfin = static_cast<int>(here());
+                for (size_t j : to_fin)
+                    code[j].target = lfin;
                 if (!compile_scalar_body(body_stmts(t->finallyBody.get()),
                                          false))
                     return bail();
-                const size_t eg = emit(OpCode::EndFinally);
-                code[eg].set_a(int_lit(guard));
+                const size_t ef = emit(OpCode::EndFinally);
+                code[ef].set_a(int_lit(region));       /* #78: whose pend */
+                to_end.push_back(emit(OpCode::Jump));
+            }
+            /* The RERAISE copies, entered only by the dispatch with a
+             * re-raise parked: the try's (no clause matched), then the
+             * catch GUARD's (an exception left a catch body). Their
+             * EndFinally re-raises; the jump between them is reached only
+             * when nothing was parked (a corrupt image) */
+            const int lrr = compile_reraise_finally(region);
+            if (lrr < 0)
+                return bail();
+            site().fin_pc = static_cast<int32_t>(lrr);
+            if (guard >= 0) {
+                to_end.push_back(emit(OpCode::Jump));
+                const int lg = compile_reraise_finally(guard);
+                if (lg < 0)
+                    return bail();
+                chunk.handler_sites[static_cast<size_t>(guard)].fin_pc =
+                    static_cast<int32_t>(lg);
             }
         }
 
@@ -11878,10 +11902,13 @@ void verify_handler_sites(const Chunk &chunk)
         ML_CHECK(region >= 0
                  && static_cast<size_t>(region) < chunk.handler_sites.size());
         const Chunk::HandlerSite &site = chunk.handler_sites[region];
-        ML_CHECK(!site.clauses.empty() || site.fin_pc >= 0);
+        ML_CHECK(!site.clauses.empty() || site.fin_pc >= 0
+                 || site.chain >= 0);
         for (const Chunk::HandlerClause &cl : site.clauses)
             ML_CHECK(cl.body_pc >= 0 && cl.body_pc < n);
         ML_CHECK(site.fin_pc < 0 || site.fin_pc < n);
+        ML_CHECK(site.chain < 0 || static_cast<size_t>(site.chain)
+                                       < chunk.handler_sites.size());
     }
 #else
     (void)chunk;
@@ -12337,15 +12364,23 @@ void ChunkVerifier::verify_one(const Instr &in)
          * activation's per-region {exc, pend} slice, which n_trys sizes. */
         pool(in.a_lit(), ck.handler_sites.size(), "handler region");
         pool(in.a_lit(), static_cast<size_t>(ck.n_trys), "try region");
-        /* A PUSHED region catches something or has a finally. Codegen
-         * leaves an empty entry only as a hole no PushHandler names; one
-         * a PushHandler names is a mutated image, which the JIT's remap
-         * check aborted on in an ASSERTS build (myv_fuzz, 2026-10-21). */
+        /* SetPend's target2 is its drop flag: -1, or 1 (question 12) */
+        if (in.op == OpCode::SetPend && in.target2 != -1 && in.target2 != 1)
+            reject("SetPend drop flag");
+        /* A PUSHED region catches something, has a finally or is a chain
+         * marker. Codegen leaves an empty entry only as a hole no
+         * PushHandler names; one a PushHandler names is a mutated image,
+         * which the JIT's remap check aborted on in an ASSERTS build
+         * (myv_fuzz, 2026-10-21). A marker's chain region indexes the
+         * {exc, pend} slice the dispatch reads (question 12). */
         if (in.op == OpCode::PushHandler) {
             const Chunk::HandlerSite &site =
                 ck.handler_sites[static_cast<size_t>(in.a_lit())];
-            if (site.clauses.empty() && site.fin_pc < 0)
+            if (site.clauses.empty() && site.fin_pc < 0 && site.chain < 0)
                 reject("an empty handler region");
+            if (site.chain >= 0)
+                pool(site.chain, static_cast<size_t>(ck.n_trys),
+                     "chain region");
         }
         break;
     case OpCode::ThrowRuntimeV:

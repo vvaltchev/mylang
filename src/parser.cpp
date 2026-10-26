@@ -3172,6 +3172,16 @@ static void freeze_exception_payload(ExceptionObject &e)
         e.set_data(EvalValue(SharedStr(d.get_type()->to_string(d))));
 }
 
+/* ...and the payloads of the exceptions it was raised while handling
+ * (question 12), which the report prints too. A chain node is a clone
+ * only this chain and its clones hold, so freezing it in place is safe. */
+static void freeze_exception_chain(RuntimeException &e)
+{
+    for (RuntimeException *c = &e; c; c = c->context.get())
+        if (c->is_exception_object())
+            freeze_exception_payload(*static_cast<ExceptionObject *>(c));
+}
+
 /* question 5: the typed copies of parse-time calls are AST - dropped when
  * the outermost block ends, so the -vm teardown finds none */
 struct PtBlockScope {
@@ -3282,8 +3292,8 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
             } while (added_elem);
         }
 
-    } catch (ExceptionObject &e) {
-        freeze_exception_payload(e);
+    } catch (RuntimeException &e) {
+        freeze_exception_chain(e);
         throw;
     }
 

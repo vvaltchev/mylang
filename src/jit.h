@@ -143,6 +143,8 @@ ptrdiff_t jit_off_rec_pend_base();
 ptrdiff_t jit_sizeof_pend_state();
 ptrdiff_t jit_off_pend_state_pend();           /* VmCallRec::pend */
 extern "C" void jit_push_handler_grow(int_type region) noexcept;
+/* question 12: a flagged SetPend frees the parked caught exception */
+extern "C" void jit_drop_caught(void *pend_state) noexcept;
 /* #78 step E: EndFinally's cold reraise arm (0 dispatched / 1 boundary /
  * 2 conveyed / 3 nothing pending). See the definition in vm.cpp. */
 extern "C" int jit_end_finally(int_type region, int_type pc,
