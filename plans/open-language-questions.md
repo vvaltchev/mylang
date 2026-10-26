@@ -13,7 +13,7 @@ at run time (#49).
 |----|-------------------------------------------------|------------|
 | 3  | does a slice alias like any other array?        | decided: B |
 | 5  | a parse-time pure call runs before inference    | decided: A |
-| 6  | a throwing constant expression inside a `try`   | open       |
+| 6  | a throwing constant expression inside a `try`   | decided: A |
 | 7  | duplicate keys in a dict literal                | open       |
 
 ## 3. Does a slice alias like any other array once assigned?
@@ -214,7 +214,24 @@ OutOfBoundsEx. `half(runtime(0))` prints "caught".
   compile warning; it stays an error only where a value is required at
   compile time (a `const` declaration).
 
-Decision: pending.
+Decision (maintainer, 2026-10-20): A. A throwing constant expression stays
+a compile error everywhere - inside a `try`, in a branch that never runs -
+and the message says why and names `runtime()`:
+
+```
+note: a constant expression is evaluated while compiling, so its error is a
+compile error, which no try/catch handles; to raise it when the program runs
+instead, pass one of its values through runtime(), as in 10 / runtime(0)
+```
+
+Done (2026-10-20). The note follows any catchable run-time kind of error
+raised before the program runs (the script driver, `-nr`, `-c`) or while a
+REPL input compiles (`format_const_eval_note`, errfmt.cpp); a type error,
+a syntax error, an undefined name and every run-time error get none. Every
+engine and `-nc` / `-nti` print it alike, since all of them evaluate the
+constant expression while compiling. Tests: a `driver_checks` case (every
+compiling mode and `-c` print it; a type error, a run-time error from
+source and from an image do not) and a `repl:` case.
 
 ## 7. Duplicate keys in a dict literal
 

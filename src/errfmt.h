@@ -34,8 +34,21 @@ void dump_loc_in_error(std::ostream &o, const Exception &e,
 /*
  * Format any thrown Exception (dispatching on its concrete type for the
  * SyntaxError op/token detail, an undefined-variable name, a user exception's
- * payload, etc.) plus its backtrace, into `o`.
+ * payload, etc.) plus its backtrace, into `o` - and, when `compiling` (the
+ * program has not started), format_const_eval_note's note.
  */
 void format_exception(std::ostream &o, const Exception &e,
                       const std::vector<std::string> &lines,
-                      const std::string &src_name = std::string());
+                      const std::string &src_name = std::string(),
+                      bool compiling = false);
+
+/*
+ * Question 6 (decision A): a run-time kind of error (a catchable one) that
+ * reaches the driver before the program runs was raised by a constant
+ * expression the compiler evaluated - a compile error, which no try/catch
+ * handles. This prints a note saying so and how to defer it (runtime()); it
+ * prints nothing for any other exception, nor when `compiling` is false (the
+ * program had started).
+ */
+void format_const_eval_note(std::ostream &o, const Exception &e,
+                            bool compiling = true);

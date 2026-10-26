@@ -3695,7 +3695,20 @@ and it lives *inside the parser*. Mechanics:
   and are *not*
   catchable by script `try/catch` (the parser never enters a const assignment
   inside a try). This is
-  intentional — const errors should fail the build, not be swallowed.
+  intentional — const errors should fail the build, not be swallowed - and
+  it is the language rule (question 6, decision A, 2026-10-20), in a branch
+  that never runs too. The message says so: a CATCHABLE run-time kind
+  (DivisionByZeroEx, OutOfBoundsEx, a thrown struct) that reaches the
+  script driver before the program runs (`mylang.cpp`'s `compiling`, false
+  from the first `vm_run` / `eval` / image load) or a REPL input's
+  parse/check/optimize phase (`format_compile_error`) gets
+  `format_const_eval_note` (errfmt.cpp; `format_exception` prints it when
+  its `compiling` argument says so - the driver's flag, true for a REPL
+  compile error), which names `runtime()`. A plain compile error (a type error, a syntax error -
+  `Exception::is_catchable()` is false) and an uncatchable one get no
+  note. Only the driver knows the program has not started, so its wiring's
+  net is `driver_checks` (and the `repl:` case); the rule's is the
+  `errfmt:` `-rt` check.
 - A const decl in `pInConstDecl` whose rvalue isn't actually const throws
   `ExpressionIsNotConstEx`.
 

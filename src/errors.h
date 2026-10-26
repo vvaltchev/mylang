@@ -224,6 +224,10 @@ struct Exception {
     { }
 
     virtual ~Exception() = default;
+
+    /* May a SCRIPT handle this? Never for a plain Exception - a compile
+     * error, raised before anything runs; RuntimeException says when. */
+    virtual bool is_catchable() const { return false; }
 };
 
 struct RuntimeException : public Exception {
@@ -276,7 +280,7 @@ struct RuntimeException : public Exception {
      * Checked by BOTH catch matchers (vm_catch_match, do_catch) before any
      * name comparison, so it also defeats the parenless catch-all.
      */
-    virtual bool is_catchable() const { return true; }
+    bool is_catchable() const override { return true; }
 };
 
 /*

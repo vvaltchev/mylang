@@ -33,6 +33,9 @@ finally 2
 Backtrace (most recent call first):
   [0] neg(x) at line 68
   [1] main() at line 71
+note: a constant expression is evaluated while compiling, so its error is a
+compile error, which no try/catch handles; to raise it when the program runs
+instead, pass one of its values through runtime(), as in 10 / runtime(0)
 >> Uncaught exception 'E', data: E(code: -4) at line 68, col 16:25
 
       if (x < 0) { throw E(x); };
@@ -41,6 +44,9 @@ Backtrace (most recent call first):
 Backtrace (most recent call first):
   [0] neg(x) at line 68
   [1] main() at line 72
+note: a constant expression is evaluated while compiling, so its error is a
+compile error, which no try/catch handles; to raise it when the program runs
+instead, pass one of its values through runtime(), as in 10 / runtime(0)
 >> .. .. .. >> Uncaught exception 'OutOfBoundsEx' at line 74, col 56:62
 
       try { var t = [1][i]; } catch (OutOfBoundsEx as e) { throw e; };
@@ -49,5 +55,8 @@ Backtrace (most recent call first):
 Backtrace (most recent call first):
   [0] oob(i) at line 74
   [1] main() at line 77
+note: a constant expression is evaluated while compiling, so its error is a
+compile error, which no try/catch handles; to raise it when the program runs
+instead, pass one of its values through runtime(), as in 10 / runtime(0)
 >> .. .. the last chain, at the end of the input 
 >> 

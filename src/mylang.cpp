@@ -734,6 +734,9 @@ int main(int argc, char **argv)
      */
     unique_ptr<Construct> root;
     VmProgram prog;
+    /* until the program runs, a run-time kind of error comes from a constant
+     * expression the compiler evaluated (format_exception's note) */
+    bool compiling = true;
 
     try {
 
@@ -768,6 +771,7 @@ int main(int argc, char **argv)
             lo.root = opt_source_root;
             lo.force = opt_force;
             MyvSource msrc;
+            compiling = false;
             prog = myv_read(opt_script_path, msrc, lo);
             lines = std::move(msrc.lines);
             src_name = msrc.name;
@@ -987,8 +991,10 @@ int main(int argc, char **argv)
                  * zero live nodes (no-op under ASSERTS=0) - the ZERO-AST
                  * proof; the VM runs without the tree. */
                 vm_ast_teardown(root, prog);
+                compiling = false;
                 vm_run(prog);
             } else {
+                compiling = false;
                 root->eval(nullptr);
             }
         }
@@ -1009,7 +1015,7 @@ int main(int argc, char **argv)
 
     } catch (const Exception &e) {
 
-        format_exception(cerr, e, lines, src_name);
+        format_exception(cerr, e, lines, src_name, compiling);
         return 1;
     }
 
