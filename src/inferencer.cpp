@@ -457,6 +457,11 @@ private:
 
     /* type computation (reads stable `type`) */
     StaticTypeRef type_of(const Construct *e);
+    /* What reading a container component yields: `bottom` (defer) for an
+     * UNFILLED one - `none`, from `[]`, `{}` or array(N) with nothing
+     * typed put in yet - so a later round's fill types the read; if
+     * nothing ever fills it, the reader finalizes `dyn` (question 9). */
+    StaticTypeRef component_read(StaticTypeRef c);
     StaticTypeRef func_static_type(FuncInfo *fi);
     StaticTypeRef binop_result(Op op, StaticTypeRef a, StaticTypeRef b);
     StaticTypeRef unary_result(Op op, StaticTypeRef a);
@@ -5007,6 +5012,11 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
     }
 }
 
+StaticTypeRef Inferencer::component_read(StaticTypeRef c)
+{
+    return is_none(static_type_resolve(c)) ? bottom : c;
+}
+
 StaticTypeRef Inferencer::type_of(const Construct *e)
 {
     if (!e)
@@ -5239,11 +5249,11 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
          * element of an array(N) before its element type is pinned); a genuine
          * non-subscriptable base is caught in the check pass. */
         if (is_unknown(w) || is_none(w)) return bottom;
-        if (w->kind == StaticTypeKind::Array) return w->elem;
+        if (w->kind == StaticTypeKind::Array) return component_read(w->elem);
         /* A dict read is non-opt: `d[k]` yields the value, the dict's default
          * (a default dict), or throws on a missing key - never none. Use
          * get()/get!() for explicit nullable / fail-fast lookup. */
-        if (w->kind == StaticTypeKind::Dict)  return w->val;
+        if (w->kind == StaticTypeKind::Dict)  return component_read(w->val);
         if (w->kind == StaticTypeKind::Str)   return A.str_ty();
         return A.dyn_ty();
     }
@@ -5300,7 +5310,9 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
                 mt = A.dyn_ty();
         } else if (w->kind == StaticTypeKind::Dict) {
             /* `d.key` mirrors `d[key]`: non-opt (value / default / throws). */
-            mt = w->val;
+            mt = component_read(w->val);
+            if (is_unknown(static_type_resolve(mt)))
+                return bottom;
         } else {
             mt = A.dyn_ty();
         }
@@ -5484,9 +5496,9 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     auto elem_of = [&](StaticTypeRef c) -> StaticTypeRef {
         c = static_type_resolve(c);
         if (is_unknown(c) || is_none(c)) return bottom;   /* defer */
-        if (c->kind == StaticTypeKind::Array) return c->elem;
+        if (c->kind == StaticTypeKind::Array) return component_read(c->elem);
         if (c->kind == StaticTypeKind::Str)   return A.str_ty();
-        if (c->kind == StaticTypeKind::Dict)  return c->key;
+        if (c->kind == StaticTypeKind::Dict)  return component_read(c->key);
         return A.dyn_ty();
     };
 
@@ -6985,18 +6997,22 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
              * both the key. (Fixing a latent front-end mis-typing the
              * tree-walker hid because it binds dynamically at runtime.) */
             if (ids.size() >= 2)
-                contribute(sym_of(1), c->key, ids[1]->start, ids[1]->end);
+                contribute(sym_of(1), component_read(c->key), ids[1]->start,
+                           ids[1]->end);
             if (ids.size() >= 3)
-                contribute(sym_of(2), c->val, ids[2]->start, ids[2]->end);
+                contribute(sym_of(2), component_read(c->val), ids[2]->start,
+                           ids[2]->end);
             return;
         }
-        StaticTypeRef el = c->kind == StaticTypeKind::Array ? c->elem
+        StaticTypeRef el = c->kind == StaticTypeKind::Array
+                    ? component_read(c->elem)
                     : c->kind == StaticTypeKind::Str ? A.str_ty()
                     : A.dyn_ty();
         StaticTypeRef bind = el;
         if (ids.size() > 2) {   /* index + 2+ targets -> unpack the element */
             StaticTypeRef re = static_type_resolve(el);
-            bind = re->kind == StaticTypeKind::Array ? re->elem : el;
+            bind = re->kind == StaticTypeKind::Array ? component_read(re->elem)
+                                                     : el;
         }
         for (size_t i = 1; i < ids.size(); i++)
             contribute(sym_of(i), bind, ids[i]->start, ids[i]->end);
@@ -7004,14 +7020,18 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
     }
 
     if (c->kind == StaticTypeKind::Dict && ids.size() >= 2) {
-        contribute(sym_of(0), c->key, ids[0]->start, ids[0]->end);
-        contribute(sym_of(1), c->val, ids[1]->start, ids[1]->end);
+        contribute(sym_of(0), component_read(c->key), ids[0]->start,
+                   ids[0]->end);
+        contribute(sym_of(1), component_read(c->val), ids[1]->start,
+                   ids[1]->end);
         return;
     }
 
-    StaticTypeRef el = c->kind == StaticTypeKind::Array ? c->elem
+    StaticTypeRef el = c->kind == StaticTypeKind::Array
+                    ? component_read(c->elem)
                 : c->kind == StaticTypeKind::Str ? A.str_ty()
-                : c->kind == StaticTypeKind::Dict ? c->key : A.dyn_ty();
+                : c->kind == StaticTypeKind::Dict ? component_read(c->key)
+                : A.dyn_ty();
 
     if (ids.size() == 1) {
         contribute(sym_of(0), el, ids[0]->start, ids[0]->end);
@@ -7019,7 +7039,8 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
         /* tuple-unpack each element (an array) into the ids */
         StaticTypeRef inner = static_type_resolve(el)->kind ==
             StaticTypeKind::Array
-                           ? static_type_resolve(el)->elem : el;
+                           ? component_read(static_type_resolve(el)->elem)
+                           : el;
         for (size_t i = 0; i < ids.size(); i++)
             contribute(sym_of(i), inner, ids[i]->start, ids[i]->end);
     }
@@ -7304,6 +7325,8 @@ bool Inferencer::fold_type_query(CallExpr *call)
         if (is_unknown(static_type_resolve(t)))
             return false;   /* type not determined yet: leave for runtime */
     }
+
+    t = A.fill_unfilled(t);   /* `type([]).elem` is dyn (question 9) */
 
     /* the argument leaves the tree but not memory: see `retired` */
     retired.push_back(std::move(args->elems[0]));

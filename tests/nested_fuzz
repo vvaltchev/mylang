@@ -526,11 +526,11 @@ class Gen:
 
     def program(self, reps):
         self.emit("var A = [1, 2, 3, 4, 5, 6, 7];", "A = [1, 2, 3, 4, 5, 6, 7]")
-        # G is seeded with [0] (not []): pins its element type to int (an untyped
-        # empty `[]` infers array<none> -> `acc + x` is a MyLang nullability
-        # error, while Python's empty foreach is a no-op) AND stays a native
-        # array literal (a typed empty-array decl would be an AST fallback). The
-        # seed 0 is harmless + identical in both engines.
+        # G is seeded with [0] (not []): pins its element type to int (an
+        # untyped `[]` nothing fills is an array<dyn>, whose elements run
+        # boxed) AND stays a native array literal (a typed empty-array decl
+        # would be an AST fallback). The seed 0 is harmless + identical in
+        # both engines.
         self.emit("var G = [0];", "G = [0]")
         self.emit("var D = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0};",
                   "D = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}")

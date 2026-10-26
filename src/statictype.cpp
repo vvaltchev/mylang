@@ -613,7 +613,36 @@ StaticTypeRef StaticTypeArena::join_elem(StaticTypeRef a, StaticTypeRef b)
     return join(a, b);
 }
 
+StaticTypeRef StaticTypeArena::fill_unfilled(StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+    auto comp = [&](StaticTypeRef c) {
+        c = static_type_resolve(c);
+        return c->kind == StaticTypeKind::None ? g_dyn[0] : fill_unfilled(c);
+    };
+
+    if (t->kind == StaticTypeKind::Array && t->elem) {
+        StaticTypeRef e = comp(t->elem);
+        return e == static_type_resolve(t->elem) ? t : array_of(e, t->opt);
+    }
+    if (t->kind == StaticTypeKind::Dict && t->key && t->val) {
+        StaticTypeRef k = comp(t->key);
+        StaticTypeRef v = comp(t->val);
+        if (k == static_type_resolve(t->key)
+                && v == static_type_resolve(t->val))
+            return t;
+        return dict_of(k, v, t->opt);
+    }
+    return t;
+}
+
 /* ----------------------------- to_string --------------------------------- */
+
+static std::string component_to_string(StaticTypeRef c)
+{
+    c = static_type_resolve(c);
+    return c->kind == StaticTypeKind::None ? "dyn" : static_type_to_string(c);
+}
 
 std::string static_type_to_string(StaticTypeRef t)
 {
@@ -636,15 +665,17 @@ std::string static_type_to_string(StaticTypeRef t)
         case StaticTypeKind::Exception: return "exception" + q;
         case StaticTypeKind::Dyn:       return "dyn" + q;   /* `dyn` / `dyn?` */
 
+        /* an UNFILLED component (`none`: `[]`, `{}`, array(N)) is the
+         * `dyn` a reader of it finalizes to (Inferencer::component_read) */
         case StaticTypeKind::Array:
-            return "array<" + static_type_to_string(t->elem) + ">" + q;
+            return "array<" + component_to_string(t->elem) + ">" + q;
 
         case StaticTypeKind::Box:
             return "box<" + static_type_to_string(t->elem) + ">" + q;
 
         case StaticTypeKind::Dict:
-            return "dict<" + static_type_to_string(t->key) + "," +
-                   static_type_to_string(t->val) + ">" + q;
+            return "dict<" + component_to_string(t->key) + "," +
+                   component_to_string(t->val) + ">" + q;
 
         case StaticTypeKind::Func: {
             std::string r = "func(";
