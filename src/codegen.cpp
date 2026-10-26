@@ -12349,6 +12349,16 @@ void ChunkVerifier::verify_one(const Instr &in)
          * activation's per-region {exc, pend} slice, which n_trys sizes. */
         pool(in.a_lit(), ck.handler_sites.size(), "handler region");
         pool(in.a_lit(), static_cast<size_t>(ck.n_trys), "try region");
+        /* A PUSHED region catches something or has a finally. Codegen
+         * leaves an empty entry only as a hole no PushHandler names; one
+         * a PushHandler names is a mutated image, which the JIT's remap
+         * check aborted on in an ASSERTS build (myv_fuzz, 2026-10-21). */
+        if (in.op == OpCode::PushHandler) {
+            const Chunk::HandlerSite &site =
+                ck.handler_sites[static_cast<size_t>(in.a_lit())];
+            if (site.clauses.empty() && site.fin_pc < 0)
+                reject("an empty handler region");
+        }
         break;
     case OpCode::ThrowRuntimeV:
         pool(in.target, ck.throws.size(), "throw site");
