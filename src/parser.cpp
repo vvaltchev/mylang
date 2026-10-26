@@ -11,6 +11,8 @@
 #include "cyclewalk.h"   /* a constant's value may contain itself */
 
 #include <algorithm>
+#include <functional>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -86,6 +88,9 @@ ParseContext::ParseContext(const TokenStream &ts, bool fold)
      * order they are declared (g_class_ident) - the same in every engine */
     class_ident_reset(0);
     pending_decl_type = DeclType::none;
+    /* a user function the parser runs is type-inferred first (question 5;
+     * the driver turns it off under -nti) */
+    const_ctx_owner->parse_typed = true;
 
     /*
      * #133: PRE-SCAN the token stream for every `func NAME` / `struct NAME`
@@ -125,7 +130,11 @@ ParseContext::ParseContext(const TokenStream &ts, bool fold)
     }
 }
 
-ParseContext::~ParseContext() = default;
+ParseContext::~ParseContext()
+{
+    /* the typed parse-time runs bind into this parse's const scopes */
+    pt_cache_clear();
+}
 
 /*
  * #137: one level of source nesting = one level of C recursion, so the depth
@@ -2693,6 +2702,12 @@ pExpr14_body(ParseContext &c, unsigned fl)
         const EvalValue &rvalue = ret->eval(c.const_ctx);
         bool keep = ShouldConstSymbolExistAtRuntime(rvalue);
 
+        /* question 5: what a typed copy declares this const by */
+        if (ctag(ret->lvalue.get()) == ConstructType::id)
+            pt_note_const(c.const_ctx,
+                          static_cast<Identifier *>(ret->lvalue.get()),
+                          ret->rvalue.get());
+
         /* `const a, b = [[1], [2]]`: the assignment's value is none, so ask
          * each target - one bound to a container needs its run-time symbol
          * (it was dropped, and reading `a` was an undefined name) */
@@ -2927,6 +2942,19 @@ static void freeze_exception_payload(ExceptionObject &e)
         e.set_data(EvalValue(SharedStr(d.get_type()->to_string(d))));
 }
 
+/* question 5: the typed copies of parse-time calls are AST - dropped when
+ * the outermost block ends, so the -vm teardown finds none */
+struct PtBlockScope {
+    ParseContext &c;
+    explicit PtBlockScope(ParseContext &pc) : c(pc) { c.block_depth++; }
+    ~PtBlockScope()
+    {
+        c.block_depth--;
+        if (c.block_depth == 0)
+            pt_cache_clear();
+    }
+};
+
 unique_ptr<Construct>
 pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
 {
@@ -2936,6 +2964,7 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
      * 5000). Guard here too; the two nest through each other, and each is
      * scoped, so a block's SIBLINGS still cost nothing. */
     NestGuard ng(c);
+    PtBlockScope pts(c);
     unique_ptr<Block> ret(new Block);
     unique_ptr<Construct> stmt, tmp;
     bool added_elem;
@@ -4284,6 +4313,561 @@ collect_value_descs(const EvalValue &v,
 {
     CycStack st;
     collect_value_descs(v, out, st);
+}
+
+/*
+ * QUESTION 5 (plans/open-language-questions.md, decision A) - A USER
+ * FUNCTION THE PARSER RUNS, RUNS TYPED.
+ *
+ * A constant call (`f(3)`, a `const` initializer, a struct const member,
+ * a callback a const builtin calls) is evaluated while parsing, before
+ * inference exists. Inference decides types that change what a run
+ * computes - `var x = n; x = 2.5;` makes `x` a float, so `str(x)` after
+ * `var x = n` is "3.000000"; a return type joined with a float returns
+ * 1.0; an array literal written into a float array is flat floats - so an
+ * untyped run gave a constant call another answer than the same call at
+ * run time, and `-nc` (no folding) disagreed with the default (RULE 2).
+ *
+ * So the call runs in a synthetic program that inference types as a
+ * compile does - a template instance per argument signature, every stamp a
+ * store or a bind reads - holding clones of the functions the call reaches
+ * by name, its consts and struct names as declarations, and the call:
+ *
+ *  - A call the PARSER makes runs AS WRITTEN: its callee and argument
+ *    expressions are cloned, and a const holding a FUNCTION is declared by
+ *    its own initializer (EvalContext::pt_inits). So a function value
+ *    arrives the way it does in the program - by its name, out of a call,
+ *    out of a const container - and inference decides what the program's
+ *    does: a template called by name, or through a name bound to it, gets
+ *    an instance; one read out of a const container runs untyped.
+ *  - A call a running function makes (a call through a value inside a
+ *    body, a callback a builtin calls) knows only VALUES: the function's
+ *    copy is called by its name with the arguments as literals (a function
+ *    argument by its name), and a TEMPLATE reached that way runs untyped,
+ *    as the program runs one it reaches through a value.
+ *
+ * Any other const is declared with its value. A builtin goes by its own
+ * name, as the program passes it. The declarations are bound under a const root of their own (the
+ * builtins only), never the parser's: the REPL keeps its consts there.
+ *
+ * A parameter whose type inference JOINS over every call site (an
+ * un-annotated `opt` parameter, a lambda's) is typed by this call alone,
+ * and so is a template's instance through a value, which the program
+ * makes only when every call through the value agrees: the parser cannot
+ * see the call sites below it.
+ *
+ * Not typed (the call runs as before, untyped): a running function's call
+ * given a struct TYPE (the template it is passed to is not instantiated
+ * for one at run time either), and a result holding a function value - a
+ * copy's descriptor dies with the cache, so it may not escape into the
+ * program.
+ */
+EvalValue pt_invoke(EvalContext *ctx, FuncObject &obj,
+                    const std::vector<EvalValue> &args, Loc call_site);
+
+namespace {
+
+/* One typed copy: the synthetic program it was inferred in, the scope its
+ * declarations are bound in, and what to run - the call as written, or the
+ * typed function. Members die in reverse order: the function and the
+ * bindings before the program that owns their descriptors. */
+struct PtEntry {
+    unique_ptr<Construct> root;
+    /* a const root of its own (the builtins only, as a script's): the
+     * REPL keeps its consts in the parser's root, where a declaration of
+     * one here would be a store into it */
+    unique_ptr<EvalContext> croot;
+    unique_ptr<EvalContext> ctx;
+    /* a call the parser makes: the call, in `root` */
+    Construct *call = nullptr;
+    /* a call a running function makes: the typed function, and each
+     * function argument as inference gave it in the program (a template's
+     * instance, where the program would make one) */
+    EvalValue fn;
+    std::vector<std::pair<size_t, EvalValue>> fn_args;
+};
+
+/* key: the call's node id (as written), or the function's node id and its
+ * argument signature (by value); null: no typed copy can be built */
+std::map<std::string, unique_ptr<PtEntry>> g_pt_cache;
+
+struct PtBuild {
+    std::vector<unique_ptr<Construct>> decls;
+    /* a name -> the one thing it names here (a descriptor, a struct def,
+     * a const's slot) */
+    std::unordered_map<const UniqueId *, const void *> bound;
+    Loc at;
+    bool failed = false;
+};
+
+EvalContext *pt_scope_of(const FuncObject &fo)
+{
+    /* one a running function made has no const scope: its root */
+    if (!fo.const_scope)
+        return fo.capture_root;
+    /* a call at parse time cannot outlive the scope that made the
+     * function: a guard */
+    if (fo.const_scope_alive && *fo.const_scope_alive) /* INT-COV-EXEMPT */
+        return fo.const_scope;
+    return fo.capture_root;
+}
+
+/* the scope that binds `uid`, from `scope` out, and its binding */
+EvalContext *pt_lookup(EvalContext *scope, const UniqueId *uid, LValue *&lv)
+{
+    for (EvalContext *c = scope; c; c = c->parent)
+        if ((lv = c->lookup(uid)) != nullptr)
+            return c;
+    return nullptr;
+}
+
+/* what `scope` noted about its const `uid` (pt_note_const), or null */
+const PtConstInit *pt_init_of(const EvalContext *scope, const UniqueId *uid)
+{
+    if (!scope->pt_inits)
+        return nullptr;
+    const auto it = scope->pt_inits->m.find(uid);
+    return it != scope->pt_inits->m.end() ? &it->second : nullptr;
+}
+
+unique_ptr<Identifier> pt_id(const UniqueId *uid, Loc at)
+{
+    auto id = make_unique<Identifier>(uid->val);
+    id->start = at;
+    id->end = at;
+    return id;
+}
+
+/* `var NAME = rv` / `const NAME = rv`, `dyn` as the program declared it */
+unique_ptr<Construct> pt_decl(const UniqueId *uid, unique_ptr<Construct> rv,
+                              bool is_const, Loc at, bool dyn)
+{
+    auto d = make_unique<Expr14>();
+    d->op = Op::assign;
+    d->fl = is_const ? (pFlags::pInDecl | pFlags::pInConstDecl)
+                     : pFlags::pInDecl;
+    d->start = at;
+    d->end = at;
+    auto id = pt_id(uid, at);
+    id->dyn_mod = dyn;
+    d->lvalue = std::move(id);
+    d->rvalue = std::move(rv);
+    return d;
+}
+
+void pt_collect(PtBuild &b, Construct *c, EvalContext *scope);
+
+/* the name a builtin value is registered under: inference knows a builtin
+ * by its name. A builtin the parser can reach is a const one, and no two
+ * of those share an implementation. */
+const UniqueId *pt_builtin_name(const Builtin &bi)
+{
+    using Names = std::map<decltype(Builtin::func), const UniqueId *>;
+    static const Names names = [] {
+        Names m;
+        for (const auto &kv : EvalContext::const_builtins)
+            if (kv.second.get().is<Builtin>())
+                m.emplace(kv.second.get().get_ref<Builtin>().func, kv.first);
+        return m;
+    }();
+    const auto it = names.find(bi.func);
+    return it != names.end() ? it->second : nullptr; /* INT-COV-EXEMPT */
+}
+
+/* `uid` names `ident` from now on; false: it did already (naming another
+ * thing fails the build) */
+bool pt_bind_new(PtBuild &b, const UniqueId *uid, const void *ident)
+{
+    const auto it = b.bound.find(uid);
+    if (it == b.bound.end()) {
+        b.bound.emplace(uid, ident);
+        return true;
+    }
+    /* a const scope chain binds a name once (CannotRebindConstEx,
+     * AlreadyDefinedEx), and a function cannot leave the block that
+     * names it at parse time: a guard */
+    if (it->second != ident)            /* INT-COV-EXEMPT: see above */
+        b.failed = true;
+    return false;
+}
+
+/* declare the function `fo` as `uid` */
+void pt_bind_func(PtBuild &b, const UniqueId *uid, const FuncObject &fo,
+                  bool scoped)
+{
+    const FuncDeclStmt *fd = fo.func->decl;
+    /* a function the parser reaches is this program's (or an earlier
+     * REPL input's, whose tree the REPL keeps) */
+    if (!fd) {                          /* INT-COV-EXEMPT: see above */
+        b.failed = true;
+        return;
+    }
+    if (fo.func->name && fo.func->name != uid) {
+        /* another name for a named function (`const FA, FB = [f, g];`
+         * notes no initializer): the function first - the declarations
+         * are evaluated in order */
+        if (pt_bind_new(b, fo.func->name, fo.func))
+            pt_bind_func(b, fo.func->name, fo, false);
+        b.decls.push_back(pt_decl(uid, pt_id(fo.func->name, b.at),
+                                  true, b.at, false));
+        return;
+    }
+    unique_ptr<Construct> cl = fd->clone();
+    Construct *body = static_cast<FuncDeclStmt *>(cl.get())->body.get();
+    if (fo.func->name)
+        b.decls.push_back(std::move(cl));
+    else            /* a lambda: a const's, or the call's own ($pt) */
+        b.decls.push_back(pt_decl(uid, std::move(cl), scoped, b.at, false));
+    pt_collect(b, body, pt_scope_of(fo));
+}
+
+/* declare what `uid` is bound to, found in `in` (null: the call's own
+ * callee or argument) */
+void pt_bind(PtBuild &b, const UniqueId *uid, const EvalValue &v,
+             const void *ident, EvalContext *in)
+{
+    const UniqueId *bname = nullptr;
+    if (v.is<Builtin>()) {
+        bname = pt_builtin_name(v.get_ref<Builtin>());
+        if (!bname) {   /* INT-COV-EXEMPT: every reachable one has a name */
+            b.failed = true;
+            return;
+        }
+        ident = bname;
+    } else if (v.is<intrusive_ptr<FuncObject>>()) {
+        ident = v.get_ref<intrusive_ptr<FuncObject>>()->func;
+    } else if (v.is<StructTypeDef *>()) {
+        ident = v.get<StructTypeDef *>();
+    }
+    if (!pt_bind_new(b, uid, ident))
+        return;
+
+    if (bname) {
+        /* another name for a builtin: `const dyn L = len;` (a builtin
+         * value is a `dyn` one) */
+        if (bname != uid)
+            b.decls.push_back(pt_decl(uid, pt_id(bname, b.at), true, b.at,
+                                      true));
+        return;
+    }
+
+    if (v.is<StructTypeDef *>()) {
+        /* the struct's own descriptor, not a copy: the decl does not own
+         * it (def_owner stays null) */
+        auto sd = make_unique<StructDeclStmt>();
+        sd->start = b.at;
+        sd->end = b.at;
+        sd->id = pt_id(uid, b.at);
+        sd->def = v.get<StructTypeDef *>();
+        b.decls.push_back(std::move(sd));
+        return;
+    }
+    if (v.is<intrusive_ptr<FuncObject>>()) {
+        const FuncObject &fo = *v.get_ref<intrusive_ptr<FuncObject>>();
+        const PtConstInit *ci = in ? pt_init_of(in, uid) : nullptr;
+        if (ci && ci->fn == fo.func) {
+            /* a const holding a function, declared by its initializer -
+             * after what that reads, which it runs */
+            unique_ptr<Construct> rv = ci->expr->clone();
+            pt_collect(b, rv.get(), in);
+            b.decls.push_back(pt_decl(uid, std::move(rv), true, b.at,
+                                      ci->dyn));
+            return;
+        }
+        pt_bind_func(b, uid, fo, in != nullptr);
+        return;
+    }
+    /* every other kind a const holds is a literal (a box, an exception
+     * object are run-time values) */
+    unique_ptr<Construct> lit;
+    if (!MakeConstructFromConstVal(v, lit, true, true)) { /* INT-COV-EXEMPT */
+        b.failed = true;
+        return;
+    }
+    lit->start = b.at;
+    lit->end = b.at;
+    b.decls.push_back(pt_decl(uid, std::move(lit), true, b.at, false));
+}
+
+/* every name `c` reads that `scope` binds, declared */
+void pt_collect(PtBuild &b, Construct *c, EvalContext *scope)
+{
+    if (!c)
+        return;
+    if (ctag(c) == ConstructType::id) {
+        const UniqueId *uid = static_cast<Identifier *>(c)->uid;
+        LValue *lv = nullptr;
+        if (EvalContext *in = pt_lookup(scope, uid, lv))
+            pt_bind(b, uid, lv->get(), lv, in);
+    }
+    for_each_child_of(c, [&](Construct *ch) { pt_collect(b, ch, scope); });
+}
+
+/* the synthetic program around `call`: inferred, every function in it
+ * marked typed, its declarations bound */
+unique_ptr<PtEntry> pt_finish(PtBuild &b, unique_ptr<Construct> call,
+                              Loc at)
+{
+    auto root = make_unique<Block>();
+    root->start = at;
+    root->end = at;
+    for (auto &d : b.decls)
+        root->elems.push_back(std::move(d));
+    Construct *callp = call.get();
+    root->elems.push_back(std::move(call));
+
+    infer_parse_time(root.get());
+
+    /* every function of the program is typed now: a call to one runs it */
+    std::function<void (Construct *)> mark = [&](Construct *c) {
+        if (!c)
+            return;
+        if (ctag(c) == ConstructType::func_decl)
+            static_cast<FuncDeclStmt *>(c)->desc->parse_typed = true;
+        for_each_child_of(c, mark);
+    };
+    mark(root.get());
+
+    auto e = make_unique<PtEntry>();
+    e->croot = make_unique<EvalContext>(nullptr, true);
+    e->croot->parse_typed = true;
+    e->croot->pt_copy = true;
+    e->ctx = make_unique<EvalContext>(e->croot.get(), true);
+    auto *rb = static_cast<Block *>(root.get());
+    for (size_t i = 0; i + 1 < rb->elems.size(); i++)
+        rb->elems[i]->eval(e->ctx.get());
+    e->call = callp;
+    e->root = std::move(root);
+    return e;
+}
+
+/* the typed copy of a call the parser makes, as written */
+unique_ptr<PtEntry> pt_build_written(EvalContext *ctx, const CallExpr *call)
+{
+    PtBuild b;
+    b.at = call->start;
+    unique_ptr<Construct> cl = call->clone();
+    pt_collect(b, cl.get(), ctx);
+    if (b.failed)                       /* INT-COV-EXEMPT: the guards */
+        return nullptr;
+    return pt_finish(b, std::move(cl), call->start);
+}
+
+/* the typed copy of `obj` for these argument values, or null */
+unique_ptr<PtEntry> pt_build_value(FuncObject &obj,
+                                   const std::vector<EvalValue> &vals,
+                                   Loc call_site)
+{
+    PtBuild b;
+    b.at = call_site;
+    const UniqueId *callee = obj.func->name;
+    if (!callee)
+        callee = UniqueId::get("$ptc");
+    b.bound.emplace(callee, obj.func);
+    pt_bind_func(b, callee, obj, false);
+
+    auto args = make_unique<ExprList>();
+    for (size_t i = 0; i < vals.size(); i++) {
+        const EvalValue &v = vals[i];
+        unique_ptr<Construct> arg;
+        if (v.is<intrusive_ptr<FuncObject>>()) {
+            const FuncObject &fo = *v.get_ref<intrusive_ptr<FuncObject>>();
+            const UniqueId *n = fo.func->name
+                ? fo.func->name
+                : UniqueId::get("$pta" + std::to_string(i));
+            pt_bind(b, n, v, nullptr, nullptr);
+            arg = pt_id(n, call_site);
+        } else if (v.is<Builtin>()) {
+            /* a builtin by its name, as the program passes it */
+            const UniqueId *n = pt_builtin_name(v.get_ref<Builtin>());
+            if (!n) {   /* INT-COV-EXEMPT: every reachable one has a name */
+                b.failed = true;
+                break;
+            }
+            arg = pt_id(n, call_site);
+        } else {
+            /* a struct TYPE is no literal, and inference types one used as
+             * a value as `none` (task #95: a lambda given one is "may be
+             * none"), so a copy cannot type its callee: the call runs
+             * untyped */
+            if (!MakeConstructFromConstVal(v, arg, true,
+                                           is_readonly_value(v))) {
+                b.failed = true;
+                break;
+            }
+            arg->start = call_site;
+            arg->end = call_site;
+        }
+        args->elems.push_back(std::move(arg));
+    }
+    if (b.failed)
+        return nullptr;
+
+    auto call = make_unique<CallExpr>();
+    call->start = call_site;
+    call->end = call_site;
+    call->what = pt_id(callee, call_site);
+    call->args = std::move(args);
+    unique_ptr<PtEntry> e = pt_finish(b, std::move(call), call_site);
+
+    CallExpr *callp = static_cast<CallExpr *>(e->call);
+    /* the callee's name was declared above as a function */
+    const EvalValue fv = RValue(callp->what->eval(e->ctx.get()));
+    if (!fv.is<intrusive_ptr<FuncObject>>())    /* INT-COV-EXEMPT: above */
+        return nullptr;
+    e->fn = fv;
+    for (size_t i = 0; i < vals.size(); i++)
+        if (vals[i].is<intrusive_ptr<FuncObject>>())
+            e->fn_args.emplace_back(
+                i, RValue(callp->args->elems[i]->eval(e->ctx.get())));
+    return e;
+}
+
+/* the cache's entry for `key`, built by `build` the first time */
+template <class Build>
+PtEntry *pt_entry(const std::string &key, Build build)
+{
+    auto it = g_pt_cache.find(key);
+    if (it == g_pt_cache.end()) {
+#ifdef TESTS
+        g_pt_builds++;
+#endif
+        it = g_pt_cache.emplace(key, build()).first;
+    }
+    return it->second.get();
+}
+
+/* a run's result, unless a function value in it is a copy's - whose
+ * descriptor dies with the cache, so it may not escape into the program:
+ * the call then runs untyped instead */
+bool pt_result(EvalValue &r, EvalValue &out)
+{
+    std::unordered_set<const FuncDescriptor *> ds;
+    collect_value_descs(r, ds);
+    for (const FuncDescriptor *d : ds)
+        if (d->parse_typed) {
+#ifdef TESTS
+            g_pt_untyped++;
+#endif
+            return false;
+        }
+#ifdef TESTS
+    g_pt_runs++;
+#endif
+    out = std::move(r);
+    return true;
+}
+
+}  /* anonymous namespace */
+
+/* question 5: note the initializer of the const just declared as `id` in
+ * `scope` when it holds a function - a typed copy declares it by that, so
+ * the function arrives as it does in the program (and `dyn` where the
+ * program declared it so: such a value has no other type there) */
+void pt_note_const(EvalContext *scope, const Identifier *id,
+                   const Construct *init)
+{
+    const EvalValue &v = scope->lookup(id->uid)->get();
+    if (!v.is<intrusive_ptr<FuncObject>>()) {
+        if (scope->pt_inits)        /* a REPL redeclaration, say */
+            scope->pt_inits->m.erase(id->uid);
+        return;
+    }
+    if (!scope->pt_inits)
+        scope->pt_inits.reset(new PtConstInits());
+    PtConstInit &ci = scope->pt_inits->m[id->uid];
+    ci.dyn = id->dyn_mod;
+    ci.fn = v.get_ref<intrusive_ptr<FuncObject>>()->func;
+    ci.expr = init->clone();
+}
+
+#ifdef TESTS
+unsigned long g_pt_runs = 0, g_pt_builds = 0, g_pt_untyped = 0;
+#endif
+
+bool pt_typed_written(EvalContext *ctx, const CallExpr *call, EvalValue &out)
+{
+    PtEntry *e = pt_entry("w" + std::to_string(call->node_id),
+                          [&] { return pt_build_written(ctx, call); });
+    if (!e) {                           /* INT-COV-EXEMPT: the guards */
+#ifdef TESTS
+        g_pt_untyped++;
+#endif
+        return false;
+    }
+    EvalValue r = RValue(e->call->eval(e->ctx.get()));
+    return pt_result(r, out);
+}
+
+bool pt_args_name_function(EvalContext *ctx, Construct *args)
+{
+    bool found = false;
+    std::function<void (Construct *)> walk = [&](Construct *c) {
+        if (!c || found)
+            return;
+        if (ctag(c) == ConstructType::func_decl) {
+            found = true;
+            return;
+        }
+        LValue *lv = nullptr;
+        if (ctag(c) == ConstructType::id
+            && pt_lookup(ctx, static_cast<Identifier *>(c)->uid, lv)
+            && lv->get().is<intrusive_ptr<FuncObject>>()) {
+            found = true;
+            return;
+        }
+        for_each_child_of(c, walk);
+    };
+    walk(args);
+    return found;
+}
+
+bool pt_typed_value(FuncObject &obj, const std::vector<EvalValue> &vals,
+                    Loc call_site, EvalValue &out)
+{
+    /* the function by its node (never its address: a freed node's is
+     * reused), each argument by the static type it gives inference, and
+     * a function in one by its node too - the copy was inferred with it */
+    std::string key = "v" + std::to_string(obj.func->decl->node_id);
+    for (const EvalValue &v : vals) {
+        key += '|';
+        key += static_type_key(v);
+        std::unordered_set<const FuncDescriptor *> ds;
+        collect_value_descs(v, ds);
+        std::vector<uint64_t> ids;
+        for (const FuncDescriptor *d : ds)
+            ids.push_back(d->decl ? d->decl->node_id : 0); /* INT-COV-EXEMPT */
+        std::sort(ids.begin(), ids.end());
+        for (uint64_t id : ids)
+            key += ':' + std::to_string(id);
+    }
+
+    PtEntry *e = pt_entry(key, [&] {
+        return pt_build_value(obj, vals, call_site);
+    });
+    if (!e) {
+#ifdef TESTS
+        g_pt_untyped++;
+#endif
+        return false;
+    }
+
+    EvalValue r;
+    FuncObject &fn = *e->fn.get_ref<intrusive_ptr<FuncObject>>();
+    if (e->fn_args.empty()) {
+        r = pt_invoke(e->ctx.get(), fn, vals, call_site);
+    } else {
+        std::vector<EvalValue> args = vals;
+        for (const auto &fa : e->fn_args)
+            args[fa.first] = fa.second;
+        r = pt_invoke(e->ctx.get(), fn, args, call_site);
+    }
+    return pt_result(r, out);
+}
+
+void pt_cache_clear()
+{
+    g_pt_cache.clear();
 }
 
 /*

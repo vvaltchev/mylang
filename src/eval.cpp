@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 
 #include "eval.h"
+#include "parser.h"   /* pt_typed_written, pt_typed_value */
 #include "errors.h"
 #include "syntax.h"
 #include "lexer.h"
@@ -793,6 +794,67 @@ vm_capture_frame(Exception &e, FuncObject &obj, const Chunk *call_ck,
  * every other caller (a builtin callback, the tree-walker) leaves it false, so
  * the signal is converted back to a C++ throw here for them.
  */
+/* inference's template rule (declare_funcdecl): a NAMED function with an
+ * un-annotated, non-dyn, non-opt parameter */
+static bool pt_is_template(const FuncDeclStmt *fd)
+{
+    if (!fd->id || !fd->params)
+        return false;
+    for (const auto &p : fd->params->elems)
+        if (!p->opt_mod && !p->dyn_mod && p->decl_type == DeclType::none)
+            return true;
+    return false;
+}
+
+/* a call the PARSER makes itself - not one inside a function's body,
+ * which runs as that function runs */
+static bool pt_parser_level(const EvalContext *ctx)
+{
+    for (const EvalContext *c = ctx; c; c = c->parent)
+        if (c->func_ctx)
+            return false;
+    return true;
+}
+
+/*
+ * Question 5: a user function run at PARSE time runs a copy of itself
+ * type-inferred as the program types it (parser.cpp) - unless it is such a
+ * copy already. The switch is on the parser's const root alone
+ * (EvalContext::parse_typed), so the call is a const-eval one and the
+ * function has its tree. A call the parser makes (`pt_call`) runs as
+ * written (pt_typed_written); one a running function makes runs by value
+ * (pt_typed_value), where a TEMPLATE runs untyped, as the program runs one
+ * it reaches through a value. The values are read where the bind put them,
+ * every parameter (an omitted trailing `opt` one is bound to none). True:
+ * `r` is the typed copy's result.
+ */
+static bool pt_try_typed(EvalContext *ctx, FuncObject &obj,
+                         const CallExpr *pt_call, Frame *bindframe,
+                         EvalContext &args_ctx, Loc call_site, EvalValue &r)
+{
+    /* every caller passes its context: a guard */
+    if (!ctx)                           /* INT-COV-EXEMPT: see above */
+        return false;
+    if (!ctx->root->parse_typed || obj.func->parse_typed)
+        return false;
+    if (pt_call)
+        return pt_typed_written(ctx, pt_call, r);
+    if (!obj.func->decl)        /* INT-COV-EXEMPT: parse time has a tree */
+        return false;
+    if (pt_is_template(obj.func->decl))
+        return false;
+    const size_t n = obj.func->params.size();
+    std::vector<EvalValue> vals;
+    vals.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        if (bindframe)
+            vals.push_back(bindframe->at(static_cast<int_type>(i)).get());
+        else
+            vals.push_back(args_ctx.lookup(obj.func->params[i].name)->get());
+    }
+    return pt_typed_value(obj, vals, call_site, r);
+}
+
 template <class ArgsVecT>
 static EvalValue
 do_func_call(EvalContext *ctx,
@@ -803,7 +865,8 @@ do_func_call(EvalContext *ctx,
              const Chunk *call_ck = nullptr,
              size_t call_pc = 0,
              bool as_signal = false,
-             bool check_fit = true)
+             bool check_fit = true,
+             const CallExpr *pt_call = nullptr)
 {
     /* func_ctx == true gives this call its own FlowState (see eval.h).
      * The parent is the closure's captured ROOT (G2): the empty link context
@@ -914,6 +977,15 @@ do_func_call(EvalContext *ctx,
         );
     }
 
+    /* question 5: a parse-time call runs a typed copy (its frame is the
+     * copy's) */
+    {
+        EvalValue r;
+        if (pt_try_typed(ctx, obj, pt_call, bindframe, args_ctx,
+                         call_site, r))
+            return r;
+    }
+
     try {
 
         /* An expression body - `func f(...) => expr;`, now parsed as
@@ -1010,6 +1082,16 @@ EvalValue eval_func(EvalContext *ctx,
         return r;
 
     return do_func_call(ctx, obj, args);
+}
+
+/* Question 5: the typed copy of a function a parse-time call runs
+ * (pt_typed_value, parser.cpp), with the call's own site for its frame */
+EvalValue pt_invoke(EvalContext *ctx,
+                    FuncObject &obj,
+                    const vector<EvalValue> &args,
+                    Loc call_site)
+{
+    return do_func_call(ctx, obj, args, call_site);
 }
 
 /* The VM's native-call entry (CallV): the args are already evaluated into a
@@ -2327,10 +2409,27 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                 al.arr_hint = ael->arr_hint;
                 return dispatch_builtin_values(ctx, b, &al, argv, n);
             }
+            /* question 5: a builtin the PARSER calls with a function in its
+             * arguments runs as written, so it calls the function as the
+             * program's inference types it - a callback's parameter takes
+             * the container's element type, not each value's own */
+            if (ctx->root->parse_typed && !ctx->root->pt_copy
+                && b.kind != Builtin::Kind::lazy
+                && b.kind != Builtin::Kind::node && pt_parser_level(ctx)
+                && pt_args_name_function(ctx, node->args.get())) {
+                EvalValue r;
+                if (pt_typed_written(ctx, node, r))
+                    return r;
+            }
             return b.func(ctx, node->args.get());
         }
 
         if (callable.is<intrusive_ptr<FuncObject>>()) {
+            /* question 5: a call the PARSER makes, as written - not one
+             * at a typed copy's own top level (do_func_call) */
+            const CallExpr *pt_call = ctx->root->parse_typed
+                    && !ctx->root->pt_copy && pt_parser_level(ctx)
+                ? node : nullptr;
             return do_func_call(
                 ctx,
                 *callable.get<intrusive_ptr<FuncObject>>().get(),
@@ -2338,7 +2437,8 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                 node->start,     /* call site = the CallExpr's location */
                 node->inline_ctx,/* virtual frames if this call is inlined */
                 ck, pc, as_signal,
-                node->check_args()
+                node->check_args(),
+                pt_call
             );
         }
 

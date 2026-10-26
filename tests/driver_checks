@@ -919,6 +919,32 @@ else
 fi
 
 # ---------------------------------------------------------------------
+# Question 5 (decision A): a function the PARSER runs runs typed - a copy
+# inferred for its argument types - so `f(3)` folded computes what
+# `f(int(runtime(3)))` computes at run time ("3.000000": `x` is a float
+# from its declaration on). The driver turns it on with inference and OFF
+# under -nti, where both calls run untyped ("3"). -rt sets it in-process,
+# so this is the only net for the driver's wiring; an image stores the
+# folded answer.
+cat > "$TMP/pt.my" <<'PTEOF'
+pure func f(int n) { var x = n; var r = str(x); x = 2.5; return r; }
+print(f(3), f(int(runtime(3))));
+PTEOF
+a=$("$BIN" "$TMP/pt.my" 2>&1)
+b=$("$BIN" -nc "$TMP/pt.my" 2>&1)
+c=$("$BIN" -nti "$TMP/pt.my" 2>&1)
+d=$("$BIN" -nti -nc "$TMP/pt.my" 2>&1)
+"$BIN" -c "$TMP/pt.my" -o "$TMP/pt.myv" >/dev/null 2>&1
+e=$("$BIN" "$TMP/pt.myv" 2>&1)
+if [ "$a" = "3.000000 3.000000 " ] && [ "$b" = "$a" ] && [ "$e" = "$a" ] \
+        && [ "$c" = "3 3 " ] && [ "$d" = "$c" ]; then
+    pass "a parse-time call runs typed, and untyped under -nti"
+else
+    fail "parse-time typed: default=[$a] -nc=[$b] -nti=[$c]" \
+         "-nti -nc=[$d] image=[$e]"
+fi
+
+# ---------------------------------------------------------------------
 # readln() at END OF INPUT is none (typed `opt str`), so a script can
 # tell it from an empty line - both used to read as "", and
 # samples/shopping busy-looped forever on a closed stdin. A last line

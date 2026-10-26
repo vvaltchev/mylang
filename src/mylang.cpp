@@ -794,6 +794,8 @@ int main(int argc, char **argv)
         }
 
         ParseContext ctx(TokenStream(tokens), !opt_no_const_fold);
+        /* -nti: nothing is typed, a parse-time call included (question 5) */
+        ctx.const_ctx->parse_typed = !opt_no_type_infer;
 
         /* -a: the parser records parse-time folds/DCE it would otherwise erase
          * (magenta folded calls, dim dead branches) into this collector; the

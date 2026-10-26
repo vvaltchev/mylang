@@ -249,6 +249,10 @@ public:
 
     explicit Inferencer(Construct *root = nullptr) : root(root) { }
     void run();
+    void propagate_decl_types();   /* question 5: see infer_parse_time */
+    std::string value_type_key(const EvalValue &v) {
+        return static_type_to_string(static_type_from_value(v));
+    }
     void stamp_proven_params();     /* C3: see the definition */
     /* #38 C: see the definition */
     void stamp_inferred_param_types(Construct *rootn);
@@ -9305,6 +9309,49 @@ void infer_types(Construct *root, bool enable, bool strict)
      * but skips the fixpoint / type checking / strict enforcement. */
     inf.checks_enabled = enable;
     inf.run();
+}
+
+/*
+ * Question 5 (plans/open-language-questions.md): type a parse-time call's
+ * synthetic program (pt_typed_call, parser.cpp) exactly as a compile
+ * types the program, then carry each declaration's decl_type to its uses,
+ * as resolve_names does for a compile - a parse-time run does not go
+ * through the resolver, and `x = 1` into a `float x` must coerce there
+ * too. Inference's trace is not the program's: it is silenced.
+ */
+void infer_parse_time(Construct *root)
+{
+    struct Quiet {
+        unsigned saved = g_trace_mask;
+        Quiet() { g_trace_mask = 0; }
+        ~Quiet() { g_trace_mask = saved; }
+    } quiet;
+    Inferencer inf(root);
+    inf.strict_dyn = true;
+    inf.checks_enabled = true;
+    inf.run();
+    inf.propagate_decl_types();
+}
+
+void Inferencer::propagate_decl_types()
+{
+    for (const auto &kv : id_sym) {
+        const TypeSym *s = kv.second;
+        if (!s || !s->decl_id || ctag(kv.first) != ConstructType::id)
+            continue;
+        auto *id = const_cast<Identifier *>(
+            static_cast<const Identifier *>(kv.first));
+        if (id->decl_type == DeclType::none)
+            id->decl_type = s->decl_id->decl_type;
+    }
+}
+
+/* The static type inference gives a parse-time VALUE (a literal of it),
+ * rendered: what a typed parse-time run's instance depends on */
+std::string static_type_key(const EvalValue &v)
+{
+    Inferencer inf;
+    return inf.value_type_key(v);
 }
 
 /*

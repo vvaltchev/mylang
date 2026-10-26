@@ -17,6 +17,7 @@
 #include <unordered_map>
 
 class Identifier;
+struct PtConstInits;  /* parser.h */
 class CaptureSlots;   /* a closure's captured values - defined below */
 
 /*
@@ -310,6 +311,29 @@ public:
      * (a same-scope duplicate declaration is an error).
      */
     bool allow_redeclare = false;
+
+    /*
+     * Set on the PARSER's root const context (ParseContext, and the REPL's
+     * persistent const scope) unless type inference is off (-nti), and
+     * read through `root`: a user function run at PARSE time is first
+     * type-inferred for its argument types (pt_typed_call, parser.cpp -
+     * question 5, plans/open-language-questions.md), so a constant call
+     * computes with the types the same call has at run time. AutoConst's
+     * own const context (after inference) never has it.
+     */
+    bool parse_typed = false;
+
+    /*
+     * Question 5: a typed copy's own const root (pt_typed_written): a call
+     * made at its top level is one a running function makes, by value.
+     */
+    bool pt_copy = false;
+
+    /*
+     * Question 5: the initializers of the consts this CONST scope declared
+     * holding a function (pt_note_const, parser.h). Allocated on the first.
+     */
+    std::unique_ptr<PtConstInits> pt_inits;
 
     /*
      * The current call's slot Frame, or nullptr outside any resolved call.

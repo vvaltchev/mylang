@@ -186,6 +186,11 @@ struct FuncDescriptor {
     /* A never-called monomorphization source: proven callee-less, so it has
      * neither a chunk nor (post-teardown) a body - calling it is a bug. */
     bool is_template_base = false;
+    /* A copy pt_typed_call (parser.cpp) type-inferred for a parse-time
+     * run: it runs as it is, typed; any other function run at parse time
+     * is typed first (EvalContext::parse_typed). COMPILE-only, never
+     * stored in an image. */
+    bool parse_typed = false;
 
     /*
      * The bytecode VM's compiled body chunk (an opaque `const Chunk *`; this

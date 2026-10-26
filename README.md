@@ -2417,6 +2417,61 @@ As you can see, in the first case an actual function call happens because
 `non_const` is not a constant, while in the second case it's AS IF we passed
 a literal integer to `print()`.
 
+#### A call at compile time computes what it computes at run time
+
+A function run at compile time gives the same answer as the same call made
+when the program runs. Type inference changes what a function computes, so
+before the compiler runs a function it infers the function's types for the
+call's argument types, just as it does for the program:
+
+```C#
+pure func f(int n) {
+    var x = n;          # x is a float: it is assigned 2.5 below
+    var r = str(x);
+    x = 2.5;
+    return r;
+}
+const R = f(3);
+print(R, f(int(runtime(3))));       # 3.000000 3.000000
+```
+
+This holds for every call the compiler makes: a `const` initializer, a
+constant call it folds inside an expression, a struct's `const` member, and a
+callback that a const builtin calls (`map`, `sort`, ...). The call is typed
+exactly as written, with the functions and constants it reaches. A function
+template gets one instance per argument signature, as in the program (see
+[Static type inference](#static-type-inference)). A const builtin given a
+function is typed as written too, so a callback's parameter takes the
+container's element type, as it does at run time:
+
+```C#
+const C = [1, none];
+const T = map(pure func(opt v) { var w = v; w = 0.5; return typestr(w); }, C);
+print(T);                           # ["float?", "float?"]
+```
+
+A function can also be reached through a **value**, and then it is typed the
+way the program types it. Suppose the value is a name bound to the function:
+`const G = show;`, a function another function returned, or a function passed
+as an argument. Then a call through it uses the template's instance. Suppose
+instead the function is read out of a constant container: `const OPS =
+[show];` and `OPS[0](4)`. Then the call runs the untyped template, because the
+program cannot redirect a value stored inside a constant to an instance.
+
+A type error in that typed code is a compile error, with the program's caret:
+`pure func bad(x) { var y = x; y = "s"; return 1; }` makes `const Z =
+bad(3);` an error, just as `bad(int(runtime(3)))` is.
+
+There is one limit. Some types are decided by joining every place in the
+program: an un-annotated `opt` parameter takes all its call sites, a lambda's
+parameter does the same (unless the lambda is written as a builtin's argument,
+whose call is its only one), and a template called through a value gets an
+instance only if every call through that value agrees on the argument types.
+For those, the compiler uses only the compile-time call itself, because it has
+not yet seen the rest of the program. With type inference off (`-nti`),
+compile-time calls and run-time calls both run untyped, so the example above
+prints `3 3`.
+
 #### Automatic pure promotion
 
 You don't always have to write `pure`. The interpreter promotes a function to

@@ -3428,6 +3428,78 @@ and it lives *inside the parser*. Mechanics:
   `CallExpr` folds when
   the callee and all args are const — that's how
   `sort(arr, pure func(a,b) => a<b)` runs at parse time.
+- **⛔ A USER FUNCTION THE PARSER RUNS, RUNS TYPED (question 5, decision
+  A, 2026-10-18; README *A call at compile time computes what it computes
+  at run time*).** Parse-time const-eval runs before inference exists,
+  and inference's stamps CHANGE what a run computes (a local's
+  `decl_type` widening, `ret_coerce`, a literal's `arr_hint` /
+  `elem_coerce`, a store's `rv_coerce` / `val_widen`, a template
+  instance) - so an untyped constant call gave another answer than the
+  same call at run time, and `-nc` disagreed with the default (RULE 2).
+  Once `do_func_call` has bound the arguments, `pt_try_typed` (eval.cpp)
+  hands the call to parser.cpp, which builds a SYNTHETIC PROGRAM: clones
+  of the functions the call reaches by name, each const it reads, each
+  struct as a NON-OWNING `StructDeclStmt` (`def` set, `def_owner` null),
+  and the call. It runs `infer_parse_time` over it (strict, checks on,
+  then `propagate_decl_types`, the resolver's decl_type propagation done
+  through the inferencer's own symbol links, since `resolve_names` does
+  not run here), marks every function in it
+  `FuncDescriptor::parse_typed` (COMPILE-only, never stored), and binds
+  its declarations under a const root OF ITS OWN (the builtins only;
+  `EvalContext::pt_copy`) - the REPL keeps its consts in the parser's
+  root, where declaring one was a store into it. Two forms:
+  - **A call the PARSER makes runs AS WRITTEN** (`pt_typed_written`; the
+    `CallExpr` is `dispatch_call_value`'s `pt_call`): the callee and
+    argument EXPRESSIONS are cloned, and a const holding a FUNCTION is
+    declared by a clone of its OWN INITIALIZER (`pt_note_const` keeps it
+    in the declaring scope's `EvalContext::pt_inits`, `dyn` as declared).
+    That is what makes a FUNCTION VALUE arrive as it does in the program,
+    which is what decides whether inference instantiates a template for
+    it: through a name bound to it (`const G = show`, `pick(true)`, an
+    argument) the program redirects the use to an instance; out of a
+    const container (`OPS[0]`, `const dyn F1 = first()` where `first()`
+    returns `OPS[0]`) it cannot - a baked value - and the template runs
+    untyped. Neither the `dyn` keyword nor "called by name" decides it;
+    both were tried and each got one shape wrong. **A BUILTIN call the
+    parser makes runs as written too when its arguments name a user
+    function** (`pt_args_name_function`: a function literal, or a name
+    bound to a function - `dispatch_call_value`'s builtin branch): the
+    builtin then calls the copy's function, whose parameters inference
+    typed from the CONTAINER's element type - by value, `map(pure
+    func(opt v) {...}, [1, none])` typed `v` from the value 1, `int` where
+    the program has `int?`.
+  - **A call a RUNNING function makes runs BY VALUE**
+    (`pt_typed_value`: a call through a value inside a body, a callback
+    a builtin calls inside a body, a call at a copy's own top level):
+    the copy is called by the function's name with the values as
+    literals (a function by its name, a BUILTIN by `pt_builtin_name`),
+    and a TEMPLATE reached that way runs untyped, as the program runs
+    one it reaches through a value.
+  Rules, each watched failing: the by-value cache key is the decl's
+  `node_id` plus each argument's STATIC type (and the ids of any function
+  in it), the written one the call's `node_id`; a result holding a
+  function value of a copy runs the call untyped instead (its
+  descriptors die with the cache - `pt_result`); the cache is cleared when
+  the outermost `pBlock` exits (`ParseContext::block_depth`) and in
+  `~ParseContext`, because the copies and the noted initializers are AST
+  the `-vm` teardown's `live_nodes == 0` proof counts; a copy's own root
+  is `pt_copy`, or a written call through a baked value recursed forever;
+  the switch is `EvalContext::parse_typed` on the const ROOT, set by the
+  ParseContext ctor, the REPL, and the script driver to
+  `!opt_no_type_infer` - under `-nti` both compile-time and run-time
+  calls run untyped, and `-rt` cannot see that wiring (`driver_checks`
+  does). Not typed (the call runs as before): a by-value call given a
+  struct TYPE - inference types a struct name used as a value `none`
+  (task #95), so a copy cannot type its callee - and guards no program
+  reaches. The known gap,
+  documented: a type the program JOINS over the whole program (an
+  un-annotated `opt` parameter, a lambda's unless written as a builtin's
+  argument, a template's instance through a value, made only when every
+  call through it agrees) is decided by this call alone. Nets: the
+  `parse: a function the parser runs runs typed` `-rt` entry (counters
+  `g_pt_runs` / `g_pt_untyped` prove the copy ran, or was declined),
+  the `repl:` cross-input case,
+  `tests/functional/97_parse_time_typed.my`, a `driver_checks` case.
 - **THE PROVER: a call that is GUARANTEED to fail is a COMPILE error
   (step 7 tier 2, `prove_unbound_calls` in resolver.cpp).** An
   unconditionally-evaluated call to a function that unconditionally reads a

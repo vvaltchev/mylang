@@ -139,7 +139,53 @@ Proposal: type-check a pure function for its argument types before
 running it at parse time, and give the folded result the call's type
 (a medium parser/inferencer change). Tracked as task #51.
 
-Decision: pending.
+Decision (maintainer, 2026-10-18): A. A pure call the parser runs at
+compile time is first type-inferred for its argument types, so it runs
+with the types the same call has at run time: constant and run-time calls
+give the same answer, and `-nc` changes nothing.
+
+Done (2026-10-18). The three examples above now print `3.000000
+3.000000`, `1.000000 1.000000` and `[3.000000]` twice, with and without
+`-nc`. A call the parser makes runs AS WRITTEN in a synthetic program
+(the call, the functions it reaches, its consts - one holding a function
+declared by its own initializer - and struct names), which inference
+types first - a builtin call given a function too, so a callback's
+parameter takes the container's element type; a call a running function
+makes runs by value. Details and the rules each part keeps are in
+CLAUDE.md, *A USER FUNCTION THE PARSER RUNS, RUNS TYPED*.
+
+What it decides beyond the question:
+
+- a function reached through a VALUE is typed the way the program types
+  it: through a name bound to it (`const G = show;`, a function another
+  returns, an argument) a template gets its instance; read out of a
+  const container (`const OPS = [show]; OPS[0](4)`) it runs untyped,
+  because the program cannot redirect a baked value to an instance;
+- a type error in the typed copy is a compile error: `pure func
+  bad(x) { var y = x; y = "s"; return 1; }` makes `const Z = bad(3);`
+  an error, as `bad(int(runtime(3)))` always was (it used to compile
+  and print 1);
+- under `-nti` both compile-time and run-time calls run untyped.
+
+Known limit: a type the program joins over the whole program (an
+un-annotated `opt` parameter, a lambda's unless it is written as a
+builtin's argument, a template's instance through a value, which the
+program makes only when every call through it agrees) is decided by the
+compile-time call alone.
+
+Found on the way (pre-existing, tasks #94-#96): a const bound to a
+builtin is undefined inside a function body; a struct name used as a
+value is typed `none` - a `dyn` parameter given one is refused, the VM
+aborts calling a template given one, and a typed copy cannot type a call
+a running function makes with one (it runs untyped, the one divergence
+left: `OPT[k](P, 3)` through a const array); a compile warning's location -
+and a compile error's - moves with folding (a folded call's site is
+gone from the program inference sees).
+
+Tests: `parse_time_typed_runs` (`-rt`, every engine, folding on and
+off, with counters proving the copy ran), the `repl:` cross-input case,
+`tests/functional/97_parse_time_typed.my`, a `driver_checks` case for
+the driver's `-nti` wiring and the `.myv` image.
 
 ## 6. A constant expression that throws is a compile error inside `try`
 
