@@ -938,6 +938,22 @@ value in rax before the fused branch; the full-op tier returns
 runs**; 43_sieve +0.2%, 56_sieve_bool +0.3% (the extra converge jump),
 18/65 exactly neutral. The `jit_delete_originals` test's array-read
 case FLIPPED to asserting deletion (it pinned the old bail behavior).
+**⛔ THE FULL-OP TIER IS DELETED (2026-10-21): it stepped a STALE
+counter.** `jit_for_step_elem` read and wrote the counter through its
+frame SLOT, but `pick_visit_op` lets ForStepElemInt keep the counter in
+a register - so on a gate decline the helper stepped whatever the slot
+last held. When that was not an int (a slot nothing had written since
+the frame was built) `getval<int_type>` threw TypeErrorEx out of the
+`noexcept` helper: `var a = b[0:3]; for (var i = 0; i < 3; i++) { var
+e = a[i]; ... }` - a SLICE base, whose gate always declines - aborted
+the default engine (`terminate`), while `-tw`, `-nj` and
+`MYLANG_JIT_OFF=cache` printed the answer. Found by `myv_fuzz` (seed
+249888766, fat-160) and then in that plain program. The emitter now
+steps and tests FIRST, through the cache-aware read_slot/write_slot,
+and checks the base only on a taken branch, so a GATE decline is just
+another SLOW A entry on the stepped counter; nothing after the step
+bails, so the double-step hazard that forced the gate first is gone
+with it. Pinned by `tests/functional/101_for_step_elem_slice.my`.
 **The native `throw` (#56, the exception trio's first third):**
 `jit_throw(val_slot, pc, &locs[i])` runs the interpreted op's exact body
 - vm_make_thrown_exc + the SHARED vm_raise - and reports one of three

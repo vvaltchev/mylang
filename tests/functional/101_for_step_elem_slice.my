@@ -1,0 +1,64 @@
+# The fused loop step `for (var i = ..; i < n; i++) { var e = a[i]; ... }`
+# (ForStepElemInt) over a base its inline read declines - a SLICE, whose
+# check fails every iteration. Its slow tier stepped the loop counter
+# through the counter's frame slot while the counter lived in a
+# register, so the step read a slot nothing had written: the default
+# engine aborted (a TypeErrorEx through a noexcept helper) where -tw and
+# -nj printed the answer (2026-10-21, myv_fuzz seed 249888766). Each
+# loop below takes that path on every iteration.
+
+var b = [1, 2, 3, 4];
+var a = b[0:3];
+var t = str(runtime(7));
+
+# counting up with `<`, the shape the fuzzer found
+var s = 0;
+for (var i = 0; i < 3; i++) { var e = a[i]; s = s * 2 + e; }
+assert(s == 11 && t == "7");
+
+# counting up with `<=`
+var s2 = 0;
+for (var i = 0; i <= 2; i++) { var e = a[i]; s2 = s2 * 10 + e; }
+assert(s2 == 123);
+
+# counting down with `>=` and `>`
+var s3 = 0;
+for (var i = 2; i >= 0; i--) { var e = a[i]; s3 = s3 * 10 + e; }
+assert(s3 == 321);
+var s4 = 0;
+for (var i = 2; i > 0; i--) { var e = a[i]; s4 = s4 * 10 + e; }
+assert(s4 == 32);
+
+# a slice of a slice, starting past 0
+var c = b[1:4][0:2];
+var s5 = 0;
+for (var i = 0; i < 2; i++) { var e = c[i]; s5 = s5 * 10 + e; }
+assert(s5 == 23);
+
+# the bound past the slice's end: the read raises at i == 3, after the
+# first three elements were summed, and the counter stopped there
+var s6 = 0;
+var last = -1;
+var raised = false;
+try {
+    for (var i = 0; i < 5; i++) {
+        var e = a[i];
+        s6 = s6 * 10 + e;
+        last = i;
+    }
+} catch (OutOfBoundsEx) {
+    raised = true;
+}
+assert(raised && s6 == 123 && last == 2);
+
+# in a function body, the loop's counter a parameter-derived bound
+func walk(array<int> v, int n) {
+    var r = 0;
+    for (var i = 0; i < n; i++) { var e = v[i]; r = r * 10 + e; }
+    return r;
+}
+assert(walk(a, 3) == 123);
+assert(walk(b[2:4], 2) == 34);
+assert(walk(b, int(runtime(4))) == 1234);
+
+print("ok", s, s2, s3, s4, s5, s6, walk(a, 3));

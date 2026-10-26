@@ -981,9 +981,6 @@ void *jit_addr_resume_pc();         /* the parked handler pc's address */
 extern int_type g_jit_elem_tmp;     /* the slow tiers' value scratch */
 extern "C" int jit_elem_int_value(LValue *base_lv, int_type idx,
                                   int_type *out) noexcept;
-extern "C" int jit_for_step_elem(int_type i_slot, int_type bound, int aop_i,
-                                 int_type base_slot,
-                                 int_type elem_slot) noexcept;
 
 /* model-flip (nativize-ops): the native SliceV `dst = base[start:end]` via the
  * runtime Type::slice (COW-registered sub-view). base/start/end/dst are frame

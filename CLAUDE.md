@@ -8939,6 +8939,19 @@ outcome is the SAME in every build (`myv_untrusted_proven_arms`,
 watched aborting both ways). When a fuzz finding is a DEBUG-ONLY abort
 on an image, ask which side of that line the assertion is on before
 calling it harmless.
+**⛔ AND A SIXTH (2026-10-21, myv_fuzz seed 249888766): A HELPER HANDED A
+SLOT INDEX READS THE FRAME, AND THE EMITTER MAY KEEP THAT SLOT IN A
+REGISTER.** ForStepElemInt's gate-decline tier, `jit_for_step_elem`,
+took the loop counter's slot number and stepped `ctx->frame->at(i)` -
+but `pick_visit_op` lets the op keep the counter pinned, so the slot
+held whatever was there before the loop (a `none`, in a slot nothing had
+written) and `getval<int_type>` threw through `noexcept`. Not an image
+bug: `for (...) { var e = a[i]; ... }` over a slice aborted the default
+engine. A slow tier gets a pinned value AS A VALUE, read through the
+cache-aware `read_slot` before the call (as `jit_elem_int_value` gets
+the stepped counter), or the op flushes first. Before handing a helper
+a slot index, ask whether `pick_visit_op` lets that slot live in a
+register at this pc.
 
 Two producer-side rules fell out: **only PRE-JIT bytecode is storable**
 (`myv_write` ML_CHECKs it - the JIT rewrites code in place and fragments
