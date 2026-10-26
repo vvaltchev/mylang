@@ -1248,6 +1248,18 @@ with the note shown above.
     holding the same pairs in different orders are still `==` and hash
     equal - the order is never part of a dict's value.
 
+    **A dict literal is built like successive stores**, so a key written
+    twice takes the LAST value, at the place of its first occurrence - as
+    in Python, and as `dict(pairs)` and `make_dict()` do. Every key and
+    value is still evaluated, left to right, and this holds whether the
+    key is a constant or known only when the program runs:
+
+    ```C#
+    print({"a": 1, "b": 2, "a": 3});     # {"a": 3, "b": 2}
+    var k = str(runtime("b"));
+    print({"b": 0, "c": 1, k: 5});       # {"b": 5, "c": 1}
+    ```
+
     ```C#
     var d = {"z": 1, "a": 2};
     d["m"] = 3;

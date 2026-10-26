@@ -15338,6 +15338,40 @@ static const std::vector<test> tests =
     },
 
     {
+        /* question 7: a literal is built like successive stores - the last
+         * value wins, at the place of the key's first occurrence */
+        "dict literal: a repeated key takes the last value at its first place",
+        {
+            "var d = {\"a\": 1, \"b\": 2, \"a\": 3};",
+            "assert(len(d) == 2);",
+            "assert(str(d) == \"{\\\"a\\\": 3, \\\"b\\\": 2}\");",
+            "const C = {\"x\": 1, \"y\": 2, \"x\": 5};",
+            "assert(C.x == 5);",
+            "assert(keys(C) == [\"x\", \"y\"]);",
+            "var k = str(runtime(\"a\"));",
+            "var e = {k: 1, \"a\": 2};",
+            "assert(len(e) == 1 && e.a == 2);",
+            "var e2 = {\"a\": 1, k: 2, \"z\": 0};",
+            "assert(keys(e2) == [\"a\", \"z\"] && e2.a == 2);",
+            /* every key and value is evaluated, left to right */
+            "var seen = [];",
+            "func t(x) { append(seen, x); return x; }",
+            "var q = {t(\"p\"): t(1), t(\"p\"): t(2)};",
+            "assert(q.p == 2);",
+            "assert(str(seen) == \"[\\\"p\\\", 1, \\\"p\\\", 2]\");",
+            /* in a loop, so the JIT builds it too */
+            "var s = 0;",
+            "for (var i = 0; i < 50; i++) {",
+            "    var m = {i % 3: i, 1: 7, i % 3: i + 100};",
+            "    s += m[i % 3];",
+            "    assert(len(m) == (i % 3 == 1 ? 1 : 2));",
+            "    assert(keys(m)[0] == i % 3);",
+            "}",
+            "assert(s == 6225);",
+        },
+    },
+
+    {
         "mixed int/float arithmetic and comparison are symmetric",
         {
             /* arithmetic: int-OP-float matches float-OP-int and yields float */

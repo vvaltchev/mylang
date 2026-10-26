@@ -14,7 +14,7 @@ at run time (#49).
 | 3  | does a slice alias like any other array?        | decided: B |
 | 5  | a parse-time pure call runs before inference    | decided: A |
 | 6  | a throwing constant expression inside a `try`   | decided: A |
-| 7  | duplicate keys in a dict literal                | open       |
+| 7  | duplicate keys in a dict literal                | decided: A |
 
 ## 3. Does a slice alias like any other array once assigned?
 
@@ -248,4 +248,17 @@ Python keeps the last value in both.
 - **C.** As A, and a repeated CONSTANT key in a literal is a compile
   error.
 
-Decision: pending.
+Decision: **A** (2026-10-20). A literal is built like successive
+stores: the last value wins and the key keeps its first position, as
+in Python and as `dict()` already does. `{"a": 1, "b": 2, "a": 3}`
+gives `{"a": 3, "b": 2}`.
+
+Done (2026-10-20). Every engine builds a literal through one function,
+`build_dict_from_pairs` (eval.cpp: the tree-walker's `LiteralDict`, the
+parser's fold of a constant literal, the VM's and the JIT's
+`MakeDictV`), which now stores each pair with `insert_or_assign`, as
+`dict(pairs)` does. Every key and value is still evaluated, left to
+right. Tests: an `-rt` case (constant and run-time keys, the evaluation
+order, a literal in a compiled loop) and
+`tests/functional/98_dict_literal_dup_keys.my`, alike in every engine
+and under `-nc`, `-nti` and `--no-opt all`.
