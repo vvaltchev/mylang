@@ -7461,7 +7461,7 @@ int_type Subscript::eval_int(EvalContext *ctx) const
             return arr.flat_ints()[at];     /* unboxed: no promotion */
         if (arr.skind() == SharedArrayObj::Storage::bools)
             return arr.flat_bools()[at] ? 1 : 0;   /* bool elem -> int 0/1 */
-        return arr.get_vec()[at].getval<int_type>();
+        return general_elem_int(arr.get_vec()[at]);
     }
     /* typed dict read `d[k]` (present key): look the value up directly instead
      * of Construct::eval_int, which would re-evaluate `what` (the dict). */

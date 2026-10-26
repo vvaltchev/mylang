@@ -1,0 +1,53 @@
+# An array<bool> is not always stored flat: an inline keys() of a
+# dict<bool, ...> and dynarray() build a GENERAL array, and a parameter
+# declared array<bool> accepts one. Reading an element where an int is
+# expected - a condition, arithmetic, a counted loop - must read it as
+# 0/1, as a flat bool array's element reads. It raised TypeErrorEx in
+# every engine, each with another caret (the tree-walker marked the
+# whole `if`, the JIT the element, -nj nothing at all).
+
+func cond_count(array<bool> b) {
+    var s = 0;
+    for (var i = 0; i < len(b); i++)
+        if (b[i])
+            s += 1;
+    return s;
+}
+
+func arith(array<bool> b) {
+    var s = 0;
+    for (var i = 0; i < len(b); i++)
+        s += b[i];
+    return s + b[0] * 10 + b[len(b) - 1];
+}
+
+func walk_down(array<bool> b) {
+    var s = 0;
+    for (var i = len(b) - 1; i >= 0; i--) {
+        var e = b[i];
+        s = s * 2 + e;
+    }
+    return s;
+}
+
+func gen_bools() {
+    var d = {};
+    d[true] = 1;
+    d[false] = 2;
+    return d;
+}
+
+var flat = [true, false, true, true];
+var gen = dynarray(flat);
+assert(array_storage(flat) == "bool" && array_storage(gen) == "general");
+assert(array_storage(keys(gen_bools())) == "general");
+
+foreach (a in [flat, gen])
+    print(cond_count(a), arith(a), walk_down(a));
+assert(cond_count(gen) == 3 && arith(gen) == 14 && walk_down(gen) == 13);
+assert(cond_count(gen) == cond_count(flat) && arith(gen) == arith(flat));
+
+# keys() follows insertion order: [true, false]
+print(cond_count(keys(gen_bools())), arith(keys(gen_bools())));
+assert(cond_count(keys(gen_bools())) == 1);
+assert(arith(keys(gen_bools())) == 11);
