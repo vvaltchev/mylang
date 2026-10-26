@@ -29,7 +29,7 @@ jobs:
   differential:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (Debug)
@@ -67,7 +67,7 @@ jobs:
            corpus_diff vdjcmp bt_oracle norec_enum norec_sweep
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -81,7 +81,7 @@ jobs:
   differential-levers-fuzz:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (Debug)
@@ -101,7 +101,7 @@ jobs:
            --bin dbg=build/mylang corpus_diff-levers nested_fuzz
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -131,7 +131,7 @@ jobs:
         shard: [0, 1, 2]
     name: disasmcheck (shard ${{matrix.shard}}/3)
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (Debug)
@@ -145,7 +145,7 @@ jobs:
            disasmcheck-matrix --shard ${{matrix.shard}}/3
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -197,7 +197,7 @@ jobs:
             cmake: -DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release
     name: nolowmem (${{matrix.name}})
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build
@@ -219,7 +219,7 @@ jobs:
            driver_checks@${{matrix.lane}}
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -253,7 +253,7 @@ jobs:
             cmake: -DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release
     name: spcheck (${{matrix.name}})
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build
@@ -269,7 +269,7 @@ jobs:
            rt-spcheck@${{matrix.lane}} corpus_diff-spcheck@${{matrix.lane}}
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -288,7 +288,7 @@ jobs:
     env:
       CXX: g++-14        # MC/DC (-fcondition-coverage) needs GCC >= 14
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Install GCC 14
@@ -319,14 +319,14 @@ jobs:
            int-vdjcmp int_run-gcov driver_checks@int-gcov
     - name: Upload the coverage report
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: int-coverage
         path: test-logs/int_run-gcov-report.txt
         if-no-files-found: ignore
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -344,7 +344,7 @@ jobs:
   int-enum:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (INT_TESTS, optimized, asserts on)
@@ -373,7 +373,7 @@ jobs:
            int_enum-1 int_enum-2 disasmcheck-rex
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -400,7 +400,7 @@ jobs:
             cmake: -DTESTS=1 -DASSERTS=OFF -DCMAKE_BUILD_TYPE=Release
     name: "myv-fuzz (${{ matrix.name }})"
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build
@@ -416,7 +416,7 @@ jobs:
            --bin ${{matrix.lane}}=build/mylang myv_fuzz@${{matrix.lane}}
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -431,7 +431,7 @@ jobs:
   repl-fuzz:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (RECYCLE)
@@ -444,7 +444,7 @@ jobs:
            --bin recycle=build/mylang repl_fuzz@recycle
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -464,7 +464,7 @@ jobs:
   coverage-gate:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (GCOV)
@@ -477,7 +477,7 @@ jobs:
            norec_coverage
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/

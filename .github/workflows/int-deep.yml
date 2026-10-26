@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Build (INT_TESTS, optimized, asserts on)
@@ -49,7 +49,7 @@ jobs:
            --bin int-rel=build-enum/mylang int_enum-3
     - name: Upload the logs and failures
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: int-enum-t3
         path: test-logs/
@@ -62,7 +62,7 @@ jobs:
     env:
       CXX: g++-14        # MC/DC (-fcondition-coverage) needs GCC >= 14
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     - name: Install GCC 14
@@ -78,7 +78,7 @@ jobs:
            --bin int-gcov=build-sel/mylang int_select
     - name: Upload the report
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: int-select
         path: test-logs/int_select*
