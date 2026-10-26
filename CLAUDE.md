@@ -90,6 +90,59 @@ the `splice_choice` INT site, `-nbi`'s "splice ON/OFF" mode names,
 this rule; read "splice" in them as "bytecode inlining", and do not write
 the word in anything new.
 
+## ⛔ WHAT A PUSH NEEDS (maintainer-set, 2026-11-06)
+
+**A change to anything that is built, run or read by a test** -
+`src/`, `tests/`, `samples/`, `bench/`, `scripts/`, `Makefile`,
+`CMakeLists.txt`, `.github/` - is pushed only after the FULL catalog is
+green on that exact commit:
+
+    cmake -S . -B build-claude/ci-int -DINT_TESTS=ON -DGCOV=ON \
+          -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug     # once
+    cmake --build build-claude/ci-int -j8
+    tests/run --build-root build-claude -t long \
+              --bin int-gcov=build-claude/ci-int/mylang
+
+**A DOCS-ONLY change needs no test run and is pushed directly**: every
+file it touches is prose that nothing compiles, executes or reads -
+`README.md`, `CLAUDE.md`, `tests/CLAUDE.md`, `tests/README.md`,
+`plans/`, the Markdown under `docs/`. (Checked 2026-11-06: no test,
+tool or build step opens any of them.) One exception:
+`docs/myv-format.txt` is a SPEC with a machine check, so a change to it
+runs `tests/myv_doc_check` first (seconds; see the format rule above).
+A commit that mixes docs with anything else is a code change.
+
+## ⛔ NO NEW LANGUAGE FEATURES UNTIL THE TESTS AND THE JIT ARE DONE
+## (maintainer-set, 2026-11-02)
+
+The work order, and nothing jumps it:
+
+ 1. **STABILIZE THE LANGUAGE** - bugs, crashes, and conflicting behavior
+    between engines (RULE 1, RULE 2). Every open language question asked
+    so far came from exactly that, not from a wish for a feature.
+ 2. **FINISH THE INTRUSIVE TESTS (#107, `plans/intrusive-tests.md`)** -
+    super powerful tests that are DETERMINISTIC and FAST because each
+    one targets a specific code path, not a fuzzer's lucky draw. Return
+    to them first after any detour.
+ 3. **FINISH THE SUSPENDED JIT OPTIMIZATION WORK (#97)**.
+ 4. Only THEN resume introducing language features.
+
+A language decision the maintainer has taken but that ADDS a feature is
+SAVED, not built: it waits in `plans/open-language-questions.md` (with
+its sketch in `plans/language-deferred.md`) until step 4. Today that is
+question 13 (builtin arity checked at compile time - decided A) and
+question 14 (struct methods, class inheritance). Do not start one
+because it looks small.
+
+**STRUCT vs CLASS - the line the language keeps (maintainer, 2026-11-02).**
+A `struct` is a value type for DATA CONTAINERS and stays super
+efficient: explicit field types only (no `var` fields), `opt` only where
+it is today (dyn / array / dict / class fields - an `opt` scalar field
+would be a nightmare to optimize in the JIT), at most BASIC methods and
+nothing more, and never inheritance. A `class` is a proper object, like
+C#'s: always heap-allocated, reference-counted, MANAGED and boxed, like
+strings and arrays - so inheritance, when it comes, goes there.
+
 ## ⛔ INFRASTRUCTURE FIRST, TESTS SECOND, FEATURES/OPTIMIZATIONS LAST
 ## (maintainer-set, 2026-08-18)
 

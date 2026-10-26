@@ -20,9 +20,10 @@ at run time (#49).
 | 10 | `deepclone` and shared instances                | decided: B |
 | 11 | the value of a multi-assignment                 | decided    |
 | 12 | exception chaining                              | decided    |
-| 13 | fixed builtin arities (`write` / `fwrite`)      | open       |
-| 14 | the struct deferrals (var/opt fields, methods,  | open       |
-|    | subtyping)                                      |            |
+| 13 | fixed builtin arities (`write` / `fwrite`)      | decided: A |
+|    |                                                 | (saved)    |
+| 14 | the struct deferrals (var/opt fields, methods,  | decided    |
+|    | subtyping)                                      | (saved)    |
 | 15 | a closure's parameters from every call site     | open       |
 | 16 | read-only views of a mutable container          | open       |
 | 17 | reference cycles, part B (reclaiming them)      | open       |
@@ -31,9 +32,13 @@ at run time (#49).
 | 20 | trace verbosity levels                          | open       |
 
 8-20 were added on 2026-10-24, in priority order, and are presented
-three at a time. 11 and 15-17 have their own plan files
-(`multi-assign-value.md`, `closure-param-join.md`, `immutable-views.md`,
-`reference-cycles.md`); 19 is in CLAUDE.md, under `--strict`.
+three at a time. **PAUSED after 14 (maintainer, 2026-11-02):** the
+language grows no features until the intrusive tests and the JIT work
+are done (CLAUDE.md, *NO NEW LANGUAGE FEATURES*), so 13 and 14 are
+decided and SAVED, not implemented, and 15-20 wait. 11 and 15-17 have
+their own plan files (`multi-assign-value.md`, `closure-param-join.md`,
+`immutable-views.md`, `reference-cycles.md`); 19 is in CLAUDE.md, under
+`--strict`.
 
 ## 3. Does a slice alias like any other array once assigned?
 
@@ -457,3 +462,41 @@ part fixed a crash on the way: a second `rethrow` in a catch body, after
 an inner `try` caught the first, aborted the VM (the first had MOVED the
 exception out of its slot).
 
+## 13. Fixed builtin arities
+
+A builtin called with the wrong number of arguments fails only when it
+runs (`InvalidNumberOfArgsEx`), even when the call is written directly.
+17 builtins take no fixed count: an optional last argument (`str`,
+`array`, `find`, `sort`, `rev_sort`, `sum`, `lpad`, `rpad`, `round`,
+`write`, `writeln`, `writelines`, `read`, `readlines`), `range` (1-3),
+`min` / `max` (one array, or 2+ values) and `print` (any). An optional
+argument does not prevent a compile-time check - "1 or 2" is as static
+as "exactly 2" - so fixed arities are not needed for it.
+
+Decision (maintainer, 2026-11-02): **A** - check every DIRECT builtin
+call's count against the builtin's range at compile time; no script
+changes; a builtin called through a value (`var f = sort; f(...)`) keeps
+the run-time check. (B, splitting the builtins whose optional argument
+changes what they do - `write(s, file)` into `fwrite` - and C, fixed
+arities everywhere, were not taken.) SAVED, not implemented: it waits
+for the end of the intrusive tests and the JIT work.
+
+## 14. The struct deferrals
+
+The four features v1 structs left out (`plans/language-deferred.md`).
+Decisions (maintainer, 2026-11-02), all SAVED and none implemented:
+
+- **`var` (inferred) fields: B - keep requiring the type.** A struct
+  field always has an explicit type.
+- **`opt` scalar fields: no.** `opt` stays allowed only on dyn, array,
+  dict and class fields: an optional scalar field would be a nightmare
+  to optimize in the JIT.
+- **Methods: structs get BASIC methods, nothing more.** The sketch
+  presented: declared in the body, an implicit `self`, a method that
+  writes `self` writes the variable it was called on (a compile error on
+  a const or a temporary); no method values, static methods or
+  overloading.
+- **Subtyping: on `class` only.** A class is a C#-style managed object -
+  always heap-allocated, reference-counted and boxed, like strings and
+  arrays - so inheritance goes there, and a struct stays an efficient
+  value container with none.

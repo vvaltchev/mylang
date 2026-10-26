@@ -40,6 +40,14 @@ Not in README.md, not in CLAUDE.md, not in
 
 ## Structs — the four remaining v1 deferrals
 
+**DECIDED 2026-11-02 (question 14 of `plans/open-language-questions.md`),
+NOT BUILT:** `var` fields - no, a field keeps an explicit type; `opt`
+scalar fields - no (a JIT optimization nightmare); methods - basic
+ones, on structs, nothing more; subtyping - on `class` only, a managed
+heap object. Nothing here is built until the intrusive tests and the
+JIT work are done (CLAUDE.md, *NO NEW LANGUAGE FEATURES*). The sketches
+below are the record of what was weighed.
+
 CLAUDE.md names these in one line and points at the plan for the
 detail, so these sketches are the only written record
 (`plans/archived/structs.md` §11).
