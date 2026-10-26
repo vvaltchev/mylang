@@ -2014,6 +2014,30 @@ pRefuseFoldedTarget(Loc start, Loc end)
     throw e;
 }
 
+/*
+ * A multi-assignment `a, b = v` has NO VALUE (question 11, maintainer,
+ * 2026-10-26): it is a statement, and where its value would be used - the
+ * value of an assignment or a declaration, a `return`, a `throw` - it is
+ * refused here, since it would always be `none` (`w = a, b = [5, 6]` made
+ * `w` none, `a, b = c, d = [1, 2]` made `a` and `b` none). A statement of
+ * its own (a block's, a `for`'s init or step) is unaffected.
+ * plans/multi-assign-value.md has what giving it a value would take.
+ */
+static void
+pRefuseMultiAssignValue(const Construct *e)
+{
+    if (!e || ctag(e) != ConstructType::expr14)
+        return;
+    const Construct *lv = static_cast<const Expr14 *>(e)->lvalue.get();
+    if (!lv || ctag(lv) != ConstructType::idlist)
+        return;
+    SyntaxErrorEx ex(e->start, intern_msg(
+        "A multi-assignment has no value: write it as a statement of its "
+        "own"));
+    ex.loc_end = e->end;
+    throw ex;
+}
+
 static void
 pRefuseUnassignable(const Construct *lv, const char *what)
 {
@@ -2669,6 +2693,7 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
         ret->lvalue = std::move(lside);
         NestGuard ng(c);                    /* #98: `a = b = ...` nests */
         ret->rvalue = pExpr14(c, fl & ~pFlags::pInDecl);
+        pRefuseMultiAssignValue(ret->rvalue.get());
     }
 
     ret->fl = fl & pFlags::pInDecl;
@@ -3009,6 +3034,7 @@ pAcceptReturnStmt(ParseContext &c,
         unique_ptr<ReturnStmt> stmt(new ReturnStmt);
 
         stmt->elem = pExpr14(c, fl);
+        pRefuseMultiAssignValue(stmt->elem.get());
         pExpectOp(c, Op::semicolon);
         stmt->start = start;
         stmt->end = c.get_loc();
@@ -3030,6 +3056,7 @@ pAcceptThrowStmt(ParseContext &c,
 
         unique_ptr<ThrowStmt> t(new ThrowStmt);
         t->elem = pExprTop(c, fl);
+        pRefuseMultiAssignValue(t->elem.get());
 
         if (!t->elem)
             noExprError(c);

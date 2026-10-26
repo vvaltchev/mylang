@@ -982,28 +982,30 @@ static const std::vector<test> tests =
         },
     },
 
-    /* A multi-assignment's value is none (README), in every engine: the
-     * VM refused to compile the value form and the inferencer typed it
-     * as the right-hand side, so a typed destination held none. */
-    {
-        "multi-assign as expr is none",
-        {
-            "var a = 0; var b = 0; var dyn w = 1;",
-            "w = a, b = [runtime(5), 6];",
-            "assert(w == none && a == 5 && b == 6);",
-            "w = a, b += [runtime(1), 1];",
-            "assert(w == none && a == 6 && b == 7);",
-        },
-    },
-
-    {
-        "multi-assign value into a typed destination is refused",
-        {
-            "var a = 0; var b = 0; array<int> w;",
-            "w = a, b = [5, 6];",
-        },
-        &typeid(NullabilityEx),
-    },
+    /* A multi-assignment has no value (README; question 11): where its
+     * value would be used it is a compile error - it used to be none,
+     * which a typed destination held at run time (RULE 1). Each case
+     * marks the multi-assignment. */
+    { "multi-assign has no value: an assignment's value",
+      { "var a = 0; var b = 0; var dyn w = 1;",
+        "w = a, b = [5, 6];" },
+      &typeid(SyntaxErrorEx), 5, 2, 19, 2 },
+    { "multi-assign has no value: a return's",
+      { "var a = 0; var b = 0;",
+        "func f() { return a, b = [5, 6]; }" },
+      &typeid(SyntaxErrorEx), 19, 2, 33, 2 },
+    { "multi-assign has no value: a declaration's",
+      { "var a = 0; var b = 0;",
+        "var w = a, b = [5, 6];" },
+      &typeid(SyntaxErrorEx), 9, 2, 23, 2 },
+    { "multi-assign has no value: another multi-assignment's",
+      { "var a = 0; var b = 0; var c = 0; var d = 0;",
+        "a, b = c, d = [1, 2];" },
+      &typeid(SyntaxErrorEx), 8, 2, 22, 2 },
+    { "multi-assign has no value: a throw's",
+      { "var a = 0; var b = 0;",
+        "throw a, b = [1, 2];" },
+      &typeid(SyntaxErrorEx), 7, 2, 21, 2 },
 
     /* A const or builtin target refuses the store in every engine: the
      * VM refused to compile a non-local target, and stored into a local

@@ -18,8 +18,8 @@ at run time (#49).
 | 8  | `rethrow` inside a `try` nested in a `catch`    | decided: A |
 | 9  | the element type of an empty container          | decided: C |
 | 10 | `deepclone` and shared instances                | decided: B |
-| 11 | the value of a multi-assignment                 | open       |
-| 12 | exception chaining                              | open       |
+| 11 | the value of a multi-assignment                 | decided    |
+| 12 | exception chaining                              | decided    |
 | 13 | fixed builtin arities (`write` / `fwrite`)      | open       |
 | 14 | the struct deferrals (var/opt fields, methods,  | open       |
 |    | subtyping)                                      |            |
@@ -413,4 +413,31 @@ Tests: `tests/functional/103_deepclone_sharing.my` and an `-rt` case;
 the three tests that pinned the old rule (`83_cyclic_values.my`, the
 `cycle: deepclone` case, `tests/int/40_box_kinds.my`) now assert the new
 one.
+
+## 11. The value of a multi-assignment
+
+`w = a, b = [5, 6]` made `w` none, and so did `return a, b = ...`,
+`var w = a, b = ...`; `a, b = c, d = [1, 2]` made `a` and `b` none, and
+`w[0] = a, b = ...` failed only at run time. Giving it a value - the
+maintainer's original idea, a list whose elements are the targets - is
+`plans/multi-assign-value.md`.
+
+Decision (maintainer, 2026-10-26): keep it valueless while a value is
+hard to give it, and refuse at compile time every use of the value,
+which could only ever be `none`. Done the same day: the parser refuses a
+multi-assignment as an assignment's or a declaration's value, a `return`
+or a `throw` (`pRefuseMultiAssignValue`); as a statement - a block's, a
+`for` init or step - it is unchanged. A value would need four more
+decisions first (the plan's "questions to settle"): what a compound one
+yields, a spread, `_`, and its type.
+
+## 12. Exception chaining
+
+An exception raised while another is being handled replaces it: the
+first is lost, from the program and from the uncaught-exception report.
+`plans/language-deferred.md` has the request (2026-07-09) and its three
+prerequisites.
+
+Decision (maintainer, 2026-10-26): **implicit**, like Python: no new
+syntax, the new exception remembers the one being handled.
 

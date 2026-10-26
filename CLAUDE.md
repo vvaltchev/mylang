@@ -4856,12 +4856,13 @@ decisions behind it: `plans/archived/type-inference.md`,
   rvalue BEFORE the store (rv_coerce, checked - which also keeps a
   misfit out of a general array<float?> or a dict, RULE 1); a struct
   field refuses a misfit in the store itself.
-  A MULTI-assignment's value is `none` (type_of answers `none` for an
-  IdList target; codegen compiles the statement, then loads none). Until
-  2026-10-06 it was typed as the rvalue, so `array<int> w; w = a, b =
-  [5, 6]` compiled and held none, and the VM refused the form. The
-  maintainer's eventual semantics - a list whose elements alias the
-  targets - is plans/multi-assign-value.md.
+  A MULTI-assignment has NO value (question 11, 2026-10-26): the parser
+  refuses one where its value would be used - an assignment's or a
+  declaration's value, a `return`, a `throw` (`pRefuseMultiAssignValue`)
+  - so codegen lowers it only as a statement. It evaluated to `none`
+  until then (typed as the rvalue before 2026-10-06, so `array<int> w;
+  w = a, b = [5, 6]` compiled and held none). What giving it a value
+  would take is plans/multi-assign-value.md.
 - **A MULTI-ASSIGNMENT'S TARGETS ARE WRITES LIKE ANY OTHER (2026-10-06).**
   `for_each_child` treats an IdList as a leaf, so walk_struct resolves
   each target of a non-declaring multi-assignment explicitly - until then
