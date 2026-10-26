@@ -1,12 +1,12 @@
-# A multi-assignment (`a, b = [5, 6]`) used as a VALUE - `w = a, b = ...`,
-# `return a, b = ...` - evaluates to none (README), whatever form it takes:
-# a destructure, a spread, a compound, a `_` placeholder. The tree-walker
-# gave none while the VM refused to compile it (NotLoweredEx), and the
-# inferencer typed the value as the right-hand side, so a typed destination
-# accepted it statically and then held none (RULE 1). The VM also refused
-# any multi-assignment into a global or a closure's capture (NotLoweredEx,
-# even as a statement); those targets are below. Values come from
-# runtime().
+# A multi-assignment (`a, b = [5, 6]`) in every form it takes - a
+# destructure, a spread, a compound, a `_` placeholder - into locals,
+# typed locals, globals and a closure's captures. It is a STATEMENT with
+# no value (README; question 11): `w = a, b = ...` or `return a, b = ...`
+# is a compile error (the -rt `multi-assign has no value` cases). It used
+# to evaluate to none, which every check below asserted alongside the
+# stores. The VM once refused any multi-assignment into a global or a
+# closure's capture (NotLoweredEx); those targets are below. Values come
+# from runtime().
 
 var events = [];
 func val(v) { append(events, "val"); return v; }
@@ -17,44 +17,42 @@ func ri(int v) => int(runtime(v));
 func pair(n) {
     var a = 0;
     var b = 0;
-    var r = 1;
-    r = a, b = [n, n + 1];
-    return [r, a, b];
+    a, b = [n, n + 1];
+    return [a, b];
 }
 func ret(n) {
     var a = 0;
     var b = 0;
-    return a, b = [n, n * 3];
+    a, b = [n, n * 3];
+    return a + b;
 }
-assert(pair(ri(5)) == [none, 5, 6]);
-assert(ret(ri(4)) == none);
+assert(pair(ri(5)) == [5, 6]);
+assert(ret(ri(4)) == 16);
 
 var a = 1;
 var b = 2;
-var dyn w = 0;
 
 # a spread, a compound, a placeholder
-w = a, b = ri(7);
-assert(w == none && a == 7 && b == 7);
-w = a, b += [ri(10), ri(20)];
-assert(w == none && a == 17 && b == 27);
-w = a, _ = [ri(3), ri(4)];
-assert(w == none && a == 3 && b == 27);
+a, b = ri(7);
+assert(a == 7 && b == 7);
+a, b += [ri(10), ri(20)];
+assert(a == 17 && b == 27);
+a, _ = [ri(3), ri(4)];
+assert(a == 3 && b == 27);
 
 # the right-hand side runs once, before the stores
-w = a, b = val([ri(8), ri(9)]);
-assert(w == none && a == 8 && b == 9 && events == ["val"]);
+a, b = val([ri(8), ri(9)]);
+assert(a == 8 && b == 9 && events == ["val"]);
 
 # in a loop (a JIT-compiled run)
 func loop(n) {
     var x = 0;
     var y = 0;
-    var z = 1;
     for (var i = 0; i < n; i++)
-        z = x, y = [i, i * 2];
-    return [z, x, y];
+        x, y = [i, i * 2];
+    return [x, y];
 }
-assert(loop(ri(5)) == [none, 4, 8]);
+assert(loop(ri(5)) == [4, 8]);
 
 # typed targets (the stores coerce, so the fast paths decline to the
 # general unpack), and a dyn right-hand side that is a scalar (a run-time
@@ -63,25 +61,24 @@ assert(loop(ri(5)) == [none, 4, 8]);
 func typed(n) {
     int x = 0;
     float y = 0.0;
-    var dyn v = 1;
     x, y = [n, n + 1];
     assert(x == 2 && y == 3.0 && typestr(y) == "float");
-    v = x, y = ri(3);
-    assert(v == none && x == 3 && y == 3.0);
-    v = x, y += [n, n];
-    assert(v == none && x == 5 && y == 5.0);
+    x, y = ri(3);
+    assert(x == 3 && y == 3.0);
+    x, y += [n, n];
+    assert(x == 5 && y == 5.0);
     var p = 0;
     var q = 0;
     var dyn d = runtime(9);
-    v = p, q = d;
-    assert(v == none && p == 9 && q == 9);
+    p, q = d;
+    assert(p == 9 && q == 9);
     var dyn e = [ri(4), ri(5)];
-    v = p, q = e;
-    assert(v == none && p == 4 && q == 5);
-    v = x, _ = [ri(6), ri(7)];
-    assert(v == none && x == 6);
-    v = y, x = [ri(1), ri(6)];
-    assert(v == none && y == 1.0 && x == 6);
+    p, q = e;
+    assert(p == 4 && q == 5);
+    x, _ = [ri(6), ri(7)];
+    assert(x == 6);
+    y, x = [ri(1), ri(6)];
+    assert(y == 1.0 && x == 6);
     return [x, y, p, q];
 }
 assert(typed(ri(2)) == [6, 1.0, 4, 5]);
@@ -110,8 +107,8 @@ ga, gb = ge;
 assert(ga == 8 && gb == 9);
 gb, _ = [ri(5), ri(6)];
 assert(gb == 5);
-w = ga, gb = [ri(10), ri(11)];
-assert(w == none && ga == 10 && gb == 11);
+ga, gb = [ri(10), ri(11)];
+assert(ga == 10 && gb == 11);
 ga = 12;
 # a local beside a global in one multi-assignment: a plain store, a typed
 # local (int, and a float that widens) and a compound
@@ -197,16 +194,15 @@ ga, gf = [ri(5), 0.5];
 assert(ga == 5 && gf == 0.5 && ga + 1 == 6);
 
 # a failing destructure raises before anything is stored
-var c = 5;
 var caught = false;
 try {
-    c = a, b = [ri(1), ri(2), ri(3)];
+    a, b = [ri(1), ri(2), ri(3)];
 } catch (TypeErrorEx) {
     caught = true;
 }
-assert(caught && c == 5 && a == 8 && b == 9);
+assert(caught && a == 8 && b == 9);
 
-print(pair(ri(5)), ret(ri(4)), w, a, b, events, loop(ri(5)), typed(ri(2)),
+print(pair(ri(5)), ret(ri(4)), a, b, events, loop(ri(5)), typed(ri(2)),
       globals(), gxy(), cf(ri(1)));
 
 # a compound multi-assignment into a dyn target, and of a dyn element into

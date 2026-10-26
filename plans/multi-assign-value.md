@@ -1,9 +1,11 @@
 # The value of a multi-assignment - a design TODO
 
 **Status: deferred by the maintainer on 2026-10-06. Not designed.**
-Filed in `plans/language-deferred.md`. Until this is built a
-multi-assignment evaluates to `none` in every engine (README, the
-assignment bullet under the language overview).
+Filed in `plans/language-deferred.md`. **Question 11 (2026-10-26):**
+until this is built a multi-assignment has NO value - using it as one
+(`w = a, b = ...`, `return a, b = ...`) is a compile error, where it
+used to evaluate to `none` (README, the assignment bullet under the
+language overview). The sections below describe the old none value.
 
 ## Today
 
