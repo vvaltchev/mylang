@@ -669,6 +669,14 @@ public:
      * the unfolded LiteralArray / LiteralDict gets it under -nc. */
     bool from_literal = false;
 
+    /* It replaced a node that builds its array to its destination's type
+     * at run time - a container literal, or a call to a builtin that reads
+     * its ArrHint (builtin_takes_arr_hint) - so it takes that storage when
+     * folded too. Any other folded value (`clone(a)`, `sort(a)`, `a + b`)
+     * keeps the storage it was built with, as the unfolded node does
+     * (#97: `var dyn d = clone(K)` was general folded and flat under -nc). */
+    bool takes_hint = false;
+
     LiteralObj(const EvalValue &v, bool immutable = false)
         : Construct("LiteralObj", true, ConstructType::lit_obj)
         , value(v)
@@ -696,6 +704,7 @@ public:
         auto c = make_unique<LiteralObj>(value, immutable);
         copy_base_fields(*c);
         c->from_literal = from_literal;
+        c->takes_hint = takes_hint;
         return c;
     }
 };
@@ -1376,6 +1385,16 @@ struct ParamSpec {
  * (parser const-fold path and the inferencer's lower_named_args).
  */
 void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params);
+
+/*
+ * The builtins that build their result array to the storage of the place
+ * it is bound to (the ArrHint the inferencer stamps on the call's
+ * arguments): range, array, make_array, keys, values, map, filter. Every
+ * other builtin's result keeps the storage it builds. The one list - the
+ * inferencer stamps the hint by it, and the parser marks a folded call by
+ * it (LiteralObj::takes_hint).
+ */
+bool builtin_takes_arr_hint(std::string_view name);
 
 class Expr01 final: public SingleChildConstruct {
 

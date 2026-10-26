@@ -6866,7 +6866,15 @@ per level of a deep value - a separate open item.
   `var k = keys(d)` gets the hint, an inline `keys(d)` arg stays general),
   `LiteralArray::do_eval`, and `LiteralObj::do_eval` (a flat baked
   literal bound to an `array<dyn>` dest is made general via
-  `make_general_array_clone`).
+  `make_general_array_clone`). **⛔ A folded value takes the hint only where
+  its UNFOLDED node would (#97, 2026-10-24):** `LiteralObj::takes_hint`
+  (set by `cse_materialize` from the node it replaces: a container literal,
+  or a call to one of `builtin_takes_arr_hint`'s builtins - the one list,
+  shared with the inferencer's stamp). `set_array_repr_hint` and the
+  parser's `stamp_literal_annot` stamp a LiteralObj only when it is set -
+  they stamped every one, so a folded `clone(K)` / `sort(K)` / `a + b`
+  bound to a `dyn` variable was general where `-nc` kept it flat, and a
+  write the program refused under `-nc` succeeded.
   The fixpoint propagates the destination type through direct aliases
   (`var b = a`), so they agree. Value-driven flat (`dflt`) is the fallback for
   contexts the hint doesn't cover. The flat fast paths (each branches on

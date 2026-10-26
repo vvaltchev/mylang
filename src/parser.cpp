@@ -818,6 +818,33 @@ static bool is_container_literal(const Construct *n)
     return false;
 }
 
+/*
+ * Whether `n`, run unfolded, builds its array to the storage of the place
+ * it is bound to (LiteralObj::takes_hint): a container literal, or a call
+ * whose callee is one of builtin_takes_arr_hint's builtins - the BUILTIN,
+ * not a `pure func` of the same name, which the parser folds too (#97).
+ */
+static bool node_takes_hint(ParseContext &c, const Construct *n)
+{
+    switch (ctag(n)) {
+    case ConstructType::lit_arr:
+    case ConstructType::lit_dict:
+        return true;
+    case ConstructType::lit_obj:
+        return static_cast<const LiteralObj *>(n)->takes_hint;
+    case ConstructType::call: {
+        const auto *call = static_cast<const CallExpr *>(n);
+        const auto *id = dynamic_cast<const Identifier *>(call->what.get());
+        if (!id || !builtin_takes_arr_hint(id->uid->val))
+            return false;
+        const EvalValue v = RValue(id->eval(c.const_ctx));
+        return v.get_type()->t == Type::t_builtin;
+    }
+    default:
+        return false;
+    }
+}
+
 /* The storage a parsed `array<...>` annotation gives an array - the
  * inferencer's array_repr_hint, read off the annotation (a typed const is
  * bound, and a pure function may run, before inference): dflt keeps a
@@ -899,9 +926,12 @@ static void stamp_literal_annot(Construct *lit, const TypeAnnot *a, bool dyn)
         return;
     const ConstructType t = ctag(lit);
     if (!a) {
-        /* `var dyn d = [...]`: a polymorphic array */
+        /* `var dyn d = [...]`: a polymorphic array - and a folded value
+         * only where its unfolded node builds to it (#97: a folded
+         * `clone(K)` keeps K's storage, as at run time) */
         if (dyn && (t == ConstructType::lit_arr
-                    || t == ConstructType::lit_obj))
+                    || (t == ConstructType::lit_obj
+                        && static_cast<LiteralObj *>(lit)->takes_hint)))
             lit->arr_hint = ArrHint::general;
         return;
     }
@@ -5138,9 +5168,11 @@ cse_materialize(ParseContext &c,
     }
     /* #47: `node` is about to be freed by the caller - keep alive every
      * function literal in it that the baked value still names. */
-    if (out && ctag(out.get()) == ConstructType::lit_obj)
-        detach_baked_funcs_below(
-            c, node, static_cast<LiteralObj *>(out.get())->literal_value());
+    if (out && ctag(out.get()) == ConstructType::lit_obj) {
+        auto *lo = static_cast<LiteralObj *>(out.get());
+        detach_baked_funcs_below(c, node, lo->literal_value());
+        lo->takes_hint = node_takes_hint(c, node);
+    }
     return true;
 }
 

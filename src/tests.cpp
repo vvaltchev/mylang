@@ -28829,6 +28829,20 @@ static bool const_fold_equivalence()
             "const G = [apply];",
             "pure func useg(int n) => G[0](pure func(v) => v, n);",
             "print(useg(1));" } },
+        /* #97: a folded value bound to a `dyn` variable takes the
+         * storage its unfolded node builds - a clone, a sort and an
+         * array sum keep a flat array's, so the write is refused both
+         * ways; a written literal and a range() are general both ways */
+        { "a folded value bound to dyn keeps the storage it builds", {
+            "const QS = [1, 2, 3];",
+            "var dyn c = clone(QS);",
+            "var dyn s = sort(QS);",
+            "var dyn j = [1, 2] + [3];",
+            "var dyn g = range(3);",
+            "var dyn l = [1, 2];",
+            "print(array_storage(c), array_storage(s), array_storage(j),",
+            "      array_storage(g), array_storage(l));",
+            "c[0] = \"x\";" } },
         /* the three shapes #54 was filed for */
         { "a struct const member reads a const", {
             "const K = 3;",

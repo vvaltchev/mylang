@@ -444,6 +444,14 @@ void ExprList::serialize(ostream &s, int level) const
     s << ")";
 }
 
+/* Declared in syntax.h - see the contract there. */
+bool builtin_takes_arr_hint(std::string_view name)
+{
+    return name == "range" || name == "array" || name == "make_array" ||
+           name == "keys" || name == "values" || name == "map" ||
+           name == "filter";
+}
+
 /*
  * Named-argument desugaring (see the declaration in syntax.h). One shared
  * implementation for the parser's const-fold path and the inferencer's

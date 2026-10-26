@@ -4208,19 +4208,25 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
         auto sit = id_sym.find(cid);
         if ((sit != id_sym.end() && sit->second) || !is_builtin(cid->uid))
             return;
-        const std::string nm(cid->uid->val);
         /* keys()/values() honor a flat hint too: building keys/values of a
          * scalar dict into a flat array<int>/<float>/<bool> avoids per-element
          * boxing (a big win for keys()/values() of a large dict). */
-        if (nm == "range" || nm == "array" || nm == "make_array" ||
-            nm == "keys" || nm == "values" || nm == "map" || nm == "filter") {
+        if (builtin_takes_arr_hint(cid->uid->val)) {
             call->args->arr_hint = hint;
             call->args->arr_hint_struct = sdef;
         }
 
+    } else if (ctag(rv) == ConstructType::lit_obj
+               && !static_cast<LiteralObj *>(rv)->takes_hint) {
+
+        /* a folded value whose unfolded node keeps its own storage
+         * (`clone(a)`, `sort(a)`, `a + b`): it keeps it folded too (#97) */
+        return;
+
     } else {
 
-        /* an array literal or a folded const literal (LiteralObj) */
+        /* an array literal, or a folded one / a folded call that builds
+         * to the hint (LiteralObj::takes_hint) */
         rv->arr_hint = hint;
         rv->arr_hint_struct = sdef;
     }
