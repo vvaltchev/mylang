@@ -1043,6 +1043,9 @@ static const std::vector<test> tests =
     { "err loc: a generic container annotation's mismatch marks the name",
       { "func g() { array arr2 = {}; }" },
       &typeid(TypeMismatchEx), 18, 1, 23, 1 },
+    { "parse: an arrow function with no body is a syntax error",
+      { "var f = func() => ;" },
+      &typeid(SyntaxErrorEx), 19, 1 },
     { "err loc: a const scalar as a later multi-assign target",
       { "const K = 5; var a = 0;",
         "a, K = [1, 2];" },
@@ -24486,6 +24489,31 @@ static bool deep_nesting_refused()
     annots += "a;";
     pannots += "d) { return 1; }";
 
+    /* #98: the operators that nest the TREE without a primary - each was
+     * unguarded, and 20000 of any of them overflowed the stack */
+    const auto rep = [](const char *u, int n) {
+        std::string r;
+        for (int i = 0; i < n; i++)
+            r += u;
+        return r;
+    };
+    const std::string nots = "var x = 1; var y = " + rep("!", 400) + "x;";
+    const std::string negs = "var x = 1; var y = " + rep("- ", 400) + "x;";
+    const std::string derefs =
+        "var b = box(1); var y = " + rep("* ", 400) + "b;";
+    const std::string terns =
+        "var c = true; var y = " + rep("c ? 1 : ", 400) + "2;";
+    const std::string coals =
+        "var n = none; var y = " + rep("n ?? ", 400) + "1;";
+    const std::string assigns = "var a = 0; " + rep("a = ", 400) + "1;";
+    const std::string calls = "func f() => f; var g = f" + rep("()", 400)
+        + ";";
+    const std::string slices = "var x = [1]; var y = x" + rep("[0:1]", 400)
+        + ";";
+    const std::string members = "var d = {}; var y = d" + rep(".a", 400)
+        + ";";
+    const std::string lambdas = "var f = " + rep("func() => ", 400) + "1;";
+
     const Case cases[] = {
         { "nested parens",  parens },
         { "nested arrays",  arrays },
@@ -24493,6 +24521,16 @@ static bool deep_nesting_refused()
         { "nested ifs",     ifs    },
         { "nested type annotations", annots },
         { "nested parameter annotations", pannots },
+        { "chained unary !", nots },
+        { "chained unary -", negs },
+        { "chained unary *", derefs },
+        { "chained ternary else arms", terns },
+        { "chained ??", coals },
+        { "chained assignments", assigns },
+        { "chained calls", calls },
+        { "chained slices", slices },
+        { "chained members", members },
+        { "nested lambda bodies", lambdas },
     };
 
     bool ok = true;
@@ -24540,6 +24578,102 @@ static bool deep_nesting_refused()
         }
     }
 
+    return ok;
+}
+
+/*
+ * #98: the other half of deep_nesting_refused - a chain just UNDER the
+ * limit compiles AND runs, in both engines with folding on and off, so
+ * every later pass (inference, the resolver, codegen, the JIT, the
+ * tree-walker's evaluation) walks a tree as deep as the parser takes.
+ * Each shape sits at the deepest depth the parser accepts for it (found
+ * by parsing from MAX_NEST down), so a pass that costs too much stack per
+ * level fails here, on every platform CI builds.
+ */
+static std::string nc_run(const std::string &src, ExecEngine eng,
+                          bool fold);
+
+static bool nesting_limit_runs()
+{
+    struct Shape {
+        const char *name;
+        const char *pre, *unit, *post;
+        std::string (*expect)(int n);
+        int levels = 1;                 /* nesting levels one unit takes */
+    };
+    const Shape shapes[] = {
+        { "!", "var dyn x = runtime(true);\nvar dyn y = ", "!",
+          "x;\nprint(y);",
+          [](int n) { return std::string(n % 2 ? "false" : "true"); } },
+        { "-", "var dyn x = runtime(5);\nvar dyn y = ", "- ",
+          "x;\nprint(y);",
+          [](int n) { return std::string(n % 2 ? "-5" : "5"); } },
+        { "?:", "var dyn c = runtime(false);\nvar dyn y = ", "c ? 1 : ",
+          "9;\nprint(y);", [](int) { return std::string("9"); } },
+        { "??", "var dyn n = runtime(none);\nvar dyn y = ", "n ?? ",
+          "7;\nprint(y);", [](int) { return std::string("7"); } },
+        { "=", "var a = 0;\n", "a = ", "runtime(3);\nprint(a);",
+          [](int) { return std::string("3"); } },
+        { "calls", "func f() { var dyn g = f; return g; }\nvar dyn h = f",
+          "()", ";\nprint(h == f);",
+          [](int) { return std::string("true"); } },
+        { "slices", "var x = [runtime(1)];\nvar y = x", "[0:1]",
+          ";\nprint(len(y));", [](int) { return std::string("1"); } },
+        { "members", "class N { opt N n; }\nvar n = N(none);\nn.n = n;\n"
+          "var t = n", "?.n", " == n;\nn.n = none;\nprint(t);",
+          [](int) { return std::string("true"); } },
+        { "lambdas", "var f = ", "func() => ",           /* its block */
+          "runtime(4);\nvar dyn g = f();\nprint(2);",   /* and return */
+          [](int) { return std::string("2"); }, 2 },
+    };
+    const auto build = [](const Shape &sh, int n) {
+        std::string src = sh.pre;
+        for (int i = 0; i < n; i++)
+            src += sh.unit;
+        return src + sh.post;
+    };
+    bool ok = true;
+    for (const Shape &sh : shapes) {
+        int n = ParseContext::MAX_NEST;
+        for (; n > 0; n--) {
+            try {
+                std::vector<Tok> toks;
+                const std::string src = build(sh, n);
+                lexer(src, 1, toks);
+                ParseContext pc(TokenStream(toks), true);
+                unique_ptr<Construct> root = pBlock(pc);
+                break;
+            } catch (const Exception &) {
+            }
+        }
+        if (n < ParseContext::MAX_NEST / sh.levels - 10) {
+            fprintf(stderr, "nesting_limit_runs: '%s' parses only %d deep\n",
+                    sh.name, n);
+            ok = false;
+            continue;
+        }
+        if (n > ParseContext::MAX_NEST / sh.levels + 10) {
+            /* a unit counted as fewer levels than the tree it builds:
+             * the later passes walk deeper than the limit promises */
+            fprintf(stderr, "nesting_limit_runs: '%s' parses %d deep: a "
+                    "unit counts less than its %d level(s)\n", sh.name, n,
+                    sh.levels);
+            ok = false;
+        }
+        const std::string src = build(sh, n);
+        const std::string want = sh.expect(n) + " \n|";   /* print's */
+        for (ExecEngine eng : { ExecEngine::TreeWalk, ExecEngine::Vm })
+            for (bool fold : { true, false }) {
+                const std::string got = nc_run(src, eng, fold);
+                if (got != want) {
+                    fprintf(stderr, "nesting_limit_runs: '%s' at %d (%s, "
+                            "fold %s)\n  want: %s\n  got:  %s\n", sh.name, n,
+                            eng == ExecEngine::Vm ? "vm" : "tw",
+                            fold ? "on" : "off", want.c_str(), got.c_str());
+                    ok = false;
+                }
+            }
+    }
     return ok;
 }
 
@@ -58641,6 +58775,8 @@ static const std::vector<extra_check> extra_checks =
       strict_forward_decl_shapes },
     { "parser: deep nesting is REFUSED, never a crash (#137)",
       deep_nesting_refused },
+    { "parser: a chain at the nesting limit compiles and runs (#98)",
+      nesting_limit_runs },
     { "opt: defined()-guard polarity (#135)", defined_guard_polarity },
     { "opt: unprovable unbound calls WARN (step 7 tier 3)",
       unbound_call_warnings },

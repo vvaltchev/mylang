@@ -366,8 +366,16 @@ bool Inferencer::cs_can_hold_func(const Construct *e)
 {
     if (!e)
         return false;
+    if (cs_hold_memo_on) {
+        const auto it = cs_hold_memo.find(e);
+        if (it != cs_hold_memo.end())
+            return it->second;
+    }
     std::set<const void *> seen;
-    return cs_type_can_hold_func(type_of(e), seen);
+    const bool r = cs_type_can_hold_func(type_of(e), seen);
+    if (cs_hold_memo_on)
+        cs_hold_memo.emplace(e, r);
+    return r;
 }
 
 /* ---------------------------------------------------------------- */
@@ -1290,6 +1298,9 @@ void Inferencer::cs_run(Block *rootBlock)
     struct LostGuard {
         ~LostGuard() { g_cs_lost = nullptr; }
     } lost_guard;
+
+    /* cs_can_hold_func's memo - live for this run only too */
+    CsHoldMemoScope memo(*this);
 
     /* id 0 must be the UNKNOWN object's element location, so that a
      * bare `cs_loc(elem, nullptr, CS_OBJ_UNKNOWN)` is always ⊤. */

@@ -144,6 +144,15 @@ ParseContext::~ParseContext()
  * literals, call arguments), the statement (a block, or a brace-less
  * if/loop body, which is why the guard is in pStmt and not pBlock) and a
  * type annotation (`array<array<...>>`, pTypeAnnot).
+ *
+ * A level is a level of the TREE too, which every later pass walks
+ * recursively - so the operators that nest without parentheses count:
+ * a unary operator, the ternary's else arm, `??`, an assignment's value,
+ * a lambda's `=> body` (each a guard around its recursive call) and a
+ * postfix chain
+ * (`f()()()`, `a[0][0]`, `a.b.c`: NestSteps, one level per step). Until
+ * 2026-10-24 they did not, and 20000 of any of them overflowed the stack
+ * in the parser or in the inferencer's walk (#98).
  */
 namespace {
 struct NestGuard {
@@ -155,6 +164,22 @@ struct NestGuard {
                                 "nesting too deep (max 256 levels)");
     }
     ~NestGuard() { c.nest_depth--; }
+};
+
+/* The levels a postfix chain adds, given back when the chain ends (or a
+ * parse error leaves it: the REPL keeps its parser for the next input) */
+struct NestSteps {
+    ParseContext &c;
+    int n = 0;
+    explicit NestSteps(ParseContext &pc) : c(pc) { }
+    void step()
+    {
+        n++;
+        if (++c.nest_depth > ParseContext::MAX_NEST)
+            throw SyntaxErrorEx(c.get_loc(),
+                                "nesting too deep (max 256 levels)");
+    }
+    ~NestSteps() { c.nest_depth -= n; }
 };
 }
 
@@ -2086,11 +2111,13 @@ pExpr01(ParseContext &c, unsigned fl)
         return nullptr;
     }
 
+    NestSteps steps(c);          /* #98: each step nests the tree */
     while (pAcceptCallExpr(c, main, otherExpr, fl)  ||
            pAcceptSubscript(c, main, otherExpr, fl) ||
            pAcceptMember(c, main, otherExpr, fl))
     {
         main = std::move(otherExpr);
+        steps.step();
     }
 
     /* postfix ++ / -- : binds tighter than any unary/binary operator (it sits
@@ -2173,7 +2200,10 @@ pExpr02(ParseContext &c, unsigned fl)
     if (*c == Op::inc || *c == Op::dec) {
         const bool is_inc = (*c == Op::inc);
         c++;
-        elem = pExpr02(c, fl);
+        {
+            NestGuard ng(c);            /* #98: a unary operator nests */
+            elem = pExpr02(c, fl);
+        }
         if (!elem)
             noExprError(c);
         pRefuseUnassignable(elem.get(), "Cannot increment or decrement");
@@ -2191,7 +2221,10 @@ pExpr02(ParseContext &c, unsigned fl)
      * followed by `*b` opens a block comment, as in C: write `a / *b`. */
     if (*c == Op::times) {
         c++;
-        elem = pExpr02(c, fl);
+        {
+            NestGuard ng(c);            /* #98: a unary operator nests */
+            elem = pExpr02(c, fl);
+        }
         if (!elem)
             noExprError(c);
         auto d = make_unique<DerefExpr>();
@@ -2238,7 +2271,10 @@ pExpr02(ParseContext &c, unsigned fl)
          *      --1, !+1, !-1, !!1
          */
 
-        elem = pExpr02(c, fl);
+        {
+            NestGuard ng(c);            /* #98: a unary operator nests */
+            elem = pExpr02(c, fl);
+        }
 
         if (!elem)
             noExprError(c);
@@ -2360,8 +2396,10 @@ pExprCoalesce(ParseContext &c, unsigned fl)
     /* the right side may be a lambda, as the ternary's arms may (a lambda
      * literal is a whole expression: pExpr14 takes it before any operator
      * level, and its `=> body` extends as far as an expression can) */
-    if (!pAcceptFuncDecl(c, co->rhs, fl & ~pFlags::pInStmt))
+    if (!pAcceptFuncDecl(c, co->rhs, fl & ~pFlags::pInStmt)) {
+        NestGuard ng(c);                    /* #98: `a ?? b ?? ...` nests */
         co->rhs = pExprCoalesce(c, fl);      /* right-associative */
+    }
     if (!co->rhs)
         noExprError(c);
     co->end = co->rhs->end;
@@ -2398,8 +2436,10 @@ pExpr13(ParseContext &c, unsigned fl)
     /* a lambda in the else arm too, as in the middle one (pExpr14 accepts
      * it there): `c ? func(x) => x + 1 : func(x) => x * 2` was "Expected
      * expression" at the second `func` */
-    if (!pAcceptFuncDecl(c, t->elseExpr, bfl))
+    if (!pAcceptFuncDecl(c, t->elseExpr, bfl)) {
+        NestGuard ng(c);                    /* #98: an else-arm chain nests */
         t->elseExpr = pExpr13(c, bfl);       /* right-associative */
+    }
     if (!t->elseExpr)
         noExprError(c);
     t->end = t->elseExpr->end;
@@ -2627,6 +2667,7 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
         ret.reset(new Expr14);
         ret->op = op;
         ret->lvalue = std::move(lside);
+        NestGuard ng(c);                    /* #98: `a = b = ...` nests */
         ret->rvalue = pExpr14(c, fl & ~pFlags::pInDecl);
     }
 
@@ -3747,7 +3788,20 @@ pAcceptFuncDecl(ParseContext &c,
          * via func_expr_body (syntax.h); the synthetic nodes carry the
          * expression's locs so carets/backtraces are unchanged.
          */
-        unique_ptr<Construct> ex = pExpr14(c, body_fl);
+        /*
+         * #98: `func() => func() => ...` nests, and each level is the
+         * Block and the ReturnStmt below: two levels, as the `{ return
+         * e; }` it stands for takes (pBlock and pStmt), so the sugar
+         * cannot nest twice as deep as what every later pass walks.
+         */
+        unique_ptr<Construct> ex;
+        {
+            NestGuard ng_block(c);
+            NestGuard ng_ret(c);
+            ex = pExpr14(c, body_fl);
+        }
+        if (!ex)                    /* `func() => ;` read a null body */
+            noExprError(c);
         auto rs = make_unique<ReturnStmt>();
         rs->start = ex->start;
         rs->end = ex->end;

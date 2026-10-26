@@ -7728,6 +7728,25 @@ and two macros:
   local has its own slot, so `pExpr14_body` at ~6 KB made 256 levels of
   `[[[...]]]` overflow macOS's 8 MB stack (2026-10-21). Work done after
   the recursive call lives in a noinline helper (`pExpr14_tail`).
+  **⛔ A LEVEL IS A LEVEL OF THE TREE, NOT ONLY OF THE PARSER'S RECURSION
+  (#98, 2026-10-24):** every later pass walks the tree recursively, so any
+  syntax that nests nodes counts - a unary operator, the ternary's else
+  arm, `??`, an assignment's value, a lambda's `=> body` (each a
+  `NestGuard` around its recursive call) and a postfix chain (`f()()`,
+  `a[0][0]`, `a.b.c`: `NestSteps`, one level per step, given back when
+  the chain ends). None of them was counted, and 20000 of any overflowed
+  the stack in the parser or the inferencer. An arrow body takes TWO
+  levels, the Block and ReturnStmt it desugars to, as `{ return e; }`
+  does: at one, 250 nested lambdas ran three `Inferencer::check` frames
+  (7.3 KB each under clang ASan) per level and overflowed 8 MB, where
+  every other shape fits in 6. `nesting_limit_runs` runs
+  each shape at the deepest depth the parser takes through every engine;
+  a pass that is superlinear in depth shows there as time (the callee-set
+  analysis asked `type_of` of a chain's whole subtree at every level -
+  `cs_can_hold_func` is memoized per no-type-change window now,
+  `CsHoldMemoScope`). Since codegen's recursive frames are ~20 KB per
+  level under clang ASan and arm64 ASan frames ~1.6x that, macOS links
+  with a 16 MB main-thread stack (both build systems).
   **The oracle is the debug+ASan+UBSan lane; a release build hides all of
   this.** When you add a runtime path, ask what it does with a program that has
   no statements, no slots, or absurd depth.
@@ -9312,7 +9331,10 @@ instrumentation (see `plans/archived/function-templates.md`).
   default** stack; Linux and macOS default to **8 MB**, which is why they never
   hit this. The **fix is a linker flag** — `CMakeLists.txt` sets
   `/STACK:8388608` (8 MB) for the MSVC build, giving Windows parity (legitimate
-  provisioning for an interpreter, not a workaround). This was a **Windows-CI-
+  provisioning for an interpreter, not a workaround). macOS gets 16 MB the
+  same way (`-stack_size`, CMake and the Makefile) for the compile passes'
+  per-level frames at the parser's nesting limit (#98, below). This was a
+  **Windows-CI-
   only crash** the VM's ackermann test hit (exit 127), that **no Linux tool
   reproduces** (ASan and `ML_VM_CHECK` do not catch a stack-DEPTH overflow — it
   is not a slot-bounds bug); it surfaced only after P8 added a `try/catch` EH

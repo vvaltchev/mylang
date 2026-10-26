@@ -85,6 +85,15 @@ if (MSVC)
    target_link_options(mylang PUBLIC "/STACK:8388608")
 endif()
 
+# macOS: a 16 MB main-thread stack. The compile passes walk the tree
+# recursively, one call per level of nesting (up to the parser's 256-level
+# limit, #98), and an ASan build's frames on arm64 are about 1.6x Linux's:
+# an assignment chain at the limit needs ~6 MB in a Linux clang ASan build,
+# so ~9.6 MB there - past the default 8 MB.
+if (APPLE)
+   target_link_options(mylang PUBLIC "LINKER:-stack_size,0x1000000")
+endif()
+
 # INT_TESTS: the INTRUSIVE test build (#107, plans/intrusive-tests.md) -
 # heavy instrumentation at every pipeline stage, so never benchmarked
 # (`mylang -v` reports it, bench/run.py refuses it). Implies TESTS.
