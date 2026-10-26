@@ -456,10 +456,9 @@ EvalValue read_sym(EvalContext *ctx, SymKind kind, int slot,
 /*
  * return / break / continue no longer use C++ exceptions: they set the
  * EvalContext's FlowState (see eval.h) and unwind via ordinary returns.
- * rethrow is genuinely exceptional (it re-throws a real exception object from
- * inside a catch block) and stays an exception.
+ * rethrow is genuinely exceptional: it raises the handled exception again
+ * (FlowState::handling) as a real RuntimeException, at the `rethrow`.
  */
-struct RethrowEx { Loc start; Loc end; };
 
 static inline EvalValue
 do_func_return(EvalValue &&tmp, Construct *retExpr)
@@ -7078,7 +7077,14 @@ EvalValue ReturnStmt::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue RethrowStmt::do_eval(EvalContext *ctx, bool rec) const
 {
-    throw RethrowEx{start, end};
+    /* the parser accepts `rethrow` only inside a catch body of this same
+     * function, and do_catch sets `handling` for as long as one runs */
+    RuntimeException *ex = ctx->flow->handling;
+    ML_CHECK(ex);
+    ex->loc_start = start;
+    ex->loc_end = end;
+    ex->rethrow();
+    return none; /* Make compilers unaware of [[noreturn]] happy */
 }
 
 EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
@@ -7489,6 +7495,25 @@ EvalValue Slice::do_eval(EvalContext *ctx, bool rec) const
     return t->slice(lval, start_v, end_v);
 }
 
+/*
+ * Runs a catch body with `saved_ex` as the exception a `rethrow` in it
+ * raises - restoring the enclosing catch body's on any exit, since a
+ * catch body may hold a try whose own catch handles another exception.
+ */
+struct HandlingScope {
+
+    FlowState &fs;
+    RuntimeException *const prev;
+
+    HandlingScope(FlowState &fs, RuntimeException *ex)
+        : fs(fs), prev(fs.handling)
+    {
+        fs.handling = ex;
+    }
+
+    ~HandlingScope() { fs.handling = prev; }
+};
+
 static bool
 do_catch(EvalContext *ctx,
          RuntimeException *saved_ex,
@@ -7504,14 +7529,8 @@ do_catch(EvalContext *ctx,
     if (!exList) {
 
         /* Catch-anything block */
-        try {
-            catchBody->eval(ctx);
-        } catch (const RethrowEx &re) {
-            saved_ex->loc_start = re.start;
-            saved_ex->loc_end = re.end;
-            saved_ex->rethrow();
-        }
-
+        HandlingScope hs(*ctx->flow, saved_ex);
+        catchBody->eval(ctx);
         return true;
     }
 
@@ -7527,8 +7546,7 @@ do_catch(EvalContext *ctx,
         if (ex_uid ? (id->uid != ex_uid) : (id->get_str() != ex_name))
             continue;
 
-        try {
-
+        {
             EvalContext catch_ctx(ctx);
 
             if (asId) {
@@ -7565,12 +7583,8 @@ do_catch(EvalContext *ctx,
                 }
             }
 
+            HandlingScope hs(*catch_ctx.flow, saved_ex);
             catchBody->eval(&catch_ctx);
-
-        } catch (const RethrowEx &re) {
-            saved_ex->loc_start = re.start;
-            saved_ex->loc_end = re.end;
-            saved_ex->rethrow();
         }
 
         return true;

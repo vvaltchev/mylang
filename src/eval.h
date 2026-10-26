@@ -31,6 +31,8 @@ class CaptureSlots;   /* a closure's captured values - defined below */
  * use C++ exceptions, where the zero-cost-when-not-thrown model is the right
  * fit.
  */
+struct RuntimeException;
+
 struct FlowState {
 
     enum Type : unsigned char {
@@ -42,6 +44,15 @@ struct FlowState {
 
     Type type = none;
     EvalValue value;    /* the return value, meaningful when type == ret */
+
+    /*
+     * The exception the innermost RUNNING catch body of this invocation
+     * handles, or null: `rethrow` raises it again where it stands, so a
+     * `try` around the `rethrow` inside that body catches it (Python's
+     * `raise`, C#'s `throw;`, the VM). Per invocation, like `rethrow`
+     * itself, which a function literal cannot carry out of its catch.
+     */
+    RuntimeException *handling = nullptr;
 };
 
 /*

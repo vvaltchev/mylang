@@ -6405,8 +6405,11 @@ payoff.
   C++ exceptions:**
   runtime errors (`RuntimeException` subclasses), user `throw`
   (`ExceptionObject`), and `rethrow`
-  (`RethrowEx`, defined locally in `eval.cpp`) — caught by
-  `do_catch`/`TryCatchStmt`.
+  (it raises `FlowState::handling`, the exception the innermost RUNNING
+  catch body of the invocation handles, so a `try` around the `rethrow`
+  inside that body catches it, as in the VM - question 8; the private
+  `RethrowEx` it threw instead reached only the catch's own `do_catch`,
+  skipping that `try`) — caught by `do_catch`/`TryCatchStmt`.
 - **⛔ EVALUATE OPERANDS INTO LOCALS, LEFT TO RIGHT - NEVER AS TWO
   ARGUMENTS OF ONE CALL (2026-10-05).** C++ leaves the order of a call's
   arguments unspecified and GCC evaluates them RIGHT TO LEFT, so

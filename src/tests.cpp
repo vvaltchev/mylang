@@ -12400,6 +12400,30 @@ static const std::vector<test> tests =
     },
 
     {
+        /* question 8, decision A: the tree-walker sent it past the
+         * inner try, to the outer handler, while the VM caught it */
+        "rethrow inside a try in its catch body: the inner catch takes it",
+        {
+            "struct E { int v; }",
+            "var got = \"\";",
+            "func f() {",
+            "   try {",
+            "       throw E(1);",
+            "   } catch (E as e) {",
+            "       try {",
+            "           rethrow;",
+            "       } catch (E as e2) {",
+            "           got += \"inner\" + str(e2.v);",
+            "       }",
+            "       got += \" after\";",
+            "   }",
+            "}",
+            "try { f(); } catch (E) { got += \" outer\"; }",
+            "assert(got == \"inner1 after\");",
+        },
+    },
+
+    {
         "Two struct exception types, the right catch fires",
         {
             "struct A { int x; }",

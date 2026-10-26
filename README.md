@@ -3043,6 +3043,24 @@ try {
 }
 ```
 
+`rethrow` raises the exception again where it stands, as Python's `raise`
+and C#'s `throw;` do: the nearest handler around the `rethrow` gets it,
+and that is a `try` inside the catch body when there is one.
+
+```C#
+struct E { int v; }
+
+try {
+    throw E(1);
+} catch (E as e) {
+    try {
+        rethrow;
+    } catch (E as again) {
+        print("caught again");      # runs: the inner catch takes it
+    }
+}
+```
+
 ### The finally clause
 
 In some cases, it might be necessary to do some clean-up, after executing
