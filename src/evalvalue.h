@@ -775,8 +775,8 @@ private:
     void put_slow(EvalValue &&v);
 
     void type_checks() const {
-        assert(val.get_type()->t != Type::t_lval);
-        assert(val.get_type()->t != Type::t_undefid);
+        ML_CHECK(val.get_type()->t != Type::t_lval);
+        ML_CHECK(val.get_type()->t != Type::t_undefid);
     }
 
 public:

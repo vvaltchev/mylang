@@ -279,11 +279,13 @@ def int_configs(prog):
 # an engine name -> its command-line flags. `vm` is the default engine
 # spelled out, `nbi` the bytecode inliner off, `noopt` every AST
 # transform off (`--no-opt all`), `nc` no const folding (-nc: RULE 2
-# says it prints what the default prints); `+` joins two (`nbi+nj`,
+# says it prints what the default prints), `ni` the AST inliner off (its
+# only oracle: --no-opt all keeps it); `+` joins two (`nbi+nj`,
 # `tw+noopt`).
 ENGINE_FLAGS = {"default": [], "tw": ["-tw"], "nj": ["-nj"],
                 "vm": ["-vm"], "nbi": ["-nbi"],
-                "noopt": ["--no-opt", "all"], "nc": ["-nc"]}
+                "noopt": ["--no-opt", "all"], "nc": ["-nc"],
+                "ni": ["-ni"]}
 
 
 def engine_flags(eng):

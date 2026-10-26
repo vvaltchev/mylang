@@ -15,7 +15,10 @@
 #                             default engine AND the tree-walker) - each
 #                             run must exit 0 (the programs self-assert),
 #                             and the engines of one configuration must
-#                             print the same stdout.
+#                             print the same stdout;
+#      tests/int/repl/*.session  fed to --repl (exactly its .expected);
+#      tests/driver_checks    the CLI driver's flags, which -rt cannot
+#                             reach (it exits non-zero on a failure).
 # 3. THE SITE CENSUS: every process appends `site hits queries` to one file
 #    (MYLANG_INT_OUT, src/inttest.cpp). A site of src/intsites.h that no
 #    test CHECKED (read through int_hits / int_events) fails - reaching a
@@ -72,6 +75,7 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPT = ["<script>"]       # a unit command that is a script, not a flag list
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(HERE, "lib"))
 from testrun import Monitor  # noqa: E402
@@ -144,6 +148,14 @@ def main():
             text = f.read()
         units.append((os.path.relpath(sess, ROOT),
                       [[(["--repl"], {}, (text, sess[:-8] + ".expected"))]]))
+    # THE DRIVER UNIT: tests/driver_checks runs the binary under the CLI
+    # flags -rt cannot reach (it runs in-process, past mylang.cpp's
+    # argument handling): -nr, -vd/-vdj, -c and a .myv load, -dti, -a, the
+    # depth cap ... A unit like any other - pass is its exit code - so
+    # the driver's code is measured by the test that checks it.
+    units.append(("tests/driver_checks",
+                  [[(SCRIPT, {"MYLANG_EXPECT_INT_TESTS": "1"},
+                     os.path.join(HERE, "driver_checks"))]]))
 
     # the two corpus-wide passes are cases too, so --only can pick them
     CENSUS, INVIS = "corpus: object census", "corpus: probe invisibility"
@@ -220,6 +232,11 @@ def main():
             for group in cmds:
                 results = []
                 for c, extra, repl in group:
+                    if c is SCRIPT:
+                        # a script unit: it runs the binary itself
+                        results.append(run([repl, binary], dict(env, **extra),
+                                           args.timeout))
+                        continue
                     if repl:
                         # the REPL retains its inputs' programs, like -rt:
                         # no object census; a fresh HOME per session
@@ -236,7 +253,7 @@ def main():
                                       "MYLANG_INT_PROBE": "1"})),
                         args.timeout))
                 for (c, extra, repl), r in zip(group, results):
-                    if not repl:
+                    if not repl or c is SCRIPT:
                         continue
                     if args.update_repl:
                         with open(repl[1], "w",
@@ -281,7 +298,9 @@ def main():
                     if r[0] != 0:
                         fails.append("`%s%s` rc=%d\n%s" % (
                             "".join("%s=%s " % kv for kv in extra.items()),
-                            " ".join(c), r[0], r[2][-2000:]))
+                            _repl + " BINARY" if c is SCRIPT
+                            else " ".join(c), r[0],
+                            (r[1] + r[2])[-2000:]))
             print("  %s  %s" % ("ok  " if ok else "FAIL", name))
             for f in fails:
                 print("        " + f)

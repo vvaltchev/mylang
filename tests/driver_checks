@@ -453,6 +453,58 @@ else
     fail "myv: -c refused the dict-order program"
 fi
 
+# A store CHAIN (`m[k][1] = v`, `o.ins[k].v[0] = v`) and an INC-DEC chain
+# (`m[1 - k][1]++`, `o.i.y++`) keep their steps and per-step carets in
+# chunk pools of their own, and a constant pool may hold a class
+# instance, a flat bool array, a string array and a default dict. No
+# image any test wrote had a chain in it until 2026-11-07 (the coverage
+# report showed those writer and reader sections never ran): the image
+# must run exactly as its source does, under the JIT and under -nj.
+cat > "$TMP/chains.my" <<'PROG'
+struct In { int y; array<int> v; }
+struct Out { In i; array<In> ins; }
+class C { int n; }
+const KC = C(5);
+const KB = [true, false, true];
+const KS = ["p", "q"];
+const KD = dict(7);
+func f(int k) {
+    var m = [[1, 2], [3, 4]];
+    m[k][1] = 9;
+    m[k][0] += 5;
+    m[1 - k][1]++;
+    var o = Out(In(1, [1, 2]), [In(2, [3]), In(3, [4, 5])]);
+    o.i.y++;
+    o.i.v[1] += 10;
+    o.ins[k].v[0] = 40;
+    o.ins[1].y--;
+    var d = {"a": {"b": [1, 2]}};
+    d["a"]["b"][k]++;
+    d["a"]["c"] = [k];
+    var e = clone(KD);
+    e["x"] += 1;
+    return str(m) + " " + str(o) + " " + str(d) + " " + str(e);
+}
+print(f(int(runtime(0))));
+print(KC.n, KB, KS, KD["zz"]);
+PROG
+src_out=$("$BIN" "$TMP/chains.my" 2>&1)
+if "$BIN" -c "$TMP/chains.my" -o "$TMP/chains.myv" >/dev/null 2>&1; then
+    img_out=$("$BIN" "$TMP/chains.myv" 2>&1)
+    got_rc=$?
+    nj_out=$("$BIN" -nj "$TMP/chains.myv" 2>&1)
+    if [ "$got_rc" = 0 ] && [ "$img_out" = "$src_out" ] && \
+       [ "$nj_out" = "$src_out" ] && \
+       [ "${src_out#\[\[6, 9\]}" != "$src_out" ]; then
+        pass "myv: store and inc-dec chains run from an image like source"
+    else
+        fail "myv: chains: rc=$got_rc src=[$src_out] img=[$img_out] \
+nj=[$nj_out]"
+    fi
+else
+    fail "myv: -c refused the store-chain program"
+fi
+
 # A CLASS instance has identity, and its hash is its identity NUMBER
 # (v33's `cls` record): an image must keep two references to one constant
 # instance one object, keep two declarations two objects, and give each

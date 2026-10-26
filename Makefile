@@ -199,7 +199,9 @@ endif
 # (-fcondition-coverage): the bar the intrusive suite is measured against
 # (plans/intrusive-tests.md, section 9; tests/int_coverage.py).
 ifeq ($(GCOV),1)
-	BASE_FLAGS += -fprofile-arcs -ftest-coverage
+	# ML_COVERAGE: the assertion macros check nothing (defs.h) - their
+	# failure arms are branches no correct run may take.
+	BASE_FLAGS += -fprofile-arcs -ftest-coverage -DML_COVERAGE=1
 	ifeq ($(shell $(CXX) -fcondition-coverage -fsyntax-only -x c++ \
 	              /dev/null 2>/dev/null && echo 1),1)
 		# GCC caps MC/DC at 64 conditions per decision, with no parameter

@@ -1,0 +1,22 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> => box(P(x: 1, nx: <none>))
+>> => box(P(x: 1, nx: box(P(...))))
+>> => box(P(x: 1, nx: box(P(...))))
+>> box(P(x: 1, nx: box(P(...)))) 
+>> => "[box(P(x: 1, nx: box(P(...))))]"
+>> => box(P(x: 2, nx: <none>))
+>> => [
+     box(P(x: 2, nx: [...])),
+     box(P(x: 2, nx: [...])),
+     "a string long enough to push the echo past the width"
+   ]
+>> => box(P(
+     x: 2,
+     nx: [
+           box(P(...)),
+           box(P(...)),
+           "a string long enough to push the echo past the width"
+         ]
+   ))
+>> => 5
+>> >> >> 

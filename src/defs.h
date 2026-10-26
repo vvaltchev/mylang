@@ -131,10 +131,30 @@ typedef intptr_t int_type;
  * failure, a real type error) do NOT use these - throw a proper Exception so
  * the error is handled in every build. ML_CHECK is for "impossible" states.
  */
-#ifndef NDEBUG
+/*
+ * A COVERAGE build (GCOV=1, which defines ML_COVERAGE=1) compiles them away
+ * too, and only them: NDEBUG stays off, so every other debug-only net (the
+ * register tracker, the AST teardown proof, the chunk verifier on our own
+ * output) still runs and is still measured. An assertion's failure arm is a
+ * branch gcov counts and no correct run may take, so in that build it was
+ * not product coverage but a fixed pile of uncoverable elements - and an
+ * always-inline helper's check (Frame::at's bounds, read_int_slot's tag)
+ * charged one to EVERY call site. The other builds keep the full net.
+ * `mylang -v` reports it (`coverage 1`, and `asserts 0`: ML_CHECK is off).
+ */
+#ifndef ML_COVERAGE
+#  define ML_COVERAGE 0
+#endif
+#if !defined(NDEBUG) && !ML_COVERAGE
 #  include <cassert>
 #  define ML_CHECK(cond)          assert(cond)
 #  define ML_CHECK_MSG(cond, msg) assert((cond) && (msg))
+#elif !defined(NDEBUG)
+   /* the coverage form NAMES the condition in an unevaluated operand: no
+    * code, no branch, and a debug-only value that only a check reads is
+    * still used (the NDEBUG form drops both the check and the value) */
+#  define ML_CHECK(cond)          ((void)sizeof(!(cond)))
+#  define ML_CHECK_MSG(cond, msg) ((void)sizeof(!(cond)), (void)sizeof(msg))
 #else
 #  define ML_CHECK(cond)          ((void)0)
 #  define ML_CHECK_MSG(cond, msg) ((void)0)

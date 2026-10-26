@@ -4037,7 +4037,7 @@ logop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx, Op op)
 
 EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
 {
-    assert(elems.size() >= 1 && elems[0].first == Op::invalid);
+    ML_CHECK(elems.size() >= 1 && elems[0].first == Op::invalid);
 
     if (elems.size() == 1)
         return elems[0].second->eval(ctx);
@@ -4053,7 +4053,7 @@ EvalValue MultiOpConstruct::eval_first_rvalue(EvalContext *ctx) const
 
 EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
 {
-    assert(elems.size() == 1 || elems.size() == 2);
+    ML_CHECK(elems.size() == 1 || elems.size() == 2);
     const auto &[op, e] = elems[0];
 
     if (op == Op::invalid)
@@ -7795,7 +7795,7 @@ LValue *LValue::write_target()
         return this;
 
     LValue *const cont = container;
-    assert(cont->is<SharedArrayObj>());
+    ML_CHECK(cont->is<SharedArrayObj>());
 
     if (cont->valtype()->is_slice(cont->val)) {
         /*

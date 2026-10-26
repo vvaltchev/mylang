@@ -202,7 +202,8 @@ Intrusive tests (need an INT_TESTS=1 build, see "Builds" below)
 | Tool       | Checks                        | Build    | Local | CI     |
 |------------|-------------------------------|----------|-------|--------|
 | int_run    | tests/int programs, REPL      | INT      | ~6 m  | 8 m    |
-|            | sessions, leak census, VM and | (+GCOV)  |       |        |
+|            | sessions, driver_checks, leak | (+GCOV)  |       |        |
+|            | census, VM and                |          |       |        |
 |            | JIT state checkers, and every |          |       |        |
 |            | declared value boundary (a    |          |       |        |
 |            | shift by 64, index -1, ...)   |          |       |        |
