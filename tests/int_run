@@ -95,7 +95,8 @@ def main():
                          "this binary's compiler")
     ap.add_argument("--report", default=None,
                     help="--gcov: write the ownership table and the "
-                         "uncovered list here")
+                         "uncovered list here (with --only: what each "
+                         "unit run covered)")
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--list", action="store_true",
                     help="print every unit's name and stop")
@@ -438,6 +439,15 @@ def main():
     if args.gcov and only:
         print("  coverage: --only ran a subset - ownership and the floor "
               "are whole-suite checks, skipped")
+        if args.report:
+            # what each unit run covered: against a whole run's uncovered
+            # list it says what a new unit adds, in minutes
+            with open(args.report, "w") as f:
+                for name in sorted(covered_by):
+                    cov = sorted(covered_by[name])
+                    f.write("== %s covers %d\n" % (name, len(cov)))
+                    for e in cov:
+                        f.write("  %s\n" % e)
     elif args.gcov:
         all_cov = set().union(*covered_by.values()) if covered_by else set()
         uncovered = sorted(e for e in universe if e not in all_cov)

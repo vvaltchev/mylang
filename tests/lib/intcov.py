@@ -278,10 +278,12 @@ def int_configs(prog):
 
 # an engine name -> its command-line flags. `vm` is the default engine
 # spelled out, `nbi` the bytecode inliner off, `noopt` every AST
-# transform off (`--no-opt all`); `+` joins two (`nbi+nj`, `tw+noopt`).
+# transform off (`--no-opt all`), `nc` no const folding (-nc: RULE 2
+# says it prints what the default prints); `+` joins two (`nbi+nj`,
+# `tw+noopt`).
 ENGINE_FLAGS = {"default": [], "tw": ["-tw"], "nj": ["-nj"],
                 "vm": ["-vm"], "nbi": ["-nbi"],
-                "noopt": ["--no-opt", "all"]}
+                "noopt": ["--no-opt", "all"], "nc": ["-nc"]}
 
 
 def engine_flags(eng):
