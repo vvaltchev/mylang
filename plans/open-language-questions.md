@@ -15,6 +15,25 @@ at run time (#49).
 | 5  | a parse-time pure call runs before inference    | decided: A |
 | 6  | a throwing constant expression inside a `try`   | decided: A |
 | 7  | duplicate keys in a dict literal                | decided: A |
+| 8  | `rethrow` inside a `try` nested in a `catch`    | open       |
+| 9  | the element type of an empty container          | open       |
+| 10 | `deepclone` and shared instances                | open       |
+| 11 | the value of a multi-assignment                 | open       |
+| 12 | exception chaining                              | open       |
+| 13 | fixed builtin arities (`write` / `fwrite`)      | open       |
+| 14 | the struct deferrals (var/opt fields, methods,  | open       |
+|    | subtyping)                                      |            |
+| 15 | a closure's parameters from every call site     | open       |
+| 16 | read-only views of a mutable container          | open       |
+| 17 | reference cycles, part B (reclaiming them)      | open       |
+| 18 | `isdefined()` for a name declared nowhere       | open       |
+| 19 | a stronger `--strict` (forward declarations)    | open       |
+| 20 | trace verbosity levels                          | open       |
+
+8-20 were added on 2026-10-24, in priority order, and are presented
+three at a time. 11 and 15-17 have their own plan files
+(`multi-assign-value.md`, `closure-param-join.md`, `immutable-views.md`,
+`reference-cycles.md`); 19 is in CLAUDE.md, under `--strict`.
 
 ## 3. Does a slice alias like any other array once assigned?
 
@@ -269,3 +288,89 @@ right. Tests: an `-rt` case (constant and run-time keys, the evaluation
 order, a literal in a compiled loop) and
 `tests/functional/98_dict_literal_dup_keys.my`, alike in every engine
 and under `-nc`, `-nti` and `--no-opt all`.
+
+## 8. `rethrow` inside a `try` nested in a `catch` body
+
+The engines disagree today (RULE 2), and the README does not say which
+is right:
+
+```
+struct E { int v; }
+func f() {
+    try {
+        throw E(1);
+    } catch (E as e) {
+        try {
+            rethrow;
+        } catch (E as e2) {
+            print("inner caught", e2.v);
+        }
+        print("after inner try");
+    }
+    print("f returns");
+}
+try {
+    f();
+    print("back in main");
+} catch (E as e) {
+    print("outer caught", e.v);
+}
+```
+
+Default engine and `-nj`: `inner caught 1`, `after inner try`, `f
+returns`, `back in main` - what Python (`raise`) and C# (`throw;`)
+print. `-tw`: `outer caught 1` - the rethrow skips the inner `try`.
+
+- **A.** `rethrow` raises the exception again at that point, so the
+  nearest enclosing handler (here the inner `catch`) gets it, like
+  Python and C# (recommended).
+- **B.** `rethrow` always leaves the `catch` it belongs to, skipping any
+  `try` nested inside it.
+
+## 9. The element type of an empty container
+
+`[]` is typed `array<none>` and `{}` `dict<none,none>`, so a loop over
+one types its variables `none`, and any use of them is a compile error
+- in a body that can never run:
+
+```
+func show(d) { foreach (k, e in d) print(k + ":"); }
+show({});              # NullabilityEx at compile time
+```
+
+It also poisons a function that is otherwise fine: `show({"a": 1});
+show({});` is refused too (the join makes `k` a `str?`), while
+`show({"a": 1})` alone runs. `var a = []; foreach (x in a) print(x +
+1);` is refused the same way. An annotated parameter
+(`dict<str,int> d`) or an `append` before the loop avoids it.
+
+- **A.** Keep it: annotate, or do not pass an empty literal.
+- **B.** An empty literal's element type adds nothing to a join, so
+  `show({"a": 1}); show({})` types `k` as `str`; alone it is `dyn`
+  (recommended).
+- **C.** An empty literal's element type is `dyn` everywhere.
+
+## 10. `deepclone` and shared instances
+
+`deepclone` copies an object that appears at two places twice, unless
+the two places are on a cycle:
+
+```
+class C { int v; }
+var c = C(1);
+var orig = [c, c];          # two references to one instance
+var copy = deepclone(orig);
+copy[0].v = 9;
+print(copy[1].v);           # MyLang: 1 (two copies); Python deepcopy: 9
+```
+
+A cycle IS preserved (`a.next = a; b = deepclone(a)`: `b.next` is `b`),
+so the rule depends on whether the sharing happens to be circular. The
+README states it ("`deepclone` does not preserve sharing").
+
+- **A.** Keep it.
+- **B.** Preserve all sharing, like Python's `deepcopy`: each object is
+  copied once and every reference to it points at that copy
+  (recommended; the cycle handling already keeps a map of copied
+  objects).
+
