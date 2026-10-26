@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <chrono>
+#include <optional>
 
 using std::pair;
 using std::vector;
@@ -2962,14 +2963,13 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
  * Scalars and strings are returned as-is. An empty array collapses to the
  * shared empty_arr singleton, matching LiteralArray.
  *
- * A value may contain ITSELF (cyclewalk.h): `st` holds each container being
- * copied with its copy in progress, and a container met again while it is
- * there is linked to that copy - the copy has the same cycle, instead of
- * the walk following the original one forever. A container shared at two
- * places that is not on the current path is copied at each, as always. A
- * read-only sub-object that is shared rather than copied cannot lead back
- * here: a frozen value holds only frozen ones. A dict copy is built in its
- * source's order, which is its order (#50).
+ * The copy keeps the source's SHAPE (question 10, Python's deepcopy):
+ * `st` holds every container copied so far with its copy, so one met
+ * again - shared at two places, or on a cycle while its copy is still
+ * being filled - is linked to that copy, never copied twice (cyclewalk.h,
+ * CycCopyStack). A read-only sub-object that is shared rather than copied
+ * cannot lead back here: a frozen value holds only frozen ones. A dict
+ * copy is built in its source's order, which is its order (#50).
  */
 static EvalValue
 clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
@@ -2980,6 +2980,19 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
 
         if (arr.is_readonly() && !through_readonly)
             return v;   /* share the const sub-object, don't copy it */
+
+        /* question 10: an array met again is the copy already made for it
+         * (or being made: a cycle), whatever its storage */
+        CycKey k;
+        const bool keyed = cyc_copy_key(arr, k);
+        if (keyed)
+            if (const EvalValue *c = st.link(k))
+                return *c;
+        auto made = [&](EvalValue res) {
+            if (keyed)
+                st.remember(k, res);
+            return res;
+        };
 
         /* An empty array must NOT collapse to the shared read-only empty_arr
          * singleton here: this is a MUTABLE clone (make_mutable_clone /
@@ -2998,26 +3011,26 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
          */
         if (arr.skind() == SharedArrayObj::Storage::ints) {
             const auto &iv = arr.flat_ints();
-            return SharedArrayObj(SharedArrayObj::ivec_type(
+            return made(SharedArrayObj(SharedArrayObj::ivec_type(
                 iv.cbegin() + arr.offset(),
                 iv.cbegin() + arr.offset() + arr.size()
-            ));
+            )));
         }
 
         if (arr.skind() == SharedArrayObj::Storage::floats) {
             const auto &fv = arr.flat_floats();
-            return SharedArrayObj(SharedArrayObj::fvec_type(
+            return made(SharedArrayObj(SharedArrayObj::fvec_type(
                 fv.cbegin() + arr.offset(),
                 fv.cbegin() + arr.offset() + arr.size()
-            ));
+            )));
         }
 
         if (arr.skind() == SharedArrayObj::Storage::bools) {
             const auto &bv = arr.flat_bools();
-            return SharedArrayObj(SharedArrayObj::bvec_type(
+            return made(SharedArrayObj(SharedArrayObj::bvec_type(
                 bv.cbegin() + arr.offset(),
                 bv.cbegin() + arr.offset() + arr.size()
-            ));
+            )));
         }
 
         /* Flat POD-struct array: a byte copy keeps it flat (POD bytes hold no
@@ -3028,28 +3041,33 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
                 sv.buf.cbegin() + arr.offset() * sv.stride,
                 sv.buf.cbegin() + (arr.offset() + arr.size()) * sv.stride
             );
-            return SharedArrayObj(
-                SharedArrayObj::svec_type(std::move(nb), sv.def, sv.stride));
+            return made(SharedArrayObj(
+                SharedArrayObj::svec_type(std::move(nb), sv.def, sv.stride)));
         }
 
         /* Flat STRING array: strings are immutable, so a handle copy IS a
          * full mutable-top copy - stays flat. */
         if (arr.skind() == SharedArrayObj::Storage::strs) {
             const auto &tv = arr.flat_strs();
-            return SharedArrayObj(SharedArrayObj::tvec_type(
+            return made(SharedArrayObj(SharedArrayObj::tvec_type(
                 tv.cbegin() + arr.offset(),
                 tv.cbegin() + arr.offset() + arr.size()
-            ));
+            )));
         }
 
         /* Flat CLASS array: each element as the general path below treats
          * it (a clone of a class instance is a class instance, so the
-         * copy stays flat). The array cannot be on a cycle without a
-         * class instance on it too, which the copy stack links. */
+         * copy stays flat). The copy exists before its elements, so an
+         * element leading back to the array links it. */
         if (arr.skind() == SharedArrayObj::Storage::objs) {
             const auto &ov = arr.flat_objs();
-            SharedArrayObj::ovec_type nv;
+            EvalValue res = SharedArrayObj(SharedArrayObj::ovec_type());
+            SharedArrayObj::ovec_type &nv =
+                res.get<SharedArrayObj>().flat_objs();
             nv.v.reserve(arr.size());
+            std::optional<CycCopyGuard> g;
+            if (keyed)
+                g.emplace(st, k, res);
             for (size_type i = 0; i < arr.size(); i++) {
                 const EvalValue c = clone_to_mutable(
                     obj_elem_value(ov[arr.offset() + i]), through_readonly,
@@ -3057,13 +3075,8 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
                 ML_CHECK(is_obj_elem(c));
                 nv.push(obj_elem_ptr(c));
             }
-            return SharedArrayObj(std::move(nv));
+            return res;
         }
-
-        CycKey k;
-        cyc_key(v, k);                       /* a general array: keyed */
-        if (const EvalValue *c = st.link(k))
-            return *c;
 
         const ArrayConstView &view = arr.get_view();
 
@@ -3071,7 +3084,9 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
         EvalValue res = SharedArrayObj(SharedArrayObj::vec_type());
         SharedArrayObj::vec_type &vec = res.get<SharedArrayObj>().get_vec();
         vec.reserve(view.size());
-        CycCopyGuard g(st, k, res);
+        std::optional<CycCopyGuard> g;
+        if (keyed)
+            g.emplace(st, k, res);
 
         for (unsigned i = 0; i < view.size(); i++) {
             vec.emplace_back(
@@ -3123,9 +3138,14 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
         const BoxObj &b = *v.get_ref<intrusive_ptr<BoxObj>>();
         if (b.readonly && !through_readonly)
             return v;
+        const CycKey k = cyc_key_obj(&b);
+        if (const EvalValue *c = st.link(k))
+            return *c;          /* one box, met again: its one copy */
         auto out = make_intrusive<BoxObj>(b);
         out->readonly = false;
-        return EvalValue(std::move(out));
+        EvalValue res(std::move(out));
+        st.remember(k, res);
+        return res;
     }
 
     if (v.is<intrusive_ptr<StructObject>>()) {
@@ -3135,16 +3155,20 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
         if (obj->is_readonly() && !through_readonly)
             return v;   /* share the const sub-object, don't copy it */
 
+        /* met again (a class instance or a box<P> held twice): its one
+         * copy */
+        const CycKey k = cyc_key_obj(obj.get());
+        if (const EvalValue *c = st.link(k))
+            return *c;
+
         /* POD: a byte copy is a full mutable copy (no nested references). */
         if (obj->is_pod()) {
             auto out = make_intrusive<StructObject>(*obj);   /* copies bytes */
             out->clear_readonly();
-            return intrusive_ptr<StructObject>(out);
+            EvalValue res = intrusive_ptr<StructObject>(out);
+            st.remember(k, res);
+            return res;
         }
-
-        const CycKey k = cyc_key_obj(obj.get());
-        if (const EvalValue *c = st.link(k))
-            return *c;
 
         auto out = make_intrusive<StructObject>(obj->def);
         if (obj->boxed) {               /* a box<P>: a new box */
@@ -3200,6 +3224,19 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
 
         const SharedArrayObj &src = v.get<SharedArrayObj>();
 
+        /* question 10: an array met again is its one copy (or being made:
+         * a cycle), whatever its storage, as in a deep copy */
+        CycKey k;
+        const bool keyed = cyc_copy_key(src, k);
+        if (keyed)
+            if (const EvalValue *c = st.link(k))
+                return *c;
+        auto made = [&](EvalValue res) {
+            if (keyed)
+                st.remember(k, res);
+            return res;
+        };
+
         /*
          * Flat homogeneous array: bake a flat read-only copy, keeping the
          * unboxed storage. The elements are scalars, so there is nothing to
@@ -3214,7 +3251,7 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
             );
             SharedArrayObj arr(std::move(nv));
             arr.set_readonly();
-            return arr;
+            return made(arr);
         }
 
         if (src.skind() == SharedArrayObj::Storage::floats) {
@@ -3225,7 +3262,7 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
             );
             SharedArrayObj arr(std::move(nv));
             arr.set_readonly();
-            return arr;
+            return made(arr);
         }
 
         if (src.skind() == SharedArrayObj::Storage::bools) {
@@ -3236,7 +3273,7 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
             );
             SharedArrayObj arr(std::move(nv));
             arr.set_readonly();
-            return arr;
+            return made(arr);
         }
 
         /* Flat POD-struct array: a deep read-only byte copy (POD bytes hold no
@@ -3250,7 +3287,7 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
             SharedArrayObj arr(
                 SharedArrayObj::svec_type(std::move(nb), sv.def, sv.stride));
             arr.set_readonly();
-            return arr;
+            return made(arr);
         }
 
         /* Flat STRING array: strings are immutable - nothing to recurse
@@ -3262,30 +3299,31 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
                 tv.cbegin() + src.offset() + src.size()
             ));
             arr.set_readonly();
-            return arr;
+            return made(arr);
         }
 
         /* Flat CLASS array: the same references (a class instance keeps
          * its identity - frozen in place for a constant, below), read-only */
         if (src.skind() == SharedArrayObj::Storage::objs) {
             const auto &ov = src.flat_objs();
-            SharedArrayObj::ovec_type nv;
+            EvalValue res = SharedArrayObj(SharedArrayObj::ovec_type());
+            SharedArrayObj &arr = res.get<SharedArrayObj>();
+            SharedArrayObj::ovec_type &nv = arr.flat_objs();
             nv.v.reserve(src.size());
-            for (size_type i = 0; i < src.size(); i++) {
-                const EvalValue c = make_const_clone_rec(
-                    obj_elem_value(ov[src.offset() + i]), key, st);
-                ML_CHECK(is_obj_elem(c));
-                nv.push(obj_elem_ptr(c));
+            {
+                std::optional<CycCopyGuard> g;
+                if (keyed)
+                    g.emplace(st, k, res);
+                for (size_type i = 0; i < src.size(); i++) {
+                    const EvalValue c = make_const_clone_rec(
+                        obj_elem_value(ov[src.offset() + i]), key, st);
+                    ML_CHECK(is_obj_elem(c));
+                    nv.push(obj_elem_ptr(c));
+                }
             }
-            SharedArrayObj arr(std::move(nv));
             arr.set_readonly();
-            return arr;
+            return res;
         }
-
-        CycKey k;
-        cyc_key(v, k);                       /* a general array: keyed */
-        if (const EvalValue *c = st.link(k))
-            return *c;
 
         const ArrayConstView &view = src.get_view();
 
@@ -3295,7 +3333,9 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
         vec.reserve(view.size());
 
         {
-            CycCopyGuard g(st, k, res);
+            std::optional<CycCopyGuard> g;
+            if (keyed)
+                g.emplace(st, k, res);
             for (unsigned i = 0; i < view.size(); i++)
                 vec.emplace_back(make_const_clone_rec(view[i].get(), key, st),
                                  false);

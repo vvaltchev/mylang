@@ -7083,8 +7083,13 @@ per level of a deep value - a separate open item.
     `cyc_eq()` - a back edge when the lhs is on it as an lhs or the rhs as
     an rhs, equal iff at the same depth, which is the one rule `hash` can
     agree with; the deep copies (`clone_to_mutable`,
-    `make_const_clone_rec`) link a back edge to the copy in progress
-    (`CycCopyStack::link`); the compiler's walks (`static_type_from_value`,
+    `make_const_clone_rec`) link a container met AGAIN to its one copy -
+    a back edge to the copy in progress, and since question 10 (Python's
+    deepcopy rule) any container already copied, flat arrays and boxes
+    included, so the copy has the source's shape (`CycCopyStack` is a
+    memo keyed by `cyc_copy_key`: an array's storage plus its slice
+    group, never its window); the
+    compiler's walks (`static_type_from_value`,
     `keep_in_value`, `cs_eval_value`, `reflect_typeof`, `shape_of`,
     `collect_value_descs`) answer their TOP (`dyn`, the site's abstract
     object, `NumShape::other`); the writer throws a MyvError.

@@ -1341,9 +1341,10 @@ print([a, a]);              # [[1, [...]], [1, [...]]]
     original.
 
   * **`deepclone`** copies the cycle: the copy of `a` contains the copy, not
-    `a`. A container that appears at two places without being on a cycle
-    is copied at each place - `deepclone` does not preserve sharing. The
-    read-only snapshot a constant or a dict key takes works the same way.
+    `a`. It keeps any other sharing too: a container that appears at two
+    places is copied once, and both places hold that one copy (see
+    [`deepclone`](#deepcloneobj)). The read-only snapshot a constant or a
+    dict key takes works the same way.
 
   * **Ordering** (`<`, `sort`, `min`, `max`) is not defined on arrays, dicts
     or structs at all (`TypeErrorEx`), so it never walks one.
@@ -3198,9 +3199,22 @@ Like `clone()`, but produces a **fully mutable, deep copy**: every nested array
 and dictionary is copied too, so the result is completely independent of the
 original and writable at any depth. This is the way to obtain a mutable version
 of a `const` (or of any object you want to change deeply without affecting the
-source). Scalars and strings are returned unchanged. A value that contains
-itself is copied with its cycle: the copy contains the copy (see
-[Values that contain themselves](#values-that-contain-themselves)).
+source). Scalars and strings are returned unchanged.
+
+The copy has the **same shape** as the original, as Python's
+`copy.deepcopy` does: each array, dict, class instance and box reachable
+from `obj` is copied exactly once, and every place that held it holds that
+one copy. So what is shared in the original is shared in the copy, and a
+value that contains itself is copied with its cycle: the copy contains the
+copy (see [Values that contain themselves](#values-that-contain-themselves)).
+A struct value is a value, so its copies stay independent.
+
+```C#
+var inner = [1, 2];
+var copy = deepclone([inner, inner]);   # one array, stored twice
+copy[0][0] = 9;
+print(copy[1][0]);                      # 9: still one array in the copy
+```
 
 #### `type(value)`
 Return a **`Type` reflection object** for the value's type — a native composite

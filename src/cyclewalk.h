@@ -550,38 +550,71 @@ inline size_t cyc_backedge_hash(int depth)
 }
 
 /*
- * The DEEP COPIES' stack: each container being copied, with its copy in
- * progress. A container met again while on it is linked to that copy, so
- * the copy reproduces the cycle instead of following it forever.
+ * An array's IDENTITY for the deep copies: its storage, and for a slice
+ * its group (question 3: every handle of one slice is one array, and two
+ * slice expressions are two arrays even over the same window) - so two
+ * handles get one key exactly when a write through one shows in the
+ * other. False for an array with no storage of its own.
+ */
+inline bool cyc_copy_key(const SharedArrayObj &a, CycKey &k)
+{
+    if (!a.storage_id())
+        return false;
+    k.obj = a.storage_id();
+    k.off = a.is_slice() ? 1 : 0;
+    k.len = a.is_slice() ? a.group : 0;
+    return true;
+}
+
+/*
+ * The DEEP COPIES' memo (question 10: Python's deepcopy rule). Each
+ * container copied so far, with its copy: a container met again is
+ * linked to that copy, so a value shared at two places is one value in
+ * the copy too, and a cycle - met again while its copy is still OPEN,
+ * i.e. being filled - is reproduced instead of followed forever. A
+ * struct VALUE's object two places share by copy-on-write stays shared
+ * in the copy the same invisible way (the first write splits it).
  */
 class CycCopyStack {
 
 public:
 
-    /* The copy in progress of the container `k`, when the walk is inside
-     * it (a back edge: the copy closes the cycle here); else null. */
+    /* The copy of the container `k` already made or being made; else
+     * null. */
     const EvalValue *link(const CycKey &k)
     {
-        for (const auto &e : st)
-            if (e.first == k) {
-                closed = true;
-                return &e.second;
-            }
-        return nullptr;
+        auto it = m.find(k);
+        if (it == m.end())
+            return nullptr;
+        if (it->second.open)
+            closed = true;
+        return &it->second.copy;
     }
 
     void push(const CycKey &k, const EvalValue &copy)
     {
-        st.emplace_back(k, copy);
+        m.emplace(k, Entry{copy, true});
     }
 
-    void pop() { st.pop_back(); }
+    /* the copy of `k` is complete: met again, it is shared */
+    void finish(const CycKey &k) { m.find(k)->second.open = false; }
+
+    /* a copy made in one step (nothing in it can lead back to it) */
+    void remember(const CycKey &k, const EvalValue &copy)
+    {
+        m.emplace(k, Entry{copy, false});
+    }
 
     /* did the copy close a cycle? (the result then contains one) */
     bool closed = false;
 
 private:
-    std::vector<std::pair<CycKey, EvalValue>> st;
+
+    struct Entry {
+        EvalValue copy;
+        bool open;
+    };
+    std::unordered_map<CycKey, Entry, CycKeyHash> m;
 };
 
 class CycCopyGuard {
@@ -589,16 +622,17 @@ class CycCopyGuard {
 public:
 
     CycCopyGuard(CycCopyStack &st, const CycKey &k, const EvalValue &copy)
-        : st(st)
+        : st(st), k(k)
     {
         st.push(k, copy);
     }
 
-    ~CycCopyGuard() { st.pop(); }
+    ~CycCopyGuard() { st.finish(k); }
 
     CycCopyGuard(const CycCopyGuard &) = delete;
     CycCopyGuard &operator=(const CycCopyGuard &) = delete;
 
 private:
     CycCopyStack &st;
+    const CycKey k;
 };

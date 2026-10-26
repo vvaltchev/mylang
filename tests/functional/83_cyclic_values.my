@@ -85,7 +85,8 @@ assert(len(m) == 1 && m[b] == "again" && len(k0) == 2);
 pop(a);
 
 # 5. deepclone reproduces the cycle INSIDE the copy; a value shared at two
-#    places that is not on a cycle is still copied twice
+#    places that is not on a cycle is one value in the copy too (question
+#    10: Python's deepcopy rule, 103_deepclone_sharing.my)
 var dyn c = deepclone(a);
 assert(c == a && str(c) == "[1, [...]]");
 assert(intptr(c[1]) == intptr(c) && intptr(c) != intptr(a));
@@ -95,7 +96,7 @@ var dyn s7 = [7];
 var dyn dag = [s7, s7];
 var dyn dc = deepclone(dag);
 dc[0][0] = 8;
-assert(dc[1][0] == 7 && s7[0] == 7);
+assert(dc[1][0] == 8 && s7[0] == 7);
 var dyn dd = deepclone(d1);
 assert(dd == d1 && str(dd) == "{\"self\": {...}}");
 dd["x"] = 1;

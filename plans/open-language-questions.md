@@ -17,7 +17,7 @@ at run time (#49).
 | 7  | duplicate keys in a dict literal                | decided: A |
 | 8  | `rethrow` inside a `try` nested in a `catch`    | decided: A |
 | 9  | the element type of an empty container          | decided: C |
-| 10 | `deepclone` and shared instances                | open       |
+| 10 | `deepclone` and shared instances                | decided: B |
 | 11 | the value of a multi-assignment                 | open       |
 | 12 | exception chaining                              | open       |
 | 13 | fixed builtin arities (`write` / `fwrite`)      | open       |
@@ -401,4 +401,16 @@ README states it ("`deepclone` does not preserve sharing").
   copied once and every reference to it points at that copy
   (recommended; the cycle handling already keeps a map of copied
   objects).
+
+Decision (maintainer, 2026-10-25): **B**, "it makes more sense". Done the
+same day: the deep copies' cycle stack became a memo of every container
+copied (`CycCopyStack`), flat arrays and boxes included, keyed by an
+array's identity (its storage and slice group, so two slice expressions
+over one window stay two arrays). `deepclone([inner, inner])` is one
+array in the copy; a struct value's copies stay independent; the
+read-only snapshot a constant or a dict key takes keeps sharing too.
+Tests: `tests/functional/103_deepclone_sharing.my` and an `-rt` case;
+the three tests that pinned the old rule (`83_cyclic_values.my`, the
+`cycle: deepclone` case, `tests/int/40_box_kinds.my`) now assert the new
+one.
 
