@@ -112,6 +112,12 @@ tool or build step opens any of them.) One exception:
 runs `tests/myv_doc_check` first (seconds; see the format rule above).
 A commit that mixes docs with anything else is a code change.
 
+**A change to the CI workflows only (`.github/`, maintainer-set
+2026-11-06) is verified by the CI run it triggers**, not by the local
+catalog, which never runs a workflow file: push it and watch every
+workflow it touches go green. A commit mixing `.github/` with code is a
+code change.
+
 ## ⛔ NO NEW LANGUAGE FEATURES UNTIL THE TESTS AND THE JIT ARE DONE
 ## (maintainer-set, 2026-11-02)
 
@@ -2256,8 +2262,19 @@ the `tests/run` paragraph below):
   tests/functional on an optimized `ASSERTS=ON` `INT_TESTS` build (the
   REGTRACK net live), after a vacuity guard on `mylang -v`.
 **`int-deep.yml` is ON DEMAND (workflow_dispatch):** the enumerator's
-tier 3 and `tests/int_select --with-rt`, each a checkbox - minutes
-locally, an hour or more on a hosted runner. (Measured 2026-10-03: the
+tier 3 and `tests/int_select --with-rt`, each an input - minutes
+locally, an hour or more on a hosted runner. **It and `mutate.yml` live
+only on exp-work, and GitHub's "Run workflow" button exists only for a
+file on the DEFAULT branch (master)**, so neither could be started at
+all until 2026-11-06. Each now has a `push` trigger limited to its own
+file, which registers it with GitHub while every job is skipped on that
+event; it is started through the API on exp-work:
+`gh workflow run int-deep.yml --ref exp-work -f tier3=true -f
+select=true` (and `gh workflow run mutate.yml --ref exp-work`). A new
+dispatch-only workflow needs the same registering trigger, and its
+jobs the same `github.event_name == 'workflow_dispatch'` guard - an
+`always()` job included, which would otherwise run on the push.
+(Measured 2026-10-03: the
 push workflows finish in Linux 8.7 min, Coverage 3.8, Windows and macOS
 2 each, Nets 57 min - all of it `differential`, whose `disasmcheck`
 step was 34; that step is its own three-shard job since, which made

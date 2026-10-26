@@ -4,7 +4,13 @@
 # corpus with probes and census, the coverage gate; `int-enum`: the
 # decision enumerator's tiers 1 and 2). These two are minutes locally
 # and an hour or more on a hosted runner, so they run when asked:
-#   Actions -> int-deep -> Run workflow (pick which jobs).
+#   gh workflow run int-deep.yml --ref exp-work -f tier3=true -f select=true
+#
+# The Actions tab offers "Run workflow" only for a file on the DEFAULT
+# branch, and this one lives on exp-work. The `push` trigger below is
+# what makes GitHub know it at all: a push that changes this file
+# registers it, and every job is skipped on that event. Once registered,
+# it is started through the API (the command above) on exp-work.
 #
 #  - tier3:  the enumerator's tier 3 - a pairwise covering array of
 #            every larger decision scope (~110k runs). Under the
@@ -17,6 +23,8 @@
 name: int-deep
 
 on:
+  push:
+    paths: ['.github/workflows/int-deep.yml']   # registers it; runs nothing
   workflow_dispatch:
     inputs:
       tier3:
@@ -30,7 +38,7 @@ on:
 
 jobs:
   tier3:
-    if: ${{ inputs.tier3 }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier3 }}
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -56,7 +64,7 @@ jobs:
         if-no-files-found: ignore
 
   select:
-    if: ${{ inputs.select }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.select }}
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
