@@ -1,0 +1,36 @@
+# A struct's (or a class's) name used as a value - a constructor passed
+# around - is a `dyn` value, as a builtin used as a value is (#95). It was
+# typed `none`: a `dyn` parameter refused it ("may be none"), and a
+# template or a lambda given one was never instantiated, so the VM called
+# a function it had not compiled and aborted, while the tree-walker ran it.
+
+struct P { int x; }
+class C { float v; }
+
+print(typestr(P), typestr(C));
+assert(typestr(runtime(0)) != "dyn" || typestr(P) == "dyn");
+
+var dyn t = P;
+print(t(2).x);
+assert(t(2).x == 2);
+
+func ap(dyn mk) { return mk(3).x; }
+print(ap(P));
+assert(ap(P) == 3);
+
+var f = func(mk) => mk(4).x;
+print(f(P));
+assert(f(P) == 4);
+
+func tm(mk, int n) { return mk(n).x; }
+print(tm(P, 5), tm(P, runtime(6)));
+assert(tm(P, 5) == 5);
+
+func tc(mk) { var dyn c = mk(1.5); c.v += 1; return c.v; }
+print(tc(C));
+assert(tc(C) == 2.5);
+
+var dyn makers = [P, C];
+print(makers[0](7).x, makers[1](0.5).v);
+assert(makers[0](7).x == 7);
+assert(P == P && P != C);

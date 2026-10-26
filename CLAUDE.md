@@ -3501,14 +3501,18 @@ and it lives *inside the parser*. Mechanics:
   ParseContext ctor, the REPL, and the script driver to
   `!opt_no_type_infer` - under `-nti` both compile-time and run-time
   calls run untyped, and `-rt` cannot see that wiring (`driver_checks`
-  does). Not typed (the call runs as before): a by-value call given a
-  struct TYPE - inference types a struct name used as a value `none`
-  (task #95), so a copy cannot type its callee - and guards no program
-  reaches. The known gap,
-  documented: a type the program JOINS over the whole program (an
+  does). A by-value call given a struct TYPE passes it by its name,
+  declared in the copy (a `dyn` value, as in the program - #95). Not
+  typed (the call runs as before): guards no program reaches. The known
+  gap, documented: a type the program JOINS over the whole program (an
   un-annotated `opt` parameter, a lambda's unless written as a builtin's
   argument, a template's instance through a value, made only when every
-  call through it agrees) is decided by this call alone. Nets: the
+  call through it agrees) is decided by this call alone - where the
+  value is needed while compiling (a const initializer, a decided
+  condition, a struct's const member) and for a join reached only
+  inside the called function. A constant call in an expression is
+  folded after inference instead (#96, below), and runs when the program
+  types it otherwise. Nets: the
   `parse: a function the parser runs runs typed` `-rt` entry (counters
   `g_pt_runs` / `g_pt_untyped` prove the copy ran, or was declined),
   the `repl:` cross-input case,
@@ -7213,7 +7217,15 @@ but the per-element `StructObject` allocation is gone (build overhead
   (construction) and `.CONST`-accessible; `t_struct` (non-trivial, `>= t_str`,
   `intrusive_ptr<StructObject>`) is an **instance**. `TypeStruct` /
   `TypeStructType` in `src/types/struct.cpp.h`; wired through `ValueU`,
-  `TypeToEnum`, `TypeNames`, `AllTypes`.
+  `TypeToEnum`, `TypeNames`, `AllTypes`. **The inferencer types the
+  descriptor used as a VALUE (`var dyn t = P; f(P)`) `dyn`**, as a builtin
+  used as a value: its TypeSym (`struct_type` set) keeps the `dyn` its
+  declaration gives it, because `commit_round` skips it like a
+  function's (#95; the reset and the finalize loop leave a `dyn` alone).
+  Committed, it took the round's empty accumulator and finalized as
+  `none`: a `dyn` parameter refused it as "may be none", and a template
+  or lambda given one was never instantiated, so the VM called a
+  chunk-less base and aborted while `-tw` ran it.
 - **`structtype.h`** defines `StructTypeDef` (owned by its `StructDeclStmt`
   under the tree-walker; under `-vm`, `vm_compile` MOVES ownership into the
   `VmProgram` so it outlives the AST teardown — the decl keeps a raw `def`
