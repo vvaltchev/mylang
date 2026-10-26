@@ -874,6 +874,16 @@ small values like integers, floats, and strings become literals during the
 read-only symbols at runtime, but still allowing some operations on them (like
 `[index]` and `len(arr)`) to be const-evaluated.
 
+A constant bound to a *builtin* is that builtin: like a scalar it does not
+exist at runtime, and every use of its name is the builtin itself, so a call
+through it is checked, typed and folded exactly as the direct call:
+
+```C#
+const L = len;
+func g(a) { return L(a) + 1; }   # the same as len(a) + 1
+print(g([1, 2, 3]));             # 4
+```
+
 A `const` array or dictionary is **deeply read-only**: there is no shallow
 const, so a const container and every element nested inside it are immutable.
 The read-only-ness is a property of the *value*, not just the name — so it holds

@@ -7452,7 +7452,9 @@ private:
 
         if (ctag(slot.get()) == ConstructType::id) {
             auto *id = static_cast<Identifier *>(slot.get());
-            if (id->uid == uid) {
+            /* a builtin_only reference (#94) names the builtin, never a
+             * parameter of the same name */
+            if (id->uid == uid && !id->builtin_only) {
                 unique_ptr<Construct> a = arg->clone();  /* fresh per use */
                 a->start = slot->start;   /* keep the param's source position */
                 a->end = slot->end;       /* so errors point as in the callee */
