@@ -243,7 +243,10 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
 - With --gcov every unit must OWN an element no other unit covers, and
   uncovered must stay <= tests/int/coverage-floor.txt for the compiler.
   Lower the floor when a change covers more (the note says by how much);
-  never raise it. CI's gcc 14.2 number comes from the `int` job log.
+  never raise it. CI's number comes from the `int` job log: its g++-14 is
+  gcc 14.3 since the runner image moved (2026-10-20 - the job failed
+  with "no coverage floor for `gcc 14.3`" and printed the count to
+  record); the 14.2 line is the local lane's.
 - nested_fuzz's generator has a WORK BUDGET (WORK_BUDGET: the product of
   the enclosing loops' iteration counts; past it a level nests an `if`).
   Without it a depth-15 program ran 1.7 million innermost iterations and
