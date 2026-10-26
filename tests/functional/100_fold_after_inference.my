@@ -1,0 +1,40 @@
+# A constant call to a user function is folded once the whole program is
+# typed (#96): folded while parsing, it was gone from the program type
+# inference saw, so a parameter the program joins over its call sites
+# missed it and every answer below depended on -nc. Each line prints the
+# same with folding on and off, in every engine.
+
+var typed = typestr(runtime(0)) == "dyn";
+
+# a folded call's argument joins the parameter of a run-time call
+pure func o4(opt v) => str(v) + "!";
+print(o4(2.5), o4(int(runtime(2))));
+assert(!typed || o4(int(runtime(2))) == "2.000000!");
+
+# ... through a value read out of a constant array too
+pure func o3(opt v) => str(v) + "!";
+const T4 = [o3];
+print(T4[0](2.5), T4[int(runtime(0))](2));
+assert(!typed || T4[int(runtime(0))](2) == "2.000000!");
+
+# a folded call the program types otherwise than the parse-time run - by
+# its result, or by an argument the bind converts - runs, as -nc runs it
+pure func id(opt v) => v;
+var x = id(2);
+var y = id(2.5);
+print(x, y, typestr(x));
+assert(!typed || (str(x) == "2.000000" && typestr(x) == "float"));
+print(id(2) + 1);
+assert(!typed || str(id(2) + 1) == "3.000000");
+# a call whose own argument fits, but whose function reaches the join
+pure func w(int n) => id(n);
+print(w(2));
+assert(!typed || str(w(2)) == "2.000000");
+pure func o5(opt v) => str(v) + "!";
+print(o5(2), o5(2.5));
+assert(!typed || o5(2) == "2.000000!");
+
+# one the program types the same way still folds
+pure func sq(int n) => n * n;
+print(sq(4) + 1);
+assert(sq(4) + 1 == 17);

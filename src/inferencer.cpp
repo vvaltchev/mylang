@@ -421,6 +421,9 @@ private:
     void stamp_callee_fn(Block *rootBlock);  /* #116 inc 4 - see it */
 
     void infer_one(Block *root);     /* the per-root passes (shared) */
+    void apply_late_folds(Block *root);                 /* #96 */
+    bool late_fold_fits(Construct *node, Construct *lit);
+    bool late_fold_fits_one(Construct *node, Construct *lit);
 
     /* helpers */
     Scope *new_scope(Scope *parent);
@@ -1941,6 +1944,7 @@ void Inferencer::infer_one(Block *rootBlock)
          * the program. */
         for (auto &e : rootBlock->elems)
             stamp_untyped_calls(e.get());
+        apply_late_folds(rootBlock);
         return;
     }
 
@@ -2400,6 +2404,117 @@ void Inferencer::infer_one(Block *rootBlock)
     /* Stamp TypeHints (int/float) for the M8 specializer + typed conditions. */
     for (auto &e : rootBlock->elems)
         annotate_hints(e.get());
+
+    apply_late_folds(rootBlock);
+}
+
+/*
+ * #96: may the literal the parse computed stand for this deferred node?
+ * Typed, only when the literal has the node's type - else the program
+ * types the expression otherwise than the parse-time run did
+ * (`id(opt v)` joined float over its calls: `id(2) + 1` is 3.0) - and,
+ * for a call, only when each argument fits its parameter as is: a bind
+ * that converts runs the body with another type than the parse did
+ * (`str(v)` of a joined float).
+ */
+bool Inferencer::late_fold_fits_one(Construct *node, Construct *lit)
+{
+    /* can a value of type `from` stand where the program has `to`, with
+     * no conversion? (dyn takes anything; an `opt` place its type and
+     * none) */
+    const auto fits_as_is = [&](StaticTypeRef from, StaticTypeRef to) {
+        from = static_type_resolve(from);    /* typed: neither is null */
+        to = static_type_resolve(to);
+        if (to->kind == StaticTypeKind::Dyn || static_type_equal(from, to))
+            return true;
+        return to->opt
+            && (from->kind == StaticTypeKind::None
+                || static_type_equal(A.with_opt(from, true), to));
+    };
+    if (!lit)
+        return false;
+    if (!checks_enabled)
+        return true;            /* -nti: both runs are untyped */
+    if (!fits_as_is(type_of(lit), type_of(node)))
+        return false;
+    if (ctag(node) != ConstructType::call)
+        return true;
+    auto *call = static_cast<CallExpr *>(node);
+    FuncInfo *fi = callee_funcinfo(call->what.get());
+    if (!fi && call->callee_fn) {
+        auto it = func_of_decl.find(call->callee_fn);
+        fi = it != func_of_decl.end() ? it->second : nullptr;
+    }
+    if (!fi || fi->is_template)
+        return true;
+    /* a checked call has no more arguments than parameters */
+    const auto &args = call->args->elems;
+    const size_t n = std::min(args.size(), fi->params.size());
+    for (size_t i = 0; i < n; i++)
+        if (!fits_as_is(type_of(args[i].get()), fi->params[i]->type))
+            return false;
+    return true;
+}
+
+/*
+ * The whole node: every deferred node inside it fits too, since the
+ * node's value was computed from theirs (`str(id(2) + 1) == "3.0"`); and
+ * no function literal is written inside it. That last rule is a
+ * precaution no test can see today: inference may name such a literal
+ * from elsewhere (a callee set, stamped as CallExpr::callee_fn /
+ * callee_desc on a call outside the node), and a retired literal's
+ * descriptor dies with the inferencer - every shape tried so far has the
+ * literal refused by the argument check, or its stamp read by no one.
+ */
+bool Inferencer::late_fold_fits(Construct *node, Construct *lit)
+{
+    bool ok = true;
+    std::function<void(Construct *)> scan = [&](Construct *n) {
+        if (!n || !ok)
+            return;
+        if (ctag(n) == ConstructType::func_decl) {
+            ok = false;
+            return;
+        }
+        if (n != node && n->defer_fold
+                && !late_fold_fits_one(n, n->late_fold.get())) {
+            ok = false;
+            return;
+        }
+        for_each_child(n, scan);
+    };
+    scan(node);
+    return ok && late_fold_fits_one(node, lit);
+}
+
+/*
+ * #96: the second half of a folding parse's deferral (pDeferFold,
+ * parser.cpp): once the program is typed, each outermost deferred node
+ * becomes the literal the parse computed, when late_fold_fits; one that
+ * does not keeps running, as it does under -nc. The replaced subtree is
+ * RETIRED, never freed: its nodes are keys of the maps -dti / -a read.
+ */
+void Inferencer::apply_late_folds(Block *root)
+{
+    std::function<void(unique_ptr<Construct> &)> visit =
+        [&](unique_ptr<Construct> &slot) {
+        Construct *n = slot.get();
+        if (!n)
+            return;
+        if (n->defer_fold) {
+            n->defer_fold = false;
+            unique_ptr<Construct> lit = std::move(n->late_fold);
+            if (lit && late_fold_fits(n, lit.get())) {
+                n->copy_base_fields(*lit);
+                retired.push_back(std::move(slot));
+                slot = std::move(lit);
+                return;
+            }
+        }
+        for_each_child_slot(n, visit);
+    };
+    for (auto &e : root->elems)
+        visit(e);
 }
 
 /*

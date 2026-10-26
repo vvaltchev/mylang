@@ -22404,6 +22404,17 @@ static const std::vector<repl_test> repl_tests =
         { "q6 = \"s\"", "TypeMismatchEx", "note:" },
         { "nosuch6 + 1", "Undefined variable 'nosuch6'", "note:" } } },
 
+    /* #96: a constant call to an earlier input's function is typed as the
+     * same call with a run-time argument - the function's types are
+     * committed (`v` was never called: dyn), and a fold no longer types
+     * the call by its value */
+    { "a constant call across inputs is typed as a run-time one",
+      { { "pure func id96(opt v) => v", "" },
+        { "var x96 = id96(2)", "DynRequiredEx" },
+        { "var y96 = id96(int(runtime(2)))", "DynRequiredEx" },
+        { "var dyn z96 = id96(2)", "" },
+        { "z96", "=> 2" } } },
+
     /* #94: a const bound to a builtin, read in a LATER input - it has no
      * run-time symbol, and the read is the builtin itself */
     { "a const bound to a builtin is the builtin in a later input",
@@ -28671,6 +28682,9 @@ static std::string nc_run(const std::string &src, ExecEngine eng, bool fold)
     /* outside the try, as main() keeps it: a tree-walker backtrace names
      * descriptors the tree owns, and the catch renders it */
     unique_ptr<Construct> root;
+    /* #96: the warnings are part of the outcome too */
+    std::string warns;
+    g_warnings.clear();
     try {
         lexer(src, 1, toks);
         ParseContext pc(TokenStream(toks), fold);
@@ -28678,6 +28692,10 @@ static std::string nc_run(const std::string &src, ExecEngine eng, bool fold)
         mark_implicit_globals(root.get(), {});
         infer_types(root.get());
         run_optimizers(root.get());
+        for (const CompileWarning &w : g_warnings)
+            warns += std::string("warning@") + std::to_string(w.start.line)
+                + ":" + std::to_string(w.start.col) + " " + w.msg + "\n";
+        g_warnings.clear();
         if (eng == ExecEngine::Vm)
             vm_execute(root.get());
         else
@@ -28691,12 +28709,110 @@ static std::string nc_run(const std::string &src, ExecEngine eng, bool fold)
     }
     cout.rdbuf(saved_buf);
     g_exec_engine = saved_eng;
-    return cap.str() + "|" + err;
+    g_warnings.clear();
+    return warns + cap.str() + "|" + err;
+}
+
+/*
+ * #96: the shape half of the late fold - an equivalence test passes for a
+ * late fold that never replaces anything (the kept call computes the same
+ * value). After inference, a constant call the program types as the
+ * parse did IS a literal; one whose argument the bind would convert (a
+ * joined parameter) is still the call.
+ */
+static bool late_fold_shape()
+{
+    const char *src =
+        "pure func sq(int n) => n * n;\n"
+        "pure func id(opt v) => v;\n"
+        "print(sq(4) + 1, id(2), id(2.5));\n";
+    /* typed, then untyped (-nti: both runs untyped, so all three fold) */
+    for (const bool typed : { true, false }) {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), typed);
+        auto *b = static_cast<Block *>(root.get());
+        CallExpr *pr = nullptr;
+        for (auto &e : b->elems)
+            if (ctag(e.get()) == ConstructType::call)
+                pr = static_cast<CallExpr *>(e.get());
+        if (!pr || pr->args->elems.size() != 3) {
+            fprintf(stderr, "late_fold_shape: no print call\n");
+            return false;
+        }
+        const auto &a = pr->args->elems;
+        const bool folded = ctag(a[0].get()) == ConstructType::lit_int
+            && static_cast<LiteralInt *>(a[0].get())->ival() == 17;
+        /* id's parameter joins int and float: the int argument would be
+         * converted, so id(2) runs; id(2.5) fits as is and folds */
+        const bool id2 = ctag(a[1].get()) == (typed ? ConstructType::call
+                                                    : ConstructType::lit_int);
+        const bool folded2 = ctag(a[2].get()) == ConstructType::lit_float;
+        if (!folded || !id2 || !folded2) {
+            fprintf(stderr, "late_fold_shape (%s): sq(4) + 1 folded %d, "
+                    "id(2) as expected %d, id(2.5) folded %d\n",
+                    typed ? "typed" : "-nti", folded, id2, folded2);
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool const_fold_equivalence()
 {
     const std::vector<NcCase> cases = {
+        /* #96: a constant call to a user function is folded only once the
+         * program is typed - folded while parsing, it was gone from the
+         * program inference typed. Its argument joins the parameter... */
+        { "a folded call's argument joins the parameter", {
+            "pure func o4(opt v) => str(v) + \"!\";",
+            "print(o4(2.5), o4(int(runtime(2))));" } },
+        { "a folded call through a const array joins the parameter", {
+            "pure func o3(opt v) => str(v) + \"!\";",
+            "const T4 = [o3];",
+            "print(T4[0](2.5), T4[int(runtime(0))](2));" } },
+        /* ...a call the program types otherwise than the parse-time run
+         * (its result, or an argument the bind converts) runs ... */
+        { "a folded call whose result the program types otherwise", {
+            "pure func id(opt v) => v;",
+            "var x = id(2);",
+            "var y = id(2.5);",
+            "print(x, y, typestr(x));" } },
+        { "a folded expression the program types otherwise", {
+            "pure func idx(opt v) => v;",
+            "print(idx(2) + 1, idx(2.5));" } },
+        /* ...and so does an expression computed from such a call: its
+         * own type may match, its value came from the parse-time one */
+        { "a folded expression over a call the program types otherwise", {
+            "pure func idn(opt v) => v;",
+            "print(str(idn(2) + 1) == \"3.000000\", idn(2.5));" } },
+        /* ...and a call whose own argument fits, but whose function
+         * reaches the join inside: its result type gives it away */
+        { "a folded call whose function reaches a join inside", {
+            "pure func idw(opt v) => v;",
+            "pure func w(int x) => idw(x);",
+            "print(w(2), idw(2.5));" } },
+        { "a folded call whose argument the bind converts", {
+            "pure func o5(opt v) => str(v) + \"!\";",
+            "print(o5(2), o5(2.5));" } },
+        /* ...and a type error about it is reported at the same call */
+        { "a type error in a folded call keeps its caret", {
+            "pure func o6(opt v) => str(v) + \"!\";",
+            "const T6 = [o6];",
+            "print(T6[0](2), T6[0](\"s\"), T6[int(runtime(0))](2),",
+            "      T6[int(runtime(0))](\"s\"));" } },
+        /* ...as is a warning about a call holding a function literal (it
+         * stays a call: inference names the literal from elsewhere) */
+        { "a warning about a folded call is the same", {
+            "pure func apply(fn, x) => fn(x);",
+            "print(apply(pure func(v) => v, 2),",
+            "      apply(pure func(v) => v, int(runtime(2))));",
+            "const G = [apply];",
+            "pure func useg(int n) => G[0](pure func(v) => v, n);",
+            "print(useg(1));" } },
         /* the three shapes #54 was filed for */
         { "a struct const member reads a const", {
             "const K = 3;",
@@ -58377,6 +58493,8 @@ static const std::vector<extra_check> extra_checks =
       opt_layer_equivalence },
     { "parse: -nc turns off folding, not the program's meaning (#54)",
       const_fold_equivalence },
+    { "parse: a constant call is folded once the program is typed (#96)",
+      late_fold_shape },
     { "parse: a function the parser runs runs typed (question 5)",
       parse_time_typed_runs },
     { "check: a dyn value entering a typed place - the messages (#49)",

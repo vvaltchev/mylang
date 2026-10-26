@@ -2393,42 +2393,21 @@ print(add2(non_const));
 print(add2(5));
 ```
 
-The abstract syntax tree that language's engine will use at runtime will be:
+The second call is run at compile time. `-s` prints the tree twice: first
+as parsed, then as the engine runs it. A constant call to a user function is
+folded once the whole program is typed (see below), so it is still a call in
+the first tree, and the second tree, the one the engine runs, ends with:
 
 ```
 $ ./build/mylang -s t
-Syntax tree
---------------------------
-Block(
-  FuncDeclStmt(
-    Id("add2")
-    <NoCaptures>
-    IdList(
-      Id("x")
-    )
-    Expr04(
-      Id("x")
-      Op '+'
-      Int(2)
-    )
-  )
-  VarDecl(
-    Id("non_const")
-    Op '='
-    Int(25)
-  )
-  CallExpr(
+...
+  DirectBuiltinCallExpr(
     Id("print")
     ExprList(
-      CallExpr(
-        Id("add2")
-        ExprList(
-          Id("non_const")
-        )
-      )
+      Int(27)
     )
   )
-  CallExpr(
+  DirectBuiltinCallExpr(
     Id("print")
     ExprList(
       Int(7)
@@ -2440,9 +2419,10 @@ Block(
 7
 ```
 
-As you can see, in the first case an actual function call happens because
-`non_const` is not a constant, while in the second case it's AS IF we passed
-a literal integer to `print()`.
+As you can see, in the second case it's AS IF we passed a literal integer to
+`print()`. (So is the first case here: the optimizer saw that `non_const` is
+never changed, and folded it too - an actual call happens only for a value
+known when the program runs.)
 
 #### A call at compile time computes what it computes at run time
 
@@ -2489,15 +2469,30 @@ A type error in that typed code is a compile error, with the program's caret:
 `pure func bad(x) { var y = x; y = "s"; return 1; }` makes `const Z =
 bad(3);` an error, just as `bad(int(runtime(3)))` is.
 
-There is one limit. Some types are decided by joining every place in the
-program: an un-annotated `opt` parameter takes all its call sites, a lambda's
-parameter does the same (unless the lambda is written as a builtin's argument,
-whose call is its only one), and a template called through a value gets an
-instance only if every call through that value agrees on the argument types.
-For those, the compiler uses only the compile-time call itself, because it has
-not yet seen the rest of the program. With type inference off (`-nti`),
-compile-time calls and run-time calls both run untyped, so the example above
-prints `3 3`.
+Some types are decided by joining every place in the program: an
+un-annotated `opt` parameter takes all its call sites, a lambda's parameter
+does the same (unless the lambda is written as a builtin's argument, whose
+call is its only one), and a template called through a value gets an instance
+only if every call through that value agrees on the argument types. A constant
+call inside an expression takes part in those joins as any call does: the
+compiler computes it while parsing, but replaces it by its value only once the
+whole program is typed, and only when that value already has the type the
+program gives the call and each argument already has its parameter's type.
+Otherwise the call runs when the program runs:
+
+```C#
+pure func id(opt v) => v;          # v joins int and float: a float
+var x = id(2);
+print(x, id(2.5));                 # 2.000000 2.500000
+```
+
+There is one limit. Where the value is needed while compiling - a `const`
+initializer, a condition the compiler decides, a struct's `const` member - and
+for a join the call reaches only inside the function it calls, the compiler
+uses only the compile-time call itself, because it has not yet seen the rest
+of the program. With type inference off (`-nti`), compile-time calls and
+run-time calls both run untyped, so the first example of this section prints
+`3 3`.
 
 #### Automatic pure promotion
 

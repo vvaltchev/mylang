@@ -112,7 +112,7 @@ z2     : int   [var]
 >> => 2
 >> >> /* pure */ int func c1() => 3;
 >> >> /* pure */ int func c2() => 3;
->> >> /* pure */ int func c3() => 55;
+>> >> /* pure */ dyn func c3() => 55;
 >> => 55
 >> >> int func c5() => addp$s0(1, 2);
 >> >> /* pure */ int func c6() => 42;

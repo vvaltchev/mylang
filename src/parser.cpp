@@ -1048,6 +1048,59 @@ nc_eval_const(ParseContext &c, Construct *node,
         RValue(node->eval(c.const_ctx)), scratch, process_arrays, immutable);
 }
 
+/*
+ * #96: a FOLDING parse leaves a constant expression holding a call to a
+ * user function in place until type inference has seen it - as `-nc`
+ * leaves it - outside a const declaration and a pure function's body,
+ * where both runs fold (or bake) it. Folded while parsing, the call was
+ * gone from the program inference typed: a parameter the program joins
+ * over its call sites missed it (`f(2.5); f(int(runtime(2)))` printed
+ * `2!` where -nc printed `2.000000!`), and a type error or a warning
+ * about it landed on another call.
+ */
+static bool
+pDefersFolds(const ParseContext &c, unsigned fl)
+{
+    return c.fold && c.pure_depth == 0 && !(fl & pFlags::pInConstDecl);
+}
+
+/* `n` or a node below it is such a call (or holds one) */
+static bool
+pHoldsDeferred(Construct *n)
+{
+    if (!n)
+        return false;
+    if (n->defer_fold)
+        return true;
+    bool found = false;
+    for_each_child_of(n, [&](Construct *ch) {
+        if (!found && pHoldsDeferred(ch))
+            found = true;
+    });
+    return found;
+}
+
+/*
+ * Evaluate the node, as the fold would - its errors are the same compile
+ * errors - and keep the literal it folds to for apply_late_folds. A
+ * value naming a function keeps none: inference may name that function
+ * from elsewhere (a callee set), so the node stays and runs.
+ */
+static void
+pDeferFold(ParseContext &c, Construct *node,
+           bool process_arrays, bool immutable)
+{
+    node->defer_fold = true;
+    const EvalValue v = RValue(node->eval(c.const_ctx));
+    unique_ptr<Construct> lit;
+    node->nc_folds = MakeConstructFromConstVal(v, lit, process_arrays,
+                                               immutable);
+    std::unordered_set<const FuncDescriptor *> descs;
+    collect_value_descs(v, descs);
+    if (node->nc_folds && descs.empty())
+        node->late_fold = std::move(lit);
+}
+
 bool
 pAcceptLiteralInt(ParseContext &c, unique_ptr<Construct> &v)
 {
@@ -1604,7 +1657,14 @@ pAcceptCallExpr(ParseContext &c,
             nc_eval_const(c, expr.get(), (fl & pFlags::pInConstDecl) != 0,
                           (fl & pFlags::pInConstDecl) != 0);
 
-        if (c.folding() && expr->is_const) {
+        /* #96: a call to a user function, or one holding one */
+        if (expr->is_const && pDefersFolds(c, fl)
+                && (RValue(expr->what->eval(c.const_ctx))
+                        .is<intrusive_ptr<FuncObject>>()
+                    || pHoldsDeferred(expr.get())))
+            pDeferFold(c, expr.get(), false, false);
+
+        else if (c.folding() && expr->is_const) {
 
             /* -a: this call is about to fold to a literal at compile time -
              * color the callee identifier magenta before it is gone. */
@@ -1651,7 +1711,12 @@ pFoldSubscript(ParseContext &c, unique_ptr<Construct> &ret, bool in_slice,
 
     } else if (ret->is_const) {
 
-        if (!in_slice || fl & pFlags::pInConstDecl) {
+        if ((!in_slice || fl & pFlags::pInConstDecl)
+                && pDefersFolds(c, fl) && pHoldsDeferred(ret.get())) {
+
+            pDeferFold(c, ret.get(), true, false);       /* #96 */
+
+        } else if (!in_slice || fl & pFlags::pInConstDecl) {
 
             unique_ptr<Construct> const_construct;
 
@@ -2384,55 +2449,27 @@ ShouldConstSymbolExistAtRuntime(const EvalValue& rvalue)
         rvalue.is<intrusive_ptr<FuncObject>>();
 }
 
-static unique_ptr<Construct>
-pExpr14_body(ParseContext &c, unsigned fl)
+/*
+ * The rest of an assignment-level expression, once its left side is
+ * parsed - a frame of its own on purpose. The left side is where the
+ * parser RECURSES for nested brackets and parentheses (pExpr13 -> ... ->
+ * pExpr01 -> pExpr14), once per level up to MAX_NEST, so what this part
+ * keeps on the stack would be kept per level too: under ASan, which gives
+ * every local its own slot, that was ~6 KB a level, and 256 levels of
+ * `[[[...]]]` overflowed macOS's 8 MB stack.
+ */
+ML_NOINLINE static unique_ptr<Construct>
+pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
+             unique_ptr<Construct> lside)
 {
     static const std::initializer_list<Op> valid_ops = {
         Op::assign, Op::addeq, Op::subeq, Op::muleq, Op::diveq, Op::modeq,
         Op::shleq, Op::shreq, Op::ushreq, Op::bandeq, Op::boreq, Op::bxoreq
     };
 
-    const Loc start = c.get_loc();
-    unique_ptr<Construct> lside;
     unique_ptr<Expr14> ret;
     bool in_idlist = false;
     Op op;
-
-    if (fl & pFlags::pInDecl) {
-
-        if (!pAcceptId(c, lside, false /* resolve_const */)) {
-
-           /*
-            * If the current statement is a declaration, require
-            * strictly an identifier instead of a generic expression.
-            */
-
-            throw SyntaxErrorEx(
-                c.get_loc(),
-                "Expected identifier, got",
-                &c.get_tok()
-            );
-        }
-
-        /*
-         * lside is just an identifier, so it's fine to evaluate it even if
-         * we're not sure it's const: at most, it will evaluate to
-         * UndefinedId.
-         */
-
-        declExprCheckId(c, lside.get());
-
-    } else {
-
-        if (pAcceptFuncDecl(c, lside, fl & ~pFlags::pInStmt))
-            return lside;
-
-
-        lside = pExpr13(c, fl & ~pFlags::pInStmt);
-    }
-
-    if (!lside)
-        return nullptr;
 
     if (fl & pFlags::pInStmt) {
 
@@ -2546,6 +2583,9 @@ pExpr14_body(ParseContext &c, unsigned fl)
 
             if (lside->is_const && !c.folding())
                 nc_eval_const(c, lside.get(), false, false);
+            else if (lside->is_const && pDefersFolds(c, fl)
+                     && pHoldsDeferred(lside.get()))
+                pDeferFold(c, lside.get(), false, false);     /* #96 */
             else if (lside->is_const)
                 MakeConstructFromConstVal(lside->eval(c.const_ctx), lside);
 
@@ -2681,7 +2721,9 @@ pExpr14_body(ParseContext &c, unsigned fl)
     {
         unique_ptr<Construct> cc;
 
-        if (cse_materialize(
+        if (pDefersFolds(c, fl) && pHoldsDeferred(ret->rvalue.get())) {
+            pDeferFold(c, ret->rvalue.get(), true, false);    /* #96 */
+        } else if (cse_materialize(
                 c,
                 ret->rvalue.get(),
                 cc,
@@ -2801,6 +2843,51 @@ pExpr14_body(ParseContext &c, unsigned fl)
     return ret;
 }
 
+static unique_ptr<Construct>
+pExpr14_body(ParseContext &c, unsigned fl)
+{
+    const Loc start = c.get_loc();
+    unique_ptr<Construct> lside;
+
+    if (fl & pFlags::pInDecl) {
+
+        if (!pAcceptId(c, lside, false /* resolve_const */)) {
+
+           /*
+            * If the current statement is a declaration, require
+            * strictly an identifier instead of a generic expression.
+            */
+
+            throw SyntaxErrorEx(
+                c.get_loc(),
+                "Expected identifier, got",
+                &c.get_tok()
+            );
+        }
+
+        /*
+         * lside is just an identifier, so it's fine to evaluate it even if
+         * we're not sure it's const: at most, it will evaluate to
+         * UndefinedId.
+         */
+
+        declExprCheckId(c, lside.get());
+
+    } else {
+
+        if (pAcceptFuncDecl(c, lside, fl & ~pFlags::pInStmt))
+            return lside;
+
+
+        lside = pExpr13(c, fl & ~pFlags::pInStmt);
+    }
+
+    if (!lside)
+        return nullptr;
+
+    return pExpr14_tail(c, fl, start, std::move(lside));
+}
+
 /*
  * An expression ends here: a const subscript that named no element (a
  * missing key, an index out of range - ParseContext::pending_fold) and
@@ -2828,7 +2915,9 @@ pExprTop(ParseContext &c, unsigned fl)
     unique_ptr<Construct> e = pExpr14(c, fl);
 
     if (e && e->is_const && !e->is_nop()) {
-        if (c.folding())
+        if (pDefersFolds(c, fl) && pHoldsDeferred(e.get()))
+            pDeferFold(c, e.get(), false, false);          /* #96 */
+        else if (c.folding())
             MakeConstructFromConstVal(e->eval(c.const_ctx), e);
         else
             nc_eval_const(c, e.get(), false, false);

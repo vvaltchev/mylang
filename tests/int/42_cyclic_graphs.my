@@ -267,11 +267,23 @@ var dyn t1 = TY[1];
 yes("struct types compare by identity", t0 == t0 && t0 != t1 &&
     !(t0 == t1) && !(t0 != t0) && t0 != 5 && !(t0 == "Q"));
 
-# 8. a value folded at compile time and bound to a `dyn` variable is a
-#    GENERAL array from the start (README: declaring `dyn` builds a
-#    polymorphic array), whatever flat storage the folded value had -
-#    strings, POD structs, bools, floats - so a write of another type
-#    just works
+# 8. a value folded at compile time and bound to a `dyn` variable: a
+#    written literal or a BUILTIN call's value is a GENERAL array from
+#    the start (README: declaring `dyn` builds a polymorphic array),
+#    whatever flat storage the folded value had, so a write of another
+#    type just works. A USER function's call keeps the storage its
+#    function built, folded or not, as at run time (#96): a string array
+#    converts itself, the type-driven flat ones refuse the write
+var dyn ls = split("a b c", " ");
+var dyn lb = [1 > 0, 1 > 1];
+var dyn lf = [1 * 1.5, 2.5];
+want("folded dyn storage", [array_storage(lb), array_storage(lf)],
+     ["general", "general"]);
+ls[0] = 5;
+lb[1] = none;
+lf[0] = "f";
+want("folded dyn writes", [ls, lb, lf],
+     [[5, "b", "c"], [true, none], ["f", 2.5]]);
 pure func mk_s(str t) => split(t, " ");
 pure func mk_p(n) => [Q(n), Q(n + 1)];
 pure func mk_b(n) => [n > 0, n > 1];
@@ -280,15 +292,16 @@ var dyn vs = mk_s("a b c");
 var dyn vp = mk_p(1);
 var dyn vb = mk_b(1);
 var dyn vf = mk_f(1);
-want("folded dyn storage", [array_storage(vs), array_storage(vp),
-                            array_storage(vb), array_storage(vf)],
-     ["general", "general", "general", "general"]);
+want("folded call storage", [array_storage(vs), array_storage(vp),
+                             array_storage(vb), array_storage(vf)],
+     ["str", "struct", "bool", "float"]);
 vs[0] = 5;
-vp[0] = "p";
-vb[1] = none;
-vf[0] = "f";
-want("folded dyn writes", [vs, vp, vb, vf],
-     [[5, "b", "c"], ["p", Q(2)], [true, none], ["f", 2.5]]);
+var refused = 0;
+try { vp[0] = "p"; } catch (TypeErrorEx) { refused += 1; }
+try { vb[1] = none; } catch (TypeErrorEx) { refused += 1; }
+try { vf[0] = "f"; } catch (TypeErrorEx) { refused += 1; }
+want("folded call writes", [vs, vp, vb, vf, refused],
+     [[5, "b", "c"], [Q(1), Q(2)], [true, false], [1.5, 2.5], 3]);
 
 print(str(bad) + " failure(s)");
 
