@@ -43,8 +43,10 @@ AFTER the match, which is exactly why this works:
 
   1. the winning clause BINDS it (`catch (T as e)`, `bind_slot >= 0`) -
      the catch variable needs a value;
-  2. the site's `has_rethrow` is set - the exception must be PARKED in
-     the region's pend slot for a later `rethrow`;
+  2. the exception must be PARKED in the region's pend slot - for a
+     later `rethrow`, and since question 12 (2026-10-27) for the chain of
+     any exception leaving the catch body, so every caught exception is
+     parked now (this point no longer saves anything);
   3. NO clause matched in this frame - it walks out, and the walk
      captures backtrace frames into it.
 

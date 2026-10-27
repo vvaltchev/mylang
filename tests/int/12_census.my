@@ -47,3 +47,24 @@ for (var i = 0; i < 5; i++) {
 }
 assert(caught == 10);
 assert(int_live("exc") == e0);
+
+# question 12: the VM parks a caught exception while its catch body runs
+# (for a rethrow and for the chain) - and frees it when the body ends, by
+# any exit, exactly when the tree-walker frees its copy
+struct Other { int n; }
+func escapes(int i) {
+    try { thrower(i); } catch (Boom) { throw Other(i); }
+}
+var got = 0;
+for (var i = 0; i < 5; i++) {
+    try { escapes(runtime(i)); } catch (Other as o) { got += o.n; }
+    try { try { thrower(i); } catch (Boom) { rethrow; } }
+    catch (Boom) { got += 1; }
+    try { try { thrower(i); } finally { throw Other(i); } }
+    catch (Other) { got += 1; }
+}
+for (var j = 0; j < 3; j++) {
+    try { thrower(runtime(j)); } catch (Boom) { if (j == 1) break; }
+}
+assert(got == 20);
+assert(int_live("exc") == e0);

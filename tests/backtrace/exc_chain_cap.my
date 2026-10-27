@@ -1,0 +1,18 @@
+# question 12: a recursion through catch bodies keeps the 16 most recent
+# earlier exceptions; a rethrow - even a second one, after a try in the
+# same catch body caught the first - raises the caught exception itself
+struct A { int v; }
+struct B { int v; }
+func f(int n) {
+    if (n == 0) {
+        try { throw B(0); }
+        catch (B) {
+            try { rethrow; } catch (B) { }
+            rethrow;
+        }
+    }
+    try { throw A(n); }
+    catch (A as a) { f(a.v - 1); }
+    return n;
+}
+print(f(runtime(20)));

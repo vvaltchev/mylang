@@ -15,6 +15,10 @@ language specification.
 
 ## Exception chaining (Python's `__context__`)
 
+**DONE 2026-10-27 (implicit, question 12 of
+`plans/open-language-questions.md`).** Kept below as the record of the
+request; script access to the chain is the part still open.
+
 **Maintainer-CONFIRMED (2026-07-09)** that his "nested exceptions" ask
 meant CHAINING, not nested `try` blocks — so this is a requested
 feature that was scoped and then deliberately deferred, not an idea.

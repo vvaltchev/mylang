@@ -1,0 +1,18 @@
+# question 12: an exception raised in a catch body - by a callee the
+# inliners may paste there - remembers the one being handled
+struct ParseErr { int at; }
+struct LogErr { int code; }
+func parse(int x) { if (x > 2) throw ParseErr(x); return x; }
+func log_it(int c) { throw LogErr(c * 10); }
+func step(int x) {
+    try { return parse(x); }
+    catch (ParseErr as e) { log_it(e.at); }
+    return 0;
+}
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++)
+        s = s + step(runtime(i));
+    return s;
+}
+print(drive(runtime(5)));

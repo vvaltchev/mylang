@@ -441,3 +441,19 @@ prerequisites.
 Decision (maintainer, 2026-10-26): **implicit**, like Python: no new
 syntax, the new exception remembers the one being handled.
 
+Done 2026-10-27, in every engine: an exception leaving a catch body, or a
+`finally` that runs while another propagates, remembers that one, and the
+uncaught report prints the earlier ones first with Python's separator
+(README, *An exception raised while handling another*). Choices made on
+the way: an earlier exception prints its header and caret but no
+backtrace (a caught exception's frames stop where it was caught, so a
+backtrace ending in `main()` would mislead); at most 16 are kept, with a
+note when there were more (a recursion through catch bodies would
+otherwise print every level, and walk the chain at every escape); a
+`throw e` of the caught value is the same exception, like `rethrow`.
+Script access to the chain is NOT done: `catch (T as e)` binds the
+struct, which has no place for it - a separate question if wanted. The VM
+part fixed a crash on the way: a second `rethrow` in a catch body, after
+an inner `try` caught the first, aborted the VM (the first had MOVED the
+exception out of its slot).
+

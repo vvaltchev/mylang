@@ -3299,8 +3299,14 @@ static EvalValue vm_catch_bind_val(RuntimeException *ex)
         ? static_cast<ExceptionObject *>(ex) : nullptr;
     if (eo && eo->get_data().is<intrusive_ptr<StructObject>>())
         return eo->get_data();
-    return EvalValue(make_intrusive<ExceptionObject>(
-        eo ? *eo : ExceptionObject(ex->name)));
+    /* a FRESH object, the caught exception's value: no caret, frames or
+     * chain of its raise (do_catch's twin says why); the serial says it
+     * IS the caught exception */
+    auto xo = make_intrusive<ExceptionObject>(
+        eo ? std::string(eo->get_name()) : std::string(ex->name),
+        eo ? eo->get_data() : EvalValue());
+    xo->serial = ex->serial;
+    return EvalValue(std::move(xo));
 }
 
 /* P8 Inc 1: build (WITHOUT C++-throwing) the RuntimeException a native `Throw`
@@ -3373,11 +3379,10 @@ static ML_ALWAYS_INLINE bool vm_catch_match(const Chunk &chunk,
  * un-deletable "matcher pc" disappears with them, which is what frees a
  * try/catch run to delete its interpreted originals.
  *
- * Three exits per handler:
+ * Three exits per handler (a CHAIN MARKER region, question 12, first
+ * hands its handled exception to the in-flight one as its context):
  *   - a clause MATCHES: bind + jump to its body. The exception is PARKED in
- *     the region's slot ONLY when the site's catch/finally bodies contain a
- *     `rethrow` (the static has_rethrow flag) - the overwhelmingly common
- *     site never rethrows and skips the move entirely.
+ *     the region's slot, for a `rethrow` and for the chain.
  *   - NO clause matches but the try has a FINALLY: park + pend=reraise and
  *     jump to it; its EndFinally re-raises (that is what the SetPend+Jump
  *     tail of the old chain did).
@@ -3405,6 +3410,25 @@ extern unsigned long g_vm_table_dispatch;
  * text rule), and splitting a cold tail out of it +2.7M (a second call and
  * its argument marshalling, for a frame it barely shrinks).
  */
+/*
+ * Question 12: `ex` is leaving the body of a CHAIN MARKER region (see
+ * Chunk::HandlerSite::chain) - remember the exception that body handled,
+ * then free it: the body that handled it is over (a catch body), or the
+ * new exception supersedes it (a finally), exactly when the tree-walker
+ * frees its copy. Out of line: only a marker pays for it.
+ */
+static ML_NOINLINE void vm_note_context(VmActivation &act,
+                                        const VmCallRec &cur,
+                                        const Chunk::HandlerSite &site,
+                                        RuntimeException &ex)
+{
+    VmPendState &ps = act.pend_at(cur, site.chain);
+    if (ps.exc) {
+        exc_note_context(ex, *ps.exc);
+        ps.exc.reset();
+    }
+}
+
 static ML_ALWAYS_INLINE bool vm_dispatch_exc_body(
         VmActivation &act, const VmCallRec &cur, EvalContext &ctx,
         size_t &pc, std::unique_ptr<RuntimeException> &ex)
@@ -3423,6 +3447,9 @@ static ML_ALWAYS_INLINE bool vm_dispatch_exc_body(
         ML_VM_CHECK(ck && h.region < ck->handler_sites.size());
         const Chunk::HandlerSite &site = ck->handler_sites[h.region];
 
+        if (site.chain >= 0)
+            vm_note_context(act, cur, site, *ex);
+
         for (const Chunk::HandlerClause &cl : site.clauses) {
 
             if (!vm_catch_match(*ck, cl.types_idx, ex.get()))
@@ -3432,14 +3459,15 @@ static ML_ALWAYS_INLINE bool vm_dispatch_exc_body(
                 ctx.frame->at(cl.bind_slot).put(vm_catch_bind_val(ex.get()));
 
             /*
-             * Park the exception for a `rethrow` ONLY when this try's catch
-             * bodies actually contain one (codegen's has_rethrow): the park
-             * is an owning move + a later release, and the overwhelmingly
-             * common catch does not rethrow.
+             * Park the exception for as long as its catch body runs: a
+             * `rethrow` there raises a copy of it, and an exception
+             * leaving the body remembers it (question 12 - the body's
+             * guard region chains here). The body's exits free it (a
+             * flagged SetPend), and so does an exception leaving it
+             * (vm_note_context) - when the tree-walker frees its copy.
              */
-            if (site.has_rethrow)
-                act.pend_at(cur, static_cast<int_type>(h.region)).exc =
-                    std::move(ex);
+            act.pend_at(cur, static_cast<int_type>(h.region)).exc =
+                std::move(ex);
 
 #ifdef TESTS
             g_vm_table_dispatch++;
@@ -7988,9 +8016,9 @@ extern "C" int jit_end_finally(int_type region, int_type pc,
  * loc_at(pc) / inline_frame_at(pc), which a DELETED run's collapsed pcs
  * cannot resolve (every op of the run shares the head EnterNative's pc).
  *
- * The slot is guaranteed non-empty by construction: a region whose catch
- * bodies contain a `rethrow` has has_rethrow set, which is precisely when
- * the dispatch PARKS the exception there.
+ * The slot is guaranteed non-empty by construction: the dispatch PARKS
+ * every caught exception there, and a rethrow raises a COPY, leaving it
+ * parked for a second rethrow and for the chain (question 12).
  */
 extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
                            int_type inline_chain,
@@ -8006,10 +8034,11 @@ extern "C" int jit_rethrow(int_type region, int_type pc, const void *lep,
     g_jit_rethrow_native++;
 #endif
     ML_VM_CHECK(ml_untrusted_bytecode() || ps.exc != nullptr);
-    std::unique_ptr<RuntimeException> ex = std::move(ps.exc);
+    std::unique_ptr<RuntimeException> ex(ps.exc ? ps.exc->clone() : nullptr);
     if (!ex) {
-        /* unreachable by the has_rethrow invariant for our own bytecode;
-         * a mutated image reaches it (fat-1150) - be LOUD, not silent */
+        /* unreachable for our own bytecode (the dispatch parks every
+         * caught exception); a mutated image reaches it (fat-1150) - be
+         * LOUD, not silent */
         try {
             throw InternalErrorEx();
         } catch (...) {
@@ -11734,6 +11763,16 @@ extern "C" void jit_push_handler_grow(int_type region) noexcept
     g_vm_act->handlers.push_back({ static_cast<uint32_t>(region) });
 }
 
+/* A flagged SetPend's drop (question 12): a catch body is done, so the
+ * exception the dispatch parked for it goes - the interpreted op's
+ * `ps.exc.reset()`. Handed the {exc, pend} slot the inline store just
+ * addressed, so it does not recompute it. Never throws: an exception's
+ * destructor does not. */
+extern "C" void jit_drop_caught(void *pend_state) noexcept
+{
+    static_cast<VmPendState *>(pend_state)->exc.reset();
+}
+
 ptrdiff_t jit_off_desc_vm_chunk()
 {
     FuncDescriptor fd;
@@ -14461,11 +14500,14 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 ML_VM_CHECK(ml_untrusted_bytecode() || ps.exc != nullptr);
                 if (!ps.exc)
                     ps.exc = std::make_unique<InternalErrorEx>();
+                /* a COPY: the caught exception stays parked for a second
+                 * rethrow and for the chain (question 12) */
+                std::unique_ptr<RuntimeException> ex(ps.exc->clone());
                 Loc ls, le;
                 chunk->loc_at(pc, ls, le);
-                ps.exc->loc_start = ls;
-                ps.exc->loc_end = le;
-                if (!vm_raise(chunk, pc, act, ctx, std::move(ps.exc)))
+                ex->loc_start = ls;
+                ex->loc_end = le;
+                if (!vm_raise(chunk, pc, act, ctx, std::move(ex)))
                     return;             /* boundary: signal set */
             }
             code = chunk->code.data();
@@ -14476,8 +14518,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * (Inc 2b) - in the try's per-REGION slot (a = region id, #78).
              * Flow ops inline their finally, so ret/brk/cont never reach the
              * shared finally. */
-            act.pend_at(cur_rec(), in->a_lit()).pend =
-                static_cast<Pend>(in->target);
+            {
+                VmPendState &ps = act.pend_at(cur_rec(), in->a_lit());
+                ps.pend = static_cast<Pend>(in->target);
+                if (in->target2 == 1)          /* a catch body's exit */
+                    ps.exc.reset();
+            }
             pc++;
             VM_NEXT;
 

@@ -1,0 +1,22 @@
+# question 12: a finally that throws while another exception propagates,
+# inside a catch body, across inlined frames: C, then B, then A
+struct A { int v; }
+struct B { int v; }
+struct C { int v; }
+func inner(int x) {
+    try { if (x > 1) throw B(x); return x; }
+    finally { if (x > 1) throw C(x + 100); }
+    return 0;
+}
+func outer(int x) {
+    try { if (x > 1) throw A(x); return inner(x); }
+    catch (A as a) { return inner(a.v); }
+    return -1;
+}
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++)
+        s = s + outer(runtime(i));
+    return s;
+}
+print(drive(runtime(3)));

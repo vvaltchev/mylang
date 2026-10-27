@@ -51,6 +51,7 @@ as well.
       - [Custom exceptions](#custom-exceptions)
       - [Re-throwing an exception](#re-throwing-an-exception)
       - [The finally clause](#the-finally-clause)
+      - [An exception raised while handling another](#an-exception-raised-while-handling-another)
   * [Builtins](#builtins)
     * [Const builtins](#const-builtins)
       - [General builtins](#general-builtins)
@@ -3107,6 +3108,72 @@ too). In the last case the exception goes on after the `finally` has run.
 
 It's worth noting that `try-finally` constructs (without any `catch` clause) are
 allowed as well.
+
+### An exception raised while handling another
+
+An exception raised while another one is being *handled* remembers that
+one, as in Python (its implicit `__context__`). An exception is being
+handled while a `catch` block that caught it runs - including any function
+called from there - and while a `finally` block runs because the exception
+is passing through it. When the new exception is never caught, the report
+prints the earlier one first, then the new one:
+
+```C#
+struct ParseError { str text; }
+struct LogError { str why; }
+
+func log_failure(str what) {
+    throw LogError("the log is read-only");
+}
+
+try {
+    throw ParseError("x = ");
+} catch (ParseError as e) {
+    log_failure(e.text);
+}
+```
+
+```
+Exception 'ParseError', data: ParseError(text: "x = ") at prog.my, line 9, col 5:28
+
+        throw ParseError("x = ");
+        ^^^^^^^^^^^^^^^^^^^^^^^
+
+During handling of the above exception, another exception occurred:
+
+Uncaught exception 'LogError', data: LogError(why: "the log is read-only") at prog.my, line 5, col 5:42
+
+        throw LogError("the log is read-only");
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Backtrace (most recent call first):
+  [0] log_failure(what) at line 5
+  [1] main()            at line 11
+```
+
+The rules:
+
+  * An earlier exception prints its header and caret, not a backtrace: only
+    the uncaught one has a backtrace.
+  * The chain can be longer: an exception raised while handling one that
+    was itself raised while handling another prints all three, oldest
+    first. At most the 16 most recent earlier exceptions are kept, and the
+    report says `(older exceptions are not shown)` when there were more.
+  * `rethrow`, and `throw e` of the value a `catch (T as e)` bound, raise
+    the exception being handled itself, so it does not remember itself.
+    It keeps whatever it remembered already.
+  * A `finally` block reached without an exception passing through handles
+    nothing, and neither does the code after a `catch` block, however the
+    block was left (at its end, or by `break`, `continue` or `return`).
+  * A `rethrow` raises the exception the `catch` caught even after an
+    earlier `rethrow` in the same block was caught by a `try` inside it.
+  * The chain belongs to the exception while it is raised, not to the
+    value a `catch (T as e)` binds: a value kept in a variable and thrown
+    again later, outside its `catch` block, starts with no chain - and,
+    like any `throw`, with the caret and backtrace of where it is thrown
+    then.
+
+The chain is part of the report only: a script cannot read it.
 
 ## Builtins
 

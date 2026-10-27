@@ -1868,8 +1868,17 @@ struct Chunk {
         int32_t fin_pc = -1;      /* the shared finally (Lfin), or -1 when
                                    * the try has none: then a no-match
                                    * RE-RAISES to the next handler out */
-        bool has_rethrow = false; /* any catch body may `rethrow` - only then
-                                   * must the dispatch PARK the exception */
+        /*
+         * Question 12, a CHAIN MARKER: the region whose parked exception an
+         * exception leaving this region's body remembers (its context), or
+         * -1. A try's catch bodies run under a guard region chaining to the
+         * try (the dispatch parks every caught exception there), and each
+         * RERAISE copy of a finally - the one the dispatch enters, never a
+         * normal exit - under a marker chaining to the region that parked
+         * the propagating exception. The dispatch reads it as it pops the
+         * region (vm_dispatch_exc_body).
+         */
+        int32_t chain = -1;
     };
     std::vector<HandlerSite> handler_sites;   /* indexed by region id */
 

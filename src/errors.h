@@ -5,6 +5,7 @@
 #include "poolalloc.h"
 #include "uniqueid.h"
 
+#include <memory>
 #include <new>
 #include <string>
 #include <string_view>
@@ -230,6 +231,19 @@ struct Exception {
     virtual bool is_catchable() const { return false; }
 };
 
+/* The identity a RuntimeException keeps across its clones (see `serial`) */
+inline uint64_t exc_next_serial()
+{
+    static uint64_t n = 0;
+    return ++n;
+}
+
+/* How many earlier exceptions one exception's chain keeps (question 12):
+ * exc_note_context attaches no more, and format_exception prints no more,
+ * so neither walks an unbounded chain - a recursion through catch bodies
+ * would otherwise make every escape cost its depth and print every level. */
+constexpr int EXC_CONTEXT_MAX = 16;
+
 struct RuntimeException : public Exception {
 
     /*
@@ -281,7 +295,48 @@ struct RuntimeException : public Exception {
      * name comparison, so it also defeats the parenless catch-all.
      */
     bool is_catchable() const override { return true; }
+
+    /*
+     * IMPLICIT CHAINING (question 12, Python's __context__): the exception
+     * that was being HANDLED when this one left the body handling it - a
+     * catch body, or a finally that runs while an exception propagates.
+     * exc_note_context sets it as the exception leaves each such body, the
+     * innermost first, so an outer one goes to the chain's TAIL; the
+     * uncaught report prints the chain oldest first (format_exception). A
+     * node is a CLONE taken when it was attached, its backtrace dropped:
+     * only its header and caret are printed. Clones of this exception share
+     * the chain.
+     */
+    std::shared_ptr<RuntimeException> context;
+
+    /* Assigned at construction and copied by clone(), so a `rethrow` of the
+     * handled exception is recognised as that exception, not a new one. */
+    uint64_t serial = exc_next_serial();
+
+    /* exc_note_context left older exceptions out (EXC_CONTEXT_MAX) */
+    bool context_cut = false;
+
+    ~RuntimeException() override
+    {
+        /* free a long chain one link at a time, not one nested destructor
+         * per link (a deep recursion through catch bodies builds one) */
+        while (context && context.use_count() == 1) {
+            std::shared_ptr<RuntimeException> next =
+                std::move(context->context);
+            context = std::move(next);
+        }
+    }
 };
+
+/*
+ * Record that `e` left a body handling `handled` (question 12): `e` is
+ * leaving a catch body that caught `handled`, or a finally that runs while
+ * `handled` propagates. Attaches a clone of `handled` at the tail of e's
+ * chain - unless `e` IS `handled` (a rethrow, or a `throw` of the caught
+ * value), which keeps the context `handled` had, or the chain already holds
+ * it or is full. Shared by every engine (eval.cpp).
+ */
+void exc_note_context(RuntimeException &e, const RuntimeException &handled);
 
 /*
  * A RUNTIME exception a script may NEVER handle.
