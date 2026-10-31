@@ -891,6 +891,37 @@ else
     fail "-nti: rc=$got_rc tw=[$a] vm=[$b]"
 fi
 
+# -nti: `n++` on a variable declared with a type (`int n`, a typed
+# parameter, a typed global) had no lowering - the statement form took
+# only an untyped variable and the typed one waits for a numeric proof,
+# which -nti never makes - so the VM refused the program (NotLoweredEx)
+# while the tree-walker ran it. A misfit is the same TypeErrorEx.
+cat > "$TMP/nti_incdec.my" <<'NTIEOF'
+int g = 1;
+func h() { g++; }
+func w(int n) { while (n < 4) n++; return n; }
+int n = 1;
+float f = 1;
+var y = n++;
+f++;
+h();
+print(y, n, ++n, n--, f, g, w(runtime(1)));
+str s = "a";
+s++;
+NTIEOF
+a=$("$BIN" -tw -nti "$TMP/nti_incdec.my" 2>&1)
+b=$("$BIN" -nti "$TMP/nti_incdec.my" 2>&1)
+got_rc=$?
+case "$a" in
+    "1 2 3 3 2.000000 2 4 "*"TypeErrorEx"*) ok=1 ;;
+    *) ok=0 ;;
+esac
+if [ "$got_rc" = 1 ] && [ "$ok" = 1 ] && [ "$a" = "$b" ]; then
+    pass "-nti: inc-dec of a typed variable runs, both engines agree"
+else
+    fail "-nti inc-dec: rc=$got_rc tw=[$a] vm=[$b]"
+fi
+
 # ---------------------------------------------------------------------
 # An optional member `a?.f` is not an assignable location (2026-10-05):
 # the PARSER refuses it as the target of `=`, `+=` and `++` / `--`, so it
