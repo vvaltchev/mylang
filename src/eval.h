@@ -119,6 +119,20 @@ inline int_type general_elem_int(const LValue &e)
     return e.getval<int_type>();
 }
 
+/* Its FLOAT twin: a typed float expression reads an int or bool operand
+ * as a float, so an element of a general array<int> or array<bool> is
+ * widened here (a bool to 0.0/1.0). The tree-walker's float chain asked a
+ * general bool element for a float and raised TypeErrorEx until
+ * 2026-11-07, where the VM read it as an int and widened the result. */
+inline float_type general_elem_float(const LValue &e)
+{
+    if (e.is<int_type>())
+        return static_cast<float_type>(e.getval<int_type>());
+    if (e.is<bool>())
+        return e.getval<bool>() ? 1.0 : 0.0;
+    return e.getval<float_type>();
+}
+
 /* Node-POOLED (poolalloc.h) like the dict map: a recursion's per-frame
  * cache inserts a node per novel call - the pool serves + reuses them. */
 /* -npc: the per-frame pure-call cache is OFF.  Declared HERE, above
