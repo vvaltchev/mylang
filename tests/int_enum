@@ -90,8 +90,10 @@ def jobs_count():
 
 def run(binary, args, env, timeout):
     try:
+        # surrogateescape: a program's output is bytes (8-bit strings)
         p = subprocess.run([binary] + args, capture_output=True, text=True,
-                           env=env, timeout=timeout)
+                           errors="surrogateescape", env=env,
+                           timeout=timeout)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return "timeout", "", ""
