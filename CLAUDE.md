@@ -4573,8 +4573,17 @@ decisions behind it: `plans/archived/type-inference.md`,
   function; (2) *fixpoint* — **Jacobi** iteration: each round recomputes every
   symbol/return type into `acc` (the `join` of all contributions) while reading
   the previous round's stable `type`, then commits; reading stable values makes
-  rounds order-independent, and since kinds only climb the lattice a `join`
-  conflict (e.g. `int` vs `str`) is a real, stable error raised immediately;
+  rounds order-independent. **⛔ A CONFLICT IN A ROUND IS NOT YET AN ERROR
+  (2026-11-07):** a `join` conflict, or a contribution that does not fit a
+  declared or REPL-committed type, is RECORDED (`Inferencer::conflict`) and
+  raised only if it is still there in the converged round. This said "kinds
+  only climb the lattice, so a conflict is stable, raised immediately" -
+  false, because a type can climb to `dyn`, where the conflict disappears
+  (a dyn value coerces into a numeric local, a dyn element fits any
+  `array<T>`): `func big(dyn v) { if (v < 9) return v * 2; return "s"; }`
+  returns `str` after round 1, since `v * 2` waits for `v`, and `dyn` after
+  round 2, so `var k = 5; k = big(x);` was refused naming `str`. A new
+  error a fixpoint contribution can raise goes through `conflict` too;
   (3) *check* — with final types, validate every operator, call, assignment, and
   return, throwing on a violation.
 - **Inference rules of note** (the non-obvious ones): a never-(concretely-)

@@ -49,9 +49,10 @@ int g_value_cands_max = [] {
  *                    return type into `acc` (join of all contributions) while
  *                    reading the previous round's stable `type`; commit acc->
  *                    type; repeat until stable. Reading stable values keeps the
- *                    round order-independent; kinds only climb the lattice,
- *                    so a join conflict (e.g. int vs str) is a real, stable
- *                    error and is raised immediately.
+ *                    round order-independent. A join conflict (e.g. int vs
+ *                    str) is an error only if it is still there once the
+ *                    fixpoint has converged: a type can climb to `dyn`,
+ *                    where the conflict disappears (Inferencer::conflict).
  *   3. check       - with final types, validate every operation/call/assign/
  *                    return and throw on a violation.
  */
@@ -624,6 +625,25 @@ private:
     [[noreturn]] void nullability(const std::string &m, Loc s, Loc e);
     [[noreturn]] void argcount(const std::string &m, Loc s, Loc e);
 
+    /*
+     * A CONTRIBUTION THAT CONFLICTS DURING THE FIXPOINT IS AN ERROR ONLY IF
+     * IT STILL CONFLICTS ONCE THE FIXPOINT HAS CONVERGED. A round reads the
+     * previous round's types, and a type can still climb - to `dyn` above
+     * all - and a conflict with a concrete kind disappears at `dyn` (a dyn
+     * value coerces into a numeric local, a dyn element fits any array<T>).
+     * `func big(dyn v) { if (v < 9) return v * 2; return "s"; }` returns
+     * `str` after round 1 (`v * 2` waits for v) and `dyn` after round 2, so
+     * `var k = 5; k = big(x);` was refused, naming a type `big(x)` never
+     * has, until 2026-11-07. During run_fixpoint contribute() records each
+     * conflict here and leaves the symbol's accumulator as it was; the
+     * converged round's first conflict is the error (its contributions are
+     * computed from the final types, so it is a stable one).
+     */
+    bool in_fixpoint = false;
+    struct Conflict { std::string msg; Loc s, e; };
+    std::vector<Conflict> round_conflicts;
+    void conflict(const std::string &m, Loc s, Loc e);
+
     /* Compile-time type queries `decltype(var)` / `typestr(expr)` /
      * `kindstr(expr)`: if the call is one, fold its (unevaluated) arg to a
      * LiteralStr of the static type (structural for decltype/typestr, the bare
@@ -1041,8 +1061,14 @@ void Inferencer::mark_lambda_templates()
 /* The Jacobi fixpoint, extracted so the instantiation loop can re-run it. */
 void Inferencer::run_fixpoint(Block *rootBlock)
 {
+    struct InFixpoint {
+        bool &f;
+        explicit InFixpoint(bool &b) : f(b) { f = true; }
+        ~InFixpoint() { f = false; }
+    } in_fp(in_fixpoint);
     for (int iter = 0; iter < 1000; iter++) {
         reset_round();
+        round_conflicts.clear();
         cur_func = nullptr;
         for (auto &e : rootBlock->elems)
             accumulate(e.get());
@@ -1065,6 +1091,12 @@ void Inferencer::run_fixpoint(Block *rootBlock)
         commit_round();          /* sets `changed` if any type moved */
         if (!changed)
             break;
+    }
+    /* the converged round's conflicts are real (see `conflict`) */
+    if (!round_conflicts.empty()) {
+        const Conflict c = round_conflicts.front();
+        round_conflicts.clear();
+        mismatch(c.msg, c.s, c.e);
     }
 }
 
@@ -5881,7 +5913,7 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
             StaticTypeRef pt = static_type_resolve(s->type);
             if (!has_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
                 pt))
-                mismatch("'" + std::string(s->name->val) + "' " +
+                conflict("'" + std::string(s->name->val) + "' " +
                              (s->ann != DeclType::none ? "is declared '"
                                                        : "has type '") +
                              static_type_to_string(pt) + "' but is assigned '" +
@@ -5907,7 +5939,7 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
             StaticTypeRef rt = static_type_resolve(t);
             if (!has_unknown(rt) && !is_none(rt) && !static_type_assignable(rt,
                 d))
-                mismatch("'" + std::string(s->name->val) +
+                conflict("'" + std::string(s->name->val) +
                              "' is declared '" + static_type_to_string(d) +
                              "' but is assigned '" + static_type_to_string(t)
                                  + "'",
@@ -5935,11 +5967,13 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
     }
 
     StaticTypeRef nw = A.join(s->acc, t);
-    if (!nw)
-        mismatch("'" + std::string(s->name->val) + "' has type '" +
+    if (!nw) {
+        conflict("'" + std::string(s->name->val) + "' has type '" +
                      static_type_to_string(s->acc) + "' but is assigned '" +
                      static_type_to_string(t) + "'",
                  loc, loc_end);
+        return;              /* the accumulator keeps what it had */
+    }
     s->acc = nw;
 }
 
@@ -7051,6 +7085,12 @@ void Inferencer::accumulate_foreach(ForeachStmt *fe)
 void Inferencer::mismatch(const std::string &m, Loc s, Loc e)
 {
     throw TypeMismatchEx(intern_msg(m), s, e ? e : s);
+}
+void Inferencer::conflict(const std::string &m, Loc s, Loc e)
+{
+    if (!in_fixpoint)
+        mismatch(m, s, e);
+    round_conflicts.push_back({ m, s, e });
 }
 void Inferencer::nullability(const std::string &m, Loc s, Loc e)
 {
