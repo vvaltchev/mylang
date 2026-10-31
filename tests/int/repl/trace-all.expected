@@ -1,0 +1,104 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> tracing: arrays autoconst autopure fold infer inline specialize template
+>> infer      func add(a, b)  template (instantiated per call)
+autopure   add  reads only consts/params -> effective pure
+>> infer      func use(x)  template (instantiated per call)
+autopure   use  reads only consts/params -> effective pure
+inline     add(2 arg(s))  body 3 nodes -> splice
+inline     add(2 arg(s))  body 3 nodes -> splice
+>> template   use(int) -> use$0  (instance 1)
+  infer      x  ? -> int
+  infer      func use$0 returns ? -> int
+infer      param x : int  (final)
+infer      func use$0(x: int) -> int  (final)
+fold       use$0(...) -> 25  (const-arg call)
+=> 25
+>>   infer      n  ? -> int
+  infer      func sq returns ? -> int
+infer      param n : int  (final)
+infer      func sq(n: int) -> int  (final)
+>> >> => 16
+>> .. .. .. .. .. .. .. ..   infer      n  ? -> int
+  infer      dbg  ? -> bool
+  infer      s  ? -> int
+  infer      i  ? -> int
+  infer      func loop returns ? -> int
+infer      param n : int  (final)
+infer      var dbg : bool  (final)
+infer      var s : int  (final)
+infer      var i : int  (final)
+infer      func loop(n: int) -> int  (final)
+autoconst  dbg  write-once scalar -> false  (folded at uses)
+>> => 10
+>>   infer      ops  ? -> array<func(dyn,dyn)->dyn>
+infer      var ops : array<func(dyn,dyn)->dyn>  (final)
+infer      param a : dyn  (final)
+infer      param b : dyn  (final)
+arrays     ops  dest array<func(dyn,dyn)->dyn> -> general
+=> [<function>, <function>]
+>>   infer      f  ? -> func(dyn,dyn)->dyn
+infer      var f : func(dyn,dyn)->dyn  (final)
+=> <function>
+>> fold       f(...) -> 7  (const-arg call)
+=> 7
+>> infer      func tmpl(x)  template (instantiated per call)
+autopure   tmpl  reads only consts/params -> effective pure
+>> template   tmpl(int) -> tmpl$0  (instance 1)
+  infer      x  ? -> int
+  infer      func tmpl$0 returns ? -> int
+infer      param x : int  (final)
+infer      func tmpl$0(x: int) -> int  (final)
+fold       tmpl$0(...) -> 2  (const-arg call)
+=> 2
+>> template   tmpl(str) -> tmpl$1  (instance 2)
+  infer      x  ? -> str
+  infer      func tmpl$1 returns ? -> str
+infer      param x : str  (final)
+infer      func tmpl$1(x: str) -> str  (final)
+fold       tmpl$1(...) -> ss  (const-arg call)
+=> "ss"
+>> template   tmpl(float) -> tmpl$2  (instance 3)
+  infer      x  ? -> float
+  infer      func tmpl$2 returns ? -> float
+infer      param x : float  (final)
+infer      func tmpl$2(x: float) -> float  (final)
+fold       tmpl$2(...) -> 5.000000  (const-arg call)
+=> 5.000000
+>>   infer      n  ? -> int
+infer      param n : int  (final)
+infer      func fib(n: int) -> dyn  (final)
+autopure   fib  reads only consts/params -> effective pure
+inline     rec_unroll_depth fib w0=62 branching=2 -> 2 level(s)
+inline     fib(1 arg(s))  block body 20 nodes -> inline (+0 local, +0 arg-temp slot(s))
+inline     fib(1 arg(s))  block body 40 nodes -> inline (+0 local, +0 arg-temp slot(s))
+inline     fib(1 arg(s))  block body 66 nodes -> inline (+0 local, +0 arg-temp slot(s))
+inline     fib(1 arg(s))  block body 92 nodes -> inline (+0 local, +0 arg-temp slot(s))
+inline     fib(1 arg(s))  block body 112 nodes -> inline (+0 local, +0 arg-temp slot(s))
+inline     fib(1 arg(s))  block body 138 nodes -> inline (+0 local, +0 arg-temp slot(s))
+>> inline     rec_unroll_depth fib w0=278 branching=8 -> 0 level(s)
+=> 55
+>> .. .. .. ..   infer      a  ? -> int
+  infer      b  ? -> int
+  infer      t  ? -> int
+  infer      func spec returns ? -> int
+infer      param a : int  (final)
+infer      param b : int  (final)
+infer      var t : int  (final)
+infer      func spec(a: int, b: int) -> int  (final)
+autopure   spec  reads only consts/params -> effective pure
+inline     rec_unroll_depth fib w0=278 branching=8 -> 0 level(s)
+>> inline     rec_unroll_depth fib w0=278 branching=8 -> 0 level(s)
+=> 13
+>>   infer      arr  ? -> array<int>
+infer      var arr : array<int>  (final)
+arrays     arr  dest array<int> -> flat (ints)
+inline     rec_unroll_depth fib w0=278 branching=8 -> 0 level(s)
+=> [1, 2, 3]
+>>   infer      fl  ? -> array<float>
+infer      var fl : array<float>  (final)
+arrays     fl  dest array<float> -> flat (floats)
+inline     rec_unroll_depth fib w0=278 branching=8 -> 0 level(s)
+=> [1.500000, 2.500000]
+>> tracing: off
+>> => 36
+>> 

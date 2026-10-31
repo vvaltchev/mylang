@@ -658,6 +658,12 @@ REGTRACK, the teardown proof and the verifier still run and are still
 measured. A failure arm no correct run may take is the same kind of edge,
 and an always-inline helper's check (`Frame::at`'s bounds) charged one to
 every call site: 8,385 elements left the universe (123,177 -> 114,792).
+**And it emits every `ML_ALWAYS_INLINE` helper once, out of line**
+(defs.h, 2026-11-07): forced inline, each caller had its own copy of the
+helper's branches, so a decision reached through one opcode's handler was
+uncovered in the eighty others (`read_int_slot`'s bool arm alone was 87
+elements) - about 4,600 more left the universe (114,835 -> 110,154,
+uncovered 19,891 -> 17,363 with that day's units).
 `mylang -v` says `coverage 1` and `asserts 0`. `ML_UNTRUSTED_CHECK` stays
 in (a hostile image takes its failure arm), and so does a raw `assert` -
 product code uses ML_CHECK. **`tests/driver_checks` is a unit too**

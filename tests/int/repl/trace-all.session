@@ -1,0 +1,36 @@
+:trace all on
+func add(a, b) => a + b
+func use(x) => add(x, 2) * add(x, 2)
+use(3)
+pure func sq(int n) => n * n
+const K = sq(4)
+K
+func loop(int n) {
+    var dbg = false
+    var s = 0
+    for (var i = 0; i < n; i++) {
+        if (dbg) print(i)
+        s += i
+    }
+    return s
+}
+loop(5)
+var ops = [add, func(a, b) => a - b]
+var f = ops[runtime(0)]
+f(3, 4)
+func tmpl(x) { return x + x; }
+tmpl(1)
+tmpl("s")
+tmpl(2.5)
+func fib(int n) => n < 2 ? n : fib(n - 1) + fib(n - 2)
+fib(10)
+func spec(int a, int b) {
+    var t = a * b
+    if (b > 2) return t + 1
+    return t
+}
+spec(runtime(4), 3)
+var arr = [1, 2, 3]
+var fl = [1.5, 2.5]
+:trace all off
+use(4)
