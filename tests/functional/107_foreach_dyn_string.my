@@ -1,0 +1,69 @@
+# README: a foreach walks an array, a STRING or a dict - a string gives
+# its characters, each a one-character string. The VM's dynamic-container
+# loop (ForeachDynInit, also the JIT's) knew only arrays and dicts, so a
+# `dyn` string - and a typed one whose loop variable is `_`, which takes
+# the same path - raised "Unsupported container type by foreach()" in
+# the default engine and -nj, while the tree-walker walked it (RULE 2).
+
+func chars(dyn d) {
+    var r = "";
+    foreach (c in d)
+        r += str(c) + ".";
+    return r;
+}
+
+func count(dyn d) {
+    var n = 0;
+    foreach (_ in d)
+        n++;
+    return n;
+}
+
+func pos(dyn d) {
+    var r = "";
+    foreach (i, c in indexed d)
+        r += str(i) + str(c);
+    return r;
+}
+
+func idx_only(dyn d) {
+    var s = 0;
+    foreach (i, _ in indexed d)
+        s += i;
+    return s;
+}
+
+var dyn s = runtime("abc");
+print(chars(s), count(s), pos(s), idx_only(s));
+assert(chars(s) == "a.b.c." && count(s) == 3 && pos(s) == "0a1b2c");
+assert(idx_only(s) == 3);
+
+# the empty string runs no iteration
+assert(chars(runtime("")) == "" && count(runtime("")) == 0);
+
+# the same function over an array and a dict still works
+assert(count(runtime([1, 2])) == 2 && count(runtime({"k": 1})) == 1);
+assert(chars(runtime(["x", "y"])) == "x.y.");
+
+# a typed string with `_` takes the dynamic loop too
+var n = 0;
+foreach (_ in "hello")
+    n++;
+assert(n == 5);
+
+# a character is not an array: unpacking one into two variables is the
+# tree-walker's TypeErrorEx
+var bad = "";
+try {
+    foreach (a, b in s)
+        bad += a;
+} catch (TypeErrorEx) {
+    bad = "TypeErrorEx";
+}
+assert(bad == "TypeErrorEx");
+
+# each character is a fresh one-character string
+var parts = [];
+foreach (c in s)
+    append(parts, c + c);
+assert(join(parts, ",") == "aa,bb,cc");

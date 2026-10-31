@@ -2443,7 +2443,11 @@ struct Codegen {
             const int t = alloc_temp();
             CgInstr in;
             in.op = OpCode::UnaryV;
-            in.node_idx = add_ast_node(e);   /* loc for a `-str`/`~str` error */
+            /* loc for a `-str`/`~str` error: the OPERAND, as the
+             * tree-walker's stamp_operand_loc and every binary op mark
+             * the operand whose type lacks the operator (it marked the
+             * whole `~d` until 2026-11-07, RULE 2) */
+            in.node_idx = add_ast_node(operand);
             in.target = t;
             in.set_a(slot_op(oslot));
             in.aop = op;

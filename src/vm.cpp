@@ -1732,6 +1732,7 @@ struct DictIterState {
 struct DynIterState {
     EvalValue container;   /* pins the array OR dict for the loop */
     bool is_dict = false;
+    bool is_str = false;   /* a string: its characters, as do_iter's */
     bool indexed = false;  /* ids[0] is the iteration counter */
     int nvars = 1;         /* TOTAL loop vars (incl. the indexed counter) */
     const std::vector<int32_t> *targets = nullptr;   /* per-var slots */
@@ -1870,6 +1871,7 @@ vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
     st.next_throws = true;
     st.slot0 = st.slot1 = -1;
     st.oob = false;
+    st.is_str = false;
     const std::vector<int32_t> &tg = *targets;
     const size_t tb = st.indexed ? 1 : 0;
     const size_t nv = static_cast<size_t>(st.nvars) - tb;
@@ -1896,6 +1898,19 @@ vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
                 st.next = &vm_dyn_next_arr_gen; break;
             }
         }
+    } else if (st.container.is<SharedStr>()) {
+        /* README: a foreach walks an array, a STRING or a dict - each
+         * character a one-character string, as do_iter's. It raised
+         * "Unsupported container type" here, so a `dyn` string - and a
+         * typed one whose loop var is `_`, which takes this path - ran
+         * only in the tree-walker. A string is immutable: no shift, no
+         * shrink; the generic body walks it. */
+        st.is_dict = false;
+        st.is_str = true;
+        st.idx = 0;
+        st.size = static_cast<size_type>(
+            st.container.get_ref<SharedStr>().size());
+        st.mark = -1;
     } else if (st.container.is<intrusive_ptr<DictObject>>()) {
         st.is_dict = true;
         st.cur.start(*st.container.get_ref<intrusive_ptr<DictObject>>());
@@ -1934,6 +1949,20 @@ vm_foreach_dyn_next_body(DynIterState &st, Frame &frame,
         if (tg[i] >= 0)
             frame.at(tg[i]).put(v);
     };
+    if (st.is_str) {
+        if (st.idx >= st.size)
+            return false;
+        const std::string_view view =
+            st.container.get_ref<SharedStr>().get_view();
+        if (st.indexed)
+            bind(0, EvalValue(static_cast<int_type>(st.idx)));
+        if (nv == 1)
+            bind(tb, EvalValue(SharedStr(std::string(&view[st.idx], 1))));
+        else if (nv >= 2)       /* a character is not an array to unpack */
+            vm_throw_unpack_nonarray(chunk, pc, static_cast<int>(nv));
+        st.idx++;
+        return true;
+    }
     if (!st.is_dict) {
         if (st.idx >= st.size)
             return false;
