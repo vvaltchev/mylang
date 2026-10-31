@@ -18205,3 +18205,31 @@ identity, the walk bound, the chain not stored in an image, the loader's
 chain check, a chain frozen at its head only, a bound value copied, and
 an "Uncaught" header on every chain entry. Every one failed a check;
 the image one fails bt_oracle's `.myv` configuration, the rest -rt.
+
+## A loop preheader after a terminator starts at the body depth (2026-11-07)
+
+**The bug.** A hoist region's PREHEADER (C1 / C2b / C5, and the #97 G1
+guard preheader) is emitted between two ops: after the op before the
+loop head, before the head's own `op_boundary`. `op_boundary` is what
+revives the stack model at the body depth, so when the op before the
+head was a TERMINATOR the preheader was emitted with the model dead -
+and a jump in it recorded the dead model's stale depth (0, from the
+`frag_ret` teardown), which a label inside the preheader then adopted.
+The next op began at depth 0 against a body of 40, and REGTRACK aborted
+the load: `op boundary reached with the native stack NOT at the body
+depth`. Codegen never puts a terminator directly before a loop head (a
+counted loop's entry test sits there), so only an image reached it:
+myv_fuzz fat-291 (Nets, CI seed 42354591781) turned main's entry test
+into a ReturnV with one byte. The `ASSERTS=0` build ran the image
+correctly - the preheader is unreachable, and the head's `op_boundary`
+resets the model before anything reachable is emitted.
+
+**The fix.** The run's emission loop revives a dead model at the body
+depth (`sp_resume_body`) at the top of every pc, before any code it
+emits between ops - the same answer `op_boundary` gives one step later.
+
+**Nets.** `myv_terminator_before_region` (`-rt`) makes the same
+retarget in memory after a load and runs the image; it requires the
+untampered image to enter the hoist region (`g_jit_hoist`), so the
+preheader it checks is emitted. Watched: without the fix it aborts with
+the finding's REGTRACK message (rc 134); restored, it passes.

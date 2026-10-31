@@ -34236,6 +34236,18 @@ retry_emission:
         std::map<size_t, uint64_t> pre_sig;   /* pc -> pre-trans sig */
         std::vector<uint64_t> fix_sigs;       /* per main-loop fixup */
         for (size_t pc = begin; pc < end && emit_ok; pc++) {
+            /* A region's PREHEADER is emitted here, between two ops, so
+             * it starts at the boundary the previous op ended at: the
+             * body depth. After a TERMINATOR (an early ReturnV) the
+             * model is dead and the preheader unreachable - but a jump
+             * in it would record the dead model's stale depth, and a
+             * label inside it adopt that, so the next op began at the
+             * wrong depth (REGTRACK aborted on a mutated image whose
+             * loop entry test had become a ReturnV: myv_fuzz fat-291,
+             * 2026-11-07). op_boundary revives the model too, but only
+             * once the op itself starts. */
+            if (!e.sp_live)
+                e.sp_resume_body();
             if (g_hoist.active && hri > 0
                     && pc == hregs[hri - 1].L + 1) {
                 g_hoist.active = false;
