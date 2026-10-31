@@ -23643,7 +23643,7 @@ static bool lineedit_joiner_keeps_chain_open()
         });
         ed.set_joiner([](const std::string &s, const std::string *n) {
             return n ? ReplEngine::continues_chain(*n)
-                     : ReplEngine::may_continue(s, true);
+                     : ReplEngine::may_continue(s);
         });
     };
     const auto lines = [](LineEditor &ed,

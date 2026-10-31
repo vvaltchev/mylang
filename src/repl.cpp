@@ -496,6 +496,63 @@ repl_scan_line(const string &line, bool &in_string, bool &in_comment,
     return begin;
 }
 
+/* `else` / `catch` / `finally`: a token that continues an if or try chain */
+static bool repl_chain_kw(const Tok &t)
+{
+    return t == Keyword::kw_else || t == Keyword::kw_catch
+        || t == Keyword::kw_finally;
+}
+
+/* how a token moves the bracket depth: +1 opens, -1 closes, 0 neither */
+static int repl_depth_delta(const Tok &t)
+{
+    if (t == Op::parenL || t == Op::bracketL || t == Op::braceL)
+        return 1;
+    if (t == Op::parenR || t == Op::bracketR || t == Op::braceR)
+        return -1;
+    return 0;
+}
+
+/*
+ * A statement HEADER that wants its body next: the `(` of an if / while /
+ * for / foreach / catch, and a trailing `else` / `try` / `finally`. A line
+ * ending in one must neither get a `;` - that gave the statement an EMPTY
+ * body and ran the next line on its own, so `if (k == 2)` / `print(x)`
+ * printed whatever k was, where a script does not - nor be submitted.
+ */
+static bool repl_header_kw(const Tok &t)
+{
+    return t == Keyword::kw_if || t == Keyword::kw_while
+        || t == Keyword::kw_for || t == Keyword::kw_foreach
+        || t == Keyword::kw_catch;
+}
+
+static bool repl_body_kw(const Tok &t)
+{
+    return t == Keyword::kw_else || t == Keyword::kw_try
+        || t == Keyword::kw_finally;
+}
+
+/* the whole input ends in a header (is_incomplete's test) */
+static bool repl_ends_in_header(const std::vector<Tok> &toks)
+{
+    if (toks.empty())
+        return false;
+    if (repl_body_kw(toks.back()))
+        return true;
+    if (!(toks.back() == Op::parenR))
+        return false;
+    int depth = 0;
+    for (size_t i = toks.size(); i-- > 0;) {
+        if (toks[i] == Op::parenR) {
+            depth++;
+        } else if (toks[i] == Op::parenL && --depth == 0) {
+            return i > 0 && repl_header_kw(toks[i - 1]);
+        }
+    }
+    return false;
+}
+
 static string
 repl_auto_terminate(const string &src)
 {
@@ -537,8 +594,7 @@ repl_auto_terminate(const string &src)
                 return false;
             }
             if (!t.empty())
-                return t[0] == Keyword::kw_else || t[0] == Keyword::kw_catch
-                    || t[0] == Keyword::kw_finally;
+                return repl_chain_kw(t[0]);
         }
         return false;
     };
@@ -593,14 +649,18 @@ repl_auto_terminate(const string &src)
 
         const Tok *last = nullptr;
         bool closed_block = false;        /* the last `}` closed a block */
+        bool header_end = false;          /* the last `)` ended a header */
         for (const auto &t : toks) {
+            header_end = false;
             if (t == Op::braceL) {
                 const char kind = expects_value ? 'D' : 'B';
                 stack.push_back(kind);
                 expects_value = (kind == 'D');
                 open_value = false;
             } else if (t == Op::parenL) {
-                stack.push_back('(');
+                /* 'H': a statement header's parentheses, an expression
+                 * bracket until the `)` that ends the header */
+                stack.push_back(last && repl_header_kw(*last) ? 'H' : '(');
                 expects_value = true;
                 open_value = false;
             } else if (t == Op::bracketL) {
@@ -621,10 +681,11 @@ repl_auto_terminate(const string &src)
                 open_value = (kind == 'D');   /* a dict literal is a value */
                 closed_block = (kind == 'B');
             } else if (t == Op::parenR || t == Op::bracketR) {
+                header_end = !stack.empty() && stack.back() == 'H';
                 if (!stack.empty())
                     stack.pop_back();
                 expects_value = false;
-                open_value = true;
+                open_value = !header_end;     /* a header is not a value */
             } else if (t == Keyword::kw_return) {
                 expects_value = true;
                 open_value = true;            /* a bare `return` ends too */
@@ -650,7 +711,9 @@ repl_auto_terminate(const string &src)
             last ? !repl_continuation_op(last->op) : closed_string;
         const bool chain_goes_on = last && *last == Op::braceR
             && closed_block && next_continues(li);
-        if (!open_at_end && stmt_ctx && ends_in_value && !chain_goes_on) {
+        const bool wants_body = last && (header_end || repl_body_kw(*last));
+        if (!open_at_end && stmt_ctx && ends_in_value && !chain_goes_on
+            && !wants_body) {
             semis.push_back(semi_before(code_end));
             open_value = false;
         }
@@ -1565,13 +1628,13 @@ ReplEngine::is_incomplete(const string &src)
     /* Net unclosed (){}/[] depth (>0 wants more). A string's / comment's own
      * brackets aren't here - they're inside a single string token / skipped. */
     int depth = 0;
-    for (const auto &t : toks) {
-        if (t == Op::parenL || t == Op::braceL || t == Op::bracketL)
-            depth++;
-        else if (t == Op::parenR || t == Op::braceR || t == Op::bracketR)
-            depth--;
-    }
+    for (const auto &t : toks)
+        depth += repl_depth_delta(t);
     if (depth > 0)
+        return true;
+
+    /* a statement header wants its body (`if (c)` / `else` at the end) */
+    if (repl_ends_in_header(toks))
         return true;
 
     /* A line ending on a binary/continuation operator wants more. The
@@ -1605,13 +1668,51 @@ ReplEngine::continues_chain(const string &line)
     } catch (const Exception &) {
         return false;
     }
-    return !toks.empty()
-        && (toks[0] == Keyword::kw_else || toks[0] == Keyword::kw_catch
-            || toks[0] == Keyword::kw_finally);
+    return !toks.empty() && repl_chain_kw(toks[0]);
+}
+
+/*
+ * may_continue's brace-less half: the input's last statement is an `if`
+ * whose last branch is a brace-less statement on a later line (`if (c)` /
+ * `print(x)`), which an `else` on the next line continues, as in a script.
+ * Read off the TERMINATED text, where each statement ends at its `;`: the
+ * last statement starts after the last top-level `;` or block `}` that no
+ * `else` / `catch` / `finally` follows. A bare `else` in it ends the chain.
+ */
+static bool brace_less_if_open(const string &src)
+{
+    /* may_continue lexed `src`, and terminating it adds only `;`, so this
+     * lexes too and ends in that `;` - the catch is defensive: an
+     * exception out of the Joiner would end the line editor */
+    std::vector<Tok> t;
+    try {
+        lexer(repl_auto_terminate(src), 1, t); /* INT-COV-EXEMPT: lexes */
+    } catch (const Exception &) {
+        return false;                   /* INT-COV-EXEMPT: see above */
+    }
+    size_t start = 0;
+    int depth = 0;
+    for (size_t i = 0; i + 1 < t.size(); i++) {
+        depth += repl_depth_delta(t[i]);
+        if (depth == 0 && (t[i] == Op::braceR || t[i] == Op::semicolon)
+            && !repl_chain_kw(t[i + 1]))
+            start = i + 1;
+    }
+    if (!(t[start] == Keyword::kw_if)
+        || t[start].loc.line == t.back().loc.line)
+        return false;
+    depth = 0;
+    for (size_t i = start; i + 1 < t.size(); i++) {
+        depth += repl_depth_delta(t[i]);
+        if (depth == 0 && t[i] == Keyword::kw_else
+            && !(t[i + 1] == Keyword::kw_if))
+            return false;
+    }
+    return true;
 }
 
 bool
-ReplEngine::may_continue(const string &src, bool multiline_only)
+ReplEngine::may_continue(const string &src)
 {
     std::vector<Tok> toks;
     try {
@@ -1619,8 +1720,10 @@ ReplEngine::may_continue(const string &src, bool multiline_only)
     } catch (const Exception &) {
         return false;
     }
-    if (toks.empty() || !(toks.back() == Op::braceR))
+    if (toks.empty())
         return false;
+    if (!(toks.back() == Op::braceR))
+        return brace_less_if_open(src);
 
     /* the `{` the final `}` closes, and what stands before it */
     const auto open_of = [&](size_t close, Op l, Op r) -> size_t {
@@ -1636,7 +1739,7 @@ ReplEngine::may_continue(const string &src, bool multiline_only)
     const size_t ob = open_of(toks.size() - 1, Op::braceL, Op::braceR);
     if (ob == string::npos || ob == 0)
         return false;
-    if (multiline_only && toks[ob].loc.line == toks.back().loc.line)
+    if (toks[ob].loc.line == toks.back().loc.line)
         return false;
 
     const Tok &before = toks[ob - 1];
@@ -1793,7 +1896,7 @@ run_repl()
         if (i != string::npos && s[i] == ':')
             return false;
         if (!next)
-            return ReplEngine::may_continue(s, true);
+            return ReplEngine::may_continue(s);
         return ReplEngine::continues_chain(*next);
     };
 

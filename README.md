@@ -224,8 +224,14 @@ a multi-line block stays open until it's balanced, auto-indented as you go:
 => 55
 ```
 
+A line that ends a statement's header - `if (c)`, `while (c)`, `for (...)`,
+`foreach (...)`, `catch (...)`, `else`, `try`, `finally` - gets no `;` and
+keeps the input open for the body on the next line, braced or not.
+
 An `if` (or a `try`) whose block closes on a line of its own may still go
-on with an `else` (`catch`, `finally`) on the next line, as in a script, so
+on with an `else` (`catch`, `finally`) on the next line, as in a script -
+and so may an `if` whose last branch is a brace-less statement on a line
+after its header (`if (c)` / `print(x)`) - so
 the input stays open there: type the `else`, or press Enter on the empty
 line to run it - any other line runs with it (Python's REPL asks the same
 empty line after a block). One closed on the line where it started (`if (c)
