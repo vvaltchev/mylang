@@ -11725,6 +11725,105 @@ static const std::vector<test> tests =
         { "rethrow;" },
         &typeid(SyntaxErrorEx), 1, 0, 0, 0,
     },
+    /* break / continue / rethrow take their `;` as return and throw do:
+     * left for the block to skip, it ended a brace-less `if` branch
+     * before its `else` (a syntax error), and `{ break }` was accepted */
+    {
+        "parse: a break takes its semicolon",
+        { "var i = 0;", "while (i < 3) { i++; break }" },
+        &typeid(SyntaxErrorEx), 28, 2, 0, 0,
+    },
+    {
+        "parse: a continue takes its semicolon",
+        { "for (var i = 0; i < 3; i++) { continue }" },
+        &typeid(SyntaxErrorEx), 40, 1, 0, 0,
+    },
+    {
+        "parse: a rethrow takes its semicolon",
+        { "struct E {}", "try { throw E(); } catch (E) { rethrow }" },
+        &typeid(SyntaxErrorEx), 40, 2, 0, 0,
+    },
+    { "parse: a brace-less branch ending in break or continue takes else",
+      { "var s = \"\";",
+        "for (var i = 0; i < 6; i++)",
+        "    if (i == 4) break; else if (i % 2) continue; else s += str(i);",
+        "var j = 0;",
+        "while (j < 9) { if (j++ == 2) break; else s += \"w\"; }",
+        "assert(s == \"02ww\");" } },
+    { "parse: a brace-less for body is a loop body",
+      { "var n = 0;",
+        "for (var i = 0; i < 9; i++) if (i == 3) break; else n++;",
+        "assert(n == 3);" } },
+    /* README "Where a function can end": a function whose end cannot be
+     * reached is not nullable, so `f() + 1` compiles */
+    { "infer: a function that cannot reach its end: while (true), dead code",
+      { "func f(int n) { while (true) { if (n > 3) return n; n++; } }",
+        "func g(int n) { for (;;) if (n-- < 0) return n; }",
+        /* a block ends at ANY statement that cannot finish */
+        "func h(int n) { return n * 2; n = 0; }",
+        "assert(f(runtime(1)) + g(runtime(1)) + h(runtime(3)) == 8);" } },
+    { "infer: a function that returns from a try body and its catch",
+      { "func f(str s) {",
+        "    try { return int(s); } catch (InvalidValueEx) { return 0; }",
+        "}",
+        "assert(f(runtime(\"5\")) + f(runtime(\"q\")) == 5);" } },
+    {
+        "infer: a while (true) with a break of its own can reach the end",
+        { "func f(int n) { while (true) { if (n > 3) break; return n; } }",
+          "print(f(runtime(1)) + 1);" },
+        &typeid(NullabilityEx),
+    },
+    {
+        "infer: a catch that falls through can reach the end",
+        { "func f(str s) {",
+          "    try { return int(s); } catch (InvalidValueEx) { print(s); }",
+          "}",
+          "print(f(runtime(\"5\")) + 1);" },
+        &typeid(NullabilityEx),
+    },
+    /* a loop the body leaves only by return: a break that belongs to a
+     * NESTED loop, or sits in a nested function, does not leave it, and a
+     * constant condition counts as written (`1 < 2`, folded or not) */
+    { "infer: a nested loop's break does not leave the outer loop",
+      { "func f(int n) {",
+        "    while (true) {",
+        "        while (n > 9) { break; }",
+        "        var g = func() { while (true) { break; } return 1; };",
+        "        if (n > 3) return n + g();",
+        "        n++;",
+        "    }",
+        "}",
+        "func h(int n) { for (; 1 < 2; n++) { if (n > 3) return n; } }",
+        "assert(f(runtime(1)) + 1 == 6);",
+        "assert(h(runtime(1)) + 1 == 5);" } },
+    {
+        "infer: a for (;;) with a break of its own can reach the end",
+        { "func f(int n) { for (;;) { if (n > 3) break; return n; } }",
+          "print(f(runtime(1)) + 1);" },
+        &typeid(NullabilityEx),
+    },
+    {
+        "infer: an if whose else can finish can reach the end",
+        { "func f(int n) {",
+          "    if (n > 3) { return n; } else { print(n); }",
+          "}",
+          "print(f(runtime(1)) + 1);" },
+        &typeid(NullabilityEx),
+    },
+    {
+        "infer: a for with a constant-false condition can reach the end",
+        { "func f(int n) { for (; 2 < 1; n++) { return n; } }",
+          "print(f(runtime(1)) + 1);" },
+        &typeid(NullabilityEx),
+    },
+    { "infer: a guard clause may end in continue or break",
+      { "func f(array<int?> a) {",
+        "    var t = 0;",
+        "    foreach (x in a) { if (x == none) continue; t += x; }",
+        "    foreach (x in a) { if (x == none) break; t += x * 10; }",
+        "    return t;",
+        "}",
+        "assert(f(runtime([2, none, 5])) == 27);" } },
     /* a function literal's body is a new context: the loop or catch
      * body the literal stands in does not carry into it (the codegen
      * refused what the parser let through, NotLoweredEx) */

@@ -1743,6 +1743,50 @@ func g(opt x) {
 }
 ```
 
+A guard clause is any `if` whose branch cannot finish - it ends in a
+`return`, a `throw`, a `rethrow`, or, in a loop, a `break` or a `continue`
+(see *Where a function can end* below for what "cannot finish" covers):
+
+```C#
+foreach (x in values) {          # values: array<int?>
+    if (x == none) continue;
+    total += x;                  # x is known non-none here
+}
+```
+
+#### Where a function can end
+
+A function whose body can finish without a `return` returns `none` there,
+so its return type is nullable: `func f(int n) { if (n > 0) return n; }`
+returns `int?`. The compiler knows a statement cannot finish when it is a
+`return`, a `throw` or a `rethrow` (or a `break` / `continue`, which leave
+it for its loop); a block holding such a statement; an `if` / `else`
+neither of whose branches can finish; a loop whose condition is always
+true (`while (true)`, `for (;;)`) and that has no `break` of its own; and
+a `try` whose body and every `catch` cannot finish, or whose `finally`
+cannot. So these return a plain `int`:
+
+```C#
+func first_over(array<int> a, int k) {
+    var i = 0;
+    while (true) {               # left only by the return (or an error)
+        if (a[i] > k) return a[i];
+        i++;
+    }
+}
+func parse_or(str s, int dflt) {
+    try {
+        return int(s);
+    } catch (InvalidValueEx) {
+        return dflt;
+    }
+}
+```
+
+A condition counts as always true only when it is a constant (`true`, `1`,
+a `const` that is true); a loop over `runtime(true)` may end, as far as the
+compiler knows, and its function stays nullable.
+
 #### Speed
 
 Type inference is not only about safety: knowing a variable is an `int` or a

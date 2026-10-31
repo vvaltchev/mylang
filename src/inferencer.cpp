@@ -846,26 +846,88 @@ Op Inferencer::compound_binop(Op op)
     return compound_assign_base(op);    /* operators.h - the single map */
 }
 
-/* True when control cannot fall off the end of `n` (it always returns/throws).
- * Used to decide if a block-bodied function contributes a `none` return. */
+/* A `break` that leaves THIS loop, somewhere in its body: one in a nested
+ * loop leaves that loop, and a function literal's body cannot break out
+ * (the parser refuses it). */
+static bool breaks_out(Construct *n)
+{
+    if (!n)
+        return false;
+    switch (ctag(n)) {
+    case ConstructType::brk:
+        return true;
+    case ConstructType::while_stmt:
+    case ConstructType::for_stmt:
+    case ConstructType::for_range:
+    case ConstructType::foreach_stmt:
+    case ConstructType::func_decl:
+        return false;
+    default:
+        break;
+    }
+    bool found = false;
+    Inferencer::for_each_child(n, [&](Construct *c) {
+        if (!found && breaks_out(c))
+            found = true;
+    });
+    return found;
+}
+
+/* True when control cannot reach the point after `n` by finishing it:
+ * every path through it returns, throws, rethrows, breaks, continues or
+ * loops forever. Decides whether a block-bodied function can reach its end
+ * (and so return `none` there, README *Where a function can end*), and the
+ * guard-clause narrowing (`if (x == none) continue;`). A `break` or a
+ * `continue` counts because the LOOP is asked separately: a loop whose
+ * condition is always true finishes only by a `break` of its own
+ * (breaks_out). True must be a proof; anything not understood is false. */
 bool Inferencer::always_exits(const Construct *n)
 {
     if (!n)
         return false;
 
-    if (ctag(n) == ConstructType::ret ||
-        dynamic_cast<const ThrowStmt *>(n) ||
-        dynamic_cast<const RethrowStmt *>(n))
+    switch (ctag(n)) {
+    case ConstructType::ret:
+    case ConstructType::throw_stmt:
+    case ConstructType::rethrow:
+    case ConstructType::brk:
+    case ConstructType::cont:
         return true;
-
-    if (auto *b = dynamic_cast<const Block *>(n))
-        return !b->elems.empty() && always_exits(b->elems.back().get());
-
-    if (auto *i = dynamic_cast<const IfStmt *>(n))
+    case ConstructType::block:
+        /* any statement that cannot finish ends the block there */
+        for (const auto &st : static_cast<const Block *>(n)->elems)
+            if (always_exits(st.get()))
+                return true;
+        return false;
+    case ConstructType::if_stmt: {
+        auto *i = static_cast<const IfStmt *>(n);
         return i->elseBlock && always_exits(i->thenBlock.get()) &&
                always_exits(i->elseBlock.get());
-
-    return false;
+    }
+    case ConstructType::while_stmt: {
+        auto *w = static_cast<const WhileStmt *>(n);
+        return w->cond_true && !breaks_out(w->body.get());
+    }
+    case ConstructType::for_stmt: {
+        auto *f = static_cast<const ForStmt *>(n);
+        return f->cond_true && !breaks_out(f->body.get());
+    }
+    case ConstructType::try_catch: {
+        /* a `finally` that cannot finish decides; else the body and every
+         * handler must not (an exception no handler takes propagates) */
+        auto *t = static_cast<const TryCatchStmt *>(n);
+        if (always_exits(t->finallyBody.get()))
+            return true;
+        if (!always_exits(t->tryBody.get()))
+            return false;
+        for (const auto &cs : t->catchStmts)
+            if (!always_exits(cs.second.get()))
+                return false;
+        return true;
+    }
+    default:
+        return false;
+    }
 }
 
 void Inferencer::for_each_child(Construct *n,

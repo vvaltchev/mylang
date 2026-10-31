@@ -1827,6 +1827,10 @@ class WhileStmt final: public Construct {
 public:
     unique_ptr<Construct> condExpr;
     unique_ptr<Construct> body;
+    /* The condition is a constant the parser found true (in both fold
+     * modes, so `-nc` agrees): the loop ends only by a `break`, a
+     * `return` or an exception - the inferencer's always_exits. */
+    bool cond_true = false;
 
     WhileStmt()
         : Construct("WhileStmt", false, ConstructType::while_stmt) { }
@@ -1838,6 +1842,7 @@ public:
         copy_base_fields(*c);
         c->condExpr = clone_as(condExpr);
         c->body = clone_as(body);
+        c->cond_true = cond_true;
         return c;
     }
 };
@@ -2503,6 +2508,8 @@ public:
     unique_ptr<Construct> cond;
     unique_ptr<Construct> inc;
     unique_ptr<Construct> body;
+    /* No condition, or a constant the parser found true: WhileStmt's */
+    bool cond_true = false;
 
     ForStmt() : Construct("ForStmt", false, ConstructType::for_stmt) { }
     EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
@@ -2515,6 +2522,7 @@ public:
         c->cond = clone_as(cond);
         c->inc = clone_as(inc);
         c->body = clone_as(body);
+        c->cond_true = cond_true;
         return c;
     }
 };

@@ -5082,8 +5082,21 @@ decisions behind it: `plans/archived/type-inference.md`,
 - **Null narrowing** (`check_if`/`narrow_target`, check pass only): inside a
   proven branch a nullable var reads as non-opt — `if (x != none)` / `if (x)`
   (then), `if (x == none) ... else` (else), and the guard clause
-  `if (x == none) return/throw; ...` (rest of the block). Sound (the branch
-  guarantees non-none). Not flow-narrowed elsewhere.
+  `if (x == none) <cannot finish>; ...` (rest of the block). Sound (the
+  branch guarantees non-none). Not flow-narrowed elsewhere.
+- **"Cannot finish" is ONE function, `Inferencer::always_exits`**: a
+  return/throw/rethrow/break/continue, a block holding one, an if/else of
+  two, a loop whose condition the PARSER found constant-true
+  (`WhileStmt` / `ForStmt::cond_true`, set in both fold modes, so `-nc`
+  types a function the same) with no `break` of its own (`breaks_out`),
+  a `try` whose body and every catch cannot finish or whose finally
+  cannot. It decides `FuncInfo::falls_through` (a reachable end returns
+  `none`, so `opt` return) and the guard-clause narrowing above. It was
+  return/throw, a block's LAST statement and if/else only, so a function
+  returning from inside `while (true)` or from both arms of a try/catch
+  was `int?` and `f() + 1` a false NullabilityEx (README *Where a
+  function can end*). Answering true is a PROOF: a shape it does not
+  understand answers false.
 - **A container LITERAL takes a FIXED destination's type (#46,
   2026-10-08).** A FIXED symbol is one whose type is checked, never
   joined: annotated or a committed REPL global (`fixed_type`). An
