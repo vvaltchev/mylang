@@ -3363,6 +3363,11 @@ if (e != none) print(e.kind);   # "int"
 For just the strings use [`typestr`/`kindstr`](#typestrx--kindstrx); for the
 declared/static type of a **variable** use [`decltype`](#decltypevariable).
 
+With static type inference turned off (`-nti`) there is no static type to
+answer from, so the query is answered when it runs, from the value: `kind`,
+`name` and `nullable` describe the value, and `elem` / `key` / `val` are
+`none`. (`decltype` behaves the same way there.)
+
 #### `hash(value)`
 Return the integer hash used by dictionaries internally when `value` is a key.
 It works on **any** value — `bool`/`int`/`float`/`str`/`none` and, **deeply

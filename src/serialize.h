@@ -23,7 +23,10 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 39;   /* v39: a builtin VALUE
+constexpr unsigned MYV_FORMAT_VERSION = 40;   /* v40: a NATIVE struct
+                                                 instance (value tag
+                                                 12, a folded type());
+                                                 v39: a builtin VALUE
                                                  (value tag 11);
                                                  v38: a HandlerSite's
                                                  chain replaces
