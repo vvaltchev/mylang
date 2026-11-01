@@ -421,6 +421,15 @@ assertions on values.
   programs, tier 2 one, tier 3 eleven, each reduced to 2-4 decisions
   (01_float_chain_ref_temp: three float picks together). CI: tiers 1
   and 2 on every push (`int-enum`), tier 3 on demand (`int-deep.yml`).
+  2026-11-11: `island_choice`, the model-flip CONTAINER of a function
+  body (key `island:<fn>/all`; pick 1 runs every island-listed op as an
+  interpreted island inside one native container). No real body formed
+  a container since every such op went native, so it is the only way
+  `jit_try_container` / `jit_exec_block` run; tests/int/90 forces four
+  bodies. Its first tier-1 run failed four deviations of
+  104_exc_chain_markers: a container cannot hold a try region (the
+  interpreter catches an island's throw and runs the handler outside the
+  container) - it declines one now.
 - **P4 - VM state checker + object census.**
   **STATUS (2026-10-03): the OBJECT CENSUS is built** - per-kind
   counters at the pooled `operator new/delete`, `int_live(kind)`,
