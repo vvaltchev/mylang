@@ -708,19 +708,24 @@ enum class VTag : uint8_t {
  * compiles write the same bytes. Only a CONST builtin can be in a pool (a
  * pool holds what the compile-time evaluator built, and it sees no other),
  * but both tables are searched, as find_builtin_name does. */
+static void builtin_value_name_scan(
+    const std::map<const UniqueId *, LValue> &tbl, const Builtin &b,
+    const UniqueId *&best)
+{
+    for (const auto &kv : tbl)
+        if (kv.second.get().is<Builtin>()
+                && kv.second.get().get_ref<Builtin>().func == b.func
+                && (!best || kv.first->val < best->val))
+            best = kv.first;
+}
+
+/* (a plain function, not a generic lambda: MSVC did not see a generic
+ * lambda's implicit captures - C2065, 'b' and 'best' undeclared) */
 static const UniqueId *builtin_value_name(const Builtin &b)
 {
     const UniqueId *best = nullptr;
-    const auto scan = [&](const auto &tbl) {
-        for (const auto &kv : tbl)
-            if (kv.second.get().template is<Builtin>()
-                    && kv.second.get().template get_ref<Builtin>().func
-                           == b.func
-                    && (!best || kv.first->val < best->val))
-                best = kv.first;
-    };
-    scan(EvalContext::const_builtins);
-    scan(EvalContext::builtins);
+    builtin_value_name_scan(EvalContext::const_builtins, b, best);
+    builtin_value_name_scan(EvalContext::builtins, b, best);
     return best;
 }
 
