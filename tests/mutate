@@ -147,32 +147,20 @@ def code_spans(text):
     return out
 
 
-TEST_ONLY_IF = re.compile(r"^\s*#\s*(?:ifdef\s+(?:INT_TESTS|TESTS)\b"
-                          r"|if\s+defined\s*\(?\s*(?:INT_TESTS|TESTS)\b)")
 INT_HELPER_DEF = re.compile(r"^\S.*\b(?:jit_|bc_)?int_\w*\s*\(")
 
 
 def not_product(text, rel):
     """0-based indices of lines that are not PRODUCT code - the coverage
-    universe's rule (tests/int_run): ML_INT / ML_INT_ONLY spans and
-    INT-COV-EXEMPT lines, the body of an INT helper function (named
-    int_* / jit_int_* / bc_int_*), and `#ifdef INT_TESTS` / `#ifdef
-    TESTS` regions. A mutant there tests the test machinery, not
-    MyLang."""
+    universe's rule (tests/lib/intcov.py, exempt_lines): ML_INT /
+    ML_INT_ONLY spans, INT-COV-EXEMPT lines and test-only `#ifdef TESTS`
+    / `#ifdef INT_TESTS` regions, plus the body of an INT helper function
+    (named int_* / jit_int_* / bc_int_*). A mutant there tests the test
+    machinery, not MyLang."""
     skip = {n - 1 for n in intcov.exempt_lines(rel, {})}
-    stack = []                  # per open #if: is it a test-only region
     in_helper = False
     for li, line in enumerate(text.split("\n")):
         st = line.strip()
-        if st.startswith("#"):
-            if re.match(r"#\s*if", st):
-                stack.append(bool(TEST_ONLY_IF.match(line)))
-            elif re.match(r"#\s*(else|elif)", st) and stack:
-                stack[-1] = False       # the other arm ships
-            elif re.match(r"#\s*endif", st) and stack:
-                stack.pop()
-        if any(stack):
-            skip.add(li)
         if not in_helper and INT_HELPER_DEF.match(line) \
                 and not st.endswith(";"):
             in_helper = True

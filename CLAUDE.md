@@ -672,7 +672,11 @@ it. The universe is the PRODUCT: `tests.cpp`, the INT core and every INT
 helper (NAME IT `int_*` / `jit_int_*` / `bc_int_*`, or its branches
 count) are outside it, and so
 are the lines of an `ML_INT(...)` / `ML_INT_ONLY(...)` call inside a
-product function (keep an INT-only condition INSIDE the macro). A test
+product function (keep an INT-only condition INSIDE the macro) and
+every test-only `#ifdef TESTS` / `#ifdef INT_TESTS` region of a product
+file (since 2026-11-11 - selftests, oracles and counter bumps no shipped
+build compiles were 512 uncovered elements; `tests/mutate` already
+skipped them). A test
 program's header picks its runs: `# INT-ENGINES: default` for a codegen or
 JIT decision (the tree-walker never runs those passes),
 `# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra` for several environments.

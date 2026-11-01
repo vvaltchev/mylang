@@ -178,17 +178,28 @@ def run_tty(cmd, env, chunks, timeout, rows=24, cols=80):
 # ------------------------------------------------------------- coverage --
 
 INT_SPAN = re.compile(r"\bML_INT(_ONLY)?\s*\(")
+# a preprocessor region compiled only into a test build: `#ifdef TESTS`,
+# `#ifdef INT_TESTS`, `#if defined(TESTS) && ...` (an AND - `||` would
+# ship). Its `#else` / `#elif` arm is product code; `#ifndef TESTS` opens
+# no test region (its #else is a test-only arm, counted, which costs only
+# precision).
+TEST_ONLY_IF = re.compile(r"^\s*#\s*(?:ifdef\s+(?:INT_TESTS|TESTS)\b"
+                          r"|if\s+defined\s*\(?\s*(?:INT_TESTS|TESTS)\b"
+                          r"(?![^\n]*\|\|))")
 
 
 def exempt_lines(rel, cache):
     """1-based line numbers of `rel` outside the universe: a line carrying
-    the INT-COV-EXEMPT marker, and every line of an `ML_INT(...)` or
+    the INT-COV-EXEMPT marker; every line of an `ML_INT(...)` or
     `ML_INT_ONLY(...)` call - the instrumentation's own branches inside a
     product function (a guard on an event, an INT-only bookkeeping `if`)
     are not product code, any more than an INT helper function is. The
     span is found by counting parentheses from the macro name (string and
     char literals skipped), so a multi-line ML_INT_ONLY block is covered
-    whole."""
+    whole; and every line of a TEST-ONLY preprocessor region
+    (TEST_ONLY_IF) - a selftest, an oracle, a counter bump, a poison
+    write: what no shipped build compiles is not product code either
+    (until 2026-11-11 it was counted, 512 uncovered elements of it)."""
     if rel not in cache:
         marked = set()
         try:
@@ -196,6 +207,18 @@ def exempt_lines(rel, cache):
                 lines = f.readlines()
         except OSError:
             lines = []
+        stack = []              # per open #if: is it a test-only region
+        for n, text in enumerate(lines, 1):
+            st = text.strip()
+            if st.startswith("#"):
+                if re.match(r"#\s*if", st):
+                    stack.append(bool(TEST_ONLY_IF.match(text)))
+                elif re.match(r"#\s*(else|elif)", st) and stack:
+                    stack[-1] = False       # the other arm ships
+                elif re.match(r"#\s*endif", st) and stack:
+                    stack.pop()
+            if any(stack):
+                marked.add(n)
         depth = 0
         for n, text in enumerate(lines, 1):
             if EXEMPT in text:

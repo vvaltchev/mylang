@@ -38,8 +38,10 @@
 #    file does not rename them. The universe is the PRODUCT: the test
 #    harness (tests.cpp), the INT core and every INT helper function (named
 #    int_* / jit_int_* / bc_int_*) are outside it, as are the lines of an
-#    ML_INT(...) / ML_INT_ONLY(...) call inside a product function and a
-#    line marked `INT-COV-EXEMPT: reason`. Two checks, as in SQLite's discipline:
+#    ML_INT(...) / ML_INT_ONLY(...) call inside a product function, every
+#    test-only `#ifdef TESTS` / `#ifdef INT_TESTS` region (selftests,
+#    oracles, counter bumps: no shipped build compiles them) and a line
+#    marked `INT-COV-EXEMPT: reason`. Two checks, as in SQLite's discipline:
 #      - every unit OWNS at least one element no other unit covers
 #        (otherwise it is redundant and must go - the suite is minimal);
 #      - uncovered elements <= the FLOOR (a ratchet: it may only go down).
