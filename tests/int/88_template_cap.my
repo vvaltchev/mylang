@@ -1,4 +1,4 @@
-# INT-ENGINES: tw default nj noopt
+# INT-ENGINES: tw default nj noopt ni
 #
 # INT unit (#107): a template instantiates once per argument signature,
 # up to 64 instances; a call with a new signature past the cap runs the

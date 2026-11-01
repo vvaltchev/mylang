@@ -18679,6 +18679,17 @@ static const std::vector<test> tests =
     { "template: int and str calls don't conflict (separate instances)",
       { "func id(x){ return x; }",
         "assert(id(5) == 5); assert(id(\"hi\") == \"hi\");" } },
+    /* a call instantiation leaves unredirected runs the BASE, which must
+     * therefore be compiled: each level of `depth([x], n - 1)` is a new
+     * signature and needs one instantiation round, and the loop stops at
+     * 64 - so level 65 called a base the dead-base pass had dropped
+     * ("call to a chunk-less function after AST teardown" in the VM) */
+    { "template: a call left past the instantiation rounds runs the base",
+      { "func depth(x, int n) {",
+        "    if (n == 0) return 0;",
+        "    return 1 + depth([x], n - 1);",
+        "}",
+        "assert(depth(1, runtime(70)) == 70);" } },
     { "template: a never-called template is not checked (no error)",
       { "func unused(a){ var r = a + 1; r += 2; return r; }",
         "assert(true);" } },

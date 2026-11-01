@@ -2438,6 +2438,9 @@ Running scripts:
                                  # declared below them; that number says
                                  # whether the discipline is paid for
 ./build/mylang -it N FILE        # inline threshold: max inlined body (nodes)
+./build/mylang --max-instances N F  # typed instances one template gets
+                                 # (default 64); past it a call runs the
+                                 # base. Not in the README, by choice
 ./build/mylang -v                # how THIS binary was built (opt, asserts,
                                  # lto, sanitizers, vm_hardening, cgoto,
                                  # tests, recycle, jit, compiler) - one
@@ -5862,8 +5865,17 @@ is non-capturing and the var is **write-once + calls-only** (`mark_lambda_
 templates`, after the structural pass, using per-symbol `writes`/`value_used`
 bookkeeping — the decl write is counted in `walk_struct`, not `declare_target`,
 which runs twice via hoist); a value-used / capturing / reassigned lambda stays
-join. **D4:** past 64 instantiations a template's further calls run dynamically
-(`tmpl_inst_count`, a one-time stderr warning).
+join. **D4:** past `g_tmpl_max_instances` instantiations (default 64; the
+driver's `--max-instances N`, not in the README by the maintainer's choice) a
+template's further calls run dynamically (`tmpl_inst_count`, a one-time stderr
+warning). **⛔ A call left UNREDIRECTED runs the BASE, so the dead-base pass
+must keep it (2026-11-09):** past that cap, and past the instantiation loop's
+64 rounds (one per nesting level of `f([x], n - 1)`), a direct call still
+names the template; the base had been dropped as dead, so the VM aborted
+("call to a chunk-less function after AST teardown") where the tree-walker
+answered - and an `ASSERTS=0` build, which never tears the AST down, walked
+it. Every LIVE call whose callee is still a template keeps it (the same
+`collect_calls` instantiate_round uses).
 
 Mechanism (`inferencer.cpp`): the fixpoint and check pass **skip** an
 un-instantiated template (`accumulate`/`accumulate_call`/`check`/`check_call`
