@@ -1296,6 +1296,10 @@ flag "--max-instances refuses a negative count" 1 'requires a count' \
      --max-instances -1 "$TMP/mi.my"
 flag "--max-instances refuses a non-number" 1 'requires a count' \
      --max-instances 2x "$TMP/mi.my"
+flag "--max-instances refuses an empty value" 1 'requires a count' \
+     --max-instances "" "$TMP/mi.my"
+flag "--max-instances refuses a count past INT_MAX" 1 'requires a count' \
+     --max-instances 99999999999 "$TMP/mi.my"
 mi_want="2:int 5.000000:float abab:str 6:int "
 for m in 2 0; do
     for eng in "" -nj -tw; do
