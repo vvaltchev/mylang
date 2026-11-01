@@ -229,16 +229,21 @@ def stage_cmds(root, binary, seed):
     }
 
 
-def run_stage(cmds, cwd, env, timeout):
+def run_stage(cmds, cwd, env, timeout, out=None):
     """(passed, seconds). A timeout is a failure - the mutant was
-    noticed."""
+    noticed. `out`, a file, receives every command's output (the pristine
+    run keeps it: a stage failing there must say why)."""
     t0 = time.time()
+    sink = out if out is not None else subprocess.DEVNULL
     for c in cmds:
+        if out is not None:
+            out.write("$ %s\n" % " ".join(c))
+            out.flush()
         try:
             r = subprocess.run(c, cwd=cwd, env=env, timeout=timeout,
-                               stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
+                               stdin=subprocess.DEVNULL, stdout=sink,
+                               stderr=subprocess.STDOUT
+                               if out is not None else subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             return False, time.time() - t0
         if r.returncode != 0:
@@ -353,11 +358,20 @@ def main():
         limit = {}
         for st in stages:
             setup.set_current("pristine " + st)
-            ok, secs = run_stage(cmds[st], w0.root, env, 7200)
+            with tempfile.TemporaryFile("w+", dir=base) as log:
+                ok, secs = run_stage(cmds[st], w0.root, env, 7200, log)
+                tail = []
+                if not ok:
+                    log.seek(0)
+                    tail = log.read().splitlines()[-40:]
             setup.advance()
             print("mutate: pristine %-6s %s in %.0fs"
                   % (st, "passes" if ok else "FAILS", secs), flush=True)
             if not ok:
+                # the end of its output: CI keeps no log of it, and a
+                # bare FAILS cost a local reproduction (2026-11-11)
+                for line in tail:
+                    print("  | " + line, file=sys.stderr)
                 print("mutate: stage %s fails WITHOUT a mutation - it would "
                       "kill every mutant and mean nothing" % st,
                       file=sys.stderr)
