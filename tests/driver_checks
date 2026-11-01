@@ -628,6 +628,37 @@ else
     fail "myv: cyclic constant: src $src_rc [$src_out] -c $c_rc [$c_head]"
 fi
 
+# A source with CRLF line ends and no final newline: an error from its
+# image quotes the source line as a source run does (the CRs dropped, the
+# last line kept). And -c to an output path that cannot be opened is a
+# MyvError, exit 1 - not a crash and not a silent success.
+printf 'var a = 1;\r\nvar z = int(runtime(0));\r\nprint(a / z);' \
+    > "$TMP/crlf.my"
+crlf_src=$("$BIN" "$TMP/crlf.my" 2>&1)
+"$BIN" -c "$TMP/crlf.my" -o "$TMP/crlf.myv" > /dev/null 2>&1
+crlf_img=$("$BIN" "$TMP/crlf.myv" 2>&1)
+# (the header names the file as the image stores it, relative to its
+# root, so the comparison starts at the source line)
+if [ "$(printf '%s' "$crlf_img" | sed 1d)" = \
+     "$(printf '%s' "$crlf_src" | sed 1d)" ] &&
+   printf '%s' "$crlf_img" | head -1 | grep -q 'line 3, col 11:12$' &&
+   printf '%s' "$crlf_img" | grep -q '^    print(a / z);$'; then
+    pass "myv: a CRLF source's line renders in an error from its image"
+else
+    fail "myv: CRLF source: [$(printf '%s' "$crlf_img" | head -c 200)] vs \
+[$(printf '%s' "$crlf_src" | head -c 200)]"
+fi
+nout=$("$BIN" -c "$TMP/crlf.my" -o "$TMP/no/such/dir/x.myv" 2>&1)
+nrc=$?
+if [ $nrc = 1 ] &&
+   printf '%s' "$nout" | grep -q '^MyvError: cannot open the output file'
+then
+    pass "myv: -c to an output path that cannot be opened: a MyvError"
+else
+    fail "myv: unwritable output: exit $nrc: $(printf '%s' "$nout" |
+          head -c 200)"
+fi
+
 # #96: the hardcoded-register RATCHET (scripts/regcensus.py header has
 # the rule). A source-analysis check, not a binary one - it lives here
 # because every CI lane and the local battery already run this script.
@@ -1260,6 +1291,47 @@ flag "--trace warns on an unknown category" 0 \
      "unknown trace category 'bogus'" -T infer,bogus, "$TMP/tr.my"
 flag "--trace traces a known category to stderr" 0 \
      'infer +var x : int' --trace infer "$TMP/tr.my"
+# -a (--analyze) prints the source colored by what the optimizers did,
+# and --trace fold narrates the folds. Here AutoConst's work INSIDE a
+# function body (a top-level name is never auto-const): the dead arm of
+# a const-false `if` - then or else - and a `while` that never runs are
+# dim, the auto-const names yellow; the short-circuits of the same
+# constants are traced. The program's output is the same either way.
+cat > "$TMP/an.my" <<'EOF'
+func h(x) {
+    var c = false;
+    var k = 3;
+    var t = true;
+    if (c) { print(1); } else { print(k); }
+    if (!c) { print(2); } else { print(4); }
+    while (c) { print(5); }
+    if (c && x > 1) { print(6); }
+    if (c || x > 1) { print(7); }
+    if (t || x > 1) { print(8); }
+    return k + x;
+}
+print(h(runtime(2)));
+EOF
+dim=$(printf '\033[2m') yel=$(printf '\033[33m')
+an=$("$BIN" -a "$TMP/an.my" 2>&1)
+if printf '%s' "$an" | grep -qF "{ ${dim}print(1); }" &&
+   printf '%s' "$an" | grep -qF "else { ${dim}print(4); }" &&
+   printf '%s' "$an" | grep -qF "${dim}while (" &&
+   printf '%s' "$an" | grep -qF "var ${yel}k" &&
+   ! printf '%s' "$an" | grep -q '^3$'; then
+    pass "-a dims AutoConst's dead code in a function body, without running it"
+else
+    fail "-a: $(printf '%s' "$an" | head -c 400)"
+fi
+tr=$("$BIN" --trace fold "$TMP/an.my" 2>"$TMP/an.err")
+if [ "$tr" = "$("$BIN" "$TMP/an.my" 2>/dev/null)" ] &&
+   grep -q 'short-circuit && -> false' "$TMP/an.err" &&
+   grep -q 'short-circuit || -> true' "$TMP/an.err" &&
+   grep -q 'drop non-contributing const operand' "$TMP/an.err"; then
+    pass "--trace fold narrates the short-circuit folds, output unchanged"
+else
+    fail "--trace fold: $(head -c 300 "$TMP/an.err")"
+fi
 printf 'print(argv);\n' > "$TMP/av.my"
 flag "argv holds the script's own arguments" 0 '^\["x", "y z"\]' \
      "$TMP/av.my" x "y z"
@@ -1423,19 +1495,30 @@ flag "--strip-source: an image with no source reference" 1 \
 # first run found two loader gaps no hand-picked program had (a cycle of
 # scalar-result claims, a builtin value in a constant) and a dump-only
 # difference (the container plan asked without the load's JitCtx).
+# The tests/int programs go through it too (2026-11-11: it found that a
+# folded type() could not be stored at all - a Type instance, whose
+# native struct no image could name); one calling an int_* builtin is
+# skipped on a build without them. NOT on an INT build, where each of
+# them is a coverage unit of its own (tests/int_run): compiling them all
+# here reached the very code they exist to own, and seven of them owned
+# nothing. Only stdout is compared: a compile's warnings go to stderr,
+# and loading an image compiles nothing.
+rt_int="$here/int/*.my"
+"$BIN" -v 2>/dev/null | grep -Eq '^ *int_tests +1' && rt_int=
 rt_n=0 rt_bad=0
-for p in "$here"/functional/*.my; do
+for p in "$here"/functional/*.my $rt_int; do
     b=$(basename "$p" .my)
     if ! "$BIN" -c "$p" -o "$TMP/rt.myv" > "$TMP/rt.c" 2>&1; then
         # the one documented refusal: a constant holding a cycle
         grep -q 'holds a reference cycle' "$TMP/rt.c" && continue
+        grep -q "Undefined variable 'int_" "$TMP/rt.c" && continue
         rt_bad=$((rt_bad + 1))
         fail "image round trip: -c $b: $(head -c 200 "$TMP/rt.c")"
         continue
     fi
     rt_n=$((rt_n + 1))
-    "$BIN" -nj -vd "$p" > "$TMP/rt.src" 2>&1
-    "$BIN" -nj -vd "$TMP/rt.myv" > "$TMP/rt.img" 2>&1
+    "$BIN" -nj -vd "$p" > "$TMP/rt.src" 2>/dev/null
+    "$BIN" -nj -vd "$TMP/rt.myv" > "$TMP/rt.img" 2>/dev/null
     if ! cmp -s "$TMP/rt.src" "$TMP/rt.img"; then
         rt_bad=$((rt_bad + 1))
         fail "image round trip: $b: $(diff "$TMP/rt.src" "$TMP/rt.img" |
@@ -1443,7 +1526,7 @@ for p in "$here"/functional/*.my; do
     fi
 done
 if [ $rt_bad = 0 ] && [ $rt_n -ge 100 ]; then
-    pass "image round trip: $rt_n functional programs, -vd identical"
+    pass "image round trip: $rt_n programs, -vd identical"
 elif [ $rt_bad = 0 ]; then
     fail "image round trip: only $rt_n programs stored - vacuous"
 fi
@@ -1603,6 +1686,64 @@ $(head -c 300 "$TMP/stats-nj.err")"
     fi
 else
     echo "  skip  MYLANG_JITSTATS (this build reports jit 0)"
+fi
+
+# The JIT's developer dumps and caps (jit.cpp, docs/jit-optimizations.md):
+# each dump prints its own lines on stderr and each cap - BINDING here,
+# 0 or 1 - changes which code is emitted; neither may change what the
+# program prints or its exit code. 17_elem2_divmod_roles reaches every
+# dump's pass (SHAREDBG and MAXSHARE belong to the legacy pick, hence
+# MYLANG_JIT_OFF=lsra), each cap below changes its emitted code, and no
+# tests/int unit runs it (INT-SOURCE) - this check reaching the paths a
+# unit exists to own made that unit redundant. A NON-binding pin cap (99,
+# above any budget) is a no-op to the byte: its -vdj equals the plain
+# one.
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    fdir="$here/functional"
+    dbg_bad=""
+    dbg_n=0
+    pg=17_elem2_divmod_roles
+    for spec in \
+        "MYLANG_LSRADBG=1|$pg|^LSRADBG " \
+        "MYLANG_SPILLDBG=1|$pg|^SPILLDBG run" \
+        "MYLANG_CACHEAUDIT=1|$pg|^CACHEAUDIT pinned" \
+        "MYLANG_REGAUDIT=1|$pg|^REGAUDIT TOTAL" \
+        "MYLANG_HOISTDBG=1|05_elem_tiers|hoist\[" \
+        "MYLANG_ESTDBG=1|05_elem_tiers|^est\[" \
+        "MYLANG_RELDBG=1|05_elem_tiers|^relent\[" \
+        "MYLANG_DELAUDIT=1|22_closure_store|^DELAUDIT run" \
+        "MYLANG_JIT_OFF=lsra MYLANG_SHAREDBG=1|$pg|^SHAREDBG" \
+        "MYLANG_JIT_MAXPINS=0|$pg|" \
+        "MYLANG_JIT_MAXPINS=1|$pg|" \
+        "MYLANG_JIT_MAXSPILL=0|$pg|" \
+        "MYLANG_JIT_OFF=lsra MYLANG_JIT_MAXSHARE=0|$pg|" \
+        "MYLANG_JIT_OFF=lsra MYLANG_JIT_MAXSHARE=1|$pg|"
+    do
+        envs=${spec%%|*}; rest=${spec#*|}
+        prog="$fdir/${rest%%|*}.my"; tag=${rest#*|}
+        want=$("$BIN" "$prog" 2>/dev/null; echo "rc=$?")
+        # shellcheck disable=SC2086
+        got=$(env $envs "$BIN" "$prog" 2>"$TMP/dbg.err"; echo "rc=$?")
+        dbg_n=$((dbg_n + 1))
+        if [ "$got" != "$want" ]; then
+            dbg_bad="$dbg_bad [$envs: output changed]"
+        elif [ -n "$tag" ] && ! grep -Eq "$tag" "$TMP/dbg.err"; then
+            dbg_bad="$dbg_bad [$envs: no '$tag' line]"
+        fi
+    done
+    "$BIN" -vdj "$fdir/$pg.my" > "$TMP/pins.vdj" 2>&1
+    MYLANG_JIT_MAXPINS=99 "$BIN" -vdj "$fdir/$pg.my" \
+        > "$TMP/pins99.vdj" 2>&1
+    cmp -s "$TMP/pins.vdj" "$TMP/pins99.vdj" ||
+        dbg_bad="$dbg_bad [MYLANG_JIT_MAXPINS=99: -vdj differs]"
+    if [ -z "$dbg_bad" ]; then
+        pass "the JIT's debug dumps and caps leave the output alone \
+($dbg_n configurations, and a non-binding pin cap emits the same code)"
+    else
+        fail "JIT debug dumps / caps:$dbg_bad"
+    fi
+else
+    echo "  skip  JIT debug dumps and caps (this build reports jit 0)"
 fi
 
 [ $rc = 0 ] && echo "all driver checks passed"

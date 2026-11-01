@@ -9,9 +9,16 @@
 # or -1, a float division by 0.0, an operand of no proven type, and a
 # function name the program reassigns. The order of the events, and the
 # exception a division by zero raises, are what a wrong paste would
-# change; the `ni` engine (no inlining) is the oracle.
+# change; the `ni` engine (no inlining) is the oracle. The second half
+# (2026-11-11) adds the shapes on the other side of the rule - inert
+# unary operands, a division by 2 - and the body facts beside it: a body
+# writing its locals (a destructuring, a foreach variable, a catch
+# variable, an in-place builtin's target) and one writing its scalar
+# parameter.
 
 var events = [];
+var trail = "";                       # the second half's event log
+var g = 10;                           # ... and its global
 func ev(str what, dyn v) { append(events, what + "=" + str(v)); }
 func tick(int v) { append(events, "tick"); return v; }
 
@@ -45,3 +52,79 @@ h = func() => 20;
 ev("rebound", call_it(h));
 
 print(join(events, " "));
+
+# ---- the shapes of the rule, and the body facts beside it ----
+
+func note(str s, int v) { trail = trail + s; return v; }
+
+func dbl(x) => x + x;
+func neg_of(x) => 0 - x;
+func half(int x) => x / 2;
+func first(c, a, b) { if (c) return a; return b; }
+
+func unary(int i, float f, bool b) {
+    trail = "";
+    var r = [dbl(-i), dbl(+i), dbl(~i), neg_of(-f)];
+    var s = first(!b, 1, 2) + first(!!b, 3, 4);
+    return str(r) + " " + str(s) + " " + trail;
+}
+print(unary(int(runtime(5)), float(runtime(1.5)), runtime(true) == true));
+
+# division and modulo by a literal: by 2 the argument is inert; by 0 or
+# -1 it may throw (or wrap), and a float division by 0.0 raises too
+# (README), so each of those is bound first
+func divs(int k, float f) {
+    trail = "";
+    var a = dbl(k / 2) + dbl(k % 3);
+    var out = str(a);
+    try { out = out + " " + str(dbl(k / 0)); }
+    catch (DivisionByZeroEx) { out = out + " div0"; }
+    try { out = out + " " + str(first(true, 0, k % 0)); }
+    catch (DivisionByZeroEx) { out = out + " mod0"; }
+    out = out + " " + str(dbl(k / -1));
+    try { out = out + " " + str(first(false, f / 0.0, 1.0)); }
+    catch (DivisionByZeroEx) { out = out + " fdiv0"; }
+    return out + " " + trail;
+}
+print(divs(int(runtime(7)), float(runtime(2.0))));
+
+# an argument with a side effect is evaluated once, before the body,
+# even when the body reads its parameter dbl or not at all
+func sides() {
+    trail = "";
+    var a = dbl(note("a", 1));
+    var b = first(false, note("b", 2), note("c", 3));
+    var c = half(note("d", 9));
+    return str([a, b, c]) + " " + trail;
+}
+print(sides());
+
+# a global read is not inert (the body may write the global); a global
+# FUNCTION name nothing reassigns is
+func bump_and(x) { g = g + 1; return x + g; }
+func apply1(fnv, x) => fnv(x);
+func inc1(x) => x + 1;
+print(bump_and(g), g, apply1(inc1, 4));
+
+struct E { int v; }
+# the body's own writes: a destructuring, a foreach variable, a catch
+# variable and an in-place builtin's first argument are writes to a
+# local, so none of those locals is collapsed into its uses
+func body_writes(int n) {
+    var p = n * 2;
+    var q, r = [p, p + 1];
+    var acc = [];
+    foreach (var e in [q, r]) { append(acc, e); }
+    var t = 0;
+    try { throw E(note("x", 1)); } catch (E as k) { t = k.v; }
+    return str(acc) + str(t) + str(p);
+}
+trail = "";
+print(body_writes(int(runtime(3))), trail);
+
+# a body that writes its scalar parameter is not pasted into (the
+# parameter is a by-value copy): ++ in a nested expression, an assignment
+func bumpp(x) { var y = (x++) + 1; return x + y; }
+func setp(x) { if (x > 0) { x = x - 1; } return x; }
+var base = int(runtime(4));
+print(bumpp(base), setp(base), base);
