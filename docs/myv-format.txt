@@ -2,8 +2,12 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 38.  This document describes the on-disk image exhaustively:
+Format version 39.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v39: the value codec gains tag 11, `bltn` - a builtin VALUE, written as its
+name (section 11).  A const container holding a builtin - `const OPS = [len,
+abs];` - compiled and ran, and `-c` refused to store it.)
 
 (v38: a HandlerSite (9.18) ends with `chain` in place of `has_rethrow` -
 question 12, implicit exception chaining.  A region may now be a CHAIN
@@ -1144,6 +1148,15 @@ keys and values, and recursively by itself.
                               context to root at - and runs under
                               its caller's root.)
     10 cls          see 11.4 - a CLASS instance (v33)
+    11 bltn         uid      (a builtin VALUE, v39 - `const OPS = [len,
+                              abs];`.  The name is the least, by
+                              spelling, of the names registered with the
+                              builtin's implementation, so two compiles
+                              write the same bytes; the loader binds it
+                              as it binds a BuiltinCall's name (9.15).
+                              A name this binary has no builtin for is
+                              "corrupt or incompatible .myv (unknown
+                              builtin)".)
 
 The writer ABORTS on any other type - "unserializable value type in a chunk
 pool".  An image is never silently lossy.
@@ -1392,7 +1405,7 @@ same is true of OpCode and Op, which appear in every instruction.)
 
     VTag (serialize.cpp, section 11)
         0 none  1 boolean  2 integer  3 flt  4 str  5 arr  6 dict
-        7 strct  8 structtype  9 func  10 cls
+        7 strct  8 structtype  9 func  10 cls  11 bltn
 
 Version 9 is exactly such a change: deleting the CatchTest and Reraise
 opcodes renumbered every OpCode after them.

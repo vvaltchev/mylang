@@ -700,8 +700,29 @@ static std::shared_ptr<TypeAnnot> read_annot(Reader &r, int depth)
 
 enum class VTag : uint8_t {
     none = 0, boolean, integer, flt, str, arr, dict, strct, structtype, func,
-    cls
+    cls, bltn
 };
+
+/* The name a builtin VALUE is written under: the least, by spelling, of the
+ * names registered with its implementation - a fixed choice, so two
+ * compiles write the same bytes. Only a CONST builtin can be in a pool (a
+ * pool holds what the compile-time evaluator built, and it sees no other),
+ * but both tables are searched, as find_builtin_name does. */
+static const UniqueId *builtin_value_name(const Builtin &b)
+{
+    const UniqueId *best = nullptr;
+    const auto scan = [&](const auto &tbl) {
+        for (const auto &kv : tbl)
+            if (kv.second.get().template is<Builtin>()
+                    && kv.second.get().template get_ref<Builtin>().func
+                           == b.func
+                    && (!best || kv.first->val < best->val))
+                best = kv.first;
+    };
+    scan(EvalContext::const_builtins);
+    scan(EvalContext::builtins);
+    return best;
+}
 
 void write_value(Writer &w, const EvalValue &v);
 EvalValue read_value(Reader &r);
@@ -936,6 +957,14 @@ void write_value(Writer &w, const EvalValue &v)
             bad_image("unserializable value (func descriptor)");
         w.u8v(static_cast<uint8_t>(VTag::func));
         w.u32v(it->second);
+    } else if (v.is<Builtin>()) {
+        /* a builtin VALUE (`const OPS = [len, abs];`): its name, re-bound
+         * on load as a BuiltinCall's is */
+        const UniqueId *nm = builtin_value_name(v.get_ref<Builtin>());
+        if (!nm)
+            bad_image("unserializable value (an unregistered builtin)");
+        w.u8v(static_cast<uint8_t>(VTag::bltn));
+        w.uidv(nm);
     } else {
         /* The loud abort: an image is never silently lossy. */
         bad_image("unserializable value type in a chunk pool");
@@ -1047,6 +1076,12 @@ EvalValue read_value(Reader &r)
         /* No context, hence no root of its own: do_func_call substitutes
          * the CALLER's root for a ctx-less closure (see capture_root). */
         return EvalValue(make_intrusive<FuncObject>(fd, nullptr));
+    }
+    case VTag::bltn: {
+        Builtin b(nullptr);
+        if (!vm_lookup_builtin(r.uidv(), b))
+            bad_image("corrupt or incompatible .myv (unknown builtin)");
+        return EvalValue(b);
     }
     }
     bad_image("corrupt .myv (value tag)");

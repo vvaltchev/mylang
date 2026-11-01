@@ -8760,8 +8760,8 @@ loader re-interns), a `Builtin` is its NAME (`vm_lookup_builtin` re-resolves;
 an unknown name is refused), struct defs / descriptors are table indices.
 Values go through a recursive codec (none/bool/int/float/str/array WITH its
 storage kind + readonly/dict + default/struct instance/struct descriptor/
-FuncObject) that ABORTS on an unlisted type - an image is never silently
-lossy. Struct LAYOUT is recomputed at load (`compute_layout`), never
+FuncObject/class instance/builtin, the last by NAME since v39) that ABORTS
+on an unlisted type - an image is never silently lossy. Struct LAYOUT is recomputed at load (`compute_layout`), never
 stored.
 **THE COMPACT INSTRUCTION ENCODING (v3, 2026-07-29).** The fixed 27-byte
 field-wise record was 37% of an image; an instruction is now

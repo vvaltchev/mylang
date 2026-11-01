@@ -88,6 +88,7 @@ def value(r):
             r.boolv()
             for _ in range(r.u32()): value(r)
         return '<class>'
+    if t == 11: return ('builtin', r.uid())       # bltn (v39)
     raise ValueError('bad value tag %d at %d' % (t, r.p))
 
 # ---- section 2.2: a TypeAnnot record (v37) -----------------------------
