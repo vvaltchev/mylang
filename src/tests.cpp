@@ -34104,6 +34104,133 @@ static bool myv_verify_ctor_minirun()
  * Watched failing: with the record stored (v17) the tampered lists came
  * back verbatim.
  */
+
+/*
+ * A CYCLE of scalar-result claims survives a load (myv_derive_ref_slots).
+ * `ev` returns `od(n - 1)` and `od` returns `ev(n - 1)`: each call's claim
+ * holds only if the other's does, so a fixpoint that restores a claim
+ * once it is justified - starting from none - restores neither, and the
+ * loaded image ran the reference-checking code the compile had proven
+ * unneeded (its native code differed from a fresh compile's in 30 of 112
+ * functional programs). Every claim the compile made, and every chunk's
+ * ref_slots, must come back as they were written.
+ */
+static bool myv_ret_scalar_cycle()
+{
+    const std::string src =
+        "func ev(int n) { if (n == 0) return 1; return od(n - 1); }\n"
+        "func od(int n) { if (n == 0) return 0; return ev(n - 1); }\n"
+        "print(ev(int(runtime(7))), od(int(runtime(7))));\n";
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-retcycle.myv";
+    /* name -> the chunk's claims (one per call) and its ref_slots */
+    using Facts = std::map<std::string,
+                           std::pair<std::vector<int>, std::vector<int32_t>>>;
+    const auto facts = [](const VmProgram &p) {
+        Facts f;
+        const auto one = [&](const std::string &nm, const Chunk &ck) {
+            auto &e = f[nm];
+            for (const Instr &in : ck.code)
+                if (in.op == OpCode::CallV || in.op == OpCode::CachedCallV)
+                    e.first.push_back(in.ret_scalar() ? 1 : 0);
+            e.second = ck.ref_slots;
+        };
+        one("<main>", p.root);
+        for (const auto &d : p.funcs)
+            if (d->vm_chunk && d->name)
+                one(d->name->val, *static_cast<const Chunk *>(d->vm_chunk));
+        return f;
+    };
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        const Facts want = facts(prog);
+        /* the vacuity guard: a claim on a call whose result its chunk
+         * returns as is, or through a move - the shape only a cycle can
+         * justify (the bytecode inliner pastes od into ev, so ev calls
+         * itself and returns a move of the result) */
+        bool cyclic = false;
+        for (const auto &d : prog.funcs) {
+            if (!d->vm_chunk)
+                continue;
+            const Chunk &ck = *static_cast<const Chunk *>(d->vm_chunk);
+            std::set<int64_t> ret;
+            for (const Instr &r : ck.code)
+                if (r.op == OpCode::ReturnV && !r.a_is_lit())
+                    ret.insert(r.a_slot());
+            for (const Instr &m : ck.code)
+                if (m.op == OpCode::MoveV && ret.count(m.target))
+                    ret.insert(m.target2);
+            for (const Instr &c : ck.code)
+                if (c.op == OpCode::CallV && c.ret_scalar()
+                        && ret.count(c.target))
+                    cyclic = true;
+        }
+        if (!cyclic) {
+            fprintf(stderr, "myv_ret_scalar_cycle: no claimed call returns "
+                            "its result as is - the test is vacuous\n");
+            ok = false;
+        }
+        myv_write(prog, path, MyvSourceRef());
+        MyvSource img_src;
+        const bool sj = g_jit_enabled;
+        g_jit_enabled = false;          /* #56 would delete the calls */
+        VmProgram plain = myv_read(path, img_src);
+        g_jit_enabled = sj;
+        const Facts got = facts(plain);
+        if (got != want) {
+            ok = false;
+            for (const auto &kv : want) {
+                const auto it = got.find(kv.first);
+                if (it == got.end() || it->second != kv.second)
+                    fprintf(stderr, "myv_ret_scalar_cycle: %s: %zu claims, "
+                                    "%zu ref slots written; %zu / %zu "
+                                    "loaded, or they differ\n",
+                            kv.first.c_str(), kv.second.first.size(),
+                            kv.second.second.size(),
+                            it == got.end() ? 0 : it->second.first.size(),
+                            it == got.end() ? 0 : it->second.second.size());
+            }
+        }
+        VmProgram loaded = myv_read(path, img_src);
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(loaded);
+        } catch (Exception &e) {
+            cap << "EXC " << e.name << "\n";
+        }
+        std::cout.rdbuf(old_buf);
+        if (cap.str() != "0 1 \n") {
+            fprintf(stderr, "myv_ret_scalar_cycle: the image printed '%s'\n",
+                    cap.str().c_str());
+            ok = false;
+        }
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_ret_scalar_cycle: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    std::remove(path.c_str());
+    g_exec_engine = saved;
+    return ok;
+}
+
 /*
  * A call's SCALAR-RESULT claim (Instr::ret_scalar) is honored on load only
  * when the loader can justify it (myv_derive_ref_slots): the claim keeps
@@ -59098,6 +59225,8 @@ static const std::vector<extra_check> extra_checks =
       myv_ref_slots_derived },
     { "myv: a call's scalar-result claim is honored only when justified "
       "(myv_fuzz small-390)", myv_ret_scalar_justified },
+    { "myv: a cycle of scalar-result claims survives a load (ev/od)",
+      myv_ret_scalar_cycle },
     { "myv: v19 - the root chunk's slot_count and the stored root slot "
       "count must agree, either copy mutated is refused",
       myv_root_slot_count_checked },
