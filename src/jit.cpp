@@ -30744,7 +30744,7 @@ static bool op_run_eligible(const Instr &in, const JitCtx *jc)
     /* M5: a plain CallV is eligible - the emit picks the #55 direct
      * fragment call for a native_leaf callee (callv_native_ok), else the
      * SYNCHRONOUS jit_call_sync (any callee with a chunk, main callers
-     * included): the callee runs to completion via the vm_try_invoke
+     * included): the callee runs to completion via the VmInvoker
      * boundary machinery and the CALLER stays native across the call.
      * Undefined/non-callable/chunk-less/depth-capped shapes BAIL
      * pre-side-effect. EXCEPT direct SELF-recursion: past the depth cap

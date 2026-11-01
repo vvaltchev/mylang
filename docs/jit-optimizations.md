@@ -60,13 +60,15 @@ convert to the `g_vm_exc_pending` signal as before. Builtin->callback loops
 **`VmInvoker`** (vm.h): the callee frame is pushed ONCE per loop and each
 element just rebinds the param slots through the activation's reusable
 invoke context (its OWN FlowState - reusing the caller's would let a
-callback's boundary return corrupt the enclosing frame's flow); single-shot
-callbacks use `vm_try_invoke` (eval_func's gate). **#60 (b): the dispatch
+callback's boundary return corrupt the enclosing frame's flow). (A
+single-shot twin, `vm_try_invoke`, was deleted on 2026-11-11: its only
+caller ran exactly when `VmInvoker`'s identical gate had failed, so it
+always returned false.) **#60 (b): the dispatch
 loop is split into a file-local `vm_dispatch(chunk, ctx, act)`** - the
 `vm_run_chunk` entry (EntryGuard + `vm_enter_invocation_fast` + the
-`g_current_ctx` CtxGuard) is per-INVOCATION, so `VmInvoker::invoke` /
-`vm_try_invoke` (which already own the activation, boundary window, captures
-switch, and - set once for the whole loop - `g_current_ctx`) re-enter
+`g_current_ctx` CtxGuard) is per-INVOCATION, so `VmInvoker::invoke`
+(which already owns the activation, boundary window, captures
+switch, and - set once for the whole loop - `g_current_ctx`) re-enters
 `vm_dispatch` DIRECTLY per element, paying ZERO entry setup (the per-element
 EntryGuard dtor was 4.6% of a map/filter profile). Measured whole-program Ir
 vs the pre-#60 baseline: 35_map_filter **-10.2%**, 34_sort_custom_cmp

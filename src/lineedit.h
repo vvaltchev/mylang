@@ -156,8 +156,6 @@ private:
     void kill_to_end();
     void kill_to_start();
     void kill_word();
-    void word_left();
-    void word_right();
     void hist_prev();
     void hist_next();
     void move_up();                       /* within buffer, else history */

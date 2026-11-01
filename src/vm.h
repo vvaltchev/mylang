@@ -60,7 +60,7 @@ bool vm_lookup_builtin(const UniqueId *name, Builtin &out);
  *
  * #60 (b): this is the per-INVOCATION entry (activation + boundary window +
  * g_current_ctx setup) around the bare dispatch loop (vm_dispatch, file-local
- * in vm.cpp). A builtin CALLBACK loop (VmInvoker / vm_try_invoke) that already
+ * in vm.cpp). A builtin CALLBACK loop (VmInvoker) that already
  * owns those re-enters vm_dispatch DIRECTLY, paying no per-element entry setup.
  */
 void vm_run_chunk(const Chunk &chunk, EvalContext &ctx);
@@ -140,18 +140,8 @@ const char *int_slots_fault(const std::vector<int32_t> &ref_slots,
 
 #endif
 
-/*
- * Phase D: run a builtin's USER-CALLBACK (eval_func's funnel) as a boundary
- * frame on the current activation - no per-element do_func_call/
- * EvalContext. False = not available (no activation / const-eval / no
- * chunk); the caller falls back to do_func_call. May throw exactly what
- * do_func_call would (arity, bind coercion, the callee's exceptions with
- * this frame's backtrace entry appended).
- */
 class FuncObject;
 class CaptureSlots;   /* a closure's captured values (eval.h) */
-bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
-                   const EvalValue *argv, size_t n, EvalValue &out);
 
 /*
  * Phase D, the LOOP form (roadmap C2): a builtin that invokes the SAME

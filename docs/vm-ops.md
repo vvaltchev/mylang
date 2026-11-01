@@ -1711,7 +1711,7 @@ hold none at run time - so the BIND refuses it (`TypeErrorEx`, the
 parameter named), before the callee's body runs. The tree-walker's
 `bind_param` checks first thing; the generic dyn-callee op
 (`CallValueGenericV`, interpreted and `jit_call_value_generic`) and the
-callback invoker (`VmInvoker::invoke`, `vm_try_invoke`) call
+callback invoker (`VmInvoker::invoke`) call
 `bind_fault` (eval.h) before their bind. The other call ops -
 `CallV`, `CachedCallV`, `CallValueV` - are NOT touched: their many native
 tiers (the emitted push, frameless sites, REGCALL, the bytecode inliner's
