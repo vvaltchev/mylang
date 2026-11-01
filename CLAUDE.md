@@ -683,7 +683,9 @@ print the same stdout.
 A unit whose header says `# INT-SOURCE: ../functional/NAME.my` RUNS that
 program under its own headers: a functional test counted as a coverage
 unit without a second copy (the census pass runs tests/functional too, but
-only units count toward the universe).
+only units count toward the universe). `driver_checks` compiles every
+functional program (the image round trip), so such a unit must own what
+RUNNING the program reaches.
 **`tests/int/repl/*.session` are REPL units:** each is fed to `--repl`
 on stdin under a fresh `HOME` and must print exactly its `.expected`, nothing
 on stderr - the interactive front end (input loop, history, the line

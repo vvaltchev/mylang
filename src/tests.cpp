@@ -24209,6 +24209,23 @@ static bool lineedit_bracketed_paste_inline()
     return ed.buffer() == "ab + 1" && !ed.pasting() && ed.cursor() == 6;
 }
 
+/* What a paste is cleaned of, and what the re-indent ignores: CRLF and a
+ * lone CR both end a line, trailing blank lines go, a tab inside a line
+ * becomes a space and another control byte is dropped, a bracket inside a
+ * string does not count toward the depth, and a line opening with `)` or
+ * `]` dedents like one opening with `}`. */
+static bool lineedit_bracketed_paste_cleans()
+{
+    LineEditor a;
+    le_feed(a, "\033[200~s = \"{(\";\r\nx =\t1;\x01\rf(\n1,\n)\n\n"
+               "\033[201~");
+    if (a.pasting() || a.buffer() != "s = \"{(\";\nx = 1;\nf(\n  1,\n)")
+        return false;
+    LineEditor b;
+    le_feed(b, "\033[200~v = [\n  [2],\n    3\n]\033[201~");
+    return !b.pasting() && b.buffer() == "v = [\n  [2],\n  3\n]";
+}
+
 static bool repl_incomplete_detection()
 {
     if (!ReplEngine::is_incomplete("func f() {")) return false;   /* open { */
@@ -59655,6 +59672,8 @@ static const std::vector<extra_check> extra_checks =
       lineedit_bracketed_paste_normalizes_indent },
     { "lineedit: bracketed paste inline continues the line",
       lineedit_bracketed_paste_inline },
+    { "lineedit: a paste drops CR, control bytes and trailing blank lines; "
+      "a bracket in a string is not a level", lineedit_bracketed_paste_cleans },
     { "highlight: inserts color escapes", highlight_inserts_color },
     { "highlight: stripping escapes restores the input",
       highlight_preserves_visible_text },
