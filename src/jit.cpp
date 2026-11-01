@@ -16183,15 +16183,6 @@ void reg_audit_report()
             g_reg_shareable, g_reg_shareable_closed);
 }
 
-static const char *jit_op_name(OpCode op)
-{
-#define ML_OPCODE_NAMEV(N) #N,
-    static const char *const names[] = { ML_FOR_EACH_OPCODE(ML_OPCODE_NAMEV) };
-#undef ML_OPCODE_NAMEV
-    const size_t i = static_cast<size_t>(op);
-    return i < sizeof(names) / sizeof(names[0]) ? names[i] : "?";
-}
-
 void jit_stats_report()
 {
     if (!getenv("MYLANG_JITSTATS"))
@@ -16482,7 +16473,7 @@ void jit_cache_audit_report()
             g_cache_pinned, g_cache_lost);
     for (const auto &pr : v)
         fprintf(stderr, "CACHEAUDIT %-26s %ld\n",
-                jit_op_name(static_cast<OpCode>(pr.second)), pr.first);
+                opcode_name(static_cast<OpCode>(pr.second)), pr.first);
 }
 
 /*
@@ -31584,17 +31575,6 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
     g_cur_fwd_tgt = fwd_live_ok ? &fwd_tgt : nullptr;   /* REGCALL 3 */
     g_fwd = JitFwd{};
 
-    /* op -> enum NAME (the audit's label; from the X-macro, so it can
-     * never drift from the opcode list) */
-    static const auto jit_op_name = [](OpCode op) -> const char * {
-        switch (op) {
-#define X(o) case OpCode::o: return #o;
-        ML_FOR_EACH_OPCODE(X)
-#undef X
-        default: return "?";
-        }
-    };
-
     /* Approach A: a run is DELETABLE (its interpreted originals removed - no
      * double copy) iff the fragment NEVER returns an interior pc, i.e. every
      * op is `op_fully_native` (no re-interpret bail, no jit_raise) AND the
@@ -31652,7 +31632,7 @@ void jit_compile_chunk(Chunk &chunk, const JitCtx *jc)
                 if (!op_fully_native(chunk.code[p])) {
                     full = false;
                     ops_s += std::string(" ")
-                        + jit_op_name(chunk.code[p].op);
+                        + opcode_name(chunk.code[p].op);
                 }
             if (!full)
                 why = "bail-op:";

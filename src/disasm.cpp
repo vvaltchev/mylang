@@ -111,18 +111,6 @@ std::string opsym(Op op)
     return OpString[static_cast<int>(op)];
 }
 
-/* The bare enum NAME of an opcode (for the M1 container-plan blocker list -
- * the full mnemonic lives in render_instr's per-op switch; here the enum
- * spelling is the clearest "what op is blocking nativization"). */
-const char *opcode_name(OpCode op)
-{
-#define ML_OPCODE_NAME(N) case OpCode::N: return #N;
-    switch (op) {
-    ML_FOR_EACH_OPCODE(ML_OPCODE_NAME)
-    default: return "?";
-    }
-#undef ML_OPCODE_NAME
-}
 
 /* The baked operator of a B1/B2 specialized arith op (bytecode.h). */
 const char *spec_arith_sym(OpCode op)
@@ -2943,6 +2931,22 @@ std::string hl_line(const std::string &line)
 }
 
 } // namespace
+
+/* The bare enum NAME of an opcode (for the M1 container-plan blocker list -
+ * the full mnemonic lives in render_instr's per-op switch; here the enum
+ * spelling is the clearest "what op is blocking nativization"). */
+const char *opcode_name(OpCode op)
+{
+    /* a TABLE, generated from THE list (bytecode.h) in enum order, not a
+     * switch: a switch's one case per opcode is a branch no dump reaches
+     * for most of them, and the coverage universe counted each twice -
+     * here and in codegen's own copy (bc_op_name, gone) */
+#define ML_OPCODE_NAME(N) #N,
+    static const char *const names[] = { ML_FOR_EACH_OPCODE(ML_OPCODE_NAME) };
+#undef ML_OPCODE_NAME
+    const size_t i = static_cast<size_t>(op);
+    return i < sizeof names / sizeof names[0] ? names[i] : "?";
+}
 
 std::string highlight_disasm(const std::string &plain)
 {

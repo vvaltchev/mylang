@@ -10,6 +10,7 @@ unsigned long g_cg_minmax_lowered = 0;  /* #97 B2: emit-time (codegen) */
 #include "vm.h"      /* vm_aop_dispatchable - #137 tier 1 */
 #include "inferencer.h"
 #include "syntax.h"
+#include "disasm.h"     /* opcode_name - the one spelling of an op */
 
 /* eval.cpp's AST-shape purity check (see eval.h) - declared here to avoid
  * pulling the whole eval.h into the codegen TU. */
@@ -13653,20 +13654,6 @@ codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit)
  * none) needs the return boundary to synthesize that none, and that is a
  * later increment.
  */
-/* The opcode's name, generated from THE list (bytecode.h), so it can never
- * name an op that does not exist nor miss one that does. jit.cpp has its
- * own copy for the delete-originals audit; this one exists so the inline
- * audit does not have to reach into a JIT-only, off-platform-absent TU. */
-static const char *bc_op_name(OpCode op)
-{
-#define ML_BC_OPNAME(N) case OpCode::N: return #N;
-    switch (op) {
-    ML_FOR_EACH_OPCODE(ML_BC_OPNAME)
-    case OpCode::OpCount_: break;
-    }
-#undef ML_BC_OPNAME
-    return "?";
-}
 
 /* #98 census shim: the retarget whitelist (op_writes_pure_target) lives
  * in the anonymous namespace above; export it under a test name - a
@@ -13850,7 +13837,7 @@ bool bc_inline_callee_ok(const Chunk &callee, std::string *why,
             continue;
         if (!bc_inline_op_ok(in.op)) {
             if (why)
-                *why = std::string("op:") + bc_op_name(in.op);
+                *why = std::string("op:") + opcode_name(in.op);
             return false;
         }
     }
@@ -13871,7 +13858,7 @@ void bc_inline_audit(const Chunk &caller, const char *caller_name,
             /* a runtime callee - unreachable without a GUARD, and 76/11
              * are entirely this shape (plans/bytecode-inliner.md) */
             fprintf(stderr, "INLAUDIT %s pc%zu %s: runtime-callee\n",
-                    caller_name, pc, bc_op_name(in.op));
+                    caller_name, pc, opcode_name(in.op));
             continue;
         }
         const int gslot = in.target2;
