@@ -1,0 +1,20 @@
+# A frameless frame that reaches the sync call depth cap (32 on a
+# sanitized build, about 200 with MYLANG_NATIVE_STACK=0) declines its
+# call to a BOUNDARY call, and the decline reset the call's destination
+# slot with a raw `none` store first. A destination that held a
+# reference lost it: in `r` the call's dst r4 first holds the copy of
+# `a` the array literal is built from, so every run of `r` past the cap
+# leaked one array - and with it the chain of arrays nested inside
+# (2026-11-09). LeakSanitizer and the INT object census report it.
+
+func r(dyn a, int n) {
+    if (n == 0)
+        return 0;
+    return 1 + r([a], n - 1);
+}
+
+var total = 0;
+for (var k = 0; k < runtime(3); k++)
+    total = total + r(k, runtime(300));
+assert(total == 900);
+print("ok", total);

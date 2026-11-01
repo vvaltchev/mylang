@@ -1812,7 +1812,11 @@ collision). Three nets now:
   LOCAL half; a parameter's bit is ignored - the fill writes it.
   `jit_chunk_frameless_derive` is the ONE derivation point for the
   three frameless facts (codegen, the splice, the loader). Emitted code
-  byte-identical corpus-wide; W5: a frameless
+  byte-identical corpus-wide. ⛔ A RESET of a possibly-raw slot covers
+  exactly that set (`frameless_init_free & ~frameless_read_first`): the
+  boundary decline's dst reset (E2b) wrote `none` over EVERY dst and
+  dropped a reference an initialised one held (a leak past the depth
+  cap, 2026-11-09); W5: a frameless
   site BORROWS a non-escaping reference INLINE - the callee is baked,
   so `noescape_params` is an emit-time bit - as a raw copy with the
   `borrowed` byte set, declining ONLY an array whose slice byte is set
