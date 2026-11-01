@@ -2524,12 +2524,26 @@ std::string disassemble_image(const VmProgram &prog)
         s << "\n";
     }
 
-    s << disassemble(prog.root, "main");
+    /* the JitCtx the load's JIT used for each chunk (vm_jit_program):
+     * the M1 container plan below asks the native-call gate, whose answer
+     * for a self-call depends on it - with none, an image's dump said
+     * READY where the fresh compile's said "islands" (a sanitized build,
+     * where the native stack is off) */
+    const std::vector<const FuncDescriptor *> slot_desc =
+        vm_image_slot_desc(prog);
+    JitCtx mjc;
+    mjc.slot_desc = &slot_desc;
+    mjc.slot_reassigned = &prog.global_slot_reassigned;
+    s << disassemble(prog.root, "main", {}, &mjc);
 
     int anon = 0;
     for (const auto &d : prog.funcs) {
         if (!d->vm_chunk)
             continue;
+        JitCtx djc;
+        djc.slot_desc = &slot_desc;
+        djc.slot_reassigned = &prog.global_slot_reassigned;
+        djc.caller_desc = d.get();
         std::vector<std::string> cap_names;
         for (const auto &c : d->captures)
             cap_names.push_back(std::string(c.name->val));
@@ -2540,7 +2554,7 @@ std::string disassemble_image(const VmProgram &prog)
             title = (cap_names.empty() ? "lambda#" : "closure#")
                     + std::to_string(anon++);
         s << "\n" << disassemble(*static_cast<const Chunk *>(d->vm_chunk),
-                                 title, cap_names);
+                                 title, cap_names, &djc);
     }
     return s.str();
 }
@@ -2676,7 +2690,10 @@ std::string disassemble_program(const Block *root)
     }
     vm_jit_program(&main_ck, bodies, slot_desc, root->global_slot_reassigned);
 
-    s << disassemble(main_ck, "main");
+    JitCtx mjc;          /* main's, as Pass B's: no caller descriptor */
+    mjc.slot_desc = &slot_desc;
+    mjc.slot_reassigned = &root->global_slot_reassigned;
+    s << disassemble(main_ck, "main", {}, &mjc);
 
     int anon = 0;
     for (const FuncDeclStmt *fn : funcs) {

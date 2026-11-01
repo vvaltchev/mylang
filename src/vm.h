@@ -438,6 +438,9 @@ struct VmProgram {
  * then jit each body with a JitCtx rebuilt from the image), so a loaded
  * program gets the IDENTICAL native tier a fresh compile does. */
 void vm_jit_loaded_image(VmProgram &prog);
+/* a loaded image's global slot -> descriptor map, by name: the one the
+ * load's JIT builds and the image's -vd dump reads */
+std::vector<const FuncDescriptor *> vm_image_slot_desc(const VmProgram &prog);
 
 /*
  * THE JIT DRIVER - the one pass sequence that turns a codegen'd program
