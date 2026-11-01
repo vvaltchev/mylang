@@ -562,7 +562,7 @@ EvalValue builtin_show(EvalContext *ctx, ExprList *exprList)
 
     /* A bare identifier bound to a function -> render the function's body.
      * (An Identifier eval is a side-effect-free scope lookup.) */
-    if (dynamic_cast<Identifier *>(arg)) {
+    if (node_cast<Identifier>(arg)) {
         const EvalValue lv = arg->eval(ctx);
         if (lv.is<LValue *>()) {
             const EvalValue &v = lv.get<LValue *>()->get();

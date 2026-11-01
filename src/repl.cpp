@@ -136,9 +136,9 @@ repl_echo_none(const Construct *last, const std::vector<Tok> &toks)
     /* the node is a lookup or a literal (never a declaration, whose node
      * starts at the declared NAME), and its tokens are a lookup */
     if (!last || !last->start
-            || !(last->is_id() || dynamic_cast<const MemberExpr *>(last)
-                 || dynamic_cast<const Subscript *>(last)
-                 || dynamic_cast<const LiteralNone *>(last)))
+            || !(last->is_id() || node_cast<const MemberExpr>(last)
+                 || node_cast<const Subscript>(last)
+                 || node_cast<const LiteralNone>(last)))
         return false;
     const Loc s = last->start;
     size_t i = 0;
@@ -171,19 +171,19 @@ static void
 repl_declared_names(const Construct *c,
                     std::unordered_set<const UniqueId *> &out)
 {
-    if (const auto *fd = dynamic_cast<const FuncDeclStmt *>(c)) {
+    if (const auto *fd = node_cast<const FuncDeclStmt>(c)) {
         if (fd->id)
             out.insert(fd->id->uid);
-    } else if (const auto *sd = dynamic_cast<const StructDeclStmt *>(c)) {
+    } else if (const auto *sd = node_cast<const StructDeclStmt>(c)) {
         if (sd->id)
             out.insert(sd->id->uid);
-    } else if (const auto *e = dynamic_cast<const Expr14 *>(c)) {
+    } else if (const auto *e = node_cast<const Expr14>(c)) {
         if (!(e->fl & pFlags::pInDecl))
             return;
-        if (const auto *id = dynamic_cast<const Identifier *>(
+        if (const auto *id = node_cast<const Identifier>(
                 e->lvalue.get()))
             out.insert(id->uid);
-        else if (const auto *il = dynamic_cast<const IdList *>(
+        else if (const auto *il = node_cast<const IdList>(
                      e->lvalue.get()))
             for (const auto &x : il->elems)
                 out.insert(x->uid);
@@ -872,7 +872,7 @@ ReplEngine::Impl::do_eval(const string &src, bool echo)
 
     /* 3. Evaluate each top-level statement directly in the persistent global
      *    scope, capturing print() output and the last statement's value. */
-    Block *blk = dynamic_cast<Block *>(root.get());
+    Block *blk = node_cast<Block>(root.get());
     EvalValue last;
     const Construct *last_elem = nullptr;   /* the last top-level statement */
     size_t ran = 0;                         /* statements that completed */
@@ -1341,14 +1341,14 @@ ReplEngine::Impl::cmd_type(const string &code)
         ParseContext pc(TokenStream(toks), true);
         bind_parser(pc);
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
-        Block *blk = dynamic_cast<Block *>(root.get());
+        Block *blk = node_cast<Block>(root.get());
         if (!blk || blk->elems.empty())
             return "(empty)\n";
 
         /* a single bare identifier that is a committed global -> its inferred
          * static type (no evaluation needed, richer than the value kind). */
         if (blk->elems.size() == 1) {
-            if (auto *id = dynamic_cast<Identifier *>(blk->elems[0].get())) {
+            if (auto *id = node_cast<Identifier>(blk->elems[0].get())) {
                 const string st = infer.global_type(id->uid);
                 if (!st.empty())
                     return string(id->get_str()) + " : " + st +
@@ -1459,7 +1459,7 @@ ReplEngine::Impl::cmd_show(const string &arg)
         unique_ptr<Construct> root = pBlock(pc, 0, /*push_const_scope=*/true);
         resolve_names(root.get(), /*inline=*/true, 24, nullptr, /*repl=*/true);
 
-        Block *blk = dynamic_cast<Block *>(root.get());
+        Block *blk = node_cast<Block>(root.get());
         string r;
         if (blk) {
             for (const auto &el : blk->elems)
@@ -1493,7 +1493,7 @@ ReplEngine::Impl::gc_redefined_instances(
      */
     std::set<string> redefined;
     for (const auto &e : blk->elems)
-        if (auto *fd = dynamic_cast<FuncDeclStmt *>(e.get()))
+        if (auto *fd = node_cast<FuncDeclStmt>(e.get()))
             if (fd->id && fd->desc->display_name.empty() &&
                 before.count(fd->id->uid))
                 redefined.insert(string(fd->id->get_str()));

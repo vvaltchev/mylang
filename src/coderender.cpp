@@ -149,31 +149,31 @@ struct Renderer {
          * of one must not read as a call of its body */
         if (ctag(c) == ConstructType::func_decl)
             return 1;
-        if (auto *e = dynamic_cast<const TypedScalarExpr *>(c)) {
+        if (auto *e = node_cast<const TypedScalarExpr>(c)) {
             if (e->cat == TypedScalarExpr::Cat::neg ||
                 e->cat == TypedScalarExpr::Cat::lnot)
                 return 8;
             return e->elems.size() > 1 ? op_prec(e->elems[1].first) : 8;
         }
         if (auto *m = dynamic_cast<const MultiOpConstruct *>(c)) {
-            if (dynamic_cast<const Expr02 *>(c))
+            if (node_cast<const Expr02>(c))
                 return 8;
             return m->elems.size() > 1 ? op_prec(m->elems[1].first) : 8;
         }
-        if (dynamic_cast<const CallExpr *>(c) ||
-            dynamic_cast<const Subscript *>(c) ||
-            dynamic_cast<const Slice *>(c) ||
-            dynamic_cast<const MemberExpr *>(c))
+        if (node_cast<const CallExpr>(c) ||
+            node_cast<const Subscript>(c) ||
+            node_cast<const Slice>(c) ||
+            node_cast<const MemberExpr>(c))
             return PREC_POSTFIX;
-        if (auto *e = dynamic_cast<const IncDecExpr *>(c))
+        if (auto *e = node_cast<const IncDecExpr>(c))
             return e->is_prefix ? 8 : PREC_POSTFIX;
         if (ctag(c) == ConstructType::deref)
             return 8;                       /* a prefix operator */
         /* ternary / ?? are the loosest expressions (just above assignment) */
-        if (dynamic_cast<const TernaryExpr *>(c) ||
-            dynamic_cast<const CoalesceExpr *>(c))
+        if (node_cast<const TernaryExpr>(c) ||
+            node_cast<const CoalesceExpr>(c))
             return 1;
-        if (auto *e1 = dynamic_cast<const Expr01 *>(c))
+        if (auto *e1 = node_cast<const Expr01>(c))
             return e1->elem ? expr_prec(e1->elem.get()) : PREC_PRIMARY;
         return PREC_PRIMARY;
     }
@@ -529,7 +529,7 @@ struct Renderer {
      * not share their parents. */
     static const InlineCtx *callee_frame(const InlinedCallExpr *e)
     {
-        auto *b = dynamic_cast<const Block *>(e->elem.get());
+        auto *b = node_cast<const Block>(e->elem.get());
         if (!b)
             return nullptr;
         const size_t n = chain_len(e->inline_ctx);
@@ -553,9 +553,9 @@ struct Renderer {
     {
         const InlineCtx *fr = callee_frame(e);
         const char *nm = fr ? fr->callee_name.c_str() : "?";
-        auto *b = dynamic_cast<const Block *>(e->elem.get());
+        auto *b = node_cast<const Block>(e->elem.get());
         const ReturnStmt *r = (b && b->elems.size() == 1)
-            ? dynamic_cast<const ReturnStmt *>(b->elems[0].get()) : nullptr;
+            ? node_cast<const ReturnStmt>(b->elems[0].get()) : nullptr;
         if (r) {
             o << "/* inlined " << nm << " */ (";
             if (r->elem) expr(r->elem.get(), 0); else o << "none";
@@ -576,10 +576,10 @@ struct Renderer {
     {
         if (e14->fl & pFlags::pInDecl) {
             const bool is_const = e14->fl & pFlags::pInConstDecl;
-            if (auto *lv = dynamic_cast<const Identifier *>(e14->lvalue.get()))
+            if (auto *lv = node_cast<const Identifier>(e14->lvalue.get()))
                 o << decl_kw(lv, e14->rvalue.get(), is_const) << " "
                   << lv->get_str();
-            else if (auto *l = dynamic_cast<const IdList *>(
+            else if (auto *l = node_cast<const IdList>(
                          e14->lvalue.get())) {
                 /* `var a, b = ...`: the keyword of the first target (the
                  * annotation and the modifiers apply to all of them) */
@@ -623,16 +623,16 @@ struct Renderer {
                        string(rv->arr_hint_struct->name->val) + ">";
             if (const char *at = arr_hint_type(rv->arr_hint))
                 return prefix + at;
-            if (auto *lo = dynamic_cast<const LiteralObj *>(rv))
+            if (auto *lo = node_cast<const LiteralObj>(rv))
                 return prefix + reflect_typeof(lo->literal_value());
             /* th == i is ALSO a bool's hint (Construct::th_bool) */
             if (rv->th == TypeHint::i)
                 return prefix + (rv->th_bool ? "bool" : "int");
             if (rv->th == TypeHint::f) return prefix + "float";
-            if (dynamic_cast<const LiteralInt *>(rv))   return prefix + "int";
-            if (dynamic_cast<const LiteralFloat *>(rv)) return prefix + "float";
-            if (dynamic_cast<const LiteralBool *>(rv))  return prefix + "bool";
-            if (dynamic_cast<const LiteralStr *>(rv))   return prefix + "str";
+            if (node_cast<const LiteralInt>(rv))   return prefix + "int";
+            if (node_cast<const LiteralFloat>(rv)) return prefix + "float";
+            if (node_cast<const LiteralBool>(rv))  return prefix + "bool";
+            if (node_cast<const LiteralStr>(rv))   return prefix + "str";
         }
         return string(is_const ? "const" : "var") +
                (lv->opt_mod ? " opt" : "");
@@ -735,7 +735,7 @@ struct Renderer {
              * with a "counted" marker so the optimization is visible. */
             auto *fr = static_cast<const ForRangeStmt *>(c);
             const Construct *ivar = nullptr;
-            if (auto *e14 = dynamic_cast<const Expr14 *>(fr->init.get()))
+            if (auto *e14 = node_cast<const Expr14>(fr->init.get()))
                 ivar = e14->lvalue.get();
             const bool asc = (fr->cmp_op == Op::lt || fr->cmp_op == Op::le);
             o << "for (";
@@ -848,7 +848,7 @@ struct Renderer {
      * still wrapped so the output is unambiguous. */
     void inline_block(const Construct *c, int level)
     {
-        if (auto *b = dynamic_cast<const Block *>(c)) {
+        if (auto *b = node_cast<const Block>(c)) {
             o << "{\n";
             for (const auto &e : b->elems)
                 stmt(e.get(), level + 1);
@@ -915,7 +915,7 @@ struct Renderer {
             expr(eb, 0);
             if (f->id)
                 o << ";";
-        } else if (auto *b = dynamic_cast<const Block *>(f->body.get())) {
+        } else if (auto *b = node_cast<const Block>(f->body.get())) {
             o << "{\n";
             for (const auto &e : b->elems)
                 stmt(e.get(), level + 1);

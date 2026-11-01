@@ -859,7 +859,7 @@ static bool node_takes_hint(ParseContext &c, const Construct *n)
         return static_cast<const LiteralObj *>(n)->takes_hint;
     case ConstructType::call: {
         const auto *call = static_cast<const CallExpr *>(n);
-        const auto *id = dynamic_cast<const Identifier *>(call->what.get());
+        const auto *id = node_cast<const Identifier>(call->what.get());
         if (!id || !builtin_takes_arr_hint(id->uid->val))
             return false;
         const EvalValue v = RValue(id->eval(c.const_ctx));
@@ -1724,7 +1724,7 @@ pAcceptCallExpr(ParseContext &c,
             /* -a: this call is about to fold to a literal at compile time -
              * color the callee identifier magenta before it is gone. */
             if (c.analysis)
-                if (auto *cid = dynamic_cast<Identifier *>(expr->what.get()))
+                if (auto *cid = node_cast<Identifier>(expr->what.get()))
                     c.analysis->mark(cid->start,
                         static_cast<int>(cid->get_str().length()),
                         AnnoKind::folded);
@@ -1952,7 +1952,7 @@ pAcceptMember(ParseContext &c,
      * the spaces after `d.zz` under its caret (and one column too few
      * when nothing separated them: `d.zz+1` underlined `d.z`) */
     mem->end = tmpId->end;
-    unique_ptr<Identifier> id(dynamic_cast<Identifier *>(tmpId.release()));
+    unique_ptr<Identifier> id(node_cast<Identifier>(tmpId.release()));
 
     if (!id)
         throw InternalErrorEx(mem->start, mem->end);
@@ -2567,7 +2567,7 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
 
     if (fl & pFlags::pInStmt) {
 
-        Identifier *first_id = dynamic_cast<Identifier *>(lside.get());
+        Identifier *first_id = node_cast<Identifier>(lside.get());
 
         /* `K, a = ..` with a const scalar K: the name folded to its value,
          * so no IdList forms - refuse it as the single target `K = 6` is
@@ -2737,10 +2737,10 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
         const bool opt_f = (fl & pFlags::pInOptDecl) != 0;
         const bool dyn_f = (fl & pFlags::pInDynDecl) != 0;
 
-        if (auto *id = dynamic_cast<Identifier *>(ret->lvalue.get())) {
+        if (auto *id = node_cast<Identifier>(ret->lvalue.get())) {
             id->opt_mod = opt_f;
             id->dyn_mod = dyn_f;
-        } else if (auto *idl = dynamic_cast<IdList *>(ret->lvalue.get())) {
+        } else if (auto *idl = node_cast<IdList>(ret->lvalue.get())) {
             for (auto &e : idl->elems) {
                 e->opt_mod = opt_f;
                 e->dyn_mod = dyn_f;
@@ -2759,11 +2759,11 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
         c.pending_decl_struct = nullptr;
         c.pending_decl_annot = nullptr;
 
-        if (auto *id = dynamic_cast<Identifier *>(ret->lvalue.get())) {
+        if (auto *id = node_cast<Identifier>(ret->lvalue.get())) {
             id->decl_type = dt;
             id->decl_struct = ds;
             id->decl_annot = da;
-        } else if (auto *idl = dynamic_cast<IdList *>(ret->lvalue.get())) {
+        } else if (auto *idl = node_cast<IdList>(ret->lvalue.get())) {
             for (auto &e : idl->elems) {
                 e->decl_type = dt;
                 e->decl_struct = ds;
@@ -2791,7 +2791,7 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
      * `var` initializer's bake is folding. */
     if (!c.folding() && ret->rvalue->is_const
         && !(fl & pFlags::pInConstDecl)
-        && !dynamic_cast<LiteralObj *>(ret->rvalue.get()))
+        && !node_cast<LiteralObj>(ret->rvalue.get()))
     {
         nc_eval_const(c, ret->rvalue.get(), true, false);
     }
@@ -2807,7 +2807,7 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
      * [f()];` compiled, and was refused under -nc). A const's bake is
      * what the const IS, so it stays, checked as a whole. */
     else if (ret->rvalue->is_const
-        && !dynamic_cast<LiteralObj *>(ret->rvalue.get())
+        && !node_cast<LiteralObj>(ret->rvalue.get())
         && !(in_idlist
              && ctag(ret->rvalue.get()) == ConstructType::lit_arr)
         && ((fl & pFlags::pInConstDecl)
@@ -2840,7 +2840,7 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
     {
         for (auto &el :
                 static_cast<LiteralArray *>(ret->rvalue.get())->elems) {
-            if (dynamic_cast<LiteralObj *>(el.get()))
+            if (node_cast<LiteralObj>(el.get()))
                 continue;
             unique_ptr<Construct> cc;
             if (cse_materialize(c, el.get(), cc, true, true))
@@ -2849,7 +2849,7 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
     }
 
     if ((fl & pFlags::pInDecl) && !in_idlist)
-        if (auto *did = dynamic_cast<Identifier *>(ret->lvalue.get()))
+        if (auto *did = node_cast<Identifier>(ret->lvalue.get()))
             stamp_literal_annot(ret->rvalue.get(), did->decl_annot.get(),
                                 did->dyn_mod);
 
@@ -2864,7 +2864,7 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
          * replaced with the coerced literal so the inlined value has the right
          * type. array/dict consts stay runtime symbols (checked by inference).
          */
-        if (auto *cid = dynamic_cast<Identifier *>(ret->lvalue.get())) {
+        if (auto *cid = node_cast<Identifier>(ret->lvalue.get())) {
             const DeclType dt = cid->decl_type;
             if (dt == DeclType::b || dt == DeclType::i ||
                 dt == DeclType::f || dt == DeclType::s) {
@@ -2892,7 +2892,7 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
         /* `const a, b = [[1], [2]]`: the assignment's value is none, so ask
          * each target - one bound to a container needs its run-time symbol
          * (it was dropped, and reading `a` was an undefined name) */
-        if (auto *il = dynamic_cast<IdList *>(ret->lvalue.get())) {
+        if (auto *il = node_cast<IdList>(ret->lvalue.get())) {
             keep = false;
             for (const auto &id : il->elems) {
                 if (id->is_underscore())
@@ -3343,13 +3343,13 @@ pAcceptBracedBlock(ParseContext &c,
  */
 static bool pStmtDeclaresName(const Construct *stmt)
 {
-    if (dynamic_cast<const FuncDeclStmt *>(stmt))
+    if (node_cast<const FuncDeclStmt>(stmt))
         return true;
 
-    if (dynamic_cast<const StructDeclStmt *>(stmt))
+    if (node_cast<const StructDeclStmt>(stmt))
         return true;
 
-    if (const auto *e = dynamic_cast<const Expr14 *>(stmt))
+    if (const auto *e = node_cast<const Expr14>(stmt))
         return (e->fl & pFlags::pInDecl) != 0;
 
     return false;
@@ -3802,7 +3802,7 @@ pAcceptFuncDecl(ParseContext &c,
     c.shadow_push();
     if (func->params)
         for (const auto &pm : func->params->elems)
-            if (const auto *pid = dynamic_cast<const Identifier *>(pm.get()))
+            if (const auto *pid = node_cast<const Identifier>(pm.get()))
                 c.shadow_add(pid->uid);
     /* ...and so does a capture: a closure's own copy, which the body may
      * rebind (a const scalar's is declared by the capture list above) */
@@ -4388,7 +4388,7 @@ cse_key_rec(ParseContext &c, const Construct *node, string &out)
     if (out.size() > CSE_KEY_CAP)
         return false;
 
-    if (const Subscript *s = dynamic_cast<const Subscript *>(node)) {
+    if (const Subscript *s = node_cast<const Subscript>(node)) {
         out += "S(";
         if (!cse_key_rec(c, s->what.get(), out))
             return false;
@@ -4399,7 +4399,7 @@ cse_key_rec(ParseContext &c, const Construct *node, string &out)
         return out.size() <= CSE_KEY_CAP;
     }
 
-    if (const Slice *s = dynamic_cast<const Slice *>(node)) {
+    if (const Slice *s = node_cast<const Slice>(node)) {
         out += "L(";
         if (!cse_key_rec(c, s->what.get(), out))
             return false;
@@ -4413,11 +4413,11 @@ cse_key_rec(ParseContext &c, const Construct *node, string &out)
         return out.size() <= CSE_KEY_CAP;
     }
 
-    if (const CallExpr *ce = dynamic_cast<const CallExpr *>(node)) {
+    if (const CallExpr *ce = node_cast<const CallExpr>(node)) {
         /* a CLASS construction makes a new object each time it is
          * evaluated: two `const a = C(1); const b = C(1);` are two
          * instances, and sharing one baked value would make a == b */
-        if (dynamic_cast<const Identifier *>(ce->what.get())) {
+        if (node_cast<const Identifier>(ce->what.get())) {
             const EvalValue cv = ce->what->eval(c.const_ctx);
             if (cv.is<LValue *>()) {
                 const EvalValue &d = cv.get<LValue *>()->get();
@@ -4454,7 +4454,7 @@ cse_key_rec(ParseContext &c, const Construct *node, string &out)
         return out.size() <= CSE_KEY_CAP;
     }
 
-    if (dynamic_cast<const Identifier *>(node)) {
+    if (node_cast<const Identifier>(node)) {
         const EvalValue ev = node->eval(c.const_ctx);
         if (!ev.is<LValue *>())
             return false;
@@ -5452,7 +5452,7 @@ pAcceptForeachStmt(ParseContext &c,
      * pBlock, because the var is declared OUTSIDE the body's own scope. */
     c.shadow_push();
     for (const auto &lv : stmt->ids->elems)
-        if (const auto *lid = dynamic_cast<const Identifier *>(lv.get()))
+        if (const auto *lid = node_cast<const Identifier>(lv.get()))
             c.shadow_add(lid->uid);
 
     if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))

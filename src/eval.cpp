@@ -2068,7 +2068,7 @@ bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
 bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
                                      Construct *arg)
 {
-    auto *cc = dynamic_cast<CallExpr *>(arg);
+    auto *cc = node_cast<CallExpr>(arg);
     if (!cc || !cc->args)
         return false;
 
@@ -4726,7 +4726,7 @@ no_side_effects(const Construct *c)
         return no_side_effects(s->what.get()) &&
                no_side_effects(s->index.get());
     }
-    if (auto *m = dynamic_cast<const MemberExpr *>(c))
+    if (auto *m = node_cast<const MemberExpr>(c))
         return no_side_effects(m->what.get());
     if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
         for (const auto &pr : mo->elems)
@@ -4734,7 +4734,7 @@ no_side_effects(const Construct *c)
                 return false;
         return true;          /* pure arithmetic/comparison index, e.g. i+1 */
     }
-    if (auto *t = dynamic_cast<const TypedScalarExpr *>(c)) {
+    if (auto *t = node_cast<const TypedScalarExpr>(c)) {
         for (const auto &pr : t->elems)
             if (!no_side_effects(pr.second.get()))
                 return false;
@@ -7186,9 +7186,9 @@ EvalValue ThrowStmt::do_eval(EvalContext *ctx, bool rec) const
  */
 static bool is_hoistable_decl(const Construct *c)
 {
-    if (const auto *fd = dynamic_cast<const FuncDeclStmt *>(c))
+    if (const auto *fd = node_cast<const FuncDeclStmt>(c))
         return fd->id != nullptr;
-    if (const auto *sd = dynamic_cast<const StructDeclStmt *>(c))
+    if (const auto *sd = node_cast<const StructDeclStmt>(c))
         return sd->id != nullptr;
     return false;
 }
@@ -8161,9 +8161,9 @@ static bool is_lvalue_rooted(const Construct *c)
 {
     if (c->is_id())
         return true;
-    if (auto *m = dynamic_cast<const MemberExpr *>(c))
+    if (auto *m = node_cast<const MemberExpr>(c))
         return is_lvalue_rooted(m->what.get());
-    if (auto *s = dynamic_cast<const Subscript *>(c))
+    if (auto *s = node_cast<const Subscript>(c))
         return is_lvalue_rooted(s->what.get());
     return false;
 }
@@ -8413,7 +8413,7 @@ dict_present_value(const intrusive_ptr<DictObject> &obj, const EvalValue &key)
 
 int_type MemberExpr::eval_int(EvalContext *ctx) const
 {
-    if (auto *sub = dynamic_cast<const Subscript *>(what.get())) {
+    if (auto *sub = node_cast<const Subscript>(what.get())) {
         int_type v;
         /* #125: the OOB caret is the SUBSCRIPT's span, not this
          * MemberExpr's - the fault is the INDEX, not the field, and it is
@@ -8458,7 +8458,7 @@ int_type MemberExpr::eval_int(EvalContext *ctx) const
 
 float_type MemberExpr::eval_float(EvalContext *ctx) const
 {
-    if (auto *sub = dynamic_cast<const Subscript *>(what.get())) {
+    if (auto *sub = node_cast<const Subscript>(what.get())) {
         float_type v;
         /* #125: the OOB caret is the SUBSCRIPT's span, not this
          * MemberExpr's - the fault is the INDEX, not the field, and it is
