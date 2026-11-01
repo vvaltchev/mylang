@@ -828,3 +828,38 @@ x = 2). What followed from it:
   `mutate.yml`, on demand): the fuzzers run as the last stage, so
   "killed by fuzz" counts exactly the planted bugs no deterministic test
   noticed.
+
+### 9.9 What an uncovered cluster turned out to be (2026-11-11)
+
+Reading a cluster before writing a test for it paid three ways in one
+batch:
+
+- **dead code**, deleted rather than tested: `vm_try_invoke` (86
+  elements) - its only caller ran exactly when `VmInvoker`'s identical
+  gate had failed, so it always returned false - and the line editor's
+  `word_left` / `word_right`, declared and never bound to a key.
+  `static_type_unify` and its occurs check (57) are the same shape -
+  only one `-rt` case calls them - but deleting them retires
+  type-variable unification from the lattice CLAUDE.md describes, so
+  that one is the maintainer's call;
+- **a real bug**: extending driver_checks' image round trip from
+  tests/functional to tests/int (166 programs) found that any program
+  asking `type(x)` / `decltype(x)` could not be stored at all - the
+  folded query is a constant `Type` instance, a struct no program's
+  table holds - and that a member read on any reflection value
+  (`layout(S).fields` too) silently lost its baked struct. `.myv` v40 names the binary's three reflection structs by
+  reserved sref numbers;
+- **instruments nobody ran**: the JIT's developer dumps (LSRADBG,
+  SHAREDBG, SPILLDBG, HOISTDBG, ESTDBG, RELDBG, DELAUDIT, CACHEAUDIT,
+  REGAUDIT) and caps (MAXPINS, MAXSPILL, MAXSHARE) - a driver check
+  now runs each, requiring its tag on stderr and the program's output
+  unchanged (all 15 configurations agreed over every functional
+  program), plus `-a` and `--trace fold`, which no driver check ran.
+
+And one cost, measured: the extended round trip, run on the INT build,
+compiled every tests/int program and so reached the compile-time code
+those units exist to own - seven of them owned nothing, and the
+ownership check failed with the count itself 662 lower. The INT build
+skips tests/int in that round trip now; every other lane runs it. **A
+check that compiles the unit corpus is a unit's rival on the coverage
+build**, whatever it checks.
