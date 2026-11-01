@@ -1614,6 +1614,29 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             s << "  (r" << chunk.slot_count << "..r"
               << (chunk.slot_count + chunk.n_temps - 1) << " are temps)";
         s << "\n";
+        /*
+         * -vdj only: the slots that may hold a reference (ref_slots, and
+         * ref_slots_raw for a raw-scalar bind) - what the frame pop
+         * releases and every JIT tier guards. DERIVED, never stored, and
+         * NOT in -vd on purpose: a compile and its image may disagree
+         * here (the loader re-derives from the final code and cannot
+         * verify every call's scalar-result claim), and -vd is the
+         * image round trip's oracle, which must stay exact.
+         */
+        const auto refs = [&](const char *nm,
+                              const std::vector<int32_t> &v) {
+            s << "; " << nm << ":";
+            if (v.empty())
+                s << " none";
+            for (const int32_t r : v)
+                s << " r" << r;
+            s << "\n";
+        };
+        if (g_jit_annotate) {
+            refs("refs", chunk.ref_slots);
+            if (chunk.ref_slots_raw != chunk.ref_slots)
+                refs("refs (raw-scalar bind)", chunk.ref_slots_raw);
+        }
         if (named) {
             for (int sl = 0; sl < chunk.slot_count; sl++)
                 if (static_cast<size_t>(sl) < chunk.slot_names.size()
