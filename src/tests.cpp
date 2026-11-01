@@ -8141,6 +8141,36 @@ static const std::vector<test> tests =
             "assert(b() == 3);",
         },
     },
+    /* a struct's construction is checked like a call: the arity range
+     * counts its trailing `opt` fields, and a field that is not `opt`
+     * refuses a value that may be none (check_struct_construction) */
+    { "struct: too many field values for a struct with an opt field",
+      { "struct Q { int a; opt array<int> b; }",
+        "var q = Q(1, [2], 3);" },
+      &typeid(WrongArgCountEx) },
+    { "struct: a possibly-none value for a field that is not opt",
+      { "struct P { int x; }",
+        "func f(opt int v) { return P(v); }",
+        "print(f(1).x);" },
+      &typeid(NullabilityEx) },
+    /* check_call over the callee forms a name does not cover: an
+     * expression that is not callable, a typed function's arity range,
+     * and a call through a function-typed PARAMETER (its parameter list
+     * comes from the type: an opt parameter may be omitted, and one that
+     * is not opt refuses a possibly-none argument) */
+    { "infer: calling an int element is a compile error",
+      { "var a = [1];", "print(a[0](3));" },
+      &typeid(TypeMismatchEx) },
+    { "infer: a typed function's arity is a range with an opt parameter",
+      { "func f(int x, opt int y) => x;", "print(f());" },
+      &typeid(WrongArgCountEx) },
+    { "infer: a call through a function parameter may omit an opt one",
+      { "func use(f) { return f(1); }",
+        "assert(use(func(int a, opt int b) => a) == 1);" } },
+    { "infer: a possibly-none argument through a function parameter",
+      { "func use(f, opt int v) { return f(v); }",
+        "print(use(func(int a) => a, 1));" },
+      &typeid(NullabilityEx) },
     { "calling a function with too many args is rejected",
       { "func f(a) { return a; } var k=1; f(k, 2);" },
       &typeid(WrongArgCountEx) },
