@@ -122,7 +122,18 @@
     /* the slow tier for every value. `key` is `<run>/<guard>@<pc>#<k>`. */ \
     /* jit.cpp, jit_int_force_decline (P7, the per-site forcing sweep).  */ \
     X(decline_choice, "a guarded tier's decline (0 as emitted, 1 forced)", \
-      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick))
+      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick)) \
+    /* An ENUMERATED decision: a function body's CONTAINER ISLANDS     */ \
+    /* (model-flip M3/M4) - 0 every op native, 1 every op the island    */ \
+    /* list admits runs as an interpreted island inside one native     */ \
+    /* container. `key` is `island:<fn>/all`. jit.cpp,                  */ \
+    /* jit_int_islands_forced.                                          */ \
+    X(island_choice, "a body's container islands (0 native, 1 islands)",  \
+      F(std::string, key) F(int64_t, n) F(int64_t, dflt) F(int64_t, pick)) \
+    /* A function body compiled as a native CONTAINER, `islands` its    */ \
+    /* interpreted islands. jit.cpp, jit_try_container's commit.        */ \
+    X(container, "a body compiled as a native container with islands",    \
+      F(std::string, func) F(int64_t, islands))
 
 /*
  * THE VALUE CLASSES (plan section 9.1): each row a declared BOUNDARY of

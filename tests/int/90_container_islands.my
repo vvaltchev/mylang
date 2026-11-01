@@ -1,0 +1,92 @@
+# INT-ENGINES: default
+# INT-CONFIGS: default ;
+#   MYLANG_INT_CHOOSE=island:mix/all=1,island:build/all=1 ;
+#   MYLANG_INT_CHOOSE=island:bad/all=1,island:viaval/all=1
+#
+# INT test (#107 P3): a function body's CONTAINER ISLANDS are an
+# enumerated decision (`island_choice`, key `island:<fn>/all`). Every op
+# the island list admits is native today, so no real body forms a
+# container (model-flip M3/M4) and the mechanism - the island call,
+# jit_exec_block, the remap past each island - ran in nothing but a
+# synthetic selftest. Pick 1 makes those ops interpreted islands inside
+# one native container, which must change nothing: the second and
+# third configurations force two bodies each, and every body must
+# compute what it does natively. `container` records each body that
+# became one.
+
+struct P { dyn x; dyn y; }
+
+# a loop around boxed arithmetic
+func mix(dyn a, int n) {
+    var dyn acc = a;
+    for (var i = 0; i < n; i++) {
+        acc = acc + i;
+        if (acc > 40)
+            acc = acc - 25;
+    }
+    var dyn tag = acc * 2;
+    return tag;
+}
+
+# straight line, no branch: a build of every boxed kind
+func build(dyn a, dyn b) {
+    var dyn arr = [a, b, a];
+    var dyn d = {"k": a, "j": b};
+    var dyn p = P(a, b);
+    var dyn s = arr[1:3];
+    var dyn t = -a;
+    var dyn u = !b;
+    return str(arr) + str(len(d)) + str(p.y) + str(s) + str(t) + str(u);
+}
+
+# an island that raises (`-` on a string), caught by the caller
+func bad(dyn a, int n) {
+    var dyn acc = a;
+    for (var i = 0; i < n; i++)
+        acc = acc - i;
+    return acc;
+}
+
+# a callee reached through a value
+func viaval(dyn f, dyn v, int n) {
+    var dyn r = v;
+    for (var i = 0; i < n; i++)
+        r = f(r);
+    return r;
+}
+
+var dyn m1 = mix(runtime(3), runtime(12));
+var dyn m2 = mix(runtime(2.5), runtime(9));
+var b1 = build(runtime(4), runtime(false));
+var dyn d1 = bad(runtime(10), runtime(4));
+var msg = "";
+try {
+    bad(runtime("s"), runtime(4));
+} catch (TypeErrorEx as e) {
+    msg = "caught";
+}
+var dyn v1 = viaval(runtime(abs), runtime(-7), runtime(3));
+print(m1, m2, b1, d1, msg, v1);
+assert(m1 == 38 && m2 == 77.0);
+assert(b1 == "[4, false, 4]2false[false, 4]-4true");
+assert(d1 == 4 && msg == "caught" && v1 == 7);
+
+func has(arr, needle) {
+    foreach (e in arr)
+        if (find(e, needle) != none) return true;
+    return false;
+}
+var names = ["mix", "build", "bad", "viaval"];
+var ev = int_events("island_choice");
+var made = int_events("container");
+var forced = 0;
+foreach (nm in names) {
+    assert(has(ev, "key=\"island:" + nm + "/all\" n=2 dflt=0"));
+    if (has(ev, "key=\"island:" + nm + "/all\" n=2 dflt=0 pick=1")) {
+        forced++;
+        assert(has(made, "func=\"" + nm + "\""));
+    }
+}
+# every forced body became a container, and no other did
+assert(len(made) == forced && (forced == 0 || forced == 2));
+print("ok");
