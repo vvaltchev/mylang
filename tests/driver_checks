@@ -1528,5 +1528,45 @@ else
     fail "repl: the history file: $(head -c 300 "$hist")"
 fi
 
+# MYLANG_JIT_MAP=<path> (disasm.cpp, jit_write_map) - the instruction
+# map scripts/jitprofile.py joins with a callgrind profile, written by
+# the PROFILED run itself. A `frag ADDR LEN NAME undecoded=N` line, then
+# one `i ADDR LEN MNEMONIC` line per instruction: the lengths must sum to
+# exactly the fragment's (a wrong length desynchronises the rest of the
+# fragment, the -vdj decoder's failure mode, and the last instruction
+# then runs past the end) and nothing may be undecoded. The program's
+# output is unchanged by the map.
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    rm -f "$TMP/jit.map"
+    plain=$("$BIN" "$here/../samples/primes" 2>&1)
+    mapped=$(MYLANG_JIT_MAP="$TMP/jit.map" "$BIN" \
+             "$here/../samples/primes" 2>&1)
+    verdict=$(awk '
+        function close_frag() {
+            if (inf && sum != flen) bad = bad " " fname ":sum=" sum "/" flen
+        }
+        $1 == "frag" {
+            close_frag(); inf = 1; nf++; sum = 0; flen = $3; fname = $4
+            if ($5 != "undecoded=0") bad = bad " " fname ":" $5
+            next }
+        $1 == "i" { ni++; sum += $3; next }
+        { bad = bad " junk:" $0 }
+        END { close_frag()
+              if (nf == 0 || ni == 0) print "EMPTY"
+              else if (bad != "") print "BAD" bad
+              else print "OK " nf " " ni }' "$TMP/jit.map" 2>&1)
+    case "$verdict" in
+        OK*) if [ "$plain" = "$mapped" ]; then
+                 pass "MYLANG_JIT_MAP: every fragment's map adds up, nothing \
+undecoded (${verdict#OK })"
+             else
+                 fail "MYLANG_JIT_MAP changed the program's output"
+             fi ;;
+        *) fail "MYLANG_JIT_MAP: $verdict" ;;
+    esac
+else
+    echo "  skip  MYLANG_JIT_MAP (this build reports jit 0)"
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc
