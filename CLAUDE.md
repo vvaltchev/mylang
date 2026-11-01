@@ -694,6 +694,11 @@ they drive `ReplEngine` directly. They came from `repl_fuzz`
 (2026-10-04: 24 of its CI sessions reached 365 elements nothing else
 did); `int_run --update-repl` rewrites the `.expected` files (not
 `.out`: .gitignore drops that extension).
+**`tests/int/tty/*.keys` are TERMINAL units:** the same REPL typed on
+a pseudo-terminal, one input per line, once the REPL waits for a key in
+raw mode, and compared byte for byte with `.expected` - the line editor's
+TTY half (raw mode, repaint, completion, the Ctrl-R pane, paste), which
+nothing else can reach. Linux only; tests/CLAUDE.md has the rules.
 **A pass that may discard and redo its work records inside an
 `ML_INT_DEFER` scope** (the JIT's retry label has one): a discarded
 attempt then records nothing. The `int_*` builtins

@@ -1,0 +1,25 @@
+# The line editor's keys on a terminal (see editing.keys for the format).
+#
+# left, right, delete under the cursor; home and end in both spellings;
+# backspace
+1 + 2 + 3\x1b[D\x1b[D\x1b[3~\x1b[3~\x1b[H\x1b[C\x1b[1~\x1b[4~\x1b[F\x7f\x7f4\r
+# Ctrl-B, Ctrl-F, Ctrl-E; Ctrl-W kills a word, Ctrl-U to the line start
+var yy = 10\x02\x02\x06\x05\x17zz\x15var yy = 7\r
+# the right arrow at the end of the line accepts the ghost suggestion
+print(y\x1b[C)\r
+# Ctrl-L clears the screen and redraws the input
+12\x0c
+# ... which Enter then runs; Ctrl-D in a line deletes under the cursor
+\x02\x04\r
+# up and down (and Ctrl-P / Ctrl-N) move between the lines of a block
+if (yy > 1) {\rprint("big");\r\x1b[A\x1b[B\x10\x0e\x05\r}\r
+# a bracketed paste is text, re-indented, never a command
+\x1b[200~func g(n) {\n\t\treturn n + 1;\n}\x1b[201~\r
+g(1)\r
+# the search pane: down, up, Ctrl-R cycles, backspace, Ctrl-G cancels
+\x12print\x1b[B\x1b[A\x12\x7f\x07
+# a search that matches nothing loads nothing; Ctrl-C drops the input
+\x12zzzz\r\x03
+# a run-time error renders its caret
+1 / runtime(0)\r
+\x04
