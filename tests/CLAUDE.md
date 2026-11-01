@@ -251,7 +251,10 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   shows must equal NAME.expected byte for byte (HOME fresh, TERM=xterm,
   LC_ALL=C, colour on) - a function of the bytes typed, so it repeats
   on every run and build; `--update-repl` rewrites it, and the file
-  holds \r, so it is opened with newline="". Linux only (/proc). A lone
+  holds \r, so it is opened with newline="". A `# TTY-SIZE: RxC` line
+  picks another terminal size and a `# TTY-ENV: K=V ...` line adds to
+  the environment (pane.keys: an 8x34 terminal, a UTF-8 locale for the
+  rounded borders; plain.keys: NO_COLOR). Linux only (/proc). A lone
   ESC is the one input that is timing-dependent (the Ctrl-R pane waits
   40 ms for a sequence): use Ctrl-G to cancel instead.
 - VALUE CLASSES (src/intsites.h, ML_INT_VCLASSES): declared operation
