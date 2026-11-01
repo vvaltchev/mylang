@@ -13,5 +13,7 @@ zz
 :analyze func ct(n) { var s = 0; for (var i = 0; i < n; i++) { s++; } }
 :analyze func bg(n) { var t = 0; for (var i = 0; i < 9; i++) { t += n; } }
 :analyze func ac(x) { var y = x; return y + 1; } func us(q) => ac(q);
+func g(int a) { var t = a + 1; return t * 2; }
+:analyze func k(int a) { return g(a); }
 :analyze var x = ;
 :analyze 1 + 2;
