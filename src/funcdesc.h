@@ -169,6 +169,20 @@ struct FuncDescriptor {
     std::vector<ParamDesc> params;
     std::vector<CaptureDesc> captures;
 
+    /*
+     * A number no other descriptor of this process has had (DescStamp,
+     * syntax.h): a descriptor CAN be freed before codegen - its lambda
+     * folded or dropped by an optimizer - and a new one may then be
+     * allocated at its address, so a pointer alone does not say which
+     * descriptor a stamp named. Compile-time only; not in a .myv image.
+     */
+    const uint64_t serial = next_serial();
+    static uint64_t next_serial()
+    {
+        static uint64_t n = 0;
+        return ++n;
+    }
+
     /* Compile results (see the field policy above). */
     bool resolved = false;
     int frame_size = 0;

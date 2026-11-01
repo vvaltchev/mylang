@@ -950,6 +950,27 @@ public:
 
 /* NOT `final`: DirectCallExpr (below) derives from it for the devirtualized
  * direct-call fast path, reusing what/args/serialize/clone helpers. */
+/*
+ * A stamp naming a FuncDescriptor (CallExpr::callee_desc): the pointer AND
+ * the descriptor's serial. A descriptor is freed with its declaration when
+ * an optimizer drops one - a lambda folded away after inference stamped a
+ * call that could reach it - and the next descriptor allocated may take
+ * its address; the pointer then names a live descriptor that is not the
+ * one stamped. A consumer trusts a stamp only once the pointer is known
+ * live AND the serials agree (Codegen::add_value_callee). Before, the
+ * check was the pointer alone, and a non-ASan build put a stray
+ * `<lambda>` in tests/functional/76_const_bindings's fa$0 pool that an
+ * ASan build (whose quarantine delays reuse) did not.
+ */
+struct DescStamp {
+    const FuncDescriptor *desc = nullptr;
+    uint64_t serial = 0;
+    DescStamp() = default;
+    explicit DescStamp(const FuncDescriptor *d)
+        : desc(d), serial(d ? d->serial : 0) { }
+    explicit operator bool() const { return desc != nullptr; }
+};
+
 class CallExpr: public Construct {
 
 public:
@@ -1044,7 +1065,7 @@ public:
      * reason: a clone is a new context and a null stamp is the
      * conservative answer.
      */
-    const FuncDescriptor *callee_desc = nullptr;
+    DescStamp callee_desc;
     /*
      * #97 E3 (2026-09-20): the SECOND candidate of a TWO-WAY value call
      * site - `ops[i % 2]` reaching add_op or sub_op. Set together with
@@ -1056,12 +1077,12 @@ public:
      * (jit_baked_callee returns null for a two-entry pool pc). Same
      * lifetime and copy rules as `callee_desc`.
      */
-    const FuncDescriptor *callee_desc2 = nullptr;
+    DescStamp callee_desc2;
     /* #97 (#72): the THIRD and later candidates of a value site the
      * callee-set analysis names at most g_value_cands_max functions for
      * (callee_desc, callee_desc2, then these) - for the splice's guard
      * chain alone; the JIT's frameless dispatch serves exactly two */
-    std::vector<const FuncDescriptor *> callee_desc_more;
+    std::vector<DescStamp> callee_desc_more;
 
     /* Set by the inferencer when the callee's static type is `dyn` (callable at
      * runtime, resolved dynamically). The VM lowers it to CallValueGenericV — a

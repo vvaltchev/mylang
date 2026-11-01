@@ -9466,6 +9466,13 @@ instrumentation (see `plans/archived/function-templates.md`).
   (`id_sym`, `func_of_decl`, inferencer) are instead **scoped to one input**
   (cleared each `infer_input`) and re-resolved every pass, so no stale entry can
   survive — that combination is the fix for the bug above.
+  **A `FuncDescriptor` pointer has the same hazard** (2026-11-07): a
+  descriptor dies with its declaration when an optimizer drops a lambda,
+  so a pointer stamped earlier (`CallExpr::callee_desc`) can name a later
+  descriptor at the reused address. Such a stamp is a `DescStamp`
+  (syntax.h), pointer plus `FuncDescriptor::serial`, trusted only when
+  the live descriptor has that serial; a non-ASan build's bytecode
+  differed from an ASan build's until it was.
 
 - **`ML_CHECK` / `ML_CHECK_MSG` (`defs.h`) are the assertion layer.** Use them —
   not bare `assert` — to state an invariant the code RELIES ON but a wrong

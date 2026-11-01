@@ -34123,6 +34123,35 @@ static bool myv_verify_ctor_minirun()
  */
 
 /*
+ * A callee stamp outlives the descriptor it named (DescStamp, syntax.h):
+ * an optimizer can drop the lambda a call could reach after inference
+ * stamped the call, and the next descriptor may be allocated at the same
+ * address. The address is reused here on purpose - placement new into one
+ * buffer - and the stale stamp must be refused while a fresh one is
+ * accepted. Until the serial, the pointer alone was compared, and a
+ * non-ASan build's bytecode for tests/functional/76_const_bindings had a
+ * stray pool entry an ASan build's did not.
+ */
+static bool codegen_desc_stamp_reuse()
+{
+    alignas(FuncDescriptor) unsigned char buf[sizeof(FuncDescriptor)];
+    FuncDescriptor *a = new (buf) FuncDescriptor();
+    const DescStamp stale(a);
+    a->~FuncDescriptor();
+    FuncDescriptor *b = new (buf) FuncDescriptor();
+    std::unordered_set<const FuncDescriptor *> live = { b };
+    const bool ok = static_cast<const void *>(a) == b
+                    && !codegen_desc_stamp_live(stale, &live)
+                    && codegen_desc_stamp_live(DescStamp(b), &live)
+                    && !codegen_desc_stamp_live(DescStamp(), &live)
+                    && !codegen_desc_stamp_live(DescStamp(b), nullptr);
+    FuncDescriptor other;
+    const bool ok2 = !codegen_desc_stamp_live(DescStamp(&other), &live);
+    b->~FuncDescriptor();
+    return ok && ok2;
+}
+
+/*
  * A CYCLE of scalar-result claims survives a load (myv_derive_ref_slots).
  * `ev` returns `od(n - 1)` and `od` returns `ev(n - 1)`: each call's claim
  * holds only if the other's does, so a fixpoint that restores a claim
@@ -59320,6 +59349,8 @@ static const std::vector<extra_check> extra_checks =
       "(myv_fuzz small-390)", myv_ret_scalar_justified },
     { "myv: a cycle of scalar-result claims survives a load (ev/od)",
       myv_ret_scalar_cycle },
+    { "codegen: a callee stamp whose descriptor's address was reused is "
+      "refused", codegen_desc_stamp_reuse },
     { "myv: v19 - the root chunk's slot_count and the stored root slot "
       "count must agree, either copy mutated is refused",
       myv_root_slot_count_checked },

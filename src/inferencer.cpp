@@ -1609,8 +1609,8 @@ void Inferencer::stamp_callee_fn(Block *rootBlock)
     for (auto &cp : calls) {
         CallExpr *call = cp.first;
         call->callee_fn = nullptr;
-        call->callee_desc = nullptr;
-        call->callee_desc2 = nullptr;
+        call->callee_desc = DescStamp();
+        call->callee_desc2 = DescStamp();
         call->callee_desc_more.clear();
         if (cs_struct_callee(call->what.get()))
             continue;                     /* a construction, not a call */
@@ -1649,10 +1649,11 @@ void Inferencer::stamp_callee_fn(Block *rootBlock)
                       [](const FuncInfo *a, const FuncInfo *b) {
                           return a->decl->node_id < b->decl->node_id;
                       });
-            call->callee_desc = order[0]->decl->desc;
-            call->callee_desc2 = order[1]->decl->desc;
+            call->callee_desc = DescStamp(order[0]->decl->desc);
+            call->callee_desc2 = DescStamp(order[1]->decl->desc);
             for (size_t k = 2; k < order.size(); k++)
-                call->callee_desc_more.push_back(order[k]->decl->desc);
+                call->callee_desc_more.push_back(
+                    DescStamp(order[k]->decl->desc));
             continue;
         }
         if (cs.funcs.size() != 1)
@@ -1665,7 +1666,7 @@ void Inferencer::stamp_callee_fn(Block *rootBlock)
         call->callee_fn = fi->decl;
         /* #97 E1: the same answer, as the program-lifetime DESCRIPTOR, for
          * consumers that run after the optimizers have freed decls. */
-        call->callee_desc = fi->decl->desc;
+        call->callee_desc = DescStamp(fi->decl->desc);
     }
 }
 
