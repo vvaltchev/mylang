@@ -429,7 +429,13 @@ assertions on values.
   bodies. Its first tier-1 run failed four deviations of
   104_exc_chain_markers: a container cannot hold a try region (the
   interpreter catches an island's throw and runs the handler outside the
-  container) - it declines one now.
+  container) - it declines one now. The same batch: the coverage
+  universe dropped test-only `#ifdef TESTS` regions (512 uncovered
+  elements of selftests and oracles) and dynamic_cast's null tests
+  (node_cast, about 1,000) - 13,789 uncovered of 106,186 on gcc 14.2;
+  and unit 91 found that a direct call --max-instances or the
+  instantiation rounds left on a template base was redirected to the
+  template's VALUE instance (a valid program refused).
 - **P4 - VM state checker + object census.**
   **STATUS (2026-10-03): the OBJECT CENSUS is built** - per-kind
   counters at the pooled `operator new/delete`, `int_live(kind)`,
