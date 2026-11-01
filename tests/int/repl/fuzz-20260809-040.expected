@@ -3,7 +3,7 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 
     throw -9223372036854775808;
           ^^^^^^^^^^^^^^^^^^^^
->> TypeErrorEx: Can only throw a struct instance at line 2, col 7:11
+>> TypeMismatchEx: can only throw a struct instance, got 'none' at line 2, col 7:11
 
     throw none;
           ^^^^
