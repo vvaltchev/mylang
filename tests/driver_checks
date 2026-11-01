@@ -1290,6 +1290,9 @@ fi
 cat > "$TMP/mi.my" <<'EOF'
 func show(x) { var t = x + x; return str(t) + ":" + typestr(t); }
 print(show(1), show(2.5), show("ab"), show(3));
+var fs = [show];
+var dyn g = fs[runtime(0)];
+print(g(int(runtime(5))));
 EOF
 flag "--max-instances needs a count" 1 'requires a count' --max-instances
 flag "--max-instances refuses a negative count" 1 'requires a count' \
@@ -1300,7 +1303,8 @@ flag "--max-instances refuses an empty value" 1 'requires a count' \
      --max-instances "" "$TMP/mi.my"
 flag "--max-instances refuses a count past INT_MAX" 1 'requires a count' \
      --max-instances 99999999999 "$TMP/mi.my"
-mi_want="2:int 5.000000:float abab:str 6:int "
+mi_want="2:int 5.000000:float abab:str 6:int 
+10:int "
 for m in 2 0; do
     for eng in "" -nj -tw; do
         out=$("$BIN" $eng --max-instances $m "$TMP/mi.my" 2> "$TMP/mi.err")
@@ -1566,6 +1570,39 @@ undecoded (${verdict#OK })"
     esac
 else
     echo "  skip  MYLANG_JIT_MAP (this build reports jit 0)"
+fi
+
+# MYLANG_JITSTATS=1 (jit_stats_report) - which tier a program's calls
+# took, from counters bumped by EMITTED code. A TESTS build prints the
+# table after the run (samples/primes is ~540 calls of one function:
+# native returns, and under -nj the no-record reach); any other JIT build
+# says the counters are not compiled in, rather than printing zeros. The
+# program's stdout is unchanged either way.
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    plain=$("$BIN" "$here/../samples/primes" 2>/dev/null)
+    st_out=$(MYLANG_JITSTATS=1 "$BIN" "$here/../samples/primes" \
+             2>"$TMP/stats.err")
+    nj_out=$(MYLANG_JITSTATS=1 "$BIN" -nj "$here/../samples/primes" \
+             2>"$TMP/stats-nj.err")
+    if [ "$st_out" != "$plain" ] || [ "$nj_out" != "$plain" ]; then
+        fail "MYLANG_JITSTATS changed the program's output"
+    elif "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1'; then
+        if grep -q '^jit stats$' "$TMP/stats.err" &&
+           grep -Eq '^  native_returns +[1-9]' "$TMP/stats.err" &&
+           grep -q '^no-record tier reach' "$TMP/stats-nj.err" &&
+           grep -Eq '^  calls_total +[1-9]' "$TMP/stats-nj.err"; then
+            pass "MYLANG_JITSTATS: the tier table, JIT on and off"
+        else
+            fail "MYLANG_JITSTATS: $(head -c 300 "$TMP/stats.err") / \
+$(head -c 300 "$TMP/stats-nj.err")"
+        fi
+    elif grep -q '^jit stats: unavailable' "$TMP/stats.err"; then
+        pass "MYLANG_JITSTATS: a build without TESTS says so"
+    else
+        fail "MYLANG_JITSTATS (no TESTS): $(head -c 300 "$TMP/stats.err")"
+    fi
+else
+    echo "  skip  MYLANG_JITSTATS (this build reports jit 0)"
 fi
 
 [ $rc = 0 ] && echo "all driver checks passed"
