@@ -1,0 +1,31 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107), from a mutation-testing survivor (2026-11-11): the
+# bounds check of vm_struct_elem_field (eval.cpp) - LoadStructFieldInt /
+# LoadStructFieldFloat in their subscript form, interpreted and through
+# the JIT helper - had no test at index == len, so `>=` weakened to `>`
+# survived every stage (it reads one element past the end). The
+# tree-walker is the oracle; the typed destination is what selects the
+# op (a boxed read goes through subscript + member).
+#
+struct P { int x; float y; bool b; }
+func at_x(array<P> ps, int k) {
+    try { int v = ps[k].x; return str(v); }
+    catch (OutOfBoundsEx) { return "oob"; }
+}
+func at_y(array<P> ps, int k) {
+    try { float v = ps[k].y; return str(v); }
+    catch (OutOfBoundsEx) { return "oob"; }
+}
+func at_b(array<P> ps, int k) {
+    try { bool v = ps[k].b; return str(v); }
+    catch (OutOfBoundsEx) { return "oob"; }
+}
+var pts = [P(1, 1.5, true), P(2, 2.5, false)];
+for (var i = 0; i < 2; i++) append(pts, P(i + 3, 0.5, true));
+var n = int(runtime(len(pts)));
+var got = "";
+foreach (var k in [0, n - 1, n, n + 1, -1, -n, -n - 1]) {
+    got = got + at_x(pts, k) + "," + at_y(pts, k) + "," + at_b(pts, k) + " ";
+}
+print(got);

@@ -269,6 +269,33 @@ done
 [ $sod_ok = 1 ] &&
     pass "overflow: a catchable StackOverflowEx in every engine configuration (4 caps)"
 
+# The VACUITY GUARD for the MYLANG_NATIVE_STACK=0 configuration above: it
+# must actually take the deep calls off the native stack - in a TESTS
+# build the sync tier's depth counter says so - or that row compares the
+# default with itself. (An ASan build compiles the native stack out, and
+# the variable with it; a build without TESTS has no counter.) Mutation
+# testing found the gap: a mutant ignoring the variable survived every
+# stage (2026-11-11).
+if "$BIN" -v 2>/dev/null | grep -Eq '^ *tests +1' &&
+   "$BIN" -v 2>/dev/null | grep -Eq '^ *asan +0' &&
+   "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
+    printf 'func d(int n) { if (n == 0) return 0; var r = d(n - 1); %s\n%s\n' \
+        'return r + 1; }' 'print(d(int(runtime(2000))));' > "$TMP/ns.my"
+    ns_on=$(MYLANG_JITSTATS=1 "$BIN" "$TMP/ns.my" 2>&1 >/dev/null |
+            awk '$1 == "sync_depth_max" { print $2 }')
+    ns_off=$(MYLANG_NATIVE_STACK=0 MYLANG_JITSTATS=1 "$BIN" "$TMP/ns.my" \
+             2>&1 >/dev/null | awk '$1 == "sync_depth_max" { print $2 }')
+    if [ -n "$ns_on" ] && [ -n "$ns_off" ] && [ "$ns_off" -gt "$ns_on" ]; then
+        pass "MYLANG_NATIVE_STACK=0 moves deep calls to the sync tier \
+(depth $ns_on -> $ns_off)"
+    else
+        fail "MYLANG_NATIVE_STACK=0 changed nothing: sync_depth_max \
+[$ns_on] by default, [$ns_off] with it"
+    fi
+else
+    echo "  skip  MYLANG_NATIVE_STACK=0 vacuity (needs TESTS, no ASan, the JIT)"
+fi
+
 # -v REPORTS THE ARENA, and MYLANG_NO_LOWMEM=1 refuses it. This is the
 # VACUITY GUARD for the no-arena CI lane: a lane that tests a
 # configuration must be able to prove it is IN that configuration, or it
