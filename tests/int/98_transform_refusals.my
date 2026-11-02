@@ -1,0 +1,185 @@
+# INT-ENGINES: tw default nj noopt ni
+#
+# INT unit (#107): shapes that compile-time transforms must REFUSE, each
+# of which gives the same answer either way:
+#  - min / max of bools keep a bool result (README: the common kind of
+#    the promotion chain), and a bool operand of an int min takes the
+#    boxed path, not the native int one;
+#  - a dict foreach with a `_` index, or with a body holding a `try`, is
+#    not the native dict loop;
+#  - an inlined call's argument is substituted only when it is INERT
+#    (THE ARGUMENT RULE): a reassigned function name, a `dyn` operand, a
+#    shift and a division by -1, by 0.0 or by a variable can throw or
+#    change, so each is bound once, first;
+#  - a callee local that a multi-assignment or `append` writes is not
+#    copy-propagated;
+#  - a loop-body slice whose base or whose own variable the body writes,
+#    or an array slice that escapes into a call, is not hoisted above the
+#    loop (one that is only read is).
+# The tree-walker is the oracle; every engine must print the same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+# ---- min / max over bools
+var yes = len(str(runtime(1))) == 1;
+var no = !yes;
+want("min bool", min(yes, no), false);
+want("max bool", max(no, yes), true);
+want("min bool kind", typestr(min(yes, no)), "bool");
+want("min int/bool", min(3, yes), 1);
+want("max int/bool", max(no, -2), 0);
+want("min int/bool kind", typestr(min(3, yes)), "int");
+want("min int", min(int(runtime(4)), len(str(runtime(12345)))), 4);
+
+# ---- dict foreach shapes
+var d = {"a": 1, "b": 2};
+var s = "";
+foreach (var _, k, v in indexed d)
+    s += k + str(v);
+want("indexed dict, `_` index", s, "a1b2");
+s = "";
+foreach (var i, k in indexed d)
+    s += str(i) + k;
+want("indexed dict, keys", s, "0a1b");
+var t = 0;
+foreach (var k, v in d) {
+    try { t += v * int(runtime(10)); } catch (TypeErrorEx) { t = -1; }
+}
+want("dict foreach with a try body", t, 30);
+
+# ---- inliner arguments that must be bound once
+func sq(x) => x * x;
+func cube(x) => x * x * x;
+func twice(f, x) => f(f(x));
+want("twice sq", twice(sq, int(runtime(3))), 81);
+sq = cube;
+want("twice rebound name", twice(sq, int(runtime(2))), 512);
+func inc(x) => x + 1;
+var dyn dv = runtime(5);
+want("dyn operand", inc(dv + 1), 7);
+want("dyn negation", inc(-dv), -4);
+var sh = int(runtime(3));
+want("shift argument", inc(sh << 2), 13);
+const M1 = -1;
+want("division by -1", inc(sh / M1), -2);
+want("modulo by -1", inc(sh % M1), 1);
+want("division by a float", inc(sh / 0.5), 7.0);
+want("division by a local", inc(sh / sh), 2);
+want("bitwise and", inc(sh & 6), 3);
+try {
+    want("float division by zero", inc(sh * 1.0 / 0.0), 0);
+} catch (DivisionByZeroEx) {
+    s = "fdiv";
+}
+want("float division by zero raised", s, "fdiv");
+var neg = int(runtime(-2));
+try {
+    want("negative shift", inc(1 << neg), 0);
+} catch (InvalidValueEx) {
+    s = "shift";
+}
+want("negative shift raised", s, "shift");
+
+# ---- callee locals written after their declaration
+func swap_sum(a) {
+    var p = a + 1;
+    var q = a * 2;
+    p, q = [q, p];
+    return p - q;
+}
+want("multi-assignment local", swap_sum(int(runtime(5))), 4);
+func grow(a) {
+    var r = [a];
+    append(r, a + 1);
+    return len(r) * 10 + r[1];
+}
+want("appended local", grow(int(runtime(5))), 26);
+
+# ---- slices in a loop body
+func slice_base_grows(array<int> a) {
+    var total = 0;
+    for (var k = 0; k < 3; k++) {
+        var w = a[0:2];
+        total += len(w) * 100 + w[1];
+        append(a, k);
+    }
+    return total;
+}
+want("slice of a growing base", slice_base_grows([1, 2]), 606);
+func slice_base_written(array<int> a) {
+    var total = 0;
+    for (var k = 0; k < 3; k++) {
+        var w = a[0:2];
+        total += w[0];
+        a[0] = k + 10;
+    }
+    return total;
+}
+want("slice of a written base", slice_base_written([1, 2]), 22);
+func slice_var_written(array<int> a) {
+    var total = 0;
+    for (var k = 0; k < 3; k++) {
+        var w = a[0:2];
+        total += w[0];
+        w[0] = 100;
+    }
+    return total + a[0];
+}
+want("slice the body writes", slice_var_written([1, 2]), 4);
+func slice_var_grows(array<int> a) {
+    var total = 0;
+    for (var k = 0; k < 3; k++) {
+        var w = a[0:1];
+        append(w, k);
+        total += len(w);
+    }
+    return total + len(a);
+}
+want("slice the body appends to", slice_var_grows([1, 2]), 8);
+func slice_kept(array<int> a) {
+    var keep = [];
+    for (var k = 0; k < 2; k++) {
+        var w = a[0:1];
+        append(keep, w);
+    }
+    keep[0][0] = 7;
+    return keep[1][0] * 10 + keep[0][0];
+}
+want("slices kept by every iteration", slice_kept([1, 2]), 17);
+func str_slice_grows(str src) {
+    var out = "";
+    for (var k = 0; k < 2; k++) {
+        var w = src[0:2];
+        w += "!";
+        out += w;
+    }
+    return out;
+}
+want("string slice the body appends to", str_slice_grows("abc"), "ab!ab!");
+func slice_escapes(array<int> a) {
+    var out = "";
+    for (var k = 0; k < 2; k++) {
+        var w = a[1:3];
+        out += str(w);
+    }
+    return out;
+}
+want("array slice passed to a call", slice_escapes([1, 2, 3]), "[2, 3][2, 3]");
+func slice_contained(array<int> a) {
+    var total = 0;
+    for (var k = 0; k < 3; k++) {
+        var w = a[1:3];
+        total += w[0] * 10 + len(w);
+    }
+    return total;
+}
+want("array slice only read", slice_contained([1, 2, 3]), 66);
+
+assert(bad == 0);
+print("ok");
