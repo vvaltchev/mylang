@@ -863,3 +863,47 @@ ownership check failed with the count itself 662 lower. The INT build
 skips tests/int in that round trip now; every other lane runs it. **A
 check that compiles the unit corpus is a unit's rival on the coverage
 build**, whatever it checks.
+
+### 9.10 The first mutation run's survivors (2026-11-11)
+
+`mutate.yml` run 43014188260 on 0b634562 (the first to get past the
+pristine stage): 125 mutants (three of the eight shards hit the 5 h 40
+job limit), 5 stillborn, 95 killed (`-rt` 93, `corpus_diff` 1, `int_run`
+1, the enumerator and the fuzzers 0), **25 survived** - 79.2%. Each was
+read; the verdicts, so a later run's survivors can be told apart:
+
+- **killed now (2):** `eval.cpp` vm_struct_elem_field's `idx >= size`
+  weakened to `>` - `pts[len].x` read one element past a flat struct
+  array (tests/int/92_struct_field_bounds.my; a TYPED destination is
+  what selects the op, a boxed read goes through subscript + member, and
+  the first draft was vacuous for exactly that reason); `jit.cpp`'s
+  MYLANG_NATIVE_STACK=0 test - the overflow check ran the configuration
+  and compared outputs, which agree by design, so nothing proved it was
+  entered (a vacuity guard in driver_checks now: the sync tier's depth
+  counter must move);
+- **equivalent (20):** a check the code repeats later (cse_key_rec's
+  entry cap - every node checks the length again on the way out), a
+  default every path overwrites (DynIterState::is_dict, round_got_dyn,
+  the multiply plan's negate, the sp model's depth, a lean record's
+  call_site_chain - read only with a baked site), a fallback that
+  computes the same answer (pod_place_rooted_field declining: the
+  member walk stores through the struct anyway), an optimization's
+  reach only (the baked read at field offset 0, a register preference,
+  the ret_unflushed audit mask, an alternative negation lowering), an
+  encoding with two valid forms (a Loc column of 254), an assertion or
+  a TESTS counter, `--weights`' repeat count, a span no caret reads (an
+  int prefix's), a pc-0 branch target no lowering emits, a share-plan
+  interval default no hot slot keeps;
+- **not reached yet (2):** a baked literal's widened storage hint
+  (inferencer.cpp, stamp_literal_repr's LiteralObj arm - no program
+  found that bakes a literal whose destination only inference knows) and
+  the bytecode inliner's parameter rename next to a capturing closure
+  (codegen.cpp, bc_site_param_renames - the shapes tried were not
+  inlined, or their closure was scalar-replaced first);
+- **needs 65 parameters (1):** the frameless site's noescape bit test
+  `i < 64` -> `i <= 64`.
+
+What it says about the stages: `-rt` does nearly all the killing; a
+mutant the enumerator or a fuzzer alone killed would have been the
+evidence for keeping them on cost grounds, and this run had none - one
+run is not enough to conclude anything about them.
