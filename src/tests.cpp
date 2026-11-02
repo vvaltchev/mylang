@@ -35572,6 +35572,8 @@ static bool myv_root_slot_count_checked()
  */
 static bool myv_struct_array_stride_checked()
 {
+    /* `const PS` is baked into the literal pool as a flat struct array
+     * (P is 16 bytes), and `clone(PS)` folds to a second one */
     const char *lines_arr[] = {
         "struct P { int x; float y; }",
         "const PS = [P(1, 2.5), P(3, 4.5)];",
@@ -35592,23 +35594,6 @@ static bool myv_struct_array_stride_checked()
         infer_types(root.get(), true);
         run_optimizers(root.get());
         VmProgram prog = vm_compile(root.get(), /*jit=*/false);
-        Chunk::LiteralObjEntry *lit = nullptr;
-        for (auto &lo : prog.root.literal_objs)
-            if (lo.value.is<SharedArrayObj>()
-                    && lo.value.get_ref<SharedArrayObj>().skind()
-                       == SharedArrayObj::Storage::structs)
-                lit = &lo;
-        if (!lit) {
-            fprintf(stderr, "myv_struct_array_stride_checked: no flat "
-                            "struct array in the literal pool (vacuous)\n");
-            g_exec_engine = saved;
-            return false;
-        }
-        const EvalValue pristine = lit->value;
-        const auto &sv =
-            pristine.get_ref<SharedArrayObj>().flat_structs();
-        StructTypeDef *def = sv.def;
-        const int size = sv.stride;
         std::string tdir = "/tmp";
         for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
             const std::optional<std::string> e = env_get(var);
@@ -35618,11 +35603,40 @@ static bool myv_struct_array_stride_checked()
                && (tdir.back() == '/' || tdir.back() == '\\'))
             tdir.pop_back();
         const std::string path = tdir + "/mylang-myv-stride.myv";
-        const auto refused = [&](int stride) -> bool {
-            lit->value = SharedArrayObj(SharedArrayObj::svec_type(
-                std::vector<char>(static_cast<size_t>(2 * stride)), def,
-                stride));
-            myv_write(prog, path, MyvSourceRef());
+        myv_write(prog, path, MyvSourceRef());
+        std::string img;
+        {
+            std::ifstream f(path, std::ios::binary);
+            img.assign((std::istreambuf_iterator<char>(f)),
+                       std::istreambuf_iterator<char>());
+        }
+        /* the record (docs/myv-format.txt 11.1): u8 kind 4 (structs),
+         * bool readonly, u32 n = 2, sref def = 0, u32 stride = 16 */
+        const std::string tail("\x02\0\0\0\0\0\0\0\x10\0\0\0", 12);
+        size_t at = std::string::npos;
+        for (size_t i = img.find(tail); i != std::string::npos;
+             i = img.find(tail, i + 1))
+            if (i >= 2 && img[i - 2] == '\x04') {
+                at = i;
+                break;
+            }
+        if (at == std::string::npos) {
+            fprintf(stderr, "myv_struct_array_stride_checked: no flat "
+                            "struct array record in the image (vacuous)\n");
+            std::remove(path.c_str());
+            g_exec_engine = saved;
+            return false;
+        }
+        /* n x stride keeps its 32 bytes, so the image stays readable to
+         * its end and only the stride is wrong */
+        const auto refused = [&](char n, char stride) -> bool {
+            std::string bad = img;
+            bad[at] = n;
+            bad[at + 8] = stride;
+            {
+                std::ofstream f(path, std::ios::binary | std::ios::trunc);
+                f << bad;
+            }
             try {
                 MyvSource img_src;
                 VmProgram loaded = myv_read(path, img_src);
@@ -35639,9 +35653,8 @@ static bool myv_struct_array_stride_checked()
                             "ACCEPTED\n", stride);
             return false;
         };
-        ok = refused(size + 8) && ok;            /* a wider element */
-        ok = refused(size - 8) && ok;            /* a narrower one */
-        lit->value = pristine;
+        ok = refused(1, 32) && ok;               /* a wider element */
+        ok = refused(4, 8) && ok;                /* a narrower one */
         myv_write(prog, path, MyvSourceRef());   /* intact: loads + runs */
         MyvSource img_src;
         VmProgram loaded = myv_read(path, img_src);
