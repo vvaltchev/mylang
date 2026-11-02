@@ -2683,8 +2683,10 @@ output AND rendered error) and `tests/corpus_diff`'s `-nc` pass.
 ./build/mylang -rt --list        # print every case's name (what [ RUN ] says)
 ./build/mylang -rt --only REGEX  # run only the cases the regex finds, in all
                                  # five modes; matching nothing is a failure
-./build/mylang --weights         # inlining cost-model calibration (any build;
-                                 # use OPT=1 ASSERTS=0 for meaningful numbers)
+./build/mylang --weights [N]     # inlining cost-model calibration (any build;
+                                 # use OPT=1 ASSERTS=0 for meaningful numbers;
+                                 # N iterations per node, default 20M - a
+                                 # small N is driver_checks' instant run)
 ```
 
 **The standalone test tools (`tests/`) have their own

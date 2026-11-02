@@ -8573,9 +8573,8 @@ static double wb_time_eval(const Construct *n, EvalContext *ctx, long M)
 
 } // namespace
 
-void run_weight_bench()
+void run_weight_bench(long M)
 {
-    const long M = 20000000;
 
     /* A clean func-context root with an 8-slot int frame (slots pre-bound). */
     EvalContext ctx(nullptr, false, true);
@@ -8667,8 +8666,8 @@ void run_weight_bench()
     const double w_call = t_call - 2 * t_id - body;  /* the call overhead    */
 
     auto rel = [&](double w) { return w / w_id; };
-    printf("\nInlining cost-model weights (ns/eval, best of 5, %ldM iters)\n",
-           M / 1000000);
+    printf("\nInlining cost-model weights (ns/eval, best of 5, %ld iters)\n",
+           M);
     printf("  built from hand-constructed AST nodes (optimizer-immune)\n\n");
     printf("  %-22s %8s %8s\n", "node", "ns", "xId");
     printf("  ------------------------------------------\n");
@@ -8684,13 +8683,14 @@ void run_weight_bench()
     printf("\n  benefit function: inline a body when the sum of its node\n");
     printf("  weights is below the CALL weight (%.1f xId).\n", rel(w_call));
     printf("\n  suggested integer weights (xId, rounded):\n");
+    /* rounded, at least 1 - and 1 for a ratio that is not finite: a run
+     * too short for the clock measures a slot read as 0 ns, and casting
+     * the inf (or NaN) that gives to int would be undefined */
+    auto iw = [&](double w) {
+        const double r = rel(w) + 0.5;
+        return std::isfinite(r) && r >= 1 ? (int)std::min(r, 1e6) : 1;
+    };
     printf("    id=%d lit=%d add=%d cmp=%d assign=%d return=%d if=%d CALL=%d\n",
-           1,
-           std::max(1, (int)(rel(w_lit)  + 0.5)),
-           std::max(1, (int)(rel(w_add)  + 0.5)),
-           std::max(1, (int)(rel(w_cmp)  + 0.5)),
-           std::max(1, (int)(rel(w_asn)  + 0.5)),
-           std::max(1, (int)(rel(w_ret)  + 0.5)),
-           std::max(1, (int)(rel(w_if)   + 0.5)),
-           std::max(1, (int)(rel(w_call) + 0.5)));
+           1, iw(w_lit), iw(w_add), iw(w_cmp), iw(w_asn), iw(w_ret),
+           iw(w_if), iw(w_call));
 }

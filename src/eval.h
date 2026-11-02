@@ -1028,7 +1028,8 @@ EvalValue build_dict_from_pairs(const EvalValue *pairs, size_t npairs,
 
 /* Inlining cost-model calibration: measure per-node-type eval cost from
  * hand-built AST nodes and print the weights. Driven by `--weights`. */
-void run_weight_bench();
+/* --weights [N]: N iterations per measured node (20M by default) */
+void run_weight_bench(long iters);
 
 /* The per-frame pure-call cache (PureCache) is on by default; `-npc` clears
  * this to measure the recursion unroll without it. */

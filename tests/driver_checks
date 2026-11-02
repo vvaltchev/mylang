@@ -1382,6 +1382,15 @@ else
     fail "-it: $c_def calls by default, $c_zero with -it 0"
 fi
 
+# --weights [N] runs the inliner's cost-model calibration
+# (run_weight_bench) with N iterations per measured node. A small N makes
+# the numbers noise and the run instant, so this checks that the tool runs
+# to its table, not what the table says.
+flag "--weights N: the count it ran" 0 'best of 5, 2000 iters' \
+     --weights 2000
+flag "--weights 1: a count too short for the clock still prints" 0 \
+     'CALL=[0-9]+' --weights 1
+
 # --max-instances N bounds one template's typed instances: a call with a
 # new signature past N runs the template itself, a one-time warning names
 # it, and the answer is the same. The base must then be compiled - a
