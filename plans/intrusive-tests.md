@@ -894,12 +894,25 @@ read; the verdicts, so a later run's survivors can be told apart:
   a TESTS counter, `--weights`' repeat count, a span no caret reads (an
   int prefix's), a pc-0 branch target no lowering emits, a share-plan
   interval default no hot slot keeps;
-- **not reached yet (2):** a baked literal's widened storage hint
-  (inferencer.cpp, stamp_literal_repr's LiteralObj arm - no program
-  found that bakes a literal whose destination only inference knows) and
-  the bytecode inliner's parameter rename next to a capturing closure
-  (codegen.cpp, bc_site_param_renames - the shapes tried were not
-  inlined, or their closure was scalar-replaced first);
+- **redundant code, deleted (1):** a baked literal's widened storage
+  hint (inferencer.cpp, stamp_literal_repr's LiteralObj arm, and the
+  parser's twin in stamp_literal_annot). It IS reached - a constant
+  literal ASSIGNED to a declared variable (`a = [1.5, 2]`) is baked at
+  parse time and only inference knows its destination - but
+  widen_baked_value already rebuilds the array in the storage the hint
+  names, so the hint changed nothing: a temporary check found the value's
+  storage equal to the hint at all 814 hits over `-rt` and the corpus,
+  except in a program the inferencer refuses. Unit 44 now asserts the
+  assignment form (watched failing with the widening removed);
+- **equivalent, first read as unreached (1):** the bytecode inliner's
+  parameter rename next to a capturing closure (codegen.cpp,
+  bc_site_param_renames): the mutant was `int lo = 0, span = 0;` with a
+  1, and make_closure_span writes both whenever it answers true - the
+  only time the loop reads them. The code IS reached and checked:
+  tests/functional/44 (its factories inlined into `run`'s body, outside
+  any loop, are not scalar-replaced) fails, with a wrong sum and a VM
+  abort, when the capture scan skips closure_defs[0]. Read a survivor's exact edit
+  (the report job's log lists it) before deciding it was not reached;
 - **needs 65 parameters (1):** the frameless site's noescape bit test
   `i < 64` -> `i <= 64`.
 
