@@ -6307,50 +6307,20 @@ vm_load_member_baked(EvalContext &ctx, const Instr *in, const Chunk *chunk)
 }
 
 /* The SHARED LoadMemberInt/Float body (H1 - the typed standalone struct-member
- * read `p.x`, th==i/f): the POD fast path reads the scalar straight from the
- * instance's bytes; anything else (boxed struct / dict / const member / a dyn
- * base) falls to member_read_core + write_scalar_slot, whose loc-less get<>
- * throw is stamped with the member's caret. ONE implementation for the
- * interpreter handlers AND jit_load_member, so they cannot drift. */
+ * read `p.x`, th==i/f) for what the BAKED read (vm_load_member_baked,
+ * jit's inline twin) does not serve: a boxed struct, a dict, a const
+ * member, a `dyn` base. member_read_core + write_scalar_slot, whose
+ * loc-less get<> throw is stamped with the member's caret. A POD field is
+ * never left here by our own bytecode - try_member_scalar bakes every one
+ * it can, and the baked def is the def every instance of the type holds -
+ * and member_read_core reads one correctly anyway (it had a byte-reading
+ * arm of its own here, which no program reached). ONE implementation for
+ * the interpreter handlers AND jit_load_member, so they cannot drift. */
 static void
 vm_load_member_scalar(EvalContext &ctx, const Chunk::MemberKey &mk,
                       int_type base_slot, int_type dst, bool is_int)
 {
     const EvalValue &b = ctx.frame->at(base_slot).get();
-    if (b.is<intrusive_ptr<StructObject>>()) {
-        const StructObject &o = *b.get<intrusive_ptr<StructObject>>().get();
-        const int fs = o.def->slot_of(mk.memUid);
-        if (fs >= 0 && o.is_pod()) {
-            const FieldDef &f = o.def->fields[fs];
-            const char *p = o.bytes.data() + f.offset;
-            if (is_int) {
-                if (f.kind == FieldKind::f_int) {
-                    int_type v;
-                    std::memcpy(&v, p, sizeof v);
-                    write_int_slot(&ctx, dst, v);
-                    return;
-                }
-                if (f.kind == FieldKind::f_bool) {
-                    write_int_slot(&ctx, dst,
-                        static_cast<unsigned char>(*p) != 0 ? 1 : 0);
-                    return;
-                }
-            } else {
-                if (f.kind == FieldKind::f_float) {
-                    float_type v;
-                    std::memcpy(&v, p, sizeof v);
-                    write_float_slot(&ctx, dst, v);
-                    return;
-                }
-                if (f.kind == FieldKind::f_int) {
-                    int_type v;
-                    std::memcpy(&v, p, sizeof v);
-                    write_float_slot(&ctx, dst, static_cast<float_type>(v));
-                    return;
-                }
-            }
-        }
-    }
     try {
         write_scalar_slot(&ctx, dst, is_int,
             member_read_core(b, mk.memId, mk.memUid, mk.optional,
@@ -14320,9 +14290,9 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
 
         VM_CASE(LoadMemberInt): {
             /* H1: typed standalone struct-member read `p.x` (th==i) - the
-             * shared body (also jit_load_member's): the POD fast path reads
-             * the scalar straight from the instance's bytes, anything else
-             * falls to member_read_core + write_scalar_slot. */
+             * baked read straight from the instance's bytes, anything else
+             * the shared body (also jit_load_member's): member_read_core +
+             * write_scalar_slot. */
             if (!vm_load_member_baked(ctx, in, chunk))
                 vm_load_member_scalar(ctx, chunk->member_keys[in->a_lit()],
                                       in->target2, in->target,
