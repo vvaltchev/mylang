@@ -777,6 +777,18 @@ static uint32_t proven_arg_kinds(const ExprList *args)
 
 struct Codegen {
 
+    /* The builtin names a lowering compares a callee with, interned once
+     * per Codegen. A function-local `static` would pay an initialization
+     * guard on every call, whose contended arm no single-threaded run can
+     * take - six coverage elements each that no test could reach. */
+    const UniqueId *const uid_abs = UniqueId::get("abs");
+    const UniqueId *const uid_min = UniqueId::get("min");
+    const UniqueId *const uid_max = UniqueId::get("max");
+    const UniqueId *const uid_len = UniqueId::get("len");
+    const UniqueId *const uid_ord = UniqueId::get("ord");
+    const UniqueId *const uid_append = UniqueId::get("append");
+    const UniqueId *const uid_push = UniqueId::get("push");
+
     /* The CODEGEN-side instruction vector (CgInstr = Instr + the transient
      * node_idx handle); codegen_chunk SLICES it into code at the end,
      * so the runtime Chunk never holds a node handle AT THE TYPE LEVEL. */
@@ -4290,9 +4302,6 @@ struct Codegen {
     bool try_native_min_max_abs(const DirectBuiltinCallExpr *dc,
                                 int &out_slot, std::vector<CgInstr> &ops)
     {
-        static const UniqueId *abs_uid = UniqueId::get("abs");
-        static const UniqueId *min_uid = UniqueId::get("min");
-        static const UniqueId *max_uid = UniqueId::get("max");
         if (!dc->args || dc->lvalue_arg0 || dc->th != TypeHint::i
                 || dc->th_bool)
             return false;
@@ -4300,9 +4309,9 @@ struct Codegen {
             node_cast<const Identifier>(dc->what.get());
         if (!bid)
             return false;
-        const bool is_abs = bid->uid == abs_uid;
-        const bool is_min = bid->uid == min_uid;
-        const bool is_max = bid->uid == max_uid;
+        const bool is_abs = bid->uid == uid_abs;
+        const bool is_min = bid->uid == uid_min;
+        const bool is_max = bid->uid == uid_max;
         const size_t want = is_abs ? 1 : 2;
         if (!(is_abs || is_min || is_max)
                 || dc->args->elems.size() != want)
@@ -4410,13 +4419,12 @@ struct Codegen {
     bool try_native_len(const DirectBuiltinCallExpr *dc, int &out_slot,
                         std::vector<CgInstr> &ops)
     {
-        static const UniqueId *len_uid = UniqueId::get("len");
         if (dc->vm_len_kind == 0 || !dc->args || dc->lvalue_arg0
             || dc->args->elems.size() != 1)
             return false;
         const Identifier *bid =
             node_cast<const Identifier>(dc->what.get());
-        if (!bid || bid->uid != len_uid)
+        if (!bid || bid->uid != uid_len)
             return false;
         const size_t mark = ops.size();
         const size_t cmark = chunk.consts.size();
@@ -4447,12 +4455,11 @@ struct Codegen {
     bool try_native_ord(const DirectBuiltinCallExpr *dc, int &out_slot,
                         std::vector<CgInstr> &ops)
     {
-        static const UniqueId *ord_uid = UniqueId::get("ord");
         if (!dc->args || dc->lvalue_arg0 || dc->args->elems.size() != 1)
             return false;
         const Identifier *bid =
             node_cast<const Identifier>(dc->what.get());
-        if (!bid || bid->uid != ord_uid)
+        if (!bid || bid->uid != uid_ord)
             return false;
         const Subscript *sub =
             node_cast<const Subscript>(dc->args->elems[0].get());
@@ -4945,9 +4952,6 @@ struct Codegen {
         if (rest_op && dc->args->elems.size() == 2) {
             if (const Identifier *bid =
                     node_cast<const Identifier>(dc->what.get())) {
-                static const UniqueId *const uid_append =
-                    UniqueId::get("append");
-                static const UniqueId *const uid_push = UniqueId::get("push");
                 if (bid->uid == uid_append || bid->uid == uid_push)
                     cv.op = OpCode::AppendV;
             }
