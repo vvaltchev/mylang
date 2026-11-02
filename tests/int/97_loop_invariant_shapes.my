@@ -1,0 +1,128 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): the shapes the loop transforms must REFUSE, and the ones
+# subscript LICM must tell apart. A counted `for` caches its bound only
+# when nothing in the loop can change it (fr_immutable): a global, the loop
+# variable itself, a variable the body writes, a capture, an element or
+# field the body writes (directly or through another array), an index the
+# body writes, a call that is not a const builtin or a pure function, a
+# builtin that sorts in place, and a ternary all keep the bound evaluated
+# every iteration. Subscript LICM hoists each distinct loop-invariant row
+# read into one temp (licm_expr_equal decides "distinct": rows indexed by
+# different names, literals, operators, element reads, fields and calls).
+# The tree-walker with every transform off is the oracle; every engine
+# must print the same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+var G = int(runtime(3));
+func use_g() { return G; }
+struct P { int n; }
+var calls = 0;
+func mk() { calls++; return [int(runtime(2)), 9]; }
+func mkp() { calls++; return P(int(runtime(2))); }
+func fib(int n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }
+func impure(int n) { calls++; return n; }
+
+# ---- bounds the counted loop must re-evaluate (or may cache: same answer)
+func b_global() { var c = 0; for (var k = 0; k < G; k++) c++; return c; }
+func b_self(int n) {
+    var c = 0; for (var k = 0; k < n - k; k++) c++; return c;
+}
+func b_mut(int n) {
+    var c = 0; for (var k = 0; k < n; k++) { n--; c++; } return c;
+}
+func b_cap(int n) {
+    var f = func [n] () {
+        var c = 0; for (var k = 0; k < n; k++) c++; return c;
+    };
+    return f();
+}
+func b_callbase() {
+    var c = 0; for (var k = 0; k < mk()[0]; k++) c++; return c;
+}
+func b_content(array<int> a) {
+    var c = 0; for (var k = 0; k < a[0]; k++) { a[0] = 2; c++; } return c;
+}
+func b_alias(array<int> a, array<int> b) {
+    var c = 0; for (var k = 0; k < a[0]; k++) { b[0] = 1; c++; } return c;
+}
+func b_idxmut(array<array<int>> m, int j) {
+    var c = 0; for (var k = 0; k < m[j][0]; k++) { j = 0; c++; } return c;
+}
+func b_mcall() {
+    var c = 0; for (var k = 0; k < mkp().n; k++) c++; return c;
+}
+func b_mcontent(P p) {
+    var c = 0; for (var k = 0; k < p.n; k++) { p.n = 2; c++; } return c;
+}
+func b_malias(dict<str, int> d, dict<str, int> e) {
+    var c = 0; for (var k = 0; k < d.n; k++) { e.n = 1; c++; } return c;
+}
+func b_sort(array<int> a) {
+    var c = 0; for (var k = 0; k < len(sort(a)); k++) c++; return c;
+}
+func b_impure(int n) {
+    var c = 0; for (var k = 0; k < impure(n); k++) c++; return c;
+}
+func b_fib(int n) {
+    var c = 0; for (var k = 0; k < fib(n); k++) c++; return c;
+}
+func b_sum(array<int> a, array<int> b) {
+    var c = 0; for (var k = 0; k < sum(a); k++) { b[0] = 0; c++; } return c;
+}
+func b_len(array<int> a, array<int> b) {
+    var c = 0; for (var k = 0; k < len(a); k++) { pop(b); c++; } return c;
+}
+func b_tern(bool t, int n) {
+    var c = 0; for (var k = 0; k < (t ? n : 1); k++) c++; return c;
+}
+
+want("global", b_global(), 3);
+want("use_g", use_g(), 3);
+want("bound reads the loop variable", b_self(int(runtime(6))), 3);
+want("bound written by the body", b_mut(int(runtime(6))), 3);
+want("bound is a capture", b_cap(int(runtime(4))), 4);
+want("bound's base is a call", b_callbase(), 2);
+var ca = [int(runtime(4)), 0];
+want("element the body writes", b_content(ca), 2);
+var sa = [int(runtime(4)), 0];
+want("element written through an alias", b_alias(sa, sa), 1);
+want("index the body writes", b_idxmut([[1], [int(runtime(4))]],
+                                       int(runtime(1))), 1);
+want("field of a call", b_mcall(), 2);
+want("field the body writes", b_mcontent(P(int(runtime(4)))), 2);
+var dd = {"n": int(runtime(4))};
+want("dict field written through an alias", b_malias(dd, dd), 1);
+want("sort in the bound", b_sort([3, 1, int(runtime(2))]), 3);
+want("impure call", b_impure(int(runtime(3))), 3);
+want("pure call", b_fib(int(runtime(5))), 5);
+var su = [1, int(runtime(2))];
+want("sum of an array the body writes", b_sum(su, su), 2);
+var la = [1, 2, int(runtime(3)), 4];
+want("len of an array the body pops", b_len(la, la), 2);
+want("ternary", b_tern(runtime(true), int(runtime(4))), 4);
+want("calls", calls, 10);
+
+# ---- subscript LICM: distinct rows get distinct temps
+func rows(array<array<int>> m, array<int> a, P p, int i, int j, int n) {
+    var s = 0;
+    for (var k = 0; k < n; k++)
+        s += m[len(a)][k] + m[a[0]][k] + m[p.n][k] + m[i][k] + m[j][k]
+             + m[0][k] + m[1][k] + m[i + 1][k] + m[i + 2][k] + m[i - 1][k]
+             + m[i * 2][k] + m[i + j + 1][k] + m[j][k] + m[i + 1][k]
+             + m[-1][k];
+    return s;
+}
+var m = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]];
+want("rows", rows(m, [1, 2], P(int(runtime(3))), int(runtime(1)),
+                  int(runtime(2)), int(runtime(2))), 161);
+
+assert(bad == 0);
+print("ok");
