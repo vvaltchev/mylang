@@ -675,6 +675,26 @@ else
     fail "myv: CRLF source: [$(printf '%s' "$crlf_img" | head -c 200)] vs \
 [$(printf '%s' "$crlf_src" | head -c 200)]"
 fi
+# ...and an error ON a CRLF-terminated line, the last line ending in a
+# bare CR: a source run keeps a CRLF file's CRs in its lines and an image
+# reading its source back drops them, so the quoted line differed by a
+# trailing CR until the renderer dropped one (2026-11-12, RULE 2).
+printf 'var a = 1;\r\nprint(a / int(runtime(0)));\r\nprint(2);\r' \
+    > "$TMP/crlf2.my"
+crlf2_src=$("$BIN" "$TMP/crlf2.my" 2>&1)
+"$BIN" -c "$TMP/crlf2.my" -o "$TMP/crlf2.myv" > /dev/null 2>&1
+crlf2_img=$("$BIN" "$TMP/crlf2.myv" 2>&1)
+if [ "$(printf '%s' "$crlf2_img" | sed 1d)" = \
+     "$(printf '%s' "$crlf2_src" | sed 1d)" ] &&
+   [ "$(printf '%s' "$crlf2_src" | tr -d '\r')" = "$crlf2_src" ] &&
+   printf '%s' "$crlf2_img" | grep -q '^    print(a / int(runtime(0)));$'
+then
+    pass "myv: a CRLF line quoted in an error: no CR, from source or image"
+else
+    fail "myv: CRLF line 2: [$(printf '%s' "$crlf2_img" | od -c |
+          head -c 300)] vs [$(printf '%s' "$crlf2_src" | od -c |
+          head -c 300)]"
+fi
 nout=$("$BIN" -c "$TMP/crlf.my" -o "$TMP/no/such/dir/x.myv" 2>&1)
 nrc=$?
 if [ $nrc = 1 ] &&
