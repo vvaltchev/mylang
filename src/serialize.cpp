@@ -857,6 +857,13 @@ EvalValue read_array(Reader &r)
         std::vector<char> b(r.buf.begin() + static_cast<long>(r.p),
                             r.buf.begin() + static_cast<long>(r.p + bytes));
         r.p += bytes;
+        /* an element is a POD struct value of `stride` bytes: the def must
+         * be a POD struct of exactly that size (checked once the layouts
+         * exist). A stride of another size made every byte-level reader
+         * of the array overrun its element - vm_emplace_struct copied
+         * `stride` bytes out of a buffer of the def's size (myv_fuzz,
+         * CI seed 43176902900, fat-276). */
+        r.check_struct_val(r.structs[di], false, true, stride);
         out = SharedArrayObj(SharedArrayObj::svec_type(
             std::move(b), r.structs[di], static_cast<int>(stride)));
         break;
