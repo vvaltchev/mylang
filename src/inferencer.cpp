@@ -4392,6 +4392,20 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
          * to the hint (LiteralObj::takes_hint) */
         rv->arr_hint = hint;
         rv->arr_hint_struct = sdef;
+        /* ...and a folded value is REBUILT in that storage now, as its
+         * unfolded call builds at run time: the parse folded it with no
+         * hint, and eval_literal_obj converts only an empty array - so a
+         * folded `keys(d)` / `map(f, a)` stayed general where -nc built it
+         * flat, and a store of another kind through a `dyn` alias was
+         * accepted in one and refused in the other (RULE 2) */
+        if (ctag(rv) == ConstructType::lit_obj) {
+            auto *lo = static_cast<LiteralObj *>(rv);
+            WidenShape w;
+            w.k = 'a';
+            w.hint = hint;
+            w.hint_struct = sdef;
+            lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
+        }
     }
 }
 
