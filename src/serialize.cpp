@@ -1576,10 +1576,6 @@ void write_chunk(Writer &w, const Chunk &c)
     for (const auto &lo : c.literal_objs) {
         write_value(w, lo.value);
         w.boolv(lo.immutable);
-        w.u8v(static_cast<uint8_t>(lo.arr_hint));
-        auto it = w.struct_ids.find(lo.arr_hint_struct);
-        w.u32v(lo.arr_hint_struct && it != w.struct_ids.end()
-                   ? it->second : 0xffffffffu);
     }
 
     w.u32v(static_cast<uint32_t>(c.closure_defs.size()));
@@ -1917,10 +1913,6 @@ void read_chunk(Reader &r, Chunk &c)
         Chunk::LiteralObjEntry lo;
         lo.value = read_value(r);
         lo.immutable = r.boolv();
-        lo.arr_hint = r.enumv(ArrHint::flat_c,
-                              "corrupt .myv (array hint)");
-        const uint32_t si = r.idx_opt(r.structs.size(), "corrupt .myv (hint)");
-        lo.arr_hint_struct = si == 0xffffffffu ? nullptr : r.structs[si];
         c.literal_objs.push_back(std::move(lo));
     }
 

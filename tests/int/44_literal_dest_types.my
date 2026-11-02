@@ -115,6 +115,17 @@ want("asdd", str(asdd), "{\"k\": [\"u\"]}");
 asm[0] = [3, 4];
 asm[0][1] = none;
 want("asm elem", str(asm[0]), "[3.000000, <none>]");
+# a bool literal widens into a numeric place like any bool (README)
+array<int> wbi = [true, false];
+want("wbi", str(wbi) + array_storage(wbi), "[1, 0]int");
+array<float> wbf = [true];
+want("wbf", str(wbf) + array_storage(wbf), "[1.000000]float");
+dict<str, int> wbd = {"a": true};
+want("wbd", str(wbd), "{\"a\": 1}");
+dict<int, float> wbk = {true: false};
+want("wbk", str(wbk), "{1: 0.000000}");
+array<array<float>> wbn = [[true], [false, true]];
+want("wbn", str(wbn), "[[1.000000], [0.000000, 1.000000]]");
 
 # --- typed constants: widened by the parser when it binds them
 const array<float> KF = [1, 2];

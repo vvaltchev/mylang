@@ -4793,8 +4793,8 @@ decisions behind it: `plans/archived/type-inference.md`,
   array now starts flat too (`LiteralArray::do_eval` honors
   `flat_i`/`flat_f`/`flat_b` for `elems.empty()`, matching the existing `flat_s`
   case), so `array<int> a; append(a, 5)` stays unboxed. **The explicit/
-  inferred `= []` form too (2026-07-18 profile #1):** `eval_literal_obj`
-  gained the flat_i/f/b empty-array arms (only flat_s existed), so
+  inferred `= []` form too (2026-07-18 profile #1):** the baked empty `[]`
+  is rebuilt flat at compile time (`set_array_repr_hint`, below), so
   `array<int> e = []` AND the inferred `var a = []; push(a, i)` (typed
   array<int> by the fixpoint) start flat — the whole grow-from-empty class
   ran on general 48-byte LValues before (bench 13: 3x faster fixed). Generic `array a` /
@@ -7038,9 +7038,12 @@ per level of a deep value - a separate open item.
   per-element boxing; the big win for `keys()`/`values()` of a large dict, and
   why `bench/27_dict_keys_values` beats CPython — only the bound form
   `var k = keys(d)` gets the hint, an inline `keys(d)` arg stays general),
-  `LiteralArray::do_eval`, and `LiteralObj::do_eval` (a flat baked
-  literal bound to an `array<dyn>` dest is made general via
-  `make_general_array_clone`). **⛔ A folded value takes the hint only where
+  `LiteralArray::do_eval`, and - for a value baked at parse time, a
+  `LiteralObj` - the compiler itself: it REBUILDS the baked value in the
+  hinted storage (`widen_baked_value`, from `set_array_repr_hint`, the
+  parser's `stamp_literal_annot` and `stamp_literal_repr`), so
+  `LiteralObj::do_eval` / LoadLiteralObjV convert nothing and the `.myv`
+  literal pool carries no hint (v41). **⛔ A folded value takes the hint only where
   its UNFOLDED node would (#97, 2026-10-24):** `LiteralObj::takes_hint`
   (set by `cse_materialize` from the node it replaces: a container literal,
   or a call to one of `builtin_takes_arr_hint`'s builtins - the one list,
@@ -7049,12 +7052,14 @@ per level of a deep value - a separate open item.
   they stamped every one, so a folded `clone(K)` / `sort(K)` / `a + b`
   bound to a `dyn` variable was general where `-nc` kept it flat, and a
   write the program refused under `-nc` succeeded. **And where it takes
-  the hint, `set_array_repr_hint` REBUILDS the value in that storage
-  (2026-11-11)** - the parse folded it with no destination, and
-  `LiteralObj::do_eval` converts only an EMPTY array to a flat hint, so a
-  folded `var v = values({"a": 1})` stayed general where `-nc` built it
-  flat: the same RULE 2 difference in the other direction
-  (`tests/functional/109_folded_builtin_storage.my`).
+  the hint, the value is REBUILT in that storage (2026-11-11)** - the
+  parse folded it with no destination, and the run-time conversion this
+  replaced handled only an EMPTY array for a flat hint, so a folded
+  `var v = values({"a": 1})` stayed general where `-nc` built it flat:
+  the same RULE 2 difference in the other direction
+  (`tests/functional/109_folded_builtin_storage.my`). A new pass that
+  stamps a baked value's hint must rebuild the value too; nothing
+  converts it later.
   The fixpoint propagates the destination type through direct aliases
   (`var b = a`), so they agree. Value-driven flat (`dflt`) is the fallback for
   contexts the hint doesn't cover. The flat fast paths (each branches on

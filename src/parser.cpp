@@ -958,6 +958,16 @@ static void stamp_literal_annot(Construct *lit, const TypeAnnot *a, bool dyn)
                     || (t == ConstructType::lit_obj
                         && static_cast<LiteralObj *>(lit)->takes_hint)))
             lit->arr_hint = ArrHint::general;
+        if (dyn && t == ConstructType::lit_obj
+                && static_cast<LiteralObj *>(lit)->takes_hint) {
+            /* and a folded value is rebuilt general now: it is loaded as
+             * it is (eval_literal_obj converts nothing) */
+            auto *lo = static_cast<LiteralObj *>(lit);
+            WidenShape w;
+            w.k = 'a';
+            w.hint = ArrHint::general;
+            lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
+        }
         return;
     }
     if (t == ConstructType::lit_arr && a->kind == DeclType::arr) {

@@ -50,12 +50,19 @@ n += t("keys bool", a10);
 var a11 = values({"a": 1.5});
 n += t("values float", a11);
 
-# a `dyn` destination: general, so the same store is accepted
+# a `dyn` destination: general, so the same store is accepted - with or
+# without inference (untyped, the parser alone rebuilds the folded value)
+var dn = 0;
 var dyn d1 = keys({"a": 1, "b": 2});
-n += t("dyn keys", d1);
+dn += t("dyn keys", d1);
 var dyn d2 = values({"a": 1});
-n += t("dyn values", d2);
+dn += t("dyn values", d2);
+var dyn d3 = map(pure func(x) => x + 1, [1, 2]);
+dn += t("dyn map", d3);
+var dyn d4 = [1, 2, 3];
+dn += t("dyn literal", d4);
+assert(dn == 0);
 
 if (typed)
     assert(n == 11);
-print(n);
+print(n, dn);

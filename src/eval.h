@@ -1015,13 +1015,11 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
  * typed destination never holds a misfit. See eval.cpp. */
 EvalValue flat_hint_value(const EvalValue &v, ArrHint hint);
 
-/* The value a baked const array/dict/struct LiteralObj materializes (immutable
- * share vs mutable clone, plus the general/flat_s arr_hint cases). Shared by
- * tree-walker (LiteralObj::do_eval) and the VM's LoadLiteralObjV op, so both
+/* The value a baked const array/dict/struct LiteralObj materializes (an
+ * immutable share vs a fresh mutable clone). Shared by the tree-walker
+ * (LiteralObj::do_eval) and the VM's LoadLiteralObjV op, so both
  * materialize byte-identically. */
-EvalValue eval_literal_obj(const EvalValue &value, bool immutable,
-                           ArrHint arr_hint,
-                           const StructTypeDef *arr_hint_struct);
+EvalValue eval_literal_obj(const EvalValue &value, bool immutable);
 
 /* Build a dict VALUE from `npairs` INTERLEAVED key/value values ([k0,v0,..]).
  * Keys are frozen. Shared by LiteralDict::do_eval and the VM's MakeDictV. */

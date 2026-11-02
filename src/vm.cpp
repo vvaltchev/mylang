@@ -4791,8 +4791,7 @@ extern "C" void jit_load_literal_obj(LValue *slots, int_type dst,
     ML_JIT_OP_RAN(LoadLiteralObjV);
     const Chunk::LiteralObjEntry *lo =
         static_cast<const Chunk::LiteralObjEntry *>(lov);
-    slots[dst].put(eval_literal_obj(lo->value, lo->immutable, lo->arr_hint,
-                                    lo->arr_hint_struct));
+    slots[dst].put(eval_literal_obj(lo->value, lo->immutable));
 }
 
 extern "C" void jit_store_global(int_type gslot,
@@ -14001,13 +14000,11 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
 
         VM_CASE(LoadLiteralObjV): {
             /* Materialize a baked const array/dict/struct literal via shared
-             * eval_literal_obj (immutable share vs a fresh mutable clone, plus
-             * the general/flat_s arr_hint cases) - byte-identical to
-             * LiteralObj::do_eval. */
+             * eval_literal_obj (immutable share vs a fresh mutable clone) -
+             * byte-identical to LiteralObj::do_eval. */
             const Chunk::LiteralObjEntry &lo = chunk->literal_objs[in->target2];
             ctx.frame->at(in->target).put(
-                eval_literal_obj(lo.value, lo.immutable, lo.arr_hint,
-                                 lo.arr_hint_struct));
+                eval_literal_obj(lo.value, lo.immutable));
             pc++;
         }
         VM_NEXT;

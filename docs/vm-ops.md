@@ -284,9 +284,10 @@ compiler route a plain-`CallExpr` statement to `try_native_value_call` after the
 live `EvalStmt` (`76_funcval_dispatch` VM 0.93x vs the tree-walker). A **baked const array/dict/struct literal** (a `LiteralObj` —
 what a fully-const `var a = [1,2,3]` / `d = {}` folds to) materializes via
 **`LoadLiteralObjV`**, which calls the shared **`eval_literal_obj`** (the
-immutable-share vs fresh-mutable-clone logic + the general/flat_s `arr_hint`
-cases, factored out of `LiteralObj::do_eval`) from a `Chunk::literal_objs` pool
-entry — AST-free, byte-identical to the tree-walker. A **plain assignment to a
+immutable-share vs fresh-mutable-clone logic, factored out of
+`LiteralObj::do_eval`) from a `Chunk::literal_objs` pool entry — AST-free,
+byte-identical to the tree-walker. The value is already in its destination's
+storage (the compiler rebuilt it), so the entry carries no array hint. A **plain assignment to a
 GLOBAL-table slot** `g = <expr>` (a top-level var a function reads — the write
 counterpart of `LoadGlobalV`) goes native via **`StoreGlobalV`** (`target` = the
 `GlobalFuncTable` slot, `a` = the value temp): it writes `gfuncs->slots[target]`

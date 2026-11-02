@@ -23,7 +23,12 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 40;   /* v40: a NATIVE struct
+constexpr unsigned MYV_FORMAT_VERSION = 41;   /* v41: a LiteralObj
+                                                 loses its arr_hint and
+                                                 arr_hint_struct (the
+                                                 value is stored in its
+                                                 storage);
+                                                 v40: a NATIVE struct
                                                  instance (value tag
                                                  12, a folded type());
                                                  v39: a builtin VALUE
