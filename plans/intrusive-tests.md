@@ -916,6 +916,15 @@ read; the verdicts, so a later run's survivors can be told apart:
 - **needs 65 parameters (1):** the frameless site's noescape bit test
   `i < 64` -> `i <= 64`.
 
+Reading the survivors led one cluster further, to a real defect: a
+folded `keys` / `values` / `map` / `filter` result bound to a typed
+variable kept GENERAL storage where `-nc` built it flat, so a store of
+another kind through a `dyn` alias was accepted in one and refused in the
+other (9 of 11 shapes; tests/functional/109). The compiler now builds a
+baked value in its destination's storage, and eval_literal_obj's run-time
+conversion arms - reached only by that gap and by `-nti` - are gone with
+make_general_array_clone (and the `.myv` literal pool's hint, v41).
+
 What it says about the stages: `-rt` does nearly all the killing; a
 mutant the enumerator or a fuzzer alone killed would have been the
 evidence for keeping them on cost grounds, and this run had none - one
