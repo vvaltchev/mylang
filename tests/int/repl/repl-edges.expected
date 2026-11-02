@@ -1,0 +1,26 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> >> >> >> >> => 1
+>> Undefined variable 'nope' at line 10, col 22:26
+
+    w1 = 7; var dyn q2 = nope();
+                         ^^^^
+>> => 7
+>> .. => <none>
+>> => <none>
+>> int   (runtime type)
+>> int   (runtime type)
+>> (empty)
+>> SyntaxError at line 1, col 4
+
+    1 +;
+       ^
+Expected expression, got ';'
+>> 3
+>> 3
+>> (nothing to show)
+>> SyntaxError at line 1, col 4
+
+    1 +;
+       ^
+Expected expression, got ';'
+>> 

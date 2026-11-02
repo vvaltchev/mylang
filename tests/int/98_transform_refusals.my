@@ -13,6 +13,9 @@
 #    change, so each is bound once, first;
 #  - a callee local that a multi-assignment or `append` writes is not
 #    copy-propagated;
+#  - a function value called at sites that disagree on its argument
+#    types (or with an opt or dyn parameter) gets no typed instance - the
+#    template itself runs;
 #  - a loop-body slice whose base or whose own variable the body writes,
 #    or an array slice that escapes into a call, is not hoisted above the
 #    loop (one that is only read is).
@@ -180,6 +183,32 @@ func slice_contained(array<int> a) {
     return total;
 }
 want("array slice only read", slice_contained([1, 2, 3]), 66);
+
+# ---- value-used templates whose call sites disagree: no typed instance
+# (the base runs, boxed), the same answers
+func vsq(x) => x * x;
+func vhalf(x) => x / 2;
+var vfs = [vsq, vhalf];
+var vg = vfs[int(runtime(0))];
+want("value template, int then float", str(vg(3)) + " " + str(vg(2.5)),
+     "9 6.250000");
+func vcat(a, opt b) {
+    if (b == none)
+        return str(a) + "-";
+    return str(a) + str(b);
+}
+var vcs = [vcat];
+var vh = vcs[int(runtime(0))];
+want("value template, an opt parameter", vh(1, 2) + vh(5), "125-");
+func vtag(a, dyn b) => str(a) + ":" + typestr(b);
+var vts = [vtag];
+var vt = vts[int(runtime(0))];
+want("value template, a dyn parameter", vt(1, "s") + vt(2, 3.5),
+     "1:dyn2:dyn");
+func vtwice(x) => x + x;
+var vws = [vtwice];
+var vw = vws[int(runtime(0))];
+want("value template, int then str", str(vw(1)) + vw("ab"), "2abab");
 
 assert(bad == 0);
 print("ok");
