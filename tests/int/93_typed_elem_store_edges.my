@@ -1,0 +1,215 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): a TYPED store into an element of a flat int, float or
+# bool array (`a[i] = v`, `a[i] OP= v` with a proven element type - the
+# VM's StoreElemInt / StoreElemFloat, vm_store_elem_int_body and
+# vm_store_elem_float_body under -nj, and the JIT's tiers) at its edges: a
+# negative index, an index out of range, every compound operator, a zero
+# divisor (README: an int or float `/` or `%` by zero raises
+# DivisionByZeroEx and stores nothing), the most negative int divided by
+# -1 and a negative shift count (both InvalidValueEx), a store into a
+# slice (a new array) and into an array another name shares, an array
+# whose storage is general (a `dyn` value that fits the type - the ops'
+# fallback), and a constant's array reached through a parameter
+# (refused). The tree-walker is the oracle; every engine must print the
+# same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + got + ", expected " + exp);
+        bad++;
+    }
+}
+
+func store(int op, array<float> a, int i, float v) {
+    if (op == 0)
+        a[i] = v;
+    else if (op == 1)
+        a[i] += v;
+    else if (op == 2)
+        a[i] -= v;
+    else if (op == 3)
+        a[i] *= v;
+    else if (op == 4)
+        a[i] /= v;
+    else
+        a[i] %= v;
+}
+
+func attempt(int op, array<float> a, int i, float v) {
+    try {
+        store(op, a, i, v);
+        return "ok";
+    } catch (OutOfBoundsEx) {
+        return "oob";
+    } catch (DivisionByZeroEx) {
+        return "div0";
+    } catch (NotLValueEx) {
+        return "refused";
+    } catch (CannotChangeConstEx) {
+        return "refused";
+    }
+    return "?";
+}
+
+var n = int(runtime(4));
+array<float> f = [];
+for (var i = 0; i < n; i++)
+    append(f, float(i) + 0.5);                  # [0.5, 1.5, 2.5, 3.5]
+want("storage", array_storage(f), "float");
+
+want("neg", attempt(0, f, -1, 9.5) + str(f[3]), "ok9.500000");
+want("neg add", attempt(1, f, -n, 1.0) + str(f[0]), "ok1.500000");
+want("oob n", attempt(0, f, n, 1.0), "oob");
+want("oob -n-1", attempt(1, f, -n - 1, 1.0), "oob");
+want("sub", attempt(2, f, 1, 0.25) + str(f[1]), "ok1.250000");
+want("mul", attempt(3, f, 1, 2.0) + str(f[1]), "ok2.500000");
+want("div", attempt(4, f, 1, 2.0) + str(f[1]), "ok1.250000");
+want("div0", attempt(4, f, 1, 0.0) + str(f[1]), "div01.250000");
+want("mod -0", attempt(5, f, 1, -0.0) + str(f[1]), "div01.250000");
+want("mod", attempt(5, f, 2, 1.0) + str(f[2]), "ok0.500000");
+want("oob div0", attempt(4, f, n, 0.0), "oob");
+
+# a slice is a new array: a store into it leaves f alone
+var s = f[1:3];
+want("slice", attempt(0, s, 0, 7.25) + str(s) + str(f[1]),
+     "ok[7.250000, 0.500000]1.250000");
+want("slice oob", attempt(0, s, 2, 1.0), "oob");
+
+# another name for the same array sees the store...
+var g = f;
+want("alias", attempt(0, g, 2, 6.0) + str(f[2]), "ok6.000000");
+# ...and a slice taken earlier keeps its own elements
+var s2 = f[0:2];
+want("live slice", attempt(1, f, 0, 4.0) + str(s2[0]) + str(f[0]),
+     "ok1.5000005.500000");
+
+# a `dyn` value that fits array<float> keeps its general storage
+array<float> gen = dynarray([1.5, 2.5]);
+want("gen storage", array_storage(gen), "general");
+want("gen", attempt(1, gen, -1, 1.0) + str(gen), "ok[1.500000, 3.500000]");
+want("gen oob", attempt(0, gen, 5, 1.0), "oob");
+want("gen div0", attempt(4, gen, 0, 0.0) + str(gen[0]), "div01.500000");
+
+# a constant's array is read-only, through any name
+const array<float> K = [1.5, 2.5];
+want("const", attempt(0, K, 0, 9.0) + str(K[0]), "refused1.500000");
+want("const add", attempt(1, K, 1, 1.0) + str(K[1]), "refused2.500000");
+
+# --- int: every compound operator, and the int-only edges
+func istore(int op, array<int> a, int i, int v) {
+    if (op == 0)
+        a[i] = v;
+    else if (op == 1)
+        a[i] += v;
+    else if (op == 2)
+        a[i] -= v;
+    else if (op == 3)
+        a[i] *= v;
+    else if (op == 4)
+        a[i] /= v;
+    else if (op == 5)
+        a[i] %= v;
+    else if (op == 6)
+        a[i] &= v;
+    else if (op == 7)
+        a[i] |= v;
+    else if (op == 8)
+        a[i] ^= v;
+    else if (op == 9)
+        a[i] <<= v;
+    else if (op == 10)
+        a[i] >>= v;
+    else
+        a[i] >>>= v;
+}
+
+func iattempt(int op, array<int> a, int i, int v) {
+    try {
+        istore(op, a, i, v);
+        return "ok";
+    } catch (OutOfBoundsEx) {
+        return "oob";
+    } catch (DivisionByZeroEx) {
+        return "div0";
+    } catch (InvalidValueEx) {
+        return "invalid";
+    } catch (NotLValueEx) {
+        return "refused";
+    } catch (CannotChangeConstEx) {
+        return "refused";
+    }
+    return "?";
+}
+
+array<int> q = [];
+for (var i = 0; i < n; i++)
+    append(q, i * 10 + 1);                      # [1, 11, 21, 31]
+want("i storage", array_storage(q), "int");
+want("i neg", iattempt(0, q, -1, 40) + str(q[3]), "ok40");
+want("i oob", iattempt(1, q, n, 1), "oob");
+want("i oob neg", iattempt(0, q, -n - 1, 1), "oob");
+want("i add", iattempt(1, q, 0, 4) + str(q[0]), "ok5");
+want("i sub", iattempt(2, q, 0, 2) + str(q[0]), "ok3");
+want("i mul", iattempt(3, q, 0, -3) + str(q[0]), "ok-9");
+want("i div", iattempt(4, q, 0, 2) + str(q[0]), "ok-4");
+want("i mod", iattempt(5, q, 1, 4) + str(q[1]), "ok3");
+want("i div0", iattempt(4, q, 1, 0) + str(q[1]), "div03");
+want("i mod0", iattempt(5, q, 1, 0) + str(q[1]), "div03");
+want("i and", iattempt(6, q, 2, 6) + str(q[2]), "ok4");
+want("i or", iattempt(7, q, 2, 3) + str(q[2]), "ok7");
+want("i xor", iattempt(8, q, 2, 5) + str(q[2]), "ok2");
+want("i shl", iattempt(9, q, 2, 3) + str(q[2]), "ok16");
+want("i shr", iattempt(10, q, 2, 2) + str(q[2]), "ok4");
+want("i neg shl", iattempt(9, q, 2, -1) + str(q[2]), "invalid4");
+want("i neg ushr", iattempt(11, q, 2, -1) + str(q[2]), "invalid4");
+want("i shl 64", iattempt(9, q, 1, 64) + str(q[1]), "ok0");
+want("i set", iattempt(0, q, 3, -8) + str(q[3]), "ok-8");
+want("i ushr", iattempt(11, q, 3, 60) + str(q[3]), "ok15");
+var mn = int(runtime(1)) << 63;
+iattempt(0, q, 0, mn);
+want("i min div", iattempt(4, q, 0, -1) + str(q[0] == mn), "invalidtrue");
+want("i min mod", iattempt(5, q, 0, -1) + str(q[0] == mn), "invalidtrue");
+var qs = q[1:3];
+want("i slice", iattempt(0, qs, 0, 77) + str(qs) + str(q[1]), "ok[77, 4]0");
+array<int> gi = dynarray([1, 2]);
+want("i gen storage", array_storage(gi), "general");
+want("i gen", iattempt(1, gi, -1, 5) + str(gi), "ok[1, 7]");
+want("i gen div0", iattempt(4, gi, 0, 0) + str(gi[0]), "div01");
+const array<int> KI = [1, 2];
+want("i const", iattempt(0, KI, 0, 9) + str(KI[0]), "refused1");
+
+# --- bool: a plain store (bools have no compound store)
+func bput(array<bool> a, int i, bool v) { a[i] = v; }
+func battempt(array<bool> a, int i, bool v) {
+    try {
+        bput(a, i, v);
+        return "ok";
+    } catch (OutOfBoundsEx) {
+        return "oob";
+    } catch (NotLValueEx) {
+        return "refused";
+    } catch (CannotChangeConstEx) {
+        return "refused";
+    }
+    return "?";
+}
+
+array<bool> bs = [];
+for (var i = 0; i < n; i++)
+    append(bs, i % 2 == 0);                     # [true, false, true, false]
+want("b storage", array_storage(bs), "bool");
+want("b neg", battempt(bs, -1, true) + str(bs[3]), "oktrue");
+want("b oob", battempt(bs, n, true), "oob");
+want("b set", battempt(bs, 0, false) + str(bs[0]), "okfalse");
+var bsl = bs[0:2];
+want("b slice", battempt(bsl, 1, true) + str(bsl) + str(bs[1]),
+     "ok[false, true]false");
+const array<bool> KB = [true];
+want("b const", battempt(KB, 0, false) + str(KB[0]), "refusedtrue");
+
+if (bad == 0)
+    print("all ok");
+else
+    print(str(bad) + " failure(s)");
