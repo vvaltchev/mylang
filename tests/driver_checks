@@ -1731,7 +1731,9 @@ fi
 # dump's pass (SHAREDBG and MAXSHARE belong to the legacy pick, hence
 # MYLANG_JIT_OFF=lsra), each cap below changes its emitted code, and no
 # tests/int unit runs it (INT-SOURCE) - this check reaching the paths a
-# unit exists to own made that unit redundant. A NON-binding pin cap (99,
+# unit exists to own made that unit redundant. 55_regcall (no unit's
+# source either) is the one whose float temps take the linear scan's own
+# plan, the dump's `fr[` and `ftrans` lines. A NON-binding pin cap (99,
 # above any budget) is a no-op to the byte: its -vdj equals the plain
 # one.
 if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
@@ -1741,6 +1743,7 @@ if "$BIN" -v 2>/dev/null | grep -Eq '^ *jit +1'; then
     pg=17_elem2_divmod_roles
     for spec in \
         "MYLANG_LSRADBG=1|$pg|^LSRADBG " \
+        "MYLANG_LSRADBG=1|55_regcall|^LSRADBG +ftrans " \
         "MYLANG_SPILLDBG=1|$pg|^SPILLDBG run" \
         "MYLANG_CACHEAUDIT=1|$pg|^CACHEAUDIT pinned" \
         "MYLANG_REGAUDIT=1|$pg|^REGAUDIT TOTAL" \
