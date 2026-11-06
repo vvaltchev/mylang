@@ -2684,7 +2684,7 @@ try {
 ### Structs
 
 `struct` declares a C-like value type with explicitly-typed fields and
-type-level `const`s (no methods in v1):
+type-level `const`s (no methods yet):
 
 ```C#
 struct Point {
@@ -2720,11 +2720,11 @@ print(build(Point, 1).y, ctor(2, 3).x);   # 10 2
 ```
 
 **Fields take the same explicit types as variables** — `bool`, `int`, `float`,
-`str`, `array`, `dict`, another struct type, or `dyn`. v1 restrictions (to be
-lifted later): a field must have an explicit type (no `var`), and `opt` is
-allowed only on a `dyn`/`array`/`dict` field or a field of a class type (see
-*Classes*; a non-opt field is guaranteed never `none`). An uninitialised
-field-less use isn't possible — every field is
+`str`, `array`, `dict`, another struct type, or `dyn`. Two rules keep a
+struct a lean data container: a field must have an explicit type (no `var`),
+and `opt` is allowed only on a `dyn`/`array`/`dict` field or a field of a
+class type (see *Classes*; a non-opt field is guaranteed never `none`). An
+uninitialised field-less use isn't possible — every field is
 supplied at construction (or defaulted to `none` when an omitted optional).
 
 **A struct may have no fields.** `struct Unit {}` is legal, and so is one
