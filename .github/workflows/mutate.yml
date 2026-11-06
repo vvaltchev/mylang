@@ -11,10 +11,17 @@
 # Hours of machine time for a few hundred mutants, so it is never run on
 # push: dispatch it after an arc of complex changes. The sample is split
 # over 8 jobs; the `report` job merges them into the run summary and an
-# artifact.
+# artifact. Start it with
+#   gh workflow run mutate.yml --ref exp-work [-f count=200 ...]
+# The Actions tab offers "Run workflow" only for a file on the DEFAULT
+# branch, and this one lives on exp-work: the `push` trigger below only
+# registers it with GitHub (a push that changes this file), and every
+# job is skipped on that event.
 name: Mutation
 
 on:
+  push:
+    paths: ['.github/workflows/mutate.yml']   # registers it; runs nothing
   workflow_dispatch:
     inputs:
       count:
@@ -32,6 +39,7 @@ on:
 
 jobs:
   mutate:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
@@ -62,7 +70,7 @@ jobs:
 
   report:
     needs: mutate
-    if: always()
+    if: always() && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/download-artifact@v7

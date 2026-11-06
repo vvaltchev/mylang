@@ -28,7 +28,10 @@ the INT_TESTS section); read those first.
   int-deep.yml, mutate.yml), never the local machine for hours, never
   per-push CI. Locally, check a long tool on a tiny input only
   (mutate --count 2, int_enum on one program). Dispatching is the
-  maintainer's call unless he asked.
+  maintainer's call unless he asked. Both live only on exp-work, so the
+  Actions tab has no "Run workflow" button for them: start one with
+  `gh workflow run int-deep.yml --ref exp-work -f tier3=true -f
+  select=true` or `gh workflow run mutate.yml --ref exp-work`.
 - **State the cost before starting anything multi-minute**, and pick the
   smallest run that answers the question.
 - **Every tool that can run > 1 minute serves its progress** so

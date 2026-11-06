@@ -461,7 +461,12 @@ On every push:
 Nets takes about 18 minutes; the others finish in under 10. The fuzzers
 use a new seed on every run, so each push tries new programs.
 
-On demand only (Actions tab, "Run workflow"):
+On demand only. These files live on exp-work, not on the default
+branch, so the Actions tab has no "Run workflow" button for them; start
+them from the command line:
+
+    $ gh workflow run int-deep.yml --ref exp-work -f tier3=true -f select=true
+    $ gh workflow run mutate.yml --ref exp-work -f count=200
 
 | Workflow | Runs                                        | Takes     |
 |----------|---------------------------------------------|-----------|
