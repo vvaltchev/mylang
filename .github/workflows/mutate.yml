@@ -43,7 +43,7 @@ jobs:
       # a CI runner has nobody at the keyboard: use every core
       MYLANG_TEST_JOBS: 4
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
     # the workflow's inputs go to the tool after `--`
@@ -53,7 +53,7 @@ jobs:
            --count ${{inputs.count}} --seed ${{inputs.seed}} --jobs 1
            --files "${{inputs.files}}" --stages "${{inputs.stages}}"
            --heartbeat 600 --out mutate-${{matrix.shard}}.json
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v6
       if: always()
       with:
         name: mutate-${{matrix.shard}}
@@ -65,7 +65,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@v7
       with:
         pattern: mutate-*
         merge-multiple: true
@@ -101,7 +101,7 @@ jobs:
                     print("- `%s`" % r)
         json.dump(muts, open("mutate-all.json", "w"), indent=1)
         EOF
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v6
       with:
         name: mutate-report
         path: mutate-all.json

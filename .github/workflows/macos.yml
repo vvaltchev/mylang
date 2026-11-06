@@ -9,7 +9,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
 
@@ -41,7 +41,7 @@ jobs:
 
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/

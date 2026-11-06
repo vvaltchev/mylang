@@ -16,7 +16,7 @@ jobs:
       CXX: ${{ matrix.cxx }}
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
 
@@ -95,7 +95,7 @@ jobs:
 
     - name: Upload crash artifacts
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: crash-${{ matrix.bt }}-${{ matrix.cxx }}
         path: |
@@ -105,7 +105,7 @@ jobs:
 
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -118,7 +118,7 @@ jobs:
   recycle:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
 
@@ -165,7 +165,7 @@ jobs:
 
     - name: Upload crash artifacts
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: crash-recycle
         path: |
@@ -175,7 +175,7 @@ jobs:
 
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -199,7 +199,7 @@ jobs:
   debug-notests:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
 
@@ -215,7 +215,7 @@ jobs:
            corpus_diff@dbg-nt driver_checks@dbg-nt
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}
         path: test-logs/
@@ -232,7 +232,7 @@ jobs:
           - asserts: OFF
             lane: ship
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
 
@@ -261,7 +261,7 @@ jobs:
            system_smoke@${{ matrix.lane }}
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -291,7 +291,7 @@ jobs:
       matrix:
         cxx: [g++, clang++]
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
 
@@ -337,7 +337,7 @@ jobs:
 
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
@@ -356,7 +356,7 @@ jobs:
       matrix:
         cxx: [g++, clang++]
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
 
@@ -408,7 +408,7 @@ jobs:
 
     - name: Upload the test logs
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-logs-${{github.job}}-${{strategy.job-index}}
         path: test-logs/
