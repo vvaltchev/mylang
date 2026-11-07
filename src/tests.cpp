@@ -37216,6 +37216,103 @@ static bool myv_struct_elem_base()
 }
 
 /*
+ * myv_fuzz fat-291 (CI seed 42354591781, 2026-11-07): one mutated byte
+ * turned a counted loop's ENTRY TEST in main into a ReturnV, so the
+ * loop's hoist PREHEADER - emitted between that op and the loop head -
+ * followed a terminator. The emitter's stack model was dead there, a
+ * jump in the preheader recorded the dead model's stale depth, a label
+ * adopted it, and REGTRACK aborted the load (`native stack NOT at the
+ * body depth`) - the assert-free build ran the image fine, since the
+ * preheader is unreachable and the next op resets the model.
+ *
+ * The same retarget here, in memory after the load (the JIT off for the
+ * load, so the retargeted op is what the tier compiles). The untampered
+ * image must ENTER the hoist region (g_jit_hoist), or the tampered one
+ * proves nothing; the tampered one must run to its early return.
+ */
+static bool myv_terminator_before_region()
+{
+    const char *src =
+        "var nested = [[1, 2], [3, 4]];\n"
+        "var s = 0;\n"
+        "for (var i = 0; i < 2; i++) { s += nested[i][1]; }\n"
+        "assert(s == 6);";
+    std::string tdir = "/tmp";
+    for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+        const std::optional<std::string> e = env_get(var);
+        if (e && !e->empty()) { tdir = *e; break; }
+    }
+    while (tdir.size() > 1 && (tdir.back() == '/' || tdir.back() == '\\'))
+        tdir.pop_back();
+    const std::string path = tdir + "/mylang-myv-termregion.myv";
+
+    const ExecEngine saved = g_exec_engine;
+    const bool saved_jit = g_jit_enabled;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    for (const bool tamper : { false, true }) {
+        g_jit_enabled = false;
+        try {
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            ParseContext pc(TokenStream(toks), true);
+            unique_ptr<Construct> root = pBlock(pc);
+            mark_implicit_globals(root.get(), {});
+            infer_types(root.get(), true);
+            run_optimizers(root.get());
+            VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+            myv_write(prog, path, MyvSourceRef());
+            MyvSource ms;
+            VmProgram loaded = myv_read(path, ms);
+
+            /* the entry test: the JumpUnlessIntCmp right before the
+             * loop body's nested read */
+            std::vector<Instr> &code = loaded.root.code;
+            int found = 0;
+            for (size_t k = 1; k < code.size(); k++)
+                if (code[k].op == OpCode::LoadElem2Int
+                        && code[k - 1].op == OpCode::JumpUnlessIntCmp) {
+                    if (tamper)
+                        code[k - 1].op = OpCode::ReturnV;  /* return i */
+                    found++;
+                }
+            if (found != 1) {
+                fprintf(stderr, "myv-termregion: expected one entry test "
+                                "before the loop (%d) - the shape "
+                                "changed\n", found);
+                ok = false;
+                remove(path.c_str());
+                continue;
+            }
+            g_jit_enabled = saved_jit;
+#if ML_JIT_SUPPORTED
+            const unsigned long before = g_jit_hoist;
+#endif
+            if (g_jit_enabled)
+                vm_jit_loaded_image(loaded);
+            vm_run(loaded);
+#if ML_JIT_SUPPORTED
+            if (g_jit_enabled && !tamper && g_jit_hoist == before) {
+                fprintf(stderr, "myv-termregion: the loop never entered "
+                                "its hoist region - the preheader this "
+                                "checks is not emitted (vacuous)\n");
+                ok = false;
+            }
+#endif
+        } catch (Exception &e) {
+            fprintf(stderr, "myv-termregion [%s]: threw %s: %s\n",
+                    tamper ? "tampered" : "plain", e.name,
+                    e.msg ? e.msg : "");
+            ok = false;
+        }
+        remove(path.c_str());
+    }
+    g_exec_engine = saved;
+    g_jit_enabled = saved_jit;
+    return ok;
+}
+
+/*
  * myv_fuzz fat-845 / fat-260 (2026-09-22): TWO ML_VM_CHECK tripwires on
  * codegen-PROVEN arms - a `th==f` operand holds a float (read_float_slot),
  * a foreach-unpack's base is an array (vm_unpack_elem_body) - aborted the
@@ -59201,6 +59298,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: a codegen-PROVEN arm on an image takes its defined fallback in "
       "every build (fat-845 float operand, fat-260 unpack base)",
       myv_untrusted_proven_arms },
+    { "myv: a loop preheader after a terminator keeps the stack model at "
+      "the body depth (fat-291)",
+      myv_terminator_before_region },
     { "myv: a Rethrow retargeted at an EMPTY region raises InternalErrorEx "
       "in both engines (fat-1150)",
       myv_rethrow_empty_region },
