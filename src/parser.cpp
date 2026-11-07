@@ -3078,18 +3078,28 @@ pStmt(ParseContext &c, unsigned fl)
     const Loc start = c.get_loc();
     fl |= pFlags::pInStmt;
 
+    /* Each of these takes its `;`, as `return` and `throw` do. Left for
+     * the enclosing block to skip, the `;` ended a brace-less `if`
+     * branch before its `else`: `if (c) break; else ...` was a syntax
+     * error ("unexpected token 'else'"). */
     if (fl & pFlags::pInLoop) {
 
-        if (pAcceptKeyword(c, Keyword::kw_break))
+        if (pAcceptKeyword(c, Keyword::kw_break)) {
+            pExpectOp(c, Op::semicolon);
             return make_unique<BreakStmt>();
-        else if (pAcceptKeyword(c, Keyword::kw_continue))
+        } else if (pAcceptKeyword(c, Keyword::kw_continue)) {
+            pExpectOp(c, Op::semicolon);
             return make_unique<ContinueStmt>();
+        }
     }
 
     if (fl & pFlags::pInCatchBody) {
 
-        if (pAcceptKeyword(c, Keyword::kw_rethrow))
-            return make_unique<RethrowStmt>(start, c.get_loc());
+        if (pAcceptKeyword(c, Keyword::kw_rethrow)) {
+            const Loc end = c.get_loc();
+            pExpectOp(c, Op::semicolon);
+            return make_unique<RethrowStmt>(start, end);
+        }
     }
 
     /*
@@ -3513,7 +3523,8 @@ pAcceptWhileStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
         const EvalValue &v = whileStmt->condExpr->eval(c.const_ctx);
 
-        if (!v.get_type()->is_true(v)) {
+        whileStmt->cond_true = v.get_type()->is_true(v);
+        if (!whileStmt->cond_true) {
             /* -a: while (false) is dead - dim the loop (the body's end, not
              * whileStmt->end, which points at the next token). */
             if (c.analysis)
@@ -5503,8 +5514,17 @@ pAcceptForStmt(ParseContext &c,
     stmt->inc = pExprTop(c, fl);
     pExpectOp(c, Op::parenR);
 
+    /* a brace-less body is a loop body too (README: `for (...) if (c)
+     * break;` - it was refused, 'break' outside a loop) */
     if (!pAcceptBracedBlock(c, stmt->body, fl | pFlags::pInLoop))
-        stmt->body = pBraceLessBody(c, fl);
+        stmt->body = pBraceLessBody(c, fl | pFlags::pInLoop);
+
+    if (!stmt->cond) {
+        stmt->cond_true = true;
+    } else if (stmt->cond->is_const) {
+        const EvalValue &v = stmt->cond->eval(c.const_ctx);
+        stmt->cond_true = v.get_type()->is_true(v);
+    }
 
     stmt->end = c.get_loc();
     ret = std::move(stmt);

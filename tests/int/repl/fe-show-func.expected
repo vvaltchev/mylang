@@ -88,7 +88,7 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
     return t;
 }
 >> .. .. .. .. .. .. .. .. >> => 3
->> /* pure */ int? func spin(int n) {
+>> /* pure */ int func spin(int n) {
     int i = 0;
     for (; ; ) {
         i++;
