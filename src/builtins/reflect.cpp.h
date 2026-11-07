@@ -507,21 +507,33 @@ EvalValue builtin_specializations(EvalContext *ctx, const ArgLocs *exprList,
             ? f->display_name
             : (f->name ? std::string(f->name->val) : std::string());
 
+    EvalContext *root = get_root_ctx(ctx);
     std::vector<std::pair<const UniqueId *, const LValue *>> syms;
-    get_root_ctx(ctx)->collect_symbols(syms);
+    root->collect_symbols(syms);
 
     std::vector<std::string> out;
-    for (const auto &kv : syms) {
-        const EvalValue &v = kv.second->get();
+    auto consider = [&](const EvalValue &v) {
         if (!v.is<intrusive_ptr<FuncObject>>())
-            continue;
+            return;
         const FuncDescriptor *g = v.get<intrusive_ptr<FuncObject>>()->func;
         if (g == f || g->display_name != name)
-            continue;
+            return;
         /* a clone has a synthetic id (name$sN / name$N) + the original name in
          * display_name; the original itself has an empty display_name so it is
          * skipped by the display_name test above. */
         out.push_back(std::string(g->name->val));
+    };
+    for (const auto &kv : syms)
+        consider(kv.second->get());
+    /* A SCRIPT's clones are GLOBAL-table slots, not map entries - as its
+     * functions are for globals() above. Only the map was walked until
+     * 2026-11-07, so in a script this answered [] for every function. (In
+     * the REPL functions stay in the map and the table is empty.) */
+    if (root->gfuncs) {
+        const GlobalFuncTable &gt = *root->gfuncs;
+        for (size_t i = 0; i < gt.slots.size(); i++)
+            if (gt.defined[i])
+                consider(gt.slots[i].get());
     }
     std::sort(out.begin(), out.end());
 

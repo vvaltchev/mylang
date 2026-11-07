@@ -18937,6 +18937,14 @@ static const std::vector<test> tests =
         "assert(find(s, \"    var dyn a, b = [d, k];\\n\") != none);" } },
     { "reflect: specializations of a plain function is empty",
       { "func f(int a) => a + 1; assert(len(specializations(f)) == 0);" } },
+    /* a script's clones are global-table slots: only the REPL's map was
+     * walked, so a script answered [] for every function */
+    { "reflect: specializations lists a script's template instances",
+      { "func tf(x) { var t = x;"
+        " for (var i = 0; i < 3; i++) t = t + x; return t; }",
+        "assert(tf(int(runtime(1))) == 4);",
+        "assert(tf(float(runtime(2.5))) == 10.0);",
+        "assert(specializations(tf) == [\"tf$0\", \"tf$1\"]);" } },
     /* the label of an inlined block body read the chain of the CALL SITE
      * (the caller's, here none), not the callee's frame. The argument is
      * a call, so it is bound to a temp and the body stays a block (an

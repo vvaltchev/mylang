@@ -4014,9 +4014,9 @@ version. `:show <expression>` works too.
 Return an `array<str>` of the synthetic global names (`name$N` template
 instances, `name$sN` specializations) of every clone derived from
 function `f` (empty when none). These clones are real globals — the compiler
-inserts each at the root and binds its synthetic name — so this is a plain scope
-walk. *What* each clone specializes on is shown by the REPL `:trace` /
-`:globals` views.
+inserts each at the root and binds its synthetic name — so they are listed in a
+script and in the REPL alike. *What* each clone specializes on is shown by the
+REPL `:trace` / `:globals` views.
 
 ### Non-const tracing builtins
 Toggle the **diagnostic tracer** — a per-category narration of the compiler's
