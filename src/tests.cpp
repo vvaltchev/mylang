@@ -58442,6 +58442,78 @@ static bool disasm_highlight_shape()
     return colored && stripped == plain;
 }
 
+/* highlight_disasm's promise - stripping every ESC..m sequence gives the
+ * plain dump back - over a REAL -vdj dump rather than three hand-made
+ * lines: a struct's type block, the pools, a string and a float constant,
+ * a closure, a try region and, where the JIT runs, the native sections
+ * (mnemonics, GP and xmm registers, memory operands, the masked
+ * addresses). Every line must survive, and the colors must be there. */
+static bool disasm_highlight_round_trip()
+{
+    const bool ann_was = g_jit_annotate;
+    g_jit_annotate = true;
+    struct AnnRestore {
+        bool v; ~AnnRestore() { g_jit_annotate = v; }
+    } ann_restore{ ann_was };
+    std::string src;
+    for (const char *l : {
+             "struct P { int x; float y; const K = 3; }",
+             "var ps = [P(1, 1.5), P(2, 2.5)];",
+             "var f = 0.0;",
+             "foreach (p in ps) f += p.y * float(p.x);",
+             "func mk(n) { return func [n] (k) { return n + k; }; }",
+             "var add = mk(int(runtime(4)));",
+             "var d = {\"a\": 1};",
+             "try { d[\"b\"]; } catch (KeyNotFoundEx) { print(\"miss\"); }",
+             "print(f, add(2), str(P.K) + \"!\");" }) {
+        src += l;
+        src += '\n';
+    }
+    std::string plain;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        const Block *b = dynamic_cast<const Block *>(root.get());
+        if (!b)
+            return false;
+        plain = disassemble_program(b);
+    } catch (Exception &e) {
+        fprintf(stderr, "disasm_highlight_round_trip: threw %s\n", e.name);
+        return false;
+    }
+    const std::string c = highlight_disasm(plain);
+    std::string stripped;
+    for (size_t i = 0; i < c.size(); ) {
+        if (c[i] == '\033') {
+            while (i < c.size() && c[i] != 'm')
+                i++;
+            if (i < c.size())
+                i++;
+        } else {
+            stripped += c[i++];
+        }
+    }
+    size_t escapes = 0;
+    for (char ch : c)
+        escapes += ch == '\033';
+    const bool native = plain.find("---- native x86-64") != std::string::npos;
+    bool ok = stripped == plain && escapes > 100
+              && plain.find("===== types") != std::string::npos
+              && plain.find("closure") != std::string::npos;
+    if (ok && native != (ML_JIT_SUPPORTED != 0) && g_jit_enabled)
+        ok = false;
+    if (!ok)
+        fprintf(stderr, "disasm_highlight_round_trip: %zu bytes plain, "
+                        "%zu stripped, %zu escapes, native %d\n",
+                plain.size(), stripped.size(), escapes, native);
+    return ok;
+}
+
 /* The disassembler (a) finds a CLOSURE body in EXPRESSION position (a returned
  * lambda - the complete collect_funcs walk), labels it + shows its captures as
  * an anonymous struct with named capture ops, and (b) drops the dead trailing
@@ -59621,6 +59693,8 @@ static const std::vector<extra_check> extra_checks =
     { "vm: vm_exec_block island executor (model-flip M2)",
       vm_exec_block_selftest },
     { "vm: disasm syntax highlight (256-color)", disasm_highlight_shape },
+    { "vm: disasm syntax highlight leaves a real -vdj dump intact",
+      disasm_highlight_round_trip },
     { "vm: disasm closures + halt-drop", vm_disasm_closure_shape },
     { "frame: >64 locals (no per-frame slot limit)", frame_over_64_slots },
     { "analyze: counted `for` is greened, float-var `for` is not",
