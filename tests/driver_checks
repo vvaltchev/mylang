@@ -1320,6 +1320,13 @@ flag "no arguments off a terminal: the usage" 0 '^Syntax:'
 flag "-h: the usage" 0 '^Syntax:' -h
 flag "--help: the usage" 0 '^Syntax:' --help
 flag "-e with no expression: the usage, exit 1" 1 '^Syntax:' -e
+flag "-e joins every argument after it into one program" 0 '^5' \
+     -e 'var a = 2;' 'print(a + 3);'
+flag "--version: the build configuration" 0 '^mylang build configuration' \
+     --version
+printf 'print(1);\n}\n' > "$TMP/stray.my"
+flag "a stray } after the program: a syntax error, exit 1" 1 \
+     "Unexpected token at the end '}'" "$TMP/stray.my"
 flag "-t: the token dump" 0 "Tok\(id_\): 'print'" -t "$TMP/f3.my"
 flag "-bi: the bytecode inliner on" 0 '^3' -bi "$TMP/f3.my"
 flag "--no-opt needs a pass list" 1 'requires a pass list' --no-opt
@@ -1410,6 +1417,10 @@ flag "--weights N: the count it ran" 0 'best of 5, 2000 iters' \
      --weights 2000
 flag "--weights 1: a count too short for the clock still prints" 0 \
      'CALL=[0-9]+' --weights 1
+flag "--weights refuses a count that is not a number" 1 \
+     'positive iteration count' --weights 2k
+flag "--weights refuses a zero count" 1 'positive iteration count' \
+     --weights 0
 
 # --max-instances N bounds one template's typed instances: a call with a
 # new signature past N runs the template itself, a one-time warning names
