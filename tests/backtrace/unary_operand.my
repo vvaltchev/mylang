@@ -1,0 +1,17 @@
+# A unary operator's error marks its OPERAND, as a binary operator's
+# marks the operand whose type lacks the operator, in every engine. The
+# VM marked the whole `~d` (and `-d`) until 2026-11-07, while the
+# tree-walker marked `d` (RULE 2).
+
+func flip(dyn d) {
+    var dyn r = ~d;
+    return r;
+}
+
+func neg(dyn d) {
+    var dyn r = -d;
+    return r;
+}
+
+print(neg(runtime(3)), flip(runtime(5)));
+print(flip(runtime(2.5)));

@@ -224,8 +224,11 @@ placeholders. Init
 pins the container, records the loop shape (`in.a.lit` packs
 `nvars | indexed << 8`; the per-var frame slots — `-1` == `_` — are an
 `unpack_targets` pool entry, `in.b`), and chooses ONCE — an
-array (`{idx, size}`) or a dict (`{it}`), else throws `TypeErrorEx` (loc side
-table); Next binds BOX-FREE from the state and advances, exactly as
+array (`{idx, size}`), a STRING (`is_str`: its characters, each a
+one-character string, walked by the generic body - until 2026-11-07 a
+string threw here, so a `dyn` string and a typed one looped with `_` ran
+only in the tree-walker) or a dict (`{it}`), else throws `TypeErrorEx`
+(loc side table); Next binds BOX-FREE from the state and advances, exactly as
 `do_iter`: `indexed` binds `targets[0]` = the iteration counter; an ARRAY
 element binds a single remaining var (`vm_arr_elem` → `arr_elem_at`) or is
 STRICT-unpacked into N remaining vars (the same non-array / wrong-length
