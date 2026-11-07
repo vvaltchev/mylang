@@ -1,0 +1,47 @@
+# INT-ENGINES: tw default nj ni noopt
+#
+# INT unit (#107): which arguments the AST inliner may paste into a body
+# (THE ARGUMENT RULE: only an INERT one - it cannot throw, has no side
+# effect, reads nothing the body can change) and which it binds to a
+# temp first, evaluated once, before the body, as the call would
+# (Inliner::arg_is_inert). Each argument here is NOT inert for its own
+# reason: a shift (a negative count throws), a division by the literal 0
+# or -1, a float division by 0.0, an operand of no proven type, and a
+# function name the program reassigns. The order of the events, and the
+# exception a division by zero raises, are what a wrong paste would
+# change; the `ni` engine (no inlining) is the oracle.
+
+var events = [];
+func ev(str what, dyn v) { append(events, what + "=" + str(v)); }
+func tick(int v) { append(events, "tick"); return v; }
+
+func inc(x) => tick(1) + x;
+func twice(x) => tick(2) * x;
+
+var a = int(runtime(5));
+var dyn d = runtime(4);                   # no proven type
+ev("shift", inc(a << 1));
+ev("neg", inc(-d));
+try {
+    ev("div0", inc(a / int(runtime(0))));
+} catch (DivisionByZeroEx) {
+    ev("div0", "raised");
+}
+try {
+    ev("lit0", inc(a / 0));
+} catch (DivisionByZeroEx) {
+    ev("lit0", "raised");
+}
+ev("mod-1", inc(a % -1));
+try {
+    ev("fdiv0", twice(float(a) / 0.0));
+} catch (DivisionByZeroEx) {
+    ev("fdiv0", "raised");
+}
+
+func h() { return 10; }
+func call_it(f) => tick(3) + f();
+h = func() => 20;
+ev("rebound", call_it(h));
+
+print(join(events, " "));
