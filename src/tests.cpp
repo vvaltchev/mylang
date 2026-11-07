@@ -36274,6 +36274,7 @@ static bool myv_value_kinds_round_trip()
         "const KPS = [P(1, 1.0, true), P(2, 2.0, false)];",
         "const KMIX = [1, \"x\", 2.5, true, none, [1.5], {\"k\": false}];",
         "const KQS = [Q(1, [1]), Q(2, [2])];",
+        "const KBI = [len, abs];",            /* builtin values, v39 */
         "print(str(runtime(KB)), str(runtime(KF)), str(runtime(KS)),",
         "      array_storage(runtime(KS)));",
         /* a dict's order is unspecified (a loaded one is rebuilt) */
@@ -36285,6 +36286,8 @@ static bool myv_value_kinds_round_trip()
         "      cc[1].next == cc[0], array_storage(cc));",
         "print(str(runtime(KPS)), array_storage(runtime(KPS)));",
         "print(str(runtime(KMIX)), str(runtime(KQS)));",
+        "var dyn bi = runtime(KBI);",
+        "print(str(bi), bi[1](-4), bi[0](\"abc\"));",
         /* the loader's verifier: an in-place builtin's and an indirect
          * call's chain argument, and the box ops */
         "struct In { array<int> xs; }",
@@ -36313,6 +36316,7 @@ static bool myv_value_kinds_round_trip()
         "struct \n"
         "[1, \"x\", 2.500000, true, <none>, [1.500000], {\"k\": false}] "
         "[Q(a: 1, xs: [1]), Q(a: 2, xs: [2])] \n"
+        "[<Builtin(len)>, <Builtin(abs)>] 4 3 \n"
         "3 2 5 \n";
 
     std::string tdir = "/tmp";
