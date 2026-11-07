@@ -67,7 +67,7 @@ class TypeTemplate : public TypeBaseDefs, public TypeErasureOps {
 public:
 
     const TypeE t;
-    TypeTemplate(TypeE t) : t(t) { assert(t != t_count); }
+    TypeTemplate(TypeE t) : t(t) { ML_CHECK(t != t_count); }
 
     virtual void add(EvalValueT &a, const EvalValueT &b) {
         throw TypeErrorEx("The object does NOT support operator +");
@@ -226,7 +226,7 @@ public:
 
     virtual EvalValueT intptr(const EvalValueT &a)
     {
-        assert(!a.template is<LValue *>() && !a.template is<UndefinedId>());
+        ML_CHECK(!a.template is<LValue *>() && !a.template is<UndefinedId>());
         return reinterpret_cast<int_type>(&a);
     }
 

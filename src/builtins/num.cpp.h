@@ -360,7 +360,7 @@ float_func(EvalContext *ctx, const ArgLocs *exprList,
         return f(x[0], x[1]);
     else
         /* We should never get here */
-        assert(0);
+        ML_CHECK(false);
 }
 
 /* The std::<name> overload for float_type (double), selected by an explicit

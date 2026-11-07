@@ -216,7 +216,7 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
 ## int_run units (tests/int)
 
 - `# INT-ENGINES:` names from ENGINE_FLAGS (default tw nj vm nbi noopt
-  nc), `+` joins (`nbi+nj`); engines of one config must print the same
+  nc ni), `+` joins (`nbi+nj`); engines of one config must print the same
   stdout, so include `tw` when the point is a value check, and `nc` when
   it is what folding must not change (78_fold_after_inference.my).
 - `# INT-CONFIGS:` `;`-separated env sets.
@@ -247,6 +247,13 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
 - `--gcov --only REGEX --report F` writes what each unit run covered:
   compared with a whole run's uncovered list it says what a new unit
   adds, in minutes instead of the whole run's ~50.
+- A coverage build (GCOV=1) compiles ML_CHECK / ML_VM_CHECK out
+  (ML_COVERAGE, defs.h; `mylang -v`: `coverage 1`, `asserts 0`) - an
+  assertion's failure arm is an edge no correct run takes, and an inlined
+  check charged one to every call site (8,385 elements). So int_run-gcov
+  runs no assertion: the int-rel int_run is the one that does.
+- tests/driver_checks is a unit too (a script; its exit code is the
+  oracle): a CLI flag's code is covered by the check that tests it.
 - With --gcov every unit must OWN an element no other unit covers, and
   uncovered must stay <= tests/int/coverage-floor.txt for the compiler.
   Lower the floor when a change covers more (the note says by how much);
@@ -259,7 +266,7 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   Without it a depth-15 program ran 1.7 million innermost iterations and
   the debug tree-walker timed out on it (26 s alone, CPython 0.5 s) -
   with fresh seeds in CI that would be a red run with no bug behind it.
-- 16-21_nested_*.my are GENERATED (nested_fuzz -> int_select --shrink ->
+- 16-19_nested_*.my are GENERATED (nested_fuzz -> int_select --shrink ->
   observe_globals -> wrapped to 80 columns, output checked identical).
   Do not tidy them by hand; regenerate.
 

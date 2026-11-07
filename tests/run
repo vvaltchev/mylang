@@ -124,11 +124,12 @@ LANES = {l.name: l for l in [
          "intrusive tests, optimized",
          expect={"int_tests": "1", "asserts": "1"}),
     Lane("int-gcov", "OPT=0 TESTS=1 INT_TESTS=1 GCOV=1",
-         "intrusive tests with coverage", expect={"int_tests": "1"}),
+         "intrusive tests with coverage",
+         expect={"int_tests": "1", "coverage": "1"}),
     Lane("cmake-gcov",
          "-DTESTS=1 -DGCOV=1 -DVM_HARDENING=ON -DCMAKE_BUILD_TYPE=Debug",
          "CMake coverage build (norec_coverage reads its layout)",
-         kind="cmake", expect={"tests": "1"}),
+         kind="cmake", expect={"tests": "1", "coverage": "1"}),
 ]}
 
 # --------------------------------------------------------------- tests --

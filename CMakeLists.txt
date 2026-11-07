@@ -166,6 +166,9 @@ endif()
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
    if (GCOV)
       target_compile_options(mylang PUBLIC -fprofile-arcs -ftest-coverage)
+      # the assertion macros check nothing (defs.h): their failure arms
+      # are branches no correct run may take (the Makefile's twin)
+      target_compile_definitions(mylang PUBLIC "ML_COVERAGE=1")
       target_link_options(mylang PUBLIC  -fprofile-arcs -ftest-coverage)
       # MC/DC condition coverage where the compiler has it (GCC >= 14) - the
       # intrusive suite's bar (plans/intrusive-tests.md section 9). Parity

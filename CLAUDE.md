@@ -650,18 +650,30 @@ cover more, NEVER raised to let a change land. Mark a genuinely
 unreachable line `INT-COV-EXEMPT: reason`. **A coverage build defaults
 UBSan OFF** (both build systems): its check on every variable shift and
 bounded access is a branch gcov counts and no input can take - 5,198
-such edges were in the universe until 2026-10-02. The universe is the PRODUCT:
-`tests.cpp`, the INT core and every INT helper (NAME IT `int_*` /
-`jit_int_*` / `bc_int_*`, or its branches count) are outside it, and so
+such edges were in the universe until 2026-10-02. **And it compiles the
+assertions out** (`ML_COVERAGE=1`, both build systems, 2026-11-07):
+`ML_CHECK` / `ML_CHECK_MSG` / `ML_VM_CHECK` name their condition in an
+unevaluated `sizeof` - no code, no branch - while NDEBUG stays off, so
+REGTRACK, the teardown proof and the verifier still run and are still
+measured. A failure arm no correct run may take is the same kind of edge,
+and an always-inline helper's check (`Frame::at`'s bounds) charged one to
+every call site: 8,385 elements left the universe (123,177 -> 114,792).
+`mylang -v` says `coverage 1` and `asserts 0`. `ML_UNTRUSTED_CHECK` stays
+in (a hostile image takes its failure arm), and so does a raw `assert` -
+product code uses ML_CHECK. **`tests/driver_checks` is a unit too**
+(2026-11-07): the CLI driver's code is measured by the test that checks
+it. The universe is the PRODUCT: `tests.cpp`, the INT core and every INT
+helper (NAME IT `int_*` / `jit_int_*` / `bc_int_*`, or its branches
+count) are outside it, and so
 are the lines of an `ML_INT(...)` / `ML_INT_ONLY(...)` call inside a
 product function (keep an INT-only condition INSIDE the macro). A test
 program's header picks its runs: `# INT-ENGINES: default` for a codegen or
 JIT decision (the tree-walker never runs those passes),
 `# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra` for several environments.
 An engine is a name from `ENGINE_FLAGS` (int_run: `default`, `tw`,
-`nj`, `vm`, `nbi`, `noopt` = `--no-opt all`, `nc` = `-nc`), two joined
-with `+` (`nbi+nj`); the engines of one configuration must print the
-same stdout.
+`nj`, `vm`, `nbi`, `noopt` = `--no-opt all`, `nc` = `-nc`, `ni` = `-ni`),
+two joined with `+` (`nbi+nj`); the engines of one configuration must
+print the same stdout.
 A unit whose header says `# INT-SOURCE: ../functional/NAME.my` RUNS that
 program under its own headers: a functional test counted as a coverage
 unit without a second copy (the census pass runs tests/functional too, but

@@ -1,0 +1,164 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): element READS in the shapes the fused and specialized
+# read ops meet only off the beaten path - a general-storage array of
+# ints or bools (an inline keys() is not hinted flat), a negative index,
+# a descending counted loop over an element read, a string read out of
+# range, an element removed under a foreach. Every engine (the
+# interpreted ops under -nj, the JIT's tiers by default) must print what
+# the tree-walker prints, with and without the AST transforms.
+
+var out = [];
+func note(str what, dyn v) { append(out, what + "=" + str(v)); }
+
+func dict_ints(int n) {
+    var d = {};
+    for (var i = 0; i < n; i++)
+        d[i * 3] = i;
+    return d;
+}
+
+func dict_bools() {
+    var d = {};
+    d[true] = 1;
+    d[false] = 2;
+    return d;
+}
+
+# counted loops over an element read: ascending, descending, by a step,
+# from a negative start - each over flat ints, flat bools and general ints
+func walk_ints(array<int> a, int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var e = a[i];
+        s += e;
+    }
+    for (var i = n - 1; i >= 0; i--) {
+        var e = a[i];
+        s = s * 3 + e;
+    }
+    for (var i = n - 1; i > 0; i -= 2) {
+        var e = a[i];
+        s += e;
+    }
+    for (var i = 0 - 1; i >= 0 - n; i--) {
+        var e = a[i];
+        s = s * 2 - e;
+    }
+    for (var i = 0; i <= n - 1; i++) {
+        if (a[i])
+            s += 1;
+        if (a[0 - 1 - i])
+            s += 10;
+    }
+    return s;
+}
+
+func walk_bools(array<bool> b, int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        var e = b[i];
+        if (e)
+            s += 1 << i;
+    }
+    for (var i = n - 1; i >= 0; i--)
+        if (b[i])
+            s = s * 3;
+    foreach (x in b)
+        s = s * 2 + (x ? 1 : 0);
+    foreach (x in b)
+        note("bool", x);
+    return s;
+}
+
+var flat = [3, 0, 7, 5, 0];
+note("flat", walk_ints(flat, int(runtime(5))));
+var ki = keys(dict_ints(int(runtime(5))));          # a general array<int>
+note("gen", walk_ints(sort(ki), int(runtime(5))));
+note("genk", walk_ints(keys(dict_ints(int(runtime(4)))), int(runtime(4))));
+
+var fb = [true, false, true, true];
+note("fbool", walk_bools(fb, int(runtime(4))));
+note("gbool", walk_bools(keys(dict_bools()), int(runtime(2))));
+
+# foreach element loads when the body removes the next element
+func shrink_ints(array<int> a) {
+    var s = 0;
+    try {
+        foreach (x in a) {
+            s += x;
+            pop(a);
+        }
+    } catch (OutOfBoundsEx) {
+        s += 1000;
+    }
+    return s;
+}
+note("shrink-i", shrink_ints([1, 2, 3, 4]));
+note("shrink-g", shrink_ints(keys(dict_ints(int(runtime(4))))));
+
+func shrink_bools(array<bool> a) {
+    var s = 0;
+    try {
+        foreach (x in a) {
+            s = s * 2 + (x ? 1 : 0);
+            pop(a);
+        }
+    } catch (OutOfBoundsEx) {
+        s += 1000;
+    }
+    return s;
+}
+note("shrink-b", shrink_bools([true, true, false, true]));
+note("shrink-gb", shrink_bools(keys(dict_bools())));
+
+func shrink_floats(array<float> a) {
+    var s = 0.0;
+    try {
+        foreach (x in a) {
+            s += x;
+            pop(a);
+        }
+    } catch (OutOfBoundsEx) {
+        s += 1000;
+    }
+    return s;
+}
+note("shrink-f", shrink_floats([1.5, 2.5, 3.5]));
+
+# string characters: in range, negative, out of range
+func chars(str s, int n) {
+    var r = "";
+    for (var i = 0; i < n; i++)
+        r += s[i];
+    for (var i = 0 - 1; i >= 0 - n; i--)
+        r += s[i];
+    try {
+        r += s[n];
+    } catch (OutOfBoundsEx) {
+        r += "!";
+    }
+    try {
+        r += s[0 - n - 1];
+    } catch (OutOfBoundsEx) {
+        r += "?";
+    }
+    return r;
+}
+note("chars", chars("abcde", int(runtime(5))));
+
+# a read at an index computed out of range, in each storage
+func oob(dyn a, int i) {
+    var r = "oob";
+    try {
+        r = str(a[i]);
+    } catch (OutOfBoundsEx) {
+    }
+    return r;
+}
+foreach (a in [flat, ki, fb, [1.5, 2.5], ["x", "y"], keys(dict_bools())])
+    note("oob", oob(a, int(runtime(7))) + "/" + oob(a, int(runtime(-9)))
+                + "/" + oob(a, int(runtime(-1))));
+
+foreach (o in out)
+    print(o);

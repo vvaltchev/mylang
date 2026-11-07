@@ -1,0 +1,54 @@
+# INT-ENGINES: tw default nj noopt nc ni
+#
+# INT unit (#107): a statement that constant folding removes ENTIRELY - a
+# write-once var promoted to a constant, dead code - as the only statement
+# of a for init or body, a while body, a foreach body, a try, catch or
+# finally body, an if arm. The slot it leaves empty must mean "nothing",
+# to every later stage of every engine (a NULL statement once broke the
+# next one); the event log is the same everywhere.
+
+var evlog = [];
+func ev(str s) { append(evlog, s); return true; }
+func run(int n) {
+    var i = 0;
+    for (var k = 3; i < n; i++)            # the init folds away
+        ev("for" + str(i));
+    var j = 0;
+    for (; j < n; j++)                      # the body folds away
+        var t = 4;
+    var m = 0;
+    while (ev("w" + str(m)) && m < 2) {     # a body that folds away ...
+        m++;
+        if (false) ev("dead");
+    }
+    while (ev("w2") && m++ < 3)             # ... a bare one
+        var u = 1;
+    foreach (x in [1, 2])
+        var y = 2;
+    try {
+        var a = 1;
+    } catch (DivisionByZeroEx) {
+        var b = 2;
+    } finally {
+        var c = 3;
+    }
+    try {
+        ev("t1");
+        var zz = 1 / int(runtime(0));
+    } catch (DivisionByZeroEx) {
+        var b2 = 2;
+    } finally {
+        var c2 = 3;
+    }
+    if (n > 0)
+        var q = 1;
+    else
+        var r = 2;
+    if (n > 0) {
+        var q2 = 1;
+    }
+    return i + j;
+}
+print(run(int(runtime(2))));
+foreach (e in evlog) print(e);
+assert(join(evlog, " ") == "for0 for1 w0 w1 w2 w2 w2 t1");

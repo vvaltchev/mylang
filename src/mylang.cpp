@@ -108,8 +108,8 @@ static void show_build_config()
     const char *opt = "0";
 #endif
 
-#ifdef NDEBUG
-    const char *asserts = "0";
+#if defined(NDEBUG) || ML_COVERAGE
+    const char *asserts = "0";      /* a coverage build drops ML_CHECK */
 #else
     const char *asserts = "1";
 #endif
@@ -194,6 +194,13 @@ static void show_build_config()
 #endif
          << "        (intrusive test instrumentation - never benchmark)"
          << endl;
+    cout << "  coverage          "
+#if ML_COVERAGE
+         << "1"
+#else
+         << "0"
+#endif
+         << "        (gcov counters; ML_CHECK compiled out)" << endl;
     cout << "  recycle           "
 #ifdef RECYCLE_ALLOC
          << "1"

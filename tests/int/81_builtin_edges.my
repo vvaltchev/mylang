@@ -1,0 +1,139 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): builtins at the edges of their arguments - a `dyn`
+# argument of the wrong type, an empty string, a general array where a
+# flat one is usual, a callback whose results change type part way (the
+# flat result spills to a general array), a hinted flat result of bools.
+# Every engine must print what the tree-walker prints: each case prints
+# its value or the name of the exception it raised.
+
+var out = [];
+func note(str what, opt dyn v) { append(out, what + "=" + str(v)); }
+
+func run(str what, dyn f) {
+    var r = "?";
+    try {
+        r = str(f());
+    } catch (TypeErrorEx) {
+        r = "TypeErrorEx";
+    } catch (InvalidArgumentEx) {
+        r = "InvalidArgumentEx";
+    } catch (InvalidValueEx) {
+        r = "InvalidValueEx";
+    } catch (OutOfBoundsEx) {
+        r = "OutOfBoundsEx";
+    }
+    append(out, what + "=" + r);
+}
+
+var dyn F = runtime(1.5);
+var dyn I = runtime(3);
+var dyn S = runtime("ab");
+var dyn N = runtime(none);
+var dyn A = runtime([1, 2]);
+
+# ---- strings --------------------------------------------------------------
+run("strip-e", func() => strip(runtime("")) + "|");
+run("lstrip-e", func() => lstrip(runtime("")) + "|");
+run("rstrip-e", func() => rstrip(runtime("")) + "|");
+run("strip-ws", func() => strip(runtime("   ")) + "|");
+run("lstrip-ws", func() => lstrip(runtime(" \t ")) + "|");
+run("rstrip-ws", func() => rstrip(runtime("  ")) + "|");
+run("strip-x", func[I]() => strip(I));
+run("lstrip-x", func[F]() => lstrip(F));
+run("rstrip-x", func[A]() => rstrip(A));
+run("split-x", func[I]() => split(I, ","));
+run("split-dx", func[S, I]() => split(S, I));
+run("join-x", func[I]() => join(I, ","));
+run("join-dx", func[A, I]() => join(A, I));
+run("join-gen", func() => join(dynarray(["a", "b", "c"]), "-"));
+run("join-gen1", func() => join(dynarray(["a"]), "-"));
+run("join-gen0", func() => join(dynarray([]), "-"));
+run("join-mix", func[A]() => join(dynarray(["a", A]), "-"));
+run("join-ints", func[A]() => join(A, "-"));
+run("splitlines-x", func[I]() => splitlines(I));
+run("ord-x", func[I]() => ord(I));
+run("chr-x", func[S]() => chr(S));
+run("ord-e", func() => ord(runtime("")));
+run("lpad-x", func[I]() => lpad(I, 5));
+run("lpad-px", func[S, I]() => lpad(S, 5, I));
+run("lpad-long", func[S]() => lpad(S, 5, "xy"));
+run("lpad-neg", func[S]() => lpad(S, int(runtime(-2))));
+run("rpad-neg", func[S]() => rpad(S, int(runtime(-2)), "."));
+run("startswith-x", func[I, S]() => startswith(I, S));
+run("startswith-dx", func[I, S]() => startswith(S, I));
+run("endswith-x", func[I, S]() => endswith(I, S));
+run("endswith-dx", func[I, S]() => endswith(S, I));
+
+# ---- bitwise operators on a dyn that is not an int ------------------------
+run("band", func[I, F]() => I & F);
+run("bor", func[I, F]() => I | F);
+run("bxor", func[I, S]() => I ^ S);
+run("shl", func[I, F]() => I << F);
+run("shr", func[I, F]() => I >> F);
+run("ushr", func[I, S]() => I >>> S);
+
+# ---- callbacks whose results change type: a flat result spills ------------
+func change(dyn v) {
+    if (v < 3)
+        return v * 2;
+    return "s" + str(v);
+}
+func fchange(dyn v) {
+    if (v < 3)
+        return v * 0.5;
+    return none;
+}
+func bchange(dyn v) {
+    if (v < 3)
+        return v > 1;
+    return [v];
+}
+var src = [1, 2, 3, 4];
+note("map-i", map(change, src));
+note("map-f", map(fchange, src));
+note("map-b", map(bchange, src));
+note("mk-i", make_array(4, func(i) => change(i + 1)));
+note("mk-f", make_array(4, func(i) => fchange(i + 1)));
+note("mk-b", make_array(4, func(i) => bchange(i + 1)));
+note("mk-bb", make_array(3, func(i) => i > 0));
+var mb = make_array(3, func(i) => i != 1);
+note("mk-bstore", array_storage(mb));
+
+# ---- dicts ----------------------------------------------------------------
+func dbool() {
+    var d = {};
+    d[true] = 10;
+    d[false] = 20;
+    return d;
+}
+var bd = dbool();
+var bk = keys(bd);
+note("keys-b", str(bk) + " " + array_storage(bk));
+var bv = {"x": true, "y": false};
+var vb = values(bv);
+note("values-b", str(vb) + " " + array_storage(vb));
+run("dict-pairs3", func() => dict(runtime([[1, 2, 3]])));
+run("dict-pairs1", func() => dict(runtime([[1]])));
+run("dict-notpair", func[I]() => dict([I]));
+run("get-x", func[I]() => get(I, 1));
+run("keys-x", func[I]() => keys(I));
+run("values-x", func[A]() => values(A));
+
+# ---- arrays ---------------------------------------------------------------
+var bools = [true, false, true];
+note("find-b", find(bools, false));
+note("find-bn", find(bools, 7));
+note("find-gb", find(dynarray(bools), false));
+note("sort-b", sort(clone(bools), func(a, b) => !a && b));
+note("sort-bk", sort([true, false, false, true, true, false],
+                     func(a, b) => a && !b));
+run("sum-key0", func() => sum(dynarray(runtime([])), func(x) => x * 2));
+note("sum-b1", sum([true]));
+run("top-x", func[I]() => top(I));
+run("top-e", func() => top(runtime([])));
+run("arraystorage-x", func[I]() => array_storage(I));
+run("dynarray-x", func[I]() => dynarray(I));
+
+foreach (o in out)
+    print(o);
