@@ -1,0 +1,113 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): a FLOAT expression whose operands are ints and bools
+# (README: bool <= int <= float - a bool computes as 0/1, an int is
+# widened). A typed float chain reads each operand as a float, so every
+# place an int or a bool can come from is a read the typed engines must
+# widen: a local, a global read in a function, a capture, an element of
+# a flat, a general and a sliced array (and at a negative index), a dict
+# value (present, and a default dict's missing key), a struct field (a
+# POD one and a boxed one). Every engine must print what the tree-walker
+# prints.
+
+var out = [];
+func note(str what, dyn v) { append(out, what + "=" + str(v)); }
+
+var G_INT = int(runtime(3));
+var G_BOOL = runtime(1) == 1;
+var G_FALSE = runtime(1) == 2;
+
+struct P { int i; bool b; float f; }
+struct Q { int i; bool b; array<int> keep; }
+
+func gen_ints(int n) {
+    var d = {};
+    for (var i = 0; i < n; i++)
+        d[i * 2] = i;
+    return keys(d);                        # a general array<int>
+}
+
+func gen_bools() {
+    var d = {};
+    d[true] = 1;
+    d[false] = 2;
+    return keys(d);                        # a general array<bool>
+}
+
+func locals(float x, int k, bool t, bool f) {
+    var a = x * k + t;
+    var b = x - f + k * 0.5;
+    var c = t * x + f * x;
+    var d = 0.25 + t + k;
+    return str(a) + " " + str(b) + " " + str(c) + " " + str(d);
+}
+note("locals", locals(float(runtime(1.5)), int(runtime(4)),
+                      runtime(1) == 1, runtime(0) == 1));
+
+func globals(float x) {
+    var a = x * G_INT + G_BOOL;
+    var b = x - G_FALSE * 2.0 + G_INT;
+    return str(a) + " " + str(b);
+}
+note("globals", globals(float(runtime(2.5))));
+
+func captures(float x, int k, bool t) {
+    var h = func[k, t](float y) => y * k + t * 0.5 + y * t;
+    return h(x) + h(x * 2.0);
+}
+note("captures", captures(float(runtime(1.0)), int(runtime(3)),
+                          runtime(1) == 1));
+
+func elems(float x, array<int> fi, array<int> gi, array<bool> fb,
+           array<bool> gb, int i) {
+    var r = [];
+    append(r, x * fi[i] + fi[0 - 1]);
+    append(r, x * gi[i] + gi[0 - 1] * 0.5);
+    append(r, x * fb[i] + fb[0 - 1] * 0.5);
+    append(r, x * gb[i] + gb[0 - 1] * 0.5);
+    var sl = fi[1:3];
+    append(r, x * sl[0] + sl[0 - 1] * 0.25);
+    try {
+        append(r, x * fi[i + 10]);
+    } catch (OutOfBoundsEx) {
+        append(r, -1.0);
+    }
+    return r;
+}
+note("elems", elems(float(runtime(0.5)), [5, 6, 7, 8],
+                    gen_ints(int(runtime(4))), [true, false, true],
+                    gen_bools(), int(runtime(1))));
+note("elems0", elems(float(runtime(2.0)), [1, 2, 3],
+                     gen_ints(int(runtime(3))), [false, true],
+                     gen_bools(), int(runtime(0))));
+
+func dicts(float x) {
+    var di = {"a": 3, "b": 4};
+    var db = {"t": true, "f": false};
+    var dd = dict(7);                      # a default dict<dyn, int>
+    dd["z"] = 2;
+    var r = x * di["a"] + di["b"] * 0.5;
+    r += x * db["t"] + db["f"] * 2.0;
+    r += x * dd["z"] + dd["missing"] * 0.5;
+    r += x * di.a + db.t * 0.25;
+    try {
+        r += x * di["nope"];
+    } catch (KeyNotFoundEx) {
+        r += 1000.0;
+    }
+    return r;
+}
+note("dicts", dicts(float(runtime(1.5))));
+
+func fields(float x, P p, Q q) {
+    var r = x * p.i + p.b * 0.5 + p.f;
+    r += x * q.i + q.b * 0.25 + len(q.keep);
+    return r;
+}
+note("fields", fields(float(runtime(2.0)), P(3, true, 0.5),
+                      Q(4, false, [1, 2])));
+note("fields2", fields(float(runtime(-1.0)), P(-2, false, 1.5),
+                       Q(0, true, [])));
+
+foreach (o in out)
+    print(o);

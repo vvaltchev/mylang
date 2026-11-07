@@ -52,3 +52,35 @@ func run(int n) {
 print(run(int(runtime(2))));
 foreach (e in evlog) print(e);
 assert(join(evlog, " ") == "for0 for1 w0 w1 w2 w2 w2 t1");
+
+# A body or an arm that folds away entirely is an `if` on a write-once
+# variable the folder makes a constant - a brace-less body that DECLARES
+# is wrapped in a block, which never folds away. The slot it leaves is
+# then empty: a loop with no body, an `if` with no arm.
+func run2(int n) {
+    var dbg = false;                        # write-once: a constant
+    var on = true;
+    var s = 0;
+    for (var i = 0; i < n; i++)             # the body folds away
+        if (dbg) ev("for-dead");
+    var w = 0;
+    while (ev("cw") && w++ < 2)             # ... in a while
+        if (dbg) ev("while-dead");
+    foreach (x in [1, 2])                   # ... in a foreach
+        if (dbg) ev("fe-dead");
+    if (ev("c") && n > 0)                   # a live if's arm folds away
+        if (dbg) ev("arm-dead");
+    if (n > 0)                              # (the else is the inner if's)
+        if (dbg) ev("arm-dead");
+    else
+        ev("else");
+    if (on)                                 # a constant if's taken arm
+        if (dbg) ev("taken-dead");
+    if (dbg) ev("x"); else if (dbg) ev("y");
+    s += 1;
+    return s;
+}
+evlog = [];
+print(run2(int(runtime(2))));
+foreach (e in evlog) print(e);
+assert(join(evlog, " ") == "cw cw cw c else");

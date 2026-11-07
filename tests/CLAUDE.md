@@ -251,7 +251,9 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   (ML_COVERAGE, defs.h; `mylang -v`: `coverage 1`, `asserts 0`) - an
   assertion's failure arm is an edge no correct run takes, and an inlined
   check charged one to every call site (8,385 elements). So int_run-gcov
-  runs no assertion: the int-rel int_run is the one that does.
+  runs no assertion: the int-rel int_run is the one that does. It also
+  emits each ML_ALWAYS_INLINE helper once, out of line: inlined, every
+  caller counted the helper's branches again (~4,600 elements).
 - tests/driver_checks is a unit too (a script; its exit code is the
   oracle): a CLI flag's code is covered by the check that tests it.
 - With --gcov every unit must OWN an element no other unit covers, and
@@ -266,7 +268,7 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   Without it a depth-15 program ran 1.7 million innermost iterations and
   the debug tree-walker timed out on it (26 s alone, CPython 0.5 s) -
   with fresh seeds in CI that would be a red run with no bug behind it.
-- 16-19_nested_*.my are GENERATED (nested_fuzz -> int_select --shrink ->
+- 16-17_nested_*.my are GENERATED (nested_fuzz -> int_select --shrink ->
   observe_globals -> wrapped to 80 columns, output checked identical).
   Do not tidy them by hand; regenerate.
 

@@ -80,7 +80,20 @@ typedef intptr_t int_type;
  * those leaf helpers ML_ALWAYS_INLINE pins them into the loop regardless of its
  * size. Use ONLY for tiny, hot, non-recursive, non-address-taken leaves.
  */
-#if defined(_MSC_VER)
+/* ML_COVERAGE: a COVERAGE build (GCOV=1) - see the assertion block below */
+#ifndef ML_COVERAGE
+#  define ML_COVERAGE 0
+#endif
+#if ML_COVERAGE
+   /* A COVERAGE build emits each of these helpers ONCE, out of line.
+    * Forced inline, every caller got its own copy of the helper's branches,
+    * so a decision reached through one opcode's handler was uncovered in
+    * the eighty others: read_int_slot's bool arm alone was 87 elements,
+    * and 2,552 uncovered elements of vm.cpp were such copies (2026-11-07).
+    * The source states each decision once, and so does the universe now.
+    * A coverage build's speed is nobody's concern. */
+#  define ML_ALWAYS_INLINE inline __attribute__((noinline))
+#elif defined(_MSC_VER)
 #  define ML_ALWAYS_INLINE __forceinline
 #else
 #  define ML_ALWAYS_INLINE inline __attribute__((always_inline))
@@ -142,9 +155,6 @@ typedef intptr_t int_type;
  * charged one to EVERY call site. The other builds keep the full net.
  * `mylang -v` reports it (`coverage 1`, and `asserts 0`: ML_CHECK is off).
  */
-#ifndef ML_COVERAGE
-#  define ML_COVERAGE 0
-#endif
 #if !defined(NDEBUG) && !ML_COVERAGE
 #  include <cassert>
 #  define ML_CHECK(cond)          assert(cond)

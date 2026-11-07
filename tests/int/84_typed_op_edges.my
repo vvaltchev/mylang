@@ -1,0 +1,159 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): the TYPED arithmetic, comparison and element-read ops
+# at their edges - a zero divisor, the most negative int over -1, a
+# negative or oversized shift count, a NaN in a comparison, a negative
+# or out-of-range index in a condition - with every operand a typed int
+# or float, so each lands in the typed op (the specialized forms, IntBin,
+# FloatBin, the fused compare-and-branch and element tests) and not the
+# boxed one a `dyn` operand takes. Each operator appears with the
+# literal on the right, on the left, and with none. Every engine must
+# print what the tree-walker prints.
+
+var out = [];
+func note(str what, dyn v) { append(out, what + "=" + str(v)); }
+
+func iops(int a, int b) {
+    var r = "";
+    try { r += str(a / b); } catch (DivisionByZeroEx) { r += "Z"; }
+                              catch (InvalidValueEx) { r += "V"; }
+    r += ",";
+    try { r += str(a % b); } catch (DivisionByZeroEx) { r += "Z"; }
+                              catch (InvalidValueEx) { r += "V"; }
+    r += ",";
+    try { r += str(a << b); } catch (InvalidValueEx) { r += "V"; }
+    r += ",";
+    try { r += str(a >> b); } catch (InvalidValueEx) { r += "V"; }
+    r += ",";
+    try { r += str(a >>> b); } catch (InvalidValueEx) { r += "V"; }
+    r += "," + str(a + b) + "," + str(a - b) + "," + str(a * b);
+    r += "," + str(a & b) + "," + str(a | b) + "," + str(a ^ b);
+    return r;
+}
+
+func lit_left(int b) {
+    var r = "";
+    try { r += str(7 / b); } catch (DivisionByZeroEx) { r += "Z"; }
+    r += ",";
+    try { r += str(7 % b); } catch (DivisionByZeroEx) { r += "Z"; }
+    r += ",";
+    try { r += str(7 << b); } catch (InvalidValueEx) { r += "V"; }
+    r += ",";
+    try { r += str(7 >> b); } catch (InvalidValueEx) { r += "V"; }
+    r += ",";
+    try { r += str(-7 >>> b); } catch (InvalidValueEx) { r += "V"; }
+    r += "," + str(100 - b) + "," + str(3 & b) + "," + str(3 | b);
+    r += "," + str(3 ^ b) + "," + str(9 + b) + "," + str(4 * b);
+    return r;
+}
+
+func lit_right(int a) {
+    var r = str(a / 3) + "," + str(a % 3) + ",";
+    try { r += str(a / -1); } catch (InvalidValueEx) { r += "V"; }
+    r += ",";
+    try { r += str(a % -1); } catch (InvalidValueEx) { r += "V"; }
+    r += "," + str(a << 3) + "," + str(a >> 3);
+    r += "," + str(a >>> 3) + "," + str(a << 64) + "," + str(a >> 64);
+    r += "," + str(a >>> 64) + "," + str(a / 1) + "," + str(a % 7);
+    return r;
+}
+
+var MIN = -9223372036854775807 - 1;
+foreach (p in [[7, 2], [-7, 2], [7, -2], [7, 0], [MIN, -1], [5, -1],
+               [1, 64], [1, 63], [-8, 1], [MIN, 1], [0, 0]])
+    note("i " + str(p[0]) + " " + str(p[1]),
+         iops(int(runtime(p[0])), int(runtime(p[1]))));
+foreach (b in [2, -3, 0, -1, 64, 63])
+    note("ll " + str(b), lit_left(int(runtime(b))));
+foreach (a in [17, -17, 0, 1, MIN])
+    note("lr " + str(a), lit_right(int(runtime(a))));
+
+func fops(float a, float b) {
+    var r = "";
+    try { r += str(a / b); } catch (DivisionByZeroEx) { r += "Z"; }
+    r += ",";
+    try { r += str(a % b); } catch (DivisionByZeroEx) { r += "Z"; }
+    r += ",";
+    try { r += str(1.5 / b); } catch (DivisionByZeroEx) { r += "Z"; }
+    r += ",";
+    try { r += str(7.5 % b); } catch (DivisionByZeroEx) { r += "Z"; }
+    r += "," + str(a + b) + "," + str(a - b) + "," + str(a * b);
+    r += "," + str(2.5 - b) + "," + str(a * 0.5) + "," + str(a / 4.0);
+    return r;
+}
+
+func fcmp(float a, float b) {
+    var r = "";
+    if (a < b) r += "<";
+    if (a > b) r += ">";
+    if (a <= b) r += "l";
+    if (a >= b) r += "g";
+    if (a == b) r += "=";
+    if (a != b) r += "!";
+    if (a < 1.5) r += "a";
+    if (2.5 > b) r += "b";
+    var c = a < b;
+    var d = a != b;
+    return r + str(c) + str(d);
+}
+
+var NAN = float(runtime("nan"));
+foreach (p in [[1.5, 2.0], [-3.0, 0.0], [4.0, -0.0], [2.5, 2.5],
+               [0.0, 0.0]])
+    note("f " + str(p[0]) + " " + str(p[1]),
+         fops(float(runtime(p[0])), float(runtime(p[1]))));
+foreach (p in [[1.0, 2.0], [2.0, 1.0], [2.5, 2.5], [NAN, 1.0],
+               [1.0, NAN], [NAN, NAN], [-0.0, 0.0]])
+    note("fc " + str(p[0]) + " " + str(p[1]),
+         fcmp(float(runtime(p[0])), float(runtime(p[1]))));
+
+# an element in a condition, at a negative and an out-of-range index
+func elem_cond(array<int> a, array<bool> b, int i) {
+    var r = "";
+    try {
+        if (a[i]) r += "a"; else r += "-";
+    } catch (OutOfBoundsEx) { r += "A"; }
+    try {
+        if (b[i]) r += "b"; else r += "-";
+    } catch (OutOfBoundsEx) { r += "B"; }
+    try {
+        if (!a[i]) r += "n"; else r += "-";
+    } catch (OutOfBoundsEx) { r += "N"; }
+    return r;
+}
+
+func gen_bools(int n) {
+    var d = {};
+    for (var i = 0; i < n; i++)
+        d[i % 2 == 0] = i;
+    return keys(d);
+}
+
+var ai = [3, 0, 5];
+var bi = [false, true, true];
+var gb = gen_bools(int(runtime(3)));       # a general array<bool>
+foreach (i in [0, 1, 2, -1, -2, -3, 3, -4, 9])
+    note("e " + str(i), elem_cond(ai, bi, int(runtime(i)))
+                        + elem_cond(ai, gb + [true], int(runtime(i))));
+
+# counted loops whose step fuses with a load or an add, descending
+func down(array<int> a, int n) {
+    var s = 0;
+    for (var i = n - 1; i > 0; i--)
+        s += a[i];
+    for (var i = n - 1; i >= 0; i -= 1)
+        s = s * 3 + a[i];
+    var t = 0;
+    for (var i = n; i > 0; i--)
+        t += i;
+    for (var i = n; i >= 2; i--)
+        t += 2;
+    for (var i = 0; i <= n; i++)
+        t += a[i % n];
+    return str(s) + "/" + str(t);
+}
+note("down", down([4, 7, 1, 9], int(runtime(4))));
+note("down1", down([5], int(runtime(1))));
+
+foreach (o in out)
+    print(o);
