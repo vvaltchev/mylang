@@ -8099,11 +8099,20 @@ headless-testable behind a thin terminal shell:
     only line ends were terminated. **And no `;` follows a block `}`
     whose next code line starts with `else` / `catch` / `finally`**
     (`next_continues`): a chain written `}` / `else {` on two lines, as
-    a script may.
+    a script may. **Nor after a statement HEADER** - the `)` of an if /
+    while / for / foreach / catch (a `'H'` entry on the bracket stack, so
+    a header spanning lines works), or a trailing `else` / `try` /
+    `finally` - and `is_incomplete` keeps such an input open
+    (`repl_ends_in_header`): a `;` there gave the statement an EMPTY body
+    and ran the next line on its own, so `if (k == 2)` / `print(x)`
+    printed whatever k was and `while (n < 2)` / `n++` never ended
+    (2026-11-07).
   - **A chain the next line may continue stays open (the Joiner,
     lineedit.h):** `ReplEngine::may_continue` - the input ends with the
     `}` of a top-level `if` / `else if` / `try` / `catch` block that
-    spans lines - keeps the editor open, a new line at the END of the
+    spans lines, or with an `if` whose last branch is a BRACE-LESS
+    statement on a later line (`brace_less_if_open`, read off the
+    terminated text) - keeps the editor open, a new line at the END of the
     buffer; an empty line submits (the editor drops it). The cooked reader
     reads ONE line ahead instead and keeps it (`carry`) for the next
     input when `continues_chain` says it is not an `else` / `catch` /

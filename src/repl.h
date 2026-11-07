@@ -44,10 +44,10 @@ public:
      * True when the COMPLETE input `src` ends with a top-level `if` /
      * `else if` or `try` / `catch` chain whose last block closes at its end
      * - so a following line starting with `else`, `catch` or `finally`
-     * still continues it, as in a script. With `multiline_only`, only when
-     * that last block spans lines: one typed on a single line runs at once.
+     * still continues it, as in a script - only when that last block spans
+     * lines: one typed on a single line runs at once.
      */
-    static bool may_continue(const std::string &src, bool multiline_only);
+    static bool may_continue(const std::string &src);
 
     /* True when `line`'s first token is `else`, `catch` or `finally`. */
     static bool continues_chain(const std::string &line);

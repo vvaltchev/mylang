@@ -1,0 +1,24 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> => 1
+>> .. >> .. .. .. else ran 
+>> .. .. .. .. .. else-if ran 
+>> .. then ran 
+>> next 
+>> .. 0 
+1 
+2 
+>> => 0
+>> .. >> => 2
+>> .. 7 
+8 
+>> .. .. two-line header 
+>> .. after a semicolon 
+>> .. a block 
+after a block 
+>> on one line 
+>> .. 2 
+>> >> .. .. .. .. .. .. .. .. .. .. .. 5 
+fin 
+>> => 0
+>> >> => 3
+>> 
