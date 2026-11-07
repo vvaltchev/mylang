@@ -3665,7 +3665,10 @@ A callback must be a function: passing a builtin (`find(a, 3, len)`) is a
 ### Numeric builtins
 
 #### `abs(num)`
-Return the absolute value of the given number.
+Return the absolute value of the given number, an `int` or a `float`. Any
+other argument whose type the compiler knows is a compile error - a `bool`
+too: `abs(true)` is refused, as is `abs(b)` for a `bool` variable `b`. A
+`dyn` value that holds no number raises `TypeErrorEx` when the call runs.
 
 #### `min(a, b, [c, [...]])`
 Return the smallest value among the ones passed to it. Numbers of different
@@ -3750,7 +3753,10 @@ Return true if `x` is "Not a Number".
 
 #### `round(x, [precision])`
 Round `x` to the nearest integer or to a floating-point number with
-`precision` digits.
+`precision` digits. `x` is an `int` or a `float` and `precision` a
+non-negative `int`: an argument of any other type the compiler knows is a
+compile error - a `bool` too, as with `abs` - and a `dyn` value that holds
+the wrong kind raises `TypeErrorEx` when the call runs.
 
 ### Numeric constants
 
