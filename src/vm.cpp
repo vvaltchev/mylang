@@ -4443,7 +4443,7 @@ vm_load_elem_int_core(const EvalValue &base, int_type idx,
         return arr.flat_ints()[at];
     if (arr.skind() == SharedArrayObj::Storage::bools)
         return arr.flat_bools()[at] ? 1 : 0;
-    return arr.get_vec()[at].getval<int_type>();
+    return general_elem_int(arr.get_vec()[at]);
 }
 
 static ML_ALWAYS_INLINE float_type
@@ -12433,7 +12433,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 else if (arr.skind() == SharedArrayObj::Storage::bools)
                     v = arr.flat_bools()[at] ? 1 : 0;
                 else
-                    v = arr.get_vec()[at].getval<int_type>();
+                    v = general_elem_int(arr.get_vec()[at]);
                 if (v == 0) {
                     pc = in->target;
                     VM_NEXT;
@@ -12519,7 +12519,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 else if (arr.skind() == SharedArrayObj::Storage::bools)
                     v = arr.flat_bools()[at] ? 1 : 0;
                 else
-                    v = arr.get_vec()[at].getval<int_type>();
+                    v = general_elem_int(arr.get_vec()[at]);
                 write_int_slot(&ctx, in->b_dual_hi(), v);
             } else {
                 throw InternalErrorEx();   /* base proven an array */

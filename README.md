@@ -3501,14 +3501,16 @@ the padding character is space.
 The counter-part of `lpad()`: pad the string on the right.
 
 #### `lstrip(string)`
-Return a slice of the given string skipping any leading whitespace.
+Return a slice of the given string skipping any leading whitespace: a
+space, a tab, `\n`, `\r`, a vertical tab or a form feed (bytes 9-13 and
+32). No other byte is whitespace.
 
 #### `rstrip(string)`
 Return a slice of the given string skipping any trailing whitespace.
 
 #### `strip(string)`
 Return a slice of the given string skipping any leading or trailing
-whitespace.
+whitespace. A string that is all whitespace strips to `""`.
 
 #### `startswith(string, sub_string)`
 Return `true` if the given string starts with the given sub_string, `false`

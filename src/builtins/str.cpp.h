@@ -345,6 +345,15 @@ EvalValue builtin_rpad(EvalContext *ctx, const ArgLocs *exprList,
     return generic_pad<false>(ctx, exprList, args, n);
 }
 
+/* The whitespace the strip family skips: space, \t \n \v \f \r - the C
+ * locale's whitespace, spelled out: the standard test is undefined for a
+ * plain `char` byte >= 0x80 (it is negative here), and a locale could
+ * change its answer; a byte is MyLang's character. */
+static inline bool strip_space(char c)
+{
+    return c == ' ' || (c >= '\t' && c <= '\r');
+}
+
 EvalValue builtin_lstrip(EvalContext *ctx, const ArgLocs *exprList,
                          const EvalValue *args, size_t n)
 {
@@ -365,7 +374,7 @@ EvalValue builtin_lstrip(EvalContext *ctx, const ArgLocs *exprList,
         return shared_str;
 
     for (s = 0; s < str.size(); s++) {
-        if (!isspace(str[s]))
+        if (!strip_space(str[s]))
             break;
     }
 
@@ -392,7 +401,7 @@ EvalValue builtin_rstrip(EvalContext *ctx, const ArgLocs *exprList,
         return shared_str;
 
     for (l = str.size(); l > 0; l--) {
-        if (!isspace(str[l-1]))
+        if (!strip_space(str[l-1]))
             break;
     }
 
@@ -419,12 +428,16 @@ EvalValue builtin_strip(EvalContext *ctx, const ArgLocs *exprList,
         return shared_str;
 
     for (s = 0; s < str.size(); s++) {
-        if (!isspace(str[s]))
+        if (!strip_space(str[s]))
             break;
     }
 
-    for (l = str.size(); l > 0; l--) {
-        if (!isspace(str[l-1]))
+    /* an all-whitespace string: the trailing scan stops at s (it must not
+     * pass it), so the window is empty - `l - s` used to WRAP, a window
+     * of 4 billion bytes past the buffer (an ML_CHECK abort, or a wild
+     * read where asserts are off) */
+    for (l = str.size(); l > s; l--) {
+        if (!strip_space(str[l-1]))
             break;
     }
 

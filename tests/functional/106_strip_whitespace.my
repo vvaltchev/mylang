@@ -1,0 +1,22 @@
+# strip() of a string that is ALL whitespace strips to "". The trailing
+# scan ran past the leading one, and the window's length wrapped to 4
+# billion bytes: an assertion abort in a checked build, a read past the
+# buffer in one without asserts - while compiling, when the argument is
+# constant. Whitespace is exactly space and bytes 9-13 (README).
+
+func show(str s) { return "[" + s + "]"; }
+
+assert(strip("   ") == "" && strip(runtime("\t \n")) == "");
+assert(strip(" a ") == "a" && strip(runtime("  ab")) == "ab");
+assert(lstrip("   ") == "" && rstrip(runtime("  ")) == "");
+assert(strip("") == "" && len(strip(runtime(" \r\n "))) == 0);
+
+# a window of a longer string, which strips to a window of its own
+var s = str(runtime("  x  "));
+assert(strip(s[2:4]) == "x" && strip(s[3:]) == "" && strip(s[:2]) == "");
+
+# no other byte is whitespace: a byte >= 0x80 is kept
+var hi = str(runtime(" ")) + chr(160) + " ";
+assert(len(strip(hi)) == 1 && ord(strip(hi)) == 160);
+
+print(show(strip("   ")), show(strip(s)), show(lstrip(s)), show(rstrip(s)));

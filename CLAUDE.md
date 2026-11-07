@@ -5192,7 +5192,11 @@ its promoted value, so a typed scalar over bool operands is unboxed like int
 (the boxing in `TypedScalarExpr::do_eval`/`LiteralBool` keeps a bool where it
 must — a comparison/logical/`!` result, a bool literal — while arithmetic over
 bools correctly yields int). `Construct`/`Identifier`/`Subscript`
-`eval_int`/`eval_float` read a bool value/slot/flat element as `0`/`1`.
+`eval_int`/`eval_float` read a bool value/slot/element as `0`/`1` - a
+GENERAL array's element too (`general_elem_int`, eval.h, which every
+engine's element-int read calls): an `array<bool>` is not always flat (an
+inline `keys()` of a `dict<bool, ...>`, `dynarray()`), and `if (b[i])` on
+a general one raised TypeErrorEx in every engine until 2026-11-07.
 **⛔ SO `th == i` DOES NOT MEAN "int" - IT ALSO MEANS BOOL, AND A
 CONSUMER THAT NEEDS THE VALUE MUST ASK (`Construct::th_bool`, added
 2026-08-26).** The VM lost that distinction for four shapes:

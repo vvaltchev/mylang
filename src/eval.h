@@ -103,6 +103,22 @@ struct PureCacheKeyHash {
     }
 };
 
+/*
+ * A GENERAL array's element read as an INT, by the typed reads of every
+ * engine (Subscript::eval_int, the VM's element-int cores). A bool reads
+ * as 0/1, exactly as a FLAT bool element does: an array<bool> is not
+ * always flat - an inline keys() of a dict<bool, ...> and dynarray() build
+ * a general one, and the bind accepts it - so `if (b[i])` on one raised
+ * TypeErrorEx in every engine, each with another caret. Anything else is
+ * the type error it always was.
+ */
+inline int_type general_elem_int(const LValue &e)
+{
+    if (e.is<bool>())
+        return e.getval<bool>() ? 1 : 0;
+    return e.getval<int_type>();
+}
+
 /* Node-POOLED (poolalloc.h) like the dict map: a recursion's per-frame
  * cache inserts a node per novel call - the pool serves + reuses them. */
 /* -npc: the per-frame pure-call cache is OFF.  Declared HERE, above
