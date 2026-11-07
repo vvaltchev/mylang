@@ -81,10 +81,14 @@ bool codegen_func_body(const FuncDeclStmt *fn, Chunk &out, bool jit = true);
  * is in this set, which vm_precompile_all builds from `collect_funcs` over
  * the FINAL tree - the same walk that decides which bodies to compile, so
  * the two cannot drift. Membership is a pointer COMPARE, never a deref, so
- * a dangling stamp is safe to test; and if a freed descriptor's address is
- * ever recycled by a live one, the worst case is a wrong PREDICTION, which
- * the emitted identity compare turns into a slow path rather than a wrong
- * answer.
+ * a dangling stamp is safe to test. A freed descriptor's address IS
+ * recycled by a live one in practice (a non-ASan build put a stray
+ * `<lambda>` into 76_const_bindings's fa$0 pool, so the bytecode depended
+ * on the allocator), so a stamp also carries the descriptor's SERIAL
+ * (DescStamp, syntax.h) and is trusted only when the live descriptor at
+ * that address has it (codegen_desc_stamp_live). A wrong prediction would
+ * still be only a slow path - the emitted identity compare misses - but
+ * the code must not differ between two builds of one program.
  *
  * Null (the tree-walker, the REPL, any path that did not precompile) means
  * "trust nothing" - every stamp declines and the old code is emitted.
@@ -106,6 +110,14 @@ public:
 private:
     std::unordered_set<const FuncDescriptor *> live;
 };
+
+/* A DescStamp (syntax.h) names a live descriptor: its pointer is in `live`
+ * and holds the serial stamped. Exported for the -rt check that reuses an
+ * address on purpose (codegen_desc_stamp_reuse). */
+struct DescStamp;
+bool codegen_desc_stamp_live(
+    const DescStamp &s,
+    const std::unordered_set<const FuncDescriptor *> *live);
 
 /*
  * Build `chunk.boxed_ops` (the JIT-bakeable operand pool for BinOpV / CmpV /

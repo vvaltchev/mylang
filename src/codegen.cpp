@@ -49,6 +49,17 @@ struct NotLoweredEx : public Exception {
 static const std::unordered_set<const FuncDescriptor *> *g_live_descs
     = nullptr;
 
+/* Declared in codegen.h: a stamp names a live descriptor - the pointer is
+ * in the live set (so it may be read) and holds the serial stamped (so it
+ * is the descriptor stamped, not a later one at a reused address). */
+bool codegen_desc_stamp_live(
+    const DescStamp &s,
+    const std::unordered_set<const FuncDescriptor *> *live)
+{
+    return s.desc && live && live->count(s.desc)
+           && s.desc->serial == s.serial;
+}
+
 CodegenLiveDescs::CodegenLiveDescs(
     const std::vector<const FuncDeclStmt *> &funcs)
 {
@@ -1148,10 +1159,11 @@ struct Codegen {
      * in a loop is one site, but two sites may name one function), which is
      * already the per-chunk, SERIALIZABLE pool of FuncDescriptor*.
      */
-    int add_value_callee(const FuncDescriptor *d)
+    int add_value_callee(const DescStamp &s)
     {
-        if (!d || !g_live_descs || !g_live_descs->count(d))
-            return -1;            /* unstamped, or a stamp that may dangle */
+        if (!codegen_desc_stamp_live(s, g_live_descs))
+            return -1;            /* unstamped, or a stamp that dangles */
+        const FuncDescriptor *d = s.desc;
         for (size_t i = 0; i < chunk.closure_defs.size(); i++)
             if (chunk.closure_defs[i] == d)
                 return static_cast<int>(i);
