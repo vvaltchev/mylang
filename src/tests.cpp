@@ -22629,7 +22629,67 @@ static bool static_type_unify_vars()
     StaticTypeRef x = a.fresh_var();
     if (!static_type_unify(a.array_of(x), a.array_of(a.int_ty()))) return false;
     if (static_type_resolve(x) != a.int_ty())       return false;
-    return true;
+
+    /* the same type; a variable on the RIGHT binds, with its own
+     * occurs-check (here through a dict's value); opt must match */
+    if (!static_type_unify(a.int_ty(), a.int_ty()))  return false;
+    StaticTypeRef y = a.fresh_var();
+    if (!static_type_unify(a.str_ty(), y))           return false;
+    if (static_type_resolve(y) != a.str_ty())        return false;
+    StaticTypeRef z = a.fresh_var();
+    if (static_type_unify(a.dict_of(a.str_ty(), z), z)) return false;
+    if (static_type_unify(a.int_ty(true), a.int_ty())) return false;
+
+    /* a dict unifies its key and its value; a box its element */
+    StaticTypeRef k = a.fresh_var(), v2 = a.fresh_var();
+    if (!static_type_unify(a.dict_of(k, v2),
+                           a.dict_of(a.str_ty(), a.float_ty())))
+        return false;
+    if (static_type_resolve(k) != a.str_ty()
+        || static_type_resolve(v2) != a.float_ty())
+        return false;
+    if (static_type_unify(a.dict_of(a.str_ty(), a.int_ty()),
+                          a.dict_of(a.int_ty(), a.int_ty())))
+        return false;
+    StaticTypeRef bx = a.fresh_var();
+    if (!static_type_unify(a.box_of(bx), a.box_of(a.int_ty()))) return false;
+    if (static_type_resolve(bx) != a.int_ty())       return false;
+
+    /* a function: arity, which parameters are opt, each parameter, the
+     * return - and the occurs-check through a parameter and the return */
+    StaticTypeRef p = a.fresh_var(), r = a.fresh_var();
+    if (!static_type_unify(a.func_of({ p }, { false }, r),
+                           a.func_of({ a.int_ty() }, { false }, a.bool_ty())))
+        return false;
+    if (static_type_resolve(p) != a.int_ty()
+        || static_type_resolve(r) != a.bool_ty())
+        return false;
+    const StaticTypeRef f_ii = a.func_of({ a.int_ty() }, { false }, a.int_ty());
+    if (static_type_unify(f_ii, a.func_of({ a.int_ty(), a.int_ty() },
+                                         { false, false }, a.int_ty())))
+        return false;
+    if (static_type_unify(f_ii, a.func_of({ a.int_ty() }, { true },
+                                         a.int_ty())))
+        return false;
+    if (static_type_unify(f_ii, a.func_of({ a.str_ty() }, { false },
+                                         a.int_ty())))
+        return false;
+    if (static_type_unify(f_ii, a.func_of({ a.int_ty() }, { false },
+                                         a.str_ty())))
+        return false;
+    StaticTypeRef f1 = a.fresh_var(), f2 = a.fresh_var();
+    if (static_type_unify(f1, a.func_of({ f1 }, { false }, a.int_ty())))
+        return false;
+    if (static_type_unify(f2, a.func_of({ a.int_ty() }, { false }, f2)))
+        return false;
+
+    /* a struct by its definition */
+    static const int def1 = 0, def2 = 0;
+    const UniqueId *s1 = UniqueId::get("UnifyS1");
+    const UniqueId *s2 = UniqueId::get("UnifyS2");
+    if (!static_type_unify(a.struct_ty(&def1, s1), a.struct_ty(&def1, s1)))
+        return false;
+    return !static_type_unify(a.struct_ty(&def1, s1), a.struct_ty(&def2, s2));
 }
 
 static bool static_type_to_string_basic()
