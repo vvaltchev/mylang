@@ -1218,6 +1218,192 @@ else
           head -c 300)"
 fi
 
+# THE DRIVER'S FLAGS. Each flag `-h` documents does what it says, and a
+# flag that takes a value refuses to run without one. -rt never parses
+# argv, so a flag wired to nothing passes every one of its tests; these
+# are the checks that would see it.
+# $1 = label, $2 = expected exit code, $3 = a grep -E pattern the output
+# (stdout + stderr) must match, $4.. = the arguments
+flag() {
+    label=$1 want_rc=$2 want=$3
+    shift 3
+    out=$("$BIN" "$@" 2>&1 < /dev/null)
+    r=$?
+    if [ "$r" = "$want_rc" ] && printf '%s' "$out" | grep -Eq -- "$want"
+    then
+        pass "$label"
+    else
+        fail "$label (exit $r, wanted $want_rc): $(printf '%s' "$out" |
+              head -c 300)"
+    fi
+}
+printf 'print(1 + 2);\n' > "$TMP/f3.my"
+flag "no arguments off a terminal: the usage" 0 '^Syntax:'
+flag "-h: the usage" 0 '^Syntax:' -h
+flag "--help: the usage" 0 '^Syntax:' --help
+flag "-e with no expression: the usage, exit 1" 1 '^Syntax:' -e
+flag "-t: the token dump" 0 "Tok\(id_\): 'print'" -t "$TMP/f3.my"
+flag "-bi: the bytecode inliner on" 0 '^3' -bi "$TMP/f3.my"
+flag "--no-opt needs a pass list" 1 'requires a pass list' --no-opt
+flag "--no-opt refuses an unknown pass after a known one" 1 \
+     "unknown --no-opt pass 'bogus'" --no-opt licm,bogus "$TMP/f3.my"
+flag "--no-opt takes empty list members" 0 '^3' \
+     --no-opt licm,,typed, "$TMP/f3.my"
+flag "-it needs a value" 1 'requires a value' -it
+flag "-o needs a path" 1 'requires an output path' -o
+flag "--source needs a root" 1 'requires a project-root path' --source
+flag "-vm then -tw: refused" 1 'mutually exclusive' -vm -tw "$TMP/f3.my"
+flag "-tw then -vm: refused" 1 'mutually exclusive' -tw -vm "$TMP/f3.my"
+flag "--trace needs a category list" 1 'requires a category list' -T
+printf 'var x = 3;\nprint(x + 1);\n' > "$TMP/tr.my"
+flag "--trace warns on an unknown category" 0 \
+     "unknown trace category 'bogus'" -T infer,bogus, "$TMP/tr.my"
+flag "--trace traces a known category to stderr" 0 \
+     'infer +var x : int' --trace infer "$TMP/tr.my"
+printf 'print(argv);\n' > "$TMP/av.my"
+flag "argv holds the script's own arguments" 0 '^\["x", "y z"\]' \
+     "$TMP/av.my" x "y z"
+
+# -it N is the inliner's size limit: at 0 nothing is inlined, so the
+# three calls the default inlines stay calls in the optimized tree.
+cat > "$TMP/it.my" <<'EOF'
+func f(int x) => x * 3 + 1;
+func g(int a) { return f(a) + f(a + 1); }
+print(g(int(runtime(2))));
+EOF
+calls() {
+    "$BIN" "$@" -s "$TMP/it.my" 2>&1 |
+        sed -n '/Optimized/,$p' | grep -c DirectCallExpr
+}
+c_def=$(calls); c_zero=$(calls -it 0)
+if [ "$c_def" = 0 ] && [ "$c_zero" = 3 ] &&
+   [ "$("$BIN" -it 0 "$TMP/it.my")" = "17 " ]; then
+    pass "-it 0: no call is inlined, the answer is the same"
+else
+    fail "-it: $c_def calls by default, $c_zero with -it 0"
+fi
+
+# --strict refuses a non-local read above its declaration, which a plain
+# run accepts (the read happens after the declaration has run).
+cat > "$TMP/st.my" <<'EOF'
+func f() { return later; }
+var later = 4;
+print(f());
+EOF
+flag "a forward read of a global runs without --strict" 0 '^4' \
+     "$TMP/st.my"
+flag "--strict refuses a forward read of a global" 1 \
+     "UseBeforeBindingEx: --strict: 'later' is used before" \
+     --strict "$TMP/st.my"
+
+# The source's last line has no newline, and a syntax error at the end
+# of the file carets the column after the last token.
+printf 'var x = 3;\nprint(x / runtime(0));' > "$TMP/nonl.my"
+flag "a file with no final newline: its last line is read" 1 \
+     'print\(x / runtime\(0\)\);' "$TMP/nonl.my"
+printf 'var x = 3 +' > "$TMP/eof.my"
+flag "a syntax error at the end of the file" 1 \
+     'line 1, col 12:12' "$TMP/eof.my"
+
+# -c with no -o writes the source's .myv twin: the extension replaced,
+# appended when there is none - and a dot in a DIRECTORY name is not an
+# extension.
+mkdir -p "$TMP/d.x"
+cp "$TMP/f3.my" "$TMP/tw.my"
+cp "$TMP/f3.my" "$TMP/d.x/prog"
+"$BIN" -c "$TMP/tw.my" >/dev/null 2>&1
+"$BIN" -c "$TMP/d.x/prog" >/dev/null 2>&1
+if [ -f "$TMP/tw.myv" ] && [ -f "$TMP/d.x/prog.myv" ] &&
+   [ ! -e "$TMP/d.myv" ] && [ "$("$BIN" "$TMP/tw.myv")" = "3 " ]; then
+    pass "-c with no -o: the source's .myv twin"
+else
+    fail "-c with no -o: $(ls "$TMP" "$TMP/d.x" | tr '\n' ' ')"
+fi
+flag "-c refuses an argument it does not know" 1 \
+     'unexpected argument after -c: extra' -c "$TMP/tw.my" extra
+flag "-vd of an image disassembles the loaded program" 0 \
+     '===== main' -vd "$TMP/tw.myv"
+
+# Where an image finds its source (README, *.myv*): the paths stored at
+# compile time, else --source ROOT; a source that changed since is
+# ignored with a warning unless -f; --strip-source stores no reference.
+mkdir -p "$TMP/proj/sub" "$TMP/none"
+printf 'var x = 3;\nprint(x / runtime(0));\n' > "$TMP/proj/sub/q.my"
+# compiled from the project root, so the stored root is $TMP/proj (BIN
+# may be a relative path: made absolute for the cd)
+abs_bin=$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")
+(cd "$TMP/proj" && "$abs_bin" -c sub/q.my -o ../q.myv &&
+     "$abs_bin" -c sub/q.my -o ../qs.myv --strip-source) >/dev/null 2>&1
+flag "an image renders its source line" 1 \
+     '^    print\(x / runtime\(0\)\);' "$TMP/q.myv"
+# the stored path holds the source here, so only --source can hide it
+out=$("$BIN" --source "$TMP/none" "$TMP/q.myv" 2>&1)
+if ! printf '%s' "$out" | grep -q 'print(x'; then
+    pass "--source ROOT is the only place looked in"
+else
+    fail "--source ROOT, the stored path present: $(printf '%s' "$out" |
+          head -c 300)"
+fi
+mv "$TMP/proj" "$TMP/moved"
+out=$("$BIN" "$TMP/q.myv" 2>&1)
+if printf '%s' "$out" | grep -q 'sub/q.my, line 2' &&
+   ! printf '%s' "$out" | grep -Eq 'warning|print\(x'; then
+    pass "an image whose source is gone: located, no source line"
+else
+    fail "an image whose source is gone: $(printf '%s' "$out" |
+          head -c 300)"
+fi
+flag "--source ROOT finds the moved source" 1 \
+     '^    print\(x / runtime\(0\)\);' --source "$TMP/moved" "$TMP/q.myv"
+printf 'var x = 3;\nprint(x / runtime(0)); # edited\n' > \
+    "$TMP/moved/sub/q.my"
+out=$("$BIN" --source "$TMP/moved" "$TMP/q.myv" 2>&1)
+if printf '%s' "$out" | grep -q 'has changed since .* ignoring it' &&
+   ! printf '%s' "$out" | grep -q edited; then
+    pass "a changed source is ignored, with a warning"
+else
+    fail "a changed source: $(printf '%s' "$out" | head -c 300)"
+fi
+flag "-f uses a changed source, with a warning" 1 \
+     'using it anyway \(-f\)' --source "$TMP/moved" -f "$TMP/q.myv"
+flag "--force: the long spelling" 1 '# edited' \
+     --source "$TMP/moved" --force "$TMP/q.myv"
+flag "--strip-source: an image with no source reference" 1 \
+     '^DivisionByZeroEx: Division by zero at line 2' "$TMP/qs.myv"
+
+# THE IMAGE ROUND TRIP OVER THE CORPUS. A loaded image's bytecode dump is
+# a fresh compile's (README *.myv*; -rt's myv_round_trip checks it for its
+# own programs): every functional program an image can hold is stored,
+# and the two -vd dumps must be the same, byte for byte. The JIT is off
+# (-nj): an image holds no native code, the load re-runs the tier. Its
+# first run found two loader gaps no hand-picked program had (a cycle of
+# scalar-result claims, a builtin value in a constant) and a dump-only
+# difference (the container plan asked without the load's JitCtx).
+rt_n=0 rt_bad=0
+for p in "$here"/functional/*.my; do
+    b=$(basename "$p" .my)
+    if ! "$BIN" -c "$p" -o "$TMP/rt.myv" > "$TMP/rt.c" 2>&1; then
+        # the one documented refusal: a constant holding a cycle
+        grep -q 'holds a reference cycle' "$TMP/rt.c" && continue
+        rt_bad=$((rt_bad + 1))
+        fail "image round trip: -c $b: $(head -c 200 "$TMP/rt.c")"
+        continue
+    fi
+    rt_n=$((rt_n + 1))
+    "$BIN" -nj -vd "$p" > "$TMP/rt.src" 2>&1
+    "$BIN" -nj -vd "$TMP/rt.myv" > "$TMP/rt.img" 2>&1
+    if ! cmp -s "$TMP/rt.src" "$TMP/rt.img"; then
+        rt_bad=$((rt_bad + 1))
+        fail "image round trip: $b: $(diff "$TMP/rt.src" "$TMP/rt.img" |
+              head -c 300)"
+    fi
+done
+if [ $rt_bad = 0 ] && [ $rt_n -ge 100 ]; then
+    pass "image round trip: $rt_n functional programs, -vd identical"
+elif [ $rt_bad = 0 ]; then
+    fail "image round trip: only $rt_n programs stored - vacuous"
+fi
+
 # THE REPL FRONT END - run_repl, which -rt's `repl:` cases never reach
 # (they drive ReplEngine directly). A session is fed on stdin, HOME
 # pointing at a scratch directory (the history file). Kept HERE rather
