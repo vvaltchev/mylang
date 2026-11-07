@@ -4,7 +4,9 @@
 # expected - a condition, arithmetic, a counted loop - must read it as
 # 0/1, as a flat bool array's element reads. It raised TypeErrorEx in
 # every engine, each with another caret (the tree-walker marked the
-# whole `if`, the JIT the element, -nj nothing at all).
+# whole `if`, the JIT the element, -nj nothing at all). And in a FLOAT
+# expression (`x * b[i]`) it is widened to 0.0/1.0 - the tree-walker
+# alone raised TypeErrorEx there, until 2026-11-07.
 
 func cond_count(array<bool> b) {
     var s = 0;
@@ -30,6 +32,13 @@ func walk_down(array<bool> b) {
     return s;
 }
 
+func scaled(float x, array<bool> b) {
+    var s = 0.0;
+    for (var i = 0; i < len(b); i++)
+        s += x * b[i];
+    return s + b[0] * 0.5 + b[len(b) - 1] * 0.25;
+}
+
 func gen_bools() {
     var d = {};
     d[true] = 1;
@@ -46,6 +55,9 @@ foreach (a in [flat, gen])
     print(cond_count(a), arith(a), walk_down(a));
 assert(cond_count(gen) == 3 && arith(gen) == 14 && walk_down(gen) == 13);
 assert(cond_count(gen) == cond_count(flat) && arith(gen) == arith(flat));
+print(scaled(float(runtime(1.5)), flat), scaled(float(runtime(1.5)), gen));
+assert(scaled(float(runtime(1.5)), gen) == 5.25);
+assert(scaled(float(runtime(1.5)), gen) == scaled(float(runtime(1.5)), flat));
 
 # keys() follows insertion order: [true, false]
 print(cond_count(keys(gen_bools())), arith(keys(gen_bools())));

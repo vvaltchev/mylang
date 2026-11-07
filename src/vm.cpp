@@ -4500,7 +4500,7 @@ vm_load_elem_float_core(const EvalValue &base, int_type idx,
         return arr.flat_floats()[at];
     if (arr.skind() == SharedArrayObj::Storage::ints)
         return static_cast<float_type>(arr.flat_ints()[at]);
-    return arr.get_vec()[at].getval<float_type>();
+    return general_elem_float(arr.get_vec()[at]);
 }
 
 /*

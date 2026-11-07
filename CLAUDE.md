@@ -5206,9 +5206,11 @@ must — a comparison/logical/`!` result, a bool literal — while arithmetic ov
 bools correctly yields int). `Construct`/`Identifier`/`Subscript`
 `eval_int`/`eval_float` read a bool value/slot/element as `0`/`1` - a
 GENERAL array's element too (`general_elem_int`, eval.h, which every
-engine's element-int read calls): an `array<bool>` is not always flat (an
-inline `keys()` of a `dict<bool, ...>`, `dynarray()`), and `if (b[i])` on
-a general one raised TypeErrorEx in every engine until 2026-11-07.
+engine's element-int read calls, and its float twin `general_elem_float`
+for a typed float chain's int or bool operand): an `array<bool>` is not
+always flat (an inline `keys()` of a `dict<bool, ...>`, `dynarray()`), and
+`if (b[i])` on a general one raised TypeErrorEx in every engine until
+2026-11-07 (`x * b[i]` in the tree-walker alone).
 **⛔ SO `th == i` DOES NOT MEAN "int" - IT ALSO MEANS BOOL, AND A
 CONSUMER THAT NEEDS THE VALUE MUST ASK (`Construct::th_bool`, added
 2026-08-26).** The VM lost that distinction for four shapes:

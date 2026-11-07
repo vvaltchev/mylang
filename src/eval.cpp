@@ -7498,10 +7498,7 @@ float_type Subscript::eval_float(EvalContext *ctx) const
             return static_cast<float_type>(arr.flat_ints()[at]);
         if (arr.skind() == SharedArrayObj::Storage::bools)
             return arr.flat_bools()[at] ? 1.0 : 0.0;
-        const LValue &el = arr.get_vec()[at];
-        if (el.is<int_type>())
-            return static_cast<float_type>(el.getval<int_type>());
-        return el.getval<float_type>();
+        return general_elem_float(arr.get_vec()[at]);
     }
     if (base.is<intrusive_ptr<DictObject>>()) {
         const EvalValue key = RValue(index->eval(ctx));
