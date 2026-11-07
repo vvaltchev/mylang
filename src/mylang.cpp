@@ -567,7 +567,7 @@ parse_args(int argc, char **argv)
             opt_vm = true;   /* explicit VM - the default; kept for scripts/
                               * CI written before the 2026-07-18 flip */
 
-            if (opt_vm && opt_tw) {
+            if (opt_tw) {
                 cout << "-vm and -tw are mutually exclusive" << endl;
                 exit(1);
             }
@@ -597,7 +597,7 @@ parse_args(int argc, char **argv)
             opt_tw = true;   /* run via the tree-walker (the pre-flip
                               * default; also the const-eval/REPL engine) */
 
-            if (opt_vm && opt_tw) {
+            if (opt_vm) {
                 cout << "-vm and -tw are mutually exclusive" << endl;
                 exit(1);
             }
@@ -639,7 +639,7 @@ parse_args(int argc, char **argv)
             const string cats = argv[1];
             argc--; argv++;   /* consume the value */
             size_t pos = 0;
-            while (pos <= cats.size()) {
+            for (;;) {
                 const size_t comma = cats.find(',', pos);
                 const size_t end =
                     (comma == string::npos) ? cats.size() : comma;

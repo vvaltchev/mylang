@@ -1345,6 +1345,8 @@ flag "--trace warns on an unknown category" 0 \
      "unknown trace category 'bogus'" -T infer,bogus, "$TMP/tr.my"
 flag "--trace traces a known category to stderr" 0 \
      'infer +var x : int' --trace infer "$TMP/tr.my"
+flag "--analyze: the long spelling, plain under --no-color" 0 \
+     '^print\(1 \+ 2\);$' --analyze --no-color "$TMP/f3.my"
 # -a (--analyze) prints the source colored by what the optimizers did,
 # and --trace fold narrates the folds. Here AutoConst's work INSIDE a
 # function body (a top-level name is never auto-const): the dead arm of
@@ -1594,6 +1596,14 @@ flag "--force: the long spelling" 1 '# edited' \
      --source "$TMP/moved" --force "$TMP/q.myv"
 flag "--strip-source: an image with no source reference" 1 \
      '^DivisionByZeroEx: Division by zero at line 2' "$TMP/qs.myv"
+# -o and --strip-source may come BEFORE the file too, and a -o left with
+# no path after the file is refused
+(cd "$TMP/moved" && "$abs_bin" -o ../qp.myv --strip-source -c sub/q.my) \
+    >/dev/null 2>&1
+flag "-o and --strip-source before the file" 1 \
+     '^DivisionByZeroEx: Division by zero at line 2' "$TMP/qp.myv"
+flag "-c FILE -o with no path: refused" 1 \
+     'unexpected argument after -c: -o' -c "$TMP/f3.my" -o
 
 # THE IMAGE ROUND TRIP OVER THE CORPUS. A loaded image's bytecode dump is
 # a fresh compile's (README *.myv*; -rt's myv_round_trip checks it for its
