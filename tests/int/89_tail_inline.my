@@ -1,0 +1,50 @@
+# INT-ENGINES: tw default nj ni noopt
+#
+# INT unit (#107): the AST inliner's TAIL-call form - `return g(args);`
+# replaced by g's body, whose returns become the caller's
+# (Inliner::try_inline_tail) - and each reason it declines: the call's
+# argument count differs (an omitted `opt` parameter), g's body can reach
+# its end, g reassigns a parameter, a parameter's bind converts its
+# argument, g writes a field of a struct parameter, and the callee is not
+# a name. Whichever form runs, every engine and `ni` (no inlining) must
+# print what the tree-walker prints.
+
+struct P { int x; }
+var out = [];
+func note(str what, opt dyn v) { append(out, what + "=" + str(v)); }
+
+func plain(int x) { var t = x * 2; return t + 1; }
+func t_plain(int x) { return plain(x); }
+
+func opt_tail(int x, opt int y) {
+    var t = x;
+    if (y == none) return t;
+    return t + y;
+}
+func t_opt(int x) { return opt_tail(x); }
+
+func falls(int x) { if (x > 0) { return x; } }
+func t_falls(int x) { return falls(x); }
+
+func reassigns(int x) { x = x + 5; return x; }
+func t_reassigns(int x) { return reassigns(x); }
+
+func widens(float f) { var t = f / 2; return t; }
+func t_widens(int x) { return widens(x); }
+
+func writes(P p) { p.x = 9; return p.x; }
+func t_writes(P p) { return writes(p); }
+
+var ops = [plain];
+func t_value(int x) { return ops[0](x); }
+
+note("plain", t_plain(int(runtime(4))));
+note("opt", t_opt(int(runtime(4))));
+note("falls", t_falls(int(runtime(-1))));
+note("reassigns", t_reassigns(int(runtime(4))));
+note("widens", t_widens(int(runtime(5))));
+var q = P(int(runtime(1)));
+note("writes", t_writes(q));
+note("unchanged", q.x);
+note("value", t_value(int(runtime(4))));
+print(join(out, " "));

@@ -99,29 +99,46 @@ infer      var fl : array<float>  (final)
 arrays     fl  dest array<float> -> flat (floats)
 inline     rec_unroll_depth fib w0=278 branching=8 -> 0 level(s)
 => [1.500000, 2.500000]
->>   infer      vops  ? -> array<func(?)->?>
-template   value-instantiate vi1(int) -> vi1$0
-template   value-instantiate vi2(int) -> vi2$0
+>>   infer      vo  ? -> array<func(?)->?>
+template   value-instantiate v1(int) -> v1$0
+template   value-instantiate v2(int) -> v2$0
   infer      x  ? -> int
   infer      x  ? -> int
-  infer      vops  array<func(?)->?> -> array<func(int)->?>
-  infer      func vi1$0 returns ? -> int
-  infer      func vi2$0 returns ? -> int
-  infer      vops  array<func(int)->?> -> array<func(int)->int>
-infer      var vops : array<func(int)->int>  (final)
+  infer      vo  array<func(?)->?> -> array<func(int)->?>
+  infer      func v1$0 returns ? -> int
+  infer      func v2$0 returns ? -> int
+  infer      vo  array<func(int)->?> -> array<func(int)->int>
+infer      var vo : array<func(int)->int>  (final)
 infer      param x : int  (final)
 infer      param x : int  (final)
-infer      func vi1(x)  template (instantiated per call)
-infer      func vi2(x)  template (instantiated per call)
-infer      func vi1$0(x: int) -> int  (final)
-infer      func vi2$0(x: int) -> int  (final)
-arrays     vops  dest array<func(int)->int> -> general
-autopure   vi2$0  reads only consts/params -> effective pure
-autopure   vi1$0  reads only consts/params -> effective pure
-autopure   vi1  reads only consts/params -> effective pure
-autopure   vi2  reads only consts/params -> effective pure
+infer      func v1(x)  template (instantiated per call)
+infer      func v2(x)  template (instantiated per call)
+infer      func v1$0(x: int) -> int  (final)
+infer      func v2$0(x: int) -> int  (final)
+arrays     vo  dest array<func(int)->int> -> general
+autopure   v2$0  reads only consts/params -> effective pure
+autopure   v1$0  reads only consts/params -> effective pure
+autopure   v1  reads only consts/params -> effective pure
+autopure   v2  reads only consts/params -> effective pure
 inline     rec_unroll_depth fib w0=278 branching=8 -> 0 level(s)
 => 10
+>>   infer      a  ? -> int
+  infer      t  ? -> int
+  infer      func g2 returns ? -> int
+infer      param a : int  (final)
+infer      var t : int  (final)
+infer      func g2(a: int) -> int  (final)
+autopure   g2  reads only consts/params -> effective pure
+inline     rec_unroll_depth fib w0=278 branching=8 -> 0 level(s)
+>>   infer      a  ? -> int
+  infer      func h2 returns ? -> int
+infer      param a : int  (final)
+infer      func h2(a: int) -> int  (final)
+autopure   h2  reads only consts/params -> effective pure
+inline     rec_unroll_depth fib w0=278 branching=8 -> 0 level(s)
+inline     g2  tail call -> splice (+1 local slot(s))
+>> inline     rec_unroll_depth fib w0=278 branching=8 -> 0 level(s)
+=> 8
 >> tracing: off
 >> => 36
 >> 

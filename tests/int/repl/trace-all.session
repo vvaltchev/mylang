@@ -32,6 +32,9 @@ func spec(int a, int b) {
 spec(runtime(4), 3)
 var arr = [1, 2, 3]
 var fl = [1.5, 2.5]
-func vi1(x) => x + 1; func vi2(x) => x * 2; var vops = [vi1, vi2]; vops[runtime(1)](5)
+func v1(x) => x + 1; func v2(x) => x * 2; var vo = [v1, v2]; vo[runtime(1)](5)
+func g2(int a) { var t = a + 1; return t * 2; }
+func h2(int a) { return g2(a); }
+h2(runtime(3))
 :trace all off
 use(4)
