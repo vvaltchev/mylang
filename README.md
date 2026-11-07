@@ -1625,6 +1625,11 @@ slot = "now a string";           # ok, because it's dyn
     value) is such a `dyn` too: `var y = x; if (c) { y = 1; }` keeps `y` an
     `int` and checks `x` when it is stored.
 
+    So is a call to a function whose returns mix a `dyn` with another type -
+    `func big(dyn v) { if (v < 9) return v * 2; return "s"; }` returns
+    `dyn` - so `var k = 5; k = big(x);` keeps `k` an `int`, and
+    `array<int> a = map(big, xs);` checks each element when it is stored.
+
     But a **fresh** `var` whose only source is `int + dyn` *is* `dyn`, so it
     must say so: `var r = 3 + d;` is an error (declare `var dyn r`), whereas
     `var dyn r = 3 + d;` holds the actual result (int/float/…). Arithmetic can't

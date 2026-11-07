@@ -6336,6 +6336,28 @@ static const std::vector<test> tests =
     { "int(x) is the explicit narrowing cast for a dyn arithmetic operand",
       { "func acc(x) { var s = 0; s = s + int(x); return s; }",
         "assert(acc(runtime(2.5)) == 2);" } },
+    /* A CONFLICT IN A FIXPOINT ROUND IS NOT YET AN ERROR (2026-11-07).
+     * `big` returns `str` after round 1 (`v * 2` waits for v) and `dyn`
+     * after round 2; the destinations below were checked against the
+     * round-1 `str` and refused, naming a type the call never has. Only a
+     * conflict the converged round still has is an error. */
+    { "infer: a dyn result coerces though the callee's type passed str",
+      { "func big(dyn v) { if (v < 100) return v * 2; return \"big\"; }",
+        "var k = 5; k = big(runtime(3)); assert(k == 6);",
+        "var j = big(runtime(4)); j = 1; assert(j == 1);",
+        "array<int> a = map(big, [1, 2]); assert(a == [2, 4]);",
+        "array<int> b = [big(runtime(5))]; assert(b == [10]);" } },
+    { "infer: a dyn result into a declared int is the dyn refusal",
+      { "func big(dyn v) { if (v < 100) return v * 2; return \"big\"; }",
+        "int k = big(runtime(3));" }, &typeid(TypeMismatchEx) },
+    { "infer: a conflict the fixpoint keeps is still refused",
+      { "func big(dyn v) { if (v < 100) return v * 2; return \"big\"; }",
+        "func s(int n) { return str(n); }",
+        "var k = 5; k = big(runtime(3)); k = s(2);" },
+      &typeid(TypeMismatchEx) },
+    { "infer: a coerced dyn misfit raises at run time",
+      { "func big(dyn v) { if (v < 100) return v * 2; return \"big\"; }",
+        "var k = 5; k = big(runtime(300));" }, &typeid(TypeErrorEx) },
     /* #60 lever 2: the boxed BinOpV/CompoundV/CmpV int-int fast path
      * (vm_num_binop). runtime() defeats folding so the ops run boxed on a dyn
      * operand; the differential pins the fast path == the tree-walker's PMF
