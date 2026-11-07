@@ -3114,21 +3114,22 @@ struct Codegen {
          * a compound StoreGlobalV/StoreCaptureV (x += 1 / x -= 1). A LOCAL
          * inc-dec is handled earlier (compile_int/float_stmt); a subscript one
          * in the store codegen; a global/capture id reaches here. A typed
-         * operand falls back. */
+         * operand with a numeric proof falls back. */
         if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
             const Identifier *id =
                 dynamic_cast<const Identifier *>(inc->lvalue.get());
-            if (id
-                && (id->decl_type == DeclType::none
-                    || id->decl_type == DeclType::dyn)) {
+            if (id) {
                 const bool numeric = inc->th == TypeHint::i
                                   || inc->th == TypeHint::f;
+                const bool untyped_decl = id->decl_type == DeclType::none
+                                       || id->decl_type == DeclType::dyn;
                 /* A PROVEN int/float global/capture -> StoreGlobalV/StoreCaptureV
                  * compound (`x += 1`; the operand is numeric so `+` == inc-dec).
                  * A proven int/float LOCAL was handled by compile_int/float_stmt
                  * (IntBin/FloatBin) before this. */
-                if (numeric && (id->sym.kind == SymKind::global
-                                || id->sym.kind == SymKind::capture)) {
+                if (numeric && untyped_decl
+                    && (id->sym.kind == SymKind::global
+                        || id->sym.kind == SymKind::capture)) {
                     /* H1b: a PROVEN capture `cap++`/`cap--` recomposes
                      * into read + IntBin + a plain (inline-emitted) store,
                      * off the compound helper call. */
@@ -3155,7 +3156,14 @@ struct Codegen {
                 }
                 /* A DYN/general scalar (local/global/capture) -> the int/float-
                  * CHECKED inc-dec: a compound `+= 1` would CONCAT a string, but
-                 * `d++` must THROW (inc-dec is int/float-only). */
+                 * `d++` must THROW (inc-dec is int/float-only). Whatever the
+                 * DECLARED type: with no numeric proof that is a variable
+                 * under -nti (`int n; n++`), which no other path lowered - a
+                 * NotLoweredEx compile refusal of a program the tree-walker
+                 * runs. A declared int/float variable holds its kind (every
+                 * store converts to it), and inc-dec keeps the kind, so the
+                 * value needs no conversion; any other declared type is the
+                 * TypeErrorEx this op raises. */
                 if (!numeric) {
                     int kind;
                     switch (id->sym.kind) {
