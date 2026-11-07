@@ -2785,6 +2785,26 @@ void vm_jit_loaded_image(VmProgram &prog)
         jit_chunk_frameless_derive(ck);          /* W3, small-60 */
     });
 
+    const std::vector<const FuncDescriptor *> slot_desc =
+        vm_image_slot_desc(prog);
+    std::vector<std::pair<Chunk *, const FuncDescriptor *>> bodies;
+    for_each_chunk([&](Chunk &ck, const FuncDescriptor *desc) {
+        bodies.push_back({ &ck, desc });
+    });
+    /* the ONE driver (vm.h): a loaded image's main must emit the native
+     * code a fresh compile's does - that is the whole point of re-running
+     * the tier here, and it holds by construction only while both run
+     * the same function. */
+    vm_jit_program(&prog.root, bodies, slot_desc,
+                   prog.global_slot_reassigned);
+}
+
+/* Declared in vm.h: a loaded image's global slot -> the function a slot
+ * names, by NAME (an image stores no pointer). The load's JIT and the
+ * image's -vd dump both read it, so the dump's container plan asks the
+ * question the JIT asked. */
+std::vector<const FuncDescriptor *> vm_image_slot_desc(const VmProgram &prog)
+{
     std::vector<const FuncDescriptor *> slot_desc(
         prog.global_func_names.size(), nullptr);
     for (size_t s = 0; s < prog.global_func_names.size(); s++) {
@@ -2797,16 +2817,7 @@ void vm_jit_loaded_image(VmProgram &prog)
                 break;
             }
     }
-    std::vector<std::pair<Chunk *, const FuncDescriptor *>> bodies;
-    for_each_chunk([&](Chunk &ck, const FuncDescriptor *desc) {
-        bodies.push_back({ &ck, desc });
-    });
-    /* the ONE driver (vm.h): a loaded image's main must emit the native
-     * code a fresh compile's does - that is the whole point of re-running
-     * the tier here, and it holds by construction only while both run
-     * the same function. */
-    vm_jit_program(&prog.root, bodies, slot_desc,
-                   prog.global_slot_reassigned);
+    return slot_desc;
 }
 
 /* Declared in vm.h - see the contract there. */
