@@ -5660,9 +5660,7 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     if (n == "float" || n == "exp" || n == "log" || n == "sqrt" ||
         n == "cbrt" || n == "pow" || n == "sin" || n == "cos" || n == "tan" ||
         n == "asin" || n == "acos" || n == "atan" || n == "ceil" ||
-        n == "floor" || n == "trunc" || n == "round" || n == "randf" ||
-        n == "math_e" || n == "math_pi" || n == "nan" || n == "inf" ||
-        n == "eps")
+        n == "floor" || n == "trunc" || n == "round" || n == "randf")
         return A.float_ty();
 
     if (n == "int")    return A.int_ty();
@@ -5873,9 +5871,6 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
             return A.with_opt(A.int_ty(), true);
         return A.with_opt(A.dyn_ty(), true);
     }
-
-    if (n == "exception" || n == "ex")
-        return A.exc_ty();
 
     /* The in-place builtins return what they worked on - append / push
      * the array - or whether they did - insert / erase a bool (false: a

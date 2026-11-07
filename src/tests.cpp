@@ -1045,6 +1045,13 @@ static const std::vector<test> tests =
     { "err loc: a generic container annotation's mismatch marks the name",
       { "func g() { array arr2 = {}; }" },
       &typeid(TypeMismatchEx), 18, 1, 23, 1 },
+    /* A builtin CONSTANT (math_e, nan, inf, eps) is a value: a call to one
+     * with a run-time argument is the check pass's "not callable", marking
+     * the callee (the call typing listed them among the float-returning
+     * functions until 2026-11-12, an entry no accepted program reached). */
+    { "err loc: a call to a builtin constant is not callable",
+      { "var dyn r = math_e(runtime(1));" },
+      &typeid(TypeMismatchEx), 13, 1, 20, 1 },
     { "parse: an arrow function with no body is a syntax error",
       { "var f = func() => ;" },
       &typeid(SyntaxErrorEx), 19, 1 },
