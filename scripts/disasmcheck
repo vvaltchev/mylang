@@ -122,8 +122,11 @@ def frags(binary, path, env, raw=False):
         e['MYLANG_VDJ_RAW'] = '1'
     else:
         e.pop('MYLANG_VDJ_RAW', None)
+    # errors=surrogateescape: a MyLang string is 8-bit, and -vdj prints a
+    # string constant's bytes as they are (chr(160) is 0xA0, not UTF-8) -
+    # a strict decode crashed the whole check on such a program
     r = subprocess.run([binary, '-vdj', path], capture_output=True,
-                       text=True, env=e)
+                       text=True, errors='surrogateescape', env=e)
     if r.returncode != 0:
         return None
     out, cur = [], []
@@ -150,7 +153,8 @@ def objdump_lens(blob):
         r = subprocess.run(['objdump', '-D', '-b', 'binary',
                             '-m', 'i386:x86-64', '-M', 'intel',
                             '-w', '--insn-width=16', name],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True,
+                           errors='surrogateescape')
     finally:
         os.unlink(name)
     #

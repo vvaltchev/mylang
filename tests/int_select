@@ -185,7 +185,8 @@ class Explorer:
         t0 = time.time()
         try:
             p = subprocess.run(cand.argv(self.binary, prog),
-                               capture_output=True, text=True, env=env,
+                               capture_output=True, text=True,
+                               errors="surrogateescape", env=env,
                                timeout=self.timeout,
                                stdin=subprocess.DEVNULL)
             rc, stdout = p.returncode, p.stdout

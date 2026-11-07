@@ -183,7 +183,8 @@ def main():
                            cwd=os.path.dirname(os.path.abspath(prog)))
         if c.returncode != 0:
             results.append((".myv compile", (c.returncode, "",
-                                             c.stderr.decode())))
+                                             c.stderr.decode(
+                                                 errors="replace"))))
         else:
             results.append((".myv", run(binary, img, [], {})))
             os.unlink(img)
