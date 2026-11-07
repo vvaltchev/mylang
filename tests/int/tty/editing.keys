@@ -1,0 +1,20 @@
+# The line editor on a terminal (tests/int_run, TERMINAL SESSIONS): each
+# line is ONE input, typed once the REPL waits for a key. `\r` is Enter.
+#
+# a plain input: the syntax colour and the ghost suggestion as it is typed
+var x = 41\r
+# the up arrow recalls it; Ctrl-A goes home, Ctrl-K kills the line
+\x1b[A\x01\x0bprint(x + 1)\r
+# Enter on an incomplete line opens the next one, indented
+func f(a) {\rreturn a * 2;\r}\r
+f(21)\r
+# Tab completes a name
+pri\t(f(1))\r
+# Ctrl-C drops the input
+abc\x03
+# Ctrl-R: the search pane; typing narrows it, Enter loads the match
+\x12var\r
+# ... and Enter runs it
+\r
+# Ctrl-D at an empty prompt ends the session
+\x04

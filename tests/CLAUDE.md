@@ -238,6 +238,22 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   coverage UNIT, so it must own an element (below): a front-end
   regression check over paths other units already reach (`:quit ` with a
   trailing space) goes in tests/driver_checks (`repl_run`) instead.
+- tests/int/tty/NAME.keys + NAME.expected: a TERMINAL session - the
+  line editor in raw mode (repaint, colour, the ghost suggestion,
+  completion, the Ctrl-R pane, bracketed paste), which no other unit
+  reaches. Each line of the .keys file is ONE input in Python
+  string-literal escapes (`\r` Enter, `\x1b[A` up, `\x12` Ctrl-R; `#`
+  lines are comments), typed on a 24x80 pseudo-terminal
+  (intcov.run_tty) once the REPL has READ the previous line
+  (/proc/PID/io's rchar) and waits in raw mode, blocked in read(0)
+  (/proc/PID/syscall). Never two inputs on one line: the editor flushes
+  typed-ahead input as it enters and leaves raw mode. What the terminal
+  shows must equal NAME.expected byte for byte (HOME fresh, TERM=xterm,
+  LC_ALL=C, colour on) - a function of the bytes typed, so it repeats
+  on every run and build; `--update-repl` rewrites it, and the file
+  holds \r, so it is opened with newline="". Linux only (/proc). A lone
+  ESC is the one input that is timing-dependent (the Ctrl-R pane waits
+  40 ms for a sequence): use Ctrl-G to cancel instead.
 - VALUE CLASSES (src/intsites.h, ML_INT_VCLASSES): declared operation
   boundaries, counted at the operation (`vc <class> <hits>` lines in the
   MYLANG_INT_OUT census). A class no run exercises fails int_run; with

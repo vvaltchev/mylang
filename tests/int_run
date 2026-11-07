@@ -65,6 +65,7 @@
 # program fuzzers never run an INT binary (plan section 7).
 
 import argparse
+import codecs
 import glob
 import gzip
 import json
@@ -76,12 +77,13 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = ["<script>"]       # a unit command that is a script, not a flag list
+TTY = ["<tty>"]             # a unit typed on a pseudo-terminal (tests/int/tty)
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(HERE, "lib"))
 from testrun import Monitor  # noqa: E402
 from intcov import (CENSUS_SAMPLES, PROBE_LINE, build_config,  # noqa: E402
                     collect, engine_flags, gcov_tool, int_configs, int_header,
-                    int_engines, run, vdj_mask)
+                    int_engines, run, run_tty, vdj_mask)
 
 
 def main():
@@ -148,6 +150,32 @@ def main():
             text = f.read()
         units.append((os.path.relpath(sess, ROOT),
                       [[(["--repl"], {}, (text, sess[:-8] + ".expected"))]]))
+    # TERMINAL SESSIONS (tests/int/tty/*.keys): the line editor ON a
+    # terminal - raw mode, the repaint, syntax colour, the ghost
+    # suggestion, completion, the Ctrl-R pane, bracketed paste - which
+    # every other unit reaches only off a TTY. Each line of a .keys file
+    # is ONE input, in Python string-literal escapes (`\r` is Enter,
+    # `\x1b[A` the up arrow); it is typed on a 24x80 pseudo-terminal once
+    # the REPL has read the line before it and waits in raw mode again
+    # (intcov.run_tty), and everything the terminal shows must equal
+    # NAME.expected byte for byte - the output is a function of the bytes
+    # typed, so it is the same on every run and every build. Linux only:
+    # the waiting test reads /proc.
+    for keys in sorted(glob.glob(os.path.join(HERE, "int", "tty",
+                                              "*.keys"))):
+        if not sys.platform.startswith("linux"):
+            print("int_run: %s skipped (a terminal session needs Linux's "
+                  "/proc)" % os.path.relpath(keys, ROOT))
+            continue
+        chunks = []
+        with open(keys, encoding="latin-1") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if line and not line.startswith("#"):
+                    chunks.append(codecs.decode(line, "unicode_escape")
+                                  .encode("latin-1"))
+        units.append((os.path.relpath(keys, ROOT),
+                      [[(TTY, {}, (chunks, keys[:-5] + ".expected"))]]))
     # THE DRIVER UNIT: tests/driver_checks runs the binary under the CLI
     # flags -rt cannot reach (it runs in-process, past mylang.cpp's
     # argument handling): -nr, -vd/-vdj, -c and a .myv load, -dti, -a, the
@@ -237,6 +265,17 @@ def main():
                         results.append(run([repl, binary], dict(env, **extra),
                                            args.timeout))
                         continue
+                    if c is TTY:
+                        # a fresh HOME (no history), ASCII borders, colour
+                        # on: what a terminal session needs to repeat
+                        home = tempfile.mkdtemp(dir=tmp)
+                        tenv = {k: v for k, v in env.items()
+                                if k not in ("NO_COLOR", "COLUMNS", "LINES",
+                                             "LANG", "LANGUAGE")}
+                        tenv.update(HOME=home, TERM="xterm", LC_ALL="C")
+                        results.append(run_tty([binary], tenv, repl[0],
+                                               args.timeout))
+                        continue
                     if repl:
                         # the REPL retains its inputs' programs, like -rt:
                         # no object census; a fresh HOME per session
@@ -256,12 +295,14 @@ def main():
                     if not repl or c is SCRIPT:
                         continue
                     if args.update_repl:
-                        with open(repl[1], "w",
+                        with open(repl[1], "w", newline="",
                                   errors="surrogateescape") as f:
                             f.write(r[1])
                     want = None
                     if os.path.exists(repl[1]):
-                        with open(repl[1], errors="surrogateescape") as f:
+                        # newline="": a terminal's output holds \r
+                        with open(repl[1], newline="",
+                                  errors="surrogateescape") as f:
                             want = f.read()
                     if want is None:
                         ok = False

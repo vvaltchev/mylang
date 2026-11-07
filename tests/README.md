@@ -487,6 +487,7 @@ Adding a test
 | a backtrace or caret                 | tests/backtrace/NAME.my       |
 | a compiler decision, under INT hooks | tests/int/NN_NAME.my          |
 | a REPL session                       | tests/int/repl/NAME.session   |
+| the line editor on a terminal        | tests/int/tty/NAME.keys       |
 | a command-line flag                  | tests/driver_checks           |
 
 A new tool also gets a line in tests/run's catalog (the catalog() function
@@ -502,6 +503,12 @@ A REPL session is the text you would type, one input per line, ending with
     $ tests/int_run build-tests/int-rel/mylang --update-repl
 
 and read it before committing: that file is the assertion.
+
+A terminal session is the keys you would press, one input per line, in
+Python string escapes (\r is Enter, \x1b[A the up arrow), ending with
+\x04 (Ctrl-D). int_run types each line on a pseudo-terminal once the REPL
+waits for a key, and compares everything the terminal showed with
+NAME.expected, written the same way (--update-repl). Linux only.
 
 Before trusting a new test, break the code it tests on purpose and watch
 the test fail. A test that passes either way checks nothing.

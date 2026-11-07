@@ -76,6 +76,105 @@ def run(cmd, env, timeout, stdin=None):
     return p.returncode, p.stdout, p.stderr
 
 
+def tty_waiting(pid, slave):
+    """The program on the terminal waits for a keystroke: the line editor's
+    raw mode is on, nothing typed is still queued, and the process is
+    blocked in read(0). (A process asleep in a WRITE - the terminal's
+    buffer momentarily full - is not waiting: input sent then could be
+    discarded by the TCSAFLUSH that leaves raw mode after a submitted
+    line. /proc/PID/syscall tells the two apart; Linux only.)"""
+    import fcntl
+    import struct
+    import termios
+    try:
+        if termios.tcgetattr(slave)[3] & termios.ICANON:
+            return False
+        queued = struct.unpack(
+            "i", fcntl.ioctl(slave, termios.FIONREAD, b"\0\0\0\0"))[0]
+        if queued:
+            return False
+        with open("/proc/%d/syscall" % pid) as f:
+            sc = f.read().split()
+    except (OSError, termios.error):
+        return False
+    return len(sc) > 1 and sc[0] == "0" and int(sc[1], 16) == 0
+
+
+def tty_read_count(pid):
+    """Bytes the process has read so far (/proc/PID/io's rchar) - the only
+    way to know it CONSUMED what was typed: a pty delivers the bytes
+    written to the master to the slave's queue asynchronously, so an empty
+    queue right after a write does not mean they were read."""
+    try:
+        with open("/proc/%d/io" % pid) as f:
+            for line in f:
+                if line.startswith("rchar:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return -1
+
+
+def run_tty(cmd, env, chunks, timeout, rows=24, cols=80):
+    """Run `cmd` on a pseudo-terminal of `rows` x `cols`, typing each of
+    `chunks` (bytes) only once the program has read the previous one
+    (tty_read_count) and waits for a keystroke again (tty_waiting),
+    draining its output all the while. One chunk must
+    be ONE input: the line editor flushes typed-ahead input when it
+    enters and leaves raw mode. Returns (rc, output, "") - a terminal
+    merges stdout and stderr - with rc -1 when it did not finish in
+    `timeout` seconds."""
+    import fcntl
+    import pty
+    import select
+    import struct
+    import termios
+    import time
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ,
+                struct.pack("HHHH", rows, cols, 0, 0))
+    p = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave,
+                         env=env, start_new_session=True)
+    out = bytearray()
+    deadline = time.time() + timeout
+
+    def drain(wait):
+        r = select.select([master], [], [], wait)[0]
+        if not r:
+            return False
+        try:
+            data = os.read(master, 65536)
+        except OSError:                 # EIO: the program closed it
+            return False
+        out.extend(data)
+        return bool(data)
+
+    try:
+        want = 0                        # rchar once the last chunk is read
+        for chunk in chunks:
+            while (tty_read_count(p.pid) < want
+                   or not tty_waiting(p.pid, slave)):
+                if p.poll() is not None or time.time() > deadline:
+                    break
+                drain(0.01)
+            if p.poll() is not None or time.time() > deadline:
+                break
+            want = tty_read_count(p.pid) + len(chunk)
+            os.write(master, chunk)
+        while p.poll() is None and time.time() < deadline:
+            drain(0.05)
+        while drain(0.05):
+            pass
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+            return -1, out.decode("utf-8", "surrogateescape"), ""
+        return p.returncode, out.decode("utf-8", "surrogateescape"), ""
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
 # ------------------------------------------------------------- coverage --
 
 INT_SPAN = re.compile(r"\bML_INT(_ONLY)?\s*\(")
