@@ -519,17 +519,17 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
         /*
          * #97 CB3: a destination PROVEN array<int>/<float>/<bool> (the
          * flat_hint - see map_filter_flat_hint) gets a FLAT result, built
-         * optimistically like make_array's: while every element is the
-         * hinted scalar it goes to the flat vector; the first one that is
-         * not spills to the general vector and the rest go there. A flat
-         * result is what lets a following map/filter/sort hand ITS
-         * callback raw elements (CB1/CB2). Never in a const-eval context,
-         * whose general elements carry the const flag.
+         * as the flat vector of that scalar. A flat result is what lets
+         * a following map/filter/sort hand ITS callback raw elements
+         * (CB1/CB2). Never in a const-eval context, whose general
+         * elements carry the const flag.
          */
-        int fmode = ctx->const_ctx ? 0 : flat_hint;
+        const int fmode = ctx->const_ctx ? 0 : flat_hint;
         /* ...and every element HAS the hinted type: a `dyn` callback's
          * bool widens and a misfit raises (flat_hint_value) - it spilled
-         * the array to general, a string in an array<int> (RULE 1) */
+         * the array to general, a string in an array<int> (RULE 1). So a
+         * value past flat_hint_value is the hinted kind, and nothing
+         * spills any more. */
         const ArrHint fit = fmode == 1 ? ArrHint::flat_i
                           : fmode == 2 ? ArrHint::flat_f
                           : fmode == 3 ? ArrHint::flat_b
@@ -539,31 +539,14 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
         SharedArrayObj::bvec_type fb;
         auto push_res = [&](EvalValue &&v0) {
             EvalValue v = flat_hint_value(v0, fit);
-            if (fmode == 1 && v.is<int_type>()) {
+            if (fmode == 1)
                 fi.push_back(v.get<int_type>());
-                return;
-            }
-            if (fmode == 2 && v.is<float_type>()) {
+            else if (fmode == 2)
                 ff.push_back(v.get<float_type>());
-                return;
-            }
-            if (fmode == 3 && v.is<bool>()) {
+            else if (fmode == 3)
                 fb.push_back(v.get<bool>() ? 1 : 0);
-                return;
-            }
-            if (fmode != 0) {            /* spill what is flat so far */
-                for (int_type x : fi)
-                    result.emplace_back(EvalValue(x), ctx->const_ctx);
-                for (float_type x : ff)
-                    result.emplace_back(EvalValue(x), ctx->const_ctx);
-                for (unsigned char x : fb)
-                    result.emplace_back(EvalValue(x != 0), ctx->const_ctx);
-                fi.clear();
-                ff.clear();
-                fb.clear();
-                fmode = 0;
-            }
-            result.emplace_back(std::move(v), ctx->const_ctx);
+            else
+                result.emplace_back(std::move(v), ctx->const_ctx);
         };
 
         /* #49: the size is re-read per step - the callback is arbitrary

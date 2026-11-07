@@ -152,22 +152,12 @@ EvalValue builtin_join(EvalContext *ctx, const ArgLocs *exprList,
         return SharedStr(std::move(result));
     }
 
-    /* A FLAT (int/float/bool/struct) array: read kind-aware (arr_elem_at, no
-     * promotion) - its elements aren't strings, so each one is a clean
-     * TypeError below (an EMPTY flat array joins to ""). */
-    for (size_type i = 0; i < n; i++) {
-
-        const EvalValue val = arr_elem_at(arr, i);
-
-        if (!val.is<SharedStr>())
-            throw TypeErrorEx("Expected string", arg_arr->start, arg_arr->end);
-
-        result += val.get<SharedStr>().get_view();
-
-        if (i != n - 1)
-            result += delim;
-    }
-
+    /* Any other storage - a FLAT int/float/bool/struct/class array - holds
+     * no string: an EMPTY one joins to "", any other is the type error (it
+     * read each element to find that out, through an append no element
+     * could ever reach). */
+    if (n != 0)
+        throw TypeErrorEx("Expected string", arg_arr->start, arg_arr->end);
     return SharedStr(std::move(result));
 }
 
