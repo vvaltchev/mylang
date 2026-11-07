@@ -1,0 +1,97 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107):
+#  - an `if` condition that is a one-argument CALL is a guard only when the
+#    callee is `defined` or `isbound` and the argument a name (README
+#    *defined() lets you feature-test a name*); any other one-argument call
+#    - through an element, of a user function, of another builtin, alone
+#    or in an `&&` chain - is an ordinary condition and narrows nothing;
+#  - `defined(none)` and `isbound(none)` are true: `none` always exists and
+#    is always bound (README *isbound(name)*);
+#  - structs of more than sixteen fields: one built from `dyn` arguments,
+#    converted field by field at run time, and a POD one embedding another
+#    struct, whose typed construction has no baked plan (the VM's
+#    vm_struct_ctor, beyond its sixteen-value stack buffer).
+# The tree-walker is the oracle; every engine must print the same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+# ---- one-argument calls as conditions
+var fs = [func(x) => x > 0];
+func truthy(x) => x != 0;
+var hits = "";
+if (fs[0](int(runtime(1))))
+    hits += "e";
+if (truthy(int(runtime(2))))
+    hits += "u";
+if (abs(int(runtime(-1))))
+    hits += "b";
+if (isbound(hits) && fs[0](int(runtime(3))))
+    hits += "c";
+if (defined(fs) && truthy(int(runtime(0))))
+    hits += "X";
+if (fs[0](int(runtime(-4))))
+    hits += "X";
+want("one-argument call conditions", hits, "eubc");
+
+# ---- none always exists and is always bound
+var nn = 0;
+if (defined(none))
+    nn += 1;
+if (isbound(none))
+    nn += 10;
+want("defined(none), isbound(none)", nn, 11);
+
+# ---- a struct of seventeen fields built from a dyn argument
+struct W {
+    int a; int b; int c; int d; int e; int f; int g; int h;
+    int i; int j; int k; int l; int m; int n; int o; int p; float q;
+}
+var dyn one = runtime(1);
+var w = W(one, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, one);
+want("wide struct ends", w.a + w.p, 17);
+want("wide struct float field from a dyn int", w.q, 1.0);
+want("wide struct float field kind", typestr(w.q), "float");
+var total = 0;
+for (var r = 0; r < 3; r++) {
+    var dyn v = runtime(r);
+    var x = W(v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v, v);
+    total += x.a + x.p + int(x.q);
+}
+want("wide struct rebuilt in a loop", total, 9);
+var caught = "";
+try {
+    var dyn s = runtime("s");
+    var y = W(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, s);
+    want("wide struct str into float", y.q, -1.0);
+} catch (TypeErrorEx) {
+    caught = "type";
+}
+want("wide struct str into float raised", caught, "type");
+
+# ---- a POD struct of seventeen fields embedding another struct: typed
+# arguments, no baked plan
+struct In { int u; float v; }
+struct N {
+    int a; int b; int c; int d; int e; int f; int g; int h;
+    int i; int j; int k; int l; int m; int n; int o; In z; float q;
+}
+var nsum = 0.0;
+for (var r = 0; r < 3; r++) {
+    var t = int(runtime(r));
+    var nn2 = N(t, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, t + 15,
+               In(t * 10, 0.5), 1.5);
+    nsum += nn2.a + nn2.o + nn2.z.u + nn2.z.v + nn2.q;
+}
+want("wide POD struct with an embedded struct", nsum, 87.0);
+want("wide POD struct storage", array_storage([N(1, 2, 3, 4, 5, 6, 7, 8, 9,
+     10, 11, 12, 13, 14, 15, In(16, 0.0), 17.0)]), "struct");
+
+assert(bad == 0);
+print("ok");
