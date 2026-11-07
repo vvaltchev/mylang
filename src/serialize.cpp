@@ -2300,13 +2300,21 @@ bool myv_is_image(const std::string &path)
  *
  * The claim is a fact about the CALLEE, and a load can check it: honored
  * only for a WRITE-ONCE global whose function returns, at every ReturnV,
- * a literal or a slot its own derived ref_slots proves scalar. A least
- * fixpoint from "no claim": a claim is restored only once justified, and
- * restoring one can only shrink ref_slots, so a recursive function (fib,
- * whose return is the sum of its own calls) qualifies through its own
- * claims. A valid image keeps every claim its compile made (the round
- * trip stays identical); a false or unprovable one costs the optimization,
- * never memory.
+ * a literal or a slot its own derived ref_slots proves scalar. A GREATEST
+ * fixpoint: every claim whose callee is such a global is kept to start
+ * with, and one is dropped as soon as its callee's derived ref_slots list
+ * a slot that callee returns; dropping one can only grow ref_slots, so the
+ * loop ends, and what survives is consistent. That is sound because a
+ * returned reference must have been WRITTEN by some op other than a kept
+ * call (by induction over the calls that have returned), and every such
+ * write puts its slot in ref_slots. It had to be the greatest: the least
+ * one (restore a claim once justified, from none) can never restore a
+ * claim on a cycle - `ev` returning `od(n - 1)` and `od` returning
+ * `ev(n - 1)` (tests/functional/55_regcall) - so the loaded image ran the
+ * reference-checking code the compile had proven unneeded, and its native
+ * code differed from a fresh compile's in 30 of 112 functional programs.
+ * A valid image keeps every claim its compile made (the round trip stays
+ * identical); a false one costs the optimization, never memory.
  */
 static void myv_derive_ref_slots(VmProgram &prog)
 {
@@ -2342,11 +2350,14 @@ static void myv_derive_ref_slots(VmProgram &prog)
             if ((in.op != OpCode::CallV && in.op != OpCode::CachedCallV)
                     || !in.ret_scalar())
                 continue;
-            in.opflags &= static_cast<uint8_t>(~0x80u);   /* unproven */
             const int64_t s = in.target2;
-            claims.push_back({ c.first, pc,
-                               s >= 0 && static_cast<size_t>(s)
-                                   < callee.size() ? callee[s] : nullptr });
+            const Chunk *g = s >= 0 && static_cast<size_t>(s) < callee.size()
+                ? callee[s] : nullptr;
+            if (!g) {
+                in.opflags &= static_cast<uint8_t>(~0x80u);   /* unprovable */
+                continue;
+            }
+            claims.push_back({ c.first, pc, g });
         }
 
     const auto derive = [&](Chunk &ck, const FuncDescriptor *d) {
@@ -2372,18 +2383,21 @@ static void myv_derive_ref_slots(VmProgram &prog)
         return true;
     };
 
-    for (bool grew = true; grew; ) {
-        grew = false;
+    for (bool dropped = true; dropped; ) {
+        dropped = false;
+        std::vector<Chunk *> dirty;
         for (Claim &cl : claims) {
             Instr &in = cl.ck->code[cl.pc];
-            if (in.ret_scalar() || !cl.callee || !returns_scalar(*cl.callee))
+            if (!in.ret_scalar() || returns_scalar(*cl.callee))
                 continue;
-            in.set_ret_scalar();
-            for (auto &c : chunks)
-                if (c.first == cl.ck)
-                    derive(*c.first, c.second);
-            grew = true;
+            in.opflags &= static_cast<uint8_t>(~0x80u);   /* refuted */
+            dirty.push_back(cl.ck);
+            dropped = true;
         }
+        for (auto &c : chunks)
+            if (std::find(dirty.begin(), dirty.end(), c.first)
+                    != dirty.end())
+                derive(*c.first, c.second);
     }
 }
 

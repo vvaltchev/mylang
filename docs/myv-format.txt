@@ -1327,12 +1327,20 @@ implementation free to drift.
                           global (`global_func_names`, not
                           `global_slot_reassigned`) whose every ReturnV
                           returns a literal or a slot its own derived
-                          `ref_slots` does not list - a least fixpoint
-                          from "no bit", so a recursive callee
-                          qualifies through its own calls.  Any other
-                          bit is CLEARED (never refused: a bit the
-                          compile set is always justified this way, so
-                          a valid image keeps every one).
+                          `ref_slots` does not list.  A GREATEST
+                          fixpoint: every bit on such a call is kept to
+                          start with, and one is cleared as soon as its
+                          callee's derived `ref_slots` list a slot the
+                          callee returns, until none is - so a cycle of
+                          calls returning each other's results (`ev`
+                          returning `od(n - 1)`, `od` returning
+                          `ev(n - 1)`) keeps its bits, which a least
+                          fixpoint from "no bit" - the loader's rule
+                          until 2026-11-07, no format change - never
+                          restores.  Any other bit is CLEARED
+                          (never refused: a bit the compile set is
+                          always justified this way, so a valid image
+                          keeps every one).
 
     Chunk::catch_uids     The interned twins of `catch_types`; re-interned
                           inline as the names are read.
