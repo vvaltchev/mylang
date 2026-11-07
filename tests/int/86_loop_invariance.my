@@ -1,0 +1,109 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): what the loop transforms may treat as loop-invariant.
+# A counted loop's bound is read once only when nothing the loop does can
+# change it (fr_immutable): not an element or a field the body stores
+# into, not one stored through another name, not a length an alias
+# grows, not a call to an impure function, not a comparison. Each loop
+# below changes its bound from its body, so reading the bound once would
+# run another number of iterations; the noopt engine (every transform
+# off) is the oracle. Last, loop-invariant ROW hoisting (LICM) shares one
+# temp between equal row reads and keeps one per distinct read
+# (licm_expr_equal, over each node kind an index is built from).
+
+struct S { int n; array<int> v; }
+class C { int n; }
+
+var out = [];
+func note(str what, int v) { append(out, what + "=" + str(v)); }
+
+func bound_elem(array<int> a) {
+    var c = 0;
+    for (var i = 0; i < a[0]; i++) { a[0] = 3; c++; }
+    return c;
+}
+func bound_alias(array<int> a) {
+    var b = a;
+    var c = 0;
+    for (var i = 0; i < a[0]; i++) { b[0] = 2; c++; }
+    return c;
+}
+func bound_len(array<int> a) {
+    var b = a;
+    var c = 0;
+    for (var i = 0; i < len(a); i++) { if (i < 2) append(b, 0); c++; }
+    return c;
+}
+func bound_field(S s) {
+    var c = 0;
+    for (var i = 0; i < s.n; i++) { s.n = 2; c++; }
+    return c;
+}
+func bound_class(C p) {
+    var q = p;
+    var c = 0;
+    for (var i = 0; i < p.n; i++) { q.n = 2; c++; }
+    return c;
+}
+var G = 5;
+func shrink() { G = 2; return 0; }
+func g_read() { return G; }
+func bound_call() {
+    var c = 0;
+    for (var i = 0; i < g_read(); i++) { shrink(); c++; }
+    return c;
+}
+var MADE = 0;
+func mk() { MADE++; return [4 - MADE, 0]; }
+func bound_base_call() {
+    var c = 0;
+    for (var i = 0; i < mk()[0]; i++) c++;
+    return c;
+}
+func bound_cmp(int n) {
+    var c = 0;
+    for (var i = 0; i < n + (c < 2); i++) c++;
+    var d = 0;
+    for (var i = 0; i < n + (d == 1); i++) d++;
+    var e = 0;
+    for (var i = 0; i < n + (e > 0 && e < 2); i++) e++;
+    var f = 0;
+    for (var i = 0; i < n + (f == 1 || f == 9); i++) f++;
+    return c * 1000 + d * 100 + e * 10 + f;
+}
+func bound_neg(int n) {
+    var c = 0;
+    for (var i = 0; i > -n; i--) c++;
+    return c;
+}
+
+note("elem", bound_elem([6, 0]));
+note("alias", bound_alias([6, 0]));
+note("len", bound_len([1, 1]));
+note("field", bound_field(S(6, [0])));
+note("class", bound_class(C(6)));
+note("call", bound_call());
+note("basecall", bound_base_call());
+note("cmp", bound_cmp(int(runtime(3))));
+note("neg", bound_neg(int(runtime(4))));
+
+func rows(array<array<int>> m, S s, array<array<int>> t, int i, int j,
+          int n) {
+    var r = 0;
+    for (var k = 0; k < n; k++) {
+        r += m[i][k] + m[i][k];
+        r += m[i + j][k] + m[i + j][k];
+        r += m[i - j][k];
+        r += m[i * j][k];
+        r += m[i + j + j][k];
+        r += m[j + i][k];
+        r += t[i][k] + t[j][k];
+        r += m[-j][k];
+        r += m[1][k] + m[2][k];
+    }
+    return r;
+}
+var m = [[1, 2], [3, 4], [5, 6], [7, 8]];
+note("rows", rows(m, S(1, [0]), m, int(runtime(1)), int(runtime(1)),
+                  int(runtime(2))));
+print(join(out, " "));
