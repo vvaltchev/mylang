@@ -191,6 +191,11 @@ std::string disassemble_image(const VmProgram &prog);
  */
 std::string highlight_disasm(const std::string &plain);
 
+/* The bare enum NAME of an opcode ("CallV"), "?" for a value outside the
+ * enum: the ONE spelling - the -vd container plan, the JIT's
+ * delete-originals audit and the inline audit all read it. */
+const char *opcode_name(OpCode op);
+
 /*
  * ⛔ THE JIT PROFILE MAP (`MYLANG_JIT_MAP=<path>`) - the instrument that
  * answers "which EMITTED INSTRUCTION does the JIT spend its cycles on".
