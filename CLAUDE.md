@@ -3969,11 +3969,12 @@ call. Four rules a future editor must not soften:
   first version sat in `process_function` beside `func_mutates_input` and
   marked a global-writing function's parameter safe. The audit-table stage
   trap, with a dangling-pointer failure direction.
-- **An unknown NODE SHAPE declines** (`esc_known_shape`). `for_each_child` is
-  a dynamic_cast chain whose fallthrough means "no children", so a node kind
-  missing from it HIDES occurrences — and a hidden occurrence is exactly how
-  a parameter gets wrongly marked. `ForRangeStmt` is the live example, out of
-  reach today only because this pass runs before `specialize_types`.
+- **An unknown NODE SHAPE declines** (`esc_known_shape`). A node kind the
+  walk does not descend into HIDES occurrences — and a hidden occurrence is
+  exactly how a parameter gets wrongly marked. It is an exhaustive switch
+  over the tag (no `default`), so a new kind is a build error until it is
+  classified; `ForRangeStmt` (out of reach only because this pass runs
+  before `specialize_types`) and `DerefExpr` are the kinds it declines.
 - **An unlisted BUILTIN captures everything** (`esc_builtin_transparent`). A
   listed one claims three things at once: stores no argument, does not return
   one, and invokes no callback. **Audit the third by grep, not by eye** —

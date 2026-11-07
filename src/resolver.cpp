@@ -3528,40 +3528,71 @@ static bool esc_is_base_position(const Construct *c, const Construct *child)
  */
 static bool esc_known_shape(const Construct *c)
 {
-    /* enumerable: fmi_children's own cases ... */
-    if (ctag(c) == ConstructType::block ||
-        dynamic_cast<const ForStmt *>(c) ||
-        dynamic_cast<const ForeachStmt *>(c) ||
-        dynamic_cast<const TryCatchStmt *>(c) ||
-        dynamic_cast<const Expr14 *>(c))
-        return true;
-    /* ... and for_each_child's, in its own order */
-    if (dynamic_cast<const SingleChildConstruct *>(c) ||
-        dynamic_cast<const MultiOpConstruct *>(c) ||
-        dynamic_cast<const TypedScalarExpr *>(c) ||
-        dynamic_cast<const IncDecExpr *>(c) ||
-        dynamic_cast<const TernaryExpr *>(c) ||
-        dynamic_cast<const CoalesceExpr *>(c) ||
-        dynamic_cast<const CallExpr *>(c) ||
-        dynamic_cast<const IfStmt *>(c) ||
-        dynamic_cast<const WhileStmt *>(c) ||
-        dynamic_cast<const Subscript *>(c) ||
-        dynamic_cast<const Slice *>(c) ||
-        dynamic_cast<const MemberExpr *>(c) ||
-        dynamic_cast<const ReturnStmt *>(c) ||
-        dynamic_cast<const LiteralDictKVPair *>(c) ||
-        dynamic_cast<const MultiElemConstruct<Construct> *>(c) ||
-        dynamic_cast<const MultiElemConstruct<Identifier> *>(c) ||
-        dynamic_cast<const MultiElemConstruct<LiteralDictKVPair> *>(c))
-        return true;
+    /* A switch over the tag with no `default`, so a new node kind fails
+     * the build until it is classified here - and no per-class
+     * dynamic_cast, whose null test was a branch no call could take (c
+     * is never null here). */
+    switch (ctag(c)) {
+    /* enumerable: fmi_children / for_each_child walk every child */
+    case ConstructType::block:
+    case ConstructType::for_stmt:
+    case ConstructType::foreach_stmt:
+    case ConstructType::try_catch:
+    case ConstructType::expr14:
+    case ConstructType::expr01:         /* SingleChildConstruct */
+    case ConstructType::inlined_call:
+    case ConstructType::throw_stmt:
+    case ConstructType::expr02:         /* MultiOpConstruct */
+    case ConstructType::expr03:
+    case ConstructType::expr04:
+    case ConstructType::expr05:
+    case ConstructType::expr06:
+    case ConstructType::expr07:
+    case ConstructType::expr08:
+    case ConstructType::expr09:
+    case ConstructType::expr10:
+    case ConstructType::expr11:
+    case ConstructType::expr12:
+    case ConstructType::typed_scalar:
+    case ConstructType::incdec:
+    case ConstructType::ternary:
+    case ConstructType::coalesce:
+    case ConstructType::call:
+    case ConstructType::if_stmt:
+    case ConstructType::while_stmt:
+    case ConstructType::subscript:
+    case ConstructType::slice:
+    case ConstructType::member:
+    case ConstructType::ret:
+    case ConstructType::lit_dict_kv:
+    case ConstructType::lit_arr:        /* MultiElemConstruct */
+    case ConstructType::expr_list:
+    case ConstructType::idlist:
+    case ConstructType::lit_dict:
     /* childless: a leaf cannot hide an occurrence */
-    return dynamic_cast<const Literal *>(c) ||
-           dynamic_cast<const LiteralObj *>(c) ||
-           dynamic_cast<const Identifier *>(c) ||
-           dynamic_cast<const ChildlessConstruct *>(c) ||
-           dynamic_cast<const NopConstruct *>(c) ||
-           dynamic_cast<const StructDeclStmt *>(c) ||
-           dynamic_cast<const FuncDeclStmt *>(c);
+    case ConstructType::lit_int:
+    case ConstructType::lit_bool:
+    case ConstructType::lit_float:
+    case ConstructType::lit_none:
+    case ConstructType::lit_str:
+    case ConstructType::lit_obj:
+    case ConstructType::id:
+    case ConstructType::brk:            /* ChildlessConstruct */
+    case ConstructType::cont:
+    case ConstructType::rethrow:
+    case ConstructType::nop:
+    case ConstructType::struct_decl:
+    case ConstructType::func_decl:
+        return true;
+    /* NOT known: a ForRangeStmt (specialize_types makes it, after this
+     * pass) and a DerefExpr have never been audited against the walkers
+     * here, and an unknown kind hides occurrences - so they decline */
+    case ConstructType::for_range:
+    case ConstructType::deref:
+    case ConstructType::other:
+        break;
+    }
+    return false;
 }
 
 /* Does this statement write a GLOBAL (`g = ..`, `g[i] = ..`, `g.f++`)? The
