@@ -1,0 +1,40 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): a TEMPLATE used as a value (README *Function
+# templates*) gets ONE typed instance when every call that can reach it
+# agrees on a settled signature (value_instantiate_round). Here: the
+# instance a DIRECT call already made is reused (the template cache), a
+# template with a typed parameter beside its template one, two call sites
+# that disagree (int / float - no instance, the base runs), a `dyn`
+# argument (no instance either), and a function with no template
+# parameter used as a value. Whatever was decided, every engine must
+# print what the tree-walker prints.
+
+var out = [];
+func note(str what, dyn v) { append(out, what + "=" + str(v)); }
+
+func inc(x) { return x + 1; }
+func dbl(x) { return x * 2; }
+note("direct", inc(5));                  # inc$0 (int), made directly
+var ops = [inc, dbl];
+note("value", ops[int(runtime(0))](3) + ops[int(runtime(1))](4));
+
+func mix(x, int y) { return x * 10 + y; }
+var mixes = [mix];
+note("mix", mixes[int(runtime(0))](2, 3));
+
+func half(x) { return x / 2; }
+func neg(x) { return 0 - x; }
+var hs = [half, neg];
+note("int", hs[int(runtime(0))](7));
+note("float", hs[int(runtime(1))](2.5));
+
+func id1(x) { return x; }
+var ids = [id1];
+note("dyn", ids[int(runtime(0))](runtime("s")));
+
+func typed(int a) { return a + 100; }
+var ts = [typed];
+note("typed", ts[int(runtime(0))](1));
+
+print(join(out, " "));
