@@ -1166,6 +1166,18 @@ static const std::vector<test> tests =
         "assert(a == 2.5 && b == 3.0 && c == 1.0 && d == 1 && e[0] == 1);",
         "assert(typestr(b) == \"float\" && typestr(c) == \"float\");",
         "assert(typestr(d) == \"int\");" } },
+    /* an if or a while needs a condition */
+    { "err loc: an if with an empty condition",
+      { "if () print(1);" }, &typeid(SyntaxErrorEx), 5, 1 },
+    { "err loc: a while with an empty condition",
+      { "while () print(1);" }, &typeid(SyntaxErrorEx), 8, 1 },
+    /* a const multi-declaration's element the parser already folded to a
+     * constant value (sort() of a constant) is bound as it is: read-only,
+     * like the elements it bakes */
+    { "const multi-declaration of a folded element",
+      { "const a, b = [sort([2, 1]), [3]];",
+        "assert(a == [1, 2] && b == [3]);",
+        "append(a, 9);" }, &typeid(CannotChangeConstEx) },
     /* a str times an int repeats it, and the compiler types it str */
     { "a str times an int is a str",
       { "var s = str(runtime(\"ab\")); var n = int(runtime(3));",
@@ -25103,6 +25115,43 @@ static bool analyze_greens_counted_for()
     ok = ok && counted.find(green + "for") != std::string::npos;
     ok = ok && flt.find(green + "for") == std::string::npos;
     return ok;
+}
+
+/* -a dims a statement the PARSER removed as dead: the untaken branch of
+ * an if on a constant (an if with no else whose condition is true has no
+ * dead branch at all), and a while (false) loop, with or without a body
+ * (pAcceptIfStmt / pAcceptWhileStmt, ParseContext::analysis). */
+static bool analyze_dims_parse_time_dead()
+{
+    const std::vector<std::string> src = {
+        "if (true) print(1);",
+        "if (false) print(2); else print(3);",
+        "while (false) print(4);",
+        "while (false);",
+        "print(5);",
+    };
+    std::string text;
+    for (const auto &l : src)
+        text += l + "\n";
+    std::vector<Tok> toks;
+    lexer(text, 1, toks);
+    ParseContext pc(TokenStream(toks), true);
+    AnalysisInfo info;
+    pc.analysis = &info;
+    unique_ptr<Construct> root = pBlock(pc);
+    std::ostringstream o;
+    analyze_and_render(o, root.get(), info, src, /*color=*/true,
+                       /*repl_mode=*/false);
+    const std::string out = o.str();
+    const std::string dim = "\033[2m";
+    /* exactly the three dead ranges, nothing for line 1 or line 5 */
+    return info.dead.size() == 3
+        && out.find(dim + "print(2)") != std::string::npos
+        && out.find(dim + "while (false) print(4)") != std::string::npos
+        && out.find(dim + "while (false)") != std::string::npos
+        && out.find(dim + "print(1)") == std::string::npos
+        && out.find(dim + "print(3)") == std::string::npos
+        && out.find(dim + "print(5)") == std::string::npos;
 }
 
 /*
@@ -60444,6 +60493,8 @@ static const std::vector<extra_check> extra_checks =
     { "frame: >64 locals (no per-frame slot limit)", frame_over_64_slots },
     { "analyze: counted `for` is greened, float-var `for` is not",
       analyze_greens_counted_for },
+    { "analyze: a parse-time dead branch or loop is dimmed",
+      analyze_dims_parse_time_dead },
     { "repl: multi-line completeness detection", repl_incomplete_detection },
     { "replhelp: overview + builtins index", replhelp_overview_and_builtins },
     { "replhelp: builtin entries + kind note", replhelp_builtin_entries },
