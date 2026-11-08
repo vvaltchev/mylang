@@ -1131,6 +1131,14 @@ static const std::vector<test> tests =
     { "err loc: no zero value for a struct declared below the variable",
       { "struct A { B b; } A a; struct B { int x; } print(a);" },
       &typeid(NullabilityEx), 21, 1, 23, 1 },
+    /* decltype() names a VARIABLE: a builtin is not one; and the program's
+     * own typestr/kindstr is called like any function */
+    { "err loc: decltype of a builtin is refused",
+      { "print(decltype(len));" },
+      &typeid(TypeMismatchEx), 16, 1, 20, 1 },
+    { "a program's own typestr and kindstr are called",
+      { "func typestr(x) => 1; func kindstr(x) { return 7; }",
+        "assert(typestr(5) == 1 && kindstr(2.5) == 7);" } },
     /* a typed `const` scalar is converted as a typed variable is: a float
      * from a float, an int or a bool, an int from a bool; a typed const
      * container is checked by the inferencer, not here */
