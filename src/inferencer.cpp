@@ -5614,20 +5614,23 @@ StaticTypeRef Inferencer::binop_result(Op op, StaticTypeRef a, StaticTypeRef b)
         return j;
     };
 
+    /* two numeric kinds always join (bool < int < float), and so do two
+     * arrays (mixed elements join to dyn): StaticTypeArena::join */
     switch (op) {
         case Op::plus:
-            /* str + anything -> str (the RHS is stringified); but int/float +
-             * str is an error (handled by falling through to dyn). */
-            if (au->kind == StaticTypeKind::Str)
-                return A.str_ty();
+            /* `str + anything` was answered above; int/float + str is an
+             * error (dyn here, refused by the check pass) */
+            ML_CHECK(au->kind != StaticTypeKind::Str);
             if (an && bn) {
                 StaticTypeRef j = arith_join(au, bu);
-                return j ? j : A.dyn_ty();
+                ML_CHECK(j);
+                return j;
             }
             if (au->kind == StaticTypeKind::Array && bu->kind ==
                 StaticTypeKind::Array) {
                 StaticTypeRef j = A.join(au, bu);
-                return j ? j : A.array_of(A.dyn_ty());
+                ML_CHECK(j);
+                return j;
             }
             return A.dyn_ty();
 
@@ -5637,7 +5640,8 @@ StaticTypeRef Inferencer::binop_result(Op op, StaticTypeRef a, StaticTypeRef b)
                 return A.str_ty();
             if (an && bn) {
                 StaticTypeRef j = arith_join(au, bu);
-                return j ? j : A.dyn_ty();
+                ML_CHECK(j);
+                return j;
             }
             return A.dyn_ty();
 
@@ -5646,7 +5650,8 @@ StaticTypeRef Inferencer::binop_result(Op op, StaticTypeRef a, StaticTypeRef b)
         case Op::mod:
             if (an && bn) {
                 StaticTypeRef j = arith_join(au, bu);
-                return j ? j : A.dyn_ty();
+                ML_CHECK(j);
+                return j;
             }
             return A.dyn_ty();
 

@@ -1113,6 +1113,10 @@ static const std::vector<test> tests =
     { "err loc: a struct field with no name",
       { "struct S { int ; }" },
       &typeid(SyntaxErrorEx), 16, 1 },
+    /* a str times an int repeats it, and the compiler types it str */
+    { "a str times an int is a str",
+      { "var s = str(runtime(\"ab\")); var n = int(runtime(3));",
+        "assert(s * n == \"ababab\"); assert(typestr(s * n) == \"str\");" } },
     /* only defined() and isbound() narrow: isconst() asks whether a name
      * is a constant, not whether it exists, so it guards nothing - the
      * name in its branch is still checked */
