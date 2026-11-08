@@ -654,31 +654,35 @@ static unique_ptr<Construct> zero_value_literal(DeclType dt)
 }
 
 static unique_ptr<Construct>
-build_zero_struct_init(const StructTypeDef *def, Loc loc);
+build_zero_struct_init(ParseContext &c, const StructTypeDef *def, Loc loc,
+                       Loc end);
 
 /* The zero value of a `box<T>` (`box<int> n;` is `box(0)`): a FRESH box of
- * T's zero value, built per evaluation like a struct's zero */
-static unique_ptr<Construct> zero_box_init(const TypeAnnot *a, Loc loc)
+ * T's zero value, built per evaluation like a struct's zero. Every node
+ * built spans the declared name [loc, end), where an error about it
+ * points. */
+static unique_ptr<Construct>
+zero_box_init(ParseContext &c, const TypeAnnot *a, Loc loc, Loc end)
 {
     const TypeAnnot *e = a ? a->elem.get() : nullptr;
     unique_ptr<Construct> z =
         !e ? unique_ptr<Construct>(new LiteralNone())
         : e->kind == DeclType::strct && e->strct
-            ? build_zero_struct_init(e->strct, loc)
+            ? build_zero_struct_init(c, e->strct, loc, end)
             : zero_value_literal(e->kind);
     z->start = loc;
-    z->end = loc;
+    z->end = end;
     auto args = make_unique<ExprList>();
     args->elems.push_back(std::move(z));
     auto callee = make_unique<Identifier>("box");
     callee->builtin_only = true;        /* a program's own `box` is not it */
     callee->start = loc;
-    callee->end = loc;
+    callee->end = end;
     auto call = make_unique<CallExpr>();
     call->what = std::move(callee);
     call->args = std::move(args);
     call->start = loc;
-    call->end = loc;
+    call->end = end;
     return call;
 }
 
@@ -691,7 +695,8 @@ static unique_ptr<Construct> zero_box_init(const TypeAnnot *a, Loc loc)
  * shared mutable state) and is type-checked like a hand-written construction.
  */
 static unique_ptr<Construct>
-build_zero_struct_init(const StructTypeDef *def, Loc loc)
+build_zero_struct_init(ParseContext &c, const StructTypeDef *def, Loc loc,
+                       Loc end)
 {
     auto args = make_unique<ExprList>();
 
@@ -713,32 +718,42 @@ build_zero_struct_init(const StructTypeDef *def, Loc loc)
                                          break;
                 case FieldKind::f_dict:  a = zero_value_literal(DeclType::dict);
                                          break;
-                case FieldKind::f_struct:
-                    a = fd.struct_def
-                        ? build_zero_struct_init(fd.struct_def, loc)
-                        : make_unique<LiteralNone>();
+                case FieldKind::f_struct: {
+                    /* a field typed by a struct declared AFTER this one
+                     * (a forward reference) has no def from the struct's
+                     * own parse; the struct is found by name now, when it
+                     * is declared above the variable. One declared below
+                     * it leaves `none` here, which the inferencer refuses
+                     * for the non-opt field - a struct type is declared
+                     * before a declaration that needs it. */
+                    const StructTypeDef *sd = fd.struct_def
+                        ? fd.struct_def
+                        : lookup_struct_type(c, fd.struct_ty->val);
+                    a = sd ? build_zero_struct_init(c, sd, loc, end)
+                           : make_unique<LiteralNone>();
                     break;
+                }
                 case FieldKind::f_box:
-                    a = zero_box_init(fd.annot.get(), loc);
+                    a = zero_box_init(c, fd.annot.get(), loc, end);
                     break;
                 default:                 a = make_unique<LiteralNone>();
                                          break;
             }
         }
         a->start = loc;
-        a->end = loc;
+        a->end = end;
         args->elems.push_back(std::move(a));
     }
 
     auto callee = make_unique<Identifier>(def->name->val);
     callee->start = loc;
-    callee->end = loc;
+    callee->end = end;
 
     auto call = make_unique<CallExpr>();
     call->what = std::move(callee);
     call->args = std::move(args);
     call->start = loc;
-    call->end = loc;
+    call->end = end;
     return call;
 }
 
@@ -2666,9 +2681,11 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
                 (fl & pFlags::pInOptDecl)
                     ? unique_ptr<Construct>(new LiteralNone())
                     : (c.pending_decl_type == DeclType::strct
-                         ? build_zero_struct_init(c.pending_decl_struct, start)
+                         ? build_zero_struct_init(c, c.pending_decl_struct,
+                                                  start, ret->lvalue->end)
                          : c.pending_decl_type == DeclType::box
-                         ? zero_box_init(c.pending_decl_annot.get(), start)
+                         ? zero_box_init(c, c.pending_decl_annot.get(), start,
+                                         ret->lvalue->end)
                          : zero_value_literal(c.pending_decl_type));
 
         } else if (in_idlist) {

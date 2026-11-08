@@ -741,6 +741,11 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     `dict x;` → `{}`, and a **struct zero-initializes recursively** by the same
     rules (`Point origin;` → `Point(x: 0, y: 0)`; each field gets its own zero,
     nested structs included). (An `opt`-qualified one defaults to `none`.)
+    A nested struct whose type is declared further down than the struct
+    holding it is zero-initialized too, provided it is declared above the
+    variable. One declared below the variable, or a non-`opt` `dyn` field
+    (which has no zero value), gives no zero value: such a variable needs
+    an initializer, and without one it is a compile error.
   * It works in a `for` initializer too: `for (int i = 0; i < n; i += 1) ...`.
 
 The type keywords are still ordinary identifiers everywhere else — `int(x)`,
