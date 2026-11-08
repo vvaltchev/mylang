@@ -1867,5 +1867,23 @@ else
     echo "  skip  JIT debug dumps and caps (this build reports jit 0)"
 fi
 
+# tmpdir(): $TMPDIR, else $TEMP, else $TMP - an empty one counts as unset -
+# else /tmp, with no trailing separator (a lone "/" stays). The test runner
+# always sets TMPDIR, so the fallbacks run only here.
+td_bad=""
+for spec in "/x/tmp|TMPDIR=/x/tmp//" "/w/t|TMPDIR= TEMP=/w/t/" \
+            '/v|TMPDIR= TEMP= TMP=/v\' "/tmp|TMPDIR= TEMP= TMP=" "/|TMPDIR=/"
+do
+    want=${spec%%|*}; envs=${spec#*|}
+    # shellcheck disable=SC2086
+    got=$(env $envs "$BIN" -e 'print(tmpdir());' 2>&1 | sed 's/ *$//')
+    [ "$got" = "$want" ] || td_bad="$td_bad [$envs: got '$got']"
+done
+if [ -z "$td_bad" ]; then
+    pass "tmpdir(): TMPDIR, TEMP, TMP, /tmp, no trailing separator"
+else
+    fail "tmpdir():$td_bad"
+fi
+
 [ $rc = 0 ] && echo "all driver checks passed"
 exit $rc
