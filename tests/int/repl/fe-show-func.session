@@ -219,3 +219,5 @@ struct R { int a; int b; }
 func mkr() => R(1, 2)
 mkr()
 :show mkr
+func lam9() { (func (x) => x); return 1; }
+:show lam9
