@@ -7821,17 +7821,14 @@ void Inferencer::check(Construct *n)
         check(idc->lvalue.get());
         Construct *opnd = idc->lvalue.get();
 
-        /* the operand must be an lvalue: a variable, an array element, a
-         * struct field or a box's value (not a literal, an expression, or
-         * a call result). */
+        /* the operand is an lvalue: a variable, an array element, a struct
+         * field or a box's value - the PARSER refuses any other shape (a
+         * literal, an expression, a call result: pRefuseUnassignable), in
+         * every configuration, before inference runs */
         auto *id = node_cast<Identifier>(opnd);
-        if (!id && ctag(opnd) != ConstructType::subscript
-                && ctag(opnd) != ConstructType::member
-                && ctag(opnd) != ConstructType::deref) {
-            mismatch("'++'/'--' needs a variable, array element, or field",
-                     idc->start, idc->end);
-            return;
-        }
+        ML_CHECK(id || ctag(opnd) == ConstructType::subscript
+                 || ctag(opnd) == ConstructType::member
+                 || ctag(opnd) == ConstructType::deref);
 
         check_const_param_store(opnd);
 

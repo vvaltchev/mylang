@@ -9113,6 +9113,13 @@ struct Codegen {
                 gen_stmt(e.get());
     }
 
+    /* Refuse a statement whose lowering failed (NotLoweredEx). */
+    void require_lowered(bool ok, const Construct *s)
+    {
+        if (!ok)
+            throw_not_lowered(s);
+    }
+
     void gen_stmt_impl(const Construct *s)
     {
         /* Native-first: the register machine applies to top-level AND
@@ -9139,36 +9146,27 @@ struct Codegen {
             return;
         code.resize(mark);
 
-        if (const IfStmt *f = node_cast<const IfStmt>(s)) {
-            if (!compile_native_if(f))
-                throw_not_lowered(s);
-            return;
-        }
-        if (const WhileStmt *w = node_cast<const WhileStmt>(s)) {
-            if (!try_native_scalar_while(w))
-                throw_not_lowered(s);
-            return;
-        }
-        if (const ForRangeStmt *fr = node_cast<const ForRangeStmt>(s)) {
-            if (!try_native_for_range(fr))
-                throw_not_lowered(s);
-            return;
-        }
-        if (const ForStmt *fs = node_cast<const ForStmt>(s)) {
-            if (!try_native_for(fs))           /* general (non-range) for */
-                throw_not_lowered(s);
-            return;
-        }
-        if (const ForeachStmt *fe = node_cast<const ForeachStmt>(s)) {
-            if (!try_native_foreach(fe)         /* flat/general array */
-                && !try_native_foreach_str(fe)  /* string chars */
-                && !try_native_foreach_unpack(fe) /* strict array destructure */
-                && !try_native_struct_foreach(fe) /* flat struct fields */
-                && !try_native_dict_foreach(fe)   /* live dict iterator */
-                && !try_native_dyn_foreach(fe))   /* runtime array|dict */
-                throw_not_lowered(s);
-            return;
-        }
+        /* A statement kind with ONE lowering (its compiler, or a chain of
+         * them) is refused at once when that fails - require_lowered, the
+         * one place the refusal is decided: no later tier takes a loop, an
+         * `if`, a `return`, a `try` or a `throw`. */
+        if (const IfStmt *f = node_cast<const IfStmt>(s))
+            return require_lowered(compile_native_if(f), s);
+        if (const WhileStmt *w = node_cast<const WhileStmt>(s))
+            return require_lowered(try_native_scalar_while(w), s);
+        if (const ForRangeStmt *fr = node_cast<const ForRangeStmt>(s))
+            return require_lowered(try_native_for_range(fr), s);
+        if (const ForStmt *fs = node_cast<const ForStmt>(s))
+            return require_lowered(try_native_for(fs), s);
+        if (const ForeachStmt *fe = node_cast<const ForeachStmt>(s))
+            return require_lowered(
+                try_native_foreach(fe)         /* flat/general array */
+                || try_native_foreach_str(fe)  /* string chars */
+                || try_native_foreach_unpack(fe) /* strict array destructure */
+                || try_native_struct_foreach(fe) /* flat struct fields */
+                || try_native_dict_foreach(fe)   /* live dict iterator */
+                || try_native_dyn_foreach(fe),   /* runtime array|dict */
+                s);
         /* A user-function call statement (result discarded) -> CallV. */
         if (const DirectCallExpr *dc =
                 dynamic_cast<const DirectCallExpr *>(s)) {
@@ -9193,10 +9191,8 @@ struct Codegen {
                 return;
         }
         /* `return <expr>;` -> ReturnV (its expr compiled natively). */
-        if (const ReturnStmt *ret = node_cast<const ReturnStmt>(s)) {
-            if (try_native_return(ret, code))
-                return;
-        }
+        if (const ReturnStmt *ret = node_cast<const ReturnStmt>(s))
+            return require_lowered(try_native_return(ret, code), s);
         /* A `func f(..) {..}` decl statement bound into a GLOBAL slot (a
          * hoisted top-level / scoped function) -> MakeClosureV (create the
          * FuncObject, snapshotting captures) + StoreGlobalV (write the slot +
@@ -9222,23 +9218,17 @@ struct Codegen {
          * `isconst` folds), so a plain StoreGlobalV is differential-identical.
          * Like a func decl, a SCRIPT struct decl is always global (structs
          * never capture; pWrapDeclBody closed the brace-less-body route). */
-        const StructDeclStmt *sd = node_cast<const StructDeclStmt>(s);
-        if (sd) {
-            if (sd->id) {
-                emit_struct_decl(sd, code);
-                return;
-            }
+        if (const StructDeclStmt *sd = node_cast<const StructDeclStmt>(s)) {
+            ML_CHECK(sd->id);          /* the grammar names every struct */
+            emit_struct_decl(sd, code);
+            return;
         }
         /* A `try/catch` -> a native handler region (P8 Inc 0). */
-        if (const TryCatchStmt *tc = node_cast<const TryCatchStmt>(s)) {
-            if (compile_native_try(tc))
-                return;
-        }
+        if (const TryCatchStmt *tc = node_cast<const TryCatchStmt>(s))
+            return require_lowered(compile_native_try(tc), s);
         /* `throw <expr>;` -> a native Throw op (P8 Inc 1). */
-        if (const ThrowStmt *th = node_cast<const ThrowStmt>(s)) {
-            if (try_native_throw(th, code))
-                return;
-        }
+        if (const ThrowStmt *th = node_cast<const ThrowStmt>(s))
+            return require_lowered(try_native_throw(th, code), s);
         /* A standalone braced block `{ ... }` statement: a SCOPE-FREE block runs
          * its statements directly in the current context (no child EvalContext -
          * every decl is a frame slot), exactly like an if/loop body, so compile
