@@ -3709,7 +3709,7 @@ and it lives *inside the parser*. Mechanics:
   `isbound(name)` asks whether its declaration has RUN. LAZY (unevaluated
   argument — `mark_lazy_builtin` + the F1 rule: callable directly, never a
   value), and its argument must be an **identifier** (or `none`), checked by
-  `Inferencer::check_isbound_args`. **Three things a future reader will get
+  `Inferencer::stamp_lazy_calls`. **Three things a future reader will get
   wrong:** (1) the arg-shape rule must be a COMPILE error, because the runtime
   body's own throw is the tree-walker's answer while the no-fail codegen
   refuses the shape (`NotLoweredEx`) — an engine divergence; (2) it must run
@@ -3731,6 +3731,17 @@ and it lives *inside the parser*. Mechanics:
   exists to avoid. The lexical kinds fold in `try_fold_isbound`; a GLOBAL is
   the one runtime query and reuses `DefinedGlobalV` (which `defined` no longer
   reaches, since a declared global folds to `true`).
+  **⛔ A LAZY CALL IS RECOGNIZED BY ITS BINDING, NOT ITS NAME
+  (2026-11-13).** The resolver and AutoConst asked the callee's NAME, so in
+  a program with its own `func defined` (or a parameter, a variable of a
+  lazy builtin's name) `defined(zork)` compiled and called the BUILTIN -
+  `false` - and the REPL folded `defined(p)` to `true` over an earlier
+  input's function. `stamp_lazy_calls` (the same structural walk, which
+  knows the REPL's earlier inputs and runs under `-nti`) stamps
+  `CallExpr::user_callee`, and every resolver site asks
+  `lazy_builtin_callee(call)` - the FIX-1 exemption, the #135 guard, the
+  prover's argument skip, the folds and refold's no-fold rule. A new site
+  that treats a lazy call specially asks it too.
 - **⛔ A DECLARATION BEATS THE CONST BUILTIN IT SHADOWS (#133, 2026-08-09).**
   `pAcceptId` used to resolve a name straight to a const builtin without ever
   asking what the program declared, so `func abs(x){return 42;}` gave

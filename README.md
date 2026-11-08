@@ -590,6 +590,10 @@ below it). The query builtins are exempt - `defined(x)`, `isbound(x)`,
 `isconst(x)` and `isconstdecl(x)` never evaluate their argument, so asking
 about a name that exists nowhere is legal and answers `false` (which is what
 makes `if (isbound(x)) { ... }` the feature test - see `isbound(name)`).
+Only the builtins are exempt: a function, parameter or variable of the
+program's own named `defined` (or `isbound`, ...) is called like any other
+function, so its argument is evaluated and must exist, and a check through
+it guards nothing.
 
 **Top-level variables have an implicit `var`.** At the outermost scope (a
 statement directly in the program/REPL, not inside any block or function), a

@@ -1158,6 +1158,26 @@ public:
      */
     bool in_const_decl = false;
 
+    /*
+     * The callee NAMES a lazy builtin (defined / isbound / isconst /
+     * isconstdecl, which ask about their argument's NAME and never
+     * evaluate it) but is the PROGRAM's own symbol of that name - a
+     * function, a parameter, a variable. Such a call is an ordinary call:
+     * its argument is evaluated, so a name in it must be declared, and no
+     * pass may answer it as the builtin would (#133: a declaration beats
+     * the builtin it shadows). Until 2026-11-13 the resolver and AutoConst
+     * recognized a lazy call by the callee's NAME, so `defined(zork)`
+     * called the builtin and answered false in a program declaring its
+     * own `func defined`, and the REPL folded `defined(p)` to true over
+     * an earlier input's function.
+     *
+     * Stamped by the inferencer's structural pass (stamp_lazy_calls), the
+     * one place that knows: its scopes hold the REPL's earlier inputs too,
+     * and it runs under -nti. Default false: an unstamped call is read as
+     * the builtin, as before.
+     */
+    bool user_callee = false;
+
     /* An argument whose SHAPE cannot evaluate to none: a non-none literal,
      * an operator chain (arithmetic, comparison, logical, bitwise and
      * unary operators yield a value or throw - never none), a typed
@@ -1230,6 +1250,7 @@ public:
         d.none_arg_mask = none_arg_mask;
         d.fit_args = fit_args;
         d.in_const_decl = in_const_decl;
+        d.user_callee = user_callee;
     }
 
     unique_ptr<Construct> clone() const override {

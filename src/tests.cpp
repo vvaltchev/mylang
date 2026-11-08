@@ -1062,6 +1062,26 @@ static const std::vector<test> tests =
     { "err loc: a struct type declared below has no such member",
       { "func g() => P.y; struct P { int x; } print(g());" },
       &typeid(TypeMismatchEx), 13, 1, 17, 1 },
+    /* A program's own function, parameter or variable named like a LAZY
+     * builtin (defined / isbound / isconst / isconstdecl) is an ordinary
+     * call: its argument is evaluated, so a name declared nowhere is the
+     * usual compile error, and a check through it guards nothing. Until
+     * 2026-11-13 these calls were recognized by NAME and answered by the
+     * builtin (`false`). */
+    { "err loc: a program's own defined() evaluates its argument",
+      { "func defined(v) { return 42; } print(defined(zork));" },
+      &typeid(UndefinedVariableEx), 46, 1, 51, 1 },
+    { "err loc: a parameter named isbound evaluates its argument",
+      { "func f(isbound) { return isbound(zork); } "
+        "print(f(func(v) => 1));" },
+      &typeid(UndefinedVariableEx), 34, 1, 39, 1 },
+    { "err loc: a variable named isconst declared below is called",
+      { "func g() { return isconst(zork); } "
+        "var isconst = func(v) => 9; print(g());" },
+      &typeid(UndefinedVariableEx), 27, 1, 32, 1 },
+    { "err loc: a check through a program's own defined() guards nothing",
+      { "func defined(v) { return 42; } if (defined(zork)) print(zork);" },
+      &typeid(UndefinedVariableEx), 44, 1, 49, 1 },
     /* abs() takes an int or a float: any other type the compiler can see,
      * a bool included, is a compile error marking the argument (decided
      * 2026-11-13; the call was typed as its argument and the run time
@@ -22820,6 +22840,19 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* a program's own defined / isbound, from an earlier input, is called
+     * like any function - in a later input and inside a function body -
+     * and the builtin it shadows is not consulted (2026-11-13: the
+     * resolver folded `defined(p)` to true over the program's function) */
+    { "a program's own defined/isbound is called across inputs",
+      { { "func defined(v) { return 42; }", "" },
+        { "defined(zork)", "Undefined variable 'zork'" },
+        { "func h(p) { return defined(p); }", "" },
+        { "h(1)", "=> 42" },
+        { "func isbound(v) { return 43; }", "" },
+        { "func j(p) { return isbound(p); }", "" },
+        { "j(1)", "=> 43" },
+        { "isconst(zork)", "=> false" } } },
     /* question 5: a function the parser runs runs typed, in a later input
      * too - the copy is inferred with the earlier input's function and
      * consts - and a redefinition is what the next constant call runs */
