@@ -1,0 +1,136 @@
+# INT-ENGINES: tw default nj ni noopt
+#
+# INT unit (#107): a TAIL call `return f(args)` is inlined by pasting f's
+# block body in place of the return (Inliner::try_inline_tail). These are
+# the calls it must DECLINE, each answering what the real call answers
+# (`ni` and `noopt` run them as calls): a callee that can fall off its end,
+# a parameter the bind converts (int into float), a parameter the body
+# writes through (an array element) or into (a struct field - the struct
+# is the call's copy), a callee whose locals would overflow the caller's
+# 64-slot frame, and a chain of tail calls deeper than the inliner's
+# nesting cap.
+
+var bad = 0;
+func want(what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+struct P { int x; }
+
+func h1(int x) { if (x > 0) return x * 2; }
+func c1(int y) { return h1(y); }
+want("a callee that can fall off its end", c1(int(runtime(3))), 6);
+want("...and does", c1(int(runtime(-3))), none);
+
+func h3(float x) { var t = x / 2; return t; }
+func c3(int y) { return h3(y); }
+want("an int bound to a float parameter", c3(int(runtime(5))), 2.5);
+
+func h4(a) { a[0] = 9; return len(a); }
+func c4(arr) { return h4(arr); }
+var arr = [1, 2, 3];
+want("a parameter written through", c4(arr), 3);
+want("...writes the caller's array", arr[0], 9);
+
+func h5(P p) { p.x = 7; return p.x; }
+func c5(P q) { return h5(q); }
+var q = P(1);
+want("a struct parameter written into", c5(q), 7);
+want("...is the call's copy", q.x, 1);
+
+func h7(int x) {
+    var v0 = x + 0;
+    var v1 = x + 1;
+    var v2 = x + 2;
+    var v3 = x + 3;
+    var v4 = x + 4;
+    var v5 = x + 5;
+    var v6 = x + 6;
+    var v7 = x + 7;
+    var v8 = x + 8;
+    var v9 = x + 9;
+    var v10 = x + 10;
+    var v11 = x + 11;
+    var v12 = x + 12;
+    var v13 = x + 13;
+    var v14 = x + 14;
+    var v15 = x + 15;
+    var v16 = x + 16;
+    var v17 = x + 17;
+    var v18 = x + 18;
+    var v19 = x + 19;
+    var v20 = x + 20;
+    var v21 = x + 21;
+    var v22 = x + 22;
+    var v23 = x + 23;
+    var v24 = x + 24;
+    var v25 = x + 25;
+    var v26 = x + 26;
+    var v27 = x + 27;
+    var v28 = x + 28;
+    var v29 = x + 29;
+    var v30 = x + 30;
+    var v31 = x + 31;
+    var v32 = x + 32;
+    var v33 = x + 33;
+    var v34 = x + 34;
+    var v35 = x + 35;
+    var v36 = x + 36;
+    var v37 = x + 37;
+    var v38 = x + 38;
+    var v39 = x + 39;
+    var v40 = x + 40;
+    var v41 = x + 41;
+    var v42 = x + 42;
+    var v43 = x + 43;
+    var v44 = x + 44;
+    var v45 = x + 45;
+    var v46 = x + 46;
+    var v47 = x + 47;
+    var v48 = x + 48;
+    var v49 = x + 49;
+    var v50 = x + 50;
+    var v51 = x + 51;
+    var v52 = x + 52;
+    var v53 = x + 53;
+    var v54 = x + 54;
+    var v55 = x + 55;
+    var v56 = x + 56;
+    var v57 = x + 57;
+    var v58 = x + 58;
+    var v59 = x + 59;
+    var v60 = x + 60;
+    var v61 = x + 61;
+    return v0 + v10 + v20 + v30 + v40 + v50 + v60;
+}
+func c7(int y) { var u = y; var w = u + 1; var z = w + 1; return h7(z); }
+want("locals past the 64-slot frame", c7(int(runtime(1))), 231);
+
+func t1(int x) { var k = x + 1; return t2(k); }
+func t2(int x) { var k = x + 1; return t3(k); }
+func t3(int x) { var k = x + 1; return t4(k); }
+func t4(int x) { var k = x + 1; return t5(k); }
+func t5(int x) { var k = x + 1; return t6(k); }
+func t6(int x) { var k = x + 1; return t7(k); }
+func t7(int x) { var k = x + 1; return t8(k); }
+func t8(int x) { var k = x + 1; return t9(k); }
+func t9(int x) { var k = x + 1; return t10(k); }
+func t10(int x) { var k = x + 1; return t11(k); }
+func t11(int x) { var k = x + 1; return t12(k); }
+func t12(int x) { var k = x + 1; return t13(k); }
+func t13(int x) { var k = x + 1; return t14(k); }
+func t14(int x) { var k = x + 1; return t15(k); }
+func t15(int x) { var k = x + 1; return t16(k); }
+func t16(int x) { var k = x + 1; return t17(k); }
+func t17(int x) { var k = x + 1; return t18(k); }
+func t18(int x) { var k = x + 1; return t19(k); }
+func t19(int x) { var k = x + 1; return t20(k); }
+func t20(int x) { var k = x + 1; return k; }
+func c9(int y) { return t1(y); }
+want("a tail chain past the nesting cap", c9(int(runtime(0))), 20);
+
+assert(bad == 0);
+print("ok");
