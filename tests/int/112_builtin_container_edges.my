@@ -1,0 +1,54 @@
+# INT-ENGINES: tw default nj nbi
+#
+# INT unit (#107): the edges of map() over a DICT and of join() that no
+# other program reaches - a map over a dict run at COMPILE time (a const
+# initializer), into each typed destination (int, float, bool), map() and
+# filter() handed something that is not a container, and join() of an
+# EMPTY flat array (a slice of split()'s string storage, and an int array
+# reached through a dyn name).
+
+const KM = map(pure func(k, v) => v * 2, {"a": 1, "b": 2});
+assert(KM == [2, 4]);
+
+func run(int n) {
+    var d = {"x": n, "y": n + 1};
+    array<int> ai = map(func(k, v) => v * 3, d);
+    array<float> af = map(func(k, v) => v * 0.5, d);
+    array<bool> ab = map(func(k, v) => v % 2 == 1, d);
+    assert(ai == [3 * n, 3 * n + 3]);
+    assert(af == [n * 0.5, (n + 1) * 0.5]);
+    assert(ab == [n % 2 == 1, n % 2 == 0]);
+    assert(array_storage(ai) == "int");
+    assert(array_storage(af) == "float");
+    assert(array_storage(ab) == "bool");
+    return len(ai) + len(af) + len(ab);
+}
+assert(run(runtime(4)) == 6);
+
+var dyn notc = runtime(5);
+var caught = 0;
+try {
+    map(func(x) => x, notc);
+} catch (TypeErrorEx) {
+    caught++;
+}
+try {
+    filter(func(x) => true, notc);
+} catch (TypeErrorEx) {
+    caught++;
+}
+assert(caught == 2);
+
+var parts = split(runtime("a,b"), ",");
+assert(join(parts[0:0], "-") == "");
+array<int> ei = [];
+var dyn de = ei;
+assert(join(de, "-") == "");
+append(ei, 1);
+try {
+    join(de, "-");
+} catch (TypeErrorEx) {
+    caught++;
+}
+assert(caught == 3);
+print("ok");
