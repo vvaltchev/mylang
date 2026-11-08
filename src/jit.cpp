@@ -30605,7 +30605,7 @@ static bool op_fully_native(const Instr &in)
     case OpCode::Throw:
         return true;
     /* #56: the struct/unpack builders - their helpers run the shared
-     * interpreter cores (vm_do_emplace / construct_struct_from_values /
+     * interpreter cores (vm_do_emplace / vm_struct_ctor /
      * the strict unpack) and every throw conveys with the exc-stamped
      * caret (the per-field/arg carets ride their own pools); no bail. */
     case OpCode::EmplaceStruct:

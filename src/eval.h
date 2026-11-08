@@ -609,10 +609,6 @@ struct FieldDef;
 EvalValue coerce_struct_field(const FieldDef &fd, EvalValue v, Loc s, Loc e,
                               bool check_fit = false);
 
-intrusive_ptr<StructObject>
-construct_struct_from_values(StructTypeDef *def,
-                             const EvalValue *vals, size_t n);
-
 /* VM StructCtorBoxedV: construct a BOXED (non-POD) struct from its field VALUES
  * (`vals[0..nargs)`), mirroring construct_struct's boxed loop. A field coerce
  * CAN throw (a dyn-laundered wrong value); `locs[i]` gives that arg's caret

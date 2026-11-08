@@ -845,8 +845,8 @@ enum class OpCode : unsigned char {
      * Construct a POD struct STANDALONE `P(x, y)` into `target`: the field arg
      * values are in the register run [a.lit, a.lit + b.lit), `target2` = the
      * index into Chunk::struct_defs (the program-lifetime StructTypeDef*; the
-     * Instr holds only the index). construct_struct_from_values coerces the
-     * values into the POD bytes. The codegen emits this ONLY when nargs ==
+     * Instr holds only the index). vm_struct_ctor coerces the values into
+     * the POD bytes. The codegen emits this ONLY when nargs ==
      * nfields and every arg is a typed scalar (th==i/f) the inferencer proved
      * assignable, so coerce cannot throw; a defensive throw is caught + given
      * the construction's loc (loc side table). The append-fused ctor is

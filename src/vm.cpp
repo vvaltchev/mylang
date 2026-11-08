@@ -692,7 +692,7 @@ vm_make_dict(EvalContext &ctx, int_type base, int_type npairs)
  * planned ctor, the C4e establish, the JIT's inline guard).
  * The fields are coerced into a stack
  * buffer BEFORE dst is touched (a defensive coerce throw leaves the old
- * value intact - construct_struct_from_values orders the same way). */
+ * value intact). */
 static ML_NOINLINE void
 vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base,
                int_type nf, int_type dst)
@@ -718,7 +718,7 @@ vm_struct_ctor(EvalContext &ctx, StructTypeDef *def, int_type base,
             }
         }
         /* Fresh path: the values are ALREADY coerced (above), so store the
-         * bytes directly - construct_struct_from_values would coerce again. */
+         * bytes directly, with no second coercion. */
         auto obj = make_intrusive<StructObject>(def);
         char *bytes = obj->bytes.data();
         for (int_type i = 0; i < nf; i++)

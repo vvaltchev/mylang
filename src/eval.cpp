@@ -1458,30 +1458,6 @@ const StructTypeDef *native_struct_type_def()
     return def;
 }
 
-/* Construct a POD struct from already-evaluated field VALUES (the VM's
- * StructCtorV, whose field args were compiled into a register run). Mirrors
- * construct_struct's POD path but takes values, not an ExprList to eval. The
- * codegen emits StructCtorV only when nargs == nfields and every arg is a typed
- * scalar the inferencer proved assignable, so coerce_struct_field cannot throw
- * here; a defensive throw is caught + given the construction's loc by the VM
- * handler (empty locs below). */
-intrusive_ptr<StructObject>
-construct_struct_from_values(StructTypeDef *def,
-                            const EvalValue *vals, size_t n)
-{
-    auto obj = make_intrusive<StructObject>(def);
-    for (size_t i = 0; i < n; i++) {
-        const FieldDef &fd = def->fields[i];
-        if (field_exact_scalar(fd, vals[i])) {          /* G3 */
-            obj->pod_set(static_cast<int>(i), vals[i]);
-            continue;
-        }
-        EvalValue v = coerce_struct_field(fd, vals[i], Loc(), Loc());
-        obj->pod_set(static_cast<int>(i), v);
-    }
-    return intrusive_ptr<StructObject>(obj);
-}
-
 intrusive_ptr<StructObject>
 construct_struct_boxed_from_values(StructTypeDef *def, const EvalValue *vals,
                                   size_t nargs, const ArgLoc *locs,

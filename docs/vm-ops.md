@@ -458,8 +458,8 @@ The tree-walker binds it `const`, but that flag is unobservable at runtime (a
 reassign `P = x` is a compile-time `CannotRebindConstEx`, `isconst` folds), so a
 plain `StoreGlobalV` is differential-identical (a REPL map-resident struct falls
 back). A standalone POD construction `P(x, y)` builds via **`StructCtorV`**: the
-field args compile into a register run, then `construct_struct_from_values`
-coerces them into the POD bytes (the `StructTypeDef*` is a `Chunk::struct_defs`
+field args compile into a register run, then `vm_struct_ctor` coerces
+them into the POD bytes (the `StructTypeDef*` is a `Chunk::struct_defs`
 index, so node-free). It's gated on **every arg a typed scalar** (`th==i/f`) —
 the inferencer already rejected a non-fitting typed arg, so `coerce` can't throw
 and no per-arg loc is needed; a **nested POD-struct-field arg** (`L(P(1,2),
