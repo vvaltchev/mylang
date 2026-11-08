@@ -1,0 +1,17 @@
+# INT-ENGINES: tw default nj nbi
+#
+# INT unit (#107): a pure TREE-recursive function deeper than the native
+# call stack's depth cap. Its duplicate self-calls are deduplicated by the
+# caller frame's pure-call cache (CachedCallV), and a cached call that
+# leaves native code at the depth cap takes the boundary path, which
+# probes the same cache (vm_cached_call). Without the cache this program
+# is exponential; with it, linear - and every engine prints the same.
+
+pure func g(int n) {
+    if (n == 0)
+        return 0;
+    return g(n - 1) + g(n - 1) * 0 + 1;
+}
+
+assert(g(int(runtime(3000))) == 3000);
+print(g(int(runtime(3000))));
