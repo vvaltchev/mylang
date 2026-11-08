@@ -15,5 +15,6 @@ zz
 :analyze func ac(x) { var y = x; return y + 1; } func us(q) => ac(q);
 func g(int a) { var t = a + 1; return t * 2; }
 :analyze func k(int a) { return g(a); }
+:analyze func g2(int a) { var t = a + 1; return t * 2; } func k2(int b)=>g2(b);
 :analyze var x = ;
 :analyze 1 + 2;
