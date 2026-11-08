@@ -988,9 +988,13 @@ private:
 
         if (ctag(c) == ConstructType::for_stmt) {
             auto *f = static_cast<ForStmt *>(c);
-            if (f->init && !fold_child(f->init, fc)) f->init.reset();
+            /* the init and the increment are expressions, which fold_child
+             * never drops (only a dead `if` / `while` folds away) */
+            if (f->init)
+                fold_child(f->init, fc);
             fold_reads(f->cond, fc);
-            if (f->inc && !fold_child(f->inc, fc)) f->inc.reset();
+            if (f->inc)
+                fold_child(f->inc, fc);
             if (f->body && !fold_child(f->body, fc)) f->body.reset();
             return true;
         }
@@ -1004,12 +1008,12 @@ private:
 
         if (ctag(c) == ConstructType::try_catch) {
             auto *tc = static_cast<TryCatchStmt *>(c);
-            if (tc->tryBody && !fold_child(tc->tryBody, fc))
-                tc->tryBody.reset();
+            /* every body is a braced block, which fold_child never drops */
+            fold_child(tc->tryBody, fc);
             for (auto &p : tc->catchStmts)
-                if (p.second && !fold_child(p.second, fc)) p.second.reset();
-            if (tc->finallyBody && !fold_child(tc->finallyBody, fc))
-                tc->finallyBody.reset();
+                fold_child(p.second, fc);
+            if (tc->finallyBody)
+                fold_child(tc->finallyBody, fc);
             return true;
         }
 
