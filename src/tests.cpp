@@ -1113,6 +1113,12 @@ static const std::vector<test> tests =
     { "err loc: a struct field with no name",
       { "struct S { int ; }" },
       &typeid(SyntaxErrorEx), 16, 1 },
+    /* only defined() and isbound() narrow: isconst() asks whether a name
+     * is a constant, not whether it exists, so it guards nothing - the
+     * name in its branch is still checked */
+    { "err loc: isconst() of an unknown name does not guard it",
+      { "if (isconst(zork)) print(zork);" },
+      &typeid(UndefinedVariableEx), 26, 1, 31, 1 },
     /* A program's own function, parameter or variable named like a LAZY
      * builtin (defined / isbound / isconst / isconstdecl) is an ordinary
      * call: its argument is evaluated, so a name declared nowhere is the
