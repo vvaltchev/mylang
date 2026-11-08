@@ -24244,6 +24244,38 @@ static bool lineedit_history_nav()
     return ed.buffer() == "live";
 }
 
+/* Editor keys with nothing to act on (#107): Up/Down with no history,
+ * Down while not browsing it, Tab with no completer, Right at the end with
+ * no suggestion, and an ESC followed by a byte that starts no sequence;
+ * and a common prefix where one candidate is a prefix of another, for an
+ * identifier holding '_'. */
+static bool lineedit_keys_with_nothing_to_do()
+{
+    LineEditor ed;
+    le_feed(ed, "ab");
+    le_feed(ed, "\033[A");                         /* Up: no history */
+    le_feed(ed, "\033[B");                         /* Down: no history */
+    ed.feed(9);                                    /* Tab: no completer */
+    le_feed(ed, "\033[C");                         /* Right, at the end */
+    le_feed(ed, "\033x");                          /* ESC + a plain byte */
+    if (ed.buffer() != "ab" || ed.cursor() != 2) return false;
+
+    std::vector<std::string> h = { "x" };
+    LineEditor e2;
+    e2.set_history(&h);
+    le_feed(e2, "live");
+    le_feed(e2, "\033[B");                         /* Down, not browsing */
+    if (e2.buffer() != "live") return false;
+
+    LineEditor e3;
+    e3.set_completer([](const std::string &, size_t) {
+        return std::vector<std::string>{ "my_var2", "my_var" };
+    });
+    le_feed(e3, "my_");
+    e3.feed(9);                                    /* Tab */
+    return e3.buffer() == "my_var" && e3.take_completions().size() == 2;
+}
+
 /* Strip ANSI escape sequences (ESC '[' ... final-letter) from `s`. */
 static std::string strip_ansi(const std::string &s)
 {
@@ -24581,6 +24613,29 @@ static bool histsearch_updown_and_accept()
 
     if (hs.feed(13) != HistorySearch::Action::accept) return false;
     return hs.selected_value() == top;
+}
+
+/* The history search's other key shapes (#107): a CSI arrow with
+ * parameters (ESC [1;5B), an SS3 arrow (ESC O A), an arrow it ignores
+ * (Right), an ESC followed by a plain byte; and an entry holding a tab or
+ * a CR, shown on one line. */
+static bool histsearch_other_keys()
+{
+    std::vector<std::string> hist = { "a\tb", "a\rc", "abc" };
+    HistorySearch hs;
+    hs.set_history(&hist);
+    hs_feed(hs, "a");
+    if (hs.matches().size() != 3) return false;
+    for (const auto &m : hs.matches())
+        if (m.display.find_first_of("\t\r\n") != std::string::npos)
+            return false;
+    hs_feed(hs, "\033[1;5B");                      /* Down, with params */
+    if (hs.selected() != 1) return false;
+    hs_feed(hs, "\033OA");                         /* SS3 Up */
+    if (hs.selected() != 0) return false;
+    hs_feed(hs, "\033[C");                         /* Right: ignored */
+    hs_feed(hs, "\033x");                          /* ESC + a plain byte */
+    return hs.selected() == 0 && hs.query() == "a";
 }
 
 /* Backspace edits the query (matches update); Ctrl-G cancels. */
@@ -60575,6 +60630,10 @@ static const std::vector<extra_check> extra_checks =
     { "lineedit: Enter submits", lineedit_submit_action },
     { "lineedit: Ctrl-C cancels, Ctrl-D eof/delete", lineedit_ctrl_c_and_d },
     { "lineedit: Up/Down history navigation", lineedit_history_nav },
+    { "lineedit: keys with nothing to act on; a prefix candidate",
+      lineedit_keys_with_nothing_to_do },
+    { "histsearch: parameterised, SS3 and ignored arrows; a tab in an entry",
+      histsearch_other_keys },
     { "lineedit: Enter inserts a newline until complete (multi-line)",
       lineedit_multiline_enter_inserts_newline },
     { "lineedit: the REPL keeps an if/try chain open for an else on the "
