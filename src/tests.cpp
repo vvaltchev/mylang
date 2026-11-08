@@ -1062,6 +1062,50 @@ static const std::vector<test> tests =
     { "err loc: a struct type declared below has no such member",
       { "func g() => P.y; struct P { int x; } print(g());" },
       &typeid(TypeMismatchEx), 13, 1, 17, 1 },
+    /* A struct field's type is a struct or class declared somewhere in the
+     * program - further down too (a forward reference). A name no struct
+     * or class takes is not a type, as for a variable: until 2026-11-13
+     * such a field compiled and the constructor refused every value at run
+     * time (TypeErrorEx), or `S s;` raised a NullabilityEx with no caret.
+     * The REPL keeps the forward reference open (a later input may declare
+     * it - the `repl:` case). */
+    { "err loc: a struct field typed by a name declared nowhere",
+      { "struct S { Nope x; } print(1);" },
+      &typeid(SyntaxErrorEx), 12, 1, 17, 1 },
+    { "err loc: a struct field typed by a constant's name",
+      { "const K = 3; struct S { K x; } print(1);" },
+      &typeid(SyntaxErrorEx), 25, 1, 27, 1 },
+    { "err loc: an opt struct field typed by a name declared nowhere",
+      { "struct S { opt Nope x; } print(S(none));" },
+      &typeid(SyntaxErrorEx), 16, 1, 21, 1 },
+    { "err loc: an unknown field type: the first in the source is reported",
+      { "struct A { B b; Nope2 c; } struct B { Nope1 d; }" },
+      &typeid(SyntaxErrorEx), 17, 1, 23, 1 },
+    { "err loc: an unknown field type, over two lines",
+      { "struct A { Zz b; }", "struct B { Yy d; }" },
+      &typeid(SyntaxErrorEx), 12, 1, 15, 1 },
+    { "a struct field may name a class declared below",
+      { "struct S { T x; } class T { int a; }",
+        "assert(S(T(4)).x.a == 4);" } },
+    /* the struct declaration's own syntax errors */
+    { "err loc: a struct with no name",
+      { "struct { int x; }" },
+      &typeid(SyntaxErrorEx), 8, 1 },
+    { "err loc: a struct const member with no name",
+      { "struct S { const = 3; }" },
+      &typeid(SyntaxErrorEx), 18, 1 },
+    { "err loc: a struct const member with no value",
+      { "struct S { const K = ; }" },
+      &typeid(SyntaxErrorEx), 22, 1 },
+    { "err loc: a ?-prefixed scalar struct field is refused as opt is",
+      { "struct S { ?int x; }" },
+      &typeid(SyntaxErrorEx), 12, 1 },
+    { "err loc: a struct field whose type is not a name",
+      { "struct S { 5 x; }" },
+      &typeid(SyntaxErrorEx), 12, 1 },
+    { "err loc: a struct field with no name",
+      { "struct S { int ; }" },
+      &typeid(SyntaxErrorEx), 16, 1 },
     /* A program's own function, parameter or variable named like a LAZY
      * builtin (defined / isbound / isconst / isconstdecl) is an ordinary
      * call: its argument is evaluated, so a name declared nowhere is the
@@ -22844,6 +22888,12 @@ static const std::vector<repl_test> repl_tests =
      * like any function - in a later input and inside a function body -
      * and the builtin it shadows is not consulted (2026-11-13: the
      * resolver folded `defined(p)` to true over the program's function) */
+    /* a struct field may name a struct a LATER input declares: the REPL's
+     * world is open, so the field type is resolved when it is used */
+    { "a struct field names a struct declared in a later input",
+      { { "struct S9 { N9 x; }", "" },
+        { "struct N9 { int a; }", "" },
+        { "S9(N9(5)).x.a", "=> 5" } } },
     { "a program's own defined/isbound is called across inputs",
       { { "func defined(v) { return 42; }", "" },
         { "defined(zork)", "Undefined variable 'zork'" },

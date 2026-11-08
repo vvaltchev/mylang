@@ -2791,6 +2791,11 @@ and `opt` is allowed only on a `dyn`/`array`/`dict` field or a field of a
 class type (see *Classes*; a non-opt field is guaranteed never `none`). An
 uninitialised field-less use isn't possible — every field is
 supplied at construction (or defaulted to `none` when an omitted optional).
+A field's struct or class type may be declared further down the program
+(`struct Line { Point a; Point b; }` above `struct Point`), but it must be
+declared somewhere: a field typed by a name that names no struct or class
+(`struct S { Nope x; }`) is a compile error, `'Nope' is not a type`, as
+for a variable. In the REPL a later input may still declare it.
 
 **A struct may have no fields.** `struct Unit {}` is legal, and so is one
 that declares only `const` members (`struct Marker { const TAG = 7; }` —

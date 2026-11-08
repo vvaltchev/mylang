@@ -96,6 +96,10 @@ struct FieldDef {
      * (an `opt` on a field whose type turns out to be a struct). Not
      * stored in a .myv image. */
     Loc loc;
+    /* Where an f_struct field's type NAME is written - for the error when
+     * no struct or class of that name is declared (a forward reference is
+     * decided once the whole program is parsed). Not stored either. */
+    Loc type_loc;
 };
 
 /*

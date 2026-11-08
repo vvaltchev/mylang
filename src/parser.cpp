@@ -4201,6 +4201,7 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         } else if (*c == TokType::id) {
             fd.kind = FieldKind::f_struct;
             fd.struct_ty = UniqueId::get(c.get_str());
+            fd.type_loc = c.get_loc();
             /* Resolve the nested type if it was declared before this struct
              * (its descriptor is in const_ctx): a POD nested struct is then
              * embedded inline (compute_layout); a forward-ref / boxed one stays

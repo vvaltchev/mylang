@@ -298,6 +298,11 @@ public:
      * named-argument lowering (both required for correctness), but skips the
      * fixpoint / checking / strict enforcement. */
     bool checks_enabled = true;
+    /* The program is WHOLE (infer_types): a struct field's type named by a
+     * forward reference must be declared somewhere in it. False for the
+     * REPL, whose later input may still declare it, and for a parse-time
+     * call's copy, which holds only the declarations the call reaches. */
+    bool closed_world = false;
 
 private:
 
@@ -2025,6 +2030,31 @@ void Inferencer::setup()
  */
 void Inferencer::check_opt_struct_fields()
 {
+    /* a field typed by a name declared further down (a forward reference)
+     * is resolved here; one no struct or class of the program takes is
+     * not a type - "'K' is not a type", as for a variable (the parser's
+     * not_a_type). The first in SOURCE order. */
+    if (closed_world) {
+        const FieldDef *unk = nullptr;
+        for (const StructTypeDef *d : declared_structs)
+            for (const FieldDef &f : d->fields) {
+                if (f.kind != FieldKind::f_struct || f.struct_def
+                        || struct_by_name.count(f.struct_ty))
+                    continue;
+                if (!unk || f.type_loc.line < unk->type_loc.line
+                    || (f.type_loc.line == unk->type_loc.line
+                        && f.type_loc.col < unk->type_loc.col))
+                    unk = &f;
+            }
+        if (unk) {
+            const std::string n(unk->struct_ty->val);
+            SyntaxErrorEx e(unk->type_loc,
+                            intern_msg("'" + n + "' is not a type"));
+            e.loc_end = unk->type_loc + static_cast<int>(n.size() + 1);
+            throw e;
+        }
+    }
+
     /* the first in SOURCE order: the map's own order follows pointers */
     const FieldDef *bad = nullptr;
     for (const StructTypeDef *d : declared_structs)
@@ -9688,6 +9718,7 @@ void infer_types(Construct *root, bool enable, bool strict)
     /* -nti still lowers named-arg calls (syntactic, required for correctness),
      * but skips the fixpoint / type checking / strict enforcement. */
     inf.checks_enabled = enable;
+    inf.closed_world = true;
     inf.run();
 }
 
