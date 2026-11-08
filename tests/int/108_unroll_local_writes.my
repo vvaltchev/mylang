@@ -1,0 +1,44 @@
+# INT-ENGINES: tw default nj noopt ni
+#
+# INT unit (#107): a pure tree-recursive function is unrolled one level
+# into itself, and each inlined copy's write-once locals are copy-
+# propagated (Inliner::collapse_locals). A local is collapsed only when
+# nothing else in the body writes it, so the write count must see every
+# kind of write in the copy:
+#  - a multi-assignment target (g: t is rewritten by `u, t = [...]`);
+#  - a catch clause with no binding next to a write in its body (f);
+#  - a mutating builtin's first argument (h: pop(t) on a local bound to
+#    a constant array, in a branch that never runs).
+# Every engine must print what the tree-walker prints, with and without
+# the inliner.
+
+struct E { int c; }
+const K = [4, 5];
+
+pure func f(int n) {
+    if (n < 2) return n;
+    var t = n + 1;
+    var w = 0;
+    try { w = 2; } catch (E) { w = 9; }
+    return f(n - 1) + f(n - 2) + t + w;
+}
+
+pure func g(int n) {
+    if (n < 2) return n;
+    var t = n + 1;
+    var u = 0;
+    u, t = [t + 1, 3];
+    return g(n - 1) + g(n - 2) + t + u;
+}
+
+pure func h(int n) {
+    if (n < 2) return n;
+    var t = K;
+    if (n == 99) pop(t);
+    return h(n - 1) + h(n - 2) + len(t);
+}
+
+assert(f(int(runtime(10))) == 628);
+assert(g(int(runtime(10))) == 804);
+assert(h(int(runtime(10))) == 231);
+print(f(int(runtime(10))), g(int(runtime(10))), h(int(runtime(10))));
