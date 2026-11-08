@@ -1,0 +1,57 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): `foreach (var a, b in rows)` unpacks each row into the
+# loop variables (the VM's UnpackElem* ops, vm_unpack_elem_body):
+#  - an element that is not an array (the rows came through a `dyn`)
+#    raises TypeErrorEx;
+#  - a body that removes rows under the loop raises OutOfBoundsEx at the
+#    row that is gone (README, *Modifying the container during the loop*);
+#  - a typed `array<array<int>>` / `array<array<float>>` whose row is
+#    stored GENERAL (built by dynarray) is unpacked from what it holds.
+# The tree-walker is the oracle; every engine must print the same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+var r = "";
+var dyn d = [1, 2];
+try {
+    foreach (var a, b in d)
+        r += "x";
+} catch (TypeErrorEx) {
+    r += "T";
+}
+want("an element that is not an array", r, "T");
+
+var rows = [[1, 2], [3, 4], [5, 6]];
+var s = 0;
+r = "";
+try {
+    foreach (var a, b in rows) {
+        s += a * 10 + b;
+        pop(rows);
+    }
+} catch (OutOfBoundsEx) {
+    r = "O";
+}
+want("rows removed under the loop", r + str(s), "O12");
+
+array<array<int>> m = [[1, 2], dynarray([3, 4])];
+var t = 0;
+foreach (var a, b in m)
+    t += a + b;
+want("an int row stored general", t, 10);
+
+array<array<float>> fm = [[1.5, 2.5], dynarray([3.5, 4.5])];
+var u = 0.0;
+foreach (var a, b in fm)
+    u += a + b;
+want("a float row stored general", u, 12.0);
+
+assert(bad == 0);
+print("ok");
