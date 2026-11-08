@@ -1113,6 +1113,15 @@ static const std::vector<test> tests =
     { "err loc: a struct field with no name",
       { "struct S { int ; }" },
       &typeid(SyntaxErrorEx), 16, 1 },
+    /* a typed `const` scalar is converted as a typed variable is: a float
+     * from a float, an int or a bool, an int from a bool; a typed const
+     * container is checked by the inferencer, not here */
+    { "typed const scalars and a typed const container",
+      { "const float a = 2.5; const float b = 3; const float c = true;",
+        "const int d = true; const array<int> e = [1];",
+        "assert(a == 2.5 && b == 3.0 && c == 1.0 && d == 1 && e[0] == 1);",
+        "assert(typestr(b) == \"float\" && typestr(c) == \"float\");",
+        "assert(typestr(d) == \"int\");" } },
     /* a str times an int repeats it, and the compiler types it str */
     { "a str times an int is a str",
       { "var s = str(runtime(\"ab\")); var n = int(runtime(3));",
@@ -25002,7 +25011,22 @@ static bool replhelp_unknown_and_topics()
         if (s == "array")         has_array = true;
         if (s == "array_storage") has_array_storage = true;
     }
-    return has_array && has_array_storage;
+    if (!has_array || !has_array_storage)
+        return false;
+    /* every kind of topic completes: the three lists, a command, a
+     * language category and a language feature */
+    const auto has = [](const std::vector<std::string> &v, const char *x) {
+        for (const auto &s : v)
+            if (s == x)
+                return true;
+        return false;
+    };
+    const auto all = repl_help_topics("");
+    return has(all, "builtins") && has(all, "language")
+        && has(all, "commands") && has(repl_help_topics("tra"), "trace")
+        && has(repl_help_topics("bas"), "basics")
+        && has(repl_help_topics("val"), "values")
+        && !has(repl_help_topics("zzz"), "trace");
 }
 
 /* -a/--analyze greens the `for` keyword of a counted (ForRangeStmt) loop, and
