@@ -1,0 +1,69 @@
+# INT-ENGINES: tw default nj nbi noopt
+#
+# INT unit (#107): the counted-loop rewrite (ForRangeStmt, CLAUDE.md
+# "Counted-loop specialization") takes `for (var i = A; i < B; i++)` and
+# its three siblings only. Each shape here is one it must DECLINE - a
+# chained comparison, an increment of another variable (++ or +=), an
+# increment that is a call, a `dyn` step, a loop with no increment or no
+# initializer - and the plain loop that runs instead must give the same
+# answer: `noopt` (every AST transform off) is its oracle.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+func loops(int n) {
+    var r = [];
+    var s = 0;
+    for (var i = 0; i < n > 0; i++)          # a chained comparison
+        s += i;
+    append(r, s);
+    s = 0;
+    var j = 0;
+    for (var i = 0; i < n; j++) {            # ++ of another variable
+        s += i;
+        i++;
+    }
+    append(r, s * 100 + j);
+    s = 0;
+    j = 0;
+    for (var i = 0; i < n; j += 2) {         # += into another variable
+        s += i;
+        i++;
+    }
+    append(r, s * 100 + j);
+    var t = [0];
+    s = 0;
+    for (var i = 0; i < n; append(t, i)) {   # a call
+        s += i;
+        i++;
+    }
+    append(r, s * 100 + len(t));
+    var dyn d = runtime(1);
+    s = 0;
+    for (var i = 0; i < n; i += d)           # a dyn step
+        s += i;
+    append(r, s);
+    s = 0;
+    for (var i = 0; i < n;) {                # no increment
+        s += i;
+        i++;
+    }
+    append(r, s);
+    s = 0;
+    var k = 0;
+    for (; k < n; k++)                       # no initializer
+        s += k;
+    append(r, s);
+    return r;
+}
+
+want("declined loops", loops(int(runtime(4))),
+     [6, 604, 608, 605, 6, 6, 6]);
+
+assert(bad == 0);
+print("ok");

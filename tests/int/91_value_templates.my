@@ -6,8 +6,9 @@
 # every engine must print: the instance a direct call already made is
 # reused, an `opt` parameter is not part of the signature, two value
 # sites that disagree leave the base running boxed, a wrong arity
-# through a value raises at run time, and a `dyn` argument gives no
-# instance at all (it could be no better than the base).
+# through a value (too few, too many) raises at run time, and a `dyn`
+# argument gives no instance at all (it could be no better than the
+# base).
 
 # (a) a direct call makes the instance first; the value use reuses it
 func sq(x) { var t = x * x; return t; }
@@ -39,6 +40,11 @@ try {
 } catch (InvalidNumberOfArgsEx) {
     msg = "arity";
 }
+try {
+    m(int(runtime(1)), 2, 3);
+} catch (InvalidNumberOfArgsEx) {
+    msg += "+";
+}
 
 # (e) a dyn argument: the clone would be no better than the base
 func neg(x) { return -x; }
@@ -49,4 +55,4 @@ var dyn n1 = n(arg);
 
 print(d1, d2, h1, k1, k2, msg, n1);
 assert(d1 == 9 && d2 == 16 && h1 == 11);
-assert(k1 == 4 && k2 == "abab" && msg == "arity" && n1 == -7);
+assert(k1 == 4 && k2 == "abab" && msg == "arity+" && n1 == -7);
