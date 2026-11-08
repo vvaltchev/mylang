@@ -14956,6 +14956,18 @@ LoadElemValue, `pick_visit_op` treats it as a helper op, and
 for the inline tier - is unchanged: the same navigation, the same
 byte load, a `jae` to the decline pad where the `jb`+bail was.
 
+**`jit_load_elem_bool` IS BACK (2026-11-14), FOR A CHECK THE SHARED
+HELPER CANNOT MAKE.** A general `array<bool>` (`dynarray()`, an inline
+`keys()` of a `dict<bool, _>`) holds whatever a `dyn` alias stored, and
+`jit_load_elem_value` boxes any element: the JIT bound the string `"s"`
+into the bool loop variable (and found it true), the interpreter read it
+as `false`, the tree-walker bound it and failed at its first use. The
+decline now goes to `jit_load_elem_bool`, which shares `vm_bool_elem`
+with the interpreted handler: OOB as before, a non-bool element a
+loc-less `TypeErrorEx` the fragment stamps with the container's caret.
+The inline tier is unchanged (a flat bool array cannot hold a misfit).
+Pinned by `tests/backtrace/foreach_typed_misfit.my`.
+
 ## #38 REPRO B - THE JIT NAMED THE WRONG INLINED-AT CHAIN, THREE WAYS
 ## (2026-09-25)
 

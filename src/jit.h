@@ -1166,8 +1166,12 @@ extern "C" void jit_struct_ctor_planned(const void *def, const void *plan,
  * boxed condition no longer splits the run at the branch. */
 extern "C" int jit_is_true(int_type cond_slot) noexcept;
 
-/* (LoadElemBool's own helper is gone - #53: its declines take
- * jit_load_elem_value, which conveys the foreach's OutOfBoundsEx.) */
+/* LoadElemBool's decline tier (#53, and its own helper again since
+ * 2026-11-14: a general element that is no bool is a TypeErrorEx, which
+ * jit_load_elem_value - the decline until then - cannot see). Returns
+ * non-zero when it raised, conveying loc-less. */
+extern "C" int jit_load_elem_bool(int_type dst, int_type base,
+                                  int_type idx) noexcept;
 extern "C" void jit_load_str_char(int_type dst, int_type base,
                                   int_type idx) noexcept;
 extern "C" void jit_load_struct_field(int_type dst, int_type base, int_type idx,

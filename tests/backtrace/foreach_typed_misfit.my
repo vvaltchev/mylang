@@ -1,0 +1,36 @@
+# A foreach over a GENERAL array<bool> whose element a `dyn` alias
+# replaced: the loop variable is typed bool, so the element that is no
+# bool is a TypeErrorEx at the container, in every engine. Until
+# 2026-11-14 the VM read it as `false`, the JIT bound the string (and
+# found it true), and the tree-walker bound it and failed at its first
+# use - three outcomes. The int twin runs first, caught.
+
+func ints(array<int> a) {
+    var dyn x = a;
+    x[0] = none;
+    var t = 0;
+    foreach (var v in a)
+        t += v * 2;
+    return t;
+}
+
+func bools(array<bool> a, int bad) {
+    var dyn x = a;
+    if (bad > 0)
+        x[0] = none;
+    var n = 0;
+    foreach (var v in a) {
+        if (v)
+            n++;
+    }
+    return n;
+}
+
+try {
+    ints(dynarray([1, 2]));
+} catch (TypeErrorEx) {
+    print("ints refused");
+}
+for (var k = 0; k < 3; k++)
+    print(bools(dynarray([true, false]), 0));
+print(bools(dynarray([true, false]), runtime(1)));

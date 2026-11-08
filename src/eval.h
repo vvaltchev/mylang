@@ -133,6 +133,45 @@ inline float_type general_elem_float(const LValue &e)
     return e.getval<float_type>();
 }
 
+/*
+ * A dict value or a general array element that a TYPED read takes as an
+ * int (or a float) holds a number of that kind: inference proved the
+ * container's element type, and the one way to store anything else is a
+ * `dyn` alias of it (#49 leaves a container reached through a dyn NAME
+ * unchecked). A read meeting anything else - a string - raises
+ * TypeErrorEx at the READ's caret, the span its OutOfBoundsEx or
+ * KeyNotFoundEx takes, in every engine (RULE 2: the tree-walker marked
+ * the enclosing statement, the VM nothing, the JIT the read).
+ */
+inline bool reads_as_int(const EvalValue &v)
+{
+    return v.is<int_type>() || v.is<bool>();
+}
+
+inline bool reads_as_float(const EvalValue &v)
+{
+    return v.is<float_type>() || v.is<int_type>() || v.is<bool>();
+}
+
+/* the tree-walker's form, whose caret is in hand */
+inline int_type typed_read_int(const EvalValue &v, Loc s, Loc e)
+{
+    if (!reads_as_int(v))
+        throw TypeErrorEx(s, e);
+    return v.is<bool>() ? (v.get<bool>() ? 1 : 0) : v.get<int_type>();
+}
+
+inline float_type typed_read_float(const EvalValue &v, Loc s, Loc e)
+{
+    if (!reads_as_float(v))
+        throw TypeErrorEx(s, e);
+    if (v.is<int_type>())
+        return static_cast<float_type>(v.get<int_type>());
+    if (v.is<bool>())
+        return v.get<bool>() ? 1.0 : 0.0;
+    return v.get<float_type>();
+}
+
 /* Node-POOLED (poolalloc.h) like the dict map: a recursion's per-frame
  * cache inserts a node per novel call - the pool serves + reuses them. */
 /* -npc: the per-frame pure-call cache is OFF.  Declared HERE, above

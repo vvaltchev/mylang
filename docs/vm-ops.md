@@ -78,7 +78,12 @@ counter is bounded by the length at the loop's start, and a body that shrank
 the array leaves the element gone, the foreach's defined `OutOfBoundsEx` with
 the container's caret (`LoadElemBool`, `LoadStructElemV` and `ForeachDynNext`
 record it in `locs` for that reason; `LoadElemBool`'s JIT tier declines to
-`jit_load_elem_value`, a STATUS helper, where it used to bail). **#53 option
+`jit_load_elem_bool`, a STATUS helper, where it used to bail). An element of
+a GENERAL array<bool> that is no bool - what a `dyn` alias stored - is a
+`TypeErrorEx` at the same caret (`vm_bool_elem`, the one answer for the
+handler and the helper); a general element LoadElemInt/Float meets that is
+no number is too (`vm_general_elem_int/float`), as is a DictLoadInt/Float
+value - the interpreter threw getval's loc-less error, located nowhere. **#53 option
 1 - THE SHIFT GUARD:** a body that MOVES elements (pop / erase / an insert
 not at the end - each bumps `SharedObject::shift_epoch`) raises that same
 `OutOfBoundsEx` at the next step even when the length is unchanged.

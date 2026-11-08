@@ -4458,6 +4458,46 @@ extern "C" int jit_subscript(LValue *base_lv, const EvalValue *idx,
  * scalar; the CALLER writes its slot (the interpreter via write_*_slot,
  * the helper via the dst LValue). A non-array base is the InternalErrorEx
  * net (base_array is proven; rides g_vm_jit_eptr from the helper). */
+/* A GENERAL element a typed op reads as an int / a float holds no
+ * number - a string a `dyn` alias stored into an array<int> (#49 leaves a
+ * container reached through a dyn NAME unchecked). That is a TypeErrorEx
+ * at the READ's caret, the span its OutOfBoundsEx takes, which is where
+ * the tree-walker (Subscript::eval_int) and the JIT's exc-stamp put it:
+ * the interpreter threw getval's loc-less error, so a run without the JIT
+ * located it nowhere ("line 0"). `chunk` null - the JIT's helpers - stays
+ * loc-less for the fragment's stamp to convey, as OOB does. */
+[[noreturn]] static ML_NOINLINE void
+vm_elem_type_error(const Chunk *chunk, size_t pc,
+                   const std::pair<Loc, Loc> *lp)
+{
+    Loc ls, le;
+    if (lp) {
+        ls = lp->first;
+        le = lp->second;
+    } else if (chunk) {
+        chunk->loc_at(pc, ls, le);
+    }
+    throw TypeErrorEx(ls, le);
+}
+
+static ML_ALWAYS_INLINE int_type
+vm_general_elem_int(const LValue &e, const Chunk *chunk, size_t pc,
+                    const std::pair<Loc, Loc> *lp = nullptr)
+{
+    if (!e.is<int_type>() && !e.is<bool>())
+        vm_elem_type_error(chunk, pc, lp);
+    return general_elem_int(e);
+}
+
+static ML_ALWAYS_INLINE float_type
+vm_general_elem_float(const LValue &e, const Chunk *chunk, size_t pc,
+                      const std::pair<Loc, Loc> *lp)
+{
+    if (!e.is<float_type>() && !e.is<int_type>() && !e.is<bool>())
+        vm_elem_type_error(chunk, pc, lp);
+    return general_elem_float(e);
+}
+
 static ML_ALWAYS_INLINE int_type
 vm_load_elem_int_core(const EvalValue &base, int_type idx,
                       const Chunk *chunk, size_t pc,
@@ -4483,7 +4523,7 @@ vm_load_elem_int_core(const EvalValue &base, int_type idx,
         return arr.flat_ints()[at];
     if (arr.skind() == SharedArrayObj::Storage::bools)
         return arr.flat_bools()[at] ? 1 : 0;
-    return general_elem_int(arr.get_vec()[at]);
+    return vm_general_elem_int(arr.get_vec()[at], chunk, pc, lp);
 }
 
 static ML_ALWAYS_INLINE float_type
@@ -4511,7 +4551,7 @@ vm_load_elem_float_core(const EvalValue &base, int_type idx,
         return arr.flat_floats()[at];
     if (arr.skind() == SharedArrayObj::Storage::ints)
         return static_cast<float_type>(arr.flat_ints()[at]);
-    return general_elem_float(arr.get_vec()[at]);
+    return vm_general_elem_float(arr.get_vec()[at], chunk, pc, lp);
 }
 
 /*
@@ -5644,6 +5684,65 @@ extern "C" int jit_load_elem_value(int_type dst, int_type base,
      * (H2) - see the interpreted twin's comment. */
     f->at(dst).put(vm_arr_elem(arr, static_cast<size_type>(i)));
     return 0;
+}
+
+/*
+ * The bool foreach loop variable's element (LoadElemBool): 0 = a bool, in
+ * `out`; 1 = past the end - the loop is bounded by the length at its
+ * START and the body may have shrunk the array, the foreach's defined
+ * OutOfBoundsEx (#53); 2 = not a bool. A GENERAL array<bool> (dynarray(),
+ * an inline keys() of a dict<bool, _>) holds whatever a `dyn` alias
+ * stored into it, and the loop variable is typed bool: such an element
+ * is a TypeErrorEx at the container, as LoadElemInt's misfit is. Until
+ * 2026-11-14 the VM read it as `false`, the JIT bound the string and
+ * the tree-walker bound it and failed at its first use. ONE answer for
+ * the interpreted handler and its JIT decline tier (jit_load_elem_bool).
+ */
+static ML_ALWAYS_INLINE int
+vm_bool_elem(const SharedArrayObj &arr, int_type idx, bool &out)
+{
+    if (idx < 0 || static_cast<size_type>(idx) >= arr.size())
+        return 1;
+    if (arr.skind() == SharedArrayObj::Storage::bools) {
+        out = arr.flat_bools()[arr.offset() + idx] != 0;
+        return 0;
+    }
+    if (arr.skind() != SharedArrayObj::Storage::general)
+        return 2;
+    const EvalValue &e = arr.get_view()[idx].get();
+    if (!e.is<bool>())
+        return 2;
+    out = e.get<bool>();
+    return 0;
+}
+
+/* LoadElemBool's decline tier: a slice, a general array, an element the
+ * body removed or one that is no bool - each through vm_bool_elem,
+ * conveying its exception LOC-LESS for the fragment's stamp (the
+ * container's caret), as jit_load_elem_value conveys its OOB. */
+extern "C" int jit_load_elem_bool(int_type dst, int_type base,
+                                  int_type idx) noexcept
+{
+    ML_JIT_OP_RAN(LoadElemBool);
+    Frame *f = g_current_ctx->frame;
+    const EvalValue &basev = f->at(base).get();
+    if (!basev.is<SharedArrayObj>()) {
+        /* the proven base's net, as jit_load_elem_value's */
+        g_vm_jit_eptr = std::make_exception_ptr(InternalErrorEx());
+        return 1;
+    }
+    bool b = false;
+    switch (vm_bool_elem(basev.get_ref<SharedArrayObj>(), idx, b)) {
+    case 0:
+        f->at(dst).put(EvalValue(b));
+        return 0;
+    case 1:
+        g_vm_jit_exc.reset(new OutOfBoundsEx());
+        return 1;
+    default:
+        g_vm_jit_exc.reset(new TypeErrorEx());
+        return 1;
+    }
 }
 
 /* TWO ENTRY POINTS (int/float) so the scalar kind is a compile-time
@@ -12341,7 +12440,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 else if (arr.skind() == SharedArrayObj::Storage::bools)
                     v = arr.flat_bools()[at] ? 1 : 0;
                 else
-                    v = general_elem_int(arr.get_vec()[at]);
+                    v = vm_general_elem_int(arr.get_vec()[at], chunk, pc);
                 if (v == 0) {
                     pc = in->target;
                     VM_NEXT;
@@ -12427,7 +12526,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 else if (arr.skind() == SharedArrayObj::Storage::bools)
                     v = arr.flat_bools()[at] ? 1 : 0;
                 else
-                    v = general_elem_int(arr.get_vec()[at]);
+                    v = vm_general_elem_int(arr.get_vec()[at], chunk, pc);
                 write_int_slot(&ctx, in->b_dual_hi(), v);
             } else {
                 throw InternalErrorEx();   /* base proven an array */
@@ -12583,24 +12682,16 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             const int_type idx = read_int_operand(in->a(), &ctx);
             bool b = false;
             if (bv.is<SharedArrayObj>()) {
-                const SharedArrayObj &arr = bv.get_ref<SharedArrayObj>();
-                /* #53: the index is loop-bounded by the length at the
-                 * loop's START, and the body may have shrunk the array
-                 * since - the element is gone, which is the foreach's
-                 * defined OutOfBoundsEx (every engine; the JIT's inline
-                 * tier bails here on the same test). */
-                if (idx >= 0 && static_cast<size_type>(idx) >= arr.size()) {
+                /* #53: the element the body removed, and a non-bool one
+                 * (vm_bool_elem), each raise at the container's caret */
+                const int r = vm_bool_elem(bv.get_ref<SharedArrayObj>(),
+                                           idx, b);
+                if (r != 0) {
                     Loc ls, le;
                     chunk->loc_at(pc, ls, le);
-                    throw OutOfBoundsEx(ls, le);
-                }
-                if (idx >= 0 && static_cast<size_type>(idx) < arr.size()) {
-                    if (arr.skind() == SharedArrayObj::Storage::bools) {
-                        b = arr.flat_bools()[arr.offset() + idx] != 0;
-                    } else {                            /* general fallback */
-                        const EvalValue &e = arr.get_view()[idx].get();
-                        b = e.is<bool>() && e.get<bool>();
-                    }
+                    if (r == 1)
+                        throw OutOfBoundsEx(ls, le);
+                    throw TypeErrorEx(ls, le);
                 }
             }
             ctx.frame->at(in->target).put(EvalValue(b));
@@ -12969,6 +13060,11 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             if (base.is<intrusive_ptr<DictObject>>())
                 if (const EvalValue *v = dict_present_value(
                         base.get_ref<intrusive_ptr<DictObject>>(), key)) {
+                    /* a laundered misfit raises at this read's caret
+                     * (reads_as_int): write_scalar_slot's throw is
+                     * loc-less, and nothing here stamps it */
+                    if (!(is_int ? reads_as_int(*v) : reads_as_float(*v)))
+                        vm_elem_type_error(chunk, pc, nullptr);
                     write_scalar_slot(&ctx, in->target, is_int, *v);
                     pc++;
                     VM_NEXT;

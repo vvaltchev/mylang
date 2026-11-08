@@ -1733,7 +1733,17 @@ slot = "now a string";           # ok, because it's dyn
     checked. The check is made where a value ENTERS a typed place, so
     one gap remains: a container reached through a `dyn` name is not a
     typed place, and `var dyn d = rows; d[0] = ["x"]` stores into the
-    `array<array<int>>` that `rows` names without a check.
+    `array<array<int>>` that `rows` names without a check. (An array
+    whose element type is `int`, `float` or `bool` is stored compactly
+    and refuses such a store - see `array_storage()` - unless it was
+    built with the general representation, as `dynarray()` builds it.)
+    Such a value is caught where it is read as the declared type: an
+    element read as a number (`a[i] * 2` of an `array<int>`), a dict
+    value read that way (`d.k + 1` of a `dict<str, int>`) and a typed
+    `foreach` variable raise `TypeErrorEx` at that read - the caret
+    marks the element read, or the container of the `foreach` - when
+    the value is not of the declared type (a `bool` reads as `0`/`1`
+    and an `int` as a float, as everywhere).
 
     With type inference disabled (`-nti`) the parameter and constructor
     checks still run - the declaration alone decides them, as it does
