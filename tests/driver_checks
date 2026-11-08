@@ -1536,6 +1536,15 @@ if [ -f "$TMP/tw.myv" ] && [ -f "$TMP/d.x/prog.myv" ] &&
 else
     fail "-c with no -o: $(ls "$TMP" "$TMP/d.x" | tr '\n' ' ')"
 fi
+# ...and a path with no directory part (run from the source's directory)
+cp "$TMP/f3.my" "$TMP/rel.my"
+abs_bin="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
+if (cd "$TMP" && "$abs_bin" -c rel.my >/dev/null 2>&1) &&
+   [ -f "$TMP/rel.myv" ] && [ "$("$BIN" "$TMP/rel.myv")" = "3 " ]; then
+    pass "-c with no -o and no directory: rel.my -> rel.myv"
+else
+    fail "-c with no -o and no directory: $(ls "$TMP" | tr '\n' ' ')"
+fi
 flag "-c refuses an argument it does not know" 1 \
      'unexpected argument after -c: extra' -c "$TMP/tw.my" extra
 flag "-vd of an image disassembles the loaded program" 0 \
