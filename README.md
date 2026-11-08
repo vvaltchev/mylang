@@ -2702,7 +2702,10 @@ exceptions that can be caught with `try-catch` blocks is:
   * InvalidArgumentEx (a builtin got a bad argument *value*, e.g. `max` of an
     empty array)
   * InvalidNumberOfArgsEx (a builtin call with the wrong number of arguments —
-    builtins validate arity at *runtime*)
+    builtins validate arity at *runtime* — and a function reached through a
+    `dyn` value, or called back by a builtin, that takes another number of
+    parameters than it is given: `filter(func() => true, [1])` passes its
+    callback one argument)
   * CannotChangeConstEx (a `const`/read-only container mutated through a
     mutating builtin — `append`/`push`/`insert`/`erase`/`sort`; the const-ness
     is a *runtime* property, e.g. an aliased const passed as a parameter)
