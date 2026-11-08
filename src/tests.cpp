@@ -1131,6 +1131,14 @@ static const std::vector<test> tests =
     { "err loc: no zero value for a struct declared below the variable",
       { "struct A { B b; } A a; struct B { int x; } print(a);" },
       &typeid(NullabilityEx), 21, 1, 23, 1 },
+    /* a float element read in a float expression, past either end */
+    { "a float element read out of range raises OutOfBoundsEx",
+      { "array<float> f = [1.5, 2.5]; var r = \"\";",
+        "try { var x = f[int(runtime(5))] * 2.0; r = str(x); }",
+        "catch (OutOfBoundsEx) { r = \"O\"; }",
+        "try { var y = f[int(runtime(-3))] + 1.0; r += str(y); }",
+        "catch (OutOfBoundsEx) { r += \"N\"; }",
+        "assert(r == \"ON\" && f[int(runtime(-1))] * 2.0 == 5.0);" } },
     /* A non-determining constant beside one other operand (`false || x`,
      * `true && x`) collapses to x only when x is itself a bool - an `||`,
      * an `&&`, a comparison, a `!` - and stays an `||`/`&&` (a bool) for
