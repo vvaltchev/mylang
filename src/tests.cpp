@@ -1131,6 +1131,16 @@ static const std::vector<test> tests =
     { "err loc: no zero value for a struct declared below the variable",
       { "struct A { B b; } A a; struct B { int x; } print(a);" },
       &typeid(NullabilityEx), 21, 1, 23, 1 },
+    /* A non-determining constant beside one other operand (`false || x`,
+     * `true && x`) collapses to x only when x is itself a bool - an `||`,
+     * an `&&`, a comparison, a `!` - and stays an `||`/`&&` (a bool) for
+     * anything else (`-x`): the answer is the same either way */
+    { "false || x and true && x keep a bool answer",
+      { "var dyn x = runtime(1); var a = len(str(runtime(1))) == 1;",
+        "var b = !a;",
+        "assert((false || (a || b)) == true && (false || !x) == false);",
+        "assert((true && -x) == true && (false || (a && b)) == false);",
+        "assert(typestr(true && -x) == \"bool\");" } },
     /* decltype() names a VARIABLE: a builtin is not one; and the program's
      * own typestr/kindstr is called like any function */
     { "err loc: decltype of a builtin is refused",
