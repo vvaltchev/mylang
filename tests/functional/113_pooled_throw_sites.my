@@ -1,0 +1,26 @@
+# A call the compiler knows will fail when it runs - a builtin given no
+# argument at all, or defined() given two - still compiles, and raises its
+# error when it runs, where a try can catch it. The compiled program holds
+# such a call as a record of the error to raise (the chunk's `throws`
+# pool); a stored image (mylang -c) keeps the record, and loading the
+# image raises the same error. The image round trip in driver_checks
+# compiles this program, so it is also what puts that record through the
+# writer, the loader and the -vd dump.
+
+var r = "";
+try {
+    append();
+} catch (InvalidNumberOfArgsEx) {
+    r += "a";
+}
+func f() {
+    try {
+        defined(runtime(1), 2);
+    } catch (InvalidNumberOfArgsEx) {
+        return "d";
+    }
+    return "x";
+}
+r += f();
+assert(r == "ad");
+print("ok");
