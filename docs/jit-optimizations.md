@@ -18233,3 +18233,57 @@ retarget in memory after a load and runs the image; it requires the
 untampered image to enter the hoist region (`g_jit_hoist`), so the
 preheader it checks is emitted. Watched: without the fix it aborts with
 the finding's REGTRACK message (rc 134); restored, it passes.
+
+## ref_slots reads in-place builtin calls via the pooled table (2026-11-09)
+
+**The gap.** `compute_ref_slots` (codegen.cpp) walked each op with
+`visit_use_def` proper, where `CallBuiltinLV` / `LVElem` / `LVMember`
+(pop / sort / insert / ... on a named first argument) are BARRIERS -
+their value run lives in the `builtin_calls` pool. A barrier makes the
+pass list every slot, so any function calling one paid the reference
+guard on every scalar store and a full release scan at every return.
+The pool-aware twin `visit_use_def_pooled` had their rows since
+2026-10-03 (above), used by the JIT's liveness but never by this pass.
+It does now.
+
+**Why arg0 not being a def is sound HERE.** For liveness a missing def
+only costs a kill; for ref_slots it is the dangerous direction. Every
+in-place builtin either only reads arg0 (`intptr`, `refcount`) or
+refuses an arg0 that is not a container, and its one write back into
+the slot (sort / reverse storing a materialized slice) stores an array
+where an array was, as struct_own's copy into a shared or borrowed
+holder does. So arg0 holds a reference before the call, and whatever
+wrote it listed it - an op, a parameter seed, a catch bind. In a
+raw-scalar frame (`ref_slots_raw`, no seeds) the builtin throws on it.
+
+**Emitted code.** 13 of 223 programs (tests/functional, samples,
+bench/my) change, every one through its lists: `take(rows, int n)` in
+tests/functional/105 lists 3 of 6 slots where it listed all 6. Ir
+(`OPT=1 ASSERTS=0`, `-npc`): the changed functional programs -0.44% to
++0.02%; 21_array_reverse, 33_sort_ints and 34_sort_custom_cmp have an
+identical per-scale cost (their hot loop is inside the C++ builtin) and
+a constant +35-39k Ir of JIT emission: main's `halt` now releases its
+five listed slots inline (18 -> 224 instructions, run once) where an
+all-slots list called the scan helper.
+
+**Not done, measured.** A compile and its `.myv` image still disagree
+about these lists in 26 of 120 functional/sample programs (the new
+`; refs:` line in `-vdj` prints them). Three causes, none unsound: the
+loader cannot verify a call's scalar-result claim when the callee
+returns a `len()` result or a `box<int>` read, which `op_writes_scalar`
+does not classify (07_exceptions, 93_dyn_fit); the compile EXTENDS
+main's list with each pasted callee's list where the loader re-derives
+from the final code, which is less precise in one direction (06: the
+compile lists a pasted temp the loader proves scalar) and more in the
+other (67: a barrier in main's own code makes the loader list the
+pasted callee's slots too). Making the two agree means making the
+compile less precise, so it stays a finding.
+
+**Nets.** `ref_slots_builtin_lv` (-rt) asserts the lists of two such
+functions in both directions: their int locals are off, the call's dst,
+the local it is moved into and the container parameter are on.
+tests/functional/105_inplace_builtin_refs.my runs the shapes. Watched:
+the pass back on `visit_use_def` fails the -rt check alone (no engine's
+answer changes); the pooled row's dst def dropped fails it too, and
+the program then aborts in `jit_ret_audit` (JIT) and `pop_window`
+(`-nj`) on the hardened debug build.

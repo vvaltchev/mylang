@@ -40336,6 +40336,121 @@ static bool norec_classify_scalar_params()
     return true;
 }
 
+/*
+ * compute_ref_slots reads an in-place builtin call (CallBuiltinLV and its
+ * Elem / Member forms) through the POOLED use/def table (2026-11-09). It
+ * used visit_use_def proper, where the call is a BARRIER, so a function
+ * calling pop / sort / insert listed EVERY slot as reference-carrying.
+ * No engine computes a different answer either way - only this list
+ * shows it - so the test asserts the list itself, in both directions:
+ * the int locals are OFF it (the precision), and the call's dst, the
+ * local it is moved into and the container parameter are ON it (the
+ * dangerous direction: arg0 is not a def in that row). The program runs
+ * as tests/functional/105_inplace_builtin_refs.my, where the hardened
+ * frame-pop audit and the INT state checker are the run-time nets.
+ */
+static bool ref_slots_builtin_lv()
+{
+    const char *src =
+        "func take(array<array<int>> rows, int n) {\n"
+        "    var k = n * 3;\n"
+        "    var x = pop(rows);\n"
+        "    return len(x) + k;\n"
+        "}\n"
+        "func work(array<array<int>> rows, int n) {\n"
+        "    var k = n * 3;\n"
+        "    var t = k + 1;\n"
+        "    var r = pop(rows);\n"
+        "    sort(r, func (x, y) => x > y);\n"
+        "    insert(r, 0, t);\n"
+        "    append(rows, r);\n"
+        "    return t + len(r) + k;\n"
+        "}\n"
+        "var rows = [[3, 1], [2], [4, 5]];\n"
+        "print(take(rows, runtime(1)), work(rows, runtime(2)));\n";
+    std::vector<Tok> toks;
+    lexer(src, 1, toks);
+    ParseContext pctx(TokenStream(toks), true);
+    unique_ptr<Construct> root = pBlock(pctx);
+    mark_implicit_globals(root.get(), {});
+    infer_types(root.get(), true);
+    run_optimizers(root.get());
+    VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+
+    const auto chunk_of = [&](const char *nm) -> const Chunk * {
+        for (const auto &d : prog.funcs)
+            if (d->vm_chunk && d->name && d->name->val == nm)
+                return static_cast<const Chunk *>(d->vm_chunk);
+        return nullptr;
+    };
+    const auto slot_of = [](const Chunk &ck, const char *nm) {
+        for (size_t i = 0; i < ck.slot_names.size(); i++)
+            if (ck.slot_names[i] == nm)
+                return static_cast<int32_t>(i);
+        return int32_t(-1);
+    };
+    const auto listed = [](const std::vector<int32_t> &v, int32_t s) {
+        return std::find(v.begin(), v.end(), s) != v.end();
+    };
+    struct Want { const char *fn; std::vector<const char *> off, on; };
+    const Want wants[] = {
+        { "take", { "k" }, { "x", "rows" } },
+        { "work", { "k", "t" }, { "r", "rows" } },
+    };
+    for (const Want &w : wants) {
+        const Chunk *ck = chunk_of(w.fn);
+        if (!ck) {
+            printf("  no chunk for %s\n", w.fn);
+            return false;
+        }
+        /* the vacuity guard: the in-place calls are there, as LV ops */
+        int lv = 0;
+        for (const Instr &in : ck->code)
+            if (in.op == OpCode::CallBuiltinLV) {
+                lv++;
+                if (!listed(ck->ref_slots, static_cast<int32_t>(in.target))) {
+                    printf("  %s: an in-place call's dst r%d is not on "
+                           "ref_slots\n", w.fn, static_cast<int>(in.target));
+                    return false;
+                }
+            }
+        if (!lv) {
+            printf("  VACUOUS: %s compiled no CallBuiltinLV\n", w.fn);
+            return false;
+        }
+        for (const char *nm : w.off) {
+            const int32_t s = slot_of(*ck, nm);
+            if (s < 0 || listed(ck->ref_slots, s)
+                    || listed(ck->ref_slots_raw, s)) {
+                printf("  %s: int `%s` (r%d) is on ref_slots - the "
+                       "in-place call is a barrier again\n", w.fn, nm,
+                       static_cast<int>(s));
+                return false;
+            }
+        }
+        for (const char *nm : w.on) {
+            const int32_t s = slot_of(*ck, nm);
+            if (s < 0 || !listed(ck->ref_slots, s)) {
+                printf("  %s: reference `%s` (r%d) is NOT on ref_slots\n",
+                       w.fn, nm, static_cast<int>(s));
+                return false;
+            }
+        }
+        /* slot 1 is `int n`, a coerced parameter: no seed */
+        if (listed(ck->ref_slots, 1)) {
+            printf("  %s: `int n` (r1) is on ref_slots\n", w.fn);
+            return false;
+        }
+        /* a raw-scalar bind wrote no reference into `rows`, and the body
+         * writes none there (arg0 is not a def) */
+        if (listed(ck->ref_slots_raw, slot_of(*ck, "rows"))) {
+            printf("  %s: `rows` is on ref_slots_raw\n", w.fn);
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool use_def_builtin_lv()
 {
 #if ML_JIT_SUPPORTED
@@ -59281,6 +59396,10 @@ static const std::vector<extra_check> extra_checks =
       "local) and its run and writes the dst, per the VM; without them a "
       "barrier",
       use_def_builtin_lv },
+    { "codegen: ref_slots reads the in-place builtin calls through the "
+      "pooled table - their function's int locals are off the list, the "
+      "call's dst and its container are on it",
+      ref_slots_builtin_lv },
     { "jit: the ELEMENT-STORE family's use/def rows match the VM's own "
       "operand reads, no defs, every op and base kind seen (#25)",
       use_def_store_family },

@@ -10126,7 +10126,16 @@ static bool visit_use_def(const Instr &in, U u, D d)
  * arg0's kind 0 local / 1 global / 2 capture) and the rest run at `b`
  * (when set: nargs - 1 slots, what vm_call_builtin_lv_rest reads).
  * Writes: the dst. arg0 is NOT a def: the builtin mutates it IN PLACE
- * (the store family's rule), and a missing def can only cost a kill.
+ * (the store family's rule). For liveness a missing def costs a kill;
+ * for compute_ref_slots it is the DANGEROUS direction, and it holds for
+ * a reason worth stating: every in-place builtin either only READS arg0
+ * (intptr, refcount) or refuses an arg0 that is not a container, and
+ * the one write back into the slot (sort / reverse storing a
+ * materialized slice) stores an array where an array was - as does
+ * struct_own's copy into a shared or borrowed holder. So arg0 holds a
+ * reference BEFORE the call, and whatever wrote it listed it (an op, a
+ * parameter seed, a catch bind); in a raw-scalar frame (ref_slots_raw)
+ * the builtin throws on it.
  * The Elem form (`append(a[i], x)`) reads the same base plus a run whose
  * first slot is the INDEX (nargs slots); the Member form (`append(s.f,
  * x)`) the base plus the values (nargs - 1) - its field name is in the
@@ -11697,7 +11706,12 @@ static void compute_ref_slots_impl(const std::vector<I> &code,
      */
     std::vector<std::pair<int, int>> moves;
     for (const I &in : code) {
-        const bool known = visit_use_def(
+        /* the POOLED table (2026-11-09): an in-place builtin call's row
+         * lives there, and visit_use_def proper reports it a barrier -
+         * which made this pass list EVERY slot of any chunk that calls
+         * append / sort / pop / ... (see visit_use_def_pooled for why
+         * its arg0 is not a def) */
+        const bool known = visit_use_def_pooled(
             in, [](int) {},
             [&](int dslot) {
                 if (dslot < 0 || dslot >= total)
@@ -11787,11 +11801,11 @@ static void compute_ref_slots_impl(const std::vector<I> &code,
                         return;               /* a TRIVIAL constant */
                 }
                 is_ref[dslot] = 1;
-            });
+            }, &chunk);
         if (!known) {
             /* A barrier op writes slots we can't enumerate (pool-target
-             * unpacks, LV builtins, iterators): every slot is a candidate
-             * - identical to the old full scan. */
+             * unpacks, iterators): every slot is a candidate - identical
+             * to the old full scan. */
             bail = true;
             break;
         }

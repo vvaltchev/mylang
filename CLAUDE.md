@@ -1202,7 +1202,10 @@ CallBuiltinLV, LVElem, LVMember) gets its row only there, and stays a
 barrier in `visit_use_def` proper (a separate function, so the row's
 branches are not instantiated once per caller - they cost 14 coverage
 elements that way). Pinned the same way,
-by `use_def_builtin_lv`.
+by `use_def_builtin_lv`. **A consumer that can hand it the chunk must
+ask it, not the table:** `compute_ref_slots` asked `visit_use_def`
+proper until 2026-11-09 and so listed EVERY slot of any function
+calling pop / sort / insert (`ref_slots_builtin_lv` pins the lists).
 
 **THE FIX, AND THE PATTERN TO REUSE: derive the test from the OPCODE
 ENUM, not from the table.** The B1/B2 specialized family is a
@@ -2551,6 +2554,13 @@ Running scripts:
                                  # whole comparison (scripts/vdjcmp).
                                  # MYLANG_VDJ_ADDRS=1 shows the numbers
                                  # when you need one specific pointer.
+                                 # Each chunk header adds `; refs:` - its
+                                 # ref_slots (and ref_slots_raw when they
+                                 # differ), the slots the JIT guards and
+                                 # a frame pop releases. -vdj only: a
+                                 # compile and its image may disagree
+                                 # there, and -vd is the round trip's
+                                 # oracle.
                                  # It SELF-REPORTS: a fragment it cannot
                                  # fully decode prints "DUMP IS UNRELIABLE"
                                  # with the undecoded-byte and skipped-mark
