@@ -1,0 +1,29 @@
+# A const bound to a function literal, whose value a BAKED const holds:
+# `const OPS = [tw];` is folded at parse time into one literal, so no
+# identifier names `tw` after it. The inferencer's value-template pass
+# took the declaration's own name `tw` for a use of the function, renamed
+# it to the typed instance - and that name was then declared twice: a
+# valid program refused with AlreadyDefinedEx, where -nti ran it
+# (2026-11-14). Each shape below calls its function with ONE signature,
+# which is what made the pass instantiate it.
+
+const tw = pure func(x) => x * 2;
+const th = pure func(x) => x * 3;
+const OPS = [tw, th];
+assert(OPS[0](7) == 14 && OPS[runtime(1)](7) == 21);
+
+const fo = pure func(x) => x * 4;
+const D = {"t": fo};
+assert(D["t"](4) == 16 && D[runtime("t")](5) == 20);
+
+const fi = pure func(x) => x + 5;
+struct S { const F = fi; }
+assert(S.F(5) == 10 && S.F(runtime(6)) == 11);
+
+func inner(int k) {
+    const q = pure func(x) => x + 100;
+    const QS = [q];
+    return QS[0](k);
+}
+assert(inner(runtime(1)) == 101 && inner(2) == 102);
+print("ok");

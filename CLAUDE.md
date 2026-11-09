@@ -5636,7 +5636,10 @@ See *THE CALLEE-SET ANALYSIS* below. `value_instantiate_round` (run beside
 `instantiate_round`) checks per-template UNIFORMITY over the attributed
 sites, makes the instance through the ordinary clone machinery
 (`tmpl_cache`/`make_template_clone` - same `$N` naming/display_name),
-REDIRECTS every value-use Identifier IN PLACE (uid + id_sym rebind), and
+REDIRECTS every value-use Identifier IN PLACE (uid + id_sym rebind) - the
+name a DECLARATION binds is not one (`const tw = pure func..` reached only
+through a baked `const OPS = [tw];` renamed its own declaration to the
+instance until 2026-11-14, AlreadyDefinedEx) - and
 seeds the clone's params with the signature each fixpoint round (a
 phantom call - no direct call feeds them). **ESCAPES disable it**
 - **ONE ESCAPE QUESTION, ONE ANSWER: `callee_escaped(f)`** - *can this
