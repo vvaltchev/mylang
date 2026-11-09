@@ -13942,8 +13942,21 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
             /* E2b: the helper put()s the result into the dst, which reads
              * the old value's type and tail - and in a frameless frame the
              * site that built this window may have left the dst raw (W3). A
-             * valid `none` first, on this cold path only. */
-            if (in.target >= 0) {
+             * valid `none` first, on this cold path only.
+             *
+             * ⛔ ONLY for a dst the site MAY have left raw - W3's own set,
+             * frameless_init_free minus frameless_read_first (the site's
+             * `free`). Every other slot was initialised, so put() releases
+             * what it holds; a raw `none` store over it DROPPED that
+             * reference. `return 1 + r([a], n - 1)` leaked one array per
+             * call that reached the depth cap: its dst r4 first holds a
+             * copy of `a` (2026-11-09). A slot in the free set holds no
+             * reference (it is not ref-listed), so zeroing it loses
+             * nothing. */
+            const uint64_t may_be_raw =
+                ck.frameless_init_free & ~ck.frameless_read_first;
+            if (in.target >= 0 && in.target < 64
+                    && ((may_be_raw >> in.target) & 1)) {
                 const JitLayout &LL = jit_layout();
                 const int32_t d = in.target * static_cast<int32_t>(sizeof(LValue));
                 e.zero_reg32(RAX);                          /* reg:proto */

@@ -18287,3 +18287,31 @@ the pass back on `visit_use_def` fails the -rt check alone (no engine's
 answer changes); the pooled row's dst def dropped fails it too, and
 the program then aborts in `jit_ret_audit` (JIT) and `pop_window`
 (`-nj`) on the hardened debug build.
+
+## A frameless decline's dst reset dropped a reference (2026-11-09)
+
+**The bug.** A frameless frame whose call declines - the sync depth cap,
+the native stack's floor, a guard - runs the callee as a BOUNDARY call
+(#97 E2), and before that the decline (E2b) wrote a raw `none` over the
+call's destination slot: the helper put()s the result there, which reads
+the old value, and W3 may have left the slot as raw stack. It did that
+for EVERY destination. One the site initialised can hold a reference,
+and the raw store dropped it without a release. `return 1 + r([a], n -
+1)` is enough: the call's dst r4 first holds the copy of `a` the array
+literal is built from, so every run of `r` past the cap leaked that
+array, and with it the chain of arrays nested inside. Pre-existing
+(9993498a has it); reachable wherever the native stack is off - every
+sanitized build (cap 32) and `MYLANG_NATIVE_STACK=0` (cap ~200) - and
+found because the new `-rt` template case recursed 70 levels on the
+ASan lanes.
+
+**The fix.** The reset is emitted only for a dst in W3's own free set,
+`frameless_init_free & ~frameless_read_first` - the slots the site may
+leave raw. Those are never ref-listed, so zeroing one loses nothing;
+every other slot was initialised and put() releases it.
+
+**Nets.** tests/functional/106_frameless_boundary_dst.my (recursion 300
+deep, three runs). Watched: the unfixed build leaks 597 arrays under the
+INT census with `MYLANG_NATIVE_STACK=0` and 16,992 bytes under clang's
+ASan; fixed, both are clean. `MYLANG_JIT_OFF=frameless` (or `norec`,
+`bakecallee`) hides it, since then no frameless frame forms.
