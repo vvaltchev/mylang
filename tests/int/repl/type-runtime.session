@@ -1,0 +1,21 @@
+# :type of an EXPRESSION is the runtime structural type of its value
+# (reflect_typeof): a struct and a box of the same struct in one array,
+# boxes of each element kind, a class array, a struct type value, a
+# caught exception, and the element of a dict of boxes. A struct and a
+# box of it are two types: such an array is array<dyn>, never array<P>.
+struct P { int x; int y; }
+class K { int v; }
+:type [P(1, 2), box(P(3, 4))]
+:type [box(P(1, 2)), box(P(3, 4))]
+:type [box(1), box(2)]
+:type [box(1), box(2.5)]
+:type [box("s"), box(true)]
+:type [box(true), box(false)]
+:type [K(1), K(2)]
+:type [P]
+var ce = none
+try { var dyn z = 1 / runtime(0); } catch (DivisionByZeroEx as e) { ce = e; }
+:type [ce]
+:type ({"k": box(1.5)})
+:type ({box(1): [P(1, 2)]})
+:type [[box("a")], [box("b")]]
