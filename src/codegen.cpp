@@ -3825,15 +3825,45 @@ struct Codegen {
         ops.push_back(chk);
     }
 
+    /* A redirected lambda-template call reads its GLOBAL variable first
+     * (Identifier::bind_guard): a LoadGlobalV, whose unbound-name raise
+     * names the variable at the callee's caret, before the arguments -
+     * the order of the call through the variable. It is the read of a
+     * name, which always lowers (a name the resolver left unresolved -
+     * no script's live code holds one - lowers to the throw the
+     * tree-walker's read of it raises). */
+    void emit_bind_guard(const Construct *what, std::vector<CgInstr> &ops)
+    {
+        if (ctag(what) != ConstructType::id)
+            return;
+        const Identifier *g =
+            static_cast<const Identifier *>(what)->live_guard();
+        if (!g)
+            return;
+        int t;
+        const bool ok = compile_boxed_expr(g, t, ops);
+        ML_CHECK(ok);
+        (void)ok;
+    }
+
     bool try_native_call(const DirectCallExpr *dc, int &out_slot,
                          std::vector<CgInstr> &ops)
     {
         if (!dc->vm_direct_func || dc->direct_func_slot < 0 || !dc->args)
             return false;
 
+        const size_t mark = ops.size();
+        const int save_top = next_temp;
+        emit_bind_guard(dc->what.get(), ops);
+
         int argbase;
-        if (!emit_args_range(dc->args->elems, argbase, ops))
+        if (!emit_args_range(dc->args->elems, argbase, ops)) {
+            /* a decline leaves nothing behind: the guard's read goes
+             * too (emit_args_range undid only its own ops) */
+            ops.resize(mark);
+            next_temp = save_top;
             return false;
+        }
         emit_none_args_check(dc, 1, dc->direct_func_slot, argbase, ops);
 
         const int dst = alloc_temp();
@@ -4046,6 +4076,7 @@ struct Codegen {
         const int save_top = next_temp;
 
         int callee_slot;
+        emit_bind_guard(call->what.get(), ops);
         if (!compile_boxed_expr(call->what.get(), callee_slot, ops)) {
             ops.resize(mark);
             next_temp = save_top;

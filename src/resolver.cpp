@@ -1794,6 +1794,8 @@ private:
     {
         walk_unconditional(fd->body.get(), [&](Construct *n) {
             auto *id = node_cast<Identifier>(n);
+            if (id && id->bind_guard)
+                id = id->bind_guard.get();     /* the variable it reads */
             if (id && id->sym.kind == SymKind::global
                     && global_decl_stmt.count(id->uid))
                 out.push_back(id);
@@ -2241,9 +2243,12 @@ private:
             std::vector<FuncDeclStmt *> calls;
 
             const auto visit = [&](Construct *n) {
-                if (auto *id = node_cast<Identifier>(n))
+                if (auto *id = node_cast<Identifier>(n)) {
+                    if (id->bind_guard)            /* the variable it reads */
+                        id = id->bind_guard.get();
                     if (id->sym.kind == SymKind::global && decls.count(id->uid))
                         add_uniq(reads, id->uid);
+                }
                 auto *call = node_cast<CallExpr>(n);
                 if (!call)
                     return;
@@ -4153,7 +4158,9 @@ func_body_is_pure(const Construct *c,
     if (auto *id = node_cast<const Identifier>(c))
         return !id->names_class &&        /* a construction: a new object */
                (id->sym.kind == SymKind::local || id->is_const ||
-                pure_names.count(id->uid) != 0);
+                pure_names.count(id->uid) != 0) &&
+               /* a redirected lambda call reads its variable too */
+               func_body_is_pure(id->bind_guard.get(), pure_names);
 
     if (ctag(c) == ConstructType::func_decl)
         return false;   /* a nested function: be conservative */
@@ -4391,6 +4398,11 @@ Resolver::walk(Construct *c, FuncState *cur)
     /* --- identifier reference --- */
     if (ctag(c) == ConstructType::id) {
         auto *id = static_cast<Identifier *>(c);
+        /* a redirected lambda-template call reads its variable first
+         * (Identifier::bind_guard): the TDZ applies to it, and a global
+         * one is stamped like any escaped read */
+        if (id->bind_guard)
+            resolve_ref(cur, id->bind_guard.get());
         resolve_ref(cur, id);
         return;
     }
@@ -5884,6 +5896,15 @@ private:
         if (held)
             held_roots.erase(held);
 
+        /* A call that must read its variable first (a lambda template's
+         * instance call through a global, Identifier::bind_guard) stays a
+         * call: inlined or specialized, it would lose the read. EACH
+         * engine below declines it itself (`live_guard()`), because each
+         * may be handed a call it did not see here: the tail engine finds
+         * its call through the ReturnStmt, and the block and specialize
+         * engines run on whatever the expression engine left in the slot
+         * - the guarded call of a body it just inlined. */
+
         /* re-scans its splice (depth + 1) */
         try_inline(slot, depth, fsize, no_block);
         try_inline_tail(slot, depth, fsize);   /* tail call to a block func */
@@ -5962,6 +5983,8 @@ private:
         auto *callee = node_cast<Identifier>(ce->what.get());
         if (!callee || callee->sym.kind == SymKind::local)
             return;
+        if (callee->live_guard())
+            return;                     /* reads its variable: see walk() */
         if (held_roots.count(ce))
             return;                     /* a store root: store_root_call */
 
@@ -6285,6 +6308,8 @@ private:
         auto *callee = node_cast<Identifier>(ce->what.get());
         if (!callee || callee->sym.kind == SymKind::local)
             return;
+        if (callee->live_guard())
+            return;                     /* reads its variable: see walk() */
         if (held_roots.count(ce))
             return;                     /* a store root: store_root_call */
 
@@ -6615,6 +6640,8 @@ private:
         auto *callee = node_cast<Identifier>(ce->what.get());
         if (!callee || callee->sym.kind == SymKind::local)
             return;
+        if (callee->live_guard())
+            return;                     /* reads its variable: see walk() */
 
         auto it = spec_funcs.find(callee->uid);   /* block-bodied, no capture/
                                                    * nested func */
@@ -7287,6 +7314,8 @@ private:
         auto *callee = node_cast<Identifier>(ce->what.get());
         if (!callee || callee->sym.kind == SymKind::local)
             return;
+        if (callee->live_guard())
+            return;                     /* reads its variable: see walk() */
 
         auto it = spec_funcs.find(callee->uid);
         if (it == spec_funcs.end() || !it->second)

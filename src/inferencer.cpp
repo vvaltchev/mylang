@@ -1429,6 +1429,17 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         /* The old callee Identifier is about to be freed: drop its id_sym entry
          * so nothing (e.g. -a's collect_arrays) walks a dangling key. */
         id_sym.erase(call->what.get());
+        /* A lambda template's call still READS its variable - the
+         * instance is bound at the top of the program, the variable
+         * where it is written (Identifier::bind_guard). A named
+         * template binds at the top of its scope, as its instance does.
+         * A lambda template is reached through its variable's name only
+         * (mark_lambda_templates: var-bound, calls-only). */
+        if (!tmpl->decl->id) {
+            ML_CHECK(ctag(call->what.get()) == ConstructType::id);
+            what->bind_guard.reset(
+                static_cast<Identifier *>(call->what.release()));
+        }
         call->what = std::move(what);
         progress = true;
     }

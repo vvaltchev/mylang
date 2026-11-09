@@ -2191,7 +2191,9 @@ A lambda with un-annotated parameters is typed from the places it is
 
 * a **non-capturing** lambda bound to a write-once variable that is only
   ever called is a *template*, so it is monomorphized per call signature -
-  `f(1)` and `f("hi")` simply produce two typed instances;
+  `f(1)` and `f("hi")` simply produce two typed instances. Each call still
+  reads `f` first, so a call made before `var f = ...` has run raises
+  `UnboundSymbolEx`, as it does for any other variable;
 * a **capturing** lambda is not, so all of its call sites *join* into one
   parameter type. Two numeric argument types widen (`int` and `float` give
   `float`, and the `int` argument is then coerced); two irreconcilable ones
