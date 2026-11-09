@@ -26,6 +26,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <climits>
 #ifndef _WIN32
 #include <unistd.h>   /* isatty (REPL launch; Unix-only) */
 #endif
@@ -275,6 +276,11 @@ void help()
          << endl;
     cout << "  -it N    Inline threshold: max inlined body size (default 24)"
          << endl;
+    cout << "  --max-instances N  Typed instances one function template gets"
+         << endl;
+    cout << "                  (default 64; past it a call runs the template"
+         << endl;
+    cout << "                  itself)" << endl;
     cout << "  -nr      Compile and validate, don't run" << endl;
     cout << "  -c       Compile to a .myv bytecode file, then exit" << endl;
     cout << "  -o FILE  Output path for -c (default: the source's .myv twin)"
@@ -482,6 +488,21 @@ parse_args(int argc, char **argv)
 
             opt_inline_threshold = atoi(argv[1]);
             argc--; argv++;   /* consume the value; the loop skips it too */
+
+        } else if (!strcmp(arg, "--max-instances")) {
+
+            /* how many typed instances a function template gets
+             * (g_tmpl_max_instances, inferencer.h) */
+            char *end = nullptr;
+            const long n = argc < 2 ? -1 : strtol(argv[1], &end, 10);
+            if (argc < 2 || !*argv[1] || *end || n < 0 || n > INT_MAX) {
+                cout << "error: --max-instances requires a count (the "
+                        "typed instances one template gets, >= 0)"
+                     << endl;
+                exit(1);
+            }
+            g_tmpl_max_instances = static_cast<int>(n);
+            argc--; argv++;
 
         } else if (!strcmp(arg, "-c")) {
 

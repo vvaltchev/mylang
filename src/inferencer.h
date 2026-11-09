@@ -140,6 +140,16 @@ extern bool g_strict_mode;
  * drains the list and renders each one with the same caret machinery errors
  * use; the `-rt` harness reads it instead.
  */
+/*
+ * How many typed instances one function template gets: past it, a call
+ * with a NEW signature runs the template itself, boxed (a one-time
+ * warning names the template). A backstop for polymorphism that never
+ * settles - `f([x], n - 1)` makes a new signature per level. Default 64;
+ * the driver's `--max-instances N` sets it, and a global for the reason
+ * g_strict_mode is one.
+ */
+extern int g_tmpl_max_instances;
+
 struct CompileWarning {
     const char *msg;    /* interned (intern_msg) - stable for the program */
     Loc start, end;

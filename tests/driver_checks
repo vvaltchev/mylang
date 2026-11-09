@@ -1283,6 +1283,42 @@ else
     fail "-it: $c_def calls by default, $c_zero with -it 0"
 fi
 
+# --max-instances N bounds one template's typed instances: a call with a
+# new signature past N runs the template itself, a one-time warning names
+# it, and the answer is the same. The base must then be compiled - a
+# dropped one aborted the VM (2026-11-09).
+cat > "$TMP/mi.my" <<'EOF'
+func show(x) { var t = x + x; return str(t) + ":" + typestr(t); }
+print(show(1), show(2.5), show("ab"), show(3));
+EOF
+flag "--max-instances needs a count" 1 'requires a count' --max-instances
+flag "--max-instances refuses a negative count" 1 'requires a count' \
+     --max-instances -1 "$TMP/mi.my"
+flag "--max-instances refuses a non-number" 1 'requires a count' \
+     --max-instances 2x "$TMP/mi.my"
+mi_want="2:int 5.000000:float abab:str 6:int "
+for m in 2 0; do
+    for eng in "" -nj -tw; do
+        out=$("$BIN" $eng --max-instances $m "$TMP/mi.my" 2> "$TMP/mi.err")
+        r=$?
+        lbl="--max-instances $m${eng:+ $eng}"
+        if [ "$r" = 0 ] && [ "$out" = "$mi_want" ] &&
+           grep -q "template 'show' exceeded $m instantiations" \
+                "$TMP/mi.err"; then
+            pass "$lbl: the base runs, with a warning"
+        else
+            fail "$lbl (exit $r): $out / $(head -c 300 \
+                  "$TMP/mi.err")"
+        fi
+    done
+done
+out=$("$BIN" "$TMP/mi.my" 2> "$TMP/mi.err")
+if [ "$out" = "$mi_want" ] && [ ! -s "$TMP/mi.err" ]; then
+    pass "--max-instances: the default 64 instantiates all four"
+else
+    fail "--max-instances default: $out / $(head -c 300 "$TMP/mi.err")"
+fi
+
 # --strict refuses a non-local read above its declaration, which a plain
 # run accepts (the read happens after the declaration has run).
 cat > "$TMP/st.my" <<'EOF'

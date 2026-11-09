@@ -365,7 +365,7 @@ private:
      * the whole session so a re-declared template can't reuse a prior name) */
     std::unordered_map<const UniqueId *, int> clone_name_counter;
     /* Per-template instantiation count + a per-template "already warned" guard:
-     * past MAX_TMPL_INSTANCES distinct signatures, further calls run
+     * past g_tmpl_max_instances distinct signatures, further calls run
      * dynamically (no clone) - a backstop for runaway polymorphism (D4). */
     std::unordered_map<FuncInfo *, int> tmpl_inst_count;
     /*
@@ -1365,15 +1365,14 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         if (!clone_sym) {
             /* D4: a new signature past the cap runs dynamically, not as a clone
              * - a backstop for pathological polymorphic recursion. */
-            static const int MAX_TMPL_INSTANCES = 64;
-            if (tmpl_inst_count[tmpl] >= MAX_TMPL_INSTANCES) {
+            if (tmpl_inst_count[tmpl] >= g_tmpl_max_instances) {
                 if (tmpl_cap_warned.insert(tmpl).second && tmpl->decl->id) {
                     auto nm = tmpl->decl->id->get_str();
                     fprintf(stderr,
                             "warning: template '%.*s' exceeded %d "
                             "instantiations; further calls run dynamically\n",
                             static_cast<int>(nm.size()), nm.data(),
-                            MAX_TMPL_INSTANCES);
+                            g_tmpl_max_instances);
                 }
                 continue;
             }
@@ -1924,8 +1923,7 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             }
         }
         if (!clone_sym) {
-            static const int MAX_TMPL_INSTANCES = 64;
-            if (tmpl_inst_count[tmpl] >= MAX_TMPL_INSTANCES)
+            if (tmpl_inst_count[tmpl] >= g_tmpl_max_instances)
                 continue;
             FuncDeclStmt *clone = make_template_clone(tmpl, key, rootBlock);
             clone_name = clone->id->uid;
@@ -2217,10 +2215,13 @@ void Inferencer::infer_one(Block *rootBlock)
      * builtin, bound to a var) can be dispatched INDIRECTLY - that call is NOT
      * redirected, so it runs the base body - so it is kept (compiled + shown).
      * (Its instances, if any, have is_template=false and are unaffected.) The
-     * residual case a `!value_used` template still runs the base - a D4 overflow
-     * (>64 instances) or an uninstantiable direct call - just tree-walks instead
-     * of VM-running (correct, only slower); the planned first-class dyn instance
-     * (foo$dyn) erases even that. Keyed off the name SYM's value_used.
+     * residual case a `!value_used` template still runs the base - a call
+     * instantiation left unredirected (past g_tmpl_max_instances, or past
+     * the loop's 64 rounds) - is KEPT too: the VM runs no AST, so a base
+     * dropped here aborted it ("call to a chunk-less function after AST
+     * teardown"; an ASSERTS=0 build, which never tears the tree down,
+     * walked the base's AST instead) - `depth([x], n - 1)` recursing 70
+     * levels was enough. Keyed off the name SYM's value_used.
      *
      * #149: reachability is TRANSITIVE, so "kept" is a CLOSURE, not the
      * flag. A value-used base runs its ORIGINAL body, whose calls were
@@ -2390,6 +2391,26 @@ void Inferencer::infer_one(Block *rootBlock)
         for (auto &kv : tmpls)
             if (kv.second->value_used || func_name_rebound(kv.second))
                 keep(kv.second);    /* a rebound name's calls stay calls */
+
+        /* A direct call instantiation left UNREDIRECTED - past the
+         * instance cap, past the instantiation loop's 64 rounds (one per
+         * nesting level of `f([x], n - 1)`) - still names the base, which
+         * then runs. Every live call is asked (the collector
+         * instantiate_round uses, so template bodies are skipped: a kept
+         * base's own calls are the closure's business, below). */
+        {
+            std::vector<std::pair<CallExpr *, bool>> live;
+            for (auto &e : rootBlock->elems)
+                collect_calls(e.get(), live, false, true);
+            for (const auto &cp : live) {
+                FuncInfo *fi = callee_funcinfo(cp.first->what.get());
+                if (!fi || !fi->is_template)
+                    continue;
+                auto it = tmpls.find(fi);
+                if (it != tmpls.end())
+                    keep(it->second);
+            }
+        }
 
         for (auto &e : rootBlock->elems)
             scan_baked(e.get());
@@ -9798,6 +9819,8 @@ unsigned g_opt_disabled = 0;
  * (strict_forward_globals); a global for the same reason g_opt_disabled is -
  * threading a flag through run_optimizers' callers buys nothing. */
 bool g_strict_mode = false;
+
+int g_tmpl_max_instances = 64;        /* --max-instances (inferencer.h) */
 
 std::vector<CompileWarning> g_warnings;
 
