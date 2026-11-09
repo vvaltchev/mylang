@@ -2406,9 +2406,11 @@ void Inferencer::infer_one(Block *rootBlock)
                 FuncInfo *fi = callee_funcinfo(cp.first->what.get());
                 if (!fi || !fi->is_template)
                     continue;
+                /* every template's symbol is in tmpls (built from the
+                 * same all_syms, above) */
                 auto it = tmpls.find(fi);
-                if (it != tmpls.end())
-                    keep(it->second);
+                ML_CHECK(it != tmpls.end());
+                keep(it->second);
             }
         }
 

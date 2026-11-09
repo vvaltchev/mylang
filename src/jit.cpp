@@ -13955,8 +13955,10 @@ static void emit_sync_call_inline(Emitter &e, const Chunk &ck,
              * nothing. */
             const uint64_t may_be_raw =
                 ck.frameless_init_free & ~ck.frameless_read_first;
-            if (in.target >= 0 && in.target < 64
-                    && ((may_be_raw >> in.target) & 1)) {
+            /* a body entered framelessly has at most FRAMELESS_MAX_SLOTS
+             * (64) slots, so the shift is defined */
+            ML_CHECK(in.target < static_cast<int64_t>(FRAMELESS_MAX_SLOTS));
+            if (in.target >= 0 && ((may_be_raw >> in.target) & 1)) {
                 const JitLayout &LL = jit_layout();
                 const int32_t d = in.target * static_cast<int32_t>(sizeof(LValue));
                 e.zero_reg32(RAX);                          /* reg:proto */
