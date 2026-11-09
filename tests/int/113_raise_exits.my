@@ -1,0 +1,70 @@
+# INT-ENGINES: tw default nj nbi
+#
+# INT unit (#107): a raising VM op's two exits. A negative shift count
+# by a literal, caught in the same function, is the op's "dispatched"
+# exit (the handler is in this activation); a float division or
+# modulo by zero inside a map() callback, caught outside the call, is
+# its "boundary" exit (the raise leaves the callback's activation, and
+# the builtin carries it out). The integer forms of both run too, so
+# each engine's whole set of raising arithmetic is compared.
+
+func same(int x) {
+    var caught = 0;
+    try { var r = x << -1; print(r); } catch (InvalidValueEx) { caught++; }
+    try { var r = x >> -2; print(r); } catch (InvalidValueEx) { caught++; }
+    return caught;
+}
+print(same(runtime(5)));
+
+func run(int z, int neg) {
+    var caught = 0;
+    var xs = [1, 2, 3];
+    var fs = [1.5, 2.5];
+    try {
+        map(func [z] (v) => v / z, xs);
+    } catch (DivisionByZeroEx) {
+        caught++;
+    }
+    try {
+        map(func [z] (v) => v % z, xs);
+    } catch (DivisionByZeroEx) {
+        caught++;
+    }
+    var lo = -9223372036854775807 - 1;
+    var m1 = z - 1;
+    try {
+        map(func [lo, m1] (v) => lo / m1, xs);
+    } catch (InvalidValueEx) {
+        caught++;
+    }
+    try {
+        map(func [lo, m1] (v) => lo % m1, xs);
+    } catch (InvalidValueEx) {
+        caught++;
+    }
+    try {
+        map(func [neg] (v) => v << neg, xs);
+    } catch (InvalidValueEx) {
+        caught++;
+    }
+    try {
+        map(func [neg] (v) => v >> neg, xs);
+    } catch (InvalidValueEx) {
+        caught++;
+    }
+    try { map(func(v) => v << -1, xs); } catch (InvalidValueEx) { caught++; }
+    try { map(func(v) => v >> -2, xs); } catch (InvalidValueEx) { caught++; }
+    var fz = z * 0.5;
+    try {
+        map(func [fz] (v) => v / fz, fs);
+    } catch (DivisionByZeroEx) {
+        caught++;
+    }
+    try {
+        map(func [fz] (v) => v % fz, fs);
+    } catch (DivisionByZeroEx) {
+        caught++;
+    }
+    return caught;
+}
+print(run(runtime(0), runtime(-3)));
