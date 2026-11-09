@@ -1,4 +1,5 @@
 # INT-ENGINES: tw default nj noopt
+# INT-CONFIGS: default ; MYLANG_BCINLINE_SRAC=0
 #
 # INT unit (#107): the other half of 116 - a capture of #97 increment
 # 5's MOVE COLLAPSE updated through a float immediate, an int and a
@@ -6,7 +7,9 @@
 # on it lowers to a boxed truth test the bytecode inliner does not
 # paste) and an int and a float element read off an array PARAMETER
 # (a captured array's element read is the boxed subscript, which the
-# inliner does not paste either). Every engine must print the same.
+# inliner does not paste either). The second configuration is the
+# same program without the collapse; every engine of both must print
+# the same, and the program asserts its own sums.
 func m_fimm(float x) {
     var f = x;
     return func [f] (float y) { f = 2.5; return f + y; };

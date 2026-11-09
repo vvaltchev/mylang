@@ -1,18 +1,22 @@
 # INT-ENGINES: tw default nj noopt
+# INT-CONFIGS: default ; MYLANG_BCINLINE_SRAC=0
 #
 # INT unit (#107): #97 increment 5's MOVE COLLAPSE, over a capture
-# updated through each producer the RETARGET rule admits - an int
-# division (IntBin), a modulo by a literal (IntModRI), the fused
-# (a + b) % k (IntAddModRI), an int immediate and a float division
-# (FloatBin). Each closure is built in the loop and never escapes, so
-# it is scalar-replaced and its capture becomes a frame slot the
-# producer may write directly. Five closures, not ten: more and main's
-# frame passes BC_INLINE_MAX_FRAME, and nothing is replaced at all
-# (117 holds the other five). MYLANG_BCINLINE_SRAC=0 is the same
-# program without the collapse; every engine must print the same.
+# written by each producer the RETARGET rule admits - an int division
+# (IntBin), a modulo by a literal and an add (IntModRI and IntAddRR,
+# both of the specialized family), the fused (a + b) % k (IntAddModRI),
+# an int immediate (LoadImmInt) and a float division (FloatBin) - and
+# by one it refuses: a call's result (CallV), whose move into the
+# capture stays. Each closure is built in the loop and never escapes,
+# so it is scalar-replaced and its capture becomes a frame slot the
+# producer may write directly. Six closures here and five in 117: with
+# all eleven in one main its frame passes BC_INLINE_MAX_FRAME, and
+# nothing is replaced at all. The second configuration is the same
+# program without the collapse; every engine of both must print the
+# same, and the program asserts its own sums.
 func m_div(int n) {
     var c = n + 7;
-    return func [c] (int k) { c = c / k + 3; return c; };
+    return func [c] (int k) { c = c / k; return c + 3; };
 }
 func m_mod(int n) {
     var c = n;
@@ -30,8 +34,15 @@ func m_fdiv(float x) {
     var f = x;
     return func [f] (float y) { f = f / y; return f; };
 }
-var ia = [3, 1, 4, 1, 5, 9, 2, 6];
-var fa = [0.5, 1.5, 2.5, 3.5];
+# linear recursion: neither inliner removes the call
+func fact(int n) {
+    if (n < 2) return 1;
+    return n * fact(n - 1);
+}
+func m_call(int n) {
+    var c = n;
+    return func [c] (int k) { c = fact(k); return c + 1; };
+}
 var s = 0;
 var fs = 0.0;
 for (var i = 1; i < 6; i++) {
@@ -45,6 +56,8 @@ for (var i = 1; i < 6; i++) {
     s = s + im(i) + im(1);
     var fd = m_fdiv(float(i));
     fs = fs + fd(2.0) + fd(4.0);
+    var cl = m_call(i);
+    s = s + cl(i) + cl(3);
 }
-assert(s == 200 && fs == 9.375);
+assert(s == 388 && fs == 9.375);
 print(s, fs);
