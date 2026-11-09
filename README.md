@@ -3095,7 +3095,11 @@ throw Stop(0);
 ```
 
 Only a struct instance can be thrown; `throw 5` or `throw "oops"` is a compile
-error.
+error, and so is throwing a value that can only be `none` (`throw none`, a
+variable nothing but `none` is ever stored in, the result of a function that
+returns nothing). A value that *may* be `none` - an `opt` struct, or a `dyn`
+variable that starts as `none` and later holds a caught exception - is checked
+when it is thrown: if it is `none` then, the `throw` raises `TypeErrorEx`.
 
 ### Re-throwing an exception
 

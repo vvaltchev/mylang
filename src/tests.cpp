@@ -12681,6 +12681,33 @@ static const std::vector<test> tests =
     {
         "throw of a string is a compile error",
         { "throw \"oops\";" }, &typeid(TypeMismatchEx) },
+    /* a value that can only be none is no struct instance either: the
+     * literal, a variable nothing but none is stored in, and the result
+     * of a function that returns nothing (2026-11-09) */
+    {
+        "throw none is a compile error",
+        { "throw none;" }, &typeid(TypeMismatchEx) },
+    {
+        "throw of a variable that only holds none is a compile error",
+        { "var x;", "if (runtime(0) > 1) x = none;", "throw x;" },
+        &typeid(TypeMismatchEx) },
+    {
+        "throw of a call that returns nothing is a compile error",
+        { "func g(int n) { print(n); }", "throw g(runtime(1));" },
+        &typeid(TypeMismatchEx) },
+    /* ...while a value that MAY be none is checked when it is thrown,
+     * and a narrowed one throws its struct */
+    {
+        "throw of an opt struct that holds none raises TypeErrorEx",
+        { "struct P { int a; }", "func f(opt P p) { throw p; }",
+          "f(runtime(none));" }, &typeid(TypeErrorEx) },
+    {
+        "throw of a narrowed opt struct throws the struct",
+        { "struct P { int a; }",
+          "func f(opt P p) { if (p != none) throw p; return 1; }",
+          "var got = 0;",
+          "try { f(P(runtime(3))); } catch (P as e) { got = e.a; }",
+          "assert(got == 3 && f(none) == 1);" } },
 
     {
         "Erase 1st element, no slice",

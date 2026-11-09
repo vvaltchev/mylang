@@ -7863,15 +7863,20 @@ void Inferencer::check(Construct *n)
     if (ctag(n) == ConstructType::throw_stmt) {
         auto *th = static_cast<ThrowStmt *>(n);
         check(th->elem.get());
-        StaticTypeRef t = strip(static_type_resolve(type_of(th->elem.get())));
+        const StaticTypeRef full = type_of(th->elem.get());
+        StaticTypeRef t = strip(static_type_resolve(full));
         /* A struct instance is the custom-exception value; a caught built-in
-         * exception (Exception) can be re-thrown; dyn/Unknown/None defer. */
+         * exception (Exception) can be re-thrown; dyn and Unknown defer to
+         * the run-time check. A value that can only be `none` (`throw
+         * none`, a variable only ever none, a call to a function that
+         * returns nothing) is no struct instance either (2026-11-09). One
+         * that MAY be none (`opt P`, `var dyn saved = none` holding a
+         * caught exception later) is checked when it is thrown. */
         if (!is_dyn(t) && t->kind != StaticTypeKind::Struct &&
             t->kind != StaticTypeKind::Exception &&
-            t->kind != StaticTypeKind::Unknown && t->kind !=
-                StaticTypeKind::None)
+            t->kind != StaticTypeKind::Unknown)
             mismatch("can only throw a struct instance, got '" +
-                         static_type_to_string(type_of(th->elem.get())) + "'",
+                         static_type_to_string(full) + "'",
                      th->elem->start, th->elem->end);
         return;
     }
