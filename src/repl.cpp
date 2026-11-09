@@ -404,7 +404,11 @@ ReplEngine::eval_input(const string &src)
 
 /* Is `op` a token after which a statement clearly continues (so no `;` should
  * be auto-inserted at a line end)? Binary/assign operators, comma/dot/arrow/
- * colon, an open bracket, or a semicolon already present. */
+ * colon, an open bracket, or a semicolon already present. The ternary's `?`
+ * and `??` count: a value follows them, so a `{` there opens a dict literal
+ * (`c ? {"a": 1} : d` got a `;` inside its dict). A `?` that is a type's
+ * nullable suffix is followed by the declared name, never by a `{` or the
+ * end of the line. */
 static bool
 repl_continuation_op(Op op)
 {
@@ -414,7 +418,8 @@ repl_continuation_op(Op op)
         case Op::ge:    case Op::eq:    case Op::noteq: case Op::land:
         case Op::lor:   case Op::band:  case Op::bor:   case Op::bxor:
         case Op::shl:   case Op::shr:   case Op::ushr:  case Op::assign:
-        case Op::comma: case Op::dot:   case Op::arrow:
+        case Op::comma: case Op::dot:   case Op::arrow: case Op::qmdot:
+        case Op::questionmark:          case Op::coalesce:
         case Op::colon: case Op::parenL: case Op::braceL: case Op::bracketL:
         case Op::semicolon:
             return true;

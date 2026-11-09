@@ -23270,6 +23270,24 @@ static const std::vector<repl_test> repl_tests =
         { "if (true) { print(f3(\n  35)) }", "35", "Error" },
         { "print(1", "SyntaxError at line" } } },
 
+    /* a dict literal right after the ternary's `?` or after `??` was read
+     * as a BLOCK, so its value got a `;` and the input was refused; a
+     * line ending in one of them (or in `?.`) got a `;` too */
+    { "auto-terminate: a dict literal after `?` or `??`",
+      { { "var dyn c4 = runtime(true)", "=> true", "Error" },
+        { "var d4 = c4 ? {\"a\": 1} : {\"b\": 2}", "=> {\"a\": 1}",
+          "Error" },
+        { "var dyn n4 = runtime(none)", "", "Error" },
+        { "var dyn e4 = n4 ?? {\"a\": 3}", "=> {\"a\": 3}",
+          "Error" },
+        { "var f4 = (c4 ? {\"a\": 4} : {\"b\": 5})", "=> {\"a\": 4}",
+          "Error" },
+        { "var g4 = c4 ?\n  6 : 7", "=> 6", "Error" },
+        { "var dyn h4 = n4 ??\n  8", "=> 8", "Error" },
+        { "struct P4 { int x; }", "", "Error" },
+        { "var dyn? p4 = runtime(P4(9))", "", "Error" },
+        { "p4?.\n  x", "=> 9", "Error" } } },
+
     /* an input that fails WHILE RUNNING keeps what its completed statements
      * defined, and nothing of the declarations it never reached: their
      * committed types stood for names the run never defined, so a later
