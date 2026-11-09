@@ -28444,6 +28444,13 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             | static_cast<uint32_t>(ls.col);
         const int site_i = static_cast<int>(in.b_lit() >> 12);
         emit_call_prologue(e);
+        /* #88's side channel: a FuncObject callee runs through
+         * jit_call_sync_core, which CLAIMS this pair for the call site's
+         * inlined-at frames. Not written here, a call FROM inlined code
+         * (`use(k) => lf(k)` with `lf` dyn) lost `use`'s virtual frame
+         * under -nti, and the core claimed whatever the last site left
+         * (2026-11-14) */
+        emit_bake_call_site(e, ck, old_pc);
         e.mov_imm(RDI,
                  (static_cast<uint64_t>(
                       static_cast<uint32_t>(in.target2)) << 32)
