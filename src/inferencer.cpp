@@ -1171,7 +1171,7 @@ void Inferencer::collect_calls(Construct *n,
 {
     if (!n)
         return;
-    if (auto *c = dynamic_cast<CallExpr *>(n))
+    if (auto *c = node_cast<CallExpr>(n))
         out.push_back({ c, in_func });
     /* a call below a FuncDeclStmt is inside a function body (a live use) */
     const bool is_fd = ctag(n) == ConstructType::func_decl;
@@ -2751,7 +2751,7 @@ void Inferencer::stamp_inferred_param_types(Construct *rootn)
 
 void Inferencer::run()
 {
-    Block *rootBlock = dynamic_cast<Block *>(root);
+    Block *rootBlock = node_cast<Block>(root);
     if (!rootBlock)
         return;
 
@@ -3704,7 +3704,7 @@ void Inferencer::annotate_hints(Construct *n)
             n->th = TypeHint::f;
     }
 
-    if (auto *e = dynamic_cast<Expr14 *>(n))
+    if (auto *e = node_cast<Expr14>(n))
         set_array_repr_hint(e);
 
     /* Mark `a[i]` whose base is statically an ARRAY, so the VM only compiles a
@@ -3936,7 +3936,7 @@ void Inferencer::annotate_hints(Construct *n)
 
         /* append / push / insert of a container LITERAL into a FIXED
          * array: the literal has the element type (literal_into) */
-        if (auto *cid = dynamic_cast<Identifier *>(call->what.get())) {
+        if (auto *cid = node_cast<Identifier>(call->what.get())) {
             const bool builtin = cs_callee_is_builtin(cid);
             const std::string_view nm = cid->uid->val;
             const size_t vi = nm == "insert" ? 2 : 1;
@@ -4294,7 +4294,7 @@ void Inferencer::annotate_hints(Construct *n)
  */
 void Inferencer::stamp_sum_identity(CallExpr *call)
 {
-    auto *cid = dynamic_cast<Identifier *>(call->what.get());
+    auto *cid = node_cast<Identifier>(call->what.get());
     if (!cid || !call->args || cid->uid->val != "sum")
         return;
     /* the builtin, not a user function of the same name */
@@ -4315,7 +4315,7 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
     if (e->op != Op::assign)
         return;
 
-    auto *id = dynamic_cast<Identifier *>(e->lvalue.get());
+    auto *id = node_cast<Identifier>(e->lvalue.get());
     if (!id)
         return;
     auto it = id_sym.find(id);
@@ -4356,7 +4356,7 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
     if (ctag(rv) == ConstructType::call) {
         auto *call = static_cast<CallExpr *>(rv);
 
-        auto *cid = dynamic_cast<Identifier *>(call->what.get());
+        auto *cid = node_cast<Identifier>(call->what.get());
         if (!cid || !call->args)
             return;
         /* must be the builtin, not a user function of the same name */
@@ -4566,9 +4566,9 @@ void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
                                   * (declare_target runs twice via hoist) */
     };
 
-    if (auto *id = dynamic_cast<Identifier *>(lvalue))
+    if (auto *id = node_cast<Identifier>(lvalue))
         decl_one(id);
-    else if (auto *idl = dynamic_cast<IdList *>(lvalue))
+    else if (auto *idl = node_cast<IdList>(lvalue))
         for (auto &up : idl->elems)
             if (!up->is_underscore())   /* `_` placeholder: not declared */
                 decl_one(up.get());
@@ -4681,8 +4681,8 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
                            e14->fl & pFlags::pInConstDecl);
             /* `var f = <lambda>`: bind f to the lambda's FuncInfo so calls to f
              * type the lambda's params and check its arity. */
-            auto *id = dynamic_cast<Identifier *>(e14->lvalue.get());
-            auto *fd = dynamic_cast<FuncDeclStmt *>(e14->rvalue.get());
+            auto *id = node_cast<Identifier>(e14->lvalue.get());
+            auto *fd = node_cast<FuncDeclStmt>(e14->rvalue.get());
             if (id && fd) {
                 TypeSym *sym = id_sym[id];
                 if (sym && !sym->func)
@@ -4700,7 +4700,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         } else {
             walk_struct(e14->lvalue.get(), s);
         }
-        if (auto *idl = dynamic_cast<IdList *>(e14->lvalue.get()))
+        if (auto *idl = node_cast<IdList>(e14->lvalue.get()))
             for (auto &up : idl->elems) count_write(up.get());
         else
             count_write(e14->lvalue.get());
@@ -4863,7 +4863,7 @@ void Inferencer::lower_named_args(Construct *n)
 
     for_each_child(n, [this](Construct *c) { lower_named_args(c); });
 
-    if (auto *call = dynamic_cast<CallExpr *>(n))
+    if (auto *call = node_cast<CallExpr>(n))
         lower_call_named_args(call);
 }
 
@@ -5173,7 +5173,7 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
         return A.dict_of(k, val);
     }
 
-    if (auto *lo = dynamic_cast<const LiteralObj *>(e))
+    if (auto *lo = node_cast<const LiteralObj>(e))
         return static_type_from_value(lo->literal_value());
 
     if (ctag(e) == ConstructType::id) {
@@ -5206,7 +5206,7 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
         return bottom;
     }
 
-    if (auto *e1 = dynamic_cast<const Expr01 *>(e))
+    if (auto *e1 = node_cast<const Expr01>(e))
         return type_of(e1->elem.get());
 
     if (ctag(e) == ConstructType::expr02) {
@@ -6215,7 +6215,7 @@ void Inferencer::accumulate_call(CallExpr *call)
         }
     }
 
-    auto *cid = dynamic_cast<Identifier *>(call->what.get());
+    auto *cid = node_cast<Identifier>(call->what.get());
     if (!cid)
         return;
 
@@ -6231,7 +6231,7 @@ void Inferencer::accumulate_call(CallExpr *call)
     auto contribute_container = [&](size_t base_i, int key_i, size_t val_i) {
         if (base_i >= args->elems.size() || val_i >= args->elems.size())
             return;
-        auto *bid = dynamic_cast<Identifier *>(args->elems[base_i].get());
+        auto *bid = node_cast<Identifier>(args->elems[base_i].get());
         if (!bid)
             return;
         auto bit = id_sym.find(bid);
@@ -7280,7 +7280,7 @@ void Inferencer::check_binops(MultiOpConstruct *mo, bool comparison,
 TypeSym *Inferencer::narrow_target(Construct *cond, bool &in_then)
 {
     auto sym_of = [&](Construct *c) -> TypeSym * {
-        auto *id = dynamic_cast<Identifier *>(c);
+        auto *id = node_cast<Identifier>(c);
         if (!id)
             return nullptr;
         auto it = id_sym.find(id);
@@ -7299,7 +7299,7 @@ TypeSym *Inferencer::narrow_target(Construct *cond, bool &in_then)
 
     /* `x != none` / `x == none` (Expr07, two operands) */
     auto *mo = dynamic_cast<MultiOpConstruct *>(cond);
-    if (mo && (dynamic_cast<Expr07 *>(cond)) && mo->elems.size() == 2) {
+    if (mo && (node_cast<Expr07>(cond)) && mo->elems.size() == 2) {
         const Op op = mo->elems[1].first;
         if (op != Op::eq && op != Op::noteq)
             return nullptr;
@@ -7412,7 +7412,7 @@ static EvalValue build_type_value(StaticTypeRef t)
  */
 bool Inferencer::fold_type_query(CallExpr *call)
 {
-    auto *cid = dynamic_cast<Identifier *>(call->what.get());
+    auto *cid = node_cast<Identifier>(call->what.get());
     if (!cid)
         return false;
     const std::string_view fn = cid->uid->val;
@@ -7436,7 +7436,7 @@ bool Inferencer::fold_type_query(CallExpr *call)
 
     StaticTypeRef t;
     if (is_decltype) {
-        auto *argid = dynamic_cast<Identifier *>(args->elems[0].get());
+        auto *argid = node_cast<Identifier>(args->elems[0].get());
         if (!argid)
             mismatch("decltype expects a variable (an identifier)",
                      args->elems[0]->start, args->elems[0]->end);
@@ -7592,7 +7592,7 @@ void Inferencer::check(Construct *n)
         std::vector<const TypeSym *> added;
         for (auto &st : b->elems) {
             check(st.get());
-            auto *gi = dynamic_cast<IfStmt *>(st.get());
+            auto *gi = node_cast<IfStmt>(st.get());
             if (!gi || gi->elseBlock || !always_exits(gi->thenBlock.get()))
                 continue;
             bool in_then = false;
@@ -7768,7 +7768,7 @@ void Inferencer::check(Construct *n)
         /* the operand must be an lvalue: a variable, an array element, a
          * struct field or a box's value (not a literal, an expression, or
          * a call result). */
-        auto *id = dynamic_cast<Identifier *>(opnd);
+        auto *id = node_cast<Identifier>(opnd);
         if (!id && ctag(opnd) != ConstructType::subscript
                 && ctag(opnd) != ConstructType::member
                 && ctag(opnd) != ConstructType::deref) {
@@ -8222,9 +8222,9 @@ static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
      * (<< >> >>>), Expr08 (&), Expr09 (^), Expr10 (|). The bitwise ones are
      * int-only (always th==i), and share the unboxed int arith loop in
      * TypedScalarExpr::eval_int. */
-    if (dynamic_cast<Expr03 *>(n.get()) || dynamic_cast<Expr04 *>(n.get()) ||
-        dynamic_cast<Expr05 *>(n.get()) || dynamic_cast<Expr08 *>(n.get()) ||
-        dynamic_cast<Expr09 *>(n.get()) || dynamic_cast<Expr10 *>(n.get())) {
+    if (node_cast<Expr03>(n.get()) || node_cast<Expr04>(n.get()) ||
+        node_cast<Expr05>(n.get()) || node_cast<Expr08>(n.get()) ||
+        node_cast<Expr09>(n.get()) || node_cast<Expr10>(n.get())) {
         auto *mo = static_cast<MultiOpConstruct *>(n.get());
         if (n->th == TypeHint::i && ops_scalar(mo, false))
             return make_typed(TypedScalarExpr::Cat::arith, TypeHint::i,
@@ -8239,7 +8239,7 @@ static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
 
     /* comparison: Expr06 (< > <= >=), Expr07 (== !=). Only the simple
      * two-operand form (the overwhelmingly common case). Result is int. */
-    if (dynamic_cast<Expr06 *>(n.get()) || dynamic_cast<Expr07 *>(n.get())) {
+    if (node_cast<Expr06>(n.get()) || node_cast<Expr07>(n.get())) {
         auto *mo = static_cast<MultiOpConstruct *>(n.get());
         if (mo->elems.size() == 2 && ops_scalar(mo, true)) {
             const bool anyf =
@@ -8253,7 +8253,7 @@ static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
     }
 
     /* logical: Expr11 (&&), Expr12 (||). Int operands, int result. */
-    if (dynamic_cast<Expr11 *>(n.get()) || dynamic_cast<Expr12 *>(n.get())) {
+    if (node_cast<Expr11>(n.get()) || node_cast<Expr12>(n.get())) {
         auto *mo = static_cast<MultiOpConstruct *>(n.get());
         if (ops_scalar(mo, false))
             return make_typed(TypedScalarExpr::Cat::logical, TypeHint::i,
@@ -8262,7 +8262,7 @@ static unique_ptr<Construct> try_specialize(unique_ptr<Construct> n)
     }
 
     /* unary: Expr02 (+ - !), exactly one operand (elems[0]). */
-    if (dynamic_cast<Expr02 *>(n.get())) {
+    if (node_cast<Expr02>(n.get())) {
         auto *mo = static_cast<MultiOpConstruct *>(n.get());
         if (mo->elems.size() != 1)
             return n;
@@ -8435,7 +8435,7 @@ static void specialize_children(Construct *n, int *fsize)
 static const UniqueId *fr_base_id(const Construct *lv)
 {
     while (lv) {
-        if (auto *id = dynamic_cast<const Identifier *>(lv))
+        if (auto *id = node_cast<const Identifier>(lv))
             return id->uid;
         if (ctag(lv) == ConstructType::subscript) {
             auto *s = static_cast<const Subscript *>(lv);
@@ -8458,7 +8458,7 @@ static const UniqueId *fr_base_id(const Construct *lv)
  * arg (e.g. `len(arr)`) is safe to evaluate once for the loop. */
 static bool fr_is_const_builtin(const Construct *callee)
 {
-    auto *id = dynamic_cast<const Identifier *>(callee);
+    auto *id = node_cast<const Identifier>(callee);
     return id && EvalContext::const_builtins.count(id->uid) != 0;
 }
 
@@ -8478,7 +8478,7 @@ static void fr_collect_pure_funcs(Construct *c)
 {
     if (!c)
         return;
-    if (auto *fd = dynamic_cast<FuncDeclStmt *>(c))
+    if (auto *fd = node_cast<FuncDeclStmt>(c))
         if (fd->id && fd->desc->effective_pure)
             g_fr_pure.insert(fd->id->uid);
     Inferencer::for_each_child(c, fr_collect_pure_funcs);
@@ -8486,7 +8486,7 @@ static void fr_collect_pure_funcs(Construct *c)
 
 static bool fr_is_pure_func(const Construct *callee)
 {
-    auto *id = dynamic_cast<const Identifier *>(callee);
+    auto *id = node_cast<const Identifier>(callee);
     return id && g_fr_pure.count(id->uid) != 0;
 }
 
@@ -8509,7 +8509,7 @@ static bool fr_is_scalar(const Construct *e)
  * user function, a value, a name a program declared over a builtin's) */
 static std::string_view fr_builtin_name(const Construct *callee)
 {
-    auto *id = dynamic_cast<const Identifier *>(callee);
+    auto *id = node_cast<const Identifier>(callee);
     if (!id || id->sym.kind != SymKind::builtin)
         return {};
     return id->get_str();
@@ -8610,7 +8610,7 @@ static void fr_collect_mutated(Construct *c, FrMut &m)
                 auto *il = static_cast<IdList *>(e->lvalue.get());
                 for (auto &p : il->elems)
                     m.taint(p->uid);
-            } else if (dynamic_cast<Identifier *>(e->lvalue.get())) {
+            } else if (node_cast<Identifier>(e->lvalue.get())) {
                 m.taint(fr_base_id(e->lvalue.get()));   /* `x = ...` */
             } else {
                 if (const UniqueId *b = fr_base_id(e->lvalue.get()))
@@ -8621,7 +8621,7 @@ static void fr_collect_mutated(Construct *c, FrMut &m)
         }
     } else if (ctag(c) == ConstructType::incdec) {
         auto *idc = static_cast<IncDecExpr *>(c);
-        if (dynamic_cast<Identifier *>(idc->lvalue.get())) {
+        if (node_cast<Identifier>(idc->lvalue.get())) {
             m.taint(fr_base_id(idc->lvalue.get()));
         } else {
             if (const UniqueId *b = fr_base_id(idc->lvalue.get()))
@@ -8652,7 +8652,7 @@ static void fr_collect_mutated(Construct *c, FrMut &m)
                     m.taint(b);
             }
         if (!pure) {
-            auto *id = dynamic_cast<const Identifier *>(callee);
+            auto *id = node_cast<const Identifier>(callee);
             const bool builtin = id && id->sym.kind == SymKind::builtin;
             if (!builtin || ce->callable_arg_mask != 0) {
                 /* a user function, a function value, or a builtin handed
@@ -8693,7 +8693,7 @@ static bool fr_immutable(const Construct *e, const FrMut &m,
         return false;
     if (ctag(e) == ConstructType::lit_int)
         return true;
-    if (auto *id = dynamic_cast<const Identifier *>(e))
+    if (auto *id = node_cast<const Identifier>(e))
         return id->sym.kind == SymKind::local && id->uid != i_uid &&
                m.len.find(id->uid) == m.len.end();
     if (auto *sc = dynamic_cast<const SingleChildConstruct *>(e))  /* Expr01 */
@@ -8742,9 +8742,9 @@ static bool fr_immutable(const Construct *e, const FrMut &m,
         /* arith (Expr02/03/04) + bitwise (Expr05/08/09/10) only - not a
          * comparison/logical (bool result, not an int bound). */
         if (ctag(e) == ConstructType::expr06 ||
-            dynamic_cast<const Expr07 *>(e) ||
-            dynamic_cast<const Expr11 *>(e) ||
-            dynamic_cast<const Expr12 *>(e))
+            node_cast<const Expr07>(e) ||
+            node_cast<const Expr11>(e) ||
+            node_cast<const Expr12>(e))
             return false;
         for (auto &p : mo->elems)
             if (!fr_immutable(p.second.get(), m, i_uid))
@@ -8763,25 +8763,25 @@ static bool fr_immutable(const Construct *e, const FrMut &m,
 static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n,
                                           int *fsize)
 {
-    auto *f = dynamic_cast<ForStmt *>(n.get());
+    auto *f = node_cast<ForStmt>(n.get());
     if (!f || !f->init || !f->cond || !f->inc || !f->body)
         return n;
 
     /* init: `var i = start`, with i a slotted-local int */
-    auto *init = dynamic_cast<Expr14 *>(f->init.get());
+    auto *init = node_cast<Expr14>(f->init.get());
     if (!init || !(init->fl & pFlags::pInDecl) || init->op != Op::assign)
         return n;
-    auto *ivar = dynamic_cast<Identifier *>(init->lvalue.get());
+    auto *ivar = node_cast<Identifier>(init->lvalue.get());
     if (!ivar || ivar->sym.kind != SymKind::local || ivar->th != TypeHint::i)
         return n;
     const UniqueId *i_uid = ivar->uid;
     const int i_slot = ivar->sym.slot;
 
     /* cond: `i </<= bound` (asc) or `i >=/> bound` (desc), bound int */
-    auto *cond = dynamic_cast<Expr06 *>(f->cond.get());
+    auto *cond = node_cast<Expr06>(f->cond.get());
     if (!cond || cond->elems.size() != 2)
         return n;
-    auto *cleft = dynamic_cast<Identifier *>(cond->elems[0].second.get());
+    auto *cleft = node_cast<Identifier>(cond->elems[0].second.get());
     if (!cleft || cleft->uid != i_uid)
         return n;
     const Op cmp_op = cond->elems[1].first;
@@ -8795,18 +8795,18 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n,
 
     /* inc: `i += step` / `i++` (asc) or `i -= step` / `i--` (desc) */
     bool inc_asc;
-    Expr14 *inc14 = dynamic_cast<Expr14 *>(f->inc.get());
+    Expr14 *inc14 = node_cast<Expr14>(f->inc.get());
     Construct *step = nullptr;
     if (ctag(f->inc.get()) == ConstructType::incdec) {
         auto *idc = static_cast<IncDecExpr *>(f->inc.get());
-        auto *iid = dynamic_cast<Identifier *>(idc->lvalue.get());
+        auto *iid = node_cast<Identifier>(idc->lvalue.get());
         if (!iid || iid->uid != i_uid)
             return n;
         inc_asc = idc->is_inc;
     } else if (inc14) {
         if (inc14->fl & pFlags::pInDecl)
             return n;
-        auto *iid = dynamic_cast<Identifier *>(inc14->lvalue.get());
+        auto *iid = node_cast<Identifier>(inc14->lvalue.get());
         if (!iid || iid->uid != i_uid)
             return n;
         if (inc14->op == Op::addeq)       inc_asc = true;
@@ -8859,7 +8859,7 @@ static bool hoist_refs_uid(Construct *c, const UniqueId *uid)
 {
     if (!c)
         return false;
-    if (auto *id = dynamic_cast<Identifier *>(c))
+    if (auto *id = node_cast<Identifier>(c))
         if (id->uid == uid)
             return true;
     bool found = false;
@@ -8985,7 +8985,7 @@ static unique_ptr<Construct> try_hoist_loop_slices(unique_ptr<Construct> n)
     } else {
         return n;
     }
-    Block *body = dynamic_cast<Block *>(body_c);
+    Block *body = node_cast<Block>(body_c);
     if (!body)
         return n;
 
@@ -8994,22 +8994,22 @@ static unique_ptr<Construct> try_hoist_loop_slices(unique_ptr<Construct> n)
 
     std::vector<unique_ptr<Construct>> hoisted;
     for (size_t i = 0; i < body->elems.size(); ) {
-        auto *e14 = dynamic_cast<Expr14 *>(body->elems[i].get());
+        auto *e14 = node_cast<Expr14>(body->elems[i].get());
         const Identifier *lhs;
         const Slice *sl;
         if (e14 && e14->op == Op::assign && (e14->fl & pFlags::pInDecl)
             && !(e14->fl & pFlags::pInConstDecl)
-            && (lhs = dynamic_cast<Identifier *>(e14->lvalue.get()))
+            && (lhs = node_cast<Identifier>(e14->lvalue.get()))
             && lhs->sym.kind == SymKind::local
             && lhs->decl_type != DeclType::i && lhs->decl_type != DeclType::f
             && !lhs->is_underscore()
-            && (sl = dynamic_cast<Slice *>(e14->rvalue.get()))
+            && (sl = node_cast<Slice>(e14->rvalue.get()))
             && sl->base_sliceable
             /* base: an inlined scalar LITERAL (an auto-const string -
              * bench 29's shape) is trivially invariant; else the
              * identifier must be length- AND content-stable (content:
              * the COW-detach hazard - see the header comment) */
-            && (dynamic_cast<LiteralStr *>(sl->what.get()) != nullptr
+            && (node_cast<LiteralStr>(sl->what.get()) != nullptr
                 || (fr_base_id(sl->what.get())
                     && mut.len.find(fr_base_id(sl->what.get()))
                            == mut.len.end()
@@ -9084,24 +9084,24 @@ static bool licm_expr_equal(const Construct *x, const Construct *y)
         return false;
     if (ctag(x) == ConstructType::id) {
         auto *ix = static_cast<const Identifier *>(x);
-        auto *iy = dynamic_cast<const Identifier *>(y);
+        auto *iy = node_cast<const Identifier>(y);
         return iy && ix->uid == iy->uid && ix->sym.kind == iy->sym.kind
                && ix->sym.slot == iy->sym.slot;
     }
     if (ctag(x) == ConstructType::lit_int) {
         auto *lx = static_cast<const LiteralInt *>(x);
-        auto *ly = dynamic_cast<const LiteralInt *>(y);
+        auto *ly = node_cast<const LiteralInt>(y);
         return ly && lx->ival() == ly->ival();
     }
     if (ctag(x) == ConstructType::subscript) {
         auto *sx = static_cast<const Subscript *>(x);
-        auto *sy = dynamic_cast<const Subscript *>(y);
+        auto *sy = node_cast<const Subscript>(y);
         return sy && licm_expr_equal(sx->what.get(), sy->what.get())
                && licm_expr_equal(sx->index.get(), sy->index.get());
     }
     if (ctag(x) == ConstructType::member) {
         auto *mx = static_cast<const MemberExpr *>(x);
-        auto *my = dynamic_cast<const MemberExpr *>(y);
+        auto *my = node_cast<const MemberExpr>(y);
         return my && mx->memUid == my->memUid
                && licm_expr_equal(mx->what.get(), my->what.get());
     }
@@ -9137,7 +9137,7 @@ static bool licm_expr_equal(const Construct *x, const Construct *y)
  */
 static bool licm_pure_callback(const Construct *arg)
 {
-    if (auto *fd = dynamic_cast<const FuncDeclStmt *>(arg))
+    if (auto *fd = node_cast<const FuncDeclStmt>(arg))
         return fd->desc && fd->desc->effective_pure;
     return fr_is_pure_func(arg);
 }
@@ -9152,7 +9152,7 @@ static bool licm_pure_callback(const Construct *arg)
  */
 static bool licm_is_const_builtin(const Construct *callee)
 {
-    auto *id = dynamic_cast<const Identifier *>(callee);
+    auto *id = node_cast<const Identifier>(callee);
     return id && id->sym.kind == SymKind::builtin
            && fr_is_const_builtin(callee);
 }
@@ -9274,7 +9274,7 @@ static bool licm_refs_any(const Construct *e,
 {
     if (!e)
         return false;
-    if (auto *id = dynamic_cast<const Identifier *>(e))
+    if (auto *id = node_cast<const Identifier>(e))
         return names.find(id->uid) != names.end();
     bool found = false;
     Inferencer::for_each_child(const_cast<Construct *>(e), [&](Construct *ch) {
@@ -9333,7 +9333,7 @@ static void licm_collect(
         || ctag(c) == ConstructType::expr11 || ctag(c) == ConstructType::expr12
         || ctag(c) == ConstructType::func_decl || ctag(c) == ConstructType::block)
         return;
-    if (auto *sub = dynamic_cast<Subscript *>(c))
+    if (auto *sub = node_cast<Subscript>(c))
         if (licm_candidate(sub, mut, body_decls, i_uid)) {
             out.push_back(&slot);
             return;
@@ -9395,25 +9395,25 @@ try_hoist_loop_subscripts(unique_ptr<Construct> n, int *fsize)
 {
     if (!fsize || *fsize >= LICM_MAX_FRAME_SLOTS)
         return n;                     /* no frame to grow, or no room in it */
-    auto *f = dynamic_cast<ForStmt *>(n.get());
+    auto *f = node_cast<ForStmt>(n.get());
     if (!f || !f->init || !f->cond || !f->inc || !f->body)
         return n;
 
     /* init: `var k = INIT`, k a slotted-local int */
-    auto *init = dynamic_cast<Expr14 *>(f->init.get());
+    auto *init = node_cast<Expr14>(f->init.get());
     if (!init || !(init->fl & pFlags::pInDecl) || init->op != Op::assign)
         return n;
-    auto *ivar = dynamic_cast<Identifier *>(init->lvalue.get());
+    auto *ivar = node_cast<Identifier>(init->lvalue.get());
     if (!ivar || ivar->sym.kind != SymKind::local || ivar->th != TypeHint::i)
         return n;
     const UniqueId *i_uid = ivar->uid;
 
     /* cond: `k CMP BOUND` (the raw pre-specialization form, as try_for_range
      * matches it) */
-    auto *cond = dynamic_cast<Expr06 *>(f->cond.get());
+    auto *cond = node_cast<Expr06>(f->cond.get());
     if (!cond || cond->elems.size() != 2)
         return n;
-    auto *cleft = dynamic_cast<Identifier *>(cond->elems[0].second.get());
+    auto *cleft = node_cast<Identifier>(cond->elems[0].second.get());
     if (!cleft || cleft->uid != i_uid)
         return n;
     const Op cmp = cond->elems[1].first;
@@ -9445,7 +9445,7 @@ try_hoist_loop_subscripts(unique_ptr<Construct> n, int *fsize)
      * guard is unconditional and can be dropped entirely.
      */
     bool guard_needed = true;
-    if (auto *li = dynamic_cast<LiteralInt *>(init_rv))
+    if (auto *li = node_cast<LiteralInt>(init_rv))
         if (ctag(bound) == ConstructType::lit_int) {
             auto *lb = static_cast<LiteralInt *>(bound);
             const int_type x = li->ival(), y = lb->ival();
@@ -9570,8 +9570,8 @@ static unique_ptr<Construct> specialize(unique_ptr<Construct> n, int *fsize)
     /* #107: each pass FIRED iff it changed the node's kind (a wrapper
      * Block, a ForRangeStmt) - recorded here, outside the passes' gates */
     ML_INT_ONLY(const Loc int_at = n->start;)
-    if (dynamic_cast<ForStmt *>(n.get())
-            || dynamic_cast<WhileStmt *>(n.get())) {
+    if (node_cast<ForStmt>(n.get())
+            || node_cast<WhileStmt>(n.get())) {
         if (!(g_opt_disabled & opt_slice_hoist)) {
             n = try_hoist_loop_slices(std::move(n));
             ML_INT_ONLY(if (ctag(n.get()) == ConstructType::block)
@@ -9582,7 +9582,7 @@ static unique_ptr<Construct> specialize(unique_ptr<Construct> n, int *fsize)
          * If the slice hoist already produced a wrapper Block, the recursion
          * below re-enters specialize() on the loop and it gets its turn. */
         if (!(g_opt_disabled & opt_licm)
-            && dynamic_cast<ForStmt *>(n.get())) {
+            && node_cast<ForStmt>(n.get())) {
             n = try_hoist_loop_subscripts(std::move(n), fsize);
             ML_INT_ONLY(if (ctag(n.get()) == ConstructType::block)
                             ML_INT(ast_transform, "licm",
@@ -9598,9 +9598,9 @@ static unique_ptr<Construct> specialize(unique_ptr<Construct> n, int *fsize)
     /* a counted for-loop -> ForRangeStmt (matched on the raw form, BEFORE its
      * cond/inc are specialized away). */
     if (!(g_opt_disabled & opt_for_range)
-        && dynamic_cast<ForStmt *>(n.get())) {
+        && node_cast<ForStmt>(n.get())) {
         n = try_for_range(std::move(n), fsize);
-        if (dynamic_cast<ForRangeStmt *>(n.get())) {
+        if (node_cast<ForRangeStmt>(n.get())) {
             ML_INT(ast_transform, "for_range", int_at.line, int_at.col);
             return n;     /* matched: sub-trees already specialized */
         }
@@ -9681,7 +9681,7 @@ void Inferencer::collect_arrays(AnalysisInfo &out)
 {
     for (const auto &kv : id_sym) {
 
-        const Identifier *id = dynamic_cast<const Identifier *>(kv.first);
+        const Identifier *id = node_cast<const Identifier>(kv.first);
         TypeSym *s = kv.second;
         if (!id || !s)
             continue;
@@ -9765,7 +9765,7 @@ static const FuncDeclStmt *
 show_named_func(const Block *root, const UniqueId *uid)
 {
     for (const auto &e : root->elems)
-        if (auto *fd = dynamic_cast<const FuncDeclStmt *>(e.get()))
+        if (auto *fd = node_cast<const FuncDeclStmt>(e.get()))
             if (fd->id && fd->id->uid == uid)
                 return fd;
     return nullptr;
@@ -9781,10 +9781,10 @@ fold_show_slot(unique_ptr<Construct> &slot, const Block *root)
     for_each_child_slot(slot.get(),
         [&](unique_ptr<Construct> &ch) { fold_show_slot(ch, root); });
 
-    auto *ce = dynamic_cast<CallExpr *>(slot.get());
+    auto *ce = node_cast<CallExpr>(slot.get());
     if (!ce || !ce->args || ce->args->elems.size() != 1)
         return;
-    auto *callee = dynamic_cast<Identifier *>(ce->what.get());
+    auto *callee = node_cast<Identifier>(ce->what.get());
     if (!callee || callee->sym.kind != SymKind::builtin
             || callee->get_str() != "show")
         return;
@@ -9856,7 +9856,7 @@ void specialize_types(Construct *root, bool enable, EvalContext *prior_scope,
     if (!enable || !root)
         return;
 
-    auto *blk = dynamic_cast<Block *>(root);
+    auto *blk = node_cast<Block>(root);
     if (!blk)
         return;
 
@@ -9920,7 +9920,7 @@ ReplInfer::~ReplInfer() = default;
 void ReplInfer::check_input(Construct *input)
 {
     impl->can_reject = false;
-    auto *blk = dynamic_cast<Block *>(input);
+    auto *blk = node_cast<Block>(input);
     if (!blk)
         return;
 

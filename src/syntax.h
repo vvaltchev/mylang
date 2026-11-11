@@ -2589,3 +2589,91 @@ public:
         return c;
     }
 };
+
+/*
+ * node_cast<T>(c) is dynamic_cast<T *>(c) for a node class whose tag NO
+ * class outside its own subtree carries: a `final` class (its tag is its
+ * alone), or CallExpr (every class tagged `call` is a CallExpr). T may be
+ * const-qualified, exactly as the dynamic_cast's target was; a class
+ * with no NodeTag entry does not compile. It reads the tag instead of the
+ * RTTI - the #102 conversion, for the forms that BIND the result.
+ *
+ * It also takes a fixed pile out of the coverage universe: dynamic_cast
+ * tests its operand for null first, a branch gcov charged to every call
+ * site, and almost every operand here cannot be null - about a thousand
+ * elements no input could take (2026-11-11). The null test is ctag's now,
+ * one per translation unit.
+ *
+ * The ML_CHECK proves every answer equals the dynamic_cast's in each
+ * build that has assertions, so a wrong NodeTag row aborts by name.
+ */
+template <class T> struct NodeTag;   /* no row: not tag-castable */
+#define ML_NODE_TAG(T, t)                                         \
+    template <> struct NodeTag<T> {                               \
+        static constexpr ConstructType tag = ConstructType::t;    \
+    };
+ML_NODE_TAG(LiteralInt, lit_int)
+ML_NODE_TAG(LiteralBool, lit_bool)
+ML_NODE_TAG(LiteralFloat, lit_float)
+ML_NODE_TAG(LiteralNone, lit_none)
+ML_NODE_TAG(NopConstruct, nop)
+ML_NODE_TAG(LiteralStr, lit_str)
+ML_NODE_TAG(LiteralArray, lit_arr)
+ML_NODE_TAG(LiteralObj, lit_obj)
+ML_NODE_TAG(LiteralDictKVPair, lit_dict_kv)
+ML_NODE_TAG(LiteralDict, lit_dict)
+ML_NODE_TAG(Identifier, id)
+ML_NODE_TAG(ExprList, expr_list)
+ML_NODE_TAG(IdList, idlist)
+ML_NODE_TAG(CallExpr, call)
+ML_NODE_TAG(InlinedCallExpr, inlined_call)
+ML_NODE_TAG(Expr01, expr01)
+ML_NODE_TAG(Expr02, expr02)
+ML_NODE_TAG(Expr03, expr03)
+ML_NODE_TAG(Expr04, expr04)
+ML_NODE_TAG(Expr05, expr05)
+ML_NODE_TAG(Expr06, expr06)
+ML_NODE_TAG(Expr07, expr07)
+ML_NODE_TAG(Expr08, expr08)
+ML_NODE_TAG(Expr09, expr09)
+ML_NODE_TAG(Expr10, expr10)
+ML_NODE_TAG(Expr11, expr11)
+ML_NODE_TAG(Expr12, expr12)
+ML_NODE_TAG(TypedScalarExpr, typed_scalar)
+ML_NODE_TAG(Expr14, expr14)
+ML_NODE_TAG(IfStmt, if_stmt)
+ML_NODE_TAG(Block, block)
+ML_NODE_TAG(BreakStmt, brk)
+ML_NODE_TAG(ContinueStmt, cont)
+ML_NODE_TAG(ReturnStmt, ret)
+ML_NODE_TAG(WhileStmt, while_stmt)
+ML_NODE_TAG(FuncDeclStmt, func_decl)
+ML_NODE_TAG(StructDeclStmt, struct_decl)
+ML_NODE_TAG(Subscript, subscript)
+ML_NODE_TAG(Slice, slice)
+ML_NODE_TAG(TryCatchStmt, try_catch)
+ML_NODE_TAG(RethrowStmt, rethrow)
+ML_NODE_TAG(ThrowStmt, throw_stmt)
+ML_NODE_TAG(ForeachStmt, foreach_stmt)
+ML_NODE_TAG(MemberExpr, member)
+ML_NODE_TAG(IncDecExpr, incdec)
+ML_NODE_TAG(DerefExpr, deref)
+ML_NODE_TAG(TernaryExpr, ternary)
+ML_NODE_TAG(CoalesceExpr, coalesce)
+ML_NODE_TAG(ForStmt, for_stmt)
+ML_NODE_TAG(ForRangeStmt, for_range)
+#undef ML_NODE_TAG
+
+template <class T, class C>
+static inline T *node_cast(C *c)
+{
+    typedef typename std::remove_const<T>::type U;
+    typedef typename std::conditional<std::is_const<C>::value,
+                                      const Construct, Construct>::type B;
+    static_assert(std::is_final<U>::value || std::is_same<U, CallExpr>::value,
+                  "node_cast: the tag must name T's whole subtree");
+    B *b = c;
+    T *r = ctag(b) == NodeTag<U>::tag ? static_cast<T *>(b) : nullptr;
+    ML_CHECK(r == dynamic_cast<T *>(b));
+    return r;
+}

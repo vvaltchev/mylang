@@ -1510,7 +1510,7 @@ void Inferencer::dump_callee_sets(std::ostream &os)
             }
             for_each_child(n, [&](Construct *c) { walk(c, inner); });
         };
-    if (auto *b = dynamic_cast<Block *>(root))
+    if (auto *b = node_cast<Block>(root))
         for (auto &e : b->elems)
             walk(e.get(), nullptr);
 

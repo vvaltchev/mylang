@@ -3017,7 +3017,7 @@ vm_compile(const Construct *root_c, bool jit)
     std::function<void (Construct *)> take_structs = [&](Construct *c) {
         if (!c)
             return;
-        if (auto *sd = dynamic_cast<StructDeclStmt *>(c)) {
+        if (auto *sd = node_cast<StructDeclStmt>(c)) {
             if (sd->def_owner)
                 prog.structs.push_back(std::move(sd->def_owner));
             return;

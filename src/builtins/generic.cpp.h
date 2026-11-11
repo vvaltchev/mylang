@@ -44,7 +44,7 @@ EvalValue builtin_isbound(EvalContext *ctx, ExprList *exprList)
         throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
 
     Construct *arg = exprList->elems[0].get();
-    const Identifier *id = dynamic_cast<const Identifier *>(arg);
+    const Identifier *id = node_cast<const Identifier>(arg);
 
     if (!id)
         throw TypeErrorEx("isbound() requires an identifier",

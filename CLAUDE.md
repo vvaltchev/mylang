@@ -9864,6 +9864,17 @@ restricted to leaf classes and double-eval-safe operands. Casts to a
 BASE (SingleChild/MultiOp/MultiElem/Literal) or to a CallExpr SUBCLASS
 (Direct/Cached/DirectBuiltin - they share the `call` tag) stay
 dynamic_cast. Total: 139.7M -> 23.8M on 83's compile, -83%.
+**The forms that BIND the result went next (2026-11-11): `if (auto *x =
+dynamic_cast<const X *>(e))` is `node_cast<const X>(e)`** (syntax.h) -
+a tag compare for a class with a `NodeTag` row, which a `final` node
+class (and CallExpr) has; a class with no row does not compile, and an
+ML_CHECK compares every answer with the dynamic_cast's in each build
+with assertions, so a wrong row aborts by name. 474 sites, emitted code
+identical corpus-wide (-vd 292/292, vdjcmp 225/225). It was done for the
+COVERAGE UNIVERSE: dynamic_cast tests its operand for null first, a
+branch gcov charged to every call site and almost no operand could
+take - about 1,000 uncoverable elements. **A new `final` node class
+gets a `NodeTag` row; write `node_cast`, not a leaf dynamic_cast.**
 
 ## Conventions
 

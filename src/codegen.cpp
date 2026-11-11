@@ -178,11 +178,11 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
 {
     if (!c)
         return true;
-    if (auto *id = dynamic_cast<const Identifier *>(c))
+    if (auto *id = node_cast<const Identifier>(c))
         return !(id->sym.kind == SymKind::local && id->sym.slot == loop_slot);
     if (ctag(c) == ConstructType::member) {
         auto *m = static_cast<const MemberExpr *>(c);
-        auto *bid = dynamic_cast<const Identifier *>(m->what.get());
+        auto *bid = node_cast<const Identifier>(m->what.get());
         if (bid && bid->sym.kind == SymKind::local
             && bid->sym.slot == loop_slot) {
             if (lval)
@@ -207,10 +207,10 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
         }
         return struct_fe_body_ok(m->what.get(), loop_slot, def, false);
     }
-    if (auto *e = dynamic_cast<const Expr14 *>(c))
+    if (auto *e = node_cast<const Expr14>(c))
         return struct_fe_body_ok(e->lvalue.get(), loop_slot, def, true)
             && struct_fe_body_ok(e->rvalue.get(), loop_slot, def, false);
-    if (auto *inc = dynamic_cast<const IncDecExpr *>(c))
+    if (auto *inc = node_cast<const IncDecExpr>(c))
         return struct_fe_body_ok(inc->lvalue.get(), loop_slot, def, true);
     auto all = [&](std::initializer_list<const Construct *> cs) {
         for (const Construct *ch : cs)
@@ -239,29 +239,29 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
     }
     if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c))
         return struct_fe_body_ok(sc->elem.get(), loop_slot, def, false);
-    if (auto *ce = dynamic_cast<const CallExpr *>(c))
+    if (auto *ce = node_cast<const CallExpr>(c))
         return all({ce->what.get(), ce->args.get()});
-    if (auto *sub = dynamic_cast<const Subscript *>(c))
+    if (auto *sub = node_cast<const Subscript>(c))
         return all({sub->what.get(), sub->index.get()});
-    if (auto *iff = dynamic_cast<const IfStmt *>(c))
+    if (auto *iff = node_cast<const IfStmt>(c))
         return all({iff->condExpr.get(), iff->thenBlock.get(),
                     iff->elseBlock.get()});
-    if (auto *w = dynamic_cast<const WhileStmt *>(c))
+    if (auto *w = node_cast<const WhileStmt>(c))
         return all({w->condExpr.get(), w->body.get()});
-    if (auto *f = dynamic_cast<const ForStmt *>(c))
+    if (auto *f = node_cast<const ForStmt>(c))
         return all({f->init.get(), f->cond.get(), f->inc.get(),
                     f->body.get()});
-    if (auto *fr = dynamic_cast<const ForRangeStmt *>(c))
+    if (auto *fr = node_cast<const ForRangeStmt>(c))
         return all({fr->init.get(), fr->bound.get(), fr->step.get(),
                     fr->body.get()});
-    if (auto *fe2 = dynamic_cast<const ForeachStmt *>(c))
+    if (auto *fe2 = node_cast<const ForeachStmt>(c))
         return all({fe2->container.get(), fe2->body.get()});
-    if (auto *te = dynamic_cast<const TernaryExpr *>(c))
+    if (auto *te = node_cast<const TernaryExpr>(c))
         return all({te->condExpr.get(), te->thenExpr.get(),
                     te->elseExpr.get()});
-    if (auto *co = dynamic_cast<const CoalesceExpr *>(c))
+    if (auto *co = node_cast<const CoalesceExpr>(c))
         return all({co->lhs.get(), co->rhs.get()});
-    if (auto *ret = dynamic_cast<const ReturnStmt *>(c))
+    if (auto *ret = node_cast<const ReturnStmt>(c))
         return struct_fe_body_ok(ret->elem.get(), loop_slot, def, false);
     if (dynamic_cast<const Literal *>(c)
         || dynamic_cast<const ChildlessConstruct *>(c))
@@ -307,24 +307,24 @@ static bool struct_fe_body_inert(const Construct *c,
     auto scalar_th = [](const Construct *e) {
         return e->th == TypeHint::i || e->th == TypeHint::f;
     };
-    if (dynamic_cast<const Identifier *>(c))
+    if (node_cast<const Identifier>(c))
         return true;
     if (ctag(c) == ConstructType::member)
         return struct_fe_body_inert(
             static_cast<const MemberExpr *>(c)->what.get(), shift_only);
-    if (auto *e = dynamic_cast<const Expr14 *>(c)) {
+    if (auto *e = node_cast<const Expr14>(c)) {
         if (shift_only)                   /* a store moves no element */
             return all({e->lvalue.get(), e->rvalue.get()});
-        if (!dynamic_cast<const Identifier *>(e->lvalue.get()))
+        if (!node_cast<const Identifier>(e->lvalue.get()))
             return false;                 /* a store through [] or . */
         if (e->op != Op::assign && !scalar_th(e->lvalue.get()))
             return false;                 /* `a += [x]` appends in place */
         return struct_fe_body_inert(e->rvalue.get());
     }
-    if (auto *inc = dynamic_cast<const IncDecExpr *>(c)) {
+    if (auto *inc = node_cast<const IncDecExpr>(c)) {
         if (shift_only)
             return struct_fe_body_inert(inc->lvalue.get(), true);
-        return dynamic_cast<const Identifier *>(inc->lvalue.get()) != nullptr;
+        return node_cast<const Identifier>(inc->lvalue.get()) != nullptr;
     }
     if (auto *bc = dynamic_cast<const DirectBuiltinCallExpr *>(c)) {
         static const char *const ok[] = {
@@ -341,7 +341,7 @@ static bool struct_fe_body_inert(const Construct *c,
             "values", "join", "split", "range", "clone", "deepclone",
             "top", "sum", "array", "dynarray", "array_storage",
         };
-        const auto *id = dynamic_cast<const Identifier *>(bc->what.get());
+        const auto *id = node_cast<const Identifier>(bc->what.get());
         if (!id || bc->callable_arg_mask != 0)
             return false;
         bool listed = false;
@@ -352,7 +352,7 @@ static bool struct_fe_body_inert(const Construct *c,
                 listed = listed || id->uid->val == n;
         return listed && all({bc->args.get()});
     }
-    if (dynamic_cast<const CallExpr *>(c))
+    if (node_cast<const CallExpr>(c))
         return false;                     /* user code, or a builtin that
                                            * may mutate / call back */
     if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
@@ -373,31 +373,31 @@ static bool struct_fe_body_inert(const Construct *c,
                 return false;
         return true;
     }
-    if (dynamic_cast<const InlinedCallExpr *>(c) && !shift_only)
+    if (node_cast<const InlinedCallExpr>(c) && !shift_only)
         return false;                     /* a spliced body: not audited */
     if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c))
         return struct_fe_body_inert(sc->elem.get(), shift_only);
-    if (auto *sub = dynamic_cast<const Subscript *>(c))
+    if (auto *sub = node_cast<const Subscript>(c))
         return all({sub->what.get(), sub->index.get()});
-    if (auto *iff = dynamic_cast<const IfStmt *>(c))
+    if (auto *iff = node_cast<const IfStmt>(c))
         return all({iff->condExpr.get(), iff->thenBlock.get(),
                     iff->elseBlock.get()});
-    if (auto *w = dynamic_cast<const WhileStmt *>(c))
+    if (auto *w = node_cast<const WhileStmt>(c))
         return all({w->condExpr.get(), w->body.get()});
-    if (auto *f = dynamic_cast<const ForStmt *>(c))
+    if (auto *f = node_cast<const ForStmt>(c))
         return all({f->init.get(), f->cond.get(), f->inc.get(),
                     f->body.get()});
-    if (auto *fr = dynamic_cast<const ForRangeStmt *>(c))
+    if (auto *fr = node_cast<const ForRangeStmt>(c))
         return all({fr->init.get(), fr->bound.get(), fr->step.get(),
                     fr->body.get()});
-    if (auto *fe2 = dynamic_cast<const ForeachStmt *>(c))
+    if (auto *fe2 = node_cast<const ForeachStmt>(c))
         return all({fe2->container.get(), fe2->body.get()});
-    if (auto *te = dynamic_cast<const TernaryExpr *>(c))
+    if (auto *te = node_cast<const TernaryExpr>(c))
         return all({te->condExpr.get(), te->thenExpr.get(),
                     te->elseExpr.get()});
-    if (auto *co = dynamic_cast<const CoalesceExpr *>(c))
+    if (auto *co = node_cast<const CoalesceExpr>(c))
         return all({co->lhs.get(), co->rhs.get()});
-    if (auto *ret = dynamic_cast<const ReturnStmt *>(c))
+    if (auto *ret = node_cast<const ReturnStmt>(c))
         return struct_fe_body_inert(ret->elem.get(), shift_only);
     if (dynamic_cast<const Literal *>(c)
         || dynamic_cast<const ChildlessConstruct *>(c))
@@ -523,7 +523,7 @@ bool is_typed_scalar_arg(const Construct *a)
 bool pod_ctor_arg_safe(const Construct *a, const FieldDef &fd)
 {
     if (fd.kind == FieldKind::f_struct) {
-        const CallExpr *ce = dynamic_cast<const CallExpr *>(a);
+        const CallExpr *ce = node_cast<const CallExpr>(a);
         return ce && ce->vm_struct_ctor_def
             && ce->vm_struct_ctor_def->name == fd.struct_ty;
     }
@@ -538,11 +538,11 @@ bool pod_ctor_arg_safe(const Construct *a, const FieldDef &fd)
  */
 bool as_int_operand(const Construct *e, Operand &out)
 {
-    if (const LiteralInt *li = dynamic_cast<const LiteralInt *>(e)) {
+    if (const LiteralInt *li = node_cast<const LiteralInt>(e)) {
         out = int_lit(li->ival());
         return true;
     }
-    if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+    if (const Identifier *id = node_cast<const Identifier>(e)) {
         if (id->sym.kind == SymKind::local && id->th == TypeHint::i) {
             out = slot_op(id->sym.slot);
             return true;
@@ -560,20 +560,20 @@ bool as_int_operand(const Construct *e, Operand &out)
  * two evals agree). A dict/member/complex-index inc-dec-as-value falls back. */
 bool incdec_lvalue_pure(const Construct *lv)
 {
-    if (const Identifier *id = dynamic_cast<const Identifier *>(lv))
+    if (const Identifier *id = node_cast<const Identifier>(lv))
         return id->sym.kind == SymKind::local
             || id->sym.kind == SymKind::global
             || id->sym.kind == SymKind::capture;
-    if (const Subscript *sub = dynamic_cast<const Subscript *>(lv)) {
+    if (const Subscript *sub = node_cast<const Subscript>(lv)) {
         Operand idx;
         /* A flat `a[i]` (slot base + immediate index), OR a NESTED `a[i][j]`
          * whose inner base `a[i]` is a Subscript over a slotted array with an
          * immediate index - both re-eval the same side-effect-free slot/index
          * in the read and the store. */
         if (const Subscript *inner =
-                dynamic_cast<const Subscript *>(sub->what.get())) {
+                node_cast<const Subscript>(sub->what.get())) {
             Operand k1, k2;
-            return dynamic_cast<const Identifier *>(inner->what.get())
+            return node_cast<const Identifier>(inner->what.get())
                 && as_int_operand(inner->index.get(), k1)
                 && as_int_operand(sub->index.get(), k2);
         }
@@ -585,8 +585,8 @@ bool incdec_lvalue_pure(const Construct *lv)
      * (MemberV) + the mutate (StoreMemberV/DictStore) both re-eval `p`, a
      * side-effect-free slot read. The emit_mut `th`-gate keeps a dyn field on
      * the fallback (inc-dec is int/float-only). */
-    if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(lv)) {
-        const Identifier *base = dynamic_cast<const Identifier *>(m->what.get());
+    if (const MemberExpr *m = node_cast<const MemberExpr>(lv)) {
+        const Identifier *base = node_cast<const Identifier>(m->what.get());
         return (m->base_struct || m->base_dict) && base
             && (base->sym.kind == SymKind::local
                 || base->sym.kind == SymKind::global
@@ -609,7 +609,7 @@ Operand float_lit(float_type v)
  * nested base (`a[i][j]`, `obj.arr[i]`) is not a bare local slot -> false. */
 bool as_array_slot(const Construct *e, int &slot)
 {
-    if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+    if (const Identifier *id = node_cast<const Identifier>(e)) {
         if (id->sym.kind == SymKind::local) {
             slot = id->sym.slot;
             return true;
@@ -629,7 +629,7 @@ bool as_array_slot(const Construct *e, int &slot)
  */
 bool as_container_base(const Construct *e, int &slot, int &kind)
 {
-    if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+    if (const Identifier *id = node_cast<const Identifier>(e)) {
         switch (id->sym.kind) {
         case SymKind::local:   kind = 0; slot = id->sym.slot; return true;
         case SymKind::global:  kind = 1; slot = id->sym.slot; return true;
@@ -648,15 +648,15 @@ bool as_container_base(const Construct *e, int &slot, int &kind)
  */
 bool as_float_operand(const Construct *e, Operand &out)
 {
-    if (const LiteralInt *li = dynamic_cast<const LiteralInt *>(e)) {
+    if (const LiteralInt *li = node_cast<const LiteralInt>(e)) {
         out = float_lit(static_cast<float_type>(li->ival()));
         return true;
     }
-    if (const LiteralFloat *lf = dynamic_cast<const LiteralFloat *>(e)) {
+    if (const LiteralFloat *lf = node_cast<const LiteralFloat>(e)) {
         out = float_lit(lf->fval());
         return true;
     }
-    if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+    if (const Identifier *id = node_cast<const Identifier>(e)) {
         if (id->sym.kind == SymKind::local
             && (id->th == TypeHint::f || id->th == TypeHint::i)) {
             out = slot_op(id->sym.slot);
@@ -679,7 +679,7 @@ bool definitely_int(const Construct *e)
 {
     if (ctag(e) == ConstructType::lit_int)
         return true;
-    const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
+    const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(e);
     return t && t->kind == TypeHint::i
         && (t->cat == TypedScalarExpr::Cat::arith
             || t->cat == TypedScalarExpr::Cat::neg);
@@ -724,19 +724,19 @@ Op compound_base_op(Op op)
  * Returns false for a non-scalar literal (an array/dict LiteralObj) - later. */
 bool boxed_literal(const Construct *e, EvalValue &out)
 {
-    if (const LiteralInt *li = dynamic_cast<const LiteralInt *>(e)) {
+    if (const LiteralInt *li = node_cast<const LiteralInt>(e)) {
         out = EvalValue(li->ival());
         return true;
     }
-    if (const LiteralFloat *lf = dynamic_cast<const LiteralFloat *>(e)) {
+    if (const LiteralFloat *lf = node_cast<const LiteralFloat>(e)) {
         out = EvalValue(lf->fval());
         return true;
     }
-    if (const LiteralBool *lb = dynamic_cast<const LiteralBool *>(e)) {
+    if (const LiteralBool *lb = node_cast<const LiteralBool>(e)) {
         out = EvalValue(lb->bval());
         return true;
     }
-    if (const LiteralStr *ls = dynamic_cast<const LiteralStr *>(e)) {
+    if (const LiteralStr *ls = node_cast<const LiteralStr>(e)) {
         out = ls->strval();
         return true;
     }
@@ -1200,7 +1200,7 @@ struct Codegen {
         bc.builtin = dc->builtin;
         bc.name = nullptr;
         if (const Identifier *id =
-                dynamic_cast<const Identifier *>(dc->what.get()))
+                node_cast<const Identifier>(dc->what.get()))
             bc.name = id->uid;
         bc.start = dc->args->start;
         bc.end = dc->args->end;
@@ -1472,7 +1472,7 @@ struct Codegen {
         if (n == 0 && !sdef)
             return false;
         for (const auto &el : la->elems) {
-            const CallExpr *ce = dynamic_cast<const CallExpr *>(el.get());
+            const CallExpr *ce = node_cast<const CallExpr>(el.get());
             if (!ce || !ce->vm_struct_ctor_def || !ce->args)
                 return false;
             if (!sdef)
@@ -1618,7 +1618,7 @@ struct Codegen {
          * free lvalue (incdec_lvalue_pure) so the read and the store's second
          * eval of the slot/index agree; a MoveV copies the scalar, so the
          * captured `dst` is unaffected by the mutation that follows. */
-        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(e)) {
+        if (const IncDecExpr *inc = node_cast<const IncDecExpr>(e)) {
             if (!incdec_lvalue_pure(inc->lvalue.get()))
                 return try_incdec_chain(inc, out_slot, ops);
             const size_t omark = ops.size();
@@ -1659,7 +1659,7 @@ struct Codegen {
          * can't lower (e.g. a try crossed inside the boundary) fails the whole
          * inline -> the tree-walker runs the InlinedCallExpr (byte-identical). */
         if (const InlinedCallExpr *ic =
-                dynamic_cast<const InlinedCallExpr *>(e)) {
+                node_cast<const InlinedCallExpr>(e)) {
             const size_t omark = ops.size();
             const size_t cmark = chunk.consts.size();
             const int st = next_temp;
@@ -1699,9 +1699,9 @@ struct Codegen {
          * UndefinedVariableEx when the callee evaluates — BEFORE the args (the
          * tree-walker's `what->eval` first). Native ThrowRuntimeV with the
          * callee's caret; the args are never compiled (never evaluated). */
-        if (const CallExpr *ce = dynamic_cast<const CallExpr *>(e)) {
+        if (const CallExpr *ce = node_cast<const CallExpr>(e)) {
             const Identifier *callee =
-                dynamic_cast<const Identifier *>(ce->what.get());
+                node_cast<const Identifier>(ce->what.get());
             if (callee && callee->sym.kind == SymKind::unresolved) {
                 emit_throw(Chunk::ThrowKind::undefined_var,
                            callee->start, callee->end, callee->uid, ops);
@@ -1710,7 +1710,7 @@ struct Codegen {
             }
         }
 
-        if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+        if (const Identifier *id = node_cast<const Identifier>(e)) {
             if (id->sym.kind == SymKind::local) {
                 out_slot = id->sym.slot;
                 return true;   /* the slot IS the operand - no op */
@@ -1763,7 +1763,7 @@ struct Codegen {
          * `var a = [1,2,3]` / `d = {}` const-literal rvalue folds to ->
          * LoadLiteralObjV materializes it from the pool (immutable share vs a
          * fresh mutable clone, plus the general/flat_s cases). Node-free. */
-        if (const LiteralObj *lo = dynamic_cast<const LiteralObj *>(e)) {
+        if (const LiteralObj *lo = node_cast<const LiteralObj>(e)) {
             const int t = alloc_temp();
             CgInstr in;
             in.op = OpCode::LoadLiteralObjV;
@@ -1781,7 +1781,7 @@ struct Codegen {
          * null - a named nested func decl is a statement) -> MakeClosureV: it
          * creates the FuncObject + snapshots captures from ctx, like
          * FuncDeclStmt::do_eval; the Instr carries only the pool index. */
-        if (const FuncDeclStmt *fd = dynamic_cast<const FuncDeclStmt *>(e)) {
+        if (const FuncDeclStmt *fd = node_cast<const FuncDeclStmt>(e)) {
             if (fd->id)
                 return false;
             const int t = alloc_temp();
@@ -1810,7 +1810,7 @@ struct Codegen {
          * the checked/boxed ctor below made a 17-field construction a
          * NotLoweredEx compile refusal in the VM while the tree-walker built
          * it (2026-10-09). */
-        if (const CallExpr *ce = dynamic_cast<const CallExpr *>(e)) {
+        if (const CallExpr *ce = node_cast<const CallExpr>(e)) {
             const StructTypeDef *sdef = ce->vm_struct_ctor_def;
             if (sdef && ce->args
                 && ce->args->elems.size() == sdef->fields.size()) {
@@ -1872,7 +1872,7 @@ struct Codegen {
                         std::vector<size_t> comp;
                         for (size_t ai = 0; ai < nf; ai++) {
                             const Identifier *aid =
-                                dynamic_cast<const Identifier *>(
+                                node_cast<const Identifier>(
                                     ce->args->elems[ai].get());
                             if (args_pure && aid
                                 && aid->sym.kind == SymKind::local)
@@ -1957,7 +1957,7 @@ struct Codegen {
          * dyn-laundered value, and must report the arg's caret). A const-arg
          * boxed ctor already folded to a LiteralObj, so only a runtime-arg one
          * reaches here. */
-        if (const CallExpr *ce = dynamic_cast<const CallExpr *>(e)) {
+        if (const CallExpr *ce = node_cast<const CallExpr>(e)) {
             /* ...and the CHECKED POD ctor: a POD construction whose typed
              * gate failed above (a dyn/general arg - the coerce CAN throw
              * and needs the arg's caret) takes the same pooled-caret op;
@@ -2000,7 +2000,7 @@ struct Codegen {
          * BEATS the tree-walker; try it before the per-element StructCtorV +
          * MakeArrayV path below (which stays the fallback for a mixed / nested /
          * non-scalar-arg literal). */
-        if (const LiteralArray *la = dynamic_cast<const LiteralArray *>(e))
+        if (const LiteralArray *la = node_cast<const LiteralArray>(e))
             if (la->arr_hint == ArrHint::flat_s) {
                 int r;
                 if (try_make_struct_array(la, r, ops)) {
@@ -2020,7 +2020,7 @@ struct Codegen {
          * mode-5 storage VALUE-DRIVEN (the def comes off the first element). If a
          * struct-ctor element can't lower either, emit_args_range fails and this
          * bails to the fallback. */
-        if (const LiteralArray *la = dynamic_cast<const LiteralArray *>(e)) {
+        if (const LiteralArray *la = node_cast<const LiteralArray>(e)) {
             const size_t cmark = chunk.consts.size();
             int base;
             if (!emit_args_range(la->elems, base, ops)) {
@@ -2046,7 +2046,7 @@ struct Codegen {
          * compile the key/value pairs INTERLEAVED into a register run [base,
          * base + 2*npairs) (key at even, value at odd), then build. Same
          * const/LiteralObj caveat as the array case. */
-        if (const LiteralDict *ld = dynamic_cast<const LiteralDict *>(e)) {
+        if (const LiteralDict *ld = node_cast<const LiteralDict>(e)) {
             const size_t mark = ops.size();
             const size_t cmark = chunk.consts.size();
             const int save_top = next_temp;
@@ -2097,7 +2097,7 @@ struct Codegen {
         /* A subscript READ `a[i]` (general array / dict / string element) ->
          * SubscriptV via the runtime Type::subscript. (A slice is a separate
          * node, not handled here.) */
-        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+        if (const Subscript *sub = node_cast<const Subscript>(e)) {
             /*
              * H2 (2026-08-12): a PROVEN ARRAY base with an int index reads
              * through LoadElemValue instead - the same value, a third of
@@ -2162,7 +2162,7 @@ struct Codegen {
         }
 
         /* A member READ `obj.f` / `d.k` -> MemberV (shared member_read). */
-        if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+        if (const MemberExpr *m = node_cast<const MemberExpr>(e)) {
             int base_slot;
             if (!compile_boxed_expr(m->what.get(), base_slot, ops))
                 return false;
@@ -2181,7 +2181,7 @@ struct Codegen {
         /* A slice READ `base[start:end]` -> SliceV. Compile base, then the
          * optional bounds (in eval order: what, start, end), each into a slot;
          * an absent bound is a slot of -1. The op calls the runtime slice(). */
-        if (const Slice *sl = dynamic_cast<const Slice *>(e)) {
+        if (const Slice *sl = node_cast<const Slice>(e)) {
             int base_slot;
             if (!compile_boxed_expr(sl->what.get(), base_slot, ops))
                 return false;
@@ -2245,7 +2245,7 @@ struct Codegen {
 
         /* An indirect call of a func VALUE (a closure / lambda / func var):
          * a plain CallExpr whose callee is Func-typed -> CallValueV. */
-        if (const CallExpr *call = dynamic_cast<const CallExpr *>(e))
+        if (const CallExpr *call = node_cast<const CallExpr>(e))
             if (try_native_value_call(call, out_slot, ops))
                 return true;
 
@@ -2254,7 +2254,7 @@ struct Codegen {
          * recursion-unroll return (fib: `return (n-1<2 ? .. : f(..)+f(..))..`)
          * go native - each arm's own calls become CallV. `dst` is reserved
          * BELOW the arms' scratch so neither arm clobbers it. */
-        if (const TernaryExpr *t = dynamic_cast<const TernaryExpr *>(e)) {
+        if (const TernaryExpr *t = node_cast<const TernaryExpr>(e)) {
             const size_t mark = ops.size();
             const int save_top = next_temp;
             const int dst = alloc_temp();
@@ -2312,7 +2312,7 @@ struct Codegen {
          * rhs never evaluated); else the rhs lands in `dst`. `dst` is
          * reserved below both sides' scratch, like the ternary.
          * JumpIfNotNoneV is a pure none test - no node, no loc. */
-        if (const CoalesceExpr *co = dynamic_cast<const CoalesceExpr *>(e)) {
+        if (const CoalesceExpr *co = node_cast<const CoalesceExpr>(e)) {
             const size_t mark = ops.size();
             const int save_top = next_temp;
             const int dst = alloc_temp();
@@ -2361,12 +2361,12 @@ struct Codegen {
          * ran them). A multi-assignment (an IdList target) has no value:
          * the parser refuses one in a value position (question 11), so
          * it never reaches here - and would decline below. */
-        if (const Expr14 *e14 = dynamic_cast<const Expr14 *>(e)) {
+        if (const Expr14 *e14 = node_cast<const Expr14>(e)) {
             if (e14->lvalue->is_subscript()
                     || ctag(e14->lvalue.get()) == ConstructType::member)
                 return try_value_store(e14, out_slot, ops);
             const Identifier *lv =
-                dynamic_cast<const Identifier *>(e14->lvalue.get());
+                node_cast<const Identifier>(e14->lvalue.get());
             if (!lv)
                 return false;
             const size_t mark = ops.size();
@@ -2391,7 +2391,7 @@ struct Codegen {
          * to a logical even when the comparisons are boxed over a dyn operand,
          * so both forms reach here. emit_boxed_chain handles both. */
         if (const TypedScalarExpr *t =
-                dynamic_cast<const TypedScalarExpr *>(e)) {
+                node_cast<const TypedScalarExpr>(e)) {
             /* A typed `!x` (Cat::lnot) as a VALUE boxes a real BOOL - the
              * boxed UnaryV (its !is_true == the typed eval's `!= 0` boxing).
              * Was undetected while expr-bodied functions had no chunks
@@ -2440,7 +2440,7 @@ struct Codegen {
          * (a typed int/float unary is the M8 path at the top). Expr02 is a
          * MultiOpConstruct with a single (op, operand): op==invalid is just the
          * operand (compile it), else the unary op. */
-        if (const Expr02 *u = dynamic_cast<const Expr02 *>(e)) {
+        if (const Expr02 *u = node_cast<const Expr02>(e)) {
             if (u->elems.size() != 1)
                 return false;
             const Op op = u->elems[0].first;
@@ -2695,7 +2695,7 @@ struct Codegen {
                                  std::vector<CgInstr> &ops)
     {
         const LiteralArray *la =
-            dynamic_cast<const LiteralArray *>(e->rvalue.get());
+            node_cast<const LiteralArray>(e->rvalue.get());
         if (!la || !il->fits.empty())   /* a checked target (#49) */
             return false;
         const int n = static_cast<int>(il->elems.size());
@@ -3128,9 +3128,9 @@ struct Codegen {
          * inc-dec is handled earlier (compile_int/float_stmt); a subscript one
          * in the store codegen; a global/capture id reaches here. A typed
          * operand with a numeric proof falls back. */
-        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
+        if (const IncDecExpr *inc = node_cast<const IncDecExpr>(s)) {
             const Identifier *id =
-                dynamic_cast<const Identifier *>(inc->lvalue.get());
+                node_cast<const Identifier>(inc->lvalue.get());
             if (id) {
                 const bool numeric = inc->th == TypeHint::i
                                   || inc->th == TypeHint::f;
@@ -3204,7 +3204,7 @@ struct Codegen {
              * walker's dyn path). Gating on `sub->th != i/f` is what excludes
              * the flat case (its element is proven numeric, handled earlier). */
             if (const Subscript *sub =
-                    dynamic_cast<const Subscript *>(inc->lvalue.get())) {
+                    node_cast<const Subscript>(inc->lvalue.get())) {
                 if (sub->th == TypeHint::i || sub->th == TypeHint::f)
                     return false;
                 int bslot, bkind;
@@ -3235,7 +3235,7 @@ struct Codegen {
              * the tree-walker. Gated on `inc->th != i/f` (excludes the proven
              * numeric case), a slotted base, and a non-optional member. */
             if (const MemberExpr *m =
-                    dynamic_cast<const MemberExpr *>(inc->lvalue.get())) {
+                    node_cast<const MemberExpr>(inc->lvalue.get())) {
                 if (inc->th == TypeHint::i || inc->th == TypeHint::f
                         || m->optional)
                     return false;
@@ -3257,7 +3257,7 @@ struct Codegen {
             return false;
         }
 
-        const Expr14 *e = dynamic_cast<const Expr14 *>(s);
+        const Expr14 *e = node_cast<const Expr14>(s);
         if (!e)
             return false;
         const bool is_assign = e->op == Op::assign;
@@ -3270,7 +3270,7 @@ struct Codegen {
          * SCALAR spreads to every target. A non-qualifying shape falls back. */
         if (is_assign) {
             if (const IdList *il =
-                    dynamic_cast<const IdList *>(e->lvalue.get())) {
+                    node_cast<const IdList>(e->lvalue.get())) {
                 if (try_multi_literal_store(e, il, ops))
                     return true;
                 if (try_multi_scalar_spread(e, il, ops))
@@ -3286,7 +3286,7 @@ struct Codegen {
          * base op. */
         if (!is_assign && cbase != Op::invalid) {
             if (const IdList *il =
-                    dynamic_cast<const IdList *>(e->lvalue.get()))
+                    node_cast<const IdList>(e->lvalue.get()))
                 return try_multi_unpack(e, il, ops, cbase);
         }
 
@@ -3303,7 +3303,7 @@ struct Codegen {
             Loc tstart = e->lvalue->start, tend = e->lvalue->end;
             bool bad = dynamic_cast<const Literal *>(e->lvalue.get()) != nullptr;
             if (const Identifier *bl =
-                    dynamic_cast<const Identifier *>(e->lvalue.get())) {
+                    node_cast<const Identifier>(e->lvalue.get())) {
                 if (bl->sym.kind == SymKind::unresolved) {
                     /* An assignment to an UNDECLARED name in a FUNCTION (a
                      * top-level one is an implicit-global DECL and never
@@ -3335,7 +3335,7 @@ struct Codegen {
         }
 
         const Identifier *lv =
-            dynamic_cast<const Identifier *>(e->lvalue.get());
+            node_cast<const Identifier>(e->lvalue.get());
         if (!lv || (lv->sym.kind != SymKind::local
                     && lv->sym.kind != SymKind::global
                     && lv->sym.kind != SymKind::capture))
@@ -3582,7 +3582,7 @@ struct Codegen {
                         std::vector<CgInstr> &ops)
     {
         const Subscript *outer =
-            dynamic_cast<const Subscript *>(sub->what.get());
+            node_cast<const Subscript>(sub->what.get());
         if (!outer || !outer->base_array)
             return false;
         const size_t nops = ops.size();
@@ -3619,7 +3619,7 @@ struct Codegen {
     {
         if (as_array_slot(e, out_slot))
             return true;
-        const Subscript *sub = dynamic_cast<const Subscript *>(e);
+        const Subscript *sub = node_cast<const Subscript>(e);
         if (!sub || !sub->base_array)
             return false;
         int inner;
@@ -3850,7 +3850,7 @@ struct Codegen {
     bool compile_indirect_arg0(const Construct *e, int dst,
                                Chunk::CallSite &cs, std::vector<CgInstr> &ops)
     {
-        if (const Identifier *id = dynamic_cast<const Identifier *>(e)) {
+        if (const Identifier *id = node_cast<const Identifier>(e)) {
             switch (id->sym.kind) {
             case SymKind::local:   cs.a0_kind = 0; break;
             case SymKind::global:  cs.a0_kind = 1; break;
@@ -3866,7 +3866,7 @@ struct Codegen {
             cs.a0_slot = id->sym.slot;
             return true;
         }
-        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+        if (const Subscript *sub = node_cast<const Subscript>(e)) {
             int bslot, bkind;
             if (as_container_base(sub->what.get(), bslot, bkind)) {
                 /* base value first, then the index - Subscript::do_eval's
@@ -3890,7 +3890,7 @@ struct Codegen {
             }
             /* an unsupported base/index: the plain value path below */
         }
-        if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+        if (const MemberExpr *m = node_cast<const MemberExpr>(e)) {
             int bslot, bkind;
             if (as_container_base(m->what.get(), bslot, bkind)) {
                 int bval;
@@ -4128,7 +4128,7 @@ struct Codegen {
     bool try_native_defined_global(const DirectBuiltinCallExpr *dc,
                                    int &out_slot, std::vector<CgInstr> &ops)
     {
-        const Identifier *callee = dynamic_cast<Identifier *>(dc->what.get());
+        const Identifier *callee = node_cast<Identifier>(dc->what.get());
         /* `isbound` (step 6) is the OTHER owner of this op - and now the only
          * one a script reaches, since `defined` of a declared global folds to
          * `true` at resolve time. Both are lowered identically: the op reads
@@ -4139,7 +4139,7 @@ struct Codegen {
         if (!dc->args || dc->args->elems.size() != 1)
             return false;
         const Identifier *arg =
-            dynamic_cast<Identifier *>(dc->args->elems[0].get());
+            node_cast<Identifier>(dc->args->elems[0].get());
         if (!arg || arg->sym.kind != SymKind::global)
             return false;
         const int dst = alloc_temp();
@@ -4165,7 +4165,7 @@ struct Codegen {
     bool try_native_defined_expr(const DirectBuiltinCallExpr *dc,
                                  int &out_slot, std::vector<CgInstr> &ops)
     {
-        const Identifier *callee = dynamic_cast<Identifier *>(dc->what.get());
+        const Identifier *callee = node_cast<Identifier>(dc->what.get());
         if (!callee || callee->get_str() != "defined" || !dc->args)
             return false;
         if (dc->args->elems.size() != 1) {
@@ -4174,7 +4174,7 @@ struct Codegen {
             out_slot = alloc_temp();   /* dead: the op always throws */
             return true;
         }
-        if (dynamic_cast<const Identifier *>(dc->args->elems[0].get()))
+        if (node_cast<const Identifier>(dc->args->elems[0].get()))
             return false;              /* id forms: fold / DefinedGlobalV */
         const size_t mark = ops.size();
         const int save_top = next_temp;
@@ -4233,7 +4233,7 @@ struct Codegen {
             return false;
 
         const Identifier *bid =
-            dynamic_cast<const Identifier *>(dc->what.get());
+            node_cast<const Identifier>(dc->what.get());
         if (!bid)
             return false;
 
@@ -4298,7 +4298,7 @@ struct Codegen {
                 || dc->th_bool)
             return false;
         const Identifier *bid =
-            dynamic_cast<const Identifier *>(dc->what.get());
+            node_cast<const Identifier>(dc->what.get());
         if (!bid)
             return false;
         const bool is_abs = bid->uid == abs_uid;
@@ -4416,7 +4416,7 @@ struct Codegen {
             || dc->args->elems.size() != 1)
             return false;
         const Identifier *bid =
-            dynamic_cast<const Identifier *>(dc->what.get());
+            node_cast<const Identifier>(dc->what.get());
         if (!bid || bid->uid != len_uid)
             return false;
         const size_t mark = ops.size();
@@ -4452,11 +4452,11 @@ struct Codegen {
         if (!dc->args || dc->lvalue_arg0 || dc->args->elems.size() != 1)
             return false;
         const Identifier *bid =
-            dynamic_cast<const Identifier *>(dc->what.get());
+            node_cast<const Identifier>(dc->what.get());
         if (!bid || bid->uid != ord_uid)
             return false;
         const Subscript *sub =
-            dynamic_cast<const Subscript *>(dc->args->elems[0].get());
+            node_cast<const Subscript>(dc->args->elems[0].get());
         if (!sub || !sub->base_str)
             return false;
         const size_t mark = ops.size();
@@ -4847,7 +4847,7 @@ struct Codegen {
          * insert/erase are rest-native, so this shape is append/push only. */
         if (!dc->lvalue_rest_native && dc->args->elems.size() == 2) {
             auto *ctor =
-                dynamic_cast<const CallExpr *>(dc->args->elems[1].get());
+                node_cast<const CallExpr>(dc->args->elems[1].get());
             if (ctor && ctor->vm_struct_ctor_def && ctor->args) {
                 int fieldbase;
                 if (emit_args_range(ctor->args->elems, fieldbase, ops)) {
@@ -4860,7 +4860,7 @@ struct Codegen {
                     site.def = ctor->vm_struct_ctor_def;
                     site.bname = nullptr;
                     if (const Identifier *cid =
-                            dynamic_cast<const Identifier *>(dc->what.get()))
+                            node_cast<const Identifier>(dc->what.get()))
                         site.bname = cid->uid;
                     site.a0_start = a0->start;
                     site.a0_end = a0->end;
@@ -4945,7 +4945,7 @@ struct Codegen {
          * to DirectBuiltinCallExpr). */
         if (rest_op && dc->args->elems.size() == 2) {
             if (const Identifier *bid =
-                    dynamic_cast<const Identifier *>(dc->what.get())) {
+                    node_cast<const Identifier>(dc->what.get())) {
                 static const UniqueId *const uid_append =
                     UniqueId::get("append");
                 static const UniqueId *const uid_push = UniqueId::get("push");
@@ -5222,7 +5222,7 @@ struct Codegen {
     {
         if (e->th != th)
             return false;
-        if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+        if (const MemberExpr *m = node_cast<const MemberExpr>(e)) {
             int dslot;
             if (!m->base_dict || !as_array_slot(m->what.get(), dslot))
                 return false;
@@ -5239,7 +5239,7 @@ struct Codegen {
             ops.push_back(in);
             return true;
         }
-        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+        if (const Subscript *sub = node_cast<const Subscript>(e)) {
             int dslot, kslot;
             if (!sub->base_dict || !as_array_slot(sub->what.get(), dslot)
                 || !compile_key(sub, kslot, ops))
@@ -5270,7 +5270,7 @@ struct Codegen {
         if (sfe_maps.empty())
             return false;
         const Identifier *bid =
-            dynamic_cast<const Identifier *>(m->what.get());
+            node_cast<const Identifier>(m->what.get());
         if (!bid || bid->sym.kind != SymKind::local)
             return false;
         const SfeMap *sm = nullptr;
@@ -5318,7 +5318,7 @@ struct Codegen {
         if (m->optional || !m->base_struct || m->base_boxed)
             return false;
         const Subscript *sub =
-            dynamic_cast<const Subscript *>(m->what.get());
+            node_cast<const Subscript>(m->what.get());
         if (!sub || !sub->base_array || sub->base_dict || sub->base_str)
             return false;
         const StructTypeDef *sd = m->base_struct_def;
@@ -5332,7 +5332,7 @@ struct Codegen {
         /* The base must be a resolved LOCAL slot: the op reads it directly,
          * so it is evaluated exactly once and cannot re-run a side effect. */
         const Identifier *bid =
-            dynamic_cast<const Identifier *>(sub->what.get());
+            node_cast<const Identifier>(sub->what.get());
         if (!bid || bid->sym.kind != SymKind::local)
             return false;
         const size_t mark = ops.size();
@@ -5372,7 +5372,7 @@ struct Codegen {
         if (!m->base_struct || m->optional)
             return false;
         const Identifier *bid =
-            dynamic_cast<const Identifier *>(m->what.get());
+            node_cast<const Identifier>(m->what.get());
         if (!bid || bid->sym.kind != SymKind::local)
             return false;
         const int tt = alloc_temp();
@@ -5438,7 +5438,7 @@ struct Codegen {
     bool try_typed_ternary(const Construct *e, Operand &out,
                            std::vector<CgInstr> &ops, bool flt)
     {
-        const TernaryExpr *t = dynamic_cast<const TernaryExpr *>(e);
+        const TernaryExpr *t = node_cast<const TernaryExpr>(e);
         if (!t)
             return false;
 
@@ -5452,7 +5452,7 @@ struct Codegen {
         size_t cj = ops.size();
         bool emitted = false;
         if (const TypedScalarExpr *c =
-                dynamic_cast<const TypedScalarExpr *>(t->condExpr.get())) {
+                node_cast<const TypedScalarExpr>(t->condExpr.get())) {
             if (c->cat == TypedScalarExpr::Cat::cmp) {
                 Operand a, b;
                 Op cmp;
@@ -5588,7 +5588,7 @@ struct Codegen {
     bool try_capture_leaf(const Construct *e, bool flt, Operand &out,
                           std::vector<CgInstr> &ops)
     {
-        const Identifier *id = dynamic_cast<const Identifier *>(e);
+        const Identifier *id = node_cast<const Identifier>(e);
         if (!id || id->sym.kind != SymKind::capture)
             return false;
         /* int wants `i`; float accepts `f` OR `i` (read_float_slot
@@ -5760,7 +5760,7 @@ struct Codegen {
         }
 
         if (e->th == TypeHint::i)
-            if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+            if (const MemberExpr *m = node_cast<const MemberExpr>(e)) {
                 if (try_sfe_field(m, out, ops, OpCode::LoadStructFieldInt))
                     return true;
                 if (try_struct_elem_field(m, out, ops,
@@ -5780,7 +5780,7 @@ struct Codegen {
         /* Array element read `a[i]` -> LoadElemInt into a temp (arrays only; a
          * dict subscript stays fallback - see Subscript::base_array). A nested
          * base `a[i][k]` loads `a[i]` via compile_array_base first. */
-        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+        if (const Subscript *sub = node_cast<const Subscript>(e)) {
             if (e->th != TypeHint::i || !sub->base_array)
                 return false;
             int fused;
@@ -5856,7 +5856,7 @@ struct Codegen {
         if (e->th == TypeHint::i && try_call_leaf(e, false, out, ops))
             return true;
 
-        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(e);
         if (!t || t->kind != TypeHint::i)
             return false;
 
@@ -6277,7 +6277,7 @@ struct Codegen {
     bool compile_int_stmt_impl(const Construct *s,
                                std::vector<CgInstr> &ops)
     {
-        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
+        if (const IncDecExpr *inc = node_cast<const IncDecExpr>(s)) {
             Operand dst;
             if (inc->th == TypeHint::i && as_int_operand(inc->lvalue.get(), dst)
                 && !dst.is_lit) {
@@ -6295,7 +6295,7 @@ struct Codegen {
              * the base op + a constant 1 (`a[i] += 1`). StoreElemInt's loc is
              * node->start/end (generic - works for an IncDecExpr node). */
             if (const Subscript *sub =
-                    dynamic_cast<const Subscript *>(inc->lvalue.get())) {
+                    node_cast<const Subscript>(inc->lvalue.get())) {
                 /* A NESTED subscript `a[i][j]++`/`--` -> StoreElem2V compound
                  * (== `a[i][j] += 1`), with a synthesized boxed 1. Checked
                  * FIRST: `a[i][j]` is base_array too, but its base `a[i]` is a
@@ -6303,7 +6303,7 @@ struct Codegen {
                  * The inner base is a Subscript over a slotted array; matches
                  * the Expr14 nested-store path (value first, then k1, then k2). */
                 if (const Subscript *inner =
-                        dynamic_cast<const Subscript *>(sub->what.get())) {
+                        node_cast<const Subscript>(sub->what.get())) {
                     /* int/float-ONLY (like all inc-dec): a dyn element must fall
                      * back (`+= 1` would concat a string; `++` throws). */
                     if (inc->th != TypeHint::i && inc->th != TypeHint::f)
@@ -6401,7 +6401,7 @@ struct Codegen {
             if (inc->th != TypeHint::i && inc->th != TypeHint::f)
                 return false;
             if (const MemberExpr *m =
-                    dynamic_cast<const MemberExpr *>(inc->lvalue.get())) {
+                    node_cast<const MemberExpr>(inc->lvalue.get())) {
                 if (!m->base_struct && !m->base_dict)
                     return false;
                 int bslot, bkind;
@@ -6446,7 +6446,7 @@ struct Codegen {
             return false;
         }
 
-        const Expr14 *e = dynamic_cast<const Expr14 *>(s);
+        const Expr14 *e = node_cast<const Expr14>(s);
         if (!e)
             return false;
 
@@ -6461,7 +6461,7 @@ struct Codegen {
          * The value is compiled BEFORE the index (tree-walker: rhs then index).
          * A subscript lvalue can't be a scalar slot, so this always returns. */
         if (const Subscript *sub =
-                dynamic_cast<const Subscript *>(e->lvalue.get())) {
+                node_cast<const Subscript>(e->lvalue.get())) {
 
             /* NESTED store `a[k0][k1]...[kn] = v` / `OP= v`: the base is another
              * Subscript. Collect the whole chain (outermost-first) down to a
@@ -6469,13 +6469,13 @@ struct Codegen {
              * StoreElem2V (value, k1, k2); anything deeper (or a global/capture
              * base) -> the GENERIC StoreElemChainV (value, then keys base-to-
              * innermost). Matches the tree-walker's rhs-then-lvalue eval order. */
-            if (dynamic_cast<const Subscript *>(sub->what.get())) {
+            if (node_cast<const Subscript>(sub->what.get())) {
                 if (e->op != Op::assign
                         && compound_assign_base(e->op) == Op::invalid)
                     return false;
                 std::vector<const Subscript *> chain;   /* outermost-first */
                 const Construct *cur = sub;
-                while (auto *s = dynamic_cast<const Subscript *>(cur)) {
+                while (auto *s = node_cast<const Subscript>(cur)) {
                     chain.push_back(s);
                     cur = s->what.get();
                 }
@@ -6618,7 +6618,7 @@ struct Codegen {
                      * expr (th==i). rhs-before-index order is preserved. */
                     bool vok;
                     if (const LiteralBool *lb =
-                            dynamic_cast<const LiteralBool *>(e->rvalue.get())) {
+                            node_cast<const LiteralBool>(e->rvalue.get())) {
                         val = int_lit(lb->bval() ? 1 : 0);
                         vok = true;
                     } else {
@@ -6679,7 +6679,7 @@ struct Codegen {
          * pool, loaded to a temp). base_dict is set by the inferencer for a dict
          * base; a STRUCT member store falls through (a separate op). */
         if (const MemberExpr *m =
-                dynamic_cast<const MemberExpr *>(e->lvalue.get())) {
+                node_cast<const MemberExpr>(e->lvalue.get())) {
             if (m->base_dict) {
                 int dslot, dkind;
                 if (e->op != Op::assign
@@ -6811,7 +6811,7 @@ struct Codegen {
     bool compile_int_cond(const Construct *cond, std::vector<CgInstr> &ops,
                           Operand &a, Op &cmp, Operand &b)
     {
-        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(cond);
         if (!t || t->cat != TypedScalarExpr::Cat::cmp
             || t->kind != TypeHint::i || t->elems.size() != 2)
             return false;
@@ -6849,7 +6849,7 @@ struct Codegen {
         }
 
         if (e->th == TypeHint::f)
-            if (const MemberExpr *m = dynamic_cast<const MemberExpr *>(e)) {
+            if (const MemberExpr *m = node_cast<const MemberExpr>(e)) {
                 if (try_sfe_field(m, out, ops, OpCode::LoadStructFieldFloat))
                     return true;
                 if (try_struct_elem_field(m, out, ops,
@@ -6868,7 +6868,7 @@ struct Codegen {
 
         /* Array element read `a[i]` (float element) -> LoadElemFloat; the index
          * is still an int expression. */
-        if (const Subscript *sub = dynamic_cast<const Subscript *>(e)) {
+        if (const Subscript *sub = node_cast<const Subscript>(e)) {
             if (e->th != TypeHint::f || !sub->base_array)
                 return false;
             int fused;
@@ -6958,7 +6958,7 @@ struct Codegen {
                 && try_call_leaf(e, true, out, ops))
             return true;
 
-        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(e);
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(e);
         if (!t || t->kind != TypeHint::f)
             return false;
 
@@ -7057,9 +7057,9 @@ struct Codegen {
     bool compile_float_stmt_impl(const Construct *s,
                                  std::vector<CgInstr> &ops)
     {
-        if (const IncDecExpr *inc = dynamic_cast<const IncDecExpr *>(s)) {
+        if (const IncDecExpr *inc = node_cast<const IncDecExpr>(s)) {
             const Identifier *id =
-                dynamic_cast<const Identifier *>(inc->lvalue.get());
+                node_cast<const Identifier>(inc->lvalue.get());
             if (inc->th == TypeHint::f && id
                 && id->sym.kind == SymKind::local && id->th == TypeHint::f) {
                 CgInstr in;
@@ -7075,7 +7075,7 @@ struct Codegen {
             /* A flat-FLOAT array element `a[i]++` / `a[i]--` -> StoreElemFloat
              * (== `a[i] += 1.0`); loc is node->start/end (generic). */
             if (const Subscript *sub =
-                    dynamic_cast<const Subscript *>(inc->lvalue.get())) {
+                    node_cast<const Subscript>(inc->lvalue.get())) {
                 if (sub->th == TypeHint::f && sub->base_array) {
                     int aslot;
                     Operand idx;
@@ -7097,14 +7097,14 @@ struct Codegen {
             return false;
         }
 
-        const Expr14 *e = dynamic_cast<const Expr14 *>(s);
+        const Expr14 *e = node_cast<const Expr14>(s);
         if (!e)
             return false;
 
         /* Native array-element store `a[i] = v` / `a[i] OP= v` (float element);
          * value before index, like compile_int_stmt. */
         if (const Subscript *sub =
-                dynamic_cast<const Subscript *>(e->lvalue.get())) {
+                node_cast<const Subscript>(e->lvalue.get())) {
             if (sub->th != TypeHint::f || !sub->base_array)
                 return false;
             Op aop;
@@ -7152,7 +7152,7 @@ struct Codegen {
         /* The destination must be a genuine FLOAT slot (int dst -> compile_int_
          * stmt handles it; a float result can't narrow into an int/bool). */
         const Identifier *dst =
-            dynamic_cast<const Identifier *>(e->lvalue.get());
+            node_cast<const Identifier>(e->lvalue.get());
         if (!dst || dst->sym.kind != SymKind::local || dst->th != TypeHint::f)
             return false;
         const int dslot = dst->sym.slot;
@@ -7216,7 +7216,7 @@ struct Codegen {
     bool compile_float_cond(const Construct *cond, std::vector<CgInstr> &ops,
                             Operand &a, Op &cmp, Operand &b)
     {
-        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(cond);
         if (!t || t->cat != TypedScalarExpr::Cat::cmp
             || t->kind != TypeHint::f || t->elems.size() != 2)
             return false;
@@ -7238,7 +7238,7 @@ struct Codegen {
     bool try_native_cmp_value(const Construct *node, int &out_slot,
                               std::vector<CgInstr> &ops)
     {
-        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(node);
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(node);
         if (!t || t->cat != TypedScalarExpr::Cat::cmp || t->elems.size() != 2)
             return false;
         Operand a, b;
@@ -7299,7 +7299,7 @@ struct Codegen {
                          std::vector<size_t> &exit_jumps,
                          const Construct *loc_node = nullptr)
     {
-        const TypedScalarExpr *t = dynamic_cast<const TypedScalarExpr *>(cond);
+        const TypedScalarExpr *t = node_cast<const TypedScalarExpr>(cond);
 
         /* A typed int/float comparison -> one native compare-branch to the
          * exit. On failure, fall through to the boxed path (don't bail). */
@@ -7377,7 +7377,7 @@ struct Codegen {
     {
         std::vector<const Construct *> stmts;
         if (body) {
-            if (const Block *b = dynamic_cast<const Block *>(body))
+            if (const Block *b = node_cast<const Block>(body))
                 for (const auto &e : b->elems)
                     stmts.push_back(e.get());
             else
@@ -7480,28 +7480,28 @@ struct Codegen {
 
             /* Nested native control flow. Each is itself self-truncating, so on
              * failure code is already back at `mark`. */
-            if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(s)) {
+            if (const ForRangeStmt *fr = node_cast<const ForRangeStmt>(s)) {
                 if (try_native_for_range(fr)) {
                     any_native = true;
                     continue;
                 }
-            } else if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(s)) {
+            } else if (const WhileStmt *w = node_cast<const WhileStmt>(s)) {
                 if (try_native_scalar_while(w)) {
                     any_native = true;
                     continue;
                 }
-            } else if (const IfStmt *iff = dynamic_cast<const IfStmt *>(s)) {
+            } else if (const IfStmt *iff = node_cast<const IfStmt>(s)) {
                 if (compile_native_if(iff)) {
                     any_native = true;
                     continue;
                 }
-            } else if (const ForStmt *fs = dynamic_cast<const ForStmt *>(s)) {
+            } else if (const ForStmt *fs = node_cast<const ForStmt>(s)) {
                 if (try_native_for(fs)) {
                     any_native = true;
                     continue;
                 }
             } else if (const ForeachStmt *fe =
-                           dynamic_cast<const ForeachStmt *>(s)) {
+                           node_cast<const ForeachStmt>(s)) {
                 if (try_native_foreach(fe) || try_native_foreach_str(fe)
                     || try_native_foreach_unpack(fe)
                     || try_native_struct_foreach(fe)
@@ -7511,12 +7511,12 @@ struct Codegen {
                     continue;
                 }
             } else if (const TryCatchStmt *tc =
-                           dynamic_cast<const TryCatchStmt *>(s)) {
+                           node_cast<const TryCatchStmt>(s)) {
                 if (compile_native_try(tc)) {   /* native handler region (P8) */
                     any_native = true;
                     continue;
                 }
-            } else if (const Block *blk = dynamic_cast<const Block *>(s)) {
+            } else if (const Block *blk = node_cast<const Block>(s)) {
                 /* A bare nested block `{ ... }` - what a const-folded
                  * `if (true) { ... }` leaves behind (a const condition drops
                  * the if but keeps its braced body), or an explicit block. A
@@ -7581,7 +7581,7 @@ struct Codegen {
             }
             /* A func-VALUE call statement -> CallValueV (result discarded);
              * rejects a Direct{Call,BuiltinCall}Expr internally (F-3). */
-            if (const CallExpr *call = dynamic_cast<const CallExpr *>(s)) {
+            if (const CallExpr *call = node_cast<const CallExpr>(s)) {
                 int dst;
                 if (try_native_value_call(call, dst, code)) {
                     any_native = true;
@@ -7589,7 +7589,7 @@ struct Codegen {
                 }
             }
             /* `return <expr>;` -> ReturnV / SetPend-to-finally (Inc 2c). */
-            if (const ReturnStmt *ret = dynamic_cast<const ReturnStmt *>(s)) {
+            if (const ReturnStmt *ret = node_cast<const ReturnStmt>(s)) {
                 if (try_native_return(ret, code)) {
                     any_native = true;
                     continue;
@@ -7618,14 +7618,14 @@ struct Codegen {
                     }
             }
             /* `throw <expr>;` -> a native Throw op (P8 Inc 1). */
-            if (const ThrowStmt *th = dynamic_cast<const ThrowStmt *>(s)) {
+            if (const ThrowStmt *th = node_cast<const ThrowStmt>(s)) {
                 if (try_native_throw(th, code)) {
                     any_native = true;
                     continue;
                 }
             }
             /* `rethrow;` (in a catch body) -> a native Rethrow op (P8 Inc 2a). */
-            if (const RethrowStmt *rt = dynamic_cast<const RethrowStmt *>(s)) {
+            if (const RethrowStmt *rt = node_cast<const RethrowStmt>(s)) {
                 emit_rethrow(rt, code);
                 any_native = true;
                 continue;
@@ -7638,7 +7638,7 @@ struct Codegen {
              * top-level/function-body decls; the loop/if body compiler did
              * not). */
             if (const FuncDeclStmt *fdd =
-                    dynamic_cast<const FuncDeclStmt *>(s)) {
+                    node_cast<const FuncDeclStmt>(s)) {
                 if (fdd->id) {
                     emit_func_decl(fdd, code);
                     any_native = true;
@@ -7646,7 +7646,7 @@ struct Codegen {
                 }
             }
             if (const StructDeclStmt *sdd =
-                    dynamic_cast<const StructDeclStmt *>(s)) {
+                    node_cast<const StructDeclStmt>(s)) {
                 if (sdd->id) {
                     emit_struct_decl(sdd, code);
                     any_native = true;
@@ -7666,7 +7666,7 @@ struct Codegen {
                 /* Same inert-leaf rule as gen_stmt's tail: always-bound ids /
                  * literals are no-ops; an unresolved or global id compiles
                  * (throw / defined-checked load), result discarded. */
-                const Identifier *bid = dynamic_cast<const Identifier *>(s);
+                const Identifier *bid = node_cast<const Identifier>(s);
                 const bool inert =
                     dynamic_cast<const Literal *>(s)
                     || (bid && bid->sym.kind != SymKind::unresolved
@@ -8312,14 +8312,14 @@ struct Codegen {
          * element in ids[0]. */
         const int elem_id = fe->indexed ? 1 : 0;
         const Identifier *id =
-            dynamic_cast<const Identifier *>(fe->ids->elems[elem_id].get());
+            node_cast<const Identifier>(fe->ids->elems[elem_id].get());
         if (!id || id->sym.kind != SymKind::local)
             return false;
         const int x_slot = id->sym.slot;
         int idx_slot = -1;
         if (fe->indexed) {
             const Identifier *ix =
-                dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+                node_cast<const Identifier>(fe->ids->elems[0].get());
             if (!ix || ix->sym.kind != SymKind::local)
                 return false;
             idx_slot = ix->sym.slot;
@@ -8435,14 +8435,14 @@ struct Codegen {
 
         const int elem_id = fe->indexed ? 1 : 0;
         const Identifier *id =
-            dynamic_cast<const Identifier *>(fe->ids->elems[elem_id].get());
+            node_cast<const Identifier>(fe->ids->elems[elem_id].get());
         if (!id || id->sym.kind != SymKind::local)
             return false;
         const int x_slot = id->sym.slot;
         int idx_slot = -1;
         if (fe->indexed) {
             const Identifier *ix =
-                dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+                node_cast<const Identifier>(fe->ids->elems[0].get());
             if (!ix || ix->sym.kind != SymKind::local)
                 return false;
             idx_slot = ix->sym.slot;
@@ -8536,7 +8536,7 @@ struct Codegen {
             || fe->ids->elems.size() != 1)
             return false;
         const Identifier *id =
-            dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+            node_cast<const Identifier>(fe->ids->elems[0].get());
         if (!id || id->sym.kind != SymKind::local)
             return false;
         const int x_slot = id->sym.slot;
@@ -8677,7 +8677,7 @@ struct Codegen {
         bool consecutive = true;
         for (int k = 0; k < N; k++) {
             const Identifier *id =
-                dynamic_cast<const Identifier *>(fe->ids->elems[k].get());
+                node_cast<const Identifier>(fe->ids->elems[k].get());
             if (!id)
                 return false;
             if (k < first) {                 /* the index var: real local */
@@ -8854,7 +8854,7 @@ struct Codegen {
          * non-local target -> bail (leave to the tree-walker). */
         auto slot_of = [&](size_t i, int &out) -> bool {
             const Identifier *id =
-                dynamic_cast<const Identifier *>(fe->ids->elems[i].get());
+                node_cast<const Identifier>(fe->ids->elems[i].get());
             if (!id)
                 return false;
             if (id->is_underscore()) { out = -1; return true; }
@@ -8867,7 +8867,7 @@ struct Codegen {
         int idx_slot = -1;
         if (off) {
             const Identifier *id0 =
-                dynamic_cast<const Identifier *>(fe->ids->elems[0].get());
+                node_cast<const Identifier>(fe->ids->elems[0].get());
             if (!id0 || id0->is_underscore()
                 || id0->sym.kind != SymKind::local)
                 return false;
@@ -8981,7 +8981,7 @@ struct Codegen {
         targets.reserve(fe->ids->elems.size());
         for (const auto &el : fe->ids->elems) {
             const Identifier *id =
-                dynamic_cast<const Identifier *>(el.get());
+                node_cast<const Identifier>(el.get());
             if (!id)
                 return false;
             if (id->is_underscore()) {
@@ -9070,9 +9070,9 @@ struct Codegen {
      */
     static bool is_hoistable_decl(const Construct *c)
     {
-        if (const auto *fd = dynamic_cast<const FuncDeclStmt *>(c))
+        if (const auto *fd = node_cast<const FuncDeclStmt>(c))
             return fd->id != nullptr;
-        if (const auto *sd = dynamic_cast<const StructDeclStmt *>(c))
+        if (const auto *sd = node_cast<const StructDeclStmt>(c))
             return sd->id != nullptr;
         return false;
     }
@@ -9117,27 +9117,27 @@ struct Codegen {
             return;
         code.resize(mark);
 
-        if (const IfStmt *f = dynamic_cast<const IfStmt *>(s)) {
+        if (const IfStmt *f = node_cast<const IfStmt>(s)) {
             if (!compile_native_if(f))
                 throw_not_lowered(s);
             return;
         }
-        if (const WhileStmt *w = dynamic_cast<const WhileStmt *>(s)) {
+        if (const WhileStmt *w = node_cast<const WhileStmt>(s)) {
             if (!try_native_scalar_while(w))
                 throw_not_lowered(s);
             return;
         }
-        if (const ForRangeStmt *fr = dynamic_cast<const ForRangeStmt *>(s)) {
+        if (const ForRangeStmt *fr = node_cast<const ForRangeStmt>(s)) {
             if (!try_native_for_range(fr))
                 throw_not_lowered(s);
             return;
         }
-        if (const ForStmt *fs = dynamic_cast<const ForStmt *>(s)) {
+        if (const ForStmt *fs = node_cast<const ForStmt>(s)) {
             if (!try_native_for(fs))           /* general (non-range) for */
                 throw_not_lowered(s);
             return;
         }
-        if (const ForeachStmt *fe = dynamic_cast<const ForeachStmt *>(s)) {
+        if (const ForeachStmt *fe = node_cast<const ForeachStmt>(s)) {
             if (!try_native_foreach(fe)         /* flat/general array */
                 && !try_native_foreach_str(fe)  /* string chars */
                 && !try_native_foreach_unpack(fe) /* strict array destructure */
@@ -9165,13 +9165,13 @@ struct Codegen {
          * result discarded) -> CallValueV (F-3, phonebook's `cmdfunc(data)`).
          * try_native_value_call rejects a Direct{Call,BuiltinCall}Expr, so this
          * only catches a plain CallExpr the two handlers above didn't. */
-        if (const CallExpr *call = dynamic_cast<const CallExpr *>(s)) {
+        if (const CallExpr *call = node_cast<const CallExpr>(s)) {
             int dst;
             if (try_native_value_call(call, dst, code))
                 return;
         }
         /* `return <expr>;` -> ReturnV (its expr compiled natively). */
-        if (const ReturnStmt *ret = dynamic_cast<const ReturnStmt *>(s)) {
+        if (const ReturnStmt *ret = node_cast<const ReturnStmt>(s)) {
             if (try_native_return(ret, code))
                 return;
         }
@@ -9186,7 +9186,7 @@ struct Codegen {
          * (parser.cpp) - so a non-global named decl is provably impossible
          * here (the REPL, whose names ARE map-resident, never runs codegen);
          * ML_CHECK guards the invariant. */
-        if (const FuncDeclStmt *fd = dynamic_cast<const FuncDeclStmt *>(s)) {
+        if (const FuncDeclStmt *fd = node_cast<const FuncDeclStmt>(s)) {
             if (fd->id) {
                 emit_func_decl(fd, code);
                 return;
@@ -9200,7 +9200,7 @@ struct Codegen {
          * `isconst` folds), so a plain StoreGlobalV is differential-identical.
          * Like a func decl, a SCRIPT struct decl is always global (structs
          * never capture; pWrapDeclBody closed the brace-less-body route). */
-        const StructDeclStmt *sd = dynamic_cast<const StructDeclStmt *>(s);
+        const StructDeclStmt *sd = node_cast<const StructDeclStmt>(s);
         if (sd) {
             if (sd->id) {
                 emit_struct_decl(sd, code);
@@ -9208,12 +9208,12 @@ struct Codegen {
             }
         }
         /* A `try/catch` -> a native handler region (P8 Inc 0). */
-        if (const TryCatchStmt *tc = dynamic_cast<const TryCatchStmt *>(s)) {
+        if (const TryCatchStmt *tc = node_cast<const TryCatchStmt>(s)) {
             if (compile_native_try(tc))
                 return;
         }
         /* `throw <expr>;` -> a native Throw op (P8 Inc 1). */
-        if (const ThrowStmt *th = dynamic_cast<const ThrowStmt *>(s)) {
+        if (const ThrowStmt *th = node_cast<const ThrowStmt>(s)) {
             if (try_native_throw(th, code))
                 return;
         }
@@ -9224,7 +9224,7 @@ struct Codegen {
          * A non-scope-free block (a capture / nested func / slot-overflow decl)
          * needs its own context, which vm_run_chunk doesn't build, so it falls
          * back. Matches the tree-walker's Block::do_eval scope-free path. */
-        if (const Block *blk = dynamic_cast<const Block *>(s)) {
+        if (const Block *blk = node_cast<const Block>(s)) {
             if (blk->scope_free) {
                 gen_stmts(blk->elems);
                 return;
@@ -9248,7 +9248,7 @@ struct Codegen {
              * id must throw UndefinedVariableEx and a GLOBAL id throws iff
              * not yet defined - both exactly what compile_boxed_expr's leaf
              * paths emit (ThrowRuntimeV / LoadGlobalV), result discarded. */
-            const Identifier *bid = dynamic_cast<const Identifier *>(s);
+            const Identifier *bid = node_cast<const Identifier>(s);
             const bool inert =
                 dynamic_cast<const Literal *>(s)
                 || (bid && bid->sym.kind != SymKind::unresolved
@@ -13563,7 +13563,7 @@ collect_funcs(const Construct *c, std::vector<const FuncDeclStmt *> &out)
 {
     if (!c)
         return;
-    if (const FuncDeclStmt *fn = dynamic_cast<const FuncDeclStmt *>(c)) {
+    if (const FuncDeclStmt *fn = node_cast<const FuncDeclStmt>(c)) {
         out.push_back(fn);
         collect_funcs(fn->body.get(), out);   /* nested closures within */
         return;

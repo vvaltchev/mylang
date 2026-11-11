@@ -157,26 +157,26 @@ void collect_structs(const Construct *c,
 {
     if (!c)
         return;
-    if (auto *sd = dynamic_cast<const StructDeclStmt *>(c)) {
+    if (auto *sd = node_cast<const StructDeclStmt>(c)) {
         out.push_back(sd);
         return;
     }
     auto rec = [&](const Construct *ch) { collect_structs(ch, out); };
-    if (auto *b = dynamic_cast<const Block *>(c)) {
+    if (auto *b = node_cast<const Block>(c)) {
         for (const auto &e : b->elems) rec(e.get());
-    } else if (auto *fn = dynamic_cast<const FuncDeclStmt *>(c)) {
+    } else if (auto *fn = node_cast<const FuncDeclStmt>(c)) {
         rec(fn->body.get());
-    } else if (auto *iff = dynamic_cast<const IfStmt *>(c)) {
+    } else if (auto *iff = node_cast<const IfStmt>(c)) {
         rec(iff->thenBlock.get()); rec(iff->elseBlock.get());
-    } else if (auto *w = dynamic_cast<const WhileStmt *>(c)) {
+    } else if (auto *w = node_cast<const WhileStmt>(c)) {
         rec(w->body.get());
-    } else if (auto *f = dynamic_cast<const ForStmt *>(c)) {
+    } else if (auto *f = node_cast<const ForStmt>(c)) {
         rec(f->body.get());
-    } else if (auto *fr = dynamic_cast<const ForRangeStmt *>(c)) {
+    } else if (auto *fr = node_cast<const ForRangeStmt>(c)) {
         rec(fr->body.get());
-    } else if (auto *fe = dynamic_cast<const ForeachStmt *>(c)) {
+    } else if (auto *fe = node_cast<const ForeachStmt>(c)) {
         rec(fe->body.get());
-    } else if (auto *t = dynamic_cast<const TryCatchStmt *>(c)) {
+    } else if (auto *t = node_cast<const TryCatchStmt>(c)) {
         rec(t->tryBody.get()); rec(t->finallyBody.get());
         for (const auto &cs : t->catchStmts) rec(cs.second.get());
     }
@@ -2717,7 +2717,7 @@ std::string disassemble_program(const Block *root)
         std::vector<std::string> cap_names;
         if (fn->captures)
             for (const auto &cap : fn->captures->elems)
-                if (auto *id = dynamic_cast<const Identifier *>(cap.get()))
+                if (auto *id = node_cast<const Identifier>(cap.get()))
                     cap_names.push_back(std::string(id->get_str()));
 
         /* Label: a named func is `func <name>`; an anonymous lambda gets a
