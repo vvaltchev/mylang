@@ -1,0 +1,52 @@
+# INT-ENGINES: default tw nj noopt
+#
+# INT test (#107): a template used as a VALUE gets a typed instance when
+# every call through the value agrees on one settled signature
+# (value_instantiate_round). Each edge of that rule, with the answer
+# every engine must print: the instance a direct call already made is
+# reused, an `opt` parameter is not part of the signature, two value
+# sites that disagree leave the base running boxed, a wrong arity
+# through a value raises at run time, and a `dyn` argument gives no
+# instance at all (it could be no better than the base).
+
+# (a) a direct call makes the instance first; the value use reuses it
+func sq(x) { var t = x * x; return t; }
+var d1 = sq(int(runtime(3)));
+var fs = [sq];
+var dyn g = fs[runtime(0)];
+var dyn d2 = g(int(runtime(4)));
+
+# (b) an opt parameter beside a template one
+func add(a, opt b) { if (b == none) return a; return a + b; }
+var ad = [add];
+var dyn h = ad[runtime(0)];
+var dyn h1 = h(int(runtime(5)), int(runtime(6)));
+
+# (c) two value sites that disagree: no instance, the base runs boxed
+func dbl(x) { return x + x; }
+var db = [dbl];
+var dyn k = db[runtime(0)];
+var dyn k1 = k(int(runtime(2)));
+var dyn k2 = k(str(runtime("ab")));
+
+# (d) a value call with the wrong arity raises at run time
+func two(a, b) { return a - b; }
+var tw = [two];
+var dyn m = tw[runtime(0)];
+var msg = "none";
+try {
+    m(int(runtime(1)));
+} catch (InvalidNumberOfArgsEx) {
+    msg = "arity";
+}
+
+# (e) a dyn argument: the clone would be no better than the base
+func neg(x) { return -x; }
+var ng = [neg];
+var dyn n = ng[runtime(0)];
+var dyn arg = runtime(7);
+var dyn n1 = n(arg);
+
+print(d1, d2, h1, k1, k2, msg, n1);
+assert(d1 == 9 && d2 == 16 && h1 == 11);
+assert(k1 == 4 && k2 == "abab" && msg == "arity" && n1 == -7);

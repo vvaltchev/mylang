@@ -1734,8 +1734,16 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             return;
         if (ctag(n) == ConstructType::call) {
             auto *call = static_cast<CallExpr *>(n);
-            /* the callee position is NOT a value use; ARG uses escape */
-            walk(call->what.get(), in_func);   /* nested callee exprs */
+            /* the callee position is NOT a value use; ARG uses escape.
+             * A bare name there is a DIRECT call, so it is not walked:
+             * one that still names the template - left on the base by
+             * --max-instances or the instantiation rounds' bound - was
+             * recorded as a value use and redirected to the VALUE
+             * instance, so `show("ab")` became a call of `show$0(int)`
+             * and a valid program was refused (2026-11-11). Any other
+             * callee expression may hold value uses (`pick(f)(x)`). */
+            if (ctag(call->what.get()) != ConstructType::id)
+                walk(call->what.get(), in_func);
             for (auto &a : call->args->elems) {
                 if (ctag(a.get()) == ConstructType::id) {
                     auto *id = static_cast<Identifier *>(a.get());

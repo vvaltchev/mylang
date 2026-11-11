@@ -18690,6 +18690,19 @@ static const std::vector<test> tests =
         "    return 1 + depth([x], n - 1);",
         "}",
         "assert(depth(1, runtime(70)) == 70);" } },
+    /* ...and stays on the base when the template is ALSO used as a
+     * value: the value-use walk recorded the left call's callee name as
+     * a value use and redirected it to the VALUE instance (int, int), a
+     * TypeMismatchEx on the valid program (2026-11-11) */
+    { "template: a call left on the base is no value use",
+      { "func depth(x, int n) {",
+        "    if (n == 0) return 0;",
+        "    return 1 + depth([x], n - 1);",
+        "}",
+        "var fs = [depth];",
+        "var dyn g = fs[runtime(0)];",
+        "assert(depth(1, runtime(70)) == 70);",
+        "assert(g(1, int(runtime(3))) == 3);" } },
     { "template: a never-called template is not checked (no error)",
       { "func unused(a){ var r = a + 1; r += 2; return r; }",
         "assert(true);" } },
