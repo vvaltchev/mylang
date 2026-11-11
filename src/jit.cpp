@@ -16213,6 +16213,9 @@ void jit_stats_report()
         { "frags",            &g_jit_frags },
         { "native_calls",     &g_jit_native_calls },
         { "native_returns",   &g_jit_native_returns },
+        /* a native container's islands (model-flip M3): reached only
+         * through #107's island_choice on today's ops */
+        { "container_calls",  &g_jit_container_calls },
         /* which TIER the boxed (dyn) arithmetic took */
         { "boxed_fast",       &g_jit_boxed_fast },
         { "divmagic",         &g_jit_divmagic },
@@ -31182,6 +31185,51 @@ static void emit_island_call(Emitter &e, const FuncDescriptor *desc,
     e.b[jfix] = static_cast<uint8_t>(e.pos() - (jfix + 1)); /* patch the jns */
 }
 
+#ifdef INT_TESTS
+/* #107 P3: a body's CONTAINER ISLANDS as an enumerated decision. Every op
+ * the island list admits is op_run_eligible today, so on real code
+ * jit_try_container forms no container (the hop chain above) and the
+ * whole mechanism - the island call, jit_exec_block, the ExitBlock remap -
+ * was reached by a synthetic selftest alone. Pick 1 makes every such op of
+ * the body an interpreted ISLAND inside one native container, which is
+ * legal: vm_exec_block runs the op's original in the same frame. Asked
+ * only of a body the gate below can take - no call, ReturnV last only,
+ * every op native or island-listed, one such op at least, and islands
+ * enough for a straight-line body's size gate - so an instance is never
+ * recorded that could not take effect. */
+static bool jit_int_islands_forced(const Chunk &chunk, const JitCtx *jc)
+{
+    const size_t n = chunk.code.size();
+    size_t forceable = 0, listed_ops = 0;
+    bool branch = false;
+    for (size_t p = 0; p < n; p++) {
+        const Instr &in = chunk.code[p];
+        if (in.op == OpCode::CallV || in.op == OpCode::CachedCallV
+                || in.op == OpCode::CallValueV)
+            return false;
+        if (in.op == OpCode::ReturnV && p != n - 1)
+            return false;
+        const bool native = op_run_eligible(in, jc);
+        const bool listed = op_is_simple_island(in.op);
+        if (!native && !listed)
+            return false;
+        branch = branch || (native && op_is_branch(in.op));
+        listed_ops += listed;
+        forceable += native && listed;
+    }
+    if (forceable == 0 || (!branch && listed_ops < MIN_CONTAINER_ISLAND))
+        return false;
+    const FuncDescriptor *d = jc->caller_desc;
+    const std::string fn = d->name ? std::string(d->name->val)
+        : "<lambda>@" + (chunk.locs.empty() ? std::string("?")
+                         : std::to_string(chunk.locs.front().start.line));
+    const std::string key = "island:" + fn + "/all";
+    const int pick = int_choose(key, 2, 0);
+    ML_INT(island_choice, key, int64_t(2), int64_t(0), int64_t(pick));
+    return pick == 1;
+}
+#endif
+
 /* Try to compile `chunk` as an M3 native container. Returns true iff it
  * matched the gate AND emitted successfully (chunk.code + chunk.native
  * committed); false leaves `chunk` PRISTINE for the normal per-run path. */
@@ -31193,6 +31241,9 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     const size_t n = chunk.code.size();
     if (n < 2 || chunk.code[n - 1].op != OpCode::ReturnV)
         return false;
+    /* #107: an INT build may run the island-listed ops as islands */
+    bool forced = false;
+    ML_INT_ONLY(forced = jit_int_islands_forced(chunk, jc);)
 
     /* Gate: collect EVERY contiguous island of simple boxed ops (M4b: multiple
      * islands - the common real shape, e.g. an init MoveV + a body island);
@@ -31216,7 +31267,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
          * op_is_simple_island whitelist, and checking that first would classify
          * it an island (run interpreted via vm_exec_block, its jit_* helper
          * NEVER called) - a verified bug the g_jit_op_run counter caught. */
-        if (op_run_eligible(chunk.code[p], jc)) {
+        if (op_run_eligible(chunk.code[p], jc)
+                && !(forced && op_is_simple_island(op))) {
             in_island = false;
             if (op_is_branch(op))
                 has_branch = true;         /* M4: a native loop/if */
@@ -31447,6 +31499,8 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
     g_jit_frags++;
     if (jit_map_wanted())
         jit_write_map(chunk, "container");
+    ML_INT(container, jit_int_fn_name(jc->caller_desc),
+           int64_t(islands.size()));
     return true;
 }
 
