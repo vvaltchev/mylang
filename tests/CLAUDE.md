@@ -264,6 +264,13 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
   `--conditions`, and int_run now says so before running anything). The
   int-gcov lane builds with the default g++; where that is older, build
   a GCOV INT lane with CXX=g++-14 (the CI int job's compiler).
+- `--no-rt` is a SUBSET like `--only`: the whole-suite checks (the site
+  and value-class censuses, ownership, the floor) are skipped, since -rt
+  alone exercises some value classes (an out-of-range literal is a
+  compile error no tests/int program can hold). tests/mutate's `int`
+  stage runs --no-rt; with the census on, its pristine build failed and
+  every mutation run stopped before its first mutant (2026-10-05 to
+  2026-11-11).
 - `--gcov --only REGEX --report F` writes what each unit run covered:
   compared with a whole run's uncovered list it says what a new unit
   adds, in minutes instead of the whole run's ~50.
