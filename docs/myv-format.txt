@@ -2,8 +2,17 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 39.  This document describes the on-disk image exhaustively:
+Format version 40.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v40: an `sref` may name one of the BINARY's own reflection structs by a
+reserved number (section 2) - in a struct value's def (11.3) and a member
+key's bake_def (9.4) only.  A folded `type(x)` / `decltype(x)`
+bakes a `Type` instance into a pool, which no program declares, so `-c`
+refused every program that asked one; and a member read on a reflection
+value - `type(x).kind`, `layout(S).fields`, a StructField's `name` - is
+baked against its native struct, and an image dropped that bake_def
+silently.)
 
 (v39: the value codec gains tag 11, `bltn` - a builtin VALUE, written as its
 name (section 11).  A const container holding a builtin - `const OPS = [len,
@@ -370,7 +379,14 @@ Notation used throughout this document:
                   struct's, field's, const's, parameter's or capture's name,
                   a member key, an emplace callee, a builtin's name, a
                   global slot's name - is refused when null.
-    sref          u32 index into the struct table, or 0xFFFFFFFF for null
+    sref          u32 index into the struct table, or 0xFFFFFFFF for null.
+                  v40: 0xFFFFFFF0, 0xFFFFFFF1 and 0xFFFFFFF2 name the
+                  binary's own reflection structs StructField,
+                  StructLayout and Type (eval.cpp, native_struct_*_def),
+                  which no struct table holds - every binary has them.
+                  Legal ONLY as a strct value's def (11.3) and a
+                  MemberKey's bake_def; anywhere else it is out of
+                  range like any index past the table.
     dref          u32 index into the descriptor table
     loc           a source location, 3 bytes in the common case (section 2.1)
     value         a runtime value, recursive (section 11)
@@ -913,6 +929,8 @@ be walked without recursion.
         loc   mstart, mend      the member expression's caret
         loc   bstart, bend      the base's caret
         sref  bake_def          the compile-proven struct type, or null
+                                (v40: or a NATIVE struct - a member read
+                                on a folded type() is baked against Type)
         u32   bake_slot         (signed) its resolved field slot
 
 `bake_def`/`bake_slot` are the compile-baked field resolution: a consumer uses
@@ -1219,7 +1237,10 @@ VALIDATION (v33): the def must be a STRUCT (not a class), `pod` must equal
 the def's computed layout, and the count must be the def's - nbytes its size,
 nfields its field count - else "corrupt .myv (a struct value does not match
 its struct)".  A value read inside the struct table (a const member) is
-checked in the wiring phase, once every layout is computed.
+checked in the wiring phase, once every layout is computed.  The def may be a
+NATIVE struct (v40, section 2's `sref`): a folded `type(x)` is a constant
+`Type` instance, whose elem / key / val fields hold more of them or none;
+the three native structs are boxed.
 
 PORTABILITY NOTE.  A POD instance's bytes are written as laid out by the
 writing host, and a flat struct array's element bytes likewise.  The layout

@@ -1,0 +1,22 @@
+# The reflection values - a folded type() and the struct layout() returns
+# - read through their fields, alike in every engine. Stored as an image
+# (driver_checks' round trip), this program holds a constant Type
+# instance and member reads baked against Type, StructLayout and
+# StructField: .myv v40 names those three by reserved struct numbers,
+# where an image could hold none of them before. With no type inference
+# (-nti) a query is not folded and type() describes the run-time value,
+# a flat Type with no element types (README *type*), so the element
+# checks hold for a typed run only.
+struct P { int x; float y; }
+var typed = typestr(runtime(0)) == "dyn";
+var a = [[1.5]];
+var t = type(a);
+assert(t.kind == "array" && !t.nullable);
+assert(!typed || (t.elem?.kind == "array" && t.elem?.elem?.kind == "float"));
+var d = {"k": [true]};
+assert(!typed || (decltype(d).val?.elem?.kind == "bool"
+                  && type(d).key?.kind == "str"));
+var l = layout(P);
+assert(l.name == "P" && len(l.fields) == 2 && l.fields[0].name == "x"
+       && l.fields[1].type == "float" && l.fields[1].offset == 8);
+print(t.kind, l.size, l.pod);

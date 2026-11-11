@@ -8804,8 +8804,15 @@ an unknown name is refused), struct defs / descriptors are table indices.
 Values go through a recursive codec (none/bool/int/float/str/array WITH its
 storage kind + readonly/dict + default/struct instance/struct descriptor/
 FuncObject/class instance/builtin, the last by NAME since v39) that ABORTS
-on an unlisted type - an image is never silently lossy. Struct LAYOUT is recomputed at load (`compute_layout`), never
-stored.
+on an unlisted type - an image is never silently lossy. **A struct
+reference may name one of the BINARY's reflection structs (StructField /
+StructLayout / Type) by a reserved number (v40)**, as a struct value's def
+or a member key's bake: a folded `type(x)` is a constant Type instance,
+which no program's struct table holds, so `-c` refused every program that
+asked one, and a member read on a reflection value (`layout(S).fields`)
+lost its bake without a word (found 2026-11-11 by
+`driver_checks`' round trip, which covers tests/int too since). Struct
+LAYOUT is recomputed at load (`compute_layout`), never stored.
 **THE COMPACT INSTRUCTION ENCODING (v3, 2026-07-29).** The fixed 27-byte
 field-wise record was 37% of an image; an instruction is now
 `op:u8 flags:u16 [the present fields]`, where the flags word gives a

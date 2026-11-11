@@ -703,6 +703,34 @@ enum class VTag : uint8_t {
     cls, bltn
 };
 
+/* v40: the binary's own reflection structs (eval.cpp) - a folded type() /
+ * decltype() bakes a Type instance into a pool, and a member read on one
+ * is baked against Type - and no program declares them, so an sref names
+ * them by a RESERVED number (docs/myv-format.txt, `sref`) and the loader
+ * hands back this binary's def. Accepted only where a program can reach
+ * one: a struct value's def, a member key's bake_def. */
+static constexpr uint32_t SREF_NATIVE = 0xfffffff0u;   /* + 0, 1, 2 */
+
+static uint32_t native_sref(const StructTypeDef *d)
+{
+    if (d == native_struct_field_def())
+        return SREF_NATIVE;
+    if (d == native_struct_layout_def())
+        return SREF_NATIVE + 1;
+    if (d == native_struct_type_def())
+        return SREF_NATIVE + 2;
+    return 0xffffffffu;
+}
+
+static StructTypeDef *native_at(uint32_t ref)
+{
+    /* the native defs are never written through (a const def) */
+    return const_cast<StructTypeDef *>(
+        ref == SREF_NATIVE ? native_struct_field_def()
+        : ref == SREF_NATIVE + 1 ? native_struct_layout_def()
+        : native_struct_type_def());
+}
+
 /* The name a builtin VALUE is written under: the least, by spelling, of the
  * names registered with its implementation - a fixed choice, so two
  * compiles write the same bytes. Only a CONST builtin can be in a pool (a
@@ -931,9 +959,10 @@ void write_value(Writer &w, const EvalValue &v)
         w.u8v(static_cast<uint8_t>(VTag::strct));
         const StructObject &so = *v.get<intrusive_ptr<StructObject>>();
         auto it = w.struct_ids.find(so.def);
-        if (it == w.struct_ids.end())
+        const uint32_t nat = native_sref(so.def);
+        if (it == w.struct_ids.end() && nat == 0xffffffffu)
             bad_image("unserializable value (struct def)");
-        w.u32v(it->second);
+        w.u32v(it != w.struct_ids.end() ? it->second : nat);
         w.boolv(so.is_readonly());
         const bool pod = so.def->layout == StructTypeDef::Layout::pod;
         w.boolv(pod);
@@ -1001,11 +1030,13 @@ EvalValue read_value(Reader &r)
         return EvalValue(std::move(d));
     }
     case VTag::strct: {
-        const uint32_t di = r.idx(r.structs.size(), "corrupt .myv (struct)");
+        const uint32_t di = r.u32v();
+        if (di < SREF_NATIVE ? di >= r.structs.size() : di > SREF_NATIVE + 2)
+            bad_image("corrupt .myv (struct)");
         const bool ro = r.boolv();
         const bool pod = r.boolv();
         auto so = make_intrusive<StructObject>();
-        so->def = r.structs[di];
+        so->def = di >= SREF_NATIVE ? native_at(di) : r.structs[di];
         if (pod) {
             const uint32_t n = r.countv();
             r.need(n);
@@ -1471,8 +1502,9 @@ void write_chunk(Writer &w, const Chunk &c)
         w.locv(m.mstart); w.locv(m.mend);
         w.locv(m.bstart); w.locv(m.bend);
         auto it = w.struct_ids.find(m.bake_def);
-        w.u32v(m.bake_def && it != w.struct_ids.end() ? it->second
-                                                      : 0xffffffffu);
+        w.u32v(!m.bake_def ? 0xffffffffu
+               : it != w.struct_ids.end() ? it->second
+               : native_sref(m.bake_def));
         w.u32v(static_cast<uint32_t>(m.bake_slot));
     }
 
@@ -1776,8 +1808,15 @@ void read_chunk(Reader &r, Chunk &c)
         m.optional = r.boolv();
         m.mstart = r.locv(); m.mend = r.locv();
         m.bstart = r.locv(); m.bend = r.locv();
-        const uint32_t bd = r.idx_opt(r.structs.size(), "corrupt .myv (bake def)");
-        m.bake_def = bd == 0xffffffffu ? nullptr : r.structs[bd];
+        const uint32_t bd = r.u32v();
+        if (bd == 0xffffffffu)
+            m.bake_def = nullptr;
+        else if (bd >= SREF_NATIVE && bd <= SREF_NATIVE + 2)
+            m.bake_def = native_at(bd);
+        else if (bd < r.structs.size())
+            m.bake_def = r.structs[bd];
+        else
+            bad_image("corrupt .myv (bake def)");
         m.bake_slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
         c.member_keys.push_back(std::move(m));
     }
