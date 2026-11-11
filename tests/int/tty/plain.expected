@@ -1,0 +1,64 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+[?2004h[J>> [3C[J>> v[4C[J>> va[5C[J>> var[6C[J>> var [7C[J>> var i[8C[J>> var it[9C[J>> var ite[10C[J>> var item[11C[J>> var item_[12C[J>> var item_c[13C[J>> var item_co[14C[J>> var item_cou[15C[J>> var item_coun[16C[J>> var item_count[17C[J>> var item_count [18C[J>> var item_count =[19C[J>> var item_count = [20C[J>> var item_count = 3[21C
+[?2004l=> 3
+[?2004h[J>> [3C[J>> i[4C[J>> it[5C[J>> ite[6C[J>> item[7C[J>> item_[8C[J>> item_count[13C
+[?2004l=> 3
+[?2004h[J>> [3C[J>> s[4C
+show  signature  sin  sort  specializations  split  splitlines  sqrt  startswith  str  strip  struct  sum
+[J>> s[4C[J>> [3C
+[?2004l[?2004h[J>> [3C[J>> z[4C[J>> zz[5C[J>> zzq[6C[J>> zzqq[7C[J>> zzqq[7C
+[?2004l[?2004h[J>> [3C[J>> [3C[J>> [3C[J>> [3C[J>> [3C[J>> [3C[J>> var pv = [1,
+..   2,
+..   3];[8C
+[?2004l=> [1, 2, 3]
+[?2004h[J>> [3C[J>> p[4C[J>> pv[5C
+[?2004l=> [1, 2, 3]
+[?2004h[J>> [3C[J>> p[4C[J>> pr[5C[J>> pri[6C[J>> prin[7C[J>> print[8C[J>> print([9C[J>> print([9C[J>> print([9C[J>> print([9C[J>> print([9C[J>> print([9C[J>> print(  pv[0] + 1)[21C
+[?2004l2 
+[?2004h[J>> [3C
+
+
+
+
+
+
+
+[7A+- search:  ------------------------------------------------------- 5 matches -+
+| > print(  pv[0] + 1)                                                         |
+|   pv                                                                         |
+|   var pv = [1,   2,   3];                                                    |
+|   item_count                                                                 |
+|   var item_count = 3                                                         |
+|                                                                              |
++------------------------------------------------------------------------------+[7A[11C+- search: i ------------------------------------------------------ 3 matches -+
+| > item_count                                                                 |
+|   var item_count = 3                                                         |
+|   print(  pv[0] + 1)                                                         |
+|                                                                              |
+|                                                                              |
+|                                                                              |
++------------------------------------------------------------------------------+[7A[12C+- search: it ----------------------------------------------------- 3 matches -+
+| > item_count                                                                 |
+|   var item_count = 3                                                         |
+|   print(  pv[0] + 1)                                                         |
+|                                                                              |
+|                                                                              |
+|                                                                              |
++------------------------------------------------------------------------------+[7A[13C+- search: ite ---------------------------------------------------- 2 matches -+
+| > item_count                                                                 |
+|   var item_count = 3                                                         |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
++------------------------------------------------------------------------------+[7A[14C+- search: item --------------------------------------------------- 2 matches -+
+| > item_count                                                                 |
+|   var item_count = 3                                                         |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
++------------------------------------------------------------------------------+[7A[15C[J[1A[J>> item_count[13C
+[?2004l=> 3
+[?2004h[J>> [3C
+[?2004l

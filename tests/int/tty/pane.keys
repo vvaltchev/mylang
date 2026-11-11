@@ -1,0 +1,27 @@
+# The Ctrl-R pane on a small terminal with a UTF-8 locale (see
+# editing.keys for the format): rounded borders, a one-row result
+# window that scrolls with the selection, and a query too long for the
+# top border.
+# TTY-SIZE: 8x34
+# TTY-ENV: LC_ALL=C.UTF-8
+#
+# a fresh session: no history to recall or search
+\x1b[A\x1b[B\x03
+\x12\x1b[A\x1b[B\x12\x7f\r
+# four entries, one too long for the pane and one on three lines
+var alpha_one = 1\r
+var alpha_two = 2\r
+var alpha_three_is_a_very_long_name = 3\r
+func af(a) {\rreturn a + alpha_one;\r}\r
+# four matches in a one-row window: down past the end, back up past
+# the top, Ctrl-R cycles, Enter loads the selection ...
+\x12alpha\x1b[B\x1b[B\x1b[B\x1b[B\x1b[A\x0e\x10\x10\x10\x10\x12\r
+# ... and Enter runs it
+\r
+# the count leaves the border first, then the query is cut
+\x12aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x07
+# the three-line entry loads as a block; a search from it, cancelled
+\x12func af\r
+\x12zz\x03
+\x03
+\x04

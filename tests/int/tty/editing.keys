@@ -16,5 +16,25 @@ abc\x03
 \x12var\r
 # ... and Enter runs it
 \r
+# the keys at the edges are no-ops: backspace, left and Ctrl-B at the
+# start, Ctrl-W over nothing but spaces, Delete at the end; an arrow in
+# its SS3 spelling (ESC O D), Home and End as ESC[7~ / ESC[8~, and a
+# control byte the editor binds to nothing
+\x7f\x1b[D\x02  \x17x\x1b[3~\x1bOD\x1b[7~\x1b[8~\x1a\r
+# Down out of no history entry, Up past the oldest one
+\x1b[B\x1b[A\x1b[A\x1b[A\x1b[A\x1b[A\x1b[A\x1b[A\x1b[A\x1b[A\x1b[A\x03
+# the search pane: an unbound byte, SS3 down, a CSI with parameters,
+# Ctrl-N / Ctrl-P, and a line feed accepting like Enter; Ctrl-C drops the
+# loaded input
+\x12pr\x1a\x1bOB\x1b[1;5A\x0e\x10\n
+\x03
+# Ctrl-C from the first row of a three-row block, and an Enter that
+# submits while the ghost suggestion still shows: both clear what they
+# leave behind
+func q() {\rvar a = 1;\r\x1b[A\x1b[A\x03
+pri\r
+# a paste of nothing but blank lines inserts nothing; one ending in a
+# lone CR keeps its text
+\x1b[200~\n\n\x1b[201~\x1b[200~print(5)\r\x1b[201~\r
 # Ctrl-D at an empty prompt ends the session
 \x04

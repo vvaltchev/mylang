@@ -158,27 +158,42 @@ def main():
     # suggestion, completion, the Ctrl-R pane, bracketed paste - which
     # every other unit reaches only off a TTY. Each line of a .keys file
     # is ONE input, in Python string-literal escapes (`\r` is Enter,
-    # `\x1b[A` the up arrow); it is typed on a 24x80 pseudo-terminal once
-    # the REPL has read the line before it and waits in raw mode again
-    # (intcov.run_tty), and everything the terminal shows must equal
-    # NAME.expected byte for byte - the output is a function of the bytes
-    # typed, so it is the same on every run and every build. Linux only:
-    # the waiting test reads /proc.
+    # `\x1b[A` the up arrow); it is typed on a 24x80 pseudo-terminal (or
+    # the TTY-SIZE below) once the REPL has read the line before it and
+    # waits in raw mode again (intcov.run_tty), and everything the
+    # terminal shows must equal NAME.expected byte for byte - the output
+    # is a function of the bytes typed, so it is the same on every run
+    # and every build. Linux only: the waiting test reads /proc.
     for keys in sorted(glob.glob(os.path.join(HERE, "int", "tty",
                                               "*.keys"))):
         if not sys.platform.startswith("linux"):
             print("int_run: %s skipped (a terminal session needs Linux's "
                   "/proc)" % os.path.relpath(keys, ROOT))
             continue
-        chunks = []
+        # A `# TTY-SIZE: ROWSxCOLS` line picks another terminal size and
+        # a `# TTY-ENV: K=V ...` line adds environment variables (a UTF-8
+        # locale for the pane's rounded borders, NO_COLOR) - both are
+        # inputs of the session, so they live in the file it is read from.
+        chunks, size, tty_env = [], (24, 80), {}
         with open(keys, encoding="latin-1") as f:
             for line in f:
                 line = line.rstrip("\n")
+                m = re.match(r"# TTY-SIZE: (\d+)x(\d+)\s*$", line)
+                if m:
+                    size = (int(m.group(1)), int(m.group(2)))
+                    continue
+                m = re.match(r"# TTY-ENV:(.*)$", line)
+                if m:
+                    for kv in m.group(1).split():
+                        k, _, v = kv.partition("=")
+                        tty_env[k] = v
+                    continue
                 if line and not line.startswith("#"):
                     chunks.append(codecs.decode(line, "unicode_escape")
                                   .encode("latin-1"))
         units.append((os.path.relpath(keys, ROOT),
-                      [[(TTY, {}, (chunks, keys[:-5] + ".expected"))]]))
+                      [[(TTY, tty_env,
+                         (chunks, keys[:-5] + ".expected", size))]]))
     # THE DRIVER UNIT: tests/driver_checks runs the binary under the CLI
     # flags -rt cannot reach (it runs in-process, past mylang.cpp's
     # argument handling): -nr, -vd/-vdj, -c and a .myv load, -dti, -a, the
@@ -281,8 +296,10 @@ def main():
                                 if k not in ("NO_COLOR", "COLUMNS", "LINES",
                                              "LANG", "LANGUAGE")}
                         tenv.update(HOME=home, TERM="xterm", LC_ALL="C")
+                        tenv.update(extra)
+                        rows, cols = repl[2]
                         results.append(run_tty([binary], tenv, repl[0],
-                                               args.timeout))
+                                               args.timeout, rows, cols))
                         continue
                     if repl:
                         # the REPL retains its inputs' programs, like -rt:

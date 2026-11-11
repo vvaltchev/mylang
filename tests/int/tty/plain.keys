@@ -1,0 +1,20 @@
+# The line editor with colour off (NO_COLOR) - no syntax colour, no
+# ghost suggestion, a plain search pane - plus completion lists and
+# pastes the editor has to clean up (see editing.keys for the format).
+# TTY-ENV: NO_COLOR=1
+#
+# Tab: one match completes, several are listed, none does nothing
+var item_count = 3\r
+item_\t\r
+s\t\x15\x03
+zzqq\t\x03
+# a paste of CRLF and CR line ends, tabs, a control byte and trailing
+# blank lines: re-indented, cleaned, one input
+\x1b[200~\tvar pv = [1,\r\n\t\t2,\r\t3];\x01\n\n\x1b[201~\r
+pv\r
+# a paste in the middle of a line continues it
+print(\x1b[200~  pv[0] + 1)\x1b[201~\r
+# the search pane without colour
+\x12item\r
+\r
+\x04
