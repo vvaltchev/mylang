@@ -92,7 +92,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
     ap.add_argument("--no-rt", action="store_true",
-                    help="skip the -rt unit (iterating on tests/int only)")
+                    help="skip the -rt unit (iterating on tests/int only;"
+                         " the whole-suite checks are then skipped)")
     ap.add_argument("--gcov", action="store_true",
                     help="measure the coverage universe (a GCOV=1 build)")
     ap.add_argument("--floor-file",
@@ -191,6 +192,11 @@ def main():
     CENSUS, INVIS = "corpus: object census", "corpus: probe invisibility"
     names = [n for n, _ in units] + [CENSUS, INVIS]
     only = re.compile(args.only) if args.only else None
+    # -rt is a unit too, so a run without it is a SUBSET like --only: the
+    # whole-suite checks (the site and value-class censuses, ownership,
+    # the floor) are skipped - see the census below for why it matters
+    partial = bool(only) or args.no_rt
+    why = "--only" if only else "--no-rt"
     if args.list:
         for n in names:
             if not only or only.search(n):
@@ -475,11 +481,15 @@ def main():
         if not totals and not only:
             failures.append("no census was written (MYLANG_INT_OUT)")
         # a subset of the units cannot check every site: the site census
-        # is a whole-suite check
-        unchecked = [] if only else \
+        # is a whole-suite check. -rt is a unit too, so --no-rt is a
+        # subset: three literal value classes are exercised by -rt alone
+        # (an out-of-range literal is a compile error, which no tests/int
+        # program can hold), and tests/mutate's `int` stage, which runs
+        # --no-rt, failed its pristine build on them from 2026-10-05 on
+        unchecked = [] if partial else \
             sorted(s for s, (h, q) in totals.items() if q == 0)
-        if only:
-            print("  site census: skipped (--only - a whole-suite check)")
+        if partial:
+            print("  site census: skipped (%s - a whole-suite check)" % why)
         else:
             print("  census: %d site(s), %d not checked by any test"
                   % (len(totals), len(unchecked)))
@@ -489,18 +499,21 @@ def main():
             failures.append("site %s checked by no test" % s)
         # the value classes (intsites.h): a declared boundary no run
         # exercised is a boundary no test checks
-        unhit = [] if only else \
+        unhit = [] if partial else \
             sorted(c for c, h in vc_totals.items() if h == 0)
-        if not only:
+        if partial:
+            print("  value classes: skipped (%s - a whole-suite check)"
+                  % why)
+        else:
             print("  value classes: %d declared, %d exercised by no test"
                   % (len(vc_totals), len(unhit)))
         for c in unhit:
             print("    UNEXERCISED  %s" % c)
             failures.append("value class %s exercised by no test" % c)
 
-    if args.gcov and only:
-        print("  coverage: --only ran a subset - ownership and the floor "
-              "are whole-suite checks, skipped")
+    if args.gcov and partial:
+        print("  coverage: %s ran a subset - ownership and the floor "
+              "are whole-suite checks, skipped" % why)
         if args.report:
             # what each unit run covered: against a whole run's uncovered
             # list it says what a new unit adds, in minutes
