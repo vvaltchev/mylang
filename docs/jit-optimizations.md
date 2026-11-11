@@ -18315,3 +18315,27 @@ deep, three runs). Watched: the unfixed build leaks 597 arrays under the
 INT census with `MYLANG_NATIVE_STACK=0` and 16,992 bytes under clang's
 ASan; fixed, both are clean. `MYLANG_JIT_OFF=frameless` (or `norec`,
 `bakecallee`) hides it, since then no frameless frame forms.
+
+## A container declines a body with a try region (2026-11-11)
+
+**The finding.** The model-flip container (`jit_try_container`: a
+native fragment driving a whole body, its un-nativized ops run as
+interpreted ISLANDS through `jit_exec_block`) has formed on no real
+program since every op of its island list went native - so #107 made it
+an enumerated decision, `island_choice` (key `island:<fn>/all`): pick 1
+runs every island-listed op of a qualifying body as an island. Tier 1
+over the corpus forced each such body, and four deviations of
+tests/functional/104_exc_chain_markers.my failed: a SIGSEGV, an
+INT-VMSTATE reference in a slot outside `ref_slots`, and the wrong
+exception rethrown. Each body holds a try region. An island that raises
+inside one is caught by the INTERPRETER - `vm_exec_block`'s dispatch
+finds the handler - which then runs the handler past the island,
+outside the container's control.
+
+**The fix.** The container declines a body with any handler site (so
+does the INT site, which is asked only of a body the gate can take),
+and the handler-table remap it used to do is an `ML_CHECK` that there is
+none. An island raising OUT of the body is unchanged: the caller catches
+it, with the tree-walker's caret and backtrace
+(tests/int/90_container_islands.my covers both). No shipped code
+changes: no real body reached the container.

@@ -31193,15 +31193,17 @@ static void emit_island_call(Emitter &e, const FuncDescriptor *desc,
  * was reached by a synthetic selftest alone. Pick 1 makes every such op of
  * the body an interpreted ISLAND inside one native container, which is
  * legal: vm_exec_block runs the op's original in the same frame. Asked
- * only of a body the gate below can take - no call, ReturnV last only,
- * every op native or island-listed, one such op at least, and islands
- * enough for a straight-line body's size gate - so an instance is never
- * recorded that could not take effect. */
+ * only of a body the gate below can take - no try region, no call,
+ * ReturnV last only, every op native or island-listed, one such op at
+ * least, and islands enough for a straight-line body's size gate - so an
+ * instance is never recorded that could not take effect. */
 static bool jit_int_islands_forced(const Chunk &chunk, const JitCtx *jc)
 {
     const size_t n = chunk.code.size();
     size_t forceable = 0, listed_ops = 0;
     bool branch = false;
+    if (!chunk.handler_sites.empty())
+        return false;
     for (size_t p = 0; p < n; p++) {
         const Instr &in = chunk.code[p];
         if (in.op == OpCode::CallV || in.op == OpCode::CachedCallV
@@ -31240,6 +31242,15 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         return false;
     const size_t n = chunk.code.size();
     if (n < 2 || chunk.code[n - 1].op != OpCode::ReturnV)
+        return false;
+    /* No try region: an island that raises inside one is caught by the
+     * INTERPRETER (vm_exec_block's dispatch finds the handler), which
+     * then runs the handler past the island, outside the container's
+     * control - a SIGSEGV, a reference in an unlisted slot, the wrong
+     * exception rethrown (#107's island_choice found it, 2026-11-11, on
+     * tests/functional/104_exc_chain_markers.my). An island raising out
+     * of the body is fine: the caller catches it. */
+    if (!chunk.handler_sites.empty())
         return false;
     /* #107: an INT build may run the island-listed ops as islands */
     bool forced = false;
@@ -31475,17 +31486,9 @@ static bool jit_try_container(Chunk &chunk, const JitCtx *jc)
         vc.pc = static_cast<uint32_t>(remap[vc.pc]);
     for (auto &ic : chunk.inline_ctxs)
         ic.pc = static_cast<uint32_t>(remap[ic.pc]);
-    /* #78: the handler table's pcs are resumes into ordinary code, remapped
-     * exactly like the branch targets above (this path keeps every original,
-     * so there is no entry map here). */
-    for (Chunk::HandlerSite &hs : chunk.handler_sites) {
-        for (Chunk::HandlerClause &cl : hs.clauses)
-            if (cl.body_pc >= 0 && static_cast<size_t>(cl.body_pc) <= n)
-                cl.body_pc = static_cast<int32_t>(remap[cl.body_pc]);
-        if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) <= n)
-            hs.fin_pc = static_cast<int32_t>(remap[hs.fin_pc]);
-    }
-    verify_handler_sites(chunk);
+    /* the gate above refused a body with a try region, so there is no
+     * handler table to remap */
+    ML_CHECK(chunk.handler_sites.empty());
 
     chunk.native.base = mem;
     chunk.native.len = len;
