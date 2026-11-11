@@ -1762,7 +1762,7 @@ struct Codegen {
         /* A baked const array/dict/struct literal (LiteralObj) - what a
          * `var a = [1,2,3]` / `d = {}` const-literal rvalue folds to ->
          * LoadLiteralObjV materializes it from the pool (immutable share vs a
-         * fresh mutable clone, plus the general/flat_s cases). Node-free. */
+         * fresh mutable clone). Node-free. */
         if (const LiteralObj *lo = node_cast<const LiteralObj>(e)) {
             const int t = alloc_temp();
             CgInstr in;
@@ -1770,8 +1770,7 @@ struct Codegen {
             in.target = t;
             in.target2 = static_cast<int>(chunk.literal_objs.size());
             chunk.literal_objs.push_back(
-                {lo->literal_value(), lo->is_immutable(), lo->arr_hint,
-                 lo->arr_hint_struct});
+                {lo->literal_value(), lo->is_immutable()});
             ops.push_back(in);
             out_slot = t;
             return true;

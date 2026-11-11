@@ -672,7 +672,7 @@ enum class OpCode : unsigned char {
     /*
      * Materialize a baked const array/dict/struct literal (a LiteralObj):
      * slot[target] = eval_literal_obj(literal_objs[target2]) - an immutable
-     * share or a fresh mutable deep clone (plus the general/flat_s cases). This
+     * share or a fresh mutable deep clone. This
      * is what a `var a = [1,2,3]` / `d = {}` const-literal rvalue lowers to (a
      * scalar const is a LoadConstV; a non-const-element literal is MakeArrayV/
      * MakeDictV). Never throws (node-free).
@@ -2723,15 +2723,13 @@ struct Chunk {
     /*
      * Baked const array/dict/struct literals (LoadLiteralObjV). The op reads
      * entry here and calls eval_literal_obj (immutable share vs a fresh mutable
-     * clone, plus the general/flat_s arr_hint cases) - AST-free, no LiteralObj
-     * node at run time. `arr_hint_struct` is a program-lifetime StructTypeDef*
-     * (a type descriptor, not a Construct), used only for the flat_s case.
+     * clone) - AST-free, no LiteralObj node at run time. The value is already
+     * in the storage its destination's type gives it (the compiler rebuilt
+     * it), so no array hint rides along.
      */
     struct LiteralObjEntry {
         EvalValue value;
         bool immutable;
-        ArrHint arr_hint;
-        const StructTypeDef *arr_hint_struct;
     };
     std::vector<LiteralObjEntry> literal_objs;
 

@@ -4389,15 +4389,15 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
     } else {
 
         /* an array literal, or a folded one / a folded call that builds
-         * to the hint (LiteralObj::takes_hint) */
+         * to the hint (LiteralObj::takes_hint). A folded value is REBUILT
+         * in that storage, as its unfolded call builds at run time: the
+         * parse folded it with no destination, so a folded `keys(d)` /
+         * `map(f, a)` stayed general where -nc built it flat, and a store
+         * of another kind through a `dyn` alias was accepted in one and
+         * refused in the other (RULE 2). Nothing converts it later - a
+         * LiteralObj's own hint is read only by the decompiler. */
         rv->arr_hint = hint;
         rv->arr_hint_struct = sdef;
-        /* ...and a folded value is REBUILT in that storage now, as its
-         * unfolded call builds at run time: the parse folded it with no
-         * hint, and eval_literal_obj converts only an empty array - so a
-         * folded `keys(d)` / `map(f, a)` stayed general where -nc built it
-         * flat, and a store of another kind through a `dyn` alias was
-         * accepted in one and refused in the other (RULE 2) */
         if (ctag(rv) == ConstructType::lit_obj) {
             auto *lo = static_cast<LiteralObj *>(rv);
             WidenShape w;

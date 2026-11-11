@@ -3564,53 +3564,6 @@ void cyc_release_kept()
 }
 
 /*
- * Build a fresh, mutable GENERAL array from a flat (unboxed int/float) array,
- * reading its scalar elements directly (no promotion of the source). Used to
- * materialize a folded array literal whose destination is dynamically typed
- * (arr_hint general): the array is born general so a later mixed write to it
- * never has to promote. Only a flat source reaches here - an already-general
- * baked value is handled by make_mutable_clone, which keeps it general.
- */
-static EvalValue arr_elem_boxed(const SharedArrayObj &a, size_type i);
-
-static EvalValue
-make_general_array_clone(const SharedArrayObj &src)
-{
-    const size_type m = src.size();
-    SharedArrayObj::vec_type gv;
-    gv.reserve(m);
-
-    if (src.skind() == SharedArrayObj::Storage::ints) {
-        const auto &iv = src.flat_ints();
-        for (size_type i = 0; i < m; i++)
-            gv.emplace_back(EvalValue(iv[src.offset() + i]), false);
-    } else if (src.skind() == SharedArrayObj::Storage::floats) {
-        const auto &fv = src.flat_floats();
-        for (size_type i = 0; i < m; i++)
-            gv.emplace_back(EvalValue(fv[src.offset() + i]), false);
-    } else if (src.skind() == SharedArrayObj::Storage::strs) {
-        const auto &tv = src.flat_strs();
-        for (size_type i = 0; i < m; i++)
-            gv.emplace_back(EvalValue(SharedStr(tv[src.offset() + i])),
-                            false);
-    } else if (src.skind() == SharedArrayObj::Storage::objs) {
-        const auto &ov = src.flat_objs();
-        for (size_type i = 0; i < m; i++)
-            gv.emplace_back(obj_elem_value(ov[src.offset() + i]), false);
-    } else if (src.skind() != SharedArrayObj::Storage::bools) {
-        for (size_type i = 0; i < m; i++)      /* a flat struct array */
-            gv.emplace_back(arr_elem_boxed(src, i), false);
-    } else {
-        const auto &bv = src.flat_bools();
-        for (size_type i = 0; i < m; i++)
-            gv.emplace_back(EvalValue(static_cast<bool>(bv[src.offset() + i])),
-                            false);
-    }
-
-    return SharedArrayObj(std::move(gv));
-}
-
-/*
  * Read array element i (slice-relative) as a boxed value without promoting flat
  * (unboxed int/float) storage - the eval.cpp counterpart of types/arr.cpp.h's
  * arr_elem_at (a separate translation unit). For a general array get_view()
@@ -3885,12 +3838,10 @@ static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
 /*
  * The value a LiteralObj (a baked const array/dict/struct) materializes -
  * factored out of LiteralObj::do_eval so the VM's LoadLiteralObjV op reproduces
- * it BYTE-for-BYTE from a baked pool entry (value + immutable + arr_hint +
- * arr_hint_struct), AST-free (no LiteralObj node needed at run time).
+ * it BYTE-for-BYTE from a baked pool entry (value + immutable), AST-free (no
+ * LiteralObj node needed at run time).
  */
-EvalValue eval_literal_obj(const EvalValue &value, bool immutable,
-                           ArrHint arr_hint,
-                           const StructTypeDef *arr_hint_struct)
+EvalValue eval_literal_obj(const EvalValue &value, bool immutable)
 {
     /*
      * A const-decl target (immutable) shares the baked value directly: it was
@@ -3900,74 +3851,17 @@ EvalValue eval_literal_obj(const EvalValue &value, bool immutable,
      * other target (a `var` or a read-only consumer) gets a fresh mutable deep
      * copy, so writes work and re-entry never sees a prior mutation.
      *
-     * Type-driven: when the destination is dynamically typed (arr_hint general)
-     * but the baked array is flat (a homogeneous literal like [1,2,3] later
-     * widened to array<dyn> by a mixed write), materialize it general from the
-     * start so that write never promotes.
+     * The value is already in the storage its destination's type gives it:
+     * the passes that learn that type rebuild it (the parser's
+     * stamp_literal_annot, the inferencer's set_array_repr_hint and
+     * stamp_literal_repr - widen_baked_value), so nothing is converted here.
      */
-    if (!immutable && arr_hint == ArrHint::general && value.is<SharedArrayObj>()
-        && value.get<SharedArrayObj>().skind()
-               != SharedArrayObj::Storage::general)
-        return make_general_array_clone(value.get<SharedArrayObj>());
-
-    /* An empty baked array bound to an array<POD struct> destination starts
-     * flat (the const-fold erased the element type, so the hint restores it),
-     * so a built-up `var a = []; append(a, S(..))` stays unboxed. */
-    if (arr_hint == ArrHint::flat_s && arr_hint_struct &&
-        value.is<SharedArrayObj>() && value.get<SharedArrayObj>().size() == 0) {
-        StructTypeDef *def = const_cast<StructTypeDef *>(arr_hint_struct);
-        return SharedArrayObj(SharedArrayObj::svec_type({}, def, def->size));
-    }
-
-    /* The SCALAR twin (2026-07-18 profile #1): an empty baked `[]` whose
-     * destination is a known array<int>/<float>/<bool> - annotated OR
-     * inferred (`var a = []; push(a, i)` fixpoints to array<int>) - starts
-     * FLAT. The const-fold baked it before inference (element type
-     * unknowable), so only the hint can restore the representation; without
-     * this arm the entire grow-from-empty class ran on 48-byte general
-     * LValues (bench 13's shape). */
-    if (value.is<SharedArrayObj>()
-        && value.get<SharedArrayObj>().size() == 0) {
-        if (arr_hint == ArrHint::flat_i)
-            return SharedArrayObj(SharedArrayObj::ivec_type{});
-        if (arr_hint == ArrHint::flat_f)
-            return SharedArrayObj(SharedArrayObj::fvec_type{});
-        if (arr_hint == ArrHint::flat_b)
-            return SharedArrayObj(SharedArrayObj::bvec_type{});
-        if (arr_hint == ArrHint::flat_c)
-            return SharedArrayObj(SharedArrayObj::ovec_type{});
-    }
-
-    /* An array<C> of a class: a baked GENERAL array of class instances (a
-     * constant's, frozen) becomes the flat CLASS storage, as a literal
-     * evaluated at run time does (build_array_from_values) - the copy of
-     * each element make_mutable_clone would make is the element itself,
-     * a frozen instance being shared. */
-    if (!immutable && arr_hint == ArrHint::flat_c &&
-        value.is<SharedArrayObj>() &&
-        value.get_ref<SharedArrayObj>().skind()
-            == SharedArrayObj::Storage::general) {
-        const EvalValue m = make_mutable_clone(value);
-        const SharedArrayObj &ma = m.get_ref<SharedArrayObj>();
-        const size_type n = ma.size();
-        bool all = true;
-        for (size_type i = 0; i < n && all; i++)
-            all = is_obj_elem(ma.get_vec()[ma.offset() + i].get());
-        if (!all)
-            return m;
-        SharedArrayObj::ovec_type ov;
-        ov.v.reserve(n);
-        for (size_type i = 0; i < n; i++)
-            ov.push(obj_elem_ptr(ma.get_vec()[ma.offset() + i].get()));
-        return SharedArrayObj(std::move(ov));
-    }
-
     return immutable ? value : make_mutable_clone(value);
 }
 
 EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
 {
-    return eval_literal_obj(value, immutable, arr_hint, arr_hint_struct);
+    return eval_literal_obj(value, immutable);
 }
 
 /*

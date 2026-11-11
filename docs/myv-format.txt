@@ -2,8 +2,12 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 40.  This document describes the on-disk image exhaustively:
+Format version 41.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v41: a LiteralObj (9.10) loses its `arr_hint` and `arr_hint_struct`.  The
+compiler now builds a baked literal's value in the storage its destination
+gives it, so nothing reads a hint when the literal is loaded.)
 
 (v40: an `sref` may name one of the BINARY's own reflection structs by a
 reserved number (section 2) - in a struct value's def (11.3) and a member
@@ -991,10 +995,10 @@ interned twins (`catch_uids`) are DERIVED - re-interned at load, not stored
 
 9.10  LiteralObj - a baked const array/dict/struct literal
 
-    value value
+    value value             already in the storage its destination's
+                            type gives it (a flat array<int> is stored
+                            flat), so it is loaded as it is
     bool  immutable         a const decl, or an already-read-only value
-    u8    arr_hint          ArrHint, section 13
-    sref  arr_hint_struct   the POD struct type for a flat struct array
 
 9.11  BoxedCtor
 

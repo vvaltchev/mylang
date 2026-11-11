@@ -160,7 +160,7 @@ def chunk(r):
         for _ in range(r.u32()): r.loc(); r.loc()
     for _ in range(r.u32()): r.nx(r.sid)          # 9.9 catch_types
     for _ in range(r.u32()):                      # 9.10 literal_objs
-        value(r); r.boolv(); r.u8(); r.sref()
+        value(r); r.boolv()                       # (v41: no hint)
     r.nx(r.dref)                                  # closure_defs
     r.nx(r.sref)                                  # struct_defs
     for _ in range(r.u32()):                                # 9.11 boxed_ctors

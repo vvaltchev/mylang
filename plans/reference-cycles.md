@@ -217,8 +217,8 @@ semantics (README, *Values that contain themselves*):
   the allocation site's abstract object (whose contents it already
   models), `shape_of` -> `NumShape::other`; `keep_in_value` and
   `collect_value_descs` simply stop. `is_readonly_value`, `value_repr`,
-  `cse_key`, `make_general_array_clone` and `join` were checked and are
-  not recursive over values.
+  `cse_key`, `make_general_array_clone` (deleted 2026-11-11) and `join`
+  were checked and are not recursive over values.
 - **A cycle a compile-time call leaves in a LOCAL is kept too** (2026-10-08,
   after this work): an explicit `pure` call folded at parse time runs
   unresolved, so its locals are map entries of its body's BLOCK scopes,
