@@ -3077,7 +3077,7 @@ vm_run(VmProgram &prog)
         ctx.gfuncs = gtable.get();
     }
 
-    /* The reusable callback-invoke context (vm_try_invoke): parented to the
+    /* The reusable callback-invoke context (VmInvoker): parented to the
      * ROOT (a callback body must not see its caller - lexical scoping; it
      * inherits gfuncs/frame from the root, func_ctx gives it its own
      * FlowState). Built once, after the root ctx is complete. */
@@ -8129,7 +8129,7 @@ vm_capture_desc_frame(Exception &e, const FuncDescriptor *d,
 }
 
 /* #60 (b): the bare dispatch loop, split out of vm_run_chunk so a builtin
- * CALLBACK loop (VmInvoker / vm_try_invoke) that already owns the activation +
+ * CALLBACK loop (VmInvoker) that already owns the activation +
  * boundary window + g_current_ctx re-enters it PER ELEMENT with ZERO entry
  * setup (no EntryGuard construct/destruct, no vm_enter_invocation_fast, no
  * CtxGuard). vm_run_chunk = the entry prologue + this. `act` is the caller's
@@ -8138,111 +8138,10 @@ static void vm_dispatch(const Chunk &chunk0, EvalContext &ctx,
                         VmActivation &act, size_t start_pc = 0);
 
 /*
- * Phase D (plans/archived/vm-native-call-stack.md): a builtin's USER-CALLBACK call
- * (map/filter/sort's comparator/make_dict's generator/find's keyfunc, via
- * eval_func) runs the callee as a BOUNDARY frame on the CURRENT activation
- * - the per-element do_func_call + EvalContext construction is gone; the
- * cost is one window push/bind/pop plus the loop entry. Returns false
- * (nothing done) when the invoke path isn't available: no activation /
- * invoke context (a tree-walk or const-eval caller), or a chunk-less
- * callee - the caller falls back to do_func_call. Exception contract as
- * do_func_call with as_signal=false: a C++ throw and the pending signal
- * both surface as a C++ throw carrying this frame's backtrace entry.
- */
-bool vm_try_invoke(EvalContext *caller_ctx, FuncObject &obj,
-                   const EvalValue *argv, size_t n, EvalValue &out)
-{
-    if (g_exec_engine != ExecEngine::Vm || !g_vm_act
-            || !g_vm_act->invoke_ctx || caller_ctx->in_const_eval())
-        return false;
-    if (!obj.func->vm_chunk_tried || !obj.func->vm_chunk)
-        return false;
-
-    VmActivation &act = *g_vm_act;
-    EvalContext &c = *act.invoke_ctx;
-    const FuncDescriptor *d = obj.func;
-    const Chunk *cck = static_cast<const Chunk *>(d->vm_chunk);
-    const size_t nparams = d->params.size();
-    if (n > nparams || n < static_cast<size_t>(d->min_args))
-        throw InvalidNumberOfArgsEx();
-    /* RULE 1: a callback's argument (a dyn container's element) may be
-     * none, or (#49) misfit a typed parameter - refused before the window
-     * is pushed */
-    const BindFault nf = bind_fault_in_range(d, n,
-                       [&](size_t i) -> const EvalValue & {
-                           return argv[i];
-                       });
-    if (nf.idx >= 0)
-        throw bind_fault_error(d, nf, -1);
-
-    const int_type total =
-        d->frame_size + static_cast<int_type>(cck->n_temps);
-    Frame *w = act.push_window(total, cck, /*boundary=*/true);
-
-    struct Restore {
-        VmActivation &a;
-        EvalContext &c;
-        CaptureSlots *caps;
-        EvalContext *gctx;                 /* #60: saved g_current_ctx */
-        ~Restore() {
-            g_current_ctx = gctx;
-            a.pop_window();
-            c.captures = caps;
-        }
-    } restore{act, c, c.captures, g_current_ctx};
-    /* #60: announce the callback ctx here (vm_dispatch runs without a CtxGuard,
-     * so this is the store the entry prologue would otherwise do; jit_ret reads
-     * g_current_ctx). */
-    g_current_ctx = &c;
-
-    /* Bind from the pre-evaluated values (do_func_bind_params' value
-     * overloads' exact semantics: non-const, none for omitted trailing opt
-     * params, i/f coercion; a bind throw pops WITHOUT capturing). */
-    if (d->fast_bind) {
-        for (size_t i = 0; i < n; i++)
-            w->at(static_cast<int_type>(i)).rebind(argv[i]);
-        for (size_t i = n; i < nparams; i++)
-            w->at(static_cast<int_type>(i)).rebind(EvalValue());
-    } else {
-        for (size_t i = 0; i < nparams; i++) {
-            const FuncDescriptor::ParamDesc &p = d->params[i];
-            EvalValue val = i < n ? argv[i] : EvalValue();
-            if (p.decl_type == DeclType::i || p.decl_type == DeclType::f)
-                val = vm_coerce_decl_num(val, p.decl_type == DeclType::f);
-            w->at(static_cast<int_type>(i)).rebind(std::move(val));
-        }
-    }
-
-    c.captures = &obj.capture_slots;
-    c.flow->type = FlowState::none;
-
-    /* #60 (b): re-enter the dispatch loop DIRECTLY - the window + captures +
-     * g_current_ctx are already set up above, so no vm_run_chunk entry setup. */
-    try {
-        vm_dispatch(*cck, c, act);
-    } catch (Exception &e) {
-        vm_capture_desc_frame(e, d);
-        throw;
-    }
-
-    if (g_vm_exc_pending) {
-        vm_capture_desc_frame(*g_vm_exc_pending, d);
-        std::unique_ptr<RuntimeException> ex = std::move(g_vm_exc_pending);
-        ex->rethrow();
-    }
-
-    if (c.flow->type == FlowState::ret) {
-        c.flow->type = FlowState::none;
-        out = std::move(c.flow->value);
-    } else {
-        out = EvalValue();
-    }
-    return true;
-}
-
-/*
- * VmInvoker (vm.h): the prepared per-loop callback invoker. The ctor gates
- * exactly like vm_try_invoke and pushes ONE boundary window; invoke()
+ * VmInvoker (vm.h): the prepared per-loop callback invoker (Phase D,
+ * plans/archived/vm-native-call-stack.md). The ctor gates on an
+ * activation to run on - the VM engine, an invoke context, not const-eval,
+ * a callee with a chunk - and pushes ONE boundary window; invoke()
  * rebinds the param slots, resets the reusable flow, re-enters the loop,
  * and resets the window's REFERENCE slots afterwards (per-call frame-death
  * semantics: references die where a fresh frame's would; stale trivial
@@ -9145,7 +9044,7 @@ vm_frame_leave_body(VmActivation &act, EvalContext &ctx, EvalValue &&res)
  * return the resume SENTINEL - EnterNative switches to the parent. BOUNDARY
  * frame: set flow (the do_func_call / callback contract, like the interpreted
  * ReturnV boundary path) and return the boundary sentinel - EnterNative stops
- * the invocation; the C++ caller (vm_try_invoke / VmInvoker) pops the window.
+ * the invocation; the C++ caller (VmInvoker) pops the window.
  * noexcept: a fully-native leaf body is throw-free, so nothing here throws.
  *
  * C4c: the COMMON shape of this function (non-boundary, no cache key, no
@@ -9353,7 +9252,7 @@ vm_cache_probe_vals(EvalContext &ctx, const FuncDescriptor *d,
 /*
  * M5 LEAN SYNC ENTER (inc 3; plans/archived/model-flip.md): a fragment's call op runs
  * the callee to completion INSIDE the helper and the CALLER CONTINUES
- * NATIVELY. Inc 1 used vm_try_invoke's BOUNDARY machinery (arg value copy,
+ * NATIVELY. Inc 1 used VmInvoker's BOUNDARY machinery (arg value copy,
  * boundary window, flow round-trip) - measured heavier than the interpreted
  * vm_enter_call it displaces (76_funcval 1.16x, 11_closure 1.23x). This
  * reuses the interpreted call's OWN lean protocol: vm_frame_setup pushes a

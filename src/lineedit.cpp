@@ -260,22 +260,6 @@ void LineEditor::kill_word()
     buf.erase(pos, end - pos);
 }
 
-void LineEditor::word_left()
-{
-    while (pos && isspace(static_cast<unsigned char>(buf[pos - 1])))
-        pos--;
-    while (pos && !isspace(static_cast<unsigned char>(buf[pos - 1])))
-        pos--;
-}
-
-void LineEditor::word_right()
-{
-    while (pos < buf.size() && isspace(static_cast<unsigned char>(buf[pos])))
-        pos++;
-    while (pos < buf.size() && !isspace(static_cast<unsigned char>(buf[pos])))
-        pos++;
-}
-
 void LineEditor::hist_prev()
 {
     if (!hist || hist->empty())
