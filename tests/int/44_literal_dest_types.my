@@ -90,6 +90,32 @@ array<array<P>> app = [[P(one, 1)], []];
 append(app[1], P(2, 2));
 want("app", str(app[1][0].y), "2.000000");
 
+# --- a constant literal ASSIGNED to a declared variable: baked at parse
+# time like a declaration's, but only inference knows its destination
+array<float?> asg;
+asg = [1.5, 2];
+asg[0] = none;
+want("asg", str(asg), "[<none>, 2.000000]");
+want("asg storage", array_storage(asg), "general");
+array<dyn> asd;
+asd = [1, 2];
+asd[0] = "s";
+want("asd", str(asd), "[\"s\", 2]");
+array<float> asf;
+asf = [1, 2];
+want("asf", str(asf) + array_storage(asf), "[1.000000, 2.000000]float");
+array<array<float?>> asm;
+asm = [[1], [2]];
+asm[1][0] = none;
+want("asm", str(asm), "[[1.000000], [<none>]]");
+dict<str, array<dyn>> asdd;
+asdd = {"k": [1]};
+asdd["k"][0] = "u";
+want("asdd", str(asdd), "{\"k\": [\"u\"]}");
+asm[0] = [3, 4];
+asm[0][1] = none;
+want("asm elem", str(asm[0]), "[3.000000, <none>]");
+
 # --- typed constants: widened by the parser when it binds them
 const array<float> KF = [1, 2];
 want("KF", str(KF), "[1.000000, 2.000000]");

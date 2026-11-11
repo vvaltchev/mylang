@@ -979,11 +979,8 @@ static void stamp_literal_annot(Construct *lit, const TypeAnnot *a, bool dyn)
             return;
         WidenShape w;
         widen_shape_of_annot(a, w);
+        /* (in its storage too: see stamp_literal_repr) */
         lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
-        if (w.k == 'a' && w.hint != ArrHint::dflt) {
-            lo->arr_hint = w.hint;
-            lo->arr_hint_struct = w.hint_struct;
-        }
     }
 }
 

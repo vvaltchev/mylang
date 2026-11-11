@@ -6634,11 +6634,10 @@ void Inferencer::stamp_literal_repr(Construct *lit, StaticTypeRef dest)
             return;
         WidenShape w;
         widen_shape_of(dest, w);
+        /* and its storage: widen_baked_value rebuilds an array in the
+         * storage w.hint names, so the node needs no hint of its own
+         * (a value that cannot take it is one this pass refuses) */
         lo->set_literal_value(widen_baked_value(lo->literal_value(), w));
-        if (w.k == 'a' && w.hint != ArrHint::dflt) {
-            lo->arr_hint = w.hint;
-            lo->arr_hint_struct = w.hint_struct;
-        }
         return;
     }
     default:
