@@ -24031,6 +24031,58 @@ static bool highlight_multiline_carries_state()
     return st == HL_NONE && c2.find(COM) != std::string::npos;
 }
 
+/* Each token class, rendered exactly (2026-11-11: the type words, the
+ * bang identifier, escapes and the carried states had no case - a
+ * coverage gap the TTY sessions only brushed). */
+static bool highlight_token_classes()
+{
+    set_highlight_enabled(true);
+    const std::string R = "\033[0m", KW = "\033[38;5;39m",
+        STR = "\033[38;5;114m", COM = "\033[38;5;244m",
+        TY = "\033[38;5;79m";
+    /* every type word is colored as a type; `_x` and `f$0` are plain
+     * identifiers; `get!` keeps its bang, `x!=y` does not */
+    const std::string types = "int a; float b; bool c; str d; array e; "
+                              "dict f; _x = f$0;";
+    const std::string h = highlight_line(types);
+    for (const char *w : { "int", "float", "bool", "str", "array", "dict" })
+        if (h.find(TY + w + R) == std::string::npos)
+            return false;
+    if (h.find("_x") == std::string::npos
+            || h.find("f$0") == std::string::npos
+            || strip_ansi(h) != types)
+        return false;
+    if (highlight_line("get!(d)") != "get!(d)"
+            || highlight_line("x!=y") != "x!=y")
+        return false;
+    /* an escaped quote stays inside the string, on one line and across */
+    if (highlight_line("\"a\\\"b\" x")
+            != STR + "\"a\\\"b\"" + R + " x")
+        return false;
+    int st = HL_NONE;
+    highlight_line("s = \"one", st);
+    if (st != HL_STRING
+            || highlight_line("tw\\\"o\" + x", st)
+                   != STR + "tw\\\"o\"" + R + " + x"
+            || st != HL_NONE)
+        return false;
+    /* a carried string or comment that does not close on the line */
+    st = HL_STRING;
+    if (highlight_line("still open", st) != STR + "still open" + R
+            || st != HL_STRING)
+        return false;
+    st = HL_COMMENT;
+    if (highlight_line("no close", st) != COM + "no close" + R
+            || st != HL_COMMENT)
+        return false;
+    /* a block comment closed on its own line, then code, then `#` */
+    st = HL_NONE;
+    const std::string bc = highlight_line("/* c */ if # t", st);
+    return st == HL_NONE
+        && bc == COM + "/* c */" + R + " " + KW + "if" + R + " " + COM
+                 + "# t" + R;
+}
+
 static bool has_cand(const std::vector<std::string> &v, const std::string &s)
 {
     return std::find(v.begin(), v.end(), s) != v.end();
@@ -35949,9 +36001,13 @@ static bool myv_names_required()
     return ok;
 }
 
+/* One program's image, every 4-byte-aligned word overwritten in turn:
+ * see myv_corrupt_refused. */
+static bool myv_corrupt_sweep(const char *const *lines_arr, size_t nlines);
+
 static bool myv_corrupt_refused()
 {
-    const char *lines_arr[] = {
+    static const char *const prog1[] = {
         "struct P { int x; float y; }",
         "func mk(int n) { return P(n, float(n) * 1.5); }",
         "func dist(P p) { return p.x * p.x + int(p.y); }",
@@ -35967,11 +36023,43 @@ static bool myv_corrupt_refused()
         "s += bump();",
         "try { throw P(1, 2.0); } catch (P as e) { s += e.x; }",
         "print(s);" };
+    /* 2026-11-11: the opcodes whose verifier rows the first program never
+     * reaches - a box, a typed multi-assignment, a class array, a flat
+     * struct array literal and an in-place construction, an in-place
+     * builtin on a member, a math builtin, a value call through `dyn`,
+     * a fused add-mod, a closure returned from a factory */
+    static const char *const prog2[] = {
+        "struct P { int x; int y; }",
+        "struct Q { int a; array<int> b; }",
+        "class N { int v; }",
+        "var bx = box(5);",
+        "array<int> pr = [int(runtime(1)), 2];",
+        "int a, b = pr;",
+        "var q = Q(a, [b]);",
+        "var ns = [N(1), N(2)];",
+        "var pts = [P(1, 2), P(int(runtime(3)), 4)];",
+        "for (var i = 0; i < 3; i++) { append(pts, P(i, i)); }",
+        "append(q.b, 3);",
+        "var rows = [[1], [2]];",
+        "rows[0] = runtime([5]);",
+        "var m = sqrt(float(runtime(16)));",
+        "var dyn f = runtime(func(x) => x + 1);",
+        "var t = 0;",
+        "for (var i = 0; i < 9; i++) { t = (t + 1) % 5; }",
+        "func mkc(n) { var c = n; return func[c]() { c += 1; return c; }; }",
+        "var g = mkc(int(runtime(7)));",
+        "print(*bx + a + b + q.b[1] + ns[1].v + pts[3].x + int(m) + f(1)",
+        "      + g() + t + rows[0][0]);" };
+    return myv_corrupt_sweep(prog1, sizeof(prog1) / sizeof(prog1[0]))
+        && myv_corrupt_sweep(prog2, sizeof(prog2) / sizeof(prog2[0]));
+}
 
+static bool myv_corrupt_sweep(const char *const *lines_arr, size_t nlines)
+{
     std::string src;
-    for (const char *l : lines_arr) {
+    for (size_t i = 0; i < nlines; i++) {
         if (!src.empty()) src += '\n';
-        src += l;
+        src += lines_arr[i];
     }
 
     std::string tdir = "/tmp";
@@ -59957,6 +60045,8 @@ static const std::vector<extra_check> extra_checks =
       highlight_float_exponent },
     { "highlight: tolerates an unterminated string",
       highlight_tolerates_unterminated_string },
+    { "highlight: every token class, rendered exactly",
+      highlight_token_classes },
     { "highlight: a string/comment is colored across lines",
       highlight_multiline_carries_state },
     { "lineedit: typing and backspace", lineedit_typing_and_backspace },
