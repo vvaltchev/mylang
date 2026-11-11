@@ -7048,7 +7048,13 @@ per level of a deep value - a separate open item.
   parser's `stamp_literal_annot` stamp a LiteralObj only when it is set -
   they stamped every one, so a folded `clone(K)` / `sort(K)` / `a + b`
   bound to a `dyn` variable was general where `-nc` kept it flat, and a
-  write the program refused under `-nc` succeeded.
+  write the program refused under `-nc` succeeded. **And where it takes
+  the hint, `set_array_repr_hint` REBUILDS the value in that storage
+  (2026-11-11)** - the parse folded it with no destination, and
+  `LiteralObj::do_eval` converts only an EMPTY array to a flat hint, so a
+  folded `var v = values({"a": 1})` stayed general where `-nc` built it
+  flat: the same RULE 2 difference in the other direction
+  (`tests/functional/109_folded_builtin_storage.my`).
   The fixpoint propagates the destination type through direct aliases
   (`var b = a`), so they agree. Value-driven flat (`dflt`) is the fallback for
   contexts the hint doesn't cover. The flat fast paths (each branches on

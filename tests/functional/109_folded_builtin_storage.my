@@ -1,0 +1,61 @@
+# A builtin call that builds an array for its destination's type (keys,
+# values, map, filter, range, make_array) builds it in the storage that
+# type gives - flat for an array<int> / <float> / <bool> - folded or not.
+# Folded at compile time (every argument constant), the value was built
+# with no destination and kept GENERAL, while the same call run unfolded
+# (-nc) built it flat: a store of another kind through a `dyn` alias was
+# accepted in one and refused in the other. README, array_storage: an
+# array's storage is decided from its proven static type.
+#
+# Untyped (-nti) nothing is proven, so every array is general and every
+# store is accepted; the count is asserted only on a typed run.
+
+var typed = typestr(runtime(0)) == "dyn";
+
+func launder(dyn x) { x[0] = "s"; }
+
+func t(what, a) {
+    var dyn st = array_storage(a);
+    try {
+        launder(a);
+        print(what, st, "accepted");
+        return 0;
+    } catch (TypeErrorEx) {
+        print(what, st, "refused");
+        return 1;
+    }
+}
+
+var n = 0;
+var a1 = values({"a": true, "b": false});
+n += t("values bool", a1);
+var a2 = values({"a": 1, "b": 2});
+n += t("values int", a2);
+var a3 = keys({1: "x", 2: "y"});
+n += t("keys int", a3);
+var a4 = map(pure func(x) => x * 2, [1, 2, 3]);
+n += t("map int", a4);
+var a5 = map(pure func(x) => x > 1, [1, 2, 3]);
+n += t("map bool", a5);
+var a6 = filter(pure func(x) => x > 1, [1, 2, 3]);
+n += t("filter int", a6);
+var a7 = map(pure func(x) => x * 0.5, [1, 2]);
+n += t("map float", a7);
+var a8 = range(3);
+n += t("range", a8);
+var a9 = make_array(3, pure func(i) => i * 2);
+n += t("make_array", a9);
+var a10 = keys({true: 1});
+n += t("keys bool", a10);
+var a11 = values({"a": 1.5});
+n += t("values float", a11);
+
+# a `dyn` destination: general, so the same store is accepted
+var dyn d1 = keys({"a": 1, "b": 2});
+n += t("dyn keys", d1);
+var dyn d2 = values({"a": 1});
+n += t("dyn values", d2);
+
+if (typed)
+    assert(n == 11);
+print(n);
