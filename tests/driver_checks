@@ -1527,6 +1527,15 @@ else
 fi
 flag "--source ROOT finds the moved source" 1 \
      '^    print\(x / runtime\(0\)\);' --source "$TMP/moved" "$TMP/q.myv"
+# an edit that keeps the file's SIZE: only the CRC can tell
+printf 'var x = 4;\nprint(x / runtime(0));\n' > "$TMP/moved/sub/q.my"
+out=$("$BIN" --source "$TMP/moved" "$TMP/q.myv" 2>&1)
+if printf '%s' "$out" | grep -q 'has changed since .* ignoring it' &&
+   ! printf '%s' "$out" | grep -q 'print(x'; then
+    pass "a changed source of the same size is ignored, with a warning"
+else
+    fail "a same-size edit: $(printf '%s' "$out" | head -c 300)"
+fi
 printf 'var x = 3;\nprint(x / runtime(0)); # edited\n' > \
     "$TMP/moved/sub/q.my"
 out=$("$BIN" --source "$TMP/moved" "$TMP/q.myv" 2>&1)
