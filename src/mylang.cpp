@@ -424,7 +424,15 @@ parse_args(int argc, char **argv)
 
         } else if (!strcmp(arg, "--weights")) {
 
-            run_weight_bench(); exit(0);
+            /* an optional iteration count per measured node: a small one
+             * makes the numbers noise and the run instant, which is how
+             * driver_checks runs the tool */
+            long iters = 20000000;
+            char *end = nullptr;
+            const long n = argc < 2 ? -1 : strtol(argv[1], &end, 10);
+            if (n > 0 && end != argv[1] && *end == '\0')
+                iters = n;
+            run_weight_bench(iters); exit(0);
 
         } else if (!strcmp(arg, "-t")) {
 
