@@ -1,6 +1,8 @@
 # The call protocol: direct calls, recursion (the C4c inline frame pop),
-# a cached recursive call, a closure with captured state, and a callback
-# through a builtin (the VmInvoker boundary path).
+# a cached recursive call, a closure with captured state, a callback
+# through a builtin (the VmInvoker boundary path), and a closure that
+# captures a BUILTIN by name - at run time, from a function, and inside a
+# pure function the compiler runs (its capture is the builtin's slot).
 func add(a, b) { var t = a + b; return t; }
 func sumto(n) { if (n == 0) { return 0; } var t = sumto(n - 1); return t + n; }
 func fib(n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }
@@ -10,3 +12,11 @@ var r = [add(2, 3), sumto(6), fib(9), c(5), c(7)];
 var arr = [5, 2, 8, 1, 9];
 sort(arr, func(a, b) => a < b);
 print("calls:", r[0], r[1], r[2], r[3], r[4], arr[0], arr[4]);
+var clen = func [len] (a) { return len(a) * 10; };
+func mkabs() { return func [abs] (x) => abs(x) + 1; }
+pure func pkabs() { return func [abs] (x) => abs(x); }
+const KABS = pkabs()(-7);
+assert(clen(runtime([1, 2, 3])) == 30);
+assert(mkabs()(int(runtime(-4))) == 5);
+assert(KABS == 7);
+print("captured builtins:", clen([1]), KABS);
