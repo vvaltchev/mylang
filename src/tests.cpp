@@ -35563,6 +35563,111 @@ static bool myv_root_slot_count_checked()
 }
 
 /*
+ * 2026-11-12 (myv_fuzz, CI seed 43176902900, fat-276): a flat struct
+ * array in an image carries its element STRIDE, and the loader took it on
+ * trust - a mutated stride made vm_emplace_struct copy `stride` bytes out
+ * of a buffer of the struct's size (an ASan stack-buffer-overflow). The
+ * stride must be the POD struct's computed size; the intact image loads
+ * and runs.
+ */
+static bool myv_struct_array_stride_checked()
+{
+    const char *lines_arr[] = {
+        "struct P { int x; float y; }",
+        "const PS = [P(1, 2.5), P(3, 4.5)];",
+        "var ps = clone(PS);",
+        "append(ps, P(int(runtime(5)), 6.5));",
+        "print(len(ps), ps[2].x);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        Chunk::LiteralObjEntry *lit = nullptr;
+        for (auto &lo : prog.root.literal_objs)
+            if (lo.value.is<SharedArrayObj>()
+                    && lo.value.get_ref<SharedArrayObj>().skind()
+                       == SharedArrayObj::Storage::structs)
+                lit = &lo;
+        if (!lit) {
+            fprintf(stderr, "myv_struct_array_stride_checked: no flat "
+                            "struct array in the literal pool (vacuous)\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        const EvalValue pristine = lit->value;
+        const auto &sv =
+            pristine.get_ref<SharedArrayObj>().flat_structs();
+        StructTypeDef *def = sv.def;
+        const int size = sv.stride;
+        std::string tdir = "/tmp";
+        for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+            const std::optional<std::string> e = env_get(var);
+            if (e && !e->empty()) { tdir = *e; break; }
+        }
+        while (tdir.size() > 1
+               && (tdir.back() == '/' || tdir.back() == '\\'))
+            tdir.pop_back();
+        const std::string path = tdir + "/mylang-myv-stride.myv";
+        const auto refused = [&](int stride) -> bool {
+            lit->value = SharedArrayObj(SharedArrayObj::svec_type(
+                std::vector<char>(static_cast<size_t>(2 * stride)), def,
+                stride));
+            myv_write(prog, path, MyvSourceRef());
+            try {
+                MyvSource img_src;
+                VmProgram loaded = myv_read(path, img_src);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError" && e.msg
+                        && strstr(e.msg, "does not match its struct"))
+                    return true;
+                fprintf(stderr, "myv_struct_array_stride_checked [%d]: "
+                                "threw %s: %s\n", stride, e.name,
+                        e.msg ? e.msg : "");
+                return false;
+            }
+            fprintf(stderr, "myv_struct_array_stride_checked [%d]: "
+                            "ACCEPTED\n", stride);
+            return false;
+        };
+        ok = refused(size + 8) && ok;            /* a wider element */
+        ok = refused(size - 8) && ok;            /* a narrower one */
+        lit->value = pristine;
+        myv_write(prog, path, MyvSourceRef());   /* intact: loads + runs */
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(loaded);
+        } catch (Exception &) {
+        }
+        std::cout.rdbuf(old_buf);
+        if (cap.str().find("3 5") == std::string::npos) {
+            fprintf(stderr, "myv_struct_array_stride_checked: ran to "
+                            "\"%s\"\n", cap.str().c_str());
+            ok = false;
+        }
+        std::remove(path.c_str());
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_struct_array_stride_checked: threw %s: %s\n",
+                e.name, e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
  * 2026-10-21 (myv_fuzz fat-258): a PushHandler naming an EMPTY handler
  * site - no catch clause, no finally, no chain - is refused at load.
  * Codegen leaves an empty site only as a hole no PushHandler names; one a
@@ -59612,6 +59717,8 @@ static const std::vector<extra_check> extra_checks =
     { "myv: v19 - the root chunk's slot_count and the stored root slot "
       "count must agree, either copy mutated is refused",
       myv_root_slot_count_checked },
+    { "myv: a flat struct array's stride must be its struct's size "
+      "(myv_fuzz fat-276)", myv_struct_array_stride_checked },
     { "myv: a PushHandler naming an empty handler site is refused "
       "(myv_fuzz fat-258)", myv_empty_handler_refused },
     { "myv: an indirect call's arg0 descriptor and an in-place builtin's "

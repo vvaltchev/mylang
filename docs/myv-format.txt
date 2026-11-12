@@ -1203,7 +1203,11 @@ constant 'S.K'" - and writes no file.  A reader therefore never meets one.
         floats    n x f64
         bools     n x bool
         strs      n x str
-        structs   sref def; u32 stride; then n*stride RAW BYTES
+        structs   sref def; u32 stride; then n*stride RAW BYTES.  The
+                  def must be a POD struct (not a class) whose computed
+                  size is `stride` - an element is that struct's bytes -
+                  else "corrupt .myv (a struct value does not match its
+                  struct)"; checked once every layout is computed
         objs      n x value (v34), each a `cls` record (11.4) or `none`,
                   else "corrupt .myv (class array element)"
         general   n x value
