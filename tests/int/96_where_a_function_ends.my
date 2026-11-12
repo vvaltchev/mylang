@@ -1,0 +1,11 @@
+# INT-SOURCE: ../functional/108_where_a_function_ends.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107) over tests/functional/108_where_a_function_ends.my:
+# where a function can end (Inferencer::always_exits): a
+# return from inside `while (true)`, from both arms of a try / catch,
+# and the shapes that can still fall through.
+#
+# It runs as a coverage unit under the engines above, with no second
+# copy (INT-SOURCE): code no other unit reaches. It asserts its own
+# results, and every engine must print the same.

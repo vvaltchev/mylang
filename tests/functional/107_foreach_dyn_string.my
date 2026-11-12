@@ -67,3 +67,16 @@ var parts = [];
 foreach (c in s)
     append(parts, c + c);
 assert(join(parts, ",") == "aa,bb,cc");
+
+# a character is not an array: unpacking one is a TypeErrorEx
+func unpack2(dyn d) {
+    try {
+        foreach (a, b in d)
+            return "no";
+    } catch (TypeErrorEx) {
+        return "TypeErrorEx";
+    }
+    return "empty";
+}
+assert(unpack2(s) == "TypeErrorEx");
+assert(unpack2(runtime("")) == "empty");
