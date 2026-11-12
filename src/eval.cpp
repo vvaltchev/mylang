@@ -4611,7 +4611,7 @@ no_side_effects(const Construct *c)
     }
     if (auto *m = node_cast<const MemberExpr>(c))
         return no_side_effects(m->what.get());
-    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+    if (auto *mo = node_cast<const MultiOpConstruct>(c)) {
         for (const auto &pr : mo->elems)
             if (!no_side_effects(pr.second.get()))
                 return false;

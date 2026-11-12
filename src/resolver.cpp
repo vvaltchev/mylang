@@ -1129,7 +1129,7 @@ private:
             return;                    /* leave capture list / name alone */
         }
 
-        if (auto *mo = dynamic_cast<MultiOpConstruct *>(c)) {
+        if (auto *mo = node_cast<MultiOpConstruct>(c)) {
             bool all_lit = true;
             for (auto &p : mo->elems) {
                 fold_reads(p.second, fc);
@@ -1228,7 +1228,7 @@ private:
             return;
         }
 
-        if (auto *sc = dynamic_cast<SingleChildConstruct *>(c)) {
+        if (auto *sc = node_cast<SingleChildConstruct>(c)) {
             fold_reads(sc->elem, fc);
             return;
         }
@@ -5424,8 +5424,8 @@ private:
             auto *lb = node_cast<const LiteralInt>(b);
             return lb && la->ival() == lb->ival();
         }
-        if (auto *ma = dynamic_cast<const MultiOpConstruct *>(a)) {
-            auto *mb = dynamic_cast<const MultiOpConstruct *>(b);
+        if (auto *ma = node_cast<const MultiOpConstruct>(a)) {
+            auto *mb = node_cast<const MultiOpConstruct>(b);
             if (!mb || ma->elems.size() != mb->elems.size())
                 return false;
             for (size_t i = 0; i < ma->elems.size(); i++)
@@ -7164,7 +7164,7 @@ private:
     /* A read-expression node we may try to evaluate-and-fold. */
     static bool is_foldable_expr(const Construct *c)
     {
-        return dynamic_cast<const MultiOpConstruct *>(c)
+        return node_cast<const MultiOpConstruct>(c)
             || ctag(c) == ConstructType::typed_scalar  /* M8: cross-input */
             || ctag(c) == ConstructType::subscript
             || ctag(c) == ConstructType::slice

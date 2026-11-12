@@ -4447,7 +4447,7 @@ cse_key_rec(ParseContext &c, const Construct *node, string &out)
     }
 
     if (const MultiOpConstruct *mo =
-            dynamic_cast<const MultiOpConstruct *>(node))
+            node_cast<const MultiOpConstruct>(node))
     {
         out += "M(";
         for (const auto &pr : mo->elems) {

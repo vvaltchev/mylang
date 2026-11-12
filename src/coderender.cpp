@@ -155,7 +155,7 @@ struct Renderer {
                 return 8;
             return e->elems.size() > 1 ? op_prec(e->elems[1].first) : 8;
         }
-        if (auto *m = dynamic_cast<const MultiOpConstruct *>(c)) {
+        if (auto *m = node_cast<const MultiOpConstruct>(c)) {
             if (node_cast<const Expr02>(c))
                 return 8;
             return m->elems.size() > 1 ? op_prec(m->elems[1].first) : 8;

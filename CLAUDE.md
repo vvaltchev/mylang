@@ -9889,9 +9889,9 @@ the passes the same way - `ctag(e) == ConstructType::x` is exactly
 null -> `other`, which no real node carries), so ~400 guarded arms in
 inferencer/resolver/codegen became tag tests via a scripted transform
 restricted to leaf classes and double-eval-safe operands. Casts to a
-BASE (SingleChild/MultiOp/MultiElem/Literal) or to a CallExpr SUBCLASS
-(Direct/Cached/DirectBuiltin - they share the `call` tag) stay
-dynamic_cast. Total: 139.7M -> 23.8M on 83's compile, -83%.
+BASE whose subtree is not a tag range (MultiElem/Literal) or to a
+CallExpr SUBCLASS (Direct/Cached/DirectBuiltin - they share the `call`
+tag) stay dynamic_cast. Total: 139.7M -> 23.8M on 83's compile, -83%.
 **The forms that BIND the result went next (2026-11-11): `if (auto *x =
 dynamic_cast<const X *>(e))` is `node_cast<const X>(e)`** (syntax.h) -
 a tag compare for a class with a `NodeTag` row, which a `final` node
@@ -9903,6 +9903,11 @@ COVERAGE UNIVERSE: dynamic_cast tests its operand for null first, a
 branch gcov charged to every call site and almost no operand could
 take - about 1,000 uncoverable elements. **A new `final` node class
 gets a `NodeTag` row; write `node_cast`, not a leaf dynamic_cast.**
+The two family BASES whose subtree is a CONTIGUOUS tag range,
+`SingleChildConstruct` and `MultiOpConstruct` (`is_single_ct` /
+`is_multiop_ct`), go through it too since 2026-11-12 (`NodeIs`, 23
+sites; -vd identical over 300 programs): a new class joining either
+family must take a tag INSIDE its range, or the ML_CHECK aborts.
 
 ## Conventions
 

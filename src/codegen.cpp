@@ -105,10 +105,10 @@ void collect_slot_names(const Construct *c, std::vector<std::string> &names)
         return;
     }
     auto rec = [&](const Construct *ch) { collect_slot_names(ch, names); };
-    if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c)) {
+    if (auto *sc = node_cast<const SingleChildConstruct>(c)) {
         rec(sc->elem.get()); return;
     }
-    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+    if (auto *mo = node_cast<const MultiOpConstruct>(c)) {
         for (auto &p : mo->elems) rec(p.second.get());
         return;
     }
@@ -218,7 +218,7 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
                 return false;
         return true;
     };
-    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+    if (auto *mo = node_cast<const MultiOpConstruct>(c)) {
         for (const auto &pr : mo->elems)
             if (!struct_fe_body_ok(pr.second.get(), loop_slot, def, false))
                 return false;
@@ -237,7 +237,7 @@ static bool struct_fe_body_ok(const Construct *c, int loop_slot,
                 return false;
         return true;
     }
-    if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c))
+    if (auto *sc = node_cast<const SingleChildConstruct>(c))
         return struct_fe_body_ok(sc->elem.get(), loop_slot, def, false);
     if (auto *ce = node_cast<const CallExpr>(c))
         return all({ce->what.get(), ce->args.get()});
@@ -355,7 +355,7 @@ static bool struct_fe_body_inert(const Construct *c,
     if (node_cast<const CallExpr>(c))
         return false;                     /* user code, or a builtin that
                                            * may mutate / call back */
-    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(c)) {
+    if (auto *mo = node_cast<const MultiOpConstruct>(c)) {
         for (const auto &pr : mo->elems)
             if (!struct_fe_body_inert(pr.second.get(), shift_only))
                 return false;
@@ -375,7 +375,7 @@ static bool struct_fe_body_inert(const Construct *c,
     }
     if (node_cast<const InlinedCallExpr>(c) && !shift_only)
         return false;                     /* a spliced body: not audited */
-    if (auto *sc = dynamic_cast<const SingleChildConstruct *>(c))
+    if (auto *sc = node_cast<const SingleChildConstruct>(c))
         return struct_fe_body_inert(sc->elem.get(), shift_only);
     if (auto *sub = node_cast<const Subscript>(c))
         return all({sub->what.get(), sub->index.get()});

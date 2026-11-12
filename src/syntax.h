@@ -2593,9 +2593,11 @@ public:
 /*
  * node_cast<T>(c) is dynamic_cast<T *>(c) for a node class whose tag NO
  * class outside its own subtree carries: a `final` class (its tag is its
- * alone), or CallExpr (every class tagged `call` is a CallExpr). T may be
- * const-qualified, exactly as the dynamic_cast's target was; a class
- * with no NodeTag entry does not compile. It reads the tag instead of the
+ * alone), CallExpr (every class tagged `call` is a CallExpr), or one of
+ * the two family bases, SingleChildConstruct and MultiOpConstruct (each
+ * a contiguous tag range, NodeIs below). T may be const-qualified,
+ * exactly as the dynamic_cast's target was; a class with no NodeTag entry
+ * does not compile. It reads the tag instead of the
  * RTTI - the #102 conversion, for the forms that BIND the result.
  *
  * It also takes a fixed pile out of the coverage universe: dynamic_cast
@@ -2664,16 +2666,34 @@ ML_NODE_TAG(ForStmt, for_stmt)
 ML_NODE_TAG(ForRangeStmt, for_range)
 #undef ML_NODE_TAG
 
+/*
+ * Is a node of tag `c` a U? Its own tag for a NodeTag class; for the two
+ * family BASES, the CONTIGUOUS tag range their subtree is (ConstructType
+ * lists each family together for exactly this) - so node_cast serves
+ * `node_cast<const MultiOpConstruct>(e)` as well, with no dynamic_cast.
+ */
+template <class U> struct NodeIs {
+    static bool in(ConstructType c) { return c == NodeTag<U>::tag; }
+};
+template <> struct NodeIs<SingleChildConstruct> {
+    static bool in(ConstructType c) { return is_single_ct(c); }
+};
+template <> struct NodeIs<MultiOpConstruct> {
+    static bool in(ConstructType c) { return is_multiop_ct(c); }
+};
+
 template <class T, class C>
 static inline T *node_cast(C *c)
 {
     typedef typename std::remove_const<T>::type U;
     typedef typename std::conditional<std::is_const<C>::value,
                                       const Construct, Construct>::type B;
-    static_assert(std::is_final<U>::value || std::is_same<U, CallExpr>::value,
+    static_assert(std::is_final<U>::value || std::is_same<U, CallExpr>::value
+                  || std::is_same<U, SingleChildConstruct>::value
+                  || std::is_same<U, MultiOpConstruct>::value,
                   "node_cast: the tag must name T's whole subtree");
     B *b = c;
-    T *r = ctag(b) == NodeTag<U>::tag ? static_cast<T *>(b) : nullptr;
+    T *r = NodeIs<U>::in(ctag(b)) ? static_cast<T *>(b) : nullptr;
     ML_CHECK(r == dynamic_cast<T *>(b));
     return r;
 }

@@ -5237,7 +5237,7 @@ StaticTypeRef Inferencer::type_of(const Construct *e)
         return unary_result(pr.first, type_of(pr.second.get()));
     }
 
-    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(e)) {
+    if (auto *mo = node_cast<const MultiOpConstruct>(e)) {
         /* Expr03/04/06/07/11/12 */
         StaticTypeRef t = type_of(mo->elems[0].second.get());
         for (size_t i = 1; i < mo->elems.size(); i++)
@@ -7319,7 +7319,7 @@ TypeSym *Inferencer::narrow_target(Construct *cond, bool &in_then)
     }
 
     /* `x != none` / `x == none` (Expr07, two operands) */
-    auto *mo = dynamic_cast<MultiOpConstruct *>(cond);
+    auto *mo = node_cast<MultiOpConstruct>(cond);
     if (mo && (node_cast<Expr07>(cond)) && mo->elems.size() == 2) {
         const Op op = mo->elems[1].first;
         if (op != Op::eq && op != Op::noteq)
@@ -8432,11 +8432,11 @@ static void specialize_children(Construct *n, int *fsize)
         }
         return;
     }
-    if (auto *sc = dynamic_cast<SingleChildConstruct *>(n)) {
+    if (auto *sc = node_cast<SingleChildConstruct>(n)) {
         if (sc->elem) sc->elem = specialize(std::move(sc->elem), fsize);
         return;
     }
-    if (auto *mo = dynamic_cast<MultiOpConstruct *>(n)) {
+    if (auto *mo = node_cast<MultiOpConstruct>(n)) {
         for (auto &pr : mo->elems)
             pr.second = specialize(std::move(pr.second), fsize);
         return;
@@ -8717,8 +8717,9 @@ static bool fr_immutable(const Construct *e, const FrMut &m,
     if (auto *id = node_cast<const Identifier>(e))
         return id->sym.kind == SymKind::local && id->uid != i_uid &&
                m.len.find(id->uid) == m.len.end();
-    if (auto *sc = dynamic_cast<const SingleChildConstruct *>(e))  /* Expr01 */
-        return fr_immutable(sc->elem.get(), m, i_uid);
+    /* No SingleChildConstruct is immutable: the parser builds no Expr01,
+     * an InlinedCallExpr's child is a Block, and a ThrowStmt is not an
+     * expression - so the family falls to the `return false` below. */
     if (ctag(e) == ConstructType::subscript) {
         auto *sub = static_cast<const Subscript *>(e);
         const UniqueId *b = fr_base_id(sub->what.get());
@@ -8759,7 +8760,7 @@ static bool fr_immutable(const Construct *e, const FrMut &m,
             }
         return true;
     }
-    if (auto *mo = dynamic_cast<const MultiOpConstruct *>(e)) {
+    if (auto *mo = node_cast<const MultiOpConstruct>(e)) {
         /* arith (Expr02/03/04) + bitwise (Expr05/08/09/10) only - not a
          * comparison/logical (bool result, not an int bound). */
         if (ctag(e) == ConstructType::expr06 ||
@@ -9126,14 +9127,12 @@ static bool licm_expr_equal(const Construct *x, const Construct *y)
         return my && mx->memUid == my->memUid
                && licm_expr_equal(mx->what.get(), my->what.get());
     }
-    if (auto *cx = dynamic_cast<const SingleChildConstruct *>(x)) {
-        auto *cy = dynamic_cast<const SingleChildConstruct *>(y);
-        return cy && licm_expr_equal(cx->elem.get(), cy->elem.get());
-    }
-    if (auto *ox = dynamic_cast<const MultiOpConstruct *>(x)) {
-        auto *oy = dynamic_cast<const MultiOpConstruct *>(y);
-        if (!oy || typeid(*x) != typeid(*y) || ox->elems.size()
-                                                   != oy->elems.size())
+    /* (no SingleChildConstruct arm: a candidate passed fr_immutable, which
+     * admits none - see there) */
+    if (auto *ox = node_cast<const MultiOpConstruct>(x)) {
+        auto *oy = node_cast<const MultiOpConstruct>(y);
+        if (!oy || ctag(x) != ctag(y) || ox->elems.size()
+                                             != oy->elems.size())
             return false;
         for (size_t i = 0; i < ox->elems.size(); i++)
             if (ox->elems[i].first != oy->elems[i].first
