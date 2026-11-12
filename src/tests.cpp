@@ -24116,6 +24116,37 @@ static bool repl_completion_struct_members()
     return one.size() == 1 && one[0] == "alpha";
 }
 
+static bool repl_completion_member_edges()
+{
+    ReplEngine e;
+    e.eval_input("struct Q { int alpha; const LIMIT = 10; const LEVEL = 3; }");
+    e.eval_input("var my_q = Q(1)");
+    e.eval_input("var n = 5");
+    /* an instance offers its fields AND its type's const members */
+    const auto inst = e.completions("my_q.L", 6);
+    if (!has_cand(inst, "LIMIT") || !has_cand(inst, "LEVEL")
+        || has_cand(inst, "alpha"))
+        return false;
+    /* the struct's name offers its const members, never a field */
+    const auto ty = e.completions("Q.", 2);
+    if (!has_cand(ty, "LIMIT") || has_cand(ty, "alpha")) return false;
+    /* a cursor past the end is the end */
+    if (!has_cand(e.completions("my_q.al", 99), "alpha")) return false;
+    /* no base, a base that holds no struct, an unknown base: nothing */
+    return e.completions(".al", 3).empty()
+        && e.completions("n.al", 4).empty()
+        && e.completions("nosuch.al", 9).empty();
+}
+
+static bool repl_quit_through_eval_input()
+{
+    /* the terminal loop ends the session on :quit before it reaches the
+     * engine; handed to the engine it is a command that prints nothing */
+    ReplEngine e;
+    return e.eval_input(":quit").empty() && e.eval_input(":q").empty()
+        && e.eval_input("1 + 1").find("2") != std::string::npos;
+}
+
 static bool lineedit_tab_unique_completion()
 {
     LineEditor ed;
@@ -60127,6 +60158,10 @@ static const std::vector<extra_check> extra_checks =
     { "repl: completion (globals/builtins/keywords)",
       repl_completion_globals_builtins_keywords },
     { "repl: completion (struct members)", repl_completion_struct_members },
+    { "repl: completion (const members, the type, odd bases)",
+      repl_completion_member_edges },
+    { "repl: :quit through eval_input prints nothing",
+      repl_quit_through_eval_input },
     { "lineedit: Tab completes a unique candidate",
       lineedit_tab_unique_completion },
     { "lineedit: Tab extends to the common prefix",
