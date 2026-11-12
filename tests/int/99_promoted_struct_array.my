@@ -1,0 +1,81 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): an array of POD structs is stored flat, and a cold
+# operation (insert, here) promotes it to general storage - one boxed
+# struct per element - before a loop reads its fields. The codegen proved
+# only the static type array<P>, never the storage, so every field read
+# must serve both (README: array_storage reports the storage, and the
+# values never depend on it):
+#  - the foreach DIRECT read of a field (the VM's sf.add and
+#    LoadStructFieldInt/Float, vm_struct_field_int/float) - an int, a
+#    float, and an int field read into a float sum;
+#  - the subscript form `ps[i].f` (LoadStructFieldInt/Float with the
+#    bounds check, vm_struct_elem_field) - int, float and bool fields, each
+#    read as an int and as a float, a negative index, and an index past
+#    the end (OutOfBoundsEx).
+# The tree-walker is the oracle; every engine must print the same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+struct P { int x; float y; bool b; }
+
+func flat_and_promoted(bool promote) {
+    var ps = [P(1, 1.5, true), P(2, 2.5, false)];
+    if (promote)
+        insert(ps, 0, P(int(runtime(5)), 0.5, true));
+    return ps;
+}
+
+foreach (var promote in [false, true]) {
+    var ps = flat_and_promoted(promote);
+    var tag = promote ? "general" : "struct";
+    want(tag + " storage", array_storage(ps), tag);
+    var n = promote ? 3 : 2;
+
+    # the foreach direct reads
+    var sx = 0;
+    foreach (var p in ps)
+        sx += p.x;
+    want(tag + " foreach int", sx, promote ? 8 : 3);
+    var sy = 0.0;
+    foreach (var p in ps)
+        sy += p.y;
+    want(tag + " foreach float", sy, promote ? 4.5 : 4.0);
+    var sxf = 0.0;
+    foreach (var p in ps)
+        sxf += p.x;
+    want(tag + " foreach int into a float", sxf, promote ? 8.0 : 3.0);
+
+    # the subscript form
+    var ti = 0;
+    var tf = 0.0;
+    for (var i = 0; i < len(ps); i++) {
+        ti += ps[i].x + ps[i].b;
+        tf += ps[i].y + ps[i].x + ps[i].b;
+    }
+    want(tag + " subscript int", ti, promote ? 10 : 4);
+    want(tag + " subscript float", tf, promote ? 14.5 : 8.0);
+    var yi = 0;
+    for (var i = 0; i < len(ps); i++)
+        yi += int(ps[i].y * 2.0);
+    want(tag + " subscript float field", yi, promote ? 9 : 8);
+    want(tag + " negative index", ps[-1].x * 10 + ps[-n].x, promote ? 25 : 21);
+    var caught = 0;
+    try {
+        var k = int(runtime(n));
+        var v = ps[k].x;
+        want(tag + " past the end", v, -1);
+    } catch (OutOfBoundsEx) {
+        caught = 1;
+    }
+    want(tag + " past the end raised", caught, 1);
+}
+
+assert(bad == 0);
+print("ok");
