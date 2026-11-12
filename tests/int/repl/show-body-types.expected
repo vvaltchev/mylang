@@ -1,0 +1,21 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> .. .. .. .. .. .. .. .. .. >> => [3, 8, 3, 2, 1]
+>> array<int> func shapes(int n) {
+    class C {
+        int v;
+    }
+    struct E {}
+    struct K {
+        const LIMIT = 8;
+    }
+    struct F {
+        int a;
+        float b;
+        const TAG = "fx";
+    }
+    var c = C(n);
+    var e = E();
+    var f = F(n, 1.5);
+    return [c.v, 8, f.a, 2, e == E() ? 1 : 0];
+}
+>> 

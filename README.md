@@ -3832,8 +3832,10 @@ func f() {
 
 The argument is **unevaluated** (which is the point — reading an unbound
 global is the very `UnboundSymbolEx` this lets a script avoid) and must be an
-**identifier**: `isbound(len)` and `isbound(none)` are fine, `isbound(3)` and
-`isbound("x")` are compile errors, as is any wrong arity. It also acts as a
+**identifier**: `isbound(len)` and `isbound(none)` are fine (both `true`: a
+builtin is always bound, and `none` always exists and is always bound, so
+`defined(none)` is `true` too), `isbound(3)` and `isbound("x")` are compile
+errors, as is any wrong arity. It also acts as a
 guard, so `if (isbound(x)) { print(x); }` compiles even when `x` exists
 nowhere. Like `defined`, it
 can only be *called* — the bare name is not usable as a value.
