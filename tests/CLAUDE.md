@@ -277,6 +277,20 @@ fail a test (`2*x` vs `2+x` agree at x = 2). So:
 - `--gcov --only REGEX --report F` writes what each unit run covered:
   compared with a whole run's uncovered list it says what a new unit
   adds, in minutes instead of the whole run's ~50.
+- A report opens with each unit's OWNED elements (`== NAME owns N`) and
+  ends with `== uncovered N`: rank only the last section - reading the
+  whole file ranks covered code as work to do (2026-11-12).
+- Measure a tree with a coverage build OF THAT TREE. An element is named
+  by its offset from its function's first line, read from the source
+  where int_run runs, while the counts come from the source the binary
+  was built from: a worktree whose src/ differs from the binary's
+  renames every element below the change - a 30-line deletion in vm.cpp
+  read as 95 new uncovered elements and 46 vanished ones, and the floor
+  check failed on a batch that had lowered the count (2026-11-12). A
+  tests-only difference is safe.
+- Two `--gcov` runs on ONE build clear and read each other's counters
+  (`exclusive=True` keeps tests/run's own apart): a second run started
+  by hand made eleven units "redundant" and the count jump (2026-11-12).
 - A coverage build (GCOV=1) compiles ML_CHECK / ML_VM_CHECK out
   (ML_COVERAGE, defs.h; `mylang -v`: `coverage 1`, `asserts 0`) - an
   assertion's failure arm is an edge no correct run takes, and an inlined
