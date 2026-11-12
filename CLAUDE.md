@@ -2686,7 +2686,9 @@ output AND rendered error) and `tests/corpus_diff`'s `-nc` pass.
 ./build/mylang --weights [N]     # inlining cost-model calibration (any build;
                                  # use OPT=1 ASSERTS=0 for meaningful numbers;
                                  # N iterations per node, default 20M - a
-                                 # small N is driver_checks' instant run)
+                                 # small N is driver_checks' instant run;
+                                 # an N that is not a positive number is
+                                 # refused, never the default)
 ```
 
 **The standalone test tools (`tests/`) have their own

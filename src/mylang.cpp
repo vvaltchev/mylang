@@ -426,12 +426,20 @@ parse_args(int argc, char **argv)
 
             /* an optional iteration count per measured node: a small one
              * makes the numbers noise and the run instant, which is how
-             * driver_checks runs the tool */
+             * driver_checks runs the tool. Anything after the flag must
+             * be that count - silently falling back to the default would
+             * turn a typo into a ten-minute run. */
             long iters = 20000000;
-            char *end = nullptr;
-            const long n = argc < 2 ? -1 : strtol(argv[1], &end, 10);
-            if (n > 0 && end != argv[1] && *end == '\0')
+            if (argc >= 2) {
+                char *end = nullptr;
+                const long n = strtol(argv[1], &end, 10);
+                if (n <= 0 || end == argv[1] || *end != '\0') {
+                    cout << "error: --weights takes a positive iteration "
+                            "count" << endl;
+                    exit(1);
+                }
                 iters = n;
+            }
             run_weight_bench(iters); exit(0);
 
         } else if (!strcmp(arg, "-t")) {
