@@ -1377,6 +1377,38 @@ if printf '%s' "$an" | grep -qF "{ ${dim}print(1); }" &&
 else
     fail "-a: $(printf '%s' "$an" | head -c 400)"
 fi
+# ...and the other colors: an array<dyn> red, an inlined call blue, a
+# call redirected to a specialization clone cyan, and a dead branch that
+# spans several lines dim on every one of them.
+cat > "$TMP/an2.my" <<'EOF'
+func sq(x) => x * x;
+func pick(a, int b) {
+    if (b > 5)
+        return a * 2;
+    return a + b;
+}
+func g(int n) {
+    var mixed = [1, "a"];
+    var r = sq(n) + pick(n, 3) + len(mixed);
+    if (false) {
+        print("never");
+        print("again");
+    }
+    return r;
+}
+print(g(int(runtime(2))));
+EOF
+red=$(printf '\033[31m') blu=$(printf '\033[94m') cyn=$(printf '\033[36m')
+an2=$("$BIN" -a "$TMP/an2.my" 2>&1)
+if printf '%s' "$an2" | grep -qF "var ${red}mixed" &&
+   printf '%s' "$an2" | grep -qF "${blu}sq(n" &&
+   printf '%s' "$an2" | grep -qF "${cyn}pick(n" &&
+   printf '%s' "$an2" | grep -qF "${dim}        print(\"again\");" &&
+   [ "$("$BIN" "$TMP/an2.my" 2>&1)" = "11 " ]; then
+    pass "-a: a dyn array, inlined/specialized calls, a long dead branch"
+else
+    fail "-a colors: $(printf '%s' "$an2" | head -c 400)"
+fi
 tr=$("$BIN" --trace fold "$TMP/an.my" 2>"$TMP/an.err")
 if [ "$tr" = "$("$BIN" "$TMP/an.my" 2>/dev/null)" ] &&
    grep -q 'short-circuit && -> false' "$TMP/an.err" &&
