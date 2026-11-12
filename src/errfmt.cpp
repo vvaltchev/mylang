@@ -15,8 +15,16 @@ using std::string;
 using std::ostream;
 
 void
-dump_line_with_caret(ostream &o, const string &ln, int from, int to)
+dump_line_with_caret(ostream &o, const string &line, int from, int to)
 {
+    /* A source run keeps a CRLF file's CRs in its lines (read_script) and
+     * an image reading its source back drops them (resolve_source): the
+     * quoted line drops a final CR, so the two print the same (RULE 2 -
+     * they did not until 2026-11-12). */
+    string ln = line;
+    if (!ln.empty() && ln.back() == '\r')
+        ln.pop_back();
+
     if (from < 1)
         from = 1;
     if (to == 0 || to > static_cast<int>(ln.length()))
