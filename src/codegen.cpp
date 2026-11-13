@@ -2488,15 +2488,13 @@ struct Codegen {
          * MultiOpConstruct with a single (op, operand): op==invalid is just the
          * operand (compile it), else the unary op. */
         if (const Expr02 *u = node_cast<const Expr02>(e)) {
-            if (u->elems.size() != 1)
-                return false;
+            /* the parser builds an Expr02 only for a written unary
+             * operator, one operand each */
+            ML_CHECK(u->elems.size() == 1);
             const Op op = u->elems[0].first;
             const Construct *operand = u->elems[0].second.get();
-            if (op == Op::invalid)
-                return compile_boxed_expr(operand, out_slot, ops);
-            if (op != Op::lnot && op != Op::minus && op != Op::bnot
-                && op != Op::plus)
-                return false;
+            ML_CHECK(op == Op::lnot || op == Op::minus || op == Op::bnot
+                     || op == Op::plus);
             int oslot;
             if (!compile_boxed_expr(operand, oslot, ops))
                 return false;

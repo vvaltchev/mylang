@@ -1087,6 +1087,13 @@ static const std::vector<test> tests =
     { "a struct field may name a class declared below",
       { "struct S { T x; } class T { int a; }",
         "assert(S(T(4)).x.a == 4);" } },
+    /* a call through a function VALUE is checked against the function's
+     * arity like a direct call (a typed function here: tests/int/91 has
+     * the template's value calls) */
+    { "err loc: a call through a function value with too few arguments",
+      { "func add_op(int a, int b) => a + b; var ops = [add_op];"
+        " var fn = ops[0]; print(fn(1));" },
+      &typeid(WrongArgCountEx), 80, 1, 86, 1 },
     /* the struct declaration's own syntax errors */
     { "err loc: a struct with no name",
       { "struct { int x; }" },

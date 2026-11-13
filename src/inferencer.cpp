@@ -1879,10 +1879,11 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
                 TypeSym *p = tmpl->params[i];
                 if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
                     continue;              /* not a template param */
-                StaticTypeRef t = i < nargs
-                    ? static_type_resolve(
-                          type_of(site.call->args->elems[i].get()))
-                    : A.none_ty();
+                /* a template param is not opt, so i < min_args <= nargs:
+                 * every site passes it */
+                ML_CHECK(i < nargs);
+                StaticTypeRef t = static_type_resolve(
+                    type_of(site.call->args->elems[i].get()));
                 if (is_unknown(t)) { ok = false; break; }
                 s1.push_back(t);
             }
@@ -1900,8 +1901,9 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
                 break;
             }
         }
-        if (!ok || first)
+        if (!ok)
             continue;
+        ML_CHECK(!first);          /* the site list is not empty */
 
         /*
          * A signature that cannot improve on the base - leave the base
@@ -8866,8 +8868,9 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n,
 
     /* init: `var i = start`, with i a slotted-local int */
     auto *init = node_cast<Expr14>(f->init.get());
-    if (!init || !(init->fl & pFlags::pInDecl) || init->op != Op::assign)
+    if (!init || !(init->fl & pFlags::pInDecl))
         return n;
+    ML_CHECK(init->op == Op::assign);   /* `var i += 1` does not parse */
     auto *ivar = node_cast<Identifier>(init->lvalue.get());
     if (!ivar || ivar->sym.kind != SymKind::local || ivar->th != TypeHint::i)
         return n;
@@ -8883,9 +8886,13 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n,
         return n;
     const Op cmp_op = cond->elems[1].first;
     bool cmp_asc;
-    if (cmp_op == Op::lt || cmp_op == Op::le)      cmp_asc = true;
-    else if (cmp_op == Op::ge || cmp_op == Op::gt) cmp_asc = false;
-    else return n;
+    if (cmp_op == Op::lt || cmp_op == Op::le) {
+        cmp_asc = true;
+    } else {
+        /* Expr06 holds the four orderings only */
+        ML_CHECK(cmp_op == Op::ge || cmp_op == Op::gt);
+        cmp_asc = false;
+    }
     Construct *bound = cond->elems[1].second.get();
     if (bound->th != TypeHint::i)
         return n;
@@ -8901,8 +8908,9 @@ static unique_ptr<Construct> try_for_range(unique_ptr<Construct> n,
             return n;
         inc_asc = idc->is_inc;
     } else if (inc14) {
-        if (inc14->fl & pFlags::pInDecl)
-            return n;
+        /* a declaration is not an increment: `for (..; ..; var j = 1)`
+         * does not parse */
+        ML_CHECK(!(inc14->fl & pFlags::pInDecl));
         auto *iid = node_cast<Identifier>(inc14->lvalue.get());
         if (!iid || iid->uid != i_uid)
             return n;
