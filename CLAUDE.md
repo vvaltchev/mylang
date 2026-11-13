@@ -7597,6 +7597,12 @@ but the per-element `StructObject` allocation is gone (build overhead
   struct). `opt` is allowed on a class-typed field (a null reference) and
   still not on a struct-typed one; a forward reference is checked by the
   inferencer's `check_opt_struct_fields` (`FieldDef::loc`, compile-only).
+  The same function refuses a field type no struct or class of the
+  program takes ("'Nope' is not a type", at `FieldDef::type_loc`) - only
+  when `Inferencer::closed_world` (set by `infer_types`): a REPL input
+  may be followed by the one declaring it, and a parse-time call's copy
+  holds only the structs the call reaches (until 2026-11-13 such a field
+  compiled and its constructor refused every value at run time).
   Net: `tests/functional/81_class_reference_semantics.my`, the `class:`
   `-rt` entries, the class `alias:` layer case, the `driver_checks` image
   case.
