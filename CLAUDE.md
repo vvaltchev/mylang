@@ -676,7 +676,11 @@ product function (keep an INT-only condition INSIDE the macro) and
 every test-only `#ifdef TESTS` / `#ifdef INT_TESTS` region of a product
 file (since 2026-11-11 - selftests, oracles and counter bumps no shipped
 build compiles were 512 uncovered elements; `tests/mutate` already
-skipped them). A test
+skipped them), and the second outcome of a `catch (Exception &)`
+handler's type test - an exception that is not an `Exception`, which
+the product never throws: gcov counts it as an ordinary branch, and 106
+uncovered elements were nothing else (`root_catch_lines`, 2026-11-13).
+A test
 program's header picks its runs: `# INT-ENGINES: default` for a codegen or
 JIT decision (the tree-walker never runs those passes),
 `# INT-CONFIGS: default ; MYLANG_JIT_OFF=lsra` for several environments.

@@ -250,6 +250,33 @@ def exempt_lines(rel, cache):
     return cache[rel]
 
 
+# a handler of the ROOT exception type: `} catch (Exception &e) {`
+ROOT_CATCH = re.compile(r"\bcatch\s*\(\s*(?:const\s+)?Exception\s*&")
+
+
+def root_catch_lines(rel, cache):
+    """1-based line numbers of `rel` holding a `catch (Exception &)`
+    handler. The handler's type test has two outcomes, and gcov counts the
+    second - an exception that is NOT an `Exception` going past - as an
+    ordinary branch (the FALLTHROUGH one; it is not marked `throw`). Every
+    exception the product throws derives from Exception (std::bad_alloc
+    becomes OutOfMemoryEx, which is both), so that edge cannot be taken:
+    106 uncovered elements of the 2026-11-13 universe were nothing but
+    it. Entering the handler stays in the universe."""
+    key = (rel, "root-catch")
+    if key not in cache:
+        found = set()
+        try:
+            with open(os.path.join(ROOT, rel), errors="replace") as f:
+                for n, text in enumerate(f, 1):
+                    if ROOT_CATCH.search(text):
+                        found.add(n)
+        except OSError:
+            pass
+        cache[key] = found
+    return cache[key]
+
+
 def gcov_tool(cfg):
     """The gcov that matches the compiler: gcov reads the .gcno/.gcda format
     of ITS OWN GCC version and fails on another's. $GCOV wins; else, for
@@ -322,6 +349,7 @@ def collect(build_dir, scratch, ex_cache, tool):
                             fn.get("demangled_name", fn["name"]))
                            for fn in fobj.get("functions", []))
             marked = exempt_lines(rel, ex_cache)
+            root_catch = root_catch_lines(rel, ex_cache)
 
             def owner(line):
                 best = None
@@ -343,6 +371,8 @@ def collect(build_dir, scratch, ex_cache, tool):
                 for b in ln.get("branches", []):
                     if b.get("throw"):
                         continue
+                    if n in root_catch and b.get("fallthrough"):
+                        continue        # not an Exception: cannot happen
                     name = "br:%s:%d" % (where, k)
                     k += 1
                     elems[name] = elems.get(name, False) or b["count"] > 0
