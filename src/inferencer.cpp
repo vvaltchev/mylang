@@ -1406,11 +1406,14 @@ bool Inferencer::instantiate_round(Block *rootBlock)
             const std::string nm = tmpl->decl->id
                 ? std::string(tmpl->decl->id->get_str())
                 : std::string("<lambda>");
-            TRACE(templ, 0, nm + "(" + ss + ") -> " +
-                  std::string(clone_name->val) +
-                  (reused ? "  (reused)"
-                          : "  (instance " +
-                            std::to_string(tmpl_inst_count[tmpl]) + ")"));
+            /* trace_emit, not TRACE: the category is tested above */
+            trace_emit(TraceCat::templ, 0,
+                       nm + "(" + ss + ") -> " +
+                       std::string(clone_name->val) +
+                       (reused ? "  (reused)"
+                               : "  (instance " +
+                                 std::to_string(tmpl_inst_count[tmpl]) +
+                                 ")"));
         }
 
         auto what = make_unique<Identifier>(clone_name->val);
@@ -1959,8 +1962,9 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             const std::string nm = tmpl->decl->id
                 ? std::string(tmpl->decl->id->get_str())
                 : std::string("<lambda>");
-            TRACE(templ, 0, "value-instantiate " + nm + "(" + ss + ") -> " +
-                  std::string(clone_name->val));
+            trace_emit(TraceCat::templ, 0,
+                       "value-instantiate " + nm + "(" + ss + ") -> " +
+                       std::string(clone_name->val));
         }
 
         /* 5) Redirect EVERY value use IN PLACE (uid + sym rebind - the
@@ -2513,9 +2517,10 @@ void Inferencer::infer_one(Block *rootBlock)
                 continue;
             const char *kind = s->is_param ? "param"
                              : s->const_decl ? "const" : "var";
-            TRACE(infer, 0, std::string(kind) + " " +
-                            std::string(s->name->val) + " : " +
-                            static_type_to_string(s->type) + "  (final)");
+            trace_emit(TraceCat::infer, 0,
+                       std::string(kind) + " " +
+                       std::string(s->name->val) + " : " +
+                       static_type_to_string(s->type) + "  (final)");
         }
         for (auto &up : all_funcs) {
             if (up->pinned || !up->decl || !up->decl->id)
@@ -2531,14 +2536,14 @@ void Inferencer::infer_one(Block *rootBlock)
                     ps += ": " + static_type_to_string(up->params[i]->type);
             }
             if (up->is_template)
-                TRACE(infer, 0, "func " +
-                                std::string(up->decl->id->get_str()) + "(" +
-                                ps + ")  template (instantiated per call)");
+                trace_emit(TraceCat::infer, 0,
+                           "func " + std::string(up->decl->id->get_str()) +
+                           "(" + ps + ")  template (instantiated per call)");
             else
-                TRACE(infer, 0, "func " +
-                                std::string(up->decl->id->get_str()) + "(" +
-                                ps + ") -> " + static_type_to_string(up->ret) +
-                                "  (final)");
+                trace_emit(TraceCat::infer, 0,
+                           "func " + std::string(up->decl->id->get_str()) +
+                           "(" + ps + ") -> " +
+                           static_type_to_string(up->ret) + "  (final)");
         }
     }
 
@@ -4356,8 +4361,9 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
                        : hint == ArrHint::flat_s ? "flat (structs)"
                        : hint == ArrHint::flat_c ? "flat (classes)"
                                                  : "general";
-        TRACE(arrays, 0, std::string(id->get_str()) + "  dest " +
-              static_type_to_string(ty) + " -> " + hn);
+        trace_emit(TraceCat::arrays, 0,
+                   std::string(id->get_str()) + "  dest " +
+                   static_type_to_string(ty) + " -> " + hn);
     }
 
     Construct *rv = e->rvalue.get();
