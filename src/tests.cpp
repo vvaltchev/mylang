@@ -1052,6 +1052,16 @@ static const std::vector<test> tests =
     { "err loc: a call to a builtin constant is not callable",
       { "var dyn r = math_e(runtime(1));" },
       &typeid(TypeMismatchEx), 13, 1, 20, 1 },
+    /* `P.x` reads a FIELD off the struct TYPE, not an instance: a compile
+     * error, the inferencer's when P is declared below the use (a struct
+     * binds at scope entry, #134) - above it, the parser's constant
+     * evaluator reads P first and raises its own. */
+    { "err loc: a field read off a struct type declared below",
+      { "func f() => P.x; struct P { int x; } print(f());" },
+      &typeid(TypeMismatchEx), 13, 1, 17, 1 },
+    { "err loc: a struct type declared below has no such member",
+      { "func g() => P.y; struct P { int x; } print(g());" },
+      &typeid(TypeMismatchEx), 13, 1, 17, 1 },
     /* abs() takes an int or a float: any other type the compiler can see,
      * a bool included, is a compile error marking the argument (decided
      * 2026-11-13; the call was typed as its argument and the run time
