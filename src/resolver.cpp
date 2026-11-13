@@ -166,6 +166,23 @@ struct FuncState {
  */
 
 /*
+ * The callee of a call to a LAZY builtin - one that asks about its
+ * argument's NAME and never evaluates it (defined / isbound / isconst /
+ * isconstdecl) - or null. The callee must NAME one and must not be the
+ * program's own symbol of that name (CallExpr::user_callee, stamped by the
+ * inferencer): a program's `func defined` is called like any function, so
+ * its argument is evaluated and must be declared (#133). Every pass that
+ * treats a lazy call specially asks this, never the name alone.
+ */
+static const Identifier *lazy_builtin_callee(const CallExpr *call)
+{
+    const Identifier *cid = node_cast<const Identifier>(call->what.get());
+    if (!cid || call->user_callee || !is_lazy_builtin(cid->uid))
+        return nullptr;
+    return cid;
+}
+
+/*
  * Builtins that take their FIRST argument as an lvalue or identifier (and throw
  * NotLValueEx / require an identifier otherwise). A value substituted/folded
  * there would change behavior, so neither auto-const nor the inliner folds it.
@@ -1239,20 +1256,21 @@ private:
         if (ctag(c) == ConstructType::call) {
             auto *ce = static_cast<CallExpr *>(c);
             auto *callee = node_cast<Identifier>(ce->what.get());
-            if (callee && ce->args && ce->args->elems.size() == 1
-                    && (callee->get_str() == "isconst"
-                        || callee->get_str() == "isconstdecl")) {
+            const Identifier *lazy = lazy_builtin_callee(ce);
+            if (lazy && ce->args && ce->args->elems.size() == 1
+                    && (lazy->get_str() == "isconst"
+                        || lazy->get_str() == "isconstdecl")) {
                 fold_isconst(slot, ce, fc,
-                             callee->get_str() == "isconstdecl");
+                             lazy->get_str() == "isconstdecl");
                 return;
             }
-            if (callee && ce->args && ce->args->elems.size() == 1
-                    && callee->get_str() == "defined"
+            if (lazy && ce->args && ce->args->elems.size() == 1
+                    && lazy->get_str() == "defined"
                     && try_fold_defined(slot, ce)) {
                 return;   /* folded; else fall through to normal arg handling */
             }
-            if (callee && ce->args && ce->args->elems.size() == 1
-                    && callee->get_str() == "isbound"
+            if (lazy && ce->args && ce->args->elems.size() == 1
+                    && lazy->get_str() == "isbound"
                     && try_fold_isbound(slot, ce)) {
                 return;
             }
@@ -1564,7 +1582,7 @@ private:
          * undefined name there is refused by FIX-1 before any guard could
          * help - which is why no test can catch that mistake. Named rather
          * than left to chance. */
-        const auto *cid = node_cast<const Identifier>(call->what.get());
+        const Identifier *cid = lazy_builtin_callee(call);
         if (!cid)
             return;
         /* `isbound` guards too: since it answers `false` for a name that
@@ -1738,8 +1756,7 @@ private:
          * program that got it right. (Caught by the isbound/defined tests.) */
         if (ctag(c) == ConstructType::call) {
             auto *call = static_cast<CallExpr *>(c);
-            auto *cid = node_cast<Identifier>(call->what.get());
-            if (cid && is_lazy_builtin(cid->uid)) {
+            if (lazy_builtin_callee(call)) {
                 f(call->what.get());
                 return;
             }
@@ -4568,8 +4585,7 @@ Resolver::walk(Construct *c, FuncState *cur)
          * `defined()` already accepts - `defined(confg)` folds to false in
          * silence - so this makes the two lazy queries consistent rather than
          * adding a new class of risk. */
-        const Identifier *cid = node_cast<Identifier>(call->what.get());
-        const bool lazy = cid && is_lazy_builtin(cid->uid);
+        const bool lazy = lazy_builtin_callee(call) != nullptr;
         const bool saved_nc = no_undef_check;
         const bool saved_tz = no_tdz_check;
 
@@ -7233,7 +7249,7 @@ private:
              * execution-order-dependent property. (An inlined `return
              * defined(gg)` body exposed this; the resolver's try_fold_defined
              * already folded every soundly-foldable case.) */
-            if (callee && is_lazy_builtin(callee->uid))
+            if (lazy_builtin_callee(ce))
                 return;
         } else {
             for_each_child_slot(cc,

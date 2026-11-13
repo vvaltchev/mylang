@@ -1,0 +1,49 @@
+# A program's own function, parameter or variable named like a builtin
+# that asks about a NAME (defined, isbound, isconst, isconstdecl) is called
+# like any function: its argument is evaluated and the call answers what
+# the program's code returns. Until 2026-11-13 the resolver and the
+# constant folder recognized those builtins by NAME, so a call whose
+# argument was a name declared nowhere compiled and called the BUILTIN
+# (`defined(zork)` answered false in a program with its own `defined`),
+# and the REPL folded `defined(p)` to true over the program's function.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+# ---- a function of the name
+func defined(v) { return v + 1; }
+var k = int(runtime(5));
+want("own defined, a variable", defined(k), 6);
+want("own defined, a literal", defined(2), 3);
+func through(int p) => defined(p);
+want("own defined, a parameter", through(int(runtime(7))), 8);
+
+# ---- a variable of the name, declared below the function reading it
+func later() { var z = int(runtime(3)); return isconst(z); }
+var isconst = func(v) => v - 1;
+want("a variable named isconst declared below", later(), 2);
+
+# ---- a parameter of the name
+func viaparam(isbound, int x) => isbound(x);
+want("a parameter named isbound",
+     viaparam(func(v) => v * 10, int(runtime(4))), 40);
+
+func isconstdecl(v) => "s" + str(v);
+want("own isconstdecl", isconstdecl(k), "s5");
+
+# ---- a condition through the program's own defined is an ordinary one
+var hits = 0;
+if (defined(k) == 6)
+    hits++;
+want("a condition through own defined", hits, 1);
+
+# ---- isbound itself is not shadowed here: it still asks about the name
+want("the builtin isbound of a name declared nowhere", isbound(nowhere), false);
+
+assert(bad == 0);
+print("ok");

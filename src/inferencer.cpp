@@ -451,7 +451,8 @@ private:
     void lower_named_args(Construct *n);        /* desugar named-arg calls */
     void lower_call_named_args(CallExpr *call); /* ...for one call */
     void reject_dev_builtins(Construct *n);     /* DEV-only builtins in a script */
-    void check_isbound_args(Construct *n);     /* isbound()'s arg SHAPE */
+    void stamp_lazy_calls(Construct *n);  /* isbound()'s arg SHAPE, and
+                                           * CallExpr::user_callee */
     void enforce_nonnull_params();   /* the mandatory-`opt` rule for params */
     static bool type_has_dyn(StaticTypeRef t, bool deep);
     static bool type_has_bottom_elem(StaticTypeRef t);
@@ -2061,9 +2062,10 @@ void Inferencer::infer_one(Block *rootBlock)
     for (auto &e : rootBlock->elems)
         lower_named_args(e.get());
 
-    /* isbound()'s argument SHAPE - syntactic, so ungated (see the fn). */
+    /* isbound()'s argument SHAPE, and which calls naming a lazy builtin
+     * call the program's own symbol - syntactic, so ungated (see the fn) */
     for (auto &e : rootBlock->elems)
-        check_isbound_args(e.get());
+        stamp_lazy_calls(e.get());
 
     /* Reserve DEV-only builtins (show()) in a script - a compile-time error,
      * even under -nti (this runs before the checks_enabled early return). A
@@ -4915,8 +4917,14 @@ void Inferencer::lower_named_args(Construct *n)
  * tree-walker would answer TypeErrorEx while the no-fail codegen refuses to
  * lower the shape at all (NotLoweredEx) - an engine divergence on top of a
  * worse diagnostic.
+ *
+ * The same walk stamps CallExpr::user_callee on a call whose callee NAMES a
+ * lazy builtin but resolved to the program's own symbol, which the resolver
+ * and AutoConst then treat as an ordinary call (#133). Every call is
+ * stamped, either way: a REPL input's tree is walked once, but a node
+ * address may be reused, and the stamp must be this walk's answer.
  */
-void Inferencer::check_isbound_args(Construct *n)
+void Inferencer::stamp_lazy_calls(Construct *n)
 {
     if (!n)
         return;
@@ -4927,6 +4935,7 @@ void Inferencer::check_isbound_args(Construct *n)
             auto *cid = static_cast<Identifier *>(call->what.get());
             auto it = id_sym.find(cid);
             const bool user_shadow = (it != id_sym.end() && it->second);
+            call->user_callee = user_shadow && is_lazy_builtin(cid->uid);
             if (!user_shadow && cid->uid->val == "isbound") {
                 const size_t n_args =
                     call->args ? call->args->elems.size() : 0;
@@ -4947,7 +4956,7 @@ void Inferencer::check_isbound_args(Construct *n)
         }
     }
 
-    for_each_child(n, [this](Construct *c) { check_isbound_args(c); });
+    for_each_child(n, [this](Construct *c) { stamp_lazy_calls(c); });
 }
 
 void Inferencer::reject_dev_builtins(Construct *n)
