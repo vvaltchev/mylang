@@ -1896,6 +1896,12 @@ a few difference from `C` worth pointing out:
     compile error, as in C), not as `-(-1)`; write `- -1` or `-(-1)` for double
     negation.
 
+  - The **initializer** and the **increment** of a `for` may be any
+    expression, as in `C`: `for (tick(); i < n; tick())` calls `tick()`
+    once before the loop and again after every pass, and a value nobody
+    reads (`for (0; i < n; i++)`) is computed and dropped - an error it
+    raises is still raised.
+
   - To declare multiple variables, use the syntax: `var a, b = [3,4];` or
     just `var a,b,c,d = 0;` if you want all the variables to have the same
     initial value. When the right-hand side is an **array**, it is destructured

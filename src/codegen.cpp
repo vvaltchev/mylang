@@ -1359,6 +1359,36 @@ struct Codegen {
      * store) when it is a resolved-local scalar decl.
      * Native-izing the once-run init doesn't speed the loop, but it keeps the
      * `i = start` off the tree-walker and reads cleanly in the disassembly. */
+    /* THE DISCARD TIER: a statement whose value nobody reads. A bare INERT
+     * leaf - a scalar literal, or an id that is ALWAYS bound (local / param
+     * / capture / builtin) - is a no-op, as the tree-walker never RValue-s a
+     * discarded statement; any OTHER expression compiles into a scratch temp
+     * whose result is dropped (`s[3];`, `x + y;`, `map(f, a);`), so an error
+     * it raises still throws with its own caret. An UNRESOLVED id throws
+     * UndefinedVariableEx and a GLOBAL id throws iff not yet defined - both
+     * what compile_boxed_expr's leaf paths emit. Every place a statement can
+     * stand asks this last: gen_stmt, a loop / if body, and a `for`'s init
+     * and increment (which had no such tier until 2026-11-13, so
+     * `for (0; c; i++)` or a write-once `z` folded to its value there was a
+     * NotLoweredEx compile refusal while the tree-walker ran it). Returns
+     * false (nothing emitted, temps restored) when it cannot compile. */
+    bool compile_discarded(const Construct *s, std::vector<CgInstr> &ops)
+    {
+        const Identifier *bid = node_cast<const Identifier>(s);
+        if (dynamic_cast<const Literal *>(s)
+                || (bid && bid->sym.kind != SymKind::unresolved
+                        && bid->sym.kind != SymKind::global))
+            return true;
+        const size_t emark = ops.size();
+        const int st = next_temp;
+        int dst;
+        if (compile_boxed_expr(s, dst, ops))
+            return true;
+        ops.resize(emark);
+        next_temp = st;
+        return false;
+    }
+
     bool emit_init(const Construct *init)
     {
         reset_temps();
@@ -1374,9 +1404,15 @@ struct Codegen {
         /* Boxed decl-init: `var k = i` (an int/bool leaf, or a dyn/string
          * value) - the int path rejects a bare identifier rhs (it can't prove
          * int-not-bool for a raw int store), but a boxed move preserves the
-         * rhs's real type. An UNCOMPILABLE init (exotic) fails the whole
-         * loop to a NotLoweredEx compile abort - no per-init fallback. */
+         * rhs's real type. Then the discard tier: an init that is a plain
+         * expression (`for (0; ...)`). An UNCOMPILABLE init (exotic) fails
+         * the whole loop to a NotLoweredEx compile abort - no per-init
+         * fallback. */
         if (compile_boxed_stmt(init, code))
+            return true;
+        code.resize(mark);
+        reset_temps();
+        if (compile_discarded(init, code))
             return true;
         code.resize(mark);
         return false;
@@ -7657,34 +7693,13 @@ struct Codegen {
                 }
             }
 
-            /* The DISCARD tier (mirrors gen_stmt's tail): a bare leaf
-             * (Identifier / scalar literal) statement is a deliberate no-op
-             * (the tree-walker never RValue-s a discarded statement); any
-             * OTHER expression statement compiles into a scratch temp and
-             * drops the result - `map(f, a);` in a loop body, a discarded
-             * ctor, `s[k];` - with the byte-identical throw carets. This is
-             * the terminal tier: what it can't compile fails the whole
-             * body (-> the enclosing statement's not-lowered abort). */
-            {
-                /* Same inert-leaf rule as gen_stmt's tail: always-bound ids /
-                 * literals are no-ops; an unresolved or global id compiles
-                 * (throw / defined-checked load), result discarded. */
-                const Identifier *bid = node_cast<const Identifier>(s);
-                const bool inert =
-                    dynamic_cast<const Literal *>(s)
-                    || (bid && bid->sym.kind != SymKind::unresolved
-                            && bid->sym.kind != SymKind::global);
-                if (inert)
-                    continue;
-                const size_t emark = code.size();
-                const int st2 = next_temp;
-                int dst;
-                if (compile_boxed_expr(s, dst, code)) {
-                    any_native = true;
-                    continue;
-                }
-                code.resize(emark);
-                next_temp = st2;
+            /* The DISCARD tier (compile_discarded, shared with gen_stmt and
+             * a `for`'s init / increment): the terminal tier - what it can't
+             * compile fails the whole body (-> the enclosing statement's
+             * not-lowered abort). */
+            if (compile_discarded(s, code)) {
+                any_native = true;
+                continue;
             }
 
             code.resize(start);
@@ -8238,9 +8253,13 @@ struct Codegen {
                     code.resize(imark);
                     reset_temps();
                     if (!compile_boxed_stmt(f->inc.get(), code)) {
-                        loops.pop_back();
-                        code.resize(start);
-                        return false;
+                        code.resize(imark);
+                        reset_temps();
+                        if (!compile_discarded(f->inc.get(), code)) {
+                            loops.pop_back();
+                            code.resize(start);
+                            return false;
+                        }
                     }
                 }
             }
@@ -9235,37 +9254,9 @@ struct Codegen {
         }
 
         /* A bare EXPRESSION statement whose value is discarded (`s[3];`,
-         * `a[i:j];`, `x + y;`, `flag ? f() : g();`): compile it into a scratch
-         * temp and drop the result - evaluating for value then discarding is the
-         * same as evaluating for effect, so any error (OOB / missing-key / type)
-         * still throws natively with the right caret. SKIP a bare leaf
-         * (Identifier / scalar Literal): it has no side effect, and the
-         * tree-walker never RValue-s a discarded statement - so an undefined
-         * name must stay its harmless no-op (an UndefinedId sentinel), NOT a
-         * LoadGlobalV that would throw. A non-liftable expr (an AST/dev builtin,
-         * an inc-dec, an unresolved name) compiles or aborts below. */
-        {
-            /* A discarded INERT leaf - a scalar literal, or an id that is
-             * ALWAYS bound (local/param/capture/builtin) - is a no-op, as
-             * Block::do_eval (it never RValue-s the result). An UNRESOLVED
-             * id must throw UndefinedVariableEx and a GLOBAL id throws iff
-             * not yet defined - both exactly what compile_boxed_expr's leaf
-             * paths emit (ThrowRuntimeV / LoadGlobalV), result discarded. */
-            const Identifier *bid = node_cast<const Identifier>(s);
-            const bool inert =
-                dynamic_cast<const Literal *>(s)
-                || (bid && bid->sym.kind != SymKind::unresolved
-                        && bid->sym.kind != SymKind::global);
-            if (inert)
-                return;
-            const size_t emark = code.size();
-            const int st = next_temp;
-            int dst;
-            if (compile_boxed_expr(s, dst, code))
-                return;
-            code.resize(emark);
-            next_temp = st;
-        }
+         * `a[i:j];`, `x + y;`, `flag ? f() : g();`): compile_discarded. */
+        if (compile_discarded(s, code))
+            return;
 
         throw_not_lowered(s);
     }
