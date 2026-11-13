@@ -9792,6 +9792,16 @@ static int pp_thread(const std::vector<CgInstr> &code, int t)
     return t;
 }
 
+/* A handler-table pc (a catch clause's body, a finally) of the chunk the
+ * peephole is optimizing. Codegen places each at a real instruction and
+ * every rewrite here moves it with the code, so it always names one: the
+ * passes below index by it without a range test of their own. */
+static size_t pp_handler_pc(int pc, size_t n)
+{
+    ML_CHECK(pc >= 0 && static_cast<size_t>(pc) < n);
+    return static_cast<size_t>(pc);
+}
+
 /* `JumpUnlessIntCmp(C)` inversion for branch-over-jump. INT ONLY: float
  * compares don't invert under NaN (`!(a<b)` is not `a>=b`). */
 static Op invert_int_cmp(Op o)
@@ -10991,8 +11001,7 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
                 liv_changed = false;
                 uint64_t hlive = 0;
                 for (int h : handler_pcs)
-                    if (h >= 0 && static_cast<size_t>(h) < n)
-                        hlive |= live_in[h];
+                    hlive |= live_in[pp_handler_pc(h, n)];
                 for (size_t r = 0; r < n; r++) {
                     const size_t p = n - 1 - r;
                     Instr &in = code[p];
@@ -11018,8 +11027,7 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
 
             uint64_t hlive = 0;
             for (int h : handler_pcs)
-                if (h >= 0 && static_cast<size_t>(h) < n)
-                    hlive |= live_in[h];
+                hlive |= live_in[pp_handler_pc(h, n)];
 
             /* Producers the MoveV elimination RETARGETS this round: their dst
              * changes (to the eliminated move's dst), so the `live_in` computed
@@ -11431,10 +11439,9 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
          * today - a no-op here, load-bearing once the chain is gone). */
         for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
             for (const Chunk::HandlerClause &cl : hs.clauses)
-                if (cl.body_pc >= 0 && static_cast<size_t>(cl.body_pc) <= n)
-                    is_tgt[cl.body_pc] = 1;
-            if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) <= n)
-                is_tgt[hs.fin_pc] = 1;
+                is_tgt[pp_handler_pc(cl.body_pc, n)] = 1;
+            if (hs.fin_pc >= 0)
+                is_tgt[pp_handler_pc(hs.fin_pc, n)] = 1;
         }
 
         std::vector<char> del(n, 0);
@@ -11503,11 +11510,9 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
              */
             for (const Chunk::HandlerSite &hs : chunk.handler_sites) {
                 for (const Chunk::HandlerClause &cl : hs.clauses)
-                    if (cl.body_pc >= 0
-                            && static_cast<size_t>(cl.body_pc) < n)
-                        push(static_cast<size_t>(cl.body_pc));
-                if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) < n)
-                    push(static_cast<size_t>(hs.fin_pc));
+                    push(pp_handler_pc(cl.body_pc, n));
+                if (hs.fin_pc >= 0)
+                    push(pp_handler_pc(hs.fin_pc, n));
             }
             while (!stack.empty()) {
                 const size_t p = stack.back();
@@ -11552,11 +11557,9 @@ static void peephole_chunk(std::vector<CgInstr> &code, Chunk &chunk)
                 });
             for (Chunk::HandlerSite &hs : chunk.handler_sites) {   /* #78 */
                 for (Chunk::HandlerClause &cl : hs.clauses)
-                    if (cl.body_pc >= 0
-                            && static_cast<size_t>(cl.body_pc) <= n)
-                        cl.body_pc = newpc[cl.body_pc];
-                if (hs.fin_pc >= 0 && static_cast<size_t>(hs.fin_pc) <= n)
-                    hs.fin_pc = newpc[hs.fin_pc];
+                    cl.body_pc = newpc[pp_handler_pc(cl.body_pc, n)];
+                if (hs.fin_pc >= 0)
+                    hs.fin_pc = newpc[pp_handler_pc(hs.fin_pc, n)];
             }
             code = std::move(out);
         }
