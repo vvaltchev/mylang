@@ -1,0 +1,67 @@
+# INT-ENGINES: tw default nj nbi noopt ni
+#
+# INT unit (#107):
+#  - an inlined call's argument is pasted into the body only when it is
+#    INERT (CLAUDE.md, THE ARGUMENT RULE); a name bound to a function is
+#    inert only while nothing reassigns it, and a unary operator over a
+#    value of no proven type (a `dyn`) is not - both are bound to a temp
+#    before the body, as a real call binds them, and the answer is the one
+#    the call gives (-ni);
+#  - loops whose body is an empty statement (`for (...);`, `foreach (...);`,
+#    `while (...);`) inside a function, where the compiler folds the
+#    function's body;
+#  - a `try` whose every body is empty after the compiler folds a constant
+#    condition away, and a `for` whose init and increment it folds to a
+#    value.
+# The tree-walker is the oracle; every engine must print the same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+# ---- a function name passed to an inlined call
+func sq(x) => x * x;
+func ng(x) => 0 - x;
+func ap(f, v) => f(v);
+want("a function name nothing rebinds", ap(ng, int(runtime(3))), -3);
+sq = ng;
+want("a rebound function name", ap(sq, int(runtime(3))), -3);
+
+# ---- a unary operator over a dyn value
+func inc1(x) => x + 1;
+var dyn d = runtime(3);
+want("negated dyn argument", inc1(-d), -2);
+want("plus dyn argument", inc1(+d), 4);
+var dyn b = runtime(true);
+func flip(x) => !x;
+want("not of a dyn argument", flip(!b), true);
+
+# ---- empty loop bodies and folded-away try bodies inside a function
+func spin(int n) {
+    var s = 0;
+    for (; s < n; s++);
+    var c = 0;
+    foreach (var x in [1, 2, 3]);
+    while ((c += 1) < n);
+    const DBG = false;
+    var z = 0;
+    var k = 0;
+    for (z; k < n; z)
+        k++;
+    try {
+        if (DBG) print("try");
+    } catch (TypeErrorEx) {
+        if (DBG) print("catch");
+    } finally {
+        if (DBG) print("finally");
+    }
+    return s * 100 + c * 10 + k;
+}
+want("empty bodies", spin(int(runtime(4))), 444);
+
+assert(bad == 0);
+print("ok");

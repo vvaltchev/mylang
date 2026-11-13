@@ -1,0 +1,47 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> >> >> tracing: infer template
+>> infer      func pair(a, b)  template (instantiated per call)
+>> template   pair(int, float) -> pair$0  (instance 1)
+  infer      a  ? -> int
+  infer      b  ? -> float
+  infer      t  ? -> int
+  infer      func pair$0 returns ? -> float
+infer      param a : int  (final)
+infer      param b : float  (final)
+infer      var t : int  (final)
+infer      func pair$0(a: int, b: float) -> float  (final)
+=> 3.500000
+>> infer      param x : dyn  (final)
+=> <function>
+>> template   <lambda>(int) -> lambda$0  (instance 1)
+  infer      x  ? -> int
+  infer      func lambda$0 returns ? -> int
+infer      param x : int  (final)
+infer      func lambda$0(x: int) -> int  (final)
+=> 12
+>>   infer      CA  ? -> array<int>
+infer      const CA : array<int>  (final)
+=> [1, 2]
+>>   infer      wo  ? -> array<func(?,?)->?>
+template   value-instantiate w1(int, int) -> w1$0
+template   value-instantiate w2(int, int) -> w2$0
+  infer      a  ? -> int
+  infer      b  ? -> int
+  infer      a  ? -> int
+  infer      b  ? -> int
+  infer      wo  array<func(?,?)->?> -> array<func(int,int)->?>
+  infer      func w1$0 returns ? -> int
+  infer      func w2$0 returns ? -> int
+  infer      wo  array<func(int,int)->?> -> array<func(int,int)->int>
+infer      var wo : array<func(int,int)->int>  (final)
+infer      param a : int  (final)
+infer      param b : int  (final)
+infer      param a : int  (final)
+infer      param b : int  (final)
+infer      func w1(a, b)  template (instantiated per call)
+infer      func w2(a, b)  template (instantiated per call)
+infer      func w1$0(a: int, b: int) -> int  (final)
+infer      func w2$0(a: int, b: int) -> int  (final)
+=> 8
+>> tracing: off
+>> 
