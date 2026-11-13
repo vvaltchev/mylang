@@ -145,14 +145,6 @@ public:
         throw TypeErrorEx("The object does NOT support unary operator - (negation)");
     }
 
-    virtual void land(EvalValueT &a, const EvalValueT &b) {
-        throw TypeErrorEx("The object does NOT support operator &&");
-    }
-
-    virtual void lor(EvalValueT &a, const EvalValueT &b) {
-        throw TypeErrorEx("The object does NOT support operator ||");
-    }
-
     virtual bool is_true(const EvalValueT &a) {
         throw TypeErrorEx("The object does NOT support conversion to bool");
     }
