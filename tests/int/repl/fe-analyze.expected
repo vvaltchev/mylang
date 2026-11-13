@@ -15,6 +15,7 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 >> func bg(n) { var t = 0; for (var i = 0; i < 9; i++) { t += n; } };
 >> func ac(x) { var y = x; return y + 1; } func us(q) => ac(q);
 >> >> func k(int a) { return g(a); };
+>> func g2(int a) { var t = a + 1; return t * 2; } func k2(int b)=>g2(b);
 >> SyntaxError at line 1, col 9
 
     var x = ;
