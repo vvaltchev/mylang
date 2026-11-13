@@ -979,14 +979,16 @@ do_func_call(EvalContext *ctx,
         bindframe = &frame;
     }
 
-    if (!obj.func->params.empty()) {
-        do_func_bind_params(
-            obj.func->params, args, ctx, &args_ctx,
-            bindframe,
-            static_cast<size_t>(obj.func->min_args),
-            check_fit
-        );
-    }
+    /* EVERY call binds, a parameter-less one included: the bind is what
+     * checks the argument count, and a function with no parameters
+     * called with one (a dyn call, a builtin's callback) used to skip
+     * it here and run - the VM refuses that call (RULE 2) */
+    do_func_bind_params(
+        obj.func->params, args, ctx, &args_ctx,
+        bindframe,
+        static_cast<size_t>(obj.func->min_args),
+        check_fit
+    );
 
     /* question 5: a parse-time call runs a typed copy (its frame is the
      * copy's) */

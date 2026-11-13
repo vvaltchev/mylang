@@ -1,0 +1,36 @@
+# A function with NO parameters called with arguments is refused like any
+# other call with too many: InvalidNumberOfArgsEx, in every engine. Until
+# 2026-11-13 the tree-walker skipped the bind - and with it the argument
+# count check - for a parameter-less function, so a dyn call or a
+# builtin's callback ran it (`filter(func() => true, [1])` gave [1]) while
+# the VM refused the call.
+
+var bad = 0;
+func refused(what, f) {
+    try {
+        f();
+    } catch (InvalidNumberOfArgsEx) {
+        return;
+    }
+    print("FAIL " + what + ": not refused");
+    bad++;
+}
+
+func none_() => 1;
+func one(int x) => 2;
+var dyn fs = [none_, one];
+var dyn f0 = fs[int(runtime(0))];
+
+refused("a dyn call", func [f0] () { f0(5); });
+refused("filter", func () { filter(func() => true, [1]); });
+refused("map over a dict", func () { map(func() => 3, {"a": 1}); });
+refused("sort", func () { sort([3, 1, 2], func() => true); });
+refused("sum", func () { sum([1, 2], func() => 3); });
+refused("find", func () { find([1, 2], 2, func() => 2); });
+refused("make_array", func () { make_array(2, func() => 1); });
+refused("make_dict", func () { make_dict([1], func() => 1); });
+
+# the same function called with no argument still runs
+assert(f0() == 1);
+assert(bad == 0);
+print("ok");
