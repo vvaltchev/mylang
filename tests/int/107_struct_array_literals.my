@@ -1,0 +1,54 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): an array literal of POD struct constructions with
+# run-time fields is built in one step (MakeStructArrayV,
+# vm_make_struct_array_op):
+#  - one with more than 32 field values in all (here 11 three-field
+#    structs) gathers them in a heap buffer instead of a stack one;
+#  - a literal in a loop REUSES last iteration's array when its variable
+#    is its only holder, and must not when the array was stored
+#    elsewhere or a slice of it is alive - the kept array keeps the
+#    values it had.
+# The tree-walker is the oracle; every engine must print the same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+struct P { int x; int y; int z; }
+var k = int(runtime(1));
+
+var big = [P(k, 2, 3), P(k, 2, 3), P(k, 2, 3), P(k, 2, 3), P(k, 2, 3),
+           P(k, 2, 3), P(k, 2, 3), P(k, 2, 3), P(k, 2, 3), P(k, 2, 3),
+           P(k + 1, 2, 3)];
+var sb = 0;
+foreach (var p in big)
+    sb += p.x + p.y + p.z;
+want("eleven three-field structs", sb, 67);
+want("their storage", array_storage(big), "struct");
+
+var keep = [];
+var tot = 0;
+var sl_len = 0;
+for (var i = 0; i < 4; i++) {
+    var pts = [P(i, k, 1), P(k, i, 2)];
+    if (i == 1)
+        append(keep, pts);
+    if (i == 2) {
+        var sl = pts[0:1];
+        sl_len = len(sl) * 100 + sl[0].x;
+    }
+    foreach (var p in pts)
+        tot += p.x + p.y + p.z;
+}
+want("the loop's literals", tot, 32);
+want("an array stored elsewhere keeps its values", keep[0][0].x, 1);
+want("...all of them", keep[0][1].y, 1);
+want("a slice taken of it", sl_len, 102);
+
+assert(bad == 0);
+print("ok");
