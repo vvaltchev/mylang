@@ -5732,7 +5732,7 @@ private:
                     && target_is_param(e->lvalue.get(), params))
                 return true;
         bool found = false;
-        for_each_child(const_cast<Construct *>(c),
+        fmi_children(const_cast<Construct *>(c),
             [&](Construct *ch) {
                 if (body_mutates_param(ch, params)) found = true;
             });
