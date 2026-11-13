@@ -504,6 +504,7 @@ private:
                              StaticTypeRef want = nullptr);
     void check_deref(DerefExpr *d);
     void check_box_call(CallExpr *call);
+    void check_num_builtin_call(CallExpr *call, bool is_round);
     void check_value_into(StaticTypeRef dest, StaticTypeRef vt,
                           const std::string &field, Construct *at);
     void check_declared_store(Expr14 *e);
@@ -6803,6 +6804,39 @@ void Inferencer::check_box_call(CallExpr *call)
 }
 
 /*
+ * abs(x) and round(x, [digits]) (README): x must be an int or a float,
+ * digits an int. Any other type the compiler can see - a bool included
+ * (decided 2026-11-13) - is refused here: the call was typed as its
+ * argument (abs) or as a float (round), and the run time raised
+ * TypeErrorEx. A dyn argument is checked when the call runs.
+ */
+void Inferencer::check_num_builtin_call(CallExpr *call, bool is_round)
+{
+    /* every call has an argument list; one with no argument is evaluated
+     * while parsing (its arguments are all constant), so never gets here */
+    const auto &args = call->args->elems;
+    if (args.size() > (is_round ? 2u : 1u))
+        return;                         /* the arity is a run-time error */
+    for (size_t i = 0; i < args.size(); i++) {
+        Construct *a = args[i].get();
+        const StaticTypeRef t = static_type_resolve(type_of(a));
+        /* an unknown type is a name the resolver reports as undefined */
+        if (is_unknown(t) || is_dyn(t))
+            continue;
+        const StaticTypeKind k = strip(t)->kind;
+        if (k == StaticTypeKind::Int ||
+                (i == 0 && k == StaticTypeKind::Float))
+            continue;
+        const std::string what =
+            i == 1 ? "round()'s digit count is an int"
+                   : (is_round ? "round() needs an int or a float"
+                               : "abs() needs an int or a float");
+        mismatch(what + ", not '" + static_type_to_string(t) + "'",
+                 a->start, a->end);
+    }
+}
+
+/*
  * The element (or, `key`, the dict key) type of the DECLARED container a
  * store or an append writes into (declared_type_of `base`): an array or a
  * dict. Null otherwise.
@@ -8030,6 +8064,10 @@ void Inferencer::check_call(CallExpr *call)
             check_builtin_store(call);
             if (cid->uid->val == std::string_view("box"))
                 check_box_call(call);
+            else if (cid->uid->val == std::string_view("abs"))
+                check_num_builtin_call(call, false);
+            else if (cid->uid->val == std::string_view("round"))
+                check_num_builtin_call(call, true);
             return;                       /* builtin arity checked at runtime */
         } else if (s) {
             mismatch("'" + std::string(cid->uid->val) +
