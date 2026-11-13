@@ -8,7 +8,7 @@
 # values never depend on it):
 #  - the foreach DIRECT read of a field (the VM's sf.add and
 #    LoadStructFieldInt/Float, vm_struct_field_int/float) - an int, a
-#    float, and an int field read into a float sum;
+#    float, a bool, and an int field read into a float sum;
 #  - the subscript form `ps[i].f` (LoadStructFieldInt/Float with the
 #    bounds check, vm_struct_elem_field) - int, float and bool fields, each
 #    read as an int and as a float, a negative index, and an index past
@@ -51,6 +51,10 @@ foreach (var promote in [false, true]) {
     foreach (var p in ps)
         sxf += p.x;
     want(tag + " foreach int into a float", sxf, promote ? 8.0 : 3.0);
+    var sb = 0;
+    foreach (var p in ps)
+        sb += p.b;
+    want(tag + " foreach bool", sb, promote ? 2 : 1);
 
     # the subscript form
     var ti = 0;
