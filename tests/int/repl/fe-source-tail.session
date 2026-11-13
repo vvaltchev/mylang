@@ -1,0 +1,11 @@
+# :source of a file whose last unit never closes: the tail is tried
+# anyway and refused, while the units before it ran. :trace's category
+# list under its other two names, and the :globals row of an explicit
+# pure function's typed instance ("pure func", its inferred types).
+:source tests/int/repl/source-trailing-open.txt
+src_ok
+:trace ?
+:trace list
+pure func pt(x) => x * 2
+pt(int(runtime(3)))
+:globals
