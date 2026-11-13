@@ -1,0 +1,57 @@
+# INT-ENGINES: tw default nj nbi noopt
+#
+# INT unit (#107): containers whose element type is optional or a box -
+# `array<bool?>` read and compared, a `box<P>?` dereferenced once
+# narrowed, a loop over boxes of a struct and of an int, an
+# `array<box<int>?>` element read through a variable. The compiler's
+# per-element hints (a bool element, a struct element read in place) must
+# take the optional and boxed element types for what they are; every
+# engine must print what the tree-walker does.
+
+var bad = 0;
+func want(what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+struct P { int x; int y; }
+
+array<bool?> ab = [true, none, false];
+var nb = 0;
+for (var i = 0; i < len(ab); i++)
+    if (ab[i] == true)
+        nb++;
+want("true elements of array<bool?>", nb, 1);
+want("a none element of array<bool?>", ab[1], none);
+
+box<P>? bp = box(P(1, 2));
+var bx = -1;
+if (bp != none)
+    bx = (*bp).x;
+want("a narrowed box<P>?", bx, 1);
+
+var bs = [box(P(3, 4)), box(P(5, 6))];
+var sy = 0;
+foreach (b in bs)
+    sy += (*b).y;
+want("a loop over boxes of a struct", sy, 10);
+
+var bi = [box(1), box(2)];
+var t = 0;
+foreach (b in bi)
+    t += *b;
+want("a loop over boxes of an int", t, 3);
+
+array<box<int>?> obi = [box(4), none];
+var e0 = obi[0];
+var e1 = obi[1];
+var v0 = -1;
+if (e0 != none)
+    v0 = *e0;
+want("an array<box<int>?> element", v0, 4);
+want("its none element", e1, none);
+
+assert(bad == 0);
+print("ok");
