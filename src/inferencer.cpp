@@ -7536,6 +7536,19 @@ bool Inferencer::fold_type_query(CallExpr *call)
         argcount(std::string(fn) + " expects exactly one argument",
                  call->start, call->end);
 
+    /* a type query INSIDE the operand is folded first, and so checked:
+     * the operand is retired below without the check pass ever reaching
+     * it, so `typestr(decltype(len))` printed "Type" where `decltype(len)`
+     * alone is refused (a builtin is not a variable) */
+    std::function<void(Construct *)> fold_inner = [&](Construct *c) {
+        if (!c)
+            return;
+        for_each_child(c, fold_inner);
+        if (ctag(c) == ConstructType::call)
+            fold_type_query(static_cast<CallExpr *>(c));
+    };
+    fold_inner(args->elems[0].get());
+
     StaticTypeRef t;
     if (is_decltype) {
         auto *argid = node_cast<Identifier>(args->elems[0].get());

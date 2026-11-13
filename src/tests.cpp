@@ -1154,6 +1154,12 @@ static const std::vector<test> tests =
     { "err loc: decltype of a builtin is refused",
       { "print(decltype(len));" },
       &typeid(TypeMismatchEx), 16, 1, 20, 1 },
+    /* ...and so is one inside another type query, at any depth: the
+     * outer query folds its operand away unchecked, so the inner one is
+     * folded (and checked) first */
+    { "err loc: decltype of a builtin inside a type query is refused",
+      { "print(typestr([decltype(len)]));" },
+      &typeid(TypeMismatchEx), 25, 1, 29, 1 },
     { "a program's own typestr and kindstr are called",
       { "func typestr(x) => 1; func kindstr(x) { return 7; }",
         "assert(typestr(5) == 1 && kindstr(2.5) == 7);" } },

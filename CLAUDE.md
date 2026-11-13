@@ -4856,6 +4856,9 @@ decisions behind it: `plans/archived/type-inference.md`,
   `id_sym` - freeing it was a heap-use-after-free in both dumps
   (`driver_checks` runs them over a folded query). A pass that cuts
   a subtree out of the tree while those maps are live does the same.
+  And because the check pass never reaches a retired operand, a type
+  query INSIDE it is folded first, innermost first, so it applies its
+  own rule (`typestr(decltype(len))` printed "Type" until 2026-11-13).
   The `?`-suffix nullability format (`static_type_to_string`) matches
   `:type` and error messages.
 - **Nullable `?` suffix, `~` short form, `null` alias.** `?` is a token
