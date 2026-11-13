@@ -6743,8 +6743,7 @@ private:
      */
     bool arg_is_inert(const Construct *c) const
     {
-        if (!c)
-            return false;
+        ML_CHECK(c);
         switch (ctag(c)) {
         case ConstructType::lit_int:
         case ConstructType::lit_bool:
@@ -6772,20 +6771,20 @@ private:
                 && !re[static_cast<size_t>(sl)];
         }
         case ConstructType::expr02: {
+            /* pExpr02 builds one only for a prefix + - ! ~ over one
+             * operand, and `~` over a non-int is a type error */
             auto *u = static_cast<const MultiOpConstruct *>(c);
-            if (u->elems.size() != 1)
-                return false;
-            const Op op = u->elems[0].first;
+            ML_CHECK(u->elems.size() == 1);
+            /* the operator is read by the checks alone (no local: an
+             * ASSERTS=0 build compiles them out) */
             const Construct *e = u->elems[0].second.get();
-            if (op == Op::invalid)
-                return arg_is_inert(e);
-            if (!e || e->th == TypeHint::none)
+            ML_CHECK(e && (u->elems[0].first == Op::plus
+                           || u->elems[0].first == Op::minus
+                           || u->elems[0].first == Op::lnot
+                           || u->elems[0].first == Op::bnot));
+            if (e->th == TypeHint::none)
                 return false;
-            if (op == Op::bnot && e->th != TypeHint::i)
-                return false;
-            if (op != Op::plus && op != Op::minus && op != Op::lnot
-                    && op != Op::bnot)
-                return false;
+            ML_CHECK(u->elems[0].first != Op::bnot || e->th == TypeHint::i);
             return arg_is_inert(e);
         }
         case ConstructType::expr03:
@@ -6801,12 +6800,12 @@ private:
             for (size_t k = 0; k < mo->elems.size(); k++) {
                 const Op op = mo->elems[k].first;
                 const Construct *e = mo->elems[k].second.get();
-                if (!e || e->th == TypeHint::none || !arg_is_inert(e))
+                ML_CHECK(e);
+                if (e->th == TypeHint::none || !arg_is_inert(e))
                     return false;
                 switch (op) {
                 case Op::invalid:
-                    if (k != 0)
-                        return false;
+                    ML_CHECK(k == 0);       /* only the first operand */
                     break;
                 case Op::plus: case Op::minus: case Op::times:
                 case Op::lt: case Op::gt: case Op::le: case Op::ge:
@@ -6814,8 +6813,6 @@ private:
                 case Op::land: case Op::lor:
                     break;
                 case Op::band: case Op::bor: case Op::bxor:
-                    if (e->th != TypeHint::i)
-                        return false;
                     break;
                 case Op::div: case Op::mod:
                     /* only by a LITERAL that cannot fail: not 0 (the
@@ -6837,12 +6834,12 @@ private:
                 default:
                     return false;   /* a shift, a runtime divisor: throws */
                 }
-                /* the bitwise ops need EVERY operand int, incl. the first */
-                if ((ctag(c) == ConstructType::expr08
-                     || ctag(c) == ConstructType::expr09
-                     || ctag(c) == ConstructType::expr10)
-                        && e->th != TypeHint::i)
-                    return false;
+                /* the bitwise ops take only ints (and bools, stamped
+                 * `i`): any other operand is a type error */
+                ML_CHECK((ctag(c) != ConstructType::expr08
+                          && ctag(c) != ConstructType::expr09
+                          && ctag(c) != ConstructType::expr10)
+                         || e->th == TypeHint::i);
             }
             return !mo->elems.empty();
         }
