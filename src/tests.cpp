@@ -1113,6 +1113,24 @@ static const std::vector<test> tests =
     { "err loc: a struct field with no name",
       { "struct S { int ; }" },
       &typeid(SyntaxErrorEx), 16, 1 },
+    /* A struct variable with no initializer gets each field's zero value,
+     * a nested struct's recursively - also through a field typed by a
+     * struct declared further down, once it is declared above the
+     * variable (until 2026-11-13 that field got `none` and the variable
+     * was refused). A struct declared below the variable, and a non-opt
+     * `dyn` field (no zero value), are compile errors marking the
+     * variable (the caret was inverted, `col 23:22`). */
+    { "a struct field typed by a struct declared below it zero-initializes",
+      { "struct A { B b; int k; } struct B { C c; } struct C { float f; }",
+        "A a; assert(a.b.c.f == 0.0 && a.k == 0);",
+        "class N { M m; } class M { int v; } N n; n.m.v = 4;",
+        "assert(n.m.v == 4);" } },
+    { "err loc: no zero value for a non-opt dyn field",
+      { "struct A { dyn d; } A a; print(a);" },
+      &typeid(NullabilityEx), 23, 1, 25, 1 },
+    { "err loc: no zero value for a struct declared below the variable",
+      { "struct A { B b; } A a; struct B { int x; } print(a);" },
+      &typeid(NullabilityEx), 21, 1, 23, 1 },
     /* a typed `const` scalar is converted as a typed variable is: a float
      * from a float, an int or a bool, an int from a bool; a typed const
      * container is checked by the inferencer, not here */
