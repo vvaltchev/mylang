@@ -249,4 +249,8 @@ pure int func pu$0(int x) => x + 1;
 >> >> >> => R(a: 1)
 >> >> >> => R(a: 1, b: 2)
 >> /* pure */ R func mkr() => R(1, 2);
+>> >> int func lam9() {
+    /* pure */ func (x) => x;
+    return 1;
+}
 >> 
