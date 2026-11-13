@@ -1,14 +1,12 @@
-# INT-ENGINES: tw default nj noopt nc
-#
-# INT unit (#107): an explicit `pure` function's stores into DECLARED
-# places are widened by the parser (pure_stamp_stores / pure_place_annot),
-# because a call with constant arguments RUNS while parsing, before
-# inference. Each place kind is here - a dict value, a field of a nested
-# struct, an element of a declared float array (plain and compound), a
-# multi-declaration and a multi-assignment, a foreach variable, a catch
-# binding, a for loop's own variable, and an element of a container no
-# declaration states - and the constant call must print exactly what the
-# same call made at run time prints, in every engine (RULE 2).
+# An explicit `pure` function's stores into DECLARED places are widened
+# by the parser (pure_stamp_stores / pure_place_annot), because a call with
+# constant arguments RUNS while parsing, before inference. Each place kind
+# is here - a dict value, a field of a nested struct, an element of a
+# declared float array (plain and compound), a multi-declaration and a
+# multi-assignment, a foreach variable, a catch binding, a for loop's own
+# variable, and an element of a container no declaration states - and the
+# constant call must print exactly what the same call made at run time
+# prints, in every engine (RULE 2).
 
 struct In { float v; }
 struct Out { In inner; int n; }
