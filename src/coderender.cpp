@@ -579,17 +579,17 @@ struct Renderer {
             if (auto *lv = node_cast<const Identifier>(e14->lvalue.get()))
                 o << decl_kw(lv, e14->rvalue.get(), is_const) << " "
                   << lv->get_str();
-            else if (auto *l = node_cast<const IdList>(
-                         e14->lvalue.get())) {
-                /* `var a, b = ...`: the keyword of the first target (the
-                 * annotation and the modifiers apply to all of them) */
-                o << (l->elems.empty()
-                          ? string(is_const ? "const" : "var")
-                          : decl_kw(l->elems[0].get(), nullptr, is_const))
-                  << " ";
+            else {
+                /* `var a, b = ...`: a declaration's only other target is
+                 * an IdList, which the parser builds from a first name and
+                 * at least one more. The keyword is the first target's
+                 * (the annotation and the modifiers apply to all). */
+                ML_CHECK(e14->lvalue->is_idlist());
+                auto *l = static_cast<const IdList *>(e14->lvalue.get());
+                ML_CHECK(!l->elems.empty());
+                o << decl_kw(l->elems[0].get(), nullptr, is_const) << " ";
                 expr_inner(l);
-            } else
-                expr(e14->lvalue.get(), 0);
+            }
             o << " = ";
             expr(e14->rvalue.get(), 0);
             return;
