@@ -17123,6 +17123,15 @@ static const std::vector<test> tests =
             "var n = 0;",
             "try { throw S(4); } catch (T as e) { n = e.a; }",
             "assert(n == 4);",
+            /* a constant multi-declaration: an element, a struct spread
+             * to every target, an element of a baked array */
+            "struct P { int b; }",
+            "const A2, B2 = S;",
+            "pure func both() => [S, P];",
+            "const A3, B3 = both();",
+            "const R, A4 = [[1], S];",
+            "assert(B2(1).a == 1 && B3(2).b == 2 && A4(3).a == 3);",
+            "assert(R[0] == 1 && typestr(B3(2)) == \"P\");",
         },
     },
     { "err loc: a type alias's construction is checked as the struct's",

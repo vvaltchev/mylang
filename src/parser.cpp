@@ -2668,11 +2668,14 @@ ShouldConstSymbolExistAtRuntime(const EvalValue& rvalue)
  * reads it like any constant's value. Nothing for another value.
  */
 static void
-alias_literal(ParseContext &c, unique_ptr<Construct> &node)
+alias_literal(ParseContext &c, unique_ptr<Construct> &node,
+              const EvalValue *value = nullptr)
 {
     if (!node || node_cast<LiteralObj>(node.get()))
         return;
-    const EvalValue v = RValue(node->eval(c.const_ctx));
+    /* the value the declaration already bound, when the caller has it: a
+     * second evaluation of a constant call is work and nothing else */
+    const EvalValue v = RValue(value ? *value : node->eval(c.const_ctx));
     if (!v.is<StructTypeDef *>())
         return;
     auto lit = make_unique<LiteralObj>(v, true);
@@ -3089,8 +3092,12 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
         }
 
         /* a type alias (`const T = S;`) holds its struct's descriptor at
-         * run time, whatever expression named it */
+         * run time, whatever expression named it - and so does each
+         * target a multi-declaration spreads one to (`const A, B = S;`;
+         * a literal's elements were done above) */
         if (ctag(ret->lvalue.get()) == ConstructType::id)
+            alias_literal(c, ret->rvalue, &rvalue);
+        else if (ctag(ret->rvalue.get()) != ConstructType::lit_arr)
             alias_literal(c, ret->rvalue);
 
         ret->fl |= pInConstDecl;

@@ -4676,31 +4676,35 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
 }
 
 /* The struct a type alias's initializer names: the parser made it a
- * literal of the descriptor (alias_literal), and a constant
- * multi-declaration's element is one too, or an element of a baked
- * array. Null for any other value. */
+ * literal of the descriptor (alias_literal) - a constant
+ * multi-declaration's element too, or one it spreads to every target -
+ * or it is an element of a baked array. Null for any other value. The
+ * index is in range: a constant multi-declaration unpacks at parse time,
+ * where a wrong count is an error. */
 static const StructTypeDef *alias_struct_of(const Construct *rv, size_t i,
                                             bool element)
 {
-    if (!element) {
-        auto *lo = node_cast<const LiteralObj>(rv);
-        const EvalValue *v = lo ? &lo->literal_value() : nullptr;
-        return v && v->is<StructTypeDef *>() ? v->get<StructTypeDef *>()
-                                             : nullptr;
-    }
-    if (auto *la = node_cast<const LiteralArray>(rv))
-        return i < la->elems.size()
-            ? alias_struct_of(la->elems[i].get(), 0, false) : nullptr;
+    if (element)
+        if (auto *la = node_cast<const LiteralArray>(rv)) {
+            ML_CHECK(i < la->elems.size());
+            return alias_struct_of(la->elems[i].get(), 0, false);
+        }
     auto *lo = node_cast<const LiteralObj>(rv);
-    if (!lo || !lo->literal_value().is<SharedArrayObj>())
+    if (!lo)
         return nullptr;
-    const SharedArrayObj &a = lo->literal_value().get_ref<SharedArrayObj>();
+    const EvalValue &v = lo->literal_value();
+    if (v.is<StructTypeDef *>())
+        return v.get<StructTypeDef *>();
+    if (!element || !v.is<SharedArrayObj>())
+        return nullptr;
+    const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
     /* a descriptor is a general element (get_view() would promote any
      * other kind in place) */
-    if (a.skind() != SharedArrayObj::Storage::general || i >= a.size())
+    if (a.skind() != SharedArrayObj::Storage::general)
         return nullptr;
-    const EvalValue &v = a.get_view()[i].get();
-    return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>() : nullptr;
+    ML_CHECK(i < a.size());
+    const EvalValue &e = a.get_view()[i].get();
+    return e.is<StructTypeDef *>() ? e.get<StructTypeDef *>() : nullptr;
 }
 
 /* `const T = S;` - a TYPE ALIAS (README, *Type aliases*): T's symbol names
