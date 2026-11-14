@@ -15768,9 +15768,11 @@ static bool bc_collapse_capture_moves(Chunk &ck)
                              >= static_cast<int>(OpCode::IntAddRR)
                          && static_cast<int>(op)
                              <= static_cast<int>(OpCode::FloatMulRI);
+        /* (IntModRI is a member of the family range, so `fam` is its
+         * answer: listed again here it was a term no op could decide) */
         const bool listed = fam || op == OpCode::IntBin
             || op == OpCode::FloatBin || op == OpCode::CmpIntV
-            || op == OpCode::CmpFloatV || op == OpCode::IntModRI
+            || op == OpCode::CmpFloatV
             || op == OpCode::IntAddModRI || op == OpCode::LoadImmInt
             || op == OpCode::LoadImmFloat || op == OpCode::MoveV
             || op == OpCode::LoadElemInt || op == OpCode::LoadElemFloat;
