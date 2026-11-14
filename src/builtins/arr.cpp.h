@@ -388,7 +388,9 @@ static bool arr_elem_fits(const SharedArrayObj &arr, const EvalValue &elem)
         if (!elem.is<intrusive_ptr<StructObject>>())
             return false;
         const StructObject &o = *elem.get<intrusive_ptr<StructObject>>();
-        return o.is_pod() && o.def == arr.flat_structs().def;
+        /* a VALUE of the def: a box<P> shares P's def but is a
+         * reference */
+        return o.is_pod() && !o.is_ref() && o.def == arr.flat_structs().def;
     }
     default:                /* general; strs and objs promote */
         return true;
@@ -452,7 +454,7 @@ static bool arr_push_value(SharedArrayObj &arr, const EvalValue &elem,
             return arr_push_refused(fits);
         const StructObject &o = *elem.get<intrusive_ptr<StructObject>>().get();
         auto &sv = arr.flat_structs();
-        if (!o.is_pod() || o.def != sv.def)
+        if (!o.is_pod() || o.is_ref() || o.def != sv.def)
             return arr_push_refused(fits);
         const size_t at = sv.buf.size();
         sv.buf.resize(at + sv.stride);

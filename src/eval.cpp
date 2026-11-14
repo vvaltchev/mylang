@@ -2759,10 +2759,16 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
     StructTypeDef *sdef = nullptr;
     int sstride = 0;
 
+    /* a POD struct VALUE: a box<P> has P's def and P's bytes, but it is a
+     * reference - packed into the bytes it would stop being one (a store
+     * through the array's element no longer reached the box, 2026-11-14) */
     auto is_pod_struct_of = [](const EvalValue &v, StructTypeDef *d) -> bool {
-        return v.is<intrusive_ptr<StructObject>>() &&
-               v.get<intrusive_ptr<StructObject>>()->is_pod() &&
-               (d == nullptr || v.get<intrusive_ptr<StructObject>>()->def == d);
+        if (!v.is<intrusive_ptr<StructObject>>())
+            return false;
+        /* get_ref, not get: the handle is only read, and each copy's
+         * release is branches no run takes */
+        const StructObject &o = *v.get_ref<intrusive_ptr<StructObject>>();
+        return o.is_pod() && !o.is_ref() && (d == nullptr || o.def == d);
     };
     auto append_struct_bytes = [&](const EvalValue &v) {
         const StructObject &o = *v.get<intrusive_ptr<StructObject>>().get();
@@ -4678,8 +4684,11 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
             apply_compound_op(r, r0, op);
         }
 
+        /* a box<P> is not a P value (its def is P's): refused like any
+         * other type, never packed into the bytes */
         if (!r.is<intrusive_ptr<StructObject>>() ||
             !r.get<intrusive_ptr<StructObject>>()->is_pod() ||
+            r.get<intrusive_ptr<StructObject>>()->is_ref() ||
             r.get<intrusive_ptr<StructObject>>()->def != sv0.def)
             throw TypeErrorEx(
                 "Cannot store a value of a different type in a flat (typed) "

@@ -1,0 +1,9 @@
+# INT-SOURCE: ../functional/117_box_in_struct_array.my
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): a box<P> is never packed into a flat array of P
+# values. The functional program runs as a coverage unit too, under the
+# engines above, with no second copy (INT-SOURCE); it asserts its own
+# results and every engine must print the same. It owns the refusals of
+# a store and an append of a box into a flat array<P> through a `dyn`
+# name, which no other unit reaches.

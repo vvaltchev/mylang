@@ -1,0 +1,55 @@
+# A box<P> has P's definition and P's bytes, but it is a REFERENCE
+# (README *Boxes*), so it may never be packed into the bytes of a flat
+# array of P values. An array literal whose first element was a P value
+# took flat struct storage and copied a later box into it, and so did a
+# store or an append through a `dyn` name: a write through the element
+# then no longer reached the box (2026-11-14).
+
+struct P { int x; int y; }
+var b = box(P(3, 4));
+
+# a literal holding a P value and a box is a general array of both
+var dyn mixed = runtime([P(1, 2), b]);
+assert(array_storage(mixed) == "general");
+func setx(dyn arr, int v) { arr[1].x = v; return arr[1].x; }
+assert(setx([P(1, 2), b], 70) == 70);
+assert((*b).x == 70);
+mixed[1].y = 80;
+assert((*b).y == 80);
+
+# the box first, then a value: already general
+var dyn other = runtime([b, P(1, 2)]);
+other[0].x = 71;
+assert((*b).x == 71);
+
+# into a flat array<P> through a dyn name: a value of another type,
+# refused with the array left as it was (README *Flat arrays*)
+array<P> flat = [P(1, 2), P(5, 6)];
+var dyn d = flat;
+var refused = 0;
+try { d[0] = b; } catch (TypeErrorEx) { refused++; }
+try { append(d, b); } catch (TypeErrorEx) { refused++; }
+assert(refused == 2);
+assert(array_storage(flat) == "struct" && len(flat) == 2);
+assert(flat[0].x == 1 && flat[1].x == 5);
+
+# insert promotes the array and keeps the reference
+var dyn g = [P(1, 2)];
+insert(g, 0, b);
+g[0].x = 72;
+assert((*b).x == 72);
+
+# a typed place takes no such literal either: built general, it is not an
+# array<P>, so a declared variable, a parameter and a struct field refuse
+# it (README *A `dyn` value entering a typed place*) - packed flat, each
+# took it. Without types (-nti) only the bind and the constructor check.
+var typed = typestr(runtime(0)) == "dyn";
+func kind(array<P> xs) { return array_storage(xs); }
+struct H { array<P> ps; }
+var dyn db = runtime(b);
+var misfits = 0;
+try { array<P> c = [P(5, 5), db]; } catch (TypeErrorEx) { misfits++; }
+try { kind([P(0, 0), db]); } catch (TypeErrorEx) { misfits++; }
+try { var h = H([P(0, 0), db]); } catch (TypeErrorEx) { misfits++; }
+assert(misfits == (typed ? 3 : 2));
+print("ok");

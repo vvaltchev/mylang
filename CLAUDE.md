@@ -7674,6 +7674,13 @@ but the per-element `StructObject` allocation is gone (build overhead
     the def matches - and a box<P> has P's def. Without the test a `dyn`
     variable or a temp that last held `box(P(..))` turned the next
     `P(..)` into a box (`tests/functional/94_struct_reuse_boxed.my`).
+  - **Flat struct storage holds VALUES, so it asks `is_ref()` beside the
+    def.** A box<P> has P's def and P's bytes: an array literal that
+    began with a P value (`build_array_from_values`), a store and an
+    append through a `dyn` name (`flat_store_core`, `arr_push_value` /
+    `arr_elem_fits`) packed it into the bytes, and a write through the
+    element no longer reached the box (2026-11-14,
+    `tests/functional/117_box_in_struct_array.my`).
   - **A store through `*` writes shared storage**: `lvalue_chain_root`,
     `fmi_base_id`, `fr_base_id` and `fr_store_reaches_shared` walk through
     a `DerefExpr`, and `fr_immutable` never treats `*b` as invariant.
