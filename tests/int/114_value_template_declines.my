@@ -1,0 +1,33 @@
+# INT-ENGINES: tw default nj nbi
+#
+# INT unit (#107): value uses of a template the instantiation through
+# values must DECLINE. `g` is called with an int and then a float, so
+# its sites disagree on the signature and `sq` keeps its base; `h` is a
+# dyn name called once with two arguments, an arity the template
+# cannot take, so `half` is not instantiated for it either (the call
+# raises InvalidNumberOfArgsEx at run time, and the program catches
+# it). `later` is a template whose instances each hold a value use.
+
+func sq(x) => x * x;
+func half(x) => x / 2;
+func twice(x) => x + x;
+func pick(int k) {
+    var g = sq;
+    var a = g(k);
+    var b = g(k + 0.5);
+    return str(a) + " " + str(b);
+}
+print(pick(runtime(3)));
+func arity(int k) {
+    var dyn h = half;
+    var caught = 0;
+    try { h(k, k); } catch (InvalidNumberOfArgsEx) { caught++; }
+    return caught + h(k);
+}
+print(arity(runtime(8)));
+func later(y) {
+    var t = twice;
+    return t(y);
+}
+print(later(runtime(4)));
+print(later(runtime(1.5)));
