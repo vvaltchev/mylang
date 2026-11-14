@@ -3278,6 +3278,21 @@ The chain is part of the report only: a script cannot read it.
 The following built-in functions will be evaluated during *parse-time* when
 const arguments are passed to them.
 
+Such a call is still **typed as the call**, by the builtin's own rule, never
+as the value it computes: `get(D, "a")` is an `int?` and `dict(pairs)` a
+`dict<dyn, dyn>` even when every argument is a constant. The value replaces
+the call once the whole program is typed, as for a constant call to a user
+function (see *Calling functions during const-evaluation*), so turning
+folding off (`-nc`) changes nothing a program can see:
+
+```
+const D = {"a": 1};
+var g = get(D, "a");
+print(g + 1);             # compile error: g is an int?, which may be none
+if (g != none)
+    print(g + 1);         # 2
+```
+
 **A declaration wins over the builtin it shadows.** A `var`/`const` may not
 take a const builtin's name at all (`var len = 7;` is a compile-time
 `CannotRebindBuiltinEx`), but a **function**, a **parameter** and a **foreach

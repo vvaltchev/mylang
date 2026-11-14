@@ -227,8 +227,13 @@ public:
      * Null: no literal can stand for it, and the node runs. Parse and
      * inference time only; a clone carries both (a template instance
      * cloned from a body during inference folds the same way).
+     * `late_fold_witness`: the literal only WITNESSES the value's type -
+     * the parse would not have baked it (an array outside a declaration)
+     * - so it decides whether an enclosing deferred node may fold
+     * (late_fold_fits) and is never swapped in itself.
      */
     bool defer_fold = false;
+    bool late_fold_witness = false;
     std::unique_ptr<Construct> late_fold;
 
     /*
@@ -321,6 +326,7 @@ public:
         d.arr_hint = arr_hint;
         d.arr_hint_struct = arr_hint_struct;
         d.defer_fold = defer_fold;
+        d.late_fold_witness = late_fold_witness;
         d.late_fold = late_fold ? late_fold->clone() : nullptr;
     }
 };

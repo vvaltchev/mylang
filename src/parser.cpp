@@ -1161,21 +1161,40 @@ pHoldsDeferred(Construct *n)
  * Evaluate the node, as the fold would - its errors are the same compile
  * errors - and keep the literal it folds to for apply_late_folds. A
  * value naming a function keeps none: inference may name that function
- * from elsewhere (a callee set), so the node stays and runs.
+ * from elsewhere (a callee set), so the node stays and runs. A value the
+ * fold would not bake (an array outside a declaration: `sort(K)` inside
+ * `sum(sort(K))`) is kept as a WITNESS of its type, so the enclosing
+ * call may still fold (late_fold_fits checks every deferred node inside
+ * it) while this one stays a call, as the fold left it.
  */
 static void
 pDeferFold(ParseContext &c, Construct *node,
            bool process_arrays, bool immutable)
 {
     node->defer_fold = true;
-    const EvalValue v = RValue(node->eval(c.const_ctx));
+    EvalValue v = RValue(node->eval(c.const_ctx));
     unique_ptr<Construct> lit;
     node->nc_folds = MakeConstructFromConstVal(v, lit, process_arrays,
                                                immutable);
     std::unordered_set<const FuncDescriptor *> descs;
     collect_value_descs(v, descs);
-    if (node->nc_folds && descs.empty())
+    /* a node can be deferred twice - the call, then the declaration
+     * whose value it is (which bakes arrays) - and the second decides */
+    node->late_fold.reset();
+    node->late_fold_witness = false;
+    if (!descs.empty())
+        return;
+    if (node->nc_folds) {
+        /* as cse_materialize marks a bake: whether the unfolded node
+         * builds to its place's storage */
+        if (ctag(lit.get()) == ConstructType::lit_obj)
+            static_cast<LiteralObj *>(lit.get())->takes_hint =
+                node_takes_hint(c, node);
         node->late_fold = std::move(lit);
+    } else {
+        node->late_fold = make_unique<LiteralObj>(std::move(v), true);
+        node->late_fold_witness = true;
+    }
 }
 
 bool
@@ -1734,14 +1753,22 @@ pAcceptCallExpr(ParseContext &c,
             nc_eval_const(c, expr.get(), (fl & pFlags::pInConstDecl) != 0,
                           (fl & pFlags::pInConstDecl) != 0);
 
-        /* #96: a call to a user function, or one holding one */
-        if (expr->is_const && pDefersFolds(c, fl)
-                && (RValue(expr->what->eval(c.const_ctx))
-                        .is<intrusive_ptr<FuncObject>>()
-                    || pHoldsDeferred(expr.get())))
+        /* #96: a call - to a user function or to a builtin - waits for
+         * inference. A builtin's value has an exact type its call does
+         * not: `get(D, "a")` is `int?` and its value 1 an `int`, so
+         * folded here `g + 1` compiled where -nc refused it (RULE 2), and
+         * `dict(pairs)` typed `dict<str,int>` against `dict<dyn,dyn>` */
+        if (expr->is_const && pDefersFolds(c, fl)) {
             pDeferFold(c, expr.get(), false, false);
+            /* -a: marked as the fold below marks it; a late fold the
+             * types refuse is folded by AutoConst, which marks it too */
+            if (c.analysis && expr->late_fold)
+                if (auto *cid = node_cast<Identifier>(expr->what.get()))
+                    c.analysis->mark(cid->start,
+                        static_cast<int>(cid->get_str().length()),
+                        AnnoKind::folded);
 
-        else if (c.folding() && expr->is_const) {
+        } else if (c.folding() && expr->is_const) {
 
             /* -a: this call is about to fold to a literal at compile time -
              * color the callee identifier magenta before it is gone. */

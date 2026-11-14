@@ -30171,6 +30171,56 @@ static bool late_fold_shape()
             return false;
         }
     }
+
+    /* a constant BUILTIN call defers the same way: a call over a call
+     * whose array the fold does not bake (`sort(K)`, a type WITNESS)
+     * folds whole; `get` folds once typed (int? takes its int); the
+     * array call itself stays a call, as the fold left it; a function
+     * literal given to a builtin does not stop the fold; and a
+     * declaration's value, which the fold bakes, is the literal */
+    const char *bsrc =
+        "const K = [3, 1, 2];\n"
+        "const D = {\"a\": 1};\n"
+        "var v = range(4);\n"
+        "print(sum(sort(K)), get(D, \"a\"), sort(K),\n"
+        "      len(map(pure func(x) => x + 1, K)));\n";
+    for (const bool typed : { true, false }) {
+        std::vector<Tok> toks;
+        lexer(bsrc, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), typed);
+        auto *b = static_cast<Block *>(root.get());
+        CallExpr *pr = nullptr;
+        const Construct *vrv = nullptr;
+        for (auto &e : b->elems) {
+            if (ctag(e.get()) == ConstructType::call)
+                pr = static_cast<CallExpr *>(e.get());
+            if (ctag(e.get()) == ConstructType::expr14)
+                vrv = static_cast<Expr14 *>(e.get())->rvalue.get();
+        }
+        if (!pr || pr->args->elems.size() != 4 || !vrv) {
+            fprintf(stderr, "late_fold_shape: no builtin print / decl\n");
+            return false;
+        }
+        const auto &a = pr->args->elems;
+        const bool sum_f = ctag(a[0].get()) == ConstructType::lit_int
+            && static_cast<LiteralInt *>(a[0].get())->ival() == 6;
+        const bool get_f = ctag(a[1].get()) == ConstructType::lit_int;
+        const bool sort_c = ctag(a[2].get()) == ConstructType::call;
+        const bool map_f = ctag(a[3].get()) == ConstructType::lit_int
+            && static_cast<LiteralInt *>(a[3].get())->ival() == 3;
+        const bool decl_f = ctag(vrv) == ConstructType::lit_obj;
+        if (!sum_f || !get_f || !sort_c || !map_f || !decl_f) {
+            fprintf(stderr, "late_fold_shape (builtins, %s): sum(sort(K)) "
+                    "folded %d, get folded %d, sort(K) a call %d, "
+                    "len(map(..)) folded %d, range(4) baked %d\n",
+                    typed ? "typed" : "-nti", sum_f, get_f, sort_c, map_f,
+                    decl_f);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -30395,6 +30445,23 @@ static bool const_fold_equivalence()
             "const array<array<float>> C = [[1], g()];",
             "array<dict<str, float>> e = [dict(1.5), {\"k\": 2}];",
             "print(a, d, C, e, e[0][\"q\"]);" } },
+        /* a constant BUILTIN call is typed as the call, not as its value:
+         * folded while parsing, `get` (int?) read as its value's int, so
+         * `g + 1` compiled where -nc refused it, and `dict(pairs)` typed
+         * dict<str,int> against dict<dyn,dyn> */
+        { "a folded get() is opt", {
+            "const D = {\"a\": 1};",
+            "var g = get(D, \"a\");",
+            "print(g + 1);" } },
+        { "a folded find() is opt, and narrows", {
+            "var w = find([1, 2], 2);",
+            "if (w != none) print(w + 10);",
+            "print(typestr(w), typestr(find([1, 2], 2)));" } },
+        { "a folded dict(pairs) is typed as the call", {
+            "var d1 = dict([[\"a\", 1]]);",
+            "var k = keys(d1);",
+            "print(typestr(d1), typestr(k), array_storage(k));",
+            "print(typestr(dict([[\"b\", 2.5]])));" } },
     };
 
     bool ok = true;

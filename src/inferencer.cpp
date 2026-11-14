@@ -2693,6 +2693,12 @@ bool Inferencer::late_fold_fits_one(Construct *node, Construct *lit)
  * callee_desc on a call outside the node), and a retired literal's
  * descriptor dies with the inferencer - every shape tried so far has the
  * literal refused by the argument check, or its stamp read by no one.
+ * The one exception is a literal written as an ARGUMENT of a BUILTIN
+ * call (`map(pure func(x) => x * 2, K)`): no builtin keeps its argument,
+ * so the function can leave the call only through its result, and
+ * pDeferFold kept no literal for a result naming a function - nothing
+ * else can name it (the callee-set analysis reads a builtin's result
+ * as top).
  */
 bool Inferencer::late_fold_fits(Construct *node, Construct *lit)
 {
@@ -2708,6 +2714,18 @@ bool Inferencer::late_fold_fits(Construct *node, Construct *lit)
                 && !late_fold_fits_one(n, n->late_fold.get())) {
             ok = false;
             return;
+        }
+        if (ctag(n) == ConstructType::call) {
+            auto *call = static_cast<CallExpr *>(n);
+            auto *cid = node_cast<Identifier>(call->what.get());
+            auto cit = cid ? id_sym.find(cid) : id_sym.end();
+            if (cid && is_builtin(cid->uid)
+                    && (cit == id_sym.end() || !cit->second)) {
+                for (auto &a : call->args->elems)
+                    if (ctag(a.get()) != ConstructType::func_decl)
+                        scan(a.get());
+                return;
+            }
         }
         for_each_child(n, scan);
     };
@@ -2732,7 +2750,30 @@ void Inferencer::apply_late_folds(Block *root)
         if (n->defer_fold) {
             n->defer_fold = false;
             unique_ptr<Construct> lit = std::move(n->late_fold);
-            if (lit && late_fold_fits(n, lit.get())) {
+            /* a witness only types the value: the node stays a call */
+            const bool witness = n->late_fold_witness;
+            n->late_fold_witness = false;
+            if (lit && !witness && late_fold_fits(n, lit.get())) {
+                /* a builtin call that builds its array to the storage of
+                 * the place it is bound to carries that storage on its
+                 * arguments (set_array_repr_hint, run before this): the
+                 * literal standing for it is rebuilt there, as a value
+                 * the parse baked is (#97 - else `array<int> v =
+                 * values(D)` stayed general where -nc built it flat) */
+                if (ctag(n) == ConstructType::call
+                        && ctag(lit.get()) == ConstructType::lit_obj) {
+                    const ExprList *args = static_cast<CallExpr *>(n)
+                        ->args.get();
+                    if (args && args->arr_hint != ArrHint::dflt) {
+                        auto *lo = static_cast<LiteralObj *>(lit.get());
+                        WidenShape w;
+                        w.k = 'a';
+                        w.hint = args->arr_hint;
+                        w.hint_struct = args->arr_hint_struct;
+                        lo->set_literal_value(
+                            widen_baked_value(lo->literal_value(), w));
+                    }
+                }
                 n->copy_base_fields(*lit);
                 retired.push_back(std::move(slot));
                 slot = std::move(lit);
