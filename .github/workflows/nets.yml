@@ -62,9 +62,13 @@ jobs:
     #
     # norec_sweep (Net 2): force a frame reconstruction at the Nth call
     # event, one process per N, in shadow AND production.
+    #
+    # disasmcheck: -vdj vs objdump on this Debug build, both arenas -
+    # the sanitizers watch the decoder, and ASan's native-stack-off
+    # emission is the one form the rel-hard matrix (below) cannot see.
     - name: tests/run
       run: tests/run -o --logs test-logs --bin dbg=build/mylang
-           corpus_diff vdjcmp bt_oracle norec_enum norec_sweep
+           corpus_diff vdjcmp bt_oracle norec_enum norec_sweep disasmcheck
     - name: Upload the test logs
       if: failure()
       uses: actions/upload-artifact@v6
@@ -118,31 +122,28 @@ jobs:
   # rotation and a range of pin budgets, because those change WHICH
   # encodings get emitted.
   #
-  # Its own job, split three ways (--shard): run as one step of
-  # `differential` it took 34 of that job's 57 minutes, and so set the
-  # wall time of the whole workflow. Same Debug build as before, so
-  # ASan/UBSan still watch the decoder.
+  # On a rel-hard build (optimized, asserts and VM hardening on): each
+  # -vdj run is 11x faster than the Debug one, and it emits every form
+  # the Debug build does in any of the 23 configurations except ASan's
+  # native-stack-off check, which `differential` covers (disasmcheck on
+  # its Debug build, both arenas). Its items run on a pool, so one job
+  # does what three Debug shards did (2026-11-15).
   # ---------------------------------------------------------------- #
   disasmcheck:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2]
-    name: disasmcheck (shard ${{matrix.shard}}/3)
     steps:
     - uses: actions/checkout@v5
     - name: Compiler and test diagnostics as annotations
       run: echo "::add-matcher::.github/problem-matchers.json"
-    - name: Build (Debug)
+    - name: Build (rel-hard)
       run: |
         cmake -S . -B build -DTESTS=1 -DVM_HARDENING=ON \
-              -DCMAKE_BUILD_TYPE=Debug
+              -DCMAKE_BUILD_TYPE=Release
         cmake --build build -j
 
     - name: "disasm: every emitted instruction agrees with objdump"
-      run: tests/run -o --logs test-logs --bin dbg=build/mylang
-           disasmcheck-matrix --shard ${{matrix.shard}}/3
+      run: tests/run -o --logs test-logs --bin rel-hard=build/mylang
+           disasmcheck-matrix
     - name: Upload the test logs
       if: failure()
       uses: actions/upload-artifact@v6

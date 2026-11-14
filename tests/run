@@ -400,18 +400,29 @@ def catalog():
     add("vdjcmp", "jit", "med", "dbg", 60,
         lambda c: [S("vdjcmp"), c.b, c.b],
         desc="-vdj is reproducible (a binary against itself)")
+    # disasmcheck is a pool of (configuration, program) items. The
+    # debug build checks both arenas: its sanitizers watch the decoder,
+    # and with ASan the native stack is off, which emits the one form
+    # no other build has (the recursion-depth `cmp [abs32], imm32`).
+    # The 23-configuration matrix runs on rel-hard: 11x faster per
+    # -vdj run, and every other form the debug build emits in any of
+    # the 23 it emits too, plus the native-stack ones (measured over
+    # the corpus, 2026-11-15)
     add("disasmcheck", "jit", "med", "dbg", 120,
-        lambda c: [S("disasmcheck"), c.b],
-        desc="-vdj decodes like objdump, default config")
-    add("disasmcheck-matrix", "jit", "long", "dbg", 1200,
-        lambda c: [S("disasmcheck"), c.b, "--matrix"],
+        lambda c: [S("disasmcheck"), c.b, "--env", "MYLANG_NO_LOWMEM=1",
+                   "--jobs", str(c.share)], wide=True,
+        desc="-vdj decodes like objdump, both arenas")
+    add("disasmcheck-matrix", "jit", "long", "rel-hard", 300,
+        lambda c: [S("disasmcheck"), c.b, "--matrix",
+                   "--jobs", str(c.share)], wide=True,
         shard=lambda spec: ["--shard", spec],
         desc="the same over 23 configurations")
     rex = []
     for p in REX_PICKS:
         rex += ["--env", "MYLANG_INT_CHOOSE=" + p]
     add("disasmcheck-rex", "jit", "long", "int-rel", 60,
-        lambda c: [S("disasmcheck"), c.b, "--only", "tests/functional"] + rex,
+        lambda c: [S("disasmcheck"), c.b, "--only", "tests/functional",
+                   "--jobs", str(c.share)] + rex, wide=True,
         guards=[guard_rex],
         desc="the same with forced picks in r8-r15 and xmm8-15")
 

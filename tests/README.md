@@ -229,7 +229,7 @@ Machine code, coverage, mutation
 
 | Tool           | Checks                        | Build   | Local | CI     |
 |----------------|-------------------------------|---------|-------|--------|
-| disasmcheck    | -vdj decodes each JIT         | TESTS=1 | ~10 m | 3x15 m |
+| disasmcheck    | -vdj decodes each JIT         | TESTS=1 | ~5 m  | ~10 m  |
 | (in scripts/)  | instruction like objdump      |         |       |        |
 | vdjcmp         | two binaries emit identical   | any     | ~30 s | 1 m    |
 | (in scripts/)  | machine code                  |         |       |        |
@@ -345,7 +345,7 @@ Driver, system, documentation
 
 Machine code
 
-    $ scripts/disasmcheck build-tests/dbg/mylang --matrix
+    $ scripts/disasmcheck build-tests/rel-hard/mylang --matrix
 
     $ scripts/vdjcmp build-old/mylang build-new/mylang
 

@@ -13,9 +13,14 @@
 # Every parallel tool asks THIS script (corpus_diff, norec_sweep,
 # norec_enum, run), so the formula lives in one place.
 #
-# WORKERS.  nproc - max(2, nproc/8), at least 1: a 24-core box runs 21,
-# leaving three cores for whoever is sitting at the machine.  Override
-# with MYLANG_TEST_JOBS=N.
+# WORKERS.  nproc - nproc/8 where the IDLE CPU class is available (see
+# PRIORITY: such a worker only gets a core nobody else wants, so holding
+# cores back buys nothing on a small box), nproc - max(2, nproc/8) under
+# the `nice` fallback; at least 1.  A 24-core box runs 21 either way,
+# leaving three cores for whoever is sitting at the machine; a 4-core
+# one runs 4 (it ran 2 until 2026-11-15, half the machine idle under a
+# battery that never competes with anyone).  Override with
+# MYLANG_TEST_JOBS=N.
 #
 # PRIORITY.  The functional battery is background work: it must never
 # get in the way of an interactive user.  `run` puts CMD in the IDLE
@@ -66,18 +71,23 @@ count() {
     esac
     n=$(ncpu)
     r=$((n / 8))
-    [ "$r" -lt 2 ] && r=2
+    idle_cpu || { [ "$r" -lt 2 ] && r=2; }
     j=$((n - r))
     [ "$j" -lt 1 ] && j=1
     echo "$j"
 }
 
+# true when `run` can put a command in the IDLE CPU class
+idle_cpu() {
+    [ "${MYLANG_TEST_IDLE:-1}" != 0 ] &&
+        command -v chrt >/dev/null 2>&1 &&
+        chrt --idle 0 true >/dev/null 2>&1
+}
+
 # the prefix `run` applies, as words
 prefix() {
     p=""
-    if [ "${MYLANG_TEST_IDLE:-1}" != 0 ] &&
-       command -v chrt >/dev/null 2>&1 &&
-       chrt --idle 0 true >/dev/null 2>&1; then
+    if idle_cpu; then
         p="chrt --idle 0"
     else
         p="nice -n 19"
