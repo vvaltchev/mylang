@@ -1,0 +1,11 @@
+# An input that fails WHILE IT RUNS keeps the bindings its completed
+# statements made (README: the REPL), whatever declared them: a lambda
+# written as a statement (it binds nothing), a struct, a var, a
+# multi-declaration, a const. The statement that failed binds nothing.
+(func (x) => x); struct S8b { int a; }; var w9 = 5; var w10, w11 = [1, 2]; const c9 = 3; var dyn q9 = 1 / runtime(0)
+w9
+w10
+w11
+S8b(2)
+c9
+q9
