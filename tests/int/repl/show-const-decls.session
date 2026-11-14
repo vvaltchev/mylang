@@ -1,6 +1,6 @@
 # :show renders a function's declarations with their keywords: a const
-# container local (kept as a symbol), a `const dyn` one, an annotated
-# const, an opt dyn variable, and an inferred const with no hint.
+# array local (kept as a symbol), a `const dyn` one, an annotated const,
+# an opt dyn variable, and a const dict typed from its baked value.
 func f(int k) {
     const A = [1, 2, 3];
     const dyn D = [1, "a"];
