@@ -23288,6 +23288,24 @@ static const std::vector<repl_test> repl_tests =
         { "var dyn? p4 = runtime(P4(9))", "", "Error" },
         { "p4?.\n  x", "=> 9", "Error" } } },
 
+    /* the same classification, for two tokens the operator set does not
+     * decide: a foreach's `in` (and `indexed`) is followed by a value, so
+     * a `{` there is a dict literal, which was read as a block and got a
+     * `;` before its `}`; and a `;` the user typed ends a statement, so a
+     * `{` after it is a block, which was read as a dict literal and its
+     * statement got no `;`. A multi-line string that closes on a later
+     * line is a value like any other: a `{` on the next line is a block */
+    { "auto-terminate: a `{` after `in`, after a typed `;`, after a string",
+      { { "foreach (var k5, v5 in {\"a\": 1}) { print(k5, v5) }", "a 1",
+          "Error" },
+        { "foreach (var i5, k5, v5 in indexed {\"b\": 2}) "
+          "{ print(i5, k5, v5) }", "0 b 2", "Error" },
+        { "var a5 = 5; { print(a5 + 1) }", "6", "Error" },
+        { "if (true) {\n  var b5 = 7;\n  { print(b5 + 1) }\n}", "8",
+          "Error" },
+        { "if (true) {\n  var s5 = \"x\ny\"\n  { print(len(s5)) }\n}",
+          "3", "Error" } } },
+
     /* an input that fails WHILE RUNNING keeps what its completed statements
      * defined, and nothing of the declarations it never reached: their
      * committed types stood for names the run never defined, so a later

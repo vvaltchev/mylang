@@ -649,8 +649,10 @@ repl_auto_terminate(const string &src)
         };
         std::vector<size_t> semis;        /* `;` positions, left to right */
 
-        if (closed_string)
+        if (closed_string) {
             open_value = true;
+            expects_value = false;        /* the string is the value */
+        }
 
         const Tok *last = nullptr;
         bool closed_block = false;        /* the last `}` closed a block */
@@ -694,6 +696,17 @@ repl_auto_terminate(const string &src)
             } else if (t == Keyword::kw_return) {
                 expects_value = true;
                 open_value = true;            /* a bare `return` ends too */
+            } else if (t == Keyword::kw_in || t == Keyword::kw_indexed) {
+                /* a foreach's container follows: `in {"a": 1}` is a
+                 * dict literal (it got a `;` before its `}`) */
+                expects_value = true;
+                open_value = false;
+            } else if (t == Op::semicolon) {
+                /* a `;` the user typed ends the statement: a `{` after
+                 * it opens a block (`x = 1; { f() }` was read as a dict
+                 * and its statement got no `;`) */
+                expects_value = false;
+                open_value = false;
             } else {
                 /* an operator that takes a RHS keeps us in value position */
                 expects_value =
