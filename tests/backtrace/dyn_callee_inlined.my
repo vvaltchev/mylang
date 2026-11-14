@@ -1,0 +1,16 @@
+# a call through a callee nothing can name (a dyn value from runtime()),
+# made FROM inlined code and thrown on a warmed call: the native site
+# did not hand its inlined-at chain to the call helper, so `use`'s
+# virtual frame was lost and `drive` got the inlined call's line
+var dyn lf = runtime(func(x) => 10 / (x - 3));
+func use(int k) { return lf(k); }
+func drive() {
+    var s = 0;
+    for (var i = 0; i < 4; i++) {
+        var k = 1;
+        if (i == 3) k = runtime(3);
+        s = s + use(k);
+    }
+    return s;
+}
+print(drive());

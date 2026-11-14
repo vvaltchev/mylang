@@ -18353,3 +18353,35 @@ none. An island raising OUT of the body is unchanged: the caller catches
 it, with the tree-walker's caret and backtrace
 (tests/int/90_container_islands.my covers both). No shipped code
 changes: no real body reached the container.
+
+## The dynamic-callee call site bakes its inline chain (2026-11-14)
+
+**The finding** (the reviewer's d2 probe). A call through a callee no
+analysis can name - `CallValueGenericV`: every call under `-nti`, and a
+typed call through a `dyn` value from `runtime()` - made FROM inlined
+code (`func use(int k) { return lf(k); }` inlined into its caller) lost
+`use`'s virtual frame in the JIT's backtrace, and the caller's frame took
+the inlined call's line. `-nj`, `-tw` and every typed call site rendered
+it right.
+
+**Cause.** A FuncObject callee runs through `jit_call_sync_core`, which
+CLAIMS #88's side channel (`g_jit_call_inline_chain` /
+`g_jit_call_inline_pool`) for the call site's inlined-at frames. Every
+typed site writes the pair first (`emit_bake_call_site`); the generic
+site never did, so the core claimed -1 - or whatever the previous site
+left, which a site that always writes cannot leave stale, but this one
+could still read.
+
+**Fix.** The generic emission calls `emit_bake_call_site` after its
+prologue, before loading the helper's arguments (nothing is staged yet,
+so no mask). The site has no inline tier - every call through it is the
+helper call - so the two stores run on each call. Under `-nti`, where
+every call takes this site, 09_fib_recursive reads +0.25% Ir per scale
+unit (callgrind, `-nti -npc`, `OPT=1 ASSERTS=0` on both sides: 1092.7M
+-> 1095.5M); typed code reaches the site only through a callee no
+analysis names.
+Pinned by
+`tests/backtrace/dyn_callee_inlined.my` (bt_oracle: 0/1 on the old
+binary, `[1] drive() at line 6` where `-ni -tw` has `use(k)`).
+**A new call site whose helper reaches `jit_call_sync_core` writes the
+pair**, or the core reads someone else's.
