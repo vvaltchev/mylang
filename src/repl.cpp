@@ -1642,26 +1642,14 @@ ReplEngine::is_incomplete(const string &src)
     if (repl_ends_in_header(toks))
         return true;
 
-    /* A line ending on a binary/continuation operator wants more. The
-     * compound assignments answer through compound_assign_base (the single
-     * map, operators.h) so a new one joins here with no edit - this switch
-     * was a second hand-copy of the set and had silently missed even `+=`
-     * (a trailing `x +=` used to submit and error). */
-    if (compound_assign_base(toks.back().op) != Op::invalid)
-        return true;
-    switch (toks.back().op) {
-        case Op::plus:    case Op::minus:   case Op::times:
-        case Op::div:     case Op::mod:     case Op::lt:
-        case Op::gt:      case Op::le:      case Op::ge:
-        case Op::eq:      case Op::noteq:   case Op::land:
-        case Op::lor:     case Op::band:    case Op::bor:
-        case Op::bxor:    case Op::shl:     case Op::shr:
-        case Op::ushr:    case Op::assign:  case Op::comma:
-        case Op::dot:     case Op::arrow:
-            return true;
-        default:
-            return false;
-    }
+    /* A line ending on a binary/continuation operator wants more - the
+     * set repl_auto_terminate asks, so the two cannot drift: this was a
+     * second hand-copy of it, which missed `+=` once and later `?`, `??`,
+     * `?.` and `:` (a trailing `c ?` submitted, and its next line ran on
+     * its own). An open bracket already answered through the depth, and a
+     * `;` the user typed ends the input. */
+    const Op last = toks.back().op;
+    return last != Op::semicolon && repl_continuation_op(last);
 }
 
 bool

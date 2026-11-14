@@ -24833,6 +24833,12 @@ static bool repl_incomplete_detection()
     if (!ReplEngine::is_incomplete("foo(1, 2")) return false;     /* open ( */
     if (!ReplEngine::is_incomplete("x >>=")) return false;  /* trailing op */
     if (!ReplEngine::is_incomplete("x <<")) return false;         /* binary */
+    /* the ternary's two halves, `??` and `?.`: they were missing here */
+    if (!ReplEngine::is_incomplete("var g = c ?")) return false;
+    if (!ReplEngine::is_incomplete("var g = c ? 1 :")) return false;
+    if (!ReplEngine::is_incomplete("var h = n ??")) return false;
+    if (!ReplEngine::is_incomplete("p?.")) return false;
+    if (ReplEngine::is_incomplete("var x = 5;")) return false;  /* a `;` */
     if (ReplEngine::is_incomplete("var x = 5")) return false;     /* complete */
     if (ReplEngine::is_incomplete("func f() { return 1; }"))      /* complete */
         return false;
