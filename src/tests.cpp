@@ -17132,6 +17132,15 @@ static const std::vector<test> tests =
             "const R, A4 = [[1], S];",
             "assert(B2(1).a == 1 && B3(2).b == 2 && A4(3).a == 3);",
             "assert(R[0] == 1 && typestr(B3(2)) == \"P\");",
+            /* ...and the targets of one that bind no struct: a spread
+             * dict, a flat array of structs, a general array mixing a
+             * struct with another value */
+            "const D1, D2 = {\"a\": 1};",
+            "pure func pts() => [P(1), P(2)];",
+            "const P1, P2 = pts();",
+            "pure func mix() => [S, [5]];",
+            "const dyn MS, MA = mix();",
+            "assert(D2.a == 1 && P2.b == 2 && MS(6).a == 6 && MA[0] == 5);",
         },
     },
     { "err loc: a type alias's construction is checked as the struct's",
