@@ -30,6 +30,8 @@ at run time (#49).
 | 18 | `isdefined()` for a name declared nowhere       | open       |
 | 19 | a stronger `--strict` (forward declarations)    | open       |
 | 20 | trace verbosity levels                          | open       |
+| 21 | a `const` container or function read before its | open       |
+|    | declaration has run                             |            |
 
 8-20 were added on 2026-10-24, in priority order, and are presented
 three at a time. **PAUSED after 14 (maintainer, 2026-11-02):** the
@@ -500,3 +502,41 @@ Decisions (maintainer, 2026-11-02), all SAVED and none implemented:
   always heap-allocated, reference-counted and boxed, like strings and
   arrays - so inheritance goes there, and a struct stays an efficient
   value container with none.
+
+## 21. A `const` container or function read before its declaration has run
+
+Found by the review of batch 26 (2026-11-14). A `const` SCALAR has no
+run-time symbol: every read is its value, and a read above the
+declaration is an undefined name. A `const` ARRAY, DICT or FUNCTION is
+kept as a run-time symbol bound where the declaration is written - but
+the optimizers fold a read of it as a value whenever they can, and that
+decides whether a read made before the declaration ran raises:
+
+```C#
+if (runtime(true)) { try { print(use(1)); }
+                     catch (UnboundSymbolEx) { print("unbound"); } }
+const K = [10, 20, 30];
+func use(int k) { return K[k]; }
+```
+
+prints `20` by default and with `-nc` (the AST inliner pastes `use` and
+folds `K[1]`), and `unbound` with `--no-opt all -ni -nc -tw` or `-nti`.
+With `const lf = pure func(x) => x * 3;` and `return lf(2) + k;` it is
+the other way round: the parser folds `lf(2)` while parsing `use`, so the
+default prints `7` and `-nc` prints `unbound`. A call that ALWAYS runs
+first (`print(use(1));` at the top level) is refused at compile time by
+the prover in every configuration; only a conditional one differs. A
+RULE 2 violation either way.
+
+- **A - bound at scope entry** (recommended). A const container or
+  function exists from the moment its scope is entered, like a named
+  `func` or `struct` (#134): its value is computed at compile time, so
+  nothing it holds depends on the declaration having run. `isbound(K)`
+  is then true throughout the scope, the TDZ and the prover stop
+  treating such a name as unbound, and both examples print their value
+  everywhere - which is what the optimizers already assume.
+- **B - bound where written**, like a `var`. Every read before the
+  declaration raises `UnboundSymbolEx`, so no pass may fold such a read
+  unless it can prove the declaration ran first - which costs the folds
+  of a const container or pure function inside a function body
+  (`len(NAMES)`, `lf(2)`) wherever a call can come from above it.
