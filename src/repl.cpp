@@ -538,12 +538,48 @@ static bool repl_body_kw(const Tok &t)
         || t == Keyword::kw_finally;
 }
 
+/* Is toks[i], a `(`, a header's - a statement keyword's, or a function's
+ * parameter list (`func f(`, a lambda's `func (`, `func [c] (`)? A body
+ * follows that `)`, as it follows `if (c)`: a script may put the `{` on
+ * the next line, and a `;` at the line's end gave the function no body. */
+static bool repl_header_paren(const std::vector<Tok> &toks, size_t i)
+{
+    if (i == 0)
+        return false;
+    const Tok &b = toks[i - 1];
+    if (repl_header_kw(b) || b == Keyword::kw_func)
+        return true;
+    if (b == TokType::id)
+        return i >= 2 && toks[i - 2] == Keyword::kw_func;
+    if (!(b == Op::bracketR))
+        return false;
+    /* a capture list: the `[` that `]` closes follows `func` */
+    int depth = 0;
+    for (size_t j = i - 1; j-- > 0;) {
+        if (toks[j] == Op::bracketR)
+            depth++;
+        else if (toks[j] == Op::bracketL && depth-- == 0)
+            return j > 0 && toks[j - 1] == Keyword::kw_func;
+    }
+    return false;
+}
+
+/* the tokens end in `struct NAME` / `class NAME`: its `{ fields }` may be
+ * on the next line */
+static bool repl_ends_in_type_name(const std::vector<Tok> &toks)
+{
+    const size_t n = toks.size();
+    return n >= 2 && toks[n - 1] == TokType::id
+        && (toks[n - 2] == Keyword::kw_struct
+            || toks[n - 2] == Keyword::kw_class);
+}
+
 /* the whole input ends in a header (is_incomplete's test) */
 static bool repl_ends_in_header(const std::vector<Tok> &toks)
 {
     if (toks.empty())
         return false;
-    if (repl_body_kw(toks.back()))
+    if (repl_body_kw(toks.back()) || repl_ends_in_type_name(toks))
         return true;
     if (!(toks.back() == Op::parenR))
         return false;
@@ -552,7 +588,7 @@ static bool repl_ends_in_header(const std::vector<Tok> &toks)
         if (toks[i] == Op::parenR) {
             depth++;
         } else if (toks[i] == Op::parenL && --depth == 0) {
-            return i > 0 && repl_header_kw(toks[i - 1]);
+            return repl_header_paren(toks, i);
         }
     }
     return false;
@@ -665,9 +701,11 @@ repl_auto_terminate(const string &src)
                 expects_value = (kind == 'D');
                 open_value = false;
             } else if (t == Op::parenL) {
-                /* 'H': a statement header's parentheses, an expression
-                 * bracket until the `)` that ends the header */
-                stack.push_back(last && repl_header_kw(*last) ? 'H' : '(');
+                /* 'H': a statement header's or a function's parameter
+                 * list's parentheses, an expression bracket until the `)`
+                 * that ends the header */
+                const size_t ti = static_cast<size_t>(&t - toks.data());
+                stack.push_back(repl_header_paren(toks, ti) ? 'H' : '(');
                 expects_value = true;
                 open_value = false;
             } else if (t == Op::bracketL) {
@@ -729,7 +767,8 @@ repl_auto_terminate(const string &src)
             last ? !repl_continuation_op(last->op) : closed_string;
         const bool chain_goes_on = last && *last == Op::braceR
             && closed_block && next_continues(li);
-        const bool wants_body = last && (header_end || repl_body_kw(*last));
+        const bool wants_body = last && (header_end || repl_body_kw(*last)
+                                         || repl_ends_in_type_name(toks));
         if (!open_at_end && stmt_ctx && ends_in_value && !chain_goes_on
             && !wants_body) {
             semis.push_back(semi_before(code_end));
