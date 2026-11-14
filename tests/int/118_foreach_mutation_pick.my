@@ -1,0 +1,13 @@
+# INT-SOURCE: ../functional/30_foreach_mutation.my
+# INT-ENGINES: tw default
+# INT-CONFIGS: MYLANG_JIT_OFF=lsra
+#
+# INT unit (#107): tests/functional/30_foreach_mutation.my under the
+# LEGACY register pick (the lsra lever off). Its loops hoist a second
+# element base where the pins would leave fewer than two callee-saved
+# registers, so jit_compile_chunk must decide what the base's register
+# pair costs: no pin (they are displaced), or the coldest pins, dropped
+# when the pair is worth more - the second an arm the linear scan never
+# takes. No other unit reaches either. The program prints and asserts
+# nothing: the tree-walker's output, which the lever does not change,
+# is the oracle (INT-SOURCE: no second copy).

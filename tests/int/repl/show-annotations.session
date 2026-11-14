@@ -1,0 +1,24 @@
+# :show renders declared annotations: a struct declared in a function
+# with box, optional parameterized, opt dyn, struct and opt array
+# fields, and locals typed with a struct, an opt struct, a box and
+# optional parameterized containers.
+# What the unit OWNS is in the inferencer: `od`, a declared dict whose
+# literal's value is a parameter still untyped in the first round, is
+# has_unknown's dict-value arm.
+struct P { int x; int y; }
+func h(int k) {
+    struct Q {
+        box<int> b; array<int>? a; opt dyn d; P p
+        box<P> bp; dict<str,int>? m; opt array e
+    }
+    P q = P(k, 2);
+    opt P r = k > 0 ? none : q;
+    box<int> bx = box(k);
+    array<int>? oa = k > 0 ? [k] : none;
+    dict<str,int>? od = k > 1 ? {"a": k} : none;
+    Q w = Q(box(1), oa, none, q, box(q), od, none);
+    *bx = *bx + 1;
+    return q.x + (r?.y ?? 0) + *bx + len(oa ?? []) + len(od ?? {}) + w.p.y;
+}
+h(runtime(2))
+:show h
