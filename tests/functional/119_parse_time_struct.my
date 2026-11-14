@@ -1,0 +1,40 @@
+# A struct declared INSIDE a pure function the compiler runs while
+# parsing (a constant call: README *Calling functions during
+# const-evaluation*). The value it returns is the program's: an
+# instance, an array or a dict of them, bound to a `var` or a `const`,
+# keeps its struct - the parse-time typed run's copy of the function
+# held its own copy of the struct, which died with it, so the instance
+# read a freed definition (a heap-use-after-free) and was of another
+# struct than the same call made at run time. Such a call runs the
+# function itself now.
+
+var bad = 0;
+func want(what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+pure func mk(int x) { struct Q { int a; } return Q(x); }
+var v = mk(1);
+const c = mk(2);
+want("an instance bound to a var", str(v), "Q(a: 1)");
+want("...to a const", str(c), "Q(a: 2)");
+want("...is the run-time call's struct", v == mk(int(runtime(1))), true);
+
+pure func mka(int n) {
+    struct R { int b; float f; }
+    return [R(0, 0.0), R(n, n * 0.5)];
+}
+var arr = mka(3);
+want("an array of them", str(arr),
+     "[R(b: 0, f: 0.000000), R(b: 3, f: 1.500000)]");
+want("...its elements' field", arr[1].b + len(arr), 5);
+
+pure func mkd(str k) { struct S { str s; } return {k: S(k + "!")}; }
+const d = mkd("x");
+want("a dict of them", str(d), "{\"x\": S(s: \"x!\")}");
+
+assert(bad == 0);
+print("ok");
