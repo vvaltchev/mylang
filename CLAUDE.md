@@ -3870,8 +3870,9 @@ and it lives *inside the parser*. Mechanics:
   `errfmt:` `-rt` check.
 - A const decl in `pInConstDecl` whose rvalue isn't actually const throws
   `ExpressionIsNotConstEx`.
-- **⛔ A CONSTANT CALL TO A USER FUNCTION IS FOLDED AFTER INFERENCE, NOT
-  WHILE PARSING (#96, 2026-10-21).** Folded while parsing, the call was gone
+- **⛔ A CONSTANT CALL IS FOLDED AFTER INFERENCE, NOT WHILE PARSING (#96,
+  2026-10-21; a BUILTIN call too since 2026-11-14).** Folded while
+  parsing, the call was gone
   from the program inference typed, while `-nc` kept it: a parameter the
   program JOINS over its call sites (an `opt` one, a lambda's) missed its
   argument - `pure func o(opt v) => str(v); o(2.5); o(int(runtime(2)))`
@@ -3896,6 +3897,24 @@ and it lives *inside the parser*. Mechanics:
   RETIRED. `-s`'s first dump (before inference) shows such a call
   unfolded. Net: `const_fold_equivalence` (`-rt`, which compares the
   warnings now too) and `tests/functional/100_fold_after_inference.my`.
+  **A BUILTIN call defers the same way** (it used to fold while parsing):
+  inference typed its VALUE, which is exact where the builtin's rule is
+  not - `get(D, "a")` was an `int`, not `int?`, so `g + 1` compiled where
+  -nc refused it, and `dict(pairs)` was `dict<str,int>`, not `dict<dyn,
+  dyn>` (typestr, keys()' storage, an error's wording; tests/functional/
+  118). A value the fold would not bake - an ARRAY outside a declaration,
+  `sort(K)` inside `sum(sort(K))` - is kept as a WITNESS
+  (`Construct::late_fold_witness`): late_fold_fits reads its type, so the
+  enclosing call still folds, and apply_late_folds never swaps it in.
+  Without it the enclosing fold was refused and bench/my/52's loop sorted
+  on every iteration. Two more rules came with it: a swapped literal
+  standing for a call that builds to its place's storage (`keys`,
+  `values`, `map`...) is REBUILT in the hint set_array_repr_hint stamped
+  on the call's arguments - the swap runs after that pass, so without it
+  tests/functional/109 failed again; and a function literal written as a
+  BUILTIN call's argument does not block a late fold (no builtin keeps
+  its argument, and a result naming a function keeps no literal), or
+  every constant `map(pure func.., K)` ran at run time.
 
 `-s` (with vs. without `-nc`) is the way to *see* all of the above happening.
 

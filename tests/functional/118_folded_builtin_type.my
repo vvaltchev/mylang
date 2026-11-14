@@ -1,0 +1,48 @@
+# A constant call to a builtin is typed as the CALL, not as the value
+# the parser computes for it (the rule #96 set for a call to a user
+# function): `get` and `find` give an `opt` result, `dict(pairs)` a
+# `dict<dyn, dyn>` (README: dict, get, find). Folded while parsing, each
+# took its value's exact type, so `-nc` printed and refused differently.
+# The program checks the types the README gives and that the values
+# are the call's.
+
+var bad = 0;
+func want(what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+const D = {"a": 1};
+var g = get(D, "a");
+want("get's type", typestr(g), "int?");
+want("get's value", g ?? 0, 1);
+want("get of a missing key", get(D, "z"), none);
+want("get! is not opt", typestr(get!(D, "a")), "int");
+
+var w = find([1, 2], 2);
+want("find's type", typestr(w), "int?");
+if (w != none)
+    want("find narrowed", w + 10, 11);
+want("find of nothing", find([1, 2], 7), none);
+
+var d1 = dict([["a", 1]]);
+want("dict(pairs)'s type", typestr(d1), "dict<dyn,dyn>");
+d1["b"] = "s";
+want("dict(pairs) takes any value", d1["b"], "s");
+var k = keys(dict([["x", 1], ["y", 2]]));
+want("keys of it", typestr(k), "array<dyn>");
+want("...stored general", array_storage(k), "general");
+want("a default dict is typed by its default", typestr(dict(2.5)),
+     "dict<dyn,float>");
+
+# a call over a call whose array the fold does not bake folds whole
+const base = [3, 1, 2];
+var tot = 0;
+for (var i = 0; i < int(runtime(3)); i++)
+    tot += sum(sort(base)) + len(reverse(base));
+want("a constant call over a constant array call", tot, 27);
+
+assert(bad == 0);
+print("ok");
