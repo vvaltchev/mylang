@@ -3915,6 +3915,28 @@ and it lives *inside the parser*. Mechanics:
   BUILTIN call's argument does not block a late fold (no builtin keeps
   its argument, and a result naming a function keeps no literal), or
   every constant `map(pure func.., K)` ran at run time.
+  **Three things the parse-time fold gave that the deferral must keep,
+  each lost at first (2026-11-14):** the bake goes through the CSE cache
+  (`cse_materialize_core`'s `deferred` argument - `var a = get!(E, "k");
+  var b = get!(E, "k");` name ONE read-only array, as under -nc; a value
+  naming a function is not cached there, since the node that owns the
+  literal stays in the tree and may still be dropped); `var dyn d =
+  range(3)` puts `general` on the call's arguments in pExpr14, where the
+  builtin and the late fold's rebuild read it (inference stamps the same
+  from the type, and with `-nti` nothing else does - the parser's
+  stamp_literal_annot only sees a baked literal); and **a `??` the parser
+  decides marks the left side it keeps `Construct::never_none`**, which
+  `type_of` strips `opt` from: the kept node stands for the whole `a ??
+  b`, and as a deferred `get()` / `find()` call (or any constant
+  expression under -nc) its own type is `int?` - `var n = get(D, "a") ??
+  0; n + 1` was refused in every mode. ⛔ The mark is set only for an
+  expression of constants and builtins (`pValueIsTypingFree`: no user
+  function called, named or written in it): a pure function's body is
+  typed by the program, so its run-time value may be `none` where the
+  parse-time one was not, and stripping `opt` then put a none in a slot
+  typed int under -nc (watched). `pf(D) ?? 0` therefore stays `int?`,
+  as it was. A new parser fold that keeps a NODE where it used to keep a
+  literal must ask what the literal's exact type was standing in for.
 
 `-s` (with vs. without `-nc`) is the way to *see* all of the above happening.
 

@@ -464,6 +464,7 @@ private:
 
     /* type computation (reads stable `type`) */
     StaticTypeRef type_of(const Construct *e);
+    StaticTypeRef type_of_node(const Construct *e);
     /* What reading a container component yields: `bottom` (defer) for an
      * UNFILLED one - `none`, from `[]`, `{}` or array(N) with nothing
      * typed put in yet - so a later round's fill types the read; if
@@ -5271,7 +5272,20 @@ StaticTypeRef Inferencer::component_read(StaticTypeRef c)
     return is_none(static_type_resolve(c)) ? bottom : c;
 }
 
+/*
+ * The static type of an expression: type_of_node's, with `opt` taken off a
+ * node the parser proved is never none (Construct::never_none - the kept
+ * left side of a `??` it decided).
+ */
 StaticTypeRef Inferencer::type_of(const Construct *e)
+{
+    StaticTypeRef t = type_of_node(e);
+    if (e && e->never_none && t)
+        t = A.with_opt(t, false);
+    return t;
+}
+
+StaticTypeRef Inferencer::type_of_node(const Construct *e)
 {
     if (!e)
         return A.none_ty();

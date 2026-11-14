@@ -3293,6 +3293,11 @@ if (g != none)
     print(g + 1);         # 2
 ```
 
+`??` gives a non-`opt` result here as everywhere (`var n = get(D, "a") ?? 0;`
+is an `int`). A `const` declaration binds the value itself, so `const c =
+get(D, "a");` is the int 1, and a `pure` function's body is evaluated the
+same way in both modes.
+
 **A declaration wins over the builtin it shadows.** A `var`/`const` may not
 take a const builtin's name at all (`var len = 7;` is a compile-time
 `CannotRebindBuiltinEx`), but a **function**, a **parameter** and a **foreach

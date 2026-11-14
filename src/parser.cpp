@@ -1101,6 +1101,14 @@ cse_materialize(ParseContext &c,
                 bool process_arrays,
                 bool immutable);
 
+static bool
+cse_materialize_core(ParseContext &c,
+                     Construct *node,
+                     unique_ptr<Construct> &out,
+                     bool process_arrays,
+                     bool immutable,
+                     EvalValue *deferred = nullptr);
+
 static void
 collect_value_descs(const EvalValue &v,
                     std::unordered_set<const FuncDescriptor *> &out);
@@ -1172,10 +1180,14 @@ pDeferFold(ParseContext &c, Construct *node,
            bool process_arrays, bool immutable)
 {
     node->defer_fold = true;
-    EvalValue v = RValue(node->eval(c.const_ctx));
+    /* through the CSE cache, as the fold it stands for went: a read-only
+     * value two identical expressions compute is ONE object (`var a =
+     * get!(E, "k"); var b = get!(E, "k");` name the same array, as they
+     * do unfolded) */
+    EvalValue v;
     unique_ptr<Construct> lit;
-    node->nc_folds = MakeConstructFromConstVal(v, lit, process_arrays,
-                                               immutable);
+    node->nc_folds = cse_materialize_core(c, node, lit, process_arrays,
+                                          immutable, &v);
     std::unordered_set<const FuncDescriptor *> descs;
     collect_value_descs(v, descs);
     /* a node can be deferred twice - the call, then the declaration
@@ -2451,6 +2463,34 @@ pExpr12(ParseContext &c, unsigned fl)
 }
 
 /*
+ * Does the constant expression `n` compute its value from constants and
+ * builtins alone - no user function called, named or written in it? Then
+ * the value the parser computed is the value it has when the program
+ * runs, however the program is typed. A pure function's body is typed
+ * by the PROGRAM (#96: a parameter joined over its call sites), so a
+ * call to one may give another value at run time than it gave here.
+ */
+static bool
+pValueIsTypingFree(ParseContext &c, Construct *n)
+{
+    if (!n)
+        return true;
+    if (ctag(n) == ConstructType::func_decl)
+        return false;
+    if (ctag(n) == ConstructType::id) {
+        std::unordered_set<const FuncDescriptor *> descs;
+        collect_value_descs(RValue(n->eval(c.const_ctx)), descs);
+        return descs.empty();
+    }
+    bool ok = true;
+    for_each_child_of(n, [&](Construct *ch) {
+        if (ok && !pValueIsTypingFree(c, ch))
+            ok = false;
+    });
+    return ok;
+}
+
+/*
  * Null-coalescing `a ?? b` (right-assoc): `a` unless it is none, otherwise `b`.
  * Precedence sits between `||` and the ternary (matching C#: || > ?? > ?: > =).
  * A const lhs folds: a none lhs -> rhs, a non-none lhs -> lhs.
@@ -2479,7 +2519,15 @@ pExprCoalesce(ParseContext &c, unsigned fl)
 
     if (co->lhs->is_const) {
         const EvalValue &v = co->lhs->eval(c.const_ctx);
-        return v.is<NoneVal>() ? std::move(co->rhs) : std::move(co->lhs);
+        if (v.is<NoneVal>())
+            return std::move(co->rhs);
+        /* the left side stands for the whole `??`, whose result is never
+         * none. A node kept for inference (a deferred call, any constant
+         * expression under -nc) may be typed `opt`: `var n = get(D, "a")
+         * ?? 0; n + 1` was refused, an int? where README says int */
+        if (pValueIsTypingFree(c, co->lhs.get()))
+            co->lhs->never_none = true;
+        return std::move(co->lhs);
     }
 
     return co;
@@ -2900,9 +2948,22 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
     }
 
     if ((fl & pFlags::pInDecl) && !in_idlist)
-        if (auto *did = node_cast<Identifier>(ret->lvalue.get()))
+        if (auto *did = node_cast<Identifier>(ret->lvalue.get())) {
             stamp_literal_annot(ret->rvalue.get(), did->decl_annot.get(),
                                 did->dyn_mod);
+            /* `var dyn d = range(3)`: a constant call that builds to its
+             * place's storage is not baked here any more (#96), so the
+             * `dyn` goes on its arguments, where the builtin and the late
+             * fold's rebuild read it. Inference stamps the same from the
+             * type; with -nti nothing else does, and `d[0] = "s"` was
+             * refused there */
+            Construct *rv = ret->rvalue.get();
+            if (did->dyn_mod && !did->decl_annot && rv->is_const
+                    && ctag(rv) == ConstructType::call
+                    && node_takes_hint(c, rv))
+                static_cast<CallExpr *>(rv)->args->arr_hint =
+                    ArrHint::general;
+        }
 
     if (fl & pFlags::pInConstDecl) {
 
@@ -5242,8 +5303,17 @@ cse_materialize_core(ParseContext &c,
                      Construct *node,
                      unique_ptr<Construct> &out,
                      bool process_arrays,
-                     bool immutable)
+                     bool immutable,
+                     EvalValue *deferred)
 {
+    /*
+     * `deferred` (pDeferFold): the node stays in the tree until inference
+     * has typed it, and the caller wants its value. Such a value is
+     * cached only when it names no function: the node may still be
+     * dropped (a dead branch) with the literal the value names, and no
+     * detach keeps that literal for a later hit, as cse_materialize's
+     * does for a node it replaces.
+     */
     /*
      * Only read-only array/dict results are cacheable, and those arise only
      * when process_arrays is set. An empty key means "don't touch the cache"
@@ -5265,11 +5335,21 @@ cse_materialize_core(ParseContext &c,
             out = make_unique<LiteralObj>(*hit, true);
             static_cast<LiteralObj *>(out.get())->from_literal =
                 is_container_literal(node);
+            if (deferred)
+                *deferred = *hit;
             return true;
         }
     }
 
     const EvalValue &v = RValue(node->eval(c.const_ctx));
+
+    if (deferred) {
+        *deferred = v;
+        std::unordered_set<const FuncDescriptor *> descs;
+        collect_value_descs(v, descs);
+        if (!descs.empty())
+            key.clear();
+    }
 
     /*
      * Read-only array/dict: bake the deep read-only clone once, cache it, and
