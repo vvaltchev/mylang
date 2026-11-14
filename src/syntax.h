@@ -832,6 +832,32 @@ public:
      */
     bool names_class = false;
 
+    /*
+     * The VARIABLE a redirected call still reads. A call through a
+     * var-bound lambda TEMPLATE (`var f = func(x) => x; f(1)`) is
+     * redirected by the inferencer to an instance, `lambda$N`, a
+     * function bound at the top of the program - but the call names
+     * `f`, and `f` binds where it is written (README). So the callee
+     * Identifier of such a call keeps the original `f` Identifier here:
+     * the resolver resolves it as an ordinary read (the TDZ, the step 7
+     * prover and the warnings see it), and when it names a GLOBAL
+     * (`live_guard`) every engine reads it before the call, so a call
+     * made before `var f = ...` ran raises UnboundSymbolEx as `-nti`
+     * does. A local `f` needs no check: a use the TDZ allows runs after
+     * the declaration. Compile-time only - no Construct survives.
+     */
+    unique_ptr<Identifier> bind_guard;
+
+    /* The guard an engine must read before the call: a GLOBAL one (or a
+     * REPL name the map holds), else null. */
+    const Identifier *live_guard() const {
+        if (!bind_guard)
+            return nullptr;
+        const SymKind k = bind_guard->sym.kind;
+        return k == SymKind::global || k == SymKind::unresolved
+            ? bind_guard.get() : nullptr;
+    }
+
     Identifier(const std::string_view &str)
         : Construct("Id", false, ConstructType::id)
         , uid(UniqueId::get(str))
@@ -857,6 +883,9 @@ public:
         c->decl_annot = decl_annot;   /* shared: TypeAnnot is immutable */
         c->names_class = names_class;
         c->builtin_only = builtin_only;
+        if (bind_guard)
+            c->bind_guard.reset(static_cast<Identifier *>(
+                bind_guard->clone().release()));
         return c;
     }
 };

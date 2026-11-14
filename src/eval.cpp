@@ -2445,6 +2445,22 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
     throw NotCallableEx(node->what->start, node->what->end);
 }
 
+/*
+ * A redirected lambda-template call reads its VARIABLE before the call
+ * (Identifier::bind_guard): one not bound yet raises UnboundSymbolEx at
+ * the callee, as the call through the variable does under -nti. In a
+ * const-eval context the global is not visible, so the read fails there
+ * and AutoConst / the inliner's refold leave the call for run time.
+ */
+static void eval_bind_guard(EvalContext *ctx, const Construct *what)
+{
+    if (ctag(what) != ConstructType::id)
+        return;
+    if (const Identifier *g = static_cast<const Identifier *>(what)
+            ->live_guard())
+        (void)RValue(g->eval(ctx));
+}
+
 EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
     /* A FOLDED type query (type/decltype/typestr/kindstr): the inferencer baked
@@ -2459,6 +2475,7 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
 
     /* Point an undefined-callee error at the callee, not the whole call. */
     try {
+        eval_bind_guard(ctx, what.get());
         callable_storage = RValue(what->eval(ctx));
     } catch (Exception &e) {
         stamp_operand_loc(what.get(), e);
@@ -2483,6 +2500,7 @@ EvalValue CallExpr::do_eval(EvalContext *ctx, bool rec) const
  */
 EvalValue DirectCallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
+    eval_bind_guard(ctx, what.get());
     if (ctx->gfuncs && ctx->gfuncs->defined[direct_func_slot]) {
         const EvalValue &fv = ctx->gfuncs->slots[direct_func_slot].get();
         if (fv.is<intrusive_ptr<FuncObject>>()) {
@@ -2516,6 +2534,7 @@ EvalValue DirectCallExpr::do_eval(EvalContext *ctx, bool rec) const
  */
 EvalValue CachedCallExpr::do_eval(EvalContext *ctx, bool rec) const
 {
+    eval_bind_guard(ctx, what.get());
     if (ctx->gfuncs && ctx->gfuncs->defined[direct_func_slot]) {
         const EvalValue &fv = ctx->gfuncs->slots[direct_func_slot].get();
         if (fv.is<intrusive_ptr<FuncObject>>()) {

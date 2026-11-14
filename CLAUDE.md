@@ -5901,7 +5901,26 @@ is non-capturing and the var is **write-once + calls-only** (`mark_lambda_
 templates`, after the structural pass, using per-symbol `writes`/`value_used`
 bookkeeping — the decl write is counted in `walk_struct`, not `declare_target`,
 which runs twice via hoist); a value-used / capturing / reassigned lambda stays
-join. **D4:** past `g_tmpl_max_instances` instantiations (default 64; the
+join. **⛔ Its redirected calls still READ the variable (2026-11-14):** the
+instance `lambda$N` is a named function bound at the top of the program, the
+variable binds where it is written, so `print(f(2)); var f = func(x) => x;`
+compiled and ran where `-nti` refused it (the TDZ), and a call made before
+the declaration ran answered instead of raising UnboundSymbolEx. The redirect
+keeps the original Identifier as the new callee's `Identifier::bind_guard`:
+the resolver resolves it as an ordinary read (TDZ, the step 7 prover and the
+warnings count it, and so does auto-purity), and a GLOBAL one
+(`live_guard()`) is read before the call by the tree-walker (CallExpr /
+DirectCallExpr / CachedCallExpr) and by codegen (`emit_bind_guard`, a
+LoadGlobalV before the arguments, in both call lowerings); the AST inliner
+leaves such a call a call, and the constant folders decline it because the
+read fails in their const context. EACH of the inliner's four engines asks
+`live_guard()` itself: the tail engine finds its call through the `return`,
+and the block and specialize engines run on whatever the expression engine
+left in the slot - a check in `walk()` alone let `return lf(k);` of a
+block-bodied lambda, and `use(2)` once `use` was inlined, lose the read. A
+local guard needs no check - a use the TDZ allows runs after the
+declaration. **D4:** past `g_tmpl_max_instances`
+instantiations (default 64; the
 driver's `--max-instances N`, not in the README by the maintainer's choice) a
 template's further calls run dynamically (`tmpl_inst_count`, a one-time stderr
 warning). **⛔ A call left UNREDIRECTED runs the BASE, so the dead-base pass

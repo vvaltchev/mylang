@@ -1177,6 +1177,32 @@ static const std::vector<test> tests =
       { "if () print(1);" }, &typeid(SyntaxErrorEx), 5, 1 },
     { "err loc: a while with an empty condition",
       { "while () print(1);" }, &typeid(SyntaxErrorEx), 8, 1 },
+    /* A call through a var-bound lambda TEMPLATE is redirected to an
+     * instance bound at the top of the program, and still reads the
+     * variable (Identifier::bind_guard): the TDZ, the prover and the
+     * run-time check see it, with the carets -nti gives. */
+    { "err loc: a lambda template called above its declaration",
+      { "print(lf(2));",
+        "var lf = func(x) => x * 3;" },
+      &typeid(UseBeforeBindingEx), 7, 1, 10, 1 },
+    { "err loc: a call that always reaches an unbound lambda template",
+      { "func use(int k) { return lf(k); }",
+        "var t = use(2);",
+        "var lf = func(x) => x * 3;" },
+      &typeid(UseBeforeBindingEx), 9, 2, 16, 2 },
+    { "err loc: a lambda template called before its variable is bound",
+      { "func use(int k) { return lf(k); }",
+        "if (runtime(true)) { print(use(2)); }",
+        "var lf = func(x) => x * 3;" },
+      &typeid(UnboundSymbolEx), 26, 1, 29, 1 },
+    /* ...in TAIL position too: a block-bodied lambda's body replaced the
+     * `return lf(k);`, and the read went with the call (the tail-call
+     * inliner finds its call through the ReturnStmt) */
+    { "err loc: a lambda template tail-called before its variable is bound",
+      { "func use(int k) { return lf(k); }",
+        "if (runtime(true)) { print(use(2)); }",
+        "var lf = func(x) { var t = x * 3; if (t > 9) return 0; return t; };" },
+      &typeid(UnboundSymbolEx), 26, 1, 29, 1 },
     /* a value a `dyn` alias stored into a GENERAL array<int> / dict<str,
      * float> is a TypeErrorEx at the typed READ's caret in every mode -
      * the tree-walker marked the whole statement, the VM nothing */
@@ -23019,6 +23045,17 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* a call through a var-bound lambda template reads the variable in
+     * the REPL too (Identifier::bind_guard; there the guard is a name
+     * the map holds): once the name is gone the call raises, as a call
+     * through any undefined name does, instead of running the instance */
+    { "a lambda template's call reads its variable across inputs",
+      { { "var lt26 = func(x) => x * 3", "" },
+        { "func use26(int k) { return lt26(k) + 1; }", "" },
+        { "use26(int(runtime(2)))", "=> 7" },
+        { "lt26(2.5)", "=> 7.5" },
+        { ":undef lt26", "" },
+        { "use26(int(runtime(2)))", "Undefined variable 'lt26'" } } },
     /* a program's own defined / isbound, from an earlier input, is called
      * like any function - in a later input and inside a function body -
      * and the builtin it shadows is not consulted (2026-11-13: the
