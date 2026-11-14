@@ -540,3 +540,44 @@ RULE 2 violation either way.
   unless it can prove the declaration ran first - which costs the folds
   of a const container or pure function inside a function body
   (`len(NAMES)`, `lf(2)`) wherever a call can come from above it.
+
+## 22. The type of a folded read of a constant container
+
+Found 2026-11-14 (batch 30), beside a fix it is the other half of. A
+constant BUILTIN call used to be typed by its VALUE, because the parser
+folded it before inference: `var g = get(D, "a"); print(g + 1);` with
+`const D = {"a": 1}` compiled and printed 2, while `-nc` refused it
+(`g` is `int?`, README *get*). That was a bug against the README and is
+fixed - a constant call now waits for inference (#96's deferral), so it
+is typed by the builtin's rule and folded afterwards.
+
+The same thing still happens to a constant SUBSCRIPT or MEMBER read,
+which the parser folds while parsing:
+
+```C#
+const K = [1, none];
+var e = K[0];
+print(e + 1);         # default: 2      -nc: NullabilityEx (int?)
+
+const M = [1, "a"];
+var f = M[0];         # default: int    -nc: DynRequiredEx (dyn)
+print(typestr(f));
+```
+
+The default types `K[0]` as its value, `1` (`int`); `-nc` types it as
+an element of `array<int?>` / `array<dyn>`. RULE 2 either way. CLAUDE.md
+records the exactness as intended ("individual elements stay exact via
+const-fold of a constant-index access"); the README says nothing.
+
+- **A - typed by the rules** (recommended). A read of a constant
+  container is an element of its type, whether or not it is folded, as
+  in C++ (`constexpr` does not change an expression's type). Consistent
+  with the builtin fix: `const M = [1, "a"]; var f = M[0];` then needs
+  `var dyn f`, and `K[0] + 1` above is refused in both runs. The read
+  would wait for inference like a call (pFoldSubscript already has the
+  deferral for a read holding a deferred call).
+- **B - typed by the value**, in both runs: `-nc` (and inference
+  generally) would type a constant read of a constant container by the
+  element it reads. Keeps every program that compiles today compiling,
+  but then the builtin fix should go the same way (`get` of a constant
+  dict would be `int`, against the README).

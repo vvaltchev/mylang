@@ -7,8 +7,10 @@
 # a parameter the bind converts (int into float), a parameter the body
 # writes through (an array element) or into (a struct field - the struct
 # is the call's copy), a callee whose locals would overflow the caller's
-# 64-slot frame, and a chain of tail calls deeper than the inliner's
-# nesting cap.
+# 64-slot frame, a chain of tail calls deeper than the inliner's
+# nesting cap, and an int local passed to a float parameter of a
+# callee that reads it more than once (its bind converts, so it is not
+# pasted).
 
 var bad = 0;
 func want(what, opt dyn got, opt dyn exp) {
@@ -28,6 +30,10 @@ want("...and does", c1(int(runtime(-3))), none);
 func h3(float x) { var t = x / 2; return t; }
 func c3(int y) { return h3(y); }
 want("an int bound to a float parameter", c3(int(runtime(5))), 2.5);
+
+func h3b(float x) { if (x > 9.5) return x; return x / 2; }
+func c3b(int y) { return h3b(y); }
+want("...read twice by a guarded body", c3b(int(runtime(3))), 1.5);
 
 func h4(a) { a[0] = 9; return len(a); }
 func c4(arr) { return h4(arr); }

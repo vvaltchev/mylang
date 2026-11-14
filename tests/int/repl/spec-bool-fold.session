@@ -1,0 +1,24 @@
+# A call with a constant argument to a pure function of an EARLIER input
+# is specialized (the inliner clones the prior body, already M8-typed,
+# and folds it with the constant bound): `false || <typed comparison>`,
+# `false || !<typed>` and `false || <typed &&>` each fold to their
+# right side, since that side is already a bool (README: && and ||
+# yield a bool). The loop is a `while`, since a prior body holding a
+# counted `for` is not taken across inputs. :show prints the clone.
+func f(dyn a, int b) {
+    var r = a || b > 2
+    var s = a || !(b > 3)
+    var t = a || (b > 1 && b < 9)
+    var w = 0
+    var i = 0
+    while (i < b) {
+        w += i * 2 + 1
+        i++
+    }
+    return [r, s, t, w > 3]
+}
+func g(int b) => f(false, b)
+:show g
+:show f$s0
+g(1)
+g(5)

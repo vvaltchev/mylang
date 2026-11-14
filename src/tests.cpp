@@ -1084,6 +1084,28 @@ static const std::vector<test> tests =
     { "err loc: an unknown field type, over two lines",
       { "struct A { Zz b; }", "struct B { Yy d; }" },
       &typeid(SyntaxErrorEx), 12, 1, 15, 1 },
+    /* ...when the struct the check meets LATER is the earlier one: a top
+     * level struct binds at scope entry, so it is declared before one
+     * nested in a function body above it - on a line above, and on the
+     * same line further left */
+    { "err loc: an unknown field type: a nested struct above a top one",
+      { "func f() { struct In { Zz q; } return 1; }",
+        "struct Top { Yy w; }", "print(f());" },
+      &typeid(SyntaxErrorEx), 24, 1, 27, 1 },
+    { "err loc: an unknown field type: a nested struct left of a top one",
+      { "func f() { struct In { Zz q; } return 1; }"
+        " struct Top { Yy w; } print(f());" },
+      &typeid(SyntaxErrorEx), 24, 1, 27, 1 },
+    /* the same order for `opt` on a struct-typed field declared below
+     * (decided once every declaration is known) */
+    { "err loc: an opt struct field: a nested struct above a top one",
+      { "func f() { struct In { opt B q; } return 1; }",
+        "struct Top { opt B w; }", "struct B { int v; }", "print(f());" },
+      &typeid(SyntaxErrorEx), 24, 1 },
+    { "err loc: an opt struct field: a nested struct left of a top one",
+      { "func f() { struct In { opt B q; } return 1; }"
+        " struct Top { opt B w; } struct B { int v; } print(f());" },
+      &typeid(SyntaxErrorEx), 24, 1 },
     { "a struct field may name a class declared below",
       { "struct S { T x; } class T { int a; }",
         "assert(S(T(4)).x.a == 4);" } },
