@@ -1,0 +1,47 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): the other half of 116 - a capture of #97 increment
+# 5's MOVE COLLAPSE updated through a float immediate, an int and a
+# float compare (a bool capture; the closure returns it, since a `?:`
+# on it lowers to a boxed truth test the bytecode inliner does not
+# paste) and an int and a float element read off an array PARAMETER
+# (a captured array's element read is the boxed subscript, which the
+# inliner does not paste either). Every engine must print the same.
+func m_fimm(float x) {
+    var f = x;
+    return func [f] (float y) { f = 2.5; return f + y; };
+}
+func m_cmp(int n) {
+    var b = n > 2;
+    return func [b] (int k) { b = k < 3; return b; };
+}
+func m_fcmp(float x) {
+    var b = x > 2.0;
+    return func [b] (float y) { b = y < 3.0; return b; };
+}
+func m_elem(int n) {
+    var c = n;
+    return func [c] (array<int> a, int k) { c = a[k]; return c + 1; };
+}
+func m_felem(float x) {
+    var f = x;
+    return func [f] (array<float> a, int k) { f = a[k]; return f + 1.0; };
+}
+var ia = [3, 1, 4, 1, 5, 9, 2, 6];
+var fa = [0.5, 1.5, 2.5, 3.5];
+var s = 0;
+var fs = 0.0;
+for (var i = 1; i < 6; i++) {
+    var fi = m_fimm(float(i));
+    fs = fs + fi(0.5) + fi(1.0);
+    var cp = m_cmp(i);
+    if (cp(i)) s = s + 1;
+    var fc = m_fcmp(float(i));
+    if (fc(float(i))) s = s + 2;
+    var el = m_elem(i);
+    s = s + el(ia, i) + el(ia, i + 1);
+    var fe = m_felem(float(i));
+    fs = fs + fe(fa, i % 4) + fe(fa, (i + 1) % 4);
+}
+assert(s == 57 && fs == 62.5);
+print(s, fs);

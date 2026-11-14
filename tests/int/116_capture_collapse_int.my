@@ -1,0 +1,50 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): #97 increment 5's MOVE COLLAPSE, over a capture
+# updated through each producer the RETARGET rule admits - an int
+# division (IntBin), a modulo by a literal (IntModRI), the fused
+# (a + b) % k (IntAddModRI), an int immediate and a float division
+# (FloatBin). Each closure is built in the loop and never escapes, so
+# it is scalar-replaced and its capture becomes a frame slot the
+# producer may write directly. Five closures, not ten: more and main's
+# frame passes BC_INLINE_MAX_FRAME, and nothing is replaced at all
+# (117 holds the other five). MYLANG_BCINLINE_SRAC=0 is the same
+# program without the collapse; every engine must print the same.
+func m_div(int n) {
+    var c = n + 7;
+    return func [c] (int k) { c = c / k + 3; return c; };
+}
+func m_mod(int n) {
+    var c = n;
+    return func [c] (int k) { c = c % 5; c = c + k; return c; };
+}
+func m_addmod(int n) {
+    var c = n;
+    return func [c] (int k) { c = (c + k) % 7; return c; };
+}
+func m_imm(int n) {
+    var c = n;
+    return func [c] (int k) { c = 4; return c + k; };
+}
+func m_fdiv(float x) {
+    var f = x;
+    return func [f] (float y) { f = f / y; return f; };
+}
+var ia = [3, 1, 4, 1, 5, 9, 2, 6];
+var fa = [0.5, 1.5, 2.5, 3.5];
+var s = 0;
+var fs = 0.0;
+for (var i = 1; i < 6; i++) {
+    var d = m_div(i);
+    s = s + d(2) + d(3);
+    var m = m_mod(i);
+    s = s + m(i) + m(1);
+    var am = m_addmod(i);
+    s = s + am(i) + am(2);
+    var im = m_imm(i);
+    s = s + im(i) + im(1);
+    var fd = m_fdiv(float(i));
+    fs = fs + fd(2.0) + fd(4.0);
+}
+assert(s == 200 && fs == 9.375);
+print(s, fs);
