@@ -18,6 +18,7 @@ arr[0]
 [none][0]
 [none, 2][0]
 [{"k": none}][0]["k"]
+({"k": none}["k"])
 var d = {"k": none}
 d["k"]
 d.k
