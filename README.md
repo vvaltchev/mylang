@@ -226,7 +226,10 @@ a multi-line block stays open until it's balanced, auto-indented as you go:
 
 A line that ends a statement's header - `if (c)`, `while (c)`, `for (...)`,
 `foreach (...)`, `catch (...)`, `else`, `try`, `finally` - gets no `;` and
-keeps the input open for the body on the next line, braced or not.
+keeps the input open for the body on the next line, braced or not. So does
+a line that ends a function's parameter list (`func f(a)`, `var g = func
+(x)`) or in `struct NAME` / `class NAME`: the `{` (or a function's `=>
+expr`) may stand on the next line, as in a script.
 
 An `if` (or a `try`) whose block closes on a line of its own may still go
 on with an `else` (`catch`, `finally`) on the next line, as in a script -

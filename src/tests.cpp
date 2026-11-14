@@ -23288,6 +23288,31 @@ static const std::vector<repl_test> repl_tests =
         { "var dyn? p4 = runtime(P4(9))", "", "Error" },
         { "p4?.\n  x", "=> 9", "Error" } } },
 
+    /* a function's parameter list is a header, like `if (c)`'s, and so is
+     * `struct NAME` / `class NAME`: a script may put the `{` on the next
+     * line, where the `;` at the line's end gave a function no body */
+    { "auto-terminate: a body on the line after a func or struct header",
+      { { "func f8(a)\n{\n  return a + 1\n}", "", "Error" },
+        { "f8(2)", "=> 3", "Error" },
+        { "pure func p8(a)\n{\n  return a * 2\n}", "", "Error" },
+        { "p8(4)", "=> 8", "Error" },
+        { "var g8 = func (x)\n{\n  return x * 3\n}", "", "Error" },
+        { "g8(2)", "=> 6", "Error" },
+        { "var k8 = 5", "=> 5", "Error" },
+        { "var h8 = func [k8] (x)\n{\n  return x + k8\n}", "", "Error" },
+        { "h8(1)", "=> 6", "Error" },
+        { "struct S8\n{\n  int a;\n}", "", "Error" },
+        { "S8(7).a", "=> 7", "Error" },
+        { "class C8\n{\n  int b;\n}", "", "Error" },
+        { "C8(9).b", "=> 9", "Error" },
+        /* an arrow body on the next line, and a lambda that is an
+         * argument: its header ends a line inside the call's `(` */
+        { "func a8(a)\n  => a + 2", "", "Error" },
+        { "a8(1)", "=> 3", "Error" },
+        { "map(func (x)\n  { return x * 2 }, [1, 2])", "=> [2, 4]",
+          "Error" },
+        { "print(f8(1))", "2", "Error" } } },
+
     /* the same classification, for two tokens the operator set does not
      * decide: a foreach's `in` (and `indexed`) is followed by a value, so
      * a `{` there is a dict literal, which was read as a block and got a
@@ -24856,6 +24881,19 @@ static bool repl_incomplete_detection()
     if (!ReplEngine::is_incomplete("var g = c ? 1 :")) return false;
     if (!ReplEngine::is_incomplete("var h = n ??")) return false;
     if (!ReplEngine::is_incomplete("p?.")) return false;
+    /* a function's or a type's header wants its body */
+    if (!ReplEngine::is_incomplete("func f(a, b)")) return false;
+    if (!ReplEngine::is_incomplete("var g = func (x)")) return false;
+    if (!ReplEngine::is_incomplete("var h = func [k] (x)")) return false;
+    if (!ReplEngine::is_incomplete("struct S")) return false;
+    if (!ReplEngine::is_incomplete("class C")) return false;
+    if (ReplEngine::is_incomplete("f(a, b)")) return false;     /* a call */
+    if (ReplEngine::is_incomplete("var y = a[k](x)")) return false;
+    /* a `]` before the `(` that closes no capture list: a nested
+     * subscript, a `[` that starts the input, a `]` with no `[` */
+    if (ReplEngine::is_incomplete("var y = a[b[0]](x)")) return false;
+    if (ReplEngine::is_incomplete("[f](1)")) return false;
+    if (ReplEngine::is_incomplete("x](1)")) return false;
     if (ReplEngine::is_incomplete("var x = 5;")) return false;  /* a `;` */
     if (ReplEngine::is_incomplete("var x = 5")) return false;     /* complete */
     if (ReplEngine::is_incomplete("func f() { return 1; }"))      /* complete */

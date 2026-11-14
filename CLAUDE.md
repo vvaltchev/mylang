@@ -8212,13 +8212,19 @@ headless-testable behind a thin terminal shell:
     whose next code line starts with `else` / `catch` / `finally`**
     (`next_continues`): a chain written `}` / `else {` on two lines, as
     a script may. **Nor after a statement HEADER** - the `)` of an if /
-    while / for / foreach / catch (a `'H'` entry on the bracket stack, so
-    a header spanning lines works), or a trailing `else` / `try` /
-    `finally` - and `is_incomplete` keeps such an input open
+    while / for / foreach / catch or of a function's parameter list
+    (`func f(`, `func (`, `func [c] (` - `repl_header_paren`; a `'H'`
+    entry on the bracket stack, so a header spanning lines works), a
+    trailing `else` / `try` / `finally`, or `struct NAME` / `class NAME`
+    - and `is_incomplete` keeps such an input open
     (`repl_ends_in_header`): a `;` there gave the statement an EMPTY body
     and ran the next line on its own, so `if (k == 2)` / `print(x)`
     printed whatever k was and `while (n < 2)` / `n++` never ended
-    (2026-11-07).
+    (2026-11-07), and a function or a struct with its `{` on the next
+    line had no body (2026-11-14). **The operators a line ending in
+    keeps going are ONE set, `repl_continuation_op`**, which both the
+    `;` insertion and `is_incomplete` ask (the latter kept its own copy,
+    which missed `?`, `??`, `?.` and `:`).
   - **A chain the next line may continue stays open (the Joiner,
     lineedit.h):** `ReplEngine::may_continue` - the input ends with the
     `}` of a top-level `if` / `else if` / `try` / `catch` block that
