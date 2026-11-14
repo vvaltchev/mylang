@@ -17022,6 +17022,64 @@ static const std::vector<test> tests =
         },
     },
 
+    /* a constant call bound by a `var` is deferred to inference (#96), and
+     * its value still goes through the cache: two identical calls that
+     * return a read-only part of a constant name ONE object, as the two
+     * calls do when they run (-nc) */
+    {
+        "CSE: two identical deferred calls share a read-only value",
+        {
+            "const E = {\"k\": [1, 2, 3]};",
+            "var a = get!(E, \"k\");",
+            "var b = get!(E, \"k\");",
+            "assert(intptr(a) == intptr(b));",
+            "var c = sort(E.k);",
+            "var d = sort(E.k);",
+            "assert(intptr(c) != intptr(d));",
+            "append(c, 9);",
+            "assert(len(c) == 4 && len(d) == 3 && len(a) == 3);",
+            /* a value naming a function is not cached (and not baked) */
+            "var fm = map(pure func(x) => pure func(q) => q + 1, [1, 2]);",
+            "assert(fm[0](1) == 2 && fm[1](5) == 6);",
+        },
+    },
+
+    /* the parser decides a `??` whose left side is a constant and keeps
+     * that side alone; kept as a NODE (a deferred call), its own type may
+     * be opt, and the `??` it stands for is not (README) */
+    {
+        "?? decided on a constant opt call is not opt",
+        {
+            "const D = {\"a\": 1};",
+            "var n = get(D, \"a\") ?? 0;",
+            "assert(n + 1 == 2);",
+            "assert(typestr(n) == \"int\");",
+            "var m = find([4, 5], 5) ?? 0 - 1;",
+            "assert(m + 1 == 2);",
+            "var z = get(D, \"zz\") ?? 7;",
+            "assert(z + 1 == 8);",
+            /* a left side holding a function literal, and one with an
+             * absent part (a slice bound), are decided too */
+            "var q = len(map(pure func(x) => x, [1, 2])) ?? 0;",
+            "assert(q + 1 == 3);",
+            "var w = find([4, 5, 6][1:], 6) ?? 0;",
+            "assert(w + 1 == 2);",
+        },
+    },
+    /* ...but only for constants and builtins: a pure function's value
+     * may be none at run time where it was not at parse time (its body
+     * is typed by the program), so its `??` keeps the function's type */
+    {
+        "?? decided on a pure function's opt result stays opt",
+        {
+            "const D = {\"a\": 1};",
+            "pure func og(dict<str,int> d) => get(d, \"a\");",
+            "var u = og(D) ?? 0;",
+            "print(u + 1);",
+        },
+        &typeid(NullabilityEx),
+    },
+
     /* =========================================================== *
      *  Type inference + checking (plans/archived/type-inference.md)         *
      * =========================================================== */
@@ -30462,6 +30520,22 @@ static bool const_fold_equivalence()
             "var k = keys(d1);",
             "print(typestr(d1), typestr(k), array_storage(k));",
             "print(typestr(dict([[\"b\", 2.5]])));" } },
+        /* the kept left side of a decided `??` is not opt, a deferred
+         * call's read-only value is one object, and a `dyn` variable's
+         * constant array is general - with folding on and off */
+        { "a decided ?? over a constant call", {
+            "const D = {\"a\": 1};",
+            "var n = get(D, \"a\") ?? 0;",
+            "print(n + 1, typestr(n));" } },
+        { "two identical constant calls, one read-only object", {
+            "const E = {\"k\": [1, 2, 3]};",
+            "var a = get!(E, \"k\");",
+            "var b = get!(E, \"k\");",
+            "print(intptr(a) == intptr(b));" } },
+        { "a dyn variable's constant range() is general", {
+            "var dyn r = range(3);",
+            "r[0] = \"z\";",
+            "print(r, array_storage(r));" } },
     };
 
     bool ok = true;

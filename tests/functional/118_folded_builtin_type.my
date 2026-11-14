@@ -4,7 +4,10 @@
 # `dict<dyn, dyn>` (README: dict, get, find). Folded while parsing, each
 # took its value's exact type, so `-nc` printed and refused differently.
 # The program checks the types the README gives and that the values
-# are the call's.
+# are the call's. With no types (-nti) typestr names a value's run-time
+# type, so the type checks are made in a typed run only.
+
+var typed = typestr(runtime(0)) == "dyn";
 
 var bad = 0;
 func want(what, opt dyn got, opt dyn exp) {
@@ -16,26 +19,51 @@ func want(what, opt dyn got, opt dyn exp) {
 
 const D = {"a": 1};
 var g = get(D, "a");
-want("get's type", typestr(g), "int?");
+if (typed)
+    want("get's type", typestr(g), "int?");
 want("get's value", g ?? 0, 1);
 want("get of a missing key", get(D, "z"), none);
 want("get! is not opt", typestr(get!(D, "a")), "int");
 
 var w = find([1, 2], 2);
-want("find's type", typestr(w), "int?");
+if (typed)
+    want("find's type", typestr(w), "int?");
 if (w != none)
     want("find narrowed", w + 10, 11);
 want("find of nothing", find([1, 2], 7), none);
 
+# `a ?? b` is never none, whatever its left side's own type says: the
+# parser decides a constant one and keeps the left side alone, which
+# stands for the whole (README: `var n = maybe ?? 0;` is an int)
+var n1 = get(D, "a") ?? 0;
+want("get ?? default is not opt", typestr(n1), "int");
+want("...and adds", n1 + 1, 2);
+var n2 = find([4, 5], 5) ?? 0 - 1;
+want("find ?? default is not opt", typestr(n2), "int");
+want("...and adds", n2 + 1, 2);
+var n3 = get(D, "z") ?? 7;
+want("a missing key takes the default", n3 + 1, 8);
+
 var d1 = dict([["a", 1]]);
-want("dict(pairs)'s type", typestr(d1), "dict<dyn,dyn>");
+if (typed)
+    want("dict(pairs)'s type", typestr(d1), "dict<dyn,dyn>");
 d1["b"] = "s";
 want("dict(pairs) takes any value", d1["b"], "s");
 var k = keys(dict([["x", 1], ["y", 2]]));
-want("keys of it", typestr(k), "array<dyn>");
-want("...stored general", array_storage(k), "general");
-want("a default dict is typed by its default", typestr(dict(2.5)),
-     "dict<dyn,float>");
+if (typed) {
+    want("keys of it", typestr(k), "array<dyn>");
+    want("...stored general", array_storage(k), "general");
+    want("a default dict is typed by its default", typestr(dict(2.5)),
+         "dict<dyn,float>");
+}
+
+# a `dyn` variable's array is general, built by a constant call too
+var dyn dr = range(3);
+dr[0] = "z";
+want("a dyn range() takes any element", dr, ["z", 1, 2]);
+var dyn dv = values(D);
+dv[0] = "s";
+want("a dyn values() takes any element", dv, ["s"]);
 
 # a call over a call whose array the fold does not bake folds whole
 const base = [3, 1, 2];

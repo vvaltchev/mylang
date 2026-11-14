@@ -237,6 +237,21 @@ public:
     std::unique_ptr<Construct> late_fold;
 
     /*
+     * The parser PROVED this constant expression is not none: it is the
+     * left side of a `??` the parser decided, which stands for the whole
+     * `a ?? b` (README: the result is non-opt). Its own static type may
+     * say `opt` - a `get()` / `find()` call kept as a node until
+     * inference has typed it (#96) or under `-nc` - so type_of strips
+     * that: `var n = get(D, "a") ?? 0` is an int, as it is when `D` is
+     * not a constant. Set only for an expression of constants and
+     * builtins (pValueIsTypingFree): a pure function's value may differ
+     * at run time from the one the parser computed, and a none in a slot
+     * typed int would be undefined behaviour. Copied by copy_base_fields
+     * (a template instance is cloned before it is typed).
+     */
+    bool never_none = false;
+
+    /*
      * Representation hint for an array-producing node, set by the inferencer
      * from the destination type so the array is built in its final
      * representation (type-driven creation, no promotion). On a CallExpr's args
@@ -327,6 +342,7 @@ public:
         d.arr_hint_struct = arr_hint_struct;
         d.defer_fold = defer_fold;
         d.late_fold_witness = late_fold_witness;
+        d.never_none = never_none;
         d.late_fold = late_fold ? late_fold->clone() : nullptr;
     }
 };
