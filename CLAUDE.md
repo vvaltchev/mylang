@@ -3623,10 +3623,9 @@ and it lives *inside the parser*. Mechanics:
   `node_id` plus each argument's STATIC type (and the ids of any function
   in it), the written one the call's `node_id`; a result holding a
   function value of a copy runs the call untyped instead (its
-  descriptors die with the cache - `pt_result`), and so does one naming
-  a struct DECLARED INSIDE a copied function (`PtEntry::owned_defs`: the
-  copy owns that def, so an instance outlived it - a heap-use-after-free
-  until 2026-11-15, tests/functional/119); the cache is cleared when
+  descriptors die with the cache - `pt_result`); a struct DECLARED INSIDE
+  a copied function is the program's own, since a clone shares its
+  definition (below; tests/functional/119); the cache is cleared when
   the outermost `pBlock` exits (`ParseContext::block_depth`) and in
   `~ParseContext`, because the copies and the noted initializers are AST
   the `-vm` teardown's `live_nodes == 0` proof counts; a copy's own root
@@ -7560,6 +7559,34 @@ but the per-element `StructObject` allocation is gone (build overhead
   `static_type_from_value` all
   handle a struct value. Outside a `const` decl, construction is left a runtime
   `CallExpr` so the inferencer gives the precise field errors.
+- **⛔ A STRUCT DECLARATION HAS ONE DEFINITION, WHICH ITS ORIGINAL NODE
+  OWNS (2026-11-15).** `StructDeclStmt::clone` SHARES `def` (the clone's
+  `def_owner` stays null): a struct declared in a function is one type,
+  however many copies of that function exist - a template's instances, an
+  inlined or specialized body, the typed copy a constant call runs
+  (question 5). It used to copy the definition, so each copy made
+  instances of ANOTHER struct: `t(1) == t("s")` was false for a template
+  `t` returning its own `Q(1)`; a copy's `Q q = Q(x);` was refused
+  ("'q' is declared 'Q' but is assigned 'Q'" - the annotation named the
+  original's def); and a constant call's instance read a definition that
+  died with the parse-time copy (heap-use-after-free). So the ORIGINAL
+  declaration must outlive every value of its struct, and one place can
+  break that: a declaration inside a function LITERAL written in a
+  constant expression, which a bake frees (cse_materialize, a struct's
+  const member) or a late fold retires (#96) while the value lives on -
+  `const c = map(pure func(x) { struct Q { int a; } return Q(x); }, K);`.
+  `collect_def_owner_funcs` (parser.cpp) finds such a literal (the
+  outermost one around the owning declaration, when the value names its
+  def - `collect_value_defs`) and the callers treat it as a literal the
+  value NAMES (#47): a bake detaches it into `baked_funcs`, pDeferFold
+  keeps no literal (the node stays and runs) and does not cache the
+  value. A new place that frees a constant expression while keeping its
+  value must ask it too. **And whatever lists a program's structs lists
+  the OWNING declarations, over the complete walk** (`for_each_child_of`):
+  `vm_compile`'s `take_structs` and `-vd`'s `collect_structs` (disasm.cpp)
+  are the same walk on purpose - the image round trip compares the two
+  lists, and a per-declaration list repeats a shared definition while a
+  statement-only walk misses one declared in a function literal.
 - **⛔ A STRUCT IS A VALUE (maintainer, 2026-10-08;
   plans/struct-value-semantics.md).** Every copy is independent and SHALLOW
   (an array / dict field stays a shared reference); until then an
