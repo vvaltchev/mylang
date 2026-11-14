@@ -45,6 +45,7 @@ as well.
       - [Pure functions](#pure-functions)
       - [Automatic pure promotion](#automatic-pure-promotion)
     * [Structs](#structs)
+      - [Type aliases](#type-aliases)
     * [Classes](#classes)
     * [Boxes](#boxes)
     * [Exceptions](#exceptions)
@@ -2946,6 +2947,32 @@ function is a template called with different argument types, and when a
 call is evaluated while compiling. A struct's fields and
 consts live in the struct's own namespace, so a struct `const PI` never clashes
 with a global `const PI`.
+
+#### Type aliases
+
+A `const` bound to a struct (or a class) is a **type alias**: another name
+for the same type, usable wherever the struct's own name is.
+
+```
+struct Point { int x; int y; const ORIGIN_X = 0; }
+const P = Point;
+
+P p;                        # a declaration: Point(x: 0, y: 0)
+func norm(P q) => q.x * q.x + q.y * q.y;
+array<P> pts = [P(1, 2), P(x: 3, y: 4)];
+print(P.ORIGIN_X, P == Point, typestr(P(5, 6)));    # 0 true Point
+try { throw Point(1, 1); } catch (P as e) { print(e.x); }
+```
+
+The alias is the struct itself, not a new type: a value constructed through
+it is a `Point` (`typestr` names `Point`, `==` compares it with any other
+`Point`), and the construction is checked against `Point`'s fields. The
+initializer may be any constant expression that yields a struct (another
+alias, a `pure` call returning one), and an alias may be declared inside a
+function like any `const`. A parameter, a loop or catch variable or a
+capture named like the alias hides it. A hidden alias in a type position or
+in a catch clause is an error (`'P' is not a type here: ...`): no struct is
+named `P`, so such a clause could never match.
 
 ### Classes
 

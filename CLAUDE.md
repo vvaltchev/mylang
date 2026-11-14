@@ -7587,6 +7587,26 @@ but the per-element `StructObject` allocation is gone (build overhead
   are the same walk on purpose - the image round trip compares the two
   lists, and a per-declaration list repeats a shared definition while a
   statement-only walk misses one declared in a function literal.
+- **A TYPE ALIAS IS A CONST BOUND TO A DESCRIPTOR (maintainer chose it,
+  2026-11-15; README *Type aliases*).** `const T = S;` - the type
+  positions (`T t;`, `func f(T p)`, `array<T>`) resolve T through
+  `lookup_struct_type`, which accepts any const bound to a
+  `StructTypeDef *`, and `T.K` / a const-declaration construction fold at
+  parse time. Three pieces make the rest work, and a new consumer of a
+  struct NAME must work for an alias too: **the declaration is KEPT**
+  (`ShouldConstSymbolExistAtRuntime` lists a descriptor, and
+  `alias_literal` makes its initializer a `LiteralObj` of the descriptor,
+  whatever expression named the struct), so a construction that runs at
+  run time - `-nti`'s dyn call, the tree-walker - reads T (dropped like a
+  scalar, it was "Undefined variable 'T'" in every engine); **the
+  inferencer gives T's TypeSym the struct** (`bind_type_aliases`, off that
+  literal, a multi-declaration's element included), so every reader of
+  `TypeSym::struct_type` - construction, named arguments, `T.CONST`, the
+  literal-argument stamps - treats T as S; and **a catch clause names the
+  struct** (`catch (T)` is rewritten to `catch (S)`: a clause matches by
+  the struct's name), refused like a type position when a binding hides
+  the alias (`const_struct_binding`). Net:
+  `tests/functional/120_type_alias.my`, the `type alias` `-rt` entries.
 - **⛔ A STRUCT IS A VALUE (maintainer, 2026-10-08;
   plans/struct-value-semantics.md).** Every copy is independent and SHALLOW
   (an array / dict field stays a shared reference); until then an

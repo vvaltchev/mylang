@@ -17106,6 +17106,39 @@ static const std::vector<test> tests =
         },
     },
 
+    /* a TYPE ALIAS (`const T = S;`, README *Type aliases*): a
+     * construction through it that runs at run time reads T, which used
+     * to be dropped like a scalar constant ("Undefined variable 'T'");
+     * it is checked as S's construction is, and a catch clause names S
+     * through it */
+    {
+        "type alias: a run-time construction through it",
+        {
+            "struct S { int a; const K = 7; }",
+            "const T = S;",
+            "func shadowed(S) { return T(S); }",
+            "var v = T(int(runtime(5)));",
+            "assert(v == S(5) && typestr(v) == \"S\" && T.K == 7);",
+            "assert(shadowed(2).a == 2 && T(a: 3).a == 3);",
+            "var n = 0;",
+            "try { throw S(4); } catch (T as e) { n = e.a; }",
+            "assert(n == 4);",
+        },
+    },
+    { "err loc: a type alias's construction is checked as the struct's",
+      { "struct S { int a; } const T = S; print(T(1, 2));" },
+      &typeid(WrongArgCountEx), 40, 1, 48, 1 },
+    { "err loc: a type alias's field takes the struct's field type",
+      { "struct S { int a; } const T = S; print(T(\"x\"));" },
+      &typeid(TypeMismatchEx), 42, 1, 46, 1 },
+    /* a binding named like the alias hides it in a catch clause, as in
+     * any type position: no struct is named T, so the clause could never
+     * match (the struct's own name is a name and is never hidden there) */
+    { "err loc: a hidden type alias in a catch clause",
+      { "struct S { int a; } const T = S; func f(T) {",
+        " try { throw S(1); } catch (T) { print(1); } } f(2);" },
+      &typeid(SyntaxErrorEx), 29, 2 },
+
     /* the parser decides a `??` whose left side is a constant and keeps
      * that side alone; kept as a NODE (a deferred call), its own type may
      * be opt, and the `??` it stands for is not (README) */
@@ -23165,6 +23198,16 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* a type alias is a const of the REPL's open world: an earlier
+     * input's alias constructs, types and names a catch clause later */
+    { "a type alias across inputs",
+      { { "struct S27 { int a; }", "" },
+        { "const T27 = S27", "=> S27" },
+        { "T27(int(runtime(3)))", "=> S27(a: 3)" },
+        { "func mk27(x) => T27(x)", "" },
+        { "typestr(mk27(1))", "=> \"S27\"" },
+        { "var c27 = 0; try { throw S27(6); } catch (T27 as e) "
+          "{ c27 = e.a; } c27", "=> 6" } } },
     /* a call through a var-bound lambda template reads the variable in
      * the REPL too (Identifier::bind_guard; there the guard is a name
      * the map holds): once the name is gone the call raises, as a call

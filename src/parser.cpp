@@ -279,6 +279,21 @@ static DeclType type_keyword(std::string_view s)
  * ctor pre-scan's entries never hide a struct here: they are added only
  * for a builtin's name, which a struct cannot take.)
  */
+/* The struct the innermost constant named `uid` is bound to - its own
+ * name, or a TYPE ALIAS (`const T = S;`) - whatever binding hides it. */
+static const StructTypeDef *
+const_struct_binding(ParseContext &c, const UniqueId *uid)
+{
+    for (EvalContext *x = c.const_ctx; x; x = x->parent) {
+        LValue *lv = x->lookup(uid);
+        if (!lv)
+            continue;
+        const EvalValue &v = lv->get();
+        return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>() : nullptr;
+    }
+    return nullptr;
+}
+
 static const StructTypeDef *
 lookup_struct_type(ParseContext &c, std::string_view name,
                    bool *hidden = nullptr)
@@ -291,21 +306,13 @@ lookup_struct_type(ParseContext &c, std::string_view name,
      * declared around a block is in an OUTER scope - looking in the
      * innermost one alone, `P p;` in any function body or `if` block was
      * "not a type" (until 2026-10-07) */
-    for (EvalContext *x = c.const_ctx; x; x = x->parent) {
-        LValue *lv = x->lookup(uid);
-        if (!lv)
-            continue;
-        const EvalValue &v = lv->get();
-        if (!v.is<StructTypeDef *>())
-            return nullptr;
-        if (c.is_shadowed(uid)) {
-            if (hidden)
-                *hidden = true;
-            return nullptr;
-        }
-        return v.get<StructTypeDef *>();
+    const StructTypeDef *def = const_struct_binding(c, uid);
+    if (def && c.is_shadowed(uid)) {
+        if (hidden)
+            *hidden = true;
+        return nullptr;
     }
-    return nullptr;
+    return def;
 }
 
 /* the error for a name in type position that is not a struct type */
@@ -2641,11 +2648,38 @@ declExprCheckId(ParseContext &c, Construct *id)
 static inline bool
 ShouldConstSymbolExistAtRuntime(const EvalValue& rvalue)
 {
+    /* a struct's descriptor: `const T = S;` is a TYPE ALIAS (README, *Type
+     * aliases*), and a construction `T(5)` that runs at run time reads T.
+     * Dropped like a scalar's, the declaration left nothing named T, and
+     * every such call was "Undefined variable 'T'" (until 2026-11-15) */
     return
         rvalue.is<SharedArrayObj>()              ||
         rvalue.is<intrusive_ptr<DictObject>>()   ||
         rvalue.is<intrusive_ptr<StructObject>>() ||
-        rvalue.is<intrusive_ptr<FuncObject>>();
+        rvalue.is<intrusive_ptr<FuncObject>>()   ||
+        rvalue.is<StructTypeDef *>();
+}
+
+/*
+ * The initializer of a type alias, or a constant multi-declaration's
+ * element bound to one, becomes a literal of the struct's descriptor: the
+ * inferencer reads the alias's struct off it (walk_struct), whatever
+ * expression named the struct (`S`, a ternary, a pure call), and the run
+ * reads it like any constant's value. Nothing for another value.
+ */
+static void
+alias_literal(ParseContext &c, unique_ptr<Construct> &node)
+{
+    if (!node || node_cast<LiteralObj>(node.get()))
+        return;
+    const EvalValue v = RValue(node->eval(c.const_ctx));
+    if (!v.is<StructTypeDef *>())
+        return;
+    auto lit = make_unique<LiteralObj>(v, true);
+    lit->start = node->start;
+    lit->end = node->end;
+    lit->is_const = true;
+    node = std::move(lit);
 }
 
 /*
@@ -2952,6 +2986,8 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
             unique_ptr<Construct> cc;
             if (cse_materialize(c, el.get(), cc, true, true))
                 el = std::move(cc);
+            else
+                alias_literal(c, el);
         }
     }
 
@@ -3051,6 +3087,11 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
              */
             return make_unique<NopConstruct>();
         }
+
+        /* a type alias (`const T = S;`) holds its struct's descriptor at
+         * run time, whatever expression named it */
+        if (ctag(ret->lvalue.get()) == ConstructType::id)
+            alias_literal(c, ret->rvalue);
 
         ret->fl |= pInConstDecl;
         ret->lvalue->is_const = true;
@@ -5581,13 +5622,34 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
              * HANDLED, so naming one here is refused rather than silently
              * never matching. The run-time half is the is_catchable() test
              * in both catch matchers, which also defeats the catch-all. */
-            for (const auto &ex_id : exList->elems) {
+            for (auto &ex_id : exList->elems) {
                 if (is_uncatchable_ex_name(ex_id->get_str())) {
                     throw SyntaxErrorEx(
                         ex_id->start,
                         "This exception cannot be caught: "
                         "it reports an error the script must not handle"
                     );
+                }
+                /* a TYPE ALIAS (`const T = S;`) names its struct here too:
+                 * a clause matches the thrown struct by name, and `T` is
+                 * no struct's name (README, *Type aliases*) */
+                bool hidden = false;
+                const StructTypeDef *sd =
+                    lookup_struct_type(c, ex_id->get_str(), &hidden);
+                /* ...unless a binding of that name hides it, as in any
+                 * type position: no struct is named `T`, so the clause
+                 * could never match */
+                if (hidden) {
+                    const StructTypeDef *h =
+                        const_struct_binding(c, ex_id->uid);
+                    if (h->name != ex_id->uid)
+                        not_a_type(c, ex_id->get_str(), ex_id->start);
+                }
+                if (sd && sd->name != ex_id->uid) {
+                    auto real = make_unique<Identifier>(sd->name->val);
+                    real->start = ex_id->start;
+                    real->end = ex_id->end;
+                    ex_id = std::move(real);
                 }
             }
 
