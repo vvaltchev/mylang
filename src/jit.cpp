@@ -27574,8 +27574,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
          * frameless frame with no signal, an assertion in a checked build)
          * and an index past the end after the BODY shrank the array (the
          * interpreted twin then answered `false`). The helper is
-         * jit_load_elem_value, which boxes a real bool and CONVEYS the
-         * foreach's defined OutOfBoundsEx.
+         * jit_load_elem_bool, which boxes a real bool and CONVEYS the
+         * foreach's defined OutOfBoundsEx - or the TypeErrorEx of an
+         * element that is no bool (vm_bool_elem).
          */
         if (in.op == OpCode::LoadElemBool
             && !std::binary_search(ck.ref_slots.begin(), ck.ref_slots.end(),
@@ -27641,6 +27642,8 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 ? Helper(jit_load_struct_field)
           : in.op == OpCode::LoadStructElemV
                 ? Helper(jit_load_struct_elem)
+          : in.op == OpCode::LoadElemBool
+                ? Helper(jit_load_elem_bool)
                 : Helper(jit_load_elem_value);
         e.call_direct(fn);
         emit_call_epilogue(e);

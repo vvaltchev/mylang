@@ -510,44 +510,53 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
      * supply - the JIT bakes it) names the callback's frame (#44). */
     VmInvoker inv(ctx, funcObj, site);
 
+    /*
+     * The result ARRAY - map's over either container, filter's over an
+     * array. #97 CB3: a destination PROVEN array<int>/<float>/<bool> (the
+     * flat_hint - see map_filter_flat_hint) gets a FLAT result, built as
+     * the flat vector of that scalar, whichever container is walked (a
+     * map over a dict built a general one until 2026-11-14, so a `dyn`
+     * alias of an array<int> took a string). A flat result is what lets
+     * a following map/filter/sort hand ITS callback raw elements
+     * (CB1/CB2). Never in a const-eval context, whose general elements
+     * carry the const flag.
+     */
+    const int fmode = ctx->const_ctx ? 0 : flat_hint;
+    /* ...and every element HAS the hinted type: a `dyn` callback's bool
+     * widens and a misfit raises (flat_hint_value) - it spilled the array
+     * to general, a string in an array<int> (RULE 1). So a value past
+     * flat_hint_value is the hinted kind, and nothing spills any more. */
+    const ArrHint fit = fmode == 1 ? ArrHint::flat_i
+                      : fmode == 2 ? ArrHint::flat_f
+                      : fmode == 3 ? ArrHint::flat_b
+                      : ArrHint::dflt;
+    SharedArrayObj::vec_type result;
+    SharedArrayObj::ivec_type fi;
+    SharedArrayObj::fvec_type ff;
+    SharedArrayObj::bvec_type fb;
+    auto push_res = [&](EvalValue &&v0) {
+        EvalValue v = flat_hint_value(v0, fit);
+        if (fmode == 1)
+            fi.push_back(v.get<int_type>());
+        else if (fmode == 2)
+            ff.push_back(v.get<float_type>());
+        else if (fmode == 3)
+            fb.push_back(v.get<bool>() ? 1 : 0);
+        else
+            result.emplace_back(std::move(v), ctx->const_ctx);
+    };
+    auto finish = [&]() -> SharedArrayObj {
+        if (fmode == 1) return SharedArrayObj(std::move(fi));
+        if (fmode == 2) return SharedArrayObj(std::move(ff));
+        if (fmode == 3) return SharedArrayObj(std::move(fb));
+        return SharedArrayObj(std::move(result));
+    };
+
     if (container.is<SharedArrayObj>()) {
 
         /* Read element-by-element WITHOUT promoting flat storage (arr_elem_at);
          * build a fresh array. */
         const SharedArrayObj &arr = container.get<SharedArrayObj>();
-        SharedArrayObj::vec_type result;
-        /*
-         * #97 CB3: a destination PROVEN array<int>/<float>/<bool> (the
-         * flat_hint - see map_filter_flat_hint) gets a FLAT result, built
-         * as the flat vector of that scalar. A flat result is what lets
-         * a following map/filter/sort hand ITS callback raw elements
-         * (CB1/CB2). Never in a const-eval context, whose general
-         * elements carry the const flag.
-         */
-        const int fmode = ctx->const_ctx ? 0 : flat_hint;
-        /* ...and every element HAS the hinted type: a `dyn` callback's
-         * bool widens and a misfit raises (flat_hint_value) - it spilled
-         * the array to general, a string in an array<int> (RULE 1). So a
-         * value past flat_hint_value is the hinted kind, and nothing
-         * spills any more. */
-        const ArrHint fit = fmode == 1 ? ArrHint::flat_i
-                          : fmode == 2 ? ArrHint::flat_f
-                          : fmode == 3 ? ArrHint::flat_b
-                          : ArrHint::dflt;
-        SharedArrayObj::ivec_type fi;
-        SharedArrayObj::fvec_type ff;
-        SharedArrayObj::bvec_type fb;
-        auto push_res = [&](EvalValue &&v0) {
-            EvalValue v = flat_hint_value(v0, fit);
-            if (fmode == 1)
-                fi.push_back(v.get<int_type>());
-            else if (fmode == 2)
-                ff.push_back(v.get<float_type>());
-            else if (fmode == 3)
-                fb.push_back(v.get<bool>() ? 1 : 0);
-            else
-                result.emplace_back(std::move(v), ctx->const_ctx);
-        };
 
         /* #49: the size is re-read per step - the callback is arbitrary
          * script code and may shrink the array under us; a count read
@@ -599,10 +608,7 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
                 push_res(std::move(e));
         }
 
-        if (fmode == 1) return SharedArrayObj(std::move(fi));
-        if (fmode == 2) return SharedArrayObj(std::move(ff));
-        if (fmode == 3) return SharedArrayObj(std::move(fb));
-        return SharedArrayObj(std::move(result));
+        return finish();
 
     } else if (container.is<intrusive_ptr<DictObject>>()) {
 
@@ -623,26 +629,16 @@ EvalValue vm_map_filter(EvalContext *ctx, const EvalValue &func_val,
             snap.emplace_back(e.first, e.second);
 
         if (!is_filter) {
-
-            /* a typed destination's element type, as for an array */
-            const int fh = ctx->const_ctx ? 0 : flat_hint;
-            const ArrHint fit = fh == 1 ? ArrHint::flat_i
-                              : fh == 2 ? ArrHint::flat_f
-                              : fh == 3 ? ArrHint::flat_b
-                              : ArrHint::dflt;
-            SharedArrayObj::vec_type result;
             for (auto const &e : snap)
-                result.emplace_back(
-                    flat_hint_value(inv.call(e.first, e.second.get()), fit),
-                    ctx->const_ctx);
-            return SharedArrayObj(std::move(result));
+                push_res(inv.call(e.first, e.second.get()));
+            return finish();
         }
 
-        DictObject::inner_type result;
+        DictObject::inner_type kept;
         for (auto const &e : snap)
             if (inv.test(e.first, e.second.get()))
-                result.insert(e);
-        return make_intrusive<DictObject>(std::move(result));
+                kept.insert(e);
+        return make_intrusive<DictObject>(std::move(kept));
     }
 
     throw TypeErrorEx(is_filter ? "Unsupported container type for filter()"

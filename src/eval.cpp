@@ -7322,7 +7322,9 @@ int_type Subscript::eval_int(EvalContext *ctx) const
             return arr.flat_ints()[at];     /* unboxed: no promotion */
         if (arr.skind() == SharedArrayObj::Storage::bools)
             return arr.flat_bools()[at] ? 1 : 0;   /* bool elem -> int 0/1 */
-        return general_elem_int(arr.get_vec()[at]);
+        /* a misfit is a TypeErrorEx at THIS subscript, as its OOB is
+         * (reads_as_int) */
+        return typed_read_int(arr.get_vec()[at].get(), start, end);
     }
     /* typed dict read `d[k]` (present key): look the value up directly instead
      * of Construct::eval_int, which would re-evaluate `what` (the dict). */
@@ -7330,9 +7332,7 @@ int_type Subscript::eval_int(EvalContext *ctx) const
         const EvalValue key = RValue(index->eval(ctx));
         if (const EvalValue *v = dict_present_value(
                 base.get_ref<intrusive_ptr<DictObject>>(), key)) {
-            if (v->is<bool>())
-                return v->get<bool>() ? 1 : 0;
-            return v->get<int_type>();
+            return typed_read_int(*v, start, end);
         }
     }
     return Construct::eval_int(ctx);   /* missing key / non-dict: do_eval */
@@ -7359,17 +7359,13 @@ float_type Subscript::eval_float(EvalContext *ctx) const
             return static_cast<float_type>(arr.flat_ints()[at]);
         if (arr.skind() == SharedArrayObj::Storage::bools)
             return arr.flat_bools()[at] ? 1.0 : 0.0;
-        return general_elem_float(arr.get_vec()[at]);
+        return typed_read_float(arr.get_vec()[at].get(), start, end);
     }
     if (base.is<intrusive_ptr<DictObject>>()) {
         const EvalValue key = RValue(index->eval(ctx));
         if (const EvalValue *v = dict_present_value(
                 base.get_ref<intrusive_ptr<DictObject>>(), key)) {
-            if (v->is<int_type>())
-                return static_cast<float_type>(v->get<int_type>());
-            if (v->is<bool>())
-                return v->get<bool>() ? 1.0 : 0.0;
-            return v->get<float_type>();
+            return typed_read_float(*v, start, end);
         }
     }
     return Construct::eval_float(ctx);   /* missing key / non-dict: do_eval */
@@ -7898,6 +7894,21 @@ ForeachStmt::do_eval(EvalContext *ctx, bool rec) const
             default:
                 /* general / strs (a handle copy, not a byte copy) */
                 elem = arr_elem_boxed(arr, i);
+                /* a TYPED loop variable takes its element as the VM's
+                 * typed loads do (LoadElemInt/Float/Bool): a general
+                 * array<int> holds what a `dyn` alias stored, so a bool
+                 * reads as 0/1, an int widens into a float variable, and
+                 * anything else is a TypeErrorEx at the container - it
+                 * was bound as it was, and failed (or not) at its first
+                 * use */
+                if (elem_th == TypeHint::i)
+                    elem = EvalValue(typed_read_int(
+                        elem, container->start, container->end));
+                else if (elem_th == TypeHint::f)
+                    elem = EvalValue(typed_read_float(
+                        elem, container->start, container->end));
+                else if (elem_is_bool && !elem.is<bool>())
+                    throw TypeErrorEx(container->start, container->end);
                 break;
             }
 
@@ -8309,9 +8320,7 @@ int_type MemberExpr::eval_int(EvalContext *ctx) const
     if (base.is<intrusive_ptr<DictObject>>()) {
         if (const EvalValue *v = dict_present_value(
                 base.get_ref<intrusive_ptr<DictObject>>(), memId)) {
-            if (v->is<bool>())
-                return v->get<bool>() ? 1 : 0;
-            return v->get<int_type>();
+            return typed_read_int(*v, start, end);
         }
     }
     return Construct::eval_int(ctx);   /* missing key / non-dict: do_eval */
@@ -8359,11 +8368,7 @@ float_type MemberExpr::eval_float(EvalContext *ctx) const
     if (base.is<intrusive_ptr<DictObject>>()) {
         if (const EvalValue *v = dict_present_value(
                 base.get_ref<intrusive_ptr<DictObject>>(), memId)) {
-            if (v->is<int_type>())
-                return static_cast<float_type>(v->get<int_type>());
-            if (v->is<bool>())
-                return v->get<bool>() ? 1.0 : 0.0;
-            return v->get<float_type>();
+            return typed_read_float(*v, start, end);
         }
     }
     return Construct::eval_float(ctx);   /* missing key / non-dict: do_eval */
