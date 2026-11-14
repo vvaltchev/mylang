@@ -1,0 +1,22 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> >> >> >> >> .. .. .. .. .. .. .. .. .. .. .. .. .. >> => 9
+>> int func h(int k) {
+    struct Q {
+        box<int> b;
+        array<int>? a;
+        opt dyn d;
+        P p;
+        box<P> bp;
+        dict<str,int>? m;
+        opt array e;
+    }
+    P q = P(k, 2);
+    opt P r = k > 0 ? none : q;
+    box<int> bx = box(k);
+    array<int>? oa = k > 0 ? [k] : none;
+    dict<str,int>? od = k > 1 ? {"a": k} : none;
+    Q w = Q(box(1), oa, none, q, box(q), od, none);
+    *bx = *bx + 1;
+    return q.x + (r?.y ?? 0) + *bx + len(oa ?? []) + len(od ?? {}) + w.p.y;
+}
+>> 
