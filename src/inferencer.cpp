@@ -1812,6 +1812,20 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
                 uses[it->second->func].push_back({ id, it->second, in_func });
             return;
         }
+        /* the NAME a declaration binds is not a use of its value. `const
+         * tw = pure func(x) => x * 2;` whose value is reached only
+         * through a baked const (`const OPS = [tw];`, folded at parse
+         * time, so no identifier names it) found the declaration's own
+         * `tw` here, renamed it to the instance - whose name was then
+         * declared twice (AlreadyDefinedEx, 2026-11-14) */
+        if (ctag(n) == ConstructType::expr14) {
+            auto *e14 = static_cast<Expr14 *>(n);
+            if ((e14->fl & pFlags::pInDecl)
+                    && ctag(e14->lvalue.get()) == ConstructType::id) {
+                walk(e14->rvalue.get(), in_func);
+                return;
+            }
+        }
         for_each_child(n, [&](Construct *c) { walk(c, in_func); });
     };
     for (auto &e : rootBlock->elems)
