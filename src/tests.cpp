@@ -34571,6 +34571,95 @@ static bool myv_verify_cross_records()
 }
 
 /*
+ * THE UNCHECKED MODULUS: IntModRI (`a % imm`) and IntAddModRI (`(a + b) %
+ * imm`) divide without a check - codegen selects them only for a modulus
+ * other than 0 and -1 (INT_MIN % -1 traps like a division by zero). A
+ * stored image is input, so the verifier refuses either value in either
+ * op: myv_fuzz (2026-11-15) turned an immediate into 0 and an assert-free
+ * build died of SIGFPE. In memory, on the compiled program itself, as
+ * myv_verify_cross_records does; the intact program passes first and the
+ * restored one after.
+ */
+static bool myv_verify_mod_immediate()
+{
+    const char *lines_arr[] = {
+        "var s = 0;",
+        "for (var i = 0; i < runtime(9); i++) {",
+        "    var m = i % 7;",
+        "    s = (s + m) % 1000;",
+        "}",
+        "print(s);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        vm_verify_program(prog);                    /* intact: passes */
+        Instr *mod = nullptr, *addmod = nullptr;
+        for (Instr &in : prog.root.code) {
+            if (in.op == OpCode::IntModRI)
+                mod = &in;
+            if (in.op == OpCode::IntAddModRI)
+                addmod = &in;
+        }
+        if (!mod || !addmod) {
+            fprintf(stderr, "myv_verify_mod_immediate: the program has no "
+                            "%s - the test shape drifted\n",
+                    !mod ? "IntModRI" : "IntAddModRI");
+            g_exec_engine = saved;
+            return false;
+        }
+        const auto refused = [&](const char *what) -> bool {
+            try {
+                vm_verify_program(prog);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError")
+                    return true;
+                fprintf(stderr, "myv_verify_mod_immediate [%s]: threw "
+                                "%s, not MyvError\n", what, e.name);
+                return false;
+            }
+            fprintf(stderr, "myv_verify_mod_immediate [%s]: ACCEPTED\n",
+                    what);
+            return false;
+        };
+        const Instr keep_mod = *mod;
+        for (const int_type bad : { int_type(0), int_type(-1) }) {
+            Operand o;
+            o.is_lit = true;
+            o.lit_kind = Operand::LitKind::i;
+            o.lit = bad;
+            mod->set_b(o);
+            ok = refused(bad ? "IntModRI % -1" : "IntModRI % 0") && ok;
+            *mod = keep_mod;
+        }
+        const int keep_t2 = addmod->target2;
+        for (const int bad : { 0, -1 }) {
+            addmod->target2 = bad;
+            ok = refused(bad ? "IntAddModRI % -1" : "IntAddModRI % 0")
+                 && ok;
+        }
+        addmod->target2 = keep_t2;
+        vm_verify_program(prog);                    /* restored: passes */
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_verify_mod_immediate: threw %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
  * THE DUMPS OF A CLASS, A BOX AND AN ARGUMENT CHAIN: `-s` renders `*b` as
  * Deref, and `-vd` names a class def, a box-typed field, `*b` with the box
  * it was proven to read (each scalar kind, and a box<P>), a store through
@@ -60579,6 +60668,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: #137 - a stored ExitBlock and a slot_count/frame_size "
       "disagreement are refused at load (myv_fuzz, 2026-09-20)",
       myv_verify_cross_records },
+    { "myv: an unchecked modulus of 0 or -1 is refused at load "
+      "(myv_fuzz, 2026-11-15)",
+      myv_verify_mod_immediate },
     { "myv: RULE 1 - CheckNoneArgsV's two callee kinds render apart in -vd, "
       "and a bad kind, callee slot or run is refused at load",
       none_check_op_static },

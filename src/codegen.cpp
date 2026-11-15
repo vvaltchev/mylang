@@ -12455,19 +12455,30 @@ void ChunkVerifier::verify_one(const Instr &in)
     case OpCode::IntXorRR: case OpCode::IntXorRI:
     case OpCode::IntShlRR: case OpCode::IntShlRI:
     case OpCode::IntShrRR: case OpCode::IntShrRI:
-    case OpCode::IntModRI:
     case OpCode::FloatAddRR: case OpCode::FloatAddRI:
     case OpCode::FloatSubRR: case OpCode::FloatSubRI:
     case OpCode::FloatMulRR: case OpCode::FloatMulRI:
         reg(in.target);
         ab_regs(in);
         break;
-    case OpCode::IntAddModRI:
-        /* E4: `dst = (a + b) % target2` - a ZERO modulus would divide by
-         * zero in an op whose whole selection premise is that it cannot. */
+    case OpCode::IntModRI:
+        /* `dst = a % imm`, UNCHECKED: codegen selects it only for a
+         * modulus other than 0 and -1 (INT_MIN % -1 traps like a division
+         * by zero), so either is a SIGFPE in the handler and in the JIT's
+         * idiv - and the handler reads the immediate whatever the operand
+         * flag says (myv_fuzz, 2026-11-15: a mutated immediate 0 killed
+         * an assert-free build) */
         reg(in.target);
         ab_regs(in);
-        if (in.target2 == 0)
+        if (in.b_lit() == 0 || in.b_lit() == -1)
+            reject("mod immediate");
+        break;
+    case OpCode::IntAddModRI:
+        /* E4: `dst = (a + b) % target2` - the same premise, fused from
+         * the IntModRI above */
+        reg(in.target);
+        ab_regs(in);
+        if (in.target2 == 0 || in.target2 == -1)
             reject("addmod modulus");
         break;
     case OpCode::MathFnV:
