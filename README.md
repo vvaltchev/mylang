@@ -2894,7 +2894,10 @@ construction's field value - `p.x = "s"`, `p.x += 1.5` into an `int` field,
 or `none` into a non-`opt` one is a compile error - and so is a write into an
 element reached through a field or another element (`s.a[0] = v`,
 `append(s.a, v)`, `m[0][0] = v`), against the element type its declaration
-gives it. At run time a field store converts and checks its value exactly
+gives it - or, for a container whose type was inferred, the element type it
+was inferred with (`var m = [["x"]]; m[0][0] = 5;` is a compile error: a
+store into an element of an element does not widen `m` the way a store into
+`m`'s own element does). At run time a field store converts and checks its value exactly
 as the constructor does, whatever the struct's layout: `p.f = 2` into a
 `float` field stores `2.0`, a `bool` into an `int` field `0` or `1`, and a
 `dyn` value that does not fit the field raises `TypeErrorEx`.

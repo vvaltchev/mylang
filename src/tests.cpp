@@ -19191,6 +19191,31 @@ static const std::vector<test> tests =
     { "element store reject: none into a non-opt nested element",
       { "array<array<int>> m = [[1]]; m[0][0] = none;" },
       &typeid(NullabilityEx) },
+    /* the same through a variable whose type was INFERRED: a nested store
+     * contributes to nothing, so the element's type is final and a value
+     * that does not fit it was stored unchecked - an array<array<str>>
+     * holding a none, `len(a[0][0])` 0 in the VM and a TypeErrorEx in the
+     * tree-walker (RULE 1) */
+    { "element store reject: none into an inferred nested element",
+      { "var m = [[\"x\"]]; m[0][0] = none;" },
+      &typeid(NullabilityEx), 28, 1, 33, 1 },
+    { "element store reject: an int into an inferred nested str element",
+      { "var m = [[\"x\"]]; m[0][0] = 5;" },
+      &typeid(TypeMismatchEx), 28, 1, 30, 1 },
+    { "element store reject: a float into an inferred nested int element",
+      { "var m = [[1, 2]]; m[0][0] = 2.5;" },
+      &typeid(TypeMismatchEx) },
+    { "element store reject: an inferred dict value's element",
+      { "var d = {\"k\": {\"j\": 1}}; d[\"k\"][\"j\"] = \"s\";" },
+      &typeid(TypeMismatchEx) },
+    { "element store reject: append into an inferred nested element",
+      { "var m = [[\"x\"]]; append(m[0], 5);" },
+      &typeid(TypeMismatchEx) },
+    { "inferred nested stores that fit still work",
+      { "var w = [[1, 2.5]]; w[0][0] = 3; assert(w[0][0] == 3.0);",
+        "var h = [[1], [\"x\"]]; h[0][0] = \"y\"; assert(h[0][0] == \"y\");",
+        "var u = [[]]; append(u[0], 7); assert(u[0][0] == 7);",
+        "var d = {\"k\": {\"j\": 1}}; d.k.j = 2; assert(d.k.j == 2);" } },
     { "field / nested element stores that fit still work (and widen)",
       { "struct S { array<float> a; float f; dyn x; }",
         "var s = S([1.5], 1.5, 1);",
