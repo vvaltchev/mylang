@@ -30543,6 +30543,15 @@ static bool late_fold_shape()
 static bool const_fold_equivalence()
 {
     const std::vector<NcCase> cases = {
+        /* a constant class instance's identity number - its hash - is
+         * the same with or without folding: -nc evaluates a constant's
+         * initializer once more, to raise its errors, and that discarded
+         * instance used to take a number (2026-11-15) */
+        { "a constant class instance hashes the same", {
+            "class C { int v; }",
+            "const A = C(1);",
+            "const B = [C(2), C(3)];",
+            "print(hash(A), hash(B[0]), hash(B[1]), hash(C(4)));" } },
         /* #96: a constant call to a user function is folded only once the
          * program is typed - folded while parsing, it was gone from the
          * program inference typed. Its argument joins the parameter... */
