@@ -1,0 +1,116 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): a function that holds a function literal is never
+# specialized - a closure inside could capture the parameters the
+# specializer would bind (Inliner::contains_func, a COMPLETE walk). One
+# function per position the walk must see into: a `for` loop's init,
+# condition and increment, a foreach's container and body, a catch body,
+# and a declaration's value - and none captures a parameter, which the
+# specializer refuses for its own reason. Each opens with `if (n > 3)`,
+# so a call with a constant argument shrinks and is specialized when
+# nothing forbids it - `plain`, the control, shows that it is
+# (`specializations()`, README reflection; `-ni` turns the specializer
+# off with the inliner, so it is not one of the engines). Each is also
+# called with a run-time argument, and every engine must compute the
+# same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+var base = int(runtime(0));
+func plain(int n) {
+    var s = base;
+    if (n > 3) s += 10; else s -= 10;
+    for (var i = 0; i < n; i++)
+        s += i;
+    return s;
+}
+func h_init(int n) {
+    var s = base;
+    if (n > 3) s += 10; else s -= 10;
+    for (var g = func(int x) => x * 2; s < n + 10; s++)
+        s += g(1);
+    return s;
+}
+func h_cond(int n) {
+    var s = base;
+    if (n > 3) s += 10; else s -= 10;
+    for (var i = 0; (func(int x) => x < 5)(i); i++)
+        s += i;
+    return s;
+}
+func h_inc(int n) {
+    var s = base;
+    if (n > 3) s += 10; else s -= 10;
+    for (var i = 0; i < n; i = (func(int x) => x + 1)(i))
+        s += i;
+    return s;
+}
+func h_fec(int n) {
+    var s = base;
+    if (n > 3) s += 10; else s -= 10;
+    foreach (var v in map(func(int x) => x * 3, [1, 2, n]))
+        s += v;
+    return s;
+}
+func h_feb(int n) {
+    var s = base;
+    if (n > 3) s += 10; else s -= 10;
+    foreach (var v in [1, 2, n]) {
+        var f = func [v] (int x) => x + v;
+        s += f(1);
+    }
+    return s;
+}
+func h_catch(int n) {
+    var s = base;
+    if (n > 3) s += 10; else s -= 10;
+    try {
+        s = s / base;
+    } catch (DivisionByZeroEx) {
+        var f = func(int x) => x + 5;
+        s = f(1);
+    }
+    return s;
+}
+func h_decl(int n) {
+    var s = base;
+    if (n > 3) s += 10; else s -= 10;
+    var d = {"f": n};
+    var g = func [d] (int x) => x + d["f"];
+    return s + g(2);
+}
+
+want("control", plain(5), 20);
+want("for init", h_init(5), 16);
+want("for condition", h_cond(5), 20);
+want("for increment", h_inc(5), 20);
+want("foreach container", h_fec(5), 34);
+want("foreach body", h_feb(5), 21);
+want("catch body", h_catch(5), 6);
+want("declaration value", h_decl(5), 17);
+want("control, run time", plain(int(runtime(5))), 20);
+want("for init, run time", h_init(int(runtime(5))), 16);
+want("for condition, run time", h_cond(int(runtime(5))), 20);
+want("for increment, run time", h_inc(int(runtime(5))), 20);
+want("foreach container, run time", h_fec(int(runtime(5))), 34);
+want("foreach body, run time", h_feb(int(runtime(5))), 21);
+want("catch body, run time", h_catch(int(runtime(5))), 6);
+want("declaration value, run time", h_decl(int(runtime(5))), 17);
+
+want("the control is specialized", len(specializations(plain)), 1);
+want("for init: no clone", len(specializations(h_init)), 0);
+want("for condition: no clone", len(specializations(h_cond)), 0);
+want("for increment: no clone", len(specializations(h_inc)), 0);
+want("foreach container: no clone", len(specializations(h_fec)), 0);
+want("foreach body: no clone", len(specializations(h_feb)), 0);
+want("catch body: no clone", len(specializations(h_catch)), 0);
+want("declaration value: no clone", len(specializations(h_decl)), 0);
+
+assert(bad == 0);
+print("ok");
