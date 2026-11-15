@@ -2939,7 +2939,11 @@ A chain may be any length: dropping the head of a million-node list frees
 it without running out of stack, in every engine.
 
 Structs may be declared anywhere a statement is allowed, **including inside a
-function** (lexically scoped like a nested function). A struct's fields and
+function** (lexically scoped like a nested function). Such a struct is one
+type however the function is called: the values two calls return are
+instances of the same struct (they compare with `==`), also when the
+function is a template called with different argument types, and when a
+call is evaluated while compiling. A struct's fields and
 consts live in the struct's own namespace, so a struct `const PI` never clashes
 with a global `const PI`.
 

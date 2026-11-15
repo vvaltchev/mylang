@@ -17066,6 +17066,46 @@ static const std::vector<test> tests =
         },
     },
 
+    /* a struct declared in a function is ONE struct for every copy of
+     * the function (StructDeclStmt::clone shares the definition): a
+     * template's instances make equal values, a copy's own typed local
+     * is accepted, and a constant call's instance is the run-time one */
+    {
+        "struct: every copy of a function shares its nested struct",
+        {
+            "func t(x) { struct Q { int a; } Q q = Q(1); return q; }",
+            "var dyn a = t(1);",
+            "var dyn b = t(\"s\");",
+            "assert(a == b && a.a == 1);",
+            "pure func mk(int x) { struct S { int a; } S s = S(x); return s; }",
+            "const c2 = mk(2);",
+            "var v2 = mk(1);",
+            "assert(v2 == mk(int(runtime(1))) && c2.a == 2);",
+        },
+    },
+    /* a function LITERAL that declares a struct, written in a constant
+     * expression, owns the definition: it is kept when the folded value
+     * holds an instance (it was freed with the expression - a heap
+     * use-after-free). The inner lambda and the comparator's struct, which
+     * the value does not hold, are the walk's other two answers */
+    {
+        "struct: a function literal's struct outlives the folded expression",
+        {
+            "const K = [3, 1];",
+            "const c = map(pure func(x) {",
+            "    struct Q { int a; }",
+            "    const g = pure func(y) => y;",
+            "    return Q(g(x)); }, K);",
+            "var v = map(pure func(x) { struct R { int a; } return [R(x)]; },",
+            "            K);",
+            "assert(str(c) == \"[Q(a: 3), Q(a: 1)]\");",
+            "assert(str(v) == \"[[R(a: 3)], [R(a: 1)]]\");",
+            "const m = [c[0], sort(K, pure func(a, b) {",
+            "    struct W { int k; } return W(a).k < W(b).k; })];",
+            "assert(str(m) == \"[Q(a: 3), [1, 3]]\");",
+        },
+    },
+
     /* the parser decides a `??` whose left side is a constant and keeps
      * that side alone; kept as a NODE (a deferred call), its own type may
      * be opt, and the `??` it stands for is not (README) */

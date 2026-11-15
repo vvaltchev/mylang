@@ -1114,6 +1114,10 @@ collect_value_descs(const EvalValue &v,
                     std::unordered_set<const FuncDescriptor *> &out);
 
 static void
+collect_def_owner_funcs(Construct *n, const EvalValue &v,
+                        std::unordered_set<const FuncDescriptor *> &descs);
+
+static void
 detach_baked_funcs(ParseContext &c, unique_ptr<Construct> &slot,
                    const std::unordered_set<const FuncDescriptor *> &descs);
 
@@ -1190,6 +1194,10 @@ pDeferFold(ParseContext &c, Construct *node,
                                           immutable, &v);
     std::unordered_set<const FuncDescriptor *> descs;
     collect_value_descs(v, descs);
+    /* ...and one holding an instance of a struct declared in a function
+     * literal written here: the literal owns the definition, and a late
+     * fold would retire it */
+    collect_def_owner_funcs(node, v, descs);
     /* a node can be deferred twice - the call, then the declaration
      * whose value it is (which bakes arrays) - and the second decides */
     node->late_fold.reset();
@@ -4263,6 +4271,7 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             {
                 std::unordered_set<const FuncDescriptor *> descs;
                 collect_value_descs(cv, descs);
+                collect_def_owner_funcs(rv.get(), cv, descs);
                 if (!descs.empty())
                     detach_baked_funcs(c, rv, descs);
             }
@@ -4692,6 +4701,119 @@ collect_value_descs(const EvalValue &v,
     collect_value_descs(v, out, st);
 }
 
+/* The struct definitions a value names: an instance's (a class's, a
+ * box's), a flat struct array's element def, a struct type itself, and
+ * those inside containers, fields and a type's const members. A flat
+ * scalar or string array names none (and get_view() would promote it).
+ * The value may contain itself (cyclewalk.h). */
+static void
+collect_value_defs(const EvalValue &v,
+                   std::unordered_set<const StructTypeDef *> &out,
+                   CycStack &st)
+{
+    CycKey k;
+    bool keyed = cyc_key(v, k);
+    if (!keyed && v.get_type()->t == Type::t_structtype) {
+        k = cyc_key_consts(v.get<StructTypeDef *>());
+        keyed = true;
+    }
+    if (keyed && st.contains(k))
+        return;
+    CycGuard g(st, k, keyed);
+
+    switch (v.get_type()->t) {
+
+    case Type::t_arr: {
+        const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
+        switch (arr.skind()) {
+        case SharedArrayObj::Storage::structs:
+            out.insert(arr.flat_structs().def);
+            break;
+        case SharedArrayObj::Storage::objs:
+            for (size_type i = 0; i < arr.size(); i++)
+                collect_value_defs(obj_elem_value(
+                    arr.flat_objs()[arr.offset() + i]), out, st);
+            break;
+        case SharedArrayObj::Storage::general: {
+            ArrayConstView view = arr.get_view();
+            for (size_type i = 0; i < view.size(); i++)
+                collect_value_defs(view[i].get(), out, st);
+            break;
+        }
+        default:
+            break;
+        }
+        break;
+    }
+
+    case Type::t_dict:
+        for (const auto &kv :
+                 v.get_ref<intrusive_ptr<DictObject>>()->get_ref()) {
+            collect_value_defs(kv.first, out, st);
+            collect_value_defs(kv.second.get(), out, st);
+        }
+        break;
+
+    case Type::t_struct: {
+        const StructObject &so = *v.get_ref<intrusive_ptr<StructObject>>();
+        out.insert(so.def);
+        /* a POD instance's fields are bytes: a nested POD struct's def
+         * is a field's, named by the def itself */
+        for (const LValue &f : so.fields)
+            collect_value_defs(f.get(), out, st);
+        break;
+    }
+
+    case Type::t_structtype: {
+        const StructTypeDef *d = v.get<StructTypeDef *>();
+        out.insert(d);
+        for (const auto &cm : d->consts)
+            collect_value_defs(cm.second, out, st);
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+/*
+ * A bake is about to free `n` (or a late fold to retire it) while the
+ * value it computed lives on. A struct declared inside a function literal
+ * written in `n` is OWNED by that declaration, so an instance of it in
+ * the value would read a freed definition - `const c = map(pure func(x)
+ * { struct Q { int a; } return Q(x); }, K);` was a heap-use-after-free.
+ * The descriptor of each such literal (the outermost one around the
+ * declaration) joins `descs`: the callers keep those literals alive as
+ * they keep one the value NAMES (#47), or leave the node in place.
+ */
+static void
+collect_def_owner_funcs(Construct *n, const EvalValue &v,
+                        std::unordered_set<const FuncDescriptor *> &descs)
+{
+    std::unordered_set<const StructTypeDef *> defs;
+    CycStack st;
+    collect_value_defs(v, defs, st);
+    if (defs.empty())
+        return;
+    std::function<void(Construct *, const FuncDeclStmt *)> walk =
+        [&](Construct *x, const FuncDeclStmt *lit) {
+        if (!x)
+            return;
+        if (!lit && ctag(x) == ConstructType::func_decl)
+            lit = static_cast<const FuncDeclStmt *>(x);
+        if (auto *sd = node_cast<StructDeclStmt>(x))
+            if (defs.count(sd->def)) {
+                /* a declaration is a statement: in an expression, one
+                 * stands in a function literal's body */
+                ML_CHECK(lit);
+                descs.insert(lit->desc);
+            }
+        for_each_child_of(x, [&](Construct *ch) { walk(ch, lit); });
+    };
+    walk(n, nullptr);
+}
+
 /*
  * QUESTION 5 (plans/open-language-questions.md, decision A) - A USER
  * FUNCTION THE PARSER RUNS, RUNS TYPED.
@@ -4737,7 +4859,8 @@ collect_value_descs(const EvalValue &v,
  * given a struct TYPE (the template it is passed to is not instantiated
  * for one at run time either), and a result holding a function value - a
  * copy's descriptor dies with the cache, so it may not escape into the
- * program.
+ * program. (A struct declared inside a copied function does not die with
+ * it: a clone shares the definition its original owns.)
  */
 EvalValue pt_invoke(EvalContext *ctx, FuncObject &obj,
                     const std::vector<EvalValue> &args, Loc call_site);
@@ -4762,11 +4885,6 @@ struct PtEntry {
      * instance, where the program would make one) */
     EvalValue fn;
     std::vector<std::pair<size_t, EvalValue>> fn_args;
-    /* the struct definitions the copy itself OWNS - a struct declared
-     * inside a copied function (the program's own are bound by a
-     * non-owning declaration): they die with the cache (pt_result) */
-    bool owned_known = false;
-    std::unordered_set<const StructTypeDef *> owned_defs;
 };
 
 /* key: the call's node id (as written), or the function's node id and its
@@ -5118,131 +5236,22 @@ PtEntry *pt_entry(const std::string &key, Build build)
     return it->second.get();
 }
 
-/* The struct definitions a value names: an instance's (a class's, a
- * box's), a flat struct array's element def, a struct type itself, and
- * those inside containers, fields and a type's const members. A flat
- * scalar or string array names none (and get_view() would promote it).
- * The value may contain itself (cyclewalk.h). */
-static void
-collect_value_defs(const EvalValue &v,
-                   std::unordered_set<const StructTypeDef *> &out,
-                   CycStack &st)
-{
-    CycKey k;
-    bool keyed = cyc_key(v, k);
-    if (!keyed && v.get_type()->t == Type::t_structtype) {
-        k = cyc_key_consts(v.get<StructTypeDef *>());
-        keyed = true;
-    }
-    if (keyed && st.contains(k))
-        return;
-    CycGuard g(st, k, keyed);
-
-    switch (v.get_type()->t) {
-
-    case Type::t_arr: {
-        const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
-        switch (arr.skind()) {
-        case SharedArrayObj::Storage::structs:
-            out.insert(arr.flat_structs().def);
-            break;
-        case SharedArrayObj::Storage::objs:
-            for (size_type i = 0; i < arr.size(); i++)
-                collect_value_defs(obj_elem_value(
-                    arr.flat_objs()[arr.offset() + i]), out, st);
-            break;
-        case SharedArrayObj::Storage::general: {
-            ArrayConstView view = arr.get_view();
-            for (size_type i = 0; i < view.size(); i++)
-                collect_value_defs(view[i].get(), out, st);
-            break;
-        }
-        default:
-            break;
-        }
-        break;
-    }
-
-    case Type::t_dict:
-        for (const auto &kv :
-                 v.get_ref<intrusive_ptr<DictObject>>()->get_ref()) {
-            collect_value_defs(kv.first, out, st);
-            collect_value_defs(kv.second.get(), out, st);
-        }
-        break;
-
-    case Type::t_struct: {
-        const StructObject &so = *v.get_ref<intrusive_ptr<StructObject>>();
-        out.insert(so.def);
-        /* a POD instance's fields are bytes: a nested POD struct's def
-         * is a field's, named by the def itself */
-        for (const LValue &f : so.fields)
-            collect_value_defs(f.get(), out, st);
-        break;
-    }
-
-    case Type::t_structtype: {
-        const StructTypeDef *d = v.get<StructTypeDef *>();
-        out.insert(d);
-        for (const auto &cm : d->consts)
-            collect_value_defs(cm.second, out, st);
-        break;
-    }
-
-    default:
-        break;
-    }
-}
-
-/* the definitions `e`'s copy owns (PtEntry::owned_defs), found once */
-static const std::unordered_set<const StructTypeDef *> &
-pt_owned_defs(PtEntry *e)
-{
-    if (!e->owned_known) {
-        e->owned_known = true;
-        std::function<void(Construct *)> walk = [&](Construct *n) {
-            if (!n)
-                return;
-            if (auto *sd = node_cast<StructDeclStmt>(n))
-                if (sd->def_owner)
-                    e->owned_defs.insert(sd->def_owner.get());
-            for_each_child_of(n, walk);
-        };
-        walk(e->root.get());
-    }
-    return e->owned_defs;
-}
-
-/* a run's result, unless it names something the copy owns - a function
- * value of a copy, a struct declared inside a copied function: both die
- * with the cache (an instance of such a struct read its freed def - a
- * heap-use-after-free), so neither may escape into the program; the call
- * then runs untyped instead, with the program's own function and struct */
-bool pt_result(PtEntry *e, EvalValue &r, EvalValue &out)
+/* a run's result, unless a function value in it is a copy's - whose
+ * descriptor dies with the cache, so it may not escape into the program:
+ * the call then runs untyped instead. (A struct declared inside a copied
+ * function is the program's own: a copy shares its definition -
+ * StructDeclStmt::clone.) */
+bool pt_result(EvalValue &r, EvalValue &out)
 {
     std::unordered_set<const FuncDescriptor *> ds;
     collect_value_descs(r, ds);
-    bool copy_owned = false;
     for (const FuncDescriptor *d : ds)
-        if (d->parse_typed)
-            copy_owned = true;
-    if (!copy_owned) {
-        const auto &owned = pt_owned_defs(e);
-        if (!owned.empty()) {
-            std::unordered_set<const StructTypeDef *> defs;
-            CycStack st;
-            collect_value_defs(r, defs, st);
-            for (const StructTypeDef *d : defs)
-                if (owned.count(d))
-                    copy_owned = true;
-        }
-    }
-    if (copy_owned) {
+        if (d->parse_typed) {
 #ifdef TESTS
-        g_pt_untyped++;
+            g_pt_untyped++;
 #endif
-        return false;
-    }
+            return false;
+        }
 #ifdef TESTS
     g_pt_runs++;
 #endif
@@ -5288,7 +5297,7 @@ bool pt_typed_written(EvalContext *ctx, const CallExpr *call, EvalValue &out)
         return false;
     }
     EvalValue r = RValue(e->call->eval(e->ctx.get()));
-    return pt_result(e, r, out);
+    return pt_result(r, out);
 }
 
 bool pt_args_name_function(EvalContext *ctx, Construct *args)
@@ -5354,7 +5363,7 @@ bool pt_typed_value(FuncObject &obj, const std::vector<EvalValue> &vals,
             args[fa.first] = fa.second;
         r = pt_invoke(e->ctx.get(), fn, args, call_site);
     }
-    return pt_result(e, r, out);
+    return pt_result(r, out);
 }
 
 void pt_cache_clear()
@@ -5398,6 +5407,7 @@ detach_baked_funcs_below(ParseContext &c, Construct *node,
 {
     std::unordered_set<const FuncDescriptor *> descs;
     collect_value_descs(baked, descs);
+    collect_def_owner_funcs(node, baked, descs);
     if (descs.empty())
         return;
     for_each_child_slot(node, [&](unique_ptr<Construct> &ch) {
@@ -5463,6 +5473,7 @@ cse_materialize_core(ParseContext &c,
         *deferred = v;
         std::unordered_set<const FuncDescriptor *> descs;
         collect_value_descs(v, descs);
+        collect_def_owner_funcs(node, v, descs);
         if (!descs.empty())
             key.clear();
     }

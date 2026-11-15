@@ -1876,7 +1876,9 @@ new pooled-caret op that can sit in inlined code needs the same.
 
 **The disassembler dumps the WHOLE serializable image, not just funcs
 (`disasm.cpp`, `-vd`).** `disassemble_program` prints the program's custom TYPES
-(every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts)
+(every `struct` def - name, POD byte-offset / boxed-slot layout, folded consts;
+one entry per definition, from the declaration that owns it, in the order
+`vm_compile` takes them)
 first, then each chunk's code, then that chunk's POOLS + side tables (`consts`,
 `member_keys`, `boxed_ops` (labelled *derived* - the model-flip nativize-ops
 JIT-bakeable operand data for BinOpV/CmpV/CompoundV; rebuilt on a `.myv` load,

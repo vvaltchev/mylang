@@ -15,6 +15,7 @@
 #include "errors.h"       /* InlineCtx (the inline_ctxs pool dump) */
 #include "lexer.h"        /* OpString */
 #include "reflect.h"      /* reflect_decl_annot (the fit_specs dump) */
+#include "inferencer.h"   /* for_each_child_of (the complete walker) */
 
 #include <sstream>
 #include <iomanip>
@@ -150,36 +151,23 @@ static std::string expr14_op(Op aop)
 /* collect_funcs moved to codegen.cpp (shared with the VM's AOT precompile);
  * declared in codegen.h. */
 
-/* Every StructDeclStmt reachable from `c` (a custom type definition). Structs
- * appear only as STATEMENTS, so only the statement-containers are walked. */
+/* Every struct DEFINITION declared under `c`, in vm_compile's order (its
+ * take_structs): the COMPLETE walk, since a struct may be declared in a
+ * function literal written in an expression, and the declarations that
+ * OWN their definition - a copy of a function (a template's instance, an
+ * inlined body) shares its original's, which is listed once. */
 void collect_structs(const Construct *c,
                      std::vector<const StructDeclStmt *> &out)
 {
     if (!c)
         return;
     if (auto *sd = node_cast<const StructDeclStmt>(c)) {
-        out.push_back(sd);
+        if (sd->def_owner)
+            out.push_back(sd);
         return;
     }
-    auto rec = [&](const Construct *ch) { collect_structs(ch, out); };
-    if (auto *b = node_cast<const Block>(c)) {
-        for (const auto &e : b->elems) rec(e.get());
-    } else if (auto *fn = node_cast<const FuncDeclStmt>(c)) {
-        rec(fn->body.get());
-    } else if (auto *iff = node_cast<const IfStmt>(c)) {
-        rec(iff->thenBlock.get()); rec(iff->elseBlock.get());
-    } else if (auto *w = node_cast<const WhileStmt>(c)) {
-        rec(w->body.get());
-    } else if (auto *f = node_cast<const ForStmt>(c)) {
-        rec(f->body.get());
-    } else if (auto *fr = node_cast<const ForRangeStmt>(c)) {
-        rec(fr->body.get());
-    } else if (auto *fe = node_cast<const ForeachStmt>(c)) {
-        rec(fe->body.get());
-    } else if (auto *t = node_cast<const TryCatchStmt>(c)) {
-        rec(t->tryBody.get()); rec(t->finallyBody.get());
-        for (const auto &cs : t->catchStmts) rec(cs.second.get());
-    }
+    for_each_child_of(const_cast<Construct *>(c),
+                      [&](Construct *ch) { collect_structs(ch, out); });
 }
 
 const char *field_kind_str(FieldKind k)

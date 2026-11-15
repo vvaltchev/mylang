@@ -548,7 +548,13 @@ unique_ptr<Construct> StructDeclStmt::clone() const
     auto c = make_unique<StructDeclStmt>();
     copy_base_fields(*c);
     c->id = clone_as(id);
-    c->set_def(make_unique<StructTypeDef>(*def));
+    /* the SAME definition, which the original keeps owning: a struct is
+     * declared once, however many copies of the function around it are
+     * made (a template's instances, an inlined body, the typed copy a
+     * constant call runs). A definition of its own made each copy's
+     * instances another struct - unequal to the original's, refused by
+     * the copy's own `Q q = Q(x);`, and dead with the copy */
+    c->def = def;
     return c;
 }
 
