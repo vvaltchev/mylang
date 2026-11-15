@@ -1,0 +1,74 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107, Q2): an UNTYPED flat container - one only a `dyn`
+# element reaches, so it carries no type of its own (README, "A
+# container keeps its type") - is checked by its STORAGE alone, as
+# every flat array was before containers carried types: a bool widens
+# into int or float storage and an int into float storage, while a value
+# the storage cannot hold is refused with the array left as it was. A
+# typed container's own type converts or refuses the value first, so
+# only an untyped one reaches these arms of the element store, append,
+# push and insert. (A flat array of struct values is
+# tests/functional/117's, unit 115.)
+array<dyn> h = [[1, 2], [1.5, 2.5], [true, false]];
+var dyn ai = h[0];
+var dyn af = h[1];
+var dyn ab = h[2];
+assert(array_storage(ai) == "int" && array_storage(af) == "float");
+assert(array_storage(ab) == "bool");
+
+# widening, through each way a value enters
+append(ai, true);
+push(ai, false);
+append(af, 3);
+append(af, false);
+ai[0] = true;
+af[0] = 4;
+af[1] = true;
+insert(ai, 0, true);
+insert(af, 0, 7);
+insert(af, 0, false);
+insert(ab, 0, true);
+append(ab, false);
+ab[1] = false;
+assert(str(ai) == "[1, 1, 2, 1, 0]");
+assert(str(af) == "[0.000000, 7.000000, 4.000000, 1.000000, 3.000000, 0.000000]");
+assert(str(ab) == "[true, false, false, false]");
+assert(array_storage(ai) == "int" && array_storage(af) == "float");
+
+# a compound store and an increment read the element and store the result
+ai[1] += 5;
+af[2] *= 2;
+var dyn old = ai[2]++;
+assert(old == 2 && ai[1] == 6 && ai[2] == 3 && af[2] == 8.0);
+
+# refused by the storage, the array left as it was
+var refused = 0;
+try { append(ab, 1); } catch (TypeErrorEx) { refused++; }
+try { ab[0] = 1; } catch (TypeErrorEx) { refused++; }
+try { insert(ab, 0, 1); } catch (TypeErrorEx) { refused++; }
+try { append(ai, "s"); } catch (TypeErrorEx) { refused++; }
+try { ai[0] = 2.5; } catch (TypeErrorEx) { refused++; }
+try { insert(ai, 0, 2.5); } catch (TypeErrorEx) { refused++; }
+try { append(af, "s"); } catch (TypeErrorEx) { refused++; }
+try { af[0] = "s"; } catch (TypeErrorEx) { refused++; }
+try { insert(af, 0, "s"); } catch (TypeErrorEx) { refused++; }
+assert(refused == 9);
+assert(len(ai) == 5 && len(af) == 6 && len(ab) == 4);
+
+# an empty slice of an untyped array is an untyped array too
+var dyn es = ai[10:20];
+append(es, "s");
+assert(len(es) == 1);
+
+# a typed dict reached through `dyn`: a NEW key's value is checked
+# against the dict's own type (insert leaves an existing key alone)
+dict<str, int> td = {"a": 1};
+var dyn dd = td;
+insert(dd, "b", 2);
+insert(dd, "a", 5);
+var miss = 0;
+try { insert(dd, "c", "s"); } catch (TypeErrorEx) { miss++; }
+try { dd[5] = 1; } catch (TypeErrorEx) { miss++; }   # a key misfit
+assert(miss == 2 && str(td) == "{\"a\": 1, \"b\": 2}");
+print("ok");

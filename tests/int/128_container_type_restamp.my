@@ -1,0 +1,65 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107, Q2): a baked container value two nodes share - a
+# template's instances clone one body - takes each node's type; a node
+# whose type differs from the one the value already carries gets a COPY,
+# made untyped all the way down and typed again (ctype_restamp), so one
+# instance's type never leaks into another's container.
+func mk(x) { var a = [[1, 2]]; append(a, x); return a; }
+var a1 = mk([3]);
+var dyn a2 = mk("s");
+assert(str(a1) == "[[1, 2], [3]]" && str(a2) == "[[1, 2], \"s\"]");
+assert(typestr(a1) == "array<array<int>>");
+append(a1[0], 9);
+var dyn i2 = a2[0];
+assert(str(a2[0]) == "[1, 2]");     # the copy: a1's append is not here
+var r = 0;
+try { append(i2, "t"); } catch (TypeErrorEx) { r++; }
+var dyn t2 = a2;
+append(t2, "u");                    # array<dyn>: takes anything
+var dyn a1d = a1;
+try { append(a1d, "v"); } catch (TypeErrorEx) { r++; }
+assert(r == 2 && len(a2) == 3 && len(a1) == 2);
+
+func mkd(x) { var d = {"k": [1]}; d["j"] = x; return d; }
+var d1 = mkd([2]);
+var dyn d2 = mkd("s");
+assert(str(d1) == "{\"k\": [1], \"j\": [2]}");
+assert(str(d2) == "{\"k\": [1], \"j\": \"s\"}");
+var dyn dk = d2;
+dk["z"] = 3.5;                      # dict<str, dyn>
+var dyn d1d = d1;
+r = 0;
+try { d1d["z"] = 3.5; } catch (TypeErrorEx) { r++; }
+assert(r == 1 && len(d2) == 3 && len(d1) == 2);
+
+# a dict default and a nested dict in the shared value
+func mkn(x) { var n = {"a": {"b": [1]}}; n["c"] = x; return n; }
+var n1 = mkn({"q": [5]});
+var dyn n2 = mkn(7);
+assert(str(n1) == "{\"a\": {\"b\": [1]}, \"c\": {\"q\": [5]}}");
+assert(str(n2) == "{\"a\": {\"b\": [1]}, \"c\": 7}");
+
+# a container a builtin builds or an array sum makes takes the type of
+# its place: dynamic where `dyn` is declared, none nested in a `dyn`
+# element (only `dyn` reaches it), its own elsewhere
+var dyn rg = range(runtime(3));
+append(rg, "s");
+var dyn dg = dict(runtime(0));
+dg["k"] = "s";
+var base = [1, 2];
+var dyn sm = base + [3];
+append(sm, true);               # array<dyn>: no type refuses it...
+var dyn smd = sm;
+r = 0;
+try { append(smd, "s"); } catch (TypeErrorEx) { r++; }  # ...its storage does
+assert(r == 1);
+array<dyn> holder = [range(runtime(2)), base + [4], dict(runtime(0))];
+var dyn hr = holder[0];
+var dyn hs = holder[1];
+r = 0;
+try { append(hr, "s"); } catch (TypeErrorEx) { r++; }   # flat storage
+try { append(hs, "s"); } catch (TypeErrorEx) { r++; }
+assert(r == 2 && len(rg) == 4 && len(sm) == 4 && str(dg) == "{\"k\": \"s\"}");
+
+print("ok");
