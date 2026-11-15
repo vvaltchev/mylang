@@ -1,0 +1,92 @@
+# A catch clause catches a struct by IDENTITY (question 25, README
+# *Exceptions*): the struct its name resolves to where the clause is
+# written, as the type in `Err e;` does. Three structs named Err below are
+# three types; a function's private struct is not caught by name outside
+# it, only by the fallback `catch (dyn as e)`, which binds whatever it
+# caught. Clauses used to compare names, so `catch (Err)` caught all three
+# and `e.ok` failed at run time inside the catch body.
+
+var bad = 0;
+func want(what, opt got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+func rt(x) => runtime(x);
+
+func a(n) { struct Err { int code; } throw Err(n); }
+func b(s) { struct Err { str text; } throw Err(s); }
+struct Err { bool ok; }
+func c() { throw Err(rt(true)); }
+
+# a's private Err passes the top-level clause by
+func catches_a() {
+    try { a(rt(7)); } catch (Err as e) { return "wrong " + str(e.ok); }
+    catch (dyn as e) { return "fallback " + str(e.code); }
+}
+want("private struct", catches_a(), "fallback 7");
+
+var got = "";
+try { b(rt("x")); } catch (Err) { got = "wrong"; }
+catch (dyn as e) { got = str(e.text); }
+want("another private struct", got, "x");
+
+# the top-level Err, and its variable has that type
+try { c(); } catch (Err as e) { got = typestr(e) + " " + str(e.ok); }
+want("top-level", got, "Err true");
+
+# through an alias: the alias's struct
+const T = Err;
+try { c(); } catch (T as e) { got = "alias " + str(e.ok); }
+want("alias", got, "alias true");
+
+# a function's own struct, caught inside the function
+func inner() {
+    struct P { int v; }
+    try { throw P(rt(3)); } catch (P as p) { return p.v; }
+}
+want("inside", inner(), 3);
+
+# a struct declared further down (it binds at scope entry)
+try { throw Late(rt(1)); } catch (Late as l) { got = "late " + str(l.v); }
+want("declared below", got, "late 1");
+struct Late { int v; }
+
+# several types in one clause: the variable is dynamic
+struct A1 { int v; }
+struct B1 { str s; }
+func pick(int k) {
+    if (k == 0)
+        throw A1(rt(4));
+    throw B1(rt("q"));
+}
+foreach (var k in [0, 1]) {
+    try { pick(rt(k)); } catch (A1, B1 as e) { got = str(e); }
+    want("multi " + str(k), got, k == 0 ? "A1(v: 4)" : "B1(s: \"q\")");
+}
+
+# a built-in exception: by name; the fallback binds it as well
+try { print(1 / rt(0)); } catch (DivisionByZeroEx as e) { got = str(e); }
+want("builtin", got, "<Exception(DivisionByZeroEx)>");
+try { print([1][rt(5)]); } catch (dyn as e) { got = str(e); }
+want("builtin fallback", got, "<Exception(OutOfBoundsEx)>");
+
+# a struct named like a built-in exception is its own type: the clause
+# naming the built-in does not catch it
+func odd() { struct TypeErrorEx { int z; } throw TypeErrorEx(rt(9)); }
+try {
+    try { odd(); } catch (TypeErrorEx) { got = "wrong"; }
+} catch (dyn as e) { got = "outer " + str(e.z); }
+want("builtin's name", got, "outer 9");
+
+# the fallback is the last clause, after the typed ones
+try { c(); } catch (A1) { got = "wrong"; } catch (dyn as e) {
+    got = "last " + str(e.ok);
+}
+want("last clause", got, "last true");
+
+assert(bad == 0);
+print("ok");

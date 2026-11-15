@@ -456,6 +456,7 @@ private:
     StaticTypeRef annot_to_static_type(const TypeAnnot *ta);
     void declare_target(Construct *lvalue, Scope *s, bool is_const);
     void bind_type_aliases(Expr14 *e14);
+    void resolve_catch_types(AllowedExList &cl, Scope *s);
     void enforce_decl_types();       /* explicit-type annotations (array/dict) */
     void enforce_concrete_decls();   /* the mandatory-`dyn` rule */
     void lower_named_args(Construct *n);        /* desugar named-arg calls */
@@ -4723,6 +4724,42 @@ static const StructTypeDef *alias_struct_of(const Construct *rv, size_t i,
  * S's struct as the struct's own name does, so a construction `T(5)`, a
  * `T.CONST` and a named argument are typed as S's (the six readers of
  * TypeSym::struct_type). Its value, a descriptor, is `dyn` like S's. */
+/*
+ * Question 25: a catch clause names a struct by IDENTITY - the struct the
+ * name resolves to where the clause is written, as the type in `Err e;`
+ * does (an alias included: its symbol carries the struct). A struct
+ * private to a function is then not caught by name outside it. A name no
+ * struct in scope takes must be a built-in exception's; otherwise it is
+ * not a type - in a closed world (a script). An open world (the REPL, a
+ * parse-time copy) may declare the struct later, so there the clause
+ * keeps matching by name. A syntactic rule: it runs under -nti too.
+ */
+void Inferencer::resolve_catch_types(AllowedExList &cl, Scope *s)
+{
+    cl.defs.clear();
+    if (!cl.exList)
+        return;
+    for (const auto &id : cl.exList->elems) {
+        TypeSym *ts = lookup(s, id->uid);
+        if (ts && ts->struct_type) {
+            cl.defs.push_back(ts->struct_type);
+            continue;
+        }
+        cl.defs.push_back(nullptr);
+        if (is_catchable_ex_name(id->get_str()))
+            continue;
+        if (!ts && !closed_world)
+            continue;
+        const std::string nm(id->get_str());
+        SyntaxErrorEx e(id->start, intern_msg(ts
+            ? "'" + nm + "' is not a type here: a variable, a parameter "
+              "or a function named '" + nm + "' is not a struct"
+            : "'" + nm + "' is not a type"));
+        e.loc_end = id->end;
+        throw e;
+    }
+}
+
 void Inferencer::bind_type_aliases(Expr14 *e14)
 {
     /* declare_target has just bound every target that is not `_` */
@@ -4972,13 +5009,31 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         auto *tc = static_cast<TryCatchStmt *>(n);
         walk_struct(tc->tryBody.get(), s);
         for (auto &cs : tc->catchStmts) {
+            resolve_catch_types(cs.first, s);
             Scope *inner = new_scope(s);
             if (cs.first.asId) {
                 TypeSym *sym = new_sym(cs.first.asId->uid, inner,
                                        cs.first.asId->start,
                                        cs.first.asId->end);
-                sym->type = A.exc_ty();
-                sym->dyn_decl = true;   /* exception payload is dynamic */
+                /* question 25: a clause that names ONE struct catches
+                 * that struct only, so its variable has that type, as if
+                 * declared `Err e;`; otherwise (a built-in exception, two
+                 * types, `catch (dyn as e)`) it is dynamic */
+                const StructTypeDef *one = nullptr;
+                bool single = !cs.first.defs.empty();
+                for (const StructTypeDef *d : cs.first.defs) {
+                    if (!d || (one && d != one))
+                        single = false;
+                    one = d;
+                }
+                if (single) {
+                    sym->ann = DeclType::strct;
+                    sym->ann_struct = one;
+                    sym->type = A.struct_ty(one, one->name);
+                } else {
+                    sym->type = A.exc_ty();
+                    sym->dyn_decl = true;   /* the payload is dynamic */
+                }
                 id_sym[cs.first.asId.get()] = sym;
             }
             walk_struct(cs.second.get(), inner);

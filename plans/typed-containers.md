@@ -1,9 +1,8 @@
 # A container's type belongs to the container (Q2, 2026-11-16)
 
-**Status: the rule is the maintainer's (2026-11-16), and so is the
-empty-container rule (question 9, carried to run time). One part is
-open: how a container is checked where it ENTERS a typed place
-(section 3).**
+**Status: decided by the maintainer (2026-11-16): the rule, the
+empty-container rule (question 9, carried to run time) and A for a
+container entering a typed place (section 3). Not built yet.**
 
 ## 1. The rule
 
@@ -59,7 +58,7 @@ Its static type where it is created, fixed for its lifetime:
 - `dynarray(a)`: `array<dyn>`, as today;
 - a value read from a `.myv` image: the type stored with it.
 
-## 3. OPEN: a container entering a typed place
+## 3. A container entering a typed place - DECIDED: A
 
 Today a container entering a typed place is checked by its CONTENTS
 at that moment (#49, `value_fits` walking a general array or a dict).
@@ -81,6 +80,11 @@ ea7bbd87, all engines):
   what C# does (`List<object>` is not a `List<int>`).
 - **B. Keep the contents check.** Closes the stores through a `dyn`
   name (section 1) and leaves the example above as it is.
+
+Decision (maintainer, 2026-11-16): **A** - "array<dyn> cannot be casted
+automatically that way. We'll need to implement a special cast operator
+to do that, but explicitly." The explicit cast is a new feature, saved
+for later (CLAUDE.md, *NO NEW LANGUAGE FEATURES*).
 
 Measured cost of A (ea7bbd87, an instrumented build reporting every
 container the contents check accepted, over tests/functional,
@@ -123,7 +127,7 @@ them #49's own tests of the contents check; no bench or sample.
    is also the test that a site was stamped.
 2. Checked stores through `dyn`, every engine, and the in-place
    builtins; the README gap removed.
-3. The entry check (section 3).
+3. The entry check (section 3, A).
 4. `.myv`.
 
 Tests: a functional program with every store form and every container

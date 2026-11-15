@@ -635,8 +635,17 @@ try { a(runtime(7)); } catch (Err as e) { print(e); }  # Err(code: 7)
   exceptions (`TypeErrorEx`, ...) are unchanged.
 - **B - by name**, as today.
 
-Open beside it: the catch-all does not bind the exception. Binding it
-(`catch (dyn as e)` was proposed; `catch (e)` cannot be told from
-`catch (T)` by its shape, and with A a misspelled type would silently
-become a catch-all) is a new form, so it waits for the maintainer.
+And (maintainer, 2026-11-16) `catch (dyn as e)`: the catch-all that
+binds the exception to a `dyn` variable, "the ultimate fallback catch,
+when we still want the content of the exception, to print it". (Not
+`catch (e)`: it cannot be told from `catch (T)` by its shape, and with A
+a misspelled type would silently become a catch-all.)
+
+Done (2026-11-17): the inferencer's structural pass resolves each clause
+name (`resolve_catch_types`), both matchers compare struct identity, a
+clause naming one struct types its variable as that struct, `.myv` v42
+stores the struct, and the REPL's open world keeps a name nothing
+declares yet matching by name. README *Custom exceptions*; tests:
+`tests/functional/124_catch_identity.my`, `catch:` `-rt` cases, a
+`repl:` case.
 

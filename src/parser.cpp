@@ -5707,7 +5707,9 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             );
         }
 
-        if (pAcceptOp(c, Op::parenL)) {
+        bool dyn_catch = false;
+        if (pAcceptOp(c, Op::parenL)
+                && !(dyn_catch = pAcceptKeyword(c, Keyword::kw_dyn))) {
 
             exList = pList<IdList>(c, fl, pIdentifier);
 
@@ -5774,6 +5776,26 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
 
             pExpectOp(c, Op::parenR);
 
+        } else if (dyn_catch) {
+
+            /* question 25: `catch (dyn as e)` - the catch-all that binds
+             * what it caught, whatever its type (a struct no clause here
+             * can name, a built-in exception), to print it, say. Like
+             * `catch { }` it has no type list. */
+            unique_ptr<Construct> id;
+            if (!pAcceptKeyword(c, Keyword::kw_as)
+                    || !pAcceptId(c, id, false)) {
+                throw SyntaxErrorEx(
+                    c.get_loc(),
+                    "Expected 'as' and a name after 'catch (dyn' "
+                    "(`catch { }` catches without binding), got",
+                    &c.get_tok()
+                );
+            }
+            asId.reset(static_cast<Identifier *>(id.release()));
+            pExpectOp(c, Op::parenR);
+            have_catch_anything = true;
+
         } else {
 
             have_catch_anything = true;
@@ -5789,7 +5811,7 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
         c.shadow_pop();
 
         stmt->catchStmts.emplace_back(
-            AllowedExList{std::move(exList), std::move(asId)},
+            AllowedExList{std::move(exList), std::move(asId), {}},
             std::move(body)
         );
     };

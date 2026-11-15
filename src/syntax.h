@@ -2267,6 +2267,13 @@ struct AllowedExList {
 
     unique_ptr<IdList> exList;
     unique_ptr<Identifier> asId;
+    /* question 25: per exList element, the struct the name resolves to
+     * where the clause is written (the clause catches THAT struct only),
+     * or null for a built-in exception's name - and for a name the
+     * inferencer could not resolve in an OPEN world (the REPL, a
+     * parse-time copy), which then matches by name. Set by the
+     * inferencer's structural pass; empty when it has not run. */
+    std::vector<const StructTypeDef *> defs;
 };
 
 class TryCatchStmt final: public Construct {
@@ -2291,6 +2298,7 @@ public:
             AllowedExList ael;
             ael.exList = clone_as(cs.first.exList);
             ael.asId = clone_as(cs.first.asId);
+            ael.defs = cs.first.defs;
             c->catchStmts.emplace_back(std::move(ael), clone_as(cs.second));
         }
         return c;

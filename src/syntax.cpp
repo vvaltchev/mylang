@@ -821,6 +821,8 @@ void TryCatchStmt::serialize(ostream &s, int level) const
 
         } else {
             s << "<anything>";
+            if (asId)
+                s << " as " << asId->get_str() << " ";
         }
 
         s << ") (\n";

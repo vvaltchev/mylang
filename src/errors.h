@@ -659,6 +659,31 @@ inline bool is_uncatchable_ex_name(const std::string_view &n)
         || n == "CannotRebindBuiltinEx";
 }
 
+/*
+ * Question 25: is `n` the name of a built-in exception a catch clause may
+ * name? A clause names a struct by IDENTITY (the struct the name resolves
+ * to where the clause is written); a name no struct in scope takes must
+ * be one of these, or it is a compile error. Every catchable run-time
+ * exception the interpreter raises: the DECL_RUNTIME_EX classes and
+ * OutOfMemoryEx. A new one joins this list (and the class list of
+ * `catch_names_every_builtin_ex`, tests.cpp, which checks each spelling),
+ * or naming it in a clause is a compile error.
+ */
+inline bool is_catchable_ex_name(const std::string_view &n)
+{
+    static constexpr const char *names[] = {
+        "UnboundSymbolEx", "InvalidArgumentEx", "InvalidNumberOfArgsEx",
+        "CannotChangeConstEx", "DivisionByZeroEx", "StackOverflowEx",
+        "OutOfMemoryEx", "AssertionFailureEx", "NotLValueEx",
+        "TypeErrorEx", "InvalidValueEx", "NotCallableEx",
+        "OutOfBoundsEx", "KeyNotFoundEx", "CannotOpenFileEx",
+    };
+    for (const char *k : names)
+        if (n == k)
+            return true;
+    return false;
+}
+
 struct SyntaxErrorEx : public Exception {
 
     const char *const msg;

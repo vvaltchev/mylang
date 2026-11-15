@@ -220,6 +220,13 @@ void dump_struct_type(const StructTypeDef *def, std::ostringstream &s)
 /* The chunk's serializable POOLS + side tables, printed after its code (a
  * `.myv` file stores exactly these, referenced by index/pc from the ops).
  * Only non-empty sections print, to keep a plain function's dump terse. */
+/* question 25: the struct table of the program being dumped (an image's,
+ * or the source's in collect_structs order - the order vm_compile stores
+ * it in), so a catch type names the struct it resolved to by its index:
+ * reproducible, and an image whose stored index is wrong dumps
+ * differently from the fresh compile */
+static std::vector<const StructTypeDef *> g_dis_structs;
+
 void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
 {
     /* One blank line + a header: these are the SERIALIZABLE pools/side
@@ -274,8 +281,21 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         s << "; -- catch_types (" << ch.catch_types.size() << ") --\n";
         for (size_t i = 0; i < ch.catch_types.size(); i++) {
             s << ";   [" << i << "]" << "  ";
-            for (size_t j = 0; j < ch.catch_types[i].size(); j++)
+            for (size_t j = 0; j < ch.catch_types[i].size(); j++) {
                 s << (j ? ", " : "") << ch.catch_types[i][j];
+                const StructTypeDef *d = ch.catch_keys[i][j].def;
+                if (!d)
+                    continue;
+                size_t k = 0;
+                while (k < g_dis_structs.size() && g_dis_structs[k] != d)
+                    k++;
+                s << " (struct #";
+                if (k < g_dis_structs.size())
+                    s << k;
+                else
+                    s << "?";
+                s << ")";
+            }
             s << "\n";
         }
     }
@@ -2522,6 +2542,9 @@ std::string disassemble_image(const VmProgram &prog)
             dump_struct_type(sd.get(), s);
         s << "\n";
     }
+    g_dis_structs.clear();
+    for (const auto &sd : prog.structs)
+        g_dis_structs.push_back(sd.get());
 
     /* the JitCtx the load's JIT used for each chunk (vm_jit_program):
      * the M1 container plan below asks the native-call gate, whose answer
@@ -2573,6 +2596,9 @@ std::string disassemble_program(const Block *root)
             dump_struct_type(sd->def, s);
         s << "\n";
     }
+    g_dis_structs.clear();
+    for (const StructDeclStmt *sd : structs)
+        g_dis_structs.push_back(sd->def);
 
     std::vector<const FuncDeclStmt *> funcs;
     for (const auto &e : root->elems)
