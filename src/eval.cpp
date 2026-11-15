@@ -7563,6 +7563,31 @@ const StructTypeDef *exc_struct_def(const RuntimeException *ex,
     return o.boxed ? nullptr : o.def;
 }
 
+/*
+ * Question 25 at COMPILE time. A function the parser runs (a constant
+ * call) may not have been through the inferencer, which is what resolves
+ * a clause's names (AllowedExList::defs): the untyped run of a pure
+ * function, -nti, a name a typed copy does not declare. There the name is
+ * resolved where the clause RUNS: the const scope chain is the lexical
+ * one (a struct binds at its block's entry, a pure function's body is
+ * parented to the scope that declared it), so the struct - or the alias -
+ * the name denotes is the one bound there. A name bound to no struct
+ * names a struct that does not exist yet (it is declared further down, or
+ * by a later REPL input), so no instance of it can have been thrown.
+ */
+static const StructTypeDef *
+const_scope_struct(EvalContext *ctx, const UniqueId *uid)
+{
+    for (EvalContext *c = ctx; c; c = c->parent) {
+        if (LValue *lv = c->lookup(uid)) {
+            const EvalValue &v = lv->get();
+            return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>()
+                                           : nullptr;
+        }
+    }
+    return nullptr;
+}
+
 static bool
 do_catch(EvalContext *ctx,
          RuntimeException *saved_ex,
@@ -7598,18 +7623,32 @@ do_catch(EvalContext *ctx,
      * or not */
     bool ex_is_struct = false;
     const StructTypeDef *ex_def = exc_struct_def(saved_ex, ex_is_struct);
+    int const_eval = -1;            /* asked once, when a name needs it */
 
     for (size_t ci = 0; ci < n_types && !matched; ci++) {
 
         const unique_ptr<Identifier> &id = exList->elems[ci];
         const StructTypeDef *cd = ci < defs.size() ? defs[ci] : nullptr;
+        if (!cd) {
+            if (const_eval < 0)
+                const_eval = ctx->in_const_eval();
+            if (const_eval)
+                cd = const_scope_struct(ctx, id->uid);
+        }
         if (cd) {
             if (cd != ex_def)
                 continue;
-        } else if (ex_is_struct && is_catchable_ex_name(id->get_str())) {
+        } else if (is_catchable_ex_name(id->get_str())) {
+            if (ex_is_struct)
+                continue;
+            if (ex_uid ? (id->uid != ex_uid) : (id->get_str() != ex_name))
+                continue;
+        } else if (const_eval) {
+            /* a struct nothing has declared yet (const_scope_struct) */
             continue;
         } else if (ex_uid ? (id->uid != ex_uid)
                           : (id->get_str() != ex_name)) {
+            /* an open world's unresolved name: by name */
             continue;
         }
         matched = true;

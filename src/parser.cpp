@@ -5242,6 +5242,22 @@ void pt_collect(PtBuild &b, Construct *c, EvalContext *scope)
         if (EvalContext *in = pt_lookup(scope, uid, lv))
             pt_bind(b, uid, lv->get(), lv, in);
     }
+    if (ctag(c) == ConstructType::try_catch) {
+        /* a catch clause names a struct (or an alias of one) the walk
+         * below does not visit: declared in the copy, the copy's own
+         * inference resolves the clause to it (question 25) - a clause
+         * catches by identity, at compile time too */
+        for (auto &cs : static_cast<TryCatchStmt *>(c)->catchStmts) {
+            if (!cs.first.exList)
+                continue;
+            for (auto &id : cs.first.exList->elems) {
+                LValue *lv = nullptr;
+                EvalContext *in = pt_lookup(scope, id->uid, lv);
+                if (in && lv->get().is<StructTypeDef *>())
+                    pt_bind(b, id->uid, lv->get(), lv, in);
+            }
+        }
+    }
     for_each_child_of(c, [&](Construct *ch) { pt_collect(b, ch, scope); });
 }
 
