@@ -451,6 +451,7 @@ private:
     /* a parsed TypeAnnot -> StaticType */
     StaticTypeRef annot_to_static_type(const TypeAnnot *ta);
     void declare_target(Construct *lvalue, Scope *s, bool is_const);
+    void bind_type_aliases(Expr14 *e14);
     void enforce_decl_types();       /* explicit-type annotations (array/dict) */
     void enforce_concrete_decls();   /* the mandatory-`dyn` rule */
     void lower_named_args(Construct *n);        /* desugar named-arg calls */
@@ -4674,6 +4675,58 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
     }
 }
 
+/* The struct a type alias's initializer names: the parser made it a
+ * literal of the descriptor (alias_literal), and a constant
+ * multi-declaration's element is one too, or an element of a baked
+ * array. Null for any other value. */
+static const StructTypeDef *alias_struct_of(const Construct *rv, size_t i,
+                                            bool element)
+{
+    if (!element) {
+        auto *lo = node_cast<const LiteralObj>(rv);
+        const EvalValue *v = lo ? &lo->literal_value() : nullptr;
+        return v && v->is<StructTypeDef *>() ? v->get<StructTypeDef *>()
+                                             : nullptr;
+    }
+    if (auto *la = node_cast<const LiteralArray>(rv))
+        return i < la->elems.size()
+            ? alias_struct_of(la->elems[i].get(), 0, false) : nullptr;
+    auto *lo = node_cast<const LiteralObj>(rv);
+    if (!lo || !lo->literal_value().is<SharedArrayObj>())
+        return nullptr;
+    const SharedArrayObj &a = lo->literal_value().get_ref<SharedArrayObj>();
+    /* a descriptor is a general element (get_view() would promote any
+     * other kind in place) */
+    if (a.skind() != SharedArrayObj::Storage::general || i >= a.size())
+        return nullptr;
+    const EvalValue &v = a.get_view()[i].get();
+    return v.is<StructTypeDef *>() ? v.get<StructTypeDef *>() : nullptr;
+}
+
+/* `const T = S;` - a TYPE ALIAS (README, *Type aliases*): T's symbol names
+ * S's struct as the struct's own name does, so a construction `T(5)`, a
+ * `T.CONST` and a named argument are typed as S's (the six readers of
+ * TypeSym::struct_type). Its value, a descriptor, is `dyn` like S's. */
+void Inferencer::bind_type_aliases(Expr14 *e14)
+{
+    auto bind = [&](Identifier *id, const StructTypeDef *def) {
+        auto it = id_sym.find(id);
+        if (!def || it == id_sym.end() || !it->second)
+            return;
+        it->second->struct_type = def;
+        it->second->type = A.dyn_ty();
+    };
+    Construct *rv = e14->rvalue.get();
+    if (auto *id = node_cast<Identifier>(e14->lvalue.get())) {
+        bind(id, alias_struct_of(rv, 0, false));
+        return;
+    }
+    if (auto *idl = node_cast<IdList>(e14->lvalue.get()))
+        for (size_t i = 0; i < idl->elems.size(); i++)
+            if (!idl->elems[i]->is_underscore())
+                bind(idl->elems[i].get(), alias_struct_of(rv, i, true));
+}
+
 void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
 {
     auto decl_one = [&](Identifier *id) {
@@ -4818,6 +4871,8 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
                 if (sym && !sym->func)
                     sym->func = func_of_decl[fd];
             }
+            if (e14->fl & pFlags::pInConstDecl)
+                bind_type_aliases(e14);
         } else if (ctag(e14->lvalue.get()) == ConstructType::idlist) {
             /* An IdList is a leaf to for_each_child, so resolve each target
              * as a single target is resolved: unresolved, the write to it
