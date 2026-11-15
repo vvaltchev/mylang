@@ -3623,7 +3623,10 @@ and it lives *inside the parser*. Mechanics:
   `node_id` plus each argument's STATIC type (and the ids of any function
   in it), the written one the call's `node_id`; a result holding a
   function value of a copy runs the call untyped instead (its
-  descriptors die with the cache - `pt_result`); the cache is cleared when
+  descriptors die with the cache - `pt_result`), and so does one naming
+  a struct DECLARED INSIDE a copied function (`PtEntry::owned_defs`: the
+  copy owns that def, so an instance outlived it - a heap-use-after-free
+  until 2026-11-15, tests/functional/119); the cache is cleared when
   the outermost `pBlock` exits (`ParseContext::block_depth`) and in
   `~ParseContext`, because the copies and the noted initializers are AST
   the `-vm` teardown's `live_nodes == 0` proof counts; a copy's own root
