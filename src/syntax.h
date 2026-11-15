@@ -274,6 +274,19 @@ public:
     const TypeAnnot *ctype = nullptr;
 
     /*
+     * Q2 increment 2: a STORE the compiler could not check against its
+     * container's own type - the place's static type is `dyn` or not yet
+     * known (a store through a `dyn` name, into an array<dyn> element, a
+     * template base's parameter): the store checks the value against the
+     * type the container carries, at the write (ct_fit, eval.h). Set by
+     * the inferencer on the lvalue node of such a store (a Subscript or a
+     * MemberExpr) and on the args ExprList of such an append / push /
+     * insert (read through ArgLocs::ct_store); codegen carries it as
+     * Instr::ct_checked. Copied by copy_base_fields.
+     */
+    bool ct_store = false;
+
+    /*
      * Set on nodes spliced in by function inlining: the "inlined-at" chain used
      * to rebuild virtual backtrace frames for the (physically absent) inlined
      * call. Null for the vast majority of nodes; consulted only on the error
@@ -350,6 +363,7 @@ public:
         d.arr_hint = arr_hint;
         d.arr_hint_struct = arr_hint_struct;
         d.ctype = ctype;
+        d.ct_store = ct_store;
         d.defer_fold = defer_fold;
         d.late_fold_witness = late_fold_witness;
         d.never_none = never_none;

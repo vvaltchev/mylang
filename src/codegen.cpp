@@ -1266,6 +1266,7 @@ struct Codegen {
         bc.end = dc->args->end;
         bc.arr_hint = dc->args->arr_hint;
         bc.ctype = dc->args->ctype;
+        bc.ct_store = dc->args->ct_store;
         bc.args.reserve(dc->args->elems.size());
         for (const auto &el : dc->args->elems)
             bc.args.push_back(ArgLoc{el->start, el->end});
@@ -2727,6 +2728,15 @@ struct Codegen {
             acc_op = slot_op(t);   /* the result temp feeds the next op */
         }
         out_slot = acc_op.slot;
+        /* Q2: an array sum takes its static type (Construct::ctype; the
+         * BinOpV's copy starts untyped, ctype_sum_copy) */
+        if (k == 'a' && node && node->ctype) {
+            CgInstr st;
+            st.op = OpCode::StampTypeV;
+            st.set_a(slot_op(out_slot));
+            st.target2 = static_cast<int>(ctype_pool_ref(node->ctype));
+            ops.push_back(st);
+        }
         return true;
     }
 
@@ -4164,6 +4174,7 @@ struct Codegen {
             cs.end = call->args->end;
             cs.arr_hint = call->args->arr_hint;
             cs.ctype = call->args->ctype;
+            cs.ct_store = call->args->ct_store;
             cs.args.reserve(n);
             for (const auto &el : call->args->elems)
                 cs.args.push_back(ArgLoc{el->start, el->end});
@@ -4995,6 +5006,7 @@ struct Codegen {
                         site.bname = cid->uid;
                     site.a0_start = a0->start;
                     site.a0_end = a0->end;
+                    site.ct_store = dc->args->ct_store;
                     site.field_locs.reserve(ctor->args->elems.size());
                     for (const auto &fe : ctor->args->elems)
                         site.field_locs.push_back(
@@ -6217,6 +6229,8 @@ struct Codegen {
         /* DUAL operand: lo = the chain_steps pool idx, hi = the base kind */
         in.set_a_dual(steps_idx, bkind);
         in.aop = e->op;
+        if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+            in.set_ct_checked();
         in.op_node_idx = add_op_node(e->op, e);
         ops.push_back(in);
         return true;
@@ -6628,6 +6642,8 @@ struct Codegen {
                     in.set_a_dual(k1slot, add_chain_locs({inner, sub}));
                     in.set_b(slot_op(k2slot));
                     in.aop = e->op;
+                    if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+                        in.set_ct_checked();
                     in.op_node_idx = add_op_node(e->op, e);
                     ops.push_back(in);
                     return true;
@@ -6683,6 +6699,8 @@ struct Codegen {
                 in.set_a_dual(add_chain_locs(locnodes), bkind);
                 in.set_b(int_lit(keybase));
                 in.aop = e->op;
+                if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+                    in.set_ct_checked();
                 in.op_node_idx = add_op_node(e->op, e);
                 ops.push_back(in);
                 return true;
@@ -6714,6 +6732,8 @@ struct Codegen {
                 in.set_a(slot_op(kslot));
                 in.set_b(slot_op(vslot));
                 in.aop = e->op;
+                if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+                    in.set_ct_checked();
                 in.op_node_idx = add_op_node(e->op, e);
                 ops.push_back(in);
                 return true;
@@ -6836,6 +6856,8 @@ struct Codegen {
                 in.set_a(slot_op(kin.target));
                 in.set_b(slot_op(vslot));
                 in.aop = e->op;
+                if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+                    in.set_ct_checked();
                 in.op_node_idx = add_op_node(e->op, e);
                 ops.push_back(in);
                 return true;
@@ -7179,6 +7201,8 @@ struct Codegen {
         in.set_a(slot_op(kslot));
         in.set_b(slot_op(vslot));
         in.aop = e->op;
+        if (e->lvalue->ct_store)      /* Q2: a store through `dyn` */
+            in.set_ct_checked();
         in.op_node_idx = add_op_node(e->op, e);
         ops.push_back(in);
         return true;
@@ -10112,6 +10136,9 @@ static bool visit_use_def(const Instr &in, U u, D d)
         u(in.a_slot()); u(in.b_slot()); return true;
     case OpCode::CheckFitV:        /* reads the value; no def (#49) */
         u(in.a_slot()); return true;
+    case OpCode::StampTypeV:       /* the array's TYPE changes, no slot
+                                    * does (Q2) */
+        u(in.a_slot()); return true;
     case OpCode::MakeArrayV:
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
@@ -12992,6 +13019,13 @@ void ChunkVerifier::verify_one(const Instr &in)
     case OpCode::StoreBoxV:
         a_slot_only(in);
         b_slot_only(in);
+        break;
+    case OpCode::StampTypeV:
+        /* Q2: `a` the sum's slot, `target2` a ctypes ref (never 0) */
+        a_slot_only(in);
+        if (in.target2 < 1)
+            reject("ctype");
+        ctype(static_cast<unsigned>(in.target2));
         break;
     case OpCode::CheckFitV:
         /* #49: `a` the value's slot, `target2` its fit_specs entry */

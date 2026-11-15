@@ -1752,25 +1752,48 @@ slot = "now a string";           # ok, because it's dyn
     refused at compile time when its result may not fit the place:
     the operation's result cannot be checked before the store, so the
     compiler asks for the plain form, `a[i] = a[i] + d`, which is
-    checked. The check is made where a value ENTERS a typed place, so
-    one gap remains: a container reached through a `dyn` name is not a
-    typed place, and `var dyn d = rows; d[0] = ["x"]` stores into the
-    `array<array<int>>` that `rows` names without a check. (An array
-    whose element type is `int`, `float` or `bool` is stored compactly
-    and refuses such a store - see `array_storage()` - unless it was
-    built with the general representation, as `dynarray()` builds it.)
-    Such a value is caught where it is read as the declared type: an
-    element read as a number (`a[i] * 2` of an `array<int>`), a dict
-    value read that way (`d.k + 1` of a `dict<str, int>`) and a typed
-    `foreach` variable raise `TypeErrorEx` at that read - the caret
-    marks the element read, or the container of the `foreach` - when
-    the value is not of the declared type (a `bool` reads as `0`/`1`
-    and an `int` as a float, as everywhere).
+    checked.
+
+    **A container keeps its type.** An array or a dict carries the type
+    it was made with - the type of the place its literal or the call
+    that built it was written for - and a store reached through a `dyn`
+    name, or into an element whose type is `dyn`, is checked against the
+    type of the container it reaches, not against the name's:
+
+    ```
+    var rows = [[1], [2]];        # an array<array<int>>
+    var dyn d = rows;
+    d[0] = ["x"];                 # TypeErrorEx: the array's elements are
+                                  # 'array<int>' but the value's [0] is
+                                  # a 'str'
+    ```
+
+    The container is left as it was; a value that fits is stored,
+    converted as a typed store converts it (an `int` into a `float`
+    element is a `float`). The same holds for every way a value enters
+    a container: an element or dict value store (plain or compound - a
+    compound's result is checked), a member store into a dict
+    (`d.k = v`), a store several levels deep (`d[0][1] = v`), and
+    `append`, `push` and `insert`. A NEW dict key is checked against
+    the dict's key type wherever it is inserted, a default dict's read
+    included (a read of a missing key inserts it), and `a += b` checks
+    and converts each element it appends against `a`'s type, however
+    `a` was reached. A container made where `dyn` is declared
+    (`var dyn d = [1, 2]`, an element of an `array<dyn>`) is dynamic
+    and holds anything; so does one whose type nothing gave it (`[]`
+    that nothing filled, or one written where only a `dyn` was known).
 
     With type inference disabled (`-nti`) the parameter and constructor
     checks still run - the declaration alone decides them, as it does
     the `none` check - but no store is checked, since inference is what
-    finds the place's declared type. A literal is not converted to its
+    finds the place's declared type and gives a container its type. A
+    value that does not fit its place is then caught where it is read as
+    the declared type: an element read as a number (`a[i] * 2` of an
+    `array<int>`), a dict value read that way (`d.k + 1` of a
+    `dict<str, int>`) and a typed `foreach` variable raise `TypeErrorEx`
+    at that read - the caret marks the element read, or the container of
+    the `foreach` - when the value is not of the declared type (a `bool`
+    reads as `0`/`1` and an `int` as a float, as everywhere). A literal is not converted to its
     place either, so `half([1, 2.5])` into an `array<float>` parameter
     is refused there: its first element is an `int`.
 
@@ -2896,11 +2919,11 @@ element reached through a field or another element (`s.a[0] = v`,
 `append(s.a, v)`, `m[0][0] = v`), against the element type its declaration
 gives it - or, for a container whose type was inferred, the element type it
 was inferred with (`var m = [["x"]]; m[0][0] = 5;` is a compile error: a
-store into an element of an element does not widen `m` the way a store into
-`m`'s own element does). At run time a field store converts and checks its value exactly
-as the constructor does, whatever the struct's layout: `p.f = 2` into a
-`float` field stores `2.0`, a `bool` into an `int` field `0` or `1`, and a
-`dyn` value that does not fit the field raises `TypeErrorEx`.
+store into an element of an element does not widen `m` the way a store
+into `m`'s own element does). At run time a field store converts and checks
+its value exactly as the constructor does, whatever the struct's layout:
+`p.f = 2` into a `float` field stores `2.0`, a `bool` into an `int` field `0`
+or `1`, and a `dyn` value that does not fit the field raises `TypeErrorEx`.
 
 **Value semantics.** A struct is a **value**, like a C struct or a C#
 `struct`: every copy is independent. A copy is made wherever a struct moves to

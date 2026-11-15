@@ -508,6 +508,18 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
     for (size_type i = 0; i < rn; i++)
         items.push_back(arr_elem_at(rhs, i));
 
+    /* Q2: each element fits the array's OWN type, converted as a typed
+     * store converts it (an int into an array<float?> is a float) - the
+     * array keeps its type however `+=` reached it. Every engine runs
+     * this, so it needs no mark from the compiler. `a + b` builds its
+     * result from an untyped copy (ctype_sum_copy), so only `+=` is
+     * checked here. */
+    if (const TypeAnnot *ct = lval.ctype()) {
+        const TypeAnnot *ea = ct->elem.get();
+        for (EvalValue &e : items)
+            e = ct_fit(ea, std::move(e), false);
+    }
+
     for (const EvalValue &e : items)
         if (!arr_elem_fits(lval, e))
             throw TypeErrorEx(flat_array_violation_msg);

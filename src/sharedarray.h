@@ -832,6 +832,9 @@ public:
         /* #53 option 1: &shobj->shift_epoch (int_type), which the
          * foreach's ArrEpochCheck compares against its recorded mark. */
         const void *shift_epoch;
+        /* Q2: &shobj->ctype, which the inline store tier reads to keep
+         * a checked store inline for an array that takes anything */
+        const void *ctype;
     };
     JitProbe jit_probe() const {
         return { static_cast<const void *>(shobj.get()),
@@ -841,7 +844,8 @@ public:
                  static_cast<const void *>(&shobj->hash_valid),
                  static_cast<const void *>(&shobj->has_slices),
                  static_cast<const void *>(&shobj->intr_refcount),
-                 static_cast<const void *>(&shobj->shift_epoch) };
+                 static_cast<const void *>(&shobj->shift_epoch),
+                 static_cast<const void *>(&shobj->ctype) };
     }
     size_type offset() const { return slice ? off : 0; }
 

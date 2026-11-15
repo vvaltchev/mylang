@@ -3564,11 +3564,20 @@ void Inferencer::stamp_literal_coerce(Construct *n, StaticTypeRef t)
             lit_coerce_by_parent.insert(c);
             stamp_literal_coerce(c, el);
         }
+        /* Q2: a container made in a `dyn` element - a literal, a call
+         * that builds one, a sum - has no type of its own (only `dyn`
+         * reaches it), as a baked value's is (stamp_ctype_rec) */
+        if (el && c && el->kind == StaticTypeKind::Dyn)
+            ctype_untype(c);
     };
-    /* Q2: the container is made with the type it is built for here */
+    /* Q2: the container is made with the type it is built for here -
+     * DYNAMIC where `dyn` is declared; untyped when nested under a `dyn`
+     * element, where only `dyn` reaches it (its storage is its own
+     * values', so a type would claim what the storage cannot hold) */
     const bool dict = ctag(n) == ConstructType::lit_dict;
     n->ctype = ctype_dyn_place.count(n)
         ? (dict ? annot_dyn_dict() : annot_dyn_array())
+        : t && t->kind == StaticTypeKind::Dyn ? nullptr
         : ctype_of(t, dict);
     if (ctag(n) == ConstructType::lit_arr) {
         auto *la = static_cast<LiteralArray *>(n);
@@ -4458,6 +4467,34 @@ void Inferencer::stamp_sum_identity(CallExpr *call)
         call->args->arr_hint = ArrHint::flat_f;
 }
 
+/* Q2 increment 2: does a store into a place of static type `t` need
+ * its value checked against the container's own type at run time - the
+ * place is `dyn`, or its type is not known here? */
+static bool ct_unsettled(StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+    return !t || t->kind == StaticTypeKind::Dyn
+        || t->kind == StaticTypeKind::Unknown;
+}
+
+/* the builtins that store a value into the container they are given */
+static bool in_place_store(std::string_view n)
+{
+    return n == "append" || n == "push" || n == "insert";
+}
+
+/* the static type of what a store into a container of static type `c`
+ * puts there: an array's element, a dict's value; `dyn` otherwise */
+static StaticTypeRef elem_place_of(StaticTypeRef c)
+{
+    c = static_type_resolve(c);
+    if (c && c->kind == StaticTypeKind::Array)
+        return c->elem;
+    if (c && c->kind == StaticTypeKind::Dict)
+        return c->val;
+    return nullptr;
+}
+
 /* Q2: is a component of `t` unfilled (`none`) or not yet known? Such a
  * container is made UNTYPED: its first typed place gives it its type. */
 static bool ctype_unfilled(StaticTypeRef t)
@@ -4599,11 +4636,36 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
                 if (!known || (into_dyn && i > 0)
                         || arg_fit_checked(call, i))
                     ctype_untype(as[i].get());
+            /* Q2 increment 2: an append / push / insert whose element
+             * type the compiler does not know checks the value against
+             * the container's own type; so does a call that may reach
+             * one through a function value */
+            call->args->ct_store = !known
+                || (builtin && !as.empty() && in_place_store(cid->uid->val)
+                    && ct_unsettled(elem_place_of(type_of(as[0].get()))));
         }
+        break;
+    }
+    case ConstructType::expr04: {
+        /* `a + b` on arrays makes a NEW array (a copy of `a` that
+         * starts untyped, ctype_sum_copy): it gets the type the place it
+         * is written into has, else the sum's own (StampTypeV) */
+        const StaticTypeRef own = static_type_resolve(type_of(n));
+        if (own && own->kind == StaticTypeKind::Array)
+            n->ctype = ctype_untyped.count(n) ? nullptr
+                : ctype_dyn_place.count(n) ? annot_dyn_array()
+                : ctype_of(dest ? dest : own, false);
         break;
     }
     case ConstructType::expr14: {
         auto *e = static_cast<Expr14 *>(n);
+        /* Q2 increment 2: a store into an element, a dict value or a
+         * member whose type the compiler does not know - through a `dyn`
+         * name, into an array<dyn> - checks the value against the
+         * container's own type at run time */
+        if (ctag(e->lvalue.get()) == ConstructType::subscript
+                || ctag(e->lvalue.get()) == ConstructType::member)
+            e->lvalue->ct_store = ct_unsettled(type_of(e->lvalue.get()));
         if (e->op == Op::assign) {
             /* checked where it lands; or stored through a `dyn` container,
              * whose element type is unknown here */
@@ -4655,6 +4717,7 @@ void Inferencer::ctype_untype(Construct *n)
     }
     case ConstructType::lit_arr: case ConstructType::lit_dict:
     case ConstructType::lit_obj: case ConstructType::call:
+    case ConstructType::expr04:
         ctype_untyped.insert(n);
         return;
     default:
@@ -7063,6 +7126,9 @@ void Inferencer::contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
 bool Inferencer::literal_fits(Construct *lit, StaticTypeRef d)
 {
     d = static_type_resolve(d);
+    /* any literal fits a `dyn` place (an element of an array<dyn>) */
+    if (d->kind == StaticTypeKind::Dyn)
+        return true;
     if (ctag(lit) == ConstructType::lit_arr) {
         if (d->kind != StaticTypeKind::Array)
             return false;

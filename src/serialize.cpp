@@ -1685,6 +1685,7 @@ void write_chunk(Writer &w, const Chunk &c)
         w.uidv(es.bname);
         w.locv(es.a0_start); w.locv(es.a0_end);
         write_arglocs(w, es.field_locs);
+        w.boolv(es.ct_store);                /* v43: Q2 increment 2 */
     }
 
     w.u32v(static_cast<uint32_t>(c.throws.size()));
@@ -1714,6 +1715,7 @@ void write_chunk(Writer &w, const Chunk &c)
         w.locv(bc.start); w.locv(bc.end);
         w.u8v(static_cast<uint8_t>(bc.arr_hint));
         write_ctype(w, bc.ctype);            /* v43 */
+        w.boolv(bc.ct_store);                /* v43: Q2 increment 2 */
         write_arglocs(w, bc.args);
         w.uidv(bc.member);
         wsteps(bc.steps);                /* v32 */
@@ -1725,6 +1727,7 @@ void write_chunk(Writer &w, const Chunk &c)
         write_arglocs(w, cs.args);
         w.u8v(static_cast<uint8_t>(cs.arr_hint));
         write_ctype(w, cs.ctype);            /* v43 */
+        w.boolv(cs.ct_store);                /* v43: Q2 increment 2 */
         w.u8v(static_cast<uint8_t>(cs.a0_form));
         w.u32v(static_cast<uint32_t>(cs.a0_kind));
         w.u32v(static_cast<uint32_t>(cs.a0_slot));
@@ -2048,6 +2051,7 @@ void read_chunk(Reader &r, Chunk &c)
         es.bname = r.uid_req("corrupt .myv (emplace callee with no name)");
         es.a0_start = r.locv(); es.a0_end = r.locv();
         es.field_locs = read_arglocs(r);
+        es.ct_store = r.boolv();             /* v43: Q2 increment 2 */
         c.emplace_sites.push_back(std::move(es));
     }
 
@@ -2096,6 +2100,7 @@ void read_chunk(Reader &r, Chunk &c)
         bc.arr_hint = r.enumv(ArrHint::flat_c,
                               "corrupt .myv (array hint)");
         bc.ctype = read_ctype_any(r);        /* v43 */
+        bc.ct_store = r.boolv();             /* v43: Q2 increment 2 */
         bc.args = read_arglocs(r);
         bc.member = r.uidv();
         bc.steps = rsteps();
@@ -2111,6 +2116,7 @@ void read_chunk(Reader &r, Chunk &c)
         cs.arr_hint = r.enumv(ArrHint::flat_c,
                               "corrupt .myv (array hint)");
         cs.ctype = read_ctype_any(r);        /* v43 */
+        cs.ct_store = r.boolv();             /* v43: Q2 increment 2 */
         cs.a0_form = r.enumv(Chunk::CallSite::A0::chain,
                              "corrupt .myv (call site arg0 form)");
         cs.a0_kind = static_cast<unsigned char>(r.u32v());

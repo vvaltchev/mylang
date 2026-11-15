@@ -844,7 +844,7 @@ vm_struct_ctor_boxed(EvalContext &ctx, StructTypeDef *def, int_type base,
 static ML_NOINLINE void
 vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
                   const std::pair<Loc, Loc> *steplocs, size_t nkeys,
-                  const EvalValue &val, Op op)
+                  const EvalValue &val, Op op, bool checked)
 {
     if (nkeys <= 8) {
         SmallArgs<8> keybuf;                          /* #97 B1 */
@@ -852,13 +852,14 @@ vm_chain_store_op(EvalContext &ctx, LValue *base, int_type kbase,
             keybuf.push(
                 ctx.frame->at(kbase + static_cast<int_type>(k)).get());
         vm_subscript_chain_store(base, keybuf.data(), nkeys, val, op,
-                                 steplocs);
+                                 steplocs, checked);
         return;
     }
     std::vector<EvalValue> keyheap(nkeys);
     for (size_t k = 0; k < nkeys; k++)
         keyheap[k] = ctx.frame->at(kbase + static_cast<int_type>(k)).get();
-    vm_subscript_chain_store(base, keyheap.data(), nkeys, val, op, steplocs);
+    vm_subscript_chain_store(base, keyheap.data(), nkeys, val, op, steplocs,
+                             checked);
 }
 
 /* GENERAL nested lvalue-chain store (StoreLValueChainV): walk the mixed
@@ -959,7 +960,7 @@ static ML_NOINLINE void
 vm_chain_lvalue_store_op(EvalContext &ctx,
                          const std::vector<Chunk::ChainStep> &steps,
                          const Chunk::MemberKey *mkeys, LValue *base,
-                         const EvalValue &value, Op op)
+                         const EvalValue &value, Op op, bool checked)
 {
     const size_t n = steps.size();
     EvalValue cur = EvalValue(base);
@@ -1014,7 +1015,7 @@ vm_chain_lvalue_store_op(EvalContext &ctx,
              * boxed field) goes through vm_member_store. */
             if (curlv->get().is<intrusive_ptr<DictObject>>())
                 vm_subscript_store(curlv, mk.memId, value, op,
-                                   last.lstart, last.lend);
+                                   last.lstart, last.lend, checked);
             else
                 vm_member_store(curlv, mk.memUid, op, value,
                                 last.lstart, last.lend, last.lstart, last.lend);
@@ -1025,7 +1026,7 @@ vm_chain_lvalue_store_op(EvalContext &ctx,
                 throw NotLValueEx(last.lstart, last.lend);
             }
             vm_subscript_store(cur.get<LValue *>(), key, value, op,
-                               last.lstart, last.lend);
+                               last.lstart, last.lend, checked);
         }
     } catch (Exception &ex) {
         /* an OPERATION error (op_caret) keeps no lvalue caret: the op's
@@ -1213,6 +1214,7 @@ vm_call_builtin_lv_rest(EvalContext &ctx, const Chunk::BuiltinCall &bc,
     al.nargs = bc.args.size();
     al.arr_hint = bc.arr_hint;
     al.ctype = bc.ctype;
+    al.ct_store = bc.ct_store;
     if (n_rest <= 8) {
         SmallArgs<8> stackbuf;                        /* #97 B1 */
         for (int_type i = 0; i < n_rest; i++)
@@ -1243,14 +1245,14 @@ vm_do_emplace(EvalContext &ctx, const Chunk::EmplaceSite &site,
             stackbuf.push(ctx.frame->at(base + i).get());
         return vm_emplace_struct(&ctx, target, site.a0_start, site.a0_end,
                                  site.def, site.field_locs.data(),
-                                 stackbuf.data(), nf);
+                                 stackbuf.data(), nf, site.ct_store);
     }
     std::vector<EvalValue> heapbuf(nf);
     for (size_t i = 0; i < nf; i++)
         heapbuf[i] = ctx.frame->at(base + i).get();
     return vm_emplace_struct(&ctx, target, site.a0_start, site.a0_end,
                              site.def, site.field_locs.data(),
-                             heapbuf.data(), nf);
+                             heapbuf.data(), nf, site.ct_store);
 }
 
 /* Map an arith/bitwise Op to its num_bin_op Type method, for the boxed BinOpV
@@ -3932,8 +3934,8 @@ extern "C" int jit_dict_store(LValue *base, const EvalValue *key,
                               const EvalValue *val, int op) noexcept
 {
     try {
-        vm_subscript_store(base, *key, *val, static_cast<Op>(op),
-                           Loc(), Loc());
+        vm_subscript_store(base, *key, *val, store_word_op(op),
+                           Loc(), Loc(), store_word_checked(op));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -3973,7 +3975,8 @@ extern "C" int jit_store_elem_value(int_type kind, int_type base_slot,
     const EvalValue &idx = ctx->frame->at(idx_slot).get();
     const EvalValue &val = ctx->frame->at(val_slot).get();
     try {
-        vm_subscript_store(alv, idx, val, static_cast<Op>(aop), Loc(), Loc());
+        vm_subscript_store(alv, idx, val, store_word_op(aop), Loc(), Loc(),
+                           store_word_checked(aop));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -4049,7 +4052,8 @@ extern "C" int jit_store_elem2(int_type base_slot, int_type k1_slot,
     const EvalValue &k2 = ctx->frame->at(k2_slot).get();
     const EvalValue &val = ctx->frame->at(val_slot).get();
     try {
-        vm_nested_subscript_store(&alv, k1, k2, val, static_cast<Op>(aop), locs);
+        vm_nested_subscript_store(&alv, k1, k2, val, store_word_op(aop), locs,
+                                  store_word_checked(aop));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -4082,7 +4086,7 @@ extern "C" int jit_store_elem_chain(int_type kind, int_type base_slot,
     const EvalValue &val = ctx->frame->at(val_slot).get();
     try {
         vm_chain_store_op(*ctx, base, kbase, cl->data(), cl->size(), val,
-                          static_cast<Op>(aop));
+                          store_word_op(aop), store_word_checked(aop));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -4121,7 +4125,7 @@ extern "C" int jit_store_lvalue_chain(int_type kind, int_type base_slot,
     const EvalValue &val = ctx->frame->at(val_slot).get();
     try {
         vm_chain_lvalue_store_op(*ctx, *steps, mkeys, base, val,
-                                 static_cast<Op>(aop));
+                                 store_word_op(aop), store_word_checked(aop));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
         return 1;
@@ -6655,6 +6659,7 @@ extern "C" int jit_boxed_binop(const void *bop) noexcept
     ML_BOXED_SLOW(boxed_operand(bo->a, ctx, sa),
                   boxed_operand(bo->b, ctx, sb));
     EvalValue val = boxed_operand(bo->a, ctx, sa).clone();
+    ctype_sum_copy(val);       /* Q2: as the BinOpV handler */
     try {
         vm_num_binop(val, boxed_operand(bo->b, ctx, sb), bo->aop);
     } catch (RuntimeException &e) {
@@ -6937,6 +6942,7 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
     al.nargs = bc->args.size();
     al.arr_hint = bc->arr_hint;
     al.ctype = bc->ctype;
+    al.ct_store = bc->ct_store;
     try {
         EvalValue r;
         if (n <= 8) {
@@ -7221,7 +7227,8 @@ extern "C" int jit_append(int_type kind, int_type arg0_slot, int_type val_slot,
     if (!target)
         return 2;
     const EvalValue &elem = ctx->frame->at(val_slot).get();
-    if (arr_append_fast(target, elem, false)) {
+    /* Q2: a checked append takes the full builtin (AppendV's handler) */
+    if (!bc->ct_store && arr_append_fast(target, elem, false)) {
         if (dst_slot >= 0)
             ctx->frame->at(dst_slot).put(target->get());
         return 0;
@@ -7278,6 +7285,7 @@ extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
             al.nargs = bc->args.size();
             al.arr_hint = bc->arr_hint;
             al.ctype = bc->ctype;
+            al.ct_store = bc->ct_store;
             res = bc->builtin.func_lv(ctx, &al, target, nullptr, 0);
         }
         ctx->frame->at(dst_slot).put(std::move(res));
@@ -7394,6 +7402,7 @@ extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
         al.nargs = bc->args.size();
         al.arr_hint = bc->arr_hint;
         al.ctype = bc->ctype;
+        al.ct_store = bc->ct_store;
         ctx->frame->at(dst_slot).put(
             bc->builtin.func_lv(ctx, &al, elem,
                                 n_rest ? restbuf.data() : nullptr,
@@ -7451,6 +7460,7 @@ extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
         al.nargs = bc->args.size();
         al.arr_hint = bc->arr_hint;
         al.ctype = bc->ctype;
+        al.ct_store = bc->ct_store;
         ctx->frame->at(dst_slot).put(
             bc->builtin.func_lv(ctx, &al, field,
                                 n_rest ? restbuf.data() : nullptr,
@@ -10624,6 +10634,7 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
     al.nargs = cs.args.size();
     al.arr_hint = cs.arr_hint;
     al.ctype = cs.ctype;
+    al.ct_store = cs.ct_store;
 
     const EvalValue &callee = ctx.frame->at(callee_slot).get();
 
@@ -12939,7 +12950,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * the hot case - pays no loc_at binary search); vm_subscript_store
              * uses it only when it throws. */
             try {
-                vm_subscript_store(&dlv, key, val, in->aop, Loc(), Loc());
+                vm_subscript_store(&dlv, key, val, in->aop, Loc(), Loc(),
+                                   in->ct_checked());
             } catch (Exception &e) {
                 vm_stamp_caret(*chunk, pc, e);
                 throw;
@@ -12991,7 +13003,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             const EvalValue &val = ctx.frame->at(in->b_slot()).get();
             /* Loc looked up LAZILY on the throw path only (see DictStore). */
             try {
-                vm_subscript_store(&alv, idx, val, in->aop, Loc(), Loc());
+                vm_subscript_store(&alv, idx, val, in->aop, Loc(), Loc(),
+                                   in->ct_checked());
             } catch (Exception &e) {
                 vm_stamp_caret(*chunk, pc, e);
                 throw;
@@ -13014,7 +13027,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             try {
                 vm_nested_subscript_store(
                     &alv, k1, k2, val, in->aop,
-                    chunk->chain_locs[in->a_dual_hi()].data());
+                    chunk->chain_locs[in->a_dual_hi()].data(),
+                    in->ct_checked());
             } catch (Exception &e) {
                 /* an operation error left loc-less by the per-step
                  * carets: the whole expression's (op_locs) */
@@ -13037,7 +13051,8 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             const auto &cl = chunk->chain_locs[in->a_dual_lo()];
             try {
                 vm_chain_store_op(ctx, base, in->b_lit(), cl.data(),
-                                  cl.size(), val, in->aop);
+                                  cl.size(), val, in->aop,
+                                  in->ct_checked());
             } catch (Exception &e) {
                 vm_stamp_caret(*chunk, pc, e);   /* see StoreElem2V */
                 throw;
@@ -13058,7 +13073,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             try {
                 vm_chain_lvalue_store_op(ctx, chunk->chain_steps[in->a_dual_lo()],
                                          chunk->member_keys.data(), base, val,
-                                         in->aop);
+                                         in->aop, in->ct_checked());
             } catch (Exception &e) {
                 vm_stamp_caret(*chunk, pc, e);
                 throw;
@@ -13380,7 +13395,10 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             LValue *target = vm_store_base(ctx, in->a_dual_hi(),
                                            in->target2, *chunk, pc, nullptr);
             const EvalValue &elem = ctx.frame->at(in->b_lit()).get();
-            if (arr_append_fast(target, elem, false)) {
+            /* Q2: a checked append (through `dyn`) takes the full builtin,
+             * which checks the element against the array's own type */
+            if (!chunk->builtin_calls[in->a_dual_lo()].ct_store
+                    && arr_append_fast(target, elem, false)) {
                 /* Call-cluster #4: a DISCARDED result (`append(a, x);` as a
                  * statement - the peephole proved the dst temp dead and set
                  * it to -1) skips materializing the array handle: one
@@ -13935,6 +13953,14 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             pc++;
             VM_NEXT;
 
+        VM_CASE(StampTypeV):
+            /* Q2: the sum `a + b` takes its static type (ctype_sum_copy) */
+            stamp_ctype_top(ctx.frame->at(in->a_slot()).get(),
+                            chunk->ctype_ref(
+                                static_cast<unsigned>(in->target2)));
+            pc++;
+            VM_NEXT;
+
         VM_CASE(CheckFitV):
             /* #49: a stored value that may misfit its place's type */
             vm_check_fit_op(ctx, *in, *chunk, pc);
@@ -14161,6 +14187,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * promotion, string `+` concat, bitwise). */
             EvalValue sa, sb;
             EvalValue val = boxed_operand(in->a(), &ctx, sa).clone();
+            ctype_sum_copy(val);   /* Q2: as the tree-walker's Expr04 */
             try {
                 vm_num_binop(val, boxed_operand(in->b(), &ctx, sb), in->aop);
             } catch (Exception &e) {

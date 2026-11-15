@@ -2,8 +2,8 @@
 
 **Status: decided by the maintainer (2026-11-16): the rule, the
 empty-container rule (question 9, carried to run time) and A for a
-container entering a typed place (section 3). Increment 1 in progress
-(section 6); two follow-on questions open (section 7).**
+container entering a typed place (section 3). Increments 1 and 2
+built (sections 6 and 8); two follow-on questions open (section 7).**
 
 ## 1. The rule
 
@@ -196,3 +196,43 @@ before any type exists, and two constants may share one baked value.
    variable assigned both and a function returning either.
    Recommendation: such a join is `array<dyn>` (stores through `c`
    checked at run time). The alternative is a compile error.
+
+## 8. Increment 2 notes (2026-11-17)
+
+Built: a store through `dyn` checks the value against the container's
+own type, in every engine (CLAUDE.md, *A CONTAINER CARRIES ITS OWN
+TYPE*; docs/vm-ops.md, *Checked stores and StampTypeV*;
+tests/functional/125_container_type_stores.my). Three things it changed
+on the way, and what increment 3 inherits:
+
+- **A container nested under a `dyn` element is UNTYPED** in both
+  paths (it was `array<dyn>` folded and its own type under `-nc` - a
+  RULE 2 difference int_ctype showed). Only `dyn` reaches it, and its
+  storage is its own values' (a flat `[1, 2]` in an `array<dyn>`
+  element), so `array<dyn>` would claim what the storage cannot hold.
+  `literal_fits` now lets any literal fit a `dyn` place, which is what
+  gives `array<dyn> a = [[1]]` its declared type under `-nc`.
+- **`a + b` on arrays** copies `a` untyped and stamps the sum with its
+  static type afterwards (a new op, StampTypeV): the copy kept `a`'s
+  type, so with checks on, `var c = x + [5]` (an `array<str?>` x, the sum
+  an `array<dyn>`) refused a valid store into `c`.
+- **`+=` checks and CONVERTS** each element against the array's own
+  type, with no mark (every engine runs TypeArr::add): `[1.5, none] +=
+  [2]` stored the int 2 in an `array<float?>` before (RULE 1).
+- **Tests that launder a misfit on purpose** (the typed-read checks,
+  the `*` box check, the JIT's box and class-reference guards) now do
+  it through a container with NO type of its own - a literal a fit
+  check examined where it landed (`h([runtime(box(1))])` into an
+  `array<box<int>>` parameter). Increment 3's entry check gives such a
+  container the parameter's type, which closes that route too: those
+  tests must move to an image (whose operands are not type-checked) or
+  to `-nti`, and the guards stay as the defense for both.
+- Two JIT guards are unreachable from compiled code now and left for
+  images: `storev_base_not_arr` (a base not proven an array is a store
+  through `dyn`, checked, the helper's) and the nested-store tier's
+  value-fit arm for a float into an int row (a compile error since
+  #58, and a `dyn` value is converted before the store).
+- A default dict's typed READ inserts the key it asks for, and that
+  key is checked; no test can reach a typed default dict until
+  increment 3 (`dict<str, int> d = dict(0)` is untyped today: the
+  declaration's fit check examines it).

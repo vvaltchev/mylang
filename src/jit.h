@@ -1450,7 +1450,7 @@ extern unsigned long g_jit_op_run[];
     X(storev_base_not_arr) X(storev_base_const) X(storev_base_slice) \
     X(storev_readonly) X(storev_base_kind) X(storev_has_slices) \
     X(storev_scale_wrap) X(storev_bounds) X(storev_elem_const) \
-    X(storev_val_ex) X(storev_val_slice) \
+    X(storev_val_ex) X(storev_val_slice) X(storev_ctype) \
     X(memberv_base_not_struct) X(memberv_def) \
     X(memberv_readonly) X(memberv_val_kind) X(memberv_val_ex) \
     X(memberv_val_slice) X(memberv_shared) X(memberv_borrowed) \

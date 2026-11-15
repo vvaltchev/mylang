@@ -462,3 +462,92 @@ void check_fit_loc(const EvalValue &v, const FitSpec &spec, Loc s, Loc e)
     ex.loc_end = e;
     throw ex;
 }
+
+/*
+ * Q2 increment 2 (plans/typed-containers.md): a container carries its
+ * own type, so a store the compiler could not check against it - one
+ * through `dyn` (Construct::ct_store, Instr::ct_checked,
+ * ArgLocs::ct_store) - checks the value here, at the write, in every
+ * engine. A new dict KEY is checked wherever it is inserted, however
+ * the dict was reached (ct_fit_key).
+ */
+const TypeAnnot *ct_elem_annot(const EvalValue &c)
+{
+    const TypeAnnot *ct = nullptr;
+    if (c.is<SharedArrayObj>()) {
+        ct = c.get_ref<SharedArrayObj>().ctype();
+        return ct ? ct->elem.get() : nullptr;
+    }
+    if (c.is<intrusive_ptr<DictObject>>()) {
+        ct = c.get_ref<intrusive_ptr<DictObject>>()->ctype();
+        return ct ? ct->val.get() : nullptr;
+    }
+    return nullptr;
+}
+
+namespace {
+
+/* an int or a bool into a float place is a float, a bool into an int
+ * place an int - the numeric widening a typed store makes
+ * (coerce_to_decl_type, flat_store_core) */
+EvalValue ct_widen(EvalValue v, const TypeAnnot *a)
+{
+    if (a->kind == DeclType::f) {
+        if (v.is<int_type>())
+            return EvalValue(static_cast<float_type>(v.get<int_type>()));
+        if (v.is<bool>())
+            return EvalValue(static_cast<float_type>(v.get<bool>() ? 1 : 0));
+    } else if (a->kind == DeclType::i && v.is<bool>()) {
+        return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
+    }
+    return v;
+}
+
+TypeErrorEx ct_misfit(const char *what, const char *subject,
+                      const TypeAnnot &a, const FitMisfit &m)
+{
+    /* an element type is written as a type, `int?` (typestr's form),
+     * not as a declaration's `opt int` */
+    std::string s = what;
+    s += " '" + fit_annot_text(*annot_nonopt(&a)) + (a.opt ? "?" : "")
+         + "' but ";
+    s += fit_subject_text(subject, m);
+    return TypeErrorEx(intern_msg(s));
+}
+
+} // namespace
+
+EvalValue ct_fit(const TypeAnnot *a, EvalValue v, bool dict, Loc s, Loc e)
+{
+    if (!a || a->kind == DeclType::dyn)
+        return v;
+    v = ct_widen(std::move(v), a);
+    FitMisfit m;
+    if (value_fits(v, *a, m))
+        return v;
+    TypeErrorEx ex = ct_misfit(dict ? "the dict's values are"
+                                    : "the array's elements are",
+                               "the value", *a, m);
+    ex.loc_start = s;
+    ex.loc_end = e;
+    throw ex;
+}
+
+EvalValue ct_fit_value(const EvalValue &c, EvalValue v, Loc s, Loc e)
+{
+    return ct_fit(ct_elem_annot(c), std::move(v),
+                  c.is<intrusive_ptr<DictObject>>(), s, e);
+}
+
+EvalValue ct_fit_key(const DictObject &d, EvalValue key)
+{
+    const TypeAnnot *ct = d.ctype();
+    const TypeAnnot *a = ct ? ct->key.get() : nullptr;
+    if (!a || a->kind == DeclType::dyn)
+        return key;
+    key = ct_widen(std::move(key), a);
+    FitMisfit m;
+    if (value_fits(key, *a, m))
+        return key;
+    throw ct_misfit("the dict's keys are", "the key", *a, m);
+}

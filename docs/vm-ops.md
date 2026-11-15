@@ -1812,6 +1812,35 @@ the value's tag; docs/jit-optimizations.md), every other shape calls
 `jit_load_box` / `jit_store_box`, the same helpers, whose raise conveys
 with the `*b` caret. Not bytecode-inlined. myv **v35** (both APPENDED).
 
+**Checked stores and `StampTypeV` — a container keeps its own type (Q2
+increment 2, plans/typed-containers.md).** An array or a dict carries
+the type it was made with (`SharedObject::ctype`, `DictObject::ctype`).
+A store the compiler could not check against it - the place's static
+type is `dyn` or unknown: a store through a `dyn` name, into an
+`array<dyn>` element - is CHECKED: opflags bit 0x80 on StoreElemValue,
+DictStore, StoreElem2V, StoreElemChainV and StoreLValueChainV
+(`Instr::ct_checked`, set from `Construct::ct_store` on the lvalue node).
+The handler passes it to the shared core (`vm_subscript_store`,
+`vm_nested_subscript_store`, `vm_subscript_chain_store`, the chain's
+final step), which checks the value against the innermost container's
+own type (`ct_fit`): a plain `=` before the element is reached, a
+compound's result at the write. A misfit is a TypeErrorEx with the
+lvalue's caret (the op's loc entry, or its final chain step's), the
+container unchanged. The JIT helpers take the mark in their operator
+word (`STORE_WORD_CHECKED`); the inline element-store tier stays inline
+for a checked store only into an untyped or `array<dyn>` array
+(JD_storev_ctype). An append / push / insert carries the mark in its
+`BuiltinCall` (`ct_store`, read through `ArgLocs`); AppendV skips its
+fast append for one. A new dict key is checked wherever it is inserted,
+and `+=` on an array checks each element, with no mark (every engine
+runs the same C++ there).
+
+`StampTypeV slot, ref` gives the array a BinOpV's `a + b` just built its
+static type, `Chunk::ctypes[ref - 1]`: the BinOpV copies `a` untyped
+(`ctype_sum_copy`), so what `b` appends is not checked against `a`'s
+narrower type. Never throws, defines nothing; `jit_stamp_ctype` natively;
+not bytecode-inlined. myv **v43** (APPENDED).
+
 **`Chunk::op_locs` — a COMPOUND store's OPERATION caret (RULE 2,
 2026-09-25).** `lv OP= rhs` (and `lv++`) fails in two places, and the
 tree-walker carets them differently: REACHING the element (an OOB index, a

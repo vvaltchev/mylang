@@ -225,15 +225,17 @@ foreach (var t in trail)
         nos++;
 print(len(trail), nos);
 
-# a box reached through a dyn alias of a typed array is not checked where
-# it is stored (README: a container reached through a dyn NAME is not a
-# typed place) - so `*` checks the box it reads: an int box, a float, a
-# bool, a str and a struct one, each given every other kind
-array<box<int>> bxi = [box(1)];
-array<box<float>> bxf = [box(1.5)];
-array<box<bool>> bxb = [box(true)];
-array<box<str>> bxs = [box("s")];
-array<box<P>> bxp = [box(P(1))];
+# a box reached through a dyn alias of an array with NO type of its own
+# is not checked where it is stored (a literal with a dyn element, which
+# the declaration's fit check examines, is untyped until the entry check
+# of plans/typed-containers.md step 3; an array<box<int>> of its own
+# refuses the store) - so `*` checks the box it reads: an int box, a
+# float, a bool, a str and a struct one, each given every other kind
+array<box<int>> bxi = [runtime(box(1))];
+array<box<float>> bxf = [runtime(box(1.5))];
+array<box<bool>> bxb = [runtime(box(true))];
+array<box<str>> bxs = [runtime(box("s"))];
+array<box<P>> bxp = [runtime(box(P(1)))];
 var dyn dxi = bxi;
 var dyn dxf = bxf;
 var dyn dxb = bxb;

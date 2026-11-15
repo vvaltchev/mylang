@@ -7280,17 +7280,49 @@ per level of a deep value - a separate open item.
   meant to take its type there (increment 3). Copies keep the type
   (`clone_internal_vec`, the dict's copy constructor, the mutable and
   const clones); an empty slice of a typed array is a fresh array of its
-  type. Three walks set it (`stamp_ctype_rec`): the top only for a
-  literal (what it holds is not its to type), along the annotation for a
-  builtin's result, and dynamic under a `dyn` element for a baked value.
-  The VM's MakeArrayV / MakeDictV / MapFilterV name theirs by a ref into
-  `Chunk::ctypes` in `target2`'s high bits; MakeStructArrayV derives
-  `array<P>` from its def. `.myv` v43 stores all of it. Nothing READS the
-  type yet except `int_ctype()` (INT builds) - the checked stores and the
-  entry check are increments 2 and 3. **A new place that makes a
-  container must stamp it**, or it is untyped where the static type says
+  type. Two walks set it (`stamp_ctype_rec`): the top only for a
+  literal (what it holds is not its to type), and along the annotation
+  for a builtin's result and a baked value - a container nested under a
+  `dyn` element stays UNTYPED in both (only `dyn` reaches it, and it keeps
+  the storage its own values gave it; `stamp_literal_coerce` leaves a
+  literal nested there untyped too, and `literal_fits` lets any literal
+  fit a `dyn` place, so `array<dyn> a = [[1]]` takes its declared type
+  under `-nc` as it does folded). The VM's MakeArrayV / MakeDictV /
+  MapFilterV / StampTypeV name theirs by a ref into `Chunk::ctypes` in
+  `target2`; MakeStructArrayV derives `array<P>` from its def. `a + b`
+  on arrays copies `a` UNTYPED (`ctype_sum_copy`) and the sum takes its
+  static type after the append (StampTypeV, the tree-walker's Expr04),
+  so what `b` appends is not checked against `a`'s narrower type.
+  `.myv` v43 stores all of it. **A new place that makes a container
+  must stamp it**, or it is untyped where the static type says
   otherwise; `tests/int/126_container_types.my` prints the type every
   creation shape gets under every engine.
+  **⛔ INCREMENT 2: A STORE THROUGH `dyn` CHECKS THE CONTAINER'S OWN
+  TYPE.** The inferencer marks a store whose place type is `dyn` or not
+  known (`Construct::ct_store` on the lvalue node; on an append / push /
+  insert's args, and on any call through a function value, read through
+  `ArgLocs::ct_store`); codegen carries it as `Instr::ct_checked`
+  (opflags 0x80 on StoreElemValue, DictStore, StoreElem2V,
+  StoreElemChainV and StoreLValueChainV, ML_CHECKed per family), the JIT
+  helpers as `STORE_WORD_CHECKED` in their operator word. The check is
+  ONE function, `ct_fit` (types/fit.cpp.h): convert as a typed store does
+  (int into float), then `value_fits`. A plain `=` is checked BEFORE the
+  element is reached (`ct_store_pre` - a dict's auto-vivified key must
+  not stay behind a refusal), a compound's result at the write (`ct_rmw`,
+  `flat_store_core`'s `ct`). Two checks need no mark, because every
+  engine runs the same C++ for them: a NEW dict key is checked wherever
+  it is inserted (`ct_fit_key` - a default dict's read inserts too), and
+  `TypeArr::add` (`+=`) checks and converts each element against the
+  array's own type. The JIT's inline element-store tier keeps a checked
+  store inline only for an untyped or the canonical `array<dyn>`
+  (`annot_dyn_array()`, one pointer compare - JD_storev_ctype), so
+  `array<dyn>` code stays fast; the nested-store tier hands a checked
+  store to its helper. Statically checked stores pay nothing. **A new
+  store path must take the mark** (and a new in-place builtin that
+  stores a value, the ArgLocs check), or a `dyn` name writes a misfit
+  into a typed container again;
+  `tests/functional/125_container_type_stores.my` stores every form
+  through `dyn`, refused and fitting.
 - **Universal `hash()` (deep, by value).** `Type::hash` returns `size_t`; the
   base throws, the leaves (`int`/`bool`/`float`/`str`) hash directly, and
   `none` + the containers/structs hash deeply (`hashing.h` combiners,

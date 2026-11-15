@@ -590,7 +590,7 @@ class CallExpr;
 EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
                             Loc a0s, Loc a0e, const StructTypeDef *cdef,
                             const ArgLoc *flocs, const EvalValue *vals,
-                            size_t n);
+                            size_t n, bool checked = false);
 
 /* F1 step 2: the VALUES dispatch of an INDIRECT builtin call, keyed on
  * Builtin::Kind - value (func_v), lvalue (func_lv; arg0 may be an
@@ -670,9 +670,11 @@ EvalValue vm_make_struct_array(StructTypeDef *def, size_t n,
  * or a general array (any base - type-dispatched Type::subscript(for_write)
  * + slot_rmw). AST-free: the not-an-lvalue caret is a Loc pair (from the loc
  * side table), not a node. See eval.cpp. */
+/* `checked` (Q2, Instr::ct_checked): a store through `dyn` - the value
+ * is checked against the container's own type (ct_fit) */
 EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
                              const EvalValue &value, Op op,
-                             Loc lstart, Loc lend);
+                             Loc lstart, Loc lend, bool checked = false);
 
 /* VM (IncDecElemCheckedV): `c[k]++` / `c[k]--` on a dyn/unproven base - forms
  * the element LValue, enforces int/float, applies ±1 (statement). Two carets:
@@ -739,6 +741,38 @@ void check_fit(const EvalValue &v, const FitSpec &spec);
  * tree-walker's stores (Expr14::rv_fit, Subscript::key_fit,
  * ExprList::arg_fit) */
 void check_fit_loc(const EvalValue &v, const FitSpec &spec, Loc s, Loc e);
+
+/*
+ * Q2 (plans/typed-containers.md): a store the compiler could not check
+ * against the container's own type - a store through `dyn` - checks the
+ * value at the write (types/fit.cpp.h).
+ *  - ct_elem_annot: what a store into container `c` checks against (an
+ *    array's element type, a dict's value type; null = nothing: untyped,
+ *    or not a container);
+ *  - ct_fit (an annotation; `dict` names a dict's value in the message)
+ *    and ct_fit_value (container `c`): the value to store - an int or a
+ *    bool into a float element converted, a bool into an int one - or a
+ *    TypeErrorEx carrying [s, e) (no caret for Loc());
+ *  - ct_fit_key: the same for a NEW key of a dict, checked wherever one
+ *    is inserted, however the dict was reached.
+ */
+const TypeAnnot *ct_elem_annot(const EvalValue &c);
+/* `a + b` on arrays builds a NEW array from a copy of `a` (BinOpV, the
+ * tree-walker's Expr04): the copy starts UNTYPED, so what `b` appends is
+ * not checked against `a`'s type - the sum's static type may be wider
+ * (`[1, none] + ["s"]` is an array<dyn>) - and the sum takes that static
+ * type once built (StampTypeV, Expr04's own stamp). */
+inline void ctype_sum_copy(const EvalValue &v)
+{
+    if (v.is<SharedArrayObj>())
+        const_cast<SharedArrayObj &>(v.get_ref<SharedArrayObj>())
+            .set_ctype(nullptr);
+}
+EvalValue ct_fit(const TypeAnnot *a, EvalValue v, bool dict,
+                 Loc s = Loc(), Loc e = Loc());
+EvalValue ct_fit_value(const EvalValue &c, EvalValue v,
+                       Loc s = Loc(), Loc e = Loc());
+EvalValue ct_fit_key(const DictObject &d, EvalValue key);
 
 /*
  * RULE 1 (2026-10-05): a parameter not declared `opt` never holds `none`
@@ -988,14 +1022,16 @@ LValue *vm_member_lvalue(LValue *base_lv, const UniqueId *memUid,
 EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
                                     const EvalValue &key2,
                                     const EvalValue &value, Op op,
-                                    const std::pair<Loc, Loc> *locs);
+                                    const std::pair<Loc, Loc> *locs,
+                                    bool checked = false);
 
 /* VM (StoreElemChainV): GENERIC N-level nested store `a[k0][k1]...[kn] = v` /
  * `OP= v`; `keys` + `steplocs` are base-to-innermost (steplocs[k] is that
  * subscript's caret). See eval.cpp. */
 EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
                                    size_t nkeys, const EvalValue &value, Op op,
-                                   const std::pair<Loc, Loc> *steplocs);
+                                   const std::pair<Loc, Loc> *steplocs,
+                                   bool checked = false);
 
 /* VM (MapFilterV) + tree-walker shared map/filter core: apply a (pre-validated)
  * function to each element of a container. See eval.cpp. */

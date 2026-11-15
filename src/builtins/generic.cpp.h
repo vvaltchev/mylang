@@ -391,9 +391,18 @@ EvalValue builtin_insert(EvalContext *ctx, const ArgLocs *exprList,
 
     if (lval->is<intrusive_ptr<DictObject>>()) {
 
-        if (lval->getval<intrusive_ptr<DictObject>>()->is_readonly())
+        const DictObject &d = *lval->getval<intrusive_ptr<DictObject>>();
+        if (d.is_readonly())
             throw CannotChangeConstEx(arg0->start, arg0->end);
 
+        /* Q2: an insert through `dyn` (ArgLocs::ct_store): a value that
+         * is stored fits the dict's own value type (its key is checked
+         * where it is inserted) */
+        if (exprList->ct_store && !d.get_ref().count(index_val))
+            return builtin_insert_dict(
+                lval, index_val,
+                ct_fit_value(lval->get(), val, exprList->start,
+                             exprList->end));
         return builtin_insert_dict(lval, index_val, val);
 
     } else if (lval->is<SharedArrayObj>()) {
@@ -404,6 +413,12 @@ EvalValue builtin_insert(EvalContext *ctx, const ArgLocs *exprList,
         if (!index_val.is<int_type>())
             throw TypeErrorEx("Expected integer", arg1->start, arg1->end);
 
+        /* Q2: through `dyn`, the element fits the array's own type */
+        if (exprList->ct_store)
+            return builtin_insert_arr(
+                lval, index_val.get<int_type>(),
+                ct_fit_value(lval->get(), val, exprList->start,
+                             exprList->end));
         return builtin_insert_arr(lval, index_val.get<int_type>(), val);
 
     } else {
