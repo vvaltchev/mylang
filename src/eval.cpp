@@ -7636,22 +7636,17 @@ do_catch(EvalContext *ctx,
                 cd = const_scope_struct(ctx, id->uid);
         }
         if (cd) {
-            if (cd != ex_def)
-                continue;
-        } else if (is_catchable_ex_name(id->get_str())) {
-            if (ex_is_struct)
-                continue;
-            if (ex_uid ? (id->uid != ex_uid) : (id->get_str() != ex_name))
-                continue;
-        } else if (const_eval) {
-            /* a struct nothing has declared yet (const_scope_struct) */
-            continue;
-        } else if (ex_uid ? (id->uid != ex_uid)
-                          : (id->get_str() != ex_name)) {
-            /* an open world's unresolved name: by name */
+            matched = cd == ex_def;
             continue;
         }
-        matched = true;
+        /* a name. A built-in exception's catches no struct object; any
+         * other is a struct nothing has declared yet (const_scope_struct)
+         * - or, in an open world, a struct a later input may declare,
+         * which catches by name */
+        const bool builtin = is_catchable_ex_name(id->get_str());
+        if (builtin ? ex_is_struct : const_eval != 0)
+            continue;
+        matched = ex_uid ? id->uid == ex_uid : id->get_str() == ex_name;
     }
     if (!matched)
         return false;

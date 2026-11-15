@@ -4758,11 +4758,17 @@ void Inferencer::resolve_catch_types(AllowedExList &cl, Scope *s)
             continue;
         if (!ts && !closed_world)
             continue;
-        const std::string nm(id->get_str());
-        SyntaxErrorEx e(id->start, intern_msg(ts
-            ? "'" + nm + "' is not a type here: a variable, a parameter "
-              "or a function named '" + nm + "' is not a struct"
-            : "'" + nm + "' is not a type"));
+        /* (built with +=: a `?:` of two string concatenations leaves a
+         * conditional cleanup per temporary, 16 branches no run takes) */
+        std::string msg("'");
+        msg += id->get_str();
+        msg += "' is not a type";
+        if (ts) {
+            msg += " here: a variable, a parameter or a function named '";
+            msg += id->get_str();
+            msg += "' is not a struct";
+        }
+        SyntaxErrorEx e(id->start, intern_msg(msg));
         e.loc_end = id->end;
         throw e;
     }

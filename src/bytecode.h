@@ -2722,8 +2722,9 @@ struct Chunk {
      * a built-in exception's name or a name an open world (the REPL)
      * could not resolve - PRIMARY data, stored in a .myv as a struct
      * index. `uid` (the name interned, #74 inc 3's pointer compare) and
-     * `builtin` (is_catchable_ex_name: such a name matches no struct) are
-     * DERIVED from the name, so a load rebuilds them.
+     * `builtin` (is_catchable_ex_name: such a name matches no struct;
+     * read for a null def only) are DERIVED from the name, so a load
+     * rebuilds them.
      */
     struct CatchKey {
         const UniqueId *uid = nullptr;
