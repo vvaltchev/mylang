@@ -1,0 +1,14 @@
+# INT-SOURCE: ../functional/55_regcall.my
+# INT-ENGINES: default
+# INT-CONFIGS: MYLANG_JIT_OFF=hoist2 ; MYLANG_JIT_OFF=cache ;
+#   MYLANG_JIT_OFF=resreg ; MYLANG_JIT_OFF=capprot ; MYLANG_JIT_OFF=peep ;
+#   MYLANG_JIT_OFF=telide ; MYLANG_JIT_OFF=vfquiet
+#
+# INT unit (#107): the REGCALL program (frameless callees whose arguments
+# arrive in registers) with one JIT lever off at a time - the levers
+# whose OFF arm only this program reaches: hoist2 (a second hoisted base),
+# cache (no register pins at all), resreg, capprot, peep, telide and
+# vfquiet. A lever changes only how fast the code runs (CLAUDE.md, the
+# lever switches), so each configuration must still pass the program's
+# own asserts. corpus_diff --levers runs every lever over the corpus;
+# this is the part of it the coverage universe counts.
