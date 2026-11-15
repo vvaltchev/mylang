@@ -9059,10 +9059,10 @@ struct Codegen {
     {
         /* No container_is_dyn gate: ForeachDynInit/Next RUNTIME-dispatch
          * array|dict and mirror do_iter's bind rules for ANY id list (any
-         * var count, `indexed`, `_`, dict none-padding), so this is the
+         * var count, `indexed`, `_`, a dict's arity error), so this is the
          * UNIVERSAL foreach - tried LAST, after the specific fast forms, it
          * also covers the residual proven shapes (a lone `_`, a 1-var
-         * indexed array, a >2-var dict with none-pad, ...). A non-iterable
+         * indexed array, a >2-var dict (an error), ...). A non-iterable
          * container throws the tree-walker's TypeErrorEx from Init. */
         if (!fe->ids || fe->ids->elems.empty())
             return false;

@@ -7812,17 +7812,20 @@ ForeachStmt::do_iter(EvalContext *ctx,
 
     } else {
 
-        for (size_type i = id_start; i < ids->elems.size(); i++) {
+        /* A dict entry: a key and a value, never padded - more variables
+         * is the strict unpack's error (the inferencer refuses it at
+         * compile time when the container is proven a dict). */
+        const size_type nvars = ids->elems.size() - id_start;
+        if (nvars > count)
+            throw TypeErrorEx(
+                intern_msg("foreach: a dict entry is a key and a value, "
+                           "which cannot be unpacked into " +
+                           std::to_string(nvars) + " variables"),
+                container->start, container->end);
 
-            const size_type val_i = i - id_start;
-
-            bind_loop_var(
-                ctx,
-                decl,
-                ids->elems[i].get(),
-                val_i < count ? elems[val_i] : none
-            );
-        }
+        for (size_type i = id_start; i < ids->elems.size(); i++)
+            bind_loop_var(ctx, decl, ids->elems[i].get(),
+                          elems[i - id_start]);
     }
 
     if (body)
