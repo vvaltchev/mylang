@@ -27,13 +27,13 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 }
 >> .. .. .. .. .. .. .. .. .. >> => [5.000000, 0.000000, 1.000000]
 >> array<float> func lits(int n) {
+    struct Q {
+        int a;
+    }
     float f = 2.5;
     f = f * n;
     bool b = true;
     b = !b;
-    struct Q {
-        int a;
-    }
     array<Q> qs = [];
     append(qs, Q(n));
     return [f, b, len(qs)];

@@ -4,12 +4,13 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
     const array<int> A = [1, 2, 3];
     const dyn D = [1, "a"];
     const array<int> T = [4, 5];
-    var opt dyn o = runtime(k > 0 ? k : none);
     const dict<str,array<int>> M = {"a": [1]};
+    var opt dyn o = runtime(k > 0 ? k : none);
     return 3 + 2 + 2 + (o ?? 0) + 1;
 }
 >> >> >> >> >> .. .. .. .. .. .. .. .. .. .. .. .. >> => 15
 >> int func g(int k) {
+    const G = pure func (y) => y * 2;
     array<P> ps = [P(k, 1), P(2, k)];
     str s = "x";
     s = s + str(k);
@@ -19,7 +20,6 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
     b = !b;
     var a, c = [k, 2];
     a, c += [1, 1];
-    const G = pure func (y) => y * 2;
     return len(ps) + len(s) + (w ?? 0) + (b ? 1 : 0) + a + c * 2;
 }
 >> 

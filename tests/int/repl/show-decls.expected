@@ -21,6 +21,14 @@ ok: opt K
 >> => "func pa(P p, opt P q, array<int> a, array<int>? b, dict<str,P> d, box<int> bx, opt int o, dyn x, opt dyn y, bool bb, str s, float f, opt K k)"
 >> .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. >> => [4, 1, 4, 1, 4, 5, 4, 4, 1, 4, 1, 4]
 >> array<dyn> func locs(int n) {
+    struct L {
+        int a;
+        opt dyn z;
+        array<float> fs;
+        box<int>? bi;
+        P p;
+        K k;
+    }
     P p = P(n, 2);
     opt P q = n > 9 ? p : none;
     array<int>? b = n > 9 ? [n] : none;
@@ -40,14 +48,6 @@ ok: opt K
     int i1, i2 = [n, 3];
     a1, a2 = [a2, a1];
     a1 += i2;
-    struct L {
-        int a;
-        opt dyn z;
-        array<float> fs;
-        box<int>? bi;
-        P p;
-        K k;
-    }
     var l = L(1, none, [1.5], none, p, k);
     bool nn = q == none && b == none && bn == none && o == none && u == none && ok == none && bb && len(s) == 1;
     return [p.x, len(ps), d["k"], int(*bx), t, a1, a2, i1, l.a, k.v, nn ? 1 : 0, int(fl)];
