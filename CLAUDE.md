@@ -2286,10 +2286,13 @@ the `tests/run` paragraph below):
 - **differential-levers-fuzz** (the same build): `corpus_diff
   --levers` and `nested_fuzz`, the two longest steps, split out so
   the halves run side by side;
-- **disasmcheck** (the same Debug build), `scripts/disasmcheck
-  --matrix` split three ways by `--shard I/3` - as a `differential`
-  step it was 34 of that job's 57 minutes and set the workflow's wall
-  time;
+- **disasmcheck**, `scripts/disasmcheck --matrix` on a rel-hard build:
+  its (configuration, program) items run on a pool, and a rel-hard
+  `-vdj` run is 11x faster than a Debug one while emitting every form
+  the Debug build does in all 23 configurations except ASan's
+  native-stack-off depth check - which the `differential` job's
+  `disasmcheck` (Debug, both arenas) covers. It used to be three Debug
+  shards, and before that 34 of `differential`'s 57 minutes;
 - **all three fuzzers take a FRESH SEED per run** (`--seed
   ${{github.run_id}}`, printed first; a re-run keeps it): with a fixed
   seed every push ran the same programs - a regression corpus, not a
@@ -2380,8 +2383,10 @@ output, its log and a REPRODUCE line naming exactly the failing cases
 (or a fuzzer's seed). The fuzzers get a fresh seed per run (`--seed` to
 repeat), and the measured times go to `BUILD_ROOT/test-times.json`.
 **`tests/jobs` is the ONE
-definition every parallel tool asks:** workers = nproc - max(2,
-nproc/8) (`MYLANG_TEST_JOBS` overrides), memory caps for concurrent
+definition every parallel tool asks:** workers = nproc - nproc/8 where
+the idle CPU class is available, nproc - max(2, nproc/8) under the
+`nice` fallback (`MYLANG_TEST_JOBS` overrides; a 4-core box ran 2
+workers until 2026-11-15), memory caps for concurrent
 `-rt` runs and builds (the measured peaks are in the file), and the
 priority - each tool re-execs itself ONCE through `jobs run`, which
 puts the whole tree in the IDLE scheduling and I/O classes (`chrt

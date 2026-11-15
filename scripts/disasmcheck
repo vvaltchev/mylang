@@ -5,7 +5,7 @@ disasmcheck - is `-vdj` DECODING CORRECTLY, judged by a second
                  disassembler?
 
     scripts/disasmcheck BINARY [--matrix] [--env K=V[,K=V...]]...
-                           [--only FILE|DIR]... [--shard I/N] [-v]
+                           [--only FILE|DIR]... [--shard I/N] [--jobs N] [-v]
 
 ⛔ WHY THIS EXISTS, AND WHY THE EXISTING NETS CANNOT REPLACE IT.
 
@@ -55,6 +55,14 @@ reason). `--only FILE|DIR` restricts the corpus (repeatable), since a
 forced pick names a site in ONE program (a DIR selects every corpus file
 under it). A value may hold commas (`MYLANG_INT_CHOOSE=k1=a,k2=b`): a
 comma starts a new variable only before `NAME=`.
+
+Every (configuration, program) pair is an independent item, run on
+`--jobs N` worker processes (default: `tests/jobs count`); the report is
+printed afterwards in the serial order - configuration by configuration,
+program by program, the MNEMONIC/OPERAND lines capped per configuration
+as before - so it is byte-identical for any job count. Nearly all of an
+item is the two `-vdj` runs: objdump is a few percent, and the fragment
+bytes hold this process's addresses, so no item can reuse another's.
 
 `--shard I/N` (0 <= I < N) keeps every Nth configuration, starting at
 the Ith, so N CI jobs split one `--matrix` run between them (the
@@ -312,72 +320,133 @@ def ops_mismatch(raw, omn, base, off):
     return None
 
 
-def check(binary, env, files, verbose, mon=None):
+def check_file(binary, env, path):
+    """Check ONE program in ONE configuration: (counters, messages).
+
+    A pure function of its arguments, so the (configuration, program)
+    items run on a pool in any order (`check` prints them in the serial
+    order). The counters are [boundary, mnemonic, operand, insns, frags,
+    wraps, operands compared]; a message is (kind, text), and `check`
+    applies the per-configuration print cap to the MNEMONIC and OPERAND
+    ones in that order, as the serial walk did."""
     bad_len = bad_mn = bad_op = insns = frag_n = wraps = 0
-    for path in files:
-        if mon:
-            mon.set_current(os.path.basename(path))
-            mon.advance()
-        fs = frags(binary, path, env)
-        if fs is None:
-            continue
-        rs = frags(binary, path, env, raw=True)
-        if rs is None or [[(o, len(h)) for o, h, _ in f] for f in rs] != \
-                [[(o, len(h)) for o, h, _ in f] for f in fs]:
-            #
-            # The RAW dump must be the SAME instructions as the plain
-            # one - it differs in rendering only. If it is not, the
-            # operand check below would compare a different stream.
-            # Offsets and LENGTHS, not bytes: the bytes hold baked
-            # addresses, which differ between the two processes.
-            #
-            # And objdump is handed the RAW run's bytes, so the
-            # addresses it prints are the ones the RAW dump printed.
-            #
-            bad_op += 1
-            print("RAW %s: MYLANG_VDJ_RAW changed the decoded stream"
-                  % path)
-            rs = None
-        for fi, ins in enumerate(fs):
-            frag_n += 1
-            base = ins[0][0]
-            src = rs[fi] if rs is not None else ins
-            blob = b''.join(bytes.fromhex(b) for _, b, _ in src)
-            od, wr = objdump_lens(blob)
-            wraps += wr
-            for i, (off, hx, mn) in enumerate(ins):
-                insns += 1
-                rel = off - base
-                if rel not in od:
-                    bad_len += 1
-                    print("BOUNDARY %s +%d: objdump has no instruction "
-                          "starting here (we said %d bytes: %s)"
-                          % (path, off, len(hx) // 2, mn))
-                    break
-                olen, omn = od[rel]
-                if olen != len(hx) // 2:
-                    bad_len += 1
-                    print("LENGTH %s +%d: we %d bytes (%s), objdump %d (%s)"
-                          % (path, off, len(hx) // 2, mn, olen, omn))
-                    break
-                a, b = norm(mn), norm(omn)
-                if a.split(' ')[0] != b.split(' ')[0] \
-                        or XMM.findall(a) != XMM.findall(b):
-                    bad_mn += 1
-                    if verbose or bad_mn <= 20:
-                        print("MNEMONIC %s +%d: {%s} we %-28r objdump %r"
-                              % (path, off, hx, mn, omn))
+    ops0 = OPS_COMPARED[0]
+    msgs = []
+    fs = frags(binary, path, env)
+    if fs is None:
+        return [0, 0, 0, 0, 0, 0, 0], msgs
+    rs = frags(binary, path, env, raw=True)
+    if rs is None or [[(o, len(h)) for o, h, _ in f] for f in rs] != \
+            [[(o, len(h)) for o, h, _ in f] for f in fs]:
+        #
+        # The RAW dump must be the SAME instructions as the plain
+        # one - it differs in rendering only. If it is not, the
+        # operand check below would compare a different stream.
+        # Offsets and LENGTHS, not bytes: the bytes hold baked
+        # addresses, which differ between the two processes.
+        #
+        # And objdump is handed the RAW run's bytes, so the
+        # addresses it prints are the ones the RAW dump printed.
+        #
+        bad_op += 1
+        msgs.append(('raw', "RAW %s: MYLANG_VDJ_RAW changed the decoded "
+                            "stream" % path))
+        rs = None
+    for fi, ins in enumerate(fs):
+        frag_n += 1
+        base = ins[0][0]
+        src = rs[fi] if rs is not None else ins
+        blob = b''.join(bytes.fromhex(b) for _, b, _ in src)
+        od, wr = objdump_lens(blob)
+        wraps += wr
+        for i, (off, hx, mn) in enumerate(ins):
+            insns += 1
+            rel = off - base
+            if rel not in od:
+                bad_len += 1
+                msgs.append(('len', "BOUNDARY %s +%d: objdump has no "
+                             "instruction starting here (we said %d "
+                             "bytes: %s)" % (path, off, len(hx) // 2, mn)))
+                break
+            olen, omn = od[rel]
+            if olen != len(hx) // 2:
+                bad_len += 1
+                msgs.append(('len', "LENGTH %s +%d: we %d bytes (%s), "
+                             "objdump %d (%s)"
+                             % (path, off, len(hx) // 2, mn, olen, omn)))
+                break
+            a, b = norm(mn), norm(omn)
+            if a.split(' ')[0] != b.split(' ')[0] \
+                    or XMM.findall(a) != XMM.findall(b):
+                bad_mn += 1
+                msgs.append(('mn', "MNEMONIC %s +%d: {%s} we %-28r "
+                             "objdump %r" % (path, off, hx, mn, omn)))
+                continue
+            if rs is None:
+                continue
+            raw = rs[fi][i][2]
+            why = ops_mismatch(raw, omn, base, rel)
+            if why:
+                bad_op += 1
+                msgs.append(('op', "OPERAND %s +%d: {%s} %s: we %r "
+                             "objdump %r" % (path, off, hx, why, raw, omn)))
+    return [bad_len, bad_mn, bad_op, insns, frag_n, wraps,
+            OPS_COMPARED[0] - ops0], msgs
+
+
+def _item(args):
+    binary, env, path = args
+    return check_file(binary, env, path)
+
+
+def run_items(binary, envs, files, jobs, mon):
+    """Every (configuration, program) item, on `jobs` worker processes:
+    the results, indexed like `items`. Processes, not threads: with a
+    fast binary the Python parsing is most of an item, and the GIL
+    would serialise it. A fork-started pool inherits this module."""
+    items = [(binary, env, path) for env, _ in envs for path in files]
+    out = [None] * len(items)
+    if jobs <= 1 or len(items) <= 1:
+        for k, it in enumerate(items):
+            if mon:
+                mon.set_current(os.path.basename(it[2]))
+            out[k] = _item(it)
+            if mon:
+                mon.advance()
+        return out
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    ctx = multiprocessing.get_context('fork')
+    with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as ex:
+        futs = {ex.submit(_item, it): k for k, it in enumerate(items)}
+        for f in as_completed(futs):
+            k = futs[f]
+            out[k] = f.result()
+            if mon:
+                mon.set_current(os.path.basename(items[k][2]))
+                mon.advance()
+    return out
+
+
+def check(results, files, verbose):
+    """One configuration's results, in program order: its counters, and
+    its messages printed as the serial walk printed them (MNEMONIC and
+    OPERAND lines capped at 20 per configuration unless --verbose)."""
+    tot = [0, 0, 0, 0, 0, 0, 0]
+    shown_mn = shown_op = 0
+    for counters, msgs in results:
+        for kind, text in msgs:
+            if kind == 'mn':
+                shown_mn += 1
+                if not (verbose or shown_mn <= 20):
                     continue
-                if rs is None:
+            elif kind == 'op':
+                shown_op += 1
+                if not (verbose or shown_op <= 20):
                     continue
-                raw = rs[fi][i][2]
-                why = ops_mismatch(raw, omn, base, rel)
-                if why:
-                    bad_op += 1
-                    if verbose or bad_op <= 20:
-                        print("OPERAND %s +%d: {%s} %s: we %r objdump %r"
-                              % (path, off, hx, why, raw, omn))
-    return bad_len, bad_mn, bad_op, insns, frag_n, wraps
+            print(text)
+        tot = [x + y for x, y in zip(tot, counters)]
+    return tot
 
 
 ENV_NAME = re.compile(r'^[A-Z_][A-Z0-9_]*=')
@@ -405,11 +474,19 @@ def main():
     argv = sys.argv[1:]
     extra, only, args = [], [], []
     shard = (0, 1)
+    jobs = 0
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in ('--env', '--only', '--shard') and i + 1 < len(argv):
-            if a == '--shard':
+        if a in ('--env', '--only', '--shard', '--jobs') \
+                and i + 1 < len(argv):
+            if a == '--jobs':
+                if not argv[i + 1].isdigit() or int(argv[i + 1]) < 1:
+                    print("error: --jobs wants a positive number",
+                          file=sys.stderr)
+                    return 2
+                jobs = int(argv[i + 1])
+            elif a == '--shard':
                 m = re.fullmatch(r'(\d+)/(\d+)', argv[i + 1])
                 if not m or not 0 <= int(m.group(1)) < int(m.group(2)):
                     print("error: --shard wants I/N with 0 <= I < N",
@@ -428,7 +505,8 @@ def main():
     if not args:
         print(__doc__.strip().split('\n')[2], file=sys.stderr)
         print("usage: disasmcheck BINARY [--matrix] "
-              "[--env K=V[,K=V...]]... [--only FILE|DIR]... [-v]",
+              "[--env K=V[,K=V...]]... [--only FILE|DIR]... "
+              "[--shard I/N] [--jobs N] [-v]",
               file=sys.stderr)
         return 2
     binary = args[0]
@@ -470,11 +548,18 @@ def main():
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(
         __file__)), "..", "tests", "lib"))
     from testrun import Monitor
+    import testjobs
     mon = Monitor("disasmcheck", total=len(envs) * len(files),
-                  phase="configs").__enter__()
-    for env, name in envs:
-        mon.set_extra(config=name)
-        bl, bm, bo, n, fn, wr = check(binary, env, files, verbose, mon)
+                  phase="items").__enter__()
+    # every (configuration, program) item at once, on the shared worker
+    # count; the report below is the serial one, configuration by
+    # configuration, whatever order the items finished in
+    results = run_items(binary, envs, files, jobs or testjobs.count(), mon)
+    mon.__exit__(None, None, None)
+    ops = 0
+    for ci, (env, name) in enumerate(envs):
+        bl, bm, bo, n, fn, wr, oc = check(
+            results[ci * len(files):(ci + 1) * len(files)], files, verbose)
         print("%-12s %6d insns in %4d frags   boundary-errors %d   "
               "mnemonic-errors %d   operand-errors %d%s"
               % (name, n, fn, bl, bm, bo,
@@ -485,12 +570,12 @@ def main():
         ti += n
         tf += fn
         tw += wr
+        ops += oc
 
-    mon.__exit__(None, None, None)
     print("\nTOTAL %d instructions, %d fragments" % (ti, tf))
     print("  boundary errors: %d   mnemonic errors: %d   "
           "operand errors: %d (of %d operands compared)"
-          % (tl, tm, to, OPS_COMPARED[0]))
+          % (tl, tm, to, ops))
     if tw:
         print("\n⛔ objdump WRAPPED %d instruction(s) across lines despite "
               "-w and\n   --insn-width=16. The comparison below cannot be "
@@ -508,7 +593,7 @@ def main():
         print("\n⛔ VACUOUS: no instructions were compared. Is "
               "MYLANG_VDJ_HEX honoured?", file=sys.stderr)
         return 2
-    if OPS_COMPARED[0] == 0:
+    if ops == 0:
         print("\n⛔ VACUOUS: no operands were compared. Is "
               "MYLANG_VDJ_RAW honoured?", file=sys.stderr)
         return 2

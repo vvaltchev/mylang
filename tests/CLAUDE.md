@@ -167,11 +167,10 @@ catalog tests.
 | Coverage                 | cmake (cmake-gcov) | rt@cmake-gcov + codecov   |
 | Nets differential        | cmake (dbg)        | corpus_diff, vdjcmp,      |
 |                          |                    | bt_oracle, norec_enum,    |
-|                          |                    | norec_sweep               |
+|                          |                    | norec_sweep, disasmcheck  |
 | Nets levers-fuzz         | cmake (dbg)        | corpus_diff-levers,       |
 |                          |                    | nested_fuzz               |
-| Nets disasmcheck x3      | cmake (dbg)        | disasmcheck-matrix        |
-|                          |                    | --shard I/3               |
+| Nets disasmcheck         | cmake (rel-hard)   | disasmcheck-matrix        |
 | Nets nolowmem x2         | cmake (dbg, rna)   | rt-nolowmem, corpus_diff- |
 |                          |                    | nolowmem, driver_checks   |
 | Nets spcheck x2          | cmake (dbg, rna)   | rt-spcheck,               |
