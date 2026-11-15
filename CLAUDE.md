@@ -5430,7 +5430,18 @@ and unreferenced by cond/inc. **⛔ And an ARRAY slice must not ESCAPE
 array, so one hoisted slice stored by every iteration would be ONE array
 where the loop stored a fresh one each time. Its uses must be an element
 read, a slice of it, `len`, or a foreach container; a STRING slice may
-escape (immutable, identity unobservable). Runs in
+escape (immutable, identity unobservable). **⛔ And NOTHING it reads may
+be DECLARED IN THE BODY (`licm_collect_decls`, LICM's own rule; added
+2026-11-16):** `fr_collect_mutated` skips a declaration, so a body-local
+`var m = [..]; var sl = m[1:3];` looked invariant and the hoisted slice
+read `m` above the loop, before anything set it - TypeErrorEx in every
+typed configuration where `--no-opt all` answered, shipped since the
+pass was written (LICM got this check on day one; its sibling never
+did, and no test sliced a body-local). A `const` declared BELOW the
+slice is the same read: it binds at the body's entry (question 21). A
+slice OF a hoisted slice still hoists, one visit later (`specialize()`
+runs again on the wrapper block's children, and by then the first slice
+is declared above the loop). Runs in
 `specialize()` BEFORE try_for_range (the wrapper block's children then
 specialize individually, so the loop still becomes a ForRangeStmt).
 Measured with the pooled slices set (inc 1): 15_array_slice_readonly

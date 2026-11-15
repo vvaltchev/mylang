@@ -29977,6 +29977,8 @@ static bool hoist_slice_shapes()
         const char *name;
         std::vector<const char *> lines;
         bool expect_hoist;
+        /* how many slices must stand above the loop (-1: not asked) */
+        int n_above = -1;
     };
     const std::vector<Case> cases = {
         { "hoist: basic for", {
@@ -30104,6 +30106,40 @@ static bool hoist_slice_shapes()
             "for (var i = 0; i < 3; i++) {",
             "  var sub = base[1:9]; last = sub;",
             "}" }, true },
+        /* a slice OF a hoisted slice hoists too, on the pass's next
+         * visit of the loop: its base is declared above the loop by then
+         * (this pins that the declared-in-body rule below did not cost
+         * the chained hoist) */
+        { "hoist: a slice of a hoisted slice", {
+            "var n = int(runtime(3));",
+            "var base = [1, 2, 3, 4, 5]; var s = 0;",
+            "for (var i = 0; i < n; i++) {",
+            "  var sl = base[1:4]; var s2 = sl[0:2]; s += s2[0];",
+            "}" }, true, 2 },
+        /* ...but nothing it reads may be DECLARED IN THE BODY otherwise:
+         * above the loop that slot is not set yet (the trip counts and
+         * `z` are run-time values, so no loop or bound folds away) */
+        { "no hoist: the base is declared in the loop body", {
+            "var n = int(runtime(3)); var s = 0;",
+            "for (var i = 0; i < n; i++) {",
+            "  var m = [i, i + 1, i + 2, i + 3];",
+            "  var sl = m[1:3]; s += sl[0];",
+            "}" }, false },
+        { "no hoist: a bound is declared in the loop body", {
+            "var n = int(runtime(3)); var z = int(runtime(0));",
+            "var base = [1, 2, 3, 4, 5]; var s = 0;",
+            "for (var i = 0; i < n; i++) {",
+            "  var lo = z + 1;",
+            "  var sl = base[lo:4]; s += sl[0];",
+            "}" }, false },
+        /* a const binds at the body's ENTRY (question 21), so one
+         * declared below the slice is a body declaration it reads */
+        { "no hoist: a const base declared below the slice", {
+            "var n = int(runtime(3)); var s = 0;",
+            "for (var i = 0; i < n; i++) {",
+            "  var sl = K[1:3]; s += sl[0];",
+            "  const K = [1, 2, 3, 4];",
+            "}" }, false },
     };
     for (const Case &c : cases) {
         std::string s;
@@ -30136,6 +30172,16 @@ static bool hoist_slice_shapes()
         if (hoisted != c.expect_hoist) {
             fprintf(stderr, "hoist_slice_shapes: '%s' expected %s\n",
                     c.name, c.expect_hoist ? "HOIST" : "no hoist");
+            return false;
+        }
+        int above = 0;
+        for (size_t at = t.find("Slice("); at < loop_at;
+             at = t.find("Slice(", at + 1))
+            above++;
+        if (c.n_above >= 0 && above != c.n_above) {
+            fprintf(stderr, "hoist_slice_shapes: '%s' has %d slices above "
+                            "the loop, expected %d\n",
+                    c.name, above, c.n_above);
             return false;
         }
     }
@@ -31692,6 +31738,41 @@ static bool opt_layer_equivalence()
             "    s += m[0][k]; mm[0] = [7, 8, 9]; }",
             "  return s; }",
             "var m = [[1, 2, 3], [4, 5, 6]]; print(run(m, m));" } },
+        /*
+         * The slice hoister read what the loop BODY declares: above the
+         * loop that slot holds nothing yet, so the hoisted slice raised
+         * TypeErrorEx (a slice of none) where the un-hoisted loop
+         * answered. A body-local base, a body-local bound, and a `const`
+         * declared BELOW the slice, which binds at the body's entry
+         * (question 21) and so is a body declaration the slice reads
+         * too. Each is in a function, with a run-time trip count, so the
+         * loop and the slice survive to the pass. Watched failing with
+         * the declared-in-body check removed (all three).
+         */
+        { "slice hoist: a base the loop body declares", {
+            "func f(int n) { var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    var m = [i, i + 1, i + 2, i + 3];",
+            "    var sl = m[1:3];",
+            "    s += sl[0] + sl[1]; }",
+            "  return s; }",
+            "print(f(int(runtime(3))));" } },
+        { "slice hoist: a bound the loop body declares", {
+            "func f(int n, int z) { var s = 0; var b = [1, 2, 3, 4];",
+            "  for (var i = 0; i < n; i++) {",
+            "    var lo = z + 1;",
+            "    var sl = b[lo:3];",
+            "    s += sl[0] * 10 + len(sl); }",
+            "  return s; }",
+            "print(f(int(runtime(3)), int(runtime(0))));" } },
+        { "slice hoist: a const declared below the slice in the body", {
+            "func f(int n) { var s = 0;",
+            "  for (var i = 0; i < n; i++) {",
+            "    var sl = K[1:3];",
+            "    s += sl[0] + sl[1];",
+            "    const K = [1, 2, 3, 4]; }",
+            "  return s; }",
+            "print(f(int(runtime(3))));" } },
     };
 
     /* every single pass off, plus all of them - each isolates one layer;
