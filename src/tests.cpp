@@ -37078,7 +37078,8 @@ static bool myv_ctype_refused()
         "var b = range(runtime(3));",
         "var c = [1, 2];",
         "var d = {\"k\": 1};",
-        "print(a, b, c, d);" };
+        "var e = [1] + [runtime(2)];",
+        "print(a, b, c, d, e);" };
     std::string src;
     for (const char *l : lines_arr) { src += l; src += '\n'; }
     const ExecEngine saved = g_exec_engine;
@@ -37107,7 +37108,11 @@ static bool myv_ctype_refused()
         const TypeAnnot *a_dict = annot_dyn_dict();
         const TypeAnnot *a_arr = annot_dyn_array();
 
-        /* the four places, each found so the test cannot pass vacuously */
+        /* the five places, each found so the test cannot pass vacuously */
+        Instr *stamp = nullptr;
+        for (Instr &in : ck.code)
+            if (in.op == OpCode::StampTypeV)
+                stamp = &in;
         Chunk::BuiltinCall *bcall = nullptr;
         for (auto &bc : ck.builtin_calls)
             if (bc.ctype)
@@ -37118,14 +37123,14 @@ static bool myv_ctype_refused()
                     && lo.value.get_ref<SharedArrayObj>().ctype())
                 larr = &lo.value;
             if (lo.value.is<intrusive_ptr<DictObject>>()
-                    && lo.value.get_ref<intrusive_ptr<DictObject>>()->ctype())
+                    && lo.value.get<intrusive_ptr<DictObject>>()->ctype())
                 ldict = &lo.value;
         }
-        if (ck.ctypes.empty() || !bcall || !larr || !ldict) {
+        if (ck.ctypes.empty() || !bcall || !larr || !ldict || !stamp) {
             fprintf(stderr, "myv_ctype_refused: a place holds no type "
-                    "(pool %zu, builtin %d, array %d, dict %d)\n",
+                    "(pool %zu, builtin %d, array %d, dict %d, stamp %d)\n",
                     ck.ctypes.size(), bcall != nullptr, larr != nullptr,
-                    ldict != nullptr);
+                    ldict != nullptr, stamp != nullptr);
             g_exec_engine = saved;
             return false;
         }
@@ -37147,7 +37152,8 @@ static bool myv_ctype_refused()
             } catch (Exception &e) {
                 if (std::string(e.name) == "MyvError" && e.msg
                         && (strstr(e.msg, "container type")
-                            || strstr(e.msg, "(ctype)")))
+                            || strstr(e.msg, "(ctype)")
+                            || strstr(e.msg, "(ctype at pc")))
                     return true;
                 fprintf(stderr, "myv_ctype_refused [%s]: threw %s: %s\n",
                         what, e.name, e.msg ? e.msg : "");
@@ -37180,7 +37186,16 @@ static bool myv_ctype_refused()
         ok = refused("array value: a dict type") && ok;
         arr.set_ctype(ar0);
 
-        DictObject &dict = *ldict->get_ref<intrusive_ptr<DictObject>>();
+        /* the verifier: a sum's StampTypeV names a pool entry (never 0,
+         * never past the pool) */
+        const int st0 = stamp->target2;
+        stamp->target2 = 0;
+        ok = refused("StampTypeV: no type") && ok;
+        stamp->target2 = static_cast<int>(ck.ctypes.size()) + 5;
+        ok = refused("StampTypeV: past the pool") && ok;
+        stamp->target2 = st0;
+
+        DictObject &dict = *ldict->get<intrusive_ptr<DictObject>>();
         const TypeAnnot *dc0 = dict.ctype();
         dict.set_ctype(a_arr);
         ok = refused("dict value: an array type") && ok;

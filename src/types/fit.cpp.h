@@ -406,7 +406,9 @@ std::string fit_annot_text(const TypeAnnot &a)
 
 std::string annot_text(const TypeAnnot *a)
 {
-    return a ? fit_annot_text(*a) : std::string("untyped");
+    if (!a)
+        return "untyped";
+    return fit_annot_text(*a);
 }
 
 bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit &why)

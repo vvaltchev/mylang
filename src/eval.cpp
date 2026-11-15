@@ -2962,7 +2962,8 @@ static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
  * literal nested there is in -nc's tree, stamp_literal_coerce: only `dyn`
  * reaches it, and it keeps the storage its own values gave it).
  */
-static void stamp_ctype_rec(const EvalValue &v, const TypeAnnot *t, int mode)
+static void stamp_ctype_rec(const EvalValue &v, const TypeAnnot *t,
+                            int mode) noexcept
 {
     if (!t)
         return;
@@ -3000,24 +3001,22 @@ static void stamp_ctype_rec(const EvalValue &v, const TypeAnnot *t, int mode)
     }
 }
 
-void stamp_ctype(const EvalValue &v, const TypeAnnot *t)
+void stamp_ctype(const EvalValue &v, const TypeAnnot *t) noexcept
 {
     stamp_ctype_rec(v, t, 1);
 }
 
-void stamp_ctype_top(const EvalValue &v, const TypeAnnot *t)
+void stamp_ctype_top(const EvalValue &v, const TypeAnnot *t) noexcept
 {
     stamp_ctype_rec(v, t, 0);
 }
 
-/* the type a container carries, or null for anything else */
+/* the type an array or a dict carries (ctype_restamp's argument is one) */
 static const TypeAnnot *ctype_get(const EvalValue &v)
 {
     if (v.is<SharedArrayObj>())
         return v.get_ref<SharedArrayObj>().ctype();
-    if (v.is<intrusive_ptr<DictObject>>())
-        return v.get_ref<intrusive_ptr<DictObject>>()->ctype();
-    return nullptr;
+    return v.get_ref<intrusive_ptr<DictObject>>()->ctype();
 }
 
 /* a fresh copy's mutable containers made untyped again (ctype_restamp) */
@@ -3988,8 +3987,10 @@ static EvalValue widen_baked_rec(const EvalValue &v, const WidenShape &w,
         return v;
     changed = true;
     EvalValue r = build_dict_from_pairs(buf.data(), buf.size() / 2, false);
-    if (d.is_readonly())
-        r = make_const_clone(r);
+    /* a constant's dict is built at its annotation's types by its bake
+     * (stamp_literal_annot runs before it), so none is widened here */
+    if (d.is_readonly())        /* INT-COV-EXEMPT: see above */
+        r = make_const_clone(r);    /* INT-COV-EXEMPT: see above */
     return r;
 }
 
@@ -4786,8 +4787,10 @@ static EvalValue
 ct_rmw(LValue &lv, Op op, const EvalValue &rval, const TypeAnnot *ea,
        bool dict, Loc s, Loc e)
 {
-    if (!ea || op == Op::assign)
+    /* (a plain `=` has no `ea`: ct_store_pre checked it) */
+    if (!ea)
         return slot_rmw(lv, op, rval);
+    ML_CHECK(op != Op::assign);
     EvalValue nv = lv.get();
     apply_compound_op(nv, RValue(rval), op);
     nv = ct_fit(ea, std::move(nv), dict, s, e);
@@ -5232,7 +5235,7 @@ subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
     EvalValue checked;
     const EvalValue *rvp = &rval;
     CtStore ct;
-    if (sub->ct_store && !ctx->const_ctx) {
+    if (sub->ct_store) {
         checked = rval;
         ct = ct_store_pre(RValue(base), op, checked, sub->start, sub->end);
         rvp = &checked;
@@ -5538,7 +5541,7 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
     EvalValue checked;
     const EvalValue *rvp = &rval;
     CtStore ct;
-    if (mem->ct_store && !ctx->const_ctx) {
+    if (mem->ct_store) {
         checked = rval;
         /* an undefined base (the REPL's open world) carets the member, as
          * the access below does - a misfit carries its own */
