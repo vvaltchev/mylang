@@ -1175,14 +1175,22 @@ detach_baked_funcs(ParseContext &c, unique_ptr<Construct> &slot,
  * raises - and record on it whether that run would have REPLACED it by a
  * literal (Construct::nc_folds, read by pExpr14's assignable-shape rule:
  * a folded `K[0]` is a value, not a location), but leave the node alone.
+ *
+ * The value is thrown away, so the class instances it made take back the
+ * identity numbers they used (g_class_ident): under -nc a constant's
+ * initializer is evaluated here and again where the constant is bound,
+ * so `const A = C(1);` got number 2 where the folding run gives it 1, and
+ * `hash(A)` differed between the two (RULE 2, found 2026-11-15).
  */
 static void
 nc_eval_const(ParseContext &c, Construct *node,
               bool process_arrays, bool immutable)
 {
+    const uint64_t ident = g_class_ident;
     unique_ptr<Construct> scratch;
     node->nc_folds = MakeConstructFromConstVal(
         RValue(node->eval(c.const_ctx)), scratch, process_arrays, immutable);
+    class_ident_reset(ident);
 }
 
 /*
