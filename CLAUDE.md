@@ -3832,10 +3832,11 @@ and it lives *inside the parser*. Mechanics:
   takes its own baked statements too.
   **`ParseContext::cap_const_decls`** (one vector per `pBlock` in
   progress, and per arrow body) dedupes per block - two captures of one
-  const in one block would otherwise be AlreadyDefinedEx. Every OTHER read of K is still
-  folded by the parser, so the synthetic var is read only by capture
-  snapshots; AutoConst cannot promote and drop it (it is captured,
-  `prescan_blocked`); the capture is shadowed in the body (H1), so `K++`
+  const in one block would otherwise be AlreadyDefinedEx. Every OTHER
+  read of K is still folded by the parser, so the synthetic var is read
+  only by capture snapshots; AutoConst cannot promote and drop it (it is
+  captured, `prescan_blocked`); the capture is shadowed in the body
+  (H1), so `K++`
   changes the closure's copy. Skipped for a shadowed name (a param or loop
   variable is a run-time binding already), a const builtin (it has a
   builtin slot) and a value no literal can hold - a struct NAME, whose
