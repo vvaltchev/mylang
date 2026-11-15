@@ -3384,10 +3384,10 @@ vm_make_thrown_exc(const EvalValue &v, Loc estart, Loc eend)
  * #78 step A: the CLAUSE MATCHER - does this clause (a catch_types index, or
  * -1 = the parenless catch-all) match the in-flight exception? ONE shared
  * implementation for the interpreted CatchTest and (step C) the handler-table
- * dispatch, so the two can never drift. The interned-pointer fast path (#74
- * inc 3: catch_uids is derived from catch_types by the same canonical
- * interning, so pointer equality == string equality); a subclass without
- * match_uid takes the string fallback.
+ * dispatch, so the two can never drift. A name compares by its interned
+ * pointer (#74 inc 3: catch_keys' uid is derived from catch_types by the
+ * same canonical interning, so pointer equality == string equality); a
+ * subclass without match_uid takes the string fallback.
  */
 static ML_ALWAYS_INLINE bool vm_catch_match(const Chunk &chunk,
                                            int_type types_idx,
@@ -3404,8 +3404,10 @@ static ML_ALWAYS_INLINE bool vm_catch_match(const Chunk &chunk,
         return true;                              /* catch-all */
 
     /* question 25: a struct by identity; a built-in exception's name
-     * matches no struct; an unresolved name (an open world) by name */
-    const StructTypeDef *xd = exc_struct_def(exc);
+     * matches no struct, boxed or not; an unresolved name (an open world)
+     * by name */
+    bool x_struct = false;
+    const StructTypeDef *xd = exc_struct_def(exc, x_struct);
     const UniqueId *eu = exc->match_uid();
     const auto &keys = chunk.catch_keys[types_idx];
     for (size_t k = 0; k < keys.size(); k++) {
@@ -3415,7 +3417,7 @@ static ML_ALWAYS_INLINE bool vm_catch_match(const Chunk &chunk,
                 return true;
             continue;
         }
-        if (key.builtin && xd)
+        if (key.builtin && x_struct)
             continue;
         if (eu ? key.uid == eu
                : chunk.catch_types[types_idx][k] == vm_exc_name(exc))

@@ -8055,7 +8055,10 @@ and two macros:
   declares yet, which matches by name; in a script such a name is a
   compile error. So a function's private struct is caught outside it only
   by a catch-all, and `catch (dyn as e)` is the catch-all that binds (no
-  exList, an asId). `catch (T as e)` binds `e` to the
+  exList, an asId). **A built-in name catches no struct OBJECT, a
+  `box<P>` included** (`exc_struct_def`'s `is_struct`; a box, which a
+  `dyn` can throw, has a null def and compared its struct's name until
+  2026-11-17). `catch (T as e)` binds `e` to the
   **struct instance** (`exObj->get_data()`, so `e.field` works) when the
   exception carries one, else to a fresh `ExceptionObject` wrapper (the
   payload-less built-in case — printable/re-throwable). The catch variable

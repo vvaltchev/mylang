@@ -88,5 +88,18 @@ try { c(); } catch (A1) { got = "wrong"; } catch (dyn as e) {
 }
 want("last clause", got, "last true");
 
+# ...and neither does a BOX of such a struct, which a `dyn` can throw: a
+# built-in exception's name catches no struct at all (a box<P> is not a P
+# either, so only the fallback catches it)
+func odd_box() {
+    struct TypeErrorEx { int z; }
+    var dyn b = box(TypeErrorEx(rt(9)));
+    throw b;
+}
+try {
+    try { odd_box(); } catch (TypeErrorEx) { got = "wrong"; }
+} catch (dyn as e) { got = "outer " + str(e); }
+want("builtin's name, boxed", got, "outer box(TypeErrorEx(z: 9))");
+
 assert(bad == 0);
 print("ok");

@@ -7547,14 +7547,18 @@ struct HandlingScope {
 };
 
 /* the struct a thrown exception carries, or null (a built-in exception,
- * or a box: a box<P> is not a P) */
-const StructTypeDef *exc_struct_def(const RuntimeException *ex)
+ * or a box: a box<P> is not a P). `is_struct`: it carries a struct object
+ * at all, a box<P> included - which no built-in exception's name catches */
+const StructTypeDef *exc_struct_def(const RuntimeException *ex,
+                                    bool &is_struct)
 {
+    is_struct = false;
     if (!ex->is_exception_object())
         return nullptr;
     const EvalValue &d = static_cast<const ExceptionObject *>(ex)->get_data();
     if (!d.is<intrusive_ptr<StructObject>>())
         return nullptr;
+    is_struct = true;
     const StructObject &o = *d.get_ref<intrusive_ptr<StructObject>>();
     return o.boxed ? nullptr : o.def;
 }
@@ -7590,8 +7594,10 @@ do_catch(EvalContext *ctx,
      * clause ids are interned already, so pointer == string equality */
     const UniqueId *ex_uid = saved_ex->match_uid();
     /* question 25: a clause names a struct by identity (defs, from the
-     * inferencer); a built-in exception's name matches no struct */
-    const StructTypeDef *ex_def = exc_struct_def(saved_ex);
+     * inferencer); a built-in exception's name matches no struct, boxed
+     * or not */
+    bool ex_is_struct = false;
+    const StructTypeDef *ex_def = exc_struct_def(saved_ex, ex_is_struct);
 
     for (size_t ci = 0; ci < n_types && !matched; ci++) {
 
@@ -7600,7 +7606,7 @@ do_catch(EvalContext *ctx,
         if (cd) {
             if (cd != ex_def)
                 continue;
-        } else if (ex_def && is_catchable_ex_name(id->get_str())) {
+        } else if (ex_is_struct && is_catchable_ex_name(id->get_str())) {
             continue;
         } else if (ex_uid ? (id->uid != ex_uid)
                           : (id->get_str() != ex_name)) {
