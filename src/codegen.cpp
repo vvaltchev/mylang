@@ -913,6 +913,20 @@ struct Codegen {
     /* #49: a CheckFitV of `slot` against `spec` (null: none) - a stored
      * value that may misfit its place's declared type, checked after its
      * widening and before the store; `node` is the value (the caret) */
+    /* Q2: the ref a creation op names its container's type by (0: none,
+     * else the Chunk::ctypes index + 1; one entry per distinct type) */
+    unsigned ctype_pool_ref(const TypeAnnot *t)
+    {
+        if (!t)
+            return 0;
+        for (size_t i = 0; i < chunk.ctypes.size(); i++)
+            if (chunk.ctypes[i] == t)
+                return static_cast<unsigned>(i + 1);
+        chunk.ctypes.push_back(t);
+        ML_CHECK(chunk.ctypes.size() < (1u << 23));
+        return static_cast<unsigned>(chunk.ctypes.size());
+    }
+
     void emit_fit(const std::shared_ptr<const FitSpec> &spec, int slot,
                   const Construct *node, std::vector<CgInstr> &ops)
     {
@@ -1251,6 +1265,7 @@ struct Codegen {
         bc.start = dc->args->start;
         bc.end = dc->args->end;
         bc.arr_hint = dc->args->arr_hint;
+        bc.ctype = dc->args->ctype;
         bc.args.reserve(dc->args->elems.size());
         for (const auto &el : dc->args->elems)
             bc.args.push_back(ArgLoc{el->start, el->end});
@@ -2119,7 +2134,8 @@ struct Codegen {
             in.target = dst;
             in.set_a(int_lit(base));
             in.set_b(int_lit(static_cast<int>(la->elems.size())));
-            in.target2 = static_cast<int>(la->arr_hint);
+            in.target2 = static_cast<int>(la->arr_hint)
+                       | static_cast<int>(ctype_pool_ref(la->ctype) << 8);
             ops.push_back(in);
             out_slot = dst;
             return true;
@@ -2165,6 +2181,7 @@ struct Codegen {
             in.target = dst;
             in.set_a(int_lit(base));
             in.set_b(int_lit(npairs));
+            in.target2 = static_cast<int>(ctype_pool_ref(ld->ctype));
             /* The build FREEZES + HASHES each key, so an UNHASHABLE key (a
              * function value laundered through `dyn`) throws TypeErrorEx from
              * build_dict_from_pairs. Record the literal's span so extract_locs
@@ -4146,6 +4163,7 @@ struct Codegen {
             cs.start = call->args->start;
             cs.end = call->args->end;
             cs.arr_hint = call->args->arr_hint;
+            cs.ctype = call->args->ctype;
             cs.args.reserve(n);
             for (const auto &el : call->args->elems)
                 cs.args.push_back(ArgLoc{el->start, el->end});
@@ -4670,7 +4688,8 @@ struct Codegen {
         /* bit 0 = is_filter; bits 1-2 = the flat result kind (#97 CB3,
          * map_filter_flat_hint) */
         in.target2 = (dc->map_filter_kind == 2 ? 1 : 0)
-                   | (map_filter_flat_hint(dc->args->arr_hint) << 1);
+                   | (map_filter_flat_hint(dc->args->arr_hint) << 1)
+                   | static_cast<int>(ctype_pool_ref(dc->args->ctype) << 3);
         in.set_a(slot_op(t0));
         in.set_b(slot_op(t1));
         ops.push_back(in);
@@ -12297,6 +12316,13 @@ struct ChunkVerifier {
         if (i < 0 || static_cast<size_t>(i) >= n)
             reject(what);
     }
+    /* Q2: a creation op's container type - a REF into Chunk::ctypes (0:
+     * untyped, else the index + 1) */
+    void ctype(unsigned ref) const
+    {
+        if (ref > ck.ctypes.size())
+            reject("ctype");
+    }
     /* A pool entry the OP WILL DEREFERENCE. Several def pointers have a
      * legitimate null form for OTHER consumers (a boxed ctor's, an emplace
      * site's), so bounding the index is not enough - the op that reads one
@@ -12992,6 +13018,7 @@ void ChunkVerifier::verify_one(const Instr &in)
     case OpCode::MapFilterV:
         reg(in.target);
         ab_regs(in);
+        ctype(static_cast<unsigned>(in.target2) >> 3);
         break;
 
     /* --- value construction ------------------------------------------- */
@@ -13010,10 +13037,12 @@ void ChunkVerifier::verify_one(const Instr &in)
     case OpCode::MakeArrayV:
         reg(in.target);
         run(in.a_lit(), in.b_lit());
+        ctype(static_cast<unsigned>(in.target2) >> 8);
         break;
     case OpCode::MakeDictV:
         reg(in.target);
         run(in.a_lit(), 2 * in.b_lit());   /* key/value pairs */
+        ctype(static_cast<unsigned>(in.target2));
         break;
     case OpCode::MakeClosureV:
         reg(in.target);

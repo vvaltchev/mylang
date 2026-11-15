@@ -56,6 +56,27 @@ struct TypeAnnot {
 };
 
 /*
+ * Q2 (plans/typed-containers.md): THE TYPE INTERN TABLE. One node per
+ * distinct annotation, for the life of the process, so two equal types
+ * are one pointer and comparing them is a pointer compare. An interned
+ * node's children are interned too (held by a non-owning shared_ptr).
+ * What a container carries as its own type (`ctype`: array<T> or
+ * dict<K, V>, its top-level opt cleared) is such a node. A struct type
+ * is held by its def pointer and never dereferenced by the table, so a
+ * node naming a def that died is merely unused.
+ */
+const TypeAnnot *annot_intern(const TypeAnnot &a);
+/* `a` (interned) with its top-level `opt` cleared */
+const TypeAnnot *annot_nonopt(const TypeAnnot *a);
+/* the interned array<dyn> / dict<dyn, dyn>: a DYNAMIC container's type */
+const TypeAnnot *annot_dyn_array();
+const TypeAnnot *annot_dyn_dict();
+/* the interned array<P> of a struct type `d` (a flat struct literal's) */
+const TypeAnnot *annot_array_of_struct(const StructTypeDef *d);
+/* how a type reads in a message ("array<int>"); "untyped" for null */
+std::string annot_text(const TypeAnnot *a);
+
+/*
  * #49: a value entering a place whose type is fixed - a parameter, a
  * declared variable, an element, a field, a dict value or key - from a
  * `dyn` (or from a container whose element is `dyn`) is checked at run

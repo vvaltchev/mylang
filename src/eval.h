@@ -1057,6 +1057,27 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
  * typed destination never holds a misfit. See eval.cpp. */
 EvalValue flat_hint_value(const EvalValue &v, ArrHint hint);
 
+/*
+ * Q2 (plans/typed-containers.md): give a container MADE HERE the type the
+ * compiler stamped where it is made (`t`: an interned array<T> / dict<K,
+ * V>; null - nothing stamped - does nothing), and the fresh containers
+ * inside it the types `t` gives them (a builtin's result). Only an
+ * UNTYPED, MUTABLE, non-slice container takes a type: a copy kept its
+ * source's type already, and a read-only one needs none (no store can
+ * change it). A `dyn` element stops the walk: what a `dyn` holds keeps
+ * the type it was made with.
+ */
+void stamp_ctype(const EvalValue &v, const TypeAnnot *t);
+/* ...the top container only: a LITERAL's (what it holds was typed where
+ * that was made, or is not this literal's to type) */
+void stamp_ctype_top(const EvalValue &v, const TypeAnnot *t);
+
+/* Q2: a BAKED mutable value (a LiteralObj's) with its fresh containers
+ * typed `t`: stamped in place when untyped, COPIED when another node's
+ * stamp already gave it a different type (two nodes may share one baked
+ * value - a template's instances clone its body). */
+EvalValue ctype_restamp(const EvalValue &v, const TypeAnnot *t);
+
 /* The value a baked const array/dict/struct LiteralObj materializes (an
  * immutable share vs a fresh mutable clone). Shared by the tree-walker
  * (LiteralObj::do_eval) and the VM's LoadLiteralObjV op, so both

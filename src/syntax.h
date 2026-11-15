@@ -265,6 +265,15 @@ public:
     const StructTypeDef *arr_hint_struct = nullptr;
 
     /*
+     * Q2 (plans/typed-containers.md): the type a container made HERE is
+     * made with - an interned array<T> / dict<K, V> (structtype.h), or
+     * null (untyped). Set by the inferencer on a LiteralArray /
+     * LiteralDict, and on a container-building builtin call's args
+     * ExprList (read through ArgLocs::ctype). Copied by copy_base_fields.
+     */
+    const TypeAnnot *ctype = nullptr;
+
+    /*
      * Set on nodes spliced in by function inlining: the "inlined-at" chain used
      * to rebuild virtual backtrace frames for the (physically absent) inlined
      * call. Null for the vast majority of nodes; consulted only on the error
@@ -340,6 +349,7 @@ public:
         d.th_val = th_val;
         d.arr_hint = arr_hint;
         d.arr_hint_struct = arr_hint_struct;
+        d.ctype = ctype;
         d.defer_fold = defer_fold;
         d.late_fold_witness = late_fold_witness;
         d.never_none = never_none;

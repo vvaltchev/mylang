@@ -366,7 +366,9 @@ compile into a
 register run (the same contiguous-run pattern native calls use for args, via
 `emit_args_range`), and the op builds the array through the tree-walker's shared
 **`build_array_from_values`** core — flat (int/float/bool) or general per the
-`ArrHint` carried in `target2`, box-free, never throwing (so `node`-free) — and
+`ArrHint` carried in `target2`'s low 8 bits (above them, the array's own type
+- Q2: a ref into `Chunk::ctypes`, as MakeDictV's whole `target2` and
+MapFilterV's bits 3 and up), box-free, never throwing (so `node`-free) — and
 is retargeted straight into the lvalue slot for `var a = [..]` (no `MoveV`). A
 **flat STRUCT-array literal** `[P(a,b), P(c,d)]` (`ArrHint::flat_s`, F-4) lowers
 to the **FUSED `MakeStructArrayV`** (`try_make_struct_array`) when every element

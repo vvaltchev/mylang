@@ -1,0 +1,74 @@
+# INT-ENGINES: tw default nj nc nbi noopt ni
+#
+# INT unit (Q2, plans/typed-containers.md): an array or a dict CARRIES
+# ITS OWN TYPE, given where it is made - the type the compiler builds it
+# for. int_ctype() reads it; every engine must give each container the
+# same type, folded (default) or not (-nc), inlined or not:
+#  - a literal: the type of the variable it is assigned to, the fixed
+#    place it lands in, its parent literal's element type, else its own;
+#  - written where `dyn` is declared: DYNAMIC (array<dyn>, dict<dyn,dyn>);
+#  - a builtin that builds one: the type of its call (range, keys, split,
+#    map, filter, make_array, kvpairs, dynarray), a copy (clone, a slice,
+#    an empty slice) its source's;
+#  - UNTYPED: a constant's (read-only, it needs none), an empty literal
+#    nothing filled, and one a fit check examines where it lands, or whose
+#    place's type is unknown here (a call through a function value, a
+#    store or an append into a `dyn` container) - it takes its type there.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + got + ", expected " + exp);
+        bad++;
+    }
+}
+func rt(x) => runtime(x);
+
+var a = [1, 2];                  want("var literal", int_ctype(a), "array<int>");
+var a2 = [rt(1), 2];             want("dyn element", int_ctype(a2), "array<dyn>");
+var dyn d = [1, 2];              want("dyn var", int_ctype(d), "array<dyn>");
+array<float> f = [1, 2];         want("declared", int_ctype(f), "array<float>");
+var n = [[1], [rt(2)]];
+want("nested outer", int_ctype(n), "array<array<dyn>>");
+want("nested inner", int_ctype(n[0]), "array<dyn>");
+var w = [1, 2]; w[0] = 2.5;      want("widened var", int_ctype(w), "array<float>");
+var m = {"a": 1};                want("dict", int_ctype(m), "dict<str,int>");
+var dyn md = {"a": 1};           want("dyn dict", int_ctype(md), "dict<dyn,dyn>");
+var het = [[1], "x"];
+want("const het", int_ctype(het), "array<dyn>");
+want("const het inner", int_ctype(het[0]), "array<dyn>");
+
+var r = range(3);                want("range", int_ctype(r), "array<int>");
+var dyn rd = range(3);           want("dyn range", int_ctype(rd), "array<dyn>");
+want("keys", int_ctype(keys(m)), "array<str>");
+want("split", int_ctype(split("a b", " ")), "array<str>");
+want("map", int_ctype(map(func(x) => x * 2, a)), "array<int>");
+want("filter", int_ctype(filter(func(x) => x > 1, a2)), "array<dyn>");
+want("make_array", int_ctype(make_array(2, func(i) => i)), "array<int>");
+want("kvpairs", int_ctype(kvpairs(m)), "array<array<dyn>>");
+want("dynarray", int_ctype(dynarray(a)), "array<dyn>");
+want("clone", int_ctype(clone(a)), "array<int>");
+want("slice", int_ctype(a[0:1]), "array<int>");
+want("empty slice", int_ctype(a[5:9]), "array<int>");
+struct P { int x; }
+want("struct literal", int_ctype([P(1), P(rt(2))]), "array<P>");
+
+const K = [1, 2];
+want("constant", int_ctype(K), "untyped");
+want("clone of a constant", int_ctype(clone(K)), "array<int>");
+var e = [];                      want("unfilled", int_ctype(e), "untyped");
+var e2 = []; append(e2, 1);      want("filled", int_ctype(e2), "array<int>");
+
+array<int?> o = [rt(1)];         want("fit-checked decl", int_ctype(o), "untyped");
+func takes(array<int> p) => int_ctype(p);
+want("fit-checked arg", takes([rt(1)]), "untyped");
+want("typed arg", takes([1]), "array<int>");
+var dyn g = takes;
+want("indirect arg", g([1]), "untyped");
+var dyn dd = [[1]];
+dd[0] = [rt(2)];                 want("dyn store", int_ctype(dd[0]), "untyped");
+var dyn dz = [];
+append(dz, [1]);                 want("dyn append", int_ctype(dz[0]), "untyped");
+
+assert(bad == 0);
+print("ok");

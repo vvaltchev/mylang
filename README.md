@@ -724,6 +724,9 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     avg([1, 2]);                      # the literal is an array<float>
     const array<float> K = [1, 2];    # a const holds 1.0, 2.0 too
     ```
+    So does a literal assigned to a variable whose type is INFERRED, at
+    the type the variable ends up with: `var d = {"a": 1}; d["b"] = 2.5;`
+    makes `d` a `dict<str, float>`, and its literal holds `1.0`.
     Its **storage** follows the declared type too, at every level: `[1.5]`
     passed for an `array<float?>` parameter is a general array, so a
     later `xs[0] = none` fits (built from its own values it would be a

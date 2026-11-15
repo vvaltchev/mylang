@@ -7259,6 +7259,38 @@ per level of a deep value - a separate open item.
   `LValue*`s rely on it), its hash is cached (a copy hashes nothing), and
   the equality test keeps libstdc++'s argument order (the looked-up key on
   the left).
+- **⛔ A CONTAINER CARRIES ITS OWN TYPE (Q2, plans/typed-containers.md,
+  increment 1, 2026-11-17).** `SharedObject::ctype` / `DictObject::ctype`:
+  the type an array or a dict was MADE with, an interned `TypeAnnot`
+  (`annot_intern`, structtype.h; equal types are one pointer, so comparing
+  them is a pointer compare), or null (UNTYPED). The compiler stamps
+  every node that makes one (`Construct::ctype`, copied by
+  `copy_base_fields`): a literal gets the type `stamp_literal_coerce`
+  builds it for (a fixed place's, the variable it is assigned to - which
+  `set_array_repr_hint` now gives an inferred variable too - its parent
+  literal's element type, else its own), `array<dyn>` / `dict<dyn,dyn>` in
+  a place declared `dyn`; a container-building builtin gets it through
+  `ArgLocs::ctype` (`builtin_builds_container`, and the `ctyped_*`
+  wrappers at registration, so every engine stamps alike); a baked
+  mutable value is restamped (`ctype_restamp`, copied when another node
+  already typed the shared value). UNTYPED: a constant's (read-only - no
+  store can change it), an empty literal nothing filled, and a literal a
+  fit check examines where it lands or whose place's type is unknown here
+  (an indirect call's argument, a store into a `dyn` container) - it is
+  meant to take its type there (increment 3). Copies keep the type
+  (`clone_internal_vec`, the dict's copy constructor, the mutable and
+  const clones); an empty slice of a typed array is a fresh array of its
+  type. Three walks set it (`stamp_ctype_rec`): the top only for a
+  literal (what it holds is not its to type), along the annotation for a
+  builtin's result, and dynamic under a `dyn` element for a baked value.
+  The VM's MakeArrayV / MakeDictV / MapFilterV name theirs by a ref into
+  `Chunk::ctypes` in `target2`'s high bits; MakeStructArrayV derives
+  `array<P>` from its def. `.myv` v43 stores all of it. Nothing READS the
+  type yet except `int_ctype()` (INT builds) - the checked stores and the
+  entry check are increments 2 and 3. **A new place that makes a
+  container must stamp it**, or it is untyped where the static type says
+  otherwise; `tests/int/126_container_types.my` prints the type every
+  creation shape gets under every engine.
 - **Universal `hash()` (deep, by value).** `Type::hash` returns `size_t`; the
   base throws, the leaves (`int`/`bool`/`float`/`str`) hash directly, and
   `none` + the containers/structs hash deeply (`hashing.h` combiners,

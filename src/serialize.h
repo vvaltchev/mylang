@@ -23,7 +23,14 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 42;   /* v42: a catch type's
+constexpr unsigned MYV_FORMAT_VERSION = 43;   /* v43: a container's
+                                                 own type (Q2) on each
+                                                 array / dict value, a
+                                                 chunk's ctypes pool, a
+                                                 builtin call's ctype;
+                                                 an annotation may name
+                                                 a reflection struct;
+                                                 v42: a catch type's
                                                  struct index;
                                                  v41: a LiteralObj
                                                  loses its arr_hint and

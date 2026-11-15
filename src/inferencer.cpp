@@ -624,6 +624,20 @@ private:
     bool call_fit_args(CallExpr *call);  /* #49: CallExpr::fit_args */
     void check_opt_struct_fields();      /* `opt` names a class (parser) */
     void stamp_literal_coerce(Construct *n, StaticTypeRef t);
+    /* Q2 (plans/typed-containers.md): the type a container is MADE with
+     * (Construct::ctype) - see stamp_ctypes */
+    const TypeAnnot *ctype_of(StaticTypeRef t, bool dict);
+    void stamp_ctypes(Construct *n, StaticTypeRef dest);
+    void stamp_lit_obj_ctype(LiteralObj *lo, StaticTypeRef t);
+    /* creation nodes written where `dyn` is declared (set_array_repr_hint) */
+    std::unordered_set<const Construct *> ctype_dyn_place;
+    /* creation nodes made UNTYPED: a fit check examines them where they
+     * land, or their place's type is unknown here (stamp_ctypes) */
+    std::unordered_set<const Construct *> ctype_untyped;
+    void ctype_untype(Construct *n);
+    bool arg_fit_checked(CallExpr *call, size_t i);
+    /* the FIXED place a baked literal was rebuilt for (stamp_literal_repr) */
+    std::unordered_map<const Construct *, StaticTypeRef> lit_obj_dest;
     FuncInfo *hint_func = nullptr;   /* annotate_hints: the enclosing func */
     /* literals whose widening an enclosing literal stamped (#75) */
     std::unordered_set<const Construct *> lit_coerce_by_parent;
@@ -2641,6 +2655,14 @@ void Inferencer::infer_one(Block *rootBlock)
     }
 
     apply_late_folds(rootBlock);
+
+    /* Q2: the type each container is made with - after the late folds,
+     * whose literals stand for calls */
+    for (auto &e : rootBlock->elems)
+        stamp_ctypes(e.get(), nullptr);
+    ctype_dyn_place.clear();
+    ctype_untyped.clear();
+    lit_obj_dest.clear();
 }
 
 /*
@@ -3543,6 +3565,11 @@ void Inferencer::stamp_literal_coerce(Construct *n, StaticTypeRef t)
             stamp_literal_coerce(c, el);
         }
     };
+    /* Q2: the container is made with the type it is built for here */
+    const bool dict = ctag(n) == ConstructType::lit_dict;
+    n->ctype = ctype_dyn_place.count(n)
+        ? (dict ? annot_dyn_dict() : annot_dyn_array())
+        : ctype_of(t, dict);
     if (ctag(n) == ConstructType::lit_arr) {
         auto *la = static_cast<LiteralArray *>(n);
         la->elem_coerce = dt;
@@ -4431,6 +4458,232 @@ void Inferencer::stamp_sum_identity(CallExpr *call)
         call->args->arr_hint = ArrHint::flat_f;
 }
 
+/* Q2: is a component of `t` unfilled (`none`) or not yet known? Such a
+ * container is made UNTYPED: its first typed place gives it its type. */
+static bool ctype_unfilled(StaticTypeRef t)
+{
+    t = static_type_resolve(t);
+    if (!t || t->kind == StaticTypeKind::None
+           || t->kind == StaticTypeKind::Unknown)
+        return true;
+    if (t->kind == StaticTypeKind::Array || t->kind == StaticTypeKind::Box)
+        return t->elem && ctype_unfilled(t->elem);
+    if (t->kind == StaticTypeKind::Dict)
+        return ctype_unfilled(t->key) || ctype_unfilled(t->val);
+    return false;
+}
+
+/*
+ * Q2 (plans/typed-containers.md): the type a container is MADE with, when
+ * it is built for the static type `t` - an interned array<T> / dict<K,
+ * V>, its top-level opt cleared; array<dyn> / dict<dyn, dyn> (DYNAMIC) for
+ * a `dyn` place; null (untyped) when `t` is no such container or has a
+ * component nothing filled.
+ */
+const TypeAnnot *Inferencer::ctype_of(StaticTypeRef t, bool dict)
+{
+    t = static_type_resolve(t);
+    if (!t)
+        return nullptr;
+    if (t->kind == StaticTypeKind::Dyn)
+        return dict ? annot_dyn_dict() : annot_dyn_array();
+    if (t->kind != (dict ? StaticTypeKind::Dict : StaticTypeKind::Array)
+            || ctype_unfilled(t))
+        return nullptr;
+    std::shared_ptr<TypeAnnot> a = fit_annot_of(t);
+    a->opt = false;
+    return annot_intern(*a);
+}
+
+/* the builtins whose result is a container they BUILD (Q2): the call
+ * gives it its type, through ArgLocs::ctype */
+static bool builtin_builds_container(std::string_view n)
+{
+    return n == "range" || n == "array" || n == "make_array" ||
+           n == "make_dict" || n == "dict" || n == "keys" ||
+           n == "values" || n == "kvpairs" || n == "map" ||
+           n == "filter" || n == "split" || n == "splitlines" ||
+           n == "readlines" || n == "clone" || n == "deepclone" ||
+           n == "dynarray" || n == "sort" || n == "rev_sort" ||
+           n == "reverse" || n == "globals" || n == "specializations" ||
+           n == "int_events";
+}
+
+/* Q2: a BAKED mutable value's containers take the type `t` gives them
+ * (eval.cpp: ctype_restamp, which copies a value another node already
+ * gave a different type) */
+void Inferencer::stamp_lit_obj_ctype(LiteralObj *lo, StaticTypeRef t)
+{
+    const EvalValue &v = lo->literal_value();
+    const bool dict = v.is<intrusive_ptr<DictObject>>();
+    if (lo->is_immutable() || (!dict && !v.is<SharedArrayObj>()))
+        return;
+    const TypeAnnot *ct = ctype_dyn_place.count(lo)
+        ? (dict ? annot_dyn_dict() : annot_dyn_array())
+        : ctype_of(t, dict);
+    if (ct)
+        lo->set_literal_value(ctype_restamp(v, ct));
+}
+
+/*
+ * Q2: give every node that MAKES a container the type it is made with.
+ * A literal got it from stamp_literal_coerce (the type it is built for);
+ * a baked mutable value and a building builtin's call get it here, from
+ * the variable it is assigned to (`dest`, set_array_repr_hint's rule: a
+ * direct right-hand side), else from the fixed place a baked value was
+ * rebuilt for, else from their own type. Runs after the late folds.
+ */
+void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
+{
+    if (!n)
+        return;
+    switch (ctag(n)) {
+    case ConstructType::lit_arr:
+    case ConstructType::lit_dict:
+        if (ctype_untyped.count(n)) {
+            /* what it holds is checked where it lands, and so are the
+             * literals nested in it */
+            n->ctype = nullptr;
+            if (ctag(n) == ConstructType::lit_arr) {
+                for (auto &el : static_cast<LiteralArray *>(n)->elems)
+                    ctype_untype(el.get());
+            } else {
+                for (auto &kv : static_cast<LiteralDict *>(n)->elems)
+                    ctype_untype(kv->value.get());
+            }
+        }
+        break;
+    case ConstructType::lit_obj: {
+        auto *lo = static_cast<LiteralObj *>(n);
+        if (ctype_untyped.count(n))
+            return;
+        StaticTypeRef t = dest;
+        if (!t) {
+            auto it = lit_obj_dest.find(lo);
+            t = it != lit_obj_dest.end() ? it->second : type_of(lo);
+        }
+        stamp_lit_obj_ctype(lo, t);
+        return;
+    }
+    case ConstructType::call: {
+        auto *call = static_cast<CallExpr *>(n);
+        auto *cid = node_cast<Identifier>(call->what.get());
+        bool builtin = false;
+        if (cid && is_builtin(cid->uid)) {
+            auto sit = id_sym.find(cid);
+            builtin = sit == id_sym.end() || !sit->second;
+        }
+        if (builtin && call->args
+                && builtin_builds_container(cid->uid->val)) {
+            const StaticTypeRef own = static_type_resolve(type_of(call));
+            const bool dict = own && own->kind == StaticTypeKind::Dict;
+            call->args->ctype = ctype_untyped.count(call) ? nullptr
+                : ctype_dyn_place.count(call)
+                    ? (dict ? annot_dyn_dict() : annot_dyn_array())
+                    : ctype_of(dest ? dest : own, dict);
+        }
+        /* an argument a fit check examines, or one whose parameter's type
+         * is unknown here (a call through a function value) */
+        if (call->args) {
+            auto &as = call->args->elems;
+            const bool known = builtin
+                || cs_struct_callee(call->what.get())
+                || callee_funcinfo(call->what.get());
+            /* a value stored into a `dyn` container by an in-place
+             * builtin: its element type is unknown here */
+            const bool into_dyn = builtin && !as.empty()
+                && (cid->uid->val == "append" || cid->uid->val == "push"
+                    || cid->uid->val == "insert")
+                && is_dyn(static_type_resolve(type_of(as[0].get())));
+            for (size_t i = 0; i < as.size(); i++)
+                if (!known || (into_dyn && i > 0)
+                        || arg_fit_checked(call, i))
+                    ctype_untype(as[i].get());
+        }
+        break;
+    }
+    case ConstructType::expr14: {
+        auto *e = static_cast<Expr14 *>(n);
+        if (e->op == Op::assign) {
+            /* checked where it lands; or stored through a `dyn` container,
+             * whose element type is unknown here */
+            Construct *lv = e->lvalue.get();
+            Construct *base =
+                ctag(lv) == ConstructType::subscript
+                    ? static_cast<Subscript *>(lv)->what.get()
+                : ctag(lv) == ConstructType::member
+                    ? static_cast<MemberExpr *>(lv)->what.get()
+                    : nullptr;
+            if (e->rv_fit || (base && is_dyn(static_type_resolve(
+                                          type_of(base)))))
+                ctype_untype(e->rvalue.get());
+            if (auto *id = node_cast<Identifier>(e->lvalue.get())) {
+                auto it = id_sym.find(id);
+                if (it != id_sym.end() && it->second) {
+                    stamp_ctypes(e->lvalue.get(), nullptr);
+                    stamp_ctypes(e->rvalue.get(), it->second->type);
+                    return;
+                }
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    for_each_child(n, [&](Construct *c) { stamp_ctypes(c, nullptr); });
+}
+
+/* Q2: make the container node `n` makes UNTYPED (stamp_ctypes) - through
+ * a ternary's arms and a `??`'s sides, which are what the place gets */
+void Inferencer::ctype_untype(Construct *n)
+{
+    if (!n)
+        return;
+    switch (ctag(n)) {
+    case ConstructType::ternary: {
+        auto *t = static_cast<TernaryExpr *>(n);
+        ctype_untype(t->thenExpr.get());
+        ctype_untype(t->elseExpr.get());
+        return;
+    }
+    case ConstructType::coalesce: {
+        auto *c = static_cast<CoalesceExpr *>(n);
+        ctype_untype(c->lhs.get());
+        ctype_untype(c->rhs.get());
+        return;
+    }
+    case ConstructType::lit_arr: case ConstructType::lit_dict:
+    case ConstructType::lit_obj: case ConstructType::call:
+        ctype_untyped.insert(n);
+        return;
+    default:
+        return;
+    }
+}
+
+/* Q2: does a fit check (#49) examine argument `i` of `call` where it is
+ * bound - a struct field's, a typed parameter's, an in-place builtin's
+ * stored value? (call_fit_args, argument by argument) */
+bool Inferencer::arg_fit_checked(CallExpr *call, size_t i)
+{
+    ExprList *args = call->args.get();
+    Construct *a = args->elems[i].get();
+    if (args->fit_of(i))
+        return true;
+    if (const StructTypeDef *def = cs_struct_callee(call->what.get())) {
+        if (i >= def->fields.size())
+            return false;
+        const FieldDef &fd = def->fields[i];
+        return fd.kind != FieldKind::f_dyn
+            && fit_needed(type_of(a), field_static_type(fd));
+    }
+    if (FuncInfo *fi = callee_funcinfo(call->what.get()))
+        return i < fi->params.size() && param_has_fit(fi->params[i])
+            && fit_needed(type_of(a), fi->params[i]->type);
+    return false;
+}
+
 void Inferencer::set_array_repr_hint(Expr14 *e)
 {
     if (e->op != Op::assign)
@@ -4445,6 +4698,18 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
     StaticTypeRef ty = static_type_resolve(it->second->type);
 
     /*
+     * A container LITERAL assigned to a variable is built for the
+     * variable's final type, as one landing in a FIXED place is (#46,
+     * literal_into): `var a = [[1, 2]]; a[0][0] = 2.5;` types `a` as
+     * array<array<float>> (the store contributes a float element), and its
+     * inner literal, built as its own array<int>, refused the store at run
+     * time - a TypeErrorEx in a well-typed program. The types are final
+     * here, so the variable's no longer joins the literal's own.
+     */
+    if (StaticTypeRef d = literal_into(e->rvalue.get(), ty))
+        stamp_literal_into(e->rvalue.get(), d);
+
+    /*
      * A `dyn`-typed destination (`var dyn d = ...`) means "I want a polymorphic
      * array", so build it general - otherwise `var dyn d = [1,2,3]; d[0]="x"`
      * would wrongly hit the flat-array error even though `d` is already dyn.
@@ -4457,6 +4722,8 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
             return;
     } else if (ty->kind == StaticTypeKind::Dyn) {
         hint = ArrHint::general;
+        /* Q2: a container made here is DYNAMIC (array<dyn>) */
+        ctype_dyn_place.insert(e->rvalue.get());
     } else {
         return;
     }
@@ -5945,7 +6212,7 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
     if (n == "str" || n == "typestr" || n == "kindstr" || n == "chr" ||
         n == "join" || n == "lpad" || n == "rpad" || n == "lstrip" ||
         n == "rstrip" || n == "strip" || n == "read" ||
-        n == "tmpdir")
+        n == "tmpdir" || n == "int_ctype")
         return A.str_ty();
 
     /* readln() is none at the end of input */
@@ -6919,6 +7186,7 @@ void Inferencer::stamp_literal_repr(Construct *lit, StaticTypeRef dest)
         auto *lo = static_cast<LiteralObj *>(lit);
         if (!lo->from_literal)
             return;
+        lit_obj_dest[lo] = dest;            /* Q2: stamp_ctypes */
         WidenShape w;
         widen_shape_of(dest, w);
         /* and its storage: widen_baked_value rebuilds an array in the

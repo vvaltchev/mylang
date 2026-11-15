@@ -37120,12 +37120,13 @@ static bool myv_struct_array_stride_checked()
                        std::istreambuf_iterator<char>());
         }
         /* the record (docs/myv-format.txt 11.1): u8 kind 4 (structs),
-         * bool readonly, u32 n = 2, sref def = 0, u32 stride = 16 */
+         * bool readonly, ctype 0xFF (a constant's array is untyped, v43),
+         * u32 n = 2, sref def = 0, u32 stride = 16 */
         const std::string tail("\x02\0\0\0\0\0\0\0\x10\0\0\0", 12);
         size_t at = std::string::npos;
         for (size_t i = img.find(tail); i != std::string::npos;
              i = img.find(tail, i + 1))
-            if (i >= 2 && img[i - 2] == '\x04') {
+            if (i >= 3 && img[i - 3] == '\x04' && img[i - 1] == '\xff') {
                 at = i;
                 break;
             }

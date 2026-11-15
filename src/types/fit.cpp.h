@@ -26,6 +26,123 @@
 
 namespace {
 
+/* the intern table's key: a node's own fields, its children by their
+ * (interned) pointers */
+struct AnnotKey {
+    DeclType kind;
+    bool opt;
+    const StructTypeDef *strct;
+    const TypeAnnot *elem, *key, *val;
+    bool operator==(const AnnotKey &o) const
+    {
+        return std::tie(kind, opt, strct, elem, key, val)
+               == std::tie(o.kind, o.opt, o.strct, o.elem, o.key, o.val);
+    }
+};
+
+struct AnnotKeyHash {
+    size_t operator()(const AnnotKey &k) const
+    {
+        size_t h = std::hash<int>()(static_cast<int>(k.kind) * 2 + k.opt);
+        hash_combine(h, std::hash<const void *>()(k.strct));
+        hash_combine(h, std::hash<const void *>()(k.elem));
+        hash_combine(h, std::hash<const void *>()(k.key));
+        hash_combine(h, std::hash<const void *>()(k.val));
+        return h;
+    }
+};
+
+std::unordered_map<AnnotKey, std::unique_ptr<TypeAnnot>, AnnotKeyHash> &
+annot_table()
+{
+    static std::unordered_map<AnnotKey, std::unique_ptr<TypeAnnot>,
+                              AnnotKeyHash> t;
+    return t;
+}
+
+/* a non-owning handle on an interned node */
+std::shared_ptr<TypeAnnot> annot_handle(const TypeAnnot *a)
+{
+    return std::shared_ptr<TypeAnnot>(std::shared_ptr<TypeAnnot>(),
+                                      const_cast<TypeAnnot *>(a));
+}
+
+const TypeAnnot *annot_intern_key(const AnnotKey &k)
+{
+    auto &t = annot_table();
+    auto it = t.find(k);
+    if (it != t.end())
+        return it->second.get();
+    auto n = std::make_unique<TypeAnnot>();
+    n->kind = k.kind;
+    n->opt = k.opt;
+    n->strct = k.strct;
+    if (k.elem)
+        n->elem = annot_handle(k.elem);
+    if (k.key)
+        n->key = annot_handle(k.key);
+    if (k.val)
+        n->val = annot_handle(k.val);
+    const TypeAnnot *r = n.get();
+    t.emplace(k, std::move(n));
+    return r;
+}
+
+} // namespace
+
+const TypeAnnot *annot_intern(const TypeAnnot &a)
+{
+    AnnotKey k{a.kind, a.opt, a.strct,
+               a.elem ? annot_intern(*a.elem) : nullptr,
+               a.key ? annot_intern(*a.key) : nullptr,
+               a.val ? annot_intern(*a.val) : nullptr};
+    return annot_intern_key(k);
+}
+
+const TypeAnnot *annot_nonopt(const TypeAnnot *a)
+{
+    if (!a->opt)
+        return a;
+    return annot_intern_key(AnnotKey{a->kind, false, a->strct,
+                                     a->elem.get(), a->key.get(),
+                                     a->val.get()});
+}
+
+const TypeAnnot *annot_dyn_array()
+{
+    static const TypeAnnot *a = [] {
+        const TypeAnnot *d =
+            annot_intern_key(AnnotKey{DeclType::dyn, false, nullptr,
+                                      nullptr, nullptr, nullptr});
+        return annot_intern_key(AnnotKey{DeclType::arr, false, nullptr,
+                                         d, nullptr, nullptr});
+    }();
+    return a;
+}
+
+const TypeAnnot *annot_dyn_dict()
+{
+    static const TypeAnnot *a = [] {
+        const TypeAnnot *d =
+            annot_intern_key(AnnotKey{DeclType::dyn, false, nullptr,
+                                      nullptr, nullptr, nullptr});
+        return annot_intern_key(AnnotKey{DeclType::dict, false, nullptr,
+                                         nullptr, d, d});
+    }();
+    return a;
+}
+
+const TypeAnnot *annot_array_of_struct(const StructTypeDef *d)
+{
+    const TypeAnnot *e = annot_intern_key(AnnotKey{DeclType::strct, false, d,
+                                                   nullptr, nullptr,
+                                                   nullptr});
+    return annot_intern_key(AnnotKey{DeclType::arr, false, nullptr, e,
+                                     nullptr, nullptr});
+}
+
+namespace {
+
 struct FitWalk {
     /* (container, annotation) keys already walked - the arrays walked
      * element by element and the dicts, the walks that cost one step per
@@ -277,6 +394,11 @@ std::string fit_annot_text(const TypeAnnot &a)
 }
 
 } // namespace
+
+std::string annot_text(const TypeAnnot *a)
+{
+    return a ? fit_annot_text(*a) : std::string("untyped");
+}
 
 bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit &why)
 {

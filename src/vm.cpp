@@ -1148,6 +1148,7 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
                 && arr.use_count() == 1
                 && !arr.is_readonly()
                 && arr.flat_structs().def == def
+                && arr.ctype() == annot_array_of_struct(def)
                 && arr.size() == static_cast<size_type>(n)) {
                 const size_t M = def->fields.size();
                 const int stride = def->size;
@@ -1173,6 +1174,9 @@ vm_make_struct_array_op(EvalContext &ctx, StructTypeDef *def, int_type base,
             }
         }
         d.put(vm_make_struct_array(def, static_cast<size_t>(n), vals));
+        /* Q2: a flat struct literal is an array<P> (its fused op is
+         * emitted for that destination type only) */
+        stamp_ctype_top(d.get(), annot_array_of_struct(def));
     };
 
     if (total <= 32) {
@@ -1208,6 +1212,7 @@ vm_call_builtin_lv_rest(EvalContext &ctx, const Chunk::BuiltinCall &bc,
     al.args = bc.args.data();
     al.nargs = bc.args.size();
     al.arr_hint = bc.arr_hint;
+    al.ctype = bc.ctype;
     if (n_rest <= 8) {
         SmallArgs<8> stackbuf;                        /* #97 B1 */
         for (int_type i = 0; i < n_rest; i++)
@@ -5249,11 +5254,12 @@ extern "C" int jit_make_closure(int_type dst, const void *defv) noexcept
  * lives in vm_make_array's frame ON PURPOSE (see that helper) - never inline it
  * into a fragment or vm_run_chunk's recursion-multiplied frame. */
 extern "C" void jit_make_array(int_type dst, int_type base, int_type n,
-                               int_type hint) noexcept
+                               int_type hint, const TypeAnnot *ct) noexcept
 {
     ML_JIT_OP_RAN(MakeArrayV);
     EvalContext *ctx = g_current_ctx;
     EvalValue v = vm_make_array(*ctx, base, n, static_cast<ArrHint>(hint));
+    stamp_ctype_top(v, ct);             /* Q2: the type it is made with */
     ctx->frame->at(dst).put(std::move(v));
 }
 
@@ -5269,12 +5275,13 @@ extern "C" void jit_make_array(int_type dst, int_type base, int_type n,
  * op_fully_native. The pair buffer lives in vm_make_dict's frame ON PURPOSE
  * (the recursion-depth reason - see vm_make_array). */
 extern "C" int jit_make_dict(int_type dst, int_type base,
-                             int_type npairs) noexcept
+                             int_type npairs, const TypeAnnot *ct) noexcept
 {
     ML_JIT_OP_RAN(MakeDictV);
     EvalContext *ctx = g_current_ctx;
     try {
         EvalValue v = vm_make_dict(*ctx, base, npairs);
+        stamp_ctype_top(v, ct);         /* Q2: the type it is made with */
         ctx->frame->at(dst).put(std::move(v));
     } catch (RuntimeException &e) {
         g_vm_jit_exc.reset(e.clone());
@@ -6929,6 +6936,7 @@ extern "C" int jit_call_builtin(int_type dst, int_type base, int_type n,
     al.args = bc->args.data();
     al.nargs = bc->args.size();
     al.arr_hint = bc->arr_hint;
+    al.ctype = bc->ctype;
     try {
         EvalValue r;
         if (n <= 8) {
@@ -7151,6 +7159,14 @@ extern "C" int jit_store_box(int_type box_slot, int_type val_slot) noexcept
  * re-raise - the same loc_at(pc) caret the interpreted op passes in; a
  * callback's own throw already carries its loc. A PLAIN exception (a
  * callback's UndefinedVariableEx - no clone()) rides g_vm_jit_eptr. */
+/* Q2: give the container MapFilterV just made in `dst` the type it is
+ * made with - a separate call after jit_map_filter, whose six argument
+ * registers are taken. Never throws. */
+extern "C" void jit_stamp_ctype(int_type dst, const TypeAnnot *ct) noexcept
+{
+    stamp_ctype(g_current_ctx->frame->at(dst).get(), ct);
+}
+
 extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
                               int_type dst, int_type is_map,
                               int_type site, int_type cend) noexcept
@@ -7261,6 +7277,7 @@ extern "C" int jit_call_builtin_lv(int_type kind, int_type arg0_slot,
             al.args = bc->args.data();
             al.nargs = bc->args.size();
             al.arr_hint = bc->arr_hint;
+            al.ctype = bc->ctype;
             res = bc->builtin.func_lv(ctx, &al, target, nullptr, 0);
         }
         ctx->frame->at(dst_slot).put(std::move(res));
@@ -7376,6 +7393,7 @@ extern "C" int jit_call_builtin_lv_elem(int_type kind, int_type base_slot,
         al.args = bc->args.data();
         al.nargs = bc->args.size();
         al.arr_hint = bc->arr_hint;
+        al.ctype = bc->ctype;
         ctx->frame->at(dst_slot).put(
             bc->builtin.func_lv(ctx, &al, elem,
                                 n_rest ? restbuf.data() : nullptr,
@@ -7432,6 +7450,7 @@ extern "C" int jit_call_builtin_lv_member(int_type kind, int_type base_slot,
         al.args = bc->args.data();
         al.nargs = bc->args.size();
         al.arr_hint = bc->arr_hint;
+        al.ctype = bc->ctype;
         ctx->frame->at(dst_slot).put(
             bc->builtin.func_lv(ctx, &al, field,
                                 n_rest ? restbuf.data() : nullptr,
@@ -10604,6 +10623,7 @@ extern "C" int jit_call_value_generic(int_type dst_callee, int_type argbase,
     al.args = cs.args.data();
     al.nargs = cs.args.size();
     al.arr_hint = cs.arr_hint;
+    al.ctype = cs.ctype;
 
     const EvalValue &callee = ctx.frame->at(callee_slot).get();
 
@@ -13146,7 +13166,12 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * multiplied by VM recursion depth). `target2` = the ArrHint; never
              * throws. */
             ctx.frame->at(in->target).put(vm_make_array(
-                ctx, in->a_lit(), in->b_lit(), static_cast<ArrHint>(in->target2)));
+                ctx, in->a_lit(), in->b_lit(),
+                static_cast<ArrHint>(in->target2 & 0xff)));
+            /* Q2: the type it is made with (target2's high bits) */
+            stamp_ctype_top(ctx.frame->at(in->target).get(),
+                        chunk->ctype_ref(
+                            static_cast<unsigned>(in->target2) >> 8));
             pc++;
         }
         VM_NEXT;
@@ -13165,6 +13190,9 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                 vm_stamp_loc(*chunk, pc, e);
                 throw;
             }
+            stamp_ctype_top(ctx.frame->at(in->target).get(),   /* Q2 */
+                            chunk->ctype_ref(
+                                static_cast<unsigned>(in->target2)));
             pc++;
         }
         VM_NEXT;
@@ -13942,6 +13970,9 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
                                   ctx.frame->at(in->b_slot()).get(),
                                   (in->target2 & 1) != 0, s, en, s,
                                   static_cast<int>((in->target2 >> 1) & 3)));
+                stamp_ctype(ctx.frame->at(in->target).get(),     /* Q2 */
+                            chunk->ctype_ref(
+                                static_cast<unsigned>(in->target2) >> 3));
             } catch (Exception &e) { /* INT-COV-EXEMPT: its type test */
                 /* a loc-less escape is a callback's BIND refusing an
                  * element: the argument list's caret (base_locs), the
