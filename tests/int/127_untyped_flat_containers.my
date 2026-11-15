@@ -56,6 +56,13 @@ try { insert(af, 0, "s"); } catch (TypeErrorEx) { refused++; }
 assert(refused == 9);
 assert(len(ai) == 5 && len(af) == 6 && len(ab) == 4);
 
+# false widens as true does
+ai[3] = false;
+af[3] = false;
+insert(ai, 0, false);
+insert(af, 0, true);
+assert(ai[0] == 0 && ai[4] == 0 && af[0] == 1.0 && af[4] == 0.0);
+
 # an empty slice of an untyped array is an untyped array too
 var dyn es = ai[10:20];
 append(es, "s");
