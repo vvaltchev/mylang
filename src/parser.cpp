@@ -1076,8 +1076,11 @@ declare_captured_const_scalars(ParseContext &c, IdList *caps)
         const bool is_fn = lit != nullptr;   /* a builtin: a `dyn` value */
         if (!lit)
             MakeConstructFromConstVal(lv->get(), lit);
-        if (!lit)
-            continue;
+        /* every value a const keeps no run-time symbol for has a
+         * literal: a scalar, a string, none (a builtin was handled
+         * above, and a struct's descriptor - a TYPE ALIAS's value - is
+         * kept since 2026-11-15) */
+        ML_CHECK(lit);
         ML_CHECK(!c.cap_const_decls.empty());
         auto &done = c.cap_const_decls.back();
         if (std::find(done.begin(), done.end(), cap->uid) != done.end())
@@ -2671,7 +2674,8 @@ static void
 alias_literal(ParseContext &c, unique_ptr<Construct> &node,
               const EvalValue *value = nullptr)
 {
-    if (!node || node_cast<LiteralObj>(node.get()))
+    ML_CHECK(node);
+    if (node_cast<LiteralObj>(node.get()))
         return;
     /* the value the declaration already bound, when the caller has it: a
      * second evaluation of a constant call is work and nothing else */

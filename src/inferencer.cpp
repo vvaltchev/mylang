@@ -4713,10 +4713,12 @@ static const StructTypeDef *alias_struct_of(const Construct *rv, size_t i,
  * TypeSym::struct_type). Its value, a descriptor, is `dyn` like S's. */
 void Inferencer::bind_type_aliases(Expr14 *e14)
 {
+    /* declare_target has just bound every target that is not `_` */
     auto bind = [&](Identifier *id, const StructTypeDef *def) {
-        auto it = id_sym.find(id);
-        if (!def || it == id_sym.end() || !it->second)
+        if (!def)
             return;
+        auto it = id_sym.find(id);
+        ML_CHECK(it != id_sym.end() && it->second);
         it->second->struct_type = def;
         it->second->type = A.dyn_ty();
     };
@@ -4725,10 +4727,12 @@ void Inferencer::bind_type_aliases(Expr14 *e14)
         bind(id, alias_struct_of(rv, 0, false));
         return;
     }
-    if (auto *idl = node_cast<IdList>(e14->lvalue.get()))
-        for (size_t i = 0; i < idl->elems.size(); i++)
-            if (!idl->elems[i]->is_underscore())
-                bind(idl->elems[i].get(), alias_struct_of(rv, i, true));
+    /* a declaration's target is a name or a list of names */
+    ML_CHECK(ctag(e14->lvalue.get()) == ConstructType::idlist);
+    auto *idl = static_cast<IdList *>(e14->lvalue.get());
+    for (size_t i = 0; i < idl->elems.size(); i++)
+        if (!idl->elems[i]->is_underscore())
+            bind(idl->elems[i].get(), alias_struct_of(rv, i, true));
 }
 
 void Inferencer::declare_target(Construct *lvalue, Scope *s, bool is_const)
