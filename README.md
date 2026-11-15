@@ -2972,7 +2972,15 @@ alias, a `pure` call returning one), and an alias may be declared inside a
 function like any `const`. A parameter, a loop or catch variable or a
 capture named like the alias hides it. A hidden alias in a type position or
 in a catch clause is an error (`'P' is not a type here: ...`): no struct is
-named `P`, so such a clause could never match.
+named `P`, so such a clause could never match. A binding named like the
+*struct* does not hide the alias: inside `func f(Point)`, `P p;` still
+declares a `Point`.
+
+An alias is a `const`, so it exists once its declaration has run, where a
+struct's own name can be used above its declaration. A construction through
+the alias that runs earlier - in a function called above `const P = Point;`
+- raises `UnboundSymbolEx`, as a read of any other global does (and is a
+compile error when the call can only fail).
 
 ### Classes
 

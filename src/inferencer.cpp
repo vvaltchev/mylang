@@ -164,6 +164,10 @@ struct TypeSym {
     /* non-null when this name is a struct TYPE (a `struct` decl): the symbol is
      * a type descriptor, callable (construction) + `.CONST`-accessible. */
     const StructTypeDef *struct_type = nullptr;
+    /* ...and it is a TYPE ALIAS (`const T = S;`), not the struct's own
+     * declaration: a const, bound where its declaration runs (a
+     * construction through it stamps CallExpr::ctor_alias) */
+    bool type_alias = false;
 };
 
 struct FuncInfo {
@@ -4619,6 +4623,14 @@ StaticTypeRef Inferencer::field_static_type(const FieldDef &fd)
             base = A.dict_of(A.dyn_ty(), A.dyn_ty()); break;
         case FieldKind::f_dyn:    base = A.dyn_ty();   break;
         case FieldKind::f_struct: {
+            /* the struct the parser resolved the field's type to, when
+             * it was declared above (by identity: a name may be hidden,
+             * or be another struct's in this scope); a forward
+             * reference is found by name */
+            if (fd.struct_def) {
+                base = A.struct_ty(fd.struct_def, fd.struct_def->name);
+                break;
+            }
             auto it = struct_by_name.find(fd.struct_ty);
             base = (it != struct_by_name.end())
                        ? A.struct_ty(it->second, fd.struct_ty)
@@ -4720,6 +4732,7 @@ void Inferencer::bind_type_aliases(Expr14 *e14)
         auto it = id_sym.find(id);
         ML_CHECK(it != id_sym.end() && it->second);
         it->second->struct_type = def;
+        it->second->type_alias = true;
         it->second->type = A.dyn_ty();
     };
     Construct *rv = e14->rvalue.get();
@@ -8236,6 +8249,7 @@ void Inferencer::check_call(CallExpr *call)
         auto it = id_sym.find(cid);
         if (it != id_sym.end() && it->second && it->second->struct_type) {
             check_struct_construction(call, it->second->struct_type);
+            call->ctor_alias = it->second->type_alias;
             return;
         }
     }
@@ -10235,6 +10249,14 @@ std::string ReplInfer::func_return_type(const FuncDeclStmt *fn)
 bool ReplInfer::instance_has_consumer(const FuncDeclStmt *fn)
 {
     return impl->inf.instance_has_consumer(fn);
+}
+
+/* The exported form of alias_struct_of (inferencer.h): the resolver's
+ * warning tier asks it which top-level constants are type aliases. */
+const StructTypeDef *type_alias_struct(const Construct *rv, size_t i,
+                                       bool element)
+{
+    return alias_struct_of(rv, i, element);
 }
 
 /* The exported COMPLETE child visitor (inferencer.h) - a thin wrapper over

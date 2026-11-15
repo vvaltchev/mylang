@@ -60,6 +60,38 @@ pure func mk(x) => T(x);
 const cm = mk(11);
 want("...through a function", cm, mk(int(runtime(11))));
 
+/* a struct field's type: the struct, not a `dyn` (its use in typed code
+ * was refused), and POD where the struct is */
+struct FW { T s; int n; C c; }
+const D0 = C;
+struct FD { D0 c; D0? oc; array<T> ts; }
+var fw = FW(T(int(runtime(1))), 2, D0(3));
+var fk = fw.s.a + fw.c.v;
+want("a field's type", fk, 4);
+want("...in the layout", layout(FW).fields[0].type, "S");
+var fd = FD(D0(5), none, [T(6)]);
+want("...of a class, and an optional one", str([fd.c.v, fd.oc, fd.ts]),
+     "[5, <none>, [S(a: 6)]]");
+struct FP { T s; int n; }
+want("...POD like the struct", array_storage([FP(T(1), 2)]), "struct");
+
+/* ...nor its zero value: `T t;` is the constructor call, and it names
+ * the alias where the struct's own name is hidden or not in scope */
+struct O { S s; int n; }
+const TO = O;
+func zero(S) { T t; t.a = S; box<T> b; b.a = S + 1; return [t, *b]; }
+want("a zero value under a hidden struct name", str(zero(5)),
+     "[S(a: 5), S(a: 6)]");
+func zero_nested(O) { TO o; o.n = O; return o; }
+want("...with a nested field", str(zero_nested(7)), "O(s: S(a: 0), n: 7)");
+pure func local_struct() { struct Q { int a; } return Q; }
+const QT = local_struct();
+QT q0;
+box<QT> bq;
+func bump(QT p) { QT z; z.a = p.a + 1; return z; }
+want("an alias of a struct declared in a function",
+     str([q0, *bq, bump(q0), QT(7)]), "[Q(a: 0), Q(a: 0), Q(a: 1), Q(a: 7)]");
+
 var cap = func [T] () => T(12);
 want("a captured alias", cap(), S(12));
 
@@ -72,7 +104,9 @@ want("a class alias makes references", x.v, 13);
 var caught = 0;
 try { throw T(14); } catch (S as e) { caught += e.a; }
 try { throw S(15); } catch (T as e) { caught += e.a; }
-try { throw P(16); } catch (T) { caught = -1; } catch (P as e) { caught += e.b; }
+try { throw P(16); }
+catch (T) { caught = -1; }
+catch (P as e) { caught += e.b; }
 want("catch clauses", caught, 14 + 15 + 16);
 
 assert(bad == 0);

@@ -2010,12 +2010,8 @@ private:
                     funcs[fd->id->uid] = fd;
                 continue;
             }
-            if (ctag(e) == ConstructType::struct_decl) {
-                auto *sd = static_cast<StructDeclStmt *>(e);
-                if (sd->id)
-                    structs.insert(sd->id->uid);
+            if (ctag(e) == ConstructType::struct_decl)
                 continue;
-            }
             auto *ex = node_cast<Expr14>(e);
             if (!ex || !(ex->fl & pFlags::pInDecl))
                 continue;
@@ -2023,6 +2019,47 @@ private:
             if (lv && lv->sym.kind == SymKind::global)
                 decls.emplace(lv->uid, i);
         }
+        collect_struct_names(rb, structs);
+    }
+
+    /* Every name the program declares a struct under - a `struct` /
+     * `class` declaration, or a TYPE ALIAS (`const T = S;`: `T(1)` is a
+     * construction, as `S(1)` is) - at any depth: one declared inside a
+     * function is constructed there. By NAME, like the set's other
+     * readers; a binding that hides one costs a "might" warning, never
+     * an answer. Left to the top-level `struct` declarations, every
+     * construction through an alias, or of a struct declared in a
+     * function, was "a callee we cannot analyse", and a program with one
+     * global declared below a call got the "might fail" warning at
+     * every call reaching such a construction (until 2026-11-15). */
+    static void collect_struct_names(Construct *n, NameSet &structs)
+    {
+        if (!n)
+            return;
+        if (auto *sd = node_cast<StructDeclStmt>(n)) {
+            if (sd->id)
+                structs.insert(sd->id->uid);
+            return;
+        }
+        auto *ex = node_cast<Expr14>(n);
+        if (ex && (ex->fl & pFlags::pInConstDecl)) {
+            Construct *rv = ex->rvalue.get();
+            if (auto *lv = node_cast<Identifier>(ex->lvalue.get())) {
+                if (type_alias_struct(rv, 0, false))
+                    structs.insert(lv->uid);
+            } else {
+                /* a declaration's target is a name or a list of names */
+                ML_CHECK(ctag(ex->lvalue.get()) == ConstructType::idlist);
+                auto *il = static_cast<IdList *>(ex->lvalue.get());
+                for (size_t k = 0; k < il->elems.size(); k++)
+                    if (!il->elems[k]->is_underscore()
+                            && type_alias_struct(rv, k, true))
+                        structs.insert(il->elems[k]->uid);
+            }
+        }
+        for_each_child_of(n, [&](Construct *ch) {
+            collect_struct_names(ch, structs);
+        });
     }
 
     /*

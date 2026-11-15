@@ -524,8 +524,11 @@ bool pod_ctor_arg_safe(const Construct *a, const FieldDef &fd)
 {
     if (fd.kind == FieldKind::f_struct) {
         const CallExpr *ce = node_cast<const CallExpr>(a);
+        /* by identity: a struct field of a POD struct is embedded, so
+         * the parser resolved its type (FieldDef::struct_def) - and the
+         * field's written name may be a TYPE ALIAS of that struct */
         return ce && ce->vm_struct_ctor_def
-            && ce->vm_struct_ctor_def->name == fd.struct_ty;
+            && ce->vm_struct_ctor_def == fd.struct_def;
     }
     return is_typed_scalar_arg(a);
 }
@@ -845,12 +848,43 @@ struct Codegen {
                 ops[i].inl = n->inline_ctx;
     }
 
+    /* A struct construction through a TYPE ALIAS that is a GLOBAL
+     * (`const T = S;` then `T(1)` in a function): the ctor ops build S's
+     * instance from the stamped def and never read T, but T is a const
+     * that binds where its declaration runs. So T is read first - a
+     * LoadGlobalV, before the arguments, as the tree-walker evaluates the
+     * callee - and a construction that runs before the declaration did
+     * raises UnboundSymbolEx at the callee's caret in every engine (the
+     * VM built the instance until 2026-11-15, RULE 2). A struct's own
+     * name binds at scope entry, and a local or captured alias is read
+     * only after its declaration (the TDZ): neither needs it. */
+    void emit_ctor_guard(const Construct *e, std::vector<CgInstr> &ops)
+    {
+        const CallExpr *ce = node_cast<const CallExpr>(e);
+        if (!ce || !ce->ctor_alias)
+            return;
+        /* the inferencer stamps ctor_alias off the callee's symbol */
+        ML_CHECK(ctag(ce->what.get()) == ConstructType::id);
+        const Identifier *callee =
+            static_cast<const Identifier *>(ce->what.get());
+        if (callee->sym.kind != SymKind::global)
+            return;
+        int t;
+        const bool ok = compile_boxed_expr(callee, t, ops);
+        ML_CHECK(ok);       /* the read of a name always lowers */
+        (void)ok;
+    }
+
     bool compile_boxed_expr(const Construct *e, int &out_slot,
                             std::vector<CgInstr> &ops,
                             bool allow_typed = true,
                             bool truthy_only = false)
     {
         const size_t mark = ops.size();
+        /* (a guarded construction always lowers - the constructor ops
+         * take any argument that lowers at all - so no decline has a
+         * guard's read to take back) */
+        emit_ctor_guard(e, ops);
         const bool ok = compile_boxed_expr_impl(e, out_slot, ops,
                                                 allow_typed, truthy_only);
         if (ok)
@@ -1546,6 +1580,8 @@ struct Codegen {
         for (int i = 0; i < n; i++) {
             const CallExpr *ce =
                 static_cast<const CallExpr *>(la->elems[i].get());
+            /* a global type alias is read before its element's fields */
+            emit_ctor_guard(ce, ops);
             for (int j = 0; j < M; j++)
                 if (!compile_to_run_slot(ce->args->elems[j].get(),
                                          base + i * M + j, ops)) {
@@ -4921,6 +4957,11 @@ struct Codegen {
                 node_cast<const CallExpr>(dc->args->elems[1].get());
             if (ctor && ctor->vm_struct_ctor_def && ctor->args) {
                 int fieldbase;
+                /* a global type alias is read before the fields; a
+                 * decline below takes the read back */
+                const size_t gmark = ops.size();
+                const int gtop = next_temp;
+                emit_ctor_guard(ctor, ops);
                 if (emit_args_range(ctor->args->elems, fieldbase, ops)) {
                     /* Pool the ctor def + carets (AST-free op): the container
                      * arg's caret, the per-field coerce carets, the callee
@@ -4962,6 +5003,8 @@ struct Codegen {
                 }
                 /* a field arg didn't lower -> fall through to CallBuiltinLV
                  * (append self-evals the ctor node = construct-in-place). */
+                ops.resize(gmark);
+                next_temp = gtop;
             }
         }
 

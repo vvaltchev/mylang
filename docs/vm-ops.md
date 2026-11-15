@@ -471,7 +471,14 @@ and no per-arg loc is needed; a **nested POD-struct-field arg** (`L(P(1,2),
 P(3,4))`) is accepted too (`pod_ctor_arg_safe`: the nested `StructCtorV`
 produces exactly that struct type, so the parent's `coerce` can't throw), while
 a `dyn` arg falls back to the tree-walker, which reports the exact arg loc (the
-`append`-fused ctor is `EmplaceStruct`). A **BOXED (non-POD) construction**
+`append`-fused ctor is `EmplaceStruct`). **A construction through a GLOBAL
+type alias** (`const T = S;` then `T(x)`, `CallExpr::ctor_alias`) is preceded
+by a `LoadGlobalV` of the alias, before its arguments - for every
+constructor form here, each element of a `MakeStructArrayV` literal and an
+`EmplaceStruct`'s fields: the ctor ops never read their callee, and an alias
+is a const that binds where its declaration runs, so the read is what raises
+`UnboundSymbolEx` for a construction that runs before it (`emit_ctor_guard`).
+A **BOXED (non-POD) construction**
 `B(a, x)` with runtime args — an `array`/`dyn`/`opt` field makes B boxed (a
 const-arg one folds to a `LiteralObj`) — is **`StructCtorBoxedV`**
 (`CallExpr::vm_struct_boxed_def`, copied onto the `DirectCallExpr` in
