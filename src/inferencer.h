@@ -79,6 +79,17 @@ extern int g_value_cands_max;
 void for_each_child_of(Construct *c,
                        const std::function<void (Construct *)> &f);
 
+/* The struct a TYPE ALIAS's initializer names (`const T = S;`, README
+ * *Type aliases*): `rv` is a constant declaration's initializer as the
+ * parser left it - a literal of the descriptor, or for a
+ * multi-declaration (`element`) its i-th element. Null for any other
+ * value. The inferencer binds the alias's symbol from it, and the
+ * resolver's warning tier reads it to know a construction through an
+ * alias is no call it cannot analyse. */
+struct StructTypeDef;
+const StructTypeDef *type_alias_struct(const Construct *rv, size_t i,
+                                       bool element);
+
 /*
  * M8 specialization pass: rewrite hot scalar expression nodes (int/float
  * arithmetic, comparison, logical, unary) that infer_types proved are typed

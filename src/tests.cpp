@@ -17156,6 +17156,123 @@ static const std::vector<test> tests =
       { "struct S { int a; } const T = S; func f(T) {",
         " try { throw S(1); } catch (T) { print(1); } } f(2);" },
       &typeid(SyntaxErrorEx), 29, 2 },
+    /* an alias is a CONST: it binds where its declaration runs (a
+     * struct's own name binds at scope entry). The VM's constructor ops
+     * build the instance from the def inference stamped and never read
+     * the callee, so a construction that ran BEFORE `const T = S;` built
+     * one where the tree-walker raised UnboundSymbolEx (RULE 2): a
+     * global alias is read first now (CallExpr::ctor_alias, codegen's
+     * emit_ctor_guard) - by the planned and the checked constructor, by
+     * each element of a struct-array literal and by an append's
+     * constructor in place. The arguments are run-time values and each
+     * result is held in a variable, so no call is folded or tail-inlined
+     * away. */
+    {
+        "type alias: a construction that runs before the alias is bound",
+        {
+            "struct S { int a; }",
+            "struct W { S s; int n; }",
+            "struct B { array<int> v; int n; }",
+            "func mk(x) { var r = T(x); return r; }",
+            "func mka(x) { var a = [T(x), T(x + 1)]; return len(a); }",
+            "func mke(x) { array<S> a = []; append(a, T(x));",
+            "              return len(a); }",
+            "func mkn(x) { var w = W(T(x), x); return w.n; }",
+            "func mkb(x) { var b = TB([x], x); return b.n; }",
+            "func rt(int k) => int(runtime(k));",
+            "var n = 0;",
+            "try { if (rt(1) > 0) mk(rt(1)); }",
+            "catch (UnboundSymbolEx) { n += 1; }",
+            "try { if (rt(1) > 0) mka(rt(1)); }",
+            "catch (UnboundSymbolEx) { n += 10; }",
+            "try { if (rt(1) > 0) mke(rt(1)); }",
+            "catch (UnboundSymbolEx) { n += 100; }",
+            "try { if (rt(1) > 0) mkn(rt(1)); }",
+            "catch (UnboundSymbolEx) { n += 1000; }",
+            "try { if (rt(1) > 0) mkb(rt(1)); }",
+            "catch (UnboundSymbolEx) { n += 10000; }",
+            "const T = S;",
+            "const TB = B;",
+            "assert(n == 11111);",
+            "assert(mk(rt(2)) == S(2) && mka(rt(1)) == 2);",
+            "assert(mke(rt(1)) == 1 && mkn(rt(4)) == 4 && mkb(rt(5)) == 5);",
+        },
+    },
+    /* a struct FIELD's type written through an alias: the field kept
+     * the name `T`, which names no struct, so the inferencer (asking by
+     * name) typed it `dyn` - `var k = w.s.a + 1` was refused,
+     * DynRequiredEx - and layout() showed a type `T`. The field's type
+     * is the struct the parser resolved, by identity. */
+    {
+        "type alias: a struct field typed through it",
+        {
+            "struct S { int a; }",
+            "class C { int v; }",
+            "const T = S;",
+            "const D = C;",
+            "struct W { T s; int n; D c; D? oc; }",
+            "struct WP { T s; int n; }",
+            "var w = W(T(int(runtime(1))), 2, D(3));",
+            "var k = w.s.a + 1;",
+            "var v = w.c.v + 1;",
+            "assert(k == 2 && v == 4 && w.oc == none);",
+            "assert(typestr(w.s) == \"S\" && typestr(w.c) == \"C\");",
+            "assert(typestr(w.oc) == \"C?\");",
+            "assert(layout(W).fields[0].type == \"S\");",
+            "assert(layout(W).fields[2].type == \"C\");",
+            "var ps = [WP(T(int(runtime(1))), 2), WP(S(3), 4)];",
+            "assert(layout(WP).pod && array_storage(ps) == \"struct\");",
+            "assert(ps[1].s.a + ps[0].n == 5);",
+            /* ...by identity: another struct of the same name, declared
+             * in another function, is not the field's type */
+            "pure func pick() { struct Q { str z; } return Q; }",
+            "const QT = pick();",
+            "struct WQ { QT q; int n; }",
+            "func other() { struct Q { int a; }",
+            "               var r = Q(int(runtime(1))); return r.a; }",
+            "var wq = WQ(QT(\"s\"), 1);",
+            "var z = wq.q.z + \"!\";",
+            "assert(z == \"s!\" && other() == 1);",
+        },
+    },
+    /* `T t;` is the constructor call `T(<zeros>)`, resolved by name like
+     * a written one - and it was built with the STRUCT's name, which a
+     * binding may hide where the alias declares the variable ("'S' is
+     * not callable"), or which may not be in scope at all (an alias of a
+     * struct declared inside a pure function: "Undefined variable"). It
+     * names the alias there (the parser's struct_name_here); a box<T>'s
+     * zero value and a nested POD field's go through the same call. */
+    {
+        "type alias: a zero value where the struct's own name is hidden",
+        {
+            "struct S { int a; }",
+            "struct O { S s; int n; }",
+            "const T = S;",
+            "const TO = O;",
+            "func f(S) { T t; t.a = S; box<T> b; b.a = S + 1;",
+            "            return [t, *b]; }",
+            "func g(O) { TO o; o.n = O; return o; }",
+            "assert(str(f(5)) == \"[S(a: 5), S(a: 6)]\");",
+            "assert(str(g(7)) == \"O(s: S(a: 0), n: 7)\");",
+            "pure func pick() { struct Q { int a; } return Q; }",
+            "const QT = pick();",
+            "QT q;",
+            "box<QT> bq;",
+            "func h(QT p) { QT z; z.a = p.a + 1; return z; }",
+            "assert(str([q, *bq, h(q)]) == \"[Q(a: 0), Q(a: 0), Q(a: 1)]\");",
+        },
+    },
+
+    /* THE LIMIT of that rule, pinned so it is visible: a NESTED field's
+     * zero value is a constructor call by the field struct's name too,
+     * and with no alias to name it instead, a binding that hides the name
+     * takes the call. Refused in every mode (the same error since nested
+     * zero values exist); it wants a callee that names a definition, not
+     * a name - a maintainer decision. */
+    { "err loc: a nested zero value under a hidden struct name (limit)",
+      { "struct In { int x; } struct Out { In i; }",
+        "func f(In) { Out o; return o; } f(1);" },
+      &typeid(TypeMismatchEx), 18, 2, 20, 2 },
 
     /* the parser decides a `??` whose left side is a constant and keeps
      * that side alone; kept as a NODE (a deferred call), its own type may
@@ -26000,6 +26117,24 @@ static bool unbound_call_warnings()
           { "struct P { int x; }",
             "func fetch() { return g; }",
             "var p = P(1);",
+            "var g = 5;" }, 0 },
+        { /* a TYPE ALIAS names a struct: `T(1)` constructs, as `P(1)`
+           * does - single, each target of a multi-declaration, and one
+           * declared inside a function, like a struct declared there */
+          "a construction through a type alias is not an unknown callee",
+          { "struct P { int x; }",
+            "struct Q { int y; }",
+            "const T = P;",
+            "const A, B = [P, Q];",
+            "const _, C, K = [P, Q, [1]];",
+            "func fetch() { return g; }",
+            "func mk(v) { var r = [T(v).x, A(v).x, B(v).y, C(v).y, K[0]];",
+            "             return r; }",
+            "func loc(v) { const L = P; struct Z { int z; }",
+            "              const M, N = Z; var r = L(v).x + Z(v).z",
+            "                               + M(v).z + N(v).z; return r; }",
+            "var p = mk(int(runtime(1)));",
+            "var q = loc(int(runtime(1)));",
             "var g = 5;" }, 0 },
         { "no later global is READ anywhere, so nothing to warn about",
           { /* the callee is just as unknown, but no function reads `g` -

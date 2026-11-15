@@ -1064,6 +1064,15 @@ public:
      * falling back to the tree-walker's construct_struct. */
     const StructTypeDef *vm_struct_boxed_def = nullptr;
 
+    /* A struct construction whose callee is a TYPE ALIAS (`const T = S;`
+     * then `T(1)`): the construction is typed and lowered as S's, but the
+     * call names T, a const that binds where its declaration runs. When T
+     * is a GLOBAL the VM reads it before the arguments (codegen's
+     * emit_ctor_guard), so a construction that runs before `const T = S;`
+     * did raises UnboundSymbolEx as the tree-walker's read of the callee
+     * does - a struct's own name binds at scope entry and needs none. */
+    bool ctor_alias = false;
+
     /*
      * #116 increment 4: THE SINGLE FUNCTION THIS CALL CAN REACH, or null
      * when the callee-set analysis cannot name one (⊤, more than one
@@ -1295,6 +1304,7 @@ public:
         d.vm_struct_ctor_def = vm_struct_ctor_def;
         d.vm_len_kind = vm_len_kind;
         d.vm_struct_boxed_def = vm_struct_boxed_def;
+        d.ctor_alias = ctor_alias;
         d.vm_dyn_callee = vm_dyn_callee;
         d.tq_folded = tq_folded;
         d.callable_arg_mask = callable_arg_mask;

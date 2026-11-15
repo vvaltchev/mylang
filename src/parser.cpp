@@ -694,6 +694,44 @@ zero_box_init(ParseContext &c, const TypeAnnot *a, Loc loc, Loc end)
 }
 
 /*
+ * The name a zero-value constructor call uses for `def` at this point of
+ * the parse: the struct's own name where it names `def` here, else a TYPE
+ * ALIAS that does. The call is resolved by NAME like a written one, and
+ * the struct's own name may be hidden or out of scope where an alias
+ * declares the variable: `const T = S; func f(S) { T t; }` called the
+ * PARAMETER ("'S' is not callable"), and an alias of a struct declared
+ * inside a pure function named nothing at all (until 2026-11-15). The
+ * innermost scope's aliases first, and the smallest name of several, so
+ * the choice does not depend on a map's order. With none - a nested
+ * field's struct whose name is hidden - the struct's own name, as before.
+ */
+static const UniqueId *
+struct_name_here(ParseContext &c, const StructTypeDef *def)
+{
+    if (lookup_struct_type(c, def->name->val) == def)
+        return def->name;
+    for (EvalContext *x = c.const_ctx; x; x = x->parent) {
+        std::vector<std::pair<const UniqueId *, const LValue *>> syms;
+        x->collect_symbols(syms);
+        const UniqueId *best = nullptr;
+        for (const auto &s : syms) {
+            const EvalValue &v = s.second->get();
+            if (!v.is<StructTypeDef *>() || v.get<StructTypeDef *>() != def)
+                continue;
+            /* ...that names it HERE: not hidden by a binding, nor by an
+             * inner constant of the same name */
+            if (lookup_struct_type(c, s.first->val) != def)
+                continue;
+            if (!best || s.first->val < best->val)
+                best = s.first;
+        }
+        if (best)
+            return best;
+    }
+    return def->name;
+}
+
+/*
  * Zero-initialize a struct (for `A obj;`): build the constructor call
  * `A(<zero per field>)`, applying the same zero-value rules as every other type
  * - 0 / 0.0 / false / "" / [] / {} per field kind, `none` for an `opt` field,
@@ -752,7 +790,7 @@ build_zero_struct_init(ParseContext &c, const StructTypeDef *def, Loc loc,
         args->elems.push_back(std::move(a));
     }
 
-    auto callee = make_unique<Identifier>(def->name->val);
+    auto callee = make_unique<Identifier>(struct_name_here(c, def)->val);
     callee->start = loc;
     callee->end = end;
 
@@ -4382,6 +4420,14 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                         fd.struct_def = dv.get<StructTypeDef *>();
                 }
             }
+            /* ...and the field's type is that struct, under its own
+             * name: written through a TYPE ALIAS (`const T = S;` then
+             * `T s;`) the field kept the name `T`, which names no struct
+             * - the inferencer, asking by name, typed it `dyn` (`var k =
+             * w.s.a + 1` was refused, DynRequiredEx) and layout() / -vd
+             * showed a type `T` (until 2026-11-15) */
+            if (fd.struct_def)
+                fd.struct_ty = fd.struct_def->name;
             c++;
         } else {
             throw SyntaxErrorEx(c.get_loc(),

@@ -7611,8 +7611,34 @@ but the per-element `StructObject` allocation is gone (build overhead
   literal-argument stamps - treats T as S; and **a catch clause names the
   struct** (`catch (T)` is rewritten to `catch (S)`: a clause matches by
   the struct's name), refused like a type position when a binding hides
-  the alias (`const_struct_binding`). Net:
-  `tests/functional/120_type_alias.my`, the `type alias` `-rt` entries.
+  the alias (`const_struct_binding`). Four more, each a bug until the
+  review of that change: **a construction through a GLOBAL alias reads it
+  first in the VM** (`CallExpr::ctor_alias`, stamped from
+  `TypeSym::type_alias`; codegen's `emit_ctor_guard`, a LoadGlobalV before
+  the arguments - in `compile_boxed_expr` for the planned and checked
+  constructors, per element of a struct-array literal, before an
+  append's in-place fields): the ctor ops build from the stamped def and
+  never read the callee, so a construction that ran before `const T = S;`
+  built an instance where the tree-walker raised UnboundSymbolEx (RULE
+  2). A struct's own name binds at scope entry and a local or captured
+  alias is read only after its declaration, so neither is guarded - **a
+  new lowering that consumes a constructor call without going through
+  `compile_boxed_expr` must emit the guard itself**. **A zero value's
+  constructor call names the alias where the struct's own name does not
+  name the struct** (`struct_name_here`, parser.cpp): `T t;` is `S(0)` by
+  name, and inside `func f(S)`, or for an alias of a struct declared in a
+  pure function, `S` is a parameter or nothing at all. **And the
+  warning tier's struct names are every struct and alias declared at any
+  depth** (`collect_struct_names`, resolver.cpp, by name): a construction
+  through an alias, or of a struct declared in a function, was "a callee
+  we cannot analyse" and drew the "might fail" warning. **A struct
+  field written through an alias (`T s;`) is S's field**: the field
+  parser stores the resolved struct's own name (`FieldDef::struct_ty`),
+  and `field_static_type` asks `struct_def` first (`pod_ctor_arg_safe`
+  asks nothing else) - by the written name the field was `dyn` and typed
+  code using it was refused. Net:
+  `tests/functional/120_type_alias.my`, the `type alias` `-rt` entries,
+  a row of `unbound_call_warnings`.
 - **⛔ A STRUCT IS A VALUE (maintainer, 2026-10-08;
   plans/struct-value-semantics.md).** Every copy is independent and SHALLOW
   (an array / dict field stays a shared reference); until then an
