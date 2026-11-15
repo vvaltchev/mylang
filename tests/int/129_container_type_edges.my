@@ -1,0 +1,36 @@
+# INT-ENGINES: default nj tw
+#
+# INT unit (#107, Q2): edges of a container's own type -
+#  - an array of reflection values is an array<Type>, a type naming a
+#    struct of the BINARY, which an image stores by its reserved number
+#    (driver_checks' round trip of this program);
+#  - a store through `dyn` that the COMPILER runs (a pure function
+#    called in a constant) is checked like one at run time;
+#  - a member store `d.k = v` through `dyn` that adds a key checks the
+#    key and the value against the dict's own type.
+var ts = [type(1), type("s")];
+var dyn tsd = ts;
+var r = 0;
+try { append(tsd, 5); } catch (TypeErrorEx) { r++; }
+assert(r == 1 && len(ts) == 2 && ts[1].kind == "str");
+
+pure func fill(int a) {
+    var dyn d = [1, 2];
+    d[0] = a;
+    var dyn m = {"k": 1};
+    m.k = a + 1;
+    return d[0] + m.k;
+}
+const FILLED = fill(3);
+assert(FILLED == 7 && fill(int(runtime(3))) == 7);
+
+dict<str, int> td = {"a": 1};
+var dyn dd = td;
+dd.b = 2;
+r = 0;
+try { dd.c = "s"; } catch (TypeErrorEx) { r++; }
+dict<int, int> ti = {1: 1};
+var dyn di = ti;
+try { di.s = 3; } catch (TypeErrorEx) { r++; }   # a str key for int keys
+assert(r == 2 && str(td) == "{\"a\": 1, \"b\": 2}" && len(ti) == 1);
+print("ok");
