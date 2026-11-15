@@ -1011,6 +1011,33 @@ static const std::vector<test> tests =
         "try { throw E(runtime(1)); }",
         "catch (E as e) { print(e.nope); }" },
       &typeid(TypeMismatchEx), 24, 3, 31, 3 },
+    /* an alias names its struct where the struct's own name does not:
+     * a parameter named like the struct does not hide the alias, and an
+     * alias of a struct a function declared has no other name. The
+     * parser used to rewrite the clause to the struct's own name, which
+     * the inferencer then refused ("'S' is not a type here"). And in a
+     * FUNCTION the alias must be bound before the body is walked. */
+    { "catch: through an alias, where a parameter has the struct's name",
+      { "struct S { int v; }",
+        "const T = S;",
+        "func thr() { throw T(int(runtime(4))); }",
+        "func f(S) { try { thr(); } catch (T as e) { return e.v + S; }",
+        "            return 0; }",
+        "assert(f(int(runtime(3))) == 7);" } },
+    { "catch: through an alias of a struct a function declared",
+      { "pure func mk() { struct P { int v; } return P; }",
+        "const T = mk();",
+        "func thr() { throw T(int(runtime(4))); }",
+        "func f() { try { thr(); } catch (T as e) { return e.v; }",
+        "           return 0; }",
+        "var got = 0;",
+        "try { thr(); } catch (T as e) { got = e.v; }",
+        "assert(got == 4 && f() == 4);" } },
+    { "catch: a hidden alias is no type",
+      { "struct S { int v; }",
+        "const T = S;",
+        "func f(T) { try { } catch (T) { } }" },
+      &typeid(SyntaxErrorEx), 28, 3, 30, 3 },
     /* a built-in exception's name catches no struct, and a box of a
      * struct named like it (which a dyn can throw) is no exception to
      * that: it compared the name whenever the struct was boxed */
@@ -23523,6 +23550,29 @@ static const std::vector<repl_test> repl_tests =
         { "func g25() { throw L25(int(runtime(5))); }", "" },
         { "f25()", "=> 5" },
         { "try { g25(); } catch (dyn as e) { print(e); }", "L25(v: 5)" } } },
+    /* a clause through an alias names the alias's struct: a parameter
+     * named like the struct does not hide it, a redefined struct of that
+     * name is another type (the clause used to be rewritten to the
+     * struct's NAME, so it caught the new struct), and a call the
+     * compiler runs catches by identity too */
+    { "a catch clause through an alias, across inputs",
+      { { "struct S28 { int a; }", "" },
+        { "const T28 = S28", "=> S28" },
+        { "func thr28() { throw T28(int(runtime(6))); }", "" },
+        { "func f28(S28) { try { thr28(); } catch (T28 as e) "
+          "{ return e.a + S28; } return 0; }", "" },
+        { "f28(1)", "=> 7" },
+        { "struct S28 { int a; int b; }", "" },
+        { "func new28() { throw S28(1, int(runtime(2))); }", "" },
+        { "func g28() { try { new28(); } catch (T28) { return \"old\"; } "
+          "catch (S28 as e) { return \"new \" + str(e.b); } }", "" },
+        { "g28()", "=> \"new 2\"" },
+        { "pure func pt28(n) { struct PQ28 { int c; } throw PQ28(n); }",
+          "" },
+        { "pure func pf28(n) { try { pt28(n); } catch (PQ28) { return 1; } "
+          "catch { return 2; } return 0; }", "" },
+        { "const K28 = pf28(1)", "" },
+        { "K28", "=> 2" } } },
     /* a type alias is a const of the REPL's open world: an earlier
      * input's alias constructs, types and names a catch clause later */
     { "a type alias across inputs",

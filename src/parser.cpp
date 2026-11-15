@@ -5752,26 +5752,22 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                         "it reports an error the script must not handle"
                     );
                 }
-                /* a TYPE ALIAS (`const T = S;`) names its struct here too:
-                 * a clause matches the thrown struct by name, and `T` is
-                 * no struct's name (README, *Type aliases*) */
+                /* A name is resolved where the clause is written, by the
+                 * inferencer (resolve_catch_types, question 25) - a TYPE
+                 * ALIAS (`const T = S;`) included, so the name stays as
+                 * written: rewritten to the struct's own name here, a
+                 * clause through an alias was refused wherever that name
+                 * is not the struct (`func f(S) { .. catch (T) .. }`, an
+                 * alias of a struct some function declared). An alias a
+                 * binding of its name hides is refused here, as in any
+                 * type position. */
                 bool hidden = false;
-                const StructTypeDef *sd =
-                    lookup_struct_type(c, ex_id->get_str(), &hidden);
-                /* ...unless a binding of that name hides it, as in any
-                 * type position: no struct is named `T`, so the clause
-                 * could never match */
+                lookup_struct_type(c, ex_id->get_str(), &hidden);
                 if (hidden) {
                     const StructTypeDef *h =
                         const_struct_binding(c, ex_id->uid);
                     if (h->name != ex_id->uid)
                         not_a_type(c, ex_id->get_str(), ex_id->start);
-                }
-                if (sd && sd->name != ex_id->uid) {
-                    auto real = make_unique<Identifier>(sd->name->val);
-                    real->start = ex_id->start;
-                    real->end = ex_id->end;
-                    ex_id = std::move(real);
                 }
             }
 

@@ -7663,9 +7663,14 @@ but the per-element `StructObject` allocation is gone (build overhead
   every target), so every reader of
   `TypeSym::struct_type` - construction, named arguments, `T.CONST`, the
   literal-argument stamps - treats T as S; and **a catch clause names the
-  struct** (`catch (T)` is rewritten to `catch (S)`: a clause matches by
-  the struct's name), refused like a type position when a binding hides
-  the alias (`const_struct_binding`). Four more, each a bug until the
+  struct through that symbol** (`resolve_catch_types`, question 25: the
+  clause keeps the name as written - rewritten to the struct's own name
+  by the parser, as it was until 2026-11-17, `catch (T)` was refused
+  wherever that name is not the struct: inside `func f(S)`, or for an
+  alias of a struct a function declared - and `hoist_globals` binds a
+  top-level alias BEFORE any function body is walked, since functions
+  come first in a block), refused like a type position when a binding
+  hides the alias (`const_struct_binding`). Four more, each a bug until the
   review of that change: **a construction through a GLOBAL alias reads it
   first in the VM** (`CallExpr::ctor_alias`, stamped from
   `TypeSym::type_alias`; codegen's `emit_ctor_guard`, a LoadGlobalV before
@@ -8055,11 +8060,12 @@ and two macros:
   declares yet, which matches by name; in a script such a name is a
   compile error. So a function's private struct is caught outside it only
   by a catch-all, and `catch (dyn as e)` is the catch-all that binds (no
-  exList, an asId). Two rules the first version got wrong (2026-11-17):
+  exList, an asId). Three rules the first version got wrong (2026-11-17):
   **a built-in name catches no struct OBJECT, a `box<P>` included**
   (`exc_struct_def`'s `is_struct`; a box, which a `dyn` can throw, has a
-  null def and compared its struct's name); and **a call the COMPILER
-  runs catches by identity too**: a function run
+  null def and compared its struct's name); **a clause resolves through
+  the name AS WRITTEN** (an alias's symbol - see *A TYPE ALIAS* above);
+  and **a call the COMPILER runs catches by identity too**: a function run
   at parse time may not have been through the inferencer (an untyped run,
   `-nti`, a name a typed copy does not declare), so `do_catch` resolves a
   clause with no def in the const scope chain where it runs
