@@ -9,6 +9,7 @@
 #include <new>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 #include <deque>
 #include "operators.h"
@@ -365,6 +366,41 @@ struct UncatchableRuntimeException : public RuntimeException {
     bool is_catchable() const override { return false; }
 };
 
+/*
+ * TESTS builds: every run-time exception CLASS registers its name and
+ * whether a script may catch it, at static initialization, from its own
+ * declaration - DECL_RUNTIME_EX_BASE for the macro classes, and an
+ * ML_EX_REGISTER line in a class declared by hand. The -rt check
+ * `catch_names_every_builtin_ex` (tests.cpp) compares that registry with
+ * is_catchable_ex_name / is_uncatchable_ex_name, so a new exception class
+ * missing from the right list fails the suite with no list of classes to
+ * keep up to date by hand.
+ */
+#ifdef TESTS
+struct ExTestClass {
+    const char *name;
+    bool catchable;
+};
+
+inline std::vector<ExTestClass> &ex_test_classes()
+{
+    static std::vector<ExTestClass> v;
+    return v;
+}
+
+inline bool ex_test_register(const char *name, bool catchable)
+{
+    ex_test_classes().push_back({name, catchable});
+    return true;
+}
+
+#define ML_EX_REGISTER(name, catchable)                         \
+        static inline const bool ex_test_registered_ =          \
+            ex_test_register(#name, catchable);
+#else
+#define ML_EX_REGISTER(name, catchable)
+#endif
+
 #define DECL_SIMPLE_EX(name, msg)                  \
                                                    \
     struct name : public Exception {               \
@@ -420,6 +456,9 @@ struct UncatchableRuntimeException : public RuntimeException {
         [[ noreturn ]] void rethrow() const override {    \
             throw *this;                                  \
         }                                                 \
+                                                          \
+        ML_EX_REGISTER(name, (!std::is_same<base,         \
+                       UncatchableRuntimeException>::value)) \
     };
 
 struct InvalidTokenEx : public Exception {
@@ -608,6 +647,8 @@ struct OutOfMemoryEx : public RuntimeException, public std::bad_alloc {
     const char *what() const noexcept override {
         return "OutOfMemoryEx";
     }
+
+    ML_EX_REGISTER(OutOfMemoryEx, true)
 };
 DECL_RUNTIME_EX(AssertionFailureEx, "Assertion failure")
 DECL_RUNTIME_EX(NotLValueEx, "Not an lvalue error")
@@ -644,19 +685,29 @@ struct UndefinedVariableEx : public UncatchableRuntimeException {
     [[ noreturn ]] void rethrow() const override {
         throw *this;
     }
+
+    ML_EX_REGISTER(UndefinedVariableEx, false)
 };
 
 /*
  * Is `n` the name of an exception a script may NOT name in a catch clause?
  * The compile-time half of UncatchableRuntimeException (the run-time half is
- * the `is_catchable()` test in both catch matchers). Keep in sync with the
- * UncatchableRuntimeException subclasses above.
+ * the `is_catchable()` test in both catch matchers): every
+ * UncatchableRuntimeException class, and "UndefinedVariable", the name
+ * UndefinedVariableEx carries. `catch_names_every_builtin_ex` (tests.cpp)
+ * checks the list against the classes themselves (ML_EX_REGISTER).
  */
+inline constexpr const char *uncatchable_ex_names[] = {
+    "InternalErrorEx", "UndefinedVariable", "UndefinedVariableEx",
+    "CannotRebindConstEx", "CannotRebindBuiltinEx",
+};
+
 inline bool is_uncatchable_ex_name(const std::string_view &n)
 {
-    return n == "InternalErrorEx" || n == "UndefinedVariable"
-        || n == "UndefinedVariableEx" || n == "CannotRebindConstEx"
-        || n == "CannotRebindBuiltinEx";
+    for (const char *k : uncatchable_ex_names)
+        if (n == k)
+            return true;
+    return false;
 }
 
 /*
@@ -665,20 +716,21 @@ inline bool is_uncatchable_ex_name(const std::string_view &n)
  * to where the clause is written); a name no struct in scope takes must
  * be one of these, or it is a compile error. Every catchable run-time
  * exception the interpreter raises: the DECL_RUNTIME_EX classes and
- * OutOfMemoryEx. A new one joins this list (and the class list of
- * `catch_names_every_builtin_ex`, tests.cpp, which checks each spelling),
- * or naming it in a clause is a compile error.
+ * OutOfMemoryEx. A new one joins this list, or naming it in a clause is a
+ * compile error - and `catch_names_every_builtin_ex` (tests.cpp) fails,
+ * since every exception class registers itself (ML_EX_REGISTER).
  */
+inline constexpr const char *catchable_ex_names[] = {
+    "UnboundSymbolEx", "InvalidArgumentEx", "InvalidNumberOfArgsEx",
+    "CannotChangeConstEx", "DivisionByZeroEx", "StackOverflowEx",
+    "OutOfMemoryEx", "AssertionFailureEx", "NotLValueEx",
+    "TypeErrorEx", "InvalidValueEx", "NotCallableEx",
+    "OutOfBoundsEx", "KeyNotFoundEx", "CannotOpenFileEx",
+};
+
 inline bool is_catchable_ex_name(const std::string_view &n)
 {
-    static constexpr const char *names[] = {
-        "UnboundSymbolEx", "InvalidArgumentEx", "InvalidNumberOfArgsEx",
-        "CannotChangeConstEx", "DivisionByZeroEx", "StackOverflowEx",
-        "OutOfMemoryEx", "AssertionFailureEx", "NotLValueEx",
-        "TypeErrorEx", "InvalidValueEx", "NotCallableEx",
-        "OutOfBoundsEx", "KeyNotFoundEx", "CannotOpenFileEx",
-    };
-    for (const char *k : names)
+    for (const char *k : catchable_ex_names)
         if (n == k)
             return true;
     return false;
