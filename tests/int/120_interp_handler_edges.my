@@ -1,0 +1,77 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): shapes whose INTERPRETED handler (-nj) had an arm no
+# program took:
+#  - `g++` on a `dyn` global the function reaches before its declaration
+#    ran (IncDecCheckedV, the global kind): UnboundSymbolEx, catchable,
+#    and the same call works once the global is bound (README
+#    UnboundSymbolEx);
+#  - the counted loop whose back edge also reads the next element
+#    (ForStepElemInt, `t = bs[i] + ...` as the body's first read) over an
+#    array<bool> - flat bool storage, and general storage from dynarray() -
+#    a bool element reading as 0 / 1;
+#  - the boxed unary operators on a `dyn` value holding an int, a bool
+#    and a float (UnaryV): a bool promotes to an int for - + ~ (README
+#    bool), ! is a bool.
+# The tree-walker is the oracle; every engine must print the same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+func bump() { g++; return 0; }
+var early = 0;
+if (runtime(true)) {
+    try {
+        bump();
+    } catch (UnboundSymbolEx) {
+        early = 1;
+    }
+}
+var dyn g = runtime(1);
+bump();
+want("unbound global ++ raised", early, 1);
+want("global ++ once bound", g, 2);
+
+func pack(array<bool> bs, int n) {
+    var t = 0;
+    for (var i = 0; i < n; i++)
+        t = bs[i] + t * 3;
+    return t;
+}
+func packi(array<int> xs, int n) {
+    var t = 0;
+    for (var i = 0; i < n; i++)
+        t = xs[i] + t * 3;
+    return t;
+}
+var bs = [true, false, true, true];
+want("bool storage", array_storage(bs), "bool");
+want("for-step element read, flat bools", pack(bs, len(bs)), 31);
+want("for-step element read, ints", packi([1, 0, 1, 1], 4), 31);
+var dyn gb = dynarray(bs);
+want("dynarray storage", array_storage(gb), "general");
+want("for-step element read, general bools", pack(gb, 4), 31);
+
+var dyn d = runtime(5);
+var dyn t = runtime(true);
+var dyn f = runtime(2.5);
+want("-int", -d, -5);
+want("+int", +d, 5);
+want("~int", ~d, -6);
+want("!int", !d, false);
+want("-bool", -t, -1);
+want("+bool", +t, 1);
+want("~bool", ~t, -2);
+want("!bool", !t, false);
+want("-float", -f, -2.5);
+want("+float", +f, 2.5);
+want("!float", !f, false);
+want("str(+bool)", str(+t), "1");
+
+assert(bad == 0);
+print("ok");
