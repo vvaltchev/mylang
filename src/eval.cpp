@@ -5539,7 +5539,15 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
     CtStore ct;
     if (mem->ct_store && !ctx->const_ctx) {
         checked = rval;
-        ct = ct_store_pre(RValue(base), op, checked, mem->start, mem->end);
+        /* an undefined base (the REPL's open world) carets the member, as
+         * the access below does - a misfit carries its own */
+        try {
+            ct = ct_store_pre(RValue(base), op, checked, mem->start,
+                              mem->end);
+        } catch (Exception &e) {
+            stamp_like_eval(mem, e);
+            throw;
+        }
         rvp = &checked;
     }
 
