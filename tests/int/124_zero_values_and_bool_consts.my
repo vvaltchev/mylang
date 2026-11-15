@@ -1,0 +1,66 @@
+# INT-ENGINES: tw default nj noopt nc
+#
+# INT unit (#107): the zero value of every field kind a struct can
+# declare (README *Typed declarations*: a bool field is false, a dict
+# field {}), a box of each scalar kind and a string (README *Boxes*), and
+# a `bool` written where an `int` or a `float` is declared - in a
+# constant the parser coerces (`const int K = true;`) and in a local the
+# resolver's auto-const promotes (README: bool <= int <= float). Last, a
+# value that contains itself, used as a dict KEY, whose cycle passes
+# through a flat array of class instances: the key is frozen and kept
+# until the program ends (README *Values that contain themselves*), and
+# releasing it at exit walks the class array.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+struct Z { bool b; int i; float f; str s; array a; dict d; }
+Z z;
+want("struct zero", str(z), "Z(b: false, i: 0, f: 0.000000, s: \"\", a: [], d: {})");
+want("bool field", z.b, false);
+want("dict field", len(z.d), 0);
+
+box<int> bi;
+box<bool> bb;
+box<str> bs;
+box<float> bf;
+want("box<int> zero", *bi, 0);
+want("box<bool> zero", *bb, false);
+want("box<str> zero", *bs, "");
+want("box<float> zero", *bf, 0.0);
+want("box<float> zero type", typestr(*bf), "float");
+
+const int K = true;
+const float F = true;
+want("const int from bool", K, 1);
+want("const int type", typestr(K), "int");
+want("const float from bool", F, 1.0);
+want("const float type", typestr(F), "float");
+
+func locals() {
+    int x = true;
+    float y = false;
+    return str(x + 1) + " " + str(y + 0.5);
+}
+want("locals from bool", locals(), "2 0.500000");
+
+class C { int v; }
+var cs = [C(1), C(2)];
+want("class array storage", array_storage(cs), "class");
+var r = [cs];
+append(r, r);
+var d = {};
+d[r] = 7;
+want("cyclic key stored", len(d), 1);
+pop(r);                       # break the program's own cycle
+want("cycle broken", len(r), 1);
+foreach (var k, v in d)
+    want("cyclic key's value", v, 7);
+
+assert(bad == 0);
+print("ok");

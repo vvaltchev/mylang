@@ -1,0 +1,53 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (#107): three inferencer rules a program reaches with a plain
+# shape. A null test narrows with `none` on EITHER side (README *Null
+# narrowing*: `if (none != x)` is `if (x != none)`), and a narrowing
+# nested inside another of the same name restores the outer one when it
+# ends. A swap `a, b = [b, a]` assigns each target the literal's element,
+# as written (README *Multiple assignment*). And a template called
+# through a value with three different dict signatures - an empty `{}`,
+# whose element type is unfilled, a `dict<str, int>` and a
+# `dict<str, dyn>` - is not instantiated (the sites disagree), so the
+# base runs every call, with the same answers.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+var o = runtime(1) ? int(runtime(5)) : none;
+var n = runtime(0) ? int(runtime(5)) : none;
+if (none != o) want("none on the left, !=", o + 1, 6);
+if (none == o) want("none on the left, ==", 1, 0);
+else want("none on the left, else", o * 2, 10);
+if (none == n) want("none on the left, n", 1, 1);
+if (o != none) {
+    if (o != none)
+        want("nested narrowing", o + 3, 8);
+    want("outer narrowing after the inner", o + 4, 9);
+}
+
+var a = int(runtime(1));
+var b = int(runtime(2));
+a, b = [b, a];
+want("swap a", a, 2);
+want("swap b", b, 1);
+var s = "x";
+var t = "y";
+s, t = [t + "!", s];
+want("swap strings", s + t, "y!x");
+
+func f(d) { return len(d); }
+var fs = [f];
+var g = fs[0];
+want("empty dict", g({}), 0);
+want("dict<str, int>", g({"k": 1, "j": 2}), 2);
+var dyn x = runtime(4);
+want("dict<str, dyn>", g({"a": x}), 1);
+
+assert(bad == 0);
+print("ok");
