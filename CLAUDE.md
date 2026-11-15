@@ -7629,7 +7629,17 @@ but the per-element `StructObject` allocation is gone (build overhead
   value NAMES (#47): a bake detaches it into `baked_funcs`, pDeferFold
   keeps no literal (the node stays and runs) and does not cache the
   value. A new place that frees a constant expression while keeping its
-  value must ask it too. **And whatever lists a program's structs lists
+  value must ask it too. **⛔ The AST INLINER was a second such place, with
+  no constant in sight (2026-11-16):** every inlining engine CLONES an
+  argument into the body it pastes (a substitution, or the `$a = arg`
+  temp) and the call it replaces dies with the original - so `app(func(v)
+  { struct E { int n; } return E(v).n; }, x)` with an inlinable `app` left
+  a pasted function building instances of a definition freed with the
+  call: a heap-use-after-free in codegen, in every engine with the
+  inliner on. A call with such an argument stays a call
+  (`arg_owns_struct_def`, beside `binds_none` in the three engines). **A
+  pass that CLONES a subtree and drops the original must ask whether the
+  original owns a definition.** **And whatever lists a program's structs lists
   the OWNING declarations, over the complete walk** (`for_each_child_of`):
   `vm_compile`'s `take_structs` and `-vd`'s `collect_structs` (disasm.cpp)
   are the same walk on purpose - the image round trip compares the two

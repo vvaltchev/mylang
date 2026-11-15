@@ -6022,6 +6022,40 @@ private:
         return false;
     }
 
+    /*
+     * Does an argument of `ce` hold a struct declaration that OWNS its
+     * definition (a function literal declaring a struct in its body)?
+     * Every inlining engine CLONES an argument into the body it pastes -
+     * a substitution, or the `$a = arg` temp - and the call it replaces
+     * dies with the original. A clone of a struct declaration shares the
+     * definition and owns nothing (StructDeclStmt::clone), so the pasted
+     * function then built instances of a definition freed with the call:
+     * `app(func(v) { struct E { int n; } return E(v).n; }, x)` with an
+     * inlinable `app` was a heap-use-after-free in the default engine
+     * (codegen read the freed definition; -ni ran). Such a call stays a
+     * call - the literal, and the definition with it, stay in the tree.
+     */
+    static bool owns_struct_def(Construct *c)
+    {
+        if (!c)
+            return false;
+        if (ctag(c) == ConstructType::struct_decl)
+            return static_cast<StructDeclStmt *>(c)->def_owner != nullptr;
+        bool found = false;
+        for_each_child_of(c, [&](Construct *ch) {
+            found = found || owns_struct_def(ch);
+        });
+        return found;
+    }
+
+    static bool arg_owns_struct_def(const CallExpr *ce)
+    {
+        for (const auto &a : ce->args->elems)
+            if (owns_struct_def(a.get()))
+                return true;
+        return false;
+    }
+
     /* `a` reads a parameter of cur_fn that is not `opt` and that the body
      * never writes - a value its bind refused none for. Slots below the
      * parameter count are the parameters (inlining remaps a callee's
@@ -6066,6 +6100,8 @@ private:
             return;
         if (binds_none(ce, f))
             return;                     /* RULE 1: see binds_none */
+        if (arg_owns_struct_def(ce))
+            return;                     /* its clone would own nothing */
 
         /* The body EXPRESSION (the splice source): the `=> expr` sugar's
          * inner expr - the Block/Return wrapper is not spliced (it would put
@@ -6408,6 +6444,8 @@ private:
             return;   /* arity mismatch: let the runtime error survive */
         if (binds_none(ce, f))
             return;       /* RULE 1: see binds_none */
+        if (arg_owns_struct_def(ce))
+            return;                     /* its clone would own nothing */
 
         /*
          * A SELF-RECURSIVE callee (block_inlinable_decl admitted it only if it
@@ -6728,6 +6766,8 @@ private:
             return;
         if (binds_none(ce, f))
             return;                     /* RULE 1: see binds_none */
+        if (arg_owns_struct_def(ce))
+            return;                     /* its clone would own nothing */
 
         const int bsz = node_count(f->body.get());
         if (bsz > max_nodes)
