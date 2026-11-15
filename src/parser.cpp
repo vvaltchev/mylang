@@ -3391,25 +3391,6 @@ pStmt(ParseContext &c, unsigned fl)
     }
 }
 
-/* An escaping user exception's payload, rendered while the definitions
- * it names are alive (pBlock) - to the text the driver prints for it */
-static void freeze_exception_payload(ExceptionObject &e)
-{
-    const EvalValue &d = e.get_data();
-    if (!d.is<NoneVal>() && !d.is<SharedStr>())
-        e.set_data(EvalValue(SharedStr(d.get_type()->to_string(d))));
-}
-
-/* ...and the payloads of the exceptions it was raised while handling
- * (question 12), which the report prints too. A chain node is a clone
- * only this chain and its clones hold, so freezing it in place is safe. */
-static void freeze_exception_chain(RuntimeException &e)
-{
-    for (RuntimeException *c = &e; c; c = c->context.get())
-        if (c->is_exception_object())
-            freeze_exception_payload(*static_cast<ExceptionObject *>(c));
-}
-
 /* question 5: the typed copies of parse-time calls are AST - dropped when
  * the outermost block ends, so the -vm teardown finds none */
 struct PtBlockScope {
@@ -3475,6 +3456,9 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
      * (`Uncaught exception 'E', data: ...`), so it is rendered HERE, while
      * every enclosing block is still alive: a freed def was a heap
      * use-after-free in every build (a SIGSEGV in a release).
+     * The call that raised it froze it already, where it left the
+     * constant evaluation (do_func_call, eval.cpp) - before any node a
+     * parse function holds in a local died; this is the second net.
      */
     try {
         if (!c.eoi()) {

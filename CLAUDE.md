@@ -8252,7 +8252,22 @@ and two macros:
   folded `pure` call) has no `root` to keep it: the statements parsed so far
   die as it unwinds, so `pBlock` replaces the payload by its rendering
   (`freeze_exception_payload`) while every enclosing block is alive - it
-  was a heap-use-after-free in main's render (2026-10-11).
+  was a heap-use-after-free in main's render (2026-10-11). **⛔ pBlock's
+  catch is the SECOND net; the first is where the exception LEAVES THE
+  CONSTANT EVALUATION (2026-11-16):** `do_func_call`'s catch (eval.cpp)
+  calls `freeze_exception_chain` when the call was made in a const
+  context by the compiler itself - its caller's context is inside no
+  function invocation (`ctx_in_function`), so no script `try` can still
+  handle the struct - before ANY node the compiler holds has died. By the
+  time pBlock's catch ran, a parse function's local could already be
+  gone: `var x = (pure func() { struct E { int n; } throw E(1); })();`
+  freed the literal owning `E` on the way, and pBlock's own freeze read
+  the freed definition. The same freeze covers a fold in the OPTIMIZERS
+  (AutoConst runs a constant call; ef903383 and its follow-up stopped
+  `fold_block` and a decided `if` from freeing statements during the
+  unwind, and this makes the report independent of what a future fold
+  holds in a local). A call a RUNNING function made is never frozen: a
+  `try` in that function may catch the struct and read its fields.
 - **Backtrace frames are LAZY (2026-07-18 profile #3).** A captured
   `BacktraceFrame` holds `{const FuncDescriptor *desc, Loc call_site}` — NO
   strings; `format_backtrace` stringifies from the program-lifetime

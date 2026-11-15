@@ -319,6 +319,15 @@ bool pt_args_name_function(EvalContext *ctx, Construct *args);
 /* a call a running function makes, by value */
 bool pt_typed_value(FuncObject &obj, const std::vector<EvalValue> &vals,
                     Loc call_site, EvalValue &out);
+/*
+ * Render the struct payload of `e`, and of every exception it was raised
+ * while handling, to the text the driver prints for it (eval.cpp). For an
+ * exception that leaves a constant evaluation: the nodes that own the
+ * definitions it names may die before the report is written (do_func_call
+ * freezes it where the call is left; pBlock again as it unwinds).
+ */
+struct RuntimeException;
+void freeze_exception_chain(RuntimeException &e);
 /* what a const scope noted about a const it declared holding a function
  * (pt_note_const): its initializer, which a typed copy declares it by, so
  * the function arrives as it does in the program; whether it is `dyn` */
