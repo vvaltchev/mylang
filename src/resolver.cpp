@@ -873,11 +873,34 @@ private:
         }
     }
 
-    /* A block's statements: promote const decls, fold, drop dead code. */
+    /* A block's statements: promote const decls, fold, drop dead code.
+     * A dropped statement is reset IN PLACE and the nulls are removed at
+     * the end - also when a fold RAISES (a constant call that throws is a
+     * compile error): the block then keeps every statement it still has,
+     * since the exception's payload may be a struct whose definition one
+     * of them owns. Moving the statements into a second vector, as this
+     * did, freed them while the exception unwound, and the driver's report
+     * read the freed definition (heap-use-after-free, every engine). */
     void fold_block(Block *b, FCtx &fc)
     {
-        std::vector<unique_ptr<Construct>> kept;
+        auto compact = [b] {
+            b->elems.erase(std::remove_if(b->elems.begin(), b->elems.end(),
+                               [](const unique_ptr<Construct> &p) {
+                                   return !p;
+                               }),
+                           b->elems.end());
+        };
+        try {
+            fold_block_stmts(b, fc);
+        } catch (...) {
+            compact();
+            throw;
+        }
+        compact();
+    }
 
+    void fold_block_stmts(Block *b, FCtx &fc)
+    {
         for (auto &e : b->elems) {
 
             if (ctag(e.get()) == ConstructType::expr14) {
@@ -903,24 +926,19 @@ private:
                               "  write-once scalar -> " +
                               fc.consts[id->sym.slot].to_string() +
                               "  (folded at uses)");
-                        continue;
+                        e.reset();
                     }
-
-                    kept.push_back(std::move(e));
                     continue;
                 }
 
                 fold_reads(e14->rvalue, fc);   /* assignment: rhs ... */
                 fold_lvalue_reads(e14->lvalue, fc);   /* ... and lvalue reads */
-                kept.push_back(std::move(e));
                 continue;
             }
 
-            if (fold_child(e, fc))
-                kept.push_back(std::move(e));
+            if (!fold_child(e, fc))
+                e.reset();
         }
-
-        b->elems = std::move(kept);
     }
 
     /*

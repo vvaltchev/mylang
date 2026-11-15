@@ -1296,6 +1296,31 @@ else
           head -c 300)"
 fi
 
+# The same while the OPTIMIZERS fold: AutoConst runs a call with constant
+# arguments at compile time, and its block used to move every statement
+# into a second vector as it went - a throw freed them all, the function
+# owning the thrown struct's definition included, and the report read the
+# freed definition (heap-use-after-free, every engine, 2026-11-16).
+cat > "$TMP/athrow.my" <<'EOF'
+func a() { struct Err { int n; } throw Err(1); }
+a();
+EOF
+uaf_bad=""
+for e in "" -tw -nj; do
+    # shellcheck disable=SC2086
+    out=$("$BIN" $e "$TMP/athrow.my" 2>&1)
+    r=$?
+    { [ $r = 1 ] &&
+      printf '%s' "$out" | grep -q "Uncaught exception 'Err', data: Err(n: 1)"
+    } || uaf_bad="$uaf_bad [${e:-default} rc $r: $(printf '%s' "$out" |
+                                                    head -c 200)]"
+done
+if [ -z "$uaf_bad" ]; then
+    pass "a struct a compile-time fold throws outlives the fold"
+else
+    fail "a struct thrown by a compile-time fold:$uaf_bad"
+fi
+
 # THE DRIVER'S FLAGS. Each flag `-h` documents does what it says, and a
 # flag that takes a value refuses to run without one. -rt never parses
 # argv, so a flag wired to nothing passes every one of its tests; these
