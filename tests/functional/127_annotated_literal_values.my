@@ -1,0 +1,41 @@
+# A container literal takes the declared type of the place it lands in,
+# element by element (README, "Explicit type annotations"): where that
+# element type is `dyn` its values stay as written, and a literal nested
+# there holds its values at its OWN type, as one in a `dyn` variable
+# does. The parse-time bake of a constant literal widened it by the join
+# of its own values instead, so `array<dyn> k = [1, 2.5, true]` held
+# 1.0 and 1.0 by default and 1 and true under -nc (RULE 2), and a const
+# declaration - baked in both modes - held 1.0 everywhere.
+array<dyn> k = [1, 2.5, true];
+assert(str(k) == "[1, 2.500000, true]");
+const array<dyn> K = [1, 2.5, true];
+assert(str(K) == "[1, 2.500000, true]");
+dict<str, dyn> d = {"a": 1, "b": 2.5, "c": true};
+assert(str(d) == "{\"a\": 1, \"b\": 2.500000, \"c\": true}");
+array<array<dyn>> m = [[1, 2.5, true]];
+assert(str(m) == "[[1, 2.500000, true]]");
+dict<str, array<dyn>> e = {"a": [1, 2.5]};
+assert(str(e) == "{\"a\": [1, 2.500000]}");
+
+# nested in a `dyn` element: each literal at its own type
+array<dyn> n = [[1, 2.5], [true], [1, 2]];
+assert(str(n) == "[[1.000000, 2.500000], [true], [1, 2]]");
+var x = [[1, 2.5], "s"];
+assert(str(x) == "[[1.000000, 2.500000], \"s\"]");
+
+# a declared numeric element type still widens, at every level
+array<array<float>> z = [[1, 2], [true]];
+assert(str(z) == "[[1.000000, 2.000000], [1.000000]]");
+array<float?> f = [1, none, 2.5];
+assert(str(f) == "[1.000000, <none>, 2.500000]");
+
+# with no element type to follow - a generic `array`, a `dyn` variable,
+# no annotation - the literal is its own type: nested ones follow the
+# outer one
+array g = [1, 2.5];
+assert(str(g) == "[1.000000, 2.500000]");
+var dyn dd = [[1, 2.5], [true]];
+assert(str(dd) == "[[1.000000, 2.500000], [1.000000]]");
+var y = [[1, 2], [1.5]];
+assert(str(y) == "[[1.000000, 2.000000], [1.500000]]");
+print("ok");

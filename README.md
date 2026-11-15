@@ -4131,6 +4131,12 @@ arms join to. So `[1, 2.5]` is an `array<float>` holding `1.0` and `2.5`,
 an `array<array<float>>`, the second row holds `3.0` and `4.0`. A constant
 array that is merely *named* inside another keeps its own type
 (`const A = [3, 4]; const N = [[1, 2.5], A];` leaves `A` an `array<int>`).
+Where the outer type is a declared one, its element type decides
+instead: `array<dyn> k = [1, 2.5, true]` holds `1`, `2.5` and `true` -
+a `dyn` element converts nothing - and a literal nested in a `dyn`
+element is its own type, as one in a `dyn` variable is: in
+`array<dyn> n = [[1, 2.5], [true]]` the first row holds `1.0` and
+`2.5`, the second `true`.
 
 The rule holds for every other place a value lands where the static type is
 wider: a function whose return type is `float` returns its `int` paths as
