@@ -7600,7 +7600,8 @@ but the per-element `StructObject` allocation is gone (build overhead
   run time - `-nti`'s dyn call, the tree-walker - reads T (dropped like a
   scalar, it was "Undefined variable 'T'" in every engine); **the
   inferencer gives T's TypeSym the struct** (`bind_type_aliases`, off that
-  literal, a multi-declaration's element included), so every reader of
+  literal - a multi-declaration's element, or a struct it spreads to
+  every target), so every reader of
   `TypeSym::struct_type` - construction, named arguments, `T.CONST`, the
   literal-argument stamps - treats T as S; and **a catch clause names the
   struct** (`catch (T)` is rewritten to `catch (S)`: a clause matches by
