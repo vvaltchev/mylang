@@ -444,6 +444,10 @@ def check(results, files, verbose):
                 shown_op += 1
                 if not (verbose or shown_op <= 20):
                     continue
+            elif kind == 'raw':
+                # always printed, and one of the capped OPERAND errors:
+                # the serial walk counted it in the same total
+                shown_op += 1
             print(text)
         tot = [x + y for x, y in zip(tot, counters)]
     return tot
