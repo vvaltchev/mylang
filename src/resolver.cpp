@@ -1642,10 +1642,10 @@ private:
      * every global declared before any function that mentions it, no call can
      * find one unbound.
      *
-     * FUNCTION and STRUCT names are NOT subject to it. They bind at SCOPE
-     * ENTRY (#134), so a forward call is not a forward reference at all -
-     * requiring definition order there would forbid mutual recursion and buy
-     * nothing.
+     * FUNCTION, STRUCT and run-time CONST names are NOT subject to it. They
+     * bind at SCOPE ENTRY (#134, question 21), so a forward use is not a
+     * forward reference at all - requiring definition order there would
+     * forbid mutual recursion and buy nothing.
      *
      * It reuses `escaped_refs`, which already holds every function-body
      * reference to an outer name, so this is a comparison of two source
@@ -1657,7 +1657,9 @@ private:
 
         for (auto &e : rb->elems) {
             auto *ex = node_cast<Expr14>(e.get());
-            if (!ex || !(ex->fl & pFlags::pInDecl))
+            /* a `const` binds at scope entry too (question 21) */
+            if (!ex || !(ex->fl & pFlags::pInDecl)
+                    || (ex->fl & pFlags::pInConstDecl))
                 continue;
             auto *lv = node_cast<Identifier>(ex->lvalue.get());
             if (lv && lv->sym.kind == SymKind::global)

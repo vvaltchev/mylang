@@ -486,6 +486,21 @@ func later() { return 7; }
 That applies at every scope, not just the top level. A *lambda* is an ordinary
 variable, though, so `var f = func(x) => x;` binds where it is written.
 
+**A `const` container, function or type alias binds at the top of its scope
+too**, right after the scope's functions and structs. Its value is computed
+while the program is compiled, so binding it early changes no value - it only
+means a read that runs before the declaration's line sees it:
+
+```C#
+func use(int k) { return K[k]; }
+print(use(1));            # 20: `K` is bound before the block runs
+const K = [10, 20, 30];
+```
+
+A `const` *scalar* (`const N = 5;`) has no run-time binding at all: every read
+of it is its value, written in place while the program is parsed, so it must be
+declared above its first use.
+
 **Where the failure is provable, the compiler refuses the program.** If a call
 is evaluated unconditionally and the function it names unconditionally reads a
 global declared further down, that call can only ever fail — so it is rejected
@@ -3919,7 +3934,9 @@ Has `name`'s **declaration run yet?** The companion to `defined()`, and the
 pair differ exactly in the *temporal dead zone* (see
 [Declaring variables](#declaring-variables)): a
 declaration's *name* exists from the moment its scope is entered, its *value*
-is bound when the declaration statement executes.
+is bound when the declaration statement executes - except a function, a
+struct and a run-time `const`, which are bound at scope entry (so `isbound`
+is `true` for them throughout their scope).
 
 | `name` is... | `defined(name)` | `isbound(name)` |
 |---|---|---|

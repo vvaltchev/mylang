@@ -3526,6 +3526,41 @@ pBlock(ParseContext &c, unsigned fl, bool push_const_scope)
     }
 
     ret->end = c.get_loc();
+
+    /*
+     * What binds at SCOPE ENTRY comes first (question 21, maintainer's
+     * decision A, 2026-11-16): the block's named function and struct
+     * declarations (#134), then its run-time `const` declarations - a
+     * const container, function or type alias - in source order. A const's
+     * value is computed while parsing and can name only what is declared
+     * above it, so binding it first changes no value; it makes a read made
+     * before its declaration ran see it, as every optimizer assumed when it
+     * folded such a read. Ordering the TREE, rather than each engine's
+     * statement loop, is what keeps every pass and every lowering in step:
+     * the loop-body compiler (compile_scalar_body) emitted a function
+     * declaration where it was written, so a call above it in a loop body
+     * raised UnboundSymbolEx in the VM alone. The REPL's input keeps its
+     * order (push_const_scope false): it runs statement by statement in an
+     * open world, and its echo reads the last statement.
+     */
+    if (push_const_scope) {
+        const auto rank = [](const unique_ptr<Construct> &e) {
+            const Construct *n = e.get();
+            if (const auto *fd = node_cast<const FuncDeclStmt>(n))
+                return fd->id ? 0 : 2;
+            if (const auto *sd = node_cast<const StructDeclStmt>(n))
+                return sd->id ? 0 : 2;
+            if (const auto *ex = node_cast<const Expr14>(n))
+                return (ex->fl & pFlags::pInConstDecl) ? 1 : 2;
+            return 2;
+        };
+        std::stable_sort(ret->elems.begin(), ret->elems.end(),
+                         [&](const unique_ptr<Construct> &a,
+                             const unique_ptr<Construct> &b) {
+                             return rank(a) < rank(b);
+                         });
+    }
+
     c.cap_const_decls.pop_back();
     c.shadow_pop();                    // #133
     c.cse->pop();                      // pop the CSE cache scope
