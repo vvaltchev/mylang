@@ -1,0 +1,67 @@
+# An arrow body `=> expr` is `{ return expr; }`, also for what the parser
+# declares beside an expression: the `var K = <value>` a closure's capture
+# of a const SCALAR needs (a const scalar has no run-time symbol), and a
+# function literal a constant container names. Both used to land in the
+# ENCLOSING block, before the statement holding the arrow function, where
+# the body could not always read them: a middle function in a function
+# body ("Undefined variable"), and a named arrow function - or a const
+# bound to a pure one - called above its line (UnboundSymbolEx). Each line
+# below has a braced twin that must answer the same.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+func rt(int k) => int(runtime(k));
+
+const K = 5;
+const S = "s";
+
+# a middle function in a function body
+func in_body_arrow() {
+    var f = func() => func [K] () => K + rt(0);
+    return f()();
+}
+func in_body_brace() {
+    var f = func() { return func [K] () => K + rt(0); };
+    return f()();
+}
+want("function body, arrow", in_body_arrow(), 5);
+want("function body, braces", in_body_brace(), 5);
+
+# a named function called above its line
+if (rt(1) > 0) {
+    want("named above, arrow", mk_arrow()(), 6);
+    want("named above, braces", mk_brace()(), 6);
+    want("const pure above, arrow", pf_arrow(), 10);
+    want("const pure above, braces", pf_brace(), 10);
+}
+func mk_arrow() => func [K] () { K += rt(1); return K; };
+func mk_brace() { return func [K] () { K += rt(1); return K; }; }
+const pf_arrow = pure func() => (func [K] () => K * 2)();
+const pf_brace = pure func() { return (func [K] () => K * 2)(); };
+
+# the closure's copy is its own, per closure
+var c = mk_arrow();
+want("own copy 1", c(), 6);
+want("own copy 2", c(), 7);
+want("fresh closure", mk_arrow()(), 6);
+
+# several captures in one arrow body, and one in the enclosing block
+var two = func() => [func [K] () => K, func [K, S] () => str(K + rt(1)) + S];
+want("two, first", two()[0](), 5);
+want("two, second", two()[1](), "6s");
+var g = func [K] () => K + 2;
+want("sibling", g(), 7);
+
+# a constant container naming function literals, in an arrow body
+func pick(int k) => [pure func(a) => a + 1, pure func(a) => a * 2][k](10);
+want("pick 0", pick(rt(0)), 11);
+want("pick 1", pick(rt(1)), 20);
+
+assert(bad == 0);
+print("ok");
