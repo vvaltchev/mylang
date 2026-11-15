@@ -1545,6 +1545,15 @@ if (cd "$TMP" && "$abs_bin" -c rel.my >/dev/null 2>&1) &&
 else
     fail "-c with no -o and no directory: $(ls "$TMP" | tr '\n' ' ')"
 fi
+# ...and a path with no dot at all ($TMP itself has one): prog -> prog.myv
+rm -f "$TMP/d.x/prog.myv"
+if (cd "$TMP/d.x" && "$abs_bin" -c prog >/dev/null 2>&1) &&
+   [ -f "$TMP/d.x/prog.myv" ] &&
+   [ "$("$BIN" "$TMP/d.x/prog.myv")" = "3 " ]; then
+    pass "-c with no -o and no dot in the path: prog -> prog.myv"
+else
+    fail "-c with no -o and no dot: $(ls "$TMP/d.x" | tr '\n' ' ')"
+fi
 flag "-c refuses an argument it does not know" 1 \
      'unexpected argument after -c: extra' -c "$TMP/tw.my" extra
 flag "-vd of an image disassembles the loaded program" 0 \
