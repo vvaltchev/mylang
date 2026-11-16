@@ -253,6 +253,15 @@ public:
     bool never_none = false;
 
     /*
+     * #68: set on the ROOT of an inlined call's spliced body - the node
+     * that stands where the call stood: that call's inlined-at element,
+     * whose call_site / call_end span an error the enclosing operation
+     * raises about this value carets (inline_operand_span). Set by the
+     * AST inliner's expression engine; copied by copy_base_fields.
+     */
+    const InlineCtx *inline_call = nullptr;
+
+    /*
      * Representation hint for an array-producing node, set by the inferencer
      * from the destination type so the array is built in its final
      * representation (type-driven creation, no promotion). On a CallExpr's args
@@ -368,6 +377,7 @@ public:
         d.defer_fold = defer_fold;
         d.late_fold_witness = late_fold_witness;
         d.never_none = never_none;
+        d.inline_call = inline_call;
         d.late_fold = late_fold ? late_fold->clone() : nullptr;
     }
 };

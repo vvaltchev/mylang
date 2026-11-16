@@ -2588,8 +2588,11 @@ struct Codegen {
             /* loc for a `-str`/`~str` error: the OPERAND, as the
              * tree-walker's stamp_operand_loc and every binary op mark
              * the operand whose type lacks the operator (it marked the
-             * whole `~d` until 2026-11-07, RULE 2) */
-            in.node_idx = add_ast_node(operand);
+             * whole `~d` until 2026-11-07, RULE 2); its chain the unary
+             * node's (#68: an inlined call as the operand lent the op its
+             * body's) */
+            in.node_idx = add_ast_node(e);
+            in.loc_node_idx = add_ast_node(operand);
             in.target = t;
             in.set_a(slot_op(oslot));
             in.aop = op;
@@ -2749,7 +2752,13 @@ struct Codegen {
             in.op = k == 'a' ? OpCode::BinOpV
                   : k == 'c' ? OpCode::CmpV
                              : OpCode::LogV;
-            in.node_idx = add_ast_node(k == 'l' ? node : elems[i].second.get());
+            /* the operand carets the op (the boxed ladder's operand-
+             * precise convention); the CHAIN node gives it its inlined-at
+             * chain - #68: an inlined call as the operand lent the op its
+             * body's chain (an extra frame) and its body's span. Both
+             * callers pass the chain node; a logical chain returned above */
+            in.node_idx = add_ast_node(node);
+            in.loc_node_idx = add_ast_node(elems[i].second.get());
             in.target = t;
             in.set_a(acc_op);
             in.set_b(rhs_op);
@@ -2760,7 +2769,7 @@ struct Codegen {
         out_slot = acc_op.slot;
         /* Q2: an array sum takes its static type (Construct::ctype; the
          * BinOpV's copy starts untyped, ctype_sum_copy) */
-        if (k == 'a' && node && node->ctype) {
+        if (k == 'a' && node->ctype) {
             CgInstr st;
             st.op = OpCode::StampTypeV;
             st.set_a(slot_op(out_slot));
@@ -9691,8 +9700,12 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
                  */
                 const Construct *ln =
                     (locnode && locnode->start) ? locnode : node;
-                chunk.locs.push_back(
-                    {static_cast<uint32_t>(pc), ln->start, ln->end});
+                Loc ls = ln->start, le = ln->end;
+                /* #68: an inlined call's value as the divisor carets the
+                 * call, as the operation writes it */
+                if (ln == locnode)
+                    inline_operand_span(locnode->inline_call, ls, le);
+                chunk.locs.push_back({static_cast<uint32_t>(pc), ls, le});
             }
             in.node_idx = -1;
             break;
