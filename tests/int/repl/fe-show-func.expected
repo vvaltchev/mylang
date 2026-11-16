@@ -109,7 +109,9 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 
 pure int func pu$0(int x) => x + 1;
 >> >> => 5.000000
->> /* pure */ float func prm(const int a, dyn? b, dyn c, float d, int? e) => a + d;
+>> /* pure */ func prm(const int a, opt b, dyn c, float d, opt int e) => a + d;
+
+/* pure */ float func prm$0(const int a, int? b, dyn c, float d, int? e) => a + d;
 >> .. .. .. .. .. .. .. .. .. .. .. .. .. .. .. >> => [2, 1, 1, 3, 2, 2, -4, -4, 3, 4]
 >> /* pure */ array<int> func tf(int n) {
     bool b = n > 1;

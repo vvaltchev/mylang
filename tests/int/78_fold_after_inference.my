@@ -65,10 +65,10 @@ var sx = A[id(3)] + id(1);
 want("subscript, var", sx, 41);
 
 # 6. a deferred call inside another: the outer one folds only when the
-#    inner one fits too
-pure func jo(opt v) => str(v);
+#    inner one fits too (a `float` parameter converts the inner int)
+pure func jo(float v) => str(v);
 want("nested", jo(id(2)), "2.000000");
-want("nested, joined", jo(2.5), "2.500000");
+want("nested, fits", jo(2.5), "2.500000");
 
 # 7. a loop with break and continue, copied for the parse-time typed run
 pure func lp(int n) {

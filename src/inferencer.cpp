@@ -191,28 +191,27 @@ struct TypeSym {
 
 /*
  * A TEMPLATE parameter - the ones an instance's signature is keyed by: an
- * un-annotated, non-`dyn`, non-`opt` one, or (rule 5, plans/strict-
- * container-types.md) one annotated with a bare `array` / `dict`, a HOLE
- * each call fills (the annotation then only checks the argument is an
- * array / a dict, in the instance). It used to join its call sites into
- * one type, which rule 1 refuses for two different element types.
+ * un-annotated, non-`dyn` one, or (rule 5, plans/strict-container-types.md)
+ * one annotated with a bare `array` / `dict`, a HOLE each call fills (the
+ * annotation then only checks the argument is an array / a dict, in the
+ * instance) - `opt` or not (rule 8.1: an `opt` one is keyed by the
+ * argument's type without its `?`, template_arg_key). Each used to join
+ * its call sites into one type, which rule 1 refuses for two different
+ * element types, and which made `f(2)` and `f(2.5)` both return floats.
  */
-static bool template_param(bool opt, bool dyn, DeclType ann,
-                           const TypeAnnot *annot)
+static bool template_param(bool dyn, DeclType ann, const TypeAnnot *annot)
 {
-    return !opt && !dyn
+    return !dyn
         && (ann == DeclType::none
             || ((ann == DeclType::arr || ann == DeclType::dict) && !annot));
 }
 static bool template_param(const TypeSym *p)
 {
-    return template_param(p->opt_decl, p->dyn_decl, p->ann,
-                          p->ann_annot.get());
+    return template_param(p->dyn_decl, p->ann, p->ann_annot.get());
 }
 static bool template_param(const Identifier *p)
 {
-    return template_param(p->opt_mod, p->dyn_mod, p->decl_type,
-                          p->decl_annot.get());
+    return template_param(p->dyn_mod, p->decl_type, p->decl_annot.get());
 }
 
 struct FuncInfo {
@@ -599,6 +598,8 @@ private:
     void mark_lambda_templates();   /* safe var-bound lambdas -> templates */
     void run_fixpoint(Block *root);             /* the Jacobi loop, extracted */
     bool instantiate_round(Block *root);     /* clone + redirect; progress? */
+    StaticTypeRef template_arg_key(CallExpr *call, const TypeSym *p,
+                                   size_t i);
     bool value_instantiate_round(Block *root);  /* value-used templates (see
                                                  * plans/value-template-
                                                  * instantiation.md) */
@@ -1379,6 +1380,20 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
  * redirect the call to it. Returns whether any call was redirected (so the
  * caller re-runs the fixpoint and looks for newly-exposed template calls).
  */
+/* What template parameter `p` (the `i`th) is keyed by at `call`: the
+ * argument's type - without its `?` for an `opt` parameter, whose
+ * instance takes `none` anyway (rule 8.1) - and `none` when a trailing
+ * `opt` one is omitted: its own instance, as a `none` argument is. */
+StaticTypeRef Inferencer::template_arg_key(CallExpr *call, const TypeSym *p,
+                                           size_t i)
+{
+    if (i >= call->args->elems.size())
+        return A.none_ty();
+    const StaticTypeRef t =
+        static_type_resolve(type_of(call->args->elems[i].get()));
+    return p->opt_decl ? A.with_opt(t, false) : t;
+}
+
 bool Inferencer::instantiate_round(Block *rootBlock)
 {
     /*
@@ -1417,18 +1432,15 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         if (nargs < min_args || nargs > nparams)
             continue;
 
-        /* The signature is keyed by the TEMPLATE params (un-annotated, non-dyn,
-         * non-opt) only; opt/typed/dyn params just join within the clone. A
-         * template param is non-opt, so min_args > its index => its arg is
-         * always present. */
+        /* The signature is keyed by the TEMPLATE params (template_param)
+         * only; typed/dyn params just join within the clone. */
         std::vector<StaticTypeRef> sig;
         bool ready = true;
         for (size_t i = 0; i < nparams; i++) {
             TypeSym *p = tmpl->params[i];
             if (!template_param(p))
                 continue;       /* not a template param */
-            StaticTypeRef t =
-                static_type_resolve(type_of(call->args->elems[i].get()));
+            StaticTypeRef t = template_arg_key(call, p, i);
             /* (a container settled all the way down: an array<?> is not a
              * signature - rule 1 makes the clone's array<?> refuse what it
              * settles to; a function value's parameters may stay open) */
@@ -2007,11 +2019,7 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
                 TypeSym *p = tmpl->params[i];
                 if (!template_param(p))
                     continue;              /* not a template param */
-                /* a template param is not opt, so i < min_args <= nargs:
-                 * every site passes it */
-                ML_CHECK(i < nargs);
-                StaticTypeRef t = static_type_resolve(
-                    type_of(site.call->args->elems[i].get()));
+                StaticTypeRef t = template_arg_key(site.call, p, i);
                 if (is_unknown(t)) { ok = false; break; }
                 s1.push_back(t);
             }
@@ -2784,8 +2792,20 @@ bool Inferencer::late_fold_fits_one(Construct *node, Construct *lit)
         auto it = func_of_decl.find(call->callee_fn);
         fi = it != func_of_decl.end() ? it->second : nullptr;
     }
-    if (!fi || fi->is_template)
+    /* a call that still reaches a template's BASE runs it untyped, while
+     * the parse's typed copy may have made an instance for it - the copy
+     * sees this one call, the program every call through the same value
+     * (`OPS[0](3)` with OPS a const array: the program's calls disagree,
+     * the copy's one call agrees) - so the two can give the same type
+     * but another value */
+    if (!fi) {
+        for (FuncInfo *f : callee_set(call->what.get()).funcs)
+            if (f->is_template)
+                return false;
         return true;
+    }
+    if (fi->is_template)
+        return false;
     /* a checked call has no more arguments than parameters */
     const auto &args = call->args->elems;
     const size_t n = std::min(args.size(), fi->params.size());
@@ -5170,13 +5190,14 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
         fd->body && fd->body->is_block() && !always_exits(fd->body.get());
     /*
      * A template iff it is a NAMED function with at least one *template
-     * parameter* (template_param): an un-annotated, non-`dyn`, non-`opt`
-     * param, or one annotated with a bare `array` / `dict`. Those are the
-     * params the instance signature is keyed by; any `opt`/typed/`dyn` params
-     * coexist and just `join` within each clone (handled by the concrete path).
-     * So `func f(a, opt b)` is a template over `a` (b joins), while `func
-     * f(opt x)` (no template param) keeps the join model. (A lambda has no name
-     * to redirect a call to, so it also keeps the join model - v1; see
+     * parameter* (template_param): an un-annotated, non-`dyn` param, `opt`
+     * or not (rule 8.1), or one annotated with a bare `array` / `dict`.
+     * Those are the params the instance signature is keyed by; typed /
+     * `dyn` params coexist and just `join` within each clone (handled by
+     * the concrete path). So `func f(a, int b)` is a template over `a` (b
+     * joins), and `func f(opt x)` over `x`. (A lambda has no name to
+     * redirect a call to, so it keeps the join model - except a
+     * write-once, calls-only one, mark_lambda_templates; see
      * plans/archived/function-templates.md.)
      */
     if (fd->id && fd->params)
@@ -6846,6 +6867,18 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
      */
     if (!s || s->func)
         return;
+
+    /* rule 8.1: a `none` given to an `opt` parameter adds nothing to its
+     * type - the declaration already lets it be none. One only `none`
+     * reaches is then unconstrained (a `dyn?`, as an omitted argument
+     * leaves it), not `none`, so its non-none branches type-check:
+     * `func f(opt x) { if (x != none) return x + 1; return 0; }` called
+     * with `none` is the instance keyed `none` (template_arg_key) */
+    if (s->is_param && s->opt_decl) {
+        const StaticTypeRef k = static_type_resolve(t);
+        if (k && k->kind == StaticTypeKind::None)
+            return;
+    }
 
     {
         /* which scalar kinds reach the symbol (see TypeSym::arg_kinds): a

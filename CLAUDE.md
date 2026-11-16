@@ -6051,11 +6051,19 @@ never-called template never errors, and `f(1); f("s")` makes two instances not a
 type conflict. `dyn` is the explicit one-instance-any-type param. Full design +
 deferrals: `plans/archived/function-templates.md`.
 
-**`opt`/typed params coexist with template params** and just `join` within each
-clone — the signature is keyed by the *template params only*. So `func f(a, opt
-b)` is a template over `a` (`b` joins; arity in `instantiate_round` is the
-`[min,nparams]` range). `func f(opt x)` with no template param keeps the join
-model. **A var-bound lambda** (`var id = func(x)=>x`) becomes a template iff it
+**Typed params coexist with template params** and just `join` within each
+clone — the signature is keyed by the *template params only*. **An
+un-annotated `opt` param IS a template param (rule 8.1)**, keyed by the
+argument's type with its `?` dropped, and an omitted argument keys as
+`none` (`template_arg_key`, used by both instantiation rounds - arity in
+`instantiate_round` is the `[min,nparams]` range); a `none` contributed
+to an `opt` param adds nothing (`contribute`), so the `none` instance's
+param is an unconstrained `dyn?` and its non-none branches type-check.
+⛔ A late fold refuses a call that still reaches a template BASE
+(`late_fold_fits_one`): the parse's typed copy sees one call and may make
+an instance where the program, seeing every call through the same value,
+runs the base untyped - same type, another value (RULE 2; rule 8.1 made
+this reachable through `OPS[0](3)`). **A var-bound lambda** (`var id = func(x)=>x`) becomes a template iff it
 is non-capturing and the var is **write-once + calls-only** (`mark_lambda_
 templates`, after the structural pass, using per-symbol `writes`/`value_used`
 bookkeeping — the decl write is counted in `walk_struct`, not `declare_target`,

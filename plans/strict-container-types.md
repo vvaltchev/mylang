@@ -328,6 +328,13 @@ later. Each is marked with what it would take to reverse it.
     none, which the JIT read as 0, the VM aborted on and the tree-walker
     threw at), anything else is a `dyn?` (a foreach variable over
     `dyn?` elements was a `dyn`).
+16. **Rule 8.1's key for a `none` argument** (2026-11-21): rule 8.1
+    keys an `opt` template parameter by the argument's non-none type, and
+    a `none` (or an omitted argument) has none - so it is an instance of
+    its own, where the parameter is a `dyn?` (a `none` contributed to an
+    `opt` parameter adds nothing). The alternative, reusing the one other
+    instance when there is exactly one, makes which instance a call runs
+    depend on the program's other calls.
 
 ### A gap left by increment 1
 
@@ -422,4 +429,13 @@ prints `0`. Choice 6 fixes it.
    `opt` parameter a template parameter - and nested holes
    (`array<array>` is an array<array<dyn>>, as before). Tests:
    tests/functional/136, the `rule 5:` `-rt` rows.
-5. Rule 8.
+5. Rule 8. 8.1 DONE 2026-11-21: an un-annotated `opt` parameter (and a
+   nullable bare `array?` / `dict?`) is a template parameter, keyed by the
+   argument's type without its `?`; a `none` or omitted argument is an
+   instance of its own (provisional choice 16, section 8), and a `none`
+   given to an `opt` parameter adds nothing to its type, so that
+   instance's parameter is a `dyn?`. A late fold now refuses a call that
+   still reaches a template base (a RULE 2 divergence 8.1 exposed: the
+   parse's copy instantiated `T2[2](3)` while the program ran the base).
+   Tests: tests/functional/137, the `rule 8.1:` `-rt` rows. 8.2 (closure
+   and lambda-value instances) not started.
