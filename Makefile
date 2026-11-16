@@ -37,10 +37,19 @@ endif
 FL_OTHER ?= -fwrapv
 FL_INC = -I$(PROJ_ROOT)/src
 
-# macOS: a 16 MB main-thread stack, as CMake gives it - see CMakeLists.txt
-# (the compile passes recurse once per level of nesting, and an ASan build's
-# frames on arm64 outgrow the default 8 MB at the 256-level limit, #98)
-ifeq ($(shell uname -s),Darwin)
+# A 16 MB main-thread stack where the default is too small: the compile
+# passes recurse once per level of nesting (#98). Decided by what the
+# compiler builds FOR, not by `uname`: a-Shell on the iPad says Darwin too,
+# but its clang makes WebAssembly, whose linker has no -stack_size.
+# - macOS, as CMake gives it (see CMakeLists.txt): an ASan build's frames on
+#   arm64 outgrow the default 8 MB at the 256-level limit.
+# - WASI (a-Shell): wasm-ld's default stack is far smaller still, and
+#   --stack-first puts the stack below the data, so an overflow traps
+#   instead of silently overwriting memory.
+TARGET_TRIPLE := $(shell $(CXX) -dumpmachine)
+ifneq (,$(findstring wasm,$(TARGET_TRIPLE)))
+	LDFLAGS += -Wl,-z,stack-size=16777216 -Wl,--stack-first
+else ifneq (,$(findstring darwin,$(TARGET_TRIPLE)))
 	LDFLAGS += -Wl,-stack_size,0x1000000
 endif
 BASE_FLAGS ?= $(FL_INC) $(FL_LANG) $(FL_DBG) $(FL_WARN) $(FL_OTHER)
