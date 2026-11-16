@@ -1,0 +1,53 @@
+# A function literal that declares a struct, passed as an ARGUMENT to a
+# function the inliner would paste. The inliner clones an argument into
+# the pasted body and drops the call it replaces - with the original
+# literal, the node that owns the struct's definition (a clone shares the
+# definition and owns nothing). The pasted function then built instances
+# of a freed definition: a heap-use-after-free in every engine with the
+# inliner on, while -ni ran. Such a call now stays a call. Every argument
+# is a run-time value, so no call is folded away.
+
+var bad = 0;
+func want(what, got, exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected " + str(exp));
+        bad++;
+    }
+}
+
+func rt(int k) => int(runtime(k));
+
+# a block-bodied callee, an expression-bodied one, a tail call
+func app(f, x) { return f(x); }
+func ap2(f, x) => f(x);
+func tl(f, x) { return app(f, x); }
+
+want("field", app(func(v) { struct E { int n; } return E(v).n + 1; }, rt(3)),
+     4);
+
+var r = ap2(func(v) { struct E2 { int n; str s; } return E2(v, "x"); }, rt(5));
+want("instance field", r.n, 5);
+want("instance text", str(r), "E2(n: 5, s: \"x\")");
+
+func use(int k) {
+    return tl(func(v) { struct E3 { int n; } return E3(v).n * 2; }, k);
+}
+want("tail", use(rt(4)), 8);
+
+# thrown out of the pasted function, and caught by name
+var caught = 0;
+try {
+    app(func(v) { struct E4 { int n; } throw E4(v); }, rt(7));
+} catch (E4 as e) {
+    caught = e.n;
+}
+want("thrown", caught, 7);
+
+# in a loop: one definition, however many calls
+var t = 0;
+for (var i = 0; i < rt(3); i++)
+    t += app(func(v) { struct E5 { int a; int b; } return E5(v, v).b; }, i);
+want("loop", t, 3);
+
+assert(bad == 0);
+print("ok");

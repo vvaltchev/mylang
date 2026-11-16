@@ -2238,6 +2238,36 @@ static const std::vector<test> tests =
         "assert(ch([[1, 2]]) == 4);",
         "func pp(p) { pop(p); return len(p); }",
         "assert(pp([1, 2, 3]) == 2);" } },
+    /*
+     * An argument that is a function literal DECLARING A STRUCT. Every
+     * inlining engine clones an argument into the body it pastes, and the
+     * call it replaces dies with the original - the node that owns the
+     * struct's definition (a clone shares it and owns nothing). The pasted
+     * function then built instances of a freed definition: a
+     * heap-use-after-free in codegen, in every engine with the inliner on
+     * (2026-11-16; a sanitized build reports it, any other reads freed
+     * memory). Such a call stays a call. The three shapes are the block,
+     * the expression and the tail engine's; every argument is a run-time
+     * value, so nothing folds.
+     */
+    { "inline: a function literal argument that declares a struct",
+      { "func rt(int k) => int(runtime(k));",
+        "func app(f, x) { return f(x); }",
+        "var a = app(func(v) { struct E { int n; } return E(v).n + 1; },",
+        "            rt(3));",
+        "assert(a == 4);",
+        "func ap2(f, x) => f(x);",
+        "var r = ap2(func(v) { struct E2 { int n; } return E2(v); }, rt(5));",
+        "assert(r.n == 5 && str(r) == \"E2(n: 5)\");",
+        "func tl(f, x) { return app(f, x); }",
+        "func use(int k) {",
+        "  return tl(func(v) { struct E3 { int n; } return E3(v).n * 2; },",
+        "            k); }",
+        "assert(use(rt(4)) == 8);",
+        "var caught = 0;",
+        "try { app(func(v) { struct E4 { int n; } throw E4(v); }, rt(7)); }",
+        "catch (E4 as e) { caught = e.n; }",
+        "assert(caught == 7);" } },
     { "inline: a literal arg written through by an EXPRESSION body",
       { "func ap(p) => pop(p) + 1;",
         "assert(ap([1, 2]) == 3);" } },
