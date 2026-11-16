@@ -30,8 +30,13 @@ at run time (#49).
 | 18 | `isdefined()` for a name declared nowhere       | open       |
 | 19 | a stronger `--strict` (forward declarations)    | open       |
 | 20 | trace verbosity levels                          | open       |
-| 21 | a `const` container or function read before its | open       |
+| 21 | a `const` container or function read before its | decided: A |
 |    | declaration has run                             |            |
+| 22 | the type of a folded read of a constant         | open       |
+|    | container                                       |            |
+| 23 | a typed container reached through a `dyn` name  | decided    |
+| 24 | more than two variables in a dict `foreach`     | decided: A |
+| 25 | which struct a `catch` clause catches           | decided: A |
 
 8-20 were added on 2026-10-24, in priority order, and are presented
 three at a time. **PAUSED after 14 (maintainer, 2026-11-02):** the
@@ -586,3 +591,52 @@ const-fold of a constant-index access"); the README says nothing.
   element it reads. Keeps every program that compiles today compiling,
   but then the builtin fix should go the same way (`get` of a constant
   dict would be `int`, against the README).
+
+## 23. A typed container reached through a `dyn` name
+
+**DECIDED (maintainer, 2026-11-16).** A name not declared `dyn` is
+statically typed; a `dyn` name is a union that holds, at any moment,
+one value of one type. So `var dyn d = a` does not make `a`'s array
+dynamic, and a store through `d` that does not fit `a`'s type fails -
+"not because 'd' is not dyn, but because the type inside the
+discriminated union, the array, is not dynamic". A container that
+should be dynamic is made so where it is created (`var dyn d = [..]`).
+An empty container whose type the compiler could not know takes the
+type of the first typed place it lands in (question 9's rule, carried
+to run time). Design and the one open part (how a container is checked
+where it enters a typed place): `plans/typed-containers.md`.
+
+## 24. More than two variables in a dict `foreach`
+
+**DECIDED: A (maintainer, 2026-11-16) - done.** A dict entry is a key
+and a value: `foreach (var k, v, w in d)` is a compile error when the
+container is known to be a dict, and a TypeErrorEx at the container
+when it is `dyn` (it used to bind `none` to the extra variables). An
+empty dict raises nothing. README *foreach*.
+
+## 25. Which struct a `catch` clause catches
+
+**DECIDED: A (maintainer, 2026-11-16).** A clause compares the struct's
+NAME today, so `catch (Err)` catches every struct named `Err` - a
+function's private one included - its bound variable is `dyn`, and
+`catch (Nope)` compiles with no struct `Nope` anywhere:
+
+```C#
+func a(n) { struct Err { int code; } throw Err(n); }
+struct Err { bool ok; }
+try { a(runtime(7)); } catch (Err as e) { print(e); }  # Err(code: 7)
+```
+
+- **A - by identity** (recommended, chosen). `catch (Err)` resolves
+  `Err` at compile time like the type in `Err e;` and catches that
+  struct only; a name that names no struct is a compile error. A
+  struct private to a function cannot be caught by name outside it:
+  only the untyped catch-all `catch { }` catches it there. Built-in
+  exceptions (`TypeErrorEx`, ...) are unchanged.
+- **B - by name**, as today.
+
+Open beside it: the catch-all does not bind the exception. Binding it
+(`catch (dyn as e)` was proposed; `catch (e)` cannot be told from
+`catch (T)` by its shape, and with A a misspelled type would silently
+become a catch-all) is a new form, so it waits for the maintainer.
+

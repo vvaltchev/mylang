@@ -1,7 +1,9 @@
 # A container's type belongs to the container (Q2, 2026-11-16)
 
-**Status: the rule is the maintainer's (2026-11-16). One part is open:
-how a container is checked where it ENTERS a typed place (section 3).**
+**Status: the rule is the maintainer's (2026-11-16), and so is the
+empty-container rule (question 9, carried to run time). One part is
+open: how a container is checked where it ENTERS a typed place
+(section 3).**
 
 ## 1. The rule
 
@@ -41,9 +43,16 @@ Its static type where it is created, fixed for its lifetime:
   `set_array_repr_hint` / `literal_into`), else its own static type;
 - a literal written where `dyn` is declared (`var dyn d = [1, 2]`, an
   `array<dyn>` element, a `dyn` field) is dynamic: `array<dyn>`;
-- an empty `[]` / `{}` with no known type is `array<dyn>` /
-  `dict<dyn, dyn>` (question 9 already reads its element as unfilled);
-- a builtin's result: the call's static type (`keys(d)` of a
+- an empty `[]` / `{}` whose type the compiler could not know (written
+  where no type is known: `f[0] = []` through a `dyn` name, a `dyn`
+  argument) is UNTYPED until it first lands in a typed place, takes
+  that place's type then, and keeps it from then on - question 9's rule
+  ("an empty literal takes the element type of what is put into it")
+  carried to run time. Anything already put into it through a `dyn`
+  name must fit that type when it lands;
+- a builtin's result: the type of the place it is written into when
+  that place has one (`var dyn d = range(3)` is dynamic, as today's
+  general storage makes it), else the call's static type (`keys(d)` of a
   `dict<str,int>` is `array<str>`; `map`, `filter`, `range`,
   `make_array`, `split`, `sort`'s copy, `clone`, `deepclone`, a slice -
   which shares its storage and so its type - and `a + b`);
