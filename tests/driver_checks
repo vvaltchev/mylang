@@ -1305,15 +1305,28 @@ cat > "$TMP/athrow.my" <<'EOF'
 func a() { struct Err { int n; } throw Err(1); }
 a();
 EOF
+# And the branch a decided `if` keeps: AutoConst folded it while holding
+# it in a local, which the unwind freed the same way (`on` is a write-once
+# variable, so the PARSER does not decide this `if` - AutoConst does).
+cat > "$TMP/athrow2.my" <<'EOF'
+var on = true;
+if (on) {
+    func a() { struct Err { int n; } throw Err(1); }
+    a();
+}
+EOF
 uaf_bad=""
-for e in "" -tw -nj; do
-    # shellcheck disable=SC2086
-    out=$("$BIN" $e "$TMP/athrow.my" 2>&1)
-    r=$?
-    { [ $r = 1 ] &&
-      printf '%s' "$out" | grep -q "Uncaught exception 'Err', data: Err(n: 1)"
-    } || uaf_bad="$uaf_bad [${e:-default} rc $r: $(printf '%s' "$out" |
-                                                    head -c 200)]"
+for p in athrow athrow2; do
+    for e in "" -tw -nj; do
+        # shellcheck disable=SC2086
+        out=$("$BIN" $e "$TMP/$p.my" 2>&1)
+        r=$?
+        { [ $r = 1 ] &&
+          printf '%s' "$out" |
+              grep -q "Uncaught exception 'Err', data: Err(n: 1)"
+        } || uaf_bad="$uaf_bad [$p ${e:-default} rc $r: $(
+                 printf '%s' "$out" | head -c 200)]"
+    done
 done
 if [ -z "$uaf_bad" ]; then
     pass "a struct a compile-time fold throws outlives the fold"

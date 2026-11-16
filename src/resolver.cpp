@@ -985,11 +985,20 @@ private:
                     if (dead)
                         analysis->mark_dead(dead->start, dead->end);
                 }
-                unique_ptr<Construct> taken =
-                    t ? std::move(iff->thenBlock) : std::move(iff->elseBlock);
-                if (!taken || !fold_child(taken, fc))
+                /* Fold the live branch WHERE IT IS, and take it out of the
+                 * `if` only afterwards: its fold may RAISE (a constant call
+                 * that throws is a compile error), and a branch held by a
+                 * local would be freed while that exception unwinds - with
+                 * the function that owns the thrown struct's definition in
+                 * it, which the driver's report then reads (fold_block's
+                 * rule; `var on = true; if (on) { func a() { struct E {..}
+                 * throw E(1); } a(); }` was that use-after-free). */
+                unique_ptr<Construct> &live =
+                    t ? iff->thenBlock : iff->elseBlock;
+                if (!live || !fold_child(live, fc))
                     return false;          /* no live branch (or folds away) */
-                slot = std::move(taken);        /* replace if with its live branch */
+                unique_ptr<Construct> taken = std::move(live);
+                slot = std::move(taken);   /* the `if` becomes that branch */
                 return true;
             }
 
