@@ -135,7 +135,7 @@ words `str` -> `bool` accepts, containers, failures, implementation).
 
 ## 6. Order
 
-1. The cast (section 5).
+1. The cast (section 5) - built 2026-11-19.
 2. Measure, before changing any rule: which corpus programs and tests
    each of rules 1, 3 and 5 refuses (a compile run of tests/functional,
    tests/int, samples, bench/my and the `-rt` sources).

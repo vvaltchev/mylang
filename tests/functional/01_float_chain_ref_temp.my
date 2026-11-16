@@ -4,7 +4,7 @@
 # is what makes the ref-listed store take its cold arm, and it is the
 # shape two JIT register bugs needed. Deliberate here; in bench code it
 # happened only by accident.
-var av = dynarray(["3"]);
+var av = cast<array<dyn>>(["3"]);
 var scale = 1;
 if (len(av) > 0)
     scale = int(av[0]);

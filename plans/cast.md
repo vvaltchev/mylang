@@ -1,9 +1,18 @@
 # The cast: `cast<T>(x)`
 
-**Status: design decided by the maintainer (2026-11-19). Built FIRST,
-before the strict container rules of `strict-container-types.md`, which
-then use it wherever a program needs a conversion.** It is a new
-language feature, decided as such.
+**Status: design decided by the maintainer (2026-11-19); BUILT the same
+day (CLAUDE.md, "THE CAST"; README, "Casts").** Built FIRST, before the
+strict container rules of `strict-container-types.md`, which then use it
+wherever a program needs a conversion. It is a new language feature,
+decided as such.
+
+As built, three details the design left open: the cast's type is
+interned and its pool is a chunk's own (`Chunk::cast_types`, .myv v45),
+since `ctypes` admits container types only; a constant cast folds after
+inference, like a call with constant arguments, and stays a cast when
+its literal's type is not T (`cast<dyn>(5)`); and the tests that needed
+a general-storage typed array from `dynarray` now build one with an
+inline `keys()`.
 
 ## 1. The rules
 

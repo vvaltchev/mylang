@@ -47,6 +47,7 @@ as well.
     * [Structs](#structs)
       - [Type aliases](#type-aliases)
     * [Classes](#classes)
+    * [Casts](#casts)
     * [Boxes](#boxes)
     * [Exceptions](#exceptions)
       - [Custom exceptions](#custom-exceptions)
@@ -3155,6 +3156,103 @@ A class instance can refer to itself, directly or through others
 refers to is not reclaimed yet - the open design question is recorded in
 `plans/reference-cycles.md`.
 
+### Casts
+
+`cast<T>(x)` converts `x` to **exactly** the type `T`, when the program
+runs. `cast` is a keyword; `T` is any complete type, written as a
+declaration writes it - a scalar, `T?`, a struct or class name, a type
+alias, `box<...>`, `array<...>`, `dict<...>`, nested as deep as you like.
+A bare `array` or `dict` (`cast<array>(x)`) leaves the element type open,
+so it is refused at compile time: the cast's type is what it makes. The
+result's static type is `T`, and the value has exactly that type (a
+container carries `T` as its own type).
+
+```
+array<int> xs = [1, 2, 3];
+var fs = cast<array<float>>(xs);    # a NEW array<float>: [1.0, 2.0, 3.0]
+var n = cast<int>("42");            # 42
+var on = cast<bool>("Yes");         # true
+var dyn v = runtime("2.5");
+float f = cast<float>(v);           # 2.5
+```
+
+**Scalars** convert both ways:
+
+| to \ from | `bool`     | `int`        | `float`        | `str`         |
+|-----------|------------|--------------|----------------|---------------|
+| `bool`    | same       | 0 / 1 only   | 0.0 / 1.0 only | the words     |
+| `int`     | 0 / 1      | same         | = `int(f)`     | = `int(s)`    |
+| `float`   | 0.0 / 1.0  | = `float(i)` | same           | = `float(s)`  |
+| `str`     | = `str(b)` | = `str(i)`   | = `str(f)`     | same          |
+
+  * A float becomes an int as [`int()`](#intvalue) makes one: it is
+    truncated, and a NaN, an infinity or a value outside the int range
+    is refused. A string becomes a number as `int()` / `float()` read
+    one: the whole string is the number.
+  * A number becomes a bool only from 0 or 1 (0.0 or 1.0).
+  * A string becomes a bool from one of these words, in any case and
+    with nothing around it: `true`, `yes`, `on`, `enabled` give `true`;
+    `false`, `no`, `off`, `disabled` give `false`.
+  * Only a scalar becomes a `str`: `str(x)` still prints a container,
+    but `cast<str>` of one is refused.
+
+**`none`, `T?` and `dyn`.** `cast<T?>` lets `none` through and casts any
+other value to `T`; a `T` without `?` refuses `none`. `cast<dyn?>(x)`
+always succeeds and keeps the value as it is - only its static type
+changes; `cast<dyn>(x)` is the same once it has checked that `x` is not
+`none`.
+
+**Containers.** `cast<array<E>>(a)` and `cast<dict<K, V>>(d)` build a
+NEW container of the type `T`, stored as `T` stores it (an
+`array<int>` flat, an `array<dyn>` general), converting each element -
+each key and value - by these rules, at every level. A nested container
+that already has its target type is not copied: the new container
+shares it, as a shallow copy would. Under a `dyn` element type the
+elements are kept as they are. A dict keeps its order and its default
+(converted too). Two keys that become the same key (`"1"` and `"01"`
+both become `1`) are refused, naming both: one of the entries would be
+lost. An array never becomes a dict, nor a dict an array.
+
+```
+dict<str, int> d = {"a": 1, "b": 2};
+var f = cast<dict<str, float>>(d);       # {"a": 1.0, "b": 2.0}
+var dyn rows = runtime([[1, 2], [3]]);
+var m = cast<array<array<int>>>(rows);   # typed array<array<int>>
+var dyn mixed = cast<array<dyn>>(xs);    # a general copy of xs
+append(mixed, "x");                      # now it can hold anything
+```
+
+**Structs, classes, boxes.** The value must already be that struct, that
+class or that box type (a `dyn` holding one is checked when the cast
+runs); the cast returns a copy - a class instance comes back as a NEW
+instance with the same field values, a box as a new box.
+
+**Failures.** A value the conversion cannot take raises
+`InvalidValueEx` (`"abc"` to an `int`, `2` to a `bool`, NaN to an `int`,
+two colliding keys); a value of the wrong kind raises `TypeErrorEx` (an
+array to an `int`, a struct `Q` to `P`, `none` to a type without `?`).
+The message names where inside the value the problem is, and the caret
+marks the cast's argument:
+
+```
+var dyn x = runtime(["1", "x"]);
+cast<array<int>>(x);   # InvalidValueEx: cast<array<int>>: [1] "x" is not
+                       # an int
+```
+
+Nothing is changed when a cast fails: the source is never written, and
+no partial result is left anywhere.
+
+**At compile time.** A cast that no value of its argument's type could
+survive is a compile error (`TypeMismatchEx`): `cast<int>(xs)` with `xs`
+an `array<int>`, `cast<array<int>>(5)`, `cast<P>(q)` with `q` a `Q`,
+`cast<dyn>(none)`. A cast of a constant is evaluated while compiling, so
+one that fails (`cast<int>("abc")`) is a compile error too, as
+`int("abc")` is. A `const` bound to a cast holds the cast's value, and
+like every constant its type is that value's exact type: `const K =
+cast<array<int?>>([1, 2]);` is an `array<int>`, since no `none` can ever
+be stored into a constant.
+
 ### Boxes
 
 A **box** is a reference to one value: `box(v)` makes one, and the prefix
@@ -4200,9 +4298,10 @@ To get a polymorphic (general) array on purpose:
     make an array general either — it only changes the array's *static
     type* as the compiler sees it, not how it is stored, so the value stays
     flat and a mixed write still throws.)
-  * **Promote an existing array with `dynarray()`** (below) — `clone()` /
-    `deepclone()` deliberately preserve the layout, so a clone of a flat array
-    is still flat.
+  * **Promote an existing array with a cast**: `cast<array<dyn>>(a)` (see
+    [Casts](#casts)) builds a general copy — `clone()` / `deepclone()`
+    deliberately preserve the layout, so a clone of a flat array is still
+    flat.
 
 ### Non-const reflection builtins
 Runtime introspection of the live program state. They are ordinary (non-const)
@@ -4356,17 +4455,6 @@ An alias for `append()`. Useful for symmetry when used with `pop()`.
 #### `pop(array)`
 Pop (and return) the last element from the given array. Popping an empty
 array throws `OutOfBoundsEx`.
-
-#### `dynarray(array)`
-Return a fresh, **general (polymorphic) copy** of `array` — its static type is
-`array<dyn>`, so the copy can hold elements of any type. This is the explicit,
-manual way to "promote" a flat (`int`/`float`) array into one you can store
-mixed types into; there is no automatic runtime promotion (see
-[`array_storage()`](#array_storagearray)). The original is left untouched and
-keeps its compact layout, and the copy is independent of it (unlike a plain
-`var d = a`, which aliases). The copy is shallow (top-level): nested arrays keep
-their own representation. Compare `var dyn a = [...]`, which builds a general
-array from the start.
 
 ### Non-const generic-container builtins
 

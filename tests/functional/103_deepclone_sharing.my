@@ -72,7 +72,7 @@ c7[0][0] = 9;
 append(seen, c7[1][0]);                    # 9
 
 # 8. a cycle, still reproduced; the original is untouched by all of it
-var dyn cyc = dynarray([1]);
+var dyn cyc = cast<array<dyn>>([1]);
 append(cyc, cyc);
 var dyn c8 = deepclone(cyc);
 c8[0] = 9;

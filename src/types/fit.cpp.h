@@ -491,6 +491,14 @@ std::string annot_text(const TypeAnnot *a)
     return fit_annot_text(*a);
 }
 
+std::string annot_type_text(const TypeAnnot *a)
+{
+    std::string s = fit_annot_text(*annot_nonopt(a));
+    if (a->opt)
+        s += '?';
+    return s;
+}
+
 bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit &why)
 {
     FitWalk w;

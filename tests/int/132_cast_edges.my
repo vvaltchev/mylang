@@ -1,0 +1,170 @@
+# INT-ENGINES: tw default nj noopt nc
+#
+# INT unit: cast<T>(x) (README, "Casts"; plans/cast.md) - every branch of
+# cast_value (types/cast.cpp.h) a program can take: each cell of the
+# scalar table and its refusals, a refusal at each position inside a
+# container (an element, a dict key, a dict value, the default), a long
+# string named in a message, each storage an array is rebuilt in, a
+# nested container shared when it has its target type and converted once
+# when met twice, and the struct / class / box checks. The verdicts are
+# asserted, so an engine that converts or refuses differently fails; the
+# tree-walker is the oracle for the rest.
+
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+func how(dyn f) {
+    try { f(); return "ok"; }
+    catch (InvalidValueEx) { return "value"; }
+    catch (TypeErrorEx) { return "kind"; }
+}
+
+# ---- the scalar table, from `dyn` (decided when the cast runs)
+var dyn tb = runtime(true);
+var dyn fb = runtime(false);
+var dyn i0 = runtime(0);
+var dyn i1 = runtime(1);
+var dyn f0 = runtime(0.0);
+var dyn f1 = runtime(1.0);
+want("b b", cast<bool>(tb), true);
+want("i b0", cast<bool>(i0), false);
+want("i b1", cast<bool>(i1), true);
+want("f b0", cast<bool>(f0), false);
+want("f b1", cast<bool>(f1), true);
+want("b i", cast<int>(fb), 0);
+want("b f", cast<float>(fb), 0.0);
+want("b s", cast<str>(fb), "false");
+want("i i", cast<int>(i1), 1);
+want("f f", cast<float>(f1), 1.0);
+want("s s", cast<str>(runtime("s")), "s");
+want("f s", cast<str>(runtime(-0.5)), "-0.500000");
+want("f i lim", how(func() => cast<int>(runtime(1e19))), "value");
+want("f i -lim", how(func() => cast<int>(runtime(-1e19))), "value");
+want("s f big", cast<float>(runtime("1e999")) > 1e300, true);
+
+# the words: every one, a word of another length, one letter off
+var yes = ["true", "Yes", "ON", "eNaBlEd"];
+var no = ["FALSE", "nO", "off", "DISABLED"];
+foreach (w in yes)
+    want("yes " + w, cast<bool>(runtime(w)), true);
+foreach (w in no)
+    want("no " + w, cast<bool>(runtime(w)), false);
+want("word len", how(func() => cast<bool>(runtime("yess"))), "value");
+want("word char", how(func() => cast<bool>(runtime("yet"))), "value");
+want("word space", how(func() => cast<bool>(runtime(" yes"))), "value");
+
+# a value of the wrong kind for each scalar target, and a long string
+var dyn arr = runtime([1]);
+want("arr b", how(func[arr]() => cast<bool>(arr)), "kind");
+want("arr i", how(func[arr]() => cast<int>(arr)), "kind");
+want("arr f", how(func[arr]() => cast<float>(arr)), "kind");
+want("long s", how(func() => cast<int>(runtime(
+    "a string much longer than forty characters, cut in the message"))),
+    "value");
+want("s i over", how(func() => cast<int>(runtime("99999999999999999999"))),
+     "value");
+
+# ---- a refusal at each position inside a container
+var dyn rows = runtime([[1, 2], [3, "x"]]);
+want("nested elem", how(func[rows]() => cast<array<array<int>>>(rows)),
+     "value");
+var dyn dk = runtime({"1": 1, "two": 2});
+want("dict key", how(func[dk]() => cast<dict<int, int>>(dk)), "value");
+var dyn dv = runtime({"a": "1", "b": "x"});
+want("dict value", how(func[dv]() => cast<dict<str, int>>(dv)), "value");
+dict<str, str> dd = dict("x");
+dd["a"] = "1";
+want("dict default", how(func[dd]() => cast<dict<str, int>>(dd)),
+     "value");
+want("dict default ok", cast<dict<str, int>>(dict(runtime("5")))["q"], 5);
+var dyn dn = runtime({"a": none});
+want("dict none", how(func[dn]() => cast<dict<str, int>>(dn)), "kind");
+want("dict none ok", str(cast<dict<str, dyn?>>(dn)), "{\"a\": <none>}");
+want("dict not arr", how(func[arr]() => cast<dict<int, int>>(arr)),
+     "kind");
+var dyn kc = runtime({1.5: "a", 1.25: "b", 2.5: "c"});
+want("key collision", how(func[kc]() => cast<dict<int, str>>(kc)),
+     "value");
+
+# ---- each storage an array is rebuilt in
+struct P { int x; }
+struct B { int x; array<int> xs; }
+class C { int v; }
+var dyn ps = runtime([P(1), P(2)]);
+want("pod storage", array_storage(cast<array<P>>(ps)), "struct");
+var dyn bs = runtime([B(1, [1])]);
+want("boxed storage", array_storage(cast<array<B>>(bs)), "general");
+var c1 = C(1);
+var dyn cs = runtime([c1, C(2)]);
+var cc = cast<array<C>>(cs);
+want("class storage", array_storage(cc), "class");
+want("class shared below the top", cc[0] == c1, true);
+want("opt storage", array_storage(cast<array<int?>>(runtime([1]))),
+     "general");
+want("str storage", array_storage(cast<array<str>>(runtime([1]))),
+     "general");
+want("bool storage", array_storage(cast<array<bool>>(runtime([1, 0]))),
+     "bool");
+want("dyn elems kept", cast<array<dyn>>(runtime([1, "a"])), [1, "a"]);
+want("dyn none", how(func() => cast<array<dyn>>(runtime([none]))), "kind");
+want("empty", cast<array<int>>(runtime([])), []);
+
+# ---- sharing: a nested container of its target type is shared; one
+# met twice is converted once (arrays and dicts)
+array<int> in1 = [1];
+dict<str, int> dm = {"a": 1};
+var twice = [dm, dm];
+var tc = cast<array<dict<str, float>>>(twice);
+want("dict once", intptr(tc[0]) == intptr(tc[1]), true);
+var tk = cast<array<dict<str, int>>>(twice);
+want("dict shared", intptr(tk[0]) == intptr(dm), true);
+var ta = cast<dict<str, array<int>>>({"p": in1, "q": in1});
+want("arr shared", intptr(ta["p"]) == intptr(in1), true);
+var tf = cast<dict<str, array<float>>>({"p": in1, "q": in1});
+want("arr once", intptr(tf["p"]) == intptr(tf["q"]), true);
+want("top copied", intptr(cast<array<int>>(in1)) != intptr(in1), true);
+want("top dict copied", intptr(cast<dict<str, int>>(dm)) != intptr(dm),
+     true);
+
+# ---- structs, classes, boxes
+var p = P(4);
+want("struct", cast<P>(p).x, 4);
+var dyn sp = runtime(p);
+want("struct dyn", cast<P>(sp).x, 4);
+var dyn sq = runtime(B(1, []));
+want("other struct", how(func[sq]() => cast<P>(sq)), "kind");
+want("not struct", how(func[arr]() => cast<P>(arr)), "kind");
+var dyn bp = runtime(box(P(2)));
+want("box<P> is no P", how(func[bp]() => cast<P>(bp)), "kind");
+want("box<P>", (*cast<box<P>>(bp)).x, 2);
+var dyn bi = runtime(box(3));
+want("box kind", how(func[bi]() => cast<box<float>>(bi)), "kind");
+want("box int", *cast<box<int>>(bi), 3);
+var bx = box(7);
+var bxs = cast<array<box<int>>>([bx]);
+want("box shared below the top", intptr(bxs[0]) == intptr(bx), true);
+var ps2 = cast<array<P>>([p]);
+want("struct below the top", ps2[0].x, 4);
+
+# ---- none and dyn
+want("int? none", cast<int?>(runtime(none)), none);
+want("array? none", cast<array<int>?>(runtime(none)), none);
+want("dyn", cast<dyn>(runtime(5)), 5);
+want("dyn none", how(func() => cast<dyn>(runtime(none))), "kind");
+want("int none", how(func() => cast<int>(runtime(none))), "kind");
+
+# ---- a cast in a pure function, folded where a call folds
+pure func half(int n) => cast<float>(n) / 2;
+want("pure", half(3), 1.5);
+pure func fl(int n) => cast<array<float>>([n, n]);
+want("pure arr", fl(2), [2.0, 2.0]);
+const K = cast<array<float>>([1, 2]);
+want("const", K, [1.0, 2.0]);
+
+assert(bad == 0);
+print("ok");

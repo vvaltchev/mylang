@@ -704,6 +704,26 @@ static std::shared_ptr<TypeAnnot> read_annot(Reader &r, int depth)
     return a;
 }
 
+/* A cast's type is COMPLETE: no bare `array` / `dict` anywhere in it (the
+ * parser refuses one), and a struct annotation names its struct */
+static bool annot_complete(const TypeAnnot *a)
+{
+    switch (a->kind) {
+    case DeclType::arr:
+    case DeclType::box:
+        return a->elem && annot_complete(a->elem.get());
+    case DeclType::dict:
+        return a->key && a->val && annot_complete(a->key.get())
+               && annot_complete(a->val.get());
+    case DeclType::strct:
+        return a->strct != nullptr;
+    case DeclType::none:
+        return false;
+    default:
+        return true;
+    }
+}
+
 /* Q2 (v43): a container's own type - an annotation, interned at load. A
  * container's type is an array<T> / dict<K, V> with no top-level `?`
  * (`dict`: which of the two this container is) */
@@ -1678,6 +1698,11 @@ void write_chunk(Writer &w, const Chunk &c)
     for (const TypeAnnot *t : c.ctypes)
         write_annot(w, t);
 
+    /* v45: the casts' types (Chunk::cast_types) */
+    w.u32v(static_cast<uint32_t>(c.cast_types.size()));
+    for (const TypeAnnot *t : c.cast_types)
+        write_annot(w, t);
+
     w.u32v(static_cast<uint32_t>(c.emplace_sites.size()));
     for (const auto &es : c.emplace_sites) {
         auto it = w.struct_ids.find(es.def);
@@ -2040,6 +2065,15 @@ void read_chunk(Reader &r, Chunk &c)
                 || (a->kind != DeclType::arr && a->kind != DeclType::dict))
             bad_image("corrupt .myv (ctype)");
         c.ctypes.push_back(annot_intern(*a));
+    }
+
+    n = r.countv();                          /* v45: cast_types */
+    c.cast_types.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        std::shared_ptr<TypeAnnot> a = read_annot(r, 0);
+        if (!a || !annot_complete(a.get()))
+            bad_image("corrupt .myv (cast type)");
+        c.cast_types.push_back(annot_intern(*a));
     }
 
     n = r.countv();

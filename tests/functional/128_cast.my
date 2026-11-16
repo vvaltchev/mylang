@@ -1,0 +1,172 @@
+# cast<T>(x) (README, "Casts"; plans/cast.md): the value converted to
+# EXACTLY T, by one function every engine calls (cast_value). Each shape
+# is asserted by value and by type, and the refusals by their exception,
+# so an engine or a JIT tier that converted differently - or refused
+# differently - fails here. Several casts run inside loops, so the JIT's
+# CastV (jit_cast) runs them, not only the interpreter.
+
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+# ---- scalars, every cell of the table (dyn sources: run-time casts)
+var dyn ib = runtime(true);
+var dyn ii = runtime(7);
+var dyn ifl = runtime(2.75);
+var dyn is = runtime("12");
+want("bool->int", cast<int>(ib), 1);
+want("bool->float", cast<float>(ib), 1.0);
+want("bool->str", cast<str>(ib), "true");
+want("int->bool", cast<bool>(runtime(0)), false);
+want("int->float", cast<float>(ii), 7.0);
+want("int->str", cast<str>(ii), "7");
+want("float->bool", cast<bool>(runtime(1.0)), true);
+want("float->int", cast<int>(ifl), 2);
+want("float->int neg", cast<int>(runtime(-2.75)), -2);
+want("float->str", cast<str>(ifl), "2.750000");
+want("str->int", cast<int>(is), 12);
+want("str->float", cast<float>(runtime("2.5")), 2.5);
+want("same int", cast<int>(ii), 7);
+want("typestr", typestr(cast<float>(ii)), "float");
+
+# the words, case ignored
+var words = ["true", "YES", "On", "enabled", "False", "no", "OFF",
+             "Disabled"];
+var wres = [];
+foreach (w in words)
+    append(wres, cast<bool>(runtime(w)));
+want("words", wres, [true, true, true, true, false, false, false, false]);
+
+# ---- refusals: the exception, the source untouched
+func refused(dyn f) {
+    try { f(); return "ok"; }
+    catch (InvalidValueEx) { return "value"; }
+    catch (TypeErrorEx) { return "kind"; }
+}
+want("int 2 -> bool", refused(func() => cast<bool>(runtime(2))), "value");
+want("0.5 -> bool", refused(func() => cast<bool>(runtime(0.5))), "value");
+want("word", refused(func() => cast<bool>(runtime("maybe"))), "value");
+want("nan -> int", refused(func() => cast<int>(runtime(nan))), "value");
+want("inf -> int", refused(func() => cast<int>(runtime(inf))), "value");
+want("abc -> int", refused(func() => cast<int>(runtime("abc"))), "value");
+want("huge -> int",
+     refused(func() => cast<int>(runtime("99999999999999999999"))),
+     "value");
+want("abc -> float", refused(func() => cast<float>(runtime("x"))),
+     "value");
+want("none -> int", refused(func() => cast<int>(runtime(none))), "kind");
+want("arr -> int", refused(func() => cast<int>(runtime([1]))), "kind");
+want("arr -> str", refused(func() => cast<str>(runtime([1]))), "kind");
+want("dict -> arr", refused(func() => cast<array<int>>(runtime({}))),
+     "kind");
+want("none -> dyn", refused(func() => cast<dyn>(runtime(none))), "kind");
+
+# ---- none, T?, dyn, dyn?
+want("int? none", cast<int?>(runtime(none)), none);
+want("int? 5", cast<int?>(runtime("5")), 5);
+want("dyn? none", cast<dyn?>(runtime(none)), none);
+array<int> xs = [1, 2, 3];
+want("dyn keeps", intptr(cast<dyn>(xs)) == intptr(xs), true);
+want("dyn? keeps", intptr(cast<dyn?>(xs)) == intptr(xs), true);
+
+# ---- arrays: a NEW container of exactly T, in T's storage
+var fs = cast<array<float>>(xs);
+want("arr float", fs, [1.0, 2.0, 3.0]);
+want("arr float type", typestr(fs), "array<float>");
+want("arr float storage", array_storage(fs), "float");
+fs[0] = 9.5;
+want("arr new", xs[0], 1);
+var same = cast<array<int>>(xs);
+want("same type copy", intptr(same) != intptr(xs), true);
+append(same, 4);
+want("same type independent", len(xs), 3);
+var gs = cast<array<dyn>>(xs);
+want("dyn storage", array_storage(gs), "general");
+append(gs, "s");
+want("dyn holds any", len(gs), 4);
+var ss = cast<array<str>>(runtime([1, 2]));
+want("arr str", ss, ["1", "2"]);
+var ns = cast<array<int?>>(runtime([1, none, 3]));
+want("arr opt", ns, [1, none, 3]);
+want("arr opt refused",
+     refused(func() => cast<array<int>>(runtime([1, none]))), "kind");
+want("arr element value",
+     refused(func() => cast<array<int>>(runtime(["1", "x"]))), "value");
+
+# a nested container already of its target type is shared, one of
+# another type rebuilt
+# (under -nti no inference types `inner`, so it is untyped and rebuilt)
+var typed = typestr(runtime(0)) == "dyn";
+array<int> inner = [1, 2];
+array<array<int>> outer = [inner, inner];
+var oc = cast<array<array<int>>>(outer);
+want("nested shared", intptr(oc[0]) == intptr(inner), typed);
+var of = cast<array<array<float>>>(outer);
+want("nested rebuilt", of, [[1.0, 2.0], [1.0, 2.0]]);
+want("nested rebuilt once", intptr(of[0]) == intptr(of[1]), true);
+
+# ---- dicts: order and default kept, a collision refused
+dict<str, int> d = dict(0);
+d["z"] = 1;
+d["a"] = 2;
+var df = cast<dict<str, float>>(d);
+want("dict", str(df), "{\"z\": 1.000000, \"a\": 2.000000}");
+want("dict default", df["nope"], 0.0);
+want("dict type", typestr(df), "dict<str,float>");
+want("dict keys",
+     str(cast<dict<int, str>>(runtime({"1": "a", "2": "b"}))),
+     "{1: \"a\", 2: \"b\"}");
+want("dict collision",
+     refused(func() => cast<dict<int, str>>(runtime({"1": "a",
+                                                     "01": "b"}))),
+     "value");
+
+# ---- structs, classes, boxes: copies
+struct P { int x; }
+class C { int v; }
+var p = P(1);
+var p2 = cast<P>(p);
+p2.x = 9;
+want("struct copy", p.x, 1);
+var c = C(1);
+var c2 = cast<C>(c);
+c2.v = 7;
+want("class new instance", c.v * 10 + c2.v, 17);
+want("class identity", c == c2, false);
+var b = box(5);
+var b2 = cast<box<int>>(b);
+*b2 = 6;
+want("box new", *b, 5);
+want("struct kind", refused(func[c]() => cast<P>(runtime(c))), "kind");
+
+# ---- casts in a loop (the JIT's CastV)
+var acc = 0.0;
+var sacc = 0;
+for (var i = 0; i < 200; i++) {
+    acc += cast<float>(i) / 2;
+    sacc += cast<int>(str(i));
+}
+want("loop float", acc, 9950.0);
+want("loop str->int", sacc, 19900);
+var rows = [];
+for (var i = 0; i < 50; i++)
+    append(rows, cast<array<float>>([i, i + 1]));
+want("loop arrays", rows[49], [49.0, 50.0]);
+var caught = 0;
+for (var i = 0; i < 100; i++) {
+    try { cast<bool>(runtime(i)); }
+    catch (InvalidValueEx) { caught++; }
+}
+want("loop refusals", caught, 98);
+
+# a promoted (auto-const) variable read inside a cast
+var n = 5;
+want("auto-const operand", cast<float>(n) / 2, 2.5);
+
+assert(bad == 0);
+print("ok");

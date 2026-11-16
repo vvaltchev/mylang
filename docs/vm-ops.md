@@ -1841,6 +1841,26 @@ static type, `Chunk::ctypes[ref - 1]`: the BinOpV copies `a` untyped
 narrower type. Never throws, defines nothing; `jit_stamp_ctype` natively;
 not bytecode-inlined. myv **v43** (APPENDED).
 
+**`CastV dst = cast<T>(src)` — the cast (plans/cast.md, 2026-11-19).**
+`a` is the source slot, `target2` an index into `Chunk::cast_types` (the
+interned, complete TypeAnnot T - any kind, `?` included; a pool of its
+own, since `ctypes` holds container types only). The handler and
+`jit_cast` call `cast_value` (types/cast.cpp.h), the conversion every
+engine shares, and write the result into `dst` - which may hold a
+reference (a container, an instance, a `dyn` value). A refusal raises
+`InvalidValueEx` (a value the conversion cannot take) or `TypeErrorEx`
+(a value of the wrong kind) with the ARGUMENT's caret: the op's `locs`
+entry comes from `loc_node_idx` = the cast's operand, while its
+`node_idx` (the inlined-at chain) is the cast. A `cast<int>` /
+`cast<bool>` / `cast<float>` operand of typed code is compiled by
+`compile_int_expr` / `compile_float_expr` into the temp CastV writes,
+which then holds exactly that kind (a bool reads as its 0 / 1 payload).
+Use/def: reads `a`, defines `target`. Fully native (`jit_cast`, conveys,
+exc-stamped); not bytecode-inlined (its index names the callee's pool).
+Bounded by `verify_chunk` (`target2 < cast_types.size()`); myv **v45**
+(APPENDED; the pool is section 9.11c), and `-vd` prints `cast dst = src
+; cast<T>`.
+
 **`Chunk::op_locs` — a COMPOUND store's OPERATION caret (RULE 2,
 2026-09-25).** `lv OP= rhs` (and `lv++`) fails in two places, and the
 tree-walker carets them differently: REACHING the element (an OOB index, a

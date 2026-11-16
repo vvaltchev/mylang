@@ -5049,6 +5049,44 @@ decisions behind it: `plans/archived/type-inference.md`,
   `typed`, `typestr(runtime(0)) == "dyn"`). Net:
   `tests/functional/93_dyn_fit.my` (every place, refused and fitting,
   old value kept).
+- **⛔ THE CAST, `cast<T>(x)`, IS ONE FUNCTION: `cast_value`
+  (types/cast.cpp.h; plans/cast.md, README *Casts*, 2026-11-19).** The
+  AST node is `CastExpr` (`ConstructType::cast`; `to` is the INTERNED,
+  complete TypeAnnot - the parser refuses a bare `array` / `dict` at any
+  depth), the opcode `CastV` (its type an index into
+  `Chunk::cast_types`, a pool of its own because `Chunk::ctypes` admits
+  container types only; `.myv` v45), the JIT helper `jit_cast` (a
+  conveying status helper). Every engine converts through
+  `cast_value` / `cast_value_loc`, so the conversions, the refusals and
+  their messages cannot drift. Four rules a change here must keep:
+  - **the result has EXACTLY type T**: `type_of` is T whatever the
+    operand, a container is rebuilt in T's storage
+    (`cast_arr_hint`: flat for a non-opt int / float / bool and a POD
+    struct, the class references for a class, else general) and carries
+    T as its `ctype`. A nested container that already carries its
+    target type is SHARED (a memo per walk shares one met twice); the
+    top is always new (a struct / class / box copied with `clone()`).
+    `cast<dyn?>` returns the value itself;
+  - **a never-possible cast is a compile error** (`check_cast` /
+    `cast_possible`, inferencer.cpp): decided per COMPONENT, an unknown
+    or `dyn` source - or component - decided at run time, a `none`
+    component UNFILLED (an empty container casts to any container
+    type), the value `none` refused unless T is `?` (or `dyn?`);
+  - **a constant cast folds like a call with constant arguments**
+    (`pCastExpr`: evaluated at parse time for its errors, deferred to
+    #96's late fold, which keeps the node when its literal's type is
+    not T's - `cast<dyn>(5)` stays a cast). AutoConst and the inliner's
+    refold descend into the operand (`fold_reads` has an explicit arm:
+    a promoted `n` read inside a cast was left reading a dropped
+    declaration's slot, `none`) but never fold the cast itself;
+  - **the operand is an expression like any other**: every walker
+    classifies the node (the exhaustive switches; `esc_known_shape`
+    DECLINES it, since `cast<dyn?>(p)` IS `p`; the callee-set analysis
+    passes the operand's set through).
+  `dynarray()` is gone: `cast<array<dyn>>(a)` / `cast<array<dyn?>>(a)`
+  replace it. A test that needs a GENERAL-storage typed array (which
+  `dynarray`'s place-typed call used to make) builds one with an inline
+  `keys()` (tests/int/93, 106).
 - **AN ASSIGNMENT'S VALUE IS THE STORED VALUE (2026-10-05).** `type_of`
   of `t = v` is v's type WIDENED to the target's numeric static type
   (`numeric_widen`: int/bool into float, bool into int), for a variable,
@@ -5368,7 +5406,7 @@ bools correctly yields int). `Construct`/`Identifier`/`Subscript`
 GENERAL array's element too (`general_elem_int`, eval.h, which every
 engine's element-int read calls, and its float twin `general_elem_float`
 for a typed float chain's int or bool operand): an `array<bool>` is not
-always flat (an inline `keys()` of a `dict<bool, ...>`, `dynarray()`), and
+always flat (an inline `keys()` of a `dict<bool, ...>`), and
 `if (b[i])` on a general one raised TypeErrorEx in every engine until
 2026-11-07 (`x * b[i]` in the tree-walker alone).
 **⛔ SO `th == i` DOES NOT MEAN "int" - IT ALSO MEANS BOOL, AND A
@@ -7241,9 +7279,9 @@ per level of a deep value - a separate open item.
   Since the storage stays int-typed and an alias-affecting write can't change
   its representation without promotion, that **throws a `TypeErrorEx`** (message
   `flat_array_violation_msg`) — declare the array `dyn` from the start, or
-  promote an existing one with the **`dynarray(a)`** builtin
-  (`builtin_dynarray`: a fresh general copy, typed `array<dyn>`, usable in any
-  position; `clone`/`deepclone` deliberately preserve the layout). `runtime()`
+  promote an existing one with a cast, **`cast<array<dyn>>(a)`** (a fresh
+  general copy, typed `array<dyn>`, usable in any position - see THE CAST
+  below; `clone`/`deepclone` deliberately preserve the layout). `runtime()`
   does *not* promote — it only relabels the static type, not the storage.
   `array_storage(a)` reports the element-type name
   `"int"`/`"float"`/`"bool"`/`"struct"`/`"general"` (tests pin it). **Gotcha:**
@@ -7699,8 +7737,8 @@ but the per-element `StructObject` allocation is gone (build overhead
   checks all come from the shared machinery. `CallExpr::do_eval` →
   `construct_struct` builds the boxed instance; `coerce_struct_field`
   coerces a numeric field and **runtime-validates** each field's type (guarding
-  a `dyn`-laundered value; the `dynarray`-style escape hatch is just declaring
-  the field `dyn`). `type_of(Point(..))` is `StaticTypeKind::Struct`
+  a `dyn`-laundered value; the escape hatch is just declaring the field
+  `dyn`). `type_of(Point(..))` is `StaticTypeKind::Struct`
   (`statictype.h`'s
   reserved `Struct` kind + `struct_def`/`struct_name`;
   `StaticTypeArena::struct_ty`).

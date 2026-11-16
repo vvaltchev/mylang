@@ -6634,6 +6634,26 @@ void vm_struct_elem_into(LValue &dst, const EvalValue &arrv, int_type idx)
 }
 
 /*
+ * `cast<T>(x)`: cast_value, its refusal carrying the argument's caret. A
+ * constant evaluation (the parser's fold) refuses a string's float out of
+ * range, as float(s) does.
+ */
+EvalValue CastExpr::do_eval(EvalContext *ctx, bool rec) const
+{
+    /* an error reading the argument (a REPL name no input declared)
+     * carets the argument, as a call's does */
+    EvalValue v;
+    try {
+        v = RValue(elem->eval(ctx));
+    } catch (Exception &e) {    /* INT-COV-EXEMPT: its type test fails */
+        stamp_operand_loc(elem.get(), e);
+        throw;
+    }
+    return cast_value_loc(v, *to, ctx->in_const_eval(), elem->start,
+                          elem->end);
+}
+
+/*
  * `*b`: the value the box holds (box_load). A box<P> reads a COPY of its
  * struct, a value. The caret of a misuse (not a box, none) is the `*b`.
  */

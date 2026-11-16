@@ -54,33 +54,45 @@ func gdict(dict d) => len(d);
 func adyn(array<dyn> a) => len(a);
 func abox(array<box<int>> a) => len(a);
 
+# an UNTYPED general array holding a's elements: a literal nested in an
+# array<dyn> carries no type of its own, and a store through `dyn` into
+# an untyped array checks nothing
+func ug(dyn a) {
+    array<dyn> h = [[none]];
+    var dyn r = h[0];
+    pop(r);
+    foreach (e in a)
+        append(r, e);
+    return r;
+}
+
 # a container only `dyn` reaches - each one made as an element of an
 # array<dyn> - carries no type of its own, so it is walked by what it
-# holds (a TYPED one is checked by its own type, Q2 decision A:
-# dynarray()'s array<dyn> and dict(5)'s dict<dyn, int> enter no
-# narrower place, "ai dynarray" and "dsi dict default" below). Each is
+# holds (a TYPED one is checked by its own type, Q2 decision A: a
+# cast<array<dyn>>'s array<dyn> and dict(5)'s dict<dyn, int> enter no
+# narrower place, "ai cast" and "dsi dict default" below). Each is
 # used once: one that fits takes the place's type as it enters
-array<dyn> U = [dynarray([1, 2]),
-                dynarray([1, "x"]),
-                dynarray([1, none]),
-                dynarray([1, none]),
+array<dyn> U = [ug([1, 2]),
+                ug([1, "x"]),
+                ug([1, none]),
+                ug([1, none]),
                 dict(5),
                 dict("s"),
                 dict(P(1)),
                 dict(Q(1)),
-                dynarray([1.5]),
-                dynarray([1]),
-                dynarray([true]),
-                dynarray([1]),
-                dynarray(["a"]),
-                dynarray([1]),
-                dynarray([P(1)]),
-                dynarray([Q(1)]),
-                dynarray([box(P(1))]),
-                dynarray([box(1)]),
-                dynarray([box(1.5)]),
-                dynarray([5]),
-                dynarray([5]),
+                ug([1.5]),
+                ug([1]),
+                ug([true]),
+                ug([1]),
+                ug(["a"]),
+                ug([1]),
+                ug([P(1)]),
+                ug([Q(1)]),
+                ug([box(P(1))]),
+                ug([box(1)]),
+                ug([box(1.5)]),
+                ug([5]),
+                ug([5]),
                 [1, 2],
                 [1, 2],
                 [1, 2],
@@ -131,14 +143,14 @@ check("ai empty", ai, U[35]);
 # a general array is walked element by element
 check("ai general", ai, U[0]);
 check("ai general bad", ai, U[1]);
-check("ai dynarray", ai, runtime(dynarray([1, 2])));
+check("ai cast", ai, runtime(cast<array<dyn>>([1, 2])));
 check("aoi none", aoi, U[2]);
 check("ai none", ai, U[3]);
 check("ac objs", ac, U[36]);
 check("ac objs bad", ac, U[37]);
 # one inner array twice is walked once; two windows of one storage are
 # two values
-array<dyn> UI = [dynarray([1, 2]), dynarray([1, 2, "x"])];
+array<dyn> UI = [ug([1, 2]), ug([1, 2, "x"])];
 var dyn inner = UI[0];
 var dyn st = UI[1];
 array<dyn> UO = [[inner, inner], [st[0:2], st[1:3]], [st[0:2], st[0:2]]];
@@ -236,7 +248,7 @@ check("t ddd", ddd, tdsi);
 # not a container at all; a container with no element type
 check("ai int", ai, runtime(5));
 check("dsi int", dsi, runtime(5));
-check("garr any", garr, runtime(dynarray([1, "x"])));
+check("garr any", garr, runtime(cast<array<dyn>>([1, "x"])));
 check("gdict any", gdict, runtime({1: "x"}));
 check("adyn any", adyn, runtime([1, "x"]));
 
@@ -286,7 +298,7 @@ var want = ["ai ints ok", "af ints no", "ab ints no", "astr ints no",
     "ap ints no", "af floats ok", "ai floats no", "ab bools ok",
     "ai bools no", "astr strs ok", "ai strs no", "ap structs ok",
     "ap other no", "ai structs no", "ai empty ok", "ai general ok",
-    "ai general bad no", "ai dynarray no", "aoi none ok", "ai none no",
+    "ai general bad no", "ai cast no", "aoi none ok", "ai none no",
     "ac objs ok", "ac objs bad no", "aai shared ok", "aai windows no",
     "aai window ok ok", "dsi ok ok", "dsi value no", "dsi key no",
     "dai ok ok", "dai key no", "dsa ok ok", "dsa value no",

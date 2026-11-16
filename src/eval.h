@@ -107,8 +107,8 @@ struct PureCacheKeyHash {
  * A GENERAL array's element read as an INT, by the typed reads of every
  * engine (Subscript::eval_int, the VM's element-int cores). A bool reads
  * as 0/1, exactly as a FLAT bool element does: an array<bool> is not
- * always flat - an inline keys() of a dict<bool, ...> and dynarray() build
- * a general one, and the bind accepts it - so `if (b[i])` on one raised
+ * always flat - an inline keys() of a dict<bool, ...> builds a general
+ * one, and the bind accepts it - so `if (b[i])` on one raised
  * TypeErrorEx in every engine, each with another caret. Anything else is
  * the type error it always was.
  */
@@ -743,6 +743,20 @@ const StructTypeDef *exc_struct_def(const RuntimeException *ex,
 TypeErrorEx param_fit_error(const UniqueId *param, const TypeAnnot &a,
                             const FitMisfit &m, int site_arg);
 TypeErrorEx fit_error(const FitSpec &spec, const FitMisfit &m);
+
+/*
+ * THE CAST (plans/cast.md, types/cast.cpp.h): `v` converted to exactly
+ * the type `t` - a scalar by the table, a container rebuilt in `t`'s
+ * storage, a struct / class / box copied - or an InvalidValueEx (a value
+ * the conversion cannot take) / a TypeErrorEx (a value of the wrong kind)
+ * naming the position inside `v`. `at_compile`: a constant evaluation
+ * (float(s)'s range rule). Every engine's cast is this function; the _loc
+ * form gives the refusal the cast's argument's caret [s, e).
+ */
+EvalValue cast_value(const EvalValue &v, const TypeAnnot &t,
+                     bool at_compile);
+EvalValue cast_value_loc(const EvalValue &v, const TypeAnnot &t,
+                         bool at_compile, Loc s, Loc e);
 
 /* throw fit_error unless `v` fits `spec` */
 void check_fit(const EvalValue &v, const FitSpec &spec);

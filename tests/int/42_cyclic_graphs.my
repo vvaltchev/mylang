@@ -55,12 +55,12 @@ func yes(str what, bool ok) {
 #    (clone), hashed, deep-copied
 
 # a -> struct N -> a
-var dyn ra = dynarray([0]);
+var dyn ra = cast<array<dyn>>([0]);
 ra[0] = N(int(runtime(1)), ra);
 want("struct ring str", str(ra), "[N(v: 1, next: [...])]");
 yes("struct ring != its clone", clone(ra) != ra);
 yes("struct ring == itself", ra == ra && !(ra != ra));
-var dyn rb = dynarray([0]);
+var dyn rb = cast<array<dyn>>([0]);
 rb[0] = N(int(runtime(1)), rb);
 yes("two struct rings alike", ra == rb && hash(ra) == hash(rb));
 var dyn ra_c = deepclone(ra);
@@ -97,7 +97,7 @@ yes("dict ring shapes differ", [d1] != [e1] && {"k": d1} != {"k": e1});
 
 # a -> default dict (its default holds a) -> a; == compares entries,
 # so only the cycle search walks the default
-var dyn rdef = dynarray([0]);
+var dyn rdef = cast<array<dyn>>([0]);
 var dyn ddef = dict(N(int(runtime(7)), rdef));
 rdef[0] = ddef;
 want("default-dict ring str", str(rdef), "[{}]");
@@ -124,12 +124,12 @@ want("class ring deepclone str", str(cc),
 #    container X on both sides is equal to itself; the search that
 #    allows skipping it walks X's dicts (keys, values, default) and
 #    structs, and a container shared at two places only once
-var dyn x = dynarray([0]);
-var dyn y = dynarray([0]);
-var dyn sh = dynarray([5, "s"]);
-var dyn kd = dict(N(0, dynarray([8, "t"])));
-kd[dynarray([1, "k"])] = dynarray([2, "v"]);
-var dyn X0 = [[1, 2], N(3, dynarray([4, "n"])), kd, sh, sh, [true],
+var dyn x = cast<array<dyn>>([0]);
+var dyn y = cast<array<dyn>>([0]);
+var dyn sh = cast<array<dyn>>([5, "s"]);
+var dyn kd = dict(N(0, cast<array<dyn>>([8, "t"])));
+kd[cast<array<dyn>>([1, "k"])] = cast<array<dyn>>([2, "v"]);
+var dyn X0 = [[1, 2], N(3, cast<array<dyn>>([4, "n"])), kd, sh, sh, [true],
               "str"];
 yes("no ring: identity", [x, X0] == [y, X0] && [x, X0, X0] == [y, X0, X0]);
 yes("no ring: a shallow copy", !([x, X0] != [y, clone(X0)]));
@@ -150,11 +150,11 @@ yes("differs after identity", [x, X1, 1] != [y, X1, 2]);
 # 3. a dict compared with a dict: a container key is looked up on its
 #    own (a fresh comparison); a missing one makes the dicts differ
 var dyn ka = {};
-ka[dynarray([1, "a"])] = 1;
+ka[cast<array<dyn>>([1, "a"])] = 1;
 var dyn kb = {};
-kb[dynarray([1, "a"])] = 1;
+kb[cast<array<dyn>>([1, "a"])] = 1;
 var dyn kc = {};
-kc[dynarray([2, "a"])] = 1;
+kc[cast<array<dyn>>([2, "a"])] = 1;
 yes("container keys", ka == kb && ka != kc && !(ka == kc));
 var dyn ke = {};
 ke[d1] = "ring key";                   # a ring as a key, frozen
@@ -166,7 +166,7 @@ want("ring key str", str(ke), "{{\"r\": {...}}: \"ring key\"}");
 # 4. a slice is its own container: it shares its array's storage but
 #    shows another window (a shorter one, or one further along), so a
 #    ring through it is not mistaken for the array it was taken from
-var dyn base = dynarray([0, 0, 2]);
+var dyn base = cast<array<dyn>>([0, 0, 2]);
 var dyn sd = {};
 var dyn sd2 = {};
 base[0] = sd;
@@ -245,7 +245,7 @@ var dyn NKm = deepclone(NKC);          # a mutable copy of a frozen struct
 NKm.next[0] = Q(7);
 want("deepclone of a constant struct", str(NKm) + " " + str(NKC),
      "NK(v: 4, next: [Q(x: 7)]) NK(v: 4, next: [Q(x: 1)])");
-var dyn fl = dynarray([0]);
+var dyn fl = cast<array<dyn>>([0]);
 fl[0] = [1, 2];                        # a flat array inside the ring
 append(fl, fl);
 var dyn kfl = {};

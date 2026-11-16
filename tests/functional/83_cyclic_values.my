@@ -13,9 +13,9 @@
 
 struct Node { int v; dyn? next; }
 
-# a ring: the array is its own second element (dynarray: `[1]` is a flat
+# a ring: the array is its own second element (the cast: `[1]` is a flat
 # int array under -nti, which has no type hints, and cannot hold an array)
-var dyn a = dynarray([1]);
+var dyn a = cast<array<dyn>>([1]);
 append(a, a);
 
 # 1. printing: a container already being printed further up is [...],
@@ -36,13 +36,13 @@ assert(str(box) == "[Node(v: 1, next: [...])]");
 
 # 2. == compares by SHAPE: a back edge must lead to the same depth on both
 #    sides
-var dyn b = dynarray([1]);
+var dyn b = cast<array<dyn>>([1]);
 append(b, b);
 assert(a == a);
 assert(a == b && !(a != b));
 assert([a] == [b]);
 assert({"r": a} == {"r": b});
-var dyn u = dynarray([1]);
+var dyn u = cast<array<dyn>>([1]);
 var dyn u2 = [1, u];
 append(u, u2);           # a ring of two: u -> u2 -> u
 assert(a != u);          # the same unfolding, a different shape
@@ -182,7 +182,7 @@ pure func mk_sring(n) {
 }
 const SR = mk_sring(2);
 assert(str(SR) == "[SN(v: 2, next: [...])]");
-var dyn sk = dynarray([0]);
+var dyn sk = cast<array<dyn>>([0]);
 sk[0] = SN(1, none);
 append(sk, sk);
 var dyn skd = {};
@@ -194,7 +194,7 @@ pop(sk);
 #     whether or not copy-on-write still shares one object between them
 #     (the cycle guard keyed a struct value by its address, so a write
 #     that changed nothing decided ==)
-var dyn ra = dynarray([0]);
+var dyn ra = cast<array<dyn>>([0]);
 ra[0] = SN(1, ra);
 var dyn rc1 = clone(ra);
 var dyn rc2 = clone(ra);

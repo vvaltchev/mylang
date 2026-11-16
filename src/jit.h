@@ -1350,6 +1350,12 @@ extern "C" int jit_store_box(int_type box_slot, int_type val_slot) noexcept;
  * 1. */
 extern "C" int jit_check_fit(int_type slot, const void *spec) noexcept;
 
+/* the native CastV (plans/cast.md) - slot `dst` = cast_value(slot `src`,
+ * the Chunk::cast_types entry `t`, baked). A refusal conveys a loc-less
+ * InvalidValueEx / TypeErrorEx, stamped with the argument's caret at the
+ * op pc, and returns 1. */
+extern "C" int jit_cast(int_type src, int_type dst, const void *t) noexcept;
+
 /* model-flip (nativize-ops): the dyn-callee generic call pair. CheckCallableV
  * (the callable guard - conveys a loc-less NotCallableEx, exc-stamped with
  * the callee caret) and CallValueGenericV (the full by-Kind dispatch over

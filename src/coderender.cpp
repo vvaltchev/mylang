@@ -332,6 +332,14 @@ struct Renderer {
             expr(static_cast<const DerefExpr *>(c)->elem.get(), 8);
             return;
 
+        case ConstructType::cast: {
+            const auto *e = static_cast<const CastExpr *>(c);
+            o << "cast<" << annot_type_text(e->to) << ">(";
+            expr(e->elem.get(), 0);
+            o << ")";
+            return;
+        }
+
         case ConstructType::ternary: {
             const auto *e = static_cast<const TernaryExpr *>(c);
             expr(e->condExpr.get(), 2);

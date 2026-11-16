@@ -4,6 +4,11 @@
 # 2026-11-14 the VM read it as `false`, the JIT bound the string (and
 # found it true), and the tree-walker bound it and failed at its first
 # use - three outcomes. The int twin runs first, caught.
+#
+# Since a container carries its type (plans/typed-containers.md), the
+# untyped array takes array<bool> as it enters the parameter, so the
+# store through the `dyn` alias is itself refused - the same located
+# TypeErrorEx and backtrace in every engine, one statement earlier.
 
 func ints(array<int> a) {
     var dyn x = a;
@@ -26,11 +31,22 @@ func bools(array<bool> a, int bad) {
     return n;
 }
 
+# A GENERAL array with no type of its own: a literal nested in an
+# array<dyn>'s element is untyped, and its `none` makes its storage
+# general; once the none is replaced, it enters an array<bool> (an
+# array<int>) by what it holds.
+func general(dyn first, dyn second) {
+    array<dyn> w = [[first, none]];
+    var dyn g = w[0];
+    g[1] = second;
+    return g;
+}
+
 try {
-    ints(dynarray([1, 2]));
+    ints(general(1, 2));
 } catch (TypeErrorEx) {
     print("ints refused");
 }
 for (var k = 0; k < 3; k++)
-    print(bools(dynarray([true, false]), 0));
-print(bools(dynarray([true, false]), runtime(1)));
+    print(bools(general(true, false), 0));
+print(bools(general(true, false), runtime(1)));

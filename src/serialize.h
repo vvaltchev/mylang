@@ -23,7 +23,9 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 44;   /* v44: the program's
+constexpr unsigned MYV_FORMAT_VERSION = 45;   /* v45: CastV and a
+                                                 chunk's cast_types pool;
+                                                 v44: the program's
                                                  `typed` byte (Q2
                                                  increment 3);
                                                  v43: a container's

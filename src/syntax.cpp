@@ -364,6 +364,15 @@ void DerefExpr::serialize(ostream &s, int level) const
     s << endl << indent << ")";
 }
 
+void CastExpr::serialize(ostream &s, int level) const
+{
+    string indent(level * 2, ' ');
+
+    s << indent << "Cast<" << annot_type_text(to) << ">(\n";
+    elem->serialize(s, level + 1);
+    s << endl << indent << ")";
+}
+
 void IncDecExpr::serialize(ostream &s, int level) const
 {
     string indent(level * 2, ' ');
@@ -463,7 +472,7 @@ bool builtin_builds_container(std::string_view n)
     static constexpr std::string_view names[] = {
         "range", "array", "make_array", "make_dict", "dict", "keys",
         "values", "kvpairs", "map", "filter", "split", "splitlines",
-        "readlines", "clone", "deepclone", "dynarray", "sort", "rev_sort",
+        "readlines", "clone", "deepclone", "sort", "rev_sort",
         "reverse", "globals", "specializations", "int_events"};
     return std::find(std::begin(names), std::end(names), n)
         != std::end(names);

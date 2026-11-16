@@ -5744,8 +5744,8 @@ extern "C" int jit_load_elem_value(int_type dst, int_type base,
  * The bool foreach loop variable's element (LoadElemBool): 0 = a bool, in
  * `out`; 1 = past the end - the loop is bounded by the length at its
  * START and the body may have shrunk the array, the foreach's defined
- * OutOfBoundsEx (#53); 2 = not a bool. A GENERAL array<bool> (dynarray(),
- * an inline keys() of a dict<bool, _>) holds whatever a `dyn` alias
+ * OutOfBoundsEx (#53); 2 = not a bool. A GENERAL array<bool> (an inline
+ * keys() of a dict<bool, _>) holds whatever a `dyn` alias
  * stored into it, and the loop variable is typed bool: such an element
  * is a TypeErrorEx at the container, as LoadElemInt's misfit is. Until
  * 2026-11-14 the VM read it as `false`, the JIT bound the string and
@@ -7141,7 +7141,7 @@ extern "C" int jit_load_box(int_type box_slot, int_type dst, int_type want,
             f->at(box_slot).get(), static_cast<int>(want),
             static_cast<const StructTypeDef *>(def));
         f->at(dst).put(std::move(v));
-    } catch (RuntimeException &e) {
+    } catch (RuntimeException &e) {   /* INT-COV-EXEMPT: its type test */
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
@@ -7157,6 +7157,23 @@ extern "C" int jit_check_fit(int_type slot, const void *spec) noexcept
         check_fit(g_current_ctx->frame->at(slot).get(),
                   *static_cast<const FitSpec *>(spec));
     } catch (RuntimeException &e) {
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
+/* the native CastV (plans/cast.md) - cast_value; a refusal conveys
+ * loc-less, stamped with the argument's caret by the op's exc-stamp */
+extern "C" int jit_cast(int_type src, int_type dst, const void *t) noexcept
+{
+    ML_JIT_OP_RAN(CastV);
+    Frame *f = g_current_ctx->frame;
+    try {
+        EvalValue v = cast_value(f->at(src).get(),
+                                 *static_cast<const TypeAnnot *>(t), false);
+        f->at(dst).put(std::move(v));
+    } catch (RuntimeException &e) {   /* INT-COV-EXEMPT: its type test */
         g_vm_jit_exc.reset(e.clone());
         return 1;
     }
@@ -8988,6 +9005,23 @@ vm_check_fit_op(EvalContext &ctx, const Instr &in, const Chunk &chunk,
     try {
         check_fit(ctx.frame->at(in.a_slot()).get(),
                   chunk.fit_specs[static_cast<size_t>(in.target2)]);
+    } catch (Exception &e) {
+        vm_stamp_loc(chunk, pc, e);
+        throw;
+    }
+}
+
+/* CastV (plans/cast.md): cast_value, a refusal taking the op's caret
+ * (the cast's argument, from the loc side table). Out of line: the
+ * dispatch loop's frame stays small. */
+static ML_NOINLINE void
+vm_cast_op(EvalContext &ctx, const Instr &in, const Chunk &chunk, size_t pc)
+{
+    try {
+        EvalValue v = cast_value(
+            ctx.frame->at(in.a_slot()).get(),
+            *chunk.cast_types[static_cast<size_t>(in.target2)], false);
+        ctx.frame->at(in.target).put(std::move(v));
     } catch (Exception &e) {
         vm_stamp_loc(chunk, pc, e);
         throw;
@@ -13981,6 +14015,11 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
         VM_CASE(CheckFitV):
             /* #49: a stored value that may misfit its place's type */
             vm_check_fit_op(ctx, *in, *chunk, pc);
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(CastV):
+            vm_cast_op(ctx, *in, *chunk, pc);
             pc++;
             VM_NEXT;
 

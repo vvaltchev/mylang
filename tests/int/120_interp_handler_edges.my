@@ -8,7 +8,7 @@
 #    UnboundSymbolEx);
 #  - the counted loop whose back edge also reads the next element
 #    (ForStepElemInt, `t = bs[i] + ...` as the body's first read) over an
-#    array<bool> - flat bool storage, and general storage from dynarray() -
+#    array<bool> - flat bool storage, and general storage only `dyn` makes -
 #    a bool element reading as 0 / 1;
 #  - the boxed unary operators on a `dyn` value holding an int, a bool
 #    and a float (UnaryV): a bool promotes to an int for - + ~ (README
@@ -54,7 +54,7 @@ want("bool storage", array_storage(bs), "bool");
 want("for-step element read, flat bools", pack(bs, len(bs)), 31);
 want("for-step element read, ints", packi([1, 0, 1, 1], 4), 31);
 # a GENERAL array of bools only `dyn` reaches: untyped, it takes
-# array<bool> as it enters `pack` (dynarray()'s array<dyn> would not)
+# array<bool> as it enters `pack` (a cast's array<dyn> would not)
 array<dyn> hgb = [[true, "x", true, true]];
 var dyn gb = hgb[0];
 gb[1] = false;

@@ -46,10 +46,10 @@ run("split-x", func[I]() => split(I, ","));
 run("split-dx", func[S, I]() => split(S, I));
 run("join-x", func[I]() => join(I, ","));
 run("join-dx", func[A, I]() => join(A, I));
-run("join-gen", func() => join(dynarray(["a", "b", "c"]), "-"));
-run("join-gen1", func() => join(dynarray(["a"]), "-"));
-run("join-gen0", func() => join(dynarray([]), "-"));
-run("join-mix", func[A]() => join(dynarray(["a", A]), "-"));
+run("join-gen", func() => join(cast<array<dyn>>(["a", "b", "c"]), "-"));
+run("join-gen1", func() => join(cast<array<dyn>>(["a"]), "-"));
+run("join-gen0", func() => join(cast<array<dyn>>([]), "-"));
+run("join-mix", func[A]() => join(cast<array<dyn>>(["a", A]), "-"));
 run("join-ints", func[A]() => join(A, "-"));
 run("splitlines-x", func[I]() => splitlines(I));
 run("ord-x", func[I]() => ord(I));
@@ -124,16 +124,16 @@ run("values-x", func[A]() => values(A));
 var bools = [true, false, true];
 note("find-b", find(bools, false));
 note("find-bn", find(bools, 7));
-note("find-gb", find(dynarray(bools), false));
+note("find-gb", find(cast<array<dyn>>(bools), false));
 note("sort-b", sort(clone(bools), func(a, b) => !a && b));
 note("sort-bk", sort([true, false, false, true, true, false],
                      func(a, b) => a && !b));
-run("sum-key0", func() => sum(dynarray(runtime([])), func(x) => x * 2));
+run("sum-key0", func() => sum(cast<array<dyn>>(runtime([])), func(x) => x * 2));
 note("sum-b1", sum([true]));
 run("top-x", func[I]() => top(I));
 run("top-e", func() => top(runtime([])));
 run("arraystorage-x", func[I]() => array_storage(I));
-run("dynarray-x", func[I]() => dynarray(I));
+run("cast-x", func[I]() => cast<array<dyn>>(runtime(I)));
 
 foreach (o in out)
     print(o);
