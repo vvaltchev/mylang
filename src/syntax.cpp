@@ -3,6 +3,9 @@
 #include "errors.h"
 #include "syntax.h"
 
+#include <algorithm>
+#include <iterator>
+
 using std::string;
 using std::string_view;
 
@@ -450,6 +453,20 @@ bool builtin_takes_arr_hint(std::string_view name)
     return name == "range" || name == "array" || name == "make_array" ||
            name == "keys" || name == "values" || name == "map" ||
            name == "filter";
+}
+
+/* Declared in syntax.h - see the contract there. A constexpr array: a
+ * static set's run-time initialisation guard is itself a branch no run
+ * takes twice */
+bool builtin_builds_container(std::string_view n)
+{
+    static constexpr std::string_view names[] = {
+        "range", "array", "make_array", "make_dict", "dict", "keys",
+        "values", "kvpairs", "map", "filter", "split", "splitlines",
+        "readlines", "clone", "deepclone", "dynarray", "sort", "rev_sort",
+        "reverse", "globals", "specializations", "int_events"};
+    return std::find(std::begin(names), std::end(names), n)
+        != std::end(names);
 }
 
 /*

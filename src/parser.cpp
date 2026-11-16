@@ -930,6 +930,60 @@ static bool node_takes_hint(ParseContext &c, const Construct *n)
     }
 }
 
+/*
+ * Q2: whether `n`, run unfolded, makes its container with the TYPE of the
+ * place it is bound to (LiteralObj::typed_by_place): a container literal,
+ * an array sum, or a call to one of builtin_builds_container's builtins -
+ * the builtin itself, as node_takes_hint asks. A user function's result
+ * keeps the type it was made with.
+ */
+static bool node_typed_by_place(ParseContext &c, const Construct *n)
+{
+    switch (ctag(n)) {
+    case ConstructType::lit_arr:
+    case ConstructType::lit_dict:
+    case ConstructType::expr04:
+        return true;
+    case ConstructType::lit_obj:
+        return static_cast<const LiteralObj *>(n)->typed_by_place;
+    case ConstructType::call: {
+        const auto *call = static_cast<const CallExpr *>(n);
+        const auto *id = node_cast<const Identifier>(call->what.get());
+        if (!id || !builtin_builds_container(id->uid->val))
+            return false;
+        const EvalValue v = RValue(id->eval(c.const_ctx));
+        return v.get_type()->t == Type::t_builtin;
+    }
+    default:
+        return false;
+    }
+}
+
+/*
+ * Q2: a mutable container a bake could not give the type the unfolded
+ * run gives it. Built while parsing, before any type exists, it carries
+ * none - unless a user function made it (its typed parse-time run typed
+ * it). A node typed by its place gets the place's type later; any other
+ * (an element or a field of a literal, `get!` of one) is typed where its
+ * literal was made, which the value no longer says. Such a node is not
+ * baked: it runs, as it does unfolded.
+ */
+static bool bake_untypable(ParseContext &c, const Construct *node,
+                           const EvalValue &v)
+{
+    if (node_typed_by_place(c, node))
+        return false;
+    if (v.is<SharedArrayObj>()) {
+        const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+        return !a.is_readonly() && !a.ctype();
+    }
+    if (v.is<intrusive_ptr<DictObject>>()) {
+        const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        return !d.is_readonly() && !d.ctype();
+    }
+    return false;
+}
+
 /* The storage a parsed `array<...>` annotation gives an array - the
  * inferencer's array_repr_hint, read off the annotation (a typed const is
  * bound, and a pure function may run, before inference): dflt keeps a
@@ -1264,12 +1318,14 @@ pDeferFold(ParseContext &c, Construct *node,
     node->late_fold_witness = false;
     if (!descs.empty())
         return;
-    if (node->nc_folds) {
+    if (node->nc_folds && !bake_untypable(c, node, v)) {
         /* as cse_materialize marks a bake: whether the unfolded node
          * builds to its place's storage */
-        if (ctag(lit.get()) == ConstructType::lit_obj)
-            static_cast<LiteralObj *>(lit.get())->takes_hint =
-                node_takes_hint(c, node);
+        if (ctag(lit.get()) == ConstructType::lit_obj) {
+            auto *lo = static_cast<LiteralObj *>(lit.get());
+            lo->takes_hint = node_takes_hint(c, node);
+            lo->typed_by_place = node_typed_by_place(c, node);
+        }
         node->late_fold = std::move(lit);
     } else {
         node->late_fold = make_unique<LiteralObj>(std::move(v), true);
@@ -5701,17 +5757,24 @@ cse_materialize(ParseContext &c,
 {
     if (!cse_materialize_core(c, node, out, process_arrays, immutable))
         return false;
+    ML_CHECK(out);              /* a bake always places a literal */
+    auto *lo = ctag(out.get()) == ConstructType::lit_obj
+        ? static_cast<LiteralObj *>(out.get()) : nullptr;
+    if (lo && bake_untypable(c, node, lo->literal_value())) {
+        out.reset();
+        return false;
+    }
     /* the baked literal stands where `node` stood: its span */
-    if (out && !out->start) {
+    if (!out->start) {
         out->start = node->start;
         out->end = node->end;
     }
     /* #47: `node` is about to be freed by the caller - keep alive every
      * function literal in it that the baked value still names. */
-    if (out && ctag(out.get()) == ConstructType::lit_obj) {
-        auto *lo = static_cast<LiteralObj *>(out.get());
+    if (lo) {
         detach_baked_funcs_below(c, node, lo->literal_value());
         lo->takes_hint = node_takes_hint(c, node);
+        lo->typed_by_place = node_typed_by_place(c, node);
     }
     return true;
 }
