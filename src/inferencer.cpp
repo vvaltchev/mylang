@@ -9240,6 +9240,16 @@ static bool hoist_slice_contained(Construct *c, const UniqueId *uid)
  *    reassign, no write-through, no mutating builtin), and not
  *    referenced by the loop's cond/inc (a pre-decl read must keep its
  *    original undefined-read semantics);
+ *  - NOTHING the slice reads is DECLARED IN THE BODY (licm_collect_decls,
+ *    LICM's own rule): above the loop such a slot holds its previous
+ *    value, or nothing at all. fr_collect_mutated skips a declaration, so
+ *    a body-local `var m = [..]; var sl = m[1:3];` looked invariant and
+ *    the hoisted slice read `m` before the loop set it (TypeErrorEx where
+ *    `--no-opt all` answered; found 2026-11-16) - and a `const` declared
+ *    BELOW the slice, which binds at the body's entry (question 21), is
+ *    the same read. A slice OF a hoisted slice still hoists, one visit
+ *    later: specialize() runs again on the wrapper block's children, and
+ *    by then the first slice is declared above the loop;
  *  - and an ARRAY slice must not ESCAPE (hoist_slice_contained): since
  *    question 3 (Python's rule) a copy of a slice is the same array, so
  *    one hoisted slice stored by every iteration would be ONE array
@@ -9251,6 +9261,11 @@ static bool hoist_slice_contained(Construct *c, const UniqueId *uid)
  * benefit (the VM compiles the block as decl-then-loop). Only DIRECT
  * body statements are considered (no try-crossing, no nested blocks).
  */
+static void licm_collect_decls(Construct *c,
+                               std::unordered_set<const UniqueId *> &out);
+static bool licm_refs_any(const Construct *e,
+                          const std::unordered_set<const UniqueId *> &names);
+
 /* every body statement but the declaration `skip` keeps the slice
  * `uid` contained (hoist_slice_contained) */
 static bool hoist_slice_uses_contained(Block *body, size_t skip,
@@ -9284,6 +9299,8 @@ static unique_ptr<Construct> try_hoist_loop_slices(unique_ptr<Construct> n)
 
     FrMut mut;
     fr_collect_mutated(n.get(), mut);
+    std::unordered_set<const UniqueId *> body_decls;
+    licm_collect_decls(body, body_decls);
 
     std::vector<unique_ptr<Construct>> hoisted;
     for (size_t i = 0; i < body->elems.size(); ) {
@@ -9312,6 +9329,10 @@ static unique_ptr<Construct> try_hoist_loop_slices(unique_ptr<Construct> n)
                      * base and detach the view just the same */
                     && (sl->what->th_val || !mut.alias_content)
                     && fr_immutable(sl->what.get(), mut, nullptr)))
+            /* nothing it reads is declared in the body */
+            && !licm_refs_any(sl->what.get(), body_decls)
+            && !licm_refs_any(sl->start_idx.get(), body_decls)
+            && !licm_refs_any(sl->end_idx.get(), body_decls)
             && mut.len.find(lhs->uid) == mut.len.end()
             && mut.content.find(lhs->uid) == mut.content.end()
             && !hoist_refs_uid(cond1, lhs->uid)
