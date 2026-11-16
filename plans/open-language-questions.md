@@ -37,6 +37,8 @@ at run time (#49).
 | 23 | a typed container reached through a `dyn` name  | decided    |
 | 24 | more than two variables in a dict `foreach`     | decided: A |
 | 25 | which struct a `catch` clause catches           | decided: A |
+| 26 | strict container types, a non-null `dyn`, the   | decided    |
+|    | cast                                            | (2 open)   |
 
 8-20 were added on 2026-10-24, in priority order, and are presented
 three at a time. **PAUSED after 14 (maintainer, 2026-11-02):** the
@@ -648,4 +650,16 @@ stores the struct, and the REPL's open world keeps a name nothing
 declares yet matching by name. README *Custom exceptions*; tests:
 `tests/functional/124_catch_identity.my`, `catch:` `-rt` cases, a
 `repl:` case.
+
+## 26. Strict container types, a non-null `dyn`, and the cast
+
+**DECIDED (maintainer, 2026-11-18/19); two sub-points open.** No
+implicit conversion between two different container types, in any
+direction or depth; `array<dyn>` is a fixed type of non-null variants
+and `array<dyn?>` another; `dyn` is non-null everywhere; the bare
+`array` / `dict` annotation is a hole the compiler fills (once in a
+declaration, per call in a parameter, forbidden in a struct field);
+more functions become templates (`opt` parameters, capturing closures);
+an explicit `cast<T>(x)` does every conversion and is built first.
+Rules, measurements and the order of work: `strict-container-types.md`.
 
