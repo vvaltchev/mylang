@@ -20,4 +20,15 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
     return q.x + (r?.y ?? 0) + *bx + len(oa ?? []) + len(od ?? {}) + w.p.y;
 }
 >> >> .. .. .. >> => 1
+>> >> >> >> array<int> b = [1]; b[0] = none;
+>> dict<int, int> k = {}; k[none] = 1;
+>> func gq(int q) { if (q > 0) return q; return none; } array<int> c = [1]; c[0] = gq(1); dict<int, int> e = {}; e[gq(1)] = 2;
+>> => {}
+>> => 1
+>> => []
+>> => [<none>]
+>> => [<none>]
+>> >> => []
+>> => [1]
+>> => [1]
 >> 

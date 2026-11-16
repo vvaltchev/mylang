@@ -7,8 +7,10 @@
 #  - a body that removes rows under the loop raises OutOfBoundsEx at the
 #    row that is gone (README, *Modifying the container during the loop*);
 #  - a typed `array<array<int>>` / `array<array<float>>` whose row is
-#    stored GENERAL (an inline keys() builds one) is unpacked from what
-#    it holds.
+#    stored GENERAL is unpacked from what it holds: an array only `dyn`
+#    reached, which took the row type as it entered (an inline keys()
+#    built one too, until rule 4 made a typed array's storage follow its
+#    type).
 # The tree-walker is the oracle; every engine must print the same.
 
 var bad = 0;
@@ -43,16 +45,22 @@ try {
 want("rows removed under the loop", r + str(s), "O12");
 
 func geni(array<int> a) => a;
-dict<int, int> ikeys = {3: 0, 4: 0};
-array<array<int>> m = [[1, 2], geni(keys(ikeys))];
+array<dyn> isrc = [[3, "x"]];
+var dyn ig = isrc[0];
+ig[1] = 4;
+array<array<int>> m = [[1, 2], geni(ig)];
+want("the int row's storage", array_storage(m[1]), "general");
 var t = 0;
 foreach (var a, b in m)
     t += a + b;
 want("an int row stored general", t, 10);
 
 func genf(array<float> a) => a;
-dict<float, int> fkeys = {3.5: 0, 4.5: 0};
-array<array<float>> fm = [[1.5, 2.5], genf(keys(fkeys))];
+array<dyn> fsrc = [[3.5, "x"]];
+var dyn fg = fsrc[0];
+fg[1] = 4.5;
+array<array<float>> fm = [[1.5, 2.5], genf(fg)];
+want("the float row's storage", array_storage(fm[1]), "general");
 var u = 0.0;
 foreach (var a, b in fm)
     u += a + b;

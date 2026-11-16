@@ -174,4 +174,50 @@ func spread() {
     return [p, q];
 }
 assert(spread() == [{"k": 4}, {"k": 4}]);
+
+# ---- the fit walk over a container only `dyn` reaches (one that has no
+# type of its own): a `dyn?` component takes none, a `dyn` one refuses
+# it, and each key, value and default of a dict is checked
+func takes_dynq(array<dyn?> a) => len(a);
+func takes_dyna(array<dyn> a) => len(a);
+func takes_dk(dict<dyn?, int> d) => len(d);
+func takes_kv(dict<int, int> d) => len(d);
+func takes_dd(dict<dyn?, dyn?> d) => len(d);
+# (each value is used once: an untyped container takes the type of the
+# first typed place it enters)
+array<dyn> holder = [[1, none], [1, none], [1, 2], {"a": 1}, {"a": 1},
+                     {1: "v"}, dict("x"), {1: 2}, {"b": 2}, [3, 4]];
+func fit_walk(int i, str which) {
+    try {
+        if (which == "dynq") return takes_dynq(holder[i]);
+        if (which == "dyna") return takes_dyna(holder[i]);
+        if (which == "dk") return takes_dk(holder[i]);
+        if (which == "kv") return takes_kv(holder[i]);
+        return takes_dd(holder[i]);
+    } catch (TypeErrorEx) {
+        return -1;
+    }
+}
+assert(fit_walk(0, "dynq") == 2);
+assert(fit_walk(1, "dyna") == -1);
+assert(fit_walk(2, "dyna") == 2);
+assert(fit_walk(3, "dk") == 1);
+assert(fit_walk(4, "kv") == -1);
+assert(fit_walk(5, "kv") == -1);
+assert(fit_walk(6, "kv") == -1);
+assert(fit_walk(7, "kv") == 1);
+assert(fit_walk(8, "dd") == 1);
+# an empty container nothing typed, and an element read from one, are
+# checked where they enter (the second fails before: it is not there)
+var e0 = [];
+assert(takes_dyna(e0) == 0);
+var e1 = [];
+var oob = 0;
+try { takes_arr(e1[0]); } catch (OutOfBoundsEx) { oob = 1; }
+assert(oob == 1);
+# ... and `+=` of a misfit onto such a flat array is refused
+var dyn flat = holder[9];
+var plus = 0;
+try { flat += ["s"]; } catch (TypeErrorEx) { plus = 1; }
+assert(plus == 1 && len(flat) == 2);
 print("ok");

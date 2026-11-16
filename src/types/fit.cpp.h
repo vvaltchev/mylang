@@ -264,7 +264,11 @@ bool ct_exact(const TypeAnnot *c, const TypeAnnot *p)
     };
     if (c == p || (is_dyn(c) && is_dyn(p)))
         return true;
-    if (!c || !p)
+    /* (a ctype the compiler makes names every component - a cast needs
+     * a complete type - so only an image's can lack one) */
+    if (!c)                             /* INT-COV-EXEMPT: an image */
+        return false;
+    if (!p)
         return false;
     return c->kind == p->kind && c->opt == p->opt && c->strct == p->strct
            && ct_exact(c->elem.get(), p->elem.get())
@@ -688,7 +692,7 @@ const TypeAnnot *ct_elem_annot(const EvalValue &c)
 ArrHint annot_arr_hint(const TypeAnnot *a, const StructTypeDef *&sd)
 {
     sd = nullptr;
-    const TypeAnnot *e = a ? a->elem.get() : nullptr;
+    const TypeAnnot *e = a->elem.get();   /* (every caller has one) */
     const StructTypeDef *esd =
         e && e->kind == DeclType::strct ? e->strct : nullptr;
     if (!e || (!e->opt && e->kind == DeclType::s))
@@ -720,33 +724,32 @@ ArrHint annot_arr_hint(const TypeAnnot *a, const StructTypeDef *&sd)
 static bool struct_zero_value(const StructTypeDef *d, EvalValue *out,
                               int depth);
 
+/* a scalar zero value into `out` (when the caller wants one) */
+static bool zero_into(EvalValue *out, EvalValue v)
+{
+    if (out)
+        *out = std::move(v);
+    return true;
+}
+
 bool annot_zero_value(const TypeAnnot *a, EvalValue *out, int depth)
 {
     /* (a non-opt cycle is refused at parse time; the bound is a guard) */
     if (depth > 64)                     /* INT-COV-EXEMPT: parse refuses it */
         return false;
-    if (!a || a->opt || a->kind == DeclType::none) {
-        if (out)
-            *out = EvalValue();
-        return true;
-    }
+    /* (every caller passes a component a type names) */
+    ML_CHECK(a && a->kind != DeclType::none);
+    if (a->opt)
+        return zero_into(out, EvalValue());
     switch (a->kind) {
     case DeclType::b:
-        if (out)
-            *out = EvalValue(false);
-        return true;
+        return zero_into(out, EvalValue(false));
     case DeclType::i:
-        if (out)
-            *out = EvalValue(static_cast<int_type>(0));
-        return true;
+        return zero_into(out, EvalValue(static_cast<int_type>(0)));
     case DeclType::f:
-        if (out)
-            *out = EvalValue(static_cast<float_type>(0.0));
-        return true;
+        return zero_into(out, EvalValue(static_cast<float_type>(0.0)));
     case DeclType::s:
-        if (out)
-            *out = EvalValue(SharedStr(std::string()));
-        return true;
+        return zero_into(out, EvalValue(SharedStr(std::string())));
     case DeclType::arr: {
         if (!out)
             return true;
@@ -763,7 +766,8 @@ bool annot_zero_value(const TypeAnnot *a, EvalValue *out, int depth)
         if (!out)
             return true;
         auto d = make_intrusive<DictObject>();
-        if (a->key || a->val)
+        /* (a dict annotation has both a key and a value, or neither) */
+        if (a->key)
             d->set_ctype(annot_nonopt(annot_intern(*a)));
         *out = EvalValue(std::move(d));
         return true;
@@ -779,9 +783,7 @@ bool annot_zero_value(const TypeAnnot *a, EvalValue *out, int depth)
             *out = box_make(inner);
         return true;
     }
-    case DeclType::dyn:
-        return false;
-    default:
+    default:                            /* a `dyn` has none */
         return false;
     }
 }
@@ -813,18 +815,16 @@ static bool struct_zero_value(const StructTypeDef *d, EvalValue *out,
             case FieldKind::f_array: k.kind = DeclType::arr; break;
             case FieldKind::f_dict:  k.kind = DeclType::dict; break;
             case FieldKind::f_dyn:   k.kind = DeclType::dyn; break;
+            /* (a box field always has its type in annot, below) */
             case FieldKind::f_box:   k.kind = DeclType::box; break;
             case FieldKind::f_struct:
                 k.kind = DeclType::strct;
                 k.strct = fd.struct_def;
                 break;
             }
-            /* a parameterized container or a box has its type in annot */
-            const TypeAnnot *fa =
-                fd.annot && (fd.kind == FieldKind::f_array
-                             || fd.kind == FieldKind::f_dict
-                             || fd.kind == FieldKind::f_box)
-                    ? fd.annot.get() : &k;
+            /* a parameterized container or a box has its type in annot
+             * (the parser sets one for those alone) */
+            const TypeAnnot *fa = fd.annot ? fd.annot.get() : &k;
             ok = annot_zero_value(fa, out ? &v : nullptr, depth + 1);
         }
         if (!ok)

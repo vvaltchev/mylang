@@ -25,6 +25,13 @@ want("int + str storage", array_storage(t), "general");
 var u = [true] + [2];
 want("bool + int", str(u), "[1, 2]");
 want("bool + int storage", array_storage(u), "int");
+var bf = [true, false] + [0.5];
+want("bool + float", str(bf), "[1.000000, 0.000000, 0.500000]");
+var bi = [false, true] + [2];
+want("bool + int, false first", str(bi), "[0, 1, 2]");
+want("bool + float storage", array_storage(bf), "float");
+var two = [1] + ["x", "y"];
+want("two that do not fit", str(two), "[1, \"x\", \"y\"]");
 
 # the left operand keeps its storage; a chain joins as it goes
 var a = [1, 2];

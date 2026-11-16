@@ -28,3 +28,18 @@ func hk(int k) {
     return len(od2 ?? {});
 }
 hk(runtime(2))
+# :analyze (a non-strict inference) of stores into declared element and
+# key types that refuse none - the refusals are a strict run's alone -
+# and a committed container nothing typed yet, which a none fills
+:analyze array<int> b = [1]; b[0] = none;
+:analyze dict<int, int> k = {}; k[none] = 1;
+:analyze func gq(int q) { if (q > 0) return q; return none; } array<int> c = [1]; c[0] = gq(1); dict<int, int> e = {}; e[gq(1)] = 2;
+var hn = {}
+hn[none] = 1
+var an = []
+append(an, none)
+an
+func gr(int q) { if (q > 0) return q; return none; }
+var ao = []
+append(ao, gr(1))
+ao

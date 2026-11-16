@@ -969,6 +969,28 @@ else
     fail "-nti: rc=$got_rc tw=[$a] vm=[$b]"
 fi
 
+# -nti: with no types, make_array guesses its storage from the first
+# element and moves to a general array when a later one does not fit -
+# the one path a typed run never takes (its storage follows its type,
+# rule 4), so the case lives here (plans/strict-container-types.md).
+cat > "$TMP/nti_mkarr.my" <<'NTIEOF'
+var a = make_array(3, func(i) { if (i == 0) return 1; return "s"; });
+var b = make_array(3, func(i) { if (i == 0) return 1.5; return 2; });
+var c = make_array(2, func(i) { if (i == 0) return true; return 1; });
+var e = make_array(2, func(i) => 0.5);
+var g = make_array(2, func(i) => i > 0);
+print(a, b, c, e, g, array_storage(a), array_storage(e), array_storage(g));
+NTIEOF
+a=$("$BIN" -tw -nti "$TMP/nti_mkarr.my" 2>&1)
+b=$("$BIN" -nti "$TMP/nti_mkarr.my" 2>&1)
+got_rc=$?
+want_mk='[1, "s", "s"] [1.500000, 2, 2] [true, 1] [0.500000, 0.500000] [false, true] general float bool '
+if [ "$got_rc" = 0 ] && [ "$a" = "$want_mk" ] && [ "$a" = "$b" ]; then
+    pass "-nti: make_array's storage follows its elements, both engines agree"
+else
+    fail "-nti make_array: rc=$got_rc tw=[$a] vm=[$b]"
+fi
+
 # -nti: `n++` on a variable declared with a type (`int n`, a typed
 # parameter, a typed global) had no lowering - the statement form took
 # only an untyped variable and the typed one waits for a numeric proof,

@@ -405,5 +405,8 @@ prints `0`. Choice 6 fixes it.
    11) - it was a run-time fit failure for a literal `none`, and a
    TypeMismatchEx about the dict's type for a `dyn?`. Not done: making
    the invariant a CHECK (the JIT does not yet rely on it - #97's
-   order), and rule 5.
+   order); a container only `dyn` reached that ADOPTS a typed place's
+   type keeps its storage (a general array of ints entering an
+   array<int> parameter is then a general array<int>: converting it in
+   place is the missing step, tests/int/106 builds one); and rule 5.
 5. Rule 8.

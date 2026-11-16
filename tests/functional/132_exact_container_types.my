@@ -66,5 +66,91 @@ dx[0] = "s";
 want("cast is new", str(xs), "[0, 2, 9]");
 want("cast value", str(dx), "[\"s\", 2, 9]");
 
+# ---- sort / rev_sort / reverse return the array they were given: an
+# alias, which keeps its type
+var src = [3, 1, 2];
+var so = sort(src);
+var rs = rev_sort(src);
+var rv = reverse(src);
+if (typed)
+    want("sort alias", typestr(so) + typestr(rs) + typestr(rv),
+         "array<int>array<int>array<int>");
+func three() { return [[1], [2]]; }
+var fs = [three];
+var got = fs[0]();
+want("call through an element", str(got), "[[1], [2]]");
+
+# ---- a `dyn` stored into an inferred container: a numeric element
+# keeps its type (the store converts), another becomes dyn (dyn? when it
+# may be none), a dict key likewise
+var dyn dn = runtime(2);
+var dyn ds = runtime("s");
+var fl = [1.5];
+fl[0] = dn;
+want("float keeps", str(fl), "[2.000000]");
+var st = ["x", none];
+st[0] = ds;
+var ky = {"a": 1};
+ky[ds] = 2;
+if (typed) {
+    want("float keeps type", typestr(fl), "array<float>");
+    want("str becomes dyn?", typestr(st), "array<dyn?>");
+    want("key becomes dyn", typestr(ky), "dict<dyn,int>");
+}
+
+# ---- dict(pairs) is typed by its pairs
+var p1 = [[1, 2]];
+var p2 = [[1, "a"]];
+var p3 = [];
+var p4 = [[]];
+var d1 = dict(p1);
+var d2 = dict(p2);
+var d3 = dict(p3);
+if (typed)
+    want("dict(pairs)", typestr(d1) + " " + typestr(d2) + " " + typestr(d3),
+         "dict<int,int> dict<dyn,dyn> dict<dyn,dyn>");
+want("dict(pairs) values", str(d1) + str(d2), "{1: 2}{1: \"a\"}");
+var p5 = [[1, 2], none];
+var refused = 0;
+try { var d5 = dict(p5); } catch (TypeErrorEx) { refused++; }
+var p6 = [1, 2];
+try { var d6 = dict(p6); } catch (TypeErrorEx) { refused++; }
+try { var d4 = dict(p4); } catch (TypeErrorEx) { refused++; }
+want("dict(not pairs)", refused, 3);
+
+# ---- a builtin's new container with no variable to type it, and one
+# made in a `dyn` element
+func zeros(int n) { return array(n); }
+want("array(n) returned", len(zeros(3)), 3);
+want("array(n) argument", len(array(2)), 2);
+var kd = {1: 2};
+array<dyn> held = [keys(kd)];
+var dyn dk = keys(kd);
+want("in a dyn element", str(held), "[[1]]");
+# a multi-assignment from a literal of another length is refused when
+# it runs (the literal is unpacked as written)
+var ua = 0;
+var ub = 0;
+var unpack = 0;
+try { ua, ub = [1, 2, runtime(3)]; } catch (TypeErrorEx) { unpack = 1; }
+want("unpack length", unpack, 1);
+# a callback's `dyn?` results fit an element that may be none (the
+# values are checked where they land)
+array<int?> mopt = map(func(int i) => runtime(i > 1 ? i : none), [1, 2]);
+want("dyn? results", str(mopt), "[<none>, 2]");
+# array(n) as a statement, and for a generic `array`
+array(2);
+array garr = array(2);
+want("generic array(n)", len(garr), 2);
+# array(n) in a template's base body: its element type is the instance's
+func tbase(x) {
+    var tb = array(2);
+    tb[0] = x;
+    return len(tb);
+}
+want("array(n) in a template", tbase("s") + tbase(1), 4);
+
+want("in a dyn variable", str(dk), "[1]");
+
 assert(bad == 0);
 print("ok");

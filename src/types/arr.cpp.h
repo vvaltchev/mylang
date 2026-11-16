@@ -569,7 +569,8 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
     /* the copy `a + b` builds (ArrSumScope) takes the storage both sides'
      * elements need, as one literal of them would - nothing else holds
      * it, and the sum takes its static type once built (StampTypeV) */
-    if (&a == g_arr_sum_copy && !lval.ctype()) {
+    /* (that copy has no type of its own yet: ctype_sum_copy) */
+    if (&a == g_arr_sum_copy) {
         bool fits = true;
         for (const EvalValue &e : items)
             fits = fits && arr_elem_fits(lval, e);
