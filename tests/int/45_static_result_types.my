@@ -116,7 +116,7 @@ var rb2 = box(two);
 rb2 = ob;
 want("opt box reassigned", str(rb2), "<none>");
 array<int>? oa = no ? [1] : none;
-var dyn tq = yes ? oa : 7;
+var dyn? tq = yes ? oa : 7;
 want("opt/int ternary", str(tq), "<none>");
 var ts = yes ? "x" : str(two);
 want("str join", ts, "x");

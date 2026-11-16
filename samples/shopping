@@ -77,7 +77,7 @@ while (true) {
     # Splitting the opt find() result (`found`) from a non-null `pnum` keeps the
     # checks below off a possibly-none value (and, unlike the old `if (!pnum)`,
     # correctly handles the product at index 0, which is falsy).
-    var dyn found = find(products, input, func(x) => x[0]);
+    var dyn? found = find(products, input, func(x) => x[0]);
     var pnum = 0;
 
     if (found != none) {

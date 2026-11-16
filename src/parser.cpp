@@ -2977,8 +2977,16 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
              * explicitly-typed `int x;` / `str s;` assumes the type's zero value
              * (0 / 0.0 / false / "" / [] / {}), so a non-null typed var is never
              * left `none`. A struct zero-initializes recursively, by the same
-             * rules: `A x;` becomes `x = A(<zero per field>)`.
+             * rules: `A x;` becomes `x = A(<zero per field>)`. A `dyn` has
+             * no zero value and is never none (rule 3, plans/strict-
+             * container-types.md): `dyn x;` is refused, `dyn? x;` is none.
              */
+            if ((fl & pFlags::pInDynDecl) && !(fl & pFlags::pInOptDecl))
+                throw SyntaxErrorEx(
+                    lside->start,
+                    "A 'dyn' variable has no zero value: give it an "
+                    "initial value, or declare it 'dyn?' to start as none"
+                );
             ret.reset(new Expr14);
             ret->op = Op::assign;
             ret->lvalue = std::move(lside);

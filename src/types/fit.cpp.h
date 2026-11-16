@@ -114,13 +114,17 @@ const TypeAnnot *annot_nonopt(const TypeAnnot *a)
                                      a->val.get()});
 }
 
-/* (annot_table's note: a plain pointer, no initialization guard) */
+/* (annot_table's note: a plain pointer, no initialization guard)
+ * The DYNAMIC types - what a container made where `dyn` is declared
+ * carries: they refuse nothing, so their components are `dyn?` (rule 3:
+ * a `dyn` component is never none, and array<dyn> is a fixed type, rule
+ * 2) */
 const TypeAnnot *annot_dyn_array()
 {
     static const TypeAnnot *a = nullptr;
     if (!a) {
         const TypeAnnot *d =
-            annot_intern_key(AnnotKey{DeclType::dyn, false, nullptr,
+            annot_intern_key(AnnotKey{DeclType::dyn, true, nullptr,
                                       nullptr, nullptr, nullptr});
         a = annot_intern_key(AnnotKey{DeclType::arr, false, nullptr,
                                       d, nullptr, nullptr});
@@ -133,10 +137,23 @@ const TypeAnnot *annot_dyn_dict()
     static const TypeAnnot *a = nullptr;
     if (!a) {
         const TypeAnnot *d =
-            annot_intern_key(AnnotKey{DeclType::dyn, false, nullptr,
+            annot_intern_key(AnnotKey{DeclType::dyn, true, nullptr,
                                       nullptr, nullptr, nullptr});
         a = annot_intern_key(AnnotKey{DeclType::dict, false, nullptr,
                                       nullptr, d, d});
+    }
+    return a;
+}
+
+const TypeAnnot *annot_array_of_dyn()
+{
+    static const TypeAnnot *a = nullptr;
+    if (!a) {
+        const TypeAnnot *d =
+            annot_intern_key(AnnotKey{DeclType::dyn, false, nullptr,
+                                      nullptr, nullptr, nullptr});
+        a = annot_intern_key(AnnotKey{DeclType::arr, false, nullptr,
+                                      d, nullptr, nullptr});
     }
     return a;
 }
@@ -269,7 +286,12 @@ bool ct_same(const TypeAnnot *c, const TypeAnnot *p)
  */
 bool ct_enters(const TypeAnnot *ct, const TypeAnnot *a)
 {
+    /* (rule 3: a `dyn` component is never none, so it takes no
+     * component that may be - an array<dyn?> does not enter an
+     * array<dyn>) */
     const auto comp = [](const TypeAnnot *c, const TypeAnnot *pl) {
+        if (pl && pl->kind == DeclType::dyn && !pl->opt && c && c->opt)
+            return false;
         return !ct_typed(pl) || ct_same(c, pl);
     };
     if (a->kind == DeclType::arr)
@@ -292,7 +314,13 @@ bool fits_elems(const SharedArrayObj &arr, const TypeAnnot *ea, FitWalk &w,
 {
     using St = SharedArrayObj::Storage;
     const size_type n = arr.size();
-    if (!ea || ea->kind == DeclType::dyn || n == 0)
+    if (!ea || n == 0)
+        return true;
+    /* a `dyn` element takes anything but none (rule 3): only a general
+     * or a class array can hold one */
+    if (ea->kind == DeclType::dyn
+            && (ea->opt || (arr.skind() != St::general
+                            && arr.skind() != St::objs)))
         return true;
     /* a FLAT array is decided by its storage kind: a misfit names what
      * that storage holds, at element 0 */
@@ -351,8 +379,9 @@ bool fits_dict(const DictObject &d, const TypeAnnot *ka,
 {
     /* a dict annotation has both a key and a value annotation, or
      * neither (a plain `dict`) */
-    const bool keys = ka && ka->kind != DeclType::dyn;
-    const bool vals = va && va->kind != DeclType::dyn;
+    /* a `dyn` key or value takes anything but none (rule 3) */
+    const bool keys = ka && !(ka->kind == DeclType::dyn && ka->opt);
+    const bool vals = va && !(va->kind == DeclType::dyn && va->opt);
     if (!keys && !vals)
         return true;
     /* one key per dict annotation: a key node always comes with the
@@ -387,13 +416,14 @@ bool fits_dict(const DictObject &d, const TypeAnnot *ka,
 bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
           FitMisfit &why)
 {
-    if (a->kind == DeclType::dyn)
-        return true;
+    /* a `dyn` takes anything but none, unless it is a `dyn?` (rule 3) */
     if (v.is<NoneVal>()) {
         if (a->opt)
             return true;
         return fit_miss(v, why);
     }
+    if (a->kind == DeclType::dyn)
+        return true;
     bool ok;
     switch (a->kind) {
     case DeclType::i:
@@ -695,7 +725,8 @@ TypeErrorEx ct_misfit(const char *what, const char *subject,
 
 EvalValue ct_fit(const TypeAnnot *a, EvalValue v, bool dict, Loc s, Loc e)
 {
-    if (!a || a->kind == DeclType::dyn)
+    /* a `dyn` element takes anything but none (rule 3) */
+    if (!a || (a->kind == DeclType::dyn && (a->opt || !v.is<NoneVal>())))
         return v;
     v = ct_widen(std::move(v), a);
     FitMisfit m;
@@ -719,7 +750,7 @@ EvalValue ct_fit_key(const DictObject &d, EvalValue key)
 {
     const TypeAnnot *ct = d.ctype();
     const TypeAnnot *a = ct ? ct->key.get() : nullptr;
-    if (!a || a->kind == DeclType::dyn)
+    if (!a || (a->kind == DeclType::dyn && (a->opt || !key.is<NoneVal>())))
         return key;
     key = ct_widen(std::move(key), a);
     FitMisfit m;

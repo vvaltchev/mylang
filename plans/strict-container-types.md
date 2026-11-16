@@ -138,8 +138,168 @@ words `str` -> `bool` accepts, containers, failures, implementation).
 1. The cast (section 5) - built 2026-11-19.
 2. Measure, before changing any rule: which corpus programs and tests
    each of rules 1, 3 and 5 refuses (a compile run of tests/functional,
-   tests/int, samples, bench/my and the `-rt` sources).
+   tests/int, samples, bench/my and the `-rt` sources) - done
+   2026-11-20, section 7.
 3. Rules 1-7, fixing the programs with the cast; decision A's
    implementation (`ct_enters`) and its tests change with rule 1.
 4. Rule 8: `opt` parameters as template parameters, then closure
    instances.
+
+## 7. Measured (2026-11-20): what rules 1, 3 and 5 refuse
+
+A measurement build (not committed) prototyped rule 1 NAIVELY - a `dyn`
+component no longer fits another type, and two settled container types
+no longer join - and rule 3 - a non-opt `dyn` refuses a possibly-none
+value, and a `dyn` variable that receives one is refused. `-nr` ran over
+389 programs (tests/functional, tests/int, tests/backtrace, bench/my,
+samples; 17 skipped, which need an INT build), and `-rt` ran under each.
+
+**Rule 3 refuses 4 programs and ~18 `-rt` cases, all genuine**: a `var
+dyn x` that receives a possibly-none value, which becomes `dyn?`.
+samples/shopping (`var dyn found = find(...)`), 22_closure_store (`var
+dyn bf = b.fn`, a `dyn?` field), 72_none_bind (`var dyn i = find(...)`),
+45_static_result_types (`var dyn tq = yes ? oa : 7`, `oa` an
+`array<int>?`). The `-rt` cases are the same shape (`var dyn a = none; a
+?? 1`), plus the cases that assert today's widening ("ti dyn accept: dyn
+var infers opt from none-flow") - they change to assert the refusal.
+
+**Rule 5 changes almost nothing.** No program in the corpus has a bare
+`array`/`dict` struct field (`-rt` has 7, `struct P { int x; array t;
+}`, which become `array<dyn?> t` or a full type); two `tests/int`
+parameters (`func garr(array a)`) become templates.
+
+**Rule 1, prototyped naively, refuses 32 programs and ~40 `-rt` cases,
+and almost none of them is a program that converts a container.** They
+are places where the COMPILER builds a container type the naive rule
+refuses:
+
+1. **A `dyn` value stored into a typed container** - `a[i] = d`,
+   `append(xs, runtime(6))`, `[P(5, 5), db]` into an `array<P>`: the
+   store contributes `array<dyn>` to the variable, which no longer fits
+   `array<int>`. Rule 1 says such a value is checked at run time where
+   it enters, so the store must contribute an ELEMENT (checked when it
+   is `dyn`), not a container type. 12 programs (the tests/backtrace
+   callback and foreach programs, 103, 93, 75, 47, 117, 45, 36, 98) and
+   most of the `-rt` cases (#49's misfit carets, "a builder for a proven
+   array<int> refuses a dyn string").
+2. **A scalar widened into an element** - `fa[0] = 3` into an
+   `array<float>`, `u[0] = n` in a pure body: rule 7's widening, refused
+   because the store contributes `array<int>`. The same fix as 1 (70,
+   73, "a bool WIDENS into int/float storage").
+3. **A builtin's unknown component typed `dyn` instead of unfilled** -
+   `dict(0)` is `dict<dyn,int>` (bench/my 47 and 62, 30, 90, 85, 132,
+   44), `dict(pairs)` `dict<dyn,dyn>` (118). They become `dict<none,
+   int>`, the key unfilled, and the stores fill it.
+4. **A later store that changes an inferred variable's element type** -
+   `var wx = [1]; wx[0] = 2.5` (today `array<float>`, the literal built
+   in float storage), `append(gs, "s")` on an `array<dyn>`, `[[1],
+   ["s"]]` into `array<array<dyn>>`. Legal under the rules when the
+   literal takes the variable's type, as it does today (129, 128, 126).
+5. **Values of two types in one fresh container** - `append(r, r)`
+   (124), `n["c"] = 5` into `{"a": {...}}` (int 128), box<int> and
+   box<P> keys (40): today `array<dyn>` / `dict<str,dyn>` /
+   `dict<dyn,str>`, built so from the start - no conversion, so legal.
+6. **Array `+` of two element types** (125): the naive join returns
+   null and `binop_result` asserts. The result is a fresh array; its
+   type is an open point below.
+7. **A test passing an `array<dyn>` where an `array<int>` is declared,
+   expecting the run-time refusal** (foreach_typed_misfit: `ints(cast<
+   array<dyn>>([1, 2]))`): refused at compile time now; the test passes
+   the value through a `dyn` name.
+
+So the implementation of rule 1 is mostly a change to how the
+inferencer contributes to a container, and the corpus barely changes.
+**Proposed design (to confirm):**
+
+- A container VALUE that flows from one place to another (an
+  assignment from a variable, an argument, a return, a ternary arm)
+  must have the destination's exact type. Two settled different types
+  meeting in one place is open point 1.
+- An element contribution (a store, an `append` / `push` / `insert`, a
+  literal's element) is checked against the element type: a scalar
+  widens (rule 7), a `dyn` value is checked at run time (as a `dyn`
+  into a numeric local is today), anything else is a compile error at
+  the store - `var a = [1]; var b = a; b[0] = "s"` is refused AT THE
+  STORE, where today `b` silently becomes `array<dyn>` while it aliases
+  `a`'s flat int storage (the hole of section 4).
+- Except for a FRESH container: a variable every one of whose container
+  values is a literal or a builtin's new container takes the join of
+  its element contributions (mixed kinds -> `dyn`, numbers widen), and
+  its literals are built in that type - what happens today, and no
+  conversion. `var a = [1]; a[0] = "s"` stays legal (`array<dyn>`).
+- A builtin result's unknown component is unfilled (`none`), never
+  `dyn`.
+
+New open point found by the measurement:
+
+3. **`a + b` of two arrays of different element types.** The result is
+   a new array, so no aliasing; but its type is a join. Recommended:
+   the element join (`array<int> + array<float>` is `array<float>`, the
+   ints widened as they are copied; `array<int> + array<str>` is
+   `array<dyn>`). Alternative: a compile error (cast one side first).
+
+## 8. Provisional choices (Claude, 2026-11-20 - for the maintainer to confirm)
+
+The maintainer was away and asked for reasonable choices, to be reviewed
+later. Each is marked with what it would take to reverse it.
+
+1. **Open point 1 (a join of two container types): the recommended
+   answer, `dyn`.** The program writes `var dyn c` (mandatory dyn).
+2. **Open point 2 (an unnameable callee): the recommended answer, the
+   implicit `dyn` stays.**
+3. **Open point 3 (`a + b` of two element types): the element join.**
+   `array<int> + array<float>` is `array<float>`, `array<int> +
+   array<str>` is `array<dyn>`; the result is new, nothing aliases.
+4. **The design of section 7 (fresh containers keep joining) is taken.**
+5. **`dyn x;` with no initial value is refused**: `dyn` has no zero
+   value, and rule 3 forbids `none`. `dyn? x;` starts as `none`.
+6. **`array(n)` fills the element type's ZERO VALUE** (Go's `make`):
+   `""` for a `str`, a fresh `[]` / `{}` for a container, a zero struct,
+   as `T x;` does - where it filled `none` into elements typed `str`,
+   which the engines then read three different ways (below). An element
+   type with no zero value (`dyn`, a function, a struct with a non-opt
+   `dyn` field) is a compile error for `array(n)`: write `array(n, v)`
+   or give the element type `?`.
+7. **An explicit `none` element is a `none`, not "no element"** (the
+   question 9 rule kept for an EMPTY container and for `array(n)`):
+   `var a = [1, 2]; a[0] = none` makes `a` an `array<int?>` (it was a
+   run-time TypeErrorEx from the flat storage), `[none]` is `array<
+   dyn?>` until filled.
+
+8. **A container made where `dyn` is declared is an `array<dyn?>`**
+   (`dict<dyn?, dyn?>`): the DYNAMIC type, which refuses nothing (it was
+   `array<dyn>`, which rule 2 makes the fixed type of non-none
+   variants - so `var dyn d = [1, none]` held a `none` its own type
+   refused). Consequence: such a container no longer enters an
+   `array<dyn>` parameter (rule 3: an `array<dyn?>` would let a `none`
+   in); `cast<array<dyn>>(d)` converts it. Reversing it means choosing
+   the dynamic type from the literal's own nullability instead (`[1,
+   2]` an `array<dyn>`, `[1, none]` an `array<dyn?>`).
+
+### A gap left by increment 1
+
+A `dyn` READ through a `dyn` (`var dyn n = holes[1]`, where `holes`
+is a `dyn` holding `[1, none]`) can hold `none` at run time: no store
+check runs on a variable (rule 3.3's "an untyped store into a `dyn`
+place gets the same check" covers a container's element, a dict value
+and a field, all checked against the container's own type; a VARIABLE
+has no run-time type to check against). Such a value is caught where it
+next enters a typed place - a parameter's bind, a typed store - as
+before.
+
+### A bug found on the way (pre-existing, RULE 1 and RULE 2)
+
+`var a = array(2); a[0] = "x"; print(len(a[1]));` - `a` is inferred
+`array<str>` while `a[1]` holds `none`: the tree-walker raises
+TypeErrorEx with a caret, `-nj` raises one with NO caret, and the JIT
+prints `0`. Choice 6 fixes it.
+
+## 9. Increments
+
+1. Rule 3 for variables, fields and `runtime()`; choice 5.
+2. Choice 6 (`array(n)`'s zero values) and choice 7.
+3. Rule 1: element contributions, fresh containers, exact assignment;
+   decision A's `ct_enters` loses the `dyn` component's tolerance.
+4. Rule 4 (storage follows the type), rule 5 (bare annotations are
+   holes), rule 6 (`none` keys - already work, gets a test).
+5. Rule 8.

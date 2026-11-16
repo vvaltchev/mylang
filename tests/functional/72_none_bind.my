@@ -36,7 +36,7 @@ func refused(dyn f) {
     return "accepted";
 }
 
-var dyn nothing = runtime(none);
+var dyn nothing = runtime([none])[0];   # a none read through dyn
 
 func ti(int x) { ran = ran + 1; var y = x * 2; return y + 1; }
 func tf(float x) { ran = ran + 1; return x * 0.5; }
@@ -110,13 +110,13 @@ want("sum", refused(func [holes] () {
     var dyn s = sum(holes, func (int x) { ran = ran + 1; return x; }); }),
      "refused late");
 want("find", refused(func [holes] () {
-    var dyn i = find(holes, 7, func (int x) { ran = ran + 1; return x; }); }),
+    var dyn? i = find(holes, 7, func (int x) { ran = ran + 1; return x; }); }),
      "refused late");
 
 # --- every argument is evaluated first, left to right; the refusal comes
 # at the bind, after a later argument's side effect (the tree-walker used
 # to evaluate each argument just before its own bind, so `b` never ran)
-func note(str s) { append(trail, s); return runtime(none); }
+func note(str s) { append(trail, s); return runtime([none])[0]; }
 want("after the arguments", refused(func () { tu(note("a"), note("b")); }),
      "refused");
 want("argument order", trail, ["a", "b"]);
@@ -124,7 +124,7 @@ want("argument order", trail, ["a", "b"]);
 # --- a none caught, then the same call with a value: the site still works
 var ok = 0;
 for (var i = 0; i < 4; i++) {
-    var dyn v = runtime(i == 2 ? none : i);
+    var dyn v = runtime([i == 2 ? none : i])[0];
     try { ok = ok + ti(v); } catch (TypeErrorEx) { ok = ok + 100; }
 }
 want("loop", ok, 1 + 3 + 100 + 7);
@@ -182,7 +182,9 @@ want("opt passed on to non-opt",
 # --- a function's own dyn LOCAL into a callee the inliner could paste
 func ident(x) => x;
 func via_local(int n) {
-    var dyn v = runtime(n == 2 ? none : n);
+    # (a `dyn` read through a `dyn` may hold none at run time - a `dyn`
+    # declared and given one directly is a compile error, rule 3)
+    var dyn v = runtime([n == 2 ? none : n])[0];
     return ident(v);
 }
 want("a dyn local", refused(func () { via_local(2); }), "refused");

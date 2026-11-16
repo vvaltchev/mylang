@@ -31,7 +31,7 @@ class C { int v; array<C> kids; }
 :type N(1, none)
 :type [func (x) { return x; }][0]
 :type [pure func (int a, opt str b) => a][0]
-var dyn ex = none
+var dyn? ex = none
 try { var dyn z = 1 / runtime(0); } catch (DivisionByZeroEx as e) { ex = e; }
 :type 0; ex
 var dyn a = cast<array<dyn>>([1])

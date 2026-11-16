@@ -6,7 +6,8 @@
 # same type, folded (default) or not (-nc), inlined or not:
 #  - a literal: the type of the variable it is assigned to, the fixed
 #    place it lands in, its parent literal's element type, else its own;
-#  - written where `dyn` is declared: DYNAMIC (array<dyn>, dict<dyn,dyn>);
+#  - written where `dyn` is declared: DYNAMIC (array<dyn?>, dict<dyn?,dyn?>:
+#    it refuses nothing - rule 3, a `dyn` element is never none);
 #  - a builtin that builds one: the type of its call (range, keys, split,
 #    map, filter, make_array, kvpairs), a cast its type, a copy (clone, a slice,
 #    an empty slice) its source's; `a + b` the sum's type;
@@ -34,7 +35,7 @@ var a = [1, 2];
 want("var literal", int_ctype(a), "array<int>");
 var a2 = [rt(1), 2];
 want("dyn element", int_ctype(a2), "array<dyn>");
-var dyn d = [1, 2];              want("dyn var", int_ctype(d), "array<dyn>");
+var dyn d = [1, 2];              want("dyn var", int_ctype(d), "array<dyn?>");
 array<float> f = [1, 2];         want("declared", int_ctype(f), "array<float>");
 var n = [[1], [rt(2)]];
 want("nested outer", int_ctype(n), "array<array<dyn>>");
@@ -43,13 +44,13 @@ var w = [1, 2]; w[0] = 2.5;
 want("widened var", int_ctype(w), "array<float>");
 var m = {"a": 1};                want("dict", int_ctype(m), "dict<str,int>");
 var dyn md = {"a": 1};
-want("dyn dict", int_ctype(md), "dict<dyn,dyn>");
+want("dyn dict", int_ctype(md), "dict<dyn?,dyn?>");
 var het = [[1], "x"];
 want("const het", int_ctype(het), "array<dyn>");
 want("const het inner", int_ctype(het[0]), "untyped");
 
 var r = range(3);                want("range", int_ctype(r), "array<int>");
-var dyn rd = range(3);           want("dyn range", int_ctype(rd), "array<dyn>");
+var dyn rd = range(3);           want("dyn range", int_ctype(rd), "array<dyn?>");
 want("keys", int_ctype(keys(m)), "array<str>");
 want("split", int_ctype(split("a b", " ")), "array<str>");
 want("map", int_ctype(map(func(x) => x * 2, a)), "array<int>");
@@ -62,8 +63,8 @@ want("slice", int_ctype(a[0:1]), "array<int>");
 want("empty slice", int_ctype(a[5:9]), "array<int>");
 want("sum", int_ctype(a + [3]), "array<int>");
 var x1 = ["a", none];
-want("wider sum", int_ctype(x1 + [rt(5)]), "array<dyn>");
-var dyn sd = a + [rt(3)];        want("dyn sum", int_ctype(sd), "array<dyn>");
+want("wider sum", int_ctype(x1 + [rt(5)]), "array<dyn?>");
+var dyn sd = a + [rt(3)];        want("dyn sum", int_ctype(sd), "array<dyn?>");
 struct P { int x; }
 want("struct literal", int_ctype([P(1), P(rt(2))]), "array<P>");
 

@@ -68,9 +68,13 @@ struct TypeAnnot {
 const TypeAnnot *annot_intern(const TypeAnnot &a);
 /* `a` (interned) with its top-level `opt` cleared */
 const TypeAnnot *annot_nonopt(const TypeAnnot *a);
-/* the interned array<dyn> / dict<dyn, dyn>: a DYNAMIC container's type */
+/* the interned array<dyn?> / dict<dyn?, dyn?>: a DYNAMIC container's
+ * type (it refuses nothing) */
 const TypeAnnot *annot_dyn_array();
 const TypeAnnot *annot_dyn_dict();
+/* the interned array<dyn>: the fixed type whose elements are variants
+ * that are never none (rule 2) */
+const TypeAnnot *annot_array_of_dyn();
 /* the interned array<P> of a struct type `d` (a flat struct literal's) */
 const TypeAnnot *annot_array_of_struct(const StructTypeDef *d);
 /* the interned array<str> (argv's) */

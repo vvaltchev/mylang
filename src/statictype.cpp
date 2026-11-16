@@ -416,8 +416,11 @@ bool static_type_assignable(StaticTypeRef src, StaticTypeRef dst)
     if (src == dst)
         return true;
 
+    /* anything fits dyn - but rule 3 (plans/strict-container-types.md):
+     * a `dyn` never holds none, so a value that may be none fits only a
+     * `dyn?` */
     if (dst->kind == StaticTypeKind::Dyn)
-        return true;                      /* anything fits dyn */
+        return dst->opt || !(src->opt || src->kind == StaticTypeKind::None);
 
     if (src->kind == StaticTypeKind::Dyn)
         return false;                     /* dyn does not implicitly narrow */

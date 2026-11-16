@@ -2506,35 +2506,35 @@ static const std::vector<test> tests =
       { "func mk2(int z) { return func [z] (int a, int b) "
         "{ return a + b + z; }; }",
         "var f2 = mk2(1);",
-        "var dyn z = 0; z = runtime(none); var s = 0;",
+        "var dyn zb = runtime([0, none]); var s = 0;",
         "for (var i = 0; i < runtime(4); i++) { s = s + f2(i, i); "
-        "s = s + f2(i, z); }",
+        "s = s + f2(i, zb[1]); }",
         "print(s);" },
-      &typeid(TypeErrorEx), 72, 4, 74, 4 },
+      &typeid(TypeErrorEx), 72, 4, 78, 4 },
     { "err loc: a NONE into an UNTYPED param of a named function marks the "
       "argument (the first of two)",
       { "func fu(a, b) { var t = 0; for (var j = 0; j < 3; j++) "
         "t = t + j; return t; }",
-        "var dyn x = 0; x = runtime(none); var s = 0;",
+        "var dyn xb = runtime([0, none]); var s = 0;",
         "for (var i = 0; i < runtime(3); i++) { s = s + fu(i, i); "
-        "s = s + fu(x, i); }",
+        "s = s + fu(xb[1], i); }",
         "print(s);" },
-      &typeid(TypeErrorEx), 69, 3, 71, 3 },
+      &typeid(TypeErrorEx), 69, 3, 75, 3 },
     { "err loc: a NONE through a DYN callee marks the argument",
       { "func g(int a, b) { return a; }",
-        "var dyn h = runtime(g); var dyn x = 0; x = runtime(none); var s = 0;",
+        "var dyn h = runtime(g); var dyn xb = runtime([0, none]); "
+        "var s = 0;",
         "for (var i = 0; i < runtime(3); i++) { s = s + h(i, i); "
-        "s = s + h(i, x); }",
+        "s = s + h(i, xb[1]); }",
         "print(s);" },
-      &typeid(TypeErrorEx), 70, 3, 72, 3 },
+      &typeid(TypeErrorEx), 70, 3, 76, 3 },
     { "err loc: a NONE into a STRUCT param marks the argument",
       { "struct P { int x; }",
         "func px(P p) { return p.x; }",
-        "var dyn q = P(1); var s = 0;",
-        "for (var i = 0; i < runtime(3); i++) { s = s + px(q); "
-        "if (i == 1) { q = runtime(none); } }",
+        "var dyn qs = runtime([P(1), P(1), none]); var s = 0;",
+        "for (var i = 0; i < runtime(3); i++) { s = s + px(qs[i]); }",
         "print(s);" },
-      &typeid(TypeErrorEx), 51, 4, 53, 4 },
+      &typeid(TypeErrorEx), 51, 4, 57, 4 },
     /* a callback's none, like its coercion, keeps the builtin call's
      * argument-list caret */
     { "err loc: a NONE element into a CALLBACK's non-opt param keeps the "
@@ -7970,11 +7970,11 @@ static const std::vector<test> tests =
         "var r2 = runtime(false) ? bump() : 2; assert(r2 == 2);",
         "assert(hit == 0);" } },
     { "coalesce: none -> rhs, value -> lhs",
-      { "var dyn a = none; assert((a ?? 5) == 5);",
+      { "var dyn? a = none; assert((a ?? 5) == 5);",
         "var dyn b = 7; assert((b ?? 5) == 7);",
         "assert((none ?? 3) == 3);" } },
     { "coalesce: right-associative",
-      { "var dyn a = none; var dyn b = none;",
+      { "var dyn? a = none; var dyn? b = none;",
         "assert((a ?? b ?? 9) == 9);" } },
     { "coalesce: rhs not evaluated when lhs is non-none",
       { "var hit = 0;",
@@ -7987,7 +7987,7 @@ static const std::vector<test> tests =
       { "assert((true || false ? 1 : 2) == 1);",
         "assert((false || false ? 1 : 2) == 2);" } },
     { "precedence: ?? binds tighter than ?:",
-      { "var dyn z = none;",
+      { "var dyn? z = none;",
         "assert((z ?? 1 > 0 ? \"Y\" : \"N\") == \"Y\");" } },
     { "ternary / coalesce const-fold at parse time",
       { "const C = true ? 11 : 22; assert(C == 11);",
@@ -11148,7 +11148,7 @@ static const std::vector<test> tests =
         "var n = cast<int>(x);" },
       &typeid(TypeErrorEx), 19, 2, 21, 2 },
     { "cast: none into a type without ? carets the argument",
-      { "var dyn x = runtime(none);",
+      { "var dyn? x = runtime(none);",
         "var n = cast<float>(x);" },
       &typeid(TypeErrorEx), 21, 2, 23, 2 },
     { "cast: an element's refusal carets the whole argument",
@@ -19539,9 +19539,40 @@ static const std::vector<test> tests =
     { "ti dyn accept: opt dyn var (parses), narrowed",
       { "var opt dyn d = 5; d = none;",
         "if (d != none) assert(d + 1 == 6); assert(1 == 1);" } },
-    { "ti dyn accept: dyn var infers opt from none-flow, narrowed",
-      { "var dyn d = 5; d = none;",
+    /* rule 3 (plans/strict-container-types.md): a `dyn` is never none -
+     * it used to widen to `dyn?` when one flowed in */
+    { "ti dyn accept: a dyn? var takes none, narrowed",
+      { "var dyn? d = 5; d = none;",
         "if (d != none) assert(false); assert(1 == 1);" } },
+    { "ti dyn reject: a dyn var cannot be none (rule 3)",
+      { "var dyn d = 5; d = none;" }, &typeid(NullabilityEx), 16, 1, 18,
+      1 },
+    { "ti dyn reject: a dyn var cannot be initialized with none",
+      { "var dyn d = none;" }, &typeid(NullabilityEx), 9, 1, 11, 1 },
+    { "ti dyn reject: a dyn var cannot take a possibly-none value",
+      { "func f() { if (runtime(true)) return 1; }",
+        "var dyn y = f();" }, &typeid(NullabilityEx), 9, 2, 11, 2 },
+    { "ti dyn reject: `dyn x;` has no zero value",
+      { "dyn x;" }, &typeid(SyntaxErrorEx) },
+    { "ti dyn accept: `dyn? x;` starts as none",
+      { "dyn? x; assert(x == none); x = 3; assert(x == 3);" } },
+    { "ti dyn: runtime() keeps its argument's nullability",
+      { "var dyn a = runtime(5); var dyn? b = runtime(none);",
+        "assert(typestr(runtime(1)) == \"dyn\");",
+        "assert(typestr(runtime(none)) == \"dyn?\");",
+        "assert(a == 5 && b == none);" } },
+    { "ti dyn reject: runtime(none) into a dyn var",
+      { "var dyn a = runtime(none);" }, &typeid(NullabilityEx), 9, 1, 11,
+      1 },
+    { "ti dyn reject: none into a declared array<dyn>'s element",
+      { "array<dyn> a = [1, \"s\"]; a[0] = none;" },
+      &typeid(NullabilityEx) },
+    { "ti dyn reject: none into a struct's dyn field",
+      { "struct S { dyn f; } var s = S(1); s.f = none;" },
+      &typeid(NullabilityEx) },
+    { "ti dyn reject: a dyn param reassigned none",
+      { "func f(dyn x) { x = none; return 1; } f(2);" },
+      &typeid(NullabilityEx) },
     { "ti dyn accept: non-null dyn arg to a concrete param (type-escape)",
       { "func f(x) => x + 1; var dyn d = 5; assert(f(d) == 6);" } },
     { "ti dyn reject: none to a non-opt dyn param forces opt dyn",
@@ -19973,7 +20004,7 @@ static const std::vector<test> tests =
         " \"func [k] (int x) {\\n    int y = x * k;\\n"
         "    return y;\\n}\");" } },
     { "reflect: typestr of a dyn variable holding none is its static type",
-      { "var dyn n = none; assert(typestr(n) == \"dyn?\");" } },
+      { "var dyn? n = none; assert(typestr(n) == \"dyn?\");" } },
     { "reflect: typeof a struct instance is its name",
       { "struct Pt { int x; int y; }",
         "var p = Pt(1, 2); assert(typestr(p) == \"Pt\");" } },
@@ -21865,7 +21896,7 @@ callback_frame_call_site()
                 "var dyn fm = map;\n"
                 "func top(array<int> xs, int k) {\n"
                 "  var gs = [[1], [xs[len(xs) - 1]]];\n"
-                "  var dyn r = " + call + ";\n"
+                "  var dyn? r = " + call + ";\n"
                 "  return k;\n"
                 "}\n"
                 "func drive(array<int> xs, int n) {\n"
@@ -24064,7 +24095,7 @@ static const std::vector<repl_test> repl_tests =
       { { "var dyn c4 = runtime(true)", "=> true", "Error" },
         { "var d4 = c4 ? {\"a\": 1} : {\"b\": 2}", "=> {\"a\": 1}",
           "Error" },
-        { "var dyn n4 = runtime(none)", "", "Error" },
+        { "var dyn? n4 = runtime(none)", "", "Error" },
         { "var dyn e4 = n4 ?? {\"a\": 3}", "=> {\"a\": 3}",
           "Error" },
         { "var f4 = (c4 ? {\"a\": 4} : {\"b\": 5})", "=> {\"a\": 4}",
@@ -26399,7 +26430,7 @@ static bool nesting_limit_runs()
           [](int n) { return std::string(n % 2 ? "-5" : "5"); } },
         { "?:", "var dyn c = runtime(false);\nvar dyn y = ", "c ? 1 : ",
           "9;\nprint(y);", [](int) { return std::string("9"); } },
-        { "??", "var dyn n = runtime(none);\nvar dyn y = ", "n ?? ",
+        { "??", "var dyn? n = runtime(none);\nvar dyn y = ", "n ?? ",
           "7;\nprint(y);", [](int) { return std::string("7"); } },
         { "=", "var a = 0;\n", "a = ", "runtime(3);\nprint(a);",
           [](int) { return std::string("3"); } },
@@ -30795,7 +30826,7 @@ static bool exc_chain_report()
          * it HAS a chain the bind could copy */
         { "a caught value thrown later, outside its catch, has no chain", {
             "struct A { int v; }",
-            "var dyn saved = none;",
+            "var dyn? saved = none;",
             "try { try { throw A(1); } catch (A) {",
             "    try { print(1 / runtime(0)); }",
             "    catch (DivisionByZeroEx as e) { throw e; } } }",
@@ -30808,7 +30839,7 @@ static bool exc_chain_report()
         { "a caught value thrown later carets and frames its own raise", {
             "func boom(int x) { return 10 / x; }",
             "func again(e) { throw e; }",
-            "var dyn saved = none;",
+            "var dyn? saved = none;",
             "try { try { boom(runtime(0)); }",
             "      catch (DivisionByZeroEx as e) { again(e); } }",
             "catch (DivisionByZeroEx as e2) { saved = e2; }",
@@ -39092,8 +39123,8 @@ static bool disasm_opcode_families()
         "func logic(dyn a, dyn b) {",
         "    var x = a && b || !a;",
         "    var dyn y = a ?? b;",
-        "    var dyn z = runtime(none);",
-        "    var dyn w = z?.x;",
+        "    var dyn? z = runtime(none);",
+        "    var dyn? w = z?.x;",
         "    return [x, y, w];",
         "}",
         "func checks(dyn f) => f(1);",
@@ -47415,7 +47446,7 @@ static bool jit_frameless_call_reach()
             "  if (k == none) { return -1; } return k + z; }; }",
             "var fi = mk(3); var ff = mkf(2.0); var fo = mko(1);",
             "var dyn a = 5; var dyn b = true; var dyn c = 2.5;",
-            "var dyn n = none;",
+            "var dyn? n = none;",
             "var s = 0; var t = 0.0;",
             "for (var i = 0; i < runtime(20); i++) {",
             "  s = s + fi(a) + fi(b) + fo(n) + fo(a);",
@@ -56110,7 +56141,7 @@ static bool jit_memberv_native()
                 "  b.a = refs[i % 3];",
                 "  b.n = i;",
                 "}",
-                "var dyn t = b.a;",
+                "var dyn? t = b.a;",
                 /* an `if` guard NARROWS an opt, an assert does not */
                 "if (t == none) { assert(false); }",
                 "else { assert(t[0] == 3); }",
@@ -56120,7 +56151,7 @@ static bool jit_memberv_native()
                  * destruction arm */
                 "var b2 = B(none, 0);",
                 "for (var i = 0; i < 12; i++) b2.a = [i, i + 1];",
-                "var dyn t2 = b2.a;",
+                "var dyn? t2 = b2.a;",
                 "if (t2 == none) { assert(false); }",
                 "else { assert(t2[1] == 12); }" }))
             return false;
@@ -56149,7 +56180,7 @@ static bool jit_memberv_native()
             /* val_slice: a slice into a boxed field must go through the
              * C++ copy that registers it in its parent's set */
             "for (var i = 0; i < 6; i++) bx.a = flat[1:3];",
-            "var dyn v = bx.a;",
+            "var dyn? v = bx.a;",
             "if (v == none) { assert(false); }",
             "else {",
             "  assert(v[0] == 2);",
@@ -59529,10 +59560,10 @@ static bool jit_op_nativized()
         { OpCode::CheckNoneArgsV, {
             "func g(int x) { var y = x * 2; return y + 1; }",
             "func f(int n) {",
-            "  var dyn v = runtime(none);",
+            "  var dyn bag = runtime([none]);",
             "  var r = 0;",
             "  for (var i = 0; i < n; i++) {",
-            "    try { var q = g(v); r += 1; }",
+            "    try { var q = g(bag[0]); r += 1; }",
             "    catch (TypeErrorEx) { r += 2; }",
             "  }",
             "  return r;",

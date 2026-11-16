@@ -1,0 +1,135 @@
+# Rule 3 (plans/strict-container-types.md; README, "Nullability is
+# orthogonal to dyn"): a `dyn` is never none - a variable, an element, a
+# field. The compiler refuses what it can see (-rt's `ti dyn reject`
+# cases); this program checks the RUN-TIME half, where a `none` arrives
+# through a `dyn` the compiler cannot see into. Each store runs in a loop,
+# so the JIT's inline array<dyn> store tier runs it too (it declines a
+# none to its helper, which refuses it).
+
+# (with -nti no store is checked - inference finds the place's type - so
+# the store refusals are asserted on a typed run only; the parameter
+# checks run either way)
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+# a none read through dyn: typed `dyn`, holding none at run time
+var dyn holes = runtime([1, none, 3]);
+
+# ---- a store through dyn into an array<dyn>: none refused, the rest kept
+var dyn a = cast<array<dyn>>([0, 0, 0]);
+var refused = 0;
+for (var i = 0; i < 3; i++) {
+    try { a[i] = holes[i]; }
+    catch (TypeErrorEx) { refused++; }
+}
+want("array<dyn> refusals", refused, typed ? 1 : 0);
+if (typed)
+    want("array<dyn> kept", str(a), "[1, 0, 3]");
+
+# ---- ... and an array<dyn?> takes it
+var dyn ao = cast<array<dyn?>>([0, 0, 0]);
+for (var i = 0; i < 3; i++)
+    ao[i] = holes[i];
+want("array<dyn?>", str(ao), "[1, <none>, 3]");
+
+# ---- a dict<str, dyn> value and a dict<dyn, int> key
+var dyn d = cast<dict<str, dyn>>({});
+refused = 0;
+for (var i = 0; i < 3; i++) {
+    try { d[str(i)] = holes[i]; }
+    catch (TypeErrorEx) { refused++; }
+}
+want("dict value refusals", refused, typed ? 1 : 0);
+want("dict kept", len(d), typed ? 2 : 3);
+var dyn dk = cast<dict<dyn, int>>({});
+refused = 0;
+for (var i = 0; i < 3; i++) {
+    try { dk[holes[i]] = i; }
+    catch (TypeErrorEx) { refused++; }
+}
+# (a new KEY is checked against the dict's own type however the dict
+# was reached, -nti included)
+want("dict key refusals", refused, 1);
+
+# ---- append through dyn
+var dyn ap = cast<array<dyn>>([]);
+refused = 0;
+for (var i = 0; i < 3; i++) {
+    try { append(ap, holes[i]); }
+    catch (TypeErrorEx) { refused++; }
+}
+want("append refusals", refused, typed ? 1 : 0);
+want("append kept", len(ap), typed ? 2 : 3);
+
+# ---- a struct's dyn field, stored through a dyn base
+struct S { dyn f; }
+var dyn s = S(1);
+refused = 0;
+for (var i = 0; i < 3; i++) {
+    try { s.f = holes[i]; }
+    catch (TypeErrorEx) { refused++; }
+}
+want("field refusals", refused, 1);
+want("field kept", s.f, 3);
+
+# ---- an array<dyn?> does not enter an array<dyn> parameter (its elements
+# may be none); an array<dyn> and an array<int> do
+func count(array<dyn> xs) => len(xs);
+var dyn maybes = cast<array<dyn?>>([1, none]);
+refused = 0;
+try { count(maybes); } catch (TypeErrorEx) { refused++; }
+want("array<dyn?> entry", refused, 1);
+want("array<dyn> entry", count(cast<array<dyn>>([1, "s"])), 2);
+want("array<int> entry", count(runtime([1, 2, 3])), 3);
+
+# ---- a container made where `dyn` is declared refuses nothing (its type is
+# the dynamic array<dyn?>)...
+var dyn made = [1, "s"];
+for (var i = 0; i < 3; i++)
+    made[i % 2] = holes[i];
+want("dynamic container", str(made), "[3, <none>]");
+
+# ---- ...while an INFERRED array<dyn> is the fixed type: a none is refused,
+# on a warmed loop too (the JIT's inline store tier declines it to its
+# helper)
+var mixed = [1, "s"];
+var dyn feed = runtime([1, 2, 3, 4, none, 6]);
+refused = 0;
+for (var i = 0; i < 6; i++) {
+    try { mixed[i % 2] = feed[i]; }
+    catch (TypeErrorEx) { refused++; }
+}
+want("inferred array<dyn> refusals", refused, typed ? 1 : 0);
+if (typed)
+    want("inferred array<dyn> kept", str(mixed), "[3, 6]");
+
+# ---- an array sum takes the join of its element types: one that may hold
+# none is an array<dyn?> at run time too, one that cannot an array<dyn>
+var x1 = ["a", none];
+var wide = x1 + [runtime(5)];
+wide[0] = none;
+want("wider sum", str(wide), "[<none>, <none>, 5]");
+var narrow = [runtime(1), 2] + [runtime(3)];
+var dyn dnarrow = narrow;
+refused = 0;
+try { dnarrow[0] = holes[1]; } catch (TypeErrorEx) { refused++; }
+# (with -nti the sum's storage is flat int, which refuses a none too)
+want("narrow sum refusal", refused, 1);
+
+# ---- the opt forms take none
+var dyn? maybe = holes[1];
+want("dyn? variable", maybe, none);
+dyn? later;
+want("dyn? with no value", later, none);
+if (typed)
+    want("runtime keeps nullability", typestr(runtime(none)), "dyn?");
+
+assert(bad == 0);
+print("ok");

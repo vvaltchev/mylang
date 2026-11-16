@@ -673,9 +673,9 @@ private:
      * computed from the final types, so it is a stable one).
      */
     bool in_fixpoint = false;
-    struct Conflict { std::string msg; Loc s, e; };
+    struct Conflict { std::string msg; Loc s, e; bool null = false; };
     std::vector<Conflict> round_conflicts;
-    void conflict(const std::string &m, Loc s, Loc e);
+    void conflict(const std::string &m, Loc s, Loc e, bool null = false);
 
     /* Compile-time type queries `decltype(var)` / `typestr(expr)` /
      * `kindstr(expr)`: if the call is one, fold its (unevaluated) arg to a
@@ -1194,6 +1194,8 @@ void Inferencer::run_fixpoint(Block *rootBlock)
     if (!round_conflicts.empty()) {
         const Conflict c = round_conflicts.front();
         round_conflicts.clear();
+        if (c.null)
+            nullability(c.msg, c.s, c.e);
         mismatch(c.msg, c.s, c.e);
     }
 }
@@ -3692,6 +3694,16 @@ static bool fit_needed(StaticTypeRef v, StaticTypeRef p, bool top = true)
     p = static_type_resolve(p);
     if (!p)                             /* INT-COV-EXEMPT: see above */
         return false;
+    /* a `dyn` component takes anything but none (rule 3): a value whose
+     * component may be none - a `dyn?`, an unfilled or unsettled one -
+     * is checked. At the top level a parameter's bind and a variable's
+     * static check already refuse none. */
+    if (p->kind == StaticTypeKind::Dyn && !top && !p->opt) {
+        const StaticTypeRef vc = static_type_resolve(v);
+        return vc->kind == StaticTypeKind::Unknown
+               || vc->kind == StaticTypeKind::None
+               || (vc->kind == StaticTypeKind::Dyn && vc->opt);
+    }
     if (p->kind == StaticTypeKind::Dyn
             || p->kind == StaticTypeKind::Unknown
             || p->kind == StaticTypeKind::None)
@@ -3760,8 +3772,10 @@ static std::shared_ptr<TypeAnnot> fit_annot_of(StaticTypeRef t)
         if (a->elem->kind == DeclType::dyn)
             a->elem = nullptr;          /* any box */
         break;
+    case StaticTypeKind::Dyn:
+        break;          /* dyn? takes anything, dyn all but none (rule 3) */
     default:
-        a->opt = false;                 /* dyn: no check */
+        a->opt = false;                 /* no check */
         break;
     }
     return a;
@@ -6411,7 +6425,10 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         }
     }
     if (n == "runtime")
-        return A.dyn_ty();   /* the documented opt-out: defer to runtime (Q) */
+        /* the documented opt-out: defer to runtime (Q) - keeping the
+         * argument's nullability (rule 3: `runtime(none)` is a `dyn?`) */
+        return A.with_opt(A.dyn_ty(), args->elems.size() == 1
+                                          && is_optish(arg(0)));
     if (n == "min" || n == "max") {
         /* min(array) -> the element type; min(a, b, ...) -> the join of args. */
         if (args->elems.size() == 1)
@@ -6621,6 +6638,24 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
             s->round_arg_kinds |= ARGK_FLOAT;
         else if (k && k->kind == StaticTypeKind::Dyn)
             s->round_arg_kinds |= ARGK_DYN;
+    }
+
+    /*
+     * Rule 3 (plans/strict-container-types.md): a `dyn` variable or
+     * parameter is never none - its type stays the `dyn` reset_round
+     * seeded, and a value that may be none is refused (in the converged
+     * round, like any conflict: a type can still climb). It used to widen
+     * to `dyn?`, so `dyn a = 1; a = none;` compiled.
+     */
+    if (s->dyn_decl && !s->opt_decl) {
+        const StaticTypeRef rt = static_type_resolve(t);
+        if (strict_dyn && !has_unknown(rt)
+                && (rt->opt || rt->kind == StaticTypeKind::None))
+            conflict("'" + std::string(s->name->val) +
+                         "' is declared 'dyn' and cannot be none "
+                         "(declare it 'dyn?')",
+                     loc, loc_end, true);
+        return;
     }
 
     /*
@@ -7112,6 +7147,20 @@ void Inferencer::contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
     const StaticTypeRef d = fixed_type(s);
     const StaticTypeRef c = static_type_resolve(cont);
     if (d && c->kind == d->kind) {
+        /* the value stored IS a none here (an unfilled component is a
+         * container's, never a stored value's): a non-opt element - a
+         * `dyn` one included (rule 3) - refuses it */
+        const StaticTypeRef de = static_type_resolve(
+            d->kind == StaticTypeKind::Array ? d->elem : d->val);
+        const StaticTypeRef ce = static_type_resolve(
+            d->kind == StaticTypeKind::Array ? c->elem : c->val);
+        if (strict_dyn && ce && de && ce->kind == StaticTypeKind::None
+                && !de->opt && de->kind != StaticTypeKind::None
+                && !has_unknown(de))
+            conflict("an element of '" + std::string(s->name->val) +
+                         "' ('" + static_type_to_string(d) +
+                         "') cannot be none",
+                     loc, loc_end, true);
         const auto fits = [&](StaticTypeRef v, StaticTypeRef into) {
             const StaticTypeRef r = static_type_resolve(v);
             return has_unknown(r) ||
@@ -7641,14 +7690,17 @@ void Inferencer::check_value_into(StaticTypeRef dest, StaticTypeRef vt,
 {
     dest = static_type_resolve(dest);
     vt = static_type_resolve(vt);
-    if (is_dyn(dest) || is_dyn(vt) || has_unknown(vt))
+    if (has_unknown(vt))
         return;
     const std::string what = field.empty()
         ? "an element of type '" + static_type_to_string(dest) + "'"
         : "field '" + field + "'";
+    /* a `dyn` place refuses none too (rule 3) */
     if (!dest->opt && is_optish(vt))
         nullability(what + " is not 'opt' but the value may be none",
                     at->start, at->end);
+    if (is_dyn(dest) || is_dyn(vt))
+        return;
     if (!static_type_assignable(dest->opt ? vt : strip(vt), dest))
         mismatch(field.empty()
                      ? what + " cannot hold '" +
@@ -7943,11 +7995,14 @@ void Inferencer::mismatch(const std::string &m, Loc s, Loc e)
 {
     throw TypeMismatchEx(intern_msg(m), s, e ? e : s);
 }
-void Inferencer::conflict(const std::string &m, Loc s, Loc e)
+void Inferencer::conflict(const std::string &m, Loc s, Loc e, bool null)
 {
-    if (!in_fixpoint)
+    if (!in_fixpoint) {
+        if (null)
+            nullability(m, s, e);
         mismatch(m, s, e);
-    round_conflicts.push_back({ m, s, e });
+    }
+    round_conflicts.push_back({ m, s, e, null });
 }
 void Inferencer::nullability(const std::string &m, Loc s, Loc e)
 {
@@ -8912,8 +8967,11 @@ void Inferencer::check_call(CallExpr *call)
         }
 
         /* TYPE check: a dyn parameter or a dyn argument accepts any type (the
-         * variant use-case), so skip assignability for those. */
-        if (p_dyn || is_dyn(at))
+         * variant use-case), so skip assignability for those - a parameter
+         * typed `dyn` too (an un-annotated one nothing settled): its
+         * nullability is the check above, not a type mismatch (rule 3 made
+         * `none` unassignable to a `dyn`) */
+        if (p_dyn || is_dyn(at) || is_dyn(ptype))
             continue;
 
         StaticTypeRef src = p_opt ? at : strip(at);

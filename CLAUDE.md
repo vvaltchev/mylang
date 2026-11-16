@@ -4716,9 +4716,30 @@ decisions behind it: `plans/archived/type-inference.md`,
   mandatory-`opt` rule errors if a non-opt param can actually receive `none`
   (see below) — this holds for `dyn` params too (a nullable dyn must be
   `opt dyn`; nullability is orthogonal to dyn). Local/return nullability is
-  *inferred* (`None` joined with a concrete `T` is `opt T`; a `dyn` var that
-  gets `none` becomes `opt dyn`). `runtime(x)` returns `Dyn`
-  (its documented opt-out: it defers to runtime). `==`/`!=` are always
+  *inferred* (`None` joined with a concrete `T` is `opt T`). **A `dyn`
+  var, element or field is never none (rule 3, plans/strict-container-
+  types.md, 2026-11-20):** `contribute` keeps a non-opt `dyn` symbol's
+  type `dyn` and records a possibly-none value as a converged-round
+  CONFLICT raised as NullabilityEx (`Conflict::null`); `static_type_
+  assignable` refuses a possibly-none source into a non-opt `Dyn`
+  (`check_call` therefore skips the TYPE check for a param TYPED `dyn`,
+  whose none is the mandatory-opt rule's); `contribute_elem` refuses a
+  `none` element into a fixed non-opt element type; the parser refuses
+  `dyn x;` (no zero value); `value_fits` / `ct_fit` refuse a `none` for
+  a non-opt `dyn` annotation at run time, and the JIT's inline
+  `array<dyn>` store tier declines a `none` to that helper. A
+  container made at a `dyn` place carries the DYNAMIC type, which
+  refuses nothing - `array<dyn?>` / `dict<dyn?, dyn?>`
+  (`annot_dyn_array` / `annot_dyn_dict`) - while the fixed `array<dyn>`
+  is `annot_array_of_dyn`; that inline tier takes both pointers, the
+  second for a value that is not none. `fit_annot_of` keeps a `dyn?`
+  component's `opt` (it dropped it while a `dyn` checked nothing, so
+  `["a", none] + [runtime(5)]`, statically an `array<dyn?>`, was
+  stamped `array<dyn>` and refused a store the compiler allowed). A `dyn`
+  READ through a `dyn` may still hold none at run time (only a typed
+  parameter's bind catches it - a documented gap). `runtime(x)` returns
+  `Dyn` with its argument's nullability (its documented opt-out: it
+  defers to runtime). `==`/`!=` are always
   well-typed (→ int); ordering is numeric-or-string. `str + anything` → str.
   **`int OP dyn` → `dyn`** — the NATURAL result of mixing a concrete with a
   variant; it is NOT forced to the concrete type. So a FRESH `var r = 3 + d`
@@ -4755,7 +4776,8 @@ decisions behind it: `plans/archived/type-inference.md`,
   In `StaticType`, `opt dyn` is `g_dyn[1]` (the opt-`Dyn` ground); `with_opt`
   carries
   the opt bit onto a `Dyn` kind, and `join` keeps it when a mix collapses to dyn
-  (`dyn | none` → `opt dyn`).
+  (`dyn | none` → `opt dyn` - for an inferred `var`, which the mandatory
+  dyn rule then makes the program write `var dyn?`).
 - **Explicit type annotations** (`int x = 5;`, `func f(str s)`,
   `array a = [...]`): the primitive type keywords `bool`/`int`/`float`/`str`/
   `array`/`dict` may replace `var` on a decl/`for`-init or precede a parameter

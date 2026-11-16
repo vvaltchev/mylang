@@ -29,7 +29,7 @@ func run(str what, dyn f) {
 var dyn F = runtime(1.5);
 var dyn I = runtime(3);
 var dyn S = runtime("ab");
-var dyn N = runtime(none);
+var dyn N = runtime([none])[0];       # a none read through dyn
 var dyn A = runtime([1, 2]);
 
 # ---- strings --------------------------------------------------------------

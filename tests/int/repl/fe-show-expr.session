@@ -4,7 +4,7 @@ struct P { int x; int y; }
 var a = [1, 2, 3]
 var d = {"x": 1}
 var dd = int(runtime(5))
-var dyn dy = runtime(none)
+var dyn? dy = runtime(none)
 var opt_p = P(1, 2)
 :show
 :show 2 + 3 * 4
