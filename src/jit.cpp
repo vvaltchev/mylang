@@ -54,8 +54,12 @@
 #include <cstring>
 #include <type_traits>
 #include <cmath>
+/* The string probe's fault window (sigsetjmp/sigaction) is JIT-only, and
+ * WASI (a-Shell) has no <signal.h> without -D_WASI_EMULATED_SIGNAL. */
+#if ML_JIT_SUPPORTED
 #include <csetjmp>
 #include <csignal>
+#endif
 #include <vector>
 
 #ifdef TESTS
