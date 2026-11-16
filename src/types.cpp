@@ -284,6 +284,7 @@ static const SharedArrayObj empty_arr_actual((std::vector<LValue>()));
 const EvalValue empty_str(SharedStr(empty_str_actual, 0, 0));
 const EvalValue empty_arr(SharedArrayObj(empty_arr_actual, 0, 0));
 const EvalValue none;
+const EvalValue *g_arr_sum_copy = nullptr;   /* eval.h, ArrSumScope */
 
 std::set<UniqueId, UniqueId::Comparator> UniqueId::unique_set;
 

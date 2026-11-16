@@ -68,10 +68,11 @@ func ug(dyn a) {
 
 # a container only `dyn` reaches - each one made as an element of an
 # array<dyn> - carries no type of its own, so it is walked by what it
-# holds (a TYPED one is checked by its own type, Q2 decision A: a
-# cast<array<dyn>>'s array<dyn> and dict(5)'s dict<dyn, int> enter no
-# narrower place, "ai cast" and "dsi dict default" below). Each is
-# used once: one that fits takes the place's type as it enters
+# holds (a TYPED one is checked by its own type, rule 1: a
+# cast<array<dyn>>'s array<dyn> enters no narrower place, "ai cast"
+# below; dict(5)'s key is unfilled - it holds no key yet - so it takes
+# the place's, "dsi dict default"). Each is used once: one that fits
+# takes the place's type as it enters
 array<dyn> U = [ug([1, 2]),
                 ug([1, "x"]),
                 ug([1, none]),
@@ -222,8 +223,8 @@ check("abox elems", abox, U[17]);
 check("abox elems bad", abox, U[18]);
 check("aai elems bad", aai, U[19]);
 check("adi elems bad", adi, U[20]);
-# a TYPED container enters by its own type (Q2 decision A): each part
-# the place does not type `dyn` must be the container's exactly
+# a TYPED container enters by its own type, exactly (rule 1: a `dyn`
+# part of the place is a type of its own, which an int or a str is not)
 array<int> ti = [1];
 array<int?> toi = [1];
 array<P> tp = [P(1)];
@@ -303,7 +304,7 @@ var want = ["ai ints ok", "af ints no", "ab ints no", "astr ints no",
     "aai window ok ok", "dsi ok ok", "dsi value no", "dsi key no",
     "dai ok ok", "dai key no", "dsa ok ok", "dsa value no",
     "dsi default ok ok", "dsi default no", "dsp default ok ok",
-    "dsp default no", "dsi dict default no", "dvi ok ok", "dvi value no",
+    "dsp default no", "dsi dict default ok", "dvi ok ok", "dvi value no",
     "dki ok ok", "dki key no", "ddd any ok", "adi shared ok", "adi bad no",
     "sp ok ok", "sp other no", "sp int no", "sp boxed no", "sp egg no",
     "sp owl no", "sp urn no", "osp none ok", "bi ok ok", "bi float no",
@@ -315,8 +316,8 @@ var want = ["ai ints ok", "af ints no", "ab ints no", "astr ints no",
     "ap elems other no", "ap elems boxed no", "abox elems ok",
     "abox elems bad no", "aai elems bad no", "adi elems bad no", "t ai ok",
     "t ai opt no", "t aoi no", "t ap ok", "t ap other no", "t aai ok",
-    "t aai opt no", "t dsi ok", "t dsi key no", "t dsi value no", "t dvi ok",
-    "t ddd ok", "ai int no", "dsi int no", "garr any ok", "gdict any ok",
+    "t aai opt no", "t dsi ok", "t dsi key no", "t dsi value no", "t dvi no",
+    "t ddd no", "ai int no", "dsi int no", "garr any ok", "gdict any ok",
     "adyn any ok", "W ok", "W bad no"];
 assert(trail == want);
 foreach (var t in trail)
@@ -409,16 +410,19 @@ func probes(dyn d, dyn k) {
     dict<str, dyn> dv = {"a": d};
     run("dk-into", func [dk] () => fk(dk));
     run("dv-into", func [dv] () => fd(dv));
-    run("si-into", func [si] () => fd(si));
+    var dyn sid = si;   # (rule 1: a compile error seen directly)
+    run("si-into", func [sid] () => fd(sid));
 }
 probes(runtime(["s"]), runtime({"a": 1}));
 probes(runtime([5]), runtime(5));
+# (rule 1: a dict<str, int> enters neither a dict<str, dyn> nor a
+# dict<dyn, int> parameter - "fv-dict", "fv-dkey", "si-into")
 assert(calls == ["s-dyn=no", "s-typed=2", "s-dynm=no", "len=1",
-    "fv-dyn=no", "fv-typed=3", "fv-dict=1", "fv-dkey=1", "fv-anyp=1",
-    "dyncallee=no", "dk-into=1", "dv-into=1", "si-into=1", "s-dyn=1",
+    "fv-dyn=no", "fv-typed=3", "fv-dict=no", "fv-dkey=no", "fv-anyp=1",
+    "dyncallee=no", "dk-into=1", "dv-into=1", "si-into=no", "s-dyn=1",
     "s-typed=2", "s-dynm=no", "len=1", "fv-dyn=1", "fv-typed=3",
     "fv-dict=no", "fv-dkey=no", "fv-anyp=1", "dyncallee=1", "dk-into=1",
-    "dv-into=1", "si-into=1"]);
+    "dv-into=1", "si-into=no"]);
 print(calls);
 
 # a store into an element or a dict value of each annotation kind
@@ -441,5 +445,6 @@ func store_kinds(dyn d) {
 var sk = [store_kinds(runtime([1.5])), store_kinds(runtime([true])),
           store_kinds(runtime(P(1))), store_kinds(runtime(box(1))),
           store_kinds(runtime(box(P(2)))), store_kinds(runtime(5))];
-assert(sk == [["f", "d"], ["b", "d"], ["p"], ["x"], ["q"], []]);
+# (rule 1: neither an array<float> nor an array<bool> is an array<dyn>)
+assert(sk == [["f"], ["b"], ["p"], ["x"], ["q"], []]);
 print(sk);

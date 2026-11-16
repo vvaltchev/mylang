@@ -7380,7 +7380,14 @@ per level of a deep value - a separate open item.
   `target2`; MakeStructArrayV derives `array<P>` from its def. `a + b`
   on arrays copies `a` UNTYPED (`ctype_sum_copy`) and the sum takes its
   static type after the append (StampTypeV, the tree-walker's Expr04),
-  so what `b` appends is not checked against `a`'s narrower type.
+  so what `b` appends is not checked against `a`'s narrower type - and,
+  since nothing else holds that copy, it may change STORAGE when `b`'s
+  elements do not fit it (`[1] + [1.5]` is float storage, `arr_sum_join`).
+  The copy is named by `g_arr_sum_copy` for the duration of one `+`
+  (`ArrSumScope`, at the three places that make it: Expr04's
+  `num_binop_loc(..., sum)`, BinOpV, `jit_boxed_binop`); an array a NAME
+  holds keeps its storage - a reference count cannot tell the two apart,
+  since the engines differ on whether a compound store copies the slot.
   `.myv` v43 stores all of it. **A new place that makes a container
   must stamp it**, or it is untyped where the static type says
   otherwise; `tests/int/126_container_types.my` prints the type every
@@ -7412,12 +7419,12 @@ per level of a deep value - a separate open item.
   `tests/functional/125_container_type_stores.my` stores every form
   through `dyn`, refused and fitting.
   **⛔ INCREMENT 3: A CONTAINER ENTERS A TYPED PLACE BY ITS OWN TYPE
-  (decision A).** `fits` (types/fit.cpp.h) checks a TYPED, mutable
-  container by its ctype (`ct_enters`): a component the place types
-  `dyn` (or leaves out - a generic `array`) takes anything, since a
-  store into it is checked; every other component must be the
-  container's exactly (`ct_same`), since a store into it is not - an
-  `array<array<int>>` must not enter `array<array<dyn>>`. An UNTYPED
+  (decision A, made EXACT by rule 1 - plans/strict-container-types.md).**
+  `fits` (types/fit.cpp.h) checks a TYPED, mutable container by its
+  ctype (`ct_enters`): every component the place types must be the
+  container's exactly (`ct_exact`: `dyn` is a type of its own, the `?`
+  included; only a component the place leaves out - a generic `array` -
+  matches any). An UNTYPED
   one is checked by what it holds, and a read-only one too. Every place
   a value ENTERS calls **`value_enters`** (value_fits, then
   `fit_adopt`: an untyped mutable container that fits TAKES the place's
@@ -7435,6 +7442,31 @@ per level of a deep value - a separate open item.
   UNFILLED component (`[]` nothing wrote) for the same reason: that
   container is untyped, and the check is where it takes its type.
   `tests/functional/126_container_entry.my`.
+  **⛔ RULE 1 (strict-container-types.md increment 3): THE STATIC SIDE IS
+  EXACT TOO.** `static_type_elem_compat` (statictype.cpp) matches a
+  component only by equality (an UNFILLED one - `none` - matches any),
+  so no implicit conversion between container types is assignable. What
+  keeps ordinary programs compiling is that a container-making
+  expression is typed for its place: a literal, a builtin's new
+  container (`literal_into` / `fresh_fits` - a non-opt `dyn` component
+  fits, the place's fit check examines it; a `dyn?` one only a nullable
+  component), each element literal a multi-assignment unpacks
+  (`idlist_elem_types`' `into`). An element contribution to an INFERRED
+  container keeps a numeric element type when the value is a `dyn`
+  (`TypeSym::round_elem_dyn`, the element twin of `coerces_dyn`) and
+  makes the element nullable when the value is an explicit `none`
+  (choice 7, its bits 4 / 8). A container a NAME may hold must have its
+  variable's exact type (`check_alias_exact`, the check pass;
+  `new_container_expr` decides what is new - not `sort` / `rev_sort` /
+  `reverse`, which return their argument). A typed literal's element
+  widening is CHECKED at run time in every engine (`literal_elem_widen`,
+  the VM's CoerceNumV): a `dyn` element that does not fit refuses while
+  the literal is built - except at compile time, where no element is a
+  `dyn` and a misfit is inference's to report. And a template is
+  instantiated only for a signature settled all the way down
+  (`has_unknown`), since an `array<?>` instance refuses what its
+  argument settles to; for that a literal with an unsettled element is
+  itself unsettled (the join would drop the element).
 - **Universal `hash()` (deep, by value).** `Type::hash` returns `size_t`; the
   base throws, the leaves (`int`/`bool`/`float`/`str`) hash directly, and
   `none` + the containers/structs hash deeply (`hashing.h` combiners,

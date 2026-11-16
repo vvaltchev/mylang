@@ -6681,6 +6681,7 @@ extern "C" int jit_boxed_binop(const void *bop) noexcept
     EvalValue val = boxed_operand(bo->a, ctx, sa).clone();
     ctype_sum_copy(val);       /* Q2: as the BinOpV handler */
     try {
+        const ArrSumScope g(val);
         vm_num_binop(val, boxed_operand(bo->b, ctx, sb), bo->aop);
     } catch (RuntimeException &e) {
         /* deletability: the op's own caret from the pool entry */
@@ -14245,6 +14246,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
             EvalValue val = boxed_operand(in->a(), &ctx, sa).clone();
             ctype_sum_copy(val);   /* Q2: as the tree-walker's Expr04 */
             try {
+                const ArrSumScope g(val);
                 vm_num_binop(val, boxed_operand(in->b(), &ctx, sb), in->aop);
             } catch (Exception &e) {
                 /* Stamp the operand loc (side table) like stamp_operand_loc, so

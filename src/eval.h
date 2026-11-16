@@ -791,6 +791,18 @@ inline void ctype_sum_copy(const EvalValue &v)
         const_cast<SharedArrayObj &>(v.get_ref<SharedArrayObj>())
             .set_ctype(nullptr);
 }
+/* ...and nothing else holds that copy, so the sum may give it the storage
+ * its elements need (TypeArr::add, arr_sum_join): `[1] + [1.5]` is an
+ * array<float>, `[1] + ["x"]` an array<dyn>. `g_arr_sum_copy` names the
+ * copy for the duration of one `+` (ArrSumScope, at the three places that
+ * make the copy); an array any name holds keeps its storage. */
+extern const EvalValue *g_arr_sum_copy;
+struct ArrSumScope {
+    explicit ArrSumScope(const EvalValue &v) { g_arr_sum_copy = &v; }
+    ~ArrSumScope() { g_arr_sum_copy = nullptr; }
+    ArrSumScope(const ArrSumScope &) = delete;
+    ArrSumScope &operator=(const ArrSumScope &) = delete;
+};
 EvalValue ct_fit(const TypeAnnot *a, EvalValue v, bool dict,
                  Loc s = Loc(), Loc e = Loc());
 EvalValue ct_fit_value(const EvalValue &c, EvalValue v,

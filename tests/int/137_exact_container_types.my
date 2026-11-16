@@ -1,0 +1,9 @@
+# INT-SOURCE: ../functional/132_exact_container_types.my
+# INT-ENGINES: tw default nj nbi
+#
+# INT unit (plans/strict-container-types.md, rule 1): a new container
+# joins what is put into it, an explicit none makes its element nullable
+# (choice 7), dict(v) has its key filled by the stores and dict(pairs) is
+# typed by its pairs, an alias and sort keep the container's type, and a
+# cast converts into a new container. The functional program runs as a
+# coverage unit (INT-SOURCE).

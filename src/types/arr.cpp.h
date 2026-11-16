@@ -431,6 +431,52 @@ EvalValue TypeArr::intptr(const EvalValue &a)
     }
 }
 
+/* `l` followed by `items`, in the storage they need together: flat ints
+ * or floats when every element is a number (a bool one as 0 / 1, an int
+ * one widened beside a float), general otherwise - a sum's copy that its
+ * right side does not fit (TypeArr::add) */
+static EvalValue arr_sum_join(const SharedArrayObj &l,
+                              const std::vector<EvalValue> &items)
+{
+    std::vector<EvalValue> all;
+    all.reserve(l.size() + items.size());
+    for (size_type i = 0; i < l.size(); i++)
+        all.push_back(arr_elem_at(l, i));
+    all.insert(all.end(), items.begin(), items.end());
+    bool nums = true, flt = false;
+    for (const EvalValue &e : all) {
+        if (e.is<float_type>())
+            flt = true;
+        else if (!e.is<int_type>() && !e.is<bool>())
+            nums = false;
+    }
+    const auto num = [](const EvalValue &e) -> float_type {
+        return e.is<float_type>() ? e.get<float_type>()
+             : e.is<int_type>() ? static_cast<float_type>(e.get<int_type>())
+             : (e.get<bool>() ? 1 : 0);
+    };
+    if (nums && flt) {
+        SharedArrayObj::fvec_type v;
+        v.reserve(all.size());
+        for (const EvalValue &e : all)
+            v.push_back(num(e));
+        return SharedArrayObj(std::move(v));
+    }
+    if (nums) {
+        SharedArrayObj::ivec_type v;
+        v.reserve(all.size());
+        for (const EvalValue &e : all)
+            v.push_back(e.is<int_type>() ? e.get<int_type>()
+                                         : (e.get<bool>() ? 1 : 0));
+        return SharedArrayObj(std::move(v));
+    }
+    SharedArrayObj::vec_type v;
+    v.reserve(all.size());
+    for (EvalValue &e : all)
+        v.emplace_back(std::move(e), false);
+    return SharedArrayObj(std::move(v));
+}
+
 /* `lv += rv[roff, roff + rn)` for one flat kind, in place. The range
  * may lie in `lv` itself (`a += a`, `a += a[0:2]`): it is copied out
  * first, since inserting a vector's own range into it is undefined. */
@@ -518,6 +564,19 @@ void TypeArr::add(EvalValue &a, const EvalValue &b)
         const TypeAnnot *ea = ct->elem.get();
         for (EvalValue &e : items)
             e = ct_fit(ea, std::move(e), false);
+    }
+
+    /* the copy `a + b` builds (ArrSumScope) takes the storage both sides'
+     * elements need, as one literal of them would - nothing else holds
+     * it, and the sum takes its static type once built (StampTypeV) */
+    if (&a == g_arr_sum_copy && !lval.ctype()) {
+        bool fits = true;
+        for (const EvalValue &e : items)
+            fits = fits && arr_elem_fits(lval, e);
+        if (!fits) {
+            a = arr_sum_join(lval, items);
+            return;
+        }
     }
 
     for (const EvalValue &e : items)

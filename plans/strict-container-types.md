@@ -276,6 +276,45 @@ later. Each is marked with what it would take to reverse it.
    the dynamic type from the literal's own nullability instead (`[1,
    2]` an `array<dyn>`, `[1, none]` an `array<dyn?>`).
 
+9. **A multi-assignment's literal builds each element for its target**
+   (rule 1, increment 3): `a, b = [[d], [d]]` with `array<int> a, b`
+   types each element literal as its target, exactly as `a = [d]` does
+   - a literal is unpacked as written, so each element IS the value its
+   target receives. Without it the same program refused the
+   multi-assignment form and accepted the single one.
+10. **A typed literal refuses a misfitting `dyn` element while it is
+    built**, with the numeric coercion's message ("cannot store a
+    non-int value in an 'int' variable"), in every engine: the VM's
+    `CoerceNumV` already did, and the tree-walker's literal widening is
+    checked the same way now. The error is the literal's caret, before
+    anything is stored (a multi-assignment writes no target). The fit
+    check's own wording ("'v' is declared 'array<int>' but the value's
+    [0] is a 'str'") would read better; getting it would mean an
+    unchecked widening op in the VM - left for later.
+11. **A possibly-none value (`T?`, `dyn?`) into a non-opt element or
+    dict value is a compile-time NullabilityEx**, as it already was into
+    a field. A `dyn?` into an element that may be none fits (checked at
+    run time), as a `dyn` does into any element.
+
+12. **A container a name may hold is refused where it FLOWS, not at the
+    store that widens it.** `var b = a; b[0] = "s"` is a compile error
+    at `var b = a` ("'b' has type 'array<dyn>' but the container it is
+    given is an 'array<int>'"), as is a `return` or a ternary arm of
+    such a value into a joined result. The design's wording was "at the
+    store"; the flow is where the two types meet, and one check covers
+    every store, append and `+=` that could widen it. Reversing it means
+    tracking, per variable, which contributions came from an alias and
+    refusing the store instead.
+13. **`dict(pairs)` is typed by its pairs** (`array<array<T>>` gives
+    `dict<T, T>`), not unfilled: its keys come from the pairs, so an
+    unfilled key a later store filled would describe a dict holding
+    other keys - measured: the JIT read a string key as an int.
+    `dict(v)` (a default dict, empty when made) has its key unfilled.
+14. **A template is instantiated only for a signature whose container
+    components have settled.** An `array<?>` instance refused what its
+    argument settled to (exact types); a literal with an unsettled
+    element is unsettled itself.
+
 ### A gap left by increment 1
 
 A `dyn` READ through a `dyn` (`var dyn n = holes[1]`, where `holes`
@@ -314,24 +353,21 @@ prints `0`. Choice 6 fixes it.
    array is an `array<dyn?>` until a variable types it.
 3. Rule 1: element contributions, fresh containers, exact assignment;
    decision A's `ct_enters` loses the `dyn` component's tolerance; and
-   choice 7 (moved here from increment 2: it is an element
-   contribution rule). STARTED, on branch `wip-strict-rule1` (not
-   pushed). Step 3a is written: `static_type_elem_compat` and
-   `ct_enters` are exact; a non-opt `dyn` value fits a declared
-   element (checked at run time, as `int x = d` is); a builtin's NEW
-   container with `dyn` components fits a declared place
-   (`fresh_fits`, the place's fit check examining it); and a `dyn`
-   stored into an inferred NUMERIC element keeps its type (the element
-   twin of the `var s = 0; s = s + d` coercion, `round_elem_dyn`), any
-   other element type taking the `dyn`. Measured: every corpus program
-   but 93_dyn_fit compiles; 10 `-rt` cases fail, all tests that used
-   an `array<dyn>` VARIABLE to stand for a value the compiler cannot
-   see (now a compile error, the rule's point) - they need rewriting
-   through a `dyn` name. It also exposed #68 (an inlined call's value
-   as an operand careted its body), fixed separately. Left: step 3b
-   (a variable assigned two different container values - the join to
-   `dyn`, choice 1; an element store into an ALIASED container checked
-   against its type) and choice 7.
+   choice 7. DONE 2026-11-21 (choices 7, 9-14 above, for the
+   maintainer): exact static and run-time container types, the flow
+   check (a container a name may hold keeps its type into a variable, a
+   result, a ternary), the element contributions (a `dyn` keeps a
+   numeric element, a `none` makes it nullable), the array sum's element
+   join and storage, `dict()` typing, the template signature rule. The
+   corpus compiles as before (0 of ~390 programs change outcome); the
+   tests that used an `array<dyn>` name for a value the compiler cannot
+   see go through a `dyn` name. **Still open:** the increment 2
+   leftover above - `func mk(n) => array(n); var q = mk(2); q[0] =
+   "s";` types `q` an `array<str>` holding none (the flow check lets an
+   unfilled component match, which is sound for an EMPTY container and
+   not for `array(n)`'s none-filled one). The fix needs `array(n)` with
+   no type of its own to be an `array<dyn?>` once it flows out untyped,
+   while `var a = array(2); a[0] = "x"` keeps typing `a` by its stores.
 4. Rule 4 (storage follows the type), rule 5 (bare annotations are
    holes), rule 6 (`none` keys - already work, gets a test).
 5. Rule 8.

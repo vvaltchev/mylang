@@ -1,13 +1,14 @@
 # Q2 increment 3 (plans/typed-containers.md, section 3, decision A): a
 # container ENTERING a typed place - a parameter, a struct field, an
 # element of a typed container - enters by its OWN type, not by what it
-# holds right now (README, "A container keeps its type"). A component the
-# place types `dyn` takes anything, since a store into it is checked
-# against the container's own type; every other component must be the
-# container's exactly. An untyped container (only `dyn` reaches it) is
-# checked by what it holds and then TAKES the place's type, so a later
-# store through a `dyn` name is checked against it. A constant's
-# container is read-only: it is checked by what it holds and takes none.
+# holds right now (README, "A container keeps its type"). Every component
+# must be the container's exactly - a `dyn` one too, which is a type of
+# its own (rule 1, plans/strict-container-types.md; decision A let it
+# take anything until 2026-11-20). An untyped container (only `dyn`
+# reaches it) is checked by what it holds and then TAKES the place's
+# type, so a later store through a `dyn` name is checked against it. A
+# constant's container is read-only: it is checked by what it holds and
+# takes none.
 #
 # Without inference (-nti) no container has a type, so nothing below is
 # refused there: every refusal is asserted in a typed run only.
@@ -30,7 +31,7 @@ try { var s = S(d); } catch (TypeErrorEx) { refused++; }
 assert(!typed || refused == 2);
 
 # invariance: an array<int> is no array<int?> (the place would let a
-# none in), but it enters array<dyn> - and a store there is checked
+# none in), nor an array<dyn> (rule 1)
 refused = 0;
 var b = [1, 2];
 var dyn x = b;
@@ -58,8 +59,8 @@ refused = 0;
 var dd = {"k": 1};
 var dyn ddd = dd;
 try { takes_dict(ddd); } catch (TypeErrorEx) { refused++; }
-assert(takes_dict_dyn(ddd) == 1);
-assert(!typed || refused == 1);
+try { takes_dict_dyn(ddd); } catch (TypeErrorEx) { refused++; }
+assert(!typed || refused == 2);
 
 # an untyped container - nested in a `dyn` element - fits by what it
 # holds, and takes the type of the place it entered

@@ -1,0 +1,9 @@
+# INT-SOURCE: ../functional/131_array_sum_types.my
+# INT-ENGINES: tw default nj nbi
+#
+# INT unit (plans/strict-container-types.md, open point 3): an array sum
+# is a new array of its operands' element join, in the storage that join
+# needs - the sum's copy changing storage (arr_sum_join) for an int and a
+# float array, an int and a str one, a bool and an int one, a chain, and
+# typed reads of a joined sum in a compiled loop. The functional program
+# runs as a coverage unit (INT-SOURCE).

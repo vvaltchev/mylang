@@ -741,7 +741,8 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     such a value written as an ELEMENT of a literal: in
     `array<array<float>> m = [[1], f()];` the `[1]` widens, while `f()`
     must already be an `array<float>`; `[dict(1)]` is not an
-    `array<dict<str, float>>` (`dict(1)` is a call, a `dict<dyn, int>`).
+    `array<dict<str, float>>` (`dict(1)` is a call, a `dict<?, int>`
+    whose key the stores fill).
     A single value stored into an element - `a[i] = 5`, `append(a, 5)`,
     `push(a, 5)`, `insert(a, 0, 5)`, a dict key or value - widens to the
     declared type the same way: `5` stored into an `array<float?>` is
@@ -1509,6 +1510,36 @@ Key rules:
     show({"a": 1});     # this instance: d is a dict<str,int>
     show({});           # this one: a dict<dyn,dyn> - prints nothing
     ```
+  * **A container's type is exact.** There is no implicit conversion between
+    two container types, in either direction and at any depth: an
+    `array<int>` is neither an `array<dyn>` nor an `array<float>` nor an
+    `array<int?>`, and the same goes for dicts. A container is a
+    reference - two names can hold one - so two names for it must agree on
+    its type. A container another name may hold (one read from a
+    variable, returned by a call, read as an element, picked by a
+    ternary...) therefore keeps its type wherever it goes, and a place of
+    another type is a compile error:
+
+    ```C#
+    var a = [1, 2];
+    var b = a;        # TypeMismatchEx: 'b' has type 'array<dyn>' but the
+    b[0] = "s";       # container it is given is an 'array<int>'
+    ```
+
+    A NEW container takes the type the program gives it - a literal, a
+    builtin's new container (`map`, `filter`, `make_array`, `keys`,
+    `values`, `clone`, ... but not `sort`, `rev_sort` or `reverse`,
+    which return the array they were given), a slice, an array sum, a
+    `cast`: the join of what is put into it, an int widened beside a
+    float and mixed kinds `dyn`. So `var a = [1]; a[0] = "s";` is an
+    `array<dyn>`. An explicit `none` stored into one makes its element
+    nullable: `var a = [1, 2]; a[0] = none;` is an `array<int?>` (an
+    EMPTY container is the exception: `[]` with nothing filled in has
+    no element type yet). `a + b` of two arrays is a new array of the
+    two element types' join: `[1] + [1.5]` is an `array<float>` (the
+    ints widened), `[1] + ["x"]` an `array<dyn>`. To change a
+    container's type, convert it: `cast<array<dyn>>(a)` is a new
+    `array<dyn>` holding `a`'s elements (see *cast*).
   * **Null safety.** A plain value is *non-nullable*: passing `none` where a
     non-`none` value is required — an arithmetic operand, a subscript base — is
     a compile error. A local that might be `none` (e.g. `var x;`, or assigned
@@ -1813,15 +1844,11 @@ slot = "now a string";           # ok, because it's dyn
                                   # 'array<dyn?>'
     ```
 
-    A part of the place's type that is `dyn` takes anything, since a
-    store into it is checked against the container's own type; every
-    other part must be the container's exactly. So an `array<int>`
-    enters an `array<dyn>` parameter (and a store of a string through it
-    is refused), but not an `array<int?>` one, which would let a `none`
-    in, and an `array<array<int>>` does not enter an
-    `array<array<dyn>>`, whose elements take any array. A `dyn` part
-    takes no part that may be `none`: an `array<dyn?>` - a dynamic
-    container too - does not enter an `array<dyn>` (convert it with
+    The container's type must be the place's exactly (*A container's
+    type is exact*): an `array<int>` enters neither an `array<dyn>`
+    parameter nor an `array<int?>` one, an `array<array<int>>` does not
+    enter an `array<array<dyn>>`, and an `array<dyn?>` - a dynamic
+    container - does not enter an `array<dyn>` (convert it with
     `cast<array<dyn>>(d)`, which refuses a `none`). A container that
     carries no type - one only a `dyn` reaches, such as an element of an
     `array<dyn>` - is checked by what it holds and then TAKES the
@@ -3555,8 +3582,9 @@ The following built-in functions will be evaluated during *parse-time* when
 const arguments are passed to them.
 
 Such a call is still **typed as the call**, by the builtin's own rule, never
-as the value it computes: `get(D, "a")` is an `int?` and `dict(pairs)` a
-`dict<dyn, dyn>` even when every argument is a constant. The value replaces
+as the value it computes: `get(D, "a")` is an `int?` and `dict([[1, "b"]])` a
+`dict<dyn, dyn>` (its pairs mix two kinds) even when every argument is a
+constant. The value replaces
 the call once the whole program is typed, as for a constant call to a user
 function (see *Calling functions during const-evaluation*), so turning
 folding off (`-nc`) changes nothing a program can see:
@@ -3847,7 +3875,11 @@ With an **array** argument, build a dictionary from an array of [key, value]
 arrays (the counterpart of `kvpairs()`), in the array's order; on a
 duplicate key the later value wins, at the place of the first. With any other (non-array, non-`none`)
 argument, build an empty **default dict**: reading a missing key returns (and
-inserts) that default value instead of throwing, so accumulation works directly:
+inserts) that default value instead of throwing, so accumulation works directly.
+The default's type is the value type; the key type is whatever the program
+stores (`dict(0)` used with string keys is a `dict<str, int>`). `dict(pairs)` is
+typed by its pairs: an array of `[k, v]` arrays of one element type `T` makes a
+`dict<T, T>`, mixed pairs a `dict<dyn, dyn>`:
 
 ```C#
 var counts = dict(0);

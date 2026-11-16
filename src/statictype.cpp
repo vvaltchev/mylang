@@ -303,15 +303,17 @@ bool static_type_unify(StaticTypeRef a, StaticTypeRef b)
 /* ---------------------------- assignable --------------------------------- */
 
 /* Two container component types are compatible for assignment when they are
- * equal, or when either is None (an empty container - the bottom element type)
- * or Dyn (a heterogeneous container). Keeps arrays/dicts practically usable
- * despite invariance: an empty [] fits any array<T>, a dyn array fits any. */
+ * equal, or when either is None (unfilled: an empty container - the bottom
+ * element type - fits any array<T>). Rule 1 (plans/strict-container-
+ * types.md): container types are EXACT - a `dyn` component is a type of
+ * its own, so an array<int> is not an array<dyn> (a store of a string
+ * through the second name would land in the first's int storage), nor
+ * the reverse. */
 static bool static_type_elem_compat(StaticTypeRef a, StaticTypeRef b)
 {
     a = static_type_resolve(a);
     b = static_type_resolve(b);
-    if (a->kind == StaticTypeKind::None || b->kind == StaticTypeKind::None ||
-        a->kind == StaticTypeKind::Dyn  || b->kind == StaticTypeKind::Dyn)
+    if (a->kind == StaticTypeKind::None || b->kind == StaticTypeKind::None)
         return true;
     return static_type_equal(a, b);
 }
