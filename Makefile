@@ -248,7 +248,9 @@ DEPDIR := $(BUILD_DIR)/.d
 DEP_REL = $(patsubst $(CURDIR)/%,%,$(abspath $@))
 DEPFLAGS = -MT $@ -MT $(abspath $@) -MT $(DEP_REL) -MMD -MP \
            -MF $(DEPDIR)/$*.Td
-POSTCOMPILE = mv -f $(DEPDIR)/$*.Td $(DEPDIR)/$*.d
+# clang writes the -MF file after the object file; touch the object so its
+# .d is not newer than it (otherwise every object is rebuilt on every run).
+POSTCOMPILE = mv -f $(DEPDIR)/$*.Td $(DEPDIR)/$*.d && touch $@
 SOURCES:=$(wildcard src/*.cpp)
 OBJECTS=$(SOURCES:src/%.cpp=$(BUILD_DIR)/%.o)
 
