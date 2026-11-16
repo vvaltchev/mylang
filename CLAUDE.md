@@ -6544,6 +6544,24 @@ payoff.
   vs `func()->int` after, where the top level said `func()->int` in both.
   **If you add a fourth pass that cares about declaration order, it needs
   the same pre-scan.**
+  **⛔ AND THE PARSER NOW ORDERS THE TREE, WHICH IS WHAT MAKES ALL OF THEM
+  AGREE (question 21, decision A, 2026-11-16).** `pBlock` ends with a stable
+  sort of the block's statements: named func/struct decls first, then the
+  RUN-TIME `const` decls (a container, a function, a type alias) in source
+  order, then the rest - so a const binds at scope entry too, and a read
+  above its line sees it in every engine (the optimizers folded some such
+  reads and others raised UnboundSymbolEx, a RULE 2 divergence). The twins
+  above were not enough on their own: `compile_scalar_body` (loop and `if`
+  bodies) emitted a func decl where it was written, so a call above it in a
+  loop body raised UnboundSymbolEx under `-ni -nj` alone. Every pass and
+  every lowering walks the ordered tree, so no new one can miss it. A
+  const's value is computed while parsing and can name only what is above
+  it, so moving it changes no value; a const SCALAR has no run-time decl
+  (the parser substitutes it) and stays declare-before-use. The REPL's
+  INPUT keeps its order (`push_const_scope` false: it runs statement by
+  statement, and its echo reads the last one) - which is why
+  `emit_ctor_guard` (a construction through a global alias reads the alias
+  first) still exists: in a script the alias is always bound by then.
   **Scope, still map-bound:** lambdas (anonymous — no name binding; their
   params/locals ARE slotted) and, in the **REPL** (top-level names stay
   redefinable), all top-level names; template-instance clones, inserted before

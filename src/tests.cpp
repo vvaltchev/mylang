@@ -15203,8 +15203,7 @@ static const std::vector<test> tests =
         {
             "var d = {\"a\": 3, \"b\": 4};",
             "var arr = [];",
-            "foreach (var k, v, nn in d) {",
-            "   assert(nn == none);",
+            "foreach (var k, v in d) {",
             "   append(arr, [k,v]);",
             "}",
             "assert(dict(arr) == d);",
@@ -17196,19 +17195,18 @@ static const std::vector<test> tests =
       { "struct S { int a; } const T = S; func f(T) {",
         " try { throw S(1); } catch (T) { print(1); } } f(2);" },
       &typeid(SyntaxErrorEx), 29, 2 },
-    /* an alias is a CONST: it binds where its declaration runs (a
-     * struct's own name binds at scope entry). The VM's constructor ops
-     * build the instance from the def inference stamped and never read
-     * the callee, so a construction that ran BEFORE `const T = S;` built
-     * one where the tree-walker raised UnboundSymbolEx (RULE 2): a
-     * global alias is read first now (CallExpr::ctor_alias, codegen's
-     * emit_ctor_guard) - by the planned and the checked constructor, by
-     * each element of a struct-array literal and by an append's
-     * constructor in place. The arguments are run-time values and each
-     * result is held in a variable, so no call is folded or tail-inlined
-     * away. */
+    /* an alias is a CONST, and a const binds at SCOPE ENTRY like a
+     * struct's own name (question 21, decision A): a construction through
+     * it that runs above `const T = S;` builds the instance, in every
+     * engine. Before, the alias bound where its declaration ran - the VM
+     * built the instance where the tree-walker raised UnboundSymbolEx
+     * (RULE 2), and then every engine raised it. Each shape: the planned
+     * and the checked constructor, each element of a struct-array
+     * literal, an append's constructor in place. The arguments are
+     * run-time values and each result is held in a variable, so no call
+     * is folded or tail-inlined away. */
     {
-        "type alias: a construction that runs before the alias is bound",
+        "type alias: a construction that runs above the alias decl",
         {
             "struct S { int a; }",
             "struct W { S s; int n; }",
@@ -17233,7 +17231,7 @@ static const std::vector<test> tests =
             "catch (UnboundSymbolEx) { n += 10000; }",
             "const T = S;",
             "const TB = B;",
-            "assert(n == 11111);",
+            "assert(n == 0);",
             "assert(mk(rt(2)) == S(2) && mka(rt(1)) == 2);",
             "assert(mke(rt(1)) == 1 && mkn(rt(4)) == 4 && mkb(rt(5)) == 5);",
         },

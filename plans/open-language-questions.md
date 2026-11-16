@@ -505,6 +505,11 @@ Decisions (maintainer, 2026-11-02), all SAVED and none implemented:
 
 ## 21. A `const` container or function read before its declaration has run
 
+**DECIDED: A (maintainer, 2026-11-16) - done.** The parser puts a block's
+run-time const declarations right after its named functions and structs
+(pBlock), so they bind at scope entry in every engine. A const scalar has
+no run-time binding and stays declare-before-use.
+
 Found by the review of batch 26 (2026-11-14). A `const` SCALAR has no
 run-time symbol: every read is its value, and a read above the
 declaration is an undefined name. A `const` ARRAY, DICT or FUNCTION is
