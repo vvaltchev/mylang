@@ -1982,6 +1982,13 @@ foreach (var k, v in d) {
 ```
 
 To iterate only through each key, just use `var k in d` instead.
+A dict entry is exactly a key and a value: a third loop variable is an
+error, never a `none` (a compile error when the container is known to be
+a dict, a `TypeErrorEx` at the container when it is `dyn`):
+
+```C#
+foreach (var k, v, w in d) { }   # error: a dict entry is a key and a value
+```
 
 #### Optional `var`
 

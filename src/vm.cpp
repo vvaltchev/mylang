@@ -385,6 +385,19 @@ vm_throw_unpack_gone(const Chunk *chunk, size_t pc)
     throw OutOfBoundsEx(ls, le);
 }
 
+/* A dict entry is a key and a value - do_iter's message and caret */
+[[noreturn]] static ML_COLD void
+vm_throw_unpack_dict(const Chunk *chunk, size_t pc, size_t nvars)
+{
+    Loc s, en;
+    if (chunk)
+        chunk->loc_at(pc, s, en);
+    throw TypeErrorEx(intern_msg("foreach: a dict entry is a key and a "
+                                 "value, which cannot be unpacked into "
+                                 + std::to_string(nvars) + " variables"),
+                      s, en);
+}
+
 [[noreturn]] static ML_COLD void
 vm_throw_unpack_len(const Chunk *chunk, size_t pc, size_type m, int_type nvars)
 {
@@ -1915,7 +1928,8 @@ vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
         st.is_dict = true;
         st.cur.start(*st.container.get_ref<intrusive_ptr<DictObject>>());
         /* lever 4: the non-indexed 1/2-var dict loop binds key/value
-         * through the baked slots (>2 vars = none-padding -> generic). */
+         * through the baked slots (more vars: the generic body, which
+         * throws). */
         if (!st.indexed && nv >= 1 && nv <= 2) {
             st.slot0 = tg[0];
             st.slot1 = nv == 2 ? tg[1] : -1;
@@ -1936,7 +1950,7 @@ vm_foreach_dyn_init_body(DynIterState &st, const EvalValue &cont,
  * targets[0] = the counter; an ARRAY element binds the single remaining var
  * box-free (vm_arr_elem) or STRICT-unpacks an array element into the N
  * remaining vars (the two TypeErrorEx throws; loc-less when `chunk` null); a
- * DICT binds key [, value [, none...]] (do_iter's count=2 padding). Then
+ * DICT binds key [, value] (a third variable is do_iter's TypeErrorEx). Then
  * advance. */
 static bool
 vm_foreach_dyn_next_body(DynIterState &st, Frame &frame,
@@ -1994,16 +2008,16 @@ vm_foreach_dyn_next_body(DynIterState &st, Frame &frame,
         const auto *p = st.cur.next_entry(d);       /* #53 */
         if (!p)
             return false;
+        /* do_iter's count==2 else-branch: key, then value; a third
+         * variable is the strict unpack's error */
+        if (nv > 2)
+            vm_throw_unpack_dict(chunk, pc, nv);
         if (st.indexed)
             bind(0, EvalValue(st.counter++));
-        /* do_iter's count==2 else-branch: key, value, then `none` for any
-         * further vars. */
         if (nv >= 1)
             bind(tb, p->first);
         if (nv >= 2)
             bind(tb + 1, p->second.get());
-        for (size_t i = 2; i < nv; i++)
-            bind(tb + i, none);
     }
     return true;
 }
@@ -12787,7 +12801,7 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
              * `indexed` binds targets[0] = the counter; an ARRAY element binds
              * the single remaining var BOX-FREE (vm_arr_elem) or STRICT-
              * unpacks an array element into the N remaining vars; a DICT
-             * binds key [, value [, none...]] (do_iter's count=2 padding). */
+             * binds key [, value] (more is do_iter's TypeErrorEx). */
             ML_VM_CHECK(in->target2 >= 0
                 && in->target2 < static_cast<int_type>(chunk->n_dyn_iters));
             DynIterState &dst_ = dyiter(in->target2);

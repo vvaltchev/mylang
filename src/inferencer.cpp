@@ -4294,7 +4294,7 @@ void Inferencer::annotate_hints(Construct *n)
          * list - any var count, the `indexed` form, `_` placeholders. It
          * dispatches at runtime and binds exactly as do_iter: an array
          * element (single var) or its STRICT unpack (multi-var); a dict key
-         * [, value [, none-padded]]; `indexed` counts in ids[0]. */
+         * [, value] (more: TypeErrorEx); `indexed` counts in ids[0]. */
         if (fe->ids && !fe->ids->elems.empty()
             && !fe->container_is_array && !fe->container_is_dict) {
             StaticTypeRef c = static_type_resolve(type_of(fe->container.get()));
@@ -8023,6 +8023,19 @@ void Inferencer::check(Construct *n)
         StaticTypeRef c = type_of(fe->container.get());
         require_nonopt(c, fe->container->start, fe->container->end,
                        "as a foreach container");
+        /* A dict entry is a key and a value: a loop over a dict binds
+         * one or two variables (after an `indexed` counter). More is the
+         * strict unpack's error, decided here when the container is
+         * proven a dict, and at run time otherwise (README *The foreach
+         * loop*). */
+        const size_t nkv = fe->ids ? fe->ids->elems.size()
+                                     - (fe->indexed ? 1 : 0) : 0;
+        if (nkv > 2 && static_type_resolve(c)->kind == StaticTypeKind::Dict)
+            throw TypeMismatchEx(
+                intern_msg("foreach: a dict entry is a key and a value, "
+                           "which cannot be unpacked into "
+                           + std::to_string(nkv) + " variables"),
+                fe->container->start, fe->container->end);
         return;
     }
 

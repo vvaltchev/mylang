@@ -12221,6 +12221,45 @@ static const std::vector<test> tests =
         &typeid(TypeErrorEx), 34, 1, 36, 1,
     },
     {
+        /* a dict entry is a key and a value: a third foreach variable is
+         * the strict unpack's error (it was bound to none), raised at run
+         * time when the container is dyn - in every engine, at the
+         * container (vm_throw_unpack_dict, do_iter) */
+        "err loc: dyn foreach over a dict with 3 variables marks it",
+        {
+            "func f(dyn c) { foreach (k, v, w in c) { } }",
+            "f(runtime({\"a\": [1, 2]}));",
+        },
+        &typeid(TypeErrorEx), 37, 1, 39, 1,
+    },
+    {
+        /* the same, indexed: the counter is not part of the entry */
+        "err loc: indexed dyn foreach over a dict, 3 more variables",
+        {
+            "func f(dyn c) { foreach (i, k, v, w in indexed c) { } }",
+            "f(runtime({\"a\": 1}));",
+        },
+        &typeid(TypeErrorEx), 48, 1, 50, 1,
+    },
+    {
+        /* a container proven a dict: refused at compile time */
+        "err loc: foreach over a proven dict with 3 variables",
+        {
+            "var d = {\"a\": [1, 2]};",
+            "foreach (var k, x, y in d) { }",
+        },
+        &typeid(TypeMismatchEx), 25, 2, 27, 2,
+    },
+    {
+        /* an empty dict has no entry to unpack: no error, no iteration */
+        "foreach over an empty dyn dict with 3 variables",
+        {
+            "func f(dyn c) { var n = 0; foreach (k, v, w in c) n++;",
+            "  return n; }",
+            "assert(f(runtime({})) == 0);",
+        },
+    },
+    {
         /* re-raise deletability: under the JIT this boxed loop's originals
          * are DELETED (the run collapses onto its EnterNative), so the OOB
          * caret comes from jit_subscript's BAKED LocEntry conveyance, not a
@@ -13972,10 +14011,11 @@ static const std::vector<test> tests =
     {
         /* The GENERAL dyn foreach (any var count, `indexed`, `_`): the
          * ForeachDyn iterator now covers the residual shapes - indexed dyn
-         * (array + dict), a 3-var strict unpack with `_`, and the dict
-         * key/value/none padding - all binding exactly as do_iter. Every
-         * assert is dict-iteration-order independent. */
-        "Foreach dyn general: indexed, N-var, `_`, dict none-pad",
+         * (array + dict), a 3-var strict unpack with `_`, and a dict's
+         * third variable, the strict unpack's TypeErrorEx (it was bound to
+         * none until 2026-11-16) - all exactly as do_iter. Every assert is
+         * dict-iteration-order independent. */
+        "Foreach dyn general: indexed, N-var, `_`, dict arity",
         {
             "func mk() { return {\"a\": 1, \"b\": 2}; }",
             "var dyn d = mk();",
@@ -13990,11 +14030,11 @@ static const std::vector<test> tests =
             "var ti = 0; var tv = 0;",
             "foreach (var i, v in indexed a2) { ti += i; tv += v; }",
             "assert(ti == 3); assert(tv == 60);",
-            "var kk = 0; var vv = 0; var nn = 0;",
-            "foreach (var k, v, x in d) {",
-            "    kk += 1; vv += v; if (x == none) nn += 1;",
-            "}",
-            "assert(kk == 2); assert(vv == 3); assert(nn == 2);",
+            "var kk = 0; var refused = false;",
+            "try {",
+            "    foreach (var k, v, x in d) kk += 1;",
+            "} catch (TypeErrorEx) { refused = true; }",
+            "assert(kk == 0); assert(refused);",
         },
     },
 
