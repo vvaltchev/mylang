@@ -866,6 +866,34 @@ static bool pt_try_typed(EvalContext *ctx, FuncObject &obj,
     return pt_typed_value(obj, vals, call_site, r);
 }
 
+/* An escaping user exception's payload, rendered while the definitions
+ * it names are alive - to the text the driver prints for it */
+static void freeze_exception_payload(ExceptionObject &e)
+{
+    const EvalValue &d = e.get_data();
+    if (!d.is<NoneVal>() && !d.is<SharedStr>())
+        e.set_data(EvalValue(SharedStr(d.get_type()->to_string(d))));
+}
+
+/* ...and the payloads of the exceptions it was raised while handling
+ * (question 12), which the report prints too. A chain node is a clone
+ * only this chain and its clones hold, so freezing it in place is safe. */
+void freeze_exception_chain(RuntimeException &e)
+{
+    for (RuntimeException *c = &e; c; c = c->context.get())
+        if (c->is_exception_object())
+            freeze_exception_payload(*static_cast<ExceptionObject *>(c));
+}
+
+/* Is `ctx` inside a function invocation (its body, or a block of it)? */
+static bool ctx_in_function(const EvalContext *ctx)
+{
+    for (const EvalContext *c = ctx; c; c = c->parent)
+        if (c->func_ctx)
+            return true;
+    return false;
+}
+
 template <class ArgsVecT>
 static EvalValue
 do_func_call(EvalContext *ctx,
@@ -1051,8 +1079,26 @@ do_func_call(EvalContext *ctx,
     } catch (Exception &e) {
         /* The tree-walker / expression-body path (a real C++ throw). Record
          * this frame + any inlined-call virtual frames, then re-throw. */
+        const bool cev = ctx && ctx->in_const_eval();
         vm_capture_frame(e, obj, call_ck, call_pc, call_site, call_site_inl,
-                         ctx && ctx->in_const_eval());
+                         cev);
+        /*
+         * An exception LEAVING A CONSTANT EVALUATION - this call was made
+         * by the compiler itself (the parser, AutoConst), not by a
+         * function it is running - is a compile error no script `try` can
+         * handle, and all that is left to do with a thrown struct is to
+         * print it. It is rendered HERE: the nodes the compiler holds die
+         * as the exception unwinds - a function literal in a parse
+         * function's local, a statement a fold took out of its block - and
+         * one of them may own the struct's definition, which the report
+         * then read freed (`var x = (pure func() { struct E { int n; }
+         * throw E(1); })();`, a heap-use-after-free in every engine).
+         * A call a running function made is not frozen: a `try` of that
+         * function may still catch the struct and read its fields.
+         */
+        if (cev && !ctx_in_function(ctx))
+            if (auto *re = dynamic_cast<RuntimeException *>(&e))
+                freeze_exception_chain(*re);
         throw;
     }
 

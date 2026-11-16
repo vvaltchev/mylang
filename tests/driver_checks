@@ -1315,8 +1315,20 @@ if (on) {
     a();
 }
 EOF
+# And a struct whose definition a function LITERAL owns, thrown by a call
+# the PARSER folds: the literal is in a parse function's local when the
+# exception passes, and died before the enclosing block could render the
+# payload (the block's own freeze read the freed definition). The call
+# that raises it renders it now, where it leaves the constant evaluation.
+cat > "$TMP/athrow3.my" <<'EOF'
+var x = (pure func() { struct Err { int n; } throw Err(1); })();
+print(x);
+EOF
+cat > "$TMP/athrow4.my" <<'EOF'
+print(map(pure func(v) { struct Err { int n; } throw Err(v); }, [1, 2]));
+EOF
 uaf_bad=""
-for p in athrow athrow2; do
+for p in athrow athrow2 athrow3 athrow4; do
     for e in "" -tw -nj; do
         # shellcheck disable=SC2086
         out=$("$BIN" $e "$TMP/$p.my" 2>&1)
