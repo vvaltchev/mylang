@@ -2698,6 +2698,14 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
             fd.is_opt = r.boolv();
             fd.slot = static_cast<int>(static_cast<int32_t>(r.u32v()));
             fd.annot = read_annot(r, 0);         /* v37 */
+            /* v46: a container or box field names its whole type and
+             * no other field has one - rule 5 makes a bare container
+             * field a compile error, and every pass reads a container
+             * field's type from this annot */
+            if (!fd.annot != !field_kind_has_annot(fd.kind))
+                bad_image(fd.annot
+                    ? "corrupt .myv (a scalar field with a type annotation)"
+                    : "corrupt .myv (a container field with no type)");
             sd.fields.push_back(std::move(fd));
         }
         const uint32_t nc = r.countv();

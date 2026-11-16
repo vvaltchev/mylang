@@ -1328,7 +1328,8 @@ static void
 field_fit_check(const FieldDef &fd, const EvalValue &v, Loc s, Loc e)
 {
     FitMisfit m;
-    if (!fd.annot || value_enters(v, *fd.annot, m))
+    ML_CHECK(fd.annot);
+    if (value_enters(v, *fd.annot, m))
         return;
     FitSpec spec;
     spec.annot = fd.annot;

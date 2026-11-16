@@ -97,35 +97,30 @@ static std::string reflect_annot_str(const TypeAnnot *ta)
 
 std::string reflect_field_type(const FieldDef &f)
 {
-    /* a parameterized container (`array<int>`, `dict<str,P>`): the annot
-     * carries the full element type (with its own `?` for nullability). */
-    if (f.annot && (f.kind == FieldKind::f_array ||
-                    f.kind == FieldKind::f_dict ||
-                    f.kind == FieldKind::f_box)) {
+    /* a parameterized container (`array<int>`, `dict<str,P>`) or a box:
+     * the annot carries the full type (with its own `?` for
+     * nullability). Such a field always has one - the parser refuses a
+     * bare `array` / `dict` field, the loader an image's (v46). */
+    if (f.annot) {
         std::string t = reflect_annot_str(f.annot.get());
-        if (f.is_opt && (t.empty() || t.back() != '?'))
+        if (f.is_opt && t.back() != '?')
             t += "?";
         return t;
     }
-
+    ML_CHECK(!field_kind_has_annot(f.kind));
     std::string s;
     if (f.is_opt)
         s += "opt ";
-    switch (f.kind) {
-        case FieldKind::f_bool:   s += "bool";  break;
-        case FieldKind::f_int:    s += "int";   break;
-        case FieldKind::f_float:  s += "float"; break;
-        case FieldKind::f_str:    s += "str";   break;
-        case FieldKind::f_array:  s += "array"; break;
-        case FieldKind::f_dict:   s += "dict";  break;
-        case FieldKind::f_dyn:    s += "dyn";   break;
-        case FieldKind::f_box:    s += "box";   break;
-        case FieldKind::f_struct:
-            s += f.struct_ty ? std::string(f.struct_ty->val)
-                             : std::string("struct");
-            break;
-    }
-    return s;
+    if (f.kind == FieldKind::f_struct)
+        return s + (f.struct_ty ? std::string(f.struct_ty->val)
+                                : std::string("struct"));
+    static const char *const keyword[] = {
+        "bool", "int", "float", "str", "array", "dict", "dyn", "struct",
+        "box" };
+    static_assert(sizeof(keyword) / sizeof(keyword[0])
+                      == static_cast<size_t>(FieldKind::f_box) + 1,
+                  "a keyword per FieldKind");
+    return s + keyword[static_cast<size_t>(f.kind)];
 }
 
 std::string reflect_decl_annot(DeclType dt, const StructTypeDef *strct,

@@ -63,8 +63,8 @@ try { garr(notarr); } catch (TypeErrorEx) { refused++; }
 try { fv(notarr); } catch (TypeErrorEx) { refused++; }
 want("a non-array refused", refused, 2);
 
-# ---- a nullable bare parameter keeps joining (an `opt` parameter is not
-# a template parameter - rule 8)
+# ---- a nullable bare parameter is a template parameter too (rule 8.1:
+# a `none` argument is an instance of its own)
 func onull(array? a) => a == none ? 0 : len(a);
 want("opt bare", onull(none) + onull([1, 2]), 2);
 

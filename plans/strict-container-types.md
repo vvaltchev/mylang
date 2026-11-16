@@ -424,11 +424,16 @@ prints `0`. Choice 6 fixes it.
    SyntaxErrorEx (the 22 `-rt` rows, functional 83 and 130, tests/int/124
    and the show-decls session now write `array<dyn>` / `dict<dyn, dyn>`,
    the type a bare field had); a declaration was already filled from what
-   it receives (`array a = [1, none]` is an array<int?>). Not done: a
-   nullable bare parameter (`array? a`) still joins - rule 8.1 makes an
-   `opt` parameter a template parameter - and nested holes
-   (`array<array>` is an array<array<dyn>>, as before). Tests:
-   tests/functional/136, the `rule 5:` `-rt` rows.
+   it receives (`array a = [1, none]` is an array<int?>). A nullable bare
+   parameter (`array? a`) is a template parameter too since rule 8.1.
+   Not done: nested holes (`array<array>` is an array<array<dyn>>, as
+   before). Tests:
+   tests/functional/136, the `rule 5:` `-rt` rows. With no bare field
+   left, a container or box field ALWAYS names its type: `.myv` v46
+   refuses an image whose field breaks that (or whose scalar field has
+   a type), and the passes that read a field's type lost their bare
+   arms (reflection, the callee-set walk, the field fit check, the
+   inferencer's field type).
 5. Rule 8. 8.1 DONE 2026-11-21: an un-annotated `opt` parameter (and a
    nullable bare `array?` / `dict?`) is a template parameter, keyed by the
    argument's type without its `?`; a `none` or omitted argument is an

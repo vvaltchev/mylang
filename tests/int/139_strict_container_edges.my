@@ -8,7 +8,8 @@
 # generic `array` component met by a typed one, a multi-assignment that
 # spreads one untyped dict into two declared targets, array(n) of a
 # struct with a box field, a general-storage int / bool array tested by
-# `if (a[k])`, a foreach body holding an inlined call and a `return`. The
+# `if (a[k])`, a foreach body holding an inlined call and a `return`, a
+# function variable given a `dyn`-parameter function and an `int` one. The
 # tree-walker is the oracle; every engine must agree.
 
 var bad = 0;
@@ -186,6 +187,17 @@ func firstp(array<P> ps) {
     return -1;
 }
 want("struct foreach with an inlined call", firstp([P(4), P(9)]), 4);
+
+# a function variable given functions whose parameters are `int` and
+# `dyn`, in both orders: a `dyn` component opts that position out
+func fint(int x) { return x; }
+func fdyn(dyn x) { return 1; }
+var g1 = fint;
+g1 = fdyn;
+want("int, then dyn", g1(3), 1);
+var g2 = fdyn;
+g2 = fint;
+want("dyn, then int", g2(4), 4);
 
 assert(bad == 0);
 print("ok");

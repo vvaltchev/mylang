@@ -28,6 +28,16 @@ enum class FieldKind : unsigned char {
     f_box        /* `box<T> f;` - a reference (its annot gives the T) */
 };
 
+/* A field of this kind names its whole type in FieldDef::annot (and a
+ * field of any other kind has none): `array<T>`, `dict<K, V>`, `box<T>`.
+ * The parser refuses a bare `array` / `dict` field (rule 5), the loader
+ * an image's (v46). */
+inline bool field_kind_has_annot(FieldKind k)
+{
+    return k == FieldKind::f_array || k == FieldKind::f_dict
+        || k == FieldKind::f_box;
+}
+
 struct StructTypeDef;
 
 /* DeclType is defined in syntax.h (which includes this header); a forward
@@ -117,8 +127,9 @@ struct FieldDef {
      * (recursive POD); otherwise the field is a boxed pointer. */
     const StructTypeDef *struct_def = nullptr;
     bool is_opt = false;
-    /* For a parameterized container field (`array<int> xs;`): the recursive
-     * element/key/value type. Null for a generic `array`/`dict` field. */
+    /* For a container or box field (`array<int> xs;`, `box<P> b;`): the
+     * recursive element/key/value type - present exactly when
+     * field_kind_has_annot(kind). */
     std::shared_ptr<TypeAnnot> annot;
     int slot = -1;        /* boxed: index into StructObject::fields */
     int offset = -1;      /* POD: byte offset into the bytes buffer; else -1 */
