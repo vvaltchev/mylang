@@ -409,4 +409,17 @@ prints `0`. Choice 6 fixes it.
    type keeps its storage (a general array of ints entering an
    array<int> parameter is then a general array<int>: converting it in
    place is the missing step, tests/int/106 builds one); and rule 5.
+   Rule 5 DONE 2026-11-21 (top level): a bare `array` / `dict`
+   parameter is a template parameter (`template_param`, inferencer.cpp)
+   - `f([1])` and `f(["s"])` are two instances where they were a join
+   rule 1 refused, and a non-array argument is refused by the instance's
+   kind check (or the bind, through `dyn`); a bare struct field is a
+   SyntaxErrorEx (the 22 `-rt` rows, functional 83 and 130, tests/int/124
+   and the show-decls session now write `array<dyn>` / `dict<dyn, dyn>`,
+   the type a bare field had); a declaration was already filled from what
+   it receives (`array a = [1, none]` is an array<int?>). Not done: a
+   nullable bare parameter (`array? a`) still joins - rule 8.1 makes an
+   `opt` parameter a template parameter - and nested holes
+   (`array<array>` is an array<array<dyn>>, as before). Tests:
+   tests/functional/136, the `rule 5:` `-rt` rows.
 5. Rule 8.

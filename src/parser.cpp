@@ -4578,6 +4578,14 @@ pAcceptStructDecl(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
                 fd.is_opt = true;
         } else if (*c == TokType::id &&
                    type_keyword(c.get_str()) != DeclType::none) {
+            /* rule 5 (plans/strict-container-types.md): a bare `array` /
+             * `dict` is a hole the compiler fills from what a variable or a
+             * parameter receives - a field has no single receiver, so it
+             * names its whole type */
+            if (container_keyword(c.get_str()) != DeclType::none)
+                throw SyntaxErrorEx(c.get_loc(), intern_msg(
+                    "a struct field needs a complete type: write "
+                    "array<T> / dict<K, V>, not a bare array / dict"));
             fd.kind = decltype_to_fieldkind(type_keyword(c.get_str()));
             c++;
         } else if (*c == TokType::id) {

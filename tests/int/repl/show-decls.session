@@ -9,7 +9,7 @@
 struct P { int x; int y; }
 struct N { str n; int v; }
 class K { int v; }
-struct Q { bool b; int i; float f; str s; array a; dict d; dyn y; box<int> bx; P p; opt dyn od; opt array oa; opt dict odc; array<int>? ai; dict<str, int> di; box<float>? bf; opt K ok; }
+struct Q { bool b; int i; float f; str s; array<dyn> a; dict<str, dyn> d; dyn y; box<int> bx; P p; opt dyn od; opt array<dyn> oa; opt dict<int, str> odc; array<int>? ai; dict<str, int> di; box<float>? bf; opt K ok; }
 signature(Q)
 foreach (var f in layout(Q).fields) { print(f.name + ": " + f.type); }
 func pa(P p, opt P q, array<int> a, array<int>? b, dict<str, P> d, box<int> bx, opt int o, dyn x, opt dyn y, bool bb, str s, float f, opt K k) => a[0] + p.x
