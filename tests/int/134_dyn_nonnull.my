@@ -1,0 +1,10 @@
+# INT-SOURCE: ../functional/129_dyn_nonnull.my
+# INT-ENGINES: tw default nj nbi
+#
+# INT unit (plans/strict-container-types.md, rule 3): a `dyn` is never
+# none. The functional program runs as a coverage unit too (INT-SOURCE):
+# the run-time refusals of a none through `dyn` into a `dyn` element, a
+# dict value or key, an append and a struct field, the dynamic
+# array<dyn?> a `dyn` place builds, the inferred array<dyn> whose JIT
+# store tier declines a none, and the array<dyn?> that does not enter an
+# array<dyn> parameter.
