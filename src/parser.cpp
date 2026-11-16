@@ -4095,12 +4095,29 @@ pAcceptFuncDecl(ParseContext &c,
          * e; }` it stands for takes (pBlock and pStmt), so the sugar
          * cannot nest twice as deep as what every later pass walks.
          */
+        /*
+         * ...and the body is its own BLOCK for the statements a parse
+         * puts beside an expression (ParseContext::baked_funcs: H2's
+         * `var K = <value>` for a const scalar a closure captures, #47's
+         * detached function literal), as a braced body is through its
+         * pBlock. They used to land in the ENCLOSING block, before the
+         * statement holding this function - outside the body that reads
+         * them: `func() => func [K] () => K` inside a function body was
+         * "Undefined variable 'K'" (the middle function cannot see the
+         * enclosing function's local), and a NAMED arrow function - or,
+         * since question 21, a `const` bound to a pure one - called above
+         * its line read the synthesized global before its statement ran
+         * (UnboundSymbolEx). The braced spelling of each worked.
+         */
         unique_ptr<Construct> ex;
+        const size_t baked_base = c.baked_funcs.size();
+        c.cap_const_decls.emplace_back();
         {
             NestGuard ng_block(c);
             NestGuard ng_ret(c);
             ex = pExpr14(c, body_fl);
         }
+        c.cap_const_decls.pop_back();
         if (!ex)                    /* `func() => ;` read a null body */
             noExprError(c);
         auto rs = make_unique<ReturnStmt>();
@@ -4110,6 +4127,9 @@ pAcceptFuncDecl(ParseContext &c,
         auto blk = make_unique<Block>();
         blk->start = rs->start;
         blk->end = rs->end;
+        for (size_t i = baked_base; i < c.baked_funcs.size(); i++)
+            blk->elems.push_back(std::move(c.baked_funcs[i]));
+        c.baked_funcs.resize(baked_base);
         blk->elems.push_back(std::move(rs));
         func->body = std::move(blk);
 

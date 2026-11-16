@@ -16458,6 +16458,39 @@ static const std::vector<test> tests =
         }
     },
     {
+        /* An ARROW body is its own block for the declaration, as a braced
+         * body is (2026-11-16). It used to land in the ENCLOSING block,
+         * before the statement holding the arrow function: a middle
+         * function in a function body could not see it ("Undefined
+         * variable 'K'"), and a named arrow function - or a const bound
+         * to a pure one (question 21) - called above its line read the
+         * synthesized global before its statement ran (UnboundSymbolEx).
+         * The braced spelling of each worked. Every closure adds a
+         * run-time value, so nothing here is folded away. */
+        "capture: a const scalar captured inside an arrow body (H2)",
+        {
+            "func rt(int k) => int(runtime(k));",
+            "const K = 5;",
+            "func outer() { var f = func() => func[K]() => K + rt(0);",
+            "    return f()(); }",
+            "assert(outer() == 5);",
+            "var r = 0;",
+            "if (rt(1) > 0) r = mk()() + pf();",
+            "func mk() => func[K]() { K += rt(1); return K; };",
+            "const pf = pure func() => (func[K]() => K * 2)();",
+            "assert(r == 16);",
+            /* each call's closure has its own copy */
+            "var c = mk();",
+            "assert(c() == 6 && c() == 7 && mk()() == 6);",
+            /* two closures in one arrow body: one declaration */
+            "var two = func() => [func[K]() => K, func[K]() => K + rt(1)];",
+            "assert(two()[0]() + two()[1]() == 11);",
+            /* a sibling capture in the enclosing block gets its own */
+            "var g = func[K]() => K + 2;",
+            "assert(g() == 7 && K == 5);",
+        }
+    },
+    {
         "capture: a struct name is captured as itself (H2)",
         {
             /* the name is bound to its descriptor in the const scope, but

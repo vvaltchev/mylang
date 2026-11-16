@@ -3816,9 +3816,23 @@ and it lives *inside the parser*. Mechanics:
   innermost `pBlock` re-inserts it before the statement holding the
   closure (the #47 mechanism), so a closure in an `if` condition or a
   brace-less body lands before that whole statement.
+  **⛔ An ARROW body `=> expr` is its own block for these statements
+  (2026-11-16):** it is parsed by `pExpr14`, never `pBlock`, so what its
+  expression pushed went to the ENCLOSING block, before the statement
+  holding the arrow function - outside the body that reads it. `func()
+  => func [K] () => K` in a function body was "Undefined variable 'K'"
+  (the middle function cannot see the enclosing function's local), and a
+  named arrow function - or, since question 21, a `const` bound to a
+  pure one - called above its line read the synthesized global before
+  its statement ran (UnboundSymbolEx); the braced spelling of each
+  worked. `pAcceptFuncDecl`'s arrow branch now takes the entries its
+  expression pushed, with a `cap_const_decls` scope of its own, and puts
+  them before the `ReturnStmt` (such a body is then no `func_expr_body`,
+  exactly like its braced twin). A new way to parse a function body
+  takes its own baked statements too.
   **`ParseContext::cap_const_decls`** (one vector per `pBlock` in
-  progress) dedupes per block - two captures of one const in one block
-  would otherwise be AlreadyDefinedEx. Every OTHER read of K is still
+  progress, and per arrow body) dedupes per block - two captures of one
+  const in one block would otherwise be AlreadyDefinedEx. Every OTHER read of K is still
   folded by the parser, so the synthetic var is read only by capture
   snapshots; AutoConst cannot promote and drop it (it is captured,
   `prescan_blocked`); the capture is shadowed in the body (H1), so `K++`
