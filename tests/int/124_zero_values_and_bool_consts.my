@@ -21,7 +21,8 @@ func want(what, got, exp) {
 
 struct Z { bool b; int i; float f; str s; array a; dict d; }
 Z z;
-want("struct zero", str(z), "Z(b: false, i: 0, f: 0.000000, s: \"\", a: [], d: {})");
+want("struct zero", str(z),
+     "Z(b: false, i: 0, f: 0.000000, s: \"\", a: [], d: {})");
 want("bool field", z.b, false);
 want("dict field", len(z.d), 0);
 
