@@ -2632,6 +2632,25 @@ static const std::vector<test> tests =
      * hold keeps its type wherever it flows - into a variable, out of a
      * function, through a ternary - and a place of another type is a
      * compile error at the flow (choice 12) */
+    /* choice 7, amended: a container that holds only nones is an
+     * array<dyn?> / dict<dyn?, ...>, never unfilled - so what is read
+     * from it may be none, and a typed place refuses it at compile
+     * time (it was an unfilled element a later store typed, or a
+     * run-time fit failure) */
+    { "rule 3: an element read from an array of nones is a dyn?",
+      { "var a = [none];", "dyn q = a[0];" },
+      &typeid(NullabilityEx), 5, 2, 7, 2 },
+    { "rule 3: a key of a dict whose only key is none is a dyn?",
+      { "var a = {none: 1};", "foreach (k, v in a) { dyn q = k; }" },
+      &typeid(NullabilityEx), 27, 2, 29, 2 },
+    { "rule 1: an array of nones does not enter an array<int>",
+      { "array<int> a = [none];" },
+      &typeid(TypeMismatchEx), 12, 1, 14, 1 },
+    /* choice 15: a dyn? into a numeric local makes it nullable */
+    { "rule 3: a dyn? given to an int local makes it an int?",
+      { "var s = 0; var dyn? d = runtime(none);", "s = d;",
+        "print(s + 1);" },
+      &typeid(NullabilityEx), 7, 3, 13, 3 },
     { "rule 1: an alias that a store would widen is refused at the alias",
       { "var a = [1, 2];", "var b = a;", "b[0] = \"s\";" },
       &typeid(TypeMismatchEx), 9, 2, 11, 2 },

@@ -252,13 +252,19 @@ bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
           FitMisfit &why);
 
 /* rule 1 (plans/strict-container-types.md): are two component types
- * EXACTLY the same type - `dyn` a type of its own, the `?` included; an
- * absent component (a generic `array`) matches any */
+ * EXACTLY the same type - `dyn` a type of its own, the `?` included. An
+ * absent component below the top (the elements of a generic `array`
+ * written as a component: `array<array>`) is a `dyn`, as its static type
+ * says (array<array<dyn>>); only a place's TOP-LEVEL generic `array` is a
+ * hole (ct_enters) */
 bool ct_exact(const TypeAnnot *c, const TypeAnnot *p)
 {
-    if (!p || c == p)
+    const auto is_dyn = [](const TypeAnnot *t) {
+        return !t || (t->kind == DeclType::dyn && !t->opt);
+    };
+    if (c == p || (is_dyn(c) && is_dyn(p)))
         return true;
-    if (!c)
+    if (!c || !p)
         return false;
     return c->kind == p->kind && c->opt == p->opt && c->strct == p->strct
            && ct_exact(c->elem.get(), p->elem.get())
@@ -276,10 +282,11 @@ bool ct_exact(const TypeAnnot *c, const TypeAnnot *p)
  */
 bool ct_enters(const TypeAnnot *ct, const TypeAnnot *a)
 {
+    /* (a place's generic `array` / `dict` takes any: a hole, rule 5) */
     if (a->kind == DeclType::arr)
-        return ct_exact(ct->elem.get(), a->elem.get());
-    return ct_exact(ct->key.get(), a->key.get())
-           && ct_exact(ct->val.get(), a->val.get());
+        return !a->elem || ct_exact(ct->elem.get(), a->elem.get());
+    return (!a->key || ct_exact(ct->key.get(), a->key.get()))
+           && (!a->val || ct_exact(ct->val.get(), a->val.get()));
 }
 
 /* a typed container refused at a place: what it is, by its type */

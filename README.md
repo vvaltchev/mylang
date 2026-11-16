@@ -1535,9 +1535,15 @@ Key rules:
     `array<dyn>`. An explicit `none` stored into one makes its element
     nullable: `var a = [1, 2]; a[0] = none;` is an `array<int?>` (an
     EMPTY container is the exception: `[]` with nothing filled in has
-    no element type yet). `a + b` of two arrays is a new array of the
-    two element types' join: `[1] + [1.5]` is an `array<float>` (the
-    ints widened), `[1] + ["x"]` an `array<dyn>`. To change a
+    no element type yet). A container that holds only `none`s has no
+    other type to take: `[none]` is an `array<dyn?>` and `{none: 1}` a
+    `dict<dyn?,int>`, and what is stored into one later keeps it so
+    (`var a = [none, none]; a[0] = 5;` is an `array<dyn?>`, never an
+    `array<int>` with a `none` in it); written for a typed place,
+    `array<int?> a = [none];`, it is that place's type. `a + b` of two
+    arrays is a new array of the two element types' join: `[1] + [1.5]`
+    is an `array<float>` (the ints widened), `[1] + ["x"]` an
+    `array<dyn>`. To change a
     container's type, convert it: `cast<array<dyn>>(a)` is a new
     `array<dyn>` holding `a`'s elements (see *cast*).
   * **Null safety.** A plain value is *non-nullable*: passing `none` where a
@@ -1694,6 +1700,11 @@ slot = "now a string";           # ok, because it's dyn
     A parameter no call site types (a function reached only through a `dyn`
     value) is such a `dyn` too: `var y = x; if (c) { y = 1; }` keeps `y` an
     `int` and checks `x` when it is stored.
+
+    A `dyn?` value may be `none`, which no coercion turns into a number, so
+    it makes the variable nullable: `var s = 0; s = d;` with `d` a `dyn?`
+    makes `s` an `int?` (and `s + 1` the compile error any possibly-none
+    operand is). A plain `var` given only `dyn?` values is a `dyn?`.
 
     So is a call to a function whose returns mix a `dyn` with another type -
     `func big(dyn v) { if (v < 9) return v * 2; return "s"; }` returns

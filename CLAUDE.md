@@ -5369,7 +5369,13 @@ decisions behind it: `plans/archived/type-inference.md`,
   and a folded `type()` / `decltype()` builds its reflection object from
   the filled type (`fill_unfilled`). So iterating an empty container is
   never a compile error, while `var a = []; append(a, 1)` stays
-  `array<int>`.
+  `array<int>`. **So a container that HOLDS nones is never typed with an
+  unfilled component** (`Inferencer::held`, 2026-11-21): `[none]`, a
+  baked one, `array(n, none)`, a callback that always returns none give
+  `dyn?` there - typed unfilled, `var a = [none, none]; a[0] = 5` made an
+  `array<int>` holding a none (a three-engine divergence). A new site
+  that builds a container's type from the types of values IN it uses
+  `held()`.
   A DEFAULT dict's reads also yield its default, so its type
   joins the default's: an empty one is `dict<dyn, T>`, the type the
   unfolded `dict(v)` call has (it was `dict<none,none>`, and a folded

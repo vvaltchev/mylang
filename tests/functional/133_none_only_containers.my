@@ -1,0 +1,96 @@
+# Choice 7, amended (plans/strict-container-types.md): a container that
+# holds only `none`s is an array<dyn?> / a dict<dyn?, ...>, never one
+# whose component is UNFILLED - unfilled means "nothing in it yet", and a
+# later store would type it as if the nones were not there:
+# `var a = [none, none]; a[0] = 5;` made an array<int> holding a none,
+# and `var d = {none: 1}; d[2] = 5;` a dict<int,int> whose none key the
+# JIT read as an int, the VM aborted on and the tree-walker threw at.
+# Choice 15: a `dyn?` value given to a plain numeric variable makes it
+# nullable (`int?`), and a foreach variable over `dyn?` elements is a
+# `dyn?`. The types are asserted on a typed run only (-nti has none).
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+# ---- an array of nones, filled later: still nullable everywhere
+var a = [none, none];
+a[0] = 5;
+want("filled later", a[1] == none, true);
+want("filled later value", str(a), "[5, <none>]");
+if (typed)
+    want("filled later type", typestr(a), "array<dyn?>");
+
+# ---- a dict whose only key is none, given more keys later
+var d = {none: 1};
+d[2] = 5;
+var keys_seen = "";
+foreach (k, v in d)
+    keys_seen += str(k) + "=" + str(v) + " ";
+want("none key", keys_seen, "<none>=1 2=5 ");
+if (typed)
+    want("none key type", typestr(d), "dict<dyn?,int>");
+
+# ---- a dict whose only value is none
+var dv = {1: none};
+dv[2] = 7;
+want("none value", dv[1] == none, true);
+if (typed)
+    want("none value type", typestr(dv), "dict<int,dyn?>");
+
+# ---- from a function, from array(n, none), from a callback
+func mk() => [none];
+var f = mk();
+f[0] = 3;
+want("from a call", f[0], 3);
+var z = array(2, none);
+z[0] = 1;
+want("array(n, none)", z[1] == none, true);
+func nothing(int i) { return none; }
+var m = map(nothing, [1, 2]);
+want("map to none", str(m), "[<none>, <none>]");
+if (typed) {
+    want("from a call type", typestr(f), "array<dyn?>");
+    want("array(n, none) type", typestr(z), "array<dyn?>");
+    want("map to none type", typestr(m), "array<dyn?>");
+}
+
+# ---- written for a typed place, the literal has the place's type
+array<int?> ti = [none];
+ti[0] = 4;
+want("typed place", ti[0], 4);
+dict<str?, int?> td = {none: none};
+want("typed dict", str(td), "{<none>: <none>}");
+array<array<int?>> nested = [[none], [none, 2]];
+want("nested", str(nested), "[[<none>], [<none>, 2]]");
+
+# ---- reading one: a `dyn?`, so a `dyn?` place takes it
+var holes = [none];
+dyn? h = holes[0];
+want("read", h == none, true);
+foreach (x in holes) {
+    dyn? hx = x;
+    want("loop read", hx == none, true);
+    if (typed)
+        want("loop var type", typestr(x), "dyn?");
+}
+
+# ---- choice 15: a dyn? into a numeric local makes it nullable
+var s = 0;
+var dyn? dn = runtime(none);
+s = dn;
+want("int? local", s == none, true);
+if (typed)
+    want("int? local type", typestr(s), "int?");
+var t = 0;
+var dyn? d3 = runtime(3);
+t = d3;
+want("int? local value", t, 3);
+
+assert(bad == 0);
+print("ok");

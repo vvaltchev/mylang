@@ -103,6 +103,10 @@ struct TypeSym {
      * inferencer stamps `decl_id->decl_type` so `coerce_to_decl_type` fires.
      */
     bool round_got_dyn = false;
+    /* ...and one of those values was a `dyn?`: what the symbol becomes is
+     * nullable too (a numeric local an `int?`, anything else a `dyn?`) -
+     * a `none` it may bring is not coerced away */
+    bool round_got_dyn_opt = false;
     bool coerces_dyn = false;
     /*
      * Rule 1 (plans/strict-container-types.md): the ELEMENT analogue of
@@ -491,6 +495,13 @@ private:
      * typed put in yet - so a later round's fill types the read; if
      * nothing ever fills it, the reader finalizes `dyn` (question 9). */
     StaticTypeRef component_read(StaticTypeRef c);
+    /* The component type of a container that HOLDS the values typed `t`:
+     * `t`, but a `none` one is `dyn?` - a component typed `none` means
+     * UNFILLED (nothing is in it: `[]`, `{}`, array(N)), and one that
+     * holds nones is not empty (rule 3, choice 7: `[none]` is an
+     * array<dyn?>, so a later `a[0] = 5` does not make it an
+     * array<int> still holding a none). */
+    StaticTypeRef held(StaticTypeRef t);
     StaticTypeRef func_static_type(FuncInfo *fi);
     StaticTypeRef binop_result(Op op, StaticTypeRef a, StaticTypeRef b);
     StaticTypeRef unary_result(Op op, StaticTypeRef a);
@@ -516,6 +527,7 @@ private:
                          Loc loc_end);
     bool literal_fits(Construct *lit, StaticTypeRef d);
     bool type_fits(StaticTypeRef t, StaticTypeRef d);
+    bool value_fits_type(const EvalValue &v, StaticTypeRef d);
     StaticTypeRef literal_dest_type(Expr14 *e);
     StaticTypeRef literal_into(Construct *rv, StaticTypeRef dest);
     bool fresh_fits(StaticTypeRef t, StaticTypeRef d);
@@ -5807,7 +5819,7 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
                         obj_elem_value(ov[arr.offset() + i])));
                     el = j ? j : A.dyn_ty();
                 }
-                return A.array_of(el);
+                return A.array_of(held(el));
             }
 
             ArrayConstView view = arr.get_view();
@@ -5819,7 +5831,7 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
                     static_type_from_value(view[i].get(), st));
                 el = j ? j : A.dyn_ty();
             }
-            return A.array_of(el);
+            return A.array_of(held(el));
         }
 
         case Type::t_dict: {
@@ -5834,7 +5846,7 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
             StaticTypeRef dft = dobj.get_has_default()
                 ? static_type_from_value(dobj.get_default(), st) : nullptr;
             if (m.empty())
-                return dft ? A.dict_of(A.dyn_ty(), dft)
+                return dft ? A.dict_of(A.dyn_ty(), held(dft))
                            : A.dict_of(A.none_ty(), A.none_ty());
             StaticTypeRef kty = nullptr, val = nullptr;
             for (const auto &kv : m) {
@@ -5851,7 +5863,7 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
                     val = jv ? jv : A.dyn_ty();
                 }
             }
-            return A.dict_of(kty, val);
+            return A.dict_of(held(kty), held(val));
         }
 
         default:
@@ -5862,6 +5874,12 @@ StaticTypeRef Inferencer::static_type_from_value(const EvalValue &v,
 StaticTypeRef Inferencer::component_read(StaticTypeRef c)
 {
     return is_none(static_type_resolve(c)) ? bottom : c;
+}
+
+StaticTypeRef Inferencer::held(StaticTypeRef t)
+{
+    return t && static_type_resolve(t)->kind == StaticTypeKind::None
+        ? A.with_opt(A.dyn_ty(), true) : t;
 }
 
 /*
@@ -5906,7 +5924,7 @@ StaticTypeRef Inferencer::type_of_node(const Construct *e)
             StaticTypeRef j = A.join(el, t);
             el = j ? j : A.dyn_ty();
         }
-        return A.array_of(el);
+        return A.array_of(held(el));
     }
 
     if (ctag(e) == ConstructType::lit_dict) {
@@ -5921,7 +5939,7 @@ StaticTypeRef Inferencer::type_of_node(const Construct *e)
             k = jk ? jk : A.dyn_ty();
             val = jv ? jv : A.dyn_ty();
         }
-        return A.dict_of(k, val);
+        return A.dict_of(held(k), held(val));
     }
 
     if (auto *lo = node_cast<const LiteralObj>(e))
@@ -6438,7 +6456,7 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
          * that would defeat fill-based typing (see plans/type-driven-*.md).
          */
         if (args->elems.size() >= 2)
-            return A.array_of(arg(1));
+            return A.array_of(held(arg(1)));
         return A.array_of(A.none_ty());
     }
     /*
@@ -6460,7 +6478,7 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         StaticTypeRef f = static_type_resolve(arg(1));
         if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
         StaticTypeRef r = cb_ret(f);
-        return is_unknown(r) ? bottom : A.array_of(r);
+        return is_unknown(r) ? bottom : A.array_of(held(r));
     }
     if (n == "make_dict") {
         /* make_dict(keys, gen) -> dict<K, V>: K = the keys array's element
@@ -6473,7 +6491,7 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         StaticTypeRef k =
             ks->kind == StaticTypeKind::Array ? ks->elem : A.dyn_ty();
         StaticTypeRef v = cb_ret(f);
-        return is_unknown(v) ? bottom : A.dict_of(k, v);
+        return is_unknown(v) ? bottom : A.dict_of(k, held(v));
     }
     if (n == "dict") {
         /* dict(default_value) -> dict<?, typeof default> (a default dict,
@@ -6586,7 +6604,7 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         StaticTypeRef f = static_type_resolve(arg(0));
         if (is_unknown(f)) return bottom;   /* defer: callback not yet known */
         StaticTypeRef r = cb_ret(f);
-        return is_unknown(r) ? bottom : A.array_of(r);
+        return is_unknown(r) ? bottom : A.array_of(held(r));
     }
     if (n == "filter")              /* filter(func, container) -> container */
         return arg(1);
@@ -6657,6 +6675,7 @@ void Inferencer::reset_round()
         if (s->func || s->pinned)   /* pinned: a prior input's fixed type */
             continue;
         s->round_got_dyn = false;   /* dyn-into-concrete coercion tracking */
+        s->round_got_dyn_opt = false;
         s->round_elem_dyn = 0;
         s->round_got_unknown = false;
         s->round_arg_kinds = 0;
@@ -6698,10 +6717,14 @@ void Inferencer::commit_round()
         if (s->round_got_dyn && !s->dyn_decl) {
             const StaticTypeRef ac = static_type_resolve(s->acc);
             if (ac->kind == StaticTypeKind::Int ||
-                ac->kind == StaticTypeKind::Float)
+                ac->kind == StaticTypeKind::Float) {
                 s->coerces_dyn = true;   /* keep numeric acc; runtime coerces */
-            else
-                s->acc = A.dyn_ty();     /* non-numeric / dyn-only -> dyn */
+                if (s->round_got_dyn_opt)
+                    s->acc = A.with_opt(ac, true);
+            } else {
+                /* non-numeric / dyn-only -> dyn (dyn? if one may be none) */
+                s->acc = A.with_opt(A.dyn_ty(), s->round_got_dyn_opt);
+            }
         }
         /* rule 1, the element twin of the decision above: a NUMERIC
          * element (key) keeps its type and its stores coerce the `dyn`
@@ -6878,6 +6901,8 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
      */
     if (!s->dyn_decl && is_dyn(t)) {
         s->round_got_dyn = true;
+        if (static_type_resolve(t)->opt)
+            s->round_got_dyn_opt = true;
         return;
     }
 
@@ -7429,7 +7454,8 @@ bool Inferencer::literal_fits(Construct *lit, StaticTypeRef d)
      * element by element (annotate_hints widens the value) */
     if (ctag(lit) == ConstructType::lit_obj)
         return static_cast<LiteralObj *>(lit)->from_literal
-            && type_fits(type_of(lit), d);
+            && value_fits_type(static_cast<LiteralObj *>(lit)
+                                   ->literal_value(), d);
     /* (a `dyn` element fits - a `dyn?` one an element that may be none:
      * the place's fit check examines it at run time, rule 1) */
     const StaticTypeRef t = static_type_resolve(type_of(lit));
@@ -7437,6 +7463,41 @@ bool Inferencer::literal_fits(Construct *lit, StaticTypeRef d)
         || (t->kind == StaticTypeKind::Dyn
             && (!t->opt || static_type_resolve(d)->opt))
         || static_type_assignable(t, d);
+}
+
+/* literal_fits for a baked literal's VALUE, element by element: a
+ * `none` element fits a component that may be none (its type is `dyn?`
+ * in the value's own type, which says nothing of where it may go - `[none]`
+ * fits an array<int?>), a flat array or anything else by its type
+ * (type_fits). A written literal is never cyclic (from_literal). */
+bool Inferencer::value_fits_type(const EvalValue &v, StaticTypeRef d)
+{
+    d = static_type_resolve(d);
+    if (v.is<NoneVal>())
+        return d->opt;
+    if (d->kind == StaticTypeKind::Dyn)
+        return true;
+    if (v.is<SharedArrayObj>() && d->kind == StaticTypeKind::Array) {
+        const SharedArrayObj &arr = v.get<SharedArrayObj>();
+        if (arr.skind() != SharedArrayObj::Storage::general)
+            return type_fits(static_type_from_value(v), d);
+        ArrayConstView view = arr.get_view();
+        for (size_type i = 0; i < view.size(); i++)
+            if (!value_fits_type(view[i].get(), d->elem))
+                return false;
+        return true;
+    }
+    if (v.is<intrusive_ptr<DictObject>>() && d->kind == StaticTypeKind::Dict) {
+        const DictObject &dobj = *v.get<intrusive_ptr<DictObject>>();
+        if (dobj.get_has_default())  /* INT-COV-EXEMPT: never a written literal */
+            return type_fits(static_type_from_value(v), d);
+        for (const auto &kv : dobj.get_ref())
+            if (!value_fits_type(kv.first, d->key)
+                    || !value_fits_type(kv.second.get(), d->val))
+                return false;
+        return true;
+    }
+    return type_fits(static_type_from_value(v), d);
 }
 
 /* literal_fits for a TYPE - a baked literal's: element by element, an
