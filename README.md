@@ -1787,6 +1787,36 @@ slot = "now a string";           # ok, because it's dyn
     their own values, so `var dyn s = [1, 2] + [3];` is flat int
     storage, which widens a `bool` and refuses a string.
 
+    **A container enters a typed place by its type.** An array or a dict
+    reaching a parameter, a field or an element declared with a type
+    through a `dyn` (the check above) is checked by the type it carries,
+    not by what it holds at that moment - whatever it holds now, any
+    other name may store into it later:
+
+    ```
+    func takes(array<int> a) => len(a);
+    var dyn d = [1, 2];           # an array<dyn>
+    takes(d);                     # TypeErrorEx: parameter 'a' is declared
+                                  # 'array<int>' but the argument is an
+                                  # 'array<dyn>'
+    ```
+
+    A part of the place's type that is `dyn` takes anything, since a
+    store into it is checked against the container's own type; every
+    other part must be the container's exactly. So an `array<int>`
+    enters an `array<dyn>` parameter (and a store of a string through it
+    is refused), but not an `array<int?>` one, which would let a `none`
+    in, and an `array<array<int>>` does not enter an
+    `array<array<dyn>>`, whose elements take any array. A container that
+    carries no type - one only a `dyn` reaches, such as an element of an
+    `array<dyn>` - is checked by what it holds and then TAKES the
+    place's type, so the place's type stays true however the container
+    is reached afterwards. A constant's container cannot change: it is
+    checked by what it holds, and takes no type. A container the runtime
+    builds carries its type too: `argv` is an `array<str>` and
+    `layout(S).fields` an `array<StructField>`, so a store of an `int`
+    through a `dyn` name for either is refused.
+
     With type inference disabled (`-nti`) the parameter and constructor
     checks still run - the declaration alone decides them, as it does
     the `none` check - but no store is checked, since inference is what

@@ -54,56 +54,120 @@ func gdict(dict d) => len(d);
 func adyn(array<dyn> a) => len(a);
 func abox(array<box<int>> a) => len(a);
 
+# a container only `dyn` reaches - each one made as an element of an
+# array<dyn> - carries no type of its own, so it is walked by what it
+# holds (a TYPED one is checked by its own type, Q2 decision A:
+# dynarray()'s array<dyn> and dict(5)'s dict<dyn, int> enter no
+# narrower place, "ai dynarray" and "dsi dict default" below). Each is
+# used once: one that fits takes the place's type as it enters
+array<dyn> U = [dynarray([1, 2]),
+                dynarray([1, "x"]),
+                dynarray([1, none]),
+                dynarray([1, none]),
+                dict(5),
+                dict("s"),
+                dict(P(1)),
+                dict(Q(1)),
+                dynarray([1.5]),
+                dynarray([1]),
+                dynarray([true]),
+                dynarray([1]),
+                dynarray(["a"]),
+                dynarray([1]),
+                dynarray([P(1)]),
+                dynarray([Q(1)]),
+                dynarray([box(P(1))]),
+                dynarray([box(1)]),
+                dynarray([box(1.5)]),
+                dynarray([5]),
+                dynarray([5]),
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [1, 2],
+                [1.5],
+                [1.5],
+                [true],
+                [true],
+                split("a b", " "),
+                split("a b", " "),
+                [P(1), P(2)],
+                [Q(1)],
+                [P(1)],
+                [],
+                [C(1), C(2)],
+                [C(1), D(2)],
+                {"a": 1},
+                {"a": "s"},
+                {1: 1},
+                {[1]: 1},
+                {["x"]: 1},
+                {"k": [1]},
+                {"k": ["x"]},
+                {"a": 1},
+                {1: "s"},
+                {1: "s"},
+                {"a": 1},
+                {"a": [1, "x"]},
+                [1],
+                {"a": 1}];
 # flat storage is decided by its kind alone
-check("ai ints", ai, runtime([1, 2]));
-check("af ints", af, runtime([1, 2]));
-check("ab ints", ab, runtime([1, 2]));
-check("astr ints", astr, runtime([1, 2]));
-check("ap ints", ap, runtime([1, 2]));
-check("af floats", af, runtime([1.5]));
-check("ai floats", ai, runtime([1.5]));
-check("ab bools", ab, runtime([true]));
-check("ai bools", ai, runtime([true]));
-check("astr strs", astr, runtime(split("a b", " ")));
-check("ai strs", ai, runtime(split("a b", " ")));
-check("ap structs", ap, runtime([P(1), P(2)]));
-check("ap other", ap, runtime([Q(1)]));
-check("ai structs", ai, runtime([P(1)]));
-check("ai empty", ai, runtime([]));
+check("ai ints", ai, U[21]);
+check("af ints", af, U[22]);
+check("ab ints", ab, U[23]);
+check("astr ints", astr, U[24]);
+check("ap ints", ap, U[25]);
+check("af floats", af, U[26]);
+check("ai floats", ai, U[27]);
+check("ab bools", ab, U[28]);
+check("ai bools", ai, U[29]);
+check("astr strs", astr, U[30]);
+check("ai strs", ai, U[31]);
+check("ap structs", ap, U[32]);
+check("ap other", ap, U[33]);
+check("ai structs", ai, U[34]);
+check("ai empty", ai, U[35]);
 # a general array is walked element by element
-check("ai general", ai, runtime(dynarray([1, 2])));
-check("ai general bad", ai, runtime(dynarray([1, "x"])));
-check("aoi none", aoi, runtime(dynarray([1, none])));
-check("ai none", ai, runtime(dynarray([1, none])));
-check("ac objs", ac, runtime([C(1), C(2)]));
-check("ac objs bad", ac, runtime([C(1), D(2)]));
+check("ai general", ai, U[0]);
+check("ai general bad", ai, U[1]);
+check("ai dynarray", ai, runtime(dynarray([1, 2])));
+check("aoi none", aoi, U[2]);
+check("ai none", ai, U[3]);
+check("ac objs", ac, U[36]);
+check("ac objs bad", ac, U[37]);
 # one inner array twice is walked once; two windows of one storage are
 # two values
-var inner = dynarray([1, 2]);
-check("aai shared", aai, runtime([inner, inner]));
-var st = dynarray([1, 2, "x"]);
-check("aai windows", aai, runtime([st[0:2], st[1:3]]));
-check("aai window ok", aai, runtime([st[0:2], st[0:2]]));
+array<dyn> UI = [dynarray([1, 2]), dynarray([1, 2, "x"])];
+var dyn inner = UI[0];
+var dyn st = UI[1];
+array<dyn> UO = [[inner, inner], [st[0:2], st[1:3]], [st[0:2], st[0:2]]];
+check("aai shared", aai, UO[0]);
+check("aai windows", aai, UO[1]);
+check("aai window ok", aai, UO[2]);
 # dicts: keys, values, both, neither, a default, a shared dict
-check("dsi ok", dsi, runtime({"a": 1}));
-check("dsi value", dsi, runtime({"a": "s"}));
-check("dsi key", dsi, runtime({1: 1}));
-check("dai ok", dai, runtime({[1]: 1}));
-check("dai key", dai, runtime({["x"]: 1}));
-check("dsa ok", dsa, runtime({"k": [1]}));
-check("dsa value", dsa, runtime({"k": ["x"]}));
-check("dsi default ok", dsi, runtime(dict(5)));
-check("dsi default", dsi, runtime(dict("s")));
-check("dsp default ok", dsp, runtime(dict(P(1))));
-check("dsp default", dsp, runtime(dict(Q(1))));
-check("dvi ok", dvi, runtime({"a": 1}));
-check("dvi value", dvi, runtime({1: "s"}));
-check("dki ok", dki, runtime({1: "s"}));
-check("dki key", dki, runtime({"a": 1}));
-check("ddd any", ddd, runtime({"a": [1, "x"]}));
-var dd = {"a": 1};
-check("adi shared", adi, runtime([dd, dd]));
-check("adi bad", adi, runtime([dd, {"b": "s"}]));
+check("dsi ok", dsi, U[38]);
+check("dsi value", dsi, U[39]);
+check("dsi key", dsi, U[40]);
+check("dai ok", dai, U[41]);
+check("dai key", dai, U[42]);
+check("dsa ok", dsa, U[43]);
+check("dsa value", dsa, U[44]);
+check("dsi default ok", dsi, U[4]);
+check("dsi default", dsi, U[5]);
+check("dsp default ok", dsp, U[6]);
+check("dsp default", dsp, U[7]);
+check("dsi dict default", dsi, runtime(dict(5)));
+check("dvi ok", dvi, U[45]);
+check("dvi value", dvi, U[46]);
+check("dki ok", dki, U[47]);
+check("dki key", dki, U[48]);
+check("ddd any", ddd, U[49]);
+array<dyn> UD = [{"a": 1}];
+var dyn dd = UD[0];
+array<dyn> UE = [[dd, dd], [dd, {"b": "s"}]];
+check("adi shared", adi, UE[0]);
+check("adi bad", adi, UE[1]);
 # structs, boxes, strings, bools, classes
 check("sp ok", sp, runtime(P(1)));
 check("sp other", sp, runtime(Q(1)));
@@ -124,8 +188,8 @@ check("bp struct", bp, runtime(P(1)));
 check("bp int", bp, runtime(box(1)));
 check("sstr ok", sstr, runtime("a"));
 check("sstr int", sstr, runtime(5));
-check("sstr arr", sstr, runtime([1]));
-check("sstr dict", sstr, runtime({"a": 1}));
+check("sstr arr", sstr, U[50]);
+check("sstr dict", sstr, U[51]);
 check("sbool ok", sbool, runtime(true));
 check("sbool int", sbool, runtime(1));
 check("sc ok", sc, runtime(C(1)));
@@ -133,19 +197,42 @@ check("sc other", sc, runtime(D(1)));
 check("sc int", sc, runtime(5));
 
 # inside a general array each element is checked as a value
-check("af elems", af, runtime(dynarray([1.5])));
-check("af elems bad", af, runtime(dynarray([1])));
-check("ab elems", ab, runtime(dynarray([true])));
-check("ab elems bad", ab, runtime(dynarray([1])));
-check("astr elems", astr, runtime(dynarray(["a"])));
-check("astr elems bad", astr, runtime(dynarray([1])));
-check("ap elems", ap, runtime(dynarray([P(1)])));
-check("ap elems other", ap, runtime(dynarray([Q(1)])));
-check("ap elems boxed", ap, runtime(dynarray([box(P(1))])));
-check("abox elems", abox, runtime(dynarray([box(1)])));
-check("abox elems bad", abox, runtime(dynarray([box(1.5)])));
-check("aai elems bad", aai, runtime(dynarray([5])));
-check("adi elems bad", adi, runtime(dynarray([5])));
+check("af elems", af, U[8]);
+check("af elems bad", af, U[9]);
+check("ab elems", ab, U[10]);
+check("ab elems bad", ab, U[11]);
+check("astr elems", astr, U[12]);
+check("astr elems bad", astr, U[13]);
+check("ap elems", ap, U[14]);
+check("ap elems other", ap, U[15]);
+check("ap elems boxed", ap, U[16]);
+check("abox elems", abox, U[17]);
+check("abox elems bad", abox, U[18]);
+check("aai elems bad", aai, U[19]);
+check("adi elems bad", adi, U[20]);
+# a TYPED container enters by its own type (Q2 decision A): each part
+# the place does not type `dyn` must be the container's exactly
+array<int> ti = [1];
+array<int?> toi = [1];
+array<P> tp = [P(1)];
+array<Q> tq = [Q(1)];
+array<array<int>> tai = [[1]];
+array<array<int?>> taoi = [[1]];
+dict<str, int> tdsi = {"a": 1};
+dict<int, int> tdii = {1: 1};
+dict<str, float> tdsf = {"a": 1.5};
+check("t ai", ai, ti);
+check("t ai opt", ai, toi);
+check("t aoi", aoi, ti);
+check("t ap", ap, tp);
+check("t ap other", ap, tq);
+check("t aai", aai, tai);
+check("t aai opt", aai, taoi);
+check("t dsi", dsi, tdsi);
+check("t dsi key", dsi, tdii);
+check("t dsi value", dsi, tdsf);
+check("t dvi", dvi, tdsi);
+check("t ddd", ddd, tdsi);
 # not a container at all; a container with no element type
 check("ai int", ai, runtime(5));
 check("dsi int", dsi, runtime(5));
@@ -199,11 +286,12 @@ var want = ["ai ints ok", "af ints no", "ab ints no", "astr ints no",
     "ap ints no", "af floats ok", "ai floats no", "ab bools ok",
     "ai bools no", "astr strs ok", "ai strs no", "ap structs ok",
     "ap other no", "ai structs no", "ai empty ok", "ai general ok",
-    "ai general bad no", "aoi none ok", "ai none no", "ac objs ok",
-    "ac objs bad no", "aai shared ok", "aai windows no", "aai window ok ok",
-    "dsi ok ok", "dsi value no", "dsi key no", "dai ok ok", "dai key no",
-    "dsa ok ok", "dsa value no", "dsi default ok ok", "dsi default no",
-    "dsp default ok ok", "dsp default no", "dvi ok ok", "dvi value no",
+    "ai general bad no", "ai dynarray no", "aoi none ok", "ai none no",
+    "ac objs ok", "ac objs bad no", "aai shared ok", "aai windows no",
+    "aai window ok ok", "dsi ok ok", "dsi value no", "dsi key no",
+    "dai ok ok", "dai key no", "dsa ok ok", "dsa value no",
+    "dsi default ok ok", "dsi default no", "dsp default ok ok",
+    "dsp default no", "dsi dict default no", "dvi ok ok", "dvi value no",
     "dki ok ok", "dki key no", "ddd any ok", "adi shared ok", "adi bad no",
     "sp ok ok", "sp other no", "sp int no", "sp boxed no", "sp egg no",
     "sp owl no", "sp urn no", "osp none ok", "bi ok ok", "bi float no",
@@ -213,9 +301,11 @@ var want = ["ai ints ok", "af ints no", "ab ints no", "astr ints no",
     "sc int no", "af elems ok", "af elems bad no", "ab elems ok",
     "ab elems bad no", "astr elems ok", "astr elems bad no", "ap elems ok",
     "ap elems other no", "ap elems boxed no", "abox elems ok",
-    "abox elems bad no", "aai elems bad no", "adi elems bad no", "ai int no",
-    "dsi int no", "garr any ok", "gdict any ok", "adyn any ok", "W ok",
-    "W bad no"];
+    "abox elems bad no", "aai elems bad no", "adi elems bad no", "t ai ok",
+    "t ai opt no", "t aoi no", "t ap ok", "t ap other no", "t aai ok",
+    "t aai opt no", "t dsi ok", "t dsi key no", "t dsi value no", "t dvi ok",
+    "t ddd ok", "ai int no", "dsi int no", "garr any ok", "gdict any ok",
+    "adyn any ok", "W ok", "W bad no"];
 assert(trail == want);
 foreach (var t in trail)
     print(t);
@@ -225,12 +315,12 @@ foreach (var t in trail)
         nos++;
 print(len(trail), nos);
 
-# a box reached through a dyn alias of an array with NO type of its own
-# is not checked where it is stored (a literal with a dyn element, which
-# the declaration's fit check examines, is untyped until the entry check
-# of plans/typed-containers.md step 3; an array<box<int>> of its own
-# refuses the store) - so `*` checks the box it reads: an int box, a
-# float, a bool, a str and a struct one, each given every other kind
+# a box stored through a dyn alias of a typed array<box<T>> is checked
+# against the array's own type where it is stored (Q2 decision A: the
+# declaration's literal, whose dyn element the fit check examined, takes
+# that type as it enters) - so `*` only ever reads the box kind its
+# static type names: an int box, a float, a bool, a str and a struct
+# one, each given every other kind, keep the last box that fitted
 array<box<int>> bxi = [runtime(box(1))];
 array<box<float>> bxf = [runtime(box(1.5))];
 array<box<bool>> bxb = [runtime(box(true))];
@@ -242,28 +332,36 @@ var dyn dxb = bxb;
 var dyn dxs = bxs;
 var dyn dxp = bxp;
 var derefs = [];
+func put(dyn f) {
+    try { f(); }
+    catch (TypeErrorEx) { append(derefs, "no"); }
+}
 func deref(dyn f) {
     try { append(derefs, str(f())); }
-    catch (TypeErrorEx) { append(derefs, "no"); }
+    catch (TypeErrorEx) { append(derefs, "bad"); }
 }
 var kinds = [box(7), box(2.5), box(false), box("t"), box(P(4)),
              box(Q(5)), P(6), 8];
 foreach (var k in kinds) {
-    dxi[0] = k;
+    put(func [k] () { dxi[0] = k; });
     deref(func () => *bxi[0]);
-    dxf[0] = k;
+    put(func [k] () { dxf[0] = k; });
     deref(func () => *bxf[0]);
-    dxb[0] = k;
+    put(func [k] () { dxb[0] = k; });
     deref(func () => *bxb[0]);
-    dxs[0] = k;
+    put(func [k] () { dxs[0] = k; });
     deref(func () => *bxs[0]);
-    dxp[0] = k;
+    put(func [k] () { dxp[0] = k; });
     deref(func () => (*bxp[0]).x);
 }
-assert(derefs == ["7", "no", "no", "no", "no", "no", "2.500000", "no",
-    "no", "no", "no", "no", "false", "no", "no", "no", "no", "no", "t", "no",
-    "no", "no", "no", "no", "4", "no", "no", "no", "no", "no", "no", "no",
-    "no", "no", "no", "no", "no", "no", "no", "no"]);
+assert(derefs == ["7", "no", "1.500000", "no", "true", "no", "s", "no", "1",
+    "no", "7", "2.500000", "no", "true", "no", "s", "no", "1", "no", "7",
+    "no", "2.500000", "false", "no", "s", "no", "1", "no", "7", "no",
+    "2.500000", "no", "false", "t", "no", "1", "no", "7", "no", "2.500000",
+    "no", "false", "no", "t", "4", "no", "7", "no", "2.500000", "no", "false",
+    "no", "t", "no", "4", "no", "7", "no", "2.500000", "no", "false", "no",
+    "t", "no", "4", "no", "7", "no", "2.500000", "no", "false", "no", "t",
+    "no", "4"]);
 print(derefs);
 
 # which calls need a check (CallExpr::fit_args): a construction, a

@@ -2357,6 +2357,8 @@ void myv_write(const VmProgram &prog, const std::string &path,
     w.u32v(static_cast<uint32_t>(prog.global_func_names.size()));
     for (const UniqueId *u : prog.global_func_names)
         w.uidv(u);
+    /* compiled with type inference: containers take types (v44) */
+    w.boolv(prog.typed);
 
     tick("globals");
 
@@ -2827,6 +2829,7 @@ VmProgram myv_read(const std::string &path, MyvSource &out_src,
     for (uint32_t i = 0; i < n; i++)
         prog.global_func_names.push_back(
             r.uid_req("corrupt .myv (global slot with no name)"));
+    prog.typed = r.boolv();
 
     /*
      * #137: VERIFY BEFORE ANYTHING INDEXES IT. Every check above bounds a

@@ -366,6 +366,12 @@ void vm_window_pop();
 struct VmProgram {
     Chunk root;
     int root_slot_count = 0;
+    /* compiled with type inference: containers take types when they enter
+     * a typed place (g_ctype_adopt; vm_run sets it from here, so an image
+     * runs as its compile would). ⛔ The two moves below list every member
+     * by hand: a new one joins both, or a moved program loses it (this one
+     * did, and -nti ran as a typed program). */
+    bool typed = true;
     std::vector<const UniqueId *> global_func_names;
     /* the root block's per-global-slot "may be reassigned" flags - the
      * native-call gate reads them, so a .myv carries them (else a loaded

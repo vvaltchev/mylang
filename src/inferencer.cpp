@@ -3696,8 +3696,12 @@ static bool fit_needed(StaticTypeRef v, StaticTypeRef p, bool top = true)
     v = static_type_resolve(v);
     if (!v)                             /* INT-COV-EXEMPT: see above */
         return true;
+    /* Q2 increment 3: an UNFILLED component (question 9: an empty
+     * container nothing wrote) counts too - such a container is untyped,
+     * and the check is where it takes the place's type */
     if (v->kind == StaticTypeKind::Dyn
-            || v->kind == StaticTypeKind::Unknown)
+            || v->kind == StaticTypeKind::Unknown
+            || (!top && v->kind == StaticTypeKind::None))
         return true;
     switch (p->kind) {
     case StaticTypeKind::Array: case StaticTypeKind::Box:
@@ -10374,6 +10378,8 @@ void infer_types(Construct *root, bool enable, bool strict)
      * but skips the fixpoint / type checking / strict enforcement. */
     inf.checks_enabled = enable;
     inf.closed_world = true;
+    /* containers take types only in a typed run (fit_adopt) */
+    g_ctype_adopt = enable;
     inf.run();
 }
 

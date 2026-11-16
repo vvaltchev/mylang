@@ -145,28 +145,41 @@ func var_store(dyn x) {
     return v == [1];
 }
 assert(var_store(runtime("s")) == typed);
-array<int> vv = dyn_rows(runtime(5));
-assert(vv == [5]);
+# ...and a container declared array<dyn> enters no array<int>, whatever
+# it holds (Q2 decision A: it may take a string through another name)
+var vvr = 0;
+try { array<int> vv = dyn_rows(runtime(5)); } catch (TypeErrorEx) { vvr = 1; }
+assert(vvr == (typed ? 1 : 0));
 # a multi-assignment checks what each declared target receives, in
 # order: a refusal leaves the targets before it written and the rest as
-# they were, as a failing coercion does
-func multi(dyn x) {
-    array<array<dyn>> src = [[1], [x]];
+# they were, as a failing coercion does. An element that is an
+# array<int> enters an array<int> target; one made array<dyn> - a
+# literal stored into the array<array<dyn>> - is refused whatever it
+# holds (Q2 decision A)
+func multi(bool bad) {
+    array<int> one = [1];
+    array<int> two = [2];
+    array<array<dyn>> src = [one, two];
+    if (bad)
+        src[1] = [2];
     array<int> a = [0];
     array<int> b = [0];
     try { a, b = src; } catch (TypeErrorEx) { return [a, b]; }
     return [a, b, [9]];
 }
-assert(!typed || multi(runtime("s")) == [[1], [0]]);
-assert(multi(runtime(2)) == [[1], [2], [9]]);
+assert(!typed || multi(runtime(true)) == [[1], [0]]);
+assert(multi(runtime(false)) == [[1], [2], [9]]);
 # ... and a non-array value, spread to each target
-func spread(dyn x) {
-    dict<str, dyn> d = {"k": x};
+func spread(bool bad) {
+    dict<str, int> good = {"k": 4};
+    dict<str, dyn> d = good;
+    if (bad)
+        d = {"k": 4};
     dict<str, int> p = {};
     dict<str, int> q = {"z": 0};
     try { p, q = d; } catch (TypeErrorEx) { return [p, q]; }
     return [p, q, {"ok": 1}];
 }
-assert(!typed || spread(runtime("s")) == [{}, {"z": 0}]);
-assert(spread(runtime(4)) == [{"k": 4}, {"k": 4}, {"ok": 1}]);
+assert(!typed || spread(runtime(true)) == [{}, {"z": 0}]);
+assert(spread(runtime(false)) == [{"k": 4}, {"k": 4}, {"ok": 1}]);
 print("ok");

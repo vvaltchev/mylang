@@ -7335,6 +7335,30 @@ per level of a deep value - a separate open item.
   into a typed container again;
   `tests/functional/125_container_type_stores.my` stores every form
   through `dyn`, refused and fitting.
+  **⛔ INCREMENT 3: A CONTAINER ENTERS A TYPED PLACE BY ITS OWN TYPE
+  (decision A).** `fits` (types/fit.cpp.h) checks a TYPED, mutable
+  container by its ctype (`ct_enters`): a component the place types
+  `dyn` (or leaves out - a generic `array`) takes anything, since a
+  store into it is checked; every other component must be the
+  container's exactly (`ct_same`), since a store into it is not - an
+  `array<array<int>>` must not enter `array<array<dyn>>`. An UNTYPED
+  one is checked by what it holds, and a read-only one too. Every place
+  a value ENTERS calls **`value_enters`** (value_fits, then
+  `fit_adopt`: an untyped mutable container that fits TAKES the place's
+  type, along the annotation, stamp_ctype; first `adopt_detach` makes
+  a slice among them an ordinary array - its whole group - and gives
+  the live slices of an array their own copies, since the type is kept
+  on the storage a slice shares and a slice is an array of its own; a
+  GENERIC component - `array<array>`'s element - types nothing,
+  `ctype_names`, since it checks no store) - the binds (`bind_param`,
+  `bind_fault`), the struct fields, `check_fit[_loc]` (CheckFitV and
+  every FitSpec store) and `ct_fit` / `ct_fit_key`. **A new entry site
+  calls value_enters, never value_fits**, or an untyped container
+  stays untyped while a typed path reaches it, and a store through a
+  `dyn` alias then writes past the place's type. `fit_needed` counts an
+  UNFILLED component (`[]` nothing wrote) for the same reason: that
+  container is untyped, and the check is where it takes its type.
+  `tests/functional/126_container_entry.my`.
 - **Universal `hash()` (deep, by value).** `Type::hash` returns `size_t`; the
   base throws, the leaves (`int`/`bool`/`float`/`str`) hash directly, and
   `none` + the containers/structs hash deeply (`hashing.h` combiners,

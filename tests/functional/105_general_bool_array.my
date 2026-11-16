@@ -1,7 +1,10 @@
 # An array<bool> is not always stored flat: an inline keys() of a
-# dict<bool, ...> and dynarray() build a GENERAL array, and a parameter
-# declared array<bool> accepts one. Reading an element where an int is
-# expected - a condition, arithmetic, a counted loop - must read it as
+# dict<bool, ...> builds a GENERAL array<bool>, and an array of bools
+# only `dyn` reaches may be general and untyped - a parameter declared
+# array<bool> accepts both (the untyped one takes that type as it enters;
+# dynarray()'s array<dyn> enters no array<bool>, Q2 decision A).
+# Reading an element where an int is expected - a condition,
+# arithmetic, a counted loop - must read it as
 # 0/1, as a flat bool array's element reads. It raised TypeErrorEx in
 # every engine, each with another caret (the tree-walker marked the
 # whole `if`, the JIT the element, -nj nothing at all). And in a FLOAT
@@ -46,9 +49,16 @@ func gen_bools() {
     return d;
 }
 
+var typed = typestr(runtime(0)) == "dyn";
 var flat = [true, false, true, true];
-var gen = dynarray(flat);
+array<dyn> holder = [[true, "x", true, true]];
+var dyn gen = holder[0];
+gen[1] = false;
 assert(array_storage(flat) == "bool" && array_storage(gen) == "general");
+var dyn dg = dynarray(flat);
+var refused = 0;
+try { cond_count(dg); } catch (TypeErrorEx) { refused = 1; }
+assert(refused == (typed ? 1 : 0));
 assert(array_storage(keys(gen_bools())) == "general");
 
 foreach (a in [flat, gen])

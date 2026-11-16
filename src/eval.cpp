@@ -569,7 +569,7 @@ bind_param(EvalContext *args_ctx,
      * CallExpr::check_args at a call site; every callback bind) */
     else if (check_fit && param.fit && !val.is<NoneVal>()) {
         FitMisfit m;
-        if (!value_fits(val, *param.fit, m))
+        if (!value_enters(val, *param.fit, m))
             throw param_fit_error(param.name, *param.fit, m, site_arg);
     }
 
@@ -1327,7 +1327,7 @@ static void
 field_fit_check(const FieldDef &fd, const EvalValue &v, Loc s, Loc e)
 {
     FitMisfit m;
-    if (!fd.annot || value_fits(v, *fd.annot, m))
+    if (!fd.annot || value_enters(v, *fd.annot, m))
         return;
     FitSpec spec;
     spec.annot = fd.annot;
@@ -2962,15 +2962,20 @@ static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
  * literal nested there is in -nc's tree, stamp_literal_coerce: only `dyn`
  * reaches it, and it keeps the storage its own values gave it).
  */
+bool ctype_names(const TypeAnnot *t) noexcept
+{
+    return t && (t->kind == DeclType::arr
+                 ? t->elem != nullptr
+                 : t->kind == DeclType::dict && t->key != nullptr);
+}
+
 static void stamp_ctype_rec(const EvalValue &v, const TypeAnnot *t,
                             int mode) noexcept
 {
     if (!t)
         return;
     const auto sub = [&](const EvalValue &e, const TypeAnnot *et) {
-        if (!et)
-            return;
-        if (et->kind == DeclType::arr || et->kind == DeclType::dict)
+        if (ctype_names(et))
             stamp_ctype_rec(e, annot_nonopt(et), mode);
     };
     if (v.is<SharedArrayObj>()) {
@@ -3024,8 +3029,11 @@ static void ctype_clear(const EvalValue &v)
 {
     if (v.is<SharedArrayObj>()) {
         const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
-        if (a.is_readonly() || a.slice || !a.ctype())
+        /* a fresh copy shares only read-only containers, slices
+         * included, so a mutable one is no slice */
+        if (a.is_readonly() || !a.ctype())
             return;
+        ML_CHECK(!a.slice);
         const_cast<SharedArrayObj &>(a).set_ctype(nullptr);
         if (a.skind() != SharedArrayObj::Storage::general)
             return;

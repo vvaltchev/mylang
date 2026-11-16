@@ -73,6 +73,8 @@ const TypeAnnot *annot_dyn_array();
 const TypeAnnot *annot_dyn_dict();
 /* the interned array<P> of a struct type `d` (a flat struct literal's) */
 const TypeAnnot *annot_array_of_struct(const StructTypeDef *d);
+/* the interned array<str> (argv's) */
+const TypeAnnot *annot_str_array();
 /* how a type reads in a message ("array<int>"); "untyped" for null */
 std::string annot_text(const TypeAnnot *a);
 

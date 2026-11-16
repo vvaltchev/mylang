@@ -1307,30 +1307,35 @@ static const std::vector<test> tests =
         "if (runtime(true)) { print(use(2)); }",
         "var lf = func(x) { var t = x * 3; if (t > 9) return 0; return t; };" },
       &typeid(UnboundSymbolEx), 26, 1, 29, 1 },
-    /* a value a `dyn` alias stored into a GENERAL array<int> / dict<str,
-     * float> is a TypeErrorEx at the typed READ's caret in every mode -
-     * the tree-walker marked the whole statement, the VM nothing */
-    { "err loc: a typed element read of a laundered string",
+    /* Q2 increment 3: these were a typed READ of a string laundered into
+     * a typed container through `dyn` (the read's caret, in every mode).
+     * A container entering a typed place now takes its type, or is
+     * refused if it carries another one, so the laundering itself is
+     * refused - at the store, or where the container enters - and the
+     * typed read can no longer meet a misfit in a typed run */
+    { "err loc: (Q2) a string stored through dyn into an array<int> "
+      "a typed parameter adopted",
       { "func f(array<int> a) {",
         "    var dyn x = a; x[1] = \"s\";",
         "    var t = 0;",
         "    for (var i = 0; i < 2; i++) t += a[i] * 2;",
         "    return t;",
         "}",
-        "f(dynarray([1, 2]));" }, &typeid(TypeErrorEx), 38, 4, 43, 4 },
-    { "err loc: a typed dict read of a laundered string",
+        "f(dynarray([1, 2]));" }, &typeid(TypeErrorEx), 20, 2, 25, 2 },
+    { "err loc: (Q2) a dynamic dict entering a dict<str, float> parameter",
       { "func g(dict<str, float> d) {",
         "    var dyn x = d; x[\"a\"] = \"s\";",
         "    var t = 0.0;",
         "    for (var i = 0; i < 2; i++) t += d.a * 2.0;",
         "    return t;",
         "}",
-        /* a DYNAMIC dict (made where `dyn` is declared) takes the
-         * string; a typed one refuses it at the store (Q2) */
+        /* a DYNAMIC dict (made where `dyn` is declared) is no
+         * dict<str, float>: refused at the argument */
         "var dyn d0 = {\"a\": 1.5}; g(d0);" },
-      &typeid(TypeErrorEx), 38, 4, 42, 4 },
-    /* the fused two-level read's inner level: the whole `m[k][0]` span */
-    { "err loc: a typed two-level read of a laundered string",
+      &typeid(TypeErrorEx), 28, 7, 31, 7 },
+    /* an element that is an array<dyn> is no array<int>: the whole
+     * argument's span */
+    { "err loc: (Q2) an array of dynamic arrays entering array<array<int>>",
       { "func f(array<array<int>> m) {",
         "    var dyn x = m[1]; x[0] = \"s\";",
         "    var t = 0;",
@@ -1338,25 +1343,26 @@ static const std::vector<test> tests =
         "    return t;",
         "}",
         "f(dynarray([dynarray([1, 2]), dynarray([3, 4])]));" },
-      &typeid(TypeErrorEx), 38, 4, 46, 4 },
-    /* a typed foreach variable: the container's caret - a bool loop had
-     * three OUTCOMES (false / bound the string / failed at its use) */
-    { "err loc: a typed bool foreach over a laundered string",
+      &typeid(TypeErrorEx), 3, 7, 50, 7 },
+    /* (the typed foreach variable's read these two reached: see above) */
+    { "err loc: (Q2) a string stored through dyn into an array<bool> "
+      "a typed parameter adopted",
       { "func f(array<bool> a) {",
         "    var dyn x = a; x[1] = \"s\";",
         "    var n = 0;",
         "    foreach (var v in a) { if (v) n++; }",
         "    return n;",
         "}",
-        "f(dynarray([true, false]));" }, &typeid(TypeErrorEx), 23, 4, 25, 4 },
-    { "err loc: a typed float foreach over a laundered string",
+        "f(dynarray([true, false]));" }, &typeid(TypeErrorEx), 20, 2, 25, 2 },
+    { "err loc: (Q2) a string stored through dyn into an array<float> "
+      "a typed parameter adopted",
       { "func f(array<float> a) {",
         "    var dyn x = a; x[1] = \"s\";",
         "    var t = 0.0;",
         "    foreach (var v in a) t += v;",
         "    return t;",
         "}",
-        "f(dynarray([1.5, 2.5]));" }, &typeid(TypeErrorEx), 23, 4, 25, 4 },
+        "f(dynarray([1.5, 2.5]));" }, &typeid(TypeErrorEx), 20, 2, 25, 2 },
     /* a const multi-declaration's element the parser already folded to a
      * constant value (sort() of a constant) is bound as it is: read-only,
      * like the elements it bakes */
@@ -18806,17 +18812,21 @@ static const std::vector<test> tests =
       { "func f(box<int> b) { return *b + 1; }",
         "var dyn d = box(\"s\"); print(f(d));" },
       &typeid(TypeErrorEx), 31, 2, 33, 2 },
-    /* ...so a misfit reaches a typed `*` only through a container with
-     * no type of its own (Q2): a literal a fit check examined where it
-     * landed, until step 3's entry check gives it that place's type */
-    { "box: `*` checks the box it was proven to read",
+    /* ...and the container it would arrive through is typed too: since
+     * Q2 increment 3 a literal a fit check examined takes its place's
+     * type where it enters, so the store of the misfit is refused (the
+     * typed `*`'s own check is reached by an untyped run - an image
+     * with no container types - in jit_box_native) */
+    { "box: (Q2) a box of another kind is refused before a typed `*` "
+      "can read it",
       { "func f(box<int> b) { return *b + 1; }",
         "func h(array<box<int>> bs) { var dyn d = bs; d[0] = box(\"s\");",
         "  return f(bs[0]); } print(h([runtime(box(1))]));" },
-      &typeid(TypeErrorEx), 29, 1, 32, 1 },
+      &typeid(TypeErrorEx), 46, 2, 51, 2 },
     /* ... in a loop the JIT compiles: its native int add reads the load's
      * result raw, so only the load's own check can refuse the misfit */
-    { "box: `*` checks the box it was proven to read, in a native loop",
+    { "box: (Q2) a box of another kind is refused before a typed `*` "
+      "in a native loop can read it",
       { "func f(box<int> b) { var s = 0;",
         "  for (var i = 0; i < 300; i++) s += *b + i;",
         "  return s; }",
@@ -18824,7 +18834,7 @@ static const std::vector<test> tests =
         "func h(array<box<int>> bs) { var dyn d = bs; d[0] = box(\"s\");",
         "  return f(bs[0]); } var r = h([runtime(g)]);",
         "print(r);" },
-      &typeid(TypeErrorEx), 38, 2, 41, 2 },
+      &typeid(TypeErrorEx), 46, 5, 51, 5 },
     { "box: ++ on a box of a str is a TypeErrorEx at the inc-dec",
       { "var dyn d = box(\"s\");",
         "(*d)++;" },
@@ -31625,8 +31635,10 @@ static bool dyn_fit_messages()
             "func outer(dyn d) { var r = ln(d); return r; }",
             "print(outer(runtime([1, 2])));",
             "print(outer(runtime([1, \"x\"])));" },
-          "parameter 'a' is declared 'array<int>' but the argument's [1] "
-          "is a 'str'" },
+          /* Q2 increment 3: a container is refused by the type it
+           * carries - [1, "x"] is an array<dyn> - not by an element */
+          "parameter 'a' is declared 'array<int>' but the argument is an "
+          "'array<dyn>'" },
         { "a struct parameter given another struct", {
             "struct P { int x; } struct Q { int x; }",
             "func px(P p) => p.x;",
@@ -31635,9 +31647,9 @@ static bool dyn_fit_messages()
         { "a nested dict value", {
             "dict<str, array<int>> m = {};",
             "m[\"k\"] = runtime([1, 2.5]);" },
-          /* the literal is a flat float array: 1 is stored 1.0 */
-          "the dict value is declared 'array<int>' but the value's [0] "
-          "is a 'float'" },
+          /* the literal is an array<float>: refused by that type */
+          "the dict value is declared 'array<int>' but the value is an "
+          "'array<float>'" },
         { "a dict key", {
             "dict<str, int> k = {};",
             "insert(k, runtime(5), 1);" },
@@ -31654,19 +31666,20 @@ static bool dyn_fit_messages()
         { "a declared variable given a container with a dyn inside", {
             "func rows(dyn x) { array<dyn> r = [x]; return r; }",
             "array<int> v = rows(runtime(\"s\"));" },
-          "'v' is declared 'array<int>' but the value's [0] is a 'str'" },
+          "'v' is declared 'array<int>' but the value is an 'array<dyn>'" },
         { "a multi-assignment target given a container with a dyn "
           "inside", {
             "func rows(dyn x) {",
             "    array<array<dyn>> r = [[1], [x]]; return r; }",
             "array<int> a = [0]; array<int> b = [0];",
             "a, b = rows(runtime(\"s\"));" },
-          "'b' is declared 'array<int>' but the value's [0] is a 'str'" },
+          /* each row is an array<dyn>: the first target refuses it */
+          "'a' is declared 'array<int>' but the value is an 'array<dyn>'" },
         { "a field at construction", {
             "struct S { array<int> v; }",
             "var s = S(runtime([[1]]));" },
-          "field 'v' is declared 'array<int>' but the value's [0] is an "
-          "'array'" },
+          "field 'v' is declared 'array<int>' but the value is an "
+          "'array<array<int>>'" },
         { "a compound whose operator does not apply keeps the "
           "operator's message (no dyn: nothing for a check to miss)", {
             "box<int> b = box(1);",
@@ -37071,6 +37084,172 @@ static bool bc_sra_closures()
  * Each reader is tampered in memory before the write, both ways, and an
  * intact write must still load.
  */
+/*
+ * Q2 increment 3: a typed READ of a misfit laundered through `dyn` - an
+ * element, a dict value, a two-level read, a typed foreach variable, a
+ * box's `*` - happens only in a run that types no container (an image
+ * whose `typed` byte is false, VmProgram::typed): a typed run refuses the
+ * laundering itself, where the container enters the typed place. These
+ * programs - the err-loc cases they were before increment 3 - run that
+ * way in the tree-walker, the VM and the JIT, and each read's own check
+ * must raise TypeErrorEx at the read's caret.
+ */
+static bool untyped_run_misfit_reads()
+{
+    struct Case {
+        const char *name;
+        std::vector<const char *> lines;
+        int col, line, col_end, line_end;
+    };
+    const std::vector<Case> cases = {
+        { "element read",
+          { "func f(array<int> a) {",
+            "    var dyn x = a; x[1] = \"s\";",
+            "    var t = 0;",
+            "    for (var i = 0; i < 2; i++) t += a[i] * 2;",
+            "    return t;",
+            "}",
+            "f(dynarray([1, 2]));" }, 38, 4, 43, 4 },
+        { "dict read",
+          { "func g(dict<str, float> d) {",
+            "    var dyn x = d; x[\"a\"] = \"s\";",
+            "    var t = 0.0;",
+            "    for (var i = 0; i < 2; i++) t += d.a * 2.0;",
+            "    return t;",
+            "}",
+            /* a dict only a dyn element reaches: untyped */
+            "array<dyn> hd = [{\"a\": 1.5}];",
+            "g(hd[0]);" }, 38, 4, 42, 4 },
+        { "two-level read",
+          { "func f(array<array<int>> m) {",
+            "    var dyn x = m[1]; x[0] = \"s\";",
+            "    var t = 0;",
+            "    for (var k = 0; k < 2; k++) t += m[k][0] * 3;",
+            "    return t;",
+            "}",
+            /* rows only `dyn` reaches: untyped, and general */
+            "array<dyn> hh = [[dynarray([1, 2]), dynarray([3, 4])]];",
+            "f(hh[0]);" }, 38, 4, 46, 4 },
+        { "bool foreach",
+          { "func f(array<bool> a) {",
+            "    var dyn x = a; x[1] = \"s\";",
+            "    var n = 0;",
+            "    foreach (var v in a) { if (v) n++; }",
+            "    return n;",
+            "}",
+            "f(dynarray([true, false]));" }, 23, 4, 25, 4 },
+        { "float foreach",
+          { "func f(array<float> a) {",
+            "    var dyn x = a; x[1] = \"s\";",
+            "    var t = 0.0;",
+            "    foreach (var v in a) t += v;",
+            "    return t;",
+            "}",
+            "f(dynarray([1.5, 2.5]));" }, 23, 4, 25, 4 },
+        { "box `*`",
+          { "func f(box<int> b) { return *b + 1; }",
+            "func h(array<box<int>> bs) { var dyn d = bs; "
+            "d[0] = box(\"s\");",
+            "  return f(bs[0]); } print(h([runtime(box(1))]));" },
+          29, 1, 32, 1 },
+        { "box `*` in a native loop",
+          { "func f(box<int> b) { var s = 0;",
+            "  for (var i = 0; i < 300; i++) s += *b + i;",
+            "  return s; }",
+            "var g = box(1); assert(f(g) == 300 + 44850);",
+            "func h(array<box<int>> bs) { var dyn d = bs; "
+            "d[0] = box(\"s\");",
+            "  return f(bs[0]); } var r = h([runtime(g)]);",
+            "print(r);" }, 38, 2, 41, 2 },
+        /* box<P>: an int box, a plain P, a box of another struct; and a
+         * box<P> where a box<int> is wanted */
+        { "box<P> `*` of an int box",
+          { "struct P { int x; }",
+            "func f(box<P> b) { var p = *b; return p.x; }",
+            "func h(array<box<P>> bs) { var dyn d = bs; d[0] = box(1);",
+            "  return f(bs[0]); } print(h([runtime(box(P(1)))]));" },
+          28, 2, 31, 2 },
+        { "box<P> `*` of a plain struct",
+          { "struct P { int x; }",
+            "func f(box<P> b) { var p = *b; return p.x; }",
+            "func h(array<box<P>> bs) { var dyn d = bs; d[0] = P(2);",
+            "  return f(bs[0]); } print(h([runtime(box(P(1)))]));" },
+          28, 2, 31, 2 },
+        { "box<P> `*` of another struct's box",
+          { "struct P { int x; } struct Q { int x; }",
+            "func f(box<P> b) { var p = *b; return p.x; }",
+            "func h(array<box<P>> bs) { var dyn d = bs;",
+            "  d[0] = box(Q(2));",
+            "  return f(bs[0]); } print(h([runtime(box(P(1)))]));" },
+          28, 2, 31, 2 },
+        { "box<int> `*` of a struct box",
+          { "struct P { int x; }",
+            "func f(box<int> b) { return *b + 1; }",
+            "func h(array<box<int>> bs) { var dyn d = bs;",
+            "  d[0] = box(P(2));",
+            "  return f(bs[0]); } print(h([runtime(box(1))]));" },
+          29, 2, 32, 2 },
+        /* layout(S).fields is untyped in an untyped run */
+        { "layout fields",
+          { "struct S { int a; }",
+            "var f = layout(S).fields;",
+            "var dyn d = f; d[0] = 5;",
+            "print(f[0].name);" }, 7, 4, 12, 4 },
+    };
+    const ExecEngine saved_engine = g_exec_engine;
+    const bool saved_jit = g_jit_enabled;
+    bool ok = true;
+    for (const Case &c : cases) {
+        for (int mode = 0; mode < 3; mode++) {
+            static const char *const mode_name[] = { "tw", "vm", "jit" };
+            std::string src;
+            for (size_t i = 0; i < c.lines.size(); i++) {
+                if (i)
+                    src += '\n';
+                src += c.lines[i];
+            }
+            std::vector<Tok> toks;
+            lexer(src, 1, toks);
+            g_exec_engine = mode ? ExecEngine::Vm : ExecEngine::TreeWalk;
+            g_jit_enabled = mode == 2 && saved_jit;
+            std::string got = "nothing";
+            Loc s, e;
+            std::ostringstream discard;
+            std::streambuf *old = std::cout.rdbuf(discard.rdbuf());
+            try {
+                ParseContext pc(TokenStream(toks), true);
+                unique_ptr<Construct> root = pBlock(pc);
+                mark_implicit_globals(root.get(), {});
+                infer_types(root.get(), true);
+                run_optimizers(root.get());
+                g_ctype_adopt = false;      /* vm_compile records it */
+                if (mode)
+                    vm_execute(root.get());
+                else
+                    root->eval(nullptr);
+            } catch (Exception &ex) {
+                got = ex.name;
+                s = ex.loc_start;
+                e = ex.loc_end;
+            }
+            std::cout.rdbuf(old);
+            g_ctype_adopt = true;
+            if (got != "TypeErrorEx" || s.col != c.col || s.line != c.line
+                    || e.col != c.col_end || e.line != c.line_end) {
+                fprintf(stderr, "untyped_run_misfit_reads [%s, %s]: %s at "
+                        "%d:%d-%d:%d, expected TypeErrorEx at %d:%d-%d:%d\n",
+                        c.name, mode_name[mode], got.c_str(), s.line, s.col,
+                        e.line, e.col, c.line, c.col, c.line_end,
+                        c.col_end);
+                ok = false;
+            }
+        }
+    }
+    g_exec_engine = saved_engine;
+    g_jit_enabled = saved_jit;
+    return ok;
+}
+
 static bool myv_ctype_refused()
 {
     const char *lines_arr[] = {
@@ -38498,7 +38677,10 @@ static bool myv_fit_round_trip()
         g_jit_enabled = false;
         const std::string dump = blk ? disassemble_program(blk) : "";
         g_jit_enabled = jit_was;
-        for (const char *need : { "; -- fit_specs (5) --",
+        /* 7: the two empty `{}` declared into typed variables take
+         * their type where they enter (Q2 increment 3) */
+        for (const char *need : { "; -- fit_specs (7) --",
+                                  "variable 'm'  dict<str,array<int>>",
                                   "variable 'v'  array<int>",
                                   "field 'v'  array<int>",
                                   "element  array<int>",
@@ -55750,7 +55932,13 @@ static bool jit_box_native()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
-    auto run = [](const std::vector<const char *> &lines) -> bool {
+    /* `untyped`: run as an image with no container types runs (Q2
+     * increment 3, VmProgram::typed false) - a container entering a
+     * typed place takes no type, so a store through `dyn` can still put
+     * a misfit where typed code reads it: the one way left to reach the
+     * read's own check */
+    auto run = [](const std::vector<const char *> &lines,
+                  bool untyped = false) -> bool {
         std::string src;
         std::vector<Tok> toks;
         for (size_t i = 0; i < lines.size(); i++) {
@@ -55767,10 +55955,13 @@ static bool jit_box_native()
             mark_implicit_globals(root.get(), {});
             infer_types(root.get(), true);
             run_optimizers(root.get());
+            if (untyped)
+                g_ctype_adopt = false;     /* vm_compile records it */
             vm_execute(root.get());
         } catch (...) {
             ok = false;
         }
+        g_ctype_adopt = true;
         g_exec_engine = saved;
         return ok;
     };
@@ -55813,10 +56004,11 @@ static bool jit_box_native()
              * kind check and its tag check - the helper raises the
              * defined TypeErrorEx (box_kind, box_not_box), and the
              * store's tag check the same. A dyn ARGUMENT is refused at
-             * the bind since #49, and a store through a dyn name is
-             * checked against the array's type since Q2, so the misfits
-             * arrive the one way left: an array with no type of its own
-             * (a literal a fit check examined where it landed) */
+             * the bind since #49, a store through a dyn name is checked
+             * against the array's type since Q2, and a container takes
+             * its place's type where it enters since Q2 increment 3, so
+             * the misfits arrive only in a run that types no container
+             * (an untyped image's): this program runs as one */
             "func wantint(box<int> x) {",
             "  var r = 0;",
             "  for (var k = 0; k < 3; k++) r += *x;",
@@ -55841,7 +56033,7 @@ static bool jit_box_native()
             "var gf = 0;",
             "for (var i = 0; i < 6; i++) {",
             "  try { *df = \"s\"; } catch (TypeErrorEx) { gf++; } }",
-            "assert(gf == 6 && *df == 1.5);" }))
+            "assert(gf == 6 && *df == 1.5);" }, true))
         return false;
     if (g_jit_op_run[static_cast<size_t>(OpCode::LoadBoxV)] <= ld0
             || g_jit_op_run[static_cast<size_t>(OpCode::StoreBoxV)] <= st0) {
@@ -55883,7 +56075,13 @@ static bool jit_class_native()
 #if ML_JIT_SUPPORTED
     if (!g_jit_enabled)
         return true;
-    auto run = [](const std::vector<const char *> &lines) -> bool {
+    /* `untyped`: run as an image with no container types runs (Q2
+     * increment 3, VmProgram::typed false) - a container entering a
+     * typed place takes no type, so a store through `dyn` can still put
+     * a misfit where typed code reads it: the one way left to reach the
+     * read's own check */
+    auto run = [](const std::vector<const char *> &lines,
+                  bool untyped = false) -> bool {
         std::string src;
         std::vector<Tok> toks;
         for (size_t i = 0; i < lines.size(); i++) {
@@ -55900,10 +56098,13 @@ static bool jit_class_native()
             mark_implicit_globals(root.get(), {});
             infer_types(root.get(), true);
             run_optimizers(root.get());
+            if (untyped)
+                g_ctype_adopt = false;     /* vm_compile records it */
             vm_execute(root.get());
         } catch (...) {
             ok = false;
         }
+        g_ctype_adopt = true;
         g_exec_engine = saved;
         return ok;
     };
@@ -55952,10 +56153,11 @@ static bool jit_class_native()
             "assert(m == 25);",
             /* a D in a C parameter: the field's slot is C's, so only
              * the def guard keeps the read off D's `m`. A dyn ARGUMENT
-             * is refused at the bind since #49, and a store through a
-             * dyn name checked against the array's type since Q2, so
-             * the D arrives the one way left: an array with no type of
-             * its own (a literal a fit check examined where it landed) */
+             * is refused at the bind since #49, a store through a dyn
+             * name checked against the array's type since Q2, and a
+             * container takes its place's type where it enters since Q2
+             * increment 3, so the D arrives only in a run that types no
+             * container (an untyped image's): this program runs as one */
             "class D { int m; int n; }",
             "func getn(C c) { var r = 0;",
             "  for (var k = 0; k < 3; k++) r += c.n; return r; }",
@@ -55972,7 +56174,7 @@ static bool jit_class_native()
             "assert(array_storage(bps) == \"class\");",
             "var sp = 0;",
             "for (var i = 0; i < 20; i++) sp += bps[i % 2].x;",
-            "assert(sp == 30);" }))
+            "assert(sp == 30);" }, true))
         return false;
     if (g_jit_elemo_fast <= eo0) {
         fprintf(stderr, "jit_class_native: the array<C> element read DID "
@@ -61481,6 +61683,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: v43 - a container type no container can have (opt, another "
       "kind) is a corrupt image, refused by every reader",
       myv_ctype_refused },
+    { "Q2: a typed read of a misfit laundered through dyn, in a run that "
+      "types no container (an untyped image): every engine refuses it at "
+      "the read's caret", untyped_run_misfit_reads },
     { "myv: a flat struct array's stride must be its struct's size "
       "(myv_fuzz fat-276)", myv_struct_array_stride_checked },
     { "myv: a PushHandler naming an empty handler site is refused "
