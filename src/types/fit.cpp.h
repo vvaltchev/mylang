@@ -691,6 +691,163 @@ const TypeAnnot *ct_elem_annot(const EvalValue &c)
     return nullptr;
 }
 
+/* The storage a parsed `array<...>` annotation gives an array - the
+ * inferencer's array_repr_hint, read off the annotation (a typed const is
+ * bound, and a pure function may run, before inference): dflt keeps a
+ * value's own (array<str>, a generic `array`); `sd` the POD struct a
+ * flat_s array needs */
+ArrHint annot_arr_hint(const TypeAnnot *a, const StructTypeDef *&sd)
+{
+    sd = nullptr;
+    const TypeAnnot *e = a ? a->elem.get() : nullptr;
+    const StructTypeDef *esd =
+        e && e->kind == DeclType::strct ? e->strct : nullptr;
+    if (!e || (!e->opt && e->kind == DeclType::s))
+        return ArrHint::dflt;
+    if (!e->opt && e->kind == DeclType::i)
+        return ArrHint::flat_i;
+    if (!e->opt && e->kind == DeclType::f)
+        return ArrHint::flat_f;
+    if (!e->opt && e->kind == DeclType::b)
+        return ArrHint::flat_b;
+    if (!e->opt && esd && esd->is_pod()) {
+        sd = esd;
+        return ArrHint::flat_s;
+    }
+    if (esd && esd->is_class)
+        return ArrHint::flat_c;
+    return ArrHint::general;
+}
+
+/*
+ * Choice 6 (plans/strict-container-types.md): the ZERO VALUE of the type
+ * `a` - what `T x;` gives (the parser's zero_value_literal and
+ * build_zero_struct_init, which build it as code) - into `out`, a FRESH
+ * value (a container, a struct, a class instance, a box is new each
+ * time). False when the type has none: a non-opt `dyn` (rule 3), a struct
+ * one of whose fields has none, or a struct field whose struct type is
+ * not known here (a forward reference). `out` null: only the answer.
+ */
+static bool struct_zero_value(const StructTypeDef *d, EvalValue *out,
+                              int depth);
+
+bool annot_zero_value(const TypeAnnot *a, EvalValue *out, int depth)
+{
+    /* (a non-opt cycle is refused at parse time; the bound is a guard) */
+    if (depth > 64)                     /* INT-COV-EXEMPT: parse refuses it */
+        return false;
+    if (!a || a->opt || a->kind == DeclType::none) {
+        if (out)
+            *out = EvalValue();
+        return true;
+    }
+    switch (a->kind) {
+    case DeclType::b:
+        if (out)
+            *out = EvalValue(false);
+        return true;
+    case DeclType::i:
+        if (out)
+            *out = EvalValue(static_cast<int_type>(0));
+        return true;
+    case DeclType::f:
+        if (out)
+            *out = EvalValue(static_cast<float_type>(0.0));
+        return true;
+    case DeclType::s:
+        if (out)
+            *out = EvalValue(SharedStr(std::string()));
+        return true;
+    case DeclType::arr: {
+        if (!out)
+            return true;
+        const StructTypeDef *sd = nullptr;
+        const ArrHint h = annot_arr_hint(a, sd);
+        EvalValue v = build_array_from_values(nullptr, 0, h, sd, false);
+        if (a->elem)
+            const_cast<SharedArrayObj &>(v.get_ref<SharedArrayObj>())
+                .set_ctype(annot_nonopt(annot_intern(*a)));
+        *out = std::move(v);
+        return true;
+    }
+    case DeclType::dict: {
+        if (!out)
+            return true;
+        auto d = make_intrusive<DictObject>();
+        if (a->key || a->val)
+            d->set_ctype(annot_nonopt(annot_intern(*a)));
+        *out = EvalValue(std::move(d));
+        return true;
+    }
+    case DeclType::strct:
+        return a->strct && struct_zero_value(a->strct, out, depth + 1);
+    case DeclType::box: {
+        EvalValue inner;
+        if (!annot_zero_value(a->elem.get(), out ? &inner : nullptr,
+                              depth + 1))
+            return false;
+        if (out)
+            *out = box_make(inner);
+        return true;
+    }
+    case DeclType::dyn:
+        return false;
+    default:
+        return false;
+    }
+}
+
+static bool struct_zero_value(const StructTypeDef *d, EvalValue *out,
+                              int depth)
+{
+    StructTypeDef *def = const_cast<StructTypeDef *>(d);
+    intrusive_ptr<StructObject> obj;
+    if (out)
+        obj = make_intrusive<StructObject>(def);  /* POD: zeroed bytes */
+    if (def->is_pod()) {
+        if (out)
+            *out = EvalValue(std::move(obj));
+        return true;
+    }
+    if (out)
+        obj->fields.reserve(def->fields.size());
+    for (const FieldDef &fd : def->fields) {
+        EvalValue v;
+        bool ok = true;
+        if (!fd.is_opt) {
+            TypeAnnot k;
+            switch (fd.kind) {
+            case FieldKind::f_bool:  k.kind = DeclType::b; break;
+            case FieldKind::f_int:   k.kind = DeclType::i; break;
+            case FieldKind::f_float: k.kind = DeclType::f; break;
+            case FieldKind::f_str:   k.kind = DeclType::s; break;
+            case FieldKind::f_array: k.kind = DeclType::arr; break;
+            case FieldKind::f_dict:  k.kind = DeclType::dict; break;
+            case FieldKind::f_dyn:   k.kind = DeclType::dyn; break;
+            case FieldKind::f_box:   k.kind = DeclType::box; break;
+            case FieldKind::f_struct:
+                k.kind = DeclType::strct;
+                k.strct = fd.struct_def;
+                break;
+            }
+            /* a parameterized container or a box has its type in annot */
+            const TypeAnnot *fa =
+                fd.annot && (fd.kind == FieldKind::f_array
+                             || fd.kind == FieldKind::f_dict
+                             || fd.kind == FieldKind::f_box)
+                    ? fd.annot.get() : &k;
+            ok = annot_zero_value(fa, out ? &v : nullptr, depth + 1);
+        }
+        if (!ok)
+            return false;
+        if (out)
+            obj->fields.emplace_back(std::move(v), false);
+    }
+    if (out)
+        *out = EvalValue(std::move(obj));
+    return true;
+}
+
 namespace {
 
 /* an int or a bool into a float place is a float, a bool into an int

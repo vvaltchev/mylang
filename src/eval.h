@@ -796,6 +796,14 @@ EvalValue ct_fit(const TypeAnnot *a, EvalValue v, bool dict,
 EvalValue ct_fit_value(const EvalValue &c, EvalValue v,
                        Loc s = Loc(), Loc e = Loc());
 EvalValue ct_fit_key(const DictObject &d, EvalValue key);
+/* the storage a parsed `array<...>` annotation gives an array (`sd`: the
+ * POD struct a flat_s array needs) - types/fit.cpp.h */
+ArrHint annot_arr_hint(const TypeAnnot *a, const StructTypeDef *&sd);
+/* choice 6 (plans/strict-container-types.md): a FRESH zero value of the
+ * type `a`, what `T x;` gives, into `out` (null: only the answer); false
+ * when the type has none - a non-opt `dyn`, a struct reaching one, a
+ * struct field whose struct is a forward reference - types/fit.cpp.h */
+bool annot_zero_value(const TypeAnnot *a, EvalValue *out, int depth = 0);
 
 /*
  * RULE 1 (2026-10-05): a parameter not declared `opt` never holds `none`

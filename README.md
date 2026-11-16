@@ -768,7 +768,8 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     holding it is zero-initialized too, provided it is declared above the
     variable. One declared below the variable, or a non-`opt` `dyn` field
     (which has no zero value), gives no zero value: such a variable needs
-    an initializer, and without one it is a compile error.
+    an initializer, and without one it is a compile error. `array(n)` fills
+    its elements with the same zero values (see `array()`).
   * It works in a `for` initializer too: `for (int i = 0; i < n; i += 1) ...`.
 
 The type keywords are still ordinary identifiers everywhere else — `int(x)`,
@@ -3721,13 +3722,26 @@ it is the same in every run and in every engine.
 
 #### `array(N, [value])`
 Return an array with `N` elements. With a second argument, every element is
-`value` (a fixed value, not a callback). With **one** argument the fill is
-chosen by *type inference*: if the array's inferred element type is `int`,
-`float`, or `bool` (e.g. you later fill it with ints), unfilled elements are
-`0` / `0.0` / `false`; otherwise they are `none`. So `var a = array(3); a[0] =
-5;` yields `[5, 0, 0]`, while an array that stays untyped/dynamic yields all
-`none`. The element type also picks the internal storage: an `int`/`float`/`bool`
-array is a compact *flat* array (see `array_storage()`), anything else is
+`value` (a fixed value, not a callback). With **one** argument every element
+is the **zero value of the array's element type** - what a declaration with
+no initializer gives (`T x;`, see *Explicit type annotations*): `0`, `0.0`,
+`false`, `""`, a fresh `[]` / `{}` of the element's own type, a struct
+zero-initialized field by field, a fresh class instance, a box of its
+value's zero - each element a value of its own (`append(m[0], 5)` grows
+one element of an `array<array<int>>`). The element type is the one type
+inference finds for the array - the variable it is assigned to, declared
+or inferred from what the program later stores: `var a = array(3); a[0] =
+5;` yields `[5, 0, 0]`, `var s = array(2); s[0] = "x";` yields `["x", ""]`.
+A nullable element type (`array<int?>`, `array<dyn?>`) is filled with
+`none`, and so is an array whose element type nothing decides (one nothing
+is stored into, one made where `dyn` is declared - `var dyn d =
+array(2)` - or any array with type inference disabled, `-nti`). An element
+type with no zero value - a non-`opt` `dyn`, a struct with a non-`opt`
+`dyn` field, a struct field whose struct is declared further down - is a
+compile error: give a fill value, `array(n, v)`, or make the element type
+nullable. The element type also picks the internal storage: an
+`int`/`float`/`bool` array is a compact *flat* array (see
+`array_storage()`), and so is an array of a POD struct; anything else is
 general. To build each element from its index, use `make_array()`.
 
 (`array()` is a *non-const* builtin: a call like `array(1000000)` is never

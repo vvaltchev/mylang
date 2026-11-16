@@ -16,7 +16,12 @@
 #include <algorithm>
 
 /*
- * array(N)        -> N elements of `none` (general storage).
+ * array(N)        -> N elements of the element type's ZERO VALUE - the
+ *                    type the compiler made the array for (its ctype, the
+ *                    variable it is assigned to), each one fresh (choice 6,
+ *                    plans/strict-container-types.md); `none` when that type
+ *                    is nullable or nothing typed it (an unfilled array,
+ *                    -nti).
  * array(N, value) -> N elements all equal to `value`. The fill value drives the
  *                    storage (value-driven, see plans/archived/typed-arrays.md): an int
  *                    -> flat int, a float -> flat float, else general. For a
@@ -67,6 +72,28 @@ EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
                 filled<SharedArrayObj::fvec_type>(n, 0.0, arg));
         if (hint == ArrHint::flat_b)
             return SharedArrayObj(filled<SharedArrayObj::bvec_type>(n, 0, arg));
+
+        /* the element type's zero value, a fresh one per element (a
+         * container, a struct, a box is a value of its own); the
+         * compiler refused an element type that has none */
+        const TypeAnnot *ea = exprList->ctype
+            ? exprList->ctype->elem.get() : nullptr;
+        if (ea && !ea->opt && ea->kind != DeclType::dyn) {
+            std::vector<EvalValue> zs;
+            reserve_or_oom(zs, static_cast<uint64_t>(n), arg);
+            for (int_type i = 0; i < n; i++) {
+                EvalValue z;
+                if (!annot_zero_value(ea, &z))  /* INT-COV-EXEMPT: refused */
+                    break;
+                zs.push_back(std::move(z));
+            }
+            if (zs.size() == static_cast<size_t>(n)) {
+                const StructTypeDef *sd = nullptr;
+                const ArrHint h = annot_arr_hint(exprList->ctype, sd);
+                return build_array_from_values(zs.data(), zs.size(), h, sd,
+                                               ctx->const_ctx);
+            }
+        }
 
         SharedArrayObj::vec_type vec;
         reserve_or_oom(vec, static_cast<uint64_t>(n), arg);

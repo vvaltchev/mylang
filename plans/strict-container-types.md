@@ -296,10 +296,26 @@ prints `0`. Choice 6 fixes it.
 
 ## 9. Increments
 
-1. Rule 3 for variables, fields and `runtime()`; choice 5.
-2. Choice 6 (`array(n)`'s zero values) and choice 7.
+1. Rule 3 for variables, fields and `runtime()`; choices 5 and 8. DONE
+   2026-11-20.
+2. Choice 6 (`array(n)`'s zero values). DONE 2026-11-20. Measured: one
+   `-rt` case refused (`func f(n) { var a = array(8); ... a[1] += n; }`
+   called with `runtime(4)`: the instance's elements are `dyn`, which has
+   no zero value - it now writes `array(8, false)`); every corpus
+   program compiles. In a template's BASE body (not checked in
+   isolation) an element type with no zero value makes the array
+   untyped and none-filled instead of a refusal. Left for increment 3:
+   an `array(n)` no VARIABLE types - returned from a function, then
+   filled by the caller (`func mk(n) => array(n); var q = mk(2); q[0] =
+   "s";`) - is still filled with none and typed `array<str>` by the
+   caller's store, the three-engine divergence above (the tree-walker's
+   caret, -nj's caret-less TypeErrorEx, the JIT's 0). Its fix is the
+   NULLABLE unfilled element type that choice 7 introduces: such an
+   array is an `array<dyn?>` until a variable types it.
 3. Rule 1: element contributions, fresh containers, exact assignment;
-   decision A's `ct_enters` loses the `dyn` component's tolerance.
+   decision A's `ct_enters` loses the `dyn` component's tolerance; and
+   choice 7 (moved here from increment 2: it is an element
+   contribution rule).
 4. Rule 4 (storage follows the type), rule 5 (bare annotations are
    holes), rule 6 (`none` keys - already work, gets a test).
 5. Rule 8.
