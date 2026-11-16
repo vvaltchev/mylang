@@ -1286,7 +1286,10 @@ with the note shown above.
     looked-up with `get()`/`get!()`/`find()`, and deleted with `erase()`. **Any
     hashable value can be a key** — strings, ints, floats, `bool`, `none`, and
     (by value) arrays, dicts and structs (e.g. `d[[1,2]]`, `d[Point(1,2)]`),
-    since `hash()` is total. A container key is **frozen** (snapshotted deeply
+    since `hash()` is total. A `none` key needs a dict whose keys may be
+    none (`dict<int?, ...>`, `dict<dyn?, ...>`, or an inferred one a
+    `none` key went into): into a `dict<int, ...>` a key that may be
+    `none` is a compile error. A container key is **frozen** (snapshotted deeply
     read-only) when inserted, so mutating the original afterwards cannot corrupt
     the dict; a key that contains itself is frozen with its cycle (see
     *Values that contain themselves* below). **Perks**: identifier-like

@@ -5434,7 +5434,7 @@ bools correctly yields int). `Construct`/`Identifier`/`Subscript`
 GENERAL array's element too (`general_elem_int`, eval.h, which every
 engine's element-int read calls, and its float twin `general_elem_float`
 for a typed float chain's int or bool operand): an `array<bool>` is not
-always flat (an inline `keys()` of a `dict<bool, ...>`), and
+always flat (an `array<bool>` a `dyn` laundered, a constant's), and
 `if (b[i])` on a general one raised TypeErrorEx in every engine until
 2026-11-07 (`x * b[i]` in the tree-walker alone).
 **⛔ SO `th == i` DOES NOT MEAN "int" - IT ALSO MEANS BOOL, AND A
@@ -7255,8 +7255,12 @@ per level of a deep value - a separate open item.
   `make_array`, `keys`/`values` (`dict_extract` — a scalar dict's keys/values
   build a flat `array<int>/<float>/<bool>` straight from the dict, no
   per-element boxing; the big win for `keys()`/`values()` of a large dict, and
-  why `bench/27_dict_keys_values` beats CPython — only the bound form
-  `var k = keys(d)` gets the hint, an inline `keys(d)` arg stays general),
+  why `bench/27_dict_keys_values` beats CPython — the bound form
+  `var k = keys(d)` takes the variable's hint (`set_array_repr_hint`), and
+  since rule 4 (2026-11-21, plans/strict-container-types.md) every other
+  position - an argument, a result, a field, an element - takes the hint
+  of the type the call has there (`stamp_ctypes`), so an `array<int>` is
+  flat wherever it is made; an inline `keys(d)` was general),
   `LiteralArray::do_eval`, and - for a value baked at parse time, a
   `LiteralObj` - the compiler itself: it REBUILDS the baked value in the
   hinted storage (`widen_baked_value`, from `set_array_repr_hint`, the
@@ -7549,8 +7553,9 @@ per level of a deep value - a separate open item.
   every engine and the `.myv` already carry into `ArgLocs`, and `sum`
   reads it for nothing else); unstamped, flat numeric STORAGE decides the
   same way, and anything else raises `InvalidArgumentEx`. Storage alone
-  cannot answer - `keys(d)` of an empty `dict<int,int>` is a GENERAL
-  array. The seed is `sum_seed`, which also turns a one-term bool sum
+  could not answer: `keys(d)` of an empty `dict<int,int>` was a GENERAL
+  array inline (flat since rule 4, 2026-11-21 - the static stamp stays,
+  since a `-nti` run's storage follows nothing). The seed is `sum_seed`, which also turns a one-term bool sum
   into the `int` its static type says.)
 - **Getting a mutable copy of a const: `clone()` vs `deepclone()`.** Two helpers
   in `eval.cpp` make mutable copies (scalars/strings returned as-is):

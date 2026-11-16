@@ -395,5 +395,15 @@ prints `0`. Choice 6 fixes it.
    statically (it matched any array there - fixed the same day; only a
    place's top-level generic `array` is a hole).
 4. Rule 4 (storage follows the type), rule 5 (bare annotations are
-   holes), rule 6 (`none` keys - already work, gets a test).
+   holes), rule 6 (`none` keys - already work, gets a test). Rules 4 and
+   6 DONE 2026-11-21: a builtin's new container takes the storage of the
+   type it has where it is made, not only as a variable's right-hand
+   side (an inline `keys(d)` of a dict<int, int> was a general
+   array<int>; tests/functional/134); `none` keys work in every engine
+   (tests/functional/135), and a key that may be none into a dict whose
+   keys may not is a compile-time NullabilityEx, as a value is (choice
+   11) - it was a run-time fit failure for a literal `none`, and a
+   TypeMismatchEx about the dict's type for a `dyn?`. Not done: making
+   the invariant a CHECK (the JIT does not yet rely on it - #97's
+   order), and rule 5.
 5. Rule 8.

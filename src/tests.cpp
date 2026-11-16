@@ -2651,6 +2651,17 @@ static const std::vector<test> tests =
       { "var s = 0; var dyn? d = runtime(none);", "s = d;",
         "print(s + 1);" },
       &typeid(NullabilityEx), 7, 3, 13, 3 },
+    /* rule 6: `none` is a key only of a dict whose keys may be none -
+     * a literal none key and a possibly-none one are refused at compile
+     * time (the first was a run-time fit failure, the second a
+     * TypeMismatchEx about the dict's type) */
+    { "rule 6: a none key into a dict<int, int> is refused",
+      { "dict<int, int> h = {};", "h[none] = 1;" },
+      &typeid(NullabilityEx), 1, 2, 3, 2 },
+    { "rule 6: a dyn? key into a dict<int, int> is refused",
+      { "dict<int, int> h = {};", "var dyn? k = runtime(none);",
+        "h[k] = 1;" },
+      &typeid(NullabilityEx), 1, 3, 3, 3 },
     { "rule 1: an alias that a store would widen is refused at the alias",
       { "var a = [1, 2];", "var b = a;", "b[0] = \"s\";" },
       &typeid(TypeMismatchEx), 9, 2, 11, 2 },
@@ -15976,7 +15987,9 @@ static const std::vector<test> tests =
             "var e = a[1:1];",
             "assert(sum(e) == 0);",
             "dict<int, int> d = {};",
-            "assert(array_storage(keys(d)) == \"general\");",
+            /* (an inline keys(d) is flat since rule 4: its storage
+             * follows its type) */
+            "assert(array_storage(keys(d)) == \"int\");",
             "assert(sum(keys(d)) + 3 == 3);",
             "assert(sum(ei, func(int x) => x * 2.5) + 1.0 == 1.0);",
             "var k = sum(ei, func(int x) => x > 1);",
