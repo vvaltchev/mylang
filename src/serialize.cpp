@@ -1922,15 +1922,12 @@ void read_chunk(Reader &r, Chunk &c)
         for (uint32_t j = 0; j < m; j++) {
             v.push_back(r.strv());
             Chunk::CatchKey key;
-            const uint32_t si = r.u32v();
-            if (si != 0xffffffffu) {
-                if (si >= r.structs.size())
-                    bad_image("corrupt .myv (catch struct)");
-                key.def = r.structs[si];
-            }
+            const uint32_t si =
+                r.idx_opt(r.structs.size(), "corrupt .myv (catch struct)");
+            key.def = si == 0xffffffffu ? nullptr : r.structs[si];
             /* the derived half (what codegen derives from the name) */
             key.uid = UniqueId::get(v.back());
-            key.builtin = !key.def && is_catchable_ex_name(v.back());
+            key.builtin = is_catchable_ex_name(v.back());
             u.push_back(key);
         }
         c.catch_types.push_back(std::move(v));

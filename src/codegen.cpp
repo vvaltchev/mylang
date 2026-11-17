@@ -8026,15 +8026,17 @@ struct Codegen {
             if (cs.first.exList) {
                 std::vector<std::string> names;
                 std::vector<Chunk::CatchKey> keys;
-                const auto &defs = cs.first.defs;
                 const auto &ids = cs.first.exList->elems;
+                /* one def per name; none at all for a tree no inference
+                 * walked (a test compiling a parsed block), padded here */
+                std::vector<const StructTypeDef *> defs = cs.first.defs;
+                defs.resize(ids.size());
                 for (size_t k = 0; k < ids.size(); k++) {
                     names.push_back(std::string(ids[k]->get_str()));
                     Chunk::CatchKey key;
                     key.uid = ids[k]->uid;
-                    key.def = k < defs.size() ? defs[k] : nullptr;
-                    key.builtin = !key.def
-                                  && is_catchable_ex_name(names.back());
+                    key.def = defs[k];
+                    key.builtin = is_catchable_ex_name(names.back());
                     keys.push_back(key);
                 }
                 types_idx = static_cast<int>(chunk.catch_types.size());

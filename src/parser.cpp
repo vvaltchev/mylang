@@ -5822,10 +5822,13 @@ pAcceptTryCatchStmt(ParseContext &c, unique_ptr<Construct> &ret, unsigned fl)
             throw SyntaxErrorEx(c.get_loc(), "Expected { } block, got", &c.get_tok());
         c.shadow_pop();
 
-        stmt->catchStmts.emplace_back(
-            AllowedExList{std::move(exList), std::move(asId), {}},
-            std::move(body)
-        );
+        /* (filled in place: a temporary AllowedExList leaves a
+         * conditional cleanup per member, branches no run takes) */
+        stmt->catchStmts.emplace_back();
+        auto &clause = stmt->catchStmts.back();
+        clause.first.exList = std::move(exList);
+        clause.first.asId = std::move(asId);
+        clause.second = std::move(body);
     };
 
     if (pAcceptKeyword(c, Keyword::kw_finally)) {

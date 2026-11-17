@@ -17,6 +17,7 @@
 #include "reflect.h"      /* reflect_decl_annot (the fit_specs dump) */
 #include "inferencer.h"   /* for_each_child_of (the complete walker) */
 
+#include <algorithm>
 #include <sstream>
 #include <iomanip>
 #include <vector>
@@ -286,15 +287,12 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
                 const StructTypeDef *d = ch.catch_keys[i][j].def;
                 if (!d)
                     continue;
-                size_t k = 0;
-                while (k < g_dis_structs.size() && g_dis_structs[k] != d)
-                    k++;
-                s << " (struct #";
-                if (k < g_dis_structs.size())
-                    s << k;
-                else
-                    s << "?";
-                s << ")";
+                /* its index in the struct table (a def the table lacks
+                 * would print the table's size: one past its last) */
+                s << " (struct #"
+                  << (std::find(g_dis_structs.begin(), g_dis_structs.end(),
+                                d) - g_dis_structs.begin())
+                  << ")";
             }
             s << "\n";
         }

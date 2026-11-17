@@ -1003,6 +1003,9 @@ static const std::vector<test> tests =
     { "catch: `catch (dyn` needs `as` and a name",
       { "try { } catch (dyn) { }" },
       &typeid(SyntaxErrorEx) },
+    { "catch: `catch (dyn as` needs a name",
+      { "try { } catch (dyn as) { }" },
+      &typeid(SyntaxErrorEx) },
     { "catch: the fallback `catch (dyn as e)` comes last",
       { "try { } catch (dyn as e) { } catch (TypeErrorEx) { }" },
       &typeid(SyntaxErrorEx) },
@@ -1033,6 +1036,21 @@ static const std::vector<test> tests =
         "var got = 0;",
         "try { thr(); } catch (T as e) { got = e.v; }",
         "assert(got == 4 && f() == 4);" } },
+    /* ...and so has the variable of a clause naming one struct twice,
+     * by its name and through an alias */
+    { "catch: a struct and its alias are one type for the variable",
+      { "struct E { int v; }",
+        "const T = E;",
+        "try { throw E(runtime(1)); }",
+        "catch (E, T as e) { print(e.nope); }" },
+      &typeid(TypeMismatchEx), 27, 4, 34, 4 },
+    /* a parameter named like the STRUCT hides the struct, as in a type
+     * position (the parser lets the name by: only the inferencer knows
+     * what it resolves to where the clause is written) */
+    { "catch: a parameter named like the struct hides it",
+      { "struct S { int v; }",
+        "func f(S) { try { } catch (S) { } }" },
+      &typeid(SyntaxErrorEx), 28, 2, 30, 2 },
     { "catch: a hidden alias is no type",
       { "struct S { int v; }",
         "const T = S;",
@@ -23549,7 +23567,13 @@ static const std::vector<repl_test> repl_tests =
         { "struct L25 { int v; }", "" },
         { "func g25() { throw L25(int(runtime(5))); }", "" },
         { "f25()", "=> 5" },
-        { "try { g25(); } catch (dyn as e) { print(e); }", "L25(v: 5)" } } },
+        { "try { g25(); } catch (dyn as e) { print(e); }", "L25(v: 5)" },
+        /* the fallback as :tree and :show print it */
+        { ":tree try { g25(); } catch (dyn as e) { print(e); }",
+          "Catch( <anything> as e ) (" },
+        { "func sh25() { try { g25(); } catch (dyn as e) { return e.v; } "
+          "return 0; }", "" },
+        { ":show sh25", "} catch (dyn as e) {" } } },
     /* a clause through an alias names the alias's struct: a parameter
      * named like the struct does not hide it, a redefined struct of that
      * name is another type (the clause used to be rewritten to the
