@@ -101,5 +101,60 @@ try {
 } catch (dyn as e) { got = "outer " + str(e); }
 want("builtin's name, boxed", got, "outer box(TypeErrorEx(z: 9))");
 
+# A call the COMPILER runs catches as the same call does at run time
+# (README, *A call at compile time computes what it computes at run
+# time*): by identity. The clauses below are resolved while compiling,
+# with no inferred program to ask, and used to compare names there.
+pure func p_thr(n) { struct PErr { int code; } throw PErr(n); }
+# PErr is declared below the constant, so nothing thrown now can be one
+pure func p_later(n) {
+    try { p_thr(n); } catch (PErr) { return "named"; }
+    catch (dyn as e) { return "fallback " + str(e.code); }
+    return "none";
+}
+const C_LATER = p_later(7);
+struct PErr { bool ok; }
+want("compile time, declared below", C_LATER, "fallback 7");
+want("run time, declared below", p_later(rt(7)), "fallback 7");
+# its own PErr2, declared after the try in the same block
+pure func p_own(n) {
+    try { p_thr2(n); } catch (PErr2) { return "named"; }
+    catch (dyn as e) { return "fallback " + str(e.code); }
+    struct PErr2 { str s; }
+    return "none";
+}
+pure func p_thr2(n) { struct PErr2 { int code; } throw PErr2(n); }
+const C_OWN = p_own(8);
+want("compile time, own struct", C_OWN, "fallback 8");
+want("run time, own struct", p_own(rt(8)), "fallback 8");
+# the struct it names, thrown as a constant no function constructs; a
+# built-in exception; a private struct named like a built-in one
+struct CErr { int v; }
+const C_VAL = CErr(5);
+pure func p_val(n) { if (n > 0) throw C_VAL; return 0; }
+pure func p_named(n) {
+    try { p_val(n); } catch (CErr as e) { return "named " + str(e.v); }
+    catch { return "all"; }
+    return "none";
+}
+pure func p_div(n) {
+    try { return str(10 / n); } catch (DivisionByZeroEx) { return "div"; }
+}
+pure func p_odd(n) { struct TypeErrorEx { int z; } throw TypeErrorEx(n); }
+pure func p_builtin(n) {
+    try { p_odd(n); } catch (TypeErrorEx) { return "wrong"; }
+    catch (dyn as e) { return "fallback " + str(e.z); }
+    return "none";
+}
+const C_NAMED = p_named(1);
+const C_DIV = p_div(0);
+const C_BUILTIN = p_builtin(6);
+want("compile time, named", C_NAMED, "named 5");
+want("run time, named", p_named(rt(1)), "named 5");
+want("compile time, built-in", C_DIV, "div");
+want("run time, built-in", p_div(rt(0)), "div");
+want("compile time, built-in's name", C_BUILTIN, "fallback 6");
+want("run time, built-in's name", p_builtin(rt(6)), "fallback 6");
+
 assert(bad == 0);
 print("ok");

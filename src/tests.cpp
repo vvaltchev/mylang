@@ -31332,6 +31332,58 @@ static bool parse_time_typed_runs()
             "const F = pick(true);",
             "print(F(5), F(int(runtime(5))));" },
           "5.000000 5.000000 \n", true, true },
+        /* question 25: a constant call catches a struct by identity, as
+         * the same call does at run time. PE is declared below the
+         * constant, so the function's private PE thrown now is not one */
+        { "a catch clause naming a struct declared below the call", {
+            "pure func thr(n) { struct PE { int c; } throw PE(n); }",
+            "pure func f(n) {",
+            "  try { thr(n); } catch (PE) { return 1; } catch { return 2; }",
+            "  return 0; }",
+            "const K = f(1);",
+            "struct PE { bool ok; }",
+            "print(K, f(int(runtime(1))));" },
+          "2 2 \n", true, false },
+        /* ...and the struct only the clause names is declared in the
+         * copy (pt_collect), or the clause would catch nothing there */
+        { "a catch clause naming a struct nothing else in the call names", {
+            "struct CE { int v; }",
+            "const CV = CE(5);",
+            "pure func thr(n) { if (n > 0) { throw CV; } return 0; }",
+            "pure func f(n) {",
+            "  try { thr(n); } catch (CE as e) { return e.v; }",
+            "  catch { return -1; }",
+            "  return 0; }",
+            "const K = f(1);",
+            "print(K, f(int(runtime(1))));" },
+          "5 5 \n", true, false },
+        /* an UNTYPED run (this result holds a function, so the typed
+         * copy's run is discarded) has no inferred clause to ask: the
+         * name is resolved in the const scope where the clause runs */
+        { "a catch clause in a call that runs untyped", {
+            "struct CE { int v; }",
+            "const CV = CE(5);",
+            "pure func thr(n) { if (n > 0) { throw CV; } return 0; }",
+            "pure func one(x) => x + 1;",
+            "pure func two(x) => x + 2;",
+            "pure func pick(n) {",
+            "  try { thr(n); } catch (CE as e) { return one; }",
+            "  catch { return two; }",
+            "  return two; }",
+            "const F = pick(1);",
+            "print(F(1), pick(int(runtime(1)))(1));" },
+          "2 2 \n", true, true },
+        /* a built-in exception's name: a parameter or a const scalar of
+         * that name is no struct, so the name still means the exception */
+        { "a built-in name a parameter and a const also have", {
+            "const KeyNotFoundEx = 3;",
+            "pure func f(TypeErrorEx) {",
+            "  try { return 10 / TypeErrorEx; }",
+            "  catch (TypeErrorEx, KeyNotFoundEx) { return -1; }",
+            "  catch (DivisionByZeroEx) { return -2; } }",
+            "const K = f(0);",
+            "print(K, f(int(runtime(0))));" },
+          "-2 -2 \n", true, false },
         /* the typed copy's own type error is the program's compile error,
          * with the program's caret */
         { "a type error in the body is a compile error", {

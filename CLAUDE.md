@@ -8055,10 +8055,20 @@ and two macros:
   declares yet, which matches by name; in a script such a name is a
   compile error. So a function's private struct is caught outside it only
   by a catch-all, and `catch (dyn as e)` is the catch-all that binds (no
-  exList, an asId). **A built-in name catches no struct OBJECT, a
-  `box<P>` included** (`exc_struct_def`'s `is_struct`; a box, which a
-  `dyn` can throw, has a null def and compared its struct's name until
-  2026-11-17). `catch (T as e)` binds `e` to the
+  exList, an asId). Two rules the first version got wrong (2026-11-17):
+  **a built-in name catches no struct OBJECT, a `box<P>` included**
+  (`exc_struct_def`'s `is_struct`; a box, which a `dyn` can throw, has a
+  null def and compared its struct's name); and **a call the COMPILER
+  runs catches by identity too**: a function run
+  at parse time may not have been through the inferencer (an untyped run,
+  `-nti`, a name a typed copy does not declare), so `do_catch` resolves a
+  clause with no def in the const scope chain where it runs
+  (`const_scope_struct` - that chain is the lexical one), and a name bound
+  to no struct there catches nothing: its struct is declared further
+  down, so no instance exists yet. It compared names, so `const K = f(1)`
+  caught another function's private struct where `f(runtime(1))` did not.
+  `pt_collect` declares a clause's struct in a typed copy, whose own
+  inference then resolves it. `catch (T as e)` binds `e` to the
   **struct instance** (`exObj->get_data()`, so `e.field` works) when the
   exception carries one, else to a fresh `ExceptionObject` wrapper (the
   payload-less built-in case — printable/re-throwable). The catch variable
