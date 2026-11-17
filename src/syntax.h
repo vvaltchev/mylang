@@ -659,6 +659,16 @@ public:
      */
     bool unpacked = false;
 
+    /*
+     * A declaration's annotation gives this literal its element type
+     * (`array<dyn> a = [1, 2.5, true]`): the const evaluator builds it
+     * as that type says (elem_coerce), never by the join of its own
+     * values - joined, the parse-time bake held 1.0 and 1.0 where the
+     * same literal built at run time (-nc) held 1 and true (RULE 2).
+     * Stamped by the parser (stamp_literal_annot), before the bake.
+     */
+    bool annotated = false;
+
     LiteralArray()
         : MultiElemConstruct<>("LiteralArray",
                                ConstructType::lit_arr) { }
@@ -670,6 +680,7 @@ public:
         clone_elems_into(*c);
         c->elem_coerce = elem_coerce;
         c->unpacked = unpacked;
+        c->annotated = annotated;
         return c;
     }
 };
@@ -786,6 +797,7 @@ public:
      * elem_coerce (keys are left as written) */
     DeclType val_coerce = DeclType::none;
     DeclType key_coerce = DeclType::none;   /* the same, for the keys */
+    bool annotated = false;     /* as LiteralArray's, keys and values */
 
     LiteralDict()
         : MultiElemConstruct<LiteralDictKVPair>(
@@ -798,6 +810,7 @@ public:
         clone_elems_into(*c);
         c->val_coerce = val_coerce;
         c->key_coerce = key_coerce;
+        c->annotated = annotated;
         return c;
     }
 };

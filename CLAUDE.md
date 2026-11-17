@@ -5264,6 +5264,18 @@ decisions behind it: `plans/archived/type-inference.md`,
   decl_type there too - the one resolve_names carries from the
   declaration, later. A local whose type
   only INFERENCE widens still differs there (an open design question).
+  **And the parse-time BAKE follows the annotation too (2026-11-17):**
+  the const evaluator builds a constant literal with no stamp by the
+  JOIN of its own values (`const_values_widen`), so `array<dyn> k = [1,
+  2.5, true]` was baked as 1.0, 2.5, 1.0 while -nc built 1, 2.5, true
+  (RULE 2), and a const - baked in both modes - widened everywhere.
+  pExpr14 now calls `stamp_literal_annot` BEFORE the bake as well, and a
+  literal whose element type the annotation gives
+  (`LiteralArray::annotated`, `LiteralDict::annotated`) never joins:
+  elem_coerce decides. The inference twin: a literal nested in a `dyn`
+  element is no longer stamped from the `dyn` (which converts nothing)
+  but by annotate_hints' visit of it, at its OWN type - as a literal in
+  a `dyn` variable is (tests/functional/127).
   Built from its own values, `[1.5]`
   for an `array<float?>` was flat floats and a later `none` store failed.
   **A store into a DECLARED place is checked against it (#48):**

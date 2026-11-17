@@ -3559,8 +3559,12 @@ void Inferencer::stamp_literal_coerce(Construct *n, StaticTypeRef t)
         : el->kind == StaticTypeKind::Int ? DeclType::i
         : DeclType::none;
     const auto nested = [&](Construct *c) {
-        if (el && c && (ctag(c) == ConstructType::lit_arr
-                        || ctag(c) == ConstructType::lit_dict)) {
+        /* a literal in a `dyn` element holds its values at its OWN type
+         * (annotate_hints' visit of it), as one in a `dyn` variable does:
+         * `[[1, 2.5], [true]]` for an array<dyn> holds 1.0 and true */
+        if (el && c && el->kind != StaticTypeKind::Dyn
+                && (ctag(c) == ConstructType::lit_arr
+                    || ctag(c) == ConstructType::lit_dict)) {
             lit_coerce_by_parent.insert(c);
             stamp_literal_coerce(c, el);
         }

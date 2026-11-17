@@ -1034,12 +1034,14 @@ static void stamp_literal_annot(Construct *lit, const TypeAnnot *a, bool dyn)
         auto *la = static_cast<LiteralArray *>(lit);
         la->arr_hint = annot_arr_hint(a, la->arr_hint_struct);
         la->elem_coerce = annot_num(a->elem.get());
+        la->annotated = a->elem != nullptr;
         for (auto &el : la->elems)
             stamp_literal_annot(el.get(), a->elem.get(), false);
     } else if (t == ConstructType::lit_dict && a->kind == DeclType::dict) {
         auto *ld = static_cast<LiteralDict *>(lit);
         ld->key_coerce = annot_num(a->key.get());
         ld->val_coerce = annot_num(a->val.get());
+        ld->annotated = a->key != nullptr && a->val != nullptr;
         for (auto &kv : ld->elems)
             stamp_literal_annot(kv->value.get(), a->val.get(), false);
     } else if (t == ConstructType::lit_obj
@@ -2973,6 +2975,17 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
      * evaluation of it must not widen it (LiteralArray::unpacked) */
     if (in_idlist && ctag(ret->rvalue.get()) == ConstructType::lit_arr)
         static_cast<LiteralArray *>(ret->rvalue.get())->unpacked = true;
+
+    /* a literal the declaration annotates is built as the annotation
+     * says by the bake below too, not by the join of its own values
+     * (LiteralArray::annotated) - stamped again after it, for a value
+     * another site baked */
+    if ((fl & pFlags::pInDecl) && !in_idlist
+            && (ctag(ret->rvalue.get()) == ConstructType::lit_arr
+                || ctag(ret->rvalue.get()) == ConstructType::lit_dict))
+        if (auto *did = node_cast<Identifier>(ret->lvalue.get()))
+            stamp_literal_annot(ret->rvalue.get(), did->decl_annot.get(),
+                                did->dyn_mod);
 
     /*
      * Materialize a const rvalue - unless it is ALREADY a LiteralObj, i.e. a
