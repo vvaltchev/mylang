@@ -5,5 +5,7 @@
 # values. The functional program runs as a coverage unit too, under the
 # engines above, with no second copy (INT-SOURCE); it asserts its own
 # results and every engine must print the same. It owns the refusals of
-# a store and an append of a box into a flat array<P> through a `dyn`
-# name, which no other unit reaches.
+# a store and an append of a box, another struct or an int into an
+# UNTYPED flat array of P values (one only a `dyn` element reaches - a
+# typed one is guarded by its own type first), which no other unit
+# reaches.

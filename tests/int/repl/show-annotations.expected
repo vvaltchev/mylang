@@ -19,4 +19,5 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
     *bx = *bx + 1;
     return q.x + (r?.y ?? 0) + *bx + len(oa ?? []) + len(od ?? {}) + w.p.y;
 }
+>> >> .. .. .. >> => 1
 >> 

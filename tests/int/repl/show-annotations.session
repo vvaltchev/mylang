@@ -2,9 +2,9 @@
 # with box, optional parameterized, opt dyn, struct and opt array
 # fields, and locals typed with a struct, an opt struct, a box and
 # optional parameterized containers.
-# What the unit OWNS is in the inferencer: `od`, a declared dict whose
-# literal's value is a parameter still untyped in the first round, is
-# has_unknown's dict-value arm.
+# What the unit OWNS is in the inferencer: `od2` below, a declared dict
+# whose literal's KEY is a parameter still untyped in the first round, is
+# has_unknown's dict-key arm.
 struct P { int x; int y; }
 func h(int k) {
     struct Q {
@@ -22,3 +22,9 @@ func h(int k) {
 }
 h(runtime(2))
 :show h
+# ...and `od2`, whose literal's KEY is that parameter, is the key arm
+func hk(int k) {
+    dict<int, int>? od2 = k > 1 ? {k: 1} : none;
+    return len(od2 ?? {});
+}
+hk(runtime(2))

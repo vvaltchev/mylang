@@ -33,6 +33,29 @@ assert(refused == 2);
 assert(array_storage(flat) == "struct" && len(flat) == 2);
 assert(flat[0].x == 1 && flat[1].x == 5);
 
+# an UNTYPED flat array of P values - one only a `dyn` element reaches,
+# so it has no type of its own to check against (README, "A container
+# keeps its type") - is guarded by its storage: a box of a P, another
+# struct and an int are refused by the store and the append, the array
+# left as it was, and a P value still packs in
+struct Q { int x; int y; }
+array<dyn> nest = [[P(1, 2), P(5, 6)]];
+var dyn un = nest[0];
+assert(array_storage(un) == "struct");
+refused = 0;
+try { un[0] = b; } catch (TypeErrorEx) { refused++; }
+try { append(un, b); } catch (TypeErrorEx) { refused++; }
+try { un[1] = Q(1, 1); } catch (TypeErrorEx) { refused++; }
+try { append(un, Q(1, 1)); } catch (TypeErrorEx) { refused++; }
+try { un[1] = 7; } catch (TypeErrorEx) { refused++; }
+try { append(un, 7); } catch (TypeErrorEx) { refused++; }
+try { un[0] += P(1, 1); } catch (TypeErrorEx) { refused++; }
+assert(refused == 7);
+assert(len(un) == 2 && un[0].x == 1 && array_storage(un) == "struct");
+append(un, P(9, 9));
+un[0] = P(3, 3);
+assert(un[0].y == 3 && un[2].x == 9 && array_storage(un) == "struct");
+
 # insert promotes the array and keeps the reference
 var dyn g = [P(1, 2)];
 insert(g, 0, b);
