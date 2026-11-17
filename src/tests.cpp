@@ -1011,6 +1011,17 @@ static const std::vector<test> tests =
         "try { throw E(runtime(1)); }",
         "catch (E as e) { print(e.nope); }" },
       &typeid(TypeMismatchEx), 24, 3, 31, 3 },
+    /* a built-in exception's name catches no struct, and a box of a
+     * struct named like it (which a dyn can throw) is no exception to
+     * that: it compared the name whenever the struct was boxed */
+    { "catch: a built-in exception's name catches no boxed struct",
+      { "func odd() { struct TypeErrorEx { int z; }",
+        "             var dyn b = box(TypeErrorEx(int(runtime(9))));",
+        "             throw b; }",
+        "var got = \"\";",
+        "try { try { odd(); } catch (TypeErrorEx) { got = \"wrong\"; } }",
+        "catch (dyn as e) { got = str(e); }",
+        "assert(got == \"box(TypeErrorEx(z: 9))\");" } },
 
     { "multi-assign has no value: an assignment's value",
       { "var a = 0; var b = 0; var dyn w = 1;",
