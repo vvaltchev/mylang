@@ -20634,36 +20634,68 @@ const_eval_note_rule()
 /*
  * Question 25: a catch clause may name a built-in exception only if its
  * name is in is_catchable_ex_name's list (errors.h) - every other name
- * must be a struct in scope. So the list must spell each catchable class
- * exactly, and hold no uncatchable one: each class is constructed and its
- * own name asked.
+ * must be a struct in scope - and never an uncatchable one
+ * (is_uncatchable_ex_name). Both lists are checked against the exception
+ * CLASSES, each of which registers its name and catchability from its own
+ * declaration (ML_EX_REGISTER, TESTS builds): a new class missing from its
+ * list, a name with no class, a class in the wrong list all fail here. A
+ * macro class registers the catchability its BASE gives it, so it agrees
+ * with is_catchable() by construction; the classes declared by hand state
+ * theirs, so each is constructed and asked.
  */
 static bool
 catch_names_every_builtin_ex()
 {
-    const RuntimeException *catchable[] = {
-        new UnboundSymbolEx(), new InvalidArgumentEx(),
-        new InvalidNumberOfArgsEx(), new CannotChangeConstEx(),
-        new DivisionByZeroEx(), new StackOverflowEx(),
-        new OutOfMemoryEx(), new AssertionFailureEx(), new NotLValueEx(),
-        new TypeErrorEx(), new InvalidValueEx(), new NotCallableEx(),
-        new OutOfBoundsEx(), new KeyNotFoundEx(), new CannotOpenFileEx(),
-    };
-    const RuntimeException *uncatchable[] = {
-        new InternalErrorEx(), new CannotRebindConstEx(),
-        new CannotRebindBuiltinEx(),
-    };
     bool ok = true;
-    for (const RuntimeException *e : catchable) {
-        if (!e->is_catchable() || !is_catchable_ex_name(e->name)) {
-            cout << "catchable " << e->name << " not listed\n";
+    auto registered = [](const char *n, bool catchable) {
+        for (const ExTestClass &c : ex_test_classes())
+            if (c.catchable == catchable && std::string_view(c.name) == n)
+                return true;
+        return false;
+    };
+    for (const ExTestClass &c : ex_test_classes()) {
+        const bool listed = is_catchable_ex_name(c.name);
+        const bool refused = is_uncatchable_ex_name(c.name);
+        if (c.catchable && (!listed || refused)) {
+            cout << "catchable " << c.name << " not listed\n";
             ok = false;
         }
-        delete e;
+        if (!c.catchable && (listed || !refused)) {
+            cout << "uncatchable " << c.name << " not refused\n";
+            ok = false;
+        }
     }
-    for (const RuntimeException *e : uncatchable) {
-        if (e->is_catchable() || is_catchable_ex_name(e->name)) {
-            cout << "uncatchable " << e->name << " listed\n";
+    for (const char *n : catchable_ex_names)
+        if (!registered(n, true)) {
+            cout << "listed " << n << " is no catchable class\n";
+            ok = false;
+        }
+    /* "UndefinedVariable" is the name UndefinedVariableEx carries */
+    for (const char *n : uncatchable_ex_names)
+        if (!registered(n, false)
+            && !registered((std::string(n) + "Ex").c_str(), false)) {
+            cout << "refused " << n << " is no uncatchable class\n";
+            ok = false;
+        }
+    /* vacuity: the registry holds the classes of both lists */
+    const size_t n_classes = ex_test_classes().size();
+    if (n_classes < std::size(catchable_ex_names) + 4) {
+        cout << "only " << n_classes << " exception classes registered\n";
+        ok = false;
+    }
+    /* the hand-declared classes register what is_catchable() says */
+    const RuntimeException *probes[] = {
+        new OutOfMemoryEx(), new UndefinedVariableEx(""),
+    };
+    for (const RuntimeException *e : probes) {
+        const bool c = e->is_catchable();
+        bool found = false;
+        for (const ExTestClass &r : ex_test_classes())
+            found |= r.catchable == c
+                && (std::string_view(r.name) == e->name
+                    || std::string(r.name) == std::string(e->name) + "Ex");
+        if (!found) {
+            cout << e->name << " registers the wrong catchability\n";
             ok = false;
         }
         delete e;
