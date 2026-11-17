@@ -1779,9 +1779,13 @@ slot = "now a string";           # ok, because it's dyn
     included (a read of a missing key inserts it), and `a += b` checks
     and converts each element it appends against `a`'s type, however
     `a` was reached. A container made where `dyn` is declared
-    (`var dyn d = [1, 2]`, an element of an `array<dyn>`) is dynamic
-    and holds anything; so does one whose type nothing gave it (`[]`
-    that nothing filled, or one written where only a `dyn` was known).
+    (`var dyn d = [1, 2]`, an element of an `array<dyn>`) is dynamic:
+    its type refuses nothing; neither does one whose type nothing gave
+    it (`[]` that nothing filled, or one written where only a `dyn` was
+    known). Its STORAGE still holds only what it can (*Flat arrays*): a
+    literal nested in a `dyn` element and an array sum are built from
+    their own values, so `var dyn s = [1, 2] + [3];` is flat int
+    storage, which widens a `bool` and refuses a string.
 
     With type inference disabled (`-nti`) the parameter and constructor
     checks still run - the declaration alone decides them, as it does
