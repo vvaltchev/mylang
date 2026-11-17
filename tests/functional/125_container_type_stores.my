@@ -132,6 +132,14 @@ array<dyn> ad = [[1, none]];
 ad[0][0] = "x";
 assert(str(ad) == "[[\"x\", <none>]]");
 
+# an array of reflection values is an array<Type> - a type naming a
+# struct of the binary, which an image stores by its reserved number
+var ts = [type(1), type("s")];
+var dyn tsd = ts;
+var tr = 0;
+try { append(tsd, 5); } catch (TypeErrorEx) { tr++; }
+assert((!typed || tr == 1) && ts[1].kind == "str");
+
 # a container made where `dyn` is declared holds anything
 var dyn z = [1, 2];
 z[0] = "s";
