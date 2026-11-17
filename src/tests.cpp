@@ -31409,20 +31409,25 @@ static bool parse_time_typed_runs()
           "5 5 \n", true, false },
         /* an UNTYPED run (this result holds a function, so the typed
          * copy's run is discarded) has no inferred clause to ask: the
-         * name is resolved in the const scope where the clause runs */
+         * name is resolved in the const scope where the clause runs.
+         * Through an alias, which no name compare can match, and F is
+         * READ at compile time (`F == one` is folded): a call of F runs
+         * `pick` again, typed - `F(1)` in a copy, `F(x)` at run time,
+         * since a constant holding a function keeps its initializer. */
         { "a catch clause in a call that runs untyped", {
             "struct CE { int v; }",
             "const CV = CE(5);",
+            "const CT = CE;",
             "pure func thr(n) { if (n > 0) { throw CV; } return 0; }",
             "pure func one(x) => x + 1;",
             "pure func two(x) => x + 2;",
             "pure func pick(n) {",
-            "  try { thr(n); } catch (CE as e) { return one; }",
+            "  try { thr(n); } catch (CT as e) { return one; }",
             "  catch { return two; }",
             "  return two; }",
             "const F = pick(1);",
-            "print(F(1), pick(int(runtime(1)))(1));" },
-          "2 2 \n", true, true },
+            "print(F == one, F == two, pick(int(runtime(1)))(1));" },
+          "true false 2 \n", false, true },
         /* a built-in exception's name: a parameter or a const scalar of
          * that name is no struct, so the name still means the exception */
         { "a built-in name a parameter and a const also have", {
