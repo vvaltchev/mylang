@@ -20670,13 +20670,19 @@ catch_names_every_builtin_ex()
             cout << "listed " << n << " is no catchable class\n";
             ok = false;
         }
-    /* "UndefinedVariable" is the name UndefinedVariableEx carries */
-    for (const char *n : uncatchable_ex_names)
+    /* "UndefinedVariable" is the name UndefinedVariableEx carries -
+     * the one entry no class name is, so the matcher is asked it here */
+    for (const char *n : uncatchable_ex_names) {
         if (!registered(n, false)
             && !registered((std::string(n) + "Ex").c_str(), false)) {
             cout << "refused " << n << " is no uncatchable class\n";
             ok = false;
         }
+        if (!is_uncatchable_ex_name(n) || is_catchable_ex_name(n)) {
+            cout << "listed " << n << " is not refused\n";
+            ok = false;
+        }
+    }
     /* vacuity: the registry holds the classes of both lists */
     const size_t n_classes = ex_test_classes().size();
     if (n_classes < std::size(catchable_ex_names) + 4) {
@@ -37052,6 +37058,144 @@ static bool bc_sra_closures()
                         "TAG - the two-closure shapes are vacuous\n");
         ok = false;
     }
+    return ok;
+}
+
+/*
+ * Q2 (v43): an image stores the type every container is made with - a
+ * chunk's `ctypes` pool (MakeArrayV / MakeDictV), a builtin call's and a
+ * call site's (read_ctype_any), and a stored array's or dict's own
+ * (read_ctype). A type that cannot be a container's - `opt`, or of
+ * another kind - is a corrupt image, refused at load: a store check
+ * against it would compare the value with a type no container has.
+ * Each reader is tampered in memory before the write, both ways, and an
+ * intact write must still load.
+ */
+static bool myv_ctype_refused()
+{
+    const char *lines_arr[] = {
+        "var a = [runtime(1), 2];",
+        "var b = range(runtime(3));",
+        "var c = [1, 2];",
+        "var d = {\"k\": 1};",
+        "print(a, b, c, d);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        Chunk &ck = prog.root;
+
+        TypeAnnot opt_arr;
+        opt_arr.kind = DeclType::arr;
+        opt_arr.opt = true;
+        opt_arr.elem = std::make_shared<TypeAnnot>();
+        opt_arr.elem->kind = DeclType::i;
+        TypeAnnot an_int;
+        an_int.kind = DeclType::i;
+        const TypeAnnot *bad_opt = annot_intern(opt_arr);
+        const TypeAnnot *bad_int = annot_intern(an_int);
+        const TypeAnnot *a_dict = annot_dyn_dict();
+        const TypeAnnot *a_arr = annot_dyn_array();
+
+        /* the four places, each found so the test cannot pass vacuously */
+        Chunk::BuiltinCall *bcall = nullptr;
+        for (auto &bc : ck.builtin_calls)
+            if (bc.ctype)
+                bcall = &bc;
+        EvalValue *larr = nullptr, *ldict = nullptr;
+        for (auto &lo : ck.literal_objs) {
+            if (lo.value.is<SharedArrayObj>()
+                    && lo.value.get_ref<SharedArrayObj>().ctype())
+                larr = &lo.value;
+            if (lo.value.is<intrusive_ptr<DictObject>>()
+                    && lo.value.get_ref<intrusive_ptr<DictObject>>()->ctype())
+                ldict = &lo.value;
+        }
+        if (ck.ctypes.empty() || !bcall || !larr || !ldict) {
+            fprintf(stderr, "myv_ctype_refused: a place holds no type "
+                    "(pool %zu, builtin %d, array %d, dict %d)\n",
+                    ck.ctypes.size(), bcall != nullptr, larr != nullptr,
+                    ldict != nullptr);
+            g_exec_engine = saved;
+            return false;
+        }
+
+        std::string tdir = "/tmp";
+        for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+            const std::optional<std::string> e = env_get(var);
+            if (e && !e->empty()) { tdir = *e; break; }
+        }
+        while (tdir.size() > 1
+               && (tdir.back() == '/' || tdir.back() == '\\'))
+            tdir.pop_back();
+        const std::string path = tdir + "/mylang-myv-ctype.myv";
+        const auto refused = [&](const char *what) -> bool {
+            myv_write(prog, path, MyvSourceRef());
+            try {
+                MyvSource img_src;
+                VmProgram loaded = myv_read(path, img_src);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError" && e.msg
+                        && (strstr(e.msg, "container type")
+                            || strstr(e.msg, "(ctype)")))
+                    return true;
+                fprintf(stderr, "myv_ctype_refused [%s]: threw %s: %s\n",
+                        what, e.name, e.msg ? e.msg : "");
+                return false;
+            }
+            fprintf(stderr, "myv_ctype_refused [%s]: ACCEPTED\n", what);
+            return false;
+        };
+
+        const TypeAnnot *pool0 = ck.ctypes[0];
+        ck.ctypes[0] = bad_opt;
+        ok = refused("pool: opt") && ok;
+        ck.ctypes[0] = bad_int;
+        ok = refused("pool: an int") && ok;
+        ck.ctypes[0] = pool0;
+
+        const TypeAnnot *bc0 = bcall->ctype;
+        bcall->ctype = bad_opt;
+        ok = refused("builtin call: opt") && ok;
+        bcall->ctype = bad_int;
+        ok = refused("builtin call: an int") && ok;
+        bcall->ctype = bc0;
+
+        SharedArrayObj &arr =
+            const_cast<SharedArrayObj &>(larr->get_ref<SharedArrayObj>());
+        const TypeAnnot *ar0 = arr.ctype();
+        arr.set_ctype(bad_opt);
+        ok = refused("array value: opt") && ok;
+        arr.set_ctype(a_dict);
+        ok = refused("array value: a dict type") && ok;
+        arr.set_ctype(ar0);
+
+        DictObject &dict = *ldict->get_ref<intrusive_ptr<DictObject>>();
+        const TypeAnnot *dc0 = dict.ctype();
+        dict.set_ctype(a_arr);
+        ok = refused("dict value: an array type") && ok;
+        dict.set_ctype(dc0);
+
+        myv_write(prog, path, MyvSourceRef());       /* intact: loads */
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        std::remove(path.c_str());
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_ctype_refused: %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
     return ok;
 }
 
@@ -61319,6 +61463,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: v19 - the root chunk's slot_count and the stored root slot "
       "count must agree, either copy mutated is refused",
       myv_root_slot_count_checked },
+    { "myv: v43 - a container type no container can have (opt, another "
+      "kind) is a corrupt image, refused by every reader",
+      myv_ctype_refused },
     { "myv: a flat struct array's stride must be its struct's size "
       "(myv_fuzz fat-276)", myv_struct_array_stride_checked },
     { "myv: a PushHandler naming an empty handler site is refused "

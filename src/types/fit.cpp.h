@@ -52,12 +52,18 @@ struct AnnotKeyHash {
     }
 };
 
+/* program-lifetime, built on first use: a plain pointer, set on the
+ * first call, needs no initialization guard (MyLang is single-threaded),
+ * and a guard's branches are ones no test can take */
 std::unordered_map<AnnotKey, std::unique_ptr<TypeAnnot>, AnnotKeyHash> &
 annot_table()
 {
     static std::unordered_map<AnnotKey, std::unique_ptr<TypeAnnot>,
-                              AnnotKeyHash> t;
-    return t;
+                              AnnotKeyHash> *t = nullptr;
+    if (!t)
+        t = new std::unordered_map<AnnotKey, std::unique_ptr<TypeAnnot>,
+                                   AnnotKeyHash>();
+    return *t;
 }
 
 /* a non-owning handle on an interned node */
@@ -108,27 +114,30 @@ const TypeAnnot *annot_nonopt(const TypeAnnot *a)
                                      a->val.get()});
 }
 
+/* (annot_table's note: a plain pointer, no initialization guard) */
 const TypeAnnot *annot_dyn_array()
 {
-    static const TypeAnnot *a = [] {
+    static const TypeAnnot *a = nullptr;
+    if (!a) {
         const TypeAnnot *d =
             annot_intern_key(AnnotKey{DeclType::dyn, false, nullptr,
                                       nullptr, nullptr, nullptr});
-        return annot_intern_key(AnnotKey{DeclType::arr, false, nullptr,
-                                         d, nullptr, nullptr});
-    }();
+        a = annot_intern_key(AnnotKey{DeclType::arr, false, nullptr,
+                                      d, nullptr, nullptr});
+    }
     return a;
 }
 
 const TypeAnnot *annot_dyn_dict()
 {
-    static const TypeAnnot *a = [] {
+    static const TypeAnnot *a = nullptr;
+    if (!a) {
         const TypeAnnot *d =
             annot_intern_key(AnnotKey{DeclType::dyn, false, nullptr,
                                       nullptr, nullptr, nullptr});
-        return annot_intern_key(AnnotKey{DeclType::dict, false, nullptr,
-                                         nullptr, d, d});
-    }();
+        a = annot_intern_key(AnnotKey{DeclType::dict, false, nullptr,
+                                      nullptr, d, d});
+    }
     return a;
 }
 
