@@ -101,6 +101,28 @@ try {
 } catch (dyn as e) { got = "outer " + str(e); }
 want("builtin's name, boxed", got, "outer box(TypeErrorEx(z: 9))");
 
+# through an alias where the struct's own name means something else: a
+# parameter named like the struct does not hide the alias (README, *Type
+# aliases*), and an alias of a struct a function declared has no other
+# name here. The clause used to be rewritten to the struct's own name,
+# which is not a type in either place.
+func hid(Err) {
+    try { c(); } catch (T as e) { return "alias " + str(e.ok) + str(Err); }
+    return "none";
+}
+want("alias, struct name hidden", hid(rt(3)), "alias true3");
+pure func mk() { struct Made { int v; } return Made; }
+const M = mk();
+func thr_m() { throw M(rt(4)); }
+try { thr_m(); } catch (M as e) { got = "made " + str(e.v); }
+want("alias of a function's struct", got, "made 4");
+# ...in a function declared above the alias, whose body is compiled first
+func in_func() {
+    try { thr_m(); } catch (M as e) { return "func " + str(e.v); }
+    return "none";
+}
+want("alias, in a function", in_func(), "func 4");
+
 # A call the COMPILER runs catches as the same call does at run time
 # (README, *A call at compile time computes what it computes at run
 # time*): by identity. The clauses below are resolved while compiling,
@@ -127,13 +149,19 @@ pure func p_thr2(n) { struct PErr2 { int code; } throw PErr2(n); }
 const C_OWN = p_own(8);
 want("compile time, own struct", C_OWN, "fallback 8");
 want("run time, own struct", p_own(rt(8)), "fallback 8");
-# the struct it names, thrown as a constant no function constructs; a
-# built-in exception; a private struct named like a built-in one
+# the struct it names, thrown as a constant no function constructs; an
+# alias; a built-in exception; a private struct named like a built-in one
 struct CErr { int v; }
 const C_VAL = CErr(5);
+const CT = CErr;
 pure func p_val(n) { if (n > 0) throw C_VAL; return 0; }
 pure func p_named(n) {
     try { p_val(n); } catch (CErr as e) { return "named " + str(e.v); }
+    catch { return "all"; }
+    return "none";
+}
+pure func p_alias(CErr) {
+    try { p_val(CErr); } catch (CT as e) { return "alias " + str(e.v); }
     catch { return "all"; }
     return "none";
 }
@@ -147,10 +175,13 @@ pure func p_builtin(n) {
     return "none";
 }
 const C_NAMED = p_named(1);
+const C_ALIAS = p_alias(1);
 const C_DIV = p_div(0);
 const C_BUILTIN = p_builtin(6);
 want("compile time, named", C_NAMED, "named 5");
 want("run time, named", p_named(rt(1)), "named 5");
+want("compile time, alias", C_ALIAS, "alias 5");
+want("run time, alias", p_alias(rt(1)), "alias 5");
 want("compile time, built-in", C_DIV, "div");
 want("run time, built-in", p_div(rt(0)), "div");
 want("compile time, built-in's name", C_BUILTIN, "fallback 6");

@@ -4538,6 +4538,14 @@ void Inferencer::hoist_globals(Block *rootBlock)
             if (e14->fl & pFlags::pInDecl)
                 declare_target(e14->lvalue.get(), global,
                                e14->fl & pFlags::pInConstDecl);
+            /* a TYPE ALIAS names its struct from here on: a function's
+             * body is walked before the statement declaring the alias
+             * (functions come first in a block, question 21), and a
+             * catch clause in it is resolved in that walk
+             * (resolve_catch_types) - unbound, `catch (T)` in a function
+             * was "'T' is not a type here" */
+            if (e14->fl & pFlags::pInConstDecl)
+                bind_type_aliases(e14);
         }
     }
 }
