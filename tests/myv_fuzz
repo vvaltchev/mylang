@@ -92,7 +92,7 @@ var bump = func[cnt]() { cnt = cnt + 1; return cnt; };
 s += bump() + bump();
 try { throw Q(9); } catch (Q as e) { s += e.a; } finally { s += 1; }
 var t = 0;
-try { var z = pts[99]; } catch (OutOfBounds) { t = 1; }
+try { var z = pts[99]; } catch (OutOfBoundsEx) { t = 1; }
 var fl = [1.0, 2.0, 3.0];
 var fs = 0.0;
 foreach (var f in fl) { fs += sqrt(f); }
