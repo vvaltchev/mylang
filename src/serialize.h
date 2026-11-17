@@ -23,7 +23,10 @@ struct VmProgram;
  * pair cannot drift; ANY format change must bump MYV_FORMAT_VERSION in the
  * same commit.
  */
-constexpr unsigned MYV_FORMAT_VERSION = 43;   /* v43: a container's
+constexpr unsigned MYV_FORMAT_VERSION = 44;   /* v44: the program's
+                                                 `typed` byte (Q2
+                                                 increment 3);
+                                                 v43: a container's
                                                  own type (Q2) on each
                                                  array / dict value, a
                                                  chunk's ctypes pool, a

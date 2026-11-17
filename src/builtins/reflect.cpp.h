@@ -68,14 +68,22 @@ static std::string reflect_annot_str(const TypeAnnot *ta)
         case DeclType::s:   s = "str";   break;
         case DeclType::dyn: s = "dyn";   break;
         case DeclType::strct:
-            s = ta->strct ? std::string(ta->strct->name->val) : "struct";
+            /* an image's annotation may name no struct */
+            s = "struct";
+            if (ta->strct)
+                s = ta->strct->name->val;
             break;
+        /* a generic component (`array<array>`) as it is written */
         case DeclType::arr:
-            s = "array<" + reflect_annot_str(ta->elem.get()) + ">";
+            s = "array";
+            if (ta->elem)
+                s += "<" + reflect_annot_str(ta->elem.get()) + ">";
             break;
         case DeclType::dict:
-            s = "dict<" + reflect_annot_str(ta->key.get()) + "," +
-                reflect_annot_str(ta->val.get()) + ">";
+            s = "dict";
+            if (ta->key)
+                s += "<" + reflect_annot_str(ta->key.get()) + "," +
+                     reflect_annot_str(ta->val.get()) + ">";
             break;
         case DeclType::box:
             s = "box<" + reflect_annot_str(ta->elem.get()) + ">";
@@ -453,7 +461,12 @@ static EvalValue reflect_make_layout(const StructTypeDef *qdef)
     lo->fields.emplace_back(EvalValue(static_cast<int_type>(qdef->align)),
                             false);
     lo->fields.emplace_back(EvalValue(qdef->is_pod()), false);
-    lo->fields.emplace_back(EvalValue(SharedArrayObj(std::move(fieldvec))), false);
+    /* Q2: the array a typed name reaches (layout(S).fields is an
+     * array<StructField>) carries that type, in a typed run */
+    EvalValue fields{SharedArrayObj(std::move(fieldvec))};
+    if (g_ctype_adopt)
+        stamp_ctype(fields, annot_array_of_struct(sf));
+    lo->fields.emplace_back(std::move(fields), false);
     return EvalValue(intrusive_ptr<StructObject>(lo));
 }
 

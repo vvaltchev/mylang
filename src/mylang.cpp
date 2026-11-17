@@ -712,14 +712,17 @@ parse_args(int argc, char **argv)
             for (int i = 1; i < argc; i++)
                 vec.emplace_back(SharedStr(string(argv[i])), false);
 
+            /* Q2: argv is an array<str>, and a typed name reaches it, so
+             * in a typed run it carries that type (a store through `dyn`
+             * is checked against it) */
+            SharedArrayObj args(std::move(vec));
+            if (!opt_no_type_infer)
+                args.set_ctype(annot_str_array());
             EvalContext::builtins.emplace(
 
                 make_pair(
                     UniqueId::get("argv"),
-                    LValue(
-                        EvalValue(SharedArrayObj(std::move(vec))),
-                        false
-                    )
+                    LValue(EvalValue(std::move(args)), false)
                 )
             );
 
@@ -842,8 +845,10 @@ int main(int argc, char **argv)
         }
 
         ParseContext ctx(TokenStream(tokens), !opt_no_const_fold);
-        /* -nti: nothing is typed, a parse-time call included (question 5) */
+        /* -nti: nothing is typed, a parse-time call included (question 5),
+         * and no container takes a type (Q2 increment 3) */
         ctx.const_ctx->parse_typed = !opt_no_type_infer;
+        g_ctype_adopt = !opt_no_type_infer;
 
         /* -a: the parser records parse-time folds/DCE it would otherwise erase
          * (magenta folded calls, dim dead branches) into this collector; the

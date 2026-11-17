@@ -721,6 +721,15 @@ struct FitMisfit {
     std::string got;
 };
 bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit &why);
+/* Q2 increment 3: value_fits, and an untyped container that fits takes
+ * the place's type (fit_adopt) - what a value ENTERING a place calls */
+bool value_enters(const EvalValue &v, const TypeAnnot &a, FitMisfit &why);
+/* do containers take types in this run? Only in one compiled with type
+ * inference (README: under -nti no container has a type). Set by
+ * infer_types and the script driver, carried by a VmProgram
+ * (VmProgram::typed) and a .myv image, and set from the program by
+ * vm_run. */
+extern bool g_ctype_adopt;
 
 /* question 25: the struct a thrown exception carries (what a catch clause
  * naming a struct compares by identity), or null - a built-in exception,
@@ -835,7 +844,7 @@ inline BindFault bind_fault_in_range(const FuncDescriptor *d, size_t n,
         }
         if (bind_coerce_throws(p.decl_type, v))
             return f;                   /* the bind's coercion error first */
-        if (p.fit && !value_fits(v, *p.fit, f.m)) {
+        if (p.fit && !value_enters(v, *p.fit, f.m)) {
             f.idx = static_cast<int>(i);
             f.fit = true;
             return f;
@@ -1092,6 +1101,13 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
  * make_array, array, keys, values) pass each element through it, so a
  * typed destination never holds a misfit. See eval.cpp. */
 EvalValue flat_hint_value(const EvalValue &v, ArrHint hint);
+
+/* Q2: does the type name a container's own type - an array<T>, a
+ * dict<K, V>? A generic `array` / `dict` (a component of `array<array>`)
+ * checks no store, so it types nothing: a container under one stays
+ * untyped, free to take a type where it enters one, as fit_adopt leaves
+ * a container entering a generic place */
+bool ctype_names(const TypeAnnot *t) noexcept;
 
 /*
  * Q2 (plans/typed-containers.md): give a container MADE HERE the type the

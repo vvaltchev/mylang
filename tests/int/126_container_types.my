@@ -12,9 +12,14 @@
 #    an empty slice) its source's; `a + b` the sum's type;
 #  - UNTYPED: a container nested in a `dyn` element (only `dyn` reaches
 #    it), a constant's (read-only, it needs none), an empty literal
-#    nothing filled, and one a fit check examines where it lands, or whose
-#    place's type is unknown here (a call through a function value, a
-#    store or an append into a `dyn` container) - it takes its type there.
+#    nothing filled, and one stored or appended into a `dyn` container;
+#  - one a fit check examines where it lands, or whose place's type is
+#    unknown here (a call through a function value), is made untyped and
+#    TAKES the place's type when it enters it (increment 3) - along the
+#    place's type: a nested container that has a type keeps it, a
+#    constant's stays untyped, so does one under a `dyn` component or a
+#    generic one (`array<array>`'s element, which checks no store), and
+#    a default dict's default value takes the value type too.
 
 var bad = 0;
 func want(what, got, exp) {
@@ -25,16 +30,20 @@ func want(what, got, exp) {
 }
 func rt(x) => runtime(x);
 
-var a = [1, 2];                  want("var literal", int_ctype(a), "array<int>");
-var a2 = [rt(1), 2];             want("dyn element", int_ctype(a2), "array<dyn>");
+var a = [1, 2];
+want("var literal", int_ctype(a), "array<int>");
+var a2 = [rt(1), 2];
+want("dyn element", int_ctype(a2), "array<dyn>");
 var dyn d = [1, 2];              want("dyn var", int_ctype(d), "array<dyn>");
 array<float> f = [1, 2];         want("declared", int_ctype(f), "array<float>");
 var n = [[1], [rt(2)]];
 want("nested outer", int_ctype(n), "array<array<dyn>>");
 want("nested inner", int_ctype(n[0]), "array<dyn>");
-var w = [1, 2]; w[0] = 2.5;      want("widened var", int_ctype(w), "array<float>");
+var w = [1, 2]; w[0] = 2.5;
+want("widened var", int_ctype(w), "array<float>");
 var m = {"a": 1};                want("dict", int_ctype(m), "dict<str,int>");
-var dyn md = {"a": 1};           want("dyn dict", int_ctype(md), "dict<dyn,dyn>");
+var dyn md = {"a": 1};
+want("dyn dict", int_ctype(md), "dict<dyn,dyn>");
 var het = [[1], "x"];
 want("const het", int_ctype(het), "array<dyn>");
 want("const het inner", int_ctype(het[0]), "untyped");
@@ -64,16 +73,62 @@ want("clone of a constant", int_ctype(clone(K)), "array<int>");
 var e = [];                      want("unfilled", int_ctype(e), "untyped");
 var e2 = []; append(e2, 1);      want("filled", int_ctype(e2), "array<int>");
 
-array<int?> o = [rt(1)];         want("fit-checked decl", int_ctype(o), "untyped");
+array<int?> o = [rt(1)];
+want("fit-checked decl", int_ctype(o), "array<int?>");
 func takes(array<int> p) => int_ctype(p);
-want("fit-checked arg", takes([rt(1)]), "untyped");
+want("fit-checked arg", takes([rt(1)]), "array<int>");
 want("typed arg", takes([1]), "array<int>");
 var dyn g = takes;
-want("indirect arg", g([1]), "untyped");
+want("indirect arg", g([1]), "array<int>");
 var dyn dd = [[1]];
 dd[0] = [rt(2)];                 want("dyn store", int_ctype(dd[0]), "untyped");
 var dyn dz = [];
-append(dz, [1]);                 want("dyn append", int_ctype(dz[0]), "untyped");
+append(dz, [1]);
+want("dyn append", int_ctype(dz[0]), "untyped");
+
+array<int> eti = [7];
+const EKI = [5];
+dict<str, int> etd = {"t": 1};
+const EKD = {"k": 2};
+func ea(array<array<int>> p) =>
+    int_ctype(p) + " " + int_ctype(p[0]) + " " + int_ctype(p[1]) + " " +
+    int_ctype(p[2]);
+array<dyn> eh1 = [[eti, EKI, [rt(2)]]];
+var dyn eu1 = eh1[0];
+want("enter nested", ea(eu1),
+     "array<array<int>> array<int> untyped array<int>");
+func ed(array<dyn> p) => int_ctype(p) + " " + int_ctype(p[0]);
+array<dyn> eh2 = [[[rt(1)], {"a": rt(1)}]];
+var dyn eu2 = eh2[0];
+want("enter dyn component", ed(eu2), "array<dyn> untyped");
+func eg(array<array> p) => int_ctype(p) + " " + int_ctype(p[0]) + " " +
+    int_ctype(p[0][0]);
+array<dyn> eh3 = [[[[rt(1)]]]];
+var dyn eu3 = eh3[0];
+want("enter generic component", eg(eu3), "array<array> untyped untyped");
+func egd(array<dict> p) => int_ctype(p) + " " + int_ctype(p[0]);
+array<dyn> eh7 = [[{"a": rt(1)}]];
+var dyn eu7 = eh7[0];
+want("enter generic dict", egd(eu7), "array<dict> untyped");
+func edd(dict<str, dict<str, int>> p) => int_ctype(p) + " " +
+    int_ctype(p["a"]) + " " + int_ctype(p["b"]) + " " + int_ctype(p["c"]);
+array<dyn> eh4 = [{"a": etd, "b": EKD, "c": {"z": rt(3)}}];
+var dyn eu4 = eh4[0];
+want("enter nested dict", edd(eu4),
+     "dict<str,dict<str,int>> dict<str,int> untyped dict<str,int>");
+func edy(dict<str, dyn> p) => int_ctype(p) + " " + int_ctype(p["a"]);
+array<dyn> eh5 = [{"a": {"z": rt(3)}}];
+var dyn eu5 = eh5[0];
+want("enter dyn value", edy(eu5), "dict<str,dyn> untyped");
+func edf(dict<str, dict<str, int>> p) => int_ctype(p) + " " +
+    int_ctype(p["q"]);
+array<dyn> ehz = [{"z": rt(4)}];
+array<dyn> eh6 = [dict(ehz[0])];
+var dyn eu6 = eh6[0];
+want("enter default", edf(eu6), "dict<str,dict<str,int>> dict<str,int>");
+func gsig(array<array> a, dict<str, dict> b) => len(a) + len(b);
+want("generic signature", signature(gsig),
+     "func gsig(array<array> a, dict<str,dict> b)");
 
 assert(bad == 0);
 print("ok");

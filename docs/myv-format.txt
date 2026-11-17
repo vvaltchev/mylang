@@ -2,8 +2,12 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 43.  This document describes the on-disk image exhaustively:
+Format version 44.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v44: the GLOBALS section (10) ends with a bool `typed` - the program was
+compiled with type inference, so a container that carries no type of its
+own takes the type of the typed place it enters.)
 
 (v43: every array (11.1) and dict (11.2) value carries its OWN TYPE, a
 `ctype` (2.3), after its readonly flag; a chunk gains the pool `ctypes`
@@ -1192,6 +1196,7 @@ section that could be dropped without losing behaviour.
                                        the loader refuses the image when
                                        the two disagree (v19)
     N x uid  global_func_names         the global table's slot -> name list
+    bool     typed                     compiled with type inference (v44)
 
 `root_slot_count` is deliberately redundant, as a function chunk's
 `slot_count` is with its descriptor's `frame_size`: `slot_count` partitions
@@ -1200,6 +1205,12 @@ pin gate classify a slot by it, and it has NO derivation - so a second copy
 is the only way to DETECT a mutated one (myv_fuzz fat-316 and fat-311, both
 the chunk's copy: a leaked reference either way, and undetectable while the
 format kept one record).
+
+`typed` says whether the program was compiled with type inference (not
+under `-nti`): only then does a container that carries no type of its own
+TAKE the type of the typed place it enters (Q2 increment 3, README "A
+container enters a typed place by its type"), so an image runs as its
+compile would.
 
 `global_slot_reassigned` is what lets the load-time JIT rebuild its compile
 context: a write-once global slot may be baked, a reassigned one may not.

@@ -236,3 +236,29 @@ on the way, and what increment 3 inherits:
   key is checked; no test can reach a typed default dict until
   increment 3 (`dict<str, int> d = dict(0)` is untyped today: the
   declaration's fit check examines it).
+
+## 9. Increment 3 notes (2026-11-17)
+
+The runtime half of A: a container ENTERING a typed place is checked by
+the type it carries (`ct_enters`, types/fit.cpp.h), at every place a
+value enters - a parameter's bind, a struct field, a FitSpec store, a
+store through `dyn` (`value_enters`, the one entry point). The rule for
+a place with `dyn` inside it is the one increment 2 makes sound: a
+component the place types `dyn` takes anything, because a store into it
+is checked against the container's own type; any other component must be
+the container's exactly, because a store into it is checked against
+nothing. So `array<int>` enters `array<dyn>` (question 7.1's
+recommendation, as it compiles today) but not `array<int?>`, and
+`array<array<int>>` does not enter `array<array<dyn>>`.
+
+An untyped container that fits takes the place's type (`fit_adopt`),
+which closes the laundering route increment 2's tests used: a literal a
+fit check examined is now typed by the check. `fit_needed` asks for a
+check where a component is UNFILLED (an empty literal nothing wrote is
+untyped), so such a container takes its type too.
+
+Not done here - the static half: `array<int> a = q` with `q` an
+`array<dyn>` still compiles, and is refused when it runs (the container
+carries `array<dyn>`). Refusing it at compile time changes
+`static_type_elem_compat`, which every assignability question asks; its
+blast radius is to be measured first.

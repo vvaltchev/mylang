@@ -232,6 +232,7 @@ def main(path):
         if hc: chunk(r); nfunc += 1
     r.nx(r.u8)                                    # section 10
     r.u32(); r.nx(r.uid)       # root_slot_count (checked at load, v19)
+    r.boolv()                  # typed (v44)
 
     left = len(r.b) - r.p
     print("%-22s v%d  %6d bytes  strings %3d  structs %d  descs %d "

@@ -3034,6 +3034,7 @@ vm_compile(const Construct *root_c, bool jit)
 
     /* Root-context data the run needs, copied OUT of the root Block. */
     prog.root_slot_count = root->slot_count;
+    prog.typed = g_ctype_adopt;
     prog.global_func_names = root->global_func_names;
     prog.global_slot_reassigned = root->global_slot_reassigned;
 
@@ -3085,6 +3086,7 @@ void
 vm_run(VmProgram &prog)
 {
     ExecGuard exec_guard;
+    g_ctype_adopt = prog.typed;
     EvalContext ctx(nullptr, /*const_ctx=*/false);
     /* a run numbers its class instances from one base, in every engine
      * (g_class_ident: the hash of a class instance) */
@@ -3170,6 +3172,7 @@ VmProgram::~VmProgram()
 VmProgram::VmProgram(VmProgram &&o) noexcept
     : root(std::move(o.root)),
       root_slot_count(o.root_slot_count),
+      typed(o.typed),
       global_func_names(std::move(o.global_func_names)),
       global_slot_reassigned(std::move(o.global_slot_reassigned)),
       funcs(std::move(o.funcs)),
@@ -3183,6 +3186,7 @@ VmProgram &VmProgram::operator=(VmProgram &&o) noexcept
     if (this != &o) {
         root = std::move(o.root);
         root_slot_count = o.root_slot_count;
+        typed = o.typed;
         global_func_names = std::move(o.global_func_names);
         global_slot_reassigned = std::move(o.global_slot_reassigned);
         funcs = std::move(o.funcs);

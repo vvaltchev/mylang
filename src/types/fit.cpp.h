@@ -141,6 +141,15 @@ const TypeAnnot *annot_dyn_dict()
     return a;
 }
 
+const TypeAnnot *annot_str_array()
+{
+    const TypeAnnot *e = annot_intern_key(AnnotKey{DeclType::s, false,
+                                                   nullptr, nullptr,
+                                                   nullptr, nullptr});
+    return annot_intern_key(AnnotKey{DeclType::arr, false, nullptr, e,
+                                     nullptr, nullptr});
+}
+
 const TypeAnnot *annot_array_of_struct(const StructTypeDef *d)
 {
     const TypeAnnot *e = annot_intern_key(AnnotKey{DeclType::strct, false, d,
@@ -212,6 +221,8 @@ std::string fit_kind_text(const EvalValue &v)
     return runtime_type_name(v);
 }
 
+std::string fit_annot_text(const TypeAnnot &a);
+
 /* a misfit at the current level: what is there */
 bool fit_miss(const EvalValue &v, FitMisfit &why)
 {
@@ -222,6 +233,58 @@ bool fit_miss(const EvalValue &v, FitMisfit &why)
 
 bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
           FitMisfit &why);
+
+/* a `dyn` component and an absent one (a generic `array`, a box of any
+ * element) say the same: no type */
+const TypeAnnot *ct_typed(const TypeAnnot *a)
+{
+    return a && a->kind != DeclType::dyn ? a : nullptr;
+}
+
+/* are two component types the same type? (a container's own type is
+ * interned, a place's annotation need not be) */
+bool ct_same(const TypeAnnot *c, const TypeAnnot *p)
+{
+    c = ct_typed(c);
+    p = ct_typed(p);
+    if (c == p)
+        return true;
+    if (!c || !p)
+        return false;
+    return c->kind == p->kind && c->opt == p->opt && c->strct == p->strct
+           && ct_same(c->elem.get(), p->elem.get())
+           && ct_same(c->key.get(), p->key.get())
+           && ct_same(c->val.get(), p->val.get());
+}
+
+/*
+ * Q2 increment 3 (plans/typed-containers.md, section 3, decision A): may
+ * a container whose own type is `ct` enter a place annotated `a` (of the
+ * same kind)? A component the place types `dyn` takes anything - a store
+ * into it is checked against the container's own type (increment 2) - and
+ * every other component must be the container's exactly, since a store
+ * into it is checked against nothing: an array<int> holds no int? because
+ * a place called it array<int?>, and an array<array<int>> does not enter
+ * an array<array<dyn>>, whose elements take any array unchecked.
+ */
+bool ct_enters(const TypeAnnot *ct, const TypeAnnot *a)
+{
+    const auto comp = [](const TypeAnnot *c, const TypeAnnot *pl) {
+        return !ct_typed(pl) || ct_same(c, pl);
+    };
+    if (a->kind == DeclType::arr)
+        return comp(ct->elem.get(), a->elem.get());
+    return comp(ct->key.get(), a->key.get())
+           && comp(ct->val.get(), a->val.get());
+}
+
+/* a typed container refused at a place: what it is, by its type */
+bool ct_miss(const TypeAnnot *ct, FitMisfit &why)
+{
+    why.where.clear();
+    why.got = fit_annot_text(*ct);
+    return false;
+}
 
 /* does every element of `arr` fit `ea`? */
 bool fits_elems(const SharedArrayObj &arr, const TypeAnnot *ea, FitWalk &w,
@@ -355,16 +418,33 @@ bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
     case DeclType::box:
         ok = box_fits_annot(v, a);
         break;
-    case DeclType::arr:
+    case DeclType::arr: {
         if (!v.is<SharedArrayObj>())
             return fit_miss(v, why);
-        return fits_elems(v.get_ref<SharedArrayObj>(), a->elem.get(), w,
-                          why);
-    case DeclType::dict:
+        /* a container that carries its own type enters by that type; an
+         * untyped one (reached through `dyn` only, or a constant's) by
+         * what it holds */
+        const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
+        const TypeAnnot *ct = arr.ctype();
+        if (ct && !arr.is_readonly()) {
+            if (ct_enters(ct, a))
+                return true;
+            return ct_miss(ct, why);
+        }
+        return fits_elems(arr, a->elem.get(), w, why);
+    }
+    case DeclType::dict: {
         if (!v.is<intrusive_ptr<DictObject>>())
             return fit_miss(v, why);
-        return fits_dict(*v.get_ref<intrusive_ptr<DictObject>>(),
-                         a->key.get(), a->val.get(), w, why);
+        const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        const TypeAnnot *ct = d.ctype();
+        if (ct && !d.is_readonly()) {
+            if (ct_enters(ct, a))
+                return true;
+            return ct_miss(ct, why);
+        }
+        return fits_dict(d, a->key.get(), a->val.get(), w, why);
+    }
     default:                /* `none`: an image's annotation, no check */
         return true;
     }
@@ -417,6 +497,83 @@ bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit &why)
     return fits(v, &a, w, why);
 }
 
+/*
+ * Q2 increment 3: an UNTYPED mutable container that fits a place takes
+ * the place's type, along the annotation (stamp_ctype: a container under
+ * a `dyn` component stays untyped, a typed one keeps its own - it fit, so
+ * it is the same). From then on a store through a `dyn` name is checked
+ * against it, so the place's type stays true however the container is
+ * reached. A read-only one (a constant's) takes none: no store changes it.
+ * Under -nti nothing takes a type (g_ctype_adopt).
+ */
+bool g_ctype_adopt = true;
+
+/*
+ * Before an untyped container takes a type: along the type, as the stamp
+ * walks, a SLICE becomes an ordinary array (its whole group, as a write
+ * through it would do) and an array other slices share gives them copies
+ * of their windows - a slice is an array of its own (question 3), and the
+ * type is kept on the storage a slice shares, so it would type them all,
+ * or (a slice) none. Invisible to a program, like any materialization.
+ * The value fits `t` (fit_adopt runs after the fit), so its kind is the
+ * type's.
+ */
+void adopt_detach(const EvalValue &v, const TypeAnnot *t)
+{
+    if (!ctype_names(t))
+        return;
+    if (v.is<SharedArrayObj>()) {
+        auto &a = const_cast<SharedArrayObj &>(v.get_ref<SharedArrayObj>());
+        if (a.ctype() || a.is_readonly())
+            return;
+        a.materialize_slice();
+        a.clone_all_slices();
+        if (a.skind() != SharedArrayObj::Storage::general)
+            return;
+        const ArrayConstView &view = a.get_view();
+        for (size_type i = 0; i < view.size(); i++)
+            adopt_detach(view[i].get(), t->elem.get());
+        return;
+    }
+    if (v.is<intrusive_ptr<DictObject>>()) {
+        const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        if (d.ctype() || d.is_readonly())
+            return;
+        for (const auto &kv : d.get_ref())
+            adopt_detach(kv.second.get(), t->val.get());
+        if (d.get_has_default())
+            adopt_detach(d.get_default(), t->val.get());
+    }
+}
+
+void fit_adopt(const EvalValue &v, const TypeAnnot &a)
+{
+    if (!g_ctype_adopt || !ctype_names(&a))
+        return;
+    if (v.is<SharedArrayObj>()) {
+        const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
+        if (arr.ctype() || arr.is_readonly())
+            return;
+    } else if (v.is<intrusive_ptr<DictObject>>()) {
+        const DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        if (d.ctype() || d.is_readonly())
+            return;
+    } else {
+        return;                 /* none, into an `opt` place */
+    }
+    const TypeAnnot *t = annot_nonopt(annot_intern(a));
+    adopt_detach(v, t);
+    stamp_ctype(v, t);
+}
+
+bool value_enters(const EvalValue &v, const TypeAnnot &a, FitMisfit &why)
+{
+    if (!value_fits(v, a, why))
+        return false;
+    fit_adopt(v, a);
+    return true;
+}
+
 TypeErrorEx param_fit_error(const UniqueId *param, const TypeAnnot &a,
                             const FitMisfit &m, int site_arg)
 {
@@ -459,14 +616,14 @@ TypeErrorEx fit_error(const FitSpec &spec, const FitMisfit &m)
 void check_fit(const EvalValue &v, const FitSpec &spec)
 {
     FitMisfit m;
-    if (!value_fits(v, *spec.annot, m))
+    if (!value_enters(v, *spec.annot, m))
         throw fit_error(spec, m);
 }
 
 void check_fit_loc(const EvalValue &v, const FitSpec &spec, Loc s, Loc e)
 {
     FitMisfit m;
-    if (value_fits(v, *spec.annot, m))
+    if (value_enters(v, *spec.annot, m))
         return;
     TypeErrorEx ex = fit_error(spec, m);
     ex.loc_start = s;
@@ -534,7 +691,7 @@ EvalValue ct_fit(const TypeAnnot *a, EvalValue v, bool dict, Loc s, Loc e)
         return v;
     v = ct_widen(std::move(v), a);
     FitMisfit m;
-    if (value_fits(v, *a, m))
+    if (value_enters(v, *a, m))
         return v;
     TypeErrorEx ex = ct_misfit(dict ? "the dict's values are"
                                     : "the array's elements are",
@@ -558,7 +715,7 @@ EvalValue ct_fit_key(const DictObject &d, EvalValue key)
         return key;
     key = ct_widen(std::move(key), a);
     FitMisfit m;
-    if (value_fits(key, *a, m))
+    if (value_enters(key, *a, m))
         return key;
     throw ct_misfit("the dict's keys are", "the key", *a, m);
 }
