@@ -1041,7 +1041,9 @@ static void stamp_literal_annot(Construct *lit, const TypeAnnot *a, bool dyn)
         auto *ld = static_cast<LiteralDict *>(lit);
         ld->key_coerce = annot_num(a->key.get());
         ld->val_coerce = annot_num(a->val.get());
-        ld->annotated = a->key != nullptr && a->val != nullptr;
+        /* (a dict annotation names both its key and its value, or
+         * neither) */
+        ld->annotated = a->key != nullptr;
         for (auto &kv : ld->elems)
             stamp_literal_annot(kv->value.get(), a->val.get(), false);
     } else if (t == ConstructType::lit_obj
@@ -2982,10 +2984,13 @@ pExpr14_tail(ParseContext &c, unsigned fl, const Loc start,
      * another site baked */
     if ((fl & pFlags::pInDecl) && !in_idlist
             && (ctag(ret->rvalue.get()) == ConstructType::lit_arr
-                || ctag(ret->rvalue.get()) == ConstructType::lit_dict))
-        if (auto *did = node_cast<Identifier>(ret->lvalue.get()))
-            stamp_literal_annot(ret->rvalue.get(), did->decl_annot.get(),
-                                did->dyn_mod);
+                || ctag(ret->rvalue.get()) == ConstructType::lit_dict)) {
+        /* (a declaration's single target is a name) */
+        ML_CHECK(ctag(ret->lvalue.get()) == ConstructType::id);
+        auto *did = static_cast<Identifier *>(ret->lvalue.get());
+        stamp_literal_annot(ret->rvalue.get(), did->decl_annot.get(),
+                            did->dyn_mod);
+    }
 
     /*
      * Materialize a const rvalue - unless it is ALREADY a LiteralObj, i.e. a

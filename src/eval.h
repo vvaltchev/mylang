@@ -1103,10 +1103,10 @@ EvalValue flat_hint_value(const EvalValue &v, ArrHint hint);
  * change it). A `dyn` element stops the walk: what a `dyn` holds keeps
  * the type it was made with.
  */
-void stamp_ctype(const EvalValue &v, const TypeAnnot *t);
+void stamp_ctype(const EvalValue &v, const TypeAnnot *t) noexcept;
 /* ...the top container only: a LITERAL's (what it holds was typed where
  * that was made, or is not this literal's to type) */
-void stamp_ctype_top(const EvalValue &v, const TypeAnnot *t);
+void stamp_ctype_top(const EvalValue &v, const TypeAnnot *t) noexcept;
 
 /* Q2: a BAKED mutable value (a LiteralObj's) with its fresh containers
  * typed `t`: stamped in place when untyped, COPIED when another node's

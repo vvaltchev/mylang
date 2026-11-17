@@ -636,6 +636,8 @@ private:
     std::unordered_set<const Construct *> ctype_untyped;
     void ctype_untype(Construct *n);
     bool arg_fit_checked(CallExpr *call, size_t i);
+    TypeSym *user_sym(const Identifier *id);
+    bool names_builtin(const Identifier *cid);
     /* the FIXED place a baked literal was rebuilt for (stamp_literal_repr) */
     std::unordered_map<const Construct *, StaticTypeRef> lit_obj_dest;
     FuncInfo *hint_func = nullptr;   /* annotate_hints: the enclosing func */
@@ -3547,32 +3549,35 @@ static DeclType assign_value_widen(StaticTypeRef target, StaticTypeRef val)
  * this one - does not restamp them from their narrower own type. */
 void Inferencer::stamp_literal_coerce(Construct *n, StaticTypeRef t)
 {
+    /* `t` is the literal's own type or a place's (literal_into's), never
+     * null */
     t = static_type_resolve(t);
+    ML_CHECK(t);
     StaticTypeRef el = nullptr;
-    if (t && t->kind == StaticTypeKind::Array)
+    if (t->kind == StaticTypeKind::Array)
         el = static_type_resolve(t->elem);
-    else if (t && t->kind == StaticTypeKind::Dict)
+    else if (t->kind == StaticTypeKind::Dict)
         el = static_type_resolve(t->val);
     const DeclType dt =
         !el ? DeclType::none
         : el->kind == StaticTypeKind::Float ? DeclType::f
         : el->kind == StaticTypeKind::Int ? DeclType::i
         : DeclType::none;
+    const bool el_dyn = el && el->kind == StaticTypeKind::Dyn;
     const auto nested = [&](Construct *c) {
         /* a literal in a `dyn` element holds its values at its OWN type
          * (annotate_hints' visit of it), as one in a `dyn` variable does:
-         * `[[1, 2.5], [true]]` for an array<dyn> holds 1.0 and true */
-        if (el && c && el->kind != StaticTypeKind::Dyn
-                && (ctag(c) == ConstructType::lit_arr
-                    || ctag(c) == ConstructType::lit_dict)) {
+         * `[[1, 2.5], [true]]` for an array<dyn> holds 1.0 and true.
+         * Q2: a container made in a `dyn` element - a literal, a call
+         * that builds one, a sum - has no type of its own (only `dyn`
+         * reaches it), as a baked value's is (stamp_ctype_rec) */
+        if (el_dyn) {
+            ctype_untype(c);
+        } else if (el && (ctag(c) == ConstructType::lit_arr
+                          || ctag(c) == ConstructType::lit_dict)) {
             lit_coerce_by_parent.insert(c);
             stamp_literal_coerce(c, el);
         }
-        /* Q2: a container made in a `dyn` element - a literal, a call
-         * that builds one, a sum - has no type of its own (only `dyn`
-         * reaches it), as a baked value's is (stamp_ctype_rec) */
-        if (el && c && el->kind == StaticTypeKind::Dyn)
-            ctype_untype(c);
     };
     /* Q2: the container is made with the type it is built for here -
      * DYNAMIC where `dyn` is declared; untyped when nested under a `dyn`
@@ -3581,7 +3586,7 @@ void Inferencer::stamp_literal_coerce(Construct *n, StaticTypeRef t)
     const bool dict = ctag(n) == ConstructType::lit_dict;
     n->ctype = ctype_dyn_place.count(n)
         ? (dict ? annot_dyn_dict() : annot_dyn_array())
-        : t && t->kind == StaticTypeKind::Dyn ? nullptr
+        : t->kind == StaticTypeKind::Dyn ? nullptr
         : ctype_of(t, dict);
     if (ctag(n) == ConstructType::lit_arr) {
         auto *la = static_cast<LiteralArray *>(n);
@@ -3592,7 +3597,7 @@ void Inferencer::stamp_literal_coerce(Construct *n, StaticTypeRef t)
         auto *ld = static_cast<LiteralDict *>(n);
         ld->val_coerce = dt;
         const StaticTypeRef kt =
-            t && t->kind == StaticTypeKind::Dict
+            t->kind == StaticTypeKind::Dict
                 ? static_type_resolve(t->key) : nullptr;
         ld->key_coerce =
             !kt ? DeclType::none
@@ -4459,8 +4464,7 @@ void Inferencer::stamp_sum_identity(CallExpr *call)
     if (!cid || !call->args || cid->uid->val != "sum")
         return;
     /* the builtin, not a user function of the same name */
-    auto sit = id_sym.find(cid);
-    if ((sit != id_sym.end() && sit->second) || !is_builtin(cid->uid))
+    if (!names_builtin(cid))
         return;
     StaticTypeRef rt = static_type_resolve(type_of(call));
     if (rt->opt)
@@ -4484,7 +4488,12 @@ static bool ct_unsettled(StaticTypeRef t)
 /* the builtins that store a value into the container they are given */
 static bool in_place_store(std::string_view n)
 {
-    return n == "append" || n == "push" || n == "insert";
+    /* constexpr: no run-time initialisation (a static set's guard is a
+     * branch no run can take twice) */
+    static constexpr std::string_view names[] = {"append", "push",
+                                                 "insert"};
+    return std::find(std::begin(names), std::end(names), n)
+        != std::end(names);
 }
 
 /* the static type of what a store into a container of static type `c`
@@ -4492,9 +4501,9 @@ static bool in_place_store(std::string_view n)
 static StaticTypeRef elem_place_of(StaticTypeRef c)
 {
     c = static_type_resolve(c);
-    if (c && c->kind == StaticTypeKind::Array)
+    if (c->kind == StaticTypeKind::Array)
         return c->elem;
-    if (c && c->kind == StaticTypeKind::Dict)
+    if (c->kind == StaticTypeKind::Dict)
         return c->val;
     return nullptr;
 }
@@ -4504,11 +4513,11 @@ static StaticTypeRef elem_place_of(StaticTypeRef c)
 static bool ctype_unfilled(StaticTypeRef t)
 {
     t = static_type_resolve(t);
-    if (!t || t->kind == StaticTypeKind::None
+    if (t->kind == StaticTypeKind::None
            || t->kind == StaticTypeKind::Unknown)
         return true;
     if (t->kind == StaticTypeKind::Array || t->kind == StaticTypeKind::Box)
-        return t->elem && ctype_unfilled(t->elem);
+        return ctype_unfilled(t->elem);
     if (t->kind == StaticTypeKind::Dict)
         return ctype_unfilled(t->key) || ctype_unfilled(t->val);
     return false;
@@ -4523,9 +4532,9 @@ static bool ctype_unfilled(StaticTypeRef t)
  */
 const TypeAnnot *Inferencer::ctype_of(StaticTypeRef t, bool dict)
 {
+    /* (a place's or a node's own type: never null) */
     t = static_type_resolve(t);
-    if (!t)
-        return nullptr;
+    ML_CHECK(t);
     if (t->kind == StaticTypeKind::Dyn)
         return dict ? annot_dyn_dict() : annot_dyn_array();
     if (t->kind != (dict ? StaticTypeKind::Dict : StaticTypeKind::Array)
@@ -4540,14 +4549,13 @@ const TypeAnnot *Inferencer::ctype_of(StaticTypeRef t, bool dict)
  * gives it its type, through ArgLocs::ctype */
 static bool builtin_builds_container(std::string_view n)
 {
-    return n == "range" || n == "array" || n == "make_array" ||
-           n == "make_dict" || n == "dict" || n == "keys" ||
-           n == "values" || n == "kvpairs" || n == "map" ||
-           n == "filter" || n == "split" || n == "splitlines" ||
-           n == "readlines" || n == "clone" || n == "deepclone" ||
-           n == "dynarray" || n == "sort" || n == "rev_sort" ||
-           n == "reverse" || n == "globals" || n == "specializations" ||
-           n == "int_events";
+    static constexpr std::string_view names[] = {
+        "range", "array", "make_array", "make_dict", "dict", "keys",
+        "values", "kvpairs", "map", "filter", "split", "splitlines",
+        "readlines", "clone", "deepclone", "dynarray", "sort", "rev_sort",
+        "reverse", "globals", "specializations", "int_events"};
+    return std::find(std::begin(names), std::end(names), n)
+        != std::end(names);
 }
 
 /* Q2: a BAKED mutable value's containers take the type `t` gives them
@@ -4609,15 +4617,11 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
     case ConstructType::call: {
         auto *call = static_cast<CallExpr *>(n);
         auto *cid = node_cast<Identifier>(call->what.get());
-        bool builtin = false;
-        if (cid && is_builtin(cid->uid)) {
-            auto sit = id_sym.find(cid);
-            builtin = sit == id_sym.end() || !sit->second;
-        }
-        if (builtin && call->args
-                && builtin_builds_container(cid->uid->val)) {
+        const bool builtin = cid && names_builtin(cid);
+        ML_CHECK(call->args);      /* every call has a (maybe empty) list */
+        if (builtin && builtin_builds_container(cid->uid->val)) {
             const StaticTypeRef own = static_type_resolve(type_of(call));
-            const bool dict = own && own->kind == StaticTypeKind::Dict;
+            const bool dict = own->kind == StaticTypeKind::Dict;
             call->args->ctype = ctype_untyped.count(call) ? nullptr
                 : ctype_dyn_place.count(call)
                     ? (dict ? annot_dyn_dict() : annot_dyn_array())
@@ -4625,29 +4629,26 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
         }
         /* an argument a fit check examines, or one whose parameter's type
          * is unknown here (a call through a function value) */
-        if (call->args) {
-            auto &as = call->args->elems;
-            const bool known = builtin
-                || cs_struct_callee(call->what.get())
-                || callee_funcinfo(call->what.get());
-            /* a value stored into a `dyn` container by an in-place
-             * builtin: its element type is unknown here */
-            const bool into_dyn = builtin && !as.empty()
-                && (cid->uid->val == "append" || cid->uid->val == "push"
-                    || cid->uid->val == "insert")
-                && is_dyn(static_type_resolve(type_of(as[0].get())));
-            for (size_t i = 0; i < as.size(); i++)
-                if (!known || (into_dyn && i > 0)
-                        || arg_fit_checked(call, i))
-                    ctype_untype(as[i].get());
-            /* Q2 increment 2: an append / push / insert whose element
-             * type the compiler does not know checks the value against
-             * the container's own type; so does a call that may reach
-             * one through a function value */
-            call->args->ct_store = !known
-                || (builtin && !as.empty() && in_place_store(cid->uid->val)
-                    && ct_unsettled(elem_place_of(type_of(as[0].get()))));
-        }
+        auto &as = call->args->elems;
+        const bool known = builtin
+            || cs_struct_callee(call->what.get())
+            || callee_funcinfo(call->what.get());
+        /* an append / push / insert (its container is argument 0) */
+        const bool stores = builtin && !as.empty()
+            && in_place_store(cid->uid->val);
+        /* a value stored into a `dyn` container by an in-place builtin:
+         * its element type is unknown here */
+        const bool into_dyn = stores
+            && is_dyn(static_type_resolve(type_of(as[0].get())));
+        for (size_t i = 0; i < as.size(); i++)
+            if (!known || (into_dyn && i > 0) || arg_fit_checked(call, i))
+                ctype_untype(as[i].get());
+        /* Q2 increment 2: an append / push / insert whose element type
+         * the compiler does not know checks the value against the
+         * container's own type; so does a call that may reach one
+         * through a function value */
+        call->args->ct_store = !known
+            || (stores && ct_unsettled(elem_place_of(type_of(as[0].get()))));
         break;
     }
     case ConstructType::expr04: {
@@ -4655,7 +4656,7 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
          * starts untyped, ctype_sum_copy): it gets the type the place it
          * is written into has, else the sum's own (StampTypeV) */
         const StaticTypeRef own = static_type_resolve(type_of(n));
-        if (own && own->kind == StaticTypeKind::Array)
+        if (own->kind == StaticTypeKind::Array)
             n->ctype = ctype_untyped.count(n) ? nullptr
                 : ctype_dyn_place.count(n) ? annot_dyn_array()
                 : ctype_of(dest ? dest : own, false);
@@ -4684,10 +4685,9 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
                                           type_of(base)))))
                 ctype_untype(e->rvalue.get());
             if (auto *id = node_cast<Identifier>(e->lvalue.get())) {
-                auto it = id_sym.find(id);
-                if (it != id_sym.end() && it->second) {
+                if (TypeSym *sym = user_sym(id)) {
                     stamp_ctypes(e->lvalue.get(), nullptr);
-                    stamp_ctypes(e->rvalue.get(), it->second->type);
+                    stamp_ctypes(e->rvalue.get(), sym->type);
                     return;
                 }
             }
@@ -4704,9 +4704,7 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
  * a ternary's arms and a `??`'s sides, which are what the place gets */
 void Inferencer::ctype_untype(Construct *n)
 {
-    if (!n)
-        return;
-    switch (ctag(n)) {
+    switch (ctag(n)) {           /* (ctag of a null is `other`) */
     case ConstructType::ternary: {
         auto *t = static_cast<TernaryExpr *>(n);
         ctype_untype(t->thenExpr.get());
@@ -4727,6 +4725,21 @@ void Inferencer::ctype_untype(Construct *n)
     default:
         return;
     }
+}
+
+/* the symbol a program declares that `id` names, or null: a builtin (or
+ * a name nothing declares, which the resolver refuses) */
+TypeSym *Inferencer::user_sym(const Identifier *id)
+{
+    auto it = id_sym.find(id);
+    return it == id_sym.end() ? nullptr : it->second;
+}
+
+/* `cid` names the builtin itself, not a function or a variable of the
+ * program that takes its name */
+bool Inferencer::names_builtin(const Identifier *cid)
+{
+    return is_builtin(cid->uid) && !user_sym(cid);
 }
 
 /* Q2: does a fit check (#49) examine argument `i` of `call` where it is
@@ -4816,8 +4829,7 @@ void Inferencer::set_array_repr_hint(Expr14 *e)
         if (!cid || !call->args)
             return;
         /* must be the builtin, not a user function of the same name */
-        auto sit = id_sym.find(cid);
-        if ((sit != id_sym.end() && sit->second) || !is_builtin(cid->uid))
+        if (!names_builtin(cid))
             return;
         /* keys()/values() honor a flat hint too: building keys/values of a
          * scalar dict into a flat array<int>/<float>/<bool> avoids per-element
@@ -7680,8 +7692,7 @@ void Inferencer::check_builtin_store(CallExpr *call)
     const std::string_view nm = cid->uid->val;
     ExprList *al = call->args.get();
     const size_t vi = nm == "insert" ? 2 : 1;
-    if ((nm != "append" && nm != "push" && nm != "insert")
-        || !al || al->elems.size() <= vi
+    if (!in_place_store(nm) || !al || al->elems.size() <= vi
         || ctag(al->elems[0].get()) == ConstructType::id)
         return;
     StaticTypeRef d = declared_type_of(al->elems[0].get());
