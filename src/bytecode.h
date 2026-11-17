@@ -2715,10 +2715,22 @@ struct Chunk {
      * carries -1). Strings, so serializable as-is.
      */
     std::vector<std::vector<std::string>> catch_types;
-    /* DERIVED from catch_types (#74 inc 3): the same names as interned
-     * UniqueId pointers, for vm_catch_match's pointer compare. NOT primary
-     * serializable data - a .myv load re-interns from catch_types. */
-    std::vector<std::vector<const UniqueId *>> catch_uids;
+    /*
+     * Per catch_types entry, what vm_catch_match compares. `def` is
+     * question 25's struct IDENTITY: the struct the name resolved to
+     * where the clause is written (it catches that struct only), null for
+     * a built-in exception's name or a name an open world (the REPL)
+     * could not resolve - PRIMARY data, stored in a .myv as a struct
+     * index. `uid` (the name interned, #74 inc 3's pointer compare) and
+     * `builtin` (is_catchable_ex_name: such a name matches no struct) are
+     * DERIVED from the name, so a load rebuilds them.
+     */
+    struct CatchKey {
+        const UniqueId *uid = nullptr;
+        const StructTypeDef *def = nullptr;
+        bool builtin = false;
+    };
+    std::vector<std::vector<CatchKey>> catch_keys;
 
     /*
      * Baked const array/dict/struct literals (LoadLiteralObjV). The op reads

@@ -2,8 +2,14 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 41.  This document describes the on-disk image exhaustively:
+Format version 42.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v42: each catch type name (9.9) is followed by the struct it names, an
+`sref`.  A catch clause catches a struct by IDENTITY - the struct its name
+resolves to where the clause is written - so two structs named `Err` are
+told apart, and a name stored with a null `sref` is a built-in exception's
+or one an open world (the REPL) could not resolve.)
 
 (v41: a LiteralObj (9.10) loses its `arr_hint` and `arr_hint_struct`.  The
 compiler now builds a baked literal's value in the storage its destination
@@ -987,11 +993,19 @@ One caret pair per step of a subscript chain store, innermost first.
 
 9.9  CatchTypes
 
-    N x sid
+    N x CatchType
 
-One list per try region: the catch clause type names, in order.  Their
-interned twins (`catch_uids`) are DERIVED - re-interned at load, not stored
-(section 12).
+    CatchType:
+        sid   name          the clause's type name, as written
+        sref  struct_def    v42 - the struct the name resolved to (the
+                            clause catches that struct only), or null:
+                            a built-in exception's name (TypeErrorEx,
+                            ...), or a name an open world could not
+                            resolve, which matches by name
+
+One list per try region: the catch clause types, in order.  The name's
+interned twin and whether it is a built-in exception's are DERIVED
+(`catch_keys`) - rebuilt at load, not stored (section 12).
 
 9.10  LiteralObj - a baked const array/dict/struct literal
 
@@ -1384,8 +1398,10 @@ implementation free to drift.
                           always justified this way, so a valid image
                           keeps every one).
 
-    Chunk::catch_uids     The interned twins of `catch_types`; re-interned
-                          inline as the names are read.
+    Chunk::catch_keys     Per catch type, the name's interned twin and
+                          whether it is a built-in exception's
+                          (is_catchable_ex_name); rebuilt inline as the
+                          names are read.  Its struct is stored (9.9).
 
     Chunk::native, native_leaf, native_entry_off
                           The native tier: recomputed by

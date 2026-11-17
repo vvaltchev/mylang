@@ -7939,7 +7939,7 @@ struct Codegen {
         auto bail = [&]() {
             code.resize(start);
             chunk.catch_types.resize(ct_start);
-            chunk.catch_uids.resize(ct_start);
+            chunk.catch_keys.resize(ct_start);
             trys.resize(trys_depth);
             /* #78: drop this region's half-built site (the region ID is not
              * reclaimed - a hole costs one unused table + pends slot) */
@@ -8025,14 +8025,21 @@ struct Codegen {
             int types_idx = -1;
             if (cs.first.exList) {
                 std::vector<std::string> names;
-                std::vector<const UniqueId *> uids;
-                for (const auto &id : cs.first.exList->elems) {
-                    names.push_back(std::string(id->get_str()));
-                    uids.push_back(id->uid);   /* derived twin (#74) */
+                std::vector<Chunk::CatchKey> keys;
+                const auto &defs = cs.first.defs;
+                const auto &ids = cs.first.exList->elems;
+                for (size_t k = 0; k < ids.size(); k++) {
+                    names.push_back(std::string(ids[k]->get_str()));
+                    Chunk::CatchKey key;
+                    key.uid = ids[k]->uid;
+                    key.def = k < defs.size() ? defs[k] : nullptr;
+                    key.builtin = !key.def
+                                  && is_catchable_ex_name(names.back());
+                    keys.push_back(key);
                 }
                 types_idx = static_cast<int>(chunk.catch_types.size());
                 chunk.catch_types.push_back(std::move(names));
-                chunk.catch_uids.push_back(std::move(uids));
+                chunk.catch_keys.push_back(std::move(keys));
             }
             const Identifier *asId = cs.first.asId.get();
             site().clauses.push_back({ types_idx,

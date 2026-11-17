@@ -158,7 +158,8 @@ def chunk(r):
         r.loc(); r.loc(); r.loc(); r.loc()
     for _ in range(r.u32()):                      # 9.8 chain_locs
         for _ in range(r.u32()): r.loc(); r.loc()
-    for _ in range(r.u32()): r.nx(r.sid)          # 9.9 catch_types
+    for _ in range(r.u32()):                      # 9.9 catch_types
+        r.nx(lambda: (r.sid(), r.sref()))         # v42: + struct_def
     for _ in range(r.u32()):                      # 9.10 literal_objs
         value(r); r.boolv()                       # (v41: no hint)
     r.nx(r.dref)                                  # closure_defs

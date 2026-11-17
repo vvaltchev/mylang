@@ -7546,10 +7546,24 @@ struct HandlingScope {
     ~HandlingScope() { fs.handling = prev; }
 };
 
+/* the struct a thrown exception carries, or null (a built-in exception,
+ * or a box: a box<P> is not a P) */
+const StructTypeDef *exc_struct_def(const RuntimeException *ex)
+{
+    if (!ex->is_exception_object())
+        return nullptr;
+    const EvalValue &d = static_cast<const ExceptionObject *>(ex)->get_data();
+    if (!d.is<intrusive_ptr<StructObject>>())
+        return nullptr;
+    const StructObject &o = *d.get_ref<intrusive_ptr<StructObject>>();
+    return o.boxed ? nullptr : o.def;
+}
+
 static bool
 do_catch(EvalContext *ctx,
          RuntimeException *saved_ex,
          IdList *exList,
+         const std::vector<const StructTypeDef *> &defs,
          Identifier *asId,
          Construct *catchBody)
 {
@@ -7558,7 +7572,7 @@ do_catch(EvalContext *ctx,
     if (!saved_ex->is_catchable())
         return false;
 
-    if (!exList) {
+    if (!exList && !asId) {
 
         /* Catch-anything block */
         HandlingScope hs(*ctx->flow, saved_ex);
@@ -7569,15 +7583,35 @@ do_catch(EvalContext *ctx,
     ExceptionObject *exObj = saved_ex->is_exception_object()
         ? static_cast<ExceptionObject *>(saved_ex) : nullptr;
     string_view ex_name = exObj ? exObj->get_name() : saved_ex->name;
+    /* `catch (dyn as e)` (question 25): the catch-all that binds */
+    const size_t n_types = exList ? exList->elems.size() : 0;
+    bool matched = !exList;
     /* interned-pointer matching when available (#74 inc 3); the catch
      * clause ids are interned already, so pointer == string equality */
     const UniqueId *ex_uid = saved_ex->match_uid();
+    /* question 25: a clause names a struct by identity (defs, from the
+     * inferencer); a built-in exception's name matches no struct */
+    const StructTypeDef *ex_def = exc_struct_def(saved_ex);
 
-    for (const unique_ptr<Identifier> &id : exList->elems) {
+    for (size_t ci = 0; ci < n_types && !matched; ci++) {
 
-        if (ex_uid ? (id->uid != ex_uid) : (id->get_str() != ex_name))
+        const unique_ptr<Identifier> &id = exList->elems[ci];
+        const StructTypeDef *cd = ci < defs.size() ? defs[ci] : nullptr;
+        if (cd) {
+            if (cd != ex_def)
+                continue;
+        } else if (ex_def && is_catchable_ex_name(id->get_str())) {
             continue;
+        } else if (ex_uid ? (id->uid != ex_uid)
+                          : (id->get_str() != ex_name)) {
+            continue;
+        }
+        matched = true;
+    }
+    if (!matched)
+        return false;
 
+    {
         {
             EvalContext catch_ctx(ctx);
 
@@ -7633,8 +7667,6 @@ do_catch(EvalContext *ctx,
 
         return true;
     }
-
-    return false;
 }
 
 EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
@@ -7667,7 +7699,8 @@ EvalValue TryCatchStmt::do_eval(EvalContext *ctx, bool rec) const
 
         for (const auto &p : catchStmts) {
             if (do_catch(ctx, saved_ex.get(), p.first.exList.get(),
-                         p.first.asId.get(), p.second.get()))
+                         p.first.defs, p.first.asId.get(),
+                         p.second.get()))
                 return;                    /* handled (do_catch may itself throw) */
         }
 

@@ -986,6 +986,32 @@ static const std::vector<test> tests =
      * value would be used it is a compile error - it used to be none,
      * which a typed destination held at run time (RULE 1). Each case
      * marks the multi-assignment. */
+    /* question 25: a catch clause names a struct by IDENTITY - the one
+     * its name resolves to where the clause is written. A name no struct
+     * in scope takes and no built-in exception has is not a type, and a
+     * clause naming one struct gives its variable that struct's type. */
+    { "catch: a name that is no type is refused",
+      { "try { } catch (Nope) { }" },
+      &typeid(SyntaxErrorEx), 16, 1, 21, 1 },
+    { "catch: a variable's name is no type",
+      { "var x = 1; try { } catch (x) { }" },
+      &typeid(SyntaxErrorEx), 27, 1, 29, 1 },
+    { "catch: a function's own struct is no type outside it",
+      { "func f() { struct E { int v; } }",
+        "try { } catch (E) { }" },
+      &typeid(SyntaxErrorEx), 16, 2, 18, 2 },
+    { "catch: `catch (dyn` needs `as` and a name",
+      { "try { } catch (dyn) { }" },
+      &typeid(SyntaxErrorEx) },
+    { "catch: the fallback `catch (dyn as e)` comes last",
+      { "try { } catch (dyn as e) { } catch (TypeErrorEx) { }" },
+      &typeid(SyntaxErrorEx) },
+    { "catch: a one-struct clause's variable has that struct's type",
+      { "struct E { int v; }",
+        "try { throw E(runtime(1)); }",
+        "catch (E as e) { print(e.nope); }" },
+      &typeid(TypeMismatchEx), 24, 3, 31, 3 },
+
     { "multi-assign has no value: an assignment's value",
       { "var a = 0; var b = 0; var dyn w = 1;",
         "w = a, b = [5, 6];" },
@@ -1604,7 +1630,7 @@ static const std::vector<test> tests =
         "var got = [];",
         "foreach (var K in [[5], [6]]) { K = [7]; append(got, K); }",
         "struct E { int x; }",
-        "try { throw E(1); } catch (E as K) { K = [3]; append(got, K); }",
+        "try { throw E(1); } catch (dyn as K) { K = [3]; append(got, K); }",
         "assert(got == [[7], [7], [3]]);",
         "func f() { const L = [1];",
         "           var g = func(L) { L = [2]; return L; };",
@@ -2266,7 +2292,7 @@ static const std::vector<test> tests =
         "assert(use(rt(4)) == 8);",
         "var caught = 0;",
         "try { app(func(v) { struct E4 { int n; } throw E4(v); }, rt(7)); }",
-        "catch (E4 as e) { caught = e.n; }",
+        "catch (dyn as e) { caught = e.n; }",
         "assert(caught == 7);" } },
     { "inline: a literal arg written through by an EXPRESSION body",
       { "func ap(p) => pop(p) + 1;",
@@ -6159,7 +6185,8 @@ static const std::vector<test> tests =
             "func f() { var s = 0;",
             "           for (var i = 0; i < 3; i += 1) { s += i; }",
             "           return s; }",
-            "func g() { try { return 1; } catch (Foo) { return 2; } }",
+            "func g() { try { return 1; } catch (TypeErrorEx) {",
+            "           return 2; } }",
             "assert(ispure(f));",
             "assert(ispure(g));",
             "assert(f() == 3);",
@@ -12572,7 +12599,8 @@ static const std::vector<test> tests =
             "func f {",
             "   var t = 0;",
             "   for (var i = 0; i < 10; i++) {",
-            "       try { t += i; if (i == 3) return t; } catch (E) { }",
+            "       try { t += i; if (i == 3) return t; }",
+            "       catch (TypeErrorEx) { }",
             "   }",
             "   return -1;",
             "}",
@@ -20510,6 +20538,46 @@ const_eval_note_rule()
 }
 
 /*
+ * Question 25: a catch clause may name a built-in exception only if its
+ * name is in is_catchable_ex_name's list (errors.h) - every other name
+ * must be a struct in scope. So the list must spell each catchable class
+ * exactly, and hold no uncatchable one: each class is constructed and its
+ * own name asked.
+ */
+static bool
+catch_names_every_builtin_ex()
+{
+    const RuntimeException *catchable[] = {
+        new UnboundSymbolEx(), new InvalidArgumentEx(),
+        new InvalidNumberOfArgsEx(), new CannotChangeConstEx(),
+        new DivisionByZeroEx(), new StackOverflowEx(),
+        new OutOfMemoryEx(), new AssertionFailureEx(), new NotLValueEx(),
+        new TypeErrorEx(), new InvalidValueEx(), new NotCallableEx(),
+        new OutOfBoundsEx(), new KeyNotFoundEx(), new CannotOpenFileEx(),
+    };
+    const RuntimeException *uncatchable[] = {
+        new InternalErrorEx(), new CannotRebindConstEx(),
+        new CannotRebindBuiltinEx(),
+    };
+    bool ok = true;
+    for (const RuntimeException *e : catchable) {
+        if (!e->is_catchable() || !is_catchable_ex_name(e->name)) {
+            cout << "catchable " << e->name << " not listed\n";
+            ok = false;
+        }
+        delete e;
+    }
+    for (const RuntimeException *e : uncatchable) {
+        if (e->is_catchable() || is_catchable_ex_name(e->name)) {
+            cout << "uncatchable " << e->name << " listed\n";
+            ok = false;
+        }
+        delete e;
+    }
+    return ok;
+}
+
+/*
  * Backtrace formatting: param names shown, most-recent on top with "main" at
  * the bottom, single-digit [N] frame numbers, line attribution (error site for
  * the top frame, call site otherwise), and the "at line" column aligned.
@@ -23434,6 +23502,16 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* question 25: a clause names a struct by identity; in the REPL's
+     * open world a name no struct takes yet may be declared by a later
+     * input, so such a clause matches by name */
+    { "a catch clause naming a struct a later input declares",
+      { { "func f25() { try { g25(); } catch (L25 as e) { return e.v; } "
+          "return 0; }", "" },
+        { "struct L25 { int v; }", "" },
+        { "func g25() { throw L25(int(runtime(5))); }", "" },
+        { "f25()", "=> 5" },
+        { "try { g25(); } catch (dyn as e) { print(e); }", "L25(v: 5)" } } },
     /* a type alias is a const of the REPL's open world: an earlier
      * input's alias constructs, types and names a catch clause later */
     { "a type alias across inputs",
@@ -61526,6 +61604,8 @@ static const std::vector<extra_check> extra_checks =
       inliner_tail_block_backtrace },
     { "errfmt: a constant expression's compile error says so",
       const_eval_note_rule },
+    { "catch: the built-in exception names a clause may use",
+      catch_names_every_builtin_ex },
     { "backtrace: basic format & alignment", backtrace_format_basic },
     { "backtrace: zero-padding for >9 frames", backtrace_zero_padding },
     { "backtrace: long-frame truncation", backtrace_truncation },

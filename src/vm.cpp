@@ -3403,17 +3403,24 @@ static ML_ALWAYS_INLINE bool vm_catch_match(const Chunk &chunk,
     if (types_idx < 0)
         return true;                              /* catch-all */
 
-    if (const UniqueId *eu = exc->match_uid()) {
-        for (const UniqueId *u : chunk.catch_uids[types_idx])
-            if (u == eu)
+    /* question 25: a struct by identity; a built-in exception's name
+     * matches no struct; an unresolved name (an open world) by name */
+    const StructTypeDef *xd = exc_struct_def(exc);
+    const UniqueId *eu = exc->match_uid();
+    const auto &keys = chunk.catch_keys[types_idx];
+    for (size_t k = 0; k < keys.size(); k++) {
+        const Chunk::CatchKey &key = keys[k];
+        if (key.def) {
+            if (key.def == xd)
                 return true;
-        return false;
-    }
-
-    const std::string_view en = vm_exc_name(exc);
-    for (const std::string &nm : chunk.catch_types[types_idx])
-        if (nm == en)
+            continue;
+        }
+        if (key.builtin && xd)
+            continue;
+        if (eu ? key.uid == eu
+               : chunk.catch_types[types_idx][k] == vm_exc_name(exc))
             return true;
+    }
     return false;
 }
 

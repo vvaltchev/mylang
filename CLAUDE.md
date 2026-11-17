@@ -8031,21 +8031,36 @@ and two macros:
   `NotLValueEx`, `NotCallableEx`,
   `AssertionFailureEx`, `CannotOpenFileEx`, `InvalidValueEx`. These are the ones
   script `try/catch`
-  can handle (matched by name).
+  can handle (matched by name; a clause may name one only if it is in
+  `is_catchable_ex_name`'s list).
 - **User exceptions are STRUCTS.** `throw <struct instance>`
   (`ThrowStmt::do_eval`, `eval.cpp`) wraps the instance in an
   `ExceptionObjectTempl` (`exceptionobj.h`) — a `RuntimeException` whose C++
   type name is `"DynamicExceptionEx"`, whose `dyn_name` is the **struct type's
-  name** (so `catch (T)` matches by type), and whose `data` EvalValue is the
+  name**, and whose `data` EvalValue is the
   struct itself. `throw` accepts only a struct instance, or a caught built-in
   exception object (re-throw); anything else is a `TypeErrorEx` (and a
   statically-known non-struct/non-exception throw is a compile-time
-  `TypeMismatchEx` from the inferencer). `do_catch` matches a catch clause by
-  the `dyn_name`/built-in `name` string, and `catch (T as e)` binds `e` to the
+  `TypeMismatchEx` from the inferencer).
+  **⛔ A CLAUSE CATCHES A STRUCT BY IDENTITY (question 25, 2026-11-16)**:
+  the inferencer's structural pass (`resolve_catch_types`, so -nti too)
+  resolves each clause name where the clause is written and stores the
+  `StructTypeDef *` in `AllowedExList::defs`; codegen copies it into
+  `Chunk::catch_keys` (the `.myv` stores it, v42), and BOTH matchers
+  (`do_catch`, `vm_catch_match`) compare it with the thrown instance's def
+  (`exc_struct_def`: null for a built-in exception or a box). A null def is
+  a built-in exception's name (`is_catchable_ex_name`, errors.h - which
+  then matches NO struct, even one named like it) or, in an OPEN world
+  only (the REPL, a parse-time copy: `closed_world` false), a name nothing
+  declares yet, which matches by name; in a script such a name is a
+  compile error. So a function's private struct is caught outside it only
+  by a catch-all, and `catch (dyn as e)` is the catch-all that binds (no
+  exList, an asId). `catch (T as e)` binds `e` to the
   **struct instance** (`exObj->get_data()`, so `e.field` works) when the
   exception carries one, else to a fresh `ExceptionObject` wrapper (the
-  payload-less built-in case — printable/re-throwable). The catch variable is
-  typed `dyn` by the inferencer (member access resolved at runtime). `finally`
+  payload-less built-in case — printable/re-throwable). The catch variable
+  has the struct's type when its clause names ONE struct (an annotated
+  symbol, `ann_struct`), and is `dyn` otherwise. `finally`
   runs via a scope guard; `rethrow` re-throws a COPY of the saved exception
   with the rethrow site's `Loc` (the saved one stays as caught, for a second
   `rethrow` and for the chain below). (The old `exception()`/`ex()`/`exdata()`

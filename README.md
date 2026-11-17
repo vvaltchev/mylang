@@ -2747,6 +2747,9 @@ exceptions that can be caught with `try-catch` blocks is:
   * CannotChangeConstEx (a `const`/read-only container mutated through a
     mutating builtin — `append`/`push`/`insert`/`erase`/`sort`; the const-ness
     is a *runtime* property, e.g. an aliased const passed as a parameter)
+  * InvalidValueEx (a value a builtin cannot use, e.g. `int("3.7")`)
+  * UnboundSymbolEx (a name read before its declaration has run - see
+    `isbound`)
 
 Other exceptions like `SyntaxErrorEx` cannot be caught, instead.
 
@@ -2789,6 +2792,22 @@ try {
 } catch {
 
     # Something went wrong.
+}
+```
+
+To see what was caught, write the catch-anything as `catch (dyn as e)`: it
+catches everything `catch { }` does and binds the exception to `e`, a `dyn`
+variable - the struct instance for a thrown struct (whatever its type, a
+function's private struct included), a printable exception object for a
+built-in one. It is the last clause of its `try`, after any typed ones:
+
+```C#
+try {
+    run_job();
+} catch (TypeErrorEx) {
+    print("bad input");
+} catch (dyn as e) {
+    print("job failed:", e);
 }
 ```
 
@@ -3162,9 +3181,31 @@ try {
 
 `throw MyError(...)` constructs the struct (positional, named, or mixed
 arguments — exactly like any struct construction) and throws it. The matching
-`catch (MyError)` selects the clause **by the struct type's name**, and
-`catch (MyError as e)` additionally binds `e` to the thrown instance, so
-`e.msg` / `e.code` read its fields.
+`catch (MyError)` selects the clause **by the struct type itself**: the name
+is resolved where the clause is written, exactly like the type in
+`MyError e;` (a type alias names its struct), and the clause catches that
+struct only. `catch (MyError as e)` additionally binds `e` to the thrown
+instance, with the type `MyError`, so `e.msg` / `e.code` read its fields and
+a field it does not have is a compile error.
+
+Two structs with the same name are two types. A struct declared inside a
+function is that function's own: a clause outside it cannot name it - the
+name there means another struct, or nothing - so such an exception is caught
+outside only by a catch-all. A name that is neither a struct visible where
+the clause is written nor a built-in exception is a compile error:
+
+```C#
+func load() { struct Err { int code; } throw Err(7); }
+struct Err { bool ok; }
+
+try { load(); } catch (Err) { ... }         # not caught: load's Err is
+                                            # another type
+try { load(); } catch (dyn as e) { print(e); }   # Err(code: 7)
+try { load(); } catch (Nope) { }            # ERROR: 'Nope' is not a type
+```
+
+(In the REPL a later input may declare the struct, so there a name no
+struct takes yet matches the thrown struct by its name.)
 
 As with built-in exceptions, a single `catch` may list several types, and a
 catch variable bound with `as` is available in the handler:
@@ -3180,10 +3221,10 @@ try {
 }
 ```
 
-When the same handler catches more than one struct type, only the fields the
-types have in common are safe to read (the bound `e` is dynamically typed, so
-field access is resolved at run time). A struct exception that no `catch`
-clause matches propagates outward like any other exception.
+When the same handler catches more than one type, only the fields the
+types have in common are safe to read (the bound `e` is then dynamically
+typed, so field access is resolved at run time). A struct exception that no
+`catch` clause matches propagates outward like any other exception.
 
 A payload-less exception is simply a struct with no relevant fields (or one
 whose fields you ignore):

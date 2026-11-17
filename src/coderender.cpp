@@ -797,6 +797,9 @@ struct Renderer {
                     if (cs.first.asId)
                         o << " as " << cs.first.asId->get_str();
                     o << ") ";
+                } else if (cs.first.asId) {
+                    /* the catch-all that binds (question 25) */
+                    o << "(dyn as " << cs.first.asId->get_str() << ") ";
                 }
                 inline_block(cs.second.get(), level);
             }

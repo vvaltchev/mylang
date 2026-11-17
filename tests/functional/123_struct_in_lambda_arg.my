@@ -34,11 +34,12 @@ func use(int k) {
 }
 want("tail", use(rt(4)), 8);
 
-# thrown out of the pasted function, and caught by name
+# thrown out of the pasted function: the struct is the function's own,
+# so no clause outside it can name it - the fallback catches it
 var caught = 0;
 try {
     app(func(v) { struct E4 { int n; } throw E4(v); }, rt(7));
-} catch (E4 as e) {
+} catch (dyn as e) {
     caught = e.n;
 }
 want("thrown", caught, 7);

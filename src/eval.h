@@ -720,6 +720,11 @@ struct FitMisfit {
 };
 bool value_fits(const EvalValue &v, const TypeAnnot &a, FitMisfit &why);
 
+/* question 25: the struct a thrown exception carries (what a catch clause
+ * naming a struct compares by identity), or null - a built-in exception,
+ * or a box (a box<P> is not a P) */
+const StructTypeDef *exc_struct_def(const RuntimeException *ex);
+
 /* the misfit errors, loc-less: a parameter's (`site_arg`: the call-site
  * argument index, as none_bind_error's) and a store's */
 TypeErrorEx param_fit_error(const UniqueId *param, const TypeAnnot &a,

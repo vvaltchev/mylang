@@ -1524,7 +1524,7 @@ void write_chunk(Writer &w, const Chunk &c)
      * entry (931 of samples/shopping's bytes, 14% of the image). The read
      * side is the build_boxed_ops call at the END of read_chunk, after `locs`
      * (which it needs) has been read - the same rebuild-a-derived-twin shape
-     * `catch_uids` already uses.
+     * `catch_keys` already uses.
      */
 
     w.u32v(static_cast<uint32_t>(c.ctor_plans.size()));
@@ -1572,11 +1572,24 @@ void write_chunk(Writer &w, const Chunk &c)
         for (const auto &pr : v) { w.locv(pr.first); w.locv(pr.second); }
     }
 
+    /* each name, then (v42, question 25) the struct it resolved to: a
+     * struct index, 0xFFFFFFFF for none */
     w.u32v(static_cast<uint32_t>(c.catch_types.size()));
-    for (const auto &v : c.catch_types) {
+    for (size_t i = 0; i < c.catch_types.size(); i++) {
+        const auto &v = c.catch_types[i];
         w.u32v(static_cast<uint32_t>(v.size()));
-        for (const auto &s : v)
-            w.strv(s);
+        for (size_t j = 0; j < v.size(); j++) {
+            w.strv(v[j]);
+            const StructTypeDef *d = c.catch_keys[i][j].def;
+            uint32_t si = 0xffffffffu;
+            if (d) {
+                auto it = w.struct_ids.find(d);
+                if (it == w.struct_ids.end())
+                    bad_image("unserializable image (catch struct)");
+                si = it->second;
+            }
+            w.u32v(si);
+        }
     }
 
     w.u32v(static_cast<uint32_t>(c.literal_objs.size()));
@@ -1736,7 +1749,7 @@ void read_chunk(Reader &r, Chunk &c)
         static_cast<int>(r.sizev("corrupt .myv (dyn iterator count)"));
     c.n_trys = static_cast<int>(r.sizev("corrupt .myv (try region count)"));
     /* DERIVED, never stored: the loader recomputes it from the three counts
-     * just read, the same rebuild-a-derived-twin shape catch_uids uses. */
+     * just read, the same rebuild-a-derived-twin shape catch_keys uses. */
     c.set_plain_frame();
 
     /* the HANDLER TABLE (write side: above) */
@@ -1900,18 +1913,28 @@ void read_chunk(Reader &r, Chunk &c)
 
     n = r.countv();
     c.catch_types.reserve(n);
-    c.catch_uids.reserve(n);
+    c.catch_keys.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
         std::vector<std::string> v;
-        std::vector<const UniqueId *> u;
+        std::vector<Chunk::CatchKey> u;
         const uint32_t m = r.countv();
         v.reserve(m); u.reserve(m);
         for (uint32_t j = 0; j < m; j++) {
             v.push_back(r.strv());
-            u.push_back(UniqueId::get(v.back()));   /* the derived twin */
+            Chunk::CatchKey key;
+            const uint32_t si = r.u32v();
+            if (si != 0xffffffffu) {
+                if (si >= r.structs.size())
+                    bad_image("corrupt .myv (catch struct)");
+                key.def = r.structs[si];
+            }
+            /* the derived half (what codegen derives from the name) */
+            key.uid = UniqueId::get(v.back());
+            key.builtin = !key.def && is_catchable_ex_name(v.back());
+            u.push_back(key);
         }
         c.catch_types.push_back(std::move(v));
-        c.catch_uids.push_back(std::move(u));
+        c.catch_keys.push_back(std::move(u));
     }
 
     n = r.countv();
@@ -2049,7 +2072,7 @@ void read_chunk(Reader &r, Chunk &c)
      * REBUILD the derived pools, LAST - both need data read above. The
      * loader calls the codegen's OWN function (codegen.h), never a private
      * copy, so what a load produces cannot drift from what a compile did.
-     * (`catch_uids`'s twin is re-interned inline where catch_types is read;
+     * (`catch_keys`' uid and builtin are rebuilt where catch_types is read;
      * boxed_ops needs the loc table, hence here.)
      */
     build_boxed_ops(c);
