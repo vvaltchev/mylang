@@ -533,13 +533,19 @@ def main():
               "are whole-suite checks, skipped" % why)
         if args.report:
             # what each unit run covered: against a whole run's uncovered
-            # list it says what a new unit adds, in minutes
+            # list it says what a new unit adds, in minutes. The elements
+            # these units met follow, so several subset runs that together
+            # run every unit (one per restartable chunk) give a whole
+            # run's totals: the universe is the union of what each run met
             with open(args.report, "w") as f:
                 for name in sorted(covered_by):
                     cov = sorted(covered_by[name])
                     f.write("== %s covers %d\n" % (name, len(cov)))
                     for e in cov:
                         f.write("  %s\n" % e)
+                f.write("== universe %d\n" % len(universe))
+                for e in sorted(universe):
+                    f.write("  %s\n" % e)
     elif args.gcov:
         all_cov = set().union(*covered_by.values()) if covered_by else set()
         uncovered = sorted(e for e in universe if e not in all_cov)
