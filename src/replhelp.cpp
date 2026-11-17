@@ -591,13 +591,16 @@ const LangFeature lang_features[] = {
 { "trycatch", "exceptions", "Exceptions",
   "struct MyError { str msg; }\ntry { throw MyError(\"boom\"); }\n"
   "catch (MyError as e) { print(e.msg); }\nfinally { ... }    rethrow;",
-  "try/catch/finally with catch clauses matched by exception NAME. A user "
-  "exception is a struct instance: `throw MyError(...)` is caught by "
-  "`catch (MyError)` (the struct type), and `catch (MyError as e)` binds the "
-  "instance so `e.field` reads its data. Built-in runtime errors "
-  "(DivisionByZeroEx, TypeErrorEx, OutOfBoundsEx, KeyNotFoundEx, ...) are "
-  "catchable too. COMPILE-time errors (type/syntax) are NOT catchable. "
-  "`rethrow` re-throws the in-flight exception from a catch." },
+  "try/catch/finally. A user exception is a struct instance: `throw "
+  "MyError(...)` is caught by `catch (MyError)` - by the struct ITSELF, "
+  "the one the name means where the clause is written, so two structs "
+  "named alike are two types - and `catch (MyError as e)` binds the "
+  "instance, typed MyError, so `e.field` reads its data. Built-in runtime "
+  "errors (DivisionByZeroEx, TypeErrorEx, OutOfBoundsEx, KeyNotFoundEx, "
+  "...) are caught by their name. `catch { }` catches anything, and "
+  "`catch (dyn as e)` also binds what it caught. COMPILE-time errors "
+  "(type/syntax) are NOT catchable. `rethrow` re-throws the in-flight "
+  "exception from a catch." },
 
 /* ---- types ---- */
 { "inference", "types", "Static type inference",
