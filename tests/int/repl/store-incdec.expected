@@ -98,7 +98,7 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 >> => 2.500000
 >> => [P(x: 2, y: 2.500000)]
 >> => [P(x: 2, y: 2.500000)]
->> TypeErrorEx: Cannot store a value of a different type in a flat (typed) array; declare the array dyn for a polymorphic array at line 52, col 1:6
+>> TypeErrorEx: the array's elements are 'P' but the value is an 'int' at line 52, col 1:6
 
     dp[0] = 5;
     ^^^^^
