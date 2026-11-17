@@ -7575,9 +7575,21 @@ void Inferencer::check_declared_store(Expr14 *e)
              || ctag(static_cast<Subscript *>(lv)->what.get())
                     == ConstructType::id)
         return;
-    const StaticTypeRef dest = declared_type_of(lv);
-    if (!dest)
-        return;
+    StaticTypeRef dest = declared_type_of(lv);
+    if (!dest) {
+        /* an element reached through something whose type was INFERRED
+         * (`var a = [["x"]]; a[0][0] = none;`): no contribution reaches
+         * it - only a store into a plain variable's element joins into
+         * that variable's type - so its type is final here, and a value
+         * that does not fit it is refused like one into a declared place.
+         * It compiled, and the array<array<str>> held the none (RULE 1:
+         * `len(a[0][0])` gave 0 in the VM and a TypeErrorEx in the
+         * tree-walker). An unfilled element (question 9) or a `dyn` one
+         * takes anything. */
+        dest = static_type_resolve(type_of(lv));
+        if (has_unknown(dest) || is_none(dest))
+            return;
+    }
     StaticTypeRef vt;
     if (e->op == Op::assign) {
         vt = literal_into(e->rvalue.get(), dest);
@@ -7602,10 +7614,18 @@ void Inferencer::check_builtin_store(CallExpr *call)
         || !al || al->elems.size() <= vi
         || ctag(al->elems[0].get()) == ConstructType::id)
         return;
-    const StaticTypeRef d = declared_type_of(al->elems[0].get());
-    if (!d)
-        return;
+    StaticTypeRef d = declared_type_of(al->elems[0].get());
+    if (!d) {
+        /* a container reached through something whose type was INFERRED
+         * - its type is final here (check_declared_store's note) */
+        d = static_type_resolve(type_of(al->elems[0].get()));
+        if (has_unknown(d) || is_none(d))
+            return;
+    }
     const auto value = [&](size_t i, StaticTypeRef into) {
+        /* an unfilled element (question 9) takes what is put in */
+        if (has_unknown(into) || is_none(static_type_resolve(into)))
+            return;
         Construct *v = al->elems[i].get();
         StaticTypeRef vt = literal_into(v, into);
         check_value_into(into, vt ? vt : type_of(v), "", v);
