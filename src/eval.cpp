@@ -2135,7 +2135,7 @@ bool try_construct_into_struct_array(EvalContext *ctx, SharedArrayObj &arr,
 EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
                             Loc a0s, Loc a0e, const StructTypeDef *cdef,
                             const ArgLoc *flocs, const EvalValue *vals,
-                            size_t n)
+                            size_t n, bool checked)
 {
     if (!target)
         throw NotLValueEx(a0s, a0e);
@@ -2182,6 +2182,12 @@ EvalValue vm_emplace_struct(EvalContext *ctx, LValue *target,
             def->fields[i], vals[i],
             flocs[i].start, flocs[i].end));
     const EvalValue elem(intrusive_ptr<StructObject>{obj});
+
+    /* Q2: an append through `dyn` (EmplaceSite::ct_store): the value fits
+     * the array's own type - loc-less, the whole argument list's caret
+     * (the op's loc entry), as the tree-walker's builtin_append stamps */
+    if (checked)
+        ct_fit_value(target->get(), elem);
 
     if (arr.skind() == SharedArrayObj::Storage::structs &&
         arr.flat_structs().def == def) {
@@ -2432,6 +2438,7 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                 al.nargs = n;
                 al.arr_hint = ael->arr_hint;
                 al.ctype = ael->ctype;
+                al.ct_store = ael->ct_store;
                 return dispatch_builtin_values(ctx, b, &al, argv, n);
             }
             /* question 5: a builtin the PARSER calls with a function in its
@@ -2950,10 +2957,10 @@ static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
  * The walk behind stamp_ctype / stamp_ctype_top / ctype_restamp. `mode`:
  * 0 the top container only (a literal: what it holds was typed where IT
  * was made, or is not its to type); 1 along the annotation, stopping at a
- * `dyn` element (a builtin's result: the fresh containers its static type
- * names); 2 along the annotation, and a fresh container under a `dyn`
- * element DYNAMIC (a baked value: every mutable container in it was made
- * by the literal, as the nested literals of -nc's tree are).
+ * `dyn` element (a builtin's result, a baked value: the fresh containers
+ * its static type names - one under a `dyn` element stays untyped, as a
+ * literal nested there is in -nc's tree, stamp_literal_coerce: only `dyn`
+ * reaches it, and it keeps the storage its own values gave it).
  */
 static void stamp_ctype_rec(const EvalValue &v, const TypeAnnot *t, int mode)
 {
@@ -2962,13 +2969,6 @@ static void stamp_ctype_rec(const EvalValue &v, const TypeAnnot *t, int mode)
     const auto sub = [&](const EvalValue &e, const TypeAnnot *et) {
         if (!et)
             return;
-        if (et->kind == DeclType::dyn) {
-            if (mode == 2)
-                stamp_ctype_rec(e, e.is<intrusive_ptr<DictObject>>()
-                                       ? annot_dyn_dict() : annot_dyn_array(),
-                                mode);
-            return;
-        }
         if (et->kind == DeclType::arr || et->kind == DeclType::dict)
             stamp_ctype_rec(e, annot_nonopt(et), mode);
     };
@@ -3051,12 +3051,12 @@ EvalValue ctype_restamp(const EvalValue &v, const TypeAnnot *t)
     if (cur == t)
         return v;
     if (!cur) {
-        stamp_ctype_rec(v, t, 2);
+        stamp_ctype_rec(v, t, 1);
         return v;
     }
     EvalValue c = make_mutable_clone(v);
     ctype_clear(c);
-    stamp_ctype_rec(c, t, 2);
+    stamp_ctype_rec(c, t, 1);
     return c;
 }
 
@@ -4260,6 +4260,7 @@ EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
 EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
 {
     EvalValue &&val = eval_first_rvalue(ctx).clone();
+    ctype_sum_copy(val);       /* Q2: the sum's copy starts untyped */
 
     for (auto &&it = elems.begin() + 1; it != elems.end(); it++) {
 
@@ -4277,6 +4278,9 @@ EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
         }
     }
 
+    /* Q2: the sum takes its static type (the VM's StampTypeV) */
+    if (ctype)
+        stamp_ctype_top(val, ctype);
     return std::move(val);
 }
 
@@ -4771,6 +4775,54 @@ slot_rmw(LValue &lv, Op op, const EvalValue &rval)
 }
 
 /*
+ * Q2: slot_rmw for a CHECKED store (Construct::ct_store, Instr::
+ * ct_checked) into an element or a dict value whose container's own type
+ * says `ea`: a compound's RESULT is checked (ct_fit) before it is put. A
+ * plain `=` was checked before the element was reached (ct_store_pre),
+ * so it is slot_rmw's. [s, e): a misfit's caret (Loc(): none).
+ */
+static EvalValue
+ct_rmw(LValue &lv, Op op, const EvalValue &rval, const TypeAnnot *ea,
+       bool dict, Loc s, Loc e)
+{
+    if (!ea || op == Op::assign)
+        return slot_rmw(lv, op, rval);
+    EvalValue nv = lv.get();
+    apply_compound_op(nv, RValue(rval), op);
+    nv = ct_fit(ea, std::move(nv), dict, s, e);
+    lv.put(nv);
+    return nv;
+}
+
+/*
+ * Q2: the start of a CHECKED store into container `c` (an array or a
+ * dict; anything else checks nothing). A plain `=`'s value is checked
+ * HERE, before the element is reached - a dict's auto-vivified key must
+ * not stay behind a refusal - and `v` becomes the value to store (an int
+ * into a float element converted). A compound's result can only be
+ * checked at the write: the element annotation is returned for ct_rmw /
+ * flat_store_core. [s, e): a misfit's caret.
+ */
+struct CtStore {
+    const TypeAnnot *ea = nullptr;   /* a compound's check, else null */
+    bool dict = false;
+};
+static CtStore
+ct_store_pre(const EvalValue &c, Op op, EvalValue &v, Loc s, Loc e)
+{
+    CtStore r;
+    const TypeAnnot *ea = ct_elem_annot(c);
+    if (!ea)
+        return r;
+    r.dict = c.is<intrusive_ptr<DictObject>>();
+    if (op == Op::assign)
+        v = ct_fit(ea, RValue(v), r.dict, s, e);
+    else
+        r.ea = ea;
+    return r;
+}
+
+/*
  * True if evaluating `c` can have no side effect (an id, a literal, a
  * subscript / member / arithmetic chain over those) - so evaluating it twice
  * is unobservable. Its users read a base a second time for speed
@@ -4828,7 +4880,8 @@ bool construct_no_side_effects(const Construct *c)
 static bool
 flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
                 const EvalValue &rval, Op op, EvalValue &out,
-                Loc sub_start, Loc sub_end, EvalValue *old_out = nullptr)
+                Loc sub_start, Loc sub_end, EvalValue *old_out = nullptr,
+                const TypeAnnot *ct = nullptr)
 {
     /*
      * Flat POD-struct array: `a[i] = <matching POD struct>` stores the value's
@@ -4980,6 +5033,9 @@ flat_store_core(LValue *blv, SharedArrayObj &arr, const EvalValue &idx_v,
         if (old_out)
             *old_out = newval;
         apply_compound_op(newval, r, op);
+        /* Q2: a checked compound's result fits the array's own type */
+        if (ct)
+            newval = ct_fit(ct, std::move(newval), false, sub_start, sub_end);
     }
 
     /*
@@ -5107,7 +5163,7 @@ static EvalValue hold_store_base(const EvalValue &base, LValue &hold)
 static EvalValue
 assign_through(EvalContext *ctx, const Construct *lvalue,
                const EvalValue &lval, const EvalValue &rval, Op op,
-               EvalValue *old_out = nullptr)
+               EvalValue *old_out = nullptr, const CtStore &ct = CtStore())
 {
     if (!lval.is<LValue *>())
         throw NotLValueEx(lvalue->start, lvalue->end);
@@ -5124,6 +5180,9 @@ assign_through(EvalContext *ctx, const Construct *lvalue,
     }
     if (old_out)
         *old_out = lv->get();
+    if (ct.ea)
+        return ct_rmw(*lv, op, rval, ct.ea, ct.dict, lvalue->start,
+                      lvalue->end);
     return doAssign(lval, rval, op);
 }
 
@@ -5167,12 +5226,23 @@ subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
         check_fit_loc(key, *sub->key_fit, sub->index->start,
                       sub->index->end);
 
+    /* Q2: a store through `dyn` checks its value against the container's
+     * own type (the VM's ct_checked store ops) */
+    EvalValue checked;
+    const EvalValue *rvp = &rval;
+    CtStore ct;
+    if (sub->ct_store && !ctx->const_ctx) {
+        checked = rval;
+        ct = ct_store_pre(RValue(base), op, checked, sub->start, sub->end);
+        rvp = &checked;
+    }
+
     SharedArrayObj *arr;
     if (!ctx->const_ctx && base.is<LValue *>()
             && flat_writable_array(base.get<LValue *>(), arr)) {
         EvalValue out;
-        if (flat_store_core(base.get<LValue *>(), *arr, key, rval, op, out,
-                            sub->start, sub->end, old_out))
+        if (flat_store_core(base.get<LValue *>(), *arr, key, *rvp, op, out,
+                            sub->start, sub->end, old_out, ct.ea))
             return out;
     }
 
@@ -5186,7 +5256,7 @@ subscript_store(EvalContext *ctx, const Subscript *sub, Op op,
         stamp_like_eval(sub, e);
         throw;
     }
-    return assign_through(ctx, sub, elv, rval, op, old_out);
+    return assign_through(ctx, sub, elv, *rvp, op, old_out, ct);
 }
 
 /*
@@ -5462,6 +5532,17 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
         }
     }
 
+    /* Q2: `d.k = v` through `dyn` checks the value against the dict's
+     * own type (a struct's field is checked by its declaration, above) */
+    EvalValue checked;
+    const EvalValue *rvp = &rval;
+    CtStore ct;
+    if (mem->ct_store && !ctx->const_ctx) {
+        checked = rval;
+        ct = ct_store_pre(RValue(base), op, checked, mem->start, mem->end);
+        rvp = &checked;
+    }
+
     EvalValue lval;
     try {
         lval = mem->access(RValue(base), /*for_write=*/op == Op::assign,
@@ -5470,7 +5551,7 @@ member_store(EvalContext *ctx, const MemberExpr *mem, Op op,
         stamp_like_eval(mem, e);
         throw;
     }
-    return assign_through(ctx, mem, lval, rval, op, old_out);
+    return assign_through(ctx, mem, lval, *rvp, op, old_out, ct);
 }
 
 /*
@@ -5593,9 +5674,20 @@ void compute_bind_flags(const FuncDescriptor *d)
  * read-only container) match the tree-walker byte-for-byte.
  */
 EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
-                             const EvalValue &value, Op op,
-                             Loc lstart, Loc lend)
+                             const EvalValue &value_in, Op op,
+                             Loc lstart, Loc lend, bool checked)
 {
+    /* Q2: a store through `dyn` (Instr::ct_checked) checks its value
+     * against the container's own type - a plain `=` here, a compound's
+     * result at the write */
+    EvalValue cv;
+    CtStore ct;
+    if (checked) {
+        cv = value_in;
+        ct = ct_store_pre(base_lv->get(), op, cv, lstart, lend);
+    }
+    const EvalValue &value = checked ? cv : value_in;
+
     /* A FLAT array element (int/float/bool/struct) has no boxed LValue - it's a
      * scalar/bytes in the flat vector - so the general subscript(for_write) path
      * below would wrongly raise NotLValueEx. Store straight into the flat buffer
@@ -5610,7 +5702,7 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
         if (flat_writable_array(base_lv, arr)) {
             EvalValue out;
             if (flat_store_core(base_lv, *arr, key, value, op, out,
-                                lstart, lend))
+                                lstart, lend, nullptr, ct.ea))
                 return out;
         }
     }
@@ -5633,7 +5725,8 @@ EvalValue vm_subscript_store(LValue *base_lv, const EvalValue &key,
     }
     if (!elv.is<LValue *>())
         throw NotLValueEx(lstart, lend);
-    return slot_rmw(*elv.get<LValue *>(), op, value);
+    return ct_rmw(*elv.get<LValue *>(), op, value, ct.ea, ct.dict,
+                  lstart, lend);
 }
 
 /*
@@ -5852,10 +5945,10 @@ LValue *vm_member_lvalue_ref(EvalValue &cur, const EvalValue &memId,
             if (it != obj->mut_end())
                 return &it->second;
             if (obj->get_has_default())      /* a new key (Cursor) */
-                return obj->insert_new(EvalValue(memId),
+                return obj->insert_new(ct_fit_key(*obj, EvalValue(memId)),
                                        LValue(obj->get_default(), false));
             if (for_write)
-                return obj->insert_new(EvalValue(memId),
+                return obj->insert_new(ct_fit_key(*obj, EvalValue(memId)),
                                        LValue(none, false));
             throw KeyNotFoundEx(mstart, mend);
         }
@@ -6116,8 +6209,9 @@ EvalValue vm_member_store(LValue *base_lv, const UniqueId *memUid, Op op,
  */
 EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
                                     const EvalValue &key2,
-                                    const EvalValue &value, Op op,
-                                    const std::pair<Loc, Loc> *locs)
+                                    const EvalValue &value_in, Op op,
+                                    const std::pair<Loc, Loc> *locs,
+                                    bool checked)
 {
     /* `locs[0]` = the INNER subscript caret, `locs[1]` = the OUTER's - read ONLY
      * on the throw path (a pointer keeps the hot store cheap). The INNER read
@@ -6133,6 +6227,17 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
         throw;
     }
 
+    /* Q2: a store through `dyn` checks against the INNER container's
+     * own type (vm_subscript_store) */
+    EvalValue cv;
+    CtStore ct;
+    if (checked) {
+        cv = value_in;
+        ct = ct_store_pre(RValue(inner), op, cv, locs[1].first,
+                          locs[1].second);
+    }
+    const EvalValue &value = checked ? cv : value_in;
+
     /* A FLAT inner array (`[[1,2],[3,4]]`: general outer, flat int inners) has
      * no element LValue - store the scalar straight into its buffer, exactly
      * like the single-level flat store (COW-correct). */
@@ -6141,7 +6246,8 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
         if (flat_writable_array(inner.get<LValue *>(), arr)) {
             EvalValue fout;
             if (flat_store_core(inner.get<LValue *>(), *arr, key2, value, op,
-                                fout, locs[1].first, locs[1].second))
+                                fout, locs[1].first, locs[1].second,
+                                nullptr, ct.ea))
                 return fout;
             /* a string / class array promoted: the general path below */
         }
@@ -6157,7 +6263,8 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
         EvalValue elv = t->subscript(inner, key2, for_write);
         if (!elv.is<LValue *>())
             throw NotLValueEx(locs[1].first, locs[1].second);
-        return slot_rmw(*elv.get<LValue *>(), op, value);
+        return ct_rmw(*elv.get<LValue *>(), op, value, ct.ea, ct.dict,
+                      locs[1].first, locs[1].second);
     } catch (Exception &e) {
         /* an OPERATION error (op_caret) is not the outer subscript's: it
          * stays loc-less for the op's op_locs caret (the handler's /
@@ -6182,8 +6289,10 @@ EvalValue vm_nested_subscript_store(LValue *outer_base, const EvalValue &key1,
  * tree-walker.
  */
 EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
-                                   size_t nkeys, const EvalValue &value, Op op,
-                                   const std::pair<Loc, Loc> *steplocs)
+                                   size_t nkeys, const EvalValue &value_in,
+                                   Op op,
+                                   const std::pair<Loc, Loc> *steplocs,
+                                   bool checked)
 {
     EvalValue cur = EvalValue(base);   /* wraps the current container LValue* */
     /* Each INTERMEDIATE read throws with ITS subscript node's loc (byte-
@@ -6216,12 +6325,20 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
     }
 
     const Loc fs = steplocs[nkeys - 1].first, fe = steplocs[nkeys - 1].second;
+    /* Q2: checked against the innermost container's own type */
+    EvalValue cv;
+    CtStore ct;
+    if (checked) {
+        cv = value_in;
+        ct = ct_store_pre(RValue(cur), op, cv, fs, fe);
+    }
+    const EvalValue &value = checked ? cv : value_in;
     LValue *inner = cur.is<LValue *>() ? cur.get<LValue *>() : nullptr;
     SharedArrayObj *arr;
     if (inner && flat_writable_array(inner, arr)) {
         EvalValue fout;
         if (flat_store_core(inner, *arr, keys[nkeys - 1], value, op,
-                            fout, fs, fe))
+                            fout, fs, fe, nullptr, ct.ea))
             return fout;
     }
     /* The FINAL store's throws (subscript OOB/KeyNotFound, slot_rmw type) are
@@ -6232,7 +6349,8 @@ EvalValue vm_subscript_chain_store(LValue *base, const EvalValue *keys,
         EvalValue elv = t->subscript(cur, keys[nkeys - 1], for_write);
         if (!elv.is<LValue *>())
             throw NotLValueEx(fs, fe);
-        return slot_rmw(*elv.get<LValue *>(), op, value);
+        return ct_rmw(*elv.get<LValue *>(), op, value, ct.ea, ct.dict,
+                      fs, fe);
     } catch (Exception &e) {
         /* an OPERATION error keeps no step caret: see the nested store */
         if (!e.loc_start && !e.op_caret) {
@@ -8401,7 +8519,7 @@ EvalValue member_read_core(const EvalValue &dval, const EvalValue &memId,
          * comes here, and left len(d) one short. A read-only dict cannot
          * take the key. */
         if (!obj->is_readonly())
-            obj->insert_new(EvalValue(memId),
+            obj->insert_new(ct_fit_key(*obj, EvalValue(memId)),
                             LValue(obj->get_default(), false));
         return obj->get_default();
     }
@@ -8470,11 +8588,12 @@ EvalValue MemberExpr::access(const EvalValue &dval, bool for_write,
                 return rooted ? EvalValue(&it->second) : it->second.get();
             if (obj->get_has_default()) {    /* a new key (Cursor) */
                 LValue *lv = obj->insert_new(
-                    EvalValue(memId), LValue(obj->get_default(), false));
+                    ct_fit_key(*obj, EvalValue(memId)),
+                    LValue(obj->get_default(), false));
                 return rooted ? EvalValue(lv) : lv->get();
             }
             if (for_write)
-                return obj->insert_new(EvalValue(memId),
+                return obj->insert_new(ct_fit_key(*obj, EvalValue(memId)),
                                        LValue(none, false));
             throw KeyNotFoundEx(start, end);
         }

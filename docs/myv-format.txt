@@ -9,9 +9,17 @@ every record, in order, with its exact byte encoding.
 `ctype` (2.3), after its readonly flag; a chunk gains the pool `ctypes`
 (9.11b) after fit_specs, which MakeArrayV / MakeDictV / MapFilterV name
 from their `target2`; a BuiltinCall (9.15) and a CallSite (9.16) carry the
-type a container the call builds is made with, after `arr_hint`.  And an
-`annot`'s struct may be one of the binary's reflection structs (the
-reserved srefs of section 2), so an `array<Type>` can be written.)
+type a container the call builds is made with, after `arr_hint`, and then
+a bool `ct_store`: the call stores a value into a container whose type the
+compiler did not know (an append, push or insert through `dyn`), and
+checks it against the container's own type; an EmplaceSite (9.12) ends
+with the same bool, for a construct-in-place append.  Opflags bit 7 on a
+container store op (StoreElemValue, DictStore, StoreElem2V,
+StoreElemChainV, StoreLValueChainV) means the same for that store.  One opcode was
+APPENDED, StampTypeV: an array sum `a + b` takes its static type, a REF
+into ctypes in its target2 (never 0).  And an `annot`'s struct may be one
+of the binary's reflection structs (the reserved srefs of section 2), so
+an `array<Type>` can be written.)
 
 (v42: each catch type name (9.9) is followed by the struct it names, an
 `sref`.  A catch clause catches a struct by IDENTITY - the struct its name
@@ -880,8 +888,11 @@ OPFLAGS BIT 6 (C1c, 2026-08-03) is the ELEM-BOOL hint on StoreElemInt - an
 ADVISORY compile-time note (the JIT's hoist pick guards the bools kind
 instead of ints; a wrong hint merely fails a runtime guard).  It rides the
 stored opflags byte with no format change: the byte was always stored whole,
-and an older reader simply carries the bit through untouched.  Bit 7 remains
-free.
+and an older reader simply carries the bit through untouched.  Bit 7 is
+spoken for per opcode family: LoadStructFieldInt/Float's checked subscript
+form, CallV/CachedCallV's scalar result, and (v43) a container store op's
+CHECKED store - StoreElemValue, DictStore, StoreElem2V, StoreElemChainV and
+StoreLValueChainV check the stored value against the container's own type.
 
 This is NOT in-format compression: no dictionary, no entropy coding, no
 bit-level packing of values, no decoder state.  Each field is a plain integer
@@ -1060,8 +1071,9 @@ interned twin and whether it is a built-in exception's are DERIVED
 Each a `ctype` (2.3), present (never 0xFF).  An op names one by a REF -
 0 for none, else the index + 1: MakeArrayV in target2's bits 8 and up
 (its low 8 bits are the ArrHint), MakeDictV in the whole of target2,
-MapFilterV in target2's bits 3 and up.  The verifier refuses a ref past
-the pool ("corrupt .myv (ctype at pc N)").
+MapFilterV in target2's bits 3 and up, StampTypeV in the whole of target2
+(never 0 there).  The verifier refuses a ref past the pool, and a
+StampTypeV with none ("corrupt .myv (ctype at pc N)").
 
 9.12  EmplaceSite - a construct-in-place append
 
@@ -1069,6 +1081,9 @@ the pool ("corrupt .myv (ctype at pc N)").
     uid      bname          the callee name (append/push)
     loc      a0_start, a0_end     the container argument's caret
     arglocs  field_locs           per-field coerce carets
+    bool     ct_store             v43 - the append goes through `dyn`: the
+                                  built value is checked against the
+                                  array's own type
 
 9.13  ThrowSite - a compiled always-throwing construct
 
@@ -1088,6 +1103,10 @@ the pool ("corrupt .myv (ctype at pc N)").
     u8       arr_hint       ArrHint, section 13
     ctype    ctype          v43 - (2.3) the type a container the call builds
                             is made with; absent for every other call
+    bool     ct_store       v43 - the call stores a value into a container
+                            whose type was not known here (append / push /
+                            insert through `dyn`): checked against the
+                            container's own type
     arglocs  args           per-argument carets
     uid      member         arg0's field name for `append(s.f, x)`, else null
     StepList steps          (9.7) CallBuiltinLVMember's chain form: arg0
@@ -1104,6 +1123,8 @@ re-resolves it through `vm_lookup_builtin`; an unknown name is refused.
     arglocs  args
     u8       arr_hint       ArrHint, section 13
     ctype    ctype          v43 - (2.3), as a BuiltinCall's
+    bool     ct_store       v43 - as a BuiltinCall's (the callee may be an
+                            in-place builtin)
     u8       a0_form        CallSite::A0, section 13
     u32      a0_kind        0 local / 1 global / 2 capture / 3 builtin
     u32      a0_slot        (signed)

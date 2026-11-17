@@ -118,17 +118,26 @@ var csl2 = cs[0:2];
 dc[0] = C(5);
 want("class aliased slice", csl2[0].v, 1);
 want("class aliased base", cs[0].v, 5);
-var cs2 = [C(1), C(2)];
+# a class array with no type of its own (nested in a `dyn` element) takes
+# another kind and promotes; an array<C> refuses it (its own type)
+var dyn tc = [C(1)];
+want("class dyn-made takes it", outcome(func [tc] () { tc[0] = "s"; }), "ok");
+array<C> tc2 = [C(1), C(2)];
+var dyn dtc2 = tc2;
+want("class array<C> refuses", outcome(func [dtc2] () { dtc2[0] = "s"; }),
+     "TypeErrorEx");
+array<dyn> hcs = [[C(1), C(2)], [C(1), C(2)], [C(1), C(2), C(3)]];
+var dyn cs2 = hcs[0];
 var dyn dc2 = cs2;
 dc2[0] = "s";
 want("class promoted", array_storage(cs2), "general");
 want("class promoted value", dc2[0], "s");
-var cs3 = [C(1), C(2)];
+var dyn cs3 = hcs[1];
 var dyn dc3 = cs3;
 want("class compound", outcome(func [dc3] () { dc3[1] += 1; }),
      "TypeErrorEx");
 want("class compound promoted", array_storage(cs3), "general");
-var cs4 = [C(1), C(2), C(3)];
+var dyn cs4 = hcs[2];
 var dyn dc4s = cs4[1:3];
 dc4s[0] = 5;
 want("class slice promoted", dc4s, [5, cs4[2]]);
@@ -662,7 +671,10 @@ want("mixed literals", [lm1[1], lm2[0].v, lm2[1], lm3[1] == none, lm3[2].x],
 want("mixed literal storages", [array_storage(lm1), array_storage(lm2),
      array_storage(lm3)], ["general", "general", "general"]);
 # a comparator that turns the string array it sorts into a general one
-var ks2 = split("b a c", " ");
+# (an array with no type of its own - nested in a `dyn` element - since
+# an array<str> refuses the int)
+array<dyn> hks = [split("b a c", str(runtime(" ")))];
+var dyn ks2 = hks[0];
 var dyn dks2 = ks2;
 var kcmp = func [dks2] (a, b) { dks2[0] = 1; return a < b; };
 want("sort storage change", outcome(func [ks2, kcmp] () { sort(ks2, kcmp); }),

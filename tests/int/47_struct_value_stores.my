@@ -109,14 +109,22 @@ want("emplace slice", [len(psl), psl[2].x, len(ps)], [3, 9, 3]);
 var dyn gen = runtime([]);
 append(gen, P(4, 4.5));
 want("emplace general", gen[0].x, 4);
-var sarr = split("a", " ");
+# a string / class array with no type of its own (nested in a `dyn`
+# element) takes a P and promotes; one with its own type refuses it
+array<dyn> hold = [split("a", str(runtime(" "))), [C(1, [])]];
+var dyn sarr = hold[0];
 var dyn dsarr = sarr;
 append(dsarr, P(5, 5.5));
 want("emplace strs", [array_storage(sarr), dsarr[1].x], ["general", 5]);
-var carr = [C(1, [])];
+var dyn carr = hold[1];
 var dyn dcarr = carr;
 append(dcarr, P(6, 6.5));
 want("emplace class", [array_storage(carr), dcarr[1].x], ["general", 6]);
+var tsarr = split("a", str(runtime(" ")));
+var dyn dtsarr = tsarr;
+want("emplace typed strs",
+     outcome(func [dtsarr] () { append(dtsarr, P(7, 7.5)); }),
+     "TypeErrorEx");
 var iarr = [1];
 var dyn diarr = iarr;
 want("emplace ints", outcome(func [diarr] () { append(diarr, P(7, 7.5)); }),

@@ -56,6 +56,9 @@ struct ArgLocs {
     /* Q2: the type a container this call builds is made with (null:
      * untyped) - Construct::ctype of the call's args list */
     const TypeAnnot *ctype = nullptr;
+    /* Q2: the stored value is checked against the container's own type
+     * (append / push / insert through `dyn`) - Construct::ct_store */
+    bool ct_store = false;
     const ArgLoc *arg(size_t i) const { return &args[i]; }
 };
 /*

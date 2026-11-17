@@ -528,7 +528,16 @@ EvalValue builtin_append(EvalContext *ctx, const ArgLocs *exprList,
      * S(..))`) needs the ctor NODE, so it lives in append_tw (tree-walker) and
      * EmplaceStruct (VM); a plain value hits the flat/general paths below. */
     ML_CHECK(rest && n_rest == 1);
-    const EvalValue &elem = rest[0];
+    /* Q2: an append through `dyn` (ArgLocs::ct_store): the element fits
+     * the array's own type - converted as a typed store converts it */
+    EvalValue checked;
+    const EvalValue *ep = &rest[0];
+    if (exprList->ct_store) {
+        checked = ct_fit_value(lval->get(), rest[0], exprList->start,
+                               exprList->end);
+        ep = &checked;
+    }
+    const EvalValue &elem = *ep;
 
     /* The shared core (arr_append_fast) does every SUCCESS path - flat
      * int/float/bool/POD-struct-match and general - with the hash upkeep.

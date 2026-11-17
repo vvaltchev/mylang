@@ -234,14 +234,18 @@ EvalValue TypeDict::subscript(const EvalValue &what_lval, const EvalValue &key,
      * (the entry would sit in the wrong bucket). A scalar/string key is
      * immutable already, so make_const_clone returns it as-is (cheap).
      */
+    /* Q2: a new key fits the dict's own key type - however the dict was
+     * reached (a read of a default dict inserts too) */
     if (obj.get_has_default()) {          /* a new key: see Cursor */
-        LValue *lv = obj.insert_new(make_const_clone(key, true),
-                                    LValue(obj.get_default(), false));
+        LValue *lv = obj.insert_new(
+            make_const_clone(ct_fit_key(obj, key), true),
+            LValue(obj.get_default(), false));
         return held ? EvalValue(lv) : lv->get();
     }
 
     if (for_write)
-        return obj.insert_new(make_const_clone(key, true), LValue(none, false));
+        return obj.insert_new(make_const_clone(ct_fit_key(obj, key), true),
+                              LValue(none, false));
 
     throw KeyNotFoundEx();
 }

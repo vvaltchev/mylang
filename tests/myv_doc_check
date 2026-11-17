@@ -178,16 +178,19 @@ def chunk(r):
         assert ctype(r) is not None, 'an absent ctypes entry'  # (v43)
     for _ in range(r.u32()):                                # 9.12 emplace
         r.sref(); r.uid(); r.loc(); r.loc(); r.arglocs()
+        r.boolv()                                           # v43: ct_store
     for _ in range(r.u32()): r.u8(); r.loc(); r.loc(); r.uid()   # 9.13 throws
     for _ in range(r.u32()): r.nx(r.u32)          # 9.14 unpack_targets
     for _ in range(r.u32()): r.nx(r.u8)           # 9.14 unpack_coerce
     for _ in range(r.u32()):                      # 9.15 builtin_calls
         r.uid(); r.loc(); r.loc(); r.u8(); ctype(r)   # v43: ctype
+        r.boolv()                                 # v43: ct_store
         r.arglocs(); r.uid()
         steps()                                   # v32
     for _ in range(r.u32()):                      # 9.16 call_sites
         r.loc(); r.loc(); r.arglocs()
         r.u8(); ctype(r)                          # v43: ctype
+        r.boolv()                                 # v43: ct_store
         r.u8(); r.u32(); r.u32(); r.u32(); r.uid()
         steps()                                   # v32
     r.nx(r.sid)                                   # 9.17 slot_names

@@ -1324,6 +1324,16 @@ enum class OpCode : unsigned char {
     CheckFitV,
 
     /*
+     * Q2: StampTypeV - the array in slot[a], a fresh `a + b` the BinOpV
+     * just built (its copy of `a` starts untyped, ctype_sum_copy), gets
+     * the sum's static type: Chunk::ctypes[target2 - 1] (target2 >= 1, a
+     * ctype_ref). Never throws, writes no frame slot; emitted right after
+     * such a BinOpV only. The bytecode inliner pastes no body that holds
+     * one (its ref names the callee's pool).
+     */
+    StampTypeV,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1376,7 +1386,7 @@ enum class OpCode : unsigned char {
     X(ExitBlock) X(LoadElem2Int) X(LoadElem2Float) X(ArrEpochMark) \
     X(ArrEpochCheck) X(GuardCalleeV) X(LoadCaptureOfV) X(StoreCaptureOfV) \
     X(UnpackLenCheck) X(CheckNoneArgsV) X(LoadBoxV) X(StoreBoxV) \
-    X(CheckFitV)
+    X(CheckFitV) X(StampTypeV)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin
@@ -1540,6 +1550,31 @@ struct Instr {
         return opflags & 0x80;
     }
     void set_ret_scalar() { opflags |= 0x80; }
+    /*
+     * Q2: on a container STORE op, bit 0x80 means "checked" - the store
+     * goes through `dyn`, so the value is checked against the container's
+     * own type at the write (Construct::ct_store; ct_fit, eval.h), and
+     * the JIT's inline store tier leaves it to the helper. Sharing the
+     * bit with struct_checked / ret_scalar is the argument they make -
+     * the opcode families do not overlap - stated as an ML_CHECK, so
+     * asking the wrong family aborts by name.
+     */
+    static bool ct_store_op(OpCode o)
+    {
+        return o == OpCode::StoreElemValue || o == OpCode::DictStore
+            || o == OpCode::StoreElem2V || o == OpCode::StoreElemChainV
+            || o == OpCode::StoreLValueChainV;
+    }
+    bool ct_checked() const
+    {
+        ML_CHECK(ct_store_op(op));
+        return opflags & 0x80;
+    }
+    void set_ct_checked()
+    {
+        ML_CHECK(ct_store_op(op));
+        opflags |= 0x80;
+    }
     bool b_is_lit() const { return opflags & 8; }
     Operand::LitKind a_kind() const {
         return static_cast<Operand::LitKind>((opflags >> 1) & 3);
@@ -1644,6 +1679,29 @@ struct Instr {
         set_b(ta);
     }
 };
+
+/*
+ * Q2: the operator WORD a JIT container-store helper takes
+ * (jit_dict_store, jit_store_elem_value, jit_store_elem2,
+ * jit_store_elem_chain, jit_store_lvalue_chain): the Expr14 operator,
+ * plus STORE_WORD_CHECKED when the store is checked against the
+ * container's own type (Instr::ct_checked) - one argument, so no
+ * helper's register ABI moved.
+ */
+constexpr int_type STORE_WORD_CHECKED = 0x100;
+inline int_type store_op_word(const Instr &in)
+{
+    return static_cast<int_type>(static_cast<int>(in.aop))
+         | (in.ct_checked() ? STORE_WORD_CHECKED : 0);
+}
+inline Op store_word_op(int_type w)
+{
+    return static_cast<Op>(w & 0xff);
+}
+inline bool store_word_checked(int_type w)
+{
+    return (w & STORE_WORD_CHECKED) != 0;
+}
 
 static_assert(sizeof(Instr) == 32,
               "the B3 packed instruction - two per cache line; a new field "
@@ -2805,6 +2863,9 @@ struct Chunk {
         const UniqueId *bname;           /* append / push (the callee name) */
         Loc a0_start, a0_end;            /* the container arg's caret */
         std::vector<ArgLoc> field_locs;  /* the ctor's per-field carets */
+        /* Q2: the append goes through `dyn` - the built value is checked
+         * against the array's own type (Construct::ct_store) */
+        bool ct_store = false;
     };
     std::vector<EmplaceSite> emplace_sites;
 
@@ -2859,6 +2920,7 @@ struct Chunk {
         Loc start, end;               /* the whole-args caret (arity/generic) */
         ArrHint arr_hint;             /* the array-repr hint (range/array/…) */
         const TypeAnnot *ctype = nullptr;   /* Q2: Construct::ctype */
+        bool ct_store = false;        /* Q2: Construct::ct_store */
         std::vector<ArgLoc> args;     /* per-arg carets, [0, n) */
         const UniqueId *member = nullptr;  /* CallBuiltinLVMember: arg0's field
                                             * name `append(s.f, x)` (else null) */
@@ -2884,6 +2946,7 @@ struct Chunk {
         al.nargs = bc.args.size();   /* total arg count (a func_lv reads this) */
         al.arr_hint = bc.arr_hint;
         al.ctype = bc.ctype;
+        al.ct_store = bc.ct_store;
         return al;
     }
 
@@ -2917,6 +2980,7 @@ struct Chunk {
         std::vector<ArgLoc> args;        /* per-arg carets */
         ArrHint arr_hint = ArrHint::dflt;
         const TypeAnnot *ctype = nullptr;   /* Q2: Construct::ctype */
+        bool ct_store = false;              /* Q2: Construct::ct_store */
         /* `chain` (#32): a deeper access chain rooted at a variable -
          * `o.i.a`, `m[0][1]` - re-derived through a0_steps (its keys are
          * frame temps the arg0 compile filled) */
@@ -2941,6 +3005,7 @@ struct Chunk {
         al.nargs = cs.args.size();
         al.arr_hint = cs.arr_hint;
         al.ctype = cs.ctype;
+        al.ct_store = cs.ct_store;
         return al;
     }
 

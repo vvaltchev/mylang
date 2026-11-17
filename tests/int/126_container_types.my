@@ -9,8 +9,9 @@
 #  - written where `dyn` is declared: DYNAMIC (array<dyn>, dict<dyn,dyn>);
 #  - a builtin that builds one: the type of its call (range, keys, split,
 #    map, filter, make_array, kvpairs, dynarray), a copy (clone, a slice,
-#    an empty slice) its source's;
-#  - UNTYPED: a constant's (read-only, it needs none), an empty literal
+#    an empty slice) its source's; `a + b` the sum's type;
+#  - UNTYPED: a container nested in a `dyn` element (only `dyn` reaches
+#    it), a constant's (read-only, it needs none), an empty literal
 #    nothing filled, and one a fit check examines where it lands, or whose
 #    place's type is unknown here (a call through a function value, a
 #    store or an append into a `dyn` container) - it takes its type there.
@@ -36,7 +37,7 @@ var m = {"a": 1};                want("dict", int_ctype(m), "dict<str,int>");
 var dyn md = {"a": 1};           want("dyn dict", int_ctype(md), "dict<dyn,dyn>");
 var het = [[1], "x"];
 want("const het", int_ctype(het), "array<dyn>");
-want("const het inner", int_ctype(het[0]), "array<dyn>");
+want("const het inner", int_ctype(het[0]), "untyped");
 
 var r = range(3);                want("range", int_ctype(r), "array<int>");
 var dyn rd = range(3);           want("dyn range", int_ctype(rd), "array<dyn>");
@@ -50,6 +51,10 @@ want("dynarray", int_ctype(dynarray(a)), "array<dyn>");
 want("clone", int_ctype(clone(a)), "array<int>");
 want("slice", int_ctype(a[0:1]), "array<int>");
 want("empty slice", int_ctype(a[5:9]), "array<int>");
+want("sum", int_ctype(a + [3]), "array<int>");
+var x1 = ["a", none];
+want("wider sum", int_ctype(x1 + [rt(5)]), "array<dyn>");
+var dyn sd = a + [rt(3)];        want("dyn sum", int_ctype(sd), "array<dyn>");
 struct P { int x; }
 want("struct literal", int_ctype([P(1), P(rt(2))]), "array<P>");
 

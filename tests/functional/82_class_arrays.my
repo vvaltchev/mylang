@@ -118,15 +118,29 @@ var mp = map(func (q) => q.v, c);
 assert(mp == [3, 2, 9]);
 assert(find(c, c[1]) == 1);
 
-# 8. a value that is not a class instance, through `dyn`, promotes
+# 8. a value that is not a class instance, through `dyn`: an array<Node>
+#    refuses it - the array keeps its type (plans/typed-containers.md;
+#    without inference, -nti, nothing has a type and it is taken) - and
+#    an array with no type of its own (one nested in a `dyn` element)
+#    promotes to general storage for it
+var typed = typestr(runtime(0)) == "dyn";
+var refused8 = 0;
 var g = [Node(ri(1), none)];
 var dyn dg = g;
-append(dg, 5);
-assert(len(g) == 2 && g[1] == 5 && array_storage(g) == "general");
+try { append(dg, 5); } catch (TypeErrorEx) { refused8++; }
 var h = [Leaf("a")];
 var dyn dh = h;
-dh[0] = P(1);
-assert(h[0] == P(1) && array_storage(h) == "general");
+try { dh[0] = P(1); } catch (TypeErrorEx) { refused8++; }
+assert(!typed || (refused8 == 2 && len(g) == 1 && h[0].name == "a"));
+assert(!typed || (array_storage(g) == "class"
+                  && array_storage(h) == "class"));
+array<dyn> hg = [[Node(ri(1), none)], [Leaf("a")]];
+var dyn g2 = hg[0];
+append(g2, 5);
+assert(len(g2) == 2 && g2[1] == 5 && array_storage(g2) == "general");
+var dyn h2 = hg[1];
+h2[0] = P(1);
+assert(h2[0] == P(1) && array_storage(h2) == "general");
 
 # 9. clone shares the instances, deepclone copies them
 var cl = clone(a);

@@ -416,6 +416,8 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
               << "  (" << bc.args.size() << " args)";
             if (!bc.steps.empty())      /* #32: the chain form's arg0 */
                 s << "  a0 chain of " << bc.steps.size();
+            if (bc.ct_store)            /* Q2: checked against the type */
+                s << "  checked";
             s << "\n";
         }
     }
@@ -2287,6 +2289,12 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "store.box    *" << RI(in.a(), false) << " = "
                 << RI(in.b(), false);
             break;
+        case OpCode::StampTypeV:
+            /* Q2: an array sum takes its static type */
+            row << "stamp.type   " << RI(in.a(), false) << "  ; "
+                << annot_text(chunk.ctype_ref(
+                       static_cast<unsigned>(in.target2)));
+            break;
         case OpCode::CheckFitV:
             /* #49: the value a store is about to put into a typed place */
             row << "check.fit    " << RI(in.a(), false) << "  ; fit ["
@@ -2507,6 +2515,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
             row << "halt";
             break;
         }
+        /* Q2: a store checked against the container's own type */
+        if (Instr::ct_store_op(in.op) && in.ct_checked())
+            row << "  ; checked";
         return row.str();
     };
 

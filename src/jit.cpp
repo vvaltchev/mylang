@@ -828,6 +828,7 @@ struct JitLayout {
     int hashv_off;     /* SharedObject: &hash_valid - shobj */
     int slices_off;    /* SharedObject: &has_slices - shobj */
     int epoch_off;     /* SharedObject: &shift_epoch - shobj (#53) */
+    int ctype_off;     /* SharedObject: &ctype - shobj (Q2) */
     int lv_const_off;  /* LValue: &is_const - &slot */
     int lv_borrowed_off; /* LValue: &borrowed - &slot (W5) */
     int type_t_off;       /* offset of Type::t (the TypeE enum) within a Type */
@@ -1147,6 +1148,8 @@ static const JitLayout &jit_layout()
             static_cast<const char *>(jp.has_slices) - so);
         l.epoch_off = static_cast<int>(
             static_cast<const char *>(jp.shift_epoch) - so);
+        l.ctype_off = static_cast<int>(
+            static_cast<const char *>(jp.ctype) - so);
         l.lv_const_off = static_cast<int>(
             reinterpret_cast<const char *>(&alv.jit_const_probe()) -
             reinterpret_cast<const char *>(&alv));
@@ -8169,6 +8172,10 @@ static bool jit_op_eligible(const Instr &in)
      * conveys, exc-stamped with the value's caret. No bail ->
      * op_fully_native too. */
     case OpCode::CheckFitV:
+        return true;
+    /* Q2: StampTypeV - jit_stamp_ctype reads the sum from memory; it
+     * never throws, so op_fully_native too. */
+    case OpCode::StampTypeV:
         return true;
     /* The dyn-callee generic call pair - the LAST formerly-boxed sequential
      * ops. CheckCallableV conveys a loc-less NotCallableEx (exc-stamped
@@ -18385,6 +18392,10 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
          * int candidate) */
         v.bad(in.a_slot());
         break;
+    case OpCode::StampTypeV:
+        /* Q2: the helper reads the array from MEMORY */
+        v.bad(in.a_slot());
+        break;
     case OpCode::CheckNoneArgsV:
         /* the helper reads the argument run (and a kind-0 callee) from
          * MEMORY, as the call that follows does - the CallV rule */
@@ -22971,6 +22982,11 @@ static bool emit_store_elem2_inline(Emitter &e, const Instr &in,
                                     std::vector<size_t> &slows,
                                     std::vector<size_t> &dones)
 {
+    /* Q2: a store checked against the inner container's own type is the
+     * helper's (the rows this tier takes are flat, whose storage already
+     * is their type - but the check, and its message, live in one place) */
+    if (in.ct_checked())
+        return false;
     const ElemScratch sc = elem_scratch_plan(e, in.op);
     if (!sc.ok)
         return false;          /* no free scratch - the helper tier */
@@ -23349,7 +23365,7 @@ static void emit_dict_store(Emitter &e, const Chunk &ck, const Instr &in,
     e.lea(RSI, off(in.a_slot()));         /* rsi = &slot[key]  (rbx=slots) */
     e.lea(RDX, off(in.b_slot()));         /* rdx = &slot[val]  (rbx=slots) */
     e.lea_rdi(off(in.target2));           /* rdi = &slot[base] (LAST) */
-    e.mov_imm(RCX, static_cast<uint64_t>(static_cast<int>(in.aop)));
+    e.mov_imm(RCX, static_cast<uint64_t>(store_op_word(in)));
     e.call_direct(jit_dict_store);
     emit_call_epilogue(e);
     e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
@@ -24744,6 +24760,21 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             decl_ne(JD_storev_base_kind);
             e.cmp_byte_base(s1, L.slices_off, 0);
             decl_ne(JD_storev_has_slices);
+            /* Q2: a CHECKED store (through `dyn`, Instr::ct_checked)
+             * stays here only for an array that takes anything - one
+             * with no type of its own, or the dynamic array<dyn> (one
+             * interned pointer); any other type is the helper's, which
+             * checks the value against it */
+            if (in.ct_checked()) {
+                e.load_base(s2, s1, L.ctype_off);
+                e.test_rr(s2, s2);
+                const size_t ct_any = e.j8(0x74);       /* jz: untyped */
+                e.movabs(acc.r, reinterpret_cast<uint64_t>(
+                                    annot_dyn_array()));
+                e.cmp_rr(s2, acc.r);
+                decl_ne(JD_storev_ctype);
+                e.patch8(ct_any, e.pos());
+            }
             /* THE VALUE GATES - the two reference kinds the raw copy
              * cannot carry (a vtable'd pointee has no refcount at +0;
              * a slice must be (un)registered in its parent's set) */
@@ -24861,7 +24892,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.mov_imm(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
         e.mov_imm(RDX, static_cast<uint64_t>(static_cast<int_type>(in.a_slot())));
         e.mov_imm(RCX, static_cast<uint64_t>(static_cast<int_type>(in.b_slot())));
-        e.mov_imm(R8, static_cast<uint64_t>(static_cast<int>(in.aop)));
+        e.mov_imm(R8, static_cast<uint64_t>(store_op_word(in)));
         e.call_direct(jit_store_elem_value);
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
@@ -25192,7 +25223,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                           static_cast<int_type>(in.a_dual_lo())));
         e.mov_imm(RDX, static_cast<uint64_t>(static_cast<int_type>(in.b_slot())));
         e.mov_imm(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
-        e.mov_imm(R8, static_cast<uint64_t>(static_cast<int>(in.aop)));
+        e.mov_imm(R8, static_cast<uint64_t>(store_op_word(in)));
         e.movabs(R9, reinterpret_cast<uint64_t>(
                         ck.chain_locs[in.a_dual_hi()].data()));
         e.call_direct(jit_store_elem2);
@@ -25219,7 +25250,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.mov_imm(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
         e.mov_imm(RDX, static_cast<uint64_t>(static_cast<int_type>(in.b_lit())));
         e.mov_imm(RCX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
-        e.mov_imm(R8, static_cast<uint64_t>(static_cast<int>(in.aop)));
+        e.mov_imm(R8, static_cast<uint64_t>(store_op_word(in)));
         e.movabs(R9, reinterpret_cast<uint64_t>(&ck.chain_locs[in.a_dual_lo()]));
         e.call_direct(jit_store_elem_chain);
         emit_call_epilogue(e);
@@ -25243,7 +25274,7 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                           static_cast<int_type>(in.a_dual_hi())));
         e.mov_imm(RSI, static_cast<uint64_t>(static_cast<int_type>(in.target2)));
         e.mov_imm(RDX, static_cast<uint64_t>(static_cast<int_type>(in.target)));
-        e.mov_imm(RCX, static_cast<uint64_t>(static_cast<int>(in.aop)));
+        e.mov_imm(RCX, static_cast<uint64_t>(store_op_word(in)));
         e.movabs(R8, reinterpret_cast<uint64_t>(&ck.chain_steps[in.a_dual_lo()]));
         e.movabs(R9, reinterpret_cast<uint64_t>(ck.member_keys.data()));
         e.call_direct(jit_store_lvalue_chain);
@@ -28410,6 +28441,18 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::StampTypeV:
+        /* Q2: jit_stamp_ctype(slot, the interned type) - rdi = a_slot,
+         * rsi = the baked type (process lifetime). Never throws. */
+        emit_call_prologue(e);
+        e.mov_imm(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        e.movabs(RSI, reinterpret_cast<uint64_t>(
+                          ck.ctype_ref(static_cast<unsigned>(in.target2))));
+        e.call_direct(jit_stamp_ctype);
+        emit_call_epilogue(e);
+        return true;
+
     case OpCode::CheckFitV: {
         /* #49: jit_check_fit(slot, &fit_specs[target2]) - rdi = a_slot,
          * rsi = the baked pool entry. A misfit conveys a loc-less
@@ -30603,6 +30646,7 @@ static bool op_fully_native(const Instr &in)
     case OpCode::CheckFuncV:
     case OpCode::CheckNoneArgsV:    /* RULE 1: conveys, exc-stamped */
     case OpCode::CheckFitV:         /* #49: conveys, exc-stamped */
+    case OpCode::StampTypeV:        /* Q2: never throws */
     case OpCode::LoadBoxV:          /* class step 4: conveys, exc-stamped */
     case OpCode::StoreBoxV:
     case OpCode::MapFilterV:

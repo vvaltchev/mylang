@@ -1,0 +1,140 @@
+# Q2 (plans/typed-containers.md): an array or a dict carries its own
+# type, so a store through a `dyn` name checks the value against the
+# CONTAINER's type - not the name's - and a misfit is a TypeErrorEx that
+# leaves the container as it was, in every engine (README, "A container
+# keeps its type"). A value that fits is stored, converted as a typed
+# store converts it (an int into a float element is a float). A new dict
+# key is checked wherever it is inserted, and `+=` on an array checks
+# each element, however the array was reached.
+#
+# Without inference (-nti) no container has a type, so nothing is
+# refused: every refusal below is asserted in a typed run only.
+struct S { array<int?> v; }
+
+var typed = typestr(runtime(0)) == "dyn";
+var refused = 0;
+
+# an element of a general array<int?>, a flat array<int> and a flat
+# array<str> (split's storage, which used to promote to general storage)
+var a = [1, none];
+var dyn d = a;
+try { d[0] = "s"; } catch (TypeErrorEx) { refused++; }
+assert(!typed || str(a) == "[1, <none>]");
+var b = [1, 2];
+var dyn e = b;
+try { e[0] = "s"; } catch (TypeErrorEx) { refused++; }
+assert(!typed || b == [1, 2]);
+var w = split("x y", " ");
+var dyn g = w;
+try { g[0] = 5; } catch (TypeErrorEx) { refused++; }
+assert(!typed || w == ["x", "y"]);
+assert(!typed || refused == 3);
+
+# what fits is stored, an int into a float element as a float
+var a2 = [1, none];
+var dyn d2 = a2;
+d2[1] = 7;
+assert(a2 == [1, 7]);
+var fl = [1.5, none];
+var dyn df = fl;
+df[1] = 2;
+assert(!typed || str(fl[1]) == "2.000000");
+
+# a compound store checks its result
+refused = 0;
+var c = [1, none];
+var dyn dc = c;
+try { dc[0] += 0.5; } catch (TypeErrorEx) { refused++; }
+dc[0] += 1;
+assert(!typed || str(c) == "[2, <none>]");
+assert(!typed || refused == 1);
+
+# nested: the inner container's own type decides
+refused = 0;
+var m = [[1], [2]];
+var dyn f = m;
+try { f[0] = ["s"]; } catch (TypeErrorEx) { refused++; }
+try { f[0][0] = "s"; } catch (TypeErrorEx) { refused++; }
+var m2 = [[1, none]];
+var dyn f2 = m2;
+try { f2[0][0] = "s"; } catch (TypeErrorEx) { refused++; }
+var m3 = [[[1, none]]];
+var dyn f3 = m3;
+try { f3[0][0][0] = "s"; } catch (TypeErrorEx) { refused++; }
+assert(!typed || (m == [[1], [2]] && str(m2) == "[[1, <none>]]"));
+assert(!typed || str(m3) == "[[[1, <none>]]]");
+assert(!typed || refused == 4);
+
+# a dict's values and its new keys
+refused = 0;
+var dd = {"k": 1};
+var dyn h = dd;
+try { h["k"] = "s"; } catch (TypeErrorEx) { refused++; }
+try { h.k = "s"; } catch (TypeErrorEx) { refused++; }
+try { h["new"] = "s"; } catch (TypeErrorEx) { refused++; }
+try { h[5] = 1; } catch (TypeErrorEx) { refused++; }
+assert(!typed || dd == {"k": 1});
+var dd2 = {"k": 1};
+var dyn h2 = dd2;
+h2["n"] = 2;
+h2.o = 3;
+assert(dd2 == {"k": 1, "n": 2, "o": 3});
+assert(!typed || refused == 4);
+
+# append, push, insert
+refused = 0;
+var al = [1, none];
+var dyn da = al;
+try { append(da, "s"); } catch (TypeErrorEx) { refused++; }
+try { push(da, "s"); } catch (TypeErrorEx) { refused++; }
+try { insert(da, 0, "s"); } catch (TypeErrorEx) { refused++; }
+try { insert(h, "z", "w"); } catch (TypeErrorEx) { refused++; }
+try { insert(h, 9, 1); } catch (TypeErrorEx) { refused++; }
+var al2 = [1, none];
+var dyn da2 = al2;
+append(da2, 3);
+insert(da2, 0, 0);
+assert(str(al2) == "[0, 1, <none>, 3]");
+assert(!typed || refused == 5);
+
+# `+=` grows the array in place, checked and converted however it was
+# reached; `a + b` is a new array of the sum's type
+refused = 0;
+var pa = [1, none];
+var dyn dp = pa;
+try { dp += ["s"]; } catch (TypeErrorEx) { refused++; }
+assert(!typed || str(pa) == "[1, <none>]");
+var pf = [1.5, none];
+pf += [2];
+assert(!typed || str(pf[2]) == "2.000000");
+var x1 = ["a", none];
+var x2 = x1 + ["b"];
+var dyn dx = x2;
+try { dx[0] = 5; } catch (TypeErrorEx) { refused++; }
+var y2 = x1 + [5];
+var dyn dy = y2;
+dy[0] = 5.5;
+assert(str(y2) == "[5.500000, <none>, 5]");
+assert(!typed || refused == 2);
+
+# through a `dyn` parameter and a struct's field
+refused = 0;
+func put(dyn x, dyn v) { x[0] = v; }
+try { put(a, "s"); } catch (TypeErrorEx) { refused++; }
+var dyn s = S([1, none]);
+try { s.v[0] = "x"; } catch (TypeErrorEx) { refused++; }
+assert(!typed || str(s.v) == "[1, <none>]");
+assert(!typed || refused == 2);
+
+# a literal nested in a `dyn` element is reached only through `dyn`: it
+# has no type, and holds what its storage holds
+array<dyn> ad = [[1, none]];
+ad[0][0] = "x";
+assert(str(ad) == "[[\"x\", <none>]]");
+
+# a container made where `dyn` is declared holds anything
+var dyn z = [1, 2];
+z[0] = "s";
+append(z, [3]);
+assert(str(z) == "[\"s\", 2, [3]]");
+print("ok");

@@ -95,8 +95,10 @@ builtin_insert_dict(LValue *lval, const EvalValue &key, const EvalValue &val)
      * hash and strand the entry in the wrong bucket, findable by NO key. */
     if (dictObj.get_ref().count(key))
         return false;
-    return dictObj.insert_if_absent(make_const_clone(key, true),
-                                    LValue(val, false));
+    /* Q2: a new key fits the dict's own key type */
+    return dictObj.insert_if_absent(
+        make_const_clone(ct_fit_key(dictObj, key), true),
+        LValue(val, false));
 }
 
 /*

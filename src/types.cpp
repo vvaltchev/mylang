@@ -482,6 +482,7 @@ build_arglocs(ExprList *exprList, ArgLoc *locbuf, size_t n)
     al.nargs = n;
     al.arr_hint = exprList->arr_hint;
     al.ctype = exprList->ctype;
+    al.ct_store = exprList->ct_store;
     return al;
 }
 

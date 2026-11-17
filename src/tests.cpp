@@ -1325,7 +1325,10 @@ static const std::vector<test> tests =
         "    for (var i = 0; i < 2; i++) t += d.a * 2.0;",
         "    return t;",
         "}",
-        "g({\"a\": 1.5});" }, &typeid(TypeErrorEx), 38, 4, 42, 4 },
+        /* a DYNAMIC dict (made where `dyn` is declared) takes the
+         * string; a typed one refuses it at the store (Q2) */
+        "var dyn d0 = {\"a\": 1.5}; g(d0);" },
+      &typeid(TypeErrorEx), 38, 4, 42, 4 },
     /* the fused two-level read's inner level: the whole `m[k][0]` span */
     { "err loc: a typed two-level read of a laundered string",
       { "func f(array<array<int>> m) {",
@@ -10168,8 +10171,10 @@ static const std::vector<test> tests =
             "var t = s;",
             "t += [\"c\"];",
             "assert(len(s) == 3 && t == s && array_storage(s) == \"str\");",
-            "t += [1];",
-            "assert(len(s) == 4 && s[3] == 1);",
+            /* Q2: `+=` grows s's own array<str>: an int is refused */
+            "var c0 = 0;",
+            "try { t += [1]; } catch (TypeErrorEx) { c0++; }",
+            "assert(c0 == 1 && len(s) == 3);",
             "var aa = split(\"x y\", str(runtime(\" \")));",
             "aa += aa;",
             "assert(aa == [\"x\", \"y\", \"x\", \"y\"]);",
@@ -10191,7 +10196,7 @@ static const std::vector<test> tests =
             "assert(f == [1.5, 2.0, 1.0] && array_storage(f) == \"float\");",
             "var sl = s[0:1];",
             "sl += [\"z\"];",
-            "assert(sl == [\"a\", \"z\"] && len(s) == 4);",
+            "assert(sl == [\"a\", \"z\"] && len(s) == 3);",
         },
     },
 
@@ -11485,18 +11490,22 @@ static const std::vector<test> tests =
     /* a store of another kind PROMOTES a flat string / class slice: the
      * slice is materialized first, so every name holding it sees the
      * promoted array, and the source keeps its storage (a flat struct
-     * array refuses such a store instead) */
+     * array refuses such a store instead). Q2: only an array whose type
+     * allows the value takes it - a dynamic one (split's result where
+     * `dyn` is declared), or one with no type (a literal nested in a
+     * `dyn` element) */
     {
         "slice: promoting a string or class slice (all its names)",
         {
-            "var w = split(\"a b c\", \" \");",
+            "var dyn w = split(\"a b c\", str(runtime(\" \")));",
             "var dyn s = w[0:2]; var dyn t = s;",
             "s[0] = 5;",
             "assert(t[0] == 5 && t[1] == \"b\");",
             "assert(w == [\"a\", \"b\", \"c\"]);",
             "assert(array_storage(w) == \"str\");",
             "class C { int v; }",
-            "var cs = [C(1), C(2), C(3)];",
+            "array<dyn> hold = [[C(1), C(2), C(3)]];",
+            "var dyn cs = hold[0];",
             "var dyn cl = cs[1:3]; var dyn cm = cl;",
             "cl[0] = 7;",
             "assert(cm[0] == 7 && cs[1].v == 2);",
@@ -18659,9 +18668,12 @@ static const std::vector<test> tests =
         "    if (i == 1) { rc = nc; rd = nd; }",
         "    if (i == 19) assert(nc == rc && nd == rd);",
         "}" } },
-    { "class: a non-instance stored in array<C> promotes it in place",
+    /* Q2: an array<C> refuses it; one with no type of its own (nested
+     * in a `dyn` element) takes it */
+    { "class: a non-instance stored in a class array promotes it in place",
       { "class C { int v; } struct P { int x; }",
-        "var a = [C(int(runtime(1)))]; var b = a; var dyn d = a;",
+        "array<dyn> h = [[C(int(runtime(1)))]];",
+        "var dyn a = h[0]; var dyn b = a; var dyn d = a;",
         "d[0] = P(3); append(d, 4);",
         "assert(array_storage(a) == \"general\" && len(b) == 2);",
         "assert(b[0] == P(3) && b[1] == 4);" } },
@@ -18794,12 +18806,13 @@ static const std::vector<test> tests =
       { "func f(box<int> b) { return *b + 1; }",
         "var dyn d = box(\"s\"); print(f(d));" },
       &typeid(TypeErrorEx), 31, 2, 33, 2 },
-    /* ...so a misfit reaches a typed `*` only through a container a dyn
-     * NAME writes (README: the one place left unchecked) */
+    /* ...so a misfit reaches a typed `*` only through a container with
+     * no type of its own (Q2): a literal a fit check examined where it
+     * landed, until step 3's entry check gives it that place's type */
     { "box: `*` checks the box it was proven to read",
       { "func f(box<int> b) { return *b + 1; }",
-        "array<box<int>> bs = [box(1)]; var dyn d = runtime(bs);",
-        "d[0] = box(\"s\"); print(f(bs[0]));" },
+        "func h(array<box<int>> bs) { var dyn d = bs; d[0] = box(\"s\");",
+        "  return f(bs[0]); } print(h([runtime(box(1))]));" },
       &typeid(TypeErrorEx), 29, 1, 32, 1 },
     /* ... in a loop the JIT compiles: its native int add reads the load's
      * result raw, so only the load's own check can refuse the misfit */
@@ -18808,8 +18821,8 @@ static const std::vector<test> tests =
         "  for (var i = 0; i < 300; i++) s += *b + i;",
         "  return s; }",
         "var g = box(1); assert(f(g) == 300 + 44850);",
-        "array<box<int>> bs = [g]; var dyn d = runtime(bs);",
-        "d[0] = box(\"s\"); var r = f(bs[0]);",
+        "func h(array<box<int>> bs) { var dyn d = bs; d[0] = box(\"s\");",
+        "  return f(bs[0]); } var r = h([runtime(g)]);",
         "print(r);" },
       &typeid(TypeErrorEx), 38, 2, 41, 2 },
     { "box: ++ on a box of a str is a TypeErrorEx at the inc-dec",
@@ -41452,23 +41465,11 @@ static bool jit_store_elem2_inline_tier()
           "    return s; }",
           "print(f(mk(8), 8));" }, 8 },
 
-      /*
-       * The value-FIT guard, and its ORDER against prep: a float value
-       * into an INT row throws the flat-mismatch TypeError WITHOUT
-       * cloning (flat_store_core checks `fits` before COW), so with a
-       * live slice over the row prep must NOT run (prep=0 is the
-       * assertion that catches a cow-before-fit misordering; the store
-       * itself must reach the helper: fast_exact=0).
-       */
-      { "DECLINE: float value into an INT row (fits before COW, slice)",
-        { MK_INT,
-          "func f(m, n) {",
-          "    var r1 = m[1];",
-          "    var sl = r1[runtime(1):3];",
-          "    var t = 0;",
-          "    try { m[1][0] = 2.5; } catch (TypeErrorEx) { t = 1; }",
-          "    return t * 1000 + sl[0]; }",
-          "print(f(mk(8), 8));" }, 0, /*prep=*/0 },
+      /* The value-FIT guard's misfit arm (a float into an INT row)
+       * has no case since #58 and Q2 step 2 (2026-11-17): a float
+       * into a proven int row is a compile error, and a `dyn` value is
+       * converted - or refused - before the store. It stays for an
+       * image, whose operands are bounded but not type-checked. */
 
       /* a const (deep read-only) nested array declines with the exact
        * interpreter error and NO prep. NOTE which guard: sabotage showed
@@ -43061,6 +43062,9 @@ static bool opcode_table_census()
           "#49: d1 - a misfit CONVEYS, stamped with the value's caret; "
           "b0 - a body holding one is not pasted (no remap of its "
           "fit_specs index)" },
+        { OpCode::StampTypeV,            1,1,1,0,0,0,
+          "Q2: d1 - never throws; b0 - a body holding one is not pasted "
+          "(its ctypes ref names the callee's pool)" },
     };
     const size_t nrows = sizeof(rows) / sizeof(rows[0]);
     const Chunk ck;      /* empty - census_instr never makes a shape
@@ -55261,15 +55265,21 @@ static bool jit_storev_native()
             "}",
             "assert(caught == 6);",
             "assert(g[2][0] == 9);",
-            /* base_kind: a dyn ALIAS of a FLAT int array (a dyn
-             * DESTINATION would have built a general one) */
-            "var fa = [1, 2, 3];",
-            "var dyn da = fa;",
-            "var dyn dv = 7;",
-            "for (var i = 0; i < 6; i++) da[i % 3] = dv;",
-            "assert(fa[0] == 7);",
-            /* base_not_arr: StoreElemValue is the UNIVERSAL store, so a
-             * dyn base holding a DICT reaches it */
+            /* base_kind: a FLAT string array (split's), which the
+             * general tier cannot store into */
+            "var ws = split(\"a b c\", str(runtime(\" \")));",
+            "for (var i = 0; i < 6; i++) ws[i % 3] = \"q\";",
+            "assert(ws[0] == \"q\" && array_storage(ws) == \"str\");",
+            /* ctype (Q2): a store through a dyn name into a TYPED
+             * array is the helper's, which checks the value against the
+             * array's own type; an array<dyn> one stays (val_ex) */
+            "var tw = [\"a\", \"b\"];",
+            "var dyn dtw = tw;",
+            "for (var i = 0; i < 6; i++) dtw[i % 2] = \"z\";",
+            "assert(tw == [\"z\", \"z\"]);",
+            /* StoreElemValue is the UNIVERSAL store, so a dyn base
+             * holding a DICT reaches it - checked against the dict's
+             * type (Q2), so the helper's */
             "var dyn dd = {0: \"a\", 1: \"b\"};",
             "for (var i = 0; i < 6; i++) dd[i % 2] = \"z\";",
             "assert(dd[0] == \"z\");",
@@ -55307,12 +55317,15 @@ static bool jit_storev_native()
      * writes through, the bug fixed that day (a write-through
      * parameter takes no argument directly). Both stay for the same
      * reason elemv_base_not_arr does - a `.myv` image's operands are
-     * bounded but not type-checked. */
+     * bounded but not type-checked. And storev_base_not_arr since Q2
+     * step 2 (2026-11-17): a base whose static type is not a proven
+     * array is a store through `dyn`, checked against the container's
+     * own type - which is the helper's, so the tier sees only stores
+     * into proven arrays. */
     static const int want[] = {
-        JD_storev_base_not_arr,
         JD_storev_base_slice, JD_storev_readonly, JD_storev_base_kind,
         JD_storev_has_slices, JD_storev_scale_wrap, JD_storev_bounds,
-        JD_storev_val_ex, JD_storev_val_slice,
+        JD_storev_val_ex, JD_storev_val_slice, JD_storev_ctype,
     };
     for (const int r : want) {
         if (g_jit_decline[r] > d0[r])
@@ -55609,24 +55622,27 @@ static bool jit_box_native()
              * kind check and its tag check - the helper raises the
              * defined TypeErrorEx (box_kind, box_not_box), and the
              * store's tag check the same. A dyn ARGUMENT is refused at
-             * the bind since #49, so the misfits arrive the one way
-             * left: stored through a dyn name of an array<box<int>> */
+             * the bind since #49, and a store through a dyn name is
+             * checked against the array's type since Q2, so the misfits
+             * arrive the one way left: an array with no type of its own
+             * (a literal a fit check examined where it landed) */
             "func wantint(box<int> x) {",
             "  var r = 0;",
             "  for (var k = 0; k < 3; k++) r += *x;",
             "  return r; }",
             "func setint(box<int> x, int v) {",
             "  for (var k = 0; k < 3; k++) *x = v + k; }",
-            "array<box<int>> bs = [box(1), box(2)];",
-            "var dyn dbs = runtime(bs);",
-            "dbs[0] = box(\"s\"); dbs[1] = runtime(5);",
-            "var got = 0;",
-            "for (var i = 0; i < 4; i++) {",
-            "  try { wantint(bs[0]); } catch (TypeErrorEx) { got++; }",
-            "  try { wantint(bs[1]); } catch (TypeErrorEx) { got++; }",
-            "  try { setint(bs[1], i); } catch (TypeErrorEx) { got++; }",
-            "}",
-            "assert(got == 12);",
+            "func misfits(array<box<int>> bs) {",
+            "  var dyn dbs = bs;",
+            "  dbs[0] = box(\"s\"); dbs[1] = runtime(5);",
+            "  var got = 0;",
+            "  for (var i = 0; i < 4; i++) {",
+            "    try { wantint(bs[0]); } catch (TypeErrorEx) { got++; }",
+            "    try { wantint(bs[1]); } catch (TypeErrorEx) { got++; }",
+            "    try { setint(bs[1], i); } catch (TypeErrorEx) { got++; }",
+            "  }",
+            "  return got; }",
+            "assert(misfits([runtime(box(1)), box(2)]) == 12);",
             /* a string into a float box (through a dyn): the value's
              * float tag check (box_val_kind) is what keeps the 'f' kind
              * byte from admitting it */
@@ -55745,16 +55761,19 @@ static bool jit_class_native()
             "assert(m == 25);",
             /* a D in a C parameter: the field's slot is C's, so only
              * the def guard keeps the read off D's `m`. A dyn ARGUMENT
-             * is refused at the bind since #49, so the D arrives the one
-             * way left: stored through a dyn name of an array<C> */
+             * is refused at the bind since #49, and a store through a
+             * dyn name checked against the array's type since Q2, so
+             * the D arrives the one way left: an array with no type of
+             * its own (a literal a fit check examined where it landed) */
             "class D { int m; int n; }",
             "func getn(C c) { var r = 0;",
             "  for (var k = 0; k < 3; k++) r += c.n; return r; }",
-            "array<C> cd = [C(0)]; var dyn dcd = runtime(cd);",
-            "dcd[0] = D(7, 9);",
-            "var rn = 0;",
-            "for (var i = 0; i < 4; i++) rn += getn(cd[0]);",
-            "assert(rn == 108);",
+            "func dsum(array<C> cd) {",
+            "  var dyn dcd = cd; dcd[0] = D(7, 9);",
+            "  var rn = 0;",
+            "  for (var i = 0; i < 4; i++) rn += getn(cd[0]);",
+            "  return rn; }",
+            "assert(dsum([runtime(C(0))]) == 108);",
             /* an array of box<P>: a reference vector, never a flat struct
              * array - its element's field is read through the reference */
             "struct P { int x; float y; }",
