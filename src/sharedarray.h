@@ -17,6 +17,7 @@
 
 struct StructTypeDef;   /* a struct type (structtype.h); only a pointer here */
 class StructObject;     /* a struct or class instance (structtype.h) */
+struct TypeAnnot;       /* Q2: a container's own type (structtype.h) */
 
 /*
  * The count of a class instance held by the flat CLASS storage below.
@@ -294,6 +295,16 @@ private:
          */
         int_type shift_epoch = 0;
 
+        /*
+         * Q2 (plans/typed-containers.md): THIS ARRAY'S OWN TYPE - an
+         * interned array<T> (structtype.h, annot_intern), or null for an
+         * UNTYPED array (one only `dyn` reaches, or a constant's). Every
+         * handle and every slice of the storage shares it; a copy keeps
+         * it (clone_internal_vec). Last in the object: the JIT bakes the
+         * offsets of the fields above.
+         */
+        const TypeAnnot *ctype = nullptr;
+
         SharedObject() : kind(Storage::general) { new (&vec) vec_type(); }
         SharedObject(vec_type &&a) : kind(Storage::general) {
             new (&vec) vec_type(std::move(a));
@@ -563,6 +574,7 @@ public:
      * a slice does: that is materialize_slice, which moves every handle
      * of the slice. */
     void clone_internal_vec();
+    void clone_internal_vec_raw();
 
     /*
      * A write through a slice: the slice - EVERY handle of its group -
@@ -711,6 +723,17 @@ public:
     int_type use_count() const { return shobj.use_count(); }
 
     bool is_readonly() const { return shobj && shobj->readonly; }
+
+    /* Q2: the array's own type (SharedObject::ctype), null if untyped */
+    const TypeAnnot *ctype() const { return shobj ? shobj->ctype : nullptr; }
+    /* Give a FRESH array its type (stamp_ctype, eval.h): an untyped array
+     * that no slice shares - never the shared empty storage an empty
+     * slice is a view of, never a type already given. */
+    void set_ctype(const TypeAnnot *t)
+    {
+        if (shobj && !slice)
+            shobj->ctype = t;
+    }
     /* #92: true iff a raw in-place store needs NO copy-on-write work -
      * not a slice view itself, and no live slice views over the storage.
      * The prep helper re-checks this after cloning so the emitted retry

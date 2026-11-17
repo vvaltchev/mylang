@@ -2,8 +2,16 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 42.  This document describes the on-disk image exhaustively:
+Format version 43.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v43: every array (11.1) and dict (11.2) value carries its OWN TYPE, a
+`ctype` (2.3), after its readonly flag; a chunk gains the pool `ctypes`
+(9.11b) after fit_specs, which MakeArrayV / MakeDictV / MapFilterV name
+from their `target2`; a BuiltinCall (9.15) and a CallSite (9.16) carry the
+type a container the call builds is made with, after `arr_hint`.  And an
+`annot`'s struct may be one of the binary's reflection structs (the
+reserved srefs of section 2), so an `array<Type>` can be written.)
 
 (v42: each catch type name (9.9) is followed by the struct it names, an
 `sref`.  A catch clause catches a struct by IDENTITY - the struct its name
@@ -447,7 +455,20 @@ A declared type, as the parser built it (`array<P?>`, `dict<str, int>`,
 
 A child may itself be absent (its kind byte 0xFF).  The reader REFUSES a kind
 above `box`, a struct index on another kind or past the table, and a nesting
-deeper than 256 levels ("corrupt .myv (annot ...)").
+deeper than 256 levels ("corrupt .myv (annot ...)").  (v43: the struct index
+may also be one of the reserved native srefs of section 2 - a reflection
+struct, as an `array<Type>`'s element.)
+
+2.3  ctype - a container's own type (v43)
+
+An `annot` (2.2) naming the type an array or a dict carries (plans/
+typed-containers.md): `array<T>` or `dict<K, V>`, possibly absent (its kind
+byte 0xFF: an UNTYPED container).  Where present its kind must be `arr` (an
+array's, a MakeArrayV's, a MapFilterV's) or `dict` (a dict's, a MakeDictV's)
+- either for a builtin call's, which may build one or the other - and its
+top-level `opt` must be false; the reader refuses anything else ("corrupt
+.myv (container type)" / "(ctype)").  The loader interns it, so two equal
+types are one object.
 
 --------------------------------------------------------------------------------
 3.  TOP-LEVEL LAYOUT
@@ -789,6 +810,7 @@ Each chunk is:
     N x sref struct_defs
     N x BoxedCtor boxed_ctors       9.11
     N x FitSpec fit_specs           9.11a   (v37)
+    N x ctype ctypes                9.11b   (v43)
     N x EmplaceSite emplace_sites   9.12
     N x ThrowSite throws            9.13
     N x SlotList unpack_targets     9.14
@@ -1033,6 +1055,14 @@ interned twin and whether it is a built-in exception's are DERIVED
     uid      name           the field's or variable's name; null (0xFFFFFFFF)
                             for an element, a dict value or a key
 
+9.11b ctypes - the creation ops' container types (v43)
+
+Each a `ctype` (2.3), present (never 0xFF).  An op names one by a REF -
+0 for none, else the index + 1: MakeArrayV in target2's bits 8 and up
+(its low 8 bits are the ArrHint), MakeDictV in the whole of target2,
+MapFilterV in target2's bits 3 and up.  The verifier refuses a ref past
+the pool ("corrupt .myv (ctype at pc N)").
+
 9.12  EmplaceSite - a construct-in-place append
 
     sref     def
@@ -1056,6 +1086,8 @@ interned twin and whether it is a built-in exception's are DERIVED
     uid      name           the builtin's NAME, re-resolved at load
     loc      start, end     the whole-args caret
     u8       arr_hint       ArrHint, section 13
+    ctype    ctype          v43 - (2.3) the type a container the call builds
+                            is made with; absent for every other call
     arglocs  args           per-argument carets
     uid      member         arg0's field name for `append(s.f, x)`, else null
     StepList steps          (9.7) CallBuiltinLVMember's chain form: arg0
@@ -1071,6 +1103,7 @@ re-resolves it through `vm_lookup_builtin`; an unknown name is refused.
     loc      start, end
     arglocs  args
     u8       arr_hint       ArrHint, section 13
+    ctype    ctype          v43 - (2.3), as a BuiltinCall's
     u8       a0_form        CallSite::A0, section 13
     u32      a0_kind        0 local / 1 global / 2 capture / 3 builtin
     u32      a0_slot        (signed)
@@ -1211,6 +1244,7 @@ constant 'S.K'" - and writes no file.  A reader therefore never meets one.
 
     u8    storage kind      Storage, section 13
     bool  readonly          the deep-const flag
+    ctype ctype             v43 - (2.3) the array's own type, or absent
     u32   n                 element count
     then, per kind:
         ints      n x i64
@@ -1236,6 +1270,7 @@ const pool holds a self-contained value.
 11.2  dict
 
     bool  readonly
+    ctype ctype             v43 - (2.3) the dict's own type, or absent
     bool  has_default
     [value default]         iff has_default
     u32   n

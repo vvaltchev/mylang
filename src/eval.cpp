@@ -2431,6 +2431,7 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
                 al.args = locs;
                 al.nargs = n;
                 al.arr_hint = ael->arr_hint;
+                al.ctype = ael->ctype;
                 return dispatch_builtin_values(ctx, b, &al, argv, n);
             }
             /* question 5: a builtin the PARSER calls with a function in its
@@ -2945,6 +2946,120 @@ EvalValue literal_widen(EvalValue v, DeclType dt)
 static void const_values_widen(EvalValue *vals, size_t n, size_t stride,
                                bool is_const);
 
+/*
+ * The walk behind stamp_ctype / stamp_ctype_top / ctype_restamp. `mode`:
+ * 0 the top container only (a literal: what it holds was typed where IT
+ * was made, or is not its to type); 1 along the annotation, stopping at a
+ * `dyn` element (a builtin's result: the fresh containers its static type
+ * names); 2 along the annotation, and a fresh container under a `dyn`
+ * element DYNAMIC (a baked value: every mutable container in it was made
+ * by the literal, as the nested literals of -nc's tree are).
+ */
+static void stamp_ctype_rec(const EvalValue &v, const TypeAnnot *t, int mode)
+{
+    if (!t)
+        return;
+    const auto sub = [&](const EvalValue &e, const TypeAnnot *et) {
+        if (!et)
+            return;
+        if (et->kind == DeclType::dyn) {
+            if (mode == 2)
+                stamp_ctype_rec(e, e.is<intrusive_ptr<DictObject>>()
+                                       ? annot_dyn_dict() : annot_dyn_array(),
+                                mode);
+            return;
+        }
+        if (et->kind == DeclType::arr || et->kind == DeclType::dict)
+            stamp_ctype_rec(e, annot_nonopt(et), mode);
+    };
+    if (v.is<SharedArrayObj>()) {
+        const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+        if (a.ctype() || a.is_readonly() || a.slice
+                || t->kind != DeclType::arr)
+            return;
+        const_cast<SharedArrayObj &>(a).set_ctype(t);
+        /* only general storage can hold a container */
+        if (mode == 0 || a.skind() != SharedArrayObj::Storage::general)
+            return;
+        const ArrayConstView &view = a.get_view();
+        for (size_type i = 0; i < view.size(); i++)
+            sub(view[i].get(), t->elem.get());
+        return;
+    }
+    if (v.is<intrusive_ptr<DictObject>>()) {
+        DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        if (d.ctype() || d.is_readonly() || t->kind != DeclType::dict)
+            return;
+        d.set_ctype(t);
+        if (mode == 0)
+            return;
+        for (const auto &kv : d.get_ref())
+            sub(kv.second.get(), t->val.get());
+        if (d.get_has_default())
+            sub(d.get_default(), t->val.get());
+    }
+}
+
+void stamp_ctype(const EvalValue &v, const TypeAnnot *t)
+{
+    stamp_ctype_rec(v, t, 1);
+}
+
+void stamp_ctype_top(const EvalValue &v, const TypeAnnot *t)
+{
+    stamp_ctype_rec(v, t, 0);
+}
+
+/* the type a container carries, or null for anything else */
+static const TypeAnnot *ctype_get(const EvalValue &v)
+{
+    if (v.is<SharedArrayObj>())
+        return v.get_ref<SharedArrayObj>().ctype();
+    if (v.is<intrusive_ptr<DictObject>>())
+        return v.get_ref<intrusive_ptr<DictObject>>()->ctype();
+    return nullptr;
+}
+
+/* a fresh copy's mutable containers made untyped again (ctype_restamp) */
+static void ctype_clear(const EvalValue &v)
+{
+    if (v.is<SharedArrayObj>()) {
+        const SharedArrayObj &a = v.get_ref<SharedArrayObj>();
+        if (a.is_readonly() || a.slice || !a.ctype())
+            return;
+        const_cast<SharedArrayObj &>(a).set_ctype(nullptr);
+        if (a.skind() != SharedArrayObj::Storage::general)
+            return;
+        const ArrayConstView &view = a.get_view();
+        for (size_type i = 0; i < view.size(); i++)
+            ctype_clear(view[i].get());
+        return;
+    }
+    if (v.is<intrusive_ptr<DictObject>>()) {
+        DictObject &d = *v.get_ref<intrusive_ptr<DictObject>>();
+        if (d.is_readonly() || !d.ctype())
+            return;
+        d.set_ctype(nullptr);
+        for (const auto &kv : d.get_ref())
+            ctype_clear(kv.second.get());
+    }
+}
+
+EvalValue ctype_restamp(const EvalValue &v, const TypeAnnot *t)
+{
+    const TypeAnnot *cur = ctype_get(v);
+    if (cur == t)
+        return v;
+    if (!cur) {
+        stamp_ctype_rec(v, t, 2);
+        return v;
+    }
+    EvalValue c = make_mutable_clone(v);
+    ctype_clear(c);
+    stamp_ctype_rec(c, t, 2);
+    return c;
+}
+
 EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
 {
     /* Evaluate the element nodes into a buffer (stack for the common small
@@ -2971,16 +3086,21 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
         for (size_t i = 0; i < n; i++)
             buf[i] = RValue(elems[i]->eval(ctx));
         widen(buf);
-        return build_array_from_values(buf, n, arr_hint, arr_hint_struct,
-                                       ctx->const_ctx);
+        EvalValue r = build_array_from_values(buf, n, arr_hint,
+                                              arr_hint_struct,
+                                              ctx->const_ctx);
+        stamp_ctype_top(r, ctype);
+        return r;
     }
 
     std::vector<EvalValue> buf(n);
     for (size_t i = 0; i < n; i++)
         buf[i] = RValue(elems[i]->eval(ctx));
     widen(buf.data());
-    return build_array_from_values(buf.data(), n, arr_hint, arr_hint_struct,
-                                   ctx->const_ctx);
+    EvalValue r = build_array_from_values(buf.data(), n, arr_hint,
+                                          arr_hint_struct, ctx->const_ctx);
+    stamp_ctype_top(r, ctype);
+    return r;
 }
 
 /*
@@ -3026,7 +3146,10 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
         if (keyed)
             if (const EvalValue *c = st.link(k))
                 return *c;
+        /* Q2: a copy is an array of the source's type */
+        const TypeAnnot *ct = arr.ctype();
         auto made = [&](EvalValue res) {
+            res.get<SharedArrayObj>().set_ctype(ct);
             if (keyed)
                 st.remember(k, res);
             return res;
@@ -3100,6 +3223,7 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
         if (arr.skind() == SharedArrayObj::Storage::objs) {
             const auto &ov = arr.flat_objs();
             EvalValue res = SharedArrayObj(SharedArrayObj::ovec_type());
+            res.get<SharedArrayObj>().set_ctype(ct);
             SharedArrayObj::ovec_type &nv =
                 res.get<SharedArrayObj>().flat_objs();
             nv.v.reserve(arr.size());
@@ -3120,6 +3244,7 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
 
         /* the copy exists before its elements, so a back edge can link it */
         EvalValue res = SharedArrayObj(SharedArrayObj::vec_type());
+        res.get<SharedArrayObj>().set_ctype(ct);
         SharedArrayObj::vec_type &vec = res.get<SharedArrayObj>().get_vec();
         vec.reserve(view.size());
         std::optional<CycCopyGuard> g;
@@ -3151,6 +3276,7 @@ clone_to_mutable(const EvalValue &v, bool through_readonly, CycCopyStack &st)
             return *c;
 
         auto out = make_intrusive<DictObject>();
+        out->set_ctype(obj->ctype());       /* Q2: the source's type */
         EvalValue res = intrusive_ptr<DictObject>(out);
         CycCopyGuard g(st, k, res);
 
@@ -3269,7 +3395,10 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
         if (keyed)
             if (const EvalValue *c = st.link(k))
                 return *c;
+        /* Q2: a copy is an array of the source's type */
+        const TypeAnnot *ct = src.ctype();
         auto made = [&](EvalValue res) {
+            res.get<SharedArrayObj>().set_ctype(ct);
             if (keyed)
                 st.remember(k, res);
             return res;
@@ -3346,6 +3475,7 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
             const auto &ov = src.flat_objs();
             EvalValue res = SharedArrayObj(SharedArrayObj::ovec_type());
             SharedArrayObj &arr = res.get<SharedArrayObj>();
+            arr.set_ctype(ct);
             SharedArrayObj::ovec_type &nv = arr.flat_objs();
             nv.v.reserve(src.size());
             {
@@ -3367,6 +3497,7 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
 
         EvalValue res = SharedArrayObj(SharedArrayObj::vec_type());
         SharedArrayObj &arr = res.get<SharedArrayObj>();
+        arr.set_ctype(ct);
         SharedArrayObj::vec_type &vec = arr.get_vec();
         vec.reserve(view.size());
 
@@ -3393,6 +3524,7 @@ make_const_clone_rec(const EvalValue &v, bool key, CycCopyStack &st)
             return *c;
 
         auto obj = make_intrusive<DictObject>();
+        obj->set_ctype(src_obj.ctype());    /* Q2: the source's type */
         EvalValue res = intrusive_ptr<DictObject>(obj);
 
         {
@@ -8164,7 +8296,9 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
             buf[2 * i + 1] = RValue(elems[i]->value->eval(ctx));
         }
         widen_vals(buf);
-        return build_dict_from_pairs(buf, np, ctx->const_ctx);
+        EvalValue r = build_dict_from_pairs(buf, np, ctx->const_ctx);
+        stamp_ctype_top(r, ctype);
+        return r;
     }
 
     std::vector<EvalValue> buf(2 * np);
@@ -8173,7 +8307,9 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
         buf[2 * i + 1] = RValue(elems[i]->value->eval(ctx));
     }
     widen_vals(buf.data());
-    return build_dict_from_pairs(buf.data(), np, ctx->const_ctx);
+    EvalValue r = build_dict_from_pairs(buf.data(), np, ctx->const_ctx);
+    stamp_ctype_top(r, ctype);
+    return r;
 }
 
 /* True if `c` is rooted at a variable (an identifier, or a member/subscript

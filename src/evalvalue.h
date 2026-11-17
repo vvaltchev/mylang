@@ -53,6 +53,9 @@ struct ArgLocs {
                                          * regardless of arity, so its arity check
                                          * must read this, not n_rest. */
     ArrHint arr_hint;                   /* the array-repr hint (range/array/…) */
+    /* Q2: the type a container this call builds is made with (null:
+     * untyped) - Construct::ctype of the call's args list */
+    const TypeAnnot *ctype = nullptr;
     const ArgLoc *arg(size_t i) const { return &args[i]; }
 };
 /*

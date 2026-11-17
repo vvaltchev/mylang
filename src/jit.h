@@ -1121,8 +1121,9 @@ extern "C" void jit_make_closure_locals_st(int_type dst,
  * the element run [base, base+n) via the shared build_array_from_values, honoring
  * `hint` (an ArrHint: flat int/float/bool/struct or general). Never throws
  * (op_fully_native). */
+struct TypeAnnot;     /* Q2: a container's type (structtype.h) */
 extern "C" void jit_make_array(int_type dst, int_type base, int_type n,
-                               int_type hint) noexcept;
+                               int_type hint, const TypeAnnot *ct) noexcept;
 
 /* model-flip (nativize-ops): MakeDictV natively - build a dict LITERAL from the
  * interleaved key/value run [base, base + 2*npairs) via the shared
@@ -1130,7 +1131,7 @@ extern "C" void jit_make_array(int_type dst, int_type base, int_type n,
  * function) throws TypeErrorEx -> g_vm_jit_exc + return 1 (EnterNative re-raises
  * with the literal's caret from the loc side table); 0 otherwise. */
 extern "C" int jit_make_dict(int_type dst, int_type base,
-                             int_type npairs) noexcept;
+                             int_type npairs, const TypeAnnot *ct) noexcept;
 
 /* model-flip (nativize-ops): the STRUCT BUILDS. `def` is the program-lifetime
  * StructTypeDef* from the struct_defs pool (baked as a VALUE); `bc` is a baked
@@ -1329,6 +1330,9 @@ extern "C" int jit_check_none_args(int_type kind, int_type callee,
 extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
                               int_type dst, int_type is_map,
                               int_type site, int_type cend) noexcept;
+/* Q2: stamp the container in `dst` with the type it is made with (the
+ * MapFilterV result - its helper's argument registers are all taken) */
+extern "C" void jit_stamp_ctype(int_type dst, const TypeAnnot *ct) noexcept;
 
 /* class step 4: the native LoadBoxV / StoreBoxV - the interpreted ops'
  * box_load_want / box_store (plans/class-and-box.md). A raise (`*` of a

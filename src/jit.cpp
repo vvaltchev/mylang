@@ -26233,7 +26233,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.mov_imm(RSI, static_cast<uint64_t>(in.a_lit()));
         e.mov_imm(RDX, static_cast<uint64_t>(in.b_lit()));
         e.mov_imm(RCX, static_cast<uint64_t>(
-                          static_cast<int_type>(in.target2)));
+                          static_cast<int_type>(in.target2 & 0xff)));
+        /* Q2: the array's type (Chunk::ctypes; null: untyped) */
+        e.movabs(R8, reinterpret_cast<uint64_t>(
+                         ck.ctype_ref(static_cast<unsigned>(in.target2) >> 8)));
         e.call_direct(jit_make_array);
         emit_call_epilogue(e);
         return true;
@@ -26249,6 +26252,9 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         e.mov_imm(RDI, static_cast<uint64_t>(static_cast<int_type>(in.target)));
         e.mov_imm(RSI, static_cast<uint64_t>(in.a_lit()));
         e.mov_imm(RDX, static_cast<uint64_t>(in.b_lit()));
+        /* Q2: the dict's type (Chunk::ctypes; null: untyped) */
+        e.movabs(RCX, reinterpret_cast<uint64_t>(
+                          ck.ctype_ref(static_cast<unsigned>(in.target2))));
         e.call_direct(jit_make_dict);
         emit_call_epilogue(e);
         e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
@@ -28248,6 +28254,16 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                        /*arg_select=*/false);
         e.exit_pc(pc);
         e.patch8(j_ok_mf, e.pos());
+        /* Q2: the result's type (Chunk::ctypes), in a call of its own */
+        if (const TypeAnnot *mct =
+                ck.ctype_ref(static_cast<unsigned>(in.target2) >> 3)) {
+            emit_call_prologue(e);
+            e.mov_imm(RDI, static_cast<uint64_t>(
+                              static_cast<int_type>(in.target)));
+            e.movabs(RSI, reinterpret_cast<uint64_t>(mct));
+            e.call_direct(jit_stamp_ctype);
+            emit_call_epilogue(e);
+        }
         return true;
     }
 

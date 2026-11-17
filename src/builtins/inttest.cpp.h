@@ -77,4 +77,21 @@ EvalValue builtin_int_events(EvalContext *ctx, const ArgLocs *exprList,
     return SharedArrayObj(std::move(vec));
 }
 
+/* int_ctype(x): the type an array or a dict carries (Q2,
+ * plans/typed-containers.md) - "array<int>", "dict<str, dyn>" - or
+ * "untyped"; "-" for a value that is no container. A test reads it to see
+ * that every engine gives a container the same type where it is made. */
+EvalValue builtin_int_ctype(EvalContext *ctx, const ArgLocs *exprList,
+                            const EvalValue *args, size_t n)
+{
+    if (n != 1)
+        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
+    if (args[0].is<SharedArrayObj>())
+        return SharedStr(annot_text(args[0].get_ref<SharedArrayObj>().ctype()));
+    if (args[0].is<intrusive_ptr<DictObject>>())
+        return SharedStr(annot_text(
+            args[0].get_ref<intrusive_ptr<DictObject>>()->ctype()));
+    return SharedStr(std::string("-"));
+}
+
 #endif  /* INT_TESTS */

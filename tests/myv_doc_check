@@ -58,7 +58,7 @@ def value(r):
     if t == 3: return r.f64()
     if t == 4: return r.raw()
     if t == 5:                                    # arr
-        kind = r.u8(); r.boolv(); n = r.u32()
+        kind = r.u8(); r.boolv(); ctype(r); n = r.u32()   # v43: ctype
         if kind == 1: return [r.i64() for _ in range(n)]
         if kind == 2: return [r.f64() for _ in range(n)]
         if kind == 3: return [r.boolv() for _ in range(n)]
@@ -70,7 +70,7 @@ def value(r):
         assert kind == 0, 'bad array storage kind %d' % kind
         return [value(r) for _ in range(n)]       # 0 general
     if t == 6:                                    # dict
-        r.boolv()
+        r.boolv(); ctype(r)                       # v43: ctype
         if r.boolv(): value(r)
         return [(value(r), value(r)) for _ in range(r.u32())]
     if t == 7:                                    # strct
@@ -102,6 +102,12 @@ def annot(r, depth=0):
     elif kind == 6:                               # dict: key, val
         annot(r, depth + 1); annot(r, depth + 1)
     return kind
+
+# ---- section 2.3: a container's own type (v43) --------------------------
+def ctype(r):
+    k = annot(r)
+    assert k in (None, 5, 6), 'a ctype must be an arr or a dict (%r)' % k
+    return k
 
 # ---- section 9: a chunk -------------------------------------------------
 def chunk(r):
@@ -168,17 +174,21 @@ def chunk(r):
         r.sref(); r.arglocs(); r.boolv()                    # v37: fit
     for _ in range(r.u32()):                                # 9.11a fit_specs
         annot(r); r.u8(); r.uid()                           # (v37)
+    for _ in range(r.u32()):                                # 9.11b ctypes
+        assert ctype(r) is not None, 'an absent ctypes entry'  # (v43)
     for _ in range(r.u32()):                                # 9.12 emplace
         r.sref(); r.uid(); r.loc(); r.loc(); r.arglocs()
     for _ in range(r.u32()): r.u8(); r.loc(); r.loc(); r.uid()   # 9.13 throws
     for _ in range(r.u32()): r.nx(r.u32)          # 9.14 unpack_targets
     for _ in range(r.u32()): r.nx(r.u8)           # 9.14 unpack_coerce
     for _ in range(r.u32()):                      # 9.15 builtin_calls
-        r.uid(); r.loc(); r.loc(); r.u8(); r.arglocs(); r.uid()
+        r.uid(); r.loc(); r.loc(); r.u8(); ctype(r)   # v43: ctype
+        r.arglocs(); r.uid()
         steps()                                   # v32
     for _ in range(r.u32()):                      # 9.16 call_sites
         r.loc(); r.loc(); r.arglocs()
-        r.u8(); r.u8(); r.u32(); r.u32(); r.u32(); r.uid()
+        r.u8(); ctype(r)                          # v43: ctype
+        r.u8(); r.u32(); r.u32(); r.u32(); r.uid()
         steps()                                   # v32
     r.nx(r.sid)                                   # 9.17 slot_names
 

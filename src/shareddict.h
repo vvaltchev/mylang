@@ -7,6 +7,8 @@
 #include "intrusiveptr.h"
 #include "orderedmap.h"
 
+struct TypeAnnot;   /* Q2: a container's own type (structtype.h) */
+
 template <class EvalValueT, class LValueT>
 class DictObjectTempl : public RefCounted {
 
@@ -39,6 +41,11 @@ private:
      */
     bool has_default = false;
     EvalValueT default_val;
+
+    /* Q2 (plans/typed-containers.md): THIS DICT'S OWN TYPE - an interned
+     * dict<K, V> (structtype.h), or null for an untyped dict. A copy
+     * keeps it. */
+    const TypeAnnot *ctype_ = nullptr;
 
 public:
 
@@ -196,12 +203,13 @@ public:
      * walkers (the RefCounted base resets the count the same way). */
     DictObjectTempl(const DictObjectTempl &o)
         : RefCounted(), data(o.data), readonly(o.readonly),
-          has_default(o.has_default), default_val(o.default_val)
+          has_default(o.has_default), default_val(o.default_val),
+          ctype_(o.ctype_)
     { }
     DictObjectTempl(DictObjectTempl &&o)
         : RefCounted(),
           readonly(o.readonly), has_default(o.has_default),
-          default_val(std::move(o.default_val))
+          default_val(std::move(o.default_val)), ctype_(o.ctype_)
     {
         o.will_restructure();          /* its walkers keep their keys */
         data = std::move(o.data);
@@ -310,6 +318,11 @@ public:
     bool is_readonly() const { return readonly; }
     void set_readonly() { readonly = true; }
     void clear_readonly() { readonly = false; }
+
+    /* Q2: the dict's own type (null: untyped); set_ctype gives a FRESH
+     * dict its type (stamp_ctype, eval.h) */
+    const TypeAnnot *ctype() const { return ctype_; }
+    void set_ctype(const TypeAnnot *t) { ctype_ = t; }
 
     bool get_has_default() const { return has_default; }
     const EvalValueT &get_default() const { return default_val; }

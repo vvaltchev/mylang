@@ -339,7 +339,17 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
             const auto &lo = ch.literal_objs[i];
             s << ";   [" << i << "]" << "  "
               << lo.value.get_type()->to_string_repr(lo.value)
-              << (lo.immutable ? "  (immutable)" : "") << "\n";
+              << (lo.immutable ? "  (immutable)" : "");
+            /* Q2: the type the value's container was made with */
+            const TypeAnnot *ct =
+                lo.value.is<SharedArrayObj>()
+                    ? lo.value.get_ref<SharedArrayObj>().ctype()
+                : lo.value.is<intrusive_ptr<DictObject>>()
+                    ? lo.value.get_ref<intrusive_ptr<DictObject>>()->ctype()
+                    : nullptr;
+            if (ct)
+                s << "  ; " << annot_text(ct);
+            s << "\n";
         }
     }
     if (!ch.closure_defs.empty()) {
@@ -355,6 +365,11 @@ void dump_chunk_pools(const Chunk &ch, std::ostringstream &s)
         for (size_t i = 0; i < ch.struct_defs.size(); i++)
             s << ";   [" << i << "]" << "  " << ch.struct_defs[i]->name->val
               << "\n";
+    }
+    if (!ch.ctypes.empty()) {               /* Q2 */
+        s << "; -- ctypes (" << ch.ctypes.size() << ") --\n";
+        for (size_t i = 0; i < ch.ctypes.size(); i++)
+            s << ";   [" << i << "]  " << annot_text(ch.ctypes[i]) << "\n";
     }
     if (!ch.fit_specs.empty()) {
         static const char *const places[] = {
@@ -2289,6 +2304,9 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 row << "  ; flat "
                     << ((((in.target2 >> 1) & 3) == 1) ? "int"
                         : (((in.target2 >> 1) & 3) == 2) ? "float" : "bool");
+            if (const TypeAnnot *t = chunk.ctype_ref(
+                    static_cast<unsigned>(in.target2) >> 3))
+                row << "  ; " << annot_text(t);
             break;
         case OpCode::ReturnV:
             row << "return.v     " << RI(in.a(), false);
@@ -2296,12 +2314,18 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
         case OpCode::MakeArrayV:
             row << "make.arr     " << D(in.target) << " = "
                 << arglist(chunk, in.a_lit(), in.b_lit())
-                << "  ; array literal, hint " << in.target2;
+                << "  ; array literal, hint " << (in.target2 & 0xff);
+            if (const TypeAnnot *t = chunk.ctype_ref(
+                    static_cast<unsigned>(in.target2) >> 8))
+                row << ", " << annot_text(t);
             break;
         case OpCode::MakeDictV:
             row << "make.dict    " << D(in.target) << " = "
                 << arglist(chunk, in.a_lit(), 2 * in.b_lit())
                 << "  ; dict literal (" << in.b_lit() << " pairs)";
+            if (const TypeAnnot *t = chunk.ctype_ref(
+                    static_cast<unsigned>(in.target2)))
+                row << ", " << annot_text(t);
             break;
         case OpCode::MakeClosureV:
             row << "make.closure " << D(in.target) << " = closure_defs["

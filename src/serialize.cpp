@@ -641,6 +641,10 @@ struct Reader {
  * annotation), bool opt, u32 struct index (0xFFFFFFFF: none), then the
  * children: elem for an array or a box, key then val for a dict.
  */
+static uint32_t native_sref(const StructTypeDef *d);
+static StructTypeDef *native_at(uint32_t ref);
+static constexpr uint32_t SREF_NATIVE_ANNOT = 0xfffffff0u;
+
 static void write_annot(Writer &w, const TypeAnnot *a)
 {
     if (!a) {
@@ -652,9 +656,10 @@ static void write_annot(Writer &w, const TypeAnnot *a)
     uint32_t si = 0xffffffffu;
     if (a->strct) {
         auto it = w.struct_ids.find(a->strct);
-        if (it == w.struct_ids.end())
+        if (it != w.struct_ids.end())
+            si = it->second;
+        else if ((si = native_sref(a->strct)) == 0xffffffffu)
             bad_image("unserializable image (annot struct)");
-        si = it->second;
     }
     w.u32v(si);
     if (a->kind == DeclType::arr || a->kind == DeclType::box)
@@ -681,9 +686,14 @@ static std::shared_ptr<TypeAnnot> read_annot(Reader &r, int depth)
     a->opt = r.boolv();
     const uint32_t si = r.u32v();
     if (si != 0xffffffffu) {
-        if (a->kind != DeclType::strct || si >= r.structs.size())
+        /* v43: a program's struct, or one of the binary's reflection
+         * structs (an array<Type>'s element) */
+        if (a->kind != DeclType::strct
+                || (si < SREF_NATIVE_ANNOT ? si >= r.structs.size()
+                                           : si > SREF_NATIVE_ANNOT + 2))
             bad_image("corrupt .myv (annot struct)");
-        a->strct = r.structs[si];
+        a->strct = si >= SREF_NATIVE_ANNOT ? native_at(si)
+                                           : r.structs[si];
     }
     if (a->kind == DeclType::arr || a->kind == DeclType::box)
         a->elem = read_annot(r, depth + 1);
@@ -692,6 +702,35 @@ static std::shared_ptr<TypeAnnot> read_annot(Reader &r, int depth)
         a->val = read_annot(r, depth + 1);
     }
     return a;
+}
+
+/* Q2 (v43): a container's own type - an annotation, interned at load. A
+ * container's type is an array<T> / dict<K, V> with no top-level `?`
+ * (`dict`: which of the two this container is) */
+static void write_ctype(Writer &w, const TypeAnnot *t)
+{
+    write_annot(w, t);
+}
+
+/* ...either kind: a builtin call's (it builds an array or a dict) */
+static const TypeAnnot *read_ctype_any(Reader &r)
+{
+    std::shared_ptr<TypeAnnot> a = read_annot(r, 0);
+    if (!a)
+        return nullptr;
+    if (a->opt || (a->kind != DeclType::arr && a->kind != DeclType::dict))
+        bad_image("corrupt .myv (container type)");
+    return annot_intern(*a);
+}
+
+static const TypeAnnot *read_ctype(Reader &r, bool dict)
+{
+    std::shared_ptr<TypeAnnot> a = read_annot(r, 0);
+    if (!a)
+        return nullptr;
+    if (a->opt || a->kind != (dict ? DeclType::dict : DeclType::arr))
+        bad_image("corrupt .myv (container type)");
+    return annot_intern(*a);
 }
 
 /* ------------------------------------------------------------------ */
@@ -765,6 +804,7 @@ void write_array(Writer &w, const SharedArrayObj &a)
     const auto kind = a.skind();
     w.u8v(static_cast<uint8_t>(kind));
     w.boolv(a.is_readonly());
+    write_ctype(w, a.ctype());              /* v43 */
     const size_type n = a.size();
     w.u32v(static_cast<uint32_t>(n));
     /* Slices and offsets are NOT stored: a stored array is materialized as
@@ -814,6 +854,7 @@ EvalValue read_array(Reader &r)
     const auto kind = r.enumv(SharedArrayObj::Storage::objs,
                               "corrupt .myv (array storage kind)");
     const bool ro = r.boolv();
+    const TypeAnnot *ct = read_ctype(r, false);     /* v43 */
     const uint32_t n = r.countv();
     SharedArrayObj out;
     switch (kind) {
@@ -889,6 +930,7 @@ EvalValue read_array(Reader &r)
         break;
     }
     }
+    out.set_ctype(ct);
     if (ro)
         out.set_readonly();
     return EvalValue(std::move(out));
@@ -928,6 +970,7 @@ void write_value(Writer &w, const EvalValue &v)
         w.u8v(static_cast<uint8_t>(VTag::dict));
         const DictObject &d = *v.get<intrusive_ptr<DictObject>>();
         w.boolv(d.is_readonly());
+        write_ctype(w, d.ctype());          /* v43 */
         w.boolv(d.get_has_default());
         if (d.get_has_default())
             write_value(w, d.get_default());
@@ -1024,6 +1067,7 @@ EvalValue read_value(Reader &r)
     case VTag::dict: {
         const bool ro = r.boolv();
         auto d = make_intrusive<DictObject>();
+        d->set_ctype(read_ctype(r, true));  /* v43 */
         if (r.boolv())
             d->set_default(read_value(r));
         const uint32_t n = r.countv();
@@ -1629,6 +1673,11 @@ void write_chunk(Writer &w, const Chunk &c)
         w.uidv(f.name);
     }
 
+    /* v43: the creation ops' container types (Chunk::ctypes) */
+    w.u32v(static_cast<uint32_t>(c.ctypes.size()));
+    for (const TypeAnnot *t : c.ctypes)
+        write_annot(w, t);
+
     w.u32v(static_cast<uint32_t>(c.emplace_sites.size()));
     for (const auto &es : c.emplace_sites) {
         auto it = w.struct_ids.find(es.def);
@@ -1664,6 +1713,7 @@ void write_chunk(Writer &w, const Chunk &c)
         w.uidv(bc.name);                 /* re-resolved at load */
         w.locv(bc.start); w.locv(bc.end);
         w.u8v(static_cast<uint8_t>(bc.arr_hint));
+        write_ctype(w, bc.ctype);            /* v43 */
         write_arglocs(w, bc.args);
         w.uidv(bc.member);
         wsteps(bc.steps);                /* v32 */
@@ -1674,6 +1724,7 @@ void write_chunk(Writer &w, const Chunk &c)
         w.locv(cs.start); w.locv(cs.end);
         write_arglocs(w, cs.args);
         w.u8v(static_cast<uint8_t>(cs.arr_hint));
+        write_ctype(w, cs.ctype);            /* v43 */
         w.u8v(static_cast<uint8_t>(cs.a0_form));
         w.u32v(static_cast<uint32_t>(cs.a0_kind));
         w.u32v(static_cast<uint32_t>(cs.a0_slot));
@@ -1978,6 +2029,16 @@ void read_chunk(Reader &r, Chunk &c)
         c.fit_specs.push_back(std::move(f));
     }
 
+    n = r.countv();                          /* v43: ctypes */
+    c.ctypes.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        std::shared_ptr<TypeAnnot> a = read_annot(r, 0);
+        if (!a || a->opt
+                || (a->kind != DeclType::arr && a->kind != DeclType::dict))
+            bad_image("corrupt .myv (ctype)");
+        c.ctypes.push_back(annot_intern(*a));
+    }
+
     n = r.countv();
     c.emplace_sites.reserve(n);
     for (uint32_t i = 0; i < n; i++) {
@@ -2034,6 +2095,7 @@ void read_chunk(Reader &r, Chunk &c)
         bc.start = r.locv(); bc.end = r.locv();
         bc.arr_hint = r.enumv(ArrHint::flat_c,
                               "corrupt .myv (array hint)");
+        bc.ctype = read_ctype_any(r);        /* v43 */
         bc.args = read_arglocs(r);
         bc.member = r.uidv();
         bc.steps = rsteps();
@@ -2048,6 +2110,7 @@ void read_chunk(Reader &r, Chunk &c)
         cs.args = read_arglocs(r);
         cs.arr_hint = r.enumv(ArrHint::flat_c,
                               "corrupt .myv (array hint)");
+        cs.ctype = read_ctype_any(r);        /* v43 */
         cs.a0_form = r.enumv(Chunk::CallSite::A0::chain,
                              "corrupt .myv (call site arg0 form)");
         cs.a0_kind = static_cast<unsigned char>(r.u32v());

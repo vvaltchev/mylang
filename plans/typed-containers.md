@@ -2,7 +2,8 @@
 
 **Status: decided by the maintainer (2026-11-16): the rule, the
 empty-container rule (question 9, carried to run time) and A for a
-container entering a typed place (section 3). Not built yet.**
+container entering a typed place (section 3). Increment 1 in progress
+(section 6); two follow-on questions open (section 7).**
 
 ## 1. The rule
 
@@ -133,3 +134,65 @@ them #49's own tests of the contents check; no bench or sample.
 Tests: a functional program with every store form and every container
 shape, each refused and each fitting (old value kept); `-rt` cases per
 engine; a `driver_checks` image round trip.
+
+## 6. Implementation notes (2026-11-17)
+
+**The invariant.** Every MUTABLE container that a path with no `dyn` in
+its static type can reach carries exactly that type. A container no such
+path reaches may be untyped (null): it is reached only through `dyn`, so
+a store into it is checked against nothing, and it is checked when it
+first enters a typed place (and takes that type then, section 2's empty
+container). A READ-ONLY container (a constant's, and everything derived
+from one) is exempt: no store can change it, so a contents check at
+entry is sound, and it needs no type. That exemption is what keeps the
+compile-time bakes simple - a constant is evaluated while parsing,
+before any type exists, and two constants may share one baked value.
+
+- **`ctype`**: the container's own type, `array<T>` / `dict<K, V>` with
+  its top-level `opt` cleared, as an interned `TypeAnnot` (one node per
+  distinct type, process lifetime: equal types are one pointer). On
+  `SharedObject` (every handle and every slice of a storage share it)
+  and on `DictObject`. Null: untyped.
+- **Copies keep it**: copy-on-write (`clone_internal_vec`), `clone()`, a
+  materialized slice, the dict's copy, the per-evaluation copy of a baked
+  value (`make_mutable_clone`), the in-place storage promotions (the
+  same object). A copy of an untyped container is untyped; the call
+  that made it stamps it (below).
+- **Creation**: the compiler stamps every node that creates a container
+  (`Construct::ctype`, copied by `copy_base_fields`) with the type it is
+  created at: the type the existing literal machinery builds it for
+  (`stamp_literal_coerce`'s `t`: a fixed destination's type, a nested
+  literal's parent element type, else its own type), or `array<dyn>` /
+  `dict<dyn, dyn>` in a place declared `dyn` (a `dyn` variable, an
+  element of a container whose element type is `dyn`, a `dyn` field or
+  parameter). A builtin that builds a container (`range`, `keys`,
+  `split`, `map`, `clone`, ...) gets it on its argument list, so in
+  `ArgLocs`, beside `arr_hint`, and sets it on its result - and on the
+  fresh containers inside it, along the static type, never through a
+  `dyn` element. A baked mutable value (a `LiteralObj` for a `var`) is
+  restamped by the compiler, copied first when another node's stamp
+  already gave it a different type.
+- **The VM**: `MakeArrayV` / `MakeDictV` / `MakeStructArrayV` take the
+  stamp from a chunk pool; the JIT's helpers likewise. `.myv` stores the
+  pool and each container value's type.
+- **Test seam**: `int_ctype(x)` (INT builds only) prints a container's
+  type, or `untyped`; a tests/int unit prints it for every creation
+  shape under every engine, so a site one engine stamps and another does
+  not is a stdout difference.
+
+## 7. Questions this raised (for the maintainer)
+
+1. **`array<int>` into `array<dyn>`.** `array<int> b = [1]; array<dyn>
+   a = b;` compiles today. Recommendation: keep it, and check every
+   store through `a` at run time against the array's own type, exactly
+   as through a `dyn` name (`a[0] = "s"` then fails: the array is an
+   `array<int>`). The alternative is to refuse the assignment (full
+   invariance, both directions).
+2. **The join of two container types.** `var c = cond ? xi : xf` (an
+   `array<int>` and an `array<float>`) types `c` as `array<float>`, and
+   `cond ? names : maybe` (`array<str>`, `array<str?>`) as
+   `array<str?>` - so `c[0] = none` today stores a none into the
+   `array<str>`, a non-optional element (RULE 1). The same holds for a
+   variable assigned both and a function returning either.
+   Recommendation: such a join is `array<dyn>` (stores through `c`
+   checked at run time). The alternative is a compile error.

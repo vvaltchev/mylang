@@ -605,7 +605,9 @@ enum class OpCode : unsigned char {
      * MapFilterV: `target` = dst; `a` = the (already CheckFuncV'd) function
      * slot; `b` = the container slot; `target2` bit 0 = is_filter (0 = map,
      * 1 = filter), bits 1-2 = the flat RESULT kind (map_filter_flat_hint:
-     * 0 general, 1 int, 2 float, 3 bool - #97 CB3, myv v23). Calls the shared vm_map_filter (generic.cpp.h) - map builds a
+     * 0 general, 1 int, 2 float, 3 bool - #97 CB3, myv v23), bits 3+ the
+     * result's type (Q2: a ref into Chunk::ctypes, 0 = untyped). Calls the
+     * shared vm_map_filter (generic.cpp.h) - map builds a
      * fresh array, filter keeps truthy elements (array->array, dict->dict).
      * `node` = arg1 (the unsupported-container caret).
      */
@@ -815,8 +817,10 @@ enum class OpCode : unsigned char {
      * - the native form of a `[a, b, ..]` LITERAL whose elements aren't all
      * const (a fully-const literal is baked to a single LoadConstV, not this).
      * The N element values are in slots [a.lit, a.lit + b.lit); `target2`
-     * carries the flat/general ArrHint. Shares the tree-walker's build core
-     * (build_array_from_values). No Construct*: the build never throws.
+     * carries the flat/general ArrHint in its low 8 bits and, above them,
+     * the array's type (Q2: a ref into Chunk::ctypes, 0 = untyped). Shares
+     * the tree-walker's build core (build_array_from_values). No
+     * Construct*: the build never throws.
      */
     MakeArrayV,
 
@@ -824,7 +828,9 @@ enum class OpCode : unsigned char {
      * Build a dict VALUE `{k0: v0, ..}` from a register run into `target` - the
      * native form of a `{..}` LITERAL. The `b.lit` key/value pairs are
      * INTERLEAVED in slots [a.lit, a.lit + 2*b.lit): key at even, value at odd
-     * offset. Shares build_dict_from_pairs (freezes each key). No Construct*.
+     * offset. `target2` = the dict's type (Q2: a ref into Chunk::ctypes, 0 =
+     * untyped). Shares build_dict_from_pairs (freezes each key). No
+     * Construct*.
      */
     MakeDictV,
 
@@ -2775,6 +2781,17 @@ struct Chunk {
      * bakes an entry's address, so nothing appends after codegen. */
     std::vector<FitSpec> fit_specs;
 
+    /* Q2 (plans/typed-containers.md): the CTYPE POOL - the type a container
+     * made by a MakeArrayV / MakeDictV / MapFilterV is made with (an
+     * interned TypeAnnot, structtype.h). The op names it by a REF in
+     * target2 (0: untyped, else the index + 1 - see each op). Primary data
+     * (myv: the TypeAnnot codec). */
+    std::vector<const TypeAnnot *> ctypes;
+    const TypeAnnot *ctype_ref(unsigned ref) const
+    {
+        return ref ? ctypes[ref - 1] : nullptr;
+    }
+
     /* EMPLACE-STRUCT SITE POOL (EmplaceStruct: `append(struct_arr, Ctor(..))`).
      * Everything vm_emplace_struct needed from the node: the ctor's POD def
      * (AST-owned/program-lifetime, re-bindable by name on load like
@@ -2841,6 +2858,7 @@ struct Chunk {
                                        * re-binds the func ptr from it on load) */
         Loc start, end;               /* the whole-args caret (arity/generic) */
         ArrHint arr_hint;             /* the array-repr hint (range/array/…) */
+        const TypeAnnot *ctype = nullptr;   /* Q2: Construct::ctype */
         std::vector<ArgLoc> args;     /* per-arg carets, [0, n) */
         const UniqueId *member = nullptr;  /* CallBuiltinLVMember: arg0's field
                                             * name `append(s.f, x)` (else null) */
@@ -2865,6 +2883,7 @@ struct Chunk {
         al.args = bc.args.data();
         al.nargs = bc.args.size();   /* total arg count (a func_lv reads this) */
         al.arr_hint = bc.arr_hint;
+        al.ctype = bc.ctype;
         return al;
     }
 
@@ -2897,6 +2916,7 @@ struct Chunk {
         Loc start, end;                  /* the whole-args caret */
         std::vector<ArgLoc> args;        /* per-arg carets */
         ArrHint arr_hint = ArrHint::dflt;
+        const TypeAnnot *ctype = nullptr;   /* Q2: Construct::ctype */
         /* `chain` (#32): a deeper access chain rooted at a variable -
          * `o.i.a`, `m[0][1]` - re-derived through a0_steps (its keys are
          * frame temps the arg0 compile filled) */
@@ -2920,6 +2940,7 @@ struct Chunk {
         al.args = cs.args.data();
         al.nargs = cs.args.size();
         al.arr_hint = cs.arr_hint;
+        al.ctype = cs.ctype;
         return al;
     }
 

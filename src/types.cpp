@@ -481,6 +481,7 @@ build_arglocs(ExprList *exprList, ArgLoc *locbuf, size_t n)
     al.args = locbuf;
     al.nargs = n;
     al.arr_hint = exprList->arr_hint;
+    al.ctype = exprList->ctype;
     return al;
 }
 
@@ -523,6 +524,39 @@ EvalValue builtin_v_adapter(EvalContext *ctx, ExprList *exprList)
     ArgLoc locbuf[8];
     ArgLocs al = build_arglocs(exprList, locbuf, n);
     return FV(ctx, &al, stackbuf, n);
+}
+
+/*
+ * Q2 (plans/typed-containers.md): a builtin that BUILDS a container gives
+ * it the type the compiler stamped on the call (ArgLocs::ctype, the args
+ * list's Construct::ctype; null when nothing was stamped). One wrapper per
+ * ABI around the registered function, so every engine's call of it - the
+ * tree-walker's adapters, the VM's ops, the JIT's helpers - stamps alike.
+ */
+template <decltype(Builtin::func_v) FV>
+EvalValue ctyped_v(EvalContext *ctx, const ArgLocs *al, const EvalValue *args,
+                   size_t n)
+{
+    EvalValue r = FV(ctx, al, args, n);
+    stamp_ctype(r, al->ctype);
+    return r;
+}
+
+template <decltype(Builtin::func_lv) FLV>
+EvalValue ctyped_lv(EvalContext *ctx, const ArgLocs *al, LValue *target,
+                    const EvalValue *rest, size_t n)
+{
+    EvalValue r = FLV(ctx, al, target, rest, n);
+    stamp_ctype(r, al->ctype);
+    return r;
+}
+
+template <decltype(Builtin::func) F>
+EvalValue ctyped_tw(EvalContext *ctx, ExprList *exprList)
+{
+    EvalValue r = F(ctx, exprList);
+    stamp_ctype(r, exprList->ctype);
+    return r;
 }
 
 template <decltype(Builtin::func_v) FV>
@@ -687,36 +721,39 @@ const EvalContext::SymbolsType EvalContext::const_builtins =
     make_const_builtin_v<builtin_str>("str"),
     make_const_builtin_v<builtin_int>("int"),
     make_const_builtin_v<builtin_float>("float"),
-    make_const_builtin_v<builtin_clone>("clone"),
+    make_const_builtin_v<ctyped_v<builtin_clone>>("clone"),
     make_const_builtin_v<builtin_hash>("hash"),
 
     /* Array or container builtins */
-    make_const_builtin_v<builtin_make_array>("make_array"),
+    make_const_builtin_v<ctyped_v<builtin_make_array>>("make_array"),
     make_const_builtin_v<builtin_top>("top"),
-    make_const_builtin_v<builtin_range>("range"),
+    make_const_builtin_v<ctyped_v<builtin_range>>("range"),
     make_const_builtin_v<builtin_find>("find"),
-    make_const_builtin_lv("sort", builtin_sort, builtin_sort_lv),
-    make_const_builtin_lv("rev_sort", builtin_rev_sort, builtin_rev_sort_lv),
-    make_const_builtin_lv("reverse", builtin_reverse, builtin_reverse_lv),
+    make_const_builtin_lv("sort", ctyped_tw<builtin_sort>,
+                          ctyped_lv<builtin_sort_lv>),
+    make_const_builtin_lv("rev_sort", ctyped_tw<builtin_rev_sort>,
+                          ctyped_lv<builtin_rev_sort_lv>),
+    make_const_builtin_lv("reverse", ctyped_tw<builtin_reverse>,
+                          ctyped_lv<builtin_reverse_lv>),
     make_const_builtin_v<builtin_sum>("sum"),
-    make_const_builtin_mf("map", builtin_map, false),
-    make_const_builtin_mf("filter", builtin_filter, true),
+    make_const_builtin_mf("map", ctyped_tw<builtin_map>, false),
+    make_const_builtin_mf("filter", ctyped_tw<builtin_filter>, true),
 
     /* Dictionary builtins */
-    make_const_builtin_v<builtin_keys>("keys"),
-    make_const_builtin_v<builtin_values>("values"),
-    make_const_builtin_v<builtin_kvpairs>("kvpairs"),
-    make_const_builtin_v<builtin_dict>("dict"),
-    make_const_builtin_v<builtin_make_dict>("make_dict"),
+    make_const_builtin_v<ctyped_v<builtin_keys>>("keys"),
+    make_const_builtin_v<ctyped_v<builtin_values>>("values"),
+    make_const_builtin_v<ctyped_v<builtin_kvpairs>>("kvpairs"),
+    make_const_builtin_v<ctyped_v<builtin_dict>>("dict"),
+    make_const_builtin_v<ctyped_v<builtin_make_dict>>("make_dict"),
     make_const_builtin_v<builtin_get>("get"),         /* dict lookup -> opt V */
     make_const_builtin_v<builtin_get_throw>("get!"),  /* lookup or throw -> V */
 
     /* String builtins */
-    make_const_builtin_v<builtin_split>("split"),
+    make_const_builtin_v<ctyped_v<builtin_split>>("split"),
     make_const_builtin_v<builtin_join>("join"),
     make_const_builtin_v<builtin_ord>("ord"),
     make_const_builtin_v<builtin_chr>("chr"),
-    make_const_builtin_v<builtin_splitlines>("splitlines"),
+    make_const_builtin_v<ctyped_v<builtin_splitlines>>("splitlines"),
     make_const_builtin_v<builtin_lpad>("lpad"),
     make_const_builtin_v<builtin_rpad>("rpad"),
     make_const_builtin_v<builtin_lstrip>("lstrip"),
@@ -798,10 +835,10 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_customv("kindstr", builtin_kindstr, builtin_kindstr_v),
 
     /* Runtime reflection (see builtins/reflect.cpp.h) */
-    make_builtin_v<builtin_globals>("globals"),
+    make_builtin_v<ctyped_v<builtin_globals>>("globals"),
     make_builtin_v<builtin_signature>("signature"),
     make_builtin_v<builtin_layout>("layout"),
-    make_builtin_v<builtin_specializations>("specializations"),
+    make_builtin_v<ctyped_v<builtin_specializations>>("specializations"),
     /* show() is a DEV-ONLY builtin (it decompiles the AST): available in the
      * REPL / tests, a compile-time error in a script (use :show at the REPL). */
     make_dev_builtin("show", builtin_show),
@@ -810,8 +847,9 @@ EvalContext::SymbolsType EvalContext::builtins =
 #ifdef INT_TESTS
     /* The intrusive-test builtins (builtins/inttest.cpp.h) - INT builds only */
     make_int_builtin<builtin_int_hits>("int_hits"),
-    make_int_builtin<builtin_int_events>("int_events"),
+    make_int_builtin<ctyped_v<builtin_int_events>>("int_events"),
     make_int_builtin<builtin_int_live>("int_live"),
+    make_int_builtin<builtin_int_ctype>("int_ctype"),
 #endif
 
     /* Diagnostic tracing (see trace.h) */
@@ -820,11 +858,11 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_v<builtin_tracing>("tracing"),
     /* dynarray(a): manual promotion - a fresh general (polymorphic) copy of an
      * array. Non-const (fresh mutable value). See builtin_dynarray. */
-    make_builtin_v<builtin_dynarray>("dynarray"),
+    make_builtin_v<ctyped_v<builtin_dynarray>>("dynarray"),
     /* array() is non-const: it never folds to a baked literal, so array(N) is
      * always a runtime call (uniform const/runtime type-driven fill) and a huge
      * array(1000000) isn't baked into the AST. */
-    make_builtin_v<builtin_array>("array"),
+    make_builtin_v<ctyped_v<builtin_array>>("array"),
 
     /* Array builtins. append/push: a CUSTOM tree-walker func (append_tw, for
      * construct-in-place) + the rest-native func_lv core (builtin_append). */
@@ -835,7 +873,8 @@ EvalContext::SymbolsType EvalContext::builtins =
     /* Generic-container builtins */
     make_builtin_lv_v<builtin_erase>("erase"),
     make_builtin_lv_v<builtin_insert>("insert"),
-    make_builtin_v<builtin_deepclone>("deepclone"), /* deep mutable copy */
+    /* deep mutable copy */
+    make_builtin_v<ctyped_v<builtin_deepclone>>("deepclone"),
     make_builtin_v<builtin_box>("box"),     /* a reference to a value */
 
     /* Numeric builtins */
@@ -848,7 +887,7 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_v<builtin_writeln>("writeln"),
     make_builtin_v<builtin_read>("read"),
     make_builtin_v<builtin_write>("write"),
-    make_builtin_v<builtin_readlines>("readlines"),
+    make_builtin_v<ctyped_v<builtin_readlines>>("readlines"),
     make_builtin_v<builtin_writelines>("writelines"),
     make_builtin_v<builtin_remove>("remove"),
     make_builtin_v<builtin_tmpdir>("tmpdir"),

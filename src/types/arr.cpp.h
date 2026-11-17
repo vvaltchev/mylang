@@ -147,8 +147,17 @@ void SharedArrayObjTempl<LValueT>::promote_objs_to_general()
     len = n;
 }
 
+/* Q2: a copy of an array is an array of the same type */
 template <class LValueT>
 void SharedArrayObjTempl<LValueT>::clone_internal_vec()
+{
+    const TypeAnnot *t = ctype();
+    clone_internal_vec_raw();
+    shobj->ctype = t;
+}
+
+template <class LValueT>
+void SharedArrayObjTempl<LValueT>::clone_internal_vec_raw()
 {
     /*
      * Use offset()/size(), not the raw off/len fields: for a non-slice, `len`
@@ -328,10 +337,16 @@ static bool arr_elem_fits(const SharedArrayObj &arr, const EvalValue &elem);
 static bool arr_push_value(SharedArrayObj &arr, const EvalValue &elem,
                            bool is_const);
 
-/* A NEW empty slice: its own group over the shared empty storage (see
- * TypeArr::slice). */
-static EvalValue arr_empty_slice()
+/* A NEW empty slice of `parent`: its own group over the shared empty
+ * storage (see TypeArr::slice) - or, for a parent with a type (Q2), a
+ * fresh empty array of that type: the shared storage takes none. */
+static EvalValue arr_empty_slice(const SharedArrayObj &parent)
 {
+    if (const TypeAnnot *t = parent.ctype()) {
+        SharedArrayObj r((SharedArrayObj::vec_type()));
+        r.set_ctype(t);
+        return r;
+    }
     return SharedArrayObj(empty_arr.get_ref<SharedArrayObj>(), 0, 0);
 }
 
@@ -827,7 +842,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
          * every copy would be ONE array: appending to one empty slice
          * would show in all of them */
         if (static_cast<size_t>(start) >= arr.size())
-            return arr_empty_slice();
+            return arr_empty_slice(arr);
 
     } else if (!start_val.is<NoneVal>()) {
 
@@ -842,7 +857,7 @@ EvalValue TypeArr::slice(const EvalValue &what_lval,
             end += arr.size();
 
         if (end <= start)
-            return arr_empty_slice();
+            return arr_empty_slice(arr);
 
         if (static_cast<size_t>(end) > arr.size())
             end = arr.size();
