@@ -13,10 +13,16 @@
 #include <utility>
 #include <iostream>
 
-/* The raw-mode interactive editor is Unix-only (termios). On Windows the REPL
- * is not interactive (read_line falls back to a cooked getline) - see
- * plans/archived/repl.md; the pure LineEditor core compiles everywhere for the tests. */
-#ifndef _WIN32
+/* The raw-mode interactive editor is Unix-only (termios). On Windows and on
+ * WASI (e.g. a-Shell on iOS: wasi-libc has no termios) the REPL is not
+ * interactive (read_line falls back to a cooked getline) - see
+ * plans/archived/repl.md; the pure LineEditor core compiles everywhere for
+ * the tests. */
+#if !defined(_WIN32) && !defined(__wasi__)
+#define ML_RAW_TTY 1
+#endif
+
+#ifdef ML_RAW_TTY
 #include <unistd.h>
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -640,6 +646,7 @@ HistorySearch::Action HistorySearch::feed(unsigned char c)
 
 namespace {
 
+#ifdef ML_RAW_TTY
 /* Split `s` into its logical lines (by '\n'). */
 std::vector<string> split_lines(const string &s)
 {
@@ -652,8 +659,9 @@ std::vector<string> split_lines(const string &s)
         }
     return rows;
 }
+#endif /* ML_RAW_TTY */
 
-#ifndef _WIN32
+#ifdef ML_RAW_TTY
 /* Put the terminal in raw mode for the lifetime of the object, restoring the
  * previous attributes on destruction (so the shell is never left broken). */
 struct RawMode {
@@ -745,7 +753,7 @@ bool unicode_ok()
     }
     return false;
 }
-#endif /* !_WIN32 */
+#endif /* ML_RAW_TTY */
 
 /*
  * Cooked (non-raw) read: accumulate physical lines until the input parses
@@ -805,6 +813,7 @@ read_line_cooked(const string &prompt, const string &cont_prompt,
     return res;
 }
 
+#ifdef ML_RAW_TTY
 /* Join a Tab-completion candidate list (two spaces apart) + a trailing NL. */
 string completions_str(const std::vector<string> &cands)
 {
@@ -817,6 +826,7 @@ string completions_str(const std::vector<string> &cands)
     out += "\n";
     return out;
 }
+#endif /* ML_RAW_TTY */
 
 }  /* namespace */
 
@@ -830,10 +840,10 @@ read_line(const string &prompt, const string &cont_prompt,
     ReadLineResult res;
 
     /*
-     * On Windows, or when stdin is not a terminal (piped input / a test
-     * harness), there is no raw-mode editor - read in cooked mode.
+     * On Windows / WASI, or when stdin is not a terminal (piped input / a
+     * test harness), there is no raw-mode editor - read in cooked mode.
      */
-#ifdef _WIN32
+#ifndef ML_RAW_TTY
     return read_line_cooked(prompt, cont_prompt, submitter, joiner);
 #else
     if (!isatty(STDIN_FILENO))
@@ -1179,5 +1189,5 @@ read_line(const string &prompt, const string &cont_prompt,
 
         repaint();
     }
-#endif /* !_WIN32 */
+#endif /* ML_RAW_TTY */
 }
