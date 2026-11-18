@@ -24,6 +24,22 @@
 /* The harness's engine switch (see vm.h). Default: the tree-walker. */
 ExecEngine g_exec_engine = ExecEngine::TreeWalk;
 
+/* The two 32-bit halves of a value the JIT packs into one int_type (a
+ * call-site Loc's line/column, an argument base + count). Through uint64_t:
+ * int_type is 32 bits on wasm32 (a-Shell), where `v >> 32` would not compile
+ * under -Werror (only the x86-64 JIT makes packed values, so there they are
+ * never used); on 64-bit hosts these equal `(int)(v >> 32)` and
+ * `(int)(v & 0xffffffff)` exactly. */
+static inline int32_t packed_hi(int_type v)
+{
+    return static_cast<int32_t>(static_cast<uint64_t>(v) >> 32);
+}
+
+static inline int32_t packed_lo(int_type v)
+{
+    return static_cast<int32_t>(static_cast<uint64_t>(v) & 0xffffffffu);
+}
+
 /* Read a register operand as an int: an immediate, or a frame slot's int (a
  * bool slot reads as 0/1, mirroring Identifier::eval_int). The register machine
  * uses the frame slots directly - no value stack. */
@@ -3700,8 +3716,8 @@ static void vm_capture_rec_frame(RuntimeException &e, const VmCallRec &rec)
      * (which doesn't know the field) can never leak a stale value. */
     Loc cs, end_ignored;
     if (rec.call_site_packed && !rec.sync_stop)
-        cs = Loc(static_cast<int>(rec.call_site_packed >> 32),
-                 static_cast<int>(rec.call_site_packed & 0xffffffff));
+        cs = Loc(packed_hi(rec.call_site_packed),
+                 packed_lo(rec.call_site_packed));
     else
         rec.ret_chunk->loc_at(rec.ret_pc - 1, cs, end_ignored);
 #ifdef TESTS
@@ -7182,10 +7198,8 @@ extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
     /* the container caret (`site` is its start): carried explicitly, as
      * the interpreted op passes it, so the only loc-less escape is a
      * callback's bind - stamped with the argument list at the site */
-    const Loc cs(static_cast<int>(site >> 32),
-                 static_cast<int>(site & 0xffffffff));
-    const Loc ce(static_cast<int>(cend >> 32),
-                 static_cast<int>(cend & 0xffffffff));
+    const Loc cs(packed_hi(site), packed_lo(site));
+    const Loc ce(packed_hi(cend), packed_lo(cend));
     try {
         ctx->frame->at(dst).put(
             vm_map_filter(ctx, ctx->frame->at(fn_slot).get(),
@@ -7628,8 +7642,7 @@ vm_jit_stamp_call_site(Exception &e, const FuncDescriptor *d,
     if (!e.backtrace.empty() && e.backtrace.back().desc == d
             && !e.backtrace.back().call_site.line)
         e.backtrace.back().call_site =
-            Loc(static_cast<int>(site_packed >> 32),
-                static_cast<int>(site_packed & 0xffffffff));
+            Loc(packed_hi(site_packed), packed_lo(site_packed));
     if (chain >= 0 && pool) {
 #ifdef TESTS
         g_jit_inline_call_baked++;
@@ -10437,7 +10450,7 @@ extern "C" int jit_call_sync(int_type callee_slot, int_type ab_n,
     ML_JIT_OP_RAN(CallV);
     /* #56 step 3: argbase|nargs<<32 packed (frees the reg resume_pc uses) */
     const int_type argbase = ab_n & 0xffffffff;
-    const int_type nargs = ab_n >> 32;
+    const int_type nargs = packed_hi(ab_n);
     EvalContext *ctx = g_current_ctx;
     /*
      * THE INVARIANT THE EMITTED PUSH RELIES ON: an undefined slot holds the
@@ -10496,7 +10509,7 @@ extern "C" int jit_call_sync_cached(int_type callee_slot, int_type ab_n,
 {
     ML_JIT_OP_RAN(CachedCallV);
     const int_type argbase = ab_n & 0xffffffff;
-    const int_type nargs = ab_n >> 32;
+    const int_type nargs = packed_hi(ab_n);
     EvalContext *ctx = g_current_ctx;
     /*
      * THE INVARIANT THE EMITTED PUSH RELIES ON: an undefined slot holds the
@@ -10554,7 +10567,7 @@ extern "C" int jit_call_sync_value(int_type callee_temp, int_type ab_n,
     ML_JIT_OP_RAN(CallValueV);
     (void)lep;
     const int_type argbase = ab_n & 0xffffffff;
-    const int_type nargs = ab_n >> 32;
+    const int_type nargs = packed_hi(ab_n);
     EvalContext *ctx = g_current_ctx;
     /* the callee VALUE was evaluated into a temp slot (CallValueV's
      * target2); a dyn-laundered non-func CONVEYS the interpreted op's
