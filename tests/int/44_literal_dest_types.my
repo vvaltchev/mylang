@@ -205,8 +205,9 @@ want("dkc", str(dkc), "[\"s\", C(v: 5)]");
 # refuses one, and a general array stays general in an array<C>
 pure func mkcg() { var a = [KC, KC]; return a; }
 var dyn dkg = mkcg();
-dkg[0] = "s";
-want("dkg", str(dkg), "[\"s\", C(v: 5)]");
+var dkg_refused = 0;
+try { dkg[0] = "s"; } catch (TypeErrorEx) { dkg_refused = 1; }
+want("dkg", str(dkg_refused) + array_storage(dkg), "1class");
 pure func mkpg() { var a = [P(1, 2.5)]; return a; }
 var dyn dpg = mkpg();
 var dpg_refused = 0;

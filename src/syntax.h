@@ -734,6 +734,15 @@ public:
      * (#97: `var dyn d = clone(K)` was general folded and flat under -nc). */
     bool takes_hint = false;
 
+    /* Q2: it replaced a node that makes its container with the TYPE of
+     * the place it is bound to - a container literal, a call to a builtin
+     * that builds one (builtin_builds_container), an array sum - so the
+     * inferencer types the baked value by that place too. Any other
+     * folded value - a user function's result - keeps the type it was
+     * made with, as the unfolded call's does (a run-time `var a = [..]`
+     * in the function is typed there). */
+    bool typed_by_place = false;
+
     LiteralObj(const EvalValue &v, bool immutable = false)
         : Construct("LiteralObj", true, ConstructType::lit_obj)
         , value(v)
@@ -762,6 +771,7 @@ public:
         copy_base_fields(*c);
         c->from_literal = from_literal;
         c->takes_hint = takes_hint;
+        c->typed_by_place = typed_by_place;
         return c;
     }
 };
@@ -1535,6 +1545,13 @@ void desugar_named_call(CallExpr *call, const std::vector<ParamSpec> &params);
  * it (LiteralObj::takes_hint).
  */
 bool builtin_takes_arr_hint(std::string_view name);
+
+/*
+ * Q2: the builtins whose result is a container they BUILD, which the call
+ * gives its type (ArgLocs::ctype): the inferencer stamps it, and the
+ * parser marks a folded call by it (LiteralObj::typed_by_place).
+ */
+bool builtin_builds_container(std::string_view name);
 
 class Expr01 final: public SingleChildConstruct {
 

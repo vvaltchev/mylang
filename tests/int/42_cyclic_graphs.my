@@ -270,10 +270,11 @@ yes("struct types compare by identity", t0 == t0 && t0 != t1 &&
 # 8. a value folded at compile time and bound to a `dyn` variable: a
 #    written literal is a GENERAL array from the start (README: declaring
 #    `dyn` builds a polymorphic array), whatever flat storage the folded
-#    value had, so a write of another type just works. Any other value
-#    keeps the storage it was built with, folded or not, as at run time
-#    (#96, #97): `split`'s and `mk_s`'s string arrays convert themselves
-#    on such a write, the type-driven flat ones refuse it
+#    value had, so a write of another type just works - and so does a
+#    builtin's (`split`'s array is made array<dyn> there). A user
+#    function's value keeps the type and storage it was built with,
+#    folded or not, as at run time (#96, #97, Q2): `mk_s`'s array<str>
+#    refuses an int, and the type-driven flat ones refuse their misfits
 var dyn ls = split("a b c", " ");
 var dyn lb = [1 > 0, 1 > 1];
 var dyn lf = [1 * 1.5, 2.5];
@@ -295,13 +296,13 @@ var dyn vf = mk_f(1);
 want("folded call storage", [array_storage(vs), array_storage(vp),
                              array_storage(vb), array_storage(vf)],
      ["str", "struct", "bool", "float"]);
-vs[0] = 5;
 var refused = 0;
+try { vs[0] = 5; } catch (TypeErrorEx) { refused += 1; }
 try { vp[0] = "p"; } catch (TypeErrorEx) { refused += 1; }
 try { vb[1] = none; } catch (TypeErrorEx) { refused += 1; }
 try { vf[0] = "f"; } catch (TypeErrorEx) { refused += 1; }
 want("folded call writes", [vs, vp, vb, vf, refused],
-     [[5, "b", "c"], [Q(1), Q(2)], [true, false], [1.5, 2.5], 3]);
+     [["a", "b", "c"], [Q(1), Q(2)], [true, false], [1.5, 2.5], 4]);
 
 print(str(bad) + " failure(s)");
 

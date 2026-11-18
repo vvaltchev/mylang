@@ -140,6 +140,31 @@ var tr = 0;
 try { append(tsd, 5); } catch (TypeErrorEx) { tr++; }
 assert((!typed || tr == 1) && ts[1].kind == "str");
 
+# a pure function's array keeps the type the function made it with,
+# whether its call is folded at compile time or runs: the fold used to
+# re-type it by the `dyn` place, so the store went through only folded
+class FC { int v; }
+const KFC = FC(5);
+pure func mkfc() { var a = [KFC, KFC]; return a; }
+var dyn dfc = mkfc();
+var fcr = 0;
+try { dfc[0] = "s"; } catch (TypeErrorEx) { fcr++; }
+assert(!typed || fcr == 1);
+
+# an element or a field of a literal, and `get!` of one, are typed where
+# their literal is made (by the literal they are taken from), which a
+# value baked at compile time no longer says: such an expression is not
+# folded, so a store through `dyn` is refused folded as it is unfolded
+func stl(dyn d, k) {
+    try { d[k] = 1; return "ok"; } catch (TypeErrorEx) { return "no"; }
+}
+var ls1 = [["x"], ["y"]][1];
+var ls2 = {"a": ["x"]}.a;
+var ls3 = get!({"a": ["x"]}, "a");
+var ls4 = {"a": {"b": "x"}}.a;
+var lsv = [stl(ls1, 0), stl(ls2, 0), stl(ls3, 0), stl(ls4, "b")];
+assert(!typed || str(lsv) == "[\"no\", \"no\", \"no\", \"no\"]");
+
 # a container made where `dyn` is declared holds anything
 var dyn z = [1, 2];
 z[0] = "s";

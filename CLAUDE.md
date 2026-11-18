@@ -7285,9 +7285,20 @@ per level of a deep value - a separate open item.
   `ArgLocs::ctype` (`builtin_builds_container`, and the `ctyped_*`
   wrappers at registration, so every engine stamps alike); a baked
   mutable value is restamped (`ctype_restamp`, copied when another node
-  already typed the shared value). UNTYPED: a constant's (read-only - no
-  store can change it), an empty literal nothing filled, and a literal a
-  fit check examines where it lands or whose place's type is unknown here
+  already typed the shared value) - ONLY when it stands for a node that
+  types its container by its place, a literal, such a builtin's call or
+  an array sum (`LiteralObj::typed_by_place`, the parser's
+  `node_typed_by_place`, `takes_hint`'s twin). A folded USER function's
+  result keeps the type its function made it with, as the unfolded call
+  does: restamped by a `dyn` place, it accepted a store `-nc` refused
+  (RULE 2, `tests/functional/125`). Any OTHER mutable container a bake
+  would hold untyped - an element or a field of a literal, `get!` of
+  one: typed where its literal was made, which the value no longer says
+  - is not baked at all (`bake_untypable`, parser.cpp; a deferred fold
+  keeps it as a witness), so it runs as it does unfolded. UNTYPED: a
+  constant's (read-only - no store can change it), an empty literal
+  nothing filled, and a literal a fit check examines where it lands or
+  whose place's type is unknown here
   (an indirect call's argument, a store into a `dyn` container) - it is
   meant to take its type there (increment 3). Copies keep the type
   (`clone_internal_vec`, the dict's copy constructor, the mutable and

@@ -4549,19 +4549,6 @@ const TypeAnnot *Inferencer::ctype_of(StaticTypeRef t, bool dict)
     return annot_intern(*a);
 }
 
-/* the builtins whose result is a container they BUILD (Q2): the call
- * gives it its type, through ArgLocs::ctype */
-static bool builtin_builds_container(std::string_view n)
-{
-    static constexpr std::string_view names[] = {
-        "range", "array", "make_array", "make_dict", "dict", "keys",
-        "values", "kvpairs", "map", "filter", "split", "splitlines",
-        "readlines", "clone", "deepclone", "dynarray", "sort", "rev_sort",
-        "reverse", "globals", "specializations", "int_events"};
-    return std::find(std::begin(names), std::end(names), n)
-        != std::end(names);
-}
-
 /* Q2: a BAKED mutable value's containers take the type `t` gives them
  * (eval.cpp: ctype_restamp, which copies a value another node already
  * gave a different type) */
@@ -4608,7 +4595,9 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
         break;
     case ConstructType::lit_obj: {
         auto *lo = static_cast<LiteralObj *>(n);
-        if (ctype_untyped.count(n))
+        /* a folded user function's result keeps the type it was made
+         * with (LiteralObj::typed_by_place) */
+        if (ctype_untyped.count(n) || !lo->typed_by_place)
             return;
         StaticTypeRef t = dest;
         if (!t) {
