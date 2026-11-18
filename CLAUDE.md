@@ -8320,7 +8320,10 @@ and two macros:
   `cs_can_hold_func` is memoized per no-type-change window now,
   `CsHoldMemoScope`). Since codegen's recursive frames are ~20 KB per
   level under clang ASan and arm64 ASan frames ~1.6x that, macOS links
-  with a 16 MB main-thread stack (both build systems).
+  with a 16 MB main-thread stack (both build systems). So does a WASI
+  build (a-Shell; the Makefile, by `$(CXX) -dumpmachine`, since `uname`
+  says Darwin there too): `-z stack-size`, plus `--stack-first` so that
+  an overflow traps instead of overwriting the data below the stack.
   **The oracle is the debug+ASan+UBSan lane; a release build hides all of
   this.** When you add a runtime path, ask what it does with a program that has
   no statements, no slots, or absurd depth.
@@ -9951,7 +9954,8 @@ instrumentation (see `plans/archived/function-templates.md`).
   `/STACK:8388608` (8 MB) for the MSVC build, giving Windows parity (legitimate
   provisioning for an interpreter, not a workaround). macOS gets 16 MB the
   same way (`-stack_size`, CMake and the Makefile) for the compile passes'
-  per-level frames at the parser's nesting limit (#98, below). This was a
+  per-level frames at the parser's nesting limit (#98, below), and so does
+  WASI (the Makefile: `-z stack-size`, `--stack-first`). This was a
   **Windows-CI-
   only crash** the VM's ackermann test hit (exit 127), that **no Linux tool
   reproduces** (ASan and `ML_VM_CHECK` do not catch a stack-DEPTH overflow — it
