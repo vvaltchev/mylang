@@ -1,5 +1,6 @@
 # :help topics: the ':'-prefixed command form, builtins whose kind note is
-# "runtime" by category (random) or by name, and the unknown-topic replies.
+# "runtime" by category (random) or by name, a language feature (cast),
+# and the unknown-topic replies.
 :help :
 :help   :   undef
 :help rand
@@ -9,7 +10,7 @@
 :help pop
 :help insert
 :help erase
-:help dynarray
+:help cast
 :help deepclone
 :help clone
 :help globals

@@ -60,6 +60,7 @@ enum class ConstructType {
     struct_decl, subscript, slice, try_catch, foreach_stmt, member,
     incdec, ternary, coalesce, for_stmt, for_range,
     deref,      /* `*b`: the value a box holds (DerefExpr) */
+    cast,       /* `cast<T>(x)` (CastExpr, plans/cast.md) */
 };
 
 /* Null-safe tag read: null -> `other`, which no real node carries
@@ -2617,6 +2618,32 @@ public:
     }
 };
 
+/*
+ * `cast<T>(x)` (plans/cast.md): `x` converted to exactly the type T, at run
+ * time - cast_value (types/cast.cpp.h), which every engine calls. T is
+ * complete (the parser refuses a bare `array` / `dict` anywhere in it) and
+ * interned, so it outlives the AST like a container's own type (Q2).
+ */
+class CastExpr final: public Construct {
+
+public:
+
+    unique_ptr<Construct> elem;         /* x */
+    const TypeAnnot *to = nullptr;      /* T, interned (annot_intern) */
+
+    CastExpr() : Construct("CastExpr", false, ConstructType::cast) { }
+    EvalValue do_eval(EvalContext *ctx, bool rec = true) const override;
+    void serialize(ostream &s, int level = 0) const override;
+
+    unique_ptr<Construct> clone() const override {
+        auto c = make_unique<CastExpr>();
+        copy_base_fields(*c);
+        c->elem = clone_as(elem);
+        c->to = to;
+        return c;
+    }
+};
+
 /* The ternary conditional `cond ? thenExpr : elseExpr` (a value expression;
  * short-circuits - only the taken branch is evaluated). */
 class TernaryExpr final: public Construct {
@@ -2804,6 +2831,7 @@ ML_NODE_TAG(ForeachStmt, foreach_stmt)
 ML_NODE_TAG(MemberExpr, member)
 ML_NODE_TAG(IncDecExpr, incdec)
 ML_NODE_TAG(DerefExpr, deref)
+ML_NODE_TAG(CastExpr, cast)
 ML_NODE_TAG(TernaryExpr, ternary)
 ML_NODE_TAG(CoalesceExpr, coalesce)
 ML_NODE_TAG(ForStmt, for_stmt)

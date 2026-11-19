@@ -701,6 +701,15 @@ CsSet Inferencer::cs_eval(Construct *e)
         /* a box is an object whose one element is the boxed value */
         return cs_read_elems(cs_eval(static_cast<DerefExpr *>(e)->elem.get()));
 
+    case ConstructType::cast:
+        /* `cast<dyn?>(f)` IS `f`; a container, struct or box cast copies
+         * the operand, its functions with it - so the operand's set, its
+         * objects standing for the copy's (a store into the copy then
+         * lands in the operand's object too: an extra member, never a
+         * missing one). A scalar target holds no function (the type gate
+         * above answered it). */
+        return cs_eval(static_cast<CastExpr *>(e)->elem.get());
+
     case ConstructType::slice:
         /* A slice is a VIEW: it denotes the parent's storage, so it
          * holds the same objects. */

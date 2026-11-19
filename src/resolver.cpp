@@ -1373,6 +1373,14 @@ private:
             fold_reads(me->what, fc);
             return;
         }
+        /* `cast<T>(n)` reads its operand like any expression - a promoted
+         * `n` dropped its declaration, so a read left unfolded here would
+         * read a slot nothing wrote. The cast itself is not folded: its
+         * literal's type need not be T (`cast<dyn>(5)`). */
+        if (ctag(c) == ConstructType::cast) {
+            fold_reads(static_cast<CastExpr *>(c)->elem, fc);
+            return;
+        }
         if (ctag(c) == ConstructType::ternary) {
             auto *te = static_cast<TernaryExpr *>(c);
             fold_reads(te->condExpr, fc);
@@ -3100,6 +3108,10 @@ for_each_child(Construct *c, const std::function<void(Construct *)> &fn)
         fn(static_cast<DerefExpr *>(c)->elem.get());
         break;
     }
+    case ConstructType::cast: {
+        fn(static_cast<CastExpr *>(c)->elem.get());
+        break;
+    }
     case ConstructType::ternary: {
         auto *n = static_cast<TernaryExpr *>(c);
         fn(n->condExpr.get());
@@ -3677,10 +3689,12 @@ static bool esc_known_shape(const Construct *c)
     case ConstructType::func_decl:
         return true;
     /* NOT known: a ForRangeStmt (specialize_types makes it, after this
-     * pass) and a DerefExpr have never been audited against the walkers
-     * here, and an unknown kind hides occurrences - so they decline */
+     * pass), a DerefExpr and a CastExpr (`cast<dyn?>(p)` IS `p`) have
+     * never been audited against the walkers here, and an unknown kind
+     * hides occurrences - so they decline */
     case ConstructType::for_range:
     case ConstructType::deref:
+    case ConstructType::cast:
     case ConstructType::other:
         break;
     }
@@ -3916,7 +3930,7 @@ static int esc_callback_fn(const Construct *arg, const EscCtx &ctx)
 static bool esc_builtin_no_invoke(const UniqueId *name)
 {
     static const char *const quiet[] = {
-        "append", "array", "clone", "deepclone", "dict", "dynarray",
+        "append", "array", "clone", "deepclone", "dict",
         "erase", "exit", "insert", "keys", "pop", "push", "reverse",
         "runtime", "top", "values",
     };
@@ -4785,6 +4799,10 @@ for_each_child_slot(Construct *c,
     }
     case ConstructType::deref: {
         fn(static_cast<DerefExpr *>(c)->elem);
+        break;
+    }
+    case ConstructType::cast: {
+        fn(static_cast<CastExpr *>(c)->elem);
         break;
     }
     case ConstructType::call: {

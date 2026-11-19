@@ -211,10 +211,6 @@ const BuiltinDoc builtin_docs[] = {
   "Insert x at index/key i in array/dict c.", nullptr },
 { "erase", "array", "erase(c, i)",
   "Erase the element at index/key i from array/dict c.", nullptr },
-{ "dynarray", "array", "dynarray(a)",
-  "A fresh general (polymorphic, array<dyn>) copy of a - the manual promotion.",
-  "There is no automatic runtime promotion; storage is fixed at creation. "
-  "clone()/deepclone() preserve the layout." },
 
 /* --- dict --- */
 { "dict", "dict", "dict(pairs) | dict(default)",
@@ -540,12 +536,12 @@ const LangFeature lang_features[] = {
   "written: a write through any name holding it copies the window once, for "
   "all of them. intptr(x) reveals when two values share storage." },
 { "flatstorage", "arrays", "Flat (unboxed) arrays",
-  "array_storage(a)    dynarray(a)",
+  "array_storage(a)    cast<array<dyn>>(a)",
   "A homogeneous array<int>/<float>/<bool> (and array<PodStruct>) is stored "
   "UNBOXED - far less memory and much faster bulk ops. The representation is "
   "decided once from the proven static type and never converted; declare `dyn` "
-  "or use dynarray() for a polymorphic array. See :help flatarrays / "
-  ":trace arrays." },
+  "or cast (cast<array<dyn>>(a), :help cast) for a polymorphic array. See "
+  ":help flatarrays / :trace arrays." },
 
 /* ---- dicts ---- */
 { "dictlit", "dicts", "Dictionaries",
@@ -621,6 +617,22 @@ const LangFeature lang_features[] = {
   "else it is a compile error at the declaration - so a non-opt parameter is "
   "PROVEN never none and the body needs no check. Inside a proven branch "
   "(if (x != none) ..., a guard clause) a nullable reads as non-opt." },
+{ "cast", "types", "Casts",
+  "cast<float>(n)    cast<int>(\"42\")    cast<bool>(\"yes\")\n"
+  "cast<array<float>>(xs)    cast<dict<str, int?>>(d)    cast<dyn>(v)",
+  "cast<T>(x) converts x to EXACTLY the type T, at run time. Scalars: bool, "
+  "int, float and str convert both ways (int(), float() and str()'s rules; "
+  "a number becomes a bool only from 0 / 1, a string from true / yes / on / "
+  "enabled or false / no / off / disabled, case ignored). T? lets none "
+  "through; cast<dyn?> keeps the value as it is, cast<dyn> refuses none. A "
+  "container cast builds a NEW container of type T, converting every "
+  "element (a nested one already of its target type is shared); a dict "
+  "keeps its order and default, and two keys that convert to one key are "
+  "refused. A struct, class or box must already be that type and comes "
+  "back copied. A value the conversion cannot take is an InvalidValueEx, "
+  "one of the wrong kind a TypeErrorEx; a cast no value of its argument's "
+  "type can survive is a compile error. T must be complete - not a bare "
+  "array or dict." },
 { "templates", "types", "Function templates",
   "func f(x) { var t = x + 1; return t; }    f(1); f(\"s\");",
   "A named function with an un-annotated, non-dyn, non-opt parameter is a "
@@ -804,7 +816,7 @@ const char *builtin_kind_note(const BuiltinDoc &d)
         !std::strcmp(d.name, "array") || !std::strcmp(d.name, "append") ||
         !std::strcmp(d.name, "push") || !std::strcmp(d.name, "pop") ||
         !std::strcmp(d.name, "insert") || !std::strcmp(d.name, "erase") ||
-        !std::strcmp(d.name, "dynarray") || !std::strcmp(d.name, "deepclone"))
+        !std::strcmp(d.name, "deepclone"))
         return "runtime (never const-folded)";
     return "const (folds with const arguments)";
 }

@@ -2295,6 +2295,13 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << annot_text(chunk.ctype_ref(
                        static_cast<unsigned>(in.target2)));
             break;
+        case OpCode::CastV:
+            row << "cast         " << D(in.target) << " = "
+                << RI(in.a(), false) << "  ; cast<"
+                << annot_type_text(chunk.cast_types[
+                       static_cast<size_t>(in.target2)])
+                << ">";
+            break;
         case OpCode::CheckFitV:
             /* #49: the value a store is about to put into a typed place */
             row << "check.fit    " << RI(in.a(), false) << "  ; fit ["

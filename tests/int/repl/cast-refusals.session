@@ -1,0 +1,49 @@
+# The cast's compile-time half (plans/cast.md): a cast no value of its
+# argument's STATIC type survives is refused - each kind of target once,
+# on typed values that are not constants (a constant cast is evaluated
+# while compiling instead); a cast of a name no input declared (decided
+# when it runs); the parse errors; and :tree of a cast.
+struct P { int x; }
+struct Q { int x; }
+func nothing() { }
+int five = int(runtime(5))
+var bs = box(str(runtime(1)))
+var bi = box(int(runtime(1)))
+var bq = box(Q(int(runtime(1))))
+var bp = box(P(int(runtime(1))))
+var di = {int(runtime(1)): 2}
+var ai = [int(runtime(1))]
+var qv = Q(int(runtime(1)))
+var e = []
+cast<P>(qv)
+cast<P>(five)
+cast<box<int>>(five)
+cast<box<int>>(bs)
+cast<box<bool>>(bi)
+cast<box<float>>(bi)
+cast<box<str>>(bi)
+cast<box<P>>(bq)
+print(*cast<box<P>>(bp))
+print(*cast<box<int>>(box(runtime(3))))
+cast<array<int>>(di)
+cast<dict<str, int>>(ai)
+cast<dict<str, P>>(di)
+cast<dict<P, int>>(di)
+cast<array<P>>(ai)
+cast<int>(ai)
+cast<box<P>>(bi)
+cast<float>("1e999")
+print(cast<float>("2.5"))
+cast<int>(nothing())
+print(cast<int?>(nothing()))
+print(cast<array<int>>(e))
+cast<int>(nosuch)
+cast<int
+cast<int>>(1)
+cast<int>()
+cast<array>([1])
+cast<dict<str, array>>({})
+cast<dict<array, int>>({})
+cast(1)
+:tree cast<int>(runtime("7"))
+:tree cast<array<dyn?>>(runtime([1, none]))

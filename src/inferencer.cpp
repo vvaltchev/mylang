@@ -14,6 +14,7 @@
 #include "coderender.h"   /* render_func_code / render_construct_code */
 #include "env.h"          /* env_get (#72: MYLANG_BCINLINE_CANDS) */
 
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
@@ -516,6 +517,8 @@ private:
     std::string box_use_hint(StaticTypeRef t, const Construct *e,
                              StaticTypeRef want = nullptr);
     void check_deref(DerefExpr *d);
+    void check_cast(CastExpr *c);
+    bool cast_possible(StaticTypeRef src, const TypeAnnot *t, bool comp);
     void check_box_call(CallExpr *call);
     void check_num_builtin_call(CallExpr *call, bool is_round);
     void check_value_into(StaticTypeRef dest, StaticTypeRef vt,
@@ -1038,6 +1041,9 @@ void Inferencer::for_each_child(Construct *n,
     }
     case ConstructType::deref: {
         fn(static_cast<DerefExpr *>(n)->elem.get()); return;
+    }
+    case ConstructType::cast: {
+        fn(static_cast<CastExpr *>(n)->elem.get()); return;
     }
     case ConstructType::ternary: {
         auto *te = static_cast<TernaryExpr *>(n);
@@ -6010,6 +6016,10 @@ StaticTypeRef Inferencer::type_of_node(const Construct *e)
         return A.dyn_ty();
     }
 
+    /* `cast<T>(x)`: exactly T (plans/cast.md) */
+    if (ctag(e) == ConstructType::cast)
+        return annot_to_static_type(static_cast<const CastExpr *>(e)->to);
+
     /* `*b`: the value a box<T> holds, a T (a box holds no none) */
     if (ctag(e) == ConstructType::deref) {
         auto *d = static_cast<const DerefExpr *>(e);
@@ -6400,11 +6410,6 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
             return s;
         }
     }
-    /* dynarray(a) -> array<dyn>: a polymorphic (general) copy. Typed array<dyn>
-     * (not bare dyn) so plain `var d = dynarray(a)` is accepted under the
-     * tolerant-array rule and d is built/typed general. */
-    if (n == "dynarray")
-        return A.array_of(A.dyn_ty());
     if (n == "runtime")
         return A.dyn_ty();   /* the documented opt-out: defer to runtime (Q) */
     if (n == "min" || n == "max") {
@@ -7407,6 +7412,83 @@ void Inferencer::check_deref(DerefExpr *d)
         mismatch("'*' needs a box, not '" + static_type_to_string(t) +
                      "' (box(v) makes one)",
                  d->start, d->end);
+}
+
+/*
+ * plans/cast.md 1.7: may SOME value of static type `src` become a `t`?
+ * An unknown or `dyn` source - or component - is decided at run time.
+ * `comp`: `src` is a container's component, where `none` is an UNFILLED
+ * component (an empty container casts to any container type), not the
+ * value none.
+ */
+bool Inferencer::cast_possible(StaticTypeRef src, const TypeAnnot *t,
+                               bool comp)
+{
+    src = static_type_resolve(src);
+    /* (a cast's type is complete - pCastExpr - and a container type has
+     * its components) */
+    if (!t || !src)                     /* INT-COV-EXEMPT: see above */
+        return true;
+    if (is_unknown(src) || is_dyn(src))
+        return true;
+    if (is_none(src))
+        return comp || t->opt;
+    if (t->kind == DeclType::dyn)
+        return true;
+    const StaticTypeRef s = strip(src);
+    const auto scalar = [&]() {
+        return s->kind == StaticTypeKind::Bool
+               || s->kind == StaticTypeKind::Int
+               || s->kind == StaticTypeKind::Float
+               || s->kind == StaticTypeKind::Str;
+    };
+    switch (t->kind) {
+    case DeclType::strct:
+        return s->kind == StaticTypeKind::Struct
+               && s->struct_def == t->strct;
+    case DeclType::box: {
+        if (s->kind != StaticTypeKind::Box)
+            return false;
+        /* (a box type has its element, and a box holds a bool, an int,
+         * a float, a str or a struct - box() and pTypeAnnot) */
+        const StaticTypeRef e = s->elem ? static_type_resolve(s->elem)
+                                        : nullptr;
+        const TypeAnnot *te = t->elem.get();
+        if (!e || !te || is_unknown(e) || is_dyn(e)) /* INT-COV-EXEMPT: above */
+            return true;
+        if (te->kind == DeclType::strct)
+            return e->kind == StaticTypeKind::Struct
+                   && e->struct_def == te->strct;
+        return e->kind == (te->kind == DeclType::b ? StaticTypeKind::Bool
+                           : te->kind == DeclType::i ? StaticTypeKind::Int
+                           : te->kind == DeclType::f ? StaticTypeKind::Float
+                                                     : StaticTypeKind::Str);
+    }
+    case DeclType::arr:
+        return s->kind == StaticTypeKind::Array
+               && cast_possible(s->elem, t->elem.get(), true);
+    case DeclType::dict:
+        return s->kind == StaticTypeKind::Dict
+               && cast_possible(s->key, t->key.get(), true)
+               && cast_possible(s->val, t->val.get(), true);
+    default:                /* bool, int, float, str (dyn returned above) */
+        return scalar();
+    }
+}
+
+/* `cast<T>(x)`: a cast no value of x's type can survive is refused */
+void Inferencer::check_cast(CastExpr *c)
+{
+    check(c->elem.get());
+    const StaticTypeRef src = type_of(c->elem.get());
+    if (cast_possible(src, c->to, false))
+        return;
+    const std::string tt = annot_type_text(c->to);
+    const char *art = std::strchr("aeiouAEIOU", tt[0]) ? "an" : "a";
+    mismatch("cast<" + tt + ">: a value of type '"
+                 + static_type_to_string(src) + "' never becomes "
+                 + art + " '" + tt + "'",
+             c->elem->start, c->elem->end);
 }
 
 /* box(v): `v` may not be none - box the value it holds */
@@ -8475,6 +8557,11 @@ void Inferencer::check(Construct *n)
         return;
     }
 
+    if (ctag(n) == ConstructType::cast) {
+        check_cast(static_cast<CastExpr *>(n));
+        return;
+    }
+
     if (ctag(n) == ConstructType::incdec) {
         auto *idc = static_cast<IncDecExpr *>(n);
         check(idc->lvalue.get());
@@ -9029,6 +9116,11 @@ static void specialize_children(Construct *n, int *fsize)
     }
     if (ctag(n) == ConstructType::deref) {
         auto *d = static_cast<DerefExpr *>(n);
+        d->elem = specialize(std::move(d->elem), fsize);
+        return;
+    }
+    if (ctag(n) == ConstructType::cast) {
+        auto *d = static_cast<CastExpr *>(n);
         d->elem = specialize(std::move(d->elem), fsize);
         return;
     }

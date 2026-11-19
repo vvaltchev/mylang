@@ -339,7 +339,7 @@ static bool struct_fe_body_inert(const Construct *c,
         static const char *const grow[] = {
             "append", "push", "sort", "rev_sort", "reverse", "keys",
             "values", "join", "split", "range", "clone", "deepclone",
-            "top", "sum", "array", "dynarray", "array_storage",
+            "top", "sum", "array", "array_storage",
         };
         const auto *id = node_cast<const Identifier>(bc->what.get());
         if (!id || bc->callable_arg_mask != 0)
@@ -1010,6 +1010,32 @@ struct Codegen {
         return true;
     }
 
+    /* `cast<T>(x)`: CastV into a fresh temp - its slot is the result -
+     * its refusal carrying the argument's caret (plans/cast.md). Every
+     * expression a cast takes lowers boxed; one that did not could lower
+     * no other way, so it is the compile refusal here */
+    int compile_cast(const CastExpr *c, std::vector<CgInstr> &ops)
+    {
+        int src;
+        if (!compile_boxed_expr(c->elem.get(), src, ops)) /* INT-COV-EXEMPT */
+            throw_not_lowered(c);
+        size_t ti = 0;
+        while (ti < chunk.cast_types.size() && chunk.cast_types[ti] != c->to)
+            ti++;
+        if (ti == chunk.cast_types.size())
+            chunk.cast_types.push_back(c->to);
+        const int t = alloc_temp();
+        CgInstr in;
+        in.op = OpCode::CastV;
+        in.node_idx = add_ast_node(c);
+        in.loc_node_idx = add_ast_node(c->elem.get());
+        in.target = t;
+        in.set_a(slot_op(src));
+        in.target2 = static_cast<int>(ti);
+        ops.push_back(in);
+        return t;
+    }
+
     /* `*b = v` / `*b OP= v`: the rvalue first, then the box once (a fresh
      * temp holds the rvalue when evaluating the box could change the
      * variable it was read from); a compound loads, applies the operator
@@ -1638,6 +1664,10 @@ struct Codegen {
                             bool allow_typed = true,
                             bool truthy_only = false)
     {
+        if (ctag(e) == ConstructType::cast) {
+            out_slot = compile_cast(static_cast<const CastExpr *>(e), ops);
+            return true;
+        }
         /* `*b`, and a store through a box used as a value */
         if (ctag(e) == ConstructType::deref)
             return compile_box_load(static_cast<const DerefExpr *>(e),
@@ -5890,6 +5920,14 @@ struct Codegen {
         if (e->th == TypeHint::i && try_typed_ternary(e, out, ops, false))
             return true;
 
+        /* `cast<int>(x)` / `cast<bool>(x)`: the result is exactly that
+         * (a bool reads as its 0 / 1 payload) */
+        if (e->th == TypeHint::i && ctag(e) == ConstructType::cast) {
+            out = slot_op(compile_cast(static_cast<const CastExpr *>(e),
+                                       ops));
+            return true;
+        }
+
         /* `*b` of a proven box<int>: the load checks the element */
         if (e->th == TypeHint::i && !e->th_bool
                 && ctag(e) == ConstructType::deref
@@ -6989,6 +7027,13 @@ struct Codegen {
 
         if (e->th == TypeHint::f && try_typed_ternary(e, out, ops, true))
             return true;
+
+        /* `cast<float>(x)`: the result is exactly a float */
+        if (e->th == TypeHint::f && ctag(e) == ConstructType::cast) {
+            out = slot_op(compile_cast(static_cast<const CastExpr *>(e),
+                                       ops));
+            return true;
+        }
 
         /* `*b` of a proven box<float>: the load checks the element */
         if (e->th == TypeHint::f && ctag(e) == ConstructType::deref
@@ -9612,6 +9657,7 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::LoadBoxV:       /* node = the `*b` (its TypeErrorEx) */
         case OpCode::StoreBoxV:      /* node = the `*b` (a misfit, const) */
         case OpCode::CheckFitV:      /* node = the stored value (#49) */
+        case OpCode::CastV:          /* node = the cast; loc = its argument */
         case OpCode::CallValueGenericV: /* node = the CallExpr: the CALL-SITE
                                      * loc (a FuncObject callee's backtrace via
                                      * do_func_call's loc_at); the op is now
@@ -10139,6 +10185,8 @@ static bool visit_use_def(const Instr &in, U u, D d)
     case OpCode::StampTypeV:       /* the array's TYPE changes, no slot
                                     * does (Q2) */
         u(in.a_slot()); return true;
+    case OpCode::CastV:            /* dst = cast<T>(src) */
+        u(in.a_slot()); d(in.target); return true;
     case OpCode::MakeArrayV:
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
         d(in.target); return true;
@@ -13026,6 +13074,12 @@ void ChunkVerifier::verify_one(const Instr &in)
         if (in.target2 < 1)
             reject("ctype");
         ctype(static_cast<unsigned>(in.target2));
+        break;
+    case OpCode::CastV:
+        /* `a` the source's slot, `target2` its cast_types entry */
+        a_slot_only(in);
+        reg(in.target);
+        pool(in.target2, ck.cast_types.size(), "cast type");
         break;
     case OpCode::CheckFitV:
         /* #49: `a` the value's slot, `target2` its fit_specs entry */

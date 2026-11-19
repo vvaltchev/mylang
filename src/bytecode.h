@@ -1334,6 +1334,18 @@ enum class OpCode : unsigned char {
     StampTypeV,
 
     /*
+     * CastV - `cast<T>(x)` (plans/cast.md): slot[target] = cast_value(
+     * slot[a], Chunk::cast_types[target2]) - the conversion every engine
+     * shares (types/cast.cpp.h). A refusal raises InvalidValueEx (a value
+     * the conversion cannot take) or TypeErrorEx (a value of the wrong
+     * kind) - caret: the loc side table (the cast's argument). The dst may
+     * hold a reference (a container, an instance, a `dyn` value). The
+     * bytecode inliner pastes no body that holds one (its index names the
+     * callee's pool).
+     */
+    CastV,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1386,7 +1398,7 @@ enum class OpCode : unsigned char {
     X(ExitBlock) X(LoadElem2Int) X(LoadElem2Float) X(ArrEpochMark) \
     X(ArrEpochCheck) X(GuardCalleeV) X(LoadCaptureOfV) X(StoreCaptureOfV) \
     X(UnpackLenCheck) X(CheckNoneArgsV) X(LoadBoxV) X(StoreBoxV) \
-    X(CheckFitV) X(StampTypeV)
+    X(CheckFitV) X(StampTypeV) X(CastV)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin
@@ -2849,6 +2861,11 @@ struct Chunk {
     {
         return ref ? ctypes[ref - 1] : nullptr;
     }
+
+    /* THE CAST POOL (plans/cast.md): the type each CastV converts to (an
+     * interned, COMPLETE TypeAnnot - any kind, `?` included), indexed by
+     * the op's target2. Primary data (myv: the TypeAnnot codec). */
+    std::vector<const TypeAnnot *> cast_types;
 
     /* EMPLACE-STRUCT SITE POOL (EmplaceStruct: `append(struct_arr, Ctor(..))`).
      * Everything vm_emplace_struct needed from the node: the ctor's POD def

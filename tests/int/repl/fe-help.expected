@@ -1,5 +1,5 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
->> >> >> REPL commands  (:help <command> for one; the leading ':' is optional)
+>> >> >> >> REPL commands  (:help <command> for one; the leading ':' is optional)
 
   :help [topic]
       Open this reference.
@@ -47,10 +47,12 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
 >> erase(c, i)
     Erase the element at index/key i from array/dict c.
     [Arrays; runtime (never const-folded)]
->> dynarray(a)
-    A fresh general (polymorphic, array<dyn>) copy of a - the manual promotion.
-    There is no automatic runtime promotion; storage is fixed at creation. clone()/deepclone() preserve the layout.
-    [Arrays; runtime (never const-folded)]
+>> Casts
+
+cast<float>(n)    cast<int>("42")    cast<bool>("yes")
+cast<array<float>>(xs)    cast<dict<str, int?>>(d)    cast<dyn>(v)
+
+cast<T>(x) converts x to EXACTLY the type T, at run time. Scalars: bool, int, float and str convert both ways (int(), float() and str()'s rules; a number becomes a bool only from 0 / 1, a string from true / yes / on / enabled or false / no / off / disabled, case ignored). T? lets none through; cast<dyn?> keeps the value as it is, cast<dyn> refuses none. A container cast builds a NEW container of type T, converting every element (a nested one already of its target type is shared); a dict keeps its order and default, and two keys that convert to one key are refused. A struct, class or box must already be that type and comes back copied. A value the conversion cannot take is an InvalidValueEx, one of the wrong kind a TypeErrorEx; a cast no value of its argument's type can survive is a compile error. T must be complete - not a bare array or dict.
 >> deepclone(x)
     A fully-mutable deep copy at every level - the way to mutate a const value.
     [Type conversion & values; runtime (never const-folded)]

@@ -1,0 +1,149 @@
+MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
+>> >> >> >> >> >> >> >> >> => 5
+>> => box("1")
+>> => box(1)
+>> => box(Q(x: 1))
+>> => box(P(x: 1))
+>> => {1: 2}
+>> => [1]
+>> => Q(x: 1)
+>> => []
+>> TypeMismatchEx: cast<P>: a value of type 'Q' never becomes a 'P' at line 18, col 9:11
+
+    cast<P>(qv);
+            ^^
+>> TypeMismatchEx: cast<P>: a value of type 'int' never becomes a 'P' at line 19, col 9:13
+
+    cast<P>(five);
+            ^^^^
+>> TypeMismatchEx: cast<box<int>>: a value of type 'int' never becomes a 'box<int>' at line 20, col 16:20
+
+    cast<box<int>>(five);
+                   ^^^^
+>> TypeMismatchEx: cast<box<int>>: a value of type 'box<str>' never becomes a 'box<int>' at line 21, col 16:18
+
+    cast<box<int>>(bs);
+                   ^^
+>> TypeMismatchEx: cast<box<bool>>: a value of type 'box<int>' never becomes a 'box<bool>' at line 22, col 17:19
+
+    cast<box<bool>>(bi);
+                    ^^
+>> TypeMismatchEx: cast<box<float>>: a value of type 'box<int>' never becomes a 'box<float>' at line 23, col 18:20
+
+    cast<box<float>>(bi);
+                     ^^
+>> TypeMismatchEx: cast<box<str>>: a value of type 'box<int>' never becomes a 'box<str>' at line 24, col 16:18
+
+    cast<box<str>>(bi);
+                   ^^
+>> TypeMismatchEx: cast<box<P>>: a value of type 'box<Q>' never becomes a 'box<P>' at line 25, col 14:16
+
+    cast<box<P>>(bq);
+                 ^^
+>> P(x: 1) 
+>> 3 
+>> TypeMismatchEx: cast<array<int>>: a value of type 'dict<int,int>' never becomes an 'array<int>' at line 28, col 18:20
+
+    cast<array<int>>(di);
+                     ^^
+>> TypeMismatchEx: cast<dict<str,int>>: a value of type 'array<int>' never becomes a 'dict<str,int>' at line 29, col 22:24
+
+    cast<dict<str, int>>(ai);
+                         ^^
+>> TypeMismatchEx: cast<dict<str,P>>: a value of type 'dict<int,int>' never becomes a 'dict<str,P>' at line 30, col 20:22
+
+    cast<dict<str, P>>(di);
+                       ^^
+>> TypeMismatchEx: cast<dict<P,int>>: a value of type 'dict<int,int>' never becomes a 'dict<P,int>' at line 31, col 20:22
+
+    cast<dict<P, int>>(di);
+                       ^^
+>> TypeMismatchEx: cast<array<P>>: a value of type 'array<int>' never becomes an 'array<P>' at line 32, col 16:18
+
+    cast<array<P>>(ai);
+                   ^^
+>> TypeMismatchEx: cast<int>: a value of type 'array<int>' never becomes an 'int' at line 33, col 11:13
+
+    cast<int>(ai);
+              ^^
+>> TypeMismatchEx: cast<box<P>>: a value of type 'box<int>' never becomes a 'box<P>' at line 34, col 14:16
+
+    cast<box<P>>(bi);
+                 ^^
+>> InvalidValueEx: cast<float>: "1e999" is outside the float range at line 35, col 13:20
+
+    cast<float>("1e999");
+                ^^^^^^^
+note: a constant expression is evaluated while compiling, so its error is a
+compile error, which no try/catch handles; to raise it when the program runs
+instead, pass one of its values through runtime(), as in 10 / runtime(0)
+>> 2.500000 
+>> TypeMismatchEx: cast<int>: a value of type 'none' never becomes an 'int' at line 37, col 11:20
+
+    cast<int>(nothing());
+              ^^^^^^^^^
+>> <none> 
+>> [] 
+>> Undefined variable 'nosuch' at line 40, col 11:17
+
+    cast<int>(nosuch);
+              ^^^^^^
+>> SyntaxError at line 41, col 9
+
+    cast<int;
+            ^
+expected '>' to close 'cast<...>' ';'
+>> SyntaxError at line 42, col 11
+
+    cast<int>>(1);
+              ^^^^
+unexpected '>' after 'cast<...>' '('
+>> SyntaxError at line 43, col 11
+
+    cast<int>();
+              ^^
+Expected expression, got ')'
+>> SyntaxError at line 44, col 6
+
+    cast<array>([1]);
+         ^^^^^^^^^^^^
+a cast needs a complete type: write array<T> / dict<K, V>, not a bare array / dict
+>> SyntaxError at line 45, col 6
+
+    cast<dict<str, array>>({});
+         ^^^^^^^^^^^^^^^^^^^^^^
+a cast needs a complete type: write array<T> / dict<K, V>, not a bare array / dict
+>> SyntaxError at line 46, col 6
+
+    cast<dict<array, int>>({});
+         ^^^^^^^^^^^^^^^^^^^^^^
+a cast needs a complete type: write array<T> / dict<K, V>, not a bare array / dict
+>> SyntaxError at line 47, col 5
+
+    cast(1);
+        ^^^^
+expected '<' after 'cast': cast<TYPE>(value) '('
+>> Block(
+  Cast<int>(
+    CallExpr(
+      Id("runtime")
+      ExprList(
+        "7"
+      )
+    )
+  )
+)
+>> Block(
+  Cast<array<dyn?>>(
+    CallExpr(
+      Id("runtime")
+      ExprList(
+        LiteralArray(
+          Int(1)
+          None
+        )
+      )
+    )
+  )
+)
+>> 

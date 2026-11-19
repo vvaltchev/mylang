@@ -2,8 +2,13 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 44.  This document describes the on-disk image exhaustively:
+Format version 45.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v45: one opcode was APPENDED, CastV - `cast<T>(x)` - and a chunk gains
+the pool `cast_types` (9.11c) after ctypes, which a CastV names by its
+`target2`.  The builtin `dynarray` was removed, so the builtin-set
+fingerprint in the header changed too.)
 
 (v44: the GLOBALS section (10) ends with a bool `typed` - the program was
 compiled with type inference, so a container that carries no type of its
@@ -823,6 +828,7 @@ Each chunk is:
     N x BoxedCtor boxed_ctors       9.11
     N x FitSpec fit_specs           9.11a   (v37)
     N x ctype ctypes                9.11b   (v43)
+    N x annot cast_types            9.11c   (v45)
     N x EmplaceSite emplace_sites   9.12
     N x ThrowSite throws            9.13
     N x SlotList unpack_targets     9.14
@@ -1078,6 +1084,15 @@ Each a `ctype` (2.3), present (never 0xFF).  An op names one by a REF -
 MapFilterV in target2's bits 3 and up, StampTypeV in the whole of target2
 (never 0 there).  The verifier refuses a ref past the pool, and a
 StampTypeV with none ("corrupt .myv (ctype at pc N)").
+
+9.11c cast_types - the casts' types (v45)
+
+Each an `annot` (2.2), present (never 0xFF) and COMPLETE: an array or a
+box names its element, a dict its key and value, a struct annotation its
+struct, at every level, and no annotation is of kind none - the reader
+refuses any other ("corrupt .myv (cast type)").  Any kind, `?` included.
+A CastV names one by its index in `target2`; the verifier refuses an
+index past the pool.
 
 9.12  EmplaceSite - a construct-in-place append
 

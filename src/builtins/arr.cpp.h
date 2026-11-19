@@ -288,40 +288,6 @@ EvalValue builtin_array_storage(EvalContext *ctx, const ArgLocs *exprList,
 }
 
 /*
- * dynarray(a): return a fresh, mutable GENERAL (polymorphic) copy of array `a`.
- * This is the explicit, manual way to "promote" a flat (statically-typed)
- * array<int>/array<float> into one that can hold any element type - there is no
- * automatic runtime promotion (the representation is fixed at creation from the
- * proven static type). Reading via arr_elem_at, so the source is never promoted
- * in place; an already-general array is just copied. Shallow (top-level):
- * nested arrays keep their own representation. Not const (a fresh mutable value
- * that must be re-copied per eval). Compare `var dyn d = [1,2,3]`, where the
- * dyn declaration already builds general from the start.
- */
-EvalValue builtin_dynarray(EvalContext *ctx, const ArgLocs *exprList,
-                           const EvalValue *args, size_t nargs)
-{
-    if (nargs != 1)
-        throw InvalidNumberOfArgsEx(exprList->start, exprList->end);
-
-    const ArgLoc *arg = exprList->arg(0);
-    const EvalValue &e = args[0];
-
-    if (!e.is<SharedArrayObj>())
-        throw TypeErrorEx("Expected array", arg->start, arg->end);
-
-    const SharedArrayObj &arr = e.get<SharedArrayObj>();
-    const size_type n = arr.size();
-    SharedArrayObj::vec_type gvec;
-    gvec.reserve(n);
-
-    for (size_type i = 0; i < n; i++)
-        gvec.emplace_back(arr_elem_at(arr, i), false);
-
-    return SharedArrayObj(std::move(gvec));
-}
-
-/*
  * Keep the array's cached hash correct across an append in O(1): a still-valid
  * cache just folds the new element in (an append extends the sequence at the
  * end, which is exactly one more hash_combine step). If the cache is invalid,

@@ -252,7 +252,7 @@ static const std::vector<test> tests =
         "dict<str, int> di = {};",
         /* a general-storage array<int> whose values fit (#49 refuses
          * the misfit a dyn element used to launder in) */
-        "array<int> gl = dynarray([1, 2]);",
+        "array<int> gl = keep(ug([1, 2]));",
         "assert(array_storage(gl) == \"general\");",
         "var n = 0;",
         "try { ga[0] = runtime(\"s\"); } catch (TypeErrorEx) { n += 1; }",
@@ -260,7 +260,11 @@ static const std::vector<test> tests =
         "try { gl[0] = runtime(\"s\"); } catch (TypeErrorEx) { n += 1; }",
         "assert(n == 3 && ga[0] == none && len(di) == 0 && gl[0] == 1);",
         "di[\"k\"] = runtime(true);",
-        "assert(str(di) == \"{\\\"k\\\": 1}\");" } },
+        "assert(str(di) == \"{\\\"k\\\": 1}\");",
+        "func keep(array<int> a) => a;",
+        /* an UNTYPED general array (what only `dyn` reaches) */
+        "func ug(dyn a) { array<dyn> h = [[none]]; var dyn r = h[0];",
+        "    pop(r); foreach (e in a) append(r, e); return r; }" } },
 
     /*
      * The struct-foreach DIRECT read (each `p.x` a byte read of the array
@@ -1321,7 +1325,10 @@ static const std::vector<test> tests =
         "    for (var i = 0; i < 2; i++) t += a[i] * 2;",
         "    return t;",
         "}",
-        "f(dynarray([1, 2]));" }, &typeid(TypeErrorEx), 20, 2, 25, 2 },
+        "f(ug([1, 2]));",
+        /* an UNTYPED general array (what only `dyn` reaches) */
+        "func ug(dyn a) { array<dyn> h = [[none]]; var dyn r = h[0];",
+        "    pop(r); foreach (e in a) append(r, e); return r; }" }, &typeid(TypeErrorEx), 20, 2, 25, 2 },
     { "err loc: (Q2) a dynamic dict entering a dict<str, float> parameter",
       { "func g(dict<str, float> d) {",
         "    var dyn x = d; x[\"a\"] = \"s\";",
@@ -1342,8 +1349,11 @@ static const std::vector<test> tests =
         "    for (var k = 0; k < 2; k++) t += m[k][0] * 3;",
         "    return t;",
         "}",
-        "f(dynarray([dynarray([1, 2]), dynarray([3, 4])]));" },
-      &typeid(TypeErrorEx), 3, 7, 50, 7 },
+        "f(ug([cast<array<dyn>>([1, 2]), cast<array<dyn>>([3, 4])]));",
+        /* an UNTYPED general array (what only `dyn` reaches) */
+        "func ug(dyn a) { array<dyn> h = [[none]]; var dyn r = h[0];",
+        "    pop(r); foreach (e in a) append(r, e); return r; }" },
+      &typeid(TypeErrorEx), 3, 7, 60, 7 },
     /* (the typed foreach variable's read these two reached: see above) */
     { "err loc: (Q2) a string stored through dyn into an array<bool> "
       "a typed parameter adopted",
@@ -1353,7 +1363,11 @@ static const std::vector<test> tests =
         "    foreach (var v in a) { if (v) n++; }",
         "    return n;",
         "}",
-        "f(dynarray([true, false]));" }, &typeid(TypeErrorEx), 20, 2, 25, 2 },
+        "f(ug([true, false]));",
+        /* an UNTYPED general array (what only `dyn` reaches) */
+        "func ug(dyn a) { array<dyn> h = [[none]]; var dyn r = h[0];",
+        "    pop(r); foreach (e in a) append(r, e); return r; }" },
+      &typeid(TypeErrorEx), 20, 2, 25, 2 },
     { "err loc: (Q2) a string stored through dyn into an array<float> "
       "a typed parameter adopted",
       { "func f(array<float> a) {",
@@ -1362,7 +1376,11 @@ static const std::vector<test> tests =
         "    foreach (var v in a) t += v;",
         "    return t;",
         "}",
-        "f(dynarray([1.5, 2.5]));" }, &typeid(TypeErrorEx), 20, 2, 25, 2 },
+        "f(ug([1.5, 2.5]));",
+        /* an UNTYPED general array (what only `dyn` reaches) */
+        "func ug(dyn a) { array<dyn> h = [[none]]; var dyn r = h[0];",
+        "    pop(r); foreach (e in a) append(r, e); return r; }" },
+      &typeid(TypeErrorEx), 20, 2, 25, 2 },
     /* a const multi-declaration's element the parser already folded to a
      * constant value (sort() of a constant) is bound as it is: read-only,
      * like the elements it bakes */
@@ -7840,11 +7858,11 @@ static const std::vector<test> tests =
      * a slice that is its storage's only owner freed the element mid-store
      * (an ASan use-after-free in every engine). Until 2026-10-08. */
     { "slice element store: a compound int store detaches the slice",
-      { "var a = dynarray([1, 2, 3]);",
+      { "var a = cast<array<dyn>>([1, 2, 3]);",
         "var s = a[0:2];",
         "for (var i = 0; i < 6; i++) { s[i % 2] += 1; }",
         "assert(a[0] == 1 && a[1] == 2 && s[0] == 4 && s[1] == 5);",
-        "var u = dynarray([1, 2, 3])[1:3];",
+        "var u = cast<array<dyn>>([1, 2, 3])[1:3];",
         "u[0] *= 5;",
         "assert(u[0] == 10 && u[1] == 3);" } },
     { "slice element store: the slice owns its storage alone",
@@ -8954,11 +8972,12 @@ static const std::vector<test> tests =
      * reference counting cannot free a cycle, and the suite runs under
      * LeakSanitizer and the INT census. A FROZEN cycle (a cyclic constant,
      * a cyclic dict key) cannot be broken by any program; the interpreter
-     * frees those when the process ends (cyc_keep_until_exit). `dynarray`
-     * keeps a ring general under every configuration. */
+     * frees those when the process ends (cyc_keep_until_exit).
+     * `cast<array<dyn>>` keeps a ring general under every
+     * configuration. */
     { "cycle: printing marks a container already being printed",
       { "struct CyN { int v; dyn? next; }",
-        "var dyn a = dynarray([1]); append(a, a);",
+        "var dyn a = cast<array<dyn>>([1]); append(a, a);",
         "assert(str(a) == \"[1, [...]]\");",
         "assert(str([a, a]) == \"[[1, [...]], [1, [...]]]\");",
         "assert(str(clone(a)) == \"[1, [1, [...]]]\");",
@@ -8976,7 +8995,7 @@ static const std::vector<test> tests =
      * decided ==. And a box<P> back edge prints box(Name(...)). */
     { "cycle: a struct value is walked by value, a box<P> by reference",
       { "struct CyS { int v; dyn? next; }",
-        "var dyn ra = dynarray([0]); ra[0] = CyS(1, ra);",
+        "var dyn ra = cast<array<dyn>>([0]); ra[0] = CyS(1, ra);",
         "var dyn r1 = clone(ra); var dyn r2 = clone(ra);",
         "r2[0].v = 1;",
         "assert(str(r1) == str(r2) && r1 == r2 && hash(r1) == hash(r2));",
@@ -8986,11 +9005,12 @@ static const std::vector<test> tests =
         "assert(str(bn) == \"box(CyB(next: box(CyB(...)), v: 1))\");",
         "pop(ra); bn.next = none;" } },
     { "cycle: == compares two cyclic values by shape",
-      { "var dyn a = dynarray([1]); append(a, a);",
-        "var dyn b = dynarray([1]); append(b, b);",
+      { "var dyn a = cast<array<dyn>>([1]); append(a, a);",
+        "var dyn b = cast<array<dyn>>([1]); append(b, b);",
         /* a ring of two and a ring of three, every node [1, next] */
-        "var dyn u = dynarray([1]); var dyn u2 = [1, u]; append(u, u2);",
-        "var dyn x = dynarray([1]); var dyn y = dynarray([1]);",
+        "var dyn u = cast<array<dyn>>([1]); var dyn u2 = [1, u];"
+        " append(u, u2);",
+        "var dyn x = cast<array<dyn>>([1]); var dyn y = cast<array<dyn>>([1]);",
         "var dyn z = [1, x]; append(y, z); append(x, y);",
         "assert(a == a && a == b && !(a != b) && [a] == [b]);",
         "assert(u == u2 && u2 == u && x == y && y == z && z == x);",
@@ -9005,10 +9025,11 @@ static const std::vector<test> tests =
         "erase(d1, \"s\"); erase(d2, \"s\");" } },
     { "cycle: equal cyclic values hash equal",
       { "struct CyN { int v; dyn? next; }",
-        "var dyn a = dynarray([1]); append(a, a);",
-        "var dyn b = dynarray([1]); append(b, b);",
-        "var dyn u = dynarray([1]); var dyn u2 = [1, u]; append(u, u2);",
-        "var dyn x = dynarray([1]); var dyn y = dynarray([1]);",
+        "var dyn a = cast<array<dyn>>([1]); append(a, a);",
+        "var dyn b = cast<array<dyn>>([1]); append(b, b);",
+        "var dyn u = cast<array<dyn>>([1]); var dyn u2 = [1, u];"
+        " append(u, u2);",
+        "var dyn x = cast<array<dyn>>([1]); var dyn y = cast<array<dyn>>([1]);",
         "var dyn z = [1, x]; append(y, z); append(x, y);",
         "var dyn d1 = {}; d1[\"s\"] = d1;",
         "var dyn d2 = {}; d2[\"s\"] = d2;",
@@ -9024,8 +9045,8 @@ static const std::vector<test> tests =
         "pop(a); pop(b); pop(u); pop(x); pop(ba); pop(bb);",
         "erase(d1, \"s\"); erase(d2, \"s\");" } },
     { "cycle: a cyclic value is a dict key, frozen with its cycle",
-      { "var dyn a = dynarray([1]); append(a, a);",
-        "var dyn b = dynarray([1]); append(b, b);",
+      { "var dyn a = cast<array<dyn>>([1]); append(a, a);",
+        "var dyn b = cast<array<dyn>>([1]); append(b, b);",
         "var dyn m = {}; m[a] = 1; m[b] = 2;",
         "assert(len(m) == 1 && m[a] == 2);",
         "var dyn k = keys(m)[0];",
@@ -9037,7 +9058,7 @@ static const std::vector<test> tests =
         "pop(a); pop(b);",
         "assert(len(k) == 2 && m[k] == 2);" } },
     { "cycle: deepclone reproduces the cycle inside the copy",
-      { "var dyn a = dynarray([1]); append(a, a);",
+      { "var dyn a = cast<array<dyn>>([1]); append(a, a);",
         "var dyn c = deepclone(a);",
         "assert(c == a && intptr(c[1]) == intptr(c));",
         "assert(intptr(c) != intptr(a));",
@@ -9063,7 +9084,7 @@ static const std::vector<test> tests =
         "r2[0] = 2; assert(r2[1][0] == 2 && C[0] == 1);",
         "pop(r2); pop(r3);" } },
     { "cycle: writing into a frozen cyclic key is refused",
-      { "var dyn a = dynarray([1]); append(a, a);",
+      { "var dyn a = cast<array<dyn>>([1]); append(a, a);",
         "var dyn m = {}; m[a] = 1;",
         "var dyn k = keys(m)[0];",
         "pop(a);",
@@ -10448,7 +10469,7 @@ static const std::vector<test> tests =
             "catch (InvalidArgumentEx) { n += 1; }",
             "array<P> ep = [];",
             "try { print(max(ep).x); } catch (InvalidArgumentEx) { n += 1; }",
-            "var dyn g = dynarray(ei);",
+            "var dyn g = cast<array<dyn>>(ei);",
             "try { print(min(g)); } catch (InvalidArgumentEx) { n += 1; }",
             "var a = [int(runtime(1)), 2, 3];",
             "var sl = a[1:1];",
@@ -11078,28 +11099,136 @@ static const std::vector<test> tests =
         },
     },
     {
-        /* dynarray(a) is the manual promotion: a fresh general copy of a flat
-         * array. The original stays flat/typed; the copy is independent and
-         * polymorphic, typed array<dyn> so a plain `var` is fine. */
-        "Typed arrays: dynarray() promotes a flat array to a general copy",
+        /* cast<array<dyn>>(a) is the manual promotion: a fresh general copy
+         * of a flat array. The original stays flat/typed; the copy is
+         * independent and polymorphic, typed array<dyn> so a plain `var` is
+         * fine. */
+        "Typed arrays: cast<array<dyn>> promotes a flat array to a general "
+        "copy",
         {
             "var a = range(3);",
-            "var d = dynarray(a);",
+            "var d = cast<array<dyn>>(a);",
             "assert(array_storage(a) == \"int\");",
             "assert(array_storage(d) == \"general\");",
             "d[0] = \"x\";",
             "append(d, 9.5);",
             "assert(d == [\"x\", 1, 2, 9.5]);",
             "assert(a == [0, 1, 2]);",      /* original untouched */
-            "var f = dynarray([1.0, 2.0]);", /* also works on float arrays */
+            /* also works on float arrays */
+            "var f = cast<array<dyn>>([1.0, 2.0]);",
             "assert(array_storage(f) == \"general\");",
         },
     },
     {
-        "dynarray() rejects a non-array",
-        { "dynarray(42);" },
+        /* a constant is cast while compiling: its run-time error */
+        "cast<array<dyn>> of a constant non-array fails while compiling",
+        { "cast<array<dyn>>(42);" },
         &typeid(TypeErrorEx),
     },
+    {
+        "cast<array<dyn>> of a non-array variable is a compile error",
+        { "int n = int(runtime(4)) + 1; cast<array<dyn>>(n);" },
+        &typeid(TypeMismatchEx),
+    },
+    {
+        "cast<array<dyn>> of a non-array dyn is a TypeErrorEx",
+        { "var dyn v = runtime(42); cast<array<dyn>>(v);" },
+        &typeid(TypeErrorEx),
+    },
+
+    /* ---- cast<T>(x) (plans/cast.md; README "Casts"): the carets of each
+     * failure kind (the argument), the compile-time refusals, the
+     * parse errors ---- */
+    { "cast: a value the conversion cannot take carets the argument",
+      { "var dyn x = runtime(\"ab\");",
+        "var n = cast<int>(x);" },
+      &typeid(InvalidValueEx), 19, 2, 21, 2 },
+    { "cast: a value of the wrong kind carets the argument",
+      { "var dyn x = runtime([1]);",
+        "var n = cast<int>(x);" },
+      &typeid(TypeErrorEx), 19, 2, 21, 2 },
+    { "cast: none into a type without ? carets the argument",
+      { "var dyn x = runtime(none);",
+        "var n = cast<float>(x);" },
+      &typeid(TypeErrorEx), 21, 2, 23, 2 },
+    { "cast: an element's refusal carets the whole argument",
+      { "var dyn x = runtime([\"1\", \"2\", \"x\"]);",
+        "var n = cast<array<int>>(  x  );" },
+      &typeid(InvalidValueEx), 28, 2, 30, 2 },
+    { "cast: two keys that become one are refused",
+      { "var dyn x = runtime({1.2: \"a\", 1.7: \"b\"});",
+        "var n = cast<dict<int, str>>(x);" },
+      &typeid(InvalidValueEx) },
+    { "cast: a refusal in a function carets the argument there",
+      { "func f(dyn v) {",
+        "    return cast<bool>(v);",
+        "}",
+        "print(f(runtime(1)));",
+        "print(f(runtime(\"perhaps\")));" },
+      &typeid(InvalidValueEx), 23, 2, 25, 2 },
+    { "cast: a never-possible cast is a compile error",
+      { "array<int> xs = [1];", "var n = cast<int>(xs);" },
+      &typeid(TypeMismatchEx), 19, 2, 22, 2 },
+    { "cast: a container never becomes a scalar", {
+        "dict<str, int> d = {\"a\": 1};",
+        "var n = cast<str>(d);" },
+      &typeid(TypeMismatchEx) },
+    { "cast: a never-possible element type is a compile error", {
+        "array<array<int>> m = [[1]];",
+        "var n = cast<array<int>>(m);" },
+      &typeid(TypeMismatchEx) },
+    { "cast: another struct is a compile error", {
+        "struct P { int x; } struct Q { int x; }",
+        "var q = Q(1);",
+        "var n = cast<P>(q);" },
+      &typeid(TypeMismatchEx) },
+    { "cast: none into dyn is a compile error",
+      { "var x = none;", "var n = cast<dyn>(x);" },
+      &typeid(TypeMismatchEx) },
+    /* a constant is cast while compiling: the run-time error, raised
+     * then */
+    { "cast: a constant none into dyn fails while compiling",
+      { "var n = cast<dyn>(none);" }, &typeid(TypeErrorEx) },
+    { "cast: none into dyn? is not",
+      { "assert(cast<dyn?>(none) == none);",
+        "assert(cast<int?>(none) == none);" } },
+    { "cast: a failing constant cast is a compile error",
+      { "var n = cast<int>(\"abc\");" },
+      &typeid(InvalidValueEx), 19, 1, 25, 1 },
+    { "cast: a bare array is a hole, refused",
+      { "var dyn v = runtime([1]);", "var n = cast<array>(v);" },
+      &typeid(SyntaxErrorEx) },
+    { "cast: a nested bare dict is a hole, refused",
+      { "var dyn v = runtime([1]);",
+        "var n = cast<array<dict>>(v);" },
+      &typeid(SyntaxErrorEx) },
+    { "cast: no '<' after cast", { "var n = cast(5);" },
+      &typeid(SyntaxErrorEx) },
+    { "cast: no '(' after the type", { "var n = cast<int> 5;" },
+      &typeid(SyntaxErrorEx) },
+    { "cast: one '>' too many", { "var n = cast<array<int>>>([1]);" },
+      &typeid(SyntaxErrorEx) },
+    { "cast: cast is a keyword", { "var cast = 5;" },
+      &typeid(SyntaxErrorEx) },
+    { "cast: values and types", {
+        "assert(cast<float>(3) == 3.0 && typestr(cast<float>(3)) == "
+        "\"float\");",
+        "assert(cast<int>(true) == 1 && cast<int>(\"-12\") == -12);",
+        "assert(cast<bool>(\"ENABLED\") && !cast<bool>(\"Off\"));",
+        "assert(cast<str>(2.5) == \"2.500000\");",
+        "array<int> xs = [1, 2];",
+        "var f = cast<array<float>>(xs);",
+        "assert(typestr(f) == \"array<float>\" && f == [1.0, 2.0]);",
+        "assert(array_storage(f) == \"float\");",
+        "var dyn d = runtime({\"a\": 1});",
+        "var g = cast<dict<str, float?>>(d);",
+        "assert(typestr(g) == \"dict<str,float?>\" && g[\"a\"] == 1.0);",
+        "array<array<int>> m = [xs, xs];",
+        "var mc = cast<array<array<int>>>(m);",
+        "assert(intptr(mc) != intptr(m) && intptr(mc[0]) == intptr(xs));",
+        "var mf = cast<array<array<float>>>(m);",
+        "assert(intptr(mf[0]) == intptr(mf[1]));" } },
+
 
     /* ----------------------- bool type ----------------------- */
 
@@ -11373,10 +11502,10 @@ static const std::vector<test> tests =
         &typeid(TypeErrorEx),
     },
     {
-        "array<bool>: dynarray() promotes to a general copy",
+        "array<bool>: cast<array<dyn>> promotes to a general copy",
         {
             "var b = [true, false];",
-            "var g = dynarray(b);",
+            "var g = cast<array<dyn>>(b);",
             "assert(array_storage(g) == \"general\");",
             "assert(g == [true, false]);",
             "g[0] = 5;",                     /* now polymorphic */
@@ -23644,6 +23773,16 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* cast<T>(x) (plans/cast.md): its echo, :type, the decompiler's
+     * rendering, and a refusal leaving the session alive */
+    { "a cast at the prompt",
+      { { "cast<float>(runtime(2))", "=> 2.000000" },
+        { ":type cast<float>(runtime(1))", "float" },
+        { "func cf(dyn v) { return cast<array<str>>(v); }", "" },
+        { ":show cf", "=> cast<array<str>>(v);" },
+        { "cf(runtime([1, 2]))", "=> [\"1\", \"2\"]" },
+        { "cast<int>(runtime(\"x\"))", "is not an int" },
+        { "cast<bool>(runtime(\"On\"))", "=> true" } } },
     /* question 25: a clause names a struct by identity; in the REPL's
      * open world a name no struct takes yet may be declared by a later
      * input, so such a clause matches by name */
@@ -24456,14 +24595,14 @@ static const std::vector<repl_test> repl_tests =
      * on one line and expanded; the last steps break the cycles (reference
      * counting cannot free one, and -rt runs under LeakSanitizer) */
     { "the => echo marks a value that contains itself",
-      { { "var dyn cy = dynarray([1])", "" },
+      { { "var dyn cy = cast<array<dyn>>([1])", "" },
         { "append(cy, cy)", "" },
         { "cy", "=> [1, [...]]" },
         { "[cy, cy]", "=> [[1, [...]], [1, [...]]]" },
         { "var dyn cd = {}", "" },
         { "cd[\"self\"] = cd", "" },
         { "cd", "=> {\"self\": {...}}" },
-        { "var dyn cw = dynarray([\"aaaaaaaaaaaaaaaaaaaaaaaaa\",\n"
+        { "var dyn cw = cast<array<dyn>>([\"aaaaaaaaaaaaaaaaaaaaaaaaa\",\n"
           "  \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"ccccccccccccccccccc\"])",
           "" },
         { "append(cw, cw)", "" },
@@ -30943,6 +31082,18 @@ static bool const_fold_equivalence()
          * the same with or without folding: -nc evaluates a constant's
          * initializer once more, to raise its errors, and that discarded
          * instance used to take a number (2026-11-15) */
+        /* cast<T>(x) of a constant folds only to a literal whose type is
+         * T; any other stays a cast (plans/cast.md) */
+        { "a constant cast folds to exactly its type", {
+            "var a = cast<float>(3);",
+            "var dyn b = cast<dyn>(5);",
+            "var c = cast<int?>(\"7\");",
+            "var d = cast<array<float>>([1, 2]);",
+            "print(a, typestr(a), b, c, typestr(c), d, typestr(d));",
+            "const K = cast<array<float>>([1, 2]);",
+            "print(K, typestr(K));" } },
+        { "a constant cast's refusal is the same compile error", {
+            "var a = cast<bool>(2);" } },
         { "a constant class instance hashes the same", {
             "class C { int v; }",
             "const A = C(1);",
@@ -32804,14 +32955,15 @@ static bool unpack_fast_bind_shapes()
         /* the GENERAL-storage twin of the slice case above, and it is
          * NOT optional: with only the strs case, dropping the general
          * arm's `+ off` left the whole suite GREEN (watched). The row is
-         * built with `dynarray()` on purpose - a plain heterogeneous
+         * built with `cast<array<dyn>>()` on purpose - a plain heterogeneous
          * literal makes the OUTER dyn too, and the foreach then lowers to
          * fe.dyn.next instead of unpack.elem.v, so that version tested
          * NOTHING (also watched: the sabotage did not move its value). */
         { "slice general rows (hoisted offset)", {
             "var rows = [];",
             "for (var j = 0; j < 3; j++)",
-            "    append(rows, dynarray([\"q\" + str(j), \"a\" + str(j),",
+            "    append(rows, cast<array<dyn>>([\"q\" + str(j),"
+            " \"a\" + str(j),",
             "                           \"bb\" + str(j)])[1:3]);",
             "var n = 0; var last = \"\";",
             "for (var r = 0; r < 3; r++)",
@@ -33788,7 +33940,7 @@ static bool invoker_call_tiers()
          * the prepared entry, never raw */
         { "map callback over boxed elements, VM engine",
           { "var g = []; for (var i = 0; i < 30; i++) { append(g, i); }",
-            "var dyn gg = dynarray(g);",
+            "var dyn gg = cast<array<dyn>>(g);",
             "var m = map(func(x) { return x; }, gg);",
             "assert(m[29] == 29);" },
           ExecEngine::Vm, true, 30, false },
@@ -33968,7 +34120,7 @@ static bool jit_boxed_int_fast()
     }
     /* mid-loop int->float flip: the guard DECLINES per element and the
      * helper computes the exact promoted result (byte-identical) */
-    if (!run({ "var dyn vals = dynarray([1, 2.5, 3, 4.5]);",
+    if (!run({ "var dyn vals = cast<array<dyn>>([1, 2.5, 3, 4.5]);",
                "var dyn s = 0.0;",
                "foreach (var v in vals) s = s + v;",
                "assert(s == 11.0);" }))
@@ -34024,7 +34176,7 @@ static bool jit_boxed_float_fast()
     };
     unsigned long c0 = g_jit_boxed_fastf;
     /* BinOpV: a slot-slot `+` and a FLOAT-LITERAL `*` operand */
-    if (!run("binop", { "var dyn a = dynarray([1.5, 2.5, 3.5, 4.5]);",
+    if (!run("binop", { "var dyn a = cast<array<dyn>>([1.5, 2.5, 3.5, 4.5]);",
                "var dyn s = 0.0;",
                "for (var r = 0; r < 5; r++)",
                "    foreach (var e in a) s = (s + e) * 0.5;",
@@ -34036,7 +34188,8 @@ static bool jit_boxed_float_fast()
     }
     c0 = g_jit_boxed_fastf;
     /* CompoundV (`s += e` on a float dst) + the four ORDERING CmpV forms */
-    if (!run("compound/cmp", { "var dyn a = dynarray([1.5, 2.5, 3.5, 4.5]);",
+    if (!run("compound/cmp", {
+            "var dyn a = cast<array<dyn>>([1.5, 2.5, 3.5, 4.5]);",
                "var dyn s = 0.0; var n = 0;",
                "for (var r = 0; r < 5; r++)",
                "    foreach (var e in a) {",
@@ -34057,7 +34210,7 @@ static bool jit_boxed_float_fast()
     /* div: a nonzero RUNTIME divisor inlines. `z` is written TWICE so
      * auto-const cannot promote it to a literal operand - which would
      * exercise the emit-time gate instead of the runtime bits guard. */
-    if (!run("div", { "var dyn a = dynarray([1.5, 2.5, 3.5, 4.5]);",
+    if (!run("div", { "var dyn a = cast<array<dyn>>([1.5, 2.5, 3.5, 4.5]);",
                "var dyn s = 0.0;",
                "for (var r = 0; r < 5; r++)",
                "    foreach (var e in a) {",
@@ -34073,7 +34226,8 @@ static bool jit_boxed_float_fast()
     }
     /* a RUNTIME +-0.0 divisor DECLINES to the helper, which throws the
      * exact DivisionByZeroEx (the bits test, not a ucomisd je) */
-    if (!run("div0 decline", { "var dyn a = dynarray([1.5, 2.5, 3.5, 4.5]);",
+    if (!run("div0 decline", {
+            "var dyn a = cast<array<dyn>>([1.5, 2.5, 3.5, 4.5]);",
                "var dyn s = 1.0; var caught = 0;",
                "for (var r = 0; r < 5; r++)",
                "    foreach (var e in a) {",
@@ -34088,7 +34242,8 @@ static bool jit_boxed_float_fast()
      * the ucomisd operand-SWAP trick - an unordered compare sets CF and
      * ZF, so the un-swapped `seta`/`setae` forms would answer TRUE for
      * two of the four. A NaN divisor is NOT +-0.0, so it divides. */
-    if (!run("nan compares", { "var dyn a = dynarray([nan, nan, nan, nan]);",
+    if (!run("nan compares", {
+            "var dyn a = cast<array<dyn>>([nan, nan, nan, nan]);",
                "var dyn t = 0; var dyn q = 0.0;",
                "for (var r = 0; r < 5; r++)",
                "    foreach (var e in a) {",
@@ -34114,7 +34269,8 @@ static bool jit_boxed_float_fast()
      * THAT is caught by the pre-existing `var dyn d = runtime(2.5); var
      * dyn r = 3 + d;` test (watched failing). Kept here for the exactness
      * claim, not as the sabotage net. */
-    if (!run("mixed decline", { "var dyn a = dynarray([1, 2.5, 3, 4.5]);",
+    if (!run("mixed decline", {
+            "var dyn a = cast<array<dyn>>([1, 2.5, 3, 4.5]);",
                "var dyn s = 0.0; var dyn k = 0;",
                "for (var r = 0; r < 5; r++)",
                "    foreach (var e in a) { s = s + e; k = k + 3; }",
@@ -34614,9 +34770,17 @@ static bool myv_round_trip()
         "struct K { const LT = pure func(a, b) => a < b;",
         "           const T = [sqk]; }",
         "var ks = [3, 1, 2];",
+        /* v45: the casts' types pool (Chunk::cast_types), one of each
+         * kind the loader validates (annot_complete) */
+        "var c1 = cast<array<float>>(runtime([1, 2]));",
+        "var c2 = cast<dict<str, int>>(runtime({\"a\": 1}));",
+        "var c3 = cast<box<P>>(runtime(box(P(1, 2))));",
+        "var c4 = cast<P>(runtime(P(3, 4)));",
+        "var c5 = cast<str?>(runtime(none));",
         "print(s, t, d[\"a\"], d[\"b\"], tbl[1], len(pts),",
         "      edge(runtime(3), runtime(1.5)), nn(runtime(12)), st2[0],",
-        "      sort(ks, K.LT)[0], K.T[0](runtime(4)));" };
+        "      sort(ks, K.LT)[0], K.T[0](runtime(4)), c1, c2, (*c3).y, c4.x,",
+        "      c5);" };
 
     std::string src;
     std::vector<Tok> toks;
@@ -37109,7 +37273,10 @@ static bool untyped_run_misfit_reads()
             "    for (var i = 0; i < 2; i++) t += a[i] * 2;",
             "    return t;",
             "}",
-            "f(dynarray([1, 2]));" }, 38, 4, 43, 4 },
+            "f(ug([1, 2]));",
+            /* an UNTYPED general array (what only `dyn` reaches) */
+            "func ug(dyn a) { array<dyn> h = [[none]]; var dyn r = h[0];",
+            "    pop(r); foreach (e in a) append(r, e); return r; }" }, 38, 4, 43, 4 },
         { "dict read",
           { "func g(dict<str, float> d) {",
             "    var dyn x = d; x[\"a\"] = \"s\";",
@@ -37128,8 +37295,11 @@ static bool untyped_run_misfit_reads()
             "    return t;",
             "}",
             /* rows only `dyn` reaches: untyped, and general */
-            "array<dyn> hh = [[dynarray([1, 2]), dynarray([3, 4])]];",
-            "f(hh[0]);" }, 38, 4, 46, 4 },
+            "array<dyn> hh = [[ug([1, 2]), ug([3, 4])]];",
+            "f(hh[0]);",
+            /* an UNTYPED general array (what only `dyn` reaches) */
+            "func ug(dyn a) { array<dyn> h = [[none]]; var dyn r = h[0];",
+            "    pop(r); foreach (e in a) append(r, e); return r; }" }, 38, 4, 46, 4 },
         { "bool foreach",
           { "func f(array<bool> a) {",
             "    var dyn x = a; x[1] = \"s\";",
@@ -37137,7 +37307,10 @@ static bool untyped_run_misfit_reads()
             "    foreach (var v in a) { if (v) n++; }",
             "    return n;",
             "}",
-            "f(dynarray([true, false]));" }, 23, 4, 25, 4 },
+            "f(ug([true, false]));",
+            /* an UNTYPED general array (what only `dyn` reaches) */
+            "func ug(dyn a) { array<dyn> h = [[none]]; var dyn r = h[0];",
+            "    pop(r); foreach (e in a) append(r, e); return r; }" }, 23, 4, 25, 4 },
         { "float foreach",
           { "func f(array<float> a) {",
             "    var dyn x = a; x[1] = \"s\";",
@@ -37145,7 +37318,10 @@ static bool untyped_run_misfit_reads()
             "    foreach (var v in a) t += v;",
             "    return t;",
             "}",
-            "f(dynarray([1.5, 2.5]));" }, 23, 4, 25, 4 },
+            "f(ug([1.5, 2.5]));",
+            /* an UNTYPED general array (what only `dyn` reaches) */
+            "func ug(dyn a) { array<dyn> h = [[none]]; var dyn r = h[0];",
+            "    pop(r); foreach (e in a) append(r, e); return r; }" }, 23, 4, 25, 4 },
         { "box `*`",
           { "func f(box<int> b) { return *b + 1; }",
             "func h(array<box<int>> bs) { var dyn d = bs; "
@@ -37386,6 +37562,119 @@ static bool myv_ctype_refused()
         std::remove(path.c_str());
     } catch (Exception &e) {
         fprintf(stderr, "myv_ctype_refused: %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
+ * v45: a cast's type is COMPLETE - no bare `array` / `dict` and no missing
+ * component (the parser refuses one), and a struct type names its struct.
+ * An image whose cast_types pool holds anything else is corrupt; each way
+ * a type can be incomplete is refused by name, and the intact image loads.
+ */
+static bool myv_cast_type_refused()
+{
+    const char *lines_arr[] = {
+        "struct P { int x; }",
+        "var dyn v = [runtime(1), 2];",
+        "var dyn w = {\"k\": runtime(1)};",
+        "var dyn q = P(runtime(3));",
+        "var a = cast<array<int>>(v);",
+        "var d = cast<dict<str, int>>(w);",
+        "var p = cast<P>(q);",
+        "var b = cast<box<P>>(box(q));",
+        "print(a, d, p.x, (*b).x);" };
+    std::string src;
+    for (const char *l : lines_arr) { src += l; src += '\n'; }
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        Chunk &ck = prog.root;
+        if (ck.cast_types.size() < 4) {
+            fprintf(stderr, "myv_cast_type_refused: %zu cast types, "
+                    "expected 4\n", ck.cast_types.size());
+            g_exec_engine = saved;
+            return false;
+        }
+
+        const auto mk = [](DeclType k) {
+            auto a = std::make_shared<TypeAnnot>();
+            a->kind = k;
+            return a;
+        };
+        struct Bad { const char *what; std::shared_ptr<TypeAnnot> a; };
+        std::vector<Bad> bad;
+        bad.push_back({ "no type", nullptr });
+        bad.push_back({ "a bare none", mk(DeclType::none) });
+        auto arr0 = mk(DeclType::arr);
+        bad.push_back({ "array, no element", arr0 });
+        auto arr1 = mk(DeclType::arr);
+        arr1->elem = mk(DeclType::none);
+        bad.push_back({ "array of an incomplete element", arr1 });
+        bad.push_back({ "box, no element", mk(DeclType::box) });
+        auto d0 = mk(DeclType::dict);
+        d0->val = mk(DeclType::i);
+        bad.push_back({ "dict, no key", d0 });
+        auto d1 = mk(DeclType::dict);
+        d1->key = mk(DeclType::s);
+        bad.push_back({ "dict, no value", d1 });
+        auto d2 = mk(DeclType::dict);
+        d2->key = mk(DeclType::none);
+        d2->val = mk(DeclType::i);
+        bad.push_back({ "dict, incomplete key", d2 });
+        auto d3 = mk(DeclType::dict);
+        d3->key = mk(DeclType::s);
+        d3->val = arr0;
+        bad.push_back({ "dict, incomplete value", d3 });
+        bad.push_back({ "a struct with no struct", mk(DeclType::strct) });
+
+        std::string tdir = "/tmp";
+        for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+            const std::optional<std::string> e = env_get(var);
+            if (e && !e->empty()) { tdir = *e; break; }
+        }
+        while (tdir.size() > 1
+               && (tdir.back() == '/' || tdir.back() == '\\'))
+            tdir.pop_back();
+        const std::string path = tdir + "/mylang-myv-cast-type.myv";
+        const TypeAnnot *t0 = ck.cast_types[0];
+        for (const Bad &b : bad) {
+            ck.cast_types[0] = b.a ? annot_intern(*b.a) : nullptr;
+            myv_write(prog, path, MyvSourceRef());
+            try {
+                MyvSource img_src;
+                VmProgram loaded = myv_read(path, img_src);
+                fprintf(stderr, "myv_cast_type_refused [%s]: ACCEPTED\n",
+                        b.what);
+                ok = false;
+            } catch (Exception &e) {
+                if (std::string(e.name) != "MyvError" || !e.msg
+                        || !strstr(e.msg, "(cast type)")) {
+                    fprintf(stderr, "myv_cast_type_refused [%s]: threw "
+                            "%s: %s\n", b.what, e.name, e.msg ? e.msg : "");
+                    ok = false;
+                }
+            }
+        }
+        ck.cast_types[0] = t0;
+        myv_write(prog, path, MyvSourceRef());       /* intact: loads */
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        std::remove(path.c_str());
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_cast_type_refused: %s: %s\n", e.name,
                 e.msg ? e.msg : "");
         ok = false;
     }
@@ -38856,8 +39145,9 @@ static bool disasm_opcode_families()
         "    var bb = bs[0];",
         "    append(aa[0], 5);",
         "    var m = map(f, [1, 2]);",
+        "    var cf = cast<array<float>>(dv);",
         "    return [len(v), p.x, dp.x, dv[0], a3[1][0][1], n, c, bb,",
-        "            len(aa[0]), m];",
+        "            len(aa[0]), m, cf[1]];",
         "}",
         "print(more(runtime([5]), runtime(func(x) => x + 1), \"abc\",",
         "           [true, false]));"
@@ -38870,7 +39160,7 @@ static bool disasm_opcode_families()
     const std::string want =
         "4.666667 6 101 1102 2 \n12 9 2 \n9.500000 \n18 \n"
         "6 5 [true, true, <none>] \n2 true 2 10 \np \n"
-        "[1, 3, 2, 2, 5, 23, \"b\", true, 2, [2, 3]] \n";
+        "[1, 3, 2, 2, 5, 23, \"b\", true, 2, [2, 3], 2.000000] \n";
     bool ok = true;
     const std::string got = myv_test_stdout(src, nullptr);
     if (got != want) {
@@ -38906,7 +39196,7 @@ static bool disasm_opcode_families()
                  " defined.g ", " decl.const ", " store.cap ",
                  " load.capture ", " make.closure ", " call.val.dyn ",
                  " store.box ", " load.box ", " jmp.ifnotel ",
-                 " coerce.num " })
+                 " coerce.num ", " cast " })
             if (dump.find(need) == std::string::npos) {
                 fprintf(stderr, "disasm-families: -vd has no '%s':\n%s\n",
                         need, dump.c_str());
@@ -43438,6 +43728,10 @@ static bool opcode_table_census()
         { OpCode::StampTypeV,            1,1,1,0,0,0,
           "Q2: d1 - never throws; b0 - a body holding one is not pasted "
           "(its ctypes ref names the callee's pool)" },
+        { OpCode::CastV,                 1,1,1,0,0,0,
+          "cast<T>(x): d1 - a refusal CONVEYS, stamped with the "
+          "argument's caret; b0 - a body holding one is not pasted (its "
+          "cast_types index names the callee's pool)" },
     };
     const size_t nrows = sizeof(rows) / sizeof(rows[0]);
     const Chunk ck;      /* empty - census_instr never makes a shape
@@ -49231,7 +49525,7 @@ static bool jit_lsra_bridge_check()
      * only here. */
     const unsigned long ftr0 = g_jit_lsra_ftrans;
     if (!run({
-            "var av = dynarray([\"3\"]);",
+            "var av = cast<array<dyn>>([\"3\"]);",
             "var scale = 1;",
             "if (len(av) > 0)",
             "    scale = int(av[0]);",
@@ -52752,7 +53046,7 @@ static bool jit_flit_c4b()
      * jit_put_float takes its value in xmm0 - so the ref-listed float
      * store must move it there first. This shape executes exactly that
      * combination: a REFERENCE lives in the temp that the chain's
-     * `x / (x + 1.0)` writes (dynarray() sources it from a builtin, so
+     * `x / (x + 1.0)` writes (cast<array<dyn>>() sources it from a builtin, so
      * unlike a local-bound array it does not shift the temp numbering),
      * and that op's operand b is FORWARDED, so its result lands in
      * xmm1. Without the move the store writes a stale xmm0.
@@ -52779,12 +53073,12 @@ static bool jit_flit_c4b()
     const unsigned long m0 = g_jit_fstore_movx0;
     const std::string resreg = go({
         "var scale = 1;",
-        "if (len(dynarray([\"1\"])) > 0)",
-        "    scale = int(dynarray([\"1\"])[0]);",
+        "if (len(cast<array<dyn>>([\"1\"])) > 0)",
+        "    scale = int(cast<array<dyn>>([\"1\"])[0]);",
         "var N = 400 * scale;",
         "var total = 0.0;",
         "for (var i = 1; i < N; i++) {",
-        "    var tag = dynarray([\"t\"]);",
+        "    var tag = cast<array<dyn>>([\"t\"]);",
         "    var x = i * 1.0;",
         "    total += x / (x + 1.0) - 0.5 / x + 1.0 / (x * x);",
         "}",
@@ -56998,7 +57292,7 @@ static bool jit_release_c5()
     }
 
     /*
-     * THE REFUSAL, and it is the interesting direction. `dynarray(..)`
+     * THE REFUSAL, and it is the interesting direction. `cast<array<dyn>>(..)`
      * writes a REFERENCE into a temp on every iteration, so for whatever
      * temp it lands in the released-therefore-trivial invariant is false
      * and the release must not happen for it. The value check is what
@@ -57010,7 +57304,7 @@ static bool jit_release_c5()
             "var n = int(av[0]);",
             "var s = 0;",
             "for (var i = 0; i < n; i++) {",
-            "    var t = dynarray([i, i + 1, i + 2]);",
+            "    var t = cast<array<dyn>>([i, i + 1, i + 2]);",
             "    s += t[0] + t[2];",
             "}",
             "assert(s == 20);",
@@ -61683,6 +61977,9 @@ static const std::vector<extra_check> extra_checks =
     { "myv: v43 - a container type no container can have (opt, another "
       "kind) is a corrupt image, refused by every reader",
       myv_ctype_refused },
+    { "myv: v45 - a cast's type with a missing or bare component (or a "
+      "struct type naming no struct) is a corrupt image, refused by every "
+      "reader", myv_cast_type_refused },
     { "Q2: a typed read of a misfit laundered through dyn, in a run that "
       "types no container (an untyped image): every engine refuses it at "
       "the read's caret", untyped_run_misfit_reads },

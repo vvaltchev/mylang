@@ -2256,6 +2256,79 @@ pRefuseUnassignable(const Construct *lv, const char *what)
     throw e;
 }
 
+/* Is `t` incomplete anywhere - a bare `array` / `dict` (a HOLE a
+ * declaration fills, which a cast cannot: its type is what it makes)? */
+static bool annot_has_hole(const TypeAnnot *t)
+{
+    if (!t)
+        return false;
+    if (t->kind == DeclType::arr && !t->elem)
+        return true;
+    if (t->kind == DeclType::dict && !t->key)
+        return true;
+    return annot_has_hole(t->elem.get()) || annot_has_hole(t->key.get())
+           || annot_has_hole(t->val.get());
+}
+
+/*
+ * `cast<T>(x)` (plans/cast.md), `cast` consumed. A constant `x` is cast
+ * at compile time, so a refusal is a compile error; the cast then folds
+ * where a call with constant arguments folds - after inference (#96),
+ * which keeps the node when its literal's type is not T's (`cast<dyn>(5)`
+ * is a dyn, its value an int).
+ */
+static unique_ptr<Construct>
+pCastExpr(ParseContext &c, unsigned fl, Loc start)
+{
+    if (!pAcceptOp(c, Op::lt))
+        throw SyntaxErrorEx(c.get_loc(), "expected '<' after 'cast': "
+                            "cast<TYPE>(value)", &c.get_tok());
+    const Loc tloc = c.get_loc();
+    std::shared_ptr<TypeAnnot> t = pTypeAnnot(c);
+    if (!pAcceptCloseAngle(c))
+        throw SyntaxErrorEx(c.get_loc(),
+            "expected '>' to close 'cast<...>'", &c.get_tok());
+    if (c.pending_gt) {
+        c.pending_gt = 0;
+        throw SyntaxErrorEx(c.get_loc(), "unexpected '>' after "
+                            "'cast<...>'", &c.get_tok());
+    }
+    if (annot_has_hole(t.get()))
+        throw SyntaxErrorEx(tloc, intern_msg(
+            "a cast needs a complete type: write array<T> / dict<K, V>, "
+            "not a bare array / dict"));
+    if (!pAcceptOp(c, Op::parenL))
+        throw SyntaxErrorEx(c.get_loc(), "expected '(' after 'cast<...>'",
+                            &c.get_tok());
+
+    auto node = make_unique<CastExpr>();
+    node->start = start;
+    node->to = annot_intern(*t);
+    {
+        NestGuard ng(c);                    /* #98: the operand nests */
+        node->elem = pExpr14(c, fl & ~pFlags::pInDecl);
+    }
+    if (!node->elem)
+        noExprError(c);
+    node->end = c.get_loc() + 2;            /* through the ')' */
+    pExpectOp(c, Op::parenR);
+
+    /* as a call with constant arguments (pAcceptCallExpr) */
+    const bool in_const = (fl & pFlags::pInConstDecl) != 0;
+    node->is_const = node->elem->is_const;
+    if (node->is_const && !c.folding())
+        nc_eval_const(c, node.get(), in_const, in_const);
+    if (node->is_const && pDefersFolds(c, fl)) {
+        pDeferFold(c, node.get(), false, false);
+    } else if (c.folding() && node->is_const) {
+        unique_ptr<Construct> lit;
+        cse_materialize(c, node.get(), lit, in_const, in_const);
+        if (lit)
+            return lit;
+    }
+    return node;
+}
+
 unique_ptr<Construct>
 pExpr01(ParseContext &c, unsigned fl)
 {
@@ -2310,6 +2383,10 @@ pExpr01(ParseContext &c, unsigned fl)
         main->start = start;            /* the '{' */
         main->end = c.get_loc() + 2;    /* span through the '}' */
         pExpectOp(c, Op::braceR);
+
+    } else if (pAcceptKeyword(c, Keyword::kw_cast)) {
+
+        main = pCastExpr(c, fl, start);
 
     } else if (pAcceptId(c, main)) {
 

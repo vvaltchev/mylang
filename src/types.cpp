@@ -91,6 +91,7 @@ std::string runtime_type_name(const EvalValue &v)
 }
 
 #include "types/fit.cpp.h"
+#include "types/cast.cpp.h"
 
 EvalValue builtin_exit(EvalContext *ctx, const ArgLocs *exprList,
                        const EvalValue *args, size_t n)
@@ -857,9 +858,6 @@ EvalContext::SymbolsType EvalContext::builtins =
     make_builtin_v<builtin_trace>("trace"),
     make_builtin_v<builtin_traceoff>("traceoff"),
     make_builtin_v<builtin_tracing>("tracing"),
-    /* dynarray(a): manual promotion - a fresh general (polymorphic) copy of an
-     * array. Non-const (fresh mutable value). See builtin_dynarray. */
-    make_builtin_v<ctyped_v<builtin_dynarray>>("dynarray"),
     /* array() is non-const: it never folds to a baked literal, so array(N) is
      * always a runtime call (uniform const/runtime type-driven fill) and a huge
      * array(1000000) isn't baked into the AST. */

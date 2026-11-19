@@ -176,6 +176,8 @@ def chunk(r):
         annot(r); r.u8(); r.uid()                           # (v37)
     for _ in range(r.u32()):                                # 9.11b ctypes
         assert ctype(r) is not None, 'an absent ctypes entry'  # (v43)
+    for _ in range(r.u32()):                                # 9.11c cast_types
+        assert annot(r) is not None, 'an absent cast type'  # (v45)
     for _ in range(r.u32()):                                # 9.12 emplace
         r.sref(); r.uid(); r.loc(); r.loc(); r.arglocs()
         r.boolv()                                           # v43: ct_store

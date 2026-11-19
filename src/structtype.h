@@ -77,6 +77,9 @@ const TypeAnnot *annot_array_of_struct(const StructTypeDef *d);
 const TypeAnnot *annot_str_array();
 /* how a type reads in a message ("array<int>"); "untyped" for null */
 std::string annot_text(const TypeAnnot *a);
+/* ...written as a TYPE (`int?`, `array<int>?`), where annot_text writes
+ * a declaration's form (`opt int`); `a` is never null */
+std::string annot_type_text(const TypeAnnot *a);
 
 /*
  * #49: a value entering a place whose type is fixed - a parameter, a

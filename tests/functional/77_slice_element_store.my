@@ -8,18 +8,18 @@
 #     died), the detach freed the element being stored through, and the
 #     store went on reading it (a use-after-free in every engine).
 
-# general (boxed) arrays: dynarray() keeps them general
-var a = dynarray([1, 2, 3]);
+# general (boxed) arrays: cast<array<dyn>>() keeps them general
+var a = cast<array<dyn>>([1, 2, 3]);
 var s = a[0:2];
 for (var i = 0; i < 20; i++) { s[i % 2] += 1; }
 assert(a[0] == 1 && a[1] == 2 && s[0] == 11 && s[1] == 12);
 
-var b = dynarray([1, 2, 3]);
+var b = cast<array<dyn>>([1, 2, 3]);
 var t = b[0:2];
 for (var i = 0; i < 20; i++) { t[i % 2] = t[i % 2] + 1; }
 assert(b[0] == 1 && b[1] == 2 && t[0] == 11 && t[1] == 12);
 
-var c = dynarray([1, 2, 3]);
+var c = cast<array<dyn>>([1, 2, 3]);
 var u = c[1:3];
 u[0] *= 5;
 u[1] -= 1;
@@ -36,7 +36,7 @@ for (var k = 0; k < 10; k++) {
 }
 assert(total == 70);
 
-func mk2() { var big = dynarray([10, 20, 30]); return big[1:3]; }
+func mk2() { var big = cast<array<dyn>>([10, 20, 30]); return big[1:3]; }
 var w = mk2();
 w[0] += 1;
 w[1] = w[1] * 2;
