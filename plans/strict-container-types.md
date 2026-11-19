@@ -3,7 +3,7 @@
 **Status: rules decided by the maintainer (2026-11-18/19), nothing built
 yet.** This replaces question 7 of `typed-containers.md` (7.1 and 7.2)
 and tightens its decision A. Two points are still open (section 3).
-The cast is designed in section 5 once agreed; it is built FIRST, so
+The cast is designed in `cast.md` (section 5); it is built FIRST, so
 the strict rule never needs a hand-written conversion loop.
 
 ## 1. The goal
@@ -130,7 +130,8 @@ array<str> ss = ["a"];
 
 ## 5. The cast
 
-To be written here once its design is agreed (syntax `cast<T>(x)`).
+Decided 2026-11-19: `plans/cast.md` (syntax, the conversion table, the
+words `str` -> `bool` accepts, containers, failures, implementation).
 
 ## 6. Order
 
