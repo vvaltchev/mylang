@@ -3,7 +3,9 @@
 **Status: decided by the maintainer (2026-11-16): the rule, the
 empty-container rule (question 9, carried to run time) and A for a
 container entering a typed place (section 3). Increments 1 and 2
-built (sections 6 and 8); two follow-on questions open (section 7).**
+built (sections 6 and 8). Section 7's two questions are DECIDED
+(2026-11-18/19) and replaced by `strict-container-types.md`, which also
+tightens decision A.**
 
 ## 1. The rule
 
@@ -181,6 +183,12 @@ before any type exists, and two constants may share one baked value.
   not is a stdout difference.
 
 ## 7. Questions this raised (for the maintainer)
+
+**DECIDED (2026-11-18/19): both are superseded by
+`strict-container-types.md`.** No implicit conversion between two
+container types, in either direction (7.1 is refused); `array<dyn>` is a
+fixed type, not a view of any array. 7.2's join is still open there.
+The recommendations below are kept as the record of what was proposed.
 
 1. **`array<int>` into `array<dyn>`.** `array<int> b = [1]; array<dyn>
    a = b;` compiles today. Recommendation: keep it, and check every
