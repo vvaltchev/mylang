@@ -1680,12 +1680,20 @@ slot = "now a string";           # ok, because it's dyn
     nullable), `dyn x` (dynamic, non-null), `opt dyn x` (dynamic, nullable). So
     `dyn` opts out of *type* checking but **not** null-safety — passing `none`
     to a non-`opt` `dyn` parameter is still a compile error asking for
-    `opt dyn`.
+    `opt dyn`. The same holds for a `dyn` **variable, element and field**:
+    `dyn a = none;`, a later `a = none`, and giving one anything that may be
+    `none` (a `T?`, a `dyn?`, a function that may return nothing,
+    `runtime(none)`) are compile errors (`NullabilityEx`), as `int a = none`
+    is - a `dyn` never widens to `dyn?` because `none` reached it. So does a
+    `none` stored into an `array<dyn>`, a `dict<K, dyn>` or a struct's `dyn`
+    field. `dyn x;` with no value is refused: a `dyn` has no zero value
+    (`dyn? x;` starts as `none`). `runtime(x)` keeps its argument's
+    nullability: `runtime(1)` is a `dyn`, `runtime(none)` a `dyn?`.
 
     **A `none` the compiler cannot see is refused at the call.** A `dyn`
     value is non-opt by type, yet at run time it may hold `none` — read from
-    a `dyn` container, returned by `runtime(none)`, or passed through a
-    `dyn` callee the compiler cannot check against. Whatever the path, a
+    a `dyn` container (`var dyn n = runtime([none])[0];`), or passed through
+    a `dyn` callee the compiler cannot check against. Whatever the path, a
     parameter that is not `opt` never holds `none`: binding one raises a
     `TypeErrorEx` naming the parameter (`parameter 'x' is not 'opt' and
     cannot be none`), at the call, before the function's body runs. Every
@@ -1781,9 +1789,11 @@ slot = "now a string";           # ok, because it's dyn
     and converts each element it appends against `a`'s type, however
     `a` was reached. A container made where `dyn` is declared
     (`var dyn d = [1, 2]`, an element of an `array<dyn>`) is dynamic:
-    its type refuses nothing; neither does one whose type nothing gave
-    it (`[]` that nothing filled, or one written where only a `dyn` was
-    known). Its STORAGE still holds only what it can (*Flat arrays*): a
+    its type refuses nothing - it is an `array<dyn?>` (a
+    `dict<dyn?, dyn?>`), since a `dyn` element is never `none` - and
+    neither does one whose type nothing gave it (`[]` that nothing
+    filled, or one written where only a `dyn` was known). Its STORAGE
+    still holds only what it can (*Flat arrays*): a
     literal nested in a `dyn` element and an array sum are built from
     their own values, so `var dyn s = [1, 2] + [3];` is flat int
     storage, which widens a `bool` and refuses a string.
@@ -1796,10 +1806,10 @@ slot = "now a string";           # ok, because it's dyn
 
     ```
     func takes(array<int> a) => len(a);
-    var dyn d = [1, 2];           # an array<dyn>
+    var dyn d = [1, 2];           # an array<dyn?>
     takes(d);                     # TypeErrorEx: parameter 'a' is declared
                                   # 'array<int>' but the argument is an
-                                  # 'array<dyn>'
+                                  # 'array<dyn?>'
     ```
 
     A part of the place's type that is `dyn` takes anything, since a
@@ -1808,7 +1818,10 @@ slot = "now a string";           # ok, because it's dyn
     enters an `array<dyn>` parameter (and a store of a string through it
     is refused), but not an `array<int?>` one, which would let a `none`
     in, and an `array<array<int>>` does not enter an
-    `array<array<dyn>>`, whose elements take any array. A container that
+    `array<array<dyn>>`, whose elements take any array. A `dyn` part
+    takes no part that may be `none`: an `array<dyn?>` - a dynamic
+    container too - does not enter an `array<dyn>` (convert it with
+    `cast<array<dyn>>(d)`, which refuses a `none`). A container that
     carries no type - one only a `dyn` reaches, such as an element of an
     `array<dyn>` - is checked by what it holds and then TAKES the
     place's type, so the place's type stays true however the container

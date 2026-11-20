@@ -24776,9 +24776,10 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
             decl_ne(JD_storev_has_slices);
             /* Q2: a CHECKED store (through `dyn`, Instr::ct_checked)
              * stays here only for an array that takes anything - one
-             * with no type of its own, or the dynamic array<dyn> (one
-             * interned pointer); any other type is the helper's, which
-             * checks the value against it */
+             * with no type of its own, or the dynamic array<dyn?> (one
+             * interned pointer) - or for the fixed array<dyn> with a
+             * value that is not none (rule 3); any other type is the
+             * helper's, which checks the value against it */
             if (in.ct_checked()) {
                 e.load_base(s2, s1, L.ctype_off);
                 e.test_rr(s2, s2);
@@ -24786,8 +24787,17 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
                 e.movabs(acc.r, reinterpret_cast<uint64_t>(
                                     annot_dyn_array()));
                 e.cmp_rr(s2, acc.r);
+                const size_t ct_dyn = e.j8(0x74);       /* je: dynamic */
+                e.movabs(acc.r, reinterpret_cast<uint64_t>(
+                                    annot_array_of_dyn()));
+                e.cmp_rr(s2, acc.r);
                 decl_ne(JD_storev_ctype);
+                e.load(s2, src.type);
+                e.load32_base(s2, s2, L.type_t_off);
+                e.cmp_reg32_imm32(s2, static_cast<uint32_t>(L.t_none_val));
+                decline_jump(e, sv_slows, 0x74, JD_storev_ctype);
                 e.patch8(ct_any, e.pos());
+                e.patch8(ct_dyn, e.pos());
             }
             /* THE VALUE GATES - the two reference kinds the raw copy
              * cannot carry (a vtable'd pointee has no refcount at +0;

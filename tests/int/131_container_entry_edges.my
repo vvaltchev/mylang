@@ -55,7 +55,7 @@ try_enter("same", pi, ai);
 func an(array<int>? a) { return a == none ? "none" : typestr(a); }
 func dn(dict<str, int>? d) { return d == none ? "none" : typestr(d); }
 const K = [1, 2];
-var dyn dnone = runtime(none);
+var dyn? dnone = runtime(none);
 note(an(dnone));
 note(dn(dnone));
 var dyn dk = K;

@@ -58,6 +58,6 @@ print("independ ", tot);
 struct Box { dyn? fn; }
 var b = Box(none);
 b.fn = mk(11);
-var dyn bf = b.fn;
+var dyn? bf = b.fn;
 if (bf == none) { print("boxed    none"); }
 else { print("boxed    ", bf(1)); }

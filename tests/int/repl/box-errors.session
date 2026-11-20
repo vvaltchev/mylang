@@ -79,7 +79,7 @@ var dyn dp = box(P(1, 2.0))
 *dp = Q("a", [])
 *dp = 5
 *dp += 1
-var dyn dn = runtime(none)
+var dyn dn = runtime([none])[0]
 *dn
 *sb = dn
 *dp = dn

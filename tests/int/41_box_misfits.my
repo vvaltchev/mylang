@@ -61,7 +61,7 @@ var dyn d_q = box(Q(s: rs("q"), xs: [1]));
 var dyn d_pval = P(x: ri(3), y: 4.0);       # a struct VALUE, not a box
 var dyn d_c = C(n: ri(5));                  # a class instance
 var dyn d_n = ri(7);
-var dyn d_none = runtime(none);
+var dyn d_none = runtime([none])[0];        # read through dyn
 var dyn d_arr = runtime([1, 2]);
 var launder = [d_int, d_flt, d_bool, d_str, d_p, d_q, d_pval, d_c, d_n,
                d_none, d_arr];
