@@ -984,34 +984,6 @@ static bool bake_untypable(ParseContext &c, const Construct *node,
     return false;
 }
 
-/* The storage a parsed `array<...>` annotation gives an array - the
- * inferencer's array_repr_hint, read off the annotation (a typed const is
- * bound, and a pure function may run, before inference): dflt keeps a
- * value's own (array<str>, a generic `array`); `sd` the POD struct a
- * flat_s array needs */
-static ArrHint annot_arr_hint(const TypeAnnot *a, const StructTypeDef *&sd)
-{
-    sd = nullptr;
-    const TypeAnnot *e = a ? a->elem.get() : nullptr;
-    const StructTypeDef *esd =
-        e && e->kind == DeclType::strct ? e->strct : nullptr;
-    if (!e || (!e->opt && e->kind == DeclType::s))
-        return ArrHint::dflt;
-    if (!e->opt && e->kind == DeclType::i)
-        return ArrHint::flat_i;
-    if (!e->opt && e->kind == DeclType::f)
-        return ArrHint::flat_f;
-    if (!e->opt && e->kind == DeclType::b)
-        return ArrHint::flat_b;
-    if (!e->opt && esd && esd->is_pod()) {
-        sd = esd;
-        return ArrHint::flat_s;
-    }
-    if (esd && esd->is_class)
-        return ArrHint::flat_c;
-    return ArrHint::general;
-}
-
 /* The numeric widening an element of annotated type `e` gets
  * (LiteralArray::elem_coerce, the inferencer's stamp_literal_coerce) */
 static DeclType annot_num(const TypeAnnot *e)

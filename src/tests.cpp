@@ -771,10 +771,11 @@ static const std::vector<test> tests =
         "arrays: a bool WIDENS into int/float storage (store, append, "
         "insert; the int-into-bool narrowing still throws) (#96)",
         {
-            /* the original repro: a[1] += n joins the elements to int,
-             * so storage is flat ints and the bool fills widen to 1 */
+            /* the original repro (its elements are `dyn` - `n` is,
+             * from runtime() - and a `dyn` has no zero value, so
+             * array(8) needs its fill value, choice 6) */
             "func f(n) {",
-            "    var a = array(8); var i = 0;",
+            "    var a = array(8, false); var i = 0;",
             "    while (i < 8) { a[i] = true; i++; }",
             "    a[1] += n;",
             "    return a[0] * 100 + a[1]; }",
@@ -19554,6 +19555,19 @@ static const std::vector<test> tests =
         "var dyn y = f();" }, &typeid(NullabilityEx), 9, 2, 11, 2 },
     { "ti dyn reject: `dyn x;` has no zero value",
       { "dyn x;" }, &typeid(SyntaxErrorEx) },
+    /* choice 6: array(n) fills its element type's zero value, so an
+     * element type with none is refused at the call */
+    { "ti zero reject: array(n) of a non-opt dyn has no zero value",
+      { "array<dyn> x = array(2);" }, &typeid(TypeMismatchEx), 16, 1, 25,
+      1 },
+    { "ti zero reject: array(n) of a struct with a dyn field",
+      { "struct R { dyn f; }",
+        "array<R> r = array(2);" }, &typeid(TypeMismatchEx), 14, 2, 23,
+      2 },
+    { "ti zero accept: array(n) fills zero values, none when nullable",
+      { "array<dyn?> a = array(2); assert(a[0] == none);",
+        "array<str> s = array(2); assert(s[1] == \"\");",
+        "var w = array(2); w[0] = 1.5; assert(w[1] == 0.0);" } },
     { "ti dyn accept: `dyn? x;` starts as none",
       { "dyn? x; assert(x == none); x = 3; assert(x == 3);" } },
     { "ti dyn: runtime() keeps its argument's nullability",

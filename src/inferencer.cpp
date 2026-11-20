@@ -631,6 +631,8 @@ private:
      * (Construct::ctype) - see stamp_ctypes */
     const TypeAnnot *ctype_of(StaticTypeRef t, bool dict);
     void stamp_ctypes(Construct *n, StaticTypeRef dest);
+    /* stamp_ctypes is inside a template's base body */
+    bool stamp_in_tmpl_base = false;
     void stamp_lit_obj_ctype(LiteralObj *lo, StaticTypeRef t);
     /* creation nodes written where `dyn` is declared (set_array_repr_hint) */
     std::unordered_set<const Construct *> ctype_dyn_place;
@@ -4635,10 +4637,34 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
         if (builtin && builtin_builds_container(cid->uid->val)) {
             const StaticTypeRef own = static_type_resolve(type_of(call));
             const bool dict = own->kind == StaticTypeKind::Dict;
-            call->args->ctype = ctype_untyped.count(call) ? nullptr
+            /* choice 6: array(n) is made with its zero values, of the
+             * type of the variable it is assigned to - which it then has
+             * exactly, so it carries that type even where a fit check
+             * would have it take the place's type on entry */
+            const bool zero_fill =
+                cid->uid->val == std::string_view("array")
+                && call->args->elems.size() == 1 && dest;
+            call->args->ctype =
+                ctype_untyped.count(call) && !zero_fill ? nullptr
                 : ctype_dyn_place.count(call)
                     ? (dict ? annot_dyn_dict() : annot_dyn_array())
                     : ctype_of(dest ? dest : own, dict);
+            /* choice 6: array(n) fills its element type's zero value,
+             * so an element type that has none is refused here - but in
+             * a template's base body, which is not checked (its
+             * instances are), it is made untyped and filled with none */
+            const TypeAnnot *ct = call->args->ctype;
+            if (zero_fill && ct && ct->elem
+                    && !annot_zero_value(ct->elem.get(), nullptr)) {
+                if (checks_enabled && !stamp_in_tmpl_base)
+                    mismatch("array(n) fills its elements with their "
+                             "type's zero value, and '"
+                             + annot_type_text(ct->elem.get())
+                             + "' has none: give a fill value, array(n, "
+                             "v), or make the element type nullable",
+                             call->start, call->end);
+                call->args->ctype = nullptr;
+            }
         }
         /* an argument a fit check examines, or one whose parameter's type
          * is unknown here (a call through a function value) */
@@ -4706,6 +4732,19 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
             }
         }
         break;
+    }
+    case ConstructType::func_decl: {
+        /* a template's BASE body is not checked in isolation (its
+         * instances are), so neither is an array(n) in it: its elements
+         * are none there (stamp_in_tmpl_base) */
+        auto it = func_of_decl.find(n);
+        const bool base = it != func_of_decl.end() && it->second
+                          && it->second->is_template;
+        const bool was = stamp_in_tmpl_base;
+        stamp_in_tmpl_base = was || base;
+        for_each_child(n, [&](Construct *c) { stamp_ctypes(c, nullptr); });
+        stamp_in_tmpl_base = was;
+        return;
     }
     default:
         break;

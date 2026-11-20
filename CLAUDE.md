@@ -7240,7 +7240,12 @@ per level of a deep value - a separate open item.
   `d[0]="x"` would wrongly hit the flat-array error on an already-`dyn` var).
   Creators honor it: `range`, `builtin_array` (1-arg `flat_i`/`flat_f`/`flat_b`
   → flat `0`/`0.0`/`false` fill, replacing the old `array(N)` rewrite;
-  `general` → general),
+  `general` → general; any other element type the call's `ctype` names
+  is filled with its ZERO VALUE, a fresh one per element -
+  `annot_zero_value` (types/fit.cpp.h), the run-time twin of the
+  parser's `T x;` zero code, which the inferencer also asks, at the
+  call, to refuse an element type with none: choice 6,
+  plans/strict-container-types.md),
   `make_array`, `keys`/`values` (`dict_extract` — a scalar dict's keys/values
   build a flat `array<int>/<float>/<bool>` straight from the dict, no
   per-element boxing; the big win for `keys()`/`values()` of a large dict, and
