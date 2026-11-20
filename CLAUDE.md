@@ -8520,6 +8520,25 @@ and two macros:
   compiles a node outside those dispatchers must stamp it too, or its
   pooled ops drop the frames. `format_backtrace` is untouched. See
   `plans/archived/function-inlining.md`.
+  **⛔ AN INLINED CALL'S VALUE USED AS AN OPERAND CARETS THE CALL (#68,
+  2026-11-20).** The expression engine's spliced body stands where the
+  call stood, so an error the ENCLOSING operation raises about it - the
+  divisor of a division by zero, the operand of a type error - took the
+  body's span (`100 / sq(x - 2)` careted `x * x` inside sq, and the
+  tree-walker printed `inv(x) at line 1`), and the VM's boxed op, whose
+  node WAS the operand, took the body's inlined-at chain too (an extra
+  `sq(x)` frame). The spliced root now carries its call
+  (`Construct::inline_call`, the splice's `InlineCtx`, which gained
+  `call_end`), and `inline_operand_span` turns the operand's span into
+  the call's at every place an operation carets its operand: the
+  boxed ladder (`num_binop_loc`, `Expr02`), the typed division and
+  modulo, and codegen's recorded caret. A boxed `BinOpV` / `CmpV` /
+  `UnaryV` takes the CHAIN node for its chain and the operand as its
+  loc twin (`loc_node_idx`), as the typed ops already did. Not a chain
+  DEPTH test: the inliner re-tags a substituted argument at every
+  splice, so its chain can be deeper than its parent's without being a
+  call. Pinned by `tests/backtrace/inlined_operand*.my` (both fail on
+  the previous build).
 - **Tests** pin caret spans via the `test` struct's
   `ex_col`/`ex_line`/`ex_col_end`/`ex_line_end` (each checked only when nonzero;
   see the "err loc:" tests in `tests.cpp`); the "backtrace:" `extra_checks`

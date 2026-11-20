@@ -1,0 +1,21 @@
+# #68, the BOXED path: an untyped function run as map's callback divides
+# by an inlined call whose value is 0. The division's op took the
+# divisor's node for its caret AND its inlined-at chain, so the VM
+# careted `x * x` inside sq and added an `sq(x)` frame; -ni carets
+# `sq(x - 2)` in inv.
+func sq(x) { return x * x; }
+func inv(x) { return 100 / sq(x - 2); }
+func pick(x) { return inv(x) > 3; }
+func stage(xs) => len(filter(pick, xs));
+func stage2(xs) => sum(map(inv, xs));
+func drive(n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        array<int> xs = [5, 7, 9];
+        s = s + stage(xs);
+        if (i == n - 1) append(xs, int(runtime(2)));
+        s = s + stage2(xs);
+    }
+    return s;
+}
+print(drive(runtime(3)));

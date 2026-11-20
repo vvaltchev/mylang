@@ -6200,7 +6200,7 @@ private:
          */
         const InlineCtx *ic = alloc_inline_ctx(
             { inline_frame_name(f), param_names(f),
-              ce->start, ce->inline_ctx });
+              ce->start, ce->inline_ctx, ce->end });
 
         unique_ptr<Construct> body = fexpr->clone();
 
@@ -6209,6 +6209,8 @@ private:
                        ce->args->elems[i].get());
 
         tag_inline(body.get(), ic);
+        /* #68: the body's root stands where the call stood */
+        body->inline_call = ic;
 
         if (analysis)
             analysis->mark(callee->start,
@@ -6585,7 +6587,7 @@ private:
 
         const InlineCtx *ic = alloc_inline_ctx(
             { inline_frame_name(f), param_names(f),
-              ce->start, ce->inline_ctx });
+              ce->start, ce->inline_ctx, ce->end });
 
         /* If the spliced body is a temp-free guard chain, emit an EXPRESSIBLE
          * ternary instead of an InlinedCall(Block(...return...)). The ternary is
@@ -6842,7 +6844,7 @@ private:
 
         const InlineCtx *ic = alloc_inline_ctx(
             { inline_frame_name(f), param_names(f),
-              ce->start, ce->inline_ctx });
+              ce->start, ce->inline_ctx, ce->end });
         tag_inline(spliced.get(), ic);
 
         if (analysis)
@@ -7678,7 +7680,8 @@ private:
             return root;
         return alloc_inline_ctx({ chain->callee_name, chain->params,
                                   chain->call_site,
-                                  rebase(chain->parent, root) });
+                                  rebase(chain->parent, root),
+                                  chain->call_end });
     }
 
     static void tag_inline(Construct *c, const InlineCtx *ic)

@@ -21016,8 +21016,8 @@ backtrace_inline_frames()
 
     /* (1) error inside g, inlined into f (both virtual). Empty bt -> flush. */
     {
-        InlineCtx f_ctx{ "f", { "b" }, Loc(30, 1), nullptr };
-        InlineCtx g_ctx{ "g", { "a" }, Loc(12, 1), &f_ctx };
+        InlineCtx f_ctx{ "f", { "b" }, Loc(30, 1), nullptr, Loc() };
+        InlineCtx g_ctx{ "g", { "a" }, Loc(12, 1), &f_ctx, Loc() };
 
         DivisionByZeroEx ex;
         ex.loc_start = Loc(5, 1);
@@ -21036,7 +21036,7 @@ backtrace_inline_frames()
 
     /* (2) physical frame P called from inlined g: push P, then flush g. */
     {
-        InlineCtx g_ctx{ "g", { "a" }, Loc(15, 1), nullptr };
+        InlineCtx g_ctx{ "g", { "a" }, Loc(15, 1), nullptr, Loc() };
 
         DivisionByZeroEx ex;
         ex.loc_start = Loc(5, 1);

@@ -108,7 +108,31 @@ struct InlineCtx {
     std::vector<std::string> params;
     Loc call_site;
     const InlineCtx *parent = nullptr;
+    /* where the call ENDS (call_site is where it starts): the call's whole
+     * span, which an error the CALLER's operation raises about the call's
+     * value carets (inline_operand_span). Compile-time only: a chunk's
+     * inline_frames store the start alone. */
+    Loc call_end;
 };
+
+/*
+ * #68: the span an error that a PARENT operation raises about one of its
+ * operands carets - the operand as written at the parent's level (the
+ * divisor of a division by zero, the operand of a type error). When the
+ * operand is the root of an inlined call's body, `call` is that call
+ * (Construct::inline_call) and the span is the CALL's: `100 / sq(x - 2)`
+ * with sq inlined carets `sq(x - 2)`, as with -ni, where it careted
+ * `x * x` inside sq. [s, e) holds the operand's own span on entry and is
+ * replaced only then. The one site that sets inline_call (the expression
+ * engine) passes a parsed call's span, so both ends are always set.
+ */
+inline void inline_operand_span(const InlineCtx *call, Loc &s, Loc &e)
+{
+    if (call) {
+        s = call->call_site;
+        e = call->call_end;
+    }
+}
 
 struct Exception {
 

@@ -1,0 +1,16 @@
+# #68: an inlined expression-bodied call used as an OPERAND - here the
+# divisor of a division by zero - carets the CALL, in its caller, as
+# -ni does. The spliced body (`x * x`) stood where the call stood and
+# lent the division its own span (the tree-walker said `inv(x) at line
+# 1`), and the VM its inlined-at chain too (an extra `sq(x)` frame).
+# The typed path; inlined_operand_boxed.my is the boxed one.
+func sq(x) { return x * x; }
+func inv(int x) { return 100 / sq(x - 2); }
+func drive(int n) {
+    var s = 0;
+    for (var i = 0; i < n; i++) {
+        s = s + inv(runtime(i + 3 - n));
+    }
+    return s;
+}
+print(drive(runtime(2)));

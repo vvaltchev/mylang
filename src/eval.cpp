@@ -1277,7 +1277,8 @@ vm_cached_call(EvalContext *ctx, FuncObject &obj,
                            /*as_signal=*/true, /*check_fit=*/false);
 }
 
-static void stamp_operand_loc(const Construct *c, Exception &e);
+static void stamp_operand_loc(const Construct *c, Exception &e,
+                              const Construct *parent = nullptr);
 static bool is_lvalue_rooted(const Construct *c);
 
 /*
@@ -4062,11 +4063,17 @@ EvalValue LiteralObj::do_eval(EvalContext *ctx, bool rec) const
  * application can throw (undefined variable, type mismatch, division by zero).
  */
 static void
-stamp_operand_loc(const Construct *c, Exception &e)
+stamp_operand_loc(const Construct *c, Exception &e,
+                  const Construct *parent)
 {
     if (!e.loc_start) {
-        e.loc_start = c->start;
-        e.loc_end = c->end;
+        Loc s = c->start, en = c->end;
+        /* #68: an error the PARENT's operation raises about an inlined
+         * call's value carets the call, as written there */
+        if (parent)
+            inline_operand_span(c->inline_call, s, en);
+        e.loc_start = s;
+        e.loc_end = en;
     }
 
     /*
@@ -4077,22 +4084,50 @@ stamp_operand_loc(const Construct *c, Exception &e)
      */
 }
 
-/* `acc OP= operand`, with operand-precise error locations. */
-static void
-num_binop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx,
-              NumBinOp op)
+/* #68: a division's errors caret its divisor as the division writes
+ * it - an inlined call's value at the call (inline_operand_span) */
+[[noreturn]] static void
+throw_operand_div0(const Construct *parent, const Construct *op)
 {
+    Loc s = op->start, e = op->end;
+    inline_operand_span(op->inline_call, s, e);
+    throw DivisionByZeroEx(s, e);
+}
+
+[[noreturn]] static void
+throw_operand_div_overflow(const Construct *parent, const Construct *op)
+{
+    Loc s = op->start, e = op->end;
+    inline_operand_span(op->inline_call, s, e);
+    throw InvalidValueEx("integer overflow in division", s, e);
+}
+
+/* `acc OP= operand`, with operand-precise error locations: an error
+ * evaluating the operand at its own span, one the operation raises
+ * about it at the operand as `parent` writes it (#68) */
+static void
+num_binop_loc(EvalValue &acc, const Construct *parent,
+              const Construct *operand, EvalContext *ctx, NumBinOp op)
+{
+    EvalValue v;
     try {
-        num_bin_op(acc, RValue(operand->eval(ctx)), op);
+        v = RValue(operand->eval(ctx));
     } catch (Exception &e) {
         stamp_operand_loc(operand, e);
+        throw;
+    }
+    try {
+        num_bin_op(acc, v, op);
+    } catch (Exception &e) {
+        stamp_operand_loc(operand, e, parent);
         throw;
     }
 }
 
 /* Same, for the short-circuiting logical operators (&& and ||). */
 static void
-logop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx, Op op)
+logop_loc(EvalValue &acc, const Construct *operand, EvalContext *ctx,
+          Op op)
 {
     /*
      * `&&` / `||` operate on truthiness (the unchanged truthy rules:
@@ -4166,7 +4201,7 @@ EvalValue Expr02::do_eval(EvalContext *ctx, bool rec) const
         return std::move(val);
 
     } catch (Exception &ex) {
-        stamp_operand_loc(e.get(), ex);
+        stamp_operand_loc(e.get(), ex, this);
         throw;
     }
 }
@@ -4180,9 +4215,9 @@ EvalValue Expr05::do_eval(EvalContext *ctx, bool rec) const
         const auto &[op, e] = *it;
 
         switch (op) {
-            case Op::shl:  num_binop_loc(val, e.get(), ctx, &Type::shl);  break;
-            case Op::shr:  num_binop_loc(val, e.get(), ctx, &Type::shr);  break;
-            case Op::ushr: num_binop_loc(val, e.get(), ctx, &Type::ushr); break;
+            case Op::shl:  num_binop_loc(val, this, e.get(), ctx, &Type::shl);  break;
+            case Op::shr:  num_binop_loc(val, this, e.get(), ctx, &Type::shr);  break;
+            case Op::ushr: num_binop_loc(val, this, e.get(), ctx, &Type::ushr); break;
             default:       throw InternalErrorEx();
         }
     }
@@ -4201,7 +4236,7 @@ EvalValue Expr08::do_eval(EvalContext *ctx, bool rec) const
         if (op != Op::band)
             throw InternalErrorEx();
 
-        num_binop_loc(val, e.get(), ctx, &Type::band);
+        num_binop_loc(val, this, e.get(), ctx, &Type::band);
     }
 
     return std::move(val);
@@ -4218,7 +4253,7 @@ EvalValue Expr09::do_eval(EvalContext *ctx, bool rec) const
         if (op != Op::bxor)
             throw InternalErrorEx();
 
-        num_binop_loc(val, e.get(), ctx, &Type::bxor);
+        num_binop_loc(val, this, e.get(), ctx, &Type::bxor);
     }
 
     return std::move(val);
@@ -4235,7 +4270,7 @@ EvalValue Expr10::do_eval(EvalContext *ctx, bool rec) const
         if (op != Op::bor)
             throw InternalErrorEx();
 
-        num_binop_loc(val, e.get(), ctx, &Type::bor);
+        num_binop_loc(val, this, e.get(), ctx, &Type::bor);
     }
 
     return std::move(val);
@@ -4251,13 +4286,13 @@ EvalValue Expr03::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::times:
-                num_binop_loc(val, e.get(), ctx, &Type::mul);
+                num_binop_loc(val, this, e.get(), ctx, &Type::mul);
                 break;
             case Op::div:
-                num_binop_loc(val, e.get(), ctx, &Type::div);
+                num_binop_loc(val, this, e.get(), ctx, &Type::div);
                 break;
             case Op::mod:
-                num_binop_loc(val, e.get(), ctx, &Type::mod);
+                num_binop_loc(val, this, e.get(), ctx, &Type::mod);
                 break;
             default:
                 throw InternalErrorEx();
@@ -4278,10 +4313,10 @@ EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::plus:
-                num_binop_loc(val, e.get(), ctx, &Type::add);
+                num_binop_loc(val, this, e.get(), ctx, &Type::add);
                 break;
             case Op::minus:
-                num_binop_loc(val, e.get(), ctx, &Type::sub);
+                num_binop_loc(val, this, e.get(), ctx, &Type::sub);
                 break;
             default:
                 throw InternalErrorEx();
@@ -4304,16 +4339,16 @@ EvalValue Expr06::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::lt:
-                num_binop_loc(val, e.get(), ctx, &Type::lt);
+                num_binop_loc(val, this, e.get(), ctx, &Type::lt);
                 break;
             case Op::gt:
-                num_binop_loc(val, e.get(), ctx, &Type::gt);
+                num_binop_loc(val, this, e.get(), ctx, &Type::gt);
                 break;
             case Op::le:
-                num_binop_loc(val, e.get(), ctx, &Type::le);
+                num_binop_loc(val, this, e.get(), ctx, &Type::le);
                 break;
             case Op::ge:
-                num_binop_loc(val, e.get(), ctx, &Type::ge);
+                num_binop_loc(val, this, e.get(), ctx, &Type::ge);
                 break;
             default:
                 throw InternalErrorEx();
@@ -4334,10 +4369,10 @@ EvalValue Expr07::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::eq:
-                num_binop_loc(val, e.get(), ctx, &Type::eq);
+                num_binop_loc(val, this, e.get(), ctx, &Type::eq);
                 break;
             case Op::noteq:
-                num_binop_loc(val, e.get(), ctx, &Type::noteq);
+                num_binop_loc(val, this, e.get(), ctx, &Type::noteq);
                 break;
             default:
                 throw InternalErrorEx();
@@ -4464,20 +4499,18 @@ int_type TypedScalarExpr::eval_int_body(EvalContext *ctx) const
                     case Op::div:
                         ML_INT_ONLY(int_vc_divmod(false, acc, r);)
                         if (r == 0)
-                            throw DivisionByZeroEx(elems[i].second->start,
-                                                   elems[i].second->end);
-                        check_int_div_overflow(acc, r,
-                                               elems[i].second->start,
-                                               elems[i].second->end);
+                            throw_operand_div0(this, elems[i].second.get());
+                        if (r == -1 && acc == INT_TYPE_MIN)
+                            throw_operand_div_overflow(
+                                this, elems[i].second.get());
                         acc /= r; break;
                     case Op::mod:
                         ML_INT_ONLY(int_vc_divmod(true, acc, r);)
                         if (r == 0)
-                            throw DivisionByZeroEx(elems[i].second->start,
-                                                   elems[i].second->end);
-                        check_int_div_overflow(acc, r,
-                                               elems[i].second->start,
-                                               elems[i].second->end);
+                            throw_operand_div0(this, elems[i].second.get());
+                        if (r == -1 && acc == INT_TYPE_MIN)
+                            throw_operand_div_overflow(
+                                this, elems[i].second.get());
                         acc %= r; break;
                     case Op::band: acc &= r; break;
                     case Op::bor:  acc |= r; break;
@@ -4568,8 +4601,7 @@ float_type TypedScalarExpr::eval_float_body(EvalContext *ctx) const
                                     if (r != 0.0)
                                         int_vc_float_op(acc, r, acc / r);)
                         if (r == 0.0)
-                            throw DivisionByZeroEx(elems[i].second->start,
-                                                   elems[i].second->end);
+                            throw_operand_div0(this, elems[i].second.get());
                         acc /= r; break;
                     case Op::mod:
                         ML_INT_ONLY(int_vc_float_div0(true, r);
@@ -4577,8 +4609,7 @@ float_type TypedScalarExpr::eval_float_body(EvalContext *ctx) const
                                         int_vc_float_op(acc, r,
                                                         fmod(acc, r));)
                         if (r == 0.0)
-                            throw DivisionByZeroEx(elems[i].second->start,
-                                                   elems[i].second->end);
+                            throw_operand_div0(this, elems[i].second.get());
                         acc = fmod(acc, r); break;
                     default: throw InternalErrorEx();
                 }
