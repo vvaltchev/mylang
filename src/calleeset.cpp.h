@@ -305,9 +305,9 @@ bool Inferencer::cs_struct_can_hold_func(const StructTypeDef *def,
         case FieldKind::f_array:
         case FieldKind::f_dict:
         case FieldKind::f_box:
-            /* a GENERIC `array`/`dict` field carries no element type,
-             * so it may hold one */
-            if (!f.annot || cs_annot_can_hold_func(f.annot.get(), seen))
+            /* (such a field always names its type, rule 5) */
+            ML_CHECK(f.annot);
+            if (cs_annot_can_hold_func(f.annot.get(), seen))
                 return true;
             break;
         case FieldKind::f_struct:

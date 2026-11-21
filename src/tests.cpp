@@ -31228,7 +31228,9 @@ static bool late_fold_shape()
         "pure func sq(int n) => n * n;\n"
         "pure func id(opt v) => v;\n"
         "pure func cv(float v) => v;\n"
-        "print(sq(4) + 1, id(2), id(2.5), cv(2));\n";
+        "pure func ot(float? v) => v;\n"
+        "pure func oi(int? v) => v;\n"
+        "print(sq(4) + 1, id(2), id(2.5), cv(2), ot(2), oi(2));\n";
     /* typed, then untyped (-nti: both runs untyped, so all three fold) */
     for (const bool typed : { true, false }) {
         std::vector<Tok> toks;
@@ -31242,7 +31244,7 @@ static bool late_fold_shape()
         for (auto &e : b->elems)
             if (ctag(e.get()) == ConstructType::call)
                 pr = static_cast<CallExpr *>(e.get());
-        if (!pr || pr->args->elems.size() != 4) {
+        if (!pr || pr->args->elems.size() != 6) {
             fprintf(stderr, "late_fold_shape: no print call\n");
             return false;
         }
@@ -31257,11 +31259,17 @@ static bool late_fold_shape()
         const bool folded2 = ctag(a[2].get()) == ConstructType::lit_float;
         const bool cv2 = ctag(a[3].get()) == (typed ? ConstructType::call
                                                     : ConstructType::lit_float);
-        if (!folded || !id2 || !folded2 || !cv2) {
+        /* ...and the same into a nullable place: an int into float? is
+         * converted (runs), into int? taken as is (folds) */
+        const bool ot2 = ctag(a[4].get()) == (typed ? ConstructType::call
+                                                    : ConstructType::lit_float);
+        const bool oi2 = ctag(a[5].get()) == ConstructType::lit_int;
+        if (!folded || !id2 || !folded2 || !cv2 || !ot2 || !oi2) {
             fprintf(stderr, "late_fold_shape (%s): sq(4) + 1 folded %d, "
                     "id(2) folded %d, id(2.5) folded %d, cv(2) as "
-                    "expected %d\n", typed ? "typed" : "-nti", folded, id2,
-                    folded2, cv2);
+                    "expected %d, ot(2) %d, oi(2) folded %d\n",
+                    typed ? "typed" : "-nti", folded, id2, folded2, cv2,
+                    ot2, oi2);
             return false;
         }
     }
@@ -37929,6 +37937,140 @@ static bool myv_cast_type_refused()
         ok = false;
     }
     g_exec_engine = saved;
+    return ok;
+}
+
+/*
+ * v46: a container or box field names its whole type (rule 5 refuses a
+ * bare `array` / `dict` field) and no other field has one, so every pass
+ * reads a container field's type from FieldDef::annot. The loader
+ * refuses an image that breaks either half - a container field with no
+ * annot, a scalar one with an annot - rather than let those passes meet
+ * a field the compiler cannot make.
+ */
+static bool myv_field_annot_checked()
+{
+    const char *src =
+        "struct S { array<int> a; int n; }\n"
+        "var s = S([runtime(1), 2], 3);\n"
+        "print(len(s.a) + s.n);\n";
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        StructTypeDef *sd = nullptr;
+        for (auto &d : prog.structs)
+            if (d && d->name == UniqueId::get("S"))
+                sd = d.get();
+        if (!sd || sd->fields.size() != 2 || !sd->fields[0].annot
+                || sd->fields[1].annot) {
+            fprintf(stderr, "myv_field_annot_checked: no struct S with "
+                            "one typed container field\n");
+            g_exec_engine = saved;
+            return false;
+        }
+        std::string tdir = "/tmp";
+        for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+            const std::optional<std::string> e = env_get(var);
+            if (e && !e->empty()) { tdir = *e; break; }
+        }
+        while (tdir.size() > 1
+               && (tdir.back() == '/' || tdir.back() == '\\'))
+            tdir.pop_back();
+        const std::string path = tdir + "/mylang-myv-fieldannot.myv";
+        const auto refused = [&](const char *what, const char *msg) {
+            myv_write(prog, path, MyvSourceRef());
+            try {
+                MyvSource img_src;
+                VmProgram loaded = myv_read(path, img_src);
+            } catch (Exception &e) {
+                if (std::string(e.name) == "MyvError" && e.msg
+                        && strstr(e.msg, msg))
+                    return true;
+                fprintf(stderr, "myv_field_annot_checked [%s]: threw "
+                                "%s: %s\n", what, e.name,
+                        e.msg ? e.msg : "");
+                return false;
+            }
+            fprintf(stderr, "myv_field_annot_checked [%s]: ACCEPTED\n",
+                    what);
+            return false;
+        };
+        const std::shared_ptr<TypeAnnot> a0 = sd->fields[0].annot;
+        sd->fields[0].annot = nullptr;
+        ok = refused("a container field with no type",
+                     "a container field with no type") && ok;
+        sd->fields[0].annot = a0;
+        sd->fields[1].annot = a0;
+        ok = refused("a scalar field with a type",
+                     "a scalar field with a type annotation") && ok;
+        sd->fields[1].annot = nullptr;
+        myv_write(prog, path, MyvSourceRef());   /* intact: loads + runs */
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(loaded);
+        } catch (Exception &) {
+        }
+        std::cout.rdbuf(old_buf);
+        if (cap.str().find("5") == std::string::npos) {
+            fprintf(stderr, "myv_field_annot_checked: ran to \"%s\"\n",
+                    cap.str().c_str());
+            ok = false;
+        }
+        std::remove(path.c_str());
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_field_annot_checked: %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
+/*
+ * The zero value of a container annotation that names no component - a
+ * bare `array` / `dict` - is an empty container with no container type.
+ * No source program reaches it any more (rule 5 refuses a bare field,
+ * and a type the compiler stamps names every component), but an image's
+ * annotations are input.
+ */
+static bool zero_value_bare_annot()
+{
+    bool ok = true;
+    for (const DeclType k : { DeclType::arr, DeclType::dict }) {
+        TypeAnnot bare;
+        bare.kind = k;
+        EvalValue v;
+        if (!annot_zero_value(&bare, &v)) {
+            fprintf(stderr, "zero_value_bare_annot: no zero value\n");
+            return false;
+        }
+        const bool empty_untyped = k == DeclType::arr
+            ? v.is<SharedArrayObj>()
+                  && v.get_ref<SharedArrayObj>().size() == 0
+                  && !v.get_ref<SharedArrayObj>().ctype()
+            : v.is<intrusive_ptr<DictObject>>()
+                  && v.get_ref<intrusive_ptr<DictObject>>()->get_ref()
+                         .size() == 0
+                  && !v.get_ref<intrusive_ptr<DictObject>>()->ctype();
+        if (!empty_untyped) {
+            fprintf(stderr, "zero_value_bare_annot: a bare %s gave %s\n",
+                    k == DeclType::arr ? "array" : "dict",
+                    v.to_string().c_str());
+            ok = false;
+        }
+    }
     return ok;
 }
 
@@ -62225,6 +62367,10 @@ static const std::vector<extra_check> extra_checks =
     { "myv: v19 - the root chunk's slot_count and the stored root slot "
       "count must agree, either copy mutated is refused",
       myv_root_slot_count_checked },
+    { "myv: v46 - a container field with no type, or a scalar field "
+      "with one, is a corrupt image", myv_field_annot_checked },
+    { "fit: the zero value of a bare container annotation is an empty, "
+      "untyped container", zero_value_bare_annot },
     { "myv: v43 - a container type no container can have (opt, another "
       "kind) is a corrupt image, refused by every reader",
       myv_ctype_refused },

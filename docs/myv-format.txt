@@ -2,8 +2,14 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 45.  This document describes the on-disk image exhaustively:
+Format version 46.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v46: a Field (7.1) carries an `annot` exactly when its kind is
+`array`, `dict` or `box` - a bare container field is a compile error
+since rule 5 (plans/strict-container-types.md) and a scalar, `dyn` or
+struct field has none, so no compile writes either, and the loader
+refuses an image that does.  The encoding is unchanged.)
 
 (v45: one opcode was APPENDED, CastV - `cast<T>(x)` - and a chunk gains
 the pool `cast_types` (9.11c) after ctypes, which a CastV names by its
@@ -645,8 +651,11 @@ counts ("corrupt .myv (table of contents exceeds the file)").
         sref  struct_def    the resolved struct type, or null
         bool  is_opt
         u32   slot          (signed) the boxed-layout slot index
-        annot annot         v37 - the field's declared type (2.2); absent
-                            for a field whose kind says it all
+        annot annot         v37 - the field's declared type (2.2):
+                            PRESENT for an `array`, `dict` or `box` kind,
+                            absent for any other (whose kind says it
+                            all) - v46: the loader refuses either the
+                            other way
 
     Const:
         uid   name

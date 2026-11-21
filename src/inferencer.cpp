@@ -5137,11 +5137,9 @@ StaticTypeRef Inferencer::field_static_type(const FieldDef &fd)
 {
     StaticTypeRef base;
 
-    /* A parameterized container field (`array<int> xs`) carries its element
-     * type in `annot`; a generic `array`/`dict` field leaves it `dyn`. */
-    if (fd.annot &&
-        (fd.kind == FieldKind::f_array || fd.kind == FieldKind::f_dict
-         || fd.kind == FieldKind::f_box)) {
+    /* A container or box field names its whole type in `annot` (rule 5:
+     * a field cannot be a bare `array` / `dict`) */
+    if (fd.annot) {
         base = annot_to_static_type(fd.annot.get());
         return fd.is_opt ? A.with_opt(base, true) : base;
     }
@@ -5151,9 +5149,6 @@ StaticTypeRef Inferencer::field_static_type(const FieldDef &fd)
         case FieldKind::f_int:    base = A.int_ty();   break;
         case FieldKind::f_float:  base = A.float_ty(); break;
         case FieldKind::f_str:    base = A.str_ty();   break;
-        case FieldKind::f_array:  base = A.array_of(A.dyn_ty()); break;
-        case FieldKind::f_dict:
-            base = A.dict_of(A.dyn_ty(), A.dyn_ty()); break;
         case FieldKind::f_dyn:    base = A.dyn_ty();   break;
         case FieldKind::f_struct: {
             /* the struct the parser resolved the field's type to, when
@@ -6874,11 +6869,9 @@ void Inferencer::contribute(TypeSym *s, StaticTypeRef t, Loc loc,
      * leaves it), not `none`, so its non-none branches type-check:
      * `func f(opt x) { if (x != none) return x + 1; return 0; }` called
      * with `none` is the instance keyed `none` (template_arg_key) */
-    if (s->is_param && s->opt_decl) {
-        const StaticTypeRef k = static_type_resolve(t);
-        if (k && k->kind == StaticTypeKind::None)
-            return;
-    }
+    ML_CHECK(t);
+    if (s->is_param && s->opt_decl && is_none(t))
+        return;
 
     {
         /* which scalar kinds reach the symbol (see TypeSym::arg_kinds): a

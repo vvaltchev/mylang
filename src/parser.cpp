@@ -4292,8 +4292,7 @@ static FieldKind decltype_to_fieldkind(DeclType dt)
         case DeclType::i:    return FieldKind::f_int;
         case DeclType::f:    return FieldKind::f_float;
         case DeclType::s:    return FieldKind::f_str;
-        case DeclType::arr:  return FieldKind::f_array;
-        case DeclType::dict: return FieldKind::f_dict;
+        /* (a bare `array` / `dict` is refused before this: rule 5) */
         default:             return FieldKind::f_dyn;
     }
 }
