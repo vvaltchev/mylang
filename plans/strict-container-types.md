@@ -439,3 +439,62 @@ prints `0`. Choice 6 fixes it.
    parse's copy instantiated `T2[2](3)` while the program ran the base).
    Tests: tests/functional/137, the `rule 8.1:` `-rt` rows. 8.2 (closure
    and lambda-value instances) not started.
+
+## 10. Rule 8.2 - a design, NOT BUILT (Claude, 2026-11-21)
+
+Stopped at the design on purpose: 8.2 changes the runtime call model
+and the `.myv` format, so the maintainer reviews it before any code.
+
+**What it is.** A capturing closure, and a lambda used as a value, get
+typed instances the way a named template does - but the program still
+makes ONE closure object per evaluation of the lambda (one capture
+vector: captures are shared, mutable state, so two objects would split
+a counter). The instances are BODIES, not objects.
+
+**Inference.** Treat such a lambda like a template whose instances are
+keyed per call site, using the sites the callee-set analysis attributes
+to it (`callee_set(call->what)` naming exactly this lambda, `!top`): a
+site that names it alone gets the instance for its argument types
+(template_arg_key, so `opt` parameters key as in 8.1); every other site
+- several candidates, or ⊤ - calls the untyped BASE body. The base is
+kept whenever such a site exists (the #149 closure keeps it today for a
+value-used template). No uniformity rule: each site picks its own.
+
+**Runtime.**
+- `FuncDescriptor` gains `instances` (descriptors of the instance
+  bodies, each with its own chunk); an instance shares the base's
+  capture layout - it is a clone of the same lambda, so capture slot `k`
+  means the same captured variable in every body.
+- A call site that picked instance `k` compiles to a call that names
+  `k`: a new operand on the closure call ops (CallValueV and its
+  frameless / record-less tiers) - the callee value is still the
+  FuncObject (its capture vector), the body is `desc->instances[k]`. A
+  guard that the value really is this lambda's object (its base
+  descriptor) protects the choice where the analysis can be wrong only
+  for a loaded image: the #97 GuardCalleeV identity check, already
+  emitted for the value splices, is that guard; its miss runs the base.
+- The tree-walker's `do_func_call` gets the instance's decl and the
+  object's captures.
+- The bytecode inliner may paste an instance body exactly as it pastes
+  a value-call's callee today (behind the same guard).
+
+**Format.** `.myv` stores each descriptor's instance list (descriptor
+table indices) - a version bump, docs/myv-format.txt in the same
+commit, `tests/myv_doc_check`; the loader checks each instance's
+capture count equals its base's (a mutated image must not make an
+instance read past the capture vector).
+
+**Questions for the maintainer.**
+1. A site that may reach two lambdas (`{A, B}`): run both bases, or
+   pick an instance of each behind a two-way guard chain (the #97 E3
+   machinery)? The design above runs the bases - simpler, and the guard
+   chain can come later.
+2. The instance cap (64 per template today) - the same for lambdas?
+3. The REPL: a closure made in one input and called in a later one is
+   called through a value the later input's analysis cannot name, so
+   it runs the base - the same as a value-used template today.
+
+**Order if approved:** inference + `-dti`/`:show` visibility first (no
+runtime change: instances unused), then the call operand and the
+tree-walker, then the VM tiers one at a time with the five-mode
+differential, then the format.
