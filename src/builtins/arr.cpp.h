@@ -74,25 +74,25 @@ EvalValue builtin_array(EvalContext *ctx, const ArgLocs *exprList,
             return SharedArrayObj(filled<SharedArrayObj::bvec_type>(n, 0, arg));
 
         /* the element type's zero value, a fresh one per element (a
-         * container, a struct, a box is a value of its own); the
-         * compiler refused an element type that has none */
+         * container, a struct, a box is a value of its own) */
         const TypeAnnot *ea = exprList->ctype
             ? exprList->ctype->elem.get() : nullptr;
-        if (ea && !ea->opt && ea->kind != DeclType::dyn) {
+        const bool zero = ea && !ea->opt;
+        /* (the compiler refuses an element type with no zero value - a
+         * `dyn` one included - so only an image's ctype can name one: it
+         * is filled with none, below) */
+        if (zero && annot_zero_value(ea, nullptr)) { /* INT-COV-EXEMPT: image */
             std::vector<EvalValue> zs;
             reserve_or_oom(zs, static_cast<uint64_t>(n), arg);
             for (int_type i = 0; i < n; i++) {
                 EvalValue z;
-                if (!annot_zero_value(ea, &z))  /* INT-COV-EXEMPT: refused */
-                    break;
+                annot_zero_value(ea, &z);
                 zs.push_back(std::move(z));
             }
-            if (zs.size() == static_cast<size_t>(n)) {
-                const StructTypeDef *sd = nullptr;
-                const ArrHint h = annot_arr_hint(exprList->ctype, sd);
-                return build_array_from_values(zs.data(), zs.size(), h, sd,
-                                               ctx->const_ctx);
-            }
+            const StructTypeDef *sd = nullptr;
+            const ArrHint h = annot_arr_hint(exprList->ctype, sd);
+            return build_array_from_values(zs.data(), zs.size(), h, sd,
+                                           ctx->const_ctx);
         }
 
         SharedArrayObj::vec_type vec;

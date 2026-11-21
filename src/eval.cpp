@@ -2959,7 +2959,9 @@ EvalValue literal_widen(EvalValue v, DeclType dt)
 static EvalValue literal_elem_widen(EvalValue v, DeclType dt,
                                     bool at_compile)
 {
-    if (at_compile || (dt != DeclType::i && dt != DeclType::f))
+    /* (a literal's stamp is an int or a float one: annot_num,
+     * stamp_literal_coerce) */
+    if (at_compile)
         return literal_widen(std::move(v), dt);
     return coerce_to_decl_type(v, dt, -1);
 }
