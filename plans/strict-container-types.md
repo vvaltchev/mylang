@@ -263,8 +263,16 @@ later. Each is marked with what it would take to reverse it.
 7. **An explicit `none` element is a `none`, not "no element"** (the
    question 9 rule kept for an EMPTY container and for `array(n)`):
    `var a = [1, 2]; a[0] = none` makes `a` an `array<int?>` (it was a
-   run-time TypeErrorEx from the flat storage), `[none]` is `array<
-   dyn?>` until filled.
+   run-time TypeErrorEx from the flat storage), and `[none]` is an
+   `array<dyn?>` (amended 2026-11-21: it said "until filled", and a
+   container holding only nones was typed UNFILLED - `var a = [none,
+   none]; a[0] = 5` made an `array<int>` holding a none, and `var d =
+   {none: 1}; d[2] = 5` a `dict<int,int>` whose none key the JIT read as
+   an int while the VM aborted and the tree-walker threw. Such a
+   component is `dyn?` now, wherever it comes from - a literal, a baked
+   one, `array(n, none)`, a callback that always returns none - and a
+   store keeps it `dyn?`; a literal written for a typed place,
+   `array<int?> a = [none]`, still has the place's type).
 
 8. **A container made where `dyn` is declared is an `array<dyn?>`**
    (`dict<dyn?, dyn?>`): the DYNAMIC type, which refuses nothing (it was
@@ -314,6 +322,12 @@ later. Each is marked with what it would take to reverse it.
     components have settled.** An `array<?>` instance refused what its
     argument settled to (exact types); a literal with an unsettled
     element is unsettled itself.
+15. **A `dyn?` value given to a plain variable makes it nullable**
+    (2026-11-21): a numeric local keeps its type, nullable (`var s = 0;
+    s = d` with `d` a `dyn?` is an `int?` - it was an `int` holding the
+    none, which the JIT read as 0, the VM aborted on and the tree-walker
+    threw at), anything else is a `dyn?` (a foreach variable over
+    `dyn?` elements was a `dyn`).
 
 ### A gap left by increment 1
 
@@ -368,6 +382,18 @@ prints `0`. Choice 6 fixes it.
    not for `array(n)`'s none-filled one). The fix needs `array(n)` with
    no type of its own to be an `array<dyn?>` once it flows out untyped,
    while `var a = array(2); a[0] = "x"` keeps typing `a` by its stores.
+   **Also open (found 2026-11-21):** the flow check covers a variable, a
+   result and a ternary arm, not an ELEMENT: a container a name holds,
+   put into an inferred container whose element type later widens -
+   `var r = [cs]; append(r, r);` with `cs` an array<C> - makes `r` an
+   array<array<dyn>> holding `cs`. Nothing is unchecked (a store through
+   `r[0]` meets `cs`'s own type at run time, and `d[r]` is refused there
+   too), but the refusal should be a compile error at the element, as it
+   is at a variable; and the literal's run-time type should then be
+   `r`'s (it is the literal's own, array<array<C>>). A nested generic
+   `array` component (`array<array>`) is a `dyn` at run time as it is
+   statically (it matched any array there - fixed the same day; only a
+   place's top-level generic `array` is a hole).
 4. Rule 4 (storage follows the type), rule 5 (bare annotations are
    holes), rule 6 (`none` keys - already work, gets a test).
 5. Rule 8.

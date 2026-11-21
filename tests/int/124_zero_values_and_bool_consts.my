@@ -53,7 +53,9 @@ want("locals from bool", locals(), "2 0.500000");
 class C { int v; }
 var cs = [C(1), C(2)];
 want("class array storage", array_storage(cs), "class");
-var r = [cs];
+# (an array holding itself is an array<dyn>: no other type contains
+# itself, and a container's type is exact - rule 1)
+array<dyn> r = [cs];
 append(r, r);
 var d = {};
 d[r] = 7;
