@@ -1,0 +1,48 @@
+# Rule 6 (plans/strict-container-types.md; README, *Dicts*): `none` is
+# a valid dict key - in a literal, through a store, a lookup, get(),
+# erase(), a foreach, a default dict and a dict keyed `dyn?` - in every
+# engine.
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+var d = {none: 1, 2: 3};
+want("literal", d[none], 1);
+d[none] = 5;
+want("store", d[none], 5);
+want("len", len(d), 2);
+want("get", get(d, none), 5);
+erase(d, none);
+want("erase", str(d), "{2: 3}");
+
+dict<str?, int> e = {};
+e[none] = 7;
+e["a"] = 1;
+var seen = "";
+foreach (k, v in e)
+    seen += str(k) + "=" + str(v) + " ";
+want("foreach", seen, "<none>=7 a=1 ");
+
+var dyn? nk = runtime(none);
+dict<dyn?, int> f = {};
+f[nk] = 9;
+want("dyn? key", f[none], 9);
+
+var dd = dict(0);
+dd[none] += 4;
+want("default dict", dd[none], 4);
+
+# a none key and the int 0 / false are different keys
+var z = {none: "n", 0: "zero"};
+want("none vs 0", z[none] + z[0], "nzero");
+
+# (a dict whose keys are not nullable refuses a key that may be none
+# at compile time - the `-rt` "rule 6:" cases)
+
+assert(bad == 0);
+print("ok");

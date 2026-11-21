@@ -4710,6 +4710,24 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
                 : ctype_dyn_place.count(call)
                     ? (dict ? annot_dyn_dict() : annot_dyn_array())
                     : ctype_of(dest ? dest : own, dict);
+            /* rule 4: the storage follows the type. A variable's direct
+             * right-hand side got its storage from the variable
+             * (set_array_repr_hint); anywhere else - an argument, a
+             * result, a field, an element - the container is built for
+             * the type it has there, as its ctype is: an inline
+             * `keys(d)` of a dict<int, int> was a GENERAL array<int> */
+            if (builtin_takes_arr_hint(cid->uid->val)
+                    && call->args->arr_hint == ArrHint::dflt
+                    && !ctype_untyped.count(call)) {
+                ArrHint h;
+                const StructTypeDef *sd = nullptr;
+                if (ctype_dyn_place.count(call)) {
+                    call->args->arr_hint = ArrHint::general;
+                } else if (array_repr_hint(dest ? dest : own, h, sd)) {
+                    call->args->arr_hint = h;
+                    call->args->arr_hint_struct = sd;
+                }
+            }
             /* choice 6: array(n) fills its element type's zero value,
              * so an element type that has none is refused here - but in
              * a template's base body, which is not checked (its
@@ -7360,6 +7378,23 @@ void Inferencer::contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
                          "' ('" + static_type_to_string(d) +
                          "') cannot be none, and the value may be",
                      loc, loc_end, true);
+        /* ...and a dict KEY the same two ways (rule 6: `none` is a key
+         * only of a dict whose keys may be none) */
+        if (d->kind == StaticTypeKind::Dict && strict_dyn) {
+            const StaticTypeRef dk = static_type_resolve(d->key);
+            const StaticTypeRef ck = static_type_resolve(c->key);
+            const bool may_none = ck && (ck->kind == StaticTypeKind::None
+                                         || ck->opt);
+            if (dk && ck && may_none && !dk->opt
+                    && dk->kind != StaticTypeKind::None
+                    && !has_unknown(dk) && !has_unknown(ck))
+                conflict("a key of '" + std::string(s->name->val) +
+                             "' ('" + static_type_to_string(d) +
+                             "') cannot be none" +
+                             (ck->kind == StaticTypeKind::None
+                                  ? "" : ", and the key may be"),
+                         loc, loc_end, true);
+        }
         /* (a `dyn` value fits - a `dyn?` one an element that may be
          * none: the store checks it at run time, as `int x = d` does) */
         const auto fits = [&](StaticTypeRef v, StaticTypeRef into) {
