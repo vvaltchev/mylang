@@ -1,0 +1,70 @@
+# Rule 1 (plans/strict-container-types.md): a container's type is exact,
+# and a NEW container takes the type the program gives it. The refusals
+# are compile errors (the `-rt` "rule 1:" cases); this program pins what
+# compiles and what it computes. An untyped run (-nti) builds a literal
+# from its own values, so the stores that need the inferred type are
+# asserted on a typed run only.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+# ---- a new container joins what is put into it
+var a = [1];
+if (typed) {
+    a[0] = "s";
+    want("join", str(a), "[\"s\"]");
+    want("join type", typestr(a), "array<dyn>");
+}
+
+# ---- choice 7: an explicit none makes the element nullable
+var n = [1, 2];
+if (typed) {
+    n[0] = none;
+    want("none element", str(n), "[<none>, 2]");
+    want("none element type", typestr(n), "array<int?>");
+}
+var m = {"k": 1};
+if (typed) {
+    m["z"] = none;
+    want("none value", typestr(m), "dict<str,int?>");
+}
+
+# ---- dict(default): the stores fill the key; dict(pairs) by its pairs
+var counts = dict(0);
+foreach (var w in ["a", "b", "a"])
+    counts[w] += 1;
+if (typed)
+    want("default dict", typestr(counts), "dict<str,int>");
+want("default dict values", counts["a"] + counts["b"] + counts["c"], 3);
+var pd = dict([["x", "y"]]);
+if (typed)
+    want("pairs", typestr(pd), "dict<str,str>");
+var mixed = dict([["x", 1]]);
+mixed[2] = "two";
+if (typed)
+    want("mixed pairs", typestr(mixed), "dict<dyn,dyn>");
+
+# ---- a container a name holds keeps its type: an alias of the same type
+# is fine, and sort / reverse return the array they were given
+var xs = [3, 1, 2];
+var ys = xs;
+ys[0] = 9;
+want("alias", str(xs), "[9, 1, 2]");
+var zs = sort(xs);
+zs[0] = 0;
+want("sort aliases", str(xs), "[0, 2, 9]");
+
+# ---- cast converts, into a new container
+array<dyn> dx = cast<array<dyn>>(xs);
+dx[0] = "s";
+want("cast is new", str(xs), "[0, 2, 9]");
+want("cast value", str(dx), "[\"s\", 2, 9]");
+
+assert(bad == 0);
+print("ok");

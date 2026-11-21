@@ -1,0 +1,51 @@
+# Open point 3 (plans/strict-container-types.md, the element join): `a + b`
+# of two arrays is a NEW array whose element type is the join of theirs -
+# `array<int> + array<float>` an array<float> (the ints widened as they
+# are copied), `array<int> + array<str>` an array<dyn>. It used to be
+# typed so and then refused at run time: the sum appended into a copy of
+# the left side's flat storage ("Cannot store a value of a different type
+# in a flat (typed) array"). The storage follows the type (rule 4); the
+# left operand is untouched. Without inference (-nti) the same values and
+# storages come out, so everything is asserted in every run.
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+var s = [1] + [1.5];
+want("int + float", str(s), "[1.000000, 1.500000]");
+want("int + float storage", array_storage(s), "float");
+var t = [1] + ["x"];
+want("int + str", str(t), "[1, \"x\"]");
+want("int + str storage", array_storage(t), "general");
+var u = [true] + [2];
+want("bool + int", str(u), "[1, 2]");
+want("bool + int storage", array_storage(u), "int");
+
+# the left operand keeps its storage; a chain joins as it goes
+var a = [1, 2];
+var b = a + [0.5] + [2];
+want("left untouched", str(a), "[1, 2]");
+want("left storage", array_storage(a), "int");
+want("chain", str(b), "[1.000000, 2.000000, 0.500000, 2.000000]");
+
+# typed reads of a joined sum, in a loop the JIT compiles
+var f = 0.0;
+for (var i = 0; i < runtime(4); i++) {
+    var w = [i] + [0.25];
+    f += w[1] + w[0];
+}
+want("typed reads", f, 7.0);
+
+# `+=` grows the array every name holding it shares: a dynamic array
+# takes the float, a flat one keeps refusing what it cannot hold
+var dyn d = [1];
+d += [1.5];
+want("dynamic +=", str(d), "[1, 1.500000]");
+
+assert(bad == 0);
+print("ok");

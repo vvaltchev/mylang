@@ -214,11 +214,14 @@ var dpg_refused = 0;
 try { dpg[0] = 3; } catch (TypeErrorEx) { dpg_refused = 1; }
 want("dpg", str(dpg_refused) + str(dpg), "1[P(x: 1, y: 2.500000)]");
 # a container declared array<dyn> enters no array<C>, whatever it holds
-# (Q2 decision A); an untyped one - only `dyn` reaches it - fits by
+# (rule 1: a compile error where the compiler sees it, refused at the
+# bind through a `dyn`); an untyped one - only `dyn` reaches it - fits by
 # what it holds, and stays general in the array<C> it enters
 pure func mkcd() { array<dyn> a = [KC, KC]; return a; }
+func takes_ac(array<C> a) => len(a);
+var dyn cd = mkcd();
 var acf2_refused = 0;
-try { array<C> acf2 = mkcd(); } catch (TypeErrorEx) { acf2_refused = 1; }
+try { takes_ac(cd); } catch (TypeErrorEx) { acf2_refused = 1; }
 want("acf2", str(acf2_refused), "1");
 array<dyn> hcd = [[KC, "x"]];
 var dyn hcd0 = hcd[0];

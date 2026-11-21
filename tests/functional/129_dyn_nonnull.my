@@ -80,14 +80,17 @@ want("field refusals", refused, 1);
 want("field kept", s.f, 3);
 
 # ---- an array<dyn?> does not enter an array<dyn> parameter (its elements
-# may be none); an array<dyn> and an array<int> do
+# may be none), nor does an array<int> (rule 1: a type of its own); an
+# array<dyn> does
 func count(array<dyn> xs) => len(xs);
 var dyn maybes = cast<array<dyn?>>([1, none]);
 refused = 0;
 try { count(maybes); } catch (TypeErrorEx) { refused++; }
 want("array<dyn?> entry", refused, 1);
 want("array<dyn> entry", count(cast<array<dyn>>([1, "s"])), 2);
-want("array<int> entry", count(runtime([1, 2, 3])), 3);
+refused = 0;
+try { count(runtime([1, 2, 3])); } catch (TypeErrorEx) { refused++; }
+want("array<int> entry", refused, typed ? 1 : 0);
 
 # ---- a container made where `dyn` is declared refuses nothing (its type is
 # the dynamic array<dyn?>)...

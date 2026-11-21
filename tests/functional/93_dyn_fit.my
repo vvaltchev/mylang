@@ -136,50 +136,42 @@ func slices(dyn mixed) {
     return true;
 }
 assert(slices(runtime([1, "x"])));
-# a declared variable takes a container with a dyn inside, checked as
-# a parameter is - the variable keeps its value on a refusal
-func dyn_rows(dyn x) { array<dyn> r = [x]; return r; }
+# a declared variable takes a container literal with a dyn inside,
+# checked as a parameter is - the variable keeps its value on a refusal
 func var_store(dyn x) {
     array<int> v = [1];
-    try { v = dyn_rows(x); return false; } catch (TypeErrorEx) { }
+    try { v = [x]; return false; } catch (TypeErrorEx) { }
     return v == [1];
 }
 assert(var_store(runtime("s")) == typed);
-# ...and a container declared array<dyn> enters no array<int>, whatever
-# it holds (Q2 decision A: it may take a string through another name)
+# ...and a container of another type enters no array<int>, whatever it
+# holds (rule 1: container types are exact - an array<dyn> may take a
+# string through another name)
 var vvr = 0;
-try { array<int> vv = dyn_rows(runtime(5)); } catch (TypeErrorEx) { vvr = 1; }
-assert(vvr == (typed ? 1 : 0));
-# a multi-assignment checks what each declared target receives, in
-# order: a refusal leaves the targets before it written and the rest as
-# they were, as a failing coercion does. An element that is an
-# array<int> enters an array<int> target; one made array<dyn> - a
-# literal stored into the array<array<dyn>> - is refused whatever it
-# holds (Q2 decision A)
-func multi(bool bad) {
+var dyn ints_as_dyn = cast<array<dyn>>([5]);
+try { takes_arr(ints_as_dyn); } catch (TypeErrorEx) { vvr = 1; }
+assert(vvr == 1);
+# a multi-assignment's literal is unpacked as written, so each element
+# literal is built for its declared target (rule 1) - and refuses a dyn
+# element that does not fit while it is built, before any target is
+# written
+func multi(dyn second) {
     array<int> one = [1];
-    array<int> two = [2];
-    array<array<dyn>> src = [one, two];
-    if (bad)
-        src[1] = [2];
     array<int> a = [0];
     array<int> b = [0];
-    try { a, b = src; } catch (TypeErrorEx) { return [a, b]; }
+    try { a, b = [one, [second]]; } catch (TypeErrorEx) { return [a, b]; }
     return [a, b, [9]];
 }
-assert(!typed || multi(runtime(true)) == [[1], [0]]);
-assert(multi(runtime(false)) == [[1], [2], [9]]);
-# ... and a non-array value, spread to each target
-func spread(bool bad) {
+assert(!typed || multi(runtime("s")) == [[0], [0]]);
+assert(multi(runtime(2)) == [[1], [2], [9]]);
+# ... and a non-array value, spread to each target (a value of another
+# type is a compile error, rule 1)
+func spread() {
     dict<str, int> good = {"k": 4};
-    dict<str, dyn> d = good;
-    if (bad)
-        d = {"k": 4};
     dict<str, int> p = {};
     dict<str, int> q = {"z": 0};
-    try { p, q = d; } catch (TypeErrorEx) { return [p, q]; }
-    return [p, q, {"ok": 1}];
+    p, q = good;
+    return [p, q];
 }
-assert(!typed || spread(runtime(true)) == [{}, {"z": 0}]);
-assert(spread(runtime(false)) == [{"k": 4}, {"k": 4}, {"ok": 1}]);
+assert(spread() == [{"k": 4}, {"k": 4}]);
 print("ok");

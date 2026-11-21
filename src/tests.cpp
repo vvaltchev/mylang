@@ -2569,10 +2569,10 @@ static const std::vector<test> tests =
     { "err loc: a DYN value that misfits a declared variable marks the "
       "value (#49)",
       { "array<int> v = [1]; var dyn d = runtime(1);",
-        "for (var i = 0; i < runtime(3); i++) { array<dyn> r = [d]; "
-        "v = r; if (i == 1) { d = runtime(\"s\"); } }",
+        "for (var i = 0; i < runtime(3); i++) { "
+        "v = [d]; if (i == 1) { d = runtime(\"s\"); } }",
         "print(v);" },
-      &typeid(TypeErrorEx), 64, 2, 66, 2 },
+      &typeid(TypeErrorEx), 44, 2, 48, 2 },
     { "err loc: a DYN value that misfits a dict value marks the value "
       "(#49)",
       { "dict<str, array<int>> m = {}; var dyn d = runtime([1]);",
@@ -2618,27 +2618,56 @@ static const std::vector<test> tests =
         "aa[0] += d;",
         "print(aa);" },
       &typeid(TypeMismatchEx), 1, 3, 12, 3 },
+    /* (rule 1: a result that may misfit a declared variable is a `dyn`
+     * - an array<dyn> no longer enters an array<array<int>> - and a
+     * declared variable refuses a `dyn` at the target, #49) */
     { "check: a compound store into a declared variable whose result "
       "may misfit is refused (#49)",
       { "array<array<int>> v = [[1]];",
-        "array<dyn> r = [runtime([2])];",
+        "var dyn r = [runtime([2])];",
         "v += r;",
         "print(v);" },
-      &typeid(TypeMismatchEx), 1, 3, 8, 3 },
+      &typeid(TypeMismatchEx), 1, 3, 3, 3 },
+    /* rule 1 (plans/strict-container-types.md): a container a name may
+     * hold keeps its type wherever it flows - into a variable, out of a
+     * function, through a ternary - and a place of another type is a
+     * compile error at the flow (choice 12) */
+    { "rule 1: an alias that a store would widen is refused at the alias",
+      { "var a = [1, 2];", "var b = a;", "b[0] = \"s\";" },
+      &typeid(TypeMismatchEx), 9, 2, 11, 2 },
+    { "rule 1: two named containers of different types in one variable",
+      { "var x = [1]; var y = [\"s\"];", "var c = x;", "c = y;" },
+      &typeid(TypeMismatchEx), 9, 2, 11, 2 },
+    { "rule 1: a ternary arm keeps its container's type",
+      { "var x = [1]; var y = [\"s\"];",
+        "var c = runtime(true) ? x : y;" },
+      &typeid(TypeMismatchEx), 25, 2, 27, 2 },
+    { "rule 1: a returned container keeps its type",
+      { "var x = [1]; var y = [\"s\"];",
+        "func pick(bool b) { if (b) return x; return y; }",
+        "print(pick(runtime(true)));" },
+      &typeid(TypeMismatchEx), 35, 2, 37, 2 },
+    { "rule 1: a dict alias that a store would widen is refused",
+      { "var d = {\"a\": 1};", "var e = d;", "e[\"b\"] = \"s\";" },
+      &typeid(TypeMismatchEx), 9, 2, 11, 2 },
+    { "rule 1: an array<int> does not enter an array<dyn> parameter",
+      { "func f(array<dyn> a) => len(a);", "var a = [1];",
+        "print(f(a));" },
+      &typeid(TypeMismatchEx), 9, 3, 11, 3 },
     { "check: a compound multi-assignment whose result may misfit a "
       "declared target is refused (#49)",
       { "array<array<int>> a = [[1]]; array<array<int>> b = [[2]];",
-        "array<array<dyn>> src = [[runtime([3])], [[4]]];",
+        "var dyn src = [[runtime([3])], [[4]]];",
         "a, b += src;",
         "print(a, b);" },
-      &typeid(TypeMismatchEx), 1, 3, 13, 3 },
+      &typeid(TypeMismatchEx), 1, 3, 3, 3 },
     { "err loc: a DYN value that misfits a multi-assignment target "
       "marks the value (#49)",
       { "array<int> v = [1]; array<int> w = [2]; var dyn d = runtime(1);",
-        "for (var i = 0; i < runtime(3); i++) { array<array<dyn>> r = "
-        "[[d], [d]]; v, w = r; if (i == 1) { d = runtime(\"s\"); } }",
+        "for (var i = 0; i < runtime(3); i++) { "
+        "v, w = [[d], [d]]; if (i == 1) { d = runtime(\"s\"); } }",
         "print(v, w);" },
-      &typeid(TypeErrorEx), 81, 2, 83, 2 },
+      &typeid(TypeErrorEx), 48, 2, 52, 2 },
     { "err loc: a DYN key inserted into a typed dict marks the key (#49)",
       { "dict<str, int> k = {}; var dyn d = runtime(\"a\");",
         "for (var i = 0; i < runtime(3); i++) { "
@@ -2661,10 +2690,11 @@ static const std::vector<test> tests =
      * (`x` is parameter 0; sort's argument 0 is the ARRAY) */
     { "err loc: a CALLBACK's bind coercion keeps the builtin call's "
       "argument-list caret, not a callback parameter's",
-      { "var a = [3, 1, 2]; var dyn b = 0; b = runtime(\"x\"); append(a, b);",
-        "var r = sort(a, func(int x, int y) { return x < y; });",
+      { "var dyn a = [3, 1, 2]; var dyn b = 0; b = runtime(\"x\");",
+        "append(a, b);",
+        "var dyn r = sort(a, func(int x, int y) { return x < y; });",
         "print(r);" },
-      &typeid(TypeErrorEx), 14, 2, 54, 2 },
+      &typeid(TypeErrorEx), 18, 3, 58, 3 },
     /* a LITERAL argument keeps its span through the parser's constant
      * folding (MakeConstructFromConstVal), so its coercion marks the
      * literal in every engine. Until 2026-10-05 the folded literal was
@@ -10199,9 +10229,12 @@ static const std::vector<test> tests =
             "var t = s;",
             "t += [\"c\"];",
             "assert(len(s) == 3 && t == s && array_storage(s) == \"str\");",
-            /* Q2: `+=` grows s's own array<str>: an int is refused */
+            /* Q2: `+=` grows s's own array<str>: an int is refused (at run
+             * time through a `dyn` alias - through `t` it would make `t`
+             * an array<dyn>, which an alias of s cannot be: rule 1) */
             "var c0 = 0;",
-            "try { t += [1]; } catch (TypeErrorEx) { c0++; }",
+            "var dyn td = s;",
+            "try { td += [1]; } catch (TypeErrorEx) { c0++; }",
             "assert(c0 == 1 && len(s) == 3);",
             "var aa = split(\"x y\", str(runtime(\" \")));",
             "aa += aa;",
@@ -18000,7 +18033,7 @@ static const std::vector<test> tests =
      * The per-field coerce carets are pooled, so a dyn-laundered wrong value
      * throws with the offending arg's caret (differential = byte-identical). */
     { "struct: boxed construction with runtime args (native StructCtorBoxedV)",
-      { "struct Bag { array items; int n; }",
+      { "struct Bag { array<int> items; int n; }",
         "func mk(int x) { var a = [x, x * 2]; return Bag(a, x); }",
         "var b = mk(3);",
         "assert(b.items == [3, 6]); assert(b.n == 3);",
@@ -31852,7 +31885,12 @@ static bool dyn_fit_messages()
           "the dict key is declared 'str' but the key is an 'int'" },
         { "a none into a non-opt element", {
             "array<str> n = [\"x\"];",
-            "n[0] = runtime(none);" },
+            "var dyn holes = runtime([\"y\", none]);",
+            "var dyn h = holes[1];",
+            "n[0] = h;" },
+          /* (a `dyn?` value is refused statically, rule 3; a none read
+           * through a `dyn` - the gap plans/strict-container-types.md
+           * section 8 names - is the store's to refuse) */
           "the element is declared 'str' but the value is none" },
         { "a box parameter given a box of another kind", {
             "func tb(box<int> b) => *b;",
@@ -31860,17 +31898,17 @@ static bool dyn_fit_messages()
           "parameter 'b' is declared 'box<int>' but the argument is a "
           "'box<float>'" },
         { "a declared variable given a container with a dyn inside", {
-            "func rows(dyn x) { array<dyn> r = [x]; return r; }",
-            "array<int> v = rows(runtime(\"s\"));" },
-          "'v' is declared 'array<int>' but the value is an 'array<dyn>'" },
+            "array<int> v = [runtime(\"s\")];" },
+          /* the literal is built for `v` (rule 1) and refuses the string
+           * while it is built */
+          "cannot store a non-int value in an 'int' variable" },
         { "a multi-assignment target given a container with a dyn "
           "inside", {
-            "func rows(dyn x) {",
-            "    array<array<dyn>> r = [[1], [x]]; return r; }",
             "array<int> a = [0]; array<int> b = [0];",
-            "a, b = rows(runtime(\"s\"));" },
-          /* each row is an array<dyn>: the first target refuses it */
-          "'a' is declared 'array<int>' but the value is an 'array<dyn>'" },
+            "a, b = [[1], [runtime(\"s\")]];" },
+          /* the literal is unpacked as written: the second element is
+           * built for `b`, and refuses the string while it is built */
+          "cannot store a non-int value in an 'int' variable" },
         { "a field at construction", {
             "struct S { array<int> v; }",
             "var s = S(runtime([[1]]));" },
@@ -38928,14 +38966,16 @@ static bool myv_fit_round_trip()
         "print(call_it(runtime(true), runtime(\"s\"), runtime([1, 2]),",
         "              runtime({\"k\": [P(1)]}), runtime(P(3)),",
         "              runtime(C(4)), runtime(box(5)), runtime(box(P(6))),",
-        "              runtime(none), runtime([1]), runtime({1: 2}),",
+        "              runtime(none), runtime(cast<array<dyn>>([1])),",
+        "              runtime(cast<dict<int, dyn>>({1: 2})),",
         "              runtime([0]), runtime({})));",
         /* each annotation's CONTENT must survive: a wrong struct, a box
          * of one, one nested in a dict, an opt array's element */
         "struct Q { int x; }",
         "func probe(dyn s, dyn p, dyn bp, dyn d, opt dyn oa) {",
-        "    try { return call_it(true, s, [1], d, p, C(1), box(1), bp,",
-        "                         oa, [], {}, [], {}); }",
+        "    try { return call_it(true, s, [1], d, p, C(1), box(1), bp, oa,",
+        "                         cast<array<dyn>>([]),",
+        "                         cast<dict<int, dyn>>({}), [], {}); }",
         "    catch (TypeErrorEx) { return -1; }",
         "}",
         "print(probe(\"s\", P(1), box(P(1)), {}, none),",
@@ -38945,11 +38985,10 @@ static bool myv_fit_round_trip()
         "      probe(\"s\", P(1), box(P(1)), {\"k\": [Q(1)]}, none),",
         "      probe(\"s\", P(1), box(P(1)), {}, [\"a\"]),",
         "      probe(\"s\", P(1), box(P(1)), {}, [1]));",
-        "func rows(dyn x) { array<dyn> r = [x]; return r; }",
         "func stores(dyn d, dyn k) {",
         "    var out = [];",
         "    array<int> v = [1];",
-        "    try { v = rows(d); } catch (TypeErrorEx) { append(out, 1); }",
+        "    try { v = [d]; } catch (TypeErrorEx) { append(out, 1); }",
         "    W w = W([1], {}, box(1));",
         "    try { w.v = d; } catch (TypeErrorEx) { append(out, 2); }",
         "    array<array<int>> aa = [[1]];",
@@ -39167,10 +39206,10 @@ static bool disasm_opcode_families()
         "      logic(runtime(true), runtime(1)));",
         "print(checks(runtime(func(x) => x + 1)), defs(), cons(), arrs(2));",
         "try { throws(); } catch (P) { print(\"p\"); }",
-        "func rows(dyn x) { array<dyn> r = [x]; return r; }",
+        "func rows(dyn x) { var dyn r = [x]; return r; }",
         "func more(dyn d, dyn f, str s, array<bool> bs) {",
         "    array<int> v = [1];",
-        "    try { v = rows(d); } catch (TypeErrorEx) { }",
+        "    try { v = [d]; } catch (TypeErrorEx) { }",
         "    array<array<int>> aa = [[1, 2], [3, 4]];",
         "    try { aa[0] = d; } catch (TypeErrorEx) { }",
         "    var p = P(1, 1.0);",

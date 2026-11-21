@@ -105,6 +105,20 @@ struct TypeSym {
     bool round_got_dyn = false;
     bool coerces_dyn = false;
     /*
+     * Rule 1 (plans/strict-container-types.md): the ELEMENT analogue of
+     * the coercion above. A non-opt `dyn` stored or appended into an
+     * inferred container (`a[i] = d`, `append(a, d)`) does not widen a
+     * NUMERIC element type to `dyn` - the store converts the value at run
+     * time, checked - so `var a = [1]; append(a, runtime(2))` stays an
+     * array<int>; any other element type takes the `dyn` (commit_round).
+     * Bit 1: an array's element or a dict's value got one this round,
+     * bit 2: a dict's key. Choice 7: an explicit `none` stored the same
+     * way is a `none`, not "no element" - the component becomes nullable
+     * (bit 4: an element or a dict's value, bit 8: a dict's key), so
+     * `var a = [1]; a[0] = none` is an array<int?>.
+     */
+    unsigned char round_elem_dyn = 0;
+    /*
      * A contribution whose type the fixpoint could not settle (Unknown at
      * the top): this round, and as of the last committed round. A local
      * that ends Unknown having received one is NOT unconstrained - it was
@@ -504,6 +518,7 @@ private:
     bool type_fits(StaticTypeRef t, StaticTypeRef d);
     StaticTypeRef literal_dest_type(Expr14 *e);
     StaticTypeRef literal_into(Construct *rv, StaticTypeRef dest);
+    bool fresh_fits(StaticTypeRef t, StaticTypeRef d);
     void stamp_literal_into(Construct *rv, StaticTypeRef dest);
     void stamp_literal_repr(Construct *lit, StaticTypeRef dest);
     StaticTypeRef fixed_elem_dest(Construct *base, bool key);
@@ -524,6 +539,10 @@ private:
     void check_value_into(StaticTypeRef dest, StaticTypeRef vt,
                           const std::string &field, Construct *at);
     void check_declared_store(Expr14 *e);
+    bool new_container_expr(Construct *e);
+    void check_alias_exact(Construct *rv, Identifier *to);
+    void check_flow_exact(Construct *rv, StaticTypeRef dest,
+                          const std::string &what);
     void refuse_compound_misfit(Op op, StaticTypeRef place,
                                 StaticTypeRef v, Construct *at);
     void check_builtin_store(CallExpr *call);
@@ -534,7 +553,8 @@ private:
     void accumulate_foreach(ForeachStmt *fe);
     void spread_idlist(IdList *idl, Construct *rvalue, Op op);
     std::vector<StaticTypeRef> idlist_elem_types(IdList *idl,
-                                                 Construct *rvalue);
+                                                 Construct *rvalue,
+                                                 bool into = false);
     void check_compound_op(Op op, StaticTypeRef l, StaticTypeRef r,
                            Construct *lv, Construct *rv, Construct *at);
 
@@ -1373,7 +1393,23 @@ bool Inferencer::instantiate_round(Block *rootBlock)
                 continue;       /* not a template param */
             StaticTypeRef t =
                 static_type_resolve(type_of(call->args->elems[i].get()));
-            if (is_unknown(t)) { ready = false; break; }
+            /* (a container settled all the way down: an array<?> is not a
+             * signature - rule 1 makes the clone's array<?> refuse what it
+             * settles to; a function value's parameters may stay open) */
+            const std::function<bool(StaticTypeRef)> open_comp =
+                [&](StaticTypeRef c) -> bool {
+                    c = c ? static_type_resolve(c) : c;
+                    if (!c)
+                        return false;
+                    if (is_unknown(c))
+                        return true;
+                    if (c->kind == StaticTypeKind::Array)
+                        return open_comp(c->elem);
+                    if (c->kind == StaticTypeKind::Dict)
+                        return open_comp(c->key) || open_comp(c->val);
+                    return false;
+                };
+            if (open_comp(t)) { ready = false; break; }
             sig.push_back(t);
         }
         if (!ready)
@@ -4015,7 +4051,7 @@ void Inferencer::annotate_hints(Construct *n)
             auto *idl = static_cast<IdList *>(const_cast<Construct *>(lv));
             idl->fits.clear();
             const std::vector<StaticTypeRef> els =
-                idlist_elem_types(idl, e->rvalue.get());
+                idlist_elem_types(idl, e->rvalue.get(), true);
             std::vector<std::shared_ptr<const FitSpec>> fits(
                 idl->elems.size());
             bool any = false;
@@ -4030,6 +4066,19 @@ void Inferencer::annotate_hints(Construct *n)
             }
             if (any)
                 idl->fits = std::move(fits);
+            /* (an element literal that took its target's type is built
+             * for it - idlist_elem_types' `into`) */
+            auto *la = node_cast<LiteralArray>(e->rvalue.get());
+            if (la && la->elems.size() == idl->elems.size()) {
+                for (size_t i = 0; i < idl->elems.size(); i++) {
+                    if (idl->elems[i]->is_underscore())
+                        continue;
+                    Construct *el = la->elems[i].get();
+                    if (StaticTypeRef dt = literal_into(
+                            el, declared_type_of(idl->elems[i].get())))
+                        stamp_literal_into(el, dt);
+                }
+            }
         }
         /* a container literal stored into a FIXED array / dict type it
          * fits has that type (literal_dest_type): its elements widen to
@@ -5843,9 +5892,18 @@ StaticTypeRef Inferencer::type_of_node(const Construct *e)
         auto *la = static_cast<const LiteralArray *>(e);
         if (la->elems.empty())
             return A.array_of(A.none_ty());
+        /* (an element not settled yet leaves the literal's element type
+         * unsettled: the join would drop it - [1, ?] is not an
+         * array<int> yet, and a template instantiated for one is wrong
+         * once the element settles) */
         StaticTypeRef el = type_of(la->elems[0].get());
+        if (is_unknown(static_type_resolve(el)))
+            return A.array_of(bottom);
         for (size_t i = 1; i < la->elems.size(); i++) {
-            StaticTypeRef j = A.join(el, type_of(la->elems[i].get()));
+            const StaticTypeRef t = type_of(la->elems[i].get());
+            if (is_unknown(static_type_resolve(t)))
+                return A.array_of(bottom);
+            StaticTypeRef j = A.join(el, t);
             el = j ? j : A.dyn_ty();
         }
         return A.array_of(el);
@@ -6418,15 +6476,34 @@ StaticTypeRef Inferencer::builtin_result(const UniqueId *name, ExprList *args)
         return is_unknown(v) ? bottom : A.dict_of(k, v);
     }
     if (n == "dict") {
-        /* dict(default_value) -> dict<dyn, typeof default> (a default dict, so
-         * d[k] is non-opt). dict(pairs) -> dict<dyn,dyn>. A non-array arg is
-         * the default value, which becomes the dict's value type. */
+        /* dict(default_value) -> dict<?, typeof default> (a default dict,
+         * so d[k] is non-opt), the key UNFILLED: the stores fill it, as an
+         * empty literal's (rule 1 - a builtin's unknown component is never
+         * `dyn`, which would be a type of its own). A non-array arg is
+         * the default value, which becomes the dict's value type.
+         * dict(pairs) holds what its pairs hold: from an array<array<T>>
+         * a dict<T, T> (both unfilled for an empty one, dyn for pairs of
+         * no known type) - never unfilled while a pair holds something,
+         * or a later store would fill the key with a type the pairs'
+         * keys do not have. */
         if (args && args->elems.size() == 1) {
             StaticTypeRef a0 = static_type_resolve(arg(0));
             if (is_unknown(a0)) return bottom;
             if (a0->kind != StaticTypeKind::Array && a0->kind !=
                 StaticTypeKind::None)
-                return A.dict_of(A.dyn_ty(), a0);
+                return A.dict_of(A.none_ty(), a0);
+            if (a0->kind == StaticTypeKind::Array && a0->elem) {
+                StaticTypeRef p = static_type_resolve(a0->elem);
+                if (is_unknown(p)) return bottom;
+                if (p->kind == StaticTypeKind::None)
+                    return A.dict_of(A.none_ty(), A.none_ty());
+                if (p->kind == StaticTypeKind::Array && !p->opt && p->elem) {
+                    StaticTypeRef t = static_type_resolve(p->elem);
+                    if (is_unknown(t)) return bottom;
+                    if (t->kind != StaticTypeKind::None)
+                        return A.dict_of(p->elem, p->elem);
+                }
+            }
         }
         return A.dict_of(A.dyn_ty(), A.dyn_ty());
     }
@@ -6580,6 +6657,7 @@ void Inferencer::reset_round()
         if (s->func || s->pinned)   /* pinned: a prior input's fixed type */
             continue;
         s->round_got_dyn = false;   /* dyn-into-concrete coercion tracking */
+        s->round_elem_dyn = 0;
         s->round_got_unknown = false;
         s->round_arg_kinds = 0;
         /* A scalar annotation pins the type: seed the accumulator with the
@@ -6624,6 +6702,44 @@ void Inferencer::commit_round()
                 s->coerces_dyn = true;   /* keep numeric acc; runtime coerces */
             else
                 s->acc = A.dyn_ty();     /* non-numeric / dyn-only -> dyn */
+        }
+        /* rule 1, the element twin of the decision above: a NUMERIC
+         * element (key) keeps its type and its stores coerce the `dyn`
+         * at run time; any other folds the `dyn` back in */
+        if (s->round_elem_dyn) {
+            const StaticTypeRef ac = static_type_resolve(s->acc);
+            const auto fold = [&](StaticTypeRef c) -> StaticTypeRef {
+                const StaticTypeRef r = c ? static_type_resolve(c) : c;
+                if (r && (r->kind == StaticTypeKind::Int
+                          || r->kind == StaticTypeKind::Float))
+                    return c;
+                return A.with_opt(A.dyn_ty(), r && r->opt);
+            };
+            if (ac->kind == StaticTypeKind::Array && (s->round_elem_dyn & 1))
+                s->acc = A.array_of(fold(ac->elem), ac->opt);
+            else if (ac->kind == StaticTypeKind::Dict
+                     && (s->round_elem_dyn & 3))
+                s->acc = A.dict_of(
+                    (s->round_elem_dyn & 2) ? fold(ac->key) : ac->key,
+                    (s->round_elem_dyn & 1) ? fold(ac->val) : ac->val,
+                    ac->opt);
+            /* choice 7: a component a `none` was stored into is nullable
+             * (one nothing else filled: dyn?) */
+            const auto nul = [&](StaticTypeRef c) -> StaticTypeRef {
+                const StaticTypeRef r = c ? static_type_resolve(c) : c;
+                if (!r || r->kind == StaticTypeKind::None)
+                    return A.with_opt(A.dyn_ty(), true);
+                return A.with_opt(c, true);
+            };
+            const StaticTypeRef an = static_type_resolve(s->acc);
+            if (an->kind == StaticTypeKind::Array && (s->round_elem_dyn & 4))
+                s->acc = A.array_of(nul(an->elem), an->opt);
+            else if (an->kind == StaticTypeKind::Dict
+                     && (s->round_elem_dyn & 12))
+                s->acc = A.dict_of(
+                    (s->round_elem_dyn & 8) ? nul(an->key) : an->key,
+                    (s->round_elem_dyn & 4) ? nul(an->val) : an->val,
+                    an->opt);
         }
         if (!static_type_equal(s->acc, s->type)) {
             changed = true;
@@ -7069,7 +7185,8 @@ void Inferencer::spread_idlist(IdList *idl, Construct *rvalue, Op op)
         contribute(id_sym[t], ct, t->start, t->end);
     };
 
-    const std::vector<StaticTypeRef> els = idlist_elem_types(idl, rvalue);
+    const std::vector<StaticTypeRef> els =
+        idlist_elem_types(idl, rvalue, op == Op::assign);
     for (size_t i = 0; i < idl->elems.size(); i++)
         give(idl->elems[i].get(), els[i]);
 }
@@ -7077,17 +7194,26 @@ void Inferencer::spread_idlist(IdList *idl, Construct *rvalue, Op op)
 /* What each target of `a, b, ... = rvalue` receives: a literal of the
  * same length element by element, as written; else an array's element
  * type, the same for every target; else the scalar itself, spread. The
- * fixpoint (spread_idlist) and the check pass agree through this. */
+ * fixpoint (spread_idlist) and the check pass agree through this.
+ * `into` (a plain `=`): an element that is itself a container literal
+ * fitting a declared target has the target's type, as in `a = [d]`
+ * (literal_into) - the literal is unpacked as written. */
 std::vector<StaticTypeRef>
-Inferencer::idlist_elem_types(IdList *idl, Construct *rvalue)
+Inferencer::idlist_elem_types(IdList *idl, Construct *rvalue, bool into)
 {
     const size_t n = idl->elems.size();
     if (ctag(rvalue) == ConstructType::lit_arr) {
         auto *la = static_cast<LiteralArray *>(rvalue);
         if (la->elems.size() == n) {
             std::vector<StaticTypeRef> out;
-            for (size_t i = 0; i < n; i++)
-                out.push_back(type_of(la->elems[i].get()));
+            for (size_t i = 0; i < n; i++) {
+                Construct *el = la->elems[i].get();
+                StaticTypeRef d = nullptr;
+                if (into && !idl->elems[i]->is_underscore())
+                    d = literal_into(el,
+                                     declared_type_of(idl->elems[i].get()));
+                out.push_back(d ? d : type_of(el));
+            }
             return out;
         }
     }
@@ -7200,10 +7326,23 @@ void Inferencer::contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
                          "' ('" + static_type_to_string(d) +
                          "') cannot be none",
                      loc, loc_end, true);
+        /* ...and a value that MAY be none (a `T?`, a `dyn?`) is refused
+         * the same way, as a field's is (rule 3) */
+        else if (strict_dyn && ce && de && ce->opt && !de->opt
+                 && de->kind != StaticTypeKind::None && !has_unknown(de)
+                 && !has_unknown(ce))
+            conflict("an element of '" + std::string(s->name->val) +
+                         "' ('" + static_type_to_string(d) +
+                         "') cannot be none, and the value may be",
+                     loc, loc_end, true);
+        /* (a `dyn` value fits - a `dyn?` one an element that may be
+         * none: the store checks it at run time, as `int x = d` does) */
         const auto fits = [&](StaticTypeRef v, StaticTypeRef into) {
             const StaticTypeRef r = static_type_resolve(v);
-            return has_unknown(r) ||
-                   static_type_assignable(r, static_type_resolve(into));
+            const StaticTypeRef i = static_type_resolve(into);
+            return has_unknown(r)
+                || (r->kind == StaticTypeKind::Dyn && (!r->opt || i->opt))
+                || static_type_assignable(r, i);
         };
         const bool ok =
             d->kind == StaticTypeKind::Array ? fits(c->elem, d->elem)
@@ -7212,6 +7351,44 @@ void Inferencer::contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
                 : false;
         if (ok) {
             contribute(s, d, loc, loc_end);
+            return;
+        }
+    }
+    /* rule 1: a non-opt `dyn` element (key) value does not widen an
+     * inferred container's element type (round_elem_dyn) - contributed
+     * as an unfilled component, which join_elem absorbs */
+    if (!d && c) {
+        /* choice 7: an explicit `none` element (key) value - recorded
+         * (round_elem_dyn), its component contributed unfilled */
+        const auto is_none_val = [](StaticTypeRef t) {
+            const StaticTypeRef r = t ? static_type_resolve(t) : t;
+            return r && r->kind == StaticTypeKind::None;
+        };
+        if (c->kind == StaticTypeKind::Array && is_none_val(c->elem))
+            s->round_elem_dyn |= 4;
+        if (c->kind == StaticTypeKind::Dict) {
+            if (is_none_val(c->key))
+                s->round_elem_dyn |= 8;
+            if (is_none_val(c->val))
+                s->round_elem_dyn |= 4;
+        }
+        const auto is_dyn_val = [](StaticTypeRef t) {
+            const StaticTypeRef r = static_type_resolve(t);
+            return r && r->kind == StaticTypeKind::Dyn && !r->opt;
+        };
+        if (c->kind == StaticTypeKind::Array && is_dyn_val(c->elem)) {
+            s->round_elem_dyn |= 1;
+            contribute(s, A.array_of(A.none_ty(), c->opt), loc, loc_end);
+            return;
+        }
+        if (c->kind == StaticTypeKind::Dict
+                && (is_dyn_val(c->key) || is_dyn_val(c->val))) {
+            const bool k = is_dyn_val(c->key);
+            const bool v = is_dyn_val(c->val);
+            s->round_elem_dyn |= (v ? 1 : 0) | (k ? 2 : 0);
+            contribute(s, A.dict_of(k ? A.none_ty() : c->key,
+                                    v ? A.none_ty() : c->val, c->opt),
+                       loc, loc_end);
             return;
         }
     }
@@ -7253,8 +7430,13 @@ bool Inferencer::literal_fits(Construct *lit, StaticTypeRef d)
     if (ctag(lit) == ConstructType::lit_obj)
         return static_cast<LiteralObj *>(lit)->from_literal
             && type_fits(type_of(lit), d);
+    /* (a `dyn` element fits - a `dyn?` one an element that may be none:
+     * the place's fit check examines it at run time, rule 1) */
     const StaticTypeRef t = static_type_resolve(type_of(lit));
-    return has_unknown(t) || static_type_assignable(t, d);
+    return has_unknown(t)
+        || (t->kind == StaticTypeKind::Dyn
+            && (!t->opt || static_type_resolve(d)->opt))
+        || static_type_assignable(t, d);
 }
 
 /* literal_fits for a TYPE - a baked literal's: element by element, an
@@ -7295,14 +7477,49 @@ StaticTypeRef Inferencer::literal_into(Construct *rv, StaticTypeRef dest)
     if (!rv || !dest)
         return nullptr;
     const ConstructType t = ctag(rv);
-    if (t != ConstructType::lit_arr && t != ConstructType::lit_dict
-        && t != ConstructType::lit_obj)
-        return nullptr;
     dest = static_type_resolve(dest);
     if (dest->kind != StaticTypeKind::Array
         && dest->kind != StaticTypeKind::Dict)
         return nullptr;
+    /* rule 1: a builtin's NEW container (map, make_array, array(n, v),
+     * values ...) whose components are `dyn` or unfilled is made for the
+     * place - its values are examined by the place's fit check at run
+     * time, as a literal's `dyn` elements are */
+    if (t == ConstructType::call) {
+        auto *call = static_cast<CallExpr *>(rv);
+        auto *cid = node_cast<Identifier>(call->what.get());
+        if (!cid || !names_builtin(cid)
+                || !builtin_builds_container(cid->uid->val))
+            return nullptr;
+        return fresh_fits(type_of(rv), dest) ? dest : nullptr;
+    }
+    if (t != ConstructType::lit_arr && t != ConstructType::lit_dict
+        && t != ConstructType::lit_obj)
+        return nullptr;
     return literal_fits(rv, dest) ? dest : nullptr;
+}
+
+/* rule 1: does a builtin's new container of type `t` fit `d` - each
+ * component the same type, unfilled, or a `dyn` (a `dyn?` only where the
+ * place's component may be none; checked where it lands)? */
+bool Inferencer::fresh_fits(StaticTypeRef t, StaticTypeRef d)
+{
+    t = static_type_resolve(t);
+    d = static_type_resolve(d);
+    if (has_unknown(t))
+        return true;
+    if (t->kind != d->kind || (t->opt && !d->opt))
+        return false;
+    const auto comp = [&](StaticTypeRef c, StaticTypeRef p) {
+        c = static_type_resolve(c);
+        p = static_type_resolve(p);
+        return c->kind == StaticTypeKind::None
+            || (c->kind == StaticTypeKind::Dyn && (!c->opt || p->opt))
+            || static_type_equal(c, p);
+    };
+    if (t->kind == StaticTypeKind::Array)
+        return comp(t->elem, d->elem);
+    return comp(t->key, d->key) && comp(t->val, d->val);
 }
 
 /* The runtime half of literal_into: the literal's elements widen to
@@ -7310,6 +7527,8 @@ StaticTypeRef Inferencer::literal_into(Construct *rv, StaticTypeRef dest)
  * stamp then leaves them alone), applied once to a baked value. */
 void Inferencer::stamp_literal_into(Construct *rv, StaticTypeRef dest)
 {
+    if (ctag(rv) == ConstructType::call)
+        return;             /* a builtin's new container (literal_into) */
     if (ctag(rv) == ConstructType::lit_obj) {
         stamp_literal_repr(rv, dest);    /* the value rebuilt, once */
         return;
@@ -7709,6 +7928,76 @@ void Inferencer::stamp_literal_args(CallExpr *call)
 
 /* `x = <literal>` / `s.f = <literal>` (literal_into) into the DECLARED
  * type of the variable or the field */
+/* Rule 1: does `e` make a NEW container - one no other name holds yet: a
+ * literal, a cast, a slice, an array sum, a builtin's new container (not
+ * sort / rev_sort / reverse, which return the array they were given), or
+ * a ternary / `??` both of whose arms do? */
+bool Inferencer::new_container_expr(Construct *e)
+{
+    switch (ctag(e)) {
+    case ConstructType::lit_arr:
+    case ConstructType::lit_dict:
+    case ConstructType::lit_obj:
+    case ConstructType::cast:
+    case ConstructType::slice:
+    case ConstructType::expr04:
+        return true;
+    case ConstructType::ternary: {
+        auto *t = static_cast<TernaryExpr *>(e);
+        return new_container_expr(t->thenExpr.get())
+            && new_container_expr(t->elseExpr.get());
+    }
+    case ConstructType::call: {
+        auto *call = static_cast<CallExpr *>(e);
+        auto *cid = node_cast<Identifier>(call->what.get());
+        if (!cid || !names_builtin(cid))
+            return false;
+        const std::string_view n = cid->uid->val;
+        return builtin_builds_container(n) && n != "sort"
+            && n != "rev_sort" && n != "reverse";
+    }
+    default:
+        return false;
+    }
+}
+
+/*
+ * Rule 1 (plans/strict-container-types.md): a container VALUE that flows
+ * into a variable - one another name may hold, not a new one - has exactly
+ * the variable's type. `var x = [1]; var y = ["s"]; var c = x; c = y;`
+ * would make `c` an array<dyn> while it holds `x`'s array<int>, and `var b
+ * = a; b[0] = "s"` an array<dyn> aliasing `a`: one container seen as two
+ * types. The variable's components may be unfilled (an empty literal's),
+ * and its top level may be `?`. cast<T>(x) converts, as a new container.
+ */
+void Inferencer::check_alias_exact(Construct *rv, Identifier *to)
+{
+    check_flow_exact(rv, type_of(to), "'" + std::string(to->uid->val) + "'");
+}
+
+/* The flow behind check_alias_exact: `rv` lands where the type is `dest`
+ * (`what` names the place) - a variable, a function's result (a return),
+ * a ternary's value (an arm). */
+void Inferencer::check_flow_exact(Construct *rv, StaticTypeRef dest,
+                                  const std::string &what)
+{
+    if (!rv || !dest || new_container_expr(rv))
+        return;
+    StaticTypeRef r = strip(static_type_resolve(type_of(rv)));
+    StaticTypeRef l = strip(static_type_resolve(dest));
+    if ((r->kind != StaticTypeKind::Array && r->kind != StaticTypeKind::Dict)
+            || r->kind != l->kind || has_unknown(r) || has_unknown(l))
+        return;
+    if (static_type_assignable(r, l) && static_type_assignable(l, r))
+        return;
+    mismatch(what + " has type '" + static_type_to_string(l)
+                 + "' but the container it is given is an '"
+                 + static_type_to_string(r) + "' - a container's type is "
+                 "exact (write cast<" + static_type_to_string(l)
+                 + ">(...) to convert it)",
+             rv->start, rv->end);
+}
+
 StaticTypeRef Inferencer::literal_dest_type(Expr14 *e)
 {
     const ConstructType lt = ctag(e->lvalue.get());
@@ -8463,6 +8752,18 @@ void Inferencer::check(Construct *n)
         return;
     }
 
+    /* rule 1: a container a name may hold, returned or picked by a
+     * ternary, has exactly the type of the result it becomes */
+    if (strict_dyn && ctag(n) == ConstructType::ret && cur_func) {
+        check_flow_exact(static_cast<ReturnStmt *>(n)->elem.get(),
+                         cur_func->ret, "the function's result");
+    }
+    if (strict_dyn && ctag(n) == ConstructType::ternary) {
+        auto *te = static_cast<TernaryExpr *>(n);
+        check_flow_exact(te->thenExpr.get(), type_of(te), "the ternary");
+        check_flow_exact(te->elseExpr.get(), type_of(te), "the ternary");
+    }
+
     if (ctag(n) == ConstructType::block) {
         auto *b = static_cast<Block *>(n);
         /* guard-clause narrowing: after `if (x == none) <return/throw>`, x is
@@ -8746,6 +9047,11 @@ void Inferencer::check(Construct *n)
 
         if (!(e14->fl & pFlags::pInDecl))
             check_declared_store(e14);
+
+        if (strict_dyn && e14->op == Op::assign
+                && ctag(e14->lvalue.get()) == ConstructType::id)
+            check_alias_exact(e14->rvalue.get(),
+                              static_cast<Identifier *>(e14->lvalue.get()));
 
         if (e14->op != Op::assign) {
             /* compound assign: validate the implied binary op - for each

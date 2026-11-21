@@ -2932,10 +2932,8 @@ EvalValue build_array_from_values(const EvalValue *vals, size_t n,
     return SharedArrayObj(std::move(gvec));
 }
 
-/* A container literal's numeric WIDENING (LiteralArray::elem_coerce,
- * LiteralDict::val_coerce): int/bool -> float, bool -> int; every other
- * value (none included) as it is. The VM applies the same rule with
- * CoerceNumV on the element's run slot. */
+/* A numeric WIDENING (a subscript's key, a store's value): int/bool ->
+ * float, bool -> int; every other value (none included) as it is. */
 EvalValue literal_widen(EvalValue v, DeclType dt)
 {
     if (dt == DeclType::f) {
@@ -2947,6 +2945,23 @@ EvalValue literal_widen(EvalValue v, DeclType dt)
         return EvalValue(static_cast<int_type>(v.get<bool>() ? 1 : 0));
     }
     return v;
+}
+
+/* A container LITERAL's element widening (LiteralArray::elem_coerce,
+ * LiteralDict::key_coerce / val_coerce): the widening above, CHECKED - a
+ * `dyn` element that is not a number refuses, as a typed store does
+ * (coerce_to_decl_type). Rule 1 (plans/strict-container-types.md): a
+ * literal built for an array<int> place may hold a `dyn` element, and the
+ * literal refuses it while it is built, before anything is stored. The VM
+ * applies the same rule with CoerceNumV on the element's run slot. At
+ * compile time (`at_compile`, a literal the parser folds) no element is a
+ * `dyn`, so a misfit is a type error inference reports: it passes here. */
+static EvalValue literal_elem_widen(EvalValue v, DeclType dt,
+                                    bool at_compile)
+{
+    if (at_compile || (dt != DeclType::i && dt != DeclType::f))
+        return literal_widen(std::move(v), dt);
+    return coerce_to_decl_type(v, dt, -1);
 }
 
 /* a fully CONSTANT literal's values, widened by their own join
@@ -3081,7 +3096,8 @@ EvalValue LiteralArray::do_eval(EvalContext *ctx, bool rec) const
     const auto widen = [&](EvalValue *buf) {
         if (elem_coerce != DeclType::none) {
             for (size_t i = 0; i < n; i++)
-                buf[i] = literal_widen(std::move(buf[i]), elem_coerce);
+                buf[i] = literal_elem_widen(std::move(buf[i]), elem_coerce,
+                                            ctx->in_const_eval());
         } else if (is_const && !unpacked && !annotated
                    && ctx->in_const_eval()) {
             /* only the PARSE-TIME build: at run time an unstamped literal
@@ -4107,7 +4123,8 @@ throw_operand_div_overflow(const Construct *parent, const Construct *op)
  * about it at the operand as `parent` writes it (#68) */
 static void
 num_binop_loc(EvalValue &acc, const Construct *parent,
-              const Construct *operand, EvalContext *ctx, NumBinOp op)
+              const Construct *operand, EvalContext *ctx, NumBinOp op,
+              bool sum = false)
 {
     EvalValue v;
     try {
@@ -4117,6 +4134,8 @@ num_binop_loc(EvalValue &acc, const Construct *parent,
         throw;
     }
     try {
+        /* `sum`: acc is the copy an array `+` builds (ArrSumScope) */
+        const ArrSumScope g(sum ? acc : none);
         num_bin_op(acc, v, op);
     } catch (Exception &e) {
         stamp_operand_loc(operand, e, parent);
@@ -4313,7 +4332,7 @@ EvalValue Expr04::do_eval(EvalContext *ctx, bool rec) const
 
         switch (op) {
             case Op::plus:
-                num_binop_loc(val, this, e.get(), ctx, &Type::add);
+                num_binop_loc(val, this, e.get(), ctx, &Type::add, true);
                 break;
             case Op::minus:
                 num_binop_loc(val, this, e.get(), ctx, &Type::sub);
@@ -8465,14 +8484,17 @@ EvalValue LiteralDict::do_eval(EvalContext *ctx, bool rec) const
     const auto widen_vals = [&](EvalValue *buf) {
         if (key_coerce != DeclType::none) {
             for (size_t i = 0; i < np; i++)
-                buf[2 * i] = literal_widen(std::move(buf[2 * i]), key_coerce);
+                buf[2 * i] = literal_elem_widen(std::move(buf[2 * i]),
+                                                key_coerce,
+                                                ctx->in_const_eval());
         } else if (is_const && !annotated && ctx->in_const_eval()) {
             const_values_widen(buf, np, 2, ctx->const_ctx);
         }
         if (val_coerce != DeclType::none) {
             for (size_t i = 0; i < np; i++)
                 buf[2 * i + 1] =
-                    literal_widen(std::move(buf[2 * i + 1]), val_coerce);
+                    literal_elem_widen(std::move(buf[2 * i + 1]), val_coerce,
+                                       ctx->in_const_eval());
         } else if (is_const && !annotated && ctx->in_const_eval()) {
             const_values_widen(buf + 1, np, 2, ctx->const_ctx);
         }

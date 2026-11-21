@@ -3013,12 +3013,13 @@ struct Codegen {
     }
 
     /* A container literal's element WIDENING (LiteralArray::elem_coerce,
-     * LiteralDict::val_coerce) - the tree-walker's literal_widen: a
+     * LiteralDict::val_coerce) - the tree-walker's literal_elem_widen: a
      * CoerceNumV IN PLACE on the element's run slot (a temp this literal
      * owns), skipped where the element is already of the literal's kind.
      * CoerceNumV widens int/bool -> float and bool -> int and passes
-     * `none`; it cannot meet a non-numeric value here, since the
-     * literal's element type is the join of its elements' types. */
+     * `none`; a non-numeric value - only a `dyn` element of a literal
+     * built for a typed place can be one (rule 1) - is refused there,
+     * while the literal is built. */
     void emit_literal_widen(const Construct *elem, DeclType dt, int slot,
                             const Construct *lit, std::vector<CgInstr> &ops)
     {

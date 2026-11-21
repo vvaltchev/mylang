@@ -251,53 +251,35 @@ bool fit_miss(const EvalValue &v, FitMisfit &why)
 bool fits(const EvalValue &v, const TypeAnnot *a, FitWalk &w,
           FitMisfit &why);
 
-/* a `dyn` component and an absent one (a generic `array`, a box of any
- * element) say the same: no type */
-const TypeAnnot *ct_typed(const TypeAnnot *a)
+/* rule 1 (plans/strict-container-types.md): are two component types
+ * EXACTLY the same type - `dyn` a type of its own, the `?` included; an
+ * absent component (a generic `array`) matches any */
+bool ct_exact(const TypeAnnot *c, const TypeAnnot *p)
 {
-    return a && a->kind != DeclType::dyn ? a : nullptr;
-}
-
-/* are two component types the same type? (a container's own type is
- * interned, a place's annotation need not be) */
-bool ct_same(const TypeAnnot *c, const TypeAnnot *p)
-{
-    c = ct_typed(c);
-    p = ct_typed(p);
-    if (c == p)
+    if (!p || c == p)
         return true;
-    if (!c || !p)
+    if (!c)
         return false;
     return c->kind == p->kind && c->opt == p->opt && c->strct == p->strct
-           && ct_same(c->elem.get(), p->elem.get())
-           && ct_same(c->key.get(), p->key.get())
-           && ct_same(c->val.get(), p->val.get());
+           && ct_exact(c->elem.get(), p->elem.get())
+           && ct_exact(c->key.get(), p->key.get())
+           && ct_exact(c->val.get(), p->val.get());
 }
 
 /*
  * Q2 increment 3 (plans/typed-containers.md, section 3, decision A): may
  * a container whose own type is `ct` enter a place annotated `a` (of the
- * same kind)? A component the place types `dyn` takes anything - a store
- * into it is checked against the container's own type (increment 2) - and
- * every other component must be the container's exactly, since a store
- * into it is checked against nothing: an array<int> holds no int? because
- * a place called it array<int?>, and an array<array<int>> does not enter
- * an array<array<dyn>>, whose elements take any array unchecked.
+ * same kind)? Every component must be the container's exactly (rule 1,
+ * plans/strict-container-types.md - a `dyn` component took anything
+ * until 2026-11-20): an array<int> holds no int? because a place called
+ * it array<int?>, nor a string because a place called it array<dyn>.
  */
 bool ct_enters(const TypeAnnot *ct, const TypeAnnot *a)
 {
-    /* (rule 3: a `dyn` component is never none, so it takes no
-     * component that may be - an array<dyn?> does not enter an
-     * array<dyn>) */
-    const auto comp = [](const TypeAnnot *c, const TypeAnnot *pl) {
-        if (pl && pl->kind == DeclType::dyn && !pl->opt && c && c->opt)
-            return false;
-        return !ct_typed(pl) || ct_same(c, pl);
-    };
     if (a->kind == DeclType::arr)
-        return comp(ct->elem.get(), a->elem.get());
-    return comp(ct->key.get(), a->key.get())
-           && comp(ct->val.get(), a->val.get());
+        return ct_exact(ct->elem.get(), a->elem.get());
+    return ct_exact(ct->key.get(), a->key.get())
+           && ct_exact(ct->val.get(), a->val.get());
 }
 
 /* a typed container refused at a place: what it is, by its type */
