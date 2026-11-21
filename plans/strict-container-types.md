@@ -315,7 +315,23 @@ prints `0`. Choice 6 fixes it.
 3. Rule 1: element contributions, fresh containers, exact assignment;
    decision A's `ct_enters` loses the `dyn` component's tolerance; and
    choice 7 (moved here from increment 2: it is an element
-   contribution rule).
+   contribution rule). STARTED, on branch `wip-strict-rule1` (not
+   pushed). Step 3a is written: `static_type_elem_compat` and
+   `ct_enters` are exact; a non-opt `dyn` value fits a declared
+   element (checked at run time, as `int x = d` is); a builtin's NEW
+   container with `dyn` components fits a declared place
+   (`fresh_fits`, the place's fit check examining it); and a `dyn`
+   stored into an inferred NUMERIC element keeps its type (the element
+   twin of the `var s = 0; s = s + d` coercion, `round_elem_dyn`), any
+   other element type taking the `dyn`. Measured: every corpus program
+   but 93_dyn_fit compiles; 10 `-rt` cases fail, all tests that used
+   an `array<dyn>` VARIABLE to stand for a value the compiler cannot
+   see (now a compile error, the rule's point) - they need rewriting
+   through a `dyn` name. It also exposed #68 (an inlined call's value
+   as an operand careted its body), fixed separately. Left: step 3b
+   (a variable assigned two different container values - the join to
+   `dyn`, choice 1; an element store into an ALIASED container checked
+   against its type) and choice 7.
 4. Rule 4 (storage follows the type), rule 5 (bare annotations are
    holes), rule 6 (`none` keys - already work, gets a test).
 5. Rule 8.
