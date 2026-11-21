@@ -1,0 +1,9 @@
+# INT-SOURCE: ../functional/130_array_zero_fill.my
+# INT-ENGINES: tw default nj nbi
+#
+# INT unit (plans/strict-container-types.md, choice 6): array(n) fills
+# its element type's zero value - every kind (a scalar, a str, a fresh
+# array or dict of its own type, a POD struct flat, a struct with boxed
+# fields, a box, a class instance), and none for a nullable element type
+# or an array nothing types. The functional program runs as a coverage
+# unit (INT-SOURCE).
