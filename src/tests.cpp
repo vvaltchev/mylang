@@ -2121,8 +2121,15 @@ static const std::vector<test> tests =
       { "func mk(n) { var w = n; return func [w] (x) { return x; }; }",
         "var g = mk(2);",
         "assert(str(g(1)) == \"1.000000\" && g(2.5) == 2.5);",
+        /* (a capturing closure's `opt` parameter joins - a NAMED
+         * function's is a template parameter, rule 8.1: one instance
+         * per argument type, nothing converted) */
+        "var cw = 1;",
+        "var oc = func [cw] (opt z) { return z; };",
+        "assert(str(oc(3)) == \"3.000000\" && oc(1.5) == 1.5);",
+        "assert(oc() == none);",
         "func o(opt z) { return z; }",
-        "assert(str(o(3)) == \"3.000000\" && o(1.5) == 1.5 && o() == none);"
+        "assert(str(o(3)) == \"3\" && o(1.5) == 1.5 && o() == none);"
         } },
     { "coerce: a joined int param converts a bool argument",
       { "var c = 1;",
@@ -19904,7 +19911,19 @@ static const std::vector<test> tests =
     { "template: the non-opt param can take different types (no conflict)",
       { "func g(a, opt tag){ return a; }",
         "assert(g(1) == 1); assert(g(\"s\") == \"s\"); assert(g(2.5) == 2.5);" } },
-    { "template: a function with only an opt param stays join (narrows)",
+    /* rule 8.1: an `opt` parameter is a template parameter - an instance
+     * per argument type, `none` its own, where it is a `dyn?` and its
+     * non-none branches type-check */
+    { "rule 8.1: two argument types for an opt parameter are two instances",
+      { "func f(opt x) { if (x == none) return \"n\"; return str(x); }",
+        "assert(f(2) == \"2\" && f(\"s\") == \"s\" && f() == \"n\");" } },
+    { "rule 8.1: an opt instance keeps its argument's type",
+      { "func f(opt x) => x;", "var a = f(2); var b = f(2.5);",
+        "assert(typestr(a) == \"int\" && typestr(b) == \"float\");" } },
+    { "rule 8.1: a none-only opt parameter still refuses an unguarded use",
+      { "func f(opt x) => x + 1;", "f(none);" },
+      &typeid(NullabilityEx) },
+    { "template: a function with only an opt param is a template (narrows)",
       { "func f(opt x){ if (x != none) return x + 1; return 0; }",
         "assert(f(5) == 6); assert(f(none) == 0);" } },
     { "template: a write-once, calls-only var-bound lambda is a template",
@@ -24135,8 +24154,12 @@ static const std::vector<repl_test> repl_tests =
      * the call by its value */
     { "a constant call across inputs is typed as a run-time one",
       { { "pure func id96(opt v) => v", "" },
-        { "var x96 = id96(2)", "DynRequiredEx" },
-        { "var y96 = id96(int(runtime(2)))", "DynRequiredEx" },
+        /* (rule 8.1: id96's `opt` parameter is a template parameter, so
+         * each call is an int instance, folded or not) */
+        { "var x96 = id96(2)", "=> 2" },
+        { ":type x96", "int" },
+        { "var y96 = id96(int(runtime(2)))", "=> 2" },
+        { ":type y96", "int" },
         { "var dyn z96 = id96(2)", "" },
         { "z96", "=> 2" } } },
 
@@ -31204,7 +31227,8 @@ static bool late_fold_shape()
     const char *src =
         "pure func sq(int n) => n * n;\n"
         "pure func id(opt v) => v;\n"
-        "print(sq(4) + 1, id(2), id(2.5));\n";
+        "pure func cv(float v) => v;\n"
+        "print(sq(4) + 1, id(2), id(2.5), cv(2));\n";
     /* typed, then untyped (-nti: both runs untyped, so all three fold) */
     for (const bool typed : { true, false }) {
         std::vector<Tok> toks;
@@ -31218,22 +31242,26 @@ static bool late_fold_shape()
         for (auto &e : b->elems)
             if (ctag(e.get()) == ConstructType::call)
                 pr = static_cast<CallExpr *>(e.get());
-        if (!pr || pr->args->elems.size() != 3) {
+        if (!pr || pr->args->elems.size() != 4) {
             fprintf(stderr, "late_fold_shape: no print call\n");
             return false;
         }
         const auto &a = pr->args->elems;
         const bool folded = ctag(a[0].get()) == ConstructType::lit_int
             && static_cast<LiteralInt *>(a[0].get())->ival() == 17;
-        /* id's parameter joins int and float: the int argument would be
-         * converted, so id(2) runs; id(2.5) fits as is and folds */
-        const bool id2 = ctag(a[1].get()) == (typed ? ConstructType::call
-                                                    : ConstructType::lit_int);
+        /* id's `opt` parameter is a template parameter (rule 8.1): each
+         * argument fits its own instance as is, so both fold; cv's int
+         * argument would be converted by the bind, so cv(2) runs (when
+         * typed - untyped, the parse's run converted it the same way) */
+        const bool id2 = ctag(a[1].get()) == ConstructType::lit_int;
         const bool folded2 = ctag(a[2].get()) == ConstructType::lit_float;
-        if (!folded || !id2 || !folded2) {
+        const bool cv2 = ctag(a[3].get()) == (typed ? ConstructType::call
+                                                    : ConstructType::lit_float);
+        if (!folded || !id2 || !folded2 || !cv2) {
             fprintf(stderr, "late_fold_shape (%s): sq(4) + 1 folded %d, "
-                    "id(2) as expected %d, id(2.5) folded %d\n",
-                    typed ? "typed" : "-nti", folded, id2, folded2);
+                    "id(2) folded %d, id(2.5) folded %d, cv(2) as "
+                    "expected %d\n", typed ? "typed" : "-nti", folded, id2,
+                    folded2, cv2);
             return false;
         }
     }
@@ -31822,7 +31850,9 @@ static bool parse_time_typed_runs()
             "print(T2[0](3), T2[int(runtime(0))](3), T2[1](3),",
             "  T2[int(runtime(1))](3), T2[2](3), T2[int(runtime(2))](3),",
             "  T2[3](), T2[int(runtime(3))]());" },
-          "3.000000 3.000000 3.000000 3.000000 3.000000 3.000000 "
+          /* (o2's `opt` parameter makes it a template - rule 8.1 - so
+           * it runs untyped through the array) */
+          "3.000000 3.000000 3.000000 3.000000 3 3 "
           "7.000000 7.000000 \n", true, false },
         /* a throw in a typed copy is the program's compile error, with
          * the program's caret and backtrace */

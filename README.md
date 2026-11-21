@@ -1500,9 +1500,14 @@ Key rules:
     annotate it (`func f(int n)`) — then the function is concrete and a
     wrong-typed call is an error — or mark it `dyn` for one dynamic instance
     that accepts anything. Return types are inferred from what each instance
-    returns. (Recursion and forward references work; an anonymous lambda or a
-    function with an `opt` parameter is not a template — it uses the join model
-    below.)
+    returns. (Recursion and forward references work; an anonymous lambda is not
+    a template — it uses the join model below.) An un-annotated **`opt`**
+    parameter is a template parameter too: each instance is keyed by the
+    argument's type without its `?` (`int` and `int?` share one), and a
+    `none` or omitted argument has an instance of its own, where the parameter
+    is a `dyn?` - so `func f(opt x)` called as `f(2)`, `f(2.5)` and `f()` gets
+    three instances, and `f(2)` stays an `int`. (A `none` given to an `opt`
+    parameter adds nothing to its type: its declaration already allows `none`.)
   * A **concrete** function's (typed or `dyn` params) parameter and return
     types are the **join** of how it is called and what it returns, across the
     whole program. A typed parameter called with an incompatible type is an
