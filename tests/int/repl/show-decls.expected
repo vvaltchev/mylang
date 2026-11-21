@@ -1,17 +1,17 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
->> >> >> >> >> >> >> >> >> >> >> >> >> => "Q(bool b, int i, float f, str s, array a, dict d, dyn y, box<int> bx, P p, opt dyn od, opt array oa, opt dict odc, array<int>? ai, dict<str,int> di, box<float>? bf, opt K ok)"
+>> >> >> >> >> >> >> >> >> >> >> >> >> => "Q(bool b, int i, float f, str s, array<dyn> a, dict<str,dyn> d, dyn y, box<int> bx, P p, opt dyn od, array<dyn>? oa, dict<int,str>? odc, array<int>? ai, dict<str,int> di, box<float>? bf, opt K ok)"
 >> b: bool 
 i: int 
 f: float 
 s: str 
-a: array 
-d: dict 
+a: array<dyn> 
+d: dict<str,dyn> 
 y: dyn 
 bx: box<int> 
 p: P 
 od: opt dyn 
-oa: opt array 
-odc: opt dict 
+oa: array<dyn>? 
+odc: dict<int,str>? 
 ai: array<int>? 
 di: dict<str,int> 
 bf: box<float>? 

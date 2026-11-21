@@ -695,7 +695,15 @@ compile errors. (A plain `var x;` is implicitly nullable — equivalent to
     `f = 5;`), and `int x = true;` stores `1`.
   * **`array`/`dict`** are *generic*: they only require the value to be an array
     / dict, while its element/key/value types are inferred as usual — so
-    `array nums = [1,2,3]` is still a fast flat `array<int>`.
+    `array nums = [1,2,3]` is still a fast flat `array<int>`. A bare `array` /
+    `dict` is a **hole** the compiler fills, never a type of its own: on a
+    variable, from what the variable receives; on a **parameter**, per call —
+    the function is a *template* over it (see *Static type inference*), so
+    `func f(array a)` called with an `array<int>` and with an `array<str>` gets
+    one instance for each, where the annotation only checks the argument is an
+    array. A **struct field** has no single receiver to fill it from, so it must
+    name its whole type (`array<dyn> t;`, `dict<str, int>? m;`): a bare `array`
+    / `dict` field is a compile error.
   * **Parameterized containers** `array<T>` and `dict<K, V>` pin the element
     (and key) types, and **compose recursively**:
     ```C#
@@ -1478,7 +1486,9 @@ Key rules:
     inline `map` callback) is unaffected. Use `dyn` when you genuinely want a
     variable to hold differently-typed functions.
   * **A function with un-annotated parameters is a *template*** (like a C++
-    template), not a fixed-type function. It is **not type-checked on its own**;
+    template), not a fixed-type function - and so is one with a parameter
+    annotated with a bare `array` / `dict`, which then only checks the argument
+    is an array / a dict. It is **not type-checked on its own**;
     instead it is **instantiated per call-site signature**, and each instance is
     type-checked + compiled separately. So `sq` above works for `int`, and would
     *independently* work for `float` — calling a template with two different
@@ -2966,7 +2976,8 @@ print(build(Point, 1).y, ctor(2, 3).x);   # 10 2
 ```
 
 **Fields take the same explicit types as variables** — `bool`, `int`, `float`,
-`str`, `array`, `dict`, another struct type, or `dyn`. Two rules keep a
+`str`, `array<T>`, `dict<K, V>`, another struct type, or `dyn` (a bare `array`
+/ `dict` is refused: a field names its whole type). Two rules keep a
 struct a lean data container: a field must have an explicit type (no `var`),
 and `opt` is allowed only on a `dyn`/`array`/`dict` field or a field of a
 class type (see *Classes*; a non-opt field is guaranteed never `none`). An

@@ -6039,8 +6039,12 @@ printed `49 50 60 42 81`, the VM aborted).
 
 
 A **named** function with ≥1 *template param* — un-annotated, non-`dyn`,
-non-`opt` — is a **template** (`FuncInfo::is_template`, set in
-`declare_funcdecl`): not type-checked in isolation, but **instantiated per
+non-`opt`, or annotated with a bare `array` / `dict` (rule 5: a HOLE each
+call fills; the annotation then only checks the kind, in the instance) —
+is a **template** (`FuncInfo::is_template`, set in `declare_funcdecl`;
+**`template_param` is the one predicate**, asked by the instantiation
+rounds, the value-template rounds and the lambda marking, so a new site
+must ask it too): not type-checked in isolation, but **instantiated per
 call-site signature** as a typed clone the ordinary concrete-function path
 handles. So `func f(x){var t=x+1; return t;}` never needs `var dyn t`, a
 never-called template never errors, and `f(1); f("s")` makes two instances not a

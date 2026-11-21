@@ -5541,14 +5541,14 @@ static const std::vector<test> tests =
          * engines (differential). */
         "general lvalue-chain store: mixed member/subscript steps",
         {
-            "struct P { int x; array t; }",   /* boxed (has a ref field) */
+            "struct P { int x; array<dyn> t; }",   /* boxed (has a ref field) */
             "var a = [P(1, []), P(2, [])];",
             "a[0].x = 99; assert(a[0].x == 99); assert(a[1].x == 2);",
             "a[1].x += 8; assert(a[1].x == 10);",   /* compound */
-            "struct Q { P p; array t2; }",
+            "struct Q { P p; array<dyn> t2; }",
             "var q = Q(P(5, []), []);",
             "q.p.x = 42; assert(q.p.x == 42);",     /* member.member */
-            "struct Box { array items; }",
+            "struct Box { array<dyn> items; }",
             "var b = Box([1, 2, 3]);",
             "b.items[1] = 88; assert(b.items[1] == 88);",   /* member.subscript */
             "var b2 = Box([P(1, []), P(2, [])]);",
@@ -5578,10 +5578,10 @@ static const std::vector<test> tests =
     /* Error paths (byte-identical carets on both engines): an intermediate
      * OOB, an intermediate missing dict key. */
     { "general lvalue-chain store: intermediate out of bounds",
-      { "struct P { int x; array t; } var a = [P(1, [])]; a[9].x = 5;" },
+      { "struct P { int x; array<dyn> t; } var a = [P(1, [])]; a[9].x = 5;" },
       &typeid(OutOfBoundsEx) },
     { "general lvalue-chain store: intermediate missing dict key",
-      { "struct P { int x; array t; } var d = {\"p\": P(1, [])};",
+      { "struct P { int x; array<dyn> t; } var d = {\"p\": P(1, [])};",
         "d.missing.x = 5;" }, &typeid(KeyNotFoundEx) },
     {
         "global array/dict base store (a function reads the global)",
@@ -6611,7 +6611,7 @@ static const std::vector<test> tests =
       { "func mkd() { var d = {\"cnt\": 5}; return d; }",
         "var dyn dd = mkd(); dd.cnt++; dd.cnt--; dd.cnt++;",
         "assert(dd.cnt == 6);",
-        "struct P { int x; array t; }",     /* boxed struct (non-POD field) */
+        "struct P { int x; array<dyn> t; }",  /* boxed (non-POD field) */
         "func mkp() { return P(10, []); }",
         "var dyn p = mkp(); p.x++;",
         "assert(p.x == 11);" } },
@@ -6752,8 +6752,8 @@ static const std::vector<test> tests =
       { "func f() { g[0][1] = 1; }", "if (runtime(1) > 0) { f(); }", "var g = [[1, 2]];" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     { "err loc: unbound global base - mixed lvalue chain store",
-      { "func f() { g.a[0] = 1; }", "if (runtime(1) > 0) { f(); }", "struct Q { array a; }",
-        "var g = Q([1, 2]);" },
+      { "func f() { g.a[0] = 1; }", "if (runtime(1) > 0) { f(); }",
+        "struct Q { array<dyn> a; }", "var g = Q([1, 2]);" },
       &typeid(UnboundSymbolEx), 12, 1, 14, 1 },
     { "err loc: unbound global base - nested chain ++",
       { "func f() { g[0][1]++; }", "if (runtime(1) > 0) { f(); }", "var g = [[1, 2]];" },
@@ -18052,19 +18052,42 @@ static const std::vector<test> tests =
         "assert(defined(Point));" } },
     { "struct: explicit field types incl dyn / array? / struct / const",
       { "struct A { int a; }",
-        "struct B { dyn d; array? arr; A nested; float f; const K = 3; }",
+        "struct B { dyn d; array<dyn>? arr; A nested; float f; const K = 3; }",
         "assert(defined(B));" } },
     { "struct: a decl inside a function is scoped to it",
       { "func f() { struct Local { int v; } return defined(Local); }",
         "assert(f() == true);" } },
     { "struct err: a var field is rejected",
       { "struct S { var x; }" }, &typeid(SyntaxErrorEx) },
+    /* rule 5 (plans/strict-container-types.md): a bare array / dict is a
+     * hole filled from what a variable or a parameter receives - a field
+     * names its whole type, nullable or not */
+    { "rule 5: a bare array field is refused",
+      { "struct S { int x; array a; }" }, &typeid(SyntaxErrorEx), 19, 1 },
+    { "rule 5: a bare dict field is refused",
+      { "struct S { dict d; }" }, &typeid(SyntaxErrorEx), 12, 1 },
+    { "rule 5: a nullable bare array field is refused",
+      { "struct S { array? a; }" }, &typeid(SyntaxErrorEx), 12, 1 },
+    { "rule 5: an opt bare dict field is refused",
+      { "struct S { opt dict d; }" }, &typeid(SyntaxErrorEx), 16, 1 },
+    { "rule 5: a full type field is accepted",
+      { "struct S { array<dyn> a; dict<str, int>? d; }",
+        "var s = S([1, \"x\"], none);", "assert(len(s.a) == 2);" } },
+    /* ...and a bare parameter is a template parameter, whose annotation
+     * checks the argument in each instance */
+    { "rule 5: a bare array parameter takes one instance per element type",
+      { "func f(array a) => typestr(a);",
+        "assert(f([1]) == \"array<int>\" && f([\"s\"]) == \"array<str>\");"
+      } },
+    { "rule 5: a bare array parameter refuses a non-array argument",
+      { "func f(array a) => len(a);", "f(5);" },
+      &typeid(TypeMismatchEx) },
     { "struct err: an opt scalar field is rejected",
       { "struct S { opt int x; }" }, &typeid(SyntaxErrorEx) },
     { "struct err: an opt str field is rejected (v1)",
       { "struct S { opt str x; }" }, &typeid(SyntaxErrorEx) },
     { "struct err: opt is allowed on dyn/array/dict",
-      { "struct S { opt dyn d; array? a; dict? m; }",
+      { "struct S { opt dyn d; array<dyn>? a; dict<dyn, dyn>? m; }",
         "assert(defined(S));" } },
     { "struct err: duplicate field name",
       { "struct S { int x; int x; }" }, &typeid(SyntaxErrorEx) },
@@ -18175,14 +18198,14 @@ static const std::vector<test> tests =
         "assert(l.a.x == 0); assert(l.b.y == 4);",
         "l.a = P(9, 9); assert(l.a.x == 9);" } },
     { "struct: an array field",
-      { "struct Bag { array items; }",
+      { "struct Bag { array<dyn> items; }",
         "var b = Bag([1, 2, 3]); assert(b.items == [1, 2, 3]);",
         "assert(len(b.items) == 3);" } },
     /* A mutating builtin on a struct-MEMBER lvalue `append(s.f, x)` (VM:
      * CallBuiltinLVMember - forms the boxed field LValue). append/push/insert/
      * erase; a const struct's field throws NotLValueEx. Differential covers -vm. */
     { "struct: append/insert/erase to an array field (native member lvalue)",
-      { "struct Bag { array items; }",
+      { "struct Bag { array<dyn> items; }",
         "var b = Bag([]);",
         "for (var i = 0; i < 3; i++) { append(b.items, i); }",
         "assert(b.items == [0, 1, 2]);",
@@ -18190,7 +18213,7 @@ static const std::vector<test> tests =
         "erase(b.items, 1); assert(b.items == [9, 1, 2]);",
         "push(b.items, 5); assert(b.items == [9, 1, 2, 5]);" } },
     { "struct: mutating a const struct's field fails",
-      { "struct Bag { array items; } const b = Bag([1, 2]);",
+      { "struct Bag { array<dyn> items; } const b = Bag([1, 2]);",
         "append(b.items, 3);" },
       &typeid(CannotChangeConstEx) },
     /* the element and member forms (CallBuiltinLVElem / LVMember): an
@@ -18254,12 +18277,12 @@ static const std::vector<test> tests =
         "f(p);" },
       &typeid(TypeMismatchEx) },
     { "struct err: a const parameter's nested field is not writable",
-      { "struct In { int v; } struct Out { In i; array a; }",
+      { "struct In { int v; } struct Out { In i; array<dyn> a; }",
         "func f(const Out c) { c.i.v++; }",
         "f(Out(In(1), [1]));" },
       &typeid(TypeMismatchEx) },
     { "struct: a const parameter's array field is a reference",
-      { "struct Out { int v; array a; dict d; }",
+      { "struct Out { int v; array<dyn> a; dict<dyn, dyn> d; }",
         "func f(const Out c) { c.a[0] = 9; append(c.a, 3); c.d.k = 4; }",
         "var o = Out(1, [1], {\"k\": 1}); f(o);",
         "assert(o.a == [9, 3] && o.d.k == 4);" } },
@@ -18294,7 +18317,7 @@ static const std::vector<test> tests =
 
     /* ----------------- struct: field kinds & opt & misc ------------------ */
     { "struct: bool / str / array / dict field kinds",
-      { "struct All { bool b; str s; array a; dict m; }",
+      { "struct All { bool b; str s; array<dyn> a; dict<dyn, dyn> m; }",
         "var v = All(true, \"hi\", [1, 2], {\"k\": 1});",
         "assert(v.b == true); assert(v.s == \"hi\");",
         "assert(v.a == [1, 2]); assert(v.m[\"k\"] == 1);" } },
@@ -18303,7 +18326,7 @@ static const std::vector<test> tests =
         "assert(R(1, 5).d == 5); assert(R(1, \"s\").d == \"s\");",
         "assert(R(1).d == none);" } },
     { "struct: all-opt struct constructed with no args",
-      { "struct O { dyn? a; array? b; }",
+      { "struct O { dyn? a; array<dyn>? b; }",
         "var o = O(); assert(o.a == none); assert(o.b == none);" } },
     { "struct: != between same-type instances",
       { "struct Point { int x; int y; }",
@@ -18314,7 +18337,7 @@ static const std::vector<test> tests =
         "assert(L(P(0, 0), P(1, 1)) == L(P(0, 0), P(1, 1)));",
         "assert(L(P(0, 0), P(1, 1)) != L(P(0, 0), P(2, 2)));" } },
     { "struct: deepclone makes a fully independent copy",
-      { "struct Bag { array items; }",
+      { "struct Bag { array<dyn> items; }",
         "var b = Bag([1, 2, 3]); var c = deepclone(b);",
         "append(b.items, 4); assert(len(b.items) == 4);",
         "assert(len(c.items) == 3);" } },
@@ -18348,7 +18371,7 @@ static const std::vector<test> tests =
         "A x = A(10); assert(x.a == 10);" } },
     { "struct: an uninitialized struct var zero-inits recursively",
       { "struct P { int x; int y; }",
-        "struct L { P a; array pts; str name; }",
+        "struct L { P a; array<dyn> pts; str name; }",
         "L v;",
         "assert(v.a.x == 0); assert(v.a.y == 0);",
         "assert(len(v.pts) == 0); assert(v.name == \"\");" } },
@@ -18475,7 +18498,7 @@ static const std::vector<test> tests =
         "var l = L(P(1, 2), P(3, 4));",
         "assert(l.a.x == 1); l.a = P(9, 9); assert(l.a.x == 9);" } },
     { "struct boxed: a ref-field struct stays boxed and mutable",
-      { "struct B { dyn d; array a; }",
+      { "struct B { dyn d; array<dyn> a; }",
         "var b = B(5, [1, 2]); assert(b.d == 5);",
         "b.d = \"x\"; append(b.a, 3);",
         "assert(b.d == \"x\"); assert(b.a == [1, 2, 3]);" } },
@@ -18533,7 +18556,7 @@ static const std::vector<test> tests =
       { "struct A { int v; B b; } struct B { int x; }",
         "var a = A(1, B(2)); assert(a.v == 1); assert(a.b.x == 2);" } },
     { "struct recursion: an array/dict field is not a recursive struct field",
-      { "struct N { int v; array kids; }",
+      { "struct N { int v; array<dyn> kids; }",
         "var n = N(1, []); assert(n.v == 1); assert(len(n.kids) == 0);" } },
 
     /* ------------- flat array<POD struct> storage (phase 7) -------------- */
@@ -24880,8 +24903,9 @@ static const std::vector<repl_test> repl_tests =
     /* a pure CONTAINER-arg bound specializes now that `pure` forbids input
        mutation (so caching the call once is sound). */
     { ":show: a pure container-arg func bound specializes (counted)",
-      { { "func cnt(array a) { var n = len(a); return n - 1; }", "" },
-        { "func uc(array x) { var s = 0; for (var i = 0; i < cnt(x); i++) {"
+      { { "func cnt(array<int> a) { var n = len(a); return n - 1; }", "" },
+        { "func uc(array<int> x) { var s = 0;"
+          " for (var i = 0; i < cnt(x); i++) {"
           " s += x[i]; } return s; }", "" },
         { ":show uc", "counted" } } },
 
@@ -38365,7 +38389,7 @@ static bool myv_names_required()
     const char *lines_arr[] = {
         "struct P { int x; int y; const K = 7; }",
         "struct E { int code; }",
-        "struct B { array a; }",
+        "struct B { array<dyn> a; }",
         "func add(a, b) { return a + b; }",
         "var ps = [P(1, 2)];",
         "append(ps, P(runtime(3), 4));",
@@ -59296,7 +59320,7 @@ static bool jit_op_nativized()
          * jit_struct_baked (g_jit_member_fast), and the helper by
          * jit_class_native's def-guard decline. */
         { OpCode::LoadMemberInt, {
-            "struct M { int x; float y; array a; }",
+            "struct M { int x; float y; array<dyn> a; }",
             "func f(int n) {",
             "  var s = 0;",
             "  for (var i = 0; i < n; i++) {",
@@ -59308,7 +59332,7 @@ static bool jit_op_nativized()
             "}",
             "assert(f(runtime(5)) == 20);" } },
         { OpCode::LoadMemberFloat, {
-            "struct M2 { int x; float y; array a; }",
+            "struct M2 { int x; float y; array<dyn> a; }",
             "func f(int n) {",
             "  var s = 0.0;",
             "  for (var i = 0; i < n; i++) {",

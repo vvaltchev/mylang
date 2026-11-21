@@ -155,7 +155,7 @@ assert(refused == 1);
 
 # 9. a CLASS ring: a class's fields are printed and deep-copied through
 #    the same guard; == and hash are its identity, never a walk
-class CNode { int v; opt CNode next; array kids; }
+class CNode { int v; opt CNode next; array<dyn> kids; }
 var cr = CNode(int(runtime(1)), none, []);
 cr.next = cr;
 append(cr.kids, cr);

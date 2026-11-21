@@ -189,6 +189,32 @@ struct TypeSym {
     bool type_alias = false;
 };
 
+/*
+ * A TEMPLATE parameter - the ones an instance's signature is keyed by: an
+ * un-annotated, non-`dyn`, non-`opt` one, or (rule 5, plans/strict-
+ * container-types.md) one annotated with a bare `array` / `dict`, a HOLE
+ * each call fills (the annotation then only checks the argument is an
+ * array / a dict, in the instance). It used to join its call sites into
+ * one type, which rule 1 refuses for two different element types.
+ */
+static bool template_param(bool opt, bool dyn, DeclType ann,
+                           const TypeAnnot *annot)
+{
+    return !opt && !dyn
+        && (ann == DeclType::none
+            || ((ann == DeclType::arr || ann == DeclType::dict) && !annot));
+}
+static bool template_param(const TypeSym *p)
+{
+    return template_param(p->opt_decl, p->dyn_decl, p->ann,
+                          p->ann_annot.get());
+}
+static bool template_param(const Identifier *p)
+{
+    return template_param(p->opt_mod, p->dyn_mod, p->decl_type,
+                          p->decl_annot.get());
+}
+
 struct FuncInfo {
     FuncDeclStmt *decl = nullptr;
     std::vector<TypeSym *> params;
@@ -1179,8 +1205,7 @@ void Inferencer::mark_lambda_templates()
         bool has_tparam = false;
         if (fd->params)
             for (auto &p : fd->params->elems)
-                if (!p->opt_mod && !p->dyn_mod &&
-                    p->decl_type == DeclType::none) {
+                if (template_param(p.get())) {
                     has_tparam = true;
                     break;
                 }
@@ -1211,7 +1236,7 @@ void Inferencer::run_fixpoint(Block *rootBlock)
             const std::vector<StaticTypeRef> &sig = kv.second;
             size_t k = 0;
             for (TypeSym *p : cfi->params) {
-                if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
+                if (!template_param(p))
                     continue;
                 if (k < sig.size())
                     contribute(p, sig[k], Loc(), Loc());
@@ -1400,7 +1425,7 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         bool ready = true;
         for (size_t i = 0; i < nparams; i++) {
             TypeSym *p = tmpl->params[i];
-            if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
+            if (!template_param(p))
                 continue;       /* not a template param */
             StaticTypeRef t =
                 static_type_resolve(type_of(call->args->elems[i].get()));
@@ -1980,7 +2005,7 @@ bool Inferencer::value_instantiate_round(Block *rootBlock)
             std::vector<StaticTypeRef> s1;
             for (size_t i = 0; i < nparams; i++) {
                 TypeSym *p = tmpl->params[i];
-                if (p->opt_decl || p->dyn_decl || p->ann != DeclType::none)
+                if (!template_param(p))
                     continue;              /* not a template param */
                 /* a template param is not opt, so i < min_args <= nargs:
                  * every site passes it */
@@ -5145,7 +5170,8 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
         fd->body && fd->body->is_block() && !always_exits(fd->body.get());
     /*
      * A template iff it is a NAMED function with at least one *template
-     * parameter*: an un-annotated, non-`dyn`, non-`opt` param. Those are the
+     * parameter* (template_param): an un-annotated, non-`dyn`, non-`opt`
+     * param, or one annotated with a bare `array` / `dict`. Those are the
      * params the instance signature is keyed by; any `opt`/typed/`dyn` params
      * coexist and just `join` within each clone (handled by the concrete path).
      * So `func f(a, opt b)` is a template over `a` (b joins), while `func
@@ -5155,7 +5181,7 @@ void Inferencer::declare_funcdecl(FuncDeclStmt *fd, Scope *s)
      */
     if (fd->id && fd->params)
         for (auto &p : fd->params->elems)
-            if (!p->opt_mod && !p->dyn_mod && p->decl_type == DeclType::none) {
+            if (template_param(p.get())) {
                 fi->is_template = true;
                 break;
             }

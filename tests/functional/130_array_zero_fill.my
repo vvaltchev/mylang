@@ -84,9 +84,10 @@ want("dynamic", str(dd), "[<none>, <none>]");
 want("unfilled", str(un), "[<none>, <none>]");
 
 # ---- a struct that is not POD (a str field) with a field of every
-# other kind, and generic containers: each element its own zero value
+# other kind, and dynamic containers (a field names its whole type -
+# rule 5): each element its own zero value
 struct R { str s; bool b; float f; dict<str, int> d; opt array<int> o;
-           array g; dict h; }
+           array<dyn> g; dict<dyn, dyn> h; }
 array<R> rs = array(2);
 array<array> gs = array(2);
 array<dict> hs = array(2);

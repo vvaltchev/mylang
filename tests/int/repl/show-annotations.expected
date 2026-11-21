@@ -8,7 +8,7 @@ MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
         P p;
         box<P> bp;
         dict<str,int>? m;
-        opt array e;
+        array<dyn>? e;
     }
     P q = P(k, 2);
     opt P r = k > 0 ? none : q;

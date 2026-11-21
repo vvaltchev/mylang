@@ -1,0 +1,72 @@
+# Rule 5 (plans/strict-container-types.md; README, *Explicit types*): a
+# bare `array` / `dict` parameter is a HOLE each call fills - the
+# function is a template over it, as over an un-annotated parameter, and
+# the annotation only checks the argument is an array (a dict). It used
+# to join its call sites into one type: `f([1])` and `f(["s"])` made it
+# an array<dyn>, which rule 1 refuses for both arguments. A struct field
+# cannot be bare (`-rt`, "rule 5:"): it has no receiver to fill it from.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+# ---- one instance per element type
+func garr(array a) => str(len(a)) + typestr(a);
+want("ints", garr([1, 2]), "2array<int>");
+want("strs", garr(["s"]), "1array<str>");
+want("floats", garr([1.5]), "1array<float>");
+func gdict(dict d) => str(len(d)) + typestr(d);
+want("dict ints", gdict({1: 2}), "1dict<int,int>");
+want("dict strs", gdict({"a": "b", "c": "d"}), "2dict<str,str>");
+
+# ---- the argument is the caller's container (a reference)
+func dup(array a) { append(a, a[0]); return len(a); }
+var xs = [1];
+var ss = ["s"];
+want("appended", dup(xs) + dup(ss), 4);
+want("appended values", str(xs) + str(ss), "[1, 1][\"s\", \"s\"]");
+func put(dict d) { d["k"] = d["k"] + 1; }
+var cnt = {"k": 1};
+put(cnt);
+want("dict through the parameter", cnt["k"], 2);
+
+# ---- typed reads of the instance's element type
+func total(array a) {
+    var s = a[0];
+    for (var i = 1; i < len(a); i++)
+        s += a[i];
+    return s;
+}
+want("int total", total([1, 2, 3]), 6);
+want("float total", total([0.5, 0.25]), 0.75);
+want("str total", total(["a", "b"]), "ab");
+
+# ---- a var-bound lambda (a template as well)
+var lam = func(array a) => len(a);
+want("lambda", lam([1]) + lam(["x", "y"]), 3);
+
+# ---- through a function value: two signatures, so the untyped base runs
+# (each container is the type it was made with)
+var dyn fv = garr;
+want("value ints", fv([3]), "1array<int>");
+want("value strs", fv(["s", "t"]), "2array<str>");
+
+# ---- a non-array reaching one at run time (through `dyn`) is refused
+var dyn notarr = runtime(5);
+var refused = 0;
+try { garr(notarr); } catch (TypeErrorEx) { refused++; }
+try { fv(notarr); } catch (TypeErrorEx) { refused++; }
+want("a non-array refused", refused, 2);
+
+# ---- a nullable bare parameter keeps joining (an `opt` parameter is not
+# a template parameter - rule 8)
+func onull(array? a) => a == none ? 0 : len(a);
+want("opt bare", onull(none) + onull([1, 2]), 2);
+
+assert(bad == 0);
+print("ok");

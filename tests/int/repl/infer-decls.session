@@ -22,7 +22,7 @@ func f4(array<array> x) => len(x);
 f4([[1], ["s"]])
 func f5(dict<str, dict> x) => len(x);
 f5({"a": {}})
-struct F1 { box<float> bf; array a; dict d; }
+struct F1 { box<float> bf; array<dyn> a; dict<str, int> d; }
 F1(box(1.5), [1], {"k": 2})
 var x1 += 1
 var y1, y2

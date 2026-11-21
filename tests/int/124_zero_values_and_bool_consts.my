@@ -19,7 +19,8 @@ func want(what, got, exp) {
     }
 }
 
-struct Z { bool b; int i; float f; str s; array a; dict d; }
+struct Z { bool b; int i; float f; str s; array<dyn> a;
+           dict<dyn, dyn> d; }
 Z z;
 want("struct zero", str(z),
      "Z(b: false, i: 0, f: 0.000000, s: \"\", a: [], d: {})");
