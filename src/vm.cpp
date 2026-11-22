@@ -7211,6 +7211,17 @@ extern "C" void jit_stamp_ctype(int_type dst, const TypeAnnot *ct) noexcept
     stamp_ctype(g_current_ctx->frame->at(dst).get(), ct);
 }
 
+/* Q2: StampTypeV's native form - the sum `a + b` takes its static type at
+ * its TOP only, as the interpreted op and the tree-walker give it: its
+ * elements are its operands' own. (It called jit_stamp_ctype, which walks
+ * along the type, so native code typed containers nested in the sum.)
+ * Never throws. */
+extern "C" void jit_stamp_ctype_top(int_type dst,
+                                    const TypeAnnot *ct) noexcept
+{
+    stamp_ctype_top(g_current_ctx->frame->at(dst).get(), ct);
+}
+
 extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
                               int_type dst, int_type is_map,
                               int_type site, int_type cend) noexcept

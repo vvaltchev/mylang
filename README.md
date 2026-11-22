@@ -1853,7 +1853,12 @@ slot = "now a string";           # ok, because it's dyn
     its type refuses nothing - it is an `array<dyn?>` (a
     `dict<dyn?, dyn?>`), since a `dyn` element is never `none` - and
     neither does one whose type nothing gave it (`[]` that nothing
-    filled, or one written where only a `dyn` was known). Its STORAGE
+    filled, or one written where only a `dyn` was known - a literal
+    written inside a dynamic one: in `var dyn d = [[1, none]];` the row
+    takes a string too). A COPY has its source's type, wherever it is
+    written: `clone()`, `reverse()`, `sort()` and `rev_sort()` give an
+    array of their argument's type, so `var dyn c = clone([1, none]);`
+    (an `array<int?>`) refuses a string. Its STORAGE
     still holds only what it can (*Flat arrays*): a
     literal nested in a `dyn` element and an array sum are built from
     their own values, so `var dyn s = [1, 2] + [3];` is flat int

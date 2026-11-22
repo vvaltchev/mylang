@@ -4717,6 +4717,32 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
                 for (auto &kv : static_cast<LiteralDict *>(n)->elems)
                     ctype_untype(kv->value.get());
             }
+        } else if (ctype_dyn_place.count(n)) {
+            /* a literal written for a `dyn` variable is DYNAMIC, so the
+             * literals written in it sit under a `dyn` element and have
+             * no type of their own - as when the parser bakes the whole
+             * literal (stamp_ctype_rec stops at a `dyn` element). Not
+             * baked (-nc, or an element only the run knows), they kept
+             * the type their OWN static type gives them (`var dyn d =
+             * [[1, none]]`: an array<int?> row), so a store through `d`
+             * was refused there and accepted folded (RULE 2). What a
+             * call or a sum makes is not written here: it is typed where
+             * it is made, in both runs; and a constant NAMED here keeps
+             * its own type (an element is never a baked written literal:
+             * the parser bakes a literal whole, at its declaration). */
+            const auto written = [&](Construct *el) {
+                const ConstructType k = ctag(el);
+                if (k == ConstructType::lit_arr
+                        || k == ConstructType::lit_dict)
+                    ctype_untype(el);
+            };
+            if (ctag(n) == ConstructType::lit_arr) {
+                for (auto &el : static_cast<LiteralArray *>(n)->elems)
+                    written(el.get());
+            } else {
+                for (auto &kv : static_cast<LiteralDict *>(n)->elems)
+                    written(kv->value.get());
+            }
         }
         break;
     case ConstructType::lit_obj: {

@@ -8182,7 +8182,7 @@ static bool jit_op_eligible(const Instr &in)
      * op_fully_native too. */
     case OpCode::CastV:
         return true;
-    /* Q2: StampTypeV - jit_stamp_ctype reads the sum from memory; it
+    /* Q2: StampTypeV - jit_stamp_ctype_top reads the sum from memory; it
      * never throws, so op_fully_native too. */
     case OpCode::StampTypeV:
         return true;
@@ -28466,14 +28466,14 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
     }
 
     case OpCode::StampTypeV:
-        /* Q2: jit_stamp_ctype(slot, the interned type) - rdi = a_slot,
+        /* Q2: jit_stamp_ctype_top(slot, the interned type) - rdi = a_slot,
          * rsi = the baked type (process lifetime). Never throws. */
         emit_call_prologue(e);
         e.mov_imm(RDI, static_cast<uint64_t>(
                           static_cast<int_type>(in.a_slot())));
         e.movabs(RSI, reinterpret_cast<uint64_t>(
                           ck.ctype_ref(static_cast<unsigned>(in.target2))));
-        e.call_direct(jit_stamp_ctype);
+        e.call_direct(jit_stamp_ctype_top);
         emit_call_epilogue(e);
         return true;
 

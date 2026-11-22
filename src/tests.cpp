@@ -38039,6 +38039,109 @@ static bool myv_field_annot_checked()
 }
 
 /*
+ * ctype_restamp's contract: a baked value another node already typed is
+ * COPIED before it takes a different type, and the copy shares exactly
+ * its read-only containers (a constant's: no store can change them, and
+ * they keep their own type) while every mutable one is fresh and loses
+ * the old type. A folded copy (`clone(...)` of a typed value) used to be
+ * restamped this way; since it keeps its source's type no program does
+ * it with a read-only container inside, so the read-only half is
+ * checked here directly - for an array and for a dict.
+ */
+static bool ctype_restamp_shares_readonly()
+{
+    const auto arr_of = [](DeclType k) {
+        TypeAnnot a;
+        a.kind = DeclType::arr;
+        a.elem = std::make_shared<TypeAnnot>();
+        a.elem->kind = k;
+        return a;
+    };
+    const TypeAnnot ints = arr_of(DeclType::i);
+    TypeAnnot rows;                              /* array<array<int>> */
+    rows.kind = DeclType::arr;
+    rows.elem = std::make_shared<TypeAnnot>(ints);
+    TypeAnnot dsi;                               /* dict<str, int> */
+    dsi.kind = DeclType::dict;
+    dsi.key = std::make_shared<TypeAnnot>();
+    dsi.key->kind = DeclType::s;
+    dsi.val = std::make_shared<TypeAnnot>();
+    dsi.val->kind = DeclType::i;
+    TypeAnnot dicts;                             /* array<dict<str, int>> */
+    dicts.kind = DeclType::arr;
+    dicts.elem = std::make_shared<TypeAnnot>(dsi);
+    const TypeAnnot *t_ints = annot_intern(ints);
+    const TypeAnnot *t_rows = annot_intern(rows);
+    const TypeAnnot *t_dsi = annot_intern(dsi);
+    const TypeAnnot *t_dicts = annot_intern(dicts);
+
+    const auto general = [](EvalValue *vals, size_t n) {
+        return build_array_from_values(vals, n, ArrHint::general, nullptr,
+                                       false);
+    };
+    const auto arr_ct = [](const EvalValue &v) {
+        return v.get_ref<SharedArrayObj>().ctype();
+    };
+    const auto elem = [](const EvalValue &v, size_type i) {
+        return v.get_ref<SharedArrayObj>().get_view()[i].get();
+    };
+    const auto same = [](const EvalValue &x, const EvalValue &y) {
+        return x.get_type()->intptr(x) == y.get_type()->intptr(y);
+    };
+    bool ok = true;
+    const auto fail = [&](const char *what) {
+        fprintf(stderr, "ctype_restamp_shares_readonly: %s\n", what);
+        ok = false;
+    };
+
+    /* an array of rows: one mutable, one read-only, both array<int> */
+    EvalValue one[1] = { EvalValue(static_cast<int_type>(1)) };
+    EvalValue mrow = general(one, 1);
+    const_cast<SharedArrayObj &>(mrow.get_ref<SharedArrayObj>())
+        .set_ctype(t_ints);
+    EvalValue rrow = make_const_clone(mrow);
+    const TypeAnnot *rrow_ct = arr_ct(rrow);
+    EvalValue rv[2] = { mrow, rrow };
+    EvalValue outer = general(rv, 2);
+    const_cast<SharedArrayObj &>(outer.get_ref<SharedArrayObj>())
+        .set_ctype(t_rows);
+    const EvalValue r = ctype_restamp(outer, annot_dyn_array());
+    if (arr_ct(r) != annot_dyn_array() || arr_ct(outer) != t_rows)
+        fail("the array was not copied and retyped");
+    if (arr_ct(elem(r, 0)) != nullptr)
+        fail("the copied mutable row kept its old type");
+    if (!same(elem(r, 1), elem(outer, 1))
+            || arr_ct(elem(r, 1)) != rrow_ct)
+        fail("the read-only row was not shared with its own type");
+
+    /* an array of dicts: one mutable, one read-only */
+    auto md = make_intrusive<DictObject>();
+    md->build_emplace(EvalValue(SharedStr(std::string("k"))),
+                      LValue(EvalValue(static_cast<int_type>(1)), false));
+    md->set_ctype(t_dsi);
+    EvalValue mdict(md);
+    EvalValue rdict = make_const_clone(mdict);
+    const TypeAnnot *rdict_ct =
+        rdict.get_ref<intrusive_ptr<DictObject>>()->ctype();
+    EvalValue dv[2] = { mdict, rdict };
+    EvalValue douter = general(dv, 2);
+    const_cast<SharedArrayObj &>(douter.get_ref<SharedArrayObj>())
+        .set_ctype(t_dicts);
+    const EvalValue dr = ctype_restamp(douter, annot_dyn_array());
+    const auto dict_ct = [](const EvalValue &v) {
+        return v.get_ref<intrusive_ptr<DictObject>>()->ctype();
+    };
+    if (arr_ct(dr) != annot_dyn_array())
+        fail("the array of dicts was not retyped");
+    if (dict_ct(elem(dr, 0)) != nullptr)
+        fail("the copied mutable dict kept its old type");
+    if (!same(elem(dr, 1), elem(douter, 1))
+            || dict_ct(elem(dr, 1)) != rdict_ct)
+        fail("the read-only dict was not shared with its own type");
+    return ok;
+}
+
+/*
  * The zero value of a container annotation that names no component - a
  * bare `array` / `dict` - is an empty container with no container type.
  * No source program reaches it any more (rule 5 refuses a bare field,
@@ -62371,6 +62474,8 @@ static const std::vector<extra_check> extra_checks =
       "with one, is a corrupt image", myv_field_annot_checked },
     { "fit: the zero value of a bare container annotation is an empty, "
       "untyped container", zero_value_bare_annot },
+    { "Q2: a restamped copy shares only its read-only containers, which "
+      "keep their own type", ctype_restamp_shares_readonly },
     { "myv: v43 - a container type no container can have (opt, another "
       "kind) is a corrupt image, refused by every reader",
       myv_ctype_refused },

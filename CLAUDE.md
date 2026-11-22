@@ -7378,7 +7378,11 @@ per level of a deep value - a separate open item.
   `node_typed_by_place`, `takes_hint`'s twin). A folded USER function's
   result keeps the type its function made it with, as the unfolded call
   does: restamped by a `dyn` place, it accepted a store `-nc` refused
-  (RULE 2, `tests/functional/125`). Any OTHER mutable container a bake
+  (RULE 2, `tests/functional/125`). So does a folded COPY - `clone`,
+  `reverse`, `sort`, `rev_sort` (`builtin_copies_container`): run, it
+  copies its source's type, which a call's type cannot overwrite; folded,
+  its source had none yet, and restamped it took the place's
+  (`tests/functional/138`). Any OTHER mutable container a bake
   would hold untyped - an element or a field of a literal, `get!` of
   one: typed where its literal was made, which the value no longer says
   - is not baked at all (`bake_untypable`, parser.cpp; a deferred fold
@@ -7397,9 +7401,14 @@ per level of a deep value - a separate open item.
   the storage its own values gave it; `stamp_literal_coerce` leaves a
   literal nested there untyped too, and `literal_fits` lets any literal
   fit a `dyn` place, so `array<dyn> a = [[1]]` takes its declared type
-  under `-nc` as it does folded). The VM's MakeArrayV / MakeDictV /
-  MapFilterV / StampTypeV name theirs by a ref into `Chunk::ctypes` in
-  `target2`; MakeStructArrayV derives `array<P>` from its def. `a + b`
+  under `-nc` as it does folded). A literal written for a `dyn` VARIABLE
+  is dynamic, so the literals written in it are untyped too
+  (`stamp_ctypes`, the `ctype_dyn_place` arm) - they took their own type
+  unfolded, and `var dyn d = [[1, none]]; d[0][0] = "s"` stored folded
+  and was refused under `-nc` (`tests/functional/138`). The VM's
+  MakeArrayV / MakeDictV / MapFilterV / StampTypeV name theirs by a
+  ref into `Chunk::ctypes` in `target2`; MakeStructArrayV derives
+  `array<P>` from its def. `a + b`
   on arrays copies `a` UNTYPED (`ctype_sum_copy`) and the sum takes its
   static type after the append (StampTypeV, the tree-walker's Expr04),
   so what `b` appends is not checked against `a`'s narrower type - and,

@@ -1,0 +1,65 @@
+# A container's type does not depend on whether the compiler folded the
+# expression that made it (RULE 2; README, *A container keeps its type*).
+# Each answer below differed between a run and -nc until 2026-11-22:
+#  - a literal written inside a `dyn` variable's literal sits under a
+#    `dyn` element and has no type of its own - as the folded whole
+#    literal already had it - but run unfolded (-nc, or with an element
+#    only the run knows) it took its OWN type and refused a store;
+#  - a COPY (clone, reverse) keeps its source's type when it runs, but a
+#    folded copy took the `dyn` variable's type, since its source had
+#    none yet, and accepted the store.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+func tryset(dyn c, dyn v) {
+    try { c[0] = v; return "stored"; }
+    catch (TypeErrorEx) { return "refused"; }
+}
+
+# ---- literals written in a `dyn` variable's literal: untyped
+var dyn d2 = [[1, none], [2]];
+want("a nested row", tryset(d2[0], "s"), "stored");
+want("its storage still refuses", tryset(d2[1], "s"), "refused");
+var dyn d7 = {"a": [1, none], "b": [2, none]};
+want("a dict's nested row", tryset(d7["a"], "s"), "stored");
+var dyn d8 = [[[1, none]]];
+want("two levels down", tryset(d8[0][0], "s"), "stored");
+var dyn dd = [{"k": 1}, {"j": 2}];
+var dict_stored = true;
+try { dd[0]["k"] = "s"; } catch (TypeErrorEx) { dict_stored = false; }
+want("a nested dict", dict_stored, true);
+# ...an element only the run knows: the literal is not folded at all
+var dyn d4 = [[1, none], [int(runtime(2))]];
+want("an unfolded literal's row", tryset(d4[0], "s"), "stored");
+# ...the values a nested literal holds are still widened by the outer
+# literal's own type
+var dyn d1 = [[1, 2.5], [3, 4]];
+want("widened rows", str(d1),
+     "[[1.000000, 2.500000], [3.000000, 4.000000]]");
+
+# ---- a copy keeps its source's type, folded or not
+var dyn c1 = clone([1, none]);
+var dyn c4 = reverse([1, none]);
+var dyn cl2 = clone([[1], [2]]);
+pure func mk1(int n) { var r = [n, none]; return r; }
+var dyn cm = clone(mk1(1));
+array<int?> t1 = [1, none];
+var dyn c6 = clone(t1);
+if (typed) {
+    want("clone of a literal", tryset(c1, "s"), "refused");
+    want("reverse of a literal", tryset(c4, "s"), "refused");
+    want("clone of nested rows", tryset(cl2, "s"), "refused");
+    want("clone of a function's result", tryset(cm, "s"), "refused");
+    want("clone of a variable", tryset(c6, "s"), "refused");
+}
+want("the copies' values", str(c1) + str(c4) + str(cl2) + str(cm),
+     "[1, <none>][<none>, 1][[1], [2]][1, <none>]");
+
+assert(bad == 0);
+print("ok");

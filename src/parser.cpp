@@ -935,7 +935,11 @@ static bool node_takes_hint(ParseContext &c, const Construct *n)
  * place it is bound to (LiteralObj::typed_by_place): a container literal,
  * an array sum, or a call to one of builtin_builds_container's builtins -
  * the builtin itself, as node_takes_hint asks. A user function's result
- * keeps the type it was made with.
+ * keeps the type it was made with, and so does a COPY (clone, sort,
+ * rev_sort, reverse): run, it carries its source's type (a call's type
+ * types only an untyped result), and folded its source had none yet, so
+ * typed by the place it took a type the run does not give it (`var dyn
+ * c = clone([1, none])` accepted a str folded, refused it under -nc).
  */
 static bool node_typed_by_place(ParseContext &c, const Construct *n)
 {
@@ -949,7 +953,8 @@ static bool node_typed_by_place(ParseContext &c, const Construct *n)
     case ConstructType::call: {
         const auto *call = static_cast<const CallExpr *>(n);
         const auto *id = node_cast<const Identifier>(call->what.get());
-        if (!id || !builtin_builds_container(id->uid->val))
+        if (!id || !builtin_builds_container(id->uid->val)
+                || builtin_copies_container(id->uid->val))
             return false;
         const EvalValue v = RValue(id->eval(c.const_ctx));
         return v.get_type()->t == Type::t_builtin;

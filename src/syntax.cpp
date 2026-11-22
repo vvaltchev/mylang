@@ -478,6 +478,14 @@ bool builtin_builds_container(std::string_view n)
         != std::end(names);
 }
 
+bool builtin_copies_container(std::string_view n)
+{
+    static constexpr std::string_view names[] = {
+        "clone", "sort", "rev_sort", "reverse"};
+    return std::find(std::begin(names), std::end(names), n)
+        != std::end(names);
+}
+
 /*
  * Named-argument desugaring (see the declaration in syntax.h). One shared
  * implementation for the parser's const-fold path and the inferencer's

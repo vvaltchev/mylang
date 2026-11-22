@@ -1333,6 +1333,8 @@ extern "C" int jit_map_filter(int_type fn_slot, int_type cont_slot,
 /* Q2: stamp the container in `dst` with the type it is made with (the
  * MapFilterV result - its helper's argument registers are all taken) */
 extern "C" void jit_stamp_ctype(int_type dst, const TypeAnnot *ct) noexcept;
+extern "C" void jit_stamp_ctype_top(int_type dst,
+                                    const TypeAnnot *ct) noexcept;
 
 /* class step 4: the native LoadBoxV / StoreBoxV - the interpreted ops'
  * box_load_want / box_store (plans/class-and-box.md). A raise (`*` of a

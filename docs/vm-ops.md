@@ -1838,8 +1838,11 @@ runs the same C++ there).
 `StampTypeV slot, ref` gives the array a BinOpV's `a + b` just built its
 static type, `Chunk::ctypes[ref - 1]`: the BinOpV copies `a` untyped
 (`ctype_sum_copy`), so what `b` appends is not checked against `a`'s
-narrower type. Never throws, defines nothing; `jit_stamp_ctype` natively;
-not bytecode-inlined. myv **v43** (APPENDED).
+narrower type. It types the sum's TOP only, as the tree-walker's Expr04
+does - the elements are its operands' own (`jit_stamp_ctype_top`
+natively; it called MapFilterV's `jit_stamp_ctype`, which walks along the
+type, until 2026-11-22). Never throws, defines nothing; not
+bytecode-inlined. myv **v43** (APPENDED).
 
 **`CastV dst = cast<T>(src)` — the cast (plans/cast.md, 2026-11-19).**
 `a` is the source slot, `target2` an index into `Chunk::cast_types` (the

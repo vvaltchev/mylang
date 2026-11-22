@@ -1564,6 +1564,13 @@ bool builtin_takes_arr_hint(std::string_view name);
  */
 bool builtin_builds_container(std::string_view name);
 
+/*
+ * Q2: those of them whose result is a COPY of their argument - which
+ * keeps its source's type (the call's type only types an untyped one),
+ * so a folded call is not typed by its place (LiteralObj::typed_by_place)
+ */
+bool builtin_copies_container(std::string_view name);
+
 class Expr01 final: public SingleChildConstruct {
 
 public:
