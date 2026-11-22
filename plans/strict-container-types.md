@@ -445,16 +445,21 @@ prints `0`. Choice 6 fixes it.
    Tests: tests/functional/137, the `rule 8.1:` `-rt` rows. 8.2 (closure
    and lambda-value instances) not started.
 
-## 10. Rule 8.2 - a design, NOT BUILT (Claude, 2026-11-21)
+## 10. Rule 8.2 - the design, approved 2026-11-22, NOT BUILT YET
 
 Stopped at the design on purpose: 8.2 changes the runtime call model
-and the `.myv` format, so the maintainer reviews it before any code.
+and the `.myv` format, so the maintainer reviewed it before any code
+(his decisions are at the end of this section).
 
 **What it is.** A capturing closure, and a lambda used as a value, get
 typed instances the way a named template does - but the program still
 makes ONE closure object per evaluation of the lambda (one capture
 vector: captures are shared, mutable state, so two objects would split
-a counter). The instances are BODIES, not objects.
+a counter). The instances are BODIES, not objects. Script-visible: a
+closure's parameters stop joining across its call sites (today
+`f(1); f(2.5)` makes `x` a float in both calls and `f(1); f("s")` is
+refused); each site gets its own instance, as a named template's does,
+so README's *Static type inference* changes with the code.
 
 **Inference.** Treat such a lambda like a template whose instances are
 keyed per call site, using the sites the callee-set analysis attributes
@@ -489,17 +494,20 @@ commit, `tests/myv_doc_check`; the loader checks each instance's
 capture count equals its base's (a mutated image must not make an
 instance read past the capture vector).
 
-**Questions for the maintainer.**
-1. A site that may reach two lambdas (`{A, B}`): run both bases, or
-   pick an instance of each behind a two-way guard chain (the #97 E3
-   machinery)? The design above runs the bases - simpler, and the guard
-   chain can come later.
-2. The instance cap (64 per template today) - the same for lambdas?
-3. The REPL: a closure made in one input and called in a later one is
-   called through a value the later input's analysis cannot name, so
-   it runs the base - the same as a value-used template today.
+**Decided (maintainer, 2026-11-22).**
+1. A site that may reach two or more lambdas calls each one's untyped
+   BASE. (A guard chain over per-candidate instances would also refuse
+   valid programs: every candidate would have to type-check with the
+   site's arguments, including one that never runs there - `h("x")`
+   with `h` either `up(s) => s + "!"` or `neg(n) => -n`.)
+2. The instance cap is the templates' one, 64 per lambda
+   (`--max-instances`).
+3. The REPL: a closure made in one input and called in a later one runs
+   its base, as a value-used template does today (`typestr(x)` in its
+   body says "dyn" there where a script says "int"). A later input
+   adding an instance to an earlier input's closure is left for later.
 
-**Order if approved:** inference + `-dti`/`:show` visibility first (no
+**Order:** inference + `-dti`/`:show` visibility first (no
 runtime change: instances unused), then the call operand and the
 tree-walker, then the VM tiers one at a time with the five-mode
 differential, then the format.
