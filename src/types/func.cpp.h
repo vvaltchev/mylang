@@ -105,6 +105,45 @@ FuncObject::FuncObject(const FuncObject &rhs)
 #endif
 }
 
+FuncObject::FuncObject(const FuncDescriptor *inst, FuncObject &base,
+                       InstanceView)
+    : RefCounted()
+    , func(inst)
+    , capture_slots(CaptureSlots::Borrow(), base.capture_slots)
+    , capture_root(base.capture_root)
+    , const_scope(base.const_scope)
+    , const_scope_alive(base.const_scope_alive)
+    , inst_base(&base)
+{
+#ifdef TESTS
+    g_live_funcobjs++;
+#endif
+}
+
+/*
+ * Rule 8.2: the callee a call site an instance serves calls - the base
+ * closure object viewed with the instance's body when `callee` is that
+ * template's object, `callee` itself otherwise (a value the analysis did
+ * not name: a loaded image's, or the same lambda's object made where
+ * another copy of it was compiled). Both engines' one answer.
+ */
+EvalValue closure_instance_value(const EvalValue &callee,
+                                 const FuncDescriptor *base,
+                                 uint64_t base_serial,
+                                 const FuncDescriptor *inst)
+{
+    if (callee.is<intrusive_ptr<FuncObject>>()) {
+        FuncObject &fo = *callee.get_ref<intrusive_ptr<FuncObject>>().get();
+        /* (the serial: a stamped address may have been reused - DescStamp;
+         * only the live object's descriptor is read) */
+        if (fo.func == base && fo.func->serial == base_serial)
+            return EvalValue(intrusive_ptr<FuncObject>(
+                make_intrusive<FuncObject>(inst, fo,
+                                           FuncObject::InstanceView())));
+    }
+    return callee;
+}
+
 #ifdef TESTS
 /* see the note at the declaration: a leaked POOLED object is invisible
  * to LeakSanitizer, so the live count is the only net that sees a

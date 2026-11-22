@@ -2348,36 +2348,42 @@ A `var`-bound lambda (`var f = func(x) => x;`) follows ordinary variable scope.
 
 ##### How a lambda's un-annotated parameters get their types
 
-A lambda with un-annotated parameters is typed from the places it is
-**called**, and there are two regimes:
+A lambda's un-annotated parameters are typed **per call site**, as a named
+template's are:
 
 * a **non-capturing** lambda bound to a write-once variable that is only
   ever called is a *template*, so it is monomorphized per call signature -
   `f(1)` and `f("hi")` simply produce two typed instances. Each call still
   reads `f` first, so a call made before `var f = ...` has run raises
   `UnboundSymbolEx`, as it does for any other variable;
-* a **capturing** lambda is not, so all of its call sites *join* into one
-  parameter type. Two numeric argument types widen (`int` and `float` give
-  `float`, and the `int` argument is then coerced); two irreconcilable ones
-  are a compile error.
-
-**A joined parameter binds exactly like a declared one.** Once the call sites
-make `x` a `float`, `x` behaves as if written `float x`: an `int` (or `bool`)
-argument is converted when it is bound, so `f(1)` receives `1.000000`, not `1`;
-likewise a parameter joined to `int` converts a `bool` argument to `0`/`1`; and
-a `dyn` argument whose value does not fit throws `TypeErrorEx` at the call. The
-same holds for an un-annotated `opt` parameter of a named function, whose call
-sites join the same way (`func o(opt z)` called with `3` and `1.5`).
+* **any other lambda** - capturing, returned from a factory, stored in a
+  container or a variable - is typed the same way through its call sites:
+  each call the compiler can tell reaches **this lambda alone** runs an
+  *instance* of it typed for that call's argument types. `f(1)` and `f(2.5)`
+  see `x` as an `int` and as a `float`; `f(1)` and `f("s")` both compile.
 
 ```C#
 var b = 2;
-var f = func [b] (x) { return x; };
-print(f(1), f(2.5));      # 1.000000 2.500000
+var f = func [b] (x) { return typestr(x); };
+print(f(1) + " " + f(2.5) + " " + f("s"));      # int float str
+```
+
+**One closure, one set of captures.** Evaluating the lambda still makes ONE
+closure object, and every instance runs with that object's captured
+variables - a captured counter counts every call, whichever instance makes it:
+
+```C#
+func make_counter() {
+  var n = 0;
+  return func [n] (x) { n++; return typestr(x) + str(n); };
+}
+var c = make_counter();
+print(c(1), c("s"), c(2.5));      # int1 str2 float3
 ```
 
 **How the closure reaches the call makes no difference.** Bound directly to a
 variable, returned from a factory, or read out of a container - as long as the
-compiler can tell *which* closure is being called, every call site joins:
+compiler can tell *which* closure is being called:
 
 ```C#
 func make_adder(n) {
@@ -2389,31 +2395,47 @@ var add = make_adder(3);
 print(add(4));            # 34 - `x` is typed `int` from this call site
 ```
 
-```C#
-func make_f(n) => func [n] (x) { return typestr(x); };
-var f = make_f(1);
-print(f(1) + " " + f(2.5));      # float float - int widened to float
-
-var base = 20;                                    # the same, written
-var g = func [base] (x) { return typestr(x); };   # directly
-print(g(1) + " " + g(2.5));      # float float - identical
-```
-
-What *does* stop the typing is not knowing **which** closure a call reaches.
-When a value may hold more than one, nothing is attributed to either and their
-parameters stay `dyn` - which is why the two closures below keep working with
-arguments of different types:
+**A call that may reach more than one function runs the lambda's untyped
+body** (its *base*): every un-annotated parameter is `dyn` there. That is
+what happens when a value may hold one of several closures, when the compiler
+cannot follow the value at all, past 64 instances of one lambda
+(`--max-instances`), and - in the REPL - when a closure made in one input is
+called in a later one:
 
 ```C#
-func mk_a(n) => func [n] (x) { return "a" + str(x); };
-func mk_b(n) => func [n] (x) { return "b" + str(x); };
+func mk_a(n) => func [n] (x) { return "a" + typestr(x); };
+func mk_b(n) => func [n] (x) { return "b" + typestr(x); };
 
 func pick(int k) {
   var ops = [mk_a(1), mk_b(2)];
   var p = ops[k];               # may be either closure
-  var q = ops[k + 1];           # ...so neither gets typed
-  return p(7) + q("s");         # both fine: their `x` stays dyn
+  return p(7) + p("s");         # adynadyn - each runs its untyped body
 }
+```
+
+Such a call's result has no type the compiler can know - the two closures
+may return different things - so it is `dyn`: a variable it initializes needs
+no `var dyn`, and what is done with the value is checked when it runs.
+
+The untyped body may not store into a variable it captured (or a global)
+anything that variable's type does not allow: such a store is checked when it
+runs, and a value that does not fit raises `TypeErrorEx`.
+
+**A lambda a higher-order builtin is handed** (`map`, `filter`, `sort`,
+`rev_sort`, `sum`, `make_array`, `make_dict`, `find`) keeps one body, which the
+builtin calls: its parameters take the type of what the builtin passes, *joined*
+with its other call sites. Two numeric argument types widen (`int` and `float`
+give `float`); two irreconcilable ones are a compile error. **A joined parameter
+binds exactly like a declared one**: once it is a `float`, an `int` (or `bool`)
+argument is converted when it is bound, so `f(1)` receives `1.000000`; a
+parameter joined to `int` converts a `bool` to `0`/`1`; and a `dyn` argument
+whose value does not fit throws `TypeErrorEx` at the call.
+
+```C#
+var b = 2;
+var g = func [b] (x) { return x; };
+var halves = map(g, [0.5]);        # map gives x a float
+print(g(1));                       # 1.000000 - converted at the bind
 ```
 
 

@@ -1,0 +1,181 @@
+# Rule 8.2 (plans/strict-container-types.md section 10; README, *How a
+# lambda's un-annotated parameters get their types*): a lambda's call
+# sites do not join. Each site the compiler can tell reaches ONE lambda
+# runs an instance of it typed for that site's arguments, with the one
+# closure object's captures; a site that may reach several runs the
+# lambda's untyped body. typestr(x) inside the body is the oracle - a
+# better-typed program computes the same values, so the type itself is
+# what has to be asserted.
+# (under -nti nothing is typed: the checks below that need a type are
+# gated on a typed run)
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+
+# (declared first: a global a function reads must be bound before any
+# call the compiler cannot follow - see "inlined and global sites")
+func apply(fn, v) => fn(v);
+var gk0 = 0;
+var hg1 = func [gk0] (x) { return x + 1; };
+var hg2 = func [gk0] (x) { return x * 2.5; };
+var hg = hg1;
+func set_hg(fn) { hg = fn; return 0; }
+var gk = 3;
+var gcl = func [gk] (x) { return typestr(x); };
+func use_i() { return gcl(1); }
+func use_s() { return gcl("s"); }
+
+# ---- one site per argument type, every spelling
+var b = 2;
+var f = func [b] (x) { return typestr(x); };
+want("direct", f(1) + f(2.5) + f("s") + f(true), "intfloatstrbool");
+func mk(n) { var w = n; return func [w] (x) { return typestr(x); }; }
+var g = mk(1);
+want("factory", g(1) + g("s"), "intstr");
+var fs = [mk(2)];
+want("through an element", fs[0](2.5) + fs[0]([1]), "floatarray<int>");
+var nc = func (x) { return typestr(x); };
+var keep = [nc];
+want("non-capturing, a value", nc(1) + nc("s") + keep[0](2.5),
+     "intstrfloat");
+# an instance's result has the instance's type
+var h = func [b] (x) { return x + b; };
+want("results", str(h(1)) + " " + str(h(0.5)), "3 2.500000");
+
+# ---- ONE closure object: every instance shares its captures
+func make_counter() {
+    var n = 0;
+    return func [n] (x) { n++; return typestr(x) + str(n); };
+}
+var c = make_counter();
+want("shared capture", c(1) + c("s") + c(2.5) + c(7), "int1str2float3int4");
+var c2 = make_counter();
+want("a second object", c2("q") + c(0), "str1int5");
+func drive(int k) {
+    var e = make_counter();
+    var s = "";
+    for (var i = 0; i < k; i++)
+        s = s + e(i) + e(str(i));
+    return s;
+}
+want("in a loop", drive(runtime(2)), "int1str2int3str4");
+
+# ---- a lambda inside an instance: its own sites get instances too
+func outer(a) {
+    return func [a] (x) {
+        var inner = func [a, x] (y) { return typestr(x) + typestr(y); };
+        return inner(x) + "|" + inner("s");
+    };
+}
+var o = outer(1);
+want("nested", o(2.5) + " " + o(true), "floatfloat|floatstr boolbool|boolstr");
+# ...and one that calls itself through a container it captures. The
+# pop that breaks the cycle (README, *Values that contain themselves*)
+# hands the container to a builtin, after which the compiler cannot name
+# what box[0] holds: the call inside runs the untyped body.
+var box = [];
+var rec = func [box] (n) {
+    if (n == 0) return typestr(n);
+    return box[0](n - 1);
+};
+append(box, rec);
+if (typed)
+    want("recursive through a capture", rec(3), "dyn");
+pop(box);
+
+# ---- a site inside a body the AST inliner pastes, and one through a
+#      global a function reads, keep their instances (both used to run
+#      the untyped body in the default engine only)
+want("inlined and global sites",
+     apply(gcl, 1) + apply(gcl, "s") + use_i() + use_s() + gcl(2.5),
+     "intstrintstrfloat");
+
+# ---- a site that may reach two lambdas runs the untyped body
+func mk_a(n) => func [n] (x) { return "a" + typestr(x); };
+func mk_b(n) => func [n] (x) { return "b" + typestr(x); };
+func pick(int k) {
+    var ops = [mk_a(1), mk_b(2)];
+    var p = ops[k];
+    return p(7) + p("s");
+}
+if (typed)
+    want("two candidates", pick(runtime(1)), "bdynbdyn");
+
+# ---- the untyped body may not store a misfit into a capture
+func mk_acc() {
+    var acc = "init";
+    return func [acc] (x) { acc = x; return acc; };
+}
+func mk_z() => func (x) { return "z"; };
+var pair = [mk_acc(), mk_z()];
+var any = pair[runtime(0)];
+want("a fitting store", any("s"), "s");
+if (typed) {
+    var refused = false;
+    try { any(5); } catch (TypeErrorEx) { refused = true; }
+    want("a misfit store", refused, true);
+}
+want("the capture kept", any("t"), "t");
+
+# ---- a lambda a builtin is handed keeps joining
+var j = func [b] (x) { return x; };
+var halves = map(j, [0.5]);
+if (typed)
+    want("joined", str(j(1)), "1.000000");
+
+# ---- a site that may call either of two closures has no type of its
+# own: one closure's result type is not the other's (each assignment
+# below read an int as a string - a different number per run)
+func ap(fn, v) { var r = fn(v); return r; }
+var gq = func [b] (x) { return typestr(x); };
+var mq = func [b] (x) { return x + 1; };
+var rq0 = ap(gq, 1);
+var rq = ap(mq, 1);
+var refused_q = false;
+try { len(rq); } catch (TypeErrorEx) { refused_q = true; }
+want("a result of either closure", refused_q, true);
+if (typed)
+    want("...untyped", typestr(rq), "dyn");
+want("...holding the int", rq + 1, 3);
+var incq = func [b] (x) { return x + 1; };
+var nameq = func (int x) { return "n" + str(x); };
+var fsq = [incq, nameq];
+var rq2 = fsq[runtime(0)](41);
+var refused_q2 = false;
+try { len(rq2); } catch (TypeErrorEx) { refused_q2 = true; }
+want("through a container", refused_q2, true);
+if (typed)
+    want("...untyped too", typestr(rq2), "dyn");
+
+# ---- a site whose callee set grows after its instance was made calls
+# the untyped body (the instance's int result typed a float as an int)
+var hr1 = hg(1);
+set_hg(hg2);
+var hr2 = hg(2);
+want("a grown callee set", str(hr2 + 1), "6.000000");
+
+# ---- a lambda the AST inliner binds to a temp keeps its instances
+# (the inliner copied it, and the copy ran its untyped body)
+func apply_both(fn) => fn(1) + fn("s");
+want("an inlined argument", apply_both(func [b] (x) { return typestr(x); }),
+     "intstr");
+func apply_one(fn, v) => fn(v);
+want("an inlined argument's store",
+     str(apply_one(func [b] (x) { var y = 0; y = x; return y; }, 2)), "2");
+
+# ---- a lambda the parser folded into a constant keeps its untyped body:
+# the constant's closure was made with it, so a site served by the one
+# instance still calls the object (its body was dropped, and the call
+# reached a function with no code)
+const POOL = [pure func(x) => typestr(x)];
+func from_pool(int k) => POOL[k](1);
+want("a constant's lambda", from_pool(int(runtime(0))), "int");
+
+assert(bad == 0);
+print("ok");

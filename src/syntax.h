@@ -1201,6 +1201,25 @@ public:
      * (callee_desc, callee_desc2, then these) - for the splice's guard
      * chain alone; the JIT's frameless dispatch serves exactly two */
     std::vector<DescStamp> callee_desc_more;
+    /*
+     * Rule 8.2: the closure INSTANCE whose body runs at this site, and
+     * its BASE - stamped by the inferencer (stamp_closure_templates) when
+     * the callee-set analysis says only that closure template reaches
+     * here. The engines call the callee value with the instance's body
+     * when the value is the base's closure object (InstanceSelectV), and
+     * the value as it is otherwise.
+     *
+     * ⛔ COPIED BY copy_call_fields, UNLIKE `callee_desc` - and that is the
+     * conservative choice here, not a completion of the copy. A null
+     * `callee_desc` costs a slower tier; a null instance stamp runs a
+     * DIFFERENT BODY (the untyped base), so an AST inliner that pasted a
+     * body holding the call and dropped the stamp changed what `typestr`
+     * says inside it (RULE 2: `apply(cl, 1)` said "dyn" where -ni said
+     * "int"). A copy is sound because the select checks the live value:
+     * a pasted call whose callee is another value calls that value.
+     */
+    DescStamp inst_desc;
+    DescStamp inst_base;
 
     /* Set by the inferencer when the callee's static type is `dyn` (callable at
      * runtime, resolved dynamically). The VM lowers it to CallValueGenericV — a
@@ -1370,6 +1389,8 @@ public:
         d.fit_args = fit_args;
         d.in_const_decl = in_const_decl;
         d.user_callee = user_callee;
+        d.inst_desc = inst_desc;            /* rule 8.2 - see inst_desc */
+        d.inst_base = inst_base;
     }
 
     unique_ptr<Construct> clone() const override {
@@ -2105,6 +2126,21 @@ public:
      * indirect call with a non-int arg. A clone (an instance) leaves this false.
      */
     bool is_template = false;
+    /*
+     * Rule 8.2 (plans/strict-container-types.md section 10): this decl is
+     * an INSTANCE of the closure template `closure_instance_of` (its
+     * base): a typed copy of that lambda the inferencer put at the root.
+     * Nothing evaluates it - neither engine makes a closure of it; a call
+     * site the instance serves calls the BASE's closure object with this
+     * body (CallExpr::inst_desc, InstanceSelectV), so its captures are
+     * that object's. Its capture descriptors are the base's (the resolver
+     * copies them).
+     */
+    const FuncDeclStmt *closure_instance_of = nullptr;
+    /* Rule 8.2, the collapse: a closure template whose one instance serves
+     * every site that can reach it is made with that instance's
+     * descriptor, and its own body never runs (stamp_closure_templates) */
+    const FuncDeclStmt *closure_use = nullptr;
 
     /*
      * Set by the inferencer when every parameter's static type can be a

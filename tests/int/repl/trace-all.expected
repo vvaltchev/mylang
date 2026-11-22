@@ -32,8 +32,6 @@ autoconst  dbg  write-once scalar -> false  (folded at uses)
 >> => 10
 >>   infer      ops  ? -> array<func(dyn,dyn)->dyn>
 infer      var ops : array<func(dyn,dyn)->dyn>  (final)
-infer      param a : dyn  (final)
-infer      param b : dyn  (final)
 arrays     ops  dest array<func(dyn,dyn)->dyn> -> general
 => [<function>, <function>]
 >>   infer      f  ? -> func(dyn,dyn)->dyn

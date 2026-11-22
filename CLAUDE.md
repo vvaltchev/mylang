@@ -5169,8 +5169,11 @@ decisions behind it: `plans/archived/type-inference.md`,
   gave `x` 12.0 in the tree-walker and the VM's general unpack while
   spread_idlist typed it int, and the JIT read the float as an int.
 - **A JOINED parameter binds like a DECLARED one (#38 C,
-  `stamp_inferred_param_types`).** A lambda's un-annotated param (and a
-  named function's `opt` one) joins every call site's argument, so
+  `stamp_inferred_param_types`).** (Since rule 8.2 only a lambda a
+  higher-order builtin is handed still joins - every other one gets an
+  instance per call site, below - and since rule 8.1 a named function's
+  `opt` parameter is a template parameter.) A lambda's un-annotated param
+  joins every call site's argument, so
   `f(1); f(2.5)` types it `float` - and the `int` then sat unconverted in a
   slot every typed consumer reads as a float (RULE 1: `print(f(1))` gave
   `1`). The param's `Identifier::decl_type` and its `ParamDesc::decl_type`
@@ -5847,6 +5850,11 @@ correct, unoptimized; pinned by a `repl:` test). This closed the last
 CPython-losing bench (76_funcval_dispatch 1.05-1.12x → **0.68x**; its
 callee bodies 6 boxed ops → 4 typed).
 
+**(HISTORY: rule 8.2 replaced the join below for every lambda but one a
+higher-order builtin is handed - see *Closure templates* after this
+section. #115's snapshot still serves those, and its gates are what the
+closure instances reuse.)**
+
 **⛔ THE FINFO SET NOW TYPES A FACTORY-RETURNED CLOSURE'S PARAMETER
 (#115, 2026-08-27) - AND THAT IS A SCRIPT-VISIBLE RULE, NOT ONLY AN
 OPTIMIZATION.** `accumulate_call` fed argument types into a callee's
@@ -6148,6 +6156,89 @@ callee to a prior clone), and `make_template_clone` clears the clone subtree's
 `id_sym`/`func_of_decl`. (This was an MSVC-only, address-dependent,
 non-deterministic bug, root-caused via CI instrumentation; GCC/clang +
 sanitizers never reproduced it.)
+
+### Closure templates (rule 8.2, plans/strict-container-types.md section 10)
+
+**A lambda's call sites do not join; each gets an INSTANCE.** Every
+lambda with a template parameter (`template_param`) that is not a
+write-once, calls-only template (`mark_lambda_templates`) and that no
+higher-order builtin is handed (`mark_closure_templates`'s `fed` set: those
+keep joining - a provisional choice, plan section 8) is a CLOSURE TEMPLATE
+(`FuncInfo::closure_tmpl`). Its own body is the BASE: an ordinary checked
+function no call site contributes to, so its template parameters stay
+unconstrained (Unknown in the fixpoint, `dyn` once finalized - exactly
+what a lambda no site could name always was). A site the callee-set
+analysis says reaches it ALONE (`callee_set(what)` = {L}, not ⊤) gets the
+instance for its argument types (`closure_instantiate_round`, keyed by
+`template_sig_key`, cap `--max-instances`): a clone of the lambda at the
+root (`FuncDeclStmt::closure_instance_of`), walked with the BASE's capture
+symbols (`struct_capture_src` - at the root a capture name would find
+nothing). `closure_site_inst` maps the site; `type_of`, `accumulate_call`,
+`check_call`, `known_params`, the none/fit masks and the callee-set
+analysis's binding (`cs_call`, `cs_eval`) all read the instance there.
+Rules it already earned:
+
+- **ONE closure object, one capture vector.** The engines call the base's
+  object with the instance's body: an INSTANCE VIEW (`FuncObject::
+  InstanceView` - the instance's descriptor, the base object's capture
+  slots borrowed, `CaptureSlots::Borrow`, and `inst_base` holding the base
+  alive), made per call by `closure_instance_value`, the one answer both
+  engines share (the tree-walker's dispatch and InstanceSelectV,
+  docs/vm-ops.md). A capture written by one instance is seen by every other.
+- **THE COLLAPSE** (`stamp_closure_templates`): a closure template with ONE
+  instance that serves every site reaching it, nothing else reaching it
+  (`callee_escaped`, a multi-candidate site) and not in the REPL is MADE
+  with the instance's descriptor (`FuncDeclStmt::closure_use`), its sites
+  need no select and its base gets no chunk. That is the common factory
+  closure (63_closures) and it costs nothing at a call; inference is the
+  same either way. **A lambda the PARSER baked into a constant's value is
+  never collapsed** (`tree_baked_funcs`, the same walk the #149 closure
+  uses): `const POOL = [pure func(x) => ...]` holds a closure made at
+  parse time with the BASE's descriptor, so a collapsed base had no code
+  and a call through POOL aborted ("call to a chunk-less function").
+- **A closure template's return type is WITHHELD until the loops are done**
+  (`closure_loop_done`, func_static_type / type_of): a site whose instance
+  does not exist yet must defer, or the base's untyped return would key the
+  instances of the calls that use its result.
+- **A template instance made mid-inference holds fresh lambda copies**, so
+  `mark_closure_templates` runs again each round.
+- **The base may not store an untyped value into a variable it does not
+  own** (`base_shared_dyn`): such a store is no contribution (it would widen
+  the variable for every instance and for the code outside), and is checked
+  at run time against the variable's type instead - `rv_fit`, or the
+  numeric coercion (`TypeSym::base_dyn_store` -> coerces_dyn). Element
+  stores into a shared container are checked by the container's own type.
+- The base's checked stores into a capture rely on the capture carrying
+  its variable's declared type (*dyn-into-concrete COERCION*, the capture
+  note).
+- A REPL input's earlier closure is `pinned`: its later sites call the base
+  (maintainer's decision 3). **And an earlier input's TEMPLATE instance is
+  not reused for a signature holding a function whose return is still
+  unknown** (`instantiate_round`'s `ret_open`): a withheld return makes two
+  closures key alike, and the pinned instance's committed body would read
+  the other closure's result as its own (`r : str` holding 2).
+- **A MAPPING IS WITHDRAWN WHEN ITS SITE'S CALLEE SET GROWS** (each
+  `closure_instantiate_round` re-checks every mapping against the current
+  sets; the site joins `closure_site_barred` for good). The sets only grow,
+  and a template clone made AFTER the mapping can add a candidate - `h =
+  fn` in a template `set_h` - so a mapped site's instance return type had
+  typed a float result as an int. Commit is non-monotone (`type = acc`
+  each round), so the rerun fixpoint drops what the instance had given;
+  `stamp_closure_templates` ML_CHECKs that no stale mapping survived.
+- **A CALL THAT MAY RUN A BASE WITH AN UNSETTLED RETURN HAS NO TYPE**
+  (`runs_unsettled_base`, consulted where `type_of` reads a function-typed
+  callee's return). A base's return computed from its parameters stays
+  Unknown for good, and the function-type JOIN under a multi-candidate
+  callee takes the other candidate's return for an unknown one: a site that
+  may call `typestr(x)`'s lambda or `x + 1`'s was typed `str` and the VM
+  read the int as a string (a wild read). A ⊤ site asks every escaped
+  closure template. The join hole itself is older (a function whose
+  return finalizes `dyn` joined with a typed one) and remains for
+  non-closure candidates.
+- **THE AST INLINER MOVES a temp-bound argument, never copies it**
+  (`splice_block_call`): a copied lambda is another function, with a
+  fresh descriptor the instance stamps of the inlined sites do not name, so
+  the inlined run called the base where `-ni` called the instance.
 
 ### THE CALLEE-SET ANALYSIS (#116, `calleeset.cpp.h`)
 

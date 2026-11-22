@@ -1358,6 +1358,13 @@ extern "C" int jit_check_fit(int_type slot, const void *spec) noexcept;
  * op pc, and returns 1. */
 extern "C" int jit_cast(int_type src, int_type dst, const void *t) noexcept;
 
+/* rule 8.2: the native InstanceSelectV - slot `dst` = slot `src` viewed
+ * with closure template instance `inst`'s body when it is the closure
+ * object of base `base` (both FuncDescriptor *, baked), else a copy of it.
+ * Only an allocation can fail: it conveys and returns 1. */
+extern "C" int jit_instance_select(int_type src, int_type dst,
+                                   const void *base, const void *inst) noexcept;
+
 /* model-flip (nativize-ops): the dyn-callee generic call pair. CheckCallableV
  * (the callable guard - conveys a loc-less NotCallableEx, exc-stamped with
  * the callee caret) and CallValueGenericV (the full by-Kind dispatch over

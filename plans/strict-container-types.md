@@ -445,7 +445,7 @@ prints `0`. Choice 6 fixes it.
    Tests: tests/functional/137, the `rule 8.1:` `-rt` rows. 8.2 (closure
    and lambda-value instances) not started.
 
-## 10. Rule 8.2 - the design, approved 2026-11-22, NOT BUILT YET
+## 10. Rule 8.2 - the design, approved 2026-11-22, BUILT 2026-11-22
 
 Stopped at the design on purpose: 8.2 changes the runtime call model
 and the `.myv` format, so the maintainer reviewed it before any code
@@ -511,3 +511,27 @@ instance read past the capture vector).
 runtime change: instances unused), then the call operand and the
 tree-walker, then the VM tiers one at a time with the five-mode
 differential, then the format.
+
+**Built (2026-11-22), and where it departs from the design above** (the
+implementation record is CLAUDE.md, *Closure templates*):
+- the runtime does not add an operand to the call ops: a new op,
+  InstanceSelectV, turns the callee into an INSTANCE VIEW (the instance's
+  descriptor, the base object's capture slots) before an unchanged call,
+  so no call tier changed. A view is a small allocation per call; the
+  common shape - one instance serving every site - needs none (the
+  COLLAPSE: the closure is made with the instance's descriptor);
+- the base is an ordinary checked function whose template parameters stay
+  unconstrained (no site contributes), not one "typed dyn" - typing them
+  `dyn` made every value derived from them `dyn` during inference, which
+  the mandatory-dyn rule refused (`var a = f(3)` at a site that runs the
+  base);
+- PROVISIONAL (for the maintainer): a lambda a higher-order builtin is
+  handed (map, filter, sort, rev_sort, sum, make_array, make_dict, find)
+  keeps the old join with its other call sites - the builtin calls the
+  closure object, whose body is the base, and types its parameters from
+  the container;
+- the base may not store an untyped value into a variable it does not own:
+  that store is checked at run time against the variable's type
+  (`base_shared_dyn`), which needed a pre-existing bug fixed first - a
+  captured variable's declared type did not reach the stores in the
+  closure's body.

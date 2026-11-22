@@ -1,0 +1,214 @@
+# INT-ENGINES: tw default nj noopt
+#
+# INT unit (rule 8.2, plans/strict-container-types.md section 10): the edges
+# of closure templates that tests/functional/139 does not reach - every
+# higher-order builtin that keeps a lambda joining, a site the analysis
+# cannot follow, sites whose arguments settle only once another instance
+# exists (a nested call, a second parameter, a dict's key or value),
+# container keys, a `dyn` callee an instance serves, the untyped body's
+# checked stores into its captures (a number, an array, a box, a dict,
+# nested arrays, a `dyn`, a captured parameter), a mapping its site
+# outgrows (a template assigns a second closure, or a value the analysis
+# cannot follow), an argument that never gets a type, and a lambda the
+# parser bakes into a constant.
+var typed = typestr(runtime(0)) == "dyn";
+var bad = 0;
+func want(str what, opt dyn got, opt dyn exp) {
+    if (got != exp) {
+        print("FAIL " + what + ": got " + str(got) + ", expected "
+              + str(exp));
+        bad++;
+    }
+}
+func refused(dyn f, dyn v) {
+    try { f(v); } catch (TypeErrorEx) { return true; }
+    return false;
+}
+
+# (globals a function reads, declared before any call the compiler cannot
+# follow)
+var k = 1;
+var o1 = func [k] (x) { return x + 1; };
+var o2 = func [k] (x) { return x * 2; };
+var dyn ho = o1;
+func set_ho(v) { ho = runtime(v); return 0; }
+var hg1 = func [k] (x) { return x + 1; };
+var hg2 = func [k] (x) { return x * 2.5; };
+var hg = hg1;
+func set_hg(fn) { hg = fn; return 0; }
+
+# ---- the untyped body stores into its captures, checked when it runs
+func mk_box() {
+    var bx = box(1);
+    return func [bx] (x) { bx = box(x); return *bx; };
+}
+func mk_dict() {
+    var dd = {"k": 1};
+    return func [dd] (x) { dd = {"k": x}; return dd["k"]; };
+}
+func mk_key() {
+    var dk = {1: "a"};
+    return func [dk] (x) { dk = {x: "b"}; return len(dk); };
+}
+func mk_rows() {
+    var rows = [[1]];
+    return func [rows] (x) { rows = [[x]]; return rows[0][0]; };
+}
+func mk_dyn() {
+    var dv = 0;
+    return func [dv] (x) { dv = runtime(x); return dv; };
+}
+func mk_dbox() {
+    var bd = box(1);
+    return func [bd] (x) { bd = box(runtime(x)); return *bd; };
+}
+func mk_fixed() {
+    var df = {"k": "v"};
+    return func [df] (x) { df = {"k": "w", "j": "v"}; return len(df); };
+}
+func mk_fdyn() {
+    var fv = 0.5;
+    return func [fv] (x) { fv = runtime(x); return fv; };
+}
+func mk_pdyn(int p) => func [p] (x) { p = runtime(x); return p; };
+func mk_zero() => func (x) { return 0; };
+func mk_fzero() => func (x) { return 0.0; };
+var cb = [mk_box(), mk_zero()][runtime(0)];
+var cd = [mk_dict(), mk_zero()][runtime(0)];
+var ck = [mk_key(), mk_zero()][runtime(0)];
+var cr = [mk_rows(), mk_zero()][runtime(0)];
+var cy = [mk_dyn(), mk_zero()][runtime(0)];
+var cx = [mk_dbox(), mk_zero()][runtime(0)];
+var cf = [mk_fixed(), mk_zero()][runtime(0)];
+var cv = [mk_fdyn(), mk_fzero()][runtime(0)];
+var cp = [mk_pdyn(1), mk_zero()][runtime(0)];
+want("a dyn into a captured float", str(cv(3)), typed ? "3.000000" : "3");
+want("a dyn into a captured parameter", cp(4), 4);
+want("a dyn value", cy(4), 4);
+want("a box of a dyn value", cx(3), 3);
+want("a settled dict", cf(2), 2);
+want("a box", cb(5), 5);
+want("a dict value", cd(6), 6);
+want("a dict key", ck(7), 1);
+want("nested rows", cr(8), 8);
+if (typed) {
+    want("a dyn misfit", refused(cy, 2.5), true);
+    want("a dyn box misfit", refused(cx, "s"), true);
+    want("a box misfit", refused(cb, "s"), true);
+    want("a dict value misfit", refused(cd, "s"), true);
+    want("a dict key misfit", refused(ck, "s"), true);
+    want("a rows misfit", refused(cr, "s"), true);
+}
+
+# ---- a two-parameter site whose first argument is another instance's
+var inner2 = func [k] (x) { return x + k; };
+var two = func [k] (p, q) { return typestr(p) + typestr(q); };
+want("a late first argument", two(inner2(1), "s"), "intstr");
+
+# ---- dict arguments whose key or value is another instance's result
+var fk2 = func [k] (x) { return typestr(x); };
+want("a late dict value", fk2({"a": inner2(1)}), "dict<str,int>");
+want("a late dict key", fk2({inner2(2): "a"}), "dict<int,str>");
+
+# ---- a mapping the site outgrows: a template assigns a second closure
+var hgr1 = hg(1);
+set_hg(hg2);
+want("a grown callee set", str(hg(2) + 1), "6.000000");
+
+# ---- a mapping the site outgrows through a value nothing follows
+var dyn hr = ho(1);
+set_ho(o2);
+var dyn hr2 = ho(3);
+want("an outgrown site", str(hr) + " " + str(hr2), "2 6");
+
+# ---- an argument that never gets a type: the result of a call that may
+# reach either of two closures
+var e1 = func [k] (x) { return x + 1; };
+var e2 = func [k] (x) { return x * 2; };
+var either = [e1, e2][runtime(0)];
+var single = func [k] (x) { return typestr(x); };
+want("a never-typed argument", single(either(1)), typed ? "dyn" : "int");
+
+# ---- a lambda the parser baked into a constant keeps its untyped body
+const POOL = [pure func(x) => typestr(x)];
+func from_pool(int i) => POOL[i](1);
+want("a constant's lambda", from_pool(int(runtime(0))), "int");
+
+var fm = func [k] (x) { return x; };
+var r1 = map(fm, [1.5]);
+var ff = func [k] (x) { return x > 0; };
+var r2 = filter(ff, [1, -1]);
+var fs = func [k] (p, q) { return p < q; };
+var r3 = sort([3, 1, 2], fs);
+var fr = func [k] (p, q) { return p < q; };
+var r4 = rev_sort([3, 1, 2], fr);
+var fu = func [k] (x) { return x * 2; };
+var r5 = sum([1, 2], fu);
+var fa = func [k] (i) { return i + k; };
+var r6 = make_array(3, fa);
+var fd = func [k] (key) { return len(key); };
+var r7 = make_dict(["a", "bb"], fd);
+var fn = func [k] (x) { return x % 2; };
+var r8 = find([3, 4], 0, fn);
+want("map", str(fm(2)), typed ? "2.000000" : "2");
+want("filter", len(r2), 1);
+want("sort", r3[0], 1);
+want("rev_sort", r4[0], 3);
+want("sum", r5, 6);
+want("make_array", r6[2], 3);
+want("make_dict", r7["bb"], 2);
+want("find", r8, 1);
+# ...a program's own `sum` is not the builtin
+func uses_own(sum) => sum(4);
+want("a parameter named sum", uses_own(func [k] (x) { return x + k; }), 5);
+
+# ---- a value the analysis cannot follow runs the untyped body
+var fl = func [k] (x) { return typestr(x); };
+var dyn opaque = runtime(fl);
+if (typed)
+    want("an opaque callee", opaque(1), "dyn");
+want("a named site still instanced", fl(1), "int");
+
+# ---- an argument that settles only once another instance exists
+var inner = func [k] (x) { return x + k; };
+var outer = func [k] (y) { return typestr(y); };
+want("a nested instance", outer(inner(1)) + outer(inner(0.5)),
+     "intfloat");
+
+# ---- container arguments key their instances
+var fk = func [k] (x) { return typestr(x); };
+want("container keys", fk([[1]]) + " " + fk({"a": 1}),
+     "array<array<int>> dict<str,int>");
+
+# ---- a `dyn` variable holding one closure: its site is an instance's
+var fg = func [k] (x) { return typestr(x); };
+var dyn viad = fg;
+want("a dyn callee", viad(2), "int");
+
+# ---- the untyped body converts or refuses what it stores into a capture
+func mk_num() {
+    var total = 0;
+    return func [total] (x) { total = x; return total; };
+}
+func mk_arr() {
+    var items = [1];
+    return func [items] (x) { append(items, x); return len(items); };
+}
+func mk_z() => func (x) { return 0; };
+var nums = [mk_num(), mk_z()];
+var some = nums[runtime(0)];
+want("a fitting number", some(5), 5);
+var refused_n = false;
+try { some(2.5); } catch (TypeErrorEx) { refused_n = true; }
+if (typed)
+    want("a float into a captured int", refused_n, true);
+var arrs = [mk_arr(), mk_z()];
+var any = arrs[runtime(0)];
+want("an element appended", any(2), 2);
+var refused2 = false;
+try { any("s"); } catch (TypeErrorEx) { refused2 = true; }
+if (typed)
+    want("a string into a captured array<int>", refused2, true);
+
+assert(bad == 0);
+print("ok");

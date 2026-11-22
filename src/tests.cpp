@@ -2109,24 +2109,30 @@ static const std::vector<test> tests =
         "var x = fi; assert(str(x) == \"1.000000\"); x = 2.5;",
         "float gl = 0.5; func setg(int v) { gl = v; } setg(fi);",
         "assert(str(gl) == \"1.000000\");" } },
+    /* (a lambda a higher-order builtin is handed keeps JOINING its
+     * call sites - rule 8.2 gives every other one an instance per site,
+     * pinned below - so the join's conversions are tested on one) */
     { "coerce: a joined float lambda param converts an int argument",
       { "var b = 2;",
         "var f = func [b] (x) { return x; };",
+        "var m = map(f, [0.5]);",
         "assert(typestr(f(1)) == \"float\" && str(f(1)) == \"1.000000\");",
         "assert(f(2.5) == 2.5);",
         "var s = 0.0;",
         "for (var i = 0; i < 40; i++) s = s + f(i);",
         "assert(s == 780.0);" } },
-    { "coerce: a factory closure's joined param, and an opt param",
+    /* rule 8.2: a closure's parameters do not join - each call site gets
+     * the instance for its argument types, so nothing is converted; a
+     * closure's `opt` parameter is a template parameter as a named
+     * function's is (rule 8.1) */
+    { "coerce: a closure's call sites do not join (rule 8.2), an opt "
+      "param neither",
       { "func mk(n) { var w = n; return func [w] (x) { return x; }; }",
         "var g = mk(2);",
-        "assert(str(g(1)) == \"1.000000\" && g(2.5) == 2.5);",
-        /* (a capturing closure's `opt` parameter joins - a NAMED
-         * function's is a template parameter, rule 8.1: one instance
-         * per argument type, nothing converted) */
+        "assert(str(g(1)) == \"1\" && g(2.5) == 2.5);",
         "var cw = 1;",
         "var oc = func [cw] (opt z) { return z; };",
-        "assert(str(oc(3)) == \"3.000000\" && oc(1.5) == 1.5);",
+        "assert(str(oc(3)) == \"3\" && oc(1.5) == 1.5);",
         "assert(oc() == none);",
         "func o(opt z) { return z; }",
         "assert(str(o(3)) == \"3\" && o(1.5) == 1.5 && o() == none);"
@@ -2134,6 +2140,7 @@ static const std::vector<test> tests =
     { "coerce: a joined int param converts a bool argument",
       { "var c = 1;",
         "var h = func [c] (y) { return y; };",
+        "var m = map(h, [5]);",
         "assert(str(h(true)) == \"1\" && h(5) == 5);" } },
     /*
      * ...but ONLY a param a bind can actually CONVERT is stamped: one every
@@ -2222,26 +2229,31 @@ static const std::vector<test> tests =
     { "coerce: a param fed only its final type stays unstamped (fast_bind)",
       { "var b = 2;",
         "var f = func [b] (x) { return x; };",
-        "f(1); f(2);",
+        "var mf = map(f, [1]); f(2);",
         "assert(signature(f) == \"func <lambda>(x)\");",
         "var g = func [b] (x) { return x; };",
-        "g(1.5); g(2.5);",
+        "var mg = map(g, [1.5]); g(2.5);",
         "assert(signature(g) == \"func <lambda>(x)\");",
         "var xs = [3, 1, 2];",
         "var c = func [b] (p, q) { return p < q; };",
         "sort(xs, c);",
         "assert(signature(c) == \"func <lambda>(p, q)\");",
         "var h = func [b] (x) { return x; };",
-        "h(1); h(2.5);",
+        "var mh = map(h, [2.5]); h(1);",
         "assert(signature(h) == \"func <lambda>(float x)\");",
         "var k = func [b] (y) { return y; };",
-        "k(true); k(5);",
-        "assert(signature(k) == \"func <lambda>(int y)\");" } },
+        "var mk = map(k, [5]); k(true);",
+        "assert(signature(k) == \"func <lambda>(int y)\");",
+        /* rule 8.2: a closure template's own (base) body binds nothing:
+         * its sites have their instances */
+        "var t = func [b] (x) { return x; };",
+        "t(1); t(2.5);",
+        "assert(signature(t) == \"func <lambda>(x)\");" } },
     { "coerce: a dyn argument the joined float param cannot take throws",
       { "var b = 2;",
         "var f = func [b] (x) { return x; };",
         "var dyn d = runtime(\"s\");",
-        "f(2.5);",
+        "var m = map(f, [2.5]);",
         "f(d);" },
       &typeid(TypeErrorEx), 3, 5, 5, 5 },
 
@@ -5860,68 +5872,67 @@ static const std::vector<test> tests =
     },
 
     /*
-     * ⛔ TWO DISAGREEING CALL SITES *JOIN*, AND BOTH SPELLINGS OF A
-     * CAPTURING CLOSURE DO THE SAME THING. These two entries are a
-     * PAIR: the same program written as a factory-returned closure and
-     * as a directly-bound capturing lambda, and BOTH must refuse an
-     * int/str pair - which is the join CONFLICT, not a rule of this
-     * pass.
+     * RULE 8.2: TWO DISAGREEING CALL SITES GET AN INSTANCE EACH, AND
+     * BOTH SPELLINGS OF A CAPTURING CLOSURE DO THE SAME THING. These
+     * entries are a PAIR: the same program written as a factory-returned
+     * closure and as a directly-bound capturing lambda. Each site the
+     * callee-set analysis says reaches the closure alone calls the
+     * instance for its own argument types, with the closure object's
+     * captures - an int/str pair is two instances, where it used to be
+     * the JOIN CONFLICT (TypeMismatchEx), and an int/float pair keeps
+     * its int, where the join made it a float.
      *
-     * They used to disagree. A UNIFORMITY check refused to contribute
-     * anything unless every site attributed to a closure passed the
-     * SAME argument types, so the factory form declined to `dyn` and
-     * printed `dyn201dyn20s` where the direct form raised
-     * TypeMismatchEx. That check was never computing a different
-     * answer - it decided whether to answer AT ALL, because
-     * `contribute_arg` is the same function the direct path already
-     * called unconditionally. It is DELETED (maintainer's call,
-     * 2026-08-28).
-     *
-     * ⛔ IT WAS SAFE TO DELETE ONLY BECAUSE THE CANDIDATE SET IS
-     * COMPLETE NOW. Uniformity went in when `join`'s
-     * `static_type_equal` shortcut dropped one side's members whenever
-     * two functions shared a signature: sites belonging to two
-     * DIFFERENT closures were attributed to one survivor, and joining
-     * those invents a conflict in a program that has none. The
-     * callee-set analysis reports such a site as a TWO-candidate set,
-     * which `disqualified` refuses - see the two array entries below,
-     * which still decline for THAT reason.
+     * (The two spellings disagreed once before: a UNIFORMITY check made
+     * the factory form decline to `dyn`; it was deleted 2026-08-28,
+     * when both started to join. Rule 8.2 replaced the join.)
      */
+    /* rule 8.2: a closure template's site with the wrong argument count
+     * gets no instance, and the check pass refuses it as it refuses any
+     * call's */
+    { "infer: a closure site with the wrong argument count is refused",
+      { "var k = 1;",
+        "var f = func [k] (x) { return x; };",
+        "print(f(1, 2));" },
+      &typeid(WrongArgCountEx) },
+    { "infer: a closure site with too few arguments is refused",
+      { "var k = 1;",
+        "var f = func [k] (x, y) { return x; };",
+        "print(f(1));" },
+      &typeid(WrongArgCountEx) },
+    /* rule 8.2: the untyped body storing into a capture that names
+     * nothing - inference sees the store before the resolver refuses the
+     * name, and must not take it for a store into a shared variable */
+    { "infer: a closure capturing an undefined name and storing into it",
+      { "var f = func [nosuch82] (x) { nosuch82 = x; return 0; };",
+        "print(f(1));" },
+      &typeid(UndefinedVariableEx) },
     {
-        "infer: a factory closure's disagreeing call sites JOIN - an "
-        "int/str pair is refused",
+        "infer: a factory closure's disagreeing call sites get an instance "
+        "each (rule 8.2)",
         {
             "func mk(n) {",
             "  var b = n * 10;",
-            "  return func [b] (x) { return str(b) + str(x); };",
+            "  return func [b] (x) { return str(b) + typestr(x); };",
             "}",
             "func drive(int k) { var f = mk(k); return f(1) + f(\"s\"); }",
-            "print(drive(runtime(2)));",
+            "assert(drive(runtime(2)) == \"20int20str\");",
         },
-        &typeid(TypeMismatchEx),
     },
     {
         "infer: ...and the DIRECTLY-bound capturing lambda agrees - the "
-        "same program, the same refusal",
+        "same program, the same instances",
         {
             "func drive(int k) {",
             "  var b = k * 10;",
-            "  var f = func [b] (x) { return str(b) + str(x); };",
+            "  var f = func [b] (x) { return str(b) + typestr(x); };",
             "  return f(1) + f(\"s\");",
             "}",
-            "print(drive(runtime(2)));",
+            "assert(drive(runtime(2)) == \"20int20str\");",
         },
-        &typeid(TypeMismatchEx),
     },
-    /*
-     * ...and where the types JOIN instead of conflicting, both
-     * spellings coerce, again identically. This is the half a
-     * refusal-only pair cannot see: uniformity's other effect was that
-     * `f(1)` stayed an int where the direct spelling made it a float.
-     */
     {
-        "infer: a factory closure's int/float sites join to float - "
-        "both spellings coerce",
+        "infer: a factory closure's int/float sites keep their types - "
+        "both spellings",
         {
             "func mk(n) {",
             "  var b = n * 10;",
@@ -5930,8 +5941,8 @@ static const std::vector<test> tests =
             "func drive(int k) { var f = mk(k); return f(1) + f(2.5); }",
             "var db = 20;",
             "var dfn = func [db] (x) { return typestr(x); };",
-            "assert(drive(runtime(2)) == \"floatfloat\");",
-            "assert(dfn(1) + dfn(2.5) == \"floatfloat\");",
+            "assert(drive(runtime(2)) == \"intfloat\");",
+            "assert(dfn(1) + dfn(2.5) == \"intfloat\");",
         },
     },
     /*
@@ -24006,6 +24017,28 @@ struct repl_test {
 
 static const std::vector<repl_test> repl_tests =
 {
+    /* rule 8.2, decision 3: a closure made in one input and called in a
+     * later one runs its untyped body; sites in its own input get
+     * instances */
+    { "a closure's instances are its own input's",
+      { { "var k82 = 5", "=> 5" },
+        { "var f82 = func [k82] (x) { return typestr(x); }; "
+          "print(f82(1) + f82(\"s\"))", "intstr" },
+        { "f82(2)", "=> \"dyn\"" } } },
+    /* rule 8.2: a function value whose return is still unknown does not
+     * say which function it is, so an earlier input's instance of a
+     * template it is passed to - typed by the closure ITS call passed -
+     * is not reused for another closure (it used to be, and its body
+     * read m82's int result as the str g82 returns) */
+    { "an earlier input's template instance serves only its closure",
+      { { "var b82r = 1", "=> 1" },
+        { "func ap82(fn, v) { var r = fn(v); return r; }", "" },
+        { "var g82 = func [b82r] (x) { return typestr(x); }", "" },
+        { "var gs82 = [g82]", "" },
+        { "ap82(g82, 1)", "=> \"dyn\"" },
+        { "var m82 = func [b82r] (x) { return x + 1; }", "" },
+        { "var ms82 = [m82]", "" },
+        { "var r82 = ap82(m82, 1)", "DynRequiredEx" } } },
     /* cast<T>(x) (plans/cast.md): its echo, :type, the decompiler's
      * rendering, and a refusal leaving the session alive */
     { "a cast at the prompt",
@@ -32201,6 +32234,27 @@ static bool opt_layer_run(const std::string &src, ExecEngine eng,
 static bool opt_layer_equivalence()
 {
     const std::vector<OptLayerCase> cases = {
+        /* rule 8.2: a closure instance's site, pasted by the AST inliner
+         * (the body of `apply` holds the call) and reached through a
+         * global (a DirectCallExpr calls the slot's object as it is) - the
+         * instance must still run: `-ni` and the default printed
+         * different typestr()s until both kept the instance stamp */
+        { "a closure instance's site inside an inlined body, and through a "
+          "global", {
+            "func apply(f, x) => f(x);",
+            "var k = 3;",
+            "var cl = func [k] (x) { return typestr(x); };",
+            "func use1() { return cl(1); }",
+            "func use2() { return cl(\"s\"); }",
+            "print(apply(cl, 1) + apply(cl, \"s\") + use1() + use2() "
+            "+ cl(2.5));" } },
+        /* the AST inliner binds a lambda argument to a temp: moved, not
+         * copied - a copy is another function, which the instance stamps
+         * of the inlined sites do not name */
+        { "a lambda argument the AST inliner binds to a temp", {
+            "func both(fn) => fn(1) + fn(\"s\");",
+            "var k = 3;",
+            "print(both(func [k] (x) { return typestr(x); }));" } },
         /* the LICM target: an invariant row read in a counted inner loop */
         /* `typed` off leaves the value an UNTYPED chain, and the flat-float
          * element store refused it (NotLoweredEx) instead of falling back
@@ -37948,6 +38002,231 @@ static bool myv_cast_type_refused()
  * annot, a scalar one with an annot - rather than let those passes meet
  * a field the compiler cannot make.
  */
+/*
+ * Rule 8.2: an InstanceSelectV runs the INSTANCE's body with the BASE
+ * object's capture slots, so the two descriptors must expect as many
+ * captures - an instance with one fewer would index past nothing, one
+ * with one more past the vector. vm_verify_program refuses an image where
+ * they differ; the intact image runs. Watched: with the capture-count
+ * test out of verify_chunk, both tampered images load.
+ */
+/*
+ * Rule 8.2: closure_instance_value, both engines' one answer - a closure
+ * object of the stamped base becomes an INSTANCE VIEW (the instance's
+ * descriptor, the object's own capture slots, the object held alive);
+ * anything else, a stamp whose serial does not match the live
+ * descriptor's included, is the value as it is. No program reaches the
+ * second half (a site is stamped only where the callee-set analysis says
+ * the base's object is all that arrives), so it is driven directly.
+ */
+static bool closure_instance_value_cases()
+{
+    bool ok = true;
+    FuncDescriptor base, inst, other;
+    const intrusive_ptr<FuncObject> fo =
+        make_intrusive<FuncObject>(&base, nullptr);
+    const intrusive_ptr<FuncObject> fother =
+        make_intrusive<FuncObject>(&other, nullptr);
+    const EvalValue vb(fo), vo(fother), vi(static_cast<int_type>(5));
+    const EvalValue view = closure_instance_value(vb, &base, base.serial,
+                                                  &inst);
+    if (!view.is<intrusive_ptr<FuncObject>>()
+            || view.get<intrusive_ptr<FuncObject>>()->func != &inst
+            || view.get<intrusive_ptr<FuncObject>>()->inst_base.get()
+                   != fo.get()) {
+        fprintf(stderr, "closure_instance_value: the base's object is not "
+                        "viewed with the instance\n");
+        ok = false;
+    }
+    const EvalValue same = closure_instance_value(vo, &base, base.serial,
+                                                  &inst);
+    if (!same.is<intrusive_ptr<FuncObject>>()
+            || same.get<intrusive_ptr<FuncObject>>().get()
+                   != fother.get()) {
+        fprintf(stderr, "closure_instance_value: another function's object "
+                        "is not passed through\n");
+        ok = false;
+    }
+    const EvalValue stale = closure_instance_value(vb, &base,
+                                                   base.serial + 1, &inst);
+    if (!stale.is<intrusive_ptr<FuncObject>>()
+            || stale.get<intrusive_ptr<FuncObject>>().get() != fo.get()) {
+        fprintf(stderr, "closure_instance_value: a stale stamp is "
+                        "honoured\n");
+        ok = false;
+    }
+    const EvalValue num = closure_instance_value(vi, &base, base.serial,
+                                                 &inst);
+    if (!num.is<int_type>() || num.get<int_type>() != 5) {
+        fprintf(stderr, "closure_instance_value: a non-function value "
+                        "changed\n");
+        ok = false;
+    }
+    return ok;
+}
+
+/*
+ * Rule 8.2: past --max-instances a closure template's further site runs
+ * its untyped body, and the `template` trace narrates each instance.
+ */
+static bool closure_instance_cap()
+{
+    const char *src =
+        "var k = 1;\n"
+        "var f = func [k] (x) { return typestr(x); };\n"
+        "print(f(1) + f(\"s\"));\n";
+    const int saved_cap = g_tmpl_max_instances;
+    const unsigned saved_mask = g_trace_mask;
+    std::ostream *saved_sink = trace_sink();
+    std::ostringstream tr, out;
+    g_tmpl_max_instances = 1;
+    g_trace_mask = static_cast<unsigned>(TraceCat::templ);
+    trace_set_sink(&tr);
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        std::streambuf *old_buf = std::cout.rdbuf(out.rdbuf());
+        try {
+            vm_execute(root.get());
+        } catch (Exception &) {
+            std::cout.rdbuf(old_buf);
+            throw;
+        }
+        std::cout.rdbuf(old_buf);
+    } catch (Exception &e) {
+        fprintf(stderr, "closure_instance_cap: %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_tmpl_max_instances = saved_cap;
+    g_trace_mask = saved_mask;
+    trace_set_sink(saved_sink);
+    if (out.str().find("intdyn") == std::string::npos) {
+        fprintf(stderr, "closure_instance_cap: ran to \"%s\"\n",
+                out.str().c_str());
+        ok = false;
+    }
+    if (tr.str().find("<lambda>(int) -> instance 1") == std::string::npos) {
+        fprintf(stderr, "closure_instance_cap: traced \"%s\"\n",
+                tr.str().c_str());
+        ok = false;
+    }
+    return ok;
+}
+
+static bool myv_instance_select_checked()
+{
+    const char *src =
+        "func mkc() { var n = 0; return func [n] (x) {\n"
+        "  n++; return typestr(x) + str(n); }; }\n"
+        "var c = mkc();\n"
+        "print(c(1) + c(\"s\"));\n";
+    const ExecEngine saved = g_exec_engine;
+    g_exec_engine = ExecEngine::Vm;
+    bool ok = true;
+    try {
+        std::vector<Tok> toks;
+        lexer(src, 1, toks);
+        ParseContext pc(TokenStream(toks), true);
+        unique_ptr<Construct> root = pBlock(pc);
+        mark_implicit_globals(root.get(), {});
+        infer_types(root.get(), true);
+        run_optimizers(root.get());
+        VmProgram prog = vm_compile(root.get(), /*jit=*/false);
+        /* the select and its two descriptors, as the program owns them */
+        FuncDescriptor *base = nullptr, *inst = nullptr;
+        int nsel = 0;
+        const auto owned = [&](const FuncDescriptor *d) -> FuncDescriptor * {
+            for (auto &f : prog.funcs)
+                if (f.get() == d)
+                    return f.get();
+            return nullptr;
+        };
+        const auto scan = [&](const Chunk &ck) {
+            for (const Instr &in : ck.code)
+                if (in.op == OpCode::InstanceSelectV) {
+                    nsel++;
+                    base = owned(ck.closure_defs[
+                        static_cast<size_t>(in.target2)]);
+                    inst = owned(ck.closure_defs[
+                        static_cast<size_t>(in.b_lit())]);
+                }
+        };
+        scan(prog.root);
+        for (auto &f : prog.funcs)
+            if (f->vm_chunk)
+                scan(*static_cast<const Chunk *>(f->vm_chunk));
+        if (nsel != 2 || !base || !inst || base->captures.size() != 1
+                || inst->captures.size() != 1) {
+            fprintf(stderr, "myv_instance_select_checked: %d select(s), "
+                            "not two over a one-capture closure\n", nsel);
+            g_exec_engine = saved;
+            return false;
+        }
+        std::string tdir = "/tmp";
+        for (const char *var : { "TMPDIR", "TEMP", "TMP" }) {
+            const std::optional<std::string> e = env_get(var);
+            if (e && !e->empty()) { tdir = *e; break; }
+        }
+        while (tdir.size() > 1
+               && (tdir.back() == '/' || tdir.back() == '\\'))
+            tdir.pop_back();
+        const std::string path = tdir + "/mylang-myv-instsel.myv";
+        const auto refused = [&](const char *what) {
+            myv_write(prog, path, MyvSourceRef());
+            try {
+                MyvSource img_src;
+                VmProgram loaded = myv_read(path, img_src);
+            } catch (Exception &e) {
+                if (e.msg && strstr(e.msg, "closure instance captures"))
+                    return true;
+                fprintf(stderr, "myv_instance_select_checked [%s]: threw "
+                                "%s: %s\n", what, e.name,
+                        e.msg ? e.msg : "");
+                return false;
+            }
+            fprintf(stderr, "myv_instance_select_checked [%s]: ACCEPTED\n",
+                    what);
+            return false;
+        };
+        const FuncDescriptor::CaptureDesc keep = inst->captures.back();
+        inst->captures.pop_back();
+        ok = refused("an instance with fewer captures") && ok;
+        inst->captures.push_back(keep);
+        inst->captures.push_back(keep);
+        ok = refused("an instance with more captures") && ok;
+        inst->captures.pop_back();
+        myv_write(prog, path, MyvSourceRef());   /* intact: loads + runs */
+        MyvSource img_src;
+        VmProgram loaded = myv_read(path, img_src);
+        std::ostringstream cap;
+        std::streambuf *old_buf = std::cout.rdbuf(cap.rdbuf());
+        try {
+            vm_run(loaded);
+        } catch (Exception &) {
+        }
+        std::cout.rdbuf(old_buf);
+        if (cap.str().find("int1str2") == std::string::npos) {
+            fprintf(stderr, "myv_instance_select_checked: ran to \"%s\"\n",
+                    cap.str().c_str());
+            ok = false;
+        }
+        std::remove(path.c_str());
+    } catch (Exception &e) {
+        fprintf(stderr, "myv_instance_select_checked: %s: %s\n", e.name,
+                e.msg ? e.msg : "");
+        ok = false;
+    }
+    g_exec_engine = saved;
+    return ok;
+}
+
 static bool myv_field_annot_checked()
 {
     const char *src =
@@ -44228,6 +44507,10 @@ static bool opcode_table_census()
           "cast<T>(x): d1 - a refusal CONVEYS, stamped with the "
           "argument's caret; b0 - a body holding one is not pasted (its "
           "cast_types index names the callee's pool)" },
+        { OpCode::InstanceSelectV,       1,1,1,0,0,0,
+          "rule 8.2: d1 - only an allocation fails, which CONVEYS, "
+          "stamped with the call's caret; b0 - a body holding one is not "
+          "pasted (its closure_defs indices name the callee's pool)" },
     };
     const size_t nrows = sizeof(rows) / sizeof(rows[0]);
     const Chunk ck;      /* empty - census_instr never makes a shape
@@ -62472,6 +62755,13 @@ static const std::vector<extra_check> extra_checks =
       myv_root_slot_count_checked },
     { "myv: v46 - a container field with no type, or a scalar field "
       "with one, is a corrupt image", myv_field_annot_checked },
+    { "myv: v47 - an InstanceSelectV whose two descriptors expect "
+      "different captures is a corrupt image", myv_instance_select_checked },
+    { "closure: an instance view is made only of the stamped base's object "
+      "(rule 8.2)", closure_instance_value_cases },
+    { "closure: past --max-instances a site runs the untyped body; the "
+      "template trace names each instance (rule 8.2)",
+      closure_instance_cap },
     { "fit: the zero value of a bare container annotation is an empty, "
       "untyped container", zero_value_bare_annot },
     { "Q2: a restamped copy shares only its read-only containers, which "

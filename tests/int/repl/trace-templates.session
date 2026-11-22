@@ -3,7 +3,8 @@
 # list), a template that is a variable-bound LAMBDA (it has no name, so the
 # trace says `<lambda>`), and two templates of two parameters instantiated
 # because a call THROUGH A VALUE reaches them (value-instantiate). And the
-# final `infer` trace of a `const` container (a const scalar has no symbol).
+# final `infer` trace of a `const` container (a const scalar has no symbol),
+# and a closure's instance for a call of two arguments (rule 8.2).
 :trace template infer on
 func pair(a, b) { var t = a; return t + b; }
 pair(1, 2.5)
@@ -11,4 +12,6 @@ var idl = func(x) => x * 3
 idl(4)
 const CA = [1, 2]
 func w1(a, b) => a + b; func w2(a, b) => a - b; var wo = [w1, w2]; wo[runtime(0)](5, 3)
+var kc = 1
+var cl2 = func [kc] (a, b) { return a; }; cl2(1, "s")
 :trace all off

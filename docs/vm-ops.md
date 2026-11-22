@@ -1864,6 +1864,38 @@ Bounded by `verify_chunk` (`target2 < cast_types.size()`); myv **v45**
 (APPENDED; the pool is section 9.11c), and `-vd` prints `cast dst = src
 ; cast<T>`.
 
+**`InstanceSelectV dst = src` — a closure instance's call (rule 8.2,
+plans/strict-container-types.md section 10, 2026-11-22).** Emitted by
+`emit_instance_select` right after a value call's callee (CallValueV and
+CallValueGenericV alike), at a site the inferencer stamped
+`CallExpr::inst_desc` / `inst_base`: the callee-set analysis says only one
+closure template reaches it, and the template has an instance for the
+site's argument types. `a` is the callee's slot, `target2` the BASE's
+descriptor in `closure_defs`, the literal `b` the INSTANCE's. The handler
+and `jit_instance_select` call `closure_instance_value` (types/func.cpp.h,
+the tree-walker's answer too): a FuncObject whose descriptor is the base
+becomes an INSTANCE VIEW - a FuncObject with the instance's descriptor,
+the base object's own capture slots (`CaptureSlots::Borrow`) and a
+reference holding the base alive (`inst_base`); any other value is copied
+as it is (a loaded image's analysis may be wrong). The call then calls
+`dst`, so every call tier is unchanged - the view is an ordinary closure
+to them, `callee_desc` names the instance, and a write to a capture lands
+in the one closure object every instance shares. A view is made per call
+and lives in a temp. Only the allocation can fail (OutOfMemoryEx, the
+call's caret). Use/def: reads `a`, defines `target` (a reference). Fully
+native (`jit_instance_select`, conveys, exc-stamped); not bytecode-inlined
+(its indices name the callee's pool). Bounded by `verify_chunk`, which
+also refuses two descriptors with capture lists of different lengths; myv
+**v47** (APPENDED), and `-vd` prints `inst.select dst = src ;
+closure_defs[base] -> closure_defs[instance]`.
+
+A closure template with ONE instance that serves every site that can reach
+it, and nothing else reaching it, needs no select: its MakeClosureV is
+made with the instance's descriptor (`FuncDeclStmt::closure_use`), and the
+base gets no chunk. An instance's own FuncDeclStmt sits at the root and
+compiles to a chunk but emits nothing where it stands
+(`FuncDeclStmt::closure_instance_of`).
+
 **`Chunk::op_locs` — a COMPOUND store's OPERATION caret (RULE 2,
 2026-09-25).** `lv OP= rhs` (and `lv++`) fails in two places, and the
 tree-walker carets them differently: REACHING the element (an OOB index, a

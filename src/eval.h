@@ -1268,7 +1268,20 @@ public:
     CaptureSlots(CaptureSlots &&rhs) = delete;
     CaptureSlots &operator=(CaptureSlots &&rhs) = delete;
 
+    /*
+     * Rule 8.2: a VIEW of another closure object's capture slots - the
+     * same slots, read and written in place (an instance view's,
+     * FuncObject::InstanceView). It owns nothing: `cap` 0 with slots is
+     * what says so (an owning vector has cap >= n), and the owner is kept
+     * alive by the view's FuncObject.
+     */
+    struct Borrow { };
+    CaptureSlots(Borrow, CaptureSlots &src) : ptr(src.ptr), n(src.n), cap(0)
+    { }
+
     ~CaptureSlots() {
+        if (cap == 0)
+            return;             /* empty, or a Borrow view */
         for (uint32_t i = n; i > 0; i--)
             ptr[i - 1].~LValue();
         if (cap > inline_cap)
@@ -1414,6 +1427,8 @@ public:
      */
     EvalContext *const_scope = nullptr;
     std::shared_ptr<bool> const_scope_alive;
+    /* an instance view's base object (rule 8.2), null otherwise */
+    intrusive_ptr<FuncObject> inst_base;
 
     FuncObject(const FuncDescriptor *func, EvalContext *ctx);
     /*
@@ -1435,6 +1450,16 @@ public:
     FuncObject(const FuncDescriptor *func, EvalContext *root,
                const LValue &src, OneLocal);
     FuncObject(const FuncObject &rhs);
+    /*
+     * Rule 8.2: an INSTANCE VIEW of closure object `base` - its capture
+     * slots, called with closure template instance `inst`'s body (a call
+     * site the instance serves: InstanceSelectV, closure_instance_value).
+     * One closure object, one capture vector: the view borrows the base's
+     * slots and holds the base alive (`inst_base`). Made per call and
+     * never stored where the program can see it.
+     */
+    struct InstanceView { };
+    FuncObject(const FuncDescriptor *inst, FuncObject &base, InstanceView);
 #ifdef TESTS
     /*
      * ⛔ POOLING BLUNTS LeakSanitizer, which is why this exists (#97
@@ -1458,6 +1483,11 @@ public:
 #ifdef TESTS
 extern "C" unsigned long g_live_funcobjs;
 #endif
+/* rule 8.2 (types/func.cpp.h) */
+EvalValue closure_instance_value(const EvalValue &callee,
+                                 const FuncDescriptor *base,
+                                 uint64_t base_serial,
+                                 const FuncDescriptor *inst);
 
 /*
  * Deep, read-only copy of a const-evaluated array/dict value (see eval.cpp).

@@ -1523,6 +1523,10 @@ public:
          * capture list: the in-walk snapshot above ran before this stamp. */
         for (FuncDeclStmt *fd : capture_funcs)
             sync_capture_desc(fd);
+        /* rule 8.2: an instance's captures are its base's - one closure
+         * object, one capture vector (FuncDeclStmt::closure_instance_of) */
+        for (FuncDeclStmt *fd : closure_instances)
+            fd->desc->captures = fd->closure_instance_of->desc->captures;
 
         /* Publish the global table's slot->name list to the root block, which
          * sizes the runtime GlobalFuncTable and lets globals() enumerate it;
@@ -2450,6 +2454,7 @@ private:
     /* Every capturing FuncDeclStmt, so its descriptor's capture snapshot can
      * be re-taken after pass 2 has stamped the escaped globals. */
     std::vector<FuncDeclStmt *> capture_funcs;
+    std::vector<FuncDeclStmt *> closure_instances;      /* rule 8.2 */
 
     /* Copy the RESOLVED capture sources into the descriptor (kind/slot), so
      * the FuncObject ctor never reads a capture Identifier. */
@@ -4444,7 +4449,14 @@ Resolver::walk(Construct *c, FuncState *cur)
     if (ctag(c) == ConstructType::func_decl) {
         auto *fd = static_cast<FuncDeclStmt *>(c);
 
-        if (fd->captures) {
+        if (fd->closure_instance_of) {
+            /* rule 8.2: an instance sits at the root, and nothing makes a
+             * closure of it - its capture LIST names its base's
+             * variables, resolved where the base is; its body still
+             * reads them through the capture scope process_function
+             * builds from the names */
+            closure_instances.push_back(fd);
+        } else if (fd->captures) {
             for (auto &cap : fd->captures->elems) {
                 resolve_ref(cur, cap.get());
             }
@@ -6702,7 +6714,12 @@ private:
                 asn->end = arg->end;
                 asn->inline_ctx = ce->inline_ctx;
                 asn->lvalue = std::move(lv);
-                asn->rvalue = arg->clone();
+                /* MOVED, not cloned - the call is replaced by the splice
+                 * below, and a copy of a lambda would be another function:
+                 * a fresh descriptor, which the instance stamps of the
+                 * sites it reaches (rule 8.2) do not name, so -ni and the
+                 * inlined run would call different bodies (RULE 2) */
+                asn->rvalue = std::move(ce->args->elems[pi]);
                 blk->elems.insert(blk->elems.begin(), std::move(asn));
             }
 
@@ -7752,7 +7769,10 @@ devirtualize_calls(unique_ptr<Construct> &slot,
                 d->args = std::move(call->args);
                 d->builtin = builtin_slot(id->sym.slot).getval<Builtin>();
                 slot = std::move(d);
-            } else if (call->direct_func_slot >= 0) {
+            } else if (call->direct_func_slot >= 0 && !call->inst_desc) {
+                /* (rule 8.2: a site a closure instance serves stays a value
+                 * call - a DirectCallExpr calls the slot's object as it is,
+                 * where the site must call it with the instance's body) */
                 /* Global-slot callee (function / struct / escaped global). A
                  * cacheable pure-recursive callee becomes a CachedCallExpr so
                  * its recursion's duplicate self-calls dedup in the per-frame

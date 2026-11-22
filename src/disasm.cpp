@@ -2295,6 +2295,12 @@ std::string disassemble(const Chunk &chunk, const std::string &title,
                 << annot_text(chunk.ctype_ref(
                        static_cast<unsigned>(in.target2)));
             break;
+        case OpCode::InstanceSelectV:
+            /* rule 8.2: the callee, viewed with a closure instance */
+            row << "inst.select  " << D(in.target) << " = "
+                << RI(in.a(), false) << "  ; closure_defs["
+                << in.target2 << "] -> closure_defs[" << in.b_lit() << "]";
+            break;
         case OpCode::CastV:
             row << "cast         " << D(in.target) << " = "
                 << RI(in.a(), false) << "  ; cast<"

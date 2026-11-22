@@ -1346,6 +1346,22 @@ enum class OpCode : unsigned char {
     CastV,
 
     /*
+     * Rule 8.2: InstanceSelectV - slot[target] = the callee value in
+     * slot[a], viewed with a closure template instance's body when it is
+     * that template's closure object: Chunk::closure_defs[target2] is the
+     * BASE's descriptor, closure_defs[b] (a literal index) the instance's.
+     * A FuncObject whose descriptor is the base becomes an instance view
+     * (FuncObject::InstanceView: the instance's body, the object's own
+     * capture slots); any other value is copied as it is. Emitted right
+     * after a value call's callee, at a site an instance serves
+     * (CallExpr::inst_desc); the call then calls slot[target]. Raises
+     * only OutOfMemoryEx (caret: the call, from the loc side table). The
+     * dst holds a reference. The bytecode inliner pastes no body that
+     * holds one (its indices name the callee's pool).
+     */
+    InstanceSelectV,
+
+    /*
      * SENTINEL - the opcode count, never emitted or executed. Backs the
      * computed-goto dispatch table's size/order static checks (see
      * ML_FOR_EACH_OPCODE below and vm.cpp's vm_optbl); disasm handles it
@@ -1398,7 +1414,7 @@ enum class OpCode : unsigned char {
     X(ExitBlock) X(LoadElem2Int) X(LoadElem2Float) X(ArrEpochMark) \
     X(ArrEpochCheck) X(GuardCalleeV) X(LoadCaptureOfV) X(StoreCaptureOfV) \
     X(UnpackLenCheck) X(CheckNoneArgsV) X(LoadBoxV) X(StoreBoxV) \
-    X(CheckFitV) X(StampTypeV) X(CastV)
+    X(CheckFitV) X(StampTypeV) X(CastV) X(InstanceSelectV)
 
 /*
  * MathFnV's function selector (Instr::target2). The names match the builtin

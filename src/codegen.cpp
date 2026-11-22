@@ -1178,6 +1178,12 @@ struct Codegen {
 
     void gen_stmt(const Construct *s)
     {
+        /* rule 8.2: a closure instance is a body, not a value - its chunk
+         * is compiled like any function's, and nothing makes a closure of
+         * it (FuncDeclStmt::closure_instance_of) */
+        if (ctag(s) == ConstructType::func_decl
+                && static_cast<const FuncDeclStmt *>(s)->closure_instance_of)
+            return;
         const size_t mark = code.size();
         gen_stmt_impl(s);
         inherit_inline(s, code, mark);
@@ -1918,7 +1924,10 @@ struct Codegen {
             in.op = OpCode::MakeClosureV;
             in.target = t;
             in.target2 = static_cast<int>(chunk.closure_defs.size());
-            chunk.closure_defs.push_back(fd->desc);
+            /* (rule 8.2: a collapsed closure template is made with its one
+             * instance's descriptor - FuncDeclStmt::closure_use) */
+            chunk.closure_defs.push_back(fd->closure_use
+                                         ? fd->closure_use->desc : fd->desc);
             ops.push_back(in);
             out_slot = t;
             return true;
@@ -4164,6 +4173,36 @@ struct Codegen {
         return compile_to_run_slot(e, dst, ops);
     }
 
+    /*
+     * Rule 8.2: at a site a closure template instance serves
+     * (CallExpr::inst_desc), the call calls the callee value viewed with
+     * the instance's body - InstanceSelectV into a fresh temp, which
+     * becomes the callee. Both descriptors join closure_defs (the
+     * per-chunk, serializable descriptor pool); a stamp that dangles
+     * emits nothing, and the call calls the value as it is.
+     */
+    void emit_instance_select(const CallExpr *call, int &callee_slot,
+                              std::vector<CgInstr> &ops)
+    {
+        if (!codegen_desc_stamp_live(call->inst_desc, g_live_descs))
+            return;
+        /* (the base and its instance are one lambda's: they live and die
+         * together) */
+        ML_CHECK(codegen_desc_stamp_live(call->inst_base, g_live_descs));
+        const int base = add_value_callee(call->inst_base);
+        const int inst = add_value_callee(call->inst_desc);
+        const int t = alloc_temp();
+        CgInstr in;
+        in.op = OpCode::InstanceSelectV;
+        in.node_idx = add_ast_node(call);
+        in.target = t;
+        in.target2 = base;
+        in.set_a(slot_op(callee_slot));
+        in.set_b(int_lit(inst));
+        ops.push_back(in);
+        callee_slot = t;
+    }
+
     bool try_native_value_call(const CallExpr *call, int &out_slot,
                                std::vector<CgInstr> &ops)
     {
@@ -4190,6 +4229,7 @@ struct Codegen {
             next_temp = save_top;
             return false;
         }
+        emit_instance_select(call, callee_slot, ops);       /* rule 8.2 */
 
         /* A DYN callee - AST-FREE (F1 step 2): CheckCallableV (a non-callable
          * throws BEFORE the args evaluate, the tree-walker's order), then the
@@ -9673,6 +9713,7 @@ static void extract_locs(std::vector<CgInstr> &code, Chunk &chunk,
         case OpCode::StoreBoxV:      /* node = the `*b` (a misfit, const) */
         case OpCode::CheckFitV:      /* node = the stored value (#49) */
         case OpCode::CastV:          /* node = the cast; loc = its argument */
+        case OpCode::InstanceSelectV: /* node = the call (rule 8.2) */
         case OpCode::CallValueGenericV: /* node = the CallExpr: the CALL-SITE
                                      * loc (a FuncObject callee's backtrace via
                                      * do_func_call's loc_at); the op is now
@@ -10205,6 +10246,8 @@ static bool visit_use_def(const Instr &in, U u, D d)
                                     * does (Q2) */
         u(in.a_slot()); return true;
     case OpCode::CastV:            /* dst = cast<T>(src) */
+        u(in.a_slot()); d(in.target); return true;
+    case OpCode::InstanceSelectV:  /* dst = the callee, viewed (rule 8.2) */
         u(in.a_slot()); d(in.target); return true;
     case OpCode::MakeArrayV:
         run(static_cast<int>(in.a_lit()), static_cast<int>(in.b_lit()));
@@ -13100,6 +13143,25 @@ void ChunkVerifier::verify_one(const Instr &in)
         reg(in.target);
         pool(in.target2, ck.cast_types.size(), "cast type");
         break;
+    case OpCode::InstanceSelectV: {
+        /* rule 8.2: `a` the callee's slot, `target2` the base's
+         * closure_defs entry, `b` (a literal) the instance's - whose body
+         * runs with the base object's capture slots, so it must expect
+         * exactly as many */
+        a_slot_only(in);
+        reg(in.target);
+        pool(in.target2, ck.closure_defs.size(), "closure base");
+        pool(in.b_lit(), ck.closure_defs.size(), "closure instance");
+        const FuncDescriptor *b =
+            ck.closure_defs[static_cast<size_t>(in.target2)];
+        const FuncDescriptor *i =
+            ck.closure_defs[static_cast<size_t>(in.b_lit())];
+        defined_ptr(b, "closure base");
+        defined_ptr(i, "closure instance");
+        if (b->captures.size() != i->captures.size())
+            reject("closure instance captures");
+        break;
+    }
     case OpCode::CheckFitV:
         /* #49: `a` the value's slot, `target2` its fit_specs entry */
         a_slot_only(in);

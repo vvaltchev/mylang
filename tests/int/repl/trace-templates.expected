@@ -1,5 +1,5 @@
 MyLang REPL. :quit (or Ctrl-D) to exit, :help for help.
->> >> >> >> >> >> >> tracing: infer template
+>> >> >> >> >> >> >> >> tracing: infer template
 >> infer      func pair(a, b)  template (instantiated per call)
 >> template   pair(int, float) -> pair$0  (instance 1)
   infer      a  ? -> int
@@ -43,5 +43,14 @@ infer      func w2(a, b)  template (instantiated per call)
 infer      func w1$0(a: int, b: int) -> int  (final)
 infer      func w2$0(a: int, b: int) -> int  (final)
 => 8
+>>   infer      kc  ? -> int
+infer      var kc : int  (final)
+=> 1
+>> template   <lambda>(int, str) -> instance 1
+  infer      a  ? -> int
+  infer      b  ? -> str
+infer      param a : int  (final)
+infer      param b : str  (final)
+=> 1
 >> tracing: off
 >> 

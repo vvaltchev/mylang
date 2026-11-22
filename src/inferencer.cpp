@@ -177,6 +177,16 @@ struct TypeSym {
      * not real inference, so `:trace infer` reports the template as a whole
      * rather than these. Set during the structural pass. */
     bool in_template = false;
+    /* The function whose body (or parameter list) declares it - null for
+     * a global; and whether that function is, or is nested in, a closure
+     * template's BASE (rule 8.2, mark_closure_templates). */
+    FuncInfo *owner = nullptr;
+    bool in_base = false;
+    /* A closure BASE stored a `dyn` into this variable, which it does
+     * not own - not a contribution (base_shared_dyn): a numeric one
+     * converts at the store (coerces_dyn), any other is checked there
+     * (rv_fit). */
+    bool base_dyn_store = false;
     Loc decl_loc;
     Loc decl_end;              /* its name's end (an error's caret span) */
     FuncInfo *func = nullptr;  /* non-null when this name is a function */
@@ -237,7 +247,23 @@ struct FuncInfo {
      * a template parameter - it is the explicit "one instantiation, any type".
      */
     bool is_template = false;
-
+    /*
+     * Rule 8.2 (plans/strict-container-types.md section 10): a CLOSURE
+     * TEMPLATE - a lambda with a template parameter that is not a
+     * write-once, calls-only template (mark_lambda_templates) and that no
+     * higher-order builtin is handed (those keep joining - see
+     * mark_closure_templates). Its body is the BASE: checked with every
+     * template parameter `dyn`, and run where a call site cannot name it
+     * alone. A site the callee-set analysis says reaches it alone gets an
+     * INSTANCE for its argument types (closure_insts, keyed by
+     * template_sig_key): a typed copy of the same lambda, called with the
+     * closure object's own captures (one object, one capture vector).
+     */
+    bool closure_tmpl = false;
+    FuncInfo *closure_base = nullptr;    /* an instance: its base */
+    std::map<std::string, FuncInfo *> closure_insts;
+    /* the function whose body declares this one (null at the top level) */
+    FuncInfo *lex_parent = nullptr;
 };
 
 /*
@@ -341,6 +367,12 @@ public:
     bool instance_has_consumer(const FuncDeclStmt *fn);
 
     bool strict_dyn = false;   /* enforce the mandatory-`dyn` rule */
+
+    /* ReplInfer's (rule 8.2: no closure collapses there - a later
+
+     * input may call a closure with anything) */
+
+    bool repl = false;
     bool strict_deep = false;  /* Phase B: dyn anywhere (incl. array<dyn>) */
     /* When false (the CLI's -nti), run() still does the structural pass and the
      * named-argument lowering (both required for correctness), but skips the
@@ -402,6 +434,39 @@ private:
      * template momentarily (cleared right after) - but the clone's syms ARE the
      * concrete instance, so they must NOT be tagged in_template. */
     bool struct_in_clone = false;
+    /* The function the structural pass is inside (TypeSym::owner,
+     * FuncInfo::lex_parent); and, while walking a closure INSTANCE (rule
+     * 8.2), its base, whose capture symbols the instance's capture list
+     * binds to - the instance sits at the root, where a lookup of its
+     * capture names would find nothing or the wrong variable. */
+    FuncInfo *struct_func = nullptr;
+    const FuncDeclStmt *struct_capture_src = nullptr;
+    /*
+     * Rule 8.2: each call site the callee-set analysis says reaches ONE
+     * closure template, mapped to that template's instance for the
+     * site's argument types (closure_instantiate_round). A mapping
+     * whose site later reaches another function too (its callee set
+     * grew - a template clone made after it) is WITHDRAWN, and the site
+     * barred for good (closure_site_barred): it calls the base, and the
+     * fixpoint recomputes what its instance's return type had given.
+     * Cleared per input (infer_one): a site is a node of the input
+     * being inferred, and a node pointer outlives its node.
+     */
+    std::map<CallExpr *, FuncInfo *> closure_site_inst;
+    std::set<CallExpr *> closure_site_barred;
+    /* >0 while the fixpoint accumulates a closure BASE's body (or a
+     * function nested in one) - see base_shared_dyn */
+    int accum_base_depth = 0;
+    /* the variable stores base_shared_dyn kept out of the fixpoint: each
+     * is checked at run time instead (stamp_closure_templates) */
+    std::set<Identifier *> base_dyn_lvals;
+    /* Set once the instantiation loops are done: until then a closure
+     * template's return type is withheld (bottom), so a call site whose
+     * instance does not exist yet DEFERS instead of taking the base's
+     * return type - which would then key the instances of the calls
+     * that use its result (func_static_type). */
+    bool closure_loop_done = false;
+    bool has_closure_tmpls = false;     /* any, a REPL input's earlier too */
 
     /* Monomorphization: instantiations cached by (template, signature) so the
      * same call signature shares ONE clone; a monotonic counter names them.
@@ -596,6 +661,20 @@ private:
 
     /* monomorphization (templates - see plans/archived/function-templates.md) */
     void mark_lambda_templates();   /* safe var-bound lambdas -> templates */
+    bool mark_closure_templates(Block *root);       /* rule 8.2 */
+    bool closure_instantiate_round(Block *root);    /* rule 8.2 */
+    FuncInfo *make_closure_instance(FuncInfo *base, const std::string &key,
+                                    Block *root);
+    bool base_shared_dyn(TypeSym *s, StaticTypeRef ct);
+    void stamp_closure_templates(Block *root);
+    FuncInfo *closure_site(const CallExpr *call) const;
+    bool runs_unsettled_base(const CallExpr *call);     /* rule 8.2 */
+    bool closure_site_current(const CallExpr *call, const FuncInfo *base);
+    void value_funcs(const EvalValue &v, CycStack &path,
+                     const std::function<void(const FuncDescriptor *)> &fn);
+    void tree_baked_funcs(Construct *n, CycStack &path,
+                          const std::function<void(const FuncDescriptor *)>
+                              &fn);
     void run_fixpoint(Block *root);             /* the Jacobi loop, extracted */
     bool instantiate_round(Block *root);     /* clone + redirect; progress? */
     StaticTypeRef template_arg_key(CallExpr *call, const TypeSym *p,
@@ -865,6 +944,7 @@ TypeSym *Inferencer::new_sym(const UniqueId *name, Scope *s, Loc loc,
     sym->decl_loc = loc;
     sym->decl_end = end ? end : loc;
     sym->in_template = struct_tmpl_depth > 0;
+    sym->owner = struct_func;
     s->syms[name] = sym;
     return sym;
 }
@@ -1215,6 +1295,188 @@ void Inferencer::mark_lambda_templates()
     }
 }
 
+/*
+ * Rule 8.2 (plans/strict-container-types.md section 10): which lambdas
+ * are CLOSURE TEMPLATES. Run after mark_lambda_templates, which has
+ * taken the write-once, calls-only ones (a call to those is redirected
+ * to a named clone). Every other lambda with a template parameter gets
+ * typed instances per call site instead (closure_instantiate_round) -
+ * except one a higher-order builtin is handed (`map(f, a)`, a callback
+ * argument callee_funcinfo names): the builtin calls the closure
+ * object, whose body is the base, and types its parameters from the
+ * container (accumulate_call), so such a lambda keeps joining its call
+ * sites, as before (a provisional choice, plan section 8).
+ *
+ * The base is an ordinary checked function no call site contributes
+ * to, so its template parameters are unconstrained - Unknown in the
+ * fixpoint, `dyn` once finalized - exactly as a lambda no site could
+ * name always was: what its locals receive from them is untyped
+ * (untyped_dyn, exempt from the mandatory-dyn rule), and a call that
+ * runs it returns an untyped value.
+ */
+/* where a higher-order builtin takes its callback (accumulate_call's
+ * feeding), or -1 */
+static int closure_fed_pos(std::string_view nm)
+{
+    static constexpr std::pair<std::string_view, int> pos[] = {
+        { "map", 0 }, { "filter", 0 }, { "sort", 1 }, { "rev_sort", 1 },
+        { "sum", 1 }, { "make_array", 1 }, { "make_dict", 1 },
+        { "find", 2 } };
+    for (const auto &e : pos)
+        if (e.first == nm)
+            return e.second;
+    return -1;
+}
+
+bool Inferencer::mark_closure_templates(Block *rootBlock)
+{
+    bool marked = false;
+    /* the lambdas a higher-order builtin is handed (accumulate_call's
+     * feeding, the same positions) */
+    std::set<FuncInfo *> fed;
+    std::vector<std::pair<CallExpr *, bool>> calls;
+    for (auto &e : rootBlock->elems)
+        collect_calls(e.get(), calls);
+    for (auto &cp : calls) {
+        CallExpr *call = cp.first;
+        auto *cid = node_cast<Identifier>(call->what.get());
+        if (!cid || user_sym(cid))
+            continue;                   /* (the program's own name) */
+        ML_CHECK(call->args);
+        const int fi_pos = closure_fed_pos(cid->uid->val);
+        if (fi_pos < 0
+                || static_cast<size_t>(fi_pos) >= call->args->elems.size())
+            continue;
+        if (FuncInfo *cb = callee_funcinfo(call->args->elems[fi_pos].get()))
+            fed.insert(cb);
+    }
+
+    for (auto &up : all_funcs) {
+        FuncInfo *fi = up.get();
+        FuncDeclStmt *fd = fi->decl;
+        ML_CHECK(fd);       /* (declare_funcdecl is the one creator) */
+        if (fd->id || fi->is_template || fi->pinned || fi->closure_base
+                || fi->closure_tmpl || !fd->params || fed.count(fi))
+            continue;
+        bool has_tparam = false;
+        for (auto &p : fd->params->elems)
+            if (template_param(p.get()))
+                has_tparam = true;
+        if (!has_tparam)
+            continue;
+        fi->closure_tmpl = true;
+        marked = true;
+    }
+
+    has_closure_tmpls = false;
+    for (auto &up : all_funcs)
+        if (up->closure_tmpl)
+            has_closure_tmpls = true;
+
+    if (!marked)
+        return false;
+    for (auto &up : all_syms) {
+        TypeSym *ts = up.get();
+        for (FuncInfo *f = ts->owner; f; f = f->lex_parent)
+            if (f->closure_tmpl) {
+                ts->in_base = true;
+                ts->in_template = true;
+                break;
+            }
+    }
+    return true;
+}
+
+/* Rule 8.2: the instance a call site reaches, or null. */
+FuncInfo *Inferencer::closure_site(const CallExpr *call) const
+{
+    auto it = closure_site_inst.find(const_cast<CallExpr *>(call));
+    return it != closure_site_inst.end() ? it->second : nullptr;
+}
+
+/* Rule 8.2: does the site still reach closure template `base` alone?
+ * (the callee sets only grow - see closure_site_barred) */
+bool Inferencer::closure_site_current(const CallExpr *call,
+                                      const FuncInfo *base)
+{
+    const CsSet cs = callee_set(call->what.get());
+    /* (set_top empties the set; and a site mapped to `base` named it
+     * alone, so a set of one still names it) */
+    ML_CHECK(!cs.top || cs.funcs.empty());
+    ML_CHECK(cs.funcs.size() != 1 || cs.funcs[0] == base);
+    return cs.funcs.size() == 1;
+}
+
+/*
+ * Rule 8.2: may this call run a closure template's BASE whose return
+ * type is not settled? A base's template parameters are never
+ * constrained, so a return computed from them stays unknown for good -
+ * and the function-type join under the callee's static type takes the
+ * OTHER candidate's return for an unknown one: a site that may call
+ * `func [b] (x) { return typestr(x); }` or `func [b] (x) { return x +
+ * 1; }` was typed `str` and read the int 2 as a string (a wild read in
+ * the VM). Such a call has no type of its own - as a call to the base
+ * alone has none - which its consumers defer on, and a local it
+ * initializes is untyped (TypeSym::got_unknown). A site the analysis
+ * cannot follow (top) may reach every closure template whose value
+ * left our view (callee_escaped).
+ */
+bool Inferencer::runs_unsettled_base(const CallExpr *call)
+{
+    if (!has_closure_tmpls || !cs_ran)
+        return false;
+    const auto unsettled = [&](FuncInfo *f) -> bool {
+        /* (a callee set holds no null: every add_func caller checks) */
+        return f->closure_tmpl && !f->pinned
+               && (!closure_loop_done || has_unknown(f->ret));
+    };
+    const CsSet cs = callee_set(call->what.get());
+    if (cs.top) {
+        for (FuncInfo *f : cs_escaped)
+            if (unsettled(f))
+                return true;
+        return false;
+    }
+    for (FuncInfo *f : cs.funcs)
+        if (unsettled(f))
+            return true;
+    return false;
+}
+
+/*
+ * Rule 8.2: a value with a `dyn` in it that a closure BASE stores into a
+ * variable it does not own (a capture, a global). The base runs where a
+ * site cannot name the closure alone, with `dyn` parameters, so such a
+ * value is not a contribution: it would widen the variable for every
+ * instance, and for the code outside (a `str` variable would become a
+ * `dyn` one and refuse its own declaration). The store is checked at run
+ * time instead, against the type the rest of the program gives the
+ * variable (stamp_closure_templates) - the base may not put anything
+ * else there.
+ */
+bool Inferencer::base_shared_dyn(TypeSym *ts, StaticTypeRef ct)
+{
+    if (accum_base_depth == 0 || !ts || ts->in_base)
+        return false;
+    ML_CHECK(ct);                       /* (type_of's answer: bottom) */
+    /* `dyn` anywhere in it, or not settled at all (what the base's own
+     * parameters give: they are unconstrained) */
+    const std::function<bool(StaticTypeRef)> open =
+        [&](StaticTypeRef t) -> bool {
+            t = static_type_resolve(t);
+            if (is_unknown(t) || t->kind == StaticTypeKind::Dyn)
+                return true;
+            /* (a box's element is a settled scalar or struct - box() of
+             * anything else is not a box type) */
+            if (t->kind == StaticTypeKind::Array)
+                return open(t->elem);
+            if (t->kind == StaticTypeKind::Dict)
+                return open(t->key) || open(t->val);
+            return false;
+        };
+    return open(ct);
+}
+
 /* The Jacobi fixpoint, extracted so the instantiation loop can re-run it. */
 void Inferencer::run_fixpoint(Block *rootBlock)
 {
@@ -1375,6 +1637,184 @@ FuncDeclStmt *Inferencer::make_template_clone(FuncInfo *tmpl,
 }
 
 /*
+ * Rule 8.2: build the instance of closure template `base` for signature
+ * `key` - a copy of the same lambda, typed by the sites it serves. It
+ * sits at the root's front as a lambda nothing evaluates
+ * (FuncDeclStmt::closure_instance_of: neither engine makes a closure of
+ * it), so every pass that compiles a body compiles it; its captures are
+ * the base's (struct_capture_src), and at run time it is called with the
+ * closure object's capture vector.
+ */
+FuncInfo *Inferencer::make_closure_instance(FuncInfo *base,
+                                            const std::string &key,
+                                            Block *rootBlock)
+{
+    FuncDeclStmt *bd = base->decl;
+    unique_ptr<Construct> cl = bd->clone();
+    auto *fc = static_cast<FuncDeclStmt *>(cl.get());
+    fc->closure_instance_of = bd;
+    ML_CHECK(fc->node_id != bd->node_id);
+    {
+        /* a fresh node may reuse a freed one's address (make_template_
+         * clone says why) */
+        std::function<void(Construct *)> clr = [&](Construct *n) {
+            if (!n) return;
+            id_sym.erase(n);
+            if (ctag(n) == ConstructType::func_decl) {
+                auto *fd2 = static_cast<FuncDeclStmt *>(n);
+                func_of_decl.erase(fd2);
+                clr(fd2->captures.get());
+                clr(fd2->params.get());
+                clr(fd2->body.get());
+                return;
+            }
+            for_each_child(n, clr);
+        };
+        clr(fc);
+    }
+    FuncInfo *prev_sf = struct_func;
+    struct_func = nullptr;              /* it sits at the root */
+    struct_in_clone = true;
+    struct_capture_src = bd;
+    walk_struct(fc, global);
+    struct_capture_src = nullptr;
+    struct_in_clone = false;
+    struct_func = prev_sf;
+    ML_CHECK(func_of_decl.count(fc));      /* walk_struct built it */
+    FuncInfo *cfi = func_of_decl[fc];
+    ML_CHECK(cfi && cfi != base);
+    cfi->closure_base = base;
+    rootBlock->elems.insert(rootBlock->elems.begin(), std::move(cl));
+    base->closure_insts[key] = cfi;
+    return cfi;
+}
+
+/*
+ * Rule 8.2: map every call site the callee-set analysis says reaches ONE
+ * closure template to that template's instance for the site's argument
+ * types (made on first use). A site keeps its instance while it names
+ * that closure alone - its arguments are settled by then (the readiness
+ * test instantiate_round uses), and a closure template's return type is
+ * withheld until the loop is done, so no argument was typed from a base
+ * it later stops calling; a site whose callee set GROWS (a template clone
+ * made after the mapping) loses it, and the fixpoint retypes what it had
+ * given. A site of a REPL input's earlier closure, one whose arguments
+ * never settle, one past the instance cap, and every site that may reach
+ * another function too, calls the base.
+ */
+bool Inferencer::closure_instantiate_round(Block *rootBlock)
+{
+    /* a template instance made this round holds copies of its lambdas,
+     * which no earlier marking saw */
+    const bool marked = mark_closure_templates(rootBlock);
+    if (!has_closure_tmpls)
+        return marked;
+    bool progress = marked;
+    /* a mapped site that now reaches another function too (a clone made
+     * after it was mapped - the sets only grow) calls the base from now
+     * on: withdrawn, and barred so it cannot flip back */
+    std::vector<CallExpr *> stale;
+    for (auto &kv : closure_site_inst)
+        if (!closure_site_current(kv.first, kv.second->closure_base))
+            stale.push_back(kv.first);
+    for (CallExpr *c : stale) {
+        closure_site_inst.erase(c);
+        closure_site_barred.insert(c);
+        progress = true;
+    }
+    std::vector<std::pair<CallExpr *, bool>> calls;
+    for (auto &e : rootBlock->elems)
+        collect_calls(e.get(), calls, false, true);
+    for (auto &cp : calls) {
+        CallExpr *call = cp.first;
+        if (closure_site_inst.count(call) || closure_site_barred.count(call))
+            continue;
+        ML_CHECK(call->args);
+        if (cs_struct_callee(call->what.get()))
+            continue;
+        const CsSet cs = callee_set(call->what.get());
+        if (cs.top || cs.funcs.size() != 1)
+            continue;
+        FuncInfo *base = cs.funcs[0];
+        if (!base->closure_tmpl || base->pinned)
+            continue;
+        /* (a closure template is a lambda with a template parameter) */
+        ML_CHECK(base->decl && base->decl->params);
+        const auto &dps = base->decl->params->elems;
+        const size_t nparams = base->params.size();
+        const size_t nargs = call->args->elems.size();
+        size_t min_args = 0;
+        for (size_t i = 0; i < nparams; i++)
+            if (!base->params[i]->opt_decl)
+                min_args = i + 1;
+        ML_CHECK(dps.size() == nparams);
+        if (nargs < min_args || nargs > nparams)
+            continue;           /* check_call reports the arity */
+
+        std::vector<StaticTypeRef> sig;
+        bool ready = true;
+        for (size_t i = 0; i < nparams && ready; i++) {
+            if (!template_param(dps[i].get()))
+                continue;
+            StaticTypeRef t = template_arg_key(call, base->params[i], i);
+            const std::function<bool(StaticTypeRef)> open_comp =
+                [&](StaticTypeRef c) -> bool {
+                    c = static_type_resolve(c);
+                    if (is_unknown(c))
+                        return true;
+                    if (c->kind == StaticTypeKind::Array)
+                        return open_comp(c->elem);
+                    if (c->kind == StaticTypeKind::Dict)
+                        return open_comp(c->key) || open_comp(c->val);
+                    return false;
+                };
+            if (open_comp(t))
+                ready = false;
+            else
+                sig.push_back(t);
+        }
+        if (!ready)
+            continue;
+
+        const std::string key = template_sig_key(base, sig);
+        FuncInfo *inst = nullptr;
+        auto it = base->closure_insts.find(key);
+        if (it != base->closure_insts.end()) {
+            inst = it->second;
+        } else {
+            if (tmpl_inst_count[base] >= g_tmpl_max_instances) {
+                if (tmpl_cap_warned.insert(base).second)
+                    fprintf(stderr,
+                            "warning: a function literal exceeded %d "
+                            "instantiations; further calls run its "
+                            "untyped body\n", g_tmpl_max_instances);
+                continue;
+            }
+            inst = make_closure_instance(base, key, rootBlock);
+            tmpl_inst_count[base]++;
+            if (trace_enabled(TraceCat::templ)) {
+                std::string ss;
+                for (size_t i = 0; i < sig.size(); i++) {
+                    if (i)
+                        ss += ", ";
+                    ss += static_type_to_string(sig[i]);
+                }
+                trace_emit(TraceCat::templ, 0,
+                           "<lambda>(" + ss + ") -> instance " +
+                           std::to_string(tmpl_inst_count[base]));
+            }
+        }
+        closure_site_inst[call] = inst;
+        progress = true;
+    }
+    /* ...and so does an instance made just now (a lambda in its body):
+     * marked before the fixpoint runs, or its sites would join */
+    if (progress && mark_closure_templates(rootBlock))
+        progress = true;
+    return progress;
+}
+
+/*
  * One instantiation round: for every call whose callee is a template and whose
  * argument types have settled, get-or-make the clone for that signature and
  * redirect the call to it. Returns whether any call was redirected (so the
@@ -1474,10 +1914,19 @@ bool Inferencer::instantiate_round(Block *rootBlock)
         TypeSym *clone_sym = nullptr;
         bool reused = false;
 
+        /* rule 8.2: a signature with anything unsettled in it - a
+         * closure template's return is withheld while the instances are
+         * made - does not say WHICH function it holds (two closures key
+         * alike), so a prior input's instance, typed by the closure ITS
+         * calls passed, is not reused for it: its committed body would
+         * read the other closure's result as that one's */
+        const bool open_sig = std::any_of(sig.begin(), sig.end(),
+            [&](StaticTypeRef t) { return has_unknown(t); });
         auto it = tmpl_cache.find(key);
         if (it != tmpl_cache.end()) {
             auto gs = global->syms.find(it->second);
-            if (gs != global->syms.end() && gs->second && gs->second->func) {
+            if (gs != global->syms.end() && gs->second && gs->second->func
+                    && !(gs->second->func->pinned && open_sig)) {
                 clone_name = it->second;
                 clone_sym = gs->second;
                 reused = true;
@@ -1683,7 +2132,9 @@ void Inferencer::snapshot_indirect_callees(Block *rootBlock)
      */
     for (auto &kv : sites) {
         FuncInfo *fi = kv.first;
-        if (!fi || fi->is_template || disqualified.count(fi))
+        /* (a closure template's sites are its instances' - rule 8.2) */
+        if (!fi || fi->is_template || fi->closure_tmpl
+                || disqualified.count(fi))
             continue;
         /* A function whose VALUE left the analysed program can be
          * called from a site this pass never saw, so no number of
@@ -1798,10 +2249,203 @@ void Inferencer::stamp_callee_fn(Block *rootBlock)
             continue;
         if (callee_escaped(fi))
             continue;
+        /* rule 8.2: the body that runs at a site an instance serves is
+         * the instance's (the closure object's capture vector, the
+         * instance's descriptor - InstanceSelectV) */
+        if (FuncInfo *ci = closure_site(call))
+            fi = ci;
         call->callee_fn = fi->decl;
         /* #97 E1: the same answer, as the program-lifetime DESCRIPTOR, for
          * consumers that run after the optimizers have freed decls. */
         call->callee_desc = DescStamp(fi->decl->desc);
+    }
+}
+
+/*
+ * Rule 8.2: hand the instances to the engines. A site an instance serves
+ * gets the instance's descriptor and its base's (CallExpr::inst_desc /
+ * inst_base): the engines call the closure object with the instance's
+ * body (InstanceSelectV) when the object is the base's - and the base,
+ * as written, when it is not (a loaded image's analysis may be wrong).
+ *
+ * THE COLLAPSE. A closure template with ONE instance, every site of
+ * which that instance serves, that nothing else can reach (not escaped,
+ * no site that may reach another function too, not a REPL input's -
+ * a later input may call it with anything), never runs its base: the
+ * closure is MADE with the instance's descriptor instead
+ * (FuncDeclStmt::closure_use), and its sites call it as any closure.
+ * That is the common shape (a factory's closure, called the same way
+ * everywhere), and it costs nothing at a call. The base gets no chunk
+ * (is_template_base). Inference is the same either way - the collapse
+ * decides only which descriptor the object carries.
+ */
+/*
+ * Every function a BAKED value holds - a constant the parser folded into
+ * one LiteralObj (`const OPS = [sq];`), FuncObject and all - reported to
+ * `fn` by descriptor. Const arrays, dicts, struct instances (a class
+ * instance's fields too) and a struct type's folded `const` members can
+ * all carry one, so the value is walked, not pattern-matched. A flat
+ * array (ints/floats/bools/strs/POD structs) cannot hold a function by
+ * construction, and get_view() on one would PROMOTE it - so those kinds
+ * are skipped, not viewed. A constant may contain itself: a container
+ * (or a struct type's consts) already on the walk's path is not entered
+ * again (cyclewalk.h).
+ */
+void Inferencer::value_funcs(
+        const EvalValue &v, CycStack &path,
+        const std::function<void(const FuncDescriptor *)> &fn)
+{
+    CycKey ck;
+    bool keyed = cyc_key(v, ck);
+    if (!keyed && v.get_type()->t == Type::t_structtype) {
+        ck = cyc_key_consts(v.get<StructTypeDef *>());
+        keyed = true;
+    }
+    if (keyed && path.contains(ck))
+        return;
+    CycGuard cg(path, ck, keyed);
+
+    switch (v.get_type()->t) {
+
+    case Type::t_func:
+        fn(v.get<intrusive_ptr<FuncObject>>()->func);
+        break;
+
+    case Type::t_arr: {
+        const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
+        if (arr.skind() == SharedArrayObj::Storage::objs) {
+            /* class instances: their fields may hold one */
+            for (size_type i = 0; i < arr.size(); i++)
+                value_funcs(obj_elem_value(arr.flat_objs()[arr.offset() + i]),
+                            path, fn);
+            break;
+        }
+        if (arr.skind() != SharedArrayObj::Storage::general)
+            break;
+        ArrayConstView view = arr.get_view();
+        for (size_type i = 0; i < view.size(); i++)
+            value_funcs(view[i].get(), path, fn);
+        break;
+    }
+
+    case Type::t_dict:
+        for (const auto &kv :
+                 v.get_ref<intrusive_ptr<DictObject>>()->get_ref()) {
+            value_funcs(kv.first, path, fn);
+            value_funcs(kv.second.get(), path, fn);
+        }
+        break;
+
+    case Type::t_struct: {
+        const StructObject &so = *v.get_ref<intrusive_ptr<StructObject>>();
+        for (const LValue &f : so.fields)   /* POD holds no func */
+            value_funcs(f.get(), path, fn);
+        break;
+    }
+
+    case Type::t_structtype:
+        for (const auto &c : v.get<StructTypeDef *>()->consts)
+            value_funcs(c.second, path, fn);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* ...and every baked value in a subtree: a LiteralObj, a struct's const
+ * members - anywhere a statement is, including inside a function body,
+ * which for_each_child does not enter */
+void Inferencer::tree_baked_funcs(
+        Construct *n, CycStack &path,
+        const std::function<void(const FuncDescriptor *)> &fn)
+{
+    if (!n)
+        return;
+    if (ctag(n) == ConstructType::lit_obj) {
+        value_funcs(static_cast<LiteralObj *>(n)->literal_value(), path, fn);
+        return;
+    }
+    if (ctag(n) == ConstructType::struct_decl) {
+        auto *sd = static_cast<StructDeclStmt *>(n);
+        ML_CHECK(sd->def);      /* (the parser always sets it) */
+        for (const auto &c : sd->def->consts)
+            value_funcs(c.second, path, fn);
+        return;
+    }
+    if (ctag(n) == ConstructType::func_decl) {
+        tree_baked_funcs(static_cast<FuncDeclStmt *>(n)->body.get(), path, fn);
+        return;
+    }
+    for_each_child(n, [&](Construct *c) { tree_baked_funcs(c, path, fn); });
+}
+
+void Inferencer::stamp_closure_templates(Block *rootBlock)
+{
+    std::vector<std::pair<CallExpr *, bool>> calls;
+    for (auto &e : rootBlock->elems)
+        collect_calls(e.get(), calls);
+    for (auto &cp : calls) {
+        cp.first->inst_desc = DescStamp();
+        cp.first->inst_base = DescStamp();
+    }
+    if (!has_closure_tmpls)
+        return;
+
+    /* which closure templates some site may reach together with another
+     * function, or without an instance */
+    std::set<FuncInfo *> other_reach;
+    for (auto &cp : calls) {
+        CallExpr *call = cp.first;
+        if (cs_struct_callee(call->what.get()))
+            continue;
+        const CsSet cs = callee_set(call->what.get());
+        if (cs.top)
+            continue;           /* covered by callee_escaped */
+        FuncInfo *ci = closure_site(call);
+        for (FuncInfo *f : cs.funcs)
+            if (f->closure_tmpl && (cs.funcs.size() != 1 || !ci))
+                other_reach.insert(f);
+    }
+
+    /* a closure the PARSER made - a lambda folded into a constant's value
+     * (`const OPS = [pure func(x) => ...]`) - holds the base's descriptor,
+     * whatever closure_use says: its base must keep its body */
+    std::set<const FuncDescriptor *> baked;
+    {
+        CycStack path;
+        for (auto &e : rootBlock->elems)
+            tree_baked_funcs(e.get(), path, [&](const FuncDescriptor *d) {
+                baked.insert(d);
+            });
+    }
+
+    std::set<FuncInfo *> collapsed;
+    for (auto &up : all_funcs) {
+        FuncInfo *b = up.get();
+        if (!b->closure_tmpl || b->pinned)
+            continue;
+        ML_CHECK(b->decl);          /* (a closure template is a lambda) */
+        b->decl->closure_use = nullptr;
+        if (repl || b->closure_insts.size() != 1 || other_reach.count(b)
+                || callee_escaped(b) || baked.count(b->decl->desc))
+            continue;
+        FuncInfo *inst = b->closure_insts.begin()->second;
+        b->decl->closure_use = inst->decl;
+        b->decl->desc->is_template_base = true;     /* never runs */
+        collapsed.insert(b);
+    }
+
+    for (auto &kv : closure_site_inst) {
+        FuncInfo *inst = kv.second;
+        FuncInfo *b = inst->closure_base;
+        /* the loop's last round withdrew every mapping whose site
+         * reaches another function too (closure_instantiate_round) */
+        ML_CHECK(closure_site_current(kv.first, b));
+        if (collapsed.count(b))
+            continue;           /* the object IS the instance */
+        kv.first->inst_desc = DescStamp(inst->decl->desc);
+        kv.first->inst_base = DescStamp(b->decl->desc);
     }
 }
 
@@ -2253,6 +2897,11 @@ void Inferencer::infer_one(Block *rootBlock)
     }
 
     mark_lambda_templates();   /* safe var-bound lambdas become templates */
+    closure_site_inst.clear();
+    closure_site_barred.clear();
+    base_dyn_lvals.clear();
+    closure_loop_done = false;
+    mark_closure_templates(rootBlock);          /* rule 8.2 */
     run_fixpoint(rootBlock);
 
     /*
@@ -2277,7 +2926,12 @@ void Inferencer::infer_one(Block *rootBlock)
             cs_run(rootBlock);
             const bool p1 = instantiate_round(rootBlock);
             const bool p2 = value_instantiate_round(rootBlock);
-            if (!p1 && !p2)
+            bool p3;
+            {
+                CsHoldMemoScope memo(*this);    /* it only reads (#98) */
+                p3 = closure_instantiate_round(rootBlock);
+            }
+            if (!p1 && !p2 && !p3)
                 break;
             run_fixpoint(rootBlock);
         }
@@ -2325,6 +2979,18 @@ void Inferencer::infer_one(Block *rootBlock)
     }
 
     /*
+     * Rule 8.2: a closure template's return type was withheld while its
+     * instances were being made (closure_loop_done). Release it: a call
+     * site no instance serves calls the base and gets the base's return
+     * type. The loop runs again for what that settles.
+     */
+    closure_loop_done = true;
+    if (has_closure_tmpls) {
+        run_fixpoint(rootBlock);
+        instantiate_to_fixpoint();
+    }
+
+    /*
      * #116 increment 4: hand the callee sets to the RESOLVER by stamping
      * them on the call nodes. Last, because everything above can still
      * redirect a call site to a fresh clone - `instantiate_to_fixpoint`
@@ -2334,6 +3000,7 @@ void Inferencer::infer_one(Block *rootBlock)
     {
         CsHoldMemoScope memo(*this);
         stamp_callee_fn(rootBlock);
+        stamp_closure_templates(rootBlock);     /* rule 8.2 */
     }
 
     /* finalize. An unconstrained value is `none` for a local ("only-none /
@@ -2379,6 +3046,15 @@ void Inferencer::infer_one(Block *rootBlock)
                  * store's check an indirect call passing 2.5 left a float
                  * in an `int` slot: the JIT printed its bits as an int,
                  * the VM aborted, the tree-walker threw. */
+                const StaticTypeRef ty = static_type_resolve(s->type);
+                if (ty->kind == StaticTypeKind::Int
+                        || ty->kind == StaticTypeKind::Float)
+                    s->coerces_dyn = true;
+            }
+            /* rule 8.2: a closure base stored a `dyn` here
+             * (base_shared_dyn) - a numeric variable converts it at the
+             * store, as any numeric local given a dyn does */
+            if (s->base_dyn_store && !s->is_param) {
                 const StaticTypeRef ty = static_type_resolve(s->type);
                 if (ty->kind == StaticTypeKind::Int
                         || ty->kind == StaticTypeKind::Float)
@@ -2459,92 +3135,13 @@ void Inferencer::infer_one(Block *rootBlock)
          * again (cyclewalk.h) - everything in it is being walked already.
          */
         CycStack keep_path;
-        std::function<void(const EvalValue &)> keep_in_value =
-            [&](const EvalValue &v) {
-            CycKey ck;
-            bool keyed = cyc_key(v, ck);
-            if (!keyed && v.get_type()->t == Type::t_structtype) {
-                ck = cyc_key_consts(v.get<StructTypeDef *>());
-                keyed = true;
-            }
-            if (keyed && keep_path.contains(ck))
-                return;
-            CycGuard cg(keep_path, ck, keyed);
-
-            switch (v.get_type()->t) {
-
-            case Type::t_func: {
-                auto it = tmpl_by_desc.find(
-                    v.get_ref<intrusive_ptr<FuncObject>>()->func);
-                if (it != tmpl_by_desc.end())
-                    keep(it->second);
-                break;
-            }
-
-            case Type::t_arr: {
-                const SharedArrayObj &arr = v.get_ref<SharedArrayObj>();
-                if (arr.skind() == SharedArrayObj::Storage::objs) {
-                    /* class instances: their fields may hold one */
-                    for (size_type i = 0; i < arr.size(); i++)
-                        keep_in_value(obj_elem_value(
-                            arr.flat_objs()[arr.offset() + i]));
-                    break;
-                }
-                if (arr.skind() != SharedArrayObj::Storage::general)
-                    break;
-                ArrayConstView view = arr.get_view();
-                for (size_type i = 0; i < view.size(); i++)
-                    keep_in_value(view[i].get());
-                break;
-            }
-
-            case Type::t_dict:
-                for (const auto &kv :
-                         v.get_ref<intrusive_ptr<DictObject>>()->get_ref()) {
-                    keep_in_value(kv.first);
-                    keep_in_value(kv.second.get());
-                }
-                break;
-
-            case Type::t_struct: {
-                const StructObject &so =
-                    *v.get_ref<intrusive_ptr<StructObject>>();
-                for (const LValue &f : so.fields)   /* POD holds no func */
-                    keep_in_value(f.get());
-                break;
-            }
-
-            case Type::t_structtype:
-                for (const auto &c : v.get<StructTypeDef *>()->consts)
-                    keep_in_value(c.second);
-                break;
-
-            default:
-                break;
-            }
+        const auto keep_desc = [&](const FuncDescriptor *d) {
+            auto it = tmpl_by_desc.find(d);
+            if (it != tmpl_by_desc.end())
+                keep(it->second);
         };
-
-        /* The baked values live anywhere a statement does - including
-         * inside a function body, which for_each_child does not enter. */
-        std::function<void(Construct *)> scan_baked = [&](Construct *n) {
-            if (!n)
-                return;
-            if (ctag(n) == ConstructType::lit_obj) {
-                keep_in_value(static_cast<LiteralObj *>(n)->literal_value());
-                return;
-            }
-            if (ctag(n) == ConstructType::struct_decl) {
-                auto *sd = static_cast<StructDeclStmt *>(n);
-                if (sd->def)
-                    for (const auto &c : sd->def->consts)
-                        keep_in_value(c.second);
-                return;
-            }
-            if (ctag(n) == ConstructType::func_decl) {
-                scan_baked(static_cast<FuncDeclStmt *>(n)->body.get());
-                return;
-            }
-            for_each_child(n, [&](Construct *c) { scan_baked(c); });
+        const auto scan_baked = [&](Construct *n) {
+            tree_baked_funcs(n, keep_path, keep_desc);
         };
 
         std::function<void(Construct *)> scan = [&](Construct *n) {
@@ -3409,9 +4006,12 @@ void Inferencer::enforce_concrete_decls()
          * (their type is derived from the container, which carries any `dyn`),
          * builtins (no decl loc), and a local assigned only values of an
          * unknowable type (untyped_dyn: its `dyn` is not the program's
-         * choice - see TypeSym::got_unknown). */
+         * choice - see TypeSym::got_unknown) - and a local of a closure
+         * template's BASE (rule 8.2), whose `dyn` is its parameters':
+         * each instance is checked with real types. */
         if (s->dyn_decl || s->func || s->struct_type || s->is_param ||
-            s->is_loopvar || s->pinned || !s->decl_loc || s->untyped_dyn)
+            s->is_loopvar || s->pinned || !s->decl_loc || s->untyped_dyn
+            || s->in_base)
             continue;
 
         if (!type_has_dyn(s->type, strict_deep))
@@ -3955,7 +4555,8 @@ bool Inferencer::call_fit_args(CallExpr *call)
         }
         return false;
     }
-    if (FuncInfo *fi = callee_funcinfo(call->what.get())) {
+    FuncInfo *ci = closure_site(call);      /* rule 8.2 */
+    if (FuncInfo *fi = ci ? ci : callee_funcinfo(call->what.get())) {
         const size_t np = std::min(na, fi->params.size());
         for (size_t i = 0; i < np; i++)
             if (param_has_fit(fi->params[i])
@@ -4121,6 +4722,16 @@ void Inferencer::annotate_hints(Construct *n)
             if (StaticTypeRef d = declared_type_of(id))
                 e->rv_fit = store_fit(d, type_of(e->rvalue.get()),
                                       FitSpec::Place::var, id->uid);
+            /* rule 8.2: a closure base's `dyn` into a variable it does
+             * not own, checked against what the program types it
+             * (base_shared_dyn; a numeric one converts - coerces_dyn) */
+            else if (base_dyn_lvals.count(id)) {
+                /* (recorded only for a symbol base_shared_dyn was given) */
+                TypeSym *bs = user_sym(id);
+                ML_CHECK(bs);
+                e->rv_fit = store_fit(bs->type, type_of(e->rvalue.get()),
+                                      FitSpec::Place::var, id->uid);
+            }
         }
         /* ... and each declared target of a multi-assignment, given what
          * it receives (idlist_elem_types) */
@@ -4354,7 +4965,10 @@ void Inferencer::annotate_hints(Construct *n)
         if (na > 32) {
             nmask = ~0u;
         } else {
-            FuncInfo *fi = callee_funcinfo(call->what.get());
+            /* (rule 8.2: a site an instance serves binds its params) */
+            FuncInfo *fi = closure_site(call);
+            if (!fi)
+                fi = callee_funcinfo(call->what.get());
             /* a known callee has a parameter per argument: the check pass
              * refused a mismatched count before this runs */
             const size_t np = fi ? fi->params.size() : 0;
@@ -4844,6 +5458,7 @@ void Inferencer::stamp_ctypes(Construct *n, StaticTypeRef dest)
         auto &as = args->elems;
         const bool known = builtin
             || cs_struct_callee(call->what.get())
+            || closure_site(call)                       /* rule 8.2 */
             || callee_funcinfo(call->what.get());
         /* an append / push / insert (its container is argument 0) */
         const bool stores = builtin && !as.empty()
@@ -4984,7 +5599,8 @@ bool Inferencer::arg_fit_checked(CallExpr *call, size_t i)
         return fd.kind != FieldKind::f_dyn
             && fit_needed(type_of(a), field_static_type(fd));
     }
-    if (FuncInfo *fi = callee_funcinfo(call->what.get()))
+    FuncInfo *ci = closure_site(call);      /* rule 8.2 */
+    if (FuncInfo *fi = ci ? ci : callee_funcinfo(call->what.get()))
         return i < fi->params.size() && param_has_fit(fi->params[i])
             && fit_needed(type_of(a), fi->params[i]->type);
     return false;
@@ -5456,16 +6072,36 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
         const bool is_tmpl = fi && fi->is_template && !struct_in_clone;
         if (is_tmpl)
             struct_tmpl_depth++;
+        ML_CHECK(fi);       /* declare_funcdecl built it */
+        fi->lex_parent = struct_func;
 
+        /* A closure INSTANCE (rule 8.2) binds each capture to its BASE's
+         * capture symbol: one closure object, one capture vector, so
+         * capture `k` is the same variable in every body. Only for the
+         * instance itself - a lambda nested in it looks up as usual. */
+        const FuncDeclStmt *csrc = struct_capture_src;
+        struct_capture_src = nullptr;
+        ML_CHECK(!csrc || (csrc->captures ? csrc->captures->elems.size()
+                                          : 0)
+                              == (fd->captures ? fd->captures->elems.size()
+                                               : 0));
         if (fd->captures)
-            for (auto &cap : fd->captures->elems) {
-                TypeSym *outer = lookup(s, cap->uid);
+            for (size_t ci = 0; ci < fd->captures->elems.size(); ci++) {
+                Identifier *cap = fd->captures->elems[ci].get();
+                TypeSym *outer;
+                if (csrc) {
+                    outer = user_sym(csrc->captures->elems[ci].get());
+                } else {
+                    outer = lookup(s, cap->uid);
+                }
                 if (outer) {
                     fscope->syms[cap->uid] = outer;
                     fscope->capture_names.insert(cap->uid);
                 }
-                id_sym[cap.get()] = outer;
+                id_sym[cap] = outer;
             }
+        FuncInfo *prev_sf = struct_func;
+        struct_func = fi;
 
         if (fd->params)
             for (auto &p : fd->params->elems) {
@@ -5482,6 +6118,7 @@ void Inferencer::walk_struct(Construct *n, Scope *s)
             }
 
         walk_struct(fd->body.get(), fscope);
+        struct_func = prev_sf;
         if (is_tmpl)
             struct_tmpl_depth--;
         return;
@@ -5842,7 +6479,10 @@ StaticTypeRef Inferencer::func_static_type(FuncInfo *fi)
      * analysis (calleeset.cpp.h), keyed by PROGRAM LOCATION - so an
      * StaticType is back to describing SHAPE and nothing else.
      */
-    return A.func_of(ps, popt, fi->ret);
+    /* rule 8.2: withheld while the instances are made (closure_loop_done) */
+    const StaticTypeRef ret =
+        fi->closure_tmpl && !closure_loop_done ? bottom : fi->ret;
+    return A.func_of(ps, popt, ret);
 }
 
 /*
@@ -6203,6 +6843,9 @@ StaticTypeRef Inferencer::type_of_node(const Construct *e)
     if (ctag(e) == ConstructType::call) {
         auto *call = static_cast<const CallExpr *>(e);
         Construct *callee = call->what.get();
+        /* rule 8.2: a site an instance serves returns what it returns */
+        if (FuncInfo *ci = closure_site(call))
+            return ci->ret;
         if (ctag(callee) == ConstructType::id) {
             auto *cid = static_cast<const Identifier *>(callee);
             auto it = id_sym.find(cid);
@@ -6220,10 +6863,14 @@ StaticTypeRef Inferencer::type_of_node(const Construct *e)
                  * DynRequiredEx and roll the instance back. */
                 if (s->func->is_template)
                     return bottom;
+                /* rule 8.2: withheld until the instances are made */
+                if (s->func->closure_tmpl && !closure_loop_done)
+                    return bottom;
                 return s->func->ret;
             }
             if (s && is_func(s->type))
-                return static_type_resolve(s->type)->ret;
+                return runs_unsettled_base(call)
+                    ? bottom : static_type_resolve(s->type)->ret;
             if (s && is_unknown(s->type))
                 return bottom;          /* defer: callee not yet known */
             if (s && is_dyn(s->type))
@@ -6236,6 +6883,8 @@ StaticTypeRef Inferencer::type_of_node(const Construct *e)
         }
         StaticTypeRef ct = type_of(callee);
         if (is_unknown(static_type_resolve(ct))) return bottom;   /* defer */
+        if (is_func(ct) && runs_unsettled_base(call))
+            return bottom;                              /* rule 8.2 */
         return is_func(ct) ? static_type_resolve(ct)->ret : A.dyn_ty();
     }
 
@@ -7070,6 +7719,9 @@ void Inferencer::accumulate(Construct *n)
             return;   /* a template: inferred per instantiation, not here */
         FuncInfo *prev = cur_func;
         cur_func = fi;
+        const bool base = fi && fi->closure_tmpl;   /* rule 8.2 */
+        if (base)
+            accum_base_depth++;
         if (fd->body && !fd->body->is_block()) {
             accumulate(fd->body.get());
             contribute_ret(type_of(fd->body.get()));
@@ -7078,6 +7730,8 @@ void Inferencer::accumulate(Construct *n)
             if (cur_func->falls_through)
                 contribute_ret(A.none_ty());
         }
+        if (base)
+            accum_base_depth--;
         cur_func = prev;
         return;
     }
@@ -7132,11 +7786,23 @@ void Inferencer::accumulate_call(CallExpr *call)
 
     ExprList *args = call->args.get();
 
+    /* rule 8.2: a site an instance serves feeds the instance */
+    if (FuncInfo *ci = closure_site(call)) {
+        size_t n = std::min(ci->params.size(), args->elems.size());
+        for (size_t i = 0; i < n; i++)
+            contribute_arg(ci->params[i],
+                           arg_type(args->elems[i].get(), ci->params[i]),
+                           args->elems[i]->start, args->elems[i]->end);
+        return;
+    }
+
     /* direct call to a known function (named, func-var, or inline lambda): feed
      * the argument types into its parameters */
     if (FuncInfo *fi = callee_funcinfo(call->what.get())) {
         if (fi->is_template)
             return;   /* a template call: handled by instantiation (redirect) */
+        if (fi->closure_tmpl)
+            return;   /* rule 8.2: its instances' business, or the base's */
         size_t n = std::min(fi->params.size(), args->elems.size());
         for (size_t i = 0; i < n; i++)
             contribute_arg(fi->params[i],
@@ -7453,6 +8119,11 @@ StaticTypeRef Inferencer::fixed_type(const TypeSym *s)
 void Inferencer::contribute_elem(TypeSym *s, StaticTypeRef cont, Loc loc,
                                  Loc loc_end)
 {
+    /* rule 8.2: a closure base's `dyn` element into a container it does
+     * not own - checked at the store (annotate_hints' rv_fit / arg_fit,
+     * from the container's final type), never joined into it */
+    if (base_shared_dyn(s, cont))
+        return;
     const StaticTypeRef d = fixed_type(s);
     const StaticTypeRef c = static_type_resolve(cont);
     if (d && c->kind == d->kind) {
@@ -8039,6 +8710,8 @@ StaticTypeRef Inferencer::fixed_elem_dest(Construct *base, bool key)
  */
 std::vector<TypeSym *> *Inferencer::known_params(CallExpr *call)
 {
+    if (FuncInfo *ci = closure_site(call))      /* rule 8.2 */
+        return &ci->params;
     FuncInfo *fi = callee_funcinfo(call->what.get());
     if (!fi) {
         auto ic = indirect_callee.find(call);
@@ -8369,8 +9042,14 @@ void Inferencer::contribute_to_lvalue(Construct *lv, StaticTypeRef ct)
     if (ctag(lv) == ConstructType::id) {
         auto *id = static_cast<Identifier *>(lv);
         auto it = id_sym.find(id);
-        if (it != id_sym.end())
+        if (it != id_sym.end()) {
+            if (base_shared_dyn(it->second, ct)) {
+                it->second->base_dyn_store = true;   /* rule 8.2 */
+                base_dyn_lvals.insert(id);
+                return;
+            }
             contribute(it->second, ct, id->start, id->end);
+        }
         return;
     }
 
@@ -9374,7 +10053,10 @@ void Inferencer::check_call(CallExpr *call)
      * instantiation (in each clone), so the per-arg loop below is skipped. */
     bool template_call = false;
 
-    if (FuncInfo *fi = callee_funcinfo(call->what.get())) {
+    if (FuncInfo *ci = closure_site(call)) {     /* rule 8.2 */
+        fparams = &ci->params;
+        callable_known = true;
+    } else if (FuncInfo *fi = callee_funcinfo(call->what.get())) {
         fparams = &fi->params;
         callable_known = true;
         template_call = fi->is_template;
@@ -11349,6 +12031,7 @@ void ReplInfer::check_input(Construct *input)
         impl->inf.setup();
         impl->did_setup = true;
     }
+    impl->inf.repl = true;
     impl->inf.infer_input(blk);
     impl->can_reject = true;
 }

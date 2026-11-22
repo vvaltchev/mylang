@@ -7181,6 +7181,26 @@ extern "C" int jit_cast(int_type src, int_type dst, const void *t) noexcept
     return 0;
 }
 
+/* rule 8.2: the native InstanceSelectV (vm_instance_select_op's body);
+ * only an allocation can fail, which conveys */
+extern "C" int jit_instance_select(int_type src, int_type dst,
+                                   const void *base, const void *inst) noexcept
+{
+    ML_JIT_OP_RAN(InstanceSelectV);
+    Frame *f = g_current_ctx->frame;
+    try {
+        const auto *b = static_cast<const FuncDescriptor *>(base);
+        EvalValue v = closure_instance_value(
+            f->at(src).get(), b, b->serial,
+            static_cast<const FuncDescriptor *>(inst));
+        f->at(dst).put(std::move(v));
+    } catch (RuntimeException &e) {   /* INT-COV-EXEMPT: an allocation */
+        g_vm_jit_exc.reset(e.clone());
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" int jit_store_box(int_type box_slot, int_type val_slot) noexcept
 {
     ML_JIT_OP_RAN(StoreBoxV);
@@ -9018,6 +9038,26 @@ vm_check_fit_op(EvalContext &ctx, const Instr &in, const Chunk &chunk,
         check_fit(ctx.frame->at(in.a_slot()).get(),
                   chunk.fit_specs[static_cast<size_t>(in.target2)]);
     } catch (Exception &e) {
+        vm_stamp_loc(chunk, pc, e);
+        throw;
+    }
+}
+
+/* Rule 8.2: InstanceSelectV - the callee viewed with the instance's body
+ * when it is the base's closure object (closure_instance_value: both
+ * engines' one answer). Only an allocation can fail. */
+static ML_NOINLINE void
+vm_instance_select_op(EvalContext &ctx, const Instr &in, const Chunk &chunk,
+                      size_t pc)
+{
+    try {
+        const FuncDescriptor *b =
+            chunk.closure_defs[static_cast<size_t>(in.target2)];
+        EvalValue v = closure_instance_value(
+            ctx.frame->at(in.a_slot()).get(), b, b->serial,
+            chunk.closure_defs[static_cast<size_t>(in.b_lit())]);
+        ctx.frame->at(in.target).put(std::move(v));
+    } catch (Exception &e) {      /* INT-COV-EXEMPT: an allocation only */
         vm_stamp_loc(chunk, pc, e);
         throw;
     }
@@ -14032,6 +14072,11 @@ vm_dispatch(const Chunk &chunk0, EvalContext &ctx, VmActivation &act,
 
         VM_CASE(CastV):
             vm_cast_op(ctx, *in, *chunk, pc);
+            pc++;
+            VM_NEXT;
+
+        VM_CASE(InstanceSelectV):
+            vm_instance_select_op(ctx, *in, *chunk, pc);
             pc++;
             VM_NEXT;
 

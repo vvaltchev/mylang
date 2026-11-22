@@ -8182,6 +8182,12 @@ static bool jit_op_eligible(const Instr &in)
      * op_fully_native too. */
     case OpCode::CastV:
         return true;
+    /* rule 8.2: InstanceSelectV - jit_instance_select reads the callee
+     * and writes the dst in memory; only an allocation can fail, which
+     * conveys, exc-stamped with the call's caret. No bail ->
+     * op_fully_native too. */
+    case OpCode::InstanceSelectV:
+        return true;
     /* Q2: StampTypeV - jit_stamp_ctype_top reads the sum from memory; it
      * never throws, so op_fully_native too. */
     case OpCode::StampTypeV:
@@ -18410,6 +18416,10 @@ pick_visit_op(const Chunk &ck, const Instr &in, size_t pc, V &&v)
          * dst may hold a reference) */
         v.bad(in.a_slot()); v.bad(in.target);
         break;
+    case OpCode::InstanceSelectV:
+        /* rule 8.2: likewise - the dst holds a FuncObject */
+        v.bad(in.a_slot()); v.bad(in.target);
+        break;
     case OpCode::CheckNoneArgsV:
         /* the helper reads the argument run (and a kind-0 callee) from
          * MEMORY, as the call that follows does - the CallV rule */
@@ -28498,6 +28508,30 @@ static bool emit_op(Emitter &e, const Chunk &ck, const Instr &in,
         return true;
     }
 
+    case OpCode::InstanceSelectV: {
+        /* rule 8.2: jit_instance_select(src, dst, base, inst) - rdi =
+         * a_slot, rsi = target, rdx / rcx = the baked closure_defs
+         * descriptors (program lifetime). An allocation failure conveys
+         * -> exc-stamp (the call's caret) + exit. */
+        emit_call_prologue(e);
+        e.mov_imm(RDI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.a_slot())));
+        e.mov_imm(RSI, static_cast<uint64_t>(
+                          static_cast<int_type>(in.target)));
+        e.movabs(RDX, reinterpret_cast<uint64_t>(
+                          ck.closure_defs[static_cast<size_t>(in.target2)]));
+        e.movabs(RCX, reinterpret_cast<uint64_t>(
+                          ck.closure_defs[static_cast<size_t>(in.b_lit())]));
+        e.call_direct(jit_instance_select);
+        emit_call_epilogue(e);
+        e.test32_rr(RAX, RAX);               /* test eax, eax; reg:abi */
+        const size_t j_ok_is = e.j8(0x74);
+        emit_exc_stamp(e, ck, old_pc);        /* cold: the call */
+        e.exit_pc(pc);
+        e.patch8(j_ok_is, e.pos());
+        return true;
+    }
+
     case OpCode::CheckFitV: {
         /* #49: jit_check_fit(slot, &fit_specs[target2]) - rdi = a_slot,
          * rsi = the baked pool entry. A misfit conveys a loc-less
@@ -30692,6 +30726,7 @@ static bool op_fully_native(const Instr &in)
     case OpCode::CheckNoneArgsV:    /* RULE 1: conveys, exc-stamped */
     case OpCode::CheckFitV:         /* #49: conveys, exc-stamped */
     case OpCode::CastV:             /* conveys, exc-stamped */
+    case OpCode::InstanceSelectV:   /* rule 8.2: conveys, exc-stamped */
     case OpCode::StampTypeV:        /* Q2: never throws */
     case OpCode::LoadBoxV:          /* class step 4: conveys, exc-stamped */
     case OpCode::StoreBoxV:

@@ -2,8 +2,17 @@
 THE .myv STORED-BYTECODE FORMAT
 ================================================================================
 
-Format version 46.  This document describes the on-disk image exhaustively:
+Format version 47.  This document describes the on-disk image exhaustively:
 every record, in order, with its exact byte encoding.
+
+(v47 changes no encoding: one opcode was APPENDED - InstanceSelectV, the
+callee of a call site a closure template's instance serves (rule 8.2,
+plans/strict-container-types.md section 10) - so a v46 binary would meet
+an opcode it does not know; see the note on version 10 below.  Its
+`target2` indexes `closure_defs` (the closure template's BASE descriptor)
+and so does its literal `b` (the INSTANCE's), and the loader refuses an
+image where the two descriptors' capture lists differ in length: the
+instance's body runs with the base object's capture slots.)
 
 (v46: a Field (7.1) carries an `annot` exactly when its kind is
 `array`, `dict` or `box` - a bare container field is a compile error
@@ -290,6 +299,8 @@ sees a kind of field the others structurally cannot (#137):
      base_locs, inline_ctxs - which are REMAPPED by indexing, not merely
      searched) and each closure descriptor's capture slots.  It runs BEFORE
      the load-time JIT, which bakes pool ENTRY ADDRESSES into machine code.
+     (InstanceSelectV's two descriptors must have as many captures each,
+     v47.)
 
      It also checks the STATIC CROSS-FIELD facts a runtime path would
      otherwise discover the hard way: a boxed arith/compare op's `aop` must

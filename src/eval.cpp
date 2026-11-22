@@ -2464,9 +2464,20 @@ EvalValue dispatch_call_value(EvalContext *ctx, const EvalValue &callable,
             const CallExpr *pt_call = ctx->root->parse_typed
                     && !ctx->root->pt_copy && pt_parser_level(ctx)
                 ? node : nullptr;
+            /* rule 8.2: the instance this site's closure template has for
+             * its arguments (CallExpr::inst_desc), with the object's own
+             * captures */
+            EvalValue view;
+            const EvalValue *cv = &callable;
+            if (node->inst_desc) {
+                view = closure_instance_value(
+                    callable, node->inst_base.desc, node->inst_base.serial,
+                    node->inst_desc.desc);
+                cv = &view;
+            }
             return do_func_call(
                 ctx,
-                *callable.get<intrusive_ptr<FuncObject>>().get(),
+                *cv->get<intrusive_ptr<FuncObject>>().get(),
                 node->args->elems,
                 node->start,     /* call site = the CallExpr's location */
                 node->inline_ctx,/* virtual frames if this call is inlined */
@@ -7637,8 +7648,15 @@ EvalValue StructDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 
 EvalValue FuncDeclStmt::do_eval(EvalContext *ctx, bool rec) const
 {
+    /* rule 8.2: a closure instance is a body, not a value - nothing makes
+     * a closure of it (its call sites call the base's object with it) */
+    if (closure_instance_of)
+        return none;
+    /* ...and a collapsed closure template is made with its one
+     * instance's descriptor (closure_use): its own body never runs */
     EvalValue func(
-        intrusive_ptr<FuncObject>(make_intrusive<FuncObject>(desc, ctx))
+        intrusive_ptr<FuncObject>(make_intrusive<FuncObject>(
+            closure_use ? closure_use->desc : desc, ctx))
     );
 
     if (id) {

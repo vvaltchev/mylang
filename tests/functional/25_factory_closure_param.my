@@ -45,25 +45,13 @@ for (var i = 0; i < 4; i++) {
 }
 print("loop   ", last);
 
-# (3) ⛔ TWO CALL SITES THAT DISAGREE *JOIN*, exactly as they do for a
-#     DIRECTLY-bound capturing lambda. This case used to DECLINE to
-#     `dyn` and print `dyn:21 dyn:22.500000`, because a UNIFORMITY
-#     check refused to contribute anything unless every site of a
-#     closure agreed. That check is deleted (maintainer's call,
-#     2026-08-28) and the two spellings of a capturing closure now
-#     behave identically:
-#
-#       var wbase = 20;                                    # DIRECT
-#       var f = func [wbase] (x) { return typestr(x); };
-#       print(f(1) + " " + f(2.5));   -> float float
-#
-#     - which is what this now prints too. `join(int, float)` is
-#     float, so `f(1)` coerces; an int/str pair is the join CONFLICT
-#     that the direct spelling already raised.
-#
-#     ⛔ WATCHED: restoring the uniformity check turns this line back
-#     into `widen  dyn:21 dyn:22.500000` - it is the ONE corpus line
-#     the deletion moves, which is why it is asserted here.
+# (3) RULE 8.2: TWO CALL SITES THAT DISAGREE GET AN INSTANCE EACH,
+#     exactly as a DIRECTLY-bound capturing lambda's do (3b). Each site
+#     that names this closure alone runs a copy of its body typed for
+#     its own arguments, with the one closure object's captures - so
+#     `f(1)` sees an int and `f(2.5)` a float. (Before rule 8.2 the two
+#     JOINED, to `float float`; before 2026-08-28 a uniformity check
+#     made this spelling decline to `dyn` while 3b joined.)
 func make_w(n) {
   var wbase = n * 10;
   return func [wbase] (x) { return typestr(x) + ":" + str(wbase + x); };
@@ -138,9 +126,9 @@ print("array  ", through_array(runtime(1)));
 #       is 'int'
 #
 #     - while the IDENTICAL program with no size-1 site compiled and
-#     printed `A:dyn B:dyn`. A callee is usable only when EVERY site
-#     whose set contains it names it ALONE. Watched: reverting the
-#     `disqualified` set makes this file fail to compile at all.
+#     printed `A:dyn B:dyn`. Since rule 8.2 each site decides alone:
+#     `only_1(7)` runs an int instance, and `either("s")`, which may
+#     reach two closures, runs mk_h1's untyped body (`1:dyn`).
 func mk_h1(n) => func [n] (x) { return "1:" + typestr(x) + str(n); };
 func mk_h2(n) => func [n] (x) { return "2:" + typestr(x) + str(n); };
 func multisite(int k) {

@@ -646,6 +646,9 @@ CsSet Inferencer::cs_eval(Construct *e)
                 out.set_top();
                 return out;
             }
+            /* rule 8.2: what the instance serving the site returns */
+            if (FuncInfo *ci = closure_site(c))
+                direct = ci;
             out = cs_pts[cs_loc(CsLocKind::ret, direct, 0)];
             return out;
         }
@@ -679,6 +682,11 @@ CsSet Inferencer::cs_eval(Construct *e)
         const CsSet cal = cs_eval(c->what.get());
         if (cal.top) {
             out.set_top();
+            return out;
+        }
+        /* rule 8.2: what the instance serving the site returns */
+        if (FuncInfo *ci = closure_site(c)) {
+            out = cs_pts[cs_loc(CsLocKind::ret, ci, 0)];
             return out;
         }
         for (FuncInfo *f : cal.funcs) {
@@ -1186,6 +1194,19 @@ void Inferencer::cs_call(CallExpr *c)
         cs_top_callee_sites++;
         for (auto &a : c->args->elems)
             cs_escape_set(cs_eval(a.get()));
+        return;
+    }
+
+    /* rule 8.2: at a site an instance serves, the INSTANCE's body is
+     * what runs (InstanceSelectV): its parameters get the arguments, and
+     * the base's do not - a base no site calls holds nothing, so a call
+     * in its body names nothing either */
+    if (FuncInfo *ci = closure_site(c)) {
+        /* (a site is mapped only when its arguments fit the parameters) */
+        ML_CHECK(c->args->elems.size() <= ci->params.size());
+        for (size_t i = 0; i < c->args->elems.size(); i++)
+            cs_write(cs_loc(CsLocKind::sym, ci->params[i], 0),
+                     cs_eval(c->args->elems[i].get()));
         return;
     }
 
